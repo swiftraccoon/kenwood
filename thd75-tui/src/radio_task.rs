@@ -400,22 +400,34 @@ async fn freq_down(
 fn discover_and_open(port: Option<String>, baud: u32) -> Result<(String, SerialTransport), String> {
     if let Some(ref path) = port {
         if path != "auto" {
+            // SerialTransport::open auto-detects BT and applies 9600/RTS-CTS
             let transport = SerialTransport::open(path, baud)
                 .map_err(|e| format!("Failed to open {path}: {e}"))?;
             return Ok((path.clone(), transport));
         }
     }
 
-    // Auto-discover
-    let ports =
+    // Auto-discover: try USB first, then Bluetooth
+    let usb_ports =
         SerialTransport::discover_usb().map_err(|e| format!("USB discovery failed: {e}"))?;
 
-    let info = ports
-        .first()
-        .ok_or_else(|| "No TH-D75 found on USB".to_string())?;
+    if let Some(info) = usb_ports.first() {
+        let path = info.port_name.clone();
+        let transport = SerialTransport::open(&path, baud)
+            .map_err(|e| format!("Failed to open {path}: {e}"))?;
+        return Ok((path, transport));
+    }
 
-    let path = info.port_name.clone();
-    let transport =
-        SerialTransport::open(&path, baud).map_err(|e| format!("Failed to open {path}: {e}"))?;
-    Ok((path, transport))
+    // No USB — try Bluetooth
+    let bt_ports = SerialTransport::discover_bluetooth()
+        .map_err(|e| format!("BT discovery failed: {e}"))?;
+
+    if let Some(info) = bt_ports.first() {
+        let path = info.port_name.clone();
+        let transport = SerialTransport::open(&path, baud)
+            .map_err(|e| format!("Failed to open {path}: {e}"))?;
+        return Ok((path, transport));
+    }
+
+    Err("No TH-D75 found on USB or Bluetooth".to_string())
 }
