@@ -17,4 +17,4 @@ thd75_re/
 *.pdf
 *.md
 
--README.md
+!README.md
