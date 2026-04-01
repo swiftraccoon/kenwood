@@ -3,6 +3,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![CI](https://github.com/swiftraccoon/kenwood/actions/workflows/ci.yml/badge.svg)](https://github.com/swiftraccoon/kenwood/actions)
+[![Docs](https://img.shields.io/badge/docs-github.io-blue)](https://swiftraccoon.github.io/kenwood/)
 
 Rust libraries and TUIs for Kenwood amateur radio transceivers.
 
@@ -16,7 +17,3 @@ Rust libraries and TUIs for Kenwood amateur radio transceivers.
 |-------|---------|-----|--------|
 | TH-D75 | `thd75/` | `thd75-tui/` | In development |
 | TM-D750 | Planned | Planned | Not started |
-
-## License
-
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
