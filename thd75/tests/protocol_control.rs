@@ -113,10 +113,7 @@ fn parse_dl_disabled() {
 
 #[test]
 fn serialize_dw_read() {
-    assert_eq!(
-        protocol::serialize(&Command::GetDualWatch),
-        b"DW\r"
-    );
+    assert_eq!(protocol::serialize(&Command::GetDualWatch), b"DW\r");
 }
 
 #[test]

@@ -62,11 +62,11 @@ async fn set_channel_2_name() {
 
     println!("  Read name page, ch002 before:");
     let old_name_bytes = &page_data[32..48]; // channel 2 at offset 2*16
-    let old_end = old_name_bytes
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(16);
-    println!("    {:?}", String::from_utf8_lossy(&old_name_bytes[..old_end]));
+    let old_end = old_name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
+    println!(
+        "    {:?}",
+        String::from_utf8_lossy(&old_name_bytes[..old_end])
+    );
 
     // Modify channel 2's name
     let mut page = [0u8; 256];

@@ -10,10 +10,7 @@ use kenwood_thd75::protocol::Codec;
 use kenwood_thd75::transport::{SerialTransport, Transport};
 use std::io::Write as IoWrite;
 
-async fn raw_exchange(
-    transport: &mut SerialTransport,
-    cmd: &str,
-) -> (String, Option<String>) {
+async fn raw_exchange(transport: &mut SerialTransport, cmd: &str) -> (String, Option<String>) {
     let wire = format!("{cmd}\r");
     let _ = transport.write(wire.as_bytes()).await;
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -70,11 +67,8 @@ fn check(
 async fn verify_all_cat_commands() {
     let ports = SerialTransport::discover_usb().unwrap();
     assert!(!ports.is_empty(), "No TH-D75 found");
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    )
-    .unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     let mut results: Vec<(String, String, String)> = Vec::new();
 
@@ -128,52 +122,130 @@ async fn verify_all_cat_commands() {
     // ===== FREQUENCY (band-indexed reads) =====
     for b in ["0", "1"] {
         let (cmd, resp) = raw_exchange(&mut transport, &format!("FO {b}")).await;
-        check(&mut results, &cmd, &resp, "FO", &format!("Full freq band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "FO",
+            &format!("Full freq band {b}"),
+        );
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("FQ {b}")).await;
-        check(&mut results, &cmd, &resp, "FQ", &format!("Quick freq band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "FQ",
+            &format!("Quick freq band {b}"),
+        );
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("SM {b}")).await;
-        check(&mut results, &cmd, &resp, "SM", &format!("S-meter band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "SM",
+            &format!("S-meter band {b}"),
+        );
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("SQ {b}")).await;
-        check(&mut results, &cmd, &resp, "SQ", &format!("Squelch band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "SQ",
+            &format!("Squelch band {b}"),
+        );
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("MD {b}")).await;
         check(&mut results, &cmd, &resp, "MD", &format!("Mode band {b}"));
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("PC {b}")).await;
-        check(&mut results, &cmd, &resp, "PC", &format!("Power level band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "PC",
+            &format!("Power level band {b}"),
+        );
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("RA {b}")).await;
-        check(&mut results, &cmd, &resp, "RA", &format!("Attenuator band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "RA",
+            &format!("Attenuator band {b}"),
+        );
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("BY {b}")).await;
         check(&mut results, &cmd, &resp, "BY", &format!("Busy band {b}"));
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("VM {b}")).await;
-        check(&mut results, &cmd, &resp, "VM", &format!("VFO/Mem mode band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "VM",
+            &format!("VFO/Mem mode band {b}"),
+        );
     }
 
     // ===== FREQUENCY (band-indexed per D75 RE) =====
     for b in ["0", "1"] {
         let (cmd, resp) = raw_exchange(&mut transport, &format!("TN {b}")).await;
-        check(&mut results, &cmd, &resp, "TN", &format!("CTCSS tone band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "TN",
+            &format!("CTCSS tone band {b}"),
+        );
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("DC {b}")).await;
-        check(&mut results, &cmd, &resp, "DC", &format!("DCS code band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "DC",
+            &format!("DCS code band {b}"),
+        );
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("RT {b}")).await;
-        check(&mut results, &cmd, &resp, "RT", &format!("Repeater tone band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "RT",
+            &format!("Repeater tone band {b}"),
+        );
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("FS {b}")).await;
-        check(&mut results, &cmd, &resp, "FS", &format!("Freq step band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "FS",
+            &format!("Freq step band {b}"),
+        );
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("SF {b}")).await;
-        check(&mut results, &cmd, &resp, "SF", &format!("Scan range band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "SF",
+            &format!("Scan range band {b}"),
+        );
 
         let (cmd, resp) = raw_exchange(&mut transport, &format!("BS {b}")).await;
-        check(&mut results, &cmd, &resp, "BS", &format!("Band scope band {b}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "BS",
+            &format!("Band scope band {b}"),
+        );
     }
 
     // ===== BARE READS (D75 RE format) =====
@@ -234,7 +306,13 @@ async fn verify_all_cat_commands() {
 
     for slot in 1..=6u8 {
         let (cmd, resp) = raw_exchange(&mut transport, &format!("DC {slot}")).await;
-        check(&mut results, &cmd, &resp, "DC", &format!("D-STAR callsign slot {slot}"));
+        check(
+            &mut results,
+            &cmd,
+            &resp,
+            "DC",
+            &format!("D-STAR callsign slot {slot}"),
+        );
     }
 
     // ===== GPS =====

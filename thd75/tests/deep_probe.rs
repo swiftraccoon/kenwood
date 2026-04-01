@@ -105,11 +105,8 @@ async fn band_read(
 async fn deep_probe_all_reads() {
     let ports = SerialTransport::discover_usb().unwrap();
     assert!(!ports.is_empty(), "No TH-D75 found");
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    )
-    .unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     let mut output: Vec<String> = Vec::new();
     let mut alive = true;
@@ -149,7 +146,9 @@ async fn deep_probe_all_reads() {
     if alive {
         output.push("\n===== FREQUENCY (per band) =====".into());
         alive = band_read(&mut transport, "FO", &mut output).await;
-        if alive { alive = band_read(&mut transport, "FQ", &mut output).await; }
+        if alive {
+            alive = band_read(&mut transport, "FQ", &mut output).await;
+        }
     }
 
     // ================================================================
@@ -161,20 +160,37 @@ async fn deep_probe_all_reads() {
     if alive {
         output.push("\n===== VFO SETTINGS =====".into());
         alive = bare_read(&mut transport, "AG", &mut output).await;
-        if alive { alive = band_read(&mut transport, "SQ", &mut output).await; }
-        if alive { alive = band_read(&mut transport, "SM", &mut output).await; }
-        if alive { alive = band_read(&mut transport, "MD", &mut output).await; }
-        if alive { alive = band_read(&mut transport, "PC", &mut output).await; }
-        if alive { alive = band_read(&mut transport, "RA", &mut output).await; }
-        if alive { alive = bare_read(&mut transport, "FS", &mut output).await; }
-        if alive { alive = bare_read(&mut transport, "FT", &mut output).await; }
+        if alive {
+            alive = band_read(&mut transport, "SQ", &mut output).await;
+        }
+        if alive {
+            alive = band_read(&mut transport, "SM", &mut output).await;
+        }
+        if alive {
+            alive = band_read(&mut transport, "MD", &mut output).await;
+        }
+        if alive {
+            alive = band_read(&mut transport, "PC", &mut output).await;
+        }
+        if alive {
+            alive = band_read(&mut transport, "RA", &mut output).await;
+        }
+        if alive {
+            alive = bare_read(&mut transport, "FS", &mut output).await;
+        }
+        if alive {
+            alive = bare_read(&mut transport, "FT", &mut output).await;
+        }
         if alive {
             // SH mode indices 0, 1, 2
             for mode_idx in 0..=2u8 {
                 let cmd = format!("SH {mode_idx}");
                 let resp = raw_cmd(&mut transport, &cmd).await;
                 log(&mut output, &cmd, &resp);
-                if resp.is_none() { alive = false; break; }
+                if resp.is_none() {
+                    alive = false;
+                    break;
+                }
             }
         }
     }
@@ -185,12 +201,24 @@ async fn deep_probe_all_reads() {
     if alive {
         output.push("\n===== CONTROL SETTINGS =====".into());
         alive = bare_read(&mut transport, "DL", &mut output).await;
-        if alive { alive = bare_read(&mut transport, "LC", &mut output).await; }
-        if alive { alive = bare_read(&mut transport, "VX", &mut output).await; }
-        if alive { alive = bare_read(&mut transport, "VG", &mut output).await; }
-        if alive { alive = bare_read(&mut transport, "VD", &mut output).await; }
-        if alive { alive = band_read(&mut transport, "BY", &mut output).await; }
-        if alive { alive = band_read(&mut transport, "VM", &mut output).await; }
+        if alive {
+            alive = bare_read(&mut transport, "LC", &mut output).await;
+        }
+        if alive {
+            alive = bare_read(&mut transport, "VX", &mut output).await;
+        }
+        if alive {
+            alive = bare_read(&mut transport, "VG", &mut output).await;
+        }
+        if alive {
+            alive = bare_read(&mut transport, "VD", &mut output).await;
+        }
+        if alive {
+            alive = band_read(&mut transport, "BY", &mut output).await;
+        }
+        if alive {
+            alive = band_read(&mut transport, "VM", &mut output).await;
+        }
     }
 
     // ================================================================
@@ -199,7 +227,9 @@ async fn deep_probe_all_reads() {
     if alive {
         output.push("\n===== TONE SETTINGS =====".into());
         alive = bare_read(&mut transport, "TN", &mut output).await;
-        if alive { alive = bare_read(&mut transport, "RT", &mut output).await; }
+        if alive {
+            alive = bare_read(&mut transport, "RT", &mut output).await;
+        }
     }
 
     // ================================================================
@@ -214,13 +244,20 @@ async fn deep_probe_all_reads() {
                 let cmd = format!("DC {slot}");
                 let resp = raw_cmd(&mut transport, &cmd).await;
                 log(&mut output, &cmd, &resp);
-                if resp.is_none() { alive = false; break; }
+                if resp.is_none() {
+                    alive = false;
+                    break;
+                }
             }
         }
         // CS bare: active callsign slot number
         // NOTE: CS N (indexed) is a WRITE that selects the slot — do NOT send
-        if alive { alive = bare_read(&mut transport, "CS", &mut output).await; }
-        if alive { alive = bare_read(&mut transport, "GW", &mut output).await; }
+        if alive {
+            alive = bare_read(&mut transport, "CS", &mut output).await;
+        }
+        if alive {
+            alive = bare_read(&mut transport, "GW", &mut output).await;
+        }
     }
 
     // ================================================================
@@ -229,8 +266,12 @@ async fn deep_probe_all_reads() {
     if alive {
         output.push("\n===== GPS =====".into());
         alive = bare_read(&mut transport, "GP", &mut output).await;
-        if alive { alive = bare_read(&mut transport, "GM", &mut output).await; }
-        if alive { alive = bare_read(&mut transport, "GS", &mut output).await; }
+        if alive {
+            alive = bare_read(&mut transport, "GM", &mut output).await;
+        }
+        if alive {
+            alive = bare_read(&mut transport, "GS", &mut output).await;
+        }
     }
 
     // ================================================================
@@ -248,8 +289,12 @@ async fn deep_probe_all_reads() {
     if alive {
         output.push("\n===== APRS =====".into());
         alive = bare_read(&mut transport, "AS", &mut output).await;
-        if alive { alive = bare_read(&mut transport, "PT", &mut output).await; }
-        if alive { alive = bare_read(&mut transport, "MS", &mut output).await; }
+        if alive {
+            alive = bare_read(&mut transport, "PT", &mut output).await;
+        }
+        if alive {
+            alive = bare_read(&mut transport, "MS", &mut output).await;
+        }
     }
 
     // ================================================================
@@ -266,7 +311,9 @@ async fn deep_probe_all_reads() {
     if alive {
         output.push("\n===== SCAN =====".into());
         alive = band_read(&mut transport, "SF", &mut output).await;
-        if alive { alive = band_read(&mut transport, "BS", &mut output).await; }
+        if alive {
+            alive = band_read(&mut transport, "BS", &mut output).await;
+        }
     }
 
     // ================================================================

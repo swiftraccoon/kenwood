@@ -71,11 +71,7 @@ impl ChannelName {
     /// that point. If no null byte is found, takes up to 8 characters.
     #[must_use]
     pub fn from_bytes(bytes: &[u8; 24]) -> Self {
-        let end = bytes
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(8)
-            .min(8);
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(8).min(8);
         let s = String::from_utf8_lossy(&bytes[..end]);
         Self(s.into_owned())
     }
@@ -206,84 +202,68 @@ impl ChannelMemory {
             });
         }
 
-        let rx_frequency =
-            Frequency::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let tx_offset =
-            Frequency::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let rx_frequency = Frequency::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let tx_offset = Frequency::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
 
-        let step_size = StepSize::try_from(bytes[0x08] >> 4).map_err(|e| {
-            ProtocolError::FieldParse {
+        let step_size =
+            StepSize::try_from(bytes[0x08] >> 4).map_err(|e| ProtocolError::FieldParse {
                 command: "channel".into(),
                 field: "step_size".into(),
                 detail: e.to_string(),
+            })?;
+
+        let shift = ShiftDirection::try_from(bytes[0x08] & 0x0F).map_err(|e| {
+            ProtocolError::FieldParse {
+                command: "channel".into(),
+                field: "shift".into(),
+                detail: e.to_string(),
             }
         })?;
-
-        let shift =
-            ShiftDirection::try_from(bytes[0x08] & 0x0F).map_err(|e| {
-                ProtocolError::FieldParse {
-                    command: "channel".into(),
-                    field: "shift".into(),
-                    detail: e.to_string(),
-                }
-            })?;
 
         let reverse = (bytes[0x09] >> 4) & 1 != 0;
         let tone_enable = (bytes[0x09] >> 2) & 1 != 0;
 
         let ctcss_mode =
-            CtcssMode::try_from(bytes[0x09] & 0x03).map_err(|e| {
-                ProtocolError::FieldParse {
-                    command: "channel".into(),
-                    field: "ctcss_mode".into(),
-                    detail: e.to_string(),
-                }
+            CtcssMode::try_from(bytes[0x09] & 0x03).map_err(|e| ProtocolError::FieldParse {
+                command: "channel".into(),
+                field: "ctcss_mode".into(),
+                detail: e.to_string(),
             })?;
 
         let dcs_enable = (bytes[0x0A] >> 7) & 1 != 0;
         let cross_tone_reverse = (bytes[0x0A] >> 6) & 1 != 0;
         let flags_0a_raw = bytes[0x0A] & 0x3F;
 
-        let tone_code = ToneCode::new(bytes[0x0B]).map_err(|e| {
-            ProtocolError::FieldParse {
-                command: "channel".into(),
-                field: "tone_code".into(),
-                detail: e.to_string(),
-            }
+        let tone_code = ToneCode::new(bytes[0x0B]).map_err(|e| ProtocolError::FieldParse {
+            command: "channel".into(),
+            field: "tone_code".into(),
+            detail: e.to_string(),
         })?;
 
-        let ctcss_code = ToneCode::new(bytes[0x0C]).map_err(|e| {
-            ProtocolError::FieldParse {
-                command: "channel".into(),
-                field: "ctcss_code".into(),
-                detail: e.to_string(),
-            }
+        let ctcss_code = ToneCode::new(bytes[0x0C]).map_err(|e| ProtocolError::FieldParse {
+            command: "channel".into(),
+            field: "ctcss_code".into(),
+            detail: e.to_string(),
         })?;
 
-        let dcs_code = DcsCode::new(bytes[0x0D]).map_err(|e| {
-            ProtocolError::FieldParse {
-                command: "channel".into(),
-                field: "dcs_code".into(),
-                detail: e.to_string(),
-            }
+        let dcs_code = DcsCode::new(bytes[0x0D]).map_err(|e| ProtocolError::FieldParse {
+            command: "channel".into(),
+            field: "dcs_code".into(),
+            detail: e.to_string(),
         })?;
 
         let data_speed =
-            DataSpeed::try_from(bytes[0x0E] >> 4).map_err(|e| {
-                ProtocolError::FieldParse {
-                    command: "channel".into(),
-                    field: "data_speed".into(),
-                    detail: e.to_string(),
-                }
+            DataSpeed::try_from(bytes[0x0E] >> 4).map_err(|e| ProtocolError::FieldParse {
+                command: "channel".into(),
+                field: "data_speed".into(),
+                detail: e.to_string(),
             })?;
 
         let lockout =
-            LockoutMode::try_from(bytes[0x0E] & 0x03).map_err(|e| {
-                ProtocolError::FieldParse {
-                    command: "channel".into(),
-                    field: "lockout".into(),
-                    detail: e.to_string(),
-                }
+            LockoutMode::try_from(bytes[0x0E] & 0x03).map_err(|e| ProtocolError::FieldParse {
+                command: "channel".into(),
+                field: "lockout".into(),
+                detail: e.to_string(),
             })?;
 
         let mut urcall_arr = [0u8; 24];
@@ -575,40 +555,35 @@ impl FlashChannel {
             });
         }
 
-        let rx_frequency =
-            Frequency::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let tx_offset =
-            Frequency::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let rx_frequency = Frequency::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let tx_offset = Frequency::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
 
         // Byte 0x08: step_size [7:4] | low nibble [3:0]
-        let step_size = StepSize::try_from(bytes[0x08] >> 4).map_err(|e| {
-            ProtocolError::FieldParse {
+        let step_size =
+            StepSize::try_from(bytes[0x08] >> 4).map_err(|e| ProtocolError::FieldParse {
                 command: "flash_channel".into(),
                 field: "step_size".into(),
                 detail: e.to_string(),
-            }
-        })?;
+            })?;
         let byte08_low = bytes[0x08] & 0x0F;
 
         // Byte 0x09: unknown[7] | mode[6:4] | narrow[3] | fine_mode[2] | fine_step[1:0]
         let byte09 = bytes[0x09];
         let byte09_bit7 = (byte09 >> 7) & 1 != 0;
-        let mode = MemoryMode::try_from((byte09 >> 4) & 0x07).map_err(|e| {
-            ProtocolError::FieldParse {
+        let mode =
+            MemoryMode::try_from((byte09 >> 4) & 0x07).map_err(|e| ProtocolError::FieldParse {
                 command: "flash_channel".into(),
                 field: "mode".into(),
                 detail: e.to_string(),
-            }
-        })?;
+            })?;
         let narrow = (byte09 >> 3) & 1 != 0;
         let fine_mode = (byte09 >> 2) & 1 != 0;
-        let fine_step = FineStep::try_from(byte09 & 0x03).map_err(|e| {
-            ProtocolError::FieldParse {
+        let fine_step =
+            FineStep::try_from(byte09 & 0x03).map_err(|e| ProtocolError::FieldParse {
                 command: "flash_channel".into(),
                 field: "fine_step".into(),
                 detail: e.to_string(),
-            }
-        })?;
+            })?;
 
         // Byte 0x0A: tone[7] | ctcss[6] | dtcs[5] | cross[4] | unk[3] | split[2] | duplex[1:0]
         let byte0a = bytes[0x0A];
@@ -618,62 +593,54 @@ impl FlashChannel {
         let cross_tone = (byte0a >> 4) & 1 != 0;
         let byte0a_bit3 = (byte0a >> 3) & 1 != 0;
         let split = (byte0a >> 2) & 1 != 0;
-        let duplex = FlashDuplex::try_from(byte0a & 0x03).map_err(|e| {
-            ProtocolError::FieldParse {
+        let duplex =
+            FlashDuplex::try_from(byte0a & 0x03).map_err(|e| ProtocolError::FieldParse {
                 command: "flash_channel".into(),
                 field: "duplex".into(),
                 detail: e.to_string(),
-            }
-        })?;
+            })?;
 
         // Byte 0x0B: CTCSS TX tone index
-        let tone_code = ToneCode::new(bytes[0x0B]).map_err(|e| {
-            ProtocolError::FieldParse {
-                command: "flash_channel".into(),
-                field: "tone_code".into(),
-                detail: e.to_string(),
-            }
+        let tone_code = ToneCode::new(bytes[0x0B]).map_err(|e| ProtocolError::FieldParse {
+            command: "flash_channel".into(),
+            field: "tone_code".into(),
+            detail: e.to_string(),
         })?;
 
         // Byte 0x0C: unknown[7:6] | CTCSS RX index[5:0]
         let byte0c_high = (bytes[0x0C] >> 6) & 0x03;
-        let ctcss_code = ToneCode::new(bytes[0x0C] & 0x3F).map_err(|e| {
-            ProtocolError::FieldParse {
+        let ctcss_code =
+            ToneCode::new(bytes[0x0C] & 0x3F).map_err(|e| ProtocolError::FieldParse {
                 command: "flash_channel".into(),
                 field: "ctcss_code".into(),
                 detail: e.to_string(),
-            }
-        })?;
+            })?;
 
         // Byte 0x0D: unknown[7] | DCS code[6:0]
         let byte0d_bit7 = (bytes[0x0D] >> 7) & 1 != 0;
-        let dcs_code = DcsCode::new(bytes[0x0D] & 0x7F).map_err(|e| {
-            ProtocolError::FieldParse {
-                command: "flash_channel".into(),
-                field: "dcs_code".into(),
-                detail: e.to_string(),
-            }
+        let dcs_code = DcsCode::new(bytes[0x0D] & 0x7F).map_err(|e| ProtocolError::FieldParse {
+            command: "flash_channel".into(),
+            field: "dcs_code".into(),
+            detail: e.to_string(),
         })?;
 
         // Byte 0x0E: reserved[7:6] | cross_type[5:4] | reserved[3:2] | digital_squelch[1:0]
         let byte0e = bytes[0x0E];
         let byte0e_reserved = (byte0e & 0xC0) | (byte0e & 0x0C);
-        let cross_tone_type =
-            CrossToneType::try_from((byte0e >> 4) & 0x03).map_err(|e| {
-                ProtocolError::FieldParse {
-                    command: "flash_channel".into(),
-                    field: "cross_tone_type".into(),
-                    detail: e.to_string(),
-                }
-            })?;
-        let digital_squelch =
-            FlashDigitalSquelch::try_from(byte0e & 0x03).map_err(|e| {
-                ProtocolError::FieldParse {
-                    command: "flash_channel".into(),
-                    field: "digital_squelch".into(),
-                    detail: e.to_string(),
-                }
-            })?;
+        let cross_tone_type = CrossToneType::try_from((byte0e >> 4) & 0x03).map_err(|e| {
+            ProtocolError::FieldParse {
+                command: "flash_channel".into(),
+                field: "cross_tone_type".into(),
+                detail: e.to_string(),
+            }
+        })?;
+        let digital_squelch = FlashDigitalSquelch::try_from(byte0e & 0x03).map_err(|e| {
+            ProtocolError::FieldParse {
+                command: "flash_channel".into(),
+                field: "digital_squelch".into(),
+                detail: e.to_string(),
+            }
+        })?;
 
         // Bytes 0x0F-0x16: UR callsign (8 bytes)
         let mut ur_arr = [0u8; 8];
@@ -881,7 +848,10 @@ mod tests {
     #[test]
     fn channel_name_too_long() {
         let err = ChannelName::new("123456789").unwrap_err();
-        assert!(matches!(err, ValidationError::ChannelNameTooLong { len: 9 }));
+        assert!(matches!(
+            err,
+            ValidationError::ChannelNameTooLong { len: 9 }
+        ));
     }
 
     #[test]
@@ -1068,9 +1038,9 @@ mod tests {
     #[test]
     fn flash_channel_byte09_packing() {
         let ch = FlashChannel {
-            mode: MemoryMode::Am, // 2 -> bits [6:4] = 0b010
-            narrow: true,         // bit 3
-            fine_mode: true,      // bit 2
+            mode: MemoryMode::Am,        // 2 -> bits [6:4] = 0b010
+            narrow: true,                // bit 3
+            fine_mode: true,             // bit 2
             fine_step: FineStep::Hz1000, // bits [1:0] = 3
             byte09_bit7: false,
             ..FlashChannel::default()
@@ -1088,12 +1058,12 @@ mod tests {
     #[test]
     fn flash_channel_byte0a_tone_duplex() {
         let ch = FlashChannel {
-            tone_enabled: true,   // bit 7
-            ctcss_enabled: false, // bit 6
-            dtcs_enabled: true,   // bit 5
-            cross_tone: false,    // bit 4
-            byte0a_bit3: false,   // bit 3
-            split: true,          // bit 2
+            tone_enabled: true,         // bit 7
+            ctcss_enabled: false,       // bit 6
+            dtcs_enabled: true,         // bit 5
+            cross_tone: false,          // bit 4
+            byte0a_bit3: false,         // bit 3
+            split: true,                // bit 2
             duplex: FlashDuplex::Minus, // bits [1:0] = 2
             ..FlashChannel::default()
         };

@@ -40,12 +40,12 @@ async fn probe_bl_formats() {
 
     // Try various write formats
     for cmd in [
-        b"BL 5\r".as_slice(),     // 5 bytes - simple value
-        b"BL 0,5\r".as_slice(),   // 7 bytes - band,value
-        b"BL 1,5\r".as_slice(),   // 7 bytes - different first param
-        b"BL 05\r".as_slice(),    // 6 bytes - zero-padded
+        b"BL 5\r".as_slice(),   // 5 bytes - simple value
+        b"BL 0,5\r".as_slice(), // 7 bytes - band,value
+        b"BL 1,5\r".as_slice(), // 7 bytes - different first param
+        b"BL 05\r".as_slice(),  // 6 bytes - zero-padded
     ] {
-        let cmd_str = String::from_utf8_lossy(&cmd[..cmd.len()-1]);
+        let cmd_str = String::from_utf8_lossy(&cmd[..cmd.len() - 1]);
         let r = raw(&mut t, cmd).await;
         println!("  {:<15} {:?}", cmd_str, r);
     }

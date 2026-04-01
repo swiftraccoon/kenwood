@@ -17,25 +17,25 @@ async fn raw_cmd(transport: &mut SerialTransport, cmd: &str) -> Option<Vec<u8>> 
                 return frame;
             }
         }
-    }).await.ok()
+    })
+    .await
+    .ok()
 }
 
 #[tokio::test]
 #[ignore]
 async fn probe_mr_formats() {
     let ports = SerialTransport::discover_usb().unwrap();
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    ).unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     println!("\n=== MR COMMAND FORMAT PROBING ===\n");
 
     // Try various MR formats for channel 018 (ForestCityPD)
     let formats = [
-        "MR 0,018",      // band 0, channel 018
-        "MR 0,18",       // band 0, channel 18 (no leading zero)
-        "MR 1,018",      // band 1, channel 018
+        "MR 0,018", // band 0, channel 018
+        "MR 0,18",  // band 0, channel 18 (no leading zero)
+        "MR 1,018", // band 1, channel 018
     ];
 
     for fmt in &formats {

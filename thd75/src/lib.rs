@@ -53,6 +53,6 @@ pub mod types;
 
 // Convenience re-exports for the most commonly used types.
 pub use error::Error;
-pub use radio::programming::McpSpeed;
 pub use radio::Radio;
+pub use radio::programming::McpSpeed;
 pub use transport::{MockTransport, SerialTransport, Transport};

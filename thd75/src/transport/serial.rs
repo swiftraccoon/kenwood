@@ -55,11 +55,10 @@ impl SerialTransport {
     /// a [`TransportError::Open`] if port enumeration fails.
     pub fn discover_usb() -> Result<Vec<tokio_serial::SerialPortInfo>, TransportError> {
         tracing::debug!(vid = %format_args!("0x{:04X}", Self::USB_VID), pid = %format_args!("0x{:04X}", Self::USB_PID), "scanning for TH-D75 USB devices");
-        let ports =
-            tokio_serial::available_ports().map_err(|e| TransportError::Open {
-                path: "<enumeration>".to_owned(),
-                source: e.into(),
-            })?;
+        let ports = tokio_serial::available_ports().map_err(|e| TransportError::Open {
+            path: "<enumeration>".to_owned(),
+            source: e.into(),
+        })?;
 
         let matching: Vec<_> = ports
             .into_iter()
@@ -80,10 +79,12 @@ impl SerialTransport {
 impl Transport for SerialTransport {
     fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
         tracing::info!(baud, "changing serial baud rate");
-        self.port.set_baud_rate(baud).map_err(|e| TransportError::Open {
-            path: String::new(),
-            source: std::io::Error::other(e.to_string()),
-        })
+        self.port
+            .set_baud_rate(baud)
+            .map_err(|e| TransportError::Open {
+                path: String::new(),
+                source: std::io::Error::other(e.to_string()),
+            })
     }
 
     async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {

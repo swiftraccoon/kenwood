@@ -152,9 +152,7 @@ impl DstarCallsign {
     /// Decodes a D-STAR callsign from an 8-byte space-padded array.
     #[must_use]
     pub fn from_wire_bytes(bytes: &[u8; 8]) -> Self {
-        let s = std::str::from_utf8(bytes)
-            .unwrap_or("")
-            .trim_end();
+        let s = std::str::from_utf8(bytes).unwrap_or("").trim_end();
         Self(s.to_owned())
     }
 

@@ -96,11 +96,7 @@ impl<T: Transport> Radio<T> {
     /// After returning, the USB connection will have been reset by the
     /// radio. The `Radio` instance should be dropped and a fresh
     /// connection established.
-    pub async fn find_channel_by_name(
-        &mut self,
-        band: Band,
-        name: &str,
-    ) -> Result<u16, Error> {
+    pub async fn find_channel_by_name(&mut self, band: Band, name: &str) -> Result<u16, Error> {
         tracing::info!(?band, name, "searching for channel by name");
 
         // Read all channel names via programming mode.

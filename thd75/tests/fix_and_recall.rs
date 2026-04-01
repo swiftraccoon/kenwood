@@ -1,7 +1,7 @@
 //! Fix channel 2 name and recall RutherfordtonPD.
 //! Run: cargo test --test fix_and_recall -- --ignored --nocapture --test-threads=1
 
-use kenwood_thd75::protocol::{self, programming, Command};
+use kenwood_thd75::protocol::{self, Command, programming};
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::Band;
@@ -54,7 +54,10 @@ async fn fix_channel_2_name_and_recall_rutherfordton() {
 
     let mut target_ch: Option<u16> = None;
     for (i, name) in names.iter().enumerate() {
-        if name.contains("Rutherfdtn") || name.contains("RutherfordtonPD") || name.contains("Rutherford") {
+        if name.contains("Rutherfdtn")
+            || name.contains("RutherfordtonPD")
+            || name.contains("Rutherford")
+        {
             println!("  Found: CH {:03} = {name}", i);
             if target_ch.is_none() {
                 target_ch = Some(i as u16);
@@ -63,7 +66,10 @@ async fn fix_channel_2_name_and_recall_rutherfordton() {
     }
 
     let ch = target_ch.expect("RutherfordtonPD not found in channel names");
-    println!("\n=== Step 2: Recalling channel {:03} (RutherfordtonPD) on Band A ===", ch);
+    println!(
+        "\n=== Step 2: Recalling channel {:03} (RutherfordtonPD) on Band A ===",
+        ch
+    );
 
     // Step 3: Recall the channel using MR command
     // Need to reconnect since read_channel_names drops connection

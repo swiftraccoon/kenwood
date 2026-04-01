@@ -105,10 +105,7 @@ impl fmt::Display for SdCardError {
             }
             Self::MissingBom => write!(f, "UTF-16LE file missing byte order mark (BOM)"),
             Self::InvalidUtf16Length { len } => {
-                write!(
-                    f,
-                    "UTF-16LE file has odd byte count ({len}), expected even"
-                )
+                write!(f, "UTF-16LE file has odd byte count ({len}), expected even")
             }
             Self::Utf16Decode { detail } => {
                 write!(f, "UTF-16 decode error: {detail}")
@@ -118,10 +115,7 @@ impl fmt::Display for SdCardError {
                 expected,
                 actual,
             } => {
-                write!(
-                    f,
-                    "line {line}: expected {expected} columns, got {actual}"
-                )
+                write!(f, "line {line}: expected {expected} columns, got {actual}")
             }
             Self::InvalidField {
                 line,

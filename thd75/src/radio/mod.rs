@@ -23,7 +23,7 @@ pub mod tuning;
 use std::time::Duration;
 
 use crate::error::{Error, ProtocolError};
-use crate::protocol::{self, command_name, Codec, Command, Response};
+use crate::protocol::{self, Codec, Command, Response, command_name};
 use crate::transport::Transport;
 use crate::types::Band;
 
@@ -226,7 +226,10 @@ impl<T: Transport> Radio<T> {
         let wire = protocol::serialize(&cmd);
 
         // 2. Write to transport.
-        self.transport.write(&wire).await.map_err(Error::Transport)?;
+        self.transport
+            .write(&wire)
+            .await
+            .map_err(Error::Transport)?;
 
         // 3. Read response bytes (loop until codec has a complete frame),
         //    wrapped in a timeout.
@@ -305,9 +308,9 @@ impl<T: Transport> Radio<T> {
             Command::SetFrequency { band, .. } | Command::SetFrequencyFull { band, .. } => {
                 match self.get_cached_mode(*band) {
                     Some(RadioMode::Vfo) | None => None,
-                    Some(_) => Some(
-                        "SetFrequency requires VFO mode \u{2014} use tune_frequency() instead",
-                    ),
+                    Some(_) => {
+                        Some("SetFrequency requires VFO mode \u{2014} use tune_frequency() instead")
+                    }
                 }
             }
             Command::RecallMemoryChannel { band, .. } => match self.get_cached_mode(*band) {
@@ -431,7 +434,9 @@ mod tests {
         let _rx1 = radio.subscribe();
         let _rx2 = radio.subscribe();
         // Sending to the broadcast channel should succeed with 2 receivers
-        let sent = radio.notifications.send(Response::AutoInfo { enabled: true });
+        let sent = radio
+            .notifications
+            .send(Response::AutoInfo { enabled: true });
         assert!(sent.is_ok());
         assert_eq!(sent.unwrap(), 2);
     }

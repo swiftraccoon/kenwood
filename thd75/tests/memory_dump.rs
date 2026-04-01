@@ -21,12 +21,12 @@ use kenwood_thd75::transport::SerialTransport;
 /// Connect to the first discovered TH-D75 via USB.
 async fn connect() -> Radio<SerialTransport> {
     let ports = SerialTransport::discover_usb().expect("USB discovery failed");
-    assert!(!ports.is_empty(), "No TH-D75 found -- connect radio via USB");
-    let transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    )
-    .expect("Failed to open serial port");
+    assert!(
+        !ports.is_empty(),
+        "No TH-D75 found -- connect radio via USB"
+    );
+    let transport = SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD)
+        .expect("Failed to open serial port");
     Radio::connect(transport).await.expect("Failed to connect")
 }
 

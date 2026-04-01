@@ -22,9 +22,8 @@ use kenwood_thd75::types::*;
 async fn connect() -> Radio<SerialTransport> {
     let ports = SerialTransport::discover_usb().expect("USB discovery failed");
     assert!(!ports.is_empty(), "No TH-D75 found");
-    let transport =
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD)
-            .expect("Failed to open port");
+    let transport = SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD)
+        .expect("Failed to open port");
     Radio::connect(transport).await.expect("Failed to connect")
 }
 
@@ -352,10 +351,12 @@ async fn write_fo_full_channel() {
 
     // Read current full state
     let original = radio.get_frequency_full(Band::A).await.unwrap();
-    println!("  Original: freq={} step={:?} name={:?}",
+    println!(
+        "  Original: freq={} step={:?} name={:?}",
         original.rx_frequency.as_hz(),
         original.step_size,
-        original.urcall.as_str());
+        original.urcall.as_str()
+    );
 
     // Create modified copy — change step size (harmless)
     let mut modified = original.clone();
@@ -368,24 +369,34 @@ async fn write_fo_full_channel() {
 
     // Read back and verify the change
     let readback = radio.get_frequency_full(Band::A).await.unwrap();
-    println!("  Readback: freq={} step={:?} name={:?}",
+    println!(
+        "  Readback: freq={} step={:?} name={:?}",
         readback.rx_frequency.as_hz(),
         readback.step_size,
-        readback.urcall.as_str());
-    assert_eq!(readback.step_size, modified.step_size,
-        "FO step size write did not take effect");
+        readback.urcall.as_str()
+    );
+    assert_eq!(
+        readback.step_size, modified.step_size,
+        "FO step size write did not take effect"
+    );
     // Verify other fields weren't clobbered
-    assert_eq!(readback.rx_frequency, original.rx_frequency,
-        "FO write clobbered rx_frequency");
-    assert_eq!(readback.tx_offset, original.tx_offset,
-        "FO write clobbered tx_offset");
+    assert_eq!(
+        readback.rx_frequency, original.rx_frequency,
+        "FO write clobbered rx_frequency"
+    );
+    assert_eq!(
+        readback.tx_offset, original.tx_offset,
+        "FO write clobbered tx_offset"
+    );
 
     // Restore original
     radio.set_frequency_full(Band::A, &original).await.unwrap();
     let restored = radio.get_frequency_full(Band::A).await.unwrap();
     println!("  Restored: step={:?}", restored.step_size);
-    assert_eq!(restored.step_size, original.step_size,
-        "Failed to restore original step size");
+    assert_eq!(
+        restored.step_size, original.step_size,
+        "Failed to restore original step size"
+    );
 
     let _ = radio.disconnect().await;
     println!("  PASS");
@@ -406,9 +417,11 @@ async fn write_memory_channel() {
 
     // Read channel 099 current state (may be empty/default)
     let original = radio.read_channel(99).await.unwrap();
-    println!("  Original ch099: freq={} name={:?}",
+    println!(
+        "  Original ch099: freq={} name={:?}",
         original.rx_frequency.as_hz(),
-        original.urcall.as_str());
+        original.urcall.as_str()
+    );
 
     // Write a known test pattern
     let mut test_channel = original.clone();
@@ -418,27 +431,34 @@ async fn write_memory_channel() {
     test_channel.step_size = StepSize::Hz5000;
     test_channel.urcall = ChannelName::new("TEST99").unwrap();
 
-    println!("  Writing ch099: freq={} name={:?}",
+    println!(
+        "  Writing ch099: freq={} name={:?}",
         test_channel.rx_frequency.as_hz(),
-        test_channel.urcall.as_str());
+        test_channel.urcall.as_str()
+    );
     radio.write_channel(99, &test_channel).await.unwrap();
 
     // Read back and verify
     let readback = radio.read_channel(99).await.unwrap();
-    println!("  Readback ch099: freq={} name={:?}",
+    println!(
+        "  Readback ch099: freq={} name={:?}",
         readback.rx_frequency.as_hz(),
-        readback.urcall.as_str());
-    assert_eq!(readback.rx_frequency, test_channel.rx_frequency,
-        "ME frequency write failed");
-    assert_eq!(readback.urcall.as_str(), "TEST99",
-        "ME urcall write failed");
+        readback.urcall.as_str()
+    );
+    assert_eq!(
+        readback.rx_frequency, test_channel.rx_frequency,
+        "ME frequency write failed"
+    );
+    assert_eq!(readback.urcall.as_str(), "TEST99", "ME urcall write failed");
 
     // Restore original
     radio.write_channel(99, &original).await.unwrap();
     let restored = radio.read_channel(99).await.unwrap();
-    println!("  Restored ch099: freq={} name={:?}",
+    println!(
+        "  Restored ch099: freq={} name={:?}",
         restored.rx_frequency.as_hz(),
-        restored.urcall.as_str());
+        restored.urcall.as_str()
+    );
 
     let _ = radio.disconnect().await;
     println!("  PASS");
@@ -495,7 +515,12 @@ async fn investigate_mr_command() {
 
     // MR with channel 0
     println!("  Trying MR 000...");
-    let result = radio.execute(Command::RecallMemoryChannel { band: Band::A, channel: 0 }).await;
+    let result = radio
+        .execute(Command::RecallMemoryChannel {
+            band: Band::A,
+            channel: 0,
+        })
+        .await;
     match &result {
         Ok(resp) => println!("  MR 000 OK: {resp:?}"),
         Err(e) => println!("  MR 000 fails: {e}"),

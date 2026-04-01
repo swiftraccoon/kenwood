@@ -6,8 +6,8 @@
 use proptest::prelude::*;
 
 use kenwood_thd75::protocol::{self, Command, Response};
-use kenwood_thd75::types::*;
 use kenwood_thd75::types::tone::{CtcssMode, DataSpeed, DcsCode, LockoutMode, ToneCode};
+use kenwood_thd75::types::*;
 
 // ============================================================================
 // Arbitrary strategies
@@ -20,29 +20,31 @@ fn arb_band() -> impl Strategy<Value = Band> {
 fn arb_channel_memory() -> impl Strategy<Value = ChannelMemory> {
     // Split into two sub-tuples to stay within proptest's 12-element limit.
     let part_a = (
-        any::<u32>(),   // rx_frequency
-        any::<u32>(),   // tx_offset
-        (0u8..12),      // step_size
-        (0u8..4),       // shift
-        any::<bool>(),  // reverse
-        any::<bool>(),  // tone_enable
-        (0u8..3),       // ctcss_mode
-        any::<bool>(),  // dcs_enable
-        any::<bool>(),  // cross_tone_reverse
-        (0u8..64),      // flags_0a_raw (6 bits)
+        any::<u32>(),  // rx_frequency
+        any::<u32>(),  // tx_offset
+        (0u8..12),     // step_size
+        (0u8..4),      // shift
+        any::<bool>(), // reverse
+        any::<bool>(), // tone_enable
+        (0u8..3),      // ctcss_mode
+        any::<bool>(), // dcs_enable
+        any::<bool>(), // cross_tone_reverse
+        (0u8..64),     // flags_0a_raw (6 bits)
     );
     let part_b = (
-        (0u8..50),         // tone_code
-        (0u8..50),         // ctcss_code
-        (0u8..104),        // dcs_code
-        (0u8..2),          // data_speed
-        (0u8..3),          // lockout
-        "[A-Z0-9]{0,8}",  // urcall (alphanumeric only for wire safety)
-        any::<u8>(),       // data_mode
+        (0u8..50),       // tone_code
+        (0u8..50),       // ctcss_code
+        (0u8..104),      // dcs_code
+        (0u8..2),        // data_speed
+        (0u8..3),        // lockout
+        "[A-Z0-9]{0,8}", // urcall (alphanumeric only for wire safety)
+        any::<u8>(),     // data_mode
     );
     (part_a, part_b).prop_map(
-        |((rx, tx, step, shift, rev, tone, ctcss_m, dcs, xrev, flags),
-          (tc, cc, dc, ds, lo, urcall, dm))| {
+        |(
+            (rx, tx, step, shift, rev, tone, ctcss_m, dcs, xrev, flags),
+            (tc, cc, dc, ds, lo, urcall, dm),
+        )| {
             ChannelMemory {
                 rx_frequency: Frequency::new(rx),
                 tx_offset: Frequency::new(tx),

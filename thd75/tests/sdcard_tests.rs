@@ -1,17 +1,17 @@
 //! Integration tests for SD card file format parsers.
 
+use kenwood_thd75::sdcard::SdCardError;
 use kenwood_thd75::sdcard::callsign_list::{
-    parse_callsign_list, write_callsign_list, CallsignEntry,
+    CallsignEntry, parse_callsign_list, write_callsign_list,
 };
 use kenwood_thd75::sdcard::config::{
-    empty_channel, make_channel, make_header, parse_config, write_config, RadioConfig,
-    HEADER_SIZE, MAX_CHANNELS,
+    HEADER_SIZE, MAX_CHANNELS, RadioConfig, empty_channel, make_channel, make_header, parse_config,
+    write_config,
 };
-use kenwood_thd75::sdcard::qso_log::{parse_qso_log, write_qso_log, QsoEntry};
+use kenwood_thd75::sdcard::qso_log::{QsoEntry, parse_qso_log, write_qso_log};
 use kenwood_thd75::sdcard::repeater_list::{
-    parse_repeater_list, write_repeater_list, RepeaterEntry,
+    RepeaterEntry, parse_repeater_list, write_repeater_list,
 };
-use kenwood_thd75::sdcard::SdCardError;
 use kenwood_thd75::types::channel::FlashChannel;
 use kenwood_thd75::types::frequency::Frequency;
 
@@ -130,10 +130,7 @@ fn d75_write_roundtrip() {
     assert_eq!(parsed.header.model, "Data For TH-D75A");
     assert!(parsed.channels[0].used);
     assert_eq!(parsed.channels[0].name, "2M CALL");
-    assert_eq!(
-        parsed.channels[0].flash.rx_frequency.as_hz(),
-        145_000_000
-    );
+    assert_eq!(parsed.channels[0].flash.rx_frequency.as_hz(), 145_000_000);
     assert!(parsed.channels[0].lockout);
 
     // Channel 1 should remain unused
@@ -249,30 +246,30 @@ fn callsign_list_write_roundtrip() {
 /// Builds a synthetic QSO log entry line with 24 tab-separated columns.
 fn make_qso_line() -> String {
     [
-        "TX",                 // TX/RX
-        "2026/03/28 14:30",   // Date
-        "145.000.000",        // Frequency
-        "DV",                 // Mode
-        "35.5951N",           // My Latitude
-        "082.5515W",          // My Longitude
-        "648m",               // My Altitude
-        "High",               // RF Power
-        "S9",                 // S Meter
-        "W4CDR",              // Caller
-        "",                   // Memo
-        "CQCQCQ",            // Called
-        "W4MOE  B",           // RPT1
-        "W4MOE  G",           // RPT2
-        "Hello",              // Message
-        "",                   // Repeater Control
-        "",                   // BK
-        "",                   // EMR
-        "",                   // Fast Data
-        "35.5950N",           // Latitude
-        "082.5514W",          // Longitude
-        "650m",               // Altitude
-        "270",                // Course
-        "0",                  // Speed
+        "TX",               // TX/RX
+        "2026/03/28 14:30", // Date
+        "145.000.000",      // Frequency
+        "DV",               // Mode
+        "35.5951N",         // My Latitude
+        "082.5515W",        // My Longitude
+        "648m",             // My Altitude
+        "High",             // RF Power
+        "S9",               // S Meter
+        "W4CDR",            // Caller
+        "",                 // Memo
+        "CQCQCQ",           // Called
+        "W4MOE  B",         // RPT1
+        "W4MOE  G",         // RPT2
+        "Hello",            // Message
+        "",                 // Repeater Control
+        "",                 // BK
+        "",                 // EMR
+        "",                 // Fast Data
+        "35.5950N",         // Latitude
+        "082.5514W",        // Longitude
+        "650m",             // Altitude
+        "270",              // Course
+        "0",                // Speed
     ]
     .join("\t")
 }

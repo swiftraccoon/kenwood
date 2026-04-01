@@ -150,7 +150,8 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if entry, any page write, or exit fails.
     /// Programming mode is always exited, even on error.
     pub async fn write_memory_image(&mut self, image: &[u8]) -> Result<(), Error> {
-        self.write_memory_image_with_progress(image, |_, _| {}).await
+        self.write_memory_image_with_progress(image, |_, _| {})
+            .await
     }
 
     /// Write a complete memory image with a progress callback.
@@ -186,7 +187,11 @@ impl<T: Transport> Radio<T> {
         // Write all pages except factory calibration (last 2).
         let writable_pages = programming::TOTAL_PAGES - programming::FACTORY_CAL_PAGES;
         let result = self
-            .write_pages_raw(0, &image[..writable_pages as usize * programming::PAGE_SIZE], &mut on_progress)
+            .write_pages_raw(
+                0,
+                &image[..writable_pages as usize * programming::PAGE_SIZE],
+                &mut on_progress,
+            )
             .await;
 
         let exit_result = self.exit_programming_mode().await;
@@ -218,9 +223,7 @@ impl<T: Transport> Radio<T> {
     ) -> Result<Vec<u8>, Error> {
         self.enter_programming_mode().await?;
 
-        let result = self
-            .read_pages_raw(start_page, count, &mut |_, _| {})
-            .await;
+        let result = self.read_pages_raw(start_page, count, &mut |_, _| {}).await;
 
         let exit_result = self.exit_programming_mode().await;
 
@@ -242,11 +245,7 @@ impl<T: Transport> Radio<T> {
     /// within the factory calibration region.
     /// Returns an error if entry, any page write, or exit fails.
     /// Programming mode is always exited, even on error.
-    pub async fn write_memory_pages(
-        &mut self,
-        start_page: u16,
-        data: &[u8],
-    ) -> Result<(), Error> {
+    pub async fn write_memory_pages(&mut self, start_page: u16, data: &[u8]) -> Result<(), Error> {
         let page_count = data.len() / programming::PAGE_SIZE;
         // Validate no factory calibration pages are in range.
         for i in 0..page_count {
@@ -262,9 +261,7 @@ impl<T: Transport> Radio<T> {
 
         self.enter_programming_mode().await?;
 
-        let result = self
-            .write_pages_raw(start_page, data, &mut |_, _| {})
-            .await;
+        let result = self.write_pages_raw(start_page, data, &mut |_, _| {}).await;
 
         let exit_result = self.exit_programming_mode().await;
 
@@ -564,8 +561,7 @@ impl<T: Transport> Radio<T> {
         for memgroup_idx in 0..programming::MEMGROUP_COUNT {
             let group_offset = memgroup_idx * programming::PAGE_SIZE;
             for slot in 0..programming::CHANNELS_PER_MEMGROUP {
-                let ch_offset =
-                    group_offset + slot * programming::CHANNEL_RECORD_SIZE;
+                let ch_offset = group_offset + slot * programming::CHANNEL_RECORD_SIZE;
                 if ch_offset + programming::CHANNEL_RECORD_SIZE <= raw.len() {
                     match FlashChannel::from_bytes(&raw[ch_offset..]) {
                         Ok(ch) => channels.push(ch),
@@ -603,9 +599,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns an error if the read fails. Programming mode is always
     /// exited, even on error.
-    pub async fn read_configuration(
-        &mut self,
-    ) -> Result<crate::memory::MemoryImage, Error> {
+    pub async fn read_configuration(&mut self) -> Result<crate::memory::MemoryImage, Error> {
         let raw = self.read_memory_image().await?;
         crate::memory::MemoryImage::from_raw(raw).map_err(|e| {
             Error::Protocol(ProtocolError::FieldParse {
@@ -764,7 +758,9 @@ impl<T: Transport> Radio<T> {
                 self.transport.read(&mut sync),
             )
             .await;
-            tracing::info!("programming mode entered, switched to {FAST_TRANSFER_BAUD} baud (fast)");
+            tracing::info!(
+                "programming mode entered, switched to {FAST_TRANSFER_BAUD} baud (fast)"
+            );
         } else {
             tracing::info!("programming mode entered, staying at {PROGRAMMING_BAUD} baud");
         }
@@ -868,10 +864,10 @@ impl<T: Transport> Radio<T> {
             let page_offset = i as u16;
             let page = start_page + page_offset;
             let byte_offset = i * programming::PAGE_SIZE;
-            let page_data: &[u8; programming::PAGE_SIZE] =
-                data[byte_offset..byte_offset + programming::PAGE_SIZE]
-                    .try_into()
-                    .expect("slice is exactly PAGE_SIZE bytes");
+            let page_data: &[u8; programming::PAGE_SIZE] = data
+                [byte_offset..byte_offset + programming::PAGE_SIZE]
+                .try_into()
+                .expect("slice is exactly PAGE_SIZE bytes");
             self.write_single_page(page, page_data).await?;
             #[allow(clippy::cast_possible_truncation)]
             let total = page_count as u16;
@@ -882,10 +878,7 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Read a single 256-byte page (caller must be in programming mode).
-    async fn read_single_page(
-        &mut self,
-        page: u16,
-    ) -> Result<[u8; programming::PAGE_SIZE], Error> {
+    async fn read_single_page(&mut self, page: u16) -> Result<[u8; programming::PAGE_SIZE], Error> {
         let cmd = programming::build_read_command(page);
 
         tracing::debug!(page, "reading page");
@@ -1057,7 +1050,10 @@ impl<T: Transport> Radio<T> {
             }
         }
 
-        tracing::info!(count = names.len(), "all channel names read (including extended)");
+        tracing::info!(
+            count = names.len(),
+            "all channel names read (including extended)"
+        );
         Ok(names)
     }
 }
@@ -1100,8 +1096,7 @@ mod tests {
         mock.expect(b"0M PROGRAM\r", b"0M\r");
 
         // First page (256): has real names in slots 0-3.
-        let first_page_data =
-            build_name_page(&["ForestCityPD", "RPT1", "", "NOAA WX"]);
+        let first_page_data = build_name_page(&["ForestCityPD", "RPT1", "", "NOAA WX"]);
         let read_cmd = programming::build_read_command(256);
         mock.expect(&read_cmd, &build_w_response(256, &first_page_data));
 
@@ -1480,10 +1475,12 @@ mod tests {
         mock.expect(b"0M PROGRAM\r", b"0M\r");
 
         // First page has some names.
-        let first_page_data =
-            build_name_page(&["AllCh0", "AllCh1"]);
+        let first_page_data = build_name_page(&["AllCh0", "AllCh1"]);
         let read_cmd = programming::build_read_command(programming::CHANNEL_NAMES_START);
-        mock.expect(&read_cmd, &build_w_response(programming::CHANNEL_NAMES_START, &first_page_data));
+        mock.expect(
+            &read_cmd,
+            &build_w_response(programming::CHANNEL_NAMES_START, &first_page_data),
+        );
 
         // Remaining 74 pages are empty.
         for page_offset in 1..programming::NAME_ALL_PAGE_COUNT {

@@ -16,17 +16,17 @@ async fn raw_cmd(transport: &mut SerialTransport, cmd: &[u8]) -> Option<Vec<u8>>
                 return frame;
             }
         }
-    }).await.ok()
+    })
+    .await
+    .ok()
 }
 
 #[tokio::test]
 #[ignore]
 async fn find_channel_name_field() {
     let ports = SerialTransport::discover_usb().unwrap();
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    ).unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     // Channel 18 should be 155.190 MHz "ForestCityPD"
     println!("\n=== ME 018 (should be 155.190 ForestCityPD) ===");
@@ -35,7 +35,12 @@ async fn find_channel_name_field() {
         let fields: Vec<&str> = text.split(',').collect();
         println!("Total fields: {}", fields.len());
         for (i, f) in fields.iter().enumerate() {
-            let hex: String = f.as_bytes().iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+            let hex: String = f
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
             println!("  [{i:2}] = {f:<20} (hex: {hex})");
         }
     }

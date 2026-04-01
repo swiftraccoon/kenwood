@@ -372,8 +372,7 @@ pub fn parse_ax25(data: &[u8]) -> Result<Ax25Packet, Ax25Error> {
 #[must_use]
 pub fn build_ax25(packet: &Ax25Packet) -> Vec<u8> {
     let no_digis = packet.digipeaters.is_empty();
-    let total_len =
-        14 + packet.digipeaters.len() * 7 + 2 + packet.info.len();
+    let total_len = 14 + packet.digipeaters.len() * 7 + 2 + packet.info.len();
     let mut out = Vec::with_capacity(total_len);
 
     // Destination (never last unless no source... but source always follows)
@@ -443,8 +442,12 @@ fn parse_aprs_latitude(s: &[u8]) -> Result<f64, AprsError> {
         return Err(AprsError::InvalidCoordinates);
     }
     let text = std::str::from_utf8(&s[..8]).map_err(|_| AprsError::InvalidCoordinates)?;
-    let degrees: f64 = text[..2].parse().map_err(|_| AprsError::InvalidCoordinates)?;
-    let minutes: f64 = text[2..7].parse().map_err(|_| AprsError::InvalidCoordinates)?;
+    let degrees: f64 = text[..2]
+        .parse()
+        .map_err(|_| AprsError::InvalidCoordinates)?;
+    let minutes: f64 = text[2..7]
+        .parse()
+        .map_err(|_| AprsError::InvalidCoordinates)?;
     let hemisphere = text.as_bytes()[7];
 
     let mut lat = degrees + minutes / 60.0;
@@ -465,8 +468,12 @@ fn parse_aprs_longitude(s: &[u8]) -> Result<f64, AprsError> {
         return Err(AprsError::InvalidCoordinates);
     }
     let text = std::str::from_utf8(&s[..9]).map_err(|_| AprsError::InvalidCoordinates)?;
-    let degrees: f64 = text[..3].parse().map_err(|_| AprsError::InvalidCoordinates)?;
-    let minutes: f64 = text[3..8].parse().map_err(|_| AprsError::InvalidCoordinates)?;
+    let degrees: f64 = text[..3]
+        .parse()
+        .map_err(|_| AprsError::InvalidCoordinates)?;
+    let minutes: f64 = text[3..8]
+        .parse()
+        .map_err(|_| AprsError::InvalidCoordinates)?;
     let hemisphere = text.as_bytes()[8];
 
     let mut lon = degrees + minutes / 60.0;

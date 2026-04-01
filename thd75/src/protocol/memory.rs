@@ -7,7 +7,7 @@
 use crate::error::ProtocolError;
 use crate::types::Band;
 
-use super::core::{parse_channel_fields, serialize_channel_fields, CHANNEL_FIELD_COUNT};
+use super::core::{CHANNEL_FIELD_COUNT, parse_channel_fields, serialize_channel_fields};
 use super::{Command, Response};
 
 /// Serialize a memory write command into its wire-format body (without trailing `\r`).
@@ -92,11 +92,13 @@ fn parse_me(payload: &str) -> Result<Response, ProtocolError> {
         });
     }
 
-    let channel = fields[0].parse::<u16>().map_err(|_| ProtocolError::FieldParse {
-        command: "ME".to_owned(),
-        field: "channel".to_owned(),
-        detail: format!("invalid channel number: {:?}", fields[0]),
-    })?;
+    let channel = fields[0]
+        .parse::<u16>()
+        .map_err(|_| ProtocolError::FieldParse {
+            command: "ME".to_owned(),
+            field: "channel".to_owned(),
+            detail: format!("invalid channel number: {:?}", fields[0]),
+        })?;
 
     // Remap ME fields to the 20-field FO layout, skipping the two ME-specific
     // fields at indices 14 and 22.
@@ -126,11 +128,13 @@ fn parse_me(payload: &str) -> Result<Response, ProtocolError> {
 fn parse_mr(payload: &str) -> Result<Response, ProtocolError> {
     if let Some((band_str, ch_str)) = payload.split_once(',') {
         // Write acknowledgment format: "band,channel"
-        let band_val = band_str.parse::<u8>().map_err(|_| ProtocolError::FieldParse {
-            command: "MR".to_owned(),
-            field: "band".to_owned(),
-            detail: format!("invalid band: {band_str:?}"),
-        })?;
+        let band_val = band_str
+            .parse::<u8>()
+            .map_err(|_| ProtocolError::FieldParse {
+                command: "MR".to_owned(),
+                field: "band".to_owned(),
+                detail: format!("invalid band: {band_str:?}"),
+            })?;
 
         let band = Band::try_from(band_val).map_err(|e| ProtocolError::FieldParse {
             command: "MR".to_owned(),
@@ -138,11 +142,13 @@ fn parse_mr(payload: &str) -> Result<Response, ProtocolError> {
             detail: e.to_string(),
         })?;
 
-        let channel = ch_str.parse::<u16>().map_err(|_| ProtocolError::FieldParse {
-            command: "MR".to_owned(),
-            field: "channel".to_owned(),
-            detail: format!("invalid channel number: {ch_str:?}"),
-        })?;
+        let channel = ch_str
+            .parse::<u16>()
+            .map_err(|_| ProtocolError::FieldParse {
+                command: "MR".to_owned(),
+                field: "channel".to_owned(),
+                detail: format!("invalid channel number: {ch_str:?}"),
+            })?;
 
         Ok(Response::MemoryRecall { band, channel })
     } else {
@@ -159,11 +165,13 @@ fn parse_mr(payload: &str) -> Result<Response, ProtocolError> {
         let band_str = &payload[..1];
         let ch_str = &payload[1..];
 
-        let band_val = band_str.parse::<u8>().map_err(|_| ProtocolError::FieldParse {
-            command: "MR".to_owned(),
-            field: "band".to_owned(),
-            detail: format!("invalid band: {band_str:?}"),
-        })?;
+        let band_val = band_str
+            .parse::<u8>()
+            .map_err(|_| ProtocolError::FieldParse {
+                command: "MR".to_owned(),
+                field: "band".to_owned(),
+                detail: format!("invalid band: {band_str:?}"),
+            })?;
 
         let band = Band::try_from(band_val).map_err(|e| ProtocolError::FieldParse {
             command: "MR".to_owned(),
@@ -171,11 +179,13 @@ fn parse_mr(payload: &str) -> Result<Response, ProtocolError> {
             detail: e.to_string(),
         })?;
 
-        let channel = ch_str.parse::<u16>().map_err(|_| ProtocolError::FieldParse {
-            command: "MR".to_owned(),
-            field: "channel".to_owned(),
-            detail: format!("invalid channel number: {ch_str:?}"),
-        })?;
+        let channel = ch_str
+            .parse::<u16>()
+            .map_err(|_| ProtocolError::FieldParse {
+                command: "MR".to_owned(),
+                field: "channel".to_owned(),
+                detail: format!("invalid channel number: {ch_str:?}"),
+            })?;
 
         Ok(Response::CurrentChannel { band, channel })
     }

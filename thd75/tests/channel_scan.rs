@@ -8,13 +8,14 @@ use kenwood_thd75::transport::{SerialTransport, Transport};
 #[ignore]
 async fn scan_channels_0_to_19() {
     let ports = SerialTransport::discover_usb().unwrap();
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    ).unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     println!("\n=== MEMORY CHANNEL SCAN (0-19) ===");
-    println!("{:<5} {:<15} {:<12} {:}", "CH", "FREQUENCY", "OFFSET", "NAME");
+    println!(
+        "{:<5} {:<15} {:<12} {:}",
+        "CH", "FREQUENCY", "OFFSET", "NAME"
+    );
     println!("{}", "-".repeat(50));
 
     for ch in 0..20u16 {
@@ -32,7 +33,8 @@ async fn scan_channels_0_to_19() {
                     return frame;
                 }
             }
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(frame) => {

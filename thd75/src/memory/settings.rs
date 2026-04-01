@@ -31,8 +31,8 @@
 
 use crate::protocol::programming;
 use crate::types::settings::{
-    AltitudeRainUnit, AutoPowerOff, DisplayUnits, KeyLockType, Language,
-    SpeedDistanceUnit, TemperatureUnit,
+    AltitudeRainUnit, AutoPowerOff, DisplayUnits, KeyLockType, Language, SpeedDistanceUnit,
+    TemperatureUnit,
 };
 use crate::types::{Frequency, MemoryMode, PowerLevel};
 
@@ -44,9 +44,9 @@ use crate::types::{Frequency, MemoryMode, PowerLevel};
 const SETTINGS_OFFSET: usize = 0x0000;
 
 /// Size of the system settings region in bytes.
-const SETTINGS_SIZE: usize =
-    (programming::SETTINGS_END as usize + 1 - programming::SETTINGS_START as usize)
-        * programming::PAGE_SIZE;
+const SETTINGS_SIZE: usize = (programming::SETTINGS_END as usize + 1
+    - programming::SETTINGS_START as usize)
+    * programming::PAGE_SIZE;
 
 /// Byte offset of the power-on message (16 bytes, null-terminated ASCII).
 const POWER_ON_MESSAGE_OFFSET: usize = 0x11C0;
@@ -362,7 +362,7 @@ impl<'a> SettingsAccess<'a> {
 
     /// Read key beep setting (0=off, 1=on).
     ///
-    /// MCP offset `0x1071`. 
+    /// MCP offset `0x1071`.
     #[must_use]
     pub fn key_beep(&self) -> bool {
         self.image.get(KEY_BEEP_OFFSET).is_some_and(|&b| b != 0)
@@ -483,17 +483,15 @@ impl<'a> SettingsAccess<'a> {
 
     /// Read VOX enabled setting (0=off, 1=on).
     ///
-    /// MCP offset `0x101B`. 
+    /// MCP offset `0x101B`.
     #[must_use]
     pub fn vox_enabled(&self) -> bool {
-        self.image
-            .get(VOX_ENABLED_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(VOX_ENABLED_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read VOX gain (0-9, 0 if unreadable).
     ///
-    /// MCP offset `0x101C`. 
+    /// MCP offset `0x101C`.
     #[must_use]
     pub fn vox_gain(&self) -> u8 {
         self.image
@@ -622,10 +620,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1018`.
     #[must_use]
     pub fn timeout_timer(&self) -> u8 {
-        self.image
-            .get(TIMEOUT_TIMER_OFFSET)
-            .copied()
-            .unwrap_or(0)
+        self.image.get(TIMEOUT_TIMER_OFFSET).copied().unwrap_or(0)
     }
 
     /// Read TX inhibit setting (false if unreadable).
@@ -633,9 +628,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1019`.
     #[must_use]
     pub fn tx_inhibit(&self) -> bool {
-        self.image
-            .get(TX_INHIBIT_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(TX_INHIBIT_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read beat shift setting (false if unreadable).
@@ -643,9 +636,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x101A`.
     #[must_use]
     pub fn beat_shift(&self) -> bool {
-        self.image
-            .get(BEAT_SHIFT_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(BEAT_SHIFT_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read VOX TX-on-busy setting (false if unreadable).
@@ -663,9 +654,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x101F`.
     #[must_use]
     pub fn cw_break_in(&self) -> bool {
-        self.image
-            .get(CW_BREAK_IN_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(CW_BREAK_IN_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read CW delay time (0 if unreadable).
@@ -673,10 +662,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1020`.
     #[must_use]
     pub fn cw_delay_time(&self) -> u8 {
-        self.image
-            .get(CW_DELAY_TIME_OFFSET)
-            .copied()
-            .unwrap_or(0)
+        self.image.get(CW_DELAY_TIME_OFFSET).copied().unwrap_or(0)
     }
 
     /// Read CW pitch (0 if unreadable).
@@ -700,10 +686,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1026`.
     #[must_use]
     pub fn dtmf_pause_time(&self) -> u8 {
-        self.image
-            .get(DTMF_PAUSE_TIME_OFFSET)
-            .copied()
-            .unwrap_or(0)
+        self.image.get(DTMF_PAUSE_TIME_OFFSET).copied().unwrap_or(0)
     }
 
     /// Read DTMF TX hold setting (false if unreadable).
@@ -711,9 +694,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1027`.
     #[must_use]
     pub fn dtmf_tx_hold(&self) -> bool {
-        self.image
-            .get(DTMF_TX_HOLD_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(DTMF_TX_HOLD_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read repeater auto offset setting (false if unreadable).
@@ -742,10 +723,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1040`.
     #[must_use]
     pub fn mic_sensitivity(&self) -> u8 {
-        self.image
-            .get(MIC_SENSITIVITY_OFFSET)
-            .copied()
-            .unwrap_or(0)
+        self.image.get(MIC_SENSITIVITY_OFFSET).copied().unwrap_or(0)
     }
 
     /// Read PF key 1 assignment (0 if unreadable).
@@ -769,9 +747,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1062`.
     #[must_use]
     pub fn lock_key_a(&self) -> bool {
-        self.image
-            .get(LOCK_KEY_A_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(LOCK_KEY_A_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read lock key B setting (false if unreadable).
@@ -779,9 +755,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1063`.
     #[must_use]
     pub fn lock_key_b(&self) -> bool {
-        self.image
-            .get(LOCK_KEY_B_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(LOCK_KEY_B_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read lock key C setting (false if unreadable).
@@ -789,9 +763,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1064`.
     #[must_use]
     pub fn lock_key_c(&self) -> bool {
-        self.image
-            .get(LOCK_KEY_C_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(LOCK_KEY_C_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read lock PTT key setting (false if unreadable).
@@ -799,9 +771,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1065`.
     #[must_use]
     pub fn lock_key_ptt(&self) -> bool {
-        self.image
-            .get(LOCK_KEY_PTT_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(LOCK_KEY_PTT_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read APRS lock setting (false if unreadable).
@@ -809,9 +779,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1097`.
     #[must_use]
     pub fn aprs_lock(&self) -> bool {
-        self.image
-            .get(APRS_LOCK_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(APRS_LOCK_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read dual display size (0 if unreadable).
@@ -857,10 +825,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x106A`.
     #[must_use]
     pub fn backlight_timer(&self) -> u8 {
-        self.image
-            .get(BACKLIGHT_TIMER_OFFSET)
-            .copied()
-            .unwrap_or(0)
+        self.image.get(BACKLIGHT_TIMER_OFFSET).copied().unwrap_or(0)
     }
 
     /// Read display hold time (0 if unreadable).
@@ -879,10 +844,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x106C`.
     #[must_use]
     pub fn display_method(&self) -> u8 {
-        self.image
-            .get(DISPLAY_METHOD_OFFSET)
-            .copied()
-            .unwrap_or(0)
+        self.image.get(DISPLAY_METHOD_OFFSET).copied().unwrap_or(0)
     }
 
     /// Read power-on display setting (0 if unreadable).
@@ -923,9 +885,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1070`.
     #[must_use]
     pub fn announce(&self) -> bool {
-        self.image
-            .get(ANNOUNCE_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(ANNOUNCE_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read voice language setting (0 if unreadable).
@@ -933,10 +893,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1073`.
     #[must_use]
     pub fn voice_language(&self) -> u8 {
-        self.image
-            .get(VOICE_LANGUAGE_OFFSET)
-            .copied()
-            .unwrap_or(0)
+        self.image.get(VOICE_LANGUAGE_OFFSET).copied().unwrap_or(0)
     }
 
     /// Read voice volume (0 if unreadable).
@@ -960,9 +917,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1076`.
     #[must_use]
     pub fn volume_lock(&self) -> bool {
-        self.image
-            .get(VOLUME_LOCK_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(VOLUME_LOCK_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read Bluetooth auto-connect setting (false if unreadable).
@@ -991,10 +946,7 @@ impl<'a> SettingsAccess<'a> {
     /// MCP offset `0x1085`.
     #[must_use]
     pub fn pc_output_mode(&self) -> u8 {
-        self.image
-            .get(PC_OUTPUT_MODE_OFFSET)
-            .copied()
-            .unwrap_or(0)
+        self.image.get(PC_OUTPUT_MODE_OFFSET).copied().unwrap_or(0)
     }
 
     /// Read APRS USB mode (0 if unreadable).
@@ -1051,7 +1003,7 @@ impl<'a> SettingsAccess<'a> {
 
     /// Read Band A power level.
     ///
-    /// MCP offset `0x0359`. 
+    /// MCP offset `0x0359`.
     /// Returns `High` if the byte is out of range or unreadable.
     #[must_use]
     pub fn power_level_a(&self) -> PowerLevel {
@@ -1064,27 +1016,23 @@ impl<'a> SettingsAccess<'a> {
 
     /// Read Band A attenuator setting (0=off, 1=on).
     ///
-    /// MCP offset `0x035C`. 
+    /// MCP offset `0x035C`.
     #[must_use]
     pub fn attenuator_a(&self) -> bool {
-        self.image
-            .get(ATTENUATOR_A_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(ATTENUATOR_A_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read dual-band display setting (0=single, 1=dual).
     ///
-    /// MCP offset `0x0396`. 
+    /// MCP offset `0x0396`.
     #[must_use]
     pub fn dual_band(&self) -> bool {
-        self.image
-            .get(DUAL_BAND_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(DUAL_BAND_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read lock setting (0=unlocked, 1=locked).
     ///
-    /// MCP offset `0x1060`. 
+    /// MCP offset `0x1060`.
     #[must_use]
     pub fn lock(&self) -> bool {
         self.image.get(LOCK_OFFSET).is_some_and(|&b| b != 0)
@@ -1092,12 +1040,10 @@ impl<'a> SettingsAccess<'a> {
 
     /// Read Bluetooth on/off setting (0=off, 1=on).
     ///
-    /// MCP offset `0x1078`. 
+    /// MCP offset `0x1078`.
     #[must_use]
     pub fn bluetooth(&self) -> bool {
-        self.image
-            .get(BLUETOOTH_OFFSET)
-            .is_some_and(|&b| b != 0)
+        self.image.get(BLUETOOTH_OFFSET).is_some_and(|&b| b != 0)
     }
 
     // -----------------------------------------------------------------------
@@ -1653,7 +1599,7 @@ impl<'a> SettingsWriter<'a> {
 
     /// Set key beep on/off.
     ///
-    /// MCP offset `0x1071`. 
+    /// MCP offset `0x1071`.
     pub fn set_key_beep(&mut self, enabled: bool) {
         if let Some(b) = self.image.get_mut(KEY_BEEP_OFFSET) {
             *b = u8::from(enabled);
@@ -1662,7 +1608,7 @@ impl<'a> SettingsWriter<'a> {
 
     /// Set VOX enabled on/off.
     ///
-    /// MCP offset `0x101B`. 
+    /// MCP offset `0x101B`.
     pub fn set_vox_enabled(&mut self, enabled: bool) {
         if let Some(b) = self.image.get_mut(VOX_ENABLED_OFFSET) {
             *b = u8::from(enabled);
@@ -1673,7 +1619,7 @@ impl<'a> SettingsWriter<'a> {
     ///
     /// Values above 9 are clamped to 9.
     ///
-    /// MCP offset `0x101C`. 
+    /// MCP offset `0x101C`.
     pub fn set_vox_gain(&mut self, gain: u8) {
         if let Some(b) = self.image.get_mut(VOX_GAIN_OFFSET) {
             *b = gain.min(9);
@@ -1682,7 +1628,7 @@ impl<'a> SettingsWriter<'a> {
 
     /// Set lock on/off.
     ///
-    /// MCP offset `0x1060`. 
+    /// MCP offset `0x1060`.
     pub fn set_lock(&mut self, locked: bool) {
         if let Some(b) = self.image.get_mut(LOCK_OFFSET) {
             *b = u8::from(locked);
@@ -1691,7 +1637,7 @@ impl<'a> SettingsWriter<'a> {
 
     /// Set dual-band display on/off.
     ///
-    /// MCP offset `0x0396`. 
+    /// MCP offset `0x0396`.
     pub fn set_dual_band(&mut self, enabled: bool) {
         if let Some(b) = self.image.get_mut(DUAL_BAND_OFFSET) {
             *b = u8::from(enabled);
@@ -1700,7 +1646,7 @@ impl<'a> SettingsWriter<'a> {
 
     /// Set Band A attenuator on/off.
     ///
-    /// MCP offset `0x035C`. 
+    /// MCP offset `0x035C`.
     pub fn set_attenuator_a(&mut self, enabled: bool) {
         if let Some(b) = self.image.get_mut(ATTENUATOR_A_OFFSET) {
             *b = u8::from(enabled);
@@ -1709,7 +1655,7 @@ impl<'a> SettingsWriter<'a> {
 
     /// Set Band A power level.
     ///
-    /// MCP offset `0x0359`. 
+    /// MCP offset `0x0359`.
     pub fn set_power_level_a(&mut self, level: PowerLevel) {
         if let Some(b) = self.image.get_mut(POWER_LEVEL_A_OFFSET) {
             *b = u8::from(level);
@@ -1718,7 +1664,7 @@ impl<'a> SettingsWriter<'a> {
 
     /// Set Bluetooth on/off.
     ///
-    /// MCP offset `0x1078`. 
+    /// MCP offset `0x1078`.
     pub fn set_bluetooth(&mut self, enabled: bool) {
         if let Some(b) = self.image.get_mut(BLUETOOTH_OFFSET) {
             *b = u8::from(enabled);
@@ -2011,7 +1957,6 @@ impl<'a> SettingsWriter<'a> {
             *b = value.min(1);
         }
     }
-
 }
 
 /// Extract a null-terminated ASCII string from the image at a given offset.
@@ -2034,8 +1979,7 @@ mod tests {
     use super::*;
     use crate::protocol::programming::TOTAL_SIZE;
     use crate::types::settings::{
-        AltitudeRainUnit, AutoPowerOff, KeyLockType, Language, SpeedDistanceUnit,
-        TemperatureUnit,
+        AltitudeRainUnit, AutoPowerOff, KeyLockType, Language, SpeedDistanceUnit, TemperatureUnit,
     };
 
     fn make_settings_image() -> Vec<u8> {
@@ -2043,8 +1987,7 @@ mod tests {
 
         // Write a power-on message at 0x11C0.
         let msg = b"Hello D75!\0\0\0\0\0\0";
-        image[POWER_ON_MESSAGE_OFFSET..POWER_ON_MESSAGE_OFFSET + 16]
-            .copy_from_slice(msg);
+        image[POWER_ON_MESSAGE_OFFSET..POWER_ON_MESSAGE_OFFSET + 16].copy_from_slice(msg);
 
         // Write a model name at 0x11D0.
         let model = b"TH-D75A\0\0\0\0\0\0\0\0\0";
@@ -2448,8 +2391,7 @@ mod tests {
     fn vfo_raw_accessible() {
         let mut image = make_settings_image();
         // Write a known pattern at VFO entry 0.
-        image[VFO_DATA_OFFSET..VFO_DATA_OFFSET + 4]
-            .copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        image[VFO_DATA_OFFSET..VFO_DATA_OFFSET + 4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
         let settings = mi.settings();
         let raw = settings.vfo_raw(0).unwrap();

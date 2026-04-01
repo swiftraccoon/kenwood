@@ -22,7 +22,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn set_scan_resume(&mut self, mode: u8) -> Result<(), Error> {
-        tracing::warn!(mode, "setting scan resume mode (SR) — may reboot radio if mode=0");
+        tracing::warn!(
+            mode,
+            "setting scan resume mode (SR) — may reboot radio if mode=0"
+        );
         let response = self.execute(Command::SetScanResume { mode }).await?;
         match response {
             Response::Ok => Ok(()),

@@ -121,10 +121,7 @@ fn serialize_ae_read() {
 #[test]
 fn parse_ae_response_serial_info() {
     match protocol::parse(b"AE C3C10368,K01").unwrap() {
-        Response::SerialInfo {
-            serial,
-            model_code,
-        } => {
+        Response::SerialInfo { serial, model_code } => {
             assert_eq!(serial, "C3C10368");
             assert_eq!(model_code, "K01");
         }
@@ -185,7 +182,10 @@ fn parse_ds_response() {
 
 #[test]
 fn serialize_cs_read() {
-    assert_eq!(protocol::serialize(&Command::GetActiveCallsignSlot), b"CS\r");
+    assert_eq!(
+        protocol::serialize(&Command::GetActiveCallsignSlot),
+        b"CS\r"
+    );
 }
 
 #[test]

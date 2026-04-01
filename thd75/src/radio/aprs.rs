@@ -132,10 +132,7 @@ impl<T: Transport> Radio<T> {
         tracing::debug!("reading serial info");
         let response = self.execute(Command::GetSerialInfo).await?;
         match response {
-            Response::SerialInfo {
-                serial,
-                model_code,
-            } => Ok((serial, model_code)),
+            Response::SerialInfo { serial, model_code } => Ok((serial, model_code)),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "SerialInfo".into(),
                 actual: format!("{other:?}").into_bytes(),

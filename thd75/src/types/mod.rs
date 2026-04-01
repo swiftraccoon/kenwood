@@ -34,26 +34,26 @@ pub use channel::{
 pub use frequency::Frequency;
 pub use mode::{MemoryMode, Mode, PowerLevel, ShiftDirection, StepSize};
 pub use tone::{
-    CtcssMode, DataSpeed, DcsCode, LockoutMode, ToneCode, ToneMode, CTCSS_FREQUENCIES, DCS_CODES,
+    CTCSS_FREQUENCIES, CtcssMode, DCS_CODES, DataSpeed, DcsCode, LockoutMode, ToneCode, ToneMode,
 };
 
 // APRS subsystem re-exports.
 pub use aprs::{
-    AprsCallsign, AprsBand, AprsConfig, AprsDataSpeed, AprsIcon, AprsMessage, AprsNetwork,
+    AprsBand, AprsCallsign, AprsConfig, AprsDataSpeed, AprsIcon, AprsMessage, AprsNetwork,
     AprsStation, AutoReplyConfig, AutoReplyDelay, AutoReplyType, BeaconControl, BeaconMethod,
     DcdSense, DigipeatAlias, DigipeatConfig, DisplayArea, FilterPhrase, FloodAlias, GroupCode,
-    InterruptTime, NavitraConfig, NavitraGroupMode, NavitraMessage, NotificationConfig, PacketFilter,
-    PacketFilterType, PacketPath, PositionAmbiguity, PositionComment, QsyConfig, ReplyMessage,
-    SmartBeaconingConfig, StatusText, TraceAlias, TxDelay, VoiceAlertConfig, WaypointConfig,
-    WaypointFormat,
+    InterruptTime, NavitraConfig, NavitraGroupMode, NavitraMessage, NotificationConfig,
+    PacketFilter, PacketFilterType, PacketPath, PositionAmbiguity, PositionComment, QsyConfig,
+    ReplyMessage, SmartBeaconingConfig, StatusText, TraceAlias, TxDelay, VoiceAlertConfig,
+    WaypointConfig, WaypointFormat,
 };
 
 // D-STAR subsystem re-exports.
 pub use dstar::{
-    CallsignEntry, DestinationSelect, DigitalSquelch, DigitalSquelchCode, DigitalSquelchType, DstarAutoReply,
-    DstarAutoReplyMode, DstarCallsign, DstarConfig, DstarMessage, DstarModule, DstarQsoEntry,
-    DstarSuffix, DvDrMode, EmrVolume, GatewayMode, HotspotEntry, PositionAccuracy, QsoDirection,
-    ReflectorCommand, RepeaterDuplex, RepeaterEntry, RouteSelect,
+    CallsignEntry, DestinationSelect, DigitalSquelch, DigitalSquelchCode, DigitalSquelchType,
+    DstarAutoReply, DstarAutoReplyMode, DstarCallsign, DstarConfig, DstarMessage, DstarModule,
+    DstarQsoEntry, DstarSuffix, DvDrMode, EmrVolume, GatewayMode, HotspotEntry, PositionAccuracy,
+    QsoDirection, ReflectorCommand, RepeaterDuplex, RepeaterEntry, RouteSelect,
 };
 
 // GPS subsystem re-exports.
@@ -64,12 +64,12 @@ pub use gps::{
 };
 
 // FM broadcast radio re-exports.
-pub use fm::{FmRadioChannel, FmRadioMode, FM_RADIO_CHANNEL_COUNT, FM_RADIO_MAX_HZ, FM_RADIO_MIN_HZ};
+pub use fm::{
+    FM_RADIO_CHANNEL_COUNT, FM_RADIO_MAX_HZ, FM_RADIO_MIN_HZ, FmRadioChannel, FmRadioMode,
+};
 
 // Scan re-exports.
-pub use scan::{
-    ProgramScanEdge, ScanResumeMethod, ScanType, VisualRange, VisualScanRange,
-};
+pub use scan::{ProgramScanEdge, ScanResumeMethod, ScanType, VisualRange, VisualScanRange};
 
 // Settings re-exports.
 pub use settings::{
@@ -84,8 +84,7 @@ pub use cw::{CwConfig, CwDelay, CwPitch};
 
 // DTMF re-exports.
 pub use dtmf::{
-    DtmfConfig, DtmfDigits, DtmfMemory, DtmfName, DtmfPause, DtmfSlot, DtmfSpeed,
-    is_valid_dtmf,
+    DtmfConfig, DtmfDigits, DtmfMemory, DtmfName, DtmfPause, DtmfSlot, DtmfSpeed, is_valid_dtmf,
 };
 
 // EchoLink re-exports.

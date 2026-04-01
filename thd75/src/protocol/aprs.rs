@@ -38,15 +38,17 @@ fn parse_ae(payload: &str) -> Response {
 /// Parse an APRS command response from mnemonic and payload.
 ///
 /// Returns `None` if the mnemonic is not an APRS command.
-pub(crate) fn parse_aprs(
-    mnemonic: &str,
-    payload: &str,
-) -> Option<Result<Response, ProtocolError>> {
+pub(crate) fn parse_aprs(mnemonic: &str, payload: &str) -> Option<Result<Response, ProtocolError>> {
     match mnemonic {
         "AS" => Some(parse_u8_field(payload, "AS", "rate").map(|rate| Response::TncBaud { rate })),
         "AE" => Some(Ok(parse_ae(payload))),
-        "PT" => Some(parse_u8_field(payload, "PT", "mode").map(|mode| Response::BeaconType { mode })),
-        "MS" => Some(parse_u8_field(payload, "MS", "source").map(|source| Response::PositionSource { source })),
+        "PT" => {
+            Some(parse_u8_field(payload, "PT", "mode").map(|mode| Response::BeaconType { mode }))
+        }
+        "MS" => Some(
+            parse_u8_field(payload, "MS", "source")
+                .map(|source| Response::PositionSource { source }),
+        ),
         _ => None,
     }
 }

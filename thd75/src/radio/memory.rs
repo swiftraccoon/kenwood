@@ -15,9 +15,7 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn read_channel(&mut self, channel: u16) -> Result<ChannelMemory, Error> {
         tracing::debug!(channel, "reading memory channel");
-        let response = self
-            .execute(Command::GetMemoryChannel { channel })
-            .await?;
+        let response = self.execute(Command::GetMemoryChannel { channel }).await?;
         match response {
             Response::MemoryChannel { data, .. } => Ok(data),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -32,11 +30,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn write_channel(
-        &mut self,
-        channel: u16,
-        data: &ChannelMemory,
-    ) -> Result<(), Error> {
+    pub async fn write_channel(&mut self, channel: u16, data: &ChannelMemory) -> Result<(), Error> {
         tracing::info!(channel, "writing memory channel");
         let response = self
             .execute(Command::SetMemoryChannel {

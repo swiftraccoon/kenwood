@@ -11,8 +11,8 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 /// Terminal UI for the Kenwood TH-D75 transceiver.
 #[derive(Parser, Debug)]
@@ -37,8 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Init tracing — only if RUST_LOG is set, write to a file to avoid corrupting TUI
     if std::env::var("RUST_LOG").is_ok() {
-        let log_file = std::fs::File::create("thd75-tui.log")
-            .expect("failed to create log file");
+        let log_file = std::fs::File::create("thd75-tui.log").expect("failed to create log file");
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_writer(log_file)

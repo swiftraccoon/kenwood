@@ -35,10 +35,21 @@ async fn read_all_available(transport: &mut SerialTransport, timeout_ms: u64) ->
 fn hex_dump(data: &[u8], label: &str) {
     println!("  {label} ({} bytes):", data.len());
     for (i, chunk) in data.chunks(16).enumerate() {
-        let hex: String = chunk.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
-        let ascii: String = chunk.iter().map(|&b| {
-            if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' }
-        }).collect();
+        let hex: String = chunk
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| {
+                if b.is_ascii_graphic() || b == b' ' {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
         println!("    {:04X}: {:<48} {}", i * 16, hex, ascii);
     }
 }
@@ -48,10 +59,8 @@ fn hex_dump(data: &[u8], label: &str) {
 async fn probe_programming_mode() {
     let ports = SerialTransport::discover_usb().unwrap();
     assert!(!ports.is_empty(), "No TH-D75 found");
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    ).unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     println!("\n=== 0M PROGRAM BINARY PROTOCOL PROBE ===\n");
 
@@ -98,8 +107,10 @@ async fn probe_programming_mode() {
         // W response is 261 bytes: W + 4-byte address + 256-byte data.
         if resp[0] == b'W' && resp.len() >= 261 {
             let page = u16::from_be_bytes([resp[1], resp[2]]);
-            println!("\n  W response: page={page:04X}, total_bytes={}",
-                resp.len());
+            println!(
+                "\n  W response: page={page:04X}, total_bytes={}",
+                resp.len()
+            );
 
             // Data starts at byte 5.
             println!("\n  First 4 name entries:");
@@ -111,7 +122,10 @@ async fn probe_programming_mode() {
                 println!("    CH {i:03}: {name:?} (raw: {entry:02X?})");
             }
         } else if resp[0] == b'W' {
-            println!("\n  W response incomplete: {} bytes (expected 261)", resp.len());
+            println!(
+                "\n  W response incomplete: {} bytes (expected 261)",
+                resp.len()
+            );
         }
 
         // Send ACK

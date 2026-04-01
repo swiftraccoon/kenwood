@@ -122,11 +122,7 @@ pub fn write_repeater_list(entries: &[RepeaterEntry]) -> Vec<u8> {
 }
 
 /// Parses a MHz frequency string (e.g., `"145.000000"`) into Hz.
-fn parse_frequency_mhz(
-    s: &str,
-    line: usize,
-    column: &str,
-) -> Result<u32, SdCardError> {
+fn parse_frequency_mhz(s: &str, line: usize, column: &str) -> Result<u32, SdCardError> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Ok(0);

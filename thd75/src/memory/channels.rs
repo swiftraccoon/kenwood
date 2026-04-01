@@ -20,7 +20,7 @@
 //! to read individual channels or iterate over all populated channels.
 
 use crate::protocol::programming::{
-    self, ChannelFlag, CHANNELS_PER_MEMGROUP, CHANNEL_RECORD_SIZE, FLAG_EMPTY, FLAG_RECORD_SIZE,
+    self, CHANNEL_RECORD_SIZE, CHANNELS_PER_MEMGROUP, ChannelFlag, FLAG_EMPTY, FLAG_RECORD_SIZE,
     MEMGROUP_COUNT, NAME_ENTRY_SIZE, PAGE_SIZE,
 };
 use crate::sdcard::config::ChannelEntry;
@@ -130,11 +130,7 @@ impl<'a> ChannelAccess<'a> {
         (0..=MAX_REGULAR_CHANNEL)
             .filter_map(|ch| {
                 let entry = self.get(ch)?;
-                if entry.used {
-                    Some(entry)
-                } else {
-                    None
-                }
+                if entry.used { Some(entry) } else { None }
             })
             .collect()
     }
@@ -288,12 +284,7 @@ impl<'a> ChannelWriter<'a> {
     }
 
     /// Write a channel flag.
-    fn set_flag(
-        &mut self,
-        number: u16,
-        used: bool,
-        lockout: bool,
-    ) -> Result<(), MemoryError> {
+    fn set_flag(&mut self, number: u16, used: bool, lockout: bool) -> Result<(), MemoryError> {
         let number_usize = number as usize;
         let offset = FLAGS_OFFSET + number_usize * FLAG_RECORD_SIZE;
         if offset + FLAG_RECORD_SIZE > self.image.len() {
@@ -324,11 +315,7 @@ impl<'a> ChannelWriter<'a> {
     }
 
     /// Write the 40-byte flash channel record.
-    fn set_flash(
-        &mut self,
-        number: u16,
-        memory: &FlashChannel,
-    ) -> Result<(), MemoryError> {
+    fn set_flash(&mut self, number: u16, memory: &FlashChannel) -> Result<(), MemoryError> {
         let number_usize = number as usize;
         let memgroup = number_usize / CHANNELS_PER_MEMGROUP;
         let slot = number_usize % CHANNELS_PER_MEMGROUP;

@@ -39,10 +39,8 @@ async fn raw_cmd(transport: &mut SerialTransport, cmd: &str) -> Option<String> {
 async fn probe_bluetooth_commands() {
     let ports = SerialTransport::discover_usb().unwrap();
     assert!(!ports.is_empty(), "No TH-D75 found");
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    ).unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     println!("\n=== BLUETOOTH COMMAND PROBE ===\n");
 
@@ -59,7 +57,10 @@ async fn probe_bluetooth_commands() {
         match &resp {
             Some(r) if r == "?" || r == "N" => println!("  {cmd}: {r}"),
             Some(r) => println!("  {cmd}: {r}"),
-            None => { println!("  {cmd}: TIMEOUT"); break; }
+            None => {
+                println!("  {cmd}: TIMEOUT");
+                break;
+            }
         }
     }
 
@@ -71,7 +72,10 @@ async fn probe_bluetooth_commands() {
         match &resp {
             Some(r) if r == "?" || r == "N" => println!("  {cmd}: {r}"),
             Some(r) => println!("  {cmd}: {r}"),
-            None => { println!("  {cmd}: TIMEOUT"); break; }
+            None => {
+                println!("  {cmd}: TIMEOUT");
+                break;
+            }
         }
     }
 

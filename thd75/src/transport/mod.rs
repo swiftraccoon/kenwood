@@ -28,7 +28,10 @@ pub trait Transport: Send + Sync {
     fn write(&mut self, data: &[u8]) -> impl Future<Output = Result<(), TransportError>> + Send;
 
     /// Read available bytes into buffer, return count of bytes read.
-    fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = Result<usize, TransportError>> + Send;
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = Result<usize, TransportError>> + Send;
 
     /// Close the connection.
     fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send;

@@ -208,10 +208,7 @@ pub fn parse_write_response(buf: &[u8]) -> Result<(u16, &[u8]), String> {
         ));
     }
     if buf[0] != b'W' {
-        return Err(format!(
-            "expected W response marker, got 0x{:02X}",
-            buf[0]
-        ));
+        return Err(format!("expected W response marker, got 0x{:02X}", buf[0]));
     }
     // 4-byte address: bytes 1-2 are the page, bytes 3-4 are offset (always 0).
     let page = u16::from_be_bytes([buf[1], buf[2]]);
@@ -276,7 +273,12 @@ impl ChannelFlag {
     /// Serialize this flag back to a 4-byte record.
     #[must_use]
     pub const fn to_bytes(&self) -> [u8; FLAG_RECORD_SIZE] {
-        [self.used, if self.lockout { 0x01 } else { 0x00 }, self.group, 0xFF]
+        [
+            self.used,
+            if self.lockout { 0x01 } else { 0x00 },
+            self.group,
+            0xFF,
+        ]
     }
 }
 
@@ -328,8 +330,8 @@ mod tests {
     fn factory_calibration_page_detection() {
         // Pages 0x07A1 and 0x07A2 are factory calibration
         assert!(!is_factory_calibration_page(0x07A0)); // last writable
-        assert!(is_factory_calibration_page(0x07A1));  // factory cal
-        assert!(is_factory_calibration_page(0x07A2));  // factory cal
+        assert!(is_factory_calibration_page(0x07A1)); // factory cal
+        assert!(is_factory_calibration_page(0x07A2)); // factory cal
         assert!(!is_factory_calibration_page(0x0000)); // system settings
         assert!(!is_factory_calibration_page(0x0100)); // channel names
     }

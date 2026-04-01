@@ -3,8 +3,8 @@
 
 use kenwood_thd75::error::ProtocolError;
 use kenwood_thd75::protocol::{self, Command, Response};
-use kenwood_thd75::types::*;
 use kenwood_thd75::types::tone::{CtcssMode, DataSpeed, DcsCode, LockoutMode, ToneCode};
+use kenwood_thd75::types::*;
 
 // ============================================================================
 // ID — Radio model identification
@@ -536,8 +536,7 @@ fn fo_vfo_extended_shift_round_trip() {
 fn fo_vfo_tune_frequency_simulation() {
     // Simulate the tune_frequency flow: read FO, modify freq, serialize, parse.
     // Start with a VFO state that has extended shift=8.
-    let vfo_response =
-        b"FO 0,0145190000,0000600000,0,8,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00";
+    let vfo_response = b"FO 0,0145190000,0000600000,0,8,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00";
     let r = protocol::parse(vfo_response).unwrap();
     let mut channel = match r {
         Response::FrequencyFull { channel, .. } => channel,

@@ -15,9 +15,9 @@
 //!
 //! Press Ctrl+C to stop.
 
+use kenwood_thd75::Transport;
 use kenwood_thd75::kiss;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::Transport;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,16 +57,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match kiss::decode_kiss_frame(&frame_data) {
                 Ok(kiss_frame) => {
                     if kiss_frame.command != kiss::CMD_DATA {
-                        println!("KISS cmd=0x{:02X} ({} bytes)", kiss_frame.command, kiss_frame.data.len());
+                        println!(
+                            "KISS cmd=0x{:02X} ({} bytes)",
+                            kiss_frame.command,
+                            kiss_frame.data.len()
+                        );
                         continue;
                     }
 
                     // Parse the AX.25 payload.
                     if let Ok(ax25) = kiss::parse_ax25(&kiss_frame.data) {
-                        print!(
-                            "{}>{}",
-                            ax25.source, ax25.destination,
-                        );
+                        print!("{}>{}", ax25.source, ax25.destination,);
                         for digi in &ax25.digipeaters {
                             print!(",{digi}");
                         }

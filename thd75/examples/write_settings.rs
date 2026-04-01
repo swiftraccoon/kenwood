@@ -14,9 +14,9 @@
 //! connection resets when done. The radio display shows "PROG MCP"
 //! during the transfer.
 
+use kenwood_thd75::Radio;
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::Band;
-use kenwood_thd75::Radio;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

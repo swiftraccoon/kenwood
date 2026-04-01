@@ -172,15 +172,9 @@ fn diff_memory_dumps() {
     eprintln!("  Range: 0x{offset_min:05X} - 0x{offset_max:05X}");
     eprintln!("  Span : {} bytes", offset_max - offset_min + 1);
     eprintln!("  Count: {} changed bytes", diffs.len());
-    eprintln!(
-        "  Region(s): {}",
-        region_for_offset(offset_min),
-    );
+    eprintln!("  Region(s): {}", region_for_offset(offset_min),);
     if region_for_offset(offset_min) != region_for_offset(offset_max) {
-        eprintln!(
-            "           + {}",
-            region_for_offset(offset_max),
-        );
+        eprintln!("           + {}", region_for_offset(offset_max),);
     }
 }
 
@@ -250,8 +244,8 @@ fn displayable_char(b: u8) -> char {
 /// variables, or just edit the constants below for quick inspection.
 #[test]
 fn hex_dump_region() {
-    let path = std::env::var("DUMP_PATH")
-        .unwrap_or_else(|_| "tests/fixtures/memory_dump.bin".to_string());
+    let path =
+        std::env::var("DUMP_PATH").unwrap_or_else(|_| "tests/fixtures/memory_dump.bin".to_string());
     let offset: usize = std::env::var("DUMP_OFFSET")
         .ok()
         .and_then(|s| {
@@ -277,9 +271,7 @@ fn hex_dump_region() {
     let end = (offset + len).min(data.len());
     let region = region_for_offset(offset);
 
-    eprintln!(
-        "Hex dump of {path} at 0x{offset:05X} ({len} bytes) [{region}]"
-    );
+    eprintln!("Hex dump of {path} at 0x{offset:05X} ({len} bytes) [{region}]");
     eprintln!("  Page 0x{:04X} + 0x{:02X}", offset / 256, offset % 256);
     eprintln!();
 

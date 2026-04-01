@@ -8,8 +8,8 @@
 //! Pass a custom serial port as the first argument:
 //! `cargo run --example identify -- /dev/cu.usbmodem1234`
 
-use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::Radio;
+use kenwood_thd75::transport::SerialTransport;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

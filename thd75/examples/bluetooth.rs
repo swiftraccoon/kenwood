@@ -13,9 +13,9 @@
 //! On Linux it is `/dev/rfcomm0` (after `rfcomm bind`).
 //! On Windows it is a COM port assigned during pairing.
 
+use kenwood_thd75::Radio;
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::Band;
-use kenwood_thd75::Radio;
 
 /// Default Bluetooth SPP port on macOS after pairing.
 const DEFAULT_BT_PORT: &str = "/dev/cu.TH-D75";
@@ -44,10 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let freq = radio.get_frequency(band).await?;
         let mode = radio.get_mode(band).await?;
         let smeter = radio.get_smeter(band).await?;
-        println!(
-            "Band {band}: {} {mode} S={smeter:02}",
-            freq.rx_frequency,
-        );
+        println!("Band {band}: {} {mode} S={smeter:02}", freq.rx_frequency,);
     }
 
     // Check Bluetooth state (should be on since we are connected via BT).

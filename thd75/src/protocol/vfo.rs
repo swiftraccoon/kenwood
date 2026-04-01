@@ -5,8 +5,8 @@
 //! size, filter width, and attenuator.
 
 use crate::error::ProtocolError;
-use crate::types::mode::{Mode, StepSize};
 use crate::types::Band;
+use crate::types::mode::{Mode, StepSize};
 
 use super::Response;
 

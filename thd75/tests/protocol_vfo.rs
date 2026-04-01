@@ -10,16 +10,16 @@ use kenwood_thd75::types::*;
 
 #[test]
 fn serialize_ag_read() {
-    assert_eq!(
-        protocol::serialize(&Command::GetAfGain),
-        b"AG\r"
-    );
+    assert_eq!(protocol::serialize(&Command::GetAfGain), b"AG\r");
 }
 
 #[test]
 fn serialize_ag_write() {
     assert_eq!(
-        protocol::serialize(&Command::SetAfGain { band: Band::A, level: 15 }),
+        protocol::serialize(&Command::SetAfGain {
+            band: Band::A,
+            level: 15
+        }),
         b"AG 0,15\r"
     );
 }
@@ -27,7 +27,10 @@ fn serialize_ag_write() {
 #[test]
 fn serialize_ag_write_band_b() {
     assert_eq!(
-        protocol::serialize(&Command::SetAfGain { band: Band::B, level: 39 }),
+        protocol::serialize(&Command::SetAfGain {
+            band: Band::B,
+            level: 39
+        }),
         b"AG 1,39\r"
     );
 }
@@ -258,10 +261,7 @@ fn parse_fs_band_b() {
 
 #[test]
 fn serialize_ft_read() {
-    assert_eq!(
-        protocol::serialize(&Command::GetFunctionType),
-        b"FT\r"
-    );
+    assert_eq!(protocol::serialize(&Command::GetFunctionType), b"FT\r");
 }
 
 #[test]

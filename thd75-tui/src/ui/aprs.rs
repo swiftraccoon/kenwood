@@ -70,11 +70,7 @@ pub fn render(app: &App, frame: &mut Frame, list_area: Rect, detail_area: Rect) 
         lines.push(kv_line("Beacon interval", disp, col));
     }
 
-    lines.push(kv_line(
-        "Packet path",
-        aprs.packet_path(),
-        Color::White,
-    ));
+    lines.push(kv_line("Packet path", aprs.packet_path(), Color::White));
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -86,10 +82,7 @@ pub fn render(app: &App, frame: &mut Frame, list_area: Rect, detail_area: Rect) 
         Style::default().fg(Color::DarkGray),
     )));
 
-    frame.render_widget(
-        Paragraph::new(lines).block(block),
-        list_area,
-    );
+    frame.render_widget(Paragraph::new(lines).block(block), list_area);
 
     // -------------------------------------------------------------------------
     // Right pane: APRS region info

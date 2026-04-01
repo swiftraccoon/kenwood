@@ -55,11 +55,8 @@ async fn raw_cmd(transport: &mut SerialTransport, cmd: &str) -> Option<String> {
 async fn scan_all_mnemonics() {
     let ports = SerialTransport::discover_usb().unwrap();
     assert!(!ports.is_empty(), "No TH-D75 found");
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    )
-    .unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     let chars: Vec<char> = ('A'..='Z').chain('0'..='9').collect();
     let mut found: Vec<(String, String)> = Vec::new();
@@ -84,7 +81,10 @@ async fn scan_all_mnemonics() {
                     // Unknown command, skip silently
                 }
                 Some(resp) if resp == "N" => {
-                    found.push((mnemonic.clone(), format!("N (not available in current mode)")));
+                    found.push((
+                        mnemonic.clone(),
+                        format!("N (not available in current mode)"),
+                    ));
                     println!("  [{scanned:4}/{total}] {mnemonic} -> N (not available)");
                 }
                 Some(resp) => {

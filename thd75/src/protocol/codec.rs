@@ -13,9 +13,7 @@ impl Codec {
     /// Creates a new codec with an empty buffer.
     #[must_use]
     pub const fn new() -> Self {
-        Self {
-            buffer: Vec::new(),
-        }
+        Self { buffer: Vec::new() }
     }
 
     /// Appends raw bytes to the internal buffer.

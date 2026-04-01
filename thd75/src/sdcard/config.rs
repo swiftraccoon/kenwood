@@ -184,18 +184,11 @@ pub fn parse_config(data: &[u8]) -> Result<RadioConfig, SdCardError> {
 
         let (used, flash) = if ch_end <= data.len() {
             let ch_bytes = &data[ch_offset..ch_end];
-            let rx_freq = u32::from_le_bytes([
-                ch_bytes[0],
-                ch_bytes[1],
-                ch_bytes[2],
-                ch_bytes[3],
-            ]);
+            let rx_freq = u32::from_le_bytes([ch_bytes[0], ch_bytes[1], ch_bytes[2], ch_bytes[3]]);
             let is_used = rx_freq != 0 && rx_freq != 0xFFFF_FFFF;
-            let ch = FlashChannel::from_bytes(ch_bytes).map_err(|e| {
-                SdCardError::ChannelParse {
-                    index: ch_index,
-                    detail: e.to_string(),
-                }
+            let ch = FlashChannel::from_bytes(ch_bytes).map_err(|e| SdCardError::ChannelParse {
+                index: ch_index,
+                detail: e.to_string(),
             })?;
             (is_used, ch)
         } else {

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
+use kenwood_thd75::Radio;
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::Band;
-use kenwood_thd75::Radio;
 use tokio::sync::mpsc;
 
 use crate::app::{BandState, Message, RadioState};
@@ -141,11 +141,6 @@ pub async fn spawn(
                                     let _ = tx.send(Message::RadioError(format!("Tune freq: {e}")));
                                 }
                             }
-                            crate::event::RadioCommand::SetBacklight(level) => {
-                                if let Err(e) = radio.set_backlight(level).await {
-                                    let _ = tx.send(Message::RadioError(format!("Backlight: {e} (D75 rejects BL write)")));
-                                }
-                            }
                             crate::event::RadioCommand::SetSquelch { band, level } => {
                                 if let Err(e) = radio.set_squelch(band, level).await {
                                     let _ = tx.send(Message::RadioError(format!("Set squelch: {e}")));
@@ -159,11 +154,6 @@ pub async fn spawn(
                             crate::event::RadioCommand::SetMode { band, mode } => {
                                 if let Err(e) = radio.set_mode(band, mode).await {
                                     let _ = tx.send(Message::RadioError(format!("Set mode: {e} (may require VFO mode)")));
-                                }
-                            }
-                            crate::event::RadioCommand::SetBeep(on) => {
-                                if let Err(e) = radio.set_beep(on).await {
-                                    let _ = tx.send(Message::RadioError(format!("Beep: {e} (D75 rejects BE write)")));
                                 }
                             }
                             crate::event::RadioCommand::SetLock(on) => {
@@ -196,11 +186,6 @@ pub async fn spawn(
                                     let _ = tx.send(Message::RadioError(format!("Set VOX delay: {e}")));
                                 }
                             }
-                            crate::event::RadioCommand::SetAfGain(level) => {
-                                if let Err(e) = radio.set_af_gain(Band::A, level).await {
-                                    let _ = tx.send(Message::RadioError(format!("AF gain: {e} (D75 rejects AG write)")));
-                                }
-                            }
                             crate::event::RadioCommand::SetPower { band, level } => {
                                 if let Err(e) = radio.set_power_level(band, level).await {
                                     let _ = tx.send(Message::RadioError(format!("Set power: {e}")));
@@ -221,24 +206,9 @@ pub async fn spawn(
                                     let _ = tx.send(Message::RadioError(format!("GPS config: {e}")));
                                 }
                             }
-                            crate::event::RadioCommand::SetGpsSentences(gga, gll, gsa, gsv, rmc, vtg) => {
-                                if let Err(e) = radio.set_gps_sentences(gga, gll, gsa, gsv, rmc, vtg).await {
-                                    let _ = tx.send(Message::RadioError(format!("GPS sentences: {e}")));
-                                }
-                            }
-                            crate::event::RadioCommand::SetMode { band, mode } => {
-                                if let Err(e) = radio.set_mode(band, mode).await {
-                                    let _ = tx.send(Message::RadioError(format!("Set mode: {e}")));
-                                }
-                            }
                             crate::event::RadioCommand::SetFmRadio(enabled) => {
                                 if let Err(e) = radio.set_fm_radio(enabled).await {
                                     let _ = tx.send(Message::RadioError(format!("FM radio: {e}")));
-                                }
-                            }
-                            crate::event::RadioCommand::SetIoPort(value) => {
-                                if let Err(e) = radio.set_io_port(value).await {
-                                    let _ = tx.send(Message::RadioError(format!("IO port: {e}")));
                                 }
                             }
                             crate::event::RadioCommand::SetCallsignSlot(slot) => {
@@ -310,9 +280,7 @@ enum PollError {
 fn classify_error(context: &str, e: &kenwood_thd75::Error) -> PollError {
     use kenwood_thd75::Error;
     match e {
-        Error::Transport(_) | Error::Timeout(_) => {
-            PollError::Transport(format!("{context}: {e}"))
-        }
+        Error::Transport(_) | Error::Timeout(_) => PollError::Transport(format!("{context}: {e}")),
         _ => PollError::Protocol(format!("{context}: {e}")),
     }
 }
@@ -333,14 +301,10 @@ async fn poll_once(radio: &mut Radio<SerialTransport>) -> Result<RadioState, Pol
     let af_gain = radio.get_af_gain().await.unwrap_or(0);
     let gps = radio.get_gps_config().await.unwrap_or((false, false));
     let beacon_type = radio.get_beacon_type().await.unwrap_or(0);
-    // DW read is unsafe — may toggle dual watch. Read from MCP cache instead.
-    let dual_watch = false;
-
     Ok(RadioState {
         band_a,
         band_b,
         backlight,
-        dual_watch,
         beep,
         lock,
         dual_band,
@@ -409,7 +373,10 @@ async fn freq_down(
 
     let ch = radio.get_frequency(band).await?;
     // FS may return N (not available) in some modes — default to 5 kHz
-    let step = radio.get_frequency_step(band).await.unwrap_or(kenwood_thd75::types::StepSize::Hz5000);
+    let step = radio
+        .get_frequency_step(band)
+        .await
+        .unwrap_or(kenwood_thd75::types::StepSize::Hz5000);
     let step_hz: u32 = match step {
         StepSize::Hz5000 => 5_000,
         StepSize::Hz6250 => 6_250,
@@ -430,10 +397,7 @@ async fn freq_down(
         .await
 }
 
-fn discover_and_open(
-    port: Option<String>,
-    baud: u32,
-) -> Result<(String, SerialTransport), String> {
+fn discover_and_open(port: Option<String>, baud: u32) -> Result<(String, SerialTransport), String> {
     if let Some(ref path) = port {
         if path != "auto" {
             let transport = SerialTransport::open(path, baud)
@@ -443,8 +407,8 @@ fn discover_and_open(
     }
 
     // Auto-discover
-    let ports = SerialTransport::discover_usb()
-        .map_err(|e| format!("USB discovery failed: {e}"))?;
+    let ports =
+        SerialTransport::discover_usb().map_err(|e| format!("USB discovery failed: {e}"))?;
 
     let info = ports
         .first()

@@ -484,7 +484,11 @@ mod tests {
         let image = vec![0u8; TOTAL_SIZE];
         let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
         // Try to read past the end of the position data region.
-        assert!(mi.aprs().position_data_bytes(APRS_POSITION_DATA_SIZE, 1).is_none());
+        assert!(
+            mi.aprs()
+                .position_data_bytes(APRS_POSITION_DATA_SIZE, 1)
+                .is_none()
+        );
     }
 
     #[test]

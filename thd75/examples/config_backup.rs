@@ -15,8 +15,8 @@
 
 use std::path::PathBuf;
 
-use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::Radio;
+use kenwood_thd75::transport::SerialTransport;
 
 /// Baud rate for MCP programming mode entry (CAT commands use this rate
 /// for the initial handshake, then the entire session stays at 9600).
@@ -49,7 +49,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     eprintln!();
-    println!("\nRead {} bytes ({} pages).", image.len(), image.len() / 256);
+    println!(
+        "\nRead {} bytes ({} pages).",
+        image.len(),
+        image.len() / 256
+    );
 
     std::fs::write(&output, &image)?;
     println!("Saved to: {}", output.display());

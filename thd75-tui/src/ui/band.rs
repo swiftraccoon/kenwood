@@ -27,7 +27,9 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect, pane: Pane) {
                 Span::styled("  Freq: ", Style::default().fg(Color::Yellow)),
                 Span::styled(
                     format!("{buf}▎ MHz"),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]));
         }
@@ -52,15 +54,21 @@ fn band_lines(band: &BandState) -> Vec<Line<'static>> {
     };
 
     let mode_line = Line::from(vec![
-        Span::styled(format!("  {}  ", band.mode), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("  {}  ", band.mode),
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled("Pwr:", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{}", power_label(band.power_level)),
+            power_label(band.power_level).to_string(),
             Style::default().fg(Color::Yellow),
         ),
         Span::raw("  "),
         Span::styled("Sq:", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}", band.squelch), Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("{}", band.squelch),
+            Style::default().fg(Color::Yellow),
+        ),
         Span::raw("  "),
         busy_span,
     ]);

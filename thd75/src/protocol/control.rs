@@ -25,9 +25,13 @@ pub(crate) fn parse_control(
         "BE" => Some(parse_bool(payload, "BE").map(|enabled| Response::Beep { enabled })),
         "RX" | "TX" => Some(Ok(Response::Ok)),
         "LC" => Some(parse_bool(payload, "LC").map(|locked| Response::Lock { locked })),
-        "IO" => Some(parse_u8_field(payload, "IO", "value").map(|value| Response::IoPort { value })),
+        "IO" => {
+            Some(parse_u8_field(payload, "IO", "value").map(|value| Response::IoPort { value }))
+        }
         "BL" => Some(parse_bl(payload)),
-        "VD" => Some(parse_u8_field(payload, "VD", "delay").map(|delay| Response::VoxDelay { delay })),
+        "VD" => {
+            Some(parse_u8_field(payload, "VD", "delay").map(|delay| Response::VoxDelay { delay }))
+        }
         "VG" => Some(parse_u8_field(payload, "VG", "gain").map(|gain| Response::VoxGain { gain })),
         "VX" => Some(parse_bool(payload, "VX").map(|enabled| Response::Vox { enabled })),
         _ => None,

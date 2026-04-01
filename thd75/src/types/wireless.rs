@@ -46,9 +46,7 @@ impl WirelessPassword {
     /// contains invalid DTMF digits.
     #[must_use]
     pub fn new(password: &str) -> Option<Self> {
-        if password.len() == Self::LEN
-            && password.chars().all(super::dtmf::is_valid_dtmf)
-        {
+        if password.len() == Self::LEN && password.chars().all(super::dtmf::is_valid_dtmf) {
             Some(Self(password.to_owned()))
         } else {
             None

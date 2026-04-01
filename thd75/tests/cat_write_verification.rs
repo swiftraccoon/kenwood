@@ -71,8 +71,11 @@ async fn verify_cat_writes() {
         Ok(()) => {
             let rb = radio.get_vox_gain().await.unwrap();
             let _ = radio.set_vox_gain(orig_vg).await;
-            if rb == new_vg { println!("  {:<25} OK", "SetVoxGain"); }
-            else { println!("  {:<25} FAIL (readback: {rb})", "SetVoxGain"); }
+            if rb == new_vg {
+                println!("  {:<25} OK", "SetVoxGain");
+            } else {
+                println!("  {:<25} FAIL (readback: {rb})", "SetVoxGain");
+            }
         }
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetVoxGain"),
     }
@@ -84,21 +87,31 @@ async fn verify_cat_writes() {
         Ok(()) => {
             let rb = radio.get_vox_delay().await.unwrap();
             let _ = radio.set_vox_delay(orig_vd).await;
-            if rb == new_vd { println!("  {:<25} OK", "SetVoxDelay"); }
-            else { println!("  {:<25} FAIL (readback: {rb})", "SetVoxDelay"); }
+            if rb == new_vd {
+                println!("  {:<25} OK", "SetVoxDelay");
+            } else {
+                println!("  {:<25} FAIL (readback: {rb})", "SetVoxDelay");
+            }
         }
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetVoxDelay"),
     }
 
     // Power level
     let orig_pc = radio.get_power_level(Band::A).await.unwrap();
-    let new_pc = if orig_pc == PowerLevel::High { PowerLevel::Low } else { PowerLevel::High };
+    let new_pc = if orig_pc == PowerLevel::High {
+        PowerLevel::Low
+    } else {
+        PowerLevel::High
+    };
     match radio.set_power_level(Band::A, new_pc).await {
         Ok(()) => {
             let rb = radio.get_power_level(Band::A).await.unwrap();
             let _ = radio.set_power_level(Band::A, orig_pc).await;
-            if rb == new_pc { println!("  {:<25} OK", "SetPowerLevel"); }
-            else { println!("  {:<25} FAIL (readback: {rb:?})", "SetPowerLevel"); }
+            if rb == new_pc {
+                println!("  {:<25} OK", "SetPowerLevel");
+            } else {
+                println!("  {:<25} FAIL (readback: {rb:?})", "SetPowerLevel");
+            }
         }
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetPowerLevel"),
     }
@@ -109,8 +122,11 @@ async fn verify_cat_writes() {
         Ok(()) => {
             let rb = radio.get_attenuator(Band::A).await.unwrap();
             let _ = radio.set_attenuator(Band::A, orig_ra).await;
-            if rb == !orig_ra { println!("  {:<25} OK", "SetAttenuator"); }
-            else { println!("  {:<25} FAIL", "SetAttenuator"); }
+            if rb == !orig_ra {
+                println!("  {:<25} OK", "SetAttenuator");
+            } else {
+                println!("  {:<25} FAIL", "SetAttenuator");
+            }
         }
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetAttenuator"),
     }
@@ -121,8 +137,11 @@ async fn verify_cat_writes() {
         Ok(()) => {
             let rb = radio.get_dual_band().await.unwrap();
             let _ = radio.set_dual_band(orig_dl).await;
-            if rb == !orig_dl { println!("  {:<25} OK", "SetDualBand"); }
-            else { println!("  {:<25} FAIL", "SetDualBand"); }
+            if rb == !orig_dl {
+                println!("  {:<25} OK", "SetDualBand");
+            } else {
+                println!("  {:<25} FAIL", "SetDualBand");
+            }
         }
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetDualBand"),
     }
@@ -133,8 +152,11 @@ async fn verify_cat_writes() {
         Ok(()) => {
             let rb = radio.get_lock().await.unwrap();
             let _ = radio.set_lock(orig_lc).await;
-            if rb == !orig_lc { println!("  {:<25} OK", "SetLock"); }
-            else { println!("  {:<25} FAIL", "SetLock"); }
+            if rb == !orig_lc {
+                println!("  {:<25} OK", "SetLock");
+            } else {
+                println!("  {:<25} FAIL", "SetLock");
+            }
         }
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetLock"),
     }
@@ -145,8 +167,11 @@ async fn verify_cat_writes() {
         Ok(()) => {
             let rb = radio.get_bluetooth().await.unwrap();
             let _ = radio.set_bluetooth(orig_bt).await;
-            if rb == !orig_bt { println!("  {:<25} OK", "SetBluetooth"); }
-            else { println!("  {:<25} FAIL", "SetBluetooth"); }
+            if rb == !orig_bt {
+                println!("  {:<25} OK", "SetBluetooth");
+            } else {
+                println!("  {:<25} FAIL", "SetBluetooth");
+            }
         }
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetBluetooth"),
     }
@@ -158,8 +183,11 @@ async fn verify_cat_writes() {
         Ok(()) => {
             let rb = radio.get_squelch(Band::A).await.unwrap();
             let _ = radio.set_squelch(Band::A, orig_sq).await;
-            if rb == new_sq { println!("  {:<25} OK", "SetSquelch"); }
-            else { println!("  {:<25} FAIL (readback: {rb})", "SetSquelch"); }
+            if rb == new_sq {
+                println!("  {:<25} OK", "SetSquelch");
+            } else {
+                println!("  {:<25} FAIL (readback: {rb})", "SetSquelch");
+            }
         }
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetSquelch"),
     }
@@ -171,21 +199,31 @@ async fn verify_cat_writes() {
         Ok(()) => {
             let rb = radio.get_backlight().await.unwrap();
             let _ = radio.set_backlight(orig_bl).await;
-            if rb == new_bl { println!("  {:<25} OK", "SetBacklight"); }
-            else { println!("  {:<25} FAIL (readback: {rb})", "SetBacklight"); }
+            if rb == new_bl {
+                println!("  {:<25} OK", "SetBacklight");
+            } else {
+                println!("  {:<25} FAIL (readback: {rb})", "SetBacklight");
+            }
         }
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetBacklight"),
     }
 
     // Mode
     let orig_md = radio.get_mode(Band::A).await.unwrap();
-    let new_md = if orig_md == Mode::Fm { Mode::Nfm } else { Mode::Fm };
+    let new_md = if orig_md == Mode::Fm {
+        Mode::Nfm
+    } else {
+        Mode::Fm
+    };
     match radio.set_mode(Band::A, new_md).await {
         Ok(()) => {
             let rb = radio.get_mode(Band::A).await.unwrap();
             let _ = radio.set_mode(Band::A, orig_md).await;
-            if rb == new_md { println!("  {:<25} OK", "SetMode"); }
-            else { println!("  {:<25} FAIL (readback: {rb:?})", "SetMode"); }
+            if rb == new_md {
+                println!("  {:<25} OK", "SetMode");
+            } else {
+                println!("  {:<25} FAIL (readback: {rb:?})", "SetMode");
+            }
         }
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetMode"),
     }
@@ -196,8 +234,11 @@ async fn verify_cat_writes() {
         Ok(()) => {
             let rb = radio.get_dual_watch().await.unwrap();
             let _ = radio.set_dual_watch(orig_dw).await;
-            if rb == !orig_dw { println!("  {:<25} OK", "SetDualWatch"); }
-            else { println!("  {:<25} FAIL", "SetDualWatch"); }
+            if rb == !orig_dw {
+                println!("  {:<25} OK", "SetDualWatch");
+            } else {
+                println!("  {:<25} FAIL", "SetDualWatch");
+            }
         }
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetDualWatch"),
     }

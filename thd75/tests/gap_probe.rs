@@ -43,10 +43,8 @@ async fn raw_cmd(transport: &mut SerialTransport, cmd: &str) -> Option<String> {
 #[ignore]
 async fn investigate_tn() {
     let ports = SerialTransport::discover_usb().unwrap();
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    ).unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     println!("\n=== INVESTIGATE TN ===");
 
@@ -80,10 +78,8 @@ async fn investigate_tn() {
 #[ignore]
 async fn investigate_cs() {
     let ports = SerialTransport::discover_usb().unwrap();
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    ).unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     println!("\n=== INVESTIGATE CS ===");
 
@@ -102,13 +98,18 @@ async fn investigate_cs() {
         match &resp {
             Some(r) if r == "?" || r == "N" => {
                 println!("    {cmd}: {}", r);
-                if slot > 6 { break; }
+                if slot > 6 {
+                    break;
+                }
             }
             Some(r) => {
                 let fields: Vec<&str> = r.split(',').collect();
                 println!("    {cmd}: {} fields = {:?}", fields.len(), fields);
             }
-            None => { println!("    {cmd}: TIMEOUT"); break; }
+            None => {
+                println!("    {cmd}: TIMEOUT");
+                break;
+            }
         }
     }
 
@@ -124,10 +125,8 @@ async fn investigate_cs() {
 #[ignore]
 async fn investigate_channel_names() {
     let ports = SerialTransport::discover_usb().unwrap();
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    ).unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     println!("\n=== INVESTIGATE CHANNEL NAMES ===");
 
@@ -137,7 +136,11 @@ async fn investigate_channel_names() {
         let fields: Vec<&str> = resp.split(',').collect();
         println!("    Total fields: {}", fields.len());
         for (i, f) in fields.iter().enumerate() {
-            let hex: String = f.bytes().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+            let hex: String = f
+                .bytes()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             println!("    [{i:2}] = {f:<20} hex: {hex}");
         }
     }
@@ -148,7 +151,11 @@ async fn investigate_channel_names() {
         let fields: Vec<&str> = resp.split(',').collect();
         println!("    Total fields: {}", fields.len());
         for (i, f) in fields.iter().enumerate() {
-            let hex: String = f.bytes().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+            let hex: String = f
+                .bytes()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             println!("    [{i:2}] = {f:<20} hex: {hex}");
         }
     }
@@ -188,10 +195,8 @@ async fn investigate_channel_names() {
 #[ignore]
 async fn investigate_us() {
     let ports = SerialTransport::discover_usb().unwrap();
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    ).unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     println!("\n=== INVESTIGATE US ===");
 
@@ -233,10 +238,8 @@ async fn investigate_us() {
 #[ignore]
 async fn investigate_ag() {
     let ports = SerialTransport::discover_usb().unwrap();
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    ).unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     println!("\n=== INVESTIGATE AG ===");
     // Safe: bare AG read
@@ -256,10 +259,8 @@ async fn investigate_ag() {
 #[ignore]
 async fn investigate_be() {
     let ports = SerialTransport::discover_usb().unwrap();
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    ).unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     println!("\n=== INVESTIGATE BE ===");
     println!("  BE is classified as BEACON SEND (transmit action) on D74.");

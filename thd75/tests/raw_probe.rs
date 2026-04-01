@@ -6,10 +6,8 @@ use kenwood_thd75::transport::{SerialTransport, Transport};
 
 async fn raw_exchange(cmd: &[u8]) {
     let ports = SerialTransport::discover_usb().unwrap();
-    let mut transport = SerialTransport::open(
-        &ports[0].port_name,
-        SerialTransport::DEFAULT_BAUD,
-    ).unwrap();
+    let mut transport =
+        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
 
     let cmd_str = String::from_utf8_lossy(&cmd[..cmd.len() - 1]);
     let _ = transport.write(cmd).await;
@@ -25,7 +23,8 @@ async fn raw_exchange(cmd: &[u8]) {
                 return frame;
             }
         }
-    }).await;
+    })
+    .await;
 
     match timeout {
         Ok(frame) => {

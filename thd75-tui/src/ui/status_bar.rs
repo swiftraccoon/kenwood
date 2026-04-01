@@ -35,11 +35,21 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect) {
     let mut flags = Vec::new();
     flags.push(format!("BL:{}", s.backlight));
     flags.push(format!("Vol:{}", s.af_gain));
-    if !s.lock { flags.push("LCK".into()); }       // CAT inverted on D75
-    if s.bluetooth { flags.push("BT".into()); }
-    if s.vox { flags.push("VOX".into()); }
-    if s.gps_enabled { flags.push("GPS".into()); }
-    if s.dual_band { flags.push("1BD".into()); }   // CAT inverted on D75
+    if !s.lock {
+        flags.push("LCK".into());
+    } // CAT inverted on D75
+    if s.bluetooth {
+        flags.push("BT".into());
+    }
+    if s.vox {
+        flags.push("VOX".into());
+    }
+    if s.gps_enabled {
+        flags.push("GPS".into());
+    }
+    if s.dual_band {
+        flags.push("1BD".into());
+    } // CAT inverted on D75
 
     spans.push(Span::styled(
         format!(" {} ", flags.join(" ")),
@@ -47,7 +57,11 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect) {
     ));
 
     // Target band indicator
-    let band_label = if app.target_band == kenwood_thd75::types::Band::B { "B" } else { "A" };
+    let band_label = if app.target_band == kenwood_thd75::types::Band::B {
+        "B"
+    } else {
+        "A"
+    };
     spans.push(Span::styled(
         format!("→{band_label} "),
         Style::default().fg(Color::Cyan),
@@ -55,7 +69,10 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect) {
 
     // Status message
     if let Some(ref msg) = app.status_message {
-        spans.push(Span::styled(format!("{msg} "), Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(
+            format!("{msg} "),
+            Style::default().fg(Color::Yellow),
+        ));
     }
 
     // Help hint

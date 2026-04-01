@@ -392,7 +392,9 @@ impl<'a> GpsAccess<'a> {
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(name_bytes.len());
-        String::from_utf8_lossy(&name_bytes[..nul]).trim().to_owned()
+        String::from_utf8_lossy(&name_bytes[..nul])
+            .trim()
+            .to_owned()
     }
 }
 
@@ -499,10 +501,7 @@ mod tests {
         let mut image = make_gps_image();
         image[GPS_ESTIMATED_OFFSET + GPS_POSITION_AMBIGUITY_REL] = 3;
         let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
-        assert_eq!(
-            mi.gps().position_ambiguity(),
-            GpsPositionAmbiguity::Level3
-        );
+        assert_eq!(mi.gps().position_ambiguity(), GpsPositionAmbiguity::Level3);
     }
 
     #[test]

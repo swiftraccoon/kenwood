@@ -12,8 +12,8 @@
 //! **Note:** Reading names enters programming mode. The USB connection
 //! resets afterward, so this should be the last operation.
 
-use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::Radio;
+use kenwood_thd75::transport::SerialTransport;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

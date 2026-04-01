@@ -315,14 +315,17 @@ async fn set_gateway() {
 
 #[test]
 fn serialize_set_fm_radio() {
-    use kenwood_thd75::protocol::{serialize, Command};
+    use kenwood_thd75::protocol::{Command, serialize};
     assert_eq!(serialize(&Command::SetFmRadio { enabled: true }), b"FR 1\r");
-    assert_eq!(serialize(&Command::SetFmRadio { enabled: false }), b"FR 0\r");
+    assert_eq!(
+        serialize(&Command::SetFmRadio { enabled: false }),
+        b"FR 0\r"
+    );
 }
 
 #[test]
 fn serialize_get_vfo_memory_mode() {
-    use kenwood_thd75::protocol::{serialize, Command};
+    use kenwood_thd75::protocol::{Command, serialize};
     assert_eq!(
         serialize(&Command::GetVfoMemoryMode { band: Band::A }),
         b"VM 0\r"
@@ -335,7 +338,7 @@ fn serialize_get_vfo_memory_mode() {
 
 #[test]
 fn serialize_set_frequency_step() {
-    use kenwood_thd75::protocol::{serialize, Command};
+    use kenwood_thd75::protocol::{Command, serialize};
     use kenwood_thd75::types::StepSize;
     assert_eq!(
         serialize(&Command::SetFrequencyStep {
@@ -348,37 +351,37 @@ fn serialize_set_frequency_step() {
 
 #[test]
 fn serialize_set_io_port() {
-    use kenwood_thd75::protocol::{serialize, Command};
+    use kenwood_thd75::protocol::{Command, serialize};
     assert_eq!(serialize(&Command::SetIoPort { value: 3 }), b"IO 3\r");
 }
 
 #[test]
 fn serialize_set_tnc_baud() {
-    use kenwood_thd75::protocol::{serialize, Command};
+    use kenwood_thd75::protocol::{Command, serialize};
     assert_eq!(serialize(&Command::SetTncBaud { rate: 1 }), b"AS 1\r");
 }
 
 #[test]
 fn serialize_set_beacon_type() {
-    use kenwood_thd75::protocol::{serialize, Command};
+    use kenwood_thd75::protocol::{Command, serialize};
     assert_eq!(serialize(&Command::SetBeaconType { mode: 2 }), b"PT 2\r");
 }
 
 #[test]
 fn serialize_set_dstar_slot() {
-    use kenwood_thd75::protocol::{serialize, Command};
+    use kenwood_thd75::protocol::{Command, serialize};
     assert_eq!(serialize(&Command::SetDstarSlot { slot: 5 }), b"DS 5\r");
 }
 
 #[test]
 fn serialize_set_gateway() {
-    use kenwood_thd75::protocol::{serialize, Command};
+    use kenwood_thd75::protocol::{Command, serialize};
     assert_eq!(serialize(&Command::SetGateway { value: 1 }), b"GW 1\r");
 }
 
 #[test]
 fn serialize_set_gps_config() {
-    use kenwood_thd75::protocol::{serialize, Command};
+    use kenwood_thd75::protocol::{Command, serialize};
     assert_eq!(
         serialize(&Command::SetGpsConfig {
             gps_enabled: true,
@@ -390,7 +393,7 @@ fn serialize_set_gps_config() {
 
 #[test]
 fn serialize_set_gps_sentences() {
-    use kenwood_thd75::protocol::{serialize, Command};
+    use kenwood_thd75::protocol::{Command, serialize};
     assert_eq!(
         serialize(&Command::SetGpsSentences {
             gga: true,

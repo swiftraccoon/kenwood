@@ -372,8 +372,7 @@ mod tests {
     #[test]
     fn dstar_my_callsign() {
         let mut image = make_dstar_image();
-        image[DSTAR_MY_CALLSIGN_OFFSET..DSTAR_MY_CALLSIGN_OFFSET + 8]
-            .copy_from_slice(b"N0CALL  ");
+        image[DSTAR_MY_CALLSIGN_OFFSET..DSTAR_MY_CALLSIGN_OFFSET + 8].copy_from_slice(b"N0CALL  ");
 
         let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
         let dstar = mi.dstar();
@@ -383,8 +382,7 @@ mod tests {
     #[test]
     fn dstar_my_callsign_typed() {
         let mut image = make_dstar_image();
-        image[DSTAR_MY_CALLSIGN_OFFSET..DSTAR_MY_CALLSIGN_OFFSET + 8]
-            .copy_from_slice(b"W1AW    ");
+        image[DSTAR_MY_CALLSIGN_OFFSET..DSTAR_MY_CALLSIGN_OFFSET + 8].copy_from_slice(b"W1AW    ");
 
         let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
         let dstar = mi.dstar();

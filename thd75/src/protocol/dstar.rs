@@ -24,9 +24,15 @@ pub(crate) fn parse_dstar(
     payload: &str,
 ) -> Option<Result<Response, ProtocolError>> {
     match mnemonic {
-        "DS" => Some(parse_u8_field(payload, "DS", "slot").map(|slot| Response::DstarSlot { slot })),
-        "CS" => Some(parse_u8_field(payload, "CS", "slot").map(|slot| Response::ActiveCallsignSlot { slot })),
-        "GW" => Some(parse_u8_field(payload, "GW", "value").map(|value| Response::Gateway { value })),
+        "DS" => {
+            Some(parse_u8_field(payload, "DS", "slot").map(|slot| Response::DstarSlot { slot }))
+        }
+        "CS" => Some(
+            parse_u8_field(payload, "CS", "slot").map(|slot| Response::ActiveCallsignSlot { slot }),
+        ),
+        "GW" => {
+            Some(parse_u8_field(payload, "GW", "value").map(|value| Response::Gateway { value }))
+        }
         _ => None,
     }
 }

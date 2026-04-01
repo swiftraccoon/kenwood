@@ -456,12 +456,8 @@ async fn map_all_settings() {
             test.name
         );
 
-        let diffs = map_single_setting(
-            test.name,
-            test.set_cmd.clone(),
-            test.restore_cmd.clone(),
-        )
-        .await;
+        let diffs =
+            map_single_setting(test.name, test.set_cmd.clone(), test.restore_cmd.clone()).await;
         let _ = results.insert(test.name.to_string(), diffs);
     }
 

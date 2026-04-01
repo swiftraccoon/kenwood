@@ -28,33 +28,23 @@ pub fn render_list(app: &App, frame: &mut Frame, area: Rect) {
                 .iter()
                 .map(|&i| {
                     let entry = channels.get(i);
-                    let name = entry
-                        .as_ref()
-                        .map(|e| e.name.clone())
-                        .unwrap_or_default();
+                    let name = entry.as_ref().map(|e| e.name.clone()).unwrap_or_default();
                     let freq = entry
                         .as_ref()
                         .map(|e| format!("{:.3}", e.flash.rx_frequency.as_mhz()))
                         .unwrap_or_default();
                     ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!("{i:>4}: "),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(
-                            format!("{name:<12}"),
-                            Style::default().fg(Color::White),
-                        ),
-                        Span::styled(
-                            format!(" {freq}"),
-                            Style::default().fg(Color::Cyan),
-                        ),
+                        Span::styled(format!("{i:>4}: "), Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("{name:<12}"), Style::default().fg(Color::White)),
+                        Span::styled(format!(" {freq}"), Style::default().fg(Color::Cyan)),
                     ]))
                 })
                 .collect();
 
             let mut list_state = ListState::default();
-            list_state.select(Some(app.channel_list_index.min(items.len().saturating_sub(1))));
+            list_state.select(Some(
+                app.channel_list_index.min(items.len().saturating_sub(1)),
+            ));
 
             let list = List::new(items)
                 .block(block)
@@ -118,7 +108,12 @@ pub fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
                         ]),
                         Line::from(vec![
                             Span::styled("  Name:    ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(entry.name.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                            Span::styled(
+                                entry.name.clone(),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
                         ]),
                         Line::from(""),
                         Line::from(vec![
@@ -141,12 +136,17 @@ pub fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
                             Span::styled(tone_info, Style::default().fg(Color::White)),
                         ]),
                         Line::from(""),
-                        Line::from(vec![
-                            Span::styled(
-                                format!("  [Enter] Tune Band {}", if app.target_band == kenwood_thd75::types::Band::B { "B" } else { "A" }),
-                                Style::default().fg(Color::DarkGray),
+                        Line::from(vec![Span::styled(
+                            format!(
+                                "  [Enter] Tune Band {}",
+                                if app.target_band == kenwood_thd75::types::Band::B {
+                                    "B"
+                                } else {
+                                    "A"
+                                }
                             ),
-                        ]),
+                            Style::default().fg(Color::DarkGray),
+                        )]),
                     ];
                     frame.render_widget(Paragraph::new(lines).block(block), area);
                     return;

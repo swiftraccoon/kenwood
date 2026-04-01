@@ -1299,11 +1299,7 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         Command::SetGpsConfig {
             gps_enabled,
             pc_output,
-        } => format!(
-            "GP {},{}",
-            u8::from(*gps_enabled),
-            u8::from(*pc_output)
-        ),
+        } => format!("GP {},{}", u8::from(*gps_enabled), u8::from(*pc_output)),
         Command::GetGpsMode => "GM".to_owned(),
         Command::GetGpsSentences => "GS".to_owned(),
         Command::SetGpsSentences {
@@ -1473,12 +1469,10 @@ mod tests {
         // All 55 known mnemonics. SR is write-only but its echo is still
         // recognized by the parser (returns Ok).
         let mnemonics = [
-            "AI", "AG", "BC", "BY", "DL", "DW", "ME", "MR", "PC", "RX",
-            "SQ", "SR", "SH", "TX", "UP", "VM", "FQ", "FO", "PS", "FV",
-            "BE", "ID", "CS", "TN", "BL", "GP", "GM", "SM", "RA", "BT",
-            "FS", "FT", "MD", "SF", "VD", "VG", "VX", "IO", "BS", "LC",
-            "GS", "MS", "PT", "AS", "DC", "DS", "RT", "FR", "US", "GW",
-            "SD", "0M", "AE",
+            "AI", "AG", "BC", "BY", "DL", "DW", "ME", "MR", "PC", "RX", "SQ", "SR", "SH", "TX",
+            "UP", "VM", "FQ", "FO", "PS", "FV", "BE", "ID", "CS", "TN", "BL", "GP", "GM", "SM",
+            "RA", "BT", "FS", "FT", "MD", "SF", "VD", "VG", "VX", "IO", "BS", "LC", "GS", "MS",
+            "PT", "AS", "DC", "DS", "RT", "FR", "US", "GW", "SD", "0M", "AE",
             // Extra mnemonics not in main dispatch table
             "TY", "0E",
         ];

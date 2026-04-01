@@ -19,7 +19,10 @@ pub fn render(frame: &mut Frame) {
         header("Navigation"),
         binding("Tab / Shift-Tab", "Cycle pane focus"),
         binding("1-4", "Jump to pane (BandA/B/Main/Detail)"),
-        binding("c / s / S / a / m", "Switch view (s=CAT settings, S=MCP settings)"),
+        binding(
+            "c / s / S / a / m",
+            "Switch view (s=CAT settings, S=MCP settings)",
+        ),
         Line::from(""),
         header("Channel List"),
         binding("j/k", "Navigate"),
@@ -62,10 +65,7 @@ fn header(text: &str) -> Line<'static> {
 
 fn binding(key: &str, desc: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("    {key:<20}"),
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled(format!("    {key:<20}"), Style::default().fg(Color::Yellow)),
         Span::styled(desc.to_string(), Style::default().fg(Color::White)),
     ])
 }

@@ -4,11 +4,11 @@
 //! the 9 core CAT protocol commands.
 
 use crate::error::ProtocolError;
+use crate::types::Band;
 use crate::types::channel::{ChannelMemory, ChannelName};
 use crate::types::frequency::Frequency;
 use crate::types::mode::{PowerLevel, ShiftDirection, StepSize};
 use crate::types::tone::{CtcssMode, DataSpeed, DcsCode, LockoutMode, ToneCode};
-use crate::types::Band;
 
 use super::{Command, Response};
 
@@ -187,7 +187,10 @@ fn parse_bc(payload: &str) -> Result<Response, ProtocolError> {
 /// `fields` must contain exactly 20 elements (the data fields after the
 /// band or channel prefix). `cmd` is used for error attribution.
 #[allow(clippy::too_many_lines, clippy::similar_names)]
-pub(crate) fn parse_channel_fields(fields: &[&str], cmd: &str) -> Result<ChannelMemory, ProtocolError> {
+pub(crate) fn parse_channel_fields(
+    fields: &[&str],
+    cmd: &str,
+) -> Result<ChannelMemory, ProtocolError> {
     if fields.len() != CHANNEL_FIELD_COUNT {
         return Err(ProtocolError::FieldCount {
             command: cmd.to_owned(),

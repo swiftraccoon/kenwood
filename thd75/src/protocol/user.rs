@@ -20,14 +20,11 @@ fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> 
 ///
 /// Handles US (user settings), TY (radio type/region), and 0E (MCP status).
 /// Returns `None` if the mnemonic is not handled by this module.
-pub(crate) fn parse_user(
-    mnemonic: &str,
-    payload: &str,
-) -> Option<Result<Response, ProtocolError>> {
+pub(crate) fn parse_user(mnemonic: &str, payload: &str) -> Option<Result<Response, ProtocolError>> {
     match mnemonic {
-        "US" => {
-            Some(parse_u8_field(payload, "US", "value").map(|value| Response::UserSettings { value }))
-        }
+        "US" => Some(
+            parse_u8_field(payload, "US", "value").map(|value| Response::UserSettings { value }),
+        ),
         "TY" => Some(parse_ty(payload)),
         "0E" => Some(Ok(Response::McpStatus {
             value: payload.to_owned(),

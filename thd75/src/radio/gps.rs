@@ -36,7 +36,9 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_gps_sentences(&mut self) -> Result<(bool, bool, bool, bool, bool, bool), Error> {
+    pub async fn get_gps_sentences(
+        &mut self,
+    ) -> Result<(bool, bool, bool, bool, bool, bool), Error> {
         tracing::debug!("reading GPS NMEA sentence flags");
         let response = self.execute(Command::GetGpsSentences).await?;
         match response {

@@ -21,16 +21,40 @@ fn num_span(v: u8) -> (String, Color) {
 /// Render the CAT settings list (instant writes, no disconnect).
 pub fn render_cat(app: &App, frame: &mut Frame, list_area: Rect, detail_area: Rect) {
     let rows = cat_settings();
-    render_settings_list(app, frame, list_area, detail_area, &rows, app.settings_cat_index, " Settings (CAT — instant) [Enter: toggle, +/-: adjust] ");
+    render_settings_list(
+        app,
+        frame,
+        list_area,
+        detail_area,
+        &rows,
+        app.settings_cat_index,
+        " Settings (CAT — instant) [Enter: toggle, +/-: adjust] ",
+    );
 }
 
 /// Render the MCP settings list (~3s per change, brief disconnect).
 pub fn render_mcp(app: &App, frame: &mut Frame, list_area: Rect, detail_area: Rect) {
     let rows = mcp_settings();
-    render_settings_list(app, frame, list_area, detail_area, &rows, app.settings_mcp_index, " Settings (MCP — ~3s per change) [Enter: toggle, +/-: adjust] ");
+    render_settings_list(
+        app,
+        frame,
+        list_area,
+        detail_area,
+        &rows,
+        app.settings_mcp_index,
+        " Settings (MCP — ~3s per change) [Enter: toggle, +/-: adjust] ",
+    );
 }
 
-fn render_settings_list(app: &App, frame: &mut Frame, list_area: Rect, detail_area: Rect, rows: &[SettingRow], selected_index: usize, title: &str) {
+fn render_settings_list(
+    app: &App,
+    frame: &mut Frame,
+    list_area: Rect,
+    detail_area: Rect,
+    rows: &[SettingRow],
+    selected_index: usize,
+    title: &str,
+) {
     let block = Block::default()
         .title(title.to_string())
         .borders(Borders::ALL)
@@ -62,51 +86,52 @@ fn render_settings_list(app: &App, frame: &mut Frame, list_area: Rect, detail_ar
         found
     };
 
-    let list_items: Vec<ListItem<'_>> = if matches!(app.mcp, McpState::Loaded { .. }) || rows.iter().any(|r| r.is_cat()) {
-        let mut result = Vec::new();
-        for (idx, &row) in rows.iter().enumerate() {
-            // Section header if this row starts a new group
-            if let Some(header) = row.section_header() {
-                result.push(ListItem::new(Line::from(vec![
-                    Span::styled(
+    let list_items: Vec<ListItem<'_>> =
+        if matches!(app.mcp, McpState::Loaded { .. }) || rows.iter().any(|r| r.is_cat()) {
+            let mut result = Vec::new();
+            for (idx, &row) in rows.iter().enumerate() {
+                // Section header if this row starts a new group
+                if let Some(header) = row.section_header() {
+                    result.push(ListItem::new(Line::from(vec![Span::styled(
                         format!(" {header}"),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
+                    )])));
+                }
+
+                let (val, color) = get_row_value(app, row);
+                let hint = if row.is_numeric() { " [+/-]" } else { "" };
+                let selected_marker = if idx == selected_index {
+                    "\u{25b8} "
+                } else {
+                    "  "
+                };
+                result.push(ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{selected_marker}{:<22}", row.label()),
+                        Style::default().fg(Color::White),
                     ),
+                    Span::styled(val, Style::default().fg(color)),
+                    Span::styled(hint.to_string(), Style::default().fg(Color::DarkGray)),
                 ])));
             }
-
-            let (val, color) = get_row_value(app, row);
-            let hint = if row.is_numeric() { " [+/-]" } else { "" };
-            let selected_marker = if idx == selected_index { "\u{25b8} " } else { "  " };
-            result.push(ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{selected_marker}{:<22}", row.label()),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(val, Style::default().fg(color)),
-                Span::styled(hint.to_string(), Style::default().fg(Color::DarkGray)),
-            ])));
-        }
-        result
-    } else {
-        vec![ListItem::new(" No MCP data loaded. Press [m] then [r].")]
-    };
+            result
+        } else {
+            vec![ListItem::new(" No MCP data loaded. Press [m] then [r].")]
+        };
 
     // Use ListState to scroll the list so the selected item is visible.
     // The selected item in ListState is the ListItem index, not the row slice index.
     let mut list_state = ListState::default();
     list_state.select(selected_list_idx);
 
-    let list = List::new(list_items)
-        .block(block)
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+    let list = List::new(list_items).block(block).highlight_style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
 
     frame.render_stateful_widget(list, list_area, &mut list_state);
 
@@ -116,7 +141,9 @@ fn render_settings_list(app: &App, frame: &mut Frame, list_area: Rect, detail_ar
 
     lines.push(Line::from(Span::styled(
         " Radio Identity",
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
     )));
     lines.push(kv(" Firmware", &s.firmware_version));
     lines.push(kv(" Type", &s.radio_type));
@@ -125,12 +152,14 @@ fn render_settings_list(app: &App, frame: &mut Frame, list_area: Rect, detail_ar
 
     lines.push(Line::from(Span::styled(
         " Live CAT State",
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
     )));
     lines.push(kv(" Backlight", &s.backlight.to_string()));
     lines.push(kv(" AF Gain", &s.af_gain.to_string()));
     lines.push(kv(" Beep", &on_off(s.beep)));
-    lines.push(kv(" Lock", &on_off(!s.lock)));          // CAT inverted on D75
+    lines.push(kv(" Lock", &on_off(!s.lock))); // CAT inverted on D75
     lines.push(kv(" Dual Band", &on_off(!s.dual_band))); // CAT inverted on D75
     lines.push(kv(" Bluetooth", &on_off(s.bluetooth)));
     lines.push(kv(" VOX", &on_off(s.vox)));
@@ -140,18 +169,32 @@ fn render_settings_list(app: &App, frame: &mut Frame, list_area: Rect, detail_ar
 
     lines.push(Line::from(Span::styled(
         " Band A",
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
     )));
-    lines.push(kv(" Step", &s.band_a.step_size.map_or("N/A".into(), |st| format!("{st:?}"))));
+    lines.push(kv(
+        " Step",
+        &s.band_a
+            .step_size
+            .map_or("N/A".into(), |st| format!("{st:?}")),
+    ));
     lines.push(kv(" Attenuator", &on_off(s.band_a.attenuator)));
     lines.push(kv(" Squelch", &s.band_a.squelch.to_string()));
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled(
         " Band B",
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
     )));
-    lines.push(kv(" Step", &s.band_b.step_size.map_or("N/A".into(), |st| format!("{st:?}"))));
+    lines.push(kv(
+        " Step",
+        &s.band_b
+            .step_size
+            .map_or("N/A".into(), |st| format!("{st:?}")),
+    ));
     lines.push(kv(" Attenuator", &on_off(s.band_b.attenuator)));
     lines.push(kv(" Squelch", &s.band_b.squelch.to_string()));
 
@@ -208,13 +251,11 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
 
         // --- Lock (Lock: live CAT inverted; rest: MCP) ---
         SettingRow::Lock => bool_span(!app.state.lock),
-        SettingRow::KeyLockType => mcp_str(app, |s| {
-            match s.settings().key_lock_type_raw() {
-                0 => "Key Only".into(),
-                1 => "Key+PTT".into(),
-                2 => "Key+PTT+Dial".into(),
-                v => format!("{v}"),
-            }
+        SettingRow::KeyLockType => mcp_str(app, |s| match s.settings().key_lock_type_raw() {
+            0 => "Key Only".into(),
+            1 => "Key+PTT".into(),
+            2 => "Key+PTT+Dial".into(),
+            v => format!("{v}"),
         }),
         SettingRow::LockKeyA => mcp_bool(app, |s| s.settings().lock_key_a()),
         SettingRow::LockKeyB => mcp_bool(app, |s| s.settings().lock_key_b()),
@@ -245,19 +286,27 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::VolumeLock => mcp_bool(app, |s| s.settings().volume_lock()),
 
         // --- Units ---
-        SettingRow::SpeedDistanceUnit => mcp_str(app, |s| {
-            match s.settings().speed_distance_unit_raw() {
+        SettingRow::SpeedDistanceUnit => {
+            mcp_str(app, |s| match s.settings().speed_distance_unit_raw() {
                 0 => "mph".into(),
                 1 => "km/h".into(),
                 2 => "knots".into(),
                 v => format!("{v}"),
+            })
+        }
+        SettingRow::AltitudeRainUnit => mcp_str(app, |s| {
+            if s.settings().altitude_rain_unit_raw() == 0 {
+                "ft/in".into()
+            } else {
+                "m/mm".into()
             }
         }),
-        SettingRow::AltitudeRainUnit => mcp_str(app, |s| {
-            if s.settings().altitude_rain_unit_raw() == 0 { "ft/in".into() } else { "m/mm".into() }
-        }),
         SettingRow::TemperatureUnit => mcp_str(app, |s| {
-            if s.settings().temperature_unit_raw() == 0 { "°F".into() } else { "°C".into() }
+            if s.settings().temperature_unit_raw() == 0 {
+                "°F".into()
+            } else {
+                "°C".into()
+            }
         }),
 
         // --- Bluetooth (Bluetooth: live CAT; BtAutoConnect: MCP) ---
@@ -283,15 +332,13 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
 
         // --- Battery ---
         SettingRow::BatterySaver => mcp_bool(app, |s| s.settings().battery_saver()),
-        SettingRow::AutoPowerOff => mcp_str(app, |s| {
-            match s.settings().auto_power_off_raw() {
-                0 => "Off".into(),
-                1 => "30 min".into(),
-                2 => "60 min".into(),
-                3 => "90 min".into(),
-                4 => "120 min".into(),
-                v => format!("{v}"),
-            }
+        SettingRow::AutoPowerOff => mcp_str(app, |s| match s.settings().auto_power_off_raw() {
+            0 => "Off".into(),
+            1 => "30 min".into(),
+            2 => "60 min".into(),
+            3 => "90 min".into(),
+            4 => "120 min".into(),
+            v => format!("{v}"),
         }),
 
         // --- CAT Radio Controls ---
@@ -334,7 +381,10 @@ fn mcp_num(app: &App, f: impl Fn(&kenwood_thd75::memory::MemoryImage) -> u8) -> 
 }
 
 /// Read a string from the MCP image; returns ("?", DarkGray) if not loaded.
-fn mcp_str(app: &App, f: impl Fn(&kenwood_thd75::memory::MemoryImage) -> String) -> (String, Color) {
+fn mcp_str(
+    app: &App,
+    f: impl Fn(&kenwood_thd75::memory::MemoryImage) -> String,
+) -> (String, Color) {
     if let McpState::Loaded { ref image, .. } = app.mcp {
         (f(image), Color::Yellow)
     } else {
@@ -344,10 +394,7 @@ fn mcp_str(app: &App, f: impl Fn(&kenwood_thd75::memory::MemoryImage) -> String)
 
 fn kv<'a>(label: &'a str, value: &str) -> Line<'a> {
     Line::from(vec![
-        Span::styled(
-            format!("{label:<16}"),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("{label:<16}"), Style::default().fg(Color::DarkGray)),
         Span::styled(value.to_string(), Style::default().fg(Color::White)),
     ])
 }

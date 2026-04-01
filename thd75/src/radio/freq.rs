@@ -127,9 +127,7 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn set_power_level(&mut self, band: Band, level: PowerLevel) -> Result<(), Error> {
         tracing::debug!(?band, ?level, "setting power level");
-        let response = self
-            .execute(Command::SetPowerLevel { band, level })
-            .await?;
+        let response = self.execute(Command::SetPowerLevel { band, level }).await?;
         match response {
             Response::PowerLevel { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -492,11 +490,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_frequency_step(
-        &mut self,
-        band: Band,
-        step: StepSize,
-    ) -> Result<(), Error> {
+    pub async fn set_frequency_step(&mut self, band: Band, step: StepSize) -> Result<(), Error> {
         tracing::info!(?band, ?step, "setting frequency step");
         let response = self
             .execute(Command::SetFrequencyStep { band, step })
@@ -536,9 +530,7 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn get_filter_width(&mut self, mode_index: u8) -> Result<u8, Error> {
         tracing::debug!(mode_index, "reading filter width");
-        let response = self
-            .execute(Command::GetFilterWidth { mode_index })
-            .await?;
+        let response = self.execute(Command::GetFilterWidth { mode_index }).await?;
         match response {
             Response::FilterWidth { width, .. } => Ok(width),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {

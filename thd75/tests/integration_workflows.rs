@@ -7,8 +7,7 @@ use std::path::Path;
 
 #[tokio::test]
 async fn full_session_from_fixture() {
-    let mock =
-        MockTransport::from_fixture(Path::new("tests/fixtures/basic_session.txt")).unwrap();
+    let mock = MockTransport::from_fixture(Path::new("tests/fixtures/basic_session.txt")).unwrap();
     let mut radio = Radio::connect(mock).await.unwrap();
 
     let info = radio.identify().await.unwrap();
