@@ -141,11 +141,6 @@ pub async fn spawn(
                                     let _ = tx.send(Message::RadioError(format!("Tune freq: {e}")));
                                 }
                             }
-                            crate::event::RadioCommand::SetBacklight(level) => {
-                                if let Err(e) = radio.set_backlight(level).await {
-                                    let _ = tx.send(Message::RadioError(format!("Backlight: {e} (D75 rejects BL write)")));
-                                }
-                            }
                             crate::event::RadioCommand::SetSquelch { band, level } => {
                                 if let Err(e) = radio.set_squelch(band, level).await {
                                     let _ = tx.send(Message::RadioError(format!("Set squelch: {e}")));
@@ -159,11 +154,6 @@ pub async fn spawn(
                             crate::event::RadioCommand::SetMode { band, mode } => {
                                 if let Err(e) = radio.set_mode(band, mode).await {
                                     let _ = tx.send(Message::RadioError(format!("Set mode: {e} (may require VFO mode)")));
-                                }
-                            }
-                            crate::event::RadioCommand::SetBeep(on) => {
-                                if let Err(e) = radio.set_beep(on).await {
-                                    let _ = tx.send(Message::RadioError(format!("Beep: {e} (D75 rejects BE write)")));
                                 }
                             }
                             crate::event::RadioCommand::SetLock(on) => {
@@ -196,11 +186,6 @@ pub async fn spawn(
                                     let _ = tx.send(Message::RadioError(format!("Set VOX delay: {e}")));
                                 }
                             }
-                            crate::event::RadioCommand::SetAfGain(level) => {
-                                if let Err(e) = radio.set_af_gain(Band::A, level).await {
-                                    let _ = tx.send(Message::RadioError(format!("AF gain: {e} (D75 rejects AG write)")));
-                                }
-                            }
                             crate::event::RadioCommand::SetPower { band, level } => {
                                 if let Err(e) = radio.set_power_level(band, level).await {
                                     let _ = tx.send(Message::RadioError(format!("Set power: {e}")));
@@ -221,24 +206,9 @@ pub async fn spawn(
                                     let _ = tx.send(Message::RadioError(format!("GPS config: {e}")));
                                 }
                             }
-                            crate::event::RadioCommand::SetGpsSentences(gga, gll, gsa, gsv, rmc, vtg) => {
-                                if let Err(e) = radio.set_gps_sentences(gga, gll, gsa, gsv, rmc, vtg).await {
-                                    let _ = tx.send(Message::RadioError(format!("GPS sentences: {e}")));
-                                }
-                            }
-                            crate::event::RadioCommand::SetMode { band, mode } => {
-                                if let Err(e) = radio.set_mode(band, mode).await {
-                                    let _ = tx.send(Message::RadioError(format!("Set mode: {e}")));
-                                }
-                            }
                             crate::event::RadioCommand::SetFmRadio(enabled) => {
                                 if let Err(e) = radio.set_fm_radio(enabled).await {
                                     let _ = tx.send(Message::RadioError(format!("FM radio: {e}")));
-                                }
-                            }
-                            crate::event::RadioCommand::SetIoPort(value) => {
-                                if let Err(e) = radio.set_io_port(value).await {
-                                    let _ = tx.send(Message::RadioError(format!("IO port: {e}")));
                                 }
                             }
                             crate::event::RadioCommand::SetCallsignSlot(slot) => {
@@ -333,14 +303,10 @@ async fn poll_once(radio: &mut Radio<SerialTransport>) -> Result<RadioState, Pol
     let af_gain = radio.get_af_gain().await.unwrap_or(0);
     let gps = radio.get_gps_config().await.unwrap_or((false, false));
     let beacon_type = radio.get_beacon_type().await.unwrap_or(0);
-    // DW read is unsafe — may toggle dual watch. Read from MCP cache instead.
-    let dual_watch = false;
-
     Ok(RadioState {
         band_a,
         band_b,
         backlight,
-        dual_watch,
         beep,
         lock,
         dual_band,
