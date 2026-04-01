@@ -55,7 +55,7 @@ fn band_lines(band: &BandState) -> Vec<Line<'static>> {
         Span::styled(format!("  {}  ", band.mode), Style::default().fg(Color::Cyan)),
         Span::styled("Pwr:", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            power_label(band.power_level).to_string(),
+            format!("{}", power_label(band.power_level)),
             Style::default().fg(Color::Yellow),
         ),
         Span::raw("  "),

@@ -665,6 +665,7 @@ pub struct RadioState {
     pub band_a: BandState,
     pub band_b: BandState,
     pub backlight: u8,
+    pub dual_watch: bool,
     pub beep: bool,
     pub lock: bool,
     pub dual_band: bool,
@@ -693,6 +694,7 @@ pub enum McpState {
 #[derive(Debug)]
 pub enum Message {
     Key(crossterm::event::KeyEvent),
+    Tick,
     RadioUpdate(RadioState),
     RadioError(String),
     Disconnected,
@@ -803,6 +805,7 @@ impl App {
     /// Process a message and update state. Returns true if a render is needed.
     pub fn update(&mut self, msg: Message) -> bool {
         match msg {
+            Message::Tick => false,
             Message::Quit => {
                 self.should_quit = true;
                 true

@@ -33,12 +33,16 @@ pub enum RadioCommand {
         /// The frequency in Hz.
         freq: u32,
     },
+    /// Set the backlight brightness level (BL write — D75 rejects via CAT).
+    SetBacklight(u8),
     /// Set the squelch level for the given band (SQ write — verified working).
     SetSquelch { band: kenwood_thd75::types::Band, level: u8 },
     /// Toggle the attenuator for the given band (RA write — verified working).
     SetAttenuator { band: kenwood_thd75::types::Band, enabled: bool },
     /// Set the operating mode for the given band (MD write — may return N in some modes).
     SetMode { band: kenwood_thd75::types::Band, mode: kenwood_thd75::types::Mode },
+    /// Toggle beep on/off (BE write — D75 rejects via CAT).
+    SetBeep(bool),
     /// Toggle lock on/off (LC write — verified working, value inverted on D75).
     SetLock(bool),
     /// Toggle dual band on/off (DL write — verified working, value inverted on D75).
@@ -51,14 +55,20 @@ pub enum RadioCommand {
     SetVoxGain(u8),
     /// Set VOX delay (VD write — verified working).
     SetVoxDelay(u8),
+    /// Set AF gain level (AG write — D75 rejects via CAT).
+    SetAfGain(u8),
     /// Set TNC baud rate (AS write — verified working).
     SetTncBaud(u8),
     /// Set beacon type (PT write — verified working).
     SetBeaconType(u8),
     /// Set GPS config (GP write — verified working).
     SetGpsConfig(bool, bool),
+    /// Set GPS sentences (GS write — verified working).
+    SetGpsSentences(bool, bool, bool, bool, bool, bool),
     /// Set FM radio on/off (FR write — verified working).
     SetFmRadio(bool),
+    /// Set IO port (IO write — verified working).
+    SetIoPort(u8),
     /// Set D-STAR callsign slot (CS write — verified working).
     SetCallsignSlot(u8),
     /// Set D-STAR slot (DS write — verified working).
@@ -95,12 +105,14 @@ impl EventHandler {
         let input_tx = tx.clone();
         std::thread::spawn(move || {
             loop {
-                if event::poll(TICK_RATE).expect("event poll failed")
-                    && let Event::Key(key) = event::read().expect("event read failed")
-                    && key.kind == KeyEventKind::Press
-                    && input_tx.send(Message::Key(key)).is_err()
-                {
-                    return;
+                if event::poll(TICK_RATE).expect("event poll failed") {
+                    if let Event::Key(key) = event::read().expect("event read failed") {
+                        if key.kind == KeyEventKind::Press {
+                            if input_tx.send(Message::Key(key)).is_err() {
+                                return; // Receiver dropped, app shutting down
+                            }
+                        }
+                    }
                 }
             }
         });
