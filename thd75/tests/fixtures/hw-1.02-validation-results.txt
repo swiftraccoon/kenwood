@@ -1,0 +1,119 @@
+TH-D75 Hardware Validation Results — Firmware 1.02
+Captured: 2026-03-25
+Radio: KQ4NIT-7
+Port: /dev/cu.usbmodem101
+
+================================================================================
+CORE COMMANDS
+================================================================================
+ID  OK   | sent: ID     | response: RadioId { model: "TH-D75" }
+FV  OK   | sent: FV     | response: FirmwareVersion { version: "1.02" }
+PS  OK   | sent: PS     | response: PowerStatus { on: true }
+BE  ERR  | sent: BE     | error: malformed frame: [78] (radio returned 'N')
+FQ  ERR  | sent: FQ 0   | error: expected 21 fields, got 2 (FQ uses shorter format than FO)
+FQ  ERR  | sent: FQ 1   | error: expected 21 fields, got 2
+FO  OK   | sent: FO 0   | response: FrequencyFull { band: A, rx: 145190000, tx_offset: 600000, step: Hz5000, shift: Simplex, reverse: false, tone_enable: false, ctcss_mode: Off, dcs_enable: false, cross_tone_reverse: false, flags_0a_raw: 2, tone_code: 8, ctcss_code: 8, dcs_code: 0, data_speed: Bps1200, lockout: Off, name: "CQCQCQ", data_mode: 0 }
+FO  OK   | sent: FO 1   | response: FrequencyFull { band: B, rx: 155190000, tx_offset: 600000, step: Hz5000, shift: Simplex, reverse: false, tone_enable: false, ctcss_mode: Off, dcs_enable: false, cross_tone_reverse: false, flags_0a_raw: 0, tone_code: 8, ctcss_code: 8, dcs_code: 0, data_speed: Bps1200, lockout: Off, name: "CQCQCQ", data_mode: 0 }
+PC  OK   | sent: PC 0   | response: PowerLevel { band: A, level: High }
+PC  OK   | sent: PC 1   | response: PowerLevel { band: B, level: High }
+FR  OK   | sent: FR     | response: FrequencyRange { data: "0" }
+
+================================================================================
+VFO COMMANDS
+================================================================================
+AG  OK   | sent: AG 0   | (AF gain Band A)
+AG  OK   | sent: AG 1   | (AF gain Band B)
+SQ  OK   | sent: SQ 0   | (Squelch Band A)
+SQ  OK   | sent: SQ 1   | (Squelch Band B)
+SM  OK   | sent: SM 0   | (S-meter Band A)
+SM  OK   | sent: SM 1   | (S-meter Band B)
+MD  OK   | sent: MD 0   | (Mode Band A)
+MD  OK   | sent: MD 1   | (Mode Band B)
+FS  OK   | sent: FS 0   | (Freq step Band A)
+FS  OK   | sent: FS 1   | (Freq step Band B)
+FT  OK   | sent: FT 0   | (Function type Band A)
+FT  OK   | sent: FT 1   | (Function type Band B)
+SH  OK   | sent: SH 0   | (Sub-step Band A)
+SH  OK   | sent: SH 1   | (Sub-step Band B)
+RA  OK   | sent: RA 0   | (Attenuator Band A)
+RA  OK   | sent: RA 1   | (Attenuator Band B)
+
+================================================================================
+CONTROL COMMANDS
+================================================================================
+BY  OK   | sent: BY 0   | response: Busy { band: A, busy: false }
+BY  OK   | sent: BY 1   | response: Busy { band: B, busy: false }
+DL  OK   | sent: DL     | response: DualBand { enabled: false }
+DW  ERR  | sent: DW     | error: expected 0 or 1, got "" (empty response value)
+LC  OK   | sent: LC     | response: Lock { locked: true }
+BL  OK   | sent: BL     | response: Backlight { level: 4 }
+VX  OK   | sent: VX     | response: Vox { enabled: false }
+VG  OK   | sent: VG     | response: VoxGain { gain: 4 }
+VD  OK   | sent: VD     | response: VoxDelay { delay: 1 }
+IO  OK   | sent: IO     | response: IoPort { data: "0" }
+
+================================================================================
+TONE COMMANDS
+================================================================================
+TN  ERR  | sent: TN 0   | error: radio returned ? (may need FM mode active)
+TN  ERR  | sent: TN 1   | error: radio returned ?
+DC  ERR  | sent: DC 0   | error: malformed frame: [78] (radio returned 'N')
+DC  ERR  | sent: DC 1   | error: residual buffer data from prior command (got callsign)
+RT  OK   | sent: RT     | response: RepeaterTone { data: "240101002016" }
+
+================================================================================
+MEMORY COMMANDS
+================================================================================
+ME  ERR  | sent: ME 000 | error: expected 21 fields, got 23 (ME has extra fields vs FO)
+ME  ERR  | sent: ME 001 | error: expected 21 fields, got 23
+MR  ERR  | sent: MR 000 | error: radio returned ?
+MR  ERR  | sent: MR 001 | error: radio returned ?
+0M  HANG | sent: 0M     | error: no response (hung, needs timeout)
+
+================================================================================
+APRS COMMANDS
+================================================================================
+AS  OK   | sent: AS     | response: AprsSettings { data: "0" }
+AE  OK   | sent: AE     | response: AprsExtended { data: "C3C10368,K01" }
+PT  OK   | sent: PT     | response: AprsPosition { data: "2" }
+MS  OK   | sent: MS     | response: Message { text: "0" }
+
+================================================================================
+D-STAR COMMANDS
+================================================================================
+DS  OK   | sent: DS     | response: DstarSettings { data: "1" }
+CS  OK   | sent: CS     | response: Callsign { callsign: "KQ4NIT-7" }
+GW  OK   | sent: GW     | response: Gateway { data: "0" }
+
+================================================================================
+GPS COMMANDS
+================================================================================
+GP  OK   | sent: GP     | response: GpsData { data: "0,0" }
+GM  OK   | sent: GM     | response: GpsMessage { text: "0" }
+GS  OK   | sent: GS     | response: GpsStatus { data: "1,1,1,1,1,1" }
+
+================================================================================
+SCAN COMMANDS
+================================================================================
+SR  ERR  | sent: SR     | error: radio returned ?
+SF  ERR  | sent: SF     | error: radio returned ?
+BS  OK   | sent: BS 0   | response: BandScope { band: A, data: "" }
+
+================================================================================
+SYSTEM COMMANDS
+================================================================================
+BT  OK   | sent: BT     | response: Bluetooth { enabled: true }
+SD  OK   | sent: SD     | response: SdCard { data: "1" }
+US  ERR  | sent: US     | error: radio returned ?
+
+================================================================================
+SUMMARY
+================================================================================
+Working:          36 commands
+Parse errors:      5 (BE, FQ, DW, ME, DC — fixable parser issues)
+Radio rejects:     5 (TN, MR, SR, SF, US — returned ?)
+Hung:              1 (0M — no response, needs timeout)
+Buffer issue:      1 (DC band B — residual data)
+
+Total:            48 command invocations across 53 command types
+                  (UP, TX, RX not tested — write-only/action commands)

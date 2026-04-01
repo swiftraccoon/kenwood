@@ -1,0 +1,234 @@
+TH-D75 Deep Probe — CONFIRMED SAFE READS ONLY
+Date: 2026-03-25
+Port: /dev/cu.usbmodem101
+Sources: D75-CAT-Control, LA3QMA TH-D74 docs, Hamlib
+
+===== IDENTITY =====
+  ID                        -> ID TH-D75
+  FV                        -> FV 1.03
+  AE                        -> AE C3C10368,K01
+
+===== STATUS =====
+  PS                        -> PS 1
+  AI                        -> AI 0
+  BC                        -> BC 1
+  SD                        -> SD 1
+  FR                        -> FR 0
+  IO                        -> IO 0
+  BL                        -> BL 3
+
+===== FREQUENCY (per band) =====
+  FO 0                      -> (21 fields) FO 0,0145190000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00
+  FO 1                      -> (21 fields) FO 1,0155190000,0000600000,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00
+  FQ 0                      -> FQ 0,0145190000
+  FQ 1                      -> FQ 1,0155190000
+
+===== VFO SETTINGS =====
+  AG                        -> AG 091
+  SQ 0                      -> SQ 0,2
+  SQ 1                      -> SQ 1,2
+  SM 0                      -> SM 0,0
+  SM 1                      -> SM 1,0
+  MD 0                      -> MD 0,0
+  MD 1                      -> MD 1,0
+  PC 0                      -> PC 0,0
+  PC 1                      -> PC 1,0
+  RA 0                      -> RA 0,0
+  RA 1                      -> RA 1,0
+  FS                        -> FS 0
+  FT                        -> FT 0
+  SH 0                      -> SH 0,1
+  SH 1                      -> SH 1,2
+  SH 2                      -> SH 2,2
+
+===== CONTROL SETTINGS =====
+  DL                        -> DL 0
+  LC                        -> LC 1
+  VX                        -> VX 0
+  VG                        -> VG 4
+  VD                        -> VD 1
+  BY 0                      -> BY 0,0
+  BY 1                      -> BY 1,0
+  VM 0                      -> VM 0,1
+  VM 1                      -> VM 1,1
+
+===== TONE SETTINGS =====
+  TN                        -> TN 0,0
+  RT                        -> RT 240101084546
+
+===== D-STAR =====
+  DS                        -> DS 1
+  DC 1                      -> (3 fields) DC 1,KQ4NIT  ,D75A
+  DC 2                      -> (3 fields) DC 2,KQ4NIT,
+  DC 3                      -> (3 fields) DC 3,,
+  DC 4                      -> (3 fields) DC 4,,
+  DC 5                      -> (3 fields) DC 5,,
+  DC 6                      -> (3 fields) DC 6,,
+  CS                        -> CS 10
+  GW                        -> GW 0
+
+===== GPS =====
+  GP                        -> GP 0,0
+  GM                        -> GM 0
+  GS                        -> (6 fields) GS 1,1,1,1,1,1
+
+===== BLUETOOTH =====
+  BT                        -> BT 1
+
+===== APRS =====
+  AS                        -> AS 0
+  PT                        -> PT 2
+  MS                        -> MS 0
+
+===== USER SETTINGS =====
+  US                        -> ?
+
+===== SCAN =====
+  SF 0                      -> SF 0,0
+  SF 1                      -> SF 1,0
+  BS 0                      -> BS 0
+  BS 1                      -> BS 1
+
+===== MEMORY CHANNELS (0-999) =====
+  ME 000  freq=0154205000   urcall=CQCQCQ     (23 fields)
+  ME 001  freq=0155220000   urcall=CQCQCQ     (23 fields)
+  ME 002  freq=0155280000   urcall=CQCQCQ     (23 fields)
+  ME 003  freq=0155340000   urcall=CQCQCQ     (23 fields)
+  ME 004  freq=0155055000   urcall=CQCQCQ     (23 fields)
+  ME 005  freq=0159195000   urcall=CQCQCQ     (23 fields)
+  ME 006  freq=0155295000   urcall=CQCQCQ     (23 fields)
+  ME 007  freq=0151055000   urcall=CQCQCQ     (23 fields)
+  ME 008  freq=0154175000   urcall=CQCQCQ     (23 fields)
+  ME 009  freq=0159172500   urcall=CQCQCQ     (23 fields)
+  ME 010  freq=0154845000   urcall=CQCQCQ     (23 fields)
+  ME 011  freq=0154875000   urcall=CQCQCQ     (23 fields)
+  ME 012  freq=0155085000   urcall=CQCQCQ     (23 fields)
+  ME 013  freq=0453200000   urcall=CQCQCQ     (23 fields)
+  ME 014  freq=0159870000   urcall=CQCQCQ     (23 fields)
+  ME 015  freq=0155370000   urcall=CQCQCQ     (23 fields)
+  ME 016  freq=0154860000   urcall=CQCQCQ     (23 fields)
+  ME 017  freq=0154875000   urcall=CQCQCQ     (23 fields)
+  ME 018  freq=0155190000   urcall=CQCQCQ     (23 fields)
+  ME 019  freq=0159255000   urcall=CQCQCQ     (23 fields)
+  ME 020  freq=0053130000   urcall=CQCQCQ     (23 fields)
+  ME 021  freq=0145190000   urcall=CQCQCQ     (23 fields)
+  ME 022  freq=0145210000   urcall=CQCQCQ     (23 fields)
+  ME 023  freq=0145270000   urcall=CQCQCQ     (23 fields)
+  ME 024  freq=0145330000   urcall=CQCQCQ     (23 fields)
+  ME 025  freq=0145370000   urcall=CQCQCQ     (23 fields)
+  ME 026  freq=0145430000   urcall=CQCQCQ     (23 fields)
+  ME 027  freq=0146640000   urcall=CQCQCQ     (23 fields)
+  ME 028  freq=0146745000   urcall=CQCQCQ     (23 fields)
+  ME 029  freq=0146820000   urcall=CQCQCQ     (23 fields)
+  ME 030  freq=0146850000   urcall=CQCQCQ     (23 fields)
+  ME 031  freq=0146880000   urcall=CQCQCQ     (23 fields)
+  ME 032  freq=0146985000   urcall=CQCQCQ     (23 fields)
+  ME 033  freq=0147045000   urcall=CQCQCQ     (23 fields)
+  ME 034  freq=0147105000   urcall=CQCQCQ     (23 fields)
+  ME 035  freq=0147150000   urcall=CQCQCQ     (23 fields)
+  ME 036  freq=0147240000   urcall=CQCQCQ     (23 fields)
+  ME 037  freq=0147285000   urcall=CQCQCQ     (23 fields)
+  ME 038  freq=0147345000   urcall=CQCQCQ     (23 fields)
+  ME 039  freq=0224060000   urcall=CQCQCQ     (23 fields)
+  ME 040  freq=0224240000   urcall=CQCQCQ     (23 fields)
+  ME 041  freq=0224460000   urcall=CQCQCQ     (23 fields)
+  ME 042  freq=0224500000   urcall=CQCQCQ     (23 fields)
+  ME 043  freq=0224540000   urcall=CQCQCQ     (23 fields)
+  ME 044  freq=0224640000   urcall=CQCQCQ     (23 fields)
+  ME 045  freq=0224960000   urcall=CQCQCQ     (23 fields)
+  ME 046  freq=0441675000   urcall=CQCQCQ     (23 fields)
+  ME 047  freq=0441950000   urcall=CQCQCQ     (23 fields)
+  ME 048  freq=0442000000   urcall=CQCQCQ     (23 fields)
+  ME 049  freq=0442500000   urcall=CQCQCQ     (23 fields)
+  ME 050  freq=0442550000   urcall=CQCQCQ     (23 fields)
+  ME 051  freq=0442800000   urcall=CQCQCQ     (23 fields)
+  ME 052  freq=0443300000   urcall=CQCQCQ     (23 fields)
+  ME 053  freq=0443625000   urcall=CQCQCQ     (23 fields)
+  ME 054  freq=0443650000   urcall=CQCQCQ     (23 fields)
+  ME 055  freq=0443800000   urcall=CQCQCQ     (23 fields)
+  ME 056  freq=0444000000   urcall=CQCQCQ     (23 fields)
+  ME 057  freq=0444250000   urcall=CQCQCQ     (23 fields)
+  ME 058  freq=0444325000   urcall=CQCQCQ     (23 fields)
+  ME 059  freq=0444375000   urcall=CQCQCQ     (23 fields)
+  ME 060  freq=0444800000   urcall=CQCQCQ     (23 fields)
+  ME 061  freq=0444975000   urcall=CQCQCQ     (23 fields)
+  ME 062  freq=0053130000   urcall=CQCQCQ     (23 fields)
+  ME 063  freq=0053190000   urcall=CQCQCQ     (23 fields)
+  ME 064  freq=0053270000   urcall=CQCQCQ     (23 fields)
+  ME 065  freq=0053290000   urcall=CQCQCQ     (23 fields)
+  ME 066  freq=0053410000   urcall=CQCQCQ     (23 fields)
+  ME 067  freq=0053950000   urcall=CQCQCQ     (23 fields)
+  ME 068  freq=0145150000   urcall=CQCQCQ     (23 fields)
+  ME 069  freq=0145190000   urcall=CQCQCQ     (23 fields)
+  ME 070  freq=0145270000   urcall=CQCQCQ     (23 fields)
+  ME 071  freq=0145310000   urcall=CQCQCQ     (23 fields)
+  ME 072  freq=0145330000   urcall=CQCQCQ     (23 fields)
+  ME 073  freq=0145350000   urcall=CQCQCQ     (23 fields)
+  ME 074  freq=0145390000   urcall=CQCQCQ     (23 fields)
+  ME 075  freq=0145410000   urcall=CQCQCQ     (23 fields)
+  ME 076  freq=0145470000   urcall=CQCQCQ     (23 fields)
+  ME 077  freq=0146610000   urcall=CQCQCQ     (23 fields)
+  ME 078  freq=0146640000   urcall=CQCQCQ     (23 fields)
+  ME 079  freq=0146730000   urcall=CQCQCQ     (23 fields)
+  ME 080  freq=0146760000   urcall=CQCQCQ     (23 fields)
+  ME 081  freq=0146790000   urcall=CQCQCQ     (23 fields)
+  ME 082  freq=0146835000   urcall=CQCQCQ     (23 fields)
+  ME 083  freq=0146910000   urcall=CQCQCQ     (23 fields)
+  ME 084  freq=0146955000   urcall=CQCQCQ     (23 fields)
+  ME 085  freq=0146985000   urcall=CQCQCQ     (23 fields)
+  ME 086  freq=0147060000   urcall=CQCQCQ     (23 fields)
+  ME 087  freq=0147090000   urcall=CQCQCQ     (23 fields)
+  ME 088  freq=0147105000   urcall=CQCQCQ     (23 fields)
+  ME 089  freq=0147165000   urcall=CQCQCQ     (23 fields)
+  ME 090  freq=0147210000   urcall=CQCQCQ     (23 fields)
+  ME 091  freq=0147240000   urcall=CQCQCQ     (23 fields)
+  ME 092  freq=0147285000   urcall=CQCQCQ     (23 fields)
+  ME 093  freq=0147345000   urcall=CQCQCQ     (23 fields)
+  ME 094  freq=0147375000   urcall=CQCQCQ     (23 fields)
+  ME 095  freq=0222120000   urcall=CQCQCQ     (23 fields)
+  ME 096  freq=0224140000   urcall=CQCQCQ     (23 fields)
+  ME 097  freq=0224240000   urcall=CQCQCQ     (23 fields)
+  ME 098  freq=0224260000   urcall=CQCQCQ     (23 fields)
+  ME 099  freq=0224320000   urcall=CQCQCQ     (23 fields)
+  ME 100  freq=0224360000   urcall=CQCQCQ     (23 fields)
+  ME 101  freq=0224440000   urcall=CQCQCQ     (23 fields)
+  ME 102  freq=0224520000   urcall=CQCQCQ     (23 fields)
+  ME 103  freq=0224540000   urcall=CQCQCQ     (23 fields)
+  ME 104  freq=0224600000   urcall=CQCQCQ     (23 fields)
+  ME 105  freq=0224640000   urcall=CQCQCQ     (23 fields)
+  ME 106  freq=0224660000   urcall=CQCQCQ     (23 fields)
+  ME 107  freq=0224740000   urcall=CQCQCQ     (23 fields)
+  ME 108  freq=0441850000   urcall=CQCQCQ     (23 fields)
+  ME 109  freq=0441975000   urcall=CQCQCQ     (23 fields)
+  ME 110  freq=0442000000   urcall=CQCQCQ     (23 fields)
+  ME 111  freq=0442050000   urcall=CQCQCQ     (23 fields)
+  ME 112  freq=0442150000   urcall=CQCQCQ     (23 fields)
+  ME 113  freq=0442175000   urcall=CQCQCQ     (23 fields)
+  ME 114  freq=0442400000   urcall=CQCQCQ     (23 fields)
+  ME 115  freq=0442500000   urcall=CQCQCQ     (23 fields)
+  ME 116  freq=0442550000   urcall=CQCQCQ     (23 fields)
+  ME 117  freq=0442650000   urcall=CQCQCQ     (23 fields)
+  ME 118  freq=0442850000   urcall=CQCQCQ     (23 fields)
+  ME 119  freq=0442925000   urcall=CQCQCQ     (23 fields)
+  ME 120  freq=0443125000   urcall=CQCQCQ     (23 fields)
+  ME 121  freq=0443150000   urcall=CQCQCQ     (23 fields)
+  ME 122  freq=0443275000   urcall=CQCQCQ     (23 fields)
+  ME 123  freq=0443300000   urcall=CQCQCQ     (23 fields)
+  ME 124  freq=0443575000   urcall=CQCQCQ     (23 fields)
+  ME 125  freq=0443650000   urcall=CQCQCQ     (23 fields)
+  ME 126  freq=0443750000   urcall=CQCQCQ     (23 fields)
+  ME 127  freq=0443925000   urcall=CQCQCQ     (23 fields)
+  ME 128  freq=0444050000   urcall=CQCQCQ     (23 fields)
+  ME 129  freq=0444250000   urcall=CQCQCQ     (23 fields)
+  ME 130  freq=0444600000   urcall=CQCQCQ     (23 fields)
+  ME 131  freq=0444650000   urcall=CQCQCQ     (23 fields)
+  ME 132  freq=0444675000   urcall=CQCQCQ     (23 fields)
+  ME 133  freq=0444700000   urcall=CQCQCQ     (23 fields)
+  ME 134  freq=0444775000   urcall=CQCQCQ     (23 fields)
+  ME 135  freq=0444850000   urcall=CQCQCQ     (23 fields)
+  ME 136  freq=0444875000   urcall=CQCQCQ     (23 fields)
+  ME 137  freq=0444875000   urcall=CQCQCQ     (23 fields)
+  ME 138  freq=0444875000   urcall=CQCQCQ     (23 fields)
+  ME 139  freq=0444975000   urcall=CQCQCQ     (23 fields)
+  ME 239+: 100 consecutive empty, stopping (found 140 total)
+  Total populated channels: 140

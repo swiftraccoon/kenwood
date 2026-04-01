@@ -1,0 +1,37 @@
+TH-D75 Mnemonic Brute-Force Scan Results
+Firmware: 1.03
+Scanned: 1296/1296
+Commands found: 32
+
+  AE     -> AE C3C10368,K01
+  AG     -> AG 091
+  AI     -> AI 0
+  AS     -> AS 0
+  BL     -> BL 3
+  BS     -> BS 1
+  BT     -> BT 1
+  CS     -> CS 10
+  DL     -> DL 0
+  DS     -> DS 1
+  FR     -> FR 0
+  FS     -> FS 0
+  FT     -> FT 0
+  FV     -> FV 1.03
+  GM     -> GM 0
+  GP     -> GP 0,0
+  GS     -> GS 1,1,1,1,1,1
+  GW     -> GW 0
+  ID     -> ID TH-D75
+  IO     -> IO 0
+  LC     -> LC 1
+  MS     -> MS 0
+  PS     -> PS 1
+  PT     -> PT 2
+  RT     -> RT 240101085815
+  SD     -> SD 1
+  TN     -> TN 0,0
+  TY     -> TY K,2
+  VD     -> VD 1
+  VG     -> VG 4
+  VX     -> VX 0
+  0E     -> N (not available in current mode)

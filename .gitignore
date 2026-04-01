@@ -1,0 +1,20 @@
+# Build
+/target
+*/target
+Cargo.lock
+
+# Local
+*.log
+.DS_Store
+.superpowers/
+.claude/
+
+# Private
+docs/
+notes/
+research/
+thd75_re/
+*.pdf
+*.md
+
+-README.md

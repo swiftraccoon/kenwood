@@ -1,0 +1,79 @@
+CAT Command Verification Results
+================================
+
+OK           ID                        ID TH-D75
+OK           FV                        FV 1.03
+OK           AE                        AE C3C10368,K01
+OK           TY                        TY K,2
+OK           PS                        PS 1
+OK           AI                        AI 0
+OK           BC                        BC 1
+OK           BT                        BT 1
+OK           SD                        SD 1
+OK           FR                        FR 0
+OK           IO                        IO 0
+OK           BL                        BL 3
+OK           FO 0                      FO 0,0145190000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00
+OK           FQ 0                      FQ 0,0145190000
+OK           SM 0                      SM 0,0
+OK           SQ 0                      SQ 0,2
+OK           MD 0                      MD 0,0
+OK           PC 0                      PC 0,0
+OK           RA 0                      RA 0,0
+OK           BY 0                      BY 0,0
+OK           VM 0                      VM 0,1
+OK           FO 1                      FO 1,0154875000,0000600000,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00
+OK           FQ 1                      FQ 1,0154875000
+OK           SM 1                      SM 1,0
+OK           SQ 1                      SQ 1,2
+OK           MD 1                      MD 1,0
+OK           PC 1                      PC 1,0
+OK           RA 1                      RA 1,0
+OK           BY 1                      BY 1,0
+OK           VM 1                      VM 1,1
+REJECTED     TN 0                      ?
+NOT_AVAIL    DC 0                      N
+REJECTED     RT 0                      ?
+NOT_AVAIL    FS 0                      N
+OK           SF 0                      SF 0,0
+OK           BS 0                      BS 0
+REJECTED     TN 1                      ?
+OK           DC 1                      DC 1,KQ4NIT  ,D75A
+REJECTED     RT 1                      ?
+NOT_AVAIL    FS 1                      N
+OK           SF 1                      SF 1,0
+OK           BS 1                      BS 1
+OK           AG                        AG 091
+OK           DL                        DL 0
+OK           DW                        DW
+OK           LC                        LC 1
+OK           VX                        VX 0
+OK           VG                        VG 4
+OK           VD                        VD 1
+OK           FT                        FT 0
+NOT_AVAIL    BE                        N
+REJECTED     SH                        ?
+OK           SH 0                      SH 0,1
+REJECTED     AG 0                      ?
+REJECTED     AG 1                      ?
+OK           TN                        TN 0,0
+OK           DS                        DS 1
+OK           CS                        CS 10
+OK           GW                        GW 0
+OK           DC 1                      DC 1,KQ4NIT  ,D75A
+OK           DC 2                      DC 2,KQ4NIT,
+OK           DC 3                      DC 3,,
+OK           DC 4                      DC 4,,
+OK           DC 5                      DC 5,,
+OK           DC 6                      DC 6,,
+OK           GP                        GP 0,0
+OK           GM                        GM 0
+OK           GS                        GS 1,1,1,1,1,1
+OK           AS                        AS 0
+OK           PT                        PT 2
+OK           MS                        MS 0
+OK           RT                        RT 240104101345
+REJECTED     SR                        ?
+OK           ME 000                    ME 000,0154205000,0000600000,0,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00,0
+OK           MR 0                      MR 021
+REJECTED     US                        ?

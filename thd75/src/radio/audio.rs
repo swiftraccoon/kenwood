@@ -1,0 +1,251 @@
+//! Audio control methods.
+//!
+//! Controls AF (Audio Frequency) gain (band-indexed) and VOX (Voice-Operated
+//! Exchange) settings for hands-free transmit.
+//!
+//! # D75 tone commands
+//!
+//! The D75 firmware RE originally identified TN, DC, and RT as tone commands.
+//! Hardware testing revealed their actual functions:
+//! - **TN**: TNC mode (not CTCSS tone)
+//! - **DC**: D-STAR callsign slots (not DCS code)
+//! - **RT**: Real-time clock (not repeater tone)
+//!
+//! CTCSS tone and DCS code are instead configured through the FO (full
+//! frequency/offset) command's channel data fields.
+
+use crate::error::{Error, ProtocolError};
+use crate::protocol::{Command, Response};
+use crate::transport::Transport;
+use crate::types::Band;
+
+use super::Radio;
+
+impl<T: Transport> Radio<T> {
+    /// Get the AF gain level (AG read).
+    ///
+    /// D75 RE: bare `AG\r` returns global gain level. Band-indexed read
+    /// returns `?`, so this is a global query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn get_af_gain(&mut self) -> Result<u8, Error> {
+        tracing::debug!("reading AF gain");
+        let response = self.execute(Command::GetAfGain).await?;
+        match response {
+            Response::AfGain { level } => Ok(level),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "AfGain".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set the AF gain level for a band (AG write).
+    ///
+    /// D75 RE: `AG x,y` (x: band 0/1, y: gain 0-39).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_af_gain(&mut self, band: Band, level: u8) -> Result<(), Error> {
+        tracing::debug!(?band, level, "setting AF gain");
+        let response = self.execute(Command::SetAfGain { band, level }).await?;
+        match response {
+            Response::AfGain { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "AfGain".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Get the TNC mode (TN bare read).
+    ///
+    /// Hardware-verified: bare `TN\r` returns `TN mode,setting`.
+    /// Returns `(mode, setting)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn get_tnc_mode(&mut self) -> Result<(u8, u8), Error> {
+        tracing::debug!("reading TNC mode");
+        let response = self.execute(Command::GetTncMode).await?;
+        match response {
+            Response::TncMode { mode, setting } => Ok((mode, setting)),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "TncMode".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Get D-STAR callsign data for a slot (DC read).
+    ///
+    /// Hardware-verified: `DC slot\r` where slot is 1-6.
+    /// Returns `(callsign, suffix)`.
+    ///
+    /// Note: This method lives in `audio.rs` rather than `dstar.rs` because
+    /// it was discovered during audio subsystem hardware probing. The `DC`
+    /// mnemonic is overloaded on the D75 (DCS code, not D-STAR callsign
+    /// as on D74).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn get_dstar_callsign(&mut self, slot: u8) -> Result<(String, String), Error> {
+        tracing::debug!(slot, "reading D-STAR callsign");
+        let response = self.execute(Command::GetDstarCallsign { slot }).await?;
+        match response {
+            Response::DstarCallsign {
+                callsign, suffix, ..
+            } => Ok((callsign, suffix)),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "DstarCallsign".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Get the real-time clock (RT bare read).
+    ///
+    /// Note: This method lives in `audio.rs` rather than `system.rs` because
+    /// `RT` is overloaded on the D75 (repeater tone vs real-time clock on D74).
+    /// It was discovered during audio subsystem probing.
+    ///
+    /// Hardware-verified: bare `RT\r` returns `RT YYMMDDHHmmss`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn get_real_time_clock(&mut self) -> Result<String, Error> {
+        tracing::debug!("reading real-time clock");
+        let response = self.execute(Command::GetRealTimeClock).await?;
+        match response {
+            Response::RealTimeClock { datetime } => Ok(datetime),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "RealTimeClock".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Get the VOX enabled state (VX read).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn get_vox(&mut self) -> Result<bool, Error> {
+        tracing::debug!("reading VOX state");
+        let response = self.execute(Command::GetVox).await?;
+        match response {
+            Response::Vox { enabled } => Ok(enabled),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "Vox".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set the VOX enabled state (VX write).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_vox(&mut self, enabled: bool) -> Result<(), Error> {
+        tracing::debug!(enabled, "setting VOX state");
+        let response = self.execute(Command::SetVox { enabled }).await?;
+        match response {
+            Response::Vox { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "Vox".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Get the VOX gain level (VG read).
+    ///
+    /// # Mode requirement
+    /// VOX must be enabled (`VX 1`) for VG read to succeed.
+    /// Returns `N` (not available) when VOX is off.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn get_vox_gain(&mut self) -> Result<u8, Error> {
+        tracing::debug!("reading VOX gain");
+        let response = self.execute(Command::GetVoxGain).await?;
+        match response {
+            Response::VoxGain { gain } => Ok(gain),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "VoxGain".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set the VOX gain level (VG write).
+    ///
+    /// # Mode requirement
+    /// VOX must be enabled (`VX 1`) for VG write to succeed.
+    /// Returns `N` (not available) when VOX is off.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_vox_gain(&mut self, gain: u8) -> Result<(), Error> {
+        tracing::debug!(gain, "setting VOX gain");
+        let response = self.execute(Command::SetVoxGain { gain }).await?;
+        match response {
+            Response::VoxGain { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "VoxGain".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Get the VOX delay value (VD read).
+    ///
+    /// # Mode requirement
+    /// VOX must be enabled (`VX 1`) for VD read to succeed.
+    /// Returns `N` (not available) when VOX is off.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn get_vox_delay(&mut self) -> Result<u8, Error> {
+        tracing::debug!("reading VOX delay");
+        let response = self.execute(Command::GetVoxDelay).await?;
+        match response {
+            Response::VoxDelay { delay } => Ok(delay),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "VoxDelay".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set the VOX delay value (VD write).
+    ///
+    /// # Mode requirement
+    /// VOX must be enabled (`VX 1`) for VD write to succeed.
+    /// Returns `N` (not available) when VOX is off.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_vox_delay(&mut self, delay: u8) -> Result<(), Error> {
+        tracing::debug!(delay, "setting VOX delay");
+        let response = self.execute(Command::SetVoxDelay { delay }).await?;
+        match response {
+            Response::VoxDelay { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "VoxDelay".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+}

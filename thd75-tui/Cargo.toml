@@ -1,0 +1,17 @@
+[package]
+name = "thd75-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Terminal UI for the Kenwood TH-D75 transceiver"
+license = "MIT OR Apache-2.0"
+authors = ["Dylan Hawkins <dylan@wnc.dev>"]
+
+[dependencies]
+kenwood-thd75 = { path = "../thd75" }
+ratatui = "0.29"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+dirs = "6"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
