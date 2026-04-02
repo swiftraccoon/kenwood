@@ -60,7 +60,7 @@ ci_pod() {
 ci_pod "ubuntu" "rust:1.89" "" &
 UBUNTU_PID=$!
 
-ci_pod "fedora" "fedora:latest" "dnf install -y gcc rust cargo clippy 2>/dev/null | tail -1" &
+ci_pod "fedora" "fedora:latest" "dnf install -y gcc 2>/dev/null | tail -1 && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.89.0 -c clippy 2>/dev/null | tail -1 && source \$HOME/.cargo/env" &
 FEDORA_PID=$!
 
 wait $UBUNTU_PID
