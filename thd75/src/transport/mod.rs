@@ -6,13 +6,13 @@
 //!
 //! Implementations:
 //! - [`SerialTransport`] — USB serial connections (and BT via `/dev/cu.*`)
-//! - [`BluetoothTransport`] — Native macOS `IOBluetooth` RFCOMM (macOS only)
+//! - `BluetoothTransport` — Native macOS `IOBluetooth` RFCOMM (macOS only)
 //! - [`MockTransport`] — Programmed exchanges for testing
 //!
-//! On macOS, prefer [`BluetoothTransport`] over [`SerialTransport`] for BT
+//! On macOS, prefer `BluetoothTransport` over [`SerialTransport`] for BT
 //! connections. The macOS serial port driver has a bug where closing and
 //! reopening `/dev/cu.TH-D75` kills the RFCOMM channel permanently.
-//! [`BluetoothTransport`] talks directly to the RFCOMM channel via
+//! `BluetoothTransport` talks directly to the RFCOMM channel via
 //! `IOBluetooth` and can be closed and reopened without issues.
 
 #[cfg(target_os = "macos")]
