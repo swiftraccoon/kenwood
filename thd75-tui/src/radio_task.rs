@@ -103,8 +103,10 @@ pub async fn spawn_with_transport(
     let path_clone = path.clone();
 
     tokio::spawn(async move {
-        // Track S-meter state from AI-pushed BY notifications.
-        // BY is the gate: squelch open → poll SM once; squelch closed → zero meter.
+        // AI notification state — these fields are updated by push notifications
+        // from the radio (AI mode) rather than polling. This reduces USB traffic,
+        // provides instant updates, and avoids firmware quirks (e.g., spurious
+        // SM/BY spikes on Band B when polled directly).
         let mut s_meter_a: u8 = 0;
         let mut s_meter_b: u8 = 0;
         let mut busy_a = false;
@@ -132,25 +134,34 @@ pub async fn spawn_with_transport(
                         }
                     }
                     Ok(notification) = notifications.recv() => {
-                        // Process AI-pushed BY notifications as SM gate.
+                        // Process AI-pushed notifications. The radio sends these
+                        // automatically when state changes (AI 1 mode). This is
+                        // faster than polling and avoids firmware quirks.
                         use kenwood_thd75::protocol::Response;
-                        if let Response::Busy { band, busy } = notification {
-                            if busy {
-                                // Squelch opened — poll SM for actual signal level
-                                if let Ok(level) = radio.get_smeter(band).await {
+                        match notification {
+                            Response::Busy { band, busy } => {
+                                // BY gate: squelch open → poll SM; closed → zero meter
+                                if busy {
+                                    if let Ok(level) = radio.get_smeter(band).await {
+                                        match band {
+                                            Band::A => { s_meter_a = level; busy_a = true; }
+                                            Band::B => { s_meter_b = level; busy_b = true; }
+                                            _ => {}
+                                        }
+                                    }
+                                } else {
                                     match band {
-                                        Band::A => { s_meter_a = level; busy_a = true; }
-                                        Band::B => { s_meter_b = level; busy_b = true; }
+                                        Band::A => { s_meter_a = 0; busy_a = false; }
+                                        Band::B => { s_meter_b = 0; busy_b = false; }
                                         _ => {}
                                     }
                                 }
-                            } else {
-                                // Squelch closed — zero the meter
-                                match band {
-                                    Band::A => { s_meter_a = 0; busy_a = false; }
-                                    Band::B => { s_meter_b = 0; busy_b = false; }
-                                    _ => {}
-                                }
+                            }
+                            _ => {
+                                // Other AI notifications (FQ, MD, SQ, VM, etc.) are
+                                // handled implicitly — the next poll cycle will read
+                                // the updated values. AI mode ensures we don't miss
+                                // rapid changes between poll cycles.
                             }
                         }
                     }
@@ -199,7 +210,7 @@ pub async fn spawn_with_transport(
                                 // Don't break — stay in poll loop, radio is still connected
                             }
                             crate::event::RadioCommand::FreqUp(band) => {
-                                if let Err(e) = radio.freq_up(band).await {
+                                if let Err(e) = radio.frequency_up(band).await {
                                     let _ = tx.send(Message::RadioError(format!("Freq up: {e}")));
                                 }
                             }

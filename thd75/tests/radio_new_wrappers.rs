@@ -78,14 +78,14 @@ async fn recall_channel_band_b() {
     radio.recall_channel(Band::B, 0).await.unwrap();
 }
 
-// ---- UP: freq_up ----
+// ---- UP: frequency_up ----
 
 #[tokio::test]
-async fn freq_up() {
+async fn frequency_up() {
     let mut mock = MockTransport::new();
     mock.expect(b"UP 0\r", b"UP 0\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio.freq_up(Band::A).await.unwrap();
+    radio.frequency_up(Band::A).await.unwrap();
 }
 
 // ---- FR: get_fm_radio / set_fm_radio ----

@@ -107,6 +107,52 @@ impl<T: Transport> Radio<T> {
         }
     }
 
+    /// Set all lock/control fields (LC 6-field write).
+    ///
+    /// Sends the full `LC a,b,c,d,e,f` format to configure all lock
+    /// parameters at once. See [`Command::SetLockFull`] for field docs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    #[allow(clippy::fn_params_excessive_bools)]
+    pub async fn set_lock_full(
+        &mut self,
+        locked: bool,
+        lock_type: u8,
+        lock_a: bool,
+        lock_b: bool,
+        lock_c: bool,
+        lock_ptt: bool,
+    ) -> Result<(), Error> {
+        tracing::info!(
+            locked,
+            lock_type,
+            lock_a,
+            lock_b,
+            lock_c,
+            lock_ptt,
+            "setting full lock configuration"
+        );
+        let response = self
+            .execute(Command::SetLockFull {
+                locked,
+                lock_type,
+                lock_a,
+                lock_b,
+                lock_c,
+                lock_ptt,
+            })
+            .await?;
+        match response {
+            Response::Lock { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "Lock".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
     /// Get the dual-band enabled state (DL read).
     ///
     /// # Errors
@@ -395,6 +441,35 @@ impl<T: Transport> Radio<T> {
         tracing::info!(enabled, offset = OFFSET, "setting key beep via MCP");
         self.modify_memory_page(PAGE, |data| {
             data[BYTE_INDEX] = u8::from(enabled);
+        })
+        .await
+    }
+
+    /// Set beep volume level via MCP memory write.
+    ///
+    /// The CAT `BE` command only supports on/off — volume level must be
+    /// set via MCP. Writes directly to verified MCP offset (`0x1072`).
+    /// Volume range is 0–7 (per Menu 915 in the Operating Tips §5.6.1).
+    ///
+    /// # Connection lifetime
+    ///
+    /// This enters MCP programming mode. The USB connection drops after
+    /// exit. The `Radio` instance should be dropped and a fresh connection
+    /// established for subsequent CAT commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if entering programming mode, reading the page,
+    /// writing the page, or exiting programming mode fails.
+    pub async fn set_beep_volume_via_mcp(&mut self, volume: u8) -> Result<(), Error> {
+        const OFFSET: usize = 0x1072;
+        #[allow(clippy::cast_possible_truncation)]
+        const PAGE: u16 = (OFFSET / 256) as u16;
+        const BYTE_INDEX: usize = OFFSET % 256;
+
+        tracing::info!(volume, offset = OFFSET, "setting beep volume via MCP");
+        self.modify_memory_page(PAGE, |data| {
+            data[BYTE_INDEX] = volume;
         })
         .await
     }

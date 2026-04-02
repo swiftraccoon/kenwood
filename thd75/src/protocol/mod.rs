@@ -247,10 +247,23 @@ pub enum Command {
     GetFunctionType,
     /// Get filter width by mode index (SH read).
     ///
-    /// `mode_index`: 0 = SSB, 1 = CW, 2 = AM.
+    /// Per Operating Tips §5.10: SSB high-cut 2.2–3.0 kHz (Menu 120),
+    /// CW bandwidth 0.3–2.0 kHz (Menu 121), AM high-cut 3.0–7.5 kHz
+    /// (Menu 122). `mode_index`: 0 = SSB, 1 = CW, 2 = AM.
     GetFilterWidth {
         /// Mode index (0 = SSB, 1 = CW, 2 = AM).
         mode_index: u8,
+    },
+    /// Set filter width by mode index (SH write).
+    ///
+    /// Sets the IF receive filter width for the specified mode. The width
+    /// value maps to the filter selection index for that mode (see
+    /// [`GetFilterWidth`](Command::GetFilterWidth) for mode descriptions).
+    SetFilterWidth {
+        /// Mode index (0 = SSB, 1 = CW, 2 = AM).
+        mode_index: u8,
+        /// Filter width setting index.
+        width: u8,
     },
     /// Step frequency up by one increment (UP action).
     ///
@@ -327,20 +340,40 @@ pub enum Command {
     },
     /// Get lock/control settings (LC read).
     ///
-    /// The firmware supports a 6-field format for LC write
-    /// (`LC a,b,c,d,e,f` where each is a control flag). The bare
-    /// LC read returns the primary lock state. Full 6-field format
-    /// is not yet implemented.
+    /// Returns the primary lock state as a boolean. For reading all
+    /// lock fields, use MCP memory offsets 0x1060–0x1065.
     GetLock,
-    /// Set lock/control state (LC write).
+    /// Set lock/control state — simple boolean form (LC write).
     ///
-    /// The firmware supports a 6-field format for LC write
-    /// (`LC a,b,c,d,e,f` where each is a control flag). This method
-    /// sends the simple boolean form. Full 6-field format is not yet
-    /// implemented.
+    /// Sends `LC 0` or `LC 1`. CAT value is inverted on the D75
+    /// (0 = locked, 1 = unlocked). For full lock configuration, use
+    /// [`SetLockFull`](Command::SetLockFull).
     SetLock {
         /// Whether key lock is engaged. CAT value is inverted on D75.
         locked: bool,
+    },
+    /// Set all lock/control fields (LC 6-field write).
+    ///
+    /// Sends `LC a,b,c,d,e,f` where each field is a control flag:
+    /// - `a`: Key lock (0=off, 1=on) — MCP 0x1060
+    /// - `b`: Key lock type (0=key, 1=PTT, 2=key+PTT) — MCP 0x1061
+    /// - `c`: Lock key A (0=off, 1=on) — MCP 0x1062
+    /// - `d`: Lock key B (0=off, 1=on) — MCP 0x1063
+    /// - `e`: Lock key C (0=off, 1=on) — MCP 0x1064
+    /// - `f`: Lock PTT (0=off, 1=on) — MCP 0x1065
+    SetLockFull {
+        /// Key lock enabled.
+        locked: bool,
+        /// Key lock type: 0=key only, 1=PTT only, 2=key+PTT.
+        lock_type: u8,
+        /// Lock key A.
+        lock_a: bool,
+        /// Lock key B.
+        lock_b: bool,
+        /// Lock key C.
+        lock_c: bool,
+        /// Lock PTT.
+        lock_ptt: bool,
     },
     /// Get I/O port state (IO read).
     GetIoPort,
@@ -1080,7 +1113,7 @@ pub const fn command_name(cmd: &Command) -> &'static str {
         Command::GetMode { .. } | Command::SetMode { .. } => "MD",
         Command::GetFrequencyStep { .. } | Command::SetFrequencyStep { .. } => "FS",
         Command::GetFunctionType => "FT",
-        Command::GetFilterWidth { .. } => "SH",
+        Command::GetFilterWidth { .. } | Command::SetFilterWidth { .. } => "SH",
         Command::FrequencyUp { .. } => "UP",
         Command::FrequencyDown { .. } => "DW",
         Command::GetAttenuator { .. } | Command::SetAttenuator { .. } => "RA",
@@ -1089,7 +1122,7 @@ pub const fn command_name(cmd: &Command) -> &'static str {
         Command::GetDualBand | Command::SetDualBand { .. } => "DL",
         Command::Receive { .. } => "RX",
         Command::Transmit { .. } => "TX",
-        Command::GetLock | Command::SetLock { .. } => "LC",
+        Command::GetLock | Command::SetLock { .. } | Command::SetLockFull { .. } => "LC",
         Command::GetIoPort | Command::SetIoPort { .. } => "IO",
         Command::GetBatteryLevel => "BL",
         Command::GetVoxDelay | Command::SetVoxDelay { .. } => "VD",
@@ -1205,6 +1238,9 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         }
         Command::GetFunctionType => "FT".to_owned(),
         Command::GetFilterWidth { mode_index } => format!("SH {mode_index}"),
+        Command::SetFilterWidth { mode_index, width } => {
+            format!("SH {mode_index},{width}")
+        }
         Command::FrequencyUp { band } => format!("UP {}", u8::from(*band)),
         Command::FrequencyDown { band } => format!("DW {}", u8::from(*band)),
         Command::GetAttenuator { band } => format!("RA {}", u8::from(*band)),
@@ -1221,6 +1257,22 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         Command::Transmit { band } => format!("TX {}", u8::from(*band)),
         Command::GetLock => "LC".to_owned(),
         Command::SetLock { locked } => format!("LC {}", u8::from(*locked)),
+        Command::SetLockFull {
+            locked,
+            lock_type,
+            lock_a,
+            lock_b,
+            lock_c,
+            lock_ptt,
+        } => format!(
+            "LC {},{},{},{},{},{}",
+            u8::from(*locked),
+            lock_type,
+            u8::from(*lock_a),
+            u8::from(*lock_b),
+            u8::from(*lock_c),
+            u8::from(*lock_ptt),
+        ),
         Command::GetIoPort => "IO".to_owned(),
         Command::SetIoPort { value } => format!("IO {value}"),
         Command::GetBatteryLevel => "BL".to_owned(),

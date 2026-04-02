@@ -418,7 +418,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn freq_up(&mut self, band: Band) -> Result<(), Error> {
+    pub async fn frequency_up(&mut self, band: Band) -> Result<(), Error> {
         tracing::info!(?band, "stepping frequency up");
         let response = self.execute(Command::FrequencyUp { band }).await?;
         match response {
@@ -533,6 +533,29 @@ impl<T: Transport> Radio<T> {
         let response = self.execute(Command::GetFilterWidth { mode_index }).await?;
         match response {
             Response::FilterWidth { width, .. } => Ok(width),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "FilterWidth".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set the filter width for a given mode index (SH write).
+    ///
+    /// `mode_index`: 0 = SSB, 1 = CW, 2 = AM. The width value selects
+    /// from the available filter options for that mode (per Operating
+    /// Tips §5.10.1–§5.10.3).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_filter_width(&mut self, mode_index: u8, width: u8) -> Result<(), Error> {
+        tracing::info!(mode_index, width, "setting filter width");
+        let response = self
+            .execute(Command::SetFilterWidth { mode_index, width })
+            .await?;
+        match response {
+            Response::FilterWidth { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "FilterWidth".into(),
                 actual: format!("{other:?}").into_bytes(),
