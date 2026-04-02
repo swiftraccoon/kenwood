@@ -6,7 +6,7 @@
 //!
 //! This module is only available on macOS (`cfg(target_os = "macos")`).
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", doc))]
 #[allow(unsafe_code)]
 mod inner {
     use std::io;
@@ -139,5 +139,5 @@ mod inner {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", doc))]
 pub use inner::BluetoothTransport;
