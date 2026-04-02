@@ -61,6 +61,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+    // Channel for BT reconnect requests from the tokio thread.
+    // IOBluetooth RFCOMM must be opened on the main thread (needs CFRunLoop).
+    // The tokio thread sends (port, baud) and the main thread replies with the transport.
+    let (bt_req_tx, bt_req_rx) = std::sync::mpsc::channel::<(Option<String>, u32)>();
+    type BtResult = Result<(String, kenwood_thd75::transport::EitherTransport), String>;
+    let (bt_resp_tx, bt_resp_rx) = std::sync::mpsc::channel::<BtResult>();
+
     let mcp_speed = cli.mcp_speed;
 
     std::thread::spawn(move || {
@@ -70,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("failed to build tokio runtime");
 
         let result = rt.block_on(async {
-            run_app(&mut terminal, transport, mcp_speed)
+            run_app(&mut terminal, transport, mcp_speed, bt_req_tx, bt_resp_rx)
                 .await
                 .map_err(|e| e.to_string())
         });
@@ -100,6 +108,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(target_os = "macos"))]
         std::thread::sleep(std::time::Duration::from_millis(10));
 
+        // Handle BT reconnect requests from the tokio thread.
+        // BluetoothTransport::open() must happen on the main thread.
+        if let Ok((port, baud)) = bt_req_rx.try_recv() {
+            let result = radio_task::discover_and_open_transport(port, baud);
+            let _ = bt_resp_tx.send(result);
+        }
+
         if let Ok(result) = done_rx.try_recv() {
             if let Err(e) = result {
                 eprintln!("Error: {e}");
@@ -115,6 +130,10 @@ async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     transport: Result<(String, kenwood_thd75::transport::EitherTransport), String>,
     mcp_speed: String,
+    bt_req_tx: std::sync::mpsc::Sender<(Option<String>, u32)>,
+    bt_resp_rx: std::sync::mpsc::Receiver<
+        Result<(String, kenwood_thd75::transport::EitherTransport), String>,
+    >,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut events = event::EventHandler::new();
     let tx = events.sender();
@@ -122,11 +141,14 @@ async fn run_app(
 
     let (path, transport) = transport.map_err(|e| format!("Could not connect to radio: {e}"))?;
 
-    let port_display =
-        match radio_task::spawn_with_transport(path, transport, mcp_speed, tx, cmd_rx).await {
-            Ok(p) => p,
-            Err(e) => return Err(format!("Could not connect to radio: {e}").into()),
-        };
+    let port_display = match radio_task::spawn_with_transport(
+        path, transport, mcp_speed, tx, cmd_rx, bt_req_tx, bt_resp_rx,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => return Err(format!("Could not connect to radio: {e}").into()),
+    };
 
     let mut app = App::new(port_display);
     app.connected = true;

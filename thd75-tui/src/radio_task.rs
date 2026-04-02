@@ -52,6 +52,8 @@ pub fn discover_and_open_transport(
 /// # Arguments
 /// - `mcp_speed`: `"fast"` for McpSpeed::Fast (risky), anything else for Safe.
 /// - `tx`: channel for sending state updates and errors to the TUI.
+/// - `bt_req_tx` / `bt_resp_rx`: channels for requesting BT reconnect from
+///   the main thread (IOBluetooth RFCOMM must be opened on main).
 /// - `cmd_rx`: channel for receiving user commands from the TUI.
 pub async fn spawn_with_transport(
     path: String,
@@ -59,6 +61,8 @@ pub async fn spawn_with_transport(
     mcp_speed: String,
     tx: mpsc::UnboundedSender<Message>,
     mut cmd_rx: mpsc::UnboundedReceiver<crate::event::RadioCommand>,
+    bt_req_tx: std::sync::mpsc::Sender<(Option<String>, u32)>,
+    bt_resp_rx: std::sync::mpsc::Receiver<Result<(String, EitherTransport), String>>,
 ) -> Result<String, String> {
     let baud = SerialTransport::DEFAULT_BAUD;
     let mut radio = Radio::connect(transport)
@@ -314,7 +318,7 @@ pub async fn spawn_with_transport(
                             }
                             crate::event::RadioCommand::McpWriteByte { offset, value } => {
                                 // Single-page MCP write for settings the D75 rejects via CAT.
-                                // Enters MCP mode, modifies one byte, exits. USB drops.
+                                // Enters MCP mode, modifies one byte, exits. USB/BT drops.
                                 let page = offset / 256;
                                 let byte_idx = (offset % 256) as usize;
                                 let _ = tx.send(Message::RadioError(format!("Writing MCP 0x{offset:04X}...")));
@@ -322,13 +326,16 @@ pub async fn spawn_with_transport(
                                     data[byte_idx] = value;
                                 }).await {
                                     Ok(()) => {
+                                        // Update the in-memory MCP cache so the TUI
+                                        // stays in sync without requiring a full re-read.
+                                        let _ = tx.send(Message::McpByteWritten { offset, value });
                                         let _ = tx.send(Message::RadioError(format!("MCP 0x{offset:04X} = {value} — reconnecting...")));
                                     }
                                     Err(e) => {
                                         let _ = tx.send(Message::McpError(format!("MCP write 0x{offset:04X}: {e}")));
                                     }
                                 }
-                                // USB drops after MCP exit
+                                // USB/BT drops after MCP exit
                                 let _ = tx.send(Message::Disconnected);
                                 break; // Go to reconnect loop
                             }
@@ -337,31 +344,46 @@ pub async fn spawn_with_transport(
                 }
             }
 
-            // Reconnect loop
+            // Reconnect loop.
+            //
+            // After MCP programming mode, the D75's USB stack resets and the
+            // device may re-enumerate with a different path (e.g., the
+            // usbmodem suffix changes on macOS). We first try the original
+            // path, then auto-discover USB. If both fail (e.g., BT connection),
+            // we request the main thread to open a new BT transport (IOBluetooth
+            // RFCOMM must be opened on the main thread for CFRunLoop callbacks).
+            tokio::time::sleep(Duration::from_secs(3)).await;
             loop {
-                tokio::time::sleep(RECONNECT_INTERVAL).await;
-                match discover_and_open(Some(path_clone.clone()), baud) {
-                    Ok((_p, transport)) => {
-                        match Radio::connect(transport).await {
-                            Ok(mut new_radio) => {
-                                if new_radio.identify().await.is_ok() {
-                                    // Re-enable AI mode and resubscribe
-                                    let _ = new_radio.set_auto_info(true).await;
-                                    notifications = new_radio.subscribe();
-                                    s_meter_a = 0;
-                                    s_meter_b = 0;
-                                    busy_a = false;
-                                    busy_b = false;
-                                    let _ = tx.send(Message::Reconnected);
-                                    radio = new_radio;
-                                    continue 'outer; // Back to main loop
-                                }
-                            }
-                            Err(_) => continue,
+                // Try USB first (original path, then auto-discover)
+                let connect_result = discover_and_open(Some(path_clone.clone()), baud)
+                    .or_else(|_| discover_and_open(None, baud))
+                    .or_else(|_| {
+                        // USB failed — ask the main thread to open BT
+                        bt_req_tx
+                            .send((Some(path_clone.clone()), baud))
+                            .map_err(|e| e.to_string())?;
+                        // Wait up to 10 seconds for the main thread to respond
+                        bt_resp_rx
+                            .recv_timeout(Duration::from_secs(10))
+                            .map_err(|e| e.to_string())?
+                    });
+                if let Ok((_p, transport)) = connect_result {
+                    if let Ok(mut new_radio) = Radio::connect(transport).await {
+                        if new_radio.identify().await.is_ok() {
+                            // Re-enable AI mode and resubscribe
+                            let _ = new_radio.set_auto_info(true).await;
+                            notifications = new_radio.subscribe();
+                            s_meter_a = 0;
+                            s_meter_b = 0;
+                            busy_a = false;
+                            busy_b = false;
+                            let _ = tx.send(Message::Reconnected);
+                            radio = new_radio;
+                            continue 'outer; // Back to main loop
                         }
                     }
-                    Err(_) => continue,
                 }
+                tokio::time::sleep(RECONNECT_INTERVAL).await;
             }
         }
     });

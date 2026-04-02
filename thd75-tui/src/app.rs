@@ -705,9 +705,18 @@ pub enum Message {
     RadioError(String),
     Disconnected,
     Reconnected,
-    McpProgress { page: u16, total: u16 },
+    McpProgress {
+        page: u16,
+        total: u16,
+    },
     McpReadComplete(Vec<u8>),
     McpWriteComplete,
+    /// A single MCP byte was written successfully — update the in-memory
+    /// cache without requiring a full re-read.
+    McpByteWritten {
+        offset: u16,
+        value: u8,
+    },
     McpError(String),
     Quit,
 }
@@ -878,8 +887,22 @@ impl App {
                 self.status_message = Some("MCP write complete — reconnecting...".into());
                 true
             }
+            Message::McpByteWritten { offset, value } => {
+                // Update the cached memory image with the single byte that
+                // was just written via MCP, so the TUI stays in sync without
+                // requiring a full re-read after reconnect.
+                if let McpState::Loaded { ref mut image, .. } = self.mcp {
+                    image.as_raw_mut()[offset as usize] = value;
+                    save_cache(image.as_raw());
+                }
+                true
+            }
             Message::McpError(err) => {
-                self.mcp = McpState::Idle;
+                // Only reset to Idle if we don't have a loaded image.
+                // A failed MCP write shouldn't destroy the cached data.
+                if !matches!(self.mcp, McpState::Loaded { .. }) {
+                    self.mcp = McpState::Idle;
+                }
                 self.status_message = Some(format!("MCP error: {err}"));
                 true
             }
