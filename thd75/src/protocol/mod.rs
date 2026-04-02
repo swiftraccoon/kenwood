@@ -339,7 +339,7 @@ pub enum Command {
     /// sends the simple boolean form. Full 6-field format is not yet
     /// implemented.
     SetLock {
-        /// Whether lock is engaged (or backlight level).
+        /// Whether key lock is engaged. CAT value is inverted on D75.
         locked: bool,
     },
     /// Get I/O port state (IO read).
@@ -798,9 +798,9 @@ pub enum Response {
         /// Whether key beep is enabled.
         enabled: bool,
     },
-    /// Lock/backlight control state response (LC).
+    /// Key lock state response (LC).
     Lock {
-        /// Whether lock is engaged (or backlight level).
+        /// Whether key lock is engaged. CAT value is inverted on D75.
         locked: bool,
     },
     /// I/O port state response (IO).

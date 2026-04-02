@@ -40,7 +40,7 @@ pub(crate) fn parse_control(
 
 /// Parse a boolean field ("0" or "1").
 ///
-/// Empty/missing value is treated as `false` (observed on DW, BE).
+/// Empty/missing value is treated as `false` (observed on BE, AI echo).
 fn parse_bool(payload: &str, cmd: &str) -> Result<bool, ProtocolError> {
     match payload.trim() {
         "" | "0" => Ok(false),
@@ -84,9 +84,11 @@ fn split_band_value<'a>(payload: &'a str, cmd: &str) -> Result<(Band, &'a str), 
 /// Parse BL (battery level): bare `"level"` response.
 ///
 /// 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green).
+///
+/// The radio sends `BL 3` for a polled read, but AI-mode unsolicited
+/// notifications may push `BL 0,3` (band-prefixed). Taking the last
+/// comma-separated field handles both formats.
 fn parse_bl(payload: &str) -> Result<Response, ProtocolError> {
-    // Read response: "3" -> take the only field
-    // Some responses may include comma format "0,3" — take last field
     let level_str = if let Some((_prefix, level)) = payload.split_once(',') {
         level
     } else {

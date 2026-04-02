@@ -66,16 +66,17 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get the lock/backlight control state (LC read).
+    /// Get the key lock state (LC read).
     ///
-    /// Note: On the TH-D75, LC may control display backlight rather than
-    /// key lock (the `LC` command controls backlight on this model).
+    /// On the TH-D75, LC controls the key lock. The CAT value is inverted
+    /// relative to the radio's display: `LC 0` means locked, `LC 1` means
+    /// unlocked. The MCP offset for the lock setting is `0x1060`.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn get_lock(&mut self) -> Result<bool, Error> {
-        tracing::debug!("reading lock/backlight state");
+        tracing::debug!("reading key lock state");
         let response = self.execute(Command::GetLock).await?;
         match response {
             Response::Lock { locked } => Ok(locked),
@@ -86,16 +87,16 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set the lock/backlight control state (LC write).
+    /// Set the key lock state (LC write).
     ///
-    /// Note: On the TH-D75, LC may control display backlight rather than
-    /// key lock. See [`get_lock`](Self::get_lock) for details.
+    /// See [`get_lock`](Self::get_lock) for details on the CAT value
+    /// inversion and the corresponding MCP offset.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn set_lock(&mut self, locked: bool) -> Result<(), Error> {
-        tracing::info!(locked, "setting lock/backlight");
+        tracing::info!(locked, "setting key lock");
         let response = self.execute(Command::SetLock { locked }).await?;
         match response {
             Response::Lock { .. } => Ok(()),
@@ -151,6 +152,8 @@ impl<T: Transport> Radio<T> {
     pub async fn frequency_down(&mut self, band: Band) -> Result<(), Error> {
         tracing::debug!(?band, "stepping frequency down");
         let response = self.execute(Command::FrequencyDown { band }).await?;
+        // The radio echoes either `DW\r` (parsed as FrequencyDown) or a bare
+        // OK depending on firmware version and AI mode state.
         match response {
             Response::FrequencyDown | Response::Ok => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -269,7 +272,14 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get the I/O port state (IO read).
+    /// Get the USB Out select state (IO read).
+    ///
+    /// Per KI4LAX CAT reference and Operating Tips §5.10.5:
+    /// 0 = AF (audio frequency output), 1 = IF (12 kHz centered IF signal
+    /// for SSB/CW/AM, 15 kHz bandwidth), 2 = Detect (pre-detection signal).
+    ///
+    /// Menu 102 (USB Out Select) controls this. IF/Detect output is only
+    /// available when in Single Band mode on Band B.
     ///
     /// # Errors
     ///
@@ -286,7 +296,9 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set the I/O port state (IO write).
+    /// Set the USB Out select state (IO write).
+    ///
+    /// See [`get_io_port`](Self::get_io_port) for value meanings.
     ///
     /// # Errors
     ///

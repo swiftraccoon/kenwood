@@ -9,11 +9,23 @@ use crate::error::ValidationError;
 /// The TH-D75 uses a numeric band index in the `FO` and `ME` commands.
 /// Variants `A` and `B` correspond to the two main VFO bands; the
 /// remaining `Band2`..`Band13` map to additional sub-band selections.
+///
+/// # Band architecture (per Kenwood Operating Tips §1.1, §5.9)
+///
+/// - **Band A** (upper display): Amateur-only TX/RX at 144 MHz, 220 MHz
+///   (TH-D75A only), and 430 MHz. Supports FM and DV modes.
+/// - **Band B** (lower display): Wideband RX from 0.1–524 MHz. Supports
+///   FM, DV, AM, LSB, USB, CW, NFM, WFM, and DR modes. Band B has an
+///   independent receiver chain (separate VCO/PLL/IF per the service
+///   manual), so both bands receive simultaneously.
+///
+/// Band A is the CTRL/PTT band by default. Band B supports all
+/// demodulation modes including SSB/CW with DSP and an IF receive filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Band {
-    /// Band A (index 0).
+    /// Band A — amateur TX/RX (144/220/430 MHz). Index 0.
     A = 0,
-    /// Band B (index 1).
+    /// Band B — wideband RX (0.1–524 MHz, all modes). Index 1.
     B = 1,
     /// Band 2 (index 2).
     Band2 = 2,

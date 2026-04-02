@@ -1,7 +1,14 @@
 //! Serial port transport for USB CDC ACM and Bluetooth SPP connections.
 //!
-//! USB uses 115200 baud (CDC ACM ignores line coding, so this is nominal).
+//! USB uses 115200 baud (CDC ACM ignores line coding — per the Kenwood
+//! Operating Tips §5.13, "configuring the baud rate is unnecessary,
+//! selecting randomly will suffice" since it's a virtual COM port).
+//!
 //! Bluetooth SPP requires 9600 baud with RTS/CTS hardware flow control.
+//! The D75 supports Bluetooth 3.0 Class 2 with HSP + SPP profiles only
+//! (no BLE). Per §5.12, "configuration of the baud rate is not necessary"
+//! for BT serial either, but we set 9600 explicitly for compatibility.
+//!
 //! [`open`](SerialTransport::open) auto-detects BT ports and applies the
 //! correct settings.
 

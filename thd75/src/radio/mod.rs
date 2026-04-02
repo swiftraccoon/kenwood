@@ -257,8 +257,12 @@ impl<T: Transport> Radio<T> {
                 }
                 self.codec.feed(&buf[..n]);
                 while let Some(frame) = self.codec.next_frame() {
+                    // Frames are CR-terminated ASCII: "MNEMONIC PAYLOAD\r"
+                    // e.g. "FQ 0,0145520000\r", "BY 1,1\r", "?\r", "N\r".
+                    // Extract the 2-letter mnemonic before the space.
                     let frame_str = String::from_utf8_lossy(&frame);
-                    let frame_mnemonic = frame_str.split_once(' ')
+                    let frame_mnemonic = frame_str
+                        .split_once(' ')
                         .map_or_else(|| frame_str.trim(), |(m, _)| m);
 
                     tracing::trace!(cmd = %cmd_name, frame = ?frame_str.trim(), "RX");
@@ -294,7 +298,7 @@ impl<T: Transport> Radio<T> {
 
         match result {
             Ok(inner) => {
-                // 6. Track mode changes from successful VM responses.
+                // 4. Track mode changes from successful VM responses.
                 self.track_mode_from_response(&cmd, &inner);
                 inner
             }

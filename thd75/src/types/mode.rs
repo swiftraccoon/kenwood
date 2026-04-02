@@ -14,6 +14,14 @@ use crate::error::ValidationError;
 /// (0=FM, 1=DV, 2=NFM, 3=AM) stored as a raw `u8` in [`ChannelMemory`].
 /// This enum is only used for the `MD` command.
 ///
+/// # WFM (Wide FM) note
+///
+/// WFM is NOT an `MD` mode — it is the FM broadcast radio mode accessed
+/// via the `FR` (FM Radio) command at 76–108 MHz on Band B. The radio's
+/// display shows "WFM" in FM Radio mode, but `MD` does not return a WFM
+/// value. Per the Kenwood Operating Tips §5.9, WFM appears in Band B's
+/// demodulation mode table for the FM Radio frequency range only.
+///
 /// [`ChannelMemory`]: crate::types::ChannelMemory
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mode {

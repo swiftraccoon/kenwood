@@ -9,14 +9,27 @@ use tokio::sync::mpsc;
 use crate::app::{BandState, Message, RadioState};
 
 /// Poll interval for reading radio state.
-/// 14 commands per cycle at 115200 baud — 500ms keeps the radio responsive.
+/// ~10 commands per cycle (FQ, SQ, MD, PC, RA, FS per band + globals).
+/// SM and BY are NOT polled — they use AI push notifications instead.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Reconnect poll interval after disconnect.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Open a transport on the calling thread (must be main for BT).
+///
 /// This is synchronous — call from main before starting tokio.
+/// On macOS, Bluetooth RFCOMM callbacks require the main thread's
+/// CFRunLoop, so transport discovery must happen before the tokio
+/// runtime is spawned on a dedicated thread.
+///
+/// # Arguments
+/// - `port`: explicit serial port path (e.g. `/dev/cu.usbmodem*`), or
+///   `None` for auto-detection of USB CDC or Bluetooth SPP.
+/// - `baud`: baud rate (115200 for USB CDC, 9600 for BT SPP).
+///
+/// # Returns
+/// `(port_path, transport)` on success, or an error string.
 pub fn discover_and_open_transport(
     port: Option<String>,
     baud: u32,
@@ -24,7 +37,22 @@ pub fn discover_and_open_transport(
     discover_and_open(port, baud)
 }
 
-/// Spawn the polling loop with a pre-opened transport.
+/// Spawn the radio communication task with a pre-opened transport.
+///
+/// Performs initial handshake (identify, enable AI mode, read firmware
+/// version and radio type), then spawns a tokio task that:
+/// 1. Polls band state (FQ, SQ, MD, PC, RA, FS) and global state on a timer
+/// 2. Processes AI-pushed BY notifications as a gate for SM reads
+/// 3. Handles user commands (tune, set squelch, MCP write, etc.)
+///
+/// S-meter and busy state are event-driven via AI mode, not polled.
+/// This avoids spurious firmware spikes on Band B that occur with
+/// direct SM/BY polling.
+///
+/// # Arguments
+/// - `mcp_speed`: `"fast"` for McpSpeed::Fast (risky), anything else for Safe.
+/// - `tx`: channel for sending state updates and errors to the TUI.
+/// - `cmd_rx`: channel for receiving user commands from the TUI.
 pub async fn spawn_with_transport(
     path: String,
     transport: EitherTransport,
@@ -176,8 +204,10 @@ pub async fn spawn_with_transport(
                                 }
                             }
                             crate::event::RadioCommand::FreqDown(band) => {
-                                // No CAT down-step command exists, so read current
-                                // freq + step, compute new freq, and tune.
+                                // DW exists as a blind step-down, but we use the manual
+                                // read-subtract-tune path for precision: DW doesn't confirm
+                                // the resulting frequency, and we need the exact value for
+                                // the TUI display update.
                                 match freq_down(&mut radio, band).await {
                                     Ok(()) => {}
                                     Err(e) => {
@@ -328,7 +358,10 @@ pub async fn spawn_with_transport(
     Ok(path)
 }
 
-/// Distinguishes transport errors (connection lost) from protocol errors (parse failures).
+/// Distinguishes transport errors (connection lost) from protocol errors
+/// (parse failures). Transport errors break out of the poll loop to the
+/// reconnect path. Protocol errors are non-fatal — the current poll cycle
+/// is skipped but the connection stays alive.
 enum PollError {
     Transport(String),
     Protocol(String),
@@ -390,6 +423,14 @@ async fn poll_once(
     })
 }
 
+/// Poll per-band state: frequency, squelch setting, mode, power, attenuator, step size.
+///
+/// **SM and BY are intentionally omitted.** The D75 firmware returns spurious
+/// SM=5 / BY=1 spikes when Band B is polled directly. Instead, S-meter and
+/// busy state are driven by AI-pushed BY notifications in the main loop,
+/// which go through the radio's internal squelch debouncing and match the
+/// radio's own display behavior. The `s_meter` and `busy` fields are set to
+/// zero here and overwritten by `poll_once` with the AI-driven values.
 async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<BandState, PollError> {
     let channel = radio
         .get_frequency(band)

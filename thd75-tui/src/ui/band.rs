@@ -6,6 +6,12 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{App, BandState, InputMode, Pane};
 
+/// Render a band panel (A or B) into the given area.
+///
+/// Displays frequency, mode, power, squelch, busy/RX indicator,
+/// S-meter bar, step size, and attenuator state. When the pane is
+/// focused and in frequency input mode, an additional input prompt
+/// line is shown. Returns early for non-band panes.
 pub fn render(app: &App, frame: &mut Frame, area: Rect, pane: Pane) {
     let (title, band) = match pane {
         Pane::BandA => (" Band A ", &app.state.band_a),
@@ -38,6 +44,11 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect, pane: Pane) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Build the 4-line display for a band panel:
+/// 1. Frequency (bold white, MHz with 6 decimal places)
+/// 2. Mode + Power + Squelch + RX indicator (green "RX" badge when busy)
+/// 3. S-meter bar (green S0-S3, yellow S5-S7, red S9)
+/// 4. Step size + ATT indicator (red when attenuator is on)
 fn band_lines(band: &BandState) -> Vec<Line<'static>> {
     let freq = format!("{:.6} MHz", band.frequency.as_mhz());
     let freq_line = Line::from(Span::styled(
@@ -124,6 +135,7 @@ fn s_meter_line(raw: u8) -> Line<'static> {
     ])
 }
 
+/// Map power level to a compact display label: H/M/L/EL.
 fn power_label(level: kenwood_thd75::types::PowerLevel) -> &'static str {
     use kenwood_thd75::types::PowerLevel;
     match level {

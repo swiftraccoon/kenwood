@@ -5,10 +5,18 @@
 //! on the radio, cycling to "KISS mode ON"), the radio accepts and
 //! produces standard KISS frames over USB or Bluetooth.
 //!
-//! The built-in TNC has 4 KB data buffers for TX and RX, supports
-//! 1200 bps and 9600 bps packet speeds, and implements the standard
-//! KISS command set (Data Frame, TXDELAY, Persistence, `SlotTime`,
-//! `TXtail`, `FullDuplex`, `SetHardware`, Return).
+//! # TH-D75 KISS TNC specifications (per Operating Tips §2.7.2)
+//!
+//! - TX buffer: 3 KB, RX buffer: 4 KB
+//! - Speeds: 1200 bps (AFSK) and 9600 bps (GMSK)
+//! - KISS commands: Data Frame (`0x00`), TXDELAY (`0x01`, 0–120, units
+//!   of 10 ms), Persistence (`0x02`, 0–255, default 128), `SlotTime`
+//!   (`0x03`, 0–250, units of 10 ms, default 10), `TXtail` (`0x04`,
+//!   0–255, default 3), `FullDuplex` (`0x05`, 0=half/default, nonzero=
+//!   full), `SetHardware` (`0x06`, 0 or 35=1200 bps, 5 or 38=9600 bps),
+//!   Return (`0xFF`)
+//! - When KISS is active, all APRS menu configs are inactive except
+//!   Menu 505 (Data Speed) and Menu 506 (Data Band)
 //!
 //! This module provides:
 //! - KISS frame encoding and decoding with proper byte stuffing
