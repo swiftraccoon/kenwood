@@ -21,7 +21,7 @@ pub mod either;
 pub mod mock;
 pub mod serial;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", doc))]
 pub use bluetooth::BluetoothTransport;
 pub use either::EitherTransport;
 pub use mock::MockTransport;
