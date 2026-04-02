@@ -47,6 +47,18 @@ pub async fn spawn_with_transport(
         .await
         .map_err(|e| format!("Identify failed: {e}"))?;
 
+    // Enable AI (Auto Information) mode — radio pushes BY/FQ/MD notifications
+    // instead of requiring polling. This is critical for reliable S-meter:
+    // AI-pushed BY notifications go through the radio's internal squelch
+    // debouncing, while polled BY reads raw hardware state with spurious spikes.
+    radio
+        .set_auto_info(true)
+        .await
+        .map_err(|e| format!("AI mode failed: {e}"))?;
+
+    // Subscribe to unsolicited notifications from AI mode
+    let mut notifications = radio.subscribe();
+
     let firmware_version = radio.get_firmware_version().await.unwrap_or_default();
     let radio_type = radio
         .get_radio_type()
@@ -63,12 +75,19 @@ pub async fn spawn_with_transport(
     let path_clone = path.clone();
 
     tokio::spawn(async move {
-        // Main loop: poll + handle commands
+        // Track S-meter state from AI-pushed BY notifications.
+        // BY is the gate: squelch open → poll SM once; squelch closed → zero meter.
+        let mut s_meter_a: u8 = 0;
+        let mut s_meter_b: u8 = 0;
+        let mut busy_a = false;
+        let mut busy_b = false;
+
+        // Main loop: poll + handle commands + process AI notifications
         'outer: loop {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(POLL_INTERVAL) => {
-                        match poll_once(&mut radio).await {
+                        match poll_once(&mut radio, s_meter_a, s_meter_b, busy_a, busy_b).await {
                             Ok(state) => {
                                 if tx.send(Message::RadioUpdate(state)).is_err() {
                                     return;
@@ -81,6 +100,29 @@ pub async fn spawn_with_transport(
                             Err(PollError::Protocol(e)) => {
                                 // Parse errors are non-fatal — skip this poll cycle
                                 let _ = tx.send(Message::RadioError(e));
+                            }
+                        }
+                    }
+                    Ok(notification) = notifications.recv() => {
+                        // Process AI-pushed BY notifications as SM gate.
+                        use kenwood_thd75::protocol::Response;
+                        if let Response::Busy { band, busy } = notification {
+                            if busy {
+                                // Squelch opened — poll SM for actual signal level
+                                if let Ok(level) = radio.get_smeter(band).await {
+                                    match band {
+                                        Band::A => { s_meter_a = level; busy_a = true; }
+                                        Band::B => { s_meter_b = level; busy_b = true; }
+                                        _ => {}
+                                    }
+                                }
+                            } else {
+                                // Squelch closed — zero the meter
+                                match band {
+                                    Band::A => { s_meter_a = 0; busy_a = false; }
+                                    Band::B => { s_meter_b = 0; busy_b = false; }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -262,6 +304,13 @@ pub async fn spawn_with_transport(
                         match Radio::connect(transport).await {
                             Ok(mut new_radio) => {
                                 if new_radio.identify().await.is_ok() {
+                                    // Re-enable AI mode and resubscribe
+                                    let _ = new_radio.set_auto_info(true).await;
+                                    notifications = new_radio.subscribe();
+                                    s_meter_a = 0;
+                                    s_meter_b = 0;
+                                    busy_a = false;
+                                    busy_b = false;
                                     let _ = tx.send(Message::Reconnected);
                                     radio = new_radio;
                                     continue 'outer; // Back to main loop
@@ -293,9 +342,22 @@ fn classify_error(context: &str, e: &kenwood_thd75::Error) -> PollError {
     }
 }
 
-async fn poll_once(radio: &mut Radio<EitherTransport>) -> Result<RadioState, PollError> {
-    let band_a = poll_band(radio, Band::A).await?;
-    let band_b = poll_band(radio, Band::B).await?;
+async fn poll_once(
+    radio: &mut Radio<EitherTransport>,
+    s_meter_a: u8,
+    s_meter_b: u8,
+    busy_a: bool,
+    busy_b: bool,
+) -> Result<RadioState, PollError> {
+    let mut band_a = poll_band(radio, Band::A).await?;
+    let mut band_b = poll_band(radio, Band::B).await?;
+
+    // S-meter and busy are driven by AI-pushed BY notifications (not polling).
+    // This avoids spurious firmware spikes on Band B.
+    band_a.s_meter = s_meter_a;
+    band_a.busy = busy_a;
+    band_b.s_meter = s_meter_b;
+    band_b.busy = busy_b;
 
     // Global state reads — all confirmed safe (no side effects)
     let battery_level = radio.get_battery_level().await.unwrap_or(0);
@@ -334,10 +396,9 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
         .await
         .map_err(|e| classify_error(&format!("FQ {band:?}"), &e))?;
 
-    let s_meter = radio
-        .get_smeter(band)
-        .await
-        .map_err(|e| classify_error(&format!("SM {band:?}"), &e))?;
+    // SM and BY are NOT polled — they are driven by AI-pushed BY notifications.
+    // Polling SM/BY causes spurious readings on Band B due to firmware behavior.
+    // The AI push path goes through the radio's internal squelch debouncing.
 
     let squelch = radio
         .get_squelch(band)
@@ -354,7 +415,6 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
         .await
         .map_err(|e| classify_error(&format!("PC {band:?}"), &e))?;
 
-    let busy = radio.get_busy(band).await.unwrap_or(false);
     let attenuator = radio.get_attenuator(band).await.unwrap_or(false);
     // FS returns N (not available) in some modes — gracefully default
     let step_size = radio.get_frequency_step(band).await.ok();
@@ -362,10 +422,10 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
     Ok(BandState {
         frequency: channel.rx_frequency,
         mode,
-        s_meter,
+        s_meter: 0, // Set by AI notification handler
         squelch,
         power_level,
-        busy,
+        busy: false, // Set by AI notification handler
         attenuator,
         step_size,
     })

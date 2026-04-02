@@ -226,13 +226,18 @@ impl<T: Transport> Radio<T> {
         let wire = protocol::serialize(&cmd);
 
         // 2. Write to transport.
+        tracing::trace!(cmd = %cmd_name, wire = ?String::from_utf8_lossy(&wire).trim(), "TX");
         self.transport
             .write(&wire)
             .await
             .map_err(Error::Transport)?;
 
         // 3. Read response bytes (loop until codec has a complete frame),
-        //    wrapped in a timeout.
+        //    wrapped in a timeout. With AI mode enabled, unsolicited
+        //    notifications may arrive interleaved with command responses.
+        //    Match the frame's mnemonic to the command we sent; route
+        //    mismatches to the notification broadcast channel.
+        let expected_mnemonic = command_name(&cmd);
         let result = tokio::time::timeout(timeout_dur, async {
             let mut buf = [0u8; 1024];
             loop {
@@ -251,21 +256,36 @@ impl<T: Transport> Radio<T> {
                     ));
                 }
                 self.codec.feed(&buf[..n]);
-                if let Some(frame) = self.codec.next_frame() {
-                    // 4. Parse response.
-                    let response = protocol::parse(&frame).map_err(Error::Protocol)?;
+                while let Some(frame) = self.codec.next_frame() {
+                    let frame_str = String::from_utf8_lossy(&frame);
+                    let frame_mnemonic = frame_str.split_once(' ')
+                        .map_or(frame_str.trim(), |(m, _)| m);
 
-                    // 5. Check for error / not-available responses.
-                    if matches!(response, Response::Error) {
-                        tracing::warn!(cmd = %cmd_name, "radio returned error response");
+                    tracing::trace!(cmd = %cmd_name, frame = ?frame_str.trim(), "RX");
+
+                    // Error/not-available are always responses to the current command.
+                    if frame_mnemonic == "?" {
                         return Err(Error::RadioError);
                     }
-                    if matches!(response, Response::NotAvailable) {
-                        tracing::warn!(cmd = %cmd_name, "radio returned not-available response");
+                    if frame_mnemonic == "N" {
                         return Err(Error::NotAvailable);
                     }
 
-                    tracing::debug!(cmd = %cmd_name, "command completed successfully");
+                    let response = protocol::parse(&frame).map_err(Error::Protocol)?;
+
+                    // If this frame's mnemonic doesn't match what we sent,
+                    // it's an unsolicited AI notification — route it to
+                    // subscribers and keep waiting for our actual response.
+                    if frame_mnemonic != expected_mnemonic {
+                        tracing::debug!(
+                            expected = expected_mnemonic,
+                            got = frame_mnemonic,
+                            "unsolicited AI notification"
+                        );
+                        let _ = self.notifications.send(response);
+                        continue;
+                    }
+
                     return Ok(response);
                 }
             }
