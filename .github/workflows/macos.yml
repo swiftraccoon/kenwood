@@ -1,0 +1,24 @@
+name: macOS
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  ci:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy
+      - run: cargo check
+        working-directory: thd75
+      - run: cargo check
+        working-directory: thd75-tui
+      - run: cargo clippy -- -D warnings
+        working-directory: thd75
+      - run: cargo clippy -- -D warnings
+        working-directory: thd75-tui
+      - run: cargo test --lib
+        working-directory: thd75

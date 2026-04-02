@@ -2,12 +2,11 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
-[![CI](https://github.com/swiftraccoon/kenwood/actions/workflows/ci.yml/badge.svg)](https://github.com/swiftraccoon/kenwood/actions)
 [![Docs](https://img.shields.io/badge/docs-github.io-blue)](https://swiftraccoon.github.io/kenwood/)
-[![Ubuntu](https://img.shields.io/badge/Ubuntu-tested-E95420)](https://github.com/swiftraccoon/kenwood/actions)
-[![Fedora](https://img.shields.io/badge/Fedora-tested-51A2DA)](https://github.com/swiftraccoon/kenwood/actions)
-[![macOS](https://img.shields.io/badge/macOS-tested-000000)](https://github.com/swiftraccoon/kenwood/actions)
-[![Windows](https://img.shields.io/badge/Windows-tested-0078D6)](https://github.com/swiftraccoon/kenwood/actions)
+[![Ubuntu](https://img.shields.io/github/actions/workflow/status/swiftraccoon/kenwood/ubuntu.yml?label=Ubuntu&logo=ubuntu)](https://github.com/swiftraccoon/kenwood/actions/workflows/ubuntu.yml)
+[![Fedora](https://img.shields.io/github/actions/workflow/status/swiftraccoon/kenwood/fedora.yml?label=Fedora&logo=fedora)](https://github.com/swiftraccoon/kenwood/actions/workflows/fedora.yml)
+[![macOS](https://img.shields.io/github/actions/workflow/status/swiftraccoon/kenwood/macos.yml?label=macOS&logo=apple)](https://github.com/swiftraccoon/kenwood/actions/workflows/macos.yml)
+[![Windows](https://img.shields.io/github/actions/workflow/status/swiftraccoon/kenwood/windows.yml?label=Windows&logo=windows)](https://github.com/swiftraccoon/kenwood/actions/workflows/windows.yml)
 
 Rust libraries and TUIs for Kenwood amateur radio transceivers.
 

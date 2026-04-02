@@ -1,98 +1,9 @@
-name: CI
-
+name: Docs
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-
 jobs:
-  check:
-    name: Check (${{ matrix.name }})
-    strategy:
-      matrix:
-        include:
-          - name: Ubuntu
-            os: ubuntu-latest
-          - name: Fedora
-            os: ubuntu-latest
-            container: fedora:latest
-          - name: macOS
-            os: macos-latest
-          - name: Windows
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container || '' }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust (Fedora)
-        if: matrix.container
-        run: dnf install -y gcc rust cargo
-      - uses: dtolnay/rust-toolchain@1.89.0
-        if: ${{ !matrix.container }}
-      - run: cargo check
-        working-directory: thd75
-      - run: cargo check
-        working-directory: thd75-tui
-
-  test:
-    name: Test (${{ matrix.name }})
-    strategy:
-      matrix:
-        include:
-          - name: Ubuntu
-            os: ubuntu-latest
-          - name: Fedora
-            os: ubuntu-latest
-            container: fedora:latest
-          - name: macOS
-            os: macos-latest
-          - name: Windows
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container || '' }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust (Fedora)
-        if: matrix.container
-        run: dnf install -y gcc rust cargo
-      - uses: dtolnay/rust-toolchain@1.89.0
-        if: ${{ !matrix.container }}
-      - run: cargo test --lib
-        working-directory: thd75
-
-  clippy:
-    name: Clippy (${{ matrix.name }})
-    strategy:
-      matrix:
-        include:
-          - name: Ubuntu
-            os: ubuntu-latest
-          - name: Fedora
-            os: ubuntu-latest
-            container: fedora:latest
-          - name: macOS
-            os: macos-latest
-          - name: Windows
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container || '' }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust (Fedora)
-        if: matrix.container
-        run: dnf install -y gcc rust cargo clippy
-      - uses: dtolnay/rust-toolchain@1.89.0
-        if: ${{ !matrix.container }}
-        with:
-          components: clippy
-      - run: cargo clippy -- -D warnings
-        working-directory: thd75
-      - run: cargo clippy -- -D warnings
-        working-directory: thd75-tui
-
   docs:
-    name: Docs
     runs-on: ubuntu-latest
     permissions:
       pages: write
@@ -109,4 +20,3 @@ jobs:
         with:
           path: thd75/target/doc
       - uses: actions/deploy-pages@v4
-        if: github.ref == 'refs/heads/main'
