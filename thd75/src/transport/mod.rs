@@ -2,16 +2,28 @@
 //!
 //! The TH-D75 communicates over USB CDC ACM (Communications Device Class
 //! Abstract Control Model) which presents as a standard serial port, and
-//! Bluetooth SPP (Serial Port Profile) which also appears as a serial port
-//! once paired at the OS level.
+//! Bluetooth SPP (Serial Port Profile) via RFCOMM.
 //!
-//! Three implementations are provided:
-//! - [`SerialTransport`] — USB and Bluetooth serial connections
+//! Implementations:
+//! - [`SerialTransport`] — USB serial connections (and BT via `/dev/cu.*`)
+//! - [`BluetoothTransport`] — Native macOS `IOBluetooth` RFCOMM (macOS only)
 //! - [`MockTransport`] — Programmed exchanges for testing
+//!
+//! On macOS, prefer [`BluetoothTransport`] over [`SerialTransport`] for BT
+//! connections. The macOS serial port driver has a bug where closing and
+//! reopening `/dev/cu.TH-D75` kills the RFCOMM channel permanently.
+//! [`BluetoothTransport`] talks directly to the RFCOMM channel via
+//! `IOBluetooth` and can be closed and reopened without issues.
 
+#[cfg(target_os = "macos")]
+pub mod bluetooth;
+pub mod either;
 pub mod mock;
 pub mod serial;
 
+#[cfg(target_os = "macos")]
+pub use bluetooth::BluetoothTransport;
+pub use either::EitherTransport;
 pub use mock::MockTransport;
 pub use serial::SerialTransport;
 

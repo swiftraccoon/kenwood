@@ -31,11 +31,9 @@ struct Cli {
     mcp_speed: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Init tracing — only if RUST_LOG is set, write to a file to avoid corrupting TUI
     if std::env::var("RUST_LOG").is_ok() {
         let log_file = std::fs::File::create("thd75-tui.log").expect("failed to create log file");
         tracing_subscriber::fmt()
@@ -45,7 +43,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    // Install panic hook that restores terminal before printing panic
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
@@ -53,23 +50,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         original_hook(panic_info);
     }));
 
-    // Terminal setup
+    // Open BT connection on the main thread (IOBluetooth needs main CFRunLoop).
+    let transport = radio_task::discover_and_open_transport(cli.port.clone(), cli.baud);
+
+    // Terminal setup on main thread before spawning
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Run the app, catching panics to restore terminal
-    let result = run_app(&mut terminal, cli.port, cli.baud, cli.mcp_speed).await;
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let mcp_speed = cli.mcp_speed;
 
-    // Terminal teardown (always runs)
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
 
-    if let Err(e) = result {
-        eprintln!("Error: {e}");
+        let result = rt.block_on(async {
+            run_app(&mut terminal, transport, mcp_speed)
+                .await
+                .map_err(|e| e.to_string())
+        });
+
+        let _ = disable_raw_mode();
+        let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = terminal.show_cursor();
+
+        let _ = done_tx.send(result);
+    });
+
+    // Main thread: pump CFRunLoop for IOBluetooth callbacks
+    loop {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            unsafe extern "C" {
+                fn CFRunLoopRunInMode(
+                    mode: *const std::ffi::c_void,
+                    seconds: f64,
+                    returnAfterSourceHandled: u8,
+                ) -> i32;
+                static kCFRunLoopDefaultMode: *const std::ffi::c_void;
+            }
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, 0);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        if let Ok(result) = done_rx.try_recv() {
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+            }
+            break;
+        }
     }
 
     Ok(())
@@ -77,27 +113,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    port: Option<String>,
-    baud: u32,
+    transport: Result<(String, kenwood_thd75::transport::EitherTransport), String>,
     mcp_speed: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut events = event::EventHandler::new();
     let tx = events.sender();
     let cmd_rx = events.take_command_receiver();
 
-    // Connect to radio in background
-    let port_display = match radio_task::spawn(port, baud, mcp_speed, tx, cmd_rx).await {
-        Ok(path) => path,
-        Err(e) => {
-            return Err(format!("Could not connect to radio: {e}").into());
-        }
-    };
+    let (path, transport) = transport.map_err(|e| format!("Could not connect to radio: {e}"))?;
+
+    let port_display =
+        match radio_task::spawn_with_transport(path, transport, mcp_speed, tx, cmd_rx).await {
+            Ok(p) => p,
+            Err(e) => return Err(format!("Could not connect to radio: {e}").into()),
+        };
 
     let mut app = App::new(port_display);
     app.connected = true;
     app.cmd_tx = Some(events.command_sender());
 
-    // Initial render
     terminal.draw(|frame| ui::render(&app, frame))?;
 
     loop {

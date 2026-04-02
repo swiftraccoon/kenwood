@@ -132,7 +132,10 @@ impl SerialTransport {
             .filter(|p| Self::is_bluetooth_port(&p.port_name))
             .collect();
 
-        tracing::info!(count = matching.len(), "discovered TH-D75 Bluetooth devices");
+        tracing::info!(
+            count = matching.len(),
+            "discovered TH-D75 Bluetooth devices"
+        );
         Ok(matching)
     }
 }

@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! Async Rust library for controlling the Kenwood TH-D75 transceiver via
 //! CAT (Computer Aided Transceiver) — the serial command protocol Kenwood
 //! uses for remote radio control.
@@ -55,4 +55,6 @@ pub mod types;
 pub use error::Error;
 pub use radio::Radio;
 pub use radio::programming::McpSpeed;
-pub use transport::{MockTransport, SerialTransport, Transport};
+#[cfg(target_os = "macos")]
+pub use transport::BluetoothTransport;
+pub use transport::{EitherTransport, MockTransport, SerialTransport, Transport};

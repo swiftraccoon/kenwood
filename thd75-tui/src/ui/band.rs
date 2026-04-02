@@ -88,14 +88,30 @@ fn band_lines(band: &BandState) -> Vec<Line<'static>> {
     vec![freq_line, mode_line, s_meter_line, extra_line]
 }
 
-fn s_meter_line(level: u8) -> Line<'static> {
-    let filled = level.min(15) as usize;
-    let empty = 15 - filled;
+/// Map raw SM value (0-5) to S-units and bar display.
+///
+/// The D75 SM command returns 0-5 representing 6 signal strength levels.
+/// The radio's display maps these to S-meter readings:
+///   0 = no signal, 1 ≈ S1, 2 ≈ S3, 3 ≈ S5, 4 ≈ S7, 5 = S9
+fn s_meter_line(raw: u8) -> Line<'static> {
+    // Map raw 0-5 to S-units: 0→0, 1→1, 2→3, 3→5, 4→7, 5→9
+    let s_unit: u8 = match raw {
+        0 => 0,
+        1 => 1,
+        2 => 3,
+        3 => 5,
+        4 => 7,
+        _ => 9,
+    };
+
+    // Bar: 9 segments for S0-S9
+    let filled = s_unit.min(9) as usize;
+    let empty = 9 - filled;
     let bar: String = "▓".repeat(filled) + &"░".repeat(empty);
 
-    let color = if filled > 9 {
+    let color = if s_unit >= 9 {
         Color::Red
-    } else if filled > 5 {
+    } else if s_unit >= 5 {
         Color::Yellow
     } else {
         Color::Green
@@ -104,7 +120,7 @@ fn s_meter_line(level: u8) -> Line<'static> {
     Line::from(vec![
         Span::styled("  S ", Style::default().fg(Color::DarkGray)),
         Span::styled(bar, Style::default().fg(color)),
-        Span::styled(format!(" S{level}"), Style::default().fg(Color::White)),
+        Span::styled(format!(" S{s_unit}"), Style::default().fg(Color::White)),
     ])
 }
 

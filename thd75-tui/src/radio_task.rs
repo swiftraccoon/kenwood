@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use kenwood_thd75::Radio;
+use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::Band;
 use tokio::sync::mpsc;
@@ -14,17 +15,24 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Reconnect poll interval after disconnect.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Connect to the radio and spawn the polling loop.
-/// Returns the serial port path used (for display in the status bar).
-pub async fn spawn(
+/// Open a transport on the calling thread (must be main for BT).
+/// This is synchronous — call from main before starting tokio.
+pub fn discover_and_open_transport(
     port: Option<String>,
     baud: u32,
+) -> Result<(String, EitherTransport), String> {
+    discover_and_open(port, baud)
+}
+
+/// Spawn the polling loop with a pre-opened transport.
+pub async fn spawn_with_transport(
+    path: String,
+    transport: EitherTransport,
     mcp_speed: String,
     tx: mpsc::UnboundedSender<Message>,
     mut cmd_rx: mpsc::UnboundedReceiver<crate::event::RadioCommand>,
 ) -> Result<String, String> {
-    let (path, transport) = discover_and_open(port.clone(), baud)?;
-
+    let baud = SerialTransport::DEFAULT_BAUD;
     let mut radio = Radio::connect(transport)
         .await
         .map_err(|e| format!("Connect failed: {e}"))?;
@@ -285,7 +293,7 @@ fn classify_error(context: &str, e: &kenwood_thd75::Error) -> PollError {
     }
 }
 
-async fn poll_once(radio: &mut Radio<SerialTransport>) -> Result<RadioState, PollError> {
+async fn poll_once(radio: &mut Radio<EitherTransport>) -> Result<RadioState, PollError> {
     let band_a = poll_band(radio, Band::A).await?;
     let band_b = poll_band(radio, Band::B).await?;
 
@@ -320,7 +328,7 @@ async fn poll_once(radio: &mut Radio<SerialTransport>) -> Result<RadioState, Pol
     })
 }
 
-async fn poll_band(radio: &mut Radio<SerialTransport>, band: Band) -> Result<BandState, PollError> {
+async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<BandState, PollError> {
     let channel = radio
         .get_frequency(band)
         .await
@@ -366,7 +374,7 @@ async fn poll_band(radio: &mut Radio<SerialTransport>, band: Band) -> Result<Ban
 /// Step frequency down by reading current freq + step size, subtracting, and tuning.
 /// The TH-D75 CAT protocol has no native down-step command (only UP exists).
 async fn freq_down(
-    radio: &mut Radio<SerialTransport>,
+    radio: &mut Radio<EitherTransport>,
     band: Band,
 ) -> Result<(), kenwood_thd75::Error> {
     use kenwood_thd75::types::StepSize;
@@ -397,17 +405,32 @@ async fn freq_down(
         .await
 }
 
-fn discover_and_open(port: Option<String>, baud: u32) -> Result<(String, SerialTransport), String> {
+fn discover_and_open(port: Option<String>, baud: u32) -> Result<(String, EitherTransport), String> {
+    // Explicit port
     if let Some(ref path) = port {
         if path != "auto" {
-            // SerialTransport::open auto-detects BT and applies 9600/RTS-CTS
+            if SerialTransport::is_bluetooth_port(path) {
+                // Use native IOBluetooth RFCOMM for BT (bypasses broken serial driver)
+                #[cfg(target_os = "macos")]
+                {
+                    let bt = kenwood_thd75::BluetoothTransport::open(None)
+                        .map_err(|e| format!("BT connect failed: {e}"))?;
+                    return Ok((path.clone(), EitherTransport::Bluetooth(bt)));
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let transport = SerialTransport::open(path, baud)
+                        .map_err(|e| format!("Failed to open {path}: {e}"))?;
+                    return Ok((path.clone(), EitherTransport::Serial(transport)));
+                }
+            }
             let transport = SerialTransport::open(path, baud)
                 .map_err(|e| format!("Failed to open {path}: {e}"))?;
-            return Ok((path.clone(), transport));
+            return Ok((path.clone(), EitherTransport::Serial(transport)));
         }
     }
 
-    // Auto-discover: try USB first, then Bluetooth
+    // Auto-discover: try USB first
     let usb_ports =
         SerialTransport::discover_usb().map_err(|e| format!("USB discovery failed: {e}"))?;
 
@@ -415,18 +438,15 @@ fn discover_and_open(port: Option<String>, baud: u32) -> Result<(String, SerialT
         let path = info.port_name.clone();
         let transport = SerialTransport::open(&path, baud)
             .map_err(|e| format!("Failed to open {path}: {e}"))?;
-        return Ok((path, transport));
+        return Ok((path, EitherTransport::Serial(transport)));
     }
 
-    // No USB — try Bluetooth
-    let bt_ports = SerialTransport::discover_bluetooth()
-        .map_err(|e| format!("BT discovery failed: {e}"))?;
-
-    if let Some(info) = bt_ports.first() {
-        let path = info.port_name.clone();
-        let transport = SerialTransport::open(&path, baud)
-            .map_err(|e| format!("Failed to open {path}: {e}"))?;
-        return Ok((path, transport));
+    // No USB — try native Bluetooth RFCOMM
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(bt) = kenwood_thd75::BluetoothTransport::open(None) {
+            return Ok(("bluetooth:TH-D75".into(), EitherTransport::Bluetooth(bt)));
+        }
     }
 
     Err("No TH-D75 found on USB or Bluetooth".to_string())
