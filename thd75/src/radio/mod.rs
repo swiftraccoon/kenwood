@@ -259,7 +259,7 @@ impl<T: Transport> Radio<T> {
                 while let Some(frame) = self.codec.next_frame() {
                     let frame_str = String::from_utf8_lossy(&frame);
                     let frame_mnemonic = frame_str.split_once(' ')
-                        .map_or(frame_str.trim(), |(m, _)| m);
+                        .map_or_else(|| frame_str.trim(), |(m, _)| m);
 
                     tracing::trace!(cmd = %cmd_name, frame = ?frame_str.trim(), "RX");
 
