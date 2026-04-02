@@ -168,13 +168,14 @@ impl AprsCallsign {
 /// APRS uses a two-character encoding: the first character selects the
 /// symbol table (`/` for primary, `\` for alternate), and the second
 /// character selects the specific icon within that table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum AprsIcon {
     /// House (primary table `/`).
     House,
     /// Car / automobile (primary table `/`).
     Car,
     /// Portable / HT (primary table `/`).
+    #[default]
     Portable,
     /// Jogger / runner (primary table `/`).
     Jogger,
@@ -208,12 +209,6 @@ pub enum AprsIcon {
         /// Symbol code character (ASCII 0x21-0x7E).
         code: char,
     },
-}
-
-impl Default for AprsIcon {
-    fn default() -> Self {
-        Self::Portable
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -430,13 +425,14 @@ pub enum PositionAmbiguity {
 /// The packet path determines which digipeaters relay the station's
 /// packets. Common paths include WIDE1-1,WIDE2-1 for typical VHF
 /// APRS operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PacketPath {
     /// Off (no digipeater path).
     Off,
     /// WIDE1-1 (one hop via fill-in digipeaters).
     Wide1_1,
     /// WIDE1-1,WIDE2-1 (standard two-hop path).
+    #[default]
     Wide1_1Wide2_1,
     /// WIDE1-1,WIDE2-2 (three-hop path).
     Wide1_1Wide2_2,
@@ -446,12 +442,6 @@ pub enum PacketPath {
     User2,
     /// Path 3 (user-configurable, stored in MCP memory).
     User3,
-}
-
-impl Default for PacketPath {
-    fn default() -> Self {
-        Self::Wide1_1Wide2_1
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,18 +1038,13 @@ impl NavitraMessage {
 /// APRS network identifier.
 ///
 /// Selects the APRS-IS network for internet gateway connections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum AprsNetwork {
     /// APRS standard network (e.g. 144.390 MHz in North America).
+    #[default]
     Aprs,
     /// NAVITRA network (Japanese navigation/tracking system).
     Navitra,
-}
-
-impl Default for AprsNetwork {
-    fn default() -> Self {
-        Self::Aprs
-    }
 }
 
 // ---------------------------------------------------------------------------

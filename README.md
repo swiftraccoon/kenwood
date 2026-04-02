@@ -4,6 +4,10 @@
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![CI](https://github.com/swiftraccoon/kenwood/actions/workflows/ci.yml/badge.svg)](https://github.com/swiftraccoon/kenwood/actions)
 [![Docs](https://img.shields.io/badge/docs-github.io-blue)](https://swiftraccoon.github.io/kenwood/)
+[![Ubuntu](https://img.shields.io/badge/Ubuntu-tested-E95420)](https://github.com/swiftraccoon/kenwood/actions)
+[![Fedora](https://img.shields.io/badge/Fedora-tested-51A2DA)](https://github.com/swiftraccoon/kenwood/actions)
+[![macOS](https://img.shields.io/badge/macOS-tested-000000)](https://github.com/swiftraccoon/kenwood/actions)
+[![Windows](https://img.shields.io/badge/Windows-tested-0078D6)](https://github.com/swiftraccoon/kenwood/actions)
 
 Rust libraries and TUIs for Kenwood amateur radio transceivers.
 
