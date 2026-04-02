@@ -1,9 +1,9 @@
 //! Control commands: AI, BY, DL, DW, RX, TX, LC, IO, BL, BE, VD, VG, VX.
 //!
 //! These commands control radio-wide functions including auto-info
-//! notifications, transmit/receive switching, lock/backlight control,
-//! dual watch, beep setting, and VOX (Voice-Operated Exchange) settings
-//! for hands-free operation.
+//! notifications, transmit/receive switching, lock control, battery level,
+//! frequency stepping, beep setting, and VOX (Voice-Operated Exchange)
+//! settings for hands-free operation.
 
 use crate::error::ProtocolError;
 use crate::types::Band;
@@ -21,7 +21,7 @@ pub(crate) fn parse_control(
         "AI" => Some(parse_bool(payload, "AI").map(|enabled| Response::AutoInfo { enabled })),
         "BY" => Some(parse_by(payload)),
         "DL" => Some(parse_bool(payload, "DL").map(|enabled| Response::DualBand { enabled })),
-        "DW" => Some(parse_bool(payload, "DW").map(|enabled| Response::DualWatch { enabled })),
+        "DW" => Some(Ok(Response::FrequencyDown)),
         "BE" => Some(parse_bool(payload, "BE").map(|enabled| Response::Beep { enabled })),
         "RX" | "TX" => Some(Ok(Response::Ok)),
         "LC" => Some(parse_bool(payload, "LC").map(|locked| Response::Lock { locked })),
@@ -81,17 +81,19 @@ fn split_band_value<'a>(payload: &'a str, cmd: &str) -> Result<(Band, &'a str), 
     Ok((band, parts[1]))
 }
 
-/// Parse BL (backlight): bare `"level"` for read, `"display,level"` for write echo.
+/// Parse BL (battery level): bare `"level"` response.
+///
+/// 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green).
 fn parse_bl(payload: &str) -> Result<Response, ProtocolError> {
-    // Write echo: "0,3" -> take second field
     // Read response: "3" -> take the only field
-    let level_str = if let Some((_display, level)) = payload.split_once(',') {
+    // Some responses may include comma format "0,3" — take last field
+    let level_str = if let Some((_prefix, level)) = payload.split_once(',') {
         level
     } else {
         payload
     };
     let level = parse_u8_field(level_str.trim(), "BL", "level")?;
-    Ok(Response::Backlight { level })
+    Ok(Response::BatteryLevel { level })
 }
 
 /// Parse BY (busy): "band,busy".

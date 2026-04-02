@@ -168,18 +168,18 @@ pub enum Command {
     // === VFO (AG, SQ, SM, MD, FS, FT, SH, UP, RA) ===
     /// Get AF gain level for a band (AG read).
     ///
-    /// D75 RE: `AG x,y` (x: band 0/1, y: gain 0-39).
+    /// Per KI4LAX CAT reference: `AG` returns gain level 000-099.
     /// Hardware observation: bare `AG\r` returns global gain. Band-indexed
-    /// `AG band\r` returns `?`. Read is bare, write may be band-indexed.
+    /// `AG band\r` returns `?`. Read is bare only.
     GetAfGain,
-    /// Set AF gain level for a band (AG write).
+    /// Set AF gain level (AG write).
     ///
-    /// D75 RE: `AG x,y` (x: band 0/1, y: gain 0-39).
-    /// Sends `AG band,level\r`.
+    /// Per KI4LAX CAT reference: `AG AAA` (AAA: 000-099, 3-digit zero-padded).
+    /// Sends bare `AG level\r` (no band parameter — firmware rejects band-indexed writes).
     SetAfGain {
-        /// Target band.
+        /// Target band (ignored by firmware — AG is global).
         band: Band,
-        /// Gain level (0-39).
+        /// Gain level (0-99).
         level: u8,
     },
     /// Get squelch level (SQ read).
@@ -189,12 +189,12 @@ pub enum Command {
     },
     /// Set squelch level (SQ write).
     ///
-    /// D75 RE: `SQ x,y` (x: band, y: squelch level 0-5).
-    /// Sends `SQ band,level\r` (no zero-padding).
+    /// Per KI4LAX CAT reference: `SQ x,yy` (x: band, yy: squelch level 0-6).
+    /// Sends `SQ band,level\r`.
     SetSquelch {
         /// Target band.
         band: Band,
-        /// Squelch level (0-5 on D75).
+        /// Squelch level (0-6 on D75).
         level: u8,
     },
     /// Get S-meter reading (SM read).
@@ -265,18 +265,14 @@ pub enum Command {
         /// Target band.
         band: Band,
     },
-    /// Get dual watch state (DW read).
+    /// Tune frequency down by one step (DW action).
     ///
-    /// D75 RE: `DW x` (x: 0=off, 1=on).
-    /// Sends bare `DW\r`.
-    GetDualWatch,
-    /// Set dual watch on/off (DW write).
-    ///
-    /// D75 RE: `DW x` (x: 0=off, 1=on).
-    /// Sends `DW 0\r` or `DW 1\r`.
-    SetDualWatch {
-        /// Whether dual watch is enabled.
-        enabled: bool,
+    /// Per KI4LAX CAT reference: DW tunes the current band's frequency
+    /// down by the current step size. This is a write-only action command
+    /// (like UP). The band parameter selects which band to step.
+    FrequencyDown {
+        /// Target band.
+        band: Band,
     },
     /// Get attenuator state (RA read).
     GetAttenuator {
@@ -353,21 +349,12 @@ pub enum Command {
         /// I/O port value to set.
         value: u8,
     },
-    /// Get backlight brightness (BL read).
+    /// Get battery level (BL read).
     ///
-    /// D75 RE: `BL x` (x: brightness level).
-    /// Sends bare `BL\r`. Response is `BL level`.
-    GetBacklight,
-    /// Set backlight brightness (BL write).
-    ///
-    /// D75 firmware expects `BL x,y\r` (7 bytes, space at \[2\], comma at \[4\]).
-    /// The first parameter `x` is a display selector (use 0 for main display).
-    /// The RE guide's simplified `BL 5\r` example is incorrect — the firmware
-    /// handler rejects it with `?`.
-    SetBacklight {
-        /// Backlight brightness level.
-        level: u8,
-    },
+    /// Per KI4LAX CAT reference: BL returns battery charge state.
+    /// 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green).
+    /// Read-only command — the radio does not accept BL writes.
+    GetBatteryLevel,
     /// Get VOX delay (VD read).
     ///
     /// # Mode requirement
@@ -729,10 +716,9 @@ pub enum Response {
     // === VFO ===
     /// AF gain response (AG).
     ///
-    /// D75 RE: `AG x,y` (x: band 0/1, y: gain 0-255).
-    /// Hardware-verified: bare `AG\r` returns values up to at least 91.
+    /// Per KI4LAX CAT reference: gain range 000-099.
     AfGain {
-        /// Gain level (0-255). Global, not per-band.
+        /// Gain level (0-99). Global, not per-band.
         level: u8,
     },
     /// Squelch level response (SQ).
@@ -803,13 +789,8 @@ pub enum Response {
         /// Whether dual-band is enabled.
         enabled: bool,
     },
-    /// Dual watch state response (DW).
-    ///
-    /// D75 RE: `DW x` (x: 0=off, 1=on).
-    DualWatch {
-        /// Whether dual watch is enabled.
-        enabled: bool,
-    },
+    /// Frequency down acknowledgement (DW).
+    FrequencyDown,
     /// Beep setting response (BE).
     ///
     /// D75 RE: `BE x` (x: 0=off, 1=on).
@@ -827,11 +808,11 @@ pub enum Response {
         /// I/O port value.
         value: u8,
     },
-    /// Backlight brightness response (BL).
+    /// Battery level response (BL).
     ///
-    /// D75 RE: `BL x` (x: brightness level).
-    Backlight {
-        /// Current backlight brightness level.
+    /// 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green).
+    BatteryLevel {
+        /// Battery charge level (0-3).
         level: u8,
     },
     /// VOX delay response (VD).
@@ -1101,7 +1082,7 @@ pub const fn command_name(cmd: &Command) -> &'static str {
         Command::GetFunctionType => "FT",
         Command::GetFilterWidth { .. } => "SH",
         Command::FrequencyUp { .. } => "UP",
-        Command::GetDualWatch | Command::SetDualWatch { .. } => "DW",
+        Command::FrequencyDown { .. } => "DW",
         Command::GetAttenuator { .. } | Command::SetAttenuator { .. } => "RA",
         Command::SetAutoInfo { .. } => "AI",
         Command::GetBusy { .. } => "BY",
@@ -1110,7 +1091,7 @@ pub const fn command_name(cmd: &Command) -> &'static str {
         Command::Transmit { .. } => "TX",
         Command::GetLock | Command::SetLock { .. } => "LC",
         Command::GetIoPort | Command::SetIoPort { .. } => "IO",
-        Command::GetBacklight | Command::SetBacklight { .. } => "BL",
+        Command::GetBatteryLevel => "BL",
         Command::GetVoxDelay | Command::SetVoxDelay { .. } => "VD",
         Command::GetVoxGain | Command::SetVoxGain { .. } => "VG",
         Command::GetVox | Command::SetVox { .. } => "VX",
@@ -1204,10 +1185,10 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         // VFO
         Command::GetAfGain => "AG".to_owned(),
         Command::SetAfGain { band: _, level } => {
-            // D75 firmware AG write handler expects bare `AG X\r` (5 bytes).
+            // D75 firmware AG write handler expects bare `AG AAA\r`.
             // Band-indexed `AG band,level` is rejected with `?`.
-            // The write value is a single digit (0-9) coarse volume step.
-            format!("AG {level}")
+            // Per KI4LAX: 3-digit zero-padded, range 000-099.
+            format!("AG {level:03}")
         }
         Command::GetSquelch { band } => format!("SQ {}", u8::from(*band)),
         Command::SetSquelch { band, level } => {
@@ -1225,8 +1206,7 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         Command::GetFunctionType => "FT".to_owned(),
         Command::GetFilterWidth { mode_index } => format!("SH {mode_index}"),
         Command::FrequencyUp { band } => format!("UP {}", u8::from(*band)),
-        Command::GetDualWatch => "DW".to_owned(),
-        Command::SetDualWatch { enabled } => format!("DW {}", u8::from(*enabled)),
+        Command::FrequencyDown { band } => format!("DW {}", u8::from(*band)),
         Command::GetAttenuator { band } => format!("RA {}", u8::from(*band)),
         Command::SetAttenuator { band, enabled } => {
             format!("RA {},{}", u8::from(*band), u8::from(*enabled))
@@ -1243,8 +1223,7 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         Command::SetLock { locked } => format!("LC {}", u8::from(*locked)),
         Command::GetIoPort => "IO".to_owned(),
         Command::SetIoPort { value } => format!("IO {value}"),
-        Command::GetBacklight => "BL".to_owned(),
-        Command::SetBacklight { level } => format!("BL 0,{level}"),
+        Command::GetBatteryLevel => "BL".to_owned(),
         Command::GetVoxDelay => "VD".to_owned(),
         Command::SetVoxDelay { delay } => format!("VD {delay}"),
         Command::GetVoxGain => "VG".to_owned(),

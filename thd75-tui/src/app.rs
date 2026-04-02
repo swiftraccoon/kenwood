@@ -672,7 +672,7 @@ impl Default for BandState {
 pub struct RadioState {
     pub band_a: BandState,
     pub band_b: BandState,
-    pub backlight: u8,
+    pub battery_level: u8,
     pub beep: bool,
     pub lock: bool,
     pub dual_band: bool,
@@ -1530,7 +1530,7 @@ impl App {
                 SettingRow::SquelchA => {
                     let cur = self.state.band_a.squelch;
                     let next = if delta > 0 {
-                        cur.saturating_add(1).min(5)
+                        cur.saturating_add(1).min(6)
                     } else {
                         cur.saturating_sub(1)
                     };
@@ -1544,7 +1544,7 @@ impl App {
                 SettingRow::SquelchB => {
                     let cur = self.state.band_b.squelch;
                     let next = if delta > 0 {
-                        cur.saturating_add(1).min(5)
+                        cur.saturating_add(1).min(6)
                     } else {
                         cur.saturating_sub(1)
                     };
@@ -1613,8 +1613,7 @@ impl App {
                         Mode::Am => Mode::Lsb,
                         Mode::Lsb => Mode::Usb,
                         Mode::Usb => Mode::Cw,
-                        Mode::Cw => Mode::Wfm,
-                        Mode::Wfm => Mode::Dv,
+                        Mode::Cw => Mode::Dv,
                         Mode::Dv => Mode::Dr,
                         Mode::Dr => Mode::Fm,
                     };
@@ -1633,8 +1632,7 @@ impl App {
                         Mode::Am => Mode::Lsb,
                         Mode::Lsb => Mode::Usb,
                         Mode::Usb => Mode::Cw,
-                        Mode::Cw => Mode::Wfm,
-                        Mode::Wfm => Mode::Dv,
+                        Mode::Cw => Mode::Dv,
                         Mode::Dv => Mode::Dr,
                         Mode::Dr => Mode::Fm,
                     };

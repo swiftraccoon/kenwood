@@ -1023,16 +1023,13 @@ mod tests {
     }
 
     #[test]
-    fn flash_channel_mode_matches_cat_for_0_to_6() {
-        // CAT MD and flash memory use the same encoding for indices 0-6.
-        // CAT extends with WFM=7 and DR=8; flash has DR=7 (no WFM).
+    fn flash_channel_mode_matches_cat() {
+        // CAT MD and flash memory use the same encoding for all 8 modes (0-7).
         use crate::types::mode::{MemoryMode, Mode};
         assert_eq!(u8::from(MemoryMode::Am), u8::from(Mode::Am));
         assert_eq!(u8::from(MemoryMode::Nfm), u8::from(Mode::Nfm));
         assert_eq!(u8::from(MemoryMode::Fm), u8::from(Mode::Fm));
-        // DR diverges: flash DR=7, CAT DR=8
-        assert_eq!(u8::from(MemoryMode::Dr), 7);
-        assert_eq!(u8::from(Mode::Dr), 8);
+        assert_eq!(u8::from(MemoryMode::Dr), u8::from(Mode::Dr));
     }
 
     #[test]

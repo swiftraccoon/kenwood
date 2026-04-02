@@ -33,7 +33,7 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect) {
     // Live toggles as compact indicators
     let s = &app.state;
     let mut flags = Vec::new();
-    flags.push(format!("BL:{}", s.backlight));
+    flags.push(format!("BAT:{}", s.battery_level));
     flags.push(format!("Vol:{}", s.af_gain));
     if !s.lock {
         flags.push("LCK".into());

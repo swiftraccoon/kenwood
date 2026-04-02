@@ -95,12 +95,12 @@ async fn write_squelch() {
 /// Safe: read-only.
 #[tokio::test]
 #[ignore]
-async fn read_backlight() {
+async fn read_battery_level() {
     let mut radio = connect().await;
-    println!("\n=== READ: BACKLIGHT ===");
+    println!("\n=== READ: BATTERY LEVEL ===");
 
-    let level = radio.get_backlight().await.unwrap();
-    println!("  Backlight level: {level}");
+    let level = radio.get_battery_level().await.unwrap();
+    println!("  Battery level: {level} (0=Empty, 1=1/3, 2=2/3, 3=Full)");
 
     let _ = radio.disconnect().await;
     println!("  PASS");

@@ -26,8 +26,8 @@ fn band_boundary() {
 
 #[test]
 fn mode_boundary() {
-    assert!(Mode::try_from(8u8).is_ok(), "8 (DR) is the last valid mode");
-    assert!(Mode::try_from(9u8).is_err(), "9 must be rejected");
+    assert!(Mode::try_from(7u8).is_ok(), "7 (DR) is the last valid mode");
+    assert!(Mode::try_from(8u8).is_err(), "8 must be rejected");
 }
 
 #[test]
@@ -140,10 +140,10 @@ fn band_full_valid_range() {
 
 #[test]
 fn mode_full_valid_range() {
-    for i in 0u8..9 {
+    for i in 0u8..8 {
         assert!(Mode::try_from(i).is_ok(), "Mode({i}) should be valid");
     }
-    for i in 9u8..=255 {
+    for i in 8u8..=255 {
         assert!(Mode::try_from(i).is_err(), "Mode({i}) should be invalid");
     }
 }

@@ -156,7 +156,16 @@ fn render_settings_list(
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )));
-    lines.push(kv(" Backlight", &s.backlight.to_string()));
+    lines.push(kv(
+        " Battery",
+        &match s.battery_level {
+            0 => "Empty (Red)".to_string(),
+            1 => "1/3 (Yellow)".to_string(),
+            2 => "2/3 (Green)".to_string(),
+            3 => "Full (Green)".to_string(),
+            n => format!("{n}"),
+        },
+    ));
     lines.push(kv(" AF Gain", &s.af_gain.to_string()));
     lines.push(kv(" Beep", &on_off(s.beep)));
     lines.push(kv(" Lock", &on_off(!s.lock))); // CAT inverted on D75

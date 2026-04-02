@@ -138,19 +138,19 @@ fn parse_me_with_tone_settings() {
 }
 
 // ============================================================================
-// DW is Dual Watch (boolean) per D75 firmware RE
+// DW is Frequency Down (step down) per KI4LAX CAT reference
 // ============================================================================
 
 #[test]
-fn parse_dw_zero_returns_dual_watch_off() {
+fn parse_dw_returns_frequency_down() {
     let r = protocol::parse(b"DW 0").unwrap();
-    assert!(matches!(r, Response::DualWatch { enabled: false }));
+    assert!(matches!(r, Response::FrequencyDown));
 }
 
 #[test]
-fn parse_dw_one_returns_dual_watch_on() {
+fn parse_dw_band_b_returns_frequency_down() {
     let r = protocol::parse(b"DW 1").unwrap();
-    assert!(matches!(r, Response::DualWatch { enabled: true }));
+    assert!(matches!(r, Response::FrequencyDown));
 }
 
 // ============================================================================

@@ -108,43 +108,30 @@ fn parse_dl_disabled() {
 }
 
 // ============================================================================
-// DW -- Dual Watch (boolean)
+// DW -- Frequency Down (step frequency down, counterpart to UP)
 // ============================================================================
 
 #[test]
-fn serialize_dw_read() {
-    assert_eq!(protocol::serialize(&Command::GetDualWatch), b"DW\r");
-}
-
-#[test]
-fn serialize_dw_on() {
+fn serialize_dw_band_a() {
     assert_eq!(
-        protocol::serialize(&Command::SetDualWatch { enabled: true }),
-        b"DW 1\r"
-    );
-}
-
-#[test]
-fn serialize_dw_off() {
-    assert_eq!(
-        protocol::serialize(&Command::SetDualWatch { enabled: false }),
+        protocol::serialize(&Command::FrequencyDown { band: Band::A }),
         b"DW 0\r"
     );
 }
 
 #[test]
-fn parse_dw_enabled() {
-    match protocol::parse(b"DW 1").unwrap() {
-        Response::DualWatch { enabled } => assert!(enabled),
-        other => panic!("expected DualWatch, got {other:?}"),
-    }
+fn serialize_dw_band_b() {
+    assert_eq!(
+        protocol::serialize(&Command::FrequencyDown { band: Band::B }),
+        b"DW 1\r"
+    );
 }
 
 #[test]
-fn parse_dw_disabled() {
+fn parse_dw_response() {
     match protocol::parse(b"DW 0").unwrap() {
-        Response::DualWatch { enabled } => assert!(!enabled),
-        other => panic!("expected DualWatch, got {other:?}"),
+        Response::FrequencyDown => {}
+        other => panic!("expected FrequencyDown, got {other:?}"),
     }
 }
 
@@ -288,37 +275,27 @@ fn parse_io_response() {
 }
 
 // ============================================================================
-// BL -- Backlight brightness (write uses comma-separated "BL 0,level")
+// BL -- Battery Level (read-only: 0=Empty, 1=1/3, 2=2/3, 3=Full)
 // ============================================================================
 
 #[test]
 fn serialize_bl_read() {
-    assert_eq!(protocol::serialize(&Command::GetBacklight), b"BL\r");
-}
-
-#[test]
-fn serialize_bl_write() {
-    // D75 firmware handler requires "BL x,y\r" (7 bytes, comma at [4])
-    assert_eq!(
-        protocol::serialize(&Command::SetBacklight { level: 5 }),
-        b"BL 0,5\r"
-    );
-}
-
-#[test]
-fn serialize_bl_write_zero() {
-    assert_eq!(
-        protocol::serialize(&Command::SetBacklight { level: 0 }),
-        b"BL 0,0\r"
-    );
+    assert_eq!(protocol::serialize(&Command::GetBatteryLevel), b"BL\r");
 }
 
 #[test]
 fn parse_bl_response() {
-    // Read response is bare level (no comma format)
     match protocol::parse(b"BL 3").unwrap() {
-        Response::Backlight { level } => assert_eq!(level, 3),
-        other => panic!("expected Backlight, got {other:?}"),
+        Response::BatteryLevel { level } => assert_eq!(level, 3),
+        other => panic!("expected BatteryLevel, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_bl_empty() {
+    match protocol::parse(b"BL 0").unwrap() {
+        Response::BatteryLevel { level } => assert_eq!(level, 0),
+        other => panic!("expected BatteryLevel, got {other:?}"),
     }
 }
 

@@ -192,21 +192,9 @@ async fn verify_cat_writes() {
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetSquelch"),
     }
 
-    // Backlight
-    let orig_bl = radio.get_backlight().await.unwrap();
-    let new_bl = if orig_bl == 2 { 5 } else { 2 };
-    match radio.set_backlight(new_bl).await {
-        Ok(()) => {
-            let rb = radio.get_backlight().await.unwrap();
-            let _ = radio.set_backlight(orig_bl).await;
-            if rb == new_bl {
-                println!("  {:<25} OK", "SetBacklight");
-            } else {
-                println!("  {:<25} FAIL (readback: {rb})", "SetBacklight");
-            }
-        }
-        Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetBacklight"),
-    }
+    // Battery Level (read-only per KI4LAX)
+    let bl = radio.get_battery_level().await.unwrap();
+    println!("  {:<25} READ_ONLY (level: {bl})", "BatteryLevel");
 
     // Mode
     let orig_md = radio.get_mode(Band::A).await.unwrap();
@@ -228,19 +216,10 @@ async fn verify_cat_writes() {
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetMode"),
     }
 
-    // Dual watch
-    let orig_dw = radio.get_dual_watch().await.unwrap();
-    match radio.set_dual_watch(!orig_dw).await {
-        Ok(()) => {
-            let rb = radio.get_dual_watch().await.unwrap();
-            let _ = radio.set_dual_watch(orig_dw).await;
-            if rb == !orig_dw {
-                println!("  {:<25} OK", "SetDualWatch");
-            } else {
-                println!("  {:<25} FAIL", "SetDualWatch");
-            }
-        }
-        Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetDualWatch"),
+    // Frequency Down (DW — action command, no readback)
+    match radio.frequency_down(Band::A).await {
+        Ok(()) => println!("  {:<25} OK", "FrequencyDown"),
+        Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "FrequencyDown"),
     }
 
     // Auto-info

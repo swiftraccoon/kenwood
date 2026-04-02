@@ -137,14 +137,13 @@ async fn hw_control_commands() {
     // DL — Dual band display
     let _ = probe(&mut radio, Command::GetDualBand).await;
 
-    // DW — Dual Watch
-    let _ = probe(&mut radio, Command::GetDualWatch).await;
+    // DW — Frequency Down (action, not probed — would change frequency)
 
-    // LC — Lock/Backlight control
+    // LC — Lock control
     let _ = probe(&mut radio, Command::GetLock).await;
 
-    // BL — Backlight brightness
-    let _ = probe(&mut radio, Command::GetBacklight).await;
+    // BL — Battery Level
+    let _ = probe(&mut radio, Command::GetBatteryLevel).await;
 
     // VX — VOX
     let _ = probe(&mut radio, Command::GetVox).await;

@@ -6,9 +6,9 @@ use crate::error::ValidationError;
 
 /// Operating mode as returned by the `MD` (mode) CAT command.
 ///
-/// The TH-D75 supports 9 modes (0-8) via the `MD` command. This
-/// encoding matches the flash memory encoding (0-6) with WFM added
-/// at index 7 and DR shifted to index 8. Confirmed from live hardware.
+/// The TH-D75 supports 8 modes (0-7) via the `MD` command per the
+/// KI4LAX CAT command reference. This encoding matches the flash
+/// memory encoding (0-7).
 ///
 /// Note: the `FO`/`ME` commands use a **different** mode encoding
 /// (0=FM, 1=DV, 2=NFM, 3=AM) stored as a raw `u8` in [`ChannelMemory`].
@@ -31,10 +31,8 @@ pub enum Mode {
     Cw = 5,
     /// Narrow FM modulation (index 6).
     Nfm = 6,
-    /// Wide FM — broadcast receive only (index 7).
-    Wfm = 7,
-    /// D-STAR repeater mode (index 8).
-    Dr = 8,
+    /// D-STAR repeater mode (index 7).
+    Dr = 7,
 }
 
 impl fmt::Display for Mode {
@@ -47,7 +45,6 @@ impl fmt::Display for Mode {
             Self::Usb => f.write_str("USB"),
             Self::Cw => f.write_str("CW"),
             Self::Nfm => f.write_str("NFM"),
-            Self::Wfm => f.write_str("WFM"),
             Self::Dr => f.write_str("DR"),
         }
     }
@@ -65,8 +62,7 @@ impl TryFrom<u8> for Mode {
             4 => Ok(Self::Usb),
             5 => Ok(Self::Cw),
             6 => Ok(Self::Nfm),
-            7 => Ok(Self::Wfm),
-            8 => Ok(Self::Dr),
+            7 => Ok(Self::Dr),
             _ => Err(ValidationError::ModeOutOfRange(value)),
         }
     }
@@ -339,20 +335,20 @@ mod tests {
 
     #[test]
     fn mode_valid_range() {
-        for i in 0u8..9 {
+        for i in 0u8..8 {
             assert!(Mode::try_from(i).is_ok(), "Mode({i}) should be valid");
         }
     }
 
     #[test]
     fn mode_invalid() {
-        assert!(Mode::try_from(9).is_err());
+        assert!(Mode::try_from(8).is_err());
         assert!(Mode::try_from(255).is_err());
     }
 
     #[test]
     fn mode_round_trip() {
-        for i in 0u8..9 {
+        for i in 0u8..8 {
             let val = Mode::try_from(i).unwrap();
             assert_eq!(u8::from(val), i);
         }
@@ -360,8 +356,8 @@ mod tests {
 
     #[test]
     fn mode_error_variant() {
-        let err = Mode::try_from(9).unwrap_err();
-        assert!(matches!(err, ValidationError::ModeOutOfRange(9)));
+        let err = Mode::try_from(8).unwrap_err();
+        assert!(matches!(err, ValidationError::ModeOutOfRange(8)));
     }
 
     #[test]
@@ -373,7 +369,6 @@ mod tests {
         assert_eq!(Mode::Usb.to_string(), "USB");
         assert_eq!(Mode::Cw.to_string(), "CW");
         assert_eq!(Mode::Nfm.to_string(), "NFM");
-        assert_eq!(Mode::Wfm.to_string(), "WFM");
         assert_eq!(Mode::Dr.to_string(), "DR");
     }
 
@@ -545,9 +540,8 @@ mod tests {
     }
 
     #[test]
-    fn cat_mode_matches_flash_encoding_0_to_6() {
-        // CAT MD and flash memory use the same encoding for indices 0-6:
-        // 0=FM, 1=DV, 2=AM, 3=LSB, 4=USB, 5=CW, 6=NFM
+    fn cat_mode_matches_flash_encoding() {
+        // CAT MD and flash memory use the same encoding for all 8 modes (0-7).
         assert_eq!(u8::from(Mode::Fm), u8::from(MemoryMode::Fm));
         assert_eq!(u8::from(Mode::Dv), u8::from(MemoryMode::Dv));
         assert_eq!(u8::from(Mode::Am), u8::from(MemoryMode::Am));
@@ -555,9 +549,6 @@ mod tests {
         assert_eq!(u8::from(Mode::Usb), u8::from(MemoryMode::Usb));
         assert_eq!(u8::from(Mode::Cw), u8::from(MemoryMode::Cw));
         assert_eq!(u8::from(Mode::Nfm), u8::from(MemoryMode::Nfm));
-        // CAT adds WFM=7 and DR=8; flash has DR=7 (no WFM)
-        assert_eq!(u8::from(Mode::Wfm), 7);
-        assert_eq!(u8::from(Mode::Dr), 8);
-        assert_eq!(u8::from(MemoryMode::Dr), 7);
+        assert_eq!(u8::from(Mode::Dr), u8::from(MemoryMode::Dr));
     }
 }

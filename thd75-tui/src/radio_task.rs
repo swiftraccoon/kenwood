@@ -298,7 +298,7 @@ async fn poll_once(radio: &mut Radio<EitherTransport>) -> Result<RadioState, Pol
     let band_b = poll_band(radio, Band::B).await?;
 
     // Global state reads — all confirmed safe (no side effects)
-    let backlight = radio.get_backlight().await.unwrap_or(0);
+    let battery_level = radio.get_battery_level().await.unwrap_or(0);
     let beep = radio.get_beep().await.unwrap_or(false);
     let lock = radio.get_lock().await.unwrap_or(false);
     let dual_band = radio.get_dual_band().await.unwrap_or(false);
@@ -312,7 +312,7 @@ async fn poll_once(radio: &mut Radio<EitherTransport>) -> Result<RadioState, Pol
     Ok(RadioState {
         band_a,
         band_b,
-        backlight,
+        battery_level,
         beep,
         lock,
         dual_band,

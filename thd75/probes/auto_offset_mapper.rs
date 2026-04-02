@@ -269,16 +269,7 @@ async fn map_vox_delay() {
     .await;
 }
 
-#[tokio::test]
-#[ignore = "requires connected radio hardware"]
-async fn map_backlight() {
-    let _ = map_single_setting(
-        "backlight_level",
-        Command::SetBacklight { level: 1 },
-        Command::SetBacklight { level: 4 },
-    )
-    .await;
-}
+// BL is battery level (read-only) per KI4LAX — no MCP offset mapping needed.
 
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
@@ -291,16 +282,7 @@ async fn map_bluetooth() {
     .await;
 }
 
-#[tokio::test]
-#[ignore = "requires connected radio hardware"]
-async fn map_dual_watch() {
-    let _ = map_single_setting(
-        "dual_watch",
-        Command::SetDualWatch { enabled: true },
-        Command::SetDualWatch { enabled: false },
-    )
-    .await;
-}
+// DW is frequency down (action command) per KI4LAX — no MCP offset mapping needed.
 
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
@@ -351,11 +333,7 @@ async fn map_all_settings() {
     println!("\n=== AUTOMATED OFFSET MAPPER (single-dump per setting) ===\n");
 
     let tests = vec![
-        SettingTest {
-            name: "backlight_level",
-            set_cmd: Command::SetBacklight { level: 1 },
-            restore_cmd: Command::SetBacklight { level: 4 },
-        },
+        // BL is battery level (read-only) per KI4LAX — excluded.
         SettingTest {
             name: "vox_enable",
             set_cmd: Command::SetVox { enabled: true },
@@ -421,11 +399,7 @@ async fn map_all_settings() {
             set_cmd: Command::SetBluetooth { enabled: false },
             restore_cmd: Command::SetBluetooth { enabled: true },
         },
-        SettingTest {
-            name: "dual_watch",
-            set_cmd: Command::SetDualWatch { enabled: true },
-            restore_cmd: Command::SetDualWatch { enabled: false },
-        },
+        // DW is frequency down (action command) per KI4LAX — excluded.
         SettingTest {
             name: "auto_info",
             set_cmd: Command::SetAutoInfo { enabled: true },

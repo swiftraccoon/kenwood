@@ -54,11 +54,11 @@ async fn lock_control() {
 }
 
 #[tokio::test]
-async fn backlight_read() {
+async fn battery_level_read() {
     let mut mock = MockTransport::new();
-    mock.expect(b"BL\r", b"BL 5\r");
+    mock.expect(b"BL\r", b"BL 3\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_backlight().await.unwrap(), 5);
+    assert_eq!(radio.get_battery_level().await.unwrap(), 3);
 }
 
 #[tokio::test]

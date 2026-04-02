@@ -5,7 +5,7 @@ use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::types::*;
 
 // ============================================================================
-// AG -- AF Gain (bare read, band-indexed write)
+// AG -- AF Gain (bare read, bare write — 3-digit zero-padded per KI4LAX)
 // ============================================================================
 
 #[test]
@@ -15,23 +15,25 @@ fn serialize_ag_read() {
 
 #[test]
 fn serialize_ag_write() {
+    // AG write is bare (no band), 3-digit zero-padded per KI4LAX.
     assert_eq!(
         protocol::serialize(&Command::SetAfGain {
             band: Band::A,
             level: 15
         }),
-        b"AG 0,15\r"
+        b"AG 015\r"
     );
 }
 
 #[test]
 fn serialize_ag_write_band_b() {
+    // Band is ignored — AG is global. 3-digit zero-padded.
     assert_eq!(
         protocol::serialize(&Command::SetAfGain {
             band: Band::B,
             level: 39
         }),
-        b"AG 1,39\r"
+        b"AG 039\r"
     );
 }
 

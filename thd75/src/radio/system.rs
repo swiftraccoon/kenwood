@@ -1,4 +1,4 @@
-//! System-level radio methods: backlight, beep, lock, dual-band, dual watch, bluetooth, attenuator, auto-info.
+//! System-level radio methods: battery level, beep, lock, dual-band, frequency step, bluetooth, attenuator, auto-info.
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
@@ -46,39 +46,21 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get the backlight brightness level (BL read).
+    /// Get the battery charge level (BL read).
     ///
-    /// D75 RE: `BL x` (x: brightness level).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_backlight(&mut self) -> Result<u8, Error> {
-        tracing::debug!("reading backlight brightness");
-        let response = self.execute(Command::GetBacklight).await?;
-        match response {
-            Response::Backlight { level } => Ok(level),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "Backlight".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Set the backlight brightness level (BL write).
-    ///
-    /// D75 RE: `BL x` (x: brightness level).
+    /// Returns 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green).
+    /// Read-only — the radio does not accept BL writes.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_backlight(&mut self, level: u8) -> Result<(), Error> {
-        tracing::debug!(level, "setting backlight brightness");
-        let response = self.execute(Command::SetBacklight { level }).await?;
+    pub async fn get_battery_level(&mut self) -> Result<u8, Error> {
+        tracing::debug!("reading battery level");
+        let response = self.execute(Command::GetBatteryLevel).await?;
         match response {
-            Response::Backlight { .. } => Ok(()),
+            Response::BatteryLevel { level } => Ok(level),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "Backlight".into(),
+                expected: "BatteryLevel".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -158,39 +140,21 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get the dual watch enabled state (DW read).
+    /// Step frequency down on the given band (DW action).
     ///
-    /// D75 RE: `DW x` (x: 0=off, 1=on).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_dual_watch(&mut self) -> Result<bool, Error> {
-        tracing::debug!("reading dual watch state");
-        let response = self.execute(Command::GetDualWatch).await?;
-        match response {
-            Response::DualWatch { enabled } => Ok(enabled),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "DualWatch".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Set the dual watch enabled state (DW write).
-    ///
-    /// D75 RE: `DW x` (x: 0=off, 1=on).
+    /// Per KI4LAX CAT reference: DW tunes the current band's frequency
+    /// down by the current step size. Counterpart to UP (frequency up).
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_dual_watch(&mut self, enabled: bool) -> Result<(), Error> {
-        tracing::debug!(enabled, "setting dual watch state");
-        let response = self.execute(Command::SetDualWatch { enabled }).await?;
+    pub async fn frequency_down(&mut self, band: Band) -> Result<(), Error> {
+        tracing::debug!(?band, "stepping frequency down");
+        let response = self.execute(Command::FrequencyDown { band }).await?;
         match response {
-            Response::DualWatch { .. } => Ok(()),
+            Response::FrequencyDown | Response::Ok => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "DualWatch".into(),
+                expected: "FrequencyDown".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
