@@ -35,6 +35,7 @@ typedef struct {
 
 static pthread_t g_pump_thread;
 static volatile int g_pump_running = 0;
+static volatile int g_open_count = 0;  // Reference count for pump thread
 
 static void *pump_main_runloop(void *arg) {
     (void)arg;
@@ -127,11 +128,19 @@ static void *do_rfcomm_open(const char *device_name, uint8_t rfcomm_channel) {
 
 
 void *bt_rfcomm_open(const char *device_name, uint8_t rfcomm_channel) {
-    // fprintf(stderr, "BT: bt_rfcomm_open called, main=%d\n", [NSThread isMainThread]);
-    g_pump_running = 1;
-    pthread_create(&g_pump_thread, NULL, pump_main_runloop, NULL);
+    if (g_open_count == 0) {
+        g_pump_running = 1;
+        pthread_create(&g_pump_thread, NULL, pump_main_runloop, NULL);
+    }
+    g_open_count++;
     void *r = do_rfcomm_open(device_name, rfcomm_channel);
-    // fprintf(stderr, "BT: bt_rfcomm_open result=%p\n", r);
+    if (!r) {
+        g_open_count--;
+        if (g_open_count == 0) {
+            g_pump_running = 0;
+            pthread_join(g_pump_thread, NULL);
+        }
+    }
     return r;
 }
 
@@ -158,11 +167,16 @@ void bt_rfcomm_close(void *handle) {
     @autoreleasepool {
         if (ctx->channel) { [ctx->channel closeChannel]; ctx->channel = nil; }
         ctx->state = -1;
-        g_pump_running = 0;
-        pthread_join(g_pump_thread, NULL);
         if (ctx->pipe_write >= 0) { close(ctx->pipe_write); ctx->pipe_write = -1; }
         ctx->delegate.ctx = NULL;
         free(ctx);
+        // Only stop the pump thread when the last connection closes.
+        g_open_count--;
+        if (g_open_count <= 0) {
+            g_open_count = 0;
+            g_pump_running = 0;
+            pthread_join(g_pump_thread, NULL);
+        }
     }
 }
 

@@ -352,6 +352,11 @@ pub async fn spawn_with_transport(
             // path, then auto-discover USB. If both fail (e.g., BT connection),
             // we request the main thread to open a new BT transport (IOBluetooth
             // RFCOMM must be opened on the main thread for CFRunLoop callbacks).
+            // Close the old transport BEFORE opening a new connection. Critical
+            // for Bluetooth: do_rfcomm_open() calls [device closeConnection] on
+            // the shared IOBluetoothDevice, which would corrupt the old
+            // RfcommContext's channel pointer if it's still alive.
+            let _ = radio.close_transport().await;
             tokio::time::sleep(Duration::from_secs(3)).await;
             loop {
                 // Try USB first (original path, then auto-discover)

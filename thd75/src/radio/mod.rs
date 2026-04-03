@@ -389,6 +389,21 @@ impl<T: Transport> Radio<T> {
         tracing::info!("disconnecting from radio");
         self.transport.close().await.map_err(Error::Transport)
     }
+
+    /// Close the underlying transport without consuming the `Radio`.
+    ///
+    /// This is used before reconnecting to ensure Bluetooth RFCOMM
+    /// resources are fully released before a new connection is opened.
+    /// The `Radio` is left in a non-functional state — only reassignment
+    /// or drop should follow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Transport`] if closing fails.
+    pub async fn close_transport(&mut self) -> Result<(), Error> {
+        tracing::info!("closing transport for reconnect");
+        self.transport.close().await.map_err(Error::Transport)
+    }
 }
 
 #[cfg(test)]
