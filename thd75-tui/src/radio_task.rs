@@ -20,7 +20,7 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// This is synchronous — call from main before starting tokio.
 /// On macOS, Bluetooth RFCOMM callbacks require the main thread's
-/// CFRunLoop, so transport discovery must happen before the tokio
+/// `CFRunLoop`, so transport discovery must happen before the tokio
 /// runtime is spawned on a dedicated thread.
 ///
 /// # Arguments
@@ -31,7 +31,7 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 /// # Returns
 /// `(port_path, transport)` on success, or an error string.
 pub fn discover_and_open_transport(
-    port: Option<String>,
+    port: Option<&str>,
     baud: u32,
 ) -> Result<(String, EitherTransport), String> {
     discover_and_open(port, baud)
@@ -50,11 +50,12 @@ pub fn discover_and_open_transport(
 /// direct SM/BY polling.
 ///
 /// # Arguments
-/// - `mcp_speed`: `"fast"` for McpSpeed::Fast (risky), anything else for Safe.
+/// - `mcp_speed`: `"fast"` for `McpSpeed::Fast` (risky), anything else for Safe.
 /// - `tx`: channel for sending state updates and errors to the TUI.
 /// - `bt_req_tx` / `bt_resp_rx`: channels for requesting BT reconnect from
-///   the main thread (IOBluetooth RFCOMM must be opened on main).
+///   the main thread (`IOBluetooth` RFCOMM must be opened on main).
 /// - `cmd_rx`: channel for receiving user commands from the TUI.
+#[allow(clippy::similar_names)]
 pub async fn spawn_with_transport(
     path: String,
     transport: EitherTransport,
@@ -120,7 +121,7 @@ pub async fn spawn_with_transport(
         'outer: loop {
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(POLL_INTERVAL) => {
+                    () = tokio::time::sleep(POLL_INTERVAL) => {
                         match poll_once(&mut radio, s_meter_a, s_meter_b, busy_a, busy_b).await {
                             Ok(state) => {
                                 if tx.send(Message::RadioUpdate(state)).is_err() {
@@ -142,30 +143,35 @@ pub async fn spawn_with_transport(
                         // automatically when state changes (AI 1 mode). This is
                         // faster than polling and avoids firmware quirks.
                         use kenwood_thd75::protocol::Response;
-                        match notification {
-                            Response::Busy { band, busy } => {
-                                // BY gate: squelch open → poll SM; closed → zero meter
-                                if busy {
-                                    if let Ok(level) = radio.get_smeter(band).await {
+                        // Other AI notifications (FQ, MD, SQ, VM, etc.) are
+                        // handled implicitly — the next poll cycle will read
+                        // the updated values. AI mode ensures we don't miss
+                        // rapid changes between poll cycles.
+                        if let Response::Busy { band, busy } = notification {
+                            // BY gate: squelch open → poll SM; closed → zero meter
+                            if busy {
+                                match radio.get_smeter(band).await {
+                                    Ok(level) => match band {
+                                        Band::A => { s_meter_a = level; busy_a = true; }
+                                        Band::B => { s_meter_b = level; busy_b = true; }
+                                        _ => {}
+                                    },
+                                    Err(e) => {
+                                        tracing::warn!(?band, "SM read failed on BY: {e}");
+                                        // Still mark busy even though SM read failed
                                         match band {
-                                            Band::A => { s_meter_a = level; busy_a = true; }
-                                            Band::B => { s_meter_b = level; busy_b = true; }
+                                            Band::A => busy_a = true,
+                                            Band::B => busy_b = true,
                                             _ => {}
                                         }
                                     }
-                                } else {
-                                    match band {
-                                        Band::A => { s_meter_a = 0; busy_a = false; }
-                                        Band::B => { s_meter_b = 0; busy_b = false; }
-                                        _ => {}
-                                    }
                                 }
-                            }
-                            _ => {
-                                // Other AI notifications (FQ, MD, SQ, VM, etc.) are
-                                // handled implicitly — the next poll cycle will read
-                                // the updated values. AI mode ensures we don't miss
-                                // rapid changes between poll cycles.
+                            } else {
+                                match band {
+                                    Band::A => { s_meter_a = 0; busy_a = false; }
+                                    Band::B => { s_meter_b = 0; busy_b = false; }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -356,18 +362,23 @@ pub async fn spawn_with_transport(
             // for Bluetooth: do_rfcomm_open() calls [device closeConnection] on
             // the shared IOBluetoothDevice, which would corrupt the old
             // RfcommContext's channel pointer if it's still alive.
-            let _ = radio.close_transport().await;
+            if let Err(e) = radio.close_transport().await {
+                tracing::warn!("failed to close transport before reconnect: {e}");
+            }
             tokio::time::sleep(Duration::from_secs(3)).await;
+            let mut attempts = 0u32;
             loop {
-                // Try USB first (original path, then auto-discover)
-                let connect_result = discover_and_open(Some(path_clone.clone()), baud)
+                attempts += 1;
+                let _ = tx.send(Message::RadioError(format!(
+                    "Reconnect attempt {attempts}..."
+                )));
+
+                let connect_result = discover_and_open(Some(&path_clone), baud)
                     .or_else(|_| discover_and_open(None, baud))
                     .or_else(|_| {
-                        // USB failed — ask the main thread to open BT
                         bt_req_tx
                             .send((Some(path_clone.clone()), baud))
                             .map_err(|e| e.to_string())?;
-                        // Wait up to 10 seconds for the main thread to respond
                         bt_resp_rx
                             .recv_timeout(Duration::from_secs(10))
                             .map_err(|e| e.to_string())?
@@ -375,8 +386,12 @@ pub async fn spawn_with_transport(
                 if let Ok((_p, transport)) = connect_result {
                     if let Ok(mut new_radio) = Radio::connect(transport).await {
                         if new_radio.identify().await.is_ok() {
-                            // Re-enable AI mode and resubscribe
-                            let _ = new_radio.set_auto_info(true).await;
+                            if let Err(e) = new_radio.set_auto_info(true).await {
+                                tracing::error!("AI mode failed after reconnect: {e}");
+                                let _ = tx.send(Message::RadioError(format!(
+                                    "AI mode failed: {e} — S-meter may not update"
+                                )));
+                            }
                             notifications = new_radio.subscribe();
                             s_meter_a = 0;
                             s_meter_b = 0;
@@ -384,11 +399,13 @@ pub async fn spawn_with_transport(
                             busy_b = false;
                             let _ = tx.send(Message::Reconnected);
                             radio = new_radio;
-                            continue 'outer; // Back to main loop
+                            continue 'outer;
                         }
                     }
                 }
-                tokio::time::sleep(RECONNECT_INTERVAL).await;
+                // Exponential backoff: 1s, 2s, 3s, ... up to 10s
+                let delay = RECONNECT_INTERVAL * attempts.min(10);
+                tokio::time::sleep(delay).await;
             }
         }
     });
@@ -544,9 +561,9 @@ async fn freq_down(
         .await
 }
 
-fn discover_and_open(port: Option<String>, baud: u32) -> Result<(String, EitherTransport), String> {
+fn discover_and_open(port: Option<&str>, baud: u32) -> Result<(String, EitherTransport), String> {
     // Explicit port
-    if let Some(ref path) = port {
+    if let Some(path) = port {
         if path != "auto" {
             if SerialTransport::is_bluetooth_port(path) {
                 // Use native IOBluetooth RFCOMM for BT (bypasses broken serial driver)
@@ -554,18 +571,18 @@ fn discover_and_open(port: Option<String>, baud: u32) -> Result<(String, EitherT
                 {
                     let bt = kenwood_thd75::BluetoothTransport::open(None)
                         .map_err(|e| format!("BT connect failed: {e}"))?;
-                    return Ok((path.clone(), EitherTransport::Bluetooth(bt)));
+                    return Ok((path.to_string(), EitherTransport::Bluetooth(bt)));
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
                     let transport = SerialTransport::open(path, baud)
                         .map_err(|e| format!("Failed to open {path}: {e}"))?;
-                    return Ok((path.clone(), EitherTransport::Serial(transport)));
+                    return Ok((path.to_string(), EitherTransport::Serial(transport)));
                 }
             }
             let transport = SerialTransport::open(path, baud)
                 .map_err(|e| format!("Failed to open {path}: {e}"))?;
-            return Ok((path.clone(), EitherTransport::Serial(transport)));
+            return Ok((path.to_string(), EitherTransport::Serial(transport)));
         }
     }
 

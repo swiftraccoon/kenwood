@@ -12,9 +12,18 @@ run() {
     fi
 }
 
+# Unsafe code audit: allow(unsafe_code) must only appear in bluetooth.rs
+echo "── unsafe audit ──"
+VIOLATIONS=$(grep -rn 'allow(unsafe_code)' thd75/src/ --include='*.rs' | grep -v 'transport/bluetooth.rs' || true)
+if [ -n "$VIOLATIONS" ]; then
+    echo "ERROR: allow(unsafe_code) found outside transport/bluetooth.rs:"
+    echo "$VIOLATIONS"
+    failed=1
+fi
+
 run cargo clippy --manifest-path thd75/Cargo.toml -- -D warnings
 run cargo clippy --manifest-path thd75-tui/Cargo.toml -- -D warnings
-run cargo test --manifest-path thd75/Cargo.toml --lib
+run cargo test --manifest-path thd75/Cargo.toml
 run cargo doc --manifest-path thd75/Cargo.toml --no-deps
 run cargo fmt --manifest-path thd75/Cargo.toml -- --check
 run cargo fmt --manifest-path thd75-tui/Cargo.toml -- --check

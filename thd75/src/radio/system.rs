@@ -48,8 +48,8 @@ impl<T: Transport> Radio<T> {
 
     /// Get the battery charge level (BL read).
     ///
-    /// Returns 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green).
-    /// Read-only — the radio does not accept BL writes.
+    /// Returns 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green),
+    /// 4=Charging (USB power connected). Read-only.
     ///
     /// # Errors
     ///

@@ -385,7 +385,8 @@ pub enum Command {
     /// Get battery level (BL read).
     ///
     /// Per KI4LAX CAT reference: BL returns battery charge state.
-    /// 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green).
+    /// 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green),
+    /// 4=Charging (observed on hardware when USB power is connected).
     /// Read-only command — the radio does not accept BL writes.
     GetBatteryLevel,
     /// Get VOX delay (VD read).
@@ -843,9 +844,10 @@ pub enum Response {
     },
     /// Battery level response (BL).
     ///
-    /// 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green).
+    /// 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green),
+    /// 4=Charging (USB power connected).
     BatteryLevel {
-        /// Battery charge level (0-3).
+        /// Battery charge level (0–4, where 4 = charging).
         level: u8,
     },
     /// VOX delay response (VD).

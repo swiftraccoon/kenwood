@@ -13,12 +13,20 @@ fn cache_path() -> PathBuf {
 }
 
 /// Save raw MCP image to disk cache.
+///
+/// Logs errors but does not propagate — a failed cache write should not
+/// block radio operation. The user will see a warning in the log.
 pub fn save_cache(data: &[u8]) {
     let path = cache_path();
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::error!(path = %parent.display(), "failed to create cache dir: {e}");
+            return;
+        }
     }
-    let _ = std::fs::write(&path, data);
+    if let Err(e) = std::fs::write(&path, data) {
+        tracing::error!(path = %path.display(), "failed to write MCP cache: {e}");
+    }
 }
 
 /// Load cached MCP image from disk. Returns (image, age).
@@ -584,7 +592,7 @@ pub fn mcp_settings() -> Vec<SettingRow> {
         .collect()
 }
 
-fn on_off(b: bool) -> &'static str {
+const fn on_off(b: bool) -> &'static str {
     if b { "On" } else { "Off" }
 }
 
@@ -644,9 +652,12 @@ pub enum InputMode {
 pub struct BandState {
     pub frequency: Frequency,
     pub mode: Mode,
+    /// S-meter level (0–5). Driven by AI-pushed BY notifications, not polled.
     pub s_meter: u8,
+    /// Squelch setting (0–6 on D75).
     pub squelch: u8,
     pub power_level: PowerLevel,
+    /// Squelch is open (receiving). Driven by AI-pushed BY notifications.
     pub busy: bool,
     pub attenuator: bool,
     pub step_size: Option<kenwood_thd75::types::StepSize>,
@@ -669,17 +680,22 @@ impl Default for BandState {
 
 /// Aggregated radio state from the poller.
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RadioState {
     pub band_a: BandState,
     pub band_b: BandState,
+    /// Battery charge level (0–4): 0=Empty, 1=1/3, 2=2/3, 3=Full, 4=Charging.
     pub battery_level: u8,
     pub beep: bool,
     pub lock: bool,
     pub dual_band: bool,
     pub bluetooth: bool,
     pub vox: bool,
+    /// VOX gain (0–9).
     pub vox_gain: u8,
+    /// VOX delay (0–30).
     pub vox_delay: u8,
+    /// Audio gain (0–99, 3-digit zero-padded on wire).
     pub af_gain: u8,
     pub firmware_version: String,
     pub radio_type: String,
@@ -722,6 +738,7 @@ pub enum Message {
 }
 
 /// Central application state.
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub connected: bool,
     pub port_path: String,
@@ -748,7 +765,7 @@ pub struct App {
 }
 
 impl App {
-    /// Returns the list of used channel numbers, filtered by search_filter.
+    /// Returns the list of used channel numbers, filtered by `search_filter`.
     pub fn filtered_channels(&self) -> Vec<u16> {
         if let McpState::Loaded { ref image, .. } = self.mcp {
             let channels = image.channels();
@@ -909,6 +926,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::cognitive_complexity)]
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -1126,7 +1144,7 @@ impl App {
                             ));
                         }
                     }
-                    _ => {}
+                    Pane::Detail => {}
                 }
                 true
             }
@@ -1158,7 +1176,7 @@ impl App {
                             ));
                         }
                     }
-                    _ => {}
+                    Pane::Detail => {}
                 }
                 true
             }
@@ -1192,7 +1210,7 @@ impl App {
                 self.toggle_setting();
                 true
             }
-            KeyCode::Char('+') | KeyCode::Char('=')
+            KeyCode::Char('+' | '=')
                 if self.focus == Pane::Main
                     && matches!(
                         self.main_view,
@@ -1411,9 +1429,8 @@ impl App {
         }
 
         // MCP-backed boolean settings — write directly to radio via single-page MCP
-        let tx = match self.cmd_tx.clone() {
-            Some(tx) => tx,
-            None => return,
+        let Some(tx) = self.cmd_tx.clone() else {
+            return;
         };
 
         // Get current value from MCP image, compute new value and offset
@@ -1711,9 +1728,8 @@ impl App {
         }
 
         // MCP-backed numeric settings — write directly via single-page MCP
-        let tx = match self.cmd_tx.clone() {
-            Some(tx) => tx,
-            None => return,
+        let Some(tx) = self.cmd_tx.clone() else {
+            return;
         };
 
         let (offset, new_val, label): (u16, u8, String) =

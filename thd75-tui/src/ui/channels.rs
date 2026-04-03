@@ -20,48 +20,45 @@ pub fn render_list(app: &App, frame: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .border_style(super::border_style(app, Pane::Main));
 
-    match &app.mcp {
-        McpState::Loaded { image, .. } => {
-            let channels = image.channels();
-            let used = app.filtered_channels();
-            let items: Vec<ListItem> = used
-                .iter()
-                .map(|&i| {
-                    let entry = channels.get(i);
-                    let name = entry.as_ref().map(|e| e.name.clone()).unwrap_or_default();
-                    let freq = entry
-                        .as_ref()
-                        .map(|e| format!("{:.3}", e.flash.rx_frequency.as_mhz()))
-                        .unwrap_or_default();
-                    ListItem::new(Line::from(vec![
-                        Span::styled(format!("{i:>4}: "), Style::default().fg(Color::DarkGray)),
-                        Span::styled(format!("{name:<12}"), Style::default().fg(Color::White)),
-                        Span::styled(format!(" {freq}"), Style::default().fg(Color::Cyan)),
-                    ]))
-                })
-                .collect();
+    if let McpState::Loaded { image, .. } = &app.mcp {
+        let channels = image.channels();
+        let used = app.filtered_channels();
+        let items: Vec<ListItem> = used
+            .iter()
+            .map(|&i| {
+                let entry = channels.get(i);
+                let name = entry.as_ref().map(|e| e.name.clone()).unwrap_or_default();
+                let freq = entry
+                    .as_ref()
+                    .map(|e| format!("{:.3}", e.flash.rx_frequency.as_mhz()))
+                    .unwrap_or_default();
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{i:>4}: "), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{name:<12}"), Style::default().fg(Color::White)),
+                    Span::styled(format!(" {freq}"), Style::default().fg(Color::Cyan)),
+                ]))
+            })
+            .collect();
 
-            let mut list_state = ListState::default();
-            list_state.select(Some(
-                app.channel_list_index.min(items.len().saturating_sub(1)),
-            ));
+        let mut list_state = ListState::default();
+        list_state.select(Some(
+            app.channel_list_index.min(items.len().saturating_sub(1)),
+        ));
 
-            let list = List::new(items)
-                .block(block)
-                .highlight_style(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol("▸ ");
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▸ ");
 
-            frame.render_stateful_widget(list, area, &mut list_state);
-        }
-        _ => {
-            let msg = " No MCP data loaded.\n Press [m] then [r] to read from radio.";
-            frame.render_widget(Paragraph::new(msg).block(block), area);
-        }
+        frame.render_stateful_widget(list, area, &mut list_state);
+    } else {
+        let msg = " No MCP data loaded.\n Press [m] then [r] to read from radio.";
+        frame.render_widget(Paragraph::new(msg).block(block), area);
     }
 }
 

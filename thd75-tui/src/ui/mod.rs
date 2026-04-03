@@ -9,7 +9,7 @@ mod status_bar;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 
-use crate::app::{App, Pane};
+use crate::app::{App, MainView, Pane};
 
 /// Render the full TUI frame.
 pub fn render(app: &App, frame: &mut Frame) {
@@ -38,7 +38,6 @@ pub fn render(app: &App, frame: &mut Frame) {
         .split(chunks[1]);
 
     // Main content + Detail
-    use crate::app::MainView;
     match app.main_view {
         MainView::Channels => {
             channels::render_list(app, frame, main_row[0]);

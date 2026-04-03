@@ -72,7 +72,7 @@ pub enum RadioCommand {
     SetCallsignSlot(u8),
     /// Set D-STAR slot (DS write — verified working).
     SetDstarSlot(u8),
-    /// Write a single byte to MCP memory via modify_memory_page.
+    /// Write a single byte to MCP memory via `modify_memory_page`.
     /// Enters MCP mode, modifies one byte, exits. USB drops and reconnects.
     /// Used for settings where CAT writes are rejected by D75 firmware.
     McpWriteByte { offset: u16, value: u8 },
@@ -137,7 +137,7 @@ impl EventHandler {
     /// # Panics
     ///
     /// Panics if the command receiver has already been taken.
-    pub fn take_command_receiver(&mut self) -> mpsc::UnboundedReceiver<RadioCommand> {
+    pub const fn take_command_receiver(&mut self) -> mpsc::UnboundedReceiver<RadioCommand> {
         self.cmd_rx.take().expect("command receiver already taken")
     }
 

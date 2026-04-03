@@ -751,16 +751,39 @@ impl<T: Transport> Radio<T> {
             self.transport
                 .set_baud_rate(FAST_TRANSFER_BAUD)
                 .map_err(Error::Transport)?;
-            // Read and discard a sync byte.
+            // Read sync byte — verifies the radio switched baud rates.
+            // If this times out, the radio is likely still at 9600 and all
+            // subsequent reads will produce garbage.
             let mut sync = [0u8; 1];
-            let _ = tokio::time::timeout(
+            match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 self.transport.read(&mut sync),
             )
-            .await;
-            tracing::info!(
-                "programming mode entered, switched to {FAST_TRANSFER_BAUD} baud (fast)"
-            );
+            .await
+            {
+                Ok(Ok(n)) if n > 0 => {
+                    tracing::info!(
+                        sync_byte = sync[0],
+                        "programming mode entered, switched to {FAST_TRANSFER_BAUD} baud (fast)"
+                    );
+                }
+                Ok(Ok(_)) => {
+                    tracing::error!("fast mode sync read returned 0 bytes — baud mismatch likely");
+                    return Err(Error::Protocol(ProtocolError::MalformedFrame(
+                        b"fast mode sync byte not received".to_vec(),
+                    )));
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("fast mode sync read failed: {e}");
+                    return Err(Error::Transport(e));
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "fast mode sync byte timed out — radio may not have switched baud"
+                    );
+                    return Err(Error::Timeout(std::time::Duration::from_secs(2)));
+                }
+            }
         } else {
             tracing::info!("programming mode entered, staying at {PROGRAMMING_BAUD} baud");
         }
@@ -789,9 +812,12 @@ impl<T: Transport> Radio<T> {
 
         // If we were in fast mode, restore the default baud rate.
         if self.mcp_speed == McpSpeed::Fast {
-            let _ = self
+            if let Err(e) = self
                 .transport
-                .set_baud_rate(crate::transport::SerialTransport::DEFAULT_BAUD);
+                .set_baud_rate(crate::transport::SerialTransport::DEFAULT_BAUD)
+            {
+                tracing::warn!("failed to restore baud rate after fast MCP exit: {e}");
+            }
             tracing::info!("programming mode exited, restored default baud rate");
         } else {
             // Stay at 9600 baud -- changing baud rate via SET_LINE_CODING

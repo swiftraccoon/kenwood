@@ -163,6 +163,7 @@ fn render_settings_list(
             1 => "1/3 (Yellow)".to_string(),
             2 => "2/3 (Green)".to_string(),
             3 => "Full (Green)".to_string(),
+            4 => "Charging".to_string(),
             n => format!("{n}"),
         },
     ));
@@ -357,21 +358,21 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::AttenuatorB => bool_span(app.state.band_b.attenuator),
         SettingRow::ModeA => (format!("{}", app.state.band_a.mode), Color::Cyan),
         SettingRow::ModeB => (format!("{}", app.state.band_b.mode), Color::Cyan),
-        SettingRow::ActiveBand => ("?".into(), Color::DarkGray),
-        SettingRow::VfoMemModeA => ("?".into(), Color::DarkGray),
-        SettingRow::VfoMemModeB => ("?".into(), Color::DarkGray),
-        SettingRow::FmRadio => ("?".into(), Color::DarkGray),
-        SettingRow::TncBaud => ("?".into(), Color::DarkGray),
         SettingRow::BeaconType => (beacon_label(app.state.beacon_type), Color::Yellow),
         SettingRow::GpsEnabled => bool_span(app.state.gps_enabled),
-        SettingRow::GpsPcOutput => ("?".into(), Color::DarkGray),
-        SettingRow::AutoInfo => ("?".into(), Color::DarkGray),
-        SettingRow::CallsignSlot => ("?".into(), Color::DarkGray),
-        SettingRow::DstarSlot => ("?".into(), Color::DarkGray),
+        SettingRow::ActiveBand
+        | SettingRow::VfoMemModeA
+        | SettingRow::VfoMemModeB
+        | SettingRow::FmRadio
+        | SettingRow::TncBaud
+        | SettingRow::GpsPcOutput
+        | SettingRow::AutoInfo
+        | SettingRow::CallsignSlot
+        | SettingRow::DstarSlot => ("?".into(), Color::DarkGray),
     }
 }
 
-/// Read a boolean from the MCP image; returns ("?", DarkGray) if not loaded.
+/// Read a boolean from the MCP image; returns ("?", `DarkGray`) if not loaded.
 fn mcp_bool(app: &App, f: impl Fn(&kenwood_thd75::memory::MemoryImage) -> bool) -> (String, Color) {
     if let McpState::Loaded { ref image, .. } = app.mcp {
         bool_span(f(image))
@@ -380,7 +381,7 @@ fn mcp_bool(app: &App, f: impl Fn(&kenwood_thd75::memory::MemoryImage) -> bool) 
     }
 }
 
-/// Read a u8 from the MCP image; returns ("?", DarkGray) if not loaded.
+/// Read a u8 from the MCP image; returns ("?", `DarkGray`) if not loaded.
 fn mcp_num(app: &App, f: impl Fn(&kenwood_thd75::memory::MemoryImage) -> u8) -> (String, Color) {
     if let McpState::Loaded { ref image, .. } = app.mcp {
         num_span(f(image))
@@ -389,7 +390,7 @@ fn mcp_num(app: &App, f: impl Fn(&kenwood_thd75::memory::MemoryImage) -> u8) -> 
     }
 }
 
-/// Read a string from the MCP image; returns ("?", DarkGray) if not loaded.
+/// Read a string from the MCP image; returns ("?", `DarkGray`) if not loaded.
 fn mcp_str(
     app: &App,
     f: impl Fn(&kenwood_thd75::memory::MemoryImage) -> String,

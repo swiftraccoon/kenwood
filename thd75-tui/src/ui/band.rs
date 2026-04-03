@@ -136,7 +136,7 @@ fn s_meter_line(raw: u8) -> Line<'static> {
 }
 
 /// Map power level to a compact display label: H/M/L/EL.
-fn power_label(level: kenwood_thd75::types::PowerLevel) -> &'static str {
+const fn power_label(level: kenwood_thd75::types::PowerLevel) -> &'static str {
     use kenwood_thd75::types::PowerLevel;
     match level {
         PowerLevel::High => "H",

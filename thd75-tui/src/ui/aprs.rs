@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{App, McpState, Pane};
 
-fn kv_line<'a>(label: &'a str, value: String, value_color: Color) -> Line<'a> {
+fn kv_line(label: &str, value: String, value_color: Color) -> Line<'_> {
     Line::from(vec![
         Span::styled(
             format!("  {label:<22}"),

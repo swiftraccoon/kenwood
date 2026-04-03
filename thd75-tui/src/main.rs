@@ -32,6 +32,8 @@ struct Cli {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    type BtResult = Result<(String, kenwood_thd75::transport::EitherTransport), String>;
+
     let cli = Cli::parse();
 
     if std::env::var("RUST_LOG").is_ok() {
@@ -51,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     // Open BT connection on the main thread (IOBluetooth needs main CFRunLoop).
-    let transport = radio_task::discover_and_open_transport(cli.port.clone(), cli.baud);
+    let transport = radio_task::discover_and_open_transport(cli.port.as_deref(), cli.baud);
 
     // Terminal setup on main thread before spawning
     enable_raw_mode()?;
@@ -66,7 +68,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // IOBluetooth RFCOMM must be opened on the main thread (needs CFRunLoop).
     // The tokio thread sends (port, baud) and the main thread replies with the transport.
     let (bt_req_tx, bt_req_rx) = std::sync::mpsc::channel::<(Option<String>, u32)>();
-    type BtResult = Result<(String, kenwood_thd75::transport::EitherTransport), String>;
     let (bt_resp_tx, bt_resp_rx) = std::sync::mpsc::channel::<BtResult>();
 
     let mcp_speed = cli.mcp_speed;
@@ -93,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Main thread: pump CFRunLoop for IOBluetooth callbacks
     loop {
         #[cfg(target_os = "macos")]
+        #[allow(unsafe_code)]
         unsafe {
             unsafe extern "C" {
                 fn CFRunLoopRunInMode(
@@ -111,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Handle BT reconnect requests from the tokio thread.
         // BluetoothTransport::open() must happen on the main thread.
         if let Ok((port, baud)) = bt_req_rx.try_recv() {
-            let result = radio_task::discover_and_open_transport(port, baud);
+            let result = radio_task::discover_and_open_transport(port.as_deref(), baud);
             let _ = bt_resp_tx.send(result);
         }
 
