@@ -406,6 +406,39 @@ fn fo_flags_0a_raw_round_trip() {
 }
 
 #[test]
+fn fo_flags_0a_raw_clamped_on_overflow() {
+    // Serialize a channel with flags_0a_raw = 0x3F (max valid 6-bit value),
+    // then manually replace the x2-x5 fields with 255 in the wire frame
+    // to simulate a malformed radio response. The & 1 / & 0x07 masks in
+    // the parser should clamp back to 0x3F.
+    let channel = ChannelMemory {
+        flags_0a_raw: 0x3F, // bits: 11_1111 => x2=1, x3=1, x4=1, x5=7
+        ..ChannelMemory::default()
+    };
+    let bytes = protocol::serialize(&Command::SetFrequencyFull {
+        band: Band::A,
+        channel,
+    });
+    // The serialized wire format is ASCII with \r terminator.
+    // Replace the x2,x3,x4,x5 fields (which serialize as "1,1,1,7")
+    // with "255,255,255,255" to simulate overflow.
+    let wire = String::from_utf8(bytes).unwrap();
+    let wire = wire.replace(",1,1,1,7,", ",255,255,255,255,");
+    let frame = &wire.as_bytes()[..wire.len() - 1]; // strip \r
+    let r = protocol::parse(frame).unwrap();
+    match r {
+        Response::FrequencyFull {
+            channel: parsed, ..
+        } => {
+            // Each field masked: 255&1=1, 255&1=1, 255&1=1, 255&0x07=7
+            // flags_0a_raw = (1<<5) | (1<<4) | (1<<3) | 7 = 0x3F
+            assert_eq!(parsed.flags_0a_raw, 0x3F);
+        }
+        other => panic!("expected FrequencyFull, got {other:?}"),
+    }
+}
+
+#[test]
 fn serialize_fq_write() {
     let channel = ChannelMemory {
         rx_frequency: Frequency::new(145_000_000),

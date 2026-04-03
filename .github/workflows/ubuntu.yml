@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
-          components: clippy
+          components: clippy, rustfmt
       - run: cargo check
         working-directory: thd75
       - run: cargo check
@@ -26,3 +26,7 @@ jobs:
         working-directory: thd75
         env:
           RUSTDOCFLAGS: "-D warnings"
+      - run: cargo fmt -- --check
+        working-directory: thd75
+      - run: cargo fmt -- --check
+        working-directory: thd75-tui

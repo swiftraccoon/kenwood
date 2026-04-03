@@ -108,4 +108,17 @@ mod tests {
         let frame = codec.next_frame().unwrap();
         assert!(frame.starts_with(b"FO"));
     }
+
+    #[test]
+    fn buffer_capped_at_max_size() {
+        let mut codec = Codec::new();
+        // Feed >64KB without a \r terminator
+        let chunk = [b'A'; 4096];
+        for _ in 0..20 {
+            codec.feed(&chunk); // 20 * 4096 = 80KB
+        }
+        assert!(codec.buffer.len() <= Codec::MAX_BUFFER);
+        // No frame should be extractable (no \r in the noise)
+        assert_eq!(codec.next_frame(), None);
+    }
 }

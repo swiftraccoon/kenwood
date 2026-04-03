@@ -14,7 +14,7 @@ run() {
 
 # Unsafe code audit: allow(unsafe_code) must only appear in bluetooth.rs
 echo "── unsafe audit ──"
-VIOLATIONS=$(grep -rn 'allow(unsafe_code)' thd75/src/ --include='*.rs' | grep -v 'transport/bluetooth.rs' || true)
+VIOLATIONS=$(grep -rn 'allow(unsafe_code)' thd75/src/ thd75-tui/src/ --include='*.rs' | grep -v 'transport/bluetooth.rs' | grep -v 'thd75-tui/src/main.rs' || true)
 if [ -n "$VIOLATIONS" ]; then
     echo "ERROR: allow(unsafe_code) found outside transport/bluetooth.rs:"
     echo "$VIOLATIONS"

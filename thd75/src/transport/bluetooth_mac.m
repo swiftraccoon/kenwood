@@ -14,7 +14,7 @@ typedef struct {
     RfcommDelegate *delegate;
     int pipe_read;
     int pipe_write;
-    volatile int state;
+    _Atomic int state;
 } RfcommContext;
 
 @interface RfcommDelegate : NSObject <IOBluetoothRFCOMMChannelDelegate>
@@ -35,7 +35,8 @@ typedef struct {
 
 static pthread_t g_pump_thread;
 static _Atomic int g_pump_running = 0;
-static _Atomic int g_open_count = 0;  // Reference count for pump thread
+static _Atomic int g_open_count = 0;
+static pthread_mutex_t g_bt_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void *pump_main_runloop(void *arg) {
     (void)arg;
@@ -108,6 +109,7 @@ static void *do_rfcomm_open(const char *device_name, uint8_t rfcomm_channel) {
                                         withChannelID:rfcomm_channel
                                              delegate:ctx->delegate];
         if (ret != kIOReturnSuccess) {
+            ctx->delegate.ctx = NULL;
             close(ctx->pipe_read); close(ctx->pipe_write);
             free(ctx); return NULL;
         }
@@ -116,7 +118,8 @@ static void *do_rfcomm_open(const char *device_name, uint8_t rfcomm_channel) {
             CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
 
         if (ctx->state != 1) {
-            if (channel) [channel closeChannel];
+            ctx->delegate.ctx = NULL;
+            if (channel) { [channel setDelegate:nil]; [channel closeChannel]; }
             close(ctx->pipe_read); close(ctx->pipe_write);
             free(ctx); return NULL;
         }
@@ -128,17 +131,24 @@ static void *do_rfcomm_open(const char *device_name, uint8_t rfcomm_channel) {
 
 
 void *bt_rfcomm_open(const char *device_name, uint8_t rfcomm_channel) {
+    pthread_mutex_lock(&g_bt_mutex);
     if (g_open_count == 0) {
         g_pump_running = 1;
         pthread_create(&g_pump_thread, NULL, pump_main_runloop, NULL);
     }
     g_open_count++;
+    pthread_mutex_unlock(&g_bt_mutex);
+
     void *r = do_rfcomm_open(device_name, rfcomm_channel);
     if (!r) {
+        pthread_mutex_lock(&g_bt_mutex);
         g_open_count--;
         if (g_open_count == 0) {
             g_pump_running = 0;
+            pthread_mutex_unlock(&g_bt_mutex);
             pthread_join(g_pump_thread, NULL);
+        } else {
+            pthread_mutex_unlock(&g_bt_mutex);
         }
     }
     return r;
@@ -165,18 +175,30 @@ void bt_rfcomm_close(void *handle) {
     RfcommContext *ctx = (RfcommContext *)handle;
     if (!ctx) return;
     @autoreleasepool {
-        if (ctx->channel) { [ctx->channel closeChannel]; ctx->channel = nil; }
+        // Nil the delegate FIRST to prevent use-after-free in IOBluetooth
+        // callbacks. IOBluetooth delivers rfcommChannelData: asynchronously
+        // on the main run loop — if we free ctx before niling the delegate,
+        // a late callback would dereference freed memory.
+        ctx->delegate.ctx = NULL;
+        if (ctx->channel) {
+            [ctx->channel setDelegate:nil];
+            [ctx->channel closeChannel];
+            ctx->channel = nil;
+        }
         ctx->state = -1;
         if (ctx->pipe_write >= 0) { close(ctx->pipe_write); ctx->pipe_write = -1; }
         if (ctx->pipe_read >= 0) { close(ctx->pipe_read); ctx->pipe_read = -1; }
-        ctx->delegate.ctx = NULL;
         free(ctx);
         // Only stop the pump thread when the last connection closes.
+        pthread_mutex_lock(&g_bt_mutex);
         g_open_count--;
         if (g_open_count <= 0) {
             g_open_count = 0;
             g_pump_running = 0;
+            pthread_mutex_unlock(&g_bt_mutex);
             pthread_join(g_pump_thread, NULL);
+        } else {
+            pthread_mutex_unlock(&g_bt_mutex);
         }
     }
 }

@@ -256,7 +256,7 @@ async fn verify_all_cat_commands() {
     check(&mut results, &cmd, &resp, "DL", "Dual band display");
 
     let (cmd, resp) = raw_exchange(&mut transport, "DW").await;
-    check(&mut results, &cmd, &resp, "DW", "Dual watch");
+    check(&mut results, &cmd, &resp, "DW", "Frequency down");
 
     let (cmd, resp) = raw_exchange(&mut transport, "LC").await;
     check(&mut results, &cmd, &resp, "LC", "Lock control");
