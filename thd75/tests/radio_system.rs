@@ -107,6 +107,17 @@ async fn scan_resume() {
     radio.set_scan_resume(1).await.unwrap();
 }
 
+#[tokio::test]
+async fn set_lock_full() {
+    let mut mock = MockTransport::new();
+    mock.expect(b"LC 1,2,1,0,1,0\r", b"LC 1\r");
+    let mut radio = Radio::connect(mock).await.unwrap();
+    radio
+        .set_lock_full(true, 2, true, false, true, false)
+        .await
+        .unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // MCP-based setting writes
 // ---------------------------------------------------------------------------
@@ -143,6 +154,23 @@ async fn set_beep_via_mcp_disables() {
 
     let mut radio = Radio::connect(mock).await.unwrap();
     radio.set_beep_via_mcp(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn set_beep_volume_via_mcp() {
+    // Offset 0x1072 => page 0x0010, byte index 0x72.
+    let page: u16 = 0x0010;
+    let byte_index: usize = 0x72;
+
+    let original = [0u8; 256];
+    let mut expected = original;
+    expected[byte_index] = 5;
+
+    let mut mock = MockTransport::new();
+    mock_modify_page_sequence(&mut mock, page, &original, &expected);
+
+    let mut radio = Radio::connect(mock).await.unwrap();
+    radio.set_beep_volume_via_mcp(5).await.unwrap();
 }
 
 #[tokio::test]

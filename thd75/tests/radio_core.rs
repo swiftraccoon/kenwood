@@ -162,3 +162,39 @@ async fn get_radio_id() {
     let mut radio = Radio::connect(mock).await.unwrap();
     assert_eq!(radio.get_radio_id().await.unwrap(), "TH-D75");
 }
+
+#[tokio::test]
+async fn execute_routes_unsolicited_to_notifications() {
+    // When AI mode is enabled, the radio may send unsolicited frames before
+    // the actual command response. The execute() method should route these
+    // to the broadcast notification channel and still return the correct
+    // response for the command that was sent.
+    let mut mock = MockTransport::new();
+    // Mock returns an unsolicited BY frame concatenated before the FV response.
+    mock.expect(b"FV\r", b"BY 0,1\rFV 1.03\r");
+    let mut radio = Radio::connect(mock).await.unwrap();
+    let mut rx = radio.subscribe();
+
+    let response = radio
+        .execute(kenwood_thd75::protocol::Command::GetFirmwareVersion)
+        .await
+        .unwrap();
+
+    // The actual FV response should be returned.
+    match response {
+        kenwood_thd75::protocol::Response::FirmwareVersion { version } => {
+            assert_eq!(version, "1.03");
+        }
+        other => panic!("expected FirmwareVersion, got {other:?}"),
+    }
+
+    // The unsolicited BY notification should appear on the subscribe channel.
+    let notification = rx.try_recv().unwrap();
+    match notification {
+        kenwood_thd75::protocol::Response::Busy { band, busy } => {
+            assert_eq!(band, Band::A);
+            assert!(busy);
+        }
+        other => panic!("expected Busy notification, got {other:?}"),
+    }
+}

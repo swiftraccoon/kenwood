@@ -373,16 +373,24 @@ pub async fn spawn_with_transport(
                     "Reconnect attempt {attempts}..."
                 )));
 
-                let connect_result = discover_and_open(Some(&path_clone), baud)
-                    .or_else(|_| discover_and_open(None, baud))
-                    .or_else(|_| {
-                        bt_req_tx
-                            .send((Some(path_clone.clone()), baud))
-                            .map_err(|e| e.to_string())?;
-                        bt_resp_rx
-                            .recv_timeout(Duration::from_secs(10))
-                            .map_err(|e| e.to_string())?
-                    });
+                // For BT paths, skip discover_and_open entirely — IOBluetooth
+                // RFCOMM must be opened on the main thread (CFRunLoop). Calling
+                // BluetoothTransport::open from a tokio thread is undefined
+                // behavior in Objective-C.
+                let connect_result = if SerialTransport::is_bluetooth_port(&path_clone) {
+                    Err("BT requires main thread".to_string())
+                } else {
+                    discover_and_open(Some(&path_clone), baud)
+                        .or_else(|_| discover_and_open(None, baud))
+                }
+                .or_else(|_| {
+                    bt_req_tx
+                        .send((Some(path_clone.clone()), baud))
+                        .map_err(|e| e.to_string())?;
+                    bt_resp_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|e| e.to_string())?
+                });
                 if let Ok((_p, transport)) = connect_result {
                     if let Ok(mut new_radio) = Radio::connect(transport).await {
                         if new_radio.identify().await.is_ok() {

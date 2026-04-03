@@ -58,7 +58,7 @@ fn parse_ag_low() {
 }
 
 // ============================================================================
-// SQ -- Squelch (no zero-padding; D75 range 0-5)
+// SQ -- Squelch (no zero-padding; D75 range 0-6 per KI4LAX)
 // ============================================================================
 
 #[test]
@@ -316,6 +316,28 @@ fn parse_sh_response() {
         }
         other => panic!("expected FilterWidth, got {other:?}"),
     }
+}
+
+#[test]
+fn serialize_sh_write() {
+    assert_eq!(
+        protocol::serialize(&Command::SetFilterWidth {
+            mode_index: 1,
+            width: 5
+        }),
+        b"SH 1,5\r"
+    );
+}
+
+#[test]
+fn serialize_sh_write_ssb() {
+    assert_eq!(
+        protocol::serialize(&Command::SetFilterWidth {
+            mode_index: 0,
+            width: 3
+        }),
+        b"SH 0,3\r"
+    );
 }
 
 // ============================================================================

@@ -257,6 +257,21 @@ fn parse_lc_unlocked() {
     }
 }
 
+#[test]
+fn serialize_lc_full() {
+    assert_eq!(
+        protocol::serialize(&Command::SetLockFull {
+            locked: true,
+            lock_type: 2,
+            lock_a: true,
+            lock_b: false,
+            lock_c: true,
+            lock_ptt: false,
+        }),
+        b"LC 1,2,1,0,1,0\r"
+    );
+}
+
 // ============================================================================
 // IO -- I/O port (read-only, u8 value)
 // ============================================================================
@@ -295,6 +310,14 @@ fn parse_bl_response() {
 fn parse_bl_empty() {
     match protocol::parse(b"BL 0").unwrap() {
         Response::BatteryLevel { level } => assert_eq!(level, 0),
+        other => panic!("expected BatteryLevel, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_bl_charging() {
+    match protocol::parse(b"BL 4").unwrap() {
+        Response::BatteryLevel { level } => assert_eq!(level, 4),
         other => panic!("expected BatteryLevel, got {other:?}"),
     }
 }

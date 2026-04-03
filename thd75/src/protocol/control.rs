@@ -83,7 +83,8 @@ fn split_band_value<'a>(payload: &'a str, cmd: &str) -> Result<(Band, &'a str), 
 
 /// Parse BL (battery level): bare `"level"` response.
 ///
-/// 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green).
+/// 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green),
+/// 4=Charging (USB power connected).
 ///
 /// The radio sends `BL 3` for a polled read, but AI-mode unsolicited
 /// notifications may push `BL 0,3` (band-prefixed). Taking the last

@@ -99,9 +99,9 @@ const BLUETOOTH_OFFSET: usize = 0x1078;
 // ---------------------------------------------------------------------------
 
 // --- RX Settings ---
-/// Band A squelch level (1 byte, range 0-5).
+/// Band A squelch level (1 byte, range 0-6).
 const SQUELCH_A_OFFSET: usize = 0x100D;
-/// Band B squelch level (1 byte, range 0-5).
+/// Band B squelch level (1 byte, range 0-6).
 const SQUELCH_B_OFFSET: usize = 0x100E;
 /// FM narrow setting (1 byte).
 const FM_NARROW_OFFSET: usize = 0x100F;
@@ -516,7 +516,7 @@ impl<'a> SettingsAccess<'a> {
         self.image
             .get(SQUELCH_A_OFFSET)
             .copied()
-            .map_or(0, |b| b.min(5))
+            .map_or(0, |b| b.min(6))
     }
 
     /// Read squelch level for Band B (0-5, 0 if unreadable).
@@ -527,7 +527,7 @@ impl<'a> SettingsAccess<'a> {
         self.image
             .get(SQUELCH_B_OFFSET)
             .copied()
-            .map_or(0, |b| b.min(5))
+            .map_or(0, |b| b.min(6))
     }
 
     // -----------------------------------------------------------------------
@@ -1377,7 +1377,7 @@ impl<'a> SettingsWriter<'a> {
     /// MCP offset `0x100D`.
     pub fn set_squelch_a(&mut self, level: u8) {
         if let Some(b) = self.image.get_mut(SQUELCH_A_OFFSET) {
-            *b = level.min(5);
+            *b = level.min(6);
         }
     }
 
@@ -1386,7 +1386,7 @@ impl<'a> SettingsWriter<'a> {
     /// MCP offset `0x100E`.
     pub fn set_squelch_b(&mut self, level: u8) {
         if let Some(b) = self.image.get_mut(SQUELCH_B_OFFSET) {
-            *b = level.min(5);
+            *b = level.min(6);
         }
     }
 
@@ -2244,7 +2244,7 @@ mod tests {
         let mut image = make_settings_image();
         image[SQUELCH_A_OFFSET] = 0xFF;
         let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
-        assert_eq!(mi.settings().squelch_a(), 5);
+        assert_eq!(mi.settings().squelch_a(), 6);
     }
 
     // -----------------------------------------------------------------------

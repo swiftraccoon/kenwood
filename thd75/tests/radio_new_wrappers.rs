@@ -149,6 +149,16 @@ async fn get_filter_width() {
     assert_eq!(radio.get_filter_width(0).await.unwrap(), 3);
 }
 
+// ---- SH: set_filter_width ----
+
+#[tokio::test]
+async fn set_filter_width() {
+    let mut mock = MockTransport::new();
+    mock.expect(b"SH 0,3\r", b"SH 0,3\r");
+    let mut radio = Radio::connect(mock).await.unwrap();
+    radio.set_filter_width(0, 3).await.unwrap();
+}
+
 // ---- IO: get_io_port / set_io_port ----
 
 #[tokio::test]

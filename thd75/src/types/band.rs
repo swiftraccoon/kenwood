@@ -15,7 +15,7 @@ use crate::error::ValidationError;
 /// - **Band A** (upper display): Amateur-only TX/RX at 144 MHz, 220 MHz
 ///   (TH-D75A only), and 430 MHz. Supports FM and DV modes.
 /// - **Band B** (lower display): Wideband RX from 0.1–524 MHz. Supports
-///   FM, DV, AM, LSB, USB, CW, NFM, WFM, and DR modes. Band B has an
+///   FM, DV, AM, LSB, USB, CW, NFM, WFM (FM Radio mode only), and DR. Band B has an
 ///   independent receiver chain (separate VCO/PLL/IF per the service
 ///   manual), so both bands receive simultaneously.
 ///

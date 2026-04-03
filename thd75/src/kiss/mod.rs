@@ -13,7 +13,7 @@
 //!   of 10 ms), Persistence (`0x02`, 0–255, default 128), `SlotTime`
 //!   (`0x03`, 0–250, units of 10 ms, default 10), `TXtail` (`0x04`,
 //!   0–255, default 3), `FullDuplex` (`0x05`, 0=half/default, nonzero=
-//!   full), `SetHardware` (`0x06`, 0 or 35=1200 bps, 5 or 38=9600 bps),
+//!   full), `SetHardware` (`0x06`, 0 or 0x23=1200 bps, 0x05 or 0x26=9600 bps),
 //!   Return (`0xFF`)
 //! - When KISS is active, all APRS menu configs are inactive except
 //!   Menu 505 (Data Speed) and Menu 506 (Data Band)
@@ -71,7 +71,7 @@ pub const CMD_TX_TAIL: u8 = 0x04;
 pub const CMD_FULL_DUPLEX: u8 = 0x05;
 
 /// Set hardware-specific parameter. TH-D75 uses this for baud rate switching:
-/// 0 or 35h = 1200 bps, 38h = 9600 bps.
+/// 0 or 0x23 (35 decimal) = 1200 bps, 0x05 or 0x26 (38 decimal) = 9600 bps.
 pub const CMD_SET_HARDWARE: u8 = 0x06;
 
 /// Exit KISS mode and return to command/normal mode.

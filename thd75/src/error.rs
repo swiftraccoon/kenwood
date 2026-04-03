@@ -165,8 +165,8 @@ pub enum ValidationError {
         u8,
     ),
 
-    /// The operating mode is outside the valid range 0-8.
-    #[error("mode {0} out of range (must be 0-8: FM/DV/AM/LSB/USB/CW/NFM/WFM/DR)")]
+    /// The operating mode is outside the valid range 0-7.
+    #[error("mode {0} out of range (must be 0-7: FM/DV/AM/LSB/USB/CW/NFM/DR)")]
     ModeOutOfRange(
         /// The invalid mode value.
         u8,
