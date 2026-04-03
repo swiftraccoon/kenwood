@@ -34,8 +34,8 @@ typedef struct {
 @end
 
 static pthread_t g_pump_thread;
-static volatile int g_pump_running = 0;
-static volatile int g_open_count = 0;  // Reference count for pump thread
+static _Atomic int g_pump_running = 0;
+static _Atomic int g_open_count = 0;  // Reference count for pump thread
 
 static void *pump_main_runloop(void *arg) {
     (void)arg;
@@ -146,7 +146,7 @@ void *bt_rfcomm_open(const char *device_name, uint8_t rfcomm_channel) {
 
 int bt_rfcomm_write(void *handle, const uint8_t *data, size_t len) {
     RfcommContext *ctx = (RfcommContext *)handle;
-    if (!ctx || !ctx->channel || ctx->state != 1) return -1;
+    if (!ctx || !ctx->channel || ctx->state != 1 || len > UINT16_MAX) return -1;
     @autoreleasepool {
         return ([ctx->channel writeSync:(void *)data
                                  length:(UInt16)(len & 0xFFFF)] == kIOReturnSuccess) ? 0 : -1;
@@ -168,6 +168,7 @@ void bt_rfcomm_close(void *handle) {
         if (ctx->channel) { [ctx->channel closeChannel]; ctx->channel = nil; }
         ctx->state = -1;
         if (ctx->pipe_write >= 0) { close(ctx->pipe_write); ctx->pipe_write = -1; }
+        if (ctx->pipe_read >= 0) { close(ctx->pipe_read); ctx->pipe_read = -1; }
         ctx->delegate.ctx = NULL;
         free(ctx);
         // Only stop the pump thread when the last connection closes.

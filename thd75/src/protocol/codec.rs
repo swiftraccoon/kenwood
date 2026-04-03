@@ -16,10 +16,24 @@ impl Codec {
         Self { buffer: Vec::new() }
     }
 
+    /// Maximum buffer size (64 KB). Prevents unbounded growth if the
+    /// radio never sends a `\r` terminator (e.g., corrupted serial link).
+    const MAX_BUFFER: usize = 64 * 1024;
+
     /// Appends raw bytes to the internal buffer.
+    ///
+    /// If the buffer would exceed [`MAX_BUFFER`](Self::MAX_BUFFER), it is
+    /// truncated to prevent unbounded memory growth.
     pub fn feed(&mut self, data: &[u8]) {
         tracing::trace!(bytes = data.len(), "codec: feeding bytes");
         self.buffer.extend_from_slice(data);
+        if self.buffer.len() > Self::MAX_BUFFER {
+            tracing::warn!(
+                len = self.buffer.len(),
+                "codec buffer exceeded max size, truncating"
+            );
+            drop(self.buffer.drain(..self.buffer.len() - Self::MAX_BUFFER));
+        }
     }
 
     /// Extracts the next complete frame from the buffer, if available.

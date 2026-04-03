@@ -246,7 +246,8 @@ pub(crate) fn parse_channel_fields(
     let x3 = parse_u8_field(fields[10], cmd, "x3")?;
     let x4 = parse_u8_field(fields[11], cmd, "x4")?;
     let x5 = parse_u8_field(fields[12], cmd, "x5")?;
-    let flags_0a_raw = (x2 << 5) | (x3 << 4) | (x4 << 3) | (x5 & 0x07);
+    // Mask each field to prevent shift overflow on malformed radio responses.
+    let flags_0a_raw = ((x2 & 1) << 5) | ((x3 & 1) << 4) | ((x4 & 1) << 3) | (x5 & 0x07);
 
     // field 13: tone code (2 digits)
     let tone_val = parse_u8_field(fields[13], cmd, "tone_code")?;

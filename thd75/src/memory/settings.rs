@@ -508,7 +508,7 @@ impl<'a> SettingsAccess<'a> {
         self.image.get(VOX_DELAY_OFFSET).copied().unwrap_or(0)
     }
 
-    /// Read squelch level for Band A (0-5, 0 if unreadable).
+    /// Read squelch level for Band A (0-6, 0 if unreadable).
     ///
     /// MCP offset `0x100D`.
     #[must_use]
@@ -519,7 +519,7 @@ impl<'a> SettingsAccess<'a> {
             .map_or(0, |b| b.min(6))
     }
 
-    /// Read squelch level for Band B (0-5, 0 if unreadable).
+    /// Read squelch level for Band B (0-6, 0 if unreadable).
     ///
     /// MCP offset `0x100E`.
     #[must_use]
@@ -1372,7 +1372,7 @@ impl<'a> SettingsWriter<'a> {
         }
     }
 
-    /// Set squelch level for Band A (0-5).
+    /// Set squelch level for Band A (0-6).
     ///
     /// MCP offset `0x100D`.
     pub fn set_squelch_a(&mut self, level: u8) {
@@ -1381,7 +1381,7 @@ impl<'a> SettingsWriter<'a> {
         }
     }
 
-    /// Set squelch level for Band B (0-5).
+    /// Set squelch level for Band B (0-6).
     ///
     /// MCP offset `0x100E`.
     pub fn set_squelch_b(&mut self, level: u8) {

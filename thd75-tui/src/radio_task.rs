@@ -392,22 +392,34 @@ pub async fn spawn_with_transport(
                         .map_err(|e| e.to_string())?
                 });
                 if let Ok((_p, transport)) = connect_result {
-                    if let Ok(mut new_radio) = Radio::connect(transport).await {
-                        if new_radio.identify().await.is_ok() {
-                            if let Err(e) = new_radio.set_auto_info(true).await {
-                                tracing::error!("AI mode failed after reconnect: {e}");
+                    match Radio::connect(transport).await {
+                        Ok(mut new_radio) => match new_radio.identify().await {
+                            Ok(_) => {
+                                if let Err(e) = new_radio.set_auto_info(true).await {
+                                    tracing::error!("AI mode failed after reconnect: {e}");
+                                    let _ = tx.send(Message::RadioError(format!(
+                                        "AI mode failed: {e} — S-meter may not update"
+                                    )));
+                                }
+                                notifications = new_radio.subscribe();
+                                s_meter_a = 0;
+                                s_meter_b = 0;
+                                busy_a = false;
+                                busy_b = false;
+                                let _ = tx.send(Message::Reconnected);
+                                radio = new_radio;
+                                continue 'outer;
+                            }
+                            Err(e) => {
                                 let _ = tx.send(Message::RadioError(format!(
-                                    "AI mode failed: {e} — S-meter may not update"
+                                    "Radio found but not responding: {e}"
                                 )));
                             }
-                            notifications = new_radio.subscribe();
-                            s_meter_a = 0;
-                            s_meter_b = 0;
-                            busy_a = false;
-                            busy_b = false;
-                            let _ = tx.send(Message::Reconnected);
-                            radio = new_radio;
-                            continue 'outer;
+                        },
+                        Err(e) => {
+                            let _ = tx.send(Message::RadioError(format!(
+                                "Transport opened but handshake failed: {e}"
+                            )));
                         }
                     }
                 }
@@ -438,6 +450,20 @@ fn classify_error(context: &str, e: &kenwood_thd75::Error) -> PollError {
     }
 }
 
+/// Read a global setting, propagating transport errors to trigger reconnect.
+/// Protocol/parse errors default to the provided fallback (non-fatal).
+macro_rules! global_read {
+    ($radio:expr, $cmd:expr, $call:expr, $default:expr) => {
+        match $call.await {
+            Ok(v) => v,
+            Err(e) => match classify_error($cmd, &e) {
+                PollError::Transport(msg) => return Err(PollError::Transport(msg)),
+                PollError::Protocol(_) => $default,
+            },
+        }
+    };
+}
+
 async fn poll_once(
     radio: &mut Radio<EitherTransport>,
     s_meter_a: u8,
@@ -455,18 +481,20 @@ async fn poll_once(
     band_b.s_meter = s_meter_b;
     band_b.busy = busy_b;
 
-    // Global state reads — all confirmed safe (no side effects)
-    let battery_level = radio.get_battery_level().await.unwrap_or(0);
-    let beep = radio.get_beep().await.unwrap_or(false);
-    let lock = radio.get_lock().await.unwrap_or(false);
-    let dual_band = radio.get_dual_band().await.unwrap_or(false);
-    let bluetooth = radio.get_bluetooth().await.unwrap_or(false);
-    let vox = radio.get_vox().await.unwrap_or(false);
-    let vox_gain = radio.get_vox_gain().await.unwrap_or(0);
-    let vox_delay = radio.get_vox_delay().await.unwrap_or(0);
-    let af_gain = radio.get_af_gain().await.unwrap_or(0);
+    // Global state reads. Transport errors trigger reconnect (a USB unplug
+    // mid-poll should not show fake defaults for a full cycle). Protocol
+    // parse errors are non-fatal and default to safe values.
+    let battery_level = global_read!(radio, "BL", radio.get_battery_level(), 0);
+    let beep = global_read!(radio, "BE", radio.get_beep(), false);
+    let lock = global_read!(radio, "LC", radio.get_lock(), false);
+    let dual_band = global_read!(radio, "DL", radio.get_dual_band(), false);
+    let bluetooth = global_read!(radio, "BT", radio.get_bluetooth(), false);
+    let vox = global_read!(radio, "VX", radio.get_vox(), false);
+    let vox_gain = global_read!(radio, "VG", radio.get_vox_gain(), 0);
+    let vox_delay = global_read!(radio, "VD", radio.get_vox_delay(), 0);
+    let af_gain = global_read!(radio, "AG", radio.get_af_gain(), 0);
     let gps = radio.get_gps_config().await.unwrap_or((false, false));
-    let beacon_type = radio.get_beacon_type().await.unwrap_or(0);
+    let beacon_type = global_read!(radio, "BN", radio.get_beacon_type(), 0);
     Ok(RadioState {
         band_a,
         band_b,
@@ -536,7 +564,8 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
 }
 
 /// Step frequency down by reading current freq + step size, subtracting, and tuning.
-/// The TH-D75 CAT protocol has no native down-step command (only UP exists).
+/// DW (frequency down) exists but does not echo the resulting frequency, so we
+/// compute it manually for accurate TUI display.
 async fn freq_down(
     radio: &mut Radio<EitherTransport>,
     band: Band,
