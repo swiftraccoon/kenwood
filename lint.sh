@@ -24,7 +24,7 @@ fi
 run cargo clippy --manifest-path thd75/Cargo.toml -- -D warnings
 run cargo clippy --manifest-path thd75-tui/Cargo.toml -- -D warnings
 run cargo test --manifest-path thd75/Cargo.toml
-run cargo doc --manifest-path thd75/Cargo.toml --no-deps
+RUSTDOCFLAGS="-D warnings" run cargo doc --manifest-path thd75/Cargo.toml --no-deps
 run cargo fmt --manifest-path thd75/Cargo.toml -- --check
 run cargo fmt --manifest-path thd75-tui/Cargo.toml -- --check
 

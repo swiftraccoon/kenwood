@@ -22,8 +22,8 @@ impl Codec {
 
     /// Appends raw bytes to the internal buffer.
     ///
-    /// If the buffer would exceed [`MAX_BUFFER`](Self::MAX_BUFFER), it is
-    /// truncated to prevent unbounded memory growth.
+    /// If the buffer would exceed 64 KB, it is truncated to prevent
+    /// unbounded memory growth.
     pub fn feed(&mut self, data: &[u8]) {
         tracing::trace!(bytes = data.len(), "codec: feeding bytes");
         self.buffer.extend_from_slice(data);
