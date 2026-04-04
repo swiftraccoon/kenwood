@@ -1,4 +1,34 @@
 //! Error types for the kenwood-thd75 library.
+//!
+//! This module defines a three-level error hierarchy that mirrors the
+//! library's architecture:
+//!
+//! 1. **[`enum@Error`]** — The top-level enum returned by all public API
+//!    methods. It wraps the three lower-level categories below, plus
+//!    radio-specific conditions like [`Error::RadioError`] (`?` response),
+//!    [`Error::NotAvailable`] (`N` response), [`Error::Timeout`], and
+//!    MCP memory-related errors.
+//!
+//! 2. **[`TransportError`]** — Failures in the serial/Bluetooth I/O
+//!    layer. These occur when opening, reading from, or writing to the
+//!    serial port. A `TransportError` generally means the physical link
+//!    is broken or was never established. Wrapped by
+//!    [`Error::Transport`].
+//!
+//! 3. **[`ProtocolError`]** — Failures in CAT command framing and
+//!    parsing. These occur when the radio sends a response that cannot
+//!    be decoded: wrong field count, unparseable field value, unknown
+//!    command prefix, or a malformed frame (e.g., missing `\r`
+//!    terminator). Wrapped by [`Error::Protocol`].
+//!
+//! 4. **[`ValidationError`]** — Failures when a caller-supplied value
+//!    is outside the valid range for its type (e.g., band index > 13,
+//!    tone code > 49, power level > 3). These are raised **before** any
+//!    I/O occurs, during construction of typed wrappers. Wrapped by
+//!    [`Error::Validation`].
+//!
+//! All three lower-level error types implement `From` conversion into
+//! [`enum@Error`], so the `?` operator propagates them naturally.
 
 use std::time::Duration;
 

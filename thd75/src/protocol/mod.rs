@@ -176,8 +176,20 @@ pub enum Command {
     ///
     /// Per KI4LAX CAT reference: `AG AAA` (AAA: 000-099, 3-digit zero-padded).
     /// Sends bare `AG level\r` (no band parameter — firmware rejects band-indexed writes).
+    ///
+    /// **Important: the `band` field is ignored by the firmware.** The AG
+    /// command on the TH-D75 is a global (non-band-specific) control.
+    /// Attempting to send a band-indexed write (`AG band,level`) results
+    /// in a `?` error response from the radio. The `band` field is
+    /// retained in this variant solely for API symmetry with other
+    /// band-indexed commands (e.g., [`Command::SetSquelch`],
+    /// [`Command::SetMode`]) so that callers can use a uniform
+    /// band+value pattern. The serializer discards it.
     SetAfGain {
-        /// Target band (ignored by firmware — AG is global).
+        /// Target band. **Ignored by firmware** — AF gain is a global
+        /// control on the TH-D75. This field exists for API symmetry
+        /// with other band-indexed commands; the serializer discards it
+        /// and sends a bare `AG level\r`.
         band: Band,
         /// Gain level (0-99).
         level: u8,

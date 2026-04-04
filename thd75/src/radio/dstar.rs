@@ -1,4 +1,18 @@
-//! D-STAR subsystem methods.
+//! D-STAR (Digital Smart Technologies for Amateur Radio) subsystem methods.
+//!
+//! D-STAR is a digital voice and data protocol developed by JARL (Japan Amateur Radio League).
+//! The TH-D75 supports D-STAR voice (DV mode) and data, including gateway linking for
+//! internet-connected repeater access.
+//!
+//! # Command relationships
+//!
+//! - **DS**: selects the active D-STAR callsign slot (which stored callsign configuration to use)
+//! - **CS**: selects the active callsign slot number (0-10) — similar to DS but for the CS
+//!   slot register. The actual callsign text is read via DC.
+//! - **DC**: reads D-STAR callsign data for a given slot (1-6). This command lives in
+//!   [`audio.rs`](super) because it was discovered during audio subsystem probing — the DC
+//!   mnemonic is overloaded on the D75 compared to the D74.
+//! - **GW**: D-STAR gateway setting for repeater linking
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};

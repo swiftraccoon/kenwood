@@ -27,29 +27,43 @@ pub enum Band {
     A = 0,
     /// Band B — wideband RX (0.1–524 MHz, all modes). Index 1.
     B = 1,
-    /// Band 2 (index 2).
+    /// Band 2 (index 2). Extended band index used internally by the firmware
+    /// for multi-band selection. Most CAT commands (e.g., `FQ`, `MD`, `SQ`)
+    /// only accept Band A (0) or Band B (1); sending an extended index
+    /// typically results in a `?` error response.
     Band2 = 2,
-    /// Band 3 (index 3).
+    /// Band 3 (index 3). Extended firmware band index — see [`Band::Band2`]
+    /// for details on CAT command restrictions.
     Band3 = 3,
-    /// Band 4 (index 4).
+    /// Band 4 (index 4). Extended firmware band index — see [`Band::Band2`]
+    /// for details on CAT command restrictions.
     Band4 = 4,
-    /// Band 5 (index 5).
+    /// Band 5 (index 5). Extended firmware band index — see [`Band::Band2`]
+    /// for details on CAT command restrictions.
     Band5 = 5,
-    /// Band 6 (index 6).
+    /// Band 6 (index 6). Extended firmware band index — see [`Band::Band2`]
+    /// for details on CAT command restrictions.
     Band6 = 6,
-    /// Band 7 (index 7).
+    /// Band 7 (index 7). Extended firmware band index — see [`Band::Band2`]
+    /// for details on CAT command restrictions.
     Band7 = 7,
-    /// Band 8 (index 8).
+    /// Band 8 (index 8). Extended firmware band index — see [`Band::Band2`]
+    /// for details on CAT command restrictions.
     Band8 = 8,
-    /// Band 9 (index 9).
+    /// Band 9 (index 9). Extended firmware band index — see [`Band::Band2`]
+    /// for details on CAT command restrictions.
     Band9 = 9,
-    /// Band 10 (index 10).
+    /// Band 10 (index 10). Extended firmware band index — see [`Band::Band2`]
+    /// for details on CAT command restrictions.
     Band10 = 10,
-    /// Band 11 (index 11).
+    /// Band 11 (index 11). Extended firmware band index — see [`Band::Band2`]
+    /// for details on CAT command restrictions.
     Band11 = 11,
-    /// Band 12 (index 12).
+    /// Band 12 (index 12). Extended firmware band index — see [`Band::Band2`]
+    /// for details on CAT command restrictions.
     Band12 = 12,
-    /// Band 13 (index 13).
+    /// Band 13 (index 13). Extended firmware band index — see [`Band::Band2`]
+    /// for details on CAT command restrictions.
     Band13 = 13,
 }
 

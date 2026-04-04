@@ -8,6 +8,24 @@ use crate::error::ProtocolError;
 ///
 /// Stored as a `u32`, matching the firmware's internal representation.
 /// Range: 0 to 4,294,967,295 Hz (0 to ~4.295 GHz).
+///
+/// # TH-D75 band frequency ranges
+///
+/// The radio enforces hardware-specific frequency limits per band:
+///
+/// - **Band B (RX only)**: 0.1 MHz to 524 MHz continuous receive
+///   coverage. Band B is receive-only across this entire range.
+/// - **Band A (TX/RX)**: Transmit is restricted to amateur allocations:
+///   - 144-148 MHz (2m)
+///   - 220-225 MHz (1.25m, TH-D75A model only)
+///   - 430-450 MHz (70cm)
+///
+/// Frequencies outside these ranges will be **rejected by the radio**
+/// when sent via CAT commands such as `FQ` or `FO`. The firmware
+/// validates the frequency against the target band's allowed range and
+/// returns a `?` error response if the value is out of bounds. This
+/// library does not pre-validate frequencies to avoid duplicating
+/// firmware logic that may vary by region or firmware version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Frequency(u32);
 

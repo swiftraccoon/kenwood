@@ -15,6 +15,9 @@ use crate::error::ValidationError;
 /// table with 15 additional tones including interleaved entries in the
 /// 159-200 Hz range (159.8, 165.5, 171.3, 177.3, 183.5, 189.9, 196.6,
 /// 199.5) and high-frequency tones (210.7-254.1 Hz).
+///
+/// This table corresponds to **KI4LAX TABLE A** in the CAT command
+/// reference, which maps hex indices 0x00-0x31 to CTCSS tone frequencies.
 pub const CTCSS_FREQUENCIES: [f64; 50] = [
     67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, // 0-9
     94.8, 97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3, // 10-19
@@ -27,6 +30,9 @@ pub const CTCSS_FREQUENCIES: [f64; 50] = [
 ///
 /// 104 digital squelch codes used for selective calling. Indexed by
 /// [`DcsCode`]. Table is at firmware address `0xC0086FC4`.
+///
+/// This table corresponds to **KI4LAX TABLE B** in the CAT command
+/// reference, which maps hex indices 0x00-0x67 to DCS code numbers.
 pub const DCS_CODES: [u16; 104] = [
     23, 25, 26, 31, 32, 36, 43, 47, 51, 53, 54, 65, 71, 72, 73, 74, 114, 115, 116, 122, 125, 131,
     132, 134, 143, 145, 152, 155, 156, 162, 165, 172, 174, 205, 212, 223, 225, 226, 243, 244, 245,
@@ -121,6 +127,8 @@ impl std::fmt::Display for DcsCode {
 /// Tone signaling mode for a channel.
 ///
 /// Maps to the tone-mode field in the `FO` and `ME` commands.
+/// Corresponds to **KI4LAX TABLE F** in the CAT command reference
+/// (index 0 = Off, 1 = CTCSS, 2 = DCS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToneMode {
     /// No tone signaling (index 0).

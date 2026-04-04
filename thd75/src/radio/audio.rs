@@ -42,9 +42,21 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set the AF gain level for a band (AG write).
+    /// Set the AF gain level (AG write).
     ///
-    /// D75 RE: `AG x,y` (x: band 0/1, y: gain 0-39).
+    /// # Get/set asymmetry
+    ///
+    /// The get and set commands have different wire formats on the D75:
+    /// - **Read** (`AG\r`): bare command, returns a global gain level. Band-indexed read
+    ///   (`AG 0\r`) returns `?`.
+    /// - **Write** (`AG NNN\r`): bare 3-digit zero-padded value (e.g., `AG 015\r`). Despite
+    ///   the `band` parameter in this method's signature, the wire format is bare (no band
+    ///   index) — the value applies globally.
+    ///
+    /// # Valid range
+    ///
+    /// `level` must be 0 through 99. The wire format zero-pads to 3 digits (e.g., `AG 005\r`).
+    /// Values outside 0-99 may be rejected or cause unexpected behavior.
     ///
     /// # Errors
     ///
@@ -131,7 +143,15 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get the VOX enabled state (VX read).
+    /// Get the VOX (Voice-Operated Exchange/Transmit) enabled state (VX read).
+    ///
+    /// VOX allows hands-free transmit operation. When enabled, the radio automatically keys
+    /// the transmitter when it detects audio input from the microphone, and returns to receive
+    /// after a configurable delay when audio stops.
+    ///
+    /// VOX must be enabled before [`get_vox_gain`](Self::get_vox_gain) or
+    /// [`get_vox_delay`](Self::get_vox_delay) will succeed — those commands return `N`
+    /// (not available) when VOX is disabled.
     ///
     /// # Errors
     ///
@@ -148,7 +168,12 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set the VOX enabled state (VX write).
+    /// Set the VOX (Voice-Operated Exchange/Transmit) enabled state (VX write).
+    ///
+    /// See [`get_vox`](Self::get_vox) for a description of VOX operation. Enabling VOX
+    /// (`true`) unlocks the [`set_vox_gain`](Self::set_vox_gain) and
+    /// [`set_vox_delay`](Self::set_vox_delay) commands. Disabling VOX (`false`) causes
+    /// those commands to return `N` (not available).
     ///
     /// # Errors
     ///

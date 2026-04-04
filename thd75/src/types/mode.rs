@@ -14,6 +14,23 @@ use crate::error::ValidationError;
 /// (0=FM, 1=DV, 2=NFM, 3=AM) stored as a raw `u8` in [`ChannelMemory`].
 /// This enum is only used for the `MD` command.
 ///
+/// # Band restrictions (per Kenwood Operating Tips §5.9)
+///
+/// Not all modes are available on both bands:
+///
+/// - **Band A** supports only **FM** and **DV**. Band A is the amateur
+///   TX/RX band (144/220/430 MHz) and its hardware path does not include
+///   the DSP demodulator needed for SSB/CW/AM.
+/// - **Band B** supports all modes: FM, DV, AM, LSB, USB, CW, NFM, and
+///   DR. Band B has an independent receiver chain with DSP and IF filter
+///   enabling wideband demodulation.
+/// - **DR** (D-STAR repeater mode) is only available on **Band A**.
+///   Attempting to set DR on Band B via `MD` will be rejected by the
+///   firmware with a `?` error.
+///
+/// Attempting to set an unsupported mode on a band via the `MD` command
+/// will result in the radio returning a `?` error response.
+///
 /// # WFM (Wide FM) note
 ///
 /// WFM is NOT an `MD` mode — it is the FM broadcast radio mode accessed
@@ -25,21 +42,27 @@ use crate::error::ValidationError;
 /// [`ChannelMemory`]: crate::types::ChannelMemory
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mode {
-    /// FM modulation (index 0).
+    /// FM modulation (index 0). Available on both Band A and Band B.
     Fm = 0,
-    /// D-STAR digital voice (index 1).
+    /// D-STAR digital voice (index 1). Available on both Band A and Band B.
     Dv = 1,
-    /// AM modulation (index 2).
+    /// AM modulation (index 2). Band B only — Band A hardware lacks the
+    /// DSP demodulator required for AM reception.
     Am = 2,
-    /// Lower sideband (index 3).
+    /// Lower sideband (index 3). Band B only — requires DSP demodulator
+    /// not present in Band A's receiver chain.
     Lsb = 3,
-    /// Upper sideband (index 4).
+    /// Upper sideband (index 4). Band B only — requires DSP demodulator
+    /// not present in Band A's receiver chain.
     Usb = 4,
-    /// CW / Morse code (index 5).
+    /// CW / Morse code (index 5). Band B only — requires DSP demodulator
+    /// not present in Band A's receiver chain.
     Cw = 5,
-    /// Narrow FM modulation (index 6).
+    /// Narrow FM modulation (index 6). Band B only — Band A supports
+    /// only standard FM deviation.
     Nfm = 6,
-    /// D-STAR repeater mode (index 7).
+    /// D-STAR repeater mode (index 7). Band A only — DR requires the
+    /// CTRL/PTT band for gateway access and callsign routing.
     Dr = 7,
 }
 
@@ -195,6 +218,26 @@ impl From<ShiftDirection> for u8 {
 ///
 /// Maps to the step field in the `FO` and `ME` commands.
 /// The variant name encodes the step in Hz (e.g. `Hz5000` = 5.0 kHz).
+///
+/// # KI4LAX TABLE C reference
+///
+/// The hex index-to-step-size mapping (TABLE C in the KI4LAX CAT command
+/// reference) is as follows:
+///
+/// | Index (hex) | Step size |
+/// |-------------|-----------|
+/// | 0x0 | 5.0 kHz |
+/// | 0x1 | 6.25 kHz |
+/// | 0x2 | 8.33 kHz |
+/// | 0x3 | 9.0 kHz |
+/// | 0x4 | 10.0 kHz |
+/// | 0x5 | 12.5 kHz |
+/// | 0x6 | 15.0 kHz |
+/// | 0x7 | 20.0 kHz |
+/// | 0x8 | 25.0 kHz |
+/// | 0x9 | 30.0 kHz |
+/// | 0xA | 50.0 kHz |
+/// | 0xB | 100.0 kHz |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StepSize {
     /// 5.000 kHz step (index 0).

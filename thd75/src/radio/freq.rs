@@ -1,5 +1,30 @@
 //! Core radio methods: frequency, mode, power, squelch, S-meter, TX/RX, firmware, power status, ID,
 //! band control, VFO/memory mode, FM radio, frequency step, function type, and filter width.
+//!
+//! # FQ vs FO
+//!
+//! The D75 has two frequency-related command pairs:
+//!
+//! - **FQ** (read-only): returns the current frequency and step size for a band. Writes are
+//!   rejected by the firmware — use FO for frequency changes.
+//! - **FO** (read/write): returns or sets the full channel configuration for a band, including
+//!   frequency, offset, tone mode, CTCSS/DCS codes, shift direction, and more. This is the
+//!   primary command for tuning the radio via CAT.
+//!
+//! # VFO mode requirement
+//!
+//! Most write commands in this module (FO write, MD write, SQ write, FS write, etc.) require the
+//! target band to be in VFO mode. If the band is in Memory, Call, or WX mode, the radio returns
+//! `?` and the write is silently rejected. Use [`set_vfo_memory_mode`](Radio::set_vfo_memory_mode)
+//! to switch to VFO mode first, or use the safe `tune_frequency()` API which handles mode
+//! management automatically.
+//!
+//! # Tone and offset configuration
+//!
+//! CTCSS tone, DCS code, tone mode, and repeater offset are not configured through dedicated
+//! commands. Instead, they are fields within the [`ChannelMemory`] struct passed to
+//! [`set_frequency_full`](Radio::set_frequency_full) (FO write). Read the current state with
+//! [`get_frequency_full`](Radio::get_frequency_full), modify the desired fields, and write it back.
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
@@ -45,6 +70,23 @@ impl<T: Transport> Radio<T> {
 
     /// Write full frequency and settings for the given band (FO write).
     ///
+    /// Sends the full channel configuration (frequency, offset, tone mode, CTCSS/DCS codes,
+    /// shift direction, and other fields) to the radio for the specified band.
+    ///
+    /// # VFO mode requirement
+    ///
+    /// The target band **must** be in VFO mode (`VM band,0`). If the band is in Memory, Call,
+    /// or WX mode, the radio returns `?` and the write is silently rejected. Use
+    /// [`set_vfo_memory_mode`](Self::set_vfo_memory_mode) to switch to VFO first, or prefer
+    /// `tune_frequency()` which handles mode management safely.
+    ///
+    /// # Wire format
+    ///
+    /// `FO band,freq,step,shift,reverse,tone_status,ctcss_status,dcs_status,tone_freq,ctcss_freq,dcs_code,offset,...\r`
+    ///
+    /// The full FO command encodes all 21 fields of the [`ChannelMemory`] struct as
+    /// comma-separated values.
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -87,6 +129,14 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Set the operating mode for the given band (MD write).
+    ///
+    /// # Band restrictions
+    ///
+    /// SSB (LSB/USB), CW, and AM modes are only available on Band B. Attempting to set these
+    /// modes on Band A will return `?`. FM, NFM, DV, and DR modes are available on both bands.
+    ///
+    /// See the [`Mode`] type for valid values. Note that the MD command uses a different
+    /// encoding than FO/ME commands — the [`Mode`] type handles this mapping internally.
     ///
     /// # Errors
     ///
@@ -156,6 +206,16 @@ impl<T: Transport> Radio<T> {
 
     /// Set the squelch level for the given band (SQ write).
     ///
+    /// # Valid range
+    ///
+    /// `level` must be 0 through 6 on the TH-D75. Values outside this range cause the radio
+    /// to return `?` and the write is rejected. Level 0 means squelch is fully open (all signals
+    /// pass); level 6 is the tightest squelch setting.
+    ///
+    /// # Wire format
+    ///
+    /// `SQ band,level\r` where band is 0 (A) or 1 (B) and level is a single digit 0-6.
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -172,6 +232,33 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Get the S-meter reading for the given band (SM read).
+    ///
+    /// Returns an instantaneous signal strength measurement as a raw value 0-5. This is a
+    /// read-only, point-in-time snapshot — the value changes continuously as signal conditions
+    /// vary.
+    ///
+    /// # Value mapping
+    ///
+    /// The raw values map to approximate S-meter readings:
+    ///
+    /// | Raw | S-meter |
+    /// |-----|---------|
+    /// |  0  | S0 (no signal) |
+    /// |  1  | S1 |
+    /// |  2  | S3 |
+    /// |  3  | S5 |
+    /// |  4  | S7 |
+    /// |  5  | S9 (full scale) |
+    ///
+    /// # Polling warning
+    ///
+    /// Do not poll SM continuously — the firmware returns spurious spikes on Band B. Instead,
+    /// use AI mode ([`set_auto_info`](Self::set_auto_info)) with the BY (busy) signal as a
+    /// gate: read SM once when squelch opens, and treat it as zero when squelch is closed.
+    ///
+    /// # Wire format
+    ///
+    /// `SM band\r` returns `SM band,level\r`.
     ///
     /// # Errors
     ///
@@ -190,6 +277,15 @@ impl<T: Transport> Radio<T> {
 
     /// Get the busy state for the given band (BY read).
     ///
+    /// "Busy" means the squelch is open — a signal strong enough to exceed the current squelch
+    /// threshold is present on the channel. Returns `true` when the squelch is open (signal
+    /// present), `false` when closed (no signal or signal below threshold).
+    ///
+    /// # Wire format
+    ///
+    /// `BY band\r` returns `BY band,state\r` where state is 0 (not busy / squelch closed) or
+    /// 1 (busy / squelch open).
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -207,6 +303,22 @@ impl<T: Transport> Radio<T> {
 
     /// Switch the given band to transmit mode (TX action).
     ///
+    /// # RF emission warning
+    ///
+    /// **This keys the transmitter and causes RF emission on the currently tuned frequency.**
+    /// The radio will transmit continuously until [`receive`](Self::receive) is called. Ensure
+    /// you are authorized to transmit on the current frequency before calling this method.
+    /// Unauthorized transmission is a violation of radio regulations (e.g., FCC Part 97 in the
+    /// US).
+    ///
+    /// Always call [`receive`](Self::receive) when done to return to receive mode. If your
+    /// program panics or is interrupted while transmitting, the radio will continue to transmit
+    /// until manually stopped or the timeout (if any) expires.
+    ///
+    /// # Wire format
+    ///
+    /// `TX band\r` where band is 0 (A) or 1 (B). Returns `OK\r` on success.
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -223,6 +335,14 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Switch the given band to receive mode (RX action).
+    ///
+    /// Stops transmitting and returns the radio to receive mode. This is the counterpart to
+    /// [`transmit`](Self::transmit) and **must** be called after transmitting to stop RF
+    /// emission.
+    ///
+    /// # Wire format
+    ///
+    /// `RX band\r` where band is 0 (A) or 1 (B). Returns `OK\r` on success.
     ///
     /// # Errors
     ///
@@ -430,7 +550,7 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get the FM radio on/off state (FR read).
+    /// Get the FM broadcast radio on/off state (FR read).
     ///
     /// # Errors
     ///
@@ -447,7 +567,18 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set the FM radio on/off state (FR write).
+    /// Set the FM broadcast radio on/off state (FR write).
+    ///
+    /// This controls the **broadcast FM receiver** (76-108 MHz), not amateur FM mode. This is
+    /// the same as the "FM Radio" menu item on the radio — it tunes to commercial broadcast
+    /// stations.
+    ///
+    /// # Side effects
+    ///
+    /// Enabling the FM broadcast receiver takes over the display and audio output. The radio's
+    /// normal amateur band display is replaced with the broadcast FM frequency. Normal band
+    /// receive audio is muted while the FM broadcast receiver is active. Disable it to return
+    /// to normal amateur radio operation.
     ///
     /// # Errors
     ///

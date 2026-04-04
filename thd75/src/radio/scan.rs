@@ -13,10 +13,19 @@ impl<T: Transport> Radio<T> {
     /// Hardware-verified: bare `SR\r` returns `?` (no read form).
     /// SR is write-only on the D75.
     ///
+    /// # Valid mode values
+    ///
+    /// - `0` = **VFO reset** — hardware-verified to **reboot the radio**. Despite being
+    ///   documented as a scan resume mode, `SR 0` performs a VFO settings reset on the D75.
+    ///   **Do not use unless you intend to reset the radio.**
+    /// - `1` = Partial reset (resets some settings, preserves memories)
+    /// - `2` = Full factory reset (erases all settings and memories)
+    ///
     /// # Safety warning
-    /// On hardware, `SR 0` was observed to reboot the radio. The D75 RE
-    /// identifies this as scan resume, but the behavior may coincide with
-    /// a reset action. Use with caution.
+    ///
+    /// **All SR values perform radio resets, not scan resume configuration.** The D75 RE
+    /// identifies this mnemonic as "scan resume", but the actual firmware behavior is a
+    /// reset command. The radio will reboot and the serial connection will be lost.
     ///
     /// # Errors
     ///

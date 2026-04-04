@@ -1,4 +1,28 @@
 //! Frame-level codec for `\r`-terminated CAT protocol messages.
+//!
+//! The TH-D75 CAT protocol uses carriage return (`\r`, 0x0D) as the
+//! frame delimiter for both commands and responses. Each message is a
+//! sequence of ASCII bytes terminated by a single `\r`. There is no
+//! length prefix or checksum — framing relies entirely on the delimiter.
+//!
+//! This codec sits between the raw serial byte stream and the protocol
+//! parser. The data flow is:
+//!
+//! ```text
+//! Serial port  -->  Codec::feed()  -->  Codec::next_frame()  -->  parse()
+//!              raw bytes          buffered             complete frame    typed Response
+//! ```
+//!
+//! On the transmit side, [`super::serialize`] produces the wire bytes
+//! (including the trailing `\r`) that are written directly to the serial
+//! port — the codec is not involved in outbound framing.
+//!
+//! The codec maintains an internal buffer that accumulates bytes from
+//! successive [`Codec::feed`] calls. When [`Codec::next_frame`] finds a
+//! `\r`, it extracts everything before it as a complete frame (without
+//! the delimiter) and drains those bytes from the buffer. The buffer is
+//! capped at 64 KB to prevent unbounded growth if the serial link
+//! delivers noise without any `\r` terminators.
 
 /// Frame-level codec for `\r`-terminated CAT protocol messages.
 ///

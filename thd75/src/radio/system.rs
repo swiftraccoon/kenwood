@@ -31,6 +31,15 @@ impl<T: Transport> Radio<T> {
     ///
     /// D75 RE: `BE x` (x: 0=off, 1=on).
     ///
+    /// # D75 firmware bug
+    ///
+    /// **The CAT `BE` write command is a firmware stub on the TH-D75.** It always returns `?`
+    /// regardless of the value sent. The read (`get_beep`) works, but writes are silently
+    /// ignored by the firmware.
+    ///
+    /// Use [`set_beep_via_mcp`](Self::set_beep_via_mcp) instead, which writes directly to
+    /// the verified MCP memory offset (`0x1071`) and actually changes the setting.
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -109,8 +118,18 @@ impl<T: Transport> Radio<T> {
 
     /// Set all lock/control fields (LC 6-field write).
     ///
-    /// Sends the full `LC a,b,c,d,e,f` format to configure all lock
-    /// parameters at once. See [`Command::SetLockFull`] for field docs.
+    /// Sends the full `LC a,b,c,d,e,f` format to configure all lock parameters at once.
+    ///
+    /// # Parameters
+    ///
+    /// - `locked`: master lock enable (`true` = locked, `false` = unlocked). Note the CAT
+    ///   value is inverted: `0` on the wire means locked, `1` means unlocked.
+    /// - `lock_type`: what to lock — `0` = key lock only, `1` = PTT lock only,
+    ///   `2` = key + PTT lock.
+    /// - `lock_a`: lock Band A controls (`true` = locked).
+    /// - `lock_b`: lock Band B controls (`true` = locked).
+    /// - `lock_c`: lock Band C controls (`true` = locked).
+    /// - `lock_ptt`: lock the PTT button (`true` = locked, prevents transmission).
     ///
     /// # Errors
     ///
@@ -190,7 +209,24 @@ impl<T: Transport> Radio<T> {
     /// Step frequency down on the given band (DW action).
     ///
     /// Per KI4LAX CAT reference: DW tunes the current band's frequency
-    /// down by the current step size. Counterpart to UP (frequency up).
+    /// down by the current step size. Counterpart to [`frequency_up`](super::Radio::frequency_up).
+    ///
+    /// # VFO mode requirement
+    ///
+    /// The target band must be in VFO mode for this command to take effect. In Memory mode,
+    /// the command may be ignored or return an error.
+    ///
+    /// # Step size
+    ///
+    /// The frequency moves by the band's current step size (see
+    /// [`get_frequency_step`](super::Radio::get_frequency_step) /
+    /// [`set_frequency_step`](super::Radio::set_frequency_step)). The step size varies by
+    /// band and mode — for example, 25 kHz for FM, 1 kHz for SSB.
+    ///
+    /// # Wire format
+    ///
+    /// `DW band\r` where band is 0 (A) or 1 (B). Despite the mnemonic suggesting "Dual Watch",
+    /// on the D75 this is strictly frequency-down.
     ///
     /// # Errors
     ///
@@ -280,6 +316,23 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Set the auto-info mode (AI write). This is a write-only command.
+    ///
+    /// When enabled (`AI 1`), the radio pushes unsolicited status updates over the serial
+    /// connection whenever internal state changes. This includes frequency changes (FQ),
+    /// mode changes (MD), squelch changes (SQ), and busy state transitions (BY). Without
+    /// AI mode, the only way to detect changes is to poll each command individually.
+    ///
+    /// Unsolicited frames pushed by the radio are delivered through the broadcast channel
+    /// returned by [`subscribe`](Self::subscribe). The `execute()` method routes solicited
+    /// responses (matching the sent command's mnemonic) to the caller and unsolicited frames
+    /// to the broadcast channel.
+    ///
+    /// This command is write-only — there is no `AI` read form. To check the current state,
+    /// you must track it in your application after calling this method.
+    ///
+    /// # Wire format
+    ///
+    /// `AI 0\r` (disable) or `AI 1\r` (enable).
     ///
     /// # Errors
     ///

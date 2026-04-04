@@ -1,4 +1,21 @@
-//! APRS subsystem methods.
+//! APRS (Automatic Packet Reporting System) subsystem methods.
+//!
+//! APRS is a digital communications protocol for real-time tactical information exchange. The
+//! TH-D75 has a built-in TNC (Terminal Node Controller) that handles AX.25 packet encoding and
+//! decoding, supporting both 1200 baud (VHF, standard APRS on 144.390 MHz in North America) and
+//! 9600 baud (UHF) operation.
+//!
+//! The TNC handles position beaconing, message exchange, and weather reporting. Beacon
+//! transmission is controlled by the beacon type setting (PT command), which determines whether
+//! beacons are sent manually, at fixed intervals, or based on `SmartBeaconing` rules.
+//!
+//! # Related commands
+//!
+//! - **AS**: TNC baud rate (1200/9600)
+//! - **PT**: Beacon TX control mode
+//! - **MS**: Position source / message send (overloaded mnemonic)
+//! - **AE**: Serial number info (not actually APRS-related, but shares the A prefix)
+//! - **BE**: Sends an APRS beacon (transmits on air) — see dangerous commands in CLAUDE.md
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
@@ -27,6 +44,14 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Get the beacon TX control mode (PT read).
+    ///
+    /// Returns the current beacon transmission mode:
+    ///
+    /// - `0` = Off (no automatic beaconing)
+    /// - `1` = Manual (beacon sent only when explicitly triggered)
+    /// - `2` = PTT (beacon sent after each PTT release)
+    /// - `3` = Auto (beacon sent at fixed intervals set by the beacon interval timer)
+    /// - `4` = `SmartBeaconing` (adaptive beaconing based on speed and direction changes)
     ///
     /// # Errors
     ///
@@ -81,6 +106,8 @@ impl<T: Transport> Radio<T> {
 
     /// Set the beacon TX control mode (PT write).
     ///
+    /// See [`get_beacon_type`](Self::get_beacon_type) for valid mode values and their meanings.
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -97,6 +124,16 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Send a message via the APRS/TNC interface (MS write).
+    ///
+    /// # RF emission warning
+    ///
+    /// **This command causes the radio to transmit on the air.** The TNC will key the
+    /// transmitter and send an AX.25 packet containing the message on the currently configured
+    /// APRS frequency. Ensure you are authorized to transmit on the current frequency before
+    /// calling this method.
+    ///
+    /// The transmission is a single packet burst (not continuous like [`transmit`](super::Radio::transmit)),
+    /// but it still constitutes an RF emission that must comply with radio regulations.
     ///
     /// # Errors
     ///
