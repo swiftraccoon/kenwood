@@ -25,6 +25,7 @@
 
 pub mod callsign_list;
 pub mod config;
+pub mod gps_log;
 pub mod qso_log;
 pub mod repeater_list;
 

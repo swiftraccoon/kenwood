@@ -79,14 +79,18 @@ pub enum GpsOperatingMode {
 }
 
 impl TryFrom<u8> for GpsOperatingMode {
-    type Error = &'static str;
+    type Error = crate::error::ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Standalone),
             1 => Ok(Self::Sbas),
             2 => Ok(Self::Manual),
-            _ => Err("GPS operating mode out of range (must be 0-2)"),
+            _ => Err(crate::error::ValidationError::SettingOutOfRange {
+                name: "GPS operating mode",
+                value,
+                detail: "must be 0-2",
+            }),
         }
     }
 }
@@ -181,14 +185,18 @@ pub enum TrackRecordMethod {
 }
 
 impl TryFrom<u8> for TrackRecordMethod {
-    type Error = &'static str;
+    type Error = crate::error::ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Off),
             1 => Ok(Self::Interval),
             2 => Ok(Self::Distance),
-            _ => Err("track record method out of range (must be 0-2)"),
+            _ => Err(crate::error::ValidationError::SettingOutOfRange {
+                name: "track record method",
+                value,
+                detail: "must be 0-2",
+            }),
         }
     }
 }

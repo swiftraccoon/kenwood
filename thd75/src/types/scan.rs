@@ -59,10 +59,14 @@ impl ScanResumeMethod {
 }
 
 impl TryFrom<u8> for ScanResumeMethod {
-    type Error = &'static str;
+    type Error = crate::error::ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Self::from_raw(value).ok_or("scan resume method out of range (must be 0-2)")
+        Self::from_raw(value).ok_or(crate::error::ValidationError::SettingOutOfRange {
+            name: "scan resume method",
+            value,
+            detail: "must be 0-2",
+        })
     }
 }
 

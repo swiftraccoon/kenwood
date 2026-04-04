@@ -301,6 +301,20 @@ pub enum ValidationError {
         /// The maximum valid channel number.
         max: u16,
     },
+
+    /// A settings/configuration enum value is outside its valid range.
+    ///
+    /// Used for MCP binary settings types (backlight, EQ, language, etc.)
+    /// where adding a dedicated variant per type would be excessive.
+    #[error("{name} value {value} out of range ({detail})")]
+    SettingOutOfRange {
+        /// The setting type name (e.g., "backlight control").
+        name: &'static str,
+        /// The invalid raw value.
+        value: u8,
+        /// Human-readable valid range description (e.g., "must be 0-2").
+        detail: &'static str,
+    },
 }
 
 #[cfg(test)]
@@ -340,6 +354,19 @@ mod tests {
         };
         assert!(err.to_string().contains("1200"));
         assert!(err.to_string().contains("1199"));
+    }
+
+    #[test]
+    fn setting_out_of_range_display() {
+        let err = ValidationError::SettingOutOfRange {
+            name: "backlight control",
+            value: 5,
+            detail: "must be 0-2",
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("backlight control"));
+        assert!(msg.contains("5"));
+        assert!(msg.contains("must be 0-2"));
     }
 
     #[test]

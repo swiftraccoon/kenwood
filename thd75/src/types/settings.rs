@@ -5,6 +5,8 @@
 //! settings from the capability gap analysis features 123-197 that are
 //! not subsystem-specific (not APRS, D-STAR, or GPS).
 
+use crate::error::ValidationError;
+
 // ---------------------------------------------------------------------------
 // Display settings
 // ---------------------------------------------------------------------------
@@ -460,20 +462,24 @@ pub enum PfKeyFunction {
 // ---------------------------------------------------------------------------
 
 impl TryFrom<u8> for BacklightControl {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::On),
             1 => Ok(Self::Auto),
             2 => Ok(Self::Off),
-            _ => Err("backlight control out of range (must be 0-2)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "backlight control",
+                value,
+                detail: "must be 0-2",
+            }),
         }
     }
 }
 
 impl TryFrom<u8> for BackgroundColor {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -481,49 +487,65 @@ impl TryFrom<u8> for BackgroundColor {
             1 => Ok(Self::Green),
             2 => Ok(Self::Blue),
             3 => Ok(Self::White),
-            _ => Err("background color out of range (must be 0-3)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "background color",
+                value,
+                detail: "must be 0-3",
+            }),
         }
     }
 }
 
 impl TryFrom<u8> for MeterType {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Bar),
             1 => Ok(Self::Numeric),
-            _ => Err("meter type out of range (must be 0-1)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "meter type",
+                value,
+                detail: "must be 0-1",
+            }),
         }
     }
 }
 
 impl TryFrom<u8> for DisplayMethod {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Dual),
             1 => Ok(Self::Single),
-            _ => Err("display method out of range (must be 0-1)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "display method",
+                value,
+                detail: "must be 0-1",
+            }),
         }
     }
 }
 
 impl TryFrom<u8> for LedControl {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::On),
             1 => Ok(Self::Off),
-            _ => Err("LED control out of range (must be 0-1)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "LED control",
+                value,
+                detail: "must be 0-1",
+            }),
         }
     }
 }
 
 impl TryFrom<u8> for DisplayHoldTime {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -531,13 +553,17 @@ impl TryFrom<u8> for DisplayHoldTime {
             1 => Ok(Self::Sec5),
             2 => Ok(Self::Sec10),
             3 => Ok(Self::Continuous),
-            _ => Err("display hold time out of range (must be 0-3)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "display hold time",
+                value,
+                detail: "must be 0-3",
+            }),
         }
     }
 }
 
 impl TryFrom<u8> for EqSetting {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -545,39 +571,51 @@ impl TryFrom<u8> for EqSetting {
             1 => Ok(Self::HighBoost),
             2 => Ok(Self::LowBoost),
             3 => Ok(Self::FullBoost),
-            _ => Err("EQ setting out of range (must be 0-3)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "EQ setting",
+                value,
+                detail: "must be 0-3",
+            }),
         }
     }
 }
 
 impl TryFrom<u8> for MicSensitivity {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Low),
             1 => Ok(Self::Medium),
             2 => Ok(Self::High),
-            _ => Err("mic sensitivity out of range (must be 0-2)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "mic sensitivity",
+                value,
+                detail: "must be 0-2",
+            }),
         }
     }
 }
 
 impl TryFrom<u8> for VoiceGuideSpeed {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Slow),
             1 => Ok(Self::Normal),
             2 => Ok(Self::Fast),
-            _ => Err("voice guide speed out of range (must be 0-2)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "voice guide speed",
+                value,
+                detail: "must be 0-2",
+            }),
         }
     }
 }
 
 impl TryFrom<u8> for AutoPowerOff {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -586,45 +624,61 @@ impl TryFrom<u8> for AutoPowerOff {
             2 => Ok(Self::Min60),
             3 => Ok(Self::Min90),
             4 => Ok(Self::Min120),
-            _ => Err("auto power off out of range (must be 0-4)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "auto power off",
+                value,
+                detail: "must be 0-4",
+            }),
         }
     }
 }
 
 impl TryFrom<u8> for KeyLockType {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::KeyOnly),
             1 => Ok(Self::KeyAndPtt),
             2 => Ok(Self::KeyPttAndDial),
-            _ => Err("key lock type out of range (must be 0-2)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "key lock type",
+                value,
+                detail: "must be 0-2",
+            }),
         }
     }
 }
 
 impl TryFrom<u8> for Language {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::English),
             1 => Ok(Self::Japanese),
-            _ => Err("language out of range (must be 0-1)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "language",
+                value,
+                detail: "must be 0-1",
+            }),
         }
     }
 }
 
 impl TryFrom<u8> for DateFormat {
-    type Error = &'static str;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::YearMonthDay),
             1 => Ok(Self::MonthDayYear),
             2 => Ok(Self::DayMonthYear),
-            _ => Err("date format out of range (must be 0-2)"),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "date format",
+                value,
+                detail: "must be 0-2",
+            }),
         }
     }
 }
