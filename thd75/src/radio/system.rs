@@ -75,6 +75,42 @@ impl<T: Transport> Radio<T> {
         }
     }
 
+    /// Set battery level display (BL write).
+    ///
+    /// # Warning
+    ///
+    /// The exact purpose of this command is unclear. It may control the battery
+    /// display indicator or be a calibration/test interface. The `display` and
+    /// `level` parameter semantics are undocumented.
+    ///
+    /// # Wire format
+    ///
+    /// `BL display,level\r` (7 bytes with comma).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_battery_level(&mut self, bl_display: u8, level: u8) -> Result<(), Error> {
+        tracing::info!(
+            bl_display,
+            level,
+            "setting battery level display (BL write)"
+        );
+        let response = self
+            .execute(Command::SetBatteryLevel {
+                display: bl_display,
+                level,
+            })
+            .await?;
+        match response {
+            Response::BatteryLevel { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "BatteryLevel".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
     /// Get the key lock state (LC read).
     ///
     /// On the TH-D75, LC controls the key lock. The CAT value is inverted

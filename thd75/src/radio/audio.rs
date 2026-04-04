@@ -78,6 +78,9 @@ impl<T: Transport> Radio<T> {
     /// Hardware-verified: bare `TN\r` returns `TN mode,setting`.
     /// Returns `(mode, setting)`.
     ///
+    /// Valid mode values per firmware validation: 0, 1, 2, 3.
+    /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -86,6 +89,30 @@ impl<T: Transport> Radio<T> {
         let response = self.execute(Command::GetTncMode).await?;
         match response {
             Response::TncMode { mode, setting } => Ok((mode, setting)),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "TncMode".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set the TNC mode (TN write).
+    ///
+    /// Valid mode values per firmware validation: 0, 1, 2, 3.
+    /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
+    ///
+    /// # Wire format
+    ///
+    /// `TN mode,setting\r`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_tnc_mode(&mut self, mode: u8, setting: u8) -> Result<(), Error> {
+        tracing::info!(mode, setting, "setting TNC mode");
+        let response = self.execute(Command::SetTncMode { mode, setting }).await?;
+        match response {
+            Response::TncMode { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "TncMode".into(),
                 actual: format!("{other:?}").into_bytes(),
@@ -113,6 +140,47 @@ impl<T: Transport> Radio<T> {
             Response::DstarCallsign {
                 callsign, suffix, ..
             } => Ok((callsign, suffix)),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "DstarCallsign".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set D-STAR callsign data for a slot (DC write).
+    ///
+    /// Writes callsign and suffix data to one of the 6 D-STAR callsign slots.
+    ///
+    /// # Wire format
+    ///
+    /// `DC slot,callsign,suffix\r` where slot is 1-6, callsign is 8 characters
+    /// (space-padded), and suffix is up to 4 characters.
+    ///
+    /// # Parameters
+    ///
+    /// - `slot`: Callsign slot number (1-6).
+    /// - `callsign`: Callsign string (8 characters, space-padded to length).
+    /// - `suffix`: Callsign suffix (up to 4 characters, e.g., "D75A").
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_dstar_callsign(
+        &mut self,
+        slot: u8,
+        callsign: &str,
+        suffix: &str,
+    ) -> Result<(), Error> {
+        tracing::info!(slot, callsign, suffix, "setting D-STAR callsign");
+        let response = self
+            .execute(Command::SetDstarCallsign {
+                slot,
+                callsign: callsign.to_owned(),
+                suffix: suffix.to_owned(),
+            })
+            .await?;
+        match response {
+            Response::DstarCallsign { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "DstarCallsign".into(),
                 actual: format!("{other:?}").into_bytes(),

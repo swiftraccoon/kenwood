@@ -652,6 +652,150 @@ impl<T: Transport> Radio<T> {
         }
     }
 
+    /// Set fine tune on/off for a band (FT write).
+    ///
+    /// Per Operating Tips section 5.10.6: Fine Tune only works with AM modulation
+    /// and Band B. The write form takes a band parameter unlike the bare read.
+    ///
+    /// # Wire format
+    ///
+    /// `FT band,value\r` where band is 0 (A) or 1 (B) and value is 0 (off) or 1 (on).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_function_type(&mut self, band: Band, enabled: bool) -> Result<(), Error> {
+        tracing::info!(?band, enabled, "setting fine tune (FT)");
+        let response = self
+            .execute(Command::SetFunctionType { band, enabled })
+            .await?;
+        match response {
+            Response::FunctionType { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "FunctionType".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set the S-meter value for a band (SM write) -- calibration/test interface.
+    ///
+    /// # Warning
+    ///
+    /// This is likely a calibration or test/debug interface. Setting the S-meter
+    /// value directly may interfere with normal signal strength readings. The
+    /// exact behavior and persistence of written values is undocumented.
+    ///
+    /// # Wire format
+    ///
+    /// `SM band,level\r` where band is 0 (A) or 1 (B) and level is a hex nibble value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_smeter(&mut self, band: Band, level: u8) -> Result<(), Error> {
+        tracing::info!(?band, level, "setting S-meter (SM write, calibration)");
+        let response = self.execute(Command::SetSmeter { band, level }).await?;
+        match response {
+            Response::Smeter { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "Smeter".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set the busy/squelch state for a band (BY write) -- test/debug interface.
+    ///
+    /// # Warning
+    ///
+    /// This is likely a test or debug interface. Setting the busy state directly
+    /// may interfere with normal squelch operation. Use with caution.
+    ///
+    /// # Wire format
+    ///
+    /// `BY band,state\r` where band is 0 (A) or 1 (B) and state is 0 (not busy)
+    /// or 1 (busy).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_busy(&mut self, band: Band, busy: bool) -> Result<(), Error> {
+        tracing::info!(?band, busy, "setting busy state (BY write, test/debug)");
+        let response = self.execute(Command::SetBusy { band, busy }).await?;
+        match response {
+            Response::Busy { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "Busy".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set the firmware version string (FV write) -- factory programming command.
+    ///
+    /// # Safety
+    ///
+    /// **DANGEROUS FACTORY COMMAND.** This is intended for factory programming
+    /// only. Writing an incorrect firmware version string may brick the radio,
+    /// cause firmware validation failures, or void your warranty. **Do not use
+    /// unless you fully understand the consequences.**
+    ///
+    /// # Wire format
+    ///
+    /// `FV version\r`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_firmware_version(&mut self, version: &str) -> Result<(), Error> {
+        tracing::warn!(version, "setting firmware version (FACTORY COMMAND)");
+        let response = self
+            .execute(Command::SetFirmwareVersion {
+                version: version.to_owned(),
+            })
+            .await?;
+        match response {
+            Response::FirmwareVersion { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "FirmwareVersion".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set the radio model identification string (ID write) -- factory programming command.
+    ///
+    /// # Safety
+    ///
+    /// **DANGEROUS FACTORY COMMAND.** This is intended for factory programming
+    /// only. Writing an incorrect model ID may cause the radio to behave as a
+    /// different model, disable features, or brick the device. **Do not use
+    /// unless you fully understand the consequences.**
+    ///
+    /// # Wire format
+    ///
+    /// `ID model\r`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_radio_id(&mut self, model: &str) -> Result<(), Error> {
+        tracing::warn!(model, "setting radio model ID (FACTORY COMMAND)");
+        let response = self
+            .execute(Command::SetRadioId {
+                model: model.to_owned(),
+            })
+            .await?;
+        match response {
+            Response::RadioId { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "RadioId".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
     /// Get the filter width for a given mode index (SH read).
     ///
     /// `mode_index`: 0 = SSB, 1 = CW, 2 = AM.

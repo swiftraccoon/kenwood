@@ -84,10 +84,38 @@ pub enum Command {
     },
     /// Get firmware version (FV).
     GetFirmwareVersion,
+    /// Set firmware version (FV write) -- factory programming command.
+    ///
+    /// Wire format: `FV version\r`.
+    ///
+    /// # Safety
+    ///
+    /// **DANGEROUS FACTORY COMMAND.** This is intended for factory programming
+    /// only. Writing an incorrect firmware version string may brick the radio,
+    /// cause firmware validation failures, or void your warranty. **Do not use
+    /// unless you fully understand the consequences.**
+    SetFirmwareVersion {
+        /// Firmware version string to write.
+        version: String,
+    },
     /// Get power on/off status (PS read).
     GetPowerStatus,
     /// Get radio model ID (ID).
     GetRadioId,
+    /// Set radio model ID (ID write) -- factory programming command.
+    ///
+    /// Wire format: `ID model\r`.
+    ///
+    /// # Safety
+    ///
+    /// **DANGEROUS FACTORY COMMAND.** This is intended for factory programming
+    /// only. Writing an incorrect model ID may cause the radio to behave as a
+    /// different model, disable features, or brick the device. **Do not use
+    /// unless you fully understand the consequences.**
+    SetRadioId {
+        /// Model identification string to write.
+        model: String,
+    },
     /// Get beep setting (BE read).
     ///
     /// D75 RE: `BE x` (x: 0=off, 1=on).
@@ -214,6 +242,21 @@ pub enum Command {
         /// Target band.
         band: Band,
     },
+    /// Set S-meter value (SM write) -- calibration/test interface.
+    ///
+    /// Wire format: `SM band,level\r` (band 0-1, level is a hex nibble value).
+    ///
+    /// # Warning
+    ///
+    /// This is likely a calibration or test/debug interface. Setting the S-meter
+    /// value directly may interfere with normal signal strength readings. The
+    /// exact behavior and persistence of written values is undocumented.
+    SetSmeter {
+        /// Target band.
+        band: Band,
+        /// S-meter level value.
+        level: u8,
+    },
     /// Get operating mode (MD read).
     GetMode {
         /// Target band.
@@ -257,6 +300,18 @@ pub enum Command {
     ///
     /// Sends `FT\r` (bare). The radio returns the current function type.
     GetFunctionType,
+    /// Set fine tune on/off (FT write).
+    ///
+    /// Wire format: `FT band,value\r` (band 0-1, value 0=off, 1=on).
+    ///
+    /// Per Operating Tips section 5.10.6: Fine Tune only works with AM modulation
+    /// and Band B. The write form takes a band parameter unlike the bare read.
+    SetFunctionType {
+        /// Target band.
+        band: Band,
+        /// Whether fine tune is enabled.
+        enabled: bool,
+    },
     /// Get filter width by mode index (SH read).
     ///
     /// Per Operating Tips §5.10: SSB high-cut 2.2–3.0 kHz (Menu 120),
@@ -327,6 +382,20 @@ pub enum Command {
     GetBusy {
         /// Target band.
         band: Band,
+    },
+    /// Set busy/squelch state (BY write) -- test/debug interface.
+    ///
+    /// Wire format: `BY band,state\r` (band 0-1, state 0=not busy, 1=busy).
+    ///
+    /// # Warning
+    ///
+    /// This is likely a test or debug interface. Setting the busy state directly
+    /// may interfere with normal squelch operation. Use with caution.
+    SetBusy {
+        /// Target band.
+        band: Band,
+        /// Whether the channel is busy (squelch open).
+        busy: bool,
     },
     /// Get dual-band mode (DL read).
     GetDualBand,
@@ -399,8 +468,22 @@ pub enum Command {
     /// Per KI4LAX CAT reference: BL returns battery charge state.
     /// 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green),
     /// 4=Charging (observed on hardware when USB power is connected).
-    /// Read-only command — the radio does not accept BL writes.
     GetBatteryLevel,
+    /// Set battery level display (BL write).
+    ///
+    /// Wire format: `BL display,level\r` (7 bytes with comma).
+    ///
+    /// # Warning
+    ///
+    /// The exact purpose of this command is unclear. It may control the battery
+    /// display indicator or be a calibration/test interface. The `display` and
+    /// `level` parameter semantics are undocumented.
+    SetBatteryLevel {
+        /// Display parameter (semantics unknown).
+        display: u8,
+        /// Level parameter (semantics unknown).
+        level: u8,
+    },
     /// Get VOX delay (VD read).
     ///
     /// # Mode requirement
@@ -499,7 +582,22 @@ pub enum Command {
     ///
     /// The D75 RE misidentified this as CTCSS tone. On hardware, TN
     /// returns TNC mode data (e.g., `TN 0,0`).
+    ///
+    /// Valid mode values per firmware validation: 0, 1, 2, 3.
+    /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
     GetTncMode,
+    /// Set TNC mode (TN write).
+    ///
+    /// Wire format: `TN mode,setting\r`.
+    ///
+    /// Valid mode values per firmware validation: 0, 1, 2, 3.
+    /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
+    SetTncMode {
+        /// TNC mode value (0-3). Mode 3 may be MMDVM/Reflector Terminal.
+        mode: u8,
+        /// TNC setting value.
+        setting: u8,
+    },
     /// Get D-STAR callsign data for a slot (DC read).
     ///
     /// Hardware-verified: `DC slot\r` where slot is 1-6.
@@ -511,6 +609,19 @@ pub enum Command {
     GetDstarCallsign {
         /// Callsign slot (1-6). Slot 0 returns `N`.
         slot: u8,
+    },
+    /// Set D-STAR callsign for a slot (DC write).
+    ///
+    /// Wire format: `DC slot,callsign,suffix\r` where slot is 1-6,
+    /// callsign is 8 characters (space-padded), and suffix is up to
+    /// 4 characters.
+    SetDstarCallsign {
+        /// Callsign slot (1-6).
+        slot: u8,
+        /// Callsign string (8 chars, space-padded).
+        callsign: String,
+        /// Callsign suffix (up to 4 chars).
+        suffix: String,
     },
     /// Get real-time clock (RT bare read).
     ///
@@ -547,6 +658,15 @@ pub enum Command {
     GetBandScope {
         /// Target band.
         band: Band,
+    },
+    /// Set band scope configuration (BS write).
+    ///
+    /// Wire format: `BS band,value\r` (band 0-1, value meaning unknown).
+    SetBandScope {
+        /// Target band.
+        band: Band,
+        /// Band scope value (semantics unknown).
+        value: u8,
     },
 
     // === APRS (AS, PT, MS) ===
@@ -918,8 +1038,11 @@ pub enum Response {
     ///
     /// Hardware-verified: bare `TN\r` returns `TN mode,setting`.
     /// Example: `TN 0,0`.
+    ///
+    /// Valid mode values per firmware validation: 0, 1, 2, 3.
+    /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
     TncMode {
-        /// TNC mode value.
+        /// TNC mode value (0-3). Mode 3 may be MMDVM/Reflector Terminal.
         mode: u8,
         /// TNC setting value.
         setting: u8,
@@ -1113,9 +1236,9 @@ pub const fn command_name(cmd: &Command) -> &'static str {
     match cmd {
         Command::GetFrequency { .. } | Command::SetFrequency { .. } => "FQ",
         Command::GetFrequencyFull { .. } | Command::SetFrequencyFull { .. } => "FO",
-        Command::GetFirmwareVersion => "FV",
+        Command::GetFirmwareVersion | Command::SetFirmwareVersion { .. } => "FV",
         Command::GetPowerStatus => "PS",
-        Command::GetRadioId => "ID",
+        Command::GetRadioId | Command::SetRadioId { .. } => "ID",
         Command::GetBeep | Command::SetBeep { .. } => "BE",
         Command::GetPowerLevel { .. } | Command::SetPowerLevel { .. } => "PC",
         Command::GetBand | Command::SetBand { .. } => "BC",
@@ -1123,34 +1246,34 @@ pub const fn command_name(cmd: &Command) -> &'static str {
         Command::GetFmRadio | Command::SetFmRadio { .. } => "FR",
         Command::GetAfGain | Command::SetAfGain { .. } => "AG",
         Command::GetSquelch { .. } | Command::SetSquelch { .. } => "SQ",
-        Command::GetSmeter { .. } => "SM",
+        Command::GetSmeter { .. } | Command::SetSmeter { .. } => "SM",
         Command::GetMode { .. } | Command::SetMode { .. } => "MD",
         Command::GetFrequencyStep { .. } | Command::SetFrequencyStep { .. } => "FS",
-        Command::GetFunctionType => "FT",
+        Command::GetFunctionType | Command::SetFunctionType { .. } => "FT",
         Command::GetFilterWidth { .. } | Command::SetFilterWidth { .. } => "SH",
         Command::FrequencyUp { .. } => "UP",
         Command::FrequencyDown { .. } => "DW",
         Command::GetAttenuator { .. } | Command::SetAttenuator { .. } => "RA",
         Command::SetAutoInfo { .. } => "AI",
-        Command::GetBusy { .. } => "BY",
+        Command::GetBusy { .. } | Command::SetBusy { .. } => "BY",
         Command::GetDualBand | Command::SetDualBand { .. } => "DL",
         Command::Receive { .. } => "RX",
         Command::Transmit { .. } => "TX",
         Command::GetLock | Command::SetLock { .. } | Command::SetLockFull { .. } => "LC",
         Command::GetIoPort | Command::SetIoPort { .. } => "IO",
-        Command::GetBatteryLevel => "BL",
+        Command::GetBatteryLevel | Command::SetBatteryLevel { .. } => "BL",
         Command::GetVoxDelay | Command::SetVoxDelay { .. } => "VD",
         Command::GetVoxGain | Command::SetVoxGain { .. } => "VG",
         Command::GetVox | Command::SetVox { .. } => "VX",
         Command::GetCurrentChannel { .. } | Command::RecallMemoryChannel { .. } => "MR",
         Command::GetMemoryChannel { .. } | Command::SetMemoryChannel { .. } => "ME",
         Command::EnterProgrammingMode => "0M",
-        Command::GetTncMode => "TN",
-        Command::GetDstarCallsign { .. } => "DC",
+        Command::GetTncMode | Command::SetTncMode { .. } => "TN",
+        Command::GetDstarCallsign { .. } | Command::SetDstarCallsign { .. } => "DC",
         Command::GetRealTimeClock => "RT",
         Command::SetScanResume { .. } => "SR",
         Command::GetScanRange { .. } => "SF",
-        Command::GetBandScope { .. } => "BS",
+        Command::GetBandScope { .. } | Command::SetBandScope { .. } => "BS",
         Command::GetTncBaud | Command::SetTncBaud { .. } => "AS",
         Command::GetSerialInfo => "AE",
         Command::GetBeaconType | Command::SetBeaconType { .. } => "PT",
@@ -1212,8 +1335,10 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
             unreachable!("SetFrequencyFull handled by core::serialize_core_write")
         }
         Command::GetFirmwareVersion => "FV".to_owned(),
+        Command::SetFirmwareVersion { version } => format!("FV {version}"),
         Command::GetPowerStatus => "PS".to_owned(),
         Command::GetRadioId => "ID".to_owned(),
+        Command::SetRadioId { model } => format!("ID {model}"),
         Command::GetBeep => "BE".to_owned(),
         Command::SetBeep { enabled } => format!("BE {}", u8::from(*enabled)),
         Command::GetPowerLevel { band } => format!("PC {}", u8::from(*band)),
@@ -1242,6 +1367,9 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
             format!("SQ {},{}", u8::from(*band), level)
         }
         Command::GetSmeter { band } => format!("SM {}", u8::from(*band)),
+        Command::SetSmeter { band, level } => {
+            format!("SM {},{}", u8::from(*band), level)
+        }
         Command::GetMode { band } => format!("MD {}", u8::from(*band)),
         Command::SetMode { band, mode } => {
             format!("MD {},{}", u8::from(*band), u8::from(*mode))
@@ -1251,6 +1379,9 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
             format!("FS {},{}", u8::from(*band), u8::from(*step))
         }
         Command::GetFunctionType => "FT".to_owned(),
+        Command::SetFunctionType { band, enabled } => {
+            format!("FT {},{}", u8::from(*band), u8::from(*enabled))
+        }
         Command::GetFilterWidth { mode_index } => format!("SH {mode_index}"),
         Command::SetFilterWidth { mode_index, width } => {
             format!("SH {mode_index},{width}")
@@ -1265,6 +1396,9 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         // Control
         Command::SetAutoInfo { enabled } => format!("AI {}", u8::from(*enabled)),
         Command::GetBusy { band } => format!("BY {}", u8::from(*band)),
+        Command::SetBusy { band, busy } => {
+            format!("BY {},{}", u8::from(*band), u8::from(*busy))
+        }
         Command::GetDualBand => "DL".to_owned(),
         Command::SetDualBand { enabled } => format!("DL {}", u8::from(*enabled)),
         Command::Receive { band } => format!("RX {}", u8::from(*band)),
@@ -1290,6 +1424,7 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         Command::GetIoPort => "IO".to_owned(),
         Command::SetIoPort { value } => format!("IO {value}"),
         Command::GetBatteryLevel => "BL".to_owned(),
+        Command::SetBatteryLevel { display, level } => format!("BL {display},{level}"),
         Command::GetVoxDelay => "VD".to_owned(),
         Command::SetVoxDelay { delay } => format!("VD {delay}"),
         Command::GetVoxGain => "VG".to_owned(),
@@ -1314,13 +1449,22 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
 
         // TNC / D-STAR / Clock
         Command::GetTncMode => "TN".to_owned(),
+        Command::SetTncMode { mode, setting } => format!("TN {mode},{setting}"),
         Command::GetDstarCallsign { slot } => format!("DC {slot}"),
+        Command::SetDstarCallsign {
+            slot,
+            callsign,
+            suffix,
+        } => format!("DC {slot},{callsign},{suffix}"),
         Command::GetRealTimeClock => "RT".to_owned(),
 
         // Scan
         Command::SetScanResume { mode } => format!("SR {mode}"),
         Command::GetScanRange { band } => format!("SF {}", u8::from(*band)),
         Command::GetBandScope { band } => format!("BS {}", u8::from(*band)),
+        Command::SetBandScope { band, value } => {
+            format!("BS {},{}", u8::from(*band), value)
+        }
 
         // APRS
         Command::GetTncBaud => "AS".to_owned(),
@@ -1507,6 +1651,86 @@ mod tests {
     fn serialize_get_mcp_status() {
         let bytes = serialize(&Command::GetMcpStatus);
         assert_eq!(bytes, b"0E\r");
+    }
+
+    #[test]
+    fn serialize_set_dstar_callsign() {
+        let bytes = serialize(&Command::SetDstarCallsign {
+            slot: 1,
+            callsign: "KQ4NIT  ".to_owned(),
+            suffix: "D75A".to_owned(),
+        });
+        assert_eq!(bytes, b"DC 1,KQ4NIT  ,D75A\r");
+    }
+
+    #[test]
+    fn serialize_set_function_type() {
+        let bytes = serialize(&Command::SetFunctionType {
+            band: Band::A,
+            enabled: true,
+        });
+        assert_eq!(bytes, b"FT 0,1\r");
+    }
+
+    #[test]
+    fn serialize_set_smeter() {
+        let bytes = serialize(&Command::SetSmeter {
+            band: Band::B,
+            level: 5,
+        });
+        assert_eq!(bytes, b"SM 1,5\r");
+    }
+
+    #[test]
+    fn serialize_set_battery_level() {
+        let bytes = serialize(&Command::SetBatteryLevel {
+            display: 0,
+            level: 3,
+        });
+        assert_eq!(bytes, b"BL 0,3\r");
+    }
+
+    #[test]
+    fn serialize_set_busy() {
+        let bytes = serialize(&Command::SetBusy {
+            band: Band::A,
+            busy: true,
+        });
+        assert_eq!(bytes, b"BY 0,1\r");
+    }
+
+    #[test]
+    fn serialize_set_band_scope() {
+        let bytes = serialize(&Command::SetBandScope {
+            band: Band::B,
+            value: 1,
+        });
+        assert_eq!(bytes, b"BS 1,1\r");
+    }
+
+    #[test]
+    fn serialize_set_firmware_version() {
+        let bytes = serialize(&Command::SetFirmwareVersion {
+            version: "1.03".to_owned(),
+        });
+        assert_eq!(bytes, b"FV 1.03\r");
+    }
+
+    #[test]
+    fn serialize_set_radio_id() {
+        let bytes = serialize(&Command::SetRadioId {
+            model: "TH-D75".to_owned(),
+        });
+        assert_eq!(bytes, b"ID TH-D75\r");
+    }
+
+    #[test]
+    fn serialize_set_tnc_mode() {
+        let bytes = serialize(&Command::SetTncMode {
+            mode: 3,
+            setting: 0,
+        });
+        assert_eq!(bytes, b"TN 3,0\r");
     }
 
     #[test]

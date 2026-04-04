@@ -85,4 +85,26 @@ impl<T: Transport> Radio<T> {
             })),
         }
     }
+
+    /// Set band scope configuration for a band (BS write).
+    ///
+    /// # Wire format
+    ///
+    /// `BS band,value\r` where band is 0 (A) or 1 (B). The exact meaning
+    /// of the value parameter is unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_band_scope(&mut self, band: Band, value: u8) -> Result<(), Error> {
+        tracing::info!(?band, value, "setting band scope configuration");
+        let response = self.execute(Command::SetBandScope { band, value }).await?;
+        match response {
+            Response::BandScope { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "BandScope".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
 }
