@@ -17,6 +17,7 @@ pub mod gps;
 pub mod memory;
 pub mod programming;
 pub mod scan;
+pub mod service;
 pub mod system;
 pub mod tuning;
 

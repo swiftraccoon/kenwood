@@ -21,6 +21,7 @@ pub mod memory;
 pub mod programming;
 pub mod scan;
 pub mod sd;
+pub mod service;
 pub mod tone;
 pub mod user;
 pub mod vfo;
@@ -816,6 +817,292 @@ pub enum Command {
     /// Returns `N` (not available) in normal operating mode. This mnemonic
     /// appears to be MCP-related. Its full behavior is unknown.
     GetMcpStatus,
+
+    // === Service Mode (factory calibration/test — requires `0G KENWOOD` first) ===
+    /// Enter factory service mode (0G write).
+    ///
+    /// Wire format: `0G KENWOOD\r`. The radio validates the "KENWOOD"
+    /// password and switches from the standard 53-command CAT table to
+    /// the 34-entry service mode table. Normal commands will not work
+    /// until service mode is exited with [`ExitServiceMode`](Command::ExitServiceMode).
+    ///
+    /// Discovered via Ghidra RE of TH-D75 V1.03 firmware at 0xC006F464.
+    EnterServiceMode,
+
+    /// Exit factory service mode (0G bare).
+    ///
+    /// Wire format: `0G\r`. Exits service mode and restores the standard
+    /// CAT command table. The 0G handler accepts both the bare form (exit)
+    /// and the `0G KENWOOD` form (entry).
+    ///
+    /// Discovered via Ghidra RE of TH-D75 V1.03 firmware at 0xC006F464.
+    ExitServiceMode,
+
+    /// Read factory calibration data (0S read).
+    ///
+    /// Wire format: `0S\r`. Reads 200 bytes of factory calibration data
+    /// (118 bytes from 0x4E000 + 82 bytes from a second address).
+    /// Response is hex-encoded calibration data.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F508.
+    ReadCalibrationData,
+
+    /// Write factory calibration data (0R write).
+    ///
+    /// Wire format: `0R data\r` where data is 400 hex characters encoding
+    /// 200 bytes. Total wire length is 404 bytes (2 mnemonic + 1 space +
+    /// 400 hex + 1 CR). Writes to the same addresses as 0S.
+    ///
+    /// # Safety
+    ///
+    /// **CRITICAL: Can corrupt factory calibration.** Incorrect data will
+    /// desynchronize RF calibration tables. Recovery may require professional
+    /// recalibration with test equipment. Always read calibration first (0S)
+    /// and keep a backup before writing.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F546.
+    WriteCalibrationData {
+        /// 400 hex characters (200 bytes of calibration data).
+        data: String,
+    },
+
+    /// Get service/MCP status (0E service mode read).
+    ///
+    /// Wire format: `0E\r`. Reads 3 bytes from address 0x110 (hardware
+    /// status register). In service mode, 0E returns actual status data
+    /// rather than `N` (not available) as in normal mode.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F4B0.
+    GetServiceStatus,
+
+    /// Service calibration parameter read/write (1A).
+    ///
+    /// Wire format: `1A\r` (read, 3 bytes). Delegates to the firmware's
+    /// command executor for calibration parameter access.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F5D0.
+    ServiceCalibrate1A,
+
+    /// Service calibration parameter read/write (1D).
+    ///
+    /// Wire format: `1D\r` (read, 3 bytes). Same executor-based pattern
+    /// as 1A.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F5E4.
+    ServiceCalibrate1D,
+
+    /// Service calibration parameter read/write (1E).
+    ///
+    /// Wire format: `1E\r` (read, 3 bytes) or `1E XXX\r` (write, 6 bytes
+    /// = 2 mnemonic + 1 space + 3 value). The firmware accepts both forms.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F5F8.
+    ServiceCalibrate1E {
+        /// Optional 3-character value for write. `None` for read.
+        value: Option<String>,
+    },
+
+    /// Service calibration parameter read/write (1N).
+    ///
+    /// Wire format: `1N\r` (read, 3 bytes). Same executor-based pattern
+    /// as 1A.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F6D0.
+    ServiceCalibrate1N,
+
+    /// Service calibration parameter read/write (1V).
+    ///
+    /// Wire format: `1V\r` (read, 3 bytes) or `1V XXX\r` (write, 6 bytes).
+    /// Same dual-mode pattern as 1E.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F740.
+    ServiceCalibrate1V {
+        /// Optional 3-character value for write. `None` for read.
+        value: Option<String>,
+    },
+
+    /// Service calibration single parameter write (1W).
+    ///
+    /// Wire format: `1W X\r` (write only, 5 bytes total).
+    /// Single-character parameter, likely a mode or flag toggle.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F766.
+    ServiceCalibrate1W {
+        /// Single-character parameter value.
+        value: String,
+    },
+
+    /// Write factory callsign/serial number (1I write).
+    ///
+    /// Wire format: `1I XXXXXXXX,YYY\r` (16 bytes total = 2 mnemonic +
+    /// 1 space + 8 hex chars + 1 comma + 3 hex chars + 1 CR). The firmware
+    /// validates all characters are alphanumeric (0-9, A-Z, a-z).
+    ///
+    /// # Safety
+    ///
+    /// **HIGH RISK: Changes the radio's factory serial number / callsign.**
+    /// This may void the warranty and could cause regulatory issues.
+    /// The original values should be backed up before any modification.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F61E.
+    ServiceWriteId {
+        /// 8-character hex identifier (factory callsign part).
+        id: String,
+        /// 3-character hex code.
+        code: String,
+    },
+
+    /// Raw flash memory read/write (1F).
+    ///
+    /// Wire format for write: `1F AAAAAA,data\r` where AAAAAA is a 6-digit
+    /// hex address (max 0x4FFFF) and data is hex-encoded bytes. The firmware
+    /// validates that address + length does not exceed 0x50000. Read form
+    /// is context-dependent on the executor.
+    ///
+    /// # Safety
+    ///
+    /// **CRITICAL: Can brick the radio.** Raw flash writes can overwrite
+    /// boot code, calibration data, or firmware. There is no recovery
+    /// mechanism short of JTAG or factory repair. Never write to flash
+    /// addresses without understanding the memory map.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F780.
+    ServiceFlashRead,
+
+    /// Raw flash memory write (1F write).
+    ///
+    /// Wire format: `1F AAAAAA,data\r` where AAAAAA is 6-digit hex address
+    /// and data is hex-encoded bytes.
+    ///
+    /// # Safety
+    ///
+    /// **CRITICAL: Can brick the radio.** See [`ServiceFlashRead`](Command::ServiceFlashRead).
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F780.
+    ServiceFlashWrite {
+        /// 6-digit hex flash address (0x000000 to 0x04FFFF).
+        address: String,
+        /// Hex-encoded data bytes to write.
+        data: String,
+    },
+
+    /// Generic write via executor (0W).
+    ///
+    /// Wire format: `0W\r` (3 bytes). Delegates to the firmware's command
+    /// executor. The exact write operation depends on the executor's
+    /// internal state.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F5BC.
+    ServiceWriteConfig,
+
+    /// Service mode band selection (0Y).
+    ///
+    /// Wire format: `0Y band\r` (5 bytes total). Band is 0 or 1.
+    /// Band 0 calls `radio_caller_06ef1c()`, band 1 calls
+    /// `ipc_caller_06eef6()` — different code paths for the two
+    /// receiver chains.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F4D0.
+    ServiceBandSelect {
+        /// Band number (0 or 1).
+        band: u8,
+    },
+
+    /// Bulk EEPROM/calibration data export (9E read).
+    ///
+    /// Wire format: `9E AAAAAA,LL\r` (13 bytes = 2 mnemonic + 1 space +
+    /// 6-digit hex address + 1 comma + 2-digit hex length + 1 CR).
+    /// Reads up to 256 bytes from the specified address. Length 0 means 256.
+    /// Address + length must not exceed 0x50000.
+    ///
+    /// Response is 128-byte formatted hex data.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F826.
+    ServiceReadEeprom {
+        /// 6-digit hex address (max 0x4FFFF).
+        address: String,
+        /// 2-digit hex length (00 = 256 bytes).
+        length: String,
+    },
+
+    /// Targeted calibration read at specific offset (9R read).
+    ///
+    /// Wire format: `9R\r` (3 bytes). Returns 4 bytes of formatted
+    /// calibration data at the current offset. The offset is determined
+    /// by internal firmware state.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F8CA.
+    ServiceReadEepromAddr,
+
+    /// Get internal version/variant information (2V).
+    ///
+    /// Wire format: `2V XX,YYY\r` (10 bytes = 2 mnemonic + 1 space +
+    /// 2-digit hex param + 1 comma + 3-digit hex param + 1 CR).
+    /// Returns internal model code (e.g., EX-5210), build date, hardware
+    /// revision, and calibration date.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F910.
+    ServiceGetVersion {
+        /// 2-digit hex parameter.
+        param1: String,
+        /// 3-digit hex parameter.
+        param2: String,
+    },
+
+    /// Get hardware register / GPIO status (1G read).
+    ///
+    /// Wire format: `1G\r` (3 bytes). Returns hex-encoded hardware
+    /// register values with a comma separator. Used for factory testing
+    /// of GPIO and peripheral status.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F9A8.
+    ServiceGetHardware,
+
+    /// New calibration command in D75 (1C write).
+    ///
+    /// Wire format: `1C XXX\r` (7 bytes = 2 mnemonic + 1 space + 3-digit
+    /// hex value + 1 CR). Value must be less than 0x100 (256). Not present
+    /// in the D74 firmware — likely related to the 220 MHz band (D75A)
+    /// or enhanced DSP.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006FA08.
+    ServiceCalibrateNew {
+        /// 3-digit hex value (0x000 to 0x0FF).
+        value: String,
+    },
+
+    /// Dynamic-length hardware configuration (1U).
+    ///
+    /// Wire format: `1U\r` (read, 3 bytes) or `1U data\r` (write, dynamic
+    /// length determined by reading a hardware register). The firmware
+    /// calls `os_disable_interrupts()` in the error path — this is a
+    /// low-level hardware configuration command.
+    ///
+    /// Requires service mode (`0G KENWOOD` first).
+    /// Discovered via Ghidra RE at 0xC006F6E4.
+    ServiceDynamicParam {
+        /// Optional data for write. `None` for read.
+        data: Option<String>,
+    },
 }
 
 /// A parsed response from the radio.
@@ -1221,6 +1508,70 @@ pub enum Response {
         value: String,
     },
 
+    // === Service Mode ===
+    /// Service mode entry/exit response (0G).
+    ServiceMode {
+        /// Raw response data.
+        data: String,
+    },
+    /// Factory calibration data response (0S).
+    ServiceCalibrationData {
+        /// Hex-encoded 200-byte calibration data.
+        data: String,
+    },
+    /// Calibration data write acknowledgment (0R).
+    ServiceCalibrationWrite {
+        /// Response data (typically echo).
+        data: String,
+    },
+    /// Individual calibration parameter response (1A, 1D, 1E, 1N, 1V, 1W, 1C, 1U).
+    ServiceCalibrationParam {
+        /// The command mnemonic that generated this response.
+        mnemonic: String,
+        /// Raw response data.
+        data: String,
+    },
+    /// Write config acknowledgment (0W).
+    ServiceWriteConfig {
+        /// Response data.
+        data: String,
+    },
+    /// Band select response (0Y).
+    ServiceBandSelect {
+        /// Response data.
+        data: String,
+    },
+    /// Factory ID write acknowledgment (1I).
+    ServiceWriteId {
+        /// Response data.
+        data: String,
+    },
+    /// Flash read/write response (1F).
+    ServiceFlash {
+        /// Hex-encoded flash data or write acknowledgment.
+        data: String,
+    },
+    /// EEPROM bulk data response (9E).
+    ServiceEepromData {
+        /// Hex-encoded EEPROM/calibration data.
+        data: String,
+    },
+    /// EEPROM targeted read response (9R).
+    ServiceEepromAddr {
+        /// 4-byte formatted calibration data.
+        data: String,
+    },
+    /// Internal version/variant response (2V).
+    ServiceVersion {
+        /// Version/variant information string.
+        data: String,
+    },
+    /// Hardware register/GPIO status response (1G).
+    ServiceHardware {
+        /// Hex-encoded register values.
+        data: String,
+    },
+
     // === Special ===
     /// Write acknowledgment (radio echoes the command).
     Ok,
@@ -1288,7 +1639,27 @@ pub const fn command_name(cmd: &Command) -> &'static str {
         Command::GetSdCard => "SD",
         Command::GetUserSettings => "US",
         Command::GetRadioType => "TY",
-        Command::GetMcpStatus => "0E",
+        Command::GetMcpStatus | Command::GetServiceStatus => "0E",
+        // Service mode
+        Command::EnterServiceMode | Command::ExitServiceMode => "0G",
+        Command::ReadCalibrationData => "0S",
+        Command::WriteCalibrationData { .. } => "0R",
+        Command::ServiceCalibrate1A => "1A",
+        Command::ServiceCalibrate1D => "1D",
+        Command::ServiceCalibrate1E { .. } => "1E",
+        Command::ServiceCalibrate1N => "1N",
+        Command::ServiceCalibrate1V { .. } => "1V",
+        Command::ServiceCalibrate1W { .. } => "1W",
+        Command::ServiceWriteId { .. } => "1I",
+        Command::ServiceFlashRead | Command::ServiceFlashWrite { .. } => "1F",
+        Command::ServiceWriteConfig => "0W",
+        Command::ServiceBandSelect { .. } => "0Y",
+        Command::ServiceReadEeprom { .. } => "9E",
+        Command::ServiceReadEepromAddr => "9R",
+        Command::ServiceGetVersion { .. } => "2V",
+        Command::ServiceGetHardware => "1G",
+        Command::ServiceCalibrateNew { .. } => "1C",
+        Command::ServiceDynamicParam { .. } => "1U",
     }
 }
 
@@ -1520,7 +1891,39 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
 
         // Extra
         Command::GetRadioType => "TY".to_owned(),
-        Command::GetMcpStatus => "0E".to_owned(),
+        Command::GetMcpStatus | Command::GetServiceStatus => "0E".to_owned(),
+
+        // Service mode
+        Command::EnterServiceMode => "0G KENWOOD".to_owned(),
+        Command::ExitServiceMode => "0G".to_owned(),
+        Command::ReadCalibrationData => "0S".to_owned(),
+        Command::WriteCalibrationData { data } => format!("0R {data}"),
+        Command::ServiceCalibrate1A => "1A".to_owned(),
+        Command::ServiceCalibrate1D => "1D".to_owned(),
+        Command::ServiceCalibrate1E { value: None } => "1E".to_owned(),
+        Command::ServiceCalibrate1E {
+            value: Some(value), ..
+        } => format!("1E {value}"),
+        Command::ServiceCalibrate1N => "1N".to_owned(),
+        Command::ServiceCalibrate1V { value: None } => "1V".to_owned(),
+        Command::ServiceCalibrate1V {
+            value: Some(value), ..
+        } => format!("1V {value}"),
+        Command::ServiceCalibrate1W { value } => format!("1W {value}"),
+        Command::ServiceWriteId { id, code } => format!("1I {id},{code}"),
+        Command::ServiceFlashRead => "1F".to_owned(),
+        Command::ServiceFlashWrite { address, data } => format!("1F {address},{data}"),
+        Command::ServiceWriteConfig => "0W".to_owned(),
+        Command::ServiceBandSelect { band } => format!("0Y {band}"),
+        Command::ServiceReadEeprom { address, length } => format!("9E {address},{length}"),
+        Command::ServiceReadEepromAddr => "9R".to_owned(),
+        Command::ServiceGetVersion { param1, param2 } => format!("2V {param1},{param2}"),
+        Command::ServiceGetHardware => "1G".to_owned(),
+        Command::ServiceCalibrateNew { value } => format!("1C {value}"),
+        Command::ServiceDynamicParam { data: None } => "1U".to_owned(),
+        Command::ServiceDynamicParam {
+            data: Some(data), ..
+        } => format!("1U {data}"),
     };
 
     let mut bytes = body.into_bytes();
@@ -1583,7 +1986,8 @@ pub fn parse(frame: &[u8]) -> Result<Response, ProtocolError> {
         .or_else(|| gps::parse_gps(mnemonic, payload))
         .or_else(|| bluetooth::parse_bluetooth(mnemonic, payload))
         .or_else(|| sd::parse_sd(mnemonic, payload))
-        .or_else(|| user::parse_user(mnemonic, payload));
+        .or_else(|| user::parse_user(mnemonic, payload))
+        .or_else(|| service::parse_service(mnemonic, payload));
 
     match result {
         Some(Ok(response)) => {
@@ -1734,9 +2138,9 @@ mod tests {
     }
 
     #[test]
-    fn all_55_mnemonics_recognized() {
-        // All 55 known mnemonics. SR is write-only but its echo is still
-        // recognized by the parser (returns Ok).
+    fn all_mnemonics_recognized() {
+        // All 55 standard mnemonics + 15 service mode mnemonics.
+        // SR is write-only but its echo is still recognized by the parser.
         let mnemonics = [
             "AI", "AG", "BC", "BY", "DL", "DW", "ME", "MR", "PC", "RX", "SQ", "SR", "SH", "TX",
             "UP", "VM", "FQ", "FO", "PS", "FV", "BE", "ID", "CS", "TN", "BL", "GP", "GM", "SM",
@@ -1744,8 +2148,11 @@ mod tests {
             "PT", "AS", "DC", "DS", "RT", "FR", "US", "GW", "SD", "0M", "AE",
             // Extra mnemonics not in main dispatch table
             "TY", "0E",
+            // Service mode mnemonics (20 commands, 15 unique mnemonics after 0E overlap)
+            "0G", "0S", "0R", "0W", "0Y", "1A", "1D", "1E", "1I", "1N", "1U", "1V", "1W", "1F",
+            "9E", "9R", "2V", "1G", "1C",
         ];
-        assert_eq!(mnemonics.len(), 55);
+        assert_eq!(mnemonics.len(), 74);
         for mnemonic in &mnemonics {
             let input = format!("{mnemonic} 0");
             let result = parse(input.as_bytes());
@@ -1753,6 +2160,247 @@ mod tests {
                 panic!("Mnemonic '{mnemonic}' not recognized by parser");
             }
             // Other errors (FieldParse, etc.) are OK — the test only checks recognition
+        }
+    }
+
+    // === Service mode serialization tests ===
+
+    #[test]
+    fn serialize_enter_service_mode() {
+        let bytes = serialize(&Command::EnterServiceMode);
+        assert_eq!(bytes, b"0G KENWOOD\r");
+    }
+
+    #[test]
+    fn serialize_exit_service_mode() {
+        let bytes = serialize(&Command::ExitServiceMode);
+        assert_eq!(bytes, b"0G\r");
+    }
+
+    #[test]
+    fn serialize_read_calibration_data() {
+        let bytes = serialize(&Command::ReadCalibrationData);
+        assert_eq!(bytes, b"0S\r");
+    }
+
+    #[test]
+    fn serialize_write_calibration_data() {
+        let bytes = serialize(&Command::WriteCalibrationData {
+            data: "AABBCCDD".to_owned(),
+        });
+        assert_eq!(bytes, b"0R AABBCCDD\r");
+    }
+
+    #[test]
+    fn serialize_get_service_status() {
+        let bytes = serialize(&Command::GetServiceStatus);
+        assert_eq!(bytes, b"0E\r");
+    }
+
+    #[test]
+    fn serialize_service_calibrate_1a() {
+        let bytes = serialize(&Command::ServiceCalibrate1A);
+        assert_eq!(bytes, b"1A\r");
+    }
+
+    #[test]
+    fn serialize_service_calibrate_1d() {
+        let bytes = serialize(&Command::ServiceCalibrate1D);
+        assert_eq!(bytes, b"1D\r");
+    }
+
+    #[test]
+    fn serialize_service_calibrate_1e_read() {
+        let bytes = serialize(&Command::ServiceCalibrate1E { value: None });
+        assert_eq!(bytes, b"1E\r");
+    }
+
+    #[test]
+    fn serialize_service_calibrate_1e_write() {
+        let bytes = serialize(&Command::ServiceCalibrate1E {
+            value: Some("0FF".to_owned()),
+        });
+        assert_eq!(bytes, b"1E 0FF\r");
+    }
+
+    #[test]
+    fn serialize_service_calibrate_1n() {
+        let bytes = serialize(&Command::ServiceCalibrate1N);
+        assert_eq!(bytes, b"1N\r");
+    }
+
+    #[test]
+    fn serialize_service_calibrate_1v_read() {
+        let bytes = serialize(&Command::ServiceCalibrate1V { value: None });
+        assert_eq!(bytes, b"1V\r");
+    }
+
+    #[test]
+    fn serialize_service_calibrate_1v_write() {
+        let bytes = serialize(&Command::ServiceCalibrate1V {
+            value: Some("ABC".to_owned()),
+        });
+        assert_eq!(bytes, b"1V ABC\r");
+    }
+
+    #[test]
+    fn serialize_service_calibrate_1w() {
+        let bytes = serialize(&Command::ServiceCalibrate1W {
+            value: "5".to_owned(),
+        });
+        assert_eq!(bytes, b"1W 5\r");
+    }
+
+    #[test]
+    fn serialize_service_write_id() {
+        let bytes = serialize(&Command::ServiceWriteId {
+            id: "C3C10368".to_owned(),
+            code: "K01".to_owned(),
+        });
+        assert_eq!(bytes, b"1I C3C10368,K01\r");
+    }
+
+    #[test]
+    fn serialize_service_flash_read() {
+        let bytes = serialize(&Command::ServiceFlashRead);
+        assert_eq!(bytes, b"1F\r");
+    }
+
+    #[test]
+    fn serialize_service_flash_write() {
+        let bytes = serialize(&Command::ServiceFlashWrite {
+            address: "04E000".to_owned(),
+            data: "AABB".to_owned(),
+        });
+        assert_eq!(bytes, b"1F 04E000,AABB\r");
+    }
+
+    #[test]
+    fn serialize_service_write_config() {
+        let bytes = serialize(&Command::ServiceWriteConfig);
+        assert_eq!(bytes, b"0W\r");
+    }
+
+    #[test]
+    fn serialize_service_band_select() {
+        let bytes = serialize(&Command::ServiceBandSelect { band: 0 });
+        assert_eq!(bytes, b"0Y 0\r");
+    }
+
+    #[test]
+    fn serialize_service_read_eeprom() {
+        let bytes = serialize(&Command::ServiceReadEeprom {
+            address: "04E000".to_owned(),
+            length: "80".to_owned(),
+        });
+        assert_eq!(bytes, b"9E 04E000,80\r");
+    }
+
+    #[test]
+    fn serialize_service_read_eeprom_addr() {
+        let bytes = serialize(&Command::ServiceReadEepromAddr);
+        assert_eq!(bytes, b"9R\r");
+    }
+
+    #[test]
+    fn serialize_service_get_version() {
+        let bytes = serialize(&Command::ServiceGetVersion {
+            param1: "00".to_owned(),
+            param2: "000".to_owned(),
+        });
+        assert_eq!(bytes, b"2V 00,000\r");
+    }
+
+    #[test]
+    fn serialize_service_get_hardware() {
+        let bytes = serialize(&Command::ServiceGetHardware);
+        assert_eq!(bytes, b"1G\r");
+    }
+
+    #[test]
+    fn serialize_service_calibrate_new() {
+        let bytes = serialize(&Command::ServiceCalibrateNew {
+            value: "0A5".to_owned(),
+        });
+        assert_eq!(bytes, b"1C 0A5\r");
+    }
+
+    #[test]
+    fn serialize_service_dynamic_param_read() {
+        let bytes = serialize(&Command::ServiceDynamicParam { data: None });
+        assert_eq!(bytes, b"1U\r");
+    }
+
+    #[test]
+    fn serialize_service_dynamic_param_write() {
+        let bytes = serialize(&Command::ServiceDynamicParam {
+            data: Some("AABB".to_owned()),
+        });
+        assert_eq!(bytes, b"1U AABB\r");
+    }
+
+    // === Service mode parse tests ===
+
+    #[test]
+    fn parse_service_mode_response() {
+        let r = parse(b"0G").unwrap();
+        assert!(matches!(r, Response::ServiceMode { .. }));
+    }
+
+    #[test]
+    fn parse_service_calibration_data() {
+        let r = parse(b"0S AABBCCDD").unwrap();
+        match r {
+            Response::ServiceCalibrationData { data } => assert_eq!(data, "AABBCCDD"),
+            other => panic!("expected ServiceCalibrationData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_service_calibration_param_1a() {
+        let r = parse(b"1A 123").unwrap();
+        match r {
+            Response::ServiceCalibrationParam { mnemonic, data } => {
+                assert_eq!(mnemonic, "1A");
+                assert_eq!(data, "123");
+            }
+            other => panic!("expected ServiceCalibrationParam, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_service_version() {
+        let r = parse(b"2V EX-5210").unwrap();
+        match r {
+            Response::ServiceVersion { data } => assert_eq!(data, "EX-5210"),
+            other => panic!("expected ServiceVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_service_hardware() {
+        let r = parse(b"1G AA,BB").unwrap();
+        match r {
+            Response::ServiceHardware { data } => assert_eq!(data, "AA,BB"),
+            other => panic!("expected ServiceHardware, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_service_eeprom_data() {
+        let r = parse(b"9E AABBCCDD").unwrap();
+        match r {
+            Response::ServiceEepromData { data } => assert_eq!(data, "AABBCCDD"),
+            other => panic!("expected ServiceEepromData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_service_eeprom_addr() {
+        let r = parse(b"9R 01020304").unwrap();
+        match r {
+            Response::ServiceEepromAddr { data } => assert_eq!(data, "01020304"),
+            other => panic!("expected ServiceEepromAddr, got {other:?}"),
         }
     }
 }
