@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn frame_with_commas() {
         let mut codec = Codec::new();
-        codec.feed(b"FO 0,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,08,08,000,0,,0,00\r");
+        codec.feed(b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r");
         let frame = codec.next_frame().unwrap();
         assert!(frame.starts_with(b"FO"));
     }

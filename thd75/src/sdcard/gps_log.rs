@@ -427,4 +427,43 @@ $GPGGA,,,,,,0,,,,,,,,*66\n";
         let valid = log.valid_fixes();
         assert!(valid.is_empty(), "no valid fixes indoors");
     }
+
+    #[test]
+    fn parse_real_d75_live_fix() {
+        // Synthetic NMEA matching D75 format (real structure, fake coordinates)
+        // Build sentences with valid checksums
+        let rmc1 = "$GPRMC,120000.00,A,4052.1234,N,07356.5678,W,2.5,180.0,010126,5.2,E,A";
+        let gga1 = "$GPGGA,120000.00,4052.1234,N,07356.5678,W,1,07,1.2,250.5,M,-33.0,M,,";
+        let rmc2 = "$GPRMC,120001.00,A,4052.1300,N,07356.5700,W,0.0,0.0,010126,5.2,E,A";
+        let gga2 = "$GPGGA,120001.00,4052.1300,N,07356.5700,W,1,05,1.5,250.6,M,-33.0,M,,";
+
+        let mut data = String::new();
+        for s in [rmc1, gga1, rmc2, gga2] {
+            let cs: u8 = s[1..].bytes().fold(0u8, |acc, b| acc ^ b);
+            data.push_str(&format!("{s}*{cs:02X}\n"));
+        }
+
+        let log = parse(data.as_bytes()).unwrap();
+        assert_eq!(log.errors, 0, "all checksums valid");
+        assert_eq!(log.sentences.len(), 4);
+
+        let rmc = log.rmc_fixes();
+        assert_eq!(rmc.len(), 2);
+        assert!(rmc[0].valid);
+        assert_eq!(rmc[0].utc_time, "120000.00");
+        assert_eq!(rmc[0].date, "010126");
+
+        let pos = rmc[0].position.as_ref().expect("should have fix");
+        // 40°52.1234'N = 40.86872°N
+        assert!((pos.latitude - 40.8687).abs() < 0.001);
+        // 073°56.5678'W = -73.94280°W
+        assert!((pos.longitude - (-73.9428)).abs() < 0.001);
+        assert!((rmc[0].speed_knots - 2.5).abs() < 0.1);
+
+        let gga = log.gga_fixes();
+        assert_eq!(gga.len(), 2);
+        assert_eq!(gga[0].quality, 1);
+        assert_eq!(gga[0].satellites, 7);
+        assert!((gga[0].altitude_m - 250.5).abs() < 0.1);
+    }
 }

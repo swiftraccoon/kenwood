@@ -123,15 +123,17 @@ fn parse_me_channel_001() {
 
 #[test]
 fn parse_me_with_tone_settings() {
-    // ME with non-default step, shift, and tone settings to verify field
-    // alignment after the extra field at index 14.
-    let raw = b"ME 005,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,0,08,08,000,0,,0,00,0";
+    // Real D75 ME response for CH 003 (CTCSS enabled, tone code 27)
+    // Hardware-verified via probes/fo_field_map.rs
+    let raw = b"ME 003,0155340000,0000600000,0,0,0,0,0,0,1,0,0,0,0,0,27,27,000,0,CQCQCQ,0,00,0";
     let r = protocol::parse(raw).unwrap();
     match r {
         Response::MemoryChannel { channel, data } => {
-            assert_eq!(channel, 5);
-            assert_eq!(data.rx_frequency, Frequency::new(145_000_000));
-            assert!(data.tone_enable);
+            assert_eq!(channel, 3);
+            assert_eq!(data.rx_frequency, Frequency::new(155_340_000));
+            // field[8]=1 → CTCSS enable → maps to byte[10] bit 6
+            // In our struct, ctcss is stored via flags_0a_raw bit 6
+            assert_eq!(data.flags_0a_raw & 0x40, 0x40);
         }
         other => panic!("expected MemoryChannel, got {other:?}"),
     }
@@ -175,14 +177,14 @@ async fn execute_timeout_field_exists() {
 
 #[test]
 fn parse_fo_21_fields_still_works() {
-    let raw = b"FO 0,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,08,08,000,0,,0,00";
+    let raw = b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00";
     let r = protocol::parse(raw).unwrap();
     assert!(matches!(r, Response::FrequencyFull { .. }));
 }
 
 #[test]
 fn parse_fq_21_fields_still_works() {
-    let raw = b"FQ 0,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,08,08,000,0,,0,00";
+    let raw = b"FQ 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00";
     let r = protocol::parse(raw).unwrap();
     assert!(matches!(r, Response::Frequency { .. }));
 }

@@ -36,7 +36,9 @@ fn our_mnemonics() -> Vec<&'static str> {
         command_name(&Command::GetMode { band: Band::A }),      // MD
         command_name(&Command::GetFrequencyStep { band: Band::A }), // FS
         command_name(&Command::GetFunctionType),                // FT
-        command_name(&Command::GetFilterWidth { mode_index: 0 }), // SH
+        command_name(&Command::GetFilterWidth {
+            mode: FilterMode::Ssb,
+        }), // SH
         command_name(&Command::FrequencyUp { band: Band::A }),  // UP
         command_name(&Command::FrequencyDown { band: Band::A }), // DW
         command_name(&Command::GetAttenuator { band: Band::A }), // RA
@@ -293,12 +295,13 @@ fn dw_is_write_only_per_spec() {
 
 #[test]
 fn sq_range_matches_spec() {
-    for level in 0..=6u8 {
-        let frame = format!("SQ 0,{level}");
+    for raw in 0..=6u8 {
+        let frame = format!("SQ 0,{raw}");
         let response = protocol::parse(frame.as_bytes()).unwrap();
+        let expected = SquelchLevel::new(raw).unwrap();
         assert!(
-            matches!(response, Response::Squelch { band: Band::A, level: l } if l == level),
-            "SQ 0,{level} should parse successfully"
+            matches!(response, Response::Squelch { band: Band::A, level } if level == expected),
+            "SQ 0,{raw} should parse successfully"
         );
     }
 }
@@ -311,7 +314,7 @@ fn sq_range_matches_spec() {
 fn ag_write_is_3_digit_per_spec() {
     let bytes = protocol::serialize(&Command::SetAfGain {
         band: Band::A,
-        level: 15,
+        level: AfGainLevel::new(15).unwrap(),
     });
     let wire = String::from_utf8(bytes).unwrap();
     let payload = wire.trim_end_matches('\r').strip_prefix("AG ").unwrap();
@@ -329,12 +332,13 @@ fn ag_write_is_3_digit_per_spec() {
 
 #[test]
 fn sm_range_matches_spec() {
-    for level in 0..=5u8 {
-        let frame = format!("SM 0,{level}");
+    for raw in 0..=5u8 {
+        let frame = format!("SM 0,{raw}");
         let response = protocol::parse(frame.as_bytes()).unwrap();
+        let expected = SMeterReading::new(raw).unwrap();
         assert!(
-            matches!(response, Response::Smeter { band: Band::A, level: l } if l == level),
-            "SM 0,{level} should parse successfully"
+            matches!(response, Response::Smeter { band: Band::A, level } if level == expected),
+            "SM 0,{raw} should parse successfully"
         );
     }
 }

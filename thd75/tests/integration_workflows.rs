@@ -19,7 +19,7 @@ async fn full_session_from_fixture() {
     radio.set_auto_info(true).await.unwrap();
 
     let level = radio.get_smeter(Band::A).await.unwrap();
-    assert_eq!(level, 5);
+    assert_eq!(level, kenwood_thd75::types::SMeterReading::new(5).unwrap());
 
     radio
         .set_power_level(Band::A, PowerLevel::Low)
@@ -47,7 +47,7 @@ async fn frequency_change_workflow() {
     // Read current frequency
     mock.expect(
         b"FO 0\r",
-        b"FO 0,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,08,08,000,0,,0,00\r",
+        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
     );
     // Change mode
     mock.expect(b"MD 0,1\r", b"MD 0,1\r");
@@ -58,7 +58,10 @@ async fn frequency_change_workflow() {
     let ch = radio.get_frequency_full(Band::A).await.unwrap();
     assert_eq!(ch.rx_frequency.as_hz(), 145_000_000);
     radio.set_mode(Band::A, Mode::Dv).await.unwrap();
-    assert_eq!(radio.get_smeter(Band::A).await.unwrap(), 3);
+    assert_eq!(
+        radio.get_smeter(Band::A).await.unwrap(),
+        kenwood_thd75::types::SMeterReading::new(3).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -66,7 +69,7 @@ async fn memory_channel_workflow() {
     let mut mock = MockTransport::new();
     mock.expect(
         b"ME 005\r",
-        b"ME 005,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,0,08,08,000,0,,0,00,0\r",
+        b"ME 005,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00,0\r",
     );
 
     let mut radio = Radio::connect(mock).await.unwrap();
@@ -82,7 +85,10 @@ async fn audio_settings_workflow() {
     mock.expect(b"VX\r", b"VX 0\r");
 
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_af_gain().await.unwrap(), 20);
+    assert_eq!(
+        radio.get_af_gain().await.unwrap(),
+        kenwood_thd75::types::AfGainLevel::new(20).unwrap()
+    );
     let (tnc_mode, tnc_setting) = radio.get_tnc_mode().await.unwrap();
     assert_eq!(tnc_mode, 0);
     assert_eq!(tnc_setting, 0);

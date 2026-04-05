@@ -2,7 +2,7 @@
 
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;
-use kenwood_thd75::types::Band;
+use kenwood_thd75::types::{Band, FilterMode, VfoMemoryMode};
 
 // ---- BC: get_band / set_band ----
 
@@ -40,7 +40,7 @@ async fn get_vfo_memory_mode() {
     mock.expect(b"VM 0\r", b"VM 0,0\r");
     let mut radio = Radio::connect(mock).await.unwrap();
     let mode = radio.get_vfo_memory_mode(Band::A).await.unwrap();
-    assert_eq!(mode, 0);
+    assert_eq!(mode, VfoMemoryMode::Vfo);
 }
 
 #[tokio::test]
@@ -49,7 +49,7 @@ async fn get_vfo_memory_mode_memory() {
     mock.expect(b"VM 1\r", b"VM 1,1\r");
     let mut radio = Radio::connect(mock).await.unwrap();
     let mode = radio.get_vfo_memory_mode(Band::B).await.unwrap();
-    assert_eq!(mode, 1);
+    assert_eq!(mode, VfoMemoryMode::Memory);
 }
 
 #[tokio::test]
@@ -57,7 +57,10 @@ async fn set_vfo_memory_mode() {
     let mut mock = MockTransport::new();
     mock.expect(b"VM 0,2\r", b"VM 0,2\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio.set_vfo_memory_mode(Band::A, 2).await.unwrap();
+    radio
+        .set_vfo_memory_mode(Band::A, VfoMemoryMode::Call)
+        .await
+        .unwrap();
 }
 
 // ---- MR: recall_channel ----
@@ -146,7 +149,7 @@ async fn get_filter_width() {
     let mut mock = MockTransport::new();
     mock.expect(b"SH 0\r", b"SH 0,3\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_filter_width(0).await.unwrap(), 3);
+    assert_eq!(radio.get_filter_width(FilterMode::Ssb).await.unwrap(), 3);
 }
 
 // ---- SH: set_filter_width ----
@@ -156,7 +159,7 @@ async fn set_filter_width() {
     let mut mock = MockTransport::new();
     mock.expect(b"SH 0,3\r", b"SH 0,3\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio.set_filter_width(0, 3).await.unwrap();
+    radio.set_filter_width(FilterMode::Ssb, 3).await.unwrap();
 }
 
 // ---- IO: get_io_port / set_io_port ----

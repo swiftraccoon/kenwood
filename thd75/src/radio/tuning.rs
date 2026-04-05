@@ -147,18 +147,17 @@ impl<T: Transport> Radio<T> {
 
         // If unknown, query the radio.
         if current.is_none() {
-            let mode_val = self.get_vfo_memory_mode(band).await?;
-            if let Some(actual) = RadioMode::from_vm_value(mode_val) {
-                if actual == target {
-                    tracing::debug!(?band, ?target, "queried mode matches target");
-                    return Ok(());
-                }
+            let vfo_mode = self.get_vfo_memory_mode(band).await?;
+            let actual = RadioMode::from_vfo_mode(vfo_mode);
+            if actual == target {
+                tracing::debug!(?band, ?target, "queried mode matches target");
+                return Ok(());
             }
         }
 
         // Switch mode.
         tracing::info!(?band, ?target, "switching band mode");
-        self.set_vfo_memory_mode(band, target.as_vm_value()).await?;
+        self.set_vfo_memory_mode(band, target.as_vfo_mode()).await?;
 
         Ok(())
     }
@@ -170,17 +169,18 @@ mod tests {
     use crate::transport::MockTransport;
 
     /// A typical FO response for Band A at 145.000 MHz.
+    /// Field layout verified against real D75 hardware (see probes/fo_field_map.rs).
     const FO_RESPONSE_145: &[u8] =
-        b"FO 0,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,08,08,000,0,,0,00\r";
+        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r";
 
     /// FO write command for 146.520 MHz (preserving other fields from
     /// `FO_RESPONSE_145` except the RX frequency).
     const FO_WRITE_146520: &[u8] =
-        b"FO 0,0146520000,0000600000,5,1,0,1,0,0,0,0,0,0,0,08,08,000,0,,0,00\r";
+        b"FO 0,0146520000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r";
 
     /// FO response echoed after writing 146.520 MHz.
     const FO_RESPONSE_146520: &[u8] =
-        b"FO 0,0146520000,0000600000,5,1,0,1,0,0,0,0,0,0,0,08,08,000,0,,0,00\r";
+        b"FO 0,0146520000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r";
 
     /// FQ short response for Band A at 146.520 MHz.
     const FQ_RESPONSE_146520: &[u8] = b"FQ 0,0146520000\r";

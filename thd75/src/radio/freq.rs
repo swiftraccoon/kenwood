@@ -29,7 +29,10 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::{Band, ChannelMemory, Mode, PowerLevel, StepSize};
+use crate::types::{
+    Band, ChannelMemory, FilterMode, Mode, PowerLevel, SMeterReading, SquelchLevel, StepSize,
+    VfoMemoryMode,
+};
 
 use super::Radio;
 
@@ -192,7 +195,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_squelch(&mut self, band: Band) -> Result<u8, Error> {
+    pub async fn get_squelch(&mut self, band: Band) -> Result<SquelchLevel, Error> {
         tracing::debug!(?band, "reading squelch level");
         let response = self.execute(Command::GetSquelch { band }).await?;
         match response {
@@ -219,8 +222,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_squelch(&mut self, band: Band, level: u8) -> Result<(), Error> {
-        tracing::debug!(?band, level, "setting squelch level");
+    pub async fn set_squelch(&mut self, band: Band, level: SquelchLevel) -> Result<(), Error> {
+        tracing::debug!(?band, ?level, "setting squelch level");
         let response = self.execute(Command::SetSquelch { band, level }).await?;
         match response {
             Response::Squelch { .. } => Ok(()),
@@ -263,7 +266,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_smeter(&mut self, band: Band) -> Result<u8, Error> {
+    pub async fn get_smeter(&mut self, band: Band) -> Result<SMeterReading, Error> {
         tracing::debug!(?band, "reading S-meter");
         let response = self.execute(Command::GetSmeter { band }).await?;
         match response {
@@ -454,7 +457,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_vfo_memory_mode(&mut self, band: Band) -> Result<u8, Error> {
+    pub async fn get_vfo_memory_mode(&mut self, band: Band) -> Result<VfoMemoryMode, Error> {
         tracing::debug!(?band, "reading VFO/Memory mode");
         let response = self.execute(Command::GetVfoMemoryMode { band }).await?;
         match response {
@@ -473,8 +476,12 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_vfo_memory_mode(&mut self, band: Band, mode: u8) -> Result<(), Error> {
-        tracing::info!(?band, mode, "setting VFO/Memory mode");
+    pub async fn set_vfo_memory_mode(
+        &mut self,
+        band: Band,
+        mode: VfoMemoryMode,
+    ) -> Result<(), Error> {
+        tracing::info!(?band, ?mode, "setting VFO/Memory mode");
         let response = self
             .execute(Command::SetVfoMemoryMode { band, mode })
             .await?;
@@ -693,8 +700,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_smeter(&mut self, band: Band, level: u8) -> Result<(), Error> {
-        tracing::info!(?band, level, "setting S-meter (SM write, calibration)");
+    pub async fn set_smeter(&mut self, band: Band, level: SMeterReading) -> Result<(), Error> {
+        tracing::info!(?band, ?level, "setting S-meter (SM write, calibration)");
         let response = self.execute(Command::SetSmeter { band, level }).await?;
         match response {
             Response::Smeter { .. } => Ok(()),
@@ -803,9 +810,9 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_filter_width(&mut self, mode_index: u8) -> Result<u8, Error> {
-        tracing::debug!(mode_index, "reading filter width");
-        let response = self.execute(Command::GetFilterWidth { mode_index }).await?;
+    pub async fn get_filter_width(&mut self, mode: FilterMode) -> Result<u8, Error> {
+        tracing::debug!(?mode, "reading filter width");
+        let response = self.execute(Command::GetFilterWidth { mode }).await?;
         match response {
             Response::FilterWidth { width, .. } => Ok(width),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -824,10 +831,10 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_filter_width(&mut self, mode_index: u8, width: u8) -> Result<(), Error> {
-        tracing::info!(mode_index, width, "setting filter width");
+    pub async fn set_filter_width(&mut self, mode: FilterMode, width: u8) -> Result<(), Error> {
+        tracing::info!(?mode, width, "setting filter width");
         let response = self
-            .execute(Command::SetFilterWidth { mode_index, width })
+            .execute(Command::SetFilterWidth { mode, width })
             .await?;
         match response {
             Response::FilterWidth { .. } => Ok(()),

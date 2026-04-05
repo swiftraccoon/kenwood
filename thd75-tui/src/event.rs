@@ -36,7 +36,7 @@ pub enum RadioCommand {
     /// Set the squelch level for the given band (SQ write — verified working).
     SetSquelch {
         band: kenwood_thd75::types::Band,
-        level: u8,
+        level: kenwood_thd75::types::SquelchLevel,
     },
     /// Toggle the attenuator for the given band (RA write — verified working).
     SetAttenuator {

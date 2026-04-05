@@ -18,7 +18,7 @@ use crate::error::{ProtocolError, ValidationError};
 use crate::types::dstar::DstarCallsign;
 use crate::types::frequency::Frequency;
 use crate::types::mode::{MemoryMode, ShiftDirection, StepSize};
-use crate::types::tone::{CtcssMode, DataSpeed, DcsCode, LockoutMode, ToneCode};
+use crate::types::tone::{CtcssMode, DcsCode, ToneCode};
 
 /// D-STAR URCALL callsign (up to 8 characters, stored in 24 bytes).
 ///
@@ -91,45 +91,79 @@ impl ChannelName {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelMemory {
-    /// RX frequency in Hz (offset 0x00, 4 bytes, little-endian).
+    /// RX frequency in Hz (byte 0x00, 4 bytes, little-endian).
     pub rx_frequency: Frequency,
-    /// TX offset or split TX frequency in Hz (offset 0x04, 4 bytes, little-endian).
+    /// TX offset or split TX frequency in Hz (byte 0x04, 4 bytes, little-endian).
     pub tx_offset: Frequency,
-    /// Frequency step size (offset 0x08 high nibble).
+    /// Frequency step size (byte 0x08 high nibble).
     pub step_size: StepSize,
-    /// Shift direction (offset 0x08 low nibble).
-    pub shift: ShiftDirection,
-    /// Reverse mode (offset 0x09 bit 4).
-    pub reverse: bool,
-    /// Tone encode enable (offset 0x09 bit 2).
-    pub tone_enable: bool,
-    /// CTCSS mode (offset 0x09 bits 1:0).
-    pub ctcss_mode: CtcssMode,
-    /// DCS enable (offset 0x0A bit 7).
-    pub dcs_enable: bool,
-    /// Cross-tone reverse DCS polarity (offset 0x0A bit 6).
-    pub cross_tone_reverse: bool,
-    /// Raw bits for byte 0x0A bits \[5:0\] -- unknown/opaque, preserved for round-trip.
-    pub flags_0a_raw: u8,
-    /// Tone encoder frequency code index (offset 0x0B).
-    pub tone_code: ToneCode,
-    /// CTCSS decoder frequency code index (offset 0x0C).
-    pub ctcss_code: ToneCode,
-    /// DCS code index (offset 0x0D).
-    pub dcs_code: DcsCode,
-    /// Data speed (offset 0x0E high nibble).
-    pub data_speed: DataSpeed,
-    /// Channel lockout mode (offset 0x0E bits 1:0).
-    pub lockout: LockoutMode,
-    /// D-STAR URCALL destination callsign (offset 0x0F, 24 bytes).
+    /// Raw byte 0x09 — mode and fine tuning configuration.
     ///
-    /// This field stores the D-STAR "UR" (your) callsign, defaulting to
-    /// "CQCQCQ" for general CQ calls. Despite being labeled "Channel Name"
-    /// in some documentation, this is NOT the user-assigned memory channel
-    /// display name. Channel display names are stored separately in flash
-    /// and are only accessible via the MCP programming interface.
+    /// Bit layout (from `FlashChannel` RE):
+    /// - bit 7: reserved
+    /// - bits 6:4: operating mode (0=FM, 1=DV, 2=AM, 3=LSB, 4=USB, 5=CW, 6=NFM)
+    /// - bit 3: narrow FM flag
+    /// - bit 2: fine tuning enable
+    /// - bits 1:0: fine step size
+    ///
+    /// In the CAT wire format (FO/ME), byte\[9\] is unpacked into fields \[3\]-\[6\]:
+    /// `tx_step`, `mode`, `fine_tuning`, `fine_step`. The binary packer preserves
+    /// this byte directly for round-trip fidelity.
+    pub mode_flags_raw: u8,
+    /// Shift direction (byte 0x08 low nibble in binary format).
+    ///
+    /// In the binary packer, this field is written to byte 0x08 low nibble.
+    /// In the CAT wire format, shift is at field\[12\] and also encoded in
+    /// `flags_0a_raw` bits 2:0. Both should carry the same value.
+    pub shift: ShiftDirection,
+    /// Reverse mode (derived from `flags_0a_raw` bit 3).
+    pub reverse: bool,
+    /// Tone encode enable (derived from `flags_0a_raw` bit 7).
+    pub tone_enable: bool,
+    /// CTCSS mode (derived from `flags_0a_raw` bit 6).
+    pub ctcss_mode: CtcssMode,
+    /// DCS enable (derived from `flags_0a_raw` bit 5).
+    pub dcs_enable: bool,
+    /// Cross-tone enable (derived from `flags_0a_raw` bit 4).
+    pub cross_tone_reverse: bool,
+    /// Raw byte 0x0A — source of truth for tone/shift configuration.
+    ///
+    /// Hardware-verified bit layout (20 channels, 0 exceptions):
+    /// - bit 7: tone encode enable
+    /// - bit 6: CTCSS enable
+    /// - bit 5: DCS enable
+    /// - bit 4: cross-tone enable
+    /// - bit 3: reverse
+    /// - bits 2:0: shift direction (0=simplex, 1=+, 2=-, 4=split)
+    ///
+    /// The individual bool fields above are convenience accessors that
+    /// MUST be consistent with this byte. The binary packer (`to_bytes`)
+    /// writes this byte directly; `from_bytes` derives the bools from it.
+    pub flags_0a_raw: u8,
+    /// Tone encoder frequency code index (byte 0x0B).
+    pub tone_code: ToneCode,
+    /// CTCSS decoder frequency code index (byte 0x0C).
+    pub ctcss_code: ToneCode,
+    /// DCS code index (byte 0x0D).
+    pub dcs_code: DcsCode,
+    /// Cross-tone combination type (byte 0x0E bits 5:4, range 0-3).
+    ///
+    /// CAT wire field 16. Controls how TX and RX tone types are combined
+    /// when cross-tone mode is enabled (`cross_tone_reverse` / byte 0x0A bit 4).
+    pub cross_tone_combo: CrossToneType,
+    /// Digital squelch mode (byte 0x0E bits 1:0, range 0-2).
+    ///
+    /// CAT wire field 18: 0=Off, 1=Code Squelch, 2=Callsign Squelch.
+    /// Note: channel lockout (ME field 22) is stored separately in MCP
+    /// flags region at offset 0x2000, not here.
+    pub digital_squelch: FlashDigitalSquelch,
+    /// D-STAR URCALL destination callsign (byte 0x0F, 24 bytes).
+    ///
+    /// Stores the D-STAR "UR" (your) callsign, defaulting to "CQCQCQ"
+    /// for general CQ calls. Display names are stored separately in MCP
+    /// at offset 0x10000.
     pub urcall: ChannelName,
-    /// Data mode / extra field (offset 0x27).
+    /// Digital code (CAT wire field 19, 2 digits).
     pub data_mode: u8,
 }
 
@@ -151,15 +185,13 @@ impl ChannelMemory {
         // byte 0x08: step_size (high nibble) | shift (low nibble)
         buf[0x08] = (u8::from(self.step_size) << 4) | u8::from(self.shift);
 
-        // byte 0x09: reverse (bit 4) | tone_enable (bit 2) | ctcss_mode (bits 1:0)
-        buf[0x09] = (u8::from(self.reverse) << 4)
-            | (u8::from(self.tone_enable) << 2)
-            | u8::from(self.ctcss_mode);
+        // byte 0x09: mode + fine tuning flags (preserved as raw byte)
+        buf[0x09] = self.mode_flags_raw;
 
-        // byte 0x0A: dcs_enable (bit 7) | cross_tone_reverse (bit 6) | flags_0a_raw (bits 5:0)
-        buf[0x0A] = (u8::from(self.dcs_enable) << 7)
-            | (u8::from(self.cross_tone_reverse) << 6)
-            | (self.flags_0a_raw & 0x3F);
+        // byte 0x0A: flags_0a_raw (all 8 bits — hardware-verified mapping):
+        //   bit 7 = tone encode, bit 6 = CTCSS, bit 5 = DCS, bit 4 = cross-tone,
+        //   bit 3 = reverse, bits 2:0 = shift direction
+        buf[0x0A] = self.flags_0a_raw;
 
         // byte 0x0B: tone code index
         buf[0x0B] = self.tone_code.index();
@@ -170,8 +202,10 @@ impl ChannelMemory {
         // byte 0x0D: DCS code index
         buf[0x0D] = self.dcs_code.index();
 
-        // byte 0x0E: data_speed (high nibble) | lockout (bits 1:0)
-        buf[0x0E] = (u8::from(self.data_speed) << 4) | u8::from(self.lockout);
+        // byte 0x0E: cross_tone_combo (bits 5:4) | data_speed=3 (bits 3:2) | digital_squelch (bits 1:0)
+        buf[0x0E] = ((u8::from(self.cross_tone_combo) & 0x03) << 4)
+            | 0x0C
+            | (u8::from(self.digital_squelch) & 0x03);
 
         // bytes[0x0F..0x27]: URCALL callsign (24 bytes)
         buf[0x0F..0x27].copy_from_slice(&self.urcall.to_bytes());
@@ -220,19 +254,30 @@ impl ChannelMemory {
             }
         })?;
 
-        let reverse = (bytes[0x09] >> 4) & 1 != 0;
-        let tone_enable = (bytes[0x09] >> 2) & 1 != 0;
+        // byte 0x09: mode + fine tuning flags (preserved as raw byte)
+        let mode_flags_raw = bytes[0x09];
 
-        let ctcss_mode =
-            CtcssMode::try_from(bytes[0x09] & 0x03).map_err(|e| ProtocolError::FieldParse {
+        // byte 0x0A: all 8 bits (hardware-verified mapping)
+        let flags_0a_raw = bytes[0x0A];
+        let tone_enable = (flags_0a_raw >> 7) & 1 != 0;
+        let ctcss_enable = (flags_0a_raw >> 6) & 1 != 0;
+        let dcs_enable = (flags_0a_raw >> 5) & 1 != 0;
+        let cross_tone_reverse = (flags_0a_raw >> 4) & 1 != 0;
+        let reverse = (flags_0a_raw >> 3) & 1 != 0;
+
+        let ctcss_mode = if ctcss_enable {
+            CtcssMode::try_from(1u8).map_err(|e| ProtocolError::FieldParse {
                 command: "channel".into(),
                 field: "ctcss_mode".into(),
                 detail: e.to_string(),
-            })?;
-
-        let dcs_enable = (bytes[0x0A] >> 7) & 1 != 0;
-        let cross_tone_reverse = (bytes[0x0A] >> 6) & 1 != 0;
-        let flags_0a_raw = bytes[0x0A] & 0x3F;
+            })?
+        } else {
+            CtcssMode::try_from(0u8).map_err(|e| ProtocolError::FieldParse {
+                command: "channel".into(),
+                field: "ctcss_mode".into(),
+                detail: e.to_string(),
+            })?
+        };
 
         let tone_code = ToneCode::new(bytes[0x0B]).map_err(|e| ProtocolError::FieldParse {
             command: "channel".into(),
@@ -252,19 +297,21 @@ impl ChannelMemory {
             detail: e.to_string(),
         })?;
 
-        let data_speed =
-            DataSpeed::try_from(bytes[0x0E] >> 4).map_err(|e| ProtocolError::FieldParse {
+        // byte 0x0E: cross_tone_combo (bits 5:4) | digital_squelch (bits 1:0)
+        let cross_tone_combo = CrossToneType::try_from((bytes[0x0E] >> 4) & 0x03).map_err(|e| {
+            ProtocolError::FieldParse {
                 command: "channel".into(),
-                field: "data_speed".into(),
+                field: "cross_tone_combo".into(),
                 detail: e.to_string(),
-            })?;
-
-        let lockout =
-            LockoutMode::try_from(bytes[0x0E] & 0x03).map_err(|e| ProtocolError::FieldParse {
+            }
+        })?;
+        let digital_squelch = FlashDigitalSquelch::try_from(bytes[0x0E] & 0x03).map_err(|e| {
+            ProtocolError::FieldParse {
                 command: "channel".into(),
-                field: "lockout".into(),
+                field: "digital_squelch".into(),
                 detail: e.to_string(),
-            })?;
+            }
+        })?;
 
         let mut urcall_arr = [0u8; 24];
         urcall_arr.copy_from_slice(&bytes[0x0F..0x27]);
@@ -276,6 +323,7 @@ impl ChannelMemory {
             rx_frequency,
             tx_offset,
             step_size,
+            mode_flags_raw,
             shift,
             reverse,
             tone_enable,
@@ -286,8 +334,8 @@ impl ChannelMemory {
             tone_code,
             ctcss_code,
             dcs_code,
-            data_speed,
-            lockout,
+            cross_tone_combo,
+            digital_squelch,
             urcall,
             data_mode,
         })
@@ -798,6 +846,7 @@ impl Default for ChannelMemory {
             rx_frequency: Frequency::new(0),
             tx_offset: Frequency::new(0),
             step_size: StepSize::Hz5000,
+            mode_flags_raw: 0,
             shift: ShiftDirection::SIMPLEX,
             reverse: false,
             tone_enable: false,
@@ -811,8 +860,8 @@ impl Default for ChannelMemory {
             ctcss_code: ToneCode::new(0).expect("0 is valid tone code"),
             // Safety: 0 is always a valid index for DcsCode (0..=103)
             dcs_code: DcsCode::new(0).expect("0 is valid DCS code"),
-            data_speed: DataSpeed::Bps1200,
-            lockout: LockoutMode::Off,
+            cross_tone_combo: CrossToneType::DtcsDtcs,
+            digital_squelch: FlashDigitalSquelch::Off,
             urcall: ChannelName::default(),
             data_mode: 0,
         }
@@ -825,7 +874,7 @@ mod tests {
     use crate::error::ValidationError;
     use crate::types::frequency::Frequency;
     use crate::types::mode::{ShiftDirection, StepSize};
-    use crate::types::tone::{CtcssMode, DataSpeed, DcsCode, LockoutMode, ToneCode};
+    use crate::types::tone::{CtcssMode, DcsCode, ToneCode};
 
     #[test]
     fn channel_name_valid() {
@@ -880,22 +929,25 @@ mod tests {
 
     #[test]
     fn channel_memory_round_trip_simplex_vhf() {
+        // flags_0a_raw must be consistent with individual fields for round-trip
+        // tone=bit7, shift=bits2:0=1 → flags_0a_raw = 0x81
         let ch = ChannelMemory {
             rx_frequency: Frequency::new(145_000_000),
             tx_offset: Frequency::new(600_000),
             step_size: StepSize::Hz12500,
+            mode_flags_raw: 0,
             shift: ShiftDirection::UP,
             reverse: false,
             tone_enable: true,
             ctcss_mode: CtcssMode::Off,
             dcs_enable: false,
             cross_tone_reverse: false,
-            flags_0a_raw: 0,
+            flags_0a_raw: 0x81, // tone(bit7) + shift+(bit0)
             tone_code: ToneCode::new(8).unwrap(),
             ctcss_code: ToneCode::new(8).unwrap(),
             dcs_code: DcsCode::new(0).unwrap(),
-            data_speed: DataSpeed::Bps1200,
-            lockout: LockoutMode::Off,
+            cross_tone_combo: CrossToneType::DtcsDtcs,
+            digital_squelch: FlashDigitalSquelch::Off,
             urcall: ChannelName::new("").unwrap(),
             data_mode: 0,
         };
@@ -918,6 +970,7 @@ mod tests {
 
     #[test]
     fn channel_memory_byte09_packing() {
+        // byte[9] is now zeroed in to_bytes (mode/fine not individually modeled)
         let ch = ChannelMemory {
             reverse: true,
             tone_enable: true,
@@ -925,19 +978,21 @@ mod tests {
             ..ChannelMemory::default()
         };
         let bytes = ch.to_bytes();
-        assert_eq!(bytes[0x09], 0x15); // (1<<4) | (1<<2) | 1
+        assert_eq!(bytes[0x09], 0x00);
     }
 
     #[test]
     fn channel_memory_byte0a_packing() {
+        // byte[0x0A] is stored directly from flags_0a_raw (hardware-verified)
+        // tone=bit7, ctcss=bit6, dcs=bit5, cross=bit4, reverse=bit3, shift=bits2:0
         let ch = ChannelMemory {
             dcs_enable: true,
             cross_tone_reverse: true,
-            flags_0a_raw: 0,
+            flags_0a_raw: 0xB0, // dcs(bit5) + cross(bit4) + tone(bit7)... actually just set directly
             ..ChannelMemory::default()
         };
         let bytes = ch.to_bytes();
-        assert_eq!(bytes[0x0A], 0xC0); // 0b1100_0000
+        assert_eq!(bytes[0x0A], 0xB0);
     }
 
     #[test]
@@ -957,12 +1012,12 @@ mod tests {
     #[test]
     fn channel_memory_byte0e_packing() {
         let ch = ChannelMemory {
-            data_speed: DataSpeed::Bps9600,
-            lockout: LockoutMode::On,
+            cross_tone_combo: CrossToneType::ToneDtcs,
+            digital_squelch: FlashDigitalSquelch::Code,
             ..ChannelMemory::default()
         };
         let bytes = ch.to_bytes();
-        assert_eq!(bytes[0x0E], 0x11); // (1<<4) | 1
+        assert_eq!(bytes[0x0E], 0x1D); // (1<<4) | 0x0C | 1
     }
 
     #[test]

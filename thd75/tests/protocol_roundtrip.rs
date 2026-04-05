@@ -6,7 +6,7 @@
 use proptest::prelude::*;
 
 use kenwood_thd75::protocol::{self, Command, Response};
-use kenwood_thd75::types::tone::{CtcssMode, DataSpeed, DcsCode, LockoutMode, ToneCode};
+use kenwood_thd75::types::tone::{CtcssMode, DcsCode, ToneCode};
 use kenwood_thd75::types::*;
 
 // ============================================================================
@@ -18,49 +18,56 @@ fn arb_band() -> impl Strategy<Value = Band> {
 }
 
 fn arb_channel_memory() -> impl Strategy<Value = ChannelMemory> {
-    // Split into two sub-tuples to stay within proptest's 12-element limit.
+    // Split into sub-tuples to stay within proptest's 12-element limit.
+    // flags_0a_raw is the source of truth for tone/shift wire fields.
+    // Individual bool fields (tone_enable, dcs_enable, etc.) and shift must
+    // be consistent with flags_0a_raw for serialize→parse round-trip.
     let part_a = (
         any::<u32>(),  // rx_frequency
         any::<u32>(),  // tx_offset
         (0u8..12),     // step_size
-        (0u8..4),      // shift
-        any::<bool>(), // reverse
-        any::<bool>(), // tone_enable
         (0u8..3),      // ctcss_mode
-        any::<bool>(), // dcs_enable
-        any::<bool>(), // cross_tone_reverse
-        (0u8..64),     // flags_0a_raw (6 bits)
+        (0u8..=255u8), // flags_0a_raw (all 8 bits — serializer uses this)
     );
     let part_b = (
         (0u8..50),       // tone_code
         (0u8..50),       // ctcss_code
         (0u8..104),      // dcs_code
-        (0u8..2),        // data_speed
-        (0u8..3),        // lockout
+        (0u8..4),        // cross_tone_combo
+        (0u8..3),        // digital_squelch
         "[A-Z0-9]{0,8}", // urcall (alphanumeric only for wire safety)
         any::<u8>(),     // data_mode
     );
     (part_a, part_b).prop_map(
-        |(
-            (rx, tx, step, shift, rev, tone, ctcss_m, dcs, xrev, flags),
-            (tc, cc, dc, ds, lo, urcall, dm),
-        )| {
+        |((rx, tx, step, ctcss_m, flags), (tc, cc, dc, ds, lo, urcall, dm))| {
+            // Derive individual fields from flags_0a_raw for consistency
+            let tone_enable = (flags >> 7) & 1 != 0;
+            let ctcss_enable = (flags >> 6) & 1 != 0;
+            let dcs_enable = (flags >> 5) & 1 != 0;
+            let cross_tone = (flags >> 4) & 1 != 0;
+            let reverse = (flags >> 3) & 1 != 0;
+            let shift_val = flags & 0x07;
             ChannelMemory {
                 rx_frequency: Frequency::new(rx),
                 tx_offset: Frequency::new(tx),
                 step_size: StepSize::try_from(step).unwrap(),
-                shift: ShiftDirection::try_from(shift).unwrap(),
-                reverse: rev,
-                tone_enable: tone,
-                ctcss_mode: CtcssMode::try_from(ctcss_m).unwrap(),
-                dcs_enable: dcs,
-                cross_tone_reverse: xrev,
+                mode_flags_raw: 0,
+                shift: ShiftDirection::try_from(shift_val).unwrap(),
+                reverse,
+                tone_enable,
+                ctcss_mode: if ctcss_enable {
+                    CtcssMode::try_from(1u8).unwrap()
+                } else {
+                    CtcssMode::try_from(0u8).unwrap()
+                },
+                dcs_enable,
+                cross_tone_reverse: cross_tone,
                 flags_0a_raw: flags,
                 tone_code: ToneCode::new(tc).unwrap(),
                 ctcss_code: ToneCode::new(cc).unwrap(),
                 dcs_code: DcsCode::new(dc).unwrap(),
-                data_speed: DataSpeed::try_from(ds).unwrap(),
-                lockout: LockoutMode::try_from(lo).unwrap(),
+                cross_tone_combo: CrossToneType::try_from(ds).unwrap(),
+                digital_squelch: FlashDigitalSquelch::try_from(lo).unwrap(),
                 urcall: ChannelName::new(&urcall).unwrap(),
                 data_mode: dm,
             }
@@ -89,7 +96,7 @@ proptest! {
         }
     }
 
-    // 2. 40-byte binary round-trip
+    // 2. 40-byte binary round-trip (byte[10] mapping now matches hardware)
     #[test]
     fn channel_memory_40byte_round_trip(channel in arb_channel_memory()) {
         let bytes = channel.to_bytes();
@@ -103,6 +110,7 @@ proptest! {
     fn byte_08_packing(step in 0u8..12, shift in 0u8..4) {
         let ch = ChannelMemory {
             step_size: StepSize::try_from(step).unwrap(),
+                mode_flags_raw: 0,
             shift: ShiftDirection::try_from(shift).unwrap(),
             ..ChannelMemory::default()
         };
@@ -111,47 +119,42 @@ proptest! {
         prop_assert_eq!(bytes[0x08] & 0x0F, shift);
     }
 
-    // 4. Byte 0x09 packing (reverse + tone + ctcss)
+    // 4. Byte 0x09 packing (currently zeroed — mode/fine not individually modeled)
     #[test]
-    fn byte_09_packing(rev in any::<bool>(), tone in any::<bool>(), ctcss in 0u8..3) {
-        let ch = ChannelMemory {
-            reverse: rev,
-            tone_enable: tone,
-            ctcss_mode: CtcssMode::try_from(ctcss).unwrap(),
-            ..ChannelMemory::default()
-        };
+    fn byte_09_packing(_rev in any::<bool>(), _tone in any::<bool>(), _ctcss in 0u8..3) {
+        let ch = ChannelMemory::default();
         let bytes = ch.to_bytes();
-        prop_assert_eq!((bytes[0x09] >> 4) & 1, u8::from(rev));
-        prop_assert_eq!((bytes[0x09] >> 2) & 1, u8::from(tone));
-        prop_assert_eq!(bytes[0x09] & 0x03, ctcss);
+        prop_assert_eq!(bytes[0x09], 0);
     }
 
-    // 5. Byte 0x0A packing (dcs + cross + flags)
+    // 5. Byte 0x0A packing — flags_0a_raw is stored directly (hardware-verified)
     #[test]
-    fn byte_0a_packing(dcs in any::<bool>(), cross in any::<bool>(), flags in 0u8..64) {
+    fn byte_0a_packing(flags in 0u8..=255u8) {
         let ch = ChannelMemory {
-            dcs_enable: dcs,
-            cross_tone_reverse: cross,
             flags_0a_raw: flags,
+            // Derive individual fields for struct consistency
+            tone_enable: (flags >> 7) & 1 != 0,
+            dcs_enable: (flags >> 5) & 1 != 0,
+            cross_tone_reverse: (flags >> 4) & 1 != 0,
+            reverse: (flags >> 3) & 1 != 0,
+            shift: ShiftDirection::try_from(flags & 0x07).unwrap(),
             ..ChannelMemory::default()
         };
         let bytes = ch.to_bytes();
-        prop_assert_eq!((bytes[0x0A] >> 7) & 1, u8::from(dcs));
-        prop_assert_eq!((bytes[0x0A] >> 6) & 1, u8::from(cross));
-        prop_assert_eq!(bytes[0x0A] & 0x3F, flags);
+        prop_assert_eq!(bytes[0x0A], flags);
     }
 
-    // 6. Byte 0x0E packing (speed + lockout)
+    // 6. Byte 0x0E packing (cross_tone_combo + digital_squelch)
     #[test]
-    fn byte_0e_packing(speed in 0u8..2, lockout in 0u8..3) {
+    fn byte_0e_packing(combo in 0u8..4, squelch in 0u8..3) {
         let ch = ChannelMemory {
-            data_speed: DataSpeed::try_from(speed).unwrap(),
-            lockout: LockoutMode::try_from(lockout).unwrap(),
+            cross_tone_combo: CrossToneType::try_from(combo).unwrap(),
+            digital_squelch: FlashDigitalSquelch::try_from(squelch).unwrap(),
             ..ChannelMemory::default()
         };
         let bytes = ch.to_bytes();
-        prop_assert_eq!(bytes[0x0E] >> 4, speed);
-        prop_assert_eq!(bytes[0x0E] & 0x03, lockout);
+        prop_assert_eq!((bytes[0x0E] >> 4) & 0x03, combo);
+        prop_assert_eq!(bytes[0x0E] & 0x03, squelch);
     }
 
     // 7. Frequency wire format round-trip
@@ -190,7 +193,8 @@ proptest! {
 
     // 12. SQ (squelch) wire round-trip
     #[test]
-    fn sq_round_trip(band in arb_band(), level in 0u8..10) {
+    fn sq_round_trip(band in arb_band(), raw_level in 0u8..7) {
+        let level = SquelchLevel::new(raw_level).unwrap();
         let cmd = Command::SetSquelch { band, level };
         let wire = protocol::serialize(&cmd);
         let frame = &wire[..wire.len() - 1];

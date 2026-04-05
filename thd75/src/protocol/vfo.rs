@@ -7,6 +7,7 @@
 use crate::error::ProtocolError;
 use crate::types::Band;
 use crate::types::mode::{Mode, StepSize};
+use crate::types::radio_params::{AfGainLevel, FilterMode, SMeterReading, SquelchLevel};
 
 use super::Response;
 
@@ -69,21 +70,36 @@ fn split_band_value<'a>(payload: &'a str, cmd: &str) -> Result<(Band, &'a str), 
 /// Hardware observation: bare `AG\r` returns a global gain level (e.g., `091`).
 /// Band-indexed `AG 0\r` returns `?`.
 fn parse_ag(payload: &str) -> Result<Response, ProtocolError> {
-    let level = parse_u8_field(payload.trim(), "AG", "level")?;
+    let raw = parse_u8_field(payload.trim(), "AG", "level")?;
+    let level = AfGainLevel::try_from(raw).map_err(|e| ProtocolError::FieldParse {
+        command: "AG".to_owned(),
+        field: "level".to_owned(),
+        detail: e.to_string(),
+    })?;
     Ok(Response::AfGain { level })
 }
 
 /// Parse SQ (squelch): "band,ll" (zero-padded 2 digits).
 fn parse_sq(payload: &str) -> Result<Response, ProtocolError> {
     let (band, val_str) = split_band_value(payload, "SQ")?;
-    let level = parse_u8_field(val_str, "SQ", "level")?;
+    let raw = parse_u8_field(val_str, "SQ", "level")?;
+    let level = SquelchLevel::try_from(raw).map_err(|e| ProtocolError::FieldParse {
+        command: "SQ".to_owned(),
+        field: "level".to_owned(),
+        detail: e.to_string(),
+    })?;
     Ok(Response::Squelch { band, level })
 }
 
 /// Parse SM (S-meter): "band,level" (hardware may return 1-4 digits).
 fn parse_sm(payload: &str) -> Result<Response, ProtocolError> {
     let (band, val_str) = split_band_value(payload, "SM")?;
-    let level = parse_u8_field(val_str, "SM", "level")?;
+    let raw = parse_u8_field(val_str, "SM", "level")?;
+    let level = SMeterReading::try_from(raw).map_err(|e| ProtocolError::FieldParse {
+        command: "SM".to_owned(),
+        field: "level".to_owned(),
+        detail: e.to_string(),
+    })?;
     Ok(Response::Smeter { band, level })
 }
 
@@ -134,14 +150,19 @@ fn parse_ft(payload: &str) -> Result<Response, ProtocolError> {
 fn parse_sh(payload: &str) -> Result<Response, ProtocolError> {
     let parts: Vec<&str> = payload.splitn(2, ',').collect();
     if parts.len() == 2 {
-        let mode_index = parse_u8_field(parts[0], "SH", "mode_index")?;
+        let mode_raw = parse_u8_field(parts[0], "SH", "mode")?;
+        let mode = FilterMode::try_from(mode_raw).map_err(|e| ProtocolError::FieldParse {
+            command: "SH".to_owned(),
+            field: "mode".to_owned(),
+            detail: e.to_string(),
+        })?;
         let width = parse_u8_field(parts[1], "SH", "width")?;
-        Ok(Response::FilterWidth { mode_index, width })
+        Ok(Response::FilterWidth { mode, width })
     } else {
-        // Bare response - treat payload as width with mode_index 0
+        // Bare response - treat payload as width with mode SSB
         let width = parse_u8_field(payload, "SH", "width")?;
         Ok(Response::FilterWidth {
-            mode_index: 0,
+            mode: FilterMode::Ssb,
             width,
         })
     }

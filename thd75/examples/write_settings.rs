@@ -38,18 +38,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read current squelch, change it, then restore.
     let band = Band::A;
     let original_squelch = radio.get_squelch(band).await?;
-    println!("Band A squelch: {original_squelch}");
+    println!("Band A squelch: {}", original_squelch.as_u8());
 
-    let test_squelch = if original_squelch >= 3 {
-        original_squelch - 1
+    let test_val = if original_squelch.as_u8() >= 3 {
+        original_squelch.as_u8() - 1
     } else {
-        original_squelch + 1
+        original_squelch.as_u8() + 1
     };
-    println!("Setting squelch to {test_squelch}...");
+    let test_squelch = kenwood_thd75::types::SquelchLevel::new(test_val).unwrap();
+    println!("Setting squelch to {}...", test_squelch.as_u8());
     radio.set_squelch(band, test_squelch).await?;
 
     let readback = radio.get_squelch(band).await?;
-    println!("Squelch readback: {readback}");
+    println!("Squelch readback: {}", readback.as_u8());
 
     println!("Restoring squelch to {original_squelch}...");
     radio.set_squelch(band, original_squelch).await?;

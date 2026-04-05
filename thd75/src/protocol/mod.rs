@@ -30,7 +30,10 @@ pub use codec::Codec;
 
 use crate::error::ProtocolError;
 #[allow(unused_imports)]
-use crate::types::{Band, ChannelMemory, Mode, PowerLevel, StepSize, ToneCode};
+use crate::types::{
+    AfGainLevel, Band, ChannelMemory, FilterMode, Mode, PowerLevel, SMeterReading, SquelchLevel,
+    StepSize, ToneCode, VfoMemoryMode,
+};
 
 /// A CAT command to send to the radio.
 #[derive(Debug, Clone)]
@@ -183,8 +186,8 @@ pub enum Command {
     SetVfoMemoryMode {
         /// Target band.
         band: Band,
-        /// VFO/Memory mode index (0 = VFO, 1 = Memory, 2 = Call, 3 = WX).
-        mode: u8,
+        /// VFO/Memory mode.
+        mode: VfoMemoryMode,
     },
     /// Get FM radio on/off state (FR read).
     GetFmRadio,
@@ -221,7 +224,7 @@ pub enum Command {
         /// and sends a bare `AG level\r`.
         band: Band,
         /// Gain level (0-99).
-        level: u8,
+        level: AfGainLevel,
     },
     /// Get squelch level (SQ read).
     GetSquelch {
@@ -236,7 +239,7 @@ pub enum Command {
         /// Target band.
         band: Band,
         /// Squelch level (0-6 on D75).
-        level: u8,
+        level: SquelchLevel,
     },
     /// Get S-meter reading (SM read).
     GetSmeter {
@@ -256,7 +259,7 @@ pub enum Command {
         /// Target band.
         band: Band,
         /// S-meter level value.
-        level: u8,
+        level: SMeterReading,
     },
     /// Get operating mode (MD read).
     GetMode {
@@ -319,8 +322,8 @@ pub enum Command {
     /// CW bandwidth 0.3–2.0 kHz (Menu 121), AM high-cut 3.0–7.5 kHz
     /// (Menu 122). `mode_index`: 0 = SSB, 1 = CW, 2 = AM.
     GetFilterWidth {
-        /// Mode index (0 = SSB, 1 = CW, 2 = AM).
-        mode_index: u8,
+        /// Receiver filter mode.
+        mode: FilterMode,
     },
     /// Set filter width by mode index (SH write).
     ///
@@ -328,8 +331,8 @@ pub enum Command {
     /// value maps to the filter selection index for that mode (see
     /// [`GetFilterWidth`](Command::GetFilterWidth) for mode descriptions).
     SetFilterWidth {
-        /// Mode index (0 = SSB, 1 = CW, 2 = AM).
-        mode_index: u8,
+        /// Receiver filter mode.
+        mode: FilterMode,
         /// Filter width setting index.
         width: u8,
     },
@@ -1157,8 +1160,8 @@ pub enum Response {
     VfoMemoryMode {
         /// Band the mode is for.
         band: Band,
-        /// VFO/Memory mode index (0 = VFO, 1 = Memory, 2 = Call, 3 = WX).
-        mode: u8,
+        /// VFO/Memory mode.
+        mode: VfoMemoryMode,
     },
     /// FM radio on/off response (FR).
     FmRadio {
@@ -1172,21 +1175,21 @@ pub enum Response {
     /// Per KI4LAX CAT reference: gain range 000-099.
     AfGain {
         /// Gain level (0-99). Global, not per-band.
-        level: u8,
+        level: AfGainLevel,
     },
     /// Squelch level response (SQ).
     Squelch {
         /// Band the squelch is for.
         band: Band,
-        /// Squelch level.
-        level: u8,
+        /// Squelch level (0-6).
+        level: SquelchLevel,
     },
     /// S-meter reading response (SM).
     Smeter {
         /// Band the reading is for.
         band: Band,
-        /// S-meter level.
-        level: u8,
+        /// S-meter level (0-5).
+        level: SMeterReading,
     },
     /// Operating mode response (MD).
     Mode {
@@ -1211,8 +1214,8 @@ pub enum Response {
     },
     /// Filter width response (SH).
     FilterWidth {
-        /// Mode index queried (0 = SSB, 1 = CW, 2 = AM).
-        mode_index: u8,
+        /// Receiver filter mode queried.
+        mode: FilterMode,
         /// Filter width setting.
         width: u8,
     },
@@ -1720,7 +1723,7 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         Command::SetBand { band } => format!("BC {}", u8::from(*band)),
         Command::GetVfoMemoryMode { band } => format!("VM {}", u8::from(*band)),
         Command::SetVfoMemoryMode { band, mode } => {
-            format!("VM {},{}", u8::from(*band), mode)
+            format!("VM {},{}", u8::from(*band), u8::from(*mode))
         }
         Command::GetFmRadio => "FR".to_owned(),
         Command::SetFmRadio { enabled } => format!("FR {}", u8::from(*enabled)),
@@ -1731,15 +1734,15 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
             // D75 firmware AG write handler expects bare `AG AAA\r`.
             // Band-indexed `AG band,level` is rejected with `?`.
             // Per KI4LAX: 3-digit zero-padded, range 000-099.
-            format!("AG {level:03}")
+            format!("AG {:03}", level.as_u8())
         }
         Command::GetSquelch { band } => format!("SQ {}", u8::from(*band)),
         Command::SetSquelch { band, level } => {
-            format!("SQ {},{}", u8::from(*band), level)
+            format!("SQ {},{}", u8::from(*band), level.as_u8())
         }
         Command::GetSmeter { band } => format!("SM {}", u8::from(*band)),
         Command::SetSmeter { band, level } => {
-            format!("SM {},{}", u8::from(*band), level)
+            format!("SM {},{}", u8::from(*band), level.as_u8())
         }
         Command::GetMode { band } => format!("MD {}", u8::from(*band)),
         Command::SetMode { band, mode } => {
@@ -1753,9 +1756,9 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         Command::SetFunctionType { band, enabled } => {
             format!("FT {},{}", u8::from(*band), u8::from(*enabled))
         }
-        Command::GetFilterWidth { mode_index } => format!("SH {mode_index}"),
-        Command::SetFilterWidth { mode_index, width } => {
-            format!("SH {mode_index},{width}")
+        Command::GetFilterWidth { mode } => format!("SH {}", u8::from(*mode)),
+        Command::SetFilterWidth { mode, width } => {
+            format!("SH {},{width}", u8::from(*mode))
         }
         Command::FrequencyUp { band } => format!("UP {}", u8::from(*band)),
         Command::FrequencyDown { band } => format!("DW {}", u8::from(*band)),
@@ -2080,7 +2083,7 @@ mod tests {
     fn serialize_set_smeter() {
         let bytes = serialize(&Command::SetSmeter {
             band: Band::B,
-            level: 5,
+            level: SMeterReading::new(5).unwrap(),
         });
         assert_eq!(bytes, b"SM 1,5\r");
     }

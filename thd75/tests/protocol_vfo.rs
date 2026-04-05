@@ -19,7 +19,7 @@ fn serialize_ag_write() {
     assert_eq!(
         protocol::serialize(&Command::SetAfGain {
             band: Band::A,
-            level: 15
+            level: AfGainLevel::new(15).unwrap()
         }),
         b"AG 015\r"
     );
@@ -31,7 +31,7 @@ fn serialize_ag_write_band_b() {
     assert_eq!(
         protocol::serialize(&Command::SetAfGain {
             band: Band::B,
-            level: 39
+            level: AfGainLevel::new(39).unwrap()
         }),
         b"AG 039\r"
     );
@@ -41,7 +41,7 @@ fn serialize_ag_write_band_b() {
 fn parse_ag_response() {
     match protocol::parse(b"AG 091").unwrap() {
         Response::AfGain { level } => {
-            assert_eq!(level, 91);
+            assert_eq!(level, AfGainLevel::new(91).unwrap());
         }
         other => panic!("expected AfGain, got {other:?}"),
     }
@@ -51,7 +51,7 @@ fn parse_ag_response() {
 fn parse_ag_low() {
     match protocol::parse(b"AG 005").unwrap() {
         Response::AfGain { level } => {
-            assert_eq!(level, 5);
+            assert_eq!(level, AfGainLevel::new(5).unwrap());
         }
         other => panic!("expected AfGain, got {other:?}"),
     }
@@ -74,7 +74,7 @@ fn serialize_sq_write() {
     assert_eq!(
         protocol::serialize(&Command::SetSquelch {
             band: Band::A,
-            level: 3
+            level: SquelchLevel::new(3).unwrap()
         }),
         b"SQ 0,3\r"
     );
@@ -85,7 +85,7 @@ fn serialize_sq_write_band_b() {
     assert_eq!(
         protocol::serialize(&Command::SetSquelch {
             band: Band::B,
-            level: 5
+            level: SquelchLevel::new(5).unwrap()
         }),
         b"SQ 1,5\r"
     );
@@ -96,7 +96,7 @@ fn parse_sq_response() {
     match protocol::parse(b"SQ 0,03").unwrap() {
         Response::Squelch { band, level } => {
             assert_eq!(band, Band::A);
-            assert_eq!(level, 3);
+            assert_eq!(level, SquelchLevel::new(3).unwrap());
         }
         other => panic!("expected Squelch, got {other:?}"),
     }
@@ -107,21 +107,16 @@ fn parse_sq_no_padding() {
     match protocol::parse(b"SQ 0,3").unwrap() {
         Response::Squelch { band, level } => {
             assert_eq!(band, Band::A);
-            assert_eq!(level, 3);
+            assert_eq!(level, SquelchLevel::new(3).unwrap());
         }
         other => panic!("expected Squelch, got {other:?}"),
     }
 }
 
 #[test]
-fn parse_sq_band_b() {
-    match protocol::parse(b"SQ 1,09").unwrap() {
-        Response::Squelch { band, level } => {
-            assert_eq!(band, Band::B);
-            assert_eq!(level, 9);
-        }
-        other => panic!("expected Squelch, got {other:?}"),
-    }
+fn parse_sq_out_of_range_rejected() {
+    // Squelch 9 exceeds valid range 0-6 — strict validation rejects it
+    assert!(protocol::parse(b"SQ 1,09").is_err());
 }
 
 // ============================================================================
@@ -141,7 +136,7 @@ fn parse_sm_response() {
     match protocol::parse(b"SM 0,0005").unwrap() {
         Response::Smeter { band, level } => {
             assert_eq!(band, Band::A);
-            assert_eq!(level, 5);
+            assert_eq!(level, SMeterReading::new(5).unwrap());
         }
         other => panic!("expected Smeter, got {other:?}"),
     }
@@ -152,21 +147,16 @@ fn parse_sm_zero() {
     match protocol::parse(b"SM 1,0000").unwrap() {
         Response::Smeter { band, level } => {
             assert_eq!(band, Band::B);
-            assert_eq!(level, 0);
+            assert_eq!(level, SMeterReading::new(0).unwrap());
         }
         other => panic!("expected Smeter, got {other:?}"),
     }
 }
 
 #[test]
-fn parse_sm_max() {
-    match protocol::parse(b"SM 0,0020").unwrap() {
-        Response::Smeter { band, level } => {
-            assert_eq!(band, Band::A);
-            assert_eq!(level, 20);
-        }
-        other => panic!("expected Smeter, got {other:?}"),
-    }
+fn parse_sm_out_of_range_rejected() {
+    // S-meter 20 exceeds valid range 0-5 — strict validation rejects it
+    assert!(protocol::parse(b"SM 0,0020").is_err());
 }
 
 // ============================================================================
@@ -294,7 +284,9 @@ fn parse_ft_response_with_band_prefix() {
 #[test]
 fn serialize_sh_read_ssb() {
     assert_eq!(
-        protocol::serialize(&Command::GetFilterWidth { mode_index: 0 }),
+        protocol::serialize(&Command::GetFilterWidth {
+            mode: FilterMode::Ssb
+        }),
         b"SH 0\r"
     );
 }
@@ -302,7 +294,9 @@ fn serialize_sh_read_ssb() {
 #[test]
 fn serialize_sh_read_cw() {
     assert_eq!(
-        protocol::serialize(&Command::GetFilterWidth { mode_index: 1 }),
+        protocol::serialize(&Command::GetFilterWidth {
+            mode: FilterMode::Cw
+        }),
         b"SH 1\r"
     );
 }
@@ -310,8 +304,8 @@ fn serialize_sh_read_cw() {
 #[test]
 fn parse_sh_response() {
     match protocol::parse(b"SH 1,3").unwrap() {
-        Response::FilterWidth { mode_index, width } => {
-            assert_eq!(mode_index, 1);
+        Response::FilterWidth { mode, width } => {
+            assert_eq!(mode, FilterMode::Cw);
             assert_eq!(width, 3);
         }
         other => panic!("expected FilterWidth, got {other:?}"),
@@ -322,7 +316,7 @@ fn parse_sh_response() {
 fn serialize_sh_write() {
     assert_eq!(
         protocol::serialize(&Command::SetFilterWidth {
-            mode_index: 1,
+            mode: FilterMode::Cw,
             width: 5
         }),
         b"SH 1,5\r"
@@ -333,7 +327,7 @@ fn serialize_sh_write() {
 fn serialize_sh_write_ssb() {
     assert_eq!(
         protocol::serialize(&Command::SetFilterWidth {
-            mode_index: 0,
+            mode: FilterMode::Ssb,
             width: 3
         }),
         b"SH 0,3\r"

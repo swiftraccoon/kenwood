@@ -91,17 +91,17 @@ fn main() {
 
         println!("\n=== ME FIELD MAPPING PROBE ===\n");
 
-        // Read ME for channels with interesting byte[10] patterns
+        // Read ME for channels with unusual byte[8], byte[9], or byte[14]
         println!("--- Reading stored memory channels ---");
-        // Channels 20-55 have byte[10] bits 7,4,1 set; also 1101-1136 for byte[9]
-        let targets: Vec<u16> = (20..56)
-            .chain(62..63)
-            .chain(75..76)
-            .chain(88..89)
-            .chain(128..129)
-            .chain(1101..1112)
-            .chain(1131..1137)
-            .collect();
+        let targets: Vec<u16> = vec![
+            // byte[14] = 0x3C (cross-tone channels)
+            31, 33, 34, 75, 88,
+            // 1100+ range: non-zero byte[8] and byte[9] lower nibble
+            1101, 1102, 1103, 1104, 1105, 1106, 1107, 1108, 1109, 1110,
+            1131, 1132, 1133, 1134, 1135, 1136,
+            // byte[8] non-zero, byte[9] = 0x43/0x75/0x79
+            1152, 1158, 1159,
+        ];
         for ch in targets {
             let cmd = format!("ME {ch:03}");
             if let Some(r) = cmd_matched(&mut transport, &mut codec, &cmd, "ME ").await {

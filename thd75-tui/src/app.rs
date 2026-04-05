@@ -1276,8 +1276,10 @@ impl App {
                     (kenwood_thd75::types::Band::B, self.state.band_b.squelch)
                 };
                 let next = cur.saturating_sub(1);
-                if let Some(ref tx) = self.cmd_tx {
-                    let _ = tx.send(crate::event::RadioCommand::SetSquelch { band, level: next });
+                if let (Some(tx), Ok(level)) =
+                    (&self.cmd_tx, kenwood_thd75::types::SquelchLevel::new(next))
+                {
+                    let _ = tx.send(crate::event::RadioCommand::SetSquelch { band, level });
                     self.status_message = Some(format!("Squelch → {next}"));
                 }
                 true
@@ -1288,9 +1290,11 @@ impl App {
                 } else {
                     (kenwood_thd75::types::Band::B, self.state.band_b.squelch)
                 };
-                let next = cur.saturating_add(1).min(5);
-                if let Some(ref tx) = self.cmd_tx {
-                    let _ = tx.send(crate::event::RadioCommand::SetSquelch { band, level: next });
+                let next = cur.saturating_add(1).min(6);
+                if let (Some(tx), Ok(level)) =
+                    (&self.cmd_tx, kenwood_thd75::types::SquelchLevel::new(next))
+                {
+                    let _ = tx.send(crate::event::RadioCommand::SetSquelch { band, level });
                     self.status_message = Some(format!("Squelch → {next}"));
                 }
                 true
@@ -1574,10 +1578,12 @@ impl App {
                     } else {
                         cur.saturating_sub(1)
                     };
-                    let _ = tx.send(crate::event::RadioCommand::SetSquelch {
-                        band: kenwood_thd75::types::Band::A,
-                        level: next,
-                    });
+                    if let Ok(level) = kenwood_thd75::types::SquelchLevel::new(next) {
+                        let _ = tx.send(crate::event::RadioCommand::SetSquelch {
+                            band: kenwood_thd75::types::Band::A,
+                            level,
+                        });
+                    }
                     self.status_message = Some(format!("Squelch A → {next}"));
                     return;
                 }
@@ -1588,10 +1594,12 @@ impl App {
                     } else {
                         cur.saturating_sub(1)
                     };
-                    let _ = tx.send(crate::event::RadioCommand::SetSquelch {
-                        band: kenwood_thd75::types::Band::B,
-                        level: next,
-                    });
+                    if let Ok(level) = kenwood_thd75::types::SquelchLevel::new(next) {
+                        let _ = tx.send(crate::event::RadioCommand::SetSquelch {
+                            band: kenwood_thd75::types::Band::B,
+                            level,
+                        });
+                    }
                     self.status_message = Some(format!("Squelch B → {next}"));
                     return;
                 }

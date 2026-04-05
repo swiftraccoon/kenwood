@@ -17,6 +17,7 @@ pub mod fm;
 pub mod frequency;
 pub mod gps;
 pub mod mode;
+pub mod radio_params;
 pub mod repeater;
 pub mod scan;
 pub mod settings;
@@ -33,6 +34,7 @@ pub use channel::{
 };
 pub use frequency::Frequency;
 pub use mode::{MemoryMode, Mode, PowerLevel, ShiftDirection, StepSize};
+pub use radio_params::{AfGainLevel, FilterMode, SMeterReading, SquelchLevel, VfoMemoryMode};
 pub use tone::{
     CTCSS_FREQUENCIES, CtcssMode, DCS_CODES, DataSpeed, DcsCode, LockoutMode, ToneCode, ToneMode,
 };

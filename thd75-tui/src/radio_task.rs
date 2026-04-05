@@ -152,8 +152,8 @@ pub async fn spawn_with_transport(
                             if busy {
                                 match radio.get_smeter(band).await {
                                     Ok(level) => match band {
-                                        Band::A => { s_meter_a = level; busy_a = true; }
-                                        Band::B => { s_meter_b = level; busy_b = true; }
+                                        Band::A => { s_meter_a = level.as_u8(); busy_a = true; }
+                                        Band::B => { s_meter_b = level.as_u8(); busy_b = true; }
                                         _ => {}
                                     },
                                     Err(e) => {
@@ -492,7 +492,13 @@ async fn poll_once(
     let vox = global_read!(radio, "VX", radio.get_vox(), false);
     let vox_gain = global_read!(radio, "VG", radio.get_vox_gain(), 0);
     let vox_delay = global_read!(radio, "VD", radio.get_vox_delay(), 0);
-    let af_gain = global_read!(radio, "AG", radio.get_af_gain(), 0);
+    let af_gain_typed = global_read!(
+        radio,
+        "AG",
+        radio.get_af_gain(),
+        kenwood_thd75::types::AfGainLevel::new(0).unwrap()
+    );
+    let af_gain = af_gain_typed.as_u8();
     let gps = radio.get_gps_config().await.unwrap_or((false, false));
     let beacon_type = global_read!(radio, "BN", radio.get_beacon_type(), 0);
     Ok(RadioState {
@@ -535,7 +541,8 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
     let squelch = radio
         .get_squelch(band)
         .await
-        .map_err(|e| classify_error(&format!("SQ {band:?}"), &e))?;
+        .map_err(|e| classify_error(&format!("SQ {band:?}"), &e))?
+        .as_u8();
 
     let mode = radio
         .get_mode(band)

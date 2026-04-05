@@ -9,7 +9,7 @@ async fn get_frequency_full() {
     let mut mock = MockTransport::new();
     mock.expect(
         b"FO 0\r",
-        b"FO 0,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,08,08,000,0,,0,00\r",
+        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
     );
     let mut radio = Radio::connect(mock).await.unwrap();
     let ch = radio.get_frequency_full(Band::A).await.unwrap();
@@ -21,7 +21,7 @@ async fn get_frequency() {
     let mut mock = MockTransport::new();
     mock.expect(
         b"FQ 0\r",
-        b"FQ 0,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,08,08,000,0,,0,00\r",
+        b"FQ 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
     );
     let mut radio = Radio::connect(mock).await.unwrap();
     let ch = radio.get_frequency(Band::A).await.unwrap();
@@ -32,27 +32,28 @@ async fn get_frequency() {
 async fn set_frequency_full() {
     let mut mock = MockTransport::new();
     mock.expect(
-        b"FO 0,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,08,08,000,0,,0,00\r",
-        b"FO 0,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,08,08,000,0,,0,00\r",
+        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
+        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
     );
     let mut radio = Radio::connect(mock).await.unwrap();
     let ch = ChannelMemory {
         rx_frequency: Frequency::new(145_000_000),
         tx_offset: Frequency::new(600_000),
-        step_size: StepSize::Hz12500,
-        shift: ShiftDirection::UP,
+        step_size: StepSize::Hz5000,
+        mode_flags_raw: 0,
+        shift: ShiftDirection::DOWN,
         reverse: false,
-        tone_enable: true,
+        tone_enable: false,
         ctcss_mode: tone::CtcssMode::Off,
         dcs_enable: false,
         cross_tone_reverse: false,
-        flags_0a_raw: 0,
+        flags_0a_raw: 0x02, // shift- = 2
         tone_code: tone::ToneCode::new(8).unwrap(),
         ctcss_code: tone::ToneCode::new(8).unwrap(),
         dcs_code: tone::DcsCode::new(0).unwrap(),
-        data_speed: tone::DataSpeed::Bps1200,
-        lockout: tone::LockoutMode::Off,
-        urcall: ChannelName::new("").unwrap(),
+        cross_tone_combo: CrossToneType::DtcsDtcs,
+        digital_squelch: FlashDigitalSquelch::Off,
+        urcall: ChannelName::new("CQCQCQ").unwrap(),
         data_mode: 0,
     };
     radio.set_frequency_full(Band::A, &ch).await.unwrap();
@@ -84,7 +85,7 @@ async fn get_smeter() {
     mock.expect(b"SM 0\r", b"SM 0,0005\r");
     let mut radio = Radio::connect(mock).await.unwrap();
     let level = radio.get_smeter(Band::A).await.unwrap();
-    assert_eq!(level, 5);
+    assert_eq!(level, SMeterReading::new(5).unwrap());
 }
 
 #[tokio::test]
@@ -128,15 +129,18 @@ async fn get_squelch() {
     mock.expect(b"SQ 0\r", b"SQ 0,05\r");
     let mut radio = Radio::connect(mock).await.unwrap();
     let level = radio.get_squelch(Band::A).await.unwrap();
-    assert_eq!(level, 5);
+    assert_eq!(level, SquelchLevel::new(5).unwrap());
 }
 
 #[tokio::test]
 async fn set_squelch() {
     let mut mock = MockTransport::new();
-    mock.expect(b"SQ 0,10\r", b"SQ 0,10\r");
+    mock.expect(b"SQ 0,4\r", b"SQ 0,4\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio.set_squelch(Band::A, 10).await.unwrap();
+    radio
+        .set_squelch(Band::A, SquelchLevel::new(4).unwrap())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

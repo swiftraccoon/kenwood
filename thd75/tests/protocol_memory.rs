@@ -33,17 +33,18 @@ fn serialize_me_read_channel_999() {
 
 #[test]
 fn parse_me_response_basic() {
-    let raw = b"ME 000,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,0,08,08,000,0,,0,00,0";
+    // Real D75 ME format: all zeros, no tone/shift
+    let raw = b"ME 000,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00,0";
     let r = protocol::parse(raw).unwrap();
     match r {
         Response::MemoryChannel { channel, data } => {
             assert_eq!(channel, 0);
             assert_eq!(data.rx_frequency, Frequency::new(145_000_000));
             assert_eq!(data.tx_offset, Frequency::new(600_000));
-            assert_eq!(data.step_size, StepSize::Hz12500);
-            assert_eq!(data.shift, ShiftDirection::UP);
+            assert_eq!(data.step_size, StepSize::Hz5000);
+            assert!(!data.tone_enable);
             assert!(!data.reverse);
-            assert!(data.tone_enable);
+            assert_eq!(data.flags_0a_raw, 0);
         }
         other => panic!("expected MemoryChannel, got {other:?}"),
     }
@@ -51,7 +52,8 @@ fn parse_me_response_basic() {
 
 #[test]
 fn parse_me_response_with_name() {
-    let raw = b"ME 042,0440000000,0005000000,5,2,1,0,1,1,1,0,0,0,0,0,14,14,023,1,REPEATER,1,05,0";
+    // tone=1[7], ctcss=1[8], dcs=1[9], cross=0[10], rev=0[11], shift=1[12]
+    let raw = b"ME 042,0440000000,0005000000,0,0,0,0,0,1,1,1,0,0,0,1,14,14,023,0,REPEATER,1,05,0";
     let r = protocol::parse(raw).unwrap();
     match r {
         Response::MemoryChannel { channel, data } => {
@@ -80,10 +82,11 @@ fn me_write_serialize_full() {
     let ch = ChannelMemory {
         rx_frequency: Frequency::new(145_000_000),
         tx_offset: Frequency::new(600_000),
-        step_size: StepSize::Hz12500,
-        shift: ShiftDirection::UP,
+        step_size: StepSize::Hz5000,
+        mode_flags_raw: 0,
+        shift: ShiftDirection::SIMPLEX,
         reverse: false,
-        tone_enable: true,
+        tone_enable: false,
         ctcss_mode: CtcssMode::Off,
         dcs_enable: false,
         cross_tone_reverse: false,
@@ -91,9 +94,9 @@ fn me_write_serialize_full() {
         tone_code: ToneCode::new(8).unwrap(),
         ctcss_code: ToneCode::new(8).unwrap(),
         dcs_code: DcsCode::new(0).unwrap(),
-        data_speed: DataSpeed::Bps1200,
-        lockout: LockoutMode::Off,
-        urcall: ChannelName::new("").unwrap(),
+        cross_tone_combo: CrossToneType::DtcsDtcs,
+        digital_squelch: FlashDigitalSquelch::Off,
+        urcall: ChannelName::new("CQCQCQ").unwrap(),
         data_mode: 0,
     };
     let wire = protocol::serialize(&Command::SetMemoryChannel {
@@ -102,7 +105,7 @@ fn me_write_serialize_full() {
     });
     assert_eq!(
         wire,
-        b"ME 000,0145000000,0000600000,5,1,0,1,0,0,0,0,0,0,0,0,08,08,000,0,,0,00,0\r"
+        b"ME 000,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00,0\r"
     );
 }
 
@@ -111,10 +114,11 @@ fn me_write_parse_round_trip() {
     let ch = ChannelMemory {
         rx_frequency: Frequency::new(145_000_000),
         tx_offset: Frequency::new(600_000),
-        step_size: StepSize::Hz12500,
-        shift: ShiftDirection::UP,
+        step_size: StepSize::Hz5000,
+        mode_flags_raw: 0,
+        shift: ShiftDirection::SIMPLEX,
         reverse: false,
-        tone_enable: true,
+        tone_enable: false,
         ctcss_mode: CtcssMode::Off,
         dcs_enable: false,
         cross_tone_reverse: false,
@@ -122,9 +126,9 @@ fn me_write_parse_round_trip() {
         tone_code: ToneCode::new(8).unwrap(),
         ctcss_code: ToneCode::new(8).unwrap(),
         dcs_code: DcsCode::new(0).unwrap(),
-        data_speed: DataSpeed::Bps1200,
-        lockout: LockoutMode::Off,
-        urcall: ChannelName::new("").unwrap(),
+        cross_tone_combo: CrossToneType::DtcsDtcs,
+        digital_squelch: FlashDigitalSquelch::Off,
+        urcall: ChannelName::new("CQCQCQ").unwrap(),
         data_mode: 0,
     };
     let wire = protocol::serialize(&Command::SetMemoryChannel {

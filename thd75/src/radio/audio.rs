@@ -17,7 +17,7 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::Band;
+use crate::types::{AfGainLevel, Band};
 
 use super::Radio;
 
@@ -30,7 +30,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_af_gain(&mut self) -> Result<u8, Error> {
+    pub async fn get_af_gain(&mut self) -> Result<AfGainLevel, Error> {
         tracing::debug!("reading AF gain");
         let response = self.execute(Command::GetAfGain).await?;
         match response {
@@ -61,8 +61,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_af_gain(&mut self, band: Band, level: u8) -> Result<(), Error> {
-        tracing::debug!(?band, level, "setting AF gain");
+    pub async fn set_af_gain(&mut self, band: Band, level: AfGainLevel) -> Result<(), Error> {
+        tracing::debug!(?band, ?level, "setting AF gain");
         let response = self.execute(Command::SetAfGain { band, level }).await?;
         match response {
             Response::AfGain { .. } => Ok(()),

@@ -27,6 +27,7 @@ use crate::error::{Error, ProtocolError};
 use crate::protocol::{self, Codec, Command, Response, command_name};
 use crate::transport::Transport;
 use crate::types::Band;
+use crate::types::radio_params::VfoMemoryMode;
 
 /// Default timeout for command execution (5 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,28 +57,25 @@ pub enum RadioMode {
 }
 
 impl RadioMode {
-    /// Converts a raw VM mode value to a `RadioMode`.
-    ///
-    /// Returns `None` if the value is not a recognized mode.
+    /// Converts a [`VfoMemoryMode`] to a `RadioMode`.
     #[must_use]
-    pub const fn from_vm_value(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::Vfo),
-            1 => Some(Self::Memory),
-            2 => Some(Self::Call),
-            3 => Some(Self::Wx),
-            _ => None,
+    pub const fn from_vfo_mode(mode: VfoMemoryMode) -> Self {
+        match mode {
+            VfoMemoryMode::Vfo => Self::Vfo,
+            VfoMemoryMode::Memory => Self::Memory,
+            VfoMemoryMode::Call => Self::Call,
+            VfoMemoryMode::Weather => Self::Wx,
         }
     }
 
-    /// Returns the VM command value for this mode.
+    /// Returns the [`VfoMemoryMode`] equivalent.
     #[must_use]
-    pub const fn as_vm_value(self) -> u8 {
+    pub const fn as_vfo_mode(self) -> VfoMemoryMode {
         match self {
-            Self::Vfo => 0,
-            Self::Memory => 1,
-            Self::Call => 2,
-            Self::Wx => 3,
+            Self::Vfo => VfoMemoryMode::Vfo,
+            Self::Memory => VfoMemoryMode::Memory,
+            Self::Call => VfoMemoryMode::Call,
+            Self::Wx => VfoMemoryMode::Weather,
         }
     }
 }
@@ -362,21 +360,20 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Update the cached mode for a band from a raw VM mode value.
-    fn update_cached_mode(&mut self, band: Band, vm_value: u8) {
-        if let Some(radio_mode) = RadioMode::from_vm_value(vm_value) {
-            match band {
-                Band::A => {
-                    tracing::debug!(?radio_mode, "updated cached mode for band A");
-                    self.mode_a = Some(radio_mode);
-                }
-                Band::B => {
-                    tracing::debug!(?radio_mode, "updated cached mode for band B");
-                    self.mode_b = Some(radio_mode);
-                }
-                _ => {
-                    // Sub-bands don't have independent mode tracking.
-                }
+    /// Update the cached mode for a band from a [`VfoMemoryMode`] value.
+    fn update_cached_mode(&mut self, band: Band, mode: VfoMemoryMode) {
+        let radio_mode = RadioMode::from_vfo_mode(mode);
+        match band {
+            Band::A => {
+                tracing::debug!(?radio_mode, "updated cached mode for band A");
+                self.mode_a = Some(radio_mode);
+            }
+            Band::B => {
+                tracing::debug!(?radio_mode, "updated cached mode for band B");
+                self.mode_b = Some(radio_mode);
+            }
+            _ => {
+                // Sub-bands don't have independent mode tracking.
             }
         }
     }
