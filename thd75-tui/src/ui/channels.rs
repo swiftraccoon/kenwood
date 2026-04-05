@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use crate::app::{App, InputMode, McpState, Pane};
 
-pub fn render_list(app: &App, frame: &mut Frame, area: Rect) {
+pub(crate) fn render_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let title = if let InputMode::Search(ref buf) = app.input_mode {
         format!(" Search: {buf}▎ ")
     } else if !app.search_filter.is_empty() {
@@ -23,7 +23,7 @@ pub fn render_list(app: &App, frame: &mut Frame, area: Rect) {
     if let McpState::Loaded { image, .. } = &app.mcp {
         let channels = image.channels();
         let used = app.filtered_channels();
-        let items: Vec<ListItem> = used
+        let items: Vec<ListItem<'_>> = used
             .iter()
             .map(|&i| {
                 let entry = channels.get(i);
@@ -62,7 +62,7 @@ pub fn render_list(app: &App, frame: &mut Frame, area: Rect) {
     }
 }
 
-pub fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
+pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()
         .title(" Detail ")
         .borders(Borders::ALL)

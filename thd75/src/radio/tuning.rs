@@ -169,7 +169,7 @@ mod tests {
     use crate::transport::MockTransport;
 
     /// A typical FO response for Band A at 145.000 MHz.
-    /// Field layout verified against real D75 hardware (see probes/fo_field_map.rs).
+    /// Field layout verified against real D75 hardware (see `probes/fo_field_map.rs`).
     const FO_RESPONSE_145: &[u8] =
         b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r";
 

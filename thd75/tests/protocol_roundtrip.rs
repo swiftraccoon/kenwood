@@ -5,6 +5,7 @@
 
 use proptest::prelude::*;
 
+use kenwood_thd75::kiss::{KissFrame, decode_kiss_frame, encode_kiss_frame};
 use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::types::tone::{CtcssMode, DcsCode, ToneCode};
 use kenwood_thd75::types::*;
@@ -39,7 +40,7 @@ fn arb_channel_memory() -> impl Strategy<Value = ChannelMemory> {
         any::<u8>(),     // data_mode
     );
     (part_a, part_b).prop_map(
-        |((rx, tx, step, ctcss_m, flags), (tc, cc, dc, ds, lo, urcall, dm))| {
+        |((rx, tx, step, _ctcss_m, flags), (tc, cc, dc, ds, lo, urcall, dm))| {
             // Derive individual fields from flags_0a_raw for consistency
             let tone_enable = (flags >> 7) & 1 != 0;
             let ctcss_enable = (flags >> 6) & 1 != 0;
@@ -237,6 +238,21 @@ proptest! {
             }
             other => prop_assert!(false, "wrong: {other:?}"),
         }
+    }
+
+    // 16. KISS frame encode/decode round-trip
+    //
+    // The type byte (port<<4 | command) is NOT escaped in KISS framing,
+    // so combinations producing 0xC0 (FEND) or 0xDB (FESC) as the type
+    // byte cannot round-trip. We restrict to port 0 (the only port the
+    // TH-D75 uses) and command 0..7 (the defined KISS commands), which
+    // keeps the type byte in the safe 0x00-0x07 range.
+    #[test]
+    fn kiss_frame_round_trip(command in 0u8..7, data in proptest::collection::vec(any::<u8>(), 0..100)) {
+        let frame = KissFrame { port: 0, command, data };
+        let encoded = encode_kiss_frame(&frame);
+        let decoded = decode_kiss_frame(&encoded).unwrap();
+        prop_assert_eq!(decoded, frame);
     }
 
     // TN (TNC mode) is a bare read command — no write variant, so no round-trip.

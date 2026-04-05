@@ -1,0 +1,21 @@
+name: Coverage
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: taiki-e/install-action@cargo-tarpaulin
+      - run: cargo tarpaulin --manifest-path thd75/Cargo.toml --lib --out xml || true
+      - uses: codecov/codecov-action@v5
+        with:
+          files: cobertura.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}

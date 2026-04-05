@@ -204,7 +204,7 @@ fn serialize_cs_write() {
 fn parse_cs_response() {
     match protocol::parse(b"CS 10").unwrap() {
         Response::ActiveCallsignSlot { slot } => {
-            assert_eq!(slot, CallsignSlot::new(10).unwrap())
+            assert_eq!(slot, CallsignSlot::new(10).unwrap());
         }
         other => panic!("expected ActiveCallsignSlot, got {other:?}"),
     }

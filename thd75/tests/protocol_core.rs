@@ -326,7 +326,7 @@ fn serialize_fo_write() {
         tone_code: ToneCode::new(8).unwrap(),
         ctcss_code: ToneCode::new(8).unwrap(),
         dcs_code: DcsCode::new(0).unwrap(),
-        cross_tone_combo: CrossToneType::DtcsDtcs,
+        cross_tone_combo: CrossToneType::DcsOff,
         digital_squelch: FlashDigitalSquelch::Off,
         urcall: ChannelName::new("CQCQCQ").unwrap(),
         data_mode: 0,
@@ -360,7 +360,7 @@ fn fo_write_parse_round_trip() {
         tone_code: ToneCode::new(8).unwrap(),
         ctcss_code: ToneCode::new(8).unwrap(),
         dcs_code: DcsCode::new(0).unwrap(),
-        cross_tone_combo: CrossToneType::DtcsDtcs,
+        cross_tone_combo: CrossToneType::DcsOff,
         digital_squelch: FlashDigitalSquelch::Off,
         urcall: ChannelName::new("CQCQCQ").unwrap(),
         data_mode: 0,
@@ -394,7 +394,7 @@ fn fo_flags_0a_raw_round_trip() {
     };
     let bytes = protocol::serialize(&Command::SetFrequencyFull {
         band: Band::A,
-        channel: channel.clone(),
+        channel,
     });
     let frame = &bytes[..bytes.len() - 1];
     let r = protocol::parse(frame).unwrap();
@@ -454,7 +454,7 @@ fn serialize_fq_write() {
         tone_code: ToneCode::new(8).unwrap(),
         ctcss_code: ToneCode::new(8).unwrap(),
         dcs_code: DcsCode::new(0).unwrap(),
-        cross_tone_combo: CrossToneType::DtcsDtcs,
+        cross_tone_combo: CrossToneType::DcsOff,
         digital_squelch: FlashDigitalSquelch::Off,
         urcall: ChannelName::new("CQCQCQ").unwrap(),
         data_mode: 0,
@@ -538,7 +538,7 @@ fn fo_vfo_extended_shift_round_trip() {
         tone_code: ToneCode::new(8).unwrap(),
         ctcss_code: ToneCode::new(8).unwrap(),
         dcs_code: DcsCode::new(0).unwrap(),
-        cross_tone_combo: CrossToneType::DtcsDtcs,
+        cross_tone_combo: CrossToneType::DcsOff,
         digital_squelch: FlashDigitalSquelch::Off,
         urcall: ChannelName::new("CQCQCQ").unwrap(),
         data_mode: 0,
@@ -581,7 +581,7 @@ fn fo_vfo_tune_frequency_simulation() {
     // Serialize the modified channel back (FO write).
     let write_bytes = protocol::serialize(&Command::SetFrequencyFull {
         band: Band::A,
-        channel: channel.clone(),
+        channel,
     });
 
     // Parse the written data to verify round-trip.

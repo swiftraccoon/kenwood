@@ -10,7 +10,7 @@ const TICK_RATE: Duration = Duration::from_millis(16); // ~60fps
 
 /// Commands sent from the app to the radio task.
 #[derive(Debug)]
-pub enum RadioCommand {
+pub(crate) enum RadioCommand {
     /// Trigger a full MCP memory read from the radio.
     ReadMemory,
     /// Trigger a full MCP memory write to the radio.
@@ -69,9 +69,20 @@ pub enum RadioCommand {
     /// Set FM radio on/off (FR write — verified working).
     SetFmRadio(bool),
     /// Set D-STAR callsign slot (CS write — verified working).
+    /// Not yet wired to `adjust_setting` (requires polling current slot first).
+    #[allow(dead_code)]
     SetCallsignSlot(kenwood_thd75::types::CallsignSlot),
     /// Set D-STAR slot (DS write — verified working).
+    /// Not yet wired to `adjust_setting` (requires polling current slot first).
+    #[allow(dead_code)]
     SetDstarSlot(kenwood_thd75::types::DstarSlot),
+    /// Set the step size for the given band (SF write — verified working).
+    SetStepSize {
+        band: kenwood_thd75::types::Band,
+        step: kenwood_thd75::types::StepSize,
+    },
+    /// Set the scan resume method (SR write — write-only on D75).
+    SetScanResumeCat(kenwood_thd75::types::ScanResumeMethod),
     /// Write a single byte to MCP memory via `modify_memory_page`.
     /// Enters MCP mode, modifies one byte, exits. USB drops and reconnects.
     /// Used for settings where CAT writes are rejected by D75 firmware.
@@ -86,7 +97,7 @@ pub enum RadioCommand {
 }
 
 /// Merges terminal key events with messages from background tasks.
-pub struct EventHandler {
+pub(crate) struct EventHandler {
     rx: mpsc::UnboundedReceiver<Message>,
     tx: mpsc::UnboundedSender<Message>,
     cmd_tx: mpsc::UnboundedSender<RadioCommand>,
@@ -95,14 +106,14 @@ pub struct EventHandler {
 
 impl EventHandler {
     /// Create a new event handler with internal message and command channels.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         // Spawn a dedicated thread for blocking crossterm event polling.
         // This avoids blocking a tokio worker thread.
         let input_tx = tx.clone();
-        std::thread::spawn(move || {
+        let _handle = std::thread::spawn(move || {
             loop {
                 if event::poll(TICK_RATE).expect("event poll failed")
                     && let Event::Key(key) = event::read().expect("event read failed")
@@ -123,12 +134,12 @@ impl EventHandler {
     }
 
     /// Returns a sender that background tasks can use to push messages.
-    pub fn sender(&self) -> mpsc::UnboundedSender<Message> {
+    pub(crate) fn sender(&self) -> mpsc::UnboundedSender<Message> {
         self.tx.clone()
     }
 
     /// Returns a sender the app can use to send commands to the radio task.
-    pub fn command_sender(&self) -> mpsc::UnboundedSender<RadioCommand> {
+    pub(crate) fn command_sender(&self) -> mpsc::UnboundedSender<RadioCommand> {
         self.cmd_tx.clone()
     }
 
@@ -137,12 +148,12 @@ impl EventHandler {
     /// # Panics
     ///
     /// Panics if the command receiver has already been taken.
-    pub const fn take_command_receiver(&mut self) -> mpsc::UnboundedReceiver<RadioCommand> {
+    pub(crate) const fn take_command_receiver(&mut self) -> mpsc::UnboundedReceiver<RadioCommand> {
         self.cmd_rx.take().expect("command receiver already taken")
     }
 
     /// Wait for the next message from any source (terminal input or background tasks).
-    pub async fn next(&mut self) -> Message {
+    pub(crate) async fn next(&mut self) -> Message {
         self.rx.recv().await.unwrap_or(Message::Quit)
     }
 }

@@ -12,7 +12,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use crate::app::{App, MainView, Pane};
 
 /// Render the full TUI frame.
-pub fn render(app: &App, frame: &mut Frame) {
+pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

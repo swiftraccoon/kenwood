@@ -372,7 +372,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("backlight control"));
-        assert!(msg.contains("5"));
+        assert!(msg.contains('5'));
         assert!(msg.contains("must be 0-2"));
     }
 

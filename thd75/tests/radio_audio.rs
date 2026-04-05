@@ -12,10 +12,10 @@ async fn get_set_af_gain() {
     let mut radio = Radio::connect(mock).await.unwrap();
     assert_eq!(
         radio.get_af_gain().await.unwrap(),
-        kenwood_thd75::types::AfGainLevel::new(15).unwrap()
+        kenwood_thd75::types::AfGainLevel::new(15)
     );
     radio
-        .set_af_gain(Band::A, kenwood_thd75::types::AfGainLevel::new(20).unwrap())
+        .set_af_gain(Band::A, kenwood_thd75::types::AfGainLevel::new(20))
         .await
         .unwrap();
 }

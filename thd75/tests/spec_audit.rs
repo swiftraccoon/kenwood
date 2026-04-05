@@ -1,5 +1,5 @@
 //! Audit tests that compare our implementation against the KI4LAX CAT
-//! command reference (docs/ki4lax_cat_spec.json). The spec is transcribed
+//! command reference (`docs/ki4lax_cat_spec.json`). The spec is transcribed
 //! directly from the PDF and must NOT be edited based on our code.
 //!
 //! Any test failure means our code disagrees with the external reference.
@@ -17,7 +17,7 @@ fn load_spec() -> serde_json::Value {
     serde_json::from_str(&data).expect("invalid JSON in spec")
 }
 
-/// Collect every unique mnemonic our code maps from command_name().
+/// Collect every unique mnemonic our code maps from `command_name()`.
 fn our_mnemonics() -> Vec<&'static str> {
     vec![
         command_name(&Command::GetFrequency { band: Band::A }), // FQ
@@ -318,7 +318,7 @@ fn sq_range_matches_spec() {
 fn ag_write_is_3_digit_per_spec() {
     let bytes = protocol::serialize(&Command::SetAfGain {
         band: Band::A,
-        level: AfGainLevel::new(15).unwrap(),
+        level: AfGainLevel::new(15),
     });
     let wire = String::from_utf8(bytes).unwrap();
     let payload = wire.trim_end_matches('\r').strip_prefix("AG ").unwrap();

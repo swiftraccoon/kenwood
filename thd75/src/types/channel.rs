@@ -440,14 +440,14 @@ impl From<FlashDuplex> for u8 {
 /// | 3 | Tone | CTCSS | T/C |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CrossToneType {
-    /// DTCS on both TX and RX (value 0).
-    DtcsDtcs = 0,
-    /// Tone on TX, DTCS on RX (value 1).
-    ToneDtcs = 1,
-    /// DTCS on TX, Tone on RX (value 2).
-    DtcsTone = 2,
-    /// Tone on both TX and RX with different codes (value 3).
-    ToneTone = 3,
+    /// DCS encode (TX), Off decode (RX). Display: D/O (value 0).
+    DcsOff = 0,
+    /// Tone encode (TX), DCS decode (RX). Display: T/D (value 1).
+    ToneDcs = 1,
+    /// DCS encode (TX), CTCSS decode (RX). Display: D/C (value 2).
+    DcsCtcss = 2,
+    /// Tone encode (TX), CTCSS decode (RX). Display: T/C (value 3).
+    ToneCtcss = 3,
 }
 
 impl TryFrom<u8> for CrossToneType {
@@ -455,10 +455,10 @@ impl TryFrom<u8> for CrossToneType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::DtcsDtcs),
-            1 => Ok(Self::ToneDtcs),
-            2 => Ok(Self::DtcsTone),
-            3 => Ok(Self::ToneTone),
+            0 => Ok(Self::DcsOff),
+            1 => Ok(Self::ToneDcs),
+            2 => Ok(Self::DcsCtcss),
+            3 => Ok(Self::ToneCtcss),
             _ => Err(ValidationError::CrossToneTypeOutOfRange(value)),
         }
     }
@@ -892,7 +892,7 @@ impl Default for FlashChannel {
             // Safety: 0 is always a valid index for DcsCode (0..=103)
             dcs_code: DcsCode::new(0).expect("0 is valid DCS code"),
             byte0d_bit7: false,
-            cross_tone_type: CrossToneType::DtcsDtcs,
+            cross_tone_type: CrossToneType::DcsOff,
             digital_squelch: FlashDigitalSquelch::Off,
             byte0e_reserved: 0,
             ur_call: DstarCallsign::default(),
@@ -924,7 +924,7 @@ impl Default for ChannelMemory {
             ctcss_code: ToneCode::new(0).expect("0 is valid tone code"),
             // Safety: 0 is always a valid index for DcsCode (0..=103)
             dcs_code: DcsCode::new(0).expect("0 is valid DCS code"),
-            cross_tone_combo: CrossToneType::DtcsDtcs,
+            cross_tone_combo: CrossToneType::DcsOff,
             digital_squelch: FlashDigitalSquelch::Off,
             urcall: ChannelName::default(),
             data_mode: 0,
@@ -1010,7 +1010,7 @@ mod tests {
             tone_code: ToneCode::new(8).unwrap(),
             ctcss_code: ToneCode::new(8).unwrap(),
             dcs_code: DcsCode::new(0).unwrap(),
-            cross_tone_combo: CrossToneType::DtcsDtcs,
+            cross_tone_combo: CrossToneType::DcsOff,
             digital_squelch: FlashDigitalSquelch::Off,
             urcall: ChannelName::new("").unwrap(),
             data_mode: 0,
@@ -1076,7 +1076,7 @@ mod tests {
     #[test]
     fn channel_memory_byte0e_packing() {
         let ch = ChannelMemory {
-            cross_tone_combo: CrossToneType::ToneDtcs,
+            cross_tone_combo: CrossToneType::ToneDcs,
             digital_squelch: FlashDigitalSquelch::Code,
             ..ChannelMemory::default()
         };
@@ -1127,8 +1127,10 @@ mod tests {
             (6, MemoryMode::Nfm),
             (7, MemoryMode::Dr),
         ] {
-            let mut ch = FlashChannel::default();
-            ch.mode = expected;
+            let ch = FlashChannel {
+                mode: expected,
+                ..FlashChannel::default()
+            };
             let bytes = ch.to_bytes();
             // Mode is at byte 0x09 bits [6:4]
             assert_eq!(
@@ -1221,7 +1223,7 @@ mod tests {
     #[test]
     fn flash_channel_byte0e_cross_tone_digital_squelch() {
         let ch = FlashChannel {
-            cross_tone_type: CrossToneType::DtcsTone, // bits [5:4] = 2
+            cross_tone_type: CrossToneType::DcsCtcss, // bits [5:4] = 2
             digital_squelch: FlashDigitalSquelch::Callsign, // bits [1:0] = 2
             byte0e_reserved: 0,
             ..FlashChannel::default()
@@ -1230,7 +1232,7 @@ mod tests {
         // Expected: 0b00_10_00_10 = 0x22
         assert_eq!(bytes[0x0E], 0x22);
         let parsed = FlashChannel::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed.cross_tone_type, CrossToneType::DtcsTone);
+        assert_eq!(parsed.cross_tone_type, CrossToneType::DcsCtcss);
         assert_eq!(parsed.digital_squelch, FlashDigitalSquelch::Callsign);
     }
 
@@ -1273,7 +1275,7 @@ mod tests {
             byte0c_high: 0,
             dcs_code: DcsCode::new(5).unwrap(),
             byte0d_bit7: false,
-            cross_tone_type: CrossToneType::ToneDtcs,
+            cross_tone_type: CrossToneType::ToneDcs,
             digital_squelch: FlashDigitalSquelch::Code,
             byte0e_reserved: 0,
             ur_call: DstarCallsign::new("CQCQCQ").unwrap(),

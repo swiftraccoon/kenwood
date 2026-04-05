@@ -16,7 +16,7 @@ fn kv_line(label: &str, value: String, value_color: Color) -> Line<'_> {
     ])
 }
 
-pub fn render(app: &App, frame: &mut Frame, list_area: Rect, detail_area: Rect) {
+pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     let block = Block::default()
         .title(" APRS ")
         .borders(Borders::ALL)

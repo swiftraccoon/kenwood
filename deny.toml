@@ -1,0 +1,35 @@
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",          # serialport crate (weak copyleft, file-level only)
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+skip = [
+    # serialport uses nix 0.26 (bitflags 1), mio-serial uses nix 0.29 (bitflags 2).
+    # Unavoidable until serialport bumps to nix 0.29+.
+    { crate = "bitflags@1" },
+    { crate = "nix@0.26" },
+    # serialport/mio-serial Windows deps — deny checks all targets.
+    { crate = "windows-sys@0.52" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

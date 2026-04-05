@@ -76,29 +76,26 @@ impl fmt::Display for SquelchLevel {
 // AfGainLevel (0-99)
 // ---------------------------------------------------------------------------
 
-/// Audio frequency gain level (0-99).
+/// Audio frequency gain level.
 ///
 /// Controls the volume output level. Used by the `AG` CAT command.
 /// The wire format is a bare 3-digit zero-padded decimal (`AG 015\r`).
+///
+/// The write range is 0-99 per KI4LAX spec, but the radio's read response
+/// can return values up to 255 when the volume knob is turned beyond the
+/// write-command range. The type accepts the full 0-255 range to avoid
+/// parse errors on hardware-observed values (e.g., AG 113).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AfGainLevel(u8);
 
 impl AfGainLevel {
     /// Creates a new `AfGainLevel` from a raw value.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ValidationError::SettingOutOfRange`] if `value > 99`.
-    pub const fn new(value: u8) -> Result<Self, ValidationError> {
-        if value > 99 {
-            Err(ValidationError::SettingOutOfRange {
-                name: "AF gain level",
-                value,
-                detail: "must be 0-99",
-            })
-        } else {
-            Ok(Self(value))
-        }
+    /// Accepts the full `u8` range (0-255) since the radio can return
+    /// values above 99 on read, even though writes are limited to 0-99.
+    #[must_use]
+    pub const fn new(value: u8) -> Self {
+        Self(value)
     }
 
     /// Returns the raw `u8` value.
@@ -108,10 +105,8 @@ impl AfGainLevel {
     }
 }
 
-impl TryFrom<u8> for AfGainLevel {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
+impl From<u8> for AfGainLevel {
+    fn from(value: u8) -> Self {
         Self::new(value)
     }
 }
@@ -1099,9 +1094,11 @@ mod tests {
 
     #[test]
     fn af_gain_valid() {
-        assert!(AfGainLevel::new(0).is_ok());
-        assert!(AfGainLevel::new(99).is_ok());
-        assert!(AfGainLevel::new(100).is_err());
+        // AfGainLevel accepts full u8 range — radio reads can exceed 99
+        assert_eq!(AfGainLevel::new(0).as_u8(), 0);
+        assert_eq!(AfGainLevel::new(99).as_u8(), 99);
+        assert_eq!(AfGainLevel::new(113).as_u8(), 113);
+        assert_eq!(AfGainLevel::new(255).as_u8(), 255);
     }
 
     #[test]

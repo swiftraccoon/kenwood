@@ -128,13 +128,13 @@ mod tests {
     #[test]
     fn frequency_display_mhz() {
         let f = Frequency::new(145_000_000);
-        assert_eq!(f.as_mhz(), 145.0);
+        assert!((f.as_mhz() - 145.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn frequency_display_khz() {
         let f = Frequency::new(145_500_000);
-        assert_eq!(f.as_khz(), 145_500.0);
+        assert!((f.as_khz() - 145_500.0).abs() < f64::EPSILON);
     }
 
     #[test]

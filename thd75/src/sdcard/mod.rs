@@ -42,8 +42,8 @@
 //! | `KENWOOD/TH-D75/SETTINGS/CALLSIGN_LIST/*.tsv` | UTF-16LE TSV | D-STAR callsign list | Yes |
 //! | `KENWOOD/TH-D75/QSO_LOG/*.tsv` | TSV | QSO contact history | Yes |
 //! | `KENWOOD/TH-D75/GPS_LOG/*.nme` | NMEA 0183 | GPS track logs | Yes |
-//! | `KENWOOD/TH-D75/AUDIO_REC/*.wav` | WAV 16kHz/16-bit/mono | TX/RX audio recordings | No |
-//! | `KENWOOD/TH-D75/CAPTURE/*.bmp` | BMP 240x180/24-bit | Screen captures | No |
+//! | `KENWOOD/TH-D75/AUDIO_REC/*.wav` | WAV 16kHz/16-bit/mono | TX/RX audio recordings | Yes |
+//! | `KENWOOD/TH-D75/CAPTURE/*.bmp` | BMP 240x180/24-bit | Screen captures | Yes |
 //!
 //! # Encoding
 //!
@@ -53,11 +53,16 @@
 //! The repeater list and callsign list use UTF-16LE encoding with a BOM.
 //! The QSO log and GPS log use plain ASCII/UTF-8 text.
 
+pub mod audio;
 pub mod callsign_list;
+pub mod capture;
 pub mod config;
 pub mod gps_log;
 pub mod qso_log;
 pub mod repeater_list;
+
+pub use audio::AudioRecording;
+pub use capture::ScreenCapture;
 
 use std::fmt;
 
@@ -120,6 +125,40 @@ pub enum SdCardError {
         /// Human-readable detail about the parse failure.
         detail: String,
     },
+
+    /// A WAV file header is invalid or corrupt.
+    InvalidWavHeader {
+        /// Human-readable detail about the problem.
+        detail: String,
+    },
+
+    /// A WAV file has a valid header but unexpected audio format
+    /// (not matching TH-D75 spec: 16 kHz, 16-bit, mono).
+    UnexpectedAudioFormat {
+        /// The sample rate found in the file.
+        sample_rate: u32,
+        /// The bits per sample found in the file.
+        bits_per_sample: u16,
+        /// The channel count found in the file.
+        channels: u16,
+    },
+
+    /// A BMP file header is invalid or corrupt.
+    InvalidBmpHeader {
+        /// Human-readable detail about the problem.
+        detail: String,
+    },
+
+    /// A BMP file has a valid header but unexpected image format
+    /// (not matching TH-D75 spec: 240x180, 24-bit).
+    UnexpectedImageFormat {
+        /// The image width found in the file.
+        width: u32,
+        /// The image height found in the file.
+        height: u32,
+        /// The bits per pixel found in the file.
+        bits_per_pixel: u16,
+    },
 }
 
 impl fmt::Display for SdCardError {
@@ -158,8 +197,51 @@ impl fmt::Display for SdCardError {
             Self::ChannelParse { index, detail } => {
                 write!(f, "channel {index}: {detail}")
             }
+            Self::InvalidWavHeader { detail } => {
+                write!(f, "invalid WAV header: {detail}")
+            }
+            Self::UnexpectedAudioFormat {
+                sample_rate,
+                bits_per_sample,
+                channels,
+            } => {
+                write!(
+                    f,
+                    "unexpected WAV format: {sample_rate} Hz, {bits_per_sample}-bit, \
+                     {channels} ch (expected 16000 Hz, 16-bit, 1 ch)"
+                )
+            }
+            Self::InvalidBmpHeader { detail } => {
+                write!(f, "invalid BMP header: {detail}")
+            }
+            Self::UnexpectedImageFormat {
+                width,
+                height,
+                bits_per_pixel,
+            } => {
+                write!(
+                    f,
+                    "unexpected BMP format: {width}x{height} @ {bits_per_pixel} bpp \
+                     (expected 240x180 @ 24 bpp)"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for SdCardError {}
+
+/// Read a little-endian `u16` from a byte slice at the given offset.
+pub(crate) fn read_u16_le(data: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([data[offset], data[offset + 1]])
+}
+
+/// Read a little-endian `u32` from a byte slice at the given offset.
+pub(crate) fn read_u32_le(data: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ])
+}

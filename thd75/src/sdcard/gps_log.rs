@@ -349,7 +349,7 @@ mod tests {
         };
         assert!(fix.valid);
         let pos = fix.position.as_ref().expect("should have position");
-        assert!((pos.latitude - 35.752057).abs() < 0.001);
+        assert!((pos.latitude - 35.752_057).abs() < 0.001);
         assert!((pos.longitude - (-82.575_463_333)).abs() < 0.001);
         assert_eq!(fix.date, "030426");
     }
@@ -436,6 +436,8 @@ $GPGGA,,,,,,0,,,,,,,,*66\n";
 
     #[test]
     fn parse_real_d75_live_fix() {
+        use std::fmt::Write;
+
         // Synthetic NMEA matching D75 format (real structure, fake coordinates)
         // Build sentences with valid checksums
         let rmc1 = "$GPRMC,120000.00,A,4052.1234,N,07356.5678,W,2.5,180.0,010126,5.2,E,A";
@@ -446,7 +448,7 @@ $GPGGA,,,,,,0,,,,,,,,*66\n";
         let mut data = String::new();
         for s in [rmc1, gga1, rmc2, gga2] {
             let cs: u8 = s[1..].bytes().fold(0u8, |acc, b| acc ^ b);
-            data.push_str(&format!("{s}*{cs:02X}\n"));
+            writeln!(data, "{s}*{cs:02X}").unwrap();
         }
 
         let log = parse(data.as_bytes()).unwrap();

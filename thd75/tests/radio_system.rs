@@ -14,7 +14,7 @@ fn build_w_response(page: u16, data: &[u8]) -> Vec<u8> {
     resp
 }
 
-/// Set up MockTransport exchanges for a single-page modify_memory_page
+/// Set up `MockTransport` exchanges for a single-page `modify_memory_page`
 /// call: enter MCP, read page, ACK, write modified page, ACK, exit.
 ///
 /// `original` is the 256-byte page content the mock will return on read.
@@ -46,11 +46,13 @@ fn mock_modify_page_sequence(
 #[tokio::test]
 async fn lock_control() {
     let mut mock = MockTransport::new();
+    // Wire LC 0 = locked on D75 (inverted); get_lock() returns true.
     mock.expect(b"LC\r", b"LC 0\r");
+    // set_lock(false) → unlocked → sends wire LC 1 (inverted).
     mock.expect(b"LC 1\r", b"LC 1\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert!(!radio.get_lock().await.unwrap());
-    radio.set_lock(true).await.unwrap();
+    assert!(radio.get_lock().await.unwrap());
+    radio.set_lock(false).await.unwrap();
 }
 
 #[tokio::test]
@@ -67,8 +69,10 @@ async fn battery_level_read() {
 #[tokio::test]
 async fn dual_band_control() {
     let mut mock = MockTransport::new();
-    mock.expect(b"DL\r", b"DL 1\r");
-    mock.expect(b"DL 0\r", b"DL 0\r");
+    // Wire DL 0 = dual band on D75 (inverted); get_dual_band() returns true.
+    mock.expect(b"DL\r", b"DL 0\r");
+    // set_dual_band(false) → single band → sends wire DL 1 (inverted).
+    mock.expect(b"DL 1\r", b"DL 1\r");
     let mut radio = Radio::connect(mock).await.unwrap();
     assert!(radio.get_dual_band().await.unwrap());
     radio.set_dual_band(false).await.unwrap();
@@ -116,7 +120,8 @@ async fn scan_resume() {
 #[tokio::test]
 async fn set_lock_full() {
     let mut mock = MockTransport::new();
-    mock.expect(b"LC 1,2,1,0,1,0\r", b"LC 1\r");
+    // set_lock_full(true, ...) → locked=true inverted to wire 0.
+    mock.expect(b"LC 0,2,1,0,1,0\r", b"LC 0\r");
     let mut radio = Radio::connect(mock).await.unwrap();
     radio
         .set_lock_full(
@@ -256,4 +261,40 @@ async fn set_beep_via_mcp_preserves_other_bytes() {
 
     let mut radio = Radio::connect(mock).await.unwrap();
     radio.set_beep_via_mcp(true).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// frequency_down — steps down and reads back frequency
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn frequency_down() {
+    let mut mock = MockTransport::new();
+    // DW 0 steps frequency down on Band A; radio echoes DW\r.
+    mock.expect(b"DW 0\r", b"DW\r");
+    // Then we read back the new frequency.
+    mock.expect(b"FQ 0\r", b"FQ 0,0144000000\r");
+    let mut radio = Radio::connect(mock).await.unwrap();
+    let ch = radio.frequency_down(Band::A).await.unwrap();
+    assert_eq!(ch.rx_frequency.as_hz(), 144_000_000);
+}
+
+#[tokio::test]
+async fn frequency_down_blind() {
+    let mut mock = MockTransport::new();
+    mock.expect(b"DW 0\r", b"DW\r");
+    let mut radio = Radio::connect(mock).await.unwrap();
+    radio.frequency_down_blind(Band::A).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// set_beep_volume_via_mcp — out-of-range rejection
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_beep_volume_rejects_out_of_range() {
+    // Volume 8 is out of range (0-7) — should fail before sending anything.
+    let mock = MockTransport::new();
+    let mut radio = Radio::connect(mock).await.unwrap();
+    assert!(radio.set_beep_volume_via_mcp(8).await.is_err());
 }

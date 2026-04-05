@@ -6,6 +6,10 @@ rust-version = "1.89"
 description = "Terminal UI for the Kenwood TH-D75 transceiver"
 license = "MIT OR Apache-2.0"
 authors = ["swiftraccoon"]
+repository = "https://github.com/swiftraccoon/kenwood"
+readme = "../README.md"
+keywords = ["ham-radio", "kenwood", "tui", "amateur-radio"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 kenwood-thd75 = { path = "../thd75" }
@@ -13,19 +17,31 @@ ratatui = "0.30"
 crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-dirs = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints.rust]
 unsafe_code = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+unused_results = "deny"
+elided_lifetimes_in_paths = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_import_braces = "deny"
+unused_qualifications = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
-# Common pedantic overrides for TUI code
+cargo = { level = "deny", priority = -1 }
+# Common overrides for TUI code
 cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 module_name_repetitions = "allow"
 too_many_lines = "allow"
+multiple_crate_versions = "allow"
+# In a binary crate with private modules, pub(crate) satisfies unreachable_pub
+# but clippy::redundant_pub_crate considers it redundant — allow to resolve conflict.
+redundant_pub_crate = "allow"

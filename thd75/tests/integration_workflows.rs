@@ -19,7 +19,7 @@ async fn full_session_from_fixture() {
     radio.set_auto_info(true).await.unwrap();
 
     let level = radio.get_smeter(Band::A).await.unwrap();
-    assert_eq!(level, kenwood_thd75::types::SMeterReading::new(5).unwrap());
+    assert_eq!(level, SMeterReading::new(5).unwrap());
 
     radio
         .set_power_level(Band::A, PowerLevel::Low)
@@ -60,7 +60,7 @@ async fn frequency_change_workflow() {
     radio.set_mode(Band::A, Mode::Dv).await.unwrap();
     assert_eq!(
         radio.get_smeter(Band::A).await.unwrap(),
-        kenwood_thd75::types::SMeterReading::new(3).unwrap()
+        SMeterReading::new(3).unwrap()
     );
 }
 
@@ -85,24 +85,22 @@ async fn audio_settings_workflow() {
     mock.expect(b"VX\r", b"VX 0\r");
 
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(
-        radio.get_af_gain().await.unwrap(),
-        kenwood_thd75::types::AfGainLevel::new(20).unwrap()
-    );
+    assert_eq!(radio.get_af_gain().await.unwrap(), AfGainLevel::new(20));
     let (tnc_mode, tnc_setting) = radio.get_tnc_mode().await.unwrap();
-    assert_eq!(tnc_mode, kenwood_thd75::types::TncMode::Aprs);
-    assert_eq!(tnc_setting, kenwood_thd75::types::TncBaud::Bps1200);
+    assert_eq!(tnc_mode, TncMode::Aprs);
+    assert_eq!(tnc_setting, TncBaud::Bps1200);
     assert!(!radio.get_vox().await.unwrap());
 }
 
 #[tokio::test]
 async fn system_settings_workflow() {
     let mut mock = MockTransport::new();
+    // LC wire value 0 = locked on D75 (inverted), so get_lock() returns true.
     mock.expect(b"LC\r", b"LC 0\r");
     mock.expect(b"BT\r", b"BT 1\r");
 
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert!(!radio.get_lock().await.unwrap());
+    assert!(radio.get_lock().await.unwrap());
     assert!(radio.get_bluetooth().await.unwrap());
 }
 
@@ -116,14 +114,14 @@ async fn dstar_callsign_slot_workflow() {
     let mut radio = Radio::connect(mock).await.unwrap();
     assert_eq!(
         radio.get_active_callsign_slot().await.unwrap(),
-        kenwood_thd75::types::CallsignSlot::new(10).unwrap()
+        CallsignSlot::new(10).unwrap()
     );
     radio
-        .set_active_callsign_slot(kenwood_thd75::types::CallsignSlot::new(5).unwrap())
+        .set_active_callsign_slot(CallsignSlot::new(5).unwrap())
         .await
         .unwrap();
     assert_eq!(
         radio.get_active_callsign_slot().await.unwrap(),
-        kenwood_thd75::types::CallsignSlot::new(5).unwrap()
+        CallsignSlot::new(5).unwrap()
     );
 }

@@ -18,8 +18,7 @@ run ./lint.sh
 echo ""
 echo "========== Preparing k8s CI =========="
 tar czf /tmp/kenwood-ci.tar.gz \
-    --exclude='*/target' --exclude='.git' --exclude='thd75_re' \
-    --exclude='docs' --exclude='.superpowers' --exclude='.claude' . 2>/dev/null
+    --exclude='*/target' --exclude='.git' . 2>/dev/null
 
 ci_pod() {
     local name=$1 image=$2 setup=$3
@@ -46,13 +45,22 @@ ci_pod() {
         echo "--- check tui ---"
         cargo check --manifest-path thd75-tui/Cargo.toml 2>&1 | tail -1
         echo "--- clippy lib ---"
-        cargo clippy --manifest-path thd75/Cargo.toml -- -D warnings 2>&1 | tail -1
+        cargo clippy --manifest-path thd75/Cargo.toml --all-targets -- -D warnings 2>&1 | tail -1
         echo "--- clippy tui ---"
-        cargo clippy --manifest-path thd75-tui/Cargo.toml -- -D warnings 2>&1 | tail -1
+        cargo clippy --manifest-path thd75-tui/Cargo.toml --all-targets -- -D warnings 2>&1 | tail -1
         echo "--- test ---"
         cargo test --manifest-path thd75/Cargo.toml --lib 2>&1 | tail -1
         echo "--- doc ---"
         RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path thd75/Cargo.toml --no-deps 2>&1 | tail -1
+        echo "--- audit ---"
+        cargo install cargo-audit --quiet 2>/dev/null
+        cargo audit --file thd75/Cargo.lock 2>&1 | tail -3
+        echo "--- deny ---"
+        cargo install cargo-deny --quiet 2>/dev/null
+        cargo deny --manifest-path thd75/Cargo.toml check 2>&1 | tail -3
+        echo "--- machete ---"
+        cargo install cargo-machete --quiet 2>/dev/null
+        cargo machete thd75/ 2>&1 | tail -3
     ' 2>&1 || failed=1
 
     kubectl delete pod "ci-$name" --grace-period=0 --force 2>/dev/null &

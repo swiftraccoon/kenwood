@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mcp_speed = cli.mcp_speed;
 
-    std::thread::spawn(move || {
+    let _thread = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -104,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ) -> i32;
                 static kCFRunLoopDefaultMode: *const std::ffi::c_void;
             }
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, 0);
+            let _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, 0);
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -156,7 +156,7 @@ async fn run_app(
     app.connected = true;
     app.cmd_tx = Some(events.command_sender());
 
-    terminal.draw(|frame| ui::render(&app, frame))?;
+    let _ = terminal.draw(|frame| ui::render(&app, frame))?;
 
     loop {
         let msg = events.next().await;
@@ -165,7 +165,7 @@ async fn run_app(
             break;
         }
         if needs_render {
-            terminal.draw(|frame| ui::render(&app, frame))?;
+            let _ = terminal.draw(|frame| ui::render(&app, frame))?;
         }
     }
 

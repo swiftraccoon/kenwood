@@ -332,14 +332,14 @@ pub enum DigitalSquelchType {
 }
 
 impl TryFrom<u8> for DigitalSquelchType {
-    type Error = crate::error::ValidationError;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Off),
             1 => Ok(Self::CodeSquelch),
             2 => Ok(Self::CallsignSquelch),
-            _ => Err(crate::error::ValidationError::SettingOutOfRange {
+            _ => Err(ValidationError::SettingOutOfRange {
                 name: "digital squelch type",
                 value,
                 detail: "must be 0-2",
@@ -387,7 +387,7 @@ pub enum DstarAutoReplyMode {
 }
 
 impl TryFrom<u8> for DstarAutoReplyMode {
-    type Error = crate::error::ValidationError;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -395,7 +395,7 @@ impl TryFrom<u8> for DstarAutoReplyMode {
             1 => Ok(Self::Reply),
             2 => Ok(Self::Position),
             3 => Ok(Self::Both),
-            _ => Err(crate::error::ValidationError::SettingOutOfRange {
+            _ => Err(ValidationError::SettingOutOfRange {
                 name: "D-STAR auto reply mode",
                 value,
                 detail: "must be 0-3",
@@ -405,13 +405,13 @@ impl TryFrom<u8> for DstarAutoReplyMode {
 }
 
 impl TryFrom<u8> for GatewayMode {
-    type Error = crate::error::ValidationError;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Auto),
             1 => Ok(Self::Manual),
-            _ => Err(crate::error::ValidationError::SettingOutOfRange {
+            _ => Err(ValidationError::SettingOutOfRange {
                 name: "gateway mode",
                 value,
                 detail: "must be 0-1",

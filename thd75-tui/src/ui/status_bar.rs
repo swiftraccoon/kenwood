@@ -6,7 +6,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::App;
 
-pub fn render(app: &App, frame: &mut Frame, area: Rect) {
+pub(crate) fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let mut spans: Vec<Span<'_>> = Vec::new();
 
     // Connection
@@ -35,9 +35,9 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect) {
     let mut flags = Vec::new();
     flags.push(format!("BAT:{}", s.battery_level));
     flags.push(format!("Vol:{}", s.af_gain));
-    if !s.lock {
+    if s.lock {
         flags.push("LCK".into());
-    } // CAT inverted on D75
+    }
     if s.bluetooth {
         flags.push("BT".into());
     }
@@ -47,9 +47,9 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect) {
     if s.gps_enabled {
         flags.push("GPS".into());
     }
-    if s.dual_band {
+    if !s.dual_band {
         flags.push("1BD".into());
-    } // CAT inverted on D75
+    }
 
     spans.push(Span::styled(
         format!(" {} ", flags.join(" ")),

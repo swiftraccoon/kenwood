@@ -35,7 +35,7 @@ struct ByteDiff {
 }
 
 /// Classify an offset into a known memory region name.
-fn region_for_offset(offset: usize) -> &'static str {
+const fn region_for_offset(offset: usize) -> &'static str {
     match offset {
         0x0000..0x2000 => "System settings",
         0x2000..0x3300 => "Channel flags",
@@ -55,6 +55,7 @@ fn region_for_offset(offset: usize) -> &'static str {
 /// The output groups changes by memory region and shows both the hex
 /// and ASCII values (when printable) to aid manual analysis.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn diff_memory_dumps() {
     let path_a = "tests/fixtures/memory_dump_a.bin";
     let path_b = "tests/fixtures/memory_dump_b.bin";
@@ -101,7 +102,9 @@ fn diff_memory_dumps() {
         .zip(dump_b.iter())
         .enumerate()
         .filter_map(|(i, (&a, &b))| {
-            if a != b {
+            if a == b {
+                None
+            } else {
                 Some(ByteDiff {
                     offset: i,
                     page: i / programming::PAGE_SIZE,
@@ -109,8 +112,6 @@ fn diff_memory_dumps() {
                     old: a,
                     new: b,
                 })
-            } else {
-                None
             }
         })
         .collect();
@@ -188,35 +189,35 @@ fn print_hex_diff(a: &[u8], b: &[u8], start: usize, end: usize) {
 
         // Dump A line.
         eprint!("    A 0x{row_start:05X}: ");
-        for i in row_start..row_end {
-            eprint!("{:02X} ", a[i]);
+        for &byte in &a[row_start..row_end] {
+            eprint!("{byte:02X} ");
         }
         eprint!(" |");
-        for i in row_start..row_end {
-            eprint!("{}", displayable_char(a[i]));
+        for &byte in &a[row_start..row_end] {
+            eprint!("{}", displayable_char(byte));
         }
         eprintln!("|");
 
         // Dump B line.
         eprint!("    B 0x{row_start:05X}: ");
-        for i in row_start..row_end {
-            eprint!("{:02X} ", b[i]);
+        for &byte in &b[row_start..row_end] {
+            eprint!("{byte:02X} ");
         }
         eprint!(" |");
-        for i in row_start..row_end {
-            eprint!("{}", displayable_char(b[i]));
+        for &byte in &b[row_start..row_end] {
+            eprint!("{}", displayable_char(byte));
         }
         eprintln!("|");
 
         // Marker line showing which bytes differ.
         eprint!("               ");
         let mut any_diff = false;
-        for i in row_start..row_end {
-            if a[i] != b[i] {
+        for (&ab, &bb) in a[row_start..row_end].iter().zip(&b[row_start..row_end]) {
+            if ab == bb {
+                eprint!("   ");
+            } else {
                 eprint!("^^ ");
                 any_diff = true;
-            } else {
-                eprint!("   ");
             }
         }
         if any_diff {
@@ -228,7 +229,7 @@ fn print_hex_diff(a: &[u8], b: &[u8], start: usize, end: usize) {
 }
 
 /// Format a byte as a printable ASCII character, or `.` if not printable.
-fn displayable_char(b: u8) -> char {
+const fn displayable_char(b: u8) -> char {
     if b.is_ascii_graphic() || b == b' ' {
         b as char
     } else {
@@ -279,16 +280,16 @@ fn hex_dump_region() {
     for row_start in (aligned_start..end).step_by(16) {
         let row_end = (row_start + 16).min(data.len());
         eprint!("  0x{row_start:05X}: ");
-        for i in row_start..row_end {
-            eprint!("{:02X} ", data[i]);
+        for &byte in &data[row_start..row_end] {
+            eprint!("{byte:02X} ");
         }
         // Pad short rows.
         for _ in row_end..row_start + 16 {
             eprint!("   ");
         }
         eprint!(" |");
-        for i in row_start..row_end {
-            eprint!("{}", displayable_char(data[i]));
+        for &byte in &data[row_start..row_end] {
+            eprint!("{}", displayable_char(byte));
         }
         eprintln!("|");
     }

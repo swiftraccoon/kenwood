@@ -3,7 +3,7 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::{Band, BatteryLevel, DetectOutputMode, KeyLockType};
+use crate::types::{Band, BatteryLevel, ChannelMemory, DetectOutputMode, KeyLockType};
 
 use super::Radio;
 
@@ -113,9 +113,10 @@ impl<T: Transport> Radio<T> {
 
     /// Get the key lock state (LC read).
     ///
-    /// On the TH-D75, LC controls the key lock. The CAT value is inverted
-    /// relative to the radio's display: `LC 0` means locked, `LC 1` means
-    /// unlocked. The MCP offset for the lock setting is `0x1060`.
+    /// On the TH-D75, the LC wire value is inverted: `LC 0` means locked,
+    /// `LC 1` means unlocked. This method inverts the response so that
+    /// `true` means locked (logical meaning). The MCP offset for the lock
+    /// setting is `0x1060`.
     ///
     /// # Errors
     ///
@@ -124,7 +125,8 @@ impl<T: Transport> Radio<T> {
         tracing::debug!("reading key lock state");
         let response = self.execute(Command::GetLock).await?;
         match response {
-            Response::Lock { locked } => Ok(locked),
+            // Wire value is inverted: 0 = locked, 1 = unlocked.
+            Response::Lock { locked } => Ok(!locked),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "Lock".into(),
                 actual: format!("{other:?}").into_bytes(),
@@ -134,15 +136,17 @@ impl<T: Transport> Radio<T> {
 
     /// Set the key lock state (LC write).
     ///
-    /// See [`get_lock`](Self::get_lock) for details on the CAT value
-    /// inversion and the corresponding MCP offset.
+    /// Accepts logical meaning: `true` = locked, `false` = unlocked.
+    /// Inverts before sending on the wire (`LC 0` = locked, `LC 1` =
+    /// unlocked on the D75).
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn set_lock(&mut self, locked: bool) -> Result<(), Error> {
         tracing::info!(locked, "setting key lock");
-        let response = self.execute(Command::SetLock { locked }).await?;
+        // Invert: logical true (locked) → wire 0, logical false → wire 1.
+        let response = self.execute(Command::SetLock { locked: !locked }).await?;
         match response {
             Response::Lock { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -158,8 +162,8 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Parameters
     ///
-    /// - `locked`: master lock enable (`true` = locked, `false` = unlocked). Note the CAT
-    ///   value is inverted: `0` on the wire means locked, `1` means unlocked.
+    /// - `locked`: master lock enable (`true` = locked, `false` = unlocked). Inverted
+    ///   before sending on the wire (D75: `0` = locked, `1` = unlocked).
     /// - `lock_type`: what to lock — key only, key+PTT, or key+PTT+dial.
     /// - `lock_a`: lock Band A controls (`true` = locked).
     /// - `lock_b`: lock Band B controls (`true` = locked).
@@ -188,9 +192,10 @@ impl<T: Transport> Radio<T> {
             lock_ptt,
             "setting full lock configuration"
         );
+        // Invert master lock: logical true (locked) → wire 0.
         let response = self
             .execute(Command::SetLockFull {
-                locked,
+                locked: !locked,
                 lock_type,
                 lock_a,
                 lock_b,
@@ -209,6 +214,10 @@ impl<T: Transport> Radio<T> {
 
     /// Get the dual-band enabled state (DL read).
     ///
+    /// On the TH-D75, the DL wire value is inverted: `DL 0` means dual
+    /// band enabled, `DL 1` means single band. This method inverts the
+    /// response so that `true` means dual band is enabled (logical meaning).
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -216,7 +225,8 @@ impl<T: Transport> Radio<T> {
         tracing::debug!("reading dual-band state");
         let response = self.execute(Command::GetDualBand).await?;
         match response {
-            Response::DualBand { enabled } => Ok(enabled),
+            // Wire value is inverted: 0 = dual band, 1 = single band.
+            Response::DualBand { enabled } => Ok(!enabled),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "DualBand".into(),
                 actual: format!("{other:?}").into_bytes(),
@@ -226,12 +236,19 @@ impl<T: Transport> Radio<T> {
 
     /// Set the dual-band enabled state (DL write).
     ///
+    /// Accepts logical meaning: `true` = dual band enabled, `false` =
+    /// single band. Inverts before sending on the wire (`DL 0` = dual
+    /// band, `DL 1` = single band on the D75).
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn set_dual_band(&mut self, enabled: bool) -> Result<(), Error> {
         tracing::debug!(enabled, "setting dual-band state");
-        let response = self.execute(Command::SetDualBand { enabled }).await?;
+        // Invert: logical true (dual band) → wire 0, logical false → wire 1.
+        let response = self
+            .execute(Command::SetDualBand { enabled: !enabled })
+            .await?;
         match response {
             Response::DualBand { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -241,7 +258,11 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Step frequency down on the given band (DW action).
+    /// Step frequency down on the given band (DW action), then read back the
+    /// resulting frequency.
+    ///
+    /// Sends `DW` to step down, then issues `FQ` to read back the new
+    /// frequency. Returns the post-step [`ChannelMemory`].
     ///
     /// Per KI4LAX CAT reference: DW tunes the current band's frequency
     /// down by the current step size. Counterpart to [`frequency_up`](super::Radio::frequency_up).
@@ -266,11 +287,38 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn frequency_down(&mut self, band: Band) -> Result<(), Error> {
+    ///
+    /// [`ChannelMemory`]: crate::types::ChannelMemory
+    pub async fn frequency_down(&mut self, band: Band) -> Result<ChannelMemory, Error> {
         tracing::debug!(?band, "stepping frequency down");
         let response = self.execute(Command::FrequencyDown { band }).await?;
         // The radio echoes either `DW\r` (parsed as FrequencyDown) or a bare
         // OK depending on firmware version and AI mode state.
+        match response {
+            Response::FrequencyDown | Response::Ok => {}
+            other => {
+                return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                    expected: "FrequencyDown".into(),
+                    actual: format!("{other:?}").into_bytes(),
+                }));
+            }
+        }
+        self.get_frequency(band).await
+    }
+
+    /// Step frequency down on the given band (DW action) without reading
+    /// back the result.
+    ///
+    /// This is the fire-and-forget variant of [`frequency_down`](Self::frequency_down).
+    /// Use this when you do not need the resulting frequency (saves one
+    /// round-trip).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn frequency_down_blind(&mut self, band: Band) -> Result<(), Error> {
+        tracing::debug!(?band, "stepping frequency down (blind)");
+        let response = self.execute(Command::FrequencyDown { band }).await?;
         match response {
             Response::FrequencyDown | Response::Ok => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -554,6 +602,16 @@ impl<T: Transport> Radio<T> {
         #[allow(clippy::cast_possible_truncation)]
         const PAGE: u16 = (OFFSET / 256) as u16;
         const BYTE_INDEX: usize = OFFSET % 256;
+
+        if volume > 7 {
+            return Err(Error::Validation(
+                crate::error::ValidationError::SettingOutOfRange {
+                    name: "beep volume",
+                    value: volume,
+                    detail: "must be 0-7",
+                },
+            ));
+        }
 
         tracing::info!(volume, offset = OFFSET, "setting beep volume via MCP");
         self.modify_memory_page(PAGE, |data| {

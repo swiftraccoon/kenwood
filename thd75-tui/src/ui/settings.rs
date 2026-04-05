@@ -14,12 +14,12 @@ fn bool_span(b: bool) -> (String, Color) {
     }
 }
 
-fn num_span(v: u8) -> (String, Color) {
+fn num_span(v: impl std::fmt::Display) -> (String, Color) {
     (format!("{v}"), Color::Yellow)
 }
 
 /// Render the CAT settings list (instant writes, no disconnect).
-pub fn render_cat(app: &App, frame: &mut Frame, list_area: Rect, detail_area: Rect) {
+pub(crate) fn render_cat(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     let rows = cat_settings();
     render_settings_list(
         app,
@@ -33,7 +33,7 @@ pub fn render_cat(app: &App, frame: &mut Frame, list_area: Rect, detail_area: Re
 }
 
 /// Render the MCP settings list (~3s per change, brief disconnect).
-pub fn render_mcp(app: &App, frame: &mut Frame, list_area: Rect, detail_area: Rect) {
+pub(crate) fn render_mcp(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     let rows = mcp_settings();
     render_settings_list(
         app,
@@ -48,7 +48,7 @@ pub fn render_mcp(app: &App, frame: &mut Frame, list_area: Rect, detail_area: Re
 
 fn render_settings_list(
     app: &App,
-    frame: &mut Frame,
+    frame: &mut Frame<'_>,
     list_area: Rect,
     detail_area: Rect,
     rows: &[SettingRow],
@@ -156,25 +156,43 @@ fn render_settings_list(
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )));
-    lines.push(kv(
-        " Battery",
-        &match s.battery_level {
-            0 => "Empty (Red)".to_string(),
-            1 => "1/3 (Yellow)".to_string(),
-            2 => "2/3 (Green)".to_string(),
-            3 => "Full (Green)".to_string(),
-            4 => "Charging".to_string(),
-            n => format!("{n}"),
-        },
-    ));
-    lines.push(kv(" AF Gain", &s.af_gain.to_string()));
+    lines.push(kv(" Battery", &{
+        use kenwood_thd75::types::BatteryLevel;
+        match s.battery_level {
+            BatteryLevel::Empty => "Empty (Red)".to_string(),
+            BatteryLevel::OneThird => "1/3 (Yellow)".to_string(),
+            BatteryLevel::TwoThirds => "2/3 (Green)".to_string(),
+            BatteryLevel::Full => "Full (Green)".to_string(),
+            BatteryLevel::Charging => "Charging".to_string(),
+        }
+    }));
+    lines.push(kv(" AF Gain", &format!("{}", s.af_gain)));
     lines.push(kv(" Beep", &on_off(s.beep)));
-    lines.push(kv(" Lock", &on_off(!s.lock))); // CAT inverted on D75
-    lines.push(kv(" Dual Band", &on_off(!s.dual_band))); // CAT inverted on D75
+    lines.push(kv(" Lock", &on_off(s.lock)));
+    lines.push(kv(" Dual Band", &on_off(s.dual_band)));
     lines.push(kv(" Bluetooth", &on_off(s.bluetooth)));
     lines.push(kv(" VOX", &on_off(s.vox)));
     lines.push(kv(" GPS", &on_off(s.gps_enabled)));
-    lines.push(kv(" Beacon", &beacon_label(s.beacon_type)));
+    lines.push(kv(" Beacon", &format!("{}", s.beacon_type)));
+    lines.push(kv(
+        " Fine Step",
+        &s.fine_step.map_or("N/A".to_string(), |fs| format!("{fs}")),
+    ));
+    lines.push(kv(
+        " Filter SSB",
+        &s.filter_width_ssb
+            .map_or("N/A".to_string(), |w| format!("{w}")),
+    ));
+    lines.push(kv(
+        " Filter CW",
+        &s.filter_width_cw
+            .map_or("N/A".to_string(), |w| format!("{w}")),
+    ));
+    lines.push(kv(
+        " Filter AM",
+        &s.filter_width_am
+            .map_or("N/A".to_string(), |w| format!("{w}")),
+    ));
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled(
@@ -187,7 +205,7 @@ fn render_settings_list(
         " Step",
         &s.band_a
             .step_size
-            .map_or("N/A".into(), |st| format!("{st:?}")),
+            .map_or("N/A".into(), |st| format!("{st}")),
     ));
     lines.push(kv(" Attenuator", &on_off(s.band_a.attenuator)));
     lines.push(kv(" Squelch", &s.band_a.squelch.to_string()));
@@ -203,7 +221,7 @@ fn render_settings_list(
         " Step",
         &s.band_b
             .step_size
-            .map_or("N/A".into(), |st| format!("{st:?}")),
+            .map_or("N/A".into(), |st| format!("{st}")),
     ));
     lines.push(kv(" Attenuator", &on_off(s.band_b.attenuator)));
     lines.push(kv(" Squelch", &s.band_b.squelch.to_string()));
@@ -215,8 +233,46 @@ fn render_settings_list(
 fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
     match row {
         // --- RX (live CAT for squelch, MCP for filters) ---
-        SettingRow::SquelchA => num_span(app.state.band_a.squelch),
-        SettingRow::SquelchB => num_span(app.state.band_b.squelch),
+        SettingRow::SquelchA => num_span(app.state.band_a.squelch.as_u8()),
+        SettingRow::SquelchB => num_span(app.state.band_b.squelch.as_u8()),
+        SettingRow::StepSizeA => (
+            app.state
+                .band_a
+                .step_size
+                .map_or("N/A".into(), |st| format!("{st}")),
+            Color::Yellow,
+        ),
+        SettingRow::StepSizeB => (
+            app.state
+                .band_b
+                .step_size
+                .map_or("N/A".into(), |st| format!("{st}")),
+            Color::Yellow,
+        ),
+        SettingRow::FineStep => (
+            app.state
+                .fine_step
+                .map_or("N/A".into(), |fs| format!("{fs}")),
+            Color::Yellow,
+        ),
+        SettingRow::FilterWidthSsb => (
+            app.state
+                .filter_width_ssb
+                .map_or("N/A".into(), |w| format!("{w}")),
+            Color::Yellow,
+        ),
+        SettingRow::FilterWidthCw => (
+            app.state
+                .filter_width_cw
+                .map_or("N/A".into(), |w| format!("{w}")),
+            Color::Yellow,
+        ),
+        SettingRow::FilterWidthAm => (
+            app.state
+                .filter_width_am
+                .map_or("N/A".into(), |w| format!("{w}")),
+            Color::Yellow,
+        ),
         SettingRow::FmNarrow => mcp_num(app, |s| s.settings().fm_narrow()),
         SettingRow::SsbHighCut => mcp_num(app, |s| s.settings().ssb_high_cut()),
         SettingRow::CwHighCut => mcp_num(app, |s| s.settings().cw_high_cut()),
@@ -236,8 +292,8 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
 
         // --- VOX (gain/delay: live CAT; rest: MCP) ---
         SettingRow::VoxEnabled => bool_span(app.state.vox),
-        SettingRow::VoxGain => num_span(app.state.vox_gain),
-        SettingRow::VoxDelay => (format!("{} (×100ms)", app.state.vox_delay), Color::Yellow),
+        SettingRow::VoxGain => num_span(app.state.vox_gain.as_u8()),
+        SettingRow::VoxDelay => (format!("{}", app.state.vox_delay), Color::Yellow),
         SettingRow::VoxTxOnBusy => mcp_bool(app, |s| s.settings().vox_tx_on_busy()),
 
         // --- CW ---
@@ -259,8 +315,8 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::PfKey1 => mcp_num(app, |s| s.settings().pf_key1()),
         SettingRow::PfKey2 => mcp_num(app, |s| s.settings().pf_key2()),
 
-        // --- Lock (Lock: live CAT inverted; rest: MCP) ---
-        SettingRow::Lock => bool_span(!app.state.lock),
+        // --- Lock (Lock: live CAT; rest: MCP) ---
+        SettingRow::Lock => bool_span(app.state.lock),
         SettingRow::KeyLockType => mcp_str(app, |s| match s.settings().key_lock_type_raw() {
             0 => "Key Only".into(),
             1 => "Key+PTT".into(),
@@ -273,7 +329,7 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::LockPtt => mcp_bool(app, |s| s.settings().lock_key_ptt()),
         SettingRow::AprsLock => mcp_bool(app, |s| s.settings().aprs_lock()),
 
-        // --- Display (DualBand: live CAT inverted; rest: MCP) ---
+        // --- Display (DualBand: live CAT; rest: MCP) ---
         SettingRow::DualDisplaySize => mcp_num(app, |s| s.settings().dual_display_size()),
         SettingRow::DisplayArea => mcp_num(app, |s| s.settings().display_area()),
         SettingRow::InfoLine => mcp_num(app, |s| s.settings().info_line()),
@@ -282,7 +338,7 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::DisplayHoldTime => mcp_num(app, |s| s.settings().display_hold_time()),
         SettingRow::DisplayMethod => mcp_num(app, |s| s.settings().display_method()),
         SettingRow::PowerOnDisplay => mcp_num(app, |s| s.settings().power_on_display()),
-        SettingRow::DualBand => bool_span(!app.state.dual_band),
+        SettingRow::DualBand => bool_span(app.state.dual_band),
 
         // --- Audio ---
         SettingRow::EmrVolumeLevel => mcp_num(app, |s| s.settings().emr_volume_level()),
@@ -358,8 +414,18 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::AttenuatorB => bool_span(app.state.band_b.attenuator),
         SettingRow::ModeA => (format!("{}", app.state.band_a.mode), Color::Cyan),
         SettingRow::ModeB => (format!("{}", app.state.band_b.mode), Color::Cyan),
-        SettingRow::BeaconType => (beacon_label(app.state.beacon_type), Color::Yellow),
+        SettingRow::BeaconType => (format!("{}", app.state.beacon_type), Color::Yellow),
         SettingRow::GpsEnabled => bool_span(app.state.gps_enabled),
+        SettingRow::ScanResumeCat => (
+            app.state
+                .scan_resume_cat
+                .map_or("? (write-only)".into(), |m| match m {
+                    kenwood_thd75::types::ScanResumeMethod::TimeOperated => "Time".into(),
+                    kenwood_thd75::types::ScanResumeMethod::CarrierOperated => "Carrier".into(),
+                    kenwood_thd75::types::ScanResumeMethod::Seek => "Seek".into(),
+                }),
+            Color::Yellow,
+        ),
         SettingRow::ActiveBand
         | SettingRow::VfoMemModeA
         | SettingRow::VfoMemModeB
@@ -411,13 +477,4 @@ fn kv<'a>(label: &'a str, value: &str) -> Line<'a> {
 
 fn on_off(b: bool) -> String {
     if b { "On".into() } else { "Off".into() }
-}
-
-fn beacon_label(b: u8) -> String {
-    match b {
-        0 => "Off".into(),
-        1 => "Auto".into(),
-        2 => "Manual".into(),
-        _ => format!("{b}"),
-    }
 }

@@ -454,9 +454,9 @@ mod tests {
         image[0x2000 + 5 * 4 + 3] = 0xFF;
 
         // Channel 5 data at memgroup 0, slot 5 = offset 0x4000 + 5 * 40 = 0x40C8.
-        let freq5: u32 = 446_000_000;
-        let freq5_bytes = freq5.to_le_bytes();
-        image[0x40C8..0x40CC].copy_from_slice(&freq5_bytes);
+        let ch5_freq: u32 = 446_000_000;
+        let ch5_freq_bytes = ch5_freq.to_le_bytes();
+        image[0x40C8..0x40CC].copy_from_slice(&ch5_freq_bytes);
         image[0x40CC..0x40D0].copy_from_slice(&[0, 0, 0, 0]);
         image[0x40D0] = 0x00;
         image[0x40D1] = 0x00;

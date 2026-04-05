@@ -1,0 +1,30 @@
+name: Quality
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  machete:
+    name: Unused deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: taiki-e/install-action@cargo-machete
+      - run: cargo machete thd75/
+
+  semver:
+    name: Semver check
+    runs-on: ubuntu-latest
+    # Only run on PRs — needs a baseline to compare against
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: taiki-e/install-action@cargo-semver-checks
+      - run: cargo semver-checks --manifest-path thd75/Cargo.toml

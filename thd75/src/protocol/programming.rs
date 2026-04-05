@@ -442,24 +442,34 @@ mod tests {
     #[test]
     fn memory_geometry_consistent() {
         assert_eq!(TOTAL_SIZE, TOTAL_PAGES as usize * PAGE_SIZE);
-        assert!(MAX_WRITABLE_PAGE < TOTAL_PAGES);
+        // These are compile-time truths but we assert them to catch
+        // regressions if someone edits the constants.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(MAX_WRITABLE_PAGE < TOTAL_PAGES);
+        }
         assert_eq!(FACTORY_CAL_PAGES, 2);
     }
 
     #[test]
     fn region_boundaries_non_overlapping() {
-        // Settings end before flags start
-        assert!(SETTINGS_END < CHANNEL_FLAGS_START);
-        // Flags end before data starts
-        assert!(CHANNEL_FLAGS_END < CHANNEL_DATA_START);
-        // Data ends before names start
-        assert!(CHANNEL_DATA_END < CHANNEL_NAMES_START);
-        // Names end before APRS starts
-        assert!(CHANNEL_NAMES_END < APRS_START);
-        // APRS region before D-STAR
-        assert!(APRS_START < DSTAR_RPT_START);
-        // D-STAR before Bluetooth
-        assert!(DSTAR_RPT_START < BT_START);
+        // These are all compile-time truths verified at test time to
+        // catch regressions if the constants are ever changed.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            // Settings end before flags start
+            assert!(SETTINGS_END < CHANNEL_FLAGS_START);
+            // Flags end before data starts
+            assert!(CHANNEL_FLAGS_END < CHANNEL_DATA_START);
+            // Data ends before names start
+            assert!(CHANNEL_DATA_END < CHANNEL_NAMES_START);
+            // Names end before APRS starts
+            assert!(CHANNEL_NAMES_END < APRS_START);
+            // APRS region before D-STAR
+            assert!(APRS_START < DSTAR_RPT_START);
+            // D-STAR before Bluetooth
+            assert!(DSTAR_RPT_START < BT_START);
+        }
     }
 
     #[test]

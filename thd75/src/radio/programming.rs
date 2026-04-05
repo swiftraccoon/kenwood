@@ -1242,6 +1242,7 @@ mod tests {
         // Read 2 pages starting at 0x0040.
         for i in 0..2u16 {
             let page = 0x0040 + i;
+            #[allow(clippy::cast_possible_truncation)]
             let data = vec![i as u8; 256];
             let cmd = programming::build_read_command(page);
             mock.expect(&cmd, &build_w_response(page, &data));

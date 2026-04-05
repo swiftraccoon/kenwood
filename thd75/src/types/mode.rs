@@ -305,6 +305,52 @@ pub enum StepSize {
     Hz100000 = 11,
 }
 
+impl StepSize {
+    /// Returns the step size in Hz.
+    #[must_use]
+    pub const fn as_hz(self) -> u32 {
+        match self {
+            Self::Hz5000 => 5_000,
+            Self::Hz6250 => 6_250,
+            Self::Hz8330 => 8_330,
+            Self::Hz9000 => 9_000,
+            Self::Hz10000 => 10_000,
+            Self::Hz12500 => 12_500,
+            Self::Hz15000 => 15_000,
+            Self::Hz20000 => 20_000,
+            Self::Hz25000 => 25_000,
+            Self::Hz30000 => 30_000,
+            Self::Hz50000 => 50_000,
+            Self::Hz100000 => 100_000,
+        }
+    }
+
+    /// Returns the step size as a kHz display string (e.g. `"5.0"`, `"6.25"`).
+    #[must_use]
+    pub const fn as_khz_str(self) -> &'static str {
+        match self {
+            Self::Hz5000 => "5.0",
+            Self::Hz6250 => "6.25",
+            Self::Hz8330 => "8.33",
+            Self::Hz9000 => "9.0",
+            Self::Hz10000 => "10.0",
+            Self::Hz12500 => "12.5",
+            Self::Hz15000 => "15.0",
+            Self::Hz20000 => "20.0",
+            Self::Hz25000 => "25.0",
+            Self::Hz30000 => "30.0",
+            Self::Hz50000 => "50.0",
+            Self::Hz100000 => "100.0",
+        }
+    }
+}
+
+impl fmt::Display for StepSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} kHz", self.as_khz_str())
+    }
+}
+
 impl TryFrom<u8> for StepSize {
     type Error = ValidationError;
 
@@ -583,6 +629,45 @@ mod tests {
     fn step_size_error_variant() {
         let err = StepSize::try_from(12).unwrap_err();
         assert!(matches!(err, ValidationError::StepSizeOutOfRange(12)));
+    }
+
+    #[test]
+    fn step_size_as_hz() {
+        assert_eq!(StepSize::Hz5000.as_hz(), 5_000);
+        assert_eq!(StepSize::Hz6250.as_hz(), 6_250);
+        assert_eq!(StepSize::Hz8330.as_hz(), 8_330);
+        assert_eq!(StepSize::Hz9000.as_hz(), 9_000);
+        assert_eq!(StepSize::Hz10000.as_hz(), 10_000);
+        assert_eq!(StepSize::Hz12500.as_hz(), 12_500);
+        assert_eq!(StepSize::Hz15000.as_hz(), 15_000);
+        assert_eq!(StepSize::Hz20000.as_hz(), 20_000);
+        assert_eq!(StepSize::Hz25000.as_hz(), 25_000);
+        assert_eq!(StepSize::Hz30000.as_hz(), 30_000);
+        assert_eq!(StepSize::Hz50000.as_hz(), 50_000);
+        assert_eq!(StepSize::Hz100000.as_hz(), 100_000);
+    }
+
+    #[test]
+    fn step_size_as_khz_str() {
+        assert_eq!(StepSize::Hz5000.as_khz_str(), "5.0");
+        assert_eq!(StepSize::Hz6250.as_khz_str(), "6.25");
+        assert_eq!(StepSize::Hz8330.as_khz_str(), "8.33");
+        assert_eq!(StepSize::Hz9000.as_khz_str(), "9.0");
+        assert_eq!(StepSize::Hz10000.as_khz_str(), "10.0");
+        assert_eq!(StepSize::Hz12500.as_khz_str(), "12.5");
+        assert_eq!(StepSize::Hz15000.as_khz_str(), "15.0");
+        assert_eq!(StepSize::Hz20000.as_khz_str(), "20.0");
+        assert_eq!(StepSize::Hz25000.as_khz_str(), "25.0");
+        assert_eq!(StepSize::Hz30000.as_khz_str(), "30.0");
+        assert_eq!(StepSize::Hz50000.as_khz_str(), "50.0");
+        assert_eq!(StepSize::Hz100000.as_khz_str(), "100.0");
+    }
+
+    #[test]
+    fn step_size_display() {
+        assert_eq!(StepSize::Hz5000.to_string(), "5.0 kHz");
+        assert_eq!(StepSize::Hz25000.to_string(), "25.0 kHz");
+        assert_eq!(StepSize::Hz8330.to_string(), "8.33 kHz");
     }
 
     // --- MemoryMode ---

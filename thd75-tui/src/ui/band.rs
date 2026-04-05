@@ -4,6 +4,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use kenwood_thd75::types::SMeterReading;
+
 use crate::app::{App, BandState, InputMode, Pane};
 
 /// Render a band panel (A or B) into the given area.
@@ -12,7 +14,7 @@ use crate::app::{App, BandState, InputMode, Pane};
 /// S-meter bar, step size, and attenuator state. When the pane is
 /// focused and in frequency input mode, an additional input prompt
 /// line is shown. Returns early for non-band panes.
-pub fn render(app: &App, frame: &mut Frame, area: Rect, pane: Pane) {
+pub(crate) fn render(app: &App, frame: &mut Frame<'_>, area: Rect, pane: Pane) {
     let (title, band) = match pane {
         Pane::BandA => (" Band A ", &app.state.band_a),
         Pane::BandB => (" Band B ", &app.state.band_b),
@@ -77,7 +79,7 @@ fn band_lines(band: &BandState) -> Vec<Line<'static>> {
         Span::raw("  "),
         Span::styled("Sq:", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{}", band.squelch),
+            format!("{}", band.squelch.as_u8()),
             Style::default().fg(Color::Yellow),
         ),
         Span::raw("  "),
@@ -86,7 +88,7 @@ fn band_lines(band: &BandState) -> Vec<Line<'static>> {
 
     let s_meter_line = s_meter_line(band.s_meter);
 
-    let step_str = band.step_size.map_or("N/A".into(), |s| format!("{s:?}"));
+    let step_str = band.step_size.map_or("N/A".into(), |s| format!("{s}"));
     let mut extra = vec![
         Span::styled("  Step:", Style::default().fg(Color::DarkGray)),
         Span::styled(step_str, Style::default().fg(Color::Yellow)),
@@ -99,20 +101,21 @@ fn band_lines(band: &BandState) -> Vec<Line<'static>> {
     vec![freq_line, mode_line, s_meter_line, extra_line]
 }
 
-/// Map raw SM value (0-5) to S-units and bar display.
+/// Render S-meter bar from an `SMeterReading`.
 ///
-/// The D75 SM command returns 0-5 representing 6 signal strength levels.
-/// The radio's display maps these to S-meter readings:
-///   0 = no signal, 1 ≈ S1, 2 ≈ S3, 3 ≈ S5, 4 ≈ S7, 5 = S9
-fn s_meter_line(raw: u8) -> Line<'static> {
-    // Map raw 0-5 to S-units: 0→0, 1→1, 2→3, 3→5, 4→7, 5→9
-    let s_unit: u8 = match raw {
-        0 => 0,
+/// Uses `as_u8()` for the raw reading (0-5) to compute bar width via
+/// `s_unit()` label mapping, and `s_unit()` for the display label.
+fn s_meter_line(reading: SMeterReading) -> Line<'static> {
+    let label = reading.s_unit(); // e.g. "S0", "S3", "S9"
+    // Use the raw-to-S-unit mapping for the bar width:
+    // raw 0→S0, 1→S1, 2→S3, 3→S5, 4→S7, 5→S9
+    let s_unit: u8 = match reading.as_u8() {
         1 => 1,
         2 => 3,
         3 => 5,
         4 => 7,
-        _ => 9,
+        5 => 9,
+        _ => 0,
     };
 
     // Bar: 9 segments for S0-S9
@@ -131,7 +134,7 @@ fn s_meter_line(raw: u8) -> Line<'static> {
     Line::from(vec![
         Span::styled("  S ", Style::default().fg(Color::DarkGray)),
         Span::styled(bar, Style::default().fg(color)),
-        Span::styled(format!(" S{s_unit}"), Style::default().fg(Color::White)),
+        Span::styled(format!(" {label}"), Style::default().fg(Color::White)),
     ])
 }
 

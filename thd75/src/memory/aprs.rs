@@ -15,14 +15,15 @@
 use crate::protocol::programming;
 use crate::types::aprs::AprsCallsign;
 
-/// Byte offset of the APRS message status header.
-const APRS_STATUS_OFFSET: usize = programming::APRS_STATUS_PAGE as usize * programming::PAGE_SIZE;
+/// Byte offset of the APRS message status header (`0x15100`).
+pub const APRS_STATUS_OFFSET: usize =
+    programming::APRS_STATUS_PAGE as usize * programming::PAGE_SIZE;
 
-/// Byte offset of the APRS messages and settings region.
-const APRS_DATA_OFFSET: usize = programming::APRS_START as usize * programming::PAGE_SIZE;
+/// Byte offset of the APRS messages and settings region (`0x15200`).
+pub const APRS_DATA_OFFSET: usize = programming::APRS_START as usize * programming::PAGE_SIZE;
 
 /// Estimated end of the APRS region (before D-STAR repeater list).
-const APRS_END_OFFSET: usize = programming::DSTAR_RPT_START as usize * programming::PAGE_SIZE;
+pub const APRS_END_OFFSET: usize = programming::DSTAR_RPT_START as usize * programming::PAGE_SIZE;
 
 // ---------------------------------------------------------------------------
 // Estimated field offsets within the APRS data region
@@ -59,13 +60,13 @@ const APRS_PACKET_PATH_REL: usize = 0x000C;
 // at byte offset 0x25100 in the MCP memory image.
 // ---------------------------------------------------------------------------
 
-/// Byte offset of the APRS/GPS position data region.
+/// Byte offset of the APRS/GPS position data region (`0x25100`).
 ///
 /// 0x4B00 bytes of APRS/GPS position data starting at offset 0x25100.
-const APRS_POSITION_DATA_OFFSET: usize = 0x2_5100;
+pub const APRS_POSITION_DATA_OFFSET: usize = 0x2_5100;
 
 /// Size of the APRS/GPS position data region in bytes.
-const APRS_POSITION_DATA_SIZE: usize = 0x4B00;
+pub const APRS_POSITION_DATA_SIZE: usize = 0x4B00;
 
 // ---------------------------------------------------------------------------
 // AprsAccess (read-only)

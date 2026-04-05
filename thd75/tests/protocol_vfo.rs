@@ -19,7 +19,7 @@ fn serialize_ag_write() {
     assert_eq!(
         protocol::serialize(&Command::SetAfGain {
             band: Band::A,
-            level: AfGainLevel::new(15).unwrap()
+            level: AfGainLevel::new(15)
         }),
         b"AG 015\r"
     );
@@ -31,7 +31,7 @@ fn serialize_ag_write_band_b() {
     assert_eq!(
         protocol::serialize(&Command::SetAfGain {
             band: Band::B,
-            level: AfGainLevel::new(39).unwrap()
+            level: AfGainLevel::new(39)
         }),
         b"AG 039\r"
     );
@@ -41,7 +41,7 @@ fn serialize_ag_write_band_b() {
 fn parse_ag_response() {
     match protocol::parse(b"AG 091").unwrap() {
         Response::AfGain { level } => {
-            assert_eq!(level, AfGainLevel::new(91).unwrap());
+            assert_eq!(level, AfGainLevel::new(91));
         }
         other => panic!("expected AfGain, got {other:?}"),
     }
@@ -51,7 +51,7 @@ fn parse_ag_response() {
 fn parse_ag_low() {
     match protocol::parse(b"AG 005").unwrap() {
         Response::AfGain { level } => {
-            assert_eq!(level, AfGainLevel::new(5).unwrap());
+            assert_eq!(level, AfGainLevel::new(5));
         }
         other => panic!("expected AfGain, got {other:?}"),
     }

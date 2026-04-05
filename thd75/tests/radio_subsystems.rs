@@ -98,6 +98,7 @@ async fn get_gps_config() {
 }
 
 #[tokio::test]
+#[allow(clippy::similar_names)]
 async fn get_gps_sentences() {
     let mut mock = MockTransport::new();
     mock.expect(b"GS\r", b"GS 1,1,1,1,1,1\r");

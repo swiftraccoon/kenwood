@@ -76,3 +76,15 @@ pub use radio::programming::McpSpeed;
 #[cfg(target_os = "macos")]
 pub use transport::BluetoothTransport;
 pub use transport::{EitherTransport, MockTransport, SerialTransport, Transport};
+
+// Memory image re-exports.
+pub use memory::{MemoryError, MemoryImage};
+
+// KISS / AX.25 / APRS re-exports.
+pub use kiss::{
+    AprsData, AprsError, AprsItem, AprsMessage, AprsObject, AprsPosition, AprsStatus, AprsWeather,
+    Ax25Address, Ax25Error, Ax25Packet, KissError, KissFrame,
+};
+
+// SD card re-exports.
+pub use sdcard::SdCardError;

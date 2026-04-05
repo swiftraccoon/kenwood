@@ -9,6 +9,8 @@ repository = "https://github.com/swiftraccoon/kenwood"
 keywords = ["kenwood", "thd75", "ham-radio", "cat-protocol", "amateur-radio"]
 categories = ["hardware-support", "encoding"]
 authors = ["swiftraccoon"]
+readme = "README.md"
+documentation = "https://swiftraccoon.github.io/kenwood/"
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "time"] }
@@ -29,6 +31,12 @@ missing_docs = "deny"
 missing_debug_implementations = "deny"
 unreachable_pub = "deny"
 unused_results = "deny"
+# Prevent accidental future regressions
+elided_lifetimes_in_paths = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_import_braces = "deny"
+unused_qualifications = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

@@ -21,9 +21,9 @@ jobs:
         working-directory: thd75
       - run: cargo check
         working-directory: thd75-tui
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
         working-directory: thd75
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
         working-directory: thd75-tui
       - run: cargo test --lib
         working-directory: thd75

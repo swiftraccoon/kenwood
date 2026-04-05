@@ -157,7 +157,13 @@ pub struct KissFrame {
 /// The output format is: `FEND <type> <escaped-data> FEND`
 #[must_use]
 pub fn encode_kiss_frame(frame: &KissFrame) -> Vec<u8> {
-    let type_byte = (frame.port << 4) | (frame.command & 0x0F);
+    // CMD_RETURN (0xFF) is a special full-byte command — NOT nibble-split.
+    // All other commands use the standard port|command nibble encoding.
+    let type_byte = if frame.command == CMD_RETURN {
+        CMD_RETURN
+    } else {
+        (frame.port << 4) | (frame.command & 0x0F)
+    };
     // Pre-allocate: FEND + type + data (worst case 2x) + FEND
     let mut out = Vec::with_capacity(2 + 1 + frame.data.len() * 2);
     out.push(FEND);
@@ -212,8 +218,12 @@ pub fn decode_kiss_frame(data: &[u8]) -> Result<KissFrame, KissError> {
     }
 
     let type_byte = inner[0];
-    let port = type_byte >> 4;
-    let command = type_byte & 0x0F;
+    // CMD_RETURN (0xFF) is a special full-byte command, not nibble-split.
+    let (port, command) = if type_byte == CMD_RETURN {
+        (0, CMD_RETURN)
+    } else {
+        (type_byte >> 4, type_byte & 0x0F)
+    };
 
     // De-stuff the payload
     let payload_raw = &inner[1..];
@@ -437,6 +447,8 @@ pub enum AprsError {
     InvalidFormat,
     /// The position coordinates could not be parsed.
     InvalidCoordinates,
+    /// Mic-E data requires the AX.25 destination address for decoding.
+    MicERequiresDestination,
 }
 
 impl fmt::Display for AprsError {
@@ -444,6 +456,10 @@ impl fmt::Display for AprsError {
         match self {
             Self::InvalidFormat => write!(f, "invalid APRS format"),
             Self::InvalidCoordinates => write!(f, "invalid APRS coordinates"),
+            Self::MicERequiresDestination => write!(
+                f,
+                "Mic-E data requires destination address \u{2014} use parse_aprs_data_full()"
+            ),
         }
     }
 }
@@ -451,6 +467,8 @@ impl fmt::Display for AprsError {
 impl std::error::Error for AprsError {}
 
 /// A parsed APRS position report.
+///
+/// Includes optional speed/course fields populated by Mic-E decoding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AprsPosition {
     /// Latitude in decimal degrees (positive = North).
@@ -461,6 +479,10 @@ pub struct AprsPosition {
     pub symbol_table: char,
     /// APRS symbol code character.
     pub symbol_code: char,
+    /// Speed in knots (from Mic-E or course/speed extension).
+    pub speed_knots: Option<u16>,
+    /// Course in degrees (from Mic-E or course/speed extension).
+    pub course_degrees: Option<u16>,
     /// Optional comment/extension text after the position.
     pub comment: String,
 }
@@ -591,6 +613,8 @@ fn parse_uncompressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
         longitude,
         symbol_table,
         symbol_code,
+        speed_knots: None,
+        course_degrees: None,
         comment,
     })
 }
@@ -626,6 +650,8 @@ fn parse_compressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
         longitude,
         symbol_table,
         symbol_code,
+        speed_knots: None,
+        course_degrees: None,
         comment,
     })
 }
@@ -674,6 +700,13 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
     let data_type = info[0];
     if data_type != b'`' && data_type != b'\'' && data_type != 0x1C && data_type != 0x1D {
         return Err(AprsError::InvalidFormat);
+    }
+
+    // Validate Mic-E longitude bytes are in valid range (28-127 per APRS101).
+    for &b in &info[1..4] {
+        if b < 28 {
+            return Err(AprsError::InvalidCoordinates);
+        }
     }
 
     let dest = destination.as_bytes();
@@ -733,6 +766,28 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
     let west = mice_dest_is_custom(dest[5]);
     let longitude = if west { -longitude_abs } else { longitude_abs };
 
+    // --- Speed and course from info[4..7] (per APRS101 Chapter 10) ---
+    // SP+28 = info[4], DC+28 = info[5], SE+28 = info[6]
+    // Speed = (SP - 28) * 10 + (DC - 28) / 10  (integer division)
+    // Course = ((DC - 28) mod 10) * 100 + (SE - 28)
+    let (speed_knots, course_degrees) = if info.len() >= 7 {
+        let sp = u16::from(info[4]).saturating_sub(28);
+        let dc = u16::from(info[5]).saturating_sub(28);
+        let se = u16::from(info[6]).saturating_sub(28);
+        let speed = sp * 10 + dc / 10;
+        let course_raw = (dc % 10) * 100 + se;
+        // Speed 800+ is invalid per spec; course 0 = not known
+        let speed_opt = if speed < 800 { Some(speed) } else { None };
+        let course_opt = if course_raw > 0 && course_raw <= 360 {
+            Some(course_raw)
+        } else {
+            None
+        };
+        (speed_opt, course_opt)
+    } else {
+        (None, None)
+    };
+
     // Symbol: info[7] = symbol code, info[8] = symbol table
     let symbol_code = if info.len() > 7 { info[7] as char } else { '/' };
     let symbol_table = if info.len() > 8 { info[8] as char } else { '/' };
@@ -748,6 +803,8 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
         longitude,
         symbol_table,
         symbol_code,
+        speed_knots,
+        course_degrees,
         comment,
     })
 }
@@ -769,6 +826,428 @@ const fn mice_dest_digit(ch: u8) -> Result<(u8, bool), AprsError> {
 /// Check if a Mic-E destination character is a "custom" (non-standard digit) character.
 const fn mice_dest_is_custom(ch: u8) -> bool {
     matches!(ch, b'A'..=b'L' | b'P'..=b'Z')
+}
+
+// ---------------------------------------------------------------------------
+// APRS data type parsing (messages, status, objects, items, weather)
+// ---------------------------------------------------------------------------
+
+/// A parsed APRS data frame, covering all major APRS data types.
+///
+/// Per APRS101.PDF, the data type is determined by the first byte of the
+/// AX.25 information field. This enum covers the types most relevant to
+/// the TH-D75's APRS implementation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AprsData {
+    /// Position report (uncompressed, compressed, or Mic-E).
+    Position(AprsPosition),
+    /// APRS message addressed to a specific station.
+    Message(AprsMessage),
+    /// Status report (free-form text, optionally with Maidenhead grid).
+    Status(AprsStatus),
+    /// Object report (named, with position and timestamp).
+    Object(AprsObject),
+    /// Item report (named, with position, no timestamp).
+    Item(AprsItem),
+    /// Weather report (temperature, wind, rain, pressure, humidity).
+    Weather(AprsWeather),
+}
+
+/// An APRS message (data type `:`) addressed to a specific station.
+///
+/// Format: `:ADDRESSEE:message text{ID`
+/// - Addressee is exactly 9 characters, space-padded.
+/// - Message text follows the second `:`.
+/// - Optional message ID after `{` (for ack/rej).
+///
+/// The TH-D75 displays received messages on-screen and can store
+/// up to 100 messages in the station list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AprsMessage {
+    /// Destination callsign (up to 9 chars, trimmed).
+    pub addressee: String,
+    /// Message text content.
+    pub text: String,
+    /// Optional message sequence number (for ack/rej tracking).
+    pub message_id: Option<String>,
+}
+
+/// An APRS status report (data type `>`).
+///
+/// Contains free-form text, optionally prefixed with a Maidenhead
+/// grid locator (6 chars) or a timestamp (7 chars DHM/HMS).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AprsStatus {
+    /// Status text.
+    pub text: String,
+}
+
+/// An APRS object report (data type `;`).
+///
+/// Objects represent entities that may not have their own radio —
+/// hurricanes, marathon runners, event locations. They include a
+/// name (9 chars), a live/killed flag, a timestamp, and a position.
+///
+/// Per User Manual Chapter 14: the TH-D75 can transmit Object
+/// information via Menu No. 550 (Object 1-3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AprsObject {
+    /// Object name (up to 9 characters).
+    pub name: String,
+    /// Whether the object is live (`true`) or killed (`false`).
+    pub live: bool,
+    /// DHM or HMS timestamp from the object report (7 characters).
+    pub timestamp: String,
+    /// Position data.
+    pub position: AprsPosition,
+}
+
+/// An APRS item report (data type `)` ).
+///
+/// Items are similar to objects but simpler — no timestamp. They
+/// represent static entities like event locations or landmarks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AprsItem {
+    /// Item name (3-9 characters).
+    pub name: String,
+    /// Whether the item is live (`true`) or killed (`false`).
+    pub live: bool,
+    /// Position data.
+    pub position: AprsPosition,
+}
+
+/// An APRS weather report.
+///
+/// Weather data can be embedded in a position report or sent as a
+/// standalone positionless weather report (data type `_`). The TH-D75
+/// displays weather station data in the station list.
+///
+/// All fields are optional — weather stations may report any subset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AprsWeather {
+    /// Wind direction in degrees (0-360).
+    pub wind_direction: Option<u16>,
+    /// Wind speed in mph.
+    pub wind_speed: Option<u16>,
+    /// Wind gust in mph (peak in last 5 minutes).
+    pub wind_gust: Option<u16>,
+    /// Temperature in degrees Fahrenheit.
+    pub temperature: Option<i16>,
+    /// Rainfall in last hour (hundredths of an inch).
+    pub rain_1h: Option<u16>,
+    /// Rainfall in last 24 hours (hundredths of an inch).
+    pub rain_24h: Option<u16>,
+    /// Rainfall since midnight (hundredths of an inch).
+    pub rain_since_midnight: Option<u16>,
+    /// Humidity in percent (1-100). Raw APRS `00` is converted to 100.
+    pub humidity: Option<u8>,
+    /// Barometric pressure in tenths of millibars/hPa.
+    pub pressure: Option<u32>,
+}
+
+/// Parse any APRS data frame from an AX.25 information field.
+///
+/// Dispatches based on the data type identifier (first byte) to the
+/// appropriate parser. For Mic-E positions, use [`parse_mice_position`]
+/// directly since it also requires the destination address.
+///
+/// **Prefer [`parse_aprs_data_full`] when the AX.25 destination address is
+/// available** — it handles all data types including Mic-E.
+///
+/// # Supported data types
+///
+/// | Byte | Type | Parser |
+/// |------|------|--------|
+/// | `!`, `=` | Position (no timestamp) | [`parse_aprs_position`] |
+/// | `/`, `@` | Position (with timestamp) | [`parse_aprs_position`] |
+/// | `:` | Message | Inline |
+/// | `>` | Status | Inline |
+/// | `;` | Object | Inline |
+/// | `)` | Item | Inline |
+/// | `_` | Positionless weather | Inline |
+/// | `` ` ``, `'` | Mic-E | Returns error (use [`parse_mice_position`]) |
+///
+/// # Errors
+///
+/// Returns [`AprsError`] if the format is unrecognized or data is invalid.
+pub fn parse_aprs_data(info: &[u8]) -> Result<AprsData, AprsError> {
+    if info.is_empty() {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    match info[0] {
+        // Position reports (uncompressed and compressed)
+        b'!' | b'=' | b'/' | b'@' => parse_aprs_position(info).map(AprsData::Position),
+        // Message
+        b':' => parse_aprs_message(info).map(AprsData::Message),
+        // Status
+        b'>' => parse_aprs_status(info).map(AprsData::Status),
+        // Object
+        b';' => parse_aprs_object(info).map(AprsData::Object),
+        // Item
+        b')' => parse_aprs_item(info).map(AprsData::Item),
+        // Positionless weather
+        b'_' => parse_aprs_weather_positionless(info).map(AprsData::Weather),
+        // Mic-E (` ' 0x1C 0x1D) needs destination address — use parse_mice_position().
+        b'`' | b'\'' | 0x1C | 0x1D => Err(AprsError::MicERequiresDestination),
+        // All other types are unrecognized.
+        _ => Err(AprsError::InvalidFormat),
+    }
+}
+
+/// Parse any APRS data frame, including Mic-E types that require the
+/// AX.25 destination address.
+///
+/// This is the recommended entry point when the full [`Ax25Packet`] is
+/// available. For Mic-E data type identifiers (`` ` ``, `'`, `0x1C`,
+/// `0x1D`), the destination callsign is used to decode the latitude
+/// via [`parse_mice_position`]. All other types delegate to
+/// [`parse_aprs_data`].
+///
+/// # Errors
+///
+/// Returns [`AprsError`] if the format is unrecognized or data is invalid.
+pub fn parse_aprs_data_full(info: &[u8], destination: &str) -> Result<AprsData, AprsError> {
+    if info.is_empty() {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    match info[0] {
+        // Mic-E current/old data types
+        b'`' | b'\'' | 0x1C | 0x1D => {
+            parse_mice_position(destination, info).map(AprsData::Position)
+        }
+        _ => parse_aprs_data(info),
+    }
+}
+
+/// Parse an APRS message (`:ADDRESSEE:text{id`).
+fn parse_aprs_message(info: &[u8]) -> Result<AprsMessage, AprsError> {
+    // Minimum: : + 9 char addressee + : + at least 0 text = 11 bytes
+    if info.len() < 11 || info[0] != b':' {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    // Addressee is exactly 9 characters (space-padded)
+    let addressee_raw = &info[1..10];
+    let addressee = String::from_utf8_lossy(addressee_raw).trim().to_string();
+
+    if info[10] != b':' {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    let body = &info[11..];
+    let body_str = String::from_utf8_lossy(body);
+
+    // Split on { for message ID
+    let (text, message_id) = if let Some(idx) = body_str.rfind('{') {
+        let id = body_str[idx + 1..].to_string();
+        let text = body_str[..idx].to_string();
+        (text, if id.is_empty() { None } else { Some(id) })
+    } else {
+        (body_str.into_owned(), None)
+    };
+
+    Ok(AprsMessage {
+        addressee,
+        text,
+        message_id,
+    })
+}
+
+/// Parse an APRS status report (`>text`).
+fn parse_aprs_status(info: &[u8]) -> Result<AprsStatus, AprsError> {
+    if info.is_empty() || info[0] != b'>' {
+        return Err(AprsError::InvalidFormat);
+    }
+    let text = String::from_utf8_lossy(&info[1..]).trim().to_string();
+    Ok(AprsStatus { text })
+}
+
+/// Parse an APRS object report (`;name_____*DDHHMMzpos...`).
+fn parse_aprs_object(info: &[u8]) -> Result<AprsObject, AprsError> {
+    // ; + 9-char name + * or _ + 7-char timestamp + position
+    if info.len() < 27 || info[0] != b';' {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    let name = String::from_utf8_lossy(&info[1..10]).trim().to_string();
+    let live = info[10] == b'*'; // * = live, _ = killed
+
+    // After the name and live/killed flag, there's a 7-char timestamp
+    // then position data. Build a synthetic position info field.
+    let pos_body = &info[11..];
+    // Timestamp is 7 chars, then position data follows
+    if pos_body.len() < 7 {
+        return Err(AprsError::InvalidFormat);
+    }
+    let timestamp = String::from_utf8_lossy(&pos_body[..7]).to_string();
+    let pos_data = &pos_body[7..];
+
+    // Detect compressed vs uncompressed
+    let position = if pos_data.is_empty() {
+        return Err(AprsError::InvalidFormat);
+    } else if pos_data[0].is_ascii_digit() {
+        parse_uncompressed_body(pos_data)?
+    } else {
+        parse_compressed_body(pos_data)?
+    };
+
+    Ok(AprsObject {
+        name,
+        live,
+        timestamp,
+        position,
+    })
+}
+
+/// Parse an APRS item report (`)name!pos...` or `)name_pos...`).
+fn parse_aprs_item(info: &[u8]) -> Result<AprsItem, AprsError> {
+    if info.len() < 2 || info[0] != b')' {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    // Item name is 3-9 chars, terminated by ! (live) or _ (killed)
+    let body = &info[1..];
+    let mut name_end = None;
+    let mut live = true;
+    for (i, &b) in body.iter().enumerate() {
+        if b == b'!' {
+            name_end = Some(i);
+            live = true;
+            break;
+        }
+        if b == b'_' {
+            name_end = Some(i);
+            live = false;
+            break;
+        }
+        if i >= 9 {
+            break;
+        }
+    }
+
+    let name_end = name_end.ok_or(AprsError::InvalidFormat)?;
+    // APRS101 Chapter 11: item names are 3-9 characters
+    if name_end < 3 {
+        return Err(AprsError::InvalidFormat);
+    }
+    let name = String::from_utf8_lossy(&body[..name_end]).to_string();
+    let pos_data = &body[name_end + 1..];
+
+    if pos_data.is_empty() {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    let position = if pos_data[0].is_ascii_digit() {
+        parse_uncompressed_body(pos_data)?
+    } else {
+        parse_compressed_body(pos_data)?
+    };
+
+    Ok(AprsItem {
+        name,
+        live,
+        position,
+    })
+}
+
+/// Parse a positionless APRS weather report (`_MMDDHHMMdata`).
+///
+/// Weather data uses single-letter field tags followed by fixed-width
+/// numeric values. Common fields:
+/// - `c` = wind direction (3 digits, degrees)
+/// - `s` = wind speed (3 digits, mph)
+/// - `g` = gust (3 digits, mph)
+/// - `t` = temperature (3 digits, Fahrenheit, may be negative)
+/// - `r` = rain last hour (3 digits, hundredths of inch)
+/// - `p` = rain last 24h (3 digits, hundredths of inch)
+/// - `P` = rain since midnight (3 digits, hundredths of inch)
+/// - `h` = humidity (2 digits, 00=100%)
+/// - `b` = barometric pressure (5 digits, tenths of mbar)
+fn parse_aprs_weather_positionless(info: &[u8]) -> Result<AprsWeather, AprsError> {
+    if info.is_empty() || info[0] != b'_' {
+        return Err(AprsError::InvalidFormat);
+    }
+    // Skip _ and 8-char timestamp (MMDDHHMM)
+    let data = if info.len() > 9 { &info[9..] } else { &[] };
+    Ok(parse_weather_fields(data))
+}
+
+/// Parse APRS weather data fields from a byte slice.
+///
+/// Weather fields use single-letter tags followed by fixed-width values.
+/// Fields with all dots or spaces are treated as missing data.
+///
+/// Note: This parser assumes the input contains only weather fields.
+/// If called on data that includes non-weather text (e.g., position report
+/// comments), tag letters in the text may cause false matches.
+fn parse_weather_fields(data: &[u8]) -> AprsWeather {
+    let s = String::from_utf8_lossy(data);
+    AprsWeather {
+        wind_direction: extract_weather_u16(&s, 'c', 3),
+        wind_speed: extract_weather_u16(&s, 's', 3),
+        wind_gust: extract_weather_u16(&s, 'g', 3),
+        temperature: extract_weather_i16(&s, 't', 3),
+        rain_1h: extract_weather_u16(&s, 'r', 3),
+        rain_24h: extract_weather_u16(&s, 'p', 3),
+        rain_since_midnight: extract_weather_u16(&s, 'P', 3),
+        humidity: extract_weather_u16(&s, 'h', 2).map(|v| {
+            if v == 0 {
+                100
+            } else {
+                #[allow(clippy::cast_possible_truncation)]
+                let val = v as u8;
+                val
+            }
+        }),
+        pressure: extract_weather_u32(&s, 'b', 5),
+    }
+}
+
+/// Extract a u16 weather field value.
+fn extract_weather_u16(s: &str, tag: char, width: usize) -> Option<u16> {
+    let tag_str = tag.to_string();
+    let idx = s.find(&tag_str)?;
+    let start = idx + 1;
+    if start + width > s.len() {
+        return None;
+    }
+    let val_str = &s[start..start + width];
+    if val_str.contains('.') || val_str.contains(' ') {
+        return None;
+    }
+    val_str.trim().parse().ok()
+}
+
+/// Extract an i16 weather field value (supports negative temperatures).
+fn extract_weather_i16(s: &str, tag: char, width: usize) -> Option<i16> {
+    let tag_str = tag.to_string();
+    let idx = s.find(&tag_str)?;
+    let start = idx + 1;
+    if start + width > s.len() {
+        return None;
+    }
+    let val_str = &s[start..start + width];
+    if val_str.contains('.') || val_str.contains(' ') {
+        return None;
+    }
+    val_str.trim().parse().ok()
+}
+
+/// Extract a u32 weather field value.
+fn extract_weather_u32(s: &str, tag: char, width: usize) -> Option<u32> {
+    let tag_str = tag.to_string();
+    let idx = s.find(&tag_str)?;
+    let start = idx + 1;
+    if start + width > s.len() {
+        return None;
+    }
+    let val_str = &s[start..start + width];
+    if val_str.contains('.') || val_str.contains(' ') {
+        return None;
+    }
+    val_str.trim().parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -828,14 +1307,29 @@ mod tests {
 
     #[test]
     fn encode_return_command() {
+        // CMD_RETURN (0xFF) is a special full-byte command, NOT nibble-split.
+        // Wire format: C0 FF C0 (per TH-D75 Operating Tips §2.7.3)
         let frame = KissFrame {
             port: 0,
-            // CMD_RETURN is 0xFF; low nibble = 0x0F
-            command: CMD_RETURN & 0x0F,
+            command: CMD_RETURN,
             data: vec![],
         };
         let encoded = encode_kiss_frame(&frame);
-        assert_eq!(encoded, vec![FEND, 0x0F, FEND]);
+        assert_eq!(encoded, vec![FEND, 0xFF, FEND]);
+    }
+
+    #[test]
+    fn return_command_roundtrip() {
+        let original = KissFrame {
+            port: 0,
+            command: CMD_RETURN,
+            data: vec![],
+        };
+        let encoded = encode_kiss_frame(&original);
+        let decoded = decode_kiss_frame(&encoded).unwrap();
+        assert_eq!(decoded.port, 0);
+        assert_eq!(decoded.command, CMD_RETURN);
+        assert!(decoded.data.is_empty());
     }
 
     #[test]
@@ -1331,6 +1825,13 @@ mod tests {
         );
         assert_eq!(pos.symbol_code, '>');
         assert_eq!(pos.symbol_table, '/');
+
+        // Speed/course from info[4..7] = [40, 40, 40]:
+        // SP = 40-28 = 12, DC = 40-28 = 12, SE = 40-28 = 12
+        // speed = 12*10 + 12/10 = 121
+        // course = (12%10)*100 + 12 = 212
+        assert_eq!(pos.speed_knots, Some(121));
+        assert_eq!(pos.course_degrees, Some(212));
     }
 
     #[test]
@@ -1341,6 +1842,283 @@ mod tests {
     #[test]
     fn parse_mice_too_short() {
         assert!(parse_mice_position("SHORT", &[0x60, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn parse_mice_speed_ge_800_rejected() {
+        // SP = 108-28 = 80, DC = 28-28 = 0, SE = 28-28 = 0
+        // speed = 80*10 + 0/10 = 800 → should be rejected (>= 800)
+        let dest = "SUQU5P";
+        let info: &[u8] = &[0x60, 125, 73, 58, 108, 28, 28, b'>', b'/'];
+        let pos = parse_mice_position(dest, info).unwrap();
+        assert_eq!(pos.speed_knots, None);
+    }
+
+    #[test]
+    fn parse_mice_course_zero_is_none() {
+        // SP = 28-28 = 0, DC = 28-28 = 0, SE = 28-28 = 0
+        // speed = 0*10 + 0/10 = 0, course = (0%10)*100 + 0 = 0
+        // course 0 = not known → None
+        let dest = "SUQU5P";
+        let info: &[u8] = &[0x60, 125, 73, 58, 28, 28, 28, b'>', b'/'];
+        let pos = parse_mice_position(dest, info).unwrap();
+        assert_eq!(pos.speed_knots, Some(0));
+        assert_eq!(pos.course_degrees, None);
+    }
+
+    // ---- APRS message tests ----
+
+    #[test]
+    fn parse_message_basic() {
+        let info = b":N0CALL   :Hello World{123";
+        let msg = parse_aprs_message(info).unwrap();
+        assert_eq!(msg.addressee, "N0CALL");
+        assert_eq!(msg.text, "Hello World");
+        assert_eq!(msg.message_id, Some("123".to_string()));
+    }
+
+    #[test]
+    fn parse_message_no_id() {
+        let info = b":KQ4NIT   :Test message";
+        let msg = parse_aprs_message(info).unwrap();
+        assert_eq!(msg.addressee, "KQ4NIT");
+        assert_eq!(msg.text, "Test message");
+        assert_eq!(msg.message_id, None);
+    }
+
+    #[test]
+    fn parse_message_ack() {
+        let info = b":N0CALL   :ack123";
+        let msg = parse_aprs_message(info).unwrap();
+        assert_eq!(msg.text, "ack123");
+    }
+
+    #[test]
+    fn parse_message_too_short() {
+        assert!(parse_aprs_message(b":SHORT:hi").is_err());
+    }
+
+    // ---- APRS status tests ----
+
+    #[test]
+    fn parse_status_basic() {
+        let info = b">Operating on 144.390";
+        let status = parse_aprs_status(info).unwrap();
+        assert_eq!(status.text, "Operating on 144.390");
+    }
+
+    #[test]
+    fn parse_status_empty() {
+        let info = b">";
+        let status = parse_aprs_status(info).unwrap();
+        assert_eq!(status.text, "");
+    }
+
+    // ---- APRS object tests ----
+
+    #[test]
+    fn parse_object_live() {
+        // ; + 9-char name + * + 7-char timestamp + uncompressed position
+        let info = b";TORNADO  *092345z4903.50N/07201.75W-Tornado warning";
+        let obj = parse_aprs_object(info).unwrap();
+        assert_eq!(obj.name, "TORNADO");
+        assert!(obj.live);
+        assert_eq!(obj.timestamp, "092345z");
+        assert!((obj.position.latitude - 49.058_333).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_object_killed() {
+        let info = b";MARATHON _092345z4903.50N/07201.75W-Event over";
+        let obj = parse_aprs_object(info).unwrap();
+        assert_eq!(obj.name, "MARATHON");
+        assert!(!obj.live);
+    }
+
+    // ---- APRS item tests ----
+
+    #[test]
+    fn parse_item_live() {
+        let info = b")AID#2!4903.50N/07201.75W-First aid";
+        let item = parse_aprs_item(info).unwrap();
+        assert_eq!(item.name, "AID#2");
+        assert!(item.live);
+        assert!((item.position.latitude - 49.058_333).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_item_killed() {
+        let info = b")AID#2_4903.50N/07201.75W-Closed";
+        let item = parse_aprs_item(info).unwrap();
+        assert!(!item.live);
+    }
+
+    #[test]
+    fn parse_item_short_name_rejected() {
+        // "AB" is only 2 characters — APRS101 requires 3-9.
+        let info = b")AB!4903.50N/07201.75W-";
+        assert!(matches!(
+            parse_aprs_item(info),
+            Err(AprsError::InvalidFormat)
+        ));
+    }
+
+    // ---- APRS weather tests ----
+
+    #[test]
+    fn parse_weather_positionless() {
+        let info = b"_01011234c180s005g010t075r001p010P020h55b10135";
+        let wx = parse_aprs_weather_positionless(info).unwrap();
+        assert_eq!(wx.wind_direction, Some(180));
+        assert_eq!(wx.wind_speed, Some(5));
+        assert_eq!(wx.wind_gust, Some(10));
+        assert_eq!(wx.temperature, Some(75));
+        assert_eq!(wx.rain_1h, Some(1));
+        assert_eq!(wx.rain_24h, Some(10));
+        assert_eq!(wx.rain_since_midnight, Some(20));
+        assert_eq!(wx.humidity, Some(55));
+        assert_eq!(wx.pressure, Some(10135));
+    }
+
+    #[test]
+    fn parse_weather_missing_fields() {
+        let info = b"_01011234c...s...t072";
+        let wx = parse_aprs_weather_positionless(info).unwrap();
+        assert_eq!(wx.wind_direction, None); // dots = missing
+        assert_eq!(wx.wind_speed, None);
+        assert_eq!(wx.temperature, Some(72));
+    }
+
+    #[test]
+    fn parse_weather_humidity_zero_means_100() {
+        let info = b"_01011234h00";
+        let wx = parse_aprs_weather_positionless(info).unwrap();
+        assert_eq!(wx.humidity, Some(100));
+    }
+
+    // ---- parse_aprs_data dispatch tests ----
+
+    #[test]
+    fn dispatch_position() {
+        let info = b"!4903.50N/07201.75W-Test";
+        assert!(matches!(parse_aprs_data(info), Ok(AprsData::Position(_))));
+    }
+
+    #[test]
+    fn dispatch_message() {
+        let info = b":N0CALL   :Hello{1";
+        assert!(matches!(parse_aprs_data(info), Ok(AprsData::Message(_))));
+    }
+
+    #[test]
+    fn dispatch_status() {
+        let info = b">Status text";
+        assert!(matches!(parse_aprs_data(info), Ok(AprsData::Status(_))));
+    }
+
+    #[test]
+    fn dispatch_object() {
+        let info = b";OBJNAME  *092345z4903.50N/07201.75W-";
+        assert!(matches!(parse_aprs_data(info), Ok(AprsData::Object(_))));
+    }
+
+    #[test]
+    fn dispatch_item() {
+        let info = b")ITEM!4903.50N/07201.75W-";
+        assert!(matches!(parse_aprs_data(info), Ok(AprsData::Item(_))));
+    }
+
+    #[test]
+    fn dispatch_weather() {
+        let info = b"_01011234c180s005t072";
+        assert!(matches!(parse_aprs_data(info), Ok(AprsData::Weather(_))));
+    }
+
+    #[test]
+    fn dispatch_mice_returns_error() {
+        // Mic-E needs destination address, can't parse from info alone
+        let info = &[0x60u8, 125, 73, 58, 40, 40, 40, b'>', b'/'];
+        assert!(matches!(
+            parse_aprs_data(info),
+            Err(AprsError::MicERequiresDestination)
+        ));
+    }
+
+    // ---- parse_aprs_data_full tests ----
+
+    #[test]
+    fn full_dispatch_mice_current() {
+        let dest = "SUQU5P";
+        let info: &[u8] = &[0x60, 125, 73, 58, 40, 40, 40, b'>', b'/'];
+        let result = parse_aprs_data_full(info, dest).unwrap();
+        assert!(matches!(result, AprsData::Position(_)));
+    }
+
+    #[test]
+    fn full_dispatch_mice_old() {
+        let dest = "SUQU5P";
+        let info: &[u8] = &[b'\'', 125, 73, 58, 40, 40, 40, b'>', b'/'];
+        let result = parse_aprs_data_full(info, dest).unwrap();
+        assert!(matches!(result, AprsData::Position(_)));
+    }
+
+    #[test]
+    fn full_dispatch_mice_0x1c() {
+        let dest = "SUQU5P";
+        let info: &[u8] = &[0x1C, 125, 73, 58, 40, 40, 40, b'>', b'/'];
+        let result = parse_aprs_data_full(info, dest).unwrap();
+        assert!(matches!(result, AprsData::Position(_)));
+    }
+
+    #[test]
+    fn full_dispatch_mice_0x1d() {
+        let dest = "SUQU5P";
+        let info: &[u8] = &[0x1D, 125, 73, 58, 40, 40, 40, b'>', b'/'];
+        let result = parse_aprs_data_full(info, dest).unwrap();
+        assert!(matches!(result, AprsData::Position(_)));
+    }
+
+    #[test]
+    fn full_dispatch_non_mice_delegates() {
+        let info = b"!4903.50N/07201.75W-Test";
+        let result = parse_aprs_data_full(info, "APRS").unwrap();
+        assert!(matches!(result, AprsData::Position(_)));
+    }
+
+    #[test]
+    fn full_dispatch_empty_info() {
+        assert!(parse_aprs_data_full(b"", "APRS").is_err());
+    }
+
+    // ---- Mic-E byte range validation tests ----
+
+    #[test]
+    fn mice_rejects_low_longitude_bytes() {
+        // info[1] = 27 (below valid Mic-E range of 28)
+        let dest = "SUQU5P";
+        let info: &[u8] = &[0x60, 27, 73, 58, 40, 40, 40, b'>', b'/'];
+        assert_eq!(
+            parse_mice_position(dest, info),
+            Err(AprsError::InvalidCoordinates)
+        );
+    }
+
+    #[test]
+    fn mice_rejects_zero_longitude_byte() {
+        let dest = "SUQU5P";
+        let info: &[u8] = &[0x60, 125, 0, 58, 40, 40, 40, b'>', b'/'];
+        assert_eq!(
+            parse_mice_position(dest, info),
+            Err(AprsError::InvalidCoordinates)
+        );
+    }
+
+    #[test]
+    fn mice_accepts_minimum_valid_byte() {
+        // info[1..4] all = 28, the minimum valid value
+        let dest = "SUQU5P";
+        let info: &[u8] = &[0x60, 28, 28, 28, 40, 40, 40, b'>', b'/'];
+        assert!(parse_mice_position(dest, info).is_ok());
     }
 
     // ---- Full integration: KISS -> AX.25 -> APRS ----

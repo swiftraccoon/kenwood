@@ -3,7 +3,7 @@ use std::time::Duration;
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::Band;
+use kenwood_thd75::types::{Band, SMeterReading};
 use tokio::sync::mpsc;
 
 use crate::app::{BandState, Message, RadioState};
@@ -30,7 +30,7 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// # Returns
 /// `(port_path, transport)` on success, or an error string.
-pub fn discover_and_open_transport(
+pub(crate) fn discover_and_open_transport(
     port: Option<&str>,
     baud: u32,
 ) -> Result<(String, EitherTransport), String> {
@@ -56,7 +56,7 @@ pub fn discover_and_open_transport(
 ///   the main thread (`IOBluetooth` RFCOMM must be opened on main).
 /// - `cmd_rx`: channel for receiving user commands from the TUI.
 #[allow(clippy::similar_names)]
-pub async fn spawn_with_transport(
+pub(crate) async fn spawn_with_transport(
     path: String,
     transport: EitherTransport,
     mcp_speed: String,
@@ -107,13 +107,13 @@ pub async fn spawn_with_transport(
 
     let path_clone = path.clone();
 
-    tokio::spawn(async move {
+    let _task = tokio::spawn(async move {
         // AI notification state — these fields are updated by push notifications
         // from the radio (AI mode) rather than polling. This reduces USB traffic,
         // provides instant updates, and avoids firmware quirks (e.g., spurious
         // SM/BY spikes on Band B when polled directly).
-        let mut s_meter_a: u8 = 0;
-        let mut s_meter_b: u8 = 0;
+        let mut s_meter_a = SMeterReading::new(0).unwrap();
+        let mut s_meter_b = SMeterReading::new(0).unwrap();
         let mut busy_a = false;
         let mut busy_b = false;
 
@@ -152,8 +152,8 @@ pub async fn spawn_with_transport(
                             if busy {
                                 match radio.get_smeter(band).await {
                                     Ok(level) => match band {
-                                        Band::A => { s_meter_a = level.as_u8(); busy_a = true; }
-                                        Band::B => { s_meter_b = level.as_u8(); busy_b = true; }
+                                        Band::A => { s_meter_a = level; busy_a = true; }
+                                        Band::B => { s_meter_b = level; busy_b = true; }
                                         _ => {}
                                     },
                                     Err(e) => {
@@ -167,9 +167,10 @@ pub async fn spawn_with_transport(
                                     }
                                 }
                             } else {
+                                let zero = SMeterReading::new(0).unwrap();
                                 match band {
-                                    Band::A => { s_meter_a = 0; busy_a = false; }
-                                    Band::B => { s_meter_b = 0; busy_b = false; }
+                                    Band::A => { s_meter_a = zero; busy_a = false; }
+                                    Band::B => { s_meter_b = zero; busy_b = false; }
                                     _ => {}
                                 }
                             }
@@ -292,6 +293,16 @@ pub async fn spawn_with_transport(
                                     let _ = tx.send(Message::RadioError(format!("Set power: {e}")));
                                 }
                             }
+                            crate::event::RadioCommand::SetStepSize { band, step } => {
+                                if let Err(e) = radio.set_step_size(band, step).await {
+                                    let _ = tx.send(Message::RadioError(format!("Set step: {e}")));
+                                }
+                            }
+                            crate::event::RadioCommand::SetScanResumeCat(method) => {
+                                if let Err(e) = radio.set_scan_resume(method).await {
+                                    let _ = tx.send(Message::RadioError(format!("Scan resume: {e}")));
+                                }
+                            }
                             crate::event::RadioCommand::SetTncBaud(rate) => {
                                 if let Err(e) = radio.set_tnc_baud(rate).await {
                                     let _ = tx.send(Message::RadioError(format!("TNC baud: {e}")));
@@ -406,8 +417,8 @@ pub async fn spawn_with_transport(
                                     )));
                                 }
                                 notifications = new_radio.subscribe();
-                                s_meter_a = 0;
-                                s_meter_b = 0;
+                                s_meter_a = SMeterReading::new(0).unwrap();
+                                s_meter_b = SMeterReading::new(0).unwrap();
                                 busy_a = false;
                                 busy_b = false;
                                 let _ = tx.send(Message::Reconnected);
@@ -462,16 +473,20 @@ macro_rules! global_read {
             Ok(v) => v,
             Err(e) => match classify_error($cmd, &e) {
                 PollError::Transport(msg) => return Err(PollError::Transport(msg)),
-                PollError::Protocol(_) => $default,
+                PollError::Protocol(msg) => {
+                    tracing::debug!(cmd = $cmd, error = %msg, "protocol error, using default");
+                    $default
+                },
             },
         }
     };
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn poll_once(
     radio: &mut Radio<EitherTransport>,
-    s_meter_a: u8,
-    s_meter_b: u8,
+    s_meter_a: SMeterReading,
+    s_meter_b: SMeterReading,
     busy_a: bool,
     busy_b: bool,
 ) -> Result<RadioState, PollError> {
@@ -488,47 +503,59 @@ async fn poll_once(
     // Global state reads. Transport errors trigger reconnect (a USB unplug
     // mid-poll should not show fake defaults for a full cycle). Protocol
     // parse errors are non-fatal and default to safe values.
-    let battery_level_typed = global_read!(
+    let battery_level = global_read!(
         radio,
         "BL",
         radio.get_battery_level(),
         kenwood_thd75::types::BatteryLevel::Empty
     );
-    let battery_level = u8::from(battery_level_typed);
-    let beep = global_read!(radio, "BE", radio.get_beep(), false);
+    // BE (beep) is a firmware stub on D75 — always returns N.
+    // Beep state is read from MCP image instead. Skip polling.
+    let beep = false;
     let lock = global_read!(radio, "LC", radio.get_lock(), false);
     let dual_band = global_read!(radio, "DL", radio.get_dual_band(), false);
     let bluetooth = global_read!(radio, "BT", radio.get_bluetooth(), false);
     let vox = global_read!(radio, "VX", radio.get_vox(), false);
-    let vox_gain_typed = global_read!(
+    let vox_gain = global_read!(
         radio,
         "VG",
         radio.get_vox_gain(),
         kenwood_thd75::types::VoxGain::new(0).unwrap()
     );
-    let vox_gain = vox_gain_typed.as_u8();
-    let vox_delay_typed = global_read!(
+    let vox_delay = global_read!(
         radio,
         "VD",
         radio.get_vox_delay(),
         kenwood_thd75::types::VoxDelay::new(0).unwrap()
     );
-    let vox_delay = vox_delay_typed.as_u8();
-    let af_gain_typed = global_read!(
+    let af_gain = global_read!(
         radio,
         "AG",
         radio.get_af_gain(),
-        kenwood_thd75::types::AfGainLevel::new(0).unwrap()
+        kenwood_thd75::types::AfGainLevel::new(0)
     );
-    let af_gain = af_gain_typed.as_u8();
     let gps = radio.get_gps_config().await.unwrap_or((false, false));
-    let beacon_type_typed = global_read!(
+    let beacon_type = global_read!(
         radio,
         "BN",
         radio.get_beacon_type(),
         kenwood_thd75::types::BeaconMode::Off
     );
-    let beacon_type = u8::from(beacon_type_typed);
+    // FS read (no band parameter) — returns N in some modes
+    let fine_step = radio.get_fine_step().await.ok();
+    // SH read per mode — returns N in some modes
+    let filter_width_ssb = radio
+        .get_filter_width(kenwood_thd75::types::FilterMode::Ssb)
+        .await
+        .ok();
+    let filter_width_cw = radio
+        .get_filter_width(kenwood_thd75::types::FilterMode::Cw)
+        .await
+        .ok();
+    let filter_width_am = radio
+        .get_filter_width(kenwood_thd75::types::FilterMode::Am)
+        .await
+        .ok();
     Ok(RadioState {
         band_a,
         band_b,
@@ -545,6 +572,11 @@ async fn poll_once(
         radio_type: String::new(),
         gps_enabled: gps.0,
         beacon_type,
+        fine_step,
+        filter_width_ssb,
+        filter_width_cw,
+        filter_width_am,
+        scan_resume_cat: None, // Write-only on D75 — not readable
     })
 }
 
@@ -569,8 +601,7 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
     let squelch = radio
         .get_squelch(band)
         .await
-        .map_err(|e| classify_error(&format!("SQ {band:?}"), &e))?
-        .as_u8();
+        .map_err(|e| classify_error(&format!("SQ {band:?}"), &e))?;
 
     let mode = radio
         .get_mode(band)
@@ -589,7 +620,7 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
     Ok(BandState {
         frequency: channel.rx_frequency,
         mode,
-        s_meter: 0, // Set by AI notification handler
+        s_meter: SMeterReading::new(0).unwrap(), // Set by AI notification handler
         squelch,
         power_level,
         busy: false, // Set by AI notification handler
@@ -605,8 +636,6 @@ async fn freq_down(
     radio: &mut Radio<EitherTransport>,
     band: Band,
 ) -> Result<(), kenwood_thd75::Error> {
-    use kenwood_thd75::types::StepSize;
-
     let ch = radio.get_frequency(band).await?;
     // SF may return N (not available) in some modes — default to 5 kHz
     let step = radio
@@ -614,21 +643,7 @@ async fn freq_down(
         .await
         .map(|(_, s)| s)
         .unwrap_or(kenwood_thd75::types::StepSize::Hz5000);
-    let step_hz: u32 = match step {
-        StepSize::Hz5000 => 5_000,
-        StepSize::Hz6250 => 6_250,
-        StepSize::Hz8330 => 8_330,
-        StepSize::Hz9000 => 9_000,
-        StepSize::Hz10000 => 10_000,
-        StepSize::Hz12500 => 12_500,
-        StepSize::Hz15000 => 15_000,
-        StepSize::Hz20000 => 20_000,
-        StepSize::Hz25000 => 25_000,
-        StepSize::Hz30000 => 30_000,
-        StepSize::Hz50000 => 50_000,
-        StepSize::Hz100000 => 100_000,
-    };
-    let new_hz = ch.rx_frequency.as_hz().saturating_sub(step_hz);
+    let new_hz = ch.rx_frequency.as_hz().saturating_sub(step.as_hz());
     radio
         .tune_frequency(band, kenwood_thd75::types::Frequency::new(new_hz))
         .await

@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-pub fn render(frame: &mut Frame) {
+pub(crate) fn render(frame: &mut Frame<'_>) {
     let area = centered_rect(60, 70, frame.area());
 
     // Clear the area behind the popup

@@ -196,20 +196,20 @@ impl MemoryImage {
 
     /// Access the APRS configuration region (raw bytes).
     #[must_use]
-    pub fn aprs(&self) -> aprs::AprsAccess<'_> {
-        aprs::AprsAccess::new(&self.raw)
+    pub fn aprs(&self) -> AprsAccess<'_> {
+        AprsAccess::new(&self.raw)
     }
 
     /// Access the D-STAR configuration region (raw bytes).
     #[must_use]
-    pub fn dstar(&self) -> dstar::DstarAccess<'_> {
-        dstar::DstarAccess::new(&self.raw)
+    pub fn dstar(&self) -> DstarAccess<'_> {
+        DstarAccess::new(&self.raw)
     }
 
     /// Access the GPS configuration region (raw bytes).
     #[must_use]
-    pub fn gps(&self) -> gps::GpsAccess<'_> {
-        gps::GpsAccess::new(&self.raw)
+    pub fn gps(&self) -> GpsAccess<'_> {
+        GpsAccess::new(&self.raw)
     }
 
     // -----------------------------------------------------------------------

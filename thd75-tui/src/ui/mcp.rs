@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 
 use crate::app::{App, McpState, Pane};
 
-pub fn render(app: &App, frame: &mut Frame, list_area: Rect, detail_area: Rect) {
+pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     let block = Block::default()
         .title(" MCP Programming ")
         .borders(Borders::ALL)

@@ -74,11 +74,7 @@ fn split_band_value<'a>(payload: &'a str, cmd: &str) -> Result<(Band, &'a str), 
 /// Band-indexed `AG 0\r` returns `?`.
 fn parse_ag(payload: &str) -> Result<Response, ProtocolError> {
     let raw = parse_u8_field(payload.trim(), "AG", "level")?;
-    let level = AfGainLevel::try_from(raw).map_err(|e| ProtocolError::FieldParse {
-        command: "AG".to_owned(),
-        field: "level".to_owned(),
-        detail: e.to_string(),
-    })?;
+    let level = AfGainLevel::from(raw);
     Ok(Response::AfGain { level })
 }
 

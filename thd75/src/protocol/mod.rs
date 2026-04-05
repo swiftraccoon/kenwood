@@ -428,11 +428,15 @@ pub enum Command {
     GetLock,
     /// Set lock/control state — simple boolean form (LC write).
     ///
-    /// Sends `LC 0` or `LC 1`. CAT value is inverted on the D75
-    /// (0 = locked, 1 = unlocked). For full lock configuration, use
+    /// Sends `LC 0` or `LC 1`. The `locked` field uses **wire semantics**:
+    /// on the D75 the wire value is inverted (`true` on the wire means
+    /// *unlocked*). The high-level `Radio::set_lock()` method handles
+    /// this inversion so callers can pass logical lock state.
+    ///
+    /// For full lock configuration, use
     /// [`SetLockFull`](Command::SetLockFull).
     SetLock {
-        /// Whether key lock is engaged. CAT value is inverted on D75.
+        /// Whether key lock is engaged (wire semantics — inverted on D75).
         locked: bool,
     },
     /// Set all lock/control fields (LC 6-field write).
@@ -1260,8 +1264,13 @@ pub enum Response {
         enabled: bool,
     },
     /// Key lock state response (LC).
+    ///
+    /// The `locked` field uses **wire semantics**: on the D75 the wire
+    /// value is inverted (`true` = unlocked on wire). `Radio::set_lock()`
+    /// and `Radio::get_lock()` handle the inversion so callers see
+    /// logical lock state.
     Lock {
-        /// Whether key lock is engaged. CAT value is inverted on D75.
+        /// Whether key lock is engaged (wire semantics — inverted on D75).
         locked: bool,
     },
     /// AF/IF/Detect output mode response (IO).

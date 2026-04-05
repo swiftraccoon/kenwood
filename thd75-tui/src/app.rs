@@ -2,21 +2,45 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use kenwood_thd75::memory::MemoryImage;
-use kenwood_thd75::types::{Frequency, Mode, PowerLevel};
+use kenwood_thd75::types::{
+    AfGainLevel, BatteryLevel, BeaconMode, Frequency, Mode, PowerLevel, SMeterReading,
+    SquelchLevel, VoxDelay, VoxGain,
+};
 
 /// Path to the MCP cache file.
+///
+/// Platform cache directories (no `dirs` crate needed):
+/// - macOS: `~/Library/Caches`
+/// - Linux: `$XDG_CACHE_HOME` or `~/.cache`
+/// - Windows: `%LOCALAPPDATA%`
 fn cache_path() -> PathBuf {
-    let mut p = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("."));
-    p.push("thd75-tui");
-    p.push("mcp.bin");
-    p
+    let base = cache_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("thd75-tui").join("mcp.bin")
+}
+
+/// Platform-specific cache directory.
+fn cache_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    }
 }
 
 /// Save raw MCP image to disk cache.
 ///
 /// Logs errors but does not propagate — a failed cache write should not
 /// block radio operation. The user will see a warning in the log.
-pub fn save_cache(data: &[u8]) {
+pub(crate) fn save_cache(data: &[u8]) {
     let path = cache_path();
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -30,7 +54,7 @@ pub fn save_cache(data: &[u8]) {
 }
 
 /// Load cached MCP image from disk. Returns (image, age).
-pub fn load_cache() -> Option<(MemoryImage, std::time::Duration)> {
+pub(crate) fn load_cache() -> Option<(MemoryImage, std::time::Duration)> {
     let path = cache_path();
     let data = std::fs::read(&path).ok()?;
     let age = std::fs::metadata(&path)
@@ -43,7 +67,7 @@ pub fn load_cache() -> Option<(MemoryImage, std::time::Duration)> {
 }
 
 /// Number of rows in the settings list (must match `SettingRow::ALL.len()`).
-pub const SETTINGS_COUNT: usize = 85;
+pub(crate) const SETTINGS_COUNT: usize = 92;
 
 /// Settings row identifiers for the interactive settings list.
 ///
@@ -51,12 +75,24 @@ pub const SETTINGS_COUNT: usize = 85;
 /// noted; all others modify the in-memory MCP image and require an MCP write
 /// to take effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingRow {
+pub(crate) enum SettingRow {
     // --- RX ---
     /// Squelch level Band A (CAT: SQ band,level).
     SquelchA,
     /// Squelch level Band B (CAT: SQ band,level).
     SquelchB,
+    /// Step size Band A (CAT: SF read/write).
+    StepSizeA,
+    /// Step size Band B (CAT: SF read/write).
+    StepSizeB,
+    /// Fine step (CAT: FS read-only, no band parameter).
+    FineStep,
+    /// Filter width SSB (CAT: SH read-only).
+    FilterWidthSsb,
+    /// Filter width CW (CAT: SH read-only).
+    FilterWidthCw,
+    /// Filter width AM (CAT: SH read-only).
+    FilterWidthAm,
     /// FM narrow (MCP only).
     FmNarrow,
     /// SSB high-cut filter (MCP only).
@@ -127,7 +163,7 @@ pub enum SettingRow {
     PfKey2,
 
     // --- Lock ---
-    /// Lock (CAT: LC, inverted).
+    /// Lock (CAT: LC).
     Lock,
     /// Key lock type (MCP only).
     KeyLockType,
@@ -159,7 +195,7 @@ pub enum SettingRow {
     DisplayMethod,
     /// Power-on display (MCP only).
     PowerOnDisplay,
-    /// Dual band (CAT: DL, inverted).
+    /// Dual band (CAT: DL).
     DualBand,
 
     // --- Audio ---
@@ -255,14 +291,22 @@ pub enum SettingRow {
     CallsignSlot,
     /// D-STAR slot (CAT: DS).
     DstarSlot,
+    /// Scan resume method (CAT: SR write-only).
+    ScanResumeCat,
 }
 
 impl SettingRow {
     /// All settings rows in display order.
-    pub const ALL: [Self; SETTINGS_COUNT] = [
+    pub(crate) const ALL: [Self; SETTINGS_COUNT] = [
         // RX
         Self::SquelchA,
         Self::SquelchB,
+        Self::StepSizeA,
+        Self::StepSizeB,
+        Self::FineStep,
+        Self::FilterWidthSsb,
+        Self::FilterWidthCw,
+        Self::FilterWidthAm,
         Self::FmNarrow,
         Self::SsbHighCut,
         Self::CwHighCut,
@@ -362,13 +406,20 @@ impl SettingRow {
         Self::AutoInfo,
         Self::CallsignSlot,
         Self::DstarSlot,
+        Self::ScanResumeCat,
     ];
 
     /// Human-readable label for the setting.
-    pub const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::SquelchA => "Squelch A",
             Self::SquelchB => "Squelch B",
+            Self::StepSizeA => "Step Size A",
+            Self::StepSizeB => "Step Size B",
+            Self::FineStep => "Fine Step",
+            Self::FilterWidthSsb => "Filter Width SSB",
+            Self::FilterWidthCw => "Filter Width CW",
+            Self::FilterWidthAm => "Filter Width AM",
             Self::FmNarrow => "FM Narrow",
             Self::SsbHighCut => "SSB High Cut",
             Self::CwHighCut => "CW High Cut",
@@ -452,11 +503,12 @@ impl SettingRow {
             Self::AutoInfo => "Auto Info",
             Self::CallsignSlot => "Callsign Slot",
             Self::DstarSlot => "D-STAR Slot",
+            Self::ScanResumeCat => "Scan Resume (CAT)",
         }
     }
 
     /// Section header label shown above this row. `None` means same group as previous row.
-    pub const fn section_header(self) -> Option<&'static str> {
+    pub(crate) const fn section_header(self) -> Option<&'static str> {
         match self {
             Self::SquelchA => Some("── RX ──"),
             Self::ScanResume => Some("── Scan ──"),
@@ -480,11 +532,14 @@ impl SettingRow {
     }
 
     /// True if this setting is adjusted with +/- rather than toggled with Enter.
-    pub const fn is_numeric(self) -> bool {
+    pub(crate) const fn is_numeric(self) -> bool {
         matches!(
             self,
             Self::SquelchA
                 | Self::SquelchB
+                | Self::StepSizeA
+                | Self::StepSizeB
+                | Self::ScanResumeCat
                 | Self::FmNarrow
                 | Self::SsbHighCut
                 | Self::CwHighCut
@@ -542,11 +597,17 @@ impl SettingRow {
     }
 
     /// True if this setting is writable via instant CAT command (no disconnect).
-    pub const fn is_cat(self) -> bool {
+    pub(crate) const fn is_cat(self) -> bool {
         matches!(
             self,
             Self::SquelchA
                 | Self::SquelchB
+                | Self::StepSizeA
+                | Self::StepSizeB
+                | Self::FineStep
+                | Self::FilterWidthSsb
+                | Self::FilterWidthCw
+                | Self::FilterWidthAm
                 | Self::VoxEnabled
                 | Self::VoxGain
                 | Self::VoxDelay
@@ -570,12 +631,13 @@ impl SettingRow {
                 | Self::AutoInfo
                 | Self::CallsignSlot
                 | Self::DstarSlot
+                | Self::ScanResumeCat
         )
     }
 }
 
 /// Settings that use instant CAT writes (no disconnect).
-pub fn cat_settings() -> Vec<SettingRow> {
+pub(crate) fn cat_settings() -> Vec<SettingRow> {
     SettingRow::ALL
         .iter()
         .copied()
@@ -584,7 +646,7 @@ pub fn cat_settings() -> Vec<SettingRow> {
 }
 
 /// Settings that require MCP page write (~3s, brief disconnect).
-pub fn mcp_settings() -> Vec<SettingRow> {
+pub(crate) fn mcp_settings() -> Vec<SettingRow> {
     SettingRow::ALL
         .iter()
         .copied()
@@ -598,7 +660,7 @@ const fn on_off(b: bool) -> &'static str {
 
 /// Which pane currently has input focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pane {
+pub(crate) enum Pane {
     BandA,
     BandB,
     Main,
@@ -606,7 +668,7 @@ pub enum Pane {
 }
 
 impl Pane {
-    pub const fn next(self) -> Self {
+    pub(crate) const fn next(self) -> Self {
         match self {
             Self::BandA => Self::BandB,
             Self::BandB => Self::Main,
@@ -615,7 +677,7 @@ impl Pane {
         }
     }
 
-    pub const fn prev(self) -> Self {
+    pub(crate) const fn prev(self) -> Self {
         match self {
             Self::BandA => Self::Detail,
             Self::BandB => Self::BandA,
@@ -627,7 +689,7 @@ impl Pane {
 
 /// Which view is shown in the main pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MainView {
+pub(crate) enum MainView {
     Channels,
     /// CAT settings — instant, no disconnect.
     SettingsCat,
@@ -639,7 +701,7 @@ pub enum MainView {
 
 /// Input mode for the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InputMode {
+pub(crate) enum InputMode {
     Normal,
     /// Searching channels — buffer holds the search string.
     Search(String),
@@ -649,13 +711,13 @@ pub enum InputMode {
 
 /// Live state for one band, updated by the radio poller.
 #[derive(Debug, Clone)]
-pub struct BandState {
+pub(crate) struct BandState {
     pub frequency: Frequency,
     pub mode: Mode,
     /// S-meter level (0–5). Driven by AI-pushed BY notifications, not polled.
-    pub s_meter: u8,
+    pub s_meter: SMeterReading,
     /// Squelch setting (0–6 on D75).
-    pub squelch: u8,
+    pub squelch: SquelchLevel,
     pub power_level: PowerLevel,
     /// Squelch is open (receiving). Driven by AI-pushed BY notifications.
     pub busy: bool,
@@ -668,8 +730,8 @@ impl Default for BandState {
         Self {
             frequency: Frequency::new(145_000_000),
             mode: Mode::Fm,
-            s_meter: 0,
-            squelch: 0,
+            s_meter: SMeterReading::new(0).unwrap(),
+            squelch: SquelchLevel::new(0).unwrap(),
             power_level: PowerLevel::High,
             busy: false,
             attenuator: false,
@@ -679,33 +741,62 @@ impl Default for BandState {
 }
 
 /// Aggregated radio state from the poller.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
-pub struct RadioState {
+pub(crate) struct RadioState {
     pub band_a: BandState,
     pub band_b: BandState,
-    /// Battery charge level (0–4): 0=Empty, 1=1/3, 2=2/3, 3=Full, 4=Charging.
-    pub battery_level: u8,
+    pub battery_level: BatteryLevel,
     pub beep: bool,
     pub lock: bool,
     pub dual_band: bool,
     pub bluetooth: bool,
     pub vox: bool,
-    /// VOX gain (0–9).
-    pub vox_gain: u8,
-    /// VOX delay (0–30).
-    pub vox_delay: u8,
-    /// Audio gain (0–99, 3-digit zero-padded on wire).
-    pub af_gain: u8,
+    pub vox_gain: VoxGain,
+    pub vox_delay: VoxDelay,
+    pub af_gain: AfGainLevel,
     pub firmware_version: String,
     pub radio_type: String,
     pub gps_enabled: bool,
-    pub beacon_type: u8,
+    pub beacon_type: BeaconMode,
+    pub fine_step: Option<kenwood_thd75::types::FineStep>,
+    pub filter_width_ssb: Option<kenwood_thd75::types::FilterWidthIndex>,
+    pub filter_width_cw: Option<kenwood_thd75::types::FilterWidthIndex>,
+    pub filter_width_am: Option<kenwood_thd75::types::FilterWidthIndex>,
+    /// Last-written scan resume method (write-only, not readable from D75).
+    pub scan_resume_cat: Option<kenwood_thd75::types::ScanResumeMethod>,
+}
+
+impl Default for RadioState {
+    fn default() -> Self {
+        Self {
+            band_a: BandState::default(),
+            band_b: BandState::default(),
+            battery_level: BatteryLevel::Empty,
+            beep: false,
+            lock: false,
+            dual_band: false,
+            bluetooth: false,
+            vox: false,
+            vox_gain: VoxGain::new(0).unwrap(),
+            vox_delay: VoxDelay::new(0).unwrap(),
+            af_gain: AfGainLevel::new(0),
+            firmware_version: String::new(),
+            radio_type: String::new(),
+            gps_enabled: false,
+            beacon_type: BeaconMode::Off,
+            fine_step: None,
+            filter_width_ssb: None,
+            filter_width_cw: None,
+            filter_width_am: None,
+            scan_resume_cat: None,
+        }
+    }
 }
 
 /// MCP programming state machine.
 #[derive(Debug)]
-pub enum McpState {
+pub(crate) enum McpState {
     Idle,
     Reading { page: u16, total: u16 },
     Loaded { image: MemoryImage, modified: bool },
@@ -715,7 +806,7 @@ pub enum McpState {
 
 /// All events that can flow into the update loop.
 #[derive(Debug)]
-pub enum Message {
+pub(crate) enum Message {
     Key(crossterm::event::KeyEvent),
     RadioUpdate(RadioState),
     RadioError(String),
@@ -739,7 +830,7 @@ pub enum Message {
 
 /// Central application state.
 #[allow(clippy::struct_excessive_bools)]
-pub struct App {
+pub(crate) struct App {
     pub connected: bool,
     pub port_path: String,
     pub state: RadioState,
@@ -766,7 +857,7 @@ pub struct App {
 
 impl App {
     /// Returns the list of used channel numbers, filtered by `search_filter`.
-    pub fn filtered_channels(&self) -> Vec<u16> {
+    pub(crate) fn filtered_channels(&self) -> Vec<u16> {
         if let McpState::Loaded { ref image, .. } = self.mcp {
             let channels = image.channels();
             let filter = self.search_filter.to_uppercase();
@@ -797,7 +888,7 @@ impl App {
     }
 
     /// Create a new app instance, loading MCP cache from disk if available.
-    pub fn new(port_path: String) -> Self {
+    pub(crate) fn new(port_path: String) -> Self {
         let (mcp, status_message) = match load_cache() {
             Some((image, age)) => {
                 let mins = age.as_secs() / 60;
@@ -841,7 +932,7 @@ impl App {
     }
 
     /// Process a message and update state. Returns true if a render is needed.
-    pub fn update(&mut self, msg: Message) -> bool {
+    pub(crate) fn update(&mut self, msg: Message) -> bool {
         match msg {
             Message::Quit => {
                 self.should_quit = true;
@@ -855,6 +946,10 @@ impl App {
                 }
                 if state.radio_type.is_empty() {
                     state.radio_type = std::mem::take(&mut self.state.radio_type);
+                }
+                // Preserve write-only fields not readable from radio
+                if state.scan_resume_cat.is_none() {
+                    state.scan_resume_cat = self.state.scan_resume_cat;
                 }
                 self.state = state;
                 self.connected = true;
@@ -948,7 +1043,7 @@ impl App {
                     self.input_mode = InputMode::Normal;
                 }
                 KeyCode::Backspace => {
-                    buf.pop();
+                    let _ = buf.pop();
                     self.search_filter = buf.clone();
                     self.channel_list_index = 0;
                 }
@@ -992,7 +1087,7 @@ impl App {
                     self.input_mode = InputMode::Normal;
                 }
                 KeyCode::Backspace => {
-                    buf.pop();
+                    let _ = buf.pop();
                 }
                 KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
                     buf.push(c);
@@ -1271,14 +1366,18 @@ impl App {
             // Squelch adjust on band pane: [ and ]
             KeyCode::Char('[') if matches!(self.focus, Pane::BandA | Pane::BandB) => {
                 let (band, cur) = if self.focus == Pane::BandA {
-                    (kenwood_thd75::types::Band::A, self.state.band_a.squelch)
+                    (
+                        kenwood_thd75::types::Band::A,
+                        self.state.band_a.squelch.as_u8(),
+                    )
                 } else {
-                    (kenwood_thd75::types::Band::B, self.state.band_b.squelch)
+                    (
+                        kenwood_thd75::types::Band::B,
+                        self.state.band_b.squelch.as_u8(),
+                    )
                 };
                 let next = cur.saturating_sub(1);
-                if let (Some(tx), Ok(level)) =
-                    (&self.cmd_tx, kenwood_thd75::types::SquelchLevel::new(next))
-                {
+                if let (Some(tx), Ok(level)) = (&self.cmd_tx, SquelchLevel::new(next)) {
                     let _ = tx.send(crate::event::RadioCommand::SetSquelch { band, level });
                     self.status_message = Some(format!("Squelch → {next}"));
                 }
@@ -1286,14 +1385,18 @@ impl App {
             }
             KeyCode::Char(']') if matches!(self.focus, Pane::BandA | Pane::BandB) => {
                 let (band, cur) = if self.focus == Pane::BandA {
-                    (kenwood_thd75::types::Band::A, self.state.band_a.squelch)
+                    (
+                        kenwood_thd75::types::Band::A,
+                        self.state.band_a.squelch.as_u8(),
+                    )
                 } else {
-                    (kenwood_thd75::types::Band::B, self.state.band_b.squelch)
+                    (
+                        kenwood_thd75::types::Band::B,
+                        self.state.band_b.squelch.as_u8(),
+                    )
                 };
                 let next = cur.saturating_add(1).min(6);
-                if let (Some(tx), Ok(level)) =
-                    (&self.cmd_tx, kenwood_thd75::types::SquelchLevel::new(next))
-                {
+                if let (Some(tx), Ok(level)) = (&self.cmd_tx, SquelchLevel::new(next)) {
                     let _ = tx.send(crate::event::RadioCommand::SetSquelch { band, level });
                     self.status_message = Some(format!("Squelch → {next}"));
                 }
@@ -1316,7 +1419,7 @@ impl App {
                 if matches!(self.mcp, McpState::Idle | McpState::Loaded { .. }) {
                     self.mcp = McpState::Reading {
                         page: 0,
-                        total: 1955,
+                        total: kenwood_thd75::protocol::programming::TOTAL_PAGES,
                     };
                     self.status_message = Some("Starting MCP read...".into());
                     if let Some(ref tx) = self.cmd_tx {
@@ -1330,7 +1433,7 @@ impl App {
                     let data = image.as_raw().to_vec();
                     self.mcp = McpState::Writing {
                         page: 0,
-                        total: 1955,
+                        total: kenwood_thd75::protocol::programming::TOTAL_PAGES,
                     };
                     self.status_message = Some("Starting MCP write...".into());
                     if let Some(ref tx) = self.cmd_tx {
@@ -1359,17 +1462,15 @@ impl App {
         if let Some(ref tx) = self.cmd_tx.clone() {
             match row {
                 SettingRow::Lock => {
-                    // LC inverted on D75: raw true = unlocked
-                    let displayed = !self.state.lock;
-                    let _ = tx.send(crate::event::RadioCommand::SetLock(displayed));
-                    self.status_message = Some(format!("Lock → {}", on_off(!displayed)));
+                    let next = !self.state.lock;
+                    let _ = tx.send(crate::event::RadioCommand::SetLock(next));
+                    self.status_message = Some(format!("Lock → {}", on_off(next)));
                     return;
                 }
                 SettingRow::DualBand => {
-                    // DL inverted on D75: raw false = dual band on
-                    let displayed = !self.state.dual_band;
-                    let _ = tx.send(crate::event::RadioCommand::SetDualBand(displayed));
-                    self.status_message = Some(format!("Dual band → {}", on_off(!displayed)));
+                    let next = !self.state.dual_band;
+                    let _ = tx.send(crate::event::RadioCommand::SetDualBand(next));
+                    self.status_message = Some(format!("Dual band → {}", on_off(next)));
                     return;
                 }
                 SettingRow::Bluetooth => {
@@ -1404,7 +1505,8 @@ impl App {
                 }
                 SettingRow::FmRadio => {
                     let _ = tx.send(crate::event::RadioCommand::SetFmRadio(true));
-                    self.status_message = Some("FM Radio toggled".into());
+                    self.status_message =
+                        Some("FM Radio: enabled (read-back not available)".into());
                     return;
                 }
                 SettingRow::GpsEnabled => {
@@ -1572,13 +1674,13 @@ impl App {
         if let Some(ref tx) = self.cmd_tx.clone() {
             match row {
                 SettingRow::SquelchA => {
-                    let cur = self.state.band_a.squelch;
+                    let cur = self.state.band_a.squelch.as_u8();
                     let next = if delta > 0 {
                         cur.saturating_add(1).min(6)
                     } else {
                         cur.saturating_sub(1)
                     };
-                    if let Ok(level) = kenwood_thd75::types::SquelchLevel::new(next) {
+                    if let Ok(level) = SquelchLevel::new(next) {
                         let _ = tx.send(crate::event::RadioCommand::SetSquelch {
                             band: kenwood_thd75::types::Band::A,
                             level,
@@ -1588,13 +1690,13 @@ impl App {
                     return;
                 }
                 SettingRow::SquelchB => {
-                    let cur = self.state.band_b.squelch;
+                    let cur = self.state.band_b.squelch.as_u8();
                     let next = if delta > 0 {
                         cur.saturating_add(1).min(6)
                     } else {
                         cur.saturating_sub(1)
                     };
-                    if let Ok(level) = kenwood_thd75::types::SquelchLevel::new(next) {
+                    if let Ok(level) = SquelchLevel::new(next) {
                         let _ = tx.send(crate::event::RadioCommand::SetSquelch {
                             band: kenwood_thd75::types::Band::B,
                             level,
@@ -1604,29 +1706,137 @@ impl App {
                     return;
                 }
                 SettingRow::VoxGain => {
-                    let cur = self.state.vox_gain;
+                    let cur = self.state.vox_gain.as_u8();
                     let next = if delta > 0 {
                         cur.saturating_add(1).min(9)
                     } else {
                         cur.saturating_sub(1)
                     };
-                    if let Ok(gain) = kenwood_thd75::types::VoxGain::new(next) {
+                    if let Ok(gain) = VoxGain::new(next) {
                         let _ = tx.send(crate::event::RadioCommand::SetVoxGain(gain));
                     }
                     self.status_message = Some(format!("VOX Gain → {next}"));
                     return;
                 }
                 SettingRow::VoxDelay => {
-                    let cur = self.state.vox_delay;
+                    let cur = self.state.vox_delay.as_u8();
                     let next = if delta > 0 {
                         cur.saturating_add(1).min(30)
                     } else {
                         cur.saturating_sub(1)
                     };
-                    if let Ok(delay) = kenwood_thd75::types::VoxDelay::new(next) {
+                    if let Ok(delay) = VoxDelay::new(next) {
                         let _ = tx.send(crate::event::RadioCommand::SetVoxDelay(delay));
                     }
                     self.status_message = Some(format!("VOX Delay → {next}"));
+                    return;
+                }
+                SettingRow::StepSizeA => {
+                    use kenwood_thd75::types::StepSize;
+                    let steps = [
+                        StepSize::Hz5000,
+                        StepSize::Hz6250,
+                        StepSize::Hz8330,
+                        StepSize::Hz9000,
+                        StepSize::Hz10000,
+                        StepSize::Hz12500,
+                        StepSize::Hz15000,
+                        StepSize::Hz20000,
+                        StepSize::Hz25000,
+                        StepSize::Hz30000,
+                        StepSize::Hz50000,
+                        StepSize::Hz100000,
+                    ];
+                    let cur_idx = self
+                        .state
+                        .band_a
+                        .step_size
+                        .and_then(|s| steps.iter().position(|&x| x == s))
+                        .unwrap_or(0);
+                    let next_idx = if delta > 0 {
+                        (cur_idx + 1).min(steps.len() - 1)
+                    } else {
+                        cur_idx.saturating_sub(1)
+                    };
+                    let next = steps[next_idx];
+                    let _ = tx.send(crate::event::RadioCommand::SetStepSize {
+                        band: kenwood_thd75::types::Band::A,
+                        step: next,
+                    });
+                    self.status_message = Some(format!("Step A → {next}"));
+                    return;
+                }
+                SettingRow::StepSizeB => {
+                    use kenwood_thd75::types::StepSize;
+                    let steps = [
+                        StepSize::Hz5000,
+                        StepSize::Hz6250,
+                        StepSize::Hz8330,
+                        StepSize::Hz9000,
+                        StepSize::Hz10000,
+                        StepSize::Hz12500,
+                        StepSize::Hz15000,
+                        StepSize::Hz20000,
+                        StepSize::Hz25000,
+                        StepSize::Hz30000,
+                        StepSize::Hz50000,
+                        StepSize::Hz100000,
+                    ];
+                    let cur_idx = self
+                        .state
+                        .band_b
+                        .step_size
+                        .and_then(|s| steps.iter().position(|&x| x == s))
+                        .unwrap_or(0);
+                    let next_idx = if delta > 0 {
+                        (cur_idx + 1).min(steps.len() - 1)
+                    } else {
+                        cur_idx.saturating_sub(1)
+                    };
+                    let next = steps[next_idx];
+                    let _ = tx.send(crate::event::RadioCommand::SetStepSize {
+                        band: kenwood_thd75::types::Band::B,
+                        step: next,
+                    });
+                    self.status_message = Some(format!("Step B → {next}"));
+                    return;
+                }
+                SettingRow::FineStep => {
+                    self.status_message = Some("Fine Step: read-only".into());
+                    return;
+                }
+                SettingRow::FilterWidthSsb
+                | SettingRow::FilterWidthCw
+                | SettingRow::FilterWidthAm => {
+                    self.status_message = Some("Filter Width: read-only".into());
+                    return;
+                }
+                SettingRow::ScanResumeCat => {
+                    use kenwood_thd75::types::ScanResumeMethod;
+                    let methods = [
+                        ScanResumeMethod::TimeOperated,
+                        ScanResumeMethod::CarrierOperated,
+                        ScanResumeMethod::Seek,
+                    ];
+                    let cur_idx = self
+                        .state
+                        .scan_resume_cat
+                        .and_then(|m| methods.iter().position(|&x| x == m))
+                        .unwrap_or(0);
+                    let next_idx = if delta > 0 {
+                        (cur_idx + 1) % methods.len()
+                    } else {
+                        (cur_idx + methods.len() - 1) % methods.len()
+                    };
+                    let next = methods[next_idx];
+                    let _ = tx.send(crate::event::RadioCommand::SetScanResumeCat(next));
+                    self.state.scan_resume_cat = Some(next);
+                    let label = match next {
+                        ScanResumeMethod::TimeOperated => "Time",
+                        ScanResumeMethod::CarrierOperated => "Carrier",
+                        ScanResumeMethod::Seek => "Seek",
+                    };
+                    self.status_message = Some(format!("Scan Resume → {label}"));
                     return;
                 }
                 SettingRow::PowerA => {
@@ -1709,38 +1919,36 @@ impl App {
                     return;
                 }
                 SettingRow::TncBaud => {
-                    let _ = tx.send(crate::event::RadioCommand::SetTncBaud(
-                        kenwood_thd75::types::TncBaud::Bps1200,
-                    ));
-                    self.status_message =
-                        Some("TNC Baud: not yet polled — send 1200 as placeholder".into());
+                    let baud = if delta > 0 {
+                        kenwood_thd75::types::TncBaud::Bps9600
+                    } else {
+                        kenwood_thd75::types::TncBaud::Bps1200
+                    };
+                    let _ = tx.send(crate::event::RadioCommand::SetTncBaud(baud));
+                    self.status_message = Some(format!("TNC Baud → {baud}"));
                     return;
                 }
                 SettingRow::BeaconType => {
-                    let cur = self.state.beacon_type;
+                    let cur = u8::from(self.state.beacon_type);
                     let next = if delta > 0 {
                         cur.saturating_add(1).min(4)
                     } else {
                         cur.saturating_sub(1)
                     };
-                    if let Ok(mode) = kenwood_thd75::types::BeaconMode::try_from(next) {
+                    if let Ok(mode) = BeaconMode::try_from(next) {
                         let _ = tx.send(crate::event::RadioCommand::SetBeaconType(mode));
+                        self.status_message = Some(format!("Beacon Type → {mode}"));
                     }
-                    self.status_message = Some(format!("Beacon Type → {next}"));
                     return;
                 }
                 SettingRow::CallsignSlot => {
-                    if let Ok(slot) = kenwood_thd75::types::CallsignSlot::new(0) {
-                        let _ = tx.send(crate::event::RadioCommand::SetCallsignSlot(slot));
-                    }
-                    self.status_message = Some("Callsign Slot: not yet polled".into());
+                    self.status_message =
+                        Some("Callsign Slot: not yet polled — cannot adjust".into());
                     return;
                 }
                 SettingRow::DstarSlot => {
-                    if let Ok(slot) = kenwood_thd75::types::DstarSlot::new(1) {
-                        let _ = tx.send(crate::event::RadioCommand::SetDstarSlot(slot));
-                    }
-                    self.status_message = Some("D-STAR Slot: not yet polled".into());
+                    self.status_message =
+                        Some("D-STAR Slot: not yet polled — cannot adjust".into());
                     return;
                 }
                 _ => {}
