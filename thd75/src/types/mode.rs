@@ -31,10 +31,20 @@ use crate::error::ValidationError;
 /// Attempting to set an unsupported mode on a band via the `MD` command
 /// will result in the radio returning a `?` error response.
 ///
+/// # Mode cycling on the radio (per User Manual Chapter 5)
+///
+/// Pressing `[MODE]` cycles through available modes:
+/// - Band A: FM/NFM -> DR (DV) -> (back to FM/NFM)
+/// - Band B: FM/NFM -> DR (DV) -> AM -> LSB -> USB -> CW -> (back to FM/NFM)
+///
+/// Switching between DV and DR requires the Digital Function Menu, not
+/// `[MODE]`. Switching between FM and NFM requires Menu No. 103
+/// (FM Narrow), not `[MODE]`.
+///
 /// # WFM (Wide FM) note
 ///
 /// WFM is NOT an `MD` mode — it is the FM broadcast radio mode accessed
-/// via the `FR` (FM Radio) command at 76–108 MHz on Band B. The radio's
+/// via the `FR` (FM Radio) command at 76-108 MHz on Band B. The radio's
 /// display shows "WFM" in FM Radio mode, but `MD` does not return a WFM
 /// value. Per the Kenwood Operating Tips §5.9, WFM appears in Band B's
 /// demodulation mode table for the FM Radio frequency range only.
@@ -109,15 +119,29 @@ impl From<Mode> for u8 {
 ///
 /// Maps to the power field in the `PC`, `FO`, and `ME` commands.
 /// The D75 firmware RE confirms 4 levels: Hi (0), Mid (1), Lo (2), EL (3).
+///
+/// Per User Manual Chapter 5 and Chapter 28: power output with external
+/// DC 13.8 V or battery 7.4 V:
+///
+/// | Level | Output | Current (DC IN) | Current (Batt) |
+/// |-------|--------|-----------------|----------------|
+/// | High | 5 W | 1.4 A | 2.0 A |
+/// | Medium | 2 W | 0.9 A | 1.3 A |
+/// | Low | 0.5 W | 0.6 A | 0.8 A |
+/// | EL | 0.05 W | 0.4 A | 0.5 A |
+///
+/// Power settings can be programmed independently for Band A and Band B.
+/// The optional KBP-9 alkaline battery case supports Low power only.
+/// Power level cannot be changed while transmitting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PowerLevel {
-    /// High power (index 0).
+    /// High power — 5 W (index 0).
     High = 0,
-    /// Medium power (index 1).
+    /// Medium power — 2 W (index 1).
     Medium = 1,
-    /// Low power (index 2).
+    /// Low power — 0.5 W (index 2).
     Low = 2,
-    /// Extra-low power (index 3). D75-specific; not present on the TH-D74.
+    /// Extra-low power — 50 mW (index 3). D75-specific; not present on the TH-D74.
     ExtraLow = 3,
 }
 
@@ -218,6 +242,21 @@ impl From<ShiftDirection> for u8 {
 ///
 /// Maps to the step field in the `FO` and `ME` commands.
 /// The variant name encodes the step in Hz (e.g. `Hz5000` = 5.0 kHz).
+///
+/// Per User Manual Chapter 12: each band can have a separate step size.
+/// Step size can only be changed in VFO mode and not while in FM
+/// broadcast mode. Band-specific restrictions:
+///
+/// - 8.33 kHz is selectable only in the 118 MHz (airband) range.
+/// - 9.0 kHz is selectable only in the LF/MF (AM broadcast) range.
+///
+/// Default step sizes per band (TH-D75A): 144 MHz = 5 kHz, 220 MHz =
+/// 20 kHz, 430 MHz = 25 kHz. TH-D75E defaults: 144 MHz = 12.5 kHz,
+/// 430 MHz = 25 kHz.
+///
+/// Changing step size may correct the displayed frequency. For example,
+/// if 144.995 MHz is shown with 5 kHz steps, switching to 12.5 kHz
+/// steps changes it to 144.9875 MHz.
 ///
 /// # KI4LAX TABLE C reference
 ///

@@ -1,11 +1,29 @@
 #![deny(unsafe_code)]
 //! Async Rust library for controlling the Kenwood TH-D75 transceiver via
-//! CAT (Computer Aided Transceiver) — the serial command protocol Kenwood
+//! CAT (Computer Aided Transceiver) -- the serial command protocol Kenwood
 //! uses for remote radio control.
 //!
 //! This library supports all 55 CAT commands over USB serial or Bluetooth
 //! SPP connections. Command definitions and validation rules are based on
 //! analysis of TH-D75 firmware v1.03.000.
+//!
+//! # TH-D75 overview (per User Manual Chapter 28)
+//!
+//! - **Models**: TH-D75A (144/220/430 MHz tribander, Americas) and
+//!   TH-D75E (144/430 MHz dual bander, Europe/UK).
+//! - **TX power**: 5 W / 2 W / 0.5 W / 0.05 W (4 steps).
+//! - **Modulation**: FM, NFM, DV (D-STAR GMSK), AM, LSB, USB, CW, WFM.
+//! - **Frequency stability**: +/-2.0 ppm.
+//! - **Operating temperature**: -20 to +60 C (-10 to +50 C with KNB-75LA).
+//! - **Receiver**: Band A double superheterodyne (1st IF 57.15 MHz,
+//!   2nd IF 450 kHz); Band B double/triple superheterodyne (1st IF
+//!   58.05 MHz, 2nd IF 450 kHz, 3rd IF 10.8 kHz for SSB/CW/AM).
+//! - **Audio output**: 400 mW or more at 8 ohm (7.4 V, 10% distortion).
+//! - **Memory**: 1000 channels, 1500 repeater lists, 30 hotspot lists.
+//! - **Weatherproof**: IP54/55.
+//! - **Bluetooth**: 3.0, Class 2, HSP + SPP profiles.
+//! - **GPS**: built-in receiver, TTFF cold ~40s / hot ~5s, 10 m accuracy.
+//! - **microSD**: 2-32 GB (FAT32), for config, recordings, GPS logs.
 //!
 //! # Usage
 //!

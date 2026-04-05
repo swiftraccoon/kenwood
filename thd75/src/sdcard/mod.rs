@@ -1,19 +1,49 @@
 //! SD card file format parsers for the TH-D75.
 //!
 //! The TH-D75 stores configuration data, logs, recordings, and captures
-//! on a microSD card. These parsers allow reading and writing radio data
-//! without entering MCP programming mode — just mount the SD card via
-//! USB Mass Storage mode (Menu 980) or remove it physically.
+//! on a microSD/microSDHC card (up to 32 GB, per Operating Tips §5.14).
+//! These parsers allow reading and writing radio data without entering
+//! MCP programming mode -- just mount the SD card via USB Mass Storage
+//! mode (Menu No. 980) or remove it physically.
+//!
+//! Per User Manual Chapter 19:
+//!
+//! - Supported cards: microSD (2 GB) and microSDHC (4-32 GB).
+//!   microSDXC is NOT supported.
+//! - File system: FAT32. Maximum 255 files per folder.
+//! - Format via Menu No. 830 (erases all data).
+//! - Unmount before removal via Menu No. 820.
+//! - Export config: Menu No. 800-803. Import: Menu No. 810-813.
+//! - Mass Storage mode (Menu No. 980 set to `Mass Storage`): the radio
+//!   appears as a removable disk on the PC. RX/TX and recording are
+//!   disabled in this mode.
+//!
+//! Per User Manual Chapter 20 (Recording):
+//!
+//! - Recording format: WAV, 16-bit, 16 kHz, mono.
+//! - Up to 2 GB per file (approximately 18 hours). Continues in a new
+//!   file if exceeded.
+//! - Recording band selectable: A or B (Menu No. 302).
+//! - Recording starts/stops via Menu No. 301.
+//!
+//! Per User Manual Chapter 19 (QSO Log):
+//!
+//! - Menu No. 180 enables QSO history logging.
+//! - Format: TSV (tab-separated values).
+//! - Records: TX/RX, date, frequency, mode, position, power, S-meter,
+//!   callsigns, messages, repeater control flags, and more.
 //!
 //! # File Types
 //!
-//! | Path | Format | Type |
-//! |------|--------|------|
-//! | `KENWOOD/TH-D75/SETTINGS/DATA/*.d75` | Binary | Full radio configuration |
-//! | `KENWOOD/TH-D75/SETTINGS/RPT_LIST/*.tsv` | UTF-16LE TSV | D-STAR repeater list |
-//! | `KENWOOD/TH-D75/SETTINGS/CALLSIGN_LIST/*.tsv` | UTF-16LE TSV | D-STAR callsign list |
-//! | `KENWOOD/TH-D75/QSO_LOG/*.tsv` | TSV | QSO contact history |
-//! | `KENWOOD/TH-D75/GPS_LOG/*.nme` | NMEA 0183 | GPS track logs |
+//! | Path | Format | Type | Parsed? |
+//! |------|--------|------|---------|
+//! | `KENWOOD/TH-D75/SETTINGS/DATA/*.d75` | Binary | Full radio configuration | Yes |
+//! | `KENWOOD/TH-D75/SETTINGS/RPT_LIST/*.tsv` | UTF-16LE TSV | D-STAR repeater list | Yes |
+//! | `KENWOOD/TH-D75/SETTINGS/CALLSIGN_LIST/*.tsv` | UTF-16LE TSV | D-STAR callsign list | Yes |
+//! | `KENWOOD/TH-D75/QSO_LOG/*.tsv` | TSV | QSO contact history | Yes |
+//! | `KENWOOD/TH-D75/GPS_LOG/*.nme` | NMEA 0183 | GPS track logs | Yes |
+//! | `KENWOOD/TH-D75/AUDIO_REC/*.wav` | WAV 16kHz/16-bit/mono | TX/RX audio recordings | No |
+//! | `KENWOOD/TH-D75/CAPTURE/*.bmp` | BMP 240x180/24-bit | Screen captures | No |
 //!
 //! # Encoding
 //!

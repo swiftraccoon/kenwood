@@ -4,6 +4,25 @@
 //! Abstract Control Model) which presents as a standard serial port, and
 //! Bluetooth SPP (Serial Port Profile) via RFCOMM.
 //!
+//! # Bluetooth (per Operating Tips §5.12)
+//!
+//! - Bluetooth version 3.0, Class 2 (range ~10m)
+//! - Profiles: HSP (Headset Profile) + SPP (Serial Port Profile)
+//! - No BLE (Bluetooth Low Energy) and no HFP (Hands-Free Profile)
+//! - BT headset provides mic + earphone for voice; PTT remains on the
+//!   radio body (no BT PTT except via VOX)
+//! - Menu No. 112: BT microphone sensitivity adjustment
+//! - When a BT headset is connected, audio is NOT routed to the USB
+//!   port or external speaker jack
+//! - Menu No. 933: view/manage connected BT devices
+//!
+//! # USB (per Operating Tips §5.13)
+//!
+//! - CDC virtual COM port (same driver as TH-D74, available at kenwood.com)
+//! - USB audio output: 48 kHz / 16-bit / mono, output only (same as speaker
+//!   output). Adjustable via Menu No. 91A.
+//! - USB Mass Storage: Menu No. 980 (Windows only for mass storage feature)
+//!
 //! Implementations:
 //! - [`SerialTransport`] — USB serial connections (and BT via `/dev/cu.*`)
 //! - [`BluetoothTransport`] — Native macOS `IOBluetooth` RFCOMM (macOS only)

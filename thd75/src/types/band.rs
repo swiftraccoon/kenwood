@@ -10,17 +10,32 @@ use crate::error::ValidationError;
 /// Variants `A` and `B` correspond to the two main VFO bands; the
 /// remaining `Band2`..`Band13` map to additional sub-band selections.
 ///
-/// # Band architecture (per Kenwood Operating Tips §1.1, §5.9)
+/// # Band architecture (per Kenwood Operating Tips §1.1, §5.9; User Manual Chapter 5)
 ///
 /// - **Band A** (upper display): Amateur-only TX/RX at 144 MHz, 220 MHz
 ///   (TH-D75A only), and 430 MHz. Supports FM and DV modes.
-/// - **Band B** (lower display): Wideband RX from 0.1–524 MHz. Supports
+///   Pressing and holding `[Left]/[Right]` cycles: 144 <-> 220 <-> 430 MHz.
+/// - **Band B** (lower display): Wideband RX from 0.1-524 MHz. Supports
 ///   FM, DV, AM, LSB, USB, CW, NFM, WFM (FM Radio mode only), and DR. Band B has an
 ///   independent receiver chain (separate VCO/PLL/IF per the service
 ///   manual), so both bands receive simultaneously.
+///   Pressing and holding `[Left]/[Right]` cycles: 430 <-> UHF(470-524) <->
+///   LF/MF(0.1-1.71) <-> HF(1.71-29.7) <-> 50(29.7-76) <-> FMBC(76-108) <->
+///   118(108-136) <-> 144(136-174) <-> VHF(174-216/230) <-> 200/300(216/230-410) <-> 430 MHz.
 ///
 /// Band A is the CTRL/PTT band by default. Band B supports all
 /// demodulation modes including SSB/CW with DSP and an IF receive filter.
+///
+/// # Dual/Single band display (per User Manual Chapter 5)
+///
+/// Press `[F]`, `[A/B]` to toggle between dual-band (both A and B visible)
+/// and single-band (only the selected band visible) display modes.
+///
+/// # Two-wave simultaneous reception (per User Manual Chapter 2)
+///
+/// Supported band combinations: `VxU`, `UxV`, `UxU` (both models), plus
+/// `Vx220M`, `220MxV`, `Ux220M` (TH-D75A only). D-STAR 2-wave simultaneous
+/// reception is also supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Band {
     /// Band A — amateur TX/RX (144/220/430 MHz). Index 0.

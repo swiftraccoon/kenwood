@@ -6,6 +6,38 @@
 //! two-way messaging, `SmartBeaconing`, digipeater path configuration,
 //! packet filtering, and QSY information exchange.
 //!
+//! # QSY function (per Operating Tips §2.3.3-§2.3.5)
+//!
+//! APRS beacons can embed a voice frequency (QSY information) so that
+//! other stations can tune directly to a voice channel. In FM mode, the
+//! beacon includes the current Band A or B voice frequency. In D-STAR DR
+//! mode, the beacon also includes the repeater callsign; in DV mode, only
+//! the frequency is included. Per Operating Tips §2.3.4.
+//!
+//! QSY display distance can be restricted via Menu No. 523 (per Operating
+//! Tips §2.3.5), limiting which QSY beacons are shown based on the
+//! transmitting station's distance from the receiver.
+//!
+//! # Fixed-position beacon during GPS track logging (per Operating Tips §2.3.6)
+//!
+//! When GPS track logging is active, APRS beacons can be transmitted from
+//! a fixed position (set via Menu No. 401) instead of the live GPS position.
+//! This is useful when operating from a known location while still logging
+//! a GPS track.
+//!
+//! # Digipeated beacon registration (per Operating Tips §2.3.7)
+//!
+//! Beacons received via digipeaters are registered in the station list.
+//! The station list shows the digipeater path used.
+//!
+//! # `VoiceAlert` (per Operating Tips §5.3)
+//!
+//! `VoiceAlert` is a CTCSS-based mechanism: APRS beacons are transmitted
+//! with a CTCSS tone so that stations monitoring the APRS frequency with
+//! matching tone squelch hear an audible alert, enabling quick voice
+//! contact. Menu No. 910 controls the balance between `VoiceAlert` audio
+//! and normal APRS audio.
+//!
 //! These types model every APRS setting accessible through the TH-D75's
 //! menu system (Chapter 14 of the user manual) and MCP programming memory
 //! (pages 0x0151+ in the memory map).
@@ -425,6 +457,13 @@ pub enum PositionAmbiguity {
 /// The packet path determines which digipeaters relay the station's
 /// packets. Common paths include WIDE1-1,WIDE2-1 for typical VHF
 /// APRS operation.
+///
+/// # New-N Paradigm (per Operating Tips §2.6.1)
+///
+/// The TH-D75 defaults to the New-N Paradigm with WIDE1-1 On and
+/// Total Hops = 2 (i.e. WIDE1-1,WIDE2-1). When the user configures
+/// a total hop count greater than 2, the radio displays a warning
+/// because excessive hops congest the APRS network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PacketPath {
     /// Off (no digipeater path).
@@ -778,6 +817,21 @@ pub enum InterruptTime {
 ///
 /// The TH-D75 can function as a fill-in digipeater, relaying packets
 /// from other APRS stations.
+///
+/// # Menu numbers (per Operating Tips §2.5)
+///
+/// - Menu No. 580: `UIdigipeat` on/off
+/// - Menu No. 581: `UIflood` alias
+/// - Menu No. 582: `UIflood` substitution
+/// - Menu No. 583: `UItrace` alias
+/// - Menu No. 584-587: My Alias 1-4
+/// - Menu No. 588: `UIcheck`
+///
+/// `UIdigipeat` enables relaying of received UI (Unnumbered Information)
+/// frames. `UIflood` handles the "flood" style of digipeating where
+/// the hop count is decremented but the alias is not changed (unless
+/// substitution is on). `UItrace` handles "trace" style digipeating
+/// where the digipeater inserts its own callsign into the path.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DigipeatConfig {
     /// Enable `UIdigipeat` (relay UI frames).
@@ -889,6 +943,15 @@ impl DigipeatAlias {
 ///
 /// QSY information allows APRS stations to advertise an alternate
 /// voice frequency so other operators can contact them directly.
+///
+/// Per Operating Tips §2.3.3: the voice frequency from Band A or B is
+/// embedded in the APRS beacon. In D-STAR DR mode, the beacon also
+/// includes the repeater callsign (§2.3.4); in DV mode, only the
+/// frequency is included.
+///
+/// Menu No. 523 controls the QSY distance restriction (§2.3.5):
+/// only QSY beacons from stations within the configured distance
+/// are displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct QsyConfig {
     /// Include QSY information in APRS status text.
@@ -910,6 +973,12 @@ pub struct QsyConfig {
 /// Voice alert transmits a CTCSS tone with APRS packets. Stations
 /// monitoring the APRS frequency with matching tone squelch will hear
 /// the alert, enabling a quick voice QSO.
+///
+/// Per Operating Tips §5.3: `VoiceAlert` is CTCSS-based. The radio
+/// transmits a CTCSS tone on the APRS frequency; stations with
+/// matching tone squelch hear an audible alert. Menu No. 910
+/// controls the volume balance between `VoiceAlert` audio and normal
+/// receive audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VoiceAlertConfig {
     /// Enable voice alert.

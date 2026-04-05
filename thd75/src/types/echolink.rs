@@ -1,9 +1,21 @@
-//! `EchoLink` memory types.
+//! `EchoLink` memory types (Menu No. 164).
 //!
 //! `EchoLink` is a `VoIP` system that links amateur radio stations over the
 //! internet. The TH-D75 supports 10 `EchoLink` memory slots for storing
 //! frequently used node numbers and their associated station names for
 //! quick access via DTMF dialing.
+//!
+//! Per User Manual Chapter 11:
+//!
+//! - `EchoLink` memory channels are separate from normal DTMF memory.
+//! - They do NOT store operating frequencies, tones, or power information.
+//! - Each slot stores a callsign/name (up to 8 characters) and a node
+//!   number or DTMF code (up to 8 digits).
+//! - The radio supports `EchoLink` "Connect by Call" (prefix `C`) and
+//!   "Query by Call" (prefix `07`) functions with automatic callsign-to-DTMF
+//!   conversion.
+//! - When only a name is stored (no code), the "Connect Call" function
+//!   automatically converts the callsign to DTMF with `C` prefix and `#` suffix.
 //!
 //! These types model `EchoLink` settings from the TH-D75's menu system.
 //! Derived from the capability gap analysis feature 138.

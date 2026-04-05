@@ -1,4 +1,9 @@
 //! Scan-related radio methods: scan resume (SR write-only), step size (SF), band scope (BS).
+//!
+//! # Single Band Display (per Operating Tips §5.10.4)
+//!
+//! Menu No. 904 controls the Single Band Display information line:
+//! Off, GPS (Altitude), GPS (Ground Speed), Date, or Demodulation Mode.
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};

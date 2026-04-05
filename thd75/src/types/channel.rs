@@ -11,6 +11,50 @@
 //! 0x0F-0x27. The flash format includes `MemoryMode` (8 modes including
 //! LSB/USB/CW/DR), separated D-STAR callsigns, and structured tone/duplex
 //! bit fields.
+//!
+//! # Memory architecture (per User Manual Chapter 8)
+//!
+//! A total of 1101 memory channels are available:
+//!
+//! - **0-999**: standard memory channels (simplex, repeater, or odd-split)
+//! - **L0/U0 through L49/U49**: 100 program scan edge memories (50 pairs)
+//! - **Pri**: 1 priority scan memory channel
+//! - **A1-A10**: weather channels (TH-D75A only)
+//! - **C**: call channels (one per band/mode combination)
+//!
+//! Each channel can store: RX frequency, TX frequency (odd-split),
+//! step size, offset direction, tone/CTCSS/DCS/cross-tone settings,
+//! shift, reverse, lockout, demodulation mode, fine mode, memory name
+//! (up to 16 characters), and D-STAR digital squelch/callsign data.
+//!
+//! Memory channels can be used as simplex/repeater (one frequency +
+//! optional offset) or odd-split (separate TX/RX frequencies for
+//! non-standard repeater offsets). Odd-split channels show "+-" on
+//! the display.
+//!
+//! # Memory groups (per Operating Tips §5.11, User Manual Chapter 8)
+//!
+//! The TH-D75 supports 30 memory groups (GRP-0 through GRP-29). By
+//! default, channels 0-99 belong to GRP-0, 100-199 to GRP-1, and so on
+//! up to 900-999 in GRP-9. Groups 10-29 are empty by default. Each group
+//! can be given a name of up to 16 characters via Menu No. 201.
+//! Groups without any registered channels are skipped during group
+//! switching.
+//!
+//! # Memory recall (per User Manual Chapter 8)
+//!
+//! Menu No. 202 controls the recall method:
+//! - `All Bands`: recall all programmed memory channels.
+//! - `Current Band`: recall only channels with frequencies in the
+//!   current frequency band. This also affects memory scan and group
+//!   link scan.
+//!
+//! # Memory shift (per User Manual Chapter 8)
+//!
+//! Memory channel or call channel contents can be copied to VFO via
+//! `[F]`, `[VFO]`. The entire contents (frequency, mode, tone, etc.)
+//! are transferred. To copy the TX frequency from an odd-split channel,
+//! turn on Reverse first.
 
 use std::fmt;
 
@@ -383,6 +427,17 @@ impl From<FlashDuplex> for u8 {
 ///
 /// Determines how different tone/DCS codes are applied to TX vs RX
 /// when cross-tone mode is active.
+///
+/// Per User Manual Chapter 10: cross tone allows separate signaling
+/// types for TX and RX when accessing a repeater that uses different
+/// encode/decode signaling. Activated by pressing `[TONE]` 4 times.
+///
+/// | Value | Encode (TX) | Decode (RX) | Display icon |
+/// |-------|-------------|-------------|--------------|
+/// | 0 | DCS | Off | D/O |
+/// | 1 | Tone | DCS | T/D |
+/// | 2 | DCS | CTCSS | D/C |
+/// | 3 | Tone | CTCSS | T/C |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CrossToneType {
     /// DTCS on both TX and RX (value 0).
@@ -453,6 +508,15 @@ impl From<FlashDigitalSquelch> for u8 {
 ///
 /// Used in conjunction with the fine-mode flag (byte 0x09 bit 2) for
 /// sub-kHz frequency adjustment.
+///
+/// Per User Manual Chapter 12: fine tuning is available only on Band B
+/// in LSB, USB, CW, or AM modes. It does not work on Band A, or in
+/// FM/DV modes. Activated via `[F]`, `[MHz]` -> On. While fine tuning
+/// is active, the 100 Hz digit appears on the display, and step size,
+/// MHz mode, and MHz scan are disabled. Turning fine tuning off does
+/// not change the current frequency, but the next frequency change
+/// uses the normal step size. The fine step can be set independently
+/// per frequency band.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FineStep {
     /// 20 Hz fine step (value 0).

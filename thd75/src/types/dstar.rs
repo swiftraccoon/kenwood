@@ -5,6 +5,41 @@
 //! Voice) mode with features including reflector linking, callsign routing,
 //! gateway access, and DR (D-STAR Repeater) mode for simplified operation.
 //!
+//! # Callsign registration (per Operating Tips §4.1.1)
+//!
+//! Before using D-STAR gateway/reflector functions, the operator's callsign
+//! must be registered at <https://regist.dstargateway.org>.
+//!
+//! # My Callsign (per Operating Tips §4.1.2)
+//!
+//! A valid MY callsign is required for any DV or DR mode transmission.
+//! Menu No. 610 allows registration of up to 6 callsigns; the active
+//! one is selected for transmission.
+//!
+//! # DR mode (per Operating Tips §4.2)
+//!
+//! DR (Digital Repeater) mode simplifies D-STAR operation by combining
+//! repeater and destination selection into a single interface. The operator
+//! selects an access repeater from the repeater list and a destination
+//! (another repeater, callsign, or reflector), and the radio automatically
+//! configures RPT1, RPT2, and UR callsign fields.
+//!
+//! # Reflector Terminal Mode (per Operating Tips §4.4)
+//!
+//! The TH-D75 supports Reflector Terminal Mode, which connects to D-STAR
+//! reflectors without a physical hotspot. On Android, use `BlueDV` Connect
+//! via Bluetooth; on Windows, use `BlueDV` via Bluetooth or USB.
+//!
+//! # Simultaneous reception
+//!
+//! The TH-D75 can receive D-STAR DV signals on both Band A and Band B
+//! simultaneously.
+//!
+//! # Repeater and Hotspot lists (per Operating Tips §4.3)
+//!
+//! The radio stores up to 1500 repeater list entries and 30 hotspot list
+//! entries. These are managed via the MCP-D75 software or SD card import.
+//!
 //! These types model every D-STAR setting accessible through the TH-D75's
 //! menu system (Chapter 16 of the user manual) and MCP programming memory
 //! (pages 0x02A1+ in the memory map, plus system settings at 0x03F0).
@@ -209,6 +244,11 @@ impl DstarSuffix {
 ///
 /// DV mode provides manual repeater configuration; DR mode simplifies
 /// operation with automatic repeater selection from the repeater list.
+///
+/// Per Operating Tips §4.2: DR (Digital Repeater) mode combines repeater
+/// selection and destination selection. The radio configures RPT1, RPT2,
+/// and UR callsign fields automatically based on the user's choices from
+/// the repeater list and destination list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DvDrMode {
     /// DV (Digital Voice) mode -- manual repeater configuration.

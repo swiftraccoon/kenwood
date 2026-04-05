@@ -1,9 +1,40 @@
 //! Weather alert types (TH-D75A only -- not available on TH-D75E).
 //!
 //! The TH-D75A (Americas model) includes a weather alert receiver that
-//! monitors NOAA Weather Radio frequencies for Specific Area Message
-//! Encoding (SAME) alerts. The radio can automatically scan weather
-//! channels and sound an alarm when a weather alert is received.
+//! monitors NOAA Weather Radio frequencies for a 1050 Hz alert tone.
+//! When the tone is received, the weather alert tone sounds.
+//!
+//! Per User Manual Chapter 24:
+//!
+//! # Weather channels
+//!
+//! The radio has 10 weather memory channels (A1-A10):
+//!
+//! | Channel | Frequency | Name | Location |
+//! |---------|-----------|------|----------|
+//! | A1 | 162.550 MHz | WX 1 | NOAA / Canada |
+//! | A2 | 162.400 MHz | WX 2 | NOAA / Canada |
+//! | A3 | 162.475 MHz | WX 3 | NOAA / Canada |
+//! | A4 | 162.425 MHz | WX 4 | NOAA |
+//! | A5 | 162.450 MHz | WX 5 | NOAA |
+//! | A6 | 162.500 MHz | WX 6 | NOAA |
+//! | A7 | 162.525 MHz | WX 7 | NOAA |
+//! | A8 | 161.650 MHz | WX 8 | Canada |
+//! | A9 | 161.775 MHz | WX 9 | Canada |
+//! | A10 | 163.275 MHz | WX 10 | -- |
+//!
+//! # Weather alert (Menu No. 105)
+//!
+//! When activated, the weather alert icon appears on the display and
+//! blinks when a signal is being received. Cannot be enabled when
+//! priority scan or FM radio mode is active.
+//!
+//! # Weather channel scan (Menu No. 136)
+//!
+//! Auto scanning options: Off / 15 / 30 / 60 minutes. When a time is
+//! set, scanning starts automatically after the interval. Scanning
+//! stops when the channel with the highest signal level is found or
+//! when no signal is received on any channel.
 //!
 //! These types model weather alert settings from the TH-D75 user manual.
 //! Derived from the capability gap analysis features 158 and 196.

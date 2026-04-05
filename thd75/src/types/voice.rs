@@ -6,6 +6,14 @@
 //! Recorded messages can be transmitted, played back locally, or set
 //! to repeat at a configurable interval.
 //!
+//! Per User Manual Chapter 22 and the menu table:
+//!
+//! - Menu No. 310: Voice message list.
+//! - Menu No. 311: TX monitor (Off/On, default: On) -- hear your own
+//!   transmitted voice message through the speaker.
+//! - Menu No. 312: Digital auto reply -- automatically reply to D-STAR
+//!   calls with a voice message (Off / Voice Message 1-4, default: Off).
+//!
 //! These types model voice message settings from Chapter 22 of the
 //! TH-D75 user manual. Derived from the capability gap analysis
 //! feature 145.

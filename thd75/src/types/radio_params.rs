@@ -14,6 +14,11 @@ use crate::error::ValidationError;
 /// Squelch threshold level (0-6).
 ///
 /// 0 = open (no squelch), 6 = maximum squelch. Used by the `SQ` CAT command.
+/// Squelch can be set independently for Band A and Band B.
+///
+/// Per User Manual Chapter 5: the squelch mutes the speaker when no signals
+/// are present. The higher the level, the stronger the signal must be to
+/// open squelch. Adjust with `[F]`, `[MONI]` on the radio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SquelchLevel(u8);
 
@@ -201,6 +206,20 @@ impl fmt::Display for SMeterReading {
 ///
 /// Controls which channel selection mode the band is in.
 /// Used by the `VM` CAT command.
+///
+/// Per User Manual Chapter 5:
+///
+/// - **VFO mode** (`[VFO]`): manually tune to any frequency using the
+///   encoder dial, up/down keys, or direct frequency entry via keypad.
+///   The default step size varies by band and model (e.g., TH-D75A:
+///   5 kHz on 144 MHz, 20 kHz on 220 MHz, 25 kHz on 430 MHz).
+/// - **Memory mode** (`[MR]`): recall one of 1000 stored memory channels
+///   (0-999) plus 100 program scan memories and 1 priority channel.
+/// - **Call mode** (`[CALL]`): quick-access channel for emergency/group
+///   use. Default call channels: TH-D75A 146.520 FM (VHF), 446.000 FM
+///   (UHF); TH-D75E 145.500 FM (VHF), 433.500 FM (UHF).
+/// - **Weather mode**: NOAA weather channels (TH-D75A only, 10 channels
+///   A1-A10 at 161.650-163.275 MHz).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VfoMemoryMode {
     /// VFO mode — frequency entered directly (index 0).
@@ -306,11 +325,20 @@ impl From<FilterMode> for u8 {
 /// Battery charge level (0-4).
 ///
 /// Reported by the `BL` CAT command. Read-only on the TH-D75.
+/// Menu No. 922 displays the battery level on the radio.
+///
 /// - 0 = Empty (Red)
 /// - 1 = 1/3 (Yellow)
 /// - 2 = 2/3 (Green)
 /// - 3 = Full (Green)
 /// - 4 = Charging (USB power connected)
+///
+/// Per User Manual Chapter 28: the supplied KNB-75LA is 1820 mAh,
+/// 7.4 V Li-ion. Battery life at TX:RX:standby = 6:6:48 ratio with
+/// GPS off and battery saver on: H=6 hrs, M=8 hrs, L=12 hrs, EL=15 hrs.
+/// GPS on reduces battery life by approximately 10%.
+/// The optional KBP-9 case uses 6x AAA alkaline batteries (Low power
+/// only, approximately 3.5 hours).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BatteryLevel {
     /// Empty — red battery indicator (index 0).
@@ -370,6 +398,12 @@ impl From<BatteryLevel> for u8 {
 ///
 /// Controls the microphone sensitivity threshold for VOX activation.
 /// Used by the `VG` CAT command. VOX must be enabled (`VX 1`) first.
+/// Menu No. 151. Default: 4.
+///
+/// Per User Manual Chapter 12: gain 9 transmits even on a quiet voice;
+/// gain 0 effectively disables VOX triggering. A headset must be used
+/// because the internal speaker and microphone are too close together
+/// for VOX to function reliably.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VoxGain(u8);
 
@@ -426,6 +460,12 @@ impl fmt::Display for VoxGain {
 ///
 /// Controls how long the transmitter stays keyed after voice stops.
 /// Used by the `VD` CAT command. VOX must be enabled (`VX 1`) first.
+/// Menu No. 152. Default: 500 ms.
+///
+/// Per User Manual Chapter 12: available values are 250, 500, 750,
+/// 1000, 1500, 2000, and 3000 ms. If you press `[PTT]` while VOX is
+/// active, the delay time is not applied. If DCS is active, the radio
+/// transmits a Turn-Off Code after the delay expires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VoxDelay(u8);
 
@@ -701,12 +741,22 @@ impl fmt::Display for CallsignSlot {
 // DetectOutputMode (IO command)
 // ---------------------------------------------------------------------------
 
-/// AF/IF/Detect output mode (Menu 102).
+/// AF/IF/Detect output mode (Menu No. 102).
 ///
 /// Controls what signal is output via the USB connector to a PC.
-/// Used by the `IO` CAT command.
+/// Used by the `IO` CAT command. Band B single-band mode must be
+/// active to select IF or Detect.
 ///
-/// Source: User Manual §12-2 "AF/IF/DETECT OUTPUT MODE".
+/// Per User Manual Chapter 12:
+///
+/// - When IF or Detect is selected, Band A is hidden and its audio
+///   output stops. Beeps and voice guidance are also suppressed.
+/// - Special PC software is required to process IF or Detect signals.
+/// - KISS mode prevents selecting IF or Detect.
+/// - DV mode prevents selecting Detect.
+/// - For IF 12 kHz output, the demodulation mode can be AM/LSB/USB/CW.
+///
+/// Source: User Manual Chapter 12 "AF/IF/DETECT OUTPUT MODE".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DetectOutputMode {
     /// AF output — received audio sound (index 0).
@@ -818,7 +868,10 @@ pub enum TncMode {
     /// NAVITRA mode — Japanese APRS variant (index 1).
     Navitra = 1,
     /// KISS mode — PC-based packet via KISS protocol (index 2).
-    /// Enter with `TN 2,0`. See Operating Tips §2.7.
+    /// Enter with `TN 2,0` (Band A) or `TN 2,1` (Band B).
+    /// See Operating Tips §2.7, User Manual Chapter 15.
+    /// The built-in TNC has 4 KB TX and RX buffers and supports only
+    /// KISS mode (no Command mode or Converse mode).
     Kiss = 2,
     /// MMDVM/Reflector Terminal mode — D-STAR reflector access (index 3).
     /// Uses MMDVM serial commands via USB or Bluetooth.
@@ -868,9 +921,16 @@ impl From<TncMode> for u8 {
 /// IF receive filter width index for the SH (filter width) command.
 ///
 /// The valid range depends on the filter mode:
-/// - **SSB** (mode 0): 0-4 → 2.2 / 2.4 / 2.6 / 2.8 / 3.0 kHz high-cut
-/// - **CW** (mode 1): 0-4 → 0.3 / 0.5 / 1.0 / 1.5 / 2.0 kHz bandwidth
-/// - **AM** (mode 2): 0-3 → 3.0 / 4.5 / 6.0 / 7.5 kHz high-cut
+/// - **SSB** (mode 0): 0-4 -> 2.2 / 2.4 / 2.6 / 2.8 / 3.0 kHz high-cut
+///   (Menu No. 120, default 2.4 kHz). Low cut is fixed at 200 Hz.
+/// - **CW** (mode 1): 0-4 -> 0.3 / 0.5 / 1.0 / 1.5 / 2.0 kHz bandwidth
+///   (Menu No. 121, default 1.0 kHz). The filter is centered on the
+///   pitch frequency (Menu No. 170).
+/// - **AM** (mode 2): 0-3 -> 3.0 / 4.5 / 6.0 / 7.5 kHz high-cut
+///   (Menu No. 122, default 6.0 kHz). Low cut is fixed at 200 Hz.
+///
+/// Per User Manual Chapter 12: these filters reduce interference and
+/// noise in SSB, CW, and AM modes to improve reception. Band B only.
 ///
 /// Source: Kenwood TH-D75A/E Operating Tips §5.10 (May 2024).
 /// Hardware-verified: `SH mode,width\r` returns echo on success.

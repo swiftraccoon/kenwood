@@ -6,6 +6,12 @@
 //! full break-in (QSK) provides instantaneous receive between every
 //! dit and dah.
 //!
+//! # CW reverse (per Operating Tips §5.10.2)
+//!
+//! Menu No. 171 controls CW sideband selection:
+//! - Normal: USB (Upper Side Band)
+//! - Reverse: LSB (Lower Side Band)
+//!
 //! These types model CW settings from the TH-D75's menu system.
 //! Derived from the capability gap analysis features 133-136.
 
@@ -71,11 +77,18 @@ pub enum CwDelay {
 // CW pitch frequency
 // ---------------------------------------------------------------------------
 
-/// CW sidetone pitch frequency (400-1000 Hz in 50 Hz steps).
+/// CW sidetone pitch frequency (400-1000 Hz in 100 Hz steps).
 ///
 /// The sidetone is the locally generated audio tone heard while
 /// transmitting CW. The pitch can be adjusted to the operator's
-/// preference between 400 Hz and 1000 Hz.
+/// preference: 400 / 500 / 600 / 700 / 800 / 900 / 1000 Hz.
+/// Default: 800 Hz.
+///
+/// Per User Manual Chapter 12: this also sets the center frequency
+/// of the CW bandwidth filter (Menu No. 121). The CW filter is
+/// centered on the pitch frequency.
+///
+/// Source: Operating Tips §5.10.2, Menu No. 170.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CwPitch(u16);
 
@@ -86,15 +99,15 @@ impl CwPitch {
     /// Maximum pitch frequency in Hz.
     pub const MAX_HZ: u16 = 1000;
 
-    /// Step size in Hz.
-    pub const STEP_HZ: u16 = 50;
+    /// Step size in Hz (100 Hz per Operating Tips §5.10.2).
+    pub const STEP_HZ: u16 = 100;
 
     /// Creates a new CW pitch frequency.
     ///
     /// # Errors
     ///
     /// Returns `None` if the frequency is outside the 400-1000 Hz range
-    /// or is not a multiple of 50 Hz.
+    /// or is not a multiple of 100 Hz.
     #[must_use]
     pub const fn new(hz: u16) -> Option<Self> {
         if hz >= Self::MIN_HZ && hz <= Self::MAX_HZ && hz % Self::STEP_HZ == 0 {
@@ -144,8 +157,8 @@ mod tests {
             count += 1;
             hz += CwPitch::STEP_HZ;
         }
-        // 400, 450, 500, ..., 1000 = 13 valid values.
-        assert_eq!(count, 13);
+        // 400, 500, 600, 700, 800, 900, 1000 = 7 valid values.
+        assert_eq!(count, 7);
     }
 
     #[test]

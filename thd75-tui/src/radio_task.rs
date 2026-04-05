@@ -373,11 +373,15 @@ pub async fn spawn_with_transport(
                     "Reconnect attempt {attempts}..."
                 )));
 
-                // For BT paths, skip discover_and_open entirely — IOBluetooth
-                // RFCOMM must be opened on the main thread (CFRunLoop). Calling
-                // BluetoothTransport::open from a tokio thread is undefined
-                // behavior in Objective-C.
-                let connect_result = if SerialTransport::is_bluetooth_port(&path_clone) {
+                // On macOS, native IOBluetooth RFCOMM must be opened on the
+                // main thread (CFRunLoop). On Linux/Windows, BT SPP serial
+                // ports can be opened directly from any thread.
+                #[cfg(target_os = "macos")]
+                let skip_direct = SerialTransport::is_bluetooth_port(&path_clone);
+                #[cfg(not(target_os = "macos"))]
+                let skip_direct = false;
+
+                let connect_result = if skip_direct {
                     Err("BT requires main thread".to_string())
                 } else {
                     discover_and_open(Some(&path_clone), baud)
@@ -666,12 +670,23 @@ fn discover_and_open(port: Option<&str>, baud: u32) -> Result<(String, EitherTra
         return Ok((path, EitherTransport::Serial(transport)));
     }
 
-    // No USB — try native Bluetooth RFCOMM
+    // No USB — try Bluetooth.
+    // macOS: use native IOBluetooth RFCOMM (the serial driver drops bytes).
+    // Linux/Windows: discover BT SPP serial ports (rfcomm*, COM with "bluetooth").
     #[cfg(target_os = "macos")]
     {
         if let Ok(bt) = kenwood_thd75::BluetoothTransport::open(None) {
             return Ok(("bluetooth:TH-D75".into(), EitherTransport::Bluetooth(bt)));
         }
+    }
+
+    let bt_ports =
+        SerialTransport::discover_bluetooth().map_err(|e| format!("BT discovery failed: {e}"))?;
+    if let Some(info) = bt_ports.first() {
+        let path = info.port_name.clone();
+        let transport = SerialTransport::open(&path, baud)
+            .map_err(|e| format!("Failed to open BT port {path}: {e}"))?;
+        return Ok((path, EitherTransport::Serial(transport)));
     }
 
     Err("No TH-D75 found on USB or Bluetooth".to_string())

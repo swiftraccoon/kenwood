@@ -4,6 +4,18 @@
 //! Contains CTCSS (Continuous Tone-Coded Squelch System) frequency and DCS
 //! code lookup tables, along with validated newtype wrappers and signaling
 //! mode enums.
+//!
+//! Per User Manual Chapter 10:
+//!
+//! - CTCSS, Tone, and DCS cannot be active simultaneously on a channel.
+//! - Pressing `[TONE]` cycles: Tone -> CTCSS (CT) -> DCS -> Cross Tone -> Off.
+//!   When APRS Voice Alert is configured, Voice Alert ON is added to the cycle.
+//! - CTCSS/DCS settings can be applied independently per VFO, Memory Channel,
+//!   and Call mode. Changes in Memory/Call mode are temporary unless stored.
+//! - Both CTCSS and DCS support frequency/code scanning (`[F]` + hold `[TONE]`)
+//!   to identify an incoming signal's tone or code.
+//!
+//! See User Manual Chapters 7 and 10 for full CTCSS/DCS/Cross Tone details.
 
 use crate::error::ValidationError;
 
@@ -129,6 +141,11 @@ impl std::fmt::Display for DcsCode {
 /// Maps to the tone-mode field in the `FO` and `ME` commands.
 /// Corresponds to **KI4LAX TABLE F** in the CAT command reference
 /// (index 0 = Off, 1 = CTCSS, 2 = DCS).
+///
+/// Per User Manual Chapter 10: CTCSS does not make conversations
+/// private -- it only relieves you from hearing unwanted conversations.
+/// When CTCSS or DCS is active during scan, scan stops on any signal
+/// but immediately resumes if the signal lacks the matching tone/code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToneMode {
     /// No tone signaling (index 0).
@@ -243,6 +260,12 @@ impl From<DataSpeed> for u8 {
 /// Channel lockout mode for scan operations.
 ///
 /// Maps to the lockout field in the `ME` command.
+///
+/// Per User Manual Chapter 9: lockout can be set individually for all
+/// 1000 memory channels but cannot be set for program scan memory
+/// (L0/U0 through L49/U49). The lockout icon appears to the right of
+/// the channel number when a locked-out channel is recalled. Lockout
+/// cannot be toggled in VFO or CALL channel mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockoutMode {
     /// Not locked out (index 0).

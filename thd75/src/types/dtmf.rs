@@ -2,8 +2,24 @@
 //!
 //! DTMF is the tone signaling system used by touch-tone telephones and
 //! amateur radio for dialing, auto-patching, and remote control. The
-//! TH-D75 supports 16 DTMF memory slots for storing digit sequences,
-//! configurable encode speed, pause time, and TX hold behavior.
+//! TH-D75 supports 10 DTMF memory channels (Menu No. 163) for storing
+//! digit sequences, plus 10 dedicated `EchoLink` memory channels (Menu
+//! No. 164), configurable encode speed, pause time, and TX hold behavior.
+//!
+//! Per User Manual Chapter 11:
+//!
+//! - **Manual dialing**: press `[PTT]` then press keypad keys to send
+//!   DTMF tones in real time.
+//! - **Automatic dialer**: store up to 16 digits per channel with an
+//!   optional name (up to 16 characters). Transmit by pressing `[PTT]`,
+//!   then `[ENT]`, selecting a channel, then `[ENT]` again.
+//! - **DTMF Hold** (Menu No. 162): when enabled, the transmitter stays
+//!   keyed for 2 seconds after each keypress without holding `[PTT]`.
+//! - **DTMF Key Lock** (Menu No. 961): locks DTMF keys to prevent
+//!   accidental transmission while PTT is held.
+//! - **Encode speed** (Menu No. 160): 50 / 100 / 150 ms per digit.
+//!   Some repeaters may not respond correctly at fast speed.
+//! - **Pause time** (Menu No. 161): 100-2000 ms between digit groups.
 //!
 //! These types model DTMF settings from the TH-D75's menu system
 //! (Chapter 11 of the user manual). Derived from the capability gap
@@ -166,9 +182,11 @@ impl Default for DtmfConfig {
     }
 }
 
-/// DTMF tone encode speed.
+/// DTMF tone encode speed (Menu No. 160).
 ///
-/// Controls how long each DTMF tone is transmitted.
+/// Controls how long each DTMF tone is transmitted. Per User Manual
+/// Chapter 11: some repeaters may not respond correctly at fast speed.
+/// The user manual lists 50, 100, and 150 ms options. Default: 100 ms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DtmfSpeed {
     /// Slow encode speed (100 ms per digit).

@@ -1,8 +1,35 @@
 //! FM broadcast radio types.
 //!
 //! The TH-D75 has a built-in wideband FM broadcast receiver covering
-//! 76.0-108.0 MHz. It provides 10 FM memory channels (FM0-FM9) for
+//! 76.0-107.9 MHz. It provides 10 FM memory channels (FM0-FM9) for
 //! storing favourite broadcast stations.
+//!
+//! # Reception methods (per Operating Tips §5.10.7)
+//!
+//! There are two ways to receive FM broadcast:
+//!
+//! 1. **Band B frequency selection**: Tune Band B to the FM broadcast
+//!    band and select WFM mode. This uses the normal Band B receiver.
+//! 2. **FM Radio mode** (Menu No. 700): A dedicated FM radio mode that
+//!    runs concurrently with APRS and D-STAR operations. When a signal
+//!    is received on the amateur bands, FM Radio audio is muted; it
+//!    returns automatically after a configurable timeout (Menu No. 701).
+//!
+//! # Operation (per User Manual Chapter 21)
+//!
+//! - Frequency range: 76.0-108.0 MHz (WFM)
+//! - 10 memory channels (FM0-FM9) with assignable names
+//! - Direct frequency input supported via `[ENT]` and number keys
+//! - `[MODE]` toggles between FM Radio mode (VFO tuning) and FM Radio
+//!   Memory mode (FM0-FM9 recall). Cannot switch to memory mode if no
+//!   stations are registered.
+//! - `[A/B]` starts seek scanning; "\<\<Tuned\>\>" is displayed when a
+//!   station is found
+//! - FM Radio cannot be enabled when Band B is set to LF/MF, HF, 50,
+//!   or FMBC bands, or when Priority Scan, WX Alert, or IF/Detect
+//!   output mode is active.
+//! - When FM Radio mode is on, Menu No. 105, 134, 200, 203, 204, 210,
+//!   and 220 cannot be accessed.
 //!
 //! The FM radio is toggled on/off via the FR CAT command (already
 //! implemented as `get_fm_radio` / `set_fm_radio`). FM memory channels
@@ -94,6 +121,10 @@ impl fmt::Display for FmRadioChannel {
 ///
 /// The TH-D75's FM broadcast receiver can operate in two modes:
 /// direct frequency tuning or memory channel recall.
+///
+/// Per User Manual Chapter 21: the auto-mute return time (Menu No. 701,
+/// 1-10 seconds, default 3) controls how long after an amateur-band
+/// signal ends before the FM radio audio resumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FmRadioMode {
     /// Direct frequency tuning — tune to any frequency in the

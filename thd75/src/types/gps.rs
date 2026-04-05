@@ -17,6 +17,67 @@
 /// Covers all settings from the radio's GPS menu tree, including
 /// receiver control, output format, track logging, and position memory.
 /// Derived from the capability gap analysis features 95-109.
+///
+/// Per User Manual Chapter 13 and Chapter 28:
+///
+/// # GPS specifications
+///
+/// - TTFF (cold start): approximately 40 seconds
+/// - TTFF (hot start): approximately 5 seconds
+/// - Horizontal accuracy: 10 m or less
+/// - Receive sensitivity: approximately -141 dBm (acquisition)
+/// - GPS logger mode current consumption: 125 mA
+///
+/// # GPS Receiver mode (per User Manual Chapter 13, Menu No. 403)
+///
+/// GPS Receiver mode turns off the transceiver function entirely to
+/// prolong battery life during GPS track logging. Only GPS information
+/// is displayed. The FM broadcast radio still works in this mode.
+/// Limited key operations are available: `[MENU]`, `[MARK]`, `[F]`
+/// (toggle North Up / Heading Up), and navigation between GPS screens.
+///
+/// # My Position (per User Manual Chapter 13, Menu No. 401)
+///
+/// 5 position memory channels store latitude, longitude, and a name
+/// (up to 8 characters) for locations from which you frequently
+/// transmit APRS packets. Select `GPS` to use the live GPS position
+/// or `My Position 1-5` for a fixed stored position.
+///
+/// # Position Ambiguity (per User Manual Chapter 13, Menu No. 402)
+///
+/// Controls how many trailing digits of position data are omitted
+/// from APRS packets: Off (full precision), 1-Digit, 2-Digit,
+/// 3-Digit, or 4-Digit.
+///
+/// # Position Memory (per User Manual Chapter 13)
+///
+/// The radio provides 100 position memory slots, each storing
+/// latitude, longitude, altitude, timestamp, name (up to 8 characters),
+/// and APRS icon. Memories can be sorted by name or date/time, used
+/// as target points for navigation, or cleared individually or all
+/// at once.
+///
+/// # GPS Battery Saver (per User Manual Chapter 13, Menu No. 404)
+///
+/// Options: Off / 1 / 2 / 4 / 8 minutes / Auto. The Auto setting
+/// progressively increases the GPS off-time: 1 min -> 2 min -> 4 min
+/// -> 8 min (stays at 8 min). If position is later acquired then lost,
+/// the cycle restarts at 1 minute.
+///
+/// # GPS PC Output (per User Manual Chapter 13, Menu No. 405)
+///
+/// When enabled, NMEA data is output via USB or Bluetooth (selected
+/// by Menu No. 981). Configurable sentences (Menu No. 406): `$GPGGA`,
+/// `$GPGLL`, `$GPGSA`, `$GPGSV`, `$GPRMC`, `$GPVTG`. At least one
+/// sentence must remain selected.
+///
+/// # Track Log (per User Manual Chapter 13, Menu No. 410-414)
+///
+/// Records movement to a microSD memory card. Record methods: Time
+/// (interval 2-1800 seconds), Distance (0.01-9.99 miles/km/nm), or
+/// Beacon (synced with APRS beacon transmissions). Track log files
+/// are named by start date/time (e.g., `05122024_124705.nme`).
+/// Track logging pauses when the microSD card is full.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GpsConfig {
     /// Built-in GPS receiver on/off.
@@ -207,9 +268,15 @@ impl TryFrom<u8> for TrackRecordMethod {
 
 /// GPS position memory slot.
 ///
-/// The TH-D75 provides 5 position memory slots ("My Position 1" through
+/// The TH-D75 provides 5 "My Position" slots ("My Position 1" through
 /// "My Position 5") for storing known locations. These can be used as
 /// manual position references when GPS is unavailable.
+///
+/// Per Operating Tips §5.14.4: the radio also has 100 general-purpose
+/// position memory slots (separate from these 5 "My Position" entries)
+/// that store latitude, longitude, altitude, timestamp, name, and APRS
+/// icon. A position memory entry can be copied to one of these "My
+/// Position" slots (§5.14.5) or to an APRS Object for transmission.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionMemory {
     /// Descriptive name for the position (up to 8 characters).

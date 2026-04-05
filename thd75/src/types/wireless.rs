@@ -1,10 +1,39 @@
-//! Wireless remote control types.
+//! Wireless remote control types (TH-D75A only).
 //!
-//! The TH-D75 supports wireless remote control of another TH-D75 (or
-//! compatible transceiver) via DTMF signaling. A "control" radio sends
+//! The TH-D75A supports wireless remote control of a Kenwood multi-band
+//! mobile transceiver via DTMF signaling. A "control" radio sends
 //! DTMF commands over air to a "target" radio, which decodes them and
 //! executes the corresponding function. Access is protected by a
-//! 4-digit DTMF password.
+//! 3-digit secret access code (Menu No. 946, range 000-999).
+//!
+//! Per User Manual Chapter 25:
+//!
+//! - FCC rules permit sending control codes only on the 440 MHz band.
+//! - The target mobile transceiver must have both the secret number and
+//!   Remote Control functions.
+//! - The DTMF format is `AXXX#YA#` where `XXX` is the 3-digit secret
+//!   code and `Y` is a single-digit control command.
+//!
+//! # Remote control commands (per User Manual Chapter 25)
+//!
+//! | RM# | Name | Operation |
+//! |-----|------|-----------|
+//! | RM0 | LOW | Toggle TX power |
+//! | RM1 | On | DCS ON / Reverse ON / Tone Alert ON |
+//! | RM2 | TONE On | Tone ON |
+//! | RM3 | CTCSS On | CTCSS ON |
+//! | RM4 | Off | DCS OFF / Reverse OFF / Tone Alert OFF |
+//! | RM5 | TONE Off | Tone OFF |
+//! | RM6 | CTCSS Off | CTCSS OFF |
+//! | RM7 | CALL | Call mode ON |
+//! | RM8 | VFO | VFO mode ON |
+//! | RM9 | MR | Memory mode ON |
+//! | RMA | Freq. Enter | Frequency or channel direct entry |
+//! | RMB | Tone Select | DCS code / Tone freq / CTCSS freq setup |
+//! | RMC | REPEATER On | Repeater ON |
+//! | RMD | REPEATER Off | Repeater OFF |
+//! | RM\* | DOWN | Step frequency/channel down |
+//! | RM# | UP | Step frequency/channel up |
 //!
 //! These types model wireless control settings from Chapter 25 of the
 //! TH-D75 user manual.
@@ -27,10 +56,15 @@ pub struct WirelessControlConfig {
     pub password: WirelessPassword,
 }
 
-/// Wireless control 4-digit DTMF password.
+/// Wireless control DTMF password.
 ///
 /// The password must be exactly 4 valid DTMF characters (`0`-`9`,
 /// `A`-`D`, `*`, `#`).
+///
+/// Note: the User Manual Chapter 25 describes a 3-digit numeric secret
+/// access code (000-999, Menu No. 946) for the over-the-air protocol.
+/// This 4-character DTMF password is the MCP/firmware internal
+/// representation which may include extended DTMF characters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WirelessPassword(String);
 

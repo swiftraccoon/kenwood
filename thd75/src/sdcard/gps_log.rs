@@ -7,7 +7,13 @@
 //!
 //! # Location
 //!
-//! `/KENWOOD/TH-D75/GPS_LOG/*.nme`
+//! `/KENWOOD/TH-D75/GPS_LOG/*.nme` — maximum 255 files per directory.
+//!
+//! # GPS Receiver mode (per Operating Tips §5.14.2)
+//!
+//! For prolonged GPS track logging, Menu No. 403 enables GPS Receiver
+//! mode, which disables the transceiver function to conserve battery.
+//! The FM broadcast radio remains functional in this mode.
 //!
 //! # Format
 //!

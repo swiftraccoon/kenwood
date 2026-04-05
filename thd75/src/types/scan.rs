@@ -8,6 +8,19 @@
 //! on a signal) is configured via the SR command. The scan range for
 //! program scan is configured via the SF command.
 //!
+//! Per User Manual Chapter 9:
+//!
+//! - Adjust squelch before scanning; too-low squelch causes immediate stops.
+//! - While using CTCSS or DCS, scan stops on any signal but immediately
+//!   resumes if the signal lacks the matching tone/code.
+//! - Pressing and holding `[PTT]` temporarily stops scan on a non-TX band.
+//! - The 1 MHz decimal point blinks on the display during active scanning.
+//! - Resume methods have separate settings for analog (Menu No. 130) and
+//!   digital DV/DR modes (Menu No. 131). Default: Time for analog, Seek
+//!   for digital.
+//! - Time-operate restart time: Menu No. 132, 1-10 seconds, default 5.
+//! - Carrier-operate restart time: Menu No. 133, 1-10 seconds, default 2.
+//!
 //! See TH-D75 User Manual, Chapter 9: Scan.
 
 use super::Frequency;
@@ -15,18 +28,23 @@ use super::Frequency;
 /// Scan resume method — controls how the radio resumes scanning after
 /// stopping on an active signal.
 ///
-/// Configured via Menu No. 200 on the radio, and via the SR CAT command.
+/// Configured via Menu No. 130 (analog) or Menu No. 131 (digital DV/DR)
+/// on the radio, and via the SR CAT command. Default: Time for analog,
+/// Seek for digital.
 ///
 /// # Safety warning
 /// The SR command with value 0 has been observed to reboot the radio
 /// on some firmware versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScanResumeMethod {
-    /// Time-operated: resume scanning after a configurable delay
-    /// (approximately 5 seconds) even if the signal is still present.
+    /// Time-operated: resume scanning after a configurable delay even
+    /// if the signal is still present. Default hold time is 5 seconds
+    /// (Menu No. 132, range 1-10 seconds).
     TimeOperated,
     /// Carrier-operated: resume scanning when the received signal
-    /// drops below the squelch threshold.
+    /// drops below the squelch threshold and stays closed for the
+    /// configured restart time. Default restart time is 2 seconds
+    /// (Menu No. 133, range 1-10 seconds).
     CarrierOperated,
     /// Seek: stop on the first active signal and remain there.
     /// The user must manually resume scanning.
@@ -76,28 +94,40 @@ impl TryFrom<u8> for ScanResumeMethod {
 /// and the key sequence used to start the scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScanType {
-    /// VFO band scan: scans the entire frequency range of the current band
-    /// using the configured step size. Started by pressing and holding
-    /// the up/down key in VFO mode.
+    /// VFO band scan: scans the frequency range stored in Menu No. 100
+    /// (Programmable VFO) using the current step size. Started by
+    /// pressing and holding `[VFO]` in VFO mode.
     BandScan,
     /// Memory channel scan: scans through all stored memory channels that
-    /// are not locked out. Started in memory mode.
+    /// are not locked out. Started by pressing and holding `[MR]`.
+    /// At least 2 non-locked-out memory channels must contain data.
+    /// Program scan memory and the priority channel are excluded.
+    /// If the recall method (Menu No. 202) is set to `Current Band`,
+    /// only channels in the same frequency band are scanned.
     MemoryScan,
-    /// Program scan: scans between two user-defined frequency limits
-    /// (programmable VFO lower and upper bounds). Configured via
-    /// Menu No. 100.
+    /// Program scan: scans between two user-defined frequency limits.
+    /// There are 50 program scan memories (L0/U0 through L49/U49).
+    /// Started by pressing and holding `[VFO]` when the VFO frequency
+    /// is within a registered program scan range.
     ProgramScan,
     /// MHz scan: scans within a 1 MHz range around the current frequency.
+    /// For example, if tuned to 145.400 MHz, scans 145.000-145.995 MHz.
     /// Started by pressing and holding `[MHz]`.
     MhzScan,
     /// Group link scan: scans memory channels within linked memory groups.
-    /// Groups are linked via Menu No. 204.
+    /// Groups are linked via Menu No. 203. Up to 30 groups can be linked.
+    /// Started by pressing and holding `[MHz]` in memory mode.
+    /// If no groups are linked, memory scan is executed instead.
     GroupLinkScan,
-    /// Priority scan: periodically checks a designated priority channel
-    /// while scanning other frequencies.
+    /// Priority scan: checks the frequency registered in the priority
+    /// channel `[Pri]` every 3 seconds. When that channel is busy, the
+    /// radio switches to it. Menu No. 134 enables/disables this.
+    /// The priority channel must be on Band B. Not available in
+    /// single-band-A mode or when FM radio mode is active.
     PriorityScan,
-    /// Call scan: alternates between the current frequency and the call
-    /// channel.
+    /// Call scan: alternates between the current VFO frequency (or memory
+    /// channel) and the call channel. Started by pressing and holding
+    /// `[CALL]`. The selected memory channel is scanned even if locked out.
     CallScan,
 }
 

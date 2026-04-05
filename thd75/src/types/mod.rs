@@ -4,6 +4,12 @@
 //! `radio_validate_channel_params` function at address `0xC003C694` in
 //! firmware v1.03.000. Invalid values are rejected at construction time,
 //! making illegal radio states unrepresentable.
+//!
+//! Menu numbers referenced throughout this module correspond to the
+//! TH-D75 menu system as documented in User Manual Chapter 6 (Menu Mode).
+//! The full menu table covers Menu No. 100-999 across categories:
+//! TX/RX, Memory, Audio File, GPS, APRS, Digital (D-STAR), FM
+//! Broadcasting, SD Card, and Configuration.
 
 pub mod aprs;
 pub mod band;

@@ -1,6 +1,21 @@
 //! Core radio methods: frequency, mode, power, squelch, S-meter, TX/RX, firmware, power status, ID,
 //! band control, VFO/memory mode, FM radio, fine step, function type, and filter width.
 //!
+//! # Band capabilities (per Operating Tips §5.9, §5.10)
+//!
+//! - **Band A**: 144 / 220 (A only) / 430 MHz amateur operation
+//! - **Band B**: 0.1-524 MHz wideband receive, all modes (FM, NFM, AM, LSB, USB, CW, DV, DR)
+//! - **TH-D75A TX ranges**: 144-148 MHz, 222-225 MHz, 430-450 MHz
+//! - **TH-D75E TX ranges**: 144-146 MHz, 430-440 MHz
+//!
+//! # IF signal output (per Operating Tips §5.10)
+//!
+//! Menu No. 102 enables IF (Intermediate Frequency) signal output via the USB
+//! port: 12 kHz center frequency, 15 kHz bandwidth. This is intended for
+//! SSB/CW/AM demodulation by a PC application. Single Band mode is required
+//! for IF/Detect output. A band scope can be driven via a third-party PC
+//! application using the BS command.
+//!
 //! # FQ vs FO
 //!
 //! The D75 has two frequency-related command pairs:

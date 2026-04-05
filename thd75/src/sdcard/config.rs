@@ -1,7 +1,13 @@
 //! Parser for `.d75` configuration files.
 //!
 //! These files contain the complete radio configuration and can be
-//! saved (Menu 800) and loaded (Menu 810) from the microSD card.
+//! saved (Menu No. 800) and loaded (Menu No. 810) from the microSD card.
+//! The data format is the same as the MCP-D75 PC application uses.
+//!
+//! Per Operating Tips §5.14.3: it is recommended to export and save the
+//! configuration before performing a firmware upgrade, as the upgrade
+//! process may reset settings.
+//!
 //! The file format is a 256-byte header followed by a raw memory image
 //! identical to what the MCP programming protocol reads.
 //!

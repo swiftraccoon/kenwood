@@ -9,16 +9,16 @@ use crate::error::ProtocolError;
 /// Stored as a `u32`, matching the firmware's internal representation.
 /// Range: 0 to 4,294,967,295 Hz (0 to ~4.295 GHz).
 ///
-/// # TH-D75 band frequency ranges
+/// # TH-D75 band frequency ranges (per User Manual Chapter 28)
 ///
 /// The radio enforces hardware-specific frequency limits per band:
 ///
-/// - **Band B (RX only)**: 0.1 MHz to 524 MHz continuous receive
-///   coverage. Band B is receive-only across this entire range.
-/// - **Band A (TX/RX)**: Transmit is restricted to amateur allocations:
-///   - 144-148 MHz (2m)
-///   - 220-225 MHz (1.25m, TH-D75A model only)
-///   - 430-450 MHz (70cm)
+/// - **Band A TX**: 144-148 MHz (TH-D75A), 144-146 MHz (TH-D75E),
+///   222-225 MHz (TH-D75A only), 430-450 MHz (TH-D75A), 430-440 MHz
+///   (TH-D75E).
+/// - **Band A RX**: 136-174 MHz, 216-260 MHz (TH-D75A only), 410-470 MHz.
+/// - **Band B TX**: same amateur allocations as Band A.
+/// - **Band B RX**: 0.1-76 MHz, 76-108 MHz (WFM), 108-524 MHz.
 ///
 /// Frequencies outside these ranges will be **rejected by the radio**
 /// when sent via CAT commands such as `FQ` or `FO`. The firmware

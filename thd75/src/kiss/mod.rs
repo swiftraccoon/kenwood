@@ -5,18 +5,42 @@
 //! on the radio, cycling to "KISS mode ON"), the radio accepts and
 //! produces standard KISS frames over USB or Bluetooth.
 //!
-//! # TH-D75 KISS TNC specifications (per Operating Tips §2.7.2)
+//! # Activation (per Operating Tips §2.7)
 //!
-//! - TX buffer: 3 KB, RX buffer: 4 KB
+//! KISS mode is activated from the radio front panel: press `[F]`, then
+//! `[LIST]`, then cycle to "KISS mode ON". When active, the display shows
+//! "KISS12" (1200 bps) or "KISS96" (9600 bps) depending on the data speed
+//! setting.
+//!
+//! From a PC application (e.g. UI-View32), KISS mode is entered by sending
+//! the `TN 2,0` command. The radio then accepts standard KISS frames.
+//!
+//! # Menu interaction while in KISS mode
+//!
+//! While KISS mode is active, **all APRS menu configurations are inactive**
+//! except Menu No. 505 (Data Speed) and Menu No. 506 (Data Band). The radio
+//! ignores changes to other APRS settings until KISS mode is exited.
+//!
+//! # TH-D75 KISS TNC specifications (per Operating Tips §2.7.2, User Manual Chapter 15)
+//!
+//! - TX buffer: 4 KB, RX buffer: 4 KB (per User Manual Chapter 15)
 //! - Speeds: 1200 bps (AFSK) and 9600 bps (GMSK)
-//! - KISS commands: Data Frame (`0x00`), TXDELAY (`0x01`, 0–120, units
-//!   of 10 ms), Persistence (`0x02`, 0–255, default 128), `SlotTime`
-//!   (`0x03`, 0–250, units of 10 ms, default 10), `TXtail` (`0x04`,
-//!   0–255, default 3), `FullDuplex` (`0x05`, 0=half/default, nonzero=
-//!   full), `SetHardware` (`0x06`, 0 or 0x23=1200 bps, 0x05 or 0x26=9600 bps),
-//!   Return (`0xFF`)
-//! - When KISS is active, all APRS menu configs are inactive except
-//!   Menu 505 (Data Speed) and Menu 506 (Data Band)
+//! - The built-in TNC does NOT support Command mode or Converse mode;
+//!   it enters KISS mode directly.
+//! - KISS commands: Data Frame (`0x00`), TXDELAY (`0x01`, 0-120, units
+//!   of 10 ms, default from Menu No. 508), Persistence (`0x02`, 0-255,
+//!   default 128), `SlotTime` (`0x03`, 0-250, units of 10 ms, default 10),
+//!   `TXtail` (`0x04`, 0-255, default 3), `FullDuplex` (`0x05`, 0=half/
+//!   default, nonzero=full), `SetHardware` (`0x06`, 0 or 0x23=1200 bps,
+//!   0x05 or 0x26=9600 bps, default from Menu No. 505), Return (`0xFF`)
+//! - The data band frequency defaults to Band A; changeable via Menu No. 506.
+//! - USB or Bluetooth interface is selectable via Menu No. 983.
+//! - Transfer rates: USB up to 12 Mbps, Bluetooth up to 128 kbps.
+//! - To exit KISS mode: send KISS command `C0,FF,C0` (192,255,192).
+//!   To re-enter KISS mode from PC: send CAT command `TN 2,0` (Band A)
+//!   or `TN 2,1` (Band B).
+//! - Display indicators: `KISS` (KISS mode active), `12` (1200 bps),
+//!   `96` (9600 bps), `STA` (TX packets remaining in buffer).
 //!
 //! This module provides:
 //! - KISS frame encoding and decoding with proper byte stuffing

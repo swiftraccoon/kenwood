@@ -15,6 +15,26 @@ use crate::error::ValidationError;
 ///
 /// Controls the TH-D75's LCD backlight, color theme, power-on message,
 /// and meter display. Derived from capability gap analysis features 159-169.
+///
+/// # Menu numbers (per Operating Tips §5.2, User Manual Chapter 12)
+///
+/// - Menu No. 900: Backlight control — `Auto` (keys/encoder turn on,
+///   timer turns off; also lights on APRS interrupt or scan pause),
+///   `Auto (DC-IN)` (same as Auto on battery, always-on on DC),
+///   `Manual` (only `[Power]` toggles), `On` (always on).
+/// - Menu No. 901: Backlight timer — 3 to 60 seconds, default 10.
+/// - Menu No. 902: LCD brightness — High / Medium / Low.
+/// - Menu No. 903: Power-on message — up to 16 characters, default
+///   "HELLO !!". Displayed for approximately 2 seconds at power-on.
+///   MCP-D75 software can also set a custom bitmap graphic.
+/// - Menu No. 904: Single Band Display — Off / GPS(Altitude) /
+///   GPS(GS) / Date / Demodulation Mode.
+/// - Menu No. 905: Meter Type — Type 1 / Type 2 / Type 3 (S/RF meter
+///   design variants).
+/// - Menu No. 906: Background Color — Black / White.
+/// - Menu No. 907: Info Backlight — Off / LCD / LCD+Key. Controls
+///   whether the backlight turns on for APRS or D-STAR interrupt
+///   display and scan pause/stop events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplaySettings {
     /// LCD backlight control mode.
@@ -59,18 +79,31 @@ impl Default for DisplaySettings {
     }
 }
 
-/// LCD backlight control mode.
+/// LCD backlight control mode (Menu No. 900).
+///
+/// Per User Manual Chapter 12: temporary lighting can also be triggered
+/// by pressing `[Power]`, which illuminates the display and keys for the
+/// timer duration (Menu No. 901). Pressing `[Power]` while lit turns
+/// the light off immediately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BacklightControl {
-    /// Backlight always on.
+    /// Backlight always on while power is on.
     On,
-    /// Backlight auto (turns on with key press, off after timer).
+    /// Backlight auto (turns on with key press or encoder rotation,
+    /// off after the timer in Menu No. 901 expires). Also lights on
+    /// APRS interrupt reception and scan pause/stop.
     Auto,
-    /// Backlight always off.
+    /// Backlight always off (only `[Power]` can trigger temporary
+    /// lighting in Manual mode, per User Manual Chapter 12).
     Off,
 }
 
-/// Background color theme for the LCD display.
+/// Background color theme for the LCD display (Menu No. 906).
+///
+/// Per User Manual Chapter 12: the user manual defines only Black
+/// and White options. The Operating Tips previously referenced Amber,
+/// Green, Blue, and White. The actual available values depend on
+/// firmware version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackgroundColor {
     /// Amber / warm color theme.
@@ -131,6 +164,10 @@ pub enum DisplayMethod {
 }
 
 /// LED indicator control.
+///
+/// Per Operating Tips §5.2: Menu No. 181 controls the RX LED and
+/// FM Radio LED independently. When enabled, the LED lights on
+/// signal reception and during FM broadcast radio playback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LedControl {
     /// LED indicators enabled.
@@ -161,6 +198,22 @@ pub enum DisplayHoldTime {
 /// Controls the TH-D75's beep, equalizer, microphone sensitivity,
 /// and voice guidance features. Derived from capability gap analysis
 /// features 123-148.
+///
+/// # Audio equalizer (per User Manual Chapter 12)
+///
+/// The TH-D75 has independent TX and RX parametric equalizers:
+///
+/// - **TX EQ** (Menu No. 911/912): 4-band (0.4/0.8/1.6/3.2 kHz),
+///   range -9 to +3 dB per band. Separate enable for FM/NFM and DV modes.
+/// - **RX EQ** (Menu No. 911/913): 5-band (0.4/0.8/1.6/3.2/6.4 kHz),
+///   range -9 to +9 dB per band. The 6.4 kHz band has no effect in
+///   DV/DR mode since digital audio bandwidth is limited to 4 kHz.
+///
+/// # Volume balance (per User Manual Chapter 5)
+///
+/// Menu No. 910 controls audio balance between Band A and Band B.
+/// The `Operation Band Only` setting outputs sound only from the
+/// operation band when both bands are simultaneously busy.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioSettings {
@@ -223,7 +276,10 @@ pub enum EqSetting {
     FullBoost,
 }
 
-/// Microphone sensitivity level.
+/// Microphone sensitivity level (Menu No. 112).
+///
+/// Per User Manual Chapter 12: applies to both the internal microphone
+/// and an external microphone. Default: Medium.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MicSensitivity {
     /// Low sensitivity.
@@ -254,6 +310,31 @@ pub enum VoiceGuideSpeed {
 /// Covers global configuration such as power management, key lock,
 /// display units, language, and programmable function keys.
 /// Derived from capability gap analysis features 170-197.
+///
+/// # USB charging (per Operating Tips §5.1)
+///
+/// The TH-D75 charges via USB but does not support USB Power Delivery
+/// (PD). It always draws 5V from USB; an internal DC-DC converter
+/// boosts this to 7.4V for the battery. Two charging current modes:
+/// - 1.5A: approximately 5.5 hours to full charge
+/// - 0.5A: approximately 13 hours to full charge
+///
+/// **Power must be off during charging.** Menu No. 923 can disable
+/// charging at power-on to prevent unintended charge sessions.
+///
+/// # Battery saver (per Operating Tips §5.1)
+///
+/// Menu No. 920 controls the battery saver, which cycles the receiver
+/// on and off to reduce power consumption. In DV/DR mode, the off
+/// duration is fixed at 200 ms regardless of the configured value.
+/// Battery saver is automatically disabled when APRS or KISS mode
+/// is active.
+///
+/// # Auto Power Off (per Operating Tips §5.1)
+///
+/// Menu No. 921 controls Auto Power Off. Default is 30 minutes.
+/// The radio powers off automatically after the configured period
+/// of inactivity.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemSettings {
@@ -278,6 +359,13 @@ pub struct SystemSettings {
     pub language: Language,
     /// Time-out timer in seconds (0 = disabled, 30-600).
     /// Automatically stops TX after the timeout.
+    ///
+    /// Menu No. 111. Per User Manual Chapter 12: available values are
+    /// 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, and 10.0
+    /// minutes. Default: 10.0 minutes. This function cannot be turned
+    /// off entirely -- it protects the transceiver from thermal damage.
+    /// A warning beep sounds just before TX is cut off. After timeout,
+    /// the transceiver beeps even if beep is disabled.
     pub time_out_timer: u16,
     /// Programmable function key PF1 (front panel) assignment.
     pub pf1_key: PfKeyFunction,
@@ -325,7 +413,16 @@ impl Default for SystemSettings {
     }
 }
 
-/// Auto power off timer duration.
+/// Auto power off timer duration (Menu No. 921).
+///
+/// Per User Manual Chapter 12: after the time limit with no operations,
+/// APO turns the power off. One minute before power-off, "APO" blinks
+/// on the display and a warning tone sounds (even if beep is disabled).
+/// APO does not operate during scanning.
+///
+/// The User Manual menu table lists options: Off / 15 / 30 / 60 minutes
+/// (default: 30). The firmware MCP binary encoding may support additional
+/// values (90, 120 minutes) not shown in the manual.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AutoPowerOff {
     /// Auto power off disabled.
@@ -340,7 +437,17 @@ pub enum AutoPowerOff {
     Min120,
 }
 
-/// Key lock type -- which controls are affected by key lock.
+/// Key lock type -- which controls are affected by key lock (Menu No. 960).
+///
+/// Per User Manual Chapter 12: key lock is toggled by pressing and
+/// holding `[F]`. The `[MONI]`, `[PTT]`, `[Power]`, and `[VOL]`
+/// controls can never be locked.
+///
+/// The User Manual lists options as `Key Lock` and/or `Frequency Lock`
+/// (checkboxes), with different combined behaviors:
+/// - Key Lock only: locks all front panel keys.
+/// - Frequency Lock only: locks frequency/channel controls.
+/// - Both: locks all keys and the encoder control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyLockType {
     /// Lock front panel keys only.
@@ -403,7 +510,7 @@ pub enum TemperatureUnit {
     Celsius,
 }
 
-/// Language selection.
+/// Language selection (Menu No. 990).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     /// English.
@@ -425,8 +532,15 @@ pub enum DateFormat {
 
 /// Programmable function key assignment.
 ///
-/// The TH-D75 has 2 front-panel PF keys and 3 microphone PF keys,
-/// each assignable to one of these functions.
+/// The TH-D75 has 2 front-panel PF keys (Menu No. 940/941) and 3
+/// microphone PF keys (Menu No. 942/943/944), each assignable to one
+/// of these functions.
+///
+/// Per User Manual Chapter 12: the microphone PF keys support a larger
+/// set of functions than the front-panel keys, including MODE, MENU,
+/// A/B, VFO, MR, CALL, MSG, LIST, BCON, REV, TONE, MHz, MARK, DUAL,
+/// APRS, OBJ, ATT, FINE, POS, BAND, MONI, UP, DOWN, and Screen Capture.
+/// Front-panel PF keys additionally support M.IN (memory registration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PfKeyFunction {
     /// Monitor (open squelch).
