@@ -7,7 +7,9 @@
 use crate::error::ProtocolError;
 use crate::types::Band;
 use crate::types::mode::{Mode, StepSize};
-use crate::types::radio_params::{AfGainLevel, FilterMode, SMeterReading, SquelchLevel};
+use crate::types::radio_params::{
+    AfGainLevel, FilterMode, FilterWidthIndex, SMeterReading, SquelchLevel,
+};
 
 use super::Response;
 
@@ -141,7 +143,9 @@ fn parse_ft(payload: &str) -> Result<Response, ProtocolError> {
         payload
     };
     let value = parse_u8_field(data_str, "FT", "value")?;
-    Ok(Response::FunctionType { value })
+    Ok(Response::FunctionType {
+        enabled: value != 0,
+    })
 }
 
 /// Parse SH (filter width): `mode_index,width`.
@@ -156,11 +160,23 @@ fn parse_sh(payload: &str) -> Result<Response, ProtocolError> {
             field: "mode".to_owned(),
             detail: e.to_string(),
         })?;
-        let width = parse_u8_field(parts[1], "SH", "width")?;
+        let width_raw = parse_u8_field(parts[1], "SH", "width")?;
+        let width =
+            FilterWidthIndex::from_raw(width_raw).map_err(|e| ProtocolError::FieldParse {
+                command: "SH".into(),
+                field: "width".into(),
+                detail: e.to_string(),
+            })?;
         Ok(Response::FilterWidth { mode, width })
     } else {
         // Bare response - treat payload as width with mode SSB
-        let width = parse_u8_field(payload, "SH", "width")?;
+        let width_raw = parse_u8_field(payload, "SH", "width")?;
+        let width =
+            FilterWidthIndex::from_raw(width_raw).map_err(|e| ProtocolError::FieldParse {
+                command: "SH".into(),
+                field: "width".into(),
+                detail: e.to_string(),
+            })?;
         Ok(Response::FilterWidth {
             mode: FilterMode::Ssb,
             width,

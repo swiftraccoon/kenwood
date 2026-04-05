@@ -30,8 +30,8 @@ use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
 use crate::types::{
-    Band, ChannelMemory, FilterMode, Mode, PowerLevel, SMeterReading, SquelchLevel, StepSize,
-    VfoMemoryMode,
+    Band, ChannelMemory, FilterMode, FilterWidthIndex, Mode, PowerLevel, SMeterReading,
+    SquelchLevel, StepSize, VfoMemoryMode,
 };
 
 use super::Radio;
@@ -647,11 +647,11 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_function_type(&mut self) -> Result<u8, Error> {
-        tracing::debug!("reading function type");
+    pub async fn get_function_type(&mut self) -> Result<bool, Error> {
+        tracing::debug!("reading function type (fine tune)");
         let response = self.execute(Command::GetFunctionType).await?;
         match response {
-            Response::FunctionType { value } => Ok(value),
+            Response::FunctionType { enabled } => Ok(enabled),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "FunctionType".into(),
                 actual: format!("{other:?}").into_bytes(),
@@ -810,7 +810,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_filter_width(&mut self, mode: FilterMode) -> Result<u8, Error> {
+    pub async fn get_filter_width(&mut self, mode: FilterMode) -> Result<FilterWidthIndex, Error> {
         tracing::debug!(?mode, "reading filter width");
         let response = self.execute(Command::GetFilterWidth { mode }).await?;
         match response {
@@ -831,8 +831,12 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_filter_width(&mut self, mode: FilterMode, width: u8) -> Result<(), Error> {
-        tracing::info!(?mode, width, "setting filter width");
+    pub async fn set_filter_width(
+        &mut self,
+        mode: FilterMode,
+        width: FilterWidthIndex,
+    ) -> Result<(), Error> {
+        tracing::info!(?mode, ?width, "setting filter width");
         let response = self
             .execute(Command::SetFilterWidth { mode, width })
             .await?;

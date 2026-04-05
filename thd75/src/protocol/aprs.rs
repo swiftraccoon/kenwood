@@ -4,6 +4,7 @@
 //! commands. Serialization is handled inline by the main dispatcher.
 
 use crate::error::ProtocolError;
+use crate::types::radio_params::{BeaconMode, TncBaud};
 
 use super::Response;
 
@@ -40,11 +41,25 @@ fn parse_ae(payload: &str) -> Response {
 /// Returns `None` if the mnemonic is not an APRS command.
 pub(crate) fn parse_aprs(mnemonic: &str, payload: &str) -> Option<Result<Response, ProtocolError>> {
     match mnemonic {
-        "AS" => Some(parse_u8_field(payload, "AS", "rate").map(|rate| Response::TncBaud { rate })),
+        "AS" => Some(parse_u8_field(payload, "AS", "rate").and_then(|raw| {
+            TncBaud::try_from(raw)
+                .map(|rate| Response::TncBaud { rate })
+                .map_err(|e| ProtocolError::FieldParse {
+                    command: "AS".into(),
+                    field: "rate".into(),
+                    detail: e.to_string(),
+                })
+        })),
         "AE" => Some(Ok(parse_ae(payload))),
-        "PT" => {
-            Some(parse_u8_field(payload, "PT", "mode").map(|mode| Response::BeaconType { mode }))
-        }
+        "PT" => Some(parse_u8_field(payload, "PT", "mode").and_then(|raw| {
+            BeaconMode::try_from(raw)
+                .map(|mode| Response::BeaconType { mode })
+                .map_err(|e| ProtocolError::FieldParse {
+                    command: "PT".into(),
+                    field: "mode".into(),
+                    detail: e.to_string(),
+                })
+        })),
         "MS" => Some(
             parse_u8_field(payload, "MS", "source")
                 .map(|source| Response::PositionSource { source }),

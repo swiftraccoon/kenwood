@@ -2,14 +2,16 @@
 //! and system commands (Bluetooth, SD, User Settings).
 
 use kenwood_thd75::protocol::{self, Command, Response};
-use kenwood_thd75::types::Band;
+use kenwood_thd75::types::*;
 
 // === Scan (SR write-only, SF band-indexed, BS) ===
 
 #[test]
 fn serialize_scan_resume_write() {
     assert_eq!(
-        protocol::serialize(&Command::SetScanResume { mode: 1 }),
+        protocol::serialize(&Command::SetScanResume {
+            mode: ScanResumeMethod::CarrierOperated
+        }),
         b"SR 1\r"
     );
 }
@@ -100,7 +102,7 @@ fn serialize_as_read() {
 #[test]
 fn parse_as_response() {
     match protocol::parse(b"AS 0").unwrap() {
-        Response::TncBaud { rate } => assert_eq!(rate, 0),
+        Response::TncBaud { rate } => assert_eq!(rate, TncBaud::Bps1200),
         other => panic!("expected TncBaud, got {other:?}"),
     }
 }
@@ -108,7 +110,7 @@ fn parse_as_response() {
 #[test]
 fn parse_as_response_9600() {
     match protocol::parse(b"AS 1").unwrap() {
-        Response::TncBaud { rate } => assert_eq!(rate, 1),
+        Response::TncBaud { rate } => assert_eq!(rate, TncBaud::Bps9600),
         other => panic!("expected TncBaud, got {other:?}"),
     }
 }
@@ -137,7 +139,7 @@ fn serialize_pt_read() {
 #[test]
 fn parse_pt_response() {
     match protocol::parse(b"PT 2").unwrap() {
-        Response::BeaconType { mode } => assert_eq!(mode, 2),
+        Response::BeaconType { mode } => assert_eq!(mode, BeaconMode::Ptt),
         other => panic!("expected BeaconType, got {other:?}"),
     }
 }
@@ -175,7 +177,7 @@ fn serialize_ds_read() {
 #[test]
 fn parse_ds_response() {
     match protocol::parse(b"DS 1").unwrap() {
-        Response::DstarSlot { slot } => assert_eq!(slot, 1),
+        Response::DstarSlot { slot } => assert_eq!(slot, DstarSlot::new(1).unwrap()),
         other => panic!("expected DstarSlot, got {other:?}"),
     }
 }
@@ -191,7 +193,9 @@ fn serialize_cs_read() {
 #[test]
 fn serialize_cs_write() {
     assert_eq!(
-        protocol::serialize(&Command::SetActiveCallsignSlot { slot: 10 }),
+        protocol::serialize(&Command::SetActiveCallsignSlot {
+            slot: CallsignSlot::new(10).unwrap()
+        }),
         b"CS 10\r"
     );
 }
@@ -199,7 +203,9 @@ fn serialize_cs_write() {
 #[test]
 fn parse_cs_response() {
     match protocol::parse(b"CS 10").unwrap() {
-        Response::ActiveCallsignSlot { slot } => assert_eq!(slot, 10),
+        Response::ActiveCallsignSlot { slot } => {
+            assert_eq!(slot, CallsignSlot::new(10).unwrap())
+        }
         other => panic!("expected ActiveCallsignSlot, got {other:?}"),
     }
 }
@@ -212,7 +218,7 @@ fn serialize_gw_read() {
 #[test]
 fn parse_gw_response() {
     match protocol::parse(b"GW 0").unwrap() {
-        Response::Gateway { value } => assert_eq!(value, 0),
+        Response::Gateway { value } => assert_eq!(value, DvGatewayMode::Off),
         other => panic!("expected Gateway, got {other:?}"),
     }
 }
@@ -260,7 +266,7 @@ fn serialize_gm_read() {
 #[test]
 fn parse_gm_response() {
     match protocol::parse(b"GM 0").unwrap() {
-        Response::GpsMode { mode } => assert_eq!(mode, 0),
+        Response::GpsMode { mode } => assert_eq!(mode, GpsRadioMode::Normal),
         other => panic!("expected GpsMode, got {other:?}"),
     }
 }

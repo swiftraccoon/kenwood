@@ -34,7 +34,11 @@ pub use channel::{
 };
 pub use frequency::Frequency;
 pub use mode::{MemoryMode, Mode, PowerLevel, ShiftDirection, StepSize};
-pub use radio_params::{AfGainLevel, FilterMode, SMeterReading, SquelchLevel, VfoMemoryMode};
+pub use radio_params::{
+    AfGainLevel, BatteryLevel, BeaconMode, CallsignSlot, DetectOutputMode, DstarSlot,
+    DvGatewayMode, FilterMode, FilterWidthIndex, GpsRadioMode, SMeterReading, SquelchLevel,
+    TncBaud, TncMode, VfoMemoryMode, VoxDelay, VoxGain,
+};
 pub use tone::{
     CTCSS_FREQUENCIES, CtcssMode, DCS_CODES, DataSpeed, DcsCode, LockoutMode, ToneCode, ToneMode,
 };

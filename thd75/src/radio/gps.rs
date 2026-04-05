@@ -18,6 +18,7 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
+use crate::types::GpsRadioMode;
 
 use super::Radio;
 
@@ -161,6 +162,9 @@ impl<T: Transport> Radio<T> {
 
     /// Get GPS/Radio mode status (GM bare read).
     ///
+    /// Returns the current GPS/Radio operating mode. `Normal` (0) means
+    /// standard transceiver operation. `GpsReceiver` (1) means GPS-only mode.
+    ///
     /// # Warning
     /// Only the bare `GM\r` read is safe. Sending `GM 1\r` would reboot
     /// the radio into GPS-only mode. This method only sends the bare read.
@@ -168,7 +172,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_gps_mode(&mut self) -> Result<u8, Error> {
+    pub async fn get_gps_mode(&mut self) -> Result<GpsRadioMode, Error> {
         tracing::debug!("reading GPS/Radio mode");
         let response = self.execute(Command::GetGpsMode).await?;
         match response {

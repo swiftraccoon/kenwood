@@ -7,6 +7,7 @@
 //! - GS: GPS NMEA sentence enable flags (6 booleans)
 
 use crate::error::ProtocolError;
+use crate::types::GpsRadioMode;
 
 use super::Response;
 
@@ -59,9 +60,16 @@ fn parse_gp(payload: &str) -> Result<Response, ProtocolError> {
     })
 }
 
-/// Parse GM (GPS mode): single value.
+/// Parse GM (GPS mode): single value (0=Normal, 1=GPS Receiver).
+///
+/// Firmware-verified: `cat_gm_handler` guard `local_18 < 2`.
 fn parse_gm(payload: &str) -> Result<Response, ProtocolError> {
-    let mode = parse_u8_field(payload, "GM", "mode")?;
+    let raw = parse_u8_field(payload, "GM", "mode")?;
+    let mode = GpsRadioMode::try_from(raw).map_err(|e| ProtocolError::FieldParse {
+        command: "GM".into(),
+        field: "mode".into(),
+        detail: e.to_string(),
+    })?;
     Ok(Response::GpsMode { mode })
 }
 

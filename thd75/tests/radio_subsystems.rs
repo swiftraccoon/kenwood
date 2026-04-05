@@ -8,7 +8,10 @@ async fn get_active_callsign_slot() {
     let mut mock = MockTransport::new();
     mock.expect(b"CS\r", b"CS 10\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_active_callsign_slot().await.unwrap(), 10);
+    assert_eq!(
+        radio.get_active_callsign_slot().await.unwrap(),
+        kenwood_thd75::types::CallsignSlot::new(10).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -16,7 +19,10 @@ async fn set_active_callsign_slot() {
     let mut mock = MockTransport::new();
     mock.expect(b"CS 5\r", b"CS 5\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio.set_active_callsign_slot(5).await.unwrap();
+    radio
+        .set_active_callsign_slot(kenwood_thd75::types::CallsignSlot::new(5).unwrap())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -24,7 +30,10 @@ async fn get_gateway() {
     let mut mock = MockTransport::new();
     mock.expect(b"GW\r", b"GW 0\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_gateway().await.unwrap(), 0);
+    assert_eq!(
+        radio.get_gateway().await.unwrap(),
+        kenwood_thd75::types::DvGatewayMode::Off
+    );
 }
 
 #[tokio::test]
@@ -32,7 +41,10 @@ async fn get_dstar_slot() {
     let mut mock = MockTransport::new();
     mock.expect(b"DS\r", b"DS 1\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_dstar_slot().await.unwrap(), 1);
+    assert_eq!(
+        radio.get_dstar_slot().await.unwrap(),
+        kenwood_thd75::types::DstarSlot::new(1).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -40,7 +52,10 @@ async fn get_tnc_baud() {
     let mut mock = MockTransport::new();
     mock.expect(b"AS\r", b"AS 0\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_tnc_baud().await.unwrap(), 0);
+    assert_eq!(
+        radio.get_tnc_baud().await.unwrap(),
+        kenwood_thd75::types::TncBaud::Bps1200
+    );
 }
 
 #[tokio::test]
@@ -48,7 +63,10 @@ async fn get_beacon_type() {
     let mut mock = MockTransport::new();
     mock.expect(b"PT\r", b"PT 2\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_beacon_type().await.unwrap(), 2);
+    assert_eq!(
+        radio.get_beacon_type().await.unwrap(),
+        kenwood_thd75::types::BeaconMode::Ptt
+    );
 }
 
 #[tokio::test]
@@ -98,5 +116,8 @@ async fn get_gps_mode() {
     let mut mock = MockTransport::new();
     mock.expect(b"GM\r", b"GM 0\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_gps_mode().await.unwrap(), 0);
+    assert_eq!(
+        radio.get_gps_mode().await.unwrap(),
+        kenwood_thd75::types::GpsRadioMode::Normal
+    );
 }

@@ -17,7 +17,7 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::{AfGainLevel, Band};
+use crate::types::{AfGainLevel, Band, DstarSlot, TncBaud, TncMode, VoxDelay, VoxGain};
 
 use super::Radio;
 
@@ -84,7 +84,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_tnc_mode(&mut self) -> Result<(u8, u8), Error> {
+    pub async fn get_tnc_mode(&mut self) -> Result<(TncMode, TncBaud), Error> {
         tracing::debug!("reading TNC mode");
         let response = self.execute(Command::GetTncMode).await?;
         match response {
@@ -108,8 +108,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_tnc_mode(&mut self, mode: u8, setting: u8) -> Result<(), Error> {
-        tracing::info!(mode, setting, "setting TNC mode");
+    pub async fn set_tnc_mode(&mut self, mode: TncMode, setting: TncBaud) -> Result<(), Error> {
+        tracing::info!(?mode, ?setting, "setting TNC mode");
         let response = self.execute(Command::SetTncMode { mode, setting }).await?;
         match response {
             Response::TncMode { .. } => Ok(()),
@@ -133,8 +133,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_dstar_callsign(&mut self, slot: u8) -> Result<(String, String), Error> {
-        tracing::debug!(slot, "reading D-STAR callsign");
+    pub async fn get_dstar_callsign(&mut self, slot: DstarSlot) -> Result<(String, String), Error> {
+        tracing::debug!(?slot, "reading D-STAR callsign");
         let response = self.execute(Command::GetDstarCallsign { slot }).await?;
         match response {
             Response::DstarCallsign {
@@ -167,11 +167,11 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn set_dstar_callsign(
         &mut self,
-        slot: u8,
+        slot: DstarSlot,
         callsign: &str,
         suffix: &str,
     ) -> Result<(), Error> {
-        tracing::info!(slot, callsign, suffix, "setting D-STAR callsign");
+        tracing::info!(?slot, callsign, suffix, "setting D-STAR callsign");
         let response = self
             .execute(Command::SetDstarCallsign {
                 slot,
@@ -267,7 +267,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_vox_gain(&mut self) -> Result<u8, Error> {
+    pub async fn get_vox_gain(&mut self) -> Result<VoxGain, Error> {
         tracing::debug!("reading VOX gain");
         let response = self.execute(Command::GetVoxGain).await?;
         match response {
@@ -288,8 +288,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_vox_gain(&mut self, gain: u8) -> Result<(), Error> {
-        tracing::debug!(gain, "setting VOX gain");
+    pub async fn set_vox_gain(&mut self, gain: VoxGain) -> Result<(), Error> {
+        tracing::debug!(?gain, "setting VOX gain");
         let response = self.execute(Command::SetVoxGain { gain }).await?;
         match response {
             Response::VoxGain { .. } => Ok(()),
@@ -309,7 +309,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_vox_delay(&mut self) -> Result<u8, Error> {
+    pub async fn get_vox_delay(&mut self) -> Result<VoxDelay, Error> {
         tracing::debug!("reading VOX delay");
         let response = self.execute(Command::GetVoxDelay).await?;
         match response {
@@ -330,8 +330,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_vox_delay(&mut self, delay: u8) -> Result<(), Error> {
-        tracing::debug!(delay, "setting VOX delay");
+    pub async fn set_vox_delay(&mut self, delay: VoxDelay) -> Result<(), Error> {
+        tracing::debug!(?delay, "setting VOX delay");
         let response = self.execute(Command::SetVoxDelay { delay }).await?;
         match response {
             Response::VoxDelay { .. } => Ok(()),

@@ -2,7 +2,10 @@
 
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;
-use kenwood_thd75::types::{Band, FilterMode, VfoMemoryMode};
+use kenwood_thd75::types::{
+    Band, BeaconMode, DetectOutputMode, DstarSlot, DvGatewayMode, FilterMode, TncBaud,
+    VfoMemoryMode,
+};
 
 // ---- BC: get_band / set_band ----
 
@@ -139,7 +142,7 @@ async fn get_function_type() {
     let mut mock = MockTransport::new();
     mock.expect(b"FT\r", b"FT 0\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_function_type().await.unwrap(), 0);
+    assert!(!radio.get_function_type().await.unwrap());
 }
 
 // ---- SH: get_filter_width ----
@@ -149,7 +152,10 @@ async fn get_filter_width() {
     let mut mock = MockTransport::new();
     mock.expect(b"SH 0\r", b"SH 0,3\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_filter_width(FilterMode::Ssb).await.unwrap(), 3);
+    assert_eq!(
+        radio.get_filter_width(FilterMode::Ssb).await.unwrap(),
+        kenwood_thd75::types::FilterWidthIndex::new(3, FilterMode::Ssb).unwrap()
+    );
 }
 
 // ---- SH: set_filter_width ----
@@ -159,7 +165,13 @@ async fn set_filter_width() {
     let mut mock = MockTransport::new();
     mock.expect(b"SH 0,3\r", b"SH 0,3\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio.set_filter_width(FilterMode::Ssb, 3).await.unwrap();
+    radio
+        .set_filter_width(
+            FilterMode::Ssb,
+            kenwood_thd75::types::FilterWidthIndex::new(3, FilterMode::Ssb).unwrap(),
+        )
+        .await
+        .unwrap();
 }
 
 // ---- IO: get_io_port / set_io_port ----
@@ -169,7 +181,7 @@ async fn get_io_port() {
     let mut mock = MockTransport::new();
     mock.expect(b"IO\r", b"IO 0\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_io_port().await.unwrap(), 0);
+    assert_eq!(radio.get_io_port().await.unwrap(), DetectOutputMode::Af);
 }
 
 #[tokio::test]
@@ -177,7 +189,7 @@ async fn set_io_port() {
     let mut mock = MockTransport::new();
     mock.expect(b"IO 1\r", b"IO 1\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio.set_io_port(1).await.unwrap();
+    radio.set_io_port(DetectOutputMode::If).await.unwrap();
 }
 
 // ---- SF: get_scan_range (band-indexed) ----
@@ -281,7 +293,7 @@ async fn set_tnc_baud() {
     let mut mock = MockTransport::new();
     mock.expect(b"AS 1\r", b"AS 1\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio.set_tnc_baud(1).await.unwrap();
+    radio.set_tnc_baud(TncBaud::Bps9600).await.unwrap();
 }
 
 // ---- PT: set_beacon_type ----
@@ -291,7 +303,7 @@ async fn set_beacon_type() {
     let mut mock = MockTransport::new();
     mock.expect(b"PT 3\r", b"PT 3\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio.set_beacon_type(3).await.unwrap();
+    radio.set_beacon_type(BeaconMode::Auto).await.unwrap();
 }
 
 // ---- MS: send_message ----
@@ -311,7 +323,10 @@ async fn set_dstar_slot() {
     let mut mock = MockTransport::new();
     mock.expect(b"DS 2\r", b"DS 2\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio.set_dstar_slot(2).await.unwrap();
+    radio
+        .set_dstar_slot(DstarSlot::new(2).unwrap())
+        .await
+        .unwrap();
 }
 
 // ---- GW: set_gateway ----
@@ -321,7 +336,10 @@ async fn set_gateway() {
     let mut mock = MockTransport::new();
     mock.expect(b"GW 1\r", b"GW 1\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio.set_gateway(1).await.unwrap();
+    radio
+        .set_gateway(DvGatewayMode::ReflectorTerminal)
+        .await
+        .unwrap();
 }
 
 // ---- Serialization tests for new command variants ----
@@ -365,31 +383,56 @@ fn serialize_set_frequency_step() {
 #[test]
 fn serialize_set_io_port() {
     use kenwood_thd75::protocol::{Command, serialize};
-    assert_eq!(serialize(&Command::SetIoPort { value: 3 }), b"IO 3\r");
+    assert_eq!(
+        serialize(&Command::SetIoPort {
+            value: DetectOutputMode::Detect
+        }),
+        b"IO 2\r"
+    );
 }
 
 #[test]
 fn serialize_set_tnc_baud() {
     use kenwood_thd75::protocol::{Command, serialize};
-    assert_eq!(serialize(&Command::SetTncBaud { rate: 1 }), b"AS 1\r");
+    assert_eq!(
+        serialize(&Command::SetTncBaud {
+            rate: TncBaud::Bps9600
+        }),
+        b"AS 1\r"
+    );
 }
 
 #[test]
 fn serialize_set_beacon_type() {
     use kenwood_thd75::protocol::{Command, serialize};
-    assert_eq!(serialize(&Command::SetBeaconType { mode: 2 }), b"PT 2\r");
+    assert_eq!(
+        serialize(&Command::SetBeaconType {
+            mode: BeaconMode::Ptt
+        }),
+        b"PT 2\r"
+    );
 }
 
 #[test]
 fn serialize_set_dstar_slot() {
     use kenwood_thd75::protocol::{Command, serialize};
-    assert_eq!(serialize(&Command::SetDstarSlot { slot: 5 }), b"DS 5\r");
+    assert_eq!(
+        serialize(&Command::SetDstarSlot {
+            slot: DstarSlot::new(5).unwrap()
+        }),
+        b"DS 5\r"
+    );
 }
 
 #[test]
 fn serialize_set_gateway() {
     use kenwood_thd75::protocol::{Command, serialize};
-    assert_eq!(serialize(&Command::SetGateway { value: 1 }), b"GW 1\r");
+    assert_eq!(
+        serialize(&Command::SetGateway {
+            value: DvGatewayMode::ReflectorTerminal
+        }),
+        b"GW 1\r"
+    );
 }
 
 #[test]

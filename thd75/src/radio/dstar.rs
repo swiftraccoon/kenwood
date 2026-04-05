@@ -17,6 +17,7 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
+use crate::types::{CallsignSlot, DstarSlot, DvGatewayMode};
 
 use super::Radio;
 
@@ -26,7 +27,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_dstar_slot(&mut self) -> Result<u8, Error> {
+    pub async fn get_dstar_slot(&mut self) -> Result<DstarSlot, Error> {
         tracing::debug!("reading D-STAR callsign slot");
         let response = self.execute(Command::GetDstarSlot).await?;
         match response {
@@ -46,7 +47,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_active_callsign_slot(&mut self) -> Result<u8, Error> {
+    pub async fn get_active_callsign_slot(&mut self) -> Result<CallsignSlot, Error> {
         tracing::debug!("reading active callsign slot");
         let response = self.execute(Command::GetActiveCallsignSlot).await?;
         match response {
@@ -66,8 +67,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_active_callsign_slot(&mut self, slot: u8) -> Result<(), Error> {
-        tracing::info!(slot, "setting active callsign slot");
+    pub async fn set_active_callsign_slot(&mut self, slot: CallsignSlot) -> Result<(), Error> {
+        tracing::info!(?slot, "setting active callsign slot");
         let response = self
             .execute(Command::SetActiveCallsignSlot { slot })
             .await?;
@@ -85,8 +86,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_dstar_slot(&mut self, slot: u8) -> Result<(), Error> {
-        tracing::info!(slot, "setting D-STAR callsign slot");
+    pub async fn set_dstar_slot(&mut self, slot: DstarSlot) -> Result<(), Error> {
+        tracing::info!(?slot, "setting D-STAR callsign slot");
         let response = self.execute(Command::SetDstarSlot { slot }).await?;
         match response {
             Response::DstarSlot { .. } => Ok(()),
@@ -102,7 +103,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_gateway(&mut self) -> Result<u8, Error> {
+    pub async fn get_gateway(&mut self) -> Result<DvGatewayMode, Error> {
         tracing::debug!("reading D-STAR gateway");
         let response = self.execute(Command::GetGateway).await?;
         match response {
@@ -119,8 +120,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_gateway(&mut self, value: u8) -> Result<(), Error> {
-        tracing::info!(value, "setting D-STAR gateway");
+    pub async fn set_gateway(&mut self, value: DvGatewayMode) -> Result<(), Error> {
+        tracing::info!(?value, "setting D-STAR gateway mode");
         let response = self.execute(Command::SetGateway { value }).await?;
         match response {
             Response::Gateway { .. } => Ok(()),

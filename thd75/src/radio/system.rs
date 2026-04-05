@@ -3,7 +3,7 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::Band;
+use crate::types::{Band, BatteryLevel, DetectOutputMode, KeyLockType};
 
 use super::Radio;
 
@@ -63,7 +63,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_battery_level(&mut self) -> Result<u8, Error> {
+    pub async fn get_battery_level(&mut self) -> Result<BatteryLevel, Error> {
         tracing::debug!("reading battery level");
         let response = self.execute(Command::GetBatteryLevel).await?;
         match response {
@@ -160,8 +160,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// - `locked`: master lock enable (`true` = locked, `false` = unlocked). Note the CAT
     ///   value is inverted: `0` on the wire means locked, `1` means unlocked.
-    /// - `lock_type`: what to lock — `0` = key lock only, `1` = PTT lock only,
-    ///   `2` = key + PTT lock.
+    /// - `lock_type`: what to lock — key only, key+PTT, or key+PTT+dial.
     /// - `lock_a`: lock Band A controls (`true` = locked).
     /// - `lock_b`: lock Band B controls (`true` = locked).
     /// - `lock_c`: lock Band C controls (`true` = locked).
@@ -174,7 +173,7 @@ impl<T: Transport> Radio<T> {
     pub async fn set_lock_full(
         &mut self,
         locked: bool,
-        lock_type: u8,
+        lock_type: KeyLockType,
         lock_a: bool,
         lock_b: bool,
         lock_c: bool,
@@ -182,7 +181,7 @@ impl<T: Transport> Radio<T> {
     ) -> Result<(), Error> {
         tracing::info!(
             locked,
-            lock_type,
+            ?lock_type,
             lock_a,
             lock_b,
             lock_c,
@@ -419,7 +418,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_io_port(&mut self) -> Result<u8, Error> {
+    pub async fn get_io_port(&mut self) -> Result<DetectOutputMode, Error> {
         tracing::debug!("reading I/O port state");
         let response = self.execute(Command::GetIoPort).await?;
         match response {
@@ -438,8 +437,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_io_port(&mut self, value: u8) -> Result<(), Error> {
-        tracing::debug!(value, "setting I/O port state");
+    pub async fn set_io_port(&mut self, value: DetectOutputMode) -> Result<(), Error> {
+        tracing::debug!(?value, "setting I/O port output mode");
         let response = self.execute(Command::SetIoPort { value }).await?;
         match response {
             Response::IoPort { .. } => Ok(()),

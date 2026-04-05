@@ -4,6 +4,7 @@
 //! commands. Serialization is handled inline by the main dispatcher.
 
 use crate::error::ProtocolError;
+use crate::types::radio_params::{CallsignSlot, DstarSlot, DvGatewayMode};
 
 use super::Response;
 
@@ -24,15 +25,33 @@ pub(crate) fn parse_dstar(
     payload: &str,
 ) -> Option<Result<Response, ProtocolError>> {
     match mnemonic {
-        "DS" => {
-            Some(parse_u8_field(payload, "DS", "slot").map(|slot| Response::DstarSlot { slot }))
-        }
-        "CS" => Some(
-            parse_u8_field(payload, "CS", "slot").map(|slot| Response::ActiveCallsignSlot { slot }),
-        ),
-        "GW" => {
-            Some(parse_u8_field(payload, "GW", "value").map(|value| Response::Gateway { value }))
-        }
+        "DS" => Some(parse_u8_field(payload, "DS", "slot").and_then(|raw| {
+            DstarSlot::try_from(raw)
+                .map(|slot| Response::DstarSlot { slot })
+                .map_err(|e| ProtocolError::FieldParse {
+                    command: "DS".into(),
+                    field: "slot".into(),
+                    detail: e.to_string(),
+                })
+        })),
+        "CS" => Some(parse_u8_field(payload, "CS", "slot").and_then(|raw| {
+            CallsignSlot::try_from(raw)
+                .map(|slot| Response::ActiveCallsignSlot { slot })
+                .map_err(|e| ProtocolError::FieldParse {
+                    command: "CS".into(),
+                    field: "slot".into(),
+                    detail: e.to_string(),
+                })
+        })),
+        "GW" => Some(parse_u8_field(payload, "GW", "value").and_then(|raw| {
+            DvGatewayMode::try_from(raw)
+                .map(|value| Response::Gateway { value })
+                .map_err(|e| ProtocolError::FieldParse {
+                    command: "GW".into(),
+                    field: "value".into(),
+                    detail: e.to_string(),
+                })
+        })),
         _ => None,
     }
 }

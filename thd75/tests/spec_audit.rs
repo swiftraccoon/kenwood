@@ -57,9 +57,13 @@ fn our_mnemonics() -> Vec<&'static str> {
         command_name(&Command::GetMemoryChannel { channel: 0 }), // ME
         command_name(&Command::EnterProgrammingMode),           // 0M
         command_name(&Command::GetTncMode),                     // TN
-        command_name(&Command::GetDstarCallsign { slot: 1 }),   // DC
+        command_name(&Command::GetDstarCallsign {
+            slot: DstarSlot::new(1).unwrap(),
+        }), // DC
         command_name(&Command::GetRealTimeClock),               // RT
-        command_name(&Command::SetScanResume { mode: 0 }),      // SR
+        command_name(&Command::SetScanResume {
+            mode: ScanResumeMethod::TimeOperated,
+        }), // SR
         command_name(&Command::GetScanRange { band: Band::A }), // SF
         command_name(&Command::GetBandScope { band: Band::A }), // BS
         command_name(&Command::GetTncBaud),                     // AS
@@ -262,18 +266,19 @@ fn bl_is_read_only_per_spec() {
 #[test]
 fn bl_values_include_spec_range() {
     // Spec documents 0-3. We additionally support 4 (charging, hardware).
-    for level in 0..=3u8 {
-        let frame = format!("BL {level}");
+    for raw in 0..=3u8 {
+        let frame = format!("BL {raw}");
         let response = protocol::parse(frame.as_bytes()).unwrap();
+        let expected = BatteryLevel::try_from(raw).unwrap();
         assert!(
-            matches!(response, Response::BatteryLevel { level: l } if l == level),
-            "BL {level} should parse as BatteryLevel"
+            matches!(response, Response::BatteryLevel { level } if level == expected),
+            "BL {raw} should parse as BatteryLevel"
         );
     }
     // Level 4 (charging) is NOT in the spec but observed on hardware
     let response = protocol::parse(b"BL 4").unwrap();
     assert!(
-        matches!(response, Response::BatteryLevel { level: 4 }),
+        matches!(response, Response::BatteryLevel { level } if level == BatteryLevel::Charging),
         "BL 4 (charging) should parse — hardware extension beyond spec"
     );
 }

@@ -259,8 +259,8 @@ fn serialize_ft_read() {
 #[test]
 fn parse_ft_response_bare() {
     match protocol::parse(b"FT 2").unwrap() {
-        Response::FunctionType { value } => {
-            assert_eq!(value, 2);
+        Response::FunctionType { enabled } => {
+            assert!(enabled);
         }
         other => panic!("expected FunctionType, got {other:?}"),
     }
@@ -270,8 +270,8 @@ fn parse_ft_response_bare() {
 fn parse_ft_response_with_band_prefix() {
     // Backward compatibility: handle "band,data" format in response
     match protocol::parse(b"FT 0,2").unwrap() {
-        Response::FunctionType { value } => {
-            assert_eq!(value, 2);
+        Response::FunctionType { enabled } => {
+            assert!(enabled);
         }
         other => panic!("expected FunctionType, got {other:?}"),
     }
@@ -306,7 +306,7 @@ fn parse_sh_response() {
     match protocol::parse(b"SH 1,3").unwrap() {
         Response::FilterWidth { mode, width } => {
             assert_eq!(mode, FilterMode::Cw);
-            assert_eq!(width, 3);
+            assert_eq!(width, FilterWidthIndex::new(3, FilterMode::Cw).unwrap());
         }
         other => panic!("expected FilterWidth, got {other:?}"),
     }
@@ -317,9 +317,9 @@ fn serialize_sh_write() {
     assert_eq!(
         protocol::serialize(&Command::SetFilterWidth {
             mode: FilterMode::Cw,
-            width: 5
+            width: FilterWidthIndex::new(4, FilterMode::Cw).unwrap()
         }),
-        b"SH 1,5\r"
+        b"SH 1,4\r"
     );
 }
 
@@ -328,7 +328,7 @@ fn serialize_sh_write_ssb() {
     assert_eq!(
         protocol::serialize(&Command::SetFilterWidth {
             mode: FilterMode::Ssb,
-            width: 3
+            width: FilterWidthIndex::new(3, FilterMode::Ssb).unwrap()
         }),
         b"SH 0,3\r"
     );

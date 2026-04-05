@@ -31,8 +31,10 @@ pub use codec::Codec;
 use crate::error::ProtocolError;
 #[allow(unused_imports)]
 use crate::types::{
-    AfGainLevel, Band, ChannelMemory, FilterMode, Mode, PowerLevel, SMeterReading, SquelchLevel,
-    StepSize, ToneCode, VfoMemoryMode,
+    AfGainLevel, Band, BeaconMode, CallsignSlot, ChannelMemory, DetectOutputMode, DstarSlot,
+    DvGatewayMode, FilterMode, FilterWidthIndex, GpsRadioMode, KeyLockType, Mode, PowerLevel,
+    SMeterReading, ScanResumeMethod, SquelchLevel, StepSize, TncBaud, TncMode, ToneCode,
+    VfoMemoryMode, VoxDelay, VoxGain,
 };
 
 /// A CAT command to send to the radio.
@@ -333,8 +335,8 @@ pub enum Command {
     SetFilterWidth {
         /// Receiver filter mode.
         mode: FilterMode,
-        /// Filter width setting index.
-        width: u8,
+        /// Filter width index (0-4 for SSB/CW, 0-3 for AM).
+        width: FilterWidthIndex,
     },
     /// Step frequency up by one increment (UP action).
     ///
@@ -449,8 +451,8 @@ pub enum Command {
     SetLockFull {
         /// Key lock enabled.
         locked: bool,
-        /// Key lock type: 0=key only, 1=PTT only, 2=key+PTT.
-        lock_type: u8,
+        /// Key lock type (key-only, key+PTT, key+PTT+dial).
+        lock_type: KeyLockType,
         /// Lock key A.
         lock_a: bool,
         /// Lock key B.
@@ -460,12 +462,12 @@ pub enum Command {
         /// Lock PTT.
         lock_ptt: bool,
     },
-    /// Get I/O port state (IO read).
+    /// Get AF/IF/Detect output mode (IO read).
     GetIoPort,
-    /// Set I/O port state (IO write).
+    /// Set AF/IF/Detect output mode (IO write).
     SetIoPort {
-        /// I/O port value to set.
-        value: u8,
+        /// Output mode (AF/IF/Detect).
+        value: DetectOutputMode,
     },
     /// Get battery level (BL read).
     ///
@@ -502,8 +504,8 @@ pub enum Command {
     /// with [`SetVox`](Command::SetVox), then set the delay, then
     /// optionally disable VOX again.
     SetVoxDelay {
-        /// VOX delay value.
-        delay: u8,
+        /// VOX delay (0-30, in 100ms units).
+        delay: VoxDelay,
     },
     /// Get VOX gain (VG read).
     ///
@@ -517,8 +519,8 @@ pub enum Command {
     /// VOX must be enabled (`VX 1`) for VG writes to succeed.
     /// Returns `N` (not available) when VOX is off.
     SetVoxGain {
-        /// VOX gain value.
-        gain: u8,
+        /// VOX gain (0-9).
+        gain: VoxGain,
     },
     /// Get VOX state (VX read).
     GetVox,
@@ -597,10 +599,10 @@ pub enum Command {
     /// Valid mode values per firmware validation: 0, 1, 2, 3.
     /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
     SetTncMode {
-        /// TNC mode value (0-3). Mode 3 may be MMDVM/Reflector Terminal.
-        mode: u8,
-        /// TNC setting value.
-        setting: u8,
+        /// TNC operating mode (APRS/NAVITRA/KISS/MMDVM).
+        mode: TncMode,
+        /// TNC data speed setting.
+        setting: TncBaud,
     },
     /// Get D-STAR callsign data for a slot (DC read).
     ///
@@ -612,7 +614,7 @@ pub enum Command {
     /// is the D-STAR callsign command.
     GetDstarCallsign {
         /// Callsign slot (1-6). Slot 0 returns `N`.
-        slot: u8,
+        slot: DstarSlot,
     },
     /// Set D-STAR callsign for a slot (DC write).
     ///
@@ -621,7 +623,7 @@ pub enum Command {
     /// 4 characters.
     SetDstarCallsign {
         /// Callsign slot (1-6).
-        slot: u8,
+        slot: DstarSlot,
         /// Callsign string (8 chars, space-padded).
         callsign: String,
         /// Callsign suffix (up to 4 chars).
@@ -647,8 +649,8 @@ pub enum Command {
     /// identifies this as scan resume, but the behavior may coincide with
     /// a reset action. Use with caution.
     SetScanResume {
-        /// Scan resume mode value.
-        mode: u8,
+        /// Scan resume method.
+        mode: ScanResumeMethod,
     },
     /// Get scan function setting for a band (SF read, band-indexed).
     ///
@@ -682,8 +684,8 @@ pub enum Command {
     ///
     /// Values: 0 = 1200 baud, 1 = 9600 baud.
     SetTncBaud {
-        /// Baud rate index (0 = 1200, 1 = 9600).
-        rate: u8,
+        /// Baud rate.
+        rate: TncBaud,
     },
 
     // === Serial Info (AE) ===
@@ -696,8 +698,8 @@ pub enum Command {
     GetBeaconType,
     /// Set beacon TX control mode (PT write).
     SetBeaconType {
-        /// Beacon type mode value.
-        mode: u8,
+        /// Beacon transmission mode.
+        mode: BeaconMode,
     },
     /// Get APRS position source (MS read).
     GetPositionSource,
@@ -712,8 +714,8 @@ pub enum Command {
     GetDstarSlot,
     /// Set active D-STAR callsign slot (DS write).
     SetDstarSlot {
-        /// Slot number to set.
-        slot: u8,
+        /// D-STAR memory slot (1-6).
+        slot: DstarSlot,
     },
     /// Get the active callsign slot number (CS bare read).
     ///
@@ -725,15 +727,15 @@ pub enum Command {
     /// Selects which callsign slot is active. Format: `CS N` where N is
     /// the slot number. The callsign text itself is read via DC slots.
     SetActiveCallsignSlot {
-        /// Slot number to select.
-        slot: u8,
+        /// Callsign slot to select (0-10).
+        slot: CallsignSlot,
     },
     /// Get gateway (GW read).
     GetGateway,
-    /// Set gateway value (GW write).
+    /// Set DV Gateway mode (GW write).
     SetGateway {
-        /// Gateway value to set.
-        value: u8,
+        /// DV Gateway mode (Off or Reflector Terminal).
+        value: DvGatewayMode,
     },
 
     // === GPS (GP, GM, GS) ===
@@ -1209,15 +1211,15 @@ pub enum Response {
     },
     /// Function type response (FT).
     FunctionType {
-        /// Function type value.
-        value: u8,
+        /// Fine tune enabled (0=off, 1=on).
+        enabled: bool,
     },
     /// Filter width response (SH).
     FilterWidth {
         /// Receiver filter mode queried.
         mode: FilterMode,
-        /// Filter width setting.
-        width: u8,
+        /// Filter width index (0-4 for SSB/CW, 0-3 for AM).
+        width: FilterWidthIndex,
     },
     /// Attenuator state response (RA).
     Attenuator {
@@ -1259,10 +1261,10 @@ pub enum Response {
         /// Whether key lock is engaged. CAT value is inverted on D75.
         locked: bool,
     },
-    /// I/O port state response (IO).
+    /// AF/IF/Detect output mode response (IO).
     IoPort {
-        /// I/O port value.
-        value: u8,
+        /// Output mode.
+        value: DetectOutputMode,
     },
     /// Battery level response (BL).
     ///
@@ -1270,17 +1272,17 @@ pub enum Response {
     /// 4=Charging (USB power connected).
     BatteryLevel {
         /// Battery charge level (0–4, where 4 = charging).
-        level: u8,
+        level: crate::types::BatteryLevel,
     },
     /// VOX delay response (VD).
     VoxDelay {
-        /// Current VOX delay.
-        delay: u8,
+        /// Current VOX delay (0-30, in 100ms units).
+        delay: VoxDelay,
     },
     /// VOX gain response (VG).
     VoxGain {
-        /// Current VOX gain.
-        gain: u8,
+        /// Current VOX gain (0-9).
+        gain: VoxGain,
     },
     /// VOX state response (VX).
     Vox {
@@ -1332,10 +1334,10 @@ pub enum Response {
     /// Valid mode values per firmware validation: 0, 1, 2, 3.
     /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
     TncMode {
-        /// TNC mode value (0-3). Mode 3 may be MMDVM/Reflector Terminal.
-        mode: u8,
-        /// TNC setting value.
-        setting: u8,
+        /// TNC operating mode.
+        mode: TncMode,
+        /// TNC data speed setting.
+        setting: TncBaud,
     },
     /// D-STAR callsign data response (DC).
     ///
@@ -1343,7 +1345,7 @@ pub enum Response {
     /// Example: `DC 1,KQ4NIT  ,D75A`.
     DstarCallsign {
         /// Callsign slot (1-6).
-        slot: u8,
+        slot: DstarSlot,
         /// Callsign string (may be space-padded).
         callsign: String,
         /// Callsign suffix/module.
@@ -1381,8 +1383,8 @@ pub enum Response {
     ///
     /// Values: 0 = 1200 baud, 1 = 9600 baud.
     TncBaud {
-        /// Baud rate index (0 = 1200, 1 = 9600).
-        rate: u8,
+        /// Baud rate.
+        rate: TncBaud,
     },
     /// Serial number and model code response (AE).
     ///
@@ -1397,8 +1399,8 @@ pub enum Response {
     },
     /// Beacon TX control mode response (PT).
     BeaconType {
-        /// Beacon type mode value.
-        mode: u8,
+        /// Beacon transmission mode.
+        mode: BeaconMode,
     },
     /// APRS position source response (MS read).
     PositionSource {
@@ -1409,21 +1411,21 @@ pub enum Response {
     // === D-STAR ===
     /// Active D-STAR callsign slot response (DS).
     DstarSlot {
-        /// Active callsign slot index.
-        slot: u8,
+        /// Active D-STAR memory slot (1-6).
+        slot: DstarSlot,
     },
     /// Active callsign slot number response (CS).
     ///
     /// CS returns a slot number, NOT the callsign text. The actual callsign
     /// text is accessible via DC (D-STAR callsign) slots 1-6.
     ActiveCallsignSlot {
-        /// Active callsign slot number.
-        slot: u8,
+        /// Active callsign slot (0-10).
+        slot: CallsignSlot,
     },
-    /// Gateway response (GW).
+    /// DV Gateway mode response (GW).
     Gateway {
-        /// Gateway value.
-        value: u8,
+        /// DV Gateway mode.
+        value: DvGatewayMode,
     },
 
     // === GPS ===
@@ -1439,10 +1441,11 @@ pub enum Response {
     },
     /// GPS/Radio mode status response (GM).
     ///
-    /// Single value: 0 = GPS off, other values TBD.
+    /// 0 = Normal transceiver mode, 1 = GPS receiver mode.
+    /// Firmware-verified: `cat_gm_handler` guard `local_18 < 2`.
     GpsMode {
-        /// GPS mode value.
-        mode: u8,
+        /// GPS/Radio operating mode.
+        mode: GpsRadioMode,
     },
     /// GPS NMEA sentence enable flags response (GS).
     ///
@@ -1758,7 +1761,7 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         }
         Command::GetFilterWidth { mode } => format!("SH {}", u8::from(*mode)),
         Command::SetFilterWidth { mode, width } => {
-            format!("SH {},{width}", u8::from(*mode))
+            format!("SH {},{}", u8::from(*mode), width.as_u8())
         }
         Command::FrequencyUp { band } => format!("UP {}", u8::from(*band)),
         Command::FrequencyDown { band } => format!("DW {}", u8::from(*band)),
@@ -1789,20 +1792,20 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         } => format!(
             "LC {},{},{},{},{},{}",
             u8::from(*locked),
-            lock_type,
+            u8::from(*lock_type),
             u8::from(*lock_a),
             u8::from(*lock_b),
             u8::from(*lock_c),
             u8::from(*lock_ptt),
         ),
         Command::GetIoPort => "IO".to_owned(),
-        Command::SetIoPort { value } => format!("IO {value}"),
+        Command::SetIoPort { value } => format!("IO {}", u8::from(*value)),
         Command::GetBatteryLevel => "BL".to_owned(),
         Command::SetBatteryLevel { display, level } => format!("BL {display},{level}"),
         Command::GetVoxDelay => "VD".to_owned(),
-        Command::SetVoxDelay { delay } => format!("VD {delay}"),
+        Command::SetVoxDelay { delay } => format!("VD {}", delay.as_u8()),
         Command::GetVoxGain => "VG".to_owned(),
-        Command::SetVoxGain { gain } => format!("VG {gain}"),
+        Command::SetVoxGain { gain } => format!("VG {}", gain.as_u8()),
         Command::GetVox => "VX".to_owned(),
         Command::SetVox { enabled } => format!("VX {}", u8::from(*enabled)),
 
@@ -1823,17 +1826,19 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
 
         // TNC / D-STAR / Clock
         Command::GetTncMode => "TN".to_owned(),
-        Command::SetTncMode { mode, setting } => format!("TN {mode},{setting}"),
-        Command::GetDstarCallsign { slot } => format!("DC {slot}"),
+        Command::SetTncMode { mode, setting } => {
+            format!("TN {},{}", u8::from(*mode), u8::from(*setting))
+        }
+        Command::GetDstarCallsign { slot } => format!("DC {}", slot.as_u8()),
         Command::SetDstarCallsign {
             slot,
             callsign,
             suffix,
-        } => format!("DC {slot},{callsign},{suffix}"),
+        } => format!("DC {},{callsign},{suffix}", slot.as_u8()),
         Command::GetRealTimeClock => "RT".to_owned(),
 
         // Scan
-        Command::SetScanResume { mode } => format!("SR {mode}"),
+        Command::SetScanResume { mode } => format!("SR {}", mode.to_raw()),
         Command::GetScanRange { band } => format!("SF {}", u8::from(*band)),
         Command::GetBandScope { band } => format!("BS {}", u8::from(*band)),
         Command::SetBandScope { band, value } => {
@@ -1842,20 +1847,20 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
 
         // APRS
         Command::GetTncBaud => "AS".to_owned(),
-        Command::SetTncBaud { rate } => format!("AS {rate}"),
+        Command::SetTncBaud { rate } => format!("AS {}", u8::from(*rate)),
         Command::GetSerialInfo => "AE".to_owned(),
         Command::GetBeaconType => "PT".to_owned(),
-        Command::SetBeaconType { mode } => format!("PT {mode}"),
+        Command::SetBeaconType { mode } => format!("PT {}", u8::from(*mode)),
         Command::GetPositionSource => "MS".to_owned(),
         Command::SendMessage { text } => format!("MS {text}"),
 
         // D-STAR
         Command::GetDstarSlot => "DS".to_owned(),
-        Command::SetDstarSlot { slot } => format!("DS {slot}"),
+        Command::SetDstarSlot { slot } => format!("DS {}", slot.as_u8()),
         Command::GetActiveCallsignSlot => "CS".to_owned(),
-        Command::SetActiveCallsignSlot { slot } => format!("CS {slot}"),
+        Command::SetActiveCallsignSlot { slot } => format!("CS {}", slot.as_u8()),
         Command::GetGateway => "GW".to_owned(),
-        Command::SetGateway { value } => format!("GW {value}"),
+        Command::SetGateway { value } => format!("GW {}", u8::from(*value)),
 
         // GPS
         Command::GetGpsConfig => "GP".to_owned(),
@@ -2063,7 +2068,7 @@ mod tests {
     #[test]
     fn serialize_set_dstar_callsign() {
         let bytes = serialize(&Command::SetDstarCallsign {
-            slot: 1,
+            slot: DstarSlot::new(1).unwrap(),
             callsign: "KQ4NIT  ".to_owned(),
             suffix: "D75A".to_owned(),
         });
@@ -2134,8 +2139,8 @@ mod tests {
     #[test]
     fn serialize_set_tnc_mode() {
         let bytes = serialize(&Command::SetTncMode {
-            mode: 3,
-            setting: 0,
+            mode: TncMode::Mmdvm,
+            setting: TncBaud::Bps1200,
         });
         assert_eq!(bytes, b"TN 3,0\r");
     }

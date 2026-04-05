@@ -650,6 +650,12 @@ impl TryFrom<u8> for KeyLockType {
     }
 }
 
+impl From<KeyLockType> for u8 {
+    fn from(klt: KeyLockType) -> Self {
+        klt as Self
+    }
+}
+
 impl TryFrom<u8> for Language {
     type Error = ValidationError;
 

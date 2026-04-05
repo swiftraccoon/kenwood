@@ -20,6 +20,7 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
+use crate::types::{BeaconMode, TncBaud};
 
 use super::Radio;
 
@@ -31,7 +32,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_tnc_baud(&mut self) -> Result<u8, Error> {
+    pub async fn get_tnc_baud(&mut self) -> Result<TncBaud, Error> {
         tracing::debug!("reading TNC baud rate");
         let response = self.execute(Command::GetTncBaud).await?;
         match response {
@@ -56,7 +57,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_beacon_type(&mut self) -> Result<u8, Error> {
+    pub async fn get_beacon_type(&mut self) -> Result<BeaconMode, Error> {
         tracing::debug!("reading beacon type");
         let response = self.execute(Command::GetBeaconType).await?;
         match response {
@@ -92,8 +93,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_tnc_baud(&mut self, rate: u8) -> Result<(), Error> {
-        tracing::info!(rate, "setting TNC baud rate");
+    pub async fn set_tnc_baud(&mut self, rate: TncBaud) -> Result<(), Error> {
+        tracing::info!(?rate, "setting TNC baud rate");
         let response = self.execute(Command::SetTncBaud { rate }).await?;
         match response {
             Response::TncBaud { .. } => Ok(()),
@@ -111,8 +112,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_beacon_type(&mut self, mode: u8) -> Result<(), Error> {
-        tracing::info!(mode, "setting beacon type");
+    pub async fn set_beacon_type(&mut self, mode: BeaconMode) -> Result<(), Error> {
+        tracing::info!(?mode, "setting beacon type");
         let response = self.execute(Command::SetBeaconType { mode }).await?;
         match response {
             Response::BeaconType { .. } => Ok(()),

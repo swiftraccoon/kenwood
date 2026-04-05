@@ -57,21 +57,21 @@ pub enum RadioCommand {
     /// Toggle VOX on/off (VX write — verified working).
     SetVox(bool),
     /// Set VOX gain (VG write — verified working).
-    SetVoxGain(u8),
+    SetVoxGain(kenwood_thd75::types::VoxGain),
     /// Set VOX delay (VD write — verified working).
-    SetVoxDelay(u8),
+    SetVoxDelay(kenwood_thd75::types::VoxDelay),
     /// Set TNC baud rate (AS write — verified working).
-    SetTncBaud(u8),
+    SetTncBaud(kenwood_thd75::types::TncBaud),
     /// Set beacon type (PT write — verified working).
-    SetBeaconType(u8),
+    SetBeaconType(kenwood_thd75::types::BeaconMode),
     /// Set GPS config (GP write — verified working).
     SetGpsConfig(bool, bool),
     /// Set FM radio on/off (FR write — verified working).
     SetFmRadio(bool),
     /// Set D-STAR callsign slot (CS write — verified working).
-    SetCallsignSlot(u8),
+    SetCallsignSlot(kenwood_thd75::types::CallsignSlot),
     /// Set D-STAR slot (DS write — verified working).
-    SetDstarSlot(u8),
+    SetDstarSlot(kenwood_thd75::types::DstarSlot),
     /// Write a single byte to MCP memory via `modify_memory_page`.
     /// Enters MCP mode, modifies one byte, exits. USB drops and reconnects.
     /// Used for settings where CAT writes are rejected by D75 firmware.

@@ -9,6 +9,7 @@
 //! testing confirmed the actual semantics documented here.
 
 use kenwood_thd75::protocol::{self, Command, Response};
+use kenwood_thd75::types::{DstarSlot, TncBaud, TncMode};
 
 // ============================================================================
 // TN -- TNC Mode (bare read only)
@@ -23,19 +24,34 @@ fn serialize_tn_read() {
 fn parse_tn_response() {
     match protocol::parse(b"TN 0,0").unwrap() {
         Response::TncMode { mode, setting } => {
-            assert_eq!(mode, 0);
-            assert_eq!(setting, 0);
+            assert_eq!(mode, TncMode::Aprs);
+            assert_eq!(setting, TncBaud::Bps1200);
         }
         other => panic!("expected TncMode, got {other:?}"),
     }
 }
 
 #[test]
-fn parse_tn_nonzero() {
-    match protocol::parse(b"TN 1,2").unwrap() {
+fn parse_tn_kiss_mode() {
+    match protocol::parse(b"TN 2,0").unwrap() {
         Response::TncMode { mode, setting } => {
-            assert_eq!(mode, 1);
-            assert_eq!(setting, 2);
+            assert_eq!(mode, TncMode::Kiss);
+            assert_eq!(setting, TncBaud::Bps1200);
+        }
+        other => panic!("expected TncMode, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_tn_navitra() {
+    // Setting 1 = 9600 bps — but TncBaud only has 0 and 1,
+    // and value 2 would be out of range. Navitra mode with 9600 setting
+    // is not documented; if the radio sends TN 1,2 it would be a parse error.
+    // Use valid values only.
+    match protocol::parse(b"TN 1,1").unwrap() {
+        Response::TncMode { mode, setting } => {
+            assert_eq!(mode, TncMode::Navitra);
+            assert_eq!(setting, TncBaud::Bps9600);
         }
         other => panic!("expected TncMode, got {other:?}"),
     }
@@ -48,7 +64,9 @@ fn parse_tn_nonzero() {
 #[test]
 fn serialize_dc_read_slot_1() {
     assert_eq!(
-        protocol::serialize(&Command::GetDstarCallsign { slot: 1 }),
+        protocol::serialize(&Command::GetDstarCallsign {
+            slot: DstarSlot::new(1).unwrap()
+        }),
         b"DC 1\r"
     );
 }
@@ -56,7 +74,9 @@ fn serialize_dc_read_slot_1() {
 #[test]
 fn serialize_dc_read_slot_6() {
     assert_eq!(
-        protocol::serialize(&Command::GetDstarCallsign { slot: 6 }),
+        protocol::serialize(&Command::GetDstarCallsign {
+            slot: DstarSlot::new(6).unwrap()
+        }),
         b"DC 6\r"
     );
 }
@@ -69,7 +89,7 @@ fn parse_dc_response() {
             callsign,
             suffix,
         } => {
-            assert_eq!(slot, 1);
+            assert_eq!(slot, DstarSlot::new(1).unwrap());
             assert_eq!(callsign, "KQ4NIT  ");
             assert_eq!(suffix, "D75A");
         }

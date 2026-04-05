@@ -7,6 +7,7 @@
 
 use crate::error::ProtocolError;
 use crate::types::Band;
+use crate::types::radio_params::{BatteryLevel, DetectOutputMode, VoxDelay, VoxGain};
 
 use super::Response;
 
@@ -25,14 +26,34 @@ pub(crate) fn parse_control(
         "BE" => Some(parse_bool(payload, "BE").map(|enabled| Response::Beep { enabled })),
         "RX" | "TX" => Some(Ok(Response::Ok)),
         "LC" => Some(parse_bool(payload, "LC").map(|locked| Response::Lock { locked })),
-        "IO" => {
-            Some(parse_u8_field(payload, "IO", "value").map(|value| Response::IoPort { value }))
-        }
+        "IO" => Some(parse_u8_field(payload, "IO", "value").and_then(|raw| {
+            DetectOutputMode::try_from(raw)
+                .map(|value| Response::IoPort { value })
+                .map_err(|e| ProtocolError::FieldParse {
+                    command: "IO".into(),
+                    field: "value".into(),
+                    detail: e.to_string(),
+                })
+        })),
         "BL" => Some(parse_bl(payload)),
-        "VD" => {
-            Some(parse_u8_field(payload, "VD", "delay").map(|delay| Response::VoxDelay { delay }))
-        }
-        "VG" => Some(parse_u8_field(payload, "VG", "gain").map(|gain| Response::VoxGain { gain })),
+        "VD" => Some(parse_u8_field(payload, "VD", "delay").and_then(|raw| {
+            VoxDelay::try_from(raw)
+                .map(|delay| Response::VoxDelay { delay })
+                .map_err(|e| ProtocolError::FieldParse {
+                    command: "VD".into(),
+                    field: "delay".into(),
+                    detail: e.to_string(),
+                })
+        })),
+        "VG" => Some(parse_u8_field(payload, "VG", "gain").and_then(|raw| {
+            VoxGain::try_from(raw)
+                .map(|gain| Response::VoxGain { gain })
+                .map_err(|e| ProtocolError::FieldParse {
+                    command: "VG".into(),
+                    field: "gain".into(),
+                    detail: e.to_string(),
+                })
+        })),
         "VX" => Some(parse_bool(payload, "VX").map(|enabled| Response::Vox { enabled })),
         _ => None,
     }
@@ -95,7 +116,12 @@ fn parse_bl(payload: &str) -> Result<Response, ProtocolError> {
     } else {
         payload
     };
-    let level = parse_u8_field(level_str.trim(), "BL", "level")?;
+    let raw = parse_u8_field(level_str.trim(), "BL", "level")?;
+    let level = BatteryLevel::try_from(raw).map_err(|e| ProtocolError::FieldParse {
+        command: "BL".to_owned(),
+        field: "level".to_owned(),
+        detail: e.to_string(),
+    })?;
     Ok(Response::BatteryLevel { level })
 }
 

@@ -1610,7 +1610,9 @@ impl App {
                     } else {
                         cur.saturating_sub(1)
                     };
-                    let _ = tx.send(crate::event::RadioCommand::SetVoxGain(next));
+                    if let Ok(gain) = kenwood_thd75::types::VoxGain::new(next) {
+                        let _ = tx.send(crate::event::RadioCommand::SetVoxGain(gain));
+                    }
                     self.status_message = Some(format!("VOX Gain → {next}"));
                     return;
                 }
@@ -1621,7 +1623,9 @@ impl App {
                     } else {
                         cur.saturating_sub(1)
                     };
-                    let _ = tx.send(crate::event::RadioCommand::SetVoxDelay(next));
+                    if let Ok(delay) = kenwood_thd75::types::VoxDelay::new(next) {
+                        let _ = tx.send(crate::event::RadioCommand::SetVoxDelay(delay));
+                    }
                     self.status_message = Some(format!("VOX Delay → {next}"));
                     return;
                 }
@@ -1705,29 +1709,37 @@ impl App {
                     return;
                 }
                 SettingRow::TncBaud => {
-                    let _ = tx.send(crate::event::RadioCommand::SetTncBaud(0));
+                    let _ = tx.send(crate::event::RadioCommand::SetTncBaud(
+                        kenwood_thd75::types::TncBaud::Bps1200,
+                    ));
                     self.status_message =
-                        Some("TNC Baud: not yet polled — send 0 as placeholder".into());
+                        Some("TNC Baud: not yet polled — send 1200 as placeholder".into());
                     return;
                 }
                 SettingRow::BeaconType => {
                     let cur = self.state.beacon_type;
                     let next = if delta > 0 {
-                        cur.saturating_add(1).min(2)
+                        cur.saturating_add(1).min(4)
                     } else {
                         cur.saturating_sub(1)
                     };
-                    let _ = tx.send(crate::event::RadioCommand::SetBeaconType(next));
+                    if let Ok(mode) = kenwood_thd75::types::BeaconMode::try_from(next) {
+                        let _ = tx.send(crate::event::RadioCommand::SetBeaconType(mode));
+                    }
                     self.status_message = Some(format!("Beacon Type → {next}"));
                     return;
                 }
                 SettingRow::CallsignSlot => {
-                    let _ = tx.send(crate::event::RadioCommand::SetCallsignSlot(0));
+                    if let Ok(slot) = kenwood_thd75::types::CallsignSlot::new(0) {
+                        let _ = tx.send(crate::event::RadioCommand::SetCallsignSlot(slot));
+                    }
                     self.status_message = Some("Callsign Slot: not yet polled".into());
                     return;
                 }
                 SettingRow::DstarSlot => {
-                    let _ = tx.send(crate::event::RadioCommand::SetDstarSlot(0));
+                    if let Ok(slot) = kenwood_thd75::types::DstarSlot::new(1) {
+                        let _ = tx.send(crate::event::RadioCommand::SetDstarSlot(slot));
+                    }
                     self.status_message = Some("D-STAR Slot: not yet polled".into());
                     return;
                 }

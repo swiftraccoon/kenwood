@@ -90,8 +90,8 @@ async fn audio_settings_workflow() {
         kenwood_thd75::types::AfGainLevel::new(20).unwrap()
     );
     let (tnc_mode, tnc_setting) = radio.get_tnc_mode().await.unwrap();
-    assert_eq!(tnc_mode, 0);
-    assert_eq!(tnc_setting, 0);
+    assert_eq!(tnc_mode, kenwood_thd75::types::TncMode::Aprs);
+    assert_eq!(tnc_setting, kenwood_thd75::types::TncBaud::Bps1200);
     assert!(!radio.get_vox().await.unwrap());
 }
 
@@ -114,7 +114,16 @@ async fn dstar_callsign_slot_workflow() {
     mock.expect(b"CS\r", b"CS 5\r");
 
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_active_callsign_slot().await.unwrap(), 10);
-    radio.set_active_callsign_slot(5).await.unwrap();
-    assert_eq!(radio.get_active_callsign_slot().await.unwrap(), 5);
+    assert_eq!(
+        radio.get_active_callsign_slot().await.unwrap(),
+        kenwood_thd75::types::CallsignSlot::new(10).unwrap()
+    );
+    radio
+        .set_active_callsign_slot(kenwood_thd75::types::CallsignSlot::new(5).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        radio.get_active_callsign_slot().await.unwrap(),
+        kenwood_thd75::types::CallsignSlot::new(5).unwrap()
+    );
 }

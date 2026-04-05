@@ -262,7 +262,7 @@ fn serialize_lc_full() {
     assert_eq!(
         protocol::serialize(&Command::SetLockFull {
             locked: true,
-            lock_type: 2,
+            lock_type: KeyLockType::try_from(2).unwrap(),
             lock_a: true,
             lock_b: false,
             lock_c: true,
@@ -284,7 +284,7 @@ fn serialize_io_read() {
 #[test]
 fn parse_io_response() {
     match protocol::parse(b"IO 0").unwrap() {
-        Response::IoPort { value } => assert_eq!(value, 0),
+        Response::IoPort { value } => assert_eq!(value, DetectOutputMode::Af),
         other => panic!("expected IoPort, got {other:?}"),
     }
 }
@@ -301,7 +301,7 @@ fn serialize_bl_read() {
 #[test]
 fn parse_bl_response() {
     match protocol::parse(b"BL 3").unwrap() {
-        Response::BatteryLevel { level } => assert_eq!(level, 3),
+        Response::BatteryLevel { level } => assert_eq!(level, BatteryLevel::Full),
         other => panic!("expected BatteryLevel, got {other:?}"),
     }
 }
@@ -309,7 +309,7 @@ fn parse_bl_response() {
 #[test]
 fn parse_bl_empty() {
     match protocol::parse(b"BL 0").unwrap() {
-        Response::BatteryLevel { level } => assert_eq!(level, 0),
+        Response::BatteryLevel { level } => assert_eq!(level, BatteryLevel::Empty),
         other => panic!("expected BatteryLevel, got {other:?}"),
     }
 }
@@ -317,7 +317,7 @@ fn parse_bl_empty() {
 #[test]
 fn parse_bl_charging() {
     match protocol::parse(b"BL 4").unwrap() {
-        Response::BatteryLevel { level } => assert_eq!(level, 4),
+        Response::BatteryLevel { level } => assert_eq!(level, BatteryLevel::Charging),
         other => panic!("expected BatteryLevel, got {other:?}"),
     }
 }
@@ -334,7 +334,9 @@ fn serialize_vd_read() {
 #[test]
 fn serialize_vd_write() {
     assert_eq!(
-        protocol::serialize(&Command::SetVoxDelay { delay: 10 }),
+        protocol::serialize(&Command::SetVoxDelay {
+            delay: VoxDelay::new(10).unwrap()
+        }),
         b"VD 10\r"
     );
 }
@@ -342,7 +344,7 @@ fn serialize_vd_write() {
 #[test]
 fn parse_vd_response() {
     match protocol::parse(b"VD 7").unwrap() {
-        Response::VoxDelay { delay } => assert_eq!(delay, 7),
+        Response::VoxDelay { delay } => assert_eq!(delay, VoxDelay::new(7).unwrap()),
         other => panic!("expected VoxDelay, got {other:?}"),
     }
 }
@@ -359,7 +361,9 @@ fn serialize_vg_read() {
 #[test]
 fn serialize_vg_write() {
     assert_eq!(
-        protocol::serialize(&Command::SetVoxGain { gain: 4 }),
+        protocol::serialize(&Command::SetVoxGain {
+            gain: VoxGain::new(4).unwrap()
+        }),
         b"VG 4\r"
     );
 }
@@ -367,7 +371,7 @@ fn serialize_vg_write() {
 #[test]
 fn parse_vg_response() {
     match protocol::parse(b"VG 9").unwrap() {
-        Response::VoxGain { gain } => assert_eq!(gain, 9),
+        Response::VoxGain { gain } => assert_eq!(gain, VoxGain::new(9).unwrap()),
         other => panic!("expected VoxGain, got {other:?}"),
     }
 }

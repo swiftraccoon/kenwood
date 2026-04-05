@@ -484,14 +484,32 @@ async fn poll_once(
     // Global state reads. Transport errors trigger reconnect (a USB unplug
     // mid-poll should not show fake defaults for a full cycle). Protocol
     // parse errors are non-fatal and default to safe values.
-    let battery_level = global_read!(radio, "BL", radio.get_battery_level(), 0);
+    let battery_level_typed = global_read!(
+        radio,
+        "BL",
+        radio.get_battery_level(),
+        kenwood_thd75::types::BatteryLevel::Empty
+    );
+    let battery_level = u8::from(battery_level_typed);
     let beep = global_read!(radio, "BE", radio.get_beep(), false);
     let lock = global_read!(radio, "LC", radio.get_lock(), false);
     let dual_band = global_read!(radio, "DL", radio.get_dual_band(), false);
     let bluetooth = global_read!(radio, "BT", radio.get_bluetooth(), false);
     let vox = global_read!(radio, "VX", radio.get_vox(), false);
-    let vox_gain = global_read!(radio, "VG", radio.get_vox_gain(), 0);
-    let vox_delay = global_read!(radio, "VD", radio.get_vox_delay(), 0);
+    let vox_gain_typed = global_read!(
+        radio,
+        "VG",
+        radio.get_vox_gain(),
+        kenwood_thd75::types::VoxGain::new(0).unwrap()
+    );
+    let vox_gain = vox_gain_typed.as_u8();
+    let vox_delay_typed = global_read!(
+        radio,
+        "VD",
+        radio.get_vox_delay(),
+        kenwood_thd75::types::VoxDelay::new(0).unwrap()
+    );
+    let vox_delay = vox_delay_typed.as_u8();
     let af_gain_typed = global_read!(
         radio,
         "AG",
@@ -500,7 +518,13 @@ async fn poll_once(
     );
     let af_gain = af_gain_typed.as_u8();
     let gps = radio.get_gps_config().await.unwrap_or((false, false));
-    let beacon_type = global_read!(radio, "BN", radio.get_beacon_type(), 0);
+    let beacon_type_typed = global_read!(
+        radio,
+        "BN",
+        radio.get_beacon_type(),
+        kenwood_thd75::types::BeaconMode::Off
+    );
+    let beacon_type = u8::from(beacon_type_typed);
     Ok(RadioState {
         band_a,
         band_b,

@@ -9,6 +9,8 @@
 //! Hardware testing confirmed the actual semantics documented here.
 
 use crate::error::ProtocolError;
+use crate::types::DstarSlot;
+use crate::types::radio_params::{TncBaud, TncMode};
 
 use super::Response;
 
@@ -53,8 +55,18 @@ fn parse_tn(payload: &str) -> Result<Response, ProtocolError> {
             detail: format!("expected mode,setting, got {payload:?}"),
         });
     }
-    let mode = parse_u8_field(parts[0], "TN", "mode")?;
-    let setting = parse_u8_field(parts[1], "TN", "setting")?;
+    let mode_raw = parse_u8_field(parts[0], "TN", "mode")?;
+    let mode = TncMode::try_from(mode_raw).map_err(|e| ProtocolError::FieldParse {
+        command: "TN".to_owned(),
+        field: "mode".to_owned(),
+        detail: e.to_string(),
+    })?;
+    let setting_raw = parse_u8_field(parts[1], "TN", "setting")?;
+    let setting = TncBaud::try_from(setting_raw).map_err(|e| ProtocolError::FieldParse {
+        command: "TN".to_owned(),
+        field: "setting".to_owned(),
+        detail: e.to_string(),
+    })?;
     Ok(Response::TncMode { mode, setting })
 }
 
@@ -71,7 +83,12 @@ fn parse_dc(payload: &str) -> Result<Response, ProtocolError> {
             detail: format!("expected slot,callsign,suffix, got {payload:?}"),
         });
     }
-    let slot = parse_u8_field(parts[0], "DC", "slot")?;
+    let raw_slot = parse_u8_field(parts[0], "DC", "slot")?;
+    let slot = DstarSlot::new(raw_slot).map_err(|e| ProtocolError::FieldParse {
+        command: "DC".into(),
+        field: "slot".into(),
+        detail: e.to_string(),
+    })?;
     let callsign = parts[1].to_owned();
     let suffix = parts[2].to_owned();
     Ok(Response::DstarCallsign {

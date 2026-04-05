@@ -58,7 +58,10 @@ async fn battery_level_read() {
     let mut mock = MockTransport::new();
     mock.expect(b"BL\r", b"BL 3\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    assert_eq!(radio.get_battery_level().await.unwrap(), 3);
+    assert_eq!(
+        radio.get_battery_level().await.unwrap(),
+        kenwood_thd75::types::BatteryLevel::Full
+    );
 }
 
 #[tokio::test]
@@ -104,7 +107,10 @@ async fn scan_resume() {
     let mut mock = MockTransport::new();
     mock.expect(b"SR 1\r", b"SR 1\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio.set_scan_resume(1).await.unwrap();
+    radio
+        .set_scan_resume(kenwood_thd75::types::ScanResumeMethod::CarrierOperated)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -113,7 +119,14 @@ async fn set_lock_full() {
     mock.expect(b"LC 1,2,1,0,1,0\r", b"LC 1\r");
     let mut radio = Radio::connect(mock).await.unwrap();
     radio
-        .set_lock_full(true, 2, true, false, true, false)
+        .set_lock_full(
+            true,
+            kenwood_thd75::types::KeyLockType::try_from(2).unwrap(),
+            true,
+            false,
+            true,
+            false,
+        )
         .await
         .unwrap();
 }
