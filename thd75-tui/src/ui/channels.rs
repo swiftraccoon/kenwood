@@ -72,82 +72,82 @@ pub fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
         McpState::Loaded { image, .. } => {
             let channels = image.channels();
             let used = app.filtered_channels();
-            if let Some(&ch_num) = used.get(app.channel_list_index) {
-                if let Some(entry) = channels.get(ch_num) {
-                    let fc = &entry.flash;
+            if let Some(&ch_num) = used.get(app.channel_list_index)
+                && let Some(entry) = channels.get(ch_num)
+            {
+                let fc = &entry.flash;
 
-                    // Tone/squelch summary string
-                    let tone_info = if fc.tone_enabled {
-                        format!("CTCSS TX {}", fc.tone_code.index())
-                    } else if fc.ctcss_enabled {
-                        format!("CTCSS {}/{}", fc.tone_code.index(), fc.ctcss_code.index())
-                    } else if fc.dtcs_enabled {
-                        format!("DCS {:03}", u16::from(fc.dcs_code.index()))
-                    } else {
-                        "None".to_string()
-                    };
+                // Tone/squelch summary string
+                let tone_info = if fc.tone_enabled {
+                    format!("CTCSS TX {}", fc.tone_code.index())
+                } else if fc.ctcss_enabled {
+                    format!("CTCSS {}/{}", fc.tone_code.index(), fc.ctcss_code.index())
+                } else if fc.dtcs_enabled {
+                    format!("DCS {:03}", u16::from(fc.dcs_code.index()))
+                } else {
+                    "None".to_string()
+                };
 
-                    // Duplex direction string
-                    let duplex_info = match fc.duplex {
-                        kenwood_thd75::types::FlashDuplex::Simplex => "Simplex".to_string(),
-                        kenwood_thd75::types::FlashDuplex::Plus => {
-                            format!("+{:.3} MHz", fc.tx_offset.as_mhz())
-                        }
-                        kenwood_thd75::types::FlashDuplex::Minus => {
-                            format!("-{:.3} MHz", fc.tx_offset.as_mhz())
-                        }
-                    };
+                // Duplex direction string
+                let duplex_info = match fc.duplex {
+                    kenwood_thd75::types::FlashDuplex::Simplex => "Simplex".to_string(),
+                    kenwood_thd75::types::FlashDuplex::Plus => {
+                        format!("+{:.3} MHz", fc.tx_offset.as_mhz())
+                    }
+                    kenwood_thd75::types::FlashDuplex::Minus => {
+                        format!("-{:.3} MHz", fc.tx_offset.as_mhz())
+                    }
+                };
 
-                    let lines = vec![
-                        Line::from(vec![
-                            Span::styled("  Channel: ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(format!("{ch_num}"), Style::default().fg(Color::White)),
-                        ]),
-                        Line::from(vec![
-                            Span::styled("  Name:    ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(
-                                entry.name.clone(),
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]),
-                        Line::from(""),
-                        Line::from(vec![
-                            Span::styled("  RX:      ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(
-                                format!("{:.6} MHz", fc.rx_frequency.as_mhz()),
-                                Style::default().fg(Color::Green),
-                            ),
-                        ]),
-                        Line::from(vec![
-                            Span::styled("  Duplex:  ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(duplex_info, Style::default().fg(Color::Yellow)),
-                        ]),
-                        Line::from(vec![
-                            Span::styled("  Mode:    ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(format!("{}", fc.mode), Style::default().fg(Color::White)),
-                        ]),
-                        Line::from(vec![
-                            Span::styled("  Tone:    ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(tone_info, Style::default().fg(Color::White)),
-                        ]),
-                        Line::from(""),
-                        Line::from(vec![Span::styled(
-                            format!(
-                                "  [Enter] Tune Band {}",
-                                if app.target_band == kenwood_thd75::types::Band::B {
-                                    "B"
-                                } else {
-                                    "A"
-                                }
-                            ),
-                            Style::default().fg(Color::DarkGray),
-                        )]),
-                    ];
-                    frame.render_widget(Paragraph::new(lines).block(block), area);
-                    return;
-                }
+                let lines = vec![
+                    Line::from(vec![
+                        Span::styled("  Channel: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("{ch_num}"), Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Name:    ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            entry.name.clone(),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("  RX:      ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("{:.6} MHz", fc.rx_frequency.as_mhz()),
+                            Style::default().fg(Color::Green),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Duplex:  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(duplex_info, Style::default().fg(Color::Yellow)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Mode:    ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("{}", fc.mode), Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Tone:    ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(tone_info, Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        format!(
+                            "  [Enter] Tune Band {}",
+                            if app.target_band == kenwood_thd75::types::Band::B {
+                                "B"
+                            } else {
+                                "A"
+                            }
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    )]),
+                ];
+                frame.render_widget(Paragraph::new(lines).block(block), area);
+                return;
             }
             frame.render_widget(Paragraph::new("  No channel selected").block(block), area);
         }

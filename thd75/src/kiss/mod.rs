@@ -495,11 +495,12 @@ fn parse_aprs_longitude(s: &[u8]) -> Result<f64, AprsError> {
 
 /// Parse an APRS position report from an AX.25 information field.
 ///
-/// Supports the two most common APRS position formats:
-/// - `!` / `=` — Position without/with messaging (uncompressed)
-/// - `/` / `@` — Position with timestamp (uncompressed)
+/// Supports three APRS position formats (per APRS101.PDF chapters 8-9):
+/// - **Uncompressed**: `!`/`=`/`/`/`@` with ASCII lat/lon (`DDMM.HH`)
+/// - **Compressed**: `!`/`=`/`/`/`@` with base-91 encoded lat/lon (13 bytes)
 ///
-/// Compressed positions and Mic-E encoding are not yet supported.
+/// For **Mic-E** positions (`` ` ``/`'`), use [`parse_mice_position`] which
+/// also requires the AX.25 destination address.
 ///
 /// # Errors
 ///
@@ -513,7 +514,7 @@ pub fn parse_aprs_position(info: &[u8]) -> Result<AprsPosition, AprsError> {
     let body = match data_type {
         // Position without timestamp: ! or =
         b'!' | b'=' => {
-            if info.len() < 20 {
+            if info.len() < 2 {
                 return Err(AprsError::InvalidFormat);
             }
             &info[1..]
@@ -521,7 +522,7 @@ pub fn parse_aprs_position(info: &[u8]) -> Result<AprsPosition, AprsError> {
         // Position with timestamp: / or @
         // Timestamp is 7 characters after the type byte
         b'/' | b'@' => {
-            if info.len() < 27 {
+            if info.len() < 9 {
                 return Err(AprsError::InvalidFormat);
             }
             &info[8..]
@@ -529,7 +530,23 @@ pub fn parse_aprs_position(info: &[u8]) -> Result<AprsPosition, AprsError> {
         _ => return Err(AprsError::InvalidFormat),
     };
 
-    // Uncompressed format: lat(8) sym_table(1) lon(9) sym_code(1) [comment]
+    if body.is_empty() {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    // Detect compressed vs uncompressed: if the first byte is a digit (0-9),
+    // it's uncompressed latitude. Otherwise it's a compressed symbol table char.
+    if body[0].is_ascii_digit() {
+        parse_uncompressed_body(body)
+    } else {
+        parse_compressed_body(body)
+    }
+}
+
+/// Parse uncompressed APRS position body.
+///
+/// Format: `lat(8) sym_table(1) lon(9) sym_code(1) [comment]` = 19+ bytes.
+fn parse_uncompressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
     if body.len() < 19 {
         return Err(AprsError::InvalidFormat);
     }
@@ -552,6 +569,182 @@ pub fn parse_aprs_position(info: &[u8]) -> Result<AprsPosition, AprsError> {
         symbol_code,
         comment,
     })
+}
+
+/// Parse compressed APRS position body (APRS101.PDF Chapter 9).
+///
+/// Format: `sym_table(1) YYYY(4) XXXX(4) sym_code(1) cs(1) s(1) t(1)` = 13 bytes.
+/// YYYY and XXXX are base-91 encoded (each byte = ASCII 33-124, value = byte - 33).
+///
+/// Latitude:  `90 - (YYYY / 380926.0)` degrees
+/// Longitude: `-180 + (XXXX / 190463.0)` degrees
+fn parse_compressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
+    if body.len() < 13 {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    let symbol_table = body[0] as char;
+    let lat_val = decode_base91_4(&body[1..5])?;
+    let lon_val = decode_base91_4(&body[5..9])?;
+    let symbol_code = body[9] as char;
+
+    let latitude = 90.0 - f64::from(lat_val) / 380_926.0;
+    let longitude = -180.0 + f64::from(lon_val) / 190_463.0;
+
+    let comment = if body.len() > 13 {
+        String::from_utf8_lossy(&body[13..]).into_owned()
+    } else {
+        String::new()
+    };
+
+    Ok(AprsPosition {
+        latitude,
+        longitude,
+        symbol_table,
+        symbol_code,
+        comment,
+    })
+}
+
+/// Decode a 4-byte base-91 value.
+///
+/// Each byte is in the ASCII range 33-124. The value is:
+/// `b[0]*91^3 + b[1]*91^2 + b[2]*91 + b[3]`
+fn decode_base91_4(bytes: &[u8]) -> Result<u32, AprsError> {
+    if bytes.len() < 4 {
+        return Err(AprsError::InvalidCoordinates);
+    }
+    let mut val: u32 = 0;
+    for &b in &bytes[..4] {
+        if !(33..=124).contains(&b) {
+            return Err(AprsError::InvalidCoordinates);
+        }
+        val = val * 91 + u32::from(b - 33);
+    }
+    Ok(val)
+}
+
+/// Parse a Mic-E encoded APRS position (APRS101.PDF Chapter 10).
+///
+/// Mic-E is a compact encoding used by Kenwood HTs (including the TH-D75)
+/// that splits the position across two fields:
+/// - **Latitude** is encoded in the 6-character AX.25 destination address
+/// - **Longitude** and speed/course are in the info field body
+///
+/// Data type identifiers: `` ` `` (0x60, current Mic-E) or `'` (0x27, old Mic-E).
+/// The TH-D75 uses current Mic-E (`` ` ``).
+///
+/// # Parameters
+///
+/// - `destination`: The AX.25 destination callsign (e.g., "T4SP0R")
+/// - `info`: The full AX.25 information field (including the type byte)
+///
+/// # Errors
+///
+/// Returns [`AprsError`] if the Mic-E encoding is invalid.
+pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPosition, AprsError> {
+    if info.len() < 9 || destination.len() < 6 {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    let data_type = info[0];
+    if data_type != b'`' && data_type != b'\'' && data_type != 0x1C && data_type != 0x1D {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    let dest = destination.as_bytes();
+
+    // --- Latitude from destination address ---
+    // Each of the 6 destination chars encodes a latitude digit plus
+    // N/S and longitude offset flags. Chars 0-9 and A-L map to digits.
+    let mut lat_digits = [0u8; 6];
+    let mut north = true;
+    let mut lon_offset = 0i16;
+    // Bit 2 (char index 3): N/S indicator
+    // Bit 1 (char index 4): longitude offset (+100)
+    // Bit 0 (char index 5): longitude offset (not used separately)
+
+    for (i, &ch) in dest[..6].iter().enumerate() {
+        let (digit, is_custom) = mice_dest_digit(ch)?;
+        lat_digits[i] = digit;
+
+        // Chars 0-3: if custom (A-L), set message bits (we don't use them for position)
+        // Char 3: N/S flag — custom = North
+        if i == 3 {
+            north = is_custom;
+        }
+        // Char 4: longitude offset — custom = +100 degrees
+        if i == 4 && is_custom {
+            lon_offset = 100;
+        }
+        // Char 5: W/E flag — custom = West (negate longitude)
+    }
+
+    let lat_deg = f64::from(lat_digits[0]).mul_add(10.0, f64::from(lat_digits[1]));
+    let lat_min = f64::from(lat_digits[2]).mul_add(10.0, f64::from(lat_digits[3]))
+        + f64::from(lat_digits[4]) / 10.0
+        + f64::from(lat_digits[5]) / 100.0;
+    let mut latitude = lat_deg + lat_min / 60.0;
+    if !north {
+        latitude = -latitude;
+    }
+
+    // --- Longitude from info field ---
+    // info[1] = degrees (d+28), info[2] = minutes (m+28), info[3] = hundredths (h+28)
+    let d = i16::from(info[1]) - 28;
+    let m = i16::from(info[2]) - 28;
+    let h = i16::from(info[3]) - 28;
+
+    let mut lon_deg = d + lon_offset;
+    if (180..=189).contains(&lon_deg) {
+        lon_deg -= 80;
+    } else if (190..=199).contains(&lon_deg) {
+        lon_deg -= 190;
+    }
+
+    let lon_min = if m >= 60 { m - 60 } else { m };
+    let longitude_abs = f64::from(lon_deg) + (f64::from(lon_min) + f64::from(h) / 100.0) / 60.0;
+
+    // Char 5 of destination: custom = West
+    let west = mice_dest_is_custom(dest[5]);
+    let longitude = if west { -longitude_abs } else { longitude_abs };
+
+    // Symbol: info[7] = symbol code, info[8] = symbol table
+    let symbol_code = if info.len() > 7 { info[7] as char } else { '/' };
+    let symbol_table = if info.len() > 8 { info[8] as char } else { '/' };
+
+    let comment = if info.len() > 9 {
+        String::from_utf8_lossy(&info[9..]).into_owned()
+    } else {
+        String::new()
+    };
+
+    Ok(AprsPosition {
+        latitude,
+        longitude,
+        symbol_table,
+        symbol_code,
+        comment,
+    })
+}
+
+/// Extract a digit (0-9) from a Mic-E destination character.
+///
+/// Returns `(digit, is_custom)` where `is_custom` is true for A-K/L
+/// (used for N/S, lon offset, and W/E flags).
+const fn mice_dest_digit(ch: u8) -> Result<(u8, bool), AprsError> {
+    match ch {
+        b'0'..=b'9' => Ok((ch - b'0', false)),
+        b'A'..=b'J' => Ok((ch - b'A', true)), // A=0, B=1, ..., J=9
+        b'K' | b'L' | b'Z' => Ok((0, true)),  // K, L, Z map to space (0)
+        b'P'..=b'Y' => Ok((ch - b'P', true)), // P=0, Q=1, ..., Y=9
+        _ => Err(AprsError::InvalidCoordinates),
+    }
+}
+
+/// Check if a Mic-E destination character is a "custom" (non-standard digit) character.
+const fn mice_dest_is_custom(ch: u8) -> bool {
+    matches!(ch, b'A'..=b'L' | b'P'..=b'Z')
 }
 
 // ---------------------------------------------------------------------------
@@ -909,6 +1102,221 @@ mod tests {
     #[test]
     fn parse_aprs_position_empty() {
         assert!(parse_aprs_position(b"").is_err());
+    }
+
+    // ---- APRS compressed position tests ----
+
+    #[test]
+    fn parse_aprs_compressed_position() {
+        // Example from APRS101.PDF chapter 9: 49°30'N, 72°45'W
+        // Lat: 90 - (49.5 * 380926 / 90) ≈ ... let me compute the base-91 bytes.
+        // lat_val = (90 - 49.5) * 380926 = 40.5 * 380926 = 15427503
+        // But easier to use known test vector.
+        //
+        // APRS101 example: /YYYY XXXX $csT
+        // Let's use a computed example:
+        // Latitude 49.5°N → val = (90 - 49.5) * 380926 = 15_427_503
+        //   15427503 / 91^3 = 20.46 → b[0] = 20 + 33 = 53 = '5'
+        //   remainder: 15427503 - 20*753571 = 15427503 - 15071420 = 356083
+        //   356083 / 91^2 = 42.98 → b[1] = 42 + 33 = 75 = 'K'
+        //   remainder: 356083 - 42*8281 = 356083 - 347802 = 8281
+        //   8281 / 91 = 90.99 → b[2] = 90 + 33 = 123 = '{'
+        //   remainder: 8281 - 90*91 = 8281 - 8190 = 91 → b[3] = 91... wait, max is 90
+        // Let me use exact integer math instead.
+
+        // Use simpler known values: lat=49.5, lon=-72.75
+        // lat_val = (90 - 49.5) * 380926.0 = 15_427_503 (round to u32)
+        // lon_val = (-72.75 + 180) * 190463.0 = 107.25 * 190463 = 20_427_156 (round)
+
+        // Actually, let me just construct valid base-91 bytes and verify the decode.
+        // lat_val = 3493929 → lat = 90 - 3493929/380926 = 90 - 9.172 = 80.828
+        // Encode 3493929 in base-91:
+        //   3493929 / 753571 = 4, rem 3493929 - 4*753571 = 479645
+        //   479645 / 8281 = 57, rem 479645 - 57*8281 = 7628
+        //   7628 / 91 = 83, rem 7628 - 83*91 = 75
+        //   bytes: (4+33, 57+33, 83+33, 75+33) = (37, 90, 116, 108) = ('%', 'Z', 't', 'l'
+
+        // lon_val = 4567890 → lon = -180 + 4567890/190463 = -180 + 23.982 = -156.018
+        //   4567890 / 753571 = 6, rem 4567890 - 6*753571 = 46464
+        //   46464 / 8281 = 5, rem 46464 - 5*8281 = 5059
+        //   5059 / 91 = 55, rem 5059 - 55*91 = 54
+        //   bytes: (6+33, 5+33, 55+33, 54+33) = (39, 38, 88, 87) = (''', '&', 'X', 'W')
+
+        // Full compressed body: sym_table YYYY XXXX sym_code cs s t
+        let body: &[u8] = b"/%Ztl'&XW> sT";
+        //                    ^     ^       ^  symbol table '/'
+        //                     ^^^^  lat     ^^^^  lon
+        //                                 ^  symbol code '>'
+        //                                  ^^^ cs, s, t (ignored for position)
+        let mut info = vec![b'!'];
+        info.extend_from_slice(body);
+
+        let pos = parse_aprs_position(&info).unwrap();
+        // Verify latitude: 90 - 3493929/380926 ≈ 80.828
+        assert!((pos.latitude - 80.828).abs() < 0.01, "lat={}", pos.latitude);
+        // Verify longitude: -180 + 4567890/190463 ≈ -156.018
+        assert!(
+            (pos.longitude - (-156.018)).abs() < 0.01,
+            "lon={}",
+            pos.longitude
+        );
+        assert_eq!(pos.symbol_table, '/');
+        assert_eq!(pos.symbol_code, '>');
+    }
+
+    #[test]
+    fn parse_aprs_compressed_with_timestamp() {
+        // '@' type with timestamp, then compressed body
+        let mut info = Vec::new();
+        info.push(b'@');
+        info.extend_from_slice(b"092345z"); // 7-char timestamp
+        info.extend_from_slice(b"/%Ztl'&XW> sT"); // compressed body
+        let pos = parse_aprs_position(&info).unwrap();
+        assert!((pos.latitude - 80.828).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_aprs_compressed_too_short() {
+        // Compressed needs at least 13 bytes in body
+        let info = b"!/short";
+        assert!(parse_aprs_position(info).is_err());
+    }
+
+    #[test]
+    fn base91_decode_zero() {
+        // All '!' (33) = value 0
+        assert_eq!(decode_base91_4(b"!!!!").unwrap(), 0);
+    }
+
+    #[test]
+    fn base91_decode_max() {
+        // All '|' (124) = value 91 for each digit
+        // 91*91^3 + 91*91^2 + 91*91 + 91 would overflow, but max char is 124=91+33
+        // so max digit value is 124-33=91. Let's just verify the computation.
+        let val = decode_base91_4(b"||||").unwrap();
+        // 91*(91^3 + 91^2 + 91 + 1) — but actually the encoding is:
+        // b[0]*91^3 + b[1]*91^2 + b[2]*91 + b[3] where each b[i] = 124-33 = 91
+        // = 91*753571 + 91*8281 + 91*91 + 91
+        let expected = 91_u32 * 753_571 + 91 * 8281 + 91 * 91 + 91;
+        assert_eq!(val, expected);
+    }
+
+    #[test]
+    fn base91_decode_invalid_char() {
+        // Space (32) is below valid range
+        assert!(decode_base91_4(b" !!!").is_err());
+    }
+
+    // ---- Mic-E position tests ----
+
+    #[test]
+    fn parse_mice_basic() {
+        // Mic-E example: destination "T4SP0R" encodes latitude
+        // T=4(custom), 4=4, S=3(custom), P=0(custom), 0=0, R=2(custom)
+        // Wait, let me use the APRS101 encoding table:
+        // P=0, Q=1, R=2, S=3, T=4, U=5, V=6, W=7, X=8, Y=9 (all custom=true)
+        // 0-9 = 0-9 (custom=false)
+        //
+        // Destination "S32N0R":
+        // S=3(custom), 3=3, 2=2, N=? — N is not in the table...
+        //
+        // Let me use a proper example.
+        // For lat 35°16.52'N, lon 97°46.35'W:
+        // Destination chars encode lat digits: 3,5,1,6,5,2
+        // With message bits: chars 0-2 custom for msg type
+        // Char 3 custom = North, char 4 custom = +100, char 5 custom = West
+        //
+        // Using "S5QN5W" as destination:
+        // S=3(custom), 5=5(std), Q=1(custom), N→invalid
+        //
+        // Let me use all-P-Y range:
+        // Destination "RUPPV2": R=2(c), U=5(c), P=0(c), P=0(c), V=6(c), 2=2(std)
+        // Lat digits: 2,5,0,0,6,2 → lat = 25°00.62'
+        // Char 3 (P) custom=true → North
+        // Char 4 (V) custom=true → lon_offset = +100
+        // Char 5 (2) custom=false → East
+        //
+        // Info: ` d m h speed_course symbol
+        // Lon: deg=d-28+offset, min=m-28, hundredths=h-28
+        // For lon 172°45.23'E: deg=172-100=72, d=72+28=100='d',
+        //   min=45, m=45+28=73='I', h=23, h=23+28=51='3'
+        //
+        // But with offset=100, lon_deg = d-28+100 = 100-28+100 = 172.
+        // If d=100-28=72, wait: d = (lon_deg - lon_offset) + 28 = (172-100)+28 = 100 = 'd'
+        // m = 45 + 28 = 73 = 'I'
+        // h = 23 + 28 = 51 = '3'
+        //
+        // Speed/course (3 bytes): just use placeholder values
+        // info[4]=28+0=28 (might be below printable)... this gets complex.
+        //
+        // Let me use a simpler real-world-like example.
+        // Lat 35°15.50'N, Lon -97°45.30'W (Oklahoma City area, synthetic)
+        //
+        // Destination encodes lat: digits 3,5,1,5,5,0
+        // Char 0-2: message type bits (use custom=true for "standard" msg)
+        //   S=3(c), U=5(c), Q=1(c) → digits 3,5,1
+        // Char 3: digit 5, North → T=4... no, need 5+custom.
+        //   For digit 5 custom: U=5(custom) → North
+        // Char 4: digit 5, lon_offset 0 → 5(std, not custom) → no offset
+        // Char 5: digit 0, West → P=0(custom) → West
+        //
+        // Destination: "SUQ5UP" → no wait, "SUQU5P"
+        // S=3(c), U=5(c), Q=1(c) → digits 3,5,1 — message type 111 = Custom
+        // U=5(c) → digit 5, North (char 3 custom=true)
+        // 5=5(std) → digit 5, no lon offset (char 4 custom=false)
+        // P=0(c) → digit 0, West (char 5 custom=true)
+        //
+        // Lat: 35°15.50'N = 35 + 15.50/60 = 35.2583
+        //
+        // Lon: 97°45.30'W. lon_offset=0 (char4 not custom).
+        // d = 97 + 28 = 125 = '}' (but max printable is 126='~', ok)
+        // Wait, d-28 must equal degrees. If lon_offset=0 and degrees=97:
+        //   If 97 >= 180 → subtract 80. If 97 >= 190 → subtract 190. Neither applies.
+        //   So d = 97 + 28 = 125 = '}'
+        // m = 45 + 28 = 73 = 'I'
+        // h = 30 + 28 = 58 = ':'
+        //
+        // Speed/course: info[4..7], let's use nulls (32+28=60, etc.)
+        // Actually just pad with reasonable values.
+        //
+        // Info bytes: ` (type) } I : <speed> <course> <sym_code> <sym_table>
+        // Let's use: type=0x60, d=125, m=73, h=58, then 3 speed/course bytes,
+        //            sym_code='>', sym_table='/'
+
+        let dest = "SUQU5P";
+        let info: &[u8] = &[
+            0x60, // Mic-E current data type
+            125,  // longitude degrees + 28 = 97+28
+            73,   // longitude minutes + 28 = 45+28
+            58,   // longitude hundredths + 28 = 30+28
+            40,   // speed/course byte 1
+            40,   // speed/course byte 2
+            40,   // speed/course byte 3
+            b'>', // symbol code
+            b'/', // symbol table
+        ];
+
+        let pos = parse_mice_position(dest, info).unwrap();
+        // Lat should be ~35.258
+        assert!((pos.latitude - 35.258).abs() < 0.01, "lat={}", pos.latitude);
+        // Lon should be ~-97.755
+        assert!(
+            (pos.longitude - (-97.755)).abs() < 0.01,
+            "lon={}",
+            pos.longitude
+        );
+        assert_eq!(pos.symbol_code, '>');
+        assert_eq!(pos.symbol_table, '/');
+    }
+
+    #[test]
+    fn parse_mice_invalid_type() {
+        assert!(parse_mice_position("SUQU5P", b"!test data").is_err());
+    }
+
+    #[test]
+    fn parse_mice_too_short() {
+        assert!(parse_mice_position("SHORT", &[0x60, 1, 2]).is_err());
     }
 
     // ---- Full integration: KISS -> AX.25 -> APRS ----

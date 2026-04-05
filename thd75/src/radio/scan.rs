@@ -1,9 +1,9 @@
-//! Scan-related radio methods: scan resume (SR write-only), scan range (SF), band scope (BS).
+//! Scan-related radio methods: scan resume (SR write-only), step size (SF), band scope (BS).
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::{Band, ScanResumeMethod};
+use crate::types::{Band, ScanResumeMethod, StepSize};
 
 use super::Radio;
 
@@ -31,23 +31,42 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get the scan range setting for a band (SF read).
+    /// Get the step size for a band (SF read).
     ///
-    /// Hardware-verified: `SF band\r` returns `SF band,value`.
+    /// Firmware-verified: SF = Step Size. `SF band\r` returns `SF band,step`.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_scan_range(&mut self, band: Band) -> Result<(Band, u8), Error> {
-        tracing::debug!(?band, "reading scan range");
-        let response = self.execute(Command::GetScanRange { band }).await?;
+    pub async fn get_step_size(&mut self, band: Band) -> Result<(Band, StepSize), Error> {
+        tracing::debug!(?band, "reading step size");
+        let response = self.execute(Command::GetStepSize { band }).await?;
         match response {
-            Response::ScanRange {
+            Response::StepSize {
                 band: resp_band,
-                value,
-            } => Ok((resp_band, value)),
+                step,
+            } => Ok((resp_band, step)),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "ScanRange".into(),
+                expected: "StepSize".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set the step size for a band (SF write).
+    ///
+    /// Firmware-verified: SF = Step Size. `SF band,step\r` (band 0-1, step 0-11).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_step_size(&mut self, band: Band, step: StepSize) -> Result<(), Error> {
+        tracing::info!(?band, ?step, "setting step size");
+        let response = self.execute(Command::SetStepSize { band, step }).await?;
+        match response {
+            Response::StepSize { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "StepSize".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }

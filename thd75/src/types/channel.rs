@@ -474,7 +474,7 @@ impl TryFrom<u8> for FineStep {
             1 => Ok(Self::Hz100),
             2 => Ok(Self::Hz500),
             3 => Ok(Self::Hz1000),
-            _ => Err(ValidationError::StepSizeOutOfRange(value)),
+            _ => Err(ValidationError::FineStepOutOfRange(value)),
         }
     }
 }

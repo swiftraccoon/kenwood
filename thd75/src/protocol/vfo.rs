@@ -1,12 +1,13 @@
 //! VFO (Variable Frequency Oscillator) commands: AG, SQ, SM, MD, FS, FT, SH, UP, RA.
 //!
 //! These commands control per-band settings including AF (Audio Frequency)
-//! gain, squelch level, S-meter reading, operating mode, frequency step
-//! size, filter width, and attenuator.
+//! gain, squelch level, S-meter reading, operating mode, fine step,
+//! filter width, and attenuator.
 
 use crate::error::ProtocolError;
 use crate::types::Band;
-use crate::types::mode::{Mode, StepSize};
+use crate::types::channel::FineStep;
+use crate::types::mode::Mode;
 use crate::types::radio_params::{
     AfGainLevel, FilterMode, FilterWidthIndex, SMeterReading, SquelchLevel,
 };
@@ -117,18 +118,18 @@ fn parse_md(payload: &str) -> Result<Response, ProtocolError> {
     Ok(Response::Mode { band, mode })
 }
 
-/// Parse FS (frequency step): `"band,step"` format.
+/// Parse FS (fine step): bare `"value"` format (no band).
 ///
-/// D75 RE: `FS x,y` (x: band, y: step index 0-11).
+/// Firmware-verified: bare `FS\r` returns `FS value` (single value, no comma).
+/// Value is a fine step index 0-3.
 fn parse_fs(payload: &str) -> Result<Response, ProtocolError> {
-    let (band, val_str) = split_band_value(payload, "FS")?;
-    let step_val = parse_u8_field(val_str, "FS", "step")?;
-    let step = StepSize::try_from(step_val).map_err(|e| ProtocolError::FieldParse {
+    let step_val = parse_u8_field(payload.trim(), "FS", "step")?;
+    let step = FineStep::try_from(step_val).map_err(|e| ProtocolError::FieldParse {
         command: "FS".to_owned(),
         field: "step".to_owned(),
         detail: e.to_string(),
     })?;
-    Ok(Response::FrequencyStep { band, step })
+    Ok(Response::FineStep { step })
 }
 
 /// Parse FT (function type): bare data (no band).

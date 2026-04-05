@@ -579,8 +579,8 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
         .map_err(|e| classify_error(&format!("PC {band:?}"), &e))?;
 
     let attenuator = radio.get_attenuator(band).await.unwrap_or(false);
-    // FS returns N (not available) in some modes — gracefully default
-    let step_size = radio.get_frequency_step(band).await.ok();
+    // SF returns N (not available) in some modes — gracefully default
+    let step_size = radio.get_step_size(band).await.ok().map(|(_, s)| s);
 
     Ok(BandState {
         frequency: channel.rx_frequency,
@@ -604,10 +604,11 @@ async fn freq_down(
     use kenwood_thd75::types::StepSize;
 
     let ch = radio.get_frequency(band).await?;
-    // FS may return N (not available) in some modes — default to 5 kHz
+    // SF may return N (not available) in some modes — default to 5 kHz
     let step = radio
-        .get_frequency_step(band)
+        .get_step_size(band)
         .await
+        .map(|(_, s)| s)
         .unwrap_or(kenwood_thd75::types::StepSize::Hz5000);
     let step_hz: u32 = match step {
         StepSize::Hz5000 => 5_000,
@@ -631,27 +632,27 @@ async fn freq_down(
 
 fn discover_and_open(port: Option<&str>, baud: u32) -> Result<(String, EitherTransport), String> {
     // Explicit port
-    if let Some(path) = port {
-        if path != "auto" {
-            if SerialTransport::is_bluetooth_port(path) {
-                // Use native IOBluetooth RFCOMM for BT (bypasses broken serial driver)
-                #[cfg(target_os = "macos")]
-                {
-                    let bt = kenwood_thd75::BluetoothTransport::open(None)
-                        .map_err(|e| format!("BT connect failed: {e}"))?;
-                    return Ok((path.to_string(), EitherTransport::Bluetooth(bt)));
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let transport = SerialTransport::open(path, baud)
-                        .map_err(|e| format!("Failed to open {path}: {e}"))?;
-                    return Ok((path.to_string(), EitherTransport::Serial(transport)));
-                }
+    if let Some(path) = port
+        && path != "auto"
+    {
+        if SerialTransport::is_bluetooth_port(path) {
+            // Use native IOBluetooth RFCOMM for BT (bypasses broken serial driver)
+            #[cfg(target_os = "macos")]
+            {
+                let bt = kenwood_thd75::BluetoothTransport::open(None)
+                    .map_err(|e| format!("BT connect failed: {e}"))?;
+                return Ok((path.to_string(), EitherTransport::Bluetooth(bt)));
             }
-            let transport = SerialTransport::open(path, baud)
-                .map_err(|e| format!("Failed to open {path}: {e}"))?;
-            return Ok((path.to_string(), EitherTransport::Serial(transport)));
+            #[cfg(not(target_os = "macos"))]
+            {
+                let transport = SerialTransport::open(path, baud)
+                    .map_err(|e| format!("Failed to open {path}: {e}"))?;
+                return Ok((path.to_string(), EitherTransport::Serial(transport)));
+            }
         }
+        let transport =
+            SerialTransport::open(path, baud).map_err(|e| format!("Failed to open {path}: {e}"))?;
+        return Ok((path.to_string(), EitherTransport::Serial(transport)));
     }
 
     // Auto-discover: try USB first

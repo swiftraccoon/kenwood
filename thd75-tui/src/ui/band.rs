@@ -27,18 +27,18 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect, pane: Pane) {
     let mut lines = band_lines(band);
 
     // Show frequency input prompt when active on this pane
-    if app.focus == pane {
-        if let InputMode::FreqInput(ref buf) = app.input_mode {
-            lines.push(Line::from(vec![
-                Span::styled("  Freq: ", Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    format!("{buf}▎ MHz"),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-        }
+    if app.focus == pane
+        && let InputMode::FreqInput(ref buf) = app.input_mode
+    {
+        lines.push(Line::from(vec![
+            Span::styled("  Freq: ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("{buf}▎ MHz"),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
 
     frame.render_widget(Paragraph::new(lines).block(block), area);

@@ -18,11 +18,11 @@ fn cache_path() -> PathBuf {
 /// block radio operation. The user will see a warning in the log.
 pub fn save_cache(data: &[u8]) {
     let path = cache_path();
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::error!(path = %parent.display(), "failed to create cache dir: {e}");
-            return;
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::error!(path = %parent.display(), "failed to create cache dir: {e}");
+        return;
     }
     if let Err(e) = std::fs::write(&path, data) {
         tracing::error!(path = %path.display(), "failed to write MCP cache: {e}");
@@ -1182,20 +1182,20 @@ impl App {
             }
             KeyCode::Enter if self.focus == Pane::Main && self.main_view == MainView::Channels => {
                 let used = self.filtered_channels();
-                if let Some(&ch_num) = used.get(self.channel_list_index) {
-                    if let Some(ref tx) = self.cmd_tx {
-                        let band_label = if self.target_band == kenwood_thd75::types::Band::B {
-                            "B"
-                        } else {
-                            "A"
-                        };
-                        let _ = tx.send(crate::event::RadioCommand::TuneChannel {
-                            band: self.target_band,
-                            channel: ch_num,
-                        });
-                        self.status_message =
-                            Some(format!("Tuning Band {band_label} to channel {ch_num}..."));
-                    }
+                if let Some(&ch_num) = used.get(self.channel_list_index)
+                    && let Some(ref tx) = self.cmd_tx
+                {
+                    let band_label = if self.target_band == kenwood_thd75::types::Band::B {
+                        "B"
+                    } else {
+                        "A"
+                    };
+                    let _ = tx.send(crate::event::RadioCommand::TuneChannel {
+                        band: self.target_band,
+                        channel: ch_num,
+                    });
+                    self.status_message =
+                        Some(format!("Tuning Band {band_label} to channel {ch_num}..."));
                 }
                 true
             }

@@ -2,13 +2,14 @@
 //!
 //! Provides parsing of responses for scan-related CAT protocol commands.
 //!
-//! Hardware-verified:
+//! Firmware-verified:
 //! - SR has no read form (bare `SR\r` returns `?`). Write-only.
-//! - SF is band-indexed (`SF band\r` returns `SF band,value`).
+//! - SF = Step Size, band-indexed (`SF band\r` returns `SF band,step`).
 //! - BS is band-indexed (`BS band\r` returns `BS band`).
 
 use crate::error::ProtocolError;
 use crate::types::Band;
+use crate::types::mode::StepSize;
 
 use super::Response;
 
@@ -45,16 +46,16 @@ fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> 
 // Individual parsers
 // ---------------------------------------------------------------------------
 
-/// Parse SF (scan function): `band,value`.
+/// Parse SF (step size): `band,step`.
 ///
-/// Hardware-verified: `SF band\r` returns `SF band,value`.
+/// Firmware-verified: SF = Step Size. `SF band\r` returns `SF band,step`.
 fn parse_sf(payload: &str) -> Result<Response, ProtocolError> {
     let parts: Vec<&str> = payload.splitn(2, ',').collect();
     if parts.len() != 2 {
         return Err(ProtocolError::FieldParse {
             command: "SF".to_owned(),
             field: "all".to_owned(),
-            detail: format!("expected band,value, got {payload:?}"),
+            detail: format!("expected band,step, got {payload:?}"),
         });
     }
     let band_val = parse_u8_field(parts[0], "SF", "band")?;
@@ -63,8 +64,13 @@ fn parse_sf(payload: &str) -> Result<Response, ProtocolError> {
         field: "band".to_owned(),
         detail: e.to_string(),
     })?;
-    let value = parse_u8_field(parts[1], "SF", "value")?;
-    Ok(Response::ScanRange { band, value })
+    let step_val = parse_u8_field(parts[1], "SF", "step")?;
+    let step = StepSize::try_from(step_val).map_err(|e| ProtocolError::FieldParse {
+        command: "SF".to_owned(),
+        field: "step".to_owned(),
+        detail: e.to_string(),
+    })?;
+    Ok(Response::StepSize { band, step })
 }
 
 /// Parse BS (band scope): just a band number echoed back.

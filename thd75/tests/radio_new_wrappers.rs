@@ -3,8 +3,8 @@
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;
 use kenwood_thd75::types::{
-    Band, BeaconMode, DetectOutputMode, DstarSlot, DvGatewayMode, FilterMode, TncBaud,
-    VfoMemoryMode,
+    Band, BeaconMode, DetectOutputMode, DstarSlot, DvGatewayMode, FilterMode, FineStep, StepSize,
+    TncBaud, VfoMemoryMode,
 };
 
 // ---- BC: get_band / set_band ----
@@ -112,27 +112,23 @@ async fn set_fm_radio() {
     radio.set_fm_radio(true).await.unwrap();
 }
 
-// ---- FS: get_frequency_step / set_frequency_step ----
+// ---- FS: get_fine_step / set_fine_step ----
 
 #[tokio::test]
-async fn get_frequency_step() {
+async fn get_fine_step() {
     let mut mock = MockTransport::new();
-    mock.expect(b"FS 0\r", b"FS 0,5\r");
+    mock.expect(b"FS\r", b"FS 0\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    let step = radio.get_frequency_step(Band::A).await.unwrap();
-    assert_eq!(u8::from(step), 5);
+    let step = radio.get_fine_step().await.unwrap();
+    assert_eq!(step, FineStep::Hz20);
 }
 
 #[tokio::test]
-async fn set_frequency_step() {
-    use kenwood_thd75::types::StepSize;
+async fn set_fine_step() {
     let mut mock = MockTransport::new();
-    mock.expect(b"FS 0,5\r", b"FS 0,5\r");
+    mock.expect(b"FS 0,2\r", b"FS 2\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    radio
-        .set_frequency_step(Band::A, StepSize::Hz12500)
-        .await
-        .unwrap();
+    radio.set_fine_step(Band::A, FineStep::Hz500).await.unwrap();
 }
 
 // ---- FT: get_function_type ----
@@ -192,16 +188,27 @@ async fn set_io_port() {
     radio.set_io_port(DetectOutputMode::If).await.unwrap();
 }
 
-// ---- SF: get_scan_range (band-indexed) ----
+// ---- SF: get_step_size / set_step_size (band-indexed) ----
 
 #[tokio::test]
-async fn get_scan_range() {
+async fn get_step_size() {
     let mut mock = MockTransport::new();
-    mock.expect(b"SF 0\r", b"SF 0,1\r");
+    mock.expect(b"SF 0\r", b"SF 0,5\r");
     let mut radio = Radio::connect(mock).await.unwrap();
-    let (band, value) = radio.get_scan_range(Band::A).await.unwrap();
+    let (band, step) = radio.get_step_size(Band::A).await.unwrap();
     assert_eq!(band, Band::A);
-    assert_eq!(value, 1);
+    assert_eq!(step, StepSize::Hz12500);
+}
+
+#[tokio::test]
+async fn set_step_size() {
+    let mut mock = MockTransport::new();
+    mock.expect(b"SF 0,5\r", b"SF 0,5\r");
+    let mut radio = Radio::connect(mock).await.unwrap();
+    radio
+        .set_step_size(Band::A, StepSize::Hz12500)
+        .await
+        .unwrap();
 }
 
 // ---- BS: get_band_scope ----
@@ -368,15 +375,26 @@ fn serialize_get_vfo_memory_mode() {
 }
 
 #[test]
-fn serialize_set_frequency_step() {
+fn serialize_set_fine_step() {
     use kenwood_thd75::protocol::{Command, serialize};
-    use kenwood_thd75::types::StepSize;
     assert_eq!(
-        serialize(&Command::SetFrequencyStep {
+        serialize(&Command::SetFineStep {
+            band: Band::A,
+            step: FineStep::Hz500
+        }),
+        b"FS 0,2\r"
+    );
+}
+
+#[test]
+fn serialize_set_step_size() {
+    use kenwood_thd75::protocol::{Command, serialize};
+    assert_eq!(
+        serialize(&Command::SetStepSize {
             band: Band::A,
             step: StepSize::Hz12500
         }),
-        b"FS 0,5\r"
+        b"SF 0,5\r"
     );
 }
 

@@ -1,5 +1,5 @@
 //! Core radio methods: frequency, mode, power, squelch, S-meter, TX/RX, firmware, power status, ID,
-//! band control, VFO/memory mode, FM radio, frequency step, function type, and filter width.
+//! band control, VFO/memory mode, FM radio, fine step, function type, and filter width.
 //!
 //! # FQ vs FO
 //!
@@ -30,8 +30,8 @@ use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
 use crate::types::{
-    Band, ChannelMemory, FilterMode, FilterWidthIndex, Mode, PowerLevel, SMeterReading,
-    SquelchLevel, StepSize, VfoMemoryMode,
+    Band, ChannelMemory, FilterMode, FilterWidthIndex, FineStep, Mode, PowerLevel, SMeterReading,
+    SquelchLevel, VfoMemoryMode,
 };
 
 use super::Radio;
@@ -602,41 +602,45 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get the frequency step size for a band (FS read).
+    /// Get the fine step setting (FS bare read).
     ///
-    /// D75 RE: `FS x,y` (x: band, y: step index 0-11).
+    /// Firmware-verified: FS = Fine Step. Bare `FS\r` returns a single value (0-3).
+    /// No band parameter — the radio returns a global fine step setting.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_frequency_step(&mut self, band: Band) -> Result<StepSize, Error> {
-        tracing::debug!(?band, "reading frequency step");
-        let response = self.execute(Command::GetFrequencyStep { band }).await?;
+    pub async fn get_fine_step(&mut self) -> Result<FineStep, Error> {
+        tracing::debug!("reading fine step");
+        let response = self.execute(Command::GetFineStep).await?;
         match response {
-            Response::FrequencyStep { step, .. } => Ok(step),
+            Response::FineStep { step } => Ok(step),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "FrequencyStep".into(),
+                expected: "FineStep".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
     }
 
-    /// Set the frequency step size for a band (FS write).
+    /// Set the fine step for a band (FS write).
     ///
-    /// D75 RE: `FS x,y` (x: band, y: step index 0-11).
+    /// Firmware-verified: `FS band,step\r` (band 0-1, step 0-3).
+    ///
+    /// # Firmware bug (v1.03)
+    ///
+    /// FS write is broken on firmware 1.03 — the radio returns `N`
+    /// (not available) for all write attempts.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_frequency_step(&mut self, band: Band, step: StepSize) -> Result<(), Error> {
-        tracing::info!(?band, ?step, "setting frequency step");
-        let response = self
-            .execute(Command::SetFrequencyStep { band, step })
-            .await?;
+    pub async fn set_fine_step(&mut self, band: Band, step: FineStep) -> Result<(), Error> {
+        tracing::info!(?band, ?step, "setting fine step");
+        let response = self.execute(Command::SetFineStep { band, step }).await?;
         match response {
-            Response::FrequencyStep { .. } => Ok(()),
+            Response::FineStep { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "FrequencyStep".into(),
+                expected: "FineStep".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }

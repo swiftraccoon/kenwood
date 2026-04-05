@@ -254,8 +254,8 @@ impl<T: Transport> Radio<T> {
     /// # Step size
     ///
     /// The frequency moves by the band's current step size (see
-    /// [`get_frequency_step`](super::Radio::get_frequency_step) /
-    /// [`set_frequency_step`](super::Radio::set_frequency_step)). The step size varies by
+    /// [`get_step_size`](super::Radio::get_step_size) /
+    /// [`set_step_size`](super::Radio::set_step_size)). The step size varies by
     /// band and mode — for example, 25 kHz for FM, 1 kHz for SSB.
     ///
     /// # Wire format

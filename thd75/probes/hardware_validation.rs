@@ -102,8 +102,8 @@ async fn hw_vfo_commands() {
     let _ = probe(&mut radio, Command::GetMode { band: Band::A }).await;
     let _ = probe(&mut radio, Command::GetMode { band: Band::B }).await;
 
-    // FS — Frequency step (band-indexed)
-    let _ = probe(&mut radio, Command::GetFrequencyStep { band: Band::A }).await;
+    // FS — Fine step (bare read)
+    let _ = probe(&mut radio, Command::GetFineStep).await;
 
     // FT — Function type (bare read, no band)
     let _ = probe(&mut radio, Command::GetFunctionType).await;
@@ -305,7 +305,7 @@ async fn hw_scan_commands() {
     println!("\n=== SCAN COMMANDS ===");
 
     // SR is write-only on D75 (bare `SR\r` returns `?`)
-    let _ = probe(&mut radio, Command::GetScanRange { band: Band::A }).await;
+    let _ = probe(&mut radio, Command::GetStepSize { band: Band::A }).await;
     let _ = probe(&mut radio, Command::GetBandScope { band: Band::A }).await;
 
     let _ = radio.disconnect().await;

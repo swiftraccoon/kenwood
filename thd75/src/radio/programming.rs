@@ -520,10 +520,10 @@ impl<T: Transport> Radio<T> {
         let mut flags = Vec::with_capacity(programming::TOTAL_CHANNEL_ENTRIES);
         for i in 0..programming::TOTAL_CHANNEL_ENTRIES {
             let offset = i * programming::FLAG_RECORD_SIZE;
-            if offset + programming::FLAG_RECORD_SIZE <= raw.len() {
-                if let Some(flag) = programming::parse_channel_flag(&raw[offset..]) {
-                    flags.push(flag);
-                }
+            if offset + programming::FLAG_RECORD_SIZE <= raw.len()
+                && let Some(flag) = programming::parse_channel_flag(&raw[offset..])
+            {
+                flags.push(flag);
             }
         }
 

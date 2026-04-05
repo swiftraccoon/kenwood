@@ -124,7 +124,7 @@ impl EchoLinkNode {
 
     /// Returns `true` if the node number is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }

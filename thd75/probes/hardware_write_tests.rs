@@ -495,8 +495,8 @@ async fn investigate_scan_commands() {
     println!("\n=== INVESTIGATE: SCAN COMMANDS ===");
 
     // Try SF with band parameter
-    println!("  Trying SF 0 (scan range band A)...");
-    let result = radio.execute(Command::GetScanRange { band: Band::A }).await;
+    println!("  Trying SF 0 (step size band A)...");
+    let result = radio.execute(Command::GetStepSize { band: Band::A }).await;
     match &result {
         Ok(resp) => println!("  SF 0 OK: {resp:?}"),
         Err(e) => println!("  SF 0 fails: {e}"),

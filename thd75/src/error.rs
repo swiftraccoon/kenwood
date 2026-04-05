@@ -237,6 +237,13 @@ pub enum ValidationError {
         u8,
     ),
 
+    /// The fine step index is outside the valid range 0-3.
+    #[error("fine step {0} out of range (must be 0-3)")]
+    FineStepOutOfRange(
+        /// The invalid fine step.
+        u8,
+    ),
+
     /// The data speed is outside the valid range 0-1.
     #[error("data speed {0} out of range (must be 0-1)")]
     DataSpeedOutOfRange(

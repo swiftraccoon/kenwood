@@ -32,9 +32,9 @@ use crate::error::ProtocolError;
 #[allow(unused_imports)]
 use crate::types::{
     AfGainLevel, Band, BeaconMode, CallsignSlot, ChannelMemory, DetectOutputMode, DstarSlot,
-    DvGatewayMode, FilterMode, FilterWidthIndex, GpsRadioMode, KeyLockType, Mode, PowerLevel,
-    SMeterReading, ScanResumeMethod, SquelchLevel, StepSize, TncBaud, TncMode, ToneCode,
-    VfoMemoryMode, VoxDelay, VoxGain,
+    DvGatewayMode, FilterMode, FilterWidthIndex, FineStep, GpsRadioMode, KeyLockType, Mode,
+    PowerLevel, SMeterReading, ScanResumeMethod, SquelchLevel, StepSize, TncBaud, TncMode,
+    ToneCode, VfoMemoryMode, VoxDelay, VoxGain,
 };
 
 /// A CAT command to send to the radio.
@@ -279,28 +279,24 @@ pub enum Command {
         /// Operating mode to set.
         mode: Mode,
     },
-    /// Get frequency step for a band (FS read).
+    /// Get fine step (FS bare read).
     ///
-    /// D75 RE: `FS x,y` (x: band, y: step index 0-11).
-    /// Sends `FS band\r`.
+    /// Firmware-verified: FS = Fine Step. Bare `FS\r` returns `FS value`
+    /// (single value, no band). Band-indexed reads are not supported.
+    GetFineStep,
+    /// Set fine step for a band (FS write).
     ///
-    /// # Mode requirement
-    /// Hardware-verified: returns `N` (not available) when the radio is in
-    /// Memory mode. The radio must be in VFO mode on the target band for
-    /// FS to return data.
-    GetFrequencyStep {
+    /// Firmware-verified: `FS band,step\r` (band 0-1, step 0-3).
+    ///
+    /// # Firmware bug (v1.03)
+    ///
+    /// FS write is broken on firmware 1.03 — the radio returns `N`
+    /// (not available) for all write attempts.
+    SetFineStep {
         /// Target band.
         band: Band,
-    },
-    /// Set frequency step for a band (FS write).
-    ///
-    /// D75 RE: `FS x,y` (x: band, y: step index 0-11).
-    /// Sends `FS band,step\r`.
-    SetFrequencyStep {
-        /// Target band.
-        band: Band,
-        /// Step size to set.
-        step: StepSize,
+        /// Fine step to set (0-3).
+        step: FineStep,
     },
     /// Get function type (FT bare read, no band parameter).
     ///
@@ -652,13 +648,22 @@ pub enum Command {
         /// Scan resume method.
         mode: ScanResumeMethod,
     },
-    /// Get scan function setting for a band (SF read, band-indexed).
+    /// Get step size for a band (SF read, band-indexed).
     ///
-    /// Hardware-verified: `SF band\r` returns `SF band,value`.
+    /// Firmware-verified: SF = Step Size. `SF band\r` returns `SF band,step`.
     /// Both `SF 0` and `SF 1` confirmed working.
-    GetScanRange {
+    GetStepSize {
         /// Target band.
         band: Band,
+    },
+    /// Set step size for a band (SF write).
+    ///
+    /// Firmware-verified: `SF band,step\r` (band 0-1, step index 0-11).
+    SetStepSize {
+        /// Target band.
+        band: Band,
+        /// Step size to set (0-11).
+        step: StepSize,
     },
     /// Get band scope data (BS read).
     GetBandScope {
@@ -1200,14 +1205,12 @@ pub enum Response {
         /// Current operating mode.
         mode: Mode,
     },
-    /// Frequency step response (FS).
+    /// Fine step response (FS).
     ///
-    /// D75 RE: `FS x,y` (x: band, y: step index 0-11).
-    FrequencyStep {
-        /// Band the step is for.
-        band: Band,
-        /// Current step size.
-        step: StepSize,
+    /// Firmware-verified: bare `FS\r` returns `FS value` (single value, no band).
+    FineStep {
+        /// Current fine step setting.
+        step: FineStep,
     },
     /// Function type response (FT).
     FunctionType {
@@ -1361,14 +1364,15 @@ pub enum Response {
     },
 
     // === Scan ===
-    /// Scan range response (SF).
+    /// Step size response (SF).
     ///
-    /// Format: `band,value` where band is 0/1 and value is the scan function setting.
-    ScanRange {
-        /// Band the setting is for.
+    /// Firmware-verified: SF = Step Size. Format: `band,step` where band is 0/1
+    /// and step is the step size index (0-11).
+    StepSize {
+        /// Band the step is for.
         band: Band,
-        /// Scan function value.
-        value: u8,
+        /// Current step size.
+        step: StepSize,
     },
     /// Band scope data response (BS).
     ///
@@ -1605,7 +1609,7 @@ pub const fn command_name(cmd: &Command) -> &'static str {
         Command::GetSquelch { .. } | Command::SetSquelch { .. } => "SQ",
         Command::GetSmeter { .. } | Command::SetSmeter { .. } => "SM",
         Command::GetMode { .. } | Command::SetMode { .. } => "MD",
-        Command::GetFrequencyStep { .. } | Command::SetFrequencyStep { .. } => "FS",
+        Command::GetFineStep | Command::SetFineStep { .. } => "FS",
         Command::GetFunctionType | Command::SetFunctionType { .. } => "FT",
         Command::GetFilterWidth { .. } | Command::SetFilterWidth { .. } => "SH",
         Command::FrequencyUp { .. } => "UP",
@@ -1629,7 +1633,7 @@ pub const fn command_name(cmd: &Command) -> &'static str {
         Command::GetDstarCallsign { .. } | Command::SetDstarCallsign { .. } => "DC",
         Command::GetRealTimeClock => "RT",
         Command::SetScanResume { .. } => "SR",
-        Command::GetScanRange { .. } => "SF",
+        Command::GetStepSize { .. } | Command::SetStepSize { .. } => "SF",
         Command::GetBandScope { .. } | Command::SetBandScope { .. } => "BS",
         Command::GetTncBaud | Command::SetTncBaud { .. } => "AS",
         Command::GetSerialInfo => "AE",
@@ -1751,8 +1755,8 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         Command::SetMode { band, mode } => {
             format!("MD {},{}", u8::from(*band), u8::from(*mode))
         }
-        Command::GetFrequencyStep { band } => format!("FS {}", u8::from(*band)),
-        Command::SetFrequencyStep { band, step } => {
+        Command::GetFineStep => "FS".to_owned(),
+        Command::SetFineStep { band, step } => {
             format!("FS {},{}", u8::from(*band), u8::from(*step))
         }
         Command::GetFunctionType => "FT".to_owned(),
@@ -1839,7 +1843,10 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
 
         // Scan
         Command::SetScanResume { mode } => format!("SR {}", mode.to_raw()),
-        Command::GetScanRange { band } => format!("SF {}", u8::from(*band)),
+        Command::GetStepSize { band } => format!("SF {}", u8::from(*band)),
+        Command::SetStepSize { band, step } => {
+            format!("SF {},{}", u8::from(*band), u8::from(*step))
+        }
         Command::GetBandScope { band } => format!("BS {}", u8::from(*band)),
         Command::SetBandScope { band, value } => {
             format!("BS {},{}", u8::from(*band), value)

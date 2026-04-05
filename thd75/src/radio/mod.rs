@@ -353,10 +353,10 @@ impl<T: Transport> Radio<T> {
             self.update_cached_mode(*band, *mode);
         }
         // Also track mode when we send a SetVfoMemoryMode command and it succeeds.
-        if let Command::SetVfoMemoryMode { band, mode } = cmd {
-            if response.is_ok() {
-                self.update_cached_mode(*band, *mode);
-            }
+        if let Command::SetVfoMemoryMode { band, mode } = cmd
+            && response.is_ok()
+        {
+            self.update_cached_mode(*band, *mode);
         }
     }
 

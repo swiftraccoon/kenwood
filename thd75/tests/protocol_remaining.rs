@@ -21,7 +21,7 @@ fn serialize_scan_resume_write() {
 #[test]
 fn serialize_sf_read_band_a() {
     assert_eq!(
-        protocol::serialize(&Command::GetScanRange { band: Band::A }),
+        protocol::serialize(&Command::GetStepSize { band: Band::A }),
         b"SF 0\r"
     );
 }
@@ -29,7 +29,7 @@ fn serialize_sf_read_band_a() {
 #[test]
 fn serialize_sf_read_band_b() {
     assert_eq!(
-        protocol::serialize(&Command::GetScanRange { band: Band::B }),
+        protocol::serialize(&Command::GetStepSize { band: Band::B }),
         b"SF 1\r"
     );
 }
@@ -37,22 +37,22 @@ fn serialize_sf_read_band_b() {
 #[test]
 fn parse_sf_response() {
     match protocol::parse(b"SF 0,0").unwrap() {
-        Response::ScanRange { band, value } => {
+        Response::StepSize { band, step } => {
             assert_eq!(band, Band::A);
-            assert_eq!(value, 0);
+            assert_eq!(step, StepSize::Hz5000);
         }
-        other => panic!("expected ScanRange, got {other:?}"),
+        other => panic!("expected StepSize, got {other:?}"),
     }
 }
 
 #[test]
 fn parse_sf_response_band_b() {
-    match protocol::parse(b"SF 1,0").unwrap() {
-        Response::ScanRange { band, value } => {
+    match protocol::parse(b"SF 1,5").unwrap() {
+        Response::StepSize { band, step } => {
             assert_eq!(band, Band::B);
-            assert_eq!(value, 0);
+            assert_eq!(step, StepSize::Hz12500);
         }
-        other => panic!("expected ScanRange, got {other:?}"),
+        other => panic!("expected StepSize, got {other:?}"),
     }
 }
 

@@ -206,44 +206,31 @@ fn parse_md_lsb() {
 }
 
 // ============================================================================
-// FS -- Frequency step (band-indexed)
+// FS -- Fine step (bare read, no band parameter)
 // ============================================================================
 
 #[test]
-fn serialize_fs_read_band_a() {
-    assert_eq!(
-        protocol::serialize(&Command::GetFrequencyStep { band: Band::A }),
-        b"FS 0\r"
-    );
-}
-
-#[test]
-fn serialize_fs_read_band_b() {
-    assert_eq!(
-        protocol::serialize(&Command::GetFrequencyStep { band: Band::B }),
-        b"FS 1\r"
-    );
+fn serialize_fs_bare_read() {
+    assert_eq!(protocol::serialize(&Command::GetFineStep), b"FS\r");
 }
 
 #[test]
 fn parse_fs_response() {
-    match protocol::parse(b"FS 0,5").unwrap() {
-        Response::FrequencyStep { band, step } => {
-            assert_eq!(band, Band::A);
-            assert_eq!(step, StepSize::Hz12500);
+    match protocol::parse(b"FS 0").unwrap() {
+        Response::FineStep { step } => {
+            assert_eq!(step, FineStep::Hz20);
         }
-        other => panic!("expected FrequencyStep, got {other:?}"),
+        other => panic!("expected FineStep, got {other:?}"),
     }
 }
 
 #[test]
-fn parse_fs_band_b() {
-    match protocol::parse(b"FS 1,0").unwrap() {
-        Response::FrequencyStep { band, step } => {
-            assert_eq!(band, Band::B);
-            assert_eq!(step, StepSize::Hz5000);
+fn parse_fs_value_3() {
+    match protocol::parse(b"FS 3").unwrap() {
+        Response::FineStep { step } => {
+            assert_eq!(step, FineStep::Hz1000);
         }
-        other => panic!("expected FrequencyStep, got {other:?}"),
+        other => panic!("expected FineStep, got {other:?}"),
     }
 }
 

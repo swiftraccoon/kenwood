@@ -34,7 +34,7 @@ fn our_mnemonics() -> Vec<&'static str> {
         command_name(&Command::GetSquelch { band: Band::A }),   // SQ
         command_name(&Command::GetSmeter { band: Band::A }),    // SM
         command_name(&Command::GetMode { band: Band::A }),      // MD
-        command_name(&Command::GetFrequencyStep { band: Band::A }), // FS
+        command_name(&Command::GetFineStep),                    // FS
         command_name(&Command::GetFunctionType),                // FT
         command_name(&Command::GetFilterWidth {
             mode: FilterMode::Ssb,
@@ -64,7 +64,7 @@ fn our_mnemonics() -> Vec<&'static str> {
         command_name(&Command::SetScanResume {
             mode: ScanResumeMethod::TimeOperated,
         }), // SR
-        command_name(&Command::GetScanRange { band: Band::A }), // SF
+        command_name(&Command::GetStepSize { band: Band::A }),  // SF
         command_name(&Command::GetBandScope { band: Band::A }), // BS
         command_name(&Command::GetTncBaud),                     // AS
         command_name(&Command::GetSerialInfo),                  // AE
@@ -101,11 +101,10 @@ fn all_spec_mnemonics_implemented() {
         }
     }
 
-    // FS/SF mnemonic conflict: KI4LAX PDF uses SF="Step Size" and
-    // FS="Fine Step". Our code (hardware-verified) uses FS="Frequency Step"
-    // and SF="Scan Range". The PDF's SF maps to our FS; the PDF's FS maps
-    // to our FT (Fine Tune). This is a DOCUMENTED discrepancy, not a bug.
-    let documented_conflicts: &[&str] = &["FS"];
+    // FS/SF mnemonic discrepancy resolved via firmware RE:
+    // SF = Step Size (band-indexed, 0-11), FS = Fine Step (bare read, 0-3).
+    // Our code now matches the firmware dispatch table exactly.
+    let documented_conflicts: &[&str] = &[];
     let real_missing: Vec<&String> = missing
         .iter()
         .filter(|m| !documented_conflicts.contains(&m.as_str()))
@@ -381,28 +380,18 @@ fn me_has_23_fields_per_spec() {
 }
 
 // ============================================================================
-// SF/FS mnemonic discrepancy documentation
+// SF/FS mnemonic assignment — firmware-verified
 // ============================================================================
 
 #[test]
-fn sf_fs_mnemonic_discrepancy_documented() {
-    // KI4LAX PDF: SF = "Step Size" (band,step), FS = "Fine Step"
-    // Our code:   FS = "Frequency Step" (band,step), SF = "Scan Range"
-    //
-    // The PDF's "SF A,B" (Step Size) matches our "FS A,B" (Frequency Step)
-    // in format and semantics — both take a band and step index.
-    //
-    // This test documents the conflict so it's not forgotten.
+fn sf_fs_mnemonic_firmware_verified() {
+    // Firmware dispatch table proves:
+    // - SF = Step Size (band-indexed, step index 0-11)
+    // - FS = Fine Step (bare read only, value 0-3)
 
-    // Our FS command takes band + step (matches PDF's SF semantics)
-    assert_eq!(
-        command_name(&Command::GetFrequencyStep { band: Band::A }),
-        "FS"
-    );
+    // FS = Fine Step (bare read, no band parameter)
+    assert_eq!(command_name(&Command::GetFineStep), "FS");
 
-    // Our SF command is scan range (NOT in PDF as SF)
-    assert_eq!(command_name(&Command::GetScanRange { band: Band::A }), "SF");
-
-    // The PDF's FS ("Fine Step") maps to our FT ("Fine Tune/Function Type")
-    // in terms of functionality, though the wire format differs.
+    // SF = Step Size (band-indexed)
+    assert_eq!(command_name(&Command::GetStepSize { band: Band::A }), "SF");
 }
