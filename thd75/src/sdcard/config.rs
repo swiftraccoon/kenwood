@@ -354,6 +354,46 @@ pub fn make_channel(number: u16, name: &str, flash: FlashChannel) -> ChannelEntr
     }
 }
 
+/// Write a `.d75` configuration file from a raw memory image and header.
+///
+/// The `.d75` file format is: 256-byte header + raw MCP memory image.
+/// This produces files identical to those exported by Menu No. 800
+/// or the MCP-D75 application.
+///
+/// # Errors
+///
+/// Returns [`SdCardError::InvalidModelString`] if the header model string
+/// is not recognised. Returns [`SdCardError::FileTooSmall`] if the image
+/// is smaller than the minimum expected size for channel parsing.
+pub fn write_d75(
+    image: &crate::memory::MemoryImage,
+    header: &ConfigHeader,
+) -> Result<Vec<u8>, SdCardError> {
+    // Validate the header model string.
+    if !KNOWN_MODELS.contains(&header.model.as_str()) {
+        return Err(SdCardError::InvalidModelString {
+            found: header.model.clone(),
+        });
+    }
+
+    let raw = image.as_raw();
+
+    // Validate that the image is at least large enough for channel data
+    // (this ensures round-trip parse_config will succeed).
+    let min_body = CHANNEL_NAME_OFFSET - HEADER_SIZE + (MAX_CHANNELS * CHANNEL_NAME_SIZE);
+    if raw.len() < min_body {
+        return Err(SdCardError::FileTooSmall {
+            expected: min_body,
+            actual: raw.len(),
+        });
+    }
+
+    let mut out = Vec::with_capacity(HEADER_SIZE + raw.len());
+    out.extend_from_slice(&header.raw);
+    out.extend_from_slice(raw);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +450,69 @@ mod tests {
     fn make_channel_zero_freq_unused() {
         let ch = make_channel(0, "empty", FlashChannel::default());
         assert!(!ch.used);
+    }
+
+    #[test]
+    fn write_d75_round_trip() {
+        use crate::memory::MemoryImage;
+        use crate::protocol::programming;
+
+        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42]).unwrap();
+        let raw = vec![0u8; programming::TOTAL_SIZE];
+        let image = MemoryImage::from_raw(raw).unwrap();
+
+        // Write the .d75 file.
+        let d75_bytes = write_d75(&image, &header).unwrap();
+
+        // The output should be header + image.
+        assert_eq!(d75_bytes.len(), HEADER_SIZE + programming::TOTAL_SIZE);
+        assert_eq!(&d75_bytes[..HEADER_SIZE], &header.raw);
+        assert_eq!(&d75_bytes[HEADER_SIZE..], image.as_raw());
+
+        // Round-trip: parse it back and verify.
+        let parsed = parse_config(&d75_bytes).unwrap();
+        assert_eq!(parsed.header.model, "Data For TH-D75A");
+        assert_eq!(parsed.header.version_bytes, [0x95, 0xC4, 0x8F, 0x42]);
+        assert_eq!(parsed.raw_image.len(), d75_bytes.len() - HEADER_SIZE);
+    }
+
+    #[test]
+    fn write_d75_invalid_model_rejected() {
+        use crate::memory::MemoryImage;
+        use crate::protocol::programming;
+
+        let mut raw_header = [0u8; HEADER_SIZE];
+        raw_header[..17].copy_from_slice(b"Data For TH-D74A\0");
+        let header = ConfigHeader {
+            model: "Data For TH-D74A".to_owned(),
+            version_bytes: [0; 4],
+            raw: raw_header,
+        };
+        let raw = vec![0u8; programming::TOTAL_SIZE];
+        let image = MemoryImage::from_raw(raw).unwrap();
+
+        let err = write_d75(&image, &header).unwrap_err();
+        assert!(matches!(err, SdCardError::InvalidModelString { .. }));
+    }
+
+    #[test]
+    fn write_d75_preserves_channel_data() {
+        use crate::memory::MemoryImage;
+        use crate::protocol::programming;
+
+        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42]).unwrap();
+
+        // Build a raw image with some nonzero data in the channel region.
+        let mut raw = vec![0u8; programming::TOTAL_SIZE];
+        // Put a marker byte at offset 0x4000 (channel data section in the body).
+        if raw.len() > 0x4000 {
+            raw[0x4000] = 0xAB;
+        }
+        let image = MemoryImage::from_raw(raw).unwrap();
+
+        let d75_bytes = write_d75(&image, &header).unwrap();
+
+        // The marker should be at file offset HEADER_SIZE + 0x4000.
+        assert_eq!(d75_bytes[HEADER_SIZE + 0x4000], 0xAB);
     }
 }

@@ -65,7 +65,7 @@ const DEFAULT_TX_LEVEL: u8 = 128;
 /// returned on [`exit`](Self::exit).
 pub struct MmdvmSession<T: Transport> {
     /// The underlying transport (serial or Bluetooth).
-    transport: T,
+    pub(crate) transport: T,
     /// Codec retained from the Radio for later restoration.
     codec: Codec,
     /// Broadcast channel retained from the Radio for later restoration.

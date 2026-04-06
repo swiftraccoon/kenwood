@@ -94,6 +94,30 @@ pub(crate) enum RadioCommand {
         /// The desired power level.
         level: kenwood_thd75::types::PowerLevel,
     },
+    /// Enter APRS/KISS mode. The radio task enters KISS mode and starts
+    /// processing APRS packets instead of CAT polling.
+    EnterAprs {
+        /// APRS client configuration (callsign, SSID, etc.).
+        config: kenwood_thd75::AprsClientConfig,
+    },
+    /// Exit APRS/KISS mode. Returns to CAT polling.
+    ExitAprs,
+    /// Send an APRS message to a station while in APRS mode.
+    SendAprsMessage {
+        /// Destination callsign.
+        addressee: String,
+        /// Message text.
+        text: String,
+    },
+    /// Transmit a manual position beacon while in APRS mode.
+    BeaconPosition {
+        /// Latitude in decimal degrees.
+        lat: f64,
+        /// Longitude in decimal degrees.
+        lon: f64,
+        /// Beacon comment text.
+        comment: String,
+    },
 }
 
 /// Merges terminal key events with messages from background tasks.

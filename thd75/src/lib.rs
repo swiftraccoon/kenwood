@@ -84,10 +84,22 @@ pub use memory::{MemoryError, MemoryImage};
 
 // KISS / AX.25 / APRS re-exports.
 pub use kiss::{
-    AprsData, AprsError, AprsItem, AprsMessage, AprsObject, AprsPosition, AprsStatus, AprsWeather,
-    Ax25Address, Ax25Error, Ax25Packet, KissError, KissFrame, build_aprs_message,
-    build_aprs_object, build_aprs_position_report,
+    AprsData, AprsDataExtension, AprsError, AprsItem, AprsMessage, AprsObject, AprsPosition,
+    AprsQuery, AprsStatus, AprsTelemetry, AprsWeather, Ax25Address, Ax25Error, Ax25Packet,
+    KissError, KissFrame, Phg, build_aprs_item, build_aprs_message, build_aprs_mice,
+    build_aprs_object, build_aprs_position_compressed, build_aprs_position_report,
+    build_aprs_status, build_aprs_weather, build_query_response_position, parse_aprs_extensions,
 };
+
+// APRS feature re-exports.
+pub use kiss::aprs_client::{AprsClient, AprsClientConfig, AprsEvent};
+pub use kiss::aprs_is::{
+    AprsIsConfig, aprs_is_passcode, build_login_string, format_is_packet, parse_is_line,
+};
+pub use kiss::aprs_messaging::AprsMessenger;
+pub use kiss::digipeater::{DigiAction, DigipeaterConfig};
+pub use kiss::smart_beaconing::{SmartBeaconing, SmartBeaconingConfig};
+pub use kiss::station_list::{StationEntry, StationList};
 
 // KISS session re-export.
 pub use radio::kiss_session::KissSession;
@@ -96,10 +108,15 @@ pub use radio::kiss_session::KissSession;
 pub use radio::mmdvm_session::MmdvmSession;
 
 // MMDVM codec re-exports.
+pub use mmdvm::hosts::{self as dstar_hosts, HostEntry};
+pub use mmdvm::reflector::{self as dstar_reflector, AMBE_SILENCE, DSTAR_SYNC_BYTES};
+pub use mmdvm::reflector::{dcs, dextra, dplus};
 pub use mmdvm::{
-    DStarHeader, MmdvmConfig, MmdvmError, MmdvmFrame, MmdvmResponse, ModemMode, ModemState,
-    ModemStatus, NakReason, SlowDataDecoder,
+    DStarEvent, DStarGateway, DStarGatewayConfig, DStarHeader, DStarVoiceFrame, LastHeardEntry,
+    MmdvmConfig, MmdvmError, MmdvmFrame, MmdvmResponse, ModemMode, ModemState, ModemStatus,
+    NakReason, SlowDataDecoder, SlowDataEncoder,
 };
 
 // SD card re-exports.
 pub use sdcard::SdCardError;
+pub use sdcard::config::{ConfigHeader, write_d75};

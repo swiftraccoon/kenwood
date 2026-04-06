@@ -310,6 +310,23 @@ impl MemoryImage {
         out
     }
 
+    /// Export this image as a `.d75` file ready to write to the SD card.
+    ///
+    /// Uses a default TH-D75A header with the standard version bytes.
+    /// For a specific model or custom header, use [`to_d75_file`](Self::to_d75_file).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the built-in model string is rejected, which should never
+    /// happen since the model is a known constant.
+    #[must_use]
+    pub fn to_d75_bytes(&self) -> Vec<u8> {
+        // Use a standard D75A header. make_header is infallible for known models.
+        let header =
+            d75::make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42]).expect("known model");
+        self.to_d75_file(&header)
+    }
+
     /// Read a byte range from the image.
     ///
     /// Returns `None` if the range is out of bounds.
@@ -334,5 +351,50 @@ impl MemoryImage {
         }
         self.raw[offset..end].copy_from_slice(data);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::programming;
+
+    #[test]
+    fn to_d75_bytes_round_trip() {
+        let raw = vec![0u8; programming::TOTAL_SIZE];
+        let image = MemoryImage::from_raw(raw.clone()).unwrap();
+        let d75_bytes = image.to_d75_bytes();
+
+        // Should be header + raw image.
+        assert_eq!(d75_bytes.len(), d75::HEADER_SIZE + programming::TOTAL_SIZE);
+
+        // The body portion should match the original raw data.
+        assert_eq!(&d75_bytes[d75::HEADER_SIZE..], &raw[..]);
+
+        // The header should be parseable and identify as D75A.
+        let reparsed = MemoryImage::from_d75_file(&d75_bytes).unwrap();
+        assert_eq!(reparsed.as_raw(), &raw[..]);
+    }
+
+    #[test]
+    fn to_d75_file_with_custom_header() {
+        let raw = vec![0u8; programming::TOTAL_SIZE];
+        let image = MemoryImage::from_raw(raw).unwrap();
+        let header = d75::make_header("Data For TH-D75E", [0x01, 0x02, 0x03, 0x04]).unwrap();
+        let d75_bytes = image.to_d75_file(&header);
+
+        // Verify header model.
+        let reparsed_config = d75::parse_config(&d75_bytes).unwrap();
+        assert_eq!(reparsed_config.header.model, "Data For TH-D75E");
+        assert_eq!(
+            reparsed_config.header.version_bytes,
+            [0x01, 0x02, 0x03, 0x04]
+        );
+    }
+
+    #[test]
+    fn from_raw_wrong_size() {
+        let err = MemoryImage::from_raw(vec![0u8; 100]).unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidSize { .. }));
     }
 }

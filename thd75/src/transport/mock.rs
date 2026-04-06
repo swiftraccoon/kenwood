@@ -12,6 +12,7 @@ use super::Transport;
 pub struct MockTransport {
     exchanges: VecDeque<(Vec<u8>, Vec<u8>)>,
     pending_response: Option<Vec<u8>>,
+    accept_any_write: bool,
 }
 
 impl MockTransport {
@@ -21,6 +22,7 @@ impl MockTransport {
         Self {
             exchanges: VecDeque::new(),
             pending_response: None,
+            accept_any_write: false,
         }
     }
 
@@ -61,6 +63,23 @@ impl MockTransport {
         Ok(mock)
     }
 
+    /// Queue data to be returned by the next `read()` without requiring
+    /// a preceding `write()`.
+    ///
+    /// This is useful for testing unsolicited incoming data (e.g., MMDVM
+    /// frames received from the radio without a prior command).
+    pub fn queue_read(&mut self, data: &[u8]) {
+        self.pending_response = Some(data.to_vec());
+    }
+
+    /// Accept any subsequent `write()` calls without validation.
+    ///
+    /// When enabled, writes succeed without checking against expected
+    /// exchanges and no response is queued.
+    pub const fn expect_any_write(&mut self) {
+        self.accept_any_write = true;
+    }
+
     /// Panic if any expected exchanges remain unconsumed.
     ///
     /// # Panics
@@ -84,6 +103,12 @@ impl Default for MockTransport {
 impl Transport for MockTransport {
     async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
         tracing::debug!(bytes = data.len(), "mock: write");
+
+        if self.accept_any_write && self.exchanges.is_empty() {
+            tracing::debug!("mock: accepting any write (no response queued)");
+            return Ok(());
+        }
+
         let (expected_cmd, response) = self.exchanges.pop_front().ok_or_else(|| {
             TransportError::Write(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

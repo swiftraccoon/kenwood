@@ -27,6 +27,9 @@
 
 pub mod dstar;
 pub mod frame;
+pub mod gateway;
+pub mod hosts;
+pub mod reflector;
 pub mod slow_data;
 
 // Re-export key types for convenience.
@@ -35,4 +38,6 @@ pub use frame::{
     MmdvmConfig, MmdvmError, MmdvmFrame, MmdvmResponse, ModemMode, ModemState, ModemStatus,
     NakReason,
 };
-pub use slow_data::SlowDataDecoder;
+pub use gateway::{DStarEvent, DStarGateway, DStarGatewayConfig, DStarVoiceFrame, LastHeardEntry};
+pub use hosts::{HostEntry, parse_host_file};
+pub use slow_data::{SlowDataDecoder, SlowDataEncoder};

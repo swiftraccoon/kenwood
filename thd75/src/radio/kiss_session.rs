@@ -66,7 +66,7 @@ const KISS_RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// | Return | `0xFF` | — | — |
 pub struct KissSession<T: Transport> {
     /// The underlying transport (serial or Bluetooth).
-    transport: T,
+    pub(crate) transport: T,
     /// Codec retained from the Radio for later restoration.
     codec: Codec,
     /// Broadcast channel retained from the Radio for later restoration.
@@ -142,6 +142,23 @@ impl<T: Transport> KissSession<T> {
     /// Defaults to 10 seconds. Set higher for quiet channels.
     pub const fn set_receive_timeout(&mut self, duration: Duration) {
         self.receive_timeout = duration;
+    }
+
+    /// Write pre-encoded KISS wire bytes directly to the transport.
+    ///
+    /// Use this when you already have a fully KISS-encoded frame (e.g.,
+    /// from [`build_aprs_message`](crate::kiss::build_aprs_message) or
+    /// [`AprsMessenger::next_frame_to_send`](crate::kiss::aprs_messaging::AprsMessenger::next_frame_to_send)).
+    /// Unlike [`send_frame`](Self::send_frame) and
+    /// [`send_data`](Self::send_data), this does **not** perform any
+    /// additional encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Transport`] if the write fails.
+    pub async fn send_wire(&mut self, wire: &[u8]) -> Result<(), Error> {
+        tracing::debug!(wire_len = wire.len(), "KISS TX (raw wire)");
+        self.transport.write(wire).await.map_err(Error::Transport)
     }
 
     /// Send a KISS frame to the TNC.

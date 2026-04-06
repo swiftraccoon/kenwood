@@ -54,6 +54,13 @@
 //! - APRS spec: <http://www.aprs.org/doc/APRS101.PDF>
 //! - TH-D75 User Manual, Chapter 15: Built-In KISS TNC
 
+pub mod aprs_client;
+pub mod aprs_is;
+pub mod aprs_messaging;
+pub mod digipeater;
+pub mod smart_beaconing;
+pub mod station_list;
+
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -851,6 +858,10 @@ pub enum AprsData {
     Item(AprsItem),
     /// Weather report (temperature, wind, rain, pressure, humidity).
     Weather(AprsWeather),
+    /// Telemetry report (analog values and digital status).
+    Telemetry(AprsTelemetry),
+    /// Query (position, status, message, or direction finding).
+    Query(AprsQuery),
 }
 
 /// An APRS message (data type `:`) addressed to a specific station.
@@ -945,6 +956,59 @@ pub struct AprsWeather {
     pub pressure: Option<u32>,
 }
 
+/// Parsed APRS telemetry report.
+///
+/// Format: `T#seq,val1,val2,val3,val4,val5,dddddddd`
+/// where vals are 0-999 analog values and d's are binary digits (8 bits).
+///
+/// Per APRS101.PDF Chapter 13, telemetry is used to transmit analog and
+/// digital sensor readings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AprsTelemetry {
+    /// Telemetry sequence number (0-999 or "MIC").
+    pub sequence: String,
+    /// Analog values (up to 5).
+    pub analog: Vec<u16>,
+    /// Digital value (8 bits).
+    pub digital: u8,
+}
+
+/// Parsed APRS query.
+///
+/// Per APRS101.PDF Chapter 15, queries start with `?` and allow stations
+/// to request information from other stations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AprsQuery {
+    /// Position query (`?APRSP` or `?APRS?`).
+    Position,
+    /// Status query (`?APRSS`).
+    Status,
+    /// Message query for a specific callsign (`?APRSM`).
+    Message,
+    /// Direction finding query (`?APRSD`).
+    DirectionFinding,
+    /// General query with raw text.
+    Other(String),
+}
+
+/// Build a position query response as a KISS-encoded APRS position report.
+///
+/// When a station receives a `?APRSP` or `?APRS?` query, it should respond
+/// with its current position. This builds that response as a KISS frame
+/// ready for transmission.
+#[must_use]
+pub fn build_query_response_position(
+    source: &Ax25Address,
+    lat: f64,
+    lon: f64,
+    symbol_table: char,
+    symbol_code: char,
+    comment: &str,
+) -> Vec<u8> {
+    // A query response is just a normal position report.
+    build_aprs_position_report(source, lat, lon, symbol_table, symbol_code, comment)
+}
+
 /// Parse any APRS data frame from an AX.25 information field.
 ///
 /// Dispatches based on the data type identifier (first byte) to the
@@ -988,6 +1052,10 @@ pub fn parse_aprs_data(info: &[u8]) -> Result<AprsData, AprsError> {
         b')' => parse_aprs_item(info).map(AprsData::Item),
         // Positionless weather
         b'_' => parse_aprs_weather_positionless(info).map(AprsData::Weather),
+        // Telemetry
+        b'T' => parse_aprs_telemetry(info).map(AprsData::Telemetry),
+        // Query
+        b'?' => parse_aprs_query(info).map(AprsData::Query),
         // Mic-E (` ' 0x1C 0x1D) needs destination address — use parse_mice_position().
         b'`' | b'\'' | 0x1C | 0x1D => Err(AprsError::MicERequiresDestination),
         // All other types are unrecognized.
@@ -1251,6 +1319,77 @@ fn extract_weather_u32(s: &str, tag: char, width: usize) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// APRS Telemetry parser
+// ---------------------------------------------------------------------------
+
+/// Parse an APRS telemetry report (`T#seq,v1,v2,v3,v4,v5,dddddddd`).
+fn parse_aprs_telemetry(info: &[u8]) -> Result<AprsTelemetry, AprsError> {
+    // Minimum: T#seq,v (at least 5 bytes)
+    if info.len() < 4 || info[0] != b'T' || info[1] != b'#' {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    let body = String::from_utf8_lossy(&info[2..]);
+    let parts: Vec<&str> = body.split(',').collect();
+    if parts.is_empty() {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    let sequence = parts[0].to_owned();
+
+    // Parse analog values (up to 5 fields after sequence).
+    let mut analog = Vec::new();
+    let analog_end = std::cmp::min(parts.len(), 6); // indices 1..=5
+    for part in &parts[1..analog_end] {
+        let val: u16 = part.trim().parse().map_err(|_| AprsError::InvalidFormat)?;
+        analog.push(val);
+    }
+
+    // Parse digital value (8 binary digits) if present.
+    let digital = if parts.len() > 6 {
+        let digi_str = parts[6].trim();
+        // May have trailing CR or other data after the 8 binary digits.
+        let digi_bits = if digi_str.len() >= 8 {
+            &digi_str[..8]
+        } else {
+            digi_str
+        };
+        u8::from_str_radix(digi_bits, 2).unwrap_or(0)
+    } else {
+        0
+    };
+
+    Ok(AprsTelemetry {
+        sequence,
+        analog,
+        digital,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// APRS Query parser
+// ---------------------------------------------------------------------------
+
+/// Parse an APRS query (`?APRSx` or `?text`).
+fn parse_aprs_query(info: &[u8]) -> Result<AprsQuery, AprsError> {
+    if info.is_empty() || info[0] != b'?' {
+        return Err(AprsError::InvalidFormat);
+    }
+
+    let body = String::from_utf8_lossy(&info[1..]);
+    let text = body.trim_end_matches('\r');
+
+    // Standard APRS queries per APRS101.PDF Chapter 15.
+    match text {
+        "APRSP" | "APRS?" => Ok(AprsQuery::Position),
+        "APRSS" => Ok(AprsQuery::Status),
+        "APRSM" => Ok(AprsQuery::Message),
+        "APRSD" => Ok(AprsQuery::DirectionFinding),
+        _ => Ok(AprsQuery::Other(text.to_owned())),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // APRS TX packet builders
 // ---------------------------------------------------------------------------
 
@@ -1451,6 +1590,671 @@ pub fn build_aprs_object(
         control: 0x03,
         protocol: 0xF0,
         info: info.into_bytes(),
+    };
+
+    let ax25_bytes = build_ax25(&packet);
+    encode_kiss_frame(&KissFrame {
+        port: 0,
+        command: CMD_DATA,
+        data: ax25_bytes,
+    })
+}
+
+/// Build a KISS-encoded APRS item report.
+///
+/// Composes an AX.25 UI frame with the APRS item format:
+/// `)name!DDMM.HHN/DDDMM.HHEscomment` (live) or
+/// `)name_DDMM.HHN/DDDMM.HHEscomment` (killed).
+///
+/// The item name must be 3-9 characters per APRS101 Chapter 11.
+///
+/// Returns wire-ready bytes (FEND-delimited KISS frame).
+///
+/// # Parameters
+///
+/// - `source`: The sender's callsign and SSID.
+/// - `name`: Item name (3-9 characters).
+/// - `live`: `true` for a live item (`!`), `false` for killed (`_`).
+/// - `lat`: Decimal degrees, positive = North.
+/// - `lon`: Decimal degrees, positive = East.
+/// - `symbol_table`: APRS symbol table character.
+/// - `symbol_code`: APRS symbol code character.
+/// - `comment`: Free-form comment text.
+#[must_use]
+pub fn build_aprs_item(
+    source: &Ax25Address,
+    name: &str,
+    live: bool,
+    lat: f64,
+    lon: f64,
+    symbol_table: char,
+    symbol_code: char,
+    comment: &str,
+) -> Vec<u8> {
+    let live_char = if live { '!' } else { '_' };
+    let lat_str = format_aprs_latitude(lat);
+    let lon_str = format_aprs_longitude(lon);
+
+    let info = format!("){name}{live_char}{lat_str}{symbol_table}{lon_str}{symbol_code}{comment}");
+
+    let packet = Ax25Packet {
+        source: source.clone(),
+        destination: Ax25Address {
+            callsign: APRS_TOCALL.to_owned(),
+            ssid: 0,
+        },
+        digipeaters: default_digipeater_path(),
+        control: 0x03,
+        protocol: 0xF0,
+        info: info.into_bytes(),
+    };
+
+    let ax25_bytes = build_ax25(&packet);
+    encode_kiss_frame(&KissFrame {
+        port: 0,
+        command: CMD_DATA,
+        data: ax25_bytes,
+    })
+}
+
+/// Build a KISS-encoded positionless APRS weather report.
+///
+/// Composes an AX.25 UI frame with the APRS positionless weather format:
+/// `_MMDDHHMMcSSSsSSS gSSS tTTT rRRR pRRR PRRR hHH bBBBBB`
+///
+/// Uses a placeholder timestamp (`00000000`). Callers needing a real
+/// timestamp should build the info field manually.
+///
+/// Returns wire-ready bytes (FEND-delimited KISS frame).
+///
+/// # Parameters
+///
+/// - `source`: The sender's callsign and SSID.
+/// - `weather`: Weather data to encode. Missing fields are omitted.
+#[must_use]
+pub fn build_aprs_weather(source: &Ax25Address, weather: &AprsWeather) -> Vec<u8> {
+    use std::fmt::Write as _;
+
+    let mut info = String::from("_00000000");
+
+    // Wind direction (3 digits) and speed (3 digits) are always paired.
+    if let Some(dir) = weather.wind_direction {
+        let _ = write!(info, "c{dir:03}");
+    }
+    if let Some(spd) = weather.wind_speed {
+        let _ = write!(info, "s{spd:03}");
+    }
+    if let Some(gust) = weather.wind_gust {
+        let _ = write!(info, "g{gust:03}");
+    }
+    if let Some(temp) = weather.temperature {
+        let _ = write!(info, "t{temp:03}");
+    }
+    if let Some(rain) = weather.rain_1h {
+        let _ = write!(info, "r{rain:03}");
+    }
+    if let Some(rain) = weather.rain_24h {
+        let _ = write!(info, "p{rain:03}");
+    }
+    if let Some(rain) = weather.rain_since_midnight {
+        let _ = write!(info, "P{rain:03}");
+    }
+    if let Some(hum) = weather.humidity {
+        let hum_val = if hum == 100 { 0 } else { hum };
+        let _ = write!(info, "h{hum_val:02}");
+    }
+    if let Some(pres) = weather.pressure {
+        let _ = write!(info, "b{pres:05}");
+    }
+
+    let packet = Ax25Packet {
+        source: source.clone(),
+        destination: Ax25Address {
+            callsign: APRS_TOCALL.to_owned(),
+            ssid: 0,
+        },
+        digipeaters: default_digipeater_path(),
+        control: 0x03,
+        protocol: 0xF0,
+        info: info.into_bytes(),
+    };
+
+    let ax25_bytes = build_ax25(&packet);
+    encode_kiss_frame(&KissFrame {
+        port: 0,
+        command: CMD_DATA,
+        data: ax25_bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// APRS compressed position TX builder
+// ---------------------------------------------------------------------------
+
+/// Encode a `u32` value as 4 bytes of base-91.
+///
+/// Base-91 encoding uses characters 33 (`!`) through 123 (`{`), giving
+/// 91 possible values per byte. Four bytes can represent values up to
+/// 91^4 - 1 = 68,574,960.
+fn encode_base91_4(mut value: u32) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for i in (0..4).rev() {
+        #[allow(clippy::cast_possible_truncation)]
+        let digit = (value % 91) as u8;
+        out[i] = digit + 33;
+        value /= 91;
+    }
+    out
+}
+
+/// Build a KISS-encoded APRS compressed position report.
+///
+/// Compressed format uses base-91 encoding for latitude and longitude,
+/// producing smaller packets than the uncompressed `DDMM.HH` format.
+/// Encoding follows APRS101 Chapter 9.
+///
+/// The compressed body is 13 bytes:
+/// `sym_table(1) YYYY(4) XXXX(4) sym_code(1) cs(1) s(1) t(1)`
+///
+/// Where `cs`, `s`, and `t` are set to indicate no course/speed/altitude
+/// data (space characters).
+///
+/// Returns wire-ready bytes (FEND-delimited KISS frame).
+///
+/// # Parameters
+///
+/// - `source`: The sender's callsign and SSID.
+/// - `latitude`: Decimal degrees, positive = North, negative = South.
+/// - `longitude`: Decimal degrees, positive = East, negative = West.
+/// - `symbol_table`: APRS symbol table character (`/` for primary, `\\` for alternate).
+/// - `symbol_code`: APRS symbol code character (e.g., `>` for car, `-` for house).
+/// - `comment`: Free-form comment text appended after the compressed position.
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+pub fn build_aprs_position_compressed(
+    source: &Ax25Address,
+    latitude: f64,
+    longitude: f64,
+    symbol_table: char,
+    symbol_code: char,
+    comment: &str,
+) -> Vec<u8> {
+    // APRS101 Chapter 9: compressed position encoding.
+    // lat = 380926 * (90 - latitude)
+    // lon = 190463 * (longitude + 180)
+    let lat_val = (380_926.0 * (90.0 - latitude)) as u32;
+    let lon_val = (190_463.0 * (longitude + 180.0)) as u32;
+
+    let lat_encoded = encode_base91_4(lat_val);
+    let lon_encoded = encode_base91_4(lon_val);
+
+    // Build the info field: '!' (position, no timestamp) + 13-byte body + comment.
+    // The parser distinguishes compressed vs uncompressed by checking if the
+    // first body byte is a digit (uncompressed) or a symbol table char (compressed).
+    let mut info = Vec::with_capacity(1 + 13 + comment.len());
+    info.push(b'!'); // Data type indicator: position without timestamp.
+    info.push(symbol_table as u8);
+    info.extend_from_slice(&lat_encoded);
+    info.extend_from_slice(&lon_encoded);
+    info.push(symbol_code as u8);
+    info.push(b' '); // cs: no course/speed data
+    info.push(b' '); // s: no course/speed data
+    info.push(b' '); // t: compression type = no data (0x20)
+    info.extend_from_slice(comment.as_bytes());
+
+    let packet = Ax25Packet {
+        source: source.clone(),
+        destination: Ax25Address {
+            callsign: APRS_TOCALL.to_owned(),
+            ssid: 0,
+        },
+        digipeaters: default_digipeater_path(),
+        control: 0x03,
+        protocol: 0xF0,
+        info,
+    };
+
+    let ax25_bytes = build_ax25(&packet);
+    encode_kiss_frame(&KissFrame {
+        port: 0,
+        command: CMD_DATA,
+        data: ax25_bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// APRS status TX builder
+// ---------------------------------------------------------------------------
+
+/// Build a KISS-encoded APRS status report.
+///
+/// Composes an AX.25 UI frame with the APRS status format:
+/// `>text\r`
+///
+/// Returns wire-ready bytes (FEND-delimited KISS frame).
+///
+/// # Parameters
+///
+/// - `source`: The sender's callsign and SSID.
+/// - `text`: Status text content.
+#[must_use]
+pub fn build_aprs_status(source: &Ax25Address, text: &str) -> Vec<u8> {
+    let mut info = Vec::with_capacity(1 + text.len() + 1);
+    info.push(b'>');
+    info.extend_from_slice(text.as_bytes());
+    info.push(b'\r');
+
+    let packet = Ax25Packet {
+        source: source.clone(),
+        destination: Ax25Address {
+            callsign: APRS_TOCALL.to_owned(),
+            ssid: 0,
+        },
+        digipeaters: default_digipeater_path(),
+        control: 0x03,
+        protocol: 0xF0,
+        info,
+    };
+
+    let ax25_bytes = build_ax25(&packet);
+    encode_kiss_frame(&KissFrame {
+        port: 0,
+        command: CMD_DATA,
+        data: ax25_bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// APRS data extensions parser (APRS101 Chapters 6-7)
+// ---------------------------------------------------------------------------
+
+/// Parsed APRS data extensions from the position comment field.
+///
+/// Position reports can carry structured data in the comment string
+/// after the coordinates. This struct captures the extensions defined
+/// in APRS101 Chapters 6-7.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AprsDataExtension {
+    /// Course in degrees (0-360) and speed in knots, from CSE/SPD.
+    pub course_speed: Option<(u16, u16)>,
+    /// Power, Height, Gain, Directivity (PHG).
+    pub phg: Option<Phg>,
+    /// Altitude in feet (from `/A=NNNNNN` in comment).
+    pub altitude_ft: Option<i32>,
+    /// DAO precision extension (`!DAO!` for extra lat/lon digits).
+    pub dao: Option<(f64, f64)>,
+}
+
+/// Power-Height-Gain-Directivity data (APRS101 Chapter 7).
+///
+/// PHG provides station RF characteristics for range circle calculations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Phg {
+    /// Effective radiated power in watts.
+    pub power_watts: u32,
+    /// Antenna height above average terrain in feet.
+    pub height_feet: u32,
+    /// Antenna gain in dB.
+    pub gain_db: u8,
+    /// Antenna directivity in degrees (0 = omni).
+    pub directivity_deg: u16,
+}
+
+/// Parse data extensions from an APRS position comment string.
+///
+/// Extracts CSE/SPD, PHG, altitude (`/A=NNNNNN`), and DAO (`!DAO!`)
+/// extensions per APRS101 Chapters 6-7.
+///
+/// # Parameters
+///
+/// - `comment`: The comment string after the APRS position fields.
+///
+/// # Returns
+///
+/// An [`AprsDataExtension`] with each field populated if found.
+#[must_use]
+pub fn parse_aprs_extensions(comment: &str) -> AprsDataExtension {
+    let course_speed = parse_cse_spd(comment);
+    let phg = parse_phg(comment);
+    let altitude_ft = parse_altitude(comment);
+    let dao = parse_dao(comment);
+
+    AprsDataExtension {
+        course_speed,
+        phg,
+        altitude_ft,
+        dao,
+    }
+}
+
+/// Parse CSE/SPD from the first 7 characters of the comment.
+///
+/// Format: `DDD/SSS` where DDD is 3-digit course (000-360) and SSS is
+/// 3-digit speed in knots. Per APRS101 Chapter 7, this must be at the
+/// start of the comment and use the exact `NNN/NNN` format.
+fn parse_cse_spd(comment: &str) -> Option<(u16, u16)> {
+    let bytes = comment.as_bytes();
+    if bytes.len() < 7 {
+        return None;
+    }
+    // Must be DDD/SSS at position 0.
+    if bytes[3] != b'/' {
+        return None;
+    }
+    // All digits check.
+    if !bytes[0..3].iter().all(u8::is_ascii_digit) || !bytes[4..7].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let course: u16 = comment[0..3].parse().ok()?;
+    let speed: u16 = comment[4..7].parse().ok()?;
+    if course > 360 {
+        return None;
+    }
+    Some((course, speed))
+}
+
+/// PHG power codes: index^2 watts. Per APRS101 Table on p.28.
+const PHG_POWER: [u32; 10] = [0, 1, 4, 9, 16, 25, 36, 49, 64, 81];
+/// PHG height codes: 10 * 2^N feet.
+const PHG_HEIGHT: [u32; 10] = [10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5120];
+/// PHG directivity codes: 0=omni, then 20, 40, ..., 320 degrees.
+const PHG_DIR: [u16; 10] = [0, 20, 40, 60, 80, 100, 120, 140, 160, 180];
+
+/// Parse a PHG extension from the comment string.
+///
+/// Format: `PHGNhgd` anywhere in the comment, where each of N, h, g, d
+/// is a single ASCII digit (0-9).
+fn parse_phg(comment: &str) -> Option<Phg> {
+    let idx = comment.find("PHG")?;
+    let rest = &comment[idx + 3..];
+    if rest.len() < 4 {
+        return None;
+    }
+    let chars: Vec<u8> = rest[..4].bytes().collect();
+    if !chars.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let p = (chars[0] - b'0') as usize;
+    let h = (chars[1] - b'0') as usize;
+    let g = chars[2] - b'0';
+    let d = (chars[3] - b'0') as usize;
+
+    Some(Phg {
+        power_watts: PHG_POWER.get(p).copied().unwrap_or(0),
+        height_feet: PHG_HEIGHT.get(h).copied().unwrap_or(10),
+        gain_db: g,
+        directivity_deg: PHG_DIR.get(d).copied().unwrap_or(0),
+    })
+}
+
+/// Parse altitude extension from the comment string.
+///
+/// Format: `/A=NNNNNN` anywhere in the comment (6-digit altitude in feet,
+/// can be negative with a leading minus sign in the 6-digit field).
+fn parse_altitude(comment: &str) -> Option<i32> {
+    let idx = comment.find("/A=")?;
+    let rest = &comment[idx + 3..];
+    if rest.len() < 6 {
+        return None;
+    }
+    let val_str = &rest[..6];
+    val_str.parse::<i32>().ok()
+}
+
+/// Parse a DAO extension from the comment string.
+///
+/// Format: `!DAO!` where D and O are extra precision digits for latitude
+/// and longitude respectively. The middle character indicates the encoding:
+/// - Uppercase letter (W): human-readable. D and O are ASCII digits (0-9)
+///   representing hundredths of a minute increment (divide by 60 for degrees).
+/// - Lowercase letter (w): base-91 encoded. D and O are base-91 characters
+///   giving finer precision.
+///
+/// Returns `(lat_correction, lon_correction)` in decimal degrees.
+fn parse_dao(comment: &str) -> Option<(f64, f64)> {
+    // Find `!` followed by 3 chars and another `!`.
+    let bytes = comment.as_bytes();
+    for i in 0..bytes.len().saturating_sub(4) {
+        if bytes[i] == b'!' && bytes[i + 4] == b'!' {
+            let d = bytes[i + 1];
+            let a = bytes[i + 2];
+            let o = bytes[i + 3];
+
+            if a.is_ascii_uppercase() {
+                // Human-readable: D and O are ASCII digits.
+                if d.is_ascii_digit() && o.is_ascii_digit() {
+                    let lat_extra = f64::from(d - b'0') / 600.0;
+                    let lon_extra = f64::from(o - b'0') / 600.0;
+                    return Some((lat_extra, lon_extra));
+                }
+            } else if a.is_ascii_lowercase() {
+                // Base-91: D and O are base-91 chars (33-123).
+                if (33..=123).contains(&d) && (33..=123).contains(&o) {
+                    let lat_extra = f64::from(d - 33) / (91.0 * 60.0);
+                    let lon_extra = f64::from(o - 33) / (91.0 * 60.0);
+                    return Some((lat_extra, lon_extra));
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Mic-E TX builder (APRS101 Chapter 10)
+// ---------------------------------------------------------------------------
+
+/// Build a Mic-E encoded APRS position report for KISS transmission.
+///
+/// Mic-E is the most compact position format and the native format
+/// used by Kenwood HTs including the TH-D75. The latitude is encoded
+/// in the AX.25 destination address, and longitude + speed/course
+/// are in the info field.
+///
+/// Encoding per APRS101 Chapter 10:
+/// - Destination address: 6 chars encoding latitude digits + N/S + lon offset + W/E flags
+/// - Info field: type byte (`0x60` for current Mic-E) + 3 lon bytes + 3 speed/course bytes
+///   + symbol code + symbol table + comment
+///
+/// Returns wire-ready bytes (FEND-delimited KISS frame).
+///
+/// # Parameters
+///
+/// - `source`: The sender's callsign and SSID.
+/// - `latitude`: Decimal degrees, positive = North, negative = South.
+/// - `longitude`: Decimal degrees, positive = East, negative = West.
+/// - `speed_knots`: Speed in knots (0-799).
+/// - `course_deg`: Course in degrees (0-360; 0 = unknown).
+/// - `symbol_table`: APRS symbol table character (`/` for primary, `\\` for alternate).
+/// - `symbol_code`: APRS symbol code character (e.g., `>` for car).
+/// - `comment`: Free-form comment text.
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::similar_names
+)]
+pub fn build_aprs_mice(
+    source: &Ax25Address,
+    latitude: f64,
+    longitude: f64,
+    speed_knots: u16,
+    course_deg: u16,
+    symbol_table: char,
+    symbol_code: char,
+    comment: &str,
+) -> Vec<u8> {
+    let north = latitude >= 0.0;
+    let west = longitude < 0.0;
+    let lat_abs = latitude.abs();
+    let lon_abs = longitude.abs();
+
+    // Decompose latitude into digits: DD MM.HH
+    let lat_deg = lat_abs as u32;
+    let lat_min_f = (lat_abs - f64::from(lat_deg)) * 60.0;
+    let lat_min = lat_min_f as u32;
+    let lat_hundredths = ((lat_min_f - f64::from(lat_min)) * 100.0).round() as u32;
+
+    let d0 = (lat_deg / 10) as u8;
+    let d1 = (lat_deg % 10) as u8;
+    let d2 = (lat_min / 10) as u8;
+    let d3 = (lat_min % 10) as u8;
+    let d4 = (lat_hundredths / 10) as u8;
+    let d5 = (lat_hundredths % 10) as u8;
+
+    // Encode destination address characters.
+    // Chars 0-2: use "custom" (P-Y range) for standard Mic-E message type
+    //   (all custom = message type 111 = "M0: Off Duty" standard encoding).
+    // Char 3: custom if North.
+    // Char 4: custom if lon_offset >= 100.
+    // Char 5: custom if West.
+    let lon_offset = lon_abs >= 100.0;
+
+    let dest_chars: [u8; 6] = [
+        b'P' + d0, // custom (P-Y) for msg bit
+        b'P' + d1, // custom
+        b'P' + d2, // custom
+        if north { b'P' + d3 } else { b'0' + d3 },
+        if lon_offset { b'P' + d4 } else { b'0' + d4 },
+        if west { b'P' + d5 } else { b'0' + d5 },
+    ];
+    let dest_callsign =
+        String::from_utf8(dest_chars.to_vec()).unwrap_or_else(|_| "PPPPPP".to_owned());
+
+    // Longitude encoding.
+    let lon_deg_raw = lon_abs as u16;
+    // Apply encoding adjustments per APRS101 Chapter 10.
+    let d = if lon_offset {
+        // Degrees 100-109: add 100+80 = d+80, then parser subtracts 80.
+        // Degrees 110-179: add 100, then parser subtracts 100...
+        // Actually per spec: if degrees 0-9 → d+100+80=d+180, degrees 10-99 → d+100+0=d+100
+        // No wait — re-reading the decode:
+        //   d = info[1] - 28
+        //   lon_deg = d + lon_offset (lon_offset is 100 if char4 custom)
+        //   if lon_deg 180..=189 → lon_deg -= 80  (i.e., effective 100-109)
+        //   if lon_deg 190..=199 → lon_deg -= 190 (i.e., effective 0-9)
+        //
+        // So to encode degrees D with lon_offset=100:
+        //   If D is 0-9: we need d+100 in 190..=199 → d = D + 190 - 100 = D + 90
+        //   If D is 10-99: we need d+100 in 180..=189... that only works for 80-89.
+        //     Actually for D=10-99: d+100 should just equal D+100 (no adjustment range).
+        //     The 180-189 range means d+100=180..189 → d=80..89 → actual deg = d+100-80 = d+20.
+        //     Hmm, that means: for D in 100-109 → we need final=D, so d+100=D → d=D-100=0-9.
+        //       But d+100=100-109, not in 180-189 or 190-199. That's just passed through. Wait:
+        //       if lon_deg (= d + lon_offset = d + 100) is NOT in 180-199, it stays as-is.
+        //       So d + 100 = D → d = D - 100. For D=100: d=0. For D=109: d=9.
+        //       d + 28 = 28-37. But spec says bytes must be >= 28. d=0 → byte=28. OK.
+        //
+        // Actually wait. For degrees 0-9 with lon_offset, we need:
+        //   d + 100 to produce the right degree after adjustments.
+        //   190..=199 → subtract 190. So d + 100 = D + 190 → d = D + 90.
+        //   For D=0: d=90, byte=90+28=118. For D=9: d=99, byte=127.
+        //
+        // For degrees 10-99 with lon_offset:
+        //   180..=189 → subtract 80. d + 100 = D + 80 → d = D - 20.
+        //   For D=10: d=-10. Negative! That can't be right.
+        //   Actually 180-189 range only covers 10 values. For degrees 10-99 (90 values)
+        //   we can't use that range. So the pass-through must handle it:
+        //   d + 100 = D → d = D - 100. But D is 10-99, so d = -90 to -1. Negative!
+        //
+        // I think I'm overcomplicating. Let me re-read the spec more carefully from the decoder.
+        // The decoder is:
+        //   d = info[1] - 28           (range 0..99)
+        //   lon_deg = d + lon_offset   (lon_offset = 0 or 100)
+        //   if lon_deg in 180..=189: lon_deg -= 80   → effective 100..109
+        //   if lon_deg in 190..=199: lon_deg -= 190  → effective 0..9
+        //
+        // So the ENCODER for degree D:
+        //   If D >= 100 and D <= 109: need lon_deg=180..189 before adj, so d+100=D+80 → d=D-20
+        //     D=100: d=80. D=109: d=89. byte=80+28=108 to 89+28=117. All valid.
+        //   If D >= 110 and D <= 179: need lon_deg=D (no adj applies), so d+100=D → d=D-100
+        //     D=110: d=10. D=179: d=79. byte=38 to 107. All valid.
+        //   If D >= 0 and D <= 9 (with offset): need lon_deg=190..199 before adj, d+100=D+190 → d=D+90
+        //     D=0: d=90. D=9: d=99. byte=118 to 127. Valid (< 128).
+        //   If D >= 10 and D <= 99 (with offset): impossible with lon_offset=100. But this means
+        //     lon_offset should be false for degrees 10-99. Char4 should NOT be custom.
+        //
+        // Wait, that makes sense! lon_offset=true means degrees >= 100 or degrees 0-9 with special encoding.
+        // Actually no, lon_offset is just "longitude >= 100" flag. For degrees 0-9, lon_offset=false.
+        //
+        // So the cases are (lon_offset = degrees >= 100):
+        //   D=0..9, lon_offset=false: d = D, byte = D+28. Need no adjustment (d+0=D, not in 180-199).
+        //     But wait, what about D=0..9 without offset? d=0..9, lon_deg=0..9, no adj. Correct.
+        //     BUT: for minutes, the decoder does: lon_min = if m >= 60 { m - 60 } else { m }.
+        //     That means for encoding, if minutes < 10 we add 60 to handle the "ambiguity".
+        //     Actually let's look at the spec table more carefully...
+        //
+        // You know what, let me just follow the standard encoding rules directly:
+        //
+        // For degrees (d byte = info[1]):
+        //   No offset (0-99°): d = degrees, byte = d + 28
+        //   With offset (100-179°):
+        //     100-109: d = degrees - 100 + 80 = degrees - 20, byte = d + 28
+        //     110-179: d = degrees - 100, byte = d + 28
+        //
+        // For minutes (m byte = info[2]):
+        //   If minutes < 10: m = minutes + 60, byte = m + 28
+        //   If minutes >= 10: m = minutes, byte = m + 28
+        //
+        // For hundredths (h byte = info[3]):
+        //   h = hundredths, byte = h + 28
+        if lon_deg_raw >= 110 {
+            (lon_deg_raw - 100) as u8
+        } else {
+            // 100-109: d = deg - 20
+            (lon_deg_raw - 20) as u8
+        }
+    } else {
+        // No offset (0-99 degrees).
+        lon_deg_raw as u8
+    };
+
+    let lon_min_f = (lon_abs - f64::from(lon_abs as u32)) * 60.0;
+    let lon_min_int = lon_min_f as u8;
+    let lon_hundredths = ((lon_min_f - f64::from(lon_min_int)) * 100.0).round() as u8;
+
+    // Minutes encoding: if < 10, add 60.
+    let m = if lon_min_int < 10 {
+        lon_min_int + 60
+    } else {
+        lon_min_int
+    };
+
+    // Speed/course encoding per APRS101.
+    // SP = speed / 10, remainder from DC.
+    // DC = (speed % 10) * 10 + course / 100
+    // SE = course % 100
+    let sp = (speed_knots / 10) as u8;
+    let dc = ((speed_knots % 10) * 10 + course_deg / 100) as u8;
+    let se = (course_deg % 100) as u8;
+
+    // Build info field.
+    let mut info = Vec::with_capacity(9 + comment.len());
+    info.push(0x60); // Current Mic-E data type.
+    info.push(d + 28);
+    info.push(m + 28);
+    info.push(lon_hundredths + 28);
+    info.push(sp + 28);
+    info.push(dc + 28);
+    info.push(se + 28);
+    info.push(symbol_code as u8);
+    info.push(symbol_table as u8);
+    info.extend_from_slice(comment.as_bytes());
+
+    let packet = Ax25Packet {
+        source: source.clone(),
+        destination: Ax25Address {
+            callsign: dest_callsign,
+            ssid: 0,
+        },
+        digipeaters: default_digipeater_path(),
+        control: 0x03,
+        protocol: 0xF0,
+        info,
     };
 
     let ax25_bytes = build_ax25(&packet);
@@ -2511,5 +3315,626 @@ mod tests {
         let obj = parse_aprs_object(&packet.info).unwrap();
         assert_eq!(obj.name, "EVENT");
         assert!(!obj.live);
+    }
+
+    // ---- APRS item TX builder tests ----
+
+    #[test]
+    fn build_item_live_roundtrip() {
+        let source = test_source();
+        let wire = build_aprs_item(
+            &source,
+            "MARKER",
+            true,
+            49.058_333,
+            -72.029_166,
+            '/',
+            '-',
+            "Test item",
+        );
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        assert_eq!(packet.destination.callsign, "APK005");
+
+        let item = parse_aprs_item(&packet.info).unwrap();
+        assert_eq!(item.name, "MARKER");
+        assert!(item.live);
+        assert!((item.position.latitude - 49.058_333).abs() < 0.01);
+        assert!((item.position.longitude - (-72.029_166)).abs() < 0.01);
+        assert_eq!(item.position.symbol_table, '/');
+        assert_eq!(item.position.symbol_code, '-');
+        assert!(item.position.comment.contains("Test item"));
+    }
+
+    #[test]
+    fn build_item_killed() {
+        let source = test_source();
+        let wire = build_aprs_item(&source, "GONE", false, 35.0, -97.0, '/', 'E', "Removed");
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        let item = parse_aprs_item(&packet.info).unwrap();
+        assert_eq!(item.name, "GONE");
+        assert!(!item.live);
+    }
+
+    // ---- APRS weather TX builder tests ----
+
+    #[test]
+    fn build_weather_full_roundtrip() {
+        let source = test_source();
+        let wx = AprsWeather {
+            wind_direction: Some(180),
+            wind_speed: Some(10),
+            wind_gust: Some(25),
+            temperature: Some(72),
+            rain_1h: Some(5),
+            rain_24h: Some(50),
+            rain_since_midnight: Some(100),
+            humidity: Some(55),
+            pressure: Some(10132),
+        };
+
+        let wire = build_aprs_weather(&source, &wx);
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        assert_eq!(packet.destination.callsign, "APK005");
+
+        // Parse it back.
+        let parsed = parse_aprs_weather_positionless(&packet.info).unwrap();
+        assert_eq!(parsed.wind_direction, Some(180));
+        assert_eq!(parsed.wind_speed, Some(10));
+        assert_eq!(parsed.wind_gust, Some(25));
+        assert_eq!(parsed.temperature, Some(72));
+        assert_eq!(parsed.rain_1h, Some(5));
+        assert_eq!(parsed.rain_24h, Some(50));
+        assert_eq!(parsed.rain_since_midnight, Some(100));
+        assert_eq!(parsed.humidity, Some(55));
+        assert_eq!(parsed.pressure, Some(10132));
+    }
+
+    #[test]
+    fn build_weather_partial_fields() {
+        let source = test_source();
+        let wx = AprsWeather {
+            wind_direction: None,
+            wind_speed: None,
+            wind_gust: None,
+            temperature: Some(32),
+            rain_1h: None,
+            rain_24h: None,
+            rain_since_midnight: None,
+            humidity: None,
+            pressure: Some(10200),
+        };
+
+        let wire = build_aprs_weather(&source, &wx);
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+
+        let parsed = parse_aprs_weather_positionless(&packet.info).unwrap();
+        assert_eq!(parsed.temperature, Some(32));
+        assert_eq!(parsed.pressure, Some(10200));
+        assert_eq!(parsed.wind_direction, None);
+        assert_eq!(parsed.humidity, None);
+    }
+
+    #[test]
+    fn build_weather_humidity_100_encodes_as_00() {
+        let source = test_source();
+        let wx = AprsWeather {
+            wind_direction: None,
+            wind_speed: None,
+            wind_gust: None,
+            temperature: None,
+            rain_1h: None,
+            rain_24h: None,
+            rain_since_midnight: None,
+            humidity: Some(100),
+            pressure: None,
+        };
+
+        let wire = build_aprs_weather(&source, &wx);
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+
+        let parsed = parse_aprs_weather_positionless(&packet.info).unwrap();
+        // APRS encodes humidity 100% as "h00", parser converts back to 100.
+        assert_eq!(parsed.humidity, Some(100));
+    }
+
+    // ---- Compressed position builder tests ----
+
+    #[test]
+    fn build_compressed_position_round_trip() {
+        let source = test_source();
+        let wire = build_aprs_position_compressed(&source, 35.3, -84.233, '/', '>', "test");
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        assert_eq!(packet.destination.callsign, "APK005");
+        assert_eq!(packet.control, 0x03);
+        assert_eq!(packet.protocol, 0xF0);
+
+        // Parse it back through the existing compressed parser.
+        let data = parse_aprs_data(&packet.info).unwrap();
+        if let AprsData::Position(pos) = data {
+            // Compressed encoding has some rounding; check within tolerance.
+            assert!((pos.latitude - 35.3).abs() < 0.01, "lat: {}", pos.latitude);
+            assert!(
+                (pos.longitude - (-84.233)).abs() < 0.01,
+                "lon: {}",
+                pos.longitude
+            );
+            assert_eq!(pos.symbol_table, '/');
+            assert_eq!(pos.symbol_code, '>');
+            assert!(pos.comment.contains("test"));
+        } else {
+            panic!("expected Position, got {data:?}");
+        }
+    }
+
+    #[test]
+    fn build_compressed_position_equator_prime_meridian() {
+        let source = test_source();
+        let wire = build_aprs_position_compressed(&source, 0.0, 0.0, '/', '-', "");
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+
+        let data = parse_aprs_data(&packet.info).unwrap();
+        if let AprsData::Position(pos) = data {
+            assert!(pos.latitude.abs() < 0.01, "lat: {}", pos.latitude);
+            assert!(pos.longitude.abs() < 0.01, "lon: {}", pos.longitude);
+        } else {
+            panic!("expected Position, got {data:?}");
+        }
+    }
+
+    #[test]
+    fn build_compressed_position_southern_hemisphere() {
+        let source = test_source();
+        let wire = build_aprs_position_compressed(&source, -33.86, 151.21, '/', '>', "sydney");
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+
+        let data = parse_aprs_data(&packet.info).unwrap();
+        if let AprsData::Position(pos) = data {
+            assert!(
+                (pos.latitude - (-33.86)).abs() < 0.01,
+                "lat: {}",
+                pos.latitude
+            );
+            assert!(
+                (pos.longitude - 151.21).abs() < 0.01,
+                "lon: {}",
+                pos.longitude
+            );
+        } else {
+            panic!("expected Position, got {data:?}");
+        }
+    }
+
+    #[test]
+    fn base91_encoding_known_value() {
+        // APRS101 example: 90 degrees latitude encodes as "!!!!".
+        let encoded = encode_base91_4(0);
+        assert_eq!(encoded, [b'!', b'!', b'!', b'!']);
+    }
+
+    // ---- Status builder tests ----
+
+    #[test]
+    fn build_status_round_trip() {
+        let source = test_source();
+        let wire = build_aprs_status(&source, "On the air in FM18");
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        assert_eq!(packet.destination.callsign, "APK005");
+
+        let data = parse_aprs_data(&packet.info).unwrap();
+        if let AprsData::Status(status) = data {
+            assert_eq!(status.text, "On the air in FM18");
+        } else {
+            panic!("expected Status, got {data:?}");
+        }
+    }
+
+    #[test]
+    fn build_status_empty_text() {
+        let source = test_source();
+        let wire = build_aprs_status(&source, "");
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+
+        let data = parse_aprs_data(&packet.info).unwrap();
+        if let AprsData::Status(status) = data {
+            assert_eq!(status.text, "");
+        } else {
+            panic!("expected Status, got {data:?}");
+        }
+    }
+
+    #[test]
+    fn build_status_info_field_format() {
+        let source = test_source();
+        let wire = build_aprs_status(&source, "Hello");
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+
+        // Info field should be: >Hello\r
+        assert_eq!(packet.info[0], b'>');
+        assert_eq!(&packet.info[1..6], b"Hello");
+        assert_eq!(packet.info[6], b'\r');
+    }
+
+    // ---- APRS data extension parser tests ----
+
+    #[test]
+    fn parse_extensions_cse_spd() {
+        let ext = parse_aprs_extensions("088/036");
+        assert_eq!(ext.course_speed, Some((88, 36)));
+        assert!(ext.phg.is_none());
+        assert!(ext.altitude_ft.is_none());
+        assert!(ext.dao.is_none());
+    }
+
+    #[test]
+    fn parse_extensions_cse_spd_with_comment() {
+        let ext = parse_aprs_extensions("270/015via Mic-E");
+        assert_eq!(ext.course_speed, Some((270, 15)));
+    }
+
+    #[test]
+    fn parse_extensions_cse_spd_invalid_course() {
+        // Course 999 > 360 is invalid.
+        let ext = parse_aprs_extensions("999/050");
+        assert!(ext.course_speed.is_none());
+    }
+
+    #[test]
+    fn parse_extensions_cse_spd_not_at_start() {
+        // CSE/SPD must be at position 0.
+        let ext = parse_aprs_extensions("xx088/036");
+        assert!(ext.course_speed.is_none());
+    }
+
+    #[test]
+    fn parse_extensions_phg() {
+        // PHG5132 = power 25W, height 20ft (10*2^1), gain 3dB, directivity 40deg
+        let ext = parse_aprs_extensions("PHG5132");
+        let phg = ext.phg.unwrap();
+        assert_eq!(phg.power_watts, 25);
+        assert_eq!(phg.height_feet, 20);
+        assert_eq!(phg.gain_db, 3);
+        assert_eq!(phg.directivity_deg, 40);
+    }
+
+    #[test]
+    fn parse_extensions_phg_omni() {
+        // PHG2360 = power 4W, height 80ft, gain 6dB, omni
+        let ext = parse_aprs_extensions("PHG2360");
+        let phg = ext.phg.unwrap();
+        assert_eq!(phg.power_watts, 4);
+        assert_eq!(phg.height_feet, 80);
+        assert_eq!(phg.gain_db, 6);
+        assert_eq!(phg.directivity_deg, 0);
+    }
+
+    #[test]
+    fn parse_extensions_phg_in_comment() {
+        let ext = parse_aprs_extensions("some text PHG5132 more text");
+        assert!(ext.phg.is_some());
+        assert_eq!(ext.phg.unwrap().power_watts, 25);
+    }
+
+    #[test]
+    fn parse_extensions_altitude() {
+        let ext = parse_aprs_extensions("some comment /A=001234 more");
+        assert_eq!(ext.altitude_ft, Some(1234));
+    }
+
+    #[test]
+    fn parse_extensions_altitude_negative() {
+        let ext = parse_aprs_extensions("/A=-00100");
+        assert_eq!(ext.altitude_ft, Some(-100));
+    }
+
+    #[test]
+    fn parse_extensions_altitude_zeros() {
+        let ext = parse_aprs_extensions("/A=000000");
+        assert_eq!(ext.altitude_ft, Some(0));
+    }
+
+    #[test]
+    fn parse_extensions_dao_human_readable() {
+        // !W5! — W is uppercase, so digits 5 and 5.
+        let ext = parse_aprs_extensions("text !5W5! more");
+        let (lat, lon) = ext.dao.unwrap();
+        let expected = 5.0 / 600.0;
+        assert!((lat - expected).abs() < 1e-9, "lat={lat}");
+        assert!((lon - expected).abs() < 1e-9, "lon={lon}");
+    }
+
+    #[test]
+    fn parse_extensions_dao_base91() {
+        // !w"! — w is lowercase, " is char 34, so base-91 value = 34-33 = 1
+        let ext = parse_aprs_extensions("!\"w\"!");
+        let (lat, lon) = ext.dao.unwrap();
+        let expected = 1.0 / (91.0 * 60.0);
+        assert!((lat - expected).abs() < 1e-9, "lat={lat}");
+        assert!((lon - expected).abs() < 1e-9, "lon={lon}");
+    }
+
+    #[test]
+    fn parse_extensions_combined() {
+        let ext = parse_aprs_extensions("088/036PHG5132/A=001234");
+        assert_eq!(ext.course_speed, Some((88, 36)));
+        assert!(ext.phg.is_some());
+        assert_eq!(ext.altitude_ft, Some(1234));
+    }
+
+    #[test]
+    fn parse_extensions_empty() {
+        let ext = parse_aprs_extensions("");
+        assert!(ext.course_speed.is_none());
+        assert!(ext.phg.is_none());
+        assert!(ext.altitude_ft.is_none());
+        assert!(ext.dao.is_none());
+    }
+
+    // ---- Mic-E TX builder tests ----
+
+    #[test]
+    fn build_mice_roundtrip_oklahoma() {
+        // 35.258 N, 97.755 W — matches the existing parse_mice test case.
+        let source = test_source();
+        let wire = build_aprs_mice(&source, 35.258, -97.755, 121, 212, '/', '>', "test");
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+
+        // Destination should encode the latitude.
+        let pos = parse_mice_position(&packet.destination.callsign, &packet.info).unwrap();
+        assert!((pos.latitude - 35.258).abs() < 0.02, "lat={}", pos.latitude);
+        assert!(
+            (pos.longitude - (-97.755)).abs() < 0.02,
+            "lon={}",
+            pos.longitude
+        );
+        assert_eq!(pos.symbol_table, '/');
+        assert_eq!(pos.symbol_code, '>');
+        assert!(pos.comment.contains("test"));
+    }
+
+    #[test]
+    fn build_mice_roundtrip_north_east() {
+        // 51.5 N, 0.1 W (London area)
+        let source = test_source();
+        let wire = build_aprs_mice(&source, 51.5, -0.1, 0, 0, '/', '-', "");
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        let pos = parse_mice_position(&packet.destination.callsign, &packet.info).unwrap();
+        assert!((pos.latitude - 51.5).abs() < 0.02, "lat={}", pos.latitude);
+        assert!(
+            (pos.longitude - (-0.1)).abs() < 0.02,
+            "lon={}",
+            pos.longitude
+        );
+    }
+
+    #[test]
+    fn build_mice_roundtrip_southern_hemisphere() {
+        // -33.86 S, 151.21 E (Sydney)
+        let source = test_source();
+        let wire = build_aprs_mice(&source, -33.86, 151.21, 50, 180, '/', '>', "sydney");
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        let pos = parse_mice_position(&packet.destination.callsign, &packet.info).unwrap();
+        assert!(
+            (pos.latitude - (-33.86)).abs() < 0.02,
+            "lat={}",
+            pos.latitude
+        );
+        assert!(
+            (pos.longitude - 151.21).abs() < 0.02,
+            "lon={}",
+            pos.longitude
+        );
+    }
+
+    #[test]
+    fn build_mice_speed_course_roundtrip() {
+        let source = test_source();
+        let wire = build_aprs_mice(&source, 35.0, -97.0, 55, 270, '/', '>', "");
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        let pos = parse_mice_position(&packet.destination.callsign, &packet.info).unwrap();
+        assert_eq!(pos.speed_knots, Some(55));
+        assert_eq!(pos.course_degrees, Some(270));
+    }
+
+    #[test]
+    fn build_mice_zero_speed_course() {
+        let source = test_source();
+        let wire = build_aprs_mice(&source, 40.0, -74.0, 0, 0, '/', '>', "");
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        let pos = parse_mice_position(&packet.destination.callsign, &packet.info).unwrap();
+        assert_eq!(pos.speed_knots, Some(0));
+        // Course 0 = unknown → None in the decoder.
+        assert_eq!(pos.course_degrees, None);
+    }
+
+    #[test]
+    fn build_mice_high_longitude() {
+        // 35.0 N, 140.0 E (Tokyo area)
+        let source = test_source();
+        let wire = build_aprs_mice(&source, 35.0, 140.0, 10, 90, '/', '>', "");
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        let pos = parse_mice_position(&packet.destination.callsign, &packet.info).unwrap();
+        assert!((pos.latitude - 35.0).abs() < 0.02, "lat={}", pos.latitude);
+        assert!(
+            (pos.longitude - 140.0).abs() < 0.02,
+            "lon={}",
+            pos.longitude
+        );
+    }
+
+    #[test]
+    fn build_mice_lon_100_109() {
+        // 35.0 N, 105.5 W (New Mexico)
+        let source = test_source();
+        let wire = build_aprs_mice(&source, 35.0, -105.5, 0, 0, '/', '>', "");
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        let pos = parse_mice_position(&packet.destination.callsign, &packet.info).unwrap();
+        assert!(
+            (pos.longitude - (-105.5)).abs() < 0.02,
+            "lon={}",
+            pos.longitude
+        );
+    }
+
+    // ---- Telemetry tests ----
+
+    #[test]
+    fn parse_telemetry_full() {
+        let info = b"T#123,100,200,300,400,500,10101010";
+        let data = parse_aprs_data(info).unwrap();
+        match data {
+            AprsData::Telemetry(t) => {
+                assert_eq!(t.sequence, "123");
+                assert_eq!(t.analog, vec![100, 200, 300, 400, 500]);
+                assert_eq!(t.digital, 0b1010_1010);
+            }
+            other => panic!("expected Telemetry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_telemetry_mic_sequence() {
+        let info = b"T#MIC,001,002,003,004,005,11111111";
+        let data = parse_aprs_data(info).unwrap();
+        match data {
+            AprsData::Telemetry(t) => {
+                assert_eq!(t.sequence, "MIC");
+                assert_eq!(t.analog, vec![1, 2, 3, 4, 5]);
+                assert_eq!(t.digital, 0xFF);
+            }
+            other => panic!("expected Telemetry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_telemetry_partial_analog() {
+        // Only 3 analog values, no digital.
+        let info = b"T#001,10,20,30";
+        let data = parse_aprs_data(info).unwrap();
+        match data {
+            AprsData::Telemetry(t) => {
+                assert_eq!(t.sequence, "001");
+                assert_eq!(t.analog, vec![10, 20, 30]);
+                assert_eq!(t.digital, 0);
+            }
+            other => panic!("expected Telemetry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_telemetry_zero_values() {
+        let info = b"T#000,0,0,0,0,0,00000000";
+        let data = parse_aprs_data(info).unwrap();
+        match data {
+            AprsData::Telemetry(t) => {
+                assert_eq!(t.sequence, "000");
+                assert_eq!(t.analog, vec![0, 0, 0, 0, 0]);
+                assert_eq!(t.digital, 0);
+            }
+            other => panic!("expected Telemetry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_telemetry_invalid_no_hash() {
+        let info = b"T123,1,2,3,4,5,00000000";
+        assert!(parse_aprs_data(info).is_err());
+    }
+
+    // ---- Query tests ----
+
+    #[test]
+    fn parse_query_position_aprsp() {
+        let info = b"?APRSP";
+        let data = parse_aprs_data(info).unwrap();
+        assert_eq!(data, AprsData::Query(AprsQuery::Position));
+    }
+
+    #[test]
+    fn parse_query_position_aprs_question() {
+        let info = b"?APRS?";
+        let data = parse_aprs_data(info).unwrap();
+        assert_eq!(data, AprsData::Query(AprsQuery::Position));
+    }
+
+    #[test]
+    fn parse_query_status() {
+        let info = b"?APRSS";
+        let data = parse_aprs_data(info).unwrap();
+        assert_eq!(data, AprsData::Query(AprsQuery::Status));
+    }
+
+    #[test]
+    fn parse_query_message() {
+        let info = b"?APRSM";
+        let data = parse_aprs_data(info).unwrap();
+        assert_eq!(data, AprsData::Query(AprsQuery::Message));
+    }
+
+    #[test]
+    fn parse_query_direction_finding() {
+        let info = b"?APRSD";
+        let data = parse_aprs_data(info).unwrap();
+        assert_eq!(data, AprsData::Query(AprsQuery::DirectionFinding));
+    }
+
+    #[test]
+    fn parse_query_other() {
+        let info = b"?IGATE";
+        let data = parse_aprs_data(info).unwrap();
+        match data {
+            AprsData::Query(AprsQuery::Other(s)) => assert_eq!(s, "IGATE"),
+            other => panic!("expected Query::Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_query_with_trailing_cr() {
+        let info = b"?APRSP\r";
+        let data = parse_aprs_data(info).unwrap();
+        assert_eq!(data, AprsData::Query(AprsQuery::Position));
+    }
+
+    #[test]
+    fn build_query_response_roundtrip() {
+        let source = test_source();
+        let wire = build_query_response_position(&source, 35.258, -97.755, '/', '>', "QRY resp");
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        let data = parse_aprs_data(&packet.info).unwrap();
+        match data {
+            AprsData::Position(pos) => {
+                assert!((pos.latitude - 35.258).abs() < 0.01);
+                assert!((pos.longitude - (-97.755)).abs() < 0.01);
+                assert!(pos.comment.contains("QRY resp"));
+            }
+            other => panic!("expected Position, got {other:?}"),
+        }
     }
 }

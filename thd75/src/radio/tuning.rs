@@ -6,7 +6,7 @@
 
 use crate::error::{Error, ProtocolError};
 use crate::transport::Transport;
-use crate::types::{Band, Frequency};
+use crate::types::{Band, Frequency, Mode, StepSize};
 
 use super::{Radio, RadioMode};
 
@@ -132,6 +132,37 @@ impl<T: Transport> Radio<T> {
         Ok(channel)
     }
 
+    /// Quick-tune: set frequency, operating mode, and step size in one call.
+    ///
+    /// Switches to VFO mode if needed, then sets the frequency, operating
+    /// mode, and step size. This is a convenience method that combines
+    /// [`tune_frequency`](Self::tune_frequency), [`set_mode`](Self::set_mode),
+    /// and [`set_step_size`](Self::set_step_size).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any of the individual operations fail.
+    pub async fn quick_tune(
+        &mut self,
+        band: Band,
+        freq_hz: u32,
+        mode: Mode,
+        step: StepSize,
+    ) -> Result<(), Error> {
+        tracing::info!(?band, freq_hz, ?mode, ?step, "quick-tuning band");
+
+        // Set frequency (handles VFO mode switch internally).
+        self.tune_frequency(band, Frequency::new(freq_hz)).await?;
+
+        // Set operating mode.
+        self.set_mode(band, mode).await?;
+
+        // Set step size.
+        self.set_step_size(band, step).await?;
+
+        Ok(())
+    }
+
     /// Ensure a band is in the specified mode, switching if necessary.
     ///
     /// # Errors
@@ -238,5 +269,29 @@ mod tests {
 
         let mut radio = Radio::connect(mock).await.unwrap();
         radio.tune_channel(Band::A, 5).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quick_tune_sets_freq_mode_step() {
+        let mut mock = MockTransport::new();
+        // tune_frequency internals:
+        //   ensure_mode: query VM -> already VFO (0)
+        mock.expect(b"VM 0\r", b"VM 0,0\r");
+        //   get_frequency_full: FO read
+        mock.expect(b"FO 0\r", FO_RESPONSE_145);
+        //   set_frequency_full: FO write (146.520 MHz)
+        mock.expect(FO_WRITE_146520, FO_RESPONSE_146520);
+        //   get_frequency: verify readback
+        mock.expect(b"FQ 0\r", FQ_RESPONSE_146520);
+        // set_mode: MD write (FM = 0)
+        mock.expect(b"MD 0,0\r", b"MD 0,0\r");
+        // set_step_size: SF write (Hz5000 = 0x0)
+        mock.expect(b"SF 0,0\r", b"SF 0,0\r");
+
+        let mut radio = Radio::connect(mock).await.unwrap();
+        radio
+            .quick_tune(Band::A, 146_520_000, Mode::Fm, StepSize::Hz5000)
+            .await
+            .unwrap();
     }
 }

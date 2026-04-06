@@ -4,7 +4,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::App;
+use crate::app::{App, AprsMode};
 
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let mut spans: Vec<Span<'_>> = Vec::new();
@@ -49,6 +49,9 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     }
     if !s.dual_band {
         flags.push("1BD".into());
+    }
+    if app.aprs_mode == AprsMode::Active {
+        flags.push("APRS".into());
     }
 
     spans.push(Span::styled(

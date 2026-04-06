@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use kenwood_thd75::memory::MemoryImage;
 use kenwood_thd75::types::{
@@ -794,6 +794,64 @@ impl Default for RadioState {
     }
 }
 
+/// Whether the APRS client is active in the radio task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AprsMode {
+    /// Not in APRS mode — show MCP config view on the APRS panel.
+    Inactive,
+    /// APRS mode active — `AprsClient` is running in the radio task.
+    Active,
+}
+
+/// Tracking state for a sent APRS message.
+#[derive(Debug, Clone)]
+pub(crate) struct AprsMessageStatus {
+    /// Destination callsign.
+    pub addressee: String,
+    /// Message text.
+    pub text: String,
+    /// Message ID from the messenger.
+    pub message_id: String,
+    /// When the message was sent.
+    #[allow(dead_code)]
+    pub sent_at: Instant,
+    /// Delivery state.
+    pub state: AprsMessageState,
+}
+
+/// Delivery state for a tracked APRS message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AprsMessageState {
+    /// Waiting for acknowledgement.
+    Pending,
+    /// Acknowledged by the remote station.
+    Delivered,
+    /// Rejected by the remote station.
+    Rejected,
+    /// Expired after exhausting all retries.
+    Expired,
+}
+
+/// Cached APRS station for the TUI display.
+///
+/// The library's `StationEntry` uses `Instant` for timestamps which is
+/// not useful for display. This caches the fields we need plus a
+/// wall-clock time for "ago" display.
+#[derive(Debug, Clone)]
+pub(crate) struct AprsStationCache {
+    pub callsign: String,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub speed_knots: Option<u16>,
+    pub course_degrees: Option<u16>,
+    pub symbol_table: Option<char>,
+    pub symbol_code: Option<char>,
+    pub comment: Option<String>,
+    pub packet_count: u32,
+    pub last_path: Vec<String>,
+    pub last_heard: Instant,
+}
+
 /// MCP programming state machine.
 #[derive(Debug)]
 pub(crate) enum McpState {
@@ -825,6 +883,20 @@ pub(crate) enum Message {
         value: u8,
     },
     McpError(String),
+    /// The radio task has entered APRS mode successfully.
+    AprsStarted,
+    /// The radio task has exited APRS mode.
+    AprsStopped,
+    /// An APRS event was received from the radio task.
+    AprsEvent(kenwood_thd75::AprsEvent),
+    /// An APRS message was sent and assigned a message ID for tracking.
+    AprsMessageSent {
+        addressee: String,
+        text: String,
+        message_id: String,
+    },
+    /// Error from the APRS subsystem.
+    AprsError(String),
     Quit,
 }
 
@@ -853,6 +925,16 @@ pub(crate) struct App {
     pub target_band: kenwood_thd75::types::Band,
     /// Sender for commands to the radio background task.
     pub cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::event::RadioCommand>>,
+    /// APRS mode state.
+    pub aprs_mode: AprsMode,
+    /// Cached APRS stations, sorted by last heard (most recent first).
+    pub aprs_stations: Vec<AprsStationCache>,
+    /// Tracked sent APRS messages.
+    pub aprs_messages: Vec<AprsMessageStatus>,
+    /// Selected station index in the APRS station list.
+    pub aprs_station_index: usize,
+    /// When set, the APRS message compose prompt is active.
+    pub aprs_compose: Option<String>,
 }
 
 impl App {
@@ -928,6 +1010,11 @@ impl App {
             search_filter: String::new(),
             target_band: kenwood_thd75::types::Band::A,
             cmd_tx: None,
+            aprs_mode: AprsMode::Inactive,
+            aprs_stations: Vec::new(),
+            aprs_messages: Vec::new(),
+            aprs_station_index: 0,
+            aprs_compose: None,
         }
     }
 
@@ -1018,6 +1105,38 @@ impl App {
                 self.status_message = Some(format!("MCP error: {err}"));
                 true
             }
+            Message::AprsStarted => {
+                self.aprs_mode = AprsMode::Active;
+                self.status_message = Some("APRS mode active".into());
+                true
+            }
+            Message::AprsStopped => {
+                self.aprs_mode = AprsMode::Inactive;
+                self.status_message = Some("APRS mode stopped — CAT polling resumed".into());
+                true
+            }
+            Message::AprsEvent(event) => {
+                self.handle_aprs_event(event);
+                true
+            }
+            Message::AprsMessageSent {
+                addressee,
+                text,
+                message_id,
+            } => {
+                self.aprs_messages.push(AprsMessageStatus {
+                    addressee,
+                    text,
+                    message_id,
+                    sent_at: Instant::now(),
+                    state: AprsMessageState::Pending,
+                });
+                true
+            }
+            Message::AprsError(err) => {
+                self.status_message = Some(format!("APRS: {err}"));
+                true
+            }
         }
     }
 
@@ -1051,6 +1170,38 @@ impl App {
                     buf.push(c);
                     self.search_filter = buf.clone();
                     self.channel_list_index = 0;
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        // Handle APRS message compose mode
+        if let Some(ref mut buf) = self.aprs_compose {
+            match key.code {
+                KeyCode::Esc => {
+                    self.aprs_compose = None;
+                }
+                KeyCode::Enter => {
+                    let text = buf.clone();
+                    self.aprs_compose = None;
+                    if !text.is_empty()
+                        && let Some(station) = self.aprs_stations.get(self.aprs_station_index)
+                        && let Some(ref tx) = self.cmd_tx
+                    {
+                        let addressee = station.callsign.clone();
+                        let _ = tx.send(crate::event::RadioCommand::SendAprsMessage {
+                            addressee: addressee.clone(),
+                            text: text.clone(),
+                        });
+                        self.status_message = Some(format!("Sending to {addressee}: {text}"));
+                    }
+                }
+                KeyCode::Backspace => {
+                    let _ = buf.pop();
+                }
+                KeyCode::Char(c) => {
+                    buf.push(c);
                 }
                 _ => {}
             }
@@ -1175,8 +1326,13 @@ impl App {
                 true
             }
             KeyCode::Char('a') => {
-                self.main_view = MainView::Aprs;
-                self.focus = Pane::Main;
+                if self.main_view == MainView::Aprs && self.focus == Pane::Main {
+                    // Toggle APRS mode on/off when already viewing APRS panel.
+                    self.toggle_aprs_mode();
+                } else {
+                    self.main_view = MainView::Aprs;
+                    self.focus = Pane::Main;
+                }
                 true
             }
             KeyCode::Char('m') => {
@@ -1223,7 +1379,12 @@ impl App {
                             self.settings_mcp_index =
                                 self.settings_mcp_index.saturating_add(1).min(max);
                         }
-                        _ => {}
+                        MainView::Aprs => {
+                            let max = self.aprs_stations.len().saturating_sub(1);
+                            self.aprs_station_index =
+                                self.aprs_station_index.saturating_add(1).min(max);
+                        }
+                        MainView::Mcp => {}
                     },
                     Pane::BandA => {
                         if let Some(ref tx) = self.cmd_tx {
@@ -1255,7 +1416,10 @@ impl App {
                         MainView::SettingsMcp => {
                             self.settings_mcp_index = self.settings_mcp_index.saturating_sub(1);
                         }
-                        _ => {}
+                        MainView::Aprs => {
+                            self.aprs_station_index = self.aprs_station_index.saturating_sub(1);
+                        }
+                        MainView::Mcp => {}
                     },
                     Pane::BandA => {
                         if let Some(ref tx) = self.cmd_tx {
@@ -1414,6 +1578,33 @@ impl App {
                     return true;
                 }
                 false
+            }
+            // APRS: compose message to selected station
+            KeyCode::Char('M')
+                if self.main_view == MainView::Aprs
+                    && self.focus == Pane::Main
+                    && self.aprs_mode == AprsMode::Active
+                    && !self.aprs_stations.is_empty() =>
+            {
+                self.aprs_compose = Some(String::new());
+                true
+            }
+            // APRS: manual position beacon
+            KeyCode::Char('b')
+                if self.main_view == MainView::Aprs
+                    && self.focus == Pane::Main
+                    && self.aprs_mode == AprsMode::Active =>
+            {
+                if let Some(ref tx) = self.cmd_tx {
+                    // Use 0,0 as placeholder — real GPS position would come from the radio.
+                    let _ = tx.send(crate::event::RadioCommand::BeaconPosition {
+                        lat: 0.0,
+                        lon: 0.0,
+                        comment: String::new(),
+                    });
+                    self.status_message = Some("Beacon sent".into());
+                }
+                true
             }
             KeyCode::Char('r') if self.main_view == MainView::Mcp => {
                 if matches!(self.mcp, McpState::Idle | McpState::Loaded { .. }) {
@@ -2341,6 +2532,159 @@ impl App {
             }
             _ => {
                 self.status_message = Some(format!("{}: not adjustable", row.label()));
+            }
+        }
+    }
+
+    /// Process an incoming APRS event from the radio task.
+    fn handle_aprs_event(&mut self, event: kenwood_thd75::AprsEvent) {
+        use kenwood_thd75::AprsEvent;
+        match event {
+            AprsEvent::StationHeard(entry) => {
+                self.update_station_cache(&entry);
+            }
+            AprsEvent::PositionReceived { source, position } => {
+                // Build a minimal cache entry from position data.
+                let idx = self.aprs_stations.iter().position(|s| s.callsign == source);
+                if let Some(idx) = idx {
+                    let cached = &mut self.aprs_stations[idx];
+                    cached.latitude = Some(position.latitude);
+                    cached.longitude = Some(position.longitude);
+                    cached.speed_knots = position.speed_knots;
+                    cached.course_degrees = position.course_degrees;
+                    cached.symbol_table = Some(position.symbol_table);
+                    cached.symbol_code = Some(position.symbol_code);
+                    if !position.comment.is_empty() {
+                        cached.comment = Some(position.comment);
+                    }
+                    cached.last_heard = Instant::now();
+                    cached.packet_count = cached.packet_count.saturating_add(1);
+                } else {
+                    self.aprs_stations.push(AprsStationCache {
+                        callsign: source,
+                        latitude: Some(position.latitude),
+                        longitude: Some(position.longitude),
+                        speed_knots: position.speed_knots,
+                        course_degrees: position.course_degrees,
+                        symbol_table: Some(position.symbol_table),
+                        symbol_code: Some(position.symbol_code),
+                        comment: if position.comment.is_empty() {
+                            None
+                        } else {
+                            Some(position.comment)
+                        },
+                        packet_count: 1,
+                        last_path: Vec::new(),
+                        last_heard: Instant::now(),
+                    });
+                }
+                self.sort_aprs_stations();
+            }
+            AprsEvent::MessageReceived(msg) => {
+                self.status_message =
+                    Some(format!("APRS msg from {}: {}", msg.addressee, msg.text));
+            }
+            AprsEvent::MessageDelivered(id) => {
+                if let Some(m) = self.aprs_messages.iter_mut().find(|m| m.message_id == id) {
+                    m.state = AprsMessageState::Delivered;
+                }
+                self.status_message = Some(format!("Message {id} delivered"));
+            }
+            AprsEvent::MessageRejected(id) => {
+                if let Some(m) = self.aprs_messages.iter_mut().find(|m| m.message_id == id) {
+                    m.state = AprsMessageState::Rejected;
+                }
+                self.status_message = Some(format!("Message {id} rejected"));
+            }
+            AprsEvent::MessageExpired(id) => {
+                if let Some(m) = self.aprs_messages.iter_mut().find(|m| m.message_id == id) {
+                    m.state = AprsMessageState::Expired;
+                }
+                self.status_message = Some(format!("Message {id} expired"));
+            }
+            AprsEvent::WeatherReceived { source, .. } => {
+                self.status_message = Some(format!("WX from {source}"));
+            }
+            AprsEvent::PacketDigipeated { source } => {
+                self.status_message = Some(format!("Digipeated packet from {source}"));
+            }
+            AprsEvent::RawPacket(_) => {
+                // Silently ignore raw packets for now.
+            }
+        }
+    }
+
+    /// Update the station cache from a `StationEntry`.
+    fn update_station_cache(&mut self, entry: &kenwood_thd75::StationEntry) {
+        let cached = AprsStationCache {
+            callsign: entry.callsign.clone(),
+            latitude: entry.position.as_ref().map(|p| p.latitude),
+            longitude: entry.position.as_ref().map(|p| p.longitude),
+            speed_knots: entry.position.as_ref().and_then(|p| p.speed_knots),
+            course_degrees: entry.position.as_ref().and_then(|p| p.course_degrees),
+            symbol_table: entry.position.as_ref().map(|p| p.symbol_table),
+            symbol_code: entry.position.as_ref().map(|p| p.symbol_code),
+            comment: entry
+                .position
+                .as_ref()
+                .filter(|p| !p.comment.is_empty())
+                .map(|p| p.comment.clone()),
+            packet_count: entry.packet_count,
+            last_path: entry.last_path.clone(),
+            last_heard: entry.last_heard,
+        };
+
+        if let Some(idx) = self
+            .aprs_stations
+            .iter()
+            .position(|s| s.callsign == cached.callsign)
+        {
+            self.aprs_stations[idx] = cached;
+        } else {
+            self.aprs_stations.push(cached);
+        }
+        self.sort_aprs_stations();
+    }
+
+    /// Sort stations by most recently heard.
+    fn sort_aprs_stations(&mut self) {
+        self.aprs_stations
+            .sort_by(|a, b| b.last_heard.cmp(&a.last_heard));
+    }
+
+    /// Toggle APRS mode on or off.
+    fn toggle_aprs_mode(&mut self) {
+        match self.aprs_mode {
+            AprsMode::Inactive => {
+                // Build APRS config from MCP data if available, else use defaults.
+                let (callsign, ssid) = if let McpState::Loaded { ref image, .. } = self.mcp {
+                    let cs = image.aprs().my_callsign();
+                    if cs.is_empty() {
+                        ("N0CALL".to_string(), 7u8)
+                    } else {
+                        // Parse SSID from callsign if present (e.g., "KQ4NIT-9").
+                        if let Some((call, ssid_str)) = cs.split_once('-') {
+                            let ssid = ssid_str.parse::<u8>().unwrap_or(7);
+                            (call.to_string(), ssid)
+                        } else {
+                            (cs, 7)
+                        }
+                    }
+                } else {
+                    ("N0CALL".to_string(), 7)
+                };
+
+                let config = kenwood_thd75::AprsClientConfig::new(&callsign, ssid);
+                if let Some(ref tx) = self.cmd_tx {
+                    let _ = tx.send(crate::event::RadioCommand::EnterAprs { config });
+                    self.status_message = Some("Entering APRS mode...".into());
+                }
+            }
+            AprsMode::Active => {
+                if let Some(ref tx) = self.cmd_tx {
+                    let _ = tx.send(crate::event::RadioCommand::ExitAprs);
+                    self.status_message = Some("Exiting APRS mode...".into());
+                }
             }
         }
     }
