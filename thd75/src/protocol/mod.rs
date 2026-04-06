@@ -5,10 +5,10 @@
 //! (`\r`), with parameters separated by commas. The protocol layer has no
 //! async or I/O dependencies — it operates purely on byte slices.
 //!
-//! All 55 CAT commands (53 from the firmware dispatch table plus 2 extra
-//! mnemonics TY and 0E) are represented as variants of [`Command`]
-//! (outgoing) and [`Response`] (incoming). Use [`serialize`] and [`parse`]
-//! to convert between typed representations and wire format.
+//! All 55 CAT commands (53 from the firmware dispatch table, plus 2 extra
+//! mnemonics TY and 0E) are represented as variants of [`Command`] (outgoing) and [`Response`]
+//! (incoming). Use [`serialize`] and [`parse`] to convert between typed
+//! representations and wire format.
 
 pub mod aprs;
 pub mod bluetooth;
@@ -308,9 +308,11 @@ pub enum Command {
     ///
     /// Per Operating Tips section 5.10.6: Fine Tune only works with AM modulation
     /// and Band B. The write form takes a band parameter unlike the bare read.
+    /// Set fine tune on/off (FT write).
+    ///
+    /// Wire format: `FT value\r` (bare, no band parameter per ARFC-D75 RE).
+    /// ARFC sends `FT 0\r` (off) or `FT 1\r` (on).
     SetFunctionType {
-        /// Target band.
-        band: Band,
         /// Whether fine tune is enabled.
         enabled: bool,
     },
@@ -1769,8 +1771,8 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
             format!("FS {},{}", u8::from(*band), u8::from(*step))
         }
         Command::GetFunctionType => "FT".to_owned(),
-        Command::SetFunctionType { band, enabled } => {
-            format!("FT {},{}", u8::from(*band), u8::from(*enabled))
+        Command::SetFunctionType { enabled } => {
+            format!("FT {}", u8::from(*enabled))
         }
         Command::GetFilterWidth { mode } => format!("SH {}", u8::from(*mode)),
         Command::SetFilterWidth { mode, width } => {
@@ -1854,7 +1856,7 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         Command::SetScanResume { mode } => format!("SR {}", mode.to_raw()),
         Command::GetStepSize { band } => format!("SF {}", u8::from(*band)),
         Command::SetStepSize { band, step } => {
-            format!("SF {},{}", u8::from(*band), u8::from(*step))
+            format!("SF {},{:X}", u8::from(*band), u8::from(*step))
         }
         Command::GetBandScope { band } => format!("BS {}", u8::from(*band)),
         Command::SetBandScope { band, value } => {
@@ -2093,11 +2095,8 @@ mod tests {
 
     #[test]
     fn serialize_set_function_type() {
-        let bytes = serialize(&Command::SetFunctionType {
-            band: Band::A,
-            enabled: true,
-        });
-        assert_eq!(bytes, b"FT 0,1\r");
+        let bytes = serialize(&Command::SetFunctionType { enabled: true });
+        assert_eq!(bytes, b"FT 1\r");
     }
 
     #[test]

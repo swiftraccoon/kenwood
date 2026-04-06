@@ -1,7 +1,7 @@
 # kenwood-thd75
 
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-blue.svg)](https://www.rust-lang.org)
-[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-green.svg)](LICENSE)
+[![License: GPL v2+](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
 
 Async Rust library for full control of the Kenwood TH-D75 ham radio transceiver.
 
@@ -53,4 +53,4 @@ Tested on TH-D75A firmware v1.03. The TH-D75E (European model) has different TX 
 
 ## License
 
-MIT OR Apache-2.0
+GPL-2.0-or-later

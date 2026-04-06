@@ -812,6 +812,11 @@ pub enum DvGatewayMode {
     Off = 0,
     /// Reflector Terminal Mode enabled (index 1).
     ReflectorTerminal = 1,
+    /// Access Point mode (index 2). Discovered via ARFC-D75 decompilation
+    /// which shows 3 gateway modes (0/1/2). Needs hardware verification
+    /// to confirm exact behavior — may be "Auto" or "Access Point" mode
+    /// for D-STAR hotspot operation.
+    AccessPoint = 2,
 }
 
 impl fmt::Display for DvGatewayMode {
@@ -819,6 +824,7 @@ impl fmt::Display for DvGatewayMode {
         match self {
             Self::Off => f.write_str("Off"),
             Self::ReflectorTerminal => f.write_str("Reflector TERM"),
+            Self::AccessPoint => f.write_str("Access Point"),
         }
     }
 }
@@ -830,10 +836,11 @@ impl TryFrom<u8> for DvGatewayMode {
         match value {
             0 => Ok(Self::Off),
             1 => Ok(Self::ReflectorTerminal),
+            2 => Ok(Self::AccessPoint),
             _ => Err(ValidationError::SettingOutOfRange {
                 name: "DV gateway mode",
                 value,
-                detail: "must be 0-1",
+                detail: "must be 0-2",
             }),
         }
     }
@@ -1241,7 +1248,11 @@ mod tests {
             DvGatewayMode::try_from(1).unwrap(),
             DvGatewayMode::ReflectorTerminal
         );
-        assert!(DvGatewayMode::try_from(2).is_err());
+        assert_eq!(
+            DvGatewayMode::try_from(2).unwrap(),
+            DvGatewayMode::AccessPoint
+        );
+        assert!(DvGatewayMode::try_from(3).is_err());
     }
 
     #[test]

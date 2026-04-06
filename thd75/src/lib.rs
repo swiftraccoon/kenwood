@@ -58,11 +58,13 @@
 //! - [`transport`] — Async I/O trait and serial / mock implementations.
 //! - [`radio`] — High-level async API wrapping the protocol and transport layers.
 //! - [`kiss`] — KISS TNC framing, AX.25 packet parsing, and APRS position decoding.
+//! - [`mmdvm`] — MMDVM serial protocol codec, D-STAR header, and slow data decoder.
 //! - [`error`] — Error types for transport, protocol, and validation failures.
 
 pub mod error;
 pub mod kiss;
 pub mod memory;
+pub mod mmdvm;
 pub mod protocol;
 pub mod radio;
 pub mod sdcard;
@@ -83,7 +85,20 @@ pub use memory::{MemoryError, MemoryImage};
 // KISS / AX.25 / APRS re-exports.
 pub use kiss::{
     AprsData, AprsError, AprsItem, AprsMessage, AprsObject, AprsPosition, AprsStatus, AprsWeather,
-    Ax25Address, Ax25Error, Ax25Packet, KissError, KissFrame,
+    Ax25Address, Ax25Error, Ax25Packet, KissError, KissFrame, build_aprs_message,
+    build_aprs_object, build_aprs_position_report,
+};
+
+// KISS session re-export.
+pub use radio::kiss_session::KissSession;
+
+// MMDVM session re-export.
+pub use radio::mmdvm_session::MmdvmSession;
+
+// MMDVM codec re-exports.
+pub use mmdvm::{
+    DStarHeader, MmdvmConfig, MmdvmError, MmdvmFrame, MmdvmResponse, ModemMode, ModemState,
+    ModemStatus, NakReason, SlowDataDecoder,
 };
 
 // SD card re-exports.

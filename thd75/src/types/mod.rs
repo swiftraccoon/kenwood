@@ -39,7 +39,7 @@ pub use channel::{
     FlashDuplex,
 };
 pub use frequency::Frequency;
-pub use mode::{MemoryMode, Mode, PowerLevel, ShiftDirection, StepSize};
+pub use mode::{CoarseStepMultiplier, MemoryMode, Mode, PowerLevel, ShiftDirection, StepSize};
 pub use radio_params::{
     AfGainLevel, BatteryLevel, BeaconMode, CallsignSlot, DetectOutputMode, DstarSlot,
     DvGatewayMode, FilterMode, FilterWidthIndex, GpsRadioMode, SMeterReading, SquelchLevel,

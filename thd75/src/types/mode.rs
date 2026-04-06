@@ -6,9 +6,10 @@ use crate::error::ValidationError;
 
 /// Operating mode as returned by the `MD` (mode) CAT command.
 ///
-/// The TH-D75 supports 8 modes (0-7) via the `MD` command per the
-/// KI4LAX CAT command reference. This encoding matches the flash
-/// memory encoding (0-7).
+/// The TH-D75 supports 10 modes (0-9) via the `MD` command. Modes 0-7
+/// are confirmed by firmware RE and the KI4LAX CAT command reference.
+/// Modes 8 (WFM) and 9 (CW-R) are confirmed by the ARFC-D75
+/// decompilation.
 ///
 /// Note: the `FO`/`ME` commands use a **different** mode encoding
 /// (0=FM, 1=DV, 2=NFM, 3=AM) stored as a raw `u8` in [`ChannelMemory`].
@@ -21,9 +22,9 @@ use crate::error::ValidationError;
 /// - **Band A** supports only **FM** and **DV**. Band A is the amateur
 ///   TX/RX band (144/220/430 MHz) and its hardware path does not include
 ///   the DSP demodulator needed for SSB/CW/AM.
-/// - **Band B** supports all modes: FM, DV, AM, LSB, USB, CW, NFM, and
-///   DR. Band B has an independent receiver chain with DSP and IF filter
-///   enabling wideband demodulation.
+/// - **Band B** supports all modes: FM, DV, AM, LSB, USB, CW, NFM, DR,
+///   WFM, and CW-R. Band B has an independent receiver chain with DSP
+///   and IF filter enabling wideband demodulation.
 /// - **DR** (D-STAR repeater mode) is only available on **Band A**.
 ///   Attempting to set DR on Band B via `MD` will be rejected by the
 ///   firmware with a `?` error.
@@ -41,13 +42,17 @@ use crate::error::ValidationError;
 /// `[MODE]`. Switching between FM and NFM requires Menu No. 103
 /// (FM Narrow), not `[MODE]`.
 ///
-/// # WFM (Wide FM) note
+/// # WFM (Wide FM)
 ///
-/// WFM is NOT an `MD` mode — it is the FM broadcast radio mode accessed
-/// via the `FR` (FM Radio) command at 76-108 MHz on Band B. The radio's
-/// display shows "WFM" in FM Radio mode, but `MD` does not return a WFM
-/// value. Per the Kenwood Operating Tips §5.9, WFM appears in Band B's
-/// demodulation mode table for the FM Radio frequency range only.
+/// WFM is `MD` mode 8, confirmed by ARFC-D75 decompilation. It is the
+/// FM broadcast radio mode used on Band B for the 76-108 MHz range.
+/// The radio's display shows "WFM" in this mode.
+///
+/// # CW-R (CW Reverse)
+///
+/// CW-R is `MD` mode 9, confirmed by ARFC-D75 decompilation. It uses
+/// LSB detection for CW reception instead of the default USB detection
+/// used by standard CW mode.
 ///
 /// [`ChannelMemory`]: crate::types::ChannelMemory
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,6 +79,13 @@ pub enum Mode {
     /// D-STAR repeater mode (index 7). Band A only — DR requires the
     /// CTRL/PTT band for gateway access and callsign routing.
     Dr = 7,
+    /// Wide FM (index 8). Band B only — FM broadcast reception mode
+    /// for the 76-108 MHz range. Confirmed by ARFC-D75 decompilation.
+    Wfm = 8,
+    /// CW Reverse (index 9). Band B only — uses LSB detection for CW
+    /// reception instead of the default USB. Confirmed by ARFC-D75
+    /// decompilation.
+    CwReverse = 9,
 }
 
 impl fmt::Display for Mode {
@@ -87,6 +99,8 @@ impl fmt::Display for Mode {
             Self::Cw => f.write_str("CW"),
             Self::Nfm => f.write_str("NFM"),
             Self::Dr => f.write_str("DR"),
+            Self::Wfm => f.write_str("WFM"),
+            Self::CwReverse => f.write_str("CW-R"),
         }
     }
 }
@@ -104,6 +118,8 @@ impl TryFrom<u8> for Mode {
             5 => Ok(Self::Cw),
             6 => Ok(Self::Nfm),
             7 => Ok(Self::Dr),
+            8 => Ok(Self::Wfm),
+            9 => Ok(Self::CwReverse),
             _ => Err(ValidationError::ModeOutOfRange(value)),
         }
     }
@@ -379,6 +395,78 @@ impl From<StepSize> for u8 {
     }
 }
 
+/// Coarse tuning step multiplier.
+///
+/// Discovered via ARFC-D75 decompilation. The ARFC application multiplies
+/// the base step size by this factor before sending `UP`/`DW` commands,
+/// enabling faster tuning in large frequency ranges. This is a
+/// client-side feature — the radio itself has no coarse step command.
+///
+/// For example, with a 25.0 kHz base step and a `X10` multiplier, each
+/// `UP`/`DW` press tunes 250.0 kHz.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CoarseStepMultiplier {
+    /// 1x — no multiplication, same as normal step (index 0).
+    X1 = 0,
+    /// 2x multiplication (index 1).
+    X2 = 1,
+    /// 5x multiplication (index 2).
+    X5 = 2,
+    /// 10x multiplication (index 3).
+    X10 = 3,
+    /// 50x multiplication (index 4).
+    X50 = 4,
+    /// 100x multiplication (index 5).
+    X100 = 5,
+}
+
+impl CoarseStepMultiplier {
+    /// Returns the numeric multiplier value.
+    #[must_use]
+    pub const fn multiplier(self) -> u16 {
+        match self {
+            Self::X1 => 1,
+            Self::X2 => 2,
+            Self::X5 => 5,
+            Self::X10 => 10,
+            Self::X50 => 50,
+            Self::X100 => 100,
+        }
+    }
+}
+
+impl fmt::Display for CoarseStepMultiplier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "x{}", self.multiplier())
+    }
+}
+
+impl TryFrom<u8> for CoarseStepMultiplier {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::X1),
+            1 => Ok(Self::X2),
+            2 => Ok(Self::X5),
+            3 => Ok(Self::X10),
+            4 => Ok(Self::X50),
+            5 => Ok(Self::X100),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "coarse step multiplier",
+                value,
+                detail: "must be 0-5",
+            }),
+        }
+    }
+}
+
+impl From<CoarseStepMultiplier> for u8 {
+    fn from(mult: CoarseStepMultiplier) -> Self {
+        mult as Self
+    }
+}
+
 /// Operating mode as stored in the flash memory image.
 ///
 /// This enum represents the mode encoding used in the MCP programming
@@ -471,20 +559,20 @@ mod tests {
 
     #[test]
     fn mode_valid_range() {
-        for i in 0u8..8 {
+        for i in 0u8..10 {
             assert!(Mode::try_from(i).is_ok(), "Mode({i}) should be valid");
         }
     }
 
     #[test]
     fn mode_invalid() {
-        assert!(Mode::try_from(8).is_err());
+        assert!(Mode::try_from(10).is_err());
         assert!(Mode::try_from(255).is_err());
     }
 
     #[test]
     fn mode_round_trip() {
-        for i in 0u8..8 {
+        for i in 0u8..10 {
             let val = Mode::try_from(i).unwrap();
             assert_eq!(u8::from(val), i);
         }
@@ -492,8 +580,8 @@ mod tests {
 
     #[test]
     fn mode_error_variant() {
-        let err = Mode::try_from(8).unwrap_err();
-        assert!(matches!(err, ValidationError::ModeOutOfRange(8)));
+        let err = Mode::try_from(10).unwrap_err();
+        assert!(matches!(err, ValidationError::ModeOutOfRange(10)));
     }
 
     #[test]
@@ -506,6 +594,8 @@ mod tests {
         assert_eq!(Mode::Cw.to_string(), "CW");
         assert_eq!(Mode::Nfm.to_string(), "NFM");
         assert_eq!(Mode::Dr.to_string(), "DR");
+        assert_eq!(Mode::Wfm.to_string(), "WFM");
+        assert_eq!(Mode::CwReverse.to_string(), "CW-R");
     }
 
     // --- PowerLevel ---
@@ -725,5 +815,51 @@ mod tests {
         assert_eq!(u8::from(Mode::Cw), u8::from(MemoryMode::Cw));
         assert_eq!(u8::from(Mode::Nfm), u8::from(MemoryMode::Nfm));
         assert_eq!(u8::from(Mode::Dr), u8::from(MemoryMode::Dr));
+    }
+
+    // --- CoarseStepMultiplier ---
+
+    #[test]
+    fn coarse_step_multiplier_valid_range() {
+        for i in 0u8..6 {
+            assert!(
+                CoarseStepMultiplier::try_from(i).is_ok(),
+                "CoarseStepMultiplier({i}) should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn coarse_step_multiplier_invalid() {
+        assert!(CoarseStepMultiplier::try_from(6).is_err());
+        assert!(CoarseStepMultiplier::try_from(255).is_err());
+    }
+
+    #[test]
+    fn coarse_step_multiplier_round_trip() {
+        for i in 0u8..6 {
+            let val = CoarseStepMultiplier::try_from(i).unwrap();
+            assert_eq!(u8::from(val), i);
+        }
+    }
+
+    #[test]
+    fn coarse_step_multiplier_values() {
+        assert_eq!(CoarseStepMultiplier::X1.multiplier(), 1);
+        assert_eq!(CoarseStepMultiplier::X2.multiplier(), 2);
+        assert_eq!(CoarseStepMultiplier::X5.multiplier(), 5);
+        assert_eq!(CoarseStepMultiplier::X10.multiplier(), 10);
+        assert_eq!(CoarseStepMultiplier::X50.multiplier(), 50);
+        assert_eq!(CoarseStepMultiplier::X100.multiplier(), 100);
+    }
+
+    #[test]
+    fn coarse_step_multiplier_display() {
+        assert_eq!(CoarseStepMultiplier::X1.to_string(), "x1");
+        assert_eq!(CoarseStepMultiplier::X2.to_string(), "x2");
+        assert_eq!(CoarseStepMultiplier::X5.to_string(), "x5");
+        assert_eq!(CoarseStepMultiplier::X10.to_string(), "x10");
+        assert_eq!(CoarseStepMultiplier::X50.to_string(), "x50");
+        assert_eq!(CoarseStepMultiplier::X100.to_string(), "x100");
     }
 }

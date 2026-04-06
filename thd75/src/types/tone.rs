@@ -21,21 +21,29 @@ use crate::error::ValidationError;
 
 /// CTCSS (Continuous Tone-Coded Squelch System) frequency table.
 ///
-/// 50 sub-audible tone frequencies in Hz, used for selective calling.
-/// Indexed by [`ToneCode`]. Table is at firmware address `0xC003C694`.
-/// The D75 supports indices 0-49 (50 tones), extending the D74's 35-tone
-/// table with 15 additional tones including interleaved entries in the
-/// 159-200 Hz range (159.8, 165.5, 171.3, 177.3, 183.5, 189.9, 196.6,
-/// 199.5) and high-frequency tones (210.7-254.1 Hz).
+/// 51 entries: 50 sub-audible CTCSS tone frequencies (indices 0-49) plus
+/// the 1750 Hz tone burst at index 50. Indexed by [`ToneCode`]. The CTCSS
+/// table is at firmware address `0xC003C694`.
+///
+/// The D75 supports indices 0-49 (50 CTCSS tones), extending the D74's
+/// 35-tone table with 15 additional tones including interleaved entries
+/// in the 159-200 Hz range (159.8, 165.5, 171.3, 177.3, 183.5, 189.9,
+/// 196.6, 199.5) and high-frequency tones (210.7-254.1 Hz).
+///
+/// Index 50 (1750.0 Hz) is the European repeater access tone burst,
+/// confirmed by ARFC-D75 decompilation. It is NOT a CTCSS tone — it is
+/// a short audio-frequency burst used to open European repeaters.
 ///
 /// This table corresponds to **KI4LAX TABLE A** in the CAT command
 /// reference, which maps hex indices 0x00-0x31 to CTCSS tone frequencies.
-pub const CTCSS_FREQUENCIES: [f64; 50] = [
+/// Index 0x32 (50) for the 1750 Hz tone burst is from ARFC-D75 RE.
+pub const CTCSS_FREQUENCIES: [f64; 51] = [
     67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, // 0-9
     94.8, 97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3, // 10-19
     131.8, 136.5, 141.3, 146.2, 151.4, 156.7, 159.8, 162.2, 165.5, 167.9, // 20-29
     171.3, 173.8, 177.3, 179.9, 183.5, 186.2, 189.9, 192.8, 196.6, 199.5, // 30-39
-    203.5, 206.5, 210.7, 218.1, 225.7, 229.1, 233.6, 241.8, 250.3, 254.1, // 40-49
+    203.5, 206.5, 210.7, 218.1, 225.7, 229.1, 233.6, 241.8, 250.3, 254.1,  // 40-49
+    1750.0, // 50: 1750 Hz tone burst (European repeater access, NOT a CTCSS tone)
 ];
 
 /// DCS (Digital-Coded Squelch) code table.
@@ -54,12 +62,14 @@ pub const DCS_CODES: [u16; 104] = [
     723, 731, 732, 734, 743, 754,
 ];
 
-/// Validated CTCSS tone code (index into [`CTCSS_FREQUENCIES`]).
+/// Validated tone code (index into [`CTCSS_FREQUENCIES`]).
 ///
-/// Wraps a `u8` index in the range 0..=49. The D75 supports 50 CTCSS tones
-/// (indices 0-49), as confirmed by the firmware tone table at `0xC003C694`.
-/// Use [`ToneCode::frequency_hz`] to look up the corresponding CTCSS
-/// frequency.
+/// Wraps a `u8` index in the range 0..=50. Indices 0-49 are standard
+/// CTCSS sub-audible tones. Index 50 is the 1750 Hz tone burst used for
+/// European repeater access — it is NOT a CTCSS tone but a short
+/// audio-frequency burst. Confirmed by ARFC-D75 decompilation.
+///
+/// Use [`ToneCode::frequency_hz`] to look up the corresponding frequency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ToneCode(u8);
 
@@ -68,9 +78,9 @@ impl ToneCode {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::ToneCodeOutOfRange`] if `index >= 50`.
+    /// Returns [`ValidationError::ToneCodeOutOfRange`] if `index > 50`.
     pub const fn new(index: u8) -> Result<Self, ValidationError> {
-        if index < 50 {
+        if index <= 50 {
             Ok(Self(index))
         } else {
             Err(ValidationError::ToneCodeOutOfRange(index))
@@ -154,6 +164,9 @@ pub enum ToneMode {
     Ctcss = 1,
     /// DCS code (index 2).
     Dcs = 2,
+    /// Cross-tone mode (index 3). Separate encode/decode signaling types.
+    /// Confirmed by ARFC-D75 decompilation (`a1` enum, 4 values).
+    CrossTone = 3,
 }
 
 impl std::fmt::Display for ToneMode {
@@ -162,6 +175,7 @@ impl std::fmt::Display for ToneMode {
             Self::Off => f.write_str("Off"),
             Self::Ctcss => f.write_str("CTCSS"),
             Self::Dcs => f.write_str("DCS"),
+            Self::CrossTone => f.write_str("Cross Tone"),
         }
     }
 }
@@ -174,6 +188,7 @@ impl TryFrom<u8> for ToneMode {
             0 => Ok(Self::Off),
             1 => Ok(Self::Ctcss),
             2 => Ok(Self::Dcs),
+            3 => Ok(Self::CrossTone),
             _ => Err(ValidationError::ToneModeOutOfRange(value)),
         }
     }
@@ -311,14 +326,14 @@ mod tests {
 
     #[test]
     fn tone_code_valid_range() {
-        for i in 0u8..50 {
+        for i in 0u8..=50 {
             assert!(ToneCode::new(i).is_ok());
         }
     }
 
     #[test]
     fn tone_code_invalid() {
-        assert!(ToneCode::new(50).is_err());
+        assert!(ToneCode::new(51).is_err());
         assert!(ToneCode::new(255).is_err());
     }
 
@@ -330,15 +345,19 @@ mod tests {
         assert!((tc.frequency_hz() - 210.7).abs() < f64::EPSILON);
         let tc = ToneCode::new(49).unwrap();
         assert!((tc.frequency_hz() - 254.1).abs() < f64::EPSILON);
+        // Code 50: 1750 Hz tone burst (European repeater access).
+        let tc = ToneCode::new(50).unwrap();
+        assert!((tc.frequency_hz() - 1750.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn ctcss_table_completeness() {
-        assert_eq!(CTCSS_FREQUENCIES.len(), 50);
+        assert_eq!(CTCSS_FREQUENCIES.len(), 51);
         assert!((CTCSS_FREQUENCIES[0] - 67.0).abs() < f64::EPSILON);
         assert!((CTCSS_FREQUENCIES[42] - 210.7).abs() < f64::EPSILON);
         assert!((CTCSS_FREQUENCIES[43] - 218.1).abs() < f64::EPSILON);
         assert!((CTCSS_FREQUENCIES[49] - 254.1).abs() < f64::EPSILON);
+        assert!((CTCSS_FREQUENCIES[50] - 1750.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -371,11 +390,12 @@ mod tests {
         assert!(ToneMode::try_from(0u8).is_ok());
         assert!(ToneMode::try_from(1u8).is_ok());
         assert!(ToneMode::try_from(2u8).is_ok());
+        assert!(ToneMode::try_from(3u8).is_ok()); // CrossTone (ARFC RE)
     }
 
     #[test]
     fn tone_mode_invalid() {
-        assert!(ToneMode::try_from(3u8).is_err());
+        assert!(ToneMode::try_from(4u8).is_err());
     }
 
     #[test]

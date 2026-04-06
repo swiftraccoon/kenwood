@@ -1251,6 +1251,217 @@ fn extract_weather_u32(s: &str, tag: char, width: usize) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// APRS TX packet builders
+// ---------------------------------------------------------------------------
+
+/// APRS tocall for the Kenwood TH-D75 (per APRS tocall registry).
+const APRS_TOCALL: &str = "APK005";
+
+/// Default APRS digipeater path: WIDE1-1, WIDE2-1.
+const DEFAULT_DIGIPEATERS: &[(&str, u8)] = &[("WIDE1", 1), ("WIDE2", 1)];
+
+/// Format latitude as APRS uncompressed `DDMM.HHN` (8 bytes).
+fn format_aprs_latitude(lat: f64) -> String {
+    let hemisphere = if lat >= 0.0 { 'N' } else { 'S' };
+    let lat_abs = lat.abs();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let degrees = lat_abs as u32;
+    let minutes = (lat_abs - f64::from(degrees)) * 60.0;
+    format!("{degrees:02}{minutes:05.2}{hemisphere}")
+}
+
+/// Format longitude as APRS uncompressed `DDDMM.HHE` (9 bytes).
+fn format_aprs_longitude(lon: f64) -> String {
+    let hemisphere = if lon >= 0.0 { 'E' } else { 'W' };
+    let lon_abs = lon.abs();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let degrees = lon_abs as u32;
+    let minutes = (lon_abs - f64::from(degrees)) * 60.0;
+    format!("{degrees:03}{minutes:05.2}{hemisphere}")
+}
+
+/// Build the default digipeater path as [`Ax25Address`] entries.
+fn default_digipeater_path() -> Vec<Ax25Address> {
+    DEFAULT_DIGIPEATERS
+        .iter()
+        .map(|(call, ssid)| Ax25Address {
+            callsign: (*call).to_owned(),
+            ssid: *ssid,
+        })
+        .collect()
+}
+
+/// Build a KISS-encoded APRS uncompressed position report.
+///
+/// Composes an AX.25 UI frame with:
+/// - Destination: `APK005-0` (Kenwood TH-D75 tocall)
+/// - Digipeater path: WIDE1-1, WIDE2-1
+/// - Info field: `!DDMM.HHN/DDDMM.HHEscomment`
+///
+/// Returns wire-ready bytes (FEND-delimited KISS frame) suitable for
+/// [`KissSession::send_data`](crate::radio::kiss_session::KissSession::send_data)
+/// or direct transport write.
+///
+/// # Parameters
+///
+/// - `source`: The sender's callsign and SSID.
+/// - `latitude`: Decimal degrees, positive = North, negative = South.
+/// - `longitude`: Decimal degrees, positive = East, negative = West.
+/// - `symbol_table`: APRS symbol table character (`/` for primary, `\\` for alternate).
+/// - `symbol_code`: APRS symbol code character (e.g., `>` for car, `-` for house).
+/// - `comment`: Free-form comment text appended after the position.
+#[must_use]
+pub fn build_aprs_position_report(
+    source: &Ax25Address,
+    latitude: f64,
+    longitude: f64,
+    symbol_table: char,
+    symbol_code: char,
+    comment: &str,
+) -> Vec<u8> {
+    let lat_str = format_aprs_latitude(latitude);
+    let lon_str = format_aprs_longitude(longitude);
+    let info = format!("!{lat_str}{symbol_table}{lon_str}{symbol_code}{comment}");
+
+    let packet = Ax25Packet {
+        source: source.clone(),
+        destination: Ax25Address {
+            callsign: APRS_TOCALL.to_owned(),
+            ssid: 0,
+        },
+        digipeaters: default_digipeater_path(),
+        control: 0x03,
+        protocol: 0xF0,
+        info: info.into_bytes(),
+    };
+
+    let ax25_bytes = build_ax25(&packet);
+    encode_kiss_frame(&KissFrame {
+        port: 0,
+        command: CMD_DATA,
+        data: ax25_bytes,
+    })
+}
+
+/// Build a KISS-encoded APRS message packet.
+///
+/// Composes an AX.25 UI frame with the APRS message format:
+/// `:ADDRESSEE:text{ID`
+///
+/// The addressee is padded to exactly 9 characters per the APRS spec.
+///
+/// Returns wire-ready bytes (FEND-delimited KISS frame).
+///
+/// # Parameters
+///
+/// - `source`: The sender's callsign and SSID.
+/// - `addressee`: Destination station callsign (up to 9 chars).
+/// - `text`: Message text content.
+/// - `message_id`: Optional message sequence number for ack/rej tracking.
+#[must_use]
+pub fn build_aprs_message(
+    source: &Ax25Address,
+    addressee: &str,
+    text: &str,
+    message_id: Option<&str>,
+) -> Vec<u8> {
+    // Pad addressee to exactly 9 characters.
+    let padded_addressee = format!("{addressee:<9}");
+    // Truncate to 9 characters if longer.
+    let padded_addressee = &padded_addressee[..9];
+
+    let info = message_id.map_or_else(
+        || format!(":{padded_addressee}:{text}"),
+        |id| format!(":{padded_addressee}:{text}{{{id}"),
+    );
+
+    let packet = Ax25Packet {
+        source: source.clone(),
+        destination: Ax25Address {
+            callsign: APRS_TOCALL.to_owned(),
+            ssid: 0,
+        },
+        digipeaters: default_digipeater_path(),
+        control: 0x03,
+        protocol: 0xF0,
+        info: info.into_bytes(),
+    };
+
+    let ax25_bytes = build_ax25(&packet);
+    encode_kiss_frame(&KissFrame {
+        port: 0,
+        command: CMD_DATA,
+        data: ax25_bytes,
+    })
+}
+
+/// Build a KISS-encoded APRS object report.
+///
+/// Composes an AX.25 UI frame with the APRS object format:
+/// `;name_____*DDHHMMzDDMM.HHN/DDDMM.HHEscomment`
+///
+/// The object name is padded to exactly 9 characters per the APRS spec.
+/// The timestamp uses the current UTC time in DHM zulu format.
+///
+/// Returns wire-ready bytes (FEND-delimited KISS frame).
+///
+/// # Parameters
+///
+/// - `source`: The sender's callsign and SSID.
+/// - `name`: Object name (up to 9 characters).
+/// - `live`: `true` for a live object (`*`), `false` for killed (`_`).
+/// - `latitude`: Decimal degrees, positive = North.
+/// - `longitude`: Decimal degrees, positive = East.
+/// - `symbol_table`: APRS symbol table character.
+/// - `symbol_code`: APRS symbol code character.
+/// - `comment`: Free-form comment text.
+#[must_use]
+pub fn build_aprs_object(
+    source: &Ax25Address,
+    name: &str,
+    live: bool,
+    latitude: f64,
+    longitude: f64,
+    symbol_table: char,
+    symbol_code: char,
+    comment: &str,
+) -> Vec<u8> {
+    // Pad object name to exactly 9 characters.
+    let padded_name = format!("{name:<9}");
+    let padded_name = &padded_name[..9];
+
+    let live_char = if live { '*' } else { '_' };
+    let lat_str = format_aprs_latitude(latitude);
+    let lon_str = format_aprs_longitude(longitude);
+
+    // Use a placeholder DHM zulu timestamp (000000z). Callers needing a real
+    // timestamp should build the info field manually. The APRS spec allows
+    // any valid DHM or HMS timestamp here.
+    let info = format!(
+        ";{padded_name}{live_char}000000z{lat_str}{symbol_table}{lon_str}{symbol_code}{comment}"
+    );
+
+    let packet = Ax25Packet {
+        source: source.clone(),
+        destination: Ax25Address {
+            callsign: APRS_TOCALL.to_owned(),
+            ssid: 0,
+        },
+        digipeaters: default_digipeater_path(),
+        control: 0x03,
+        protocol: 0xF0,
+        info: info.into_bytes(),
+    };
+
+    let ax25_bytes = build_ax25(&packet);
+    encode_kiss_frame(&KissFrame {
+        port: 0,
+        command: CMD_DATA,
+        data: ax25_bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2147,5 +2358,158 @@ mod tests {
         // Parse APRS position from info field
         let pos = parse_aprs_position(&packet.info).unwrap();
         assert!((pos.latitude - 49.058_333).abs() < 0.001);
+    }
+
+    // ---- APRS TX builder tests ----
+
+    fn test_source() -> Ax25Address {
+        Ax25Address {
+            callsign: "N0CALL".to_owned(),
+            ssid: 7,
+        }
+    }
+
+    #[test]
+    fn format_latitude_north() {
+        let s = format_aprs_latitude(49.058_333);
+        // 49 degrees, 3.50 minutes North
+        assert_eq!(s.len(), 8);
+        assert!(s.ends_with('N'));
+        assert!(s.starts_with("49"));
+    }
+
+    #[test]
+    fn format_latitude_south() {
+        let s = format_aprs_latitude(-33.856);
+        assert!(s.ends_with('S'));
+        assert!(s.starts_with("33"));
+    }
+
+    #[test]
+    fn format_longitude_east() {
+        let s = format_aprs_longitude(151.209);
+        assert_eq!(s.len(), 9);
+        assert!(s.ends_with('E'));
+        assert!(s.starts_with("151"));
+    }
+
+    #[test]
+    fn format_longitude_west() {
+        let s = format_aprs_longitude(-72.029_166);
+        assert!(s.ends_with('W'));
+        assert!(s.starts_with("072"));
+    }
+
+    #[test]
+    fn build_position_report_roundtrip() {
+        let source = test_source();
+        let wire = build_aprs_position_report(&source, 49.058_333, -72.029_166, '/', '-', "Test");
+
+        // Decode the KISS frame.
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        assert_eq!(kiss.command, CMD_DATA);
+
+        // Decode the AX.25 packet.
+        let packet = parse_ax25(&kiss.data).unwrap();
+        assert_eq!(packet.source.callsign, "N0CALL");
+        assert_eq!(packet.source.ssid, 7);
+        assert_eq!(packet.destination.callsign, "APK005");
+        assert_eq!(packet.destination.ssid, 0);
+        assert_eq!(packet.digipeaters.len(), 2);
+        assert_eq!(packet.digipeaters[0].callsign, "WIDE1");
+        assert_eq!(packet.digipeaters[0].ssid, 1);
+        assert_eq!(packet.digipeaters[1].callsign, "WIDE2");
+        assert_eq!(packet.digipeaters[1].ssid, 1);
+        assert_eq!(packet.control, 0x03);
+        assert_eq!(packet.protocol, 0xF0);
+
+        // Parse the APRS position from the info field.
+        let pos = parse_aprs_position(&packet.info).unwrap();
+        assert!((pos.latitude - 49.058_333).abs() < 0.01);
+        assert!((pos.longitude - (-72.029_166)).abs() < 0.01);
+        assert_eq!(pos.symbol_table, '/');
+        assert_eq!(pos.symbol_code, '-');
+        assert!(pos.comment.contains("Test"));
+    }
+
+    #[test]
+    fn build_message_roundtrip() {
+        let source = test_source();
+        let wire = build_aprs_message(&source, "KQ4NIT", "Hello 73!", Some("42"));
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        assert_eq!(packet.destination.callsign, "APK005");
+
+        let msg = parse_aprs_message(&packet.info).unwrap();
+        assert_eq!(msg.addressee, "KQ4NIT");
+        assert_eq!(msg.text, "Hello 73!");
+        assert_eq!(msg.message_id, Some("42".to_string()));
+    }
+
+    #[test]
+    fn build_message_no_id() {
+        let source = test_source();
+        let wire = build_aprs_message(&source, "W1AW", "Test msg", None);
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        let msg = parse_aprs_message(&packet.info).unwrap();
+        assert_eq!(msg.addressee, "W1AW");
+        assert_eq!(msg.text, "Test msg");
+        assert_eq!(msg.message_id, None);
+    }
+
+    #[test]
+    fn build_message_pads_short_addressee() {
+        let source = test_source();
+        let wire = build_aprs_message(&source, "AB", "Hi", None);
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        // The info field should have the addressee padded to 9 chars.
+        let info_str = String::from_utf8_lossy(&packet.info);
+        // Format: :ADDRESSEE:text — addressee is bytes 1..10.
+        assert_eq!(&info_str[1..10], "AB       ");
+    }
+
+    #[test]
+    fn build_object_roundtrip() {
+        let source = test_source();
+        let wire = build_aprs_object(
+            &source,
+            "TORNADO",
+            true,
+            49.058_333,
+            -72.029_166,
+            '/',
+            '-',
+            "Wrn",
+        );
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        assert_eq!(packet.destination.callsign, "APK005");
+
+        let obj = parse_aprs_object(&packet.info).unwrap();
+        assert_eq!(obj.name, "TORNADO");
+        assert!(obj.live);
+        assert!((obj.position.latitude - 49.058_333).abs() < 0.01);
+        assert!((obj.position.longitude - (-72.029_166)).abs() < 0.01);
+        assert_eq!(obj.position.symbol_table, '/');
+        assert_eq!(obj.position.symbol_code, '-');
+        assert!(obj.position.comment.contains("Wrn"));
+    }
+
+    #[test]
+    fn build_object_killed() {
+        let source = test_source();
+        let wire = build_aprs_object(&source, "EVENT", false, 35.0, -97.0, '/', 'E', "Done");
+
+        let kiss = decode_kiss_frame(&wire).unwrap();
+        let packet = parse_ax25(&kiss.data).unwrap();
+        let obj = parse_aprs_object(&packet.info).unwrap();
+        assert_eq!(obj.name, "EVENT");
+        assert!(!obj.live);
     }
 }

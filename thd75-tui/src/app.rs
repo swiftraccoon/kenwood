@@ -1539,126 +1539,74 @@ impl App {
             return;
         };
 
-        // Get current value from MCP image, compute new value and offset
-        let (offset, new_val, label): (u16, u8, String) =
-            if let McpState::Loaded { ref image, .. } = self.mcp {
-                let s = image.settings();
-                match row {
-                    SettingRow::TxInhibit => (
-                        0x1019,
-                        u8::from(!s.tx_inhibit()),
-                        format!("TX Inhibit → {}", on_off(!s.tx_inhibit())),
-                    ),
-                    SettingRow::BeatShift => (
-                        0x101A,
-                        u8::from(!s.beat_shift()),
-                        format!("Beat Shift → {}", on_off(!s.beat_shift())),
-                    ),
-                    SettingRow::VoxTxOnBusy => (
-                        0x101E,
-                        u8::from(!s.vox_tx_on_busy()),
-                        format!("VOX TX Busy → {}", on_off(!s.vox_tx_on_busy())),
-                    ),
-                    SettingRow::CwBreakIn => (
-                        0x101F,
-                        u8::from(!s.cw_break_in()),
-                        format!("CW Break-In → {}", on_off(!s.cw_break_in())),
-                    ),
-                    SettingRow::DtmfTxHold => (
-                        0x1027,
-                        u8::from(!s.dtmf_tx_hold()),
-                        format!("DTMF TX Hold → {}", on_off(!s.dtmf_tx_hold())),
-                    ),
-                    SettingRow::RepeaterAutoOffset => (
-                        0x1030,
-                        u8::from(!s.repeater_auto_offset()),
-                        format!("Rpt Auto Offset → {}", on_off(!s.repeater_auto_offset())),
-                    ),
-                    SettingRow::LockKeyA => (
-                        0x1062,
-                        u8::from(!s.lock_key_a()),
-                        format!("Lock Key A → {}", on_off(!s.lock_key_a())),
-                    ),
-                    SettingRow::LockKeyB => (
-                        0x1063,
-                        u8::from(!s.lock_key_b()),
-                        format!("Lock Key B → {}", on_off(!s.lock_key_b())),
-                    ),
-                    SettingRow::LockKeyC => (
-                        0x1064,
-                        u8::from(!s.lock_key_c()),
-                        format!("Lock Key C → {}", on_off(!s.lock_key_c())),
-                    ),
-                    SettingRow::LockPtt => (
-                        0x1065,
-                        u8::from(!s.lock_key_ptt()),
-                        format!("Lock PTT → {}", on_off(!s.lock_key_ptt())),
-                    ),
-                    SettingRow::AprsLock => (
-                        0x1097,
-                        u8::from(!s.aprs_lock()),
-                        format!("APRS Lock → {}", on_off(!s.aprs_lock())),
-                    ),
-                    SettingRow::Announce => (
-                        0x1070,
-                        u8::from(!s.announce()),
-                        format!("Announce → {}", on_off(!s.announce())),
-                    ),
-                    SettingRow::KeyBeep => (
-                        0x1071,
-                        u8::from(!s.key_beep()),
-                        format!("Key Beep → {}", on_off(!s.key_beep())),
-                    ),
-                    SettingRow::VolumeLock => (
-                        0x1076,
-                        u8::from(!s.volume_lock()),
-                        format!("Vol Lock → {}", on_off(!s.volume_lock())),
-                    ),
-                    SettingRow::BtAutoConnect => (
-                        0x1079,
-                        u8::from(!s.bt_auto_connect()),
-                        format!("BT Auto Connect → {}", on_off(!s.bt_auto_connect())),
-                    ),
-                    SettingRow::UsbAudioOutput => (
-                        0x1094,
-                        u8::from(!s.usb_audio_output()),
-                        format!("USB Audio Out → {}", on_off(!s.usb_audio_output())),
-                    ),
-                    SettingRow::InternetLink => (
-                        0x1095,
-                        u8::from(!s.internet_link()),
-                        format!("Internet Link → {}", on_off(!s.internet_link())),
-                    ),
-                    SettingRow::PowerOnMessageFlag => (
-                        0x1087,
-                        u8::from(!s.power_on_message_flag()),
-                        format!("PowerOn Msg → {}", on_off(!s.power_on_message_flag())),
-                    ),
-                    SettingRow::BatterySaver => (
-                        0x10C0,
-                        u8::from(!s.battery_saver()),
-                        format!("Battery Saver → {}", on_off(!s.battery_saver())),
-                    ),
-                    _ => {
-                        self.status_message = Some(format!("{}: use +/- to adjust", row.label()));
-                        return;
-                    }
-                }
-            } else {
-                self.status_message = Some(format!("{}: load MCP data first (m → r)", row.label()));
-                return;
-            };
+        let McpState::Loaded { ref mut image, .. } = self.mcp else {
+            self.status_message = Some(format!("{}: load MCP data first (m → r)", row.label()));
+            return;
+        };
 
-        // Send single-page MCP write — radio will disconnect briefly and reconnect
-        let _ = tx.send(crate::event::RadioCommand::McpWriteByte {
-            offset,
-            value: new_val,
-        });
-        self.status_message = Some(format!("{label} — applying..."));
+        macro_rules! toggle_bool {
+            ($getter:ident, $setter:ident, $label:expr) => {{
+                let new_val = !image.settings().$getter();
+                if let Some((offset, value)) = image.modify_setting(|w| w.$setter(new_val)) {
+                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message =
+                        Some(format!("{} → {} — applying...", $label, on_off(new_val)));
+                }
+            }};
+        }
+
+        match row {
+            SettingRow::TxInhibit => toggle_bool!(tx_inhibit, set_tx_inhibit, "TX Inhibit"),
+            SettingRow::BeatShift => toggle_bool!(beat_shift, set_beat_shift, "Beat Shift"),
+            SettingRow::VoxTxOnBusy => {
+                toggle_bool!(vox_tx_on_busy, set_vox_tx_on_busy, "VOX TX Busy");
+            }
+            SettingRow::CwBreakIn => toggle_bool!(cw_break_in, set_cw_break_in, "CW Break-In"),
+            SettingRow::DtmfTxHold => {
+                toggle_bool!(dtmf_tx_hold, set_dtmf_tx_hold, "DTMF TX Hold");
+            }
+            SettingRow::RepeaterAutoOffset => {
+                toggle_bool!(
+                    repeater_auto_offset,
+                    set_repeater_auto_offset,
+                    "Rpt Auto Offset"
+                );
+            }
+            SettingRow::LockKeyA => toggle_bool!(lock_key_a, set_lock_key_a, "Lock Key A"),
+            SettingRow::LockKeyB => toggle_bool!(lock_key_b, set_lock_key_b, "Lock Key B"),
+            SettingRow::LockKeyC => toggle_bool!(lock_key_c, set_lock_key_c, "Lock Key C"),
+            SettingRow::LockPtt => toggle_bool!(lock_key_ptt, set_lock_key_ptt, "Lock PTT"),
+            SettingRow::AprsLock => toggle_bool!(aprs_lock, set_aprs_lock, "APRS Lock"),
+            SettingRow::Announce => toggle_bool!(announce, set_announce, "Announce"),
+            SettingRow::KeyBeep => toggle_bool!(key_beep, set_key_beep, "Key Beep"),
+            SettingRow::VolumeLock => toggle_bool!(volume_lock, set_volume_lock, "Vol Lock"),
+            SettingRow::BtAutoConnect => {
+                toggle_bool!(bt_auto_connect, set_bt_auto_connect, "BT Auto Connect");
+            }
+            SettingRow::UsbAudioOutput => {
+                toggle_bool!(usb_audio_output, set_usb_audio_output, "USB Audio Out");
+            }
+            SettingRow::InternetLink => {
+                toggle_bool!(internet_link, set_internet_link, "Internet Link");
+            }
+            SettingRow::PowerOnMessageFlag => {
+                toggle_bool!(
+                    power_on_message_flag,
+                    set_power_on_message_flag,
+                    "PowerOn Msg"
+                );
+            }
+            SettingRow::BatterySaver => {
+                toggle_bool!(battery_saver, set_battery_saver, "Battery Saver");
+            }
+            _ => {
+                self.status_message = Some(format!("{}: use +/- to adjust", row.label()));
+            }
+        }
     }
 
     /// Adjust a numeric setting by delta with +/-.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     fn adjust_setting(&mut self, delta: i8) {
         let (rows, idx) = if self.main_view == MainView::SettingsCat {
             (cat_settings(), self.settings_cat_index)
@@ -1877,7 +1825,9 @@ impl App {
                         Mode::Usb => Mode::Cw,
                         Mode::Cw => Mode::Dv,
                         Mode::Dv => Mode::Dr,
-                        Mode::Dr => Mode::Fm,
+                        Mode::Dr => Mode::Wfm,
+                        Mode::Wfm => Mode::CwReverse,
+                        Mode::CwReverse => Mode::Fm,
                     };
                     let _ = tx.send(crate::event::RadioCommand::SetMode {
                         band: kenwood_thd75::types::Band::A,
@@ -1896,7 +1846,9 @@ impl App {
                         Mode::Usb => Mode::Cw,
                         Mode::Cw => Mode::Dv,
                         Mode::Dv => Mode::Dr,
-                        Mode::Dr => Mode::Fm,
+                        Mode::Dr => Mode::Wfm,
+                        Mode::Wfm => Mode::CwReverse,
+                        Mode::CwReverse => Mode::Fm,
                     };
                     let _ = tx.send(crate::event::RadioCommand::SetMode {
                         band: kenwood_thd75::types::Band::B,
@@ -1960,354 +1912,436 @@ impl App {
             return;
         };
 
-        let (offset, new_val, label): (u16, u8, String) =
-            if let McpState::Loaded { ref image, .. } = self.mcp {
-                let s = image.settings();
-                match row {
-                    SettingRow::FmNarrow => (
-                        0x100F,
-                        s.fm_narrow().saturating_add_signed(delta),
-                        format!("FM Narrow → {}", s.fm_narrow().saturating_add_signed(delta)),
-                    ),
-                    SettingRow::SsbHighCut => (
-                        0x1011,
-                        s.ssb_high_cut().saturating_add_signed(delta),
-                        format!(
-                            "SSB High Cut → {}",
-                            s.ssb_high_cut().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::CwHighCut => (
-                        0x1012,
-                        s.cw_high_cut().saturating_add_signed(delta),
-                        format!(
-                            "CW High Cut → {}",
-                            s.cw_high_cut().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::AmHighCut => (
-                        0x1013,
-                        s.am_high_cut().saturating_add_signed(delta),
-                        format!(
-                            "AM High Cut → {}",
-                            s.am_high_cut().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::AutoFilter => (
-                        0x100C,
-                        s.auto_filter().saturating_add_signed(delta),
-                        format!(
-                            "Auto Filter → {}",
-                            s.auto_filter().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::ScanResume => (
-                        0x1007,
-                        s.scan_resume().saturating_add_signed(delta),
-                        format!(
-                            "Scan Resume → {}",
-                            s.scan_resume().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::DigitalScanResume => (
-                        0x1008,
-                        s.digital_scan_resume().saturating_add_signed(delta),
-                        format!(
-                            "Dig Scan Resume → {}",
-                            s.digital_scan_resume().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::ScanRestartTime => (
-                        0x1009,
-                        s.scan_restart_time().saturating_add_signed(delta),
-                        format!(
-                            "Scan Restart Time → {}",
-                            s.scan_restart_time().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::ScanRestartCarrier => (
-                        0x100A,
-                        s.scan_restart_carrier().saturating_add_signed(delta),
-                        format!(
-                            "Scan Restart Carrier → {}",
-                            s.scan_restart_carrier().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::TimeoutTimer => (
-                        0x1018,
-                        s.timeout_timer().saturating_add_signed(delta),
-                        format!(
-                            "Timeout Timer → {}",
-                            s.timeout_timer().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::CwDelayTime => (
-                        0x1020,
-                        s.cw_delay_time().saturating_add_signed(delta),
-                        format!(
-                            "CW Delay → {}",
-                            s.cw_delay_time().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::CwPitch => (
-                        0x1021,
-                        s.cw_pitch().saturating_add_signed(delta),
-                        format!("CW Pitch → {}", s.cw_pitch().saturating_add_signed(delta)),
-                    ),
-                    SettingRow::DtmfSpeed => (
-                        0x1024,
-                        s.dtmf_speed().saturating_add_signed(delta),
-                        format!(
-                            "DTMF Speed → {}",
-                            s.dtmf_speed().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::DtmfPauseTime => (
-                        0x1026,
-                        s.dtmf_pause_time().saturating_add_signed(delta),
-                        format!(
-                            "DTMF Pause → {}",
-                            s.dtmf_pause_time().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::RepeaterCallKey => (
-                        0x1031,
-                        s.repeater_call_key().saturating_add_signed(delta),
-                        format!(
-                            "Call Key → {}",
-                            s.repeater_call_key().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::MicSensitivity => (
-                        0x1040,
-                        s.mic_sensitivity().saturating_add_signed(delta),
-                        format!(
-                            "Mic Sens → {}",
-                            s.mic_sensitivity().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::PfKey1 => (
-                        0x1041,
-                        s.pf_key1().saturating_add_signed(delta),
-                        format!("PF Key 1 → {}", s.pf_key1().saturating_add_signed(delta)),
-                    ),
-                    SettingRow::PfKey2 => (
-                        0x1042,
-                        s.pf_key2().saturating_add_signed(delta),
-                        format!("PF Key 2 → {}", s.pf_key2().saturating_add_signed(delta)),
-                    ),
-                    SettingRow::KeyLockType => (
-                        0x1061,
-                        s.key_lock_type_raw().saturating_add_signed(delta).min(2),
-                        format!(
-                            "Lock Type → {}",
-                            s.key_lock_type_raw().saturating_add_signed(delta).min(2)
-                        ),
-                    ),
-                    SettingRow::DualDisplaySize => (
-                        0x1066,
-                        s.dual_display_size().saturating_add_signed(delta),
-                        format!(
-                            "Dual Display → {}",
-                            s.dual_display_size().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::DisplayArea => (
-                        0x1067,
-                        s.display_area().saturating_add_signed(delta),
-                        format!(
-                            "Display Area → {}",
-                            s.display_area().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::InfoLine => (
-                        0x1068,
-                        s.info_line().saturating_add_signed(delta),
-                        format!("Info Line → {}", s.info_line().saturating_add_signed(delta)),
-                    ),
-                    SettingRow::BacklightControl => (
-                        0x1069,
-                        s.backlight_control().saturating_add_signed(delta),
-                        format!(
-                            "Backlight Ctrl → {}",
-                            s.backlight_control().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::BacklightTimer => (
-                        0x106A,
-                        s.backlight_timer().saturating_add_signed(delta),
-                        format!(
-                            "Backlight Timer → {}",
-                            s.backlight_timer().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::DisplayHoldTime => (
-                        0x106B,
-                        s.display_hold_time().saturating_add_signed(delta),
-                        format!(
-                            "Display Hold → {}",
-                            s.display_hold_time().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::DisplayMethod => (
-                        0x106C,
-                        s.display_method().saturating_add_signed(delta),
-                        format!(
-                            "Display Method → {}",
-                            s.display_method().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::PowerOnDisplay => (
-                        0x106D,
-                        s.power_on_display().saturating_add_signed(delta),
-                        format!(
-                            "PowerOn Display → {}",
-                            s.power_on_display().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::EmrVolumeLevel => (
-                        0x106E,
-                        s.emr_volume_level().saturating_add_signed(delta),
-                        format!(
-                            "EMR Vol → {}",
-                            s.emr_volume_level().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::AutoMuteReturnTime => (
-                        0x106F,
-                        s.auto_mute_return_time().saturating_add_signed(delta),
-                        format!(
-                            "Auto Mute → {}",
-                            s.auto_mute_return_time().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::BeepVolume => {
-                        let cur = s.beep_volume();
-                        let v = if delta > 0 {
-                            cur.saturating_add(1).min(7)
-                        } else {
-                            cur.saturating_sub(1).max(1)
-                        };
-                        (0x1072, v, format!("Beep Vol → {v}"))
-                    }
-                    SettingRow::VoiceLanguage => (
-                        0x1073,
-                        s.voice_language().saturating_add_signed(delta),
-                        format!(
-                            "Voice Lang → {}",
-                            s.voice_language().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::VoiceVolume => (
-                        0x1074,
-                        s.voice_volume().saturating_add_signed(delta),
-                        format!(
-                            "Voice Vol → {}",
-                            s.voice_volume().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::VoiceSpeed => (
-                        0x1075,
-                        s.voice_speed().saturating_add_signed(delta),
-                        format!(
-                            "Voice Speed → {}",
-                            s.voice_speed().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::SpeedDistanceUnit => {
-                        let v = if delta > 0 {
-                            s.speed_distance_unit_raw().saturating_add(1).min(2)
-                        } else {
-                            s.speed_distance_unit_raw().saturating_sub(1)
-                        };
-                        (
-                            0x1077,
-                            v,
-                            format!(
-                                "Speed Unit → {}",
-                                ["mph", "km/h", "knots"].get(v as usize).unwrap_or(&"?")
-                            ),
-                        )
-                    }
-                    SettingRow::AltitudeRainUnit => {
-                        let v = if delta > 0 {
-                            s.altitude_rain_unit_raw().saturating_add(1).min(1)
-                        } else {
-                            s.altitude_rain_unit_raw().saturating_sub(1)
-                        };
-                        (
-                            0x1083,
-                            v,
-                            format!("Alt Unit → {}", if v == 0 { "ft/in" } else { "m/mm" }),
-                        )
-                    }
-                    SettingRow::TemperatureUnit => {
-                        let v = if delta > 0 {
-                            s.temperature_unit_raw().saturating_add(1).min(1)
-                        } else {
-                            s.temperature_unit_raw().saturating_sub(1)
-                        };
-                        (
-                            0x1084,
-                            v,
-                            format!("Temp Unit → {}", if v == 0 { "°F" } else { "°C" }),
-                        )
-                    }
-                    SettingRow::GpsBtInterface => (
-                        0x1080,
-                        s.gps_bt_interface().saturating_add_signed(delta),
-                        format!(
-                            "GPS/BT → {}",
-                            s.gps_bt_interface().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::PcOutputMode => (
-                        0x1085,
-                        s.pc_output_mode().saturating_add_signed(delta),
-                        format!(
-                            "PC Output → {}",
-                            s.pc_output_mode().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::AprsUsbMode => (
-                        0x1086,
-                        s.aprs_usb_mode().saturating_add_signed(delta),
-                        format!(
-                            "APRS USB → {}",
-                            s.aprs_usb_mode().saturating_add_signed(delta)
-                        ),
-                    ),
-                    SettingRow::AutoPowerOff => {
-                        let v = if delta > 0 {
-                            s.auto_power_off_raw().saturating_add(1).min(4)
-                        } else {
-                            s.auto_power_off_raw().saturating_sub(1)
-                        };
-                        (
-                            0x10D0,
-                            v,
-                            format!(
-                                "Auto PwrOff → {}",
-                                ["Off", "30m", "60m", "90m", "120m"]
-                                    .get(v as usize)
-                                    .unwrap_or(&"?")
-                            ),
-                        )
-                    }
-                    _ => {
-                        self.status_message = Some(format!("{}: not adjustable", row.label()));
-                        return;
-                    }
-                }
-            } else {
-                self.status_message = Some(format!("{}: load MCP data first (m → r)", row.label()));
-                return;
-            };
+        let McpState::Loaded { ref mut image, .. } = self.mcp else {
+            self.status_message = Some(format!("{}: load MCP data first (m → r)", row.label()));
+            return;
+        };
 
-        let _ = tx.send(crate::event::RadioCommand::McpWriteByte {
-            offset,
-            value: new_val,
-        });
-        self.status_message = Some(format!("{label} — applying..."));
+        /// Compute a new numeric value by applying `delta` to the current value,
+        /// then write it via `modify_setting`.
+        macro_rules! adjust_numeric {
+            ($getter:ident, $setter:ident, $label:expr, $image:expr, $delta:expr, $tx:expr) => {{
+                let new_val = $image.settings().$getter().saturating_add_signed($delta);
+                if let Some((offset, value)) = $image.modify_setting(|w| w.$setter(new_val)) {
+                    let _ = $tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message =
+                        Some(format!("{} → {} — applying...", $label, new_val));
+                }
+            }};
+        }
+
+        match row {
+            SettingRow::FmNarrow => {
+                adjust_numeric!(fm_narrow, set_fm_narrow, "FM Narrow", image, delta, tx);
+            }
+            SettingRow::SsbHighCut => {
+                adjust_numeric!(
+                    ssb_high_cut,
+                    set_ssb_high_cut,
+                    "SSB High Cut",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::CwHighCut => {
+                adjust_numeric!(
+                    cw_high_cut,
+                    set_cw_high_cut,
+                    "CW High Cut",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::AmHighCut => {
+                adjust_numeric!(
+                    am_high_cut,
+                    set_am_high_cut,
+                    "AM High Cut",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::AutoFilter => {
+                adjust_numeric!(
+                    auto_filter,
+                    set_auto_filter,
+                    "Auto Filter",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::ScanResume => {
+                adjust_numeric!(
+                    scan_resume,
+                    set_scan_resume,
+                    "Scan Resume",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::DigitalScanResume => {
+                adjust_numeric!(
+                    digital_scan_resume,
+                    set_digital_scan_resume,
+                    "Dig Scan Resume",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::ScanRestartTime => {
+                adjust_numeric!(
+                    scan_restart_time,
+                    set_scan_restart_time,
+                    "Scan Restart Time",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::ScanRestartCarrier => {
+                adjust_numeric!(
+                    scan_restart_carrier,
+                    set_scan_restart_carrier,
+                    "Scan Restart Carrier",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::TimeoutTimer => {
+                adjust_numeric!(
+                    timeout_timer,
+                    set_timeout_timer,
+                    "Timeout Timer",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::CwDelayTime => {
+                adjust_numeric!(
+                    cw_delay_time,
+                    set_cw_delay_time,
+                    "CW Delay",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::CwPitch => {
+                adjust_numeric!(cw_pitch, set_cw_pitch, "CW Pitch", image, delta, tx);
+            }
+            SettingRow::DtmfSpeed => {
+                adjust_numeric!(dtmf_speed, set_dtmf_speed, "DTMF Speed", image, delta, tx);
+            }
+            SettingRow::DtmfPauseTime => {
+                adjust_numeric!(
+                    dtmf_pause_time,
+                    set_dtmf_pause_time,
+                    "DTMF Pause",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::RepeaterCallKey => {
+                adjust_numeric!(
+                    repeater_call_key,
+                    set_repeater_call_key,
+                    "Call Key",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::MicSensitivity => {
+                adjust_numeric!(
+                    mic_sensitivity,
+                    set_mic_sensitivity,
+                    "Mic Sens",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::PfKey1 => {
+                adjust_numeric!(pf_key1, set_pf_key1, "PF Key 1", image, delta, tx);
+            }
+            SettingRow::PfKey2 => {
+                adjust_numeric!(pf_key2, set_pf_key2, "PF Key 2", image, delta, tx);
+            }
+            SettingRow::KeyLockType => {
+                let new_val = image
+                    .settings()
+                    .key_lock_type_raw()
+                    .saturating_add_signed(delta)
+                    .min(2);
+                if let Some((offset, value)) =
+                    image.modify_setting(|w| w.set_key_lock_type_raw(new_val))
+                {
+                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message = Some(format!("Lock Type → {new_val} — applying..."));
+                }
+            }
+            SettingRow::DualDisplaySize => {
+                adjust_numeric!(
+                    dual_display_size,
+                    set_dual_display_size,
+                    "Dual Display",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::DisplayArea => {
+                adjust_numeric!(
+                    display_area,
+                    set_display_area,
+                    "Display Area",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::InfoLine => {
+                adjust_numeric!(info_line, set_info_line, "Info Line", image, delta, tx);
+            }
+            SettingRow::BacklightControl => {
+                adjust_numeric!(
+                    backlight_control,
+                    set_backlight_control,
+                    "Backlight Ctrl",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::BacklightTimer => {
+                adjust_numeric!(
+                    backlight_timer,
+                    set_backlight_timer,
+                    "Backlight Timer",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::DisplayHoldTime => {
+                adjust_numeric!(
+                    display_hold_time,
+                    set_display_hold_time,
+                    "Display Hold",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::DisplayMethod => {
+                adjust_numeric!(
+                    display_method,
+                    set_display_method,
+                    "Display Method",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::PowerOnDisplay => {
+                adjust_numeric!(
+                    power_on_display,
+                    set_power_on_display,
+                    "PowerOn Display",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::EmrVolumeLevel => {
+                adjust_numeric!(
+                    emr_volume_level,
+                    set_emr_volume_level,
+                    "EMR Vol",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::AutoMuteReturnTime => {
+                adjust_numeric!(
+                    auto_mute_return_time,
+                    set_auto_mute_return_time,
+                    "Auto Mute",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::BeepVolume => {
+                let cur = image.settings().beep_volume();
+                let new_val = if delta > 0 {
+                    cur.saturating_add(1).min(7)
+                } else {
+                    cur.saturating_sub(1).max(1)
+                };
+                if let Some((offset, value)) = image.modify_setting(|w| w.set_beep_volume(new_val))
+                {
+                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message = Some(format!("Beep Vol → {new_val} — applying..."));
+                }
+            }
+            SettingRow::VoiceLanguage => {
+                adjust_numeric!(
+                    voice_language,
+                    set_voice_language,
+                    "Voice Lang",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::VoiceVolume => {
+                adjust_numeric!(
+                    voice_volume,
+                    set_voice_volume,
+                    "Voice Vol",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::VoiceSpeed => {
+                adjust_numeric!(
+                    voice_speed,
+                    set_voice_speed,
+                    "Voice Speed",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::SpeedDistanceUnit => {
+                let new_val = if delta > 0 {
+                    image
+                        .settings()
+                        .speed_distance_unit_raw()
+                        .saturating_add(1)
+                        .min(2)
+                } else {
+                    image.settings().speed_distance_unit_raw().saturating_sub(1)
+                };
+                if let Some((offset, value)) =
+                    image.modify_setting(|w| w.set_speed_distance_unit_raw(new_val))
+                {
+                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message = Some(format!(
+                        "Speed Unit → {} — applying...",
+                        ["mph", "km/h", "knots"]
+                            .get(new_val as usize)
+                            .unwrap_or(&"?")
+                    ));
+                }
+            }
+            SettingRow::AltitudeRainUnit => {
+                let new_val = if delta > 0 {
+                    image
+                        .settings()
+                        .altitude_rain_unit_raw()
+                        .saturating_add(1)
+                        .min(1)
+                } else {
+                    image.settings().altitude_rain_unit_raw().saturating_sub(1)
+                };
+                if let Some((offset, value)) =
+                    image.modify_setting(|w| w.set_altitude_rain_unit_raw(new_val))
+                {
+                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message = Some(format!(
+                        "Alt Unit → {} — applying...",
+                        if new_val == 0 { "ft/in" } else { "m/mm" }
+                    ));
+                }
+            }
+            SettingRow::TemperatureUnit => {
+                let new_val = if delta > 0 {
+                    image
+                        .settings()
+                        .temperature_unit_raw()
+                        .saturating_add(1)
+                        .min(1)
+                } else {
+                    image.settings().temperature_unit_raw().saturating_sub(1)
+                };
+                if let Some((offset, value)) =
+                    image.modify_setting(|w| w.set_temperature_unit_raw(new_val))
+                {
+                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message = Some(format!(
+                        "Temp Unit → {} — applying...",
+                        if new_val == 0 { "°F" } else { "°C" }
+                    ));
+                }
+            }
+            SettingRow::GpsBtInterface => {
+                adjust_numeric!(
+                    gps_bt_interface,
+                    set_gps_bt_interface,
+                    "GPS/BT",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::PcOutputMode => {
+                adjust_numeric!(
+                    pc_output_mode,
+                    set_pc_output_mode,
+                    "PC Output",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::AprsUsbMode => {
+                adjust_numeric!(
+                    aprs_usb_mode,
+                    set_aprs_usb_mode,
+                    "APRS USB",
+                    image,
+                    delta,
+                    tx
+                );
+            }
+            SettingRow::AutoPowerOff => {
+                let new_val = if delta > 0 {
+                    image
+                        .settings()
+                        .auto_power_off_raw()
+                        .saturating_add(1)
+                        .min(4)
+                } else {
+                    image.settings().auto_power_off_raw().saturating_sub(1)
+                };
+                if let Some((offset, value)) =
+                    image.modify_setting(|w| w.set_auto_power_off_raw(new_val))
+                {
+                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message = Some(format!(
+                        "Auto PwrOff → {} — applying...",
+                        ["Off", "30m", "60m", "90m", "120m"]
+                            .get(new_val as usize)
+                            .unwrap_or(&"?")
+                    ));
+                }
+            }
+            _ => {
+                self.status_message = Some(format!("{}: not adjustable", row.label()));
+            }
+        }
     }
 }

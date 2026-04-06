@@ -64,7 +64,12 @@ fn parse_sf(payload: &str) -> Result<Response, ProtocolError> {
         field: "band".to_owned(),
         detail: e.to_string(),
     })?;
-    let step_val = parse_u8_field(parts[1], "SF", "step")?;
+    // Step value uses hex (TABLE C: A=50kHz, B=100kHz, confirmed by ARFC RE)
+    let step_val = u8::from_str_radix(parts[1], 16).map_err(|_| ProtocolError::FieldParse {
+        command: "SF".to_owned(),
+        field: "step".to_owned(),
+        detail: format!("invalid hex step: {:?}", parts[1]),
+    })?;
     let step = StepSize::try_from(step_val).map_err(|e| ProtocolError::FieldParse {
         command: "SF".to_owned(),
         field: "step".to_owned(),

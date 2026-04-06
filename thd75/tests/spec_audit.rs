@@ -194,11 +194,17 @@ fn mode_table_matches_spec() {
         );
     }
 
-    // Mode 8 should NOT exist (no WFM in MD command)
+    // Modes 8 (WFM) and 9 (CW-R) are NOT in the KI4LAX spec but
+    // confirmed via ARFC-D75 decompilation. Mode 10 should be invalid.
     assert!(
-        Mode::try_from(8).is_err(),
-        "Mode 8 should be invalid — spec only defines 0-7"
+        Mode::try_from(8).is_ok(),
+        "Mode 8 (WFM) confirmed by ARFC RE"
     );
+    assert!(
+        Mode::try_from(9).is_ok(),
+        "Mode 9 (CW-R) confirmed by ARFC RE"
+    );
+    assert!(Mode::try_from(10).is_err(), "Mode 10 should be invalid");
 }
 
 // ============================================================================
@@ -244,11 +250,13 @@ fn tone_table_matches_spec() {
         );
     }
 
-    // Index 50 should be invalid
+    // Index 50 = 1750 Hz tone burst (not in KI4LAX spec, confirmed by ARFC RE)
     assert!(
-        ToneCode::new(50).is_err(),
-        "Tone code 50 should be invalid — spec defines 0-49"
+        ToneCode::new(50).is_ok(),
+        "Tone code 50 (1750 Hz burst) confirmed by ARFC RE"
     );
+    // Index 51 should be invalid
+    assert!(ToneCode::new(51).is_err(), "Tone code 51 should be invalid");
 }
 
 // ============================================================================

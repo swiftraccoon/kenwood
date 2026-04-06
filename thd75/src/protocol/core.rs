@@ -79,10 +79,10 @@ pub(crate) fn serialize_channel_fields(ch: &ChannelMemory) -> String {
     // Build exactly 20 comma-separated fields matching the real D75 FO wire format.
     // Verified against hardware: see probes/fo_field_map.rs
     format!(
-        "{},{},{},0,0,0,0,{},{},{},{},{},{},{:02},{:02},{:03},{},{},{},{:02}",
+        "{},{},{:X},0,0,0,0,{},{},{},{},{},{},{:02},{:02},{:03},{},{},{},{:02}",
         ch.rx_frequency.to_wire_string(), // [0]  freq
         ch.tx_offset.to_wire_string(),    // [1]  offset
-        u8::from(ch.step_size),           // [2]  step
+        u8::from(ch.step_size),           // [2]  step (hex: TABLE C A=50kHz, B=100kHz)
         //                                   [3]  tx_step=0
         //                                   [4]  mode=0
         //                                   [5]  fine=0
@@ -121,12 +121,24 @@ fn parse_bool_field(payload: &str, cmd: &str) -> Result<bool, ProtocolError> {
     }
 }
 
-/// Parse a `u8` from a string field.
+/// Parse a `u8` from a string field (decimal).
 fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> {
     s.parse::<u8>().map_err(|_| ProtocolError::FieldParse {
         command: cmd.to_owned(),
         field: field.to_owned(),
         detail: format!("invalid u8: {s:?}"),
+    })
+}
+
+/// Parse a `u8` from a hex string field (e.g., step size in FO/ME uses TABLE C hex indices).
+///
+/// Confirmed by KI4LAX TABLE C (indices A=10, B=11) and ARFC-D75 decompilation
+/// (`NumberStyles.HexNumber` in response parsing).
+fn parse_hex_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> {
+    u8::from_str_radix(s, 16).map_err(|_| ProtocolError::FieldParse {
+        command: cmd.to_owned(),
+        field: field.to_owned(),
+        detail: format!("invalid hex u8: {s:?}"),
     })
 }
 
@@ -246,8 +258,8 @@ pub(crate) fn parse_channel_fields(
     // field 1: TX offset or split TX frequency (10 digits)
     let tx_offset = Frequency::from_wire_string(fields[1])?;
 
-    // field 2: RX step size
-    let step_val = parse_u8_field(fields[2], cmd, "step_size")?;
+    // field 2: RX step size (hex per KI4LAX TABLE C: A=50kHz, B=100kHz)
+    let step_val = parse_hex_u8_field(fields[2], cmd, "step_size")?;
     let step_size = StepSize::try_from(step_val).map_err(|e| ProtocolError::FieldParse {
         command: cmd.to_owned(),
         field: "step_size".to_owned(),

@@ -194,6 +194,51 @@ impl MemoryImage {
         SettingsWriter::new(&mut self.raw)
     }
 
+    /// Apply a settings mutation and return the changed byte's MCP offset
+    /// and new value.
+    ///
+    /// The closure receives a `SettingsWriter` to modify exactly one setting.
+    /// This method snapshots the settings page before the closure, runs it,
+    /// then diffs to find the single changed byte. Returns `Some((offset, value))`
+    /// if a byte changed, or `None` if nothing changed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than one byte changed (the closure should modify
+    /// exactly one setting).
+    pub fn modify_setting<F>(&mut self, f: F) -> Option<(u16, u8)>
+    where
+        F: FnOnce(&mut SettingsWriter<'_>),
+    {
+        // Settings live at offsets 0x0000..0x2000 in the raw image
+        // (MCP addresses 0x1000..0x10FF map to image[0x1000..0x10FF])
+        const SETTINGS_START: usize = 0x1000;
+        const SETTINGS_END: usize = 0x1100;
+
+        // Snapshot the settings region
+        let mut snapshot = [0u8; SETTINGS_END - SETTINGS_START];
+        snapshot.copy_from_slice(&self.raw[SETTINGS_START..SETTINGS_END]);
+
+        // Apply the mutation
+        f(&mut SettingsWriter::new(&mut self.raw));
+
+        // Diff to find the changed byte
+        let mut changed: Option<(u16, u8)> = None;
+        for (i, &snap_byte) in snapshot.iter().enumerate() {
+            let current = self.raw[SETTINGS_START + i];
+            if current != snap_byte {
+                assert!(
+                    changed.is_none(),
+                    "modify_setting: more than one byte changed"
+                );
+                #[allow(clippy::cast_possible_truncation)]
+                let offset = (SETTINGS_START + i) as u16;
+                changed = Some((offset, current));
+            }
+        }
+        changed
+    }
+
     /// Access the APRS configuration region (raw bytes).
     #[must_use]
     pub fn aprs(&self) -> AprsAccess<'_> {

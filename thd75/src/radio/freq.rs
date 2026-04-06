@@ -678,23 +678,23 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set fine tune on/off for a band (FT write).
+    /// Set fine tune on/off (FT write).
     ///
     /// Per Operating Tips section 5.10.6: Fine Tune only works with AM modulation
-    /// and Band B. The write form takes a band parameter unlike the bare read.
+    /// and Band B.
     ///
     /// # Wire format
     ///
-    /// `FT band,value\r` where band is 0 (A) or 1 (B) and value is 0 (off) or 1 (on).
+    /// `FT value\r` where value is 0 (off) or 1 (on). This is a global toggle
+    /// (no band parameter). Confirmed by ARFC-D75 decompilation and firmware
+    /// handler analysis (accepts only 5-byte commands: `FT N\r`).
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_function_type(&mut self, band: Band, enabled: bool) -> Result<(), Error> {
-        tracing::info!(?band, enabled, "setting fine tune (FT)");
-        let response = self
-            .execute(Command::SetFunctionType { band, enabled })
-            .await?;
+    pub async fn set_function_type(&mut self, enabled: bool) -> Result<(), Error> {
+        tracing::info!(enabled, "setting fine tune (FT)");
+        let response = self.execute(Command::SetFunctionType { enabled }).await?;
         match response {
             Response::FunctionType { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {

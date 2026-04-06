@@ -14,7 +14,9 @@ pub mod dstar;
 #[path = "freq.rs"]
 pub mod freq;
 pub mod gps;
+pub mod kiss_session;
 pub mod memory;
+pub mod mmdvm_session;
 pub mod programming;
 pub mod scan;
 pub mod service;
@@ -90,16 +92,20 @@ impl RadioMode {
 /// Use the safe tuning methods ([`tune_frequency`](Radio::tune_frequency),
 /// [`tune_channel`](Radio::tune_channel)) for automatic mode management.
 pub struct Radio<T: Transport> {
-    transport: T,
-    codec: Codec,
-    notifications: tokio::sync::broadcast::Sender<Response>,
-    timeout: Duration,
+    pub(crate) transport: T,
+    pub(crate) codec: Codec,
+    pub(crate) notifications: tokio::sync::broadcast::Sender<Response>,
+    pub(crate) timeout: Duration,
     /// Cached mode for band A. `None` until a VM command is observed.
-    mode_a: Option<RadioMode>,
+    pub(crate) mode_a: Option<RadioMode>,
     /// Cached mode for band B. `None` until a VM command is observed.
-    mode_b: Option<RadioMode>,
+    pub(crate) mode_b: Option<RadioMode>,
     /// MCP programming mode transfer speed.
     pub(crate) mcp_speed: programming::McpSpeed,
+    /// Timestamp of last command sent, for 5ms inter-command spacing.
+    /// ARFC-D75 enforces a minimum 5ms gap between commands to avoid
+    /// overwhelming the radio's command buffer.
+    last_cmd_time: Option<tokio::time::Instant>,
 }
 
 impl<T: Transport> std::fmt::Debug for Radio<T> {
@@ -114,6 +120,7 @@ impl<T: Transport> std::fmt::Debug for Radio<T> {
             .field("mode_a", &self.mode_a)
             .field("mode_b", &self.mode_b)
             .field("mcp_speed", &self.mcp_speed)
+            .field("last_cmd_time", &self.last_cmd_time)
             .finish_non_exhaustive()
     }
 }
@@ -136,7 +143,51 @@ impl<T: Transport> Radio<T> {
             mode_a: None,
             mode_b: None,
             mcp_speed: programming::McpSpeed::default(),
+            last_cmd_time: None,
         })
+    }
+
+    /// Connect with a TNC exit preamble for robustness.
+    ///
+    /// If the radio was left in KISS/TNC mode (e.g., by a crashed application),
+    /// normal CAT commands will fail. This method sends the same exit sequence
+    /// that Kenwood's ARFC-D75 software uses before starting CAT communication:
+    ///
+    /// 1. Two empty frames
+    /// 2. 300ms delay
+    /// 3. ETX byte (0x03)
+    /// 4. `\rTC 1\r` (TNC exit command)
+    ///
+    /// After the preamble, the radio should be in normal CAT mode regardless
+    /// of its previous state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transport connection fails.
+    pub async fn connect_safe(transport: T) -> Result<Self, Error> {
+        tracing::info!("connecting with TNC exit preamble");
+        let mut radio = Self::connect(transport).await?;
+
+        // Send empty frames
+        let _ = radio.transport.write(b"\r").await;
+        let _ = radio.transport.write(b"\r").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // ETX (exit KISS/TNC mode)
+        let _ = radio.transport.write(&[0x03]).await;
+        // TNC exit command
+        let _ = radio.transport.write(b"\rTC 1\r").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Drain any buffered responses
+        let mut drain_buf = [0u8; 4096];
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            radio.transport.read(&mut drain_buf),
+        )
+        .await;
+
+        Ok(radio)
     }
 
     /// Subscribe to auto-info notifications.
@@ -221,17 +272,26 @@ impl<T: Transport> Radio<T> {
             tracing::warn!(cmd = %cmd_name, warning, "command may fail in current mode");
         }
 
-        // 1. Serialize command to wire format.
+        // 1. Enforce 5ms minimum inter-command spacing (per ARFC-D75 RE).
+        if let Some(last) = self.last_cmd_time {
+            let elapsed = last.elapsed();
+            if elapsed < Duration::from_millis(5) {
+                tokio::time::sleep(Duration::from_millis(5) - elapsed).await;
+            }
+        }
+
+        // 2. Serialize command to wire format.
         let wire = protocol::serialize(&cmd);
 
-        // 2. Write to transport.
+        // 3. Write to transport.
         tracing::trace!(cmd = %cmd_name, wire = ?String::from_utf8_lossy(&wire).trim(), "TX");
         self.transport
             .write(&wire)
             .await
             .map_err(Error::Transport)?;
+        self.last_cmd_time = Some(tokio::time::Instant::now());
 
-        // 3. Read response bytes (loop until codec has a complete frame),
+        // 4. Read response bytes (loop until codec has a complete frame),
         //    wrapped in a timeout. With AI mode enabled, unsolicited
         //    notifications may arrive interleaved with command responses.
         //    Match the frame's mnemonic to the command we sent; route

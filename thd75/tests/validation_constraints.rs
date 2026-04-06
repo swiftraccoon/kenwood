@@ -14,8 +14,12 @@ use kenwood_thd75::types::*;
 
 #[test]
 fn tone_code_boundary() {
-    assert!(ToneCode::new(49).is_ok(), "49 is the last valid tone code");
-    assert!(ToneCode::new(50).is_err(), "50 must be rejected");
+    assert!(ToneCode::new(49).is_ok(), "49 is the last CTCSS tone code");
+    assert!(
+        ToneCode::new(50).is_ok(),
+        "50 is the 1750 Hz tone burst (ARFC RE)"
+    );
+    assert!(ToneCode::new(51).is_err(), "51 must be rejected");
 }
 
 #[test]
@@ -26,8 +30,10 @@ fn band_boundary() {
 
 #[test]
 fn mode_boundary() {
-    assert!(Mode::try_from(7u8).is_ok(), "7 (DR) is the last valid mode");
-    assert!(Mode::try_from(8u8).is_err(), "8 must be rejected");
+    assert!(Mode::try_from(7u8).is_ok(), "7 (DR) is valid");
+    assert!(Mode::try_from(8u8).is_ok(), "8 (WFM) confirmed by ARFC RE");
+    assert!(Mode::try_from(9u8).is_ok(), "9 (CW-R) confirmed by ARFC RE");
+    assert!(Mode::try_from(10u8).is_err(), "10 must be rejected");
 }
 
 #[test]
@@ -41,11 +47,12 @@ fn power_level_boundary() {
 
 #[test]
 fn tone_mode_boundary() {
+    assert!(ToneMode::try_from(2u8).is_ok(), "2 (DCS) is valid");
     assert!(
-        ToneMode::try_from(2u8).is_ok(),
-        "2 (DCS) is the last valid tone mode"
+        ToneMode::try_from(3u8).is_ok(),
+        "3 (CrossTone) confirmed by ARFC RE"
     );
-    assert!(ToneMode::try_from(3u8).is_err(), "3 must be rejected");
+    assert!(ToneMode::try_from(4u8).is_err(), "4 must be rejected");
 }
 
 #[test]
@@ -120,10 +127,10 @@ fn dcs_code_index_boundary() {
 
 #[test]
 fn tone_code_full_valid_range() {
-    for i in 0u8..50 {
+    for i in 0u8..=50 {
         assert!(ToneCode::new(i).is_ok(), "ToneCode({i}) should be valid");
     }
-    for i in 50u8..=255 {
+    for i in 51u8..=255 {
         assert!(ToneCode::new(i).is_err(), "ToneCode({i}) should be invalid");
     }
 }
@@ -140,10 +147,10 @@ fn band_full_valid_range() {
 
 #[test]
 fn mode_full_valid_range() {
-    for i in 0u8..8 {
+    for i in 0u8..=9 {
         assert!(Mode::try_from(i).is_ok(), "Mode({i}) should be valid");
     }
-    for i in 8u8..=255 {
+    for i in 10u8..=255 {
         assert!(Mode::try_from(i).is_err(), "Mode({i}) should be invalid");
     }
 }
@@ -164,11 +171,12 @@ fn dcs_code_full_valid_range() {
 
 #[test]
 fn ctcss_frequency_table_every_entry() {
-    let expected: [f64; 50] = [
+    let expected: [f64; 51] = [
         67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8, 97.4, 100.0, 103.5,
         107.2, 110.9, 114.8, 118.8, 123.0, 127.3, 131.8, 136.5, 141.3, 146.2, 151.4, 156.7, 159.8,
         162.2, 165.5, 167.9, 171.3, 173.8, 177.3, 179.9, 183.5, 186.2, 189.9, 192.8, 196.6, 199.5,
         203.5, 206.5, 210.7, 218.1, 225.7, 229.1, 233.6, 241.8, 250.3, 254.1,
+        1750.0, // Code 50: 1750 Hz tone burst (ARFC RE, not a CTCSS tone)
     ];
     assert_eq!(CTCSS_FREQUENCIES.len(), expected.len());
     for (i, (&actual, &exp)) in CTCSS_FREQUENCIES.iter().zip(expected.iter()).enumerate() {
@@ -311,8 +319,8 @@ fn all_enum_types_round_trip() {
         assert_eq!(u8::from(val), i, "PowerLevel round-trip failed for {i}");
     }
 
-    // ToneMode: 0..3
-    for i in 0u8..3 {
+    // ToneMode: 0..4
+    for i in 0u8..4 {
         let val = ToneMode::try_from(i).unwrap();
         assert_eq!(u8::from(val), i, "ToneMode round-trip failed for {i}");
     }

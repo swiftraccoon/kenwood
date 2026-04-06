@@ -1,4 +1,4 @@
-//! Service mode commands: 0G, 0E, 0Y, 0S, 0R, 0W, 1A, 1D, 1E, 1I, 1N, 1U, 1V, 1W, 1F, 9E, 9R, 2V, 1G, 1C.
+//! Service mode commands: 0G, 0Y, 0S, 0R, 0W, 1A, 1D, 1E, 1I, 1N, 1U, 1V, 1W, 1F, 9E, 9R, 2V, 1G, 1C.
 //!
 //! Provides parsing of responses for the 20 factory service mode commands
 //! discovered via Ghidra firmware reverse engineering of the TH-D75 V1.03.
