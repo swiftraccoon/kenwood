@@ -1,6 +1,9 @@
 mod aprs;
 mod band;
 mod channels;
+mod dstar;
+mod fm_radio;
+mod gps;
 mod help;
 mod mcp;
 mod settings;
@@ -52,8 +55,17 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         MainView::Aprs => {
             aprs::render(app, frame, main_row[0], main_row[1]);
         }
+        MainView::DStar => {
+            dstar::render(app, frame, main_row[0], main_row[1]);
+        }
+        MainView::Gps => {
+            gps::render(app, frame, main_row[0], main_row[1]);
+        }
         MainView::Mcp => {
             mcp::render(app, frame, main_row[0], main_row[1]);
+        }
+        MainView::FmRadio => {
+            fm_radio::render(app, frame, main_row[0], main_row[1]);
         }
     }
 

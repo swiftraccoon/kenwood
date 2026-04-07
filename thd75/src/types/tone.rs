@@ -74,6 +74,9 @@ pub const DCS_CODES: [u16; 104] = [
 pub struct ToneCode(u8);
 
 impl ToneCode {
+    /// Maximum valid tone code index (inclusive).
+    pub const MAX_INDEX: u8 = 50;
+
     /// Creates a new `ToneCode` from a raw index.
     ///
     /// # Errors
@@ -114,6 +117,12 @@ impl std::fmt::Display for ToneCode {
 pub struct DcsCode(u8);
 
 impl DcsCode {
+    /// Number of valid DCS code indices (0-103).
+    pub const COUNT: u8 = 104;
+
+    /// Maximum valid DCS code index (inclusive).
+    pub const MAX_INDEX: u8 = 103;
+
     /// Creates a new `DcsCode` from a raw index.
     ///
     /// # Errors
@@ -169,6 +178,11 @@ pub enum ToneMode {
     CrossTone = 3,
 }
 
+impl ToneMode {
+    /// Number of valid tone mode values (0-3).
+    pub const COUNT: u8 = 4;
+}
+
 impl std::fmt::Display for ToneMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -215,6 +229,11 @@ pub enum CtcssMode {
     EncodeOnly = 2,
 }
 
+impl CtcssMode {
+    /// Number of valid CTCSS mode values (0-2).
+    pub const COUNT: u8 = 3;
+}
+
 impl TryFrom<u8> for CtcssMode {
     type Error = ValidationError;
 
@@ -243,6 +262,11 @@ pub enum DataSpeed {
     Bps1200 = 0,
     /// 9600 bps (index 1).
     Bps9600 = 1,
+}
+
+impl DataSpeed {
+    /// Number of valid data speed values (0-1).
+    pub const COUNT: u8 = 2;
 }
 
 impl std::fmt::Display for DataSpeed {
@@ -291,6 +315,11 @@ pub enum LockoutMode {
     Group = 2,
 }
 
+impl LockoutMode {
+    /// Number of valid lockout mode values (0-2).
+    pub const COUNT: u8 = 3;
+}
+
 impl std::fmt::Display for LockoutMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -326,14 +355,15 @@ mod tests {
 
     #[test]
     fn tone_code_valid_range() {
-        for i in 0u8..=50 {
-            assert!(ToneCode::new(i).is_ok());
+        for i in 0u8..=ToneCode::MAX_INDEX {
+            let val = ToneCode::new(i).unwrap();
+            assert_eq!(val.index(), i, "ToneCode round-trip failed at {i}");
         }
     }
 
     #[test]
     fn tone_code_invalid() {
-        assert!(ToneCode::new(51).is_err());
+        assert!(ToneCode::new(ToneCode::MAX_INDEX + 1).is_err());
         assert!(ToneCode::new(255).is_err());
     }
 
@@ -363,12 +393,12 @@ mod tests {
     #[test]
     fn dcs_code_valid() {
         assert!(DcsCode::new(0).is_ok());
-        assert!(DcsCode::new(103).is_ok());
+        assert!(DcsCode::new(DcsCode::MAX_INDEX).is_ok());
     }
 
     #[test]
     fn dcs_code_invalid() {
-        assert!(DcsCode::new(104).is_err());
+        assert!(DcsCode::new(DcsCode::COUNT).is_err());
         assert!(DcsCode::new(255).is_err());
     }
 
@@ -387,35 +417,41 @@ mod tests {
 
     #[test]
     fn tone_mode_valid_range() {
-        assert!(ToneMode::try_from(0u8).is_ok());
-        assert!(ToneMode::try_from(1u8).is_ok());
-        assert!(ToneMode::try_from(2u8).is_ok());
-        assert!(ToneMode::try_from(3u8).is_ok()); // CrossTone (ARFC RE)
+        for i in 0u8..ToneMode::COUNT {
+            let val = ToneMode::try_from(i).unwrap();
+            assert_eq!(u8::from(val), i, "ToneMode round-trip failed at {i}");
+        }
     }
 
     #[test]
     fn tone_mode_invalid() {
-        assert!(ToneMode::try_from(4u8).is_err());
+        assert!(ToneMode::try_from(ToneMode::COUNT).is_err());
     }
 
     #[test]
     fn data_speed_valid() {
-        assert!(DataSpeed::try_from(0u8).is_ok());
-        assert!(DataSpeed::try_from(1u8).is_ok());
-        assert!(DataSpeed::try_from(2u8).is_err());
+        for i in 0u8..DataSpeed::COUNT {
+            let val = DataSpeed::try_from(i).unwrap();
+            assert_eq!(u8::from(val), i, "DataSpeed round-trip failed at {i}");
+        }
+        assert!(DataSpeed::try_from(DataSpeed::COUNT).is_err());
     }
 
     #[test]
     fn lockout_mode_valid() {
-        assert!(LockoutMode::try_from(0u8).is_ok());
-        assert!(LockoutMode::try_from(2u8).is_ok());
-        assert!(LockoutMode::try_from(3u8).is_err());
+        for i in 0u8..LockoutMode::COUNT {
+            let val = LockoutMode::try_from(i).unwrap();
+            assert_eq!(u8::from(val), i, "LockoutMode round-trip failed at {i}");
+        }
+        assert!(LockoutMode::try_from(LockoutMode::COUNT).is_err());
     }
 
     #[test]
     fn ctcss_mode_valid() {
-        assert!(CtcssMode::try_from(0u8).is_ok());
-        assert!(CtcssMode::try_from(2u8).is_ok());
-        assert!(CtcssMode::try_from(3u8).is_err());
+        for i in 0u8..CtcssMode::COUNT {
+            let val = CtcssMode::try_from(i).unwrap();
+            assert_eq!(u8::from(val), i, "CtcssMode round-trip failed at {i}");
+        }
+        assert!(CtcssMode::try_from(CtcssMode::COUNT).is_err());
     }
 }

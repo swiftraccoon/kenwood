@@ -747,6 +747,11 @@ impl TryFrom<u8> for AutoPowerOff {
     }
 }
 
+impl KeyLockType {
+    /// Number of valid key lock type values (0-2).
+    pub const COUNT: u8 = 3;
+}
+
 impl TryFrom<u8> for KeyLockType {
     type Error = ValidationError;
 

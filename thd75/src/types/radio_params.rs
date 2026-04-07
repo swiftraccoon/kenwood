@@ -27,6 +27,8 @@ impl SquelchLevel {
     pub const OPEN: Self = Self(0);
     /// Maximum squelch (level 6).
     pub const MAX: Self = Self(6);
+    /// Number of valid squelch levels (0-6).
+    pub const COUNT: u8 = 7;
 
     /// Creates a new `SquelchLevel` from a raw value.
     ///
@@ -135,6 +137,9 @@ impl fmt::Display for AfGainLevel {
 pub struct SMeterReading(u8);
 
 impl SMeterReading {
+    /// Number of valid S-meter reading values (0-5).
+    pub const COUNT: u8 = 6;
+
     /// Creates a new `SMeterReading` from a raw value.
     ///
     /// # Errors
@@ -227,6 +232,11 @@ pub enum VfoMemoryMode {
     Weather = 3,
 }
 
+impl VfoMemoryMode {
+    /// Number of valid VFO/memory mode values (0-3).
+    pub const COUNT: u8 = 4;
+}
+
 impl fmt::Display for VfoMemoryMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -278,6 +288,11 @@ pub enum FilterMode {
     Cw = 1,
     /// AM filter (index 2).
     Am = 2,
+}
+
+impl FilterMode {
+    /// Number of valid filter mode values (0-2).
+    pub const COUNT: u8 = 3;
 }
 
 impl fmt::Display for FilterMode {
@@ -348,6 +363,11 @@ pub enum BatteryLevel {
     Charging = 4,
 }
 
+impl BatteryLevel {
+    /// Number of valid battery level values (0-4).
+    pub const COUNT: u8 = 5;
+}
+
 impl fmt::Display for BatteryLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -403,6 +423,9 @@ impl From<BatteryLevel> for u8 {
 pub struct VoxGain(u8);
 
 impl VoxGain {
+    /// Maximum valid VOX gain value (inclusive).
+    pub const MAX: u8 = 9;
+
     /// Creates a new `VoxGain` from a raw value.
     ///
     /// # Errors
@@ -465,6 +488,9 @@ impl fmt::Display for VoxGain {
 pub struct VoxDelay(u8);
 
 impl VoxDelay {
+    /// Maximum valid VOX delay value (inclusive).
+    pub const MAX: u8 = 30;
+
     /// Creates a new `VoxDelay` from a raw value.
     ///
     /// # Errors
@@ -530,6 +556,11 @@ pub enum TncBaud {
     Bps9600 = 1,
 }
 
+impl TncBaud {
+    /// Number of valid TNC baud rate values (0-1).
+    pub const COUNT: u8 = 2;
+}
+
 impl fmt::Display for TncBaud {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -583,6 +614,11 @@ pub enum BeaconMode {
     SmartBeaconing = 4,
 }
 
+impl BeaconMode {
+    /// Number of valid beacon mode values (0-4).
+    pub const COUNT: u8 = 5;
+}
+
 impl fmt::Display for BeaconMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -632,6 +668,11 @@ impl From<BeaconMode> for u8 {
 pub struct DstarSlot(u8);
 
 impl DstarSlot {
+    /// Minimum valid D-STAR slot index.
+    pub const MIN: u8 = 1;
+    /// Maximum valid D-STAR slot index.
+    pub const MAX: u8 = 6;
+
     /// Creates a new `DstarSlot` from a raw value.
     ///
     /// # Errors
@@ -688,6 +729,9 @@ impl fmt::Display for DstarSlot {
 pub struct CallsignSlot(u8);
 
 impl CallsignSlot {
+    /// Maximum valid callsign slot index (inclusive).
+    pub const MAX: u8 = 10;
+
     /// Creates a new `CallsignSlot` from a raw value.
     ///
     /// # Errors
@@ -762,6 +806,11 @@ pub enum DetectOutputMode {
     Detect = 2,
 }
 
+impl DetectOutputMode {
+    /// Number of valid detect output mode values (0-2).
+    pub const COUNT: u8 = 3;
+}
+
 impl fmt::Display for DetectOutputMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -817,6 +866,11 @@ pub enum DvGatewayMode {
     /// to confirm exact behavior — may be "Auto" or "Access Point" mode
     /// for D-STAR hotspot operation.
     AccessPoint = 2,
+}
+
+impl DvGatewayMode {
+    /// Number of valid DV gateway mode values (0-2).
+    pub const COUNT: u8 = 3;
 }
 
 impl fmt::Display for DvGatewayMode {
@@ -879,6 +933,11 @@ pub enum TncMode {
     /// Uses MMDVM serial commands via USB or Bluetooth.
     /// See Operating Tips §4.5.
     Mmdvm = 3,
+}
+
+impl TncMode {
+    /// Number of valid TNC mode values (0-3).
+    pub const COUNT: u8 = 4;
 }
 
 impl fmt::Display for TncMode {
@@ -1045,6 +1104,11 @@ pub enum GpsRadioMode {
     GpsReceiver = 1,
 }
 
+impl GpsRadioMode {
+    /// Number of valid GPS radio mode values (0-1).
+    pub const COUNT: u8 = 2;
+}
+
 impl TryFrom<u8> for GpsRadioMode {
     type Error = ValidationError;
 
@@ -1086,10 +1150,11 @@ mod tests {
 
     #[test]
     fn squelch_level_valid() {
-        for v in 0..=6 {
-            assert!(SquelchLevel::new(v).is_ok());
+        for v in 0..SquelchLevel::COUNT {
+            let val = SquelchLevel::new(v).unwrap();
+            assert_eq!(val.as_u8(), v, "SquelchLevel round-trip failed at {v}");
         }
-        assert!(SquelchLevel::new(7).is_err());
+        assert!(SquelchLevel::new(SquelchLevel::COUNT).is_err());
     }
 
     #[test]
@@ -1111,35 +1176,40 @@ mod tests {
     #[test]
     fn smeter_s_units() {
         assert_eq!(SMeterReading::new(0).unwrap().s_unit(), "S0");
-        assert_eq!(SMeterReading::new(5).unwrap().s_unit(), "S9");
-        assert!(SMeterReading::new(6).is_err());
+        assert_eq!(
+            SMeterReading::new(SMeterReading::COUNT - 1)
+                .unwrap()
+                .s_unit(),
+            "S9"
+        );
+        assert!(SMeterReading::new(SMeterReading::COUNT).is_err());
     }
 
     #[test]
     fn vfo_memory_mode_round_trip() {
-        for v in 0..=3 {
+        for v in 0..VfoMemoryMode::COUNT {
             let mode = VfoMemoryMode::try_from(v).unwrap();
             assert_eq!(u8::from(mode), v);
         }
-        assert!(VfoMemoryMode::try_from(4).is_err());
+        assert!(VfoMemoryMode::try_from(VfoMemoryMode::COUNT).is_err());
     }
 
     #[test]
     fn filter_mode_round_trip() {
-        for v in 0..=2 {
+        for v in 0..FilterMode::COUNT {
             let mode = FilterMode::try_from(v).unwrap();
             assert_eq!(u8::from(mode), v);
         }
-        assert!(FilterMode::try_from(3).is_err());
+        assert!(FilterMode::try_from(FilterMode::COUNT).is_err());
     }
 
     #[test]
     fn battery_level_round_trip() {
-        for v in 0..=4 {
+        for v in 0..BatteryLevel::COUNT {
             let bl = BatteryLevel::try_from(v).unwrap();
             assert_eq!(u8::from(bl), v);
         }
-        assert!(BatteryLevel::try_from(5).is_err());
+        assert!(BatteryLevel::try_from(BatteryLevel::COUNT).is_err());
     }
 
     #[test]
@@ -1150,48 +1220,50 @@ mod tests {
     #[test]
     fn vox_gain_valid() {
         assert!(VoxGain::new(0).is_ok());
-        assert!(VoxGain::new(9).is_ok());
-        assert!(VoxGain::new(10).is_err());
+        assert!(VoxGain::new(VoxGain::MAX).is_ok());
+        assert!(VoxGain::new(VoxGain::MAX + 1).is_err());
     }
 
     #[test]
     fn vox_delay_millis() {
         let d = VoxDelay::new(15).unwrap();
         assert_eq!(d.as_millis(), 1500);
-        assert!(VoxDelay::new(31).is_err());
+        assert!(VoxDelay::new(VoxDelay::MAX + 1).is_err());
     }
 
     #[test]
     fn tnc_baud_round_trip() {
-        assert_eq!(TncBaud::try_from(0).unwrap(), TncBaud::Bps1200);
-        assert_eq!(TncBaud::try_from(1).unwrap(), TncBaud::Bps9600);
-        assert!(TncBaud::try_from(2).is_err());
+        for v in 0..TncBaud::COUNT {
+            let val = TncBaud::try_from(v).unwrap();
+            assert_eq!(u8::from(val), v, "TncBaud round-trip failed at {v}");
+        }
+        assert!(TncBaud::try_from(TncBaud::COUNT).is_err());
     }
 
     #[test]
     fn beacon_mode_round_trip() {
-        for v in 0..=4 {
+        for v in 0..BeaconMode::COUNT {
             let mode = BeaconMode::try_from(v).unwrap();
             assert_eq!(u8::from(mode), v);
         }
-        assert!(BeaconMode::try_from(5).is_err());
+        assert!(BeaconMode::try_from(BeaconMode::COUNT).is_err());
     }
 
     #[test]
     fn dstar_slot_valid() {
-        assert!(DstarSlot::new(0).is_err());
-        assert!(DstarSlot::new(1).is_ok());
-        assert!(DstarSlot::new(6).is_ok());
-        assert!(DstarSlot::new(7).is_err());
+        assert!(DstarSlot::new(DstarSlot::MIN - 1).is_err());
+        assert!(DstarSlot::new(DstarSlot::MIN).is_ok());
+        assert!(DstarSlot::new(DstarSlot::MAX).is_ok());
+        assert!(DstarSlot::new(DstarSlot::MAX + 1).is_err());
     }
 
     #[test]
     fn tnc_mode_round_trip() {
-        for v in 0..=3 {
+        for v in 0..TncMode::COUNT {
             let mode = TncMode::try_from(v).unwrap();
             assert_eq!(u8::from(mode), v);
         }
-        assert!(TncMode::try_from(4).is_err());
+        assert!(TncMode::try_from(TncMode::COUNT).is_err());
     }
 
     #[test]
@@ -1202,8 +1274,8 @@ mod tests {
     #[test]
     fn callsign_slot_valid() {
         assert!(CallsignSlot::new(0).is_ok());
-        assert!(CallsignSlot::new(10).is_ok());
-        assert!(CallsignSlot::new(11).is_err());
+        assert!(CallsignSlot::new(CallsignSlot::MAX).is_ok());
+        assert!(CallsignSlot::new(CallsignSlot::MAX + 1).is_err());
     }
 
     #[test]
@@ -1232,36 +1304,32 @@ mod tests {
 
     #[test]
     fn detect_output_mode_round_trip() {
-        assert_eq!(DetectOutputMode::try_from(0).unwrap(), DetectOutputMode::Af);
-        assert_eq!(DetectOutputMode::try_from(1).unwrap(), DetectOutputMode::If);
-        assert_eq!(
-            DetectOutputMode::try_from(2).unwrap(),
-            DetectOutputMode::Detect
-        );
-        assert!(DetectOutputMode::try_from(3).is_err());
+        for v in 0..DetectOutputMode::COUNT {
+            let val = DetectOutputMode::try_from(v).unwrap();
+            assert_eq!(
+                u8::from(val),
+                v,
+                "DetectOutputMode round-trip failed at {v}"
+            );
+        }
+        assert!(DetectOutputMode::try_from(DetectOutputMode::COUNT).is_err());
     }
 
     #[test]
     fn dv_gateway_mode_round_trip() {
-        assert_eq!(DvGatewayMode::try_from(0).unwrap(), DvGatewayMode::Off);
-        assert_eq!(
-            DvGatewayMode::try_from(1).unwrap(),
-            DvGatewayMode::ReflectorTerminal
-        );
-        assert_eq!(
-            DvGatewayMode::try_from(2).unwrap(),
-            DvGatewayMode::AccessPoint
-        );
-        assert!(DvGatewayMode::try_from(3).is_err());
+        for v in 0..DvGatewayMode::COUNT {
+            let val = DvGatewayMode::try_from(v).unwrap();
+            assert_eq!(u8::from(val), v, "DvGatewayMode round-trip failed at {v}");
+        }
+        assert!(DvGatewayMode::try_from(DvGatewayMode::COUNT).is_err());
     }
 
     #[test]
     fn gps_radio_mode_round_trip() {
-        assert_eq!(GpsRadioMode::try_from(0).unwrap(), GpsRadioMode::Normal);
-        assert_eq!(
-            GpsRadioMode::try_from(1).unwrap(),
-            GpsRadioMode::GpsReceiver
-        );
-        assert!(GpsRadioMode::try_from(2).is_err());
+        for v in 0..GpsRadioMode::COUNT {
+            let val = GpsRadioMode::try_from(v).unwrap();
+            assert_eq!(u8::from(val), v, "GpsRadioMode round-trip failed at {v}");
+        }
+        assert!(GpsRadioMode::try_from(GpsRadioMode::COUNT).is_err());
     }
 }

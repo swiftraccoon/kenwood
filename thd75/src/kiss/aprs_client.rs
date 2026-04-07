@@ -1119,4 +1119,224 @@ mod tests {
             .unwrap();
         assert!(!result);
     }
+
+    // -----------------------------------------------------------------------
+    // next_event dispatch tests
+    // -----------------------------------------------------------------------
+
+    /// Build a KISS-encoded data frame from a source callsign and APRS info.
+    fn build_kiss_data_frame(source: &str, ssid: u8, info: &[u8]) -> Vec<u8> {
+        let packet = Ax25Packet {
+            source: Ax25Address {
+                callsign: source.to_owned(),
+                ssid,
+            },
+            destination: Ax25Address {
+                callsign: "APK005".to_owned(),
+                ssid: 0,
+            },
+            digipeaters: vec![],
+            control: 0x03,
+            protocol: 0xF0,
+            info: info.to_vec(),
+        };
+        let ax25_bytes = build_ax25(&packet);
+        encode_kiss_frame(&KissFrame {
+            port: 0,
+            command: CMD_DATA,
+            data: ax25_bytes,
+        })
+    }
+
+    #[tokio::test]
+    async fn next_event_position_received() {
+        let radio = mock_radio(TncBaud::Bps1200).await;
+        let config = test_config();
+        let mut client = AprsClient::start(radio, config).await.unwrap();
+
+        // Uncompressed position: !DDMM.MMN/DDDMM.MMW>comment
+        let info = b"!3515.00N/09745.00W>mobile";
+        let wire = build_kiss_data_frame("W1AW", 0, info);
+        client.session.transport.queue_read(&wire);
+
+        let event = client.next_event().await.unwrap();
+        assert!(event.is_some());
+        match event.unwrap() {
+            AprsEvent::StationHeard(entry) => {
+                assert_eq!(entry.callsign, "W1AW");
+            }
+            AprsEvent::PositionReceived { source, .. } => {
+                assert_eq!(source, "W1AW");
+            }
+            other => panic!("expected StationHeard or PositionReceived, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn next_event_weather_received() {
+        let radio = mock_radio(TncBaud::Bps1200).await;
+        let config = test_config();
+        let mut client = AprsClient::start(radio, config).await.unwrap();
+
+        // Position + weather report: !DDMM.MMN/DDDMM.MMW_DIR/SPDgGUSTt072
+        let info = b"!3515.00N/09745.00W_090/010g015t072";
+        let wire = build_kiss_data_frame("WX1STA", 0, info);
+        client.session.transport.queue_read(&wire);
+
+        let event = client.next_event().await.unwrap();
+        assert!(event.is_some());
+        match event.unwrap() {
+            AprsEvent::WeatherReceived { source, weather } => {
+                assert_eq!(source, "WX1STA");
+                assert_eq!(weather.temperature, Some(72));
+            }
+            AprsEvent::StationHeard(_) => {
+                // Also acceptable -- depends on station list state.
+            }
+            other => panic!("expected WeatherReceived, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn next_event_message_received() {
+        let radio = mock_radio(TncBaud::Bps1200).await;
+        let mut config = test_config();
+        config.auto_ack = false; // Disable auto-ack to simplify test
+        let mut client = AprsClient::start(radio, config).await.unwrap();
+
+        // APRS message: :ADDRESSEE:message text{id
+        let info = b":N0CALL   :Hello from W1AW{42";
+        let wire = build_kiss_data_frame("W1AW", 0, info);
+        client.session.transport.queue_read(&wire);
+
+        let event = client.next_event().await.unwrap();
+        assert!(event.is_some());
+        match event.unwrap() {
+            AprsEvent::MessageReceived(msg) => {
+                assert_eq!(msg.addressee, "N0CALL");
+                assert!(msg.text.contains("Hello from W1AW"));
+            }
+            other => panic!("expected MessageReceived, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn next_event_message_delivered() {
+        let radio = mock_radio(TncBaud::Bps1200).await;
+        let config = test_config();
+        let mut client = AprsClient::start(radio, config).await.unwrap();
+
+        // First, send a message so we have a pending message with id "1"
+        let expected_wire = build_msg(&test_address(), "W1AW", "Test", Some("1"));
+        client.session.transport.expect(&expected_wire, &[]);
+        let _id = client.send_message("W1AW", "Test").await.unwrap();
+
+        // Now simulate receiving an ack for that message
+        let info = b":N0CALL   :ack1";
+        let wire = build_kiss_data_frame("W1AW", 0, info);
+        client.session.transport.queue_read(&wire);
+
+        let event = client.next_event().await.unwrap();
+        assert!(event.is_some());
+        match event.unwrap() {
+            AprsEvent::MessageDelivered(id) => {
+                assert_eq!(id, "1");
+            }
+            other => panic!("expected MessageDelivered, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn next_event_message_rejected() {
+        let radio = mock_radio(TncBaud::Bps1200).await;
+        let config = test_config();
+        let mut client = AprsClient::start(radio, config).await.unwrap();
+
+        // Send a message to have pending id "1"
+        let expected_wire = build_msg(&test_address(), "W1AW", "Test", Some("1"));
+        client.session.transport.expect(&expected_wire, &[]);
+        let _id = client.send_message("W1AW", "Test").await.unwrap();
+
+        // Simulate receiving a rejection
+        let info = b":N0CALL   :rej1";
+        let wire = build_kiss_data_frame("W1AW", 0, info);
+        client.session.transport.queue_read(&wire);
+
+        let event = client.next_event().await.unwrap();
+        assert!(event.is_some());
+        match event.unwrap() {
+            AprsEvent::MessageRejected(id) => {
+                assert_eq!(id, "1");
+            }
+            other => panic!("expected MessageRejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn next_event_raw_packet_for_unknown_data() {
+        let radio = mock_radio(TncBaud::Bps1200).await;
+        let config = test_config();
+        let mut client = AprsClient::start(radio, config).await.unwrap();
+
+        // Send some unparseable APRS data (random info bytes)
+        let info = b"XUNKNOWN_DATA_TYPE";
+        let wire = build_kiss_data_frame("W1AW", 0, info);
+        client.session.transport.queue_read(&wire);
+
+        let event = client.next_event().await.unwrap();
+        assert!(event.is_some());
+        match event.unwrap() {
+            AprsEvent::RawPacket(pkt) => {
+                assert_eq!(pkt.source.callsign, "W1AW");
+            }
+            other => panic!("expected RawPacket, got {other:?}"),
+        }
+    }
+
+    // Timeout test omitted: MockTransport returns WouldBlock (not a
+    // true timeout), and waiting for the 500ms poll timeout would make
+    // tests slow. The dispatch tests above cover the event parsing logic.
+
+    // -----------------------------------------------------------------------
+    // update_motion tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn update_motion_first_call_triggers_beacon() {
+        let radio = mock_radio(TncBaud::Bps1200).await;
+        let config = test_config();
+        let mut client = AprsClient::start(radio, config).await.unwrap();
+
+        // SmartBeaconing always triggers on first call.
+        let expected = build_pos(&test_address(), 35.25, -97.75, '/', '>', "");
+        client.session.transport.expect(&expected, &[]);
+
+        let beaconed = client
+            .update_motion(50.0, 90.0, 35.25, -97.75)
+            .await
+            .unwrap();
+        assert!(beaconed);
+    }
+
+    #[tokio::test]
+    async fn update_motion_second_call_no_beacon() {
+        let radio = mock_radio(TncBaud::Bps1200).await;
+        let config = test_config();
+        let mut client = AprsClient::start(radio, config).await.unwrap();
+
+        // First call beacons.
+        let expected = build_pos(&test_address(), 35.25, -97.75, '/', '>', "");
+        client.session.transport.expect(&expected, &[]);
+        let _ = client
+            .update_motion(50.0, 90.0, 35.25, -97.75)
+            .await
+            .unwrap();
+
+        // Second call immediately after should NOT beacon.
+        let beaconed = client
+            .update_motion(50.0, 90.0, 35.25, -97.75)
+            .await
+            .unwrap();
+        assert!(!beaconed);
+    }
 }

@@ -515,4 +515,29 @@ mod tests {
         // The marker should be at file offset HEADER_SIZE + 0x4000.
         assert_eq!(d75_bytes[HEADER_SIZE + 0x4000], 0xAB);
     }
+
+    #[test]
+    fn parse_config_channel_parse_error() {
+        use crate::protocol::programming;
+
+        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42]).unwrap();
+
+        // Build a valid .d75 file, then corrupt channel 0's step_size byte.
+        let mut d75_data = vec![0u8; HEADER_SIZE + programming::TOTAL_SIZE];
+        d75_data[..HEADER_SIZE].copy_from_slice(&header.raw);
+
+        // Channel 0 data starts at file offset CHANNEL_DATA_OFFSET.
+        // Give it a nonzero RX frequency so it's "used" and parsed.
+        let ch0_offset = CHANNEL_DATA_OFFSET;
+        d75_data[ch0_offset..ch0_offset + 4].copy_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        // Byte 0x08 of the channel record: high nibble = step_size.
+        // Value 0xF0 => step_size = 15 which is out of range.
+        d75_data[ch0_offset + 0x08] = 0xF0;
+
+        let err = parse_config(&d75_data).unwrap_err();
+        assert!(
+            matches!(err, SdCardError::ChannelParse { index: 0, .. }),
+            "expected ChannelParse for index 0, got {err:?}"
+        );
+    }
 }

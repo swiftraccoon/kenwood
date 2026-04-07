@@ -579,3 +579,71 @@ impl<T: Transport> Radio<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::radio::Radio;
+    use crate::transport::MockTransport;
+
+    #[tokio::test]
+    async fn service_enter_and_exit() {
+        let mut mock = MockTransport::new();
+        mock.expect(b"0G KENWOOD\r", b"0G KENWOOD\r");
+        mock.expect(b"0G\r", b"0G \r");
+        let mut radio = Radio::connect(mock).await.unwrap();
+        radio.enter_service_mode().await.unwrap();
+        radio.exit_service_mode().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_band_select() {
+        let mut mock = MockTransport::new();
+        mock.expect(b"0Y 0\r", b"0Y 0\r");
+        let mut radio = Radio::connect(mock).await.unwrap();
+        radio.service_band_select(0).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_band_select_band_1() {
+        let mut mock = MockTransport::new();
+        mock.expect(b"0Y 1\r", b"0Y 1\r");
+        let mut radio = Radio::connect(mock).await.unwrap();
+        radio.service_band_select(1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_get_hardware() {
+        let mut mock = MockTransport::new();
+        mock.expect(b"1G\r", b"1G AA,BB,CC\r");
+        let mut radio = Radio::connect(mock).await.unwrap();
+        let data = radio.service_get_hardware().await.unwrap();
+        assert_eq!(data, "AA,BB,CC");
+    }
+
+    #[tokio::test]
+    async fn service_get_version() {
+        let mut mock = MockTransport::new();
+        mock.expect(b"2V 00,000\r", b"2V EX-5210\r");
+        let mut radio = Radio::connect(mock).await.unwrap();
+        let data = radio.service_get_version("00", "000").await.unwrap();
+        assert_eq!(data, "EX-5210");
+    }
+
+    #[tokio::test]
+    async fn service_read_calibration_data() {
+        let mut mock = MockTransport::new();
+        mock.expect(b"0S\r", b"0S AABBCCDD\r");
+        let mut radio = Radio::connect(mock).await.unwrap();
+        let data = radio.read_calibration_data().await.unwrap();
+        assert_eq!(data, "AABBCCDD");
+    }
+
+    #[tokio::test]
+    async fn service_read_eeprom() {
+        let mut mock = MockTransport::new();
+        mock.expect(b"9E 04E000,10\r", b"9E DEADBEEF\r");
+        let mut radio = Radio::connect(mock).await.unwrap();
+        let data = radio.service_read_eeprom("04E000", "10").await.unwrap();
+        assert_eq!(data, "DEADBEEF");
+    }
+}

@@ -353,19 +353,18 @@ mod tests {
 
     #[test]
     fn purge_expired_removes_old_entries() {
-        // Use a very short max_age so entries expire immediately.
-        let mut sl = StationList::new(100, Duration::from_secs(0));
+        // Use a reasonable max_age and manually backdate the entry to
+        // guarantee expiration without wall-clock timing dependencies.
+        let mut sl = StationList::new(100, Duration::from_secs(60));
         sl.update("N0CALL", &make_position(35.0, -97.0), &[]);
-        // The entry was just created at Instant::now(), and max_age is 0,
-        // so any duration_since > 0 means expired. In practice on any
-        // real machine the purge call happens at a later Instant.
-        // We accept that this test may occasionally be flaky on extremely
-        // fast machines where now == last_heard, but Duration::from_secs(0)
-        // means it expires at the next Instant.
+        assert_eq!(sl.len(), 1);
+
+        // Backdate last_heard so the entry is definitely expired.
+        sl.stations.get_mut("N0CALL").unwrap().last_heard = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .unwrap();
+
         sl.purge_expired();
-        // With max_age 0, the entry should be gone (or at most still there
-        // if the two Instants are identical — which is unlikely).
-        // We'll just verify the function doesn't panic.
-        assert!(sl.len() <= 1);
+        assert_eq!(sl.len(), 0, "expired entry should have been purged");
     }
 }

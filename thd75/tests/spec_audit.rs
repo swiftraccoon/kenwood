@@ -403,3 +403,44 @@ fn sf_fs_mnemonic_firmware_verified() {
     // SF = Step Size (band-indexed)
     assert_eq!(command_name(&Command::GetStepSize { band: Band::A }), "SF");
 }
+
+// ============================================================================
+// TABLE E: Fine Step values must match our FineStep enum
+// ============================================================================
+
+#[test]
+fn fine_step_table_matches_spec() {
+    let spec = load_spec();
+    let table_e = spec["tables"]["TABLE_E"]["entries"].as_object().unwrap();
+
+    let expected_names: [(u8, &str); 4] =
+        [(0, "20 Hz"), (1, "100 Hz"), (2, "500 Hz"), (3, "1,000 Hz")];
+
+    // Verify spec has all entries
+    assert_eq!(table_e.len(), 4, "TABLE E should have 4 entries (0-3)");
+
+    for (index_str, name_val) in table_e {
+        let index: u8 = index_str.parse().unwrap();
+        let spec_name = name_val.as_str().unwrap();
+        // Verify our code accepts this index
+        assert!(
+            FineStep::try_from(index).is_ok(),
+            "FineStep index {index} from spec is invalid in our code"
+        );
+        // Verify the spec name matches our expected mapping
+        let (_, expected_name) = expected_names
+            .iter()
+            .find(|(i, _)| *i == index)
+            .unwrap_or_else(|| panic!("unexpected TABLE E index {index}"));
+        assert_eq!(
+            spec_name, *expected_name,
+            "TABLE E index {index}: spec says {spec_name}, expected {expected_name}"
+        );
+    }
+
+    // Index 4 should be invalid
+    assert!(
+        FineStep::try_from(4).is_err(),
+        "FineStep 4 should be invalid"
+    );
+}

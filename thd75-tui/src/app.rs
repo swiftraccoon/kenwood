@@ -696,7 +696,49 @@ pub(crate) enum MainView {
     /// MCP settings — ~3s per change, brief disconnect.
     SettingsMcp,
     Aprs,
+    DStar,
+    Gps,
     Mcp,
+    /// FM broadcast radio control (76-108 MHz WFM on Band B).
+    FmRadio,
+}
+
+/// Which field is selected in channel edit mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChannelEditField {
+    Frequency,
+    Name,
+    Mode,
+    ToneMode,
+    ToneFreq,
+    Duplex,
+    Offset,
+}
+
+impl ChannelEditField {
+    pub(crate) const fn next(self) -> Self {
+        match self {
+            Self::Frequency => Self::Name,
+            Self::Name => Self::Mode,
+            Self::Mode => Self::ToneMode,
+            Self::ToneMode => Self::ToneFreq,
+            Self::ToneFreq => Self::Duplex,
+            Self::Duplex => Self::Offset,
+            Self::Offset => Self::Frequency,
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Frequency => "Frequency",
+            Self::Name => "Name",
+            Self::Mode => "Mode",
+            Self::ToneMode => "Tone Mode",
+            Self::ToneFreq => "Tone Freq",
+            Self::Duplex => "Duplex",
+            Self::Offset => "Offset",
+        }
+    }
 }
 
 /// Input mode for the UI.
@@ -758,6 +800,11 @@ pub(crate) struct RadioState {
     pub firmware_version: String,
     pub radio_type: String,
     pub gps_enabled: bool,
+    pub gps_pc_output: bool,
+    /// NMEA sentence enable flags: (GGA, GLL, GSA, GSV, RMC, VTG).
+    pub gps_sentences: Option<(bool, bool, bool, bool, bool, bool)>,
+    /// GPS/Radio operating mode (GM read).
+    pub gps_mode: Option<kenwood_thd75::types::GpsRadioMode>,
     pub beacon_type: BeaconMode,
     pub fine_step: Option<kenwood_thd75::types::FineStep>,
     pub filter_width_ssb: Option<kenwood_thd75::types::FilterWidthIndex>,
@@ -765,6 +812,24 @@ pub(crate) struct RadioState {
     pub filter_width_am: Option<kenwood_thd75::types::FilterWidthIndex>,
     /// Last-written scan resume method (write-only, not readable from D75).
     pub scan_resume_cat: Option<kenwood_thd75::types::ScanResumeMethod>,
+    /// D-STAR URCALL callsign (8-char, space-padded).
+    pub dstar_urcall: String,
+    /// D-STAR URCALL suffix (4-char, space-padded).
+    pub dstar_urcall_suffix: String,
+    /// D-STAR RPT1 callsign.
+    pub dstar_rpt1: String,
+    /// D-STAR RPT1 suffix.
+    pub dstar_rpt1_suffix: String,
+    /// D-STAR RPT2 callsign.
+    pub dstar_rpt2: String,
+    /// D-STAR RPT2 suffix.
+    pub dstar_rpt2_suffix: String,
+    /// D-STAR gateway mode.
+    pub dstar_gateway_mode: Option<kenwood_thd75::types::DvGatewayMode>,
+    /// Active D-STAR slot.
+    pub dstar_slot: Option<kenwood_thd75::types::DstarSlot>,
+    /// Active callsign slot.
+    pub dstar_callsign_slot: Option<kenwood_thd75::types::CallsignSlot>,
 }
 
 impl Default for RadioState {
@@ -784,14 +849,35 @@ impl Default for RadioState {
             firmware_version: String::new(),
             radio_type: String::new(),
             gps_enabled: false,
+            gps_pc_output: false,
+            gps_sentences: None,
+            gps_mode: None,
             beacon_type: BeaconMode::Off,
             fine_step: None,
             filter_width_ssb: None,
             filter_width_cw: None,
             filter_width_am: None,
             scan_resume_cat: None,
+            dstar_urcall: String::new(),
+            dstar_urcall_suffix: String::new(),
+            dstar_rpt1: String::new(),
+            dstar_rpt1_suffix: String::new(),
+            dstar_rpt2: String::new(),
+            dstar_rpt2_suffix: String::new(),
+            dstar_gateway_mode: None,
+            dstar_slot: None,
+            dstar_callsign_slot: None,
         }
     }
+}
+
+/// Whether the D-STAR gateway is active in the radio task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DStarMode {
+    /// Not in gateway mode — show CAT config view on the D-STAR panel.
+    Inactive,
+    /// Gateway mode active — `DStarGateway` is running in the radio task.
+    Active,
 }
 
 /// Whether the APRS client is active in the radio task.
@@ -897,6 +983,14 @@ pub(crate) enum Message {
     },
     /// Error from the APRS subsystem.
     AprsError(String),
+    /// The radio task has entered D-STAR gateway mode successfully.
+    DStarStarted,
+    /// The radio task has exited D-STAR gateway mode.
+    DStarStopped,
+    /// A D-STAR event was received from the radio task (gateway mode).
+    DStarEvent(kenwood_thd75::DStarEvent),
+    /// Error from the D-STAR subsystem.
+    DStarError(String),
     Quit,
 }
 
@@ -935,6 +1029,30 @@ pub(crate) struct App {
     pub aprs_station_index: usize,
     /// When set, the APRS message compose prompt is active.
     pub aprs_compose: Option<String>,
+    /// D-STAR mode state.
+    pub dstar_mode: DStarMode,
+    /// D-STAR last heard entries (gateway mode).
+    pub dstar_last_heard: Vec<kenwood_thd75::LastHeardEntry>,
+    /// Selected index in the D-STAR last heard list.
+    pub dstar_last_heard_index: usize,
+    /// Current D-STAR text message (from slow data).
+    pub dstar_text_message: Option<String>,
+    /// Current D-STAR RX header (gateway mode).
+    pub dstar_rx_header: Option<kenwood_thd75::DStarHeader>,
+    /// Whether a D-STAR voice transmission is active.
+    pub dstar_rx_active: bool,
+    /// D-STAR URCALL input buffer (when prompting).
+    pub dstar_urcall_input: Option<String>,
+    /// D-STAR reflector input buffer (when prompting).
+    pub dstar_reflector_input: Option<String>,
+    /// Channel edit mode is active.
+    pub channel_edit_mode: bool,
+    /// Which field is selected in channel edit mode.
+    pub channel_edit_field: ChannelEditField,
+    /// Text buffer for the currently edited field.
+    pub channel_edit_buffer: String,
+    /// FM radio status (true = on). Tracked locally since FR is write-only.
+    pub fm_radio_on: bool,
 }
 
 impl App {
@@ -1015,6 +1133,18 @@ impl App {
             aprs_messages: Vec::new(),
             aprs_station_index: 0,
             aprs_compose: None,
+            dstar_mode: DStarMode::Inactive,
+            dstar_last_heard: Vec::new(),
+            dstar_last_heard_index: 0,
+            dstar_text_message: None,
+            dstar_rx_header: None,
+            dstar_rx_active: false,
+            dstar_urcall_input: None,
+            dstar_reflector_input: None,
+            channel_edit_mode: false,
+            channel_edit_field: ChannelEditField::Frequency,
+            channel_edit_buffer: String::new(),
+            fm_radio_on: false,
         }
     }
 
@@ -1037,6 +1167,28 @@ impl App {
                 // Preserve write-only fields not readable from radio
                 if state.scan_resume_cat.is_none() {
                     state.scan_resume_cat = self.state.scan_resume_cat;
+                }
+                // Preserve D-STAR state when not provided by poll
+                if state.dstar_urcall.is_empty() {
+                    state.dstar_urcall = std::mem::take(&mut self.state.dstar_urcall);
+                    state.dstar_urcall_suffix = std::mem::take(&mut self.state.dstar_urcall_suffix);
+                }
+                if state.dstar_rpt1.is_empty() {
+                    state.dstar_rpt1 = std::mem::take(&mut self.state.dstar_rpt1);
+                    state.dstar_rpt1_suffix = std::mem::take(&mut self.state.dstar_rpt1_suffix);
+                }
+                if state.dstar_rpt2.is_empty() {
+                    state.dstar_rpt2 = std::mem::take(&mut self.state.dstar_rpt2);
+                    state.dstar_rpt2_suffix = std::mem::take(&mut self.state.dstar_rpt2_suffix);
+                }
+                if state.dstar_gateway_mode.is_none() {
+                    state.dstar_gateway_mode = self.state.dstar_gateway_mode;
+                }
+                if state.dstar_slot.is_none() {
+                    state.dstar_slot = self.state.dstar_slot;
+                }
+                if state.dstar_callsign_slot.is_none() {
+                    state.dstar_callsign_slot = self.state.dstar_callsign_slot;
                 }
                 self.state = state;
                 self.connected = true;
@@ -1137,6 +1289,27 @@ impl App {
                 self.status_message = Some(format!("APRS: {err}"));
                 true
             }
+            Message::DStarStarted => {
+                self.dstar_mode = DStarMode::Active;
+                self.status_message = Some("D-STAR gateway mode active".into());
+                true
+            }
+            Message::DStarStopped => {
+                self.dstar_mode = DStarMode::Inactive;
+                self.dstar_rx_active = false;
+                self.dstar_rx_header = None;
+                self.status_message =
+                    Some("D-STAR gateway mode stopped — CAT polling resumed".into());
+                true
+            }
+            Message::DStarEvent(event) => {
+                self.handle_dstar_event(event);
+                true
+            }
+            Message::DStarError(err) => {
+                self.status_message = Some(format!("D-STAR: {err}"));
+                true
+            }
         }
     }
 
@@ -1202,6 +1375,114 @@ impl App {
                 }
                 KeyCode::Char(c) => {
                     buf.push(c);
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        // Handle D-STAR URCALL input mode
+        if let Some(ref mut buf) = self.dstar_urcall_input {
+            match key.code {
+                KeyCode::Esc => {
+                    self.dstar_urcall_input = None;
+                }
+                KeyCode::Enter => {
+                    let input = buf.clone();
+                    self.dstar_urcall_input = None;
+                    if !input.is_empty()
+                        && let Some(ref tx) = self.cmd_tx
+                    {
+                        let _ = tx.send(crate::event::RadioCommand::SetUrcall {
+                            callsign: input.clone(),
+                            suffix: String::new(),
+                        });
+                        self.status_message = Some(format!("URCALL set to {input}"));
+                    }
+                }
+                KeyCode::Backspace => {
+                    let _ = buf.pop();
+                }
+                KeyCode::Char(c) => {
+                    if buf.len() < 8 {
+                        buf.push(c.to_ascii_uppercase());
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        // Handle D-STAR reflector input mode (format: NAME MODULE, e.g. "REF030 C")
+        if let Some(ref mut buf) = self.dstar_reflector_input {
+            match key.code {
+                KeyCode::Esc => {
+                    self.dstar_reflector_input = None;
+                }
+                KeyCode::Enter => {
+                    let input = buf.clone();
+                    self.dstar_reflector_input = None;
+                    // Parse "REF030 C" or "REF030C"
+                    let parts: Vec<&str> = input.split_whitespace().collect();
+                    let (name, module) = if parts.len() >= 2 {
+                        (parts[0].to_string(), parts[1].chars().next().unwrap_or('A'))
+                    } else if input.len() > 1 {
+                        let module = input.chars().last().unwrap_or('A');
+                        let name = &input[..input.len() - 1];
+                        (name.trim().to_string(), module)
+                    } else {
+                        self.status_message = Some("Invalid reflector (e.g. REF030 C)".into());
+                        return true;
+                    };
+                    if let Some(ref tx) = self.cmd_tx {
+                        let _ = tx.send(crate::event::RadioCommand::ConnectReflector {
+                            name: name.clone(),
+                            module,
+                        });
+                        self.status_message =
+                            Some(format!("Connecting to {name} module {module}..."));
+                    }
+                }
+                KeyCode::Backspace => {
+                    let _ = buf.pop();
+                }
+                KeyCode::Char(c) => {
+                    if buf.len() < 12 {
+                        buf.push(c.to_ascii_uppercase());
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        // Handle channel edit mode
+        if self.channel_edit_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.channel_edit_mode = false;
+                    self.channel_edit_buffer.clear();
+                    self.status_message = Some("Edit cancelled".into());
+                }
+                KeyCode::Tab => {
+                    self.channel_edit_field = self.channel_edit_field.next();
+                    self.channel_edit_buffer.clear();
+                    self.status_message = Some(format!(
+                        "Editing: {} (type value, Enter to apply)",
+                        self.channel_edit_field.label()
+                    ));
+                }
+                KeyCode::Backspace => {
+                    let _ = self.channel_edit_buffer.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.channel_edit_buffer.push(c);
+                }
+                KeyCode::Enter => {
+                    let field = self.channel_edit_field;
+                    let buf = self.channel_edit_buffer.clone();
+                    self.apply_channel_edit(field, &buf);
+                    self.channel_edit_buffer.clear();
                 }
                 _ => {}
             }
@@ -1325,6 +1606,35 @@ impl App {
                 self.focus = Pane::Main;
                 true
             }
+            // Channel edit mode: press 'e' on channel detail pane
+            KeyCode::Char('e')
+                if self.main_view == MainView::Channels
+                    && matches!(self.focus, Pane::Main | Pane::Detail)
+                    && matches!(self.mcp, McpState::Loaded { .. }) =>
+            {
+                let used = self.filtered_channels();
+                if used.get(self.channel_list_index).is_some() {
+                    self.channel_edit_mode = true;
+                    self.channel_edit_field = ChannelEditField::Frequency;
+                    self.channel_edit_buffer.clear();
+                    self.status_message =
+                        Some("Edit mode: Tab=next field, Enter=apply, Esc=cancel".into());
+                }
+                true
+            }
+            // FM Radio panel
+            KeyCode::Char('F') => {
+                self.main_view = MainView::FmRadio;
+                self.focus = Pane::Main;
+                true
+            }
+            // FM Radio toggle (when viewing FM panel)
+            KeyCode::Char('f')
+                if self.main_view == MainView::FmRadio && self.focus == Pane::Main =>
+            {
+                self.toggle_fm_radio();
+                true
+            }
             KeyCode::Char('a') => {
                 if self.main_view == MainView::Aprs && self.focus == Pane::Main {
                     // Toggle APRS mode on/off when already viewing APRS panel.
@@ -1333,6 +1643,20 @@ impl App {
                     self.main_view = MainView::Aprs;
                     self.focus = Pane::Main;
                 }
+                true
+            }
+            KeyCode::Char('d') => {
+                if self.main_view == MainView::DStar && self.focus == Pane::Main {
+                    // Toggle D-STAR gateway mode on/off when already viewing D-STAR panel.
+                    self.toggle_dstar_mode();
+                } else {
+                    self.main_view = MainView::DStar;
+                    self.focus = Pane::Main;
+                }
+                true
+            }
+            KeyCode::Char('p') if self.main_view == MainView::Gps && self.focus == Pane::Main => {
+                self.toggle_gps_pc_output();
                 true
             }
             KeyCode::Char('m') => {
@@ -1352,9 +1676,24 @@ impl App {
                 self.input_mode = InputMode::FreqInput(String::new());
                 true
             }
-            // Jump to first/last channel
+            // GPS panel or jump-to-first-channel
             KeyCode::Char('g') if self.focus == Pane::Main => {
-                self.channel_list_index = 0;
+                if self.main_view == MainView::Gps {
+                    // Toggle GPS on/off when already viewing GPS panel.
+                    self.toggle_gps();
+                } else if self.main_view == MainView::Channels {
+                    // Jump to first channel in channel list.
+                    self.channel_list_index = 0;
+                } else {
+                    // Switch to GPS view from any other panel.
+                    self.main_view = MainView::Gps;
+                }
+                true
+            }
+            KeyCode::Char('g') => {
+                // Switch to GPS view when focus is not on Main pane.
+                self.main_view = MainView::Gps;
+                self.focus = Pane::Main;
                 true
             }
             KeyCode::Char('G') if self.focus == Pane::Main => {
@@ -1384,7 +1723,12 @@ impl App {
                             self.aprs_station_index =
                                 self.aprs_station_index.saturating_add(1).min(max);
                         }
-                        MainView::Mcp => {}
+                        MainView::DStar => {
+                            let max = self.dstar_last_heard.len().saturating_sub(1);
+                            self.dstar_last_heard_index =
+                                self.dstar_last_heard_index.saturating_add(1).min(max);
+                        }
+                        MainView::Gps | MainView::Mcp | MainView::FmRadio => {}
                     },
                     Pane::BandA => {
                         if let Some(ref tx) = self.cmd_tx {
@@ -1419,7 +1763,11 @@ impl App {
                         MainView::Aprs => {
                             self.aprs_station_index = self.aprs_station_index.saturating_sub(1);
                         }
-                        MainView::Mcp => {}
+                        MainView::DStar => {
+                            self.dstar_last_heard_index =
+                                self.dstar_last_heard_index.saturating_sub(1);
+                        }
+                        MainView::Gps | MainView::Mcp | MainView::FmRadio => {}
                     },
                     Pane::BandA => {
                         if let Some(ref tx) = self.cmd_tx {
@@ -1630,6 +1978,48 @@ impl App {
                     if let Some(ref tx) = self.cmd_tx {
                         let _ = tx.send(crate::event::RadioCommand::WriteMemory(data));
                     }
+                }
+                true
+            }
+            // D-STAR: set CQ (URCALL = CQCQCQ)
+            KeyCode::Char('C')
+                if self.main_view == MainView::DStar
+                    && self.focus == Pane::Main
+                    && self.dstar_mode == DStarMode::Inactive =>
+            {
+                if let Some(ref tx) = self.cmd_tx {
+                    let _ = tx.send(crate::event::RadioCommand::SetCQ);
+                    self.status_message = Some("URCALL set to CQCQCQ".into());
+                }
+                true
+            }
+            // D-STAR: set URCALL (prompt)
+            KeyCode::Char('u')
+                if self.main_view == MainView::DStar
+                    && self.focus == Pane::Main
+                    && self.dstar_mode == DStarMode::Inactive =>
+            {
+                self.dstar_urcall_input = Some(String::new());
+                true
+            }
+            // D-STAR: connect reflector (prompt)
+            KeyCode::Char('r')
+                if self.main_view == MainView::DStar
+                    && self.focus == Pane::Main
+                    && self.dstar_mode == DStarMode::Inactive =>
+            {
+                self.dstar_reflector_input = Some(String::new());
+                true
+            }
+            // D-STAR: unlink reflector
+            KeyCode::Char('U')
+                if self.main_view == MainView::DStar
+                    && self.focus == Pane::Main
+                    && self.dstar_mode == DStarMode::Inactive =>
+            {
+                if let Some(ref tx) = self.cmd_tx {
+                    let _ = tx.send(crate::event::RadioCommand::DisconnectReflector);
+                    self.status_message = Some("Unlinking reflector...".into());
                 }
                 true
             }
@@ -2653,6 +3043,197 @@ impl App {
     }
 
     /// Toggle APRS mode on or off.
+    fn handle_dstar_event(&mut self, event: kenwood_thd75::DStarEvent) {
+        use kenwood_thd75::DStarEvent;
+        match event {
+            DStarEvent::VoiceStart(header) => {
+                self.dstar_rx_active = true;
+                self.dstar_rx_header = Some(header);
+                self.dstar_text_message = None;
+            }
+            DStarEvent::VoiceData(_frame) => {
+                // Voice data — no UI action needed.
+            }
+            DStarEvent::VoiceEnd => {
+                self.dstar_rx_active = false;
+            }
+            DStarEvent::VoiceLost => {
+                self.dstar_rx_active = false;
+                self.status_message = Some("D-STAR: voice lost (no clean EOT)".into());
+            }
+            DStarEvent::TextMessage(text) => {
+                self.dstar_text_message = Some(text);
+            }
+            DStarEvent::StationHeard(entry) => {
+                // Update the last-heard list (newest first).
+                if let Some(idx) = self
+                    .dstar_last_heard
+                    .iter()
+                    .position(|e| e.callsign == entry.callsign)
+                {
+                    let _ = self.dstar_last_heard.remove(idx);
+                }
+                self.dstar_last_heard.insert(0, entry);
+                // Limit to 100 entries.
+                self.dstar_last_heard.truncate(100);
+            }
+            DStarEvent::StatusUpdate(_status) => {
+                // Modem status — no UI action needed.
+            }
+        }
+    }
+
+    fn toggle_gps(&mut self) {
+        let next = !self.state.gps_enabled;
+        if let Some(ref tx) = self.cmd_tx {
+            let _ = tx.send(crate::event::RadioCommand::SetGpsConfig(
+                next,
+                self.state.gps_pc_output,
+            ));
+            self.status_message =
+                Some(format!("GPS {}", if next { "enabled" } else { "disabled" }));
+        }
+    }
+
+    fn toggle_gps_pc_output(&mut self) {
+        let next = !self.state.gps_pc_output;
+        if let Some(ref tx) = self.cmd_tx {
+            let _ = tx.send(crate::event::RadioCommand::SetGpsConfig(
+                self.state.gps_enabled,
+                next,
+            ));
+            self.status_message = Some(format!(
+                "GPS PC Output {}",
+                if next { "enabled" } else { "disabled" }
+            ));
+        }
+    }
+
+    fn toggle_dstar_mode(&mut self) {
+        match self.dstar_mode {
+            DStarMode::Inactive => {
+                // Build D-STAR config from MCP data if available.
+                let callsign = if let McpState::Loaded { ref image, .. } = self.mcp {
+                    let cs = image.dstar().my_callsign();
+                    if cs.is_empty() {
+                        "N0CALL".to_string()
+                    } else {
+                        cs
+                    }
+                } else {
+                    "N0CALL".to_string()
+                };
+
+                let config = kenwood_thd75::DStarGatewayConfig::new(&callsign);
+                if let Some(ref tx) = self.cmd_tx {
+                    let _ = tx.send(crate::event::RadioCommand::EnterDStar { config });
+                    self.status_message = Some("Entering D-STAR gateway mode...".into());
+                }
+            }
+            DStarMode::Active => {
+                if let Some(ref tx) = self.cmd_tx {
+                    let _ = tx.send(crate::event::RadioCommand::ExitDStar);
+                    self.status_message = Some("Exiting D-STAR gateway mode...".into());
+                }
+            }
+        }
+    }
+
+    fn toggle_fm_radio(&mut self) {
+        let next = !self.fm_radio_on;
+        if let Some(ref tx) = self.cmd_tx {
+            let _ = tx.send(crate::event::RadioCommand::SetFmRadio(next));
+            self.fm_radio_on = next;
+            self.status_message = Some(format!(
+                "FM Radio {}",
+                if next { "enabled" } else { "disabled" }
+            ));
+        }
+    }
+
+    /// Apply a channel edit from the edit buffer.
+    ///
+    /// Uses ME (memory channel) write via CAT. This tunes the radio's live
+    /// channel, not permanent memory storage (which would require MCP).
+    fn apply_channel_edit(&mut self, field: ChannelEditField, buf: &str) {
+        if buf.is_empty() {
+            self.status_message = Some("No value entered".into());
+            return;
+        }
+
+        let used = self.filtered_channels();
+        let Some(&ch_num) = used.get(self.channel_list_index) else {
+            self.status_message = Some("No channel selected".into());
+            return;
+        };
+
+        match field {
+            ChannelEditField::Frequency => {
+                // Parse as MHz, tune via CAT
+                if let Ok(mhz) = buf.parse::<f64>() {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let hz = (mhz * 1_000_000.0) as u32;
+                    if let Some(ref tx) = self.cmd_tx {
+                        let _ = tx.send(crate::event::RadioCommand::TuneFreq {
+                            band: self.target_band,
+                            freq: hz,
+                        });
+                        self.status_message = Some(format!("Ch {ch_num}: tuning to {mhz:.6} MHz"));
+                    }
+                } else {
+                    self.status_message = Some(format!("Invalid frequency: {buf}"));
+                }
+            }
+            ChannelEditField::Name => {
+                // Channel name editing requires MCP write (no CAT command for name-only).
+                self.status_message = Some(format!(
+                    "Ch {ch_num}: name editing requires MCP write — use MCP panel (m)"
+                ));
+            }
+            ChannelEditField::Mode => {
+                // Cycle mode via CAT
+                if let Some(ref tx) = self.cmd_tx {
+                    use kenwood_thd75::types::Mode;
+                    let mode = match buf.to_uppercase().as_str() {
+                        "FM" => Some(Mode::Fm),
+                        "NFM" => Some(Mode::Nfm),
+                        "AM" => Some(Mode::Am),
+                        "DV" => Some(Mode::Dv),
+                        "LSB" => Some(Mode::Lsb),
+                        "USB" => Some(Mode::Usb),
+                        "CW" => Some(Mode::Cw),
+                        "DR" => Some(Mode::Dr),
+                        "WFM" => Some(Mode::Wfm),
+                        _ => None,
+                    };
+                    if let Some(mode) = mode {
+                        let _ = tx.send(crate::event::RadioCommand::SetMode {
+                            band: self.target_band,
+                            mode,
+                        });
+                        self.status_message = Some(format!("Ch {ch_num}: mode set to {mode}"));
+                    } else {
+                        self.status_message = Some(format!(
+                            "Unknown mode '{buf}' (try FM/NFM/AM/DV/LSB/USB/CW/DR/WFM)"
+                        ));
+                    }
+                }
+            }
+            ChannelEditField::ToneMode
+            | ChannelEditField::ToneFreq
+            | ChannelEditField::Duplex
+            | ChannelEditField::Offset => {
+                // These fields are stored in the ME channel record and require
+                // either a full ME write (which changes the live channel) or MCP
+                // for permanent memory storage. Full ME write support is planned.
+                self.status_message = Some(format!(
+                    "Ch {ch_num}: {} editing not yet implemented — requires ME write",
+                    field.label()
+                ));
+            }
+        }
+    }
+
     fn toggle_aprs_mode(&mut self) {
         match self.aprs_mode {
             AprsMode::Inactive => {

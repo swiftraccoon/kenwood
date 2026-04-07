@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
-use crate::app::{App, InputMode, McpState, Pane};
+use crate::app::{App, ChannelEditField, InputMode, McpState, Pane};
 
 pub(crate) fn render_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let title = if let InputMode::Search(ref buf) = app.input_mode {
@@ -99,7 +99,7 @@ pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
                     }
                 };
 
-                let lines = vec![
+                let mut lines = vec![
                     Line::from(vec![
                         Span::styled("  Channel: ", Style::default().fg(Color::DarkGray)),
                         Span::styled(format!("{ch_num}"), Style::default().fg(Color::White)),
@@ -133,10 +133,63 @@ pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
                         Span::styled("  Tone:    ", Style::default().fg(Color::DarkGray)),
                         Span::styled(tone_info, Style::default().fg(Color::White)),
                     ]),
-                    Line::from(""),
-                    Line::from(vec![Span::styled(
+                ];
+
+                lines.push(Line::from(""));
+                if app.channel_edit_mode {
+                    lines.push(Line::from(Span::styled(
+                        "  ── Edit Mode ──",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+
+                    let fields = [
+                        ChannelEditField::Frequency,
+                        ChannelEditField::Name,
+                        ChannelEditField::Mode,
+                        ChannelEditField::ToneMode,
+                        ChannelEditField::ToneFreq,
+                        ChannelEditField::Duplex,
+                        ChannelEditField::Offset,
+                    ];
+                    for field in fields {
+                        let marker = if field == app.channel_edit_field {
+                            "\u{25b8} "
+                        } else {
+                            "  "
+                        };
+                        let color = if field == app.channel_edit_field {
+                            Color::Cyan
+                        } else {
+                            Color::DarkGray
+                        };
+                        lines.push(Line::from(Span::styled(
+                            format!("  {marker}{:<12}", field.label()),
+                            Style::default().fg(color),
+                        )));
+                    }
+
+                    if !app.channel_edit_buffer.is_empty() {
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(vec![
+                            Span::styled("  Input: ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                format!("{}\u{258e}", app.channel_edit_buffer),
+                                Style::default().fg(Color::White),
+                            ),
+                        ]));
+                    }
+
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "  Tab=next  Enter=apply  Esc=cancel",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    lines.push(Line::from(vec![Span::styled(
                         format!(
-                            "  [Enter] Tune Band {}",
+                            "  [Enter] Tune Band {}  [e] Edit",
                             if app.target_band == kenwood_thd75::types::Band::B {
                                 "B"
                             } else {
@@ -144,8 +197,8 @@ pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
                             }
                         ),
                         Style::default().fg(Color::DarkGray),
-                    )]),
-                ];
+                    )]));
+                }
                 frame.render_widget(Paragraph::new(lines).block(block), area);
                 return;
             }

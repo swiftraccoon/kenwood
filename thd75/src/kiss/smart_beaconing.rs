@@ -286,4 +286,35 @@ mod tests {
         // Large heading change but at low speed — should NOT trigger.
         assert!(!sb.should_beacon(3.0, 90.0));
     }
+
+    #[test]
+    fn turn_beacon_triggered_at_high_speed() {
+        let mut sb = SmartBeaconing::new(SmartBeaconingConfig {
+            turn_time_secs: 0, // No minimum turn time for test simplicity.
+            ..SmartBeaconingConfig::default()
+        });
+
+        // Send initial beacon heading north at high speed.
+        assert!(sb.should_beacon(75.0, 0.0));
+        sb.beacon_sent_with(75.0, 0.0);
+
+        // Course change above turn_threshold (28 deg) at high speed
+        // should trigger an immediate beacon.
+        assert!(sb.should_beacon(75.0, 45.0));
+    }
+
+    #[test]
+    fn turn_beacon_below_threshold_no_trigger() {
+        let mut sb = SmartBeaconing::new(SmartBeaconingConfig {
+            turn_time_secs: 0,
+            ..SmartBeaconingConfig::default()
+        });
+
+        // Send initial beacon heading north at high speed.
+        assert!(sb.should_beacon(75.0, 0.0));
+        sb.beacon_sent_with(75.0, 0.0);
+
+        // Course change below turn_threshold (28 deg) should NOT trigger.
+        assert!(!sb.should_beacon(75.0, 20.0));
+    }
 }

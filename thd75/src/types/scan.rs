@@ -52,6 +52,9 @@ pub enum ScanResumeMethod {
 }
 
 impl ScanResumeMethod {
+    /// Number of valid scan resume method values (0-2).
+    pub const COUNT: u8 = 3;
+
     /// Convert from the SR command's numeric value.
     ///
     /// Returns `None` for unrecognized values.

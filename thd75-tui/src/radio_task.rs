@@ -125,6 +125,7 @@ pub(crate) async fn spawn_with_transport(
         // APRS mode entry (radio consumed). `aprs_pending` stores an APRS
         // config when the inner loop broke because of an EnterAprs command.
         let mut aprs_pending: Option<kenwood_thd75::AprsClientConfig> = None;
+        let mut dstar_pending: Option<kenwood_thd75::DStarGatewayConfig> = None;
 
         // Main loop: poll + handle commands + process AI notifications
         'outer: loop {
@@ -152,6 +153,34 @@ pub(crate) async fn spawn_with_transport(
                     Err(EnterAprsError::KissExitFailed(msg)) => {
                         let _ = tx.send(Message::AprsError(msg));
                         let _ = tx.send(Message::AprsStopped);
+                        let _ = tx.send(Message::Disconnected);
+                        // radio_opt is None — fall through to reconnect.
+                    }
+                }
+            }
+
+            // --- Handle pending D-STAR gateway mode entry ---
+            if let Some(config) = dstar_pending.take()
+                && let Some(taken_radio) = radio_opt.take()
+            {
+                match enter_dstar_session(taken_radio, config, &tx, &mut cmd_rx).await {
+                    Ok(new_radio) => {
+                        let mut r = new_radio;
+                        if let Err(e) = r.set_auto_info(true).await {
+                            tracing::warn!("AI mode after D-STAR exit: {e}");
+                        }
+                        notifications = r.subscribe();
+                        s_meter_a = SMeterReading::new(0).unwrap();
+                        s_meter_b = SMeterReading::new(0).unwrap();
+                        busy_a = false;
+                        busy_b = false;
+                        radio_opt = Some(r);
+                        let _ = tx.send(Message::DStarStopped);
+                        continue 'outer;
+                    }
+                    Err(EnterDStarError::MmdvmExitFailed(msg)) => {
+                        let _ = tx.send(Message::DStarError(msg));
+                        let _ = tx.send(Message::DStarStopped);
                         let _ = tx.send(Message::Disconnected);
                         // radio_opt is None — fall through to reconnect.
                     }
@@ -398,6 +427,35 @@ pub(crate) async fn spawn_with_transport(
                                     let _ = tx.send(Message::Disconnected);
                                     break; // Go to reconnect loop
                                 }
+                                crate::event::RadioCommand::SetUrcall { callsign, suffix } => {
+                                    if let Err(e) = radio.set_urcall(&callsign, &suffix).await {
+                                        let _ = tx.send(Message::RadioError(format!("Set URCALL: {e}")));
+                                    }
+                                }
+                                crate::event::RadioCommand::ConnectReflector { name, module } => {
+                                    if let Err(e) = radio.connect_reflector(&name, module).await {
+                                        let _ = tx.send(Message::RadioError(format!("Connect reflector: {e}")));
+                                    }
+                                }
+                                crate::event::RadioCommand::DisconnectReflector => {
+                                    if let Err(e) = radio.disconnect_reflector().await {
+                                        let _ = tx.send(Message::RadioError(format!("Disconnect reflector: {e}")));
+                                    }
+                                }
+                                crate::event::RadioCommand::SetCQ => {
+                                    if let Err(e) = radio.set_cq().await {
+                                        let _ = tx.send(Message::RadioError(format!("Set CQ: {e}")));
+                                    }
+                                }
+                                crate::event::RadioCommand::EnterDStar { config } => {
+                                    dstar_pending = Some(config);
+                                    continue 'outer;
+                                }
+                                crate::event::RadioCommand::ExitDStar => {
+                                    let _ = tx.send(Message::RadioError(
+                                        "Not in D-STAR gateway mode".into()
+                                    ));
+                                }
                                 crate::event::RadioCommand::EnterAprs { config } => {
                                     // Store the config and break out of the inner loop.
                                     // The APRS session runs at the top of 'outer where
@@ -596,6 +654,8 @@ async fn poll_once(
         kenwood_thd75::types::AfGainLevel::new(0)
     );
     let gps = radio.get_gps_config().await.unwrap_or((false, false));
+    let gps_sentences = radio.get_gps_sentences().await.ok();
+    let gps_mode = radio.get_gps_mode().await.ok();
     let beacon_type = global_read!(
         radio,
         "BN",
@@ -617,6 +677,13 @@ async fn poll_once(
         .get_filter_width(kenwood_thd75::types::FilterMode::Am)
         .await
         .ok();
+    // D-STAR reads — non-fatal, default to empty/None on error
+    let dstar_urcall = radio.get_urcall().await.unwrap_or_default();
+    let dstar_rpt1 = radio.get_rpt1().await.unwrap_or_default();
+    let dstar_rpt2 = radio.get_rpt2().await.unwrap_or_default();
+    let dstar_gw = radio.get_gateway().await.ok();
+    let dstar_slot = radio.get_dstar_slot().await.ok();
+    let dstar_callsign_slot = radio.get_active_callsign_slot().await.ok();
     Ok(RadioState {
         band_a,
         band_b,
@@ -632,12 +699,25 @@ async fn poll_once(
         firmware_version: String::new(),
         radio_type: String::new(),
         gps_enabled: gps.0,
+        gps_pc_output: gps.1,
+        gps_sentences,
+        gps_mode,
         beacon_type,
         fine_step,
         filter_width_ssb,
         filter_width_cw,
         filter_width_am,
         scan_resume_cat: None, // Write-only on D75 — not readable
+        // D-STAR state — non-fatal reads (protocol errors use defaults)
+        dstar_urcall: dstar_urcall.0,
+        dstar_urcall_suffix: dstar_urcall.1,
+        dstar_rpt1: dstar_rpt1.0,
+        dstar_rpt1_suffix: dstar_rpt1.1,
+        dstar_rpt2: dstar_rpt2.0,
+        dstar_rpt2_suffix: dstar_rpt2.1,
+        dstar_gateway_mode: dstar_gw,
+        dstar_slot,
+        dstar_callsign_slot,
     })
 }
 
@@ -811,6 +891,88 @@ async fn run_aprs_loop(
                         // CAT commands are not valid in APRS mode.
                         let _ = tx.send(Message::RadioError(
                             "CAT commands unavailable in APRS mode".into()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Error type for the D-STAR gateway session — the radio is lost, reconnect required.
+enum EnterDStarError {
+    /// MMDVM exit failed or the session ended with a transport error.
+    MmdvmExitFailed(String),
+}
+
+/// Enter D-STAR gateway mode, run the event loop, and return the radio on clean exit.
+///
+/// Takes ownership of the `Radio` (consumed by `DStarGateway::start`), runs the
+/// D-STAR event loop, and returns the `Radio` after `DStarGateway::stop`.
+async fn enter_dstar_session(
+    radio: Radio<EitherTransport>,
+    config: kenwood_thd75::DStarGatewayConfig,
+    tx: &mpsc::UnboundedSender<Message>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<crate::event::RadioCommand>,
+) -> Result<Radio<EitherTransport>, EnterDStarError> {
+    let mut gateway = match kenwood_thd75::DStarGateway::start(radio, config).await {
+        Ok(g) => g,
+        Err(e) => {
+            return Err(EnterDStarError::MmdvmExitFailed(format!(
+                "D-STAR gateway start failed: {e}"
+            )));
+        }
+    };
+
+    let _ = tx.send(Message::DStarStarted);
+
+    let exit_result = run_dstar_loop(&mut gateway, tx, cmd_rx).await;
+
+    match gateway.stop().await {
+        Ok(new_radio) => {
+            if let Err(msg) = exit_result {
+                let _ = tx.send(Message::DStarError(msg));
+            }
+            Ok(new_radio)
+        }
+        Err(e) => Err(EnterDStarError::MmdvmExitFailed(format!(
+            "D-STAR gateway stop failed: {e}"
+        ))),
+    }
+}
+
+/// Run the D-STAR gateway event loop until `ExitDStar` is received or a transport error occurs.
+async fn run_dstar_loop(
+    gateway: &mut kenwood_thd75::DStarGateway<EitherTransport>,
+    tx: &mpsc::UnboundedSender<Message>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<crate::event::RadioCommand>,
+) -> Result<(), String> {
+    loop {
+        tokio::select! {
+            event_result = gateway.next_event() => {
+                match event_result {
+                    Ok(Some(event)) => {
+                        if tx.send(Message::DStarEvent(event)).is_err() {
+                            return Ok(()); // TUI closed
+                        }
+                    }
+                    Ok(None) | Err(kenwood_thd75::Error::Timeout(_)) => {
+                        // Timeout — no activity, loop again.
+                    }
+                    Err(e) => {
+                        return Err(format!("D-STAR transport error: {e}"));
+                    }
+                }
+            }
+            Some(cmd) = cmd_rx.recv() => {
+                match cmd {
+                    crate::event::RadioCommand::ExitDStar => {
+                        return Ok(());
+                    }
+                    _ => {
+                        // CAT commands are not valid in D-STAR gateway mode.
+                        let _ = tx.send(Message::RadioError(
+                            "CAT commands unavailable in D-STAR gateway mode".into()
                         ));
                     }
                 }

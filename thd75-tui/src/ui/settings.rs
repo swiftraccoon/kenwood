@@ -225,6 +225,22 @@ fn render_settings_list(
     ));
     lines.push(kv(" Attenuator", &on_off(s.band_b.attenuator)));
     lines.push(kv(" Squelch", &s.band_b.squelch.to_string()));
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        " Not Available via CAT/MCP",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )));
+    lines.push(Line::from(Span::styled(
+        " Recording: radio-button only",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        " (no known MCP offset for Menu 301/302)",
+        Style::default().fg(Color::DarkGray),
+    )));
 
     frame.render_widget(Paragraph::new(lines).block(detail_block), detail_area);
 }

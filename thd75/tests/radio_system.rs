@@ -288,7 +288,7 @@ async fn frequency_down_blind() {
 }
 
 // ---------------------------------------------------------------------------
-// set_beep_volume_via_mcp — out-of-range rejection
+// set_beep_volume_via_mcp — out-of-range rejection and boundary success
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -297,4 +297,89 @@ async fn set_beep_volume_rejects_out_of_range() {
     let mock = MockTransport::new();
     let mut radio = Radio::connect(mock).await.unwrap();
     assert!(radio.set_beep_volume_via_mcp(8).await.is_err());
+}
+
+#[tokio::test]
+async fn set_beep_volume_boundary_max() {
+    // Volume 7 is the maximum valid value — should succeed and do an MCP write.
+    // Offset 0x1072 => page 0x0010, byte index 0x72.
+    let page: u16 = 0x0010;
+    let byte_index: usize = 0x72;
+
+    let original = [0u8; 256];
+    let mut expected = original;
+    expected[byte_index] = 7;
+
+    let mut mock = MockTransport::new();
+    mock_modify_page_sequence(&mut mock, page, &original, &expected);
+
+    let mut radio = Radio::connect(mock).await.unwrap();
+    radio.set_beep_volume_via_mcp(7).await.unwrap();
+}
+
+#[tokio::test]
+async fn set_beep_volume_boundary_min() {
+    // Volume 0 is the minimum valid value — should succeed.
+    let page: u16 = 0x0010;
+    let byte_index: usize = 0x72;
+
+    let mut original = [0u8; 256];
+    original[byte_index] = 5; // currently at 5
+    let mut expected = original;
+    expected[byte_index] = 0;
+
+    let mut mock = MockTransport::new();
+    mock_modify_page_sequence(&mut mock, page, &original, &expected);
+
+    let mut radio = Radio::connect(mock).await.unwrap();
+    radio.set_beep_volume_via_mcp(0).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// read_channels — skip-N integration test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn read_channels_skips_empty_and_not_available() {
+    // Verifies that read_channels:
+    //   - skips channels returning N (not available / unprogrammed)
+    //   - skips channels with zero frequency
+    //   - returns only populated channels with their correct numbers
+    let mut mock = MockTransport::new();
+    // Channel 0: not available (N)
+    mock.expect(b"ME 000\r", b"N\r");
+    // Channel 1: populated at 146.520 MHz
+    mock.expect(
+        b"ME 001\r",
+        b"ME 001,0146520000,0000600000,5,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,,0,00,0\r",
+    );
+    // Channel 2: zero frequency (empty, should be skipped)
+    mock.expect(
+        b"ME 002\r",
+        b"ME 002,0000000000,0000000000,0,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,,0,00,0\r",
+    );
+    // Channel 3: not available (N)
+    mock.expect(b"ME 003\r", b"N\r");
+    // Channel 4: populated at 440.000 MHz
+    mock.expect(
+        b"ME 004\r",
+        b"ME 004,0440000000,0005000000,5,2,0,0,0,0,0,0,0,0,0,0,08,08,000,0,,0,00,0\r",
+    );
+
+    let mut radio = Radio::connect(mock).await.unwrap();
+    let channels = radio.read_channels(0..5).await.unwrap();
+
+    assert_eq!(channels.len(), 2, "only 2 populated channels expected");
+    assert_eq!(channels[0].0, 1, "first result should be channel 1");
+    assert_eq!(
+        channels[0].1.rx_frequency.as_hz(),
+        146_520_000,
+        "channel 1 frequency"
+    );
+    assert_eq!(channels[1].0, 4, "second result should be channel 4");
+    assert_eq!(
+        channels[1].1.rx_frequency.as_hz(),
+        440_000_000,
+        "channel 4 frequency"
+    );
 }

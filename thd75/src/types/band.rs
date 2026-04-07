@@ -82,6 +82,11 @@ pub enum Band {
     Band13 = 13,
 }
 
+impl Band {
+    /// Number of valid band values (0-13).
+    pub const COUNT: u8 = 14;
+}
+
 impl fmt::Display for Band {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -129,20 +134,20 @@ mod tests {
 
     #[test]
     fn band_valid_range() {
-        for i in 0u8..14 {
+        for i in 0u8..Band::COUNT {
             assert!(Band::try_from(i).is_ok(), "Band({i}) should be valid");
         }
     }
 
     #[test]
     fn band_invalid() {
-        assert!(Band::try_from(14).is_err());
+        assert!(Band::try_from(Band::COUNT).is_err());
         assert!(Band::try_from(255).is_err());
     }
 
     #[test]
     fn band_round_trip() {
-        for i in 0u8..14 {
+        for i in 0u8..Band::COUNT {
             let val = Band::try_from(i).unwrap();
             assert_eq!(u8::from(val), i);
         }
@@ -150,7 +155,7 @@ mod tests {
 
     #[test]
     fn band_error_variant() {
-        let err = Band::try_from(14).unwrap_err();
+        let err = Band::try_from(Band::COUNT).unwrap_err();
         assert!(matches!(err, ValidationError::BandOutOfRange(14)));
     }
 

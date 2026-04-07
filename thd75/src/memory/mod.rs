@@ -397,4 +397,88 @@ mod tests {
         let err = MemoryImage::from_raw(vec![0u8; 100]).unwrap_err();
         assert!(matches!(err, MemoryError::InvalidSize { .. }));
     }
+
+    // -----------------------------------------------------------------------
+    // modify_setting tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn modify_setting_returns_changed_byte() {
+        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE]).unwrap();
+        // key_beep lives at offset 0x1071; set it from 0 to 1
+        let result = image.modify_setting(|w| {
+            w.set_key_beep(true);
+        });
+        assert_eq!(result, Some((0x1071, 1)));
+    }
+
+    #[test]
+    fn modify_setting_no_change_returns_none() {
+        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE]).unwrap();
+        // beep is already 0 (false); setting it to false again changes nothing
+        let result = image.modify_setting(|w| {
+            w.set_key_beep(false);
+        });
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one byte changed")]
+    fn modify_setting_panics_on_multi_byte() {
+        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE]).unwrap();
+        let _ = image.modify_setting(|w| {
+            // Change two distinct single-byte settings
+            w.set_key_beep(true); // 0x1071
+            w.set_beep_volume(5); // 0x1072
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // write_region error path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_region_out_of_bounds() {
+        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE]).unwrap();
+        assert!(
+            image
+                .write_region(programming::TOTAL_SIZE - 10, &[0u8; 20])
+                .is_err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // from_d75_file too-small error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_d75_file_too_small() {
+        assert!(MemoryImage::from_d75_file(&[0u8; 100]).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // MemoryError variant coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_channel_out_of_range_display() {
+        let err = MemoryError::ChannelOutOfRange {
+            channel: 2000,
+            max: 1199,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("2000"));
+        assert!(msg.contains("1199"));
+    }
+
+    #[test]
+    fn error_parse_error_display() {
+        let err = MemoryError::ParseError {
+            region: "channel 42 data".into(),
+            detail: "bad mode byte".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("channel 42 data"));
+        assert!(msg.contains("bad mode byte"));
+    }
 }

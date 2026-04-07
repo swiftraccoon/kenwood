@@ -404,6 +404,11 @@ pub enum FlashDuplex {
     Minus = 2,
 }
 
+impl FlashDuplex {
+    /// Number of valid flash duplex values (0-2).
+    pub const COUNT: u8 = 3;
+}
+
 impl TryFrom<u8> for FlashDuplex {
     type Error = ValidationError;
 
@@ -450,6 +455,11 @@ pub enum CrossToneType {
     ToneCtcss = 3,
 }
 
+impl CrossToneType {
+    /// Number of valid cross-tone type values (0-3).
+    pub const COUNT: u8 = 4;
+}
+
 impl TryFrom<u8> for CrossToneType {
     type Error = ValidationError;
 
@@ -483,6 +493,11 @@ pub enum FlashDigitalSquelch {
     Code = 1,
     /// Callsign squelch -- match source callsign (value 2).
     Callsign = 2,
+}
+
+impl FlashDigitalSquelch {
+    /// Number of valid flash digital squelch values (0-2).
+    pub const COUNT: u8 = 3;
 }
 
 impl TryFrom<u8> for FlashDigitalSquelch {
@@ -527,6 +542,11 @@ pub enum FineStep {
     Hz500 = 2,
     /// 1000 Hz fine step (value 3).
     Hz1000 = 3,
+}
+
+impl FineStep {
+    /// Number of valid fine step values (0-3).
+    pub const COUNT: u8 = 4;
 }
 
 impl TryFrom<u8> for FineStep {
@@ -1326,28 +1346,28 @@ mod tests {
 
     #[test]
     fn flash_duplex_round_trip() {
-        for i in 0u8..3 {
+        for i in 0u8..FlashDuplex::COUNT {
             let d = FlashDuplex::try_from(i).unwrap();
             assert_eq!(u8::from(d), i);
         }
-        assert!(FlashDuplex::try_from(3).is_err());
+        assert!(FlashDuplex::try_from(FlashDuplex::COUNT).is_err());
     }
 
     #[test]
     fn cross_tone_type_round_trip() {
-        for i in 0u8..4 {
+        for i in 0u8..CrossToneType::COUNT {
             let ct = CrossToneType::try_from(i).unwrap();
             assert_eq!(u8::from(ct), i);
         }
-        assert!(CrossToneType::try_from(4).is_err());
+        assert!(CrossToneType::try_from(CrossToneType::COUNT).is_err());
     }
 
     #[test]
     fn flash_digital_squelch_round_trip() {
-        for i in 0u8..3 {
+        for i in 0u8..FlashDigitalSquelch::COUNT {
             let ds = FlashDigitalSquelch::try_from(i).unwrap();
             assert_eq!(u8::from(ds), i);
         }
-        assert!(FlashDigitalSquelch::try_from(3).is_err());
+        assert!(FlashDigitalSquelch::try_from(FlashDigitalSquelch::COUNT).is_err());
     }
 }

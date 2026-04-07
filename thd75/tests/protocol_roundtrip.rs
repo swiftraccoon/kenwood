@@ -24,20 +24,20 @@ fn arb_channel_memory() -> impl Strategy<Value = ChannelMemory> {
     // Individual bool fields (tone_enable, dcs_enable, etc.) and shift must
     // be consistent with flags_0a_raw for serialize→parse round-trip.
     let part_a = (
-        any::<u32>(),  // rx_frequency
-        any::<u32>(),  // tx_offset
-        (0u8..12),     // step_size
-        (0u8..3),      // ctcss_mode
-        (0u8..=255u8), // flags_0a_raw (all 8 bits — serializer uses this)
+        any::<u32>(),            // rx_frequency
+        any::<u32>(),            // tx_offset
+        (0u8..StepSize::COUNT),  // step_size
+        (0u8..CtcssMode::COUNT), // ctcss_mode
+        (0u8..=255u8),           // flags_0a_raw (all 8 bits — serializer uses this)
     );
     let part_b = (
-        (0u8..50),       // tone_code
-        (0u8..50),       // ctcss_code
-        (0u8..104),      // dcs_code
-        (0u8..4),        // cross_tone_combo
-        (0u8..3),        // digital_squelch
-        "[A-Z0-9]{0,8}", // urcall (alphanumeric only for wire safety)
-        any::<u8>(),     // data_mode
+        (0u8..ToneCode::MAX_INDEX),        // tone_code
+        (0u8..ToneCode::MAX_INDEX),        // ctcss_code
+        (0u8..DcsCode::COUNT),             // dcs_code
+        (0u8..CrossToneType::COUNT),       // cross_tone_combo
+        (0u8..FlashDigitalSquelch::COUNT), // digital_squelch
+        "[A-Z0-9]{0,8}",                   // urcall (alphanumeric only for wire safety)
+        any::<u8>(),                       // data_mode
     );
     (part_a, part_b).prop_map(
         |((rx, tx, step, _ctcss_m, flags), (tc, cc, dc, ds, lo, urcall, dm))| {
@@ -108,7 +108,7 @@ proptest! {
 
     // 3. Byte 0x08 packing (step + shift)
     #[test]
-    fn byte_08_packing(step in 0u8..12, shift in 0u8..4) {
+    fn byte_08_packing(step in 0u8..StepSize::COUNT, shift in 0u8..4) {
         let ch = ChannelMemory {
             step_size: StepSize::try_from(step).unwrap(),
                 mode_flags_raw: 0,
@@ -122,7 +122,7 @@ proptest! {
 
     // 4. Byte 0x09 packing (currently zeroed — mode/fine not individually modeled)
     #[test]
-    fn byte_09_packing(_rev in any::<bool>(), _tone in any::<bool>(), _ctcss in 0u8..3) {
+    fn byte_09_packing(_rev in any::<bool>(), _tone in any::<bool>(), _ctcss in 0u8..CtcssMode::COUNT) {
         let ch = ChannelMemory::default();
         let bytes = ch.to_bytes();
         prop_assert_eq!(bytes[0x09], 0);
@@ -147,7 +147,7 @@ proptest! {
 
     // 6. Byte 0x0E packing (cross_tone_combo + digital_squelch)
     #[test]
-    fn byte_0e_packing(combo in 0u8..4, squelch in 0u8..3) {
+    fn byte_0e_packing(combo in 0u8..CrossToneType::COUNT, squelch in 0u8..FlashDigitalSquelch::COUNT) {
         let ch = ChannelMemory {
             cross_tone_combo: CrossToneType::try_from(combo).unwrap(),
             digital_squelch: FlashDigitalSquelch::try_from(squelch).unwrap(),
@@ -177,14 +177,14 @@ proptest! {
 
     // 9. ToneCode round-trip
     #[test]
-    fn tone_code_round_trip(idx in 0u8..50) {
+    fn tone_code_round_trip(idx in 0u8..=ToneCode::MAX_INDEX) {
         let tc = ToneCode::new(idx).unwrap();
         prop_assert_eq!(tc.index(), idx);
     }
 
     // 10. DcsCode round-trip
     #[test]
-    fn dcs_code_round_trip(idx in 0u8..104) {
+    fn dcs_code_round_trip(idx in 0u8..DcsCode::COUNT) {
         let dc = DcsCode::new(idx).unwrap();
         prop_assert_eq!(dc.index(), idx);
     }
@@ -194,7 +194,7 @@ proptest! {
 
     // 12. SQ (squelch) wire round-trip
     #[test]
-    fn sq_round_trip(band in arb_band(), raw_level in 0u8..7) {
+    fn sq_round_trip(band in arb_band(), raw_level in 0u8..SquelchLevel::COUNT) {
         let level = SquelchLevel::new(raw_level).unwrap();
         let cmd = Command::SetSquelch { band, level };
         let wire = protocol::serialize(&cmd);
@@ -210,7 +210,7 @@ proptest! {
 
     // 13. MD (mode) wire round-trip
     #[test]
-    fn md_round_trip(band in arb_band(), mode_val in 0u8..4) {
+    fn md_round_trip(band in arb_band(), mode_val in 0u8..Mode::COUNT) {
         let mode = Mode::try_from(mode_val).unwrap();
         let cmd = Command::SetMode { band, mode };
         let wire = protocol::serialize(&cmd);
@@ -226,7 +226,7 @@ proptest! {
 
     // 14. PC (power level) wire round-trip
     #[test]
-    fn pc_round_trip(band in arb_band(), pl in 0u8..4) {
+    fn pc_round_trip(band in arb_band(), pl in 0u8..PowerLevel::COUNT) {
         let level = PowerLevel::try_from(pl).unwrap();
         let cmd = Command::SetPowerLevel { band, level };
         let wire = protocol::serialize(&cmd);
@@ -271,6 +271,42 @@ proptest! {
                 prop_assert_eq!(parsed, channel);
             }
             other => prop_assert!(false, "wrong variant: {other:?}"),
+        }
+    }
+
+    // 17. GW (DV Gateway mode) wire round-trip
+    #[test]
+    fn gw_round_trip(gw_val in 0u8..DvGatewayMode::COUNT) {
+        let value = DvGatewayMode::try_from(gw_val).unwrap();
+        let cmd = Command::SetGateway { value };
+        let wire = protocol::serialize(&cmd);
+        let frame = &wire[..wire.len() - 1];
+        match protocol::parse(frame).unwrap() {
+            Response::Gateway { value: v } => {
+                prop_assert_eq!(v, value);
+            }
+            other => prop_assert!(false, "wrong: {other:?}"),
+        }
+    }
+
+    // 18. SH (filter width) wire round-trip
+    #[test]
+    fn sh_round_trip(mode in 0u8..FilterMode::COUNT, width in 0u8..5) {
+        let filter_mode = FilterMode::try_from(mode).unwrap();
+        // AM mode max is 3, SSB/CW max is 4
+        let max_width = if mode == 2 { 4 } else { 5 };
+        if width < max_width {
+            let filter_width = FilterWidthIndex::new(width, filter_mode).unwrap();
+            let cmd = Command::SetFilterWidth { mode: filter_mode, width: filter_width };
+            let wire = protocol::serialize(&cmd);
+            let frame = &wire[..wire.len() - 1];
+            match protocol::parse(frame).unwrap() {
+                Response::FilterWidth { mode: m, width: w } => {
+                    prop_assert_eq!(m, filter_mode);
+                    prop_assert_eq!(w, filter_width);
+                }
+                other => prop_assert!(false, "wrong: {other:?}"),
+            }
         }
     }
 }

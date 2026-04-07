@@ -175,12 +175,23 @@ mod tests {
 
     #[test]
     fn crc_known_value() {
-        // Verify the CRC function produces a non-trivial value.
+        // Independently computed CRC-CCITT (poly 0x8408, init 0xFFFF, final invert)
+        // for "ABCDEFGH" = 0x1873.
         let crc = crc_ccitt(b"ABCDEFGH");
-        // The important thing is determinism and that the bit-reflected
-        // algorithm with inversion produces a consistent result.
-        assert_ne!(crc, 0);
-        assert_eq!(crc, crc_ccitt(b"ABCDEFGH"));
+        assert_eq!(crc, 0x1873, "CRC of ABCDEFGH must be 0x1873");
+    }
+
+    #[test]
+    fn crc_known_header_vector() {
+        // All-zeros flags + all-spaces callsigns (39 bytes): independently
+        // computed CRC = 0x38B6.
+        let mut header = [0u8; 39];
+        header[3..39].fill(b' ');
+        let crc = crc_ccitt(&header);
+        assert_eq!(
+            crc, 0x38B6,
+            "CRC of all-spaces D-STAR header must be 0x38B6"
+        );
     }
 
     #[test]

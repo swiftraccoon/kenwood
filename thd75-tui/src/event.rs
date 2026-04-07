@@ -94,6 +94,31 @@ pub(crate) enum RadioCommand {
         /// The desired power level.
         level: kenwood_thd75::types::PowerLevel,
     },
+    /// Set D-STAR URCALL callsign via CAT (works in normal CAT mode).
+    SetUrcall {
+        /// Callsign (up to 8 chars).
+        callsign: String,
+        /// Suffix (up to 4 chars).
+        suffix: String,
+    },
+    /// Connect to a D-STAR reflector via CAT (sets URCALL to link command).
+    ConnectReflector {
+        /// Reflector callsign (e.g. "REF030").
+        name: String,
+        /// Reflector module letter (e.g. 'C').
+        module: char,
+    },
+    /// Disconnect from the current D-STAR reflector via CAT.
+    DisconnectReflector,
+    /// Set URCALL to CQCQCQ via CAT.
+    SetCQ,
+    /// Enter D-STAR gateway mode (MMDVM/DStarGateway).
+    EnterDStar {
+        /// D-STAR gateway configuration.
+        config: kenwood_thd75::DStarGatewayConfig,
+    },
+    /// Exit D-STAR gateway mode.
+    ExitDStar,
     /// Enter APRS/KISS mode. The radio task enters KISS mode and starts
     /// processing APRS packets instead of CAT polling.
     EnterAprs {

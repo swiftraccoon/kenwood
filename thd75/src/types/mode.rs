@@ -88,6 +88,11 @@ pub enum Mode {
     CwReverse = 9,
 }
 
+impl Mode {
+    /// Number of valid mode values (0-9).
+    pub const COUNT: u8 = 10;
+}
+
 impl fmt::Display for Mode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -159,6 +164,11 @@ pub enum PowerLevel {
     Low = 2,
     /// Extra-low power — 50 mW (index 3). D75-specific; not present on the TH-D74.
     ExtraLow = 3,
+}
+
+impl PowerLevel {
+    /// Number of valid power level values (0-3).
+    pub const COUNT: u8 = 4;
 }
 
 impl fmt::Display for PowerLevel {
@@ -322,6 +332,9 @@ pub enum StepSize {
 }
 
 impl StepSize {
+    /// Number of valid step size values (0-11).
+    pub const COUNT: u8 = 12;
+
     /// Returns the step size in Hz.
     #[must_use]
     pub const fn as_hz(self) -> u32 {
@@ -421,6 +434,9 @@ pub enum CoarseStepMultiplier {
 }
 
 impl CoarseStepMultiplier {
+    /// Number of valid coarse step multiplier values (0-5).
+    pub const COUNT: u8 = 6;
+
     /// Returns the numeric multiplier value.
     #[must_use]
     pub const fn multiplier(self) -> u16 {
@@ -511,6 +527,11 @@ pub enum MemoryMode {
     Dr = 7,
 }
 
+impl MemoryMode {
+    /// Number of valid memory mode values (0-7).
+    pub const COUNT: u8 = 8;
+}
+
 impl fmt::Display for MemoryMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -559,20 +580,21 @@ mod tests {
 
     #[test]
     fn mode_valid_range() {
-        for i in 0u8..10 {
-            assert!(Mode::try_from(i).is_ok(), "Mode({i}) should be valid");
+        for i in 0u8..Mode::COUNT {
+            let val = Mode::try_from(i).unwrap();
+            assert_eq!(u8::from(val), i, "Mode round-trip failed at {i}");
         }
     }
 
     #[test]
     fn mode_invalid() {
-        assert!(Mode::try_from(10).is_err());
+        assert!(Mode::try_from(Mode::COUNT).is_err());
         assert!(Mode::try_from(255).is_err());
     }
 
     #[test]
     fn mode_round_trip() {
-        for i in 0u8..10 {
+        for i in 0u8..Mode::COUNT {
             let val = Mode::try_from(i).unwrap();
             assert_eq!(u8::from(val), i);
         }
@@ -580,7 +602,7 @@ mod tests {
 
     #[test]
     fn mode_error_variant() {
-        let err = Mode::try_from(10).unwrap_err();
+        let err = Mode::try_from(Mode::COUNT).unwrap_err();
         assert!(matches!(err, ValidationError::ModeOutOfRange(10)));
     }
 
@@ -602,23 +624,21 @@ mod tests {
 
     #[test]
     fn power_level_valid_range() {
-        for i in 0u8..4 {
-            assert!(
-                PowerLevel::try_from(i).is_ok(),
-                "PowerLevel({i}) should be valid"
-            );
+        for i in 0u8..PowerLevel::COUNT {
+            let val = PowerLevel::try_from(i).unwrap();
+            assert_eq!(u8::from(val), i, "PowerLevel round-trip failed at {i}");
         }
     }
 
     #[test]
     fn power_level_invalid() {
-        assert!(PowerLevel::try_from(4).is_err());
+        assert!(PowerLevel::try_from(PowerLevel::COUNT).is_err());
         assert!(PowerLevel::try_from(255).is_err());
     }
 
     #[test]
     fn power_level_round_trip() {
-        for i in 0u8..4 {
+        for i in 0u8..PowerLevel::COUNT {
             let val = PowerLevel::try_from(i).unwrap();
             assert_eq!(u8::from(val), i);
         }
@@ -626,7 +646,7 @@ mod tests {
 
     #[test]
     fn power_level_error_variant() {
-        let err = PowerLevel::try_from(4).unwrap_err();
+        let err = PowerLevel::try_from(PowerLevel::COUNT).unwrap_err();
         assert!(matches!(err, ValidationError::PowerLevelOutOfRange(4)));
     }
 
@@ -644,10 +664,8 @@ mod tests {
     fn shift_direction_valid_range() {
         // All 4-bit values (0-15) are valid.
         for i in 0u8..=15 {
-            assert!(
-                ShiftDirection::try_from(i).is_ok(),
-                "ShiftDirection({i}) should be valid"
-            );
+            let val = ShiftDirection::try_from(i).unwrap();
+            assert_eq!(u8::from(val), i, "ShiftDirection round-trip failed at {i}");
         }
     }
 
@@ -693,23 +711,21 @@ mod tests {
 
     #[test]
     fn step_size_valid_range() {
-        for i in 0u8..12 {
-            assert!(
-                StepSize::try_from(i).is_ok(),
-                "StepSize({i}) should be valid"
-            );
+        for i in 0u8..StepSize::COUNT {
+            let val = StepSize::try_from(i).unwrap();
+            assert_eq!(u8::from(val), i, "StepSize round-trip failed at {i}");
         }
     }
 
     #[test]
     fn step_size_invalid() {
-        assert!(StepSize::try_from(12).is_err());
+        assert!(StepSize::try_from(StepSize::COUNT).is_err());
         assert!(StepSize::try_from(255).is_err());
     }
 
     #[test]
     fn step_size_round_trip() {
-        for i in 0u8..12 {
+        for i in 0u8..StepSize::COUNT {
             let val = StepSize::try_from(i).unwrap();
             assert_eq!(u8::from(val), i);
         }
@@ -717,7 +733,7 @@ mod tests {
 
     #[test]
     fn step_size_error_variant() {
-        let err = StepSize::try_from(12).unwrap_err();
+        let err = StepSize::try_from(StepSize::COUNT).unwrap_err();
         assert!(matches!(err, ValidationError::StepSizeOutOfRange(12)));
     }
 
@@ -764,23 +780,21 @@ mod tests {
 
     #[test]
     fn memory_mode_valid_range() {
-        for i in 0u8..8 {
-            assert!(
-                MemoryMode::try_from(i).is_ok(),
-                "MemoryMode({i}) should be valid"
-            );
+        for i in 0u8..MemoryMode::COUNT {
+            let val = MemoryMode::try_from(i).unwrap();
+            assert_eq!(u8::from(val), i, "MemoryMode round-trip failed at {i}");
         }
     }
 
     #[test]
     fn memory_mode_invalid() {
-        assert!(MemoryMode::try_from(8).is_err());
+        assert!(MemoryMode::try_from(MemoryMode::COUNT).is_err());
         assert!(MemoryMode::try_from(255).is_err());
     }
 
     #[test]
     fn memory_mode_round_trip() {
-        for i in 0u8..8 {
+        for i in 0u8..MemoryMode::COUNT {
             let val = MemoryMode::try_from(i).unwrap();
             assert_eq!(u8::from(val), i);
         }
@@ -788,7 +802,7 @@ mod tests {
 
     #[test]
     fn memory_mode_error_variant() {
-        let err = MemoryMode::try_from(8).unwrap_err();
+        let err = MemoryMode::try_from(MemoryMode::COUNT).unwrap_err();
         assert!(matches!(err, ValidationError::MemoryModeOutOfRange(8)));
     }
 
@@ -821,23 +835,25 @@ mod tests {
 
     #[test]
     fn coarse_step_multiplier_valid_range() {
-        for i in 0u8..6 {
-            assert!(
-                CoarseStepMultiplier::try_from(i).is_ok(),
-                "CoarseStepMultiplier({i}) should be valid"
+        for i in 0u8..CoarseStepMultiplier::COUNT {
+            let val = CoarseStepMultiplier::try_from(i).unwrap();
+            assert_eq!(
+                u8::from(val),
+                i,
+                "CoarseStepMultiplier round-trip failed at {i}"
             );
         }
     }
 
     #[test]
     fn coarse_step_multiplier_invalid() {
-        assert!(CoarseStepMultiplier::try_from(6).is_err());
+        assert!(CoarseStepMultiplier::try_from(CoarseStepMultiplier::COUNT).is_err());
         assert!(CoarseStepMultiplier::try_from(255).is_err());
     }
 
     #[test]
     fn coarse_step_multiplier_round_trip() {
-        for i in 0u8..6 {
+        for i in 0u8..CoarseStepMultiplier::COUNT {
             let val = CoarseStepMultiplier::try_from(i).unwrap();
             assert_eq!(u8::from(val), i);
         }
