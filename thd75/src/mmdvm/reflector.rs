@@ -489,6 +489,54 @@ pub mod dplus {
     /// Poll/keepalive interval in milliseconds.
     pub const POLL_INTERVAL_MS: u32 = 5000;
 
+    /// Default `DPlus` authentication port.
+    pub const AUTH_PORT: u16 = 20001;
+
+    /// Well-known `DPlus` authentication servers (tried in order).
+    pub const AUTH_SERVERS: &[&str] = &[
+        "auth.dstargateway.org",
+        "opendstar.org",
+        "dpns.dutch-star.eu",
+    ];
+
+    /// Build a `DPlus` authentication packet (56 bytes).
+    ///
+    /// Sent to an auth server (port 20001) before linking to a `REF`
+    /// reflector. The packet contains the station callsign and fixed
+    /// authentication tokens from the `DPlus` protocol specification.
+    ///
+    /// The auth server responds with a 56-byte ACK/NAK using the same
+    /// format as [`build_connect`] — parse it with [`parse_packet`].
+    #[must_use]
+    pub fn build_auth(callsign: &str) -> Vec<u8> {
+        let mut pkt = vec![0u8; 56];
+        pkt[0] = 0x38; // length = 56
+        pkt[1] = 0x00;
+        pkt[2] = 0x03; // auth request type
+        pkt[3] = 0x01;
+        pkt[4..12].copy_from_slice(&pad_callsign(callsign));
+        // Auth tokens (fixed protocol values from DPlus spec).
+        pkt[20..28].copy_from_slice(b"HS000001");
+        pkt[28..33].copy_from_slice(b"W7IB2");
+        pkt[40..44].copy_from_slice(b"DHS0");
+        pkt[44..47].copy_from_slice(b"257");
+        pkt
+    }
+
+    /// Parse a `DPlus` authentication response (56 bytes).
+    ///
+    /// Returns `true` if the auth server accepted the callsign, `false`
+    /// if rejected. Returns `None` if the packet is not an auth response.
+    #[must_use]
+    pub fn parse_auth_response(data: &[u8]) -> Option<bool> {
+        if data.len() != 56 {
+            return None;
+        }
+        // Auth responses use byte[2] to indicate success/failure.
+        // 0x03 = same as request = ACK, anything else = NAK.
+        Some(data[2] == 0x03)
+    }
+
     /// Events received from a `DPlus` reflector.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum DPlusEvent {
@@ -930,6 +978,46 @@ mod tests {
     }
 
     // ---- DPlus tests ----
+
+    #[test]
+    fn dplus_auth_packet_size_and_format() {
+        let pkt = dplus::build_auth("W1AW");
+        assert_eq!(pkt.len(), 56);
+        assert_eq!(pkt[0], 0x38);
+        assert_eq!(pkt[1], 0x00);
+        assert_eq!(pkt[2], 0x03);
+        assert_eq!(pkt[3], 0x01);
+        assert_eq!(&pkt[4..12], b"W1AW    ");
+        assert_eq!(&pkt[20..28], b"HS000001");
+        assert_eq!(&pkt[28..33], b"W7IB2");
+        assert_eq!(&pkt[40..44], b"DHS0");
+        assert_eq!(&pkt[44..47], b"257");
+    }
+
+    #[test]
+    fn dplus_auth_response_accepted() {
+        let mut resp = vec![0u8; 56];
+        resp[2] = 0x03; // ACK
+        assert_eq!(dplus::parse_auth_response(&resp), Some(true));
+    }
+
+    #[test]
+    fn dplus_auth_response_rejected() {
+        let mut resp = vec![0u8; 56];
+        resp[2] = 0x00; // NAK
+        assert_eq!(dplus::parse_auth_response(&resp), Some(false));
+    }
+
+    #[test]
+    fn dplus_auth_response_wrong_size() {
+        assert_eq!(dplus::parse_auth_response(&[0u8; 28]), None);
+    }
+
+    #[test]
+    fn dplus_auth_constants() {
+        assert_eq!(dplus::AUTH_SERVERS.len(), 3);
+        assert_eq!(dplus::AUTH_PORT, 20001);
+    }
 
     #[test]
     fn dplus_connect_packet_size_and_format() {

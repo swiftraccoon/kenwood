@@ -114,7 +114,7 @@ pub use mmdvm::reflector::{dcs, dextra, dplus};
 pub use mmdvm::{
     DStarEvent, DStarGateway, DStarGatewayConfig, DStarHeader, DStarVoiceFrame, LastHeardEntry,
     MmdvmConfig, MmdvmError, MmdvmFrame, MmdvmResponse, ModemMode, ModemState, ModemStatus,
-    NakReason, SlowDataDecoder, SlowDataEncoder,
+    NakReason, ReconnectPolicy, SlowDataDecoder, SlowDataEncoder,
 };
 
 // SD card re-exports.

@@ -77,6 +77,7 @@
 //! # }
 //! ```
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::error::Error;
@@ -88,6 +89,7 @@ use crate::radio::Radio;
 use crate::radio::mmdvm_session::MmdvmSession;
 use crate::transport::Transport;
 use crate::types::TncBaud;
+use crate::types::dstar::UrCallAction;
 
 /// Default receive timeout for `next_event` polling (500 ms).
 ///
@@ -97,6 +99,21 @@ const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Default maximum entries in the last-heard list.
 const DEFAULT_MAX_LAST_HEARD: usize = 100;
+
+/// Default initial reconnection delay.
+const DEFAULT_RECONNECT_INITIAL: Duration = Duration::from_secs(1);
+
+/// Default maximum reconnection delay.
+const DEFAULT_RECONNECT_MAX: Duration = Duration::from_secs(30);
+
+/// D-STAR voice frame interval (20 ms per AMBE frame).
+const VOICE_FRAME_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Number of frames to burst-send on initial TX (prebuffer).
+///
+/// Allows the radio's MMDVM buffer to fill before audio starts playing,
+/// preventing initial audio gaps.
+const TX_PREBUFFER_FRAMES: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -136,6 +153,82 @@ impl DStarGatewayConfig {
             baud: TncBaud::Bps9600,
             max_last_heard: DEFAULT_MAX_LAST_HEARD,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reconnection backoff
+// ---------------------------------------------------------------------------
+
+/// Exponential backoff policy for reflector reconnection.
+///
+/// Provides a state machine that tracks reconnection attempts and
+/// computes the next delay using exponential backoff with a configurable
+/// ceiling.
+///
+/// # Usage
+///
+/// ```
+/// use kenwood_thd75::mmdvm::ReconnectPolicy;
+///
+/// let mut policy = ReconnectPolicy::default();
+/// // After first failure:
+/// let delay = policy.next_delay();
+/// // ... wait `delay`, then retry ...
+/// // On success:
+/// policy.reset();
+/// ```
+#[derive(Debug, Clone)]
+pub struct ReconnectPolicy {
+    /// Initial delay before the first retry.
+    pub initial_delay: Duration,
+    /// Maximum delay between retries.
+    pub max_delay: Duration,
+    /// Current delay (doubles after each failure).
+    current_delay: Duration,
+    /// Number of consecutive failures.
+    attempts: u32,
+}
+
+impl ReconnectPolicy {
+    /// Create a new policy with custom initial and max delays.
+    #[must_use]
+    pub const fn new(initial_delay: Duration, max_delay: Duration) -> Self {
+        Self {
+            initial_delay,
+            max_delay,
+            current_delay: initial_delay,
+            attempts: 0,
+        }
+    }
+
+    /// Get the next delay and advance the backoff state.
+    ///
+    /// The delay doubles with each call, up to `max_delay`.
+    #[must_use]
+    pub fn next_delay(&mut self) -> Duration {
+        let delay = self.current_delay;
+        self.attempts = self.attempts.saturating_add(1);
+        self.current_delay = (self.current_delay * 2).min(self.max_delay);
+        delay
+    }
+
+    /// Reset the backoff state after a successful connection.
+    pub const fn reset(&mut self) {
+        self.current_delay = self.initial_delay;
+        self.attempts = 0;
+    }
+
+    /// Number of consecutive reconnection attempts.
+    #[must_use]
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self::new(DEFAULT_RECONNECT_INITIAL, DEFAULT_RECONNECT_MAX)
     }
 }
 
@@ -201,8 +294,19 @@ pub enum DStarEvent {
     VoiceLost,
     /// A slow data text message was decoded from the voice stream.
     TextMessage(String),
+    /// GPS/DPRS data was decoded from the voice stream slow data.
+    ///
+    /// The bytes are the raw DPRS position encoding from type 3 slow
+    /// data blocks (not NMEA text).
+    GpsData(Vec<u8>),
     /// A station was heard (added or updated in the last-heard list).
     StationHeard(LastHeardEntry),
+    /// A URCALL command was detected in the voice header.
+    ///
+    /// The gateway parsed the UR field and identified a special command
+    /// (echo, unlink, info, link). The caller should handle the command
+    /// (e.g. connect/disconnect reflector, start echo recording).
+    UrCallCommand(UrCallAction),
     /// Modem status update received.
     StatusUpdate(ModemStatus),
 }
@@ -235,6 +339,18 @@ pub struct DStarGateway<T: Transport> {
     rx_active: bool,
     /// The D-STAR header for the currently active RX transmission.
     rx_header: Option<DStarHeader>,
+    /// Count of TX frames sent in the current outgoing transmission.
+    tx_frame_count: usize,
+    /// Timestamp of the last TX voice frame sent to the radio.
+    last_tx_frame: Option<Instant>,
+    /// Buffered events to emit on the next `next_event` call.
+    pending_events: VecDeque<DStarEvent>,
+    /// Echo recording buffer (header + voice frames).
+    echo_header: Option<DStarHeader>,
+    /// Echo recorded voice frames.
+    echo_frames: Vec<DStarVoiceFrame>,
+    /// Whether echo recording is active.
+    echo_active: bool,
 }
 
 impl<T: Transport> std::fmt::Debug for DStarGateway<T> {
@@ -274,6 +390,12 @@ impl<T: Transport> DStarGateway<T> {
             last_heard: Vec::new(),
             rx_active: false,
             rx_header: None,
+            tx_frame_count: 0,
+            last_tx_frame: None,
+            pending_events: VecDeque::new(),
+            echo_header: None,
+            echo_frames: Vec::new(),
+            echo_active: false,
         })
     }
 
@@ -308,6 +430,11 @@ impl<T: Transport> DStarGateway<T> {
     ///
     /// Returns an error on transport failures.
     pub async fn next_event(&mut self) -> Result<Option<DStarEvent>, Error> {
+        // Drain buffered events first (e.g. UrCallCommand after VoiceStart).
+        if let Some(evt) = self.pending_events.pop_front() {
+            return Ok(Some(evt));
+        }
+
         let response = match self.session.receive_response().await {
             Ok(r) => r,
             Err(Error::Timeout(_)) => return Ok(None),
@@ -321,6 +448,23 @@ impl<T: Transport> DStarGateway<T> {
                 self.slow_data.reset();
                 self.slow_data_frame_index = 0;
                 self.rx_header = Some(header.clone());
+
+                // Parse URCALL for special commands.
+                let action = UrCallAction::parse(&header.ur_call);
+                match &action {
+                    UrCallAction::Cq | UrCallAction::Callsign(_) => {}
+                    UrCallAction::Echo => {
+                        // Start echo recording.
+                        self.echo_active = true;
+                        self.echo_header = Some(header.clone());
+                        self.echo_frames.clear();
+                    }
+                    _ => {
+                        // Queue the command event after VoiceStart.
+                        self.pending_events
+                            .push_back(DStarEvent::UrCallCommand(action));
+                    }
+                }
 
                 // Update last-heard list.
                 let entry = LastHeardEntry {
@@ -347,30 +491,40 @@ impl<T: Transport> DStarGateway<T> {
                 self.slow_data.add_frame(&slow, self.slow_data_frame_index);
                 self.slow_data_frame_index = self.slow_data_frame_index.wrapping_add(1);
 
-                Ok(Some(DStarEvent::VoiceData(DStarVoiceFrame {
+                let frame = DStarVoiceFrame {
                     ambe,
                     slow_data: slow,
-                })))
+                };
+
+                // Record frames for echo playback.
+                if self.echo_active {
+                    self.echo_frames.push(frame.clone());
+                }
+
+                Ok(Some(DStarEvent::VoiceData(frame)))
             }
 
             MmdvmResponse::DStarEot => {
-                // Check for a decoded slow data message before clearing state.
+                // Check for decoded slow data before clearing state.
                 let text_event = self.take_text_message();
+                let gps_event = self.take_gps_data();
+
+                // If echo mode was active, play back the recorded frames.
+                let was_echo = self.echo_active;
+                if was_echo {
+                    self.echo_active = false;
+                    self.play_echo().await?;
+                }
 
                 self.rx_active = false;
                 self.rx_header = None;
 
-                // If there is a pending text message, emit it first.
-                // The caller will get VoiceEnd on the next call (we store
-                // neither --- simplify by emitting VoiceEnd now and letting
-                // the text come via a separate check).
+                // Prioritize text message, then GPS data, then VoiceEnd.
                 if let Some(text) = text_event {
-                    // We lose the VoiceEnd here, but the text is more
-                    // valuable. Alternatively, we could buffer events, but
-                    // matching the AprsClient pattern of one-event-per-call
-                    // is simpler. The clean EOT is implicit after TextMessage
-                    // when rx_active transitions to false.
                     return Ok(Some(DStarEvent::TextMessage(text)));
+                }
+                if let Some(gps) = gps_event {
+                    return Ok(Some(DStarEvent::GpsData(gps)));
                 }
 
                 Ok(Some(DStarEvent::VoiceEnd))
@@ -395,12 +549,15 @@ impl<T: Transport> DStarGateway<T> {
     /// Send a D-STAR voice header to the radio for transmission.
     ///
     /// Use this to relay incoming reflector headers to the radio so they
-    /// are transmitted over the air.
+    /// are transmitted over the air. Resets the TX pacing state for the
+    /// new transmission.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Transport`] if the write fails.
     pub async fn send_header(&mut self, header: &DStarHeader) -> Result<(), Error> {
+        self.tx_frame_count = 0;
+        self.last_tx_frame = None;
         self.session.send_dstar_header(header).await
     }
 
@@ -410,26 +567,84 @@ impl<T: Transport> DStarGateway<T> {
     /// The AMBE and slow data bytes are combined into the 12-byte format
     /// expected by the modem.
     ///
+    /// Enforces 20 ms inter-frame pacing to match the D-STAR AMBE frame
+    /// rate. The first 5 frames are sent immediately (burst) to fill the
+    /// radio's MMDVM buffer; subsequent frames are paced at 20 ms
+    /// intervals.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Transport`] if the write fails.
     pub async fn send_voice(&mut self, frame: &DStarVoiceFrame) -> Result<(), Error> {
+        // Pace frames after the initial prebuffer burst.
+        if self.tx_frame_count >= TX_PREBUFFER_FRAMES
+            && let Some(last) = self.last_tx_frame
+        {
+            let elapsed = last.elapsed();
+            if elapsed < VOICE_FRAME_INTERVAL {
+                tokio::time::sleep(VOICE_FRAME_INTERVAL - elapsed).await;
+            }
+        }
+
         let mut data = [0u8; 12];
         data[..9].copy_from_slice(&frame.ambe);
         data[9..12].copy_from_slice(&frame.slow_data);
-        self.session.send_dstar_data(&data).await
+        self.session.send_dstar_data(&data).await?;
+
+        self.tx_frame_count += 1;
+        self.last_tx_frame = Some(Instant::now());
+        Ok(())
     }
 
     /// Send end-of-transmission to the radio.
     ///
     /// Signals the modem that the current D-STAR transmission from the
-    /// reflector side is complete.
+    /// reflector side is complete. Resets the TX pacing state.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Transport`] if the write fails.
     pub async fn send_eot(&mut self) -> Result<(), Error> {
+        self.tx_frame_count = 0;
+        self.last_tx_frame = None;
         self.session.send_dstar_eot().await
+    }
+
+    /// Send a status header to the radio indicating connection state.
+    ///
+    /// When connected to a reflector, sets RPT1/RPT2 to the reflector
+    /// name + module and UR to CQCQCQ. When disconnected, sets
+    /// RPT1/RPT2 to "DIRECT".
+    ///
+    /// This updates the radio's display to show the current gateway
+    /// state, matching the behavior of `d75link` and `BlueDV`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Transport`] if the write fails.
+    pub async fn send_status_header(
+        &mut self,
+        reflector: Option<(&str, char)>,
+    ) -> Result<(), Error> {
+        let (rpt1, rpt2) = if let Some((name, module)) = reflector {
+            let rpt = format!("{name:<7}{module}");
+            (rpt.clone(), rpt)
+        } else {
+            ("DIRECT  ".to_owned(), "DIRECT  ".to_owned())
+        };
+
+        let header = DStarHeader {
+            flag1: 0x00,
+            flag2: 0x00,
+            flag3: 0x00,
+            rpt2,
+            rpt1,
+            ur_call: "CQCQCQ  ".to_owned(),
+            my_call: format!("{:<8}", self.config.callsign),
+            my_suffix: format!("{:<4}", self.config.suffix),
+        };
+
+        self.session.send_dstar_header(&header).await
     }
 
     /// Encode a text message into slow data blocks.
@@ -500,13 +715,55 @@ impl<T: Transport> DStarGateway<T> {
         }
     }
 
+    /// Play back recorded echo frames to the radio.
+    ///
+    /// Builds a modified header (`RPT2` = callsign + G, `RPT1` = callsign
+    /// + reflector module) and transmits all recorded frames with 20 ms pacing.
+    async fn play_echo(&mut self) -> Result<(), Error> {
+        let Some(orig_header) = self.echo_header.take() else {
+            return Ok(());
+        };
+        let frames = std::mem::take(&mut self.echo_frames);
+        if frames.is_empty() {
+            return Ok(());
+        }
+
+        // Build echo playback header: swap RPT fields to indicate
+        // the echo came from the gateway.
+        let echo_header = DStarHeader {
+            flag1: orig_header.flag1,
+            flag2: orig_header.flag2,
+            flag3: orig_header.flag3,
+            rpt2: format!("{:<7}G", self.config.callsign),
+            rpt1: orig_header.rpt1.clone(),
+            ur_call: orig_header.my_call.clone(),
+            my_call: format!("{:<8}", self.config.callsign),
+            my_suffix: format!("{:<4}", self.config.suffix),
+        };
+
+        self.send_header(&echo_header).await?;
+        for frame in &frames {
+            self.send_voice(frame).await?;
+        }
+        self.send_eot().await?;
+
+        Ok(())
+    }
+
     /// Take the decoded text message from the slow data decoder, if
     /// complete.
-    fn take_text_message(&mut self) -> Option<String> {
+    fn take_text_message(&self) -> Option<String> {
         if self.slow_data.has_message() {
-            let msg = self.slow_data.message().map(str::to_owned);
-            self.slow_data.reset();
-            msg
+            self.slow_data.message().map(str::to_owned)
+        } else {
+            None
+        }
+    }
+
+    /// Take the decoded GPS data from the slow data decoder, if present.
+    fn take_gps_data(&self) -> Option<Vec<u8>> {
+        if self.slow_data.has_gps_data() {
+            self.slow_data.gps_data().map(<[u8]>::to_vec)
         } else {
             None
         }
@@ -587,6 +844,12 @@ mod tests {
             last_heard: Vec::new(),
             rx_active: false,
             rx_header: None,
+            tx_frame_count: 0,
+            last_tx_frame: None,
+            pending_events: VecDeque::new(),
+            echo_header: None,
+            echo_frames: Vec::new(),
+            echo_active: false,
         }
     }
 

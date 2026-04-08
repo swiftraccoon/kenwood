@@ -3077,6 +3077,12 @@ impl App {
                 // Limit to 100 entries.
                 self.dstar_last_heard.truncate(100);
             }
+            DStarEvent::GpsData(_gps) => {
+                // GPS/DPRS data from slow data — available for future display.
+            }
+            DStarEvent::UrCallCommand(action) => {
+                self.status_message = Some(format!("D-STAR: URCALL command detected: {action:?}"));
+            }
             DStarEvent::StatusUpdate(_status) => {
                 // Modem status — no UI action needed.
             }

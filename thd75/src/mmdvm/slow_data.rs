@@ -21,6 +21,9 @@
 /// XOR descrambling key for D-STAR slow data (MMDVM Specification 20150922).
 const SCRAMBLE_KEY: [u8; 3] = [0x70, 0x4F, 0x93];
 
+/// Type nibble indicating a GPS data block in D-STAR slow data.
+const GPS_BLOCK_TYPE: u8 = 0x30;
+
 /// Type nibble indicating a text message block in D-STAR slow data.
 const TEXT_BLOCK_TYPE: u8 = 0x40;
 
@@ -28,6 +31,12 @@ const TEXT_BLOCK_TYPE: u8 = 0x40;
 ///
 /// D-STAR text messages are limited to 20 characters by the standard.
 pub const MAX_MESSAGE_LEN: usize = 20;
+
+/// Maximum GPS data length (bytes).
+///
+/// D-STAR GPS slow data blocks carry up to 5 bytes per block; multiple
+/// blocks are concatenated to form the complete NMEA-derived position.
+pub const MAX_GPS_LEN: usize = 50;
 
 /// Decoder for D-STAR slow data text messages.
 ///
@@ -56,8 +65,12 @@ pub struct SlowDataDecoder {
     block_pos: usize,
     /// Assembled text message bytes.
     text_buf: Vec<u8>,
-    /// Whether a complete message has been detected.
+    /// Whether a complete text message has been detected.
     complete: bool,
+    /// Accumulated GPS data bytes from type 3 blocks.
+    gps_buf: Vec<u8>,
+    /// Whether GPS data has been received.
+    gps_complete: bool,
 }
 
 impl SlowDataDecoder {
@@ -69,6 +82,8 @@ impl SlowDataDecoder {
             block_pos: 0,
             text_buf: Vec::with_capacity(MAX_MESSAGE_LEN),
             complete: false,
+            gps_buf: Vec::with_capacity(MAX_GPS_LEN),
+            gps_complete: false,
         }
     }
 
@@ -78,6 +93,8 @@ impl SlowDataDecoder {
         self.block_pos = 0;
         self.text_buf.clear();
         self.complete = false;
+        self.gps_buf.clear();
+        self.gps_complete = false;
     }
 
     /// Feed a 3-byte slow data segment from a voice frame.
@@ -134,9 +151,35 @@ impl SlowDataDecoder {
         }
     }
 
+    /// Returns `true` if GPS data has been received from slow data.
+    #[must_use]
+    pub const fn has_gps_data(&self) -> bool {
+        self.gps_complete
+    }
+
+    /// Returns the raw GPS data bytes, if any have been received.
+    ///
+    /// GPS data in D-STAR slow data (type 3 blocks) carries DPRS
+    /// position information derived from NMEA sentences. The format
+    /// is a compressed lat/lon/altitude encoding, not raw NMEA text.
+    #[must_use]
+    pub fn gps_data(&self) -> Option<&[u8]> {
+        if self.gps_complete {
+            Some(&self.gps_buf)
+        } else {
+            None
+        }
+    }
+
     /// Process a completed 6-byte block.
     fn process_block(&mut self) {
         let type_nibble = self.block_buf[0] & 0xF0;
+
+        if type_nibble == GPS_BLOCK_TYPE {
+            self.process_gps_block();
+            return;
+        }
+
         if type_nibble != TEXT_BLOCK_TYPE {
             return;
         }
@@ -161,6 +204,29 @@ impl SlowDataDecoder {
         // Message is complete if we received a short block or hit the length limit.
         if available < 5 || self.text_buf.len() >= MAX_MESSAGE_LEN {
             self.complete = true;
+        }
+    }
+
+    /// Process a GPS data block (type 3).
+    ///
+    /// GPS blocks carry 5 bytes of DPRS position data per block.
+    /// The lower nibble of the header byte indicates the number of
+    /// valid data bytes (1-5).
+    fn process_gps_block(&mut self) {
+        let byte_count = usize::from(self.block_buf[0] & 0x0F);
+        let available = byte_count.min(5);
+
+        for &b in &self.block_buf[1..=available] {
+            if self.gps_buf.len() >= MAX_GPS_LEN {
+                self.gps_complete = true;
+                return;
+            }
+            self.gps_buf.push(b);
+        }
+
+        // GPS data is complete if we received a short block or hit the limit.
+        if available < 5 || self.gps_buf.len() >= MAX_GPS_LEN {
+            self.gps_complete = true;
         }
     }
 }
@@ -316,15 +382,78 @@ mod tests {
     }
 
     #[test]
-    fn non_text_blocks_ignored() {
+    fn non_text_non_gps_blocks_ignored() {
         let mut decoder = SlowDataDecoder::new();
 
-        // A non-text block (type 0x30 = GPS data or something else).
-        let half1 = scramble([0x35, 0x01, 0x02]);
+        // A type 0x50 block (reserved) — should be ignored entirely.
+        let half1 = scramble([0x53, 0x01, 0x02]);
         let half2 = scramble([0x03, 0x04, 0x05]);
         decoder.add_frame(&half1, 0);
         decoder.add_frame(&half2, 1);
         assert!(!decoder.has_message());
+        assert!(!decoder.has_gps_data());
+    }
+
+    #[test]
+    fn gps_block_decoded() {
+        let mut decoder = SlowDataDecoder::new();
+
+        // GPS block: type 0x33 = 3 GPS bytes.
+        let half1 = scramble([0x33, 0xAA, 0xBB]);
+        let half2 = scramble([0xCC, 0x00, 0x00]);
+        decoder.add_frame(&half1, 0);
+        decoder.add_frame(&half2, 1);
+        assert!(decoder.has_gps_data());
+        assert_eq!(decoder.gps_data().unwrap(), &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn gps_full_block_continues() {
+        let mut decoder = SlowDataDecoder::new();
+
+        // GPS block: type 0x35 = 5 GPS bytes (full block).
+        let half1 = scramble([0x35, 0x01, 0x02]);
+        let half2 = scramble([0x03, 0x04, 0x05]);
+        decoder.add_frame(&half1, 0);
+        decoder.add_frame(&half2, 1);
+        // Full 5-byte block — expects more data.
+        assert!(!decoder.has_gps_data());
+    }
+
+    #[test]
+    fn gps_and_text_independent() {
+        let mut decoder = SlowDataDecoder::new();
+
+        // First: a GPS block (type 3, 2 bytes).
+        let g1 = scramble([0x32, 0xAA, 0xBB]);
+        let g2 = scramble([0x00, 0x00, 0x00]);
+        decoder.add_frame(&g1, 0);
+        decoder.add_frame(&g2, 1);
+        assert!(decoder.has_gps_data());
+        assert!(!decoder.has_message());
+
+        // Then: a text block (type 4, 2 chars).
+        let t1 = scramble([0x42, b'O', b'K']);
+        let t2 = scramble([0x00, 0x00, 0x00]);
+        decoder.add_frame(&t1, 2);
+        decoder.add_frame(&t2, 3);
+        assert!(decoder.has_message());
+        assert_eq!(decoder.message().unwrap(), "OK");
+        // GPS data still available.
+        assert_eq!(decoder.gps_data().unwrap(), &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn reset_clears_gps() {
+        let mut decoder = SlowDataDecoder::new();
+        let g1 = scramble([0x32, 0xAA, 0xBB]);
+        let g2 = scramble([0x00, 0x00, 0x00]);
+        decoder.add_frame(&g1, 0);
+        decoder.add_frame(&g2, 1);
+        assert!(decoder.has_gps_data());
+        decoder.reset();
+        assert!(!decoder.has_gps_data());
+        assert!(decoder.gps_data().is_none());
     }
 
     #[test]

@@ -469,15 +469,8 @@ pub enum GatewayMode {
 ///
 /// When EMR mode is activated by the remote station, the radio increases
 /// volume to the configured EMR level. 0 disables EMR volume override.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct EmrVolume(u8);
-
-#[allow(clippy::derivable_impls)]
-impl Default for EmrVolume {
-    fn default() -> Self {
-        Self(0)
-    }
-}
 
 impl EmrVolume {
     /// Maximum EMR volume level.
@@ -644,6 +637,91 @@ pub enum ReflectorCommand {
     Info,
     /// Use the currently linked reflector.
     Use,
+}
+
+/// Parsed action from a D-STAR URCALL field (8 characters).
+///
+/// The URCALL field in a D-STAR header can contain either a destination
+/// callsign for routing, or a special command for the gateway. This enum
+/// represents all possible interpretations.
+///
+/// # Special URCALL patterns (per DPlus/DCS/DExtra conventions)
+///
+/// - `"CQCQCQ  "` — Broadcast CQ (no routing)
+/// - `"       E"` — Echo test (7 spaces + `E`)
+/// - `"       U"` — Unlink from reflector (7 spaces + `U`)
+/// - `"       I"` — Request info (7 spaces + `I`)
+/// - `"REF001 A"` — Link to reflector REF001, module A
+///   (up to 7 chars reflector name + module letter)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UrCallAction {
+    /// Broadcast CQ — no special routing.
+    Cq,
+    /// Echo test — record and play back the transmission.
+    Echo,
+    /// Unlink — disconnect from the current reflector.
+    Unlink,
+    /// Request information from the gateway.
+    Info,
+    /// Link to a reflector and module.
+    Link {
+        /// Reflector name (e.g. "REF001", "XRF012", "DCS003").
+        reflector: String,
+        /// Module letter (A-Z).
+        module: char,
+    },
+    /// Route to a specific callsign (not a special command).
+    Callsign(String),
+}
+
+impl UrCallAction {
+    /// Parse an 8-character URCALL field into an action.
+    ///
+    /// The input should be exactly 8 characters (space-padded). If
+    /// shorter, it is right-padded with spaces. If longer, only the
+    /// first 8 characters are used.
+    #[must_use]
+    pub fn parse(ur_call: &str) -> Self {
+        // Pad to 8 characters.
+        let padded = format!("{:<8}", &ur_call[..ur_call.len().min(8)]);
+        let bytes = padded.as_bytes();
+
+        // Check for CQCQCQ.
+        if padded.trim() == "CQCQCQ" {
+            return Self::Cq;
+        }
+
+        // Check single-char commands (7 spaces + command).
+        if bytes[..7] == *b"       " {
+            return match bytes[7] {
+                b'E' => Self::Echo,
+                b'U' => Self::Unlink,
+                b'I' => Self::Info,
+                _ => Self::Callsign(padded.trim().to_owned()),
+            };
+        }
+
+        // Check for reflector link: last char is A-Z module letter,
+        // and the name portion matches known reflector prefixes.
+        let module = bytes[7];
+        if module.is_ascii_uppercase() {
+            let name = padded[..7].trim();
+            if !name.is_empty()
+                && (name.starts_with("REF")
+                    || name.starts_with("XRF")
+                    || name.starts_with("DCS")
+                    || name.starts_with("XLX"))
+            {
+                return Self::Link {
+                    reflector: name.to_owned(),
+                    module: module as char,
+                };
+            }
+        }
+
+        // Default: treat as a destination callsign.
+        Self::Callsign(padded.trim().to_owned())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -825,5 +903,91 @@ mod tests {
         let sq = DigitalSquelch::default();
         assert_eq!(sq.squelch_type, DigitalSquelchType::Off);
         assert_eq!(sq.code.value(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // UrCallAction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn urcall_cq() {
+        assert_eq!(UrCallAction::parse("CQCQCQ  "), UrCallAction::Cq);
+        assert_eq!(UrCallAction::parse("CQCQCQ"), UrCallAction::Cq);
+    }
+
+    #[test]
+    fn urcall_echo() {
+        assert_eq!(UrCallAction::parse("       E"), UrCallAction::Echo);
+    }
+
+    #[test]
+    fn urcall_unlink() {
+        assert_eq!(UrCallAction::parse("       U"), UrCallAction::Unlink);
+    }
+
+    #[test]
+    fn urcall_info() {
+        assert_eq!(UrCallAction::parse("       I"), UrCallAction::Info);
+    }
+
+    #[test]
+    fn urcall_link_ref() {
+        let action = UrCallAction::parse("REF001 A");
+        assert_eq!(
+            action,
+            UrCallAction::Link {
+                reflector: "REF001".to_owned(),
+                module: 'A',
+            }
+        );
+    }
+
+    #[test]
+    fn urcall_link_xrf() {
+        let action = UrCallAction::parse("XRF012 C");
+        assert_eq!(
+            action,
+            UrCallAction::Link {
+                reflector: "XRF012".to_owned(),
+                module: 'C',
+            }
+        );
+    }
+
+    #[test]
+    fn urcall_link_dcs() {
+        let action = UrCallAction::parse("DCS003 B");
+        assert_eq!(
+            action,
+            UrCallAction::Link {
+                reflector: "DCS003".to_owned(),
+                module: 'B',
+            }
+        );
+    }
+
+    #[test]
+    fn urcall_link_xlx() {
+        let action = UrCallAction::parse("XLX999 A");
+        assert_eq!(
+            action,
+            UrCallAction::Link {
+                reflector: "XLX999".to_owned(),
+                module: 'A',
+            }
+        );
+    }
+
+    #[test]
+    fn urcall_callsign() {
+        let action = UrCallAction::parse("W1AW    ");
+        assert_eq!(action, UrCallAction::Callsign("W1AW".to_owned()));
+    }
+
+    #[test]
+    fn urcall_unknown_single_char() {
+        // 7 spaces + unknown letter → callsign
+        let action = UrCallAction::parse("       X");
+        assert_eq!(action, UrCallAction::Callsign("X".to_owned()));
     }
 }

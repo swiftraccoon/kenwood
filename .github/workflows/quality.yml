@@ -15,6 +15,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: taiki-e/install-action@cargo-machete
       - run: cargo machete thd75/
+      - run: cargo machete thd75-tui/
 
   semver:
     name: Semver check

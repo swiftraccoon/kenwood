@@ -38,6 +38,8 @@ pub use frame::{
     MmdvmConfig, MmdvmError, MmdvmFrame, MmdvmResponse, ModemMode, ModemState, ModemStatus,
     NakReason,
 };
-pub use gateway::{DStarEvent, DStarGateway, DStarGatewayConfig, DStarVoiceFrame, LastHeardEntry};
+pub use gateway::{
+    DStarEvent, DStarGateway, DStarGatewayConfig, DStarVoiceFrame, LastHeardEntry, ReconnectPolicy,
+};
 pub use hosts::{HostEntry, parse_host_file};
 pub use slow_data::{SlowDataDecoder, SlowDataEncoder};
