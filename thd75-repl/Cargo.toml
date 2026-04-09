@@ -1,0 +1,43 @@
+[package]
+name = "thd75-repl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Accessible command-line REPL for the Kenwood TH-D75 transceiver"
+license = "GPL-2.0-or-later"
+authors = ["swiftraccoon"]
+repository = "https://github.com/swiftraccoon/kenwood"
+readme = "../README.md"
+keywords = ["ham-radio", "kenwood", "accessibility", "amateur-radio"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+kenwood-thd75 = { path = "../thd75" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rustyline = "15"
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+unused_results = "deny"
+elided_lifetimes_in_paths = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_import_braces = "deny"
+unused_qualifications = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+# In a binary crate with private modules, pub(crate) satisfies unreachable_pub
+# but clippy::redundant_pub_crate considers it redundant — allow to resolve conflict.
+redundant_pub_crate = "allow"
