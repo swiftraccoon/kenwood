@@ -44,20 +44,30 @@ ci_pod() {
         cargo check --manifest-path thd75/Cargo.toml 2>&1 | tail -1
         echo "--- check tui ---"
         cargo check --manifest-path thd75-tui/Cargo.toml 2>&1 | tail -1
+        echo "--- check dstar-gateway ---"
+        cargo check --manifest-path dstar-gateway/Cargo.toml 2>&1 | tail -1
+        echo "--- check repl ---"
+        cargo check --manifest-path thd75-repl/Cargo.toml 2>&1 | tail -1
         echo "--- clippy lib ---"
         cargo clippy --manifest-path thd75/Cargo.toml --all-targets -- -D warnings 2>&1 | tail -1
         echo "--- clippy tui ---"
         cargo clippy --manifest-path thd75-tui/Cargo.toml --all-targets -- -D warnings 2>&1 | tail -1
-        echo "--- test ---"
+        echo "--- clippy dstar-gateway ---"
+        cargo clippy --manifest-path dstar-gateway/Cargo.toml --all-targets -- -D warnings 2>&1 | tail -1
+        echo "--- clippy repl ---"
+        cargo clippy --manifest-path thd75-repl/Cargo.toml --all-targets -- -D warnings 2>&1 | tail -1
+        echo "--- test lib ---"
         cargo test --manifest-path thd75/Cargo.toml --lib 2>&1 | tail -1
+        echo "--- test dstar-gateway ---"
+        cargo test --manifest-path dstar-gateway/Cargo.toml 2>&1 | tail -1
         echo "--- doc ---"
-        RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path thd75/Cargo.toml --no-deps 2>&1 | tail -1
+        RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps 2>&1 | tail -1
         echo "--- audit ---"
         cargo install cargo-audit --quiet 2>/dev/null
-        cargo audit --file thd75/Cargo.lock 2>&1 | tail -3
+        cargo audit --file Cargo.lock 2>&1 | tail -3
         echo "--- deny ---"
         cargo install cargo-deny --quiet 2>/dev/null
-        cargo deny --manifest-path thd75/Cargo.toml check 2>&1 | tail -3
+        cargo deny check 2>&1 | tail -3
         echo "--- machete ---"
         cargo install cargo-machete --quiet 2>/dev/null
         cargo machete thd75/ 2>&1 | tail -3

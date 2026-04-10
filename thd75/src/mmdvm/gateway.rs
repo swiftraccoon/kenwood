@@ -48,7 +48,7 @@
 //! let radio = Radio::connect(transport).await?;
 //!
 //! let config = DStarGatewayConfig::new("N0CALL");
-//! let mut gw = DStarGateway::start(radio, config).await?;
+//! let mut gw = DStarGateway::start(radio, config).await.map_err(|(_, e)| e)?;
 //!
 //! while let Some(event) = gw.next_event().await? {
 //!     match event {
@@ -372,14 +372,82 @@ impl<T: Transport> DStarGateway<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the radio fails to enter MMDVM mode or if
-    /// the D-STAR initialization sequence fails.
-    pub async fn start(radio: Radio<T>, config: DStarGatewayConfig) -> Result<Self, Error> {
-        let mut session = radio.enter_mmdvm(config.baud).await?;
+    /// On failure, returns the [`Radio`] alongside the error so the
+    /// caller can continue using CAT mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics if MMDVM mode was entered but D-STAR init failed AND
+    /// the subsequent MMDVM exit also failed (unrecoverable state).
+    pub async fn start(
+        radio: Radio<T>,
+        config: DStarGatewayConfig,
+    ) -> Result<Self, (Radio<T>, Error)> {
+        let mut session = match radio.enter_mmdvm(config.baud).await {
+            Ok(s) => s,
+            Err((radio, e)) => return Err((radio, e)),
+        };
         session.set_receive_timeout(EVENT_POLL_TIMEOUT);
 
         // Initialize the modem for D-STAR. This sends GetVersion,
-        // SetConfig, and SetMode commands.
+        // SetConfig, and SetMode commands. If init fails, exit MMDVM
+        // mode and return the radio so the caller can continue.
+        let _status = match session.init_dstar().await {
+            Ok(s) => s,
+            Err(e) => {
+                // Init failed — exit MMDVM mode to recover the radio.
+                let radio = session
+                    .exit()
+                    .await
+                    .map_err(|exit_err| {
+                        tracing::error!("failed to exit MMDVM after init failure: {exit_err}");
+                    })
+                    .ok();
+                // If we recovered the radio, return it with the error.
+                // If not, we have no radio to return — this is unrecoverable.
+                return Err((
+                    radio.expect(
+                        "MMDVM exit failed after init failure; \
+                         transport is in an unrecoverable state",
+                    ),
+                    e,
+                ));
+            }
+        };
+
+        Ok(Self {
+            session,
+            config,
+            slow_data: SlowDataDecoder::new(),
+            slow_data_frame_index: 0,
+            last_heard: Vec::new(),
+            rx_active: false,
+            rx_header: None,
+            tx_frame_count: 0,
+            last_tx_frame: None,
+            pending_events: VecDeque::new(),
+            echo_header: None,
+            echo_frames: Vec::new(),
+            echo_active: false,
+        })
+    }
+
+    /// Start the D-STAR gateway on a radio already in MMDVM mode.
+    ///
+    /// Use this when the radio was put into DV Gateway / Reflector
+    /// Terminal Mode via MCP write (offset `0x1CA0 = 1`). The transport
+    /// already speaks MMDVM binary — no `TN` command is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the D-STAR initialization sequence fails.
+    pub async fn start_gateway_mode(
+        radio: Radio<T>,
+        config: DStarGatewayConfig,
+    ) -> Result<Self, Error> {
+        let mut session = radio.into_mmdvm_session();
+        session.set_receive_timeout(EVENT_POLL_TIMEOUT);
+
         let _status = session.init_dstar().await?;
 
         Ok(Self {
@@ -596,6 +664,22 @@ impl<T: Transport> DStarGateway<T> {
         Ok(())
     }
 
+    /// Send a voice frame to the radio without TX pacing.
+    ///
+    /// Use this for reflector→radio relay where the radio's MMDVM
+    /// buffer handles pacing internally. The prebuffer burst and
+    /// 20 ms inter-frame timing are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Transport`] if the write fails.
+    pub async fn send_voice_unpaced(&mut self, frame: &DStarVoiceFrame) -> Result<(), Error> {
+        let mut data = [0u8; 12];
+        data[..9].copy_from_slice(&frame.ambe);
+        data[9..12].copy_from_slice(&frame.slow_data);
+        self.session.send_dstar_data(&data).await
+    }
+
     /// Send end-of-transmission to the radio.
     ///
     /// Signals the modem that the current D-STAR transmission from the
@@ -645,6 +729,15 @@ impl<T: Transport> DStarGateway<T> {
         };
 
         self.session.send_dstar_header(&header).await
+    }
+
+    /// Set the receive timeout for `next_event` polling.
+    ///
+    /// Lower values make the event loop more responsive but increase
+    /// CPU usage. Use short timeouts (10-50ms) when actively relaying
+    /// voice from a reflector.
+    pub const fn set_event_timeout(&mut self, timeout: Duration) {
+        self.session.set_receive_timeout(timeout);
     }
 
     /// Encode a text message into slow data blocks.

@@ -168,21 +168,24 @@ impl<T: Transport> Radio<T> {
         tracing::info!("connecting with TNC exit preamble");
         let mut radio = Self::connect(transport).await?;
 
-        // Send empty frames
+        // Send empty frames to wake up any stale connection.
         let _ = radio.transport.write(b"\r").await;
         let _ = radio.transport.write(b"\r").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // ETX (exit KISS/TNC mode)
+        // ETX (exit KISS mode if active).
         let _ = radio.transport.write(&[0x03]).await;
-        // TNC exit command
+        // TC 1 exits KISS TNC mode.
         let _ = radio.transport.write(b"\rTC 1\r").await;
         tokio::time::sleep(Duration::from_millis(100)).await;
+        // TN 0,0 exits MMDVM mode (returns to APRS/normal TNC).
+        let _ = radio.transport.write(b"TN 0,0\r").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // Drain any buffered responses
+        // Drain any buffered responses from the mode exit commands.
         let mut drain_buf = [0u8; 4096];
         let _ = tokio::time::timeout(
-            Duration::from_millis(200),
+            Duration::from_millis(500),
             radio.transport.read(&mut drain_buf),
         )
         .await;
@@ -446,6 +449,30 @@ impl<T: Transport> Radio<T> {
     pub async fn disconnect(mut self) -> Result<(), Error> {
         tracing::info!("disconnecting from radio");
         self.transport.close().await.map_err(Error::Transport)
+    }
+
+    /// Write raw bytes to the underlying transport.
+    ///
+    /// Use this for protocol detection (e.g. sending MMDVM frames to
+    /// check if the radio is in gateway mode). No framing or parsing
+    /// is applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Transport`] if the write fails.
+    pub async fn transport_write(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.transport.write(data).await.map_err(Error::Transport)
+    }
+
+    /// Read raw bytes from the underlying transport.
+    ///
+    /// Use this for protocol detection. No framing or parsing is applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Transport`] if the read fails.
+    pub async fn transport_read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        self.transport.read(buf).await.map_err(Error::Transport)
     }
 
     /// Close the underlying transport without consuming the `Radio`.

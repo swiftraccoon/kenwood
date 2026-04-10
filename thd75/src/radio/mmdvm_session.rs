@@ -22,7 +22,7 @@
 //! let radio = Radio::connect(transport).await?;
 //!
 //! // Enter MMDVM mode (consumes the Radio).
-//! let mut mmdvm = radio.enter_mmdvm(TncBaud::Bps1200).await?;
+//! let mut mmdvm = radio.enter_mmdvm(TncBaud::Bps1200).await.map_err(|(_, e)| e)?;
 //!
 //! // Initialize D-STAR modem.
 //! let status = mmdvm.init_dstar().await?;
@@ -94,6 +94,28 @@ impl<T: Transport> std::fmt::Debug for MmdvmSession<T> {
 }
 
 impl<T: Transport> Radio<T> {
+    /// Wrap this [`Radio`] as an [`MmdvmSession`] without sending any commands.
+    ///
+    /// Use this when the radio is already in MMDVM mode (e.g. after
+    /// enabling DV Gateway / Reflector Terminal Mode via MCP write to
+    /// offset `0x1CA0`). The transport is assumed to already speak
+    /// MMDVM binary framing.
+    #[must_use]
+    pub fn into_mmdvm_session(self) -> MmdvmSession<T> {
+        tracing::info!("wrapping transport as MMDVM session (radio already in gateway mode)");
+        MmdvmSession {
+            transport: self.transport,
+            codec: self.codec,
+            notifications: self.notifications,
+            timeout: self.timeout,
+            mode_a: self.mode_a,
+            mode_b: self.mode_b,
+            mcp_speed: self.mcp_speed,
+            receive_timeout: MMDVM_RECEIVE_TIMEOUT,
+            rx_buffer: Vec::with_capacity(512),
+        }
+    }
+
     /// Enter MMDVM mode, consuming this [`Radio`] and returning an [`MmdvmSession`].
     ///
     /// Sends the `TN 3,x` CAT command to switch the TNC to MMDVM mode at the
@@ -103,22 +125,30 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the `TN` command fails.
-    pub async fn enter_mmdvm(mut self, baud: TncBaud) -> Result<MmdvmSession<T>, Error> {
+    /// On failure, returns the [`Radio`] alongside the error so the caller
+    /// can continue using CAT mode. The radio is NOT consumed on error.
+    pub async fn enter_mmdvm(mut self, baud: TncBaud) -> Result<MmdvmSession<T>, (Self, Error)> {
         tracing::info!(?baud, "entering MMDVM mode");
-        let response = self
+        let response = match self
             .execute(Command::SetTncMode {
                 mode: TncMode::Mmdvm,
                 setting: baud,
             })
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Err((self, e)),
+        };
         match response {
             Response::TncMode { .. } => {}
             other => {
-                return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                    expected: "TncMode".into(),
-                    actual: format!("{other:?}").into_bytes(),
-                }));
+                return Err((
+                    self,
+                    Error::Protocol(ProtocolError::UnexpectedResponse {
+                        expected: "TncMode".into(),
+                        actual: format!("{other:?}").into_bytes(),
+                    }),
+                ));
             }
         }
 

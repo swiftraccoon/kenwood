@@ -17,7 +17,7 @@
 //! let radio = Radio::connect(transport).await?;
 //!
 //! // Enter KISS mode (consumes the Radio).
-//! let mut kiss = radio.enter_kiss(TncBaud::Bps1200).await?;
+//! let mut kiss = radio.enter_kiss(TncBaud::Bps1200).await.map_err(|(_, e)| e)?;
 //!
 //! // Send and receive KISS frames.
 //! use kenwood_thd75::kiss::{KissFrame, CMD_DATA};
@@ -103,22 +103,30 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the `TN` command fails.
-    pub async fn enter_kiss(mut self, baud: TncBaud) -> Result<KissSession<T>, Error> {
+    /// On failure, returns the [`Radio`] alongside the error so the caller
+    /// can continue using CAT mode. The radio is NOT consumed on error.
+    pub async fn enter_kiss(mut self, baud: TncBaud) -> Result<KissSession<T>, (Self, Error)> {
         tracing::info!(?baud, "entering KISS mode");
-        let response = self
+        let response = match self
             .execute(Command::SetTncMode {
                 mode: TncMode::Kiss,
                 setting: baud,
             })
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Err((self, e)),
+        };
         match response {
             Response::TncMode { .. } => {}
             other => {
-                return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                    expected: "TncMode".into(),
-                    actual: format!("{other:?}").into_bytes(),
-                }));
+                return Err((
+                    self,
+                    Error::Protocol(ProtocolError::UnexpectedResponse {
+                        expected: "TncMode".into(),
+                        actual: format!("{other:?}").into_bytes(),
+                    }),
+                ));
             }
         }
 

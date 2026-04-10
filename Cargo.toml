@@ -1,0 +1,3 @@
+[workspace]
+members = ["thd75", "thd75-tui", "thd75-repl", "dstar-gateway"]
+resolver = "3"

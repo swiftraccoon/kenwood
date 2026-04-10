@@ -31,7 +31,7 @@
 //! let radio = Radio::connect(transport).await?;
 //!
 //! let config = AprsClientConfig::new("N0CALL", 7);
-//! let mut client = AprsClient::start(radio, config).await?;
+//! let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 //!
 //! // Send a message
 //! client.send_message("KQ4NIT", "Hello!").await?;
@@ -238,9 +238,16 @@ impl<T: Transport> AprsClient<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the radio fails to enter KISS mode.
-    pub async fn start(radio: Radio<T>, config: AprsClientConfig) -> Result<Self, Error> {
-        let mut session = radio.enter_kiss(config.baud).await?;
+    /// On failure, returns the [`Radio`] alongside the error so the
+    /// caller can continue using CAT mode.
+    pub async fn start(
+        radio: Radio<T>,
+        config: AprsClientConfig,
+    ) -> Result<Self, (Radio<T>, Error)> {
+        let mut session = match radio.enter_kiss(config.baud).await {
+            Ok(s) => s,
+            Err((radio, e)) => return Err((radio, e)),
+        };
         session.set_receive_timeout(EVENT_POLL_TIMEOUT);
 
         let my_addr = config.my_address();

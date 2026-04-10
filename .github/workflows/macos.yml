@@ -18,15 +18,31 @@ jobs:
         working-directory: thd75
       - run: cargo check
         working-directory: thd75-tui
+      - run: cargo check
+        working-directory: dstar-gateway
+      - run: cargo check
+        working-directory: thd75-repl
       - run: cargo build
         working-directory: thd75
       - run: cargo build
         working-directory: thd75-tui
+      - run: cargo build
+        working-directory: dstar-gateway
+      - run: cargo build
+        working-directory: thd75-repl
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: thd75
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: thd75-tui
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: dstar-gateway
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: thd75-repl
       - run: cargo test --lib
         working-directory: thd75
       - run: cargo test
         working-directory: thd75-tui
+      - run: cargo test
+        working-directory: dstar-gateway
+      - run: cargo test
+        working-directory: thd75-repl

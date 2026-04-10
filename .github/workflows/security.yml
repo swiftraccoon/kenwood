@@ -15,9 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
-      - run: cargo generate-lockfile --manifest-path thd75/Cargo.toml
+      - run: cargo generate-lockfile
       - run: cargo install cargo-audit
-      - run: cargo audit --file thd75/Cargo.lock
+      - run: cargo audit --file Cargo.lock
 
   deny:
     name: cargo-deny
@@ -25,5 +25,3 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          manifest-path: thd75/Cargo.toml

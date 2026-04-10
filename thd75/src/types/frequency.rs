@@ -9,16 +9,34 @@ use crate::error::ProtocolError;
 /// Stored as a `u32`, matching the firmware's internal representation.
 /// Range: 0 to 4,294,967,295 Hz (0 to ~4.295 GHz).
 ///
-/// # TH-D75 band frequency ranges (per User Manual Chapter 28)
+/// # TH-D75 band frequency ranges
 ///
-/// The radio enforces hardware-specific frequency limits per band:
+/// Per service manual §2.1.2 (Table 1) and User Manual Chapter 28, the
+/// radio enforces hardware-specific frequency limits per band. The
+/// service manual frequency configuration points (A-E) map to the
+/// signal path in the receiver block diagrams (§2.1.3):
 ///
-/// - **Band A TX**: 144-148 MHz (TH-D75A), 144-146 MHz (TH-D75E),
-///   222-225 MHz (TH-D75A only), 430-450 MHz (TH-D75A), 430-440 MHz
-///   (TH-D75E).
-/// - **Band A RX**: 136-174 MHz, 216-260 MHz (TH-D75A only), 410-470 MHz.
-/// - **Band B TX**: same amateur allocations as Band A.
-/// - **Band B RX**: 0.1-76 MHz, 76-108 MHz (WFM), 108-524 MHz.
+/// ## TH-D75A (K type)
+///
+/// | Point | Frequency range | Function |
+/// |-------|----------------|----------|
+/// | A (TX/RX) | 144.000-147.995, 222.000-224.995, 430.000-449.995 MHz | VCO/PLL output → 1st mixer |
+/// | B (RX) | 136.000-173.995, 216.000-259.995, 410.000-469.995 MHz | RF AMP → distribution circuit |
+/// | C (RX) | 0.100-75.995, 108.000-523.995 MHz | Band B wideband RX input |
+/// | D (1st IF) | 193.150-231.145, 158.850-202.845, 352.850-412.845 MHz | After 1st mixer (Band A) |
+/// | E (1st IF) | 58.150-134.045, 166.050-465.945 MHz | After 1st mixer (Band B) |
+///
+/// ## TH-D75E (E, T types)
+///
+/// | Point | Frequency range | Function |
+/// |-------|----------------|----------|
+/// | A (TX/RX) | 144.000-145.995, 430.000-439.995 MHz | VCO/PLL output → 1st mixer |
+/// | B (RX) | 136.000-173.995, 410.000-469.995 MHz | RF AMP → distribution circuit |
+/// | C (RX) | 0.100-75.995, 108.000-523.995 MHz | Band B wideband RX input |
+///
+/// Band A uses double super heterodyne (1st IF 57.15 MHz, 2nd IF
+/// 450 kHz). Band B uses triple super heterodyne (1st IF 58.05 MHz,
+/// 2nd IF 450 kHz, 3rd IF 10.8 kHz for AM/SSB/CW).
 ///
 /// Frequencies outside these ranges will be **rejected by the radio**
 /// when sent via CAT commands such as `FQ` or `FO`. The firmware

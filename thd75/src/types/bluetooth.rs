@@ -10,6 +10,22 @@
 //! HFP (Hands-Free Profile) and BLE (Bluetooth Low Energy) are **not**
 //! supported. The radio only works with HSP + SPP compatible devices.
 //!
+//! # Hardware (per service manual §2.1.8.9, Fig.12)
+//!
+//! The BT/GPS combo IC is IC2044, connected to the MAIN MPU (IC2005)
+//! via three interfaces:
+//!
+//! - **HCI UART** (UART2): BT control/data at 115.2 kbps (access) /
+//!   3.569 Mbps (normal), level-shifted 3.3V↔1.8V through IC2046.
+//! - **AI2 UART** (UART1): GPS NMEA data at 115.2 kbps, level-shifted
+//!   through IC2036.
+//! - **PCM audio** (McASP): digital audio I2S for BT headset audio,
+//!   level-shifted 3.3V↔1.8V through IC2048.
+//!
+//! IC2044 runs on dedicated 3.3V (IC2041) and 1.8V (IC2038) regulators,
+//! with a 19.2 MHz TCXO (X2003) and 32.768 kHz RTC crystal (X2004).
+//! The MAIN MPU controls BT power via `/BT_SHUTDOWN` (active low reset).
+//!
 //! Per User Manual Chapter 18:
 //!
 //! - Menu No. 930: Bluetooth on/off (default: Off).
@@ -32,6 +48,7 @@
 //! is `0000`.
 //!
 //! Per User Manual Chapter 28 (specifications): Bluetooth output power
-//! is -6 to +4 dBm.
+//! is -6 to +4 dBm, carrier frequency drift ±25 kHz (one slot),
+//! ±40 kHz (three/five slot).
 //!
 //! This module is intentionally empty pending hardware capture data.

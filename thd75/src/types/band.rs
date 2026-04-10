@@ -15,13 +15,42 @@ use crate::error::ValidationError;
 /// - **Band A** (upper display): Amateur-only TX/RX at 144 MHz, 220 MHz
 ///   (TH-D75A only), and 430 MHz. Supports FM and DV modes.
 ///   Pressing and holding `[Left]/[Right]` cycles: 144 <-> 220 <-> 430 MHz.
+///   Band A uses a double super heterodyne receiver (1st IF 57.15 MHz,
+///   2nd IF 450 kHz) with VCO/PLL IC800 and IF IC IC900 (AK2365AU).
 /// - **Band B** (lower display): Wideband RX from 0.1-524 MHz. Supports
-///   FM, DV, AM, LSB, USB, CW, NFM, WFM (FM Radio mode only), and DR. Band B has an
-///   independent receiver chain (separate VCO/PLL/IF per the service
-///   manual), so both bands receive simultaneously.
+///   FM, DV, AM, LSB, USB, CW, NFM, WFM (FM Radio mode only), and DR.
+///   Band B has an independent receiver chain with its own VCO/PLL IC700,
+///   IF IC IC1002 (AK2365AU), and a third IF stage at 10.8 kHz via 3rd
+///   mixer IC1001 for AM/SSB/CW demodulation. 1st IF is 58.05 MHz, 2nd
+///   IF is 450 kHz. This independent hardware allows both bands to
+///   receive simultaneously.
 ///   Pressing and holding `[Left]/[Right]` cycles: 430 <-> UHF(470-524) <->
 ///   LF/MF(0.1-1.71) <-> HF(1.71-29.7) <-> 50(29.7-76) <-> FMBC(76-108) <->
 ///   118(108-136) <-> 144(136-174) <-> VHF(174-216/230) <-> 200/300(216/230-410) <-> 430 MHz.
+///
+/// Both bands share the MAIN MPU (IC2005, OMAP-L138), CODEC (IC2011),
+/// and SUB MPU (IC1103) which controls the VCO/PLLs and IF ICs via SPI.
+/// The VCO/PLL reference clocks are TCXO1 57.6 MHz (X600) and TCXO2
+/// 55.95 MHz (X601), selected by analog switches IC604/IC605.
+///
+/// Per service manual §2.1.5, the Band B VCO/PLL (IC700) is also used
+/// for transmission on all bands. Band A's VCO/PLL (IC800) handles
+/// Band A 1st local oscillation only.
+///
+/// # Hardware signal path (per service manual §2.1.3, §2.1.4)
+///
+/// ```text
+/// Band A RX: ANT → LNA Q404/Q406 → BPF → 1st MIX Q400 → IF 57.15MHz
+///            → MCF XF1 → IF AMP Q900 → IC900 → 2nd IF 450kHz → CODEC IC2011
+///
+/// Band B RX: ANT → LNA Q404/Q406 → BPF → 1st MIX Q500 → IF 58.05MHz
+///            → MCF XF2 → IF AMP Q1000 → IC1002 → 2nd IF 450kHz → CODEC IC2011
+///            (AM/SSB/CW: → 3rd MIX IC1001 → 3rd IF 10.8kHz → CODEC)
+///
+/// TX (all):  CODEC IC2011 → MOD AMP IC2027 → SUB MPU IC1103 → Band B
+///            VCO/PLL IC700 → RF AMP Q201 → PRE DRV IC201 → DRV AMP Q212
+///            → FINAL AMP Q217/Q218 → ANT
+/// ```
 ///
 /// Band A is the CTRL/PTT band by default. Band B supports all
 /// demodulation modes including SSB/CW with DSP and an IF receive filter.

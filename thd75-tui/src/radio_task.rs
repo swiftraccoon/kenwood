@@ -808,9 +808,7 @@ async fn enter_aprs_session(
 ) -> Result<Radio<EitherTransport>, EnterAprsError> {
     let mut client = match kenwood_thd75::AprsClient::start(radio, config).await {
         Ok(c) => c,
-        Err(e) => {
-            // AprsClient::start() calls enter_kiss() which consumes the radio.
-            // If it fails, the radio is gone. We need to reconnect.
+        Err((_radio, e)) => {
             return Err(EnterAprsError::KissExitFailed(format!(
                 "KISS entry failed: {e}"
             )));
@@ -917,7 +915,7 @@ async fn enter_dstar_session(
 ) -> Result<Radio<EitherTransport>, EnterDStarError> {
     let mut gateway = match kenwood_thd75::DStarGateway::start(radio, config).await {
         Ok(g) => g,
-        Err(e) => {
+        Err((_radio, e)) => {
             return Err(EnterDStarError::MmdvmExitFailed(format!(
                 "D-STAR gateway start failed: {e}"
             )));

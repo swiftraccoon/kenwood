@@ -12,12 +12,14 @@ keywords = ["ham-radio", "kenwood", "accessibility", "amateur-radio"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-kenwood-thd75 = { path = "../thd75" }
+kenwood-thd75 = { path = "../thd75", version = "0.1.0" }
+dstar-gateway = { path = "../dstar-gateway", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std", "process", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustyline = "15"
+dirs-next = "2"
 
 [lints.rust]
 unsafe_code = "deny"

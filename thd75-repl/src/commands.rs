@@ -168,7 +168,7 @@ pub(crate) fn help() {
     println!("-- APRS packet radio mode --");
     println!("aprs start MYCALL 7: Enter APRS mode with callsign and SSID");
     println!("-- D-STAR gateway mode --");
-    println!("dstar start MYCALL: Enter D-STAR gateway mode with callsign");
+    println!("dstar start MYCALL XRF030C: Enter D-STAR gateway with reflector");
 }
 
 /// Print the APRS mode help text listing APRS-specific commands.
@@ -186,9 +186,12 @@ pub(crate) fn aprs_help() {
 pub(crate) fn dstar_help() {
     println!("You are in D-STAR digital voice gateway mode.");
     println!("-- D-STAR gateway commands --");
-    println!("listen: Check for the next D-STAR event");
+    println!("listen: Poll once for D-STAR and reflector events");
+    println!("monitor: Continuous monitoring with keepalives and voice relay");
+    println!("link XRF030C: Connect to a reflector");
+    println!("unlink: Disconnect from the reflector");
     println!("heard: List recently heard stations");
-    println!("status: Modem buffer and transmit status");
+    println!("status: Modem and reflector connection status");
     println!("dstar stop: Leave D-STAR mode, return to normal radio control");
     println!("quit: Exit the program");
 }

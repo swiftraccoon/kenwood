@@ -37,15 +37,29 @@ Rust libraries, TUI, and accessible REPL for Kenwood amateur radio transceivers.
 - Three operating modes: CAT (radio control), APRS (packet radio), D-STAR (digital voice gateway)
 
 ```
-$ thd75-repl --port /dev/cu.usbmodem1234
+$ thd75-repl
 Kenwood TH-D75 accessible radio control, version 0.1.0.
-Connected via /dev/cu.usbmodem1234.
-Radio model: TH-D75A. Firmware version: 1.03.
-Type help for a list of commands, or quit to exit.
-d75> freq
-Band A frequency: 146.52 megahertz
-d75> battery
-Battery level: two thirds
-d75> power a
-Band A power: high, 5 watts
+Connected via bluetooth:TH-D75.
+Radio is in D-STAR Reflector Terminal Mode.
+Type dstar start <callsign> to begin, or quit to exit.
+d75> dstar start KQ4NIT
+Checking if radio is already in D-STAR gateway mode.
+Radio is already in Reflector Terminal Mode.
+Starting D-STAR gateway as KQ4NIT.
+MMDVM modem initialized.
+No reflector specified. Use link command to connect.
+D-STAR gateway active. Type dstar stop to exit.
+Commands: listen, link, unlink, heard, status, dstar stop
+dstar> link REF030C
+Connecting to REF030 module C at 45.79.43.161:20001.
+Authenticating with D-STAR gateway server.
+Authentication successful.
+Waiting for reflector acknowledgement.
+Connected to REF030 module C.
+dstar> monitor
+Entering monitor mode. Press Ctrl-C to return to prompt.
+Reflector: voice from K3ATA to CQCQCQ.
+Reflector: voice transmission ended.
+Reflector: voice from KF0WFM to CQCQCQ.
+Reflector: voice transmission ended.
 ```

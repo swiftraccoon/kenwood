@@ -17,6 +17,8 @@ allow = [
     "MPL-2.0",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    "BSL-1.0",
+    "Zlib",
 ]
 confidence-threshold = 0.8
 
@@ -25,11 +27,14 @@ multiple-versions = "deny"
 wildcards = "deny"
 skip = [
     # serialport uses nix 0.26 (bitflags 1), mio-serial uses nix 0.29 (bitflags 2).
-    # Unavoidable until serialport bumps to nix 0.29+.
     { crate = "bitflags@1" },
     { crate = "nix@0.26" },
-    # serialport/mio-serial Windows deps — deny checks all targets.
+    # serialport/mio-serial Windows deps.
     { crate = "windows-sys@0.52" },
+    { crate = "windows-sys@0.59" },
+    # thiserror 1.x pulled by transitive deps alongside our thiserror 2.x.
+    { crate = "thiserror@1" },
+    { crate = "thiserror-impl@1" },
 ]
 
 [sources]

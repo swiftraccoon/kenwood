@@ -12,7 +12,7 @@ keywords = ["ham-radio", "kenwood", "tui", "amateur-radio"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-kenwood-thd75 = { path = "../thd75" }
+kenwood-thd75 = { path = "../thd75", version = "0.1.0" }
 ratatui = "0.30"
 crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }

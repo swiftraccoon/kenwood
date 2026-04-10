@@ -1,15 +1,27 @@
 //! Serial port transport for USB CDC ACM and Bluetooth SPP connections.
 //!
+//! The MAIN MPU (IC2005, OMAP-L138) communicates with the PC via USB
+//! Type-C (J1) using a Mentor Graphics MUSB USB 2.0 OTG controller
+//! with `MatrixQuest` CDC ACM stack. VID `0x2166` (JVCKENWOOD), PID
+//! `0x9023`. The USB interface presents as CDC ACM (class 0x02,
+//! subclass 0x02, protocol 0x01 V.25ter) with 3 endpoints: interrupt
+//! IN, bulk OUT, bulk IN. USB D+/D- run at Full Speed (12 Mbps).
+//!
 //! USB uses 115200 baud (CDC ACM ignores line coding — per the Kenwood
 //! Operating Tips §5.13, "configuring the baud rate is unnecessary,
 //! selecting randomly will suffice" since it's a virtual COM port).
 //! USB also provides audio output (48 kHz, 16-bit, monaural — per §5.13.2).
 //!
-//! Bluetooth SPP requires 9600 baud with RTS/CTS hardware flow control.
-//! The D75 supports Bluetooth 3.0 Class 2 with HSP + SPP profiles only
-//! (no BLE, no HFP). Per §5.12, "configuration of the baud rate is not
-//! necessary" for BT serial either, but we set 9600 explicitly for
-//! compatibility.
+//! Bluetooth SPP runs through BT/GPS IC2044 → level-shift IC2046 →
+//! MAIN MPU UART2. Requires 9600 baud with RTS/CTS hardware flow
+//! control. The D75 supports Bluetooth 3.0 Class 2 with HSP + SPP
+//! profiles only (no BLE, no HFP). Per §5.12, "configuration of the
+//! baud rate is not necessary" for BT serial either, but we set 9600
+//! explicitly for compatibility.
+//!
+//! The same VID/PID (2166:9023) is used in both normal operation and
+//! firmware update mode (PTT+1 at power-on), though update mode uses
+//! the bootloader's simpler USB implementation rather than `MatrixQuest`.
 //!
 //! [`open`](SerialTransport::open) auto-detects BT ports and applies the
 //! correct settings.

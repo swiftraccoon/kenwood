@@ -20,11 +20,16 @@ use crate::error::ValidationError;
 /// Not all modes are available on both bands:
 ///
 /// - **Band A** supports only **FM** and **DV**. Band A is the amateur
-///   TX/RX band (144/220/430 MHz) and its hardware path does not include
-///   the DSP demodulator needed for SSB/CW/AM.
+///   TX/RX band (144/220/430 MHz). Its receiver chain (VCO/PLL IC800,
+///   IF IC IC900) is a double super heterodyne with 1st IF at 57.15 MHz
+///   and 2nd IF at 450 kHz — it has no third IF stage, so AM/SSB/CW
+///   demodulation is not possible in hardware (service manual §2.1.3).
 /// - **Band B** supports all modes: FM, DV, AM, LSB, USB, CW, NFM, DR,
-///   WFM, and CW-R. Band B has an independent receiver chain with DSP
-///   and IF filter enabling wideband demodulation.
+///   WFM, and CW-R. Band B's receiver chain (VCO/PLL IC700, IF IC
+///   IC1002) adds a third mixer (IC1001) producing a 3rd IF at 10.8 kHz,
+///   which feeds into the CODEC (IC2011) for AM/SSB/CW demodulation.
+///   This triple super heterodyne architecture is what enables the
+///   wideband mode support (service manual §2.1.3.2).
 /// - **DR** (D-STAR repeater mode) is only available on **Band A**.
 ///   Attempting to set DR on Band B via `MD` will be rejected by the
 ///   firmware with a `?` error.
@@ -61,17 +66,17 @@ pub enum Mode {
     Fm = 0,
     /// D-STAR digital voice (index 1). Available on both Band A and Band B.
     Dv = 1,
-    /// AM modulation (index 2). Band B only — Band A hardware lacks the
-    /// DSP demodulator required for AM reception.
+    /// AM modulation (index 2). Band B only — Band A lacks the 3rd IF
+    /// stage (10.8 kHz via IC1001) required for AM envelope detection.
     Am = 2,
-    /// Lower sideband (index 3). Band B only — requires DSP demodulator
-    /// not present in Band A's receiver chain.
+    /// Lower sideband (index 3). Band B only — requires the 3rd IF at
+    /// 10.8 kHz (via 3rd mixer IC1001 and 460.8 kHz local oscillation).
     Lsb = 3,
-    /// Upper sideband (index 4). Band B only — requires DSP demodulator
-    /// not present in Band A's receiver chain.
+    /// Upper sideband (index 4). Band B only — requires the 3rd IF at
+    /// 10.8 kHz (via 3rd mixer IC1001 and 460.8 kHz local oscillation).
     Usb = 4,
-    /// CW / Morse code (index 5). Band B only — requires DSP demodulator
-    /// not present in Band A's receiver chain.
+    /// CW / Morse code (index 5). Band B only — requires the 3rd IF at
+    /// 10.8 kHz (via 3rd mixer IC1001 and 460.8 kHz local oscillation).
     Cw = 5,
     /// Narrow FM modulation (index 6). Band B only — Band A supports
     /// only standard FM deviation.

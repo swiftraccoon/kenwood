@@ -1,0 +1,39 @@
+[package]
+name = "dstar-gateway"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "D-STAR reflector gateway client library (DPlus, DExtra, DCS)"
+license = "GPL-2.0-or-later"
+authors = ["swiftraccoon"]
+keywords = ["dstar", "ham-radio", "reflector", "amateur-radio", "mmdvm"]
+categories = ["network-programming", "hardware-support"]
+repository = "https://github.com/swiftraccoon/dstar-gateway"
+readme = "README.md"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "time", "sync", "macros", "io-util"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+unused_results = "deny"
+elided_lifetimes_in_paths = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_import_braces = "deny"
+unused_qualifications = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
