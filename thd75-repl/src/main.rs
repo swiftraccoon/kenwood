@@ -23,15 +23,83 @@ mod commands;
 mod transport;
 
 use std::net::ToSocketAddrs;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global flag for timestamp output mode.
+static TIMESTAMPS: AtomicBool = AtomicBool::new(false);
+
+/// Print a line with an optional `[HH:MM:SS]` timestamp prefix.
+///
+/// When `--timestamps` is enabled, prepends the UTC time to every
+/// output line. This helps blind operators track when events occurred
+/// without needing to check a clock. Uses UTC to avoid pulling in
+/// timezone dependencies.
+macro_rules! tprintln {
+    ($($arg:tt)*) => {
+        if TIMESTAMPS.load(Ordering::Relaxed) {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let h = (secs / 3600) % 24;
+            let m = (secs / 60) % 60;
+            let s = secs % 60;
+            println!("[{h:02}:{m:02}:{s:02}] {}", format!($($arg)*));
+        } else {
+            println!($($arg)*);
+        }
+    };
+}
 
 use clap::Parser;
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::{AprsClient, AprsClientConfig, AprsEvent};
-use kenwood_thd75::{DStarEvent, DStarGateway, DStarGatewayConfig};
+use kenwood_thd75::{DStarEvent, DStarGateway, DStarGatewayConfig, SlowDataDecoder};
 
-use dstar_gateway::ReflectorClient;
 use dstar_gateway::protocol::{ConnectionState, ReflectorEvent};
+use dstar_gateway::{
+    Callsign, Module, Protocol, ReflectorClient, ReflectorClientParams, StreamId, Suffix,
+};
+
+/// Log verbosity level for the opt-in file sink.
+///
+/// The default is [`Self::Off`]: no file is created and no tracing
+/// output is written. File logging is enabled only when the user
+/// explicitly passes `--log-level` or `--trace` — this prevents the
+/// rotating log file from accumulating hundreds of megabytes on
+/// every normal session (D-STAR voice at trace level is ~1 MB/s).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum LogLevel {
+    /// No file logging (default).
+    Off,
+    /// Only errors.
+    Error,
+    /// Warnings and errors.
+    Warn,
+    /// Informational messages and state transitions.
+    Info,
+    /// Debug events (connect flow, keepalives, stream boundaries).
+    Debug,
+    /// Trace events (every packet, every slow-data frame).
+    Trace,
+}
+
+impl LogLevel {
+    /// Render the level as the string accepted by `EnvFilter::new`,
+    /// or `None` for [`Self::Off`] (in which case no file sink is
+    /// attached at all).
+    const fn as_filter(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Error => Some("error"),
+            Self::Warn => Some("warn"),
+            Self::Info => Some("info"),
+            Self::Debug => Some("debug"),
+            Self::Trace => Some("trace"),
+        }
+    }
+}
 
 /// Accessible REPL for the Kenwood TH-D75 transceiver.
 ///
@@ -47,37 +115,247 @@ struct Cli {
     /// Baud rate for serial connection.
     #[arg(short, long, default_value_t = 115_200)]
     baud: u32,
+
+    /// Prepend timestamps to all output lines (e.g. `[14:32:07]`).
+    #[arg(short, long)]
+    timestamps: bool,
+
+    /// Enable file logging at the given level (default: no file).
+    ///
+    /// File location:
+    /// - macOS: `~/Library/Logs/thd75-repl/thd75-repl.log.<date>`
+    /// - Linux: `~/.local/state/thd75-repl/thd75-repl.log.<date>`
+    /// - Windows: `%LOCALAPPDATA%\thd75-repl\logs\thd75-repl.log.<date>`
+    ///
+    /// Files rotate daily. **File logging is opt-in** because trace-
+    /// level capture during D-STAR voice flow generates large files
+    /// fast (~1 MB/s of trace output per active reflector link).
+    /// Pass `--log-level=trace` or `--trace` when you want to capture
+    /// a bug report; leave it off for normal operation.
+    #[arg(long, value_enum, default_value_t = LogLevel::Off)]
+    log_level: LogLevel,
+
+    /// Shorthand for `--log-level=trace`. Creates the log file and
+    /// captures every packet, every frame, every state transition.
+    #[arg(long)]
+    trace: bool,
+
+    /// Command to run on startup (e.g. "dstar start KQ4NIT REF030C").
+    ///
+    /// If provided, the command is executed immediately after connecting.
+    /// The REPL continues normally after the command completes.
+    #[arg(trailing_var_arg = true)]
+    command: Vec<String>,
+}
+
+/// Determine the on-disk directory where daily log files should be
+/// written. Returns `None` if no suitable directory can be derived
+/// from the environment (extremely rare — only if `home_dir()` is
+/// unset on Unix or `data_local_dir()` is unset on Windows).
+///
+/// Locations follow platform convention:
+/// - macOS: `$HOME/Library/Logs/thd75-repl`
+/// - Linux: `$XDG_STATE_HOME/thd75-repl` (falls back to
+///   `$HOME/.local/state/thd75-repl`)
+/// - Windows: `%LOCALAPPDATA%\thd75-repl\logs`
+fn log_directory() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut path = dirs_next::home_dir()?;
+        path.push("Library");
+        path.push("Logs");
+        path.push("thd75-repl");
+        Some(path)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut path = dirs_next::data_local_dir()?;
+        path.push("thd75-repl");
+        path.push("logs");
+        Some(path)
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        // Linux / BSD: prefer $XDG_STATE_HOME, else $HOME/.local/state.
+        if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
+            let mut path = std::path::PathBuf::from(xdg);
+            path.push("thd75-repl");
+            return Some(path);
+        }
+        let mut path = dirs_next::home_dir()?;
+        path.push(".local");
+        path.push("state");
+        path.push("thd75-repl");
+        Some(path)
+    }
+}
+
+/// Guard returned by [`init_logging`] that must be kept alive for the
+/// whole process lifetime. Dropping it terminates the background
+/// flush thread for the non-blocking file sink, which would cause
+/// late log lines to be silently discarded — so `main` stores it in
+/// a local variable whose scope spans the entire runtime.
+struct LoggingGuard {
+    /// Keeps the non-blocking file sink's flush thread alive until
+    /// the program exits. The inner `WorkerGuard` is intentionally
+    /// unused apart from its `Drop` impl.
+    _file_worker: Option<tracing_appender::non_blocking::WorkerGuard>,
+}
+
+/// Configure the global tracing subscriber, returning a
+/// [`LoggingGuard`] that must be kept alive for the full process
+/// lifetime.
+///
+/// **Default behaviour: no logging at all.** Neither a file sink nor
+/// a stderr sink is attached. The interactive REPL terminal only
+/// shows `println!` / `tprintln!` output and no log file accumulates
+/// on disk. This keeps normal sessions cheap and quiet.
+///
+/// Opt-in logging is controlled by CLI flags:
+/// - `--log-level=X` creates a daily-rotating file at level X
+/// - `--trace` is shorthand for `--log-level=trace`
+///
+/// For power users who want live log output on stderr, `RUST_LOG` is
+/// still honoured. Setting e.g. `RUST_LOG=dstar_gateway=debug` routes
+/// matching events to stderr at the requested level. `RUST_LOG` does
+/// NOT enable the file sink on its own — file logging is file-flag
+/// controlled, stderr logging is env-var controlled, and the two are
+/// independent.
+fn init_logging(cli: &Cli) -> LoggingGuard {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::{EnvFilter, Registry};
+
+    // Resolve the effective file level. `--trace` overrides
+    // `--log-level` (shorthand for the most verbose setting).
+    let file_level = if cli.trace {
+        LogLevel::Trace
+    } else {
+        cli.log_level
+    };
+
+    // stderr layer is opt-in via `RUST_LOG` only. Default is silent.
+    let stderr_layer = std::env::var("RUST_LOG").ok().map(|spec| {
+        fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_filter(EnvFilter::new(spec))
+    });
+
+    // File layer is opt-in via `--log-level` / `--trace`. Default is
+    // no file created at all. When enabled, a daily-rotating file is
+    // written to the platform-appropriate log directory.
+    let mut file_layer_opt = None;
+    let mut worker_guard = None;
+    let mut announced_path = None;
+    if let Some(level_str) = file_level.as_filter() {
+        if let Some(dir) = log_directory() {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!(
+                    "Warning: could not create log directory {}: {e}. \
+                     File logging disabled.",
+                    dir.display()
+                );
+            } else {
+                let appender = tracing_appender::rolling::daily(&dir, "thd75-repl.log");
+                let (writer, guard) = tracing_appender::non_blocking(appender);
+                let layer = fmt::layer()
+                    .with_writer(writer)
+                    .with_ansi(false)
+                    .with_filter(EnvFilter::new(level_str));
+                file_layer_opt = Some(layer);
+                worker_guard = Some(guard);
+                announced_path = Some(dir);
+            }
+        } else {
+            eprintln!(
+                "Warning: could not determine a log directory for this \
+                 platform. File logging disabled."
+            );
+        }
+    }
+
+    Registry::default()
+        .with(stderr_layer)
+        .with(file_layer_opt)
+        .init();
+
+    if let Some(dir) = announced_path {
+        // Daily rotation suffixes the file name with the local date.
+        // Tell the user where to find it so they can share the path
+        // in bug reports.
+        println!(
+            "Logging at {} to {}/thd75-repl.log.<date> (rotates daily).",
+            file_level.as_filter().unwrap_or("off"),
+            dir.display()
+        );
+    }
+
+    LoggingGuard {
+        _file_worker: worker_guard,
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    if std::env::var("RUST_LOG").is_ok() {
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_writer(std::io::stderr)
-            .with_ansi(false)
-            .init();
+    if cli.timestamps {
+        TIMESTAMPS.store(true, Ordering::Relaxed);
     }
+
+    // Configure logging before anything else so the file captures
+    // the full startup sequence. The guard returned here must live
+    // until the program exits — dropping it would terminate the
+    // background flush thread and silently drop late log lines.
+    let _logging_guard = init_logging(&cli);
 
     println!(
         "Kenwood TH-D75 accessible radio control, version {}.",
         env!("CARGO_PKG_VERSION")
     );
 
-    // Create the tokio runtime first — SerialTransport::open requires
-    // a reactor (tokio-serial registers the fd with mio).
-    let rt = tokio::runtime::Runtime::new()?;
-
-    // Open transport on the main thread inside the runtime context.
-    // IOBluetooth needs the main CFRunLoop, but block_on runs on main
-    // so this is safe for both BT and serial paths.
-    let (path, transport) =
-        rt.block_on(async { transport::discover_and_open(cli.port.as_deref(), cli.baud) })?;
+    // Try to open transport BEFORE creating the tokio runtime.
+    //
+    // IOBluetooth RFCOMM uses CoreFoundation callbacks on the main thread.
+    // A tokio runtime's reactor can interfere with CFRunLoop dispatch,
+    // causing BT connections to fail. The TUI avoids this by opening
+    // transport before the runtime — we do the same.
+    //
+    // If BT isn't available (USB connected, or Linux/Windows), serial
+    // transport needs a tokio reactor (mio), so we create the runtime
+    // and retry via the serial path.
+    let (path, transport, rt) = if let Ok((path, transport)) =
+        transport::discover_and_open(cli.port.as_deref(), cli.baud)
+    {
+        let rt = tokio::runtime::Runtime::new()?;
+        (path, transport, rt)
+    } else {
+        // BT failed or unavailable — serial needs a tokio reactor.
+        let rt = tokio::runtime::Runtime::new()?;
+        let (path, transport) =
+            rt.block_on(async { transport::discover_and_open(cli.port.as_deref(), cli.baud) })?;
+        (path, transport, rt)
+    };
     println!("Connected via {path}.");
 
+    // Build initial command from trailing args, if any.
+    let initial_command = if cli.command.is_empty() {
+        None
+    } else {
+        Some(cli.command.join(" "))
+    };
+
     // Run the async REPL.
-    rt.block_on(run_repl(transport, cli.port.clone(), cli.baud))?;
+    rt.block_on(run_repl(
+        transport,
+        cli.port.clone(),
+        cli.baud,
+        initial_command,
+    ))?;
 
     Ok(())
 }
@@ -116,16 +394,76 @@ struct DStarSession {
     gateway: DStarGateway<EitherTransport>,
     /// Reflector-side UDP client (`DExtra` for now).
     reflector: Option<ReflectorClient>,
-    /// Station callsign.
-    callsign: String,
-    /// TX stream ID for radio-to-reflector relay (0 = not transmitting).
-    tx_stream_id: u16,
+    /// Station callsign (validated once at session construction).
+    callsign: Callsign,
+    /// TX stream ID for radio-to-reflector relay (`None` = not transmitting).
+    tx_stream_id: Option<StreamId>,
     /// TX sequence counter (0-20 cycle).
     tx_seq: u8,
-    /// Reflector module letter.
-    reflector_module: char,
-    /// Current RX stream ID from reflector (0 = no active stream).
-    rx_stream_id: u16,
+    /// Local module letter (what we present to the reflector as our
+    /// originating module). Cross-module linking uses this to differ
+    /// from `reflector_module`.
+    local_module: Module,
+    /// Reflector module letter we are linked to.
+    reflector_module: Module,
+    /// Current RX stream ID from reflector (`None` = no active stream).
+    rx_stream_id: Option<StreamId>,
+    /// Echo test state: records TX frames and plays them back.
+    echo: EchoState,
+    /// When true, the next TX is captured for echo regardless of URCALL.
+    echo_armed: bool,
+    /// Slow data decoder for incoming reflector voice frames.
+    /// Decodes text messages embedded in the slow data bytes.
+    rx_slow_data: SlowDataDecoder,
+    /// Last 20-byte slow-data text message printed for the current
+    /// stream, used to dedupe repeat emissions. D-STAR radios
+    /// continuously re-transmit the operator's text message across
+    /// the voice stream (so late joiners can see it), so the decoder
+    /// legitimately re-emits the same 20 bytes every ~320 ms for the
+    /// full duration of a burst. Print it the first time we see it
+    /// per stream, and again only if the operator actually changes
+    /// the text mid-transmission. Cleared on `VoiceStart` for a new
+    /// stream and on `VoiceEnd`.
+    rx_last_slow_text: Option<[u8; 20]>,
+    /// Outgoing slow data text message to embed in TX voice frames.
+    /// Set via the `text` command. Cleared after one transmission.
+    tx_text: Option<String>,
+    /// Pre-encoded slow data payloads for the current TX text.
+    tx_slow_data: Vec<[u8; 3]>,
+    /// Index into `tx_slow_data` for the next frame to send.
+    tx_slow_data_idx: usize,
+}
+
+/// Echo test state machine.
+///
+/// Records the user's TX audio and plays it back locally through the
+/// radio, verifying the full MMDVM voice path without involving a
+/// reflector. Triggered by the `echo` REPL command (arms the next TX)
+/// or by URCALL `"       E"` per ircDDBGateway convention.
+///
+/// Max 60 seconds of audio (3000 frames at 50 fps).
+#[derive(Debug)]
+enum EchoState {
+    /// Echo test not active.
+    Idle,
+    /// Recording TX audio. Stores the original header and AMBE frames.
+    Recording {
+        /// Original D-STAR header from the TX stream.
+        header: kenwood_thd75::DStarHeader,
+        /// Buffered AMBE voice frames.
+        frames: Vec<kenwood_thd75::DStarVoiceFrame>,
+    },
+    /// Waiting briefly before playback (per ircDDBGateway `REPLY_TIME`).
+    Waiting {
+        /// Original D-STAR header from the TX stream.
+        header: kenwood_thd75::DStarHeader,
+        /// Buffered AMBE voice frames.
+        frames: Vec<kenwood_thd75::DStarVoiceFrame>,
+        /// When the wait started.
+        since: std::time::Instant,
+    },
+    /// Playing back recorded audio to the radio.
+    Playing,
 }
 
 impl std::fmt::Debug for DStarSession {
@@ -148,6 +486,7 @@ async fn run_repl(
     transport: EitherTransport,
     cli_port: Option<String>,
     cli_baud: u32,
+    initial_command: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Try connect_safe (sends TNC exit preamble to recover from stuck modes).
     let mut radio = Radio::connect_safe(transport).await?;
@@ -164,7 +503,8 @@ async fn run_repl(
             // CAT failed. Check if radio is in MMDVM/gateway mode.
             if detect_mmdvm_mode(&mut radio).await {
                 println!("Radio is in D-STAR Reflector Terminal Mode.");
-                println!("Type dstar start <callsign> to begin, or quit to exit.");
+                println!("Type dstar start <callsign> [reflector] to begin, or quit to exit.");
+                println!("Example: dstar start W1AW REF030C");
                 ReplState::Cat(radio)
             } else {
                 return Err(
@@ -175,6 +515,7 @@ async fn run_repl(
     };
 
     let mut rl = rustyline::DefaultEditor::new()?;
+    let mut pending_command = initial_command;
 
     loop {
         let prompt = match &state {
@@ -183,7 +524,15 @@ async fn run_repl(
             ReplState::Dstar(_) => "dstar> ",
         };
 
-        let Some(line) = read_line_blocking(&mut rl, prompt) else {
+        // Use the initial CLI command if available, then interactive input.
+        #[allow(clippy::option_if_let_else)]
+        let line = if let Some(cmd) = pending_command.take() {
+            println!("{prompt}{cmd}");
+            Some(cmd)
+        } else {
+            read_line_blocking(&mut rl, prompt)
+        };
+        let Some(line) = line else {
             // EOF or Ctrl-C: disconnect cleanly.
             let radio = match state {
                 ReplState::Cat(r) => Some(r),
@@ -286,7 +635,14 @@ async fn run_repl(
                         ReplState::Cat(radio)
                     } else {
                         match enter_dstar(radio, &parts[2..], cli_port.as_deref(), cli_baud).await {
-                            Ok(session) => ReplState::Dstar(Box::new(session)),
+                            Ok(mut session) => {
+                                // If a reflector was connected, auto-enter monitor.
+                                if session.reflector.is_some() {
+                                    println!("Monitoring. Press Ctrl-C to return to prompt.");
+                                    run_dstar_monitor(&mut session).await;
+                                }
+                                ReplState::Dstar(Box::new(session))
+                            }
                             Err((Some(radio_back), e)) => {
                                 println!("Error entering D-STAR mode: {e}");
                                 ReplState::Cat(radio_back)
@@ -409,8 +765,9 @@ async fn dispatch_cat(radio: &mut Radio<EitherTransport>, cmd: &str, parts: &[&s
             if parts.get(1).is_some_and(|s| *s == "start") {
                 // Handled by caller after dispatch.
             } else {
-                println!("Usage: dstar start <callsign>");
-                println!("  Enters D-STAR gateway mode. Type dstar stop to exit.");
+                println!("Usage: dstar start <callsign> [reflector]");
+                println!("  Enters D-STAR gateway mode. Optionally connects to a reflector.");
+                println!("  Example: dstar start W1AW REF030C");
             }
         }
         other => println!("Unknown command: {other}. Type help for a list of commands."),
@@ -435,14 +792,14 @@ async fn enter_aprs(
     match AprsClient::start(radio, config).await {
         Ok(client) => {
             println!("APRS mode active. Type aprs stop to exit.");
-            println!("Commands: listen, msg, beacon, aprs stop");
+            println!("Commands: monitor, msg, position, beacon, stations, igate, aprs stop");
             Ok(client)
         }
         Err((radio, e)) => Err((radio, format!("{e}"))),
     }
 }
 
-/// Dispatch a command in APRS mode (listen, msg, beacon).
+/// Dispatch a command in APRS mode.
 async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, parts: &[&str]) {
     match cmd {
         "listen" | "poll" => match client.next_event().await {
@@ -450,6 +807,10 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
             Ok(None) => println!("No APRS activity."),
             Err(e) => println!("Error: {e}"),
         },
+        "monitor" => {
+            println!("Monitoring APRS. Press Ctrl-C to stop.");
+            run_aprs_monitor(client).await;
+        }
         "msg" | "message" => {
             if parts.len() < 3 {
                 println!("Usage: msg <callsign> <message text>");
@@ -466,10 +827,197 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
             Ok(()) => println!("Status beacon sent."),
             Err(e) => println!("Error sending beacon: {e}"),
         },
+        "position" | "pos" => {
+            if parts.len() < 3 {
+                println!("Usage: position <lat> <lon> [comment]");
+                println!("  Example: position 35.30 -82.46 Portable");
+                return;
+            }
+            let Ok(lat) = parts[1].parse::<f64>() else {
+                println!("Error: invalid latitude. Use decimal degrees (e.g. 35.30).");
+                return;
+            };
+            let Ok(lon) = parts[2].parse::<f64>() else {
+                println!("Error: invalid longitude. Use decimal degrees (e.g. -82.46).");
+                return;
+            };
+            let comment = if parts.len() > 3 {
+                parts[3..].join(" ")
+            } else {
+                String::new()
+            };
+            match client.beacon_position(lat, lon, &comment).await {
+                Ok(()) => println!(
+                    "Position beacon sent: {lat:.4}, {lon:.4}{}.",
+                    if comment.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({comment})")
+                    }
+                ),
+                Err(e) => println!("Error sending position: {e}"),
+            }
+        }
+        "stations" | "heard" => {
+            let stations = client.stations().recent();
+            if stations.is_empty() {
+                println!("No stations heard yet.");
+            } else {
+                for entry in stations.iter().take(20) {
+                    let pos = entry
+                        .position
+                        .as_ref()
+                        .map(|p| format!(" at {:.4}, {:.4}", p.latitude, p.longitude))
+                        .unwrap_or_default();
+                    println!(
+                        "Station {}{pos}, {} packets, heard {} ago.",
+                        entry.callsign,
+                        entry.packet_count,
+                        commands::fmt_elapsed(entry.last_heard.elapsed())
+                    );
+                }
+                println!("{} stations heard.", stations.len());
+            }
+        }
+        "igate" => {
+            if parts.len() < 2 {
+                println!("Usage: igate <filter>");
+                println!("  Connects to APRS-IS and bridges RF to internet.");
+                println!("  Example: igate r/35.30/-82.46/100");
+                println!("  (receive stations within 100km of the given lat/lon)");
+                println!("  Press Ctrl-C to disconnect.");
+                return;
+            }
+            let filter = parts[1..].join(" ");
+            run_igate(client, &filter).await;
+        }
         _ => println!(
             "APRS command not recognized: {cmd}. \
-             Commands: listen, msg, beacon, aprs stop"
+             Commands: monitor, msg, position, beacon, stations, igate, aprs stop"
         ),
+    }
+}
+
+/// Run the `IGate` bridge: APRS-IS ↔ RF.
+///
+/// Connects to the default APRS-IS server, forwards received RF packets
+/// to IS, and gates appropriate IS packets back to RF. Runs until the
+/// user presses Ctrl-C or the connection is lost.
+async fn run_igate(client: &mut AprsClient<EitherTransport>, filter: &str) {
+    use kenwood_thd75::{AprsIsClient, AprsIsConfig, AprsIsEvent};
+
+    let callsign = client.config().callsign.clone();
+    let ssid = client.config().ssid;
+    let login_call = if ssid > 0 {
+        format!("{callsign}-{ssid}")
+    } else {
+        callsign.clone()
+    };
+
+    println!("Connecting to APRS-IS as {login_call}.");
+    let mut is_config = AprsIsConfig::new(&login_call);
+    filter.clone_into(&mut is_config.filter);
+
+    let mut is_client = match AprsIsClient::connect(is_config).await {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Error: APRS-IS connect failed: {e}");
+            return;
+        }
+    };
+
+    println!("APRS-IS connected. Forwarding RF ↔ internet. Press Ctrl-C to stop.");
+
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
+    loop {
+        tokio::select! {
+            _ = &mut ctrl_c => {
+                println!("IGate stopping.");
+                let _ = is_client.shutdown().await;
+                break;
+            }
+            // Poll APRS-IS for incoming packets.
+            is_result = is_client.next_event() => {
+                match is_result {
+                    Ok(AprsIsEvent::Packet(line)) => {
+                        tprintln!("IS → {line}");
+                        // Gate to RF if appropriate. The helper checks
+                        // whether the packet should be forwarded per
+                        // IGate rules (station heard on RF recently, etc).
+                        if let Err(e) = client.gate_from_is(&line).await {
+                            println!("Error: gate to RF: {e}");
+                        }
+                    }
+                    Ok(AprsIsEvent::Comment(line)) => {
+                        tracing::debug!("APRS-IS comment: {line}");
+                    }
+                    Ok(AprsIsEvent::LoggedIn) => {
+                        println!("APRS-IS login verified.");
+                    }
+                    Ok(AprsIsEvent::Disconnected) => {
+                        println!("APRS-IS disconnected. Stopping IGate.");
+                        break;
+                    }
+                    Err(e) => {
+                        println!("Error: APRS-IS: {e}");
+                        break;
+                    }
+                }
+            }
+            // Poll RF for incoming packets.
+            rf_result = client.next_event() => {
+                match rf_result {
+                    Ok(Some(event)) => {
+                        print_aprs_event(&event);
+                        // Forward raw packets to APRS-IS.
+                        if let AprsEvent::RawPacket(ref pkt) = event {
+                            let is_line = client.format_for_is(pkt);
+                            if let Err(e) = is_client.send_raw_line(&is_line).await {
+                                println!("Error: gate to IS: {e}");
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        println!("Error: RF: {e}");
+                    }
+                }
+            }
+        }
+
+        // Send keepalive if interval elapsed.
+        if let Err(e) = is_client.maybe_send_keepalive().await {
+            println!("Error: APRS-IS keepalive: {e}");
+            break;
+        }
+    }
+}
+
+/// Continuous APRS monitoring loop. Polls for events and prints them.
+/// Exits on Ctrl-C.
+async fn run_aprs_monitor(client: &mut AprsClient<EitherTransport>) {
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
+    loop {
+        tokio::select! {
+            _ = &mut ctrl_c => {
+                println!("Monitor stopped. Type monitor to resume, or help for commands.");
+                break;
+            }
+            result = client.next_event() => {
+                match result {
+                    Ok(Some(event)) => print_aprs_event(&event),
+                    Ok(None) => {}
+                    Err(e) => {
+                        println!("Error: {e}");
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -477,34 +1025,38 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
 fn print_aprs_event(event: &AprsEvent) {
     match event {
         AprsEvent::StationHeard(entry) => {
-            println!("APRS station heard: {}", entry.callsign);
+            tprintln!("APRS station heard: {}", entry.callsign);
         }
         AprsEvent::MessageReceived(msg) => {
-            println!("APRS message received for {}: {}", msg.addressee, msg.text);
+            tprintln!("APRS message received for {}: {}", msg.addressee, msg.text);
         }
         AprsEvent::MessageDelivered(id) => {
-            println!("APRS message delivered, ID {id}.");
+            tprintln!("APRS message delivered, ID {id}.");
         }
         AprsEvent::MessageRejected(id) => {
-            println!("APRS message rejected by remote station, ID {id}.");
+            tprintln!("APRS message rejected by remote station, ID {id}.");
         }
         AprsEvent::MessageExpired(id) => {
-            println!("APRS message expired after all retries, ID {id}.");
+            tprintln!("APRS message expired after all retries, ID {id}.");
         }
         AprsEvent::PositionReceived { source, position } => {
-            println!(
+            tprintln!(
                 "APRS position from {source}: latitude {:.4}, longitude {:.4}.",
-                position.latitude, position.longitude
+                position.latitude,
+                position.longitude
             );
         }
         AprsEvent::WeatherReceived { source, .. } => {
-            println!("APRS weather report from {source}.");
+            tprintln!("APRS weather report from {source}.");
         }
         AprsEvent::PacketDigipeated { source } => {
-            println!("APRS packet relayed from {source}.");
+            tprintln!("APRS packet relayed from {source}.");
+        }
+        AprsEvent::QueryResponded { to } => {
+            tprintln!("APRS position query from {to} — responded with beacon.");
         }
         AprsEvent::RawPacket(pkt) => {
-            println!("APRS packet from {}.", pkt.source);
+            tprintln!("APRS packet from {}.", pkt.source);
         }
     }
 }
@@ -606,38 +1158,65 @@ async fn enter_dstar(
     };
     println!("MMDVM modem initialized.");
 
+    // Validate the callsign once. Everything downstream uses the typed form.
+    let callsign_typed = match Callsign::try_from_str(callsign) {
+        Ok(cs) => cs,
+        Err(e) => {
+            return Err((None, format!("Invalid station callsign {callsign}: {e}")));
+        }
+    };
+
     // Connect to reflector if specified.
-    let reflector = if let Some(ref_str) = reflector_arg {
-        match connect_reflector(callsign, ref_str).await {
-            Ok(client) => Some(client),
+    let (reflector, link_arg) = if let Some(ref_str) = reflector_arg {
+        match parse_link_arg(ref_str) {
+            Ok(arg) => match connect_reflector(callsign_typed, &arg).await {
+                Ok(client) => (Some(client), Some(arg)),
+                Err(e) => {
+                    println!("Error: could not connect to reflector: {e}");
+                    println!(
+                        "Gateway active without reflector. Use link command to connect later."
+                    );
+                    (None, None)
+                }
+            },
             Err(e) => {
-                println!("Error: could not connect to reflector: {e}");
-                println!("Gateway active without reflector. Use link command to connect later.");
-                None
+                println!("Error: {e}");
+                (None, None)
             }
         }
     } else {
         println!("No reflector specified. Use link command to connect.");
-        None
+        (None, None)
     };
 
     println!("D-STAR gateway active. Type dstar stop to exit.");
-    println!("Commands: listen, link, unlink, heard, status, dstar stop");
-    let module = reflector_arg
-        .and_then(parse_reflector_arg)
-        .map_or('C', |(_, m)| m);
+    println!("Commands: monitor, link, unlink, echo, text, heard, status, dstar stop");
+    let default_module = Module::try_from_char('C').expect("'C' is valid");
+    let (local_module, reflector_module) = link_arg
+        .as_ref()
+        .map_or((default_module, default_module), |arg| {
+            (arg.local_module, arg.reflector_module)
+        });
     Ok(DStarSession {
         gateway,
         reflector,
-        callsign: callsign.to_owned(),
-        tx_stream_id: 0,
+        callsign: callsign_typed,
+        tx_stream_id: None,
         tx_seq: 0,
-        reflector_module: module,
-        rx_stream_id: 0,
+        local_module,
+        reflector_module,
+        rx_stream_id: None,
+        echo: EchoState::Idle,
+        echo_armed: false,
+        rx_slow_data: SlowDataDecoder::new(),
+        rx_last_slow_text: None,
+        tx_text: None,
+        tx_slow_data: Vec::new(),
+        tx_slow_data_idx: 0,
     })
 }
 
-/// Parse a reflector string like "XRF030C" into (name, module).
+/// Parse a reflector string like `"XRF030C"` into (name, module).
 fn parse_reflector_arg(s: &str) -> Option<(String, char)> {
     if s.len() < 4 {
         return None;
@@ -648,6 +1227,47 @@ fn parse_reflector_arg(s: &str) -> Option<(String, char)> {
     }
     let name = &s[..s.len() - 1];
     Some((name.to_uppercase(), module))
+}
+
+/// Parsed form of the `link` command argument.
+///
+/// Supports two forms:
+/// - `XRF030C` — link to `XRF030` module `C`, with our local module
+///   matching the reflector module (`C`).
+/// - `B:XRF030C` — link to `XRF030` module `C`, but present our local
+///   module as `B` for cross-module routing.
+struct LinkArg {
+    reflector_name: String,
+    reflector_module: Module,
+    local_module: Module,
+}
+
+fn parse_link_arg(s: &str) -> Result<LinkArg, String> {
+    let (local_prefix, refl_str) = if let Some((left, right)) = s.split_once(':') {
+        (Some(left), right)
+    } else {
+        (None, s)
+    };
+    let (reflector_name, refl_mod_char) = parse_reflector_arg(refl_str)
+        .ok_or_else(|| format!("Invalid reflector format: {refl_str}. Expected e.g. XRF030C"))?;
+    let reflector_module = Module::try_from_char(refl_mod_char)
+        .map_err(|e| format!("Invalid reflector module letter: {e}"))?;
+    let local_module = if let Some(prefix) = local_prefix {
+        if prefix.len() != 1 {
+            return Err(format!(
+                "Local module prefix must be a single letter, got {prefix:?}"
+            ));
+        }
+        let c = prefix.chars().next().unwrap_or_default();
+        Module::try_from_char(c).map_err(|e| format!("Invalid local module letter: {e}"))?
+    } else {
+        reflector_module
+    };
+    Ok(LinkArg {
+        reflector_name,
+        reflector_module,
+        local_module,
+    })
 }
 
 /// Pi-Star host file URLs.
@@ -749,23 +1369,25 @@ fn load_host_files() -> dstar_gateway::HostFile {
     hosts
 }
 
-/// Connect to a reflector by name+module string (e.g. "XRF030C").
-async fn connect_reflector(callsign: &str, ref_str: &str) -> Result<ReflectorClient, String> {
-    let (ref_name, module) = parse_reflector_arg(ref_str)
-        .ok_or_else(|| format!("Invalid reflector format: {ref_str}. Expected e.g. XRF030C"))?;
+/// Connect to a reflector using a parsed [`LinkArg`].
+///
+/// The caller validates the reflector string into `LinkArg` first so
+/// this function takes already-typed parameters and can focus on
+/// protocol selection, host lookup, and state-machine driving.
+async fn connect_reflector(callsign: Callsign, link: &LinkArg) -> Result<ReflectorClient, String> {
+    let ref_name = &link.reflector_name;
 
-    let prefix = ref_name.get(..3).unwrap_or("");
-    if prefix != "XRF" && prefix != "XLX" && prefix != "REF" {
-        return Err(format!(
+    let protocol = Protocol::from_reflector_prefix(ref_name).ok_or_else(|| {
+        format!(
             "Unsupported reflector prefix: {ref_name}. \
-             Supported: REF (DPlus), XRF/XLX (DExtra)."
-        ));
-    }
+             Supported: REF (DPlus), XRF/XLX (DExtra), DCS."
+        )
+    })?;
 
     // Ensure host files exist, downloading if needed.
     ensure_host_files().await;
     let hosts = load_host_files();
-    let entry = hosts.lookup(&ref_name).ok_or_else(|| {
+    let entry = hosts.lookup(ref_name).ok_or_else(|| {
         format!(
             "Reflector {ref_name} not found in host files. \
              Download host files to ~/.config/thd75-repl/ from pistar.uk/downloads/"
@@ -778,13 +1400,27 @@ async fn connect_reflector(callsign: &str, ref_str: &str) -> Result<ReflectorCli
         .next()
         .ok_or_else(|| format!("No address found for {}", entry.address))?;
 
-    println!("Connecting to {ref_name} module {module} at {addr}.");
-    let mut client = ReflectorClient::new(callsign, module, addr, prefix)
+    let reflector_callsign = Callsign::try_from_str(ref_name)
+        .map_err(|e| format!("Invalid reflector callsign {ref_name}: {e}"))?;
+
+    println!(
+        "Connecting to {ref_name} module {} (local {}) at {addr}.",
+        link.reflector_module, link.local_module
+    );
+    let params = ReflectorClientParams {
+        callsign,
+        local_module: link.local_module,
+        reflector_callsign,
+        reflector_module: link.reflector_module,
+        remote: addr,
+        protocol,
+    };
+    let mut client = ReflectorClient::new(params)
         .await
         .map_err(|e| format!("UDP socket error: {e}"))?;
 
     // DPlus (REF) requires TCP auth before UDP connect.
-    if prefix == "REF" {
+    if protocol == Protocol::DPlus {
         println!("Authenticating with D-STAR gateway server.");
         match client.authenticate().await {
             Ok(()) => println!("Authentication successful."),
@@ -797,37 +1433,24 @@ async fn connect_reflector(callsign: &str, ref_str: &str) -> Result<ReflectorCli
         }
     }
 
-    client
-        .connect()
-        .await
-        .map_err(|e| format!("Connect send failed: {e}"))?;
-
-    // Wait for connect ACK.
+    // Drive the connect state machine (5 second timeout).
     println!("Waiting for reflector acknowledgement.");
-    for _ in 0..50 {
-        // 50 * 100ms = 5 seconds max wait
-        match client.poll().await {
-            Ok(Some(ReflectorEvent::Connected)) => {
-                println!("Connected to {ref_name} module {module}.");
-                return Ok(client);
-            }
-            Ok(Some(ReflectorEvent::VoiceStart { .. })) => {
-                // REF reflectors start sending voice immediately after
-                // link — receiving any DSVT packet confirms the link.
-                println!("Connected to {ref_name} module {module}.");
-                return Ok(client);
-            }
-            Ok(Some(ReflectorEvent::Rejected)) => {
-                return Err(format!("Reflector {ref_name} rejected the connection."));
-            }
-            Ok(_) => {} // keep waiting
-            Err(e) => return Err(format!("UDP error: {e}")),
+    match client
+        .connect_and_wait(std::time::Duration::from_secs(5))
+        .await
+    {
+        Ok(()) => {
+            println!("Connected to {ref_name} module {}.", link.reflector_module);
+            Ok(client)
         }
+        Err(dstar_gateway::Error::Rejected) => {
+            Err(format!("Reflector {ref_name} rejected the connection."))
+        }
+        Err(dstar_gateway::Error::ConnectTimeout(_)) => Err(format!(
+            "Timeout waiting for {ref_name} to acknowledge connection."
+        )),
+        Err(e) => Err(format!("Connect failed: {e}")),
     }
-
-    Err(format!(
-        "Timeout waiting for {ref_name} to acknowledge connection."
-    ))
 }
 
 /// Exit D-STAR gateway mode and restore CAT mode.
@@ -839,18 +1462,31 @@ async fn exit_dstar(
     cli_port: Option<&str>,
     cli_baud: u32,
 ) -> Result<Radio<EitherTransport>, String> {
-    // Stop the gateway (exits MMDVM session).
+    // Stop the gateway — this sends TN 0,0 which won't actually exit
+    // Reflector Terminal Mode (that's a firmware setting, not a TNC
+    // mode). But it cleanly ends our MMDVM session.
     println!("Stopping D-STAR gateway.");
     let radio = gw
         .stop()
         .await
         .map_err(|e| format!("Gateway stop failed: {e}"))?;
-    drop(radio);
 
-    // Reconnect — radio is still in MMDVM mode (setting persists).
-    // We need CAT mode to do MCP write, but we're in MMDVM.
-    // Disconnect and reconnect with connect_safe which sends TNC exit preamble.
-    println!("Reconnecting to restore normal radio mode.");
+    // Disconnect BT to release the RFCOMM channel.
+    let _ = radio.disconnect().await;
+
+    // The radio is still in Reflector Terminal Mode. We cannot
+    // MCP-write it back to Off because MCP requires CAT mode, but
+    // the radio speaks MMDVM binary in TERM mode. This is the same
+    // limitation d75link has — the user must change Menu 650 manually.
+    println!("D-STAR gateway stopped.");
+    println!("Please set Menu 650 (DV Gateway) to Off on the radio.");
+    println!("Press Enter when done.");
+
+    let mut input = String::new();
+    let _ = std::io::stdin().read_line(&mut input);
+
+    // Reconnect — should be in CAT mode now if user changed Menu 650.
+    println!("Reconnecting.");
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     let (_path, transport) = transport::discover_and_open(cli_port, cli_baud)
@@ -860,38 +1496,15 @@ async fn exit_dstar(
         .await
         .map_err(|e| format!("Connect failed: {e}"))?;
 
-    // Try MCP write to disable gateway mode.
-    println!("Disabling Reflector Terminal Mode via memory write.");
-    if let Err(e) = radio
-        .modify_memory_page(GATEWAY_MODE_PAGE, |data| {
-            data[GATEWAY_MODE_BYTE] = 0; // Off
-        })
-        .await
-    {
-        // If MCP write fails, we're still in MMDVM mode.
-        println!("Error: could not disable gateway mode: {e}");
-        println!("Please set Menu 650 to Off on the radio manually.");
-        // Reconnect one more time after manual change.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let (_path, transport) = transport::discover_and_open(cli_port, cli_baud)
-            .map_err(|e| format!("Reconnect failed: {e}"))?;
-        let radio = Radio::connect_safe(transport)
-            .await
-            .map_err(|e| format!("Connect failed: {e}"))?;
-        return Ok(radio);
+    // Verify we're back in CAT mode.
+    if radio.identify().await.is_ok() {
+        println!("Radio restored to normal mode.");
+        Ok(radio)
+    } else {
+        println!("Error: radio is still in Reflector Terminal Mode.");
+        println!("Please set Menu 650 to Off and restart the REPL.");
+        Err("Radio still in MMDVM mode".into())
     }
-
-    // MCP write succeeded — connection dropped. Reconnect in CAT mode.
-    println!("Reconnecting in normal radio mode.");
-    drop(radio);
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-    let (_path, transport) = transport::discover_and_open(cli_port, cli_baud)
-        .map_err(|e| format!("Reconnect failed: {e}"))?;
-
-    Radio::connect_safe(transport)
-        .await
-        .map_err(|e| format!("Connect failed: {e}"))
 }
 
 /// Dispatch a command in D-STAR mode.
@@ -911,7 +1524,7 @@ async fn run_dstar_monitor(session: &mut DStarSession) {
     loop {
         tokio::select! {
             _ = &mut ctrl_c => {
-                println!("Monitor stopped.");
+                println!("Monitor stopped. Type monitor to resume, or help for commands.");
                 // Restore default timeout.
                 session.gateway.set_event_timeout(std::time::Duration::from_millis(500));
                 break;
@@ -921,39 +1534,66 @@ async fn run_dstar_monitor(session: &mut DStarSession) {
     }
 }
 
+/// Maximum number of reflector events processed inline per poll cycle.
+///
+/// Caps the inline processing loop at roughly one D-STAR superframe
+/// (21 voice frames plus a handful of control events = 24) so the
+/// outer `select!` in [`run_dstar_monitor`] can yield to `ctrl_c`,
+/// radio polling, and the rest of the cycle even while voice is
+/// flowing continuously at the 20 ms D-STAR frame cadence.
+///
+/// Without this cap the inline loop never breaks during an active
+/// voice burst: `DPlus`'s internal `recv_from` has a 100 ms timeout
+/// and reflectors send voice frames every 20 ms, so `poll()` always
+/// returns `Ok(Some(_))` well before the recv timeout fires.
+const MAX_EVENTS_PER_CYCLE: usize = 24;
+
 /// One cycle of the D-STAR poll loop: poll reflector (keepalive + rx),
 /// poll radio (mmdvm events), relay between them.
+///
+/// **Inline processing:** each reflector event is relayed to the
+/// radio immediately after it is pulled from the socket, instead of
+/// the previous drain-into-Vec-then-process-Vec pattern. The old
+/// two-phase version blocked the relay for the duration of the drain
+/// phase — typically 30-80 ms waiting for `poll()` to return `None`
+/// at the end of a superframe — during which the 20 already-drained
+/// voice frames sat in the Vec instead of going to the radio. The
+/// MMDVM modem's small voice buffer underran during those gaps,
+/// dropping the receive popup. Observed live on REF030 C with 85 ms
+/// gaps between BT write bursts mid-stream; confirmed in the trace
+/// log at `kenwood_thd75::transport::bluetooth::inner: BT write`
+/// timestamps. With inline processing, each frame is handed off to
+/// the paced `send_voice` immediately, so the modem sees a steady
+/// 20 ms cadence with no >20 ms gaps inside a stream.
 async fn dstar_poll_cycle(session: &mut DStarSession) {
-    // Poll reflector — collect events then relay (avoids borrow conflict).
-    let mut reflector_events = Vec::new();
-    if let Some(ref mut client) = session.reflector {
-        loop {
-            match client.poll().await {
-                Ok(Some(event)) => reflector_events.push(event),
-                Ok(None) => break,
-                Err(e) => {
-                    println!("Error: reflector UDP: {e}");
-                    break;
-                }
+    for _ in 0..MAX_EVENTS_PER_CYCLE {
+        // Scope the reflector borrow tightly so relay_reflector_to_radio
+        // (which needs &mut session) can re-borrow after poll returns.
+        let poll_result = if let Some(client) = session.reflector.as_mut() {
+            client.poll().await
+        } else {
+            break;
+        };
+        let event = match poll_result {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(e) => {
+                println!("Error: reflector UDP: {e}");
+                break;
             }
-        }
-    }
-    for event in &reflector_events {
-        // Only print VoiceStart for new streams (avoid duplicate announcements).
-        if let ReflectorEvent::VoiceStart { stream_id, .. } = event {
-            if *stream_id != session.rx_stream_id {
-                print_reflector_event(event);
+        };
+        trace_reflector_event(&event);
+        // Only print VoiceStart for new streams (avoid duplicate
+        // announcements on superframe-boundary header refreshes
+        // that the parser's stream tracker did not suppress).
+        if let ReflectorEvent::VoiceStart { stream_id, .. } = &event {
+            if session.rx_stream_id != Some(*stream_id) {
+                print_reflector_event(&event);
             }
         } else {
-            print_reflector_event(event);
+            print_reflector_event(&event);
         }
-        relay_reflector_to_radio(session, event).await;
-        // Pace frames to radio at ~20ms like d75link's processTimers.
-        // Without pacing, the entire UDP burst dumps into the MMDVM
-        // buffer at wire speed, overflowing the 127-slot buffer.
-        if matches!(event, ReflectorEvent::VoiceData { .. }) {
-            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-        }
+        relay_reflector_to_radio(session, &event).await;
     }
 
     // Poll radio — drain MMDVM responses (ACK/NAK/status + PTT voice).
@@ -962,6 +1602,9 @@ async fn dstar_poll_cycle(session: &mut DStarSession) {
         print_dstar_event(&event);
         relay_radio_to_reflector(session, &event).await;
     }
+
+    // Drive echo playback state machine.
+    echo_playback_tick(session).await;
 }
 
 /// `listen` polls both the radio MMDVM and reflector UDP, relaying
@@ -977,14 +1620,26 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
             if parts.len() < 2 {
                 println!("Usage: link <reflector>");
                 println!("Example: link XRF030C");
+                println!(
+                    "Example: link B:XRF030C (present local module B when \
+                     cross-linking to reflector module C)"
+                );
                 return;
             }
-            match connect_reflector(&session.callsign, parts[1]).await {
+            let link = match parse_link_arg(parts[1]) {
+                Ok(l) => l,
+                Err(e) => {
+                    println!("Error: {e}");
+                    return;
+                }
+            };
+            match connect_reflector(session.callsign, &link).await {
                 Ok(client) => {
-                    if let Some((_, m)) = parse_reflector_arg(parts[1]) {
-                        session.reflector_module = m;
-                    }
+                    session.local_module = link.local_module;
+                    session.reflector_module = link.reflector_module;
                     session.reflector = Some(client);
+                    println!("Monitoring. Press Ctrl-C to return to prompt.");
+                    run_dstar_monitor(session).await;
                 }
                 Err(e) => println!("Error: {e}"),
             }
@@ -1041,88 +1696,360 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
                 println!("Reflector: not connected.");
             }
         }
+        "echo" => {
+            session.echo_armed = true;
+            println!(
+                "Echo test: transmit now. Your audio will be recorded \
+                 and played back."
+            );
+            run_echo_monitor(session).await;
+        }
+        "text" | "msg" | "message" => {
+            if parts.len() < 2 {
+                if let Some(ref text) = session.tx_text {
+                    println!("Current outgoing text: {text}");
+                    println!("This text will be sent with your next transmission.");
+                } else {
+                    println!("No outgoing text set.");
+                }
+                println!("Usage: text <message up to 20 chars>");
+                println!("  Sets text to embed in your next voice transmission.");
+                println!("  text clear: Remove the outgoing text.");
+                return;
+            }
+            if parts[1] == "clear" || parts[1] == "off" || parts[1] == "none" {
+                session.tx_text = None;
+                session.tx_slow_data.clear();
+                session.tx_slow_data_idx = 0;
+                println!("Outgoing text cleared.");
+            } else {
+                let text = parts[1..].join(" ");
+                let truncated = if text.len() > 20 {
+                    println!("Text truncated to 20 characters.");
+                    text[..20].to_owned()
+                } else {
+                    text
+                };
+                session.tx_slow_data =
+                    DStarGateway::<EitherTransport>::encode_text_message(&truncated);
+                session.tx_slow_data_idx = 0;
+                println!(
+                    "Outgoing text set: \"{truncated}\". \
+                     Will be embedded in your next transmission."
+                );
+                session.tx_text = Some(truncated);
+            }
+        }
         _ => println!(
             "D-STAR command not recognized: {cmd}. \
-             Commands: listen, link, unlink, heard, status, dstar stop"
+             Commands: monitor, link, unlink, echo, text, heard, status, dstar stop"
         ),
     }
 }
 
-/// Relay a radio MMDVM event to the reflector.
+/// Maximum echo recording length (60 seconds at 50 frames/sec).
+const ECHO_MAX_FRAMES: usize = 60 * 50;
+
+/// Transition echo from Recording to Waiting (ready for playback).
+fn finish_echo_recording(session: &mut DStarSession) {
+    let echo = std::mem::replace(&mut session.echo, EchoState::Idle);
+    if let EchoState::Recording { header, frames } = echo {
+        #[allow(clippy::cast_precision_loss)]
+        let secs = frames.len() as f64 / 50.0;
+        println!("Echo test: recorded {secs:.1} seconds of audio. Playing back.");
+        session.echo = EchoState::Waiting {
+            header,
+            frames,
+            since: std::time::Instant::now(),
+        };
+    }
+}
+
+/// Delay before echo playback starts (milliseconds).
+///
+/// Per ircDDBGateway `REPLY_TIME`, a short pause so the user hears
+/// a clear break between their TX and the playback.
+const ECHO_REPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Build the outbound reflector [`DStarHeader`](dstar_gateway::DStarHeader)
+/// from the kenwood-thd75 header emitted by the radio.
+fn build_reflector_header(
+    station_callsign: Callsign,
+    reflector_module: Module,
+    header: &kenwood_thd75::DStarHeader,
+) -> dstar_gateway::DStarHeader {
+    // RPT2 is the gateway (reflector+local module), RPT1 is the
+    // gateway module 'G'. We build the 8-byte form by taking the
+    // first 7 bytes of our callsign and appending the module letter.
+    let mut rpt2_buf = [b' '; 8];
+    let cs_bytes = station_callsign.as_bytes();
+    rpt2_buf[..7].copy_from_slice(&cs_bytes[..7]);
+    rpt2_buf[7] = reflector_module.as_byte();
+    // Infallible: the bytes came from a valid Callsign + a validated
+    // Module letter, so every byte is ASCII. Using from_wire_bytes
+    // (which stores verbatim without checks) is correct here because
+    // we've already constructed a well-formed 8-byte field.
+    let rpt2 = Callsign::from_wire_bytes(rpt2_buf);
+
+    let mut rpt1_buf = rpt2_buf;
+    rpt1_buf[7] = b'G';
+    let rpt1 = Callsign::from_wire_bytes(rpt1_buf);
+
+    // Convert the kenwood-thd75 header's string fields into typed
+    // wire-format callsigns. If the radio emits an unexpectedly
+    // malformed field, fall back to a safe default rather than
+    // dropping the relay altogether.
+    let my_call = Callsign::try_from_str(header.my_call.trim()).unwrap_or(station_callsign);
+    let my_suffix = Suffix::try_from_str(header.my_suffix.trim()).unwrap_or(Suffix::EMPTY);
+    let ur_call = Callsign::try_from_str("CQCQCQ").expect("static constant");
+
+    dstar_gateway::DStarHeader {
+        flag1: header.flag1,
+        flag2: header.flag2,
+        flag3: header.flag3,
+        rpt2,
+        rpt1,
+        ur_call,
+        my_call,
+        my_suffix,
+    }
+}
+
+/// Relay a radio MMDVM event to the reflector, or record for echo test.
+///
+/// If the URCALL field is `"       E"` (7 spaces + E), the
+/// transmission is captured for local echo playback instead of
+/// being relayed to any reflector. This matches the `ircDDBGateway`
+/// echo test convention.
 async fn relay_radio_to_reflector(session: &mut DStarSession, event: &DStarEvent) {
-    let Some(ref client) = session.reflector else {
+    // Echo test interception: either the `echo` command armed it, or
+    // URCALL is "       E" (per ircDDBGateway convention).
+    if let DStarEvent::VoiceStart(header) = event
+        && (session.echo_armed || header.ur_call.trim() == "E")
+    {
+        session.echo_armed = false;
+        println!(
+            "Echo test: recording from {}. Transmit up to 60 seconds.",
+            header.my_call.trim()
+        );
+        session.echo = EchoState::Recording {
+            header: header.clone(),
+            frames: Vec::with_capacity(256),
+        };
+        return;
+    }
+
+    // If we're currently recording for echo, buffer frames.
+    if matches!(session.echo, EchoState::Recording { .. }) {
+        match event {
+            DStarEvent::VoiceData(frame) => {
+                if let EchoState::Recording { frames, .. } = &mut session.echo
+                    && frames.len() < ECHO_MAX_FRAMES
+                {
+                    frames.push(frame.clone());
+                }
+                return;
+            }
+            DStarEvent::VoiceEnd | DStarEvent::VoiceLost => {
+                finish_echo_recording(session);
+                return;
+            }
+            DStarEvent::VoiceStart(_) => {
+                // New stream started before VoiceEnd — the previous
+                // stream's end was lost. Finish what we have.
+                finish_echo_recording(session);
+                // Don't return — let this VoiceStart fall through to
+                // normal processing below.
+            }
+            _ => {}
+        }
+    }
+
+    // Normal relay to reflector. Capture copies of the typed
+    // station_callsign/reflector_module up front so the session can
+    // still be borrowed mutably further down for tx_stream_id /
+    // tx_seq updates without aliasing against `session.reflector`.
+    let station_callsign = session.callsign;
+    let reflector_module = session.reflector_module;
+    let Some(ref mut client) = session.reflector else {
         return;
     };
 
     match event {
         DStarEvent::VoiceStart(header) => {
             // Generate a new stream ID for this transmission.
-            session.tx_stream_id = rand_stream_id();
+            let sid = rand_stream_id();
+            session.tx_stream_id = Some(sid);
             session.tx_seq = 0;
+            session.tx_slow_data_idx = 0;
 
-            // Build the reflector header with proper routing.
-            let cs = dstar_gateway::DStarHeader::pad_callsign(&session.callsign);
-            let mut rpt2 = [b' '; 8];
-            rpt2[..cs.len().min(7)].copy_from_slice(&cs[..cs.len().min(7)]);
-            rpt2[7] = session.reflector_module as u8;
-            let mut rpt1 = rpt2;
-            rpt1[7] = b'G';
-
-            let ref_header = dstar_gateway::DStarHeader {
-                flag1: header.flag1,
-                flag2: header.flag2,
-                flag3: header.flag3,
-                rpt2,
-                rpt1,
-                ur_call: *b"CQCQCQ  ",
-                my_call: dstar_gateway::DStarHeader::pad_callsign(header.my_call.trim()),
-                my_suffix: dstar_gateway::DStarHeader::pad_suffix(header.my_suffix.trim()),
-            };
-
-            if let Err(e) = client.send_header(&ref_header, session.tx_stream_id).await {
+            let ref_header = build_reflector_header(station_callsign, reflector_module, header);
+            if let Err(e) = client.send_header(&ref_header, sid).await {
                 println!("Error: relay header to reflector: {e}");
             }
         }
         DStarEvent::VoiceData(frame) => {
-            if session.tx_stream_id == 0 {
+            let Some(sid) = session.tx_stream_id else {
                 return;
-            }
+            };
+            // If outgoing text is set, replace the slow data with
+            // encoded text message bytes (cycling through the encoded
+            // payloads). Frame 0 of each superframe carries sync and
+            // is skipped (seq handled by tx_seq counter).
+            let slow_data = if session.tx_slow_data.is_empty() {
+                frame.slow_data
+            } else {
+                let sd =
+                    session.tx_slow_data[session.tx_slow_data_idx % session.tx_slow_data.len()];
+                session.tx_slow_data_idx += 1;
+                sd
+            };
             let ref_frame = dstar_gateway::VoiceFrame {
                 ambe: frame.ambe,
-                slow_data: frame.slow_data,
+                slow_data,
             };
-            if let Err(e) = client
-                .send_voice(session.tx_stream_id, session.tx_seq, &ref_frame)
-                .await
-            {
+            if let Err(e) = client.send_voice(sid, session.tx_seq, &ref_frame).await {
                 println!("Error: relay voice to reflector: {e}");
             }
             session.tx_seq = (session.tx_seq + 1) % 21;
         }
         DStarEvent::VoiceEnd => {
-            if session.tx_stream_id == 0 {
+            let Some(sid) = session.tx_stream_id else {
                 return;
-            }
-            if let Err(e) = client.send_eot(session.tx_stream_id, session.tx_seq).await {
+            };
+            if let Err(e) = client.send_eot(sid, session.tx_seq).await {
                 println!("Error: relay EOT to reflector: {e}");
             }
-            session.tx_stream_id = 0;
+            session.tx_stream_id = None;
             session.tx_seq = 0;
         }
         _ => {}
     }
 }
 
-/// Generate a random 16-bit stream ID.
-fn rand_stream_id() -> u16 {
+/// Drive the echo playback state machine.
+///
+/// Called from the poll cycle. When in `Waiting` state and the delay
+/// has elapsed, plays back all buffered frames to the radio with
+/// proper 20ms pacing per AMBE frame.
+async fn echo_playback_tick(session: &mut DStarSession) {
+    // Check if we're in Waiting and the delay has elapsed.
+    let should_play = matches!(
+        &session.echo,
+        EchoState::Waiting { since, .. } if since.elapsed() >= ECHO_REPLY_DELAY
+    );
+
+    if !should_play {
+        return;
+    }
+
+    // Move to Playing state and extract the buffered data.
+    let echo = std::mem::replace(&mut session.echo, EchoState::Playing);
+    let EchoState::Waiting { header, frames, .. } = echo else {
+        return;
+    };
+
+    // Build the echo playback header per ircDDBGateway EchoUnit.cpp:
+    // MY = gateway callsign, MY suffix = "ECHO", YOUR = "CQCQCQ  ".
+    let echo_header = kenwood_thd75::DStarHeader {
+        flag1: header.flag1,
+        flag2: header.flag2,
+        flag3: header.flag3,
+        rpt2: header.rpt2.clone(),
+        rpt1: header.rpt1.clone(),
+        ur_call: "CQCQCQ  ".to_owned(),
+        my_call: format!("{:<8}", session.callsign.as_str()),
+        my_suffix: "ECHO".to_owned(),
+    };
+
+    // Send header to radio.
+    if let Err(e) = session.gateway.send_header(&echo_header).await {
+        println!("Echo playback error: header: {e}");
+        session.echo = EchoState::Idle;
+        return;
+    }
+
+    // Play back each frame with 20ms pacing.
+    for frame in &frames {
+        if let Err(e) = session.gateway.send_voice_unpaced(frame).await {
+            println!("Echo playback error: voice: {e}");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
+
+    // Send EOT.
+    if let Err(e) = session.gateway.send_eot().await {
+        println!("Echo playback error: EOT: {e}");
+    }
+
+    // Drain any stale MMDVM events so they don't leak into the next
+    // echo cycle or reflector relay.
+    for _ in 0..20 {
+        if session.gateway.next_event().await.ok().flatten().is_none() {
+            break;
+        }
+    }
+
+    println!("Echo test: playback complete.");
+    session.echo = EchoState::Idle;
+}
+
+/// Run the poll loop for an echo test cycle.
+///
+/// Polls the radio MMDVM for the user's TX, records it, plays it
+/// back, then returns automatically. Also handles Ctrl-C to cancel.
+async fn run_echo_monitor(session: &mut DStarSession) {
+    session
+        .gateway
+        .set_event_timeout(std::time::Duration::from_millis(10));
+
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
+    // Track whether we've started recording (so we don't exit
+    // immediately before the user has transmitted).
+    let mut started = false;
+
+    loop {
+        tokio::select! {
+            _ = &mut ctrl_c => {
+                println!("Echo test cancelled.");
+                session.echo_armed = false;
+                session.echo = EchoState::Idle;
+                break;
+            }
+            () = dstar_poll_cycle(session) => {}
+        }
+
+        if !started && !matches!(session.echo, EchoState::Idle) {
+            started = true;
+        }
+
+        // Exit once playback is complete (Idle after having recorded).
+        if started && matches!(session.echo, EchoState::Idle) {
+            break;
+        }
+    }
+
+    session
+        .gateway
+        .set_event_timeout(std::time::Duration::from_millis(500));
+}
+
+/// Generate a random non-zero stream ID.
+///
+/// Uses system time entropy (not cryptographic — just needs to be
+/// per-stream unique). The low bit is forced to 1 so the result is
+/// always non-zero, making the `StreamId::new` unwrap trivial.
+fn rand_stream_id() -> StreamId {
     use std::time::SystemTime;
     let t = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
-    // Mix time nanos into a u16. Not cryptographic, just needs to be unique per stream.
     #[allow(clippy::cast_possible_truncation)]
-    let id = (t.subsec_nanos() ^ (t.as_secs() as u32)) as u16;
-    if id == 0 { 1 } else { id }
+    let id = ((t.subsec_nanos() ^ (t.as_secs() as u32)) as u16) | 0x0001;
+    StreamId::new(id).expect("low bit forced to 1 guarantees non-zero")
 }
 
 /// Relay a reflector event to the radio MMDVM modem.
@@ -1131,39 +2058,111 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &ReflectorE
     match event {
         ReflectorEvent::VoiceStart { header, stream_id } => {
             // Deduplicate: only send header once per stream.
-            if *stream_id == session.rx_stream_id {
+            if session.rx_stream_id == Some(*stream_id) {
                 return;
             }
-            session.rx_stream_id = *stream_id;
+            session.rx_stream_id = Some(*stream_id);
+            // Reset slow data decoder for the new stream so a partial
+            // message from a previous transmission is not silently
+            // reassembled onto this one. Also clear the last-printed
+            // text tracker so the new stream's first complete text
+            // always prints, even if it happens to match the previous
+            // operator's message verbatim.
+            session.rx_slow_data.reset();
+            session.rx_last_slow_text = None;
             // Convert dstar-gateway header to kenwood-thd75 header.
+            // Both sides are already ASCII-validated so
+            // `String::from_utf8_lossy` is a cheap direct conversion.
             let radio_header = kenwood_thd75::DStarHeader {
                 flag1: header.flag1,
                 flag2: header.flag2,
                 flag3: header.flag3,
-                rpt2: String::from_utf8_lossy(&header.rpt2).to_string(),
-                rpt1: String::from_utf8_lossy(&header.rpt1).to_string(),
-                ur_call: String::from_utf8_lossy(&header.ur_call).to_string(),
-                my_call: String::from_utf8_lossy(&header.my_call).to_string(),
-                my_suffix: String::from_utf8_lossy(&header.my_suffix).to_string(),
+                rpt2: String::from_utf8_lossy(header.rpt2.as_bytes()).into_owned(),
+                rpt1: String::from_utf8_lossy(header.rpt1.as_bytes()).into_owned(),
+                ur_call: String::from_utf8_lossy(header.ur_call.as_bytes()).into_owned(),
+                my_call: String::from_utf8_lossy(header.my_call.as_bytes()).into_owned(),
+                my_suffix: String::from_utf8_lossy(header.my_suffix.as_bytes()).into_owned(),
             };
             if let Err(e) = gw.send_header(&radio_header).await {
                 println!("Error relaying header to radio: {e}");
             }
         }
-        ReflectorEvent::VoiceData { frame, .. } => {
+        ReflectorEvent::VoiceData { frame, seq, .. } => {
+            // Feed the raw seq byte from the DSVT header; the decoder
+            // treats seq==0 as a sync frame and re-aligns its half-block
+            // phase automatically. No external skipping needed.
+            session.rx_slow_data.add_frame(&frame.slow_data, *seq);
+            // D-STAR radios repeat the 20-char text message across
+            // the voice stream continuously (~320 ms per full cycle)
+            // so late joiners can see it. The decoder correctly
+            // re-assembles on each cycle, which would print the same
+            // line 5-10 times per burst. Dedupe against the last
+            // printed text for this stream so we only announce the
+            // message when it changes (either fresh stream or the
+            // operator changed text mid-transmission).
+            if let Some(bytes) = session.rx_slow_data.take_message()
+                && session.rx_last_slow_text.as_ref() != Some(&bytes)
+            {
+                print_slow_data_text_message(&bytes);
+                session.rx_last_slow_text = Some(bytes);
+            }
+
             let radio_frame = kenwood_thd75::DStarVoiceFrame {
                 ambe: frame.ambe,
                 slow_data: frame.slow_data,
             };
-            // Use unpaced send — the radio's MMDVM buffer handles
-            // pacing internally. Paced send would block the reflector
-            // poll loop for 20ms per frame, starving the UDP receive.
+            // Use send_voice_unpaced — no host-side pacing. The
+            // correct pattern per `ref/MMDVMHost/Modem.cpp:1049` is
+            // to query the modem's `dstarSpace` status field and
+            // only write when the modem reports buffer room,
+            // letting the modem's own buffer state drive the rate.
+            // We don't yet implement that status-polling loop, so
+            // the second-best option is to let the BT kernel
+            // buffer + 9600 baud UART backpressure naturally
+            // rate-limit our writes.
+            //
+            // Host-side 20 ms pacing is wrong because DPlus
+            // delivers 21 voice packets per ~440 ms superframe
+            // (~47.7 fps — there's an extra header packet slot
+            // each superframe) while the modem's internal AMBE
+            // decoder consumes at exactly 50 fps. A ~2 ms/frame
+            // shortfall drains the modem's 10-slot buffer after
+            // roughly 2 seconds of continuous audio, then every
+            // subsequent write hits an empty buffer → constant
+            // underrun-driven stutter. Writing as fast as BT
+            // accepts (≈64 fps on 9600 baud) is much closer to
+            // the modem's expected 50 fps consumption rate.
+            //
+            // The REPL's inline event processing in
+            // [`dstar_poll_cycle`] means each reflector frame
+            // flows immediately from UDP → decode → BT write.
+            // There's no drain-then-process batching any more, so
+            // the original reason to pace (avoid bursting a full
+            // superframe followed by 400 ms idle) no longer
+            // applies.
+            //
+            // Proper fix: implement MMDVMHost-style periodic
+            // status polling and gate writes on
+            // `ModemStatus::dstar_buffer`. Tracked as future work.
             if let Err(e) = gw.send_voice_unpaced(&radio_frame).await {
                 println!("Error relaying voice to radio: {e}");
             }
         }
         ReflectorEvent::VoiceEnd { .. } => {
-            session.rx_stream_id = 0;
+            // Drain any message that became complete on the very last
+            // voice frame; any partial message mid-assembly is silently
+            // discarded by the reset below. Apply the same dedupe
+            // against `rx_last_slow_text` so we don't double-print
+            // the message on VoiceEnd if it already printed during
+            // VoiceData processing.
+            if let Some(bytes) = session.rx_slow_data.take_message()
+                && session.rx_last_slow_text.as_ref() != Some(&bytes)
+            {
+                print_slow_data_text_message(&bytes);
+            }
+            session.rx_slow_data.reset();
+            session.rx_last_slow_text = None;
+            session.rx_stream_id = None;
             if let Err(e) = gw.send_eot().await {
                 println!("Error relaying end of transmission to radio: {e}");
             }
@@ -1172,25 +2171,104 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &ReflectorE
     }
 }
 
+/// Announce a complete D-STAR slow data text message from a reflector stream.
+///
+/// `bytes` is the fixed 20-byte buffer returned by
+/// [`SlowDataDecoder::take_message`]. Trailing spaces and non-printable
+/// characters are stripped before display so screen readers don't
+/// announce padding.
+fn print_slow_data_text_message(bytes: &[u8; 20]) {
+    // Lossy UTF-8 is fine: the decoder already masks to 7-bit ASCII via
+    // `& 0x7F`, but a rogue stream could still carry 0x00..0x1F control
+    // bytes that we don't want to feed the terminal.
+    let raw = String::from_utf8_lossy(bytes);
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    if !trimmed.is_empty() {
+        tprintln!("D-STAR message: \"{trimmed}\"");
+    }
+}
+
+/// Emit a TRACE-level log entry for every reflector event consumed
+/// from the poll loop. Logs the variant discriminant plus any
+/// stream ID, source callsign, or sequence number that accompanied
+/// the event. Keyed off `target = "thd75_repl::reflector"` so users
+/// can filter just this firehose via `RUST_LOG` if they want.
+fn trace_reflector_event(event: &ReflectorEvent) {
+    match event {
+        ReflectorEvent::Connected => {
+            tracing::trace!(target: "thd75_repl::reflector", "event: Connected");
+        }
+        ReflectorEvent::Rejected => {
+            tracing::trace!(target: "thd75_repl::reflector", "event: Rejected");
+        }
+        ReflectorEvent::Disconnected => {
+            tracing::trace!(target: "thd75_repl::reflector", "event: Disconnected");
+        }
+        ReflectorEvent::PollEcho => {
+            tracing::trace!(target: "thd75_repl::reflector", "event: PollEcho");
+        }
+        ReflectorEvent::VoiceStart { header, stream_id } => {
+            tracing::trace!(
+                target: "thd75_repl::reflector",
+                stream_id = %stream_id,
+                my_call = %header.my_call_str(),
+                my_suffix = %header.my_suffix_str(),
+                ur_call = %header.ur_call_str(),
+                rpt1 = %header.rpt1_str(),
+                rpt2 = %header.rpt2_str(),
+                flag1 = format_args!("{:#04x}", header.flag1),
+                flag2 = format_args!("{:#04x}", header.flag2),
+                flag3 = format_args!("{:#04x}", header.flag3),
+                "event: VoiceStart"
+            );
+        }
+        ReflectorEvent::VoiceData { stream_id, seq, .. } => {
+            tracing::trace!(
+                target: "thd75_repl::reflector",
+                stream_id = %stream_id,
+                seq = *seq,
+                "event: VoiceData"
+            );
+        }
+        ReflectorEvent::VoiceEnd { stream_id } => {
+            tracing::trace!(
+                target: "thd75_repl::reflector",
+                stream_id = %stream_id,
+                "event: VoiceEnd"
+            );
+        }
+    }
+}
+
 /// Print a reflector event for the user.
 fn print_reflector_event(event: &ReflectorEvent) {
     match event {
-        ReflectorEvent::Connected => println!("Reflector: connected."),
-        ReflectorEvent::Rejected => println!("Reflector: connection rejected."),
-        ReflectorEvent::Disconnected => println!("Reflector: disconnected."),
+        ReflectorEvent::Connected => tprintln!("Reflector: connected."),
+        ReflectorEvent::Rejected => tprintln!("Reflector: connection rejected."),
+        ReflectorEvent::Disconnected => tprintln!("Reflector: disconnected."),
         ReflectorEvent::PollEcho | ReflectorEvent::VoiceData { .. } => {
             // Silent: keepalives and individual voice frames are too
             // frequent to announce.
         }
         ReflectorEvent::VoiceStart { header, .. } => {
-            println!(
-                "Reflector: voice from {} to {}.",
+            let suffix = header.my_suffix_str();
+            let suffix_part = if suffix.is_empty() {
+                String::new()
+            } else {
+                format!(" /{suffix}")
+            };
+            tprintln!(
+                "Reflector: voice from {}{suffix_part}, to {}.",
                 header.my_call_str(),
                 header.ur_call_str()
             );
         }
         ReflectorEvent::VoiceEnd { .. } => {
-            println!("Reflector: voice transmission ended.");
+            tprintln!("Reflector: voice transmission ended.");
         }
     }
 }
@@ -1199,8 +2277,14 @@ fn print_reflector_event(event: &ReflectorEvent) {
 fn print_dstar_event(event: &DStarEvent) {
     match event {
         DStarEvent::VoiceStart(header) => {
-            println!(
-                "D-STAR voice transmission from {} to {}.",
+            let suffix = header.my_suffix.trim();
+            let suffix_part = if suffix.is_empty() {
+                String::new()
+            } else {
+                format!(" /{suffix}")
+            };
+            tprintln!(
+                "D-STAR voice from {}{suffix_part}, to {}.",
                 header.my_call.trim(),
                 header.ur_call.trim()
             );
@@ -1209,32 +2293,39 @@ fn print_dstar_event(event: &DStarEvent) {
             // Don't announce every 20ms frame — too noisy for screen readers.
         }
         DStarEvent::VoiceEnd => {
-            println!("D-STAR voice transmission ended.");
+            tprintln!("D-STAR voice transmission ended.");
         }
         DStarEvent::VoiceLost => {
-            println!("D-STAR voice signal lost, no clean end of transmission.");
+            tprintln!("D-STAR voice signal lost, no clean end of transmission.");
         }
         DStarEvent::TextMessage(text) => {
-            println!("D-STAR text message received: {text}");
+            tprintln!("D-STAR message: \"{text}\"");
         }
-        DStarEvent::GpsData(_) => {
-            println!("D-STAR GPS position data received.");
+        DStarEvent::GpsData(data) => {
+            // GPS/DPRS data is raw NMEA-like bytes. Show as text if valid ASCII.
+            let text = String::from_utf8_lossy(data);
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                tprintln!("D-STAR GPS position data received.");
+            } else {
+                tprintln!("D-STAR GPS data: {trimmed}");
+            }
         }
         DStarEvent::StationHeard(entry) => {
-            println!("D-STAR station heard: {}.", entry.callsign);
+            tprintln!("D-STAR station heard: {}.", entry.callsign);
         }
         DStarEvent::UrCallCommand(action) => {
             use kenwood_thd75::types::dstar::UrCallAction;
             match action {
-                UrCallAction::Cq => println!("D-STAR command: call CQ."),
-                UrCallAction::Echo => println!("D-STAR command: echo test."),
-                UrCallAction::Unlink => println!("D-STAR command: unlink reflector."),
-                UrCallAction::Info => println!("D-STAR command: request info."),
+                UrCallAction::Cq => tprintln!("D-STAR command: call CQ."),
+                UrCallAction::Echo => tprintln!("D-STAR command: echo test."),
+                UrCallAction::Unlink => tprintln!("D-STAR command: unlink reflector."),
+                UrCallAction::Info => tprintln!("D-STAR command: request info."),
                 UrCallAction::Link { reflector, module } => {
-                    println!("D-STAR command: link to {reflector} module {module}.");
+                    tprintln!("D-STAR command: link to {reflector} module {module}.");
                 }
                 UrCallAction::Callsign(call) => {
-                    println!("D-STAR command: route to callsign {call}.");
+                    tprintln!("D-STAR command: route to callsign {call}.");
                 }
             }
         }

@@ -175,9 +175,12 @@ pub(crate) fn help() {
 pub(crate) fn aprs_help() {
     println!("You are in APRS packet radio mode.");
     println!("-- APRS commands --");
-    println!("listen: Check for the next APRS event");
+    println!("monitor: Continuously listen for APRS events (Ctrl-C to stop)");
     println!("msg W1AW Hello there: Send an APRS message to a station");
+    println!("position 35.30 -82.46 Portable: Send a position beacon");
     println!("beacon: Send a status beacon");
+    println!("stations: List recently heard stations");
+    println!("igate r/35.30/-82.46/100: Bridge RF to APRS-IS with a filter");
     println!("aprs stop: Leave APRS mode, return to normal radio control");
     println!("quit: Exit the program");
 }
@@ -186,10 +189,13 @@ pub(crate) fn aprs_help() {
 pub(crate) fn dstar_help() {
     println!("You are in D-STAR digital voice gateway mode.");
     println!("-- D-STAR gateway commands --");
-    println!("listen: Poll once for D-STAR and reflector events");
-    println!("monitor: Continuous monitoring with keepalives and voice relay");
-    println!("link XRF030C: Connect to a reflector");
+    println!("monitor: Start listening for voice and reflector events (Ctrl-C to stop)");
+    println!("link REF030C: Connect to a reflector and start monitoring");
+    println!("  Supported prefixes: REF (DPlus), XRF/XLX (DExtra), DCS");
     println!("unlink: Disconnect from the reflector");
+    println!("echo: Test your audio — records your transmission, plays it back");
+    println!("text Hello: Set a text message to embed in your next voice transmission");
+    println!("text clear: Remove the outgoing text message");
     println!("heard: List recently heard stations");
     println!("status: Modem and reflector connection status");
     println!("dstar stop: Leave D-STAR mode, return to normal radio control");

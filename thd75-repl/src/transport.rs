@@ -62,16 +62,6 @@ fn open_explicit(
 fn open_bluetooth(baud: u32) -> Result<(String, EitherTransport), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     {
-        // First attempt.
-        if let Ok(bt) = kenwood_thd75::BluetoothTransport::open(None) {
-            return Ok(("bluetooth:TH-D75".into(), EitherTransport::Bluetooth(bt)));
-        }
-
-        // The previous session may not have released the RFCOMM channel.
-        // Wait and retry once.
-        println!("Bluetooth connection failed, retrying in 3 seconds.");
-        std::thread::sleep(std::time::Duration::from_secs(3));
-
         let bt = kenwood_thd75::BluetoothTransport::open(None).map_err(|e| {
             format!(
                 "Error: Bluetooth connection failed: {e}. \

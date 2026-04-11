@@ -124,7 +124,7 @@ pub(crate) async fn spawn_with_transport(
         // Why break out of the inner loop: Reconnect (transport lost) or
         // APRS mode entry (radio consumed). `aprs_pending` stores an APRS
         // config when the inner loop broke because of an EnterAprs command.
-        let mut aprs_pending: Option<kenwood_thd75::AprsClientConfig> = None;
+        let mut aprs_pending: Option<Box<kenwood_thd75::AprsClientConfig>> = None;
         let mut dstar_pending: Option<kenwood_thd75::DStarGatewayConfig> = None;
 
         // Main loop: poll + handle commands + process AI notifications
@@ -135,7 +135,7 @@ pub(crate) async fn spawn_with_transport(
             if let Some(config) = aprs_pending.take()
                 && let Some(taken_radio) = radio_opt.take()
             {
-                match enter_aprs_session(taken_radio, config, &tx, &mut cmd_rx).await {
+                match enter_aprs_session(taken_radio, *config, &tx, &mut cmd_rx).await {
                     Ok(new_radio) => {
                         let mut r = new_radio;
                         if let Err(e) = r.set_auto_info(true).await {

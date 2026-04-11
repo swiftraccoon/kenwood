@@ -1,7 +1,16 @@
-//! D-STAR voice frame types.
+//! D-STAR voice frame types and constants.
 //!
-//! Each D-STAR voice frame carries 20 ms of AMBE-encoded audio (9 bytes)
-//! and 3 bytes of slow data used for text messages or GPS position.
+//! Each voice frame carries 9 bytes of AMBE-encoded audio and 3 bytes
+//! of slow data. Frames are transmitted at 50 Hz (one every 20 ms)
+//! per the JARL D-STAR specification. A superframe is 21 frames
+//! (frame 0 is a sync frame, frames 1-20 carry slow data) for a
+//! total of 420 ms per superframe.
+//!
+//! # References
+//!
+//! - JARL D-STAR specification
+//! - `ircDDBGateway/Common/AMBEData.cpp`
+//! - `xlxd/src/cdextraprotocol.cpp:EncodeDvPacket`
 
 /// AMBE silence frame (9 bytes) — used in EOT packets.
 ///
@@ -16,7 +25,7 @@ pub const DSTAR_SYNC_BYTES: [u8; 3] = [0x55, 0x55, 0x55];
 /// 21 frames form one superframe. Frame 0 carries the sync pattern,
 /// frames 1-20 carry slow data. At 20 ms per frame, one superframe
 /// is 420 ms of audio.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoiceFrame {
     /// AMBE 3600x2450 codec voice data (9 bytes).
     pub ambe: [u8; 9],

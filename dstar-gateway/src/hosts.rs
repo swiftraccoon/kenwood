@@ -33,6 +33,28 @@ pub struct HostEntry {
 }
 
 /// Collection of host file entries keyed by reflector name.
+///
+/// # Semantics
+///
+/// - Lookups via [`HostFile::lookup`] are case-insensitive: the query
+///   is upper-cased before the `HashMap` lookup, so `lookup("ref030")`
+///   and `lookup("REF030")` find the same entry.
+/// - Parsed insertion via [`HostFile::parse`] upper-cases the name
+///   before inserting, so both `REF030 ...` and `ref030 ...` map to
+///   the same key `"REF030"`.
+/// - Manual insertion via [`HostFile::insert`] uses
+///   `HostEntry::name` verbatim as the key. Inserting an entry whose
+///   `name` is mixed-case produces a key that is only reachable
+///   through `lookup` if its upper-cased form matches, so callers
+///   should pass upper-case callsigns when inserting manually.
+/// - Duplicate callsigns use last-wins semantics: the most recently
+///   parsed (or inserted) entry replaces any earlier entry with the
+///   same key.
+/// - Malformed lines in [`HostFile::parse`] (fewer than 2
+///   whitespace-separated fields) are logged at
+///   `tracing::debug!` and skipped. Unparseable port values fall
+///   back to the supplied `default_port` rather than skipping the
+///   entry.
 #[derive(Debug, Clone, Default)]
 pub struct HostFile {
     entries: HashMap<String, HostEntry>,
@@ -61,15 +83,39 @@ impl HostFile {
 
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 2 {
+                tracing::debug!(
+                    line = %line,
+                    reason = "fewer than 2 whitespace-separated fields",
+                    "host file parse error, skipping line"
+                );
                 continue;
             }
 
             let name = parts[0].to_uppercase();
             let address = parts[1].to_string();
-            let port = parts
-                .get(2)
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(default_port);
+            // The third column is historically the port number, but
+            // Pi-Star-flavoured host files use single-letter status
+            // flags in that column instead:
+            //   `L` — locked / link-only (no user dial-in)
+            //   `S` — selfcare / status page
+            //   `U` — unused
+            // None of these are port numbers. When we see a known
+            // non-port flag, silently fall back to default_port. Only
+            // genuinely unexpected content produces a debug log.
+            let port = parts.get(2).map_or(default_port, |raw| {
+                raw.parse::<u16>().unwrap_or_else(|_| {
+                    if !matches!(*raw, "L" | "S" | "U") {
+                        // Unknown non-numeric value — log for visibility.
+                        // Known flags fall through silently.
+                        tracing::debug!(
+                            line = %line,
+                            raw_port = %raw,
+                            "host file port not a number, using default_port"
+                        );
+                    }
+                    default_port
+                })
+            });
 
             let _ = self.entries.insert(
                 name.clone(),
@@ -89,8 +135,8 @@ impl HostFile {
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the file cannot be read.
-    pub fn load(path: &std::path::Path, default_port: u16) -> Result<Self, std::io::Error> {
+    /// Returns [`crate::Error::Io`] if the file cannot be read.
+    pub fn load(path: &std::path::Path, default_port: u16) -> Result<Self, crate::Error> {
         let content = std::fs::read_to_string(path)?;
         let mut hf = Self::new();
         hf.parse(&content, default_port);
@@ -181,6 +227,31 @@ mod tests {
         hf.parse("REF001 host1 notaport\n", 20001);
         assert_eq!(hf.len(), 1);
         assert_eq!(hf.lookup("REF001").unwrap().port, 20001);
+    }
+
+    #[test]
+    fn parse_pistar_lock_flag_uses_default_port() {
+        // Pi-Star host files put "L" (locked / link-only) in the port
+        // column for reflectors that don't accept user dial-in. We
+        // should treat this as "no port specified" and silently fall
+        // back to default_port, without a warning log.
+        let mut hf = HostFile::new();
+        hf.parse("W4LCO\t208.89.76.92\tL\nDCS005\t44.31.166.9\tL\n", 20001);
+        assert_eq!(hf.len(), 2);
+        assert_eq!(hf.lookup("W4LCO").unwrap().port, 20001);
+        assert_eq!(hf.lookup("W4LCO").unwrap().address, "208.89.76.92");
+        assert_eq!(hf.lookup("DCS005").unwrap().port, 20001);
+    }
+
+    #[test]
+    fn parse_pistar_status_flags_also_accepted() {
+        // `S` (selfcare) and `U` (unused) are other Pi-Star flag values
+        // that appear in the port column. Treat them the same as `L`.
+        let mut hf = HostFile::new();
+        hf.parse("REFX1 host1.example S\nREFX2 host2.example U\n", 20001);
+        assert_eq!(hf.len(), 2);
+        assert_eq!(hf.lookup("REFX1").unwrap().port, 20001);
+        assert_eq!(hf.lookup("REFX2").unwrap().port, 20001);
     }
 
     #[test]

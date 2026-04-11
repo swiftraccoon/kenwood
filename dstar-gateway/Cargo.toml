@@ -14,9 +14,11 @@ readme = "README.md"
 [dependencies]
 tokio = { version = "1", features = ["net", "time", "sync", "macros", "io-util"] }
 tracing = "0.1"
+thiserror = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+proptest = "1"
 
 [lints.rust]
 unsafe_code = "deny"

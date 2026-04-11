@@ -74,7 +74,8 @@ use crate::kiss::station_list::{StationEntry, StationList};
 use crate::kiss::{
     AprsData, AprsMessage, AprsPosition, AprsWeather, Ax25Address, Ax25Packet, CMD_DATA, KissFrame,
     build_aprs_object, build_aprs_position_compressed, build_aprs_position_report,
-    build_aprs_status, build_ax25, encode_kiss_frame, parse_aprs_data_full, parse_ax25,
+    build_aprs_status, build_ax25, build_query_response_position, encode_kiss_frame,
+    parse_aprs_data_full, parse_ax25,
 };
 use crate::radio::Radio;
 use crate::radio::kiss_session::KissSession;
@@ -118,6 +119,26 @@ pub struct AprsClientConfig {
     /// Automatically acknowledge incoming messages addressed to us.
     /// Default: `true`.
     pub auto_ack: bool,
+    /// Digipeater path for outgoing packets.
+    ///
+    /// Default: `WIDE1-1,WIDE2-1` (standard 2-hop path). Use an empty
+    /// vector for direct transmission with no digipeating. Parse from
+    /// a string with [`crate::kiss::parse_digipeater_path`].
+    pub digipeater_path: Vec<Ax25Address>,
+    /// Automatically respond to `?APRSP` position queries addressed to us.
+    ///
+    /// When set and an incoming message contains `?APRSP`, the client
+    /// sends a position beacon in response. Requires
+    /// [`auto_query_position`](Self::auto_query_position) to be set.
+    ///
+    /// Default: `true`.
+    pub auto_query_response: bool,
+    /// Cached position for auto query responses, as `(lat, lon)`.
+    ///
+    /// When `None`, query responses are not sent even if
+    /// `auto_query_response` is `true`. Update via
+    /// [`AprsClient::set_query_response_position`].
+    pub auto_query_position: Option<(f64, f64)>,
 }
 
 impl AprsClientConfig {
@@ -142,15 +163,15 @@ impl AprsClientConfig {
             max_stations: 500,
             station_timeout_secs: 3600,
             auto_ack: true,
+            digipeater_path: crate::kiss::default_digipeater_path(),
+            auto_query_response: true,
+            auto_query_position: None,
         }
     }
 
     /// Build the [`Ax25Address`] for this station.
     fn my_address(&self) -> Ax25Address {
-        Ax25Address {
-            callsign: self.callsign.clone(),
-            ssid: self.ssid,
-        }
+        Ax25Address::new(&self.callsign, self.ssid)
     }
 }
 
@@ -194,6 +215,11 @@ pub enum AprsEvent {
     PacketDigipeated {
         /// Original source callsign.
         source: String,
+    },
+    /// An automatic response to a `?APRSP` position query was sent.
+    QueryResponded {
+        /// The callsign that sent the query.
+        to: String,
     },
     /// A raw AX.25 packet that does not match any specific event type.
     RawPacket(Ax25Packet),
@@ -251,7 +277,7 @@ impl<T: Transport> AprsClient<T> {
         session.set_receive_timeout(EVENT_POLL_TIMEOUT);
 
         let my_addr = config.my_address();
-        let messenger = AprsMessenger::new(my_addr);
+        let messenger = AprsMessenger::new(my_addr, config.digipeater_path.clone());
         let stations = StationList::new(
             config.max_stations,
             Duration::from_secs(config.station_timeout_secs),
@@ -431,6 +457,7 @@ impl<T: Transport> AprsClient<T> {
             self.config.symbol_table,
             self.config.symbol_code,
             comment,
+            &self.config.digipeater_path,
         );
         self.session.send_wire(&wire).await?;
         self.beaconing.beacon_sent();
@@ -459,6 +486,7 @@ impl<T: Transport> AprsClient<T> {
             self.config.symbol_table,
             self.config.symbol_code,
             comment,
+            &self.config.digipeater_path,
         );
         self.session.send_wire(&wire).await?;
         self.beaconing.beacon_sent();
@@ -472,9 +500,17 @@ impl<T: Transport> AprsClient<T> {
     /// Returns an error if the transmission fails.
     pub async fn send_status(&mut self, text: &str) -> Result<(), Error> {
         let source = self.config.my_address();
-        let wire = build_aprs_status(&source, text);
+        let wire = build_aprs_status(&source, text, &self.config.digipeater_path);
         self.session.send_wire(&wire).await?;
         Ok(())
+    }
+
+    /// Set the cached position for auto query responses.
+    ///
+    /// When a station sends `?APRSP` and auto query response is enabled,
+    /// the client replies with a position beacon using this position.
+    pub const fn set_query_response_position(&mut self, lat: f64, lon: f64) {
+        self.config.auto_query_position = Some((lat, lon));
     }
 
     /// Send an object report.
@@ -500,6 +536,7 @@ impl<T: Transport> AprsClient<T> {
             self.config.symbol_table,
             self.config.symbol_code,
             comment,
+            &self.config.digipeater_path,
         );
         self.session.send_wire(&wire).await?;
         Ok(())
@@ -600,17 +637,11 @@ impl<T: Transport> AprsClient<T> {
         // Wrap in third-party header: }original_packet
         let third_party_payload = format!("}}{header}:{data}");
         let source = self.config.my_address();
-        let dest = Ax25Address {
-            callsign: "APRS".to_owned(),
-            ssid: 0,
-        };
+        let dest = Ax25Address::new("APRS", 0);
         let packet = Ax25Packet {
             source,
             destination: dest,
-            digipeaters: vec![Ax25Address {
-                callsign: "TCPIP".to_owned(),
-                ssid: 0,
-            }],
+            digipeaters: vec![Ax25Address::new("TCPIP", 0)],
             control: 0x03,
             protocol: 0xF0,
             info: third_party_payload.into_bytes(),
@@ -743,6 +774,33 @@ impl<T: Transport> AprsClient<T> {
             self.session.send_wire(&ack_frame).await?;
         }
 
+        // Handle directed position query (`?APRSP`).
+        //
+        // When enabled and a position is cached, respond with a position
+        // beacon. The beacon goes to CQCQCQ (all stations), not just the
+        // querying station — this is per APRS spec, which treats the
+        // query as a request for a fresh beacon from the queried station.
+        if self.config.auto_query_response
+            && msg.text.trim() == "?APRSP"
+            && let Some((lat, lon)) = self.config.auto_query_position
+        {
+            tracing::info!(from = %from.callsign, "responding to ?APRSP query");
+            let source = self.config.my_address();
+            let wire = build_query_response_position(
+                &source,
+                lat,
+                lon,
+                self.config.symbol_table,
+                self.config.symbol_code,
+                &self.config.beacon_comment,
+                &self.config.digipeater_path,
+            );
+            self.session.send_wire(&wire).await?;
+            return Ok(Some(AprsEvent::QueryResponded {
+                to: from.callsign.clone(),
+            }));
+        }
+
         Ok(Some(AprsEvent::MessageReceived(msg.clone())))
     }
 
@@ -777,6 +835,7 @@ mod tests {
     use super::*;
     use crate::kiss::{
         FEND, build_aprs_message as build_msg, build_aprs_position_report as build_pos,
+        default_digipeater_path,
     };
     use crate::transport::MockTransport;
     use crate::types::TncBaud;
@@ -795,10 +854,7 @@ mod tests {
     }
 
     fn test_address() -> Ax25Address {
-        Ax25Address {
-            callsign: "N0CALL".to_owned(),
-            ssid: 7,
-        }
+        Ax25Address::new("N0CALL", 7)
     }
 
     #[tokio::test]
@@ -832,7 +888,13 @@ mod tests {
 
         // The messenger builds a KISS-encoded wire frame internally.
         // send_message calls send_wire which writes it directly.
-        let expected_wire = build_msg(&test_address(), "W1AW", "Hello", Some("1"));
+        let expected_wire = build_msg(
+            &test_address(),
+            "W1AW",
+            "Hello",
+            Some("1"),
+            &default_digipeater_path(),
+        );
         client.session.transport.expect(&expected_wire, &[]);
 
         let id = client.send_message("W1AW", "Hello").await.unwrap();
@@ -846,7 +908,15 @@ mod tests {
         let config = test_config();
         let mut client = AprsClient::start(radio, config).await.unwrap();
 
-        let expected = build_pos(&test_address(), 35.25, -97.75, '/', '>', "mobile");
+        let expected = build_pos(
+            &test_address(),
+            35.25,
+            -97.75,
+            '/',
+            '>',
+            "mobile",
+            &default_digipeater_path(),
+        );
         client.session.transport.expect(&expected, &[]);
 
         client
@@ -861,8 +931,15 @@ mod tests {
         let config = test_config();
         let mut client = AprsClient::start(radio, config).await.unwrap();
 
-        let expected =
-            build_aprs_position_compressed(&test_address(), 35.25, -97.75, '/', '>', "compressed");
+        let expected = build_aprs_position_compressed(
+            &test_address(),
+            35.25,
+            -97.75,
+            '/',
+            '>',
+            "compressed",
+            &default_digipeater_path(),
+        );
         client.session.transport.expect(&expected, &[]);
 
         client
@@ -877,7 +954,7 @@ mod tests {
         let config = test_config();
         let mut client = AprsClient::start(radio, config).await.unwrap();
 
-        let expected = build_aprs_status(&test_address(), "On the air");
+        let expected = build_aprs_status(&test_address(), "On the air", &default_digipeater_path());
         client.session.transport.expect(&expected, &[]);
 
         client.send_status("On the air").await.unwrap();
@@ -898,6 +975,7 @@ mod tests {
             '/',
             '>',
             "5K run",
+            &default_digipeater_path(),
         );
         client.session.transport.expect(&expected, &[]);
 
@@ -951,21 +1029,9 @@ mod tests {
 
     fn make_test_packet(source: &str, dest: &str, digis: &[&str], info: &[u8]) -> Ax25Packet {
         Ax25Packet {
-            source: Ax25Address {
-                callsign: source.to_owned(),
-                ssid: 0,
-            },
-            destination: Ax25Address {
-                callsign: dest.to_owned(),
-                ssid: 0,
-            },
-            digipeaters: digis
-                .iter()
-                .map(|d| Ax25Address {
-                    callsign: (*d).to_owned(),
-                    ssid: 0,
-                })
-                .collect(),
+            source: Ax25Address::new(source, 0),
+            destination: Ax25Address::new(dest, 0),
+            digipeaters: digis.iter().map(|d| Ax25Address::new(d, 0)).collect(),
             control: 0x03,
             protocol: 0xF0,
             info: info.to_vec(),
@@ -1134,14 +1200,8 @@ mod tests {
     /// Build a KISS-encoded data frame from a source callsign and APRS info.
     fn build_kiss_data_frame(source: &str, ssid: u8, info: &[u8]) -> Vec<u8> {
         let packet = Ax25Packet {
-            source: Ax25Address {
-                callsign: source.to_owned(),
-                ssid,
-            },
-            destination: Ax25Address {
-                callsign: "APK005".to_owned(),
-                ssid: 0,
-            },
+            source: Ax25Address::new(source, ssid),
+            destination: Ax25Address::new("APK005", 0),
             digipeaters: vec![],
             control: 0x03,
             protocol: 0xF0,
@@ -1234,7 +1294,13 @@ mod tests {
         let mut client = AprsClient::start(radio, config).await.unwrap();
 
         // First, send a message so we have a pending message with id "1"
-        let expected_wire = build_msg(&test_address(), "W1AW", "Test", Some("1"));
+        let expected_wire = build_msg(
+            &test_address(),
+            "W1AW",
+            "Test",
+            Some("1"),
+            &default_digipeater_path(),
+        );
         client.session.transport.expect(&expected_wire, &[]);
         let _id = client.send_message("W1AW", "Test").await.unwrap();
 
@@ -1260,7 +1326,13 @@ mod tests {
         let mut client = AprsClient::start(radio, config).await.unwrap();
 
         // Send a message to have pending id "1"
-        let expected_wire = build_msg(&test_address(), "W1AW", "Test", Some("1"));
+        let expected_wire = build_msg(
+            &test_address(),
+            "W1AW",
+            "Test",
+            Some("1"),
+            &default_digipeater_path(),
+        );
         client.session.transport.expect(&expected_wire, &[]);
         let _id = client.send_message("W1AW", "Test").await.unwrap();
 
@@ -1315,7 +1387,15 @@ mod tests {
         let mut client = AprsClient::start(radio, config).await.unwrap();
 
         // SmartBeaconing always triggers on first call.
-        let expected = build_pos(&test_address(), 35.25, -97.75, '/', '>', "");
+        let expected = build_pos(
+            &test_address(),
+            35.25,
+            -97.75,
+            '/',
+            '>',
+            "",
+            &default_digipeater_path(),
+        );
         client.session.transport.expect(&expected, &[]);
 
         let beaconed = client
@@ -1332,7 +1412,15 @@ mod tests {
         let mut client = AprsClient::start(radio, config).await.unwrap();
 
         // First call beacons.
-        let expected = build_pos(&test_address(), 35.25, -97.75, '/', '>', "");
+        let expected = build_pos(
+            &test_address(),
+            35.25,
+            -97.75,
+            '/',
+            '>',
+            "",
+            &default_digipeater_path(),
+        );
         client.session.transport.expect(&expected, &[]);
         let _ = client
             .update_motion(50.0, 90.0, 35.25, -97.75)

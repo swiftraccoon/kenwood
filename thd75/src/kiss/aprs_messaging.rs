@@ -35,6 +35,8 @@ struct PendingMessage {
 pub struct AprsMessenger {
     /// This station's callsign/SSID.
     my_callsign: Ax25Address,
+    /// Digipeater path used for outgoing message frames.
+    digipeater_path: Vec<Ax25Address>,
     /// Messages awaiting acknowledgement.
     pending_messages: Vec<PendingMessage>,
     /// Counter for generating unique message IDs.
@@ -42,11 +44,12 @@ pub struct AprsMessenger {
 }
 
 impl AprsMessenger {
-    /// Create a new messenger for the given callsign.
+    /// Create a new messenger for the given callsign and digipeater path.
     #[must_use]
-    pub const fn new(callsign: Ax25Address) -> Self {
+    pub const fn new(callsign: Ax25Address, digipeater_path: Vec<Ax25Address>) -> Self {
         Self {
             my_callsign: callsign,
+            digipeater_path,
             pending_messages: Vec::new(),
             next_message_id: 1,
         }
@@ -62,7 +65,13 @@ impl AprsMessenger {
             self.next_message_id = 1;
         }
 
-        let wire_frame = build_aprs_message(&self.my_callsign, addressee, text, Some(&message_id));
+        let wire_frame = build_aprs_message(
+            &self.my_callsign,
+            addressee,
+            text,
+            Some(&message_id),
+            &self.digipeater_path,
+        );
 
         // Use a time in the past so the message is immediately eligible.
         let now = Instant::now();
@@ -126,7 +135,7 @@ impl AprsMessenger {
     #[must_use]
     pub fn build_ack(&self, from: &str, message_id: &str) -> Vec<u8> {
         let text = format!("ack{message_id}");
-        build_aprs_message(&self.my_callsign, from, &text, None)
+        build_aprs_message(&self.my_callsign, from, &text, None, &self.digipeater_path)
     }
 
     /// Build a rej (reject) frame for a received message.
@@ -135,7 +144,7 @@ impl AprsMessenger {
     #[must_use]
     pub fn build_rej(&self, from: &str, message_id: &str) -> Vec<u8> {
         let text = format!("rej{message_id}");
-        build_aprs_message(&self.my_callsign, from, &text, None)
+        build_aprs_message(&self.my_callsign, from, &text, None, &self.digipeater_path)
     }
 
     /// Remove expired messages (those that have reached [`MAX_RETRIES`] attempts).
@@ -153,18 +162,21 @@ impl AprsMessenger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kiss::{decode_kiss_frame, parse_aprs_message as parse_msg, parse_ax25};
+    use crate::kiss::{
+        decode_kiss_frame, default_digipeater_path, parse_aprs_message as parse_msg, parse_ax25,
+    };
 
     fn test_callsign() -> Ax25Address {
-        Ax25Address {
-            callsign: "N0CALL".to_owned(),
-            ssid: 7,
-        }
+        Ax25Address::new("N0CALL", 7)
+    }
+
+    fn test_messenger() -> AprsMessenger {
+        AprsMessenger::new(test_callsign(), default_digipeater_path())
     }
 
     #[test]
     fn send_message_assigns_incrementing_ids() {
-        let mut m = AprsMessenger::new(test_callsign());
+        let mut m = test_messenger();
         let id1 = m.send_message("W1AW", "Hello");
         let id2 = m.send_message("W1AW", "World");
         assert_eq!(id1, "1");
@@ -174,7 +186,7 @@ mod tests {
 
     #[test]
     fn next_frame_returns_pending_message() {
-        let mut m = AprsMessenger::new(test_callsign());
+        let mut m = test_messenger();
         let _id = m.send_message("W1AW", "Test");
 
         // Message was created with last_sent in the past, so it should be ready.
@@ -193,7 +205,7 @@ mod tests {
 
     #[test]
     fn next_frame_returns_none_when_recently_sent() {
-        let mut m = AprsMessenger::new(test_callsign());
+        let mut m = test_messenger();
         let _id = m.send_message("W1AW", "Test");
 
         // First call sends the message.
@@ -204,7 +216,7 @@ mod tests {
 
     #[test]
     fn process_incoming_ack_removes_pending() {
-        let mut m = AprsMessenger::new(test_callsign());
+        let mut m = test_messenger();
         let id = m.send_message("W1AW", "Hello");
         assert_eq!(m.pending_count(), 1);
 
@@ -219,7 +231,7 @@ mod tests {
 
     #[test]
     fn process_incoming_rej_removes_pending() {
-        let mut m = AprsMessenger::new(test_callsign());
+        let mut m = test_messenger();
         let id = m.send_message("W1AW", "Hello");
 
         let rej = AprsMessage {
@@ -233,7 +245,7 @@ mod tests {
 
     #[test]
     fn process_incoming_unrelated_message_returns_false() {
-        let mut m = AprsMessenger::new(test_callsign());
+        let mut m = test_messenger();
         let _id = m.send_message("W1AW", "Hello");
 
         let unrelated = AprsMessage {
@@ -247,7 +259,7 @@ mod tests {
 
     #[test]
     fn build_ack_produces_valid_frame() {
-        let m = AprsMessenger::new(test_callsign());
+        let m = test_messenger();
         let wire = m.build_ack("W1AW", "42");
 
         let kiss = decode_kiss_frame(&wire).unwrap();
@@ -259,7 +271,7 @@ mod tests {
 
     #[test]
     fn build_rej_produces_valid_frame() {
-        let m = AprsMessenger::new(test_callsign());
+        let m = test_messenger();
         let wire = m.build_rej("W1AW", "42");
 
         let kiss = decode_kiss_frame(&wire).unwrap();
@@ -271,7 +283,7 @@ mod tests {
 
     #[test]
     fn cleanup_expired_removes_maxed_messages() {
-        let mut m = AprsMessenger::new(test_callsign());
+        let mut m = test_messenger();
         let _id = m.send_message("W1AW", "Test");
 
         // Exhaust all retries by sending MAX_RETRIES times.
@@ -293,7 +305,7 @@ mod tests {
 
     #[test]
     fn message_id_wraps_around_skipping_zero() {
-        let mut m = AprsMessenger::new(test_callsign());
+        let mut m = test_messenger();
         m.next_message_id = u16::MAX;
         let id1 = m.send_message("W1AW", "A");
         assert_eq!(id1, u16::MAX.to_string());

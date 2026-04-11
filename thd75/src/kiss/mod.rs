@@ -56,6 +56,7 @@
 
 pub mod aprs_client;
 pub mod aprs_is;
+pub mod aprs_is_client;
 pub mod aprs_messaging;
 pub mod digipeater;
 pub mod smart_beaconing;
@@ -297,12 +298,35 @@ pub struct Ax25Address {
     pub callsign: String,
     /// Secondary Station Identifier (0-15).
     pub ssid: u8,
+    /// Has-been-repeated flag (H-bit).
+    ///
+    /// For digipeater addresses, indicates this hop has already been
+    /// consumed. Encoded as bit 7 of the SSID byte in AX.25 wire format.
+    pub repeated: bool,
+}
+
+impl Ax25Address {
+    /// Create a new address with the H-bit unset (not yet repeated).
+    #[must_use]
+    pub fn new(callsign: &str, ssid: u8) -> Self {
+        Self {
+            callsign: callsign.to_owned(),
+            ssid,
+            repeated: false,
+        }
+    }
 }
 
 impl fmt::Display for Ax25Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.ssid == 0 {
-            write!(f, "{}", self.callsign)
+            if self.repeated {
+                write!(f, "{}*", self.callsign)
+            } else {
+                write!(f, "{}", self.callsign)
+            }
+        } else if self.repeated {
+            write!(f, "{}-{}*", self.callsign, self.ssid)
         } else {
             write!(f, "{}-{}", self.callsign, self.ssid)
         }
@@ -330,6 +354,9 @@ pub struct Ax25Packet {
 }
 
 /// Decode a single AX.25 address from a 7-byte slice.
+///
+/// The H-bit (has-been-repeated) is extracted from bit 7 of the SSID
+/// byte. For digipeater addresses, this indicates the hop has been used.
 fn decode_ax25_address(bytes: &[u8]) -> Ax25Address {
     let mut callsign = String::with_capacity(6);
     for &b in &bytes[..6] {
@@ -339,12 +366,18 @@ fn decode_ax25_address(bytes: &[u8]) -> Ax25Address {
         }
     }
     let ssid = (bytes[6] >> 1) & 0x0F;
-    Ax25Address { callsign, ssid }
+    let repeated = bytes[6] & 0x80 != 0;
+    Ax25Address {
+        callsign,
+        ssid,
+        repeated,
+    }
 }
 
 /// Encode an AX.25 address into 7 bytes.
 ///
 /// `is_last` sets the address-extension bit on the final address.
+/// The H-bit (has-been-repeated) is encoded into bit 7 of the SSID byte.
 fn encode_ax25_address(addr: &Ax25Address, is_last: bool) -> [u8; 7] {
     let mut bytes = [0x40u8; 7]; // space << 1 = 0x40
     for (i, ch) in addr.callsign.bytes().take(6).enumerate() {
@@ -353,6 +386,9 @@ fn encode_ax25_address(addr: &Ax25Address, is_last: bool) -> [u8; 7] {
     let mut ssid_byte = 0x60 | ((addr.ssid & 0x0F) << 1);
     if is_last {
         ssid_byte |= 0x01; // address-extension bit
+    }
+    if addr.repeated {
+        ssid_byte |= 0x80; // H-bit (has-been-repeated)
     }
     bytes[6] = ssid_byte;
     bytes
@@ -456,6 +492,8 @@ pub enum AprsError {
     InvalidCoordinates,
     /// Mic-E data requires the AX.25 destination address for decoding.
     MicERequiresDestination,
+    /// A digipeater path string could not be parsed.
+    InvalidPath(String),
 }
 
 impl fmt::Display for AprsError {
@@ -467,6 +505,7 @@ impl fmt::Display for AprsError {
                 f,
                 "Mic-E data requires destination address \u{2014} use parse_aprs_data_full()"
             ),
+            Self::InvalidPath(s) => write!(f, "invalid digipeater path: {s}"),
         }
     }
 }
@@ -1004,9 +1043,10 @@ pub fn build_query_response_position(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
+    path: &[Ax25Address],
 ) -> Vec<u8> {
     // A query response is just a normal position report.
-    build_aprs_position_report(source, lat, lon, symbol_table, symbol_code, comment)
+    build_aprs_position_report(source, lat, lon, symbol_table, symbol_code, comment, path)
 }
 
 /// Parse any APRS data frame from an AX.25 information field.
@@ -1399,6 +1439,57 @@ const APRS_TOCALL: &str = "APK005";
 /// Default APRS digipeater path: WIDE1-1, WIDE2-1.
 const DEFAULT_DIGIPEATERS: &[(&str, u8)] = &[("WIDE1", 1), ("WIDE2", 1)];
 
+/// Parse a digipeater path string like `"WIDE1-1,WIDE2-2"` into addresses.
+///
+/// Accepts comma-separated entries, each of the form `CALLSIGN[-SSID]`.
+/// Whitespace around entries is trimmed. An empty string returns an empty
+/// path (direct transmission with no digipeating).
+///
+/// # Errors
+///
+/// Returns [`AprsError::InvalidPath`] if any entry has an SSID that is
+/// not a valid 0-15 integer, or if the callsign is empty or longer than
+/// 6 characters.
+///
+/// # Examples
+///
+/// ```
+/// use kenwood_thd75::kiss::parse_digipeater_path;
+/// let path = parse_digipeater_path("WIDE1-1,WIDE2-2").unwrap();
+/// assert_eq!(path.len(), 2);
+/// assert_eq!(path[0].callsign, "WIDE1");
+/// assert_eq!(path[0].ssid, 1);
+/// ```
+pub fn parse_digipeater_path(s: &str) -> Result<Vec<Ax25Address>, AprsError> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    for entry in trimmed.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(AprsError::InvalidPath(s.to_owned()));
+        }
+        let (callsign, ssid) = if let Some((call, ssid_str)) = entry.split_once('-') {
+            let ssid: u8 = ssid_str
+                .parse()
+                .map_err(|_| AprsError::InvalidPath(s.to_owned()))?;
+            if ssid > 15 {
+                return Err(AprsError::InvalidPath(s.to_owned()));
+            }
+            (call, ssid)
+        } else {
+            (entry, 0)
+        };
+        if callsign.is_empty() || callsign.len() > 6 {
+            return Err(AprsError::InvalidPath(s.to_owned()));
+        }
+        result.push(Ax25Address::new(callsign, ssid));
+    }
+    Ok(result)
+}
+
 /// Format latitude as APRS uncompressed `DDMM.HHN` (8 bytes).
 fn format_aprs_latitude(lat: f64) -> String {
     let hemisphere = if lat >= 0.0 { 'N' } else { 'S' };
@@ -1420,13 +1511,11 @@ fn format_aprs_longitude(lon: f64) -> String {
 }
 
 /// Build the default digipeater path as [`Ax25Address`] entries.
-fn default_digipeater_path() -> Vec<Ax25Address> {
+#[must_use]
+pub fn default_digipeater_path() -> Vec<Ax25Address> {
     DEFAULT_DIGIPEATERS
         .iter()
-        .map(|(call, ssid)| Ax25Address {
-            callsign: (*call).to_owned(),
-            ssid: *ssid,
-        })
+        .map(|(call, ssid)| Ax25Address::new(call, *ssid))
         .collect()
 }
 
@@ -1449,6 +1538,8 @@ fn default_digipeater_path() -> Vec<Ax25Address> {
 /// - `symbol_table`: APRS symbol table character (`/` for primary, `\\` for alternate).
 /// - `symbol_code`: APRS symbol code character (e.g., `>` for car, `-` for house).
 /// - `comment`: Free-form comment text appended after the position.
+/// - `path`: Digipeater path. Use [`default_digipeater_path`] for the
+///   standard `WIDE1-1,WIDE2-1` path, or an empty slice for direct.
 #[must_use]
 pub fn build_aprs_position_report(
     source: &Ax25Address,
@@ -1457,6 +1548,7 @@ pub fn build_aprs_position_report(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
+    path: &[Ax25Address],
 ) -> Vec<u8> {
     let lat_str = format_aprs_latitude(latitude);
     let lon_str = format_aprs_longitude(longitude);
@@ -1464,11 +1556,8 @@ pub fn build_aprs_position_report(
 
     let packet = Ax25Packet {
         source: source.clone(),
-        destination: Ax25Address {
-            callsign: APRS_TOCALL.to_owned(),
-            ssid: 0,
-        },
-        digipeaters: default_digipeater_path(),
+        destination: Ax25Address::new(APRS_TOCALL, 0),
+        digipeaters: path.to_vec(),
         control: 0x03,
         protocol: 0xF0,
         info: info.into_bytes(),
@@ -1497,12 +1586,14 @@ pub fn build_aprs_position_report(
 /// - `addressee`: Destination station callsign (up to 9 chars).
 /// - `text`: Message text content.
 /// - `message_id`: Optional message sequence number for ack/rej tracking.
+/// - `path`: Digipeater path.
 #[must_use]
 pub fn build_aprs_message(
     source: &Ax25Address,
     addressee: &str,
     text: &str,
     message_id: Option<&str>,
+    path: &[Ax25Address],
 ) -> Vec<u8> {
     // Pad addressee to exactly 9 characters.
     let padded_addressee = format!("{addressee:<9}");
@@ -1516,11 +1607,8 @@ pub fn build_aprs_message(
 
     let packet = Ax25Packet {
         source: source.clone(),
-        destination: Ax25Address {
-            callsign: APRS_TOCALL.to_owned(),
-            ssid: 0,
-        },
-        digipeaters: default_digipeater_path(),
+        destination: Ax25Address::new(APRS_TOCALL, 0),
+        digipeaters: path.to_vec(),
         control: 0x03,
         protocol: 0xF0,
         info: info.into_bytes(),
@@ -1554,6 +1642,7 @@ pub fn build_aprs_message(
 /// - `symbol_table`: APRS symbol table character.
 /// - `symbol_code`: APRS symbol code character.
 /// - `comment`: Free-form comment text.
+/// - `path`: Digipeater path.
 #[must_use]
 pub fn build_aprs_object(
     source: &Ax25Address,
@@ -1564,6 +1653,7 @@ pub fn build_aprs_object(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
+    path: &[Ax25Address],
 ) -> Vec<u8> {
     // Pad object name to exactly 9 characters.
     let padded_name = format!("{name:<9}");
@@ -1582,11 +1672,8 @@ pub fn build_aprs_object(
 
     let packet = Ax25Packet {
         source: source.clone(),
-        destination: Ax25Address {
-            callsign: APRS_TOCALL.to_owned(),
-            ssid: 0,
-        },
-        digipeaters: default_digipeater_path(),
+        destination: Ax25Address::new(APRS_TOCALL, 0),
+        digipeaters: path.to_vec(),
         control: 0x03,
         protocol: 0xF0,
         info: info.into_bytes(),
@@ -1620,6 +1707,7 @@ pub fn build_aprs_object(
 /// - `symbol_table`: APRS symbol table character.
 /// - `symbol_code`: APRS symbol code character.
 /// - `comment`: Free-form comment text.
+/// - `path`: Digipeater path.
 #[must_use]
 pub fn build_aprs_item(
     source: &Ax25Address,
@@ -1630,6 +1718,7 @@ pub fn build_aprs_item(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
+    path: &[Ax25Address],
 ) -> Vec<u8> {
     let live_char = if live { '!' } else { '_' };
     let lat_str = format_aprs_latitude(lat);
@@ -1639,11 +1728,8 @@ pub fn build_aprs_item(
 
     let packet = Ax25Packet {
         source: source.clone(),
-        destination: Ax25Address {
-            callsign: APRS_TOCALL.to_owned(),
-            ssid: 0,
-        },
-        digipeaters: default_digipeater_path(),
+        destination: Ax25Address::new(APRS_TOCALL, 0),
+        digipeaters: path.to_vec(),
         control: 0x03,
         protocol: 0xF0,
         info: info.into_bytes(),
@@ -1671,8 +1757,13 @@ pub fn build_aprs_item(
 ///
 /// - `source`: The sender's callsign and SSID.
 /// - `weather`: Weather data to encode. Missing fields are omitted.
+/// - `path`: Digipeater path.
 #[must_use]
-pub fn build_aprs_weather(source: &Ax25Address, weather: &AprsWeather) -> Vec<u8> {
+pub fn build_aprs_weather(
+    source: &Ax25Address,
+    weather: &AprsWeather,
+    path: &[Ax25Address],
+) -> Vec<u8> {
     use std::fmt::Write as _;
 
     let mut info = String::from("_00000000");
@@ -1709,11 +1800,8 @@ pub fn build_aprs_weather(source: &Ax25Address, weather: &AprsWeather) -> Vec<u8
 
     let packet = Ax25Packet {
         source: source.clone(),
-        destination: Ax25Address {
-            callsign: APRS_TOCALL.to_owned(),
-            ssid: 0,
-        },
-        digipeaters: default_digipeater_path(),
+        destination: Ax25Address::new(APRS_TOCALL, 0),
+        digipeaters: path.to_vec(),
         control: 0x03,
         protocol: 0xF0,
         info: info.into_bytes(),
@@ -1769,6 +1857,7 @@ fn encode_base91_4(mut value: u32) -> [u8; 4] {
 /// - `symbol_table`: APRS symbol table character (`/` for primary, `\\` for alternate).
 /// - `symbol_code`: APRS symbol code character (e.g., `>` for car, `-` for house).
 /// - `comment`: Free-form comment text appended after the compressed position.
+/// - `path`: Digipeater path.
 #[must_use]
 #[allow(
     clippy::cast_possible_truncation,
@@ -1782,6 +1871,7 @@ pub fn build_aprs_position_compressed(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
+    path: &[Ax25Address],
 ) -> Vec<u8> {
     // APRS101 Chapter 9: compressed position encoding.
     // lat = 380926 * (90 - latitude)
@@ -1808,11 +1898,8 @@ pub fn build_aprs_position_compressed(
 
     let packet = Ax25Packet {
         source: source.clone(),
-        destination: Ax25Address {
-            callsign: APRS_TOCALL.to_owned(),
-            ssid: 0,
-        },
-        digipeaters: default_digipeater_path(),
+        destination: Ax25Address::new(APRS_TOCALL, 0),
+        digipeaters: path.to_vec(),
         control: 0x03,
         protocol: 0xF0,
         info,
@@ -1841,8 +1928,9 @@ pub fn build_aprs_position_compressed(
 ///
 /// - `source`: The sender's callsign and SSID.
 /// - `text`: Status text content.
+/// - `path`: Digipeater path.
 #[must_use]
-pub fn build_aprs_status(source: &Ax25Address, text: &str) -> Vec<u8> {
+pub fn build_aprs_status(source: &Ax25Address, text: &str, path: &[Ax25Address]) -> Vec<u8> {
     let mut info = Vec::with_capacity(1 + text.len() + 1);
     info.push(b'>');
     info.extend_from_slice(text.as_bytes());
@@ -1850,11 +1938,8 @@ pub fn build_aprs_status(source: &Ax25Address, text: &str) -> Vec<u8> {
 
     let packet = Ax25Packet {
         source: source.clone(),
-        destination: Ax25Address {
-            callsign: APRS_TOCALL.to_owned(),
-            ssid: 0,
-        },
-        digipeaters: default_digipeater_path(),
+        destination: Ax25Address::new(APRS_TOCALL, 0),
+        digipeaters: path.to_vec(),
         control: 0x03,
         protocol: 0xF0,
         info,
@@ -2087,6 +2172,7 @@ pub fn build_aprs_mice(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
+    path: &[Ax25Address],
 ) -> Vec<u8> {
     let north = latitude >= 0.0;
     let west = longitude < 0.0;
@@ -2247,11 +2333,8 @@ pub fn build_aprs_mice(
 
     let packet = Ax25Packet {
         source: source.clone(),
-        destination: Ax25Address {
-            callsign: dest_callsign,
-            ssid: 0,
-        },
-        digipeaters: default_digipeater_path(),
+        destination: Ax25Address::new(&dest_callsign, 0),
+        digipeaters: path.to_vec(),
         control: 0x03,
         protocol: 0xF0,
         info,
@@ -2522,24 +2605,9 @@ mod tests {
     #[test]
     fn ax25_roundtrip() {
         let original = Ax25Packet {
-            source: Ax25Address {
-                callsign: "N0CALL".to_owned(),
-                ssid: 7,
-            },
-            destination: Ax25Address {
-                callsign: "APRS".to_owned(),
-                ssid: 0,
-            },
-            digipeaters: vec![
-                Ax25Address {
-                    callsign: "WIDE1".to_owned(),
-                    ssid: 1,
-                },
-                Ax25Address {
-                    callsign: "WIDE2".to_owned(),
-                    ssid: 1,
-                },
-            ],
+            source: Ax25Address::new("N0CALL", 7),
+            destination: Ax25Address::new("APRS", 0),
+            digipeaters: vec![Ax25Address::new("WIDE1", 1), Ax25Address::new("WIDE2", 1)],
             control: 0x03,
             protocol: 0xF0,
             info: b"!4903.50N/07201.75W-Test 73".to_vec(),
@@ -2569,17 +2637,26 @@ mod tests {
 
     #[test]
     fn ax25_address_display() {
-        let addr = Ax25Address {
-            callsign: "N0CALL".to_owned(),
-            ssid: 0,
-        };
+        let addr = Ax25Address::new("N0CALL", 0);
         assert_eq!(format!("{addr}"), "N0CALL");
 
-        let addr_ssid = Ax25Address {
-            callsign: "N0CALL".to_owned(),
-            ssid: 7,
-        };
+        let addr_ssid = Ax25Address::new("N0CALL", 7);
         assert_eq!(format!("{addr_ssid}"), "N0CALL-7");
+
+        // H-bit (repeated) shows asterisk.
+        let addr_repeated = Ax25Address {
+            callsign: "WIDE1".to_owned(),
+            ssid: 1,
+            repeated: true,
+        };
+        assert_eq!(format!("{addr_repeated}"), "WIDE1-1*");
+
+        let addr_repeated_no_ssid = Ax25Address {
+            callsign: "MYDIGI".to_owned(),
+            ssid: 0,
+            repeated: true,
+        };
+        assert_eq!(format!("{addr_repeated_no_ssid}"), "MYDIGI*");
     }
 
     // ---- APRS position tests ----
@@ -3167,10 +3244,7 @@ mod tests {
     // ---- APRS TX builder tests ----
 
     fn test_source() -> Ax25Address {
-        Ax25Address {
-            callsign: "N0CALL".to_owned(),
-            ssid: 7,
-        }
+        Ax25Address::new("N0CALL", 7)
     }
 
     #[test]
@@ -3207,7 +3281,15 @@ mod tests {
     #[test]
     fn build_position_report_roundtrip() {
         let source = test_source();
-        let wire = build_aprs_position_report(&source, 49.058_333, -72.029_166, '/', '-', "Test");
+        let wire = build_aprs_position_report(
+            &source,
+            49.058_333,
+            -72.029_166,
+            '/',
+            '-',
+            "Test",
+            &default_digipeater_path(),
+        );
 
         // Decode the KISS frame.
         let kiss = decode_kiss_frame(&wire).unwrap();
@@ -3239,7 +3321,13 @@ mod tests {
     #[test]
     fn build_message_roundtrip() {
         let source = test_source();
-        let wire = build_aprs_message(&source, "KQ4NIT", "Hello 73!", Some("42"));
+        let wire = build_aprs_message(
+            &source,
+            "KQ4NIT",
+            "Hello 73!",
+            Some("42"),
+            &default_digipeater_path(),
+        );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
@@ -3254,7 +3342,13 @@ mod tests {
     #[test]
     fn build_message_no_id() {
         let source = test_source();
-        let wire = build_aprs_message(&source, "W1AW", "Test msg", None);
+        let wire = build_aprs_message(
+            &source,
+            "W1AW",
+            "Test msg",
+            None,
+            &default_digipeater_path(),
+        );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
@@ -3267,7 +3361,7 @@ mod tests {
     #[test]
     fn build_message_pads_short_addressee() {
         let source = test_source();
-        let wire = build_aprs_message(&source, "AB", "Hi", None);
+        let wire = build_aprs_message(&source, "AB", "Hi", None, &default_digipeater_path());
 
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
@@ -3289,6 +3383,7 @@ mod tests {
             '/',
             '-',
             "Wrn",
+            &default_digipeater_path(),
         );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
@@ -3308,7 +3403,17 @@ mod tests {
     #[test]
     fn build_object_killed() {
         let source = test_source();
-        let wire = build_aprs_object(&source, "EVENT", false, 35.0, -97.0, '/', 'E', "Done");
+        let wire = build_aprs_object(
+            &source,
+            "EVENT",
+            false,
+            35.0,
+            -97.0,
+            '/',
+            'E',
+            "Done",
+            &default_digipeater_path(),
+        );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
@@ -3331,6 +3436,7 @@ mod tests {
             '/',
             '-',
             "Test item",
+            &default_digipeater_path(),
         );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
@@ -3350,7 +3456,17 @@ mod tests {
     #[test]
     fn build_item_killed() {
         let source = test_source();
-        let wire = build_aprs_item(&source, "GONE", false, 35.0, -97.0, '/', 'E', "Removed");
+        let wire = build_aprs_item(
+            &source,
+            "GONE",
+            false,
+            35.0,
+            -97.0,
+            '/',
+            'E',
+            "Removed",
+            &default_digipeater_path(),
+        );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
@@ -3376,7 +3492,7 @@ mod tests {
             pressure: Some(10132),
         };
 
-        let wire = build_aprs_weather(&source, &wx);
+        let wire = build_aprs_weather(&source, &wx, &default_digipeater_path());
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
         assert_eq!(packet.destination.callsign, "APK005");
@@ -3409,7 +3525,7 @@ mod tests {
             pressure: Some(10200),
         };
 
-        let wire = build_aprs_weather(&source, &wx);
+        let wire = build_aprs_weather(&source, &wx, &default_digipeater_path());
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
 
@@ -3435,7 +3551,7 @@ mod tests {
             pressure: None,
         };
 
-        let wire = build_aprs_weather(&source, &wx);
+        let wire = build_aprs_weather(&source, &wx, &default_digipeater_path());
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
 
@@ -3449,7 +3565,15 @@ mod tests {
     #[test]
     fn build_compressed_position_round_trip() {
         let source = test_source();
-        let wire = build_aprs_position_compressed(&source, 35.3, -84.233, '/', '>', "test");
+        let wire = build_aprs_position_compressed(
+            &source,
+            35.3,
+            -84.233,
+            '/',
+            '>',
+            "test",
+            &default_digipeater_path(),
+        );
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
         assert_eq!(packet.destination.callsign, "APK005");
@@ -3477,7 +3601,15 @@ mod tests {
     #[test]
     fn build_compressed_position_equator_prime_meridian() {
         let source = test_source();
-        let wire = build_aprs_position_compressed(&source, 0.0, 0.0, '/', '-', "");
+        let wire = build_aprs_position_compressed(
+            &source,
+            0.0,
+            0.0,
+            '/',
+            '-',
+            "",
+            &default_digipeater_path(),
+        );
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
 
@@ -3493,7 +3625,15 @@ mod tests {
     #[test]
     fn build_compressed_position_southern_hemisphere() {
         let source = test_source();
-        let wire = build_aprs_position_compressed(&source, -33.86, 151.21, '/', '>', "sydney");
+        let wire = build_aprs_position_compressed(
+            &source,
+            -33.86,
+            151.21,
+            '/',
+            '>',
+            "sydney",
+            &default_digipeater_path(),
+        );
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
 
@@ -3526,7 +3666,7 @@ mod tests {
     #[test]
     fn build_status_round_trip() {
         let source = test_source();
-        let wire = build_aprs_status(&source, "On the air in FM18");
+        let wire = build_aprs_status(&source, "On the air in FM18", &default_digipeater_path());
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
         assert_eq!(packet.destination.callsign, "APK005");
@@ -3542,7 +3682,7 @@ mod tests {
     #[test]
     fn build_status_empty_text() {
         let source = test_source();
-        let wire = build_aprs_status(&source, "");
+        let wire = build_aprs_status(&source, "", &default_digipeater_path());
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
 
@@ -3557,7 +3697,7 @@ mod tests {
     #[test]
     fn build_status_info_field_format() {
         let source = test_source();
-        let wire = build_aprs_status(&source, "Hello");
+        let wire = build_aprs_status(&source, "Hello", &default_digipeater_path());
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
 
@@ -3688,7 +3828,17 @@ mod tests {
     fn build_mice_roundtrip_oklahoma() {
         // 35.258 N, 97.755 W — matches the existing parse_mice test case.
         let source = test_source();
-        let wire = build_aprs_mice(&source, 35.258, -97.755, 121, 212, '/', '>', "test");
+        let wire = build_aprs_mice(
+            &source,
+            35.258,
+            -97.755,
+            121,
+            212,
+            '/',
+            '>',
+            "test",
+            &default_digipeater_path(),
+        );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
@@ -3710,7 +3860,17 @@ mod tests {
     fn build_mice_roundtrip_north_east() {
         // 51.5 N, 0.1 W (London area)
         let source = test_source();
-        let wire = build_aprs_mice(&source, 51.5, -0.1, 0, 0, '/', '-', "");
+        let wire = build_aprs_mice(
+            &source,
+            51.5,
+            -0.1,
+            0,
+            0,
+            '/',
+            '-',
+            "",
+            &default_digipeater_path(),
+        );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
@@ -3727,7 +3887,17 @@ mod tests {
     fn build_mice_roundtrip_southern_hemisphere() {
         // -33.86 S, 151.21 E (Sydney)
         let source = test_source();
-        let wire = build_aprs_mice(&source, -33.86, 151.21, 50, 180, '/', '>', "sydney");
+        let wire = build_aprs_mice(
+            &source,
+            -33.86,
+            151.21,
+            50,
+            180,
+            '/',
+            '>',
+            "sydney",
+            &default_digipeater_path(),
+        );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
@@ -3747,7 +3917,17 @@ mod tests {
     #[test]
     fn build_mice_speed_course_roundtrip() {
         let source = test_source();
-        let wire = build_aprs_mice(&source, 35.0, -97.0, 55, 270, '/', '>', "");
+        let wire = build_aprs_mice(
+            &source,
+            35.0,
+            -97.0,
+            55,
+            270,
+            '/',
+            '>',
+            "",
+            &default_digipeater_path(),
+        );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
@@ -3759,7 +3939,17 @@ mod tests {
     #[test]
     fn build_mice_zero_speed_course() {
         let source = test_source();
-        let wire = build_aprs_mice(&source, 40.0, -74.0, 0, 0, '/', '>', "");
+        let wire = build_aprs_mice(
+            &source,
+            40.0,
+            -74.0,
+            0,
+            0,
+            '/',
+            '>',
+            "",
+            &default_digipeater_path(),
+        );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
@@ -3773,7 +3963,17 @@ mod tests {
     fn build_mice_high_longitude() {
         // 35.0 N, 140.0 E (Tokyo area)
         let source = test_source();
-        let wire = build_aprs_mice(&source, 35.0, 140.0, 10, 90, '/', '>', "");
+        let wire = build_aprs_mice(
+            &source,
+            35.0,
+            140.0,
+            10,
+            90,
+            '/',
+            '>',
+            "",
+            &default_digipeater_path(),
+        );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
@@ -3790,7 +3990,17 @@ mod tests {
     fn build_mice_lon_100_109() {
         // 35.0 N, 105.5 W (New Mexico)
         let source = test_source();
-        let wire = build_aprs_mice(&source, 35.0, -105.5, 0, 0, '/', '>', "");
+        let wire = build_aprs_mice(
+            &source,
+            35.0,
+            -105.5,
+            0,
+            0,
+            '/',
+            '>',
+            "",
+            &default_digipeater_path(),
+        );
 
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
@@ -3924,7 +4134,15 @@ mod tests {
     #[test]
     fn build_query_response_roundtrip() {
         let source = test_source();
-        let wire = build_query_response_position(&source, 35.258, -97.755, '/', '>', "QRY resp");
+        let wire = build_query_response_position(
+            &source,
+            35.258,
+            -97.755,
+            '/',
+            '>',
+            "QRY resp",
+            &default_digipeater_path(),
+        );
         let kiss = decode_kiss_frame(&wire).unwrap();
         let packet = parse_ax25(&kiss.data).unwrap();
         let data = parse_aprs_data(&packet.info).unwrap();

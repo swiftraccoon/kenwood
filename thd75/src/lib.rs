@@ -96,6 +96,7 @@ pub use kiss::aprs_client::{AprsClient, AprsClientConfig, AprsEvent};
 pub use kiss::aprs_is::{
     AprsIsConfig, aprs_is_passcode, build_login_string, format_is_packet, parse_is_line,
 };
+pub use kiss::aprs_is_client::{AprsIsClient, AprsIsError, AprsIsEvent};
 pub use kiss::aprs_messaging::AprsMessenger;
 pub use kiss::digipeater::{DigiAction, DigipeaterConfig};
 pub use kiss::smart_beaconing::{SmartBeaconing, SmartBeaconingConfig};

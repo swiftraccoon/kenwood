@@ -129,11 +129,13 @@ fn apply_uiflood(packet: &Ax25Packet, idx: usize) -> DigiAction {
         modified.digipeaters[idx] = mark_used(&Ax25Address {
             callsign: digi.callsign.clone(),
             ssid: 0,
+            repeated: false,
         });
     } else {
         modified.digipeaters[idx] = Ax25Address {
             callsign: digi.callsign.clone(),
             ssid: new_ssid,
+            repeated: false,
         };
     }
     DigiAction::Relay {
@@ -162,11 +164,13 @@ fn apply_uitrace(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> Dig
         modified.digipeaters[trace_idx] = mark_used(&Ax25Address {
             callsign: digi.callsign.clone(),
             ssid: 0,
+            repeated: false,
         });
     } else {
         modified.digipeaters[trace_idx] = Ax25Address {
             callsign: digi.callsign.clone(),
             ssid: new_ssid,
+            repeated: false,
         };
     }
 
@@ -180,25 +184,16 @@ fn apply_uitrace(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> Dig
 // ---------------------------------------------------------------------------
 
 /// Check if a digipeater entry has been used (has-been-repeated).
-///
-/// A callsign ending with `*` indicates the H-bit is set (the entry
-/// has been consumed by a prior digipeater).
-fn is_used_digi(addr: &Ax25Address) -> bool {
-    addr.callsign.ends_with('*')
+const fn is_used_digi(addr: &Ax25Address) -> bool {
+    addr.repeated
 }
 
-/// Create a copy of an address marked as "used" (H-bit set).
-///
-/// Appends `*` to the callsign if not already present.
+/// Create a copy of an address with the H-bit (has-been-repeated) set.
 fn mark_used(addr: &Ax25Address) -> Ax25Address {
-    let callsign = if addr.callsign.ends_with('*') {
-        addr.callsign.clone()
-    } else {
-        format!("{}*", addr.callsign)
-    };
     Ax25Address {
-        callsign,
+        callsign: addr.callsign.clone(),
         ssid: addr.ssid,
+        repeated: true,
     }
 }
 
@@ -211,9 +206,14 @@ mod tests {
     use super::*;
 
     fn make_addr(call: &str, ssid: u8) -> Ax25Address {
+        // If call ends with '*', strip it and set repeated=true.
+        let (callsign, repeated) = call
+            .strip_suffix('*')
+            .map_or_else(|| (call.to_owned(), false), |s| (s.to_owned(), true));
         Ax25Address {
-            callsign: call.to_owned(),
+            callsign,
             ssid,
+            repeated,
         }
     }
 
@@ -246,7 +246,8 @@ mod tests {
 
         match config.process(&packet) {
             DigiAction::Relay { modified_packet } => {
-                assert_eq!(modified_packet.digipeaters[0].callsign, "MYDIGI*");
+                assert_eq!(modified_packet.digipeaters[0].callsign, "MYDIGI");
+                assert!(modified_packet.digipeaters[0].repeated);
                 assert_eq!(modified_packet.digipeaters[0].ssid, 0);
                 // Second entry unchanged.
                 assert_eq!(modified_packet.digipeaters[1].callsign, "WIDE2");
@@ -264,9 +265,11 @@ mod tests {
         match config.process(&packet) {
             DigiAction::Relay { modified_packet } => {
                 // First entry untouched (already used).
-                assert_eq!(modified_packet.digipeaters[0].callsign, "N1ABC*");
+                assert_eq!(modified_packet.digipeaters[0].callsign, "N1ABC");
+                assert!(modified_packet.digipeaters[0].repeated);
                 // Second entry replaced.
-                assert_eq!(modified_packet.digipeaters[1].callsign, "MYDIGI*");
+                assert_eq!(modified_packet.digipeaters[1].callsign, "MYDIGI");
+                assert!(modified_packet.digipeaters[1].repeated);
             }
             DigiAction::Drop => panic!("expected Relay"),
         }
@@ -311,7 +314,8 @@ mod tests {
 
         match config.process(&packet) {
             DigiAction::Relay { modified_packet } => {
-                assert_eq!(modified_packet.digipeaters[0].callsign, "CA*");
+                assert_eq!(modified_packet.digipeaters[0].callsign, "CA");
+                assert!(modified_packet.digipeaters[0].repeated);
                 assert_eq!(modified_packet.digipeaters[0].ssid, 0);
             }
             DigiAction::Drop => panic!("expected Relay"),
@@ -337,7 +341,8 @@ mod tests {
             DigiAction::Relay { modified_packet } => {
                 assert_eq!(modified_packet.digipeaters.len(), 2);
                 // Our callsign inserted first, marked used.
-                assert_eq!(modified_packet.digipeaters[0].callsign, "MYDIGI*");
+                assert_eq!(modified_packet.digipeaters[0].callsign, "MYDIGI");
+                assert!(modified_packet.digipeaters[0].repeated);
                 assert_eq!(modified_packet.digipeaters[0].ssid, 0);
                 // Original entry with decremented hop.
                 assert_eq!(modified_packet.digipeaters[1].callsign, "WIDE");
@@ -355,8 +360,10 @@ mod tests {
         match config.process(&packet) {
             DigiAction::Relay { modified_packet } => {
                 assert_eq!(modified_packet.digipeaters.len(), 2);
-                assert_eq!(modified_packet.digipeaters[0].callsign, "MYDIGI*");
-                assert_eq!(modified_packet.digipeaters[1].callsign, "WIDE*");
+                assert_eq!(modified_packet.digipeaters[0].callsign, "MYDIGI");
+                assert!(modified_packet.digipeaters[0].repeated);
+                assert_eq!(modified_packet.digipeaters[1].callsign, "WIDE");
+                assert!(modified_packet.digipeaters[1].repeated);
                 assert_eq!(modified_packet.digipeaters[1].ssid, 0);
             }
             DigiAction::Drop => panic!("expected Relay"),

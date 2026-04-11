@@ -112,7 +112,10 @@ const VOICE_FRAME_INTERVAL: Duration = Duration::from_millis(20);
 /// Number of frames to burst-send on initial TX (prebuffer).
 ///
 /// Allows the radio's MMDVM buffer to fill before audio starts playing,
-/// preventing initial audio gaps.
+/// preventing initial audio gaps. Only used by [`DStarGateway::send_voice`];
+/// the REPL path uses [`DStarGateway::send_voice_unpaced`] which
+/// bypasses this constant entirely (see that function's docs for
+/// the rationale).
 const TX_PREBUFFER_FRAMES: usize = 5;
 
 // ---------------------------------------------------------------------------
@@ -555,8 +558,14 @@ impl<T: Transport> DStarGateway<T> {
                 let mut slow = [0u8; 3];
                 slow.copy_from_slice(&data[9..12]);
 
-                // Feed the slow data decoder.
-                self.slow_data.add_frame(&slow, self.slow_data_frame_index);
+                // Feed the slow data decoder. The MMDVM modem strips the
+                // per-superframe sync frames itself, so every DStarData
+                // delivery is a real data frame; pass a non-zero index so
+                // the decoder's `% 21 == 0` sync-skip path doesn't fire.
+                // Wrap the local counter in `1..=20` to stay inside the
+                // D-STAR data-frame range.
+                let idx = (self.slow_data_frame_index % 20) + 1;
+                self.slow_data.add_frame(&slow, idx);
                 self.slow_data_frame_index = self.slow_data_frame_index.wrapping_add(1);
 
                 let frame = DStarVoiceFrame {
@@ -587,12 +596,14 @@ impl<T: Transport> DStarGateway<T> {
                 self.rx_active = false;
                 self.rx_header = None;
 
-                // Prioritize text message, then GPS data, then VoiceEnd.
+                // Queue text/GPS for delivery on the next poll —
+                // VoiceEnd must always be emitted so callers can
+                // detect the end of the stream reliably.
                 if let Some(text) = text_event {
-                    return Ok(Some(DStarEvent::TextMessage(text)));
+                    self.pending_events.push_back(DStarEvent::TextMessage(text));
                 }
                 if let Some(gps) = gps_event {
-                    return Ok(Some(DStarEvent::GpsData(gps)));
+                    self.pending_events.push_back(DStarEvent::GpsData(gps));
                 }
 
                 Ok(Some(DStarEvent::VoiceEnd))
@@ -844,13 +855,15 @@ impl<T: Transport> DStarGateway<T> {
     }
 
     /// Take the decoded text message from the slow data decoder, if
-    /// complete.
-    fn take_text_message(&self) -> Option<String> {
-        if self.slow_data.has_message() {
-            self.slow_data.message().map(str::to_owned)
-        } else {
-            None
-        }
+    /// complete. Consumes the message and rearms the decoder so the next
+    /// four blocks in the same stream can be reassembled independently.
+    fn take_text_message(&mut self) -> Option<String> {
+        let bytes = self.slow_data.take_message()?;
+        // Decoder already masks each character with `& 0x7F`, so the
+        // bytes are guaranteed ASCII and `from_utf8` is infallible here,
+        // but prefer the lossy path to stay robust if that contract ever
+        // changes.
+        Some(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// Take the decoded GPS data from the slow data decoder, if present.
@@ -1278,10 +1291,11 @@ mod tests {
         gw.session.transport.queue_read(&header_frame);
         let _ = gw.next_event().await.unwrap();
 
-        // Encode a text message as slow data.
+        // Encode a text message as slow data. A complete message is always
+        // 4 blocks × 2 halves = 8 payloads (space-padded).
         let slow_enc = SlowDataEncoder::new();
         let payloads = slow_enc.encode_message("Hi!");
-        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads.len(), 8);
 
         // Feed voice frames with the slow data.
         for payload in &payloads {
@@ -1294,15 +1308,24 @@ mod tests {
             let _ = gw.next_event().await.unwrap();
         }
 
-        // Now send EOT --- should emit TextMessage instead of VoiceEnd
-        // because a complete message was decoded.
+        // Now send EOT --- should emit VoiceEnd first, then
+        // TextMessage on the next poll (queued in pending_events).
         let eot_frame = vec![START_BYTE, 3, CMD_DSTAR_EOT];
         gw.session.transport.queue_read(&eot_frame);
 
         let event = gw.next_event().await.unwrap().unwrap();
+        assert!(
+            matches!(event, DStarEvent::VoiceEnd),
+            "expected VoiceEnd, got {event:?}"
+        );
+
+        // TextMessage is delivered on the next poll. The raw 20-byte
+        // buffer is space-padded; the REPL trims before display.
+        let event = gw.next_event().await.unwrap().unwrap();
         match event {
             DStarEvent::TextMessage(text) => {
-                assert_eq!(text, "Hi!");
+                assert_eq!(text.trim_end(), "Hi!");
+                assert_eq!(text.len(), 20);
             }
             other => panic!("expected TextMessage, got {other:?}"),
         }
@@ -1315,8 +1338,9 @@ mod tests {
     #[test]
     fn encode_text_message_produces_blocks() {
         let payloads = DStarGateway::<MockTransport>::encode_text_message("Hello");
-        // "Hello" = 5 chars => 1 block => 2 halves.
-        assert_eq!(payloads.len(), 2);
+        // Slow data text messages are always the full 4 blocks × 2 halves
+        // = 8 payloads per the D-STAR spec; short text is space-padded.
+        assert_eq!(payloads.len(), 8);
     }
 
     #[test]
@@ -1328,8 +1352,8 @@ mod tests {
     #[test]
     fn encode_text_message_multi_block() {
         let payloads = DStarGateway::<MockTransport>::encode_text_message("Hello World");
-        // 11 chars => 3 blocks (5+5+1) => 6 halves.
-        assert_eq!(payloads.len(), 6);
+        // Any non-empty text encodes to 4 blocks × 2 halves = 8 payloads.
+        assert_eq!(payloads.len(), 8);
     }
 
     // -------------------------------------------------------------------

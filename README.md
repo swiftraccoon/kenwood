@@ -25,6 +25,15 @@ Rust libraries, TUI, and accessible REPL for Kenwood amateur radio transceivers.
 | TH-D75 | `thd75/` | `thd75-tui/` | `thd75-repl/` | In development |
 | TM-D750 | Planned | Planned | Planned | Not started |
 
+## Crates
+
+This is a Cargo workspace with four crates:
+
+- **`thd75/`** — core TH-D75 library (async Rust, CAT/MCP/SD card, full hardware control)
+- **`thd75-tui/`** — terminal UI frontend built on the core library
+- **`thd75-repl/`** — accessible REPL for blind operators (screen-reader-friendly, D-STAR gateway, APRS-IS)
+- **`dstar-gateway/`** — standalone D-STAR reflector client (DExtra/DPlus/DCS), usable independently of the TH-D75
+
 ## Accessible REPL
 
 `thd75-repl` is a screen-reader-friendly command-line interface for blind and visually impaired operators. It follows WCAG 2.1 accessibility guidelines and the CHI 2021 CLI accessibility study recommendations:

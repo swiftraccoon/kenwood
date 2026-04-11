@@ -2998,6 +2998,9 @@ impl App {
             AprsEvent::PacketDigipeated { source } => {
                 self.status_message = Some(format!("Digipeated packet from {source}"));
             }
+            AprsEvent::QueryResponded { to } => {
+                self.status_message = Some(format!("Responded to query from {to}"));
+            }
             AprsEvent::RawPacket(_) => {
                 // Silently ignore raw packets for now.
             }
@@ -3261,7 +3264,7 @@ impl App {
                     ("N0CALL".to_string(), 7)
                 };
 
-                let config = kenwood_thd75::AprsClientConfig::new(&callsign, ssid);
+                let config = Box::new(kenwood_thd75::AprsClientConfig::new(&callsign, ssid));
                 if let Some(ref tx) = self.cmd_tx {
                     let _ = tx.send(crate::event::RadioCommand::EnterAprs { config });
                     self.status_message = Some("Entering APRS mode...".into());

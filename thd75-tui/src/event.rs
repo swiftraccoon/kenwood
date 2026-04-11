@@ -123,7 +123,10 @@ pub(crate) enum RadioCommand {
     /// processing APRS packets instead of CAT polling.
     EnterAprs {
         /// APRS client configuration (callsign, SSID, etc.).
-        config: kenwood_thd75::AprsClientConfig,
+        ///
+        /// Boxed because `AprsClientConfig` contains vector and option
+        /// fields that make it significantly larger than other variants.
+        config: Box<kenwood_thd75::AprsClientConfig>,
     },
     /// Exit APRS/KISS mode. Returns to CAT polling.
     ExitAprs,
