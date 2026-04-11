@@ -1,0 +1,3 @@
+# CAT mode smoke test
+id
+quit

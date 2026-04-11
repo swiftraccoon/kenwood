@@ -11,6 +11,19 @@ readme = "../README.md"
 keywords = ["ham-radio", "kenwood", "accessibility", "amateur-radio"]
 categories = ["command-line-utilities"]
 
+[lib]
+name = "thd75_repl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "thd75-repl"
+path = "src/main.rs"
+
+[features]
+# Compiles in extra CLI flags (currently `--mock-radio <scenario>`)
+# used only by integration tests. Not enabled in release builds.
+testing = []
+
 [dependencies]
 kenwood-thd75 = { path = "../thd75", version = "0.1.0" }
 dstar-gateway = { path = "../dstar-gateway", version = "0.1.0" }
@@ -44,3 +57,6 @@ multiple_crate_versions = "allow"
 # In a binary crate with private modules, pub(crate) satisfies unreachable_pub
 # but clippy::redundant_pub_crate considers it redundant — allow to resolve conflict.
 redundant_pub_crate = "allow"
+
+[dev-dependencies]
+proptest = "1"

@@ -80,7 +80,7 @@ pub struct AprsConfig {
     /// Beacon transmission control settings.
     pub beacon_control: BeaconControl,
     /// `SmartBeaconing` configuration (speed-adaptive beaconing).
-    pub smart_beaconing: SmartBeaconingConfig,
+    pub smart_beaconing: McpSmartBeaconingConfig,
     /// APRS lock (prevent accidental APRS setting changes).
     pub aprs_lock: bool,
     /// Position ambiguity level (0 = full precision, 1-4 = progressively
@@ -133,7 +133,7 @@ impl Default for AprsConfig {
             dcd_sense: DcdSense::Both,
             tx_delay: TxDelay::default(),
             beacon_control: BeaconControl::default(),
-            smart_beaconing: SmartBeaconingConfig::default(),
+            smart_beaconing: McpSmartBeaconingConfig::default(),
             aprs_lock: false,
             position_ambiguity: PositionAmbiguity::Full,
             waypoint: WaypointConfig::default(),
@@ -391,7 +391,7 @@ pub enum BeaconMethod {
 /// Settings correspond to the 7 parameters under the
 /// APRS > `SmartBeaconing` menu on the TH-D75.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SmartBeaconingConfig {
+pub struct McpSmartBeaconingConfig {
     /// Low speed threshold in mph (range 1-30). Below this speed,
     /// beacons are sent at `slow_rate`.
     pub low_speed: u8,
@@ -411,7 +411,7 @@ pub struct SmartBeaconingConfig {
     pub turn_time: u8,
 }
 
-impl Default for SmartBeaconingConfig {
+impl Default for McpSmartBeaconingConfig {
     fn default() -> Self {
         Self {
             low_speed: 5,
@@ -1236,7 +1236,7 @@ mod tests {
 
     #[test]
     fn smart_beaconing_defaults() {
-        let sb = SmartBeaconingConfig::default();
+        let sb = McpSmartBeaconingConfig::default();
         assert_eq!(sb.low_speed, 5);
         assert_eq!(sb.high_speed, 60);
         assert_eq!(sb.fast_rate, 60);

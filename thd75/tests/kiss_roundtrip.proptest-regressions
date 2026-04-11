@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8870c5ac7af17a3c68b985e600083d2ae7ef5b6cb20e81c4b48a8b853c9dd3f7 # shrinks to source = Ax25Address { callsign: Callsign("A"), ssid: Ssid(0), repeated: false }, text = " A"

@@ -12,6 +12,7 @@
 //! Broadcasting, SD Card, and Configuration.
 
 pub mod aprs;
+pub mod aprs_wire;
 pub mod band;
 pub mod bluetooth;
 pub mod channel;
@@ -54,9 +55,9 @@ pub use aprs::{
     AprsBand, AprsCallsign, AprsConfig, AprsDataSpeed, AprsIcon, AprsMessage, AprsNetwork,
     AprsStation, AutoReplyConfig, AutoReplyDelay, AutoReplyType, BeaconControl, BeaconMethod,
     DcdSense, DigipeatAlias, DigipeatConfig, DisplayArea, FilterPhrase, FloodAlias, GroupCode,
-    InterruptTime, NavitraConfig, NavitraGroupMode, NavitraMessage, NotificationConfig,
-    PacketFilter, PacketFilterType, PacketPath, PositionAmbiguity, PositionComment, QsyConfig,
-    ReplyMessage, SmartBeaconingConfig, StatusText, TraceAlias, TxDelay, VoiceAlertConfig,
+    InterruptTime, McpSmartBeaconingConfig, NavitraConfig, NavitraGroupMode, NavitraMessage,
+    NotificationConfig, PacketFilter, PacketFilterType, PacketPath, PositionAmbiguity,
+    PositionComment, QsyConfig, ReplyMessage, StatusText, TraceAlias, TxDelay, VoiceAlertConfig,
     WaypointConfig, WaypointFormat,
 };
 

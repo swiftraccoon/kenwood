@@ -80,6 +80,11 @@ impl StationList {
 
         match data {
             AprsData::Position(pos) => {
+                // A weather-station position (symbol `_`) carries embedded
+                // wx data too — record both.
+                if let Some(ref wx) = pos.weather {
+                    entry.last_weather = Some(wx.clone());
+                }
                 entry.position = Some(pos.clone());
             }
             AprsData::Status(status) => {
@@ -89,9 +94,16 @@ impl StationList {
             | AprsData::Object(_)
             | AprsData::Item(_)
             | AprsData::Telemetry(_)
-            | AprsData::Query(_) => {
-                // Messages, objects, items, telemetry, and queries don't
-                // change the station's own position or status.
+            | AprsData::Query(_)
+            | AprsData::ThirdParty { .. }
+            | AprsData::Grid(_)
+            | AprsData::RawGps(_)
+            | AprsData::StationCapabilities(_)
+            | AprsData::AgreloDfJr(_)
+            | AprsData::UserDefined { .. }
+            | AprsData::InvalidOrTest(_) => {
+                // These frame types don't update the station's own
+                // position or status.
             }
             AprsData::Weather(wx) => {
                 entry.last_weather = Some(wx.clone());
@@ -194,6 +206,11 @@ mod tests {
             speed_knots: None,
             course_degrees: None,
             comment: String::new(),
+            weather: None,
+            extensions: crate::kiss::AprsDataExtension::default(),
+            mice_message: None,
+            mice_altitude_m: None,
+            ambiguity: crate::kiss::PositionAmbiguity::None,
         })
     }
 
@@ -268,6 +285,7 @@ mod tests {
             addressee: "W1AW".to_owned(),
             text: "Hello".to_owned(),
             message_id: None,
+            reply_ack: None,
         });
         sl.update("N0CALL", &msg, &[]);
 

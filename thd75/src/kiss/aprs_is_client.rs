@@ -19,7 +19,13 @@
 //!     match client.next_event().await? {
 //!         AprsIsEvent::Packet(line) => println!("Got: {line}"),
 //!         AprsIsEvent::Comment(line) => println!("Server: {line}"),
-//!         AprsIsEvent::LoggedIn => println!("Authenticated"),
+//!         AprsIsEvent::LoggedIn { server } => {
+//!             println!("Authenticated (server {server:?})");
+//!         }
+//!         AprsIsEvent::LoginRejected { reason } => {
+//!             println!("Login rejected: {reason}");
+//!             break;
+//!         }
 //!         AprsIsEvent::Disconnected => break,
 //!     }
 //! }
@@ -47,6 +53,20 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use super::aprs_is::{AprsIsConfig, build_login_string, format_is_packet, parse_is_line};
+
+/// Extract the server hostname from a `# logresp ... verified, server X`
+/// comment line. Returns `None` if the `server` clause is absent.
+fn parse_logresp_server(line: &str) -> Option<String> {
+    let idx = line.find("server ")?;
+    let rest = &line[idx + "server ".len()..];
+    // Skip any extra whitespace after "server" and take the next
+    // whitespace-delimited token.
+    let name = rest
+        .split_whitespace()
+        .next()
+        .map(|s| s.trim_matches(',').to_owned())?;
+    if name.is_empty() { None } else { Some(name) }
+}
 
 /// Default APRS-IS keepalive interval.
 ///
@@ -77,9 +97,22 @@ pub enum AprsIsEvent {
 
     /// The server accepted the login (`# logresp ... verified, server ...`).
     ///
-    /// Emitted the first time a comment line containing `logresp` and
-    /// `verified` is seen. Not emitted for rejected logins.
-    LoggedIn,
+    /// Emitted the first time a `logresp` line confirming `verified` is
+    /// seen. `server` is the upstream server's hostname extracted from
+    /// the comment, if present.
+    LoggedIn {
+        /// APRS-IS server hostname from the `logresp` line (e.g. `T2TEST`).
+        server: Option<String>,
+    },
+
+    /// The server rejected the login (`# logresp ... unverified`).
+    ///
+    /// Emitted when the passcode does not validate for the given
+    /// callsign. `reason` carries the full comment text for diagnosis.
+    LoginRejected {
+        /// Raw reason text from the server's `logresp` line.
+        reason: String,
+    },
 
     /// The TCP connection was closed (EOF from server).
     Disconnected,
@@ -116,6 +149,29 @@ pub enum AprsIsError {
 ///
 /// Not `Clone` and not `Send`-across-the-await — typical usage is to own
 /// it from a single task.
+///
+/// # TLS support
+///
+/// This client speaks plaintext TCP only. APRS-IS T2 servers also
+/// support TLS on port 24580 — to use it, build the connection
+/// yourself with your preferred TLS library (e.g. `tokio-rustls` or
+/// `tokio-native-tls`) and use the line-level helpers in
+/// [`crate::kiss::aprs_is`]:
+///
+/// ```no_run
+/// use kenwood_thd75::kiss::aprs_is::{
+///     AprsIsConfig, AprsIsLine, build_login_string, format_is_packet,
+/// };
+/// // 1. TLS handshake against `core.aprs2.net:24580` using your TLS library.
+/// // 2. Send the result of `build_login_string(&config)` over the stream.
+/// // 3. Read lines from the stream and parse them with `AprsIsLine::parse`.
+/// // 4. Send packets formatted via `format_is_packet`.
+/// # let _ = (AprsIsConfig::new("N0CALL"), build_login_string, format_is_packet,
+/// #     |line: &str| AprsIsLine::parse(line));
+/// ```
+///
+/// The library deliberately does not bundle a TLS implementation so
+/// callers can choose their preferred backend.
 #[derive(Debug)]
 pub struct AprsIsClient {
     config: AprsIsConfig,
@@ -261,10 +317,26 @@ impl AprsIsClient {
         }
 
         // Comment line. Check for login response on first one.
-        if !self.logged_in_emitted && line.contains("logresp") && line.contains("verified") {
-            self.logged_in_emitted = true;
-            tracing::info!(response = %line, "APRS-IS login verified");
-            return Ok(AprsIsEvent::LoggedIn);
+        if !self.logged_in_emitted && line.contains("logresp") {
+            // The verified response has the form
+            //   "# logresp CALL verified, server T2FOO"
+            // and the rejected response has
+            //   "# logresp CALL unverified, ..."
+            // We have to check `unverified` before `verified` because the
+            // latter is a substring of the former.
+            if line.contains("unverified") {
+                self.logged_in_emitted = true;
+                tracing::warn!(response = %line, "APRS-IS login rejected");
+                return Ok(AprsIsEvent::LoginRejected {
+                    reason: line.to_owned(),
+                });
+            }
+            if line.contains("verified") {
+                self.logged_in_emitted = true;
+                let server = parse_logresp_server(line);
+                tracing::info!(response = %line, ?server, "APRS-IS login verified");
+                return Ok(AprsIsEvent::LoggedIn { server });
+            }
         }
 
         Ok(AprsIsEvent::Comment(line.to_owned()))
@@ -381,7 +453,7 @@ mod tests {
     fn test_config(addr: std::net::SocketAddr) -> AprsIsConfig {
         AprsIsConfig {
             callsign: "N0CALL".to_owned(),
-            passcode: -1,
+            passcode: crate::kiss::aprs_is::Passcode::ReceiveOnly,
             server: addr.ip().to_string(),
             port: addr.port(),
             filter: String::new(),
@@ -478,7 +550,50 @@ mod tests {
 
         let mut client = AprsIsClient::connect(test_config(addr)).await.unwrap();
         let event = client.next_event().await.unwrap();
-        assert!(matches!(event, AprsIsEvent::LoggedIn));
+        match event {
+            AprsIsEvent::LoggedIn { server } => {
+                assert_eq!(server, Some("T2TEST".to_owned()));
+            }
+            other => panic!("expected LoggedIn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn next_event_detects_login_rejected() {
+        let addr = spawn_mock_server(|mut stream| async move {
+            let mut buf = [0u8; 512];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                .await
+                .unwrap();
+            stream
+                .write_all(b"# logresp N0CALL unverified, server T2TEST\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        })
+        .await;
+
+        let mut client = AprsIsClient::connect(test_config(addr)).await.unwrap();
+        let event = client.next_event().await.unwrap();
+        match event {
+            AprsIsEvent::LoginRejected { reason } => {
+                assert!(reason.contains("unverified"));
+            }
+            other => panic!("expected LoginRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_logresp_server_extracts_name() {
+        assert_eq!(
+            parse_logresp_server("# logresp N0CALL verified, server T2TEST"),
+            Some("T2TEST".to_owned())
+        );
+        assert_eq!(
+            parse_logresp_server("# logresp N0CALL verified, server  T2A "),
+            Some("T2A".to_owned())
+        );
+        assert_eq!(parse_logresp_server("# javAPRSSrvr 4.2.0b05"), None);
     }
 
     #[tokio::test]
@@ -570,7 +685,7 @@ mod tests {
         // Using 198.51.100.1 (TEST-NET-2) which should not respond.
         let config = AprsIsConfig {
             callsign: "N0CALL".to_owned(),
-            passcode: -1,
+            passcode: crate::kiss::aprs_is::Passcode::ReceiveOnly,
             server: "198.51.100.1".to_owned(),
             port: 14580,
             filter: String::new(),

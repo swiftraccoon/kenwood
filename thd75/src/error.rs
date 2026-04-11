@@ -322,6 +322,19 @@ pub enum ValidationError {
         /// Human-readable valid range description (e.g., "must be 0-2").
         detail: &'static str,
     },
+
+    /// A runtime APRS wire-format value failed validation.
+    ///
+    /// Used by [`crate::types::aprs_wire`] for typed primitives such as
+    /// `Callsign`, `Latitude`, `Longitude`, `Course`, and `MessageId`
+    /// where the failing value may be too wide to fit in a `u8`.
+    #[error("{field} out of range: {detail}")]
+    AprsWireOutOfRange {
+        /// Field name, e.g. `"Latitude"`, `"Callsign byte"`.
+        field: &'static str,
+        /// Human-readable explanation (e.g. `"length 7 exceeds max 6"`).
+        detail: &'static str,
+    },
 }
 
 #[cfg(test)]

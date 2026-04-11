@@ -16,6 +16,7 @@ research/
 thd75_re/
 *.pdf
 *.md
+*.csv
 
 !README.md
 ref/

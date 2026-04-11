@@ -23,33 +23,9 @@ mod commands;
 mod transport;
 
 use std::net::ToSocketAddrs;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
-/// Global flag for timestamp output mode.
-static TIMESTAMPS: AtomicBool = AtomicBool::new(false);
-
-/// Print a line with an optional `[HH:MM:SS]` timestamp prefix.
-///
-/// When `--timestamps` is enabled, prepends the UTC time to every
-/// output line. This helps blind operators track when events occurred
-/// without needing to check a clock. Uses UTC to avoid pulling in
-/// timezone dependencies.
-macro_rules! tprintln {
-    ($($arg:tt)*) => {
-        if TIMESTAMPS.load(Ordering::Relaxed) {
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let h = (secs / 3600) % 24;
-            let m = (secs / 60) % 60;
-            let s = secs % 60;
-            println!("[{h:02}:{m:02}:{s:02}] {}", format!($($arg)*));
-        } else {
-            println!($($arg)*);
-        }
-    };
-}
+use thd75_repl::aprintln;
 
 use clap::Parser;
 use kenwood_thd75::Radio;
@@ -101,13 +77,34 @@ impl LogLevel {
     }
 }
 
+/// Subcommands that bypass the interactive REPL entirely.
+///
+/// `check` runs the accessibility compliance self-check and exits.
+/// Any future non-interactive operations (status dump, send-one,
+/// etc.) belong as sibling variants here.
+#[derive(clap::Subcommand, Debug)]
+enum Subcommand {
+    /// Run the accessibility compliance self-check and print a report.
+    ///
+    /// Exercises every user-facing formatter, runs the accessibility
+    /// lint on each result, and prints a rule-by-rule report. Exits
+    /// 0 if every rule passes, 1 otherwise. Does not connect to a
+    /// radio and is safe to run unattended.
+    Check,
+}
+
 /// Accessible REPL for the Kenwood TH-D75 transceiver.
 ///
 /// Screen-reader friendly: plain text output, one line at a time.
 /// Also scriptable: pipe commands via stdin.
 #[derive(Parser, Debug)]
 #[command(version, about)]
+#[allow(clippy::struct_excessive_bools)]
 struct Cli {
+    /// Optional subcommand. Defaults to interactive REPL if omitted.
+    #[command(subcommand)]
+    command_mode: Option<Subcommand>,
+
     /// Serial port path (default: auto-discover USB, then Bluetooth).
     #[arg(short, long)]
     port: Option<String>,
@@ -119,6 +116,19 @@ struct Cli {
     /// Prepend timestamps to all output lines (e.g. `[14:32:07]`).
     #[arg(short, long)]
     timestamps: bool,
+
+    /// Display timestamps in local time instead of UTC.
+    ///
+    /// The offset is detected at startup by running `date +%z`. If
+    /// detection fails, a warning is printed and UTC is used. Implies
+    /// `--timestamps`.
+    #[arg(long)]
+    local_time: bool,
+
+    /// Override the UTC offset used for timestamps, e.g. `+05:30`,
+    /// `-08:00`, or `+0530`. Implies `--timestamps`.
+    #[arg(long)]
+    utc_offset: Option<String>,
 
     /// Enable file logging at the given level (default: no file).
     ///
@@ -139,6 +149,48 @@ struct Cli {
     /// captures every packet, every frame, every state transition.
     #[arg(long)]
     trace: bool,
+
+    /// Read commands from a script file (use `-` for stdin) and exit.
+    ///
+    /// One command per line. `#` at line start is a comment. Blank
+    /// lines are skipped. `exit`/`quit` ends the script. Errors from
+    /// individual commands are printed but do not halt the script
+    /// unless `--script-strict` is also passed.
+    #[arg(long)]
+    script: Option<std::path::PathBuf>,
+
+    /// When running a script, halt on the first command error.
+    ///
+    /// Reserved for future strict-mode enforcement. Currently
+    /// accepted and recorded but not yet enforced by the dispatcher.
+    #[arg(long)]
+    script_strict: bool,
+
+    /// Use a programmed mock radio instead of real hardware.
+    ///
+    /// Only available when compiled with the `testing` cargo feature.
+    /// Used by integration tests to drive the REPL loop without a
+    /// physical radio attached. Scenario names are defined in
+    /// `thd75_repl::mock_scenarios::build`.
+    #[cfg(feature = "testing")]
+    #[arg(long)]
+    mock_radio: Option<String>,
+
+    /// Maximum number of output lines retained by the `last` history
+    /// buffer (default: 30). Older lines are evicted first. Setting
+    /// this to 0 disables history recording entirely.
+    #[arg(long, default_value_t = thd75_repl::HISTORY_CAPACITY_DEFAULT)]
+    history_lines: usize,
+
+    /// Skip transmit confirmation prompts.
+    ///
+    /// By default every transmit command (`cq`, `beacon`, `position`,
+    /// `msg`, `echo`, `link`) prompts before keying the radio. Pass
+    /// `--yes` to disable the prompt globally — required when running
+    /// a script in automation and also useful for interactive sessions
+    /// where the operator does not want to be asked every time.
+    #[arg(long)]
+    yes: bool,
 
     /// Command to run on startup (e.g. "dstar start KQ4NIT REF030C").
     ///
@@ -210,7 +262,7 @@ struct LoggingGuard {
 ///
 /// **Default behaviour: no logging at all.** Neither a file sink nor
 /// a stderr sink is attached. The interactive REPL terminal only
-/// shows `println!` / `tprintln!` output and no log file accumulates
+/// shows `println!` / `aprintln!` output and no log file accumulates
 /// on disk. This keeps normal sessions cheap and quiet.
 ///
 /// Opt-in logging is controlled by CLI flags:
@@ -300,11 +352,147 @@ fn init_logging(cli: &Cli) -> LoggingGuard {
     }
 }
 
+/// Open a real hardware transport (USB serial or macOS Bluetooth)
+/// and return it alongside a fresh tokio runtime.
+///
+/// Tries Bluetooth first on macOS (synchronously, no tokio reactor
+/// needed) and falls back to serial discovery via the async path.
+/// This matches the exact behaviour the binary had before Task 26
+/// introduced the optional mock branch; factoring it out keeps the
+/// mock + real paths symmetric in `main`.
+fn open_real_transport(
+    cli_port: Option<&str>,
+    cli_baud: u32,
+) -> Result<(String, EitherTransport, tokio::runtime::Runtime), Box<dyn std::error::Error>> {
+    if let Ok((path, transport)) = transport::discover_and_open(cli_port, cli_baud) {
+        let rt = tokio::runtime::Runtime::new()?;
+        return Ok((path, transport, rt));
+    }
+    // BT failed or unavailable — serial needs a tokio reactor.
+    let rt = tokio::runtime::Runtime::new()?;
+    let (path, transport) =
+        rt.block_on(async { transport::discover_and_open(cli_port, cli_baud) })?;
+    Ok((path, transport, rt))
+}
+
+/// Parse a UTC offset string like `+05:30`, `-08:00`, `+0530`, or
+/// `+5`. Returns the offset in seconds, positive for east of UTC.
+///
+/// Accepted forms:
+/// - `+HH:MM`, `-HH:MM`
+/// - `+HHMM`, `-HHMM`
+/// - `+H`, `-H` (hours only, no minutes)
+/// - Leading sign is optional for positive offsets.
+fn parse_utc_offset(s: &str) -> Result<i32, String> {
+    if s.is_empty() {
+        return Err("empty".to_string());
+    }
+    let bytes = s.as_bytes();
+    let (sign, rest) = match bytes[0] {
+        b'+' => (1i32, &s[1..]),
+        b'-' => (-1i32, &s[1..]),
+        _ => (1i32, s),
+    };
+    let rest = rest.trim_start_matches(':');
+    if rest.is_empty() {
+        return Err("missing hours".to_string());
+    }
+    let (h_str, m_str) = if let Some((h, m)) = rest.split_once(':') {
+        (h, m)
+    } else if rest.len() >= 3 {
+        (&rest[..rest.len() - 2], &rest[rest.len() - 2..])
+    } else {
+        (rest, "0")
+    };
+    let h: i32 = h_str
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
+    let m: i32 = m_str
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
+    if !(0..=14).contains(&h) {
+        return Err("hours out of range (0 to 14)".to_string());
+    }
+    if !(0..=59).contains(&m) {
+        return Err("minutes out of range (0 to 59)".to_string());
+    }
+    Ok(sign * (h * 3600 + m * 60))
+}
+
+/// Detect the local UTC offset by running `date +%z` on Unix.
+///
+/// Returns `None` on platforms where this is not supported (Windows)
+/// or when the detection command fails.
+//
+// The `#[cfg(unix)]` body runs a subprocess so it cannot be `const`.
+// The `#[cfg(not(unix))]` body is just `None`, which Clippy's nursery
+// `missing_const_for_fn` lint flags on Windows builds. Marking the
+// function `const fn` would then fail to compile the Unix variant.
+// Suppress the lint rather than splitting the function in two.
+#[allow(clippy::missing_const_for_fn)]
+fn detect_utc_offset_seconds() -> Option<i32> {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("date")
+            .arg("+%z")
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8(out.stdout).ok()?;
+        parse_utc_offset(s.trim()).ok()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
+    // Subcommands bypass the REPL loop entirely. `check` runs a
+    // hardware-free accessibility self-check and exits.
+    if matches!(&cli.command_mode, Some(Subcommand::Check)) {
+        std::process::exit(thd75_repl::check::run());
+    }
+
+    // Configure history buffer capacity before any output is
+    // recorded so the first banner line is captured at the correct
+    // size.
+    thd75_repl::set_history_capacity(cli.history_lines);
+
+    // Apply the --yes flag and script mode settings to the transmit
+    // confirmation module so the first transmit command respects them.
+    if cli.yes {
+        thd75_repl::confirm::set_required(false);
+    }
+    if cli.script.is_some() {
+        thd75_repl::confirm::set_script_mode(true);
+    }
+
     if cli.timestamps {
-        TIMESTAMPS.store(true, Ordering::Relaxed);
+        thd75_repl::TIMESTAMPS.store(true, Ordering::Relaxed);
+    }
+
+    if cli.local_time || cli.utc_offset.is_some() {
+        thd75_repl::TIMESTAMPS.store(true, Ordering::Relaxed);
+        let offset_secs = cli.utc_offset.as_ref().map_or_else(
+            || {
+                detect_utc_offset_seconds().unwrap_or_else(|| {
+                    eprintln!("Warning: could not detect local time zone. Using UTC.");
+                    0
+                })
+            },
+            |spec| {
+                parse_utc_offset(spec).unwrap_or_else(|e| {
+                    eprintln!("Warning: invalid --utc-offset {spec:?}: {e}. Using UTC.");
+                    0
+                })
+            },
+        );
+        thd75_repl::UTC_OFFSET_SECS.store(offset_secs, Ordering::Relaxed);
     }
 
     // Configure logging before anything else so the file captures
@@ -314,8 +502,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _logging_guard = init_logging(&cli);
 
     println!(
-        "Kenwood TH-D75 accessible radio control, version {}.",
-        env!("CARGO_PKG_VERSION")
+        "{}",
+        thd75_repl::output::startup_banner(env!("CARGO_PKG_VERSION"))
     );
 
     // Try to open transport BEFORE creating the tokio runtime.
@@ -328,19 +516,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // If BT isn't available (USB connected, or Linux/Windows), serial
     // transport needs a tokio reactor (mio), so we create the runtime
     // and retry via the serial path.
-    let (path, transport, rt) = if let Ok((path, transport)) =
-        transport::discover_and_open(cli.port.as_deref(), cli.baud)
-    {
+    //
+    // When compiled with the `testing` feature and `--mock-radio
+    // <scenario>` is passed, short-circuit the real transport
+    // discovery entirely and construct a programmed `MockTransport`
+    // instead.
+    #[cfg(feature = "testing")]
+    let (path, transport, rt) = if let Some(ref scenario) = cli.mock_radio {
+        let mock = thd75_repl::mock_scenarios::build(scenario)
+            .ok_or_else(|| format!("Unknown mock scenario: {scenario}. Known: simple, empty."))?;
         let rt = tokio::runtime::Runtime::new()?;
-        (path, transport, rt)
+        (format!("mock:{scenario}"), EitherTransport::Mock(mock), rt)
     } else {
-        // BT failed or unavailable — serial needs a tokio reactor.
-        let rt = tokio::runtime::Runtime::new()?;
-        let (path, transport) =
-            rt.block_on(async { transport::discover_and_open(cli.port.as_deref(), cli.baud) })?;
-        (path, transport, rt)
+        open_real_transport(cli.port.as_deref(), cli.baud)?
     };
-    println!("Connected via {path}.");
+    #[cfg(not(feature = "testing"))]
+    let (path, transport, rt) = open_real_transport(cli.port.as_deref(), cli.baud)?;
+
+    println!("{}", thd75_repl::output::connected_via(&path));
 
     // Build initial command from trailing args, if any.
     let initial_command = if cli.command.is_empty() {
@@ -349,12 +542,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cli.command.join(" "))
     };
 
+    // Load script if --script was provided.
+    let script = cli.script.as_ref().map(|path| {
+        thd75_repl::script::Script::from_path(path).unwrap_or_else(|e| {
+            eprintln!("Error: could not read script {}: {e}", path.display());
+            std::process::exit(1)
+        })
+    });
+    let in_script_mode = cli.script.is_some();
+    let script_strict = cli.script_strict;
+
     // Run the async REPL.
     rt.block_on(run_repl(
         transport,
         cli.port.clone(),
         cli.baud,
         initial_command,
+        script,
+        script_strict,
+        in_script_mode,
     ))?;
 
     Ok(())
@@ -481,13 +687,26 @@ impl std::fmt::Debug for DStarSession {
 /// Main REPL loop. Manages three states: CAT (normal radio control),
 /// APRS (packet radio), and D-STAR (digital voice gateway). Each state
 /// owns the radio transport exclusively.
-#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 async fn run_repl(
     transport: EitherTransport,
     cli_port: Option<String>,
     cli_baud: u32,
     initial_command: Option<String>,
+    script: Option<thd75_repl::script::Script>,
+    script_strict: bool,
+    in_script_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // `script_strict` is reserved for a future enhancement that halts
+    // the REPL loop on the first command error. Silencing the
+    // unused-var lint keeps the signature stable now so later tasks
+    // don't have to reshape the calls.
+    let _ = script_strict;
+
     // Try connect_safe (sends TNC exit preamble to recover from stuck modes).
     let mut radio = Radio::connect_safe(transport).await?;
 
@@ -495,8 +714,11 @@ async fn run_repl(
     let mut state = match radio.identify().await {
         Ok(info) => {
             let fw = radio.get_firmware_version().await.unwrap_or_default();
-            println!("Radio model: {}. Firmware version: {fw}.", info.model);
-            println!("Type help for a list of commands, or quit to exit.");
+            println!(
+                "{}",
+                thd75_repl::output::startup_identified(&info.model.to_string(), &fw)
+            );
+            println!("{}", thd75_repl::output::type_help_hint());
             ReplState::Cat(radio)
         }
         Err(_) => {
@@ -516,6 +738,12 @@ async fn run_repl(
 
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut pending_command = initial_command;
+    let mut script_commands: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    if let Some(s) = script {
+        for cmd in s.commands {
+            script_commands.push_back(cmd);
+        }
+    }
 
     loop {
         let prompt = match &state {
@@ -524,11 +752,21 @@ async fn run_repl(
             ReplState::Dstar(_) => "dstar> ",
         };
 
-        // Use the initial CLI command if available, then interactive input.
+        // Command source priority: initial command, then script queue,
+        // then interactive input. When in script mode and the queue
+        // drains, return None so the main loop exits cleanly instead
+        // of falling into the rustyline prompt. Clippy wants us to
+        // rewrite this as `map_or_else`, but the three-way chain is
+        // clearer as an if-ladder.
         #[allow(clippy::option_if_let_else)]
         let line = if let Some(cmd) = pending_command.take() {
             println!("{prompt}{cmd}");
             Some(cmd)
+        } else if let Some(cmd) = script_commands.pop_front() {
+            println!("{prompt}{cmd}");
+            Some(cmd)
+        } else if in_script_mode {
+            None
         } else {
             read_line_blocking(&mut rl, prompt)
         };
@@ -547,7 +785,7 @@ async fn run_repl(
             if let Some(r) = radio {
                 let _ = r.disconnect().await;
             }
-            println!("Goodbye.");
+            println!("{}", thd75_repl::output::goodbye());
             return Ok(());
         };
 
@@ -567,10 +805,31 @@ async fn run_repl(
         // Global commands available in any mode.
         match cmd.as_str() {
             "help" | "?" => {
-                match &state {
-                    ReplState::Cat(_) => commands::help(),
-                    ReplState::Aprs(_) => commands::aprs_help(),
-                    ReplState::Dstar(_) => commands::dstar_help(),
+                if let Some(sub) = parts.get(1) {
+                    if *sub == "all" {
+                        for cmd in thd75_repl::help_text::ALL_COMMANDS {
+                            if let Some(text) = thd75_repl::help_text::for_command(cmd) {
+                                println!("{text}");
+                                println!();
+                            }
+                        }
+                    } else if let Some(text) = thd75_repl::help_text::for_command(sub) {
+                        println!("{text}");
+                    } else {
+                        println!(
+                            "{}",
+                            thd75_repl::output::error(format_args!(
+                                "help for {sub:?} not found. Type help for a list of commands."
+                            ))
+                        );
+                    }
+                } else {
+                    let text = match &state {
+                        ReplState::Cat(_) => thd75_repl::help_text::CAT_MODE_HELP,
+                        ReplState::Aprs(_) => thd75_repl::help_text::APRS_MODE_HELP,
+                        ReplState::Dstar(_) => thd75_repl::help_text::DSTAR_MODE_HELP,
+                    };
+                    println!("{text}");
                 }
                 continue;
             }
@@ -590,7 +849,12 @@ async fn run_repl(
                         match exit_dstar(session.gateway, cli_port.as_deref(), cli_baud).await {
                             Ok(r) => Some(r),
                             Err(e) => {
-                                println!("Error restoring radio mode: {e}");
+                                println!(
+                                    "{}",
+                                    thd75_repl::output::error(format_args!(
+                                        "restoring radio mode: {e}"
+                                    ))
+                                );
                                 None
                             }
                         }
@@ -600,8 +864,82 @@ async fn run_repl(
                 if let Some(r) = radio {
                     let _ = r.disconnect().await;
                 }
-                println!("Goodbye.");
+                println!("{}", thd75_repl::output::goodbye());
                 return Ok(());
+            }
+            "last" | "repeat" => {
+                let count = if let Some(arg) = parts.get(1) {
+                    if *arg == "all" {
+                        thd75_repl::HISTORY_CAPACITY_DEFAULT
+                    } else if let Ok(n) = arg.parse::<usize>() {
+                        n
+                    } else {
+                        println!(
+                            "{}",
+                            thd75_repl::output::error(format_args!(
+                                "invalid count {arg:?}. Use a number or \"all\"."
+                            ))
+                        );
+                        continue;
+                    }
+                } else {
+                    1
+                };
+                let lines = thd75_repl::last_lines(count);
+                if lines.is_empty() {
+                    println!("No previous output available.");
+                } else {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                continue;
+            }
+            "verbose" => {
+                let new_value = match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    Some(other) => {
+                        aprintln!(
+                            "{}",
+                            thd75_repl::output::error(format_args!(
+                                "unknown verbose argument {other:?}. Use on or off."
+                            ))
+                        );
+                        continue;
+                    }
+                    None => !thd75_repl::is_verbose(),
+                };
+                thd75_repl::VERBOSE.store(new_value, Ordering::Relaxed);
+                aprintln!("Verbose output: {}", if new_value { "on" } else { "off" });
+                continue;
+            }
+            "quiet" => {
+                thd75_repl::VERBOSE.store(false, Ordering::Relaxed);
+                aprintln!("Verbose output: off");
+                continue;
+            }
+            "confirm" => {
+                let new_value = match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
+                    Some("on" | "true" | "1") => true,
+                    Some("off" | "false" | "0") => false,
+                    Some(other) => {
+                        aprintln!(
+                            "{}",
+                            thd75_repl::output::error(format_args!(
+                                "unknown confirm argument {other:?}. Use on or off."
+                            ))
+                        );
+                        continue;
+                    }
+                    None => !thd75_repl::confirm::is_required(),
+                };
+                thd75_repl::confirm::set_required(new_value);
+                aprintln!(
+                    "Transmit confirmation: {}",
+                    if new_value { "on" } else { "off" }
+                );
+                continue;
             }
             _ => {}
         }
@@ -621,7 +959,12 @@ async fn run_repl(
                         match enter_aprs(radio, &parts[2..]).await {
                             Ok(client) => ReplState::Aprs(Box::new(client)),
                             Err((radio_back, e)) => {
-                                println!("Error entering APRS mode: {e}");
+                                println!(
+                                    "{}",
+                                    thd75_repl::output::error(format_args!(
+                                        "entering APRS mode: {e}"
+                                    ))
+                                );
                                 ReplState::Cat(radio_back)
                             }
                         }
@@ -644,11 +987,21 @@ async fn run_repl(
                                 ReplState::Dstar(Box::new(session))
                             }
                             Err((Some(radio_back), e)) => {
-                                println!("Error entering D-STAR mode: {e}");
+                                println!(
+                                    "{}",
+                                    thd75_repl::output::error(format_args!(
+                                        "entering D-STAR mode: {e}"
+                                    ))
+                                );
                                 ReplState::Cat(radio_back)
                             }
                             Err((None, e)) => {
-                                println!("Error entering D-STAR mode: {e}");
+                                println!(
+                                    "{}",
+                                    thd75_repl::output::error(format_args!(
+                                        "entering D-STAR mode: {e}"
+                                    ))
+                                );
                                 println!(
                                     "Error: radio connection lost. Please close and reopen the program."
                                 );
@@ -669,7 +1022,10 @@ async fn run_repl(
                             ReplState::Cat(radio)
                         }
                         Err(e) => {
-                            println!("Error stopping APRS: {e}");
+                            println!(
+                                "{}",
+                                thd75_repl::output::error(format_args!("stopping APRS: {e}"))
+                            );
                             println!(
                                 "Error: radio connection lost. Please close and reopen the program."
                             );
@@ -693,7 +1049,10 @@ async fn run_repl(
                             ReplState::Cat(radio)
                         }
                         Err(e) => {
-                            println!("Error exiting D-STAR mode: {e}");
+                            println!(
+                                "{}",
+                                thd75_repl::output::error(format_args!("exiting D-STAR mode: {e}"))
+                            );
                             println!(
                                 "Error: radio connection lost. Please close and reopen the program."
                             );
@@ -753,6 +1112,7 @@ async fn dispatch_cat(radio: &mut Radio<EitherTransport>, cmd: &str, parts: &[&s
         "cq" => commands::cq(radio).await,
         "reflector" | "ref" => commands::reflector(radio, &parts[1..]).await,
         "unreflector" | "unref" | "unlink" => commands::unreflector(radio).await,
+        "status" => commands::status(radio).await,
         "aprs" => {
             if parts.get(1).is_some_and(|s| *s == "start") {
                 // Handled by caller after dispatch.
@@ -791,7 +1151,7 @@ async fn enter_aprs(
     let config = AprsClientConfig::new(callsign, ssid);
     match AprsClient::start(radio, config).await {
         Ok(client) => {
-            println!("APRS mode active. Type aprs stop to exit.");
+            println!("{}", thd75_repl::output::aprs_mode_active());
             println!("Commands: monitor, msg, position, beacon, stations, igate, aprs stop");
             Ok(client)
         }
@@ -800,6 +1160,7 @@ async fn enter_aprs(
 }
 
 /// Dispatch a command in APRS mode.
+#[allow(clippy::too_many_lines)]
 async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, parts: &[&str]) {
     match cmd {
         "listen" | "poll" => match client.next_event().await {
@@ -816,17 +1177,31 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
                 println!("Usage: msg <callsign> <message text>");
                 return;
             }
+            if !thd75_repl::confirm::tx_confirm() {
+                return;
+            }
             let addressee = parts[1];
             let text = parts[2..].join(" ");
             match client.send_message(addressee, &text).await {
                 Ok(msg_id) => println!("Message queued to {addressee}: {text} (ID: {msg_id})"),
-                Err(e) => println!("Error sending message: {e}"),
+                Err(e) => println!(
+                    "{}",
+                    thd75_repl::output::error(format_args!("sending message: {e}"))
+                ),
             }
         }
-        "beacon" => match client.send_status("REPL beacon").await {
-            Ok(()) => println!("Status beacon sent."),
-            Err(e) => println!("Error sending beacon: {e}"),
-        },
+        "beacon" => {
+            if !thd75_repl::confirm::tx_confirm() {
+                return;
+            }
+            match client.send_status("REPL beacon").await {
+                Ok(()) => println!("Status beacon sent."),
+                Err(e) => println!(
+                    "{}",
+                    thd75_repl::output::error(format_args!("sending beacon: {e}"))
+                ),
+            }
+        }
         "position" | "pos" => {
             if parts.len() < 3 {
                 println!("Usage: position <lat> <lon> [comment]");
@@ -841,6 +1216,9 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
                 println!("Error: invalid longitude. Use decimal degrees (e.g. -82.46).");
                 return;
             };
+            if !thd75_repl::confirm::tx_confirm() {
+                return;
+            }
             let comment = if parts.len() > 3 {
                 parts[3..].join(" ")
             } else {
@@ -855,7 +1233,10 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
                         format!(" ({comment})")
                     }
                 ),
-                Err(e) => println!("Error sending position: {e}"),
+                Err(e) => println!(
+                    "{}",
+                    thd75_repl::output::error(format_args!("sending position: {e}"))
+                ),
             }
         }
         "stations" | "heard" => {
@@ -864,19 +1245,22 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
                 println!("No stations heard yet.");
             } else {
                 for entry in stations.iter().take(20) {
-                    let pos = entry
-                        .position
-                        .as_ref()
-                        .map(|p| format!(" at {:.4}, {:.4}", p.latitude, p.longitude))
-                        .unwrap_or_default();
+                    let elapsed = commands::fmt_elapsed(entry.last_heard.elapsed());
+                    let position = entry.position.as_ref().map(|p| (p.latitude, p.longitude));
                     println!(
-                        "Station {}{pos}, {} packets, heard {} ago.",
-                        entry.callsign,
-                        entry.packet_count,
-                        commands::fmt_elapsed(entry.last_heard.elapsed())
+                        "{}",
+                        thd75_repl::output::aprs_station_entry(
+                            &entry.callsign,
+                            position,
+                            entry.packet_count,
+                            &elapsed,
+                        )
                     );
                 }
-                println!("{} stations heard.", stations.len());
+                println!(
+                    "{}",
+                    thd75_repl::output::aprs_stations_summary(stations.len())
+                );
             }
         }
         "igate" => {
@@ -926,7 +1310,7 @@ async fn run_igate(client: &mut AprsClient<EitherTransport>, filter: &str) {
         }
     };
 
-    println!("APRS-IS connected. Forwarding RF ↔ internet. Press Ctrl-C to stop.");
+    println!("{}", thd75_repl::output::aprs_is_connected());
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -942,7 +1326,7 @@ async fn run_igate(client: &mut AprsClient<EitherTransport>, filter: &str) {
             is_result = is_client.next_event() => {
                 match is_result {
                     Ok(AprsIsEvent::Packet(line)) => {
-                        tprintln!("IS → {line}");
+                        aprintln!("{}", thd75_repl::output::aprs_is_incoming(&line));
                         // Gate to RF if appropriate. The helper checks
                         // whether the packet should be forwarded per
                         // IGate rules (station heard on RF recently, etc).
@@ -953,8 +1337,15 @@ async fn run_igate(client: &mut AprsClient<EitherTransport>, filter: &str) {
                     Ok(AprsIsEvent::Comment(line)) => {
                         tracing::debug!("APRS-IS comment: {line}");
                     }
-                    Ok(AprsIsEvent::LoggedIn) => {
-                        println!("APRS-IS login verified.");
+                    Ok(AprsIsEvent::LoggedIn { server }) => {
+                        match server {
+                            Some(s) => println!("APRS-IS login verified (server {s})."),
+                            None => println!("APRS-IS login verified."),
+                        }
+                    }
+                    Ok(AprsIsEvent::LoginRejected { reason }) => {
+                        println!("APRS-IS login rejected: {reason}");
+                        break;
                     }
                     Ok(AprsIsEvent::Disconnected) => {
                         println!("APRS-IS disconnected. Stopping IGate.");
@@ -1025,38 +1416,55 @@ async fn run_aprs_monitor(client: &mut AprsClient<EitherTransport>) {
 fn print_aprs_event(event: &AprsEvent) {
     match event {
         AprsEvent::StationHeard(entry) => {
-            tprintln!("APRS station heard: {}", entry.callsign);
+            aprintln!(
+                "{}",
+                thd75_repl::output::aprs_station_heard(&entry.callsign)
+            );
         }
         AprsEvent::MessageReceived(msg) => {
-            tprintln!("APRS message received for {}: {}", msg.addressee, msg.text);
+            aprintln!(
+                "{}",
+                thd75_repl::output::aprs_message_received(&msg.addressee, &msg.text)
+            );
         }
         AprsEvent::MessageDelivered(id) => {
-            tprintln!("APRS message delivered, ID {id}.");
+            aprintln!("{}", thd75_repl::output::aprs_message_delivered(id));
         }
         AprsEvent::MessageRejected(id) => {
-            tprintln!("APRS message rejected by remote station, ID {id}.");
+            aprintln!("{}", thd75_repl::output::aprs_message_rejected(id));
         }
         AprsEvent::MessageExpired(id) => {
-            tprintln!("APRS message expired after all retries, ID {id}.");
+            aprintln!("{}", thd75_repl::output::aprs_message_expired(id));
         }
         AprsEvent::PositionReceived { source, position } => {
-            tprintln!(
-                "APRS position from {source}: latitude {:.4}, longitude {:.4}.",
-                position.latitude,
-                position.longitude
+            aprintln!(
+                "{}",
+                thd75_repl::output::aprs_position(source, position.latitude, position.longitude)
             );
         }
         AprsEvent::WeatherReceived { source, .. } => {
-            tprintln!("APRS weather report from {source}.");
+            aprintln!("{}", thd75_repl::output::aprs_weather(source));
         }
         AprsEvent::PacketDigipeated { source } => {
-            tprintln!("APRS packet relayed from {source}.");
+            if !thd75_repl::is_verbose() {
+                return;
+            }
+            aprintln!("{}", thd75_repl::output::aprs_digipeated(source));
         }
         AprsEvent::QueryResponded { to } => {
-            tprintln!("APRS position query from {to} — responded with beacon.");
+            if !thd75_repl::is_verbose() {
+                return;
+            }
+            aprintln!("{}", thd75_repl::output::aprs_query_responded(to));
         }
         AprsEvent::RawPacket(pkt) => {
-            tprintln!("APRS packet from {}.", pkt.source);
+            if !thd75_repl::is_verbose() {
+                return;
+            }
+            aprintln!(
+                "{}",
+                thd75_repl::output::aprs_raw_packet(&pkt.source.to_string())
+            );
         }
     }
 }
@@ -1633,6 +2041,9 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
                     return;
                 }
             };
+            if !thd75_repl::confirm::tx_confirm() {
+                return;
+            }
             match connect_reflector(session.callsign, &link).await {
                 Ok(client) => {
                     session.local_module = link.local_module;
@@ -1651,7 +2062,10 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
                         println!("Disconnected from reflector.");
                         session.reflector = None;
                     }
-                    Err(e) => println!("Error disconnecting: {e}"),
+                    Err(e) => println!(
+                        "{}",
+                        thd75_repl::output::error(format_args!("disconnecting: {e}"))
+                    ),
                 }
             } else {
                 println!("Not connected to a reflector.");
@@ -1697,6 +2111,9 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
             }
         }
         "echo" => {
+            if !thd75_repl::confirm::tx_confirm() {
+                return;
+            }
             session.echo_armed = true;
             println!(
                 "Echo test: transmit now. Your audio will be recorded \
@@ -2084,7 +2501,10 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &ReflectorE
                 my_suffix: String::from_utf8_lossy(header.my_suffix.as_bytes()).into_owned(),
             };
             if let Err(e) = gw.send_header(&radio_header).await {
-                println!("Error relaying header to radio: {e}");
+                println!(
+                    "{}",
+                    thd75_repl::output::error(format_args!("relaying header to radio: {e}"))
+                );
             }
         }
         ReflectorEvent::VoiceData { frame, seq, .. } => {
@@ -2145,7 +2565,10 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &ReflectorE
             // status polling and gate writes on
             // `ModemStatus::dstar_buffer`. Tracked as future work.
             if let Err(e) = gw.send_voice_unpaced(&radio_frame).await {
-                println!("Error relaying voice to radio: {e}");
+                println!(
+                    "{}",
+                    thd75_repl::output::error(format_args!("relaying voice to radio: {e}"))
+                );
             }
         }
         ReflectorEvent::VoiceEnd { .. } => {
@@ -2164,7 +2587,12 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &ReflectorE
             session.rx_last_slow_text = None;
             session.rx_stream_id = None;
             if let Err(e) = gw.send_eot().await {
-                println!("Error relaying end of transmission to radio: {e}");
+                println!(
+                    "{}",
+                    thd75_repl::output::error(format_args!(
+                        "relaying end of transmission to radio: {e}"
+                    ))
+                );
             }
         }
         _ => {}
@@ -2188,7 +2616,7 @@ fn print_slow_data_text_message(bytes: &[u8; 20]) {
         .collect();
     let trimmed = cleaned.trim();
     if !trimmed.is_empty() {
-        tprintln!("D-STAR message: \"{trimmed}\"");
+        aprintln!("{}", thd75_repl::output::dstar_text_message(trimmed));
     }
 }
 
@@ -2247,28 +2675,31 @@ fn trace_reflector_event(event: &ReflectorEvent) {
 /// Print a reflector event for the user.
 fn print_reflector_event(event: &ReflectorEvent) {
     match event {
-        ReflectorEvent::Connected => tprintln!("Reflector: connected."),
-        ReflectorEvent::Rejected => tprintln!("Reflector: connection rejected."),
-        ReflectorEvent::Disconnected => tprintln!("Reflector: disconnected."),
+        ReflectorEvent::Connected => {
+            aprintln!("{}", thd75_repl::output::reflector_event_connected());
+        }
+        ReflectorEvent::Rejected => {
+            aprintln!("{}", thd75_repl::output::reflector_event_rejected());
+        }
+        ReflectorEvent::Disconnected => {
+            aprintln!("{}", thd75_repl::output::reflector_event_disconnected());
+        }
         ReflectorEvent::PollEcho | ReflectorEvent::VoiceData { .. } => {
             // Silent: keepalives and individual voice frames are too
             // frequent to announce.
         }
         ReflectorEvent::VoiceStart { header, .. } => {
-            let suffix = header.my_suffix_str();
-            let suffix_part = if suffix.is_empty() {
-                String::new()
-            } else {
-                format!(" /{suffix}")
-            };
-            tprintln!(
-                "Reflector: voice from {}{suffix_part}, to {}.",
-                header.my_call_str(),
-                header.ur_call_str()
+            aprintln!(
+                "{}",
+                thd75_repl::output::reflector_event_voice_start(
+                    header.my_call_str().as_ref(),
+                    header.my_suffix_str().as_ref(),
+                    header.ur_call_str().as_ref(),
+                )
             );
         }
         ReflectorEvent::VoiceEnd { .. } => {
-            tprintln!("Reflector: voice transmission ended.");
+            aprintln!("{}", thd75_repl::output::reflector_event_voice_end());
         }
     }
 }
@@ -2277,64 +2708,111 @@ fn print_reflector_event(event: &ReflectorEvent) {
 fn print_dstar_event(event: &DStarEvent) {
     match event {
         DStarEvent::VoiceStart(header) => {
-            let suffix = header.my_suffix.trim();
-            let suffix_part = if suffix.is_empty() {
-                String::new()
-            } else {
-                format!(" /{suffix}")
-            };
-            tprintln!(
-                "D-STAR voice from {}{suffix_part}, to {}.",
-                header.my_call.trim(),
-                header.ur_call.trim()
+            aprintln!(
+                "{}",
+                thd75_repl::output::dstar_voice_start(
+                    &header.my_call,
+                    &header.my_suffix,
+                    &header.ur_call,
+                )
             );
         }
         DStarEvent::VoiceData(_) => {
             // Don't announce every 20ms frame — too noisy for screen readers.
         }
         DStarEvent::VoiceEnd => {
-            tprintln!("D-STAR voice transmission ended.");
+            aprintln!("{}", thd75_repl::output::dstar_voice_end());
         }
         DStarEvent::VoiceLost => {
-            tprintln!("D-STAR voice signal lost, no clean end of transmission.");
+            if !thd75_repl::is_verbose() {
+                return;
+            }
+            aprintln!("{}", thd75_repl::output::dstar_voice_lost());
         }
         DStarEvent::TextMessage(text) => {
-            tprintln!("D-STAR message: \"{text}\"");
+            aprintln!("{}", thd75_repl::output::dstar_text_message(text));
         }
         DStarEvent::GpsData(data) => {
             // GPS/DPRS data is raw NMEA-like bytes. Show as text if valid ASCII.
             let text = String::from_utf8_lossy(data);
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                tprintln!("D-STAR GPS position data received.");
-            } else {
-                tprintln!("D-STAR GPS data: {trimmed}");
-            }
+            aprintln!("{}", thd75_repl::output::dstar_gps(text.trim()));
         }
         DStarEvent::StationHeard(entry) => {
-            tprintln!("D-STAR station heard: {}.", entry.callsign);
+            aprintln!(
+                "{}",
+                thd75_repl::output::dstar_station_heard(&entry.callsign)
+            );
         }
         DStarEvent::UrCallCommand(action) => {
             use kenwood_thd75::types::dstar::UrCallAction;
-            match action {
-                UrCallAction::Cq => tprintln!("D-STAR command: call CQ."),
-                UrCallAction::Echo => tprintln!("D-STAR command: echo test."),
-                UrCallAction::Unlink => tprintln!("D-STAR command: unlink reflector."),
-                UrCallAction::Info => tprintln!("D-STAR command: request info."),
+            let s = match action {
+                UrCallAction::Cq => thd75_repl::output::dstar_command_cq().to_string(),
+                UrCallAction::Echo => thd75_repl::output::dstar_command_echo().to_string(),
+                UrCallAction::Unlink => thd75_repl::output::dstar_command_unlink().to_string(),
+                UrCallAction::Info => thd75_repl::output::dstar_command_info().to_string(),
                 UrCallAction::Link { reflector, module } => {
-                    tprintln!("D-STAR command: link to {reflector} module {module}.");
+                    thd75_repl::output::dstar_command_link(reflector, *module)
                 }
-                UrCallAction::Callsign(call) => {
-                    tprintln!("D-STAR command: route to callsign {call}.");
-                }
-            }
+                UrCallAction::Callsign(call) => thd75_repl::output::dstar_command_callsign(call),
+            };
+            aprintln!("{s}");
         }
         DStarEvent::StatusUpdate(status) => {
             println!(
-                "D-STAR modem: buffer {}, transmit {}.",
-                status.dstar_buffer,
-                if status.tx { "active" } else { "idle" }
+                "{}",
+                thd75_repl::output::dstar_modem_status(status.dstar_buffer, status.tx)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::parse_utc_offset;
+
+    #[test]
+    fn parses_plus_hhmm_colon() {
+        assert_eq!(parse_utc_offset("+05:30").unwrap(), 5 * 3600 + 30 * 60);
+    }
+
+    #[test]
+    fn parses_minus_hhmm_colon() {
+        assert_eq!(parse_utc_offset("-08:00").unwrap(), -8 * 3600);
+    }
+
+    #[test]
+    fn parses_plus_hhmm_no_colon() {
+        assert_eq!(parse_utc_offset("+0530").unwrap(), 5 * 3600 + 30 * 60);
+    }
+
+    #[test]
+    fn parses_plus_h() {
+        assert_eq!(parse_utc_offset("+5").unwrap(), 5 * 3600);
+    }
+
+    #[test]
+    fn parses_no_sign_positive() {
+        assert_eq!(parse_utc_offset("03:00").unwrap(), 3 * 3600);
+    }
+
+    #[test]
+    fn rejects_out_of_range_hours() {
+        assert!(parse_utc_offset("+15:00").is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_range_minutes() {
+        assert!(parse_utc_offset("+02:60").is_err());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(parse_utc_offset("").is_err());
+    }
+
+    #[test]
+    fn parses_zero_offset() {
+        assert_eq!(parse_utc_offset("+00:00").unwrap(), 0);
+        assert_eq!(parse_utc_offset("-00:00").unwrap(), 0);
     }
 }

@@ -1,0 +1,5 @@
+# Exercise the help system
+help
+help freq
+help all
+quit
