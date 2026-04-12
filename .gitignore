@@ -19,4 +19,19 @@ thd75_re/
 *.csv
 
 !README.md
+
+# dstar-gateway: public docs and ADRs are committed
+!dstar-gateway/README.md
+!dstar-gateway/ARCHITECTURE.md
+!dstar-gateway/REFERENCES.md
+!dstar-gateway/CHANGELOG.md
+!dstar-gateway/adr/
+!dstar-gateway/adr/*.md
+!dstar-gateway/book/
+!dstar-gateway/book/book.toml
+!dstar-gateway/book/src/
+!dstar-gateway/book/src/**/*.md
+# but NOT the mdbook build output
+dstar-gateway/book/book/
+
 ref/

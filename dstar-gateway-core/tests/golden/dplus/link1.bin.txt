@@ -1,0 +1,7 @@
+# link1.bin
+# DPlus LINK1 connect request (5 bytes)
+#
+# Reference: ircDDBGateway/Common/ConnectData.cpp:441-447 (getDPlusData CT_LINK1)
+# Reference: xlxd/src/cdplusprotocol.cpp:430 (IsValidConnectPacket)
+
+00:  05 00 18 00 01    # fixed connect-request literal

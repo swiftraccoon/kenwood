@@ -1,0 +1,13 @@
+# link2_w1aw.bin
+# DPlus LINK2 login packet for callsign "W1AW" (28 bytes)
+#
+# Reference: ircDDBGateway/Common/ConnectData.cpp:449-473 (getDPlusData CT_LINK2)
+# Reference: xlxd/src/cdplusprotocol.cpp (IsValidLoginPacket)
+
+00:  1C C0 04 00       # 4-byte LINK2 header (LINK2_HEADER)
+04:  57 31 41 57       # "W1AW" at offset 4 (ASCII)
+08:  00 00 00 00       # zero padding
+0C:  00 00 00 00       # zero padding
+10:  00 00 00 00       # zero padding (callsign region ends at offset 20)
+14:  44 56 30 31       # "DV01" (client id first half)
+18:  39 39 39 39       # "9999" (client id second half) = b"DV019999"

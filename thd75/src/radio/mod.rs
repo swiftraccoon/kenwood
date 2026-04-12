@@ -279,7 +279,7 @@ impl<T: Transport> Radio<T> {
         if let Some(last) = self.last_cmd_time {
             let elapsed = last.elapsed();
             if elapsed < Duration::from_millis(5) {
-                tokio::time::sleep(Duration::from_millis(5) - elapsed).await;
+                tokio::time::sleep(Duration::from_millis(5).saturating_sub(elapsed)).await;
             }
         }
 

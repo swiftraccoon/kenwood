@@ -1,0 +1,14 @@
+# unlink.bin
+# DExtra UNLINK request (11 bytes)
+#
+# Reference: ircDDBGateway/Common/ConnectData.cpp:298-300 (getDExtraData CT_UNLINK)
+#
+# Same shape as LINK but byte [9] = 0x20 (space) instead of reflector module.
+#
+# Inputs: callsign="W1AW", client_module='B'
+
+00:  57 31 41 57        # "W1AW" at [0..4]
+04:  20 20 20 20        # space padding at [4..8]
+08:  42                 # client module 'B' at [8]
+09:  20                 # space where reflector module would be
+10:  00                 # 0x00 at [10]

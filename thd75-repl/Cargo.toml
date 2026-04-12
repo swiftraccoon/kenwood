@@ -2,7 +2,7 @@
 name = "thd75-repl"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 description = "Accessible command-line REPL for the Kenwood TH-D75 transceiver"
 license = "GPL-2.0-or-later"
 authors = ["swiftraccoon"]
@@ -10,6 +10,7 @@ repository = "https://github.com/swiftraccoon/kenwood"
 readme = "../README.md"
 keywords = ["ham-radio", "kenwood", "accessibility", "amateur-radio"]
 categories = ["command-line-utilities"]
+publish = false
 
 [lib]
 name = "thd75_repl"
@@ -25,14 +26,22 @@ path = "src/main.rs"
 testing = []
 
 [dependencies]
-kenwood-thd75 = { path = "../thd75", version = "0.1.0" }
-dstar-gateway = { path = "../dstar-gateway", version = "0.1.0" }
+kenwood-thd75 = { path = "../thd75" }
+dstar-gateway = { path = "../dstar-gateway" }
+dstar-gateway-core = { path = "../dstar-gateway-core" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std", "process", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-rustyline = "15"
+# `time` is already in the transitive tree via tracing-appender's
+# daily rotation logic. We use it directly here only to format the
+# current UTC date into the "log file path" startup message so
+# users can copy-paste the real filename for bug reports. Matching
+# tracing-appender's internal UTC-based rotation means the date we
+# print will always equal the rotation suffix at that moment.
+time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
+rustyline = "18"
 dirs-next = "2"
 
 [lints.rust]

@@ -1,0 +1,12 @@
+# connect_link.bin
+# DExtra LINK connect request (11 bytes)
+#
+# Reference: ircDDBGateway/Common/ConnectData.cpp:283-296 (getDExtraData CT_LINK1)
+#
+# Inputs: callsign="W1AW", reflector_module='C', client_module='B'
+
+00:  57 31 41 57        # "W1AW" at [0..4]
+04:  20 20 20 20        # space padding at [4..8]
+08:  42                 # client module 'B' at [8]
+09:  43                 # reflector module 'C' at [9]
+10:  00                 # 0x00 at [10]

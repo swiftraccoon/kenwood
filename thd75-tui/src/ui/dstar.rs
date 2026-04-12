@@ -116,21 +116,21 @@ fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
     let gw_str = app
         .state
         .dstar_gateway_mode
-        .map_or("Unknown".to_string(), |g| format!("{g:?}"));
+        .map_or_else(|| "Unknown".to_string(), |g| format!("{g:?}"));
     lines.push(kv_line("Gateway Mode", gw_str, Color::White));
 
     // D-STAR slot
     let slot_str = app
         .state
         .dstar_slot
-        .map_or("Unknown".to_string(), |s| format!("{}", s.as_u8()));
+        .map_or_else(|| "Unknown".to_string(), |s| format!("{}", s.as_u8()));
     lines.push(kv_line("D-STAR Slot", slot_str, Color::White));
 
     // Callsign slot
     let cs_slot_str = app
         .state
         .dstar_callsign_slot
-        .map_or("Unknown".to_string(), |s| format!("{}", s.as_u8()));
+        .map_or_else(|| "Unknown".to_string(), |s| format!("{}", s.as_u8()));
     lines.push(kv_line("Callsign Slot", cs_slot_str, Color::White));
 
     // Input prompts

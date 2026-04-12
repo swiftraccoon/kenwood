@@ -48,6 +48,10 @@ ci_pod() {
         cargo check --manifest-path dstar-gateway/Cargo.toml 2>&1 | tail -1
         echo "--- check repl ---"
         cargo check --manifest-path thd75-repl/Cargo.toml 2>&1 | tail -1
+        echo "--- check mbelib-rs ---"
+        cargo check --manifest-path mbelib-rs/Cargo.toml 2>&1 | tail -1
+        echo "--- check stargazer ---"
+        cargo check --manifest-path stargazer/Cargo.toml 2>&1 | tail -1
         echo "--- clippy lib ---"
         cargo clippy --manifest-path thd75/Cargo.toml --all-targets -- -D warnings 2>&1 | tail -1
         echo "--- clippy tui ---"
@@ -56,10 +60,18 @@ ci_pod() {
         cargo clippy --manifest-path dstar-gateway/Cargo.toml --all-targets -- -D warnings 2>&1 | tail -1
         echo "--- clippy repl ---"
         cargo clippy --manifest-path thd75-repl/Cargo.toml --all-targets -- -D warnings 2>&1 | tail -1
+        echo "--- clippy mbelib-rs ---"
+        cargo clippy --manifest-path mbelib-rs/Cargo.toml --all-targets -- -D warnings 2>&1 | tail -1
+        echo "--- clippy stargazer ---"
+        cargo clippy --manifest-path stargazer/Cargo.toml --all-targets -- -D warnings 2>&1 | tail -1
         echo "--- test lib ---"
         cargo test --manifest-path thd75/Cargo.toml --lib 2>&1 | tail -1
         echo "--- test dstar-gateway ---"
         cargo test --manifest-path dstar-gateway/Cargo.toml 2>&1 | tail -1
+        echo "--- test mbelib-rs ---"
+        cargo test --manifest-path mbelib-rs/Cargo.toml 2>&1 | tail -1
+        echo "--- test stargazer ---"
+        cargo test --manifest-path stargazer/Cargo.toml --bins 2>&1 | tail -1
         echo "--- doc ---"
         RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps 2>&1 | tail -1
         echo "--- audit ---"
@@ -76,10 +88,10 @@ ci_pod() {
     kubectl delete pod "ci-$name" --grace-period=0 --force 2>/dev/null &
 }
 
-ci_pod "ubuntu" "rust:1.89" "" &
+ci_pod "ubuntu" "rust:1.94" "" &
 UBUNTU_PID=$!
 
-ci_pod "fedora" "fedora:latest" "dnf install -y gcc 2>/dev/null | tail -1 && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.89.0 -c clippy 2>/dev/null | tail -1" &
+ci_pod "fedora" "fedora:latest" "dnf install -y gcc 2>/dev/null | tail -1 && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.94.0 -c clippy 2>/dev/null | tail -1" &
 FEDORA_PID=$!
 
 wait $UBUNTU_PID

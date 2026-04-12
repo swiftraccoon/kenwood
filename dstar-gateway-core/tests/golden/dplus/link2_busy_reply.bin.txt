@@ -1,0 +1,7 @@
+# link2_busy_reply.bin
+# DPlus LINK2 busy reply (8 bytes)
+#
+# Reference: xlxd/src/cdplusprotocol.cpp:541-545 (EncodeLoginNackPacket)
+
+00:  08 C0 04 00       # 4-byte reply prefix (LINK2_REPLY_PREFIX)
+04:  42 55 53 59       # "BUSY" = login refused (LINK2_BUSY_TAG)

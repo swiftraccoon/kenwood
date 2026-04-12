@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/cross_protocol_session_mismatch.rs:20:22
+   |
+20 |     accepts_dcs_only(session);
+   |     ---------------- ^^^^^^^ expected `Session<Dcs, Configured>`, found `Session<DPlus, Configured>`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected struct `Session<dstar_gateway_core::Dcs, dstar_gateway_core::Configured>`
+              found struct `Session<dstar_gateway_core::DPlus, dstar_gateway_core::Configured>`
+note: function defined here
+  --> tests/compile_fail/cross_protocol_session_mismatch.rs:9:4
+   |
+ 9 | fn accepts_dcs_only(_session: Session<Dcs, Configured>) {}
+   |    ^^^^^^^^^^^^^^^^ ----------------------------------

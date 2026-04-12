@@ -1,0 +1,8 @@
+error[E0599]: no method named `build` found for struct `SessionBuilder<dstar_gateway_core::DExtra, Provided, Missing, Provided, Provided>` in the current scope
+  --> tests/compile_fail/builder_missing_local_module.rs:17:28
+   |
+17 |     let _session = builder.build();
+   |                            ^^^^^ method not found in `SessionBuilder<dstar_gateway_core::DExtra, Provided, Missing, Provided, Provided>`
+   |
+   = note: the method was found for
+           - `SessionBuilder<P, Provided, Provided, Provided, Provided>`

@@ -12,10 +12,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: dtolnay/rust-toolchain@1.94.0
       - uses: taiki-e/install-action@cargo-machete
       - run: cargo machete thd75/
       - run: cargo machete thd75-tui/
+      - run: cargo machete mbelib-rs/
+      - run: cargo machete stargazer/
 
   semver:
     name: Semver check
@@ -26,6 +28,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: dtolnay/rust-toolchain@1.94.0
       - uses: taiki-e/install-action@cargo-semver-checks
       - run: cargo semver-checks --manifest-path thd75/Cargo.toml

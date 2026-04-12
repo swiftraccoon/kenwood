@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/spawn_connecting_session.rs:38:33
+   |
+38 |     let _ = AsyncSession::spawn(connecting, socket);
+   |             ------------------- ^^^^^^^^^^ expected `Session<_, Connected>`, found `Session<DExtra, Connecting>`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected struct `Session<_, dstar_gateway_core::Connected>`
+              found struct `Session<dstar_gateway_core::DExtra, dstar_gateway_core::Connecting>`
+note: associated function defined here
+  --> src/tokio_shell/handle.rs
+   |
+   |     pub fn spawn(session: Session<P, Connected>, socket: Arc<UdpSocket>) -> Self
+   |            ^^^^^

@@ -1,0 +1,13 @@
+error[E0599]: the method `connect` exists for struct `Session<dstar_gateway_core::DPlus, dstar_gateway_core::Configured>`, but its trait bounds were not satisfied
+  --> tests/compile_fail/dplus_connect_without_authenticate.rs:24:31
+   |
+24 |     let _connecting = session.connect(Instant::now());
+   |                               ^^^^^^^ method cannot be called due to unsatisfied trait bounds
+   |
+  ::: src/session/client/protocol.rs
+   |
+   | pub struct DPlus;
+   | ---------------- doesn't satisfy `dstar_gateway_core::DPlus: NoAuthRequired`
+   |
+   = note: the following trait bounds were not satisfied:
+           `dstar_gateway_core::DPlus: NoAuthRequired`

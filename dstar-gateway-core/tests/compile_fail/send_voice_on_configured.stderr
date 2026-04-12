@@ -1,0 +1,8 @@
+error[E0599]: no method named `send_voice` found for struct `Session<dstar_gateway_core::DExtra, dstar_gateway_core::Configured>` in the current scope
+  --> tests/compile_fail/send_voice_on_configured.rs:27:21
+   |
+27 |     let _ = session.send_voice(
+   |             --------^^^^^^^^^^ method not found in `Session<dstar_gateway_core::DExtra, dstar_gateway_core::Configured>`
+   |
+   = note: the method was found for
+           - `Session<P, dstar_gateway_core::Connected>`

@@ -1,14 +1,48 @@
+# Explicit target list: without this, cargo-deny uses the host platform
+# only and silently filters out deps gated for other targets. CI runs on
+# Linux x86_64 and sees redox-specific crates (parking_lot_core →
+# redox_syscall) that macOS developers don't — leading to local "bans
+# ok" but CI "bans FAILED". These triples cover every platform we ship
+# to (macOS ARM, macOS x86, Linux x86, Linux ARM, Windows).
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # RUSTSEC-2025-0057: fxhash is unmaintained.
+    #
+    # fxhash is a tiny (~50 LOC) hash-function crate pulled in transitively
+    # by `selectors` → `scraper` (our HTML parser for ircDDB scraping in
+    # stargazer). It provides FxHasher, a fast non-cryptographic hash used
+    # for internal hashmaps in HTML selector matching.
+    #
+    # "Unmaintained" here is a maintenance concern, not a security concern:
+    # there is no known vulnerability and no safe upgrade path. The upstream
+    # recommendation is rustc-hash, which scraper has not yet migrated to.
+    #
+    # Dependency path:
+    #   fxhash ← selectors ← scraper ← stargazer
+    #
+    # Recheck when `scraper` ships a version that migrates to rustc-hash.
+    { id = "RUSTSEC-2025-0057", reason = "fxhash is an unmaintained tiny hash-function crate pulled transitively by scraper/selectors; no known vulnerability, no safe upgrade; upstream recommendation (rustc-hash) requires a scraper upstream change" },
+]
 
 [licenses]
 version = 2
 allow = [
-    "GPL-2.0",
     "GPL-2.0-or-later",
     "GPL-3.0",
-    "GPL-3.0-or-later",
+    # LGPL-3.0 is required by mp3lame-encoder and mp3lame-sys (bindings to
+    # libmp3lame, LGPL-2.1+). LGPL allows linking from GPL-compatible code,
+    # which matches stargazer's GPL-2.0-or-later licensing.
+    "LGPL-3.0",
     "MIT",
     "Apache-2.0",
     "BSD-2-Clause",
@@ -16,25 +50,139 @@ allow = [
     "ISC",
     "MPL-2.0",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "BSL-1.0",
     "Zlib",
+    # Community Data License Agreement — Permissive 2.0. Used by
+    # webpki-roots (Mozilla's web PKI root cert list, pulled in via
+    # reqwest's rustls feature). Permissive data license similar to CC0.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "deny"
+# Path dependencies in this workspace don't carry a `version = "..."`
+# constraint — the dstar-gateway-* crates live in the kenwood monorepo
+# and are consumed by sibling crates via path only (we are not
+# publishing to crates.io). cargo-deny's `wildcards = "deny"` would
+# otherwise flag every path dep as a wildcard. `allow-wildcard-paths`
+# narrows the ban to non-path wildcards (e.g. `serde = "*"`).
 wildcards = "deny"
+allow-wildcard-paths = true
 skip = [
-    # serialport uses nix 0.26 (bitflags 1), mio-serial uses nix 0.29 (bitflags 2).
+    # ─────────────────────────────────────────────────────────────────────
+    # thd75 serial stack (serialport → mio-serial → tokio-serial)
+    # ─────────────────────────────────────────────────────────────────────
+
+    # serialport 4.x directly uses nix 0.26 (which itself uses bitflags 1).
+    # Newer nix (0.28+) migrated to bitflags 2. Other crates in the tree
+    # use bitflags 2. Can be dropped once serialport updates its nix pin.
     { crate = "bitflags@1" },
+
+    # serialport 4.x uses nix 0.26 for Unix-specific serial port IOCTLs.
+    # Dropable when serialport upgrades; tokio-serial pins serialport 4.x.
     { crate = "nix@0.26" },
-    # serialport/mio-serial Windows deps.
-    { crate = "windows-sys@0.52" },
-    { crate = "windows-sys@0.59" },
-    # thiserror 1.x pulled by transitive deps alongside our thiserror 2.x.
+
+    # mio-serial 5.x uses nix 0.29 for serial port event registration.
+    # Separate from serialport's nix 0.26 because mio-serial upgraded
+    # first. Dropable when mio-serial and serialport align on one nix.
+    { crate = "nix@0.29" },
+
+    # ─────────────────────────────────────────────────────────────────────
+    # thd75-repl directory detection (dirs-next → dirs-sys-next → redox_users)
+    # ─────────────────────────────────────────────────────────────────────
+
+    # redox_users 0.4 (used on Redox OS detection in dirs-next) still pins
+    # thiserror 1.x. Our workspace crates all use thiserror 2.x. Dropable
+    # when redox_users updates, or when dirs-next is replaced.
     { crate = "thiserror@1" },
+
+    # Proc-macro companion to thiserror 1.x. Tracks thiserror@1 exactly.
     { crate = "thiserror-impl@1" },
+
+    # ─────────────────────────────────────────────────────────────────────
+    # stargazer HTML parser (scraper → selectors + html5ever → phf_generator)
+    # ─────────────────────────────────────────────────────────────────────
+
+    # selectors 0.26 (used by scraper for CSS selector matching) uses
+    # derive_more 0.99. mp3lame-sys and other newer deps use derive_more
+    # 2.x. Dropable when scraper updates to the 2.x major. Low risk — the
+    # 0.99 branch is security-patched.
+    { crate = "derive_more@0.99" },
+
+    # ─────────────────────────────────────────────────────────────────────
+    # stargazer Postgres driver (sqlx → sqlx-core + sqlx-postgres)
+    # ─────────────────────────────────────────────────────────────────────
+
+    # hashlink 0.10 (used by sqlx-core for linked hash maps) uses
+    # hashbrown 0.15. Our other deps use hashbrown 0.17 (or 0.16 via
+    # kasuari, see below). Dropable when sqlx updates its hashlink
+    # dependency.
+    { crate = "hashbrown@0.15" },
+
+    # hashbrown 0.15 (via sqlx-core → hashlink) uses foldhash 0.1.
+    # Newer hashbrown uses foldhash 0.2. Dropable when sqlx's hashbrown
+    # updates (tracks hashbrown@0.15 above exactly).
+    { crate = "foldhash@0.1" },
+
+    # sqlx-core bundles webpki-roots 0.26 for TLS cert validation when
+    # connecting to Postgres over TLS. reqwest's rustls-tls pulls in
+    # webpki-roots 1.0. Dropable when sqlx upgrades to webpki-roots 1.x.
+    { crate = "webpki-roots@0.26" },
+
+    # etcetera 0.8 (used by sqlx-postgres for locating config dirs on
+    # Windows) uses windows-sys 0.48. Serialport pulls windows-sys 0.52
+    # (see below) and newer deps use 0.60+. Dropable when etcetera
+    # updates.
+    { crate = "windows-sys@0.48" },
+
+    # ─────────────────────────────────────────────────────────────────────
+    # thd75-tui layout engine (ratatui → kasuari)
+    # ─────────────────────────────────────────────────────────────────────
+
+    # kasuari 0.4 (ratatui's Cassowary constraint solver) uses hashbrown
+    # 0.16, separate from sqlx's 0.15 and the workspace default 0.17.
+    # Dropable when ratatui/kasuari updates.
+    { crate = "hashbrown@0.16" },
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Windows platform shim family 0.48 (sqlx-postgres → etcetera)
+    # ─────────────────────────────────────────────────────────────────────
+    #
+    # etcetera 0.8 (config-directory locator used by sqlx-postgres on
+    # Windows) depends on windows-sys 0.48, which transitively requires
+    # the full windows-targets 0.48 family (one shim per target triple).
+    # Newer crates in the tree use 0.52 or 0.53. Entire 0.48 family
+    # dropable when etcetera upgrades its windows-sys pin.
+
+    { crate = "windows-targets@0.48" },
+    { crate = "windows_aarch64_gnullvm@0.48" },
+    { crate = "windows_aarch64_msvc@0.48" },
+    { crate = "windows_i686_gnu@0.48" },
+    { crate = "windows_i686_msvc@0.48" },
+    { crate = "windows_x86_64_gnu@0.48" },
+    { crate = "windows_x86_64_gnullvm@0.48" },
+    { crate = "windows_x86_64_msvc@0.48" },
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Windows platform shim family 0.52 (serialport + ring on Windows)
+    # ─────────────────────────────────────────────────────────────────────
+    #
+    # serialport 4.x uses windows-sys 0.52 for Windows serial APIs.
+    # ring (rustls crypto) also pulls windows-sys 0.52 on Windows.
+    # Newer crates use windows-sys 0.60+ which use the unified
+    # `windows-link` crate instead of per-target shims. Entire 0.52
+    # family dropable when serialport/ring upgrade.
+
+    { crate = "windows-sys@0.52" },
+    { crate = "windows-targets@0.52" },
+    { crate = "windows_aarch64_gnullvm@0.52" },
+    { crate = "windows_aarch64_msvc@0.52" },
+    { crate = "windows_i686_gnu@0.52" },
+    { crate = "windows_i686_msvc@0.52" },
+    { crate = "windows_x86_64_gnu@0.52" },
+    { crate = "windows_x86_64_gnullvm@0.52" },
+    { crate = "windows_x86_64_msvc@0.52" },
 ]
 
 [sources]

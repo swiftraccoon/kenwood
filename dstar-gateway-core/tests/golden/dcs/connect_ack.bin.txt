@@ -1,0 +1,14 @@
+# connect_ack.bin
+# DCS connect ACK reply (14 bytes)
+#
+# Reference: ircDDBGateway/Common/ConnectData.cpp:374-380 (getDCSData CT_ACK)
+#
+# Inputs: callsign="DCS001", reflector_module='C'
+
+00:  44 43 53 30 30 31        # "DCS001" at [0..6]
+06:  20                       # space padding at [6]
+07:  20                       # memset pad slot at [7]
+08:  20                       # 8th char of callsign "DCS001  " (space) at [8]
+09:  43                       # reflector module 'C' at [9]
+10:  41 43 4B                 # "ACK" tag at [10..13]
+13:  00                       # NUL terminator at [13]

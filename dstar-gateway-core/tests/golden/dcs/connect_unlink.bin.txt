@@ -1,0 +1,13 @@
+# connect_unlink.bin
+# DCS UNLINK request (19 bytes)
+#
+# Reference: ircDDBGateway/Common/ConnectData.cpp:366-372 (getDCSData CT_UNLINK)
+#
+# 11-byte LINK skeleton + 8-byte reflector callsign.
+# Inputs: callsign="W1AW", client_module='B', reflector_callsign="DCS001"
+
+00:  57 31 41 57 20 20 20 20  # "W1AW    " at [0..8]
+08:  42                       # client module 'B' at [8]
+09:  20                       # space (unlink marker) at [9]
+10:  00                       # 0x00 at [10]
+11:  44 43 53 30 30 31 20 20  # "DCS001  " reflector callsign at [11..19]

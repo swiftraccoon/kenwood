@@ -1,6 +1,6 @@
 # kenwood-thd75
 
-[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-blue.svg)](https://www.rust-lang.org)
+[![Rust 1.94+](https://img.shields.io/badge/rust-1.94%2B-blue.svg)](https://www.rust-lang.org)
 [![License: GPL v2+](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
 
 Async Rust library for full control of the Kenwood TH-D75 ham radio transceiver.

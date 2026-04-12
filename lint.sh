@@ -14,7 +14,7 @@ run() {
 
 # Unsafe code audit: allow(unsafe_code) must only appear in bluetooth.rs
 echo "── unsafe audit ──"
-VIOLATIONS=$(grep -rn 'allow(unsafe_code)' thd75/src/ thd75-tui/src/ thd75-repl/src/ dstar-gateway/src/ --include='*.rs' | grep -v 'transport/bluetooth.rs' | grep -v 'thd75-tui/src/main.rs' | grep -v 'mmdvm_gateway_probe' || true)
+VIOLATIONS=$(grep -rn 'allow(unsafe_code)' thd75/src/ thd75-tui/src/ thd75-repl/src/ dstar-gateway/src/ dstar-gateway-core/src/ dstar-gateway-server/src/ mbelib-rs/src/ stargazer/src/ --include='*.rs' | grep -v 'transport/bluetooth.rs' | grep -v 'thd75-tui/src/main.rs' | grep -v 'mmdvm_gateway_probe' || true)
 if [ -n "$VIOLATIONS" ]; then
     echo "ERROR: allow(unsafe_code) found outside transport/bluetooth.rs:"
     echo "$VIOLATIONS"
@@ -24,12 +24,20 @@ fi
 # Clippy (all crates)
 run cargo clippy --manifest-path thd75/Cargo.toml --all-targets -- -D warnings
 run cargo clippy --manifest-path thd75-tui/Cargo.toml --all-targets -- -D warnings
+run cargo clippy --manifest-path dstar-gateway-core/Cargo.toml --all-targets -- -D warnings
 run cargo clippy --manifest-path dstar-gateway/Cargo.toml --all-targets -- -D warnings
+run cargo clippy --manifest-path dstar-gateway-server/Cargo.toml --all-targets -- -D warnings
 run cargo clippy --manifest-path thd75-repl/Cargo.toml --all-targets -- -D warnings
+run cargo clippy --manifest-path mbelib-rs/Cargo.toml --all-targets -- -D warnings
+run cargo clippy --manifest-path stargazer/Cargo.toml --all-targets -- -D warnings
 
 # Tests (all crates)
 run cargo test --manifest-path thd75/Cargo.toml
+run cargo test --manifest-path dstar-gateway-core/Cargo.toml
 run cargo test --manifest-path dstar-gateway/Cargo.toml
+run cargo test --manifest-path dstar-gateway-server/Cargo.toml
+run cargo test --manifest-path mbelib-rs/Cargo.toml
+run cargo test --manifest-path stargazer/Cargo.toml
 
 # Docs (workspace)
 RUSTDOCFLAGS="-D warnings" run cargo doc --workspace --no-deps
@@ -37,8 +45,12 @@ RUSTDOCFLAGS="-D warnings" run cargo doc --workspace --no-deps
 # Format (all crates)
 run cargo fmt --manifest-path thd75/Cargo.toml -- --check
 run cargo fmt --manifest-path thd75-tui/Cargo.toml -- --check
+run cargo fmt --manifest-path dstar-gateway-core/Cargo.toml -- --check
 run cargo fmt --manifest-path dstar-gateway/Cargo.toml -- --check
+run cargo fmt --manifest-path dstar-gateway-server/Cargo.toml -- --check
 run cargo fmt --manifest-path thd75-repl/Cargo.toml -- --check
+run cargo fmt --manifest-path mbelib-rs/Cargo.toml -- --check
+run cargo fmt --manifest-path stargazer/Cargo.toml -- --check
 
 # Security & quality checks (optional — only run if tools are installed)
 if command -v cargo-audit &>/dev/null; then

@@ -176,22 +176,23 @@ fn render_settings_list(
     lines.push(kv(" Beacon", &format!("{}", s.beacon_type)));
     lines.push(kv(
         " Fine Step",
-        &s.fine_step.map_or("N/A".to_string(), |fs| format!("{fs}")),
+        &s.fine_step
+            .map_or_else(|| "N/A".to_string(), |fs| format!("{fs}")),
     ));
     lines.push(kv(
         " Filter SSB",
         &s.filter_width_ssb
-            .map_or("N/A".to_string(), |w| format!("{w}")),
+            .map_or_else(|| "N/A".to_string(), |w| format!("{w}")),
     ));
     lines.push(kv(
         " Filter CW",
         &s.filter_width_cw
-            .map_or("N/A".to_string(), |w| format!("{w}")),
+            .map_or_else(|| "N/A".to_string(), |w| format!("{w}")),
     ));
     lines.push(kv(
         " Filter AM",
         &s.filter_width_am
-            .map_or("N/A".to_string(), |w| format!("{w}")),
+            .map_or_else(|| "N/A".to_string(), |w| format!("{w}")),
     ));
     lines.push(Line::from(""));
 
@@ -205,7 +206,7 @@ fn render_settings_list(
         " Step",
         &s.band_a
             .step_size
-            .map_or("N/A".into(), |st| format!("{st}")),
+            .map_or_else(|| "N/A".into(), |st| format!("{st}")),
     ));
     lines.push(kv(" Attenuator", &on_off(s.band_a.attenuator)));
     lines.push(kv(" Squelch", &s.band_a.squelch.to_string()));
@@ -221,7 +222,7 @@ fn render_settings_list(
         " Step",
         &s.band_b
             .step_size
-            .map_or("N/A".into(), |st| format!("{st}")),
+            .map_or_else(|| "N/A".into(), |st| format!("{st}")),
     ));
     lines.push(kv(" Attenuator", &on_off(s.band_b.attenuator)));
     lines.push(kv(" Squelch", &s.band_b.squelch.to_string()));
@@ -255,38 +256,38 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
             app.state
                 .band_a
                 .step_size
-                .map_or("N/A".into(), |st| format!("{st}")),
+                .map_or_else(|| "N/A".into(), |st| format!("{st}")),
             Color::Yellow,
         ),
         SettingRow::StepSizeB => (
             app.state
                 .band_b
                 .step_size
-                .map_or("N/A".into(), |st| format!("{st}")),
+                .map_or_else(|| "N/A".into(), |st| format!("{st}")),
             Color::Yellow,
         ),
         SettingRow::FineStep => (
             app.state
                 .fine_step
-                .map_or("N/A".into(), |fs| format!("{fs}")),
+                .map_or_else(|| "N/A".into(), |fs| format!("{fs}")),
             Color::Yellow,
         ),
         SettingRow::FilterWidthSsb => (
             app.state
                 .filter_width_ssb
-                .map_or("N/A".into(), |w| format!("{w}")),
+                .map_or_else(|| "N/A".into(), |w| format!("{w}")),
             Color::Yellow,
         ),
         SettingRow::FilterWidthCw => (
             app.state
                 .filter_width_cw
-                .map_or("N/A".into(), |w| format!("{w}")),
+                .map_or_else(|| "N/A".into(), |w| format!("{w}")),
             Color::Yellow,
         ),
         SettingRow::FilterWidthAm => (
             app.state
                 .filter_width_am
-                .map_or("N/A".into(), |w| format!("{w}")),
+                .map_or_else(|| "N/A".into(), |w| format!("{w}")),
             Color::Yellow,
         ),
         SettingRow::FmNarrow => mcp_num(app, |s| s.settings().fm_narrow()),
@@ -433,13 +434,14 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::BeaconType => (format!("{}", app.state.beacon_type), Color::Yellow),
         SettingRow::GpsEnabled => bool_span(app.state.gps_enabled),
         SettingRow::ScanResumeCat => (
-            app.state
-                .scan_resume_cat
-                .map_or("? (write-only)".into(), |m| match m {
+            app.state.scan_resume_cat.map_or_else(
+                || "? (write-only)".into(),
+                |m| match m {
                     kenwood_thd75::types::ScanResumeMethod::TimeOperated => "Time".into(),
                     kenwood_thd75::types::ScanResumeMethod::CarrierOperated => "Carrier".into(),
                     kenwood_thd75::types::ScanResumeMethod::Seek => "Seek".into(),
-                }),
+                },
+            ),
             Color::Yellow,
         ),
         SettingRow::ActiveBand

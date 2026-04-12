@@ -1,0 +1,25 @@
+[package]
+name = "dstar-gateway-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Sans-io core for the dstar-gateway D-STAR reflector library"
+license = "GPL-2.0-or-later"
+authors = ["swiftraccoon"]
+keywords = ["dstar", "ham-radio", "reflector", "amateur-radio"]
+categories = ["network-programming", "parser-implementations"]
+repository = "https://github.com/swiftraccoon/kenwood"
+readme = "README.md"
+publish = false
+
+[dependencies]
+thiserror = "2"
+tracing = { version = "0.1", default-features = false, features = ["attributes"] }
+
+[dev-dependencies]
+proptest = "1"
+static_assertions = "1"
+trybuild = "1"
+
+[lints]
+workspace = true

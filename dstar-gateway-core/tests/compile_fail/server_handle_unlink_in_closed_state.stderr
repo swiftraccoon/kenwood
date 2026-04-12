@@ -1,0 +1,19 @@
+warning: unreachable statement
+  --> tests/compile_fail/server_handle_unlink_in_closed_state.rs:20:5
+   |
+15 |     let session: ServerSession<DExtra, Closed> = todo!();
+   |                                                  ------- any code following this expression is unreachable
+...
+20 |     let _ = session.handle_unlink(Instant::now(), &[0u8; 0]);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0599]: no method named `handle_unlink` found for struct `ServerSession<dstar_gateway_core::DExtra, dstar_gateway_core::session::server::Closed>` in the current scope
+  --> tests/compile_fail/server_handle_unlink_in_closed_state.rs:20:21
+   |
+20 |     let _ = session.handle_unlink(Instant::now(), &[0u8; 0]);
+   |                     ^^^^^^^^^^^^^ method not found in `ServerSession<dstar_gateway_core::DExtra, dstar_gateway_core::session::server::Closed>`
+   |
+   = note: the method was found for
+           - `ServerSession<P, dstar_gateway_core::session::server::Linked>`

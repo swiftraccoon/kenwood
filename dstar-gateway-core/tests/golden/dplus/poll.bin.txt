@@ -1,0 +1,8 @@
+# poll.bin
+# DPlus keepalive poll (3 bytes)
+#
+# Reference: xlxd/src/cdplusprotocol.cpp:529-533 (EncodeKeepAlivePacket)
+# Reference: ircDDBGateway/Common/DPlusHandler.cpp:57
+#   (m_pollTimer(1000U, 1U) = 1 second cadence)
+
+00:  03 60 00          # fixed 3-byte keepalive literal

@@ -11,10 +11,40 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: dtolnay/rust-toolchain@1.94.0
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
+      # rustdoc does not generate a root index.html when called with
+      # --workspace — each crate gets its own subdirectory. Without this
+      # redirect, https://<org>.github.io/kenwood/ returns 404 while
+      # /kenwood_thd75/ etc. serve correctly. The content below is 100%
+      # static (no GitHub event input interpolation) so no injection risk.
+      - name: Generate root index redirect
+        run: |
+          cat > target/doc/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <title>Kenwood TH-D75 Rust workspace documentation</title>
+            <meta http-equiv="refresh" content="0; url=kenwood_thd75/">
+            <link rel="canonical" href="kenwood_thd75/">
+          </head>
+          <body>
+            <p>Redirecting to <a href="kenwood_thd75/">kenwood-thd75 documentation</a>.</p>
+            <p>Other crates in this workspace:
+              <a href="dstar_gateway/">dstar-gateway</a>,
+              <a href="dstar_gateway_core/">dstar-gateway-core</a>,
+              <a href="dstar_gateway_server/">dstar-gateway-server</a>,
+              <a href="thd75_tui/">thd75-tui</a>,
+              <a href="thd75_repl/">thd75-repl</a>,
+              <a href="mbelib_rs/">mbelib-rs</a>,
+              <a href="stargazer/">stargazer</a>.
+            </p>
+          </body>
+          </html>
+          HTML
       - uses: actions/upload-pages-artifact@v3
         with:
           path: target/doc

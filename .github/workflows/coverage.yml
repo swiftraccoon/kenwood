@@ -11,11 +11,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: dtolnay/rust-toolchain@1.94.0
       - uses: taiki-e/install-action@cargo-tarpaulin
       - run: cargo tarpaulin --manifest-path thd75/Cargo.toml --lib --out xml || true
+      - run: cargo tarpaulin --manifest-path mbelib-rs/Cargo.toml --lib --out xml --output-dir target/tarpaulin-mbelib-rs || true
+      - run: cargo tarpaulin --manifest-path stargazer/Cargo.toml --bins --out xml --output-dir target/tarpaulin-stargazer || true
       - uses: codecov/codecov-action@v5
         with:
-          files: cobertura.xml
+          files: cobertura.xml,target/tarpaulin-mbelib-rs/cobertura.xml,target/tarpaulin-stargazer/cobertura.xml
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}

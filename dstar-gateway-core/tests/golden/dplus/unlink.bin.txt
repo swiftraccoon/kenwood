@@ -1,0 +1,7 @@
+# unlink.bin
+# DPlus UNLINK request (5 bytes)
+#
+# Reference: ircDDBGateway/Common/ConnectData.cpp:475-481 (getDPlusData CT_UNLINK)
+# Reference: xlxd/src/cdplusprotocol.cpp:447-451 (IsValidDisconnectPacket)
+
+00:  05 00 18 00 00    # fixed unlink literal (byte 4 = 0x00 vs LINK1's 0x01)

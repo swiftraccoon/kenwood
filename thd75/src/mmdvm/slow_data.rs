@@ -170,7 +170,7 @@ impl SlowDataDecoder {
         // Frame 0 of each 21-frame superframe is a sync frame carrying
         // [0x55,0x55,0x55] filler. It must not be fed into the half-block
         // accumulator or it would misalign every following block.
-        if frame_index % 21 == 0 {
+        if frame_index.is_multiple_of(21) {
             tracing::trace!(
                 target: "kenwood_thd75::slow_data",
                 frame_index,

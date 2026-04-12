@@ -130,5 +130,5 @@ RUST_LOG=dstar_gateway=trace,kenwood_thd75::slow_data=debug thd75-repl
 
 ## Requirements
 
-- Rust 1.89+
+- Rust 1.94+
 - Kenwood TH-D75 connected via USB or Bluetooth

@@ -1,0 +1,8 @@
+error[E0599]: no method named `build` found for struct `ReflectorConfigBuilder<Missing, Provided, Provided>` in the current scope
+  --> tests/compile_fail/reflector_config_missing_callsign.rs:19:27
+   |
+19 |     let _config = builder.build();
+   |                           ^^^^^ method not found in `ReflectorConfigBuilder<Missing, Provided, Provided>`
+   |
+   = note: the method was found for
+           - `ReflectorConfigBuilder<Provided, Provided, Provided>`

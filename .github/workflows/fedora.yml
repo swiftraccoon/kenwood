@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: dnf install -y gcc
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: dtolnay/rust-toolchain@1.94.0
         with:
           components: clippy
       - run: cargo check
@@ -25,6 +25,10 @@ jobs:
         working-directory: dstar-gateway
       - run: cargo check
         working-directory: thd75-repl
+      - run: cargo check
+        working-directory: mbelib-rs
+      - run: cargo check
+        working-directory: stargazer
       - run: cargo build
         working-directory: thd75
       - run: cargo build
@@ -33,6 +37,10 @@ jobs:
         working-directory: dstar-gateway
       - run: cargo build
         working-directory: thd75-repl
+      - run: cargo build
+        working-directory: mbelib-rs
+      - run: cargo build
+        working-directory: stargazer
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: thd75
       - run: cargo clippy --all-targets -- -D warnings
@@ -41,6 +49,10 @@ jobs:
         working-directory: dstar-gateway
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: thd75-repl
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: mbelib-rs
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: stargazer
       - run: cargo test --lib
         working-directory: thd75
       - run: cargo test
@@ -49,3 +61,7 @@ jobs:
         working-directory: dstar-gateway
       - run: cargo test
         working-directory: thd75-repl
+      - run: cargo test
+        working-directory: mbelib-rs
+      - run: cargo test --bins
+        working-directory: stargazer

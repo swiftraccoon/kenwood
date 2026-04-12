@@ -88,7 +88,9 @@ fn band_lines(band: &BandState) -> Vec<Line<'static>> {
 
     let s_meter_line = s_meter_line(band.s_meter);
 
-    let step_str = band.step_size.map_or("N/A".into(), |s| format!("{s}"));
+    let step_str = band
+        .step_size
+        .map_or_else(|| "N/A".into(), |s| format!("{s}"));
     let mut extra = vec![
         Span::styled("  Step:", Style::default().fg(Color::DarkGray)),
         Span::styled(step_str, Style::default().fg(Color::Yellow)),

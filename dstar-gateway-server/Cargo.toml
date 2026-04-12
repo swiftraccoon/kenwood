@@ -1,0 +1,28 @@
+[package]
+name = "dstar-gateway-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Multi-client D-STAR reflector server (DPlus, DExtra, DCS)"
+license = "GPL-2.0-or-later"
+authors = ["swiftraccoon"]
+keywords = ["dstar", "ham-radio", "reflector", "amateur-radio"]
+categories = ["network-programming"]
+repository = "https://github.com/swiftraccoon/kenwood"
+readme = "README.md"
+publish = false
+
+[dependencies]
+dstar-gateway-core = { path = "../dstar-gateway-core" }
+tokio = { version = "1", features = ["net", "time", "sync", "macros", "io-util", "rt", "rt-multi-thread"] }
+tracing = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter"] }
+proptest = "1"
+trybuild = "1"
+
+[lints]
+workspace = true

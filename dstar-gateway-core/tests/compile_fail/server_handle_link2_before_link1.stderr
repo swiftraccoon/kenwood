@@ -1,0 +1,18 @@
+warning: unreachable statement
+  --> tests/compile_fail/server_handle_link2_before_link1.rs:18:5
+   |
+17 |     let session: ServerSession<DPlus, Unknown> = todo!();
+   |                                                  ------- any code following this expression is unreachable
+18 |     let callsign = Callsign::from_wire_bytes(*b"W1AW    ");
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0599]: no method named `handle_link2` found for struct `ServerSession<dstar_gateway_core::DPlus, dstar_gateway_core::session::server::Unknown>` in the current scope
+  --> tests/compile_fail/server_handle_link2_before_link1.rs:23:21
+   |
+23 |     let _ = session.handle_link2(Instant::now(), callsign, &[0u8; 0]);
+   |                     ^^^^^^^^^^^^ method not found in `ServerSession<dstar_gateway_core::DPlus, dstar_gateway_core::session::server::Unknown>`
+   |
+   = note: the method was found for
+           - `ServerSession<dstar_gateway_core::DPlus, Link1Received>`

@@ -1,0 +1,9 @@
+# link2_okrw_reply.bin
+# DPlus LINK2 accept reply (8 bytes)
+#
+# Reference: ircDDBGateway/Common/ConnectData.cpp:251-259
+#   (memcmp(data + 4, "OKRW", 4))
+# Reference: xlxd/src/cdplusprotocol.cpp:535-539 (EncodeLoginAckPacket)
+
+00:  08 C0 04 00       # 4-byte reply prefix (LINK2_REPLY_PREFIX)
+04:  4F 4B 52 57       # "OKRW" = login accepted (LINK2_ACCEPT_TAG)

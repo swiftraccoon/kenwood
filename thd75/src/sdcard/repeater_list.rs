@@ -154,7 +154,7 @@ fn decode_utf16le_bom(data: &[u8]) -> Result<String, SdCardError> {
     }
 
     let payload = &data[2..];
-    if payload.len() % 2 != 0 {
+    if !payload.len().is_multiple_of(2) {
         return Err(SdCardError::InvalidUtf16Length { len: payload.len() });
     }
 

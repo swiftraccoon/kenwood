@@ -1,0 +1,11 @@
+# poll_request.bin
+# DCS keepalive poll request (17 bytes)
+#
+# Reference: ircDDBGateway/Common/PollData.cpp:170-186 (getDCSData DIR_OUTGOING)
+#
+# Callsign at [0..8], 0x00 at [8], reflector callsign at [9..17].
+# Inputs: callsign="W1AW", reflector_callsign="DCS001"
+
+00:  57 31 41 57 20 20 20 20  # "W1AW    " at [0..8]
+08:  00                       # 0x00 at [8]
+09:  44 43 53 30 30 31 20 20  # "DCS001  " reflector callsign at [9..17]

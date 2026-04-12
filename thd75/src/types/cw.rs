@@ -110,7 +110,7 @@ impl CwPitch {
     /// or is not a multiple of 100 Hz.
     #[must_use]
     pub const fn new(hz: u16) -> Option<Self> {
-        if hz >= Self::MIN_HZ && hz <= Self::MAX_HZ && hz % Self::STEP_HZ == 0 {
+        if hz >= Self::MIN_HZ && hz <= Self::MAX_HZ && hz.is_multiple_of(Self::STEP_HZ) {
             Some(Self(hz))
         } else {
             None

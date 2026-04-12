@@ -1,0 +1,10 @@
+[book]
+title = "The dstar-gateway Book"
+authors = ["swiftraccoon"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "ayu"
+git-repository-url = "https://github.com/swiftraccoon/dstar-gateway"
+edit-url-template = "https://github.com/swiftraccoon/dstar-gateway/edit/main/dstar-gateway/book/{path}"

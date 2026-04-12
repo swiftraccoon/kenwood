@@ -1,0 +1,42 @@
+name: fuzz
+
+on:
+  pull_request:
+    paths:
+      - 'dstar-gateway-core/**'
+      - '.github/workflows/fuzz.yml'
+  workflow_dispatch:
+
+# Minimum required permissions: fuzz jobs only checkout source and run
+# cargo-fuzz — no writes to any GitHub resource.
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - dplus_decode_server_to_client
+          - dplus_decode_client_to_server
+          - dplus_parse_auth_response
+          - dextra_decode_server_to_client
+          - dextra_decode_client_to_server
+          - dcs_decode_server_to_client
+          - dcs_decode_client_to_server
+          - header_decode
+          - slow_data_descramble
+          - dprs_parse
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - run: cargo install cargo-fuzz
+      - name: Run fuzz target
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time=60
+        working-directory: dstar-gateway-core

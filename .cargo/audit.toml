@@ -1,0 +1,43 @@
+# cargo-audit configuration for the kenwood workspace.
+#
+# cargo-audit and cargo-deny use different advisory resolution logic, so
+# the ignore lists are not identical. Entries here must match what
+# cargo-audit actually detects in our Cargo.lock.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2025-0057: fxhash is unmaintained.
+    #
+    # Pulled in transitively by `selectors` → `scraper` (our HTML parser
+    # for ircDDB scraping in stargazer). Tiny (~50 LOC) hash-function
+    # crate, no known vulnerability, no safe upgrade path. Upstream
+    # recommendation (rustc-hash) requires a scraper upstream change.
+    # Recheck when scraper ships a version that migrates away.
+    "RUSTSEC-2025-0057",
+
+    # RUSTSEC-2023-0071: Marvin Attack timing side-channel in rsa 0.9.x.
+    #
+    # Pulled in by sqlx-mysql, which itself comes from sqlx-macros-core
+    # (sqlx's proc-macro crate hard-includes code for all three backends
+    # at compile time regardless of which runtime features are enabled).
+    # Our stargazer crate enables only the postgres backend. The
+    # vulnerable RSA decryption code path is never executed at runtime
+    # because we never talk to a MySQL server — it is only present in
+    # the proc-macro compilation stage.
+    # Recheck when rsa 0.10+ (timing-safe) is adopted by sqlx, or when
+    # sqlx splits its proc-macro crate per backend.
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0097: rand unsoundness with custom log::Log impls.
+    #
+    # Fires when a custom `log::Log` implementation calls `rand::rng()`
+    # from within its `log()` method, causing recursive re-entry into
+    # the logger. Our workspace uses `tracing` (not the `log` crate)
+    # for all logging. `tracing-subscriber`'s fmt layer and
+    # `tracing-appender` do not call into rand from their filter/
+    # format/write paths, so the vulnerable usage pattern does not
+    # exist in this codebase.
+    # Recheck when rand 0.9.3+ ships the fix and sqlx upgrades, or
+    # when we add any custom log::Log implementation.
+    "RUSTSEC-2026-0097",
+]

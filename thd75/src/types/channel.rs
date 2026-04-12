@@ -1264,7 +1264,7 @@ mod tests {
             ..FlashChannel::default()
         };
         let bytes = ch.to_bytes();
-        assert_eq!(bytes[0x27], 0x80 | 42);
+        assert_eq!(bytes[0x27], 0x80 | 0x2A);
         let parsed = FlashChannel::from_bytes(&bytes).unwrap();
         assert_eq!(parsed.dv_code, 42);
         assert!(parsed.byte27_bit7);

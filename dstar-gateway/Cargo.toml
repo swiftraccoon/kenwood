@@ -2,40 +2,91 @@
 name = "dstar-gateway"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
-description = "D-STAR reflector gateway client library (DPlus, DExtra, DCS)"
+rust-version = "1.94"
+description = "Async tokio shell for the dstar-gateway-core D-STAR reflector library (DPlus, DExtra, DCS)"
 license = "GPL-2.0-or-later"
 authors = ["swiftraccoon"]
 keywords = ["dstar", "ham-radio", "reflector", "amateur-radio", "mmdvm"]
 categories = ["network-programming", "hardware-support"]
-repository = "https://github.com/swiftraccoon/dstar-gateway"
+repository = "https://github.com/swiftraccoon/kenwood"
 readme = "README.md"
+publish = false
 
 [dependencies]
-tokio = { version = "1", features = ["net", "time", "sync", "macros", "io-util"] }
+tokio = { version = "1", features = ["net", "time", "sync", "macros", "io-util", "rt"] }
 tracing = "0.1"
 thiserror = "2"
+dstar-gateway-core = { path = "../dstar-gateway-core" }
+# reqwest 0.12's `rustls-tls` feature uses webpki-roots directly for cert
+# verification. reqwest 0.13's `rustls` feature mandatorily includes
+# `rustls-platform-verifier` which pulls in the `jni` crate (for Android
+# cert verification) and its Windows platform shims, causing duplicate
+# windows_x86_64_msvc versions under cargo-deny. Pin to 0.12 to avoid.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+
+[features]
+default = []
+blocking = []
+hosts-fetcher = ["dep:reqwest"]
+# Opt-in hardware-in-the-loop integration tests. Requires a reachable
+# reflector (see `tests/hardware.rs`). Off by default so normal
+# `cargo test` runs do not reach out to the network. Enable with
+# `cargo test --features hardware-tests --test hardware -- --test-threads=1`.
+hardware-tests = []
+# Compiles the examples that require real network access at runtime.
+# Default off so `cargo build --examples` is hermetic. Enable with
+# `cargo build --examples --features examples-network`.
+examples-network = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
-proptest = "1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+trybuild = "1"
+# Legacy pcap reader for the conformance replay tests. Dev-only; the
+# main library never pulls pcap-parser or its transitive nom stack.
+pcap-parser = "0.17"
 
-[lints.rust]
-unsafe_code = "deny"
-missing_docs = "deny"
-missing_debug_implementations = "deny"
-unreachable_pub = "deny"
-unused_results = "deny"
-elided_lifetimes_in_paths = "deny"
-trivial_casts = "deny"
-trivial_numeric_casts = "deny"
-unused_import_braces = "deny"
-unused_qualifications = "deny"
+# Network-gated examples: skipped unless `--features examples-network`
+# is passed on the command line. `required-features` tells Cargo to
+# skip the example when the feature is disabled; the `#![cfg(...)]`
+# attribute on each file is belt-and-suspenders so a stray
+# `cargo build --example` without `-p dstar-gateway` still compiles
+# cleanly.
+[[example]]
+name = "04_send_voice_dplus"
+required-features = ["examples-network"]
 
-[lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-cargo = { level = "deny", priority = -1 }
-module_name_repetitions = "allow"
-multiple_crate_versions = "allow"
+[[example]]
+name = "05_receive_voice_with_diagnostics"
+required-features = ["examples-network"]
+
+[[example]]
+name = "06_dprs_position_listener"
+required-features = ["examples-network"]
+
+[[example]]
+name = "07_reconnect_with_backoff"
+required-features = ["examples-network"]
+
+[[example]]
+name = "08_bridge_two_reflectors"
+required-features = ["examples-network"]
+
+[[example]]
+name = "09_blocking_cli"
+required-features = ["examples-network", "blocking"]
+
+[[example]]
+name = "10_record_session_to_file"
+required-features = ["examples-network"]
+
+# Hardware-in-the-loop tests: Cargo skips the test target entirely
+# when the feature is off, so the unused_crate_dependencies lint
+# never fires on it and no #![cfg] gymnastics are needed inside
+# the file.
+[[test]]
+name = "hardware"
+required-features = ["hardware-tests"]
+
+[lints]
+workspace = true

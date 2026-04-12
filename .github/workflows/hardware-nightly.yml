@@ -1,0 +1,23 @@
+name: hardware-nightly
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+# Minimum required permissions: the job only needs to checkout source and
+# run cargo test — no writes to any GitHub resource.
+permissions:
+  contents: read
+
+jobs:
+  hardware:
+    runs-on: [self-hosted, hardware-thd75]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - run: cargo test --features hardware-tests --test hardware -- --test-threads=1 --nocapture
+        env:
+          DSTAR_TEST_REFLECTOR_DPLUS: REF030
+          DSTAR_TEST_REFLECTOR_DEXTRA: XLX307
+          DSTAR_TEST_REFLECTOR_DCS: DCS001

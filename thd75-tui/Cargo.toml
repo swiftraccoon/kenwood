@@ -2,7 +2,7 @@
 name = "thd75-tui"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 description = "Terminal UI for the Kenwood TH-D75 transceiver"
 license = "GPL-2.0-or-later"
 authors = ["swiftraccoon"]
@@ -10,9 +10,10 @@ repository = "https://github.com/swiftraccoon/kenwood"
 readme = "../README.md"
 keywords = ["ham-radio", "kenwood", "tui", "amateur-radio"]
 categories = ["command-line-utilities"]
+publish = false
 
 [dependencies]
-kenwood-thd75 = { path = "../thd75", version = "0.1.0" }
+kenwood-thd75 = { path = "../thd75" }
 ratatui = "0.30"
 crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }

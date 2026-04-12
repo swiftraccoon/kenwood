@@ -661,7 +661,7 @@ impl<T: Transport> DStarGateway<T> {
         {
             let elapsed = last.elapsed();
             if elapsed < VOICE_FRAME_INTERVAL {
-                tokio::time::sleep(VOICE_FRAME_INTERVAL - elapsed).await;
+                tokio::time::sleep(VOICE_FRAME_INTERVAL.saturating_sub(elapsed)).await;
             }
         }
 

@@ -1,3 +1,52 @@
 [workspace]
-members = ["thd75", "thd75-tui", "thd75-repl", "dstar-gateway"]
+members = [
+    "thd75",
+    "thd75-tui",
+    "thd75-repl",
+    "dstar-gateway",
+    "dstar-gateway-core",
+    "dstar-gateway-server",
+    "mbelib-rs",
+    "stargazer",
+]
 resolver = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+unused_results = "deny"
+elided_lifetimes_in_paths = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_qualifications = "deny"
+non_ascii_idents = "deny"
+single_use_lifetimes = "deny"
+let_underscore_drop = "deny"
+unused_crate_dependencies = "deny"
+unused_import_braces = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+restriction = { level = "allow", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+missing_assert_message = "deny"
+missing_const_for_fn = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+missing_crate_level_docs = "deny"
+invalid_codeblock_attributes = "deny"
+bare_urls = "deny"
+unescaped_backticks = "deny"

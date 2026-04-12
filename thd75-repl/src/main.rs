@@ -33,10 +33,18 @@ use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::{AprsClient, AprsClientConfig, AprsEvent};
 use kenwood_thd75::{DStarEvent, DStarGateway, DStarGatewayConfig, SlowDataDecoder};
 
-use dstar_gateway::protocol::{ConnectionState, ReflectorEvent};
-use dstar_gateway::{
-    Callsign, Module, Protocol, ReflectorClient, ReflectorClientParams, StreamId, Suffix,
+use dstar_gateway::auth::AuthClient;
+use dstar_gateway::tokio_shell::{AsyncSession, ShellError};
+use dstar_gateway_core::header::DStarHeader as CoreDStarHeader;
+use dstar_gateway_core::hosts::HostFile;
+use dstar_gateway_core::session::Driver;
+use dstar_gateway_core::session::client::{
+    ClientStateKind, Connected, Connecting, DExtra, DPlus, Dcs, DisconnectReason, Event, Session,
+    VoiceEndReason,
 };
+use dstar_gateway_core::types::ProtocolKind;
+use dstar_gateway_core::voice::VoiceFrame as CoreVoiceFrame;
+use dstar_gateway_core::{Callsign, Module, StreamId, Suffix};
 
 /// Log verbosity level for the opt-in file sink.
 ///
@@ -132,16 +140,19 @@ struct Cli {
 
     /// Enable file logging at the given level (default: no file).
     ///
-    /// File location:
-    /// - macOS: `~/Library/Logs/thd75-repl/thd75-repl.log.<date>`
-    /// - Linux: `~/.local/state/thd75-repl/thd75-repl.log.<date>`
-    /// - Windows: `%LOCALAPPDATA%\thd75-repl\logs\thd75-repl.log.<date>`
+    /// File location (one fresh file per session, suffix is the UTC
+    /// session start time at second granularity):
+    /// - macOS: `~/Library/Logs/thd75-repl/thd75-repl.log.<YYYY-MM-DD-HHMMSS>`
+    /// - Linux: `~/.local/state/thd75-repl/thd75-repl.log.<YYYY-MM-DD-HHMMSS>`
+    /// - Windows: `%LOCALAPPDATA%\thd75-repl\logs\thd75-repl.log.<YYYY-MM-DD-HHMMSS>`
     ///
-    /// Files rotate daily. **File logging is opt-in** because trace-
-    /// level capture during D-STAR voice flow generates large files
-    /// fast (~1 MB/s of trace output per active reflector link).
-    /// Pass `--log-level=trace` or `--trace` when you want to capture
-    /// a bug report; leave it off for normal operation.
+    /// Every `thd75-repl` invocation creates its own log file — old
+    /// files accumulate until you clean them up manually. **File
+    /// logging is opt-in** because trace-level capture during D-STAR
+    /// voice flow generates large files fast (~1 MB/s of trace output
+    /// per active reflector link). Pass `--log-level=trace` or
+    /// `--trace` when you want to capture a bug report; leave it off
+    /// for normal operation.
     #[arg(long, value_enum, default_value_t = LogLevel::Off)]
     log_level: LogLevel,
 
@@ -200,10 +211,11 @@ struct Cli {
     command: Vec<String>,
 }
 
-/// Determine the on-disk directory where daily log files should be
-/// written. Returns `None` if no suitable directory can be derived
-/// from the environment (extremely rare — only if `home_dir()` is
-/// unset on Unix or `data_local_dir()` is unset on Windows).
+/// Determine the on-disk directory where per-session log files
+/// should be written. Returns `None` if no suitable directory can
+/// be derived from the environment (extremely rare — only if
+/// `home_dir()` is unset on Unix or `data_local_dir()` is unset on
+/// Windows).
 ///
 /// Locations follow platform convention:
 /// - macOS: `$HOME/Library/Logs/thd75-repl`
@@ -266,7 +278,7 @@ struct LoggingGuard {
 /// on disk. This keeps normal sessions cheap and quiet.
 ///
 /// Opt-in logging is controlled by CLI flags:
-/// - `--log-level=X` creates a daily-rotating file at level X
+/// - `--log-level=X` creates a fresh per-session file at level X
 /// - `--trace` is shorthand for `--log-level=trace`
 ///
 /// For power users who want live log output on stderr, `RUST_LOG` is
@@ -299,8 +311,11 @@ fn init_logging(cli: &Cli) -> LoggingGuard {
     });
 
     // File layer is opt-in via `--log-level` / `--trace`. Default is
-    // no file created at all. When enabled, a daily-rotating file is
-    // written to the platform-appropriate log directory.
+    // no file created at all. When enabled, a fresh per-session file
+    // is written to the platform-appropriate log directory. The
+    // filename embeds the UTC session start time at second
+    // granularity so sequential invocations don't overwrite each
+    // other and can be sorted chronologically by `ls`.
     let mut file_layer_opt = None;
     let mut worker_guard = None;
     let mut announced_path = None;
@@ -313,15 +328,32 @@ fn init_logging(cli: &Cli) -> LoggingGuard {
                     dir.display()
                 );
             } else {
-                let appender = tracing_appender::rolling::daily(&dir, "thd75-repl.log");
-                let (writer, guard) = tracing_appender::non_blocking(appender);
-                let layer = fmt::layer()
-                    .with_writer(writer)
-                    .with_ansi(false)
-                    .with_filter(EnvFilter::new(level_str));
-                file_layer_opt = Some(layer);
-                worker_guard = Some(guard);
-                announced_path = Some(dir);
+                let session_suffix = time::OffsetDateTime::now_utc()
+                    .format(time::macros::format_description!(
+                        "[year]-[month]-[day]-[hour][minute][second]"
+                    ))
+                    .unwrap_or_else(|_| "session".to_string());
+                let file_name = format!("thd75-repl.log.{session_suffix}");
+                let path = dir.join(&file_name);
+                match std::fs::File::create(&path) {
+                    Ok(file) => {
+                        let (writer, guard) = tracing_appender::non_blocking(file);
+                        let layer = fmt::layer()
+                            .with_writer(writer)
+                            .with_ansi(false)
+                            .with_filter(EnvFilter::new(level_str));
+                        file_layer_opt = Some(layer);
+                        worker_guard = Some(guard);
+                        announced_path = Some(path);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: could not create log file {}: {e}. \
+                             File logging disabled.",
+                            path.display()
+                        );
+                    }
+                }
             }
         } else {
             eprintln!(
@@ -336,14 +368,14 @@ fn init_logging(cli: &Cli) -> LoggingGuard {
         .with(file_layer_opt)
         .init();
 
-    if let Some(dir) = announced_path {
-        // Daily rotation suffixes the file name with the local date.
-        // Tell the user where to find it so they can share the path
-        // in bug reports.
+    if let Some(path) = announced_path {
+        // Per-session file: a fresh log file was just created for
+        // this invocation. Print the concrete filename so users can
+        // copy-paste it into bug reports.
         println!(
-            "Logging at {} to {}/thd75-repl.log.<date> (rotates daily).",
+            "Logging at {} to {}.",
             file_level.as_filter().unwrap_or("off"),
-            dir.display()
+            path.display(),
         );
     }
 
@@ -598,8 +630,9 @@ enum ReplState {
 struct DStarSession {
     /// Radio-side MMDVM gateway.
     gateway: DStarGateway<EitherTransport>,
-    /// Reflector-side UDP client (`DExtra` for now).
-    reflector: Option<ReflectorClient>,
+    /// Reflector-side UDP session wrapper (runtime-dispatched across
+    /// all three supported protocols).
+    reflector: Option<ReflectorSession>,
     /// Station callsign (validated once at session construction).
     callsign: Callsign,
     /// TX stream ID for radio-to-reflector relay (`None` = not transmitting).
@@ -612,6 +645,19 @@ struct DStarSession {
     local_module: Module,
     /// Reflector module letter we are linked to.
     reflector_module: Module,
+    /// Reflector callsign (e.g. `REF030  `, `XLX307  `, `DCS001  `).
+    ///
+    /// Used by the radio-to-reflector relay to build the outbound
+    /// `rpt2` field. The D-STAR convention for a hotspot relaying
+    /// voice to a reflector is:
+    /// - `rpt1` = operator's own callsign + local module letter
+    /// - `rpt2` = reflector's callsign + reflector module letter
+    ///
+    /// Both end in the same A-E module letter (NEVER a literal `G`)
+    /// because xlxd's `cdplusprotocol.cpp:209` rejects inbound
+    /// packets whose `rpt1` module byte is not a valid module — see
+    /// [`build_reflector_header`] for details.
+    reflector_callsign: Callsign,
     /// Current RX stream ID from reflector (`None` = no active stream).
     rx_stream_id: Option<StreamId>,
     /// Echo test state: records TX frames and plays them back.
@@ -676,11 +722,156 @@ impl std::fmt::Debug for DStarSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DStarSession")
             .field("callsign", &self.callsign)
-            .field(
-                "reflector_connected",
-                &self.reflector.as_ref().map(ReflectorClient::state),
-            )
+            .field("reflector_connected", &self.reflector.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+/// Protocol-generic wrapper over [`AsyncSession<P>`] for runtime dispatch.
+///
+/// thd75-repl supports all three reflector protocols at runtime via
+/// the `link` command, but the new typestate API is protocol-parametric
+/// at compile time. This enum fans the handle out into per-protocol
+/// variants so the repl can hold a single session value regardless of
+/// which protocol the user connected to, and dispatch to the right
+/// inner `AsyncSession<P>` for voice TX / event reception.
+#[derive(Debug)]
+enum ReflectorSession {
+    /// `DPlus` (REF) session handle.
+    DPlus(AsyncSession<DPlus>),
+    /// `DExtra` (XRF/XLX) session handle.
+    DExtra(AsyncSession<DExtra>),
+    /// `DCS` session handle.
+    Dcs(AsyncSession<Dcs>),
+}
+
+/// Runtime-unified event mirror of [`Event<P>`].
+///
+/// The inner event data is identical across the three protocols —
+/// this enum exists only to erase the `P: Protocol` parameter for the
+/// runtime event-handling functions (`relay_reflector_to_radio`,
+/// `trace_reflector_event`, `print_reflector_event`) that don't care
+/// which protocol produced a given event.
+#[derive(Debug)]
+enum RuntimeEvent {
+    /// Session reached `Connected`.
+    Connected,
+    /// Session left `Connected` with a reason.
+    Disconnected(DisconnectReason),
+    /// Keepalive echo from the reflector.
+    PollEcho,
+    /// A new voice stream started.
+    VoiceStart {
+        /// Stream id of the new stream.
+        stream_id: StreamId,
+        /// Decoded D-STAR header.
+        header: Box<CoreDStarHeader>,
+    },
+    /// A voice frame within an active stream.
+    VoiceFrame {
+        /// Stream id the frame belongs to.
+        stream_id: StreamId,
+        /// Frame sequence (0-20).
+        seq: u8,
+        /// Voice frame payload.
+        frame: Box<CoreVoiceFrame>,
+    },
+    /// A voice stream ended.
+    VoiceEnd {
+        /// Stream id of the terminated stream.
+        stream_id: StreamId,
+        /// Why the stream ended.
+        #[allow(dead_code, reason = "reason reserved for future trace output")]
+        reason: VoiceEndReason,
+    },
+}
+
+impl<P> From<Event<P>> for RuntimeEvent
+where
+    P: dstar_gateway_core::session::client::Protocol,
+{
+    fn from(e: Event<P>) -> Self {
+        match e {
+            Event::Connected { .. } => Self::Connected,
+            Event::Disconnected { reason } => Self::Disconnected(reason),
+            Event::PollEcho { .. } => Self::PollEcho,
+            Event::VoiceStart {
+                stream_id, header, ..
+            } => Self::VoiceStart {
+                stream_id,
+                header: Box::new(header),
+            },
+            Event::VoiceFrame {
+                stream_id,
+                seq,
+                frame,
+            } => Self::VoiceFrame {
+                stream_id,
+                seq,
+                frame: Box::new(frame),
+            },
+            Event::VoiceEnd { stream_id, reason } => Self::VoiceEnd { stream_id, reason },
+            // `Event` is `#[non_exhaustive]` and carries a private
+            // `__Phantom` variant to thread the `P` type parameter.
+            // Catch any future additions here.
+            _ => unreachable!("Event<P> is exhaustively matched above"),
+        }
+    }
+}
+
+impl ReflectorSession {
+    /// Drain the next runtime event from whichever protocol variant is active.
+    async fn next_event(&mut self) -> Option<RuntimeEvent> {
+        match self {
+            Self::DPlus(s) => s.next_event().await.map(RuntimeEvent::from),
+            Self::DExtra(s) => s.next_event().await.map(RuntimeEvent::from),
+            Self::Dcs(s) => s.next_event().await.map(RuntimeEvent::from),
+        }
+    }
+
+    /// Send a voice header and start a new outbound voice stream.
+    async fn send_header(
+        &mut self,
+        header: CoreDStarHeader,
+        stream_id: StreamId,
+    ) -> Result<(), ShellError> {
+        match self {
+            Self::DPlus(s) => s.send_header(header, stream_id).await,
+            Self::DExtra(s) => s.send_header(header, stream_id).await,
+            Self::Dcs(s) => s.send_header(header, stream_id).await,
+        }
+    }
+
+    /// Send a voice data frame on the active stream.
+    async fn send_voice(
+        &mut self,
+        stream_id: StreamId,
+        seq: u8,
+        frame: CoreVoiceFrame,
+    ) -> Result<(), ShellError> {
+        match self {
+            Self::DPlus(s) => s.send_voice(stream_id, seq, frame).await,
+            Self::DExtra(s) => s.send_voice(stream_id, seq, frame).await,
+            Self::Dcs(s) => s.send_voice(stream_id, seq, frame).await,
+        }
+    }
+
+    /// Send a voice EOT packet, ending the outbound stream.
+    async fn send_eot(&mut self, stream_id: StreamId, seq: u8) -> Result<(), ShellError> {
+        match self {
+            Self::DPlus(s) => s.send_eot(stream_id, seq).await,
+            Self::DExtra(s) => s.send_eot(stream_id, seq).await,
+            Self::Dcs(s) => s.send_eot(stream_id, seq).await,
+        }
+    }
+
+    /// Request a graceful disconnect from the reflector.
+    async fn disconnect(&mut self) -> Result<(), ShellError> {
+        match self {
+            Self::DPlus(s) => s.disconnect().await,
+            Self::DExtra(s) => s.disconnect().await,
+            Self::Dcs(s) => s.disconnect().await,
+        }
     }
 }
 
@@ -716,7 +907,7 @@ async fn run_repl(
             let fw = radio.get_firmware_version().await.unwrap_or_default();
             println!(
                 "{}",
-                thd75_repl::output::startup_identified(&info.model.to_string(), &fw)
+                thd75_repl::output::startup_identified(&info.model.clone(), &fw)
             );
             println!("{}", thd75_repl::output::type_help_hint());
             ReplState::Cat(radio)
@@ -1605,6 +1796,15 @@ async fn enter_dstar(
         .map_or((default_module, default_module), |arg| {
             (arg.local_module, arg.reflector_module)
         });
+    // Parse the reflector name into a Callsign. This is used in the
+    // radio-to-reflector relay path to build the outbound rpt2 field
+    // per ircDDBGateway convention (see build_reflector_header). If
+    // no reflector was specified on the command line, we fall back
+    // to the station callsign as a placeholder — the relay path only
+    // cares once link has actually connected.
+    let reflector_callsign = link_arg.as_ref().map_or(callsign_typed, |arg| {
+        Callsign::try_from_str(&arg.reflector_name).unwrap_or(callsign_typed)
+    });
     Ok(DStarSession {
         gateway,
         reflector,
@@ -1613,6 +1813,7 @@ async fn enter_dstar(
         tx_seq: 0,
         local_module,
         reflector_module,
+        reflector_callsign,
         rx_stream_id: None,
         echo: EchoState::Idle,
         echo_armed: false,
@@ -1764,8 +1965,8 @@ async fn ensure_host_files() {
 }
 
 /// Load Pi-Star host files from `~/.config/thd75-repl/`.
-fn load_host_files() -> dstar_gateway::HostFile {
-    let mut hosts = dstar_gateway::HostFile::new();
+fn load_host_files() -> HostFile {
+    let mut hosts = HostFile::new();
     let dir = host_files_dir();
 
     for (name, _, port) in HOST_FILES {
@@ -1777,15 +1978,226 @@ fn load_host_files() -> dstar_gateway::HostFile {
     hosts
 }
 
+/// Connect timeout for the manual handshake loop.
+const REFLECTOR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bind an ephemeral local UDP socket for a new reflector session.
+async fn bind_reflector_socket() -> Result<std::sync::Arc<tokio::net::UdpSocket>, String> {
+    tokio::net::UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map(std::sync::Arc::new)
+        .map_err(|e| format!("UDP bind failed: {e}"))
+}
+
+/// Drive a `Session<P, Connecting>` through the reflector handshake
+/// until the sans-io core reports [`ClientStateKind::Connected`] or
+/// [`ClientStateKind::Closed`] (rejected), or the configured deadline
+/// elapses. Returns the promoted `Session<P, Connected>` on success.
+///
+/// Shared between [`connect_dextra`], [`connect_dplus`], and
+/// [`connect_dcs`] — the handshake packet count differs across
+/// protocols but the polling loop is identical (drain outbound,
+/// recv with short timeout, feed `handle_input`, repeat).
+async fn drive_handshake_to_connected<P>(
+    mut session: Session<P, Connecting>,
+    socket: &tokio::net::UdpSocket,
+) -> Result<Session<P, Connected>, String>
+where
+    P: dstar_gateway_core::session::client::Protocol,
+{
+    let deadline = std::time::Instant::now() + REFLECTOR_CONNECT_TIMEOUT;
+    let mut buf = [0u8; 2048];
+
+    loop {
+        match session.state_kind() {
+            ClientStateKind::Connected => break,
+            ClientStateKind::Closed => {
+                return Err("reflector rejected the connection".to_string());
+            }
+            _ => {}
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err("timeout waiting for reflector acknowledgement".to_string());
+        }
+
+        // Drain any outbound packets the core wants to send.
+        while let Some(tx) = session.poll_transmit(std::time::Instant::now()) {
+            let _ = socket
+                .send_to(tx.payload, tx.dst)
+                .await
+                .map_err(|e| format!("handshake send failed: {e}"))?;
+        }
+
+        // Wait for either an inbound datagram or a short polling tick.
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            socket.recv_from(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok((n, src))) => {
+                let Some(bytes) = buf.get(..n) else {
+                    continue;
+                };
+                session
+                    .handle_input(std::time::Instant::now(), src, bytes)
+                    .map_err(|e| format!("handshake decode failed: {e}"))?;
+            }
+            Ok(Err(e)) => return Err(format!("handshake recv failed: {e}")),
+            Err(_) => {
+                // No datagram within the polling window — let the core
+                // fire any timers (keepalives, retransmits).
+                session.handle_timeout(std::time::Instant::now());
+            }
+        }
+    }
+
+    session
+        .promote()
+        .map_err(|f| format!("promote to Connected failed: {}", f.error))
+}
+
+/// Build and drive a full `DExtra` connect handshake.
+async fn connect_dextra(
+    callsign: Callsign,
+    peer: std::net::SocketAddr,
+    local_module: Module,
+    reflector_module: Module,
+    reflector_callsign: Callsign,
+) -> Result<AsyncSession<DExtra>, String> {
+    tracing::info!(
+        target: "thd75_repl::reflector",
+        protocol = "DExtra",
+        %callsign,
+        %local_module,
+        %reflector_module,
+        peer = %peer,
+        "connecting to reflector"
+    );
+    let socket = bind_reflector_socket().await?;
+
+    let configured = Session::<DExtra, _>::builder()
+        .callsign(callsign)
+        .local_module(local_module)
+        .reflector_module(reflector_module)
+        .reflector_callsign(reflector_callsign)
+        .peer(peer)
+        .build();
+
+    let connecting = configured
+        .connect(std::time::Instant::now())
+        .map_err(|f| format!("enqueue LINK failed: {}", f.error))?;
+
+    let connected = drive_handshake_to_connected(connecting, &socket).await?;
+    Ok(AsyncSession::spawn(connected, socket))
+}
+
+/// Build, authenticate, and drive a full `DPlus` (REF) connect handshake.
+///
+/// Performs the mandatory TCP auth step via [`AuthClient`] first, then
+/// attaches the returned host list to the sans-io session to satisfy
+/// the `Authenticated` typestate. If the TCP auth fails, the function
+/// falls back to an empty host list so the caller can still attempt
+/// the UDP handshake (matching the legacy best-effort behavior).
+async fn connect_dplus(
+    callsign: Callsign,
+    peer: std::net::SocketAddr,
+    local_module: Module,
+    reflector_module: Module,
+    reflector_callsign: Callsign,
+) -> Result<AsyncSession<DPlus>, String> {
+    tracing::info!(
+        target: "thd75_repl::reflector",
+        protocol = "DPlus",
+        %callsign,
+        %local_module,
+        %reflector_module,
+        peer = %peer,
+        "connecting to reflector"
+    );
+    println!("Authenticating with D-STAR gateway server.");
+    let hosts = match AuthClient::new().authenticate(callsign).await {
+        Ok(h) => {
+            println!("Authentication successful.");
+            h
+        }
+        Err(e) => {
+            println!(
+                "Warning: authentication failed: {e}. \
+                 Trying to connect anyway (previous auth may still be valid)."
+            );
+            dstar_gateway_core::codec::dplus::HostList::new()
+        }
+    };
+
+    let socket = bind_reflector_socket().await?;
+
+    let configured = Session::<DPlus, _>::builder()
+        .callsign(callsign)
+        .local_module(local_module)
+        .reflector_module(reflector_module)
+        .reflector_callsign(reflector_callsign)
+        .peer(peer)
+        .build();
+
+    let authenticated = configured
+        .authenticate(hosts)
+        .map_err(|f| format!("attach host list failed: {}", f.error))?;
+
+    let connecting = authenticated
+        .connect(std::time::Instant::now())
+        .map_err(|f| format!("enqueue LINK1 failed: {}", f.error))?;
+
+    let connected = drive_handshake_to_connected(connecting, &socket).await?;
+    Ok(AsyncSession::spawn(connected, socket))
+}
+
+/// Build and drive a full `DCS` connect handshake.
+async fn connect_dcs(
+    callsign: Callsign,
+    peer: std::net::SocketAddr,
+    local_module: Module,
+    reflector_module: Module,
+    reflector_callsign: Callsign,
+) -> Result<AsyncSession<Dcs>, String> {
+    tracing::info!(
+        target: "thd75_repl::reflector",
+        protocol = "DCS",
+        %callsign,
+        %local_module,
+        %reflector_module,
+        peer = %peer,
+        "connecting to reflector"
+    );
+    let socket = bind_reflector_socket().await?;
+
+    let configured = Session::<Dcs, _>::builder()
+        .callsign(callsign)
+        .local_module(local_module)
+        .reflector_module(reflector_module)
+        .reflector_callsign(reflector_callsign)
+        .peer(peer)
+        .build();
+
+    let connecting = configured
+        .connect(std::time::Instant::now())
+        .map_err(|f| format!("enqueue CONNECT failed: {}", f.error))?;
+
+    let connected = drive_handshake_to_connected(connecting, &socket).await?;
+    Ok(AsyncSession::spawn(connected, socket))
+}
+
 /// Connect to a reflector using a parsed [`LinkArg`].
 ///
 /// The caller validates the reflector string into `LinkArg` first so
 /// this function takes already-typed parameters and can focus on
-/// protocol selection, host lookup, and state-machine driving.
-async fn connect_reflector(callsign: Callsign, link: &LinkArg) -> Result<ReflectorClient, String> {
+/// protocol selection, host lookup, and driving the sans-io
+/// typestate session through the handshake.
+async fn connect_reflector(callsign: Callsign, link: &LinkArg) -> Result<ReflectorSession, String> {
     let ref_name = &link.reflector_name;
 
-    let protocol = Protocol::from_reflector_prefix(ref_name).ok_or_else(|| {
+    let protocol = ProtocolKind::from_reflector_prefix(ref_name).ok_or_else(|| {
         format!(
             "Unsupported reflector prefix: {ref_name}. \
              Supported: REF (DPlus), XRF/XLX (DExtra), DCS."
@@ -1808,57 +2220,58 @@ async fn connect_reflector(callsign: Callsign, link: &LinkArg) -> Result<Reflect
         .next()
         .ok_or_else(|| format!("No address found for {}", entry.address))?;
 
-    let reflector_callsign = Callsign::try_from_str(ref_name)
-        .map_err(|e| format!("Invalid reflector callsign {ref_name}: {e}"))?;
-
     println!(
         "Connecting to {ref_name} module {} (local {}) at {addr}.",
         link.reflector_module, link.local_module
     );
-    let params = ReflectorClientParams {
-        callsign,
-        local_module: link.local_module,
-        reflector_callsign,
-        reflector_module: link.reflector_module,
-        remote: addr,
-        protocol,
-    };
-    let mut client = ReflectorClient::new(params)
-        .await
-        .map_err(|e| format!("UDP socket error: {e}"))?;
-
-    // DPlus (REF) requires TCP auth before UDP connect.
-    if protocol == Protocol::DPlus {
-        println!("Authenticating with D-STAR gateway server.");
-        match client.authenticate().await {
-            Ok(()) => println!("Authentication successful."),
-            Err(e) => {
-                println!(
-                    "Warning: authentication failed: {e}. \
-                     Trying to connect anyway (previous auth may still be valid)."
-                );
-            }
-        }
-    }
-
-    // Drive the connect state machine (5 second timeout).
     println!("Waiting for reflector acknowledgement.");
-    match client
-        .connect_and_wait(std::time::Duration::from_secs(5))
+
+    // Parse the reflector name into a Callsign so the sans-io
+    // session can embed it in DCS wire packets (the DCS client's
+    // LINK / UNLINK / POLL packets each carry the target reflector
+    // callsign, and the default `DCS001  ` fallback would make us
+    // invisible to any other DCS reflector). DPlus and DExtra
+    // don't carry it on the wire but we pass it along anyway as
+    // metadata.
+    let reflector_callsign = Callsign::try_from_str(ref_name)
+        .map_err(|e| format!("Reflector name {ref_name:?} is not a valid callsign: {e}"))?;
+
+    let session = match protocol {
+        ProtocolKind::DPlus => connect_dplus(
+            callsign,
+            addr,
+            link.local_module,
+            link.reflector_module,
+            reflector_callsign,
+        )
         .await
-    {
-        Ok(()) => {
-            println!("Connected to {ref_name} module {}.", link.reflector_module);
-            Ok(client)
-        }
-        Err(dstar_gateway::Error::Rejected) => {
-            Err(format!("Reflector {ref_name} rejected the connection."))
-        }
-        Err(dstar_gateway::Error::ConnectTimeout(_)) => Err(format!(
-            "Timeout waiting for {ref_name} to acknowledge connection."
-        )),
-        Err(e) => Err(format!("Connect failed: {e}")),
-    }
+        .map(ReflectorSession::DPlus)?,
+        ProtocolKind::DExtra => connect_dextra(
+            callsign,
+            addr,
+            link.local_module,
+            link.reflector_module,
+            reflector_callsign,
+        )
+        .await
+        .map(ReflectorSession::DExtra)?,
+        ProtocolKind::Dcs => connect_dcs(
+            callsign,
+            addr,
+            link.local_module,
+            link.reflector_module,
+            reflector_callsign,
+        )
+        .await
+        .map(ReflectorSession::Dcs)?,
+        // `ProtocolKind` is `#[non_exhaustive]`; any future variants
+        // would need their own `connect_*` helper above. Until then,
+        // only the three classic protocols are reachable here.
+        _ => return Err(format!("Unsupported reflector protocol: {protocol:?}")),
+    };
+
+    println!("Connected to {ref_name} module {}.", link.reflector_module);
+    Ok(session)
 }
 
 /// Exit D-STAR gateway mode and restore CAT mode.
@@ -1974,27 +2387,32 @@ const MAX_EVENTS_PER_CYCLE: usize = 24;
 /// the paced `send_voice` immediately, so the modem sees a steady
 /// 20 ms cadence with no >20 ms gaps inside a stream.
 async fn dstar_poll_cycle(session: &mut DStarSession) {
+    // Matches the legacy `ReflectorClient::poll` 100 ms inner recv
+    // timeout — gives the reflector session task a short window to
+    // deliver a frame before we yield control back to the outer
+    // `select!` for radio polling and ctrl_c.
+    const EVENT_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
     for _ in 0..MAX_EVENTS_PER_CYCLE {
-        // Scope the reflector borrow tightly so relay_reflector_to_radio
-        // (which needs &mut session) can re-borrow after poll returns.
-        let poll_result = if let Some(client) = session.reflector.as_mut() {
-            client.poll().await
-        } else {
+        let Some(client) = session.reflector.as_mut() else {
             break;
         };
-        let event = match poll_result {
-            Ok(Some(event)) => event,
-            Ok(None) => break,
-            Err(e) => {
-                println!("Error: reflector UDP: {e}");
+        let event = match tokio::time::timeout(EVENT_POLL_TIMEOUT, client.next_event()).await {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                // Channel closed — session task exited. Drop the
+                // dead handle so subsequent iterations short-circuit
+                // via the `is_none()` check above.
+                session.reflector = None;
                 break;
             }
+            Err(_) => break,
         };
         trace_reflector_event(&event);
         // Only print VoiceStart for new streams (avoid duplicate
         // announcements on superframe-boundary header refreshes
         // that the parser's stream tracker did not suppress).
-        if let ReflectorEvent::VoiceStart { stream_id, .. } = &event {
+        if let RuntimeEvent::VoiceStart { stream_id, .. } = &event {
             if session.rx_stream_id != Some(*stream_id) {
                 print_reflector_event(&event);
             }
@@ -2007,6 +2425,7 @@ async fn dstar_poll_cycle(session: &mut DStarSession) {
     // Poll radio — drain MMDVM responses (ACK/NAK/status + PTT voice).
     // Short timeout so this doesn't block the reflector relay.
     if let Ok(Some(event)) = session.gateway.next_event().await {
+        trace_dstar_event(&event);
         print_dstar_event(&event);
         relay_radio_to_reflector(session, &event).await;
     }
@@ -2048,6 +2467,12 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
                 Ok(client) => {
                     session.local_module = link.local_module;
                     session.reflector_module = link.reflector_module;
+                    // Update the stored reflector callsign too — the
+                    // relay path uses it to build the outbound rpt2
+                    // field (see build_reflector_header).
+                    if let Ok(cs) = Callsign::try_from_str(&link.reflector_name) {
+                        session.reflector_callsign = cs;
+                    }
                     session.reflector = Some(client);
                     println!("Monitoring. Press Ctrl-C to return to prompt.");
                     run_dstar_monitor(session).await;
@@ -2096,16 +2521,15 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
                 ),
                 Err(e) => println!("Error: {e}"),
             }
-            if let Some(ref client) = session.reflector {
-                println!(
-                    "Reflector connection: {}.",
-                    match client.state() {
-                        ConnectionState::Disconnected => "disconnected",
-                        ConnectionState::Connecting => "connecting",
-                        ConnectionState::Connected => "connected",
-                        ConnectionState::Disconnecting => "disconnecting",
-                    }
-                );
+            if session.reflector.is_some() {
+                // The new typestate API only exposes a session handle
+                // once the sans-io core has reached `Connected`, so
+                // any `Some(_)` here means we're operational. The
+                // transient `Connecting` / `Disconnecting` states run
+                // inside the per-protocol handshake helpers before
+                // `AsyncSession::spawn` is called and don't surface
+                // here.
+                println!("Reflector connection: connected.");
             } else {
                 println!("Reflector: not connected.");
             }
@@ -2188,29 +2612,58 @@ fn finish_echo_recording(session: &mut DStarSession) {
 /// a clear break between their TX and the playback.
 const ECHO_REPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Build the outbound reflector [`DStarHeader`](dstar_gateway::DStarHeader)
-/// from the kenwood-thd75 header emitted by the radio.
+/// Build the outbound reflector [`CoreDStarHeader`] from the
+/// kenwood-thd75 header emitted by the radio.
+///
+/// The TH-D75 in Reflector Terminal Mode emits its TX header with
+/// `rpt1` / `rpt2` both set to the literal string `"DIRECT  "` as
+/// placeholders — the radio knows it's talking to a local gateway
+/// but doesn't know the gateway's callsign. This function is the
+/// gateway half of that contract: we rewrite those placeholders
+/// into the real `rpt1` / `rpt2` that a `DPlus` / `DExtra` / `DCS`
+/// reflector expects.
+///
+/// The D-STAR hotspot convention (per
+/// `ircDDBGateway/Common/DPlusHandler.cpp:77-79` and `:865`, and
+/// `Common/HeaderData.cpp::getDPlusData`) is:
+///
+/// - `rpt1[0..7]` = operator's own callsign (first 7 bytes,
+///   space-padded)
+/// - `rpt1[7]`   = operator's local module letter (A–E)
+/// - `rpt2[0..7]` = reflector callsign (e.g. `"REF030 "`)
+/// - `rpt2[7]`   = reflector module letter (A–E)
+///
+/// **Critical: both rpt1[7] and rpt2[7] are actual module letters,
+/// NEVER the literal `'G'`.** xlxd's `cdplusprotocol.cpp:209` reads
+/// rpt1's byte 7 as the module letter and silently drops the
+/// packet if `IsValidModule` fails — `'G'` is not a valid module
+/// so any packet we send with `rpt1 = "KQ4NIT G"` is discarded by
+/// the reflector with no NAK, no log line, no retry. Pre-fix we
+/// were building exactly that, which is why the operator's TX was
+/// received by every peer's tokio socket but never echoed back by
+/// the reflector to any other client.
 fn build_reflector_header(
     station_callsign: Callsign,
+    local_module: Module,
+    reflector_callsign: Callsign,
     reflector_module: Module,
     header: &kenwood_thd75::DStarHeader,
-) -> dstar_gateway::DStarHeader {
-    // RPT2 is the gateway (reflector+local module), RPT1 is the
-    // gateway module 'G'. We build the 8-byte form by taking the
-    // first 7 bytes of our callsign and appending the module letter.
-    let mut rpt2_buf = [b' '; 8];
+) -> CoreDStarHeader {
+    // rpt1 = operator's own callsign + local module letter.
+    let mut rpt1_buf = [b' '; 8];
     let cs_bytes = station_callsign.as_bytes();
-    rpt2_buf[..7].copy_from_slice(&cs_bytes[..7]);
-    rpt2_buf[7] = reflector_module.as_byte();
-    // Infallible: the bytes came from a valid Callsign + a validated
-    // Module letter, so every byte is ASCII. Using from_wire_bytes
-    // (which stores verbatim without checks) is correct here because
-    // we've already constructed a well-formed 8-byte field.
-    let rpt2 = Callsign::from_wire_bytes(rpt2_buf);
-
-    let mut rpt1_buf = rpt2_buf;
-    rpt1_buf[7] = b'G';
+    rpt1_buf[..7].copy_from_slice(&cs_bytes[..7]);
+    rpt1_buf[7] = local_module.as_byte();
+    // Infallible: bytes came from a validated Callsign + Module, so
+    // every byte is already ASCII and the 8-byte form is well-formed.
     let rpt1 = Callsign::from_wire_bytes(rpt1_buf);
+
+    // rpt2 = reflector callsign + reflector module letter.
+    let mut rpt2_buf = [b' '; 8];
+    let refl_bytes = reflector_callsign.as_bytes();
+    rpt2_buf[..7].copy_from_slice(&refl_bytes[..7]);
+    rpt2_buf[7] = reflector_module.as_byte();
+    let rpt2 = Callsign::from_wire_bytes(rpt2_buf);
 
     // Convert the kenwood-thd75 header's string fields into typed
     // wire-format callsigns. If the radio emits an unexpectedly
@@ -2220,7 +2673,7 @@ fn build_reflector_header(
     let my_suffix = Suffix::try_from_str(header.my_suffix.trim()).unwrap_or(Suffix::EMPTY);
     let ur_call = Callsign::try_from_str("CQCQCQ").expect("static constant");
 
-    dstar_gateway::DStarHeader {
+    CoreDStarHeader {
         flag1: header.flag1,
         flag2: header.flag2,
         flag3: header.flag3,
@@ -2283,10 +2736,13 @@ async fn relay_radio_to_reflector(session: &mut DStarSession, event: &DStarEvent
     }
 
     // Normal relay to reflector. Capture copies of the typed
-    // station_callsign/reflector_module up front so the session can
-    // still be borrowed mutably further down for tx_stream_id /
-    // tx_seq updates without aliasing against `session.reflector`.
+    // station_callsign / local_module / reflector_callsign /
+    // reflector_module up front so the session can still be borrowed
+    // mutably further down for tx_stream_id / tx_seq updates without
+    // aliasing against `session.reflector`.
     let station_callsign = session.callsign;
+    let local_module = session.local_module;
+    let reflector_callsign = session.reflector_callsign;
     let reflector_module = session.reflector_module;
     let Some(ref mut client) = session.reflector else {
         return;
@@ -2300,8 +2756,14 @@ async fn relay_radio_to_reflector(session: &mut DStarSession, event: &DStarEvent
             session.tx_seq = 0;
             session.tx_slow_data_idx = 0;
 
-            let ref_header = build_reflector_header(station_callsign, reflector_module, header);
-            if let Err(e) = client.send_header(&ref_header, sid).await {
+            let ref_header = build_reflector_header(
+                station_callsign,
+                local_module,
+                reflector_callsign,
+                reflector_module,
+                header,
+            );
+            if let Err(e) = client.send_header(ref_header, sid).await {
                 println!("Error: relay header to reflector: {e}");
             }
         }
@@ -2321,11 +2783,11 @@ async fn relay_radio_to_reflector(session: &mut DStarSession, event: &DStarEvent
                 session.tx_slow_data_idx += 1;
                 sd
             };
-            let ref_frame = dstar_gateway::VoiceFrame {
+            let ref_frame = CoreVoiceFrame {
                 ambe: frame.ambe,
                 slow_data,
             };
-            if let Err(e) = client.send_voice(sid, session.tx_seq, &ref_frame).await {
+            if let Err(e) = client.send_voice(sid, session.tx_seq, ref_frame).await {
                 println!("Error: relay voice to reflector: {e}");
             }
             session.tx_seq = (session.tx_seq + 1) % 21;
@@ -2470,10 +2932,10 @@ fn rand_stream_id() -> StreamId {
 }
 
 /// Relay a reflector event to the radio MMDVM modem.
-async fn relay_reflector_to_radio(session: &mut DStarSession, event: &ReflectorEvent) {
+async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEvent) {
     let gw = &mut session.gateway;
     match event {
-        ReflectorEvent::VoiceStart { header, stream_id } => {
+        RuntimeEvent::VoiceStart { header, stream_id } => {
             // Deduplicate: only send header once per stream.
             if session.rx_stream_id == Some(*stream_id) {
                 return;
@@ -2487,7 +2949,7 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &ReflectorE
             // operator's message verbatim.
             session.rx_slow_data.reset();
             session.rx_last_slow_text = None;
-            // Convert dstar-gateway header to kenwood-thd75 header.
+            // Convert typed core header to kenwood-thd75 header.
             // Both sides are already ASCII-validated so
             // `String::from_utf8_lossy` is a cheap direct conversion.
             let radio_header = kenwood_thd75::DStarHeader {
@@ -2507,7 +2969,7 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &ReflectorE
                 );
             }
         }
-        ReflectorEvent::VoiceData { frame, seq, .. } => {
+        RuntimeEvent::VoiceFrame { frame, seq, .. } => {
             // Feed the raw seq byte from the DSVT header; the decoder
             // treats seq==0 as a sync frame and re-aligns its half-block
             // phase automatically. No external skipping needed.
@@ -2571,13 +3033,13 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &ReflectorE
                 );
             }
         }
-        ReflectorEvent::VoiceEnd { .. } => {
+        RuntimeEvent::VoiceEnd { .. } => {
             // Drain any message that became complete on the very last
             // voice frame; any partial message mid-assembly is silently
             // discarded by the reset below. Apply the same dedupe
             // against `rx_last_slow_text` so we don't double-print
             // the message on VoiceEnd if it already printed during
-            // VoiceData processing.
+            // VoiceFrame processing.
             if let Some(bytes) = session.rx_slow_data.take_message()
                 && session.rx_last_slow_text.as_ref() != Some(&bytes)
             {
@@ -2595,7 +3057,7 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &ReflectorE
                 );
             }
         }
-        _ => {}
+        RuntimeEvent::Connected | RuntimeEvent::Disconnected(_) | RuntimeEvent::PollEcho => {}
     }
 }
 
@@ -2625,47 +3087,49 @@ fn print_slow_data_text_message(bytes: &[u8; 20]) {
 /// stream ID, source callsign, or sequence number that accompanied
 /// the event. Keyed off `target = "thd75_repl::reflector"` so users
 /// can filter just this firehose via `RUST_LOG` if they want.
-fn trace_reflector_event(event: &ReflectorEvent) {
+fn trace_reflector_event(event: &RuntimeEvent) {
     match event {
-        ReflectorEvent::Connected => {
+        RuntimeEvent::Connected => {
             tracing::trace!(target: "thd75_repl::reflector", "event: Connected");
         }
-        ReflectorEvent::Rejected => {
-            tracing::trace!(target: "thd75_repl::reflector", "event: Rejected");
+        RuntimeEvent::Disconnected(reason) => {
+            tracing::trace!(
+                target: "thd75_repl::reflector",
+                reason = ?reason,
+                "event: Disconnected"
+            );
         }
-        ReflectorEvent::Disconnected => {
-            tracing::trace!(target: "thd75_repl::reflector", "event: Disconnected");
-        }
-        ReflectorEvent::PollEcho => {
+        RuntimeEvent::PollEcho => {
             tracing::trace!(target: "thd75_repl::reflector", "event: PollEcho");
         }
-        ReflectorEvent::VoiceStart { header, stream_id } => {
+        RuntimeEvent::VoiceStart { header, stream_id } => {
             tracing::trace!(
                 target: "thd75_repl::reflector",
                 stream_id = %stream_id,
-                my_call = %header.my_call_str(),
-                my_suffix = %header.my_suffix_str(),
-                ur_call = %header.ur_call_str(),
-                rpt1 = %header.rpt1_str(),
-                rpt2 = %header.rpt2_str(),
+                my_call = %header.my_call.as_str(),
+                my_suffix = %header.my_suffix.as_str(),
+                ur_call = %header.ur_call.as_str(),
+                rpt1 = %header.rpt1.as_str(),
+                rpt2 = %header.rpt2.as_str(),
                 flag1 = format_args!("{:#04x}", header.flag1),
                 flag2 = format_args!("{:#04x}", header.flag2),
                 flag3 = format_args!("{:#04x}", header.flag3),
                 "event: VoiceStart"
             );
         }
-        ReflectorEvent::VoiceData { stream_id, seq, .. } => {
+        RuntimeEvent::VoiceFrame { stream_id, seq, .. } => {
             tracing::trace!(
                 target: "thd75_repl::reflector",
                 stream_id = %stream_id,
                 seq = *seq,
-                "event: VoiceData"
+                "event: VoiceFrame"
             );
         }
-        ReflectorEvent::VoiceEnd { stream_id } => {
+        RuntimeEvent::VoiceEnd { stream_id, reason } => {
             tracing::trace!(
                 target: "thd75_repl::reflector",
                 stream_id = %stream_id,
+                reason = ?reason,
                 "event: VoiceEnd"
             );
         }
@@ -2673,33 +3137,106 @@ fn trace_reflector_event(event: &ReflectorEvent) {
 }
 
 /// Print a reflector event for the user.
-fn print_reflector_event(event: &ReflectorEvent) {
+fn print_reflector_event(event: &RuntimeEvent) {
     match event {
-        ReflectorEvent::Connected => {
+        RuntimeEvent::Connected => {
             aprintln!("{}", thd75_repl::output::reflector_event_connected());
         }
-        ReflectorEvent::Rejected => {
-            aprintln!("{}", thd75_repl::output::reflector_event_rejected());
-        }
-        ReflectorEvent::Disconnected => {
-            aprintln!("{}", thd75_repl::output::reflector_event_disconnected());
-        }
-        ReflectorEvent::PollEcho | ReflectorEvent::VoiceData { .. } => {
+        RuntimeEvent::Disconnected(reason) => match reason {
+            DisconnectReason::Rejected => {
+                aprintln!("{}", thd75_repl::output::reflector_event_rejected());
+            }
+            _ => {
+                aprintln!("{}", thd75_repl::output::reflector_event_disconnected());
+            }
+        },
+        RuntimeEvent::PollEcho | RuntimeEvent::VoiceFrame { .. } => {
             // Silent: keepalives and individual voice frames are too
             // frequent to announce.
         }
-        ReflectorEvent::VoiceStart { header, .. } => {
+        RuntimeEvent::VoiceStart { header, .. } => {
             aprintln!(
                 "{}",
                 thd75_repl::output::reflector_event_voice_start(
-                    header.my_call_str().as_ref(),
-                    header.my_suffix_str().as_ref(),
-                    header.ur_call_str().as_ref(),
+                    header.my_call.as_str().as_ref(),
+                    header.my_suffix.as_str().as_ref(),
+                    header.ur_call.as_str().as_ref(),
                 )
             );
         }
-        ReflectorEvent::VoiceEnd { .. } => {
+        RuntimeEvent::VoiceEnd { .. } => {
             aprintln!("{}", thd75_repl::output::reflector_event_voice_end());
+        }
+    }
+}
+
+/// Emit a TRACE-level log entry for every D-STAR (radio MMDVM)
+/// event consumed from the poll loop. Mirror of
+/// [`trace_reflector_event`] for the radio-side event stream so the
+/// operator's own callsign, stream header fields, and text/GPS
+/// payloads appear in the persistent trace log (not just in the
+/// console print via [`print_dstar_event`]). Keyed off
+/// `target = "thd75_repl::dstar"` so users can filter just this
+/// firehose via `RUST_LOG` if they want.
+fn trace_dstar_event(event: &DStarEvent) {
+    match event {
+        DStarEvent::VoiceStart(header) => {
+            tracing::trace!(
+                target: "thd75_repl::dstar",
+                my_call = %header.my_call,
+                my_suffix = %header.my_suffix,
+                ur_call = %header.ur_call,
+                rpt1 = %header.rpt1,
+                rpt2 = %header.rpt2,
+                flag1 = format_args!("{:#04x}", header.flag1),
+                flag2 = format_args!("{:#04x}", header.flag2),
+                flag3 = format_args!("{:#04x}", header.flag3),
+                "event: VoiceStart"
+            );
+        }
+        DStarEvent::VoiceData(_) => {
+            // Per-frame trace is too noisy at 20 fps; skip.
+        }
+        DStarEvent::VoiceEnd => {
+            tracing::trace!(target: "thd75_repl::dstar", "event: VoiceEnd");
+        }
+        DStarEvent::VoiceLost => {
+            tracing::trace!(target: "thd75_repl::dstar", "event: VoiceLost");
+        }
+        DStarEvent::TextMessage(text) => {
+            tracing::trace!(
+                target: "thd75_repl::dstar",
+                text = %text,
+                "event: TextMessage"
+            );
+        }
+        DStarEvent::GpsData(data) => {
+            tracing::trace!(
+                target: "thd75_repl::dstar",
+                bytes_len = data.len(),
+                "event: GpsData"
+            );
+        }
+        DStarEvent::StationHeard(entry) => {
+            tracing::trace!(
+                target: "thd75_repl::dstar",
+                callsign = %entry.callsign,
+                "event: StationHeard"
+            );
+        }
+        DStarEvent::UrCallCommand(action) => {
+            tracing::trace!(
+                target: "thd75_repl::dstar",
+                action = ?action,
+                "event: UrCallCommand"
+            );
+        }
+        DStarEvent::StatusUpdate(status) => {
+            tracing::trace!(
+                target: "thd75_repl::dstar",
+                status = ?status,
+                "event: StatusUpdate"
+            );
         }
     }
 }

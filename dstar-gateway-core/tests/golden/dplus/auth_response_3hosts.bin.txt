@@ -1,0 +1,18 @@
+# auth_response_3hosts.bin.txt
+# DPlus auth TCP response chunk (86 bytes total)
+#
+# Reference: ircDDBGateway/Common/DPlusAuthenticator.cpp:151-192
+
+00:  56 C0 01 00 00 00 00 00    # chunk header: len=86, flags+hi=0xC0, type=0x01, 5 filler
+08:  31 30 2E 30 2E 30 2E 31    # record 1: IP "10.0.0.1" space-padded to 16 bytes
+10:  20 20 20 20 20 20 20 20
+18:  52 45 46 30 30 31 20 20    # callsign "REF001" space-padded to 8 bytes
+20:  00 80                      # module=0, active=0x80
+22:  31 39 32 2E 31 36 38 2E    # record 2: IP "192.168.1.100"
+2A:  31 2E 31 30 30 20 20 20
+32:  52 45 46 30 33 30 20 20    # callsign "REF030"
+3A:  00 80
+3C:  32 30 33 2E 30 2E 31 31    # record 3: IP "203.0.113.45"
+44:  33 2E 34 35 20 20 20 20
+4C:  58 4C 58 33 30 37 20 20    # callsign "XLX307"
+54:  00 80
