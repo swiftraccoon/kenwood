@@ -1,0 +1,24 @@
+[package]
+name = "mmdvm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Tokio async shell for the MMDVM ham radio digital voice modem protocol"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/swiftraccoon/kenwood"
+keywords = ["ham-radio", "mmdvm", "dstar", "amateur-radio", "tokio"]
+categories = ["network-programming", "asynchronous"]
+authors = ["swiftraccoon"]
+publish = false
+
+[dependencies]
+mmdvm-core = { path = "../mmdvm-core" }
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "time"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "test-util", "macros", "sync", "io-util", "time"] }
+
+[lints]
+workspace = true

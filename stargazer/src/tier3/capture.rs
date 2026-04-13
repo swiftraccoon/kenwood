@@ -1,13 +1,13 @@
 // StreamCapture and CaptureManager are consumed by the AsyncSession-based
-// Tier 3 orchestrator, which is scheduled for Task 13 (connection pool
-// management). Until then the types are built and unit-tested in place.
+// Tier 3 orchestrator (connection-pool management), which is not yet
+// implemented. Until then the types are built and unit-tested in place.
 // The `cfg_attr(not(test), ...)` gate avoids an unfulfilled expectation
 // in the test build, where the unit tests exercise every item.
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "capture state is wired into the session pool in the follow-up orchestrator task"
+        reason = "capture state is wired in once the tier-3 connection-pool orchestrator lands"
     )
 )]
 

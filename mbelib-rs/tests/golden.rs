@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Swift Raccoon
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Golden tests exercising the complete AMBE decode pipeline end-to-end.
 //!
 //! These tests verify PROPERTIES of the decoder output -- boundedness,

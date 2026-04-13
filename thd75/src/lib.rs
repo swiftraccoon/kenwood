@@ -108,14 +108,13 @@ pub use radio::kiss_session::KissSession;
 // MMDVM session re-export.
 pub use radio::mmdvm_session::MmdvmSession;
 
-// MMDVM codec re-exports.
-pub use mmdvm::hosts::{self as dstar_hosts, HostEntry};
-pub use mmdvm::reflector::{self as dstar_reflector, AMBE_SILENCE, DSTAR_SYNC_BYTES};
-pub use mmdvm::reflector::{dcs, dextra, dplus};
+// MMDVM gateway re-exports. Raw codec types live in mmdvm-core; the
+// async event loop lives in mmdvm. The types re-exported here
+// compose those crates into the D-STAR-specific surface
+// TH-D75 consumers use.
 pub use mmdvm::{
-    DStarEvent, DStarGateway, DStarGatewayConfig, DStarHeader, DStarVoiceFrame, LastHeardEntry,
-    MmdvmConfig, MmdvmError, MmdvmFrame, MmdvmResponse, ModemMode, ModemState, ModemStatus,
-    NakReason, ReconnectPolicy, SlowDataDecoder, SlowDataEncoder,
+    DStarEvent, DStarGateway, DStarGatewayConfig, LastHeardEntry, MmdvmError, ModemMode,
+    ModemStatus, NakReason, ReconnectPolicy,
 };
 
 // SD card re-exports.

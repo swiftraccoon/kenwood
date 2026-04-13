@@ -1,8 +1,18 @@
+// SPDX-FileCopyrightText: 2010 szechyjs (mbelib)
+// SPDX-FileCopyrightText: 2026 Swift Raccoon
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! AMBE 3600x2450 parameter decoding from error-corrected data bits.
 //!
 //! This module implements the core parameter extraction pipeline that converts
 //! the 49-bit demodulated/error-corrected parameter vector into the harmonic
 //! speech model parameters carried by [`MbeParams`].
+//!
+//! Ported from `mbe_decodeAmbe2450Parms()` in mbelib's `ambe3600x2450.c`
+//! (<https://github.com/szechyjs/mbelib>), ISC license. Sub-field bit
+//! positions, the b0..=b8 partitioning, the DCT-then-IDCT spectral
+//! reconstruction sequence, and the equation-43 magnitude interpolation
+//! all follow the upstream C reference exactly.
 //!
 //! # Decode Pipeline
 //!
@@ -58,6 +68,7 @@
 //! [`MbeParams`]: crate::params::MbeParams
 
 use crate::ecc::AMBE_DATA_BITS;
+use crate::math::CosOscillator;
 use crate::params::{MAX_BANDS, MbeParams};
 use crate::tables;
 
@@ -328,20 +339,27 @@ fn assemble_gm(b3: usize, b4: usize) -> [f32; PRBA_BLOCKS + 1] {
 ///
 /// `Ri[i] = sum(am * Gm[m] * cos(pi*(m-1)*(i-0.5)/8))` where am=1 for
 /// the DC term (m=1) and am=2 for all others.
+///
+/// For each fixed `i`, the angle is a linear function of `m`:
+/// `angle = step_i * (m - 1)` with `step_i = pi * (i - 0.5) / 8`. The
+/// inner cosines are evaluated via [`CosOscillator`] recurrence, which
+/// replaces 8 `cos()` calls per outer iteration with 1 `sin_cos` plus
+/// 8 cheap recurrence ticks.
 fn forward_dct_8(gm: &[f32; PRBA_BLOCKS + 1]) -> [f32; PRBA_BLOCKS + 1] {
     let mut ri = [0.0_f32; PRBA_BLOCKS + 1];
     for i in 1..=PRBA_BLOCKS {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "i is at most 8; no precision loss"
+        )]
+        let step = std::f32::consts::PI * (i as f32 - 0.5) / PRBA_BLOCKS as f32;
+        let mut osc = CosOscillator::new(0.0, step);
         let mut sum = 0.0_f32;
         for m in 1..=PRBA_BLOCKS {
             let am: f32 = if m == 1 { 1.0 } else { 2.0 };
             let gm_val = *gm.get(m).unwrap_or(&0.0);
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "m and i are at most 8; no precision loss"
-            )]
-            let angle =
-                std::f32::consts::PI * (m - 1) as f32 * (i as f32 - 0.5) / PRBA_BLOCKS as f32;
-            sum = (am * gm_val).mul_add(angle.cos(), sum);
+            // osc.tick() returns cos(step * (m-1)) for m=1,2,...,8.
+            sum = (am * gm_val).mul_add(osc.tick(), sum);
         }
         if let Some(slot) = ri.get_mut(i) {
             *slot = sum;
@@ -372,6 +390,13 @@ fn lookup_ji(big_l: usize) -> [usize; IDCT_BLOCKS + 1] {
 /// Inverse DCT per block: Cik -> Tl (per-band spectral offsets).
 ///
 /// Each of 4 blocks produces Ji[i] values; concatenated they give Tl[1..L].
+///
+/// For each fixed `(i, j)` the inner cosines are linear in `k`:
+/// `angle = step_j * (k - 1)` with `step_j = pi * (j - 0.5) / ji_val`.
+/// The inner cosine evaluations use [`CosOscillator`] recurrence,
+/// replacing up to 17 `cos()` calls per `j` with one `sin_cos` plus 17
+/// cheap recurrence ticks. With L=56 split into 4 blocks of ~14 each,
+/// this saves ~600 cosines per frame.
 fn inverse_dct_blocks(
     cik: &[[f32; MAX_HOC_TERMS + 1]; IDCT_BLOCKS + 1],
     ji: &[usize; IDCT_BLOCKS + 1],
@@ -381,7 +406,21 @@ fn inverse_dct_blocks(
 
     for i in 1..=IDCT_BLOCKS {
         let ji_val = *ji.get(i).unwrap_or(&0);
+        if ji_val == 0 {
+            continue;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "ji_val is at most 17; no precision loss"
+        )]
+        let inv_ji = 1.0 / ji_val as f32;
         for j in 1..=ji_val {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "j is at most 17; no precision loss"
+            )]
+            let step = std::f32::consts::PI * (j as f32 - 0.5) * inv_ji;
+            let mut osc = CosOscillator::new(0.0, step);
             let mut sum = 0.0_f32;
             for k in 1..=ji_val {
                 let ak: f32 = if k == 1 { 1.0 } else { 2.0 };
@@ -390,13 +429,8 @@ fn inverse_dct_blocks(
                     .and_then(|block| block.get(k))
                     .copied()
                     .unwrap_or(0.0);
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "k, j, ji_val are at most 17; no precision loss"
-                )]
-                let angle =
-                    std::f32::consts::PI * (k - 1) as f32 * (j as f32 - 0.5) / ji_val as f32;
-                sum = (ak * cik_val).mul_add(angle.cos(), sum);
+                // osc.tick() returns cos(step * (k-1)) for k=1,2,...,ji_val.
+                sum = (ak * cik_val).mul_add(osc.tick(), sum);
             }
             if let Some(slot) = tl.get_mut(l_idx) {
                 *slot = sum;

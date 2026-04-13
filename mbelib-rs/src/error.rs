@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Swift Raccoon
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Error types for the AMBE 3600×2450 decoder.
 //!
 //! The AMBE codec uses Golay(23,12) and Hamming(15,11) forward error

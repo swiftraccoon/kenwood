@@ -4,8 +4,16 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 description = "Pure Rust AMBE 3600x2450 voice codec decoder for D-STAR digital radio"
-license = "ISC"
+license = "GPL-2.0-or-later"
 publish = false
+
+[dependencies]
+# Real-input FFT for JMBE-compatible unvoiced synthesis (Algorithms #117-126).
+# Pure Rust, MIT/Apache-2.0 (compatible with our GPL outgoing license).
+realfft = "3.4"
+# SIMD primitives (f32x4 / i32x4) for the float→i16 conversion hot path.
+# Pure Rust, MIT/Apache-2.0/Zlib.
+wide = "0.7"
 
 [lints.rust]
 unsafe_code = "forbid"

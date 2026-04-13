@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Swift Raccoon
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Trait and constructor invariant tests for `AmbeDecoder`.
 //!
 //! These tests verify properties of the decoder type itself rather than

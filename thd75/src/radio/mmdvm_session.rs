@@ -1,4 +1,4 @@
-//! MMDVM (Multi-Mode Digital Voice Modem) session management for the TH-D75.
+//! MMDVM session management for the TH-D75.
 //!
 //! When the radio enters MMDVM mode (via `TN 3,x`), the serial port switches
 //! from ASCII CAT commands to binary MMDVM framing. CAT commands cannot be
@@ -6,10 +6,19 @@
 //! at the type level: creating one consumes the [`Radio`], and exiting
 //! returns it.
 //!
-//! The MMDVM protocol is used for D-STAR digital voice gateway operation,
-//! where the radio acts as an MMDVM-compatible modem. Once in MMDVM mode,
-//! the host can send and receive D-STAR headers, voice data, and modem
-//! control commands using the binary MMDVM framing protocol.
+//! # Design notes
+//!
+//! The session holds an [`mmdvm::AsyncModem`] that owns the transport via a
+//! [`MmdvmTransportAdapter`]. All MMDVM framing, periodic status polling,
+//! TX-queue slot gating, and RX frame dispatch happen inside the
+//! `AsyncModem`'s spawned task — the session itself is just a thin
+//! lifecycle wrapper that also caches the [`Radio`]'s CAT-mode state for
+//! restoration on exit.
+//!
+//! Higher-level D-STAR operation (slow-data decode, last-heard list,
+//! URCALL parsing, echo recording, etc.) lives in
+//! [`crate::mmdvm::DStarGateway`], which owns an [`MmdvmSession`] and
+//! delegates raw frame I/O to it.
 //!
 //! # Example
 //!
@@ -22,78 +31,68 @@
 //! let radio = Radio::connect(transport).await?;
 //!
 //! // Enter MMDVM mode (consumes the Radio).
-//! let mut mmdvm = radio.enter_mmdvm(TncBaud::Bps1200).await.map_err(|(_, e)| e)?;
+//! let session = radio.enter_mmdvm(TncBaud::Bps9600).await.map_err(|(_, e)| e)?;
 //!
-//! // Initialize D-STAR modem.
-//! let status = mmdvm.init_dstar().await?;
-//! println!("Modem status: {:?}", status);
+//! // ... use session.modem_mut() for raw MMDVM operations, or build a
+//! // DStarGateway on top of it ...
 //!
 //! // Exit MMDVM mode (returns the Radio).
-//! let radio = mmdvm.exit().await?;
+//! let radio = session.exit().await?;
 //! # Ok(())
 //! # }
 //! ```
 
 use std::time::Duration;
 
-use crate::error::{Error, ProtocolError, TransportError};
-use crate::mmdvm::{
-    self, DStarHeader, MmdvmConfig, MmdvmFrame, MmdvmResponse, ModemMode, ModemStatus,
-};
+use mmdvm::AsyncModem;
+
+use crate::error::{Error, ProtocolError};
 use crate::protocol::{Codec, Command, Response};
-use crate::transport::Transport;
+use crate::transport::{MmdvmTransportAdapter, Transport};
 use crate::types::{TncBaud, TncMode};
 
 use super::Radio;
 
-/// Default timeout for MMDVM receive operations (10 seconds).
-const MMDVM_RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Wait time after the `TN 0,0` exit command before rebuilding the
+/// `Radio`. Matches the pre-refactor delay so the TNC has time to
+/// switch back to CAT mode.
+const EXIT_SWITCH_DELAY: Duration = Duration::from_millis(100);
 
-/// Default TX delay for MMDVM configuration (in 10 ms units).
-const DEFAULT_TX_DELAY: u8 = 10;
-
-/// Default RX audio level for MMDVM configuration.
-const DEFAULT_RX_LEVEL: u8 = 128;
-
-/// Default TX audio level for MMDVM configuration.
-const DEFAULT_TX_LEVEL: u8 = 128;
-
-/// An MMDVM session that owns the radio transport.
-///
-/// While this session is active, the serial port speaks MMDVM binary framing
-/// instead of ASCII CAT commands. The [`Radio`] is consumed on entry and
-/// returned on [`exit`](Self::exit).
-pub struct MmdvmSession<T: Transport> {
-    /// The underlying transport (serial or Bluetooth).
-    pub(crate) transport: T,
-    /// Codec retained from the Radio for later restoration.
+/// Cached Radio state that persists across an MMDVM session so the
+/// `Radio` can be rebuilt on [`MmdvmSession::exit`].
+struct RadioState {
     codec: Codec,
-    /// Broadcast channel retained from the Radio for later restoration.
     notifications: tokio::sync::broadcast::Sender<Response>,
-    /// Cached timeout from the Radio.
     timeout: Duration,
-    /// Cached `mode_a` from the Radio.
     mode_a: Option<super::RadioMode>,
-    /// Cached `mode_b` from the Radio.
     mode_b: Option<super::RadioMode>,
-    /// MCP speed from the Radio.
     mcp_speed: super::programming::McpSpeed,
-    /// Timeout for receive operations.
-    receive_timeout: Duration,
-    /// Internal buffer for accumulating MMDVM bytes from the transport.
-    rx_buffer: Vec<u8>,
 }
 
-impl<T: Transport> std::fmt::Debug for MmdvmSession<T> {
+/// An MMDVM session that owns the radio transport via an
+/// [`mmdvm::AsyncModem`].
+///
+/// While this session is active, the transport speaks the MMDVM binary
+/// framing protocol and all I/O is funneled through the spawned
+/// modem-loop task. CAT commands are unavailable until
+/// [`MmdvmSession::exit`] is called.
+///
+/// The session is consumed on entry (via [`Radio::enter_mmdvm`]) and
+/// returned on exit.
+pub struct MmdvmSession<T: Transport + Unpin + 'static> {
+    /// Async MMDVM modem driving the transport.
+    modem: AsyncModem<MmdvmTransportAdapter<T>>,
+    /// Radio state cached for restoration on exit.
+    radio_state: RadioState,
+}
+
+impl<T: Transport + Unpin + 'static> std::fmt::Debug for MmdvmSession<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MmdvmSession")
-            .field("receive_timeout", &self.receive_timeout)
-            .field("rx_buffer_len", &self.rx_buffer.len())
-            .finish_non_exhaustive()
+        f.debug_struct("MmdvmSession").finish_non_exhaustive()
     }
 }
 
-impl<T: Transport> Radio<T> {
+impl<T: Transport + Unpin + 'static> Radio<T> {
     /// Wrap this [`Radio`] as an [`MmdvmSession`] without sending any commands.
     ///
     /// Use this when the radio is already in MMDVM mode (e.g. after
@@ -103,16 +102,18 @@ impl<T: Transport> Radio<T> {
     #[must_use]
     pub fn into_mmdvm_session(self) -> MmdvmSession<T> {
         tracing::info!("wrapping transport as MMDVM session (radio already in gateway mode)");
+        let adapter = MmdvmTransportAdapter::new(self.transport);
+        let modem = AsyncModem::spawn(adapter);
         MmdvmSession {
-            transport: self.transport,
-            codec: self.codec,
-            notifications: self.notifications,
-            timeout: self.timeout,
-            mode_a: self.mode_a,
-            mode_b: self.mode_b,
-            mcp_speed: self.mcp_speed,
-            receive_timeout: MMDVM_RECEIVE_TIMEOUT,
-            rx_buffer: Vec::with_capacity(512),
+            modem,
+            radio_state: RadioState {
+                codec: self.codec,
+                notifications: self.notifications,
+                timeout: self.timeout,
+                mode_a: self.mode_a,
+                mode_b: self.mode_b,
+                mcp_speed: self.mcp_speed,
+            },
         }
     }
 
@@ -120,8 +121,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// Sends the `TN 3,x` CAT command to switch the TNC to MMDVM mode at the
     /// specified baud rate. After this call, the serial port speaks MMDVM
-    /// binary framing. The radio enters DV Gateway mode and communicates
-    /// using MMDVM framing. Use [`MmdvmSession::exit`] to return to CAT mode.
+    /// binary framing. Use [`MmdvmSession::exit`] to return to CAT mode.
     ///
     /// # Errors
     ///
@@ -152,511 +152,189 @@ impl<T: Transport> Radio<T> {
             }
         }
 
-        Ok(MmdvmSession {
-            transport: self.transport,
-            codec: self.codec,
-            notifications: self.notifications,
-            timeout: self.timeout,
-            mode_a: self.mode_a,
-            mode_b: self.mode_b,
-            mcp_speed: self.mcp_speed,
-            receive_timeout: MMDVM_RECEIVE_TIMEOUT,
-            rx_buffer: Vec::with_capacity(512),
-        })
+        Ok(self.into_mmdvm_session())
     }
 }
 
-impl<T: Transport> MmdvmSession<T> {
-    /// Set the timeout for [`receive_response`](Self::receive_response) operations.
+impl<T: Transport + Unpin + 'static> MmdvmSession<T> {
+    /// Mutable access to the underlying [`mmdvm::AsyncModem`].
     ///
-    /// Defaults to 10 seconds.
-    pub const fn set_receive_timeout(&mut self, duration: Duration) {
-        self.receive_timeout = duration;
+    /// Consumers that need low-level MMDVM control (custom status polls,
+    /// mode changes, raw frame send) work with the handle directly.
+    /// Higher-level D-STAR orchestration (headers, voice frames, EOT)
+    /// is wrapped by [`crate::mmdvm::DStarGateway`].
+    pub const fn modem_mut(&mut self) -> &mut AsyncModem<MmdvmTransportAdapter<T>> {
+        &mut self.modem
+    }
+
+    /// Consume the session and return its [`mmdvm::AsyncModem`].
+    ///
+    /// Used by [`crate::mmdvm::DStarGateway`] to keep long-lived ownership
+    /// of the modem while tracking D-STAR-specific state separately.
+    /// Returns the associated Radio restore state alongside the modem
+    /// so the caller can rebuild the [`Radio`] after shutdown.
+    pub(crate) fn into_parts(self) -> (AsyncModem<MmdvmTransportAdapter<T>>, MmdvmRadioRestore<T>) {
+        (
+            self.modem,
+            MmdvmRadioRestore {
+                state: self.radio_state,
+                _phantom: std::marker::PhantomData,
+            },
+        )
     }
 
     /// Exit MMDVM mode and return the [`Radio`].
     ///
-    /// Sends a `TN 0,0` command to switch back to APRS/normal TNC mode,
-    /// then rebuilds the Radio from saved state.
+    /// Shuts down the [`mmdvm::AsyncModem`], recovering the transport,
+    /// sends `TN 0,0` on the raw transport to return the radio's TNC to
+    /// normal APRS mode, then rebuilds the `Radio` from saved state.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] if the write fails.
-    pub async fn exit(mut self) -> Result<Radio<T>, Error> {
+    /// Returns [`Error::Transport`] if the `TN 0,0` write fails, or
+    /// translates [`mmdvm::ShellError`] into [`Error::Transport`] /
+    /// [`Error::Protocol`] as appropriate.
+    pub async fn exit(self) -> Result<Radio<T>, Error> {
         tracing::info!("exiting MMDVM mode");
 
-        // Send TN 0,0 to return to APRS mode (exits MMDVM framing).
-        let tn_cmd = b"TN 0,0\r";
-        self.transport
-            .write(tn_cmd)
+        let (modem, restore) = self.into_parts();
+        restore.exit_and_rebuild(modem).await
+    }
+}
+
+/// Radio restore state carried alongside the [`mmdvm::AsyncModem`] during
+/// MMDVM operation. Keeps the `Radio`'s CAT-mode codec, notifications,
+/// timeouts, and VFO/memory cache alive so they can be restored on exit.
+///
+/// This type is crate-internal — it only escapes [`MmdvmSession::into_parts`]
+/// so [`crate::mmdvm::DStarGateway`] can reconstruct the `Radio` after
+/// `AsyncModem::shutdown`.
+pub(crate) struct MmdvmRadioRestore<T: Transport + Unpin + 'static> {
+    state: RadioState,
+    _phantom: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T: Transport + Unpin + 'static> std::fmt::Debug for MmdvmRadioRestore<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MmdvmRadioRestore").finish_non_exhaustive()
+    }
+}
+
+impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
+    /// Shut down the modem, send `TN 0,0`, and rebuild the [`Radio`].
+    pub(crate) async fn exit_and_rebuild(
+        self,
+        modem: AsyncModem<MmdvmTransportAdapter<T>>,
+    ) -> Result<Radio<T>, Error> {
+        // Shutdown returns the MmdvmTransportAdapter holding our T.
+        let adapter = modem.shutdown().await.map_err(shell_err_to_thd75_err)?;
+
+        // Pull the inner T out of the adapter.
+        let mut inner = adapter
+            .into_inner()
             .await
-            .map_err(Error::Transport)?;
+            .map_err(|e| Error::Transport(crate::error::TransportError::Disconnected(e)))?;
+
+        // Send TN 0,0 on the raw transport to switch the TNC back to
+        // APRS mode. The adapter is dropped; we speak ASCII CAT on T
+        // directly now.
+        inner.write(b"TN 0,0\r").await.map_err(Error::Transport)?;
 
         // Small delay to let the TNC switch back to CAT mode.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(EXIT_SWITCH_DELAY).await;
 
         Ok(Radio {
-            transport: self.transport,
-            codec: self.codec,
-            notifications: self.notifications,
-            timeout: self.timeout,
-            mode_a: self.mode_a,
-            mode_b: self.mode_b,
-            mcp_speed: self.mcp_speed,
+            transport: inner,
+            codec: self.state.codec,
+            notifications: self.state.notifications,
+            timeout: self.state.timeout,
+            mode_a: self.state.mode_a,
+            mode_b: self.state.mode_b,
+            mcp_speed: self.state.mcp_speed,
             last_cmd_time: None,
         })
     }
+}
 
-    /// Send an MMDVM frame to the radio.
-    ///
-    /// The frame is encoded to MMDVM wire format (`[0xE0, length, command,
-    /// payload...]`) before transmission.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Transport`] if the write fails.
-    pub async fn send_frame(&mut self, frame: &MmdvmFrame) -> Result<(), Error> {
-        let wire = mmdvm::frame::encode_frame(frame);
-        tracing::debug!(
-            command = frame.command,
-            payload_len = frame.payload.len(),
-            wire_len = wire.len(),
-            "MMDVM TX"
-        );
-        self.transport.write(&wire).await.map_err(Error::Transport)
-    }
-
-    /// Receive an MMDVM response from the radio.
-    ///
-    /// Blocks until a complete MMDVM frame is received and parsed, or the
-    /// receive timeout expires. Accumulates bytes from the transport and
-    /// decodes frames using the MMDVM framing protocol.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Timeout`] if no complete frame arrives within the
-    /// configured receive timeout.
-    /// Returns [`Error::Transport`] if the read fails.
-    /// Returns [`Error::Protocol`] if the frame cannot be parsed.
-    pub async fn receive_response(&mut self) -> Result<MmdvmResponse, Error> {
-        let timeout_dur = self.receive_timeout;
-        tokio::time::timeout(timeout_dur, self.receive_response_inner())
-            .await
-            .map_err(|_| Error::Timeout(timeout_dur))?
-    }
-
-    /// Inner receive loop that accumulates bytes and decodes MMDVM frames.
-    async fn receive_response_inner(&mut self) -> Result<MmdvmResponse, Error> {
-        let mut tmp = [0u8; 1024];
-        loop {
-            // Try to decode a frame from the buffer first.
-            match mmdvm::frame::decode_frame(&self.rx_buffer) {
-                Ok(Some((frame, consumed))) => {
-                    let _ = self.rx_buffer.drain(..consumed);
-                    tracing::debug!(
-                        command = frame.command,
-                        payload_len = frame.payload.len(),
-                        "MMDVM RX"
-                    );
-                    let response = mmdvm::frame::parse_response(&frame).map_err(|e| {
-                        Error::Protocol(ProtocolError::FieldParse {
-                            command: "MMDVM".to_owned(),
-                            field: "frame".to_owned(),
-                            detail: format!("{e}"),
-                        })
-                    })?;
-                    return Ok(response);
-                }
-                Ok(None) => {
-                    // Need more data.
-                }
-                Err(e) => {
-                    tracing::warn!(?e, "discarding invalid MMDVM data, resetting buffer");
-                    self.rx_buffer.clear();
-                }
-            }
-
-            // Read more bytes from the transport.
-            let n = self
-                .transport
-                .read(&mut tmp)
-                .await
-                .map_err(Error::Transport)?;
-            if n == 0 {
-                return Err(Error::Transport(TransportError::Disconnected(
-                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed"),
-                )));
-            }
-            self.rx_buffer.extend_from_slice(&tmp[..n]);
+/// Translate an [`mmdvm::ShellError`] into a thd75 [`Error`].
+fn shell_err_to_thd75_err(err: mmdvm::ShellError) -> Error {
+    match err {
+        mmdvm::ShellError::SessionClosed => Error::Protocol(ProtocolError::UnexpectedResponse {
+            expected: "MMDVM session active".into(),
+            actual: b"session closed".to_vec(),
+        }),
+        mmdvm::ShellError::Core(e) => Error::Protocol(ProtocolError::FieldParse {
+            command: "MMDVM".to_owned(),
+            field: "frame".to_owned(),
+            detail: format!("{e}"),
+        }),
+        mmdvm::ShellError::Io(e) => Error::Transport(crate::error::TransportError::Disconnected(e)),
+        mmdvm::ShellError::BufferFull { mode } => {
+            Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: format!("MMDVM {mode:?} buffer ready"),
+                actual: b"buffer full".to_vec(),
+            })
         }
-    }
-
-    /// Initialize the MMDVM modem for D-STAR operation.
-    ///
-    /// Performs the following sequence:
-    /// 1. Send `GetVersion`, receive version response.
-    /// 2. Send `SetConfig` with D-STAR enabled and default TX delay.
-    /// 3. Wait for ACK.
-    /// 4. Send `SetMode(DStar)`.
-    /// 5. Wait for ACK.
-    ///
-    /// Returns the modem status after initialization.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any step in the initialization sequence fails
-    /// or if the modem responds with a NAK.
-    pub async fn init_dstar(&mut self) -> Result<ModemStatus, Error> {
-        tracing::info!("initializing MMDVM modem for D-STAR");
-
-        // Step 1: Get version.
-        let version_frame = MmdvmFrame {
-            command: mmdvm::frame::CMD_GET_VERSION,
-            payload: vec![],
-        };
-        self.send_frame(&version_frame).await?;
-        let version_resp = self.receive_response().await?;
-        match &version_resp {
-            MmdvmResponse::Version {
-                protocol,
-                description,
-            } => {
-                tracing::info!(protocol, description, "MMDVM modem version");
-            }
-            other => {
-                return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                    expected: "Version".into(),
-                    actual: format!("{other:?}").into_bytes(),
-                }));
-            }
+        mmdvm::ShellError::Nak { command, reason } => {
+            Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: format!("MMDVM ACK for 0x{command:02X}"),
+                actual: format!("NAK: {reason:?}").into_bytes(),
+            })
         }
-
-        // Step 2: Set config with D-STAR enabled.
-        let config = MmdvmConfig {
-            invert: 0x00,
-            mode_flags: 0x01, // D-STAR only
-            tx_delay: DEFAULT_TX_DELAY,
-            state: ModemMode::DStar,
-            rx_level: DEFAULT_RX_LEVEL,
-            tx_level: DEFAULT_TX_LEVEL,
-        };
-        let config_frame = MmdvmFrame {
-            command: mmdvm::frame::CMD_SET_CONFIG,
-            payload: vec![
-                config.invert,
-                config.mode_flags,
-                config.tx_delay,
-                config.state as u8,
-                config.rx_level,
-                config.tx_level,
-            ],
-        };
-        self.send_frame(&config_frame).await?;
-
-        // Step 3: Wait for ACK.
-        let ack_resp = self.receive_response().await?;
-        match &ack_resp {
-            MmdvmResponse::Ack { .. } => {
-                tracing::debug!("SetConfig acknowledged");
-            }
-            MmdvmResponse::Nak { reason, .. } => {
-                return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                    expected: "Ack".into(),
-                    actual: format!("NAK: {reason:?}").into_bytes(),
-                }));
-            }
-            other => {
-                return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                    expected: "Ack".into(),
-                    actual: format!("{other:?}").into_bytes(),
-                }));
-            }
-        }
-
-        // Step 4: Set mode to D-STAR.
-        let mode_frame = MmdvmFrame {
-            command: mmdvm::frame::CMD_SET_MODE,
-            payload: vec![ModemMode::DStar as u8],
-        };
-        self.send_frame(&mode_frame).await?;
-
-        // Step 5: Wait for ACK.
-        let ack_resp = self.receive_response().await?;
-        match &ack_resp {
-            MmdvmResponse::Ack { .. } => {
-                tracing::debug!("SetMode acknowledged");
-            }
-            MmdvmResponse::Nak { reason, .. } => {
-                return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                    expected: "Ack".into(),
-                    actual: format!("NAK: {reason:?}").into_bytes(),
-                }));
-            }
-            other => {
-                return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                    expected: "Ack".into(),
-                    actual: format!("{other:?}").into_bytes(),
-                }));
-            }
-        }
-
-        // Get status to return.
-        self.get_status().await
-    }
-
-    /// Send a D-STAR header to the radio for transmission.
-    ///
-    /// The header contains routing information (callsigns, repeater paths)
-    /// and is sent before voice data frames.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Transport`] if the write fails.
-    pub async fn send_dstar_header(&mut self, header: &DStarHeader) -> Result<(), Error> {
-        tracing::debug!(
-            my_call = %header.my_call.trim(),
-            ur_call = %header.ur_call.trim(),
-            "sending D-STAR header"
-        );
-        let encoded = header.encode();
-        let frame = MmdvmFrame {
-            command: mmdvm::frame::CMD_DSTAR_HEADER,
-            payload: encoded.to_vec(),
-        };
-        self.send_frame(&frame).await
-    }
-
-    /// Send D-STAR voice data (12 bytes: 9 AMBE + 3 slow data).
-    ///
-    /// Each voice frame consists of 9 bytes of AMBE-encoded audio followed
-    /// by 3 bytes of slow data (used for text messages, GPS, etc.).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Transport`] if the write fails.
-    pub async fn send_dstar_data(&mut self, data: &[u8; 12]) -> Result<(), Error> {
-        let frame = MmdvmFrame {
-            command: mmdvm::frame::CMD_DSTAR_DATA,
-            payload: data.to_vec(),
-        };
-        self.send_frame(&frame).await
-    }
-
-    /// Send end-of-transmission marker.
-    ///
-    /// Signals the modem that the current D-STAR transmission is complete.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Transport`] if the write fails.
-    pub async fn send_dstar_eot(&mut self) -> Result<(), Error> {
-        tracing::debug!("sending D-STAR EOT");
-        let frame = MmdvmFrame {
-            command: mmdvm::frame::CMD_DSTAR_EOT,
-            payload: vec![],
-        };
-        self.send_frame(&frame).await
-    }
-
-    /// Poll modem status.
-    ///
-    /// Sends a `GET_STATUS` command and returns the current modem status
-    /// including enabled modes, operating state, TX status, and buffer
-    /// availability.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the status request fails or the response is
-    /// not a valid status frame.
-    pub async fn get_status(&mut self) -> Result<ModemStatus, Error> {
-        let status_frame = MmdvmFrame {
-            command: mmdvm::frame::CMD_GET_STATUS,
-            payload: vec![],
-        };
-        self.send_frame(&status_frame).await?;
-        let resp = self.receive_response().await?;
-        match resp {
-            MmdvmResponse::Status(status) => Ok(status),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "Status".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
+        // `mmdvm::ShellError` is `#[non_exhaustive]`. Surface unknown
+        // variants as a generic transport disconnection.
+        _ => Error::Transport(crate::error::TransportError::Disconnected(
+            std::io::Error::other("unknown MMDVM shell error"),
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mmdvm::frame::{CMD_ACK, CMD_GET_STATUS, CMD_GET_VERSION, START_BYTE};
     use crate::transport::MockTransport;
     use crate::types::TncBaud;
 
-    /// Helper: create a Radio with a mock that expects the TN 3,0 command.
-    async fn mock_radio_for_mmdvm(baud: TncBaud) -> Radio<MockTransport> {
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Helper: create a Radio with a mock that expects the TN 3,x command.
+    async fn mock_radio_for_mmdvm(baud: TncBaud) -> Result<Radio<MockTransport>, Error> {
         let tn_cmd = format!("TN 3,{}\r", u8::from(baud));
         let tn_resp = format!("TN 3,{}\r", u8::from(baud));
         let mut mock = MockTransport::new();
         mock.expect(tn_cmd.as_bytes(), tn_resp.as_bytes());
-        Radio::connect(mock).await.unwrap()
+        Radio::connect(mock).await
     }
 
     #[tokio::test]
-    async fn enter_mmdvm_sends_tn_command() {
-        let radio = mock_radio_for_mmdvm(TncBaud::Bps1200).await;
-        let session = radio.enter_mmdvm(TncBaud::Bps1200).await.unwrap();
-        assert!(format!("{session:?}").contains("MmdvmSession"));
+    async fn enter_mmdvm_sends_tn_command() -> TestResult {
+        // `enter_mmdvm` constructs an `MmdvmTransportAdapter`, which
+        // spawns its pump task via `tokio::task::spawn_local`. Run
+        // inside a `LocalSet` so the spawn succeeds.
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let radio = mock_radio_for_mmdvm(TncBaud::Bps1200).await?;
+                let session = radio
+                    .enter_mmdvm(TncBaud::Bps1200)
+                    .await
+                    .map_err(|(_, e)| e)?;
+                assert!(format!("{session:?}").contains("MmdvmSession"));
+                Ok(())
+            })
+            .await
     }
 
     #[tokio::test]
-    async fn enter_mmdvm_9600_baud() {
-        let radio = mock_radio_for_mmdvm(TncBaud::Bps9600).await;
-        let _session = radio.enter_mmdvm(TncBaud::Bps9600).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn send_frame_writes_mmdvm_encoded() {
-        let radio = mock_radio_for_mmdvm(TncBaud::Bps1200).await;
-        let mut session = radio.enter_mmdvm(TncBaud::Bps1200).await.unwrap();
-
-        // Expect a GET_VERSION frame: [0xE0, 0x03, 0x00]
-        session
-            .transport
-            .expect(&[START_BYTE, 3, CMD_GET_VERSION], &[]);
-
-        let frame = MmdvmFrame {
-            command: CMD_GET_VERSION,
-            payload: vec![],
-        };
-        session.send_frame(&frame).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn send_dstar_eot_sends_correct_frame() {
-        let radio = mock_radio_for_mmdvm(TncBaud::Bps1200).await;
-        let mut session = radio.enter_mmdvm(TncBaud::Bps1200).await.unwrap();
-
-        // EOT frame: [0xE0, 0x03, 0x13]
-        session
-            .transport
-            .expect(&[START_BYTE, 3, mmdvm::frame::CMD_DSTAR_EOT], &[]);
-
-        session.send_dstar_eot().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn send_dstar_data_sends_correct_frame() {
-        let radio = mock_radio_for_mmdvm(TncBaud::Bps1200).await;
-        let mut session = radio.enter_mmdvm(TncBaud::Bps1200).await.unwrap();
-
-        let data: [u8; 12] = [0xAA; 12];
-        // Data frame: [0xE0, 15, 0x11, 12 bytes of data]
-        let mut expected = vec![START_BYTE, 15, mmdvm::frame::CMD_DSTAR_DATA];
-        expected.extend_from_slice(&data);
-        session.transport.expect(&expected, &[]);
-
-        session.send_dstar_data(&data).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn exit_sends_tn_and_restores_radio() {
-        let radio = mock_radio_for_mmdvm(TncBaud::Bps1200).await;
-        let mut session = radio.enter_mmdvm(TncBaud::Bps1200).await.unwrap();
-
-        // Exit sends TN 0,0 to return to normal mode.
-        session.transport.expect(b"TN 0,0\r", &[]);
-
-        let _radio = session.exit().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn set_receive_timeout() {
-        let radio = mock_radio_for_mmdvm(TncBaud::Bps1200).await;
-        let mut session = radio.enter_mmdvm(TncBaud::Bps1200).await.unwrap();
-        session.set_receive_timeout(Duration::from_secs(30));
-        assert_eq!(session.receive_timeout, Duration::from_secs(30));
-    }
-
-    #[tokio::test]
-    async fn receive_response_parses_version() {
-        let radio = mock_radio_for_mmdvm(TncBaud::Bps1200).await;
-        let mut session = radio.enter_mmdvm(TncBaud::Bps1200).await.unwrap();
-
-        // Queue: send GET_VERSION, receive version response.
-        let mut resp = vec![START_BYTE, 9, CMD_GET_VERSION, 1];
-        resp.extend_from_slice(b"MMDVM");
-        session
-            .transport
-            .expect(&[START_BYTE, 3, CMD_GET_VERSION], &resp);
-
-        // send_frame + receive_response round-trip.
-        let frame = MmdvmFrame {
-            command: CMD_GET_VERSION,
-            payload: vec![],
-        };
-        session.send_frame(&frame).await.unwrap();
-        let response = session.receive_response().await.unwrap();
-        match response {
-            MmdvmResponse::Version {
-                protocol,
-                description: desc,
-            } => {
-                assert_eq!(protocol, 1);
-                assert_eq!(desc, "MMDVM");
-            }
-            other => panic!("expected Version, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn receive_response_parses_ack() {
-        let radio = mock_radio_for_mmdvm(TncBaud::Bps1200).await;
-        let mut session = radio.enter_mmdvm(TncBaud::Bps1200).await.unwrap();
-
-        // Queue: send SET_CONFIG frame, receive ACK.
-        let config_wire = vec![
-            START_BYTE,
-            9,
-            mmdvm::frame::CMD_SET_CONFIG,
-            0,
-            1,
-            10,
-            1,
-            128,
-            128,
-        ];
-        let resp = vec![START_BYTE, 4, CMD_ACK, mmdvm::frame::CMD_SET_CONFIG];
-        session.transport.expect(&config_wire, &resp);
-
-        let frame = MmdvmFrame {
-            command: mmdvm::frame::CMD_SET_CONFIG,
-            payload: vec![0, 1, 10, 1, 128, 128],
-        };
-        session.send_frame(&frame).await.unwrap();
-        let response = session.receive_response().await.unwrap();
-        match response {
-            MmdvmResponse::Ack { command } => {
-                assert_eq!(command, mmdvm::frame::CMD_SET_CONFIG);
-            }
-            other => panic!("expected Ack, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn get_status_sends_and_parses() {
-        let radio = mock_radio_for_mmdvm(TncBaud::Bps1200).await;
-        let mut session = radio.enter_mmdvm(TncBaud::Bps1200).await.unwrap();
-
-        // Expect GET_STATUS write: [0xE0, 0x03, 0x01]
-        // Return status response: [0xE0, 0x07, 0x01, modes, state, tx, dstar_buf]
-        let status_resp = vec![START_BYTE, 7, CMD_GET_STATUS, 0x01, 0x01, 0x00, 10];
-        session
-            .transport
-            .expect(&[START_BYTE, 3, CMD_GET_STATUS], &status_resp);
-
-        let status = session.get_status().await.unwrap();
-        assert_eq!(status.enabled_modes, 0x01);
-        assert_eq!(status.dstar_buffer, 10);
-        assert!(!status.tx);
+    async fn enter_mmdvm_9600_baud() -> TestResult {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let radio = mock_radio_for_mmdvm(TncBaud::Bps9600).await?;
+                let _session = radio
+                    .enter_mmdvm(TncBaud::Bps9600)
+                    .await
+                    .map_err(|(_, e)| e)?;
+                Ok(())
+            })
+            .await
     }
 }

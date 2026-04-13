@@ -1,45 +1,25 @@
-//! MMDVM (Multi-Mode Digital Voice Modem) serial protocol codec.
+//! D-STAR gateway client for the TH-D75.
 //!
-//! This module implements the binary framing protocol used by MMDVM-compatible
-//! modems for D-STAR digital voice communication. The codec is pure logic with
-//! no I/O or async dependencies --- it encodes and decodes byte frames suitable
-//! for transmission over any serial transport.
+//! The TH-D75 in Reflector Terminal Mode speaks the MMDVM binary
+//! framing protocol on its serial link. This module owns the radio-facing
+//! side of that interface: a [`DStarGateway`] wraps an
+//! [`mmdvm::AsyncModem`] and translates its [`mmdvm::Event`] stream into
+//! the higher-level [`DStarEvent`]s that TH-D75 consumers care about
+//! (slow-data text messages, URCALL commands, last-heard tracking,
+//! echo record/playback).
 //!
-//! # Frame format (MMDVM Specification 20150922)
+//! The raw MMDVM framing codec lives in the [`mmdvm_core`] crate; the
+//! async event loop, TX-queue buffer gating, and 250 ms status polling
+//! live in the [`mmdvm`] crate.
 //!
-//! Every MMDVM frame has the structure:
-//!
-//! ```text
-//! [0xE0] [length] [command] [payload...]
-//! ```
-//!
-//! - Byte 0: Start marker, always `0xE0`.
-//! - Byte 1: Total frame length (includes start, length, command, and payload).
-//! - Byte 2: Command or response type identifier.
-//! - Bytes 3+: Variable-length payload (may be empty).
-//!
-//! # Submodules
-//!
-//! - [`frame`] --- Frame-level encode/decode, builders, and response parsing.
-//! - [`dstar`] --- D-STAR radio header (41 bytes with CRC-CCITT) codec.
-//! - [`slow_data`] --- D-STAR slow data decoder for extracting text messages
-//!   from voice frame payloads.
+//! D-STAR protocol types (headers, voice frames, slow-data codecs,
+//! reflector protocols, host file parser) live in the
+//! [`dstar-gateway-core`](dstar_gateway_core) crate.
 
-pub mod dstar;
-pub mod frame;
 pub mod gateway;
-pub mod hosts;
-pub mod reflector;
-pub mod slow_data;
 
-// Re-export key types for convenience.
-pub use dstar::DStarHeader;
-pub use frame::{
-    MmdvmConfig, MmdvmError, MmdvmFrame, MmdvmResponse, ModemMode, ModemState, ModemStatus,
-    NakReason,
-};
-pub use gateway::{
-    DStarEvent, DStarGateway, DStarGatewayConfig, DStarVoiceFrame, LastHeardEntry, ReconnectPolicy,
-};
-pub use hosts::{HostEntry, parse_host_file};
-pub use slow_data::{SlowDataDecoder, SlowDataEncoder};
+// Re-export the most commonly used types from mmdvm-core so thd75
+// consumers don't need to depend on it directly.
+pub use mmdvm_core::{MmdvmError, ModemMode, ModemStatus, NakReason};
+
+pub use gateway::{DStarEvent, DStarGateway, DStarGatewayConfig, LastHeardEntry, ReconnectPolicy};

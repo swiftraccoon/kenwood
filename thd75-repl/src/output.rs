@@ -4,13 +4,16 @@
 //! zero async, zero radio access. Testing happens directly on the
 //! returned strings plus the accessibility lint.
 //!
-//! ## Accessibility rules (see spec for full rationale)
+//! ## Accessibility rules
 //!
-//! - Label-colon-value format
-//! - Natural-language units (megahertz, watts, hertz)
-//! - Booleans as words (on/off)
-//! - Lines under 80 characters
-//! - ASCII printable only
+//! Strings are designed for screen-reader output (blind operators) and
+//! fixed-width terminals:
+//!
+//! - Label-colon-value format (screen readers parse "Label: value" well)
+//! - Natural-language units (megahertz, watts, hertz — not symbols)
+//! - Booleans as words (on/off, not true/false or checkmarks)
+//! - Lines under 80 characters (no wrapping in standard terminals)
+//! - ASCII printable only (no box-drawing or symbols)
 
 use kenwood_thd75::types::{Band, BatteryLevel, PowerLevel};
 

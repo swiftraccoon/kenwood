@@ -18,6 +18,9 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "net", "
 tokio-serial = "5"
 thiserror = "2"
 tracing = "0.1"
+dstar-gateway-core = { path = "../dstar-gateway-core" }
+mmdvm-core = { path = "../mmdvm-core" }
+mmdvm = { path = "../mmdvm" }
 
 [build-dependencies]
 cc = "1"

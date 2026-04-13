@@ -68,16 +68,45 @@ and send them to a DVSI chip via the AMBEserver protocol.
 
 ## Legal notes
 
-- **License:** ISC (permissive, matching upstream mbelib)
-- **Patents:** The core AMBE/MBE algorithm patents
-  (US 5,715,365, 5,754,974, 5,826,222, 5,870,405, 6,161,089, 6,199,037,
-  6,377,916, 6,397,178) **have all expired** as of 2020. mbelib has
-  existed publicly for 16+ years with zero enforcement action from
-  DVSI. For decode-only monitoring use, the practical patent risk is
-  minimal.
-- **Amateur radio:** Amateur radio transmissions are explicitly
-  "readily accessible to the general public" under 18 USC 2511, so
-  recording and decoding them is legal in the US. Check your local
+- **License:** GPL-2.0-or-later (matching the kenwood workspace). Originally
+  ported from szechyjs's ISC-licensed mbelib and DSD projects; ISC notices
+  are preserved for attribution in [`LICENSE`](./LICENSE) per the ISC
+  reproduction requirement. Full GPL-2.0 and ISC texts are in
+  [`LICENSES/`](./LICENSES/). This matches the relicensing pathway used
+  by [arancormonk/mbelib-neo](https://github.com/arancormonk/mbelib-neo).
+
+- **Patents:** US patents commonly cited as covering the AMBE 3600×2450
+  algorithm, with anticipated expiration dates per Google Patents:
+
+  | Patent          | Assignee               | Expired      |
+  |-----------------|------------------------|--------------|
+  | US 5,715,365    | Digital Voice Systems  | 2015-02-03   |
+  | US 5,754,974    | Digital Voice Systems  | 2015-05-19   |
+  | US 5,826,222    | Digital Voice Systems  | 2015-01-12   |
+  | US 5,870,405    | Digital Voice Systems  | 2012-11-30   |
+  | US 6,161,089    | Digital Voice Systems  | 2017-03-14   |
+  | US 6,199,037    | Digital Voice Systems  | 2017-12-04   |
+  | US 6,377,916    | Digital Voice Systems  | 2019-11-29   |
+  | US 6,397,178    | Conexant Systems       | 2018-09-18 † |
+
+  † US 6,397,178 ("Data organizational scheme for enhanced selection of
+  gain parameters for speech coding") is a generic speech-coding patent
+  assigned to Conexant Systems, not DVSI. It is included here because it
+  appears in commonly-circulated AMBE patent lists, but its applicability
+  to the AMBE 3600×2450 codec specifically is debatable.
+
+  Newer DVSI codec generations (AMBE+, AMBE+2, AMBE-3000) may be covered
+  by additional patents. This decoder implements only AMBE 3600×2450 and
+  does not implement those newer variants.
+
+  **This is not legal advice.** Patent law varies by jurisdiction, patent
+  status can change (reexamination, term adjustment, foreign equivalents),
+  and the table above is a snapshot — verify current status with counsel
+  for any commercial use.
+
+- **Amateur radio (US):** Amateur radio transmissions are explicitly
+  "readily accessible to the general public" under 18 USC 2511(2)(g)(ii),
+  so recording and decoding them is legal in the US. Check your local
   jurisdiction for similar exemptions.
 
 ## Quality bar

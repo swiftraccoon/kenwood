@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2010 szechyjs (mbelib)
+// SPDX-FileCopyrightText: 2026 Swift Raccoon
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Error correction coding for AMBE 3600×2450 voice frames.
 //!
 //! The AMBE codec protects its parameter bits with two levels of

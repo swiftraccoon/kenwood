@@ -1,0 +1,22 @@
+[package]
+name = "mmdvm-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Sans-io Rust codec for the MMDVM ham radio digital voice modem protocol"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/swiftraccoon/kenwood"
+keywords = ["ham-radio", "mmdvm", "dstar", "amateur-radio", "digital-voice"]
+categories = ["encoding", "network-programming"]
+authors = ["swiftraccoon"]
+publish = false
+
+[dependencies]
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

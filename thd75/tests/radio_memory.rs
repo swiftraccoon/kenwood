@@ -1,4 +1,4 @@
-//! Integration tests for radio memory methods (Task 25).
+//! Integration tests for radio memory methods.
 
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;

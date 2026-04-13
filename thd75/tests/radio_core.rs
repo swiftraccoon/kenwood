@@ -1,4 +1,4 @@
-//! Integration tests for radio core methods (Task 24).
+//! Integration tests for radio core methods.
 
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;

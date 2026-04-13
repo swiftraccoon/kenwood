@@ -61,8 +61,8 @@ use capture::StreamCapture;
 ///
 /// # Current behavior
 ///
-/// This is a placeholder: connection-pool management against
-/// `AsyncSession<P>` is the bulk of Task 13+ and is deferred. For now the
+/// This is a placeholder: the connection-pool management layer that
+/// drives `AsyncSession<P>` is not yet implemented. For now the
 /// function logs its configuration and then blocks on a never-completing
 /// future so the main task-supervisor loop treats it as a well-behaved
 /// long-running task.

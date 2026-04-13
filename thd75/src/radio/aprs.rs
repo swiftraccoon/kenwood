@@ -15,7 +15,8 @@
 //! - **PT**: Beacon TX control mode
 //! - **MS**: Position source / message send (overloaded mnemonic)
 //! - **AE**: Serial number info (not actually APRS-related, but shares the A prefix)
-//! - **BE**: Sends an APRS beacon (transmits on air) — see dangerous commands in CLAUDE.md
+//! - **BE**: Sends an APRS beacon (transmits on air — requires a valid
+//!   amateur licence and appropriate authorisation; use deliberately)
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};

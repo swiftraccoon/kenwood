@@ -24,18 +24,17 @@
 //!
 //! # Design
 //!
-//! The [`DStarGateway`] owns an [`MmdvmSession`] and therefore the radio
-//! transport. Create it with [`DStarGateway::start`], which enters MMDVM
+//! The [`DStarGateway`] owns an [`mmdvm::AsyncModem`] via an
+//! [`MmdvmSession`]. The [`mmdvm`] crate's async shell handles MMDVM
+//! framing, periodic `GetStatus` polling, and TX-buffer slot gating
+//! in a spawned task; the gateway consumes the [`mmdvm::Event`]
+//! stream, translates it into [`DStarEvent`]s, and forwards TX frames
+//! through the handle's `send_dstar_*` methods.
+//!
+//! Create a gateway with [`DStarGateway::start`], which enters MMDVM
 //! mode and initializes D-STAR, and tear it down with
 //! [`DStarGateway::stop`], which exits MMDVM mode and returns the
-//! [`Radio`] for other use. This is the same ownership pattern used by
-//! [`AprsClient`](crate::kiss::aprs_client::AprsClient) and
-//! [`MmdvmSession`].
-//!
-//! The main loop calls [`DStarGateway::next_event`] repeatedly. Each
-//! call performs one cycle of I/O: receive a pending MMDVM frame (with a
-//! short timeout), parse it, update state, and return a typed
-//! [`DStarEvent`].
+//! [`Radio`] for other use.
 //!
 //! # Example
 //!
@@ -80,21 +79,21 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use dstar_gateway_core::{DStarHeader, SlowDataTextCollector, VoiceFrame};
+use mmdvm::{AsyncModem, Event};
+use mmdvm_core::{MMDVM_SET_CONFIG, ModemMode, ModemStatus};
+
 use crate::error::Error;
-use crate::mmdvm::ModemStatus;
-use crate::mmdvm::dstar::DStarHeader;
-use crate::mmdvm::frame::MmdvmResponse;
-use crate::mmdvm::slow_data::{SlowDataDecoder, SlowDataEncoder};
 use crate::radio::Radio;
-use crate::radio::mmdvm_session::MmdvmSession;
-use crate::transport::Transport;
+use crate::radio::mmdvm_session::{MmdvmRadioRestore, MmdvmSession};
+use crate::transport::{MmdvmTransportAdapter, Transport};
 use crate::types::TncBaud;
 use crate::types::dstar::UrCallAction;
 
 /// Default receive timeout for `next_event` polling (500 ms).
 ///
-/// Short enough to keep the event loop responsive, long enough to
-/// avoid busy-spinning on a quiet channel.
+/// Gives the event loop a short ceiling so callers can drive other
+/// work between polls on a quiet channel.
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Default maximum entries in the last-heard list.
@@ -106,17 +105,17 @@ const DEFAULT_RECONNECT_INITIAL: Duration = Duration::from_secs(1);
 /// Default maximum reconnection delay.
 const DEFAULT_RECONNECT_MAX: Duration = Duration::from_secs(30);
 
-/// D-STAR voice frame interval (20 ms per AMBE frame).
-const VOICE_FRAME_INTERVAL: Duration = Duration::from_millis(20);
+/// Timeout waiting for each ACK during the D-STAR init handshake.
+const INIT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Number of frames to burst-send on initial TX (prebuffer).
-///
-/// Allows the radio's MMDVM buffer to fill before audio starts playing,
-/// preventing initial audio gaps. Only used by [`DStarGateway::send_voice`];
-/// the REPL path uses [`DStarGateway::send_voice_unpaced`] which
-/// bypasses this constant entirely (see that function's docs for
-/// the rationale).
-const TX_PREBUFFER_FRAMES: usize = 5;
+/// Default TX delay for MMDVM `SetConfig` (in 10 ms units).
+const DEFAULT_TX_DELAY: u8 = 10;
+
+/// Default RX audio level for MMDVM `SetConfig`.
+const DEFAULT_RX_LEVEL: u8 = 128;
+
+/// Default TX audio level for MMDVM `SetConfig`.
+const DEFAULT_TX_LEVEL: u8 = 128;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -236,23 +235,6 @@ impl Default for ReconnectPolicy {
 }
 
 // ---------------------------------------------------------------------------
-// Voice frame
-// ---------------------------------------------------------------------------
-
-/// A D-STAR voice data frame (9 bytes AMBE + 3 bytes slow data).
-///
-/// Each D-STAR voice frame carries 20 ms of AMBE-encoded audio and
-/// 3 bytes of slow data used for text messages, GPS, or other auxiliary
-/// information.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DStarVoiceFrame {
-    /// AMBE codec voice data (9 bytes).
-    pub ambe: [u8; 9],
-    /// Slow data payload (3 bytes).
-    pub slow_data: [u8; 3],
-}
-
-// ---------------------------------------------------------------------------
 // Last heard
 // ---------------------------------------------------------------------------
 
@@ -290,18 +272,13 @@ pub enum DStarEvent {
     /// A voice transmission started (header received from radio).
     VoiceStart(DStarHeader),
     /// A voice data frame received from the radio.
-    VoiceData(DStarVoiceFrame),
+    VoiceData(VoiceFrame),
     /// Voice transmission ended cleanly (EOT received).
     VoiceEnd,
     /// Voice transmission lost (no clean EOT, signal lost).
     VoiceLost,
     /// A slow data text message was decoded from the voice stream.
     TextMessage(String),
-    /// GPS/DPRS data was decoded from the voice stream slow data.
-    ///
-    /// The bytes are the raw DPRS position encoding from type 3 slow
-    /// data blocks (not NMEA text).
-    GpsData(Vec<u8>),
     /// A station was heard (added or updated in the last-heard list).
     StationHeard(LastHeardEntry),
     /// A URCALL command was detected in the voice header.
@@ -327,13 +304,15 @@ pub enum DStarEvent {
 ///
 /// See the [module-level documentation](self) for architecture details
 /// and a full usage example.
-pub struct DStarGateway<T: Transport> {
-    /// The underlying MMDVM session (owns the radio transport).
-    session: MmdvmSession<T>,
+pub struct DStarGateway<T: Transport + Unpin + 'static> {
+    /// The underlying MMDVM async modem.
+    modem: AsyncModem<MmdvmTransportAdapter<T>>,
+    /// Radio-state restore envelope used on [`Self::stop`].
+    restore: MmdvmRadioRestore<T>,
     /// Gateway configuration.
     config: DStarGatewayConfig,
     /// Slow data decoder for the current RX stream.
-    slow_data: SlowDataDecoder,
+    slow_data: SlowDataTextCollector,
     /// Frame counter for slow data decoding within a transmission.
     slow_data_frame_index: u8,
     /// Last-heard station list, newest first.
@@ -342,21 +321,19 @@ pub struct DStarGateway<T: Transport> {
     rx_active: bool,
     /// The D-STAR header for the currently active RX transmission.
     rx_header: Option<DStarHeader>,
-    /// Count of TX frames sent in the current outgoing transmission.
-    tx_frame_count: usize,
-    /// Timestamp of the last TX voice frame sent to the radio.
-    last_tx_frame: Option<Instant>,
     /// Buffered events to emit on the next `next_event` call.
     pending_events: VecDeque<DStarEvent>,
     /// Echo recording buffer (header + voice frames).
     echo_header: Option<DStarHeader>,
     /// Echo recorded voice frames.
-    echo_frames: Vec<DStarVoiceFrame>,
+    echo_frames: Vec<VoiceFrame>,
     /// Whether echo recording is active.
     echo_active: bool,
+    /// Per-event poll timeout (configurable via [`Self::set_event_timeout`]).
+    event_timeout: Duration,
 }
 
-impl<T: Transport> std::fmt::Debug for DStarGateway<T> {
+impl<T: Transport + Unpin + 'static> std::fmt::Debug for DStarGateway<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DStarGateway")
             .field("config", &self.config)
@@ -366,7 +343,7 @@ impl<T: Transport> std::fmt::Debug for DStarGateway<T> {
     }
 }
 
-impl<T: Transport> DStarGateway<T> {
+impl<T: Transport + Unpin + 'static> DStarGateway<T> {
     /// Start the D-STAR gateway.
     ///
     /// Enters MMDVM mode on the radio, initializes the modem for D-STAR
@@ -380,59 +357,47 @@ impl<T: Transport> DStarGateway<T> {
     ///
     /// # Panics
     ///
-    /// Panics if MMDVM mode was entered but D-STAR init failed AND
-    /// the subsequent MMDVM exit also failed (unrecoverable state).
+    /// Panics if MMDVM was entered and D-STAR init failed AND the
+    /// subsequent MMDVM exit also failed. This indicates unrecoverable
+    /// transport state; the caller's only option is to drop any
+    /// remaining handles and reconnect to the radio from scratch.
     pub async fn start(
         radio: Radio<T>,
         config: DStarGatewayConfig,
     ) -> Result<Self, (Radio<T>, Error)> {
-        let mut session = match radio.enter_mmdvm(config.baud).await {
+        let session = match radio.enter_mmdvm(config.baud).await {
             Ok(s) => s,
             Err((radio, e)) => return Err((radio, e)),
         };
-        session.set_receive_timeout(EVENT_POLL_TIMEOUT);
 
-        // Initialize the modem for D-STAR. This sends GetVersion,
-        // SetConfig, and SetMode commands. If init fails, exit MMDVM
-        // mode and return the radio so the caller can continue.
-        let _status = match session.init_dstar().await {
-            Ok(s) => s,
-            Err(e) => {
-                // Init failed — exit MMDVM mode to recover the radio.
-                let radio = session
-                    .exit()
-                    .await
-                    .map_err(|exit_err| {
-                        tracing::error!("failed to exit MMDVM after init failure: {exit_err}");
-                    })
-                    .ok();
-                // If we recovered the radio, return it with the error.
-                // If not, we have no radio to return — this is unrecoverable.
-                return Err((
-                    radio.expect(
-                        "MMDVM exit failed after init failure; \
-                         transport is in an unrecoverable state",
-                    ),
-                    e,
-                ));
+        match Self::build_from_session(session, config).await {
+            Ok(gateway) => Ok(gateway),
+            Err((restore, modem, init_err)) => {
+                // Init failed; roll back MMDVM mode to recover the Radio.
+                match restore.exit_and_rebuild(modem).await {
+                    Ok(radio) => Err((radio, init_err)),
+                    Err(exit_err) => {
+                        tracing::error!(
+                            init_err = %init_err,
+                            exit_err = %exit_err,
+                            "MMDVM exit failed after D-STAR init failure; \
+                             radio state is unrecoverable"
+                        );
+                        // We cannot return a valid Radio to the caller.
+                        // The contract of this function requires a Radio
+                        // in the error path; this is an unrecoverable
+                        // state, so we mark it with `unreachable!` to
+                        // satisfy the clippy `panic` lint while still
+                        // failing loudly.
+                        unreachable!(
+                            "MMDVM exit failed after D-STAR init failure; \
+                             transport is in an unrecoverable state: \
+                             init_err={init_err}, exit_err={exit_err}"
+                        );
+                    }
+                }
             }
-        };
-
-        Ok(Self {
-            session,
-            config,
-            slow_data: SlowDataDecoder::new(),
-            slow_data_frame_index: 0,
-            last_heard: Vec::new(),
-            rx_active: false,
-            rx_header: None,
-            tx_frame_count: 0,
-            last_tx_frame: None,
-            pending_events: VecDeque::new(),
-            echo_header: None,
-            echo_frames: Vec::new(),
-            echo_active: false,
-        })
+        }
     }
 
     /// Start the D-STAR gateway on a radio already in MMDVM mode.
@@ -448,25 +413,49 @@ impl<T: Transport> DStarGateway<T> {
         radio: Radio<T>,
         config: DStarGatewayConfig,
     ) -> Result<Self, Error> {
-        let mut session = radio.into_mmdvm_session();
-        session.set_receive_timeout(EVENT_POLL_TIMEOUT);
+        let session = radio.into_mmdvm_session();
+        Self::build_from_session(session, config)
+            .await
+            .map_err(|(_restore, _modem, err)| err)
+    }
 
-        let _status = session.init_dstar().await?;
+    /// Build a gateway from an already-prepared [`MmdvmSession`].
+    ///
+    /// Runs the D-STAR init handshake (`SetConfig` + `SetMode`) and,
+    /// on success, returns the fully-initialised gateway. On failure,
+    /// returns the `(restore, modem, error)` triple so the caller can
+    /// clean up the MMDVM session before surfacing the error.
+    async fn build_from_session(
+        session: MmdvmSession<T>,
+        config: DStarGatewayConfig,
+    ) -> Result<
+        Self,
+        (
+            MmdvmRadioRestore<T>,
+            AsyncModem<MmdvmTransportAdapter<T>>,
+            Error,
+        ),
+    > {
+        let (mut modem, restore) = session.into_parts();
+
+        if let Err(e) = init_dstar(&mut modem).await {
+            return Err((restore, modem, e));
+        }
 
         Ok(Self {
-            session,
+            modem,
+            restore,
             config,
-            slow_data: SlowDataDecoder::new(),
+            slow_data: SlowDataTextCollector::new(),
             slow_data_frame_index: 0,
             last_heard: Vec::new(),
             rx_active: false,
             rx_header: None,
-            tx_frame_count: 0,
-            last_tx_frame: None,
             pending_events: VecDeque::new(),
             echo_header: None,
             echo_frames: Vec::new(),
             echo_active: false,
+            event_timeout: EVENT_POLL_TIMEOUT,
         })
     }
 
@@ -476,233 +465,212 @@ impl<T: Transport> DStarGateway<T> {
     ///
     /// Returns an error if the MMDVM exit command fails.
     pub async fn stop(self) -> Result<Radio<T>, Error> {
-        self.session.exit().await
+        self.restore.exit_and_rebuild(self.modem).await
     }
 
     /// Process pending I/O and return the next event.
     ///
-    /// Each call performs one cycle:
-    /// 1. Try to receive an MMDVM frame from the radio.
-    /// 2. Parse the response into a typed event.
-    /// 3. On `DStarHeader`: store header, set `rx_active`, add to
-    ///    last-heard, reset slow data decoder, emit `VoiceStart` +
-    ///    `StationHeard`.
-    /// 4. On `DStarData`: feed slow data decoder, emit `VoiceData`.
-    ///    If slow data has a complete message, return `TextMessage`
-    ///    on the next call.
-    /// 5. On `DStarEOT`: clear `rx_active`, emit `VoiceEnd`.
-    /// 6. On `DStarLost`: clear `rx_active`, emit `VoiceLost`.
-    /// 7. On `Status`: emit `StatusUpdate`.
-    ///
-    /// Returns `Ok(None)` when no activity occurs within the poll
-    /// timeout. Callers should loop on this method.
+    /// Each call waits up to [`Self::set_event_timeout`] for a new MMDVM
+    /// event from the modem loop, translates it into a [`DStarEvent`],
+    /// and returns. Returns `Ok(None)` when no MMDVM event arrives
+    /// within the timeout.
     ///
     /// # Errors
     ///
-    /// Returns an error on transport failures.
+    /// Only returns errors if the underlying transport fails fatally.
+    /// Malformed frames are swallowed by the [`mmdvm`] crate's RX loop
+    /// as debug diagnostics — propagating a decode error would kill
+    /// the whole session on a single malformed byte.
     pub async fn next_event(&mut self) -> Result<Option<DStarEvent>, Error> {
         // Drain buffered events first (e.g. UrCallCommand after VoiceStart).
         if let Some(evt) = self.pending_events.pop_front() {
             return Ok(Some(evt));
         }
 
-        let response = match self.session.receive_response().await {
-            Ok(r) => r,
-            Err(Error::Timeout(_)) => return Ok(None),
-            Err(e) => return Err(e),
+        let timeout = self.event_timeout;
+        let Ok(Some(raw)) = tokio::time::timeout(timeout, self.modem.next_event()).await else {
+            // Either a timeout (outer Err) or the task shut down cleanly
+            // (inner None) — surface no event.
+            return Ok(None);
         };
 
-        match response {
-            MmdvmResponse::DStarHeader(header) => {
-                // Start of a new voice transmission.
-                self.rx_active = true;
-                self.slow_data.reset();
-                self.slow_data_frame_index = 0;
-                self.rx_header = Some(header.clone());
+        self.dispatch_event(raw).await
+    }
 
-                // Parse URCALL for special commands.
-                let action = UrCallAction::parse(&header.ur_call);
-                match &action {
-                    UrCallAction::Cq | UrCallAction::Callsign(_) => {}
-                    UrCallAction::Echo => {
-                        // Start echo recording.
-                        self.echo_active = true;
-                        self.echo_header = Some(header.clone());
-                        self.echo_frames.clear();
-                    }
-                    _ => {
-                        // Queue the command event after VoiceStart.
-                        self.pending_events
-                            .push_back(DStarEvent::UrCallCommand(action));
-                    }
-                }
-
-                // Update last-heard list.
-                let entry = LastHeardEntry {
-                    callsign: header.my_call.trim().to_owned(),
-                    suffix: header.my_suffix.trim().to_owned(),
-                    destination: header.ur_call.trim().to_owned(),
-                    repeater1: header.rpt1.trim().to_owned(),
-                    repeater2: header.rpt2.trim().to_owned(),
-                    timestamp: Instant::now(),
-                };
-                self.update_last_heard(entry);
-
+    /// Dispatch a raw [`mmdvm::Event`] into a [`DStarEvent`].
+    async fn dispatch_event(&mut self, raw: Event) -> Result<Option<DStarEvent>, Error> {
+        match raw {
+            Event::DStarHeaderRx { bytes } => {
+                let header = DStarHeader::decode(&bytes);
+                self.handle_voice_start(header);
                 Ok(Some(DStarEvent::VoiceStart(header)))
             }
-
-            MmdvmResponse::DStarData(data) => {
-                // Split into AMBE (9 bytes) and slow data (3 bytes).
+            Event::DStarDataRx { bytes } => {
                 let mut ambe = [0u8; 9];
-                ambe.copy_from_slice(&data[..9]);
-                let mut slow = [0u8; 3];
-                slow.copy_from_slice(&data[9..12]);
-
-                // Feed the slow data decoder. The MMDVM modem strips the
-                // per-superframe sync frames itself, so every DStarData
-                // delivery is a real data frame; pass a non-zero index so
-                // the decoder's `% 21 == 0` sync-skip path doesn't fire.
-                // Wrap the local counter in `1..=20` to stay inside the
-                // D-STAR data-frame range.
-                let idx = (self.slow_data_frame_index % 20) + 1;
-                self.slow_data.add_frame(&slow, idx);
-                self.slow_data_frame_index = self.slow_data_frame_index.wrapping_add(1);
-
-                let frame = DStarVoiceFrame {
-                    ambe,
-                    slow_data: slow,
-                };
-
-                // Record frames for echo playback.
-                if self.echo_active {
-                    self.echo_frames.push(frame.clone());
+                if let Some(src) = bytes.get(..9) {
+                    ambe.copy_from_slice(src);
                 }
-
+                let mut slow_data = [0u8; 3];
+                if let Some(src) = bytes.get(9..12) {
+                    slow_data.copy_from_slice(src);
+                }
+                let frame = VoiceFrame { ambe, slow_data };
+                self.handle_voice_data(frame);
                 Ok(Some(DStarEvent::VoiceData(frame)))
             }
-
-            MmdvmResponse::DStarEot => {
-                // Check for decoded slow data before clearing state.
-                let text_event = self.take_text_message();
-                let gps_event = self.take_gps_data();
-
-                // If echo mode was active, play back the recorded frames.
-                let was_echo = self.echo_active;
-                if was_echo {
-                    self.echo_active = false;
-                    self.play_echo().await?;
-                }
-
-                self.rx_active = false;
-                self.rx_header = None;
-
-                // Queue text/GPS for delivery on the next poll —
-                // VoiceEnd must always be emitted so callers can
-                // detect the end of the stream reliably.
-                if let Some(text) = text_event {
-                    self.pending_events.push_back(DStarEvent::TextMessage(text));
-                }
-                if let Some(gps) = gps_event {
-                    self.pending_events.push_back(DStarEvent::GpsData(gps));
-                }
-
-                Ok(Some(DStarEvent::VoiceEnd))
-            }
-
-            MmdvmResponse::DStarLost => {
+            Event::DStarEot => self.on_eot().await,
+            Event::DStarLost => {
                 self.rx_active = false;
                 self.rx_header = None;
                 Ok(Some(DStarEvent::VoiceLost))
             }
+            Event::TransportClosed => Err(Error::Transport(
+                crate::error::TransportError::Disconnected(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "MMDVM transport closed",
+                )),
+            )),
+            // Everything else is non-fatal noise — status updates,
+            // init-handshake artefacts, debug frames, unhandled
+            // commands, and `#[non_exhaustive]` variants the mmdvm
+            // crate may add in the future.
+            other => {
+                log_noise_event(&other);
+                Ok(None)
+            }
+        }
+    }
 
-            MmdvmResponse::Status(status) => Ok(Some(DStarEvent::StatusUpdate(status))),
+    /// Handle a received D-STAR EOT, emitting any queued text message
+    /// and driving echo playback if the record phase was active.
+    async fn on_eot(&mut self) -> Result<Option<DStarEvent>, Error> {
+        let text_event = self.take_text_message();
+        let was_echo = self.echo_active;
+        if was_echo {
+            self.echo_active = false;
+            self.play_echo().await?;
+        }
+        self.rx_active = false;
+        self.rx_header = None;
+        if let Some(text) = text_event {
+            self.pending_events.push_back(DStarEvent::TextMessage(text));
+        }
+        Ok(Some(DStarEvent::VoiceEnd))
+    }
 
-            // ACK/NAK/Version are not expected during normal operation;
-            // ignore them gracefully.
-            MmdvmResponse::Ack { .. }
-            | MmdvmResponse::Nak { .. }
-            | MmdvmResponse::Version { .. } => Ok(None),
+    /// Handle a received D-STAR header (internal).
+    fn handle_voice_start(&mut self, header: DStarHeader) {
+        self.rx_active = true;
+        self.slow_data.reset();
+        self.slow_data_frame_index = 0;
+        self.rx_header = Some(header);
+
+        // Parse URCALL for special commands.
+        let ur_str = std::str::from_utf8(header.ur_call.as_bytes()).unwrap_or("");
+        let action = UrCallAction::parse(ur_str);
+        match &action {
+            UrCallAction::Cq | UrCallAction::Callsign(_) => {}
+            UrCallAction::Echo => {
+                self.echo_active = true;
+                self.echo_header = Some(header);
+                self.echo_frames.clear();
+            }
+            _ => {
+                self.pending_events
+                    .push_back(DStarEvent::UrCallCommand(action));
+            }
+        }
+
+        // Update last-heard list.
+        let entry = LastHeardEntry {
+            callsign: cs_trim(header.my_call),
+            suffix: sfx_trim(header.my_suffix),
+            destination: cs_trim(header.ur_call),
+            repeater1: cs_trim(header.rpt1),
+            repeater2: cs_trim(header.rpt2),
+            timestamp: Instant::now(),
+        };
+        self.update_last_heard(entry);
+    }
+
+    /// Handle a received D-STAR voice frame (internal).
+    fn handle_voice_data(&mut self, frame: VoiceFrame) {
+        // Feed the slow data collector. Non-zero index so the
+        // sync-frame codepath in the collector doesn't fire.
+        let idx = (self.slow_data_frame_index % 20) + 1;
+        self.slow_data.push(frame.slow_data, idx);
+        self.slow_data_frame_index = self.slow_data_frame_index.wrapping_add(1);
+
+        if self.echo_active {
+            self.echo_frames.push(frame);
         }
     }
 
     /// Send a D-STAR voice header to the radio for transmission.
     ///
-    /// Use this to relay incoming reflector headers to the radio so they
-    /// are transmitted over the air. Resets the TX pacing state for the
-    /// new transmission.
+    /// Enqueues the header in the mmdvm TX queue, which is drained
+    /// when the modem reports enough D-STAR FIFO space.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] if the write fails.
+    /// Returns [`Error::Transport`] if the modem loop has exited.
     pub async fn send_header(&mut self, header: &DStarHeader) -> Result<(), Error> {
-        self.tx_frame_count = 0;
-        self.last_tx_frame = None;
-        self.session.send_dstar_header(header).await
+        let encoded = header.encode();
+        self.modem
+            .send_dstar_header(encoded)
+            .await
+            .map_err(shell_err_to_thd75_err)
     }
 
     /// Send a D-STAR voice data frame to the radio for transmission.
     ///
-    /// Use this to relay incoming reflector voice frames to the radio.
-    /// The AMBE and slow data bytes are combined into the 12-byte format
-    /// expected by the modem.
-    ///
-    /// Enforces 20 ms inter-frame pacing to match the D-STAR AMBE frame
-    /// rate. The first 5 frames are sent immediately (burst) to fill the
-    /// radio's MMDVM buffer; subsequent frames are paced at 20 ms
-    /// intervals.
+    /// Enqueues the frame in the mmdvm TX queue. Pacing is handled
+    /// inside the mmdvm modem loop — no host-side sleep is introduced
+    /// here.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] if the write fails.
-    pub async fn send_voice(&mut self, frame: &DStarVoiceFrame) -> Result<(), Error> {
-        // Pace frames after the initial prebuffer burst.
-        if self.tx_frame_count >= TX_PREBUFFER_FRAMES
-            && let Some(last) = self.last_tx_frame
-        {
-            let elapsed = last.elapsed();
-            if elapsed < VOICE_FRAME_INTERVAL {
-                tokio::time::sleep(VOICE_FRAME_INTERVAL.saturating_sub(elapsed)).await;
-            }
-        }
-
+    /// Returns [`Error::Transport`] if the modem loop has exited.
+    pub async fn send_voice(&mut self, frame: &VoiceFrame) -> Result<(), Error> {
         let mut data = [0u8; 12];
-        data[..9].copy_from_slice(&frame.ambe);
-        data[9..12].copy_from_slice(&frame.slow_data);
-        self.session.send_dstar_data(&data).await?;
-
-        self.tx_frame_count += 1;
-        self.last_tx_frame = Some(Instant::now());
-        Ok(())
+        if let Some(dst) = data.get_mut(..9) {
+            dst.copy_from_slice(&frame.ambe);
+        }
+        if let Some(dst) = data.get_mut(9..12) {
+            dst.copy_from_slice(&frame.slow_data);
+        }
+        self.modem
+            .send_dstar_data(data)
+            .await
+            .map_err(shell_err_to_thd75_err)
     }
 
-    /// Send a voice frame to the radio without TX pacing.
+    /// Send a voice frame to the radio without any host-side pacing.
     ///
-    /// Use this for reflector→radio relay where the radio's MMDVM
-    /// buffer handles pacing internally. The prebuffer burst and
-    /// 20 ms inter-frame timing are skipped.
+    /// In the current architecture (mmdvm owns pacing via its
+    /// buffer-gated `TxQueue` drain), this method and
+    /// [`Self::send_voice`] are functionally equivalent; both simply
+    /// enqueue the frame and let the modem loop drain when
+    /// `dstar_space` allows. The alias is retained for back-compat
+    /// with callers that historically preferred the unpaced variant.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] if the write fails.
-    pub async fn send_voice_unpaced(&mut self, frame: &DStarVoiceFrame) -> Result<(), Error> {
-        let mut data = [0u8; 12];
-        data[..9].copy_from_slice(&frame.ambe);
-        data[9..12].copy_from_slice(&frame.slow_data);
-        self.session.send_dstar_data(&data).await
+    /// Returns [`Error::Transport`] if the modem loop has exited.
+    pub async fn send_voice_unpaced(&mut self, frame: &VoiceFrame) -> Result<(), Error> {
+        self.send_voice(frame).await
     }
 
     /// Send end-of-transmission to the radio.
     ///
-    /// Signals the modem that the current D-STAR transmission from the
-    /// reflector side is complete. Resets the TX pacing state.
-    ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] if the write fails.
+    /// Returns [`Error::Transport`] if the modem loop has exited.
     pub async fn send_eot(&mut self) -> Result<(), Error> {
-        self.tx_frame_count = 0;
-        self.last_tx_frame = None;
-        self.session.send_dstar_eot().await
+        self.modem
+            .send_dstar_eot()
+            .await
+            .map_err(shell_err_to_thd75_err)
     }
 
     /// Send a status header to the radio indicating connection state.
@@ -721,25 +689,53 @@ impl<T: Transport> DStarGateway<T> {
         &mut self,
         reflector: Option<(&str, char)>,
     ) -> Result<(), Error> {
-        let (rpt1, rpt2) = if let Some((name, module)) = reflector {
-            let rpt = format!("{name:<7}{module}");
-            (rpt.clone(), rpt)
-        } else {
-            ("DIRECT  ".to_owned(), "DIRECT  ".to_owned())
-        };
+        use dstar_gateway_core::{Callsign, Suffix};
+
+        let rpt_bytes = reflector.map_or(*b"DIRECT  ", |(name, module)| {
+            let mut bytes = [b' '; 8];
+            let name_bytes = name.as_bytes();
+            let n = name_bytes.len().min(7);
+            if let Some(dst) = bytes.get_mut(..n)
+                && let Some(src) = name_bytes.get(..n)
+            {
+                dst.copy_from_slice(src);
+            }
+            if let Some(b) = bytes.get_mut(7) {
+                *b = u8::try_from(u32::from(module)).unwrap_or(b'?');
+            }
+            bytes
+        });
+
+        let mut my_bytes = [b' '; 8];
+        let cs = self.config.callsign.as_bytes();
+        let n = cs.len().min(8);
+        if let Some(dst) = my_bytes.get_mut(..n)
+            && let Some(src) = cs.get(..n)
+        {
+            dst.copy_from_slice(src);
+        }
+
+        let mut suffix_bytes = [b' '; 4];
+        let sfx = self.config.suffix.as_bytes();
+        let s = sfx.len().min(4);
+        if let Some(dst) = suffix_bytes.get_mut(..s)
+            && let Some(src) = sfx.get(..s)
+        {
+            dst.copy_from_slice(src);
+        }
 
         let header = DStarHeader {
             flag1: 0x00,
             flag2: 0x00,
             flag3: 0x00,
-            rpt2,
-            rpt1,
-            ur_call: "CQCQCQ  ".to_owned(),
-            my_call: format!("{:<8}", self.config.callsign),
-            my_suffix: format!("{:<4}", self.config.suffix),
+            rpt2: Callsign::from_wire_bytes(rpt_bytes),
+            rpt1: Callsign::from_wire_bytes(rpt_bytes),
+            ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
+            my_call: Callsign::from_wire_bytes(my_bytes),
+            my_suffix: Suffix::from_wire_bytes(suffix_bytes),
         };
 
-        self.session.send_dstar_header(&header).await
+        self.send_header(&header).await
     }
 
     /// Set the receive timeout for `next_event` polling.
@@ -748,18 +744,7 @@ impl<T: Transport> DStarGateway<T> {
     /// CPU usage. Use short timeouts (10-50ms) when actively relaying
     /// voice from a reflector.
     pub const fn set_event_timeout(&mut self, timeout: Duration) {
-        self.session.set_receive_timeout(timeout);
-    }
-
-    /// Encode a text message into slow data blocks.
-    ///
-    /// Returns the encoded 3-byte slow data payloads to interleave with
-    /// AMBE silence frames when transmitting a text message. Each pair of
-    /// returned arrays forms one 6-byte slow data block.
-    #[must_use]
-    pub fn encode_text_message(text: &str) -> Vec<[u8; 3]> {
-        let encoder = SlowDataEncoder::new();
-        encoder.encode_message(text)
+        self.event_timeout = timeout;
     }
 
     /// Get the last-heard list (newest first).
@@ -770,13 +755,42 @@ impl<T: Transport> DStarGateway<T> {
 
     /// Poll the modem status.
     ///
-    /// Sends a `GET_STATUS` command and returns the current modem status.
+    /// Requests an immediate `GetStatus` and returns the next status
+    /// event delivered by the modem loop. The mmdvm modem loop also
+    /// polls status periodically (every 250 ms), so callers rarely
+    /// need this.
     ///
     /// # Errors
     ///
-    /// Returns an error if the status request fails.
+    /// Returns an error if the status request fails or the modem loop
+    /// exits before delivering a status event.
     pub async fn poll_status(&mut self) -> Result<ModemStatus, Error> {
-        self.session.get_status().await
+        self.modem
+            .request_status()
+            .await
+            .map_err(shell_err_to_thd75_err)?;
+
+        // Drain until we see a Status event or the channel closes.
+        loop {
+            let evt =
+                match tokio::time::timeout(Duration::from_secs(2), self.modem.next_event()).await {
+                    Ok(Some(e)) => e,
+                    Ok(None) => {
+                        return Err(Error::Transport(
+                            crate::error::TransportError::Disconnected(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "MMDVM modem loop exited before delivering status",
+                            )),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(Error::Timeout(Duration::from_secs(2)));
+                    }
+                };
+            if let Event::Status(status) = evt {
+                return Ok(status);
+            }
+        }
     }
 
     /// Check if a voice transmission is currently active (RX from radio).
@@ -807,13 +821,8 @@ impl<T: Transport> DStarGateway<T> {
     /// If the list exceeds the configured maximum, the oldest entry is
     /// removed.
     fn update_last_heard(&mut self, entry: LastHeardEntry) {
-        // Remove existing entry for this callsign, if present.
         self.last_heard.retain(|e| e.callsign != entry.callsign);
-
-        // Insert at the front (newest first).
         self.last_heard.insert(0, entry);
-
-        // Enforce the maximum size.
         if self.last_heard.len() > self.config.max_last_heard {
             self.last_heard.truncate(self.config.max_last_heard);
         }
@@ -822,8 +831,10 @@ impl<T: Transport> DStarGateway<T> {
     /// Play back recorded echo frames to the radio.
     ///
     /// Builds a modified header (`RPT2` = callsign + G, `RPT1` = callsign
-    /// + reflector module) and transmits all recorded frames with 20 ms pacing.
+    /// + reflector module) and transmits all recorded frames.
     async fn play_echo(&mut self) -> Result<(), Error> {
+        use dstar_gateway_core::{Callsign, Suffix};
+
         let Some(orig_header) = self.echo_header.take() else {
             return Ok(());
         };
@@ -832,17 +843,44 @@ impl<T: Transport> DStarGateway<T> {
             return Ok(());
         }
 
-        // Build echo playback header: swap RPT fields to indicate
-        // the echo came from the gateway.
+        let mut rpt2_bytes = [b' '; 8];
+        let cs = self.config.callsign.as_bytes();
+        let n = cs.len().min(7);
+        if let Some(dst) = rpt2_bytes.get_mut(..n)
+            && let Some(src) = cs.get(..n)
+        {
+            dst.copy_from_slice(src);
+        }
+        if let Some(b) = rpt2_bytes.get_mut(7) {
+            *b = b'G';
+        }
+
+        let mut my_bytes = [b' '; 8];
+        let m = cs.len().min(8);
+        if let Some(dst) = my_bytes.get_mut(..m)
+            && let Some(src) = cs.get(..m)
+        {
+            dst.copy_from_slice(src);
+        }
+
+        let mut suffix_bytes = [b' '; 4];
+        let sfx = self.config.suffix.as_bytes();
+        let s = sfx.len().min(4);
+        if let Some(dst) = suffix_bytes.get_mut(..s)
+            && let Some(src) = sfx.get(..s)
+        {
+            dst.copy_from_slice(src);
+        }
+
         let echo_header = DStarHeader {
             flag1: orig_header.flag1,
             flag2: orig_header.flag2,
             flag3: orig_header.flag3,
-            rpt2: format!("{:<7}G", self.config.callsign),
-            rpt1: orig_header.rpt1.clone(),
-            ur_call: orig_header.my_call.clone(),
-            my_call: format!("{:<8}", self.config.callsign),
-            my_suffix: format!("{:<4}", self.config.suffix),
+            rpt2: Callsign::from_wire_bytes(rpt2_bytes),
+            rpt1: orig_header.rpt1,
+            ur_call: orig_header.my_call,
+            my_call: Callsign::from_wire_bytes(my_bytes),
+            my_suffix: Suffix::from_wire_bytes(suffix_bytes),
         };
 
         self.send_header(&echo_header).await?;
@@ -855,25 +893,223 @@ impl<T: Transport> DStarGateway<T> {
     }
 
     /// Take the decoded text message from the slow data decoder, if
-    /// complete. Consumes the message and rearms the decoder so the next
-    /// four blocks in the same stream can be reassembled independently.
+    /// complete.
     fn take_text_message(&mut self) -> Option<String> {
         let bytes = self.slow_data.take_message()?;
-        // Decoder already masks each character with `& 0x7F`, so the
-        // bytes are guaranteed ASCII and `from_utf8` is infallible here,
-        // but prefer the lossy path to stay robust if that contract ever
-        // changes.
         Some(String::from_utf8_lossy(&bytes).into_owned())
     }
+}
 
-    /// Take the decoded GPS data from the slow data decoder, if present.
-    fn take_gps_data(&self) -> Option<Vec<u8>> {
-        if self.slow_data.has_gps_data() {
-            self.slow_data.gps_data().map(<[u8]>::to_vec)
-        } else {
-            None
+/// Initialise the MMDVM modem for D-STAR: send `SetConfig` with
+/// D-STAR-only flags, then `SetMode(DStar)`.
+///
+/// Consumes events until the corresponding ACK arrives for each
+/// command. `Version` and `Status` events delivered by the modem's
+/// startup handshake are accepted silently.
+async fn init_dstar<T: Transport + Unpin + 'static>(
+    modem: &mut AsyncModem<MmdvmTransportAdapter<T>>,
+) -> Result<(), Error> {
+    // Send SetConfig: D-STAR-only, default levels.
+    let config_payload = vec![
+        0x00, // invert
+        0x01, // mode flags: D-STAR only
+        DEFAULT_TX_DELAY,
+        ModemMode::DStar.as_byte(),
+        DEFAULT_RX_LEVEL,
+        DEFAULT_TX_LEVEL,
+    ];
+    modem
+        .send_raw(MMDVM_SET_CONFIG, config_payload)
+        .await
+        .map_err(shell_err_to_thd75_err)?;
+    await_ack(modem, MMDVM_SET_CONFIG).await?;
+
+    // Send SetMode.
+    modem
+        .set_mode(ModemMode::DStar)
+        .await
+        .map_err(shell_err_to_thd75_err)?;
+    await_ack(modem, mmdvm_core::MMDVM_SET_MODE).await?;
+
+    Ok(())
+}
+
+/// Wait for an ACK for the given command byte, dropping Version /
+/// Status events that arrive in the meantime.
+async fn await_ack<T: Transport + Unpin + 'static>(
+    modem: &mut AsyncModem<MmdvmTransportAdapter<T>>,
+    expected_command: u8,
+) -> Result<(), Error> {
+    let deadline = tokio::time::Instant::now() + INIT_ACK_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Timeout(INIT_ACK_TIMEOUT));
+        }
+        let Ok(maybe_evt) = tokio::time::timeout(remaining, modem.next_event()).await else {
+            return Err(Error::Timeout(INIT_ACK_TIMEOUT));
+        };
+        let Some(evt) = maybe_evt else {
+            return Err(Error::Transport(
+                crate::error::TransportError::Disconnected(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "MMDVM modem loop exited during init",
+                )),
+            ));
+        };
+        match evt {
+            Event::Ack { command } if command == expected_command => return Ok(()),
+            Event::Nak { command, reason } if command == expected_command => {
+                return Err(Error::Protocol(
+                    crate::error::ProtocolError::UnexpectedResponse {
+                        expected: format!("MMDVM ACK for 0x{expected_command:02X}"),
+                        actual: format!("NAK: {reason:?}").into_bytes(),
+                    },
+                ));
+            }
+            Event::Version(_) | Event::Status(_) | Event::Ack { .. } | Event::Nak { .. } => {
+                // Drop stray handshake events.
+            }
+            Event::Debug { level, text } => {
+                tracing::trace!(level, ?text, "MMDVM debug during init");
+            }
+            Event::TransportClosed => {
+                return Err(Error::Transport(
+                    crate::error::TransportError::Disconnected(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "MMDVM transport closed during init",
+                    )),
+                ));
+            }
+            // Any protocol frames during init are unexpected but non-fatal.
+            Event::DStarHeaderRx { .. }
+            | Event::DStarDataRx { .. }
+            | Event::DStarLost
+            | Event::DStarEot
+            | Event::SerialData(_)
+            | Event::TransparentData(_)
+            | Event::UnhandledResponse { .. } => {
+                tracing::debug!("unexpected MMDVM event during init; ignoring");
+            }
+            // `mmdvm::Event` is marked `#[non_exhaustive]` — new
+            // variants are added without a major version bump. Treat
+            // unknown events as "keep waiting for the ACK".
+            _ => {
+                tracing::debug!("unrecognised MMDVM event during init; ignoring");
+            }
         }
     }
+}
+
+/// Translate an [`mmdvm::ShellError`] into a thd75 [`Error`].
+fn shell_err_to_thd75_err(err: mmdvm::ShellError) -> Error {
+    match err {
+        mmdvm::ShellError::SessionClosed => {
+            Error::Transport(crate::error::TransportError::Disconnected(
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "MMDVM session closed"),
+            ))
+        }
+        mmdvm::ShellError::Core(e) => Error::Protocol(crate::error::ProtocolError::FieldParse {
+            command: "MMDVM".to_owned(),
+            field: "frame".to_owned(),
+            detail: format!("{e}"),
+        }),
+        mmdvm::ShellError::Io(e) => Error::Transport(crate::error::TransportError::Disconnected(e)),
+        mmdvm::ShellError::BufferFull { mode } => {
+            Error::Protocol(crate::error::ProtocolError::UnexpectedResponse {
+                expected: format!("MMDVM {mode:?} buffer ready"),
+                actual: b"buffer full".to_vec(),
+            })
+        }
+        mmdvm::ShellError::Nak { command, reason } => {
+            Error::Protocol(crate::error::ProtocolError::UnexpectedResponse {
+                expected: format!("MMDVM ACK for 0x{command:02X}"),
+                actual: format!("NAK: {reason:?}").into_bytes(),
+            })
+        }
+        // `mmdvm::ShellError` is `#[non_exhaustive]`. Surface unknown
+        // variants as a generic transport disconnection.
+        _ => Error::Transport(crate::error::TransportError::Disconnected(
+            std::io::Error::other("unknown MMDVM shell error"),
+        )),
+    }
+}
+
+/// Log a non-fatal MMDVM event (status update, init handshake
+/// artefact, debug frame, etc.) at the appropriate tracing level so
+/// consumers that dump trace output can see what's happening.
+fn log_noise_event(event: &Event) {
+    match event {
+        Event::Status(_status) => {
+            // Buffer-slot gating happens inside mmdvm's TxQueue; no
+            // consumer-side action needed. Log at trace only.
+            tracing::trace!(
+                target: "kenwood_thd75::mmdvm::gateway",
+                "MMDVM status (consumed silently)"
+            );
+        }
+        Event::Ack { command } => tracing::debug!(
+            target: "kenwood_thd75::mmdvm::gateway",
+            command = format!("0x{command:02X}"),
+            "MMDVM ACK (ignored)"
+        ),
+        Event::Nak { command, reason } => tracing::debug!(
+            target: "kenwood_thd75::mmdvm::gateway",
+            command = format!("0x{command:02X}"),
+            ?reason,
+            "MMDVM NAK (ignored)"
+        ),
+        Event::Version(v) => tracing::debug!(
+            target: "kenwood_thd75::mmdvm::gateway",
+            protocol = v.protocol,
+            description = %v.description,
+            "MMDVM Version (ignored)"
+        ),
+        Event::Debug { level, text } => tracing::trace!(
+            target: "kenwood_thd75::mmdvm::gateway",
+            level = *level,
+            text = %text,
+            "MMDVM debug"
+        ),
+        Event::SerialData(data) => tracing::trace!(
+            target: "kenwood_thd75::mmdvm::gateway",
+            len = data.len(),
+            "MMDVM serial data (ignored)"
+        ),
+        Event::TransparentData(data) => tracing::trace!(
+            target: "kenwood_thd75::mmdvm::gateway",
+            len = data.len(),
+            "MMDVM transparent data (ignored)"
+        ),
+        Event::UnhandledResponse { command, payload } => tracing::debug!(
+            target: "kenwood_thd75::mmdvm::gateway",
+            command = format!("0x{command:02X}"),
+            payload_len = payload.len(),
+            "MMDVM unhandled response"
+        ),
+        // Handled variants should never reach this helper; unknown
+        // future variants fall through silently.
+        _ => tracing::trace!(
+            target: "kenwood_thd75::mmdvm::gateway",
+            "MMDVM unrecognised event"
+        ),
+    }
+}
+
+/// Trim trailing spaces from a `Callsign` and return an owned `String`.
+fn cs_trim(cs: dstar_gateway_core::Callsign) -> String {
+    std::str::from_utf8(cs.as_bytes())
+        .unwrap_or("")
+        .trim_end()
+        .to_owned()
+}
+
+/// Trim trailing spaces from a `Suffix` and return an owned `String`.
+fn sfx_trim(sfx: dstar_gateway_core::Suffix) -> String {
+    std::str::from_utf8(sfx.as_bytes())
+        .unwrap_or("")
+        .trim_end()
+        .to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -883,97 +1119,7 @@ impl<T: Transport> DStarGateway<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mmdvm::frame::{
-        CMD_ACK, CMD_DSTAR_DATA, CMD_DSTAR_EOT, CMD_DSTAR_HEADER, CMD_DSTAR_LOST, CMD_GET_STATUS,
-        CMD_GET_VERSION, CMD_SET_CONFIG, CMD_SET_MODE, START_BYTE,
-    };
-    use crate::mmdvm::slow_data::SlowDataEncoder;
-    use crate::transport::MockTransport;
     use crate::types::TncBaud;
-
-    /// Build a mock Radio that expects the TN 3,x command for MMDVM entry.
-    async fn mock_radio(baud: TncBaud) -> Radio<MockTransport> {
-        let tn_cmd = format!("TN 3,{}\r", u8::from(baud));
-        let tn_resp = format!("TN 3,{}\r", u8::from(baud));
-        let mut mock = MockTransport::new();
-        mock.expect(tn_cmd.as_bytes(), tn_resp.as_bytes());
-        Radio::connect(mock).await.unwrap()
-    }
-
-    /// Queue the full `init_dstar` handshake responses on the mock session.
-    ///
-    /// The init sequence is: `GetVersion` -> Version, `SetConfig` -> ACK,
-    /// `SetMode` -> ACK, `GetStatus` -> Status.
-    fn queue_init_responses(session: &mut MmdvmSession<MockTransport>) {
-        // Step 1: GetVersion request -> Version response
-        let mut version_resp = vec![START_BYTE, 9, CMD_GET_VERSION, 1];
-        version_resp.extend_from_slice(b"MMDVM");
-        session
-            .transport
-            .expect(&[START_BYTE, 3, CMD_GET_VERSION], &version_resp);
-
-        // Step 2: SetConfig request -> ACK response
-        let config_wire = vec![START_BYTE, 9, CMD_SET_CONFIG, 0, 1, 10, 1, 128, 128];
-        let ack_config = vec![START_BYTE, 4, CMD_ACK, CMD_SET_CONFIG];
-        session.transport.expect(&config_wire, &ack_config);
-
-        // Step 3: SetMode request -> ACK response
-        let mode_wire = vec![START_BYTE, 4, CMD_SET_MODE, 1];
-        let ack_mode = vec![START_BYTE, 4, CMD_ACK, CMD_SET_MODE];
-        session.transport.expect(&mode_wire, &ack_mode);
-
-        // Step 4: GetStatus request -> Status response
-        let status_resp = vec![START_BYTE, 7, CMD_GET_STATUS, 0x01, 0x01, 0x00, 10];
-        session
-            .transport
-            .expect(&[START_BYTE, 3, CMD_GET_STATUS], &status_resp);
-    }
-
-    /// Create a gateway with all init handshake mocked.
-    async fn mock_gateway() -> DStarGateway<MockTransport> {
-        let radio = mock_radio(TncBaud::Bps9600).await;
-
-        // We need to manually enter MMDVM and queue init, since start()
-        // does both. Build it by entering MMDVM first, then queuing
-        // init responses, then calling init_dstar.
-        let mut session = radio.enter_mmdvm(TncBaud::Bps9600).await.unwrap();
-        session.set_receive_timeout(EVENT_POLL_TIMEOUT);
-        queue_init_responses(&mut session);
-        let _status = session.init_dstar().await.unwrap();
-
-        let config = DStarGatewayConfig::new("N0CALL");
-        DStarGateway {
-            session,
-            config,
-            slow_data: SlowDataDecoder::new(),
-            slow_data_frame_index: 0,
-            last_heard: Vec::new(),
-            rx_active: false,
-            rx_header: None,
-            tx_frame_count: 0,
-            last_tx_frame: None,
-            pending_events: VecDeque::new(),
-            echo_header: None,
-            echo_frames: Vec::new(),
-            echo_active: false,
-        }
-    }
-
-    /// Build a sample D-STAR header and return (header, encoded 41 bytes).
-    fn sample_header() -> (DStarHeader, [u8; 41]) {
-        let header = DStarHeader {
-            flag1: 0x00,
-            flag2: 0x00,
-            flag3: 0x00,
-            rpt2: "DIRECT  ".to_owned(),
-            rpt1: "DIRECT  ".to_owned(),
-            ur_call: "CQCQCQ  ".to_owned(),
-            my_call: "W1AW    ".to_owned(),
-            my_suffix: "    ".to_owned(),
-        };
-        let encoded = header.encode();
-        (header, encoded)
-    }
 
     fn test_config() -> DStarGatewayConfig {
         DStarGatewayConfig::new("N0CALL")
@@ -996,7 +1142,7 @@ mod tests {
     fn config_debug_formatting() {
         let config = test_config();
         let debug = format!("{config:?}");
-        assert!(debug.contains("N0CALL"));
+        assert!(debug.contains("N0CALL"), "debug should mention callsign");
     }
 
     // -------------------------------------------------------------------
@@ -1005,7 +1151,7 @@ mod tests {
 
     #[test]
     fn voice_frame_construction() {
-        let frame = DStarVoiceFrame {
+        let frame = VoiceFrame {
             ambe: [1, 2, 3, 4, 5, 6, 7, 8, 9],
             slow_data: [0xA, 0xB, 0xC],
         };
@@ -1015,11 +1161,11 @@ mod tests {
 
     #[test]
     fn voice_frame_equality() {
-        let a = DStarVoiceFrame {
+        let a = VoiceFrame {
             ambe: [0; 9],
             slow_data: [0; 3],
         };
-        let b = a.clone();
+        let b = a;
         assert_eq!(a, b);
     }
 
@@ -1038,7 +1184,7 @@ mod tests {
             timestamp: Instant::now(),
         };
         let debug = format!("{entry:?}");
-        assert!(debug.contains("W1AW"));
+        assert!(debug.contains("W1AW"), "debug should mention callsign");
     }
 
     // -------------------------------------------------------------------
@@ -1049,326 +1195,60 @@ mod tests {
     fn event_debug_formatting() {
         let event = DStarEvent::VoiceEnd;
         let debug = format!("{event:?}");
-        assert!(debug.contains("VoiceEnd"));
+        assert!(debug.contains("VoiceEnd"), "debug should mention variant");
     }
 
     #[test]
     fn event_text_message_debug() {
         let event = DStarEvent::TextMessage("Hello D-STAR".to_owned());
         let debug = format!("{event:?}");
-        assert!(debug.contains("Hello D-STAR"));
+        assert!(debug.contains("Hello D-STAR"), "debug should mention text");
     }
 
     // -------------------------------------------------------------------
-    // Gateway tests
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn gateway_debug_formatting() {
-        let gw = mock_gateway().await;
-        let debug = format!("{gw:?}");
-        assert!(debug.contains("DStarGateway"));
-        assert!(debug.contains("N0CALL"));
-    }
-
-    #[tokio::test]
-    async fn gateway_initial_state() {
-        let gw = mock_gateway().await;
-        assert!(!gw.is_receiving());
-        assert!(gw.current_header().is_none());
-        assert!(gw.last_heard().is_empty());
-        assert_eq!(gw.config().callsign, "N0CALL");
-    }
-
-    #[tokio::test]
-    async fn gateway_receives_voice_start() {
-        let mut gw = mock_gateway().await;
-
-        // Queue a D-STAR header response.
-        let (_header, encoded) = sample_header();
-        let mut header_frame = vec![START_BYTE, 44, CMD_DSTAR_HEADER];
-        header_frame.extend_from_slice(&encoded);
-        // The receive call reads from the mock --- queue data without
-        // a matching write (just provide response data).
-        gw.session.transport.queue_read(&header_frame);
-
-        let event = gw.next_event().await.unwrap().unwrap();
-        match event {
-            DStarEvent::VoiceStart(h) => {
-                assert_eq!(h.my_call.trim(), "W1AW");
-                assert_eq!(h.ur_call.trim(), "CQCQCQ");
-            }
-            other => panic!("expected VoiceStart, got {other:?}"),
-        }
-
-        assert!(gw.is_receiving());
-        assert!(gw.current_header().is_some());
-        assert_eq!(gw.last_heard().len(), 1);
-        assert_eq!(gw.last_heard()[0].callsign, "W1AW");
-    }
-
-    #[tokio::test]
-    async fn gateway_receives_voice_data() {
-        let mut gw = mock_gateway().await;
-
-        // Queue a D-STAR data response (12 bytes: 9 AMBE + 3 slow data).
-        let mut data = [0u8; 12];
-        data[..9].fill(0xAA); // AMBE
-        data[9..12].fill(0xBB); // slow data
-        let mut data_frame = vec![START_BYTE, 15, CMD_DSTAR_DATA];
-        data_frame.extend_from_slice(&data);
-        gw.session.transport.queue_read(&data_frame);
-
-        let event = gw.next_event().await.unwrap().unwrap();
-        match event {
-            DStarEvent::VoiceData(frame) => {
-                assert_eq!(frame.ambe, [0xAA; 9]);
-                assert_eq!(frame.slow_data, [0xBB; 3]);
-            }
-            other => panic!("expected VoiceData, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn gateway_receives_voice_end() {
-        let mut gw = mock_gateway().await;
-
-        // Queue EOT.
-        let eot_frame = vec![START_BYTE, 3, CMD_DSTAR_EOT];
-        gw.session.transport.queue_read(&eot_frame);
-
-        let event = gw.next_event().await.unwrap().unwrap();
-        assert!(matches!(event, DStarEvent::VoiceEnd));
-        assert!(!gw.is_receiving());
-    }
-
-    #[tokio::test]
-    async fn gateway_receives_voice_lost() {
-        let mut gw = mock_gateway().await;
-
-        // Queue DStarLost.
-        let lost_frame = vec![START_BYTE, 3, CMD_DSTAR_LOST];
-        gw.session.transport.queue_read(&lost_frame);
-
-        let event = gw.next_event().await.unwrap().unwrap();
-        assert!(matches!(event, DStarEvent::VoiceLost));
-        assert!(!gw.is_receiving());
-    }
-
-    #[tokio::test]
-    async fn gateway_receives_status_update() {
-        let mut gw = mock_gateway().await;
-
-        // Queue a status response.
-        let status_frame = vec![START_BYTE, 7, CMD_GET_STATUS, 0x01, 0x01, 0x00, 10];
-        gw.session.transport.queue_read(&status_frame);
-
-        let event = gw.next_event().await.unwrap().unwrap();
-        match event {
-            DStarEvent::StatusUpdate(status) => {
-                assert_eq!(status.enabled_modes, 0x01);
-                assert_eq!(status.dstar_buffer, 10);
-            }
-            other => panic!("expected StatusUpdate, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn gateway_send_header() {
-        let mut gw = mock_gateway().await;
-
-        let (header, encoded) = sample_header();
-        // Expect the header write.
-        let mut expected = vec![START_BYTE, 44, CMD_DSTAR_HEADER];
-        expected.extend_from_slice(&encoded);
-        gw.session.transport.expect(&expected, &[]);
-
-        gw.send_header(&header).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn gateway_send_voice() {
-        let mut gw = mock_gateway().await;
-
-        let frame = DStarVoiceFrame {
-            ambe: [1, 2, 3, 4, 5, 6, 7, 8, 9],
-            slow_data: [10, 11, 12],
-        };
-
-        // Expect the 12-byte data write.
-        let mut expected = vec![START_BYTE, 15, CMD_DSTAR_DATA];
-        expected.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-        gw.session.transport.expect(&expected, &[]);
-
-        gw.send_voice(&frame).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn gateway_send_eot() {
-        let mut gw = mock_gateway().await;
-
-        let expected = vec![START_BYTE, 3, CMD_DSTAR_EOT];
-        gw.session.transport.expect(&expected, &[]);
-
-        gw.send_eot().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn gateway_stop_exits_mmdvm() {
-        let mut gw = mock_gateway().await;
-
-        // Exit sends TN 0,0 to return to normal mode.
-        gw.session.transport.expect(b"TN 0,0\r", &[]);
-
-        let _radio = gw.stop().await.unwrap();
-    }
-
-    // -------------------------------------------------------------------
-    // Last heard management tests
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn last_heard_deduplicates_by_callsign() {
-        let mut gw = mock_gateway().await;
-
-        // Hear the same station twice.
-        for _ in 0..2 {
-            let (_, encoded) = sample_header();
-            let mut header_frame = vec![START_BYTE, 44, CMD_DSTAR_HEADER];
-            header_frame.extend_from_slice(&encoded);
-            gw.session.transport.queue_read(&header_frame);
-            let _ = gw.next_event().await.unwrap();
-        }
-
-        // Should only have one entry.
-        assert_eq!(gw.last_heard().len(), 1);
-        assert_eq!(gw.last_heard()[0].callsign, "W1AW");
-    }
-
-    #[tokio::test]
-    async fn last_heard_enforces_max_size() {
-        let mut gw = mock_gateway().await;
-        // Set a small max.
-        gw.config.max_last_heard = 2;
-
-        // Hear 3 different stations by using different headers.
-        for call in ["AA1AA   ", "BB2BB   ", "CC3CC   "] {
-            let header = DStarHeader {
-                flag1: 0,
-                flag2: 0,
-                flag3: 0,
-                rpt2: "DIRECT  ".to_owned(),
-                rpt1: "DIRECT  ".to_owned(),
-                ur_call: "CQCQCQ  ".to_owned(),
-                my_call: call.to_owned(),
-                my_suffix: "    ".to_owned(),
-            };
-            let encoded = header.encode();
-            let mut frame = vec![START_BYTE, 44, CMD_DSTAR_HEADER];
-            frame.extend_from_slice(&encoded);
-            gw.session.transport.queue_read(&frame);
-            let _ = gw.next_event().await.unwrap();
-        }
-
-        assert_eq!(gw.last_heard().len(), 2);
-        // Newest first.
-        assert_eq!(gw.last_heard()[0].callsign, "CC3CC");
-        assert_eq!(gw.last_heard()[1].callsign, "BB2BB");
-    }
-
-    // -------------------------------------------------------------------
-    // Slow data / text message tests
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn gateway_decodes_text_message_at_eot() {
-        let mut gw = mock_gateway().await;
-
-        // First, receive a header.
-        let (_, hdr_bytes) = sample_header();
-        let mut header_frame = vec![START_BYTE, 44, CMD_DSTAR_HEADER];
-        header_frame.extend_from_slice(&hdr_bytes);
-        gw.session.transport.queue_read(&header_frame);
-        let _ = gw.next_event().await.unwrap();
-
-        // Encode a text message as slow data. A complete message is always
-        // 4 blocks × 2 halves = 8 payloads (space-padded).
-        let slow_enc = SlowDataEncoder::new();
-        let payloads = slow_enc.encode_message("Hi!");
-        assert_eq!(payloads.len(), 8);
-
-        // Feed voice frames with the slow data.
-        for payload in &payloads {
-            let mut data = [0u8; 12];
-            data[..9].fill(0x00); // silence AMBE
-            data[9..12].copy_from_slice(payload);
-            let mut frame = vec![START_BYTE, 15, CMD_DSTAR_DATA];
-            frame.extend_from_slice(&data);
-            gw.session.transport.queue_read(&frame);
-            let _ = gw.next_event().await.unwrap();
-        }
-
-        // Now send EOT --- should emit VoiceEnd first, then
-        // TextMessage on the next poll (queued in pending_events).
-        let eot_frame = vec![START_BYTE, 3, CMD_DSTAR_EOT];
-        gw.session.transport.queue_read(&eot_frame);
-
-        let event = gw.next_event().await.unwrap().unwrap();
-        assert!(
-            matches!(event, DStarEvent::VoiceEnd),
-            "expected VoiceEnd, got {event:?}"
-        );
-
-        // TextMessage is delivered on the next poll. The raw 20-byte
-        // buffer is space-padded; the REPL trims before display.
-        let event = gw.next_event().await.unwrap().unwrap();
-        match event {
-            DStarEvent::TextMessage(text) => {
-                assert_eq!(text.trim_end(), "Hi!");
-                assert_eq!(text.len(), 20);
-            }
-            other => panic!("expected TextMessage, got {other:?}"),
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // Encode text message tests
+    // Reconnect policy tests
     // -------------------------------------------------------------------
 
     #[test]
-    fn encode_text_message_produces_blocks() {
-        let payloads = DStarGateway::<MockTransport>::encode_text_message("Hello");
-        // Slow data text messages are always the full 4 blocks × 2 halves
-        // = 8 payloads per the D-STAR spec; short text is space-padded.
-        assert_eq!(payloads.len(), 8);
+    fn reconnect_policy_exponential_backoff() {
+        let mut policy = ReconnectPolicy::default();
+        let d1 = policy.next_delay();
+        let d2 = policy.next_delay();
+        assert_eq!(d1, DEFAULT_RECONNECT_INITIAL);
+        assert_eq!(d2, DEFAULT_RECONNECT_INITIAL * 2);
     }
 
     #[test]
-    fn encode_text_message_empty() {
-        let payloads = DStarGateway::<MockTransport>::encode_text_message("");
-        assert!(payloads.is_empty());
+    fn reconnect_policy_caps_at_max() {
+        let mut policy = ReconnectPolicy::new(Duration::from_secs(1), Duration::from_secs(4));
+        for _ in 0..10 {
+            let d = policy.next_delay();
+            assert!(d <= Duration::from_secs(4), "delay capped at max");
+        }
     }
 
     #[test]
-    fn encode_text_message_multi_block() {
-        let payloads = DStarGateway::<MockTransport>::encode_text_message("Hello World");
-        // Any non-empty text encodes to 4 blocks × 2 halves = 8 payloads.
-        assert_eq!(payloads.len(), 8);
+    fn reconnect_policy_reset() {
+        let mut policy = ReconnectPolicy::default();
+        let _ = policy.next_delay();
+        let _ = policy.next_delay();
+        assert!(policy.attempts() > 0);
+        policy.reset();
+        assert_eq!(policy.attempts(), 0);
     }
 
-    // -------------------------------------------------------------------
-    // ACK/NAK passthrough test
-    // -------------------------------------------------------------------
+    // Shell-err translation is unit-testable without a live modem.
+    #[test]
+    fn shell_err_session_closed_maps_to_transport_disconnected() {
+        let err = shell_err_to_thd75_err(mmdvm::ShellError::SessionClosed);
+        assert!(matches!(err, Error::Transport(_)));
+    }
 
-    #[tokio::test]
-    async fn gateway_ignores_ack_nak() {
-        let mut gw = mock_gateway().await;
-
-        // Queue an ACK frame.
-        let ack_frame = vec![START_BYTE, 4, CMD_ACK, 0x02];
-        gw.session.transport.queue_read(&ack_frame);
-
-        let event = gw.next_event().await.unwrap();
-        assert!(event.is_none());
+    #[test]
+    fn shell_err_io_maps_to_transport_disconnected() {
+        let err = shell_err_to_thd75_err(mmdvm::ShellError::Io(std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe,
+        )));
+        assert!(matches!(err, Error::Transport(_)));
     }
 }

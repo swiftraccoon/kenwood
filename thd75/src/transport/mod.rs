@@ -37,12 +37,14 @@
 #[cfg(any(target_os = "macos", doc))]
 pub mod bluetooth;
 pub mod either;
+pub mod mmdvm_adapter;
 pub mod mock;
 pub mod serial;
 
 #[cfg(any(target_os = "macos", doc))]
 pub use bluetooth::BluetoothTransport;
 pub use either::EitherTransport;
+pub use mmdvm_adapter::MmdvmTransportAdapter;
 pub use mock::MockTransport;
 pub use serial::SerialTransport;
 

@@ -7,6 +7,8 @@ members = [
     "dstar-gateway-core",
     "dstar-gateway-server",
     "mbelib-rs",
+    "mmdvm",
+    "mmdvm-core",
     "stargazer",
 ]
 resolver = "3"

@@ -1,4 +1,4 @@
-//! Integration tests for APRS, D-STAR, and GPS radio methods (Task 27).
+//! Integration tests for APRS, D-STAR, and GPS radio methods.
 
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;

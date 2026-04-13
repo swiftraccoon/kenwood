@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2010 szechyjs (mbelib)
+// SPDX-FileCopyrightText: 2026 Swift Raccoon
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Lookup tables for the AMBE 3600x2450 codec.
 //!
 //! All tables are transcribed verbatim from the mbelib C source

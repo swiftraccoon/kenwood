@@ -71,6 +71,21 @@ impl<P: Protocol> SessionLoop<P> {
         loop {
             // 1. Drain the outbox to the socket.
             while let Some(tx) = self.session.poll_transmit(Instant::now()) {
+                // TRACE every outbound datagram so a future
+                // `KeepaliveInactivity` post-mortem can confirm that
+                // we kept transmitting POLLs through the silent window
+                // (rules out our side as the cause). The first byte
+                // is the protocol-specific opcode (`0x03` = DPlus
+                // POLL, `0x10`/`0x11` = voice frames, etc.) — enough
+                // to spot keepalive vs voice without being verbose.
+                let first_byte = tx.payload.first().copied().unwrap_or(0);
+                tracing::trace!(
+                    target: "dstar_gateway::tokio_shell",
+                    dst = %tx.dst,
+                    bytes = tx.payload.len(),
+                    first = format_args!("{first_byte:#04x}"),
+                    "UDP send_to"
+                );
                 if let Err(e) = self.socket.send_to(tx.payload, tx.dst).await {
                     tracing::warn!(
                         target: "dstar_gateway::tokio_shell",

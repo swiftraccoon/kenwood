@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2010 szechyjs (mbelib)
+// SPDX-FileCopyrightText: 2026 Swift Raccoon
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! AMBE harmonic speech model parameters.
 //!
 //! The AMBE 3600×2450 codec models speech as a sum of harmonically
@@ -12,9 +16,11 @@
 //! are needed: current, previous (prediction reference), and
 //! previous-enhanced (synthesis cross-fade source).
 //!
-//! All arrays in `MbeParams` are 1-indexed to match the AMBE
-//! specification notation (band 1 through band L). Index 0 is unused
-//! padding to avoid off-by-one errors when porting from the C source.
+//! Field layout, naming, and the 1-based-indexing convention all mirror
+//! the `mbe_parms` struct from mbelib's `mbelib.h`
+//! (<https://github.com/szechyjs/mbelib>), ISC license. Index 0 is
+//! unused padding to allow direct indexing by harmonic band number
+//! (band 1 through band L) matching the AMBE specification notation.
 
 /// Maximum number of harmonic bands the codec supports.
 ///
@@ -121,6 +127,63 @@ pub(crate) struct MbeParams {
     /// garbage. After 3 consecutive repeats, the decoder outputs
     /// silence to avoid sustained artifacts from corrupted state.
     pub(crate) repeat: u32,
+
+    // === JMBE adaptive smoothing state (algorithms #111-116) ===
+    /// IIR-smoothed local energy estimate (Algorithm #111).
+    ///
+    /// Tracks the per-frame total spectral energy with α=0.95/β=0.05
+    /// smoothing. Used as the input to the adaptive voicing threshold
+    /// `VM` in Algorithm #112. Initialized to 75000.0 to match JMBE.
+    pub(crate) local_energy: f32,
+
+    /// Adaptive amplitude threshold `Tm` (Algorithm #115).
+    ///
+    /// The maximum total amplitude (`Σ Ml`) allowed for the current
+    /// frame. When exceeded, all magnitudes are scaled down (Algorithm
+    /// #116). Default 20480 matches JMBE.
+    pub(crate) amplitude_threshold: i32,
+
+    /// Channel error rate from the FEC decoder, in [0, 1].
+    ///
+    /// Used to gate adaptive smoothing entry (>1.25%) and frame muting
+    /// (>9.6% for AMBE, >8.75% for IMBE). Updated by the AMBE decoder's
+    /// Golay/Hamming syndrome counts.
+    pub(crate) error_rate: f32,
+
+    /// Total bit errors detected by FEC across all four codewords.
+    pub(crate) error_count_total: i32,
+
+    /// Bit errors in the C4 codeword (used by Algorithm #112).
+    pub(crate) error_count_4: i32,
+
+    /// Count of consecutive frames where the decoder repeated previous
+    /// parameters due to excessive errors.
+    ///
+    /// When this reaches `MBE_MAX_FRAME_REPEATS` (3), the decoder
+    /// outputs comfort noise instead of synthesized speech.
+    pub(crate) repeat_count: i32,
+
+    /// Codec-specific muting threshold for `error_rate`.
+    ///
+    /// AMBE 3600x2450 uses 0.096 (9.6%); IMBE uses 0.0875 (8.75%). For
+    /// D-STAR (this crate's target) the AMBE value applies.
+    pub(crate) muting_threshold: f32,
+
+    // === JMBE FFT-based unvoiced synthesis state (algorithms #117-126) ===
+    /// Previous frame's 256-sample IFFT output, retained for WOLA combine.
+    pub(crate) previous_uw: [f32; 256],
+
+    /// LCG state for JMBE-compatible noise generation.
+    ///
+    /// `x' = (171 · x + 11213) mod 53125`. The negative sentinel
+    /// `-1.0` indicates cold start: the next noise frame returns all
+    /// zeros and primes the LCG with `MBE_LCG_DEFAULT_SEED` (3147.0).
+    pub(crate) noise_seed: f32,
+
+    /// First 96 samples of the previous noise buffer, prepended to the
+    /// current frame's noise to maintain continuity across frame
+    /// boundaries (avoids audible discontinuities).
+    pub(crate) noise_overlap: [f32; 96],
 }
 
 impl MbeParams {
@@ -141,6 +204,18 @@ impl MbeParams {
             psi_l: [0.0; MAX_BANDS],
             gamma: 0.0,
             repeat: 0,
+            // JMBE adaptive smoothing defaults (mbe_initMbeParms).
+            local_energy: 75000.0,
+            amplitude_threshold: 20480,
+            error_rate: 0.0,
+            error_count_total: 0,
+            error_count_4: 0,
+            repeat_count: 0,
+            muting_threshold: 0.096, // AMBE 3600x2450 threshold (D-STAR)
+            // JMBE FFT-unvoiced state.
+            previous_uw: [0.0; 256],
+            noise_seed: -1.0, // cold-start sentinel
+            noise_overlap: [0.0; 96],
         }
     }
 
@@ -161,5 +236,15 @@ impl MbeParams {
         self.psi_l = src.psi_l;
         self.gamma = src.gamma;
         self.repeat = src.repeat;
+        self.local_energy = src.local_energy;
+        self.amplitude_threshold = src.amplitude_threshold;
+        self.error_rate = src.error_rate;
+        self.error_count_total = src.error_count_total;
+        self.error_count_4 = src.error_count_4;
+        self.repeat_count = src.repeat_count;
+        self.muting_threshold = src.muting_threshold;
+        self.previous_uw = src.previous_uw;
+        self.noise_seed = src.noise_seed;
+        self.noise_overlap = src.noise_overlap;
     }
 }

@@ -30,8 +30,8 @@ live in a runtime-agnostic crate that accepts byte slices and
 returns byte slices plus events, and a thin shell crate wires that
 core to a specific async runtime.
 
-The brainstorming session (see spec §2.3) asked whether sans-io was
-worth the extra boilerplate of the two-crate split. The answer was
+We explicitly asked whether sans-io was worth the extra boilerplate
+of the two-crate split. The answer was
 yes, primarily because the alternative — a small tokio integration
 test that pretends to be a unit test — is a well-known anti-pattern
 and we wanted to exit this state definitively rather than incrementally.

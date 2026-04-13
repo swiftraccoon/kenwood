@@ -1,6 +1,17 @@
 //! Audit tests that compare our implementation against the KI4LAX CAT
-//! command reference (`docs/ki4lax_cat_spec.json`). The spec is transcribed
-//! directly from the PDF and must NOT be edited based on our code.
+//! command reference, a JSON transcription of a third-party PDF.
+//!
+//! The reference JSON is NOT committed to the repository (unverified
+//! third-party provenance). To run these tests, set the environment
+//! variable `THD75_KI4LAX_SPEC` to the absolute path of the JSON spec:
+//!
+//! ```bash
+//! THD75_KI4LAX_SPEC=/path/to/ki4lax_cat_spec.json cargo test -p kenwood-thd75 --test spec_audit
+//! ```
+//!
+//! When the variable is unset, every test in this file returns early
+//! without running any assertions (they appear as "ok" in the output
+//! but perform no checks).
 //!
 //! Any test failure means our code disagrees with the external reference.
 //! Investigate which is correct (spec, code, or hardware) before fixing.
@@ -8,13 +19,21 @@
 use kenwood_thd75::protocol::{self, Command, Response, command_name};
 use kenwood_thd75::types::*;
 
-/// Load the KI4LAX spec and return the parsed JSON.
-fn load_spec() -> serde_json::Value {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/ki4lax_cat_spec.json");
-    let data = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read spec at {}: {e}", path.display()));
-    serde_json::from_str(&data).expect("invalid JSON in spec")
+/// Load the KI4LAX spec if `THD75_KI4LAX_SPEC` is set, else `None`.
+///
+/// Panics only when the env var is set but the file is unreadable or the
+/// JSON is malformed — that's a configuration error and should surface
+/// loudly. An unset env var is silent by design so the test suite is
+/// still runnable without the third-party fixture.
+fn load_spec() -> Option<serde_json::Value> {
+    let path = std::env::var_os("THD75_KI4LAX_SPEC")?;
+    let data = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read THD75_KI4LAX_SPEC={}: {e}",
+            path.to_string_lossy()
+        )
+    });
+    Some(serde_json::from_str(&data).expect("invalid JSON in THD75_KI4LAX_SPEC"))
 }
 
 /// Collect every unique mnemonic our code maps from `command_name()`.
@@ -90,7 +109,9 @@ fn our_mnemonics() -> Vec<&'static str> {
 
 #[test]
 fn all_spec_mnemonics_implemented() {
-    let spec = load_spec();
+    let Some(spec) = load_spec() else {
+        return;
+    };
     let commands = spec["commands"].as_object().unwrap();
     let ours = our_mnemonics();
 
@@ -134,7 +155,9 @@ fn all_our_mnemonics_are_valid() {
 
 #[test]
 fn document_commands_beyond_spec() {
-    let spec = load_spec();
+    let Some(spec) = load_spec() else {
+        return;
+    };
     let commands = spec["commands"].as_object().unwrap();
     let ours = our_mnemonics();
 
@@ -179,7 +202,9 @@ fn document_commands_beyond_spec() {
 
 #[test]
 fn mode_table_matches_spec() {
-    let spec = load_spec();
+    let Some(spec) = load_spec() else {
+        return;
+    };
     let table_d = spec["tables"]["TABLE_D"]["entries"].as_object().unwrap();
 
     for (index_str, name_val) in table_d {
@@ -213,7 +238,9 @@ fn mode_table_matches_spec() {
 
 #[test]
 fn step_size_table_matches_spec() {
-    let spec = load_spec();
+    let Some(spec) = load_spec() else {
+        return;
+    };
     let table_c = spec["tables"]["TABLE_C"]["entries"].as_object().unwrap();
 
     for (hex_str, _value) in table_c {
@@ -237,7 +264,9 @@ fn step_size_table_matches_spec() {
 
 #[test]
 fn tone_table_matches_spec() {
-    let spec = load_spec();
+    let Some(spec) = load_spec() else {
+        return;
+    };
     let table_a = spec["tables"]["TABLE_A"]["entries"].as_object().unwrap();
 
     assert_eq!(table_a.len(), 50, "TABLE A should have 50 entries (0-49)");
@@ -265,7 +294,9 @@ fn tone_table_matches_spec() {
 
 #[test]
 fn bl_is_read_only_per_spec() {
-    let spec = load_spec();
+    let Some(spec) = load_spec() else {
+        return;
+    };
     let bl = &spec["commands"]["BL"];
     assert!(bl["write"].is_null(), "BL should be read-only per spec");
 }
@@ -296,7 +327,9 @@ fn bl_values_include_spec_range() {
 
 #[test]
 fn dw_is_write_only_per_spec() {
-    let spec = load_spec();
+    let Some(spec) = load_spec() else {
+        return;
+    };
     let dw = &spec["commands"]["DW"];
     assert!(dw["read"].is_null(), "DW should be write-only per spec");
 }
@@ -361,7 +394,9 @@ fn sm_range_matches_spec() {
 
 #[test]
 fn fo_has_21_fields_per_spec() {
-    let spec = load_spec();
+    let Some(spec) = load_spec() else {
+        return;
+    };
     let expected = spec["commands"]["FO"]["field_count"].as_u64().unwrap();
     assert_eq!(expected, 21);
 
@@ -382,7 +417,9 @@ fn fo_has_21_fields_per_spec() {
 
 #[test]
 fn me_has_23_fields_per_spec() {
-    let spec = load_spec();
+    let Some(spec) = load_spec() else {
+        return;
+    };
     let expected = spec["commands"]["ME"]["field_count"].as_u64().unwrap();
     assert_eq!(expected, 23);
 }
@@ -410,7 +447,9 @@ fn sf_fs_mnemonic_firmware_verified() {
 
 #[test]
 fn fine_step_table_matches_spec() {
-    let spec = load_spec();
+    let Some(spec) = load_spec() else {
+        return;
+    };
     let table_e = spec["tables"]["TABLE_E"]["entries"].as_object().unwrap();
 
     let expected_names: [(u8, &str); 4] =

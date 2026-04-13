@@ -1,3 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Swift Raccoon
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// See ../LICENSE for full attribution including upstream copyrights from
+// szechyjs's mbelib and DSD projects (both originally ISC-licensed,
+// redistributed here under GPL-2.0-or-later as permitted by ISC) and
+// JMBE-compatible algorithm ports adapted from arancormonk/mbelib-neo
+// (also GPL-2.0-or-later).
+
 //! Pure Rust AMBE 3600×2450 voice codec decoder for D-STAR digital radio.
 //!
 //! The AMBE (Advanced Multi-Band Excitation) 3600×2450 codec compresses
@@ -10,10 +19,6 @@
 //! second (20 ms per frame). The codec models speech as a sum of
 //! harmonically related sinusoids, with each band independently
 //! classified as voiced or unvoiced.
-//!
-//! This crate is a decode-only port of the ISC-licensed
-//! [mbelib](https://github.com/szechyjs/mbelib) C library. It has zero
-//! runtime dependencies and requires only `std` for floating-point math.
 //!
 //! # Usage
 //!
@@ -42,17 +47,27 @@
 //! 4. **Parameter extraction** — 49 decoded bits → fundamental frequency,
 //!    harmonic count, voiced/unvoiced decisions, spectral magnitudes
 //! 5. **Spectral enhancement** — adaptive amplitude weighting for clarity
-//! 6. **Synthesis** — harmonic oscillator bank (voiced) + noise (unvoiced)
-//! 7. **Output conversion** — float PCM → i16 with gain and clamping
+//! 6. **Adaptive smoothing** — JMBE algorithms #111-116, gracefully
+//!    damps spurious magnitudes/voicing decisions on noisy frames
+//! 7. **Frame muting check** — comfort noise on excessive errors or
+//!    repeats (JMBE-compatible)
+//! 8. **Synthesis** — voiced bands per-band cosine oscillators (with
+//!    JMBE phase/amplitude interpolation for low harmonics) plus a
+//!    single FFT-based unvoiced pass (JMBE algorithms #117-126)
+//! 9. **Output conversion** — float PCM → i16 with SIMD-vectorized
+//!    gain and clamping
 
+mod adaptive;
 mod decode;
 mod ecc;
 mod enhance;
 mod error;
+mod math;
 mod params;
 mod synthesize;
 mod tables;
 mod unpack;
+mod unvoiced_fft;
 
 pub use error::DecodeError;
 
@@ -60,12 +75,17 @@ use ecc::AMBE_DATA_BITS;
 use params::MbeParams;
 use synthesize::FRAME_SAMPLES;
 use unpack::AMBE_FRAME_BITS;
+use wide::{f32x4, i32x4};
 
 /// Output audio gain applied during float-to-i16 conversion.
 const GAIN: f32 = 7.0;
 
-/// Maximum absolute sample value after gain (clamp threshold).
-const CLAMP_MAX: f32 = 32_760.0;
+/// Maximum absolute sample value after gain (clamp threshold). Matches
+/// mbelib-neo's JMBE-parity soft-clip at 95% of i16 max.
+const CLAMP_MAX: f32 = 32_767.0 * 0.95;
+
+/// Total bits per AMBE 3600x2450 frame (used to compute error rate).
+const FRAME_BITS: f32 = 72.0;
 
 /// Stateful AMBE 3600×2450 voice frame decoder.
 ///
@@ -96,6 +116,8 @@ pub struct AmbeDecoder {
     /// Previous frame's enhanced parameters (cross-fade source during
     /// harmonic synthesis, ensuring smooth transitions between frames).
     prev_enhanced: MbeParams,
+    /// Per-stream RNG state for comfort noise output during muting.
+    comfort_noise_state: u64,
 }
 
 impl AmbeDecoder {
@@ -110,6 +132,7 @@ impl AmbeDecoder {
             cur: MbeParams::new(),
             prev: MbeParams::new(),
             prev_enhanced: MbeParams::new(),
+            comfort_noise_state: adaptive::COMFORT_NOISE_INIT_SEED,
         }
     }
 
@@ -117,105 +140,192 @@ impl AmbeDecoder {
     ///
     /// Returns 160 signed 16-bit samples at 8000 Hz (20 ms of audio).
     /// A gain factor of 7.0 is applied and samples are clamped to
-    /// ±32760 to prevent clipping artifacts.
+    /// `±32767 × 0.95` to match JMBE soft-clipping semantics.
     ///
     /// If the frame contains excessive bit errors (more than the FEC
-    /// can correct), the decoder repeats the previous frame's
-    /// parameters up to 3 times, then outputs silence.
+    /// can correct) or the decoder has hit the maximum repeat count,
+    /// comfort noise is output instead of synthesized speech.
     #[must_use]
     pub fn decode_frame(&mut self, ambe: &[u8; 9]) -> [i16; FRAME_SAMPLES] {
         let mut ambe_fr = [0u8; AMBE_FRAME_BITS];
         let mut ambe_d = [0u8; AMBE_DATA_BITS];
 
-        // Unpack the 9-byte frame into individual bits ordered by FEC
-        // codeword. The 72 bits are interleaved across 4 codewords
-        // (C0, C1, C2, C3) so the FEC can protect different parts of
-        // the parameter space independently.
+        // Unpack + ECC + demod pipeline.
         unpack::unpack_frame(ambe, &mut ambe_fr);
-
-        // Apply Golay(23,12) error correction to the C0 codeword.
-        // C0 protects the most critical parameters (fundamental
-        // frequency index b0), so it gets the strongest FEC.
-        let _c0_errors = ecc::ecc_c0(&mut ambe_fr);
-
-        // Demodulate C1 using an LFSR sequence seeded from the
-        // corrected C0 data. This scrambling prevents systematic
-        // errors in C0 from propagating into C1.
+        let c0_errors = ecc::ecc_c0(&mut ambe_fr);
         unpack::demodulate_c1(&mut ambe_fr);
+        let other_errors = ecc::ecc_data(&ambe_fr, &mut ambe_d);
 
-        // Apply ECC to the remaining codewords (C1 Golay, C2 Golay,
-        // C3 Hamming) and pack the corrected bits into the 49-bit
-        // parameter vector.
-        let _total_errors = ecc::ecc_data(&ambe_fr, &mut ambe_d);
-
-        // Decode the 49 parameter bits into the harmonic speech model:
-        // fundamental frequency (b0), voiced/unvoiced decisions (b1),
-        // gain delta (b2), and spectral magnitudes (b3-b8).
-        // Status: 0 = valid voice, 2 = erasure, 3 = tone signal.
+        // Decode the 49 parameter bits into the harmonic speech model.
         let _decode_status = decode::decode_params(&ambe_d, &mut self.cur, &self.prev);
 
-        // TODO(task-6): if combined errors exceed threshold, increment
-        // the repeat counter and reuse previous frame's parameters.
-        // After 3 consecutive repeats, output silence. This matches
-        // mbelib's mbe_processAmbe2450Dataf() error handling.
-
-        // Snapshot current parameters as the prediction reference for
-        // the NEXT frame's delta decoding. This must happen BEFORE
-        // enhancement, because the delta predictions are relative to
-        // un-enhanced magnitudes.
-        self.prev.copy_from(&self.cur);
-
-        // Spectral amplitude enhancement: adjusts per-band magnitudes
-        // based on autocorrelation to reduce codec artifacts. This
-        // operates on the current frame only and does not affect the
-        // prediction reference saved above.
-        enhance::spectral_amp_enhance(&mut self.cur);
-
-        // Synthesize PCM audio from the enhanced parameters. Each
-        // harmonic band contributes a windowed cosine oscillator
-        // (voiced) or random-phase multisine (unvoiced). The synthesis
-        // window (Ws) cross-fades between the previous enhanced frame
-        // and the current one for smooth transitions.
-        //
-        // Both `cur` and `prev_enhanced` are mutated: `cur` gets phase
-        // updates (PSI/PHI) for continuity into the next frame, and
-        // `prev_enhanced` gets band extension (zero-fill when the
-        // current frame has more harmonics).
-        let mut pcm_f = [0.0f32; FRAME_SAMPLES];
-        synthesize::synthesize_speech(&mut pcm_f, &mut self.cur, &mut self.prev_enhanced);
-
-        // Save the enhanced parameters as the cross-fade source for
-        // the next frame's synthesis.
-        self.prev_enhanced.copy_from(&self.cur);
-
-        // Convert floating-point PCM to 16-bit signed integers.
-        // The gain of 7.0 matches mbelib's mbe_floattoshort() output
-        // level. Clamping to ±32760 (not ±32767) leaves headroom to
-        // avoid wrap-around clipping artifacts.
-        let mut pcm = [0i16; FRAME_SAMPLES];
-        let mut i = 0;
-        while i < FRAME_SAMPLES {
-            let scaled = pcm_f.get(i).map_or(0.0, |sample| sample * GAIN);
-            let clamped = scaled.clamp(-CLAMP_MAX, CLAMP_MAX);
-            if let Some(out) = pcm.get_mut(i) {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "clamped to ±32760 which fits in i16; no truncation-free \
-                              f32→i16 path exists in stable Rust without unsafe"
-                )]
-                {
-                    *out = clamped as i16;
-                }
-            }
-            i += 1;
+        // Update error tracking for adaptive smoothing and muting.
+        // AMBE 3600x2450 has 72 raw bits; C4 is IMBE-only (always 0 here).
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "error counts are at most a few dozen; fit in i32"
+        )]
+        {
+            self.cur.error_count_total = (c0_errors + other_errors) as i32;
+            self.cur.error_count_4 = 0;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "error counts are at most a few dozen; no precision loss in f32"
+        )]
+        {
+            self.cur.error_rate = self.cur.error_count_total as f32 / FRAME_BITS;
         }
 
-        pcm
+        // Snapshot raw parameters as prediction reference for next frame.
+        self.prev.copy_from(&self.cur);
+
+        // Compute pre-enhancement RM0 (algorithm #111 input).
+        let pre_enhance_rm0 = (1..=self.cur.l)
+            .map(|l| {
+                let m = self.cur.ml.get(l).copied().unwrap_or(0.0);
+                m * m
+            })
+            .sum::<f32>();
+
+        // Spectral amplitude enhancement.
+        enhance::spectral_amp_enhance(&mut self.cur);
+
+        // Adaptive smoothing (JMBE algorithms #111-116).
+        adaptive::apply_adaptive_smoothing(
+            &mut self.cur,
+            &self.prev_enhanced,
+            Some(pre_enhance_rm0),
+        );
+
+        // Check muting conditions: max repeat count or AMBE error-rate
+        // threshold. Muting outputs comfort noise instead of synthesized
+        // speech, while preserving model state for next-frame recovery.
+        let muted = adaptive::is_max_frame_repeat(&self.cur)
+            || (self.cur.muting_threshold <= adaptive::MUTING_THRESHOLD_AMBE
+                && adaptive::requires_muting(&self.cur));
+
+        let mut pcm_f = [0.0_f32; FRAME_SAMPLES];
+        if muted {
+            adaptive::synthesize_comfort_noise(&mut pcm_f, &mut self.comfort_noise_state);
+        } else {
+            synthesize::synthesize_speech(&mut pcm_f, &mut self.cur, &mut self.prev_enhanced);
+        }
+
+        // Save enhanced parameters as cross-fade source for next frame.
+        self.prev_enhanced.copy_from(&self.cur);
+
+        float_to_i16(&pcm_f)
     }
 }
 
 impl Default for AmbeDecoder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Converts 160 float PCM samples to 16-bit signed integers using
+/// SIMD-vectorized gain + clamp + round.
+///
+/// Processes 4 samples per loop iteration via `wide::f32x4`. The
+/// `round_int` step uses round-to-nearest-even (vs the C reference's
+/// truncation), which produces marginally better fidelity at the cost
+/// of being one ulp different on samples exactly on a half-integer.
+fn float_to_i16(input: &[f32; FRAME_SAMPLES]) -> [i16; FRAME_SAMPLES] {
+    let mut output = [0_i16; FRAME_SAMPLES];
+
+    let gain_v = f32x4::splat(GAIN);
+    let max_v = f32x4::splat(CLAMP_MAX);
+    let min_v = f32x4::splat(-CLAMP_MAX);
+
+    // FRAME_SAMPLES (160) is divisible by 4, no scalar tail needed.
+    let mut i = 0;
+    while i + 4 <= FRAME_SAMPLES {
+        let chunk = f32x4::new([
+            input.get(i).copied().unwrap_or(0.0),
+            input.get(i + 1).copied().unwrap_or(0.0),
+            input.get(i + 2).copied().unwrap_or(0.0),
+            input.get(i + 3).copied().unwrap_or(0.0),
+        ]);
+        let scaled = chunk * gain_v;
+        let clamped = scaled.fast_min(max_v).fast_max(min_v);
+        let rounded: i32x4 = clamped.round_int();
+        let arr: [i32; 4] = rounded.into();
+        for (j, &v) in arr.iter().enumerate() {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "v is in i16 range due to clamp above"
+            )]
+            if let Some(slot) = output.get_mut(i + j) {
+                *slot = v as i16;
+            }
+        }
+        i += 4;
+    }
+
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Float→i16 produces results bit-identical (or within 1 ULP) to
+    /// the scalar reference implementation.
+    #[test]
+    fn float_to_i16_matches_scalar() {
+        let mut input = [0.0_f32; FRAME_SAMPLES];
+        for (i, slot) in input.iter_mut().enumerate() {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "i is at most 159; no precision loss"
+            )]
+            {
+                *slot = ((i as f32 / 80.0) - 1.0) * 5000.0;
+            }
+        }
+
+        let simd_out = float_to_i16(&input);
+
+        for (n, &got) in simd_out.iter().enumerate() {
+            let expected = (input[n] * GAIN).clamp(-CLAMP_MAX, CLAMP_MAX).round();
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "expected is in i16 range due to clamp"
+            )]
+            let expected_i16 = expected as i16;
+            let diff = (i32::from(got) - i32::from(expected_i16)).abs();
+            assert!(
+                diff <= 1,
+                "sample {n}: got {got}, expected {expected_i16} (input={})",
+                input[n]
+            );
+        }
+    }
+
+    /// Float→i16 properly clamps values outside the valid range.
+    #[test]
+    fn float_to_i16_clamps_extremes() {
+        let mut input = [0.0_f32; FRAME_SAMPLES];
+        input[0] = 1_000_000.0;
+        input[1] = -1_000_000.0;
+        input[2] = 0.0;
+        input[3] = -0.0;
+
+        let out = float_to_i16(&input);
+        // CLAMP_MAX is 31128.65, so clamped × 7 then round → ≤ 31129.
+        assert!(
+            (31_125..=31_130).contains(&out[0]),
+            "max should clamp near 31128, got {}",
+            out[0]
+        );
+        assert!(
+            (-31_130..=-31_125).contains(&out[1]),
+            "min should clamp near -31128, got {}",
+            out[1]
+        );
+        assert_eq!(out[2], 0);
+        assert_eq!(out[3], 0);
     }
 }

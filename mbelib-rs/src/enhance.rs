@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2010 szechyjs (mbelib)
+// SPDX-FileCopyrightText: 2026 Swift Raccoon
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Spectral amplitude enhancement for decoded AMBE parameters.
 //!
 //! After the AMBE parameter decoder recovers per-band magnitudes from
@@ -11,8 +15,13 @@
 //! while weak bands get a modest boost. A final energy-preserving
 //! normalization step ensures the total power stays unchanged.
 //!
-//! This is a direct port of `mbe_spectralAmpEnhance()` from the ISC-licensed
-//! mbelib C library (<https://github.com/szechyjs/mbelib>).
+//! Base implementation ported from `mbe_spectralAmpEnhance()` in
+//! szechyjs/mbelib (originally ISC, redistributed here under
+//! GPL-2.0-or-later). The shared `cos(w0 * l)` precomputation via
+//! angle-addition recurrence is adapted from `mbe_spectralAmpEnhance` in
+//! arancormonk/mbelib-neo (<https://github.com/arancormonk/mbelib-neo>,
+//! GPL-2.0-or-later). The recurrence formula itself is the standard
+//! angle-addition identity (cf. Numerical Recipes §5.5).
 
 use crate::params::MbeParams;
 
@@ -56,6 +65,34 @@ pub(crate) fn spectral_amp_enhance(params: &mut MbeParams) {
         return;
     }
 
+    // Precompute cos(w0 * l) for l in 1..=L via angle-addition recurrence.
+    //
+    // Replaces 2*L individual cos() calls (one per band in each of the two
+    // loops below) with a single sin_cos() and L iterations of 2 fma + 2
+    // mul. Numerical drift over L≤56 steps is below 1e-5, well within
+    // audio-perception tolerance.
+    //
+    // Recurrence: given (c_step, s_step) = (cos(w0), sin(w0)) and
+    // (c_l, s_l) = (cos(l·w0), sin(l·w0)), the next pair is
+    //   c_{l+1} = c_l · c_step - s_l · s_step
+    //   s_{l+1} = s_l · c_step + c_l · s_step
+    let cos_tab: [f32; 57] = {
+        let mut tab = [0.0_f32; 57];
+        let (s_step, c_step) = params.w0.sin_cos();
+        let mut c = 1.0_f32;
+        let mut s = 0.0_f32;
+        for l in 1..=big_l.min(56) {
+            let c_next = c.mul_add(c_step, -s * s_step);
+            let s_next = s.mul_add(c_step, c * s_step);
+            c = c_next;
+            s = s_next;
+            if let Some(slot) = tab.get_mut(l) {
+                *slot = c;
+            }
+        }
+        tab
+    };
+
     // Step 1: Compute autocorrelation R(m,0) and R(m,1).
     //
     // Rm0 is the zero-lag autocorrelation (total spectral energy).
@@ -68,13 +105,8 @@ pub(crate) fn spectral_amp_enhance(params: &mut MbeParams) {
         let ml = *params.ml.get(l).unwrap_or(&0.0);
         let ml_sq = ml * ml;
         rm0 += ml_sq;
-        // Cast is safe: l is at most 56, well within f32 mantissa precision.
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "l is at most 56; no precision loss in f32"
-        )]
-        let angle = params.w0 * l as f32;
-        rm1 = ml_sq.mul_add(angle.cos(), rm1);
+        let cos_w0l = cos_tab.get(l).copied().unwrap_or(0.0);
+        rm1 = ml_sq.mul_add(cos_w0l, rm1);
     }
 
     // Squared autocorrelation values for the weighting formula.
@@ -93,12 +125,7 @@ pub(crate) fn spectral_amp_enhance(params: &mut MbeParams) {
             continue;
         }
 
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "l is at most 56; no precision loss in f32"
-        )]
-        let l_f32 = l as f32;
-        let cos_w0l = (params.w0 * l_f32).cos();
+        let cos_w0l = cos_tab.get(l).copied().unwrap_or(0.0);
 
         // Spectral density ratio: numerator measures local density at
         // band l, denominator is the global spectral density estimate.

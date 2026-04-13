@@ -1,0 +1,68 @@
+mmdvm Licensing
+===============
+
+This crate is distributed under the GNU General Public License, version 2
+or (at your option) any later version (GPL-2.0-or-later). This matches the
+workspace-wide license choice for the kenwood project.
+
+mmdvm is a tokio async shell for the MMDVM ham-radio digital voice modem
+protocol. It builds on the sans-io mmdvm-core crate and implements the
+event-loop / queue / handle orchestration described in the reference C++
+implementation MMDVMHost (https://github.com/g4klx/MMDVMHost), which is
+distributed under GPL-2.0-or-later for the files that inform this crate's
+derivation.
+
+================================================================
+Original Rust port code
+================================================================
+
+Copyright (c) 2024-2026 Swift Raccoon
+    <47705353+swiftraccoon@users.noreply.github.com>
+
+Distributed under GPL-2.0-or-later.
+
+================================================================
+Derivation from MMDVMHost (by Jonathan Naylor, G4KLX)
+https://github.com/g4klx/MMDVMHost
+================================================================
+
+Affected files (in this crate):
+    src/lib.rs
+    src/tokio_shell/modem_loop.rs
+    src/tokio_shell/tx_queue.rs
+
+These modules mirror the periodic-GetStatus poll cadence, the per-mode
+TX ring buffers, and the space-gated drain logic described in the
+upstream file:
+
+    ref/MMDVMHost/Modem.cpp
+
+Specifically mirrored regions (see the //! doc comments in each file
+for exact line references):
+    - m_statusTimer cadence (Modem.cpp:245)
+    - m_playoutTimer cadence (Modem.cpp:247)
+    - Per-mode m_tx<MODE>Data ring buffers (Modem.cpp:288-315)
+    - Space-gated drain logic (Modem.cpp:1049-1220)
+    - D-STAR slot-cost constants (Modem.cpp:1053-1055)
+
+Copyright (c) 2015-2026 Jonathan Naylor, G4KLX
+    (https://github.com/g4klx)
+
+Modem.cpp carries the GPL-2.0-or-later header ("either version 2 of
+the License, or (at your option) any later version"). This crate
+therefore inherits the "or later" grant.
+
+No code from MMDVMHost is copied verbatim into this crate. The
+derivation is documented inline in each affected module via
+"//! Mirrors ref/MMDVMHost/Modem.cpp:<line>" comments; those pointers
+are the audit trail, not copy-paste. The Rust implementations use
+tokio channels, VecDeque, and tokio::time::Interval in place of the
+upstream CThread / CRingBuffer / CTimer primitives.
+
+================================================================
+License texts
+================================================================
+
+The full text of GPL-2.0-or-later (the outgoing license for this crate
+and the inherited license for the MMDVMHost-derived portions) is in
+LICENSES/GPL-2.0-or-later.txt.

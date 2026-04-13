@@ -597,7 +597,8 @@ impl fmt::Display for FineStep {
 /// - **Cross-tone / digital squelch** (byte 0x0E): cross-tone type and
 ///   per-channel digital squelch mode.
 ///
-/// See `docs/mcp_memory_map.md` Section 3.3 for the complete field map.
+/// The per-field offsets documented on each struct member below are the
+/// complete byte map, correlated against MCP memory dumps from hardware.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashChannel {

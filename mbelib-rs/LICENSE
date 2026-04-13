@@ -1,0 +1,90 @@
+mbelib-rs Licensing
+===================
+
+This crate is distributed under the GNU General Public License, version 2
+or (at your option) any later version (GPL-2.0-or-later). This matches the
+workspace-wide license choice for the kenwood project.
+
+It is a Rust port of code from two upstream C projects authored by szechyjs,
+both originally published under the ISC license. ISC permits redistribution
+under more restrictive terms, so those portions are redistributed in this
+crate under GPL-2.0-or-later, with the original ISC copyright notices
+retained for attribution as ISC requires.
+
+This is the same relicensing pathway that arancormonk used in mbelib-neo
+(https://github.com/arancormonk/mbelib-neo) — taking the ISC mbelib code
+and redistributing the combined work under GPL-2.0-or-later.
+
+================================================================
+Original Rust port code
+================================================================
+
+Copyright (c) 2026 Swift Raccoon
+    <47705353+swiftraccoon@users.noreply.github.com>
+
+Distributed under GPL-2.0-or-later.
+
+================================================================
+Portions ported from mbelib by szechyjs
+https://github.com/szechyjs/mbelib
+================================================================
+
+Affected files:
+    src/decode.rs
+    src/ecc.rs
+    src/enhance.rs
+    src/params.rs
+    src/synthesize.rs
+    src/tables.rs
+    src/unpack.rs (mbelib-derived demodulation helper only)
+
+Copyright (c) 2010 szechyjs
+    (https://github.com/szechyjs)
+    GPG Key ID: 0xEA5EFE2C
+        (9E7A 5527 9CDC EBF7 BF1B  D772 4F98 E863 EA5E FE2C)
+
+Originally published under the ISC license; redistributed here under
+GPL-2.0-or-later as permitted by ISC. The full ISC notice text is
+preserved for attribution in LICENSES/ISC.txt.
+
+The mbelib upstream COPYRIGHT file uses the pseudonym "mbelib Author"
+in its literal copyright line. The same GPG key ID is published on
+szechyjs's GitHub profile, so the copyright is reproduced here under
+the publicly-identifiable name.
+
+================================================================
+Portions ported from DSD by szechyjs (ISC-licensed files only)
+https://github.com/szechyjs/dsd
+================================================================
+
+Affected file:
+    src/unpack.rs (dW/dX D-STAR interleave tables only,
+                   ported from include/dstar_const.h)
+
+Note on DSD's dual licensing: the upstream DSD repository is dual-licensed.
+The files dstar_header.{c,h}, descramble.h, and fcs.h are GPLv2-only —
+none of those files are used here. All code reused from DSD originates
+from ISC-licensed files (specifically include/dstar_const.h).
+
+Copyright (c) 2010 szechyjs
+    (https://github.com/szechyjs)
+    GPG Key ID: 0x3F1D7FD0
+        (74EF 430D F7F2 0A48 FCE6  F630 FAA2 635D 3F1D 7FD0)
+
+Originally published under the ISC license; redistributed here under
+GPL-2.0-or-later as permitted by ISC. The full ISC notice text is
+preserved for attribution in LICENSES/ISC.txt.
+
+The DSD upstream COPYRIGHT file uses the pseudonym "DSD Author" in its
+literal copyright line, with a different GPG key from the mbelib one.
+Both keys are published on szechyjs's GitHub profile.
+
+================================================================
+License texts
+================================================================
+
+The full text of GPL-2.0-or-later (the outgoing license for this crate)
+is in LICENSES/GPL-2.0-or-later.txt.
+
+The full text of the ISC license (preserved for upstream attribution
+under the ISC reproduction requirement) is in LICENSES/ISC.txt.

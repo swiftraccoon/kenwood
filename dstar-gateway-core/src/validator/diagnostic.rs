@@ -1,9 +1,10 @@
 //! Structured warnings emitted by the lenient parsers.
 //!
-//! Plans 2 and 3 each populate this enum with the variants their
-//! protocol's parser can fire. This file holds the union — every
-//! protocol contributes its own variants, but the type is shared
-//! so a single `DiagnosticSink` can route across protocols.
+//! This file holds the cross-protocol union of diagnostic variants.
+//! Every protocol codec (`DPlus`, `DExtra`, DCS) contributes the variants
+//! its parser can fire, but the type is shared so a single
+//! `DiagnosticSink` can route diagnostics across all protocols without
+//! branching on codec.
 
 use std::net::SocketAddr;
 use std::time::Duration;

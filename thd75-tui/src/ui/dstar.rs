@@ -296,22 +296,22 @@ fn render_gateway(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area
 
         detail_lines.push(kv_line(
             "From",
-            format!("{} {}", header.my_call.trim(), header.my_suffix.trim()),
+            format!("{} {}", header.my_call.as_str(), header.my_suffix.as_str()),
             Color::Cyan,
         ));
         detail_lines.push(kv_line(
             "To",
-            header.ur_call.trim().to_string(),
+            header.ur_call.as_str().into_owned(),
             Color::White,
         ));
         detail_lines.push(kv_line(
             "RPT1",
-            header.rpt1.trim().to_string(),
+            header.rpt1.as_str().into_owned(),
             Color::White,
         ));
         detail_lines.push(kv_line(
             "RPT2",
-            header.rpt2.trim().to_string(),
+            header.rpt2.as_str().into_owned(),
             Color::White,
         ));
         detail_lines.push(kv_line("Status", status_str.to_string(), status_color));

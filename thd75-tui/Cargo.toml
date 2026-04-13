@@ -14,6 +14,7 @@ publish = false
 
 [dependencies]
 kenwood-thd75 = { path = "../thd75" }
+dstar-gateway-core = { path = "../dstar-gateway-core" }
 ratatui = "0.30"
 crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }

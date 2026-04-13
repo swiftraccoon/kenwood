@@ -724,11 +724,12 @@ pub(crate) async fn unreflector<T: Transport>(radio: &mut Radio<T>) {
 /// and the dump continues with the next field instead of aborting.
 ///
 /// S-meter polls are defensive: the D75 firmware occasionally
-/// returns spurious values on Band B while squelch is open
-/// (`CLAUDE.local.md` §AI Mode), so we accept whatever the radio
-/// gives us and only fall through to `"not available"` on an actual
-/// transport error rather than gating the read behind AI push
-/// events. This keeps the command useful as a one-shot snapshot.
+/// returns spurious values on Band B while squelch is open (the
+/// hardware-correct pattern is to gate SM reads on AI-pushed BY
+/// events, not to poll them directly), so we accept whatever the
+/// radio gives us and only fall through to `"not available"` on
+/// an actual transport error. This keeps the command useful as a
+/// one-shot snapshot.
 #[allow(clippy::cognitive_complexity)]
 pub(crate) async fn status<T: Transport>(radio: &mut Radio<T>) {
     aprintln!("Reading radio status, please wait.");

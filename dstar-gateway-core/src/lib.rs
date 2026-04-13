@@ -43,8 +43,8 @@ pub use session::server::{
 };
 pub use session::{Driver, Transmit};
 pub use slowdata::{
-    SlowDataAssembler, SlowDataBlock, SlowDataBlockKind, SlowDataError, SlowDataText, descramble,
-    scramble,
+    MAX_MESSAGE_LEN, SlowDataAssembler, SlowDataBlock, SlowDataBlockKind, SlowDataError,
+    SlowDataText, SlowDataTextCollector, descramble, encode_text_message, scramble,
 };
 pub use types::{
     BandLetter, Callsign, Module, ProtocolKind, ReflectorCallsign, StreamId, Suffix, TypeError,

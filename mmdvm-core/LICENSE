@@ -1,0 +1,75 @@
+mmdvm-core Licensing
+====================
+
+This crate is distributed under the GNU General Public License, version 2
+or (at your option) any later version (GPL-2.0-or-later). This matches the
+workspace-wide license choice for the kenwood project.
+
+mmdvm-core is a sans-io Rust codec for the MMDVM ham-radio digital voice
+modem protocol. It is a clean-room Rust reimplementation of the protocol
+facts described in the reference C++ implementation MMDVMHost
+(https://github.com/g4klx/MMDVMHost), which is distributed under
+GPL-2.0-or-later for the files that inform this crate's derivation.
+
+================================================================
+Original Rust port code
+================================================================
+
+Copyright (c) 2024-2026 Swift Raccoon
+    <47705353+swiftraccoon@users.noreply.github.com>
+
+Distributed under GPL-2.0-or-later.
+
+================================================================
+Derivation from MMDVMHost (by Jonathan Naylor, G4KLX)
+https://github.com/g4klx/MMDVMHost
+================================================================
+
+Affected files (in this crate):
+    src/capabilities.rs
+    src/command.rs
+    src/config.rs
+    src/hw_type.rs
+    src/lib.rs
+    src/mode.rs
+    src/nak.rs
+    src/status.rs
+    src/version.rs
+
+These modules reimplement the wire-format codec, command-byte table,
+mode enumeration, status-payload parser, version-handshake parser,
+NAK reason codes, hardware-type detection, and configuration builder
+as described in the upstream files:
+
+    ref/MMDVMHost/Modem.cpp
+    ref/MMDVMHost/Modem.h
+    ref/MMDVMHost/Defines.h
+
+Copyright (c) 2015-2026 Jonathan Naylor, G4KLX
+    (https://github.com/g4klx)
+
+The upstream files enumerated above all carry the GPL-2.0-or-later
+header ("either version 2 of the License, or (at your option) any
+later version"). This crate therefore inherits the "or later" grant.
+
+MMDVMHost contains a subset of files (17 of 174, notably DStarControl.cpp,
+DMRControl.cpp, DMRData.*, DMRSlot.cpp, DMRTA.*, DMRTrellis.*, NXDNControl.cpp,
+P25Trellis.*, POCSAGControl.cpp, YSFControl.cpp, YSFPayload.cpp,
+Utils.*, Golay24128.cpp, BCH.cpp) that carry a GPL-2.0-only header.
+This crate does NOT derive from any of those files; see the file:line
+attributions in each module's doc comment for the upstream reference
+point. Keeping the derivation confined to the "or later" subset is
+what preserves the outgoing "or later" grant.
+
+No code from MMDVMHost is copied verbatim into this crate. The
+derivation is documented inline in each affected module via
+"//! Mirrors ref/MMDVMHost/<file>:<line>" comments; those pointers
+are the audit trail, not copy-paste.
+
+================================================================
+License texts
+================================================================
+
+The full text of GPL-2.0-or-later (the outgoing license for this crate
+and the inherited license for the MMDVMHost-derived portions) is in
+LICENSES/GPL-2.0-or-later.txt.

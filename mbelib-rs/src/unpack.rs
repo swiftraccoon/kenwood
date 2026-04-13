@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2010 szechyjs (mbelib and DSD)
+// SPDX-FileCopyrightText: 2026 Swift Raccoon
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Bit unpacking and LFSR demodulation for AMBE 3600x2450 voice frames.
 //!
 //! The AMBE codec transmits 72 bits (9 bytes) per voice frame, but the

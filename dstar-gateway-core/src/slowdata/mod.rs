@@ -17,10 +17,14 @@
 
 mod assembler;
 mod block;
+mod encoder;
 mod error;
 mod scrambler;
+mod text_collector;
 
 pub use assembler::SlowDataAssembler;
 pub use block::{SlowDataBlock, SlowDataBlockKind, SlowDataText};
+pub use encoder::encode_text_message;
 pub use error::SlowDataError;
 pub use scrambler::{descramble, scramble};
+pub use text_collector::{MAX_MESSAGE_LEN, SlowDataTextCollector};

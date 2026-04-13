@@ -28,14 +28,15 @@ use std::sync::atomic::Ordering;
 use thd75_repl::aprintln;
 
 use clap::Parser;
+use dstar_gateway_core::slowdata::{SlowDataTextCollector, encode_text_message};
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::{AprsClient, AprsClientConfig, AprsEvent};
-use kenwood_thd75::{DStarEvent, DStarGateway, DStarGatewayConfig, SlowDataDecoder};
+use kenwood_thd75::{DStarEvent, DStarGateway, DStarGatewayConfig};
 
 use dstar_gateway::auth::AuthClient;
 use dstar_gateway::tokio_shell::{AsyncSession, ShellError};
-use dstar_gateway_core::header::DStarHeader as CoreDStarHeader;
+use dstar_gateway_core::header::DStarHeader;
 use dstar_gateway_core::hosts::HostFile;
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{
@@ -43,7 +44,7 @@ use dstar_gateway_core::session::client::{
     VoiceEndReason,
 };
 use dstar_gateway_core::types::ProtocolKind;
-use dstar_gateway_core::voice::VoiceFrame as CoreVoiceFrame;
+use dstar_gateway_core::voice::VoiceFrame;
 use dstar_gateway_core::{Callsign, Module, StreamId, Suffix};
 
 /// Log verbosity level for the opt-in file sink.
@@ -389,9 +390,8 @@ fn init_logging(cli: &Cli) -> LoggingGuard {
 ///
 /// Tries Bluetooth first on macOS (synchronously, no tokio reactor
 /// needed) and falls back to serial discovery via the async path.
-/// This matches the exact behaviour the binary had before Task 26
-/// introduced the optional mock branch; factoring it out keeps the
-/// mock + real paths symmetric in `main`.
+/// Factored out of `main` so the mock + real transport branches stay
+/// symmetric: both return the same `(path, transport, runtime)` shape.
 fn open_real_transport(
     cli_port: Option<&str>,
     cli_baud: u32,
@@ -584,16 +584,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let in_script_mode = cli.script.is_some();
     let script_strict = cli.script_strict;
 
-    // Run the async REPL.
-    rt.block_on(run_repl(
-        transport,
-        cli.port.clone(),
-        cli.baud,
-        initial_command,
-        script,
-        script_strict,
-        in_script_mode,
-    ))?;
+    // Run the async REPL inside a LocalSet so the MMDVM transport
+    // adapter can pump its inner thd75 transport via `spawn_local`.
+    // That keeps the BluetoothTransport's CFRunLoop pumping on the
+    // main OS thread, which is the only thread where IOBluetooth's
+    // RFCOMM data callbacks fire.
+    let local = tokio::task::LocalSet::new();
+    local.block_on(
+        &rt,
+        run_repl(
+            transport,
+            cli.port.clone(),
+            cli.baud,
+            initial_command,
+            script,
+            script_strict,
+            in_script_mode,
+        ),
+    )?;
 
     Ok(())
 }
@@ -666,7 +674,7 @@ struct DStarSession {
     echo_armed: bool,
     /// Slow data decoder for incoming reflector voice frames.
     /// Decodes text messages embedded in the slow data bytes.
-    rx_slow_data: SlowDataDecoder,
+    rx_slow_data: SlowDataTextCollector,
     /// Last 20-byte slow-data text message printed for the current
     /// stream, used to dedupe repeat emissions. D-STAR radios
     /// continuously re-transmit the operator's text message across
@@ -701,16 +709,16 @@ enum EchoState {
     /// Recording TX audio. Stores the original header and AMBE frames.
     Recording {
         /// Original D-STAR header from the TX stream.
-        header: kenwood_thd75::DStarHeader,
+        header: DStarHeader,
         /// Buffered AMBE voice frames.
-        frames: Vec<kenwood_thd75::DStarVoiceFrame>,
+        frames: Vec<VoiceFrame>,
     },
     /// Waiting briefly before playback (per ircDDBGateway `REPLY_TIME`).
     Waiting {
         /// Original D-STAR header from the TX stream.
-        header: kenwood_thd75::DStarHeader,
+        header: DStarHeader,
         /// Buffered AMBE voice frames.
-        frames: Vec<kenwood_thd75::DStarVoiceFrame>,
+        frames: Vec<VoiceFrame>,
         /// When the wait started.
         since: std::time::Instant,
     },
@@ -765,7 +773,7 @@ enum RuntimeEvent {
         /// Stream id of the new stream.
         stream_id: StreamId,
         /// Decoded D-STAR header.
-        header: Box<CoreDStarHeader>,
+        header: Box<DStarHeader>,
     },
     /// A voice frame within an active stream.
     VoiceFrame {
@@ -774,7 +782,7 @@ enum RuntimeEvent {
         /// Frame sequence (0-20).
         seq: u8,
         /// Voice frame payload.
-        frame: Box<CoreVoiceFrame>,
+        frame: Box<VoiceFrame>,
     },
     /// A voice stream ended.
     VoiceEnd {
@@ -832,7 +840,7 @@ impl ReflectorSession {
     /// Send a voice header and start a new outbound voice stream.
     async fn send_header(
         &mut self,
-        header: CoreDStarHeader,
+        header: DStarHeader,
         stream_id: StreamId,
     ) -> Result<(), ShellError> {
         match self {
@@ -847,7 +855,7 @@ impl ReflectorSession {
         &mut self,
         stream_id: StreamId,
         seq: u8,
-        frame: CoreVoiceFrame,
+        frame: VoiceFrame,
     ) -> Result<(), ShellError> {
         match self {
             Self::DPlus(s) => s.send_voice(stream_id, seq, frame).await,
@@ -1817,7 +1825,7 @@ async fn enter_dstar(
         rx_stream_id: None,
         echo: EchoState::Idle,
         echo_armed: false,
-        rx_slow_data: SlowDataDecoder::new(),
+        rx_slow_data: SlowDataTextCollector::new(),
         rx_last_slow_text: None,
         tx_text: None,
         tx_slow_data: Vec::new(),
@@ -2188,6 +2196,40 @@ async fn connect_dcs(
     Ok(AsyncSession::spawn(connected, socket))
 }
 
+/// Re-establish the reflector link in place using the session's
+/// remembered link parameters.
+///
+/// Triggered automatically when a `Disconnected(KeepaliveInactivity)`
+/// event arrives — those mean we lost contact with the reflector for
+/// 30 s but neither side intentionally closed the link, so a fresh
+/// `LINK1` handshake usually restores service. On success
+/// `session.reflector` is replaced with the newly-spawned client; on
+/// failure it is left as `None` so the user can retry manually with
+/// `link <reflector>`.
+async fn try_reconnect_reflector(session: &mut DStarSession) {
+    let link = LinkArg {
+        reflector_name: session.reflector_callsign.as_str().into_owned(),
+        reflector_module: session.reflector_module,
+        local_module: session.local_module,
+    };
+    aprintln!(
+        "Auto-reconnecting to {} module {}.",
+        link.reflector_name,
+        link.reflector_module
+    );
+    match connect_reflector(session.callsign, &link).await {
+        Ok(client) => {
+            session.reflector = Some(client);
+        }
+        Err(e) => {
+            aprintln!(
+                "{}",
+                thd75_repl::output::error(format_args!("auto-reconnect failed: {e}"))
+            );
+        }
+    }
+}
+
 /// Connect to a reflector using a parsed [`LinkArg`].
 ///
 /// The caller validates the reflector string into `LinkArg` first so
@@ -2420,6 +2462,22 @@ async fn dstar_poll_cycle(session: &mut DStarSession) {
             print_reflector_event(&event);
         }
         relay_reflector_to_radio(session, &event).await;
+
+        // Auto-reconnect on keepalive inactivity. The other disconnect
+        // reasons (`Rejected`, `UnlinkAcked`, `DisconnectTimeout`)
+        // reflect deliberate or terminal closures — never retry those
+        // automatically.
+        if matches!(
+            event,
+            RuntimeEvent::Disconnected(DisconnectReason::KeepaliveInactivity)
+        ) {
+            // Drop the dead session handle before reconnecting; the
+            // underlying loop has already exited and any further
+            // `next_event` would return `None` anyway.
+            session.reflector = None;
+            try_reconnect_reflector(session).await;
+            break;
+        }
     }
 
     // Poll radio — drain MMDVM responses (ACK/NAK/status + PTT voice).
@@ -2516,8 +2574,8 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
             match session.gateway.poll_status().await {
                 Ok(status) => println!(
                     "Modem status: D-STAR buffer {}, transmit {}.",
-                    status.dstar_buffer,
-                    if status.tx { "active" } else { "idle" }
+                    status.dstar_space,
+                    if status.tx() { "active" } else { "idle" }
                 ),
                 Err(e) => println!("Error: {e}"),
             }
@@ -2571,8 +2629,7 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
                 } else {
                     text
                 };
-                session.tx_slow_data =
-                    DStarGateway::<EitherTransport>::encode_text_message(&truncated);
+                session.tx_slow_data = encode_text_message(&truncated);
                 session.tx_slow_data_idx = 0;
                 println!(
                     "Outgoing text set: \"{truncated}\". \
@@ -2612,7 +2669,7 @@ fn finish_echo_recording(session: &mut DStarSession) {
 /// a clear break between their TX and the playback.
 const ECHO_REPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Build the outbound reflector [`CoreDStarHeader`] from the
+/// Build the outbound reflector [`DStarHeader`] from the
 /// kenwood-thd75 header emitted by the radio.
 ///
 /// The TH-D75 in Reflector Terminal Mode emits its TX header with
@@ -2647,8 +2704,8 @@ fn build_reflector_header(
     local_module: Module,
     reflector_callsign: Callsign,
     reflector_module: Module,
-    header: &kenwood_thd75::DStarHeader,
-) -> CoreDStarHeader {
+    header: &DStarHeader,
+) -> DStarHeader {
     // rpt1 = operator's own callsign + local module letter.
     let mut rpt1_buf = [b' '; 8];
     let cs_bytes = station_callsign.as_bytes();
@@ -2665,15 +2722,14 @@ fn build_reflector_header(
     rpt2_buf[7] = reflector_module.as_byte();
     let rpt2 = Callsign::from_wire_bytes(rpt2_buf);
 
-    // Convert the kenwood-thd75 header's string fields into typed
-    // wire-format callsigns. If the radio emits an unexpectedly
-    // malformed field, fall back to a safe default rather than
-    // dropping the relay altogether.
-    let my_call = Callsign::try_from_str(header.my_call.trim()).unwrap_or(station_callsign);
-    let my_suffix = Suffix::try_from_str(header.my_suffix.trim()).unwrap_or(Suffix::EMPTY);
+    // The source header already carries typed Callsign/Suffix fields,
+    // so my_call / my_suffix pass through unchanged. ur_call is forced
+    // to CQCQCQ per the hotspot-to-reflector relay convention.
+    let my_call = header.my_call;
+    let my_suffix = header.my_suffix;
     let ur_call = Callsign::try_from_str("CQCQCQ").expect("static constant");
 
-    CoreDStarHeader {
+    DStarHeader {
         flag1: header.flag1,
         flag2: header.flag2,
         flag3: header.flag3,
@@ -2695,15 +2751,15 @@ async fn relay_radio_to_reflector(session: &mut DStarSession, event: &DStarEvent
     // Echo test interception: either the `echo` command armed it, or
     // URCALL is "       E" (per ircDDBGateway convention).
     if let DStarEvent::VoiceStart(header) = event
-        && (session.echo_armed || header.ur_call.trim() == "E")
+        && (session.echo_armed || header.ur_call.as_str().trim() == "E")
     {
         session.echo_armed = false;
         println!(
             "Echo test: recording from {}. Transmit up to 60 seconds.",
-            header.my_call.trim()
+            header.my_call.as_str().trim()
         );
         session.echo = EchoState::Recording {
-            header: header.clone(),
+            header: *header,
             frames: Vec::with_capacity(256),
         };
         return;
@@ -2716,7 +2772,7 @@ async fn relay_radio_to_reflector(session: &mut DStarSession, event: &DStarEvent
                 if let EchoState::Recording { frames, .. } = &mut session.echo
                     && frames.len() < ECHO_MAX_FRAMES
                 {
-                    frames.push(frame.clone());
+                    frames.push(*frame);
                 }
                 return;
             }
@@ -2783,7 +2839,7 @@ async fn relay_radio_to_reflector(session: &mut DStarSession, event: &DStarEvent
                 session.tx_slow_data_idx += 1;
                 sd
             };
-            let ref_frame = CoreVoiceFrame {
+            let ref_frame = VoiceFrame {
                 ambe: frame.ambe,
                 slow_data,
             };
@@ -2830,15 +2886,15 @@ async fn echo_playback_tick(session: &mut DStarSession) {
 
     // Build the echo playback header per ircDDBGateway EchoUnit.cpp:
     // MY = gateway callsign, MY suffix = "ECHO", YOUR = "CQCQCQ  ".
-    let echo_header = kenwood_thd75::DStarHeader {
+    let echo_header = DStarHeader {
         flag1: header.flag1,
         flag2: header.flag2,
         flag3: header.flag3,
-        rpt2: header.rpt2.clone(),
-        rpt1: header.rpt1.clone(),
-        ur_call: "CQCQCQ  ".to_owned(),
-        my_call: format!("{:<8}", session.callsign.as_str()),
-        my_suffix: "ECHO".to_owned(),
+        rpt2: header.rpt2,
+        rpt1: header.rpt1,
+        ur_call: Callsign::try_from_str("CQCQCQ").expect("static constant"),
+        my_call: session.callsign,
+        my_suffix: Suffix::try_from_str("ECHO").expect("static constant"),
     };
 
     // Send header to radio.
@@ -2949,20 +3005,9 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             // operator's message verbatim.
             session.rx_slow_data.reset();
             session.rx_last_slow_text = None;
-            // Convert typed core header to kenwood-thd75 header.
-            // Both sides are already ASCII-validated so
-            // `String::from_utf8_lossy` is a cheap direct conversion.
-            let radio_header = kenwood_thd75::DStarHeader {
-                flag1: header.flag1,
-                flag2: header.flag2,
-                flag3: header.flag3,
-                rpt2: String::from_utf8_lossy(header.rpt2.as_bytes()).into_owned(),
-                rpt1: String::from_utf8_lossy(header.rpt1.as_bytes()).into_owned(),
-                ur_call: String::from_utf8_lossy(header.ur_call.as_bytes()).into_owned(),
-                my_call: String::from_utf8_lossy(header.my_call.as_bytes()).into_owned(),
-                my_suffix: String::from_utf8_lossy(header.my_suffix.as_bytes()).into_owned(),
-            };
-            if let Err(e) = gw.send_header(&radio_header).await {
+            // Radio-side gateway now takes the same core DStarHeader —
+            // no translation needed.
+            if let Err(e) = gw.send_header(header).await {
                 println!(
                     "{}",
                     thd75_repl::output::error(format_args!("relaying header to radio: {e}"))
@@ -2973,7 +3018,7 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             // Feed the raw seq byte from the DSVT header; the decoder
             // treats seq==0 as a sync frame and re-aligns its half-block
             // phase automatically. No external skipping needed.
-            session.rx_slow_data.add_frame(&frame.slow_data, *seq);
+            session.rx_slow_data.push(frame.slow_data, *seq);
             // D-STAR radios repeat the 20-char text message across
             // the voice stream continuously (~320 ms per full cycle)
             // so late joiners can see it. The decoder correctly
@@ -2989,10 +3034,6 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
                 session.rx_last_slow_text = Some(bytes);
             }
 
-            let radio_frame = kenwood_thd75::DStarVoiceFrame {
-                ambe: frame.ambe,
-                slow_data: frame.slow_data,
-            };
             // Use send_voice_unpaced — no host-side pacing. The
             // correct pattern per `ref/MMDVMHost/Modem.cpp:1049` is
             // to query the modem's `dstarSpace` status field and
@@ -3023,10 +3064,11 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             // superframe followed by 400 ms idle) no longer
             // applies.
             //
-            // Proper fix: implement MMDVMHost-style periodic
-            // status polling and gate writes on
-            // `ModemStatus::dstar_buffer`. Tracked as future work.
-            if let Err(e) = gw.send_voice_unpaced(&radio_frame).await {
+            // The mmdvm crate already implements MMDVMHost-style
+            // periodic status polling and gates its TxQueue drain on
+            // `ModemStatus::dstar_space`, so this path is effectively
+            // as close to the reference behavior as we can get.
+            if let Err(e) = gw.send_voice_unpaced(frame).await {
                 println!(
                     "{}",
                     thd75_repl::output::error(format_args!("relaying voice to radio: {e}"))
@@ -3064,10 +3106,31 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
 /// Announce a complete D-STAR slow data text message from a reflector stream.
 ///
 /// `bytes` is the fixed 20-byte buffer returned by
-/// [`SlowDataDecoder::take_message`]. Trailing spaces and non-printable
+/// [`SlowDataTextCollector::take_message`]. Trailing spaces and non-printable
 /// characters are stripped before display so screen readers don't
 /// announce padding.
 fn print_slow_data_text_message(bytes: &[u8; 20]) {
+    // Diagnostic: log the full 20-byte message in hex alongside the
+    // lossy-UTF-8 rendering. This closes the loop with the per-frame
+    // and per-block traces — together they let you reverse-engineer
+    // what an operator's non-standard slow-data scheme actually
+    // contains.
+    tracing::trace!(
+        target: "thd75_repl::reflector",
+        bytes_hex = format_args!(
+            "{:02X} {:02X} {:02X} {:02X} {:02X} | \
+             {:02X} {:02X} {:02X} {:02X} {:02X} | \
+             {:02X} {:02X} {:02X} {:02X} {:02X} | \
+             {:02X} {:02X} {:02X} {:02X} {:02X}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
+            bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
+            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+            bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
+        ),
+        text_lossy = format_args!("{:?}", String::from_utf8_lossy(bytes)),
+        "slow-data text message assembled"
+    );
+
     // Lossy UTF-8 is fine: the decoder already masks to 7-bit ASCII via
     // `& 0x7F`, but a rogue stream could still carry 0x00..0x1F control
     // bytes that we don't want to feed the terminal.
@@ -3117,11 +3180,23 @@ fn trace_reflector_event(event: &RuntimeEvent) {
                 "event: VoiceStart"
             );
         }
-        RuntimeEvent::VoiceFrame { stream_id, seq, .. } => {
+        RuntimeEvent::VoiceFrame {
+            stream_id,
+            seq,
+            frame,
+        } => {
+            // Slow-data bytes are logged raw (pre-descramble) so a
+            // packet capture can be cross-checked against the wire.
+            // Reverse-engineering a non-standard slow-data scheme
+            // (e.g. AMBEserver/Pi-Star variants) starts here.
             tracing::trace!(
                 target: "thd75_repl::reflector",
                 stream_id = %stream_id,
                 seq = *seq,
+                slow_data = format_args!(
+                    "{:02X} {:02X} {:02X}",
+                    frame.slow_data[0], frame.slow_data[1], frame.slow_data[2]
+                ),
                 "event: VoiceFrame"
             );
         }
@@ -3210,13 +3285,6 @@ fn trace_dstar_event(event: &DStarEvent) {
                 "event: TextMessage"
             );
         }
-        DStarEvent::GpsData(data) => {
-            tracing::trace!(
-                target: "thd75_repl::dstar",
-                bytes_len = data.len(),
-                "event: GpsData"
-            );
-        }
         DStarEvent::StationHeard(entry) => {
             tracing::trace!(
                 target: "thd75_repl::dstar",
@@ -3245,13 +3313,12 @@ fn trace_dstar_event(event: &DStarEvent) {
 fn print_dstar_event(event: &DStarEvent) {
     match event {
         DStarEvent::VoiceStart(header) => {
+            let my_call = header.my_call.as_str();
+            let my_suffix = header.my_suffix.as_str();
+            let ur_call = header.ur_call.as_str();
             aprintln!(
                 "{}",
-                thd75_repl::output::dstar_voice_start(
-                    &header.my_call,
-                    &header.my_suffix,
-                    &header.ur_call,
-                )
+                thd75_repl::output::dstar_voice_start(&my_call, &my_suffix, &ur_call,)
             );
         }
         DStarEvent::VoiceData(_) => {
@@ -3268,11 +3335,6 @@ fn print_dstar_event(event: &DStarEvent) {
         }
         DStarEvent::TextMessage(text) => {
             aprintln!("{}", thd75_repl::output::dstar_text_message(text));
-        }
-        DStarEvent::GpsData(data) => {
-            // GPS/DPRS data is raw NMEA-like bytes. Show as text if valid ASCII.
-            let text = String::from_utf8_lossy(data);
-            aprintln!("{}", thd75_repl::output::dstar_gps(text.trim()));
         }
         DStarEvent::StationHeard(entry) => {
             aprintln!(
@@ -3297,7 +3359,7 @@ fn print_dstar_event(event: &DStarEvent) {
         DStarEvent::StatusUpdate(status) => {
             println!(
                 "{}",
-                thd75_repl::output::dstar_modem_status(status.dstar_buffer, status.tx)
+                thd75_repl::output::dstar_modem_status(status.dstar_space, status.tx())
             );
         }
     }

@@ -1038,7 +1038,7 @@ pub(crate) struct App {
     /// Current D-STAR text message (from slow data).
     pub dstar_text_message: Option<String>,
     /// Current D-STAR RX header (gateway mode).
-    pub dstar_rx_header: Option<kenwood_thd75::DStarHeader>,
+    pub dstar_rx_header: Option<dstar_gateway_core::DStarHeader>,
     /// Whether a D-STAR voice transmission is active.
     pub dstar_rx_active: bool,
     /// D-STAR URCALL input buffer (when prompting).
@@ -3079,9 +3079,6 @@ impl App {
                 self.dstar_last_heard.insert(0, entry);
                 // Limit to 100 entries.
                 self.dstar_last_heard.truncate(100);
-            }
-            DStarEvent::GpsData(_gps) => {
-                // GPS/DPRS data from slow data — available for future display.
             }
             DStarEvent::UrCallCommand(action) => {
                 self.status_message = Some(format!("D-STAR: URCALL command detected: {action:?}"));
