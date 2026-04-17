@@ -12,7 +12,6 @@
 //! Broadcasting, SD Card, and Configuration.
 
 pub mod aprs;
-pub mod aprs_wire;
 pub mod band;
 pub mod bluetooth;
 pub mod channel;

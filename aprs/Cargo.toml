@@ -1,0 +1,23 @@
+[package]
+name = "aprs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "APRS protocol stack: parser, digipeater, SmartBeaconing, messaging, station list"
+license = "GPL-2.0-or-later"
+authors = ["swiftraccoon"]
+repository = "https://github.com/swiftraccoon/kenwood"
+keywords = ["aprs", "ham-radio", "packet-radio", "amateur-radio"]
+categories = ["encoding", "parser-implementations"]
+publish = false
+
+[dependencies]
+ax25-codec = { path = "../ax25-codec" }
+kiss-tnc = { path = "../kiss-tnc" }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

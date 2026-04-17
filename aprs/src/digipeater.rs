@@ -14,12 +14,21 @@
 //! that packets seen more than once within [`DigipeaterConfig::dedup_ttl`]
 //! are not re-transmitted, and it performs own-callsign loop detection to
 //! prevent relaying a packet that has already been through this station.
+//!
+//! # Time handling
+//!
+//! Per the crate-level convention, this module is sans-io and never calls
+//! `std::time::Instant::now()` internally. Every stateful method accepts
+//! a `now: Instant` parameter; callers (typically the tokio shell) read
+//! the wall clock once per iteration and thread it down.
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use super::{Ax25Address, Ax25Packet};
+use ax25_codec::{Ax25Address, Ax25Packet, Ssid};
+
+use crate::error::AprsError;
 
 /// Default rolling dedup window for digipeater retransmission suppression.
 ///
@@ -50,14 +59,10 @@ impl DigipeaterAlias {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::ValidationError::AprsWireOutOfRange`] on
-    /// invalid input.
-    pub fn new(s: &str) -> Result<Self, crate::error::ValidationError> {
+    /// Returns [`AprsError::InvalidDigipeaterAlias`] on invalid input.
+    pub fn new(s: &str) -> Result<Self, AprsError> {
         if s.is_empty() || !s.is_ascii() {
-            return Err(crate::error::ValidationError::AprsWireOutOfRange {
-                field: "DigipeaterAlias",
-                detail: "must be non-empty ASCII",
-            });
+            return Err(AprsError::InvalidDigipeaterAlias("must be non-empty ASCII"));
         }
         Ok(Self(s.to_ascii_uppercase()))
     }
@@ -123,7 +128,6 @@ pub struct DigipeaterConfig {
 impl DigipeaterConfig {
     /// Build a new config with an empty dedup cache and the default TTL.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)]
     pub fn new(
         callsign: Ax25Address,
         uidigipeat_aliases: Vec<String>,
@@ -147,8 +151,10 @@ impl DigipeaterConfig {
     /// Call this periodically (e.g. from the client event loop) to pick
     /// up relays whose viscous delay has expired without anyone else
     /// transmitting the same packet. Returns the frames ready to send.
-    pub fn drain_ready_viscous(&mut self) -> Vec<Ax25Packet> {
-        let now = Instant::now();
+    ///
+    /// The caller provides `now` so this module remains sans-io; pass the
+    /// same `Instant` used for the surrounding [`Self::process`] calls.
+    pub fn drain_ready_viscous(&mut self, now: Instant) -> Vec<Ax25Packet> {
         let delay = self.viscous_delay;
         let mut ready = Vec::new();
         let mut remaining = HashMap::new();
@@ -210,8 +216,12 @@ impl DigipeaterConfig {
     /// 5. On successful relay, the packet hash is recorded in the dedup
     ///    cache with the current time.
     ///
+    /// The caller provides `now` so this module remains sans-io. Passing
+    /// the same `Instant` to every stateful call in a single loop
+    /// iteration keeps timing invariants consistent.
+    ///
     /// Returns [`DigiAction::Drop`] if any check fails or no alias matches.
-    pub fn process(&mut self, packet: &Ax25Packet) -> DigiAction {
+    pub fn process(&mut self, packet: &Ax25Packet, now: Instant) -> DigiAction {
         // --- 1. UI frame check ---
         if packet.control != 0x03 || packet.protocol != 0xF0 {
             return DigiAction::NotUiFrame;
@@ -223,7 +233,7 @@ impl DigipeaterConfig {
         }
 
         // --- 3. Prune expired dedup entries and check ---
-        self.prune_dedup();
+        self.prune_dedup(now);
         let packet_hash = hash_packet_identity(packet);
         if self.dedup_cache.contains_key(&packet_hash) {
             return DigiAction::Duplicate;
@@ -236,7 +246,7 @@ impl DigipeaterConfig {
         if self.viscous_delay > Duration::from_secs(0)
             && self.pending_viscous.remove(&packet_hash).is_some()
         {
-            let _prev = self.dedup_cache.insert(packet_hash, Instant::now());
+            let _prev = self.dedup_cache.insert(packet_hash, now);
             return DigiAction::Duplicate;
         }
 
@@ -245,7 +255,12 @@ impl DigipeaterConfig {
             return DigiAction::Drop;
         };
 
-        let digi = &packet.digipeaters[first_unused];
+        let Some(digi) = packet.digipeaters.get(first_unused) else {
+            // `position` just returned `Some(first_unused)`, so this
+            // branch is unreachable; fall through as a drop to preserve
+            // the "no relay" invariant without panicking.
+            return DigiAction::Drop;
+        };
 
         let action = {
             let digi_str = format!("{digi}");
@@ -279,19 +294,18 @@ impl DigipeaterConfig {
                 // transmit (in `drain_ready_viscous`).
                 let _prev = self
                     .pending_viscous
-                    .insert(packet_hash, (Instant::now(), modified_packet.clone()));
+                    .insert(packet_hash, (now, modified_packet.clone()));
                 return DigiAction::Drop;
             }
-            let _previous = self.dedup_cache.insert(packet_hash, Instant::now());
+            let _previous = self.dedup_cache.insert(packet_hash, now);
         }
 
         action
     }
 
     /// Remove dedup entries older than [`Self::dedup_ttl`].
-    fn prune_dedup(&mut self) {
+    fn prune_dedup(&mut self, now: Instant) {
         let ttl = self.dedup_ttl;
-        let now = Instant::now();
         self.dedup_cache.retain(|_, t| now.duration_since(*t) < ttl);
     }
 
@@ -333,7 +347,15 @@ fn own_callsign_already_relayed(own: &Ax25Address, path: &[Ax25Address]) -> bool
 /// `UIdigipeat`: replace the alias entry with our callsign, marked as used.
 fn apply_uidigipeat(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> DigiAction {
     let mut modified = packet.clone();
-    modified.digipeaters[idx] = mark_used(callsign);
+    if let Some(slot) = modified.digipeaters.get_mut(idx) {
+        *slot = mark_used(callsign);
+    } else {
+        // Caller only invokes this with an `idx` produced by `position`
+        // on `packet.digipeaters`, so the slot is always present. If
+        // the packet has been mutated in the meantime, prefer a drop
+        // over a panic.
+        return DigiAction::Drop;
+    }
     DigiAction::Relay {
         modified_packet: modified,
     }
@@ -341,23 +363,28 @@ fn apply_uidigipeat(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> 
 
 /// `UIflood`: decrement the hop count. Mark as used when exhausted.
 fn apply_uiflood(packet: &Ax25Packet, idx: usize) -> DigiAction {
-    let digi = &packet.digipeaters[idx];
+    let Some(digi) = packet.digipeaters.get(idx) else {
+        return DigiAction::Drop;
+    };
     let new_ssid_raw = digi.ssid.get().saturating_sub(1);
     // SSID is already validated 0-15, and new_ssid_raw is strictly
-    // smaller, so `new(...)` cannot fail.
-    let new_ssid =
-        crate::types::aprs_wire::Ssid::new(new_ssid_raw).expect("decremented SSID stays in 0..=15");
+    // smaller, so `new(...)` cannot fail. Fall back to zero if the
+    // codec's validator ever disagrees.
+    let new_ssid = Ssid::new(new_ssid_raw).unwrap_or(Ssid::ZERO);
 
     let mut modified = packet.clone();
+    let Some(slot) = modified.digipeaters.get_mut(idx) else {
+        return DigiAction::Drop;
+    };
     if new_ssid_raw == 0 {
-        modified.digipeaters[idx] = mark_used(&Ax25Address {
+        *slot = mark_used(&Ax25Address {
             callsign: digi.callsign.clone(),
-            ssid: crate::types::aprs_wire::Ssid::ZERO,
+            ssid: Ssid::ZERO,
             repeated: false,
             c_bit: false,
         });
     } else {
-        modified.digipeaters[idx] = Ax25Address {
+        *slot = Ax25Address {
             callsign: digi.callsign.clone(),
             ssid: new_ssid,
             repeated: false,
@@ -376,10 +403,15 @@ fn apply_uitrace(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> Dig
         return DigiAction::Drop;
     }
 
-    let digi = &packet.digipeaters[idx];
-    let new_ssid_raw = digi.ssid.get().saturating_sub(1);
-    let new_ssid =
-        crate::types::aprs_wire::Ssid::new(new_ssid_raw).expect("decremented SSID stays in 0..=15");
+    // Snapshot the alias digipeater's callsign + current hop count;
+    // after `modified.digipeaters.insert` the indices shift and we can
+    // no longer borrow from the original slice without re-indexing.
+    let Some(source_digi) = packet.digipeaters.get(idx) else {
+        return DigiAction::Drop;
+    };
+    let alias_callsign = source_digi.callsign.clone();
+    let new_ssid_raw = source_digi.ssid.get().saturating_sub(1);
+    let new_ssid = Ssid::new(new_ssid_raw).unwrap_or(Ssid::ZERO);
 
     let mut modified = packet.clone();
 
@@ -388,16 +420,19 @@ fn apply_uitrace(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> Dig
 
     // The original entry shifted to idx+1; update its hop count.
     let trace_idx = idx + 1;
+    let Some(slot) = modified.digipeaters.get_mut(trace_idx) else {
+        return DigiAction::Drop;
+    };
     if new_ssid_raw == 0 {
-        modified.digipeaters[trace_idx] = mark_used(&Ax25Address {
-            callsign: digi.callsign.clone(),
-            ssid: crate::types::aprs_wire::Ssid::ZERO,
+        *slot = mark_used(&Ax25Address {
+            callsign: alias_callsign,
+            ssid: Ssid::ZERO,
             repeated: false,
             c_bit: false,
         });
     } else {
-        modified.digipeaters[trace_idx] = Ax25Address {
-            callsign: digi.callsign.clone(),
+        *slot = Ax25Address {
+            callsign: alias_callsign,
             ssid: new_ssid,
             repeated: false,
             c_bit: false,
@@ -436,6 +471,8 @@ fn mark_used(addr: &Ax25Address) -> Ax25Address {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     fn make_addr(call: &str, ssid: u8) -> Ax25Address {
         // If call ends with '*', strip it and set repeated=true.
         let (callsign, repeated) = call
@@ -469,147 +506,190 @@ mod tests {
     // ---- UIdigipeat tests ----
 
     #[test]
-    fn uidigipeat_matches_alias() {
+    fn uidigipeat_matches_alias() -> TestResult {
         let mut config = make_config();
         let packet = make_packet(vec![make_addr("WIDE1", 1), make_addr("WIDE2", 1)]);
+        let t0 = Instant::now();
 
-        match config.process(&packet) {
+        match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
-                assert_eq!(modified_packet.digipeaters[0].callsign, "MYDIGI");
-                assert!(modified_packet.digipeaters[0].repeated);
-                assert_eq!(modified_packet.digipeaters[0].ssid, 0);
+                let d0 = modified_packet
+                    .digipeaters
+                    .first()
+                    .ok_or("missing digi 0")?;
+                assert_eq!(d0.callsign, "MYDIGI");
+                assert!(d0.repeated);
+                assert_eq!(d0.ssid, 0);
                 // Second entry unchanged.
-                assert_eq!(modified_packet.digipeaters[1].callsign, "WIDE2");
-                assert_eq!(modified_packet.digipeaters[1].ssid, 1);
+                let d1 = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                assert_eq!(d1.callsign, "WIDE2");
+                assert_eq!(d1.ssid, 1);
             }
-            other => panic!("expected Relay, got {other:?}"),
+            other => return Err(format!("expected Relay, got {other:?}").into()),
         }
+        Ok(())
     }
 
     #[test]
-    fn uidigipeat_skips_used_entries() {
+    fn uidigipeat_skips_used_entries() -> TestResult {
         let mut config = make_config();
         let packet = make_packet(vec![make_addr("N1ABC*", 0), make_addr("WIDE1", 1)]);
+        let t0 = Instant::now();
 
-        match config.process(&packet) {
+        match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
                 // First entry untouched (already used).
-                assert_eq!(modified_packet.digipeaters[0].callsign, "N1ABC");
-                assert!(modified_packet.digipeaters[0].repeated);
+                let d0 = modified_packet
+                    .digipeaters
+                    .first()
+                    .ok_or("missing digi 0")?;
+                assert_eq!(d0.callsign, "N1ABC");
+                assert!(d0.repeated);
                 // Second entry replaced.
-                assert_eq!(modified_packet.digipeaters[1].callsign, "MYDIGI");
-                assert!(modified_packet.digipeaters[1].repeated);
+                let d1 = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                assert_eq!(d1.callsign, "MYDIGI");
+                assert!(d1.repeated);
             }
-            other => panic!("expected Relay, got {other:?}"),
+            other => return Err(format!("expected Relay, got {other:?}").into()),
         }
+        Ok(())
     }
 
     #[test]
     fn uidigipeat_no_match_drops() {
         let mut config = make_config();
         let packet = make_packet(vec![make_addr("RELAY", 0)]);
+        let t0 = Instant::now();
 
-        assert_eq!(config.process(&packet), DigiAction::Drop);
+        assert_eq!(config.process(&packet, t0), DigiAction::Drop);
     }
 
     #[test]
     fn uidigipeat_all_used_drops() {
         let mut config = make_config();
         let packet = make_packet(vec![make_addr("WIDE1*", 1)]);
+        let t0 = Instant::now();
 
-        assert_eq!(config.process(&packet), DigiAction::Drop);
+        assert_eq!(config.process(&packet, t0), DigiAction::Drop);
     }
 
     // ---- UIflood tests ----
 
     #[test]
-    fn uiflood_decrements_hop() {
+    fn uiflood_decrements_hop() -> TestResult {
         let mut config = make_config();
         let packet = make_packet(vec![make_addr("N1ABC*", 0), make_addr("CA", 3)]);
+        let t0 = Instant::now();
 
-        match config.process(&packet) {
+        match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
-                assert_eq!(modified_packet.digipeaters[1].callsign, "CA");
-                assert_eq!(modified_packet.digipeaters[1].ssid, 2);
+                let d1 = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                assert_eq!(d1.callsign, "CA");
+                assert_eq!(d1.ssid, 2);
             }
-            other => panic!("expected Relay, got {other:?}"),
+            other => return Err(format!("expected Relay, got {other:?}").into()),
         }
+        Ok(())
     }
 
     #[test]
-    fn uiflood_last_hop_marks_used() {
+    fn uiflood_last_hop_marks_used() -> TestResult {
         let mut config = make_config();
         let packet = make_packet(vec![make_addr("CA", 1)]);
+        let t0 = Instant::now();
 
-        match config.process(&packet) {
+        match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
-                assert_eq!(modified_packet.digipeaters[0].callsign, "CA");
-                assert!(modified_packet.digipeaters[0].repeated);
-                assert_eq!(modified_packet.digipeaters[0].ssid, 0);
+                let d0 = modified_packet
+                    .digipeaters
+                    .first()
+                    .ok_or("missing digi 0")?;
+                assert_eq!(d0.callsign, "CA");
+                assert!(d0.repeated);
+                assert_eq!(d0.ssid, 0);
             }
-            other => panic!("expected Relay, got {other:?}"),
+            other => return Err(format!("expected Relay, got {other:?}").into()),
         }
+        Ok(())
     }
 
     #[test]
     fn uiflood_zero_ssid_drops() {
         let mut config = make_config();
         let packet = make_packet(vec![make_addr("CA", 0)]);
+        let t0 = Instant::now();
 
-        assert_eq!(config.process(&packet), DigiAction::Drop);
+        assert_eq!(config.process(&packet, t0), DigiAction::Drop);
     }
 
     // ---- UItrace tests ----
 
     #[test]
-    fn uitrace_inserts_callsign_and_decrements() {
+    fn uitrace_inserts_callsign_and_decrements() -> TestResult {
         let mut config = make_config();
         let packet = make_packet(vec![make_addr("WIDE", 3)]);
+        let t0 = Instant::now();
 
-        match config.process(&packet) {
+        match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
                 assert_eq!(modified_packet.digipeaters.len(), 2);
                 // Our callsign inserted first, marked used.
-                assert_eq!(modified_packet.digipeaters[0].callsign, "MYDIGI");
-                assert!(modified_packet.digipeaters[0].repeated);
-                assert_eq!(modified_packet.digipeaters[0].ssid, 0);
+                let d0 = modified_packet
+                    .digipeaters
+                    .first()
+                    .ok_or("missing digi 0")?;
+                assert_eq!(d0.callsign, "MYDIGI");
+                assert!(d0.repeated);
+                assert_eq!(d0.ssid, 0);
                 // Original entry with decremented hop.
-                assert_eq!(modified_packet.digipeaters[1].callsign, "WIDE");
-                assert_eq!(modified_packet.digipeaters[1].ssid, 2);
+                let d1 = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                assert_eq!(d1.callsign, "WIDE");
+                assert_eq!(d1.ssid, 2);
             }
-            other => panic!("expected Relay, got {other:?}"),
+            other => return Err(format!("expected Relay, got {other:?}").into()),
         }
+        Ok(())
     }
 
     #[test]
-    fn uitrace_last_hop_marks_exhausted() {
+    fn uitrace_last_hop_marks_exhausted() -> TestResult {
         let mut config = make_config();
         let packet = make_packet(vec![make_addr("WIDE", 1)]);
+        let t0 = Instant::now();
 
-        match config.process(&packet) {
+        match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
                 assert_eq!(modified_packet.digipeaters.len(), 2);
-                assert_eq!(modified_packet.digipeaters[0].callsign, "MYDIGI");
-                assert!(modified_packet.digipeaters[0].repeated);
-                assert_eq!(modified_packet.digipeaters[1].callsign, "WIDE");
-                assert!(modified_packet.digipeaters[1].repeated);
-                assert_eq!(modified_packet.digipeaters[1].ssid, 0);
+                let d0 = modified_packet
+                    .digipeaters
+                    .first()
+                    .ok_or("missing digi 0")?;
+                assert_eq!(d0.callsign, "MYDIGI");
+                assert!(d0.repeated);
+                let d1 = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                assert_eq!(d1.callsign, "WIDE");
+                assert!(d1.repeated);
+                assert_eq!(d1.ssid, 0);
             }
-            other => panic!("expected Relay, got {other:?}"),
+            other => return Err(format!("expected Relay, got {other:?}").into()),
         }
+        Ok(())
     }
 
     #[test]
-    fn uitrace_full_path_drops() {
+    fn uitrace_full_path_drops() -> TestResult {
         let mut config = make_config();
         // 8 digipeaters = maximum, can't insert another.
         let mut digis: Vec<Ax25Address> = (0..8).map(|i| make_addr("USED*", i)).collect();
         // Replace last one with an unused WIDE entry.
-        digis[7] = make_addr("WIDE", 2);
+        let last = digis.get_mut(7).ok_or("missing digi 7")?;
+        *last = make_addr("WIDE", 2);
 
         // But the first unused is at index 7, and there are already 8 entries.
         let packet = make_packet(digis);
-        assert_eq!(config.process(&packet), DigiAction::Drop);
+        let t0 = Instant::now();
+        assert_eq!(config.process(&packet, t0), DigiAction::Drop);
+        Ok(())
     }
 
     // ---- Edge cases ----
@@ -619,20 +699,22 @@ mod tests {
         let mut config = make_config();
         let mut packet = make_packet(vec![make_addr("WIDE1", 1)]);
         packet.control = 0x01; // Not a UI frame.
+        let t0 = Instant::now();
 
-        assert_eq!(config.process(&packet), DigiAction::NotUiFrame);
+        assert_eq!(config.process(&packet, t0), DigiAction::NotUiFrame);
     }
 
     #[test]
     fn empty_digipeater_path_drops() {
         let mut config = make_config();
         let packet = make_packet(vec![]);
+        let t0 = Instant::now();
 
-        assert_eq!(config.process(&packet), DigiAction::Drop);
+        assert_eq!(config.process(&packet, t0), DigiAction::Drop);
     }
 
     #[test]
-    fn case_insensitive_alias_match() {
+    fn case_insensitive_alias_match() -> TestResult {
         let mut config = DigipeaterConfig::new(
             make_addr("MYDIGI", 0),
             vec!["wide1-1".to_owned()],
@@ -640,15 +722,16 @@ mod tests {
             None,
         );
         let packet = make_packet(vec![make_addr("WIDE1", 1)]);
+        let t0 = Instant::now();
 
-        match config.process(&packet) {
-            DigiAction::Relay { .. } => {}
-            other => panic!("expected case-insensitive match, got {other:?}"),
+        match config.process(&packet, t0) {
+            DigiAction::Relay { .. } => Ok(()),
+            other => Err(format!("expected case-insensitive match, got {other:?}").into()),
         }
     }
 
     #[test]
-    fn uitrace_priority_over_flood_when_both_configured() {
+    fn uitrace_priority_over_flood_when_both_configured() -> TestResult {
         // If both uiflood and uitrace are configured for different aliases,
         // the correct one should match.
         let mut config = DigipeaterConfig::new(
@@ -658,28 +741,35 @@ mod tests {
             Some("WIDE".to_owned()),
         );
 
+        let t0 = Instant::now();
+
         // UIflood packet (distinct info so dedup doesn't fire between cases).
         let mut flood_pkt = make_packet(vec![make_addr("CA", 2)]);
         flood_pkt.info = b"!3518.00N/08414.00W-flood".to_vec();
-        match config.process(&flood_pkt) {
+        match config.process(&flood_pkt, t0) {
             DigiAction::Relay { modified_packet } => {
                 // Should NOT insert callsign (flood, not trace).
                 assert_eq!(modified_packet.digipeaters.len(), 1);
-                assert_eq!(modified_packet.digipeaters[0].ssid, 1);
+                let d0 = modified_packet
+                    .digipeaters
+                    .first()
+                    .ok_or("missing digi 0")?;
+                assert_eq!(d0.ssid, 1);
             }
-            other => panic!("expected flood relay, got {other:?}"),
+            other => return Err(format!("expected flood relay, got {other:?}").into()),
         }
 
         // UItrace packet.
         let mut trace_pkt = make_packet(vec![make_addr("WIDE", 2)]);
         trace_pkt.info = b"!3518.00N/08414.00W-trace".to_vec();
-        match config.process(&trace_pkt) {
+        match config.process(&trace_pkt, t0) {
             DigiAction::Relay { modified_packet } => {
                 // Should insert callsign (trace).
                 assert_eq!(modified_packet.digipeaters.len(), 2);
             }
-            other => panic!("expected trace relay, got {other:?}"),
+            other => return Err(format!("expected trace relay, got {other:?}").into()),
         }
+        Ok(())
     }
 
     // ---- Dedup cache tests ----
@@ -688,14 +778,18 @@ mod tests {
     fn duplicate_packet_within_window_is_dropped() {
         let mut config = make_config();
         let packet = make_packet(vec![make_addr("WIDE1", 1)]);
+        let t0 = Instant::now();
 
         // First sighting → relay.
-        assert!(matches!(config.process(&packet), DigiAction::Relay { .. }));
+        assert!(matches!(
+            config.process(&packet, t0),
+            DigiAction::Relay { .. }
+        ));
         assert_eq!(config.dedup_cache_len(), 1);
 
         // Second sighting within TTL → duplicate.
         let packet_2 = make_packet(vec![make_addr("WIDE1", 1)]);
-        assert_eq!(config.process(&packet_2), DigiAction::Duplicate);
+        assert_eq!(config.process(&packet_2, t0), DigiAction::Duplicate);
     }
 
     #[test]
@@ -705,10 +799,11 @@ mod tests {
         let mut p2 = make_packet(vec![make_addr("WIDE1", 1)]);
         p1.info = b"!3518.00N/08414.00W-one".to_vec();
         p2.info = b"!3518.00N/08414.00W-two".to_vec();
+        let t0 = Instant::now();
 
-        assert!(matches!(config.process(&p1), DigiAction::Relay { .. }));
+        assert!(matches!(config.process(&p1, t0), DigiAction::Relay { .. }));
         // Different info → different hash → should relay.
-        assert!(matches!(config.process(&p2), DigiAction::Relay { .. }));
+        assert!(matches!(config.process(&p2, t0), DigiAction::Relay { .. }));
     }
 
     #[test]
@@ -718,10 +813,18 @@ mod tests {
         config.dedup_ttl = Duration::from_secs(0);
 
         let packet = make_packet(vec![make_addr("WIDE1", 1)]);
-        assert!(matches!(config.process(&packet), DigiAction::Relay { .. }));
+        let t0 = Instant::now();
+        assert!(matches!(
+            config.process(&packet, t0),
+            DigiAction::Relay { .. }
+        ));
         // With zero TTL the previous entry is pruned, so the same packet
-        // can be relayed again.
-        assert!(matches!(config.process(&packet), DigiAction::Relay { .. }));
+        // can be relayed again — pass the same instant to force the
+        // pruning branch (`now.duration_since(t) < 0s` is false).
+        assert!(matches!(
+            config.process(&packet, t0),
+            DigiAction::Relay { .. }
+        ));
     }
 
     #[test]
@@ -729,9 +832,10 @@ mod tests {
         let mut config = make_config();
         config.viscous_delay = Duration::from_secs(5);
         let packet = make_packet(vec![make_addr("WIDE1", 1)]);
+        let t0 = Instant::now();
         // With viscous_delay enabled, the first sighting is deferred.
-        assert_eq!(config.process(&packet), DigiAction::Drop);
-        assert_eq!(config.drain_ready_viscous().len(), 0);
+        assert_eq!(config.process(&packet, t0), DigiAction::Drop);
+        assert_eq!(config.drain_ready_viscous(t0).len(), 0);
     }
 
     #[test]
@@ -739,12 +843,13 @@ mod tests {
         let mut config = make_config();
         config.viscous_delay = Duration::from_secs(5);
         let packet = make_packet(vec![make_addr("WIDE1", 1)]);
+        let t0 = Instant::now();
         // Defer.
-        assert_eq!(config.process(&packet), DigiAction::Drop);
+        assert_eq!(config.process(&packet, t0), DigiAction::Drop);
         // Same packet arrives again (someone else relayed).
-        assert_eq!(config.process(&packet), DigiAction::Duplicate);
+        assert_eq!(config.process(&packet, t0), DigiAction::Duplicate);
         // Drained queue is empty because the pending relay was cancelled.
-        assert_eq!(config.drain_ready_viscous().len(), 0);
+        assert_eq!(config.drain_ready_viscous(t0).len(), 0);
     }
 
     #[test]
@@ -752,7 +857,11 @@ mod tests {
         let mut config = make_config();
         config.viscous_delay = Duration::from_secs(0);
         let packet = make_packet(vec![make_addr("WIDE1", 1)]);
-        assert!(matches!(config.process(&packet), DigiAction::Relay { .. }));
+        let t0 = Instant::now();
+        assert!(matches!(
+            config.process(&packet, t0),
+            DigiAction::Relay { .. }
+        ));
     }
 
     #[test]
@@ -760,7 +869,8 @@ mod tests {
         let mut config = make_config(); // our callsign is MYDIGI
         // Packet already shows us as a used digi — must not be re-relayed.
         let packet = make_packet(vec![make_addr("MYDIGI*", 0), make_addr("WIDE2", 1)]);
-        assert_eq!(config.process(&packet), DigiAction::LoopDetected);
+        let t0 = Instant::now();
+        assert_eq!(config.process(&packet, t0), DigiAction::LoopDetected);
     }
 
     #[test]
@@ -769,6 +879,58 @@ mod tests {
         // Our callsign appears later in the path but the first entry is an
         // alias we should handle. The loop detector only trips on H-bit set.
         let packet = make_packet(vec![make_addr("WIDE1", 1), make_addr("MYDIGI", 0)]);
-        assert!(matches!(config.process(&packet), DigiAction::Relay { .. }));
+        let t0 = Instant::now();
+        assert!(matches!(
+            config.process(&packet, t0),
+            DigiAction::Relay { .. }
+        ));
+    }
+
+    // ---- Viscous drain timing ----
+
+    #[test]
+    fn drain_ready_viscous_returns_entries_past_delay() -> TestResult {
+        let mut config = make_config();
+        config.viscous_delay = Duration::from_secs(5);
+        let packet = make_packet(vec![make_addr("WIDE1", 1)]);
+        let t0 = Instant::now();
+        assert_eq!(config.process(&packet, t0), DigiAction::Drop);
+        // Still inside the delay window: nothing ready yet.
+        assert_eq!(config.drain_ready_viscous(t0).len(), 0);
+        // Past the delay window: the pending relay is returned.
+        let later = t0 + Duration::from_secs(6);
+        let ready = config.drain_ready_viscous(later);
+        assert_eq!(ready.len(), 1);
+        let p = ready.first().ok_or("missing ready packet")?;
+        // Our callsign was inserted by UIdigipeat substitution.
+        let d0 = p.digipeaters.first().ok_or("missing digi 0")?;
+        assert_eq!(d0.callsign, "MYDIGI");
+        Ok(())
+    }
+
+    // ---- DigipeaterAlias ----
+
+    #[test]
+    fn alias_rejects_empty() {
+        assert!(matches!(
+            DigipeaterAlias::new(""),
+            Err(AprsError::InvalidDigipeaterAlias(_))
+        ));
+    }
+
+    #[test]
+    fn alias_rejects_non_ascii() {
+        assert!(matches!(
+            DigipeaterAlias::new("CA\u{00E9}"),
+            Err(AprsError::InvalidDigipeaterAlias(_))
+        ));
+    }
+
+    #[test]
+    fn alias_uppercases_input() -> TestResult {
+        let a = DigipeaterAlias::new("wide1-1")?;
+        assert_eq!(a.as_str(), "WIDE1-1");
+        assert_eq!(format!("{a}"), "WIDE1-1");
+        Ok(())
     }
 }

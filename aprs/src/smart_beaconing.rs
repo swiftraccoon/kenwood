@@ -28,6 +28,13 @@
 //! | 544 | Turn Slope   | 26       | `turn_slope` |
 //! | 545 | Turn Thresh  | 28°      | `turn_min_deg` |
 //! | 546 | Turn Time    | 30 s     | `turn_time_secs` |
+//!
+//! # Time handling
+//!
+//! Per the crate-level convention, this module is sans-io and never calls
+//! `std::time::Instant::now()` internally. Every stateful method accepts
+//! a `now: Instant` parameter; callers (typically the tokio shell) read
+//! the wall clock once per iteration and thread it down.
 
 use std::time::{Duration, Instant};
 
@@ -60,23 +67,6 @@ pub struct SmartBeaconingConfig {
     /// Minimum time between turn-triggered beacons (seconds). Default: 15.
     /// Corresponds to TH-D75 Menu 546 (Turn Time).
     pub turn_time_secs: u32,
-}
-
-impl From<crate::types::McpSmartBeaconingConfig> for SmartBeaconingConfig {
-    /// Convert a radio-memory `SmartBeaconing` config (mph/seconds) to
-    /// the runtime form (`km/h` / seconds / `f64`).
-    fn from(mcp: crate::types::McpSmartBeaconingConfig) -> Self {
-        const MPH_TO_KMH: f64 = 1.609_344;
-        Self {
-            low_speed_kmh: f64::from(mcp.low_speed) * MPH_TO_KMH,
-            high_speed_kmh: f64::from(mcp.high_speed) * MPH_TO_KMH,
-            slow_rate_secs: u32::from(mcp.slow_rate),
-            fast_rate_secs: u32::from(mcp.fast_rate),
-            turn_slope: u16::from(mcp.turn_slope),
-            turn_min_deg: f64::from(mcp.turn_angle),
-            turn_time_secs: u32::from(mcp.turn_time),
-        }
-    }
 }
 
 impl Default for SmartBeaconingConfig {
@@ -167,18 +157,27 @@ impl SmartBeaconing {
     }
 
     /// Check if a beacon should be sent now, given current speed and course.
+    ///
+    /// `now` is the current wall-clock time, injected by the caller so
+    /// this module remains sans-io.
     #[must_use]
-    pub fn should_beacon(&mut self, speed_kmh: f64, course_deg: f64) -> bool {
-        self.beacon_reason(speed_kmh, course_deg).is_some()
+    pub fn should_beacon(&mut self, speed_kmh: f64, course_deg: f64, now: Instant) -> bool {
+        self.beacon_reason(speed_kmh, course_deg, now).is_some()
     }
 
     /// Classify why (if at all) a beacon is due at the current speed and
     /// course. Returns `None` if no beacon should be sent yet, otherwise
     /// a [`BeaconReason`] identifying which condition tripped.
+    ///
+    /// `now` is the current wall-clock time, injected by the caller so
+    /// this module remains sans-io.
     #[must_use]
-    pub fn beacon_reason(&mut self, speed_kmh: f64, course_deg: f64) -> Option<BeaconReason> {
-        let now = Instant::now();
-
+    pub fn beacon_reason(
+        &mut self,
+        speed_kmh: f64,
+        course_deg: f64,
+        now: Instant,
+    ) -> Option<BeaconReason> {
         // First beacon: always send.
         let BeaconState::Running {
             last_beacon_time,
@@ -226,9 +225,11 @@ impl SmartBeaconing {
     }
 
     /// Mark that a beacon was just sent. Updates the internal state
-    /// with the current time, preserving any previously-recorded course
+    /// with the supplied time, preserving any previously-recorded course
     /// and speed.
-    pub fn beacon_sent(&mut self) {
+    ///
+    /// `now` is the wall-clock time at which the beacon was sent.
+    pub const fn beacon_sent(&mut self, now: Instant) {
         let (prev_course, prev_speed) = match self.state {
             BeaconState::Uninitialized => (None, None),
             BeaconState::Running {
@@ -238,16 +239,18 @@ impl SmartBeaconing {
             } => (last_course, last_speed),
         };
         self.state = BeaconState::Running {
-            last_beacon_time: Instant::now(),
+            last_beacon_time: now,
             last_course: prev_course,
             last_speed: prev_speed,
         };
     }
 
     /// Mark that a beacon was just sent with the given speed and course.
-    pub fn beacon_sent_with(&mut self, speed_kmh: f64, course_deg: f64) {
+    ///
+    /// `now` is the wall-clock time at which the beacon was sent.
+    pub const fn beacon_sent_with(&mut self, speed_kmh: f64, course_deg: f64, now: Instant) {
         self.state = BeaconState::Running {
-            last_beacon_time: Instant::now(),
+            last_beacon_time: now,
             last_course: Some(course_deg),
             last_speed: Some(speed_kmh),
         };
@@ -285,7 +288,11 @@ impl SmartBeaconing {
             f64::from(self.config.slow_rate_secs) - f64::from(self.config.fast_rate_secs);
         let fraction = (speed_kmh - self.config.low_speed_kmh) / speed_range;
 
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "interval is bounded by slow_rate_secs (u32) and fraction is in [0,1]"
+        )]
         let interval = fraction.mul_add(-rate_range, f64::from(self.config.slow_rate_secs)) as u32;
         interval
     }
@@ -304,6 +311,8 @@ fn heading_delta(a: f64, b: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
     fn default_config_values() {
@@ -339,8 +348,9 @@ mod tests {
 
     #[test]
     fn first_beacon_always_true() {
+        let t0 = Instant::now();
         let mut sb = SmartBeaconing::new(SmartBeaconingConfig::default());
-        assert!(sb.should_beacon(0.0, 0.0));
+        assert!(sb.should_beacon(0.0, 0.0, t0));
     }
 
     #[test]
@@ -374,45 +384,51 @@ mod tests {
 
     #[test]
     fn current_interval_with_speed_data() {
+        let t0 = Instant::now();
         let mut sb = SmartBeaconing::new(SmartBeaconingConfig::default());
-        sb.beacon_sent_with(70.0, 0.0);
+        sb.beacon_sent_with(70.0, 0.0, t0);
         assert_eq!(sb.current_interval_secs(), 180);
     }
 
     #[test]
     fn beacon_sent_updates_state() {
+        let t0 = Instant::now();
         let mut sb = SmartBeaconing::new(SmartBeaconingConfig::default());
         assert!(matches!(sb.state(), BeaconState::Uninitialized));
-        sb.beacon_sent();
+        sb.beacon_sent(t0);
         assert!(matches!(sb.state(), BeaconState::Running { .. }));
     }
 
     #[test]
-    fn beacon_sent_with_stores_course_and_speed() {
+    fn beacon_sent_with_stores_course_and_speed() -> TestResult {
+        let t0 = Instant::now();
         let mut sb = SmartBeaconing::new(SmartBeaconingConfig::default());
-        sb.beacon_sent_with(50.0, 270.0);
-        match sb.state() {
-            BeaconState::Running {
-                last_course,
-                last_speed,
-                ..
-            } => {
-                assert!((last_speed.unwrap() - 50.0).abs() < f64::EPSILON);
-                assert!((last_course.unwrap() - 270.0).abs() < f64::EPSILON);
-            }
-            BeaconState::Uninitialized => panic!("expected Running state"),
-        }
+        sb.beacon_sent_with(50.0, 270.0, t0);
+        let BeaconState::Running {
+            last_course,
+            last_speed,
+            ..
+        } = sb.state()
+        else {
+            return Err("expected Running state".into());
+        };
+        let speed = last_speed.ok_or("expected last_speed to be Some")?;
+        let course = last_course.ok_or("expected last_course to be Some")?;
+        assert!((speed - 50.0).abs() < f64::EPSILON);
+        assert!((course - 270.0).abs() < f64::EPSILON);
+        Ok(())
     }
 
     #[test]
     fn no_beacon_immediately_after_send() {
+        let t0 = Instant::now();
         let mut sb = SmartBeaconing::new(SmartBeaconingConfig::default());
         // First beacon is always true.
-        assert!(sb.should_beacon(0.0, 0.0));
-        sb.beacon_sent_with(0.0, 0.0);
+        assert!(sb.should_beacon(0.0, 0.0, t0));
+        sb.beacon_sent_with(0.0, 0.0, t0);
 
         // Immediately after, should not beacon (interval not elapsed).
-        assert!(!sb.should_beacon(0.0, 0.0));
+        assert!(!sb.should_beacon(0.0, 0.0, t0));
     }
 
     #[test]
@@ -436,47 +452,84 @@ mod tests {
 
     #[test]
     fn turn_beacon_not_triggered_at_low_speed() {
+        let t0 = Instant::now();
         let mut sb = SmartBeaconing::new(SmartBeaconingConfig {
             turn_time_secs: 0, // No minimum turn time for test simplicity.
             ..SmartBeaconingConfig::default()
         });
 
         // Send initial beacon heading north.
-        assert!(sb.should_beacon(3.0, 0.0));
-        sb.beacon_sent_with(3.0, 0.0);
+        assert!(sb.should_beacon(3.0, 0.0, t0));
+        sb.beacon_sent_with(3.0, 0.0, t0);
 
         // Large heading change but at low speed — should NOT trigger.
-        assert!(!sb.should_beacon(3.0, 90.0));
+        assert!(!sb.should_beacon(3.0, 90.0, t0));
     }
 
     #[test]
     fn turn_beacon_triggered_at_high_speed() {
+        let t0 = Instant::now();
         let mut sb = SmartBeaconing::new(SmartBeaconingConfig {
             turn_time_secs: 0, // No minimum turn time for test simplicity.
             ..SmartBeaconingConfig::default()
         });
 
         // Send initial beacon heading north at high speed.
-        assert!(sb.should_beacon(75.0, 0.0));
-        sb.beacon_sent_with(75.0, 0.0);
+        assert!(sb.should_beacon(75.0, 0.0, t0));
+        sb.beacon_sent_with(75.0, 0.0, t0);
 
         // Course change above turn_threshold (28 deg) at high speed
         // should trigger an immediate beacon.
-        assert!(sb.should_beacon(75.0, 45.0));
+        assert!(sb.should_beacon(75.0, 45.0, t0));
     }
 
     #[test]
     fn turn_beacon_below_threshold_no_trigger() {
+        let t0 = Instant::now();
         let mut sb = SmartBeaconing::new(SmartBeaconingConfig {
             turn_time_secs: 0,
             ..SmartBeaconingConfig::default()
         });
 
         // Send initial beacon heading north at high speed.
-        assert!(sb.should_beacon(75.0, 0.0));
-        sb.beacon_sent_with(75.0, 0.0);
+        assert!(sb.should_beacon(75.0, 0.0, t0));
+        sb.beacon_sent_with(75.0, 0.0, t0);
 
         // Course change below turn_threshold (28 deg) should NOT trigger.
-        assert!(!sb.should_beacon(75.0, 20.0));
+        assert!(!sb.should_beacon(75.0, 20.0, t0));
+    }
+
+    #[test]
+    fn time_expired_triggers_beacon_after_interval() {
+        let t0 = Instant::now();
+        let mut sb = SmartBeaconing::new(SmartBeaconingConfig::default());
+        assert!(sb.should_beacon(0.0, 0.0, t0));
+        sb.beacon_sent_with(0.0, 0.0, t0);
+
+        // At low speed, slow_rate is 1800 secs. Advance past interval.
+        let later = t0 + Duration::from_secs(1801);
+        assert_eq!(
+            sb.beacon_reason(0.0, 0.0, later),
+            Some(BeaconReason::TimeExpired),
+        );
+    }
+
+    #[test]
+    fn turn_time_gates_turn_beacon() {
+        let t0 = Instant::now();
+        let mut sb = SmartBeaconing::new(SmartBeaconingConfig::default());
+        // Default turn_time_secs is 15 — less than 15 secs and the turn
+        // beacon is suppressed even when the angle threshold is met.
+        assert!(sb.should_beacon(75.0, 0.0, t0));
+        sb.beacon_sent_with(75.0, 0.0, t0);
+
+        // 5 seconds after the beacon, a 45-degree turn should NOT fire —
+        // the turn_time_secs gate is still closed.
+        let t5 = t0 + Duration::from_secs(5);
+        assert_eq!(sb.beacon_reason(75.0, 45.0, t5), None);
+
+        // 16 seconds after, the gate is open and the turn beacon fires.
+        let t16 = t0 + Duration::from_secs(16);
+        assert_eq!(sb.beacon_reason(75.0, 45.0, t16), Some(BeaconReason::Turn));
     }
 }

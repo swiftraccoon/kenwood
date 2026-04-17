@@ -1,0 +1,21 @@
+[package]
+name = "ax25-codec"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "AX.25 v2.2 frame encode/decode codec"
+license = "GPL-2.0-or-later"
+authors = ["swiftraccoon"]
+repository = "https://github.com/swiftraccoon/kenwood"
+keywords = ["ax25", "ham-radio", "packet-radio", "amateur-radio"]
+categories = ["encoding", "parser-implementations", "no-std"]
+publish = false
+
+[dependencies]
+thiserror = { version = "2", default-features = false }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

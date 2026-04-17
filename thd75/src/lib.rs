@@ -57,12 +57,12 @@
 //! - [`protocol`] — Pure-logic CAT command codec (serialize / parse).
 //! - [`transport`] — Async I/O trait and serial / mock implementations.
 //! - [`radio`] — High-level async API wrapping the protocol and transport layers.
-//! - [`kiss`] — KISS TNC framing, AX.25 packet parsing, and APRS position decoding.
+//! - [`aprs`] — KISS TNC framing, AX.25 packet parsing, and APRS position decoding.
 //! - [`mmdvm`] — MMDVM serial protocol codec, D-STAR header, and slow data decoder.
 //! - [`error`] — Error types for transport, protocol, and validation failures.
 
+pub mod aprs;
 pub mod error;
-pub mod kiss;
 pub mod memory;
 pub mod mmdvm;
 pub mod protocol;
@@ -82,25 +82,30 @@ pub use transport::{EitherTransport, MockTransport, SerialTransport, Transport};
 // Memory image re-exports.
 pub use memory::{MemoryError, MemoryImage};
 
-// KISS / AX.25 / APRS re-exports.
-pub use kiss::{
-    AprsData, AprsDataExtension, AprsError, AprsItem, AprsMessage, AprsObject, AprsPosition,
-    AprsQuery, AprsStatus, AprsTelemetry, AprsWeather, Ax25Address, Ax25Error, Ax25Packet,
-    KissError, KissFrame, Phg, build_aprs_item, build_aprs_message, build_aprs_mice,
-    build_aprs_object, build_aprs_position_compressed, build_aprs_position_report,
-    build_aprs_status, build_aprs_weather, build_query_response_position, parse_aprs_extensions,
+// Generic crate re-exports at crate root for consumer convenience.
+//
+// These let existing downstream code keep using `kenwood_thd75::AprsClient`,
+// `kenwood_thd75::KissFrame`, etc. without importing the generic crates
+// directly. The items themselves live in `kiss-tnc`, `ax25-codec`, `aprs`,
+// and `aprs-is`; inside this crate, use those crate paths directly rather
+// than routing through these re-exports.
+pub use ::aprs::{
+    AprsData, AprsDataExtension, AprsError, AprsItem, AprsMessage, AprsMessenger, AprsObject,
+    AprsPosition, AprsQuery, AprsStatus, AprsTelemetry, AprsWeather, DigiAction, DigipeaterConfig,
+    Phg, SmartBeaconing, SmartBeaconingConfig, StationEntry, StationList, build_aprs_item,
+    build_aprs_message, build_aprs_mice, build_aprs_object, build_aprs_position_compressed,
+    build_aprs_position_report, build_aprs_status, build_aprs_weather,
+    build_query_response_position, parse_aprs_extensions,
 };
+pub use aprs_is::{
+    AprsIsClient, AprsIsConfig, AprsIsError, AprsIsEvent, aprs_is_passcode, build_login_string,
+    format_is_packet, parse_is_line,
+};
+pub use ax25_codec::{Ax25Address, Ax25Error, Ax25Packet};
+pub use kiss_tnc::{KissError, KissFrame};
 
-// APRS feature re-exports.
-pub use kiss::aprs_client::{AprsClient, AprsClientConfig, AprsEvent};
-pub use kiss::aprs_is::{
-    AprsIsConfig, aprs_is_passcode, build_login_string, format_is_packet, parse_is_line,
-};
-pub use kiss::aprs_is_client::{AprsIsClient, AprsIsError, AprsIsEvent};
-pub use kiss::aprs_messaging::AprsMessenger;
-pub use kiss::digipeater::{DigiAction, DigipeaterConfig};
-pub use kiss::smart_beaconing::{SmartBeaconing, SmartBeaconingConfig};
-pub use kiss::station_list::{StationEntry, StationList};
+// D75-specific re-exports.
+pub use aprs::client::{AprsClient, AprsClientConfig, AprsEvent};
 
 // KISS session re-export.
 pub use radio::kiss_session::KissSession;

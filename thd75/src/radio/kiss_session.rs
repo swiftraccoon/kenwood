@@ -20,7 +20,7 @@
 //! let mut kiss = radio.enter_kiss(TncBaud::Bps1200).await.map_err(|(_, e)| e)?;
 //!
 //! // Send and receive KISS frames.
-//! use kenwood_thd75::kiss::{KissFrame, CMD_DATA};
+//! use kiss_tnc::{KissFrame, CMD_DATA};
 //! let frame = KissFrame { port: 0, command: CMD_DATA, data: vec![/* AX.25 */ ] };
 //! kiss.send_frame(&frame).await?;
 //!
@@ -32,11 +32,12 @@
 
 use std::time::Duration;
 
-use crate::error::{Error, ProtocolError, TransportError};
-use crate::kiss::{
-    self, CMD_DATA, CMD_FULL_DUPLEX, CMD_PERSISTENCE, CMD_RETURN, CMD_SET_HARDWARE, CMD_SLOT_TIME,
-    CMD_TX_DELAY, CMD_TX_TAIL, FEND, KissFrame,
+use kiss_tnc::{
+    CMD_DATA, CMD_FULL_DUPLEX, CMD_PERSISTENCE, CMD_RETURN, CMD_SET_HARDWARE, CMD_SLOT_TIME,
+    CMD_TX_DELAY, CMD_TX_TAIL, FEND, KissFrame, decode_kiss_frame, encode_kiss_frame,
 };
+
+use crate::error::{Error, ProtocolError, TransportError};
 use crate::protocol::{Codec, Command, Response};
 use crate::transport::Transport;
 use crate::types::{TncBaud, TncMode};
@@ -155,8 +156,8 @@ impl<T: Transport> KissSession<T> {
     /// Write pre-encoded KISS wire bytes directly to the transport.
     ///
     /// Use this when you already have a fully KISS-encoded frame (e.g.,
-    /// from [`build_aprs_message`](crate::kiss::build_aprs_message) or
-    /// [`AprsMessenger::next_frame_to_send`](crate::kiss::aprs_messaging::AprsMessenger::next_frame_to_send)).
+    /// from [`build_aprs_message`](::aprs::build_aprs_message) or
+    /// [`AprsMessenger::next_frame_to_send`](::aprs::AprsMessenger::next_frame_to_send)).
     /// Unlike [`send_frame`](Self::send_frame) and
     /// [`send_data`](Self::send_data), this does **not** perform any
     /// additional encoding.
@@ -178,7 +179,7 @@ impl<T: Transport> KissSession<T> {
     ///
     /// Returns [`Error::Transport`] if the write fails.
     pub async fn send_frame(&mut self, frame: &KissFrame) -> Result<(), Error> {
-        let wire = kiss::encode_kiss_frame(frame);
+        let wire = encode_kiss_frame(frame);
         tracing::debug!(
             command = frame.command,
             data_len = frame.data.len(),
@@ -251,7 +252,7 @@ impl<T: Transport> KissSession<T> {
         let frame_end = end_pos + 2; // Include the closing FEND.
 
         let frame_bytes: Vec<u8> = buf.drain(..frame_end).collect();
-        match kiss::decode_kiss_frame(&frame_bytes) {
+        match decode_kiss_frame(&frame_bytes) {
             Ok(frame) => {
                 tracing::debug!(
                     command = frame.command,
@@ -427,9 +428,9 @@ impl<T: Transport> KissSession<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kiss::{CMD_DATA, FEND};
     use crate::transport::MockTransport;
     use crate::types::TncBaud;
+    use kiss_tnc::{CMD_DATA, FEND};
 
     /// Helper: create a Radio with a mock that expects the TN 2,0 command.
     async fn mock_radio_for_kiss(baud: TncBaud) -> Radio<MockTransport> {

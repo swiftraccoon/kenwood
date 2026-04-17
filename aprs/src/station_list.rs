@@ -3,11 +3,21 @@
 //! Maintains a list of APRS stations heard on the network, with their
 //! latest position, status, weather data, packet count, and digipeater
 //! path. Supports spatial queries via the haversine formula.
+//!
+//! # Time handling
+//!
+//! Per the crate-level convention, this module is sans-io and never calls
+//! `std::time::Instant::now()` internally. Every stateful method that
+//! reads the clock accepts a `now: Instant` parameter; callers (typically
+//! the tokio shell) read the wall clock once per iteration and thread
+//! it down.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::{AprsData, AprsPosition, AprsWeather};
+use crate::packet::AprsData;
+use crate::position::AprsPosition;
+use crate::weather::AprsWeather;
 
 /// Earth's mean radius in kilometres (WGS-84 volumetric mean).
 const EARTH_RADIUS_KM: f64 = 6_371.0;
@@ -57,10 +67,10 @@ impl StationList {
     /// Update the station list from a parsed APRS packet.
     ///
     /// Creates a new entry if the station has not been seen before, or
-    /// updates the existing entry with fresh data.
-    pub fn update(&mut self, source: &str, data: &AprsData, path: &[String]) {
-        let now = Instant::now();
-
+    /// updates the existing entry with fresh data. The `now` parameter
+    /// stamps the entry's `last_heard` field — callers in the tokio
+    /// shell read the wall clock once per iteration and thread it down.
+    pub fn update(&mut self, source: &str, data: &AprsData, path: &[String], now: Instant) {
         let entry = self
             .stations
             .entry(source.to_owned())
@@ -147,8 +157,10 @@ impl StationList {
     }
 
     /// Remove expired entries (older than `max_age`).
-    pub fn purge_expired(&mut self) {
-        let now = Instant::now();
+    ///
+    /// The `now` parameter is compared against each entry's `last_heard`
+    /// timestamp; entries older than `max_age` are evicted.
+    pub fn purge_expired(&mut self, now: Instant) {
         let max_age = self.max_age;
         self.stations
             .retain(|_, e| now.duration_since(e.last_heard) < max_age);
@@ -195,7 +207,11 @@ fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kiss::{AprsMessage, AprsPosition, AprsStatus, AprsWeather};
+    use crate::message::AprsMessage;
+    use crate::packet::{AprsDataExtension, PositionAmbiguity};
+    use crate::status::AprsStatus;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn make_position(lat: f64, lon: f64) -> AprsData {
         AprsData::Position(AprsPosition {
@@ -207,10 +223,10 @@ mod tests {
             course_degrees: None,
             comment: String::new(),
             weather: None,
-            extensions: crate::kiss::AprsDataExtension::default(),
+            extensions: AprsDataExtension::default(),
             mice_message: None,
             mice_altitude_m: None,
-            ambiguity: crate::kiss::PositionAmbiguity::None,
+            ambiguity: PositionAmbiguity::None,
         })
     }
 
@@ -242,44 +258,49 @@ mod tests {
     }
 
     #[test]
-    fn update_creates_and_increments() {
+    fn update_creates_and_increments() -> TestResult {
         let mut sl = StationList::new(100, Duration::from_secs(3600));
         let pos = make_position(35.0, -97.0);
-        sl.update("N0CALL", &pos, &["WIDE1-1".to_owned()]);
+        let t0 = Instant::now();
+        sl.update("N0CALL", &pos, &["WIDE1-1".to_owned()], t0);
 
         assert_eq!(sl.len(), 1);
-        let entry = sl.get("N0CALL").unwrap();
+        let entry = sl.get("N0CALL").ok_or("expected N0CALL entry")?;
         assert_eq!(entry.callsign, "N0CALL");
         assert_eq!(entry.packet_count, 1);
         assert!(entry.position.is_some());
         assert_eq!(entry.last_path, vec!["WIDE1-1".to_owned()]);
 
         // Second update increments count.
-        sl.update("N0CALL", &pos, &[]);
-        let entry = sl.get("N0CALL").unwrap();
+        sl.update("N0CALL", &pos, &[], t0);
+        let entry = sl.get("N0CALL").ok_or("expected N0CALL entry")?;
         assert_eq!(entry.packet_count, 2);
+        Ok(())
     }
 
     #[test]
-    fn update_status_and_weather() {
+    fn update_status_and_weather() -> TestResult {
         let mut sl = StationList::new(100, Duration::from_secs(3600));
+        let t0 = Instant::now();
 
-        sl.update("WX1", &make_status("Sunny"), &[]);
-        let entry = sl.get("WX1").unwrap();
+        sl.update("WX1", &make_status("Sunny"), &[], t0);
+        let entry = sl.get("WX1").ok_or("expected WX1 entry")?;
         assert_eq!(entry.last_status.as_deref(), Some("Sunny"));
         assert!(entry.last_weather.is_none());
 
-        sl.update("WX1", &make_weather(), &[]);
-        let entry = sl.get("WX1").unwrap();
+        sl.update("WX1", &make_weather(), &[], t0);
+        let entry = sl.get("WX1").ok_or("expected WX1 entry")?;
         assert!(entry.last_weather.is_some());
         assert_eq!(entry.packet_count, 2);
+        Ok(())
     }
 
     #[test]
-    fn message_does_not_update_position_or_status() {
+    fn message_does_not_update_position_or_status() -> TestResult {
         let mut sl = StationList::new(100, Duration::from_secs(3600));
         let pos = make_position(35.0, -97.0);
-        sl.update("N0CALL", &pos, &[]);
+        let t0 = Instant::now();
+        sl.update("N0CALL", &pos, &[], t0);
 
         let msg = AprsData::Message(AprsMessage {
             addressee: "W1AW".to_owned(),
@@ -287,12 +308,13 @@ mod tests {
             message_id: None,
             reply_ack: None,
         });
-        sl.update("N0CALL", &msg, &[]);
+        sl.update("N0CALL", &msg, &[], t0);
 
-        let entry = sl.get("N0CALL").unwrap();
+        let entry = sl.get("N0CALL").ok_or("expected N0CALL entry")?;
         // Position should still be the original.
         assert!(entry.position.is_some());
         assert_eq!(entry.packet_count, 2);
+        Ok(())
     }
 
     #[test]
@@ -302,46 +324,53 @@ mod tests {
     }
 
     #[test]
-    fn recent_returns_sorted_by_last_heard() {
+    fn recent_returns_sorted_by_last_heard() -> TestResult {
         let mut sl = StationList::new(100, Duration::from_secs(3600));
         let pos = make_position(35.0, -97.0);
+        let t0 = Instant::now();
 
-        sl.update("FIRST", &pos, &[]);
-        sl.update("SECOND", &pos, &[]);
-        sl.update("THIRD", &pos, &[]);
+        sl.update("FIRST", &pos, &[], t0);
+        sl.update("SECOND", &pos, &[], t0 + Duration::from_millis(1));
+        sl.update("THIRD", &pos, &[], t0 + Duration::from_millis(2));
 
         let recent = sl.recent();
         assert_eq!(recent.len(), 3);
         // Most recent should be last updated.
-        assert_eq!(recent[0].callsign, "THIRD");
+        let first = recent.first().ok_or("expected at least one entry")?;
+        assert_eq!(first.callsign, "THIRD");
+        Ok(())
     }
 
     #[test]
-    fn nearby_filters_by_distance() {
+    fn nearby_filters_by_distance() -> TestResult {
         let mut sl = StationList::new(100, Duration::from_secs(3600));
+        let t0 = Instant::now();
 
         // Two stations: one close, one far.
-        sl.update("CLOSE", &make_position(35.01, -97.01), &[]);
-        sl.update("FAR", &make_position(40.0, -80.0), &[]);
+        sl.update("CLOSE", &make_position(35.01, -97.01), &[], t0);
+        sl.update("FAR", &make_position(40.0, -80.0), &[], t0);
         // One station with no position.
-        sl.update("NOPOS", &make_status("No GPS"), &[]);
+        sl.update("NOPOS", &make_status("No GPS"), &[], t0);
 
         let nearby = sl.nearby(35.0, -97.0, 10.0);
         assert_eq!(nearby.len(), 1);
-        assert_eq!(nearby[0].callsign, "CLOSE");
+        let first = nearby.first().ok_or("expected a nearby entry")?;
+        assert_eq!(first.callsign, "CLOSE");
+        Ok(())
     }
 
     #[test]
     fn evict_oldest_when_over_capacity() {
         let mut sl = StationList::new(2, Duration::from_secs(3600));
         let pos = make_position(35.0, -97.0);
+        let t0 = Instant::now();
 
-        sl.update("FIRST", &pos, &[]);
-        sl.update("SECOND", &pos, &[]);
+        sl.update("FIRST", &pos, &[], t0);
+        sl.update("SECOND", &pos, &[], t0 + Duration::from_millis(1));
         assert_eq!(sl.len(), 2);
 
         // Adding a third should evict the oldest (FIRST).
-        sl.update("THIRD", &pos, &[]);
+        sl.update("THIRD", &pos, &[], t0 + Duration::from_millis(2));
         assert_eq!(sl.len(), 2);
         assert!(sl.get("FIRST").is_none());
         assert!(sl.get("SECOND").is_some());
@@ -364,25 +393,25 @@ mod tests {
     #[test]
     fn purge_expired_is_no_op_for_fresh_entries() {
         let mut sl = StationList::new(100, Duration::from_secs(3600));
-        sl.update("N0CALL", &make_position(35.0, -97.0), &[]);
-        sl.purge_expired();
+        let t0 = Instant::now();
+        sl.update("N0CALL", &make_position(35.0, -97.0), &[], t0);
+        sl.purge_expired(t0);
         assert_eq!(sl.len(), 1);
     }
 
     #[test]
     fn purge_expired_removes_old_entries() {
-        // Use a reasonable max_age and manually backdate the entry to
-        // guarantee expiration without wall-clock timing dependencies.
+        // Use a reasonable max_age. We can now drive the clock directly
+        // via the injected `now` parameter instead of backdating
+        // `last_heard` after the fact.
         let mut sl = StationList::new(100, Duration::from_secs(60));
-        sl.update("N0CALL", &make_position(35.0, -97.0), &[]);
+        let t0 = Instant::now();
+        sl.update("N0CALL", &make_position(35.0, -97.0), &[], t0);
         assert_eq!(sl.len(), 1);
 
-        // Backdate last_heard so the entry is definitely expired.
-        sl.stations.get_mut("N0CALL").unwrap().last_heard = Instant::now()
-            .checked_sub(Duration::from_secs(120))
-            .unwrap();
-
-        sl.purge_expired();
+        // Advance the clock past max_age.
+        let future = t0 + Duration::from_secs(120);
+        sl.purge_expired(future);
         assert_eq!(sl.len(), 0, "expired entry should have been purged");
     }
 }

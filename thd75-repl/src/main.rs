@@ -1499,6 +1499,10 @@ async fn run_igate(client: &mut AprsClient<EitherTransport>, filter: &str) {
 
     println!("Connecting to APRS-IS as {login_call}.");
     let mut is_config = AprsIsConfig::new(&login_call);
+    // Preserve the pre-extraction software_name identity when running under
+    // the thd75 stack. The aprs-is crate defaults to "aprs-is" so callers
+    // from inside kenwood-thd75 must override explicitly.
+    is_config.software_name = String::from("kenwood-thd75");
     filter.clone_into(&mut is_config.filter);
 
     let mut is_client = match AprsIsClient::connect(is_config).await {

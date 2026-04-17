@@ -9,16 +9,16 @@
 //! replaced with well-known testing callsigns (`N0CALL`, `W1AW`) and
 //! positions with synthetic values.
 
-use kenwood_thd75::kiss::{
-    AprsData, Ax25Packet, KissFrame, MessageKind, MiceMessage, build_ax25, decode_kiss_frame,
-    encode_kiss_frame, parse_aprs_data, parse_aprs_data_full, parse_ax25,
-};
+use aprs::{AprsData, MessageKind, MiceMessage, parse_aprs_data, parse_aprs_data_full};
+use ax25_codec::{Ax25Packet, build_ax25, parse_ax25};
+use kenwood_thd75::aprs::ax25_to_kiss_wire;
+use kiss_tnc::{KissFrame, decode_kiss_frame, encode_kiss_frame};
 
 /// Build a KISS-wrapped AX.25 UI frame from (src, dst, path, info)
 /// components. Used by the tests below to simulate what a radio's KISS
 /// TNC emits.
 fn make_wire_frame(src: &str, dst: &str, digis: &[&str], info: &[u8]) -> Vec<u8> {
-    use kenwood_thd75::kiss::Ax25Address;
+    use ax25_codec::Ax25Address;
     let packet = Ax25Packet {
         source: Ax25Address::new(src, 0),
         destination: Ax25Address::new(dst, 0),
@@ -65,7 +65,8 @@ fn real_capture_mice_emergency() {
     // Use "354UPP" where U=N indicator, P=+100 offset, P=W.
     //
     // Actually the simplest: construct via the builder and verify parse.
-    use kenwood_thd75::kiss::{Ax25Address, build_aprs_mice_with_message_packet};
+    use aprs::build_aprs_mice_with_message_packet;
+    use ax25_codec::Ax25Address;
     let source = Ax25Address::new("N0CALL", 7);
     let packet = build_aprs_mice_with_message_packet(
         &source,
@@ -79,7 +80,7 @@ fn real_capture_mice_emergency() {
         "emergency test",
         &[],
     );
-    let wire = packet.encode_kiss();
+    let wire = ax25_to_kiss_wire(&packet);
     let kiss = decode_kiss_frame(&wire).unwrap();
     let parsed_packet = parse_ax25(&kiss.data).unwrap();
     let data =

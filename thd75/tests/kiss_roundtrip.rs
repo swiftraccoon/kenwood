@@ -1,18 +1,25 @@
-//! Property-based round-trip tests for the KISS / AX.25 / APRS codec.
+//! Property-based round-trip tests for the AX.25 / APRS codec.
 //!
 //! Every parser the library exposes is paired with a builder. This file
 //! generates arbitrary well-formed inputs and checks `parse(build(x)) ==
 //! x` for each layer.
+//!
+//! The pure-KISS codec round-trip lives in `kiss-tnc/tests/roundtrip.rs`
+//! (extracted in PR 1 of the KISS / AX.25 / APRS split). AX.25 and
+//! APRS round-trips stay here until those layers are extracted in
+//! PRs 2 and 3.
 
 use proptest::prelude::*;
 
-use kenwood_thd75::kiss::{
-    AprsData, AprsPosition, AprsWeather, Ax25Address, Ax25Packet, KissFrame, MiceMessage,
-    build_aprs_message_packet, build_aprs_mice_with_message_packet,
-    build_aprs_position_compressed_packet, build_aprs_position_report_packet,
-    build_aprs_status_packet, build_aprs_weather_packet, build_ax25, decode_kiss_frame,
-    encode_kiss_frame, parse_aprs_data, parse_aprs_position, parse_ax25, parse_mice_position,
+use aprs::{
+    AprsData, AprsPosition, AprsWeather, MiceMessage, build_aprs_message_packet,
+    build_aprs_mice_with_message_packet, build_aprs_position_compressed_packet,
+    build_aprs_position_report_packet, build_aprs_status_packet, build_aprs_weather_packet,
+    parse_aprs_data, parse_aprs_position, parse_mice_position,
 };
+use ax25_codec::{Ax25Address, Ax25Packet, build_ax25, parse_ax25};
+use kenwood_thd75::aprs::ax25_to_kiss_wire;
+use kiss_tnc::decode_kiss_frame;
 
 // ---------------------------------------------------------------------------
 // Strategies
@@ -88,24 +95,6 @@ fn arb_weather() -> impl Strategy<Value = AprsWeather> {
 }
 
 // ---------------------------------------------------------------------------
-// KISS codec round-trip
-// ---------------------------------------------------------------------------
-
-proptest! {
-    #[test]
-    fn kiss_codec_roundtrip(data in prop::collection::vec(any::<u8>(), 0..256)) {
-        let frame = KissFrame {
-            port: 0,
-            command: 0x00,
-            data: data.clone(),
-        };
-        let wire = encode_kiss_frame(&frame);
-        let decoded = decode_kiss_frame(&wire).unwrap();
-        prop_assert_eq!(decoded.data, data);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // AX.25 encode/parse round-trip
 // ---------------------------------------------------------------------------
 
@@ -150,7 +139,7 @@ proptest! {
         let packet = build_aprs_position_report_packet(
             &source, lat, lon, '/', '>', "", &[],
         );
-        let wire = packet.encode_kiss();
+        let wire = ax25_to_kiss_wire(&packet);
         let kiss = decode_kiss_frame(&wire).unwrap();
         let parsed_packet = parse_ax25(&kiss.data).unwrap();
         let parsed: AprsPosition = parse_aprs_position(&parsed_packet.info).unwrap();
@@ -175,7 +164,7 @@ proptest! {
         let packet = build_aprs_position_compressed_packet(
             &source, lat, lon, '/', '>', "", &[],
         );
-        let wire = packet.encode_kiss();
+        let wire = ax25_to_kiss_wire(&packet);
         let kiss = decode_kiss_frame(&wire).unwrap();
         let parsed_packet = parse_ax25(&kiss.data).unwrap();
         let parsed: AprsPosition = parse_aprs_position(&parsed_packet.info).unwrap();
@@ -209,7 +198,7 @@ proptest! {
         let packet = build_aprs_mice_with_message_packet(
             &source, lat, lon, 0, 0, message, '/', '>', "", &[],
         );
-        let wire = packet.encode_kiss();
+        let wire = ax25_to_kiss_wire(&packet);
         let kiss = decode_kiss_frame(&wire).unwrap();
         let parsed_packet = parse_ax25(&kiss.data).unwrap();
         let parsed = parse_mice_position(
@@ -234,7 +223,7 @@ proptest! {
         wx in arb_weather(),
     ) {
         let packet = build_aprs_weather_packet(&source, &wx, &[]);
-        let wire = packet.encode_kiss();
+        let wire = ax25_to_kiss_wire(&packet);
         let kiss = decode_kiss_frame(&wire).unwrap();
         let parsed_packet = parse_ax25(&kiss.data).unwrap();
         let data = parse_aprs_data(&parsed_packet.info).unwrap();
@@ -269,7 +258,7 @@ proptest! {
         let packet = build_aprs_message_packet(
             &source, &addressee, &text, msg_id.as_deref(), &[],
         );
-        let wire = packet.encode_kiss();
+        let wire = ax25_to_kiss_wire(&packet);
         let kiss = decode_kiss_frame(&wire).unwrap();
         let parsed_packet = parse_ax25(&kiss.data).unwrap();
         let data = parse_aprs_data(&parsed_packet.info).unwrap();
@@ -304,7 +293,7 @@ proptest! {
         text in arb_printable_text(),
     ) {
         let packet = build_aprs_status_packet(&source, &text, &[]);
-        let wire = packet.encode_kiss();
+        let wire = ax25_to_kiss_wire(&packet);
         let kiss = decode_kiss_frame(&wire).unwrap();
         let parsed_packet = parse_ax25(&kiss.data).unwrap();
         let data = parse_aprs_data(&parsed_packet.info).unwrap();

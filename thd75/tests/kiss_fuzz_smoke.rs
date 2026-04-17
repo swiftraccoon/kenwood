@@ -1,14 +1,20 @@
-//! Smoke fuzzing for the KISS / AX.25 / APRS parsers.
+//! Smoke fuzzing for the AX.25 / APRS parsers.
 //!
 //! Not a real `cargo-fuzz` harness — that requires nightly. Instead,
 //! we feed the parsers a large number of pseudo-random byte sequences
 //! and assert that none of them panic. The seed is fixed so the test
 //! is reproducible.
 //!
+//! The pure-KISS decode fuzz case lives in `kiss-tnc/tests/fuzz_smoke.rs`
+//! (extracted in PR 1 of the KISS / AX.25 / APRS split). AX.25 and
+//! APRS cases stay here until those layers are extracted in PRs 2
+//! and 3.
+//!
 //! For real fuzzing (libfuzzer/AFL), the same body can be lifted into
 //! a `fuzz_targets/` crate.
 
-use kenwood_thd75::kiss::{decode_kiss_frame, parse_aprs_data, parse_aprs_position, parse_ax25};
+use aprs::{parse_aprs_data, parse_aprs_position};
+use ax25_codec::parse_ax25;
 
 /// Tiny xorshift32 RNG — deterministic, no `rand` dependency.
 struct Xor32(u32);
@@ -28,20 +34,6 @@ impl Xor32 {
             for (dst, src) in chunk.iter_mut().zip(bytes.iter()) {
                 *dst = *src;
             }
-        }
-    }
-}
-
-#[test]
-fn fuzz_kiss_decode_no_panic() {
-    let mut rng = Xor32(0xC0FF_EE42);
-    for size in 0..=128 {
-        for _ in 0..50 {
-            let mut buf = vec![0u8; size];
-            rng.fill(&mut buf);
-            // Result doesn't matter — we just want to make sure
-            // decoding doesn't panic on arbitrary input.
-            let _ = decode_kiss_frame(&buf);
         }
     }
 }

@@ -1,0 +1,21 @@
+[package]
+name = "kiss-tnc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "KISS TNC (Terminal Node Controller) wire protocol codec"
+license = "GPL-2.0-or-later"
+authors = ["swiftraccoon"]
+repository = "https://github.com/swiftraccoon/kenwood"
+keywords = ["kiss", "ax25", "tnc", "ham-radio", "amateur-radio"]
+categories = ["encoding", "parser-implementations", "no-std"]
+publish = false
+
+[dependencies]
+thiserror = { version = "2", default-features = false }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

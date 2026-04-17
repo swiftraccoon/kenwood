@@ -65,19 +65,19 @@
 //! ```
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::error::Error;
-use crate::kiss::aprs_messaging::{AprsMessenger, classify_ack_rej};
-use crate::kiss::digipeater::{DigiAction, DigipeaterConfig};
-use crate::kiss::smart_beaconing::{SmartBeaconing, SmartBeaconingConfig};
-use crate::kiss::station_list::{StationEntry, StationList};
-use crate::kiss::{
-    AprsData, AprsMessage, AprsPosition, AprsWeather, Ax25Address, Ax25Packet, CMD_DATA, KissFrame,
-    build_aprs_object, build_aprs_position_compressed, build_aprs_position_report,
-    build_aprs_status, build_ax25, build_query_response_position, encode_kiss_frame,
-    parse_aprs_data_full, parse_ax25,
+use aprs::{
+    AprsData, AprsMessage, AprsMessenger, AprsPosition, AprsWeather, DigiAction, DigipeaterConfig,
+    SmartBeaconing, SmartBeaconingConfig, StationEntry, StationList, build_aprs_object,
+    build_aprs_position_compressed, build_aprs_position_report, build_aprs_status,
+    build_query_response_position, classify_ack_rej, parse_aprs_data_full,
 };
+use ax25_codec::{Ax25Address, Ax25Packet, build_ax25, parse_ax25};
+use kiss_tnc::{CMD_DATA, KissFrame, encode_kiss_frame};
+
+use crate::aprs::ax25_to_kiss_wire;
+use crate::error::Error;
 use crate::radio::Radio;
 use crate::radio::kiss_session::KissSession;
 use crate::transport::Transport;
@@ -127,7 +127,7 @@ pub struct AprsClientConfig {
     ///
     /// Default: `WIDE1-1,WIDE2-1` (standard 2-hop path). Use an empty
     /// vector for direct transmission with no digipeating. Parse from
-    /// a string with [`crate::kiss::parse_digipeater_path`].
+    /// a string with [`crate::aprs::parse_digipeater_path`].
     pub digipeater_path: Vec<Ax25Address>,
     /// Automatically respond to `?APRSP` position queries addressed to us.
     ///
@@ -167,7 +167,7 @@ impl AprsClientConfig {
             max_stations: 500,
             station_timeout_secs: 3600,
             auto_ack: true,
-            digipeater_path: crate::kiss::default_digipeater_path(),
+            digipeater_path: crate::aprs::default_digipeater_path(),
             auto_query_response: true,
             auto_query_position: None,
         }
@@ -235,7 +235,7 @@ impl AprsClientConfigBuilder {
             max_stations: 500,
             station_timeout_secs: 3600,
             auto_ack: true,
-            digipeater_path: crate::kiss::default_digipeater_path(),
+            digipeater_path: crate::aprs::default_digipeater_path(),
             auto_query_response: true,
             auto_query_position: None,
         }
@@ -328,9 +328,25 @@ impl AprsClientConfigBuilder {
     /// byte is outside the APRS-defined set (`/`, `\\`, 0-9, A-Z).
     pub fn build(self) -> Result<AprsClientConfig, crate::error::ValidationError> {
         // Callsign + SSID validation (same rules as Ax25Address::try_new).
-        let _ = Ax25Address::try_new(&self.callsign, self.ssid)?;
-        // Validate symbol table character.
-        let _ = crate::types::aprs_wire::SymbolTable::from_byte(self.symbol_table as u8)?;
+        // `Ax25Address::try_new` now returns `Ax25Error` from the
+        // `ax25-codec` crate; map to this crate's `ValidationError` at the
+        // boundary so callers keep the stable error type.
+        let _ = Ax25Address::try_new(&self.callsign, self.ssid).map_err(|_| {
+            crate::error::ValidationError::AprsWireOutOfRange {
+                field: "callsign",
+                detail: "callsign must be 1-6 A-Z/0-9 and SSID 0-15",
+            }
+        })?;
+        // Validate symbol table character. The aprs crate's
+        // `SymbolTable::from_byte` returns `AprsError`; map to
+        // `ValidationError` at the thd75 API boundary so callers keep the
+        // stable error type.
+        let _ = aprs::SymbolTable::from_byte(self.symbol_table as u8).map_err(|_| {
+            crate::error::ValidationError::AprsWireOutOfRange {
+                field: "APRS symbol table",
+                detail: "must be '/', '\\\\', 0-9, or A-Z",
+            }
+        })?;
         // Validate symbol code (printable ASCII per APRS 1.0.1).
         let code_byte = self.symbol_code as u8;
         if !(0x21..=0x7E).contains(&code_byte) {
@@ -516,8 +532,15 @@ impl<T: Transport> AprsClient<T> {
             return Ok(Some(ev));
         }
 
+        // Read the wall clock exactly once per iteration and thread it
+        // through every stateful `aprs` call that needs a timestamp.
+        // This keeps the sans-io `aprs` crate pure and guarantees that
+        // all state-machine decisions within a single iteration observe
+        // the same instant.
+        let now = Instant::now();
+
         // 1. Send pending retries and enqueue expired message events.
-        self.process_retries().await?;
+        self.process_retries(now).await?;
         if let Some(ev) = self.pending_events.pop_front() {
             return Ok(Some(ev));
         }
@@ -528,22 +551,22 @@ impl<T: Transport> AprsClient<T> {
         };
 
         // 3. Run digipeater logic before consuming the packet.
-        if let Some(ev) = self.process_digipeater(&packet).await? {
+        if let Some(ev) = self.process_digipeater(&packet, now).await? {
             return Ok(Some(ev));
         }
 
         // 4. Parse APRS content and dispatch.
-        self.handle_packet(packet).await
+        self.handle_packet(packet, now).await
     }
 
     /// Phase 1: send any retry frames that are due and queue up
     /// `MessageExpired` events for any messages that exhausted their
     /// retry budget.
-    async fn process_retries(&mut self) -> Result<(), Error> {
-        if let Some(frame) = self.messenger.next_frame_to_send() {
+    async fn process_retries(&mut self, now: Instant) -> Result<(), Error> {
+        if let Some(frame) = self.messenger.next_frame_to_send(now) {
             self.session.send_wire(&frame).await?;
         }
-        for id in self.messenger.cleanup_expired() {
+        for id in self.messenger.cleanup_expired(now) {
             self.pending_events.push_back(AprsEvent::MessageExpired(id));
         }
         Ok(())
@@ -579,11 +602,12 @@ impl<T: Transport> AprsClient<T> {
     async fn process_digipeater(
         &mut self,
         packet: &Ax25Packet,
+        now: Instant,
     ) -> Result<Option<AprsEvent>, Error> {
         if let Some(digi_config) = self.config.digipeater.as_mut()
-            && let DigiAction::Relay { modified_packet } = digi_config.process(packet)
+            && let DigiAction::Relay { modified_packet } = digi_config.process(packet, now)
         {
-            let wire = modified_packet.encode_kiss();
+            let wire = ax25_to_kiss_wire(&modified_packet);
             self.session.send_wire(&wire).await?;
             return Ok(Some(AprsEvent::PacketDigipeated {
                 source: packet.source.callsign.as_str().to_owned(),
@@ -594,17 +618,24 @@ impl<T: Transport> AprsClient<T> {
 
     /// Phase 4: parse the APRS info field, update the station list,
     /// and dispatch to the appropriate event variant.
-    async fn handle_packet(&mut self, packet: Ax25Packet) -> Result<Option<AprsEvent>, Error> {
+    async fn handle_packet(
+        &mut self,
+        packet: Ax25Packet,
+        now: Instant,
+    ) -> Result<Option<AprsEvent>, Error> {
         let Ok(aprs_data) = parse_aprs_data_full(&packet.info, &packet.destination.callsign) else {
             return Ok(Some(AprsEvent::RawPacket(packet)));
         };
 
         let path: Vec<String> = packet.digipeaters.iter().map(ToString::to_string).collect();
         self.stations
-            .update(&packet.source.callsign, &aprs_data, &path);
+            .update(&packet.source.callsign, &aprs_data, &path, now);
 
         if let AprsData::Message(ref msg) = aprs_data {
-            if !self.messenger.is_new_incoming(&packet.source.callsign, msg) {
+            if !self
+                .messenger
+                .is_new_incoming(&packet.source.callsign, msg, now)
+            {
                 return Ok(None);
             }
             return self.handle_incoming_message(msg, &packet.source).await;
@@ -681,10 +712,11 @@ impl<T: Transport> AprsClient<T> {
     ///
     /// Returns an error if the initial transmission fails.
     pub async fn send_message(&mut self, addressee: &str, text: &str) -> Result<String, Error> {
-        let message_id = self.messenger.send_message(addressee, text);
+        let now = Instant::now();
+        let message_id = self.messenger.send_message(addressee, text, now);
 
         // Send the first frame immediately.
-        if let Some(frame) = self.messenger.next_frame_to_send() {
+        if let Some(frame) = self.messenger.next_frame_to_send(now) {
             self.session.send_wire(&frame).await?;
         }
 
@@ -716,7 +748,7 @@ impl<T: Transport> AprsClient<T> {
             &self.config.digipeater_path,
         );
         self.session.send_wire(&wire).await?;
-        self.beaconing.beacon_sent();
+        self.beaconing.beacon_sent(Instant::now());
         Ok(())
     }
 
@@ -745,7 +777,7 @@ impl<T: Transport> AprsClient<T> {
             &self.config.digipeater_path,
         );
         self.session.send_wire(&wire).await?;
-        self.beaconing.beacon_sent();
+        self.beaconing.beacon_sent(Instant::now());
         Ok(())
     }
 
@@ -815,10 +847,11 @@ impl<T: Transport> AprsClient<T> {
         lat: f64,
         lon: f64,
     ) -> Result<bool, Error> {
-        if self.beaconing.should_beacon(speed_kmh, course_deg) {
+        let now = Instant::now();
+        if self.beaconing.should_beacon(speed_kmh, course_deg, now) {
             let comment = &self.config.beacon_comment.clone();
             self.beacon_position(lat, lon, comment).await?;
-            self.beaconing.beacon_sent_with(speed_kmh, course_deg);
+            self.beaconing.beacon_sent_with(speed_kmh, course_deg, now);
             Ok(true)
         } else {
             Ok(false)
@@ -951,7 +984,7 @@ impl<T: Transport> AprsClient<T> {
     /// - Don't gate packets containing TCPIP/TCPXX/NOGATE/RFONLY in path
     #[must_use]
     pub fn should_gate_to_rf(&self, is_line: &str) -> bool {
-        let Some(line) = crate::kiss::aprs_is::AprsIsLine::parse(is_line) else {
+        let Some(line) = aprs_is::AprsIsLine::parse(is_line) else {
             return false;
         };
 
@@ -1054,10 +1087,10 @@ impl<T: Transport> AprsClient<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kiss::{
-        FEND, build_aprs_message as build_msg, build_aprs_position_report as build_pos,
-        default_digipeater_path,
-    };
+    use aprs::{build_aprs_message as build_msg, build_aprs_position_report as build_pos};
+    use kiss_tnc::FEND;
+
+    use crate::aprs::default_digipeater_path;
     use crate::transport::MockTransport;
     use crate::types::TncBaud;
 
@@ -1410,10 +1443,11 @@ mod tests {
         // Simulate hearing a station on RF.
         client.stations.update(
             "KQ4NIT",
-            &AprsData::Status(crate::kiss::AprsStatus {
+            &AprsData::Status(aprs::AprsStatus {
                 text: "on air".to_owned(),
             }),
             &[],
+            Instant::now(),
         );
 
         // Message addressed to that station should be gated (no TCPIP
@@ -1432,10 +1466,11 @@ mod tests {
         // be gated back to RF (APRS-IS spec).
         client.stations.update(
             "KQ4NIT",
-            &AprsData::Status(crate::kiss::AprsStatus {
+            &AprsData::Status(aprs::AprsStatus {
                 text: "on air".to_owned(),
             }),
             &[],
+            Instant::now(),
         );
         let line = "W1AW>APK005,TCPIP::KQ4NIT   :Hello{123\r\n";
         assert!(!client.should_gate_to_rf(line));
@@ -1450,10 +1485,11 @@ mod tests {
         // Simulate hearing the addressee on RF so gating is allowed.
         client.stations.update(
             "KQ4NIT",
-            &AprsData::Status(crate::kiss::AprsStatus {
+            &AprsData::Status(aprs::AprsStatus {
                 text: "on air".to_owned(),
             }),
             &[],
+            Instant::now(),
         );
 
         // Expect the KISS frame output (we just need the mock to accept it).

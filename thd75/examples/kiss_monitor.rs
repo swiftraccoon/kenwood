@@ -16,7 +16,6 @@
 //! Press Ctrl+C to stop.
 
 use kenwood_thd75::Transport;
-use kenwood_thd75::kiss;
 use kenwood_thd75::transport::SerialTransport;
 
 #[tokio::main]
@@ -54,9 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             print!("[{packet_count:04}] ");
 
             // Decode the KISS frame.
-            match kiss::decode_kiss_frame(&frame_data) {
+            match kiss_tnc::decode_kiss_frame(&frame_data) {
                 Ok(kiss_frame) => {
-                    if kiss_frame.command != kiss::CMD_DATA {
+                    if kiss_frame.command != kiss_tnc::CMD_DATA {
                         println!(
                             "KISS cmd=0x{:02X} ({} bytes)",
                             kiss_frame.command,
@@ -66,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // Parse the AX.25 payload.
-                    if let Ok(ax25) = kiss::parse_ax25(&kiss_frame.data) {
+                    if let Ok(ax25) = ax25_codec::parse_ax25(&kiss_frame.data) {
                         print!("{}>{}", ax25.source, ax25.destination,);
                         for digi in &ax25.digipeaters {
                             print!(",{digi}");
@@ -74,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         print!(": ");
 
                         // Try to parse as APRS position report.
-                        if let Ok(pos) = kiss::parse_aprs_position(&ax25.info) {
+                        if let Ok(pos) = aprs::parse_aprs_position(&ax25.info) {
                             println!(
                                 "APRS {:.4},{:.4} ({}{}) \"{}\"",
                                 pos.latitude,
@@ -109,12 +108,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `None` if no complete frame is available yet.
 fn extract_kiss_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     // Find first FEND.
-    let start = buf.iter().position(|&b| b == kiss::FEND)?;
+    let start = buf.iter().position(|&b| b == kiss_tnc::FEND)?;
 
     // Find next FEND after start.
     let end = buf[start + 1..]
         .iter()
-        .position(|&b| b == kiss::FEND)
+        .position(|&b| b == kiss_tnc::FEND)
         .map(|i| start + 1 + i)?;
 
     // Extract the frame (between the two FENDs).

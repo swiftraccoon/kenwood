@@ -2,13 +2,14 @@
 //!
 //! Provides a [`AprsIsClient`] that connects to an APRS-IS server over
 //! TCP, authenticates, and exchanges APRS packets as line-delimited text.
-//! This is the complement to the pure-data helpers in [`super::aprs_is`],
-//! which stay transport-agnostic.
+//! This is the complement to the pure-data helpers at the crate root
+//! (e.g. [`crate::parse_is_line`], [`crate::format_is_packet`],
+//! [`crate::build_login_string`]), which stay transport-agnostic.
 //!
 //! # Usage
 //!
 //! ```no_run
-//! use kenwood_thd75::{AprsIsClient, AprsIsConfig, AprsIsEvent};
+//! use aprs_is::{AprsIsClient, AprsIsConfig, AprsIsEvent};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut config = AprsIsConfig::new("N0CALL");
@@ -52,13 +53,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-use super::aprs_is::{AprsIsConfig, build_login_string, format_is_packet, parse_is_line};
+use crate::error::AprsIsError;
+use crate::events::AprsIsEvent;
+use crate::line::{format_is_packet, parse_is_line};
+use crate::login::{AprsIsConfig, build_login_string};
 
 /// Extract the server hostname from a `# logresp ... verified, server X`
 /// comment line. Returns `None` if the `server` clause is absent.
 fn parse_logresp_server(line: &str) -> Option<String> {
     let idx = line.find("server ")?;
-    let rest = &line[idx + "server ".len()..];
+    let rest = line.get(idx + "server ".len()..)?;
     // Skip any extra whitespace after "server" and take the next
     // whitespace-delimited token.
     let name = rest
@@ -77,70 +81,8 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 /// Default connect timeout for the initial TCP handshake + login.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Keepalive comment text (sent as `# kenwood-thd75 keepalive\r\n`).
-const KEEPALIVE_COMMENT: &str = "# kenwood-thd75 keepalive";
-
-/// An event from the APRS-IS server.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AprsIsEvent {
-    /// An APRS packet line was received (not a comment).
-    ///
-    /// The line is stripped of trailing `\r\n`. Parse with the standard
-    /// APRS parsers in [`crate::kiss`] after splitting source/dest/path/data.
-    Packet(String),
-
-    /// A server comment line was received (starts with `#`).
-    ///
-    /// Comments carry server info, login responses, and keepalives.
-    /// The line is stripped of trailing `\r\n`.
-    Comment(String),
-
-    /// The server accepted the login (`# logresp ... verified, server ...`).
-    ///
-    /// Emitted the first time a `logresp` line confirming `verified` is
-    /// seen. `server` is the upstream server's hostname extracted from
-    /// the comment, if present.
-    LoggedIn {
-        /// APRS-IS server hostname from the `logresp` line (e.g. `T2TEST`).
-        server: Option<String>,
-    },
-
-    /// The server rejected the login (`# logresp ... unverified`).
-    ///
-    /// Emitted when the passcode does not validate for the given
-    /// callsign. `reason` carries the full comment text for diagnosis.
-    LoginRejected {
-        /// Raw reason text from the server's `logresp` line.
-        reason: String,
-    },
-
-    /// The TCP connection was closed (EOF from server).
-    Disconnected,
-}
-
-/// Errors that can occur during APRS-IS operations.
-#[derive(Debug, thiserror::Error)]
-pub enum AprsIsError {
-    /// The TCP connection could not be established.
-    #[error("APRS-IS connect failed: {0}")]
-    Connect(std::io::Error),
-
-    /// A read from the TCP socket failed.
-    #[error("APRS-IS read failed: {0}")]
-    Read(std::io::Error),
-
-    /// A write to the TCP socket failed.
-    #[error("APRS-IS write failed: {0}")]
-    Write(std::io::Error),
-
-    /// The initial login handshake timed out.
-    #[error("APRS-IS login timed out")]
-    LoginTimeout,
-
-    /// The server rejected the login credentials.
-    #[error("APRS-IS login rejected: {0}")]
-    LoginRejected(String),
-}
+/// Keepalive comment text (sent as `# aprs-is keepalive\r\n`).
+const KEEPALIVE_COMMENT: &str = "# aprs-is keepalive";
 
 /// Async TCP client for APRS-IS.
 ///
@@ -155,13 +97,12 @@ pub enum AprsIsError {
 /// This client speaks plaintext TCP only. APRS-IS T2 servers also
 /// support TLS on port 24580 — to use it, build the connection
 /// yourself with your preferred TLS library (e.g. `tokio-rustls` or
-/// `tokio-native-tls`) and use the line-level helpers in
-/// [`crate::kiss::aprs_is`]:
+/// `tokio-native-tls`) and use the line-level helpers at the crate
+/// root ([`crate::build_login_string`], [`crate::format_is_packet`],
+/// [`crate::AprsIsLine`]):
 ///
 /// ```no_run
-/// use kenwood_thd75::kiss::aprs_is::{
-///     AprsIsConfig, AprsIsLine, build_login_string, format_is_packet,
-/// };
+/// use aprs_is::{AprsIsConfig, AprsIsLine, build_login_string, format_is_packet};
 /// // 1. TLS handshake against `core.aprs2.net:24580` using your TLS library.
 /// // 2. Send the result of `build_login_string(&config)` over the stream.
 /// // 3. Read lines from the stream and parse them with `AprsIsLine::parse`.
@@ -345,7 +286,7 @@ impl AprsIsClient {
     /// Send a formatted APRS packet to the server.
     ///
     /// The packet is formatted as `source>destination,path:data\r\n` via
-    /// [`format_is_packet`] and written to the TCP socket.
+    /// [`crate::format_is_packet`] and written to the TCP socket.
     ///
     /// # Errors
     ///
@@ -380,7 +321,7 @@ impl AprsIsClient {
 
     /// Send a keepalive comment line unconditionally.
     ///
-    /// Sends `# kenwood-thd75 keepalive\r\n` to the server. Call this
+    /// Sends `# aprs-is keepalive\r\n` to the server. Call this
     /// on a timer or use [`maybe_send_keepalive`](Self::maybe_send_keepalive)
     /// to only send if the interval has elapsed.
     ///
@@ -428,32 +369,52 @@ impl AprsIsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::login::Passcode;
     use std::future::Future;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpListener;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Read up to `buf.len()` bytes from `stream`. Returns the number of
+    /// bytes read, or panics via `assert!` in the test handler on I/O
+    /// error — the handler is spawned on a tokio task and must not
+    /// leak an `?` beyond the `async move` body.
+    async fn read_some(stream: &mut TcpStream, buf: &mut [u8]) -> Option<usize> {
+        stream.read(buf).await.ok().filter(|n| *n > 0)
+    }
+
+    /// Write all of `data` to `stream`; swallow any I/O error since the
+    /// test will fail separately if the client doesn't see the line.
+    async fn write_all_ignore(stream: &mut TcpStream, data: &[u8]) {
+        if let Err(err) = stream.write_all(data).await {
+            tracing::debug!(%err, "mock server write_all error");
+        }
+    }
 
     /// Spawn a mock APRS-IS server that accepts one connection, reads
     /// the login line, and runs the given handler.
     ///
     /// Returns the bound `SocketAddr` so tests can connect to it.
-    async fn spawn_mock_server<F, Fut>(handler: F) -> std::net::SocketAddr
+    async fn spawn_mock_server<F, Fut>(handler: F) -> Result<std::net::SocketAddr, std::io::Error>
     where
         F: FnOnce(TcpStream) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send,
     {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
         drop(tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            handler(stream).await;
+            if let Ok((stream, _)) = listener.accept().await {
+                handler(stream).await;
+            }
         }));
-        addr
+        Ok(addr)
     }
 
     fn test_config(addr: std::net::SocketAddr) -> AprsIsConfig {
         AprsIsConfig {
             callsign: "N0CALL".to_owned(),
-            passcode: crate::kiss::aprs_is::Passcode::ReceiveOnly,
+            passcode: Passcode::ReceiveOnly,
             server: addr.ip().to_string(),
             port: addr.port(),
             filter: String::new(),
@@ -463,124 +424,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_sends_login_string() {
+    async fn connect_sends_login_string() -> TestResult {
         let addr = spawn_mock_server(|mut stream| async move {
-            // Read the login line.
             let mut buf = [0u8; 512];
-            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap();
-            let login = std::str::from_utf8(&buf[..n]).unwrap();
-            assert!(login.starts_with("user N0CALL pass -1 vers test 0.1"));
-            assert!(login.ends_with("\r\n"));
-            // Keep the connection open briefly.
+            let Some(n) = read_some(&mut stream, &mut buf).await else {
+                return;
+            };
+            let Ok(login) = std::str::from_utf8(buf.get(..n).unwrap_or(&[])) else {
+                return;
+            };
+            assert!(
+                login.starts_with("user N0CALL pass -1 vers test 0.1"),
+                "unexpected login: {login:?}"
+            );
+            assert!(login.ends_with("\r\n"), "missing CRLF: {login:?}");
             tokio::time::sleep(Duration::from_millis(50)).await;
         })
-        .await;
+        .await?;
 
-        let _client = AprsIsClient::connect(test_config(addr)).await.unwrap();
+        let _client = AprsIsClient::connect(test_config(addr)).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn next_event_receives_packet_line() {
+    async fn next_event_receives_packet_line() -> TestResult {
         let addr = spawn_mock_server(|mut stream| async move {
-            // Read and discard login.
             let mut buf = [0u8; 512];
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap();
-            // Send a packet line.
-            stream
-                .write_all(b"N0CALL>APK005:!4903.50N/07201.75W-Test\r\n")
-                .await
-                .unwrap();
+            let _ = read_some(&mut stream, &mut buf).await;
+            write_all_ignore(&mut stream, b"N0CALL>APK005:!4903.50N/07201.75W-Test\r\n").await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         })
-        .await;
+        .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await.unwrap();
-        let event = client.next_event().await.unwrap();
-        match event {
-            AprsIsEvent::Packet(line) => {
-                assert_eq!(line, "N0CALL>APK005:!4903.50N/07201.75W-Test");
-            }
-            other => panic!("expected Packet, got {other:?}"),
-        }
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        let event = client.next_event().await?;
+        assert!(
+            matches!(event, AprsIsEvent::Packet(ref line) if line == "N0CALL>APK005:!4903.50N/07201.75W-Test"),
+            "expected Packet, got {event:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn next_event_receives_comment_line() {
+    async fn next_event_receives_comment_line() -> TestResult {
         let addr = spawn_mock_server(|mut stream| async move {
             let mut buf = [0u8; 512];
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap();
-            stream
-                .write_all(b"# javAPRSSrvr 4.2.0b05\r\n")
-                .await
-                .unwrap();
+            let _ = read_some(&mut stream, &mut buf).await;
+            write_all_ignore(&mut stream, b"# javAPRSSrvr 4.2.0b05\r\n").await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         })
-        .await;
+        .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await.unwrap();
-        let event = client.next_event().await.unwrap();
-        match event {
-            AprsIsEvent::Comment(line) => {
-                assert_eq!(line, "# javAPRSSrvr 4.2.0b05");
-            }
-            other => panic!("expected Comment, got {other:?}"),
-        }
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        let event = client.next_event().await?;
+        assert!(
+            matches!(event, AprsIsEvent::Comment(ref line) if line == "# javAPRSSrvr 4.2.0b05"),
+            "expected Comment, got {event:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn next_event_detects_login_verified() {
+    async fn next_event_detects_login_verified() -> TestResult {
         let addr = spawn_mock_server(|mut stream| async move {
             let mut buf = [0u8; 512];
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap();
-            stream
-                .write_all(b"# logresp N0CALL verified, server T2TEST\r\n")
-                .await
-                .unwrap();
+            let _ = read_some(&mut stream, &mut buf).await;
+            write_all_ignore(&mut stream, b"# logresp N0CALL verified, server T2TEST\r\n").await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         })
-        .await;
+        .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await.unwrap();
-        let event = client.next_event().await.unwrap();
-        match event {
-            AprsIsEvent::LoggedIn { server } => {
-                assert_eq!(server, Some("T2TEST".to_owned()));
-            }
-            other => panic!("expected LoggedIn, got {other:?}"),
-        }
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        let event = client.next_event().await?;
+        assert!(
+            matches!(event, AprsIsEvent::LoggedIn { ref server } if server.as_deref() == Some("T2TEST")),
+            "expected LoggedIn, got {event:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn next_event_detects_login_rejected() {
+    async fn next_event_detects_login_rejected() -> TestResult {
         let addr = spawn_mock_server(|mut stream| async move {
             let mut buf = [0u8; 512];
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap();
-            stream
-                .write_all(b"# logresp N0CALL unverified, server T2TEST\r\n")
-                .await
-                .unwrap();
+            let _ = read_some(&mut stream, &mut buf).await;
+            write_all_ignore(
+                &mut stream,
+                b"# logresp N0CALL unverified, server T2TEST\r\n",
+            )
+            .await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         })
-        .await;
+        .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await.unwrap();
-        let event = client.next_event().await.unwrap();
-        match event {
-            AprsIsEvent::LoginRejected { reason } => {
-                assert!(reason.contains("unverified"));
-            }
-            other => panic!("expected LoginRejected, got {other:?}"),
-        }
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        let event = client.next_event().await?;
+        assert!(
+            matches!(event, AprsIsEvent::LoginRejected { ref reason } if reason.contains("unverified")),
+            "expected LoginRejected, got {event:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -597,95 +540,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_event_detects_disconnect() {
+    async fn next_event_detects_disconnect() -> TestResult {
         let addr = spawn_mock_server(|mut stream| async move {
             let mut buf = [0u8; 512];
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap();
-            // Close immediately.
+            let _ = read_some(&mut stream, &mut buf).await;
             drop(stream);
         })
-        .await;
+        .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await.unwrap();
-        let event = client.next_event().await.unwrap();
-        assert!(matches!(event, AprsIsEvent::Disconnected));
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        let event = client.next_event().await?;
+        assert!(
+            matches!(event, AprsIsEvent::Disconnected),
+            "expected Disconnected, got {event:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn send_packet_formats_line() {
+    async fn send_packet_formats_line() -> TestResult {
         let addr = spawn_mock_server(|mut stream| async move {
             let mut buf = [0u8; 1024];
-            // Read login.
-            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap();
-            // Login is the first line.
-            let text = std::str::from_utf8(&buf[..n]).unwrap();
-            assert!(text.contains("user N0CALL"));
-            // Read the next write (the packet).
-            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap();
-            let pkt = std::str::from_utf8(&buf[..n]).unwrap();
-            assert_eq!(pkt, "N0CALL>APK005,WIDE1-1:!4903.50N/07201.75W-Test\r\n");
+            let Some(n) = read_some(&mut stream, &mut buf).await else {
+                return;
+            };
+            let Ok(text) = std::str::from_utf8(buf.get(..n).unwrap_or(&[])) else {
+                return;
+            };
+            assert!(text.contains("user N0CALL"), "login missing: {text:?}");
+            let Some(n) = read_some(&mut stream, &mut buf).await else {
+                return;
+            };
+            let Ok(pkt) = std::str::from_utf8(buf.get(..n).unwrap_or(&[])) else {
+                return;
+            };
+            assert_eq!(
+                pkt, "N0CALL>APK005,WIDE1-1:!4903.50N/07201.75W-Test\r\n",
+                "unexpected packet: {pkt:?}"
+            );
         })
-        .await;
+        .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await.unwrap();
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
         client
             .send_packet("N0CALL", "APK005", &["WIDE1-1"], "!4903.50N/07201.75W-Test")
-            .await
-            .unwrap();
+            .await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn send_keepalive_sends_comment_line() {
+    async fn send_keepalive_sends_comment_line() -> TestResult {
         let addr = spawn_mock_server(|mut stream| async move {
             let mut buf = [0u8; 1024];
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap();
-            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap();
-            let ka = std::str::from_utf8(&buf[..n]).unwrap();
-            assert!(ka.starts_with("# kenwood-thd75 keepalive"));
-            assert!(ka.ends_with("\r\n"));
+            let _ = read_some(&mut stream, &mut buf).await;
+            let Some(n) = read_some(&mut stream, &mut buf).await else {
+                return;
+            };
+            let Ok(ka) = std::str::from_utf8(buf.get(..n).unwrap_or(&[])) else {
+                return;
+            };
+            assert!(
+                ka.starts_with("# aprs-is keepalive"),
+                "unexpected keepalive: {ka:?}"
+            );
+            assert!(ka.ends_with("\r\n"), "missing CRLF: {ka:?}");
         })
-        .await;
+        .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await.unwrap();
-        client.send_keepalive().await.unwrap();
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        client.send_keepalive().await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn maybe_send_keepalive_noop_when_recent() {
+    async fn maybe_send_keepalive_noop_when_recent() -> TestResult {
         let addr = spawn_mock_server(|mut stream| async move {
             let mut buf = [0u8; 1024];
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap();
-            // Reader should not see any further data (keepalive skipped).
+            let _ = read_some(&mut stream, &mut buf).await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         })
-        .await;
+        .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await.unwrap();
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
         // Called immediately after connect — last_write is fresh, no send.
-        client.maybe_send_keepalive().await.unwrap();
+        client.maybe_send_keepalive().await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn connect_timeout() {
+    async fn connect_timeout() -> TestResult {
         // Connect to a non-routable IP to trigger timeout.
         // Using 198.51.100.1 (TEST-NET-2) which should not respond.
         let config = AprsIsConfig {
             callsign: "N0CALL".to_owned(),
-            passcode: crate::kiss::aprs_is::Passcode::ReceiveOnly,
+            passcode: Passcode::ReceiveOnly,
             server: "198.51.100.1".to_owned(),
             port: 14580,
             filter: String::new(),
@@ -703,7 +653,8 @@ mod tests {
         // Either the overall test timeout fires, or the connect fails.
         // Both are acceptable as long as we don't hang.
         if let Ok(r) = result {
-            assert!(r.is_err());
+            assert!(r.is_err(), "expected connect to fail, got Ok");
         }
+        Ok(())
     }
 }

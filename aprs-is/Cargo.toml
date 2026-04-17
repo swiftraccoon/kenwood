@@ -1,0 +1,25 @@
+[package]
+name = "aprs-is"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "APRS-IS TCP client for IGate and monitor applications"
+license = "GPL-2.0-or-later"
+authors = ["swiftraccoon"]
+repository = "https://github.com/swiftraccoon/kenwood"
+keywords = ["aprs", "aprs-is", "igate", "ham-radio", "amateur-radio"]
+categories = ["network-programming"]
+publish = false
+
+[dependencies]
+aprs = { path = "../aprs" }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
+
+[lints]
+workspace = true

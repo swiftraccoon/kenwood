@@ -5,10 +5,10 @@
 
 use proptest::prelude::*;
 
-use kenwood_thd75::kiss::{KissFrame, decode_kiss_frame, encode_kiss_frame};
 use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::types::tone::{CtcssMode, DcsCode, ToneCode};
 use kenwood_thd75::types::*;
+use kiss_tnc::{KissFrame, decode_kiss_frame, encode_kiss_frame};
 
 // ============================================================================
 // Arbitrary strategies

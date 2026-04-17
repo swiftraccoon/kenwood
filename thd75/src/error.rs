@@ -325,9 +325,10 @@ pub enum ValidationError {
 
     /// A runtime APRS wire-format value failed validation.
     ///
-    /// Used by [`crate::types::aprs_wire`] for typed primitives such as
-    /// `Callsign`, `Latitude`, `Longitude`, `Course`, and `MessageId`
-    /// where the failing value may be too wide to fit in a `u8`.
+    /// Used by the `aprs` and `ax25-codec` crates for typed primitives
+    /// such as `Callsign`, `Latitude`, `Longitude`, `Course`, and
+    /// `MessageId` where the failing value may be too wide to fit in a
+    /// `u8`.
     #[error("{field} out of range: {detail}")]
     AprsWireOutOfRange {
         /// Field name, e.g. `"Latitude"`, `"Callsign byte"`.

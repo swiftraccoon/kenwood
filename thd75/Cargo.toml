@@ -18,7 +18,11 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "net", "
 tokio-serial = "5"
 thiserror = "2"
 tracing = "0.1"
+aprs = { path = "../aprs" }
+aprs-is = { path = "../aprs-is" }
+ax25-codec = { path = "../ax25-codec" }
 dstar-gateway-core = { path = "../dstar-gateway-core" }
+kiss-tnc = { path = "../kiss-tnc" }
 mmdvm-core = { path = "../mmdvm-core" }
 mmdvm = { path = "../mmdvm" }
 
