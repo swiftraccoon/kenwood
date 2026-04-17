@@ -51,7 +51,7 @@ const FFT_BINS: usize = FFT_SIZE / 2 + 1;
 const FRAME_LEN: usize = 160;
 
 /// Number of overlap samples carried between consecutive noise frames.
-pub(crate) const NOISE_OVERLAP: usize = 96;
+const NOISE_OVERLAP: usize = 96;
 
 /// JMBE LCG multiplier coefficient.
 const LCG_A: u32 = 171;

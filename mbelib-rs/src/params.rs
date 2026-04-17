@@ -67,13 +67,6 @@ pub(crate) struct MbeParams {
     /// via the L lookup table.
     pub(crate) l: usize,
 
-    /// Number of voiced bands (K), range 0..=L.
-    ///
-    /// Computed from the voiced/unvoiced decisions in `vl`. Used by
-    /// the synthesizer to determine how many bands get deterministic
-    /// oscillators vs. noise generators.
-    pub(crate) k: usize,
-
     /// Voiced/unvoiced decision per harmonic band.
     ///
     /// `vl[band] == true` means band `band` is voiced (synthesized as
@@ -120,14 +113,6 @@ pub(crate) struct MbeParams {
     /// first-order smoothing that prevents abrupt level changes.
     pub(crate) gamma: f32,
 
-    /// Count of consecutive repeated (error-concealment) frames.
-    ///
-    /// When bit errors exceed the FEC correction capacity, the decoder
-    /// reuses the previous frame's parameters instead of decoding
-    /// garbage. After 3 consecutive repeats, the decoder outputs
-    /// silence to avoid sustained artifacts from corrupted state.
-    pub(crate) repeat: u32,
-
     // === JMBE adaptive smoothing state (algorithms #111-116) ===
     /// IIR-smoothed local energy estimate (Algorithm #111).
     ///
@@ -153,21 +138,13 @@ pub(crate) struct MbeParams {
     /// Total bit errors detected by FEC across all four codewords.
     pub(crate) error_count_total: i32,
 
-    /// Bit errors in the C4 codeword (used by Algorithm #112).
-    pub(crate) error_count_4: i32,
-
-    /// Count of consecutive frames where the decoder repeated previous
-    /// parameters due to excessive errors.
+    /// Count of consecutive frames where C0 was uncorrectable (C0 Golay
+    /// errors > 3) and the decoder reused the previous frame's
+    /// parameters. Reset to 0 on any successful decode.
     ///
-    /// When this reaches `MBE_MAX_FRAME_REPEATS` (3), the decoder
-    /// outputs comfort noise instead of synthesized speech.
+    /// When this reaches 3, the decoder emits comfort noise instead of
+    /// synthesized speech to avoid sustained artifacts from stale state.
     pub(crate) repeat_count: i32,
-
-    /// Codec-specific muting threshold for `error_rate`.
-    ///
-    /// AMBE 3600x2450 uses 0.096 (9.6%); IMBE uses 0.0875 (8.75%). For
-    /// D-STAR (this crate's target) the AMBE value applies.
-    pub(crate) muting_threshold: f32,
 
     // === JMBE FFT-based unvoiced synthesis state (algorithms #117-126) ===
     /// Previous frame's 256-sample IFFT output, retained for WOLA combine.
@@ -196,22 +173,18 @@ impl MbeParams {
         Self {
             w0: 0.0,
             l: 0,
-            k: 0,
             vl: [false; MAX_BANDS],
             ml: [0.0; MAX_BANDS],
             log2_ml: [0.0; MAX_BANDS],
             phi_l: [0.0; MAX_BANDS],
             psi_l: [0.0; MAX_BANDS],
             gamma: 0.0,
-            repeat: 0,
             // JMBE adaptive smoothing defaults (mbe_initMbeParms).
             local_energy: 75000.0,
             amplitude_threshold: 20480,
             error_rate: 0.0,
             error_count_total: 0,
-            error_count_4: 0,
             repeat_count: 0,
-            muting_threshold: 0.096, // AMBE 3600x2450 threshold (D-STAR)
             // JMBE FFT-unvoiced state.
             previous_uw: [0.0; 256],
             noise_seed: -1.0, // cold-start sentinel
@@ -228,21 +201,17 @@ impl MbeParams {
     pub(crate) const fn copy_from(&mut self, src: &Self) {
         self.w0 = src.w0;
         self.l = src.l;
-        self.k = src.k;
         self.vl = src.vl;
         self.ml = src.ml;
         self.log2_ml = src.log2_ml;
         self.phi_l = src.phi_l;
         self.psi_l = src.psi_l;
         self.gamma = src.gamma;
-        self.repeat = src.repeat;
         self.local_energy = src.local_energy;
         self.amplitude_threshold = src.amplitude_threshold;
         self.error_rate = src.error_rate;
         self.error_count_total = src.error_count_total;
-        self.error_count_4 = src.error_count_4;
         self.repeat_count = src.repeat_count;
-        self.muting_threshold = src.muting_threshold;
         self.previous_uw = src.previous_uw;
         self.noise_seed = src.noise_seed;
         self.noise_overlap = src.noise_overlap;

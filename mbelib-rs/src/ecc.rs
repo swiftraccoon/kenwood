@@ -4,19 +4,18 @@
 
 //! Error correction coding for AMBE 3600×2450 voice frames.
 //!
-//! The AMBE codec protects its parameter bits with two levels of
-//! forward error correction:
+//! AMBE 3600×2450 uses **Golay(23,12)** — a 3-error-correcting code —
+//! on the C0 and C1 codewords. C0 carries the fundamental frequency
+//! index (the most perceptually critical parameter), so it receives
+//! the strongest protection. C1 carries the PRBA spectral coefficients.
 //!
-//! - **Golay(23,12)** — a 3-error-correcting code applied to the C0 and
-//!   C1 codewords. C0 carries the fundamental frequency index (the most
-//!   perceptually critical parameter), so it receives the strongest
-//!   protection. C1 carries the PRBA spectral coefficients.
+//! C2 (11 bits) and C3 (14 bits) are unprotected: they carry data bits
+//! directly with no ECC. The codec accepts this reduced protection
+//! because C3 carries higher-order coefficients and gain LSBs that are
+//! less perceptually critical than the C0 pitch index.
 //!
-//! - **Hamming(15,11)** — a single-error-correcting code. Although the
-//!   AMBE 3600×2450 format includes a 14-bit C3 codeword, the reference
-//!   implementation does not apply Hamming decoding to it — C3 bits are
-//!   copied verbatim. The Hamming decoder is provided here for
-//!   completeness and future codec variants.
+//! (Some related codec variants apply Hamming(15,11) to a C4 codeword,
+//! but AMBE 3600×2450 has no C4; this crate does not implement Hamming.)
 //!
 //! After error correction, `ecc_data` packs the corrected data bits
 //! from all four codewords (C0–C3) into a 49-element parameter vector
@@ -99,7 +98,7 @@ const C3_LEN: usize = 14;
 ///   retain the original parity bits (uncorrected, as Golay correction
 ///   targets the data bits only).
 /// - Error count: the number of data bits that were corrected.
-pub(crate) fn golay_decode(in_bits: &[u8; 23]) -> ([u8; 23], u32) {
+fn golay_decode(in_bits: &[u8; 23]) -> ([u8; 23], u32) {
     // Step 1: Pack the 23 input bits into a single integer.
     // The C code packs LSB-first: in[0] is bit 0, in[22] is bit 22.
     let mut block: i64 = 0;
@@ -205,109 +204,6 @@ pub(crate) fn golay_decode(in_bits: &[u8; 23]) -> ([u8; 23], u32) {
             break;
         }
         ci -= 1;
-    }
-
-    (out_bits, errs)
-}
-
-/// Decodes a Hamming(15,11) codeword, correcting up to 1 bit error.
-///
-/// The Hamming(15,11) code encodes 11 data bits with 4 parity bits,
-/// yielding a 15-bit codeword. It can detect and correct any single-bit
-/// error in the 15-bit block.
-///
-/// # Algorithm
-///
-/// 1. Pack the 15 input bits into a single integer (LSB-first).
-/// 2. Compute the 4-bit syndrome by masking the packed block with each
-///    generator polynomial and counting parity (popcount mod 2).
-/// 3. If the syndrome is non-zero, XOR the correction mask from the
-///    Hamming matrix to flip the erroneous bit.
-/// 4. Unpack the corrected 15 bits back into the output array.
-///
-/// # Arguments
-///
-/// - `in_bits`: 15-element array of single-bit bytes (LSB-first).
-///
-/// # Returns
-///
-/// A tuple of:
-/// - `out_bits`: 15-element corrected bit array.
-/// - Error count: 0 if no error detected, 1 if a single bit was corrected.
-#[cfg(test)]
-pub(crate) fn hamming_decode(in_bits: &[u8; 15]) -> ([u8; 15], u32) {
-    // Step 1: Pack the 15 bits LSB-first into a single integer.
-    let mut block: i32 = 0;
-    let mut i: usize = 14;
-    loop {
-        block <<= 1;
-        block |= i32::from(*in_bits.get(i).unwrap_or(&0));
-        if i == 0 {
-            break;
-        }
-        i -= 1;
-    }
-
-    // Step 2: Compute the 4-bit syndrome. For each of the 4 generator
-    // polynomial entries, AND it with the block and count the number of
-    // set bits modulo 2 (parity). The resulting 4-bit syndrome identifies
-    // which bit (if any) is in error.
-    let mut syndrome: i32 = 0;
-    let mut gi: usize = 0;
-    while gi < 4 {
-        syndrome <<= 1;
-        let stmp_init = block & *tables::HAMMING_GENERATOR.get(gi).unwrap_or(&0);
-
-        // Compute parity of stmp by shifting and XORing each bit.
-        // This is the standard software parity computation: repeatedly
-        // XOR the LSB with the running parity, then shift right.
-        let mut stmp = stmp_init;
-        let mut parity = stmp & 1; // start with bit 0
-        let mut j: usize = 0;
-        while j < 14 {
-            stmp >>= 1;
-            parity ^= stmp & 1;
-            j += 1;
-        }
-
-        syndrome |= parity;
-        gi += 1;
-    }
-
-    // Step 3: If the syndrome is non-zero, exactly one bit is in error.
-    // The Hamming matrix lookup gives us a mask with that bit's position.
-    let mut errs: u32 = 0;
-    if syndrome > 0 {
-        errs = 1;
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "syndrome is 0..15 from 4-bit computation, always non-negative"
-        )]
-        {
-            block ^= *tables::HAMMING_MATRIX.get(syndrome as usize).unwrap_or(&0);
-        }
-    }
-
-    // Step 4: Unpack the corrected bits back into the output array.
-    // MSB-first unpacking: bit 14 goes to out[14], bit 0 to out[0].
-    let mut out_bits = [0u8; 15];
-    let mut unpack = block;
-    let mut oi: usize = 14;
-    loop {
-        if let Some(slot) = out_bits.get_mut(oi) {
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "masking with 0x4000 then shifting right by 14 always yields 0 or 1"
-            )]
-            {
-                *slot = ((unpack & 0x4000) >> 14) as u8;
-            }
-        }
-        unpack <<= 1;
-        if oi == 0 {
-            break;
-        }
-        oi -= 1;
     }
 
     (out_bits, errs)
@@ -585,125 +481,6 @@ mod tests {
         }
 
         assert_eq!(corrected_data, data, "corrected data should match original");
-    }
-
-    /// Verifies that a zero-error Hamming codeword passes through unchanged.
-    #[test]
-    fn hamming_zero_error_passthrough() {
-        // Construct a valid Hamming(15,11) codeword.
-        // Data bits = 0b101_0101_0101 (11 bits), compute 4 parity bits.
-        let data: i32 = 0x555; // 11-bit data
-
-        // Pack just data into bits 4..14 of a 15-bit word, parity in bits 0..3.
-        // To compute valid parity, we need the full 15-bit block.
-        // The Hamming code's parity is computed from the generator matrix.
-        // For a valid codeword, syndrome must be 0.
-        //
-        // We'll encode by brute force: try all 16 parity combinations and
-        // find the one that gives syndrome = 0.
-        let data_shifted = data << 4; // put data in upper 11 bits
-        let mut valid_block: i32 = 0;
-        let mut p = 0;
-        while p < 16 {
-            let candidate = data_shifted | p;
-            // Compute syndrome
-            let mut syn: i32 = 0;
-            let mut gi = 0;
-            while gi < 4 {
-                syn <<= 1;
-                let masked = candidate & tables::HAMMING_GENERATOR[gi];
-                let mut parity = masked & 1;
-                let mut tmp = masked >> 1;
-                let mut j = 0;
-                while j < 14 {
-                    parity ^= tmp & 1;
-                    tmp >>= 1;
-                    j += 1;
-                }
-                syn |= parity;
-                gi += 1;
-            }
-            if syn == 0 {
-                valid_block = candidate;
-                break;
-            }
-            p += 1;
-        }
-
-        // Unpack to bit array (LSB-first).
-        let mut in_bits = [0u8; 15];
-        let mut bi = 0;
-        while bi < 15 {
-            in_bits[bi] = bit_at(valid_block, bi);
-            bi += 1;
-        }
-
-        let (out_bits, errs) = hamming_decode(&in_bits);
-
-        assert_eq!(errs, 0, "expected zero errors for a valid codeword");
-
-        // All 15 bits should be unchanged.
-        let mut ci = 0;
-        while ci < 15 {
-            assert_eq!(out_bits[ci], in_bits[ci], "bit {ci} should be unchanged");
-            ci += 1;
-        }
-    }
-
-    /// Verifies that the Hamming decoder corrects a single-bit error.
-    #[test]
-    fn hamming_single_error_correction() {
-        // Same valid codeword as the zero-error test.
-        let data: i32 = 0x555;
-        let data_shifted = data << 4;
-        let mut valid_block: i32 = 0;
-        let mut p = 0;
-        while p < 16 {
-            let candidate = data_shifted | p;
-            let mut syn: i32 = 0;
-            let mut gi = 0;
-            while gi < 4 {
-                syn <<= 1;
-                let masked = candidate & tables::HAMMING_GENERATOR[gi];
-                let mut parity = masked & 1;
-                let mut tmp = masked >> 1;
-                let mut j = 0;
-                while j < 14 {
-                    parity ^= tmp & 1;
-                    tmp >>= 1;
-                    j += 1;
-                }
-                syn |= parity;
-                gi += 1;
-            }
-            if syn == 0 {
-                valid_block = candidate;
-                break;
-            }
-            p += 1;
-        }
-
-        // Unpack to bit array.
-        let mut in_bits = [0u8; 15];
-        let mut bi = 0;
-        while bi < 15 {
-            in_bits[bi] = bit_at(valid_block, bi);
-            bi += 1;
-        }
-
-        // Flip bit 10 (a data bit).
-        in_bits[10] ^= 1;
-
-        let (out_bits, errs) = hamming_decode(&in_bits);
-
-        assert_eq!(errs, 1, "expected exactly 1 corrected error");
-
-        // Repack the output and verify bit 10 was corrected.
-        let expected_bit = bit_at(valid_block, 10);
-        assert_eq!(
-            out_bits[10], expected_bit,
-            "bit 10 should be corrected back to original"
-        );
     }
 
     /// Verifies that `ecc_c0` leaves a zero frame unchanged and reports

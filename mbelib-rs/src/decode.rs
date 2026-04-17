@@ -72,16 +72,27 @@ use crate::math::CosOscillator;
 use crate::params::{MAX_BANDS, MbeParams};
 use crate::tables;
 
-/// Status code for a valid voice frame with fully decoded parameters.
-const STATUS_VOICE: u32 = 0;
-
-/// Status code for an erasure frame (b0 120..=123). The frame is
-/// unrecoverable and the caller should use error concealment.
-const STATUS_ERASURE: u32 = 2;
-
-/// Status code for a tone signal frame (b0 126..=127). The frame
-/// contains a signaling tone rather than speech.
-const STATUS_TONE: u32 = 3;
+/// Result of decoding a single AMBE parameter vector.
+///
+/// For D-STAR, only [`FrameStatus::Voice`] produces synthesizable
+/// parameters; the other two variants signal that the caller should
+/// fall back to error concealment (reuse previous frame's parameters
+/// and increment the repeat counter).
+///
+/// D-STAR does not use codec-level tone signaling (DTMF and similar
+/// run over slow-data, not via AMBE tones), so in this crate
+/// [`FrameStatus::Tone`] is treated identically to erasure rather than
+/// being synthesized as a tone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameStatus {
+    /// Valid speech frame with fully decoded parameters.
+    Voice,
+    /// Erasure frame (b0 in 120..=123). The encoder explicitly signals
+    /// that this frame is unrecoverable.
+    Erasure,
+    /// Tone signaling frame (b0 in 126..=127). Unused by D-STAR.
+    Tone,
+}
 
 /// Number of PRBA coefficient blocks used in the forward/inverse DCT.
 const PRBA_BLOCKS: usize = 8;
@@ -110,15 +121,17 @@ const SILENCE_L: usize = 14;
 /// Decodes the 49-bit AMBE parameter vector into harmonic speech model parameters.
 ///
 /// See the [module-level documentation](self) for a full description of the
-/// decode pipeline. Returns: 0 = valid voice, 2 = erasure, 3 = tone signal.
+/// decode pipeline.
+///
+/// Returns [`FrameStatus::Voice`] for a normal speech frame. For erasure
+/// or tone frames (which D-STAR treats identically — see [`FrameStatus`]
+/// docs), returns early without modifying `cur`, so the caller can
+/// safely reuse the previous frame's parameters.
 pub(crate) fn decode_params(
     ambe_d: &[u8; AMBE_DATA_BITS],
     cur: &mut MbeParams,
     prev: &MbeParams,
-) -> u32 {
-    // Carry forward the repeat counter from previous frame.
-    cur.repeat = prev.repeat;
-
+) -> FrameStatus {
     // -- b0: fundamental frequency (7 bits) --
     let b0: usize = (bit(ambe_d, 0) << 6)
         | (bit(ambe_d, 1) << 5)
@@ -129,8 +142,8 @@ pub(crate) fn decode_params(
         | bit(ambe_d, 39);
 
     match b0 {
-        120..=123 => return STATUS_ERASURE,
-        126..=127 => return STATUS_TONE,
+        120..=123 => return FrameStatus::Erasure,
+        126..=127 => return FrameStatus::Tone,
         _ => {}
     }
 
@@ -156,7 +169,7 @@ pub(crate) fn decode_params(
     // -- Magnitude interpolation and final computation --
     compute_magnitudes(cur, prev, &tl, unvc);
 
-    STATUS_VOICE
+    FrameStatus::Voice
 }
 
 /// Decodes fundamental frequency and harmonic count from b0.
@@ -533,7 +546,6 @@ fn compute_magnitudes(cur: &mut MbeParams, prev: &MbeParams, tl: &[f32; MAX_BAND
     let big_gamma = 0.5_f32.mul_add(-cur_l_f32.log2(), cur.gamma) - sum42;
 
     // Final per-band magnitudes.
-    let mut k_count = 0_usize;
     for l in 1..=big_l {
         let int_k = *intkl.get(l).unwrap_or(&0);
         let delta = *deltal.get(l).unwrap_or(&0.0);
@@ -558,11 +570,7 @@ fn compute_magnitudes(cur: &mut MbeParams, prev: &MbeParams, tl: &[f32; MAX_BAND
                 unvc * linear_base
             };
         }
-        if is_voiced {
-            k_count += 1;
-        }
     }
-    cur.k = k_count;
 }
 
 /// Extracts a single bit from the parameter vector as a `usize`.
@@ -588,7 +596,11 @@ mod tests {
         let mut cur = MbeParams::new();
 
         let status = decode_params(&ambe_d, &mut cur, &prev);
-        assert_eq!(status, STATUS_VOICE, "all-zero input should be valid voice");
+        assert_eq!(
+            status,
+            FrameStatus::Voice,
+            "all-zero input should be valid voice"
+        );
 
         let table_f0 = *tables::W0_TABLE.first().ok_or("W0_TABLE[0] missing")?;
         let expected_w0 = table_f0 * std::f32::consts::TAU;
@@ -646,7 +658,7 @@ mod tests {
         let mut cur = MbeParams::new();
 
         let status = decode_params(&ambe_d, &mut cur, &prev);
-        assert_eq!(status, STATUS_VOICE);
+        assert_eq!(status, FrameStatus::Voice);
 
         for l in 1..=cur.l {
             assert!(
@@ -673,7 +685,7 @@ mod tests {
         }
 
         let status = decode_params(&ambe_d, &mut cur, &prev);
-        assert_eq!(status, STATUS_ERASURE, "b0=120 should be erasure");
+        assert_eq!(status, FrameStatus::Erasure, "b0=120 should be erasure");
     }
 
     /// Tone frames (b0 = 126..=127) should return status 3.
@@ -691,7 +703,7 @@ mod tests {
         }
 
         let status = decode_params(&ambe_d, &mut cur, &prev);
-        assert_eq!(status, STATUS_TONE, "b0=127 should be tone");
+        assert_eq!(status, FrameStatus::Tone, "b0=127 should be tone");
     }
 
     /// Silence frames (b0 = 124 or 125) should produce valid voice
@@ -710,7 +722,11 @@ mod tests {
         }
 
         let status = decode_params(&ambe_d, &mut cur, &prev);
-        assert_eq!(status, STATUS_VOICE, "silence frame should return status 0");
+        assert_eq!(
+            status,
+            FrameStatus::Voice,
+            "silence frame should return status 0"
+        );
         assert_eq!(cur.l, SILENCE_L, "silence L should be 14");
         assert!(
             (cur.w0 - SILENCE_W0).abs() < 1e-6,
@@ -742,7 +758,6 @@ mod tests {
         assert_eq!(s1, s2, "status codes must match");
         assert_eq!(cur1.w0.to_bits(), cur2.w0.to_bits(), "w0 must match");
         assert_eq!(cur1.l, cur2.l, "l must match");
-        assert_eq!(cur1.k, cur2.k, "k must match");
         assert_eq!(
             cur1.gamma.to_bits(),
             cur2.gamma.to_bits(),
@@ -775,7 +790,7 @@ mod tests {
 
         let mut cur = MbeParams::new();
         let status = decode_params(&ambe_d, &mut cur, &prev);
-        assert_eq!(status, STATUS_VOICE);
+        assert_eq!(status, FrameStatus::Voice);
 
         let dg = *tables::DG_TABLE.first().ok_or("DG_TABLE[0] missing")?;
         let expected = 0.5_f32.mul_add(4.0, dg);
@@ -817,18 +832,5 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    /// Repeat counter is carried from prev to cur.
-    #[test]
-    fn repeat_counter_carried() {
-        let ambe_d = [0u8; AMBE_DATA_BITS];
-        let mut prev = MbeParams::new();
-        prev.repeat = 2;
-
-        let mut cur = MbeParams::new();
-        let _status = decode_params(&ambe_d, &mut cur, &prev);
-
-        assert_eq!(cur.repeat, 2, "repeat should carry from prev");
     }
 }

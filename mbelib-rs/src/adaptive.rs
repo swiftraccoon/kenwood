@@ -53,21 +53,24 @@ const AMPLITUDE_PENALTY_PER_ERROR: i32 = 300;
 /// Base constant for the amplitude threshold formula (Algorithm #115).
 const AMPLITUDE_BASE: i32 = 6_000;
 /// AMBE 3600x2450 frame muting threshold (9.6%).
-pub(crate) const MUTING_THRESHOLD_AMBE: f32 = 0.096;
-/// Maximum consecutive frame repeats before muting.
-pub(crate) const MAX_FRAME_REPEATS: i32 = 3;
+///
+/// When the FEC-reported error rate for the frame exceeds this, the
+/// decoder emits comfort noise instead of synthesized speech. IMBE
+/// uses 8.75% instead, but this crate is AMBE-only (D-STAR).
+const MUTING_THRESHOLD_AMBE: f32 = 0.096;
 
-/// Returns true if frame muting should be applied based on the
-/// stored error rate exceeding the codec-specific threshold.
+/// Maximum consecutive C0-uncorrectable frames before muting.
+const MAX_FRAME_REPEATS: i32 = 3;
+
+/// C0 Golay(23,12) error-correction capacity. Above this, the C0
+/// codeword is too corrupt to trust; the decoder should reuse the
+/// previous frame's parameters and increment `repeat_count`.
+pub(crate) const GOLAY_C0_CAPACITY: u32 = 3;
+
+/// Returns true if frame muting should be applied based on the error
+/// rate threshold OR sustained C0-uncorrectable frames.
 pub(crate) fn requires_muting(params: &MbeParams) -> bool {
-    params.error_rate > params.muting_threshold
-}
-
-/// Returns true if the decoder has hit the maximum consecutive frame
-/// repeat count, indicating the parameter chain is too stale to be
-/// useful and the frame should be muted to comfort noise.
-pub(crate) const fn is_max_frame_repeat(params: &MbeParams) -> bool {
-    params.repeat_count >= MAX_FRAME_REPEATS
+    params.error_rate > MUTING_THRESHOLD_AMBE || params.repeat_count >= MAX_FRAME_REPEATS
 }
 
 /// Applies JMBE-compatible adaptive smoothing to the current frame's
@@ -90,7 +93,6 @@ pub(crate) fn apply_adaptive_smoothing(
     let big_l = cur.l;
     let error_rate = cur.error_rate;
     let error_total = cur.error_count_total;
-    let error_count_4 = cur.error_count_4;
 
     // Algorithm #111: local energy IIR.
     let rm0 = pre_enhance_rm0.unwrap_or_else(|| {
@@ -120,7 +122,7 @@ pub(crate) fn apply_adaptive_smoothing(
         // x^(3/8) computed as (x^(1/8))^3 = (sqrt(sqrt(sqrt(x))))^3
         let x8 = cur.local_energy.sqrt().sqrt().sqrt();
         let energy = x8 * x8 * x8;
-        if error_rate <= ERROR_THRESHOLD_ENTRY && error_count_4 == 0 {
+        if error_rate <= ERROR_THRESHOLD_ENTRY {
             (ADAPTIVE_GAIN * energy) / (ADAPTIVE_EXPONENT * error_rate).exp()
         } else {
             ADAPTIVE_ALT * energy
@@ -295,24 +297,24 @@ mod tests {
         assert!(max_abs > 0.0, "should not be silent");
     }
 
-    /// `requires_muting` is true exactly when `error_rate` exceeds threshold.
+    /// `requires_muting` is true when `error_rate` exceeds the AMBE
+    /// muting threshold OR when `repeat_count` reaches the max.
     #[test]
     fn muting_threshold() {
         let mut params = MbeParams::new();
-        // muting_threshold defaults to 0.096 (AMBE).
         params.error_rate = 0.05;
         assert!(!requires_muting(&params));
         params.error_rate = 0.10;
         assert!(requires_muting(&params));
     }
 
-    /// Repeat-count muting fires at `MAX_FRAME_REPEATS`.
+    /// `requires_muting` fires on sustained C0-uncorrectable frames.
     #[test]
     fn repeat_count_muting() {
         let mut params = MbeParams::new();
-        params.repeat_count = 2;
-        assert!(!is_max_frame_repeat(&params));
-        params.repeat_count = 3;
-        assert!(is_max_frame_repeat(&params));
+        params.repeat_count = MAX_FRAME_REPEATS - 1;
+        assert!(!requires_muting(&params));
+        params.repeat_count = MAX_FRAME_REPEATS;
+        assert!(requires_muting(&params));
     }
 }

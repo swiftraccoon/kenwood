@@ -11,7 +11,7 @@
 //!
 //! - `ambe3600x2450_const.h`: W0, L, VUV, DG, PRBA24, PRBA58, HOC B5-B8, LMPRBL
 //! - `mbelib_const.h`: WS (synthesis window)
-//! - `ecc_const.h`: Golay generator/matrix, Hamming generator/matrix
+//! - `ecc_const.h`: Golay generator/matrix
 
 // ---- Fundamental Frequency Quantization (ambe3600x2450_const.h) ----
 
@@ -1168,28 +1168,4 @@ pub(crate) static GOLAY_MATRIX: [i32; 2048] = [
     24, 1088, 256, 2176, 512, 2176, 2176, 2176, 256, 34, 256, 256, 64, 13, 256, 2176,
     2304, 8, 8, 8, 512, 1044, 32, 8, 1025, 34, 656, 8, 64, 128, 2054, 257,
     512, 34, 69, 8, 512, 512, 512, 2176, 34, 34, 256, 34, 512, 34, 1032, 80,
-];
-
-/// Hamming (15,11) generator polynomial coefficients.
-///
-/// 4 entries, one per parity bit position. Used to compute the
-/// 4-bit Hamming parity. Test-only: the AMBE 3600x2450 codec does
-/// not use Hamming, and the decoder is only referenced from the
-/// unit tests that exercise it for future IMBE variants.
-#[cfg(test)]
-#[rustfmt::skip]
-pub(crate) static HAMMING_GENERATOR: [i32; 4] = [
-    0x7f08, 0x78e4, 0x66d2, 0x55b1,
-];
-
-/// Hamming (15,11) syndrome lookup table (16 entries).
-///
-/// Indexed by the 4-bit syndrome value. Returns a bit-position
-/// mask for single-bit error correction. Entry 0 means no error.
-/// Test-only for the same reason as [`HAMMING_GENERATOR`].
-#[cfg(test)]
-#[rustfmt::skip]
-pub(crate) static HAMMING_MATRIX: [i32; 16] = [
-    0x0, 0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40,
-    0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000,
 ];

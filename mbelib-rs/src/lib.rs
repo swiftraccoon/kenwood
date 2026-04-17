@@ -42,15 +42,20 @@
 //! Each frame passes through these stages:
 //!
 //! 1. **Bit unpacking** — 72-bit frame → 4 FEC codeword bitplanes
-//! 2. **Error correction** — Golay(23,12) on C0/C1, Hamming(15,11) on C3
+//! 2. **Error correction** — Golay(23,12) on C0 and C1 (3-error
+//!    correction). AMBE 3600×2450 does not apply Hamming to C3; those
+//!    14 bits are copied verbatim into the parameter vector.
 //! 3. **Demodulation** — LFSR descrambling of C1 using C0 seed
 //! 4. **Parameter extraction** — 49 decoded bits → fundamental frequency,
-//!    harmonic count, voiced/unvoiced decisions, spectral magnitudes
+//!    harmonic count, voiced/unvoiced decisions, spectral magnitudes.
+//!    Frames with b0 in the erasure range (120..=123) or tone range
+//!    (126..=127) trigger the same repeat/conceal path as Golay-C0
+//!    failures, since D-STAR does not use codec-level tone signaling.
 //! 5. **Spectral enhancement** — adaptive amplitude weighting for clarity
 //! 6. **Adaptive smoothing** — JMBE algorithms #111-116, gracefully
 //!    damps spurious magnitudes/voicing decisions on noisy frames
 //! 7. **Frame muting check** — comfort noise on excessive errors or
-//!    repeats (JMBE-compatible)
+//!    sustained repeat frames (JMBE-compatible)
 //! 8. **Synthesis** — voiced bands per-band cosine oscillators (with
 //!    JMBE phase/amplitude interpolation for low harmonics) plus a
 //!    single FFT-based unvoiced pass (JMBE algorithms #117-126)
@@ -156,18 +161,41 @@ impl AmbeDecoder {
         unpack::demodulate_c1(&mut ambe_fr);
         let other_errors = ecc::ecc_data(&ambe_fr, &mut ambe_d);
 
-        // Decode the 49 parameter bits into the harmonic speech model.
-        let _decode_status = decode::decode_params(&ambe_d, &mut self.cur, &self.prev);
+        // Error concealment: three conditions trigger "reuse previous
+        // frame's parameters + increment repeat_count" for the current
+        // frame. `repeat_count` accumulates across consecutive bad
+        // frames; sustained failures (≥3) trigger muting downstream.
+        //
+        // 1. C0-uncorrectable (Golay(23,12) exceeded its 3-error
+        //    correction capacity). b0 and the other C0 data bits are
+        //    untrustworthy, so decode_params shouldn't even run.
+        // 2. decode_params returned `Erasure`: b0 in 120..=123 is the
+        //    AMBE codec's explicit "unrecoverable frame" signal.
+        // 3. decode_params returned `Tone`: b0 in 126..=127 signals a
+        //    codec-level tone. D-STAR doesn't use codec tones (DTMF
+        //    goes over slow-data), so we treat this as erasure too.
+        let mut reuse_prev = c0_errors > adaptive::GOLAY_C0_CAPACITY;
+        if !reuse_prev {
+            reuse_prev = decode::decode_params(&ambe_d, &mut self.cur, &self.prev)
+                != decode::FrameStatus::Voice;
+        }
+
+        if reuse_prev {
+            let prev_repeat = self.prev_enhanced.repeat_count;
+            self.cur.copy_from(&self.prev_enhanced);
+            self.cur.repeat_count = prev_repeat + 1;
+        } else {
+            self.cur.repeat_count = 0;
+        }
 
         // Update error tracking for adaptive smoothing and muting.
-        // AMBE 3600x2450 has 72 raw bits; C4 is IMBE-only (always 0 here).
+        // AMBE 3600x2450 has 72 raw bits.
         #[expect(
             clippy::cast_possible_wrap,
             reason = "error counts are at most a few dozen; fit in i32"
         )]
         {
             self.cur.error_count_total = (c0_errors + other_errors) as i32;
-            self.cur.error_count_4 = 0;
         }
         #[expect(
             clippy::cast_precision_loss,
@@ -198,12 +226,10 @@ impl AmbeDecoder {
             Some(pre_enhance_rm0),
         );
 
-        // Check muting conditions: max repeat count or AMBE error-rate
-        // threshold. Muting outputs comfort noise instead of synthesized
-        // speech, while preserving model state for next-frame recovery.
-        let muted = adaptive::is_max_frame_repeat(&self.cur)
-            || (self.cur.muting_threshold <= adaptive::MUTING_THRESHOLD_AMBE
-                && adaptive::requires_muting(&self.cur));
+        // Muting: output comfort noise instead of synthesized speech
+        // when the FEC-reported error rate exceeds the AMBE threshold.
+        // Preserves model state for next-frame recovery.
+        let muted = adaptive::requires_muting(&self.cur);
 
         let mut pcm_f = [0.0_f32; FRAME_SAMPLES];
         if muted {
