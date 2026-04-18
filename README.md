@@ -12,63 +12,63 @@
 [![Security](https://img.shields.io/github/actions/workflow/status/swiftraccoon/kenwood/security.yml?label=Security&logo=githubactions)](https://github.com/swiftraccoon/kenwood/actions/workflows/security.yml)
 [![codecov](https://codecov.io/gh/swiftraccoon/kenwood/graph/badge.svg?token=TVW1UKPRMW)](https://codecov.io/gh/swiftraccoon/kenwood)
 
-Rust libraries, TUI, and accessible REPL for Kenwood amateur radio transceivers.
+Rust workspace for Kenwood amateur-radio transceivers: core TH-D75 library, TUI, accessible REPL, plus generic packet-radio, D-STAR reflector, and MMDVM protocol stacks usable independently of any specific radio.
 
-> **WARNING: This project is a work in progress. Use at your own risk. There are no guarantees that this software will not damage, brick, or otherwise render your radio inoperable. Incorrect memory writes can corrupt radio configuration. Do not use this on a radio you are not prepared to factory reset or send in for service.**
+> **Hardware risk.** This code talks to real radios over CAT, MCP, KISS, and MMDVM. Incorrect memory writes can corrupt radio configuration. Do not use this on a radio you are not prepared to factory-reset or send in for service. No warranty; see [LICENSE](LICENSE).
 
-![thd75-tui](thd75_tui.png)
+> **API instability.** Every crate in this workspace is pre-1.0 and pre-release. Public APIs change without notice — often within a single commit. Nothing here is published to crates.io. Pin to a specific git SHA if you need a stable build. `Cargo.lock` is gitignored.
+
 
 ## Radios
 
-| Radio | Library | TUI | REPL | Status |
-|-------|---------|-----|------|--------|
-| TH-D75 | `thd75/` | `thd75-tui/` | `thd75-repl/` | In development |
+| Radio | Core | TUI | REPL | Status |
+|-------|------|-----|------|--------|
+| TH-D75A/E | [`thd75/`](thd75/) | [`thd75-tui/`](thd75-tui/) | [`thd75-repl/`](thd75-repl/) | In development |
 | TM-D750 | Planned | Planned | Planned | Not started |
 
 ## Crates
 
-This is a Cargo workspace with four crates:
+Stability column:
+- `experimental` — may not compile on all platforms; under heavy change.
+- `alpha` — builds, tests pass, API breaks often.
+- `pre-release` — feature-complete within its stated scope; API still unstable pending downstream integration.
 
-- **`thd75/`** — core TH-D75 library (async Rust, CAT/MCP/SD card, full hardware control)
-- **`thd75-tui/`** — terminal UI frontend built on the core library
-- **`thd75-repl/`** — accessible REPL for blind operators (screen-reader-friendly, D-STAR gateway, APRS-IS)
-- **`dstar-gateway/`** — standalone D-STAR reflector client (DExtra/DPlus/DCS), usable independently of the TH-D75
+| Crate | Purpose | Stability |
+|-------|---------|-----------|
+| [`thd75/`](thd75/) | TH-D75 library: CAT, MCP programming, SD-card parsing, transports, high-level `AprsClient` | alpha |
+| [`thd75-tui/`](thd75-tui/) | Terminal UI for the TH-D75 | alpha |
+| [`thd75-repl/`](thd75-repl/) | Screen-reader-friendly REPL (CAT, APRS, D-STAR gateway) | alpha |
+| [`kiss-tnc/`](kiss-tnc/) | KISS TNC wire framing (`no_std` + `alloc`, sans-io) | pre-release |
+| [`ax25-codec/`](ax25-codec/) | AX.25 v2.2 frame codec (`no_std` + `alloc`, sans-io) | pre-release |
+| [`aprs/`](aprs/) | APRS parser, digipeater, SmartBeaconing, messaging, station list (std, sans-io) | pre-release |
+| [`aprs-is/`](aprs-is/) | APRS-IS TCP client (tokio) | pre-release |
+| [`dstar-gateway-core/`](dstar-gateway-core/) | DPlus / DExtra / DCS reflector codecs + typestate client and server sessions (no I/O) | alpha |
+| [`dstar-gateway/`](dstar-gateway/) | Tokio async shell over `dstar-gateway-core` with auth and host-file fetcher | alpha |
+| [`dstar-gateway-server/`](dstar-gateway-server/) | Multi-client D-STAR reflector server with cross-protocol forwarding | experimental |
+| [`mmdvm-core/`](mmdvm-core/) | Sans-io MMDVM modem protocol codec | alpha |
+| [`mmdvm/`](mmdvm/) | Tokio async shell for MMDVM modems | alpha |
+| [`mbelib-rs/`](mbelib-rs/) | AMBE voice-frame decoder | experimental |
+| [`stargazer/`](stargazer/) | Tracing / metrics / observability scaffolding | experimental |
 
-## Accessible REPL
-
-`thd75-repl` is a screen-reader-friendly command-line interface for blind and visually impaired operators. It follows WCAG 2.1 accessibility guidelines and the CHI 2021 CLI accessibility study recommendations:
-
-- Plain text output, one self-contained line per datum
-- Natural language units ("146.52 megahertz", not "146520000 Hz")
-- All abbreviations expanded on first use
-- Consistent "Error:" prefix for screen reader search
-- No box drawing, escape sequences, spinners, or cursor repositioning
-- Three operating modes: CAT (radio control), APRS (packet radio), D-STAR (digital voice gateway)
+## Building
 
 ```
-$ thd75-repl
-Kenwood TH-D75 accessible radio control, version 0.1.0.
-Connected via bluetooth:TH-D75.
-Radio is in D-STAR Reflector Terminal Mode.
-Type dstar start <callsign> to begin, or quit to exit.
-d75> dstar start KQ4NIT
-Checking if radio is already in D-STAR gateway mode.
-Radio is already in Reflector Terminal Mode.
-Starting D-STAR gateway as KQ4NIT.
-MMDVM modem initialized.
-No reflector specified. Use link command to connect.
-D-STAR gateway active. Type dstar stop to exit.
-Commands: listen, link, unlink, heard, status, dstar stop
-dstar> link REF030C
-Connecting to REF030 module C at 45.79.43.161:20001.
-Authenticating with D-STAR gateway server.
-Authentication successful.
-Waiting for reflector acknowledgement.
-Connected to REF030 module C.
-dstar> monitor
-Entering monitor mode. Press Ctrl-C to return to prompt.
-Reflector: voice from K3ATA to CQCQCQ.
-Reflector: voice transmission ended.
-Reflector: voice from KF0WFM to CQCQCQ.
-Reflector: voice transmission ended.
+cargo build --workspace
+cargo test --workspace
+./lint.sh       # clippy --all-targets, cargo-audit, cargo-deny, cargo-machete, fmt
+./ci-local.sh   # cross-platform CI in macOS + Ubuntu + Fedora pods
 ```
+
+Rust 1.94+, edition 2024. Workspace-level lints enforce `unsafe_code = "forbid"`, `missing_docs = "deny"`, and clippy `pedantic`/`nursery`/`cargo` across every crate.
+
+## License
+
+GPL-2.0-or-later.
+
+Derived works and attribution:
+
+- [`mmdvm/`](mmdvm/) and [`mmdvm-core/`](mmdvm-core/) — portions derived from [MMDVMHost](https://github.com/g4klx/MMDVMHost) by Jonathan Naylor G4KLX (2015–2026, GPL-2.0-or-later).
+- [`dstar-gateway-core/`](dstar-gateway-core/) reflector codec constants and session-transition timing — derived from [ircDDBGateway](https://github.com/g4klx/ircDDBGateway) by Jonathan Naylor G4KLX (GPL-2.0-or-later) and [xlxd](https://github.com/LX3JL/xlxd) by LX3JL and contributors (GPL-2.0-or-later).
+- [`mbelib-rs/`](mbelib-rs/) — Rust port of [mbelib](https://github.com/szechyjs/mbelib) and [DSD](https://github.com/szechyjs/dsd) by szechyjs (originally ISC-licensed; redistributed here under GPL-2.0-or-later per ISC's relicensing allowance). Relicensing pathway follows [mbelib-neo](https://github.com/arancormonk/mbelib-neo) by arancormonk.
+- [`aprs/`](aprs/) SmartBeaconing implementation — algorithm by Tony Arnerich KD7TA and Steve Bragg KA9MVA (HamHUD).
+- KISS protocol specification (Chepponis / Karn, 1987) and AX.25 v2.2 (TAPR, 1998) are referenced as public specifications, not derivations.

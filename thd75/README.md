@@ -10,7 +10,8 @@ Async Rust library for full control of the Kenwood TH-D75 ham radio transceiver.
 - **CAT protocol** — All 55 commands with strict type safety. Every parameter uses validated types that reject invalid values at construction time.
 - **MCP programming** — Binary memory read/write via `0M PROGRAM` mode. Read and modify all 1,200 channels, settings, and calibration data.
 - **SD card parsing** — Read `.d75` configs, `.nme` GPS logs, `.tsv` repeater/callsign/QSO lists, `.wav` audio recordings, and `.bmp` screen captures.
-- **KISS TNC** — Full KISS frame encode/decode, AX.25 UI frame parsing, and APRS data parsing (position, message, status, object, item, weather, Mic-E, compressed).
+- **APRS integration** — High-level `AprsClient` that owns `Radio<T>` + `KissSession` and threads `now: Instant` into the sans-io stack. Packet-radio protocol code (KISS framing, AX.25 codec, APRS parser/digipeater/SmartBeaconing/messaging/station-list, APRS-IS) lives in the sibling [`kiss-tnc`](../kiss-tnc/), [`ax25-codec`](../ax25-codec/), [`aprs`](../aprs/), [`aprs-is`](../aprs-is/) crates.
+- **MCP bridge** — `From<McpSmartBeaconingConfig> for aprs::SmartBeaconingConfig` (mph → km/h) in `thd75/src/aprs/mcp_bridge.rs`.
 - **Transport layer** — USB (CDC ACM) and Bluetooth SPP with auto-detection. Native IOBluetooth on macOS, serial RFCOMM on Linux/Windows.
 - **Async** — Built on tokio. All radio operations are async.
 
