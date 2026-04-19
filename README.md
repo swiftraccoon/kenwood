@@ -47,7 +47,8 @@ Stability column:
 | [`dstar-gateway-server/`](dstar-gateway-server/) | Multi-client D-STAR reflector server with cross-protocol forwarding | experimental |
 | [`mmdvm-core/`](mmdvm-core/) | Sans-io MMDVM modem protocol codec | alpha |
 | [`mmdvm/`](mmdvm/) | Tokio async shell for MMDVM modems | alpha |
-| [`mbelib-rs/`](mbelib-rs/) | AMBE voice-frame decoder | experimental |
+| [`mbelib-rs/`](mbelib-rs/) | AMBE 3600×2400 voice codec (decoder default; encoder behind `--features encoder`) | experimental |
+| [`sextant/`](sextant/) | GUI D-STAR reflector client — exercises the laptop-only encode/decode pipeline against a local `polaris` reflector | experimental |
 | [`stargazer/`](stargazer/) | Tracing / metrics / observability scaffolding | experimental |
 
 ## Building

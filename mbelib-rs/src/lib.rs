@@ -7,10 +7,10 @@
 // JMBE-compatible algorithm ports adapted from arancormonk/mbelib-neo
 // (also GPL-2.0-or-later).
 
-//! Pure Rust AMBE 3600×2450 voice codec decoder for D-STAR digital radio.
+//! Pure Rust AMBE 3600×2400 voice codec decoder for D-STAR digital radio.
 //!
-//! The AMBE (Advanced Multi-Band Excitation) 3600×2450 codec compresses
-//! speech at 3600 bits/second with 2450 bits of voice data and 1150 bits
+//! The AMBE (Advanced Multi-Band Excitation) 3600×2400 codec compresses
+//! speech at 3600 bits/second with 2400 bits of voice data and 1200 bits
 //! of forward error correction (FEC). It is the mandatory voice codec
 //! for the JARL D-STAR digital radio standard, used in all D-STAR
 //! transceivers and reflectors worldwide.
@@ -43,7 +43,7 @@
 //!
 //! 1. **Bit unpacking** — 72-bit frame → 4 FEC codeword bitplanes
 //! 2. **Error correction** — Golay(23,12) on C0 and C1 (3-error
-//!    correction). AMBE 3600×2450 does not apply Hamming to C3; those
+//!    correction). AMBE 3600×2400 does not apply Hamming to C3; those
 //!    14 bits are copied verbatim into the parameter vector.
 //! 3. **Demodulation** — LFSR descrambling of C1 using C0 seed
 //! 4. **Parameter extraction** — 49 decoded bits → fundamental frequency,
@@ -65,6 +65,8 @@
 mod adaptive;
 mod decode;
 mod ecc;
+#[cfg(feature = "encoder")]
+mod encode;
 mod enhance;
 mod error;
 mod math;
@@ -75,6 +77,79 @@ mod unpack;
 mod unvoiced_fft;
 
 pub use error::DecodeError;
+
+/// Inspection helper for golden-vector validation.
+///
+/// Runs just the unpack → ECC → parameter-extract pipeline for a
+/// single frame and returns `(b[0..9], w0, L, ambe_d)` as the decoder
+/// sees them.  Used by the validation harness in
+/// `examples/decode_ambe_stream.rs` to diff against mbelib's decoded
+/// `(b, w0, L, ambe_d)` for identical wire bytes.
+///
+/// The full `ambe_d` vector (49 bits, one byte per bit, 0 or 1) is
+/// returned alongside the extracted parameter fields so downstream
+/// tooling can localize a divergence to "ECC disagrees" (`ambe_d`
+/// bits differ) vs "parameter extraction disagrees" (`ambe_d` bits
+/// match but `b[]` differs).
+///
+/// This is deliberately stateless — each call constructs fresh
+/// `MbeParams` — so the output depends only on the input bytes and
+/// can be compared frame-for-frame against another implementation.
+#[must_use]
+pub fn decode_trace(ambe: &[u8; 9]) -> ([usize; 9], f32, usize, [u8; 49]) {
+    let mut ambe_fr = [0u8; AMBE_FRAME_BITS];
+    let mut ambe_d = [0u8; AMBE_DATA_BITS];
+    unpack::unpack_frame(ambe, &mut ambe_fr);
+    let _ = ecc::ecc_c0(&mut ambe_fr);
+    unpack::demodulate_c1(&mut ambe_fr);
+    let _ = ecc::ecc_data(&ambe_fr, &mut ambe_d);
+
+    let bit = |i: usize| usize::from(*ambe_d.get(i).unwrap_or(&0));
+    let b0 = (bit(0) << 6)
+        | (bit(1) << 5)
+        | (bit(2) << 4)
+        | (bit(3) << 3)
+        | (bit(4) << 2)
+        | (bit(5) << 1)
+        | bit(48);
+    let b1 = (bit(38) << 3) | (bit(39) << 2) | (bit(40) << 1) | bit(41);
+    let b2 =
+        (bit(6) << 5) | (bit(7) << 4) | (bit(8) << 3) | (bit(9) << 2) | (bit(42) << 1) | bit(43);
+    let b3 = (bit(10) << 8)
+        | (bit(11) << 7)
+        | (bit(12) << 6)
+        | (bit(13) << 5)
+        | (bit(14) << 4)
+        | (bit(15) << 3)
+        | (bit(16) << 2)
+        | (bit(44) << 1)
+        | bit(45);
+    let b4 = (bit(17) << 6)
+        | (bit(18) << 5)
+        | (bit(19) << 4)
+        | (bit(20) << 3)
+        | (bit(21) << 2)
+        | (bit(46) << 1)
+        | bit(47);
+    let b5 = (bit(22) << 3) | (bit(23) << 2) | (bit(25) << 1) | bit(26);
+    let b6 = (bit(27) << 3) | (bit(28) << 2) | (bit(29) << 1) | bit(30);
+    let b7 = (bit(31) << 3) | (bit(32) << 2) | (bit(33) << 1) | bit(34);
+    let b8 = (bit(35) << 3) | (bit(36) << 2) | (bit(37) << 1);
+
+    let b = [b0, b1, b2, b3, b4, b5, b6, b7, b8];
+    let f0 = *tables::W0_TABLE.get(b0).unwrap_or(&0.0);
+    let w0 = f0 * std::f32::consts::TAU;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let big_l = *tables::L_TABLE.get(b0).unwrap_or(&0.0) as usize;
+    (b, w0, big_l, ambe_d)
+}
+
+#[cfg(feature = "encoder")]
+pub use encode::{
+    AmbeEncoder, EncoderBuffers, FftPlan, MAX_BANDS, MAX_HARMONICS, PitchEstimate, PitchTracker,
+    SpectralAmplitudes, VuvDecisions, analyze_frame, detect_vuv, extract_spectral_amplitudes,
+    pack_frame, validation,
+};
 
 use ecc::AMBE_DATA_BITS;
 use params::MbeParams;
@@ -89,10 +164,10 @@ const GAIN: f32 = 7.0;
 /// mbelib-neo's JMBE-parity soft-clip at 95% of i16 max.
 const CLAMP_MAX: f32 = 32_767.0 * 0.95;
 
-/// Total bits per AMBE 3600x2450 frame (used to compute error rate).
+/// Total bits per AMBE 3600x2400 frame (used to compute error rate).
 const FRAME_BITS: f32 = 72.0;
 
-/// Stateful AMBE 3600×2450 voice frame decoder.
+/// Stateful AMBE 3600×2400 voice frame decoder.
 ///
 /// The AMBE codec uses inter-frame prediction: each frame's gain and
 /// spectral magnitudes are delta-coded against the previous frame.
@@ -189,7 +264,7 @@ impl AmbeDecoder {
         }
 
         // Update error tracking for adaptive smoothing and muting.
-        // AMBE 3600x2450 has 72 raw bits.
+        // AMBE 3600x2400 has 72 raw bits.
         #[expect(
             clippy::cast_possible_wrap,
             reason = "error counts are at most a few dozen; fit in i32"

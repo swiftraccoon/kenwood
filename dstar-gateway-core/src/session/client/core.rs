@@ -141,6 +141,28 @@ pub struct SessionCore {
     /// so the cache is not consulted on those protocols — it is still
     /// populated for symmetry and future header retransmit support.
     cached_tx_header: Option<DStarHeader>,
+    /// Stream id of the currently-active incoming voice stream, or
+    /// `None` when no stream is active.
+    ///
+    /// D-STAR protocols retransmit the voice header periodically
+    /// (DExtra/DPlus: once per ~21-frame superframe; DCS: embedded in
+    /// every voice frame, so every `seq == 0` frame carries a fresh
+    /// copy). This is a protocol feature so that late-joining listeners
+    /// can decode the stream even if they missed the initial header.
+    ///
+    /// Without tracking the "active stream" here, every retransmitted
+    /// header would surface as a fresh [`RawEvent::VoiceStart`] to the
+    /// consumer — which resets any decoder state kept per stream and
+    /// sounds like the first few frames of the stream repeating over
+    /// and over (because those are the only frames the decoder ever
+    /// converges on before being reset again).
+    ///
+    /// Populated by the header-emitting branch of
+    /// [`Self::handle_input`]; cleared on [`RawEvent::VoiceEnd`]. A
+    /// mid-stream change in `stream_id` (new talker on the same
+    /// module) triggers a synthesized `VoiceEnd` for the outgoing
+    /// stream id followed by a `VoiceStart` for the new one.
+    active_rx_stream: Option<StreamId>,
     /// Diagnostic sink for lenient parser warnings.
     ///
     /// Concrete [`VecSink`] owned by the core so [`Self::drain_diagnostics`]
@@ -165,12 +187,84 @@ impl std::fmt::Debug for SessionCore {
             .field("events", &self.events)
             .field("host_list", &self.host_list)
             .field("cached_tx_header", &self.cached_tx_header)
+            .field("active_rx_stream", &self.active_rx_stream)
             .field("diagnostics", &self.diagnostics)
             .finish()
     }
 }
 
 impl SessionCore {
+    // ── Stream bookkeeping helpers ────────────────────────────
+
+    /// Emit [`RawEvent::VoiceStart`] for a new incoming stream,
+    /// suppressing the event for retransmitted headers of the
+    /// currently-active stream.
+    ///
+    /// D-STAR reflectors retransmit the voice header (DExtra/DPlus:
+    /// per super-frame, DCS: embedded in every voice frame) so
+    /// late-joining clients can decode. Without the
+    /// [`Self::active_rx_stream`] check, every retransmit would
+    /// surface as a fresh `VoiceStart`, which typically resets the
+    /// consumer's per-stream AMBE decoder state — the user hears the
+    /// first few frames of the stream looping indefinitely.
+    ///
+    /// If `stream_id` differs from the current active stream, an
+    /// [`RawEvent::VoiceEnd`] with
+    /// [`VoiceEndReason::Inactivity`] is synthesized for the old
+    /// stream before the new `VoiceStart` — covers the case where a
+    /// new talker takes the module mid-flight without an EOT from
+    /// the previous one.
+    fn emit_voice_start_if_new(&mut self, stream_id: StreamId, header: DStarHeader) {
+        match self.active_rx_stream {
+            Some(current) if current == stream_id => {
+                tracing::trace!(
+                    target: "dstar_gateway_core::session::client",
+                    stream_id = format_args!("{:#06X}", stream_id.get()),
+                    "suppressing retransmitted voice header for active stream"
+                );
+            }
+            Some(old_sid) => {
+                tracing::debug!(
+                    target: "dstar_gateway_core::session::client",
+                    old_sid = format_args!("{:#06X}", old_sid.get()),
+                    new_sid = format_args!("{:#06X}", stream_id.get()),
+                    "mid-stream sid change — synthesizing VoiceEnd for old + VoiceStart for new"
+                );
+                self.events.push_back(RawEvent::VoiceEnd {
+                    stream_id: old_sid,
+                    reason: VoiceEndReason::Inactivity,
+                });
+                self.active_rx_stream = Some(stream_id);
+                self.events
+                    .push_back(RawEvent::VoiceStart { stream_id, header });
+            }
+            None => {
+                tracing::debug!(
+                    target: "dstar_gateway_core::session::client",
+                    stream_id = format_args!("{:#06X}", stream_id.get()),
+                    "new voice stream — emitting VoiceStart"
+                );
+                self.active_rx_stream = Some(stream_id);
+                self.events
+                    .push_back(RawEvent::VoiceStart { stream_id, header });
+            }
+        }
+    }
+
+    /// Emit [`RawEvent::VoiceEnd`] and clear the active-stream tracker.
+    fn emit_voice_end(&mut self, stream_id: StreamId, reason: VoiceEndReason) {
+        tracing::debug!(
+            target: "dstar_gateway_core::session::client",
+            stream_id = format_args!("{:#06X}", stream_id.get()),
+            ?reason,
+            was_active = self.active_rx_stream == Some(stream_id),
+            "emitting VoiceEnd, clearing active stream tracker"
+        );
+        self.active_rx_stream = None;
+        self.events
+            .push_back(RawEvent::VoiceEnd { stream_id, reason });
+    }
+
     // ── Construction ──────────────────────────────────────────
 
     /// Build a new [`SessionCore`] in [`ClientStateKind::Configured`].
@@ -246,6 +340,7 @@ impl SessionCore {
             events: VecDeque::new(),
             host_list: None,
             cached_tx_header: None,
+            active_rx_stream: None,
             diagnostics: VecSink::default(),
         }
     }
@@ -746,8 +841,7 @@ impl SessionCore {
             }
             dplus::ServerPacket::VoiceHeader { stream_id, header } => {
                 self.arm_keepalive_inactivity(now);
-                self.events
-                    .push_back(RawEvent::VoiceStart { stream_id, header });
+                self.emit_voice_start_if_new(stream_id, header);
                 Ok(())
             }
             dplus::ServerPacket::VoiceData {
@@ -765,10 +859,7 @@ impl SessionCore {
             }
             dplus::ServerPacket::VoiceEot { stream_id, seq: _ } => {
                 self.arm_keepalive_inactivity(now);
-                self.events.push_back(RawEvent::VoiceEnd {
-                    stream_id,
-                    reason: VoiceEndReason::Eot,
-                });
+                self.emit_voice_end(stream_id, VoiceEndReason::Eot);
                 Ok(())
             }
         }
@@ -823,8 +914,7 @@ impl SessionCore {
             }
             dextra::ServerPacket::VoiceHeader { stream_id, header } => {
                 self.arm_keepalive_inactivity(now);
-                self.events
-                    .push_back(RawEvent::VoiceStart { stream_id, header });
+                self.emit_voice_start_if_new(stream_id, header);
                 Ok(())
             }
             dextra::ServerPacket::VoiceData {
@@ -842,10 +932,7 @@ impl SessionCore {
             }
             dextra::ServerPacket::VoiceEot { stream_id, seq: _ } => {
                 self.arm_keepalive_inactivity(now);
-                self.events.push_back(RawEvent::VoiceEnd {
-                    stream_id,
-                    reason: VoiceEndReason::Eot,
-                });
+                self.emit_voice_end(stream_id, VoiceEndReason::Eot);
                 Ok(())
             }
         }
@@ -905,18 +992,18 @@ impl SessionCore {
             } => {
                 self.arm_keepalive_inactivity(now);
                 if is_end {
-                    self.events.push_back(RawEvent::VoiceEnd {
-                        stream_id,
-                        reason: VoiceEndReason::Eot,
-                    });
-                } else if seq == 0 {
-                    // DCS doesn't have a separate header packet — the
-                    // first frame (seq=0) carries the embedded header.
-                    // Surface it as the stream-start event so consumers
-                    // see VoiceStart, then VoiceFrame, ..., VoiceEnd.
-                    self.events
-                        .push_back(RawEvent::VoiceStart { stream_id, header });
+                    self.emit_voice_end(stream_id, VoiceEndReason::Eot);
                 } else {
+                    // DCS embeds the D-STAR header in every voice
+                    // frame. Treat `seq == 0` (or a fresh stream id)
+                    // as the stream-start trigger via
+                    // [`Self::emit_voice_start_if_new`], but ALWAYS
+                    // surface the frame as `VoiceFrame` too — the
+                    // `seq == 0` frame carries real voice data plus
+                    // the superframe sync pattern in slow-data, so
+                    // dropping it (as the pre-fix code did) left
+                    // audible gaps every 420 ms.
+                    self.emit_voice_start_if_new(stream_id, header);
                     self.events.push_back(RawEvent::VoiceFrame {
                         stream_id,
                         seq,
@@ -1785,6 +1872,59 @@ mod tests {
     }
 
     #[test]
+    fn dextra_retransmitted_voice_header_does_not_re_emit_voice_start() -> TestResult {
+        // Regression test: D-STAR voice headers are retransmitted by
+        // reflectors every superframe (~21 frames / 420 ms) so late
+        // joiners can decode. The previous client emitted VoiceStart
+        // on every header packet, which reset per-stream decoder
+        // state in the consumer (heard as "first ~80 ms of the
+        // stream repeating over and over"). The fix is to track the
+        // currently-active stream and suppress duplicate headers.
+        let (mut core, _) = connected_dextra()?;
+        let now = Instant::now();
+        let mut buf = [0u8; 64];
+        let n = dextra_codec::encode_voice_header(&mut buf, sid(0x1234), &test_header())?;
+        core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+        core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+        core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+        let first = core.pop_event::<DExtra>().ok_or("no event")?;
+        assert!(matches!(first, Event::VoiceStart { stream_id, .. } if stream_id.get() == 0x1234));
+        assert!(
+            core.pop_event::<DExtra>().is_none(),
+            "retransmitted headers must not emit additional events"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dextra_mid_stream_sid_change_synthesizes_voice_end() -> TestResult {
+        // If a new talker takes the module without an explicit EOT
+        // from the previous one, the client surfaces a synthetic
+        // VoiceEnd(Inactivity) for the old stream before emitting
+        // VoiceStart for the new one.
+        let (mut core, _) = connected_dextra()?;
+        let now = Instant::now();
+        let mut buf = [0u8; 64];
+        let n = dextra_codec::encode_voice_header(&mut buf, sid(0x1234), &test_header())?;
+        core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+        let n = dextra_codec::encode_voice_header(&mut buf, sid(0x5678), &test_header())?;
+        core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+        let first = core.pop_event::<DExtra>().ok_or("no event 1")?;
+        assert!(matches!(first, Event::VoiceStart { stream_id, .. } if stream_id.get() == 0x1234));
+        let second = core.pop_event::<DExtra>().ok_or("no event 2")?;
+        assert!(
+            matches!(second, Event::VoiceEnd { stream_id, reason } if stream_id.get() == 0x1234 && reason == VoiceEndReason::Inactivity),
+            "expected synthesized VoiceEnd for old stream, got {second:?}"
+        );
+        let third = core.pop_event::<DExtra>().ok_or("no event 3")?;
+        assert!(
+            matches!(third, Event::VoiceStart { stream_id, .. } if stream_id.get() == 0x5678),
+            "expected VoiceStart for new stream, got {third:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn dextra_handle_voice_data_emits_voice_frame() -> TestResult {
         let (mut core, _) = connected_dextra()?;
         let now = Instant::now();
@@ -1809,6 +1949,136 @@ mod tests {
         assert!(
             matches!(event, Event::VoiceEnd { stream_id, reason } if stream_id.get() == 0x1234 && reason == VoiceEndReason::Eot)
         );
+        Ok(())
+    }
+
+    /// Regression scenario: replay the exact wire sequence a running
+    /// reflector sends — one header every superframe interleaved
+    /// with 21 voice-data frames — and verify that exactly ONE
+    /// `VoiceStart` is emitted for the whole stream, followed by all
+    /// the `VoiceFrame`s in order, then `VoiceEnd` on the EOT packet.
+    #[test]
+    fn dextra_superframe_header_retransmit_emits_single_voice_start() -> TestResult {
+        let (mut core, _) = connected_dextra()?;
+        let now = Instant::now();
+        let mut buf = [0u8; 64];
+
+        // Simulate 3 superframes: each is 1 header + 21 voice-data
+        // frames. The reflector retransmits the header at the start
+        // of each superframe so late-joiners can decode.
+        for _sf in 0..3 {
+            let n = dextra_codec::encode_voice_header(&mut buf, sid(0x19C9), &test_header())?;
+            core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+            for seq in 0..21_u8 {
+                let n = dextra_codec::encode_voice_data(
+                    &mut buf,
+                    sid(0x19C9),
+                    seq,
+                    &VoiceFrame::silence(),
+                )?;
+                core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+            }
+        }
+        // Then EOT.
+        let n = dextra_codec::encode_voice_eot(&mut buf, sid(0x19C9), 21)?;
+        core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+
+        // Drain events and count per variant.
+        let mut voice_starts = 0_usize;
+        let mut voice_frames = 0_usize;
+        let mut voice_ends = 0_usize;
+        while let Some(ev) = core.pop_event::<DExtra>() {
+            match ev {
+                Event::VoiceStart { stream_id, .. } => {
+                    assert_eq!(stream_id.get(), 0x19C9);
+                    voice_starts += 1;
+                }
+                Event::VoiceFrame { stream_id, .. } => {
+                    assert_eq!(stream_id.get(), 0x19C9);
+                    voice_frames += 1;
+                }
+                Event::VoiceEnd { stream_id, reason } => {
+                    assert_eq!(stream_id.get(), 0x19C9);
+                    assert_eq!(reason, VoiceEndReason::Eot);
+                    voice_ends += 1;
+                }
+                other => unreachable!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(
+            voice_starts, 1,
+            "expected exactly 1 VoiceStart across 3 superframes of header retransmits, got {voice_starts}"
+        );
+        assert_eq!(
+            voice_frames,
+            3 * 21,
+            "expected all 63 voice frames surfaced"
+        );
+        assert_eq!(voice_ends, 1, "expected exactly 1 VoiceEnd");
+        Ok(())
+    }
+
+    /// Same regression for DCS: its header is embedded in every
+    /// voice frame, so the dedup check has to fire on every
+    /// `seq == 0` after the first one.
+    #[test]
+    fn dcs_superframe_boundary_emits_single_voice_start() -> TestResult {
+        let (mut core, _) = connected_dcs()?;
+        let now = Instant::now();
+        let mut buf = [0u8; 128];
+        // 3 superframes = 63 voice frames, each carrying the header.
+        for sf in 0..3 {
+            for seq in 0..21_u8 {
+                let n = dcs_codec::encode_voice(
+                    &mut buf,
+                    &test_header(),
+                    sid(0x789A),
+                    seq,
+                    &non_silence_frame(),
+                    false,
+                )?;
+                core.handle_input(now, ADDR_DCS, buf.get(..n).ok_or("n > buf")?)?;
+                // Silence `sf` unused warning on non-debug builds.
+                let _ = sf;
+            }
+        }
+        let n = dcs_codec::encode_voice(
+            &mut buf,
+            &test_header(),
+            sid(0x789A),
+            21,
+            &VoiceFrame::silence(),
+            true,
+        )?;
+        core.handle_input(now, ADDR_DCS, buf.get(..n).ok_or("n > buf")?)?;
+
+        let mut voice_starts = 0_usize;
+        let mut voice_frames = 0_usize;
+        let mut voice_ends = 0_usize;
+        while let Some(ev) = core.pop_event::<Dcs>() {
+            match ev {
+                Event::VoiceStart { stream_id, .. } => {
+                    assert_eq!(stream_id.get(), 0x789A);
+                    voice_starts += 1;
+                }
+                Event::VoiceFrame { stream_id, .. } => {
+                    assert_eq!(stream_id.get(), 0x789A);
+                    voice_frames += 1;
+                }
+                Event::VoiceEnd { stream_id, reason } => {
+                    assert_eq!(stream_id.get(), 0x789A);
+                    assert_eq!(reason, VoiceEndReason::Eot);
+                    voice_ends += 1;
+                }
+                other => unreachable!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(
+            voice_starts, 1,
+            "DCS: expected 1 VoiceStart, got {voice_starts}"
+        );
+        assert_eq!(voice_frames, 3 * 21, "DCS: expected 63 voice frames");
+        assert_eq!(voice_ends, 1, "DCS: expected 1 VoiceEnd");
         Ok(())
     }
 
@@ -1864,6 +2134,11 @@ mod tests {
 
     #[test]
     fn dcs_handle_subsequent_voice_frame_emits_voice_frame() -> TestResult {
+        // A DCS voice frame with `seq > 0` arriving without a prior
+        // `seq == 0` frame (lost initial-header packet or late-join)
+        // now synthesizes a VoiceStart first so consumers always see
+        // a stream-start event before any VoiceFrame. The frame data
+        // is then surfaced as VoiceFrame.
         let (mut core, _) = connected_dcs()?;
         let now = Instant::now();
         let mut buf = [0u8; 128];
@@ -1876,9 +2151,15 @@ mod tests {
             false,
         )?;
         core.handle_input(now, ADDR_DCS, buf.get(..n).ok_or("n > buf")?)?;
-        let event = core.pop_event::<Dcs>().ok_or("no event")?;
+        let first = core.pop_event::<Dcs>().ok_or("no first event")?;
         assert!(
-            matches!(event, Event::VoiceFrame { stream_id, seq, .. } if stream_id.get() == 0x789A && seq == 5)
+            matches!(first, Event::VoiceStart { stream_id, .. } if stream_id.get() == 0x789A),
+            "expected VoiceStart, got {first:?}"
+        );
+        let second = core.pop_event::<Dcs>().ok_or("no second event")?;
+        assert!(
+            matches!(second, Event::VoiceFrame { stream_id, seq, .. } if stream_id.get() == 0x789A && seq == 5),
+            "expected VoiceFrame(seq=5), got {second:?}"
         );
         Ok(())
     }

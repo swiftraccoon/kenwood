@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Error correction coding for AMBE 3600×2450 voice frames.
+//! Error correction coding for AMBE 3600×2400 voice frames.
 //!
-//! AMBE 3600×2450 uses **Golay(23,12)** — a 3-error-correcting code —
+//! AMBE 3600×2400 uses **Golay(23,12)** — a 3-error-correcting code —
 //! on the C0 and C1 codewords. C0 carries the fundamental frequency
 //! index (the most perceptually critical parameter), so it receives
 //! the strongest protection. C1 carries the PRBA spectral coefficients.
@@ -15,7 +15,7 @@
 //! less perceptually critical than the C0 pitch index.
 //!
 //! (Some related codec variants apply Hamming(15,11) to a C4 codeword,
-//! but AMBE 3600×2450 has no C4; this crate does not implement Hamming.)
+//! but AMBE 3600×2400 has no C4; this crate does not implement Hamming.)
 //!
 //! After error correction, `ecc_data` packs the corrected data bits
 //! from all four codewords (C0–C3) into a 49-element parameter vector
@@ -34,7 +34,7 @@
 //!
 //! # Reference
 //!
-//! Ported from mbelib `ecc.c` and `ambe3600x2450.c`
+//! Ported from mbelib `ecc.c` and `ambe3600x2400.c`
 //! (<https://github.com/szechyjs/mbelib>), ISC license.
 
 use crate::tables;
@@ -370,6 +370,133 @@ pub(crate) fn ecc_data(ambe_fr: &[u8; AMBE_FRAME_BITS], ambe_d: &mut [u8; AMBE_D
     }
 
     errs
+}
+
+/// Encode 12 data bits into a 23-bit Golay(23,12) codeword, LSB-first.
+///
+/// Inverse of the data-extraction side of [`golay_decode`]. Given a
+/// 12-bit data value (`data_bits[0]` = MSB), compute the 11-bit
+/// parity via the generator matrix and produce the 23-bit codeword in
+/// the LSB-first layout that [`ecc_data`] expects:
+///
+/// - `codeword[0..11]` = parity bits (codeword bit 0 at `[0]`)
+/// - `codeword[11..23]` = data bits (LSB at `[11]`, MSB at `[22]`)
+#[cfg(feature = "encoder")]
+pub(crate) fn golay_encode(data_bits: &[u8; 12]) -> [u8; 23] {
+    // Parity: XOR each generator row whose corresponding data bit is 1.
+    let mut parity: i32 = 0;
+    let mut i: usize = 0;
+    while i < 12 {
+        if let Some(&b) = data_bits.get(i)
+            && b != 0
+            && let Some(&row) = tables::GOLAY_GENERATOR.get(i)
+        {
+            parity ^= row;
+        }
+        i += 1;
+    }
+
+    // Assemble codeword: parity at bits 0..10, data at bits 11..22
+    // (LSB-first layout matching `golay_decode`'s `in_bits`).
+    let mut out = [0u8; 23];
+    // Parity bits first (indices 0..11). `parity` is 11 bits wide
+    // (the generator produces at most 11-bit parity values).
+    let mut pi: usize = 0;
+    while pi < 11 {
+        #[expect(clippy::cast_sign_loss, reason = "masking with 1 always yields 0 or 1")]
+        if let Some(slot) = out.get_mut(pi) {
+            *slot = ((parity >> pi) & 1) as u8;
+        }
+        pi += 1;
+    }
+    // Data bits at indices 11..23. `data_bits[0]` (MSB) → `out[22]`;
+    // `data_bits[11]` (LSB) → `out[11]`.
+    let mut di: usize = 0;
+    while di < 12 {
+        let src = *data_bits.get(di).unwrap_or(&0);
+        if let Some(slot) = out.get_mut(22 - di) {
+            *slot = src;
+        }
+        di += 1;
+    }
+    out
+}
+
+/// Assemble an `ambe_fr[72]` frame from 49 data bits + FEC.
+///
+/// Inverse of [`ecc_data`]: given the parameter vector `ambe_d`,
+/// produce an `ambe_fr` bit array with:
+/// - C0 (24 bits): outer parity bit + 23-bit Golay codeword containing
+///   the 12 C0 data bits.
+/// - C1 (23 bits): Golay codeword containing the 12 C1 data bits.
+/// - C2 (11 bits): copied verbatim.
+/// - C3 (14 bits): copied verbatim.
+///
+/// The caller is expected to invoke C1 LFSR scrambling (via
+/// `crate::unpack::demodulate_c1`, whose XOR is self-inverse) and
+/// `crate::encode::pack_frame` to produce wire bytes.
+#[cfg(feature = "encoder")]
+pub(crate) fn ecc_encode(ambe_d: &[u8; AMBE_DATA_BITS], ambe_fr: &mut [u8; AMBE_FRAME_BITS]) {
+    // Reset the whole frame; anything we don't write explicitly is 0.
+    *ambe_fr = [0u8; AMBE_FRAME_BITS];
+
+    // --- C0: encode 12 data bits, place at ambe_fr[1..24] ---
+    let mut c0_data = [0u8; 12];
+    // `ambe_d[0..12]` goes into C0 MSB-first. `ambe_d[0]` is the MSB
+    // (data bit 11), `ambe_d[11]` is the LSB (data bit 0). Direct copy.
+    c0_data.copy_from_slice(ambe_d.get(0..12).unwrap_or(&[0u8; 12][..]));
+    let c0_codeword = golay_encode(&c0_data);
+    // Place at ambe_fr[C0_OFFSET + 1 ..= C0_OFFSET + 23] (skipping
+    // the outer parity bit at C0_OFFSET).
+    let mut i: usize = 0;
+    while i < 23 {
+        if let Some(slot) = ambe_fr.get_mut(C0_OFFSET + 1 + i) {
+            *slot = *c0_codeword.get(i).unwrap_or(&0);
+        }
+        i += 1;
+    }
+    // Outer parity: XOR of all 23 Golay bits. mbelib decode ignores
+    // this bit, but real DVSI chips may check it — we compute it
+    // correctly to be safe.
+    let mut outer: u8 = 0;
+    for &b in &c0_codeword {
+        outer ^= b;
+    }
+    if let Some(slot) = ambe_fr.get_mut(C0_OFFSET) {
+        *slot = outer;
+    }
+
+    // --- C1: encode 12 data bits, place at ambe_fr[24..47] ---
+    let mut c1_data = [0u8; 12];
+    c1_data.copy_from_slice(ambe_d.get(12..24).unwrap_or(&[0u8; 12][..]));
+    let c1_codeword = golay_encode(&c1_data);
+    let mut ci: usize = 0;
+    while ci < 23 {
+        if let Some(slot) = ambe_fr.get_mut(C1_OFFSET + ci) {
+            *slot = *c1_codeword.get(ci).unwrap_or(&0);
+        }
+        ci += 1;
+    }
+
+    // --- C2: 11 bits verbatim, descending. `ambe_d[24]` → ambe_fr[C2_OFFSET + 10]. ---
+    let mut c2i: usize = 0;
+    while c2i < C2_LEN {
+        let src = *ambe_d.get(24 + c2i).unwrap_or(&0);
+        if let Some(slot) = ambe_fr.get_mut(C2_OFFSET + (C2_LEN - 1 - c2i)) {
+            *slot = src;
+        }
+        c2i += 1;
+    }
+
+    // --- C3: 14 bits verbatim, descending. `ambe_d[35]` → ambe_fr[C3_OFFSET + 13]. ---
+    let mut c3i: usize = 0;
+    while c3i < C3_LEN {
+        let src = *ambe_d.get(35 + c3i).unwrap_or(&0);
+        if let Some(slot) = ambe_fr.get_mut(C3_OFFSET + (C3_LEN - 1 - c3i)) {
+            *slot = src;
+        }
+        c3i += 1;
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,150 @@
+FRAME 0
+  wire_bytes = a7 47 35 46 db 13 8d 74 17
+  w0 = 0.105126  L = 28  gamma = 3.6233  errs = 0  errs2 = 2
+FRAME 1
+  wire_bytes = b7 8d 39 42 7b 9b ec 67 91
+  w0 = 0.116593  L = 25  gamma = 5.1565  errs = 0  errs2 = 3
+FRAME 2
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 5.9230  errs = 0  errs2 = 2
+FRAME 3
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.3063  errs = 0  errs2 = 2
+FRAME 4
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.4979  errs = 0  errs2 = 2
+FRAME 5
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.5938  errs = 0  errs2 = 2
+FRAME 6
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6417  errs = 0  errs2 = 2
+FRAME 7
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6656  errs = 0  errs2 = 2
+FRAME 8
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6776  errs = 0  errs2 = 2
+FRAME 9
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6836  errs = 0  errs2 = 2
+FRAME 10
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6866  errs = 0  errs2 = 2
+FRAME 11
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6881  errs = 0  errs2 = 2
+FRAME 12
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6888  errs = 0  errs2 = 2
+FRAME 13
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6892  errs = 0  errs2 = 2
+FRAME 14
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6894  errs = 0  errs2 = 2
+FRAME 15
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6895  errs = 0  errs2 = 2
+FRAME 16
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6895  errs = 0  errs2 = 2
+FRAME 17
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6895  errs = 0  errs2 = 2
+FRAME 18
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 19
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 20
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 21
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 22
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 23
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 24
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 25
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 26
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 27
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 28
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 29
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 30
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 31
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 32
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 33
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 34
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 35
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 36
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 37
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 38
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 39
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 40
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 41
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 42
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 43
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 44
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 45
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 46
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 47
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 48
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2
+FRAME 49
+  wire_bytes = 27 8d 31 82 5b 13 cc 47 95
+  w0 = 0.120093  L = 24  gamma = 6.6896  errs = 0  errs2 = 2

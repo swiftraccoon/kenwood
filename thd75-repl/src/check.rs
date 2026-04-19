@@ -279,7 +279,8 @@ fn gen_dstar_events() -> Vec<String> {
         output::dstar_modem_status(5, false),
         output::reflector_event_connected().to_string(),
         output::reflector_event_voice_start("W1AW", "", "CQCQCQ"),
-        output::reflector_event_voice_end().to_string(),
+        output::reflector_event_voice_end(0, 0),
+        output::reflector_event_voice_end(42, 840),
     ]
 }
 

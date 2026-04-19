@@ -14,9 +14,14 @@ publish = false
 
 [dependencies]
 dstar-gateway-core = { path = "../dstar-gateway-core" }
-tokio = { version = "1", features = ["net", "time", "sync", "macros", "io-util", "rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["net", "time", "sync", "macros", "io-util", "rt", "rt-multi-thread", "signal"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 thiserror = "2"
+
+[[bin]]
+name = "polaris"
+path = "src/bin/polaris.rs"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

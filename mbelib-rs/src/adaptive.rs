@@ -52,7 +52,7 @@ const ADAPTIVE_ALT: f32 = 1.414;
 const AMPLITUDE_PENALTY_PER_ERROR: i32 = 300;
 /// Base constant for the amplitude threshold formula (Algorithm #115).
 const AMPLITUDE_BASE: i32 = 6_000;
-/// AMBE 3600x2450 frame muting threshold (9.6%).
+/// AMBE 3600x2400 frame muting threshold (9.6%).
 ///
 /// When the FEC-reported error rate for the frame exceeds this, the
 /// decoder emits comfort noise instead of synthesized speech. IMBE

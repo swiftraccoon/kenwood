@@ -579,10 +579,29 @@ pub fn reflector_event_voice_start(my_call: &str, my_suffix: &str, ur_call: &str
     format!("Reflector: voice from {my_call}{suffix_part}, to {ur_call}.")
 }
 
-/// `Reflector: voice transmission ended.`
+/// `Reflector: voice transmission ended, {frames} frames in {seconds} seconds.`
+///
+/// When `frames == 0` (no voice frames tracked — e.g. a `VoiceEnd`
+/// arrived without a preceding `VoiceStart`), falls back to the bare
+/// `Reflector: voice transmission ended.` sentence so the message
+/// never contains a misleading zero count.
+///
+/// The frame count helps blind and sighted operators alike distinguish
+/// real voice traffic (tens to hundreds of frames, ~50 per second)
+/// from dead-key carriers (a handful of frames), which otherwise look
+/// identical in the console (announce → silence → ended).
 #[must_use]
-pub const fn reflector_event_voice_end() -> &'static str {
-    "Reflector: voice transmission ended."
+pub fn reflector_event_voice_end(frames: u32, duration_ms: u64) -> String {
+    if frames == 0 {
+        return "Reflector: voice transmission ended.".to_owned();
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "duration is milliseconds, well under f64 precision for human-scale transmissions"
+    )]
+    let seconds = duration_ms as f64 / 1000.0;
+    let frame_word = if frames == 1 { "frame" } else { "frames" };
+    format!("Reflector: voice transmission ended, {frames} {frame_word} in {seconds:.2} seconds.")
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,7 +1038,9 @@ mod tests {
             reflector_event_disconnected().to_string(),
             reflector_event_voice_start("W1AW", "", "CQCQCQ"),
             reflector_event_voice_start("W1AW", "P", "CQCQCQ"),
-            reflector_event_voice_end().to_string(),
+            reflector_event_voice_end(0, 0),
+            reflector_event_voice_end(1, 20),
+            reflector_event_voice_end(42, 840),
         ];
         for s in &cases {
             assert_lint(s);

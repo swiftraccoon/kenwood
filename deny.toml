@@ -56,8 +56,25 @@ allow = [
     # webpki-roots (Mozilla's web PKI root cert list, pulled in via
     # reqwest's rustls feature). Permissive data license similar to CC0.
     "CDLA-Permissive-2.0",
+    # SIL Open Font License 1.1 — used by epaint_default_fonts
+    # (Ubuntu font family shipped with egui for sextant). Permissive
+    # font licence that allows redistribution + derivative works.
+    "OFL-1.1",
 ]
 confidence-threshold = 0.8
+
+# Per-crate license exceptions — used where a crate carries a
+# non-SPDX license reference (`LicenseRef-*`) that cargo-deny can't
+# match against the `allow` list.
+[[licenses.exceptions]]
+# epaint_default_fonts also bundles the Ubuntu fonts under the
+# Ubuntu Font Licence 1.0 (a proprietary-but-permissive licence
+# that predates the SPDX registry). `LicenseRef-UFL-1.0` is
+# cargo-deny's form for non-SPDX licences; we allow it only for
+# this specific crate since the licence text is fonts-only (no
+# source implications for our own GPL code).
+allow = ["LicenseRef-UFL-1.0"]
+name = "epaint_default_fonts"
 
 [bans]
 multiple-versions = "deny"
@@ -183,6 +200,59 @@ skip = [
     { crate = "windows_x86_64_gnu@0.52" },
     { crate = "windows_x86_64_gnullvm@0.52" },
     { crate = "windows_x86_64_msvc@0.52" },
+
+    # ─────────────────────────────────────────────────────────────────────
+    # sextant egui + cpal + winit transitive graph
+    # ─────────────────────────────────────────────────────────────────────
+    #
+    # sextant (GUI test app for sextant↔sextant D-STAR traffic) pulls
+    # in egui, cpal, and winit — three large GUI/audio stacks whose
+    # own dep graphs sit at different maturity levels. The pairs
+    # below are the "old" side of each duplicate; each will resolve
+    # on its own cadence as egui/cpal/winit upgrade their transitive
+    # graphs. None are security-sensitive: all have the security
+    # advisories checked separately by `cargo-audit`.
+
+    # winit 0.30 uses calloop 0.13 on wayland/X11; smithay-client-
+    # toolkit 0.19 (wayland toolkit) uses calloop 0.14 through a
+    # different path. Drop when winit bumps.
+    { crate = "calloop@0.13.0" },
+    { crate = "calloop-wayland-source@0.3.0" },
+    { crate = "smithay-client-toolkit@0.19.2" },
+
+    # cpal on macOS uses core-foundation 0.9; winit 0.30 uses 0.10.
+    # Drop when cpal updates to objc2-based path.
+    { crate = "core-foundation@0.9.4" },
+
+    # cpal on macOS uses objc2 0.5; winit 0.30 uses 0.6. Drop when
+    # cpal bumps its objc2 pin.
+    { crate = "objc2@0.5.2" },
+    { crate = "objc2-app-kit@0.2.2" },
+    { crate = "objc2-foundation@0.2.2" },
+
+    # rand_core 0.6 chain (stargazer scraper path via fxhash-adjacent
+    # crates) uses getrandom 0.2; newer deps use 0.3.
+    { crate = "getrandom@0.2.17" },
+
+    # scraper 0.22 uses itertools 0.13; multiple newer deps (including
+    # egui_extras) use 0.14. Drop when scraper updates.
+    { crate = "itertools@0.13.0" },
+
+    # rustix 0.38 chain from tokio-uring / mio-serial; rustix 1.x is
+    # pulled by winit. Drop when mio-serial updates.
+    { crate = "rustix@0.38.44" },
+    { crate = "linux-raw-sys@0.4.15" },
+
+    # quick-xml 0.37 from cpal-alsa (Linux); egui_extras uses 0.39.
+    { crate = "quick-xml@0.37.5" },
+
+    # windows-sys family 0.59 / 0.60 coexist with 0.61 from newer deps.
+    # 0.59 from accesskit/winit, 0.60 from other winit-adjacent crates.
+    { crate = "windows-sys@0.59.0" },
+    { crate = "windows-sys@0.60.2" },
+    # windows-core 0.54 from older winit path; 0.62 from newer.
+    { crate = "windows-core@0.54.0" },
+    { crate = "windows-result@0.1.2" },
 ]
 
 [sources]

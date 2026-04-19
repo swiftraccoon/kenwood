@@ -4,7 +4,7 @@
 
 //! AMBE harmonic speech model parameters.
 //!
-//! The AMBE 3600×2450 codec models speech as a sum of harmonically
+//! The AMBE 3600×2400 codec models speech as a sum of harmonically
 //! related sinusoids at integer multiples of a fundamental frequency.
 //! Each harmonic band is independently classified as voiced (periodic
 //! oscillator) or unvoiced (noise-like). The spectral envelope is
@@ -24,7 +24,7 @@
 
 /// Maximum number of harmonic bands the codec supports.
 ///
-/// The AMBE 3600×2450 codec produces 9 to 56 harmonic bands depending
+/// The AMBE 3600×2400 codec produces 9 to 56 harmonic bands depending
 /// on the fundamental frequency (lower pitch = more bands). Arrays are
 /// dimensioned to 57 entries (indices 0..=56) to allow direct 1-based
 /// indexing matching the codec specification.
@@ -33,7 +33,7 @@ pub(crate) const MAX_BANDS: usize = 57;
 /// Decoded parameters from a single AMBE voice frame.
 ///
 /// These parameters describe the harmonic speech model used by the
-/// AMBE 3600×2450 codec. They are populated by the parameter decoder
+/// AMBE 3600×2400 codec. They are populated by the parameter decoder
 /// (`decode.rs`), refined by spectral enhancement (`enhance.rs`), and
 /// consumed by the speech synthesizer (`synthesize.rs`).
 ///

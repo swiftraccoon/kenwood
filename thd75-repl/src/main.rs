@@ -692,6 +692,31 @@ struct DStarSession {
     tx_slow_data: Vec<[u8; 3]>,
     /// Index into `tx_slow_data` for the next frame to send.
     tx_slow_data_idx: usize,
+    /// Count of `VoiceFrame` events received for the current RX
+    /// stream. Reset to 0 on each fresh `VoiceStart`; read at
+    /// `VoiceEnd` to report the transmission length alongside the
+    /// elapsed duration. Helps distinguish real voice from dead-key
+    /// carriers (which produce only a handful of frames).
+    rx_frame_count: u32,
+    /// Wall-clock timestamp of the first `VoiceStart` for the current
+    /// RX stream (`None` when no stream is active). Used to report
+    /// the elapsed duration at `VoiceEnd`.
+    rx_stream_start: Option<std::time::Instant>,
+    /// Open file handle for DVSI-origin AMBE capture.
+    ///
+    /// When set (via `AMBE_CAPTURE=/path/to/file.ambe` env var at
+    /// startup), every 9-byte AMBE frame the radio's DVSI chip
+    /// produces during a TX session is appended to the file. The
+    /// result is a byte-for-byte record of what the real hardware
+    /// encoder emits for a specific known input — used as a golden
+    /// vector against which the Rust encoder's output can be
+    /// compared.
+    ///
+    /// Captures both radio→reflector frames (user speaking into the
+    /// mic during D-STAR TX) and the raw DVSI TX output regardless
+    /// of whether a reflector is linked, so the operator can do a
+    /// pure PTT-and-speak capture without setting up a reflector.
+    ambe_capture: Option<std::fs::File>,
 }
 
 /// Echo test state machine.
@@ -1834,7 +1859,39 @@ async fn enter_dstar(
         tx_text: None,
         tx_slow_data: Vec::new(),
         tx_slow_data_idx: 0,
+        rx_frame_count: 0,
+        rx_stream_start: None,
+        ambe_capture: open_ambe_capture_from_env(),
     })
+}
+
+/// If `AMBE_CAPTURE=/path/to/file.ambe` is set, open that file for
+/// append. Every `DStarEvent::VoiceData` the radio emits during TX
+/// will write its 9-byte AMBE to this file, producing a ground-truth
+/// record of DVSI-encoder output for whatever the operator speaks
+/// into the microphone.
+fn open_ambe_capture_from_env() -> Option<std::fs::File> {
+    let path = std::env::var_os("AMBE_CAPTURE")?;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => {
+            println!(
+                "AMBE capture enabled: writing DVSI-origin voice frames to {}",
+                std::path::Path::new(&path).display()
+            );
+            Some(f)
+        }
+        Err(e) => {
+            println!(
+                "Warning: AMBE_CAPTURE={} could not be opened: {e}",
+                std::path::Path::new(&path).display()
+            );
+            None
+        }
+    }
 }
 
 /// Parse a reflector string like `"XRF030C"` into (name, module).
@@ -1976,7 +2033,26 @@ async fn ensure_host_files() {
     }
 }
 
+/// Filename for the user's local/vanity reflector host list. Seeded
+/// on first run with the POLARIS local test reflector and parsed as
+/// `DExtra` (port 30001). Add your own reflectors here manually.
+const LOCAL_HOSTS_FILE: &str = "Local_Hosts.txt";
+
+/// Initial content written to `Local_Hosts.txt` if missing. Documents
+/// the format and seeds the POLARIS test reflector so `link POLARIS`
+/// works out of the box against a locally-running `polaris` server.
+const LOCAL_HOSTS_SEED: &str = "\
+# Local / vanity D-STAR reflectors. Each line: NAME ADDRESS [PORT]
+# Entries here are treated as DExtra (default port 30001).
+# POLARIS is the local test reflector (`cargo run -p dstar-gateway-server --bin polaris`).
+POLARIS\t127.0.0.1
+";
+
 /// Load Pi-Star host files from `~/.config/thd75-repl/`.
+///
+/// Also seeds and loads `Local_Hosts.txt` (`DExtra` port) on first
+/// use so vanity callsigns like POLARIS resolve to the local test
+/// server without any manual setup.
 fn load_host_files() -> HostFile {
     let mut hosts = HostFile::new();
     let dir = host_files_dir();
@@ -1987,6 +2063,19 @@ fn load_host_files() -> HostFile {
             hosts.parse(&content, *port);
         }
     }
+
+    // Seed + load the local/vanity host file.
+    let local_path = dir.join(LOCAL_HOSTS_FILE);
+    if !local_path.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::write(&local_path, LOCAL_HOSTS_SEED) {
+            tracing::warn!(error = %e, "failed to seed Local_Hosts.txt");
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string(&local_path) {
+        hosts.parse(&content, 30001);
+    }
+
     hosts
 }
 
@@ -2243,22 +2332,27 @@ async fn try_reconnect_reflector(session: &mut DStarSession) {
 async fn connect_reflector(callsign: Callsign, link: &LinkArg) -> Result<ReflectorSession, String> {
     let ref_name = &link.reflector_name;
 
-    let protocol = ProtocolKind::from_reflector_prefix(ref_name).ok_or_else(|| {
-        format!(
-            "Unsupported reflector prefix: {ref_name}. \
-             Supported: REF (DPlus), XRF/XLX (DExtra), DCS."
-        )
-    })?;
-
     // Ensure host files exist, downloading if needed.
     ensure_host_files().await;
     let hosts = load_host_files();
     let entry = hosts.lookup(ref_name).ok_or_else(|| {
         format!(
             "Reflector {ref_name} not found in host files. \
-             Download host files to ~/.config/thd75-repl/ from pistar.uk/downloads/"
+             Download Pi-Star files or add {ref_name} to Local_Hosts.txt in \
+             ~/.config/thd75-repl/."
         )
     })?;
+
+    // Prefix-based protocol detection covers the stock Pi-Star host
+    // files (REF/XRF/XLX/DCS). Vanity entries in Local_Hosts.txt fall
+    // through to port-based inference (20001=DPlus, 30001=DExtra,
+    // 30051=DCS); any other port defaults to DExtra because
+    // Local_Hosts.txt is parsed with that port.
+    let protocol = ProtocolKind::from_reflector_prefix(ref_name).unwrap_or(match entry.port {
+        20001 => ProtocolKind::DPlus,
+        30051 => ProtocolKind::Dcs,
+        _ => ProtocolKind::DExtra,
+    });
 
     let addr = format!("{}:{}", entry.address, entry.port)
         .to_socket_addrs()
@@ -2460,10 +2554,10 @@ async fn dstar_poll_cycle(session: &mut DStarSession) {
         // that the parser's stream tracker did not suppress).
         if let RuntimeEvent::VoiceStart { stream_id, .. } = &event {
             if session.rx_stream_id != Some(*stream_id) {
-                print_reflector_event(&event);
+                print_reflector_event(&event, session);
             }
         } else {
-            print_reflector_event(&event);
+            print_reflector_event(&event, session);
         }
         relay_reflector_to_radio(session, &event).await;
 
@@ -2484,13 +2578,49 @@ async fn dstar_poll_cycle(session: &mut DStarSession) {
         }
     }
 
-    // Poll radio — drain MMDVM responses (ACK/NAK/status + PTT voice).
-    // Short timeout so this doesn't block the reflector relay.
-    if let Ok(Some(event)) = session.gateway.next_event().await {
+    // Poll radio — drain MMDVM events until the queue empties.
+    //
+    // The radio emits voice-data events at the D-STAR frame rate
+    // (~50 fps) while keyed.  A prior revision handled at most ONE
+    // event per outer cycle, which capped the radio→reflector
+    // forwarding rate at 10 fps (one event per 100 ms cycle) and
+    // produced the "voice in bursts with ~80 ms gaps" symptom the
+    // user reported on their POLARIS test reflector.  Draining
+    // all immediately-available events per cycle lets us keep pace
+    // with the modem; the `MAX_EVENTS_PER_CYCLE` cap prevents a
+    // runaway radio (huge pending queue) from starving the outer
+    // select loop on reflector input or Ctrl-C.
+    //
+    // Drop the per-event timeout to 5 ms for the drain so "nothing
+    // pending" exits fast — the first call reuses the modem's
+    // already-buffered events with zero wait, subsequent calls
+    // wait briefly in case a 20 ms-paced frame arrives mid-drain,
+    // and the loop exits as soon as the queue runs dry.
+    let saved_timeout = session.gateway.event_timeout();
+    session
+        .gateway
+        .set_event_timeout(std::time::Duration::from_millis(5));
+    for _ in 0..MAX_EVENTS_PER_CYCLE {
+        let Ok(Some(event)) = session.gateway.next_event().await else {
+            break;
+        };
         trace_dstar_event(&event);
         print_dstar_event(&event);
+        // Tap DVSI-origin voice bytes into the golden-vector capture
+        // file BEFORE any further processing, so the bytes we record
+        // are exactly what the chip emitted (untouched by our
+        // slow-data rewrite or sequence-number bookkeeping in
+        // `relay_radio_to_reflector`).
+        if let (Some(file), DStarEvent::VoiceData(frame)) = (session.ambe_capture.as_mut(), &event)
+        {
+            use std::io::Write;
+            if let Err(e) = file.write_all(&frame.ambe) {
+                println!("Warning: AMBE capture write failed: {e}");
+            }
+        }
         relay_radio_to_reflector(session, &event).await;
     }
+    session.gateway.set_event_timeout(saved_timeout);
 
     // Drive echo playback state machine.
     echo_playback_tick(session).await;
@@ -3001,6 +3131,12 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
                 return;
             }
             session.rx_stream_id = Some(*stream_id);
+            // Reset per-stream bookkeeping on the first header of a
+            // new stream. The frame counter + start timestamp drive
+            // the `VoiceEnd` summary line that distinguishes dead
+            // keys from real audio.
+            session.rx_frame_count = 0;
+            session.rx_stream_start = Some(std::time::Instant::now());
             // Reset slow data decoder for the new stream so a partial
             // message from a previous transmission is not silently
             // reassembled onto this one. Also clear the last-printed
@@ -3019,6 +3155,11 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             }
         }
         RuntimeEvent::VoiceFrame { frame, seq, .. } => {
+            // Count voice frames per stream so the VoiceEnd line can
+            // report whether the transmission actually carried audio
+            // or was a dead-key carrier (saturating_add keeps the
+            // counter safe for the unlikely 4-billion-frame stream).
+            session.rx_frame_count = session.rx_frame_count.saturating_add(1);
             // Feed the raw seq byte from the DSVT header; the decoder
             // treats seq==0 as a sync frame and re-aligns its half-block
             // phase automatically. No external skipping needed.
@@ -3094,6 +3235,11 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             session.rx_slow_data.reset();
             session.rx_last_slow_text = None;
             session.rx_stream_id = None;
+            // Reset the per-stream voice counters last so the
+            // immediately-preceding `print_reflector_event(VoiceEnd,
+            // session)` call in `dstar_poll_cycle` still sees them.
+            session.rx_frame_count = 0;
+            session.rx_stream_start = None;
             if let Err(e) = gw.send_eot().await {
                 println!(
                     "{}",
@@ -3216,7 +3362,13 @@ fn trace_reflector_event(event: &RuntimeEvent) {
 }
 
 /// Print a reflector event for the user.
-fn print_reflector_event(event: &RuntimeEvent) {
+///
+/// `VoiceEnd` reads the per-stream frame counter and start timestamp
+/// off [`DStarSession`] to include them in the closing line. Must be
+/// called before [`relay_reflector_to_radio`] for `VoiceEnd` events —
+/// the relay resets those counters so the accessible "ended" line
+/// would otherwise see zeros.
+fn print_reflector_event(event: &RuntimeEvent, session: &DStarSession) {
     match event {
         RuntimeEvent::Connected => {
             aprintln!("{}", thd75_repl::output::reflector_event_connected());
@@ -3243,8 +3395,27 @@ fn print_reflector_event(event: &RuntimeEvent) {
                 )
             );
         }
-        RuntimeEvent::VoiceEnd { .. } => {
-            aprintln!("{}", thd75_repl::output::reflector_event_voice_end());
+        RuntimeEvent::VoiceEnd { stream_id, reason } => {
+            let frames = session.rx_frame_count;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "voice transmissions are seconds to minutes; u128 → u64 ms is safe for realistic streams"
+            )]
+            let duration_ms = session
+                .rx_stream_start
+                .map_or(0_u64, |t| t.elapsed().as_millis() as u64);
+            tracing::trace!(
+                target: "thd75_repl::reflector",
+                stream_id = %stream_id,
+                reason = ?reason,
+                frames = frames,
+                duration_ms = duration_ms,
+                "stream summary"
+            );
+            aprintln!(
+                "{}",
+                thd75_repl::output::reflector_event_voice_end(frames, duration_ms)
+            );
         }
     }
 }

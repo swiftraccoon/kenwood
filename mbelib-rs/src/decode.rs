@@ -2,43 +2,65 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! AMBE 3600x2450 parameter decoding from error-corrected data bits.
+//! AMBE 3600x2400 (D-STAR) parameter decoding from error-corrected data bits.
 //!
 //! This module implements the core parameter extraction pipeline that converts
 //! the 49-bit demodulated/error-corrected parameter vector into the harmonic
 //! speech model parameters carried by [`MbeParams`].
 //!
-//! Ported from `mbe_decodeAmbe2450Parms()` in mbelib's `ambe3600x2450.c`
-//! (<https://github.com/szechyjs/mbelib>), ISC license. Sub-field bit
-//! positions, the b0..=b8 partitioning, the DCT-then-IDCT spectral
-//! reconstruction sequence, and the equation-43 magnitude interpolation
-//! all follow the upstream C reference exactly.
+//! Ported from `mbe_decodeAmbe2400Parms()` in mbelib's `ambe3600x2400.c`
+//! (<https://github.com/szechyjs/mbelib>), ISC license — the D-STAR variant
+//! of the AMBE codec family.  **This is not compatible with the AMBE+2 /
+//! 2450-bit layout used by DMR / YSF / NXDN** — those are different codecs
+//! with different bit positions, different codebooks, and different gain
+//! quantization, and mbelib-rs no longer claims support for them.
 //!
 //! # Decode Pipeline
 //!
-//! The 49 data bits are partitioned into 9 sub-fields (b0 through b8), each
-//! controlling a different aspect of the speech model:
+//! The 49 data bits are partitioned into 9 sub-fields (b0 through b8). The
+//! bit positions below are the D-STAR 2400 layout; every position is taken
+//! directly from `ref/mbelib/ambe3600x2400.c` and matches the bit layout
+//! OP25's `ambe_encoder.cc` produces in its `dstar` branch.
 //!
 //! 1. **b0 (7 bits)** -- fundamental frequency (w0) and harmonic count (L).
-//!    Indexes into [`W0_TABLE`] and [`L_TABLE`]. Special codes signal
-//!    erasure (120..=123), silence (124..=125), or tone frames (126..=127).
+//!    Extracted from `ambe_d` bits `[0, 1, 2, 3, 4, 5, 48]`. Indexes into
+//!    [`W0_TABLE`] (computed from the mbelib formula) and [`L_TABLE`].
+//!    Special codes signal erasure (120..=123), silence (124..=125), or
+//!    tone frames (detected by `(b0 & 0x7E) == 0x7E`, i.e. 126 or 127).
 //!
-//! 2. **b1 (5 bits)** -- voiced/unvoiced (V/UV) decisions per harmonic band.
-//!    Indexes into [`VUV_TABLE`] which provides 8 V/UV decisions that are
-//!    mapped across the L bands using frequency-proportional interpolation.
+//! 2. **b1 (4 bits)** -- voiced/unvoiced (V/UV) decisions per harmonic band.
+//!    Extracted from `ambe_d` bits `[38, 39, 40, 41]`. Indexes into the
+//!    16-row [`VUV_TABLE`] (D-STAR uses 4-bit VUV, not the 5-bit AMBE+2
+//!    variant). Each row provides 8 V/UV decisions that are mapped across
+//!    the L bands using frequency-proportional interpolation.
 //!
-//! 3. **b2 (5 bits)** -- gain delta (delta-gamma). Indexes into [`DG_TABLE`],
-//!    then applies first-order smoothing: gamma = `delta_gamma` + 0.5 * `gamma_prev`.
+//! 3. **b2 (6 bits)** -- gain delta (delta-gamma). Extracted from bits
+//!    `[6, 7, 8, 9, 42, 43]`. Indexes into the 64-entry [`DG_TABLE`]
+//!    (D-STAR uses 6-bit gain with `AmbePlusDg`, not the 5-bit AMBE+2
+//!    `AmbeDg`). Smoothing: `gamma = delta_gamma + 0.5 * gamma_prev`.
 //!
-//! 4. **b3 (9 bits)** -- low-band PRBA (Prediction Residual Block Average)
-//!    coefficients Gm\[2..4\] via [`PRBA24_TABLE`].
+//! 4. **b3 (9 bits)** -- low-band PRBA from bits
+//!    `[10, 11, 12, 13, 14, 15, 16, 44, 45]`. PRBA coefficients Gm\[2..4\]
+//!    via [`PRBA24_TABLE`] (same 512x3 size as 2450 but different codebook
+//!    values).
 //!
-//! 5. **b4 (7 bits)** -- high-band PRBA coefficients Gm\[5..8\] via
-//!    [`PRBA58_TABLE`].
+//! 5. **b4 (7 bits)** -- high-band PRBA from bits
+//!    `[17, 18, 19, 20, 21, 46, 47]`. Gm\[5..8\] via [`PRBA58_TABLE`].
 //!
-//! 6. **b5 (5 bits), b6 (4 bits), b7 (4 bits), b8 (3 bits)** -- higher-order
-//!    coefficients (HOC) for each IDCT block, via [`HOC_B5_TABLE`] through
-//!    [`HOC_B8_TABLE`].
+//! 6. **b5 (4 bits)** -- first-block HOC from bits `[22, 23, 25, 26]` —
+//!    note bit 24 is **skipped**; it is the only `ambe_d` bit that carries
+//!    no parameter data in the D-STAR layout. Indexes [`HOC_B5_TABLE`].
+//!
+//! 7. **b6 (4 bits)** -- second-block HOC from bits `[27, 28, 29, 30]`.
+//!    Indexes [`HOC_B6_TABLE`].
+//!
+//! 8. **b7 (4 bits)** -- third-block HOC from bits `[31, 32, 33, 34]`.
+//!    Indexes [`HOC_B7_TABLE`].
+//!
+//! 9. **b8 (3 bits, stored shifted)** -- fourth-block HOC from bits
+//!    `[35, 36, 37]` assembled as `(a35 << 3) | (a36 << 2) | (a37 << 1)`.
+//!    The low bit is always zero — per the AMBE+ patent the LSB of `HOCb8`
+//!    is forced to 0 when unused. Indexes [`HOC_B8_TABLE`] on even values.
 //!
 //! After extracting these sub-fields, the decoder:
 //!
@@ -132,34 +154,42 @@ pub(crate) fn decode_params(
     cur: &mut MbeParams,
     prev: &MbeParams,
 ) -> FrameStatus {
-    // -- b0: fundamental frequency (7 bits) --
+    // -- b0: fundamental frequency (7 bits, D-STAR 2400 layout) --
+    // Reference: `ref/mbelib/ambe3600x2400.c:167-174`.
     let b0: usize = (bit(ambe_d, 0) << 6)
         | (bit(ambe_d, 1) << 5)
         | (bit(ambe_d, 2) << 4)
         | (bit(ambe_d, 3) << 3)
-        | (bit(ambe_d, 37) << 2)
-        | (bit(ambe_d, 38) << 1)
-        | bit(ambe_d, 39);
+        | (bit(ambe_d, 4) << 2)
+        | (bit(ambe_d, 5) << 1)
+        | bit(ambe_d, 48);
 
-    match b0 {
-        120..=123 => return FrameStatus::Erasure,
-        126..=127 => return FrameStatus::Tone,
-        _ => {}
+    // Tone detection: mbelib 2400 treats `(b0 & 0x7E) == 0x7E` (i.e.
+    // b0 ∈ {126, 127}) as tone, which we surface as `FrameStatus::Tone`
+    // since D-STAR doesn't do in-band tones through the voice codec.
+    if (b0 & 0x7E) == 0x7E {
+        return FrameStatus::Tone;
+    }
+    if (120..=123).contains(&b0) {
+        return FrameStatus::Erasure;
     }
 
     let silence = matches!(b0, 124 | 125);
     let f0 = decode_frequency(b0, silence, cur);
     let unvc: f32 = 0.2046 / cur.w0.sqrt();
 
-    // -- b1: V/UV decisions (5 bits) --
+    // -- b1: V/UV decisions (4 bits, D-STAR 2400 layout) --
     decode_vuv(ambe_d, f0, silence, cur);
 
-    // -- b2: gain delta (5 bits) --
-    let b2: usize = (bit(ambe_d, 8) << 4)
-        | (bit(ambe_d, 9) << 3)
-        | (bit(ambe_d, 10) << 2)
-        | (bit(ambe_d, 11) << 1)
-        | bit(ambe_d, 36);
+    // -- b2: gain delta (6 bits, D-STAR 2400 layout) --
+    // Reference: `ref/mbelib/ambe3600x2400.c:325-331`. Indexes the
+    // 64-entry AmbePlusDg table (re-exported here as DG_TABLE).
+    let b2: usize = (bit(ambe_d, 6) << 5)
+        | (bit(ambe_d, 7) << 4)
+        | (bit(ambe_d, 8) << 3)
+        | (bit(ambe_d, 9) << 2)
+        | (bit(ambe_d, 42) << 1)
+        | bit(ambe_d, 43);
     let delta_gamma = *tables::DG_TABLE.get(b2).unwrap_or(&0.0);
     cur.gamma = GAIN_SMOOTH.mul_add(prev.gamma, delta_gamma);
 
@@ -200,11 +230,10 @@ fn decode_frequency(b0: usize, silence: bool, cur: &mut MbeParams) -> f32 {
 /// Each band is assigned to one of 8 VUV decision slots using the
 /// frequency-proportional index: `jl = floor(l * 16 * f0)`.
 fn decode_vuv(ambe_d: &[u8; AMBE_DATA_BITS], f0: f32, silence: bool, cur: &mut MbeParams) {
-    let b1: usize = (bit(ambe_d, 4) << 4)
-        | (bit(ambe_d, 5) << 3)
-        | (bit(ambe_d, 6) << 2)
-        | (bit(ambe_d, 7) << 1)
-        | bit(ambe_d, 35);
+    // D-STAR 2400 V/UV index is 4 bits, read from ambe_d[38..42].
+    // Reference: `ref/mbelib/ambe3600x2400.c:298-302`.
+    let b1: usize =
+        (bit(ambe_d, 38) << 3) | (bit(ambe_d, 39) << 2) | (bit(ambe_d, 40) << 1) | bit(ambe_d, 41);
 
     let vuv_row = tables::VUV_TABLE.get(b1);
     for l in 1..=cur.l {
@@ -231,25 +260,27 @@ fn decode_vuv(ambe_d: &[u8; AMBE_DATA_BITS], f0: f32, silence: bool, cur: &mut M
 /// Decodes PRBA coefficients, performs forward DCT, assembles Cik with
 /// HOC, and runs inverse DCT to produce per-band spectral offsets Tl.
 fn decode_spectral_offsets(ambe_d: &[u8; AMBE_DATA_BITS], big_l: usize) -> [f32; MAX_BANDS] {
-    // -- b3: low-band PRBA (9 bits) --
-    let b3: usize = (bit(ambe_d, 12) << 8)
-        | (bit(ambe_d, 13) << 7)
-        | (bit(ambe_d, 14) << 6)
-        | (bit(ambe_d, 15) << 5)
-        | (bit(ambe_d, 16) << 4)
-        | (bit(ambe_d, 17) << 3)
-        | (bit(ambe_d, 18) << 2)
-        | (bit(ambe_d, 19) << 1)
-        | bit(ambe_d, 40);
+    // -- b3: low-band PRBA (9 bits, D-STAR 2400 layout) --
+    // Reference: `ref/mbelib/ambe3600x2400.c:345-353`.
+    let b3: usize = (bit(ambe_d, 10) << 8)
+        | (bit(ambe_d, 11) << 7)
+        | (bit(ambe_d, 12) << 6)
+        | (bit(ambe_d, 13) << 5)
+        | (bit(ambe_d, 14) << 4)
+        | (bit(ambe_d, 15) << 3)
+        | (bit(ambe_d, 16) << 2)
+        | (bit(ambe_d, 44) << 1)
+        | bit(ambe_d, 45);
 
-    // -- b4: high-band PRBA (7 bits) --
-    let b4: usize = (bit(ambe_d, 20) << 6)
-        | (bit(ambe_d, 21) << 5)
-        | (bit(ambe_d, 22) << 4)
-        | (bit(ambe_d, 23) << 3)
-        | (bit(ambe_d, 41) << 2)
-        | (bit(ambe_d, 42) << 1)
-        | bit(ambe_d, 43);
+    // -- b4: high-band PRBA (7 bits, D-STAR 2400 layout) --
+    // Reference: `ref/mbelib/ambe3600x2400.c:360-366`.
+    let b4: usize = (bit(ambe_d, 17) << 6)
+        | (bit(ambe_d, 18) << 5)
+        | (bit(ambe_d, 19) << 4)
+        | (bit(ambe_d, 20) << 3)
+        | (bit(ambe_d, 21) << 2)
+        | (bit(ambe_d, 46) << 1)
+        | bit(ambe_d, 47);
 
     // Assemble Gm[1..8]: Gm[1]=0, Gm[2..4] from PRBA24, Gm[5..8] from PRBA58.
     let gm = assemble_gm(b3, b4);
@@ -273,17 +304,21 @@ fn decode_spectral_offsets(ambe_d: &[u8; AMBE_DATA_BITS], big_l: usize) -> [f32;
         }
     }
 
-    // -- b5-b8: HOC coefficients --
-    let b5: usize = (bit(ambe_d, 24) << 4)
-        | (bit(ambe_d, 25) << 3)
-        | (bit(ambe_d, 26) << 2)
-        | (bit(ambe_d, 27) << 1)
-        | bit(ambe_d, 44);
+    // -- b5-b8: HOC coefficients (D-STAR 2400 layout) --
+    // Reference: `ref/mbelib/ambe3600x2400.c:414-439`.
+    //
+    // b5 is 4 bits at `[22, 23, 25, 26]` — bit 24 is deliberately
+    // skipped (the only unused ambe_d position in D-STAR).
+    let b5: usize =
+        (bit(ambe_d, 22) << 3) | (bit(ambe_d, 23) << 2) | (bit(ambe_d, 25) << 1) | bit(ambe_d, 26);
     let b6: usize =
-        (bit(ambe_d, 28) << 3) | (bit(ambe_d, 29) << 2) | (bit(ambe_d, 30) << 1) | bit(ambe_d, 45);
+        (bit(ambe_d, 27) << 3) | (bit(ambe_d, 28) << 2) | (bit(ambe_d, 29) << 1) | bit(ambe_d, 30);
     let b7: usize =
-        (bit(ambe_d, 31) << 3) | (bit(ambe_d, 32) << 2) | (bit(ambe_d, 33) << 1) | bit(ambe_d, 46);
-    let b8: usize = (bit(ambe_d, 34) << 2) | (bit(ambe_d, 47) << 1) | bit(ambe_d, 48);
+        (bit(ambe_d, 31) << 3) | (bit(ambe_d, 32) << 2) | (bit(ambe_d, 33) << 1) | bit(ambe_d, 34);
+    // b8 has only 3 source bits — the LSB is forced to 0 per the
+    // AMBE+ patent (mbelib 2400 line 437-440 comment). The resulting
+    // value is always even and indexes HOC_B8_TABLE at even indices.
+    let b8: usize = (bit(ambe_d, 35) << 3) | (bit(ambe_d, 36) << 2) | (bit(ambe_d, 37) << 1);
 
     // Look up IDCT block lengths Ji[1..4] from LMPRBL table.
     let ji = lookup_ji(big_l);
@@ -649,8 +684,11 @@ mod tests {
         Ok(())
     }
 
-    /// b1 V/UV mapping: `VUV_TABLE`[0] is all-voiced, so every band
-    /// should be voiced with b0=0 (L=9).
+    /// b1 V/UV mapping: D-STAR `VUV_TABLE`[0] is all-zeros, so every
+    /// band should be UNVOICED with b1=0. (This is the opposite of the
+    /// old 2450 table which placed voiced in slot 0 — the D-STAR
+    /// VUV codebook puts the all-unvoiced pattern at index 0 and the
+    /// all-voiced pattern at index 15.)
     #[test]
     fn b1_vuv_mapping() -> TestResult {
         let ambe_d = [0u8; AMBE_DATA_BITS];
@@ -662,8 +700,8 @@ mod tests {
 
         for l in 1..=cur.l {
             assert!(
-                *cur.vl.get(l).ok_or("vl out of bounds")?,
-                "band {l} should be voiced for b1=0"
+                !*cur.vl.get(l).ok_or("vl out of bounds")?,
+                "band {l} should be unvoiced for b1=0"
             );
         }
 
@@ -688,15 +726,18 @@ mod tests {
         assert_eq!(status, FrameStatus::Erasure, "b0=120 should be erasure");
     }
 
-    /// Tone frames (b0 = 126..=127) should return status 3.
+    /// Tone frames (`(b0 & 0x7E) == 0x7E`, i.e. b0 ∈ {126, 127})
+    /// should return `FrameStatus::Tone`. In the D-STAR 2400 layout
+    /// b0 is read from bits `[0, 1, 2, 3, 4, 5, 48]`, so setting all
+    /// those positions to 1 gives b0 = 127.
     #[test]
     fn tone_frame_detection() {
         let prev = MbeParams::new();
         let mut cur = MbeParams::new();
         let mut ambe_d = [0u8; AMBE_DATA_BITS];
 
-        // b0 = 127 = 0b1111111
-        for idx in [0, 1, 2, 3, 37, 38, 39] {
+        // b0 = 127 = 0b1111111 (all 7 bits set).
+        for idx in [0, 1, 2, 3, 4, 5, 48] {
             if let Some(b) = ambe_d.get_mut(idx) {
                 *b = 1;
             }
@@ -714,8 +755,10 @@ mod tests {
         let mut cur = MbeParams::new();
         let mut ambe_d = [0u8; AMBE_DATA_BITS];
 
-        // b0 = 124 = 0b1111100
-        for idx in [0, 1, 2, 3, 37] {
+        // b0 = 124 = 0b1111100. In the 2400 layout the MSB of b0 is
+        // at ambe_d[0] and the LSB at ambe_d[48], with the middle
+        // bits linearly at ambe_d[1..6]. So bits 6,5,4,3,2 set = 124.
+        for idx in [0, 1, 2, 3, 4] {
             if let Some(b) = ambe_d.get_mut(idx) {
                 *b = 1;
             }

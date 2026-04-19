@@ -45,8 +45,7 @@ use proptest as _;
 // here so the dev-dep lint pass stays silent in this crate.
 #[cfg(test)]
 use trybuild as _;
-// `tracing-subscriber` is consumed by the `ref_reflector` example
-// (separate compilation unit). Acknowledge it here so the lib test
-// crate's dev-dep lint pass stays silent.
-#[cfg(test)]
+// `tracing-subscriber` is consumed by the `polaris` binary and the
+// `ref_reflector` example (separate compilation units). Acknowledge
+// here so the lib's `unused-crate-dependencies` lint stays silent.
 use tracing_subscriber as _;

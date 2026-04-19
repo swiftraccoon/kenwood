@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Bit unpacking and LFSR demodulation for AMBE 3600x2450 voice frames.
+//! Bit unpacking and LFSR demodulation for AMBE 3600x2400 voice frames.
 //!
 //! The AMBE codec transmits 72 bits (9 bytes) per voice frame, but the
 //! bits are not stored in codeword order on the wire. Instead, they are
@@ -40,8 +40,8 @@
 //!
 //! - Interleave tables: DSD `dstar_const.h`
 //!   (<https://github.com/szechyjs/dsd>), ISC license.
-//! - Demodulation: mbelib `ambe3600x2450.c`
-//!   `mbe_demodulateAmbe3600x2450Data()`
+//! - Demodulation: mbelib `ambe3600x2400.c`
+//!   `mbe_demodulateAmbe3600x2400Data()`
 //!   (<https://github.com/szechyjs/mbelib>), ISC license.
 
 /// Number of bits in the FEC codeword array.

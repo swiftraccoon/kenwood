@@ -13,6 +13,7 @@ members = [
     "mbelib-rs",
     "mmdvm",
     "mmdvm-core",
+    "sextant",
     "stargazer",
 ]
 resolver = "3"

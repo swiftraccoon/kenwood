@@ -3,17 +3,47 @@ name = "mbelib-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Pure Rust AMBE 3600x2450 voice codec decoder for D-STAR digital radio"
+description = "Pure Rust AMBE 3600x2400 voice codec for D-STAR digital radio"
 license = "GPL-2.0-or-later"
 publish = false
 
 [dependencies]
-# Real-input FFT for JMBE-compatible unvoiced synthesis (Algorithms #117-126).
+# Real-input FFT for JMBE-compatible unvoiced synthesis (Algorithms #117-126)
+# and (when `encoder` is enabled) for the AMBE encode-side spectral analysis.
 # Pure Rust, MIT/Apache-2.0 (compatible with our GPL outgoing license).
 realfft = "3.4"
 # SIMD primitives (f32x4 / i32x4) for the float→i16 conversion hot path.
 # Pure Rust, MIT/Apache-2.0/Zlib.
 wide = "0.7"
+
+[features]
+default = []
+# AMBE 3600×2400 D-STAR encoder. Off by default because decode-only
+# consumers are the common case. When enabled, ports Max H. Parke's
+# OP25 `ambe_encoder.cc` + Pavel Yazev's `imbe_vocoder` analysis path.
+# Scope is deliberately D-STAR only — the AMBE+2 "half-rate vocoder"
+# variant (DMR / YSF / NXDN) is NOT implemented and is covered by
+# US Patent 8,359,197 B2 (DVSI, active until 2028-05-20). See LICENSE
+# for full jurisdictional notes.
+encoder = []
+
+[dev-dependencies]
+proptest = "1"
+
+# Examples that depend on the encoder feature — lint.sh runs
+# clippy with `--all-targets` but without `--features encoder`, so
+# these are skipped unless explicitly enabled.
+[[example]]
+name = "encode_ambe_stream"
+required-features = ["encoder"]
+
+[[example]]
+name = "validate_quantize_vs_op25"
+required-features = ["encoder"]
+
+[[example]]
+name = "validate_analysis_vs_op25"
+required-features = ["encoder"]
 
 [lints.rust]
 unsafe_code = "forbid"
