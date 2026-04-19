@@ -202,7 +202,10 @@ impl PitchTracker {
             }
             // Average correlation across harmonics — divide by number
             // of terms so longer p (fewer terms) isn't penalized vs
-            // short p (many terms).
+            // short p (many terms). Empirically the raw-sum variant
+            // pushed 45% → 25.5% ±5 match on real voice because
+            // short-period candidates accumulate more terms and
+            // dominate on short voiced attacks.
             #[allow(clippy::cast_precision_loss)]
             let salience = if n_terms == 0 {
                 0.0
@@ -226,6 +229,16 @@ impl PitchTracker {
                 }
             }
         }
+
+        // Sub-multiples analysis considered: OP25 `pitch_est.cc:273`
+        // tests p/2, p/3, p/4, p/5 and prefers the sub-multiple when
+        // its E(p) is ≥1.7× smaller. For our averaged-salience
+        // ranking that test never fires (both the true period and
+        // any integer multiple score nearly equal under this
+        // normalization). OP25's discriminator comes from the
+        // 3-frame look-ahead DP, not from single-frame E(p) alone —
+        // porting that would close most of the remaining gap but is
+        // its own multi-hundred-line piece of work.
 
         // Parabolic interpolation around the min for sub-sample
         // resolution. Re-evaluate E at the two neighbour integer

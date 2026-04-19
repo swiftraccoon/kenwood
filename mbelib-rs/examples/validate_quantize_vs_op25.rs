@@ -27,6 +27,7 @@
     clippy::uninlined_format_args,
     clippy::collapsible_if,
     clippy::cast_lossless,
+    clippy::too_many_lines,
     dead_code,
     missing_docs
 )]
