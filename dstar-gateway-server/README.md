@@ -22,6 +22,27 @@ sans-io `ServerSessionCore<P>`. It owns:
   `transcode_voice` helper) gated behind the
   `cross_protocol_forwarding` config flag.
 
+## `polaris` — local test reflector
+
+The crate also ships a `polaris` binary: a minimal standalone
+DExtra reflector that binds `127.0.0.1:30001` with callsign
+`POLARIS` and the default `AllowAllAuthorizer`. It's the
+counterpart we pair with the `sextant` GUI and `thd75-repl`'s
+D-STAR mode for end-to-end voice-pipeline testing with no
+external reflector in the loop:
+
+```text
+cargo run -p dstar-gateway-server --bin polaris
+```
+
+With POLARIS running, any DExtra client (sextant instance,
+thd75-repl session, or a real radio configured to link to
+`127.0.0.1 30001`) can join module `C` (or any A..E) and
+exchange voice frames. A second client on the same module
+hears the first; the reflector itself doesn't store or
+transcode anything. See [`sextant/README.md`](../sextant/README.md)
+for the typical two-client test flow.
+
 Alpha. Not yet published to crates.io. Consume via path or git
 dependency from the kenwood monorepo until the first numbered
 release.

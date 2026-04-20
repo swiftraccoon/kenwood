@@ -7,45 +7,73 @@
 //! V/UV detector, spectral amplitude extractor, and bit packer into
 //! a single `AmbeEncoder::encode_frame(pcm) -> [u8; 9]` entry point.
 //!
-//! # Current status
+//! # Status
 //!
-//! This is the **skeleton** encoder. It produces valid, well-formed
-//! 9-byte AMBE wire frames for every input, but the parameter
-//! quantization against the AMBE codebooks (PRBA, HOC, LMPRBL) is
-//! not yet implemented — the output frame currently encodes a
-//! neutral "silence" (b0 = 0, all bands unvoiced, zero amplitudes).
-//! Decoding our output with `mbelib-rs`'s own decoder will yield
-//! silence regardless of input.
+//! Functional end-to-end.  Every stage of OP25's `ambe_encoder.cc`
+//! is ported and wired together; the output bytes decode cleanly
+//! through our own decoder and through reference `mbelib`.
 //!
-//! What works end-to-end today:
-//! - PCM ingestion, DC removal, pitch-estimation LPF, windowing, FFT
-//! - Pitch tracking with quadratic interpolation
-//! - Voiced/unvoiced per-band detection
-//! - Per-harmonic magnitude extraction
-//! - 72-bit frame assembly via our inverse-interleave packer
+//! Bit-exact vs OP25 on the stage-5..8 (quantize) path when fed
+//! identical `sa`/`v_uv_dsn`/`prev_mp` state — validated by
+//! `examples/validate_quantize_vs_op25.rs`:
+//! b3/b4/b5/b6/b7 = 100%, b2 (gain) = 99%, b1 (VUV) = 88%,
+//! b0 (pitch) = 60%.  b8 (`HOC_B8`) = 30% because OP25 searches the
+//! full 0..=15 codebook in D-STAR mode while the wire format only
+//! carries 3 bits with a forced-zero LSB; our stride-2 search
+//! follows mbelib's decoder convention (the DVSI implementation).
 //!
-//! What is stubbed (produces silence):
-//! - b0 (pitch) quantization against the W0 codebook
-//! - b1 (V/UV) bit encoding
-//! - `b2..b_L` (spectral amplitudes) PRBA/HOC vector quantization
-//! - Golay FEC encoding (output bytes pass through pack without FEC
-//!   — real encoder must apply Golay encode before pack)
+//! Stages 1..4 (analysis: pitch / `num_harms` / V/UV / sa from FFT)
+//! still diverge from OP25 during pitch transitions. The pitch
+//! tracker ports OP25's exact E(p) detectability function plus
+//! look-back tracking (`pitch_est.cc:200–226`) and sub-multiples
+//! analysis (`pitch_est.cc:273–332`). The remaining gap — OP25's
+//! 2-frame look-ahead DP (`pitch_est.cc:229–270`) — is the main
+//! stage 1-4 improvement left. Audio remains intelligible on real
+//! speech despite the divergence because the spectral-envelope
+//! reconstruction (stages 5..8) emits the correct codebook entries
+//! for whatever pitch we pick.
 //!
-//! The public API is stable. Calls to `encode_frame` produce
-//! deterministic output; upgrading the codebook side later will NOT
-//! change the function signature.
+//! # Pipeline
+//!
+//! 1. Front-end: DC remove → pitch-LPF → window → 256-pt FFT.
+//! 2. Pitch estimation (sub-harmonic summation on the LPF'd buffer).
+//! 3. Per-band V/UV decisions from the FFT.
+//! 4. Per-harmonic magnitudes via 3-bin power integration.
+//! 5. Quantization to the 49-bit `ambe_d` parameter vector:
+//!    L-constrained W0 search for b0, energy-weighted VUV codebook
+//!    search for b1, `AmbePlus` DG nearest for b2, block-DCT → R
+//!    pairs → 8-pt DCT → G for PRBA24/PRBA58 (b3/b4), per-block
+//!    HOC codebooks for b5..b8. Prediction residual
+//!    `T = lsa − 0.65·interp(prev_log2_ml)` uses closed-loop
+//!    reconstruction via `decode_params` so encoder and decoder
+//!    track identical magnitude history.
+//! 6. Golay(23,12) FEC on C0 and C1, plus outer parity on C0.
+//! 7. LFSR scramble of C1 seeded from C0 data bits.
+//! 8. 72-bit DSD-style interleave to wire order, pack to 9 bytes.
 
 use crate::ecc::ecc_encode;
 use crate::encode::analyze::{FftPlan, analyze_frame};
 use crate::encode::interleave::AMBE_FRAME_BITS;
 use crate::encode::pack::pack_frame;
-use crate::encode::pitch::PitchTracker;
+use crate::encode::pitch::{PITCH_CANDIDATES, PitchTracker, compute_e_p};
 use crate::encode::quantize::quantize;
-use crate::encode::spectral::extract_spectral_amplitudes;
 use crate::encode::state::{EncoderBuffers, FFT_LENGTH, FRAME};
-use crate::encode::vuv::detect_vuv;
+use crate::encode::vuv::{VuvState, detect_vuv_and_sa};
 use crate::unpack::demodulate_c1;
 use realfft::num_complex::Complex;
+
+/// Per-frame snapshot buffered by the 2-frame look-ahead pipeline.
+///
+/// The look-ahead DP commits pitch for frame `N-2` only after it has
+/// seen the `E(p)` arrays for frames `N-2`, `N-1`, and `N`. Until
+/// frame `N` arrives, every `encode_frame(N-2)` call's downstream
+/// quantization is held in this slot; the FFT output is saved so
+/// voicing / spectral-amplitude extraction re-runs against the same
+/// spectrum the encoder saw at analysis time.
+struct FrameSlot {
+    e_p: [f32; PITCH_CANDIDATES],
+    fft_out: Vec<Complex<f32>>,
+}
 
 /// Top-level D-STAR AMBE 3600×2400 encoder.
 ///
@@ -86,13 +114,54 @@ pub struct AmbeEncoder {
     /// mapping `kl = (prev_l / cur_l) * l` that drives the prev-frame
     /// log-magnitude interpolation.
     prev_l: usize,
+    /// 2-slot ring buffer holding analysis output for frames `N-2`
+    /// and `N-1`. On `encode_frame(N)` we compute `E(p)_N`, run the
+    /// DP on `(E(p)_{N-2}, E(p)_{N-1}, E(p)_N)` to commit pitch for
+    /// frame `N-2`, quantize its saved FFT against that pitch, emit
+    /// bytes, then shift the ring.
+    ///
+    /// While `pending.len() < 2` the encoder is warming up: the
+    /// output is `AMBE_SILENCE` and the decoder's `prev_log2_ml`
+    /// state is re-zeroed each time (via
+    /// [`Self::reset_prev_state_after_silence`]).
+    ///
+    /// `None` means look-ahead is disabled entirely — the default
+    /// zero-latency [`Self::new`] sets this to `None`, while
+    /// [`Self::new_with_lookahead`] sets it to `Some(Vec::new())`.
+    pending: Option<Vec<FrameSlot>>,
+    /// Hysteretic V/UV state — previous frame's per-band decisions
+    /// plus the slow-update frame-energy ceiling `th_max`. Carried
+    /// across frames so the V/UV threshold reflects the signal's
+    /// recent history (OP25 `v_uv_det.cc:152`).
+    vuv_state: VuvState,
 }
 
+/// Silence shortcut threshold — when the pitch tracker reports
+/// essentially-no-signal (confidence below this), emit the canonical
+/// D-STAR silence pattern directly (`MMDVMHost` / DVSI convention)
+/// rather than trying to quantize zeros. Reference:
+/// `NULL_AMBE_DATA_BYTES` in `ref/MMDVMHost/DStarDefines.h:44`.
+const SILENCE_CONFIDENCE: f32 = 0.05;
+
+/// Canonical 9-byte AMBE silence frame returned for inputs that fall
+/// below [`SILENCE_CONFIDENCE`] and during the 2-frame warmup of the
+/// look-ahead pipeline.
+const AMBE_SILENCE: [u8; 9] = [0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8];
+
 impl AmbeEncoder {
-    /// Construct a fresh encoder. The first handful of
-    /// [`encode_frame`](Self::encode_frame) calls warm up the
-    /// pitch-history buffers; until then, output quality is
-    /// marginally reduced.
+    /// Construct a fresh encoder using OP25's single-frame
+    /// (look-back + sub-multiples) pitch tracker. Zero added
+    /// latency; each [`encode_frame`](Self::encode_frame) call
+    /// commits pitch for the just-received frame.
+    ///
+    /// This is the backwards-compatible default. Real-voice inputs
+    /// work well here because sub-multiples analysis resolves the
+    /// common octave ambiguities; pure-sine synthetic tests can
+    /// lose the 2P-vs-P disambiguation on settled tones. For the
+    /// full OP25 pitch pipeline (2-frame look-ahead DP), see
+    /// [`Self::new_with_lookahead`] — it costs 40 ms of latency and
+    /// an extra 2-frame warmup but matches OP25's pitch decisions
+    /// on pure sines as well as voice.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -102,6 +171,28 @@ impl AmbeEncoder {
             fft_out: vec![Complex::new(0.0, 0.0); FFT_LENGTH / 2 + 1],
             prev_log2_ml: [0.0_f32; 57],
             prev_l: 0,
+            pending: None,
+            vuv_state: VuvState::new(),
+        }
+    }
+
+    /// Construct a fresh encoder WITH the 2-frame look-ahead DP
+    /// enabled. The first two [`encode_frame`](Self::encode_frame)
+    /// calls return `AMBE_SILENCE` while the pipeline fills; frame
+    /// `N-2`'s pitch is committed on the third call (frame `N`).
+    /// Adds ≈40 ms end-to-end latency; matches OP25's pitch-tracking
+    /// behaviour across pure sines and pitch transitions.
+    #[must_use]
+    pub fn new_with_lookahead() -> Self {
+        Self {
+            bufs: EncoderBuffers::new(),
+            plan: FftPlan::new(),
+            pitch: PitchTracker::new(),
+            fft_out: vec![Complex::new(0.0, 0.0); FFT_LENGTH / 2 + 1],
+            prev_log2_ml: [0.0_f32; 57],
+            prev_l: 0,
+            pending: Some(Vec::with_capacity(2)),
+            vuv_state: VuvState::new(),
         }
     }
 
@@ -138,42 +229,101 @@ impl AmbeEncoder {
     /// short-circuits to the canonical `AMBE_SILENCE` pattern that
     /// `MMDVMHost` and DVSI chips use for zero-audio frames, so silent
     /// stretches stay wire-compatible with conformant receivers.
+    ///
+    /// # Panics
+    ///
+    /// Never panics under normal use. The look-ahead pipeline's
+    /// internal invariant — `self.pending` is `Some` iff the encoder
+    /// was built with [`Self::new_with_lookahead`] — is enforced at
+    /// construction and never mutated afterwards; the unreachable
+    /// `expect` is kept as a defensive check rather than removed
+    /// entirely.
     pub fn encode_frame(&mut self, pcm: &[f32]) -> [u8; 9] {
-        // Silence shortcut threshold — when the pitch tracker reports
-        // essentially-no-signal (confidence below this), emit the
-        // canonical D-STAR silence pattern directly (MMDVMHost /
-        // DVSI convention) rather than trying to quantize zeros.
-        // Reference: `NULL_AMBE_DATA_BYTES` in
-        // `ref/MMDVMHost/DStarDefines.h:44`.
-        const SILENCE_CONFIDENCE: f32 = 0.05;
-        const AMBE_SILENCE: [u8; 9] = [0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8];
-
-        // Front-end: DC remove → LPF → window → FFT.
+        // Front-end: DC remove → LPF → window → FFT. After this
+        // call, `self.bufs.pitch_est_buf` holds the latest 301
+        // samples of LPF'd audio and `self.fft_out` holds the
+        // 129-bin complex spectrum of the just-arrived frame.
         analyze_frame(pcm, &mut self.bufs, &mut self.plan, &mut self.fft_out);
-        // Pitch tracking consumes the LPF'd pitch-estimation buffer.
-        let pitch = self.pitch.estimate(&self.bufs.pitch_est_buf);
+        let e_p_current = compute_e_p(&self.bufs.pitch_est_buf);
 
-        if pitch.confidence < SILENCE_CONFIDENCE {
-            // The decoder will update its own prev state when it
-            // parses this silence frame; resync ours so the next
-            // voice frame's prediction residual lines up.
+        if self.pending.is_none() {
+            // Zero-latency path: commit pitch for the just-received
+            // frame via single-frame look-back + sub-multiples.
+            let pitch = self.pitch.estimate(&self.bufs.pitch_est_buf);
+            return self.quantize_and_pack(pitch);
+        }
+
+        // Look-ahead path: buffer the e_p array + a copy of the FFT
+        // spectrum, then emit bytes only once we have 3 frames.
+        let slot = FrameSlot {
+            e_p: e_p_current,
+            fft_out: self.fft_out.clone(),
+        };
+        // Construction invariant: `self.pending.is_some()` here
+        // because we returned early above when it was None.
+        let pending = self
+            .pending
+            .as_mut()
+            .expect("checked Some above; see # Panics");
+        if pending.len() < 2 {
+            pending.push(slot);
+            // Pipeline not full yet — emit silence and keep the
+            // decoder's `prev_log2_ml` state consistent with what
+            // it sees on the wire.
             self.reset_prev_state_after_silence();
             return AMBE_SILENCE;
         }
 
-        // Derive the fractional FFT bin for the fundamental.
+        // Three frames now on hand: pending[0]=N-2, pending[1]=N-1,
+        // slot=N. Run the DP against pending[0]'s e_p, using the
+        // next two as lookahead.
+        let pitch = self
+            .pitch
+            .estimate_with_lookahead(&pending[0].e_p, &pending[1].e_p, &slot.e_p);
+        // Swap out the oldest slot so we can take ownership of its
+        // FFT output without cloning; push the newly-arrived slot.
+        let oldest = pending.remove(0);
+        pending.push(slot);
+
+        // Quantize frame N-2's spectrum against the DP-chosen pitch.
+        self.quantize_from_fft(&oldest.fft_out, pitch)
+    }
+
+    /// Quantize the encoder's current-frame FFT output (set by
+    /// [`analyze_frame`]) against a just-committed pitch and return
+    /// 9 wire bytes. Used by the zero-latency path.
+    fn quantize_and_pack(&mut self, pitch: crate::encode::pitch::PitchEstimate) -> [u8; 9] {
+        if pitch.confidence < SILENCE_CONFIDENCE {
+            self.reset_prev_state_after_silence();
+            return AMBE_SILENCE;
+        }
+        let fft = self.fft_out.clone();
+        self.quantize_from_fft(&fft, pitch)
+    }
+
+    /// Quantize an arbitrary saved FFT spectrum against a committed
+    /// pitch, returning 9 wire bytes. Shared by the zero-latency and
+    /// look-ahead paths; the look-ahead path hands in an FFT saved
+    /// from 2 frames ago.
+    fn quantize_from_fft(
+        &mut self,
+        fft_out: &[Complex<f32>],
+        pitch: crate::encode::pitch::PitchEstimate,
+    ) -> [u8; 9] {
+        if pitch.confidence < SILENCE_CONFIDENCE {
+            self.reset_prev_state_after_silence();
+            return AMBE_SILENCE;
+        }
+
         #[allow(clippy::cast_precision_loss)]
         let f0_bin = FFT_LENGTH as f32 / pitch.period_samples;
-        // V/UV decisions per band.
-        let vuv = detect_vuv(&self.fft_out, f0_bin);
-        // Per-harmonic magnitudes.
-        let amps = extract_spectral_amplitudes(&self.fft_out, f0_bin);
+        // `e_p` for OP25's V/UV threshold is the pitch tracker's
+        // reconstruction-error metric (1 − confidence on the chosen
+        // period). Our PitchEstimate carries `confidence`; invert to
+        // get the error.
+        let e_p = (1.0 - pitch.confidence).clamp(0.0, 1.0);
+        let (vuv, amps) = detect_vuv_and_sa(fft_out, f0_bin, &mut self.vuv_state, e_p);
 
-        // Quantize parameters into the 49-bit D-STAR 2400 data vector.
-        // The encoder tracks `prev_log2_ml` / `prev_l` across frames so
-        // the spectral path can compute the prediction residual
-        // `T[i] = lsa[i] - 0.65 * interp_prev[i]` that the PRBA/HOC
-        // codebooks match against.
         let prev = crate::encode::quantize::PrevFrameState {
             log2_ml: self.prev_log2_ml,
             l: self.prev_l,
@@ -183,19 +333,9 @@ impl AmbeEncoder {
         self.prev_l = outcome.prev_l;
         let ambe_d = outcome.ambe_d;
 
-        // Apply Golay(23,12) FEC to C0 and C1, place data bits into
-        // ambe_fr[72] in the layout `unpack_frame` → `ecc_data`
-        // expects to reverse.
         let mut ambe_fr = [0u8; AMBE_FRAME_BITS];
         ecc_encode(&ambe_d, &mut ambe_fr);
-
-        // Scramble C1 with the LFSR seeded from C0 data bits. The
-        // decoder's `demodulate_c1` is the exact inverse — because
-        // XOR is self-inverse, we just call it again.
         demodulate_c1(&mut ambe_fr);
-
-        // Final: interleave bits into transmission order and pack
-        // into 9 wire bytes.
         pack_frame(&ambe_fr)
     }
 
@@ -238,9 +378,13 @@ mod tests {
         assert_eq!(out.len(), 9);
     }
 
-    /// End-to-end: encode a sine, decode it, verify we get back
-    /// SOMETHING (length, shape). Perceptual quality is not yet
-    /// meaningful because the quantization is stubbed.
+    /// End-to-end: encode a 200 Hz sine, decode it, verify the
+    /// decoder produces PCM of the expected shape and non-zero
+    /// energy.  Full perceptual-quality validation lives in the
+    /// `encoder_roundtrip.rs` integration test + the `validate_*`
+    /// example harnesses; this unit test is a smoke check that the
+    /// `encode_frame` → `decode_frame` pipeline doesn't panic or
+    /// deadlock on a trivial input.
     #[test]
     fn encode_sine_round_trips_through_decoder() {
         use crate::AmbeDecoder;

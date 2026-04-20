@@ -44,7 +44,7 @@ Stability column:
 | [`aprs-is/`](aprs-is/) | APRS-IS TCP client (tokio) | pre-release |
 | [`dstar-gateway-core/`](dstar-gateway-core/) | DPlus / DExtra / DCS reflector codecs + typestate client and server sessions (no I/O) | alpha |
 | [`dstar-gateway/`](dstar-gateway/) | Tokio async shell over `dstar-gateway-core` with auth and host-file fetcher | alpha |
-| [`dstar-gateway-server/`](dstar-gateway-server/) | Multi-client D-STAR reflector server with cross-protocol forwarding | experimental |
+| [`dstar-gateway-server/`](dstar-gateway-server/) | Multi-client D-STAR reflector server with cross-protocol forwarding; ships a `polaris` binary as a standalone local DExtra test reflector | experimental |
 | [`mmdvm-core/`](mmdvm-core/) | Sans-io MMDVM modem protocol codec | alpha |
 | [`mmdvm/`](mmdvm/) | Tokio async shell for MMDVM modems | alpha |
 | [`mbelib-rs/`](mbelib-rs/) | AMBE 3600×2400 voice codec (decoder default; encoder behind `--features encoder`) | experimental |

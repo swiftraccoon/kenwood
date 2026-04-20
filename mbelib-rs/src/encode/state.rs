@@ -56,8 +56,14 @@ pub struct EncoderBuffers {
     pub(crate) pitch_ref_buf: [f32; PITCH_EST_BUF_SIZE],
     /// Pitch-estimation LPF delay line (one sample per tap).
     pub(crate) pe_lpf_mem: [f32; PE_LPF_ORD],
-    /// DC-removal single-pole high-pass integrator state.
+    /// OP25 `dc_rmv` single-pole HPF integrator — default path.
+    #[cfg(not(feature = "kenwood-tables"))]
     pub(crate) dc_rmv_mem: f32,
+    /// Kenwood 345 Hz biquad HPF delay line — replaces `dc_rmv_mem`
+    /// as the active input-conditioning state when the
+    /// `kenwood-tables` feature is enabled.
+    #[cfg(feature = "kenwood-tables")]
+    pub(crate) kenwood_hpf_mem: crate::encode::kenwood::filter::Biquad2State,
 }
 
 impl EncoderBuffers {
@@ -68,7 +74,10 @@ impl EncoderBuffers {
             pitch_est_buf: [0.0; PITCH_EST_BUF_SIZE],
             pitch_ref_buf: [0.0; PITCH_EST_BUF_SIZE],
             pe_lpf_mem: [0.0; PE_LPF_ORD],
+            #[cfg(not(feature = "kenwood-tables"))]
             dc_rmv_mem: 0.0,
+            #[cfg(feature = "kenwood-tables")]
+            kenwood_hpf_mem: crate::encode::kenwood::filter::Biquad2State::new(),
         }
     }
 
@@ -116,6 +125,7 @@ mod tests {
         assert!(b.pitch_est_buf.iter().all(|&x| is_zero(x)));
         assert!(b.pitch_ref_buf.iter().all(|&x| is_zero(x)));
         assert!(b.pe_lpf_mem.iter().all(|&x| is_zero(x)));
+        #[cfg(not(feature = "kenwood-tables"))]
         assert!(is_zero(b.dc_rmv_mem));
     }
 

@@ -115,10 +115,7 @@ fn init_logging() -> Option<WorkerGuard> {
                 eprintln!("sextant: logging to {}", path.display());
             }
             Err(e) => {
-                eprintln!(
-                    "sextant: could not create log file {}: {e}",
-                    path.display()
-                );
+                eprintln!("sextant: could not create log file {}: {e}", path.display());
             }
         }
     }

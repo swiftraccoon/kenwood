@@ -4,9 +4,8 @@
 //! argv[1], decode each frame with `AmbeDecoder`, and write 160
 //! s16le PCM samples per frame to argv[2].
 //!
-//! Used by the validation harness in `ref_tools/run_validation.sh`
-//! to compare our decoder output against mbelib's for identical
-//! AMBE input.
+//! Used by the validation harness that compares our decoder output
+//! against mbelib's for identical AMBE input.
 
 #![allow(clippy::print_stderr)]
 

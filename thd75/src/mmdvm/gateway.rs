@@ -106,8 +106,9 @@ const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 /// gateway boundary translates between the two conventions so
 /// downstream decoders see standards-compliant bytes.
 ///
-/// Discovered empirically (`ref_tools/chip_hello_bitrev.ambe`
-/// experiment, 2026-04): applying this transform to captured `DStarData`
+/// Discovered empirically (bit-reversal experiment on a captured
+/// "chip hello" AMBE frame, 2026-04): applying this transform to
+/// captured `DStarData`
 /// payloads eliminated all spurious tone/erasure frames and dropped
 /// the mean per-frame `b0` jump from 38 to 6.6, consistent with real
 /// speech. The fix applies symmetrically on TX so what we hand to the
@@ -663,19 +664,28 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
     ///
     /// Returns [`Error::Transport`] if the modem loop has exited.
     pub async fn send_voice(&mut self, frame: &VoiceFrame) -> Result<(), Error> {
-        // Bit-reverse each byte on TX so the TH-D75 firmware's
-        // LSB-first byte assembly produces the correct on-wire bit
-        // order. Inverse of the RX path in `dispatch_event`.
+        // Do NOT bit-reverse on TX.
+        //
+        // Originally this path mirrored the RX bit-reversal for
+        // symmetry, but the TH-D75's MMDVM firmware turns out to
+        // handle TX and RX asymmetrically — the RX path delivers
+        // bytes LSB-first (hence `dispatch_event`'s reversal to
+        // restore MSB-first spec convention), but the TX path
+        // accepts bytes in the on-wire MSB-first order directly.
+        // User-confirmed regression: adding TX reversal broke
+        // thd75-repl's D-STAR audio forwarding — the radio
+        // received the D-STAR header (text message popped up on the
+        // LCD) but couldn't decode any voice frames because the
+        // byte layout no longer matched what the DVSI chip expected.
+        // Reverting the TX path to raw passthrough restores
+        // thd75-repl audio forwarding while keeping the RX fix that
+        // made radio→sextant intelligible.
         let mut data = [0u8; 12];
         if let Some(dst) = data.get_mut(..9) {
-            for (slot, &b) in dst.iter_mut().zip(frame.ambe.iter()) {
-                *slot = bit_reverse(b);
-            }
+            dst.copy_from_slice(&frame.ambe);
         }
         if let Some(dst) = data.get_mut(9..12) {
-            for (slot, &b) in dst.iter_mut().zip(frame.slow_data.iter()) {
-                *slot = bit_reverse(b);
-            }
+            dst.copy_from_slice(&frame.slow_data);
         }
         self.modem
             .send_dstar_data(data)

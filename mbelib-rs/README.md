@@ -115,9 +115,9 @@ OP25's reference implementation with identical inputs:
   frame DP look-ahead from OP25 `pitch_est.cc:229-281` is the
   remaining piece to close this gap.
 
-Produce the `.trace` input with
-`ref_tools/build/ambe_encode_dump <pcm> <out.ambe> <trace>` after
-`cmake`-building `ref_tools/` against the included OP25 source.
+Produce the `.trace` input with the `ambe_encode_dump` harness
+built against an OP25 checkout (CLI: `ambe_encode_dump <pcm>
+<out.ambe> <trace>`).
 
 Derived from Max H. Parke (KA1RBI)'s `ambe_encoder.cc` and Pavel
 Yazev's `imbe_vocoder` in [boatbod/op25](https://github.com/boatbod/op25)

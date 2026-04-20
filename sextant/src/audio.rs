@@ -97,7 +97,7 @@ impl AudioHandle {
     /// Send a command to the audio worker. Drops silently if the
     /// worker has exited.
     pub(crate) fn send(&self, cmd: AudioCommand) {
-        let _unused =self.cmd_tx.send(cmd);
+        let _unused = self.cmd_tx.send(cmd);
     }
 }
 
@@ -241,12 +241,9 @@ impl AudioWorker {
                 self.tx_active = true;
                 self.tx_stats.reset();
                 self.encoder = AmbeEncoder::new();
-                if let Err(e) = self
-                    .session_tx
-                    .try_send(SessionCommand::StartTx {
-                        my_call: my_call.clone(),
-                    })
-                {
+                if let Err(e) = self.session_tx.try_send(SessionCommand::StartTx {
+                    my_call: my_call.clone(),
+                }) {
                     warn!(error = %e, "session StartTx enqueue failed");
                 }
                 tracing::info!(my_call, "TX path enabled — mic capture active");
@@ -372,8 +369,7 @@ impl AudioWorker {
             // Pad / truncate to exactly AMBE_FRAME_SAMPLES — linear
             // resampling can produce N-1 or N+1 depending on rounding.
             if self.resampled_in.len() < AMBE_FRAME_SAMPLES {
-                self.resampled_in
-                    .resize(AMBE_FRAME_SAMPLES, 0.0);
+                self.resampled_in.resize(AMBE_FRAME_SAMPLES, 0.0);
             } else if self.resampled_in.len() > AMBE_FRAME_SAMPLES {
                 self.resampled_in.truncate(AMBE_FRAME_SAMPLES);
             }
@@ -388,7 +384,6 @@ impl AudioWorker {
             }
         }
     }
-
 }
 
 /// Owns the cpal streams and ringbufs. One input (mic) + one output
@@ -435,12 +430,8 @@ impl AudioIo {
         let (speaker_tx, speaker_cons) = HeapRb::<f32>::new(speaker_cap).split();
 
         let input_stream = build_input_stream(&input_device, &input_cfg, input_channels, mic_prod)?;
-        let output_stream = build_output_stream(
-            &output_device,
-            &output_cfg,
-            output_channels,
-            speaker_cons,
-        )?;
+        let output_stream =
+            build_output_stream(&output_device, &output_cfg, output_channels, speaker_cons)?;
 
         input_stream
             .play()
@@ -559,7 +550,7 @@ fn build_input_stream(
                         let sum: f32 = chunk.iter().map(|&s| f32::from(s) / 32768.0).sum();
                         #[allow(clippy::cast_precision_loss)]
                         let avg = sum / chunk.len() as f32;
-                        let _unused =mic_prod.try_push(avg);
+                        let _unused = mic_prod.try_push(avg);
                     }
                 },
                 err_fn,
@@ -577,7 +568,7 @@ fn build_input_stream(
                             .sum();
                         #[allow(clippy::cast_precision_loss)]
                         let avg = sum / chunk.len() as f32;
-                        let _unused =mic_prod.try_push(avg);
+                        let _unused = mic_prod.try_push(avg);
                     }
                 },
                 err_fn,
@@ -650,7 +641,7 @@ fn write_mono(data: &[f32], channels: u16, mic_prod: &mut ringbuf::HeapProd<f32>
         let sum: f32 = chunk.iter().sum();
         #[allow(clippy::cast_precision_loss)]
         let avg = sum / chunk.len() as f32;
-        let _unused =mic_prod.try_push(avg);
+        let _unused = mic_prod.try_push(avg);
     }
 }
 

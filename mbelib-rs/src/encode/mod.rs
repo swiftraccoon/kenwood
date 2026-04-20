@@ -11,24 +11,22 @@
 //! GPLv3) with AMBE-specific parameter requantization against the
 //! szechyjs mbelib codebooks we already ship in [`crate::tables`].
 //!
-//! # What this module contains (P1 scope)
-//!
-//! P1 is only the *packing* layer — given a 72-bit FEC-codeword array
-//! `ambe_fr` (same layout [`crate::unpack`] produces after error
-//! correction), produce the 9-byte wire frame. It is the exact
-//! algorithmic inverse of [`crate::unpack::unpack_frame`] plus
-//! [`crate::unpack::demodulate_c1`].
-//!
-//! The encode pipeline layers on top of this in later phases:
+//! # Phase status
 //!
 //! | Phase | Adds | Status |
 //! |------:|------|--------|
-//! | P1    | bit pack + interleave + C1 XOR (this module) | present |
-//! | P2    | FFT front-end, windowing | TODO |
-//! | P3    | pitch estimation (`pitch_est.cc` / `pitch_ref.cc`) | TODO |
-//! | P4    | V/UV + spectral amplitudes + quantization | TODO |
-//! | P5    | MBE→AMBE parameter remap + `AmbeEncoder` wrapper | TODO |
-//! | P6    | chip interop tuning | TODO |
+//! | P1    | bit pack + interleave + C1 XOR ([`pack_frame`]) | done |
+//! | P2    | DC removal, LPF, window, FFT ([`analyze_frame`]) | done |
+//! | P3    | pitch estimation (sub-harmonic summation port of `pitch_est.cc`) | done (single-frame; multi-frame DP deferred) |
+//! | P4    | V/UV + spectral amplitudes + gain quantization ([`detect_vuv`], [`extract_spectral_amplitudes`], `quantize`) | done |
+//! | P5    | PRBA/HOC codebook search, FEC, `AmbeEncoder` wrapper | done (bit-exact vs OP25 on b3..b7) |
+//! | P6    | chip-interop tuning | partial (see [`encoder`]'s status block) |
+//!
+//! The top-level entry point is [`AmbeEncoder::encode_frame`]. The
+//! individual stage functions (`analyze_frame`, `PitchTracker`,
+//! `detect_vuv`, `extract_spectral_amplitudes`) remain public so
+//! diagnostic tooling (`examples/validate_*.rs`) can feed known-good
+//! inputs at each stage boundary.
 //!
 //! # IP status
 //!
@@ -38,33 +36,32 @@
 //! module deliberately does **not** implement AMBE+2; a `set_49bit_mode`
 //! equivalent is explicitly out of scope.
 
-// P2 front-end (DC removal, LPF, window, FFT) + P1 packer. Public
-// items are exposed so operators can experiment with the in-progress
-// pipeline; they WILL be wrapped inside a stable `AmbeEncoder` in P5.
-// Until then, `mbelib_rs::EncoderBuffers` + `mbelib_rs::FftPlan` +
-// `mbelib_rs::analyze_frame` + `mbelib_rs::pack_frame` form the
-// piecemeal API.
-
 mod analyze;
+#[cfg(not(feature = "kenwood-tables"))]
 mod dc_rmv;
 mod encoder;
 mod interleave;
 mod pack;
 mod pe_lpf;
 mod pitch;
+mod pitch_quant;
 mod quantize;
 mod spectral;
 mod state;
 mod vuv;
 mod window;
+mod wr_sp;
+
+#[cfg(feature = "kenwood-tables")]
+pub mod kenwood;
 
 pub use analyze::{FftPlan, analyze_frame};
 pub use encoder::AmbeEncoder;
 pub use pack::pack_frame;
-pub use pitch::{PitchEstimate, PitchTracker};
+pub use pitch::{PitchEstimate, PitchTracker, compute_e_p};
 pub use spectral::{MAX_HARMONICS, SpectralAmplitudes, extract_spectral_amplitudes};
 pub use state::EncoderBuffers;
-pub use vuv::{MAX_BANDS, VuvDecisions, detect_vuv};
+pub use vuv::{MAX_BANDS, VuvDecisions, VuvState, detect_vuv, detect_vuv_and_sa};
 
 /// Validation-only exposure of the internal quantize pipeline.
 ///

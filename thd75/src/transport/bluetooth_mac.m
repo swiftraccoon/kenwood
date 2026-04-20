@@ -4,7 +4,53 @@
 #import <IOBluetooth/IOBluetooth.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <sys/time.h>
 #include <unistd.h>
+
+// Opt-in shim tracing. Set THD75_BT_TRACE=1 before launching the
+// host (thd75-repl/-tui/examples) to get microsecond-stamped entry
+// and exit lines for every FFI boundary that can block the main
+// thread: bt_pump_runloop, bt_rfcomm_write's writeSync:, and the
+// rfcommChannelData: delegate callback (whose blocking write()
+// into the ingress pipe is the most plausible freeze point).
+//
+// Written to stderr (unbuffered via fflush) so the output shows up
+// alongside Rust tracing without requiring a new sink. Wall-clock
+// timestamps let you line these up with the thd75-repl trace log.
+static _Atomic int g_bt_trace = -1;
+
+static int bt_trace_enabled(void) {
+    int v = g_bt_trace;
+    if (v < 0) {
+        const char *e = getenv("THD75_BT_TRACE");
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+        g_bt_trace = v;
+    }
+    return v;
+}
+
+// Print a microsecond-stamped line to stderr. Uses vfprintf so the
+// caller site looks like a regular printf, but with the timestamp
+// and a "[bt] " prefix auto-prepended. NO-OP when tracing is off.
+static void bt_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void bt_trace(const char *fmt, ...) {
+    if (!bt_trace_enabled()) return;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm t;
+    gmtime_r(&tv.tv_sec, &t);
+    fprintf(stderr,
+            "[bt] %02d:%02d:%02d.%06d thread=%s ",
+            t.tm_hour, t.tm_min, t.tm_sec, (int)tv.tv_usec,
+            [NSThread isMainThread] ? "main" : "other");
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
 
 @class RfcommDelegate;
 
@@ -26,7 +72,18 @@ typedef struct {
     if (_ctx && e == kIOReturnSuccess) _ctx->state = 1;
 }
 - (void)rfcommChannelData:(IOBluetoothRFCOMMChannel *)ch data:(void *)data length:(size_t)len {
-    if (_ctx && _ctx->pipe_write >= 0) write(_ctx->pipe_write, data, len);
+    // This runs on the main thread's CFRunLoop. The write() below
+    // can block if the ingress pipe fills (Rust side not draining
+    // fast enough), and while it blocks the whole main thread is
+    // wedged — nothing else on the LocalSet runs. Trace both sides
+    // so a hang here is visible as "enter" with no matching "exit".
+    bt_trace("rfcommChannelData enter len=%zu", len);
+    if (_ctx && _ctx->pipe_write >= 0) {
+        ssize_t w = write(_ctx->pipe_write, data, len);
+        bt_trace("rfcommChannelData exit wrote=%zd", w);
+    } else {
+        bt_trace("rfcommChannelData exit no-pipe");
+    }
 }
 - (void)rfcommChannelClosed:(IOBluetoothRFCOMMChannel *)ch {
     if (_ctx) _ctx->state = 0;
@@ -52,11 +109,18 @@ void bt_pump_runloop(void) {
     // Must pump the MAIN thread's run loop — IOBluetooth delivers
     // RFCOMM callbacks there regardless of which thread calls this.
     if ([NSThread isMainThread]) {
+        // Bounded pump: 1 ms cap. Should always return promptly.
+        // If a long "enter" with no matching "exit" shows up in a
+        // hang's tail, the freeze is inside a CFRunLoop callback
+        // (most likely rfcommChannelData: — see its own trace).
+        bt_trace("bt_pump_runloop enter main");
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, false);
+        bt_trace("bt_pump_runloop exit main");
     } else {
         // From a non-main thread, wake the main run loop so it processes
         // pending IOBluetooth callbacks. The pump_main_runloop background
         // thread also does this, but an explicit wake ensures timely delivery.
+        bt_trace("bt_pump_runloop wake-main from other");
         CFRunLoopWakeUp(CFRunLoopGetMain());
     }
 }
@@ -157,9 +221,18 @@ void *bt_rfcomm_open(const char *device_name, uint8_t rfcomm_channel) {
 int bt_rfcomm_write(void *handle, const uint8_t *data, size_t len) {
     RfcommContext *ctx = (RfcommContext *)handle;
     if (!ctx || !ctx->channel || ctx->state != 1 || len > UINT16_MAX) return -1;
+    // writeSync: blocks until the peer acknowledges the RFCOMM
+    // frame (or the channel errors out). If the radio's RFCOMM
+    // buffer is full and the firmware has stalled, this is where
+    // the main thread parks indefinitely. An "enter" line with no
+    // matching "exit" in the trace dump narrows the hang to here
+    // rather than bt_pump_runloop.
+    bt_trace("bt_rfcomm_write enter len=%zu", len);
     @autoreleasepool {
-        return ([ctx->channel writeSync:(void *)data
-                                 length:(UInt16)(len & 0xFFFF)] == kIOReturnSuccess) ? 0 : -1;
+        IOReturn r = [ctx->channel writeSync:(void *)data
+                                      length:(UInt16)(len & 0xFFFF)];
+        bt_trace("bt_rfcomm_write exit ret=0x%08x", (unsigned)r);
+        return (r == kIOReturnSuccess) ? 0 : -1;
     }
 }
 

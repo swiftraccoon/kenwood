@@ -147,9 +147,19 @@ pub fn decode_trace(ambe: &[u8; 9]) -> ([usize; 9], f32, usize, [u8; 49]) {
 #[cfg(feature = "encoder")]
 pub use encode::{
     AmbeEncoder, EncoderBuffers, FftPlan, MAX_BANDS, MAX_HARMONICS, PitchEstimate, PitchTracker,
-    SpectralAmplitudes, VuvDecisions, analyze_frame, detect_vuv, extract_spectral_amplitudes,
-    pack_frame, validation,
+    SpectralAmplitudes, VuvDecisions, VuvState, analyze_frame, compute_e_p, detect_vuv,
+    detect_vuv_and_sa, extract_spectral_amplitudes, pack_frame, validation,
 };
+
+/// Kenwood-specific constants for A/B testing the encoder, gated
+/// behind the `kenwood-tables` feature.
+///
+/// The encoder pipeline does NOT consume these by default — the
+/// module is a catalogue, not a swap. Swap points are introduced
+/// deliberately, one at a time, with each change measurable against
+/// hardware-in-the-loop captures.
+#[cfg(feature = "kenwood-tables")]
+pub use encode::kenwood;
 
 use ecc::AMBE_DATA_BITS;
 use params::MbeParams;

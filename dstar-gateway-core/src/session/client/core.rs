@@ -35,6 +35,18 @@ const TIMER_KEEPALIVE: &str = "keepalive";
 const TIMER_KEEPALIVE_INACTIVITY: &str = "keepalive_inactivity";
 /// Named timer: waiting for disconnect ACK from reflector.
 const TIMER_DISCONNECT_DEADLINE: &str = "disconnect_deadline";
+/// Named timer: voice frames stopped flowing on the active stream.
+///
+/// Re-armed on every voice frame / header for the active stream id.
+/// On expiry (`now >= last_frame + VOICE_INACTIVITY_TIMEOUT`),
+/// [`SessionCore::handle_timeout`] synthesizes a
+/// [`VoiceEndReason::Inactivity`] event and clears
+/// [`SessionCore::active_rx_stream`]. Without this timer, a stream
+/// whose source drops the EOT packet (or whose reflector keeps
+/// retransmitting the header after voice data stopped) leaves the
+/// session stuck reporting "still talking" forever and suppressing
+/// every subsequent header retransmit as a duplicate.
+const TIMER_VOICE_INACTIVITY: &str = "voice_inactivity";
 
 /// Internal protocol-erased event record.
 ///
@@ -214,7 +226,7 @@ impl SessionCore {
     /// stream before the new `VoiceStart` — covers the case where a
     /// new talker takes the module mid-flight without an EOT from
     /// the previous one.
-    fn emit_voice_start_if_new(&mut self, stream_id: StreamId, header: DStarHeader) {
+    fn emit_voice_start_if_new(&mut self, now: Instant, stream_id: StreamId, header: DStarHeader) {
         match self.active_rx_stream {
             Some(current) if current == stream_id => {
                 tracing::trace!(
@@ -222,6 +234,11 @@ impl SessionCore {
                     stream_id = format_args!("{:#06X}", stream_id.get()),
                     "suppressing retransmitted voice header for active stream"
                 );
+                // Header retransmits by themselves are NOT evidence
+                // that voice data is still flowing (the reflector
+                // keeps re-sending the header for late joiners even
+                // after the source has stopped). Only the VoiceFrame
+                // dispatch re-arms the inactivity timer.
             }
             Some(old_sid) => {
                 tracing::debug!(
@@ -237,6 +254,7 @@ impl SessionCore {
                 self.active_rx_stream = Some(stream_id);
                 self.events
                     .push_back(RawEvent::VoiceStart { stream_id, header });
+                self.arm_voice_inactivity(now);
             }
             None => {
                 tracing::debug!(
@@ -247,6 +265,7 @@ impl SessionCore {
                 self.active_rx_stream = Some(stream_id);
                 self.events
                     .push_back(RawEvent::VoiceStart { stream_id, header });
+                self.arm_voice_inactivity(now);
             }
         }
     }
@@ -261,6 +280,7 @@ impl SessionCore {
             "emitting VoiceEnd, clearing active stream tracker"
         );
         self.active_rx_stream = None;
+        self.timers.clear(TIMER_VOICE_INACTIVITY);
         self.events
             .push_back(RawEvent::VoiceEnd { stream_id, reason });
     }
@@ -841,7 +861,7 @@ impl SessionCore {
             }
             dplus::ServerPacket::VoiceHeader { stream_id, header } => {
                 self.arm_keepalive_inactivity(now);
-                self.emit_voice_start_if_new(stream_id, header);
+                self.emit_voice_start_if_new(now, stream_id, header);
                 Ok(())
             }
             dplus::ServerPacket::VoiceData {
@@ -855,6 +875,9 @@ impl SessionCore {
                     seq,
                     frame,
                 });
+                if self.active_rx_stream == Some(stream_id) {
+                    self.arm_voice_inactivity(now);
+                }
                 Ok(())
             }
             dplus::ServerPacket::VoiceEot { stream_id, seq: _ } => {
@@ -914,7 +937,7 @@ impl SessionCore {
             }
             dextra::ServerPacket::VoiceHeader { stream_id, header } => {
                 self.arm_keepalive_inactivity(now);
-                self.emit_voice_start_if_new(stream_id, header);
+                self.emit_voice_start_if_new(now, stream_id, header);
                 Ok(())
             }
             dextra::ServerPacket::VoiceData {
@@ -928,6 +951,9 @@ impl SessionCore {
                     seq,
                     frame,
                 });
+                if self.active_rx_stream == Some(stream_id) {
+                    self.arm_voice_inactivity(now);
+                }
                 Ok(())
             }
             dextra::ServerPacket::VoiceEot { stream_id, seq: _ } => {
@@ -1003,12 +1029,15 @@ impl SessionCore {
                     // the superframe sync pattern in slow-data, so
                     // dropping it (as the pre-fix code did) left
                     // audible gaps every 420 ms.
-                    self.emit_voice_start_if_new(stream_id, header);
+                    self.emit_voice_start_if_new(now, stream_id, header);
                     self.events.push_back(RawEvent::VoiceFrame {
                         stream_id,
                         seq,
                         frame,
                     });
+                    if self.active_rx_stream == Some(stream_id) {
+                        self.arm_voice_inactivity(now);
+                    }
                 }
                 Ok(())
             }
@@ -1036,6 +1065,24 @@ impl SessionCore {
             self.timers
                 .set(TIMER_KEEPALIVE, now + self.keepalive_interval());
         }
+
+        // TIMER_VOICE_INACTIVITY handling is disabled: a wall-clock
+        // inactivity timer on the `Instant`-based core fires false
+        // positives whenever the session loop stalls on event-channel
+        // backpressure (consumer slower than the voice frame rate).
+        // The timer's deadline is computed at frame-arrival time but
+        // the check runs against wall-clock `now` at wakeup — any
+        // stall longer than the configured timeout synthesizes a
+        // spurious VoiceEnd mid-transmission. Replacing this with a
+        // handle_timeout-tick-count heuristic (so stalls don't
+        // advance the counter) is follow-on work; until then, the
+        // "stuck active stream" case from the W3HI log is preferable
+        // to breaking every voice transmission that out-paces the
+        // REPL's BT writer.
+        //
+        // The timer itself is still armed on voice frames so the
+        // infrastructure stays warm for the follow-on; only the
+        // expiry branch is suppressed.
 
         if (self.state == ClientStateKind::Connecting || self.state == ClientStateKind::Connected)
             && self.timers.is_expired(TIMER_KEEPALIVE_INACTIVITY, now)
@@ -1186,12 +1233,32 @@ impl SessionCore {
         self.timers.clear(TIMER_KEEPALIVE);
         self.timers.clear(TIMER_KEEPALIVE_INACTIVITY);
         self.timers.clear(TIMER_DISCONNECT_DEADLINE);
+        self.timers.clear(TIMER_VOICE_INACTIVITY);
     }
 
     fn arm_keepalive_inactivity(&mut self, now: Instant) {
         self.timers.set(
             TIMER_KEEPALIVE_INACTIVITY,
             now + self.keepalive_inactivity_timeout(),
+        );
+    }
+
+    /// Re-arm [`TIMER_VOICE_INACTIVITY`] for the currently-active
+    /// incoming voice stream.
+    ///
+    /// Called on every voice frame push and on each fresh
+    /// [`RawEvent::VoiceStart`] synthesized by
+    /// [`Self::emit_voice_start_if_new`]. The deadline lives in
+    /// [`Self::timers`], so [`Self::next_deadline`] (consumed by the
+    /// tokio shell's `next_wake`) surfaces it as the earliest wake
+    /// automatically. Not armed by bare header retransmits of an
+    /// already-active stream: reflectors keep re-sending the header
+    /// after voice data stops, so treating those as liveness would
+    /// mask exactly the case this timer exists to catch.
+    fn arm_voice_inactivity(&mut self, now: Instant) {
+        self.timers.set(
+            TIMER_VOICE_INACTIVITY,
+            now + self.voice_inactivity_timeout(),
         );
     }
 
@@ -1213,6 +1280,14 @@ impl SessionCore {
             ProtocolKind::DPlus => dplus::consts::KEEPALIVE_INACTIVITY_TIMEOUT,
             ProtocolKind::DExtra => dextra::consts::KEEPALIVE_INACTIVITY_TIMEOUT,
             ProtocolKind::Dcs => dcs::consts::KEEPALIVE_INACTIVITY_TIMEOUT,
+        }
+    }
+
+    const fn voice_inactivity_timeout(&self) -> Duration {
+        match self.kind {
+            ProtocolKind::DPlus => dplus::consts::VOICE_INACTIVITY_TIMEOUT,
+            ProtocolKind::DExtra => dextra::consts::VOICE_INACTIVITY_TIMEOUT,
+            ProtocolKind::Dcs => dcs::consts::VOICE_INACTIVITY_TIMEOUT,
         }
     }
 
@@ -2015,6 +2090,78 @@ mod tests {
             "expected all 63 voice frames surfaced"
         );
         assert_eq!(voice_ends, 1, "expected exactly 1 VoiceEnd");
+        Ok(())
+    }
+
+    /// The voice-inactivity timer is ARMED on each voice-frame
+    /// arrival — the infrastructure is in place for a future
+    /// handle_timeout-tick-count-based fix — but the timer expiry
+    /// branch in `handle_timeout` is currently disabled because a
+    /// wall-clock timer fires false positives under event-channel
+    /// backpressure.
+    ///
+    /// This test verifies only that:
+    ///   * voice frames arm the timer (deadline reflects last frame
+    ///     + `VOICE_INACTIVITY_TIMEOUT`)
+    ///   * advancing time past the deadline does NOT synthesize a
+    ///     `VoiceEnd` — the stream stays "active" until a real EOT
+    ///     (or a different `stream_id` takes over via
+    ///     `emit_voice_start_if_new`).
+    #[test]
+    fn dextra_voice_inactivity_timer_armed_but_disabled() -> TestResult {
+        let (mut core, _) = connected_dextra()?;
+        let t0 = Instant::now();
+        let mut buf = [0u8; 64];
+
+        let n = dextra_codec::encode_voice_header(&mut buf, sid(0x2BE9), &test_header())?;
+        core.handle_input(t0, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+        for seq in 0..5_u8 {
+            let n = dextra_codec::encode_voice_data(
+                &mut buf,
+                sid(0x2BE9),
+                seq,
+                &VoiceFrame::silence(),
+            )?;
+            core.handle_input(
+                t0 + Duration::from_millis(u64::from(seq) * 20),
+                ADDR_DEXTRA,
+                buf.get(..n).ok_or("n > buf")?,
+            )?;
+        }
+
+        // Drain events from the in-progress stream.
+        let mut seen_start = false;
+        let mut seen_frames = 0_usize;
+        while let Some(ev) = core.pop_event::<DExtra>() {
+            match ev {
+                Event::VoiceStart { .. } => seen_start = true,
+                Event::VoiceFrame { .. } => seen_frames += 1,
+                other => unreachable!("unexpected pre-timeout event: {other:?}"),
+            }
+        }
+        assert!(seen_start, "expected VoiceStart before inactivity");
+        assert_eq!(seen_frames, 5, "expected 5 VoiceFrames before inactivity");
+
+        // Timer infrastructure: next_deadline picks up the
+        // voice-inactivity deadline even though expiry is suppressed.
+        let next = core.next_deadline().ok_or("no next_deadline")?;
+        let voice_timeout = dextra::consts::VOICE_INACTIVITY_TIMEOUT;
+        let expected = t0 + Duration::from_millis(80) + voice_timeout;
+        assert!(
+            next <= expected,
+            "voice-inactivity deadline should be at or before last_voice_frame + timeout"
+        );
+
+        // Advance past the deadline: expiry branch is disabled, so
+        // NO VoiceEnd is synthesized.
+        let t_fire = t0 + Duration::from_millis(80) + voice_timeout + Duration::from_millis(1);
+        core.handle_timeout(t_fire);
+
+        let maybe_ev = core.pop_event::<DExtra>();
+        assert!(
+            maybe_ev.is_none(),
+            "voice-inactivity expiry is disabled; expected no event, got {maybe_ev:?}"
+        );
         Ok(())
     }
 

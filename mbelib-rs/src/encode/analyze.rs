@@ -21,6 +21,7 @@
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
 
+#[cfg(not(feature = "kenwood-tables"))]
 use crate::encode::dc_rmv::dc_rmv;
 use crate::encode::pe_lpf::pe_lpf;
 use crate::encode::state::{EncoderBuffers, FFT_LENGTH, FRAME, PITCH_EST_BUF_SIZE};
@@ -104,11 +105,28 @@ pub fn analyze_frame(
     // room for the new samples at the tail.
     bufs.shift_pitch_history();
 
-    // Step 2: DC-remove the new frame into pitch_ref_buf's tail.
+    // Step 2: input conditioning — remove DC (plus, when Kenwood
+    // tables are enabled, everything below ≈345 Hz) and write the
+    // result into `pitch_ref_buf`'s tail. The default path uses
+    // OP25's 13 Hz first-order HPF; the `kenwood-tables` path uses
+    // the radio's own 345 Hz biquad HPF (zeros on the unit circle
+    // at DC, corner ≈345 Hz) which rejects rumble entirely before
+    // pitch analysis sees it. Either way, the tail slice of
+    // `pitch_ref_buf` is what downstream pitch refinement + FFT
+    // stages read — swapping the filter doesn't change the data
+    // flow, only the frequency response of the input.
     let tail_start = PITCH_EST_BUF_SIZE - FRAME;
     let (prefix, tail) = bufs.pitch_ref_buf.split_at_mut(tail_start);
     let _ = prefix; // keeping older history intact
+    #[cfg(not(feature = "kenwood-tables"))]
     dc_rmv(&snd[..FRAME], tail, &mut bufs.dc_rmv_mem);
+    #[cfg(feature = "kenwood-tables")]
+    crate::encode::kenwood::filter::biquad_df1_section(
+        &crate::encode::kenwood::biquads::HPF_345HZ_COEFFS,
+        &snd[..FRAME],
+        tail,
+        &mut bufs.kenwood_hpf_mem,
+    );
 
     // Step 3: apply the pitch-estimation LPF from pitch_ref_buf into
     // pitch_est_buf (both in the same tail slot). We can't borrow

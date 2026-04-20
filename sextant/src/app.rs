@@ -152,9 +152,7 @@ impl App {
                     reason,
                 } => self.append_log(LogLine {
                     level: LogLevel::Event,
-                    text: format!(
-                        "VoiceEnd sid=0x{stream_id:04X} frames={frames} reason={reason}"
-                    ),
+                    text: format!("VoiceEnd sid=0x{stream_id:04X} frames={frames} reason={reason}"),
                 }),
                 SessionEvent::Error(e) => {
                     self.last_error = Some(e.clone());
@@ -179,7 +177,7 @@ impl App {
                 return;
             }
         };
-        let _unused =self.cmd_tx.try_send(SessionCommand::Connect(cfg));
+        let _unused = self.cmd_tx.try_send(SessionCommand::Connect(cfg));
     }
 
     fn try_disconnect(&self) {
@@ -204,7 +202,7 @@ impl App {
     }
 
     fn tx_silence_test(&self) {
-        let _unused =self
+        let _unused = self
             .cmd_tx
             .try_send(SessionCommand::TxSilence { seconds: 2.0 });
     }
@@ -275,17 +273,18 @@ impl eframe::App for App {
                     egui::ComboBox::from_id_salt("protocol_select")
                         .selected_text(format!("{:?}", self.protocol))
                         .show_ui(ui, |ui| {
-                            let _unused =ui.selectable_value(
+                            let _unused = ui.selectable_value(
                                 &mut self.protocol,
                                 ProtocolKind::DExtra,
                                 "DExtra",
                             );
-                            let _unused =ui.selectable_value(
+                            let _unused = ui.selectable_value(
                                 &mut self.protocol,
                                 ProtocolKind::DPlus,
                                 "DPlus",
                             );
-                            let _unused =ui.selectable_value(&mut self.protocol, ProtocolKind::Dcs, "DCS");
+                            let _unused =
+                                ui.selectable_value(&mut self.protocol, ProtocolKind::Dcs, "DCS");
                         });
                     ui.end_row();
 
@@ -325,20 +324,28 @@ impl eframe::App for App {
 
             ui.horizontal(|ui| {
                 let connected = matches!(self.status, ConnStatus::Connected { .. });
-                let ptt_label = if self.active_tx { "PTT ON (click to stop)" } else { "PTT" };
+                let ptt_label = if self.active_tx {
+                    "PTT ON (click to stop)"
+                } else {
+                    "PTT"
+                };
                 let colour = if self.active_tx {
                     egui::Color32::from_rgb(180, 40, 40)
                 } else {
                     egui::Color32::DARK_GRAY
                 };
-                let ptt_btn = egui::Button::new(egui::RichText::new(ptt_label).color(egui::Color32::WHITE))
-                    .fill(colour)
-                    .min_size(egui::vec2(180.0, 40.0));
+                let ptt_btn =
+                    egui::Button::new(egui::RichText::new(ptt_label).color(egui::Color32::WHITE))
+                        .fill(colour)
+                        .min_size(egui::vec2(180.0, 40.0));
                 if ui.add_enabled(connected, ptt_btn).clicked() {
                     self.toggle_ptt();
                 }
                 if ui
-                    .add_enabled(connected && !self.active_tx, egui::Button::new("TX silence (2 s)"))
+                    .add_enabled(
+                        connected && !self.active_tx,
+                        egui::Button::new("TX silence (2 s)"),
+                    )
                     .clicked()
                 {
                     self.tx_silence_test();
@@ -379,7 +386,7 @@ fn module_picker(ui: &mut egui::Ui, id: &str, value: &mut char) {
         .selected_text(String::from(*value))
         .show_ui(ui, |ui| {
             for ch in ['A', 'B', 'C', 'D', 'E'] {
-                let _unused =ui.selectable_value(value, ch, String::from(ch));
+                let _unused = ui.selectable_value(value, ch, String::from(ch));
             }
         });
 }

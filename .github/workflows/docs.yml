@@ -12,7 +12,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.0
-      - run: cargo doc --workspace --no-deps
+      # sextant (our GUI D-STAR client) pulls in cpal → alsa-sys on
+      # Linux, which requires the ALSA development headers at build
+      # time. `--workspace` docs exercise the full dep graph, unlike
+      # the other workflows which build crates individually.
+      - name: Install Linux audio headers (alsa for cpal/sextant)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
       # rustdoc does not generate a root index.html when called with
@@ -40,6 +47,7 @@ jobs:
               <a href="thd75_tui/">thd75-tui</a>,
               <a href="thd75_repl/">thd75-repl</a>,
               <a href="mbelib_rs/">mbelib-rs</a>,
+              <a href="sextant/">sextant</a>,
               <a href="stargazer/">stargazer</a>.
             </p>
           </body>

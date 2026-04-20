@@ -40,4 +40,15 @@ ignore = [
     # Recheck when rand 0.9.3+ ships the fix and sqlx upgrades, or
     # when we add any custom log::Log implementation.
     "RUSTSEC-2026-0097",
+
+    # RUSTSEC-2024-0436: paste is unmaintained (proc-macro crate).
+    #
+    # Pulled in transitively by `metal` → `wgpu-hal` → `wgpu-core` /
+    # `wgpu` → `egui-wgpu` → `eframe` → `sextant`. paste is a
+    # compile-time-only identifier-concatenation macro; no runtime
+    # code ships. The advisory flags maintenance status, not a
+    # vulnerability. The upstream fix is the wgpu stack migrating to
+    # `pastey` or similar; sextant's egui/wgpu versions don't ship
+    # that yet. Recheck on the next eframe/wgpu bump.
+    "RUSTSEC-2024-0436",
 ]

@@ -12,8 +12,8 @@
 // Usage:
 //   validate_quantize_vs_op25 <op25_trace_file>
 //
-// Produces the OP25 trace with:
-//   ref_tools/build/ambe_encode_dump <in.s16> <out.ambe> <trace>
+// Produces the OP25 trace with the `ambe_encode_dump` harness built
+// against OP25: `ambe_encode_dump <in.s16> <out.ambe> <trace>`
 //
 // The trace must include `prev_log2Ml` / `prev_L` lines (added via
 // `#define private public` access to `ambe_encoder::prev_mp`).

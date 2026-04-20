@@ -26,6 +26,15 @@ default = []
 # US Patent 8,359,197 B2 (DVSI, active until 2028-05-20). See LICENSE
 # for full jurisdictional notes.
 encoder = []
+# Reference data lifted from the TH-D75 AMBE DSP firmware image
+# (lawfully owned hardware, DMCA §1201(f) interoperability exception).
+# Enabling this compiles the `encode::kenwood` module — a catalogue of
+# `pub const` tables (filter coefficients, postfilter weights, math
+# constants) that the encoder pipeline can swap in at specific A/B
+# test points against radio-captured AMBE frames. No Kenwood algorithm
+# code is imported; the feature reshapes NUMBERS only. Pulls in
+# `encoder` because every current swap site is encoder-only.
+kenwood-tables = ["encoder"]
 
 [dev-dependencies]
 proptest = "1"
@@ -43,6 +52,14 @@ required-features = ["encoder"]
 
 [[example]]
 name = "validate_analysis_vs_op25"
+required-features = ["encoder"]
+
+[[example]]
+name = "validate_dp_vs_op25"
+required-features = ["encoder"]
+
+[[example]]
+name = "validate_bvec_vs_op25"
 required-features = ["encoder"]
 
 [lints.rust]

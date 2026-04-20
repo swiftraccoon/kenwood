@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 //
 // Algorithmic reference: Pavel Yazev's `imbe_vocoder/sa_encode.cc`
-// (OP25, 2009, GPLv3). Simplified extraction — the reference's
-// log-magnitude predictor + PRBA/HOC vector quantization is deferred
-// to later phases; this module handles raw harmonic magnitude
-// extraction from the FFT output.
+// (OP25, 2009, GPLv3). This module handles the raw harmonic
+// magnitude extraction from the FFT output; the log-magnitude
+// predictor + PRBA/HOC vector quantization the reference chains
+// onto it lives in [`crate::encode::quantize`] (fed by our output
+// via [`crate::encode::encoder::AmbeEncoder::encode_frame`]).
 
 //! Spectral amplitude extraction: FFT bins → per-harmonic magnitudes.
 

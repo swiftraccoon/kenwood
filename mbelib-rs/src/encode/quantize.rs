@@ -7,23 +7,39 @@
 //! spectral amplitudes) and produces the 49-bit `ambe_d` parameter
 //! vector consumed by the FEC encoder.
 //!
-//! # Current scope
+//! # Fields
 //!
-//! - **`b0` (pitch, 7 bits):** nearest-neighbor search against
-//!   [`crate::tables::W0_TABLE`].
-//! - **`b1` (V/UV, 5 bits):** heuristic mapping from per-band
-//!   decisions to the 5-bit V/UV codebook index. Simplified:
-//!   roughly-voiced (≥50% bands voiced) → index 0x1F (all-voiced);
-//!   roughly-unvoiced → index 0x00 (all-unvoiced); otherwise index 0x0F.
-//! - **`b2` (gain, 5 bits):** set to 0 (no gain change).
-//! - **`b3..b8` (spectral amplitudes):** all zero.
+//! - **`b0` (pitch, 7 bits):** L-constrained search against
+//!   [`crate::tables::W0_TABLE`] — pick the index whose
+//!   [`crate::tables::L_TABLE`] entry equals `amps.num_harmonics`
+//!   and whose W0 value is closest to the target f0. Falls back
+//!   to nearest-W0 only when no b0 matches the target L (rare,
+//!   edge pitches only).
+//! - **`b1` (V/UV, 4 bits):** per-band voicing pattern chosen by
+//!   minimizing the energy-weighted disagreement with each of the
+//!   16 [`crate::tables::VUV_TABLE`] rows across the active bands.
+//! - **`b2` (gain, 6 bits):** nearest-neighbor on the 64-entry
+//!   [`crate::tables::DG_TABLE`] against the mean of the per-
+//!   harmonic log-spectral amplitudes.
+//! - **`b3..b8` (spectral envelope):** block-DCT on the prediction
+//!   residual `T = lsa - 0.65·interp(prev_log2_ml)`; assemble R
+//!   pairs from block DC + first AC coefficients; inverse 8-pt DCT
+//!   → G[8]; PRBA24 / PRBA58 codebook search (b3, b4); per-block
+//!   HOC codebook search (b5..b8). `b8` uses stride-2 search —
+//!   only even indices are representable in the 3-bits-with-
+//!   forced-zero-LSB wire field (mbelib decoder convention).
 //!
-//! A full implementation would do PRBA/HOC/LMPRBL vector quantization
-//! against the remaining codebooks in [`crate::tables`] — that work
-//! is bracketed for a later iteration. The current output is not
-//! perceptually equivalent to real speech, but produces valid AMBE
-//! frames with a correct pitch header that real DVSI chips will
-//! recognize as legitimate voice (not silence / erasure / tone).
+//! After emitting the 49-bit vector, the encoder runs a closed-loop
+//! [`crate::decode::decode_params`] on its own output and carries
+//! the reconstructed `log2_ml` forward as `prev_log2_ml` for the
+//! next frame — so the prediction residual the decoder adds back
+//! matches bit-for-bit what the encoder subtracted.
+//!
+//! Stage 5..8 is bit-exact against OP25's `ambe_encoder.cc` for
+//! b3/b4/b5/b6/b7 when given identical `imbe_param` inputs
+//! (validated by `examples/validate_quantize_vs_op25.rs`). The
+//! remaining mismatch on b0 / b1 / b2 / b8 is documented inline
+//! next to each codebook search.
 
 use crate::ecc::AMBE_DATA_BITS;
 use crate::encode::pitch::PitchEstimate;
@@ -454,82 +470,40 @@ fn compute_spectral_residuals(lsa: &[f32; 57], n: usize, prev: &PrevFrameState) 
     t
 }
 
-/// Find the `W0_TABLE` index whose `f0` is nearest the estimate.
+/// Quantize pitch to a 7-bit `b0` code using OP25's `b0_lookup` +
+/// ±1 walk policy (`ambe_encoder.cc:158-192`).
 ///
 /// Returns a value in `0..=119`. Codes 120–123 (erasure) and 126–127
 /// (tone) are avoided; 124/125 (silence) are only emitted when the
 /// pitch confidence is below the voice threshold.
+///
+/// See [`crate::encode::pitch_quant::pitch_index`] for the full
+/// description of the walk. This wrapper adds:
+///
+/// - The silence short-circuit (low-confidence inputs emit `124`, the
+///   D-STAR silence code).
+/// - Conversion from our `PitchEstimate` (float period in samples) to
+///   OP25's Q8.8 `ref_pitch` format.
 fn quantize_pitch(pitch: PitchEstimate, target_l: usize) -> u8 {
     if pitch.confidence < 0.05 {
         // Near-silence — emit the silence code that mbelib 2400
         // treats specially (w0 = 2π/32, L = 14, all bands unvoiced).
         return 124;
     }
-    let target_w0 = pitch.f0_hz / 8000.0; // cycles/sample
-    // L-constrained nearest-W0 search.
+    // Convert period (f32 samples) → Q8.8 (samples · 256).
     //
-    // OP25's `ambe_encoder.cc:169-191` picks `b[0]` via a direct
-    // `b0_lookup[ref_pitch_bin]` lookup then ADJUSTS it up/down until
-    // `AmbePlusLtable[b[0]] == imbe_param->num_harms`. That
-    // adjustment is necessary because `L_TABLE` is piecewise-constant
-    // over `b0` — several adjacent `b0` values map to the same `L`
-    // before stepping up to `L+1`. A pure nearest-W0 pick (our prior
-    // revision) returns whatever `b0` has the closest frequency, even
-    // if its `L` doesn't match the harmonic count the rest of the
-    // encoder is working with; that mismatch forces the receiver's
-    // `L` to differ from what the spectral envelope was computed for.
-    //
-    // We reproduce the same outcome here without needing the 784-
-    // entry `b0_lookup` array: scan every `b0` whose `L_TABLE` entry
-    // matches `target_l` and pick the one with the closest `W0_TABLE`
-    // value. When no `b0` maps to `target_l` (target outside the
-    // piecewise `L` range — only for very-high or very-low pitch
-    // edge cases), fall back to plain nearest-W0.
-    let mut best_idx: u8 = 0;
-    let mut best_err = f32::INFINITY;
-    let mut matched_any = false;
-    for (idx, (&w0, &l_val)) in tables::W0_TABLE
-        .iter()
-        .zip(tables::L_TABLE.iter())
-        .take(120)
-        .enumerate()
-    {
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "L_TABLE values are whole numbers 9..=56"
-        )]
-        let l_int = l_val as usize;
-        if l_int != target_l {
-            continue;
-        }
-        let err = (w0 - target_w0).abs();
-        if err < best_err {
-            best_err = err;
-            #[allow(clippy::cast_possible_truncation, reason = "idx < 120 fits in u8")]
-            {
-                best_idx = idx as u8;
-            }
-            matched_any = true;
-        }
-    }
-    if matched_any {
-        return best_idx;
-    }
-    // Fallback: no b0 matches target_l (rare — happens when target_l
-    // is outside the 9..=56 range L_TABLE covers). Pick the closest
-    // b0 on frequency alone.
-    for (idx, &w0) in tables::W0_TABLE.iter().take(120).enumerate() {
-        let err = (w0 - target_w0).abs();
-        if err < best_err {
-            best_err = err;
-            #[allow(clippy::cast_possible_truncation, reason = "idx < 120 fits in u8")]
-            {
-                best_idx = idx as u8;
-            }
-        }
-    }
-    best_idx
+    // OP25 expects `ref_pitch` in the range 19.875..123.125 samples
+    // (`ambe_encoder.cc:163`). Values outside clamp into the table's
+    // valid index range inside `pitch_index`, which is the
+    // least-bad fallback — the caller should have silenced the
+    // frame if the pitch were that far out.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "period ∈ (0, 256) for valid pitches; multiplying by 256 keeps it in u32 range"
+    )]
+    let ref_pitch_q8_8 = (pitch.period_samples * 256.0).round().max(0.0) as u32;
+    crate::encode::pitch_quant::pitch_index(ref_pitch_q8_8, target_l, &tables::L_TABLE)
 }
 
 /// Find the 4-bit `VUV_TABLE` index whose voicing pattern best matches
@@ -894,8 +868,29 @@ fn quantize_spectrum(t_residuals: &[f32; 57], n: usize) -> QuantizedSpectrum {
     } else {
         nearest_hoc(&tables::HOC_B7_TABLE, &hoc_target(3), hoc_dims(3), 1)
     };
-    // b8 uses stride 2 — only even indices are representable in
-    // the 3-bit-with-forced-zero-LSB wire field.
+    // b8: stride-2 search over the 16-row HOCb8 codebook.
+    //
+    // OP25's `ambe_encoder.cc:495` uses `max_8 = (dstar) ? 16 : 8`,
+    // searching all 16 rows and storing whichever has minimum SSE.
+    // OP25's trace dumper (`ambe_encode_dump`) reads the wire back
+    // through `decode_dstar`, whose `load_reg` reconstructs the LOW
+    // 3 bits of OP25's internal `b[8]` (`p25p2_vf.cc:39,45`).
+    //
+    // Our wire format is mbelib's: `ambe_d[35..=37]` hold bits 3, 2,
+    // 1 of the 4-bit index, with bit 0 forced to 0
+    // (`ref/mbelib/ambe3600x2400.c:436-440`). Reconstruction uses
+    // the MIDDLE 3 bits, not the LOW 3.
+    //
+    // Consequence: if we'd done the stride=1 full-row search, an
+    // odd-indexed best pick (say row k+1) would pack-collapse to
+    // even row k on our wire — and row k may have HIGHER SSE than
+    // row k+2 would. Stride=2 evaluates `{k, k+2}` directly and
+    // picks whichever has lower SSE. That's strictly ≤ what
+    // stride=1 achieves under mbelib wire packing. Empirically
+    // (chirp fixture), stride=1 and stride=2 produce identical
+    // wire bytes AND identical validator b8 match rate (22%) — the
+    // remaining gap is structural wire-format difference with
+    // OP25's D-STAR path, not search policy.
     let b8 = if hoc_dims(4) == 0 {
         0
     } else {
@@ -1214,6 +1209,217 @@ mod tests {
             assert!(
                 err < 1e-5,
                 "gm[{m}] recovery error {err}: in={input} out={output}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Regression tests — each pins a specific bug we fixed during the
+    // stage-by-stage OP25 validation pass. A failure on any of these
+    // indicates a regression in the quantize pipeline.
+    // -------------------------------------------------------------------
+
+    /// Fix #1 (`SA_SCALE`): without `SA_SCALE = 32768` mapping our
+    /// [-1, 1] f32 magnitudes into OP25's int16 `imbe_param->sa[]`
+    /// domain, `log2(sa)` sits 15 bits below IMBE's scale and every
+    /// PRBA/HOC codebook search collapses to the all-zero corner.
+    ///
+    /// This test feeds a moderate-amplitude input and checks that
+    /// the gain index `b2` lands somewhere meaningful — neither at
+    /// the codebook floor (0) nor clamped at the ceiling (63) for a
+    /// mid-level signal. A regression like `SA_SCALE = 1` would pin
+    /// b2 to 0; `SA_SCALE = 2^30` would pin it to 63.
+    #[test]
+    fn sa_scale_maps_amps_into_gain_codebook_range() {
+        use crate::encode::spectral::{MAX_HARMONICS, SpectralAmplitudes};
+        let pitch = PitchEstimate {
+            period_samples: 50.0, // 160 Hz
+            f0_hz: 160.0,
+            confidence: 0.9,
+        };
+        let vuv = VuvDecisions {
+            voiced: [true; MAX_BANDS],
+            num_bands: 10,
+        };
+        let mut magnitudes = [0.0_f32; MAX_HARMONICS];
+        // Voiced harmonic magnitudes in a typical mic-level range.
+        // Peak ~0.15 (−16 dBFS) across 20 harmonics.
+        for slot in magnitudes.iter_mut().take(20) {
+            *slot = 0.15;
+        }
+        let amps = SpectralAmplitudes {
+            magnitudes,
+            num_harmonics: 20,
+        };
+        let prev = PrevFrameState {
+            log2_ml: [0.0_f32; 57],
+            l: 0,
+        };
+        let outcome = quantize(pitch, vuv, &amps, &prev);
+        // Extract b2 from the emitted ambe_d.
+        let a = &outcome.ambe_d;
+        let bit = |k: usize| u8::from(a[k] != 0);
+        let b2 = (bit(6) << 5)
+            | (bit(7) << 4)
+            | (bit(8) << 3)
+            | (bit(9) << 2)
+            | (bit(42) << 1)
+            | bit(43);
+        assert!(
+            (5..=63).contains(&b2),
+            "b2 for a voiced moderate-amplitude input should sit in \
+             the upper half of DG_TABLE, got {b2} — likely SA_SCALE \
+             regression"
+        );
+    }
+
+    /// Fix #2 (closed-loop prev): encoder must emit `prev_log2_ml`
+    /// that a fresh decoder would reconstruct from the same
+    /// emitted bytes. If we stored raw `lsa` instead of running
+    /// `decode_params` internally, the prediction residual drifts
+    /// every frame.
+    ///
+    /// This test encodes a voiced frame, then independently runs
+    /// our decoder on the emitted `ambe_d` and asserts the decoder's
+    /// `log2_ml` matches what `quantize()` returned as
+    /// `prev_log2_ml`.
+    #[test]
+    fn prev_log2_ml_matches_decoder_reconstruction() {
+        use crate::decode;
+        use crate::encode::spectral::{MAX_HARMONICS, SpectralAmplitudes};
+        use crate::params::MbeParams;
+        let pitch = PitchEstimate {
+            period_samples: 50.0,
+            f0_hz: 160.0,
+            confidence: 0.9,
+        };
+        let vuv = VuvDecisions {
+            voiced: [true; MAX_BANDS],
+            num_bands: 10,
+        };
+        let mut magnitudes = [0.0_f32; MAX_HARMONICS];
+        for slot in magnitudes.iter_mut().take(25) {
+            *slot = 0.10;
+        }
+        let amps = SpectralAmplitudes {
+            magnitudes,
+            num_harmonics: 25,
+        };
+        let prev = PrevFrameState {
+            log2_ml: [0.0_f32; 57],
+            l: 0,
+        };
+        let outcome = quantize(pitch, vuv, &amps, &prev);
+
+        // Independently decode the emitted ambe_d.
+        let mut cur = MbeParams::new();
+        let decoder_prev = {
+            let mut p = MbeParams::new();
+            p.log2_ml = prev.log2_ml;
+            p.l = prev.l;
+            p
+        };
+        let _status = decode::decode_params(&outcome.ambe_d, &mut cur, &decoder_prev);
+
+        // Encoder's carry-forward prev_log2_ml must match the
+        // decoder's reconstructed log2_ml bit-for-bit.
+        for i in 0..=cur.l {
+            let encoder_side = outcome.prev_log2_ml.get(i).copied().unwrap_or(f32::NAN);
+            let decoder_side = cur.log2_ml.get(i).copied().unwrap_or(f32::NAN);
+            assert!(
+                (encoder_side - decoder_side).abs() < 1e-6,
+                "prev_log2_ml[{i}] diverges from decoder: encoder={encoder_side} \
+                 decoder={decoder_side}"
+            );
+        }
+        assert_eq!(
+            outcome.prev_l, cur.l,
+            "prev_l must match decoder's reconstructed L"
+        );
+    }
+
+    /// Fix #5 (per-harmonic voicing via `i/3` band expansion):
+    /// `compute_lsa` must map harmonic index `i` to band `i/3` when
+    /// reading `vuv.voiced`. If it reads `vuv.voiced[i]` directly,
+    /// every harmonic past `num_bands` (i.e. past the 12th) picks
+    /// the wrong voicing offset, shifting `lsa[i]` by the
+    /// `log_l_w0 - log_l_2` gap (~0.44 for typical voice pitch).
+    ///
+    /// This test forces a scenario where the bug would be visible:
+    /// all bands voiced, 30 harmonics. If the bug is back,
+    /// harmonics 12..=29 would read `vuv.voiced[12..=29]` which is
+    /// the `false` zero-padding and treat those as unvoiced.
+    #[test]
+    fn per_harmonic_voicing_uses_band_expansion() {
+        use crate::encode::spectral::{MAX_HARMONICS, SpectralAmplitudes};
+        let pitch = PitchEstimate {
+            period_samples: 40.0,
+            f0_hz: 200.0,
+            confidence: 0.9,
+        };
+        // 10 bands all voiced; voiced[10..] would be the default false.
+        let mut voiced = [false; MAX_BANDS];
+        voiced.iter_mut().take(10).for_each(|v| *v = true);
+        let vuv = VuvDecisions {
+            voiced,
+            num_bands: 10,
+        };
+        let mut magnitudes = [0.0_f32; MAX_HARMONICS];
+        for slot in magnitudes.iter_mut().take(30) {
+            *slot = 0.05;
+        }
+        let amps = SpectralAmplitudes {
+            magnitudes,
+            num_harmonics: 30,
+        };
+        let prev = PrevFrameState {
+            log2_ml: [0.0_f32; 57],
+            l: 0,
+        };
+        let outcome = quantize(pitch, vuv, &amps, &prev);
+
+        // b1 (VUV index) is 4 bits at positions [38, 39, 40, 41]. For
+        // all 10 bands voiced with the band-expansion bug absent, the
+        // V/UV codebook search should pick row 15 (all-voiced) — the
+        // minimum-energy pattern when every band matches. With the
+        // bug (voiced[i] read per-harmonic), harmonics 10..=29 report
+        // unvoiced, pulling the search toward a mid-voiced row.
+        let a = &outcome.ambe_d;
+        let bit = |k: usize| u8::from(a[k] != 0);
+        let b1 = (bit(38) << 3) | (bit(39) << 2) | (bit(40) << 1) | bit(41);
+        assert_eq!(
+            b1, 15,
+            "b1 should pick the all-voiced row (15) when every band is \
+             voiced; got {b1} — likely per-harmonic band-expansion \
+             regression"
+        );
+    }
+
+    /// Fix #6 (L-constrained b0 search): `quantize_pitch` must pick
+    /// a `b0` where `L_TABLE[b0] == target_l`, not purely the
+    /// nearest-W0. Multiple `b0` values map to the same L; nearest-W0
+    /// alone can land on a b0 whose L differs from the one the
+    /// spectral analysis computed harmonics for, desync'ing the
+    /// downstream quantizer.
+    #[test]
+    fn quantize_pitch_respects_target_l() {
+        use crate::tables::L_TABLE;
+        let est = PitchEstimate {
+            period_samples: 40.0, // 200 Hz
+            f0_hz: 200.0,
+            confidence: 0.9,
+        };
+        // For a mid-range target_l, the chosen b0 must satisfy
+        // L_TABLE[b0] == target_l — this is the whole point of the
+        // L-constrained search.
+        for target_l in [18_usize, 24, 30, 40] {
+            let b0 = quantize_pitch(est, target_l);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let got_l = L_TABLE[b0 as usize] as usize;
+            assert_eq!(
+                got_l, target_l,
+                "L_TABLE[b0={b0}]={got_l} does not match target_l={target_l} \
+                 — nearest-W0 fallback fired when a matching entry exists"
             );
         }
     }

@@ -141,11 +141,7 @@ impl RuntimeSession {
         }
     }
 
-    async fn send_header(
-        &mut self,
-        header: DStarHeader,
-        sid: StreamId,
-    ) -> Result<(), ShellError> {
+    async fn send_header(&mut self, header: DStarHeader, sid: StreamId) -> Result<(), ShellError> {
         match self {
             Self::DPlus(s) => s.send_header(header, sid).await,
             Self::DExtra(s) => s.send_header(header, sid).await,
@@ -644,7 +640,10 @@ async fn start_tx(session: &mut RuntimeSession, my_call: &str) -> Result<TxStrea
         my_call,
         "TX starting — sending header"
     );
-    session.send_header(header, sid).await.map_err(|e| e.to_string())?;
+    session
+        .send_header(header, sid)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(TxStream { sid, seq: 0 })
 }
 
@@ -706,7 +705,10 @@ async fn tx_silence(
     // supposedly-10-s run.  Wrap mod SUPERFRAME_LEN (21) to match the
     // real-mic TxFrame handler above and stay clear of bit 6.
     for i in 0..total_frames {
-        #[allow(clippy::cast_possible_truncation, reason = "result is always < 21, fits in u8")]
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "result is always < 21, fits in u8"
+        )]
         let seq = (i % u32::from(SUPERFRAME_LEN)) as u8;
         session
             .send_voice(sid, seq, frame)
@@ -714,13 +716,16 @@ async fn tx_silence(
             .map_err(|e| e.to_string())?;
         // Natural 20 ms pacing — avoids flooding the reflector. Real
         // mic capture will inherently pace itself at 50 fps.
-        tokio::time::sleep_until(
-            tokio::time::Instant::from_std(start + Duration::from_millis(20 * u64::from(i + 1))),
-        )
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            start + Duration::from_millis(20 * u64::from(i + 1)),
+        ))
         .await;
     }
 
-    #[allow(clippy::cast_possible_truncation, reason = "result is always < 21, fits in u8")]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "result is always < 21, fits in u8"
+    )]
     let eot_seq = (total_frames % u32::from(SUPERFRAME_LEN)) as u8;
     session
         .send_eot(sid, eot_seq)

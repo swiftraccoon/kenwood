@@ -5,7 +5,8 @@
 // For each 160-sample PCM frame, runs our analysis pipeline
 // (analyze_frame → pitch tracker → V/UV detector → spectral
 // amplitudes) and compares the outputs frame-by-frame against OP25's
-// `imbe_param` values dumped by `ref_tools/build/ambe_encode_dump`.
+// `imbe_param` values dumped by an `ambe_encode_dump` harness built
+// against OP25.
 //
 // This isolates Stages 1–4 from Stages 5–8 — stage-5+ divergences
 // are covered by `validate_quantize_vs_op25`. Together, the two
@@ -30,7 +31,7 @@
 )]
 
 use mbelib_rs::{
-    EncoderBuffers, FftPlan, PitchTracker, analyze_frame, detect_vuv, extract_spectral_amplitudes,
+    EncoderBuffers, FftPlan, PitchTracker, VuvState, analyze_frame, detect_vuv_and_sa,
 };
 use realfft::num_complex::Complex;
 use std::io::{BufRead, BufReader, Read};
@@ -130,6 +131,7 @@ fn main() {
     let mut plan = FftPlan::new();
     let mut fft_out: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); 129];
     let mut pitch_tracker = PitchTracker::new();
+    let mut vuv_state = VuvState::new();
 
     println!();
     println!("Frame | OP25 (L, pitch_ref_samples)   | OURS (L_est, pitch_samples)");
@@ -147,8 +149,8 @@ fn main() {
         analyze_frame(&samples, &mut bufs, &mut plan, &mut fft_out);
         let pitch = pitch_tracker.estimate(bufs.pitch_est_buf());
         let f0_bin = 256.0 / pitch.period_samples;
-        let vuv = detect_vuv(&fft_out, f0_bin);
-        let amps = extract_spectral_amplitudes(&fft_out, f0_bin);
+        let e_p = (1.0 - pitch.confidence).clamp(0.0, 1.0);
+        let (vuv, amps) = detect_vuv_and_sa(&fft_out, f0_bin, &mut vuv_state, e_p);
         let our_l = amps.num_harmonics;
 
         let op25_f = &op25[frame_idx];
