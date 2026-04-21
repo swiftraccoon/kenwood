@@ -151,6 +151,7 @@ impl<T: Transport> ModemLoop<T> {
                 biased;
 
                 maybe_cmd = self.command_rx.recv() => {
+                    tracing::trace!(target: "mmdvm::hang_hunt", "select: command_rx fired");
                     let Some(cmd) = maybe_cmd else {
                         tracing::debug!(
                             target: "mmdvm::tokio_shell",
@@ -159,9 +160,11 @@ impl<T: Transport> ModemLoop<T> {
                         return Ok(());
                     };
                     self.apply_command(cmd).await?;
+                    tracing::trace!(target: "mmdvm::hang_hunt", "select: command handled");
                 }
 
                 read = self.transport.read(&mut read_chunk) => {
+                    tracing::trace!(target: "mmdvm::hang_hunt", "select: transport.read fired");
                     match read {
                         Ok(0) => {
                             tracing::debug!(
@@ -186,16 +189,21 @@ impl<T: Transport> ModemLoop<T> {
                             return Err(ShellError::Io(e));
                         }
                     }
+                    tracing::trace!(target: "mmdvm::hang_hunt", "select: transport.read handled");
                 }
 
                 _ = status_tick.tick() => {
+                    tracing::trace!(target: "mmdvm::hang_hunt", "select: status_tick fired");
                     if !self.shutting_down {
                         self.write_frame(&MmdvmFrame::new(MMDVM_GET_STATUS)).await?;
                     }
+                    tracing::trace!(target: "mmdvm::hang_hunt", "select: status_tick handled");
                 }
 
                 _ = playout_tick.tick() => {
+                    tracing::trace!(target: "mmdvm::hang_hunt", "select: playout_tick fired");
                     self.drain_tx_queue().await?;
+                    tracing::trace!(target: "mmdvm::hang_hunt", "select: playout_tick handled");
                 }
             }
         }
@@ -396,14 +404,23 @@ impl<T: Transport> ModemLoop<T> {
             self.write_frame(&wire).await?;
             self.dstar_space = self.dstar_space.saturating_sub(frame.slots_required);
         }
+        tracing::trace!(target: "mmdvm::hang_hunt", "drain_tx_queue: queue empty");
         Ok(())
     }
 
     /// Encode `frame` and push the bytes to the transport.
     async fn write_frame(&mut self, frame: &MmdvmFrame) -> Result<(), ShellError> {
         let bytes = encode_frame(frame)?;
+        tracing::trace!(
+            target: "mmdvm::hang_hunt",
+            len = bytes.len(),
+            cmd = format!("0x{:02X}", frame.command),
+            "write_frame: awaiting transport.write_all"
+        );
         self.transport.write_all(&bytes).await?;
+        tracing::trace!(target: "mmdvm::hang_hunt", "write_frame: write_all done, awaiting flush");
         self.transport.flush().await?;
+        tracing::trace!(target: "mmdvm::hang_hunt", "write_frame: flushed");
         Ok(())
     }
 }
@@ -412,11 +429,25 @@ impl<T: Transport> ModemLoop<T> {
 /// channel has been dropped. Kept as a free function so the
 /// auto-`Send` checker doesn't require `&ModemLoop<T>: Sync`.
 async fn emit_event(sender: &mpsc::Sender<Event>, event: Event) {
+    // Hang-hunt: if the REPL stops consuming mmdvm events, this
+    // send will eventually block on a full channel (cap 256) and
+    // the entire modem loop freezes. A matched "awaiting" / "sent"
+    // pair is healthy; "awaiting" with no "sent" for hundreds of
+    // ms points directly at event-channel backpressure.
+    let variant = std::mem::discriminant(&event);
+    tracing::trace!(
+        target: "mmdvm::hang_hunt",
+        remaining_cap = sender.capacity(),
+        ?variant,
+        "emit_event: awaiting event_tx.send"
+    );
     if sender.send(event).await.is_err() {
         tracing::debug!(
             target: "mmdvm::tokio_shell",
             "event consumer dropped; suppressing further events"
         );
+    } else {
+        tracing::trace!(target: "mmdvm::hang_hunt", "emit_event: sent");
     }
 }
 

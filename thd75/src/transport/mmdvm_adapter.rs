@@ -203,24 +203,27 @@ async fn pump_task<T: Transport>(
 
             maybe_write = write_rx.recv() => {
                 let Some(data) = maybe_write else {
-                    // Adapter dropped — clean shutdown.
                     tracing::debug!(
                         target: "kenwood_thd75::transport::mmdvm_adapter",
                         "write channel closed; pump task exiting"
                     );
                     return transport;
                 };
+                tracing::trace!(
+                    target: "mmdvm::hang_hunt",
+                    len = data.len(),
+                    "pump: write branch — calling transport.write"
+                );
                 if let Err(e) = transport.write(&data).await {
                     tracing::warn!(
                         target: "kenwood_thd75::transport::mmdvm_adapter",
                         error = %e,
                         "transport write failed; pump task exiting"
                     );
-                    // Report the error upstream (best-effort); receiver
-                    // may have already closed.
                     let _ = read_tx.send(Err(transport_err_to_io(e))).await;
                     return transport;
                 }
+                tracing::trace!(target: "mmdvm::hang_hunt", "pump: transport.write returned");
             }
 
             read_result = transport.read(&mut scratch) => {
@@ -240,9 +243,6 @@ async fn pump_task<T: Transport>(
                     }
                     Ok(n) => {
                         let Some(slice) = scratch.get(..n) else {
-                            // Should be unreachable — Transport::read
-                            // never reports more bytes than the buffer
-                            // holds. Guard defensively.
                             tracing::warn!(
                                 target: "kenwood_thd75::transport::mmdvm_adapter",
                                 got = n,
@@ -252,6 +252,12 @@ async fn pump_task<T: Transport>(
                             continue;
                         };
                         let bytes = slice.to_vec();
+                        tracing::trace!(
+                            target: "mmdvm::hang_hunt",
+                            len = bytes.len(),
+                            cap_remaining = read_tx.capacity(),
+                            "pump: read branch — awaiting read_tx.send"
+                        );
                         if read_tx.send(Ok(bytes)).await.is_err() {
                             tracing::debug!(
                                 target: "kenwood_thd75::transport::mmdvm_adapter",
@@ -259,6 +265,7 @@ async fn pump_task<T: Transport>(
                             );
                             return transport;
                         }
+                        tracing::trace!(target: "mmdvm::hang_hunt", "pump: read_tx.send done");
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -323,15 +330,19 @@ impl<T: Transport + Unpin + 'static> AsyncWrite for MmdvmTransportAdapter<T> {
         match this.write_tx.try_send(data) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                // Pump task is briefly busy. Register our waker with
-                // the channel's reserve mechanism by doing a
-                // `poll_reserve`-equivalent. The simplest portable
-                // thing is to wake ourselves and retry shortly; the
-                // pump drains write_rx eagerly.
-                //
-                // A more efficient approach would use `PollSender`
-                // from `tokio-util`, but we don't want the extra
-                // dependency for this rarely-hit backpressure path.
+                // Pump task is briefly busy. Wake ourselves and
+                // retry shortly; the pump drains write_rx eagerly.
+                // A sustained hang-hunt trace here (many "Full" in
+                // a row with no matching pump write progress) means
+                // the pump task is wedged in FFI. The log is
+                // rate-limited by the spin itself — every retry
+                // emits one line, so "hundreds of Full in a millisecond"
+                // is the signal, not the volume.
+                tracing::trace!(
+                    target: "mmdvm::hang_hunt",
+                    cap_remaining = this.write_tx.capacity(),
+                    "adapter.poll_write: write_tx FULL (will wake-retry)"
+                );
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }

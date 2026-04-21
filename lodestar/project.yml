@@ -1,0 +1,133 @@
+name: Lodestar
+options:
+  bundleIdPrefix: me.dhawkins.lodestar
+  deploymentTarget:
+    iOS: "17.0"
+    macOS: "14.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    DEVELOPMENT_TEAM: ""
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    GENERATE_INFOPLIST_FILE: NO
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    # Ad-hoc signing for local dev (no team needed). macOS Bluetooth
+    # entitlements require the binary to be signed, so CODE_SIGNING_ALLOWED
+    # must be YES. Real distribution / TestFlight later sets DEVELOPMENT_TEAM.
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGNING_ALLOWED: YES
+    CODE_SIGNING_REQUIRED: YES
+
+targets:
+  LodestarIOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: Shared
+      - path: iOS
+        excludes:
+          - Info.plist
+      - path: Generated
+        optional: true
+    dependencies:
+      - framework: LodestarKit.xcframework
+        embed: false
+    info:
+      path: iOS/Info.plist
+      properties:
+        CFBundleDisplayName: Lodestar
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: true
+        UIRequiredDeviceCapabilities: [arm64]
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        "UISupportedInterfaceOrientations~ipad":
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "1,2"
+        PRODUCT_MODULE_NAME: Lodestar
+        PRODUCT_BUNDLE_IDENTIFIER: me.dhawkins.lodestar
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Prevent this iOS binary from launching on Apple Silicon Macs
+        # as "Designed for iPad". Users should run LodestarMac instead,
+        # which is the real native macOS build with IOBluetooth access.
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        SUPPORTS_MACCATALYST: NO
+
+  LodestarMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: Shared
+      - path: macOS
+        excludes:
+          - Info.plist
+      - path: Generated
+        optional: true
+    dependencies:
+      - framework: LodestarKit.xcframework
+        embed: false
+      # Real macOS framework — works on native macOS target (unlike Catalyst).
+      - sdk: IOBluetooth.framework
+    info:
+      path: macOS/Info.plist
+      properties:
+        CFBundleDisplayName: Lodestar
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        LSApplicationCategoryType: public.app-category.utilities
+        NSBluetoothAlwaysUsageDescription: "Lodestar uses Bluetooth to connect to your Kenwood TH-D75 transceiver and exchange CAT commands."
+        NSBluetoothPeripheralUsageDescription: "Lodestar uses Bluetooth to connect to your Kenwood TH-D75 transceiver and exchange CAT commands."
+        NSPrincipalClass: NSApplication
+    settings:
+      base:
+        PRODUCT_MODULE_NAME: Lodestar
+        PRODUCT_BUNDLE_IDENTIFIER: me.dhawkins.lodestar.mac
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+  LodestarTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: LodestarMac
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: me.dhawkins.lodestar.mac.tests
+
+schemes:
+  LodestarMac:
+    build:
+      targets:
+        LodestarMac: all
+        LodestarTests: [test]
+    test:
+      targets:
+        - LodestarTests
+    run:
+      config: Debug
+  LodestarIOS:
+    build:
+      targets:
+        LodestarIOS: all
+    run:
+      config: Debug

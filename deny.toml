@@ -234,6 +234,21 @@ skip = [
     # crates) uses getrandom 0.2; newer deps use 0.3.
     { crate = "getrandom@0.2.17" },
 
+    # UniFFI 0.31 (lodestar-core Rust↔Swift FFI) pulls getrandom 0.4;
+    # older workspace crates still use 0.3. Drop when those upgrade.
+    { crate = "getrandom@0.3.4" },
+
+    # toml 0.8 chain (stargazer direct + the toml_edit / toml_datetime
+    # / winnow that 0.8 pulls); UniFFI 0.31's uniffi_bindgen / trybuild
+    # pull the toml 0.9 / 1.1 chain which brings serde_spanned 1.x,
+    # toml_datetime 0.7, winnow 1.0. Drop whichever entries resolve
+    # when stargazer bumps toml or uniffi converges on one toml
+    # major.
+    { crate = "serde_spanned@0.6.9" },
+    { crate = "toml@0.8.23" },
+    { crate = "toml_datetime@0.6.11" },
+    { crate = "winnow@0.7.15" },
+
     # scraper 0.22 uses itertools 0.13; multiple newer deps (including
     # egui_extras) use 0.14. Drop when scraper updates.
     { crate = "itertools@0.13.0" },

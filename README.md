@@ -23,30 +23,30 @@ Rust workspace for Kenwood amateur-radio transceivers: core TH-D75 library, TUI,
 
 | Radio | Core | TUI | REPL | Status |
 |-------|------|-----|------|--------|
-| TH-D75A/E | [`thd75/`](thd75/) | [`thd75-tui/`](thd75-tui/) | [`thd75-repl/`](thd75-repl/) | In development |
-| TM-D750 | Planned | Planned | Planned | Not started |
+| TH-D75A/E | [`thd75/`](thd75/) | [`thd75-tui/`](thd75-tui/) | [`thd75-repl/`](thd75-repl/) | experimental |
+| TM-D750 | Planned | Planned | Planned | not started |
 
 ## Crates
 
-Stability column:
-- `experimental` — may not compile on all platforms; under heavy change.
-- `alpha` — builds, tests pass, API breaks often.
-- `pre-release` — feature-complete within its stated scope; API still unstable pending downstream integration.
+Every crate in this workspace is `experimental`: may not compile on
+all platforms, under heavy change, public API and wire formats can
+break between any two commits. Do not depend on anything here
+expecting stability.
 
 | Crate | Purpose | Stability |
 |-------|---------|-----------|
-| [`thd75/`](thd75/) | TH-D75 library: CAT, MCP programming, SD-card parsing, transports, high-level `AprsClient` | alpha |
-| [`thd75-tui/`](thd75-tui/) | Terminal UI for the TH-D75 | alpha |
-| [`thd75-repl/`](thd75-repl/) | Screen-reader-friendly REPL (CAT, APRS, D-STAR gateway) | alpha |
-| [`kiss-tnc/`](kiss-tnc/) | KISS TNC wire framing (`no_std` + `alloc`, sans-io) | pre-release |
-| [`ax25-codec/`](ax25-codec/) | AX.25 v2.2 frame codec (`no_std` + `alloc`, sans-io) | pre-release |
-| [`aprs/`](aprs/) | APRS parser, digipeater, SmartBeaconing, messaging, station list (std, sans-io) | pre-release |
-| [`aprs-is/`](aprs-is/) | APRS-IS TCP client (tokio) | pre-release |
-| [`dstar-gateway-core/`](dstar-gateway-core/) | DPlus / DExtra / DCS reflector codecs + typestate client and server sessions (no I/O) | alpha |
-| [`dstar-gateway/`](dstar-gateway/) | Tokio async shell over `dstar-gateway-core` with auth and host-file fetcher | alpha |
+| [`thd75/`](thd75/) | TH-D75 library: CAT, MCP programming, SD-card parsing, transports, high-level `AprsClient` | experimental |
+| [`thd75-tui/`](thd75-tui/) | Terminal UI for the TH-D75 | experimental |
+| [`thd75-repl/`](thd75-repl/) | Screen-reader-friendly REPL (CAT, APRS, D-STAR gateway) | experimental |
+| [`kiss-tnc/`](kiss-tnc/) | KISS TNC wire framing (`no_std` + `alloc`, sans-io) | experimental |
+| [`ax25-codec/`](ax25-codec/) | AX.25 v2.2 frame codec (`no_std` + `alloc`, sans-io) | experimental |
+| [`aprs/`](aprs/) | APRS parser, digipeater, SmartBeaconing, messaging, station list (std, sans-io) | experimental |
+| [`aprs-is/`](aprs-is/) | APRS-IS TCP client (tokio) | experimental |
+| [`dstar-gateway-core/`](dstar-gateway-core/) | DPlus / DExtra / DCS reflector codecs + typestate client and server sessions (no I/O) | experimental |
+| [`dstar-gateway/`](dstar-gateway/) | Tokio async shell over `dstar-gateway-core` with auth and host-file fetcher | experimental |
 | [`dstar-gateway-server/`](dstar-gateway-server/) | Multi-client D-STAR reflector server with cross-protocol forwarding; ships a `polaris` binary as a standalone local DExtra test reflector | experimental |
-| [`mmdvm-core/`](mmdvm-core/) | Sans-io MMDVM modem protocol codec | alpha |
-| [`mmdvm/`](mmdvm/) | Tokio async shell for MMDVM modems | alpha |
+| [`mmdvm-core/`](mmdvm-core/) | Sans-io MMDVM modem protocol codec | experimental |
+| [`mmdvm/`](mmdvm/) | Tokio async shell for MMDVM modems | experimental |
 | [`mbelib-rs/`](mbelib-rs/) | AMBE 3600×2400 voice codec (decoder default; encoder behind `--features encoder`) | experimental |
 | [`sextant/`](sextant/) | GUI D-STAR reflector client — exercises the laptop-only encode/decode pipeline against a local `polaris` reflector | experimental |
 | [`stargazer/`](stargazer/) | Tracing / metrics / observability scaffolding | experimental |

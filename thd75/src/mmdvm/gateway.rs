@@ -513,14 +513,46 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
             return Ok(Some(evt));
         }
 
+        // Noise events (Status at 4 Hz, init-handshake Version/Ack/Nak,
+        // Debug frames, etc.) are swallowed by `dispatch_event` and
+        // surface as `Ok(None)`. Callers' typical drain loop is
+        // `while let Ok(Some(e)) = gw.next_event().await { ... }`,
+        // which would BREAK on the first noise event — leaving the
+        // remaining noise in the mmdvm event channel. During an
+        // active D-STAR voice stream the REPL spends most of its
+        // time in the reflector-event branch of `dstar_poll_cycle`,
+        // producing only ~one radio-drain pass per cycle; if that
+        // pass swallows a single Status and then breaks, noise
+        // accumulates faster than it's consumed. The channel fills
+        // at cap 256 after ~128 s of voice, at which point
+        // `ModemLoop::emit_event` blocks forever on `event_tx.send`,
+        // wedging command processing and deadlocking the REPL on
+        // `send_dstar_data`'s oneshot reply.
+        //
+        // Fix: loop internally past noise within the caller's time
+        // budget so `Ok(None)` means "timed out with no meaningful
+        // event" and nothing else.
         let timeout = self.event_timeout;
-        let Ok(Some(raw)) = tokio::time::timeout(timeout, self.modem.next_event()).await else {
-            // Either a timeout (outer Err) or the task shut down cleanly
-            // (inner None) — surface no event.
-            return Ok(None);
-        };
-
-        self.dispatch_event(raw).await
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let Ok(Some(raw)) = tokio::time::timeout(remaining, self.modem.next_event()).await
+            else {
+                // Either a timeout (outer Err) or the task shut down cleanly
+                // (inner None) — surface no event.
+                return Ok(None);
+            };
+            if let Some(evt) = self.dispatch_event(raw).await? {
+                return Ok(Some(evt));
+            }
+            // `dispatch_event` returned `Ok(None)` — noise event
+            // consumed. Keep pulling from the mmdvm channel within
+            // the same deadline so periodic Status frames don't
+            // short-circuit the caller's drain loop.
+        }
     }
 
     /// Dispatch a raw [`mmdvm::Event`] into a [`DStarEvent`].
@@ -687,10 +719,14 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
         if let Some(dst) = data.get_mut(9..12) {
             dst.copy_from_slice(&frame.slow_data);
         }
-        self.modem
+        tracing::trace!(target: "mmdvm::hang_hunt", "gateway.send_voice: awaiting modem.send_dstar_data");
+        let r = self
+            .modem
             .send_dstar_data(data)
             .await
-            .map_err(shell_err_to_thd75_err)
+            .map_err(shell_err_to_thd75_err);
+        tracing::trace!(target: "mmdvm::hang_hunt", "gateway.send_voice: modem.send_dstar_data returned");
+        r
     }
 
     /// Send a voice frame to the radio without any host-side pacing.

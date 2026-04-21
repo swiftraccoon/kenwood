@@ -1,0 +1,21 @@
+# CodeQL default-setup configuration for the kenwood workspace.
+#
+# The lodestar/ directory holds the native iOS / macOS Swift app
+# that talks to lodestar-core over UniFFI. Its Xcode project is
+# generated on demand via XcodeGen from project.yml — we don't
+# commit the .xcodeproj, .xcworkspace, or DerivedData/ directories,
+# so CodeQL's Swift autobuild step fails with
+# "autobuild detected neither an Xcode project or workspace, nor a
+# Swift package". The Swift code is reviewed manually and via the
+# native Xcode toolchain; CodeQL Swift analysis here would require
+# checking in generated Xcode artifacts or wiring up a manual
+# build step in the workflow (which the default setup doesn't
+# expose), neither of which is worth the complexity today.
+#
+# Drop this exclusion when either:
+#   * lodestar gains a committed Package.swift that SwiftPM can
+#     build, or
+#   * we move to the advanced CodeQL setup with a per-language
+#     manual build step that runs `xcodegen generate` first.
+paths-ignore:
+  - "lodestar/**"

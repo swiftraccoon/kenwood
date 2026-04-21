@@ -9,6 +9,7 @@ Cargo.lock
 .superpowers/
 .claude/
 .worktrees/
+.lint-failures/
 
 # Private
 docs/
@@ -37,3 +38,11 @@ dstar-gateway/book/book/
 
 ref/
 ref_tools/
+
+# Lodestar build artifacts (xcframework, generated Swift, Xcode-generated project)
+lodestar/LodestarKit.xcframework/
+lodestar/Generated/
+lodestar/build/
+lodestar/Lodestar.xcodeproj/
+lodestar/*.xcworkspace/
+lodestar/DerivedData/

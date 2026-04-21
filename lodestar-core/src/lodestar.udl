@@ -1,0 +1,19 @@
+namespace lodestar {
+    string version();
+
+    sequence<u8> encode_cat(CatCommand command);
+
+    CatResponse parse_cat_line(sequence<u8> line);
+};
+
+enum CatCommand {
+    "Identify",
+};
+
+[Enum]
+interface CatResponse {
+    Identify(string model);
+    Unknown();
+    NotAvailableInMode();
+    Raw(string line);
+};

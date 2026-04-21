@@ -48,6 +48,26 @@ const TIMER_DISCONNECT_DEADLINE: &str = "disconnect_deadline";
 /// every subsequent header retransmit as a duplicate.
 const TIMER_VOICE_INACTIVITY: &str = "voice_inactivity";
 
+/// How long the currently-active inbound stream must be silent
+/// (no voice frames / no matching-`stream_id` headers) before a
+/// different `stream_id` is allowed to take over as the active
+/// stream.
+///
+/// Reflectors that bridge multiple upstream gateways can forward
+/// two simultaneous talkers' packets to the same module, producing
+/// rapidly-alternating `stream_id` values (observed: ~2-5 swaps
+/// per second at REF030 C during a round-table). Swapping
+/// `active_rx_stream` on every change tears the radio modem down
+/// and re-keys it at that frequency and destroys the audio.
+///
+/// The threshold is deliberately longer than `DPlus`'s ~420 ms
+/// superframe boundary so a normal inter-header gap (during which
+/// voice frames still flow) doesn't count as silence, but shorter
+/// than a real talker pause (which usually takes >1 s to release
+/// PTT cleanly). 500 ms hits the right balance on live reflector
+/// traffic.
+const STREAM_TAKEOVER_THRESHOLD: Duration = Duration::from_millis(500);
+
 /// Internal protocol-erased event record.
 ///
 /// [`SessionCore::pop_event`] is generic over `P: Protocol` and
@@ -175,6 +195,27 @@ pub struct SessionCore {
     /// module) triggers a synthesized `VoiceEnd` for the outgoing
     /// stream id followed by a `VoiceStart` for the new one.
     active_rx_stream: Option<StreamId>,
+    /// Wall-clock instant of the most recent voice frame or header
+    /// that belonged to [`Self::active_rx_stream`].
+    ///
+    /// Used by [`Self::emit_voice_start_if_new`] to distinguish a
+    /// legitimate mid-stream takeover (new talker picks up where
+    /// the previous one stopped) from a concurrent stream (reflector
+    /// interleaves frames from two simultaneous talkers). A header
+    /// for a different `stream_id` that arrives while the active
+    /// stream is still producing frames indicates the latter, and
+    /// must not swap `active_rx_stream` — doing so tears down and
+    /// re-keys the radio modem 2-4 times per second and produces
+    /// audible chopping between talkers. Observed live at REF030 C
+    /// when two gateways forwarded the same QSO to the reflector,
+    /// 252 mid-stream sid changes in a single session log before
+    /// this guard was added.
+    ///
+    /// Cleared on `VoiceEnd` and on session reset. Updated on every
+    /// voice frame / header push for the active stream (and only
+    /// the active stream — concurrent streams must not keep the
+    /// liveness timer alive).
+    last_voice_activity_at: Option<Instant>,
     /// Diagnostic sink for lenient parser warnings.
     ///
     /// Concrete [`VecSink`] owned by the core so [`Self::drain_diagnostics`]
@@ -200,6 +241,7 @@ impl std::fmt::Debug for SessionCore {
             .field("host_list", &self.host_list)
             .field("cached_tx_header", &self.cached_tx_header)
             .field("active_rx_stream", &self.active_rx_stream)
+            .field("last_voice_activity_at", &self.last_voice_activity_at)
             .field("diagnostics", &self.diagnostics)
             .finish()
     }
@@ -241,6 +283,25 @@ impl SessionCore {
                 // dispatch re-arms the inactivity timer.
             }
             Some(old_sid) => {
+                // Different stream_id arrived while another is
+                // active. Only honour this as a takeover if the
+                // active stream has been silent for longer than
+                // [`STREAM_TAKEOVER_THRESHOLD`]. Otherwise the
+                // reflector is forwarding two simultaneous talkers
+                // and swapping `active_rx_stream` would re-key the
+                // radio modem 2-4x per second.
+                let active_stale = self
+                    .last_voice_activity_at
+                    .is_none_or(|t| now.saturating_duration_since(t) >= STREAM_TAKEOVER_THRESHOLD);
+                if !active_stale {
+                    tracing::debug!(
+                        target: "dstar_gateway_core::session::client",
+                        active_sid = format_args!("{:#06X}", old_sid.get()),
+                        concurrent_sid = format_args!("{:#06X}", stream_id.get()),
+                        "suppressing concurrent stream header (active stream still live)"
+                    );
+                    return;
+                }
                 tracing::debug!(
                     target: "dstar_gateway_core::session::client",
                     old_sid = format_args!("{:#06X}", old_sid.get()),
@@ -255,6 +316,7 @@ impl SessionCore {
                 self.events
                     .push_back(RawEvent::VoiceStart { stream_id, header });
                 self.arm_voice_inactivity(now);
+                self.last_voice_activity_at = Some(now);
             }
             None => {
                 tracing::debug!(
@@ -266,20 +328,37 @@ impl SessionCore {
                 self.events
                     .push_back(RawEvent::VoiceStart { stream_id, header });
                 self.arm_voice_inactivity(now);
+                self.last_voice_activity_at = Some(now);
             }
         }
     }
 
     /// Emit [`RawEvent::VoiceEnd`] and clear the active-stream tracker.
+    ///
+    /// EOTs for non-active streams (e.g. a concurrent stream whose
+    /// `VoiceStart` was suppressed by [`Self::emit_voice_start_if_new`])
+    /// are silently ignored — the consumer never saw a matching
+    /// `VoiceStart`, so emitting `VoiceEnd` for that stream would
+    /// be a dangling close.
     fn emit_voice_end(&mut self, stream_id: StreamId, reason: VoiceEndReason) {
+        if self.active_rx_stream != Some(stream_id) {
+            tracing::trace!(
+                target: "dstar_gateway_core::session::client",
+                stream_id = format_args!("{:#06X}", stream_id.get()),
+                active_sid = ?self.active_rx_stream.map(StreamId::get),
+                ?reason,
+                "ignoring VoiceEnd for non-active stream (concurrent stream closing)"
+            );
+            return;
+        }
         tracing::debug!(
             target: "dstar_gateway_core::session::client",
             stream_id = format_args!("{:#06X}", stream_id.get()),
             ?reason,
-            was_active = self.active_rx_stream == Some(stream_id),
             "emitting VoiceEnd, clearing active stream tracker"
         );
         self.active_rx_stream = None;
+        self.last_voice_activity_at = None;
         self.timers.clear(TIMER_VOICE_INACTIVITY);
         self.events
             .push_back(RawEvent::VoiceEnd { stream_id, reason });
@@ -361,6 +440,7 @@ impl SessionCore {
             host_list: None,
             cached_tx_header: None,
             active_rx_stream: None,
+            last_voice_activity_at: None,
             diagnostics: VecSink::default(),
         }
     }
@@ -870,13 +950,35 @@ impl SessionCore {
                 frame,
             } => {
                 self.arm_keepalive_inactivity(now);
-                self.events.push_back(RawEvent::VoiceFrame {
-                    stream_id,
-                    seq,
-                    frame,
-                });
+                // Only emit frames for the currently-active stream.
+                // When the reflector forwards a second concurrent
+                // talker's packets, this drops them cleanly rather
+                // than mixing both streams' audio into the modem's
+                // single-stream FIFO.
                 if self.active_rx_stream == Some(stream_id) {
+                    self.events.push_back(RawEvent::VoiceFrame {
+                        stream_id,
+                        seq,
+                        frame,
+                    });
                     self.arm_voice_inactivity(now);
+                    self.last_voice_activity_at = Some(now);
+                } else {
+                    // Concurrent stream's voice frame dropped. The
+                    // corresponding header suppression logs at
+                    // debug in `emit_voice_start_if_new`; this trace
+                    // makes every single dropped frame visible so
+                    // operators can confirm the magnitude of a
+                    // doubling event without having to estimate
+                    // from the (superframe-cadence) header log.
+                    let _ = frame;
+                    tracing::trace!(
+                        target: "dstar_gateway_core::session::client",
+                        concurrent_sid = format_args!("{:#06X}", stream_id.get()),
+                        active_sid = ?self.active_rx_stream.map(StreamId::get),
+                        seq,
+                        "dropping voice frame for concurrent stream"
+                    );
                 }
                 Ok(())
             }
@@ -946,13 +1048,26 @@ impl SessionCore {
                 frame,
             } => {
                 self.arm_keepalive_inactivity(now);
-                self.events.push_back(RawEvent::VoiceFrame {
-                    stream_id,
-                    seq,
-                    frame,
-                });
+                // See the DPlus branch above — emit only for the
+                // active stream so concurrent talkers' frames don't
+                // mix into the modem FIFO.
                 if self.active_rx_stream == Some(stream_id) {
+                    self.events.push_back(RawEvent::VoiceFrame {
+                        stream_id,
+                        seq,
+                        frame,
+                    });
                     self.arm_voice_inactivity(now);
+                    self.last_voice_activity_at = Some(now);
+                } else {
+                    let _ = frame;
+                    tracing::trace!(
+                        target: "dstar_gateway_core::session::client",
+                        concurrent_sid = format_args!("{:#06X}", stream_id.get()),
+                        active_sid = ?self.active_rx_stream.map(StreamId::get),
+                        seq,
+                        "dropping voice frame for concurrent stream"
+                    );
                 }
                 Ok(())
             }
@@ -1029,14 +1144,29 @@ impl SessionCore {
                     // the superframe sync pattern in slow-data, so
                     // dropping it (as the pre-fix code did) left
                     // audible gaps every 420 ms.
+                    //
+                    // Frames for a concurrent stream whose header
+                    // was suppressed by
+                    // [`Self::emit_voice_start_if_new`] are dropped
+                    // here — see the DPlus branch for rationale.
                     self.emit_voice_start_if_new(now, stream_id, header);
-                    self.events.push_back(RawEvent::VoiceFrame {
-                        stream_id,
-                        seq,
-                        frame,
-                    });
                     if self.active_rx_stream == Some(stream_id) {
+                        self.events.push_back(RawEvent::VoiceFrame {
+                            stream_id,
+                            seq,
+                            frame,
+                        });
                         self.arm_voice_inactivity(now);
+                        self.last_voice_activity_at = Some(now);
+                    } else {
+                        let _ = frame;
+                        tracing::trace!(
+                            target: "dstar_gateway_core::session::client",
+                            concurrent_sid = format_args!("{:#06X}", stream_id.get()),
+                            active_sid = ?self.active_rx_stream.map(StreamId::get),
+                            seq,
+                            "dropping voice frame for concurrent stream"
+                        );
                     }
                 }
                 Ok(())
@@ -1066,23 +1196,40 @@ impl SessionCore {
                 .set(TIMER_KEEPALIVE, now + self.keepalive_interval());
         }
 
-        // TIMER_VOICE_INACTIVITY handling is disabled: a wall-clock
-        // inactivity timer on the `Instant`-based core fires false
-        // positives whenever the session loop stalls on event-channel
-        // backpressure (consumer slower than the voice frame rate).
-        // The timer's deadline is computed at frame-arrival time but
-        // the check runs against wall-clock `now` at wakeup — any
-        // stall longer than the configured timeout synthesizes a
-        // spurious VoiceEnd mid-transmission. Replacing this with a
-        // handle_timeout-tick-count heuristic (so stalls don't
-        // advance the counter) is follow-on work; until then, the
-        // "stuck active stream" case from the W3HI log is preferable
-        // to breaking every voice transmission that out-paces the
-        // REPL's BT writer.
+        // Voice-inactivity expiry: the active inbound stream has
+        // produced no voice frames for `VOICE_INACTIVITY_TIMEOUT`
+        // (2 s on all three protocols). Synthesize a
+        // `VoiceEnd(Inactivity)` so the consumer isn't left with a
+        // dangling "in progress" stream when the reflector drops
+        // an EOT packet or the remote source de-keys too fast for
+        // the EOT to be forwarded (observed at REF030 C: 15 frames
+        // of M6JBE audio relayed cleanly, then silence with no
+        // EOT, stream stuck "active" indefinitely).
         //
-        // The timer itself is still armed on voice frames so the
-        // infrastructure stays warm for the follow-on; only the
-        // expiry branch is suppressed.
+        // This branch was previously disabled because the
+        // mmdvm-event-channel backpressure (now fixed by the
+        // next_event noise drain) would stall the session loop
+        // long enough that any wall-clock deadline fired as a
+        // false positive mid-transmission. With the deadlock
+        // fixed the loop reliably drains, and the timer is armed
+        // on each voice frame so the deadline always sits
+        // `VOICE_INACTIVITY_TIMEOUT` past the latest real activity.
+        if self.state == ClientStateKind::Connected
+            && self.timers.is_expired(TIMER_VOICE_INACTIVITY, now)
+        {
+            if let Some(stream_id) = self.active_rx_stream {
+                tracing::debug!(
+                    target: "dstar_gateway_core::session::client",
+                    stream_id = format_args!("{:#06X}", stream_id.get()),
+                    "voice inactivity expired — synthesizing VoiceEnd(Inactivity)"
+                );
+                self.emit_voice_end(stream_id, VoiceEndReason::Inactivity);
+            } else {
+                // Defensive: timer fired but no active stream.
+                // Clear it so we don't spin-loop in a stuck state.
+                self.timers.clear(TIMER_VOICE_INACTIVITY);
+            }
+        }
 
         if (self.state == ClientStateKind::Connecting || self.state == ClientStateKind::Connected)
             && self.timers.is_expired(TIMER_KEEPALIVE_INACTIVITY, now)
@@ -1976,14 +2123,22 @@ mod tests {
         // If a new talker takes the module without an explicit EOT
         // from the previous one, the client surfaces a synthetic
         // VoiceEnd(Inactivity) for the old stream before emitting
-        // VoiceStart for the new one.
+        // VoiceStart for the new one. This is only done once the
+        // old stream has been silent for `STREAM_TAKEOVER_THRESHOLD`
+        // — see `emit_voice_start_if_new`. The previous test sent
+        // both headers at the same `now`, which under the new
+        // guard (suppress if active stream still live) would be
+        // treated as a concurrent stream and suppressed, so we
+        // advance `now` past the threshold between the two
+        // headers to exercise the takeover branch.
         let (mut core, _) = connected_dextra()?;
         let now = Instant::now();
         let mut buf = [0u8; 64];
         let n = dextra_codec::encode_voice_header(&mut buf, sid(0x1234), &test_header())?;
         core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+        let later = now + STREAM_TAKEOVER_THRESHOLD + Duration::from_millis(1);
         let n = dextra_codec::encode_voice_header(&mut buf, sid(0x5678), &test_header())?;
-        core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+        core.handle_input(later, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
         let first = core.pop_event::<DExtra>().ok_or("no event 1")?;
         assert!(matches!(first, Event::VoiceStart { stream_id, .. } if stream_id.get() == 0x1234));
         let second = core.pop_event::<DExtra>().ok_or("no event 2")?;
@@ -2000,10 +2155,77 @@ mod tests {
     }
 
     #[test]
+    fn dextra_concurrent_stream_header_suppressed_while_active_live() -> TestResult {
+        // Two simultaneous talkers being forwarded by a reflector:
+        // stream A's header, then a voice frame for A (re-arms
+        // `last_voice_activity_at`), then stream B's header arrives
+        // only a few ms later. The new guard must suppress B's
+        // header so the radio modem isn't re-keyed mid-audio.
+        let (mut core, _) = connected_dextra()?;
+        let now = Instant::now();
+        let mut buf = [0u8; 64];
+        let n = dextra_codec::encode_voice_header(&mut buf, sid(0xAAAA), &test_header())?;
+        core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+        let n = dextra_codec::encode_voice_data(&mut buf, sid(0xAAAA), 1, &VoiceFrame::silence())?;
+        core.handle_input(
+            now + Duration::from_millis(20),
+            ADDR_DEXTRA,
+            buf.get(..n).ok_or("n > buf")?,
+        )?;
+        // Drain the two events we expect for stream A.
+        drop(core.pop_event::<DExtra>().ok_or("no VoiceStart")?);
+        drop(core.pop_event::<DExtra>().ok_or("no VoiceFrame")?);
+        // B's header arrives only 50 ms after A's last activity —
+        // well inside STREAM_TAKEOVER_THRESHOLD (500 ms). Must be
+        // suppressed silently.
+        let n = dextra_codec::encode_voice_header(&mut buf, sid(0xBBBB), &test_header())?;
+        core.handle_input(
+            now + Duration::from_millis(70),
+            ADDR_DEXTRA,
+            buf.get(..n).ok_or("n > buf")?,
+        )?;
+        assert!(
+            core.pop_event::<DExtra>().is_none(),
+            "concurrent stream's header must not emit any event"
+        );
+        // And a voice frame for B is dropped silently too.
+        let n = dextra_codec::encode_voice_data(&mut buf, sid(0xBBBB), 2, &VoiceFrame::silence())?;
+        core.handle_input(
+            now + Duration::from_millis(80),
+            ADDR_DEXTRA,
+            buf.get(..n).ok_or("n > buf")?,
+        )?;
+        assert!(
+            core.pop_event::<DExtra>().is_none(),
+            "concurrent stream's voice frame must be dropped"
+        );
+        // A's EOT ends the active stream normally; B's EOT (if it
+        // arrived) would be ignored as non-active.
+        let n = dextra_codec::encode_voice_eot(&mut buf, sid(0xAAAA), 21)?;
+        core.handle_input(
+            now + Duration::from_millis(100),
+            ADDR_DEXTRA,
+            buf.get(..n).ok_or("n > buf")?,
+        )?;
+        let eot = core.pop_event::<DExtra>().ok_or("no VoiceEnd")?;
+        assert!(
+            matches!(eot, Event::VoiceEnd { stream_id, reason } if stream_id.get() == 0xAAAA && reason == VoiceEndReason::Eot),
+            "expected VoiceEnd for stream A, got {eot:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn dextra_handle_voice_data_emits_voice_frame() -> TestResult {
         let (mut core, _) = connected_dextra()?;
         let now = Instant::now();
         let mut buf = [0u8; 64];
+        // Voice frames are gated on `active_rx_stream` matching —
+        // see `handle_dextra_input`'s VoiceData branch — so
+        // establish the stream with a VoiceHeader first.
+        let n = dextra_codec::encode_voice_header(&mut buf, sid(0x1234), &test_header())?;
+        core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+        drop(core.pop_event::<DExtra>().ok_or("no VoiceStart")?);
         let n = dextra_codec::encode_voice_data(&mut buf, sid(0x1234), 7, &VoiceFrame::silence())?;
         core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
         let event = core.pop_event::<DExtra>().ok_or("no event")?;
@@ -2018,6 +2240,11 @@ mod tests {
         let (mut core, _) = connected_dextra()?;
         let now = Instant::now();
         let mut buf = [0u8; 64];
+        // Establish the stream first; `emit_voice_end` ignores EOTs
+        // for non-active streams (concurrent stream closing).
+        let n = dextra_codec::encode_voice_header(&mut buf, sid(0x1234), &test_header())?;
+        core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
+        drop(core.pop_event::<DExtra>().ok_or("no VoiceStart")?);
         let n = dextra_codec::encode_voice_eot(&mut buf, sid(0x1234), 21)?;
         core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
         let event = core.pop_event::<DExtra>().ok_or("no event")?;
@@ -2093,22 +2320,23 @@ mod tests {
         Ok(())
     }
 
-    /// The voice-inactivity timer is ARMED on each voice-frame
-    /// arrival — the infrastructure is in place for a future
-    /// handle_timeout-tick-count-based fix — but the timer expiry
-    /// branch in `handle_timeout` is currently disabled because a
-    /// wall-clock timer fires false positives under event-channel
-    /// backpressure.
+    /// The voice-inactivity timer is armed on each voice-frame
+    /// arrival and fires `VoiceEnd(Inactivity)` when the active
+    /// stream has been silent for `VOICE_INACTIVITY_TIMEOUT` without
+    /// an explicit EOT. This covers reflector-side EOT loss (remote
+    /// source de-keys too fast for the EOT packet to propagate, or
+    /// a UDP drop in transit) so the consumer doesn't see a
+    /// dangling "in progress" stream.
     ///
-    /// This test verifies only that:
+    /// This test verifies:
     ///   * voice frames arm the timer (deadline reflects last frame
     ///     + `VOICE_INACTIVITY_TIMEOUT`)
-    ///   * advancing time past the deadline does NOT synthesize a
-    ///     `VoiceEnd` — the stream stays "active" until a real EOT
-    ///     (or a different `stream_id` takes over via
-    ///     `emit_voice_start_if_new`).
+    ///   * advancing time past the deadline and calling
+    ///     `handle_timeout` synthesizes a `VoiceEnd(Inactivity)`
+    ///   * `active_rx_stream` is cleared so the next header can
+    ///     start a fresh stream.
     #[test]
-    fn dextra_voice_inactivity_timer_armed_but_disabled() -> TestResult {
+    fn dextra_voice_inactivity_synthesizes_voice_end() -> TestResult {
         let (mut core, _) = connected_dextra()?;
         let t0 = Instant::now();
         let mut buf = [0u8; 64];
@@ -2143,7 +2371,7 @@ mod tests {
         assert_eq!(seen_frames, 5, "expected 5 VoiceFrames before inactivity");
 
         // Timer infrastructure: next_deadline picks up the
-        // voice-inactivity deadline even though expiry is suppressed.
+        // voice-inactivity deadline.
         let next = core.next_deadline().ok_or("no next_deadline")?;
         let voice_timeout = dextra::consts::VOICE_INACTIVITY_TIMEOUT;
         let expected = t0 + Duration::from_millis(80) + voice_timeout;
@@ -2152,15 +2380,20 @@ mod tests {
             "voice-inactivity deadline should be at or before last_voice_frame + timeout"
         );
 
-        // Advance past the deadline: expiry branch is disabled, so
-        // NO VoiceEnd is synthesized.
+        // Advance past the deadline and tick: expiry branch fires
+        // and synthesizes VoiceEnd(Inactivity) for the orphaned
+        // stream, clearing `active_rx_stream`.
         let t_fire = t0 + Duration::from_millis(80) + voice_timeout + Duration::from_millis(1);
         core.handle_timeout(t_fire);
 
-        let maybe_ev = core.pop_event::<DExtra>();
+        let ev = core.pop_event::<DExtra>().ok_or("no VoiceEnd on timeout")?;
         assert!(
-            maybe_ev.is_none(),
-            "voice-inactivity expiry is disabled; expected no event, got {maybe_ev:?}"
+            matches!(ev, Event::VoiceEnd { stream_id, reason } if stream_id.get() == 0x2BE9 && reason == VoiceEndReason::Inactivity),
+            "expected VoiceEnd(Inactivity) for orphaned stream, got {ev:?}"
+        );
+        assert!(
+            core.pop_event::<DExtra>().is_none(),
+            "no further events expected after the inactivity VoiceEnd"
         );
         Ok(())
     }
@@ -2246,6 +2479,14 @@ mod tests {
         let (mut core, _) = connected_dplus()?;
         let now = Instant::now();
         let mut buf = [0u8; 64];
+        // Establish the stream first so the EOT's stream_id matches
+        // `active_rx_stream`. Without the VoiceHeader, `emit_voice_end`
+        // ignores the EOT as a dangling close of a stream the
+        // consumer never saw start — see the mid-stream sid-change
+        // guard in `emit_voice_start_if_new`.
+        let n = dplus_codec::encode_voice_header(&mut buf, sid(0x4567), &test_header())?;
+        core.handle_input(now, ADDR_DPLUS, buf.get(..n).ok_or("n > buf")?)?;
+        drop(core.pop_event::<DPlus>().ok_or("no VoiceStart")?);
         let n = dplus_codec::encode_voice_eot(&mut buf, sid(0x4567), 21)?;
         core.handle_input(now, ADDR_DPLUS, buf.get(..n).ok_or("n > buf")?)?;
         let event = core.pop_event::<DPlus>().ok_or("no event")?;
@@ -2316,6 +2557,24 @@ mod tests {
         let (mut core, _) = connected_dcs()?;
         let now = Instant::now();
         let mut buf = [0u8; 128];
+        // Establish the stream with a non-end voice packet first —
+        // DCS embeds the header in every frame, so this is also the
+        // VoiceStart trigger. `emit_voice_end` now ignores EOTs
+        // for non-active streams. Using `non_silence_frame()` so
+        // the frame isn't mistaken for a DCS keepalive payload by
+        // the codec (silence-patterned voice packets are treated
+        // as keepalive elsewhere).
+        let n = dcs_codec::encode_voice(
+            &mut buf,
+            &test_header(),
+            sid(0x789A),
+            0,
+            &non_silence_frame(),
+            false,
+        )?;
+        core.handle_input(now, ADDR_DCS, buf.get(..n).ok_or("n > buf")?)?;
+        drop(core.pop_event::<Dcs>().ok_or("no VoiceStart")?);
+        drop(core.pop_event::<Dcs>().ok_or("no VoiceFrame")?);
         let n = dcs_codec::encode_voice(
             &mut buf,
             &test_header(),

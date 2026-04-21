@@ -1,0 +1,4 @@
+[bindings.swift]
+module_name = "LodestarCore"
+ffi_module_name = "LodestarCoreFFI"
+generate_module_map = true

@@ -116,12 +116,30 @@ impl<T: Transport + 'static> AsyncModem<T> {
     ///
     /// - [`ShellError::SessionClosed`] if the loop has exited.
     pub async fn send_dstar_data(&mut self, bytes: [u8; 12]) -> Result<(), ShellError> {
+        // Hang-hunt: two awaits here. Trace both sides so a repro
+        // log narrows the freeze to "command_tx full" (ModemLoop
+        // not draining command_rx) vs. "reply never came"
+        // (ModemLoop received but stuck before replying).
         let (tx, rx) = oneshot::channel();
+        tracing::trace!(
+            target: "mmdvm::hang_hunt",
+            cmd_cap = self.command_tx.capacity(),
+            "send_dstar_data: awaiting command_tx.send"
+        );
         self.command_tx
             .send(Command::SendDStarData { bytes, reply: tx })
             .await
             .map_err(|_| ShellError::SessionClosed)?;
-        rx.await.map_err(|_| ShellError::SessionClosed)?
+        tracing::trace!(
+            target: "mmdvm::hang_hunt",
+            "send_dstar_data: command queued, awaiting reply"
+        );
+        let r = rx.await.map_err(|_| ShellError::SessionClosed)?;
+        tracing::trace!(
+            target: "mmdvm::hang_hunt",
+            "send_dstar_data: reply received"
+        );
+        r
     }
 
     /// Enqueue a D-STAR end-of-transmission marker.

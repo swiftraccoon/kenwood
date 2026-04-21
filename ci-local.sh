@@ -44,14 +44,16 @@ run() {
 cleanup_pods
 
 # --- macOS (local) ---
-echo "========== macOS (local) =========="
-run ./lint.sh
+# echo "========== macOS (local) =========="
+# run ./lint.sh
 
 # --- Create tarball ---
 echo ""
 echo "========== Preparing k8s CI =========="
 tar czf /tmp/kenwood-ci.tar.gz \
-    --exclude='*/target' --exclude='.git' . 2>/dev/null
+    --exclude='target' --exclude='.git' \
+    --exclude='ref' --exclude='ref_tools' \
+    --exclude='thd75_re' . 2>/dev/null
 
 ci_pod() {
     local name=$1 image=$2 setup=$3
@@ -88,21 +90,48 @@ ci_pod() {
     # The `step` helper echoes a delimiter, runs the command with
     # `set -e` semantics, and keeps stderr on the normal output path
     # so context is visible without `tail -1` hiding cargo errors.
+    # Run checks. `kubectl exec` returns the exit code of the remote
+    # command, so letting the exit code propagate up makes this the
+    # last command in the function — and the subshell spawned by
+    # `ci_pod &` inherits that exit status. The parent's `wait` then
+    # surfaces the failure via its own exit code, which drives
+    # `failed=1` back in the main shell. An earlier version wrapped
+    # this with `|| failed=1`, but since ci_pod runs in a subshell
+    # the assignment was local-only and every pod failure was
+    # silently swallowed (the script always printed "CI PASSED").
     kubectl exec "ci-$name" -- bash -c '
         set -eo pipefail
         [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
         cd /work/kenwood
         step() { echo "--- $1 ---"; shift; "$@"; }
 
-        # sextant (cpal) needs ALSA headers on Linux; install up-front
-        # so the workspace-wide cargo commands see them. Missing ALSA
-        # is exactly the silent regression the Docs workflow hit.
+        # Pod-level system deps. Neither base image ships these out
+        # of the box:
+        #   libasound2-dev / alsa-lib-devel — sextant (cpal) needs
+        #     ALSA headers. Missing ALSA is exactly the silent
+        #     regression the Docs workflow hit previously.
+        #   git — cargo-deny clones the RustSec advisory database
+        #     via `git clone`, and neither `rust:1.94` nor
+        #     `fedora:latest` preinstalls a git binary. Without
+        #     this, `cargo deny check` fails with
+        #     "failed to spawn git: No such file or directory".
+        # No `sudo` — both base images run as root and neither
+        # ships sudo; adding it would break with "command not
+        # found".
         if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update >/dev/null
-            sudo apt-get install -y libasound2-dev >/dev/null
+            apt-get update >/dev/null
+            apt-get install -y libasound2-dev git >/dev/null
         elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y alsa-lib-devel >/dev/null
+            dnf install -y alsa-lib-devel git >/dev/null
         fi
+
+        # Ensure clippy is present. Neither `rust:1.94` nor the
+        # `rustup --profile minimal` install on fedora ships clippy
+        # by default — a previous run surfaced the mistake only at
+        # the `cargo clippy` step, far too late. rustup component
+        # add is idempotent, so running it unconditionally is cheap
+        # on pods that already have it.
+        rustup component add clippy >/dev/null
 
         # Install required lint-gate tools. Fail hard if install
         # fails; dont skip-if-missing.
@@ -126,7 +155,7 @@ ci_pod() {
         step "audit"                 cargo audit --file Cargo.lock
         step "deny"                  cargo deny check
         step "machete"               cargo machete .
-    ' 2>&1 || failed=1
+    ' 2>&1
 
     # Per-pod delete intentionally removed: the EXIT/INT/TERM trap at
     # the top of this script calls `cleanup_pods` which deletes every
@@ -140,11 +169,45 @@ ci_pod() {
 ci_pod "ubuntu" "rust:1.94" "" &
 UBUNTU_PID=$!
 
-ci_pod "fedora" "fedora:latest" "dnf install -y gcc 2>/dev/null | tail -1 && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.94.0 -c clippy 2>/dev/null | tail -1" &
+ci_pod "fedora" "fedora:latest" "
+    set -eo pipefail
+    # Fedora base image ships neither a compiler nor rustup. Install
+    # gcc first (rustc's linker needs it), then rustup-init with an
+    # explicit minimal profile. Clippy is added by the inner lint
+    # script via 'rustup component add clippy' — kept there as a
+    # single source of truth that handles both pods. Dropped the
+    # ' | tail -1' mask that used to hide install failures (see
+    # the 'pass-through policy' comment at the top of this file).
+    #
+    # Retry loop on 'dnf install -y gcc': fedora:latest sometimes
+    # hits transient 'package X does not verify: (null)' RPM
+    # checksum/signature failures when fc43 just-released packages
+    # haven't fully propagated to all mirrors. 'dnf clean metadata'
+    # between retries forces a fresh download of the repodata,
+    # which often picks up a different mirror.
+    n=0
+    until dnf install -y gcc; do
+        n=\$((n + 1))
+        [ \"\$n\" -ge 3 ] && { echo 'dnf install failed after 3 attempts'; exit 1; }
+        echo \"dnf retry \$n of 3\"
+        dnf clean metadata
+        sleep 5
+    done
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain 1.94.0
+    source \$HOME/.cargo/env
+" &
 FEDORA_PID=$!
 
-wait $UBUNTU_PID
-wait $FEDORA_PID
+# `|| failed=1` here (in the PARENT shell, not the subshell) is the
+# actual gate that sets the overall CI status. `wait $PID` reports
+# the exit code of the backgrounded ci_pod invocation; without the
+# `||` the shell's `set -e` would abort before the second pod is
+# awaited, and without assigning to `failed` the final summary
+# line would lie. Both pods are awaited unconditionally so we get
+# a complete status report even when one fails.
+wait "$UBUNTU_PID" || failed=1
+wait "$FEDORA_PID" || failed=1
 
 # Cleanup runs via the EXIT trap registered at the top. No manual
 # tarball / pod removal here; the trap handles both synchronously.

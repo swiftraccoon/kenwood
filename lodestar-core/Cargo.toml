@@ -1,0 +1,84 @@
+[package]
+name = "lodestar-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Rust core for Lodestar — iOS/iPadOS/Mac Catalyst D-STAR gateway app for the Kenwood TH-D75."
+license = "GPL-2.0-or-later OR GPL-3.0-or-later"
+authors = ["swiftraccoon"]
+repository = "https://github.com/swiftraccoon/kenwood"
+readme = "README.md"
+keywords = ["dstar", "ham-radio", "ios", "kenwood", "th-d75"]
+categories = ["multimedia", "api-bindings"]
+publish = false
+
+[lib]
+name = "lodestar_core"
+crate-type = ["lib", "staticlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+uniffi = { version = "0.31", features = ["cli"] }
+
+[build-dependencies]
+uniffi = { version = "0.31", features = ["build"] }
+
+[dev-dependencies]
+uniffi = { version = "0.31", features = ["bindgen-tests"] }
+
+# Lints: inherit workspace strictness but opt out of `unsafe_code`
+# enforcement because UniFFI's generated scaffolding emits
+# `#[unsafe(no_mangle)]` which is fundamental to the Rust-to-Swift FFI.
+# This crate exists for that FFI, so unsafe is inherent to its purpose.
+# The `thd75` crate uses a similar pattern for its IOBluetooth wrapper
+# (module-level `#[allow(unsafe_code)]` on `transport/bluetooth.rs`).
+[lints.rust]
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+unused_results = "deny"
+elided_lifetimes_in_paths = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+# `unused_qualifications = "deny"` is intentionally omitted — UniFFI's
+# generated scaffolding emits fully qualified paths like
+# `std::vec::Vec<u8>` that trip this lint. The lint still applies to
+# our hand-written code via clippy's pedantic group, which catches the
+# same issue with `redundant_path_prefix`.
+non_ascii_idents = "deny"
+single_use_lifetimes = "deny"
+let_underscore_drop = "deny"
+unused_crate_dependencies = "deny"
+unused_import_braces = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+restriction = { level = "allow", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+missing_assert_message = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+# UniFFI's generated scaffolding declares top-level FFI functions
+# (`extern "C" fn ...`) that clippy flags as candidates for `const`.
+# They can't be const — they're the `#[unsafe(no_mangle)]` FFI surface.
+# Allowing here rather than per-file because the scaffolding is emitted
+# directly into `lib.rs` by `include_scaffolding!` and cannot be scoped.
+missing_const_for_fn = "allow"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+missing_crate_level_docs = "deny"
+invalid_codeblock_attributes = "deny"
+bare_urls = "deny"
+unescaped_backticks = "deny"

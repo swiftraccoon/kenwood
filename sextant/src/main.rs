@@ -154,7 +154,7 @@ fn log_directory() -> Option<PathBuf> {
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
+        if let Some(xdg) = env::var_os("XDG_STATE_HOME") {
             let mut path = PathBuf::from(xdg);
             path.push("sextant");
             return Some(path);

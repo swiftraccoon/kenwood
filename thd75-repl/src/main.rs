@@ -717,6 +717,26 @@ struct DStarSession {
     /// of whether a reflector is linked, so the operator can do a
     /// pure PTT-and-speak capture without setting up a reflector.
     ambe_capture: Option<std::fs::File>,
+    /// Last voice frame received from the reflector for the current
+    /// inbound stream. Used as the repeat-template by
+    /// [`emit_silence_pad_if_needed`] to keep the modem's D-STAR
+    /// FIFO fed while the reflector itself pauses delivery
+    /// (observed: gaps of 400-600 ms on REF030 C mid-stream). Without
+    /// padding, those gaps drain the modem buffer and the radio
+    /// briefly drops carrier, producing audible cuts. Cleared on
+    /// every `VoiceStart` and `VoiceEnd` so padding never leaks
+    /// across streams.
+    last_rx_voice_frame: Option<VoiceFrame>,
+    /// Wall-clock timestamp of the most recent relay to the radio
+    /// (real or padded frame). Drives the pacing decision in
+    /// [`emit_silence_pad_if_needed`] — if no frame has been sent
+    /// for longer than [`PAD_THRESHOLD`], the pad timer emits a
+    /// copy of the last known frame to cover the gap.
+    last_relay_at: Option<std::time::Instant>,
+    /// Consecutive padding frames emitted since the last real voice
+    /// frame. Capped at [`PAD_FRAMES_MAX`] so a fully dead reflector
+    /// doesn't keep the modem fed with repeated audio indefinitely.
+    pad_frames_emitted: u32,
 }
 
 /// Echo test state machine.
@@ -1862,6 +1882,9 @@ async fn enter_dstar(
         rx_frame_count: 0,
         rx_stream_start: None,
         ambe_capture: open_ambe_capture_from_env(),
+        last_rx_voice_frame: None,
+        last_relay_at: None,
+        pad_frames_emitted: 0,
     })
 }
 
@@ -2495,6 +2518,129 @@ async fn run_dstar_monitor(session: &mut DStarSession) {
     }
 }
 
+/// D-STAR voice frame interval — 50 fps, one frame per 20 ms.
+///
+/// Matches the rate the modem's internal AMBE decoder consumes
+/// frames at. Used as:
+/// 1. The tick interval for the silence-padding timer in
+///    [`dstar_poll_cycle`].
+/// 2. The cadence check for *subsequent* pads inside a single
+///    silence gap (see [`emit_silence_pad_if_needed`]). Once we've
+///    decided a gap is real and started padding, each additional
+///    pad fires on modem consumption rhythm so the FIFO stays
+///    fed without over-production.
+const PAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How long the reflector must be silent before we decide a gap
+/// is real and start padding.
+///
+/// The modem's D-STAR FIFO averages ~100-140 ms of buffered audio
+/// per the `dstar_space_before` telemetry (mean 120/125 slots
+/// free, i.e. 5-7 slots used = 100-140 ms). Any gap shorter than
+/// the buffer depth gets absorbed natively by the modem without
+/// an audible cut, so padding short gaps is pure over-production
+/// — every synthetic frame becomes permanent latency the modem
+/// plays out at 50 fps. A prior 30 ms threshold fired on routine
+/// 20-50 ms inter-frame jitter and accumulated 6+ seconds of
+/// audio delay over a 57 s stream.
+///
+/// 100 ms lets the FIFO absorb all normal jitter and only kicks
+/// in on genuine reflector-side silences where the FIFO would
+/// otherwise drain to zero.
+const PAD_INITIAL_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Cap on consecutive padding frames per silence gap.
+///
+/// 30 frames × 20 ms = 600 ms of padding per gap. Past that, the
+/// reflector has been silent long enough that continuing to stuff
+/// stale audio is counter-productive: the FIFO reaches steady
+/// state at full, the BT/radio buffers accumulate, and by the time
+/// real frames arrive we've added seconds of latency that never
+/// drain. Better to let the modem underrun cleanly and the radio
+/// squelch, which gives the operator an accurate signal that the
+/// reflector is having real trouble.
+const PAD_FRAMES_MAX: u32 = 30;
+
+/// Emit one padding frame if the reflector has gone silent mid-stream.
+///
+/// No-ops when no stream is active, when the pad-template frame is
+/// absent (stream hasn't produced its first voice frame yet), when
+/// the last relay was too recent to count as a gap, or when the
+/// per-gap cap has already been reached. On match, sends a copy of
+/// the last received voice frame through the same unpaced relay
+/// path the real frames take, then updates the relay timestamp so
+/// the next tick re-evaluates against the moment of padding (not
+/// the moment of the last real frame) — this keeps us emitting at
+/// a steady 20 ms cadence until either a real frame arrives or the
+/// cap hits.
+async fn emit_silence_pad_if_needed(session: &mut DStarSession) {
+    if session.rx_stream_id.is_none() {
+        return;
+    }
+    let Some(last_at) = session.last_relay_at else {
+        return;
+    };
+    if session.pad_frames_emitted >= PAD_FRAMES_MAX {
+        return;
+    }
+    let Some(pad_frame) = session.last_rx_voice_frame else {
+        return;
+    };
+
+    // Two-phase threshold: wait until the modem's FIFO would
+    // actually be in trouble before we *start* padding, then once
+    // we're in pad mode keep up with the 50 fps consumption rate
+    // so the FIFO stays stable rather than draining. Re-checking
+    // `last_relay_at.elapsed()` against `PAD_INTERVAL` on every
+    // subsequent pad gives an effective 20 ms cadence that matches
+    // the modem's consumption exactly — no over-production, no
+    // under-production.
+    let threshold = if session.pad_frames_emitted == 0 {
+        PAD_INITIAL_THRESHOLD
+    } else {
+        PAD_INTERVAL
+    };
+    if last_at.elapsed() < threshold {
+        return;
+    }
+
+    let pad_no = session.pad_frames_emitted;
+    if pad_no == 0 {
+        // First pad of this gap — log at debug so operators can
+        // correlate audible smoothing events with reflector
+        // silence in the trace log without drowning the stream
+        // in per-pad-frame noise.
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ms = last_at.elapsed().as_millis() as u64;
+        tracing::debug!(
+            target: "thd75_repl::reflector",
+            elapsed_ms,
+            "reflector silence — emitting silence pad to keep modem fed"
+        );
+    }
+    tracing::trace!(
+        target: "thd75_repl::hang_hunt",
+        pad_no,
+        "emit_silence_pad: awaiting send_voice_unpaced"
+    );
+    if let Err(e) = session.gateway.send_voice_unpaced(&pad_frame).await {
+        tracing::warn!(
+            target: "thd75_repl::reflector",
+            error = %e,
+            "silence pad send failed; giving up this gap"
+        );
+        session.pad_frames_emitted = PAD_FRAMES_MAX;
+        return;
+    }
+    session.last_relay_at = Some(std::time::Instant::now());
+    session.pad_frames_emitted = pad_no.saturating_add(1);
+    tracing::trace!(
+        target: "thd75_repl::hang_hunt",
+        pad_no = pad_no + 1,
+        "emit_silence_pad: sent"
+    );
+}
+
 /// Maximum number of reflector events processed inline per poll cycle.
 ///
 /// Caps the inline processing loop at roughly one D-STAR superframe
@@ -2533,47 +2679,82 @@ async fn dstar_poll_cycle(session: &mut DStarSession) {
     // `select!` for radio polling and ctrl_c.
     const EVENT_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
+    // Local pad_tick — lives for the duration of this cycle only.
+    // The previous design put the tick on the outer `run_dstar_monitor`
+    // select!, which caused tokio to cancel `dstar_poll_cycle` every
+    // time the tick won the race. Cancelling in the middle of
+    // `relay_reflector_to_radio.await` dropped 48 of 2634 in-flight
+    // relays in a 60 s trace and repeatedly short-circuited the radio
+    // drain below — the same mmdvm event-channel backpressure that
+    // produced the original deadlock. Making the tick a branch of
+    // this cycle's inner select! keeps cancellation scoped to a
+    // single iteration and the radio drain is reached reliably.
+    let mut pad_tick = tokio::time::interval(PAD_INTERVAL);
+    pad_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     for _ in 0..MAX_EVENTS_PER_CYCLE {
-        let Some(client) = session.reflector.as_mut() else {
-            break;
-        };
-        let event = match tokio::time::timeout(EVENT_POLL_TIMEOUT, client.next_event()).await {
-            Ok(Some(e)) => e,
-            Ok(None) => {
-                // Channel closed — session task exited. Drop the
-                // dead handle so subsequent iterations short-circuit
-                // via the `is_none()` check above.
-                session.reflector = None;
+        // Race "next reflector event" vs "20 ms pad tick", scoping
+        // the `session.reflector.as_mut()` borrow so it doesn't
+        // conflict with `emit_silence_pad_if_needed(session)` which
+        // needs the full session.
+        let mut event_opt: Option<RuntimeEvent> = None;
+        let mut pad_fired = false;
+        let mut reflector_closed = false;
+        {
+            let Some(client) = session.reflector.as_mut() else {
                 break;
+            };
+            tokio::select! {
+                biased;
+                r = tokio::time::timeout(EVENT_POLL_TIMEOUT, client.next_event()) => {
+                    match r {
+                        Ok(Some(e)) => event_opt = Some(e),
+                        Ok(None) => reflector_closed = true,
+                        Err(_) => { /* 100 ms elapsed, no event */ }
+                    }
+                }
+                _ = pad_tick.tick() => {
+                    pad_fired = true;
+                }
             }
-            Err(_) => break,
-        };
-        trace_reflector_event(&event);
-        // Only print VoiceStart for new streams (avoid duplicate
-        // announcements on superframe-boundary header refreshes
-        // that the parser's stream tracker did not suppress).
-        if let RuntimeEvent::VoiceStart { stream_id, .. } = &event {
-            if session.rx_stream_id != Some(*stream_id) {
+        }
+        if reflector_closed {
+            session.reflector = None;
+            break;
+        }
+        if let Some(event) = event_opt {
+            trace_reflector_event(&event);
+            // Only print VoiceStart for new streams (avoid duplicate
+            // announcements on superframe-boundary header refreshes
+            // that the parser's stream tracker did not suppress).
+            if let RuntimeEvent::VoiceStart { stream_id, .. } = &event {
+                if session.rx_stream_id != Some(*stream_id) {
+                    print_reflector_event(&event, session);
+                }
+            } else {
                 print_reflector_event(&event, session);
             }
-        } else {
-            print_reflector_event(&event, session);
-        }
-        relay_reflector_to_radio(session, &event).await;
+            relay_reflector_to_radio(session, &event).await;
 
-        // Auto-reconnect on keepalive inactivity. The other disconnect
-        // reasons (`Rejected`, `UnlinkAcked`, `DisconnectTimeout`)
-        // reflect deliberate or terminal closures — never retry those
-        // automatically.
-        if matches!(
-            event,
-            RuntimeEvent::Disconnected(DisconnectReason::KeepaliveInactivity)
-        ) {
-            // Drop the dead session handle before reconnecting; the
-            // underlying loop has already exited and any further
-            // `next_event` would return `None` anyway.
-            session.reflector = None;
-            try_reconnect_reflector(session).await;
+            // Auto-reconnect on keepalive inactivity. The other disconnect
+            // reasons (`Rejected`, `UnlinkAcked`, `DisconnectTimeout`)
+            // reflect deliberate or terminal closures — never retry those
+            // automatically.
+            if matches!(
+                event,
+                RuntimeEvent::Disconnected(DisconnectReason::KeepaliveInactivity)
+            ) {
+                session.reflector = None;
+                try_reconnect_reflector(session).await;
+                break;
+            }
+        } else if pad_fired {
+            emit_silence_pad_if_needed(session).await;
+        } else {
+            // client.next_event timed out with no event and no pad
+            // tick this iteration — nothing useful is happening, so
+            // exit and let the outer loop re-enter (which also gives
+            // ctrl_c a chance to fire).
             break;
         }
     }
@@ -3145,6 +3326,14 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             // operator's message verbatim.
             session.rx_slow_data.reset();
             session.rx_last_slow_text = None;
+            // Reset silence-padding state. `last_rx_voice_frame`
+            // stays `None` until the first voice frame of this
+            // stream arrives, which keeps the pad timer a no-op
+            // during the pre-first-frame window (no content to
+            // repeat yet).
+            session.last_rx_voice_frame = None;
+            session.last_relay_at = None;
+            session.pad_frames_emitted = 0;
             // Radio-side gateway now takes the same core DStarHeader —
             // no translation needed.
             if let Err(e) = gw.send_header(header).await {
@@ -3155,6 +3344,11 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             }
         }
         RuntimeEvent::VoiceFrame { frame, seq, .. } => {
+            tracing::trace!(
+                target: "thd75_repl::hang_hunt",
+                seq = *seq,
+                "relay VoiceFrame: enter"
+            );
             // Count voice frames per stream so the VoiceEnd line can
             // report whether the transmission actually carried audio
             // or was a dead-key carrier (saturating_add keeps the
@@ -3213,11 +3407,28 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             // periodic status polling and gates its TxQueue drain on
             // `ModemStatus::dstar_space`, so this path is effectively
             // as close to the reference behavior as we can get.
-            if let Err(e) = gw.send_voice_unpaced(frame).await {
-                println!(
-                    "{}",
-                    thd75_repl::output::error(format_args!("relaying voice to radio: {e}"))
-                );
+            tracing::trace!(target: "thd75_repl::hang_hunt", "relay VoiceFrame: awaiting send_voice_unpaced");
+            let relay_result = gw.send_voice_unpaced(frame).await;
+            tracing::trace!(target: "thd75_repl::hang_hunt", "relay VoiceFrame: send_voice_unpaced returned");
+            match relay_result {
+                Ok(()) => {
+                    // Arm the silence-padding timer: remember this
+                    // frame as the repeat template, timestamp the
+                    // relay, and zero the pad counter. The 20 ms
+                    // pad tick in `run_dstar_monitor` will repeat
+                    // this frame only if the next real frame
+                    // doesn't arrive before `PAD_THRESHOLD` past
+                    // this moment.
+                    session.last_rx_voice_frame = Some(**frame);
+                    session.last_relay_at = Some(std::time::Instant::now());
+                    session.pad_frames_emitted = 0;
+                }
+                Err(e) => {
+                    println!(
+                        "{}",
+                        thd75_repl::output::error(format_args!("relaying voice to radio: {e}"))
+                    );
+                }
             }
         }
         RuntimeEvent::VoiceEnd { .. } => {
@@ -3240,6 +3451,14 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             // session)` call in `dstar_poll_cycle` still sees them.
             session.rx_frame_count = 0;
             session.rx_stream_start = None;
+            // Tear down silence padding: the stream ended cleanly,
+            // so any further pad ticks should no-op. Without this
+            // reset, the first ~2 s after EOT would keep padding
+            // the modem with the final voice frame of the prior
+            // stream — the pad timer only checks `rx_stream_id`.
+            session.last_rx_voice_frame = None;
+            session.last_relay_at = None;
+            session.pad_frames_emitted = 0;
             if let Err(e) = gw.send_eot().await {
                 println!(
                     "{}",

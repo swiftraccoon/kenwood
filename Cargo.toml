@@ -15,6 +15,7 @@ members = [
     "mmdvm-core",
     "sextant",
     "stargazer",
+    "lodestar-core",
 ]
 resolver = "3"
 
