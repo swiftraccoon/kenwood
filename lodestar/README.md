@@ -5,6 +5,8 @@ iPad (iPadOS 17+), and Mac (native macOS 14+). Bluetooth Classic SPP
 to the radio is macOS-only right now because `IOBluetoothDevice` is
 unavailable on Mac Catalyst and iOS Core Bluetooth Classic is GATT-only.
 
+![lodestar_macos](../lodestar_macos.png)
+
 ## Build
 
 ```bash
