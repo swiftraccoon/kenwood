@@ -4,6 +4,8 @@ namespace lodestar {
     sequence<u8> encode_cat(CatCommand command);
 
     CatResponse parse_cat_line(sequence<u8> line);
+
+    sequence<Reflector> default_reflectors();
 };
 
 enum CatCommand {
@@ -16,4 +18,18 @@ interface CatResponse {
     Unknown();
     NotAvailableInMode();
     Raw(string line);
+};
+
+enum ReflectorProtocol {
+    "DPlus",
+    "DExtra",
+    "Dcs",
+};
+
+dictionary Reflector {
+    string name;
+    string host;
+    u16 port;
+    ReflectorProtocol protocol;
+    string description;
 };

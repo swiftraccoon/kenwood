@@ -1,16 +1,43 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Lodestar core — Rust library powering the Lodestar iOS/iPadOS/Mac Catalyst app.
+//! Lodestar core — Rust library powering the Lodestar native macOS and
+//! iOS/iPadOS D-STAR gateway app for the Kenwood TH-D75.
 //!
-//! Phase 1 exposed `version()`. Phase 2 adds a minimal CAT codec
-//! (`encode_cat`, `parse_cat_line`) for the `ID` identify command.
-//! Later phases wrap `thd75`, `dstar-gateway`, and `dstar-gateway-core`
-//! and drive the radio-to-reflector session loop.
+//! Surfaces to Swift via `UniFFI`:
+//!
+//! - `version()` — crate semver.
+//! - [`cat`] — minimal CAT codec covering the `ID` identify command.
+//! - [`mcp`] — programming-protocol primitives for flipping menu 650
+//!   (DV Gateway) into Reflector Terminal Mode.
+//! - [`mmdvm`] — MMDVM frame codec and the `GetVersion` probe used for
+//!   radio-mode detection.
+//! - [`reflector`] — `DPlus` / `DExtra` / `DCS` reflector list loaded
+//!   from bundled `ircDDBGateway` host files.
+//! - [`session`] — async `connect_reflector` + [`session::ReflectorSession`]
+//!   driving the full radio-to-reflector voice loop, plus the
+//!   [`session::ReflectorObserver`] callback trait Swift implements to
+//!   receive voice events, slow-data text updates, and parsed GPS
+//!   positions.
 
 pub mod cat;
+pub mod mcp;
+pub mod mmdvm;
+pub mod reflector;
+pub mod session;
 
 pub use cat::{CatCommand, CatResponse, encode_cat, parse_cat_line};
+pub use mcp::{
+    GATEWAY_MODE_ACCESS_POINT, GATEWAY_MODE_OFF, GATEWAY_MODE_OFFSET,
+    GATEWAY_MODE_REFLECTOR_TERMINAL, McpError, McpPage, build_enter_cmd, build_exit_cmd,
+    build_read_page_cmd, build_write_page_cmd, byte_of, page_of, parse_w_frame, patch_page_byte,
+};
+pub use mmdvm::{
+    MMDVM_CMD_GET_VERSION, MMDVM_START_BYTE, MmdvmDecodeResult, MmdvmFrame, MmdvmFrameError,
+    build_mmdvm_frame, decode_mmdvm_bytes, looks_like_mmdvm_response, mmdvm_get_version_probe,
+};
+pub use reflector::{Reflector, ReflectorProtocol, default_reflectors};
+pub use session::{ReflectorError, ReflectorSession, connect_reflector};
 
 uniffi::include_scaffolding!("lodestar");
 

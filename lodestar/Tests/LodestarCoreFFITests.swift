@@ -25,8 +25,8 @@ final class LodestarCoreFFITests: XCTestCase {
         }
     }
 
-    func testVersionMatchesPhase1Major() {
+    func testVersionMatchesZeroYxMajor() {
         let v = Lodestar.version()
-        XCTAssertTrue(v.hasPrefix("0."), "Phase 1 expects 0.x.y core version, got \(v)")
+        XCTAssertTrue(v.hasPrefix("0."), "expected 0.x.y core version, got \(v)")
     }
 }

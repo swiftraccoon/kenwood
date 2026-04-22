@@ -5,7 +5,7 @@ import Foundation
 import Observation
 import OSLog
 
-private let log = Logger(subsystem: "me.dhawkins.lodestar", category: "transport")
+private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "transport")
 
 /// UI-facing state store for the active `RadioTransport`.
 ///
@@ -20,11 +20,28 @@ public final class TransportCoordinator {
     public private(set) var state: RadioTransportState = .disconnected
     public private(set) var lastResponseText: String = ""
     public private(set) var isBusy: Bool = false
+    public private(set) var mcpStatus: McpStatus = .idle
+    public private(set) var radioMode: RadioMode = .unknown
+    public private(set) var isProbingMode: Bool = false
+
+    /// Handle to the underlying transport — exposed only so
+    /// `RelayCoordinator` can run an `MmdvmReader`/`MmdvmWriter`
+    /// alongside the coordinator's own calls. All I/O still serialises
+    /// through the transport actor.
+    public var relayTransport: RadioTransport? { transport }
 
     private var transport: RadioTransport?
     private var stateObserver: Task<Void, Never>?
 
     public init() {}
+
+    /// Status of the current/most-recent MCP programming-mode operation.
+    public enum McpStatus: Equatable, Sendable {
+        case idle
+        case running(String)      // human-readable progress message
+        case succeededRebooting   // radio dropped the connection; user must reconnect
+        case failed(String)
+    }
 
     public func refreshPairedDevices() {
         availableDevices = IOBluetoothTransport.pairedDevices()
@@ -38,12 +55,16 @@ public final class TransportCoordinator {
         guard let device = selectedDevice else { return }
         isBusy = true
         defer { isBusy = false }
+        radioMode = .unknown
 
         let t = IOBluetoothTransport(device: device)
         transport = t
         observeState(of: t)
         do {
             try await t.open()
+            // Once open, fire off a mode probe so the UI can show the
+            // right affordances (MCP button only if still in CAT mode).
+            await probeRadioMode()
         } catch {
             state = .failed(message: String(describing: error))
         }
@@ -55,6 +76,26 @@ public final class TransportCoordinator {
         stateObserver?.cancel()
         stateObserver = nil
         state = .disconnected
+        radioMode = .unknown
+    }
+
+    /// Re-run the MMDVM GetVersion probe against the current transport.
+    /// Safe to call any time a transport exists — don't gate on
+    /// `state == .connected` because that's set asynchronously by the
+    /// state-observer task, which races with the probe kicked off from
+    /// `connect()` and causes the first-launch probe to silently bail.
+    public func probeRadioMode() async {
+        guard let t = transport else { return }
+        isProbingMode = true
+        defer { isProbingMode = false }
+        let prober = RadioModeProber(transport: t)
+        do {
+            radioMode = try await prober.probe()
+            log.info("radio mode: \(String(describing: self.radioMode))")
+        } catch {
+            log.error("radio mode probe failed: \(error)")
+            radioMode = .unknown
+        }
     }
 
     public func sendIdentify() async {
@@ -100,6 +141,63 @@ public final class TransportCoordinator {
             log.error("Send ID failed: \(error)")
             lastResponseText = "Error: \(error)"
         }
+    }
+
+    /// Flip Menu 650 (DV Gateway) to Reflector Terminal Mode via an MCP
+    /// programming-mode write. The radio drops the BT connection after
+    /// the exit byte and reboots; the coordinator transitions to
+    /// `.disconnected` and the user must re-pair / reconnect.
+    public func enableReflectorTerminalMode() async {
+        guard let t = transport, case .connected = state else {
+            mcpStatus = .failed("Not connected to the radio.")
+            return
+        }
+        isBusy = true
+        mcpStatus = .running("Entering programming mode…")
+        log.info("MCP: enable Reflector Terminal Mode starting")
+
+        let session = McpSession(transport: t)
+        do {
+            // Surface progress as the coordinator works through the steps.
+            mcpStatus = .running("Entering programming mode…")
+            try await session.enterProgramming()
+            mcpStatus = .running("Reading page 0x1C…")
+            // `enableReflectorTerminalMode` performs read → patch → write → exit.
+            // We already called `enterProgramming` above, so run the rest
+            // piecewise for better progress reporting.
+            let page = pageOf(offset: 0x1CA0)
+            let byte = byteOf(offset: 0x1CA0)
+            let currentData = try await session.readPage(page)
+            let patched = try patchPageByte(pageData: currentData, offset: byte, value: 1)
+            if currentData == patched {
+                log.info("MCP: radio already in Reflector Terminal Mode; skipping write")
+                mcpStatus = .running("Already enabled; exiting programming mode…")
+            } else {
+                mcpStatus = .running("Writing page 0x1C…")
+                try await session.writePage(page, data: patched)
+                mcpStatus = .running("Exiting programming mode…")
+            }
+            try await session.exitProgramming()
+
+            // Radio will drop the connection; force our local state to match.
+            await transport?.close()
+            transport = nil
+            stateObserver?.cancel()
+            stateObserver = nil
+            state = .disconnected
+            radioMode = .unknown
+            mcpStatus = .succeededRebooting
+            isBusy = false
+            log.info("MCP: enable Reflector Terminal Mode succeeded")
+        } catch {
+            log.error("MCP: enable Reflector Terminal Mode failed: \(error)")
+            mcpStatus = .failed(String(describing: error))
+            isBusy = false
+        }
+    }
+
+    public func acknowledgeMcpStatus() {
+        mcpStatus = .idle
     }
 
     /// Race `transport.read` against an absolute deadline. Returns `nil` if

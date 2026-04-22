@@ -14,7 +14,7 @@ public enum RadioTransportState: Sendable, Equatable {
 /// Abstract transport to a radio. Bytes in, bytes out.
 ///
 /// Implementations:
-/// - `IOBluetoothTransport` (Mac Catalyst, via IOBluetooth RFCOMM).
+/// - `IOBluetoothTransport` (native macOS, via IOBluetooth RFCOMM).
 /// - `MockRadioTransport` (unit tests, in-memory).
 /// - Future: `USBCDCTransport` (iPadOS + iPhone 15+ + Mac, via IOUSBHost).
 public protocol RadioTransport: Sendable {

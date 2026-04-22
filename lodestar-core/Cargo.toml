@@ -3,7 +3,7 @@ name = "lodestar-core"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Rust core for Lodestar — iOS/iPadOS/Mac Catalyst D-STAR gateway app for the Kenwood TH-D75."
+description = "Rust core for Lodestar — native macOS + iOS/iPadOS D-STAR gateway app for the Kenwood TH-D75."
 license = "GPL-2.0-or-later OR GPL-3.0-or-later"
 authors = ["swiftraccoon"]
 repository = "https://github.com/swiftraccoon/kenwood"
@@ -21,7 +21,21 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
-uniffi = { version = "0.31", features = ["cli"] }
+# UniFFI `tokio` feature enables `#[uniffi::export(async_runtime = "tokio")]`
+# which we need for the reflector session's async FFI surface.
+uniffi = { version = "0.31", features = ["cli", "tokio"] }
+# Sans-io D-STAR types (Callsign, Module, ProtocolKind, hosts file parsing, etc.)
+dstar-gateway-core = { path = "../dstar-gateway-core" }
+# Async tokio shell for reflector sessions (UDP socket + session loop).
+dstar-gateway = { path = "../dstar-gateway" }
+# Sans-io MMDVM wire-frame codec (`[0xE0, len, cmd, payload...]`).
+mmdvm-core = { path = "../mmdvm-core" }
+# Runtime: reused across FFI calls that drive reflector I/O.
+tokio = { version = "1", features = ["net", "time", "sync", "rt", "macros", "io-util"] }
+# Error wrapping for the FFI-visible ReflectorError enum.
+thiserror = "2"
+# Tracing for diagnostics inside the async session tasks.
+tracing = { version = "0.1", default-features = false }
 
 [build-dependencies]
 uniffi = { version = "0.31", features = ["build"] }

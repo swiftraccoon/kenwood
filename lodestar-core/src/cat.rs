@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Minimal CAT command codec — Phase 2 exposes only the `ID` identify
-//! command and a generic `ID`-response parser. Future phases wrap
-//! `kenwood-thd75`'s full protocol module.
+//! Minimal CAT command codec exposed to Swift.
+//!
+//! Covers the `ID` identify command and a generic `ID`-response
+//! parser. Broader CAT coverage lives in `kenwood-thd75`'s protocol
+//! module and can be surfaced here on demand.
 
 /// CAT commands that Lodestar can send over the transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

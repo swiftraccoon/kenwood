@@ -64,9 +64,13 @@ echo "==> Generating Swift bindings"
 HEADERS_DIR="${STAGING_DIR}/headers"
 mkdir -p "${HEADERS_DIR}"
 
+# Library mode: reads the metadata embedded in the compiled static lib,
+# which combines UDL-derived items (via include_scaffolding!) and
+# proc-macro-derived items (#[uniffi::export], #[derive(uniffi::Object)],
+# etc.). This is required for mixed UDL + proc-macro crates like ours.
 cargo run --manifest-path "${CRATE_DIR}/Cargo.toml" \
     --bin uniffi-bindgen -- generate \
-    "${CRATE_DIR}/src/lodestar.udl" \
+    --library "${STAGING_DIR}/ios-device/${LIB_NAME}" \
     --config "${CRATE_DIR}/uniffi.toml" \
     --language swift \
     --out-dir "${HEADERS_DIR}"
