@@ -185,6 +185,14 @@ impl FftPlan {
             reason = "FRAME_LEN is 160; fits in i32"
         )]
         let frame_len_i32 = FRAME_LEN as i32;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "Filling three fixed-size WOLA buffers of exactly FRAME_LEN elements \
+                      inside a bounded `0..FRAME_LEN` loop — indexing is always in-bounds \
+                      by construction. Rewriting as a three-way zip would obscure the \
+                      parallel per-sample write pattern that mirrors the WOLA reference \
+                      algorithm."
+        )]
         for n in 0..FRAME_LEN {
             #[expect(
                 clippy::cast_possible_wrap,

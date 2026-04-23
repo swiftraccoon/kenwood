@@ -4,6 +4,8 @@
 use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::types::*;
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
 // ============================================================================
 // AG -- AF Gain (bare read, bare write — 3-digit zero-padded per KI4LAX)
 // ============================================================================
@@ -38,23 +40,23 @@ fn serialize_ag_write_band_b() {
 }
 
 #[test]
-fn parse_ag_response() {
-    match protocol::parse(b"AG 091").unwrap() {
-        Response::AfGain { level } => {
-            assert_eq!(level, AfGainLevel::new(91));
-        }
-        other => panic!("expected AfGain, got {other:?}"),
-    }
+fn parse_ag_response() -> TestResult {
+    let r = protocol::parse(b"AG 091")?;
+    let Response::AfGain { level } = r else {
+        return Err(format!("expected AfGain, got {r:?}").into());
+    };
+    assert_eq!(level, AfGainLevel::new(91));
+    Ok(())
 }
 
 #[test]
-fn parse_ag_low() {
-    match protocol::parse(b"AG 005").unwrap() {
-        Response::AfGain { level } => {
-            assert_eq!(level, AfGainLevel::new(5));
-        }
-        other => panic!("expected AfGain, got {other:?}"),
-    }
+fn parse_ag_low() -> TestResult {
+    let r = protocol::parse(b"AG 005")?;
+    let Response::AfGain { level } = r else {
+        return Err(format!("expected AfGain, got {r:?}").into());
+    };
+    assert_eq!(level, AfGainLevel::new(5));
+    Ok(())
 }
 
 // ============================================================================
@@ -70,47 +72,49 @@ fn serialize_sq_read() {
 }
 
 #[test]
-fn serialize_sq_write() {
+fn serialize_sq_write() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::SetSquelch {
             band: Band::A,
-            level: SquelchLevel::new(3).unwrap()
+            level: SquelchLevel::new(3)?
         }),
         b"SQ 0,3\r"
     );
+    Ok(())
 }
 
 #[test]
-fn serialize_sq_write_band_b() {
+fn serialize_sq_write_band_b() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::SetSquelch {
             band: Band::B,
-            level: SquelchLevel::new(5).unwrap()
+            level: SquelchLevel::new(5)?
         }),
         b"SQ 1,5\r"
     );
+    Ok(())
 }
 
 #[test]
-fn parse_sq_response() {
-    match protocol::parse(b"SQ 0,03").unwrap() {
-        Response::Squelch { band, level } => {
-            assert_eq!(band, Band::A);
-            assert_eq!(level, SquelchLevel::new(3).unwrap());
-        }
-        other => panic!("expected Squelch, got {other:?}"),
-    }
+fn parse_sq_response() -> TestResult {
+    let r = protocol::parse(b"SQ 0,03")?;
+    let Response::Squelch { band, level } = r else {
+        return Err(format!("expected Squelch, got {r:?}").into());
+    };
+    assert_eq!(band, Band::A);
+    assert_eq!(level, SquelchLevel::new(3)?);
+    Ok(())
 }
 
 #[test]
-fn parse_sq_no_padding() {
-    match protocol::parse(b"SQ 0,3").unwrap() {
-        Response::Squelch { band, level } => {
-            assert_eq!(band, Band::A);
-            assert_eq!(level, SquelchLevel::new(3).unwrap());
-        }
-        other => panic!("expected Squelch, got {other:?}"),
-    }
+fn parse_sq_no_padding() -> TestResult {
+    let r = protocol::parse(b"SQ 0,3")?;
+    let Response::Squelch { band, level } = r else {
+        return Err(format!("expected Squelch, got {r:?}").into());
+    };
+    assert_eq!(band, Band::A);
+    assert_eq!(level, SquelchLevel::new(3)?);
+    Ok(())
 }
 
 #[test]
@@ -132,25 +136,25 @@ fn serialize_sm_read() {
 }
 
 #[test]
-fn parse_sm_response() {
-    match protocol::parse(b"SM 0,0005").unwrap() {
-        Response::Smeter { band, level } => {
-            assert_eq!(band, Band::A);
-            assert_eq!(level, SMeterReading::new(5).unwrap());
-        }
-        other => panic!("expected Smeter, got {other:?}"),
-    }
+fn parse_sm_response() -> TestResult {
+    let r = protocol::parse(b"SM 0,0005")?;
+    let Response::Smeter { band, level } = r else {
+        return Err(format!("expected Smeter, got {r:?}").into());
+    };
+    assert_eq!(band, Band::A);
+    assert_eq!(level, SMeterReading::new(5)?);
+    Ok(())
 }
 
 #[test]
-fn parse_sm_zero() {
-    match protocol::parse(b"SM 1,0000").unwrap() {
-        Response::Smeter { band, level } => {
-            assert_eq!(band, Band::B);
-            assert_eq!(level, SMeterReading::new(0).unwrap());
-        }
-        other => panic!("expected Smeter, got {other:?}"),
-    }
+fn parse_sm_zero() -> TestResult {
+    let r = protocol::parse(b"SM 1,0000")?;
+    let Response::Smeter { band, level } = r else {
+        return Err(format!("expected Smeter, got {r:?}").into());
+    };
+    assert_eq!(band, Band::B);
+    assert_eq!(level, SMeterReading::new(0)?);
+    Ok(())
 }
 
 #[test]
@@ -183,26 +187,26 @@ fn serialize_md_write() {
 }
 
 #[test]
-fn parse_md_fm() {
-    match protocol::parse(b"MD 0,0").unwrap() {
-        Response::Mode { band, mode } => {
-            assert_eq!(band, Band::A);
-            assert_eq!(mode, Mode::Fm);
-        }
-        other => panic!("expected Mode, got {other:?}"),
-    }
+fn parse_md_fm() -> TestResult {
+    let r = protocol::parse(b"MD 0,0")?;
+    let Response::Mode { band, mode } = r else {
+        return Err(format!("expected Mode, got {r:?}").into());
+    };
+    assert_eq!(band, Band::A);
+    assert_eq!(mode, Mode::Fm);
+    Ok(())
 }
 
 #[test]
-fn parse_md_lsb() {
+fn parse_md_lsb() -> TestResult {
     // MD mode 3 = LSB on D75 (not AM — AM is mode 2)
-    match protocol::parse(b"MD 1,3").unwrap() {
-        Response::Mode { band, mode } => {
-            assert_eq!(band, Band::B);
-            assert_eq!(mode, Mode::Lsb);
-        }
-        other => panic!("expected Mode, got {other:?}"),
-    }
+    let r = protocol::parse(b"MD 1,3")?;
+    let Response::Mode { band, mode } = r else {
+        return Err(format!("expected Mode, got {r:?}").into());
+    };
+    assert_eq!(band, Band::B);
+    assert_eq!(mode, Mode::Lsb);
+    Ok(())
 }
 
 // ============================================================================
@@ -215,23 +219,23 @@ fn serialize_fs_bare_read() {
 }
 
 #[test]
-fn parse_fs_response() {
-    match protocol::parse(b"FS 0").unwrap() {
-        Response::FineStep { step } => {
-            assert_eq!(step, FineStep::Hz20);
-        }
-        other => panic!("expected FineStep, got {other:?}"),
-    }
+fn parse_fs_response() -> TestResult {
+    let r = protocol::parse(b"FS 0")?;
+    let Response::FineStep { step } = r else {
+        return Err(format!("expected FineStep, got {r:?}").into());
+    };
+    assert_eq!(step, FineStep::Hz20);
+    Ok(())
 }
 
 #[test]
-fn parse_fs_value_3() {
-    match protocol::parse(b"FS 3").unwrap() {
-        Response::FineStep { step } => {
-            assert_eq!(step, FineStep::Hz1000);
-        }
-        other => panic!("expected FineStep, got {other:?}"),
-    }
+fn parse_fs_value_3() -> TestResult {
+    let r = protocol::parse(b"FS 3")?;
+    let Response::FineStep { step } = r else {
+        return Err(format!("expected FineStep, got {r:?}").into());
+    };
+    assert_eq!(step, FineStep::Hz1000);
+    Ok(())
 }
 
 // ============================================================================
@@ -244,24 +248,24 @@ fn serialize_ft_read() {
 }
 
 #[test]
-fn parse_ft_response_bare() {
-    match protocol::parse(b"FT 2").unwrap() {
-        Response::FunctionType { enabled } => {
-            assert!(enabled);
-        }
-        other => panic!("expected FunctionType, got {other:?}"),
-    }
+fn parse_ft_response_bare() -> TestResult {
+    let r = protocol::parse(b"FT 2")?;
+    let Response::FunctionType { enabled } = r else {
+        return Err(format!("expected FunctionType, got {r:?}").into());
+    };
+    assert!(enabled);
+    Ok(())
 }
 
 #[test]
-fn parse_ft_response_with_band_prefix() {
+fn parse_ft_response_with_band_prefix() -> TestResult {
     // Backward compatibility: handle "band,data" format in response
-    match protocol::parse(b"FT 0,2").unwrap() {
-        Response::FunctionType { enabled } => {
-            assert!(enabled);
-        }
-        other => panic!("expected FunctionType, got {other:?}"),
-    }
+    let r = protocol::parse(b"FT 0,2")?;
+    let Response::FunctionType { enabled } = r else {
+        return Err(format!("expected FunctionType, got {r:?}").into());
+    };
+    assert!(enabled);
+    Ok(())
 }
 
 // ============================================================================
@@ -289,36 +293,38 @@ fn serialize_sh_read_cw() {
 }
 
 #[test]
-fn parse_sh_response() {
-    match protocol::parse(b"SH 1,3").unwrap() {
-        Response::FilterWidth { mode, width } => {
-            assert_eq!(mode, FilterMode::Cw);
-            assert_eq!(width, FilterWidthIndex::new(3, FilterMode::Cw).unwrap());
-        }
-        other => panic!("expected FilterWidth, got {other:?}"),
-    }
+fn parse_sh_response() -> TestResult {
+    let r = protocol::parse(b"SH 1,3")?;
+    let Response::FilterWidth { mode, width } = r else {
+        return Err(format!("expected FilterWidth, got {r:?}").into());
+    };
+    assert_eq!(mode, FilterMode::Cw);
+    assert_eq!(width, FilterWidthIndex::new(3, FilterMode::Cw)?);
+    Ok(())
 }
 
 #[test]
-fn serialize_sh_write() {
+fn serialize_sh_write() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::SetFilterWidth {
             mode: FilterMode::Cw,
-            width: FilterWidthIndex::new(4, FilterMode::Cw).unwrap()
+            width: FilterWidthIndex::new(4, FilterMode::Cw)?
         }),
         b"SH 1,4\r"
     );
+    Ok(())
 }
 
 #[test]
-fn serialize_sh_write_ssb() {
+fn serialize_sh_write_ssb() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::SetFilterWidth {
             mode: FilterMode::Ssb,
-            width: FilterWidthIndex::new(3, FilterMode::Ssb).unwrap()
+            width: FilterWidthIndex::new(3, FilterMode::Ssb)?
         }),
         b"SH 0,3\r"
     );
+    Ok(())
 }
 
 // ============================================================================
@@ -368,23 +374,23 @@ fn serialize_ra_write_off() {
 }
 
 #[test]
-fn parse_ra_enabled() {
-    match protocol::parse(b"RA 0,1").unwrap() {
-        Response::Attenuator { band, enabled } => {
-            assert_eq!(band, Band::A);
-            assert!(enabled);
-        }
-        other => panic!("expected Attenuator, got {other:?}"),
-    }
+fn parse_ra_enabled() -> TestResult {
+    let r = protocol::parse(b"RA 0,1")?;
+    let Response::Attenuator { band, enabled } = r else {
+        return Err(format!("expected Attenuator, got {r:?}").into());
+    };
+    assert_eq!(band, Band::A);
+    assert!(enabled);
+    Ok(())
 }
 
 #[test]
-fn parse_ra_disabled() {
-    match protocol::parse(b"RA 1,0").unwrap() {
-        Response::Attenuator { band, enabled } => {
-            assert_eq!(band, Band::B);
-            assert!(!enabled);
-        }
-        other => panic!("expected Attenuator, got {other:?}"),
-    }
+fn parse_ra_disabled() -> TestResult {
+    let r = protocol::parse(b"RA 1,0")?;
+    let Response::Attenuator { band, enabled } = r else {
+        return Err(format!("expected Attenuator, got {r:?}").into());
+    };
+    assert_eq!(band, Band::B);
+    assert!(!enabled);
+    Ok(())
 }

@@ -16,6 +16,15 @@
 //! (<https://github.com/szechyjs/dsd>, ISC-licensed, copied under
 //! GPL-2.0-or-later via the mbelib relicensing pathway).
 
+#![expect(
+    clippy::indexing_slicing,
+    reason = "All indices are bounded by AMBE_FRAME_BITS=72 (enforced by the table \
+              declarations themselves — FORWARD and INVERSE are `[u8; 72]`). The bit \
+              permutation routines iterate over 0..72 and index into fixed-size tables; \
+              bounds are statically provable but clippy can't prove them from the local \
+              code shape."
+)]
+
 /// Number of bits in an AMBE frame (also the codeword array length).
 pub(crate) const AMBE_FRAME_BITS: usize = 72;
 
@@ -54,7 +63,10 @@ const fn build_inverse() -> [u8; AMBE_FRAME_BITS] {
             "FORWARD interleave has a collision — two input bits map to the same ambe_fr slot",
         );
         // Input-bit indices are 0..72 so the u8 narrowing is exact.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "input_bit counts 0..AMBE_FRAME_BITS = 0..72; fits trivially in u8."
+        )]
         {
             inverse[target] = input_bit as u8;
         }

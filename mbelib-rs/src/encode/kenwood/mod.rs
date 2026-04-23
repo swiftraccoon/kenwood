@@ -59,17 +59,12 @@
 //! Python-based extraction scripts that produced them are not
 //! redistributed.
 
-#![allow(
+#![expect(
     clippy::excessive_precision,
     reason = "f32 literals carry the full 32-bit pattern from the firmware image; \
               truncating them would silently break the bit-for-bit match."
 )]
-#![allow(
-    clippy::approx_constant,
-    reason = "some values in MATH_CONSTANTS_LUT are approximations of π, ln(2), ln(10); \
-              they match what the DSP uses, not the mathematical exact values."
-)]
-#![allow(
+#![expect(
     clippy::unreadable_literal,
     reason = "tables are machine-generated from the firmware image; adding digit \
               separators by hand risks transcription errors and would diverge from \

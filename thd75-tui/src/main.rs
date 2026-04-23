@@ -94,7 +94,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Main thread: pump CFRunLoop for IOBluetooth callbacks
     loop {
         #[cfg(target_os = "macos")]
-        #[allow(unsafe_code)]
+        #[expect(
+            unsafe_code,
+            reason = "macOS IOBluetooth RFCOMM delivers packet callbacks on the main \
+                      thread's CFRunLoop, so a non-Cocoa binary must pump that run loop \
+                      itself — otherwise incoming BT frames never arrive. The Rust \
+                      ecosystem has no safe wrapper for CFRunLoopRunInMode; this is \
+                      Apple's only documented API for pumping the run loop from a \
+                      non-Cocoa binary. `seconds=0.01` keeps the main thread responsive \
+                      while yielding to IOBluetooth's internal queue. `unsafe_code` fires \
+                      here because the FFI block transits through Apple's C ABI; the \
+                      signatures are verified against the CoreFoundation headers in this \
+                      machine's SDK."
+        )]
         unsafe {
             unsafe extern "C" {
                 fn CFRunLoopRunInMode(

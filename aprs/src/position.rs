@@ -342,10 +342,16 @@ fn decode_compressed_tail(cs: u8, s: u8, t: u8) -> (Option<i32>, Option<(u16, u1
         0 | 1 => {
             let c = cs.saturating_sub(33);
             let s_val = s.saturating_sub(33);
-            #[allow(
+            #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
-                clippy::cast_precision_loss
+                reason = "APRS 1.0.1 §8.4 compressed speed is `1.08^s - 1` knots where `s` is \
+                          in [0, 89] (single printable-ASCII byte minus 33). Max value is \
+                          `1.08^89 - 1 ≈ 934` knots, trivially fits in u16. \
+                          `cast_possible_truncation` fires on `.round() as u16` because \
+                          clippy can't prove the f64 is bounded; `cast_sign_loss` fires \
+                          because `1.08^x - 1` is non-negative for x >= 0 but the type \
+                          system can't see that."
             )]
             let speed_knots = (1.08_f64.powi(i32::from(s_val)) - 1.0).round() as u16;
             let course_deg = u16::from(c) * 4;
@@ -362,10 +368,16 @@ fn decode_compressed_tail(cs: u8, s: u8, t: u8) -> (Option<i32>, Option<(u16, u1
             let c = i32::from(cs.saturating_sub(33));
             let s_val = i32::from(s.saturating_sub(33));
             let exponent = c * 91 + s_val;
-            #[allow(
+            #[expect(
                 clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                clippy::cast_precision_loss
+                reason = "APRS 1.0.1 §8.5 compressed altitude is `1.002^(c*91 + s)` feet \
+                          where c,s are in [0, 90] (single printable-ASCII byte minus 33), \
+                          so `exponent` is in [0, 8281]. Max altitude ≈ `1.002^8281 ≈ 1.56e7` \
+                          feet, comfortably within i32 range. `cast_possible_truncation` \
+                          fires on `.round() as i32` because clippy can't prove the f64 is \
+                          bounded; f64→i32 is signed-to-signed so `cast_sign_loss` doesn't \
+                          apply and `cast_precision_loss` is for integer→float narrowing \
+                          (neither fires here)."
             )]
             let alt_ft = 1.002_f64.powi(exponent).round() as i32;
             (Some(alt_ft), None)

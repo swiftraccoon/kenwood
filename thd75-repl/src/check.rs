@@ -301,7 +301,6 @@ fn gen_help_text() -> Vec<String> {
 /// Returns 0 if all rules pass, 1 if any violation is found. Prints
 /// the full report to stdout.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn run() -> i32 {
     println!(
         "Accessibility compliance check, thd75-repl version {}.",

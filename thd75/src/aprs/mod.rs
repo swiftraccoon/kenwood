@@ -154,40 +154,42 @@ mod tests {
     use super::*;
     use kiss_tnc::FEND;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn parse_digipeater_path_empty_is_ok() {
-        assert_eq!(
-            parse_digipeater_path("").unwrap(),
-            Vec::<Ax25Address>::new()
-        );
-        assert_eq!(
-            parse_digipeater_path("   ").unwrap(),
-            Vec::<Ax25Address>::new()
-        );
+    fn parse_digipeater_path_empty_is_ok() -> TestResult {
+        assert_eq!(parse_digipeater_path("")?, Vec::<Ax25Address>::new());
+        assert_eq!(parse_digipeater_path("   ")?, Vec::<Ax25Address>::new());
+        Ok(())
     }
 
     #[test]
-    fn parse_digipeater_path_single() {
-        let path = parse_digipeater_path("WIDE1-1").unwrap();
+    fn parse_digipeater_path_single() -> TestResult {
+        let path = parse_digipeater_path("WIDE1-1")?;
         assert_eq!(path.len(), 1);
-        assert_eq!(path[0].callsign, "WIDE1");
-        assert_eq!(path[0].ssid, 1);
+        let first = path.first().ok_or("path[0] missing")?;
+        assert_eq!(first.callsign, "WIDE1");
+        assert_eq!(first.ssid, 1);
+        Ok(())
     }
 
     #[test]
-    fn parse_digipeater_path_multiple() {
-        let path = parse_digipeater_path("WIDE1-1,WIDE2-2").unwrap();
+    fn parse_digipeater_path_multiple() -> TestResult {
+        let path = parse_digipeater_path("WIDE1-1,WIDE2-2")?;
         assert_eq!(path.len(), 2);
-        assert_eq!(path[0].callsign, "WIDE1");
-        assert_eq!(path[1].callsign, "WIDE2");
-        assert_eq!(path[1].ssid, 2);
+        assert_eq!(path.first().ok_or("path[0] missing")?.callsign, "WIDE1");
+        let second = path.get(1).ok_or("path[1] missing")?;
+        assert_eq!(second.callsign, "WIDE2");
+        assert_eq!(second.ssid, 2);
+        Ok(())
     }
 
     #[test]
-    fn parse_digipeater_path_no_ssid() {
-        let path = parse_digipeater_path("WIDE1").unwrap();
+    fn parse_digipeater_path_no_ssid() -> TestResult {
+        let path = parse_digipeater_path("WIDE1")?;
         assert_eq!(path.len(), 1);
-        assert_eq!(path[0].ssid, 0);
+        assert_eq!(path.first().ok_or("path[0] missing")?.ssid, 0);
+        Ok(())
     }
 
     #[test]
@@ -202,13 +204,16 @@ mod tests {
     }
 
     #[test]
-    fn default_path_is_wide1_wide2() {
+    fn default_path_is_wide1_wide2() -> TestResult {
         let path = default_digipeater_path();
         assert_eq!(path.len(), 2);
-        assert_eq!(path[0].callsign, "WIDE1");
-        assert_eq!(path[0].ssid, 1);
-        assert_eq!(path[1].callsign, "WIDE2");
-        assert_eq!(path[1].ssid, 1);
+        let first = path.first().ok_or("path[0] missing")?;
+        assert_eq!(first.callsign, "WIDE1");
+        assert_eq!(first.ssid, 1);
+        let second = path.get(1).ok_or("path[1] missing")?;
+        assert_eq!(second.callsign, "WIDE2");
+        assert_eq!(second.ssid, 1);
+        Ok(())
     }
 
     #[test]

@@ -47,21 +47,20 @@ fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> 
 
 /// Split a `"band,value"` payload into (band, `value_str`).
 fn split_band_value<'a>(payload: &'a str, cmd: &str) -> Result<(Band, &'a str), ProtocolError> {
-    let parts: Vec<&str> = payload.splitn(2, ',').collect();
-    if parts.len() != 2 {
-        return Err(ProtocolError::FieldParse {
+    let (band_str, value) = payload
+        .split_once(',')
+        .ok_or_else(|| ProtocolError::FieldParse {
             command: cmd.to_owned(),
             field: "all".to_owned(),
             detail: format!("expected band,value, got {payload:?}"),
-        });
-    }
-    let band_val = parse_u8_field(parts[0], cmd, "band")?;
+        })?;
+    let band_val = parse_u8_field(band_str, cmd, "band")?;
     let band = Band::try_from(band_val).map_err(|e| ProtocolError::FieldParse {
         command: cmd.to_owned(),
         field: "band".to_owned(),
         detail: e.to_string(),
     })?;
-    Ok((band, parts[1]))
+    Ok((band, value))
 }
 
 // ---------------------------------------------------------------------------
@@ -149,15 +148,14 @@ fn parse_ft(payload: &str) -> Result<Response, ProtocolError> {
 ///
 /// The response to `SH N\r` includes the mode index and filter width.
 fn parse_sh(payload: &str) -> Result<Response, ProtocolError> {
-    let parts: Vec<&str> = payload.splitn(2, ',').collect();
-    if parts.len() == 2 {
-        let mode_raw = parse_u8_field(parts[0], "SH", "mode")?;
+    if let Some((mode_str, width_str)) = payload.split_once(',') {
+        let mode_raw = parse_u8_field(mode_str, "SH", "mode")?;
         let mode = FilterMode::try_from(mode_raw).map_err(|e| ProtocolError::FieldParse {
             command: "SH".to_owned(),
             field: "mode".to_owned(),
             detail: e.to_string(),
         })?;
-        let width_raw = parse_u8_field(parts[1], "SH", "width")?;
+        let width_raw = parse_u8_field(width_str, "SH", "width")?;
         let width =
             FilterWidthIndex::from_raw(width_raw).map_err(|e| ProtocolError::FieldParse {
                 command: "SH".into(),

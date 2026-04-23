@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         original_squelch.as_u8() + 1
     };
-    let test_squelch = kenwood_thd75::types::SquelchLevel::new(test_val).unwrap();
+    let test_squelch = kenwood_thd75::types::SquelchLevel::new(test_val)?;
     println!("Setting squelch to {}...", test_squelch.as_u8());
     radio.set_squelch(band, test_squelch).await?;
 

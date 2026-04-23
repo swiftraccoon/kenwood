@@ -185,15 +185,17 @@ mod tests {
     }
 
     #[test]
-    fn voice_message_name_valid() {
-        let name = VoiceMessageName::new("CQ Call").unwrap();
+    fn voice_message_name_valid() -> Result<(), Box<dyn std::error::Error>> {
+        let name = VoiceMessageName::new("CQ Call").ok_or("valid voice message name rejected")?;
         assert_eq!(name.as_str(), "CQ Call");
+        Ok(())
     }
 
     #[test]
-    fn voice_message_name_max_length() {
-        let name = VoiceMessageName::new("12345678").unwrap();
+    fn voice_message_name_max_length() -> Result<(), Box<dyn std::error::Error>> {
+        let name = VoiceMessageName::new("12345678").ok_or("valid 8-char name rejected")?;
         assert_eq!(name.as_str().len(), 8);
+        Ok(())
     }
 
     #[test]
@@ -214,9 +216,10 @@ mod tests {
     }
 
     #[test]
-    fn repeat_interval_value() {
-        let interval = RepeatInterval::new(45).unwrap();
+    fn repeat_interval_value() -> Result<(), Box<dyn std::error::Error>> {
+        let interval = RepeatInterval::new(45).ok_or("valid interval rejected")?;
         assert_eq!(interval.seconds(), 45);
+        Ok(())
     }
 
     #[test]

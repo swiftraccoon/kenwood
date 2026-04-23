@@ -62,23 +62,21 @@ required-features = ["encoder"]
 name = "validate_bvec_vs_op25"
 required-features = ["encoder"]
 
-[lints.rust]
-unsafe_code = "forbid"
-missing_docs = "deny"
-missing_debug_implementations = "deny"
-unreachable_pub = "deny"
-unused_results = "deny"
-elided_lifetimes_in_paths = "deny"
-trivial_casts = "deny"
-trivial_numeric_casts = "deny"
-unused_import_braces = "deny"
-unused_qualifications = "deny"
+# Integration tests that depend on the encoder feature. Declaring them here with
+# `required-features` means cargo skips compiling them entirely when the feature
+# is off, instead of compiling them to empty crates that then trip
+# `unused_crate_dependencies` for every dev-dep in the workspace.
+[[test]]
+name = "encoder_roundtrip"
+required-features = ["encoder"]
 
-[lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-cargo = { level = "deny", priority = -1 }
-# In a library crate with private modules, pub(crate) satisfies unreachable_pub
-# but clippy::redundant_pub_crate considers it redundant — allow to resolve conflict.
-redundant_pub_crate = "allow"
+[[test]]
+name = "diagnostic_voice_pipeline"
+required-features = ["encoder"]
+
+[[test]]
+name = "kenwood_tables_integrity"
+required-features = ["kenwood-tables"]
+
+[lints]
+workspace = true

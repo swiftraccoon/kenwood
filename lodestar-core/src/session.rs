@@ -1011,6 +1011,10 @@ fn handle_event<P>(
     }
 }
 
+/// Every recognised GPS sentence prefix paired with its terminator.
+const GPS_SENTENCE_PATTERNS: [(&str, char); 3] =
+    [("$$CRC", '\r'), ("$GPRMC", '\n'), ("$GPGGA", '\n')];
+
 /// Append a 5-byte GPS block payload to the running buffer, then
 /// scan for complete sentences and parse each. Returns `true` if the
 /// latest position changed.
@@ -1019,6 +1023,12 @@ fn handle_event<P>(
 /// - `$$CRC` (DPRS), terminated by `\r` (0x0D).
 /// - `$GPRMC` (NMEA), terminated by `\n` (0x0A).
 /// - `$GPGGA` (NMEA), terminated by `\n` (0x0A).
+///
+/// The prefix may appear anywhere in the running buffer (not just
+/// byte 0) — GPS payload chunks span many blocks, and the first few
+/// blocks can contain leading padding or the tail of a prior sentence.
+/// Any bytes preceding a recognised prefix are dropped as noise once
+/// the sentence lands.
 fn ingest_gps_chunk(state: &mut StreamSlowDataState, chunk: &str) -> bool {
     tracing::debug!(
         target: "lodestar_core::session::gps",
@@ -1029,18 +1039,51 @@ fn ingest_gps_chunk(state: &mut StreamSlowDataState, chunk: &str) -> bool {
     state.gps_buffer.push_str(chunk);
 
     let mut changed = false;
-    while let Some(end) = state.gps_buffer.find(['\r', '\n']) {
-        let sentence: String = state.gps_buffer.drain(..=end).collect();
-        let trimmed = sentence.trim_matches(['\r', '\n', '\0']).trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+    loop {
+        // Earliest recognised prefix anywhere in the buffer.
+        let earliest = GPS_SENTENCE_PATTERNS
+            .iter()
+            .filter_map(|(prefix, term)| {
+                state
+                    .gps_buffer
+                    .find(prefix)
+                    .map(|idx| (idx, *prefix, *term))
+            })
+            .min_by_key(|(idx, _, _)| *idx);
+
+        let Some((start, prefix, terminator)) = earliest else {
+            break;
+        };
+
+        // Terminator must appear after the prefix start.
+        let Some(rel_end) = state
+            .gps_buffer
+            .get(start..)
+            .and_then(|s| s.find(terminator))
+        else {
+            // Sentence still assembling. Drop the noise before the
+            // prefix so the buffer doesn't grow unbounded while we
+            // wait for the terminator.
+            if start > 0 {
+                drop(state.gps_buffer.drain(..start));
+            }
+            break;
+        };
+        let end = start + rel_end;
+        let sentence: String = state
+            .gps_buffer
+            .get(start..end)
+            .map(ToOwned::to_owned)
+            .unwrap_or_default();
+        drop(state.gps_buffer.drain(..=end));
+
         tracing::debug!(
             target: "lodestar_core::session::gps",
-            sentence = %trimmed,
+            prefix,
+            sentence = %sentence,
             "parsing GPS sentence"
         );
-        if let Some(position) = parse_gps_sentence(trimmed)
+        if let Some(position) = parse_gps_sentence(&sentence, prefix)
             && state.latest_position.as_ref() != Some(&position)
         {
             state.latest_position = Some(position);
@@ -1056,11 +1099,12 @@ fn ingest_gps_chunk(state: &mut StreamSlowDataState, chunk: &str) -> bool {
     changed
 }
 
-/// Parse a complete GPS sentence into a [`GpsPosition`]. Dispatches
-/// by prefix: `$$CRC` → DPRS, `$GPRMC` / `$GPGGA` → NMEA.
-fn parse_gps_sentence(sentence: &str) -> Option<GpsPosition> {
-    if sentence.starts_with("$$CRC") {
-        match parse_dprs(sentence) {
+/// Parse a complete GPS sentence into a [`GpsPosition`]. The prefix
+/// has already been identified by the ingest loop so we dispatch
+/// directly.
+fn parse_gps_sentence(sentence: &str, prefix: &str) -> Option<GpsPosition> {
+    match prefix {
+        "$$CRC" => match parse_dprs(sentence) {
             Ok(report) => Some(GpsPosition {
                 callsign: report.callsign.as_str().trim().to_owned(),
                 latitude: report.latitude.degrees(),
@@ -1077,13 +1121,10 @@ fn parse_gps_sentence(sentence: &str) -> Option<GpsPosition> {
                 );
                 None
             }
-        }
-    } else if sentence.starts_with("$GPRMC") {
-        parse_nmea_rmc(sentence)
-    } else if sentence.starts_with("$GPGGA") {
-        parse_nmea_gga(sentence)
-    } else {
-        None
+        },
+        "$GPRMC" => parse_nmea_rmc(sentence),
+        "$GPGGA" => parse_nmea_gga(sentence),
+        _ => None,
     }
 }
 

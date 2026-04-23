@@ -48,8 +48,23 @@ panic = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
+# Workspace-wide ban on `#[allow(...)]`. Use `#[expect(...)]` with a
+# `reason = "..."` field instead — `#[expect]` is self-auditing because
+# clippy reports "unfulfilled lint expectation" when the suppressed lint
+# stops firing, forcing stale suppressions to be pruned on every refactor.
+# `allow_attributes_without_reason` additionally requires every remaining
+# `expect`/`allow` to carry a `reason = "..."` field so the justification
+# is visible at the suppression site.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
+# Every crate in this workspace has at least one `pub(crate)` private module — that's
+# the pattern `unreachable_pub = "deny"` wants — but `clippy::redundant_pub_crate` (in
+# the `nursery` group we deny) considers the `pub(crate)` redundant on an already-private
+# module. The conflict is universal, so allow it workspace-wide instead of forcing every
+# crate to override.
+redundant_pub_crate = "allow"
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"

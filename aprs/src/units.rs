@@ -46,7 +46,12 @@ impl Latitude {
     /// Create a latitude, clamping any input to `[-90.0, 90.0]`. NaN
     /// becomes `0.0`.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // f64::clamp is not const stable
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "clippy suggests `const fn` based on structural shape, but `f64::clamp` \
+                  is not const-stable yet (tracked at rust-lang/rust#93396). Cannot be made \
+                  `const` until that stabilizes."
+    )]
     pub fn new_clamped(degrees: f64) -> Self {
         if degrees.is_nan() {
             return Self(0.0);
@@ -66,7 +71,16 @@ impl Latitude {
     pub fn as_aprs_uncompressed(self) -> String {
         let hemisphere = if self.0 >= 0.0 { 'N' } else { 'S' };
         let lat_abs = self.0.abs();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "`lat_abs` is in [0.0, 90.0] by the Latitude invariant (validated at \
+                      construction via `Latitude::new` / `Latitude::new_clamped`), so the \
+                      `as u32` cast is always lossless. `cast_possible_truncation` fires \
+                      because clippy can't prove the f64 range from the surrounding code; \
+                      `cast_sign_loss` fires because f64→u32 drops the sign bit even though \
+                      `.abs()` two lines above guarantees non-negative input."
+        )]
         let degrees = lat_abs as u32;
         let minutes = (lat_abs - f64::from(degrees)) * 60.0;
         format!("{degrees:02}{minutes:05.2}{hemisphere}")
@@ -102,7 +116,12 @@ impl Longitude {
 
     /// Create a longitude, clamping to `[-180.0, 180.0]`. NaN → `0.0`.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // f64::clamp is not const stable
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "clippy suggests `const fn` based on structural shape, but `f64::clamp` \
+                  is not const-stable yet (tracked at rust-lang/rust#93396). Cannot be made \
+                  `const` until that stabilizes."
+    )]
     pub fn new_clamped(degrees: f64) -> Self {
         if degrees.is_nan() {
             return Self(0.0);
@@ -122,7 +141,16 @@ impl Longitude {
     pub fn as_aprs_uncompressed(self) -> String {
         let hemisphere = if self.0 >= 0.0 { 'E' } else { 'W' };
         let lon_abs = self.0.abs();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "`lon_abs` is in [0.0, 180.0] by the Longitude invariant (validated at \
+                      construction via `Longitude::new` / `Longitude::new_clamped`), so the \
+                      `as u32` cast is always lossless. `cast_possible_truncation` fires \
+                      because clippy can't prove the f64 range from the surrounding code; \
+                      `cast_sign_loss` fires because f64→u32 drops the sign bit even though \
+                      `.abs()` two lines above guarantees non-negative input."
+        )]
         let degrees = lon_abs as u32;
         let minutes = (lon_abs - f64::from(degrees)) * 60.0;
         format!("{degrees:03}{minutes:05.2}{hemisphere}")
@@ -170,7 +198,19 @@ impl Speed {
 
     /// Convert to knots (rounded to nearest integer).
     #[must_use]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "APRS speeds are physical quantities the caller is responsible for keeping \
+                  sane — u16 covers 0..65535 knots which exceeds every terrestrial APRS use \
+                  case (satellites up to ~14,000 knots, aircraft to ~2000 knots). \
+                  `cast_possible_truncation` fires on `.round() as u16` because clippy can't \
+                  prove the f64 is bounded; `cast_sign_loss` fires because the `Kmh` and \
+                  `Mph` variants internally store non-negative floats but the types don't \
+                  enforce it. A fix-the-code version of this method would use \
+                  `.round().clamp(0.0, f64::from(u16::MAX)) as u16` to make the saturation \
+                  explicit — left as `#[expect]` pending that refactor."
+    )]
     pub fn as_knots(self) -> u16 {
         match self {
             Self::Knots(k) => k,

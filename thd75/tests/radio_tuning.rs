@@ -6,6 +6,9 @@ use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;
 use kenwood_thd75::types::{Band, Frequency, Mode, StepSize};
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+type BoxErr = Box<dyn std::error::Error>;
+
 // ---------------------------------------------------------------------------
 // Shared fixtures
 // ---------------------------------------------------------------------------
@@ -30,17 +33,29 @@ const FQ_RESPONSE_146520: &[u8] = b"FQ 0,0146520000\r";
 // tune_frequency
 // ---------------------------------------------------------------------------
 
-/// Build a mock for `mock_modify_page_sequence`-style MCP exchanges.
-fn build_w_response(page: u16, data: &[u8]) -> Vec<u8> {
-    assert_eq!(data.len(), 256);
-    let addr = page.to_be_bytes();
-    let mut resp = vec![b'W', addr[0], addr[1], 0x00, 0x00];
+/// Build a mock W response for `mock_modify_page_sequence`-style MCP exchanges.
+fn build_w_response(page: u16, data: &[u8]) -> Result<Vec<u8>, BoxErr> {
+    if data.len() != 256 {
+        return Err(format!("W response payload must be 256 bytes, got {}", data.len()).into());
+    }
+    let [addr_hi, addr_lo] = page.to_be_bytes();
+    let mut resp = vec![b'W', addr_hi, addr_lo, 0x00, 0x00];
     resp.extend_from_slice(data);
-    resp
+    Ok(resp)
+}
+
+/// Return a 256-byte page with `page[idx] = value`, cloning `base`.
+fn patch_page(base: &[u8; 256], idx: usize, value: u8) -> Result<[u8; 256], BoxErr> {
+    let mut out = *base;
+    let slot: &mut u8 = out.get_mut(idx).ok_or_else(|| -> BoxErr {
+        format!("patch_page: idx {idx} out of 256-byte page").into()
+    })?;
+    *slot = value;
+    Ok(out)
 }
 
 #[tokio::test]
-async fn tune_frequency_when_already_vfo() {
+async fn tune_frequency_when_already_vfo() -> TestResult {
     // Radio is already in VFO mode — no VM write needed.
     let mut mock = MockTransport::new();
     // ensure_mode: query VM -> already VFO
@@ -52,15 +67,15 @@ async fn tune_frequency_when_already_vfo() {
     // verify readback
     mock.expect(b"FQ 0\r", FQ_RESPONSE_146520);
 
-    let mut radio = Radio::connect(mock).await.unwrap();
+    let mut radio = Radio::connect(mock).await?;
     radio
         .tune_frequency(Band::A, Frequency::new(146_520_000))
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn tune_frequency_switches_from_memory_to_vfo() {
+async fn tune_frequency_switches_from_memory_to_vfo() -> TestResult {
     // Radio starts in Memory mode — must switch to VFO first.
     let mut mock = MockTransport::new();
     // ensure_mode: query VM -> Memory (1), needs to switch
@@ -74,11 +89,11 @@ async fn tune_frequency_switches_from_memory_to_vfo() {
     // verify readback
     mock.expect(b"FQ 0\r", FQ_RESPONSE_146520);
 
-    let mut radio = Radio::connect(mock).await.unwrap();
+    let mut radio = Radio::connect(mock).await?;
     radio
         .tune_frequency(Band::A, Frequency::new(146_520_000))
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +101,7 @@ async fn tune_frequency_switches_from_memory_to_vfo() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tune_channel_switches_to_memory_mode() {
+async fn tune_channel_switches_to_memory_mode() -> TestResult {
     // Radio starts in VFO mode — tune_channel must switch to Memory.
     let mut mock = MockTransport::new();
     // read_channel: verify channel is populated
@@ -100,12 +115,13 @@ async fn tune_channel_switches_to_memory_mode() {
     // recall channel
     mock.expect(b"MR 0,021\r", b"MR 0,021\r");
 
-    let mut radio = Radio::connect(mock).await.unwrap();
-    radio.tune_channel(Band::A, 21).await.unwrap();
+    let mut radio = Radio::connect(mock).await?;
+    radio.tune_channel(Band::A, 21).await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn tune_channel_already_in_memory_mode() {
+async fn tune_channel_already_in_memory_mode() -> TestResult {
     // Radio already in Memory mode — no VM write needed.
     let mut mock = MockTransport::new();
     // read_channel: verify channel is populated
@@ -118,12 +134,13 @@ async fn tune_channel_already_in_memory_mode() {
     // recall channel
     mock.expect(b"MR 0,005\r", b"MR 0,005\r");
 
-    let mut radio = Radio::connect(mock).await.unwrap();
-    radio.tune_channel(Band::A, 5).await.unwrap();
+    let mut radio = Radio::connect(mock).await?;
+    radio.tune_channel(Band::A, 5).await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn tune_channel_band_b() {
+async fn tune_channel_band_b() -> TestResult {
     // Tune Band B to a channel — confirms band index is passed correctly.
     let mut mock = MockTransport::new();
     mock.expect(
@@ -134,8 +151,9 @@ async fn tune_channel_band_b() {
     mock.expect(b"VM 1\r", b"VM 1,1\r");
     mock.expect(b"MR 1,042\r", b"MR 1,042\r");
 
-    let mut radio = Radio::connect(mock).await.unwrap();
-    radio.tune_channel(Band::B, 42).await.unwrap();
+    let mut radio = Radio::connect(mock).await?;
+    radio.tune_channel(Band::B, 42).await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +161,7 @@ async fn tune_channel_band_b() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn quick_tune_sets_freq_mode_and_step() {
+async fn quick_tune_sets_freq_mode_and_step() -> TestResult {
     let mut mock = MockTransport::new();
     // tune_frequency:
     //   ensure_mode: already VFO
@@ -159,15 +177,15 @@ async fn quick_tune_sets_freq_mode_and_step() {
     // set_step_size: Hz5000 = 0
     mock.expect(b"SF 0,0\r", b"SF 0,0\r");
 
-    let mut radio = Radio::connect(mock).await.unwrap();
+    let mut radio = Radio::connect(mock).await?;
     radio
         .quick_tune(Band::A, 146_520_000, Mode::Fm, StepSize::Hz5000)
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn quick_tune_nfm_with_step_12500() {
+async fn quick_tune_nfm_with_step_12500() -> TestResult {
     // Different mode and step size to confirm all three sub-calls forward
     // their parameters correctly.
     let mut mock = MockTransport::new();
@@ -185,11 +203,11 @@ async fn quick_tune_nfm_with_step_12500() {
     // set_step_size: Hz12500 = 5
     mock.expect(b"SF 0,5\r", b"SF 0,5\r");
 
-    let mut radio = Radio::connect(mock).await.unwrap();
+    let mut radio = Radio::connect(mock).await?;
     radio
         .quick_tune(Band::A, 145_000_000, Mode::Nfm, StepSize::Hz12500)
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -197,7 +215,7 @@ async fn quick_tune_nfm_with_step_12500() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn connect_safe_sends_tnc_exit_preamble() {
+async fn connect_safe_sends_tnc_exit_preamble() -> TestResult {
     // connect_safe writes 4 raw payloads (CR, CR, ETX, "\rTC 1\r") and then
     // does a best-effort drain read — all ignored on error.  We use
     // expect_any_write so the mock accepts all writes without validation
@@ -206,23 +224,25 @@ async fn connect_safe_sends_tnc_exit_preamble() {
     mock.expect_any_write();
 
     // Should not panic or return an error.
-    let radio = Radio::connect_safe(mock).await.unwrap();
+    let radio = Radio::connect_safe(mock).await?;
 
     // Verify we got a usable Radio back — the mock has no exchanges left.
     drop(radio);
+    Ok(())
 }
 
 #[tokio::test]
-async fn connect_safe_returns_functional_radio() {
+async fn connect_safe_returns_functional_radio() -> TestResult {
     // After the preamble, connect_safe returns a usable Radio.
     // Verify by checking that subscribe() works (it requires a valid Radio).
     let mut mock = MockTransport::new();
     mock.expect_any_write();
 
-    let radio = Radio::connect_safe(mock).await.unwrap();
+    let radio = Radio::connect_safe(mock).await?;
     let _rx = radio.subscribe();
     // If we get here, connect_safe returned a valid Radio instance.
     drop(radio);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -234,67 +254,73 @@ fn mock_modify_page_sequence(
     page: u16,
     original: &[u8; 256],
     expected: &[u8; 256],
-) {
+) -> Result<(), BoxErr> {
     mock.expect(b"0M PROGRAM\r", b"0M\r");
     let read_cmd = programming::build_read_command(page);
-    mock.expect(&read_cmd, &build_w_response(page, original));
+    mock.expect(&read_cmd, &build_w_response(page, original)?);
     mock.expect(&[programming::ACK], &[programming::ACK]);
     let write_cmd = programming::build_write_command(page, expected);
     mock.expect(&write_cmd, &[programming::ACK]);
     mock.expect(b"E", &[]);
+    Ok(())
 }
 
 #[tokio::test]
-async fn modify_memory_page_applies_closure() {
+async fn modify_memory_page_applies_closure() -> TestResult {
     // Verify: enter MCP → read page → closure mutates data → write back → exit.
     let page: u16 = 0x0020;
     let byte_index: usize = 0x55;
 
     let original = [0u8; 256];
-    let mut expected = original;
-    expected[byte_index] = 0xAB;
+    let expected = patch_page(&original, byte_index, 0xAB)?;
 
     let mut mock = MockTransport::new();
-    mock_modify_page_sequence(&mut mock, page, &original, &expected);
+    mock_modify_page_sequence(&mut mock, page, &original, &expected)?;
 
-    let mut radio = Radio::connect(mock).await.unwrap();
+    let mut radio = Radio::connect(mock).await?;
     radio
         .modify_memory_page(page, |data| {
-            data[byte_index] = 0xAB;
+            if let Some(slot) = data.get_mut(byte_index) {
+                *slot = 0xAB;
+            }
         })
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn modify_memory_page_preserves_surrounding_bytes() {
+async fn modify_memory_page_preserves_surrounding_bytes() -> TestResult {
     // A non-zero page pattern ensures only the target byte is changed.
     let page: u16 = 0x0010;
     let byte_index: usize = 0x30;
 
-    let mut original = [0xFFu8; 256];
-    original[byte_index] = 0x00;
-    let mut expected = original;
-    expected[byte_index] = 0x01;
+    let original = patch_page(&[0xFFu8; 256], byte_index, 0x00)?;
+    let expected = patch_page(&original, byte_index, 0x01)?;
 
     let mut mock = MockTransport::new();
-    mock_modify_page_sequence(&mut mock, page, &original, &expected);
+    mock_modify_page_sequence(&mut mock, page, &original, &expected)?;
 
-    let mut radio = Radio::connect(mock).await.unwrap();
+    let mut radio = Radio::connect(mock).await?;
     radio
         .modify_memory_page(page, |data| {
-            data[byte_index] = 0x01;
+            if let Some(slot) = data.get_mut(byte_index) {
+                *slot = 0x01;
+            }
         })
-        .await
-        .unwrap();
+        .await?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn modify_memory_page_rejects_factory_cal_page() {
+async fn modify_memory_page_rejects_factory_cal_page() -> TestResult {
     // Pages 0x07A1 and 0x07A2 are factory calibration — must be rejected
     // before entering MCP mode (no mock exchanges needed).
     let mock = MockTransport::new();
-    let mut radio = Radio::connect(mock).await.unwrap();
+    let mut radio = Radio::connect(mock).await?;
     let result = radio.modify_memory_page(0x07A1, |_| {}).await;
-    assert!(result.is_err());
+    assert!(
+        result.is_err(),
+        "expected factory-cal modify to fail: {result:?}"
+    );
+    Ok(())
 }

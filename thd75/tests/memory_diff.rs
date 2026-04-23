@@ -55,7 +55,13 @@ const fn region_for_offset(offset: usize) -> &'static str {
 /// The output groups changes by memory region and shows both the hex
 /// and ASCII values (when printable) to aid manual analysis.
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Developer-only diagnostic harness that correlates two memory dumps region by \
+              region. Inlining every region's print logic keeps the diff context visible while \
+              manually analysing firmware behaviour; splitting would make the report output \
+              harder to scan."
+)]
 fn diff_memory_dumps() {
     let path_a = "tests/fixtures/memory_dump_a.bin";
     let path_b = "tests/fixtures/memory_dump_b.bin";
@@ -189,22 +195,22 @@ fn print_hex_diff(a: &[u8], b: &[u8], start: usize, end: usize) {
 
         // Dump A line.
         eprint!("    A 0x{row_start:05X}: ");
-        for &byte in &a[row_start..row_end] {
+        for &byte in a.get(row_start..row_end).unwrap_or(&[]) {
             eprint!("{byte:02X} ");
         }
         eprint!(" |");
-        for &byte in &a[row_start..row_end] {
+        for &byte in a.get(row_start..row_end).unwrap_or(&[]) {
             eprint!("{}", displayable_char(byte));
         }
         eprintln!("|");
 
         // Dump B line.
         eprint!("    B 0x{row_start:05X}: ");
-        for &byte in &b[row_start..row_end] {
+        for &byte in b.get(row_start..row_end).unwrap_or(&[]) {
             eprint!("{byte:02X} ");
         }
         eprint!(" |");
-        for &byte in &b[row_start..row_end] {
+        for &byte in b.get(row_start..row_end).unwrap_or(&[]) {
             eprint!("{}", displayable_char(byte));
         }
         eprintln!("|");
@@ -212,7 +218,9 @@ fn print_hex_diff(a: &[u8], b: &[u8], start: usize, end: usize) {
         // Marker line showing which bytes differ.
         eprint!("               ");
         let mut any_diff = false;
-        for (&ab, &bb) in a[row_start..row_end].iter().zip(&b[row_start..row_end]) {
+        let a_row = a.get(row_start..row_end).unwrap_or(&[]);
+        let b_row = b.get(row_start..row_end).unwrap_or(&[]);
+        for (&ab, &bb) in a_row.iter().zip(b_row) {
             if ab == bb {
                 eprint!("   ");
             } else {
@@ -280,7 +288,8 @@ fn hex_dump_region() {
     for row_start in (aligned_start..end).step_by(16) {
         let row_end = (row_start + 16).min(data.len());
         eprint!("  0x{row_start:05X}: ");
-        for &byte in &data[row_start..row_end] {
+        let row = data.get(row_start..row_end).unwrap_or(&[]);
+        for &byte in row {
             eprint!("{byte:02X} ");
         }
         // Pad short rows.
@@ -288,7 +297,7 @@ fn hex_dump_region() {
             eprint!("   ");
         }
         eprint!(" |");
-        for &byte in &data[row_start..row_end] {
+        for &byte in row {
             eprint!("{}", displayable_char(byte));
         }
         eprintln!("|");

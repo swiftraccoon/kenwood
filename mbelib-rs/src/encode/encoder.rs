@@ -23,6 +23,14 @@
 //! follows mbelib's decoder convention (the DVSI implementation).
 //!
 //! Stages 1..4 (analysis: pitch / `num_harms` / V/UV / sa from FFT)
+#![expect(
+    clippy::indexing_slicing,
+    reason = "Top-level encoder: orchestrates fixed-size IMBE arrays (9-byte ambe_fr, \
+              49-bit ambe_d, FRAME_LEN=160 PCM samples) through the analysis → \
+              quantize → pack pipeline. Indices are bounded by IMBE-spec constants \
+              known at compile time; `.get()?` chains would add unwrap noise on every \
+              array access inside the per-stage driver functions."
+)]
 //! still diverge from OP25 during pitch transitions. The pitch
 //! tracker ports OP25's exact E(p) detectability function plus
 //! look-back tracking (`pitch_est.cc:200–226`) and sub-multiples
@@ -261,6 +269,14 @@ impl AmbeEncoder {
         };
         // Construction invariant: `self.pending.is_some()` here
         // because we returned early above when it was None.
+        #[expect(
+            clippy::expect_used,
+            reason = "Early return above guarantees `self.pending.is_some()` at this point \
+                      (see # Panics section in the method docs). The `.expect()` documents \
+                      the invariant at the use site so a future refactor that drops the \
+                      early return will trigger it immediately in tests rather than \
+                      silently producing None."
+        )]
         let pending = self
             .pending
             .as_mut()
@@ -315,7 +331,11 @@ impl AmbeEncoder {
             return AMBE_SILENCE;
         }
 
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "FFT_LENGTH is 256 (constant), well within f32 mantissa precision; \
+                      the usize-to-f32 cast is exact."
+        )]
         let f0_bin = FFT_LENGTH as f32 / pitch.period_samples;
         // `e_p` for OP25's V/UV threshold is the pitch tracker's
         // reconstruction-error metric (1 − confidence on the chosen
@@ -344,7 +364,6 @@ impl AmbeEncoder {
         let mut scratch = [0.0_f32; FRAME];
         for (i, &s) in pcm.iter().enumerate().take(FRAME) {
             if let Some(slot) = scratch.get_mut(i) {
-                #[allow(clippy::cast_precision_loss)]
                 let f = f32::from(s) / 32768.0;
                 *slot = f;
             }
@@ -395,7 +414,11 @@ mod tests {
         // Feed several frames of a 200 Hz sine.
         for frame in 0..5 {
             let pcm: [f32; FRAME] = core::array::from_fn(|i| {
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test sine generator: frame * FRAME + i stays under 5 * 160 = 800, \
+                              far below f32 mantissa precision."
+                )]
                 let t = (frame * FRAME + i) as f32;
                 (t * 2.0 * std::f32::consts::PI * f0 / sr).sin()
             });
@@ -414,7 +437,11 @@ mod tests {
         let mut enc = AmbeEncoder::new();
         for i in 0..50 {
             let pcm: [f32; FRAME] = core::array::from_fn(|j| {
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test tone generator: i * FRAME + j stays under 50 * 160 = 8000, \
+                              far below f32 mantissa precision."
+                )]
                 let t = (i * FRAME + j) as f32;
                 0.5 * (t * 0.1).sin()
             });
@@ -440,7 +467,11 @@ mod tests {
         let mut last_bytes = [0u8; 9];
         for frame in 0..25 {
             let pcm: [f32; FRAME] = core::array::from_fn(|i| {
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test sine generator: frame * FRAME + i stays under \
+                              25 * 160 = 4000, far below f32 mantissa precision."
+                )]
                 let t = (frame * FRAME + i) as f32;
                 (t * 2.0 * std::f32::consts::PI * f0 / sr).sin()
             });
@@ -473,11 +504,18 @@ mod tests {
         let harmonics = [1.0_f32, 0.6, 0.35, 0.2];
         let make_pcm = |frame_idx: usize| -> [f32; FRAME] {
             core::array::from_fn(|i| {
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test voice-like generator: frame_idx * FRAME + i stays \
+                              below the f32 mantissa threshold for test frame counts."
+                )]
                 let t = (frame_idx * FRAME + i) as f32;
                 let mut sum = 0.0_f32;
                 for (k, &amp) in harmonics.iter().enumerate() {
-                    #[allow(clippy::cast_precision_loss)]
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "harmonic index: k < 4, usize-to-f32 cast is exact."
+                    )]
                     let harm = (k + 1) as f32;
                     sum += amp * (t * 2.0 * std::f32::consts::PI * f0 * harm / sr).sin();
                 }
@@ -507,7 +545,11 @@ mod tests {
                 total_samples += 1;
             }
         }
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "total_samples <= 10 frames * 160 samples = 1600; usize-to-f32 cast \
+                      is exact."
+        )]
         let rms = (total_energy / total_samples as f32).sqrt();
         assert!(
             rms > 1e-4,

@@ -44,11 +44,14 @@ pub struct SpectralAmplitudes {
 /// L is limited by both the FFT size and the AMBE codec:
 /// `L = min(floor((N − 1) / f0_bin), MAX_HARMONICS)`.
 #[must_use]
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    reason = "DSP bin math; values bounded by FFT length"
+    reason = "Spectral amplitude extraction: fft_out.len() is <= 129 (half of 256-pt \
+              real FFT + 1), k is in 1..=MAX_HARMONICS (56), and f0_bin is a positive \
+              spectrum-relative fundamental frequency. All bin-index casts between usize \
+              and f32 fit well within f32 mantissa and stay non-negative by construction."
 )]
 pub fn extract_spectral_amplitudes(fft_out: &[Complex<f32>], f0_bin: f32) -> SpectralAmplitudes {
     let mut magnitudes = [0.0_f32; MAX_HARMONICS];
@@ -94,11 +97,12 @@ mod tests {
         let f0_bin = 6.4_f32; // 200 Hz at 8 kHz
         // Place 3 harmonics with known magnitudes.
         for (k, mag) in [(1_usize, 1.0_f32), (2, 0.5), (3, 0.25)] {
-            #[allow(
+            #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
                 clippy::cast_precision_loss,
-                reason = "test-only bin math, values small"
+                reason = "test bin painter: k in [1, 3], f0_bin = 6.4, so bin is bounded \
+                          and non-negative — all casts are exact."
             )]
             let bin = (f0_bin * k as f32).round() as usize;
             if let Some(c) = fft_out.get_mut(bin) {

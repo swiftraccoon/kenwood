@@ -3,6 +3,8 @@
 use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::types::*;
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
 // ============================================================================
 // ME — Memory channel read/write
 // ============================================================================
@@ -32,37 +34,35 @@ fn serialize_me_read_channel_999() {
 }
 
 #[test]
-fn parse_me_response_basic() {
+fn parse_me_response_basic() -> TestResult {
     // Real D75 ME format: all zeros, no tone/shift
     let raw = b"ME 000,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00,0";
-    let r = protocol::parse(raw).unwrap();
-    match r {
-        Response::MemoryChannel { channel, data } => {
-            assert_eq!(channel, 0);
-            assert_eq!(data.rx_frequency, Frequency::new(145_000_000));
-            assert_eq!(data.tx_offset, Frequency::new(600_000));
-            assert_eq!(data.step_size, StepSize::Hz5000);
-            assert!(!data.tone_enable);
-            assert!(!data.reverse);
-            assert_eq!(data.flags_0a_raw, 0);
-        }
-        other => panic!("expected MemoryChannel, got {other:?}"),
-    }
+    let r = protocol::parse(raw)?;
+    let Response::MemoryChannel { channel, data } = r else {
+        return Err(format!("expected MemoryChannel, got {r:?}").into());
+    };
+    assert_eq!(channel, 0);
+    assert_eq!(data.rx_frequency, Frequency::new(145_000_000));
+    assert_eq!(data.tx_offset, Frequency::new(600_000));
+    assert_eq!(data.step_size, StepSize::Hz5000);
+    assert!(!data.tone_enable);
+    assert!(!data.reverse);
+    assert_eq!(data.flags_0a_raw, 0);
+    Ok(())
 }
 
 #[test]
-fn parse_me_response_with_name() {
+fn parse_me_response_with_name() -> TestResult {
     // tone=1[7], ctcss=1[8], dcs=1[9], cross=0[10], rev=0[11], shift=1[12]
     let raw = b"ME 042,0440000000,0005000000,0,0,0,0,0,1,1,1,0,0,0,1,14,14,023,0,REPEATER,1,05,0";
-    let r = protocol::parse(raw).unwrap();
-    match r {
-        Response::MemoryChannel { channel, data } => {
-            assert_eq!(channel, 42);
-            assert_eq!(data.rx_frequency, Frequency::new(440_000_000));
-            assert_eq!(data.urcall, ChannelName::new("REPEATER").unwrap());
-        }
-        other => panic!("expected MemoryChannel, got {other:?}"),
-    }
+    let r = protocol::parse(raw)?;
+    let Response::MemoryChannel { channel, data } = r else {
+        return Err(format!("expected MemoryChannel, got {r:?}").into());
+    };
+    assert_eq!(channel, 42);
+    assert_eq!(data.rx_frequency, Frequency::new(440_000_000));
+    assert_eq!(data.urcall, ChannelName::new("REPEATER")?);
+    Ok(())
 }
 
 #[test]
@@ -78,7 +78,7 @@ fn me_write_serialize() {
 }
 
 #[test]
-fn me_write_serialize_full() {
+fn me_write_serialize_full() -> TestResult {
     let ch = ChannelMemory {
         rx_frequency: Frequency::new(145_000_000),
         tx_offset: Frequency::new(600_000),
@@ -91,12 +91,12 @@ fn me_write_serialize_full() {
         dcs_enable: false,
         cross_tone_reverse: false,
         flags_0a_raw: 0,
-        tone_code: ToneCode::new(8).unwrap(),
-        ctcss_code: ToneCode::new(8).unwrap(),
-        dcs_code: DcsCode::new(0).unwrap(),
+        tone_code: ToneCode::new(8)?,
+        ctcss_code: ToneCode::new(8)?,
+        dcs_code: DcsCode::new(0)?,
         cross_tone_combo: CrossToneType::DcsOff,
         digital_squelch: FlashDigitalSquelch::Off,
-        urcall: ChannelName::new("CQCQCQ").unwrap(),
+        urcall: ChannelName::new("CQCQCQ")?,
         data_mode: 0,
     };
     let wire = protocol::serialize(&Command::SetMemoryChannel {
@@ -107,10 +107,11 @@ fn me_write_serialize_full() {
         wire,
         b"ME 000,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00,0\r"
     );
+    Ok(())
 }
 
 #[test]
-fn me_write_parse_round_trip() {
+fn me_write_parse_round_trip() -> TestResult {
     let ch = ChannelMemory {
         rx_frequency: Frequency::new(145_000_000),
         tx_offset: Frequency::new(600_000),
@@ -123,12 +124,12 @@ fn me_write_parse_round_trip() {
         dcs_enable: false,
         cross_tone_reverse: false,
         flags_0a_raw: 0,
-        tone_code: ToneCode::new(8).unwrap(),
-        ctcss_code: ToneCode::new(8).unwrap(),
-        dcs_code: DcsCode::new(0).unwrap(),
+        tone_code: ToneCode::new(8)?,
+        ctcss_code: ToneCode::new(8)?,
+        dcs_code: DcsCode::new(0)?,
         cross_tone_combo: CrossToneType::DcsOff,
         digital_squelch: FlashDigitalSquelch::Off,
-        urcall: ChannelName::new("CQCQCQ").unwrap(),
+        urcall: ChannelName::new("CQCQCQ")?,
         data_mode: 0,
     };
     let wire = protocol::serialize(&Command::SetMemoryChannel {
@@ -136,18 +137,18 @@ fn me_write_parse_round_trip() {
         data: ch.clone(),
     });
     // Strip trailing \r and parse
-    let frame = &wire[..wire.len() - 1];
-    let r = protocol::parse(frame).unwrap();
-    match r {
-        Response::MemoryChannel {
-            channel,
-            data: parsed,
-        } => {
-            assert_eq!(channel, 42);
-            assert_eq!(parsed, ch);
-        }
-        other => panic!("expected MemoryChannel, got {other:?}"),
-    }
+    let frame = wire.split_last().map(|(_, r)| r).ok_or("empty wire")?;
+    let r = protocol::parse(frame)?;
+    let Response::MemoryChannel {
+        channel,
+        data: parsed,
+    } = r
+    else {
+        return Err(format!("expected MemoryChannel, got {r:?}").into());
+    };
+    assert_eq!(channel, 42);
+    assert_eq!(parsed, ch);
+    Ok(())
 }
 
 // ============================================================================
@@ -177,27 +178,25 @@ fn serialize_mr_recall_band_b_channel_123() {
 }
 
 #[test]
-fn parse_mr_echo_response() {
-    let r = protocol::parse(b"MR 0,000").unwrap();
-    match r {
-        Response::MemoryRecall { band, channel } => {
-            assert_eq!(band, Band::A);
-            assert_eq!(channel, 0);
-        }
-        other => panic!("expected MemoryRecall, got {other:?}"),
-    }
+fn parse_mr_echo_response() -> TestResult {
+    let r = protocol::parse(b"MR 0,000")?;
+    let Response::MemoryRecall { band, channel } = r else {
+        return Err(format!("expected MemoryRecall, got {r:?}").into());
+    };
+    assert_eq!(band, Band::A);
+    assert_eq!(channel, 0);
+    Ok(())
 }
 
 #[test]
-fn parse_mr_echo_band_b() {
-    let r = protocol::parse(b"MR 1,042").unwrap();
-    match r {
-        Response::MemoryRecall { band, channel } => {
-            assert_eq!(band, Band::B);
-            assert_eq!(channel, 42);
-        }
-        other => panic!("expected MemoryRecall, got {other:?}"),
-    }
+fn parse_mr_echo_band_b() -> TestResult {
+    let r = protocol::parse(b"MR 1,042")?;
+    let Response::MemoryRecall { band, channel } = r else {
+        return Err(format!("expected MemoryRecall, got {r:?}").into());
+    };
+    assert_eq!(band, Band::B);
+    assert_eq!(channel, 42);
+    Ok(())
 }
 
 // ============================================================================
@@ -221,40 +220,37 @@ fn serialize_mr_read_band_b() {
 }
 
 #[test]
-fn parse_mr_read_response() {
+fn parse_mr_read_response() -> TestResult {
     // Hardware returns `MR 021` (no comma) for `MR 0\r`
-    let r = protocol::parse(b"MR 021").unwrap();
-    match r {
-        Response::CurrentChannel { band, channel } => {
-            assert_eq!(band, Band::A);
-            assert_eq!(channel, 21);
-        }
-        other => panic!("expected CurrentChannel, got {other:?}"),
-    }
+    let r = protocol::parse(b"MR 021")?;
+    let Response::CurrentChannel { band, channel } = r else {
+        return Err(format!("expected CurrentChannel, got {r:?}").into());
+    };
+    assert_eq!(band, Band::A);
+    assert_eq!(channel, 21);
+    Ok(())
 }
 
 #[test]
-fn parse_mr_read_response_band_b() {
-    let r = protocol::parse(b"MR 1042").unwrap();
-    match r {
-        Response::CurrentChannel { band, channel } => {
-            assert_eq!(band, Band::B);
-            assert_eq!(channel, 42);
-        }
-        other => panic!("expected CurrentChannel, got {other:?}"),
-    }
+fn parse_mr_read_response_band_b() -> TestResult {
+    let r = protocol::parse(b"MR 1042")?;
+    let Response::CurrentChannel { band, channel } = r else {
+        return Err(format!("expected CurrentChannel, got {r:?}").into());
+    };
+    assert_eq!(band, Band::B);
+    assert_eq!(channel, 42);
+    Ok(())
 }
 
 #[test]
-fn parse_mr_read_response_channel_0() {
-    let r = protocol::parse(b"MR 0000").unwrap();
-    match r {
-        Response::CurrentChannel { band, channel } => {
-            assert_eq!(band, Band::A);
-            assert_eq!(channel, 0);
-        }
-        other => panic!("expected CurrentChannel, got {other:?}"),
-    }
+fn parse_mr_read_response_channel_0() -> TestResult {
+    let r = protocol::parse(b"MR 0000")?;
+    let Response::CurrentChannel { band, channel } = r else {
+        return Err(format!("expected CurrentChannel, got {r:?}").into());
+    };
+    assert_eq!(band, Band::A);
+    assert_eq!(channel, 0);
+    Ok(())
 }
 
 // ============================================================================
@@ -270,10 +266,11 @@ fn serialize_0m_enter_programming() {
 }
 
 #[test]
-fn parse_0m_response() {
-    let r = protocol::parse(b"0M somedata").unwrap();
+fn parse_0m_response() -> TestResult {
+    let r = protocol::parse(b"0M somedata")?;
     assert!(
         matches!(r, Response::ProgrammingMode),
         "expected ProgrammingMode, got {r:?}"
     );
+    Ok(())
 }

@@ -175,17 +175,24 @@ mod tests {
     }
 
     #[test]
-    fn band_round_trip() {
+    fn band_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0u8..Band::COUNT {
-            let val = Band::try_from(i).unwrap();
+            let val = Band::try_from(i)?;
             assert_eq!(u8::from(val), i);
         }
+        Ok(())
     }
 
     #[test]
-    fn band_error_variant() {
-        let err = Band::try_from(Band::COUNT).unwrap_err();
-        assert!(matches!(err, ValidationError::BandOutOfRange(14)));
+    fn band_error_variant() -> Result<(), Box<dyn std::error::Error>> {
+        let err = Band::try_from(Band::COUNT)
+            .err()
+            .ok_or("expected BandOutOfRange but got Ok")?;
+        assert!(
+            matches!(err, ValidationError::BandOutOfRange(14)),
+            "expected BandOutOfRange(14), got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]

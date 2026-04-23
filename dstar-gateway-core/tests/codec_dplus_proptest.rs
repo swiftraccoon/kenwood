@@ -1,5 +1,14 @@
-// proptest closures cannot use `?` — unwrap and slice are structurally required.
-#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#![expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "Proptest `prop_assert!` / closure bodies cannot use `?` to unwrap `Result` \
+              or `Option`, so `.unwrap()` on known-valid constructor outputs and direct \
+              `buf[..n]` slicing on fixed-size decoded byte arrays are structurally \
+              required. `clippy::unwrap_used` fires on those unwraps; \
+              `clippy::indexing_slicing` fires on the slice expressions. Both are safe \
+              because the proptest strategies generate inputs that are guaranteed valid \
+              by construction, and any failure would correctly panic the test."
+)]
 //! Property tests for `DPlus` codec round-trips.
 //!
 //! Two flavours:

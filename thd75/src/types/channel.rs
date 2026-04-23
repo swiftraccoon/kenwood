@@ -104,8 +104,12 @@ impl ChannelName {
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 24] {
         let mut buf = [0u8; 24];
-        let src = self.0.as_bytes();
-        buf[..src.len()].copy_from_slice(src);
+        // `ChannelName::new` caps the inner string at 8 bytes, so zipping
+        // against `buf` (length 24) is always bounded without a fallible
+        // copy_from_slice + length check.
+        buf.iter_mut()
+            .zip(self.0.as_bytes().iter())
+            .for_each(|(dst, &byte)| *dst = byte);
         buf
     }
 
@@ -116,7 +120,10 @@ impl ChannelName {
     #[must_use]
     pub fn from_bytes(bytes: &[u8; 24]) -> Self {
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(8).min(8);
-        let s = String::from_utf8_lossy(&bytes[..end]);
+        // `end <= 8 <= 24 == bytes.len()`, so `get(..end)` always yields
+        // `Some`; the fallback is unreachable but keeps this panic-free.
+        let slice = bytes.get(..end).unwrap_or(bytes);
+        let s = String::from_utf8_lossy(slice);
         Self(s.into_owned())
     }
 }
@@ -132,7 +139,13 @@ impl ChannelName {
 /// protocol. The `urcall` field stores the D-STAR URCALL destination callsign
 /// from the ME/FO wire format (typically "CQCQCQ" for D-STAR). Display names
 /// are only accessible via the MCP programming protocol on USB interface 2.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Mirrors the D75's CAT FO/ME wire format 1:1 — each bool corresponds to an independent \
+              bit flag in the channel-memory byte layout (tone_on, ctcss_on, dcs_on, cross_tone, \
+              reverse, lockout). A bitflags enum would obscure the byte-for-byte protocol mapping \
+              this type exists to document."
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelMemory {
     /// RX frequency in Hz (byte 0x00, 4 bytes, little-endian).
@@ -266,19 +279,27 @@ impl ChannelMemory {
     ///
     /// Returns [`ProtocolError::FieldParse`] if any field contains an
     /// invalid value, or if the slice is too short.
-    #[allow(clippy::similar_names, clippy::too_many_lines)]
+    #[expect(
+        clippy::similar_names,
+        reason = "`rx_frequency`/`tx_offset` and `tone_code`/`ctcss_code`/`dtcs_code` are the \
+                  canonical field names from the D75 firmware RE notes — renaming them would \
+                  desync this parser from the RE documentation it implements."
+    )]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        if bytes.len() < Self::BYTE_SIZE {
-            return Err(ProtocolError::FieldParse {
-                command: "channel".into(),
-                field: "length".into(),
-                detail: format!(
-                    "expected at least {} bytes, got {}",
-                    Self::BYTE_SIZE,
-                    bytes.len()
-                ),
-            });
-        }
+        // Capture the raw length first — `first_chunk` only yields the prefix,
+        // but the error message should reflect the original input size.
+        let total_len = bytes.len();
+        let bytes: &[u8; Self::BYTE_SIZE] =
+            bytes
+                .first_chunk()
+                .ok_or_else(|| ProtocolError::FieldParse {
+                    command: "channel".into(),
+                    field: "length".into(),
+                    detail: format!(
+                        "expected at least {} bytes, got {total_len}",
+                        Self::BYTE_SIZE,
+                    ),
+                })?;
 
         let rx_frequency = Frequency::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let tx_offset = Frequency::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
@@ -599,7 +620,13 @@ impl fmt::Display for FineStep {
 ///
 /// The per-field offsets documented on each struct member below are the
 /// complete byte map, correlated against MCP memory dumps from hardware.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Mirrors the MCP flash channel record 1:1 — each bool is a discrete bit in the 40-byte \
+              binary layout (tone_enabled, ctcss_enabled, dtcs_enabled, cross_tone, reverse, \
+              narrow, fine_mode, byte09_bit7, split_tune). A bitflags enum would lose the \
+              byte-for-byte offset documentation that makes this struct useful."
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashChannel {
     /// RX frequency in Hz (offset 0x00, 4 bytes, little-endian).
@@ -674,19 +701,29 @@ impl FlashChannel {
     ///
     /// Returns [`ProtocolError::FieldParse`] if any field contains an
     /// invalid value, or if the slice is too short.
-    #[allow(clippy::similar_names, clippy::too_many_lines)]
+    #[expect(
+        clippy::similar_names,
+        clippy::too_many_lines,
+        reason = "`rx_frequency`/`tx_offset` plus `tone_code`/`ctcss_code`/`dtcs_code` are the \
+                  canonical RE notes names — renaming would desync from firmware documentation. \
+                  The method decodes every bit of a 40-byte flash record inline so the bit \
+                  layout is visible in one place; splitting would fragment that."
+    )]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        if bytes.len() < Self::BYTE_SIZE {
-            return Err(ProtocolError::FieldParse {
-                command: "flash_channel".into(),
-                field: "length".into(),
-                detail: format!(
-                    "expected at least {} bytes, got {}",
-                    Self::BYTE_SIZE,
-                    bytes.len()
-                ),
-            });
-        }
+        // Capture the raw length first — `first_chunk` only yields the prefix,
+        // but the error message should reflect the original input size.
+        let total_len = bytes.len();
+        let bytes: &[u8; Self::BYTE_SIZE] =
+            bytes
+                .first_chunk()
+                .ok_or_else(|| ProtocolError::FieldParse {
+                    command: "flash_channel".into(),
+                    field: "length".into(),
+                    detail: format!(
+                        "expected at least {} bytes, got {total_len}",
+                        Self::BYTE_SIZE,
+                    ),
+                })?;
 
         let rx_frequency = Frequency::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let tx_offset = Frequency::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
@@ -906,12 +943,10 @@ impl Default for FlashChannel {
             byte0a_bit3: false,
             split: false,
             duplex: FlashDuplex::Simplex,
-            // Safety: 0 is always a valid index for ToneCode (0..=49)
-            tone_code: ToneCode::new(0).expect("0 is valid tone code"),
-            ctcss_code: ToneCode::new(0).expect("0 is valid tone code"),
+            tone_code: ToneCode::default(),
+            ctcss_code: ToneCode::default(),
             byte0c_high: 0,
-            // Safety: 0 is always a valid index for DcsCode (0..=103)
-            dcs_code: DcsCode::new(0).expect("0 is valid DCS code"),
+            dcs_code: DcsCode::default(),
             byte0d_bit7: false,
             cross_tone_type: CrossToneType::DcsOff,
             digital_squelch: FlashDigitalSquelch::Off,
@@ -939,12 +974,9 @@ impl Default for ChannelMemory {
             dcs_enable: false,
             cross_tone_reverse: false,
             flags_0a_raw: 0,
-            // Safety: 0 is always a valid index for ToneCode (0..=49)
-            tone_code: ToneCode::new(0).expect("0 is valid tone code"),
-            // Safety: 0 is always a valid index for ToneCode (0..=49)
-            ctcss_code: ToneCode::new(0).expect("0 is valid tone code"),
-            // Safety: 0 is always a valid index for DcsCode (0..=103)
-            dcs_code: DcsCode::new(0).expect("0 is valid DCS code"),
+            tone_code: ToneCode::default(),
+            ctcss_code: ToneCode::default(),
+            dcs_code: DcsCode::default(),
             cross_tone_combo: CrossToneType::DcsOff,
             digital_squelch: FlashDigitalSquelch::Off,
             urcall: ChannelName::default(),
@@ -961,48 +993,87 @@ mod tests {
     use crate::types::mode::{ShiftDirection, StepSize};
     use crate::types::tone::{CtcssMode, DcsCode, ToneCode};
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type BoxErr = Box<dyn std::error::Error>;
+
+    /// Return `bytes[offset]` or an error if the offset is out of bounds.
+    fn byte_at(bytes: &[u8], offset: usize) -> Result<u8, BoxErr> {
+        bytes.get(offset).copied().ok_or_else(|| {
+            format!(
+                "byte_at: offset {offset} out of bounds (len={})",
+                bytes.len()
+            )
+            .into()
+        })
+    }
+
+    /// Return `&bytes[start..end]` or an error if the range is out of bounds.
+    fn slice_range(bytes: &[u8], start: usize, end: usize) -> Result<&[u8], BoxErr> {
+        bytes.get(start..end).ok_or_else(|| {
+            format!(
+                "slice_range: {start}..{end} out of bounds (len={})",
+                bytes.len()
+            )
+            .into()
+        })
+    }
+
     #[test]
-    fn channel_name_valid() {
-        let name = ChannelName::new("RPT1").unwrap();
+    fn channel_name_valid() -> TestResult {
+        let name = ChannelName::new("RPT1")?;
         assert_eq!(name.as_str(), "RPT1");
+        Ok(())
     }
 
     #[test]
-    fn channel_name_empty() {
-        let name = ChannelName::new("").unwrap();
+    fn channel_name_empty() -> TestResult {
+        let name = ChannelName::new("")?;
         assert_eq!(name.as_str(), "");
+        Ok(())
     }
 
     #[test]
-    fn channel_name_max_length() {
-        let name = ChannelName::new("12345678").unwrap();
+    fn channel_name_max_length() -> TestResult {
+        let name = ChannelName::new("12345678")?;
         assert_eq!(name.as_str(), "12345678");
+        Ok(())
     }
 
     #[test]
-    fn channel_name_too_long() {
-        let err = ChannelName::new("123456789").unwrap_err();
-        assert!(matches!(
-            err,
-            ValidationError::ChannelNameTooLong { len: 9 }
-        ));
+    fn channel_name_too_long() -> TestResult {
+        let err = ChannelName::new("123456789")
+            .err()
+            .ok_or("expected ChannelNameTooLong error but got Ok")?;
+        assert!(
+            matches!(err, ValidationError::ChannelNameTooLong { len: 9 }),
+            "expected ChannelNameTooLong {{ len: 9 }}, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn channel_name_to_bytes_padded() {
-        let name = ChannelName::new("RPT1").unwrap();
+    fn channel_name_to_bytes_padded() -> TestResult {
+        let name = ChannelName::new("RPT1")?;
         let bytes = name.to_bytes();
         assert_eq!(bytes.len(), 24);
-        assert_eq!(&bytes[..4], b"RPT1");
-        assert!(bytes[4..].iter().all(|&b| b == 0));
+        assert_eq!(slice_range(&bytes, 0, 4)?, b"RPT1");
+        assert!(
+            slice_range(&bytes, 4, bytes.len())?.iter().all(|&b| b == 0),
+            "bytes[4..] should be all zero"
+        );
+        Ok(())
     }
 
     #[test]
-    fn channel_name_from_bytes() {
+    fn channel_name_from_bytes() -> TestResult {
         let mut bytes = [0u8; 24];
-        bytes[..4].copy_from_slice(b"RPT1");
+        bytes
+            .get_mut(..4)
+            .ok_or("bytes[..4] out of range")?
+            .copy_from_slice(b"RPT1");
         let name = ChannelName::from_bytes(&bytes);
         assert_eq!(name.as_str(), "RPT1");
+        Ok(())
     }
 
     // --- ChannelMemory tests ---
@@ -1013,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_memory_round_trip_simplex_vhf() {
+    fn channel_memory_round_trip_simplex_vhf() -> TestResult {
         // flags_0a_raw must be consistent with individual fields for round-trip
         // tone=bit7, shift=bits2:0=1 → flags_0a_raw = 0x81
         let ch = ChannelMemory {
@@ -1028,33 +1099,35 @@ mod tests {
             dcs_enable: false,
             cross_tone_reverse: false,
             flags_0a_raw: 0x81, // tone(bit7) + shift+(bit0)
-            tone_code: ToneCode::new(8).unwrap(),
-            ctcss_code: ToneCode::new(8).unwrap(),
-            dcs_code: DcsCode::new(0).unwrap(),
+            tone_code: ToneCode::new(8)?,
+            ctcss_code: ToneCode::new(8)?,
+            dcs_code: DcsCode::new(0)?,
             cross_tone_combo: CrossToneType::DcsOff,
             digital_squelch: FlashDigitalSquelch::Off,
-            urcall: ChannelName::new("").unwrap(),
+            urcall: ChannelName::new("")?,
             data_mode: 0,
         };
         let bytes = ch.to_bytes();
         assert_eq!(bytes.len(), 40);
-        let parsed = ChannelMemory::from_bytes(&bytes).unwrap();
+        let parsed = ChannelMemory::from_bytes(&bytes)?;
         assert_eq!(parsed, ch);
+        Ok(())
     }
 
     #[test]
-    fn channel_memory_byte08_packing() {
+    fn channel_memory_byte08_packing() -> TestResult {
         let ch = ChannelMemory {
             step_size: StepSize::Hz12500, // index 5
             shift: ShiftDirection::UP,    // 1
             ..ChannelMemory::default()
         };
         let bytes = ch.to_bytes();
-        assert_eq!(bytes[0x08], 0x51); // 5 << 4 | 1
+        assert_eq!(byte_at(&bytes, 0x08)?, 0x51); // 5 << 4 | 1
+        Ok(())
     }
 
     #[test]
-    fn channel_memory_byte09_packing() {
+    fn channel_memory_byte09_packing() -> TestResult {
         // byte[9] is now zeroed in to_bytes (mode/fine not individually modeled)
         let ch = ChannelMemory {
             reverse: true,
@@ -1063,11 +1136,12 @@ mod tests {
             ..ChannelMemory::default()
         };
         let bytes = ch.to_bytes();
-        assert_eq!(bytes[0x09], 0x00);
+        assert_eq!(byte_at(&bytes, 0x09)?, 0x00);
+        Ok(())
     }
 
     #[test]
-    fn channel_memory_byte0a_packing() {
+    fn channel_memory_byte0a_packing() -> TestResult {
         // byte[0x0A] is stored directly from flags_0a_raw (hardware-verified)
         // tone=bit7, ctcss=bit6, dcs=bit5, cross=bit4, reverse=bit3, shift=bits2:0
         let ch = ChannelMemory {
@@ -1077,11 +1151,12 @@ mod tests {
             ..ChannelMemory::default()
         };
         let bytes = ch.to_bytes();
-        assert_eq!(bytes[0x0A], 0xB0);
+        assert_eq!(byte_at(&bytes, 0x0A)?, 0xB0);
+        Ok(())
     }
 
     #[test]
-    fn channel_memory_unknown_bits_passthrough() {
+    fn channel_memory_unknown_bits_passthrough() -> TestResult {
         let ch = ChannelMemory {
             dcs_enable: false,
             cross_tone_reverse: false,
@@ -1089,34 +1164,39 @@ mod tests {
             ..ChannelMemory::default()
         };
         let bytes = ch.to_bytes();
-        assert_eq!(bytes[0x0A], 0x2B);
-        let parsed = ChannelMemory::from_bytes(&bytes).unwrap();
+        assert_eq!(byte_at(&bytes, 0x0A)?, 0x2B);
+        let parsed = ChannelMemory::from_bytes(&bytes)?;
         assert_eq!(parsed.flags_0a_raw, 0x2B);
+        Ok(())
     }
 
     #[test]
-    fn channel_memory_byte0e_packing() {
+    fn channel_memory_byte0e_packing() -> TestResult {
         let ch = ChannelMemory {
             cross_tone_combo: CrossToneType::ToneDcs,
             digital_squelch: FlashDigitalSquelch::Code,
             ..ChannelMemory::default()
         };
         let bytes = ch.to_bytes();
-        assert_eq!(bytes[0x0E], 0x1D); // (1<<4) | 0x0C | 1
+        assert_eq!(byte_at(&bytes, 0x0E)?, 0x1D); // (1<<4) | 0x0C | 1
+        Ok(())
     }
 
     #[test]
-    fn channel_memory_frequency_le_bytes() {
+    fn channel_memory_frequency_le_bytes() -> TestResult {
         let ch = ChannelMemory {
             rx_frequency: Frequency::new(145_000_000),
             tx_offset: Frequency::new(600_000),
             ..ChannelMemory::default()
         };
         let bytes = ch.to_bytes();
-        let rx = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        assert_eq!(rx, 145_000_000);
-        let tx = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        assert_eq!(tx, 600_000);
+        let rx_bytes = slice_range(&bytes, 0, 4)?;
+        let rx_arr: [u8; 4] = rx_bytes.try_into().map_err(|_| "rx_bytes length != 4")?;
+        assert_eq!(u32::from_le_bytes(rx_arr), 145_000_000);
+        let tx_bytes = slice_range(&bytes, 4, 8)?;
+        let tx_arr: [u8; 4] = tx_bytes.try_into().map_err(|_| "tx_bytes length != 4")?;
+        assert_eq!(u32::from_le_bytes(tx_arr), 600_000);
+        Ok(())
     }
 
     // --- FlashChannel tests ---
@@ -1127,15 +1207,16 @@ mod tests {
     }
 
     #[test]
-    fn flash_channel_default_round_trip() {
+    fn flash_channel_default_round_trip() -> TestResult {
         let ch = FlashChannel::default();
         let bytes = ch.to_bytes();
-        let parsed = FlashChannel::from_bytes(&bytes).unwrap();
+        let parsed = FlashChannel::from_bytes(&bytes)?;
         assert_eq!(parsed, ch);
+        Ok(())
     }
 
     #[test]
-    fn flash_channel_mode_encoding() {
+    fn flash_channel_mode_encoding() -> TestResult {
         use crate::types::mode::MemoryMode;
         // Flash mode encoding: FM=0, DV=1, AM=2, LSB=3, USB=4, CW=5, NFM=6, DR=7
         for (raw, expected) in [
@@ -1155,13 +1236,14 @@ mod tests {
             let bytes = ch.to_bytes();
             // Mode is at byte 0x09 bits [6:4]
             assert_eq!(
-                (bytes[0x09] >> 4) & 0x07,
+                (byte_at(&bytes, 0x09)? >> 4) & 0x07,
                 raw,
                 "mode {expected} should encode as {raw}"
             );
-            let parsed = FlashChannel::from_bytes(&bytes).unwrap();
+            let parsed = FlashChannel::from_bytes(&bytes)?;
             assert_eq!(parsed.mode, expected);
         }
+        Ok(())
     }
 
     #[test]
@@ -1175,7 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn flash_channel_byte09_packing() {
+    fn flash_channel_byte09_packing() -> TestResult {
         let ch = FlashChannel {
             mode: MemoryMode::Am,        // 2 -> bits [6:4] = 0b010
             narrow: true,                // bit 3
@@ -1186,16 +1268,17 @@ mod tests {
         };
         let bytes = ch.to_bytes();
         // Expected: 0b0_010_1_1_11 = 0x2F
-        assert_eq!(bytes[0x09], 0x2F);
-        let parsed = FlashChannel::from_bytes(&bytes).unwrap();
+        assert_eq!(byte_at(&bytes, 0x09)?, 0x2F);
+        let parsed = FlashChannel::from_bytes(&bytes)?;
         assert_eq!(parsed.mode, MemoryMode::Am);
         assert!(parsed.narrow);
         assert!(parsed.fine_mode);
         assert_eq!(parsed.fine_step, FineStep::Hz1000);
+        Ok(())
     }
 
     #[test]
-    fn flash_channel_byte0a_tone_duplex() {
+    fn flash_channel_byte0a_tone_duplex() -> TestResult {
         let ch = FlashChannel {
             tone_enabled: true,         // bit 7
             ctcss_enabled: false,       // bit 6
@@ -1208,41 +1291,43 @@ mod tests {
         };
         let bytes = ch.to_bytes();
         // Expected: 0b1_0_1_0_0_1_10 = 0xA6
-        assert_eq!(bytes[0x0A], 0xA6);
-        let parsed = FlashChannel::from_bytes(&bytes).unwrap();
+        assert_eq!(byte_at(&bytes, 0x0A)?, 0xA6);
+        let parsed = FlashChannel::from_bytes(&bytes)?;
         assert!(parsed.tone_enabled);
         assert!(!parsed.ctcss_enabled);
         assert!(parsed.dtcs_enabled);
         assert!(!parsed.cross_tone);
         assert!(parsed.split);
         assert_eq!(parsed.duplex, FlashDuplex::Minus);
+        Ok(())
     }
 
     #[test]
-    fn flash_channel_dstar_callsigns() {
+    fn flash_channel_dstar_callsigns() -> TestResult {
         use crate::types::dstar::DstarCallsign;
         let ch = FlashChannel {
-            ur_call: DstarCallsign::new("CQCQCQ").unwrap(),
-            rpt1: DstarCallsign::new("W4BFB B").unwrap(),
-            rpt2: DstarCallsign::new("W4BFB G").unwrap(),
+            ur_call: DstarCallsign::new("CQCQCQ").ok_or("invalid UR callsign")?,
+            rpt1: DstarCallsign::new("W4BFB B").ok_or("invalid RPT1 callsign")?,
+            rpt2: DstarCallsign::new("W4BFB G").ok_or("invalid RPT2 callsign")?,
             ..FlashChannel::default()
         };
         let bytes = ch.to_bytes();
         // UR at 0x0F-0x16 (8 bytes, space-padded)
-        assert_eq!(&bytes[0x0F..0x17], b"CQCQCQ  ");
+        assert_eq!(slice_range(&bytes, 0x0F, 0x17)?, b"CQCQCQ  ");
         // RPT1 at 0x17-0x1E
-        assert_eq!(&bytes[0x17..0x1F], b"W4BFB B ");
+        assert_eq!(slice_range(&bytes, 0x17, 0x1F)?, b"W4BFB B ");
         // RPT2 at 0x1F-0x26
-        assert_eq!(&bytes[0x1F..0x27], b"W4BFB G ");
+        assert_eq!(slice_range(&bytes, 0x1F, 0x27)?, b"W4BFB G ");
 
-        let parsed = FlashChannel::from_bytes(&bytes).unwrap();
+        let parsed = FlashChannel::from_bytes(&bytes)?;
         assert_eq!(parsed.ur_call.as_str(), "CQCQCQ");
         assert_eq!(parsed.rpt1.as_str(), "W4BFB B");
         assert_eq!(parsed.rpt2.as_str(), "W4BFB G");
+        Ok(())
     }
 
     #[test]
-    fn flash_channel_byte0e_cross_tone_digital_squelch() {
+    fn flash_channel_byte0e_cross_tone_digital_squelch() -> TestResult {
         let ch = FlashChannel {
             cross_tone_type: CrossToneType::DcsCtcss, // bits [5:4] = 2
             digital_squelch: FlashDigitalSquelch::Callsign, // bits [1:0] = 2
@@ -1251,28 +1336,30 @@ mod tests {
         };
         let bytes = ch.to_bytes();
         // Expected: 0b00_10_00_10 = 0x22
-        assert_eq!(bytes[0x0E], 0x22);
-        let parsed = FlashChannel::from_bytes(&bytes).unwrap();
+        assert_eq!(byte_at(&bytes, 0x0E)?, 0x22);
+        let parsed = FlashChannel::from_bytes(&bytes)?;
         assert_eq!(parsed.cross_tone_type, CrossToneType::DcsCtcss);
         assert_eq!(parsed.digital_squelch, FlashDigitalSquelch::Callsign);
+        Ok(())
     }
 
     #[test]
-    fn flash_channel_dv_code() {
+    fn flash_channel_dv_code() -> TestResult {
         let ch = FlashChannel {
             dv_code: 42,
             byte27_bit7: true,
             ..FlashChannel::default()
         };
         let bytes = ch.to_bytes();
-        assert_eq!(bytes[0x27], 0x80 | 0x2A);
-        let parsed = FlashChannel::from_bytes(&bytes).unwrap();
+        assert_eq!(byte_at(&bytes, 0x27)?, 0x80 | 0x2A);
+        let parsed = FlashChannel::from_bytes(&bytes)?;
         assert_eq!(parsed.dv_code, 42);
         assert!(parsed.byte27_bit7);
+        Ok(())
     }
 
     #[test]
-    fn flash_channel_full_round_trip() {
+    fn flash_channel_full_round_trip() -> TestResult {
         use crate::types::dstar::DstarCallsign;
         let ch = FlashChannel {
             rx_frequency: Frequency::new(146_520_000),
@@ -1291,35 +1378,39 @@ mod tests {
             byte0a_bit3: false,
             split: false,
             duplex: FlashDuplex::Plus,
-            tone_code: ToneCode::new(8).unwrap(),
-            ctcss_code: ToneCode::new(12).unwrap(),
+            tone_code: ToneCode::new(8)?,
+            ctcss_code: ToneCode::new(12)?,
             byte0c_high: 0,
-            dcs_code: DcsCode::new(5).unwrap(),
+            dcs_code: DcsCode::new(5)?,
             byte0d_bit7: false,
             cross_tone_type: CrossToneType::ToneDcs,
             digital_squelch: FlashDigitalSquelch::Code,
             byte0e_reserved: 0,
-            ur_call: DstarCallsign::new("CQCQCQ").unwrap(),
-            rpt1: DstarCallsign::new("W4BFB B").unwrap(),
-            rpt2: DstarCallsign::new("W4BFB G").unwrap(),
+            ur_call: DstarCallsign::new("CQCQCQ").ok_or("invalid UR callsign")?,
+            rpt1: DstarCallsign::new("W4BFB B").ok_or("invalid RPT1 callsign")?,
+            rpt2: DstarCallsign::new("W4BFB G").ok_or("invalid RPT2 callsign")?,
             dv_code: 99,
             byte27_bit7: false,
         };
         let bytes = ch.to_bytes();
         assert_eq!(bytes.len(), 40);
-        let parsed = FlashChannel::from_bytes(&bytes).unwrap();
+        let parsed = FlashChannel::from_bytes(&bytes)?;
         assert_eq!(parsed, ch);
+        Ok(())
     }
 
     #[test]
     fn flash_channel_too_short() {
         let bytes = [0u8; 39];
         let err = FlashChannel::from_bytes(&bytes);
-        assert!(err.is_err());
+        assert!(
+            err.is_err(),
+            "expected from_bytes to reject 39-byte input: {err:?}"
+        );
     }
 
     #[test]
-    fn flash_channel_reserved_bits_preserved() {
+    fn flash_channel_reserved_bits_preserved() -> TestResult {
         let ch = FlashChannel {
             byte0c_high: 0x03,
             byte0d_bit7: true,
@@ -1329,12 +1420,13 @@ mod tests {
             ..FlashChannel::default()
         };
         let bytes = ch.to_bytes();
-        let parsed = FlashChannel::from_bytes(&bytes).unwrap();
+        let parsed = FlashChannel::from_bytes(&bytes)?;
         assert_eq!(parsed.byte0c_high, 0x03);
         assert!(parsed.byte0d_bit7);
         assert_eq!(parsed.byte0e_reserved, 0xCC);
         assert!(parsed.byte0a_bit3);
         assert!(parsed.byte09_bit7);
+        Ok(())
     }
 
     #[test]
@@ -1346,29 +1438,32 @@ mod tests {
     }
 
     #[test]
-    fn flash_duplex_round_trip() {
+    fn flash_duplex_round_trip() -> TestResult {
         for i in 0u8..FlashDuplex::COUNT {
-            let d = FlashDuplex::try_from(i).unwrap();
+            let d = FlashDuplex::try_from(i)?;
             assert_eq!(u8::from(d), i);
         }
         assert!(FlashDuplex::try_from(FlashDuplex::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn cross_tone_type_round_trip() {
+    fn cross_tone_type_round_trip() -> TestResult {
         for i in 0u8..CrossToneType::COUNT {
-            let ct = CrossToneType::try_from(i).unwrap();
+            let ct = CrossToneType::try_from(i)?;
             assert_eq!(u8::from(ct), i);
         }
         assert!(CrossToneType::try_from(CrossToneType::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn flash_digital_squelch_round_trip() {
+    fn flash_digital_squelch_round_trip() -> TestResult {
         for i in 0u8..FlashDigitalSquelch::COUNT {
-            let ds = FlashDigitalSquelch::try_from(i).unwrap();
+            let ds = FlashDigitalSquelch::try_from(i)?;
             assert_eq!(u8::from(ds), i);
         }
         assert!(FlashDigitalSquelch::try_from(FlashDigitalSquelch::COUNT).is_err());
+        Ok(())
     }
 }

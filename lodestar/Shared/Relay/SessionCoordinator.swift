@@ -34,8 +34,23 @@ public final class SessionCoordinator {
     }
 
     /// Start watching for precondition changes. Idempotent.
+    ///
+    /// Also kicks off per-coordinator auto-connect attempts. Both are
+    /// guarded internally — `tryAutoConnect()` no-ops when its toggle
+    /// is off, when a session is already live, or when the remembered
+    /// identifier isn't available on the device.
     public func activate() {
         guard preconditionsTask == nil else { return }
+        // Kick off auto-connect in the background — it guards on its
+        // own preconditions, so this is safe to call unconditionally
+        // every time the view reappears.
+        let transport = self.transport
+        let reflector = self.reflector
+        Task { @MainActor in
+            await transport.tryAutoConnect()
+            await reflector.tryAutoConnect()
+        }
+
         // Poll the two coordinators at a low duty cycle and reconcile
         // the relay state. `@MainActor` isolation makes the reads
         // trivial; `reconcileRelay` is idempotent so there's no harm
@@ -53,6 +68,22 @@ public final class SessionCoordinator {
     public func deactivate() {
         preconditionsTask?.cancel()
         preconditionsTask = nil
+    }
+
+    /// Graceful shutdown: send the reflector unlink packet and close
+    /// the radio transport so the reflector clears our session
+    /// immediately instead of waiting ~30–60 s for keepalive timeout.
+    /// Called on `scenePhase` transitions to `.background` / `.inactive`
+    /// so the next launch's auto-connect lands cleanly.
+    public func shutdown() async {
+        deactivate()
+        await relay.stop()
+        if reflector.state == .connected {
+            await reflector.disconnect()
+        }
+        if case .connected = transport.state {
+            await transport.disconnect()
+        }
     }
 
     /// `true` iff the radio is in MMDVM mode and the reflector session

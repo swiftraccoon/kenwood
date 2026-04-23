@@ -247,7 +247,14 @@ pub(crate) async fn step_down<T: Transport>(radio: &mut Radio<T>, args: &[&str])
 // ---------------------------------------------------------------------------
 
 /// Tune a band to a specific frequency in megahertz. Args: `<a|b> <mhz>`.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Frequencies are entered in megahertz (e.g. 146.52), multiplied by 1_000_000 to yield \
+              at most ~1.3e9 — well within u32 range. The parsed f64 is always non-negative since \
+              the radio's supported bands are all positive frequencies, so the `as u32` truncation \
+              and sign-loss are both fine."
+)]
 pub(crate) async fn tune<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     if args.len() < 2 {
         aprintln!("Usage: tune <a or b> <frequency in megahertz>");
@@ -462,7 +469,13 @@ pub(crate) async fn set_power<T: Transport>(radio: &mut Radio<T>, args: &[&str])
 
 /// Read or set voice-operated transmit (VOX) settings.
 /// Args: `[on|off]`, `gain [0-9]`, or `delay [0-6]`.
-#[allow(clippy::cognitive_complexity)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "Dispatch for the `vox` command: four sub-command arms (`gain`, `delay`, on/off, \
+              read) each fork into parse-success/parse-failure plus radio-Ok/Err branches. \
+              Splitting into helpers would require passing `&mut Radio<T>` around and multiply \
+              lifetime noise without clarifying the straightforward command structure."
+)]
 pub(crate) async fn vox<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     match args.first().map(|s| s.to_lowercase()).as_deref() {
         Some("gain") => {
@@ -730,7 +743,13 @@ pub(crate) async fn unreflector<T: Transport>(radio: &mut Radio<T>) {
 /// radio gives us and only fall through to `"not available"` on
 /// an actual transport error. This keeps the command useful as a
 /// one-shot snapshot.
-#[allow(clippy::cognitive_complexity)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "`status` intentionally enumerates every per-field fetch so a single flaky CAT \
+              command can't prevent the rest of the snapshot from printing. The linear list of \
+              if-let branches is the simplest way to encode that independence; extracting \
+              helpers would only hide the structure behind noise."
+)]
 pub(crate) async fn status<T: Transport>(radio: &mut Radio<T>) {
     aprintln!("Reading radio status, please wait.");
 

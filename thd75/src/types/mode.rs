@@ -581,14 +581,17 @@ mod tests {
     use super::*;
     use crate::error::ValidationError;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     // --- Mode ---
 
     #[test]
-    fn mode_valid_range() {
+    fn mode_valid_range() -> TestResult {
         for i in 0u8..Mode::COUNT {
-            let val = Mode::try_from(i).unwrap();
+            let val = Mode::try_from(i)?;
             assert_eq!(u8::from(val), i, "Mode round-trip failed at {i}");
         }
+        Ok(())
     }
 
     #[test]
@@ -598,17 +601,24 @@ mod tests {
     }
 
     #[test]
-    fn mode_round_trip() {
+    fn mode_round_trip() -> TestResult {
         for i in 0u8..Mode::COUNT {
-            let val = Mode::try_from(i).unwrap();
+            let val = Mode::try_from(i)?;
             assert_eq!(u8::from(val), i);
         }
+        Ok(())
     }
 
     #[test]
-    fn mode_error_variant() {
-        let err = Mode::try_from(Mode::COUNT).unwrap_err();
-        assert!(matches!(err, ValidationError::ModeOutOfRange(10)));
+    fn mode_error_variant() -> TestResult {
+        let err = Mode::try_from(Mode::COUNT)
+            .err()
+            .ok_or("expected ModeOutOfRange error but got Ok")?;
+        assert!(
+            matches!(err, ValidationError::ModeOutOfRange(10)),
+            "expected ModeOutOfRange(10), got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -628,11 +638,12 @@ mod tests {
     // --- PowerLevel ---
 
     #[test]
-    fn power_level_valid_range() {
+    fn power_level_valid_range() -> TestResult {
         for i in 0u8..PowerLevel::COUNT {
-            let val = PowerLevel::try_from(i).unwrap();
+            let val = PowerLevel::try_from(i)?;
             assert_eq!(u8::from(val), i, "PowerLevel round-trip failed at {i}");
         }
+        Ok(())
     }
 
     #[test]
@@ -642,17 +653,24 @@ mod tests {
     }
 
     #[test]
-    fn power_level_round_trip() {
+    fn power_level_round_trip() -> TestResult {
         for i in 0u8..PowerLevel::COUNT {
-            let val = PowerLevel::try_from(i).unwrap();
+            let val = PowerLevel::try_from(i)?;
             assert_eq!(u8::from(val), i);
         }
+        Ok(())
     }
 
     #[test]
-    fn power_level_error_variant() {
-        let err = PowerLevel::try_from(PowerLevel::COUNT).unwrap_err();
-        assert!(matches!(err, ValidationError::PowerLevelOutOfRange(4)));
+    fn power_level_error_variant() -> TestResult {
+        let err = PowerLevel::try_from(PowerLevel::COUNT)
+            .err()
+            .ok_or("expected PowerLevelOutOfRange error but got Ok")?;
+        assert!(
+            matches!(err, ValidationError::PowerLevelOutOfRange(4)),
+            "expected PowerLevelOutOfRange(4), got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -666,12 +684,13 @@ mod tests {
     // --- ShiftDirection ---
 
     #[test]
-    fn shift_direction_valid_range() {
+    fn shift_direction_valid_range() -> TestResult {
         // All 4-bit values (0-15) are valid.
         for i in 0u8..=15 {
-            let val = ShiftDirection::try_from(i).unwrap();
+            let val = ShiftDirection::try_from(i)?;
             assert_eq!(u8::from(val), i, "ShiftDirection round-trip failed at {i}");
         }
+        Ok(())
     }
 
     #[test]
@@ -681,11 +700,12 @@ mod tests {
     }
 
     #[test]
-    fn shift_direction_round_trip() {
+    fn shift_direction_round_trip() -> TestResult {
         for i in 0u8..=15 {
-            let val = ShiftDirection::try_from(i).unwrap();
+            let val = ShiftDirection::try_from(i)?;
             assert_eq!(u8::from(val), i);
         }
+        Ok(())
     }
 
     #[test]
@@ -699,27 +719,35 @@ mod tests {
     }
 
     #[test]
-    fn shift_direction_extended_vfo_values() {
+    fn shift_direction_extended_vfo_values() -> TestResult {
         // Values 4-15 are valid but not "known" named shift modes.
-        let ext = ShiftDirection::new(8).unwrap();
+        let ext = ShiftDirection::new(8)?;
         assert_eq!(ext.as_u8(), 8);
         assert!(!ext.is_known());
+        Ok(())
     }
 
     #[test]
-    fn shift_direction_error_variant() {
-        let err = ShiftDirection::try_from(16).unwrap_err();
-        assert!(matches!(err, ValidationError::ShiftOutOfRange(16)));
+    fn shift_direction_error_variant() -> TestResult {
+        let err = ShiftDirection::try_from(16)
+            .err()
+            .ok_or("expected ShiftOutOfRange error but got Ok")?;
+        assert!(
+            matches!(err, ValidationError::ShiftOutOfRange(16)),
+            "expected ShiftOutOfRange(16), got {err:?}"
+        );
+        Ok(())
     }
 
     // --- StepSize ---
 
     #[test]
-    fn step_size_valid_range() {
+    fn step_size_valid_range() -> TestResult {
         for i in 0u8..StepSize::COUNT {
-            let val = StepSize::try_from(i).unwrap();
+            let val = StepSize::try_from(i)?;
             assert_eq!(u8::from(val), i, "StepSize round-trip failed at {i}");
         }
+        Ok(())
     }
 
     #[test]
@@ -729,17 +757,24 @@ mod tests {
     }
 
     #[test]
-    fn step_size_round_trip() {
+    fn step_size_round_trip() -> TestResult {
         for i in 0u8..StepSize::COUNT {
-            let val = StepSize::try_from(i).unwrap();
+            let val = StepSize::try_from(i)?;
             assert_eq!(u8::from(val), i);
         }
+        Ok(())
     }
 
     #[test]
-    fn step_size_error_variant() {
-        let err = StepSize::try_from(StepSize::COUNT).unwrap_err();
-        assert!(matches!(err, ValidationError::StepSizeOutOfRange(12)));
+    fn step_size_error_variant() -> TestResult {
+        let err = StepSize::try_from(StepSize::COUNT)
+            .err()
+            .ok_or("expected StepSizeOutOfRange error but got Ok")?;
+        assert!(
+            matches!(err, ValidationError::StepSizeOutOfRange(12)),
+            "expected StepSizeOutOfRange(12), got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -784,11 +819,12 @@ mod tests {
     // --- MemoryMode ---
 
     #[test]
-    fn memory_mode_valid_range() {
+    fn memory_mode_valid_range() -> TestResult {
         for i in 0u8..MemoryMode::COUNT {
-            let val = MemoryMode::try_from(i).unwrap();
+            let val = MemoryMode::try_from(i)?;
             assert_eq!(u8::from(val), i, "MemoryMode round-trip failed at {i}");
         }
+        Ok(())
     }
 
     #[test]
@@ -798,17 +834,24 @@ mod tests {
     }
 
     #[test]
-    fn memory_mode_round_trip() {
+    fn memory_mode_round_trip() -> TestResult {
         for i in 0u8..MemoryMode::COUNT {
-            let val = MemoryMode::try_from(i).unwrap();
+            let val = MemoryMode::try_from(i)?;
             assert_eq!(u8::from(val), i);
         }
+        Ok(())
     }
 
     #[test]
-    fn memory_mode_error_variant() {
-        let err = MemoryMode::try_from(MemoryMode::COUNT).unwrap_err();
-        assert!(matches!(err, ValidationError::MemoryModeOutOfRange(8)));
+    fn memory_mode_error_variant() -> TestResult {
+        let err = MemoryMode::try_from(MemoryMode::COUNT)
+            .err()
+            .ok_or("expected MemoryModeOutOfRange error but got Ok")?;
+        assert!(
+            matches!(err, ValidationError::MemoryModeOutOfRange(8)),
+            "expected MemoryModeOutOfRange(8), got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -839,15 +882,16 @@ mod tests {
     // --- CoarseStepMultiplier ---
 
     #[test]
-    fn coarse_step_multiplier_valid_range() {
+    fn coarse_step_multiplier_valid_range() -> TestResult {
         for i in 0u8..CoarseStepMultiplier::COUNT {
-            let val = CoarseStepMultiplier::try_from(i).unwrap();
+            let val = CoarseStepMultiplier::try_from(i)?;
             assert_eq!(
                 u8::from(val),
                 i,
                 "CoarseStepMultiplier round-trip failed at {i}"
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -857,11 +901,12 @@ mod tests {
     }
 
     #[test]
-    fn coarse_step_multiplier_round_trip() {
+    fn coarse_step_multiplier_round_trip() -> TestResult {
         for i in 0u8..CoarseStepMultiplier::COUNT {
-            let val = CoarseStepMultiplier::try_from(i).unwrap();
+            let val = CoarseStepMultiplier::try_from(i)?;
             assert_eq!(u8::from(val), i);
         }
+        Ok(())
     }
 
     #[test]

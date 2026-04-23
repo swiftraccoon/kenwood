@@ -43,31 +43,5 @@ tracing-appender = "0.2"
 time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 dirs-next = "2"
 
-[lints.rust]
-unsafe_code = "deny"
-missing_docs = "deny"
-missing_debug_implementations = "deny"
-unreachable_pub = "deny"
-unused_results = "deny"
-elided_lifetimes_in_paths = "deny"
-trivial_casts = "deny"
-trivial_numeric_casts = "deny"
-unused_qualifications = "deny"
-non_ascii_idents = "deny"
-single_use_lifetimes = "deny"
-let_underscore_drop = "deny"
-unused_crate_dependencies = "deny"
-unused_import_braces = "deny"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-cargo = { level = "deny", priority = -1 }
-restriction = { level = "allow", priority = -1 }
-module_name_repetitions = "allow"
-multiple_crate_versions = "allow"
-# Binary crate with private modules: `pub(crate)` is what
-# `unreachable_pub` wants, but the module being non-public trips
-# `redundant_pub_crate`. Same pattern as `thd75-repl`.
-redundant_pub_crate = "allow"
+[lints]
+workspace = true

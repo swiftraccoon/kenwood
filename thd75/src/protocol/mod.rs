@@ -29,7 +29,13 @@ pub mod vfo;
 pub use codec::Codec;
 
 use crate::error::ProtocolError;
-#[allow(unused_imports)]
+#[expect(
+    unused_imports,
+    reason = "Broad re-export of every D75 type the protocol layer constructs. Some variants \
+              only appear behind `#[cfg(test)]` paths or in docstrings; the umbrella import \
+              keeps the `use` block consistent with the enum variants regardless of which \
+              features/targets are enabled."
+)]
 use crate::types::{
     AfGainLevel, Band, BeaconMode, CallsignSlot, ChannelMemory, DetectOutputMode, DstarSlot,
     DvGatewayMode, FilterMode, FilterWidthIndex, FineStep, GpsRadioMode, KeyLockType, Mode,
@@ -39,7 +45,6 @@ use crate::types::{
 
 /// A CAT command to send to the radio.
 #[derive(Debug, Clone)]
-#[allow(clippy::module_name_repetitions)]
 pub enum Command {
     // === Core (FQ, FO, FV, PS, ID, PC, BC, VM, FR) ===
     /// Get frequency (FQ read).
@@ -776,7 +781,6 @@ pub enum Command {
     /// Set GPS NMEA sentence enable flags (GS write).
     ///
     /// Sets 6 boolean flags for GGA, GLL, GSA, GSV, RMC, VTG.
-    #[allow(clippy::struct_excessive_bools)]
     SetGpsSentences {
         /// GGA (Global Positioning System Fix Data) enabled.
         gga: bool,
@@ -1123,7 +1127,6 @@ pub enum Command {
 
 /// A parsed response from the radio.
 #[derive(Debug, Clone)]
-#[allow(clippy::module_name_repetitions)]
 pub enum Response {
     // === Core ===
     /// Frequency response (FQ).
@@ -1689,7 +1692,13 @@ pub const fn command_name(cmd: &Command) -> &'static str {
 /// Converts a [`Command`] into the byte sequence expected by the radio's
 /// CAT protocol. Each serialized command ends with a carriage return.
 #[must_use]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Dispatch table over every CAT Command variant — one match arm per command is the \
+              clearest mapping of the Command enum to its wire format. Splitting by submodule \
+              would hide the complete command inventory; fall-through helpers already exist \
+              (core::serialize_core_write, memory::serialize_memory_write, etc.)."
+)]
 pub fn serialize(cmd: &Command) -> Vec<u8> {
     let cmd_mnemonic = command_name(cmd);
     tracing::debug!(command = %cmd_mnemonic, "serializing command");
@@ -2035,10 +2044,13 @@ pub fn parse(frame: &[u8]) -> Result<Response, ProtocolError> {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn parse_error_response() {
-        let r = parse(b"?").unwrap();
+    fn parse_error_response() -> TestResult {
+        let r = parse(b"?")?;
         assert!(matches!(r, Response::Error));
+        Ok(())
     }
 
     #[test]
@@ -2060,15 +2072,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_ty_response() {
-        let r = parse(b"TY K,2").unwrap();
-        match r {
-            Response::RadioType { region, variant } => {
-                assert_eq!(region, "K");
-                assert_eq!(variant, 2);
-            }
-            other => panic!("expected RadioType, got {other:?}"),
-        }
+    fn parse_ty_response() -> TestResult {
+        let r = parse(b"TY K,2")?;
+        let Response::RadioType { region, variant } = r else {
+            return Err(format!("expected RadioType, got {r:?}").into());
+        };
+        assert_eq!(region, "K");
+        assert_eq!(variant, 2);
+        Ok(())
     }
 
     #[test]
@@ -2084,13 +2095,14 @@ mod tests {
     }
 
     #[test]
-    fn serialize_set_dstar_callsign() {
+    fn serialize_set_dstar_callsign() -> TestResult {
         let bytes = serialize(&Command::SetDstarCallsign {
-            slot: DstarSlot::new(1).unwrap(),
+            slot: DstarSlot::new(1)?,
             callsign: "KQ4NIT  ".to_owned(),
             suffix: "D75A".to_owned(),
         });
         assert_eq!(bytes, b"DC 1,KQ4NIT  ,D75A\r");
+        Ok(())
     }
 
     #[test]
@@ -2100,12 +2112,13 @@ mod tests {
     }
 
     #[test]
-    fn serialize_set_smeter() {
+    fn serialize_set_smeter() -> TestResult {
         let bytes = serialize(&Command::SetSmeter {
             band: Band::B,
-            level: SMeterReading::new(5).unwrap(),
+            level: SMeterReading::new(5)?,
         });
         assert_eq!(bytes, b"SM 1,5\r");
+        Ok(())
     }
 
     #[test]
@@ -2161,7 +2174,7 @@ mod tests {
     }
 
     #[test]
-    fn all_mnemonics_recognized() {
+    fn all_mnemonics_recognized() -> TestResult {
         // All 55 standard mnemonics + 15 service mode mnemonics.
         // SR is write-only but its echo is still recognized by the parser.
         let mnemonics = [
@@ -2180,10 +2193,11 @@ mod tests {
             let input = format!("{mnemonic} 0");
             let result = parse(input.as_bytes());
             if let Err(ProtocolError::UnknownCommand(_)) = result {
-                panic!("Mnemonic '{mnemonic}' not recognized by parser");
+                return Err(format!("Mnemonic '{mnemonic}' not recognized by parser").into());
             }
             // Other errors (FieldParse, etc.) are OK — the test only checks recognition
         }
+        Ok(())
     }
 
     // === Service mode serialization tests ===
@@ -2365,65 +2379,70 @@ mod tests {
     // === Service mode parse tests ===
 
     #[test]
-    fn parse_service_mode_response() {
-        let r = parse(b"0G").unwrap();
+    fn parse_service_mode_response() -> TestResult {
+        let r = parse(b"0G")?;
         assert!(matches!(r, Response::ServiceMode { .. }));
+        Ok(())
     }
 
     #[test]
-    fn parse_service_calibration_data() {
-        let r = parse(b"0S AABBCCDD").unwrap();
-        match r {
-            Response::ServiceCalibrationData { data } => assert_eq!(data, "AABBCCDD"),
-            other => panic!("expected ServiceCalibrationData, got {other:?}"),
-        }
+    fn parse_service_calibration_data() -> TestResult {
+        let r = parse(b"0S AABBCCDD")?;
+        let Response::ServiceCalibrationData { data } = r else {
+            return Err(format!("expected ServiceCalibrationData, got {r:?}").into());
+        };
+        assert_eq!(data, "AABBCCDD");
+        Ok(())
     }
 
     #[test]
-    fn parse_service_calibration_param_1a() {
-        let r = parse(b"1A 123").unwrap();
-        match r {
-            Response::ServiceCalibrationParam { mnemonic, data } => {
-                assert_eq!(mnemonic, "1A");
-                assert_eq!(data, "123");
-            }
-            other => panic!("expected ServiceCalibrationParam, got {other:?}"),
-        }
+    fn parse_service_calibration_param_1a() -> TestResult {
+        let r = parse(b"1A 123")?;
+        let Response::ServiceCalibrationParam { mnemonic, data } = r else {
+            return Err(format!("expected ServiceCalibrationParam, got {r:?}").into());
+        };
+        assert_eq!(mnemonic, "1A");
+        assert_eq!(data, "123");
+        Ok(())
     }
 
     #[test]
-    fn parse_service_version() {
-        let r = parse(b"2V EX-5210").unwrap();
-        match r {
-            Response::ServiceVersion { data } => assert_eq!(data, "EX-5210"),
-            other => panic!("expected ServiceVersion, got {other:?}"),
-        }
+    fn parse_service_version() -> TestResult {
+        let r = parse(b"2V EX-5210")?;
+        let Response::ServiceVersion { data } = r else {
+            return Err(format!("expected ServiceVersion, got {r:?}").into());
+        };
+        assert_eq!(data, "EX-5210");
+        Ok(())
     }
 
     #[test]
-    fn parse_service_hardware() {
-        let r = parse(b"1G AA,BB").unwrap();
-        match r {
-            Response::ServiceHardware { data } => assert_eq!(data, "AA,BB"),
-            other => panic!("expected ServiceHardware, got {other:?}"),
-        }
+    fn parse_service_hardware() -> TestResult {
+        let r = parse(b"1G AA,BB")?;
+        let Response::ServiceHardware { data } = r else {
+            return Err(format!("expected ServiceHardware, got {r:?}").into());
+        };
+        assert_eq!(data, "AA,BB");
+        Ok(())
     }
 
     #[test]
-    fn parse_service_eeprom_data() {
-        let r = parse(b"9E AABBCCDD").unwrap();
-        match r {
-            Response::ServiceEepromData { data } => assert_eq!(data, "AABBCCDD"),
-            other => panic!("expected ServiceEepromData, got {other:?}"),
-        }
+    fn parse_service_eeprom_data() -> TestResult {
+        let r = parse(b"9E AABBCCDD")?;
+        let Response::ServiceEepromData { data } = r else {
+            return Err(format!("expected ServiceEepromData, got {r:?}").into());
+        };
+        assert_eq!(data, "AABBCCDD");
+        Ok(())
     }
 
     #[test]
-    fn parse_service_eeprom_addr() {
-        let r = parse(b"9R 01020304").unwrap();
-        match r {
-            Response::ServiceEepromAddr { data } => assert_eq!(data, "01020304"),
-            other => panic!("expected ServiceEepromAddr, got {other:?}"),
-        }
+    fn parse_service_eeprom_addr() -> TestResult {
+        let r = parse(b"9R 01020304")?;
+        let Response::ServiceEepromAddr { data } = r else {
+            return Err(format!("expected ServiceEepromAddr, got {r:?}").into());
+        };
+        assert_eq!(data, "01020304");
+        Ok(())
     }
 }

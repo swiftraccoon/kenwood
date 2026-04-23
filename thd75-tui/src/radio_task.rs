@@ -55,7 +55,21 @@ pub(crate) fn discover_and_open_transport(
 /// - `bt_req_tx` / `bt_resp_rx`: channels for requesting BT reconnect from
 ///   the main thread (`IOBluetooth` RFCOMM must be opened on main).
 /// - `cmd_rx`: channel for receiving user commands from the TUI.
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    reason = "`bt_req_tx` and `bt_resp_rx` (and internally `bt_req_rx`/`bt_resp_tx`) form \
+              the canonical request/response channel pair for the main-thread IOBluetooth \
+              reconnect path. The names are structurally parallel by design — renaming \
+              would obscure which channel is the request side and which is the response \
+              side. The channel pair exists because IOBluetooth RFCOMM reconnect must run \
+              on the process main thread (Cocoa run loop); the radio task lives on a \
+              tokio worker and dispatches reconnect requests across this channel pair. \
+              `too_many_lines` fires because the function owns the entire radio task loop \
+              (command polling + event handling + BT reconnect dance) in a single \
+              `tokio::select!` over MPSC receivers — splitting would require channel \
+              plumbing for no reader benefit."
+)]
 pub(crate) async fn spawn_with_transport(
     path: String,
     transport: EitherTransport,
@@ -601,7 +615,16 @@ macro_rules! global_read {
     };
 }
 
-#[allow(clippy::cognitive_complexity)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "`poll_once` issues every CAT read the TUI displays — band A/B state, battery, \
+              GPS, filter widths, VOX, beacon, AI-gated meter — in a single dump per \
+              refresh cycle. Each individual read is simple; the combined function looks \
+              complex to clippy because it orchestrates ~20 serial CAT round-trips. \
+              Splitting by subsystem would force multiple concurrent `Radio<T>` borrows \
+              (which is impossible) or a second layer of channel plumbing for no reader \
+              benefit — the whole point is `poll_once` owns the radio for one atomic pass."
+)]
 async fn poll_once(
     radio: &mut Radio<EitherTransport>,
     s_meter_a: SMeterReading,

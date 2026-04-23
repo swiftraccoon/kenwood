@@ -8,6 +8,17 @@ use kenwood_thd75::error::ValidationError;
 use kenwood_thd75::types::tone::{CTCSS_FREQUENCIES, DCS_CODES};
 use kenwood_thd75::types::*;
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+type BoxErr = Box<dyn std::error::Error>;
+
+/// Return `table[idx]` or an error if the index is out of range.
+fn entry<T: Copy>(table: &[T], idx: usize, name: &str) -> Result<T, BoxErr> {
+    table
+        .get(idx)
+        .copied()
+        .ok_or_else(|| format!("{name}[{idx}] out of range (len={})", table.len()).into())
+}
+
 // ============================================================================
 // 1. Boundary tests — exact boundary for each validated type (12 tests)
 // ============================================================================
@@ -178,47 +189,51 @@ fn dcs_code_index_boundary() {
 // ============================================================================
 
 #[test]
-fn tone_code_full_valid_range() {
+fn tone_code_full_valid_range() -> TestResult {
     for i in 0u8..=ToneCode::MAX_INDEX {
-        let val = ToneCode::new(i).unwrap();
+        let val = ToneCode::new(i)?;
         assert_eq!(val.index(), i, "ToneCode round-trip failed at {i}");
     }
     for i in (ToneCode::MAX_INDEX + 1)..=255 {
         assert!(ToneCode::new(i).is_err(), "ToneCode({i}) should be invalid");
     }
+    Ok(())
 }
 
 #[test]
-fn band_full_valid_range() {
+fn band_full_valid_range() -> TestResult {
     for i in 0u8..Band::COUNT {
-        let val = Band::try_from(i).unwrap();
+        let val = Band::try_from(i)?;
         assert_eq!(u8::from(val), i, "Band round-trip failed at {i}");
     }
     for i in Band::COUNT..=255 {
         assert!(Band::try_from(i).is_err(), "Band({i}) should be invalid");
     }
+    Ok(())
 }
 
 #[test]
-fn mode_full_valid_range() {
+fn mode_full_valid_range() -> TestResult {
     for i in 0u8..Mode::COUNT {
-        let val = Mode::try_from(i).unwrap();
+        let val = Mode::try_from(i)?;
         assert_eq!(u8::from(val), i, "Mode round-trip failed at {i}");
     }
     for i in Mode::COUNT..=255 {
         assert!(Mode::try_from(i).is_err(), "Mode({i}) should be invalid");
     }
+    Ok(())
 }
 
 #[test]
-fn dcs_code_full_valid_range() {
+fn dcs_code_full_valid_range() -> TestResult {
     for i in 0u8..DcsCode::COUNT {
-        let val = DcsCode::new(i).unwrap();
+        let val = DcsCode::new(i)?;
         assert_eq!(val.index(), i, "DcsCode round-trip failed at {i}");
     }
     for i in DcsCode::COUNT..=255 {
         assert!(DcsCode::new(i).is_err(), "DcsCode({i}) should be invalid");
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -244,16 +259,17 @@ fn ctcss_frequency_table_every_entry() {
 }
 
 #[test]
-fn ctcss_table_monotonically_increasing() {
+fn ctcss_table_monotonically_increasing() -> TestResult {
     for i in 1..CTCSS_FREQUENCIES.len() {
+        let current = entry(&CTCSS_FREQUENCIES, i, "CTCSS_FREQUENCIES")?;
+        let previous = entry(&CTCSS_FREQUENCIES, i - 1, "CTCSS_FREQUENCIES")?;
         assert!(
-            CTCSS_FREQUENCIES[i] > CTCSS_FREQUENCIES[i - 1],
-            "CTCSS_FREQUENCIES[{i}] ({}) must be > [{prev}] ({})",
-            CTCSS_FREQUENCIES[i],
-            CTCSS_FREQUENCIES[i - 1],
+            current > previous,
+            "CTCSS_FREQUENCIES[{i}] ({current}) must be > [{prev}] ({previous})",
             prev = i - 1,
         );
     }
+    Ok(())
 }
 
 #[test]
@@ -297,29 +313,31 @@ fn dcs_code_table_no_duplicates() {
 // ============================================================================
 
 #[test]
-fn tone_code_frequency_cross_reference() {
+fn tone_code_frequency_cross_reference() -> TestResult {
     for i in 0u8..ToneCode::MAX_INDEX {
-        let tc = ToneCode::new(i).unwrap();
-        let expected = CTCSS_FREQUENCIES[i as usize];
+        let tc = ToneCode::new(i)?;
+        let expected = entry(&CTCSS_FREQUENCIES, usize::from(i), "CTCSS_FREQUENCIES")?;
         let actual = tc.frequency_hz();
         assert!(
             (actual - expected).abs() < f64::EPSILON,
             "ToneCode({i}).frequency_hz() = {actual}, expected CTCSS_FREQUENCIES[{i}] = {expected}"
         );
     }
+    Ok(())
 }
 
 #[test]
-fn dcs_code_value_cross_reference() {
+fn dcs_code_value_cross_reference() -> TestResult {
     for i in 0u8..DcsCode::COUNT {
-        let dc = DcsCode::new(i).unwrap();
-        let expected = DCS_CODES[i as usize];
+        let dc = DcsCode::new(i)?;
+        let expected = entry(&DCS_CODES, usize::from(i), "DCS_CODES")?;
         let actual = dc.code_value();
         assert_eq!(
             actual, expected,
             "DcsCode({i}).code_value() = {actual}, expected DCS_CODES[{i}] = {expected}"
         );
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -688,48 +706,58 @@ fn all_validation_error_variants_display() {
 // ============================================================================
 
 /// Verify `TryFrom<u8>` -> `From<T>` -> `u8` round-trip for a range.
-fn assert_try_from_round_trip<T>(range: std::ops::Range<u8>, name: &str)
+fn assert_try_from_round_trip<T>(range: std::ops::Range<u8>, name: &str) -> Result<(), BoxErr>
 where
     T: TryFrom<u8> + Copy,
     u8: From<T>,
+    <T as TryFrom<u8>>::Error: std::fmt::Debug,
 {
     for i in range {
-        let val = T::try_from(i).unwrap_or_else(|_| panic!("{name}({i}) should be valid"));
+        let val = T::try_from(i)
+            .map_err(|e| -> BoxErr { format!("{name}({i}) should be valid: {e:?}").into() })?;
         assert_eq!(u8::from(val), i, "{name} round-trip failed for {i}");
     }
+    Ok(())
 }
 
 /// Verify `TryFrom<u8>` -> `From<T>` -> `u8` round-trip for an inclusive range.
-fn assert_try_from_round_trip_inclusive<T>(range: std::ops::RangeInclusive<u8>, name: &str)
+fn assert_try_from_round_trip_inclusive<T>(
+    range: std::ops::RangeInclusive<u8>,
+    name: &str,
+) -> Result<(), BoxErr>
 where
     T: TryFrom<u8> + Copy,
     u8: From<T>,
+    <T as TryFrom<u8>>::Error: std::fmt::Debug,
 {
     for i in range {
-        let val = T::try_from(i).unwrap_or_else(|_| panic!("{name}({i}) should be valid"));
+        let val = T::try_from(i)
+            .map_err(|e| -> BoxErr { format!("{name}({i}) should be valid: {e:?}").into() })?;
         assert_eq!(u8::from(val), i, "{name} round-trip failed for {i}");
     }
+    Ok(())
 }
 
 #[test]
-fn channel_enum_types_round_trip() {
-    assert_try_from_round_trip::<Band>(0..Band::COUNT, "Band");
-    assert_try_from_round_trip::<Mode>(0..Mode::COUNT, "Mode");
-    assert_try_from_round_trip::<PowerLevel>(0..PowerLevel::COUNT, "PowerLevel");
-    assert_try_from_round_trip::<ToneMode>(0..ToneMode::COUNT, "ToneMode");
-    assert_try_from_round_trip::<ShiftDirection>(0..16, "ShiftDirection");
-    assert_try_from_round_trip::<StepSize>(0..StepSize::COUNT, "StepSize");
-    assert_try_from_round_trip::<DataSpeed>(0..DataSpeed::COUNT, "DataSpeed");
-    assert_try_from_round_trip::<LockoutMode>(0..LockoutMode::COUNT, "LockoutMode");
-    assert_try_from_round_trip::<CtcssMode>(0..CtcssMode::COUNT, "CtcssMode");
-    assert_try_from_round_trip::<CrossToneType>(0..CrossToneType::COUNT, "CrossToneType");
-    assert_try_from_round_trip::<FlashDuplex>(0..FlashDuplex::COUNT, "FlashDuplex");
+fn channel_enum_types_round_trip() -> TestResult {
+    assert_try_from_round_trip::<Band>(0..Band::COUNT, "Band")?;
+    assert_try_from_round_trip::<Mode>(0..Mode::COUNT, "Mode")?;
+    assert_try_from_round_trip::<PowerLevel>(0..PowerLevel::COUNT, "PowerLevel")?;
+    assert_try_from_round_trip::<ToneMode>(0..ToneMode::COUNT, "ToneMode")?;
+    assert_try_from_round_trip::<ShiftDirection>(0..16, "ShiftDirection")?;
+    assert_try_from_round_trip::<StepSize>(0..StepSize::COUNT, "StepSize")?;
+    assert_try_from_round_trip::<DataSpeed>(0..DataSpeed::COUNT, "DataSpeed")?;
+    assert_try_from_round_trip::<LockoutMode>(0..LockoutMode::COUNT, "LockoutMode")?;
+    assert_try_from_round_trip::<CtcssMode>(0..CtcssMode::COUNT, "CtcssMode")?;
+    assert_try_from_round_trip::<CrossToneType>(0..CrossToneType::COUNT, "CrossToneType")?;
+    assert_try_from_round_trip::<FlashDuplex>(0..FlashDuplex::COUNT, "FlashDuplex")?;
     assert_try_from_round_trip::<FlashDigitalSquelch>(
         0..FlashDigitalSquelch::COUNT,
         "FlashDigitalSquelch",
-    );
-    assert_try_from_round_trip::<FineStep>(0..FineStep::COUNT, "FineStep");
-    assert_try_from_round_trip::<MemoryMode>(0..MemoryMode::COUNT, "MemoryMode");
+    )?;
+    assert_try_from_round_trip::<FineStep>(0..FineStep::COUNT, "FineStep")?;
+    assert_try_from_round_trip::<MemoryMode>(0..MemoryMode::COUNT, "MemoryMode")?;
+    Ok(())
 }
 
 // ============================================================================
@@ -737,46 +765,49 @@ fn channel_enum_types_round_trip() {
 // ============================================================================
 
 #[test]
-fn radio_param_types_round_trip() {
-    assert_try_from_round_trip::<SquelchLevel>(0..SquelchLevel::COUNT, "SquelchLevel");
-    assert_try_from_round_trip::<SMeterReading>(0..SMeterReading::COUNT, "SMeterReading");
-    assert_try_from_round_trip::<VfoMemoryMode>(0..VfoMemoryMode::COUNT, "VfoMemoryMode");
-    assert_try_from_round_trip::<FilterMode>(0..FilterMode::COUNT, "FilterMode");
-    assert_try_from_round_trip::<BatteryLevel>(0..BatteryLevel::COUNT, "BatteryLevel");
-    assert_try_from_round_trip_inclusive::<VoxGain>(0..=VoxGain::MAX, "VoxGain");
-    assert_try_from_round_trip_inclusive::<VoxDelay>(0..=VoxDelay::MAX, "VoxDelay");
-    assert_try_from_round_trip::<TncBaud>(0..TncBaud::COUNT, "TncBaud");
-    assert_try_from_round_trip::<BeaconMode>(0..BeaconMode::COUNT, "BeaconMode");
-    assert_try_from_round_trip::<DetectOutputMode>(0..DetectOutputMode::COUNT, "DetectOutputMode");
-    assert_try_from_round_trip::<DvGatewayMode>(0..DvGatewayMode::COUNT, "DvGatewayMode");
-    assert_try_from_round_trip::<TncMode>(0..TncMode::COUNT, "TncMode");
-    assert_try_from_round_trip::<GpsRadioMode>(0..GpsRadioMode::COUNT, "GpsRadioMode");
-    assert_try_from_round_trip::<FilterWidthIndex>(0..5, "FilterWidthIndex");
-    assert_try_from_round_trip::<KeyLockType>(0..KeyLockType::COUNT, "KeyLockType");
+fn radio_param_types_round_trip() -> TestResult {
+    assert_try_from_round_trip::<SquelchLevel>(0..SquelchLevel::COUNT, "SquelchLevel")?;
+    assert_try_from_round_trip::<SMeterReading>(0..SMeterReading::COUNT, "SMeterReading")?;
+    assert_try_from_round_trip::<VfoMemoryMode>(0..VfoMemoryMode::COUNT, "VfoMemoryMode")?;
+    assert_try_from_round_trip::<FilterMode>(0..FilterMode::COUNT, "FilterMode")?;
+    assert_try_from_round_trip::<BatteryLevel>(0..BatteryLevel::COUNT, "BatteryLevel")?;
+    assert_try_from_round_trip_inclusive::<VoxGain>(0..=VoxGain::MAX, "VoxGain")?;
+    assert_try_from_round_trip_inclusive::<VoxDelay>(0..=VoxDelay::MAX, "VoxDelay")?;
+    assert_try_from_round_trip::<TncBaud>(0..TncBaud::COUNT, "TncBaud")?;
+    assert_try_from_round_trip::<BeaconMode>(0..BeaconMode::COUNT, "BeaconMode")?;
+    assert_try_from_round_trip::<DetectOutputMode>(0..DetectOutputMode::COUNT, "DetectOutputMode")?;
+    assert_try_from_round_trip::<DvGatewayMode>(0..DvGatewayMode::COUNT, "DvGatewayMode")?;
+    assert_try_from_round_trip::<TncMode>(0..TncMode::COUNT, "TncMode")?;
+    assert_try_from_round_trip::<GpsRadioMode>(0..GpsRadioMode::COUNT, "GpsRadioMode")?;
+    assert_try_from_round_trip::<FilterWidthIndex>(0..5, "FilterWidthIndex")?;
+    assert_try_from_round_trip::<KeyLockType>(0..KeyLockType::COUNT, "KeyLockType")?;
     assert_try_from_round_trip::<CoarseStepMultiplier>(
         0..CoarseStepMultiplier::COUNT,
         "CoarseStepMultiplier",
-    );
+    )?;
 
     // DstarSlot starts at 1
     for i in DstarSlot::MIN..=DstarSlot::MAX {
-        let val = DstarSlot::new(i).unwrap();
+        let val = DstarSlot::new(i)?;
         assert_eq!(u8::from(val), i, "DstarSlot round-trip failed for {i}");
     }
 
     // CallsignSlot: 0..=MAX
     for i in 0u8..=CallsignSlot::MAX {
-        let val = CallsignSlot::new(i).unwrap();
+        let val = CallsignSlot::new(i)?;
         assert_eq!(u8::from(val), i, "CallsignSlot round-trip failed for {i}");
     }
 
     // ScanResumeMethod uses from_raw/to_raw
     for i in 0u8..ScanResumeMethod::COUNT {
-        let val = ScanResumeMethod::from_raw(i).unwrap();
+        let val = ScanResumeMethod::from_raw(i).ok_or_else(|| -> BoxErr {
+            format!("ScanResumeMethod::from_raw({i}) returned None").into()
+        })?;
         assert_eq!(
             val.to_raw(),
             i,
             "ScanResumeMethod round-trip failed for {i}"
         );
     }
+    Ok(())
 }

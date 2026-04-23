@@ -9,6 +9,12 @@
 
 use mbelib_rs::AmbeDecoder;
 
+// Dev-dependencies pulled in by sibling integration tests. Acknowledge them
+// here so `unused_crate_dependencies` stays silent for this compilation unit.
+use proptest as _;
+use realfft as _;
+use wide as _;
+
 /// `AmbeDecoder` must implement `Send + Sync` for use in async contexts.
 ///
 /// D-STAR voice decoding in `stargazer` and `dstar-gateway` happens inside

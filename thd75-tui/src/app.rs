@@ -784,7 +784,16 @@ impl Default for BandState {
 
 /// Aggregated radio state from the poller.
 #[derive(Debug, Clone)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "RadioState aggregates the TH-D75's independent CAT toggle settings — beep, \
+              lock, dual_band, bluetooth, vox, gps_enabled, gps_pc_output — each mapping \
+              1:1 to a distinct CAT command name (BP, LK, DW, BT, VX, GP, GP). Collapsing \
+              these into a `HashSet<RadioFlag>` (the refactor clippy wants) would break \
+              the 1:1 CAT-command-to-field mapping that makes the poll_once / apply_state \
+              code trivially auditable against the D-STAR + CAT spec. The bools here are \
+              the data model, not a premature abstraction."
+)]
 pub(crate) struct RadioState {
     pub band_a: BandState,
     pub band_b: BandState,
@@ -899,7 +908,13 @@ pub(crate) struct AprsMessageStatus {
     /// Message ID from the messenger.
     pub message_id: String,
     /// When the message was sent.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "`sent_at` is populated at construction time so an upcoming \"pending \
+                  messages timeout\" UI view can age entries out of the list. It's not yet \
+                  read anywhere because that UI hasn't landed; keeping the field means the \
+                  constructor callers don't need to change when the feature ships."
+    )]
     pub sent_at: Instant,
     /// Delivery state.
     pub state: AprsMessageState,
@@ -995,7 +1010,16 @@ pub(crate) enum Message {
 }
 
 /// Central application state.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "App aggregates the TUI's global mode flags — connected, should_quit, \
+              quit_pending, show_help — plus several view-specific toggles. Each flag \
+              drives a distinct Ratatui branch in the event/render loop and mutates at a \
+              distinct site; collapsing into a `HashSet<AppFlag>` would force every \
+              dispatch to go through a hash lookup for no reader benefit, and the flags \
+              are not semantically related enough to form a coherent enum. This is the \
+              right data model, even if it looks bool-heavy to clippy."
+)]
 pub(crate) struct App {
     pub connected: bool,
     pub port_path: String,
@@ -1149,6 +1173,15 @@ impl App {
     }
 
     /// Process a message and update state. Returns true if a render is needed.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "`update` is the TUI's single message-dispatch entry point — it matches \
+                  over every `Message` variant (radio state updates, status text, D-STAR \
+                  events, APRS events, TX responses, etc.) and translates each into the \
+                  corresponding `App` state change. Splitting per variant would create a \
+                  fan of one-line helper methods with no real abstraction benefit; the \
+                  match statement itself IS the dispatch table."
+    )]
     pub(crate) fn update(&mut self, msg: Message) -> bool {
         match msg {
             Message::Quit => {
@@ -1313,7 +1346,18 @@ impl App {
         }
     }
 
-    #[allow(clippy::cognitive_complexity)]
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "`handle_key` is the TUI's single keyboard dispatch entry point — it \
+                  branches on (`InputMode`, `MainView`, key) to route every keystroke in \
+                  the app. Splitting per mode would either (a) duplicate the Ctrl-C \
+                  global-quit handling at every site or (b) add a second-level dispatch \
+                  layer for no reader benefit. The function is linear: read input mode, \
+                  match keystroke, update state, return whether a redraw is needed. \
+                  `too_many_lines` fires because this single dispatch covers every mode, \
+                  which is the correct granularity."
+    )]
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -1498,7 +1542,15 @@ impl App {
                 KeyCode::Enter => {
                     // Parse as MHz (e.g. "145.19" -> 145_190_000 Hz)
                     if let Ok(mhz) = buf.parse::<f64>() {
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "User-entered MHz value (bounded by D75 tuning range \
+                                      ~30..=1300 MHz per hardware spec) multiplied by 1e6 \
+                                      fits easily in u32. The lint fires because clippy \
+                                      can't prove the f64 range from the local `parse::<f64>()`; \
+                                      a pre-validated input makes the `as u32` cast safe."
+                        )]
                         let hz = (mhz * 1_000_000.0) as u32;
                         if let Some(ref tx) = self.cmd_tx {
                             let _ = tx.send(crate::event::RadioCommand::TuneFreq {
@@ -2028,6 +2080,14 @@ impl App {
     }
 
     /// Toggle a boolean setting or show hint for numeric ones.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "`toggle_setting` is paired with `adjust_setting` — together they are \
+                  the TUI's dispatch into the settings-mutation path. It matches over \
+                  every settings row and issues the corresponding RadioCommand. Splitting \
+                  would duplicate the row-resolution logic; keeping it linear matches the \
+                  settings table's order."
+    )]
     fn toggle_setting(&mut self) {
         let (rows, idx) = if self.main_view == MainView::SettingsCat {
             (cat_settings(), self.settings_cat_index)
@@ -2187,7 +2247,16 @@ impl App {
     }
 
     /// Adjust a numeric setting by delta with +/-.
-    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "`adjust_setting` is the TUI's single entry point for +/- delta edits to \
+                  every CAT- or MCP-backed numeric setting. Dispatches on the settings \
+                  row's type (enum CAT setting, numeric CAT setting, MCP setting, …) to \
+                  the appropriate wire-format encoder and sends via the `RadioCommand` \
+                  channel. Splitting per setting-type would require duplicating the \
+                  delta-clamping and feedback logic at every site."
+    )]
     fn adjust_setting(&mut self, delta: i8) {
         let (rows, idx) = if self.main_view == MainView::SettingsCat {
             (cat_settings(), self.settings_cat_index)
@@ -3177,7 +3246,15 @@ impl App {
             ChannelEditField::Frequency => {
                 // Parse as MHz, tune via CAT
                 if let Ok(mhz) = buf.parse::<f64>() {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "User-entered MHz value (bounded by D75 tuning range \
+                                  ~30..=1300 MHz per hardware spec) multiplied by 1e6 \
+                                  fits easily in u32. The lint fires because clippy can't \
+                                  prove the f64 range from the local `parse::<f64>()`; a \
+                                  pre-validated input makes the `as u32` cast safe."
+                    )]
                     let hz = (mhz * 1_000_000.0) as u32;
                     if let Some(ref tx) = self.cmd_tx {
                         let _ = tx.send(crate::event::RadioCommand::TuneFreq {

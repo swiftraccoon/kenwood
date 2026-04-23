@@ -11,6 +11,8 @@
 use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::types::{DstarSlot, TncBaud, TncMode};
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
 // ============================================================================
 // TN -- TNC Mode (bare read only)
 // ============================================================================
@@ -21,40 +23,40 @@ fn serialize_tn_read() {
 }
 
 #[test]
-fn parse_tn_response() {
-    match protocol::parse(b"TN 0,0").unwrap() {
-        Response::TncMode { mode, setting } => {
-            assert_eq!(mode, TncMode::Aprs);
-            assert_eq!(setting, TncBaud::Bps1200);
-        }
-        other => panic!("expected TncMode, got {other:?}"),
-    }
+fn parse_tn_response() -> TestResult {
+    let r = protocol::parse(b"TN 0,0")?;
+    let Response::TncMode { mode, setting } = r else {
+        return Err(format!("expected TncMode, got {r:?}").into());
+    };
+    assert_eq!(mode, TncMode::Aprs);
+    assert_eq!(setting, TncBaud::Bps1200);
+    Ok(())
 }
 
 #[test]
-fn parse_tn_kiss_mode() {
-    match protocol::parse(b"TN 2,0").unwrap() {
-        Response::TncMode { mode, setting } => {
-            assert_eq!(mode, TncMode::Kiss);
-            assert_eq!(setting, TncBaud::Bps1200);
-        }
-        other => panic!("expected TncMode, got {other:?}"),
-    }
+fn parse_tn_kiss_mode() -> TestResult {
+    let r = protocol::parse(b"TN 2,0")?;
+    let Response::TncMode { mode, setting } = r else {
+        return Err(format!("expected TncMode, got {r:?}").into());
+    };
+    assert_eq!(mode, TncMode::Kiss);
+    assert_eq!(setting, TncBaud::Bps1200);
+    Ok(())
 }
 
 #[test]
-fn parse_tn_navitra() {
+fn parse_tn_navitra() -> TestResult {
     // Setting 1 = 9600 bps — but TncBaud only has 0 and 1,
     // and value 2 would be out of range. Navitra mode with 9600 setting
     // is not documented; if the radio sends TN 1,2 it would be a parse error.
     // Use valid values only.
-    match protocol::parse(b"TN 1,1").unwrap() {
-        Response::TncMode { mode, setting } => {
-            assert_eq!(mode, TncMode::Navitra);
-            assert_eq!(setting, TncBaud::Bps9600);
-        }
-        other => panic!("expected TncMode, got {other:?}"),
-    }
+    let r = protocol::parse(b"TN 1,1")?;
+    let Response::TncMode { mode, setting } = r else {
+        return Err(format!("expected TncMode, got {r:?}").into());
+    };
+    assert_eq!(mode, TncMode::Navitra);
+    assert_eq!(setting, TncBaud::Bps9600);
+    Ok(())
 }
 
 // ============================================================================
@@ -62,39 +64,42 @@ fn parse_tn_navitra() {
 // ============================================================================
 
 #[test]
-fn serialize_dc_read_slot_1() {
+fn serialize_dc_read_slot_1() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::GetDstarCallsign {
-            slot: DstarSlot::new(1).unwrap()
+            slot: DstarSlot::new(1)?
         }),
         b"DC 1\r"
     );
+    Ok(())
 }
 
 #[test]
-fn serialize_dc_read_slot_6() {
+fn serialize_dc_read_slot_6() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::GetDstarCallsign {
-            slot: DstarSlot::new(6).unwrap()
+            slot: DstarSlot::new(6)?
         }),
         b"DC 6\r"
     );
+    Ok(())
 }
 
 #[test]
-fn parse_dc_response() {
-    match protocol::parse(b"DC 1,KQ4NIT  ,D75A").unwrap() {
-        Response::DstarCallsign {
-            slot,
-            callsign,
-            suffix,
-        } => {
-            assert_eq!(slot, DstarSlot::new(1).unwrap());
-            assert_eq!(callsign, "KQ4NIT  ");
-            assert_eq!(suffix, "D75A");
-        }
-        other => panic!("expected DstarCallsign, got {other:?}"),
-    }
+fn parse_dc_response() -> TestResult {
+    let r = protocol::parse(b"DC 1,KQ4NIT  ,D75A")?;
+    let Response::DstarCallsign {
+        slot,
+        callsign,
+        suffix,
+    } = r
+    else {
+        return Err(format!("expected DstarCallsign, got {r:?}").into());
+    };
+    assert_eq!(slot, DstarSlot::new(1)?);
+    assert_eq!(callsign, "KQ4NIT  ");
+    assert_eq!(suffix, "D75A");
+    Ok(())
 }
 
 // ============================================================================
@@ -107,11 +112,11 @@ fn serialize_rt_read() {
 }
 
 #[test]
-fn parse_rt_response() {
-    match protocol::parse(b"RT 240104095700").unwrap() {
-        Response::RealTimeClock { datetime } => {
-            assert_eq!(datetime, "240104095700");
-        }
-        other => panic!("expected RealTimeClock, got {other:?}"),
-    }
+fn parse_rt_response() -> TestResult {
+    let r = protocol::parse(b"RT 240104095700")?;
+    let Response::RealTimeClock { datetime } = r else {
+        return Err(format!("expected RealTimeClock, got {r:?}").into());
+    };
+    assert_eq!(datetime, "240104095700");
+    Ok(())
 }

@@ -14,6 +14,22 @@
 //! reference data. See the file-header comment above for context.
 
 #![cfg(feature = "kenwood-tables")]
+#![expect(
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    reason = "Provenance-integrity test file. Directly indexes into extracted Kenwood DSP \
+              tables (known exact-size const arrays imported above) to check specific \
+              signature values, and uses `.expect()` on optional fields that the extracted \
+              firmware data guarantees present. Any bounds violation or missing field \
+              would indicate the wrong firmware dump was copied in — the test correctly \
+              panics in that case."
+)]
+
+// Dev-dependencies pulled in by sibling tests. Acknowledge them here so
+// `unused_crate_dependencies` stays silent for this compilation unit.
+use proptest as _;
+use realfft as _;
+use wide as _;
 
 use mbelib_rs::kenwood::{
     SOURCE_VERSION,
@@ -74,7 +90,11 @@ fn hpf_345hz_is_prefix_of_bank_h_i_j() {
 fn harmonic_decay_is_reciprocal_of_1_plus_015k() {
     // HARMONIC_DECAY[k] should equal 1/(1 + 0.15·k) within f32 rounding.
     for (k, &v) in HARMONIC_DECAY.iter().enumerate() {
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "HARMONIC_DECAY table index k is bounded by the table's small length; \
+                      the usize-to-f32 cast is exact in that range."
+        )]
         let expected = 1.0_f32 / 0.15_f32.mul_add(k as f32, 1.0);
         assert!(
             (v - expected).abs() < 1e-4,

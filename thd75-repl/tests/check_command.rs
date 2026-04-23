@@ -5,6 +5,29 @@
 //! test runs without the `testing` feature because `check` never
 //! opens a radio transport.
 
+#![expect(
+    clippy::expect_used,
+    reason = "Integration test. `.expect()` on `Command::output()` correctly aborts the \
+              test with a specific message if the spawn itself fails — there's no useful \
+              recovery path when the binary under test can't even be invoked."
+)]
+
+// Crate-level dev-dependencies pulled in by sibling integration tests. Acknowledge
+// them here so `unused_crate_dependencies` stays silent for this compilation unit.
+use clap as _;
+use dirs_next as _;
+use dstar_gateway as _;
+use dstar_gateway_core as _;
+use kenwood_thd75 as _;
+use proptest as _;
+use rustyline as _;
+use thd75_repl as _;
+use time as _;
+use tokio as _;
+use tracing as _;
+use tracing_appender as _;
+use tracing_subscriber as _;
+
 use std::process::Command;
 
 #[test]

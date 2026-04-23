@@ -18,6 +18,16 @@
 //! The pitch-estimation step (`pitch_est()`) itself runs in phase P3
 //! and consumes `pitch_est_buf`. Phase P4 consumes the FFT output.
 
+#![expect(
+    clippy::indexing_slicing,
+    reason = "DSP front-end: indices into pitch-history buffers (`pitch_ref_buf`, \
+              `pitch_est_buf`, `snd[..FRAME]`) are bounded by the buffer constants \
+              (`PITCH_EST_BUF_SIZE`, `FRAME`) defined in the IMBE spec and enforced by \
+              the caller. Rewriting with `.get()?` would add unwrap noise to every array \
+              access in the FFT-scatter path without catching any real bug — bounds are \
+              static and obvious by construction."
+)]
+
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
 
@@ -137,6 +147,13 @@ pub fn analyze_frame(
         .get(tail_start..)
         .map(<[f32]>::to_vec)
         .unwrap_or_default();
+    #[expect(
+        clippy::expect_used,
+        reason = "`tail_start = PITCH_EST_BUF_SIZE - FRAME` which is always < PITCH_EST_BUF_SIZE \
+                  (FRAME=160, PITCH_EST_BUF_SIZE is 256 in current layout), so the slice is \
+                  always valid. A `.unwrap_or_else(|| unreachable!())` would be equivalent but \
+                  less readable."
+    )]
     let est_tail = bufs
         .pitch_est_buf
         .get_mut(tail_start..)
@@ -229,7 +246,11 @@ mod tests {
         for frame_idx in 0..5 {
             let snd: Vec<f32> = (0..FRAME)
                 .map(|i| {
-                    #[allow(clippy::cast_precision_loss)]
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "test tone generator: frame_idx * FRAME + i stays under \
+                                  5 * 160 = 800, far below f32 mantissa precision."
+                    )]
                     let t = (frame_idx * FRAME + i) as f32;
                     (t * 2.0 * std::f32::consts::PI * freq_hz / sample_rate).sin()
                 })

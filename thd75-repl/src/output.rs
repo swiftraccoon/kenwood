@@ -30,7 +30,6 @@ pub fn band_name(band: Band) -> &'static str {
 /// zero is kept so `146.5 megahertz` reads cleanly. Values below 1 Hz
 /// render as `0 megahertz`.
 #[must_use]
-#[allow(clippy::cast_precision_loss)]
 pub fn freq_mhz(hz: u32) -> String {
     let mhz = f64::from(hz) / 1_000_000.0;
     let s = format!("{mhz:.6}");

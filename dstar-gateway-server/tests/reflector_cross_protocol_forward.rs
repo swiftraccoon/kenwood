@@ -23,10 +23,17 @@
 //! `Reflector::run` is exercised separately by
 //! `reflector_dextra_fanout::reflector_new_with_socket_shutdown_smoke_test`.
 
-// Integration tests live in a separate compilation unit from the
-// library crate. Match the library's lint opt-out so test code stays
-// expressive.
-#![allow(clippy::indexing_slicing, clippy::unreachable, unused_results)]
+#![expect(
+    clippy::unreachable,
+    reason = "Integration test file. Tests live in a separate compilation unit from the \
+              library crate, so the library's internal lint posture does not apply — we \
+              restate this opt-out here so test code stays expressive while production \
+              code remains strict. `clippy::unreachable` fires on `unreachable!()` used \
+              inside `match` arms as assertion-style 'this variant cannot occur given \
+              the test's setup' guards — if the invariant is violated the test correctly \
+              panics with a specific message naming the impossible variant, which is more \
+              debuggable than a generic `assert!` failure."
+)]
 
 // Workspace dev-deps used by sibling test targets. Acknowledge them
 // here so the strict `unused_crate_dependencies` lint stays silent

@@ -42,16 +42,15 @@ pub fn parse_callsign_list(data: &[u8]) -> Result<Vec<CallsignEntry>, SdCardErro
         }
 
         let line_num = line_idx + 1;
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.is_empty() {
-            return Err(SdCardError::ColumnCount {
+        let callsign = line
+            .split('\t')
+            .next()
+            .ok_or(SdCardError::ColumnCount {
                 line: line_num,
                 expected: 1,
                 actual: 0,
-            });
-        }
-
-        let callsign = cols[0].to_owned();
+            })?
+            .to_owned();
 
         // Skip the D-STAR broadcast CQ address — it is always implicit.
         if callsign.trim() == "CQCQCQ" {
@@ -85,21 +84,20 @@ pub fn write_callsign_list(entries: &[CallsignEntry]) -> Vec<u8> {
 
 /// Decodes a UTF-16LE byte sequence with a leading BOM into a `String`.
 fn decode_utf16le_bom(data: &[u8]) -> Result<String, SdCardError> {
-    if data.len() < 2 {
+    let Some((bom, payload)) = data.split_first_chunk::<2>() else {
         return Err(SdCardError::MissingBom);
-    }
-    if data[0] != 0xFF || data[1] != 0xFE {
+    };
+    if *bom != [0xFF, 0xFE] {
         return Err(SdCardError::MissingBom);
     }
 
-    let payload = &data[2..];
     if !payload.len().is_multiple_of(2) {
         return Err(SdCardError::InvalidUtf16Length { len: payload.len() });
     }
 
     let code_units: Vec<u16> = payload
         .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .map(|pair| u16::from_le_bytes(pair.try_into().unwrap_or([0, 0])))
         .collect();
 
     String::from_utf16(&code_units).map_err(|e| SdCardError::Utf16Decode {
@@ -115,9 +113,7 @@ fn encode_utf16le_bom(text: &str) -> Vec<u8> {
     out.push(0xFE);
     // UTF-16LE payload
     for unit in text.encode_utf16() {
-        let bytes = unit.to_le_bytes();
-        out.push(bytes[0]);
-        out.push(bytes[1]);
+        out.extend_from_slice(&unit.to_le_bytes());
     }
     out
 }
@@ -126,19 +122,24 @@ fn encode_utf16le_bom(text: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn parse_empty_list() {
+    fn parse_empty_list() -> TestResult {
         let data = encode_utf16le_bom("Callsign\r\n");
-        let entries = parse_callsign_list(&data).unwrap();
+        let entries = parse_callsign_list(&data)?;
         assert!(entries.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn parse_filters_cqcqcq() {
+    fn parse_filters_cqcqcq() -> TestResult {
         let data = encode_utf16le_bom("Callsign\r\nCQCQCQ  \r\nW4CDR   \r\n");
-        let entries = parse_callsign_list(&data).unwrap();
+        let entries = parse_callsign_list(&data)?;
         // CQCQCQ (with trailing spaces trimmed) should be filtered out.
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].callsign, "W4CDR   ");
+        let first = entries.first().ok_or("expected one entry")?;
+        assert_eq!(first.callsign, "W4CDR   ");
+        Ok(())
     }
 }

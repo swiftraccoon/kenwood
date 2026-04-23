@@ -124,11 +124,7 @@ impl<'a> GpsAccess<'a> {
     #[must_use]
     pub fn estimated_region(&self) -> Option<&[u8]> {
         let end = GPS_ESTIMATED_OFFSET + GPS_ESTIMATED_SIZE;
-        if end <= self.image.len() {
-            Some(&self.image[GPS_ESTIMATED_OFFSET..end])
-        } else {
-            None
-        }
+        self.image.get(GPS_ESTIMATED_OFFSET..end)
     }
 
     /// Read an arbitrary byte range from the image.
@@ -138,11 +134,7 @@ impl<'a> GpsAccess<'a> {
     #[must_use]
     pub fn read_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
         let end = offset + len;
-        if end <= self.image.len() {
-            Some(&self.image[offset..end])
-        } else {
-            None
-        }
+        self.image.get(offset..end)
     }
 
     /// Get the estimated size of the GPS region in bytes.
@@ -305,11 +297,7 @@ impl<'a> GpsAccess<'a> {
     #[must_use]
     pub fn channel_index_raw(&self) -> Option<&[u8]> {
         let end = GPS_CHANNEL_INDEX_OFFSET + GPS_CHANNEL_INDEX_COUNT;
-        if end <= self.image.len() {
-            Some(&self.image[GPS_CHANNEL_INDEX_OFFSET..end])
-        } else {
-            None
-        }
+        self.image.get(GPS_CHANNEL_INDEX_OFFSET..end)
     }
 
     /// Get the GPS channel index value for a given slot (0-99).
@@ -360,11 +348,7 @@ impl<'a> GpsAccess<'a> {
         let index_value = self.channel_index(slot)? as usize;
         let data_offset = (index_value + GPS_WAYPOINT_BASE_INDEX) * GPS_WAYPOINT_RECORD_SIZE;
         let end = data_offset + GPS_WAYPOINT_RECORD_SIZE;
-        if end <= self.image.len() {
-            Some(&self.image[data_offset..end])
-        } else {
-            None
-        }
+        self.image.get(data_offset..end)
     }
 
     /// Read the name field from a GPS waypoint record (up to 8 characters).
@@ -380,21 +364,21 @@ impl<'a> GpsAccess<'a> {
         };
 
         // Name is at record offset 0x10, 9 bytes.
-        if record.len() < 0x19 {
+        let Some(name_bytes) = record.get(0x10..0x19) else {
             return String::new();
-        }
-        let name_bytes = &record[0x10..0x19];
+        };
         // 0xFE in the first byte means unused.
-        if name_bytes[0] == 0xFE {
+        if name_bytes.first().copied() == Some(0xFE) {
             return String::new();
         }
         let nul = name_bytes
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(name_bytes.len());
-        String::from_utf8_lossy(&name_bytes[..nul])
-            .trim()
-            .to_owned()
+        let Some(trimmed) = name_bytes.get(..nul) else {
+            return String::new();
+        };
+        String::from_utf8_lossy(trimmed).trim().to_owned()
     }
 }
 
@@ -408,115 +392,158 @@ mod tests {
     use crate::protocol::programming::TOTAL_SIZE;
     use crate::types::gps::{GpsOperatingMode, GpsPositionAmbiguity};
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type BoxErr = Box<dyn std::error::Error>;
+
+    fn set_byte(image: &mut [u8], offset: usize, value: u8) -> Result<(), BoxErr> {
+        let img_len = image.len();
+        *image
+            .get_mut(offset)
+            .ok_or_else(|| format!("set_byte: offset {offset} out of range (len={img_len})"))? =
+            value;
+        Ok(())
+    }
+
+    fn write_slice(image: &mut [u8], offset: usize, data: &[u8]) -> Result<(), BoxErr> {
+        let end = offset + data.len();
+        let img_len = image.len();
+        image
+            .get_mut(offset..end)
+            .ok_or_else(|| {
+                format!("write_slice: range {offset}..{end} out of bounds (len={img_len})")
+            })?
+            .copy_from_slice(data);
+        Ok(())
+    }
+
     fn make_gps_image() -> Vec<u8> {
         vec![0u8; TOTAL_SIZE]
     }
 
     #[test]
-    fn gps_estimated_region_accessible() {
+    fn gps_estimated_region_accessible() -> TestResult {
         let image = vec![0xBB_u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let gps = mi.gps();
-        let region = gps.estimated_region().unwrap();
+        let region = gps
+            .estimated_region()
+            .ok_or("gps.estimated_region() returned None")?;
         assert_eq!(region.len(), GPS_ESTIMATED_SIZE);
         assert!(region.iter().all(|&b| b == 0xBB));
+        Ok(())
     }
 
     #[test]
-    fn gps_read_bytes() {
+    fn gps_read_bytes() -> TestResult {
         let mut image = make_gps_image();
-        image[GPS_ESTIMATED_OFFSET..GPS_ESTIMATED_OFFSET + 4]
-            .copy_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        write_slice(&mut image, GPS_ESTIMATED_OFFSET, &[0x01, 0x02, 0x03, 0x04])?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let gps = mi.gps();
-        let bytes = gps.read_bytes(GPS_ESTIMATED_OFFSET, 4).unwrap();
+        let bytes = gps
+            .read_bytes(GPS_ESTIMATED_OFFSET, 4)
+            .ok_or("gps.read_bytes returned None")?;
         assert_eq!(bytes, &[0x01, 0x02, 0x03, 0x04]);
+        Ok(())
     }
 
     #[test]
-    fn gps_region_size() {
+    fn gps_region_size() -> TestResult {
         let image = make_gps_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let gps = mi.gps();
         assert_eq!(gps.estimated_region_size(), 0x1000);
+        Ok(())
     }
 
     #[test]
-    fn gps_enabled() {
+    fn gps_enabled() -> TestResult {
         let mut image = make_gps_image();
-        image[GPS_ESTIMATED_OFFSET + GPS_ENABLED_REL] = 1;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        set_byte(&mut image, GPS_ESTIMATED_OFFSET + GPS_ENABLED_REL, 1)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.gps().gps_enabled());
+        Ok(())
     }
 
     #[test]
-    fn gps_enabled_off() {
+    fn gps_enabled_off() -> TestResult {
         let image = make_gps_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.gps().gps_enabled());
+        Ok(())
     }
 
     #[test]
-    fn gps_pc_output() {
+    fn gps_pc_output() -> TestResult {
         let mut image = make_gps_image();
-        image[GPS_ESTIMATED_OFFSET + GPS_PC_OUTPUT_REL] = 1;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        set_byte(&mut image, GPS_ESTIMATED_OFFSET + GPS_PC_OUTPUT_REL, 1)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.gps().pc_output());
+        Ok(())
     }
 
     #[test]
-    fn gps_operating_mode() {
+    fn gps_operating_mode() -> TestResult {
         let mut image = make_gps_image();
-        image[GPS_ESTIMATED_OFFSET + GPS_OPERATING_MODE_REL] = 1;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        set_byte(&mut image, GPS_ESTIMATED_OFFSET + GPS_OPERATING_MODE_REL, 1)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.gps().operating_mode(), GpsOperatingMode::Sbas);
+        Ok(())
     }
 
     #[test]
-    fn gps_operating_mode_manual() {
+    fn gps_operating_mode_manual() -> TestResult {
         let mut image = make_gps_image();
-        image[GPS_ESTIMATED_OFFSET + GPS_OPERATING_MODE_REL] = 2;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        set_byte(&mut image, GPS_ESTIMATED_OFFSET + GPS_OPERATING_MODE_REL, 2)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.gps().operating_mode(), GpsOperatingMode::Manual);
+        Ok(())
     }
 
     #[test]
-    fn gps_operating_mode_default() {
+    fn gps_operating_mode_default() -> TestResult {
         let image = make_gps_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.gps().operating_mode(), GpsOperatingMode::Standalone);
+        Ok(())
     }
 
     #[test]
-    fn gps_battery_saver() {
+    fn gps_battery_saver() -> TestResult {
         let mut image = make_gps_image();
-        image[GPS_ESTIMATED_OFFSET + GPS_BATTERY_SAVER_REL] = 1;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        set_byte(&mut image, GPS_ESTIMATED_OFFSET + GPS_BATTERY_SAVER_REL, 1)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.gps().battery_saver());
+        Ok(())
     }
 
     #[test]
-    fn gps_position_ambiguity() {
+    fn gps_position_ambiguity() -> TestResult {
         let mut image = make_gps_image();
-        image[GPS_ESTIMATED_OFFSET + GPS_POSITION_AMBIGUITY_REL] = 3;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        set_byte(
+            &mut image,
+            GPS_ESTIMATED_OFFSET + GPS_POSITION_AMBIGUITY_REL,
+            3,
+        )?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.gps().position_ambiguity(), GpsPositionAmbiguity::Level3);
+        Ok(())
     }
 
     #[test]
-    fn gps_position_ambiguity_default() {
+    fn gps_position_ambiguity_default() -> TestResult {
         let image = make_gps_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.gps().position_ambiguity(), GpsPositionAmbiguity::Full);
+        Ok(())
     }
 
     #[test]
-    fn gps_nmea_flags() {
+    fn gps_nmea_flags() -> TestResult {
         let mut image = make_gps_image();
         // Enable GGA (bit 0) and RMC (bit 4) = 0b00010001 = 0x11.
-        image[GPS_ESTIMATED_OFFSET + GPS_NMEA_FLAGS_REL] = 0x11;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        set_byte(&mut image, GPS_ESTIMATED_OFFSET + GPS_NMEA_FLAGS_REL, 0x11)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let gps = mi.gps();
         assert_eq!(gps.nmea_sentence_flags(), 0x11);
         assert!(gps.nmea_sentence_enabled(0)); // GGA
@@ -525,14 +552,16 @@ mod tests {
         assert!(!gps.nmea_sentence_enabled(3)); // GSV
         assert!(gps.nmea_sentence_enabled(4)); // RMC
         assert!(!gps.nmea_sentence_enabled(5)); // VTG
+        Ok(())
     }
 
     #[test]
-    fn gps_nmea_sentence_out_of_range() {
+    fn gps_nmea_sentence_out_of_range() -> TestResult {
         let image = make_gps_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.gps().nmea_sentence_enabled(6));
         assert!(!mi.gps().nmea_sentence_enabled(255));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -540,115 +569,130 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn gps_channel_index_raw_accessible() {
+    fn gps_channel_index_raw_accessible() -> TestResult {
         let image = vec![0xFF_u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let gps = mi.gps();
-        let index = gps.channel_index_raw().unwrap();
+        let index = gps
+            .channel_index_raw()
+            .ok_or("channel_index_raw returned None")?;
         assert_eq!(index.len(), GPS_CHANNEL_INDEX_COUNT);
         // All 0xFF = unused.
         assert!(index.iter().all(|&b| b == 0xFF));
+        Ok(())
     }
 
     #[test]
-    fn gps_channel_index_unused() {
+    fn gps_channel_index_unused() -> TestResult {
         let image = vec![0xFF_u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.gps().channel_index(0).is_none());
         assert!(mi.gps().channel_index(99).is_none());
+        Ok(())
     }
 
     #[test]
-    fn gps_channel_index_out_of_range() {
+    fn gps_channel_index_out_of_range() -> TestResult {
         let image = vec![0xFF_u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.gps().channel_index(100).is_none());
         assert!(mi.gps().channel_index(255).is_none());
+        Ok(())
     }
 
     #[test]
-    fn gps_channel_index_populated() {
+    fn gps_channel_index_populated() -> TestResult {
         let mut image = vec![0xFF_u8; TOTAL_SIZE];
         // Set slot 0 to waypoint index 5.
-        image[GPS_CHANNEL_INDEX_OFFSET] = 5;
+        set_byte(&mut image, GPS_CHANNEL_INDEX_OFFSET, 5)?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.gps().channel_index(0), Some(5));
+        Ok(())
     }
 
     #[test]
-    fn gps_waypoint_count_all_empty() {
+    fn gps_waypoint_count_all_empty() -> TestResult {
         let image = vec![0xFF_u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.gps().waypoint_count(), 0);
+        Ok(())
     }
 
     #[test]
-    fn gps_waypoint_count_with_entries() {
+    fn gps_waypoint_count_with_entries() -> TestResult {
         let mut image = vec![0xFF_u8; TOTAL_SIZE];
         // Set 3 slots as used.
-        image[GPS_CHANNEL_INDEX_OFFSET] = 0;
-        image[GPS_CHANNEL_INDEX_OFFSET + 1] = 1;
-        image[GPS_CHANNEL_INDEX_OFFSET + 50] = 10;
+        set_byte(&mut image, GPS_CHANNEL_INDEX_OFFSET, 0)?;
+        set_byte(&mut image, GPS_CHANNEL_INDEX_OFFSET + 1, 1)?;
+        set_byte(&mut image, GPS_CHANNEL_INDEX_OFFSET + 50, 10)?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.gps().waypoint_count(), 3);
+        Ok(())
     }
 
     #[test]
-    fn gps_waypoint_raw_empty_slot() {
+    fn gps_waypoint_raw_empty_slot() -> TestResult {
         let image = vec![0xFF_u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.gps().waypoint_raw(0).is_none());
+        Ok(())
     }
 
     #[test]
-    fn gps_waypoint_raw_populated() {
+    fn gps_waypoint_raw_populated() -> TestResult {
         let mut image = vec![0xFF_u8; TOTAL_SIZE];
-        image[GPS_CHANNEL_INDEX_OFFSET] = 0; // Waypoint index 0.
+        set_byte(&mut image, GPS_CHANNEL_INDEX_OFFSET, 0)?; // Waypoint index 0.
         // Waypoint data at (0 + 0x2608) * 0x20 = 0x4C100.
         let wp_offset = GPS_WAYPOINT_BASE_INDEX * GPS_WAYPOINT_RECORD_SIZE;
         if wp_offset + GPS_WAYPOINT_RECORD_SIZE <= image.len() {
-            image[wp_offset..wp_offset + 4].copy_from_slice(&[0x01, 0x02, 0x03, 0x04]);
-            let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+            write_slice(&mut image, wp_offset, &[0x01, 0x02, 0x03, 0x04])?;
+            let mi = crate::memory::MemoryImage::from_raw(image)?;
             let gps = mi.gps();
-            let raw = gps.waypoint_raw(0).unwrap();
+            let raw = gps.waypoint_raw(0).ok_or("waypoint_raw(0) returned None")?;
             assert_eq!(raw.len(), GPS_WAYPOINT_RECORD_SIZE);
-            assert_eq!(&raw[..4], &[0x01, 0x02, 0x03, 0x04]);
+            assert_eq!(
+                raw.get(..4).ok_or("waypoint raw too short")?,
+                &[0x01, 0x02, 0x03, 0x04]
+            );
         }
+        Ok(())
     }
 
     #[test]
-    fn gps_waypoint_name() {
+    fn gps_waypoint_name() -> TestResult {
         let mut image = vec![0xFF_u8; TOTAL_SIZE];
-        image[GPS_CHANNEL_INDEX_OFFSET] = 0;
+        set_byte(&mut image, GPS_CHANNEL_INDEX_OFFSET, 0)?;
         let wp_offset = GPS_WAYPOINT_BASE_INDEX * GPS_WAYPOINT_RECORD_SIZE;
         if wp_offset + GPS_WAYPOINT_RECORD_SIZE <= image.len() {
             // Write name at waypoint record offset 0x10.
-            let name = b"HOME\0\0\0\0\0";
-            image[wp_offset + 0x10..wp_offset + 0x19].copy_from_slice(name);
-            let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+            write_slice(&mut image, wp_offset + 0x10, b"HOME\0\0\0\0\0")?;
+            let mi = crate::memory::MemoryImage::from_raw(image)?;
             assert_eq!(mi.gps().waypoint_name(0), "HOME");
         }
+        Ok(())
     }
 
     #[test]
-    fn gps_waypoint_name_empty_slot() {
+    fn gps_waypoint_name_empty_slot() -> TestResult {
         let image = vec![0xFF_u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.gps().waypoint_name(0), "");
+        Ok(())
     }
 
     #[test]
-    fn gps_waypoint_name_unused_marker() {
+    fn gps_waypoint_name_unused_marker() -> TestResult {
         let mut image = vec![0xFF_u8; TOTAL_SIZE];
-        image[GPS_CHANNEL_INDEX_OFFSET] = 0;
+        set_byte(&mut image, GPS_CHANNEL_INDEX_OFFSET, 0)?;
         let wp_offset = GPS_WAYPOINT_BASE_INDEX * GPS_WAYPOINT_RECORD_SIZE;
         if wp_offset + GPS_WAYPOINT_RECORD_SIZE <= image.len() {
             // 0xFE as first byte of name = unused.
-            image[wp_offset + 0x10] = 0xFE;
-            let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+            set_byte(&mut image, wp_offset + 0x10, 0xFE)?;
+            let mi = crate::memory::MemoryImage::from_raw(image)?;
             assert_eq!(mi.gps().waypoint_name(0), "");
         }
+        Ok(())
     }
 }

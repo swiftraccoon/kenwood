@@ -68,9 +68,9 @@ pub(crate) enum AudioCommand {
     /// Stop mic capture and tell the session task to emit EOT.
     StopTx,
     /// A new RX voice stream is starting. The audio worker resets the
-    /// [`AmbeDecoder`] (CLAUDE.md: "one `AmbeDecoder` per voice
-    /// stream") so stale state from the prior stream doesn't leak
-    /// into the first frames of the new one.
+    /// [`AmbeDecoder`] — one decoder per voice stream — so stale
+    /// synthesiser state from the prior stream doesn't leak into the
+    /// first frames of the new one.
     RxStart,
     /// One voice frame arrived from the reflector — decode + play.
     RxFrame(VoiceFrame),
@@ -84,6 +84,14 @@ impl AudioHandle {
     /// `AudioCommand`s the GUI sends to the worker itself.
     pub(crate) fn start(session_tx: tokio_mpsc::Sender<SessionCommand>) -> Self {
         let (cmd_tx, cmd_rx) = std_mpsc::channel();
+        #[expect(
+            clippy::expect_used,
+            reason = "Thread spawn can only fail from OS resource exhaustion (PTHREAD_CREATE \
+                      ENOMEM/EAGAIN), which is unrecoverable inside an egui constructor — \
+                      the audio subsystem is mandatory for the GUI's purpose. Panicking \
+                      with a named message here produces a clearer crash report than \
+                      propagating the error through the GUI init path."
+        )]
         let worker = std::thread::Builder::new()
             .name("sextant-audio".into())
             .spawn(move || run_audio_worker(cmd_rx, session_tx))
@@ -304,11 +312,8 @@ impl AudioWorker {
                 let pcm_i16 = self.decoder.decode_frame(&frame.ambe);
                 // Convert to f32 for resampling.
                 self.resampled_in.clear();
-                self.resampled_in.extend(pcm_i16.iter().map(|&s| {
-                    #[allow(clippy::cast_precision_loss)]
-                    let f = f32::from(s) / 32768.0;
-                    f
-                }));
+                self.resampled_in
+                    .extend(pcm_i16.iter().map(|&s| f32::from(s) / 32768.0));
                 // Resample to HW output rate, push to speaker ringbuf.
                 self.resampled_out.clear();
                 resample_linear(
@@ -495,21 +500,48 @@ fn resample_linear(input: &[f32], input_rate: u32, output_rate: u32, output: &mu
         return;
     }
     let ratio = f64::from(input_rate) / f64::from(output_rate);
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "input.len() as f64 is a precision-loss-only lint; audio buffers are \
+                  small (voice frames, thousands of samples max) so f64's 52-bit \
+                  mantissa represents them exactly."
+    )]
     let out_len_f = input.len() as f64 / ratio;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "out_len_f is .round()ed from a positive product of small usize/audio \
+                  rates, always fits a usize and is non-negative."
+    )]
     let out_len = out_len_f.round() as usize;
     output.reserve(out_len);
     for i in 0..out_len {
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "i is bounded by out_len (small); i as f64 is exact for all audio \
+                      buffer sizes we will ever process."
+        )]
         let src_pos = i as f64 * ratio;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "src_pos is i*ratio where i>=0 and ratio>0, so src_pos is \
+                      non-negative and bounded by input.len() in the typical case; the \
+                      bounds check below protects against overshoot."
+        )]
         let src_idx = src_pos as usize;
         if src_idx >= input.len() {
             break;
         }
         let next_idx = (src_idx + 1).min(input.len() - 1);
-        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "src_idx as f64 is exact for small audio indices. The difference \
+                      (src_pos - src_idx) is in [0.0, 1.0); narrowing from f64 to f32 \
+                      loses only fractional precision that is inaudible in linear \
+                      interpolation weighting."
+        )]
         let frac = (src_pos - src_idx as f64) as f32;
         let a = input.get(src_idx).copied().unwrap_or(0.0);
         let b = input.get(next_idx).copied().unwrap_or(a);
@@ -518,7 +550,13 @@ fn resample_linear(input: &[f32], input_rate: u32, output_rate: u32, output: &mu
 }
 
 /// HW samples per 20 ms at the given rate.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "rate is a u32 audio sample rate (typically 8000..=192000); multiplied \
+              by 0.020 and rounded the result is a small non-negative integer that \
+              fits a usize on every platform we target."
+)]
 fn hw_samples_per_frame(rate: u32) -> usize {
     (f64::from(rate) * 0.020).round() as usize
 }
@@ -548,7 +586,13 @@ fn build_input_stream(
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     for chunk in data.chunks(channels as usize) {
                         let sum: f32 = chunk.iter().map(|&s| f32::from(s) / 32768.0).sum();
-                        #[allow(clippy::cast_precision_loss)]
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "chunk.len() is a small channel count (typically \
+                                      1..=8); f32 represents it exactly. Division to \
+                                      average channels is audio-averaging where f32 \
+                                      precision is the standard."
+                        )]
                         let avg = sum / chunk.len() as f32;
                         let _unused = mic_prod.try_push(avg);
                     }
@@ -566,7 +610,13 @@ fn build_input_stream(
                             .iter()
                             .map(|&s| (f32::from(s) - 32768.0) / 32768.0)
                             .sum();
-                        #[allow(clippy::cast_precision_loss)]
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "chunk.len() is a small channel count (typically \
+                                      1..=8); f32 represents it exactly. Division to \
+                                      average channels is audio-averaging where f32 \
+                                      precision is the standard."
+                        )]
                         let avg = sum / chunk.len() as f32;
                         let _unused = mic_prod.try_push(avg);
                     }
@@ -604,7 +654,12 @@ fn build_output_stream(
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     for chunk in data.chunks_mut(channels as usize) {
                         let s = speaker_cons.try_pop().unwrap_or(0.0);
-                        #[allow(clippy::cast_possible_truncation)]
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "s is clamped to -1.0..=1.0 then multiplied by \
+                                      32767.0, yielding -32767.0..=32767.0 — all \
+                                      representable in i16 with no truncation."
+                        )]
                         let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
                         for slot in chunk.iter_mut() {
                             *slot = v;
@@ -621,7 +676,13 @@ fn build_output_stream(
                 move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
                     for chunk in data.chunks_mut(channels as usize) {
                         let s = speaker_cons.try_pop().unwrap_or(0.0);
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "s is clamped to -1.0..=1.0, so (s + 1.0) is \
+                                      0.0..=2.0, times 32767.5 is 0.0..=65535.0 — \
+                                      non-negative and fits in u16 with no truncation."
+                        )]
                         let v = ((s.clamp(-1.0, 1.0) + 1.0) * 32767.5) as u16;
                         for slot in chunk.iter_mut() {
                             *slot = v;
@@ -639,7 +700,12 @@ fn build_output_stream(
 fn write_mono(data: &[f32], channels: u16, mic_prod: &mut ringbuf::HeapProd<f32>) {
     for chunk in data.chunks(channels as usize) {
         let sum: f32 = chunk.iter().sum();
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "chunk.len() is a small channel count (typically 1..=8); f32 \
+                      represents it exactly. Division to average channels is \
+                      audio-averaging where f32 precision is the standard."
+        )]
         let avg = sum / chunk.len() as f32;
         let _unused = mic_prod.try_push(avg);
     }

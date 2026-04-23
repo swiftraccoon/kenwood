@@ -71,8 +71,8 @@ fn fuzz_parse_aprs_position_no_panic() {
             rng.fill(&mut buf);
             // Force the data type identifier to one of the position
             // identifiers so we exercise the position parser path.
-            if !buf.is_empty() {
-                buf[0] = match buf[0] % 4 {
+            if let Some(first) = buf.first_mut() {
+                *first = match *first % 4 {
                     0 => b'!',
                     1 => b'=',
                     2 => b'/',
@@ -109,9 +109,13 @@ fn fuzz_parse_aprs_data_known_first_bytes() {
     for &prefix in prefixes {
         for size in 1..=64 {
             let mut buf = vec![0u8; size];
-            buf[0] = prefix;
-            if size > 1 {
-                rng.fill(&mut buf[1..]);
+            if let Some(first) = buf.first_mut() {
+                *first = prefix;
+            }
+            if size > 1
+                && let Some(tail) = buf.get_mut(1..)
+            {
+                rng.fill(tail);
             }
             let _ = parse_aprs_data(&buf);
         }

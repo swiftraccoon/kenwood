@@ -116,7 +116,11 @@ const PITCH_DEFAULT_IDX: usize = 116;
 /// in samples. Index 0 → period 21.0, index 1 → 21.5, ...,
 /// index 202 → 122.0.
 #[inline]
-#[allow(clippy::cast_precision_loss, reason = "pitch index always ≤ 202")]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "OP25 pitch index is bounded by PITCH_CANDIDATES (203); usize-to-f32 is exact \
+              at these magnitudes."
+)]
 const fn idx_to_period(idx: usize) -> f32 {
     21.0 + (idx as f32) * 0.5
 }
@@ -124,11 +128,13 @@ const fn idx_to_period(idx: usize) -> f32 {
 /// Inverse of [`idx_to_period`], clamping out-of-range periods into
 /// the valid `0..PITCH_CANDIDATES` index space.
 #[inline]
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    reason = "period is small, finite, and already clamped to valid range"
+    reason = "Inverse of idx_to_period: the caller passes a period that is small (<= 123 \
+              samples) and finite, and this function explicitly clamps into 0..PITCH_CANDIDATES, \
+              so all casts are safe within the bounded range."
 )]
 fn period_to_idx(period: f32) -> usize {
     let idx = ((period - 21.0) * 2.0).round();
@@ -160,9 +166,11 @@ pub struct PitchEstimate {
 /// variables. All fields are prefixed `prev` by design — they're the
 /// rolling history the look-back / cumulative-error tests consume.
 #[derive(Debug, Clone, Copy)]
-#[allow(
+#[expect(
     clippy::struct_field_names,
-    reason = "OP25 uses the same `prev_*` naming; lint fires on the pattern, not on real confusion"
+    reason = "OP25 pitch_est member variables use the `prev_*` prefix by convention; the \
+              lint fires on the naming pattern itself, not on real ambiguity. Matching OP25's \
+              naming keeps cross-references to the reference implementation straightforward."
 )]
 pub struct PitchTracker {
     /// Previous frame's pitch index (0..203).
@@ -223,10 +231,6 @@ impl PitchTracker {
     /// pre-computed `E(p)` array. Used by [`Self::estimate`] and
     /// internally by [`Self::estimate_with_lookahead`] as its
     /// look-back half.
-    #[allow(
-        clippy::similar_names,
-        reason = "pb/pf and ceb/cef mirror OP25's variable naming for cross-reference"
-    )]
     fn track_single_frame(&mut self, e_p: &[f32; PITCH_CANDIDATES]) -> PitchEstimate {
         // --- Look-back pitch tracking (pitch_est.cc:200–226) ---
         let entry = MIN_MAX_TBL
@@ -389,10 +393,11 @@ impl PitchTracker {
     /// — `prev_pitch_idx`, `prev_e_p`, and their `prev_prev`
     /// shadows roll forward.
     #[must_use]
-    #[allow(
-        clippy::similar_names,
+    #[expect(
         clippy::too_many_lines,
-        reason = "Mirrors OP25's pitch_est block so the port can be read side-by-side with the reference"
+        reason = "Mirrors OP25's pitch_est lookahead block so the port can be read \
+                  side-by-side with the reference. The long linear structure comes from \
+                  OP25's algorithm; splitting would obscure the one-to-one mapping."
     )]
     pub fn estimate_with_lookahead(
         &mut self,
@@ -565,10 +570,11 @@ impl PitchTracker {
 /// and hand them to [`PitchTracker::estimate_with_lookahead`]. The
 /// single-frame [`PitchTracker::estimate`] calls this internally.
 #[must_use]
-#[allow(
+#[expect(
     clippy::similar_names,
-    clippy::too_many_lines,
-    reason = "OP25's e_p() body kept flat for easy cross-reference with the reference implementation"
+    reason = "OP25's e_p() body is kept close to the reference: similar variable names \
+              (e.g., cef/ceb, pb/pf) mirror OP25's pitch_est.cc, which makes \
+              cross-referencing straightforward."
 )]
 pub fn compute_e_p(pitch_est_buf: &[f32; PITCH_EST_BUF_SIZE]) -> [f32; PITCH_CANDIDATES] {
     let mut windowed = [0.0_f32; PITCH_EST_BUF_SIZE];
@@ -630,7 +636,11 @@ pub fn compute_e_p(pitch_est_buf: &[f32; PITCH_EST_BUF_SIZE]) -> [f32; PITCH_CAN
             j += index_step;
         }
         let sum_corr_scaled = sum_corr / 64.0;
-        #[allow(clippy::cast_precision_loss, reason = "index_step ≤ 244")]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "E(p) pitch-period computation: index_step = 42 + i with i bounded by \
+                      PITCH_CANDIDATES (203), so index_step <= 244; usize-to-f32 cast is exact."
+        )]
         let p = index_step as f32;
         let l_num = p.mul_add(-(l_e0 + sum_corr_scaled), l_sum);
         let ratio = (l_num / l_sum).clamp(0.0, 1.0);
@@ -691,7 +701,10 @@ mod tests {
         let f0_hz = 150.0_f32;
         let sr = 8000.0_f32;
         for (i, slot) in buf.iter_mut().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test tone generator: i < PITCH_EST_BUF_SIZE (320), exact in f32."
+            )]
             let t = i as f32;
             *slot = (t * 2.0 * std::f32::consts::PI * f0_hz / sr).sin();
         }
@@ -722,7 +735,10 @@ mod tests {
         let f0_hz = 200.0_f32;
         let sr = 8000.0_f32;
         for (i, slot) in buf.iter_mut().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test tone generator: i < PITCH_EST_BUF_SIZE (320), exact in f32."
+            )]
             let t = i as f32;
             *slot = (t * 2.0 * std::f32::consts::PI * f0_hz / sr).sin();
         }
@@ -760,7 +776,10 @@ mod tests {
         // frames agree on pitch, so DP picks the stable answer.
         let mut buf = [0.0_f32; PITCH_EST_BUF_SIZE];
         for (i, slot) in buf.iter_mut().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test tone generator: i < PITCH_EST_BUF_SIZE (320), exact in f32."
+            )]
             let t = i as f32;
             *slot = (t * 2.0 * std::f32::consts::PI * 200.0 / 8000.0).sin();
         }
@@ -790,11 +809,17 @@ mod tests {
         let sr = 8000.0_f32;
         let harmonics = [1.0_f32, 0.6, 0.35, 0.2];
         for (i, slot) in buf.iter_mut().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test voice-like generator: i < PITCH_EST_BUF_SIZE (320), exact in f32."
+            )]
             let t = i as f32;
             let mut sum = 0.0_f32;
             for (k, &amp) in harmonics.iter().enumerate() {
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "harmonic index: k < 4, usize-to-f32 cast is exact."
+                )]
                 let harm = (k + 1) as f32;
                 sum += amp * (t * 2.0 * std::f32::consts::PI * f0_hz * harm / sr).sin();
             }
@@ -827,7 +852,10 @@ mod tests {
         let f0_hz = 150.0_f32;
         let sr = 8000.0_f32;
         for (i, slot) in buf.iter_mut().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test tone generator: i < PITCH_EST_BUF_SIZE (320), exact in f32."
+            )]
             let t = i as f32;
             *slot = (t * 2.0 * std::f32::consts::PI * f0_hz / sr).sin();
         }

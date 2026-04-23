@@ -992,8 +992,7 @@ impl Default for VoiceAlertConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            // SAFETY: 12 is within valid range 0-49.
-            tone_code: ToneCode::new(12).expect("default tone code 12 is valid"),
+            tone_code: ToneCode::TONE_100HZ,
         }
     }
 }
@@ -1179,16 +1178,20 @@ pub struct AprsStation {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn aprs_callsign_valid() {
-        let cs = AprsCallsign::new("N0CALL-9").unwrap();
+    fn aprs_callsign_valid() -> TestResult {
+        let cs = AprsCallsign::new("N0CALL-9").ok_or("valid callsign rejected")?;
         assert_eq!(cs.as_str(), "N0CALL-9");
+        Ok(())
     }
 
     #[test]
-    fn aprs_callsign_max_length() {
-        let cs = AprsCallsign::new("N0CALL-15").unwrap();
+    fn aprs_callsign_max_length() -> TestResult {
+        let cs = AprsCallsign::new("N0CALL-15").ok_or("valid 9-char callsign rejected")?;
         assert_eq!(cs.as_str(), "N0CALL-15");
+        Ok(())
     }
 
     #[test]
@@ -1197,9 +1200,10 @@ mod tests {
     }
 
     #[test]
-    fn status_text_valid() {
-        let st = StatusText::new("Testing 1 2 3").unwrap();
+    fn status_text_valid() -> TestResult {
+        let st = StatusText::new("Testing 1 2 3").ok_or("valid status text rejected")?;
         assert_eq!(st.as_str(), "Testing 1 2 3");
+        Ok(())
     }
 
     #[test]
@@ -1245,9 +1249,10 @@ mod tests {
     }
 
     #[test]
-    fn filter_phrase_valid() {
-        let fp = FilterPhrase::new("N0CALL").unwrap();
+    fn filter_phrase_valid() -> TestResult {
+        let fp = FilterPhrase::new("N0CALL").ok_or("valid filter phrase rejected")?;
         assert_eq!(fp.as_str(), "N0CALL");
+        Ok(())
     }
 
     #[test]
@@ -1256,9 +1261,10 @@ mod tests {
     }
 
     #[test]
-    fn reply_message_valid() {
-        let rm = ReplyMessage::new("I am away").unwrap();
+    fn reply_message_valid() -> TestResult {
+        let rm = ReplyMessage::new("I am away").ok_or("valid reply message rejected")?;
         assert_eq!(rm.as_str(), "I am away");
+        Ok(())
     }
 
     #[test]
@@ -1275,9 +1281,10 @@ mod tests {
     }
 
     #[test]
-    fn group_code_valid() {
-        let gc = GroupCode::new("ARES").unwrap();
+    fn group_code_valid() -> TestResult {
+        let gc = GroupCode::new("ARES").ok_or("valid group code rejected")?;
         assert_eq!(gc.as_str(), "ARES");
+        Ok(())
     }
 
     #[test]

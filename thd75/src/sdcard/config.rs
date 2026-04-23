@@ -156,16 +156,36 @@ pub fn parse_config(data: &[u8]) -> Result<RadioConfig, SdCardError> {
     }
 
     // --- Parse header ---
-    let mut raw_header = [0u8; HEADER_SIZE];
-    raw_header.copy_from_slice(&data[..HEADER_SIZE]);
+    let header_slice = data.get(..HEADER_SIZE).ok_or(SdCardError::FileTooSmall {
+        expected: HEADER_SIZE,
+        actual: data.len(),
+    })?;
+    let raw_header =
+        <[u8; HEADER_SIZE]>::try_from(header_slice).map_err(|_| SdCardError::FileTooSmall {
+            expected: HEADER_SIZE,
+            actual: data.len(),
+        })?;
 
-    let model = extract_null_terminated(&raw_header[..16]);
+    let model_slice = raw_header.get(..16).ok_or(SdCardError::FileTooSmall {
+        expected: 16,
+        actual: raw_header.len(),
+    })?;
+    let model = extract_null_terminated(model_slice);
     if !KNOWN_MODELS.contains(&model.as_str()) {
         return Err(SdCardError::InvalidModelString { found: model });
     }
 
-    let mut version_bytes = [0u8; 4];
-    version_bytes.copy_from_slice(&raw_header[0x14..0x18]);
+    let version_slice = raw_header
+        .get(0x14..0x18)
+        .ok_or(SdCardError::FileTooSmall {
+            expected: 0x18,
+            actual: raw_header.len(),
+        })?;
+    let version_bytes =
+        <[u8; 4]>::try_from(version_slice).map_err(|_| SdCardError::FileTooSmall {
+            expected: 0x18,
+            actual: raw_header.len(),
+        })?;
 
     let header = ConfigHeader {
         model,
@@ -185,12 +205,18 @@ pub fn parse_config(data: &[u8]) -> Result<RadioConfig, SdCardError> {
         // treat it as unused rather than erroring (the file may have
         // been truncated after the documented sections).
         let ch_end = ch_offset + CHANNEL_ENTRY_SIZE;
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Loop index `i` ranges over 0..MAX_CHANNELS (=1000). u16::MAX is 65535, so \
+                      the usize-to-u16 cast is provably lossless."
+        )]
         let ch_index = i as u16; // MAX_CHANNELS = 1000, always fits in u16
 
-        let (used, flash) = if ch_end <= data.len() {
-            let ch_bytes = &data[ch_offset..ch_end];
-            let rx_freq = u32::from_le_bytes([ch_bytes[0], ch_bytes[1], ch_bytes[2], ch_bytes[3]]);
+        let (used, flash) = if let Some(ch_bytes) = data.get(ch_offset..ch_end) {
+            // ch_bytes is CHANNEL_ENTRY_SIZE (40) bytes so split_first_chunk::<4> always yields Some.
+            let rx_freq = ch_bytes
+                .split_first_chunk::<4>()
+                .map_or(0, |(head, _)| u32::from_le_bytes(*head));
             let is_used = rx_freq != 0 && rx_freq != 0xFFFF_FFFF;
             let ch = FlashChannel::from_bytes(ch_bytes).map_err(|e| SdCardError::ChannelParse {
                 index: ch_index,
@@ -202,18 +228,15 @@ pub fn parse_config(data: &[u8]) -> Result<RadioConfig, SdCardError> {
         };
 
         // Channel name
-        let name = if name_offset + CHANNEL_NAME_SIZE <= data.len() {
-            extract_null_terminated(&data[name_offset..name_offset + CHANNEL_NAME_SIZE])
-        } else {
-            String::new()
-        };
+        let name = data
+            .get(name_offset..name_offset + CHANNEL_NAME_SIZE)
+            .map_or_else(String::new, extract_null_terminated);
 
         // Channel flags: bit 0 of byte 0 = lockout
-        let lockout = if flags_offset + CHANNEL_FLAGS_SIZE <= data.len() {
-            data[flags_offset] & 0x01 != 0
-        } else {
-            false
-        };
+        let lockout = data
+            .get(flags_offset..flags_offset + CHANNEL_FLAGS_SIZE)
+            .and_then(<[u8]>::first)
+            .is_some_and(|b| b & 0x01 != 0);
 
         channels.push(ChannelEntry {
             number: ch_index,
@@ -225,7 +248,14 @@ pub fn parse_config(data: &[u8]) -> Result<RadioConfig, SdCardError> {
     }
 
     // Preserve the entire memory image (minus header) for round-trip.
-    let raw_image = data[HEADER_SIZE..].to_vec();
+    // The FileTooSmall check at the top of this function guarantees data.len() >= HEADER_SIZE.
+    let raw_image = data
+        .get(HEADER_SIZE..)
+        .ok_or(SdCardError::FileTooSmall {
+            expected: HEADER_SIZE,
+            actual: data.len(),
+        })?
+        .to_vec();
 
     Ok(RadioConfig {
         header,
@@ -245,11 +275,17 @@ pub fn write_config(config: &RadioConfig) -> Vec<u8> {
     let total_size = HEADER_SIZE + image_size;
     let mut out = vec![0u8; total_size];
 
-    // Write header
-    out[..HEADER_SIZE].copy_from_slice(&config.header.raw);
+    // Write header. `out` was just sized to `HEADER_SIZE + image_size`, so the 0..HEADER_SIZE
+    // split always succeeds; `copy_from_slice` panics only on length mismatch, which is
+    // impossible here since both halves are fixed-size HEADER_SIZE bytes.
+    if let Some(dst) = out.get_mut(..HEADER_SIZE) {
+        dst.copy_from_slice(&config.header.raw);
+    }
 
     // Write raw image as the base (preserves all settings)
-    out[HEADER_SIZE..].copy_from_slice(&config.raw_image);
+    if let Some(dst) = out.get_mut(HEADER_SIZE..) {
+        dst.copy_from_slice(&config.raw_image);
+    }
 
     // Patch channel data, names, and flags
     for entry in &config.channels {
@@ -261,30 +297,38 @@ pub fn write_config(config: &RadioConfig) -> Vec<u8> {
         // Channel memory (40 bytes)
         let ch_offset = CHANNEL_DATA_OFFSET + (i * CHANNEL_ENTRY_SIZE);
         let ch_end = ch_offset + CHANNEL_ENTRY_SIZE;
-        if ch_end <= out.len() {
+        if let Some(dst) = out.get_mut(ch_offset..ch_end) {
             let bytes = entry.flash.to_bytes();
-            out[ch_offset..ch_end].copy_from_slice(&bytes);
+            dst.copy_from_slice(&bytes);
         }
 
         // Channel name (16 bytes, null-padded)
         let name_offset = CHANNEL_NAME_OFFSET + (i * CHANNEL_NAME_SIZE);
         let name_end = name_offset + CHANNEL_NAME_SIZE;
-        if name_end <= out.len() {
+        if let Some(dst) = out.get_mut(name_offset..name_end) {
             let mut name_buf = [0u8; CHANNEL_NAME_SIZE];
             let src = entry.name.as_bytes();
             let copy_len = src.len().min(CHANNEL_NAME_SIZE);
-            name_buf[..copy_len].copy_from_slice(&src[..copy_len]);
-            out[name_offset..name_end].copy_from_slice(&name_buf);
+            // Both halves are bounded by copy_len, so these slices exist by construction.
+            if let (Some(dst_head), Some(src_head)) =
+                (name_buf.get_mut(..copy_len), src.get(..copy_len))
+            {
+                dst_head.copy_from_slice(src_head);
+            }
+            dst.copy_from_slice(&name_buf);
         }
 
         // Channel flags (4 bytes, bit 0 = lockout)
         let flags_offset = CHANNEL_FLAGS_OFFSET + (i * CHANNEL_FLAGS_SIZE);
-        if flags_offset + CHANNEL_FLAGS_SIZE <= out.len() {
-            // Preserve existing flag bits; only toggle lockout bit 0.
-            if entry.lockout {
-                out[flags_offset] |= 0x01;
-            } else {
-                out[flags_offset] &= !0x01;
+        if let Some(flag_byte) = out.get_mut(flags_offset) {
+            // Guard that the full 4-byte flags region is within bounds before touching byte 0.
+            if flags_offset + CHANNEL_FLAGS_SIZE <= total_size {
+                // Preserve existing flag bits; only toggle lockout bit 0.
+                if entry.lockout {
+                    *flag_byte |= 0x01;
+                } else {
+                    *flag_byte &= !0x01;
+                }
             }
         }
     }
@@ -295,7 +339,10 @@ pub fn write_config(config: &RadioConfig) -> Vec<u8> {
 /// Extracts a null-terminated ASCII string from a byte slice.
 fn extract_null_terminated(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
+    // `position` guarantees `end <= bytes.len()`, so `.get(..end)` always returns `Some`.
+    bytes.get(..end).map_or_else(String::new, |valid| {
+        String::from_utf8_lossy(valid).into_owned()
+    })
 }
 
 /// Creates a minimal valid `.d75` header for the given model string.
@@ -316,8 +363,14 @@ pub fn make_header(model: &str, version_bytes: [u8; 4]) -> Result<ConfigHeader, 
     let mut raw = [0u8; HEADER_SIZE];
     let model_bytes = model.as_bytes();
     let copy_len = model_bytes.len().min(16);
-    raw[..copy_len].copy_from_slice(&model_bytes[..copy_len]);
-    raw[0x14..0x18].copy_from_slice(&version_bytes);
+    // copy_len <= 16 <= HEADER_SIZE, so both slices are in bounds by construction.
+    if let (Some(dst), Some(src)) = (raw.get_mut(..copy_len), model_bytes.get(..copy_len)) {
+        dst.copy_from_slice(src);
+    }
+    // 0x18 <= HEADER_SIZE (0x100), so this 4-byte slot is in bounds by construction.
+    if let Some(dst) = raw.get_mut(0x14..0x18) {
+        dst.copy_from_slice(&version_bytes);
+    }
 
     Ok(ConfigHeader {
         model: model.to_owned(),
@@ -399,11 +452,38 @@ mod tests {
     use super::*;
     use crate::types::frequency::Frequency;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type BoxErr = Box<dyn std::error::Error>;
+
+    fn set_byte(image: &mut [u8], offset: usize, value: u8) -> Result<(), BoxErr> {
+        let img_len = image.len();
+        *image
+            .get_mut(offset)
+            .ok_or_else(|| format!("set_byte: offset {offset} out of range (len={img_len})"))? =
+            value;
+        Ok(())
+    }
+
+    fn write_slice(image: &mut [u8], offset: usize, data: &[u8]) -> Result<(), BoxErr> {
+        let end = offset + data.len();
+        let img_len = image.len();
+        image
+            .get_mut(offset..end)
+            .ok_or_else(|| {
+                format!("write_slice: range {offset}..{end} out of bounds (len={img_len})")
+            })?
+            .copy_from_slice(data);
+        Ok(())
+    }
+
     #[test]
-    fn extract_null_terminated_basic() {
+    fn extract_null_terminated_basic() -> TestResult {
         let mut buf = [0u8; 16];
-        buf[..5].copy_from_slice(b"hello");
+        buf.get_mut(..5)
+            .ok_or("buf too short for 5 bytes")?
+            .copy_from_slice(b"hello");
         assert_eq!(extract_null_terminated(&buf), "hello");
+        Ok(())
     }
 
     #[test]
@@ -413,17 +493,24 @@ mod tests {
     }
 
     #[test]
-    fn make_header_valid() {
-        let hdr = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42]).unwrap();
+    fn make_header_valid() -> TestResult {
+        let hdr = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
         assert_eq!(hdr.model, "Data For TH-D75A");
         assert_eq!(hdr.version_bytes, [0x95, 0xC4, 0x8F, 0x42]);
         assert_eq!(hdr.raw.len(), HEADER_SIZE);
+        Ok(())
     }
 
     #[test]
-    fn make_header_invalid_model() {
-        let err = make_header("Data For TH-D74A", [0; 4]).unwrap_err();
-        assert!(matches!(err, SdCardError::InvalidModelString { .. }));
+    fn make_header_invalid_model() -> TestResult {
+        let err = make_header("Data For TH-D74A", [0; 4])
+            .err()
+            .ok_or("expected InvalidModelString error but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::InvalidModelString { .. }),
+            "expected InvalidModelString, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -453,91 +540,116 @@ mod tests {
     }
 
     #[test]
-    fn write_d75_round_trip() {
+    fn write_d75_round_trip() -> TestResult {
         use crate::memory::MemoryImage;
         use crate::protocol::programming;
 
-        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42]).unwrap();
+        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
         let raw = vec![0u8; programming::TOTAL_SIZE];
-        let image = MemoryImage::from_raw(raw).unwrap();
+        let image = MemoryImage::from_raw(raw)?;
 
         // Write the .d75 file.
-        let d75_bytes = write_d75(&image, &header).unwrap();
+        let d75_bytes = write_d75(&image, &header)?;
 
         // The output should be header + image.
         assert_eq!(d75_bytes.len(), HEADER_SIZE + programming::TOTAL_SIZE);
-        assert_eq!(&d75_bytes[..HEADER_SIZE], &header.raw);
-        assert_eq!(&d75_bytes[HEADER_SIZE..], image.as_raw());
+        assert_eq!(
+            d75_bytes.get(..HEADER_SIZE).ok_or("d75_bytes too short")?,
+            &header.raw
+        );
+        assert_eq!(
+            d75_bytes.get(HEADER_SIZE..).ok_or("d75_bytes too short")?,
+            image.as_raw()
+        );
 
         // Round-trip: parse it back and verify.
-        let parsed = parse_config(&d75_bytes).unwrap();
+        let parsed = parse_config(&d75_bytes)?;
         assert_eq!(parsed.header.model, "Data For TH-D75A");
         assert_eq!(parsed.header.version_bytes, [0x95, 0xC4, 0x8F, 0x42]);
         assert_eq!(parsed.raw_image.len(), d75_bytes.len() - HEADER_SIZE);
+        Ok(())
     }
 
     #[test]
-    fn write_d75_invalid_model_rejected() {
+    fn write_d75_invalid_model_rejected() -> TestResult {
         use crate::memory::MemoryImage;
         use crate::protocol::programming;
 
         let mut raw_header = [0u8; HEADER_SIZE];
-        raw_header[..17].copy_from_slice(b"Data For TH-D74A\0");
+        raw_header
+            .get_mut(..17)
+            .ok_or("raw_header too short")?
+            .copy_from_slice(b"Data For TH-D74A\0");
         let header = ConfigHeader {
             model: "Data For TH-D74A".to_owned(),
             version_bytes: [0; 4],
             raw: raw_header,
         };
         let raw = vec![0u8; programming::TOTAL_SIZE];
-        let image = MemoryImage::from_raw(raw).unwrap();
+        let image = MemoryImage::from_raw(raw)?;
 
-        let err = write_d75(&image, &header).unwrap_err();
-        assert!(matches!(err, SdCardError::InvalidModelString { .. }));
+        let err = write_d75(&image, &header)
+            .err()
+            .ok_or("expected InvalidModelString but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::InvalidModelString { .. }),
+            "expected InvalidModelString, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn write_d75_preserves_channel_data() {
+    fn write_d75_preserves_channel_data() -> TestResult {
         use crate::memory::MemoryImage;
         use crate::protocol::programming;
 
-        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42]).unwrap();
+        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
 
         // Build a raw image with some nonzero data in the channel region.
         let mut raw = vec![0u8; programming::TOTAL_SIZE];
         // Put a marker byte at offset 0x4000 (channel data section in the body).
         if raw.len() > 0x4000 {
-            raw[0x4000] = 0xAB;
+            set_byte(&mut raw, 0x4000, 0xAB)?;
         }
-        let image = MemoryImage::from_raw(raw).unwrap();
+        let image = MemoryImage::from_raw(raw)?;
 
-        let d75_bytes = write_d75(&image, &header).unwrap();
+        let d75_bytes = write_d75(&image, &header)?;
 
         // The marker should be at file offset HEADER_SIZE + 0x4000.
-        assert_eq!(d75_bytes[HEADER_SIZE + 0x4000], 0xAB);
+        assert_eq!(
+            *d75_bytes
+                .get(HEADER_SIZE + 0x4000)
+                .ok_or("d75_bytes too short")?,
+            0xAB
+        );
+        Ok(())
     }
 
     #[test]
-    fn parse_config_channel_parse_error() {
+    fn parse_config_channel_parse_error() -> TestResult {
         use crate::protocol::programming;
 
-        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42]).unwrap();
+        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
 
         // Build a valid .d75 file, then corrupt channel 0's step_size byte.
         let mut d75_data = vec![0u8; HEADER_SIZE + programming::TOTAL_SIZE];
-        d75_data[..HEADER_SIZE].copy_from_slice(&header.raw);
+        write_slice(&mut d75_data, 0, &header.raw)?;
 
         // Channel 0 data starts at file offset CHANNEL_DATA_OFFSET.
         // Give it a nonzero RX frequency so it's "used" and parsed.
         let ch0_offset = CHANNEL_DATA_OFFSET;
-        d75_data[ch0_offset..ch0_offset + 4].copy_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        write_slice(&mut d75_data, ch0_offset, &[0x01, 0x00, 0x00, 0x00])?;
         // Byte 0x08 of the channel record: high nibble = step_size.
         // Value 0xF0 => step_size = 15 which is out of range.
-        d75_data[ch0_offset + 0x08] = 0xF0;
+        set_byte(&mut d75_data, ch0_offset + 0x08, 0xF0)?;
 
-        let err = parse_config(&d75_data).unwrap_err();
+        let err = parse_config(&d75_data)
+            .err()
+            .ok_or("expected ChannelParse error but got Ok")?;
         assert!(
             matches!(err, SdCardError::ChannelParse { index: 0, .. }),
             "expected ChannelParse for index 0, got {err:?}"
         );
+        Ok(())
     }
 }

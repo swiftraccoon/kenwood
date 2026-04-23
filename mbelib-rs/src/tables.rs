@@ -30,10 +30,13 @@
 // them at module scope both keeps the upstream values byte-for-byte
 // identical to the C source and avoids a review burden every time
 // upstream changes. NOT the place to start applying style fixups.
-#![allow(
+#![expect(
     clippy::unreadable_literal,
     clippy::excessive_precision,
-    reason = "verbatim port of mbelib 2400 codebook values"
+    reason = "verbatim port of mbelib 2400 codebook values: clippy's style lints \
+              (unreadable literals, excessive f32 precision) flag thousands of entries in \
+              these codec tables. Silencing at module scope keeps values byte-for-byte \
+              identical to the C source and avoids reformatting upstream data."
 )]
 
 /// D-STAR fundamental frequency table (`cycles/sample`).

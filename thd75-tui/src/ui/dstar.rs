@@ -1,3 +1,12 @@
+#![expect(
+    clippy::too_many_lines,
+    reason = "D-STAR pane render functions draw complete UI sections (session status, \
+              stream history, last-heard list) — Ratatui's immediate-mode API means each \
+              visible cell is an explicit construction call. Splitting per-section \
+              helpers would move the layout logic away from the constraints that bound \
+              it, making the view harder to read end-to-end."
+)]
+
 use std::time::Instant;
 
 use ratatui::Frame;

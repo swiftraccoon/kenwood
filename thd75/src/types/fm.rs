@@ -95,7 +95,6 @@ impl FmRadioChannel {
 
     /// Returns the frequency in MHz as a floating-point value.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
     pub fn frequency_mhz(&self) -> f64 {
         f64::from(self.frequency_hz) / 1_000_000.0
     }
@@ -140,12 +139,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fm_channel_valid() {
-        let ch = FmRadioChannel::new(0, 89_100_000, "NPR".to_owned()).unwrap();
+    fn fm_channel_valid() -> Result<(), Box<dyn std::error::Error>> {
+        let ch = FmRadioChannel::new(0, 89_100_000, "NPR".to_owned())
+            .ok_or("valid FM channel rejected")?;
         assert_eq!(ch.number, 0);
         assert_eq!(ch.frequency_hz, 89_100_000);
         assert!((ch.frequency_mhz() - 89.1).abs() < 0.001);
         assert_eq!(ch.name, "NPR");
+        Ok(())
     }
 
     #[test]
@@ -169,21 +170,25 @@ mod tests {
     }
 
     #[test]
-    fn fm_channel_display_with_name() {
-        let ch = FmRadioChannel::new(3, 101_100_000, "KFLY".to_owned()).unwrap();
+    fn fm_channel_display_with_name() -> Result<(), Box<dyn std::error::Error>> {
+        let ch = FmRadioChannel::new(3, 101_100_000, "KFLY".to_owned())
+            .ok_or("valid FM channel rejected")?;
         let s = format!("{ch}");
         assert!(s.contains("FM3"));
         assert!(s.contains("101.1"));
         assert!(s.contains("KFLY"));
+        Ok(())
     }
 
     #[test]
-    fn fm_channel_display_without_name() {
-        let ch = FmRadioChannel::new(0, 88_500_000, String::new()).unwrap();
+    fn fm_channel_display_without_name() -> Result<(), Box<dyn std::error::Error>> {
+        let ch =
+            FmRadioChannel::new(0, 88_500_000, String::new()).ok_or("valid FM channel rejected")?;
         let s = format!("{ch}");
         assert!(s.contains("FM0"));
         assert!(s.contains("88.5"));
         assert!(!s.contains('('));
+        Ok(())
     }
 
     #[test]

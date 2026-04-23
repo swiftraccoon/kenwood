@@ -250,15 +250,17 @@ mod tests {
     }
 
     #[test]
-    fn dtmf_name_valid() {
-        let name = DtmfName::new("AUTOPAT").unwrap();
+    fn dtmf_name_valid() -> Result<(), Box<dyn std::error::Error>> {
+        let name = DtmfName::new("AUTOPAT").ok_or("valid DTMF name rejected")?;
         assert_eq!(name.as_str(), "AUTOPAT");
+        Ok(())
     }
 
     #[test]
-    fn dtmf_name_max_length() {
-        let name = DtmfName::new("12345678").unwrap();
+    fn dtmf_name_max_length() -> Result<(), Box<dyn std::error::Error>> {
+        let name = DtmfName::new("12345678").ok_or("valid 8-char DTMF name rejected")?;
         assert_eq!(name.as_str().len(), 8);
+        Ok(())
     }
 
     #[test]
@@ -267,17 +269,19 @@ mod tests {
     }
 
     #[test]
-    fn dtmf_digits_valid() {
-        let digits = DtmfDigits::new("123A*#BD").unwrap();
+    fn dtmf_digits_valid() -> Result<(), Box<dyn std::error::Error>> {
+        let digits = DtmfDigits::new("123A*#BD").ok_or("valid DTMF digits rejected")?;
         assert_eq!(digits.as_str(), "123A*#BD");
         assert_eq!(digits.len(), 8);
         assert!(!digits.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn dtmf_digits_empty() {
-        let digits = DtmfDigits::new("").unwrap();
+    fn dtmf_digits_empty() -> Result<(), Box<dyn std::error::Error>> {
+        let digits = DtmfDigits::new("").ok_or("empty DTMF digits rejected")?;
         assert!(digits.is_empty());
+        Ok(())
     }
 
     #[test]

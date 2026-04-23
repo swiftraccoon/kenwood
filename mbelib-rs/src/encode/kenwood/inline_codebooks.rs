@@ -9,8 +9,6 @@
 //! Each constant includes the original PC address as a comment so the
 //! load sequence can be cross-referenced back to the disassembly.
 
-#![allow(dead_code)]
-
 /// Codebook from DSP function at 0x11800000
 /// (51 values).
 pub const FN_11800000: [i16; 51] = [

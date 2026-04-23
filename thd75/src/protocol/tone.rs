@@ -47,21 +47,21 @@ fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> 
 ///
 /// Hardware-verified: bare `TN\r` returns `TN mode,setting` (e.g., `TN 0,0`).
 fn parse_tn(payload: &str) -> Result<Response, ProtocolError> {
-    let parts: Vec<&str> = payload.splitn(2, ',').collect();
-    if parts.len() != 2 {
-        return Err(ProtocolError::FieldParse {
-            command: "TN".to_owned(),
-            field: "all".to_owned(),
-            detail: format!("expected mode,setting, got {payload:?}"),
-        });
-    }
-    let mode_raw = parse_u8_field(parts[0], "TN", "mode")?;
+    let (mode_str, setting_str) =
+        payload
+            .split_once(',')
+            .ok_or_else(|| ProtocolError::FieldParse {
+                command: "TN".to_owned(),
+                field: "all".to_owned(),
+                detail: format!("expected mode,setting, got {payload:?}"),
+            })?;
+    let mode_raw = parse_u8_field(mode_str, "TN", "mode")?;
     let mode = TncMode::try_from(mode_raw).map_err(|e| ProtocolError::FieldParse {
         command: "TN".to_owned(),
         field: "mode".to_owned(),
         detail: e.to_string(),
     })?;
-    let setting_raw = parse_u8_field(parts[1], "TN", "setting")?;
+    let setting_raw = parse_u8_field(setting_str, "TN", "setting")?;
     let setting = TncBaud::try_from(setting_raw).map_err(|e| ProtocolError::FieldParse {
         command: "TN".to_owned(),
         field: "setting".to_owned(),
@@ -75,22 +75,28 @@ fn parse_tn(payload: &str) -> Result<Response, ProtocolError> {
 /// Hardware-verified: `DC slot\r` returns `DC slot,callsign,suffix`.
 /// Example: `DC 1,KQ4NIT  ,D75A`.
 fn parse_dc(payload: &str) -> Result<Response, ProtocolError> {
-    let parts: Vec<&str> = payload.splitn(3, ',').collect();
-    if parts.len() != 3 {
-        return Err(ProtocolError::FieldParse {
+    let (slot_str, rest) = payload
+        .split_once(',')
+        .ok_or_else(|| ProtocolError::FieldParse {
             command: "DC".to_owned(),
             field: "all".to_owned(),
             detail: format!("expected slot,callsign,suffix, got {payload:?}"),
-        });
-    }
-    let raw_slot = parse_u8_field(parts[0], "DC", "slot")?;
+        })?;
+    let (callsign_str, suffix_str) =
+        rest.split_once(',')
+            .ok_or_else(|| ProtocolError::FieldParse {
+                command: "DC".to_owned(),
+                field: "all".to_owned(),
+                detail: format!("expected slot,callsign,suffix, got {payload:?}"),
+            })?;
+    let raw_slot = parse_u8_field(slot_str, "DC", "slot")?;
     let slot = DstarSlot::new(raw_slot).map_err(|e| ProtocolError::FieldParse {
         command: "DC".into(),
         field: "slot".into(),
         detail: e.to_string(),
     })?;
-    let callsign = parts[1].to_owned();
-    let suffix = parts[2].to_owned();
+    let callsign = callsign_str.to_owned();
+    let suffix = suffix_str.to_owned();
     Ok(Response::DstarCallsign {
         slot,
         callsign,

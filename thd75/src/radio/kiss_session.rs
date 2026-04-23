@@ -227,7 +227,9 @@ impl<T: Transport> KissSession<T> {
                     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed"),
                 )));
             }
-            self.read_buf.extend_from_slice(&tmp[..n]);
+            if let Some(chunk) = tmp.get(..n) {
+                self.read_buf.extend_from_slice(chunk);
+            }
         }
     }
 
@@ -237,18 +239,18 @@ impl<T: Transport> KissSession<T> {
     /// are removed from the buffer and decoded. Leading FENDs (inter-frame
     /// fill) are consumed.
     fn try_extract_frame(buf: &mut Vec<u8>) -> Option<KissFrame> {
-        // Skip leading FENDs.
-        while buf.first() == Some(&FEND) && buf.len() > 1 && buf[1] == FEND {
-            let _ = buf.remove(0);
+        // Skip leading duplicate FENDs (inter-frame fill).
+        while matches!(buf.first(), Some(&FEND)) && matches!(buf.get(1), Some(&FEND)) {
+            let _removed: u8 = buf.remove(0);
         }
 
         // Need at least FEND + type + FEND.
-        if buf.len() < 3 || buf[0] != FEND {
+        if buf.len() < 3 || buf.first() != Some(&FEND) {
             return None;
         }
 
         // Find the closing FEND after the opening one.
-        let end_pos = buf[1..].iter().position(|&b| b == FEND)?;
+        let end_pos = buf.get(1..)?.iter().position(|&b| b == FEND)?;
         let frame_end = end_pos + 2; // Include the closing FEND.
 
         let frame_bytes: Vec<u8> = buf.drain(..frame_end).collect();
@@ -432,33 +434,47 @@ mod tests {
     use crate::types::TncBaud;
     use kiss_tnc::{CMD_DATA, FEND};
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type BoxErr = Box<dyn std::error::Error>;
+
     /// Helper: create a Radio with a mock that expects the TN 2,0 command.
-    async fn mock_radio_for_kiss(baud: TncBaud) -> Radio<MockTransport> {
+    async fn mock_radio_for_kiss(baud: TncBaud) -> Result<Radio<MockTransport>, BoxErr> {
         let tn_cmd = format!("TN 2,{}\r", u8::from(baud));
         let tn_resp = format!("TN 2,{}\r", u8::from(baud));
         let mut mock = MockTransport::new();
         mock.expect(tn_cmd.as_bytes(), tn_resp.as_bytes());
-        Radio::connect(mock).await.unwrap()
+        Ok(Radio::connect(mock).await?)
     }
 
     #[tokio::test]
-    async fn enter_kiss_sends_tn_command() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await;
-        let session = radio.enter_kiss(TncBaud::Bps1200).await.unwrap();
+    async fn enter_kiss_sends_tn_command() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
         // Session created successfully means the TN command was sent and accepted.
         assert!(format!("{session:?}").contains("KissSession"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn enter_kiss_9600_baud() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps9600).await;
-        let _session = radio.enter_kiss(TncBaud::Bps9600).await.unwrap();
+    async fn enter_kiss_9600_baud() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps9600).await?;
+        let _session = radio
+            .enter_kiss(TncBaud::Bps9600)
+            .await
+            .map_err(|(_, e)| e)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn send_frame_writes_kiss_encoded() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await;
-        let mut session = radio.enter_kiss(TncBaud::Bps1200).await.unwrap();
+    async fn send_frame_writes_kiss_encoded() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
 
         // The mock transport has no more exchanges queued, so sending
         // will fail. We add one to verify encoding.
@@ -471,112 +487,149 @@ mod tests {
             command: CMD_DATA,
             data: vec![0xAA, 0xBB],
         };
-        session.send_frame(&frame).await.unwrap();
+        session.send_frame(&frame).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn send_data_wraps_in_kiss() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await;
-        let mut session = radio.enter_kiss(TncBaud::Bps1200).await.unwrap();
+    async fn send_data_wraps_in_kiss() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
 
         session
             .transport
             .expect(&[FEND, 0x00, 0x01, 0x02, FEND], &[]);
 
-        session.send_data(&[0x01, 0x02]).await.unwrap();
+        session.send_data(&[0x01, 0x02]).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_tx_delay_sends_correct_frame() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await;
-        let mut session = radio.enter_kiss(TncBaud::Bps1200).await.unwrap();
+    async fn set_tx_delay_sends_correct_frame() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
 
         // TX delay of 50 (500 ms)
         session.transport.expect(&[FEND, 0x01, 50, FEND], &[]);
 
-        session.set_tx_delay(50).await.unwrap();
+        session.set_tx_delay(50).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_persistence_sends_correct_frame() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await;
-        let mut session = radio.enter_kiss(TncBaud::Bps1200).await.unwrap();
+    async fn set_persistence_sends_correct_frame() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
 
         session.transport.expect(&[FEND, 0x02, 128, FEND], &[]);
 
-        session.set_persistence(128).await.unwrap();
+        session.set_persistence(128).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_slot_time_sends_correct_frame() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await;
-        let mut session = radio.enter_kiss(TncBaud::Bps1200).await.unwrap();
+    async fn set_slot_time_sends_correct_frame() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
 
         session.transport.expect(&[FEND, 0x03, 10, FEND], &[]);
 
-        session.set_slot_time(10).await.unwrap();
+        session.set_slot_time(10).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_tx_tail_sends_correct_frame() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await;
-        let mut session = radio.enter_kiss(TncBaud::Bps1200).await.unwrap();
+    async fn set_tx_tail_sends_correct_frame() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
 
         session.transport.expect(&[FEND, 0x04, 3, FEND], &[]);
 
-        session.set_tx_tail(3).await.unwrap();
+        session.set_tx_tail(3).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_full_duplex_sends_correct_frame() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await;
-        let mut session = radio.enter_kiss(TncBaud::Bps1200).await.unwrap();
+    async fn set_full_duplex_sends_correct_frame() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
 
         session.transport.expect(&[FEND, 0x05, 1, FEND], &[]);
 
-        session.set_full_duplex(true).await.unwrap();
+        session.set_full_duplex(true).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_hardware_baud_1200() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await;
-        let mut session = radio.enter_kiss(TncBaud::Bps1200).await.unwrap();
+    async fn set_hardware_baud_1200() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
 
         session.transport.expect(&[FEND, 0x06, 0x00, FEND], &[]);
 
-        session.set_hardware_baud(true).await.unwrap();
+        session.set_hardware_baud(true).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_hardware_baud_9600() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await;
-        let mut session = radio.enter_kiss(TncBaud::Bps1200).await.unwrap();
+    async fn set_hardware_baud_9600() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
 
         session.transport.expect(&[FEND, 0x06, 0x05, FEND], &[]);
 
-        session.set_hardware_baud(false).await.unwrap();
+        session.set_hardware_baud(false).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn exit_sends_return_and_restores_radio() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await;
-        let mut session = radio.enter_kiss(TncBaud::Bps1200).await.unwrap();
+    async fn exit_sends_return_and_restores_radio() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
 
         // CMD_RETURN frame: C0 FF C0
         session.transport.expect(&[FEND, 0xFF, FEND], &[]);
 
-        let _radio = session.exit().await.unwrap();
+        let _radio = session.exit().await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn try_extract_frame_complete() {
+    async fn try_extract_frame_complete() -> TestResult {
         let mut buf = vec![FEND, 0x00, 0xAA, FEND];
-        let frame = KissSession::<MockTransport>::try_extract_frame(&mut buf);
-        assert!(frame.is_some());
-        let frame = frame.unwrap();
+        let frame = KissSession::<MockTransport>::try_extract_frame(&mut buf)
+            .ok_or("try_extract_frame returned None for complete frame")?;
         assert_eq!(frame.command, CMD_DATA);
         assert_eq!(frame.data, vec![0xAA]);
         assert!(buf.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -589,20 +642,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_extract_frame_leading_fends() {
+    async fn try_extract_frame_leading_fends() -> TestResult {
         let mut buf = vec![FEND, FEND, FEND, 0x00, 0xBB, FEND];
-        let frame = KissSession::<MockTransport>::try_extract_frame(&mut buf);
-        assert!(frame.is_some());
-        let frame = frame.unwrap();
+        let frame = KissSession::<MockTransport>::try_extract_frame(&mut buf)
+            .ok_or("try_extract_frame returned None for frame with leading FENDs")?;
         assert_eq!(frame.command, CMD_DATA);
         assert_eq!(frame.data, vec![0xBB]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_receive_timeout() {
-        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await;
-        let mut session = radio.enter_kiss(TncBaud::Bps1200).await.unwrap();
+    async fn set_receive_timeout() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
         session.set_receive_timeout(Duration::from_secs(30));
         assert_eq!(session.receive_timeout, Duration::from_secs(30));
+        Ok(())
     }
 }

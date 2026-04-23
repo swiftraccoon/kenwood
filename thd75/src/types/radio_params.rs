@@ -1148,20 +1148,24 @@ impl fmt::Display for GpsRadioMode {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn squelch_level_valid() {
+    fn squelch_level_valid() -> TestResult {
         for v in 0..SquelchLevel::COUNT {
-            let val = SquelchLevel::new(v).unwrap();
+            let val = SquelchLevel::new(v)?;
             assert_eq!(val.as_u8(), v, "SquelchLevel round-trip failed at {v}");
         }
         assert!(SquelchLevel::new(SquelchLevel::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn squelch_level_round_trip() {
-        let sq = SquelchLevel::new(4).unwrap();
+    fn squelch_level_round_trip() -> TestResult {
+        let sq = SquelchLevel::new(4)?;
         assert_eq!(u8::from(sq), 4);
         assert_eq!(sq.as_u8(), 4);
+        Ok(())
     }
 
     #[test]
@@ -1174,47 +1178,47 @@ mod tests {
     }
 
     #[test]
-    fn smeter_s_units() {
-        assert_eq!(SMeterReading::new(0).unwrap().s_unit(), "S0");
-        assert_eq!(
-            SMeterReading::new(SMeterReading::COUNT - 1)
-                .unwrap()
-                .s_unit(),
-            "S9"
-        );
+    fn smeter_s_units() -> TestResult {
+        assert_eq!(SMeterReading::new(0)?.s_unit(), "S0");
+        assert_eq!(SMeterReading::new(SMeterReading::COUNT - 1)?.s_unit(), "S9");
         assert!(SMeterReading::new(SMeterReading::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn vfo_memory_mode_round_trip() {
+    fn vfo_memory_mode_round_trip() -> TestResult {
         for v in 0..VfoMemoryMode::COUNT {
-            let mode = VfoMemoryMode::try_from(v).unwrap();
+            let mode = VfoMemoryMode::try_from(v)?;
             assert_eq!(u8::from(mode), v);
         }
         assert!(VfoMemoryMode::try_from(VfoMemoryMode::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn filter_mode_round_trip() {
+    fn filter_mode_round_trip() -> TestResult {
         for v in 0..FilterMode::COUNT {
-            let mode = FilterMode::try_from(v).unwrap();
+            let mode = FilterMode::try_from(v)?;
             assert_eq!(u8::from(mode), v);
         }
         assert!(FilterMode::try_from(FilterMode::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn battery_level_round_trip() {
+    fn battery_level_round_trip() -> TestResult {
         for v in 0..BatteryLevel::COUNT {
-            let bl = BatteryLevel::try_from(v).unwrap();
+            let bl = BatteryLevel::try_from(v)?;
             assert_eq!(u8::from(bl), v);
         }
         assert!(BatteryLevel::try_from(BatteryLevel::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn battery_level_charging() {
-        assert_eq!(BatteryLevel::try_from(4).unwrap(), BatteryLevel::Charging);
+    fn battery_level_charging() -> TestResult {
+        assert_eq!(BatteryLevel::try_from(4)?, BatteryLevel::Charging);
+        Ok(())
     }
 
     #[test]
@@ -1225,28 +1229,31 @@ mod tests {
     }
 
     #[test]
-    fn vox_delay_millis() {
-        let d = VoxDelay::new(15).unwrap();
+    fn vox_delay_millis() -> TestResult {
+        let d = VoxDelay::new(15)?;
         assert_eq!(d.as_millis(), 1500);
         assert!(VoxDelay::new(VoxDelay::MAX + 1).is_err());
+        Ok(())
     }
 
     #[test]
-    fn tnc_baud_round_trip() {
+    fn tnc_baud_round_trip() -> TestResult {
         for v in 0..TncBaud::COUNT {
-            let val = TncBaud::try_from(v).unwrap();
+            let val = TncBaud::try_from(v)?;
             assert_eq!(u8::from(val), v, "TncBaud round-trip failed at {v}");
         }
         assert!(TncBaud::try_from(TncBaud::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn beacon_mode_round_trip() {
+    fn beacon_mode_round_trip() -> TestResult {
         for v in 0..BeaconMode::COUNT {
-            let mode = BeaconMode::try_from(v).unwrap();
+            let mode = BeaconMode::try_from(v)?;
             assert_eq!(u8::from(mode), v);
         }
         assert!(BeaconMode::try_from(BeaconMode::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
@@ -1258,17 +1265,19 @@ mod tests {
     }
 
     #[test]
-    fn tnc_mode_round_trip() {
+    fn tnc_mode_round_trip() -> TestResult {
         for v in 0..TncMode::COUNT {
-            let mode = TncMode::try_from(v).unwrap();
+            let mode = TncMode::try_from(v)?;
             assert_eq!(u8::from(mode), v);
         }
         assert!(TncMode::try_from(TncMode::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn tnc_mode_kiss() {
-        assert_eq!(TncMode::try_from(2).unwrap(), TncMode::Kiss);
+    fn tnc_mode_kiss() -> TestResult {
+        assert_eq!(TncMode::try_from(2)?, TncMode::Kiss);
+        Ok(())
     }
 
     #[test]
@@ -1303,9 +1312,9 @@ mod tests {
     }
 
     #[test]
-    fn detect_output_mode_round_trip() {
+    fn detect_output_mode_round_trip() -> TestResult {
         for v in 0..DetectOutputMode::COUNT {
-            let val = DetectOutputMode::try_from(v).unwrap();
+            let val = DetectOutputMode::try_from(v)?;
             assert_eq!(
                 u8::from(val),
                 v,
@@ -1313,23 +1322,26 @@ mod tests {
             );
         }
         assert!(DetectOutputMode::try_from(DetectOutputMode::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn dv_gateway_mode_round_trip() {
+    fn dv_gateway_mode_round_trip() -> TestResult {
         for v in 0..DvGatewayMode::COUNT {
-            let val = DvGatewayMode::try_from(v).unwrap();
+            let val = DvGatewayMode::try_from(v)?;
             assert_eq!(u8::from(val), v, "DvGatewayMode round-trip failed at {v}");
         }
         assert!(DvGatewayMode::try_from(DvGatewayMode::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn gps_radio_mode_round_trip() {
+    fn gps_radio_mode_round_trip() -> TestResult {
         for v in 0..GpsRadioMode::COUNT {
-            let val = GpsRadioMode::try_from(v).unwrap();
+            let val = GpsRadioMode::try_from(v)?;
             assert_eq!(u8::from(val), v, "GpsRadioMode round-trip failed at {v}");
         }
         assert!(GpsRadioMode::try_from(GpsRadioMode::COUNT).is_err());
+        Ok(())
     }
 }

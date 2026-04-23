@@ -4,6 +4,8 @@
 use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::types::*;
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
 // ============================================================================
 // AI -- Auto-info (write-only boolean)
 // ============================================================================
@@ -25,19 +27,23 @@ fn serialize_ai_off() {
 }
 
 #[test]
-fn parse_ai_response_on() {
-    match protocol::parse(b"AI 1").unwrap() {
-        Response::AutoInfo { enabled } => assert!(enabled),
-        other => panic!("expected AutoInfo, got {other:?}"),
-    }
+fn parse_ai_response_on() -> TestResult {
+    let r = protocol::parse(b"AI 1")?;
+    let Response::AutoInfo { enabled } = r else {
+        return Err(format!("expected AutoInfo, got {r:?}").into());
+    };
+    assert!(enabled);
+    Ok(())
 }
 
 #[test]
-fn parse_ai_response_off() {
-    match protocol::parse(b"AI 0").unwrap() {
-        Response::AutoInfo { enabled } => assert!(!enabled),
-        other => panic!("expected AutoInfo, got {other:?}"),
-    }
+fn parse_ai_response_off() -> TestResult {
+    let r = protocol::parse(b"AI 0")?;
+    let Response::AutoInfo { enabled } = r else {
+        return Err(format!("expected AutoInfo, got {r:?}").into());
+    };
+    assert!(!enabled);
+    Ok(())
 }
 
 // ============================================================================
@@ -53,25 +59,25 @@ fn serialize_by_read() {
 }
 
 #[test]
-fn parse_by_busy() {
-    match protocol::parse(b"BY 0,1").unwrap() {
-        Response::Busy { band, busy } => {
-            assert_eq!(band, Band::A);
-            assert!(busy);
-        }
-        other => panic!("expected Busy, got {other:?}"),
-    }
+fn parse_by_busy() -> TestResult {
+    let r = protocol::parse(b"BY 0,1")?;
+    let Response::Busy { band, busy } = r else {
+        return Err(format!("expected Busy, got {r:?}").into());
+    };
+    assert_eq!(band, Band::A);
+    assert!(busy);
+    Ok(())
 }
 
 #[test]
-fn parse_by_not_busy() {
-    match protocol::parse(b"BY 1,0").unwrap() {
-        Response::Busy { band, busy } => {
-            assert_eq!(band, Band::B);
-            assert!(!busy);
-        }
-        other => panic!("expected Busy, got {other:?}"),
-    }
+fn parse_by_not_busy() -> TestResult {
+    let r = protocol::parse(b"BY 1,0")?;
+    let Response::Busy { band, busy } = r else {
+        return Err(format!("expected Busy, got {r:?}").into());
+    };
+    assert_eq!(band, Band::B);
+    assert!(!busy);
+    Ok(())
 }
 
 // ============================================================================
@@ -92,19 +98,23 @@ fn serialize_dl_on() {
 }
 
 #[test]
-fn parse_dl_enabled() {
-    match protocol::parse(b"DL 1").unwrap() {
-        Response::DualBand { enabled } => assert!(enabled),
-        other => panic!("expected DualBand, got {other:?}"),
-    }
+fn parse_dl_enabled() -> TestResult {
+    let r = protocol::parse(b"DL 1")?;
+    let Response::DualBand { enabled } = r else {
+        return Err(format!("expected DualBand, got {r:?}").into());
+    };
+    assert!(enabled);
+    Ok(())
 }
 
 #[test]
-fn parse_dl_disabled() {
-    match protocol::parse(b"DL 0").unwrap() {
-        Response::DualBand { enabled } => assert!(!enabled),
-        other => panic!("expected DualBand, got {other:?}"),
-    }
+fn parse_dl_disabled() -> TestResult {
+    let r = protocol::parse(b"DL 0")?;
+    let Response::DualBand { enabled } = r else {
+        return Err(format!("expected DualBand, got {r:?}").into());
+    };
+    assert!(!enabled);
+    Ok(())
 }
 
 // ============================================================================
@@ -128,11 +138,12 @@ fn serialize_dw_band_b() {
 }
 
 #[test]
-fn parse_dw_response() {
-    match protocol::parse(b"DW 0").unwrap() {
-        Response::FrequencyDown => {}
-        other => panic!("expected FrequencyDown, got {other:?}"),
-    }
+fn parse_dw_response() -> TestResult {
+    let r = protocol::parse(b"DW 0")?;
+    let Response::FrequencyDown = r else {
+        return Err(format!("expected FrequencyDown, got {r:?}").into());
+    };
+    Ok(())
 }
 
 // ============================================================================
@@ -161,19 +172,23 @@ fn serialize_be_off() {
 }
 
 #[test]
-fn parse_be_enabled() {
-    match protocol::parse(b"BE 1").unwrap() {
-        Response::Beep { enabled } => assert!(enabled),
-        other => panic!("expected Beep, got {other:?}"),
-    }
+fn parse_be_enabled() -> TestResult {
+    let r = protocol::parse(b"BE 1")?;
+    let Response::Beep { enabled } = r else {
+        return Err(format!("expected Beep, got {r:?}").into());
+    };
+    assert!(enabled);
+    Ok(())
 }
 
 #[test]
-fn parse_be_disabled() {
-    match protocol::parse(b"BE 0").unwrap() {
-        Response::Beep { enabled } => assert!(!enabled),
-        other => panic!("expected Beep, got {other:?}"),
-    }
+fn parse_be_disabled() -> TestResult {
+    let r = protocol::parse(b"BE 0")?;
+    let Response::Beep { enabled } = r else {
+        return Err(format!("expected Beep, got {r:?}").into());
+    };
+    assert!(!enabled);
+    Ok(())
 }
 
 // ============================================================================
@@ -242,27 +257,31 @@ fn serialize_lc_unlocked() {
 }
 
 #[test]
-fn parse_lc_locked() {
-    match protocol::parse(b"LC 1").unwrap() {
-        Response::Lock { locked } => assert!(locked),
-        other => panic!("expected Lock, got {other:?}"),
-    }
+fn parse_lc_locked() -> TestResult {
+    let r = protocol::parse(b"LC 1")?;
+    let Response::Lock { locked } = r else {
+        return Err(format!("expected Lock, got {r:?}").into());
+    };
+    assert!(locked);
+    Ok(())
 }
 
 #[test]
-fn parse_lc_unlocked() {
-    match protocol::parse(b"LC 0").unwrap() {
-        Response::Lock { locked } => assert!(!locked),
-        other => panic!("expected Lock, got {other:?}"),
-    }
+fn parse_lc_unlocked() -> TestResult {
+    let r = protocol::parse(b"LC 0")?;
+    let Response::Lock { locked } = r else {
+        return Err(format!("expected Lock, got {r:?}").into());
+    };
+    assert!(!locked);
+    Ok(())
 }
 
 #[test]
-fn serialize_lc_full() {
+fn serialize_lc_full() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::SetLockFull {
             locked: true,
-            lock_type: KeyLockType::try_from(2).unwrap(),
+            lock_type: KeyLockType::try_from(2)?,
             lock_a: true,
             lock_b: false,
             lock_c: true,
@@ -270,6 +289,7 @@ fn serialize_lc_full() {
         }),
         b"LC 1,2,1,0,1,0\r"
     );
+    Ok(())
 }
 
 // ============================================================================
@@ -282,11 +302,13 @@ fn serialize_io_read() {
 }
 
 #[test]
-fn parse_io_response() {
-    match protocol::parse(b"IO 0").unwrap() {
-        Response::IoPort { value } => assert_eq!(value, DetectOutputMode::Af),
-        other => panic!("expected IoPort, got {other:?}"),
-    }
+fn parse_io_response() -> TestResult {
+    let r = protocol::parse(b"IO 0")?;
+    let Response::IoPort { value } = r else {
+        return Err(format!("expected IoPort, got {r:?}").into());
+    };
+    assert_eq!(value, DetectOutputMode::Af);
+    Ok(())
 }
 
 // ============================================================================
@@ -299,27 +321,33 @@ fn serialize_bl_read() {
 }
 
 #[test]
-fn parse_bl_response() {
-    match protocol::parse(b"BL 3").unwrap() {
-        Response::BatteryLevel { level } => assert_eq!(level, BatteryLevel::Full),
-        other => panic!("expected BatteryLevel, got {other:?}"),
-    }
+fn parse_bl_response() -> TestResult {
+    let r = protocol::parse(b"BL 3")?;
+    let Response::BatteryLevel { level } = r else {
+        return Err(format!("expected BatteryLevel, got {r:?}").into());
+    };
+    assert_eq!(level, BatteryLevel::Full);
+    Ok(())
 }
 
 #[test]
-fn parse_bl_empty() {
-    match protocol::parse(b"BL 0").unwrap() {
-        Response::BatteryLevel { level } => assert_eq!(level, BatteryLevel::Empty),
-        other => panic!("expected BatteryLevel, got {other:?}"),
-    }
+fn parse_bl_empty() -> TestResult {
+    let r = protocol::parse(b"BL 0")?;
+    let Response::BatteryLevel { level } = r else {
+        return Err(format!("expected BatteryLevel, got {r:?}").into());
+    };
+    assert_eq!(level, BatteryLevel::Empty);
+    Ok(())
 }
 
 #[test]
-fn parse_bl_charging() {
-    match protocol::parse(b"BL 4").unwrap() {
-        Response::BatteryLevel { level } => assert_eq!(level, BatteryLevel::Charging),
-        other => panic!("expected BatteryLevel, got {other:?}"),
-    }
+fn parse_bl_charging() -> TestResult {
+    let r = protocol::parse(b"BL 4")?;
+    let Response::BatteryLevel { level } = r else {
+        return Err(format!("expected BatteryLevel, got {r:?}").into());
+    };
+    assert_eq!(level, BatteryLevel::Charging);
+    Ok(())
 }
 
 // ============================================================================
@@ -332,21 +360,24 @@ fn serialize_vd_read() {
 }
 
 #[test]
-fn serialize_vd_write() {
+fn serialize_vd_write() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::SetVoxDelay {
-            delay: VoxDelay::new(10).unwrap()
+            delay: VoxDelay::new(10)?
         }),
         b"VD 10\r"
     );
+    Ok(())
 }
 
 #[test]
-fn parse_vd_response() {
-    match protocol::parse(b"VD 7").unwrap() {
-        Response::VoxDelay { delay } => assert_eq!(delay, VoxDelay::new(7).unwrap()),
-        other => panic!("expected VoxDelay, got {other:?}"),
-    }
+fn parse_vd_response() -> TestResult {
+    let r = protocol::parse(b"VD 7")?;
+    let Response::VoxDelay { delay } = r else {
+        return Err(format!("expected VoxDelay, got {r:?}").into());
+    };
+    assert_eq!(delay, VoxDelay::new(7)?);
+    Ok(())
 }
 
 // ============================================================================
@@ -359,21 +390,24 @@ fn serialize_vg_read() {
 }
 
 #[test]
-fn serialize_vg_write() {
+fn serialize_vg_write() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::SetVoxGain {
-            gain: VoxGain::new(4).unwrap()
+            gain: VoxGain::new(4)?
         }),
         b"VG 4\r"
     );
+    Ok(())
 }
 
 #[test]
-fn parse_vg_response() {
-    match protocol::parse(b"VG 9").unwrap() {
-        Response::VoxGain { gain } => assert_eq!(gain, VoxGain::new(9).unwrap()),
-        other => panic!("expected VoxGain, got {other:?}"),
-    }
+fn parse_vg_response() -> TestResult {
+    let r = protocol::parse(b"VG 9")?;
+    let Response::VoxGain { gain } = r else {
+        return Err(format!("expected VoxGain, got {r:?}").into());
+    };
+    assert_eq!(gain, VoxGain::new(9)?);
+    Ok(())
 }
 
 // ============================================================================
@@ -394,17 +428,21 @@ fn serialize_vx_on() {
 }
 
 #[test]
-fn parse_vx_enabled() {
-    match protocol::parse(b"VX 1").unwrap() {
-        Response::Vox { enabled } => assert!(enabled),
-        other => panic!("expected Vox, got {other:?}"),
-    }
+fn parse_vx_enabled() -> TestResult {
+    let r = protocol::parse(b"VX 1")?;
+    let Response::Vox { enabled } = r else {
+        return Err(format!("expected Vox, got {r:?}").into());
+    };
+    assert!(enabled);
+    Ok(())
 }
 
 #[test]
-fn parse_vx_disabled() {
-    match protocol::parse(b"VX 0").unwrap() {
-        Response::Vox { enabled } => assert!(!enabled),
-        other => panic!("expected Vox, got {other:?}"),
-    }
+fn parse_vx_disabled() -> TestResult {
+    let r = protocol::parse(b"VX 0")?;
+    let Response::Vox { enabled } = r else {
+        return Err(format!("expected Vox, got {r:?}").into());
+    };
+    assert!(!enabled);
+    Ok(())
 }

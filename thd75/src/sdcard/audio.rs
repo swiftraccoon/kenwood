@@ -81,14 +81,14 @@ pub fn parse(data: &[u8]) -> Result<AudioRecording, SdCardError> {
     }
 
     // Validate RIFF header: bytes 0-3 = "RIFF"
-    if &data[0..4] != b"RIFF" {
+    if data.get(..4) != Some(b"RIFF") {
         return Err(SdCardError::InvalidWavHeader {
             detail: "missing RIFF magic bytes".to_owned(),
         });
     }
 
     // Validate WAVE format: bytes 8-11 = "WAVE"
-    if &data[8..12] != b"WAVE" {
+    if data.get(8..12) != Some(b"WAVE") {
         return Err(SdCardError::InvalidWavHeader {
             detail: "missing WAVE format identifier".to_owned(),
         });
@@ -166,7 +166,7 @@ fn find_chunk(data: &[u8], id: [u8; 4]) -> Option<usize> {
     let mut offset = 12; // Skip RIFF header (4 + 4 + 4)
 
     while offset + 8 <= data.len() {
-        if data[offset..offset + 4] == id {
+        if data.get(offset..offset + 4) == Some(id.as_slice()) {
             return Some(offset);
         }
 
@@ -217,86 +217,149 @@ mod tests {
         buf
     }
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type BoxErr = Box<dyn std::error::Error>;
+
+    fn write_slice(image: &mut [u8], offset: usize, data: &[u8]) -> Result<(), BoxErr> {
+        let end = offset + data.len();
+        let img_len = image.len();
+        image
+            .get_mut(offset..end)
+            .ok_or_else(|| {
+                format!("write_slice: range {offset}..{end} out of bounds (len={img_len})")
+            })?
+            .copy_from_slice(data);
+        Ok(())
+    }
+
     #[test]
-    fn parse_valid_d75_wav() {
+    fn parse_valid_d75_wav() -> TestResult {
         // 1 second of 16 kHz / 16-bit / mono = 32000 bytes
         let pcm_len: u32 = 32_000;
         let wav = build_wav(16_000, 16, 1, pcm_len);
-        let rec = parse(&wav).unwrap();
+        let rec = parse(&wav)?;
 
         assert_eq!(rec.sample_rate, 16_000);
         assert_eq!(rec.bits_per_sample, 16);
         assert_eq!(rec.channels, 1);
         assert_eq!(rec.data_length, pcm_len);
         assert!((rec.duration_secs - 1.0).abs() < 0.001);
+        Ok(())
     }
 
     #[test]
-    fn parse_duration_calculation() {
+    fn parse_duration_calculation() -> TestResult {
         // 5 minutes = 300 seconds → 300 * 32000 = 9_600_000 bytes
         let pcm_len: u32 = 9_600_000;
         let wav = build_wav(16_000, 16, 1, pcm_len);
-        let rec = parse(&wav).unwrap();
+        let rec = parse(&wav)?;
 
         assert!((rec.duration_secs - 300.0).abs() < 0.001);
+        Ok(())
     }
 
     #[test]
-    fn too_short_returns_error() {
+    fn too_short_returns_error() -> TestResult {
         let data = b"RIFF";
-        let err = parse(data).unwrap_err();
-        assert!(matches!(err, SdCardError::FileTooSmall { .. }));
+        let err = parse(data)
+            .err()
+            .ok_or("expected FileTooSmall but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::FileTooSmall { .. }),
+            "expected FileTooSmall, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn empty_returns_error() {
-        let err = parse(b"").unwrap_err();
-        assert!(matches!(err, SdCardError::FileTooSmall { .. }));
+    fn empty_returns_error() -> TestResult {
+        let err = parse(b"").err().ok_or("expected FileTooSmall but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::FileTooSmall { .. }),
+            "expected FileTooSmall, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn wrong_riff_magic() {
+    fn wrong_riff_magic() -> TestResult {
         let mut wav = build_wav(16_000, 16, 1, 32_000);
-        wav[0..4].copy_from_slice(b"XXXX");
-        let err = parse(&wav).unwrap_err();
-        assert!(matches!(err, SdCardError::InvalidWavHeader { .. }));
+        write_slice(&mut wav, 0, b"XXXX")?;
+        let err = parse(&wav)
+            .err()
+            .ok_or("expected InvalidWavHeader but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::InvalidWavHeader { .. }),
+            "expected InvalidWavHeader, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn wrong_wave_format() {
+    fn wrong_wave_format() -> TestResult {
         let mut wav = build_wav(16_000, 16, 1, 32_000);
-        wav[8..12].copy_from_slice(b"AVI ");
-        let err = parse(&wav).unwrap_err();
-        assert!(matches!(err, SdCardError::InvalidWavHeader { .. }));
+        write_slice(&mut wav, 8, b"AVI ")?;
+        let err = parse(&wav)
+            .err()
+            .ok_or("expected InvalidWavHeader but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::InvalidWavHeader { .. }),
+            "expected InvalidWavHeader, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn non_pcm_format_rejected() {
+    fn non_pcm_format_rejected() -> TestResult {
         let mut wav = build_wav(16_000, 16, 1, 32_000);
         // Set audio format to 3 (IEEE float) at fmt+8 = offset 20
-        wav[20..22].copy_from_slice(&3u16.to_le_bytes());
-        let err = parse(&wav).unwrap_err();
-        assert!(matches!(err, SdCardError::InvalidWavHeader { .. }));
+        write_slice(&mut wav, 20, &3u16.to_le_bytes())?;
+        let err = parse(&wav)
+            .err()
+            .ok_or("expected InvalidWavHeader but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::InvalidWavHeader { .. }),
+            "expected InvalidWavHeader, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn wrong_sample_rate_rejected() {
+    fn wrong_sample_rate_rejected() -> TestResult {
         let wav = build_wav(44_100, 16, 1, 88_200);
-        let err = parse(&wav).unwrap_err();
-        assert!(matches!(err, SdCardError::UnexpectedAudioFormat { .. }));
+        let err = parse(&wav)
+            .err()
+            .ok_or("expected UnexpectedAudioFormat but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::UnexpectedAudioFormat { .. }),
+            "expected UnexpectedAudioFormat, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn wrong_bit_depth_rejected() {
+    fn wrong_bit_depth_rejected() -> TestResult {
         let wav = build_wav(16_000, 8, 1, 16_000);
-        let err = parse(&wav).unwrap_err();
-        assert!(matches!(err, SdCardError::UnexpectedAudioFormat { .. }));
+        let err = parse(&wav)
+            .err()
+            .ok_or("expected UnexpectedAudioFormat but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::UnexpectedAudioFormat { .. }),
+            "expected UnexpectedAudioFormat, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn stereo_rejected() {
+    fn stereo_rejected() -> TestResult {
         let wav = build_wav(16_000, 16, 2, 64_000);
-        let err = parse(&wav).unwrap_err();
-        assert!(matches!(err, SdCardError::UnexpectedAudioFormat { .. }));
+        let err = parse(&wav)
+            .err()
+            .ok_or("expected UnexpectedAudioFormat but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::UnexpectedAudioFormat { .. }),
+            "expected UnexpectedAudioFormat, got {err:?}"
+        );
+        Ok(())
     }
 }

@@ -9,11 +9,17 @@
 
 #![cfg_attr(
     test,
-    allow(
-        clippy::unwrap_used,
-        clippy::panic,
+    expect(
         clippy::indexing_slicing,
         clippy::unreachable,
+        reason = "Only active under `cfg(test)` — applies exclusively to inline unit test \
+                  modules inside this crate (integration tests in `tests/` are separate \
+                  compilation units and carry their own `#![expect]` blocks). Library \
+                  production code remains bound by the strict workspace clippy policy. \
+                  `clippy::indexing_slicing` fires on direct indexing against fixed-size \
+                  test buffers where bounds are obvious by construction. \
+                  `clippy::unreachable` fires on `unreachable!()` in match arms guarding \
+                  'this variant cannot occur given the test's setup' invariants."
     )
 )]
 

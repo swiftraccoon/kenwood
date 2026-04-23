@@ -24,18 +24,24 @@ pub(crate) fn serialize_memory_write(cmd: &Command) -> Option<String> {
             // FO serializes 20 comma-separated fields. Split them so we can
             // insert the two ME-specific extras.
             let parts: Vec<&str> = fo.split(',').collect();
-            debug_assert_eq!(parts.len(), CHANNEL_FIELD_COUNT);
+            debug_assert_eq!(
+                parts.len(),
+                CHANNEL_FIELD_COUNT,
+                "FO serializer must produce exactly {CHANNEL_FIELD_COUNT} comma-separated \
+                 fields before ME layout reconstruction",
+            );
 
             // Reconstruct ME layout:
             //   parts[0..=12]  -> ME fields 1..=13  (freq through x5)
             //   "0"            -> ME field 14        (ME-specific)
             //   parts[13..=19] -> ME fields 15..=21  (tt through dm)
             //   "0"            -> ME field 22        (ME-specific)
-            let me_body: String = parts[..13]
+            let (head, tail) = parts.split_at(parts.len().min(13));
+            let me_body: String = head
                 .iter()
                 .copied()
                 .chain(std::iter::once("0"))
-                .chain(parts[13..].iter().copied())
+                .chain(tail.iter().copied())
                 .chain(std::iter::once("0"))
                 .collect::<Vec<&str>>()
                 .join(",");
@@ -83,34 +89,58 @@ const ME_FIELD_COUNT: usize = 23;
 /// [`parse_channel_fields`].
 fn parse_me(payload: &str) -> Result<Response, ProtocolError> {
     let fields: Vec<&str> = payload.split(',').collect();
+    let actual = fields.len();
 
-    if fields.len() != ME_FIELD_COUNT {
+    // ME wire: `channel,f1..=f13,me14,f15..=f21,me22` — 23 fields exactly.
+    let &[ch_str, ref body @ ..] = fields.as_slice() else {
         return Err(ProtocolError::FieldCount {
             command: "ME".to_owned(),
             expected: ME_FIELD_COUNT,
-            actual: fields.len(),
+            actual,
+        });
+    };
+    if body.len() != ME_FIELD_COUNT - 1 {
+        return Err(ProtocolError::FieldCount {
+            command: "ME".to_owned(),
+            expected: ME_FIELD_COUNT,
+            actual,
         });
     }
 
-    let channel = fields[0]
+    let channel = ch_str
         .parse::<u16>()
         .map_err(|_| ProtocolError::FieldParse {
             command: "ME".to_owned(),
             field: "channel".to_owned(),
-            detail: format!("invalid channel number: {:?}", fields[0]),
+            detail: format!("invalid channel number: {ch_str:?}"),
         })?;
 
     // Remap ME fields to the 20-field FO layout, skipping the two ME-specific
-    // fields at indices 14 and 22.
-    //   fields[1..=13]  -> FO fields 0..=12  (freq through x5, 13 items)
-    //   fields[15..=21] -> FO fields 13..=19 (tt through dm, 7 items)
-    let fo_fields: Vec<&str> = fields[1..=13]
-        .iter()
-        .chain(fields[15..=21].iter())
-        .copied()
-        .collect();
+    // fields at body indices 13 (ME field 14) and 21 (ME field 22).
+    //   body[0..=12]  -> FO fields 0..=12  (freq through x5, 13 items)
+    //   body[14..=20] -> FO fields 13..=19 (tt through dm, 7 items)
+    let Some(head) = body.get(..13) else {
+        return Err(ProtocolError::FieldCount {
+            command: "ME".to_owned(),
+            expected: ME_FIELD_COUNT,
+            actual,
+        });
+    };
+    let Some(tail) = body.get(14..21) else {
+        return Err(ProtocolError::FieldCount {
+            command: "ME".to_owned(),
+            expected: ME_FIELD_COUNT,
+            actual,
+        });
+    };
+    let fo_fields: Vec<&str> = head.iter().chain(tail.iter()).copied().collect();
 
-    debug_assert_eq!(fo_fields.len(), CHANNEL_FIELD_COUNT);
+    debug_assert_eq!(
+        fo_fields.len(),
+        CHANNEL_FIELD_COUNT,
+        "ME → FO reconstruction must yield exactly {CHANNEL_FIELD_COUNT} fields for the \
+         shared `parse_channel_fields` path to accept the input",
+    );
 
     let data = parse_channel_fields(&fo_fields, "ME")?;
 

@@ -71,7 +71,7 @@ pub fn tx_confirm() -> bool {
     // Flush stdout so the prompt is visible before the blocking read.
     // A flush failure is fine — the prompt was already sent via
     // `println!` so there is nothing left buffered.
-    let _ = std::io::stdout().flush();
+    drop(std::io::stdout().flush());
 
     let stdin = std::io::stdin();
     let mut line = String::new();

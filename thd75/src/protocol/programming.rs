@@ -200,20 +200,21 @@ pub const fn is_factory_calibration_page(page: u16) -> bool {
 /// Returns an error string if the response is too short or has an
 /// invalid marker byte.
 pub fn parse_write_response(buf: &[u8]) -> Result<(u16, &[u8]), String> {
-    if buf.len() < W_RESPONSE_SIZE {
+    // W response layout: `W` marker + 4-byte address + PAGE_SIZE bytes.
+    let actual = buf.len();
+    let &[marker, page_hi, page_lo, _off_hi, _off_lo, ..] = buf else {
         return Err(format!(
-            "W response too short: {} bytes, expected {}",
-            buf.len(),
-            W_RESPONSE_SIZE
+            "W response too short: {actual} bytes, expected {W_RESPONSE_SIZE}"
         ));
+    };
+    if marker != b'W' {
+        return Err(format!("expected W response marker, got 0x{marker:02X}"));
     }
-    if buf[0] != b'W' {
-        return Err(format!("expected W response marker, got 0x{:02X}", buf[0]));
-    }
-    // 4-byte address: bytes 1-2 are the page, bytes 3-4 are offset (always 0).
-    let page = u16::from_be_bytes([buf[1], buf[2]]);
-    // Data starts at byte 5, 256 bytes.
-    Ok((page, &buf[5..5 + PAGE_SIZE]))
+    let page = u16::from_be_bytes([page_hi, page_lo]);
+    let data = buf.get(5..5 + PAGE_SIZE).ok_or_else(|| {
+        format!("W response too short: {actual} bytes, expected {W_RESPONSE_SIZE}")
+    })?;
+    Ok((page, data))
 }
 
 /// Extract a channel name from a 16-byte entry.
@@ -227,7 +228,11 @@ pub fn extract_name(entry: &[u8]) -> String {
         .position(|&b| b == 0)
         .unwrap_or(entry.len())
         .min(NAME_ENTRY_SIZE);
-    String::from_utf8_lossy(&entry[..end]).trim().to_string()
+    entry
+        .get(..end)
+        .map(String::from_utf8_lossy)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// Parse a 4-byte channel flag record.
@@ -239,15 +244,12 @@ pub fn extract_name(entry: &[u8]) -> String {
 /// - `group`: bank/group assignment (0-29)
 #[must_use]
 pub fn parse_channel_flag(bytes: &[u8]) -> Option<ChannelFlag> {
-    if bytes.len() < FLAG_RECORD_SIZE {
+    let &[used, lockout_byte, group, _pad, ..] = bytes else {
         return None;
-    }
-    let used = bytes[0];
-    let lockout = bytes[1] & 0x01 != 0;
-    let group = bytes[2];
+    };
     Some(ChannelFlag {
         used,
-        lockout,
+        lockout: lockout_byte & 0x01 != 0,
         group,
     })
 }
@@ -286,6 +288,16 @@ impl ChannelFlag {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type BoxErr = Box<dyn std::error::Error>;
+
+    fn byte_at(bytes: &[u8], idx: usize) -> Result<u8, BoxErr> {
+        bytes
+            .get(idx)
+            .copied()
+            .ok_or_else(|| format!("byte_at: idx {idx} out of range (len={})", bytes.len()).into())
+    }
+
     #[test]
     fn build_read_command_page_256() {
         let cmd = build_read_command(256);
@@ -306,24 +318,32 @@ mod tests {
     }
 
     #[test]
-    fn build_write_command_format() {
+    fn build_write_command_format() -> TestResult {
         let data = [0xAA; PAGE_SIZE];
         let cmd = build_write_command(0x0100, &data);
         assert_eq!(cmd.len(), W_RESPONSE_SIZE);
-        assert_eq!(cmd[0], b'W');
-        assert_eq!(cmd[1], 0x01); // page high byte
-        assert_eq!(cmd[2], 0x00); // page low byte
-        assert_eq!(cmd[3], 0x00); // offset high
-        assert_eq!(cmd[4], 0x00); // offset low
-        assert!(cmd[5..].iter().all(|&b| b == 0xAA));
+        assert_eq!(byte_at(&cmd, 0)?, b'W');
+        assert_eq!(byte_at(&cmd, 1)?, 0x01); // page high byte
+        assert_eq!(byte_at(&cmd, 2)?, 0x00); // page low byte
+        assert_eq!(byte_at(&cmd, 3)?, 0x00); // offset high
+        assert_eq!(byte_at(&cmd, 4)?, 0x00); // offset low
+        assert!(
+            cmd.get(5..)
+                .ok_or("cmd[5..] missing")?
+                .iter()
+                .all(|&b| b == 0xAA),
+            "payload should be all 0xAA"
+        );
+        Ok(())
     }
 
     #[test]
-    fn build_write_command_page_zero() {
+    fn build_write_command_page_zero() -> TestResult {
         let data = [0u8; PAGE_SIZE];
         let cmd = build_write_command(0, &data);
-        assert_eq!(cmd[1], 0x00);
-        assert_eq!(cmd[2], 0x00);
+        assert_eq!(byte_at(&cmd, 1)?, 0x00);
+        assert_eq!(byte_at(&cmd, 2)?, 0x00);
+        Ok(())
     }
 
     #[test]
@@ -337,24 +357,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_write_response_valid() {
+    fn parse_write_response_valid() -> TestResult {
         let mut resp = vec![b'W', 0x01, 0x00, 0x00, 0x00]; // W + 4-byte address
         resp.extend_from_slice(&[0x41; 256]); // 256 bytes of 'A'
         assert_eq!(resp.len(), 261);
-        let (addr, data) = parse_write_response(&resp).unwrap();
+        let (addr, data) = parse_write_response(&resp)?;
         assert_eq!(addr, 256);
         assert_eq!(data.len(), 256);
         assert!(data.iter().all(|&b| b == 0x41));
+        Ok(())
     }
 
     #[test]
-    fn parse_write_response_full_page() {
+    fn parse_write_response_full_page() -> TestResult {
         let mut resp = vec![b'W', 0x01, 0x3E, 0x00, 0x00]; // page 318
         resp.extend_from_slice(&[0u8; 256]);
         assert_eq!(resp.len(), 261);
-        let (addr, data) = parse_write_response(&resp).unwrap();
+        let (addr, data) = parse_write_response(&resp)?;
         assert_eq!(addr, 318);
         assert_eq!(data.len(), 256);
+        Ok(())
     }
 
     #[test]
@@ -377,10 +399,14 @@ mod tests {
     }
 
     #[test]
-    fn extract_name_null_terminated() {
+    fn extract_name_null_terminated() -> TestResult {
         let mut entry = [0u8; 16];
-        entry[..4].copy_from_slice(b"RPT1");
+        entry
+            .get_mut(..4)
+            .ok_or("entry[..4] missing")?
+            .copy_from_slice(b"RPT1");
         assert_eq!(extract_name(&entry), "RPT1");
+        Ok(())
     }
 
     #[test]
@@ -402,10 +428,14 @@ mod tests {
     }
 
     #[test]
-    fn extract_name_trims_whitespace() {
+    fn extract_name_trims_whitespace() -> TestResult {
         let mut entry = [0u8; 16];
-        entry[..6].copy_from_slice(b"RPT1  ");
+        entry
+            .get_mut(..6)
+            .ok_or("entry[..6] missing")?
+            .copy_from_slice(b"RPT1  ");
         assert_eq!(extract_name(&entry), "RPT1");
+        Ok(())
     }
 
     #[test]
@@ -444,7 +474,14 @@ mod tests {
         assert_eq!(TOTAL_SIZE, TOTAL_PAGES as usize * PAGE_SIZE);
         // These are compile-time truths but we assert them to catch
         // regressions if someone edits the constants.
-        #[allow(clippy::assertions_on_constants)]
+        #[expect(
+            clippy::assertions_on_constants,
+            reason = "Deliberately asserting on `const` values. If someone edits these constants \
+                      to violate the factory-calibration invariant (MAX_WRITABLE_PAGE < \
+                      TOTAL_PAGES), this test must fail; compile-time-only assertions via \
+                      `const { assert!(...) }` would be silenced by the same const-folding \
+                      clippy is complaining about."
+        )]
         {
             assert!(MAX_WRITABLE_PAGE < TOTAL_PAGES);
         }
@@ -455,7 +492,13 @@ mod tests {
     fn region_boundaries_non_overlapping() {
         // These are all compile-time truths verified at test time to
         // catch regressions if the constants are ever changed.
-        #[allow(clippy::assertions_on_constants)]
+        #[expect(
+            clippy::assertions_on_constants,
+            reason = "Regression guard: if any region offset constant is edited to overlap with \
+                      a neighbour, these asserts must fail. Clippy warns because the constants \
+                      are known at compile time; that's exactly the point — we want a test \
+                      failure if someone silently breaks the memory map."
+        )]
         {
             // Settings end before flags start
             assert!(SETTINGS_END < CHANNEL_FLAGS_START);
@@ -473,41 +516,45 @@ mod tests {
     }
 
     #[test]
-    fn channel_flag_parse_vhf() {
+    fn channel_flag_parse_vhf() -> TestResult {
         let bytes = [FLAG_VHF, 0x00, 0x05, 0xFF];
-        let flag = parse_channel_flag(&bytes).unwrap();
+        let flag = parse_channel_flag(&bytes).ok_or("parse_channel_flag returned None")?;
         assert!(!flag.is_empty());
         assert!(!flag.lockout);
         assert_eq!(flag.group, 5);
         assert_eq!(flag.used, FLAG_VHF);
+        Ok(())
     }
 
     #[test]
-    fn channel_flag_parse_empty() {
+    fn channel_flag_parse_empty() -> TestResult {
         let bytes = [FLAG_EMPTY, 0x00, 0x00, 0xFF];
-        let flag = parse_channel_flag(&bytes).unwrap();
+        let flag = parse_channel_flag(&bytes).ok_or("parse_channel_flag returned None")?;
         assert!(flag.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn channel_flag_parse_locked_out() {
+    fn channel_flag_parse_locked_out() -> TestResult {
         let bytes = [FLAG_UHF, 0x01, 0x0A, 0xFF];
-        let flag = parse_channel_flag(&bytes).unwrap();
+        let flag = parse_channel_flag(&bytes).ok_or("parse_channel_flag returned None")?;
         assert!(!flag.is_empty());
         assert!(flag.lockout);
         assert_eq!(flag.group, 10);
+        Ok(())
     }
 
     #[test]
-    fn channel_flag_round_trip() {
+    fn channel_flag_round_trip() -> TestResult {
         let flag = ChannelFlag {
             used: FLAG_220,
             lockout: true,
             group: 15,
         };
         let bytes = flag.to_bytes();
-        let parsed = parse_channel_flag(&bytes).unwrap();
+        let parsed = parse_channel_flag(&bytes).ok_or("parse_channel_flag returned None")?;
         assert_eq!(parsed, flag);
+        Ok(())
     }
 
     #[test]

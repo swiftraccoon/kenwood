@@ -84,7 +84,12 @@ mod tests {
 
         let mut c = SlowDataTextCollector::new();
         for (i, h) in out.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "`i` comes from `.enumerate()` over an 8-element fixture \
+                          (`out.len() == 8` asserted above), so `i as u8` is always \
+                          lossless. `wrapping_add(1)` then produces frame indices 1..=8."
+            )]
             let idx = (i as u8).wrapping_add(1);
             c.push(*h, idx);
         }
@@ -98,7 +103,13 @@ mod tests {
         let out = encode_text_message("ABCDEFGHIJKLMNOPQRST");
         let mut c = SlowDataTextCollector::new();
         for (i, h) in out.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "`i` comes from `.enumerate()` over `encode_text_message`'s output \
+                          which is bounded to at most 8 halves (D-STAR slow-data carries \
+                          20 chars in 4 packets × 2 halves), so `i as u8` is always \
+                          lossless."
+            )]
             let idx = (i as u8).wrapping_add(1);
             c.push(*h, idx);
         }
@@ -112,7 +123,13 @@ mod tests {
         let out = encode_text_message("1234567890ABCDEFGHIJKLMN");
         let mut c = SlowDataTextCollector::new();
         for (i, h) in out.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "`i` comes from `.enumerate()` over `encode_text_message`'s output \
+                          which is bounded to at most 8 halves (D-STAR slow-data carries \
+                          20 chars in 4 packets × 2 halves), so `i as u8` is always \
+                          lossless."
+            )]
             let idx = (i as u8).wrapping_add(1);
             c.push(*h, idx);
         }

@@ -162,21 +162,24 @@ mod tests {
     }
 
     #[test]
-    fn echolink_slot_index() {
-        let slot = EchoLinkSlot::new(5).unwrap();
+    fn echolink_slot_index() -> Result<(), Box<dyn std::error::Error>> {
+        let slot = EchoLinkSlot::new(5).ok_or("valid slot index rejected")?;
         assert_eq!(slot.index(), 5);
+        Ok(())
     }
 
     #[test]
-    fn echolink_name_valid() {
-        let name = EchoLinkName::new("W1AW").unwrap();
+    fn echolink_name_valid() -> Result<(), Box<dyn std::error::Error>> {
+        let name = EchoLinkName::new("W1AW").ok_or("valid echolink name rejected")?;
         assert_eq!(name.as_str(), "W1AW");
+        Ok(())
     }
 
     #[test]
-    fn echolink_name_max_length() {
-        let name = EchoLinkName::new("12345678").unwrap();
+    fn echolink_name_max_length() -> Result<(), Box<dyn std::error::Error>> {
+        let name = EchoLinkName::new("12345678").ok_or("valid 8-char name rejected")?;
         assert_eq!(name.as_str().len(), 8);
+        Ok(())
     }
 
     #[test]
@@ -185,22 +188,25 @@ mod tests {
     }
 
     #[test]
-    fn echolink_node_valid() {
-        let node = EchoLinkNode::new("123456").unwrap();
+    fn echolink_node_valid() -> Result<(), Box<dyn std::error::Error>> {
+        let node = EchoLinkNode::new("123456").ok_or("valid 6-digit node rejected")?;
         assert_eq!(node.as_str(), "123456");
         assert!(!node.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn echolink_node_short() {
-        let node = EchoLinkNode::new("1").unwrap();
+    fn echolink_node_short() -> Result<(), Box<dyn std::error::Error>> {
+        let node = EchoLinkNode::new("1").ok_or("valid 1-digit node rejected")?;
         assert_eq!(node.as_str(), "1");
+        Ok(())
     }
 
     #[test]
-    fn echolink_node_empty() {
-        let node = EchoLinkNode::new("").unwrap();
+    fn echolink_node_empty() -> Result<(), Box<dyn std::error::Error>> {
+        let node = EchoLinkNode::new("").ok_or("empty node rejected")?;
         assert!(node.is_empty());
+        Ok(())
     }
 
     #[test]

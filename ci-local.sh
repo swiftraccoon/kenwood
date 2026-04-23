@@ -146,8 +146,8 @@ ci_pod() {
         step "clippy workspace"      cargo clippy --workspace --all-targets -- -D warnings
         step "clippy +encoder"       cargo clippy -p mbelib-rs --all-targets --features encoder -- -D warnings
         step "clippy +kenwood"       cargo clippy -p mbelib-rs --all-targets --features kenwood-tables -- -D warnings
-        # Integration tests in thd75 depend on gitignored fixtures
-        # (docs/ki4lax_cat_spec.json), so stick to --lib in CI.
+        # Some thd75 integration tests depend on gitignored spec
+        # fixtures that aren't shipped in CI, so stick to --lib here.
         step "test workspace (lib)"  cargo test --workspace --lib
         step "test +encoder"         cargo test -p mbelib-rs --features encoder --lib
         step "test +kenwood"         cargo test -p mbelib-rs --features kenwood-tables --lib

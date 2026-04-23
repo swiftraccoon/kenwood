@@ -15,20 +15,32 @@
 // Usage:
 //   validate_analysis_vs_op25 <pcm_file> <op25_trace_file>
 
-#![allow(
+#![expect(
     clippy::print_stdout,
     clippy::print_stderr,
     clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_lossless,
     clippy::uninlined_format_args,
     clippy::too_many_lines,
+    clippy::indexing_slicing,
+    clippy::expect_used,
     dead_code,
     unused_results,
-    missing_docs
+    missing_docs,
+    reason = "Stages 1-4 analysis A/B harness (PCM + OP25 trace -> metrics). Validation \
+              scratchwork, not library code. Prints diagnostics, allows panics on \
+              malformed fixtures (`.expect()` on trace parse, indexing into fixed-size \
+              PCM/FFT arrays). DSP casts are unavoidable in spectral/pitch analysis. \
+              Any bounds violation would surface during fixture load and correctly abort \
+              the example."
 )]
+
+// Dev-dependencies pulled in by sibling tests/examples. Acknowledge them here so
+// `unused_crate_dependencies` stays silent for this compilation unit.
+use proptest as _;
+use wide as _;
 
 use mbelib_rs::{
     EncoderBuffers, FftPlan, PitchTracker, VuvState, analyze_frame, detect_vuv_and_sa,

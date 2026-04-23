@@ -80,6 +80,11 @@ panic = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
+# Ban `#[allow]` — every suppression must be `#[expect(..., reason = "...")]`.
+# Mirrors the root `[workspace.lints.clippy]` ban; restated here because this crate's
+# `[lints]` block replaces the workspace one entirely (cargo does not merge).
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
 # UniFFI's generated scaffolding declares top-level FFI functions

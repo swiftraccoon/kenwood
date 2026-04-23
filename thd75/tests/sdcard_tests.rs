@@ -15,6 +15,20 @@ use kenwood_thd75::sdcard::repeater_list::{
 use kenwood_thd75::types::channel::FlashChannel;
 use kenwood_thd75::types::frequency::Frequency;
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+type BoxErr = Box<dyn std::error::Error>;
+
+/// Copy `data` into `image` starting at `offset`.
+fn write_slice(image: &mut [u8], offset: usize, data: &[u8]) -> Result<(), BoxErr> {
+    let end = offset + data.len();
+    let img_len = image.len();
+    image
+        .get_mut(offset..end)
+        .ok_or_else(|| format!("write_slice: range {offset}..{end} out of bounds (len={img_len})"))?
+        .copy_from_slice(data);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // .d75 config tests
 // ---------------------------------------------------------------------------
@@ -26,84 +40,102 @@ const CH_DATA_OFFSET: usize = 0x4100;
 const CH_NAME_OFFSET: usize = 0x10100;
 
 /// Builds a synthetic `.d75` file large enough to parse.
-fn make_synthetic_d75() -> Vec<u8> {
+fn make_synthetic_d75() -> Result<Vec<u8>, BoxErr> {
     // Minimum file size: channel name region end
     let min_size = CH_NAME_OFFSET + (1000 * 16);
     let mut data = vec![0u8; min_size];
 
     // Write model string at offset 0
-    let model = b"Data For TH-D75A";
-    data[..model.len()].copy_from_slice(model);
+    write_slice(&mut data, 0, b"Data For TH-D75A")?;
 
     // Write version bytes at offset 0x14
-    data[0x14..0x18].copy_from_slice(&[0x95, 0xC4, 0x8F, 0x42]);
+    write_slice(&mut data, 0x14, &[0x95, 0xC4, 0x8F, 0x42])?;
 
-    data
+    Ok(data)
 }
 
 #[test]
-fn parse_synthetic_d75_header() {
-    let data = make_synthetic_d75();
-    let config = parse_config(&data).unwrap();
+fn parse_synthetic_d75_header() -> TestResult {
+    let data = make_synthetic_d75()?;
+    let config = parse_config(&data)?;
 
     assert_eq!(config.header.model, "Data For TH-D75A");
     assert_eq!(config.header.version_bytes, [0x95, 0xC4, 0x8F, 0x42]);
     assert_eq!(config.channels.len(), MAX_CHANNELS);
+    Ok(())
 }
 
 #[test]
-fn parse_d75_rejects_bad_model() {
-    let mut data = make_synthetic_d75();
+fn parse_d75_rejects_bad_model() -> TestResult {
+    let mut data = make_synthetic_d75()?;
     // Overwrite model with something invalid
-    data[..16].copy_from_slice(b"Data For TH-D74A");
-    let err = parse_config(&data).unwrap_err();
-    assert!(matches!(err, SdCardError::InvalidModelString { .. }));
+    write_slice(&mut data, 0, b"Data For TH-D74A")?;
+    let err = parse_config(&data)
+        .err()
+        .ok_or("expected InvalidModelString but got Ok")?;
+    assert!(
+        matches!(err, SdCardError::InvalidModelString { .. }),
+        "expected InvalidModelString, got {err:?}"
+    );
+    Ok(())
 }
 
 #[test]
-fn parse_d75_rejects_too_small() {
+fn parse_d75_rejects_too_small() -> TestResult {
     let data = vec![0u8; 100];
-    let err = parse_config(&data).unwrap_err();
-    assert!(matches!(err, SdCardError::FileTooSmall { .. }));
+    let err = parse_config(&data)
+        .err()
+        .ok_or("expected FileTooSmall but got Ok")?;
+    assert!(
+        matches!(err, SdCardError::FileTooSmall { .. }),
+        "expected FileTooSmall, got {err:?}"
+    );
+    Ok(())
 }
 
 #[test]
-fn d75_all_channels_unused_in_empty_file() {
-    let data = make_synthetic_d75();
-    let config = parse_config(&data).unwrap();
+fn d75_all_channels_unused_in_empty_file() -> TestResult {
+    let data = make_synthetic_d75()?;
+    let config = parse_config(&data)?;
     for ch in &config.channels {
         assert!(!ch.used, "channel {} should be unused", ch.number);
     }
+    Ok(())
 }
 
 #[test]
-fn d75_channel_with_frequency_is_used() {
-    let mut data = make_synthetic_d75();
+fn d75_channel_with_frequency_is_used() -> TestResult {
+    let mut data = make_synthetic_d75()?;
 
     // Write 145 MHz into channel 0's RX frequency (at file offset 0x4100)
-    let freq_bytes = 145_000_000u32.to_le_bytes();
-    data[CH_DATA_OFFSET..CH_DATA_OFFSET + 4].copy_from_slice(&freq_bytes);
+    write_slice(&mut data, CH_DATA_OFFSET, &145_000_000u32.to_le_bytes())?;
 
-    let config = parse_config(&data).unwrap();
-    assert!(config.channels[0].used);
-    assert_eq!(config.channels[0].flash.rx_frequency.as_hz(), 145_000_000);
+    let config = parse_config(&data)?;
+    let ch0 = config.channels.first().ok_or("channel 0 missing")?;
+    assert!(ch0.used);
+    assert_eq!(ch0.flash.rx_frequency.as_hz(), 145_000_000);
+    Ok(())
 }
 
 #[test]
-fn d75_channel_name_roundtrip() {
-    let mut data = make_synthetic_d75();
+fn d75_channel_name_roundtrip() -> TestResult {
+    let mut data = make_synthetic_d75()?;
 
     // Write a name for channel 0 at the name table offset
-    data[CH_NAME_OFFSET..CH_NAME_OFFSET + 6].copy_from_slice(b"2M RPT");
+    write_slice(&mut data, CH_NAME_OFFSET, b"2M RPT")?;
 
-    let config = parse_config(&data).unwrap();
-    assert_eq!(config.channels[0].name, "2M RPT");
+    let config = parse_config(&data)?;
+    assert_eq!(
+        config.channels.first().ok_or("channel 0 missing")?.name,
+        "2M RPT"
+    );
+    Ok(())
 }
 
 #[test]
-fn d75_write_roundtrip() {
+fn d75_write_roundtrip() -> TestResult {
     // Build a config from scratch
-    let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42]).unwrap();
+    let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
     let raw_image_size = CH_NAME_OFFSET + (1000 * 16) - HEADER_SIZE;
     let raw_image = vec![0u8; raw_image_size];
 
@@ -114,8 +146,11 @@ fn d75_write_roundtrip() {
         rx_frequency: Frequency::new(145_000_000),
         ..FlashChannel::default()
     };
-    channels[0] = make_channel(0, "2M CALL", flash);
-    channels[0].lockout = true;
+    {
+        let ch = channels.get_mut(0).ok_or("channel 0 missing")?;
+        *ch = make_channel(0, "2M CALL", flash);
+        ch.lockout = true;
+    }
 
     let config = RadioConfig {
         header,
@@ -125,16 +160,19 @@ fn d75_write_roundtrip() {
 
     // Write then re-parse
     let bytes = write_config(&config);
-    let parsed = parse_config(&bytes).unwrap();
+    let parsed = parse_config(&bytes)?;
 
     assert_eq!(parsed.header.model, "Data For TH-D75A");
-    assert!(parsed.channels[0].used);
-    assert_eq!(parsed.channels[0].name, "2M CALL");
-    assert_eq!(parsed.channels[0].flash.rx_frequency.as_hz(), 145_000_000);
-    assert!(parsed.channels[0].lockout);
+    let ch0 = parsed.channels.first().ok_or("parsed channel 0 missing")?;
+    assert!(ch0.used);
+    assert_eq!(ch0.name, "2M CALL");
+    assert_eq!(ch0.flash.rx_frequency.as_hz(), 145_000_000);
+    assert!(ch0.lockout);
 
     // Channel 1 should remain unused
-    assert!(!parsed.channels[1].used);
+    let ch1 = parsed.channels.get(1).ok_or("parsed channel 1 missing")?;
+    assert!(!ch1.used);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -154,30 +192,32 @@ fn encode_utf16le_bom(text: &str) -> Vec<u8> {
     out.push(0xFF);
     out.push(0xFE);
     for unit in text.encode_utf16() {
-        let bytes = unit.to_le_bytes();
-        out.push(bytes[0]);
-        out.push(bytes[1]);
+        let [lo, hi] = unit.to_le_bytes();
+        out.push(lo);
+        out.push(hi);
     }
     out
 }
 
 #[test]
-fn parse_repeater_list_basic() {
+fn parse_repeater_list_basic() -> TestResult {
     let data = make_repeater_tsv();
-    let entries = parse_repeater_list(&data).unwrap();
+    let entries = parse_repeater_list(&data)?;
 
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].group_name, "Kanto");
-    assert_eq!(entries[0].name, "Tokyo");
-    assert_eq!(entries[0].callsign_rpt1, "JR1YXV B");
-    assert_eq!(entries[0].callsign_rpt2, "JR1YXV G");
-    assert_eq!(entries[0].frequency, 439_310_000);
-    assert_eq!(entries[0].duplex, "-");
-    assert_eq!(entries[0].offset, 5_000_000);
+    let entry = entries.first().ok_or("repeater entry missing")?;
+    assert_eq!(entry.group_name, "Kanto");
+    assert_eq!(entry.name, "Tokyo");
+    assert_eq!(entry.callsign_rpt1, "JR1YXV B");
+    assert_eq!(entry.callsign_rpt2, "JR1YXV G");
+    assert_eq!(entry.frequency, 439_310_000);
+    assert_eq!(entry.duplex, "-");
+    assert_eq!(entry.offset, 5_000_000);
+    Ok(())
 }
 
 #[test]
-fn repeater_list_write_roundtrip() {
+fn repeater_list_write_roundtrip() -> TestResult {
     let entries = vec![RepeaterEntry {
         group_name: "Southeast".to_owned(),
         name: "Asheville".to_owned(),
@@ -190,20 +230,28 @@ fn repeater_list_write_roundtrip() {
     }];
 
     let bytes = write_repeater_list(&entries);
-    let parsed = parse_repeater_list(&bytes).unwrap();
+    let parsed = parse_repeater_list(&bytes)?;
 
     assert_eq!(parsed.len(), 1);
-    assert_eq!(parsed[0].group_name, "Southeast");
-    assert_eq!(parsed[0].name, "Asheville");
-    assert_eq!(parsed[0].callsign_rpt1, "W4MOE  B");
-    assert_eq!(parsed[0].frequency, 145_250_000);
-    assert_eq!(parsed[0].offset, 600_000);
+    let parsed0 = parsed.first().ok_or("parsed[0] missing")?;
+    assert_eq!(parsed0.group_name, "Southeast");
+    assert_eq!(parsed0.name, "Asheville");
+    assert_eq!(parsed0.callsign_rpt1, "W4MOE  B");
+    assert_eq!(parsed0.frequency, 145_250_000);
+    assert_eq!(parsed0.offset, 600_000);
+    Ok(())
 }
 
 #[test]
-fn repeater_list_missing_bom() {
-    let err = parse_repeater_list(&[0x00, 0x00]).unwrap_err();
-    assert!(matches!(err, SdCardError::MissingBom));
+fn repeater_list_missing_bom() -> TestResult {
+    let err = parse_repeater_list(&[0x00, 0x00])
+        .err()
+        .ok_or("expected MissingBom but got Ok")?;
+    assert!(
+        matches!(err, SdCardError::MissingBom),
+        "expected MissingBom, got {err:?}"
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -211,17 +259,24 @@ fn repeater_list_missing_bom() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn callsign_list_parse_basic() {
+fn callsign_list_parse_basic() -> TestResult {
     let data = encode_utf16le_bom("Callsign\r\nW4CDR   \r\nKE4FOX  \r\n");
-    let entries = parse_callsign_list(&data).unwrap();
+    let entries = parse_callsign_list(&data)?;
 
     assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].callsign, "W4CDR   ");
-    assert_eq!(entries[1].callsign, "KE4FOX  ");
+    assert_eq!(
+        entries.first().ok_or("entries[0] missing")?.callsign,
+        "W4CDR   "
+    );
+    assert_eq!(
+        entries.get(1).ok_or("entries[1] missing")?.callsign,
+        "KE4FOX  "
+    );
+    Ok(())
 }
 
 #[test]
-fn callsign_list_write_roundtrip() {
+fn callsign_list_write_roundtrip() -> TestResult {
     let entries = vec![
         CallsignEntry {
             callsign: "W4CDR   ".to_owned(),
@@ -232,11 +287,18 @@ fn callsign_list_write_roundtrip() {
     ];
 
     let bytes = write_callsign_list(&entries);
-    let parsed = parse_callsign_list(&bytes).unwrap();
+    let parsed = parse_callsign_list(&bytes)?;
 
     assert_eq!(parsed.len(), 2);
-    assert_eq!(parsed[0].callsign, entries[0].callsign);
-    assert_eq!(parsed[1].callsign, entries[1].callsign);
+    assert_eq!(
+        parsed.first().ok_or("parsed[0] missing")?.callsign,
+        entries.first().ok_or("entries[0] missing")?.callsign
+    );
+    assert_eq!(
+        parsed.get(1).ok_or("parsed[1] missing")?.callsign,
+        entries.get(1).ok_or("entries[1] missing")?.callsign
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +337,7 @@ fn make_qso_line() -> String {
 }
 
 #[test]
-fn parse_qso_log_basic() {
+fn parse_qso_log_basic() -> TestResult {
     let header = "TX/RX\tDate\tFrequency\tMode\t\
         My Latitude\tMy Longitude\tMy Altitude\t\
         RF Power\tS Meter\tCaller\tMemo\tCalled\t\
@@ -284,20 +346,22 @@ fn parse_qso_log_basic() {
         Latitude\tLongitude\tAltitude\tCourse\tSpeed";
     let line = make_qso_line();
     let data = format!("{header}\r\n{line}\r\n");
-    let entries = parse_qso_log(data.as_bytes()).unwrap();
+    let entries = parse_qso_log(data.as_bytes())?;
 
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].tx_rx, "TX");
-    assert_eq!(entries[0].date, "2026/03/28 14:30");
-    assert_eq!(entries[0].mode, "DV");
-    assert_eq!(entries[0].caller, "W4CDR");
-    assert_eq!(entries[0].called, "CQCQCQ");
-    assert_eq!(entries[0].rpt1, "W4MOE  B");
-    assert_eq!(entries[0].message, "Hello");
+    let entry = entries.first().ok_or("qso entry missing")?;
+    assert_eq!(entry.tx_rx, "TX");
+    assert_eq!(entry.date, "2026/03/28 14:30");
+    assert_eq!(entry.mode, "DV");
+    assert_eq!(entry.caller, "W4CDR");
+    assert_eq!(entry.called, "CQCQCQ");
+    assert_eq!(entry.rpt1, "W4MOE  B");
+    assert_eq!(entry.message, "Hello");
+    Ok(())
 }
 
 #[test]
-fn qso_log_write_roundtrip() {
+fn qso_log_write_roundtrip() -> TestResult {
     let entry = QsoEntry {
         tx_rx: "RX".to_owned(),
         date: "2026/03/28 15:00".to_owned(),
@@ -326,15 +390,17 @@ fn qso_log_write_roundtrip() {
     };
 
     let bytes = write_qso_log(std::slice::from_ref(&entry));
-    let parsed = parse_qso_log(&bytes).unwrap();
+    let parsed = parse_qso_log(&bytes)?;
 
     assert_eq!(parsed.len(), 1);
-    assert_eq!(parsed[0].tx_rx, entry.tx_rx);
-    assert_eq!(parsed[0].date, entry.date);
-    assert_eq!(parsed[0].frequency, entry.frequency);
-    assert_eq!(parsed[0].mode, entry.mode);
-    assert_eq!(parsed[0].caller, entry.caller);
-    assert_eq!(parsed[0].called, entry.called);
+    let parsed0 = parsed.first().ok_or("parsed qso missing")?;
+    assert_eq!(parsed0.tx_rx, entry.tx_rx);
+    assert_eq!(parsed0.date, entry.date);
+    assert_eq!(parsed0.frequency, entry.frequency);
+    assert_eq!(parsed0.mode, entry.mode);
+    assert_eq!(parsed0.caller, entry.caller);
+    assert_eq!(parsed0.called, entry.called);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@
 //! PRs 2 and 3.
 
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 
 use aprs::{
     AprsData, AprsPosition, AprsWeather, MiceMessage, build_aprs_message_packet,
@@ -20,6 +21,12 @@ use aprs::{
 use ax25_codec::{Ax25Address, Ax25Packet, build_ax25, parse_ax25};
 use kenwood_thd75::aprs::ax25_to_kiss_wire;
 use kiss_tnc::decode_kiss_frame;
+
+/// Convert any debug-printable error into a `TestCaseError` so `?` can be used
+/// in proptest blocks without violating workspace `unwrap_used` policy.
+fn to_test_err<E: std::fmt::Debug>(e: E) -> TestCaseError {
+    TestCaseError::fail(format!("{e:?}"))
+}
 
 // ---------------------------------------------------------------------------
 // Strategies
@@ -34,7 +41,9 @@ fn arb_callsign() -> impl Strategy<Value = String> {
         ]),
         1..=6,
     )
-    .prop_map(|bytes| String::from_utf8(bytes).unwrap())
+    .prop_filter_map("invalid utf-8 callsign", |bytes| {
+        String::from_utf8(bytes).ok()
+    })
 }
 
 fn arb_ssid() -> impl Strategy<Value = u8> {
@@ -115,7 +124,7 @@ proptest! {
             info: info.clone(),
         };
         let bytes = build_ax25(&packet);
-        let parsed = parse_ax25(&bytes).unwrap();
+        let parsed = parse_ax25(&bytes).map_err(to_test_err)?;
         prop_assert_eq!(parsed.source.callsign, source.callsign);
         prop_assert_eq!(parsed.source.ssid, source.ssid);
         prop_assert_eq!(parsed.destination.callsign, dest.callsign);
@@ -140,9 +149,9 @@ proptest! {
             &source, lat, lon, '/', '>', "", &[],
         );
         let wire = ax25_to_kiss_wire(&packet);
-        let kiss = decode_kiss_frame(&wire).unwrap();
-        let parsed_packet = parse_ax25(&kiss.data).unwrap();
-        let parsed: AprsPosition = parse_aprs_position(&parsed_packet.info).unwrap();
+        let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
+        let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
+        let parsed: AprsPosition = parse_aprs_position(&parsed_packet.info).map_err(to_test_err)?;
         prop_assert!((parsed.latitude - lat).abs() < 0.02,
             "lat roundtrip failed: in {lat}, out {}", parsed.latitude);
         prop_assert!((parsed.longitude - lon).abs() < 0.02,
@@ -165,9 +174,9 @@ proptest! {
             &source, lat, lon, '/', '>', "", &[],
         );
         let wire = ax25_to_kiss_wire(&packet);
-        let kiss = decode_kiss_frame(&wire).unwrap();
-        let parsed_packet = parse_ax25(&kiss.data).unwrap();
-        let parsed: AprsPosition = parse_aprs_position(&parsed_packet.info).unwrap();
+        let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
+        let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
+        let parsed: AprsPosition = parse_aprs_position(&parsed_packet.info).map_err(to_test_err)?;
         // Compressed is less precise than uncompressed — allow more slop.
         prop_assert!((parsed.latitude - lat).abs() < 0.1);
         prop_assert!((parsed.longitude - lon).abs() < 0.1);
@@ -199,12 +208,12 @@ proptest! {
             &source, lat, lon, 0, 0, message, '/', '>', "", &[],
         );
         let wire = ax25_to_kiss_wire(&packet);
-        let kiss = decode_kiss_frame(&wire).unwrap();
-        let parsed_packet = parse_ax25(&kiss.data).unwrap();
+        let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
+        let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
         let parsed = parse_mice_position(
             &parsed_packet.destination.callsign,
             &parsed_packet.info,
-        ).unwrap();
+        ).map_err(to_test_err)?;
         prop_assert_eq!(parsed.mice_message, Some(message));
         // Mic-E encodes position to 0.01 minute → ~18 metre precision.
         prop_assert!((parsed.latitude - lat).abs() < 0.02);
@@ -224,9 +233,9 @@ proptest! {
     ) {
         let packet = build_aprs_weather_packet(&source, &wx, &[]);
         let wire = ax25_to_kiss_wire(&packet);
-        let kiss = decode_kiss_frame(&wire).unwrap();
-        let parsed_packet = parse_ax25(&kiss.data).unwrap();
-        let data = parse_aprs_data(&parsed_packet.info).unwrap();
+        let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
+        let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
+        let data = parse_aprs_data(&parsed_packet.info).map_err(to_test_err)?;
         let AprsData::Weather(parsed) = data else {
             prop_assert!(false, "expected weather variant");
             return Ok(());
@@ -259,9 +268,9 @@ proptest! {
             &source, &addressee, &text, msg_id.as_deref(), &[],
         );
         let wire = ax25_to_kiss_wire(&packet);
-        let kiss = decode_kiss_frame(&wire).unwrap();
-        let parsed_packet = parse_ax25(&kiss.data).unwrap();
-        let data = parse_aprs_data(&parsed_packet.info).unwrap();
+        let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
+        let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
+        let data = parse_aprs_data(&parsed_packet.info).map_err(to_test_err)?;
         let AprsData::Message(parsed) = data else {
             prop_assert!(false, "expected message variant");
             return Ok(());
@@ -294,9 +303,9 @@ proptest! {
     ) {
         let packet = build_aprs_status_packet(&source, &text, &[]);
         let wire = ax25_to_kiss_wire(&packet);
-        let kiss = decode_kiss_frame(&wire).unwrap();
-        let parsed_packet = parse_ax25(&kiss.data).unwrap();
-        let data = parse_aprs_data(&parsed_packet.info).unwrap();
+        let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
+        let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
+        let data = parse_aprs_data(&parsed_packet.info).map_err(to_test_err)?;
         let AprsData::Status(parsed) = data else {
             prop_assert!(false, "expected status variant");
             return Ok(());

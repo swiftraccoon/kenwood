@@ -19,26 +19,33 @@
 use kenwood_thd75::protocol::{self, Command, Response, command_name};
 use kenwood_thd75::types::*;
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+type BoxErr = Box<dyn std::error::Error>;
+
 /// Load the KI4LAX spec if `THD75_KI4LAX_SPEC` is set, else `None`.
 ///
-/// Panics only when the env var is set but the file is unreadable or the
-/// JSON is malformed — that's a configuration error and should surface
-/// loudly. An unset env var is silent by design so the test suite is
-/// still runnable without the third-party fixture.
-fn load_spec() -> Option<serde_json::Value> {
-    let path = std::env::var_os("THD75_KI4LAX_SPEC")?;
-    let data = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
+/// Returns `Err` when the env var is set but the file is unreadable or the
+/// JSON is malformed. An unset env var produces `Ok(None)`, so tests can
+/// still run without the third-party fixture.
+fn load_spec() -> Result<Option<serde_json::Value>, BoxErr> {
+    let Some(path) = std::env::var_os("THD75_KI4LAX_SPEC") else {
+        return Ok(None);
+    };
+    let data = std::fs::read_to_string(&path).map_err(|e| -> BoxErr {
+        format!(
             "failed to read THD75_KI4LAX_SPEC={}: {e}",
             path.to_string_lossy()
         )
-    });
-    Some(serde_json::from_str(&data).expect("invalid JSON in THD75_KI4LAX_SPEC"))
+        .into()
+    })?;
+    let json: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| -> BoxErr { format!("invalid JSON in THD75_KI4LAX_SPEC: {e}").into() })?;
+    Ok(Some(json))
 }
 
 /// Collect every unique mnemonic our code maps from `command_name()`.
-fn our_mnemonics() -> Vec<&'static str> {
-    vec![
+fn our_mnemonics() -> Result<Vec<&'static str>, BoxErr> {
+    Ok(vec![
         command_name(&Command::GetFrequency { band: Band::A }), // FQ
         command_name(&Command::GetFrequencyFull { band: Band::A }), // FO
         command_name(&Command::GetFirmwareVersion),             // FV
@@ -77,7 +84,7 @@ fn our_mnemonics() -> Vec<&'static str> {
         command_name(&Command::EnterProgrammingMode),           // 0M
         command_name(&Command::GetTncMode),                     // TN
         command_name(&Command::GetDstarCallsign {
-            slot: DstarSlot::new(1).unwrap(),
+            slot: DstarSlot::new(1)?,
         }), // DC
         command_name(&Command::GetRealTimeClock),               // RT
         command_name(&Command::SetScanResume {
@@ -100,7 +107,7 @@ fn our_mnemonics() -> Vec<&'static str> {
         command_name(&Command::GetUserSettings),                // US
         command_name(&Command::GetRadioType),                   // TY
         command_name(&Command::GetMcpStatus),                   // 0E
-    ]
+    ])
 }
 
 // ============================================================================
@@ -108,12 +115,15 @@ fn our_mnemonics() -> Vec<&'static str> {
 // ============================================================================
 
 #[test]
-fn all_spec_mnemonics_implemented() {
-    let Some(spec) = load_spec() else {
-        return;
+fn all_spec_mnemonics_implemented() -> TestResult {
+    let Some(spec) = load_spec()? else {
+        return Ok(());
     };
-    let commands = spec["commands"].as_object().unwrap();
-    let ours = our_mnemonics();
+    let commands = spec
+        .get("commands")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("spec.commands is missing or not an object")?;
+    let ours = our_mnemonics()?;
 
     let mut missing = Vec::new();
     for mnemonic in commands.keys() {
@@ -136,17 +146,19 @@ fn all_spec_mnemonics_implemented() {
         "KI4LAX spec commands missing from our code: {real_missing:?}\n\
          Our mnemonics: {ours:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn all_our_mnemonics_are_valid() {
+fn all_our_mnemonics_are_valid() -> TestResult {
     // Verify every entry in our_mnemonics() is a real 2-char string
-    for m in our_mnemonics() {
+    for m in our_mnemonics()? {
         assert!(
             m.len() == 2 || m == "0M" || m == "0E",
             "Invalid mnemonic: {m:?}"
         );
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -154,12 +166,15 @@ fn all_our_mnemonics_are_valid() {
 // ============================================================================
 
 #[test]
-fn document_commands_beyond_spec() {
-    let Some(spec) = load_spec() else {
-        return;
+fn document_commands_beyond_spec() -> TestResult {
+    let Some(spec) = load_spec()? else {
+        return Ok(());
     };
-    let commands = spec["commands"].as_object().unwrap();
-    let ours = our_mnemonics();
+    let commands = spec
+        .get("commands")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("spec.commands is missing or not an object")?;
+    let ours = our_mnemonics()?;
 
     let extra: Vec<&&str> = ours
         .iter()
@@ -194,6 +209,7 @@ fn document_commands_beyond_spec() {
             "New undocumented command {m} — add to expected_extra or document in spec"
         );
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -201,17 +217,24 @@ fn document_commands_beyond_spec() {
 // ============================================================================
 
 #[test]
-fn mode_table_matches_spec() {
-    let Some(spec) = load_spec() else {
-        return;
+fn mode_table_matches_spec() -> TestResult {
+    let Some(spec) = load_spec()? else {
+        return Ok(());
     };
-    let table_d = spec["tables"]["TABLE_D"]["entries"].as_object().unwrap();
+    let table_d = spec
+        .get("tables")
+        .and_then(|t| t.get("TABLE_D"))
+        .and_then(|d| d.get("entries"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or("tables.TABLE_D.entries is missing or not an object")?;
 
     for (index_str, name_val) in table_d {
-        let index: u8 = index_str.parse().unwrap();
-        let expected_name = name_val.as_str().unwrap();
+        let index: u8 = index_str.parse()?;
+        let expected_name = name_val
+            .as_str()
+            .ok_or_else(|| format!("TABLE_D[{index_str}] is not a string"))?;
         let mode = Mode::try_from(index)
-            .unwrap_or_else(|_| panic!("Mode index {index} from spec is invalid in our code"));
+            .map_err(|_| format!("Mode index {index} from spec is invalid in our code"))?;
         assert_eq!(
             mode.to_string(),
             expected_name,
@@ -230,6 +253,7 @@ fn mode_table_matches_spec() {
         "Mode 9 (CW-R) confirmed by ARFC RE"
     );
     assert!(Mode::try_from(10).is_err(), "Mode 10 should be invalid");
+    Ok(())
 }
 
 // ============================================================================
@@ -237,14 +261,19 @@ fn mode_table_matches_spec() {
 // ============================================================================
 
 #[test]
-fn step_size_table_matches_spec() {
-    let Some(spec) = load_spec() else {
-        return;
+fn step_size_table_matches_spec() -> TestResult {
+    let Some(spec) = load_spec()? else {
+        return Ok(());
     };
-    let table_c = spec["tables"]["TABLE_C"]["entries"].as_object().unwrap();
+    let table_c = spec
+        .get("tables")
+        .and_then(|t| t.get("TABLE_C"))
+        .and_then(|c| c.get("entries"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or("tables.TABLE_C.entries is missing or not an object")?;
 
     for (hex_str, _value) in table_c {
-        let index = u8::from_str_radix(hex_str, 16).unwrap();
+        let index = u8::from_str_radix(hex_str, 16)?;
         assert!(
             StepSize::try_from(index).is_ok(),
             "Step size index 0x{hex_str} ({index}) from spec is invalid in our code"
@@ -256,6 +285,7 @@ fn step_size_table_matches_spec() {
         StepSize::try_from(12).is_err(),
         "Step size 12 should be invalid — spec only defines 0-B"
     );
+    Ok(())
 }
 
 // ============================================================================
@@ -263,16 +293,21 @@ fn step_size_table_matches_spec() {
 // ============================================================================
 
 #[test]
-fn tone_table_matches_spec() {
-    let Some(spec) = load_spec() else {
-        return;
+fn tone_table_matches_spec() -> TestResult {
+    let Some(spec) = load_spec()? else {
+        return Ok(());
     };
-    let table_a = spec["tables"]["TABLE_A"]["entries"].as_object().unwrap();
+    let table_a = spec
+        .get("tables")
+        .and_then(|t| t.get("TABLE_A"))
+        .and_then(|a| a.get("entries"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or("tables.TABLE_A.entries is missing or not an object")?;
 
     assert_eq!(table_a.len(), 50, "TABLE A should have 50 entries (0-49)");
 
     for (index_str, _freq) in table_a {
-        let index: u8 = index_str.parse().unwrap();
+        let index: u8 = index_str.parse()?;
         assert!(
             ToneCode::new(index).is_ok(),
             "Tone code {index} from spec is invalid in our code"
@@ -286,6 +321,7 @@ fn tone_table_matches_spec() {
     );
     // Index 51 should be invalid
     assert!(ToneCode::new(51).is_err(), "Tone code 51 should be invalid");
+    Ok(())
 }
 
 // ============================================================================
@@ -293,32 +329,38 @@ fn tone_table_matches_spec() {
 // ============================================================================
 
 #[test]
-fn bl_is_read_only_per_spec() {
-    let Some(spec) = load_spec() else {
-        return;
+fn bl_is_read_only_per_spec() -> TestResult {
+    let Some(spec) = load_spec()? else {
+        return Ok(());
     };
-    let bl = &spec["commands"]["BL"];
-    assert!(bl["write"].is_null(), "BL should be read-only per spec");
+    let bl = spec
+        .get("commands")
+        .and_then(|c| c.get("BL"))
+        .ok_or("commands.BL missing from spec")?;
+    let write = bl.get("write").ok_or("BL.write missing from spec")?;
+    assert!(write.is_null(), "BL should be read-only per spec");
+    Ok(())
 }
 
 #[test]
-fn bl_values_include_spec_range() {
+fn bl_values_include_spec_range() -> TestResult {
     // Spec documents 0-3. We additionally support 4 (charging, hardware).
     for raw in 0..=3u8 {
         let frame = format!("BL {raw}");
-        let response = protocol::parse(frame.as_bytes()).unwrap();
-        let expected = BatteryLevel::try_from(raw).unwrap();
+        let response = protocol::parse(frame.as_bytes())?;
+        let expected = BatteryLevel::try_from(raw)?;
         assert!(
             matches!(response, Response::BatteryLevel { level } if level == expected),
             "BL {raw} should parse as BatteryLevel"
         );
     }
     // Level 4 (charging) is NOT in the spec but observed on hardware
-    let response = protocol::parse(b"BL 4").unwrap();
+    let response = protocol::parse(b"BL 4")?;
     assert!(
         matches!(response, Response::BatteryLevel { level } if level == BatteryLevel::Charging),
         "BL 4 (charging) should parse — hardware extension beyond spec"
     );
+    Ok(())
 }
 
 // ============================================================================
@@ -326,12 +368,17 @@ fn bl_values_include_spec_range() {
 // ============================================================================
 
 #[test]
-fn dw_is_write_only_per_spec() {
-    let Some(spec) = load_spec() else {
-        return;
+fn dw_is_write_only_per_spec() -> TestResult {
+    let Some(spec) = load_spec()? else {
+        return Ok(());
     };
-    let dw = &spec["commands"]["DW"];
-    assert!(dw["read"].is_null(), "DW should be write-only per spec");
+    let dw = spec
+        .get("commands")
+        .and_then(|c| c.get("DW"))
+        .ok_or("commands.DW missing from spec")?;
+    let read = dw.get("read").ok_or("DW.read missing from spec")?;
+    assert!(read.is_null(), "DW should be write-only per spec");
+    Ok(())
 }
 
 // ============================================================================
@@ -339,16 +386,17 @@ fn dw_is_write_only_per_spec() {
 // ============================================================================
 
 #[test]
-fn sq_range_matches_spec() {
+fn sq_range_matches_spec() -> TestResult {
     for raw in 0..=6u8 {
         let frame = format!("SQ 0,{raw}");
-        let response = protocol::parse(frame.as_bytes()).unwrap();
-        let expected = SquelchLevel::new(raw).unwrap();
+        let response = protocol::parse(frame.as_bytes())?;
+        let expected = SquelchLevel::new(raw)?;
         assert!(
             matches!(response, Response::Squelch { band: Band::A, level } if level == expected),
             "SQ 0,{raw} should parse successfully"
         );
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -356,19 +404,23 @@ fn sq_range_matches_spec() {
 // ============================================================================
 
 #[test]
-fn ag_write_is_3_digit_per_spec() {
+fn ag_write_is_3_digit_per_spec() -> TestResult {
     let bytes = protocol::serialize(&Command::SetAfGain {
         band: Band::A,
         level: AfGainLevel::new(15),
     });
-    let wire = String::from_utf8(bytes).unwrap();
-    let payload = wire.trim_end_matches('\r').strip_prefix("AG ").unwrap();
+    let wire = String::from_utf8(bytes)?;
+    let payload = wire
+        .trim_end_matches('\r')
+        .strip_prefix("AG ")
+        .ok_or("AG wire missing 'AG ' prefix")?;
     assert_eq!(
         payload.len(),
         3,
         "AG payload should be 3 chars per spec: got '{payload}'"
     );
     assert_eq!(payload, "015", "AG 15 should serialize as '015'");
+    Ok(())
 }
 
 // ============================================================================
@@ -376,16 +428,17 @@ fn ag_write_is_3_digit_per_spec() {
 // ============================================================================
 
 #[test]
-fn sm_range_matches_spec() {
+fn sm_range_matches_spec() -> TestResult {
     for raw in 0..=5u8 {
         let frame = format!("SM 0,{raw}");
-        let response = protocol::parse(frame.as_bytes()).unwrap();
-        let expected = SMeterReading::new(raw).unwrap();
+        let response = protocol::parse(frame.as_bytes())?;
+        let expected = SMeterReading::new(raw)?;
         assert!(
             matches!(response, Response::Smeter { band: Band::A, level } if level == expected),
             "SM 0,{raw} should parse successfully"
         );
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -393,11 +446,16 @@ fn sm_range_matches_spec() {
 // ============================================================================
 
 #[test]
-fn fo_has_21_fields_per_spec() {
-    let Some(spec) = load_spec() else {
-        return;
+fn fo_has_21_fields_per_spec() -> TestResult {
+    let Some(spec) = load_spec()? else {
+        return Ok(());
     };
-    let expected = spec["commands"]["FO"]["field_count"].as_u64().unwrap();
+    let expected = spec
+        .get("commands")
+        .and_then(|c| c.get("FO"))
+        .and_then(|fo| fo.get("field_count"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("commands.FO.field_count missing or not a number")?;
     assert_eq!(expected, 21);
 
     let channel = ChannelMemory::default();
@@ -405,10 +463,14 @@ fn fo_has_21_fields_per_spec() {
         band: Band::A,
         channel,
     });
-    let wire = String::from_utf8(bytes).unwrap();
-    let payload = wire.trim_end_matches('\r').strip_prefix("FO ").unwrap();
+    let wire = String::from_utf8(bytes)?;
+    let payload = wire
+        .trim_end_matches('\r')
+        .strip_prefix("FO ")
+        .ok_or("FO wire missing 'FO ' prefix")?;
     let count = payload.split(',').count();
     assert_eq!(count, 21, "FO should serialize to 21 fields, got {count}");
+    Ok(())
 }
 
 // ============================================================================
@@ -416,12 +478,18 @@ fn fo_has_21_fields_per_spec() {
 // ============================================================================
 
 #[test]
-fn me_has_23_fields_per_spec() {
-    let Some(spec) = load_spec() else {
-        return;
+fn me_has_23_fields_per_spec() -> TestResult {
+    let Some(spec) = load_spec()? else {
+        return Ok(());
     };
-    let expected = spec["commands"]["ME"]["field_count"].as_u64().unwrap();
+    let expected = spec
+        .get("commands")
+        .and_then(|c| c.get("ME"))
+        .and_then(|me| me.get("field_count"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("commands.ME.field_count missing or not a number")?;
     assert_eq!(expected, 23);
+    Ok(())
 }
 
 // ============================================================================
@@ -446,11 +514,16 @@ fn sf_fs_mnemonic_firmware_verified() {
 // ============================================================================
 
 #[test]
-fn fine_step_table_matches_spec() {
-    let Some(spec) = load_spec() else {
-        return;
+fn fine_step_table_matches_spec() -> TestResult {
+    let Some(spec) = load_spec()? else {
+        return Ok(());
     };
-    let table_e = spec["tables"]["TABLE_E"]["entries"].as_object().unwrap();
+    let table_e = spec
+        .get("tables")
+        .and_then(|t| t.get("TABLE_E"))
+        .and_then(|e| e.get("entries"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or("tables.TABLE_E.entries is missing or not an object")?;
 
     let expected_names: [(u8, &str); 4] =
         [(0, "20 Hz"), (1, "100 Hz"), (2, "500 Hz"), (3, "1,000 Hz")];
@@ -459,8 +532,10 @@ fn fine_step_table_matches_spec() {
     assert_eq!(table_e.len(), 4, "TABLE E should have 4 entries (0-3)");
 
     for (index_str, name_val) in table_e {
-        let index: u8 = index_str.parse().unwrap();
-        let spec_name = name_val.as_str().unwrap();
+        let index: u8 = index_str.parse()?;
+        let spec_name = name_val
+            .as_str()
+            .ok_or_else(|| format!("TABLE_E[{index_str}] is not a string"))?;
         // Verify our code accepts this index
         assert!(
             FineStep::try_from(index).is_ok(),
@@ -470,7 +545,7 @@ fn fine_step_table_matches_spec() {
         let (_, expected_name) = expected_names
             .iter()
             .find(|(i, _)| *i == index)
-            .unwrap_or_else(|| panic!("unexpected TABLE E index {index}"));
+            .ok_or_else(|| format!("unexpected TABLE E index {index}"))?;
         assert_eq!(
             spec_name, *expected_name,
             "TABLE E index {index}: spec says {spec_name}, expected {expected_name}"
@@ -482,4 +557,5 @@ fn fine_step_table_matches_spec() {
         FineStep::try_from(4).is_err(),
         "FineStep 4 should be invalid"
     );
+    Ok(())
 }

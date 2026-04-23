@@ -214,7 +214,6 @@ pub enum DisplayHoldTime {
 /// Menu No. 910 controls audio balance between Band A and Band B.
 /// The `Operation Band Only` setting outputs sound only from the
 /// operation band when both bands are simultaneously busy.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioSettings {
     /// Key beep on/off.
@@ -335,7 +334,12 @@ pub enum VoiceGuideSpeed {
 /// Menu No. 921 controls Auto Power Off. Default is 30 minutes.
 /// The radio powers off automatically after the configured period
 /// of inactivity.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Maps 1:1 to the D75 System menu tree — each bool is a discrete on/off menu item \
+              (battery saver, key lock, PC output NMEA, GPS on). Collapsing to bitflags would \
+              lose the per-field User Manual Menu-number documentation."
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemSettings {
     /// Battery saver on/off (reduce power in standby by cycling the
@@ -841,15 +845,18 @@ mod tests {
     }
 
     #[test]
-    fn power_on_message_valid() {
-        let msg = PowerOnMessage::new("TH-D75 Ready").unwrap();
+    fn power_on_message_valid() -> Result<(), Box<dyn std::error::Error>> {
+        let msg = PowerOnMessage::new("TH-D75 Ready").ok_or("valid message rejected")?;
         assert_eq!(msg.as_str(), "TH-D75 Ready");
+        Ok(())
     }
 
     #[test]
-    fn power_on_message_max_length() {
-        let msg = PowerOnMessage::new("1234567890123456").unwrap();
+    fn power_on_message_max_length() -> Result<(), Box<dyn std::error::Error>> {
+        let msg =
+            PowerOnMessage::new("1234567890123456").ok_or("valid 16-char message rejected")?;
         assert_eq!(msg.as_str().len(), 16);
+        Ok(())
     }
 
     #[test]

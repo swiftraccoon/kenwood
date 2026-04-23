@@ -61,13 +61,13 @@ pub struct ScreenCapture {
 }
 
 /// Read a little-endian `i32` from a byte slice at the given offset.
+///
+/// Returns `0` if the slice is too short — the caller is expected to have
+/// validated the buffer length before calling.
 fn read_i32_le(data: &[u8], offset: usize) -> i32 {
-    i32::from_le_bytes([
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-    ])
+    data.get(offset..offset + 4)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .map_or(0, i32::from_le_bytes)
 }
 
 /// Parse a BMP screen capture file from raw bytes.
@@ -95,7 +95,7 @@ pub fn parse(data: &[u8]) -> Result<ScreenCapture, SdCardError> {
     }
 
     // Validate BM magic bytes.
-    if &data[0..2] != b"BM" {
+    if data.get(..2) != Some(b"BM") {
         return Err(SdCardError::InvalidBmpHeader {
             detail: "missing BM magic bytes".to_owned(),
         });
@@ -165,13 +165,24 @@ pub fn parse(data: &[u8]) -> Result<ScreenCapture, SdCardError> {
 
     // Extract pixel data, stripping row padding if present.
     let pixels = if row_stride == bytes_per_row {
-        data[pixel_offset..pixel_offset + pixel_data_size].to_vec()
+        data.get(pixel_offset..pixel_offset + pixel_data_size)
+            .ok_or(SdCardError::FileTooSmall {
+                expected: pixel_offset + pixel_data_size,
+                actual: data.len(),
+            })?
+            .to_vec()
     } else {
         let mut pixels = Vec::with_capacity(bytes_per_row as usize * height as usize);
         for row in 0..height as usize {
             let row_start = pixel_offset + row * row_stride as usize;
             let row_end = row_start + bytes_per_row as usize;
-            pixels.extend_from_slice(&data[row_start..row_end]);
+            let row_slice = data
+                .get(row_start..row_end)
+                .ok_or(SdCardError::FileTooSmall {
+                    expected: row_end,
+                    actual: data.len(),
+                })?;
+            pixels.extend_from_slice(row_slice);
         }
         pixels
     };
@@ -206,9 +217,18 @@ mod tests {
 
         // DIB header (BITMAPINFOHEADER, 40 bytes)
         buf.extend_from_slice(&40u32.to_le_bytes()); // header size
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "Test helper builds synthetic BMP for parser round-trip. BMP DIB width is a \
+                      signed i32 per Microsoft's BITMAPINFOHEADER spec; test inputs are small \
+                      positive values (<= 2^31-1), so the cast from u32 never wraps."
+        )]
         buf.extend_from_slice(&(width as i32).to_le_bytes());
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "BMP DIB height is i32 (negative indicates top-down rows) per Microsoft's \
+                      BITMAPINFOHEADER spec. Test-only values stay well below i32::MAX."
+        )]
         buf.extend_from_slice(&(height as i32).to_le_bytes());
         buf.extend_from_slice(&1u16.to_le_bytes()); // planes
         buf.extend_from_slice(&bpp.to_le_bytes());
@@ -222,11 +242,23 @@ mod tests {
         // Pixel data (fill with a recognisable pattern).
         for row in 0..height {
             for col in 0..width {
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "Synthesises a recognisable test pixel pattern. `x % 256` is \
+                              provably in 0..=255, so the u32-to-u8 cast cannot truncate."
+                )]
                 let b = ((row + col) % 256) as u8;
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "Synthesises a recognisable test pixel pattern. `x % 256` is \
+                              provably in 0..=255, so the u32-to-u8 cast cannot truncate."
+                )]
                 let g = ((row * 2 + col) % 256) as u8;
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "Synthesises a recognisable test pixel pattern. `x % 256` is \
+                              provably in 0..=255, so the u32-to-u8 cast cannot truncate."
+                )]
                 let r = ((row + col * 2) % 256) as u8;
                 buf.push(b);
                 buf.push(g);
@@ -240,84 +272,149 @@ mod tests {
         buf
     }
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type BoxErr = Box<dyn std::error::Error>;
+
+    fn write_slice(image: &mut [u8], offset: usize, data: &[u8]) -> Result<(), BoxErr> {
+        let end = offset + data.len();
+        let img_len = image.len();
+        image
+            .get_mut(offset..end)
+            .ok_or_else(|| {
+                format!("write_slice: range {offset}..{end} out of bounds (len={img_len})")
+            })?
+            .copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Return `bytes[idx]` or an error if out of range.
+    fn byte_at(bytes: &[u8], idx: usize) -> Result<u8, BoxErr> {
+        bytes
+            .get(idx)
+            .copied()
+            .ok_or_else(|| format!("byte_at: idx {idx} out of range (len={})", bytes.len()).into())
+    }
+
     #[test]
-    fn parse_valid_d75_capture() {
+    fn parse_valid_d75_capture() -> TestResult {
         let bmp = build_bmp(240, 180, 24);
-        let cap = parse(&bmp).unwrap();
+        let cap = parse(&bmp)?;
 
         assert_eq!(cap.width, 240);
         assert_eq!(cap.height, 180);
         assert_eq!(cap.bits_per_pixel, 24);
         // 240 * 180 * 3 = 129600 bytes of pixel data (no padding needed: 240*3=720, divisible by 4)
         assert_eq!(cap.pixels.len(), 240 * 180 * 3);
+        Ok(())
     }
 
     #[test]
-    fn pixel_data_correct() {
+    fn pixel_data_correct() -> TestResult {
         let bmp = build_bmp(240, 180, 24);
-        let cap = parse(&bmp).unwrap();
+        let cap = parse(&bmp)?;
 
         // Verify first pixel (row 0, col 0): b=0, g=0, r=0
-        assert_eq!(cap.pixels[0], 0); // blue
-        assert_eq!(cap.pixels[1], 0); // green
-        assert_eq!(cap.pixels[2], 0); // red
+        assert_eq!(byte_at(&cap.pixels, 0)?, 0); // blue
+        assert_eq!(byte_at(&cap.pixels, 1)?, 0); // green
+        assert_eq!(byte_at(&cap.pixels, 2)?, 0); // red
 
         // Verify second pixel (row 0, col 1): b=1, g=1, r=2
-        assert_eq!(cap.pixels[3], 1);
-        assert_eq!(cap.pixels[4], 1);
-        assert_eq!(cap.pixels[5], 2);
+        assert_eq!(byte_at(&cap.pixels, 3)?, 1);
+        assert_eq!(byte_at(&cap.pixels, 4)?, 1);
+        assert_eq!(byte_at(&cap.pixels, 5)?, 2);
+        Ok(())
     }
 
     #[test]
-    fn too_short_returns_error() {
+    fn too_short_returns_error() -> TestResult {
         let data = b"BM\x00\x00";
-        let err = parse(data).unwrap_err();
-        assert!(matches!(err, SdCardError::FileTooSmall { .. }));
+        let err = parse(data)
+            .err()
+            .ok_or("expected FileTooSmall but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::FileTooSmall { .. }),
+            "expected FileTooSmall, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn empty_returns_error() {
-        let err = parse(b"").unwrap_err();
-        assert!(matches!(err, SdCardError::FileTooSmall { .. }));
+    fn empty_returns_error() -> TestResult {
+        let err = parse(b"").err().ok_or("expected FileTooSmall but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::FileTooSmall { .. }),
+            "expected FileTooSmall, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn wrong_magic_bytes() {
+    fn wrong_magic_bytes() -> TestResult {
         let mut bmp = build_bmp(240, 180, 24);
-        bmp[0..2].copy_from_slice(b"XX");
-        let err = parse(&bmp).unwrap_err();
-        assert!(matches!(err, SdCardError::InvalidBmpHeader { .. }));
+        write_slice(&mut bmp, 0, b"XX")?;
+        let err = parse(&bmp)
+            .err()
+            .ok_or("expected InvalidBmpHeader but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::InvalidBmpHeader { .. }),
+            "expected InvalidBmpHeader, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn wrong_dimensions_rejected() {
+    fn wrong_dimensions_rejected() -> TestResult {
         let bmp = build_bmp(320, 240, 24);
-        let err = parse(&bmp).unwrap_err();
-        assert!(matches!(err, SdCardError::UnexpectedImageFormat { .. }));
+        let err = parse(&bmp)
+            .err()
+            .ok_or("expected UnexpectedImageFormat but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::UnexpectedImageFormat { .. }),
+            "expected UnexpectedImageFormat, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn wrong_bit_depth_rejected() {
+    fn wrong_bit_depth_rejected() -> TestResult {
         let bmp = build_bmp(240, 180, 32);
-        let err = parse(&bmp).unwrap_err();
-        assert!(matches!(err, SdCardError::UnexpectedImageFormat { .. }));
+        let err = parse(&bmp)
+            .err()
+            .ok_or("expected UnexpectedImageFormat but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::UnexpectedImageFormat { .. }),
+            "expected UnexpectedImageFormat, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn compressed_bmp_rejected() {
+    fn compressed_bmp_rejected() -> TestResult {
         let mut bmp = build_bmp(240, 180, 24);
         // Set compression to 1 (BI_RLE8) at offset 30.
-        bmp[30..34].copy_from_slice(&1u32.to_le_bytes());
-        let err = parse(&bmp).unwrap_err();
-        assert!(matches!(err, SdCardError::InvalidBmpHeader { .. }));
+        write_slice(&mut bmp, 30, &1u32.to_le_bytes())?;
+        let err = parse(&bmp)
+            .err()
+            .ok_or("expected InvalidBmpHeader but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::InvalidBmpHeader { .. }),
+            "expected InvalidBmpHeader, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn truncated_pixel_data_rejected() {
+    fn truncated_pixel_data_rejected() -> TestResult {
         let mut bmp = build_bmp(240, 180, 24);
         // Truncate to just the header.
         bmp.truncate(60);
-        let err = parse(&bmp).unwrap_err();
-        assert!(matches!(err, SdCardError::FileTooSmall { .. }));
+        let err = parse(&bmp)
+            .err()
+            .ok_or("expected FileTooSmall but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::FileTooSmall { .. }),
+            "expected FileTooSmall, got {err:?}"
+        );
+        Ok(())
     }
 }

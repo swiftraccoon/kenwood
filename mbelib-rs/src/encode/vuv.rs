@@ -23,6 +23,17 @@
 //! produces different numerical SAs because the 3-bin-power
 //! integration doesn't account for the Hamming spectral lobe the
 //! analysis window imparts on each harmonic.
+#![expect(
+    clippy::indexing_slicing,
+    reason = "V/UV detection: iterates per harmonic and per-bin over the fitted \
+              sinusoid response; indices come from the harmonic count L (<= 56 by \
+              IMBE spec) and the fixed WR_SP analysis window bounds. All array \
+              accesses are bounded by the analysis-stage invariants — the FFT bins, \
+              the fitted amplitudes, and the per-band window offsets are all \
+              algorithmically defined. `.get()?` on every access would overwhelm the \
+              reference-algorithm correspondence this file maintains with OP25 \
+              `v_uv_det.cc`."
+)]
 //!
 //! # State carried across frames
 //!
@@ -106,12 +117,6 @@ pub struct VuvDecisions {
 /// [`detect_vuv_and_sa`] directly so that hysteresis + ``th_max`` carry
 /// across frames.
 #[must_use]
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    reason = "DSP bin math; inputs bounded by FFT length"
-)]
 pub fn detect_vuv(fft_out: &[Complex<f32>], f0_bin: f32) -> VuvDecisions {
     let mut state = VuvState::new();
     let (vuv, _sa) = detect_vuv_and_sa(fft_out, f0_bin, &mut state, 0.5);
@@ -131,12 +136,16 @@ pub fn detect_vuv(fft_out: &[Complex<f32>], f0_bin: f32) -> VuvDecisions {
 /// in all but the first band — the pitch quality is too low to trust
 /// the harmonic model.
 #[must_use]
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
     clippy::too_many_lines,
-    reason = "Mirrors OP25's v_uv_det block so the port can be cross-referenced line-by-line"
+    reason = "Mirrors OP25's v_uv_det block so the port can be cross-referenced line-by-line. \
+              DSP bin math: indices are bounded by the FFT length (256), harmonic count is \
+              capped at MAX_HARMONICS (56), so the many f32/usize casts in the windowed \
+              sinusoid fit are all within safe magnitudes. Splitting into smaller helpers \
+              would break the line-by-line mapping with the reference."
 )]
 pub fn detect_vuv_and_sa(
     fft_out: &[Complex<f32>],
@@ -165,19 +174,25 @@ pub fn detect_vuv_and_sa(
     // `L_TABLE`-indexed `b0` selection and cascades into b1/b2/b3
     // quantizer searches. Matched exactly here.
     let num_harms: usize = {
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "period ∈ (0, 1024); period/2 + 0.25 < 513; truncating to usize is exact"
+            reason = "OP25-parity num_harms inner truncation: period is in (0, 1024], so \
+                      `period*0.5 + 0.25` is < 513; the float-to-usize truncation matches \
+                      OP25's Q8.8 arithmetic exactly (see comment above)."
         )]
         let tmp = (period * 0.5 + 0.25) as usize;
-        #[allow(clippy::cast_precision_loss, reason = "tmp ≤ 513; exact in f32")]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "tmp <= 513 from the truncation above; usize-to-f32 cast is exact."
+        )]
         let raw = tmp as f32 * 0.9254;
         let clamped = raw.max(9.0).min(MAX_HARMONICS as f32);
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "clamped above to [9.0, MAX_HARMONICS]; truncation is exact"
+            reason = "Clamped above to [9.0, MAX_HARMONICS (56)]; float-to-usize truncation \
+                      is exact within this range."
         )]
         let n = clamped as usize;
         n
@@ -357,19 +372,21 @@ fn wr_sp_sample(bin: usize, harmonic_center: f32) -> f32 {
     // output is therefore in `[WR_SP_CENTER − 64·128, WR_SP_CENTER +
     // 64·128] ⊂ i32`. Bounds check against `WR_SP_LEN` happens
     // before indexing; out-of-range returns zero.
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
-        reason = "bin ≤ 128 and WR_SP_CENTER = 160; both fit exactly in f32"
+        reason = "wr_sp lookup: bin is bounded by 128 (256-pt real FFT) and WR_SP_CENTER is \
+                  160; both tiny magnitudes fit exactly in f32 mantissa precision."
     )]
     let offset_raw = 64.0_f32.mul_add(bin as f32 - harmonic_center, WR_SP_CENTER as f32);
     let offset = offset_raw.round();
     if !offset.is_finite() || offset < 0.0 {
         return 0.0;
     }
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "Checked above: offset is finite and ≥ 0; truncation is exact for the integer result of `.round()` on a bounded small value"
+        reason = "offset is verified finite and non-negative above; `.round()` produces an \
+                  integer value from a bounded calculation, so the f32-to-usize cast is exact."
     )]
     let idx = offset as usize;
     WR_SP.get(idx).copied().unwrap_or(0.0)
@@ -402,7 +419,11 @@ fn unvoiced_sa_calc(m_num: f32, bin_count: usize) -> f32 {
     if bin_count == 0 {
         return 0.0;
     }
-    #[allow(clippy::cast_precision_loss, reason = "bin_count ≤ 128")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "bin_count is the number of FFT bins in a harmonic window, bounded by 128 \
+                  (half of 256-pt real FFT); usize-to-f32 cast is exact."
+    )]
     let n = bin_count as f32;
     0.1454 * (m_num / n).sqrt() * (2.0_f32).sqrt()
 }
@@ -437,24 +458,26 @@ mod tests {
         // bins either side of center (160/64 ≈ 2.5), tapered to zero
         // at the edges.
         for k in 1..=10 {
-            #[allow(
+            #[expect(
                 clippy::cast_precision_loss,
-                reason = "k ∈ [1, 10]; f32 rounding is exact below 2^24"
+                reason = "test harmonic index: k in [1, 10], usize-to-f32 is exact."
             )]
             let center = f0_bin * k as f32;
             for (wr_idx, &w) in WR_SP.iter().enumerate() {
-                #[allow(
+                #[expect(
                     clippy::cast_precision_loss,
-                    reason = "wr_idx ∈ [0, 321); exact in f32"
+                    reason = "WR_SP table index: wr_idx < 321, exact in f32."
                 )]
                 let offset_bins = (wr_idx as f32 - WR_SP_CENTER as f32) / 64.0;
                 // `bin` is bounded: center ∈ [6.4, 64], offset_bins
                 // ∈ [−2.5, 2.5], so `bin ∈ [3, 67]` — well within
                 // usize and within the 129-bin FFT.
-                #[allow(
+                #[expect(
                     clippy::cast_possible_truncation,
                     clippy::cast_sign_loss,
-                    reason = "bounded per comment above; truncation is exact for `.round()`"
+                    reason = "Bin index from the wr_sp lobe painting: the comment above \
+                              establishes bin is in [3, 67], non-negative and bounded, so \
+                              the float-to-usize truncation of `.round()` is exact."
                 )]
                 let bin = (center + offset_bins).round() as usize;
                 if let Some(c) = fft_out.get_mut(bin) {
@@ -512,10 +535,12 @@ mod tests {
         let mut fft_out = vec![Complex::new(0.0, 0.0); 129];
         let f0_bin = 6.4_f32;
         for k in 1..=10 {
-            #[allow(
+            #[expect(
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
-                clippy::cast_sign_loss
+                clippy::cast_sign_loss,
+                reason = "test harmonic bin painter: k in [1, 10] and f0_bin is 6.4, so \
+                          bin = round(6.4 * k) is in [6, 64], non-negative and within 129."
             )]
             let bin = (f0_bin * k as f32).round() as usize;
             if let Some(c) = fft_out.get_mut(bin) {
@@ -552,10 +577,12 @@ mod tests {
         let mut fft_out = vec![Complex::new(0.0, 0.0); 129];
         let f0_bin = 6.4_f32;
         for k in 1..=10 {
-            #[allow(
+            #[expect(
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
-                clippy::cast_sign_loss
+                clippy::cast_sign_loss,
+                reason = "test harmonic bin painter: k in [1, 10] and f0_bin is 6.4, so \
+                          bin = round(6.4 * k) is in [6, 64], non-negative and within 129."
             )]
             let bin = (f0_bin * k as f32).round() as usize;
             if let Some(c) = fft_out.get_mut(bin) {

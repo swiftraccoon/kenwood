@@ -24,6 +24,8 @@ pub mod dstar;
 pub mod gps;
 pub mod settings;
 
+use crate::sdcard::SdCardError;
+
 use std::fmt;
 
 use crate::protocol::programming;
@@ -215,9 +217,12 @@ impl MemoryImage {
         const SETTINGS_START: usize = 0x1000;
         const SETTINGS_END: usize = 0x1100;
 
-        // Snapshot the settings region
+        // Snapshot the settings region. If the image is shorter than
+        // SETTINGS_END (shouldn't happen for a valid MCP image), there's nothing
+        // to diff against, so return early via `?` (function returns `Option`).
+        let snapshot_src = self.raw.get(SETTINGS_START..SETTINGS_END)?;
         let mut snapshot = [0u8; SETTINGS_END - SETTINGS_START];
-        snapshot.copy_from_slice(&self.raw[SETTINGS_START..SETTINGS_END]);
+        snapshot.copy_from_slice(snapshot_src);
 
         // Apply the mutation
         f(&mut SettingsWriter::new(&mut self.raw));
@@ -225,13 +230,21 @@ impl MemoryImage {
         // Diff to find the changed byte
         let mut changed: Option<(u16, u8)> = None;
         for (i, &snap_byte) in snapshot.iter().enumerate() {
-            let current = self.raw[SETTINGS_START + i];
+            let Some(&current) = self.raw.get(SETTINGS_START + i) else {
+                continue;
+            };
             if current != snap_byte {
                 assert!(
                     changed.is_none(),
                     "modify_setting: more than one byte changed"
                 );
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "Settings region is tiny (a few KB within the 500KB MCP image) and \
+                              `SETTINGS_START + i` cannot exceed the settings-region size which \
+                              fits in u16::MAX. The returned offset is only used to identify \
+                              which settings byte changed."
+                )]
                 let offset = (SETTINGS_START + i) as u16;
                 changed = Some((offset, current));
             }
@@ -293,7 +306,16 @@ impl MemoryImage {
             });
         }
 
-        let body = data[d75::HEADER_SIZE..d75::HEADER_SIZE + programming::TOTAL_SIZE].to_vec();
+        let body = data
+            .get(d75::HEADER_SIZE..d75::HEADER_SIZE + programming::TOTAL_SIZE)
+            .ok_or_else(|| MemoryError::D75Error {
+                detail: format!(
+                    "file body too short after header: {} bytes, expected {}",
+                    data.len().saturating_sub(d75::HEADER_SIZE),
+                    programming::TOTAL_SIZE
+                ),
+            })?
+            .to_vec();
         Self::from_raw(body)
     }
 
@@ -315,16 +337,15 @@ impl MemoryImage {
     /// Uses a default TH-D75A header with the standard version bytes.
     /// For a specific model or custom header, use [`to_d75_file`](Self::to_d75_file).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the built-in model string is rejected, which should never
-    /// happen since the model is a known constant.
-    #[must_use]
-    pub fn to_d75_bytes(&self) -> Vec<u8> {
-        // Use a standard D75A header. make_header is infallible for known models.
-        let header =
-            d75::make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42]).expect("known model");
-        self.to_d75_file(&header)
+    /// Returns a [`SdCardError`] if the built-in model string is rejected
+    /// (unreachable under normal operation — `"Data For TH-D75A"` is in the
+    /// crate's `KNOWN_MODELS` constant, so this method is effectively
+    /// infallible unless that constant changes).
+    pub fn to_d75_bytes(&self) -> Result<Vec<u8>, SdCardError> {
+        let header = d75::make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
+        Ok(self.to_d75_file(&header))
     }
 
     /// Read a byte range from the image.
@@ -343,13 +364,15 @@ impl MemoryImage {
     /// the end of the image.
     pub fn write_region(&mut self, offset: usize, data: &[u8]) -> Result<(), MemoryError> {
         let end = offset + data.len();
-        if end > self.raw.len() {
-            return Err(MemoryError::InvalidSize {
+        let raw_len = self.raw.len();
+        let dst = self
+            .raw
+            .get_mut(offset..end)
+            .ok_or(MemoryError::InvalidSize {
                 actual: end,
-                expected: self.raw.len(),
-            });
-        }
-        self.raw[offset..end].copy_from_slice(data);
+                expected: raw_len,
+            })?;
+        dst.copy_from_slice(data);
         Ok(())
     }
 }
@@ -359,43 +382,58 @@ mod tests {
     use super::*;
     use crate::protocol::programming;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn to_d75_bytes_round_trip() {
+    fn to_d75_bytes_round_trip() -> TestResult {
         let raw = vec![0u8; programming::TOTAL_SIZE];
-        let image = MemoryImage::from_raw(raw.clone()).unwrap();
-        let d75_bytes = image.to_d75_bytes();
+        let image = MemoryImage::from_raw(raw.clone())?;
+        let d75_bytes = image.to_d75_bytes()?;
 
         // Should be header + raw image.
         assert_eq!(d75_bytes.len(), d75::HEADER_SIZE + programming::TOTAL_SIZE);
 
         // The body portion should match the original raw data.
-        assert_eq!(&d75_bytes[d75::HEADER_SIZE..], &raw[..]);
+        assert_eq!(
+            d75_bytes
+                .get(d75::HEADER_SIZE..)
+                .ok_or("d75 bytes too short")?,
+            &raw[..]
+        );
 
         // The header should be parseable and identify as D75A.
-        let reparsed = MemoryImage::from_d75_file(&d75_bytes).unwrap();
+        let reparsed = MemoryImage::from_d75_file(&d75_bytes)?;
         assert_eq!(reparsed.as_raw(), &raw[..]);
+        Ok(())
     }
 
     #[test]
-    fn to_d75_file_with_custom_header() {
+    fn to_d75_file_with_custom_header() -> TestResult {
         let raw = vec![0u8; programming::TOTAL_SIZE];
-        let image = MemoryImage::from_raw(raw).unwrap();
-        let header = d75::make_header("Data For TH-D75E", [0x01, 0x02, 0x03, 0x04]).unwrap();
+        let image = MemoryImage::from_raw(raw)?;
+        let header = d75::make_header("Data For TH-D75E", [0x01, 0x02, 0x03, 0x04])?;
         let d75_bytes = image.to_d75_file(&header);
 
         // Verify header model.
-        let reparsed_config = d75::parse_config(&d75_bytes).unwrap();
+        let reparsed_config = d75::parse_config(&d75_bytes)?;
         assert_eq!(reparsed_config.header.model, "Data For TH-D75E");
         assert_eq!(
             reparsed_config.header.version_bytes,
             [0x01, 0x02, 0x03, 0x04]
         );
+        Ok(())
     }
 
     #[test]
-    fn from_raw_wrong_size() {
-        let err = MemoryImage::from_raw(vec![0u8; 100]).unwrap_err();
-        assert!(matches!(err, MemoryError::InvalidSize { .. }));
+    fn from_raw_wrong_size() -> TestResult {
+        let err = MemoryImage::from_raw(vec![0u8; 100])
+            .err()
+            .ok_or("expected InvalidSize error but got Ok")?;
+        assert!(
+            matches!(err, MemoryError::InvalidSize { .. }),
+            "expected InvalidSize, got {err:?}"
+        );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -403,29 +441,36 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn modify_setting_returns_changed_byte() {
-        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE]).unwrap();
+    fn modify_setting_returns_changed_byte() -> TestResult {
+        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE])?;
         // key_beep lives at offset 0x1071; set it from 0 to 1
         let result = image.modify_setting(|w| {
             w.set_key_beep(true);
         });
         assert_eq!(result, Some((0x1071, 1)));
+        Ok(())
     }
 
     #[test]
-    fn modify_setting_no_change_returns_none() {
-        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE]).unwrap();
+    fn modify_setting_no_change_returns_none() -> TestResult {
+        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE])?;
         // beep is already 0 (false); setting it to false again changes nothing
         let result = image.modify_setting(|w| {
             w.set_key_beep(false);
         });
         assert_eq!(result, None);
+        Ok(())
     }
 
     #[test]
     #[should_panic(expected = "more than one byte changed")]
     fn modify_setting_panics_on_multi_byte() {
-        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE]).unwrap();
+        let raw = vec![0u8; programming::TOTAL_SIZE];
+        // Unwrap is OK here: this test is specifically verifying the panic
+        // from modify_setting. #[should_panic] captures it.
+        let Ok(mut image) = MemoryImage::from_raw(raw) else {
+            unreachable!("TOTAL_SIZE is always a valid memory image size");
+        };
         let _ = image.modify_setting(|w| {
             // Change two distinct single-byte settings
             w.set_key_beep(true); // 0x1071
@@ -438,13 +483,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn write_region_out_of_bounds() {
-        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE]).unwrap();
+    fn write_region_out_of_bounds() -> TestResult {
+        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE])?;
         assert!(
             image
                 .write_region(programming::TOTAL_SIZE - 10, &[0u8; 20])
                 .is_err()
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

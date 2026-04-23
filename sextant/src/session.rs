@@ -125,7 +125,6 @@ pub(crate) enum SessionEvent {
 /// Protocol-generic wrapper over `AsyncSession<P>`. Borrowed verbatim
 /// from the pattern in `thd75-repl/src/main.rs` — same runtime-state
 /// dispatch so the event-pump code can be protocol-agnostic.
-#[allow(clippy::large_enum_variant)] // session handles are comparable across protocols
 enum RuntimeSession {
     DPlus(AsyncSession<DPlus>),
     DExtra(AsyncSession<DExtra>),
@@ -661,7 +660,13 @@ async fn tx_silence(
     // brief gap), 10 s maximum to keep an accidental infinite loop
     // from holding the mic open on a shared reflector.
     let frames_f = (seconds.clamp(0.2, 10.0) * 50.0).round();
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "seconds is clamped to 0.2..=10.0 and multiplied by 50, yielding \
+                  10.0..=500.0 before rounding; the result is always a small positive \
+                  integer that fits in u32 with no sign loss or truncation."
+    )]
     let total_frames = frames_f as u32;
 
     let Some(sid) = StreamId::new(rand_stream_id()) else {
@@ -669,9 +674,9 @@ async fn tx_silence(
     };
 
     // Build a minimal CQCQCQ header. `rpt1`/`rpt2` follow the xlxd /
-    // ircDDBGateway convention (see CLAUDE.md "D-STAR Header rpt1/rpt2
-    // Convention" section) — the operator callsign + local module in
-    // rpt1, the reflector + reflector module in rpt2.
+    // ircDDBGateway convention — operator callsign + local module in
+    // rpt1, reflector callsign + reflector module in rpt2. Reflectors
+    // silently drop packets whose `rpt1[7]` isn't a valid module letter.
     let header = DStarHeader {
         flag1: 0,
         flag2: 0,
@@ -705,9 +710,10 @@ async fn tx_silence(
     // supposedly-10-s run.  Wrap mod SUPERFRAME_LEN (21) to match the
     // real-mic TxFrame handler above and stay clear of bit 6.
     for i in 0..total_frames {
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
-            reason = "result is always < 21, fits in u8"
+            reason = "Modulo SUPERFRAME_LEN (21) keeps the result in 0..=20, which \
+                      trivially fits in u8."
         )]
         let seq = (i % u32::from(SUPERFRAME_LEN)) as u8;
         session
@@ -722,9 +728,10 @@ async fn tx_silence(
         .await;
     }
 
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
-        reason = "result is always < 21, fits in u8"
+        reason = "Modulo SUPERFRAME_LEN (21) keeps the result in 0..=20, which \
+                  trivially fits in u8."
     )]
     let eot_seq = (total_frames % u32::from(SUPERFRAME_LEN)) as u8;
     session
@@ -748,7 +755,11 @@ fn rand_stream_id() -> u16 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
     // Map to 1..=0xFFFF to avoid the zero that `StreamId::new` rejects.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Intentional truncation of u32 nanos to u16 — we want the low 16 bits \
+                  as a seed for StreamId. OR with 0x1 then .max(1) guarantees non-zero."
+    )]
     let v = (nanos as u16) | 0x1;
     v.max(1)
 }

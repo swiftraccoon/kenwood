@@ -85,6 +85,14 @@ pub struct QsoEntry {
 ///
 /// Returns an [`SdCardError`] if a data row has an unexpected column
 /// count.
+#[expect(
+    clippy::similar_names,
+    reason = "TSV columns use the firmware's naming convention where `my_latitude` / \
+              `my_longitude` / `my_altitude` are the station's own GPS snapshot and the \
+              unprefixed `latitude` / `longitude` / `altitude` are the remote station's \
+              D-STAR-embedded position. Renaming would diverge from the wire format \
+              (see struct docs above)."
+)]
 pub fn parse_qso_log(data: &[u8]) -> Result<Vec<QsoEntry>, SdCardError> {
     let text = String::from_utf8_lossy(data);
     let mut entries = Vec::new();
@@ -97,39 +105,69 @@ pub fn parse_qso_log(data: &[u8]) -> Result<Vec<QsoEntry>, SdCardError> {
 
         let line_num = line_idx + 1;
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < EXPECTED_COLUMNS {
+        let actual = cols.len();
+        // Slice-pattern destructure: requires >= EXPECTED_COLUMNS elements, tail `..`
+        // allows (and ignores) extras. Binds each column to a named local — no indexing.
+        let &[
+            tx_rx,
+            date,
+            frequency,
+            mode,
+            my_latitude,
+            my_longitude,
+            my_altitude,
+            rf_power,
+            s_meter,
+            caller,
+            memo,
+            called,
+            rpt1,
+            rpt2,
+            message,
+            repeater_control,
+            bk,
+            emr,
+            fast_data,
+            latitude,
+            longitude,
+            altitude,
+            course,
+            speed,
+            ..,
+        ] = cols.as_slice()
+        else {
             return Err(SdCardError::ColumnCount {
                 line: line_num,
                 expected: EXPECTED_COLUMNS,
-                actual: cols.len(),
+                actual,
             });
-        }
+        };
 
         entries.push(QsoEntry {
-            tx_rx: cols[0].to_owned(),
-            date: cols[1].to_owned(),
-            frequency: cols[2].to_owned(),
-            mode: cols[3].to_owned(),
-            my_latitude: cols[4].to_owned(),
-            my_longitude: cols[5].to_owned(),
-            my_altitude: cols[6].to_owned(),
-            rf_power: cols[7].to_owned(),
-            s_meter: cols[8].to_owned(),
-            caller: cols[9].to_owned(),
-            memo: cols[10].to_owned(),
-            called: cols[11].to_owned(),
-            rpt1: cols[12].to_owned(),
-            rpt2: cols[13].to_owned(),
-            message: cols[14].to_owned(),
-            repeater_control: cols[15].to_owned(),
-            bk: cols[16].to_owned(),
-            emr: cols[17].to_owned(),
-            fast_data: cols[18].to_owned(),
-            latitude: cols[19].to_owned(),
-            longitude: cols[20].to_owned(),
-            altitude: cols[21].to_owned(),
-            course: cols[22].to_owned(),
-            speed: cols[23].to_owned(),
+            tx_rx: tx_rx.to_owned(),
+            date: date.to_owned(),
+            frequency: frequency.to_owned(),
+            mode: mode.to_owned(),
+            my_latitude: my_latitude.to_owned(),
+            my_longitude: my_longitude.to_owned(),
+            my_altitude: my_altitude.to_owned(),
+            rf_power: rf_power.to_owned(),
+            s_meter: s_meter.to_owned(),
+            caller: caller.to_owned(),
+            memo: memo.to_owned(),
+            called: called.to_owned(),
+            rpt1: rpt1.to_owned(),
+            rpt2: rpt2.to_owned(),
+            message: message.to_owned(),
+            repeater_control: repeater_control.to_owned(),
+            bk: bk.to_owned(),
+            emr: emr.to_owned(),
+            fast_data: fast_data.to_owned(),
+            latitude: latitude.to_owned(),
+            longitude: longitude.to_owned(),
+            altitude: altitude.to_owned(),
+            course: course.to_owned(),
+            speed: speed.to_owned(),
         });
     }
 
@@ -213,23 +251,29 @@ pub fn write_qso_log(entries: &[QsoEntry]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn parse_empty_log() {
+    fn parse_empty_log() -> TestResult {
         let data = b"TX/RX\tDate\tFrequency\tMode\t\
             My Latitude\tMy Longitude\tMy Altitude\t\
             RF Power\tS Meter\tCaller\tMemo\tCalled\t\
             RPT1\tRPT2\tMessage\tRepeater Control\t\
             BK\tEMR\tFast Data\t\
             Latitude\tLongitude\tAltitude\tCourse\tSpeed\r\n";
-        let entries = parse_qso_log(data).unwrap();
+        let entries = parse_qso_log(data)?;
         assert!(entries.is_empty());
+        Ok(())
     }
 
     #[test]
     fn parse_too_few_columns() {
         let data = b"TX/RX\tDate\tFrequency\n\
             TX\t2026/03/28\n";
-        let err = parse_qso_log(data).unwrap_err();
-        assert!(matches!(err, SdCardError::ColumnCount { line: 2, .. }));
+        let result = parse_qso_log(data);
+        assert!(
+            matches!(result, Err(SdCardError::ColumnCount { line: 2, .. })),
+            "expected ColumnCount error for line 2, got {result:?}"
+        );
     }
 }

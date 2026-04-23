@@ -17,16 +17,27 @@
 // Usage:
 //   validate_bvec_vs_op25 <pcm_file> <op25_trace_file>
 
-#![allow(
+#![expect(
     clippy::print_stdout,
     clippy::uninlined_format_args,
-    clippy::unwrap_used,
     clippy::expect_used,
+    clippy::indexing_slicing,
     clippy::missing_docs_in_private_items,
     clippy::cast_precision_loss,
     missing_docs,
-    unused_results
+    unused_results,
+    reason = "Debugging example binary that parses OP25 trace files and compares b-vector \
+              quantization to the Rust port. Uses stdout for diagnostics, allows panics \
+              on malformed input (`.expect()` on parse, direct indexing into \
+              deterministic-length byte arrays). This is validation scratchwork, not \
+              library code. Skips docs since the tool is internal. DSP casts are \
+              unavoidable here."
 )]
+
+// Dev-dependencies pulled in by sibling tests/examples. Acknowledge them here so
+// `unused_crate_dependencies` stays silent for this compilation unit.
+use proptest as _;
+use wide as _;
 
 use mbelib_rs::{
     AmbeEncoder, EncoderBuffers, FftPlan, analyze_frame, compute_e_p, detect_vuv_and_sa,
@@ -69,7 +80,7 @@ fn reassemble_b_vec(ambe_d: &[u8]) -> [u16; 9] {
 
 #[derive(Debug, Clone, Default)]
 struct Op25Frame {
-    #[allow(dead_code, reason = "kept for future diagnostics")]
+    #[expect(dead_code, reason = "kept for future diagnostics")]
     index: usize,
     b: [i32; 9],
 }
@@ -129,10 +140,10 @@ fn load_pcm(path: &str) -> Vec<f32> {
         .collect()
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "A/B harness with inline option parsing + pipeline + summary output; \
-              splitting adds indirection without clarifying what each section does"
+              splitting adds indirection without clarifying what each section does."
 )]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -183,7 +194,8 @@ fn main() {
     };
     // Ignore AmbeEncoder here: it would short-circuit to silence on
     // low-confidence pitch, which hides the b_vec values for silence.
-    let _ = AmbeEncoder::new();
+    // Construct-and-drop (kept as a smoke test that `::new()` doesn't panic).
+    drop(AmbeEncoder::new());
 
     // DP mode buffers: 3 e_p arrays + 3 FFT snapshots for the
     // pipeline; emission is delayed by 2 frames so frame N-2 commits

@@ -16,7 +16,7 @@
 #
 # Note: Mac Catalyst slices (aarch64-apple-ios-macabi, x86_64-apple-ios-macabi)
 # are intentionally omitted. IOBluetoothDevice is unavailable on Catalyst,
-# so the Mac build uses a native macOS target instead. See CLAUDE.md.
+# so the Mac build uses a native macOS target instead.
 
 set -euo pipefail
 

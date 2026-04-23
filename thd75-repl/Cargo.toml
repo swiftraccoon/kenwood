@@ -45,7 +45,9 @@ rustyline = "18"
 dirs-next = "2"
 
 [lints.rust]
-unsafe_code = "deny"
+# unsafe_code lives at the source level — `#![deny(unsafe_code)]` in `src/lib.rs:13`
+# and `#![deny(unsafe_code)]` in `src/main.rs`. Not declared here so the attribute-level
+# deny is the single source of truth.
 missing_docs = "deny"
 missing_debug_implementations = "deny"
 unreachable_pub = "deny"
@@ -55,17 +57,44 @@ trivial_casts = "deny"
 trivial_numeric_casts = "deny"
 unused_import_braces = "deny"
 unused_qualifications = "deny"
+non_ascii_idents = "deny"
+single_use_lifetimes = "deny"
+let_underscore_drop = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
+restriction = { level = "allow", priority = -1 }
+# Match workspace restriction-lint policy
+undocumented_unsafe_blocks = "deny"
+missing_assert_message = "deny"
+missing_const_for_fn = "deny"
+indexing_slicing = "deny"
+# `#[allow]` ban — see root workspace.lints.clippy for rationale.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+# Interactive REPL code legitimately uses `.unwrap()`/`.expect()`/`panic!` on
+# grammar-guaranteed parsed tokens and channel sends to a known-live receiver — propagating
+# Result through the command loop would add error-handling ceremony without catching real
+# bugs. The bin target's `main.rs` carries a crate-level `#![expect(...)]` block restating
+# and documenting each specific usage. Workspace denies these, we relax here because the
+# REPL's interactive-CLI shape is the exception that proves the rule.
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
-# In a binary crate with private modules, pub(crate) satisfies unreachable_pub
-# but clippy::redundant_pub_crate considers it redundant — allow to resolve conflict.
 redundant_pub_crate = "allow"
 
 [dev-dependencies]
 proptest = "1"
+
+# Integration test that spawns the REPL binary with mock radio + fixture scripts.
+# Declaring `required-features = ["testing"]` here means cargo skips compiling it entirely
+# when the feature is off, avoiding an unused_crate_dependencies report for every dev-dep
+# on the empty-crate compilation unit.
+[[test]]
+name = "script_integration"
+required-features = ["testing"]

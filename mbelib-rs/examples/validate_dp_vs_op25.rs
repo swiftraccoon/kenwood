@@ -3,18 +3,26 @@
 // A/B: single-frame PitchTracker::estimate vs DP estimate_with_lookahead.
 // Feeds both against a PCM fixture + OP25 trace, reports pitch match.
 
-#![allow(
+#![expect(
     clippy::print_stdout,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    clippy::uninlined_format_args,
+    clippy::indexing_slicing,
     missing_docs,
     unused_results,
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::missing_panics_doc
+    reason = "Single-frame vs DP pitch-tracker A/B harness. Prints diagnostic output, \
+              allows panics on malformed fixtures (validation scratchwork). DSP precision \
+              casts and direct indexing into fixed-size PCM / FFT arrays are unavoidable \
+              in pitch search. The binary exists to produce bit-level comparisons against \
+              an OP25 reference trace — any bounds violation would surface during the \
+              fixture load and correctly abort the example."
 )]
+
+// Dev-dependencies pulled in by sibling tests/examples. Acknowledge them here so
+// `unused_crate_dependencies` stays silent for this compilation unit.
+use proptest as _;
+use wide as _;
 
 use mbelib_rs::{EncoderBuffers, FftPlan, PitchTracker, analyze_frame, compute_e_p};
 use realfft::num_complex::Complex;

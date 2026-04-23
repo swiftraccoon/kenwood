@@ -38,12 +38,30 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
-# Common overrides for TUI code
-cast_possible_truncation = "allow"
-cast_sign_loss = "allow"
+# Ban `#[allow]` — every suppression must be `#[expect(..., reason = "...")]`.
+# Mirrors the root `[workspace.lints.clippy]` ban; restated here because this crate's
+# `[lints]` block replaces the workspace one entirely (cargo does not merge).
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
 module_name_repetitions = "allow"
-too_many_lines = "allow"
 multiple_crate_versions = "allow"
-# In a binary crate with private modules, pub(crate) satisfies unreachable_pub
-# but clippy::redundant_pub_crate considers it redundant — allow to resolve conflict.
+# Binary crate with private modules: `pub(crate)` satisfies `unreachable_pub` but
+# trips `redundant_pub_crate` (from the nursery group). The conflict is universal
+# and would ordinarily inherit from workspace, but this block replaces workspace
+# entirely so we restate it here.
 redundant_pub_crate = "allow"
+# KNOWN DIVERGENCE FROM WORKSPACE:
+#
+# The workspace denies these restriction lints (not repeated here):
+#   undocumented_unsafe_blocks, missing_assert_message, missing_const_for_fn,
+#   panic, unwrap_used, expect_used, indexing_slicing
+#
+# The TUI binary uses patterns these rules forbid (`.unwrap()` on channel sends to
+# live receivers, direct buffer indexing in the Ratatui render loop, `.expect()` on
+# known-connected transports, etc.) — adopting them would surface hundreds of sites,
+# tracked separately.
+#
+# Previously this block also allowed `cast_possible_truncation`, `cast_sign_loss`,
+# and `too_many_lines` at the crate level — removed so the workspace pedantic policy
+# applies. The sites that genuinely need those suppressions now carry documented
+# per-site `#[expect(..., reason = "...")]`.

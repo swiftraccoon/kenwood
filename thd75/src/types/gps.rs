@@ -165,7 +165,12 @@ impl TryFrom<u8> for GpsOperatingMode {
 /// Controls which NMEA 0183 sentences are included when GPS data is
 /// output to the PC serial port. Each sentence provides different
 /// navigation data.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Mirrors the `GS band,gga,gll,gsa,gsv,rmc,vtg` CAT command 1:1 — each bool is one \
+              NMEA 0183 sentence-type enable bit per the TH-D75 CAT reference. Keeping the \
+              fields independent matches the protocol layout the type serialises to."
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NmeaSentences {
     /// GGA -- Global Positioning System Fix Data.
@@ -537,15 +542,17 @@ mod tests {
     }
 
     #[test]
-    fn position_name_valid() {
-        let name = PositionName::new("Home").unwrap();
+    fn position_name_valid() -> Result<(), Box<dyn std::error::Error>> {
+        let name = PositionName::new("Home").ok_or("valid position name rejected")?;
         assert_eq!(name.as_str(), "Home");
+        Ok(())
     }
 
     #[test]
-    fn position_name_max_length() {
-        let name = PositionName::new("12345678").unwrap();
+    fn position_name_max_length() -> Result<(), Box<dyn std::error::Error>> {
+        let name = PositionName::new("12345678").ok_or("valid 8-char name rejected")?;
         assert_eq!(name.as_str(), "12345678");
+        Ok(())
     }
 
     #[test]

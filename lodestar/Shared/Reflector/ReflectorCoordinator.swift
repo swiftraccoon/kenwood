@@ -31,6 +31,19 @@ public final class ReflectorCoordinator: ReflectorObserver {
         didSet { UserDefaults.standard.set(reflectorModule, forKey: Self.reflectorModuleKey) }
     }
 
+    /// When `true`, `tryAutoConnect()` will reconnect on launch to the
+    /// last-used reflector. Persisted.
+    public var autoConnectReflector: Bool {
+        didSet { UserDefaults.standard.set(autoConnectReflector, forKey: Self.autoConnectKey) }
+    }
+
+    /// Name (e.g. `REF030`) of the most recently connected reflector.
+    /// Captured on every successful link-up; persisted so
+    /// `tryAutoConnect()` can find it on the next launch.
+    public private(set) var rememberedReflectorName: String? {
+        didSet { UserDefaults.standard.set(rememberedReflectorName, forKey: Self.rememberedNameKey) }
+    }
+
     // MARK: - Runtime state
 
     public private(set) var state: State = .disconnected
@@ -56,6 +69,8 @@ public final class ReflectorCoordinator: ReflectorObserver {
     private static let callsignKey = "lodestar.callsign"
     private static let localModuleKey = "lodestar.localModule"
     private static let reflectorModuleKey = "lodestar.reflectorModule"
+    private static let autoConnectKey = "lodestar.autoConnectReflector"
+    private static let rememberedNameKey = "lodestar.rememberedReflectorName"
 
     // MARK: - Init
 
@@ -64,6 +79,8 @@ public final class ReflectorCoordinator: ReflectorObserver {
         self.callsign = defaults.string(forKey: Self.callsignKey) ?? ""
         self.localModule = defaults.string(forKey: Self.localModuleKey) ?? "C"
         self.reflectorModule = defaults.string(forKey: Self.reflectorModuleKey) ?? "C"
+        self.autoConnectReflector = defaults.bool(forKey: Self.autoConnectKey)
+        self.rememberedReflectorName = defaults.string(forKey: Self.rememberedNameKey)
     }
 
     // MARK: - Actions
@@ -100,12 +117,80 @@ public final class ReflectorCoordinator: ReflectorObserver {
             )
             session = s
             state = .connected
+            // Remember this reflector so `tryAutoConnect()` can find it
+            // on the next launch. Captured unconditionally; the user's
+            // `autoConnectReflector` toggle controls whether we act on it.
+            rememberedReflectorName = reflector.name
         } catch {
             let msg = String(describing: error)
             state = .failed(msg)
             lastError = msg
             connectedReflector = nil
         }
+    }
+
+    /// Auto-reconnect to the remembered reflector on launch, if enabled
+    /// and the remembered name is present in the bundled directory.
+    /// Idempotent and silent when conditions aren't met.
+    ///
+    /// Retries with backoff on rejection — if the app was recently
+    /// terminated without a graceful `disconnect()`, reflectors hold
+    /// the previous UDP session in memory for 30–60 s until keepalive
+    /// timeout and reject fresh LINK attempts during that window.
+    /// The backoff schedule gives the reflector time to clear us.
+    public func tryAutoConnect() async {
+        guard autoConnectReflector, session == nil else { return }
+        guard case .disconnected = state else { return }
+        guard let name = rememberedReflectorName else { return }
+        guard !callsign.isEmpty else {
+            // No callsign yet; can't connect. The user will configure
+            // one the first time they open the picker.
+            return
+        }
+        let target = defaultReflectors().first(where: { $0.name == name })
+        guard let r = target else {
+            lastError = "Auto-connect: reflector \(name) not in the bundled directory"
+            return
+        }
+
+        // Delays chosen so the total backoff window (~30 s) exceeds
+        // the typical reflector keepalive-timeout window for stale
+        // sessions. `0` = try immediately on the first attempt.
+        let delaysNs: [UInt64] = [0, 3_000_000_000, 10_000_000_000, 20_000_000_000]
+        for (attempt, delay) in delaysNs.enumerated() {
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            // Between retries, re-check: user might have manually
+            // connected, toggled the setting off, or disconnected.
+            // We retry when the previous attempt ended in `.failed`
+            // or we're still at `.disconnected` — but NOT while a
+            // `.connecting` / `.connected` session is in flight or live.
+            guard autoConnectReflector, session == nil else { return }
+            switch state {
+            case .connecting, .connected:
+                return
+            case .disconnected, .failed:
+                // If the previous attempt failed, clear the error so
+                // the next connect() starts from a clean slate.
+                if case .failed = state {
+                    state = .disconnected
+                    lastError = nil
+                }
+            }
+
+            await connect(to: r)
+            if case .connected = state {
+                if attempt > 0 {
+                    // Clear whatever transient error the earlier
+                    // attempt surfaced — the retry succeeded.
+                    lastError = nil
+                }
+                return
+            }
+        }
+        // All attempts failed; whatever `connect(to:)` left in
+        // `state` / `lastError` is the final answer.
     }
 
     public func disconnect() async {

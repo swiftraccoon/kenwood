@@ -33,6 +33,8 @@ struct LodestarShell: View {
     @State private var session: SessionCoordinator? = nil
     @State private var route: AppRoute = .session
 
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some View {
         Group {
             #if os(macOS)
@@ -50,6 +52,26 @@ struct LodestarShell: View {
         }
         .onDisappear {
             session?.deactivate()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // Graceful shutdown on background / inactive so the
+            // reflector receives our unlink packet before the process
+            // is suspended / terminated. Without this, reflectors
+            // hold the stale session for 30–60 s and the next launch's
+            // auto-connect gets rejected.
+            if phase == .background || phase == .inactive {
+                Task { @MainActor in
+                    await session?.shutdown()
+                }
+            } else if phase == .active, session == nil {
+                let s = SessionCoordinator(transport: transport, reflector: reflector)
+                s.activate()
+                session = s
+            } else if phase == .active {
+                // Returning from background: restart the watchers +
+                // re-run auto-connect (shutdown cleared everything).
+                session?.activate()
+            }
         }
     }
 

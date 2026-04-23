@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        accumulator.extend_from_slice(&buf[..n]);
+        accumulator.extend_from_slice(buf.get(..n).unwrap_or(&[]));
 
         // Scan for complete KISS frames (FEND-delimited).
         while let Some(frame_data) = extract_kiss_frame(&mut accumulator) {
@@ -111,13 +111,14 @@ fn extract_kiss_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     let start = buf.iter().position(|&b| b == kiss_tnc::FEND)?;
 
     // Find next FEND after start.
-    let end = buf[start + 1..]
+    let end = buf
+        .get(start + 1..)?
         .iter()
         .position(|&b| b == kiss_tnc::FEND)
         .map(|i| start + 1 + i)?;
 
     // Extract the frame (between the two FENDs).
-    let frame: Vec<u8> = buf[start..=end].to_vec();
+    let frame: Vec<u8> = buf.get(start..=end)?.to_vec();
 
     // Remove processed bytes from accumulator.
     drop(buf.drain(..=end));

@@ -8,6 +8,30 @@
 //! ```
 
 #![cfg(feature = "testing")]
+#![expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "Integration test: spawns the REPL with mock fixtures and asserts on captured \
+              stdout. Uses `.expect()` on spawn/read operations (if fixture loading fails \
+              the test should abort with a specific message) and `panic!` on mismatched \
+              assertions — both appropriate for a test that correctly fails on setup \
+              violations."
+)]
+
+// Dev-dependencies pulled in by sibling integration tests. Acknowledge them here so
+// `unused_crate_dependencies` stays silent for this compilation unit.
+use clap as _;
+use dirs_next as _;
+use dstar_gateway as _;
+use dstar_gateway_core as _;
+use kenwood_thd75 as _;
+use proptest as _;
+use rustyline as _;
+use time as _;
+use tokio as _;
+use tracing as _;
+use tracing_appender as _;
+use tracing_subscriber as _;
 
 use std::path::PathBuf;
 use std::process::Command;

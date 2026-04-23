@@ -49,7 +49,11 @@ const TOTAL_ENTRIES: usize = programming::TOTAL_CHANNEL_ENTRIES; // 1200
 
 /// Maximum channel index as u16 (1199). `TOTAL_ENTRIES` is 1200, which
 /// always fits in u16, so this truncation is safe.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "`TOTAL_ENTRIES = 1200`, so `TOTAL_ENTRIES - 1 = 1199`. u16::MAX = 65535. The \
+              const cast is lossless and evaluated at compile time."
+)]
 const MAX_ENTRY_INDEX: u16 = (TOTAL_ENTRIES - 1) as u16;
 
 // ---------------------------------------------------------------------------
@@ -90,10 +94,10 @@ impl<'a> ChannelAccess<'a> {
             return false;
         }
         let offset = FLAGS_OFFSET + number_usize * FLAG_RECORD_SIZE;
-        if offset >= self.image.len() {
-            return false;
-        }
-        self.image[offset] != FLAG_EMPTY
+        self.image
+            .get(offset)
+            .copied()
+            .is_some_and(|b| b != FLAG_EMPTY)
     }
 
     /// Get a specific channel by number.
@@ -154,10 +158,10 @@ impl<'a> ChannelAccess<'a> {
             return String::new();
         }
         let offset = NAMES_OFFSET + number_usize * NAME_ENTRY_SIZE;
-        if offset + NAME_ENTRY_SIZE > self.image.len() {
-            return String::new();
-        }
-        programming::extract_name(&self.image[offset..offset + NAME_ENTRY_SIZE])
+        self.image
+            .get(offset..offset + NAME_ENTRY_SIZE)
+            .map(programming::extract_name)
+            .unwrap_or_default()
     }
 
     /// Get the channel flag (used/band, lockout, group) for a channel.
@@ -170,10 +174,8 @@ impl<'a> ChannelAccess<'a> {
             return None;
         }
         let offset = FLAGS_OFFSET + number_usize * FLAG_RECORD_SIZE;
-        if offset + FLAG_RECORD_SIZE > self.image.len() {
-            return None;
-        }
-        programming::parse_channel_flag(&self.image[offset..])
+        let slice = self.image.get(offset..offset + FLAG_RECORD_SIZE)?;
+        programming::parse_channel_flag(slice)
     }
 
     /// Get the 40-byte flash channel record for a channel.
@@ -198,10 +200,8 @@ impl<'a> ChannelAccess<'a> {
         }
 
         let offset = DATA_OFFSET + memgroup * PAGE_SIZE + slot * CHANNEL_RECORD_SIZE;
-        if offset + CHANNEL_RECORD_SIZE > self.image.len() {
-            return None;
-        }
-        FlashChannel::from_bytes(&self.image[offset..]).ok()
+        let slice = self.image.get(offset..offset + CHANNEL_RECORD_SIZE)?;
+        FlashChannel::from_bytes(slice).ok()
     }
 
     /// Get all channel names (0-999) as a vector of strings.
@@ -222,10 +222,10 @@ impl<'a> ChannelAccess<'a> {
         }
         let name_index = 1152 + group as usize;
         let offset = NAMES_OFFSET + name_index * NAME_ENTRY_SIZE;
-        if offset + NAME_ENTRY_SIZE > self.image.len() {
-            return String::new();
-        }
-        programming::extract_name(&self.image[offset..offset + NAME_ENTRY_SIZE])
+        self.image
+            .get(offset..offset + NAME_ENTRY_SIZE)
+            .map(programming::extract_name)
+            .unwrap_or_default()
     }
 
     /// Get all 30 group names.
@@ -287,28 +287,35 @@ impl<'a> ChannelWriter<'a> {
     fn set_flag(&mut self, number: u16, used: bool, lockout: bool) -> Result<(), MemoryError> {
         let number_usize = number as usize;
         let offset = FLAGS_OFFSET + number_usize * FLAG_RECORD_SIZE;
-        if offset + FLAG_RECORD_SIZE > self.image.len() {
+        let flag_bytes = self
+            .image
+            .get_mut(offset..offset + FLAG_RECORD_SIZE)
+            .ok_or(MemoryError::ChannelOutOfRange {
+                channel: number,
+                max: MAX_ENTRY_INDEX,
+            })?;
+        let [byte0, byte1, ..] = flag_bytes else {
             return Err(MemoryError::ChannelOutOfRange {
                 channel: number,
                 max: MAX_ENTRY_INDEX,
             });
-        }
+        };
 
         if used {
-            // Preserve the existing band indicator (byte 0) if already set.
-            // If transitioning from empty to used, default to 0x00 (VHF).
-            if self.image[offset] == FLAG_EMPTY {
-                self.image[offset] = 0x00; // VHF default
+            // Preserve the existing band indicator if already set.
+            // Transitioning from empty to used defaults to 0x00 (VHF).
+            if *byte0 == FLAG_EMPTY {
+                *byte0 = 0x00;
             }
         } else {
-            self.image[offset] = FLAG_EMPTY;
+            *byte0 = FLAG_EMPTY;
         }
 
         // Byte 1: lockout in bit 0, preserve other bits.
         if lockout {
-            self.image[offset + 1] |= 0x01;
+            *byte1 |= 0x01;
         } else {
-            self.image[offset + 1] &= !0x01;
+            *byte1 &= !0x01;
         }
 
         Ok(())
@@ -328,15 +335,16 @@ impl<'a> ChannelWriter<'a> {
         }
 
         let offset = DATA_OFFSET + memgroup * PAGE_SIZE + slot * CHANNEL_RECORD_SIZE;
-        if offset + CHANNEL_RECORD_SIZE > self.image.len() {
-            return Err(MemoryError::ChannelOutOfRange {
+        let dst = self
+            .image
+            .get_mut(offset..offset + CHANNEL_RECORD_SIZE)
+            .ok_or(MemoryError::ChannelOutOfRange {
                 channel: number,
                 max: MAX_ENTRY_INDEX,
-            });
-        }
+            })?;
 
         let bytes = memory.to_bytes();
-        self.image[offset..offset + CHANNEL_RECORD_SIZE].copy_from_slice(&bytes);
+        dst.copy_from_slice(&bytes);
         Ok(())
     }
 
@@ -344,18 +352,19 @@ impl<'a> ChannelWriter<'a> {
     fn set_name(&mut self, number: u16, name: &str) -> Result<(), MemoryError> {
         let number_usize = number as usize;
         let offset = NAMES_OFFSET + number_usize * NAME_ENTRY_SIZE;
-        if offset + NAME_ENTRY_SIZE > self.image.len() {
-            return Err(MemoryError::ChannelOutOfRange {
+        let dst = self.image.get_mut(offset..offset + NAME_ENTRY_SIZE).ok_or(
+            MemoryError::ChannelOutOfRange {
                 channel: number,
                 max: MAX_ENTRY_INDEX,
-            });
-        }
+            },
+        )?;
 
         let mut buf = [0u8; NAME_ENTRY_SIZE];
-        let src = name.as_bytes();
-        let copy_len = src.len().min(NAME_ENTRY_SIZE);
-        buf[..copy_len].copy_from_slice(&src[..copy_len]);
-        self.image[offset..offset + NAME_ENTRY_SIZE].copy_from_slice(&buf);
+        // Zip is bounded by the shorter of buf (NAME_ENTRY_SIZE) and src — no indexing.
+        buf.iter_mut()
+            .zip(name.as_bytes().iter())
+            .for_each(|(b, &s)| *b = s);
+        dst.copy_from_slice(&buf);
         Ok(())
     }
 
@@ -376,18 +385,19 @@ impl<'a> ChannelWriter<'a> {
         }
         let name_index = 1152 + group as usize;
         let offset = NAMES_OFFSET + name_index * NAME_ENTRY_SIZE;
-        if offset + NAME_ENTRY_SIZE > self.image.len() {
-            return Err(MemoryError::ChannelOutOfRange {
+        let dst = self
+            .image
+            .get_mut(offset..offset + NAME_ENTRY_SIZE)
+            .ok_or_else(|| MemoryError::ChannelOutOfRange {
                 channel: u16::from(group),
                 max: 29,
-            });
-        }
+            })?;
 
         let mut buf = [0u8; NAME_ENTRY_SIZE];
-        let src = name.as_bytes();
-        let copy_len = src.len().min(NAME_ENTRY_SIZE);
-        buf[..copy_len].copy_from_slice(&src[..copy_len]);
-        self.image[offset..offset + NAME_ENTRY_SIZE].copy_from_slice(&buf);
+        buf.iter_mut()
+            .zip(name.as_bytes().iter())
+            .for_each(|(b, &s)| *b = s);
+        dst.copy_from_slice(&buf);
         Ok(())
     }
 }
@@ -402,76 +412,115 @@ mod tests {
     use crate::protocol::programming::TOTAL_SIZE;
     use crate::types::Frequency;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type BoxErr = Box<dyn std::error::Error>;
+
+    /// Set a single byte at `offset` in a mutable slice, returning an error if out of range.
+    fn set_byte(image: &mut [u8], offset: usize, value: u8) -> Result<(), BoxErr> {
+        let img_len = image.len();
+        *image
+            .get_mut(offset)
+            .ok_or_else(|| format!("set_byte: offset {offset} out of range (len={img_len})"))? =
+            value;
+        Ok(())
+    }
+
+    /// Copy `data` into `image` starting at `offset`.
+    fn write_slice(image: &mut [u8], offset: usize, data: &[u8]) -> Result<(), BoxErr> {
+        let end = offset + data.len();
+        let img_len = image.len();
+        image
+            .get_mut(offset..end)
+            .ok_or_else(|| {
+                format!("write_slice: range {offset}..{end} out of bounds (len={img_len})")
+            })?
+            .copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Fill `len` bytes starting at `offset` with `value`.
+    fn fill_range(image: &mut [u8], offset: usize, len: usize, value: u8) -> Result<(), BoxErr> {
+        let end = offset + len;
+        let img_len = image.len();
+        image
+            .get_mut(offset..end)
+            .ok_or_else(|| {
+                format!("fill_range: range {offset}..{end} out of bounds (len={img_len})")
+            })?
+            .fill(value);
+        Ok(())
+    }
+
     /// Create a test image with known channel data.
-    fn make_test_image() -> Vec<u8> {
+    fn make_test_image() -> Result<Vec<u8>, BoxErr> {
         let mut image = vec![0xFF_u8; TOTAL_SIZE];
 
         // Zero out the names region (real radio uses null bytes for empty names).
-        let names_end = NAMES_OFFSET + TOTAL_ENTRIES * NAME_ENTRY_SIZE;
-        image[NAMES_OFFSET..names_end].fill(0x00);
+        fill_range(
+            &mut image,
+            NAMES_OFFSET,
+            TOTAL_ENTRIES * NAME_ENTRY_SIZE,
+            0x00,
+        )?;
 
         // Set up channel 0 as a used VHF channel.
         // Flag at 0x2000: [0x00 (VHF), 0x00 (no lockout), 0x00 (group 0), 0xFF]
-        image[0x2000] = 0x00; // used = VHF
-        image[0x2001] = 0x00; // no lockout
-        image[0x2002] = 0x00; // group 0
-        image[0x2003] = 0xFF;
+        set_byte(&mut image, 0x2000, 0x00)?; // used = VHF
+        set_byte(&mut image, 0x2001, 0x00)?; // no lockout
+        set_byte(&mut image, 0x2002, 0x00)?; // group 0
+        set_byte(&mut image, 0x2003, 0xFF)?;
 
         // Channel 0 data at memgroup 0, slot 0 = offset 0x4000.
         // Write a valid 40-byte channel record with 146.520 MHz.
         let freq: u32 = 146_520_000;
-        let freq_bytes = freq.to_le_bytes();
-        image[0x4000..0x4004].copy_from_slice(&freq_bytes);
+        write_slice(&mut image, 0x4000, &freq.to_le_bytes())?;
         // TX offset = 0
-        image[0x4004..0x4008].copy_from_slice(&[0, 0, 0, 0]);
+        write_slice(&mut image, 0x4004, &[0, 0, 0, 0])?;
         // Step size 0 (5 kHz) | shift 0 (simplex)
-        image[0x4008] = 0x00;
+        set_byte(&mut image, 0x4008, 0x00)?;
         // Mode/flags byte 0x09: all zero (FM, no reverse, no tone, CTCSS off)
-        image[0x4009] = 0x00;
+        set_byte(&mut image, 0x4009, 0x00)?;
         // Byte 0x0A: DCS off, etc.
-        image[0x400A] = 0x00;
+        set_byte(&mut image, 0x400A, 0x00)?;
         // Tone/CTCSS/DCS indices
-        image[0x400B] = 0x00;
-        image[0x400C] = 0x00;
-        image[0x400D] = 0x00;
+        set_byte(&mut image, 0x400B, 0x00)?;
+        set_byte(&mut image, 0x400C, 0x00)?;
+        set_byte(&mut image, 0x400D, 0x00)?;
         // Data speed / lockout
-        image[0x400E] = 0x00;
+        set_byte(&mut image, 0x400E, 0x00)?;
         // URCALL: 24 bytes of zeros (empty callsign)
         // data_mode
-        image[0x4027] = 0x00;
+        set_byte(&mut image, 0x4027, 0x00)?;
 
         // Channel 0 name at 0x10000: "2M CALL"
-        let name = b"2M CALL\0\0\0\0\0\0\0\0\0";
-        image[0x10000..0x10010].copy_from_slice(name);
+        write_slice(&mut image, 0x10000, b"2M CALL\0\0\0\0\0\0\0\0\0")?;
 
         // Set up channel 1 as empty (default 0xFF in flags is already there).
 
         // Set up channel 5 as used UHF (to test crossing memgroup boundary
         // -- ch 5 is still in memgroup 0, slot 5).
-        image[0x2000 + 5 * 4] = 0x02; // used = UHF
-        image[0x2000 + 5 * 4 + 1] = 0x01; // lockout = yes
-        image[0x2000 + 5 * 4 + 2] = 0x03; // group 3
-        image[0x2000 + 5 * 4 + 3] = 0xFF;
+        set_byte(&mut image, 0x2000 + 5 * 4, 0x02)?; // used = UHF
+        set_byte(&mut image, 0x2000 + 5 * 4 + 1, 0x01)?; // lockout = yes
+        set_byte(&mut image, 0x2000 + 5 * 4 + 2, 0x03)?; // group 3
+        set_byte(&mut image, 0x2000 + 5 * 4 + 3, 0xFF)?;
 
         // Channel 5 data at memgroup 0, slot 5 = offset 0x4000 + 5 * 40 = 0x40C8.
         let ch5_freq: u32 = 446_000_000;
-        let ch5_freq_bytes = ch5_freq.to_le_bytes();
-        image[0x40C8..0x40CC].copy_from_slice(&ch5_freq_bytes);
-        image[0x40CC..0x40D0].copy_from_slice(&[0, 0, 0, 0]);
-        image[0x40D0] = 0x00;
-        image[0x40D1] = 0x00;
-        image[0x40D2] = 0x00;
-        image[0x40D3] = 0x00;
-        image[0x40D4] = 0x00;
-        image[0x40D5] = 0x00;
-        image[0x40D6] = 0x00;
-        image[0x40EF] = 0x00;
+        write_slice(&mut image, 0x40C8, &ch5_freq.to_le_bytes())?;
+        write_slice(&mut image, 0x40CC, &[0, 0, 0, 0])?;
+        set_byte(&mut image, 0x40D0, 0x00)?;
+        set_byte(&mut image, 0x40D1, 0x00)?;
+        set_byte(&mut image, 0x40D2, 0x00)?;
+        set_byte(&mut image, 0x40D3, 0x00)?;
+        set_byte(&mut image, 0x40D4, 0x00)?;
+        set_byte(&mut image, 0x40D5, 0x00)?;
+        set_byte(&mut image, 0x40D6, 0x00)?;
+        set_byte(&mut image, 0x40EF, 0x00)?;
 
         // Channel 5 name.
-        let name5 = b"UHF CHAN\0\0\0\0\0\0\0\0";
-        image[0x10000 + 5 * 16..0x10000 + 5 * 16 + 16].copy_from_slice(name5);
+        write_slice(&mut image, 0x10000 + 5 * 16, b"UHF CHAN\0\0\0\0\0\0\0\0")?;
 
-        image
+        Ok(image)
     }
 
     #[test]
@@ -481,113 +530,125 @@ mod tests {
     }
 
     #[test]
-    fn from_raw_invalid_size() {
+    fn from_raw_invalid_size() -> TestResult {
         let image = vec![0u8; 1000];
-        let err = super::super::MemoryImage::from_raw(image).unwrap_err();
-        assert!(matches!(err, MemoryError::InvalidSize { .. }));
+        let err = super::super::MemoryImage::from_raw(image)
+            .err()
+            .ok_or("expected InvalidSize error but got Ok")?;
+        assert!(
+            matches!(err, MemoryError::InvalidSize { .. }),
+            "expected InvalidSize, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn channel_is_used() {
-        let image = make_test_image();
-        let mi = super::super::MemoryImage::from_raw(image).unwrap();
+    fn channel_is_used() -> TestResult {
+        let image = make_test_image()?;
+        let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
         assert!(ch.is_used(0));
         assert!(!ch.is_used(1));
         assert!(ch.is_used(5));
+        Ok(())
     }
 
     #[test]
-    fn channel_count() {
-        let image = make_test_image();
-        let mi = super::super::MemoryImage::from_raw(image).unwrap();
+    fn channel_count() -> TestResult {
+        let image = make_test_image()?;
+        let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
         assert_eq!(ch.count(), 2); // channels 0 and 5
+        Ok(())
     }
 
     #[test]
-    fn channel_get_name() {
-        let image = make_test_image();
-        let mi = super::super::MemoryImage::from_raw(image).unwrap();
+    fn channel_get_name() -> TestResult {
+        let image = make_test_image()?;
+        let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
         assert_eq!(ch.name(0), "2M CALL");
         assert_eq!(ch.name(5), "UHF CHAN");
         assert_eq!(ch.name(1), ""); // empty channel
+        Ok(())
     }
 
     #[test]
-    fn channel_get_entry() {
-        let image = make_test_image();
-        let mi = super::super::MemoryImage::from_raw(image).unwrap();
+    fn channel_get_entry() -> TestResult {
+        let image = make_test_image()?;
+        let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
 
-        let entry0 = ch.get(0).unwrap();
+        let entry0 = ch.get(0).ok_or("ch.get(0) returned None")?;
         assert!(entry0.used);
         assert!(!entry0.lockout);
         assert_eq!(entry0.name, "2M CALL");
         assert_eq!(entry0.flash.rx_frequency.as_hz(), 146_520_000);
 
-        let entry5 = ch.get(5).unwrap();
+        let entry5 = ch.get(5).ok_or("ch.get(5) returned None")?;
         assert!(entry5.used);
         assert!(entry5.lockout);
         assert_eq!(entry5.name, "UHF CHAN");
         assert_eq!(entry5.flash.rx_frequency.as_hz(), 446_000_000);
+        Ok(())
     }
 
     #[test]
-    fn channel_get_out_of_range() {
-        let image = make_test_image();
-        let mi = super::super::MemoryImage::from_raw(image).unwrap();
+    fn channel_get_out_of_range() -> TestResult {
+        let image = make_test_image()?;
+        let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
         assert!(ch.get(1200).is_none());
+        Ok(())
     }
 
     #[test]
-    fn channel_all_returns_only_used() {
-        let image = make_test_image();
-        let mi = super::super::MemoryImage::from_raw(image).unwrap();
+    fn channel_all_returns_only_used() -> TestResult {
+        let image = make_test_image()?;
+        let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
         let all = ch.all();
         assert_eq!(all.len(), 2);
-        assert_eq!(all[0].number, 0);
-        assert_eq!(all[1].number, 5);
+        assert_eq!(all.first().ok_or("all[0] missing")?.number, 0);
+        assert_eq!(all.get(1).ok_or("all[1] missing")?.number, 5);
+        Ok(())
     }
 
     #[test]
-    fn channel_flag() {
-        let image = make_test_image();
-        let mi = super::super::MemoryImage::from_raw(image).unwrap();
+    fn channel_flag() -> TestResult {
+        let image = make_test_image()?;
+        let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
 
-        let flag0 = ch.flag(0).unwrap();
-        assert_eq!(flag0.used, 0x00); // VHF
-        assert!(!flag0.lockout);
-        assert_eq!(flag0.group, 0);
+        let ch0_flag = ch.flag(0).ok_or("channel 0 flag missing")?;
+        assert_eq!(ch0_flag.used, 0x00); // VHF
+        assert!(!ch0_flag.lockout);
+        assert_eq!(ch0_flag.group, 0);
 
-        let flag5 = ch.flag(5).unwrap();
-        assert_eq!(flag5.used, 0x02); // UHF
-        assert!(flag5.lockout);
-        assert_eq!(flag5.group, 3);
+        let ch5_flag = ch.flag(5).ok_or("channel 5 flag missing")?;
+        assert_eq!(ch5_flag.used, 0x02); // UHF
+        assert!(ch5_flag.lockout);
+        assert_eq!(ch5_flag.group, 3);
+        Ok(())
     }
 
     #[test]
-    fn channel_group_names() {
-        let mut image = make_test_image();
+    fn channel_group_names() -> TestResult {
+        let mut image = make_test_image()?;
         // Write a group name at index 1152 (group 0).
-        let name = b"Ham Radio\0\0\0\0\0\0\0";
-        let offset = 0x10000 + 1152 * 16;
-        image[offset..offset + 16].copy_from_slice(name);
+        write_slice(&mut image, 0x10000 + 1152 * 16, b"Ham Radio\0\0\0\0\0\0\0")?;
 
-        let mi = super::super::MemoryImage::from_raw(image).unwrap();
+        let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
         assert_eq!(ch.group_name(0), "Ham Radio");
         assert_eq!(ch.group_name(1), ""); // no name set
+        Ok(())
     }
 
     #[test]
-    fn channel_writer_set() {
-        let image = make_test_image();
-        let mut mi = super::super::MemoryImage::from_raw(image).unwrap();
+    fn channel_writer_set() -> TestResult {
+        let image = make_test_image()?;
+        let mut mi = super::super::MemoryImage::from_raw(image)?;
 
         let entry = ChannelEntry {
             number: 10,
@@ -602,35 +663,37 @@ mod tests {
 
         {
             let mut writer = ChannelWriter::new(mi.as_raw_mut());
-            writer.set(&entry).unwrap();
+            writer.set(&entry)?;
         }
 
         let ch = mi.channels();
         assert!(ch.is_used(10));
-        let read_back = ch.get(10).unwrap();
+        let read_back = ch.get(10).ok_or("ch.get(10) returned None after write")?;
         assert!(read_back.used);
         assert_eq!(read_back.name, "TEST CH");
         assert_eq!(read_back.flash.rx_frequency.as_hz(), 145_000_000);
+        Ok(())
     }
 
     #[test]
-    fn channel_writer_group_name() {
-        let image = make_test_image();
-        let mut mi = super::super::MemoryImage::from_raw(image).unwrap();
+    fn channel_writer_group_name() -> TestResult {
+        let image = make_test_image()?;
+        let mut mi = super::super::MemoryImage::from_raw(image)?;
 
         {
             let mut writer = ChannelWriter::new(mi.as_raw_mut());
-            writer.set_group_name(0, "My Group").unwrap();
+            writer.set_group_name(0, "My Group")?;
         }
 
         let ch = mi.channels();
         assert_eq!(ch.group_name(0), "My Group");
+        Ok(())
     }
 
     #[test]
-    fn channel_writer_out_of_range() {
-        let image = make_test_image();
-        let mut mi = super::super::MemoryImage::from_raw(image).unwrap();
+    fn channel_writer_out_of_range() -> TestResult {
+        let image = make_test_image()?;
+        let mut mi = super::super::MemoryImage::from_raw(image)?;
 
         let entry = ChannelEntry {
             number: 1200,
@@ -642,6 +705,10 @@ mod tests {
 
         let mut writer = ChannelWriter::new(mi.as_raw_mut());
         let result = writer.set(&entry);
-        assert!(result.is_err());
+        assert!(
+            result.is_err(),
+            "expected out-of-range set to fail: {result:?}"
+        );
+        Ok(())
     }
 }

@@ -174,11 +174,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scan_resume_roundtrip() {
+    fn scan_resume_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         for raw in 0..=2 {
-            let method = ScanResumeMethod::from_raw(raw).unwrap();
+            let method = ScanResumeMethod::from_raw(raw).ok_or("valid resume method rejected")?;
             assert_eq!(method.to_raw(), raw);
         }
+        Ok(())
     }
 
     #[test]

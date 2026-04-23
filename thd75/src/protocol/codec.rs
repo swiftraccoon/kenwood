@@ -67,8 +67,8 @@ impl Codec {
     /// from the buffer. Returns `None` if no complete frame is available.
     pub fn next_frame(&mut self) -> Option<Vec<u8>> {
         let pos = self.buffer.iter().position(|&b| b == b'\r')?;
-        let frame = self.buffer[..pos].to_vec();
-        let _ = self.buffer.drain(..=pos);
+        let frame = self.buffer.get(..pos)?.to_vec();
+        drop(self.buffer.drain(..=pos));
         tracing::debug!(frame_len = frame.len(), "codec: extracted frame");
         tracing::trace!(frame = %String::from_utf8_lossy(&frame), "codec: frame content");
         Some(frame)
@@ -126,11 +126,12 @@ mod tests {
     }
 
     #[test]
-    fn frame_with_commas() {
+    fn frame_with_commas() -> Result<(), Box<dyn std::error::Error>> {
         let mut codec = Codec::new();
         codec.feed(b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r");
-        let frame = codec.next_frame().unwrap();
+        let frame = codec.next_frame().ok_or("next_frame returned None")?;
         assert!(frame.starts_with(b"FO"));
+        Ok(())
     }
 
     #[test]

@@ -29,8 +29,12 @@ struct SessionScreen: View {
                 if shouldShowMcpCard {
                     McpCard(transport: transport)
                 }
-                if let stream = reflector.currentStream {
-                    StreamNowPlayingCard(stream: stream)
+                if reflector.state == .connected {
+                    // Always shown once linked, so an idle reflector
+                    // still surfaces the chain and reassures that the
+                    // link is live. Fields show placeholders while
+                    // nobody's transmitting.
+                    StreamNowPlayingCard(stream: reflector.currentStream)
                 }
                 heardHistory
             }
@@ -162,6 +166,11 @@ struct SessionScreen: View {
                     }
                 }
                 Divider()
+                Toggle("Auto-connect on launch", isOn: Binding(
+                    get: { transport.autoConnectRadio },
+                    set: { transport.autoConnectRadio = $0 }
+                ))
+                Divider()
                 Button(role: .destructive) {
                     Task { await transport.disconnect() }
                 } label: {
@@ -228,6 +237,12 @@ struct SessionScreen: View {
         case .connected:
             Menu {
                 Button("Switch reflector") { showPicker = true }
+                Divider()
+                Toggle("Auto-connect on launch", isOn: Binding(
+                    get: { reflector.autoConnectReflector },
+                    set: { reflector.autoConnectReflector = $0 }
+                ))
+                Divider()
                 Button(role: .destructive) {
                     Task { await reflector.disconnect() }
                 } label: {
@@ -448,123 +463,316 @@ private struct DevicePickerSheet: View {
     let coordinator: TransportCoordinator
     @Environment(\.dismiss) private var dismiss
 
+    @State private var diagnosticText: String?
+    #if os(iOS)
+    @State private var discovered: [DiscoveredBluetoothDevice] = []
+    @State private var isScanning = false
+    @State private var pairingAddress: String?
+    @State private var pairingError: String?
+    #endif
+
     var body: some View {
         NavigationStack {
             Group {
-                if coordinator.availableDevices.isEmpty {
-                    ContentUnavailableView {
-                        Label("No paired radios", systemImage: "antenna.radiowaves.left.and.right.slash")
-                    } description: {
-                        #if os(macOS)
-                        Text("Pair your TH-D75 in **System Settings → Bluetooth** (menu 934 on the radio enables pairing).")
-                        #else
-                        Text("Bluetooth Classic SPP isn't available on iOS / iPadOS. Run the macOS build to pair with a TH-D75.")
-                        #endif
-                    } actions: {
-                        Button("Refresh") {
-                            coordinator.refreshPairedDevices()
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                } else {
-                    List(coordinator.availableDevices) { dev in
-                        Button {
-                            coordinator.select(dev)
-                            Task {
-                                await coordinator.connect()
-                                dismiss()
-                            }
-                        } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: "antenna.radiowaves.left.and.right")
-                                    .foregroundStyle(.blue)
-                                VStack(alignment: .leading) {
-                                    Text(dev.name).font(.headline)
-                                    Text(dev.address).font(.caption.monospaced()).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Image(systemName: "chevron.forward").foregroundStyle(.tertiary).font(.caption)
-                            }
-                            .contentShape(.rect)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(coordinator.isBusy)
-                    }
-                }
+                #if os(iOS)
+                iosBody
+                #else
+                macBody
+                #endif
             }
             .navigationTitle("Connect radio")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
-                }
-                ToolbarItem {
-                    Button {
-                        coordinator.refreshPairedDevices()
-                    } label: {
-                        Label("Refresh", systemImage: "arrow.clockwise")
-                    }
-                }
-            }
+            .toolbar { toolbar }
             .onAppear { coordinator.refreshPairedDevices() }
+            #if os(iOS)
+            .onDisappear { PrivateBluetoothBridge.stopInquiry() }
+            #endif
         }
         #if os(macOS)
         .frame(minWidth: 420, minHeight: 360)
         #endif
     }
+
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        ToolbarItem(placement: .cancellationAction) {
+            Button("Close") {
+                #if os(iOS)
+                PrivateBluetoothBridge.stopInquiry()
+                #endif
+                dismiss()
+            }
+        }
+        ToolbarItem {
+            Button {
+                coordinator.refreshPairedDevices()
+            } label: {
+                Label("Refresh", systemImage: "arrow.clockwise")
+            }
+        }
+    }
+
+    #if os(macOS)
+    @ViewBuilder
+    private var macBody: some View {
+        if coordinator.availableDevices.isEmpty {
+            ContentUnavailableView {
+                Label("No paired radios", systemImage: "antenna.radiowaves.left.and.right.slash")
+            } description: {
+                Text("Pair your TH-D75 in **System Settings → Bluetooth** (menu 934 on the radio enables pairing).")
+            } actions: {
+                Button("Refresh") {
+                    coordinator.refreshPairedDevices()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        } else {
+            List(coordinator.availableDevices) { dev in
+                deviceButton(dev)
+            }
+        }
+    }
+    #endif
+
+    #if os(iOS)
+    @ViewBuilder
+    private var iosBody: some View {
+        List {
+            Section {
+                scanControls
+            } header: {
+                Text("Scan for nearby radios")
+            } footer: {
+                Text("iOS Settings doesn't surface Classic Bluetooth pairing for non-MFi accessories, so Lodestar drives the pair flow itself through the private BluetoothManager framework. Put the TH-D75 in pairing mode (menu 934), then tap Scan.")
+            }
+
+            if !discovered.isEmpty {
+                Section("Discovered") {
+                    ForEach(discovered) { dev in
+                        Button {
+                            beginPair(with: dev)
+                        } label: {
+                            discoveredRow(dev)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            if !coordinator.availableDevices.isEmpty {
+                Section("Already paired") {
+                    ForEach(coordinator.availableDevices) { dev in
+                        deviceButton(dev)
+                    }
+                }
+            }
+
+            if let err = pairingError {
+                Section {
+                    Label(err, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                        .font(.callout)
+                }
+            }
+
+            Section("Diagnostics") {
+                Button("Run framework probe") {
+                    diagnosticText = PrivateBluetoothBridge.diagnostic()
+                }
+                if let diag = diagnosticText {
+                    Text(diag)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+    }
+
+    private var scanControls: some View {
+        HStack {
+            if isScanning {
+                ProgressView().controlSize(.small)
+                Text("Scanning… \(discovered.count) seen")
+                    .font(.callout)
+                Spacer()
+                Button("Stop") { stopScan() }
+            } else {
+                Button {
+                    startScan()
+                } label: {
+                    Label("Scan", systemImage: "dot.radiowaves.left.and.right")
+                }
+                .buttonStyle(.borderedProminent)
+                Spacer()
+                Text("\(discovered.count) seen")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func discoveredRow(_ dev: DiscoveredBluetoothDevice) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "antenna.radiowaves.left.and.right")
+                .foregroundStyle(.blue)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(dev.name).font(.headline)
+                    if pairingAddress == dev.address {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                Text(dev.address)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if let r = dev.rssi {
+                Text("\(r) dBm")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .contentShape(.rect)
+    }
+
+    private func startScan() {
+        pairingError = nil
+        discovered.removeAll()
+        let ok = PrivateBluetoothBridge.startInquiry { dev in
+            DispatchQueue.main.async {
+                if !discovered.contains(where: { $0.address == dev.address }) {
+                    discovered.append(dev)
+                }
+            }
+        }
+        if ok {
+            isScanning = true
+        } else {
+            pairingError = "Scan request refused — private framework probably isn't callable on this iOS / signing combination. Run the framework probe for details."
+        }
+    }
+
+    private func stopScan() {
+        PrivateBluetoothBridge.stopInquiry()
+        isScanning = false
+    }
+
+    private func beginPair(with dev: DiscoveredBluetoothDevice) {
+        pairingError = nil
+        pairingAddress = dev.address
+        PrivateBluetoothBridge.pair(address: dev.address) { result in
+            DispatchQueue.main.async {
+                pairingAddress = nil
+                switch result {
+                case .success:
+                    let bt = BluetoothDevice(id: dev.address, name: dev.name, address: dev.address)
+                    coordinator.select(bt)
+                    Task {
+                        await coordinator.connect()
+                        dismiss()
+                    }
+                case .denied(let reason):
+                    pairingError = "Pair denied: \(reason)"
+                case .cancelled:
+                    pairingError = "Pairing cancelled."
+                case .timeout:
+                    pairingError = "Pairing timed out — is the radio in pairing mode (menu 934)?"
+                }
+            }
+        }
+    }
+    #endif
+
+    private func deviceButton(_ dev: BluetoothDevice) -> some View {
+        Button {
+            coordinator.select(dev)
+            Task {
+                await coordinator.connect()
+                dismiss()
+            }
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "antenna.radiowaves.left.and.right")
+                    .foregroundStyle(.blue)
+                VStack(alignment: .leading) {
+                    Text(dev.name).font(.headline)
+                    Text(dev.address).font(.caption.monospaced()).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.forward")
+                    .foregroundStyle(.tertiary)
+                    .font(.caption)
+            }
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .disabled(coordinator.isBusy)
+    }
 }
 
 private struct StreamNowPlayingCard: View {
-    let stream: ReflectorCoordinator.StreamSnapshot
+    let stream: ReflectorCoordinator.StreamSnapshot?
+
+    private var isLive: Bool { stream != nil }
 
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Label("Now transmitting", systemImage: "waveform")
-                        .foregroundStyle(.green)
-                        .font(.headline)
-                    Spacer()
-                    Text("\(stream.framesReceived) frames")
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                }
-                Divider()
-                row("MY",   "\(stream.mycall)/\(stream.suffix)")
-                row("UR",   stream.urcall)
-                row("RPT1", stream.rpt1)
-                row("RPT2", stream.rpt2)
-                if stream.latestText != nil || stream.latestPosition != nil {
-                    Divider()
-                }
-                if let text = stream.latestText, !text.isEmpty {
-                    slowDataRow(
-                        icon: "text.bubble",
-                        label: "TX",
-                        value: text,
-                        monospaced: false
-                    )
-                }
-                if let pos = stream.latestPosition {
-                    slowDataRow(
-                        icon: "location.fill",
-                        label: "GPS",
-                        value: GpsFormat.coordinate(pos),
-                        monospaced: true
-                    )
-                    if let comment = pos.comment, !comment.isEmpty {
-                        slowDataRow(
-                            icon: "quote.bubble",
-                            label: "",
-                            value: comment,
-                            monospaced: false
-                        )
+                    if isLive {
+                        Label("Now transmitting", systemImage: "waveform")
+                            .foregroundStyle(.green)
+                            .font(.headline)
+                        Spacer()
+                        if let s = stream {
+                            Text("\(s.framesReceived) frames")
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        Label("Reflector quiet", systemImage: "waveform.slash")
+                            .foregroundStyle(.secondary)
+                            .font(.headline)
+                        Spacer()
+                        Text("Waiting")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
                     }
                 }
+                Divider()
+                row("MY",   mycall)
+                row("UR",   stream?.urcall ?? "")
+                row("RPT1", stream?.rpt1 ?? "")
+                row("RPT2", stream?.rpt2 ?? "")
+                Divider()
+                // Slow-data fields are always rendered so the card's
+                // footprint is stable across the transmit / idle /
+                // text-arrives-first / position-arrives-first sequence.
+                // An empty value renders as a tertiary `—`, matching
+                // the callsign rows above.
+                slowDataRow(
+                    icon: "text.bubble",
+                    label: "TX",
+                    value: stream?.latestText ?? "",
+                    monospaced: false
+                )
+                slowDataRow(
+                    icon: "location.fill",
+                    label: "GPS",
+                    value: stream?.latestPosition.map(GpsFormat.coordinate) ?? "",
+                    monospaced: true
+                )
             }
         }
+    }
+
+    private var mycall: String {
+        guard let s = stream else { return "" }
+        return "\(s.mycall)/\(s.suffix)"
     }
 
     private func row(_ label: String, _ value: String) -> some View {
@@ -575,6 +783,7 @@ private struct StreamNowPlayingCard: View {
                 .frame(width: 40, alignment: .leading)
             Text(value.isEmpty ? "—" : value)
                 .font(.body.monospaced())
+                .foregroundStyle(value.isEmpty ? .tertiary : .primary)
         }
     }
 
@@ -584,9 +793,10 @@ private struct StreamNowPlayingCard: View {
         value: String,
         monospaced: Bool
     ) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        let isEmpty = value.isEmpty
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: icon)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(isEmpty ? .tertiary : .secondary)
                 .font(.caption)
                 .frame(width: 14)
             if !label.isEmpty {
@@ -597,9 +807,9 @@ private struct StreamNowPlayingCard: View {
             } else {
                 Color.clear.frame(width: 30)
             }
-            Text(value)
+            Text(isEmpty ? "—" : value)
                 .font(monospaced ? .callout.monospaced() : .callout)
-                .foregroundStyle(.primary)
+                .foregroundStyle(isEmpty ? .tertiary : .primary)
                 .textSelection(.enabled)
             Spacer(minLength: 0)
         }

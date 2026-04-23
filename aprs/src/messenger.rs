@@ -96,14 +96,12 @@ pub struct AprsMessenger {
 impl AprsMessenger {
     /// Create a new messenger with the default config.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // HashMap::new is not const
     pub fn new(callsign: Ax25Address, digipeater_path: Vec<Ax25Address>) -> Self {
         Self::with_config(callsign, digipeater_path, MessengerConfig::default())
     }
 
     /// Create a new messenger with a caller-supplied [`MessengerConfig`].
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // HashMap::new is not const
     pub fn with_config(
         callsign: Ax25Address,
         digipeater_path: Vec<Ax25Address>,

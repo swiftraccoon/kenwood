@@ -1,3 +1,13 @@
+#![expect(
+    clippy::too_many_lines,
+    reason = "Settings pane render functions walk the CAT / MCP settings tables and \
+              build a list widget row-by-row, where each row's rendering depends on the \
+              setting's type (bool, enum, numeric, etc.). Splitting per-setting-type \
+              would require threading a `row_idx`+`setting` context through multiple \
+              helpers for no reader benefit; the inline match stays aligned with the \
+              settings-table order."
+)]
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};

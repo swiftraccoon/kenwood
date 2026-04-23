@@ -19,6 +19,23 @@
 //!   MMDVM mode and D-STAR events (voice, text messages, stations heard)
 //!   are announced. Exit with `dstar stop`.
 
+#![expect(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    let_underscore_drop,
+    reason = "Interactive REPL binary. The REPL's `main.rs` (and its `commands`/`transport` \
+              submodules) parses user input line-by-line and drives the radio via the \
+              async `Radio<T>` API. CLI patterns like `.expect()` on channel sends whose \
+              receiver is known live, direct `line[..n]` slicing on pre-validated input, \
+              and `let _ = stdout().flush()` (flush failures don't affect the \
+              already-queued `println!` output) are the correct level of abstraction for \
+              an operator REPL — a `Result`-propagating version would noise up the \
+              command loop without catching real bugs. Any failure of these assumptions \
+              would correctly abort the REPL with a useful message. This opt-out is \
+              restated in source at the bin target's entry point so it is visible to \
+              anyone reading the REPL code, rather than buried in Cargo.toml."
+)]
+
 mod commands;
 mod transport;
 
@@ -108,7 +125,13 @@ enum Subcommand {
 /// Also scriptable: pipe commands via stdin.
 #[derive(Parser, Debug)]
 #[command(version, about)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "clap derive maps each `bool` flag to a discrete CLI switch (`--timestamps`, \
+              `--local-time`, `--quiet`, `--script-strict`, etc.). Grouping them into a bitflags \
+              enum would break the derive macro's parser generation and the --help documentation \
+              format users expect."
+)]
 struct Cli {
     /// Optional subcommand. Defaults to interactive REPL if omitted.
     #[command(subcommand)]
@@ -455,30 +478,24 @@ fn parse_utc_offset(s: &str) -> Result<i32, String> {
 ///
 /// Returns `None` on platforms where this is not supported (Windows)
 /// or when the detection command fails.
-//
-// The `#[cfg(unix)]` body runs a subprocess so it cannot be `const`.
-// The `#[cfg(not(unix))]` body is just `None`, which Clippy's nursery
-// `missing_const_for_fn` lint flags on Windows builds. Marking the
-// function `const fn` would then fail to compile the Unix variant.
-// Suppress the lint rather than splitting the function in two.
-#[allow(clippy::missing_const_for_fn)]
+#[cfg(unix)]
 fn detect_utc_offset_seconds() -> Option<i32> {
-    #[cfg(unix)]
-    {
-        let out = std::process::Command::new("date")
-            .arg("+%z")
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8(out.stdout).ok()?;
-        parse_utc_offset(s.trim()).ok()
+    let out = std::process::Command::new("date")
+        .arg("+%z")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    #[cfg(not(unix))]
-    {
-        None
-    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    parse_utc_offset(s.trim()).ok()
+}
+
+/// No reliable non-subprocess way to read the local UTC offset on
+/// non-Unix targets; callers fall back to UTC.
+#[cfg(not(unix))]
+const fn detect_utc_offset_seconds() -> Option<i32> {
+    None
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -834,7 +851,6 @@ enum RuntimeEvent {
         /// Stream id of the terminated stream.
         stream_id: StreamId,
         /// Why the stream ended.
-        #[allow(dead_code, reason = "reason reserved for future trace output")]
         reason: VoiceEndReason,
     },
 }
@@ -931,10 +947,15 @@ impl ReflectorSession {
 /// Main REPL loop. Manages three states: CAT (normal radio control),
 /// APRS (packet radio), and D-STAR (digital voice gateway). Each state
 /// owns the radio transport exclusively.
-#[allow(
+#[expect(
     clippy::cognitive_complexity,
     clippy::too_many_lines,
-    clippy::too_many_arguments
+    reason = "`run_repl` is the single state-machine owner for CAT/APRS/D-STAR modes: it fetches \
+              input from the appropriate queue (pending command, script queue, or rustyline), \
+              dispatches to the active mode, handles mode transitions, and unwinds on quit. \
+              Extracting the three dispatch arms would require threading every mode's session \
+              type through helpers and would not meaningfully reduce the function's inherent \
+              complexity — the branching is the algorithm."
 )]
 async fn run_repl(
     transport: EitherTransport,
@@ -1002,7 +1023,13 @@ async fn run_repl(
         // of falling into the rustyline prompt. Clippy wants us to
         // rewrite this as `map_or_else`, but the three-way chain is
         // clearer as an if-ladder.
-        #[allow(clippy::option_if_let_else)]
+        #[expect(
+            clippy::option_if_let_else,
+            reason = "Three-way priority chain (pending command, script queue, interactive \
+                      input). Rewriting the outer `if let Some` as `map_or_else` would require \
+                      a closure that's itself another if-else, obscuring the priority ordering \
+                      that's the whole point of this structure."
+        )]
         let line = if let Some(cmd) = pending_command.take() {
             println!("{prompt}{cmd}");
             Some(cmd)
@@ -1326,7 +1353,12 @@ async fn run_repl(
 // ---------------------------------------------------------------------------
 
 /// Dispatch a command in CAT mode to the appropriate handler function.
-#[allow(clippy::cognitive_complexity)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "Command dispatch table for every CAT-mode REPL command. The flat `match` over \
+              string aliases is the idiomatic shape for a dispatcher; any refactor would move \
+              the dispatch into a per-command map without reducing real complexity."
+)]
 async fn dispatch_cat(radio: &mut Radio<EitherTransport>, cmd: &str, parts: &[&str]) {
     match cmd {
         "id" | "identify" => commands::identify(radio).await,
@@ -1404,7 +1436,13 @@ async fn enter_aprs(
 }
 
 /// Dispatch a command in APRS mode.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Command dispatch for APRS mode covering listen, monitor, msg, position, beacon, \
+              stations, igate, and the aprs-stop transition. Each arm is a small handler; the \
+              sum is long but the structure is a flat dispatch table, so splitting helpers would \
+              only fragment a single command table across files."
+)]
 async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, parts: &[&str]) {
     match cmd {
         "listen" | "poll" => match client.next_event().await {
@@ -2610,7 +2648,12 @@ async fn emit_silence_pad_if_needed(session: &mut DStarSession) {
         // correlate audible smoothing events with reflector
         // silence in the trace log without drowning the stream
         // in per-pad-frame noise.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Silence-pad interval is measured in milliseconds of radio dead-air. The \
+                      value will be tens of milliseconds in practice (well under u64::MAX), so \
+                      the u128→u64 truncation can never lose bits."
+        )]
         let elapsed_ms = last_at.elapsed().as_millis() as u64;
         tracing::debug!(
             target: "thd75_repl::reflector",
@@ -2809,7 +2852,13 @@ async fn dstar_poll_cycle(session: &mut DStarSession) {
 
 /// `listen` polls both the radio MMDVM and reflector UDP, relaying
 /// voice frames between them.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "D-STAR command dispatch covering listen, link/unlink, echo, text, heard, status, \
+              and the dstar-stop transition. Each arm is a small handler; the sum is long but \
+              the structure is a flat dispatch table. Splitting helpers would only fragment a \
+              single command table across files."
+)]
 async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
     match cmd {
         "listen" | "poll" => {
@@ -2967,7 +3016,11 @@ const ECHO_MAX_FRAMES: usize = 60 * 50;
 fn finish_echo_recording(session: &mut DStarSession) {
     let echo = std::mem::replace(&mut session.echo, EchoState::Idle);
     if let EchoState::Recording { header, frames } = echo {
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "Echo buffer is capped at ECHO_MAX_FRAMES (3000), which fits exactly in \
+                      f64's 52-bit mantissa, so the usize→f64 conversion never loses precision."
+        )]
         let secs = frames.len() as f64 / 50.0;
         println!("Echo test: recorded {secs:.1} seconds of audio. Playing back.");
         session.echo = EchoState::Waiting {
@@ -3297,7 +3350,12 @@ fn rand_stream_id() -> StreamId {
     let t = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Stream IDs are 16-bit per the D-STAR protocol, so deliberate truncation of the \
+                  64-bit seconds-since-epoch and the XOR result is how we derive a per-stream \
+                  unique ID. Only the low 16 bits of entropy matter here."
+    )]
     let id = ((t.subsec_nanos() ^ (t.as_secs() as u32)) as u16) | 0x0001;
     StreamId::new(id).expect("low bit forced to 1 guarantees non-zero")
 }

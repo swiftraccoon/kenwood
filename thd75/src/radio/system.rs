@@ -173,7 +173,13 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    #[allow(clippy::fn_params_excessive_bools)]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "CAT `LC a,b,c,d,e,f` is a 6-field fixed-format command where five fields are \
+                  booleans (master lock, lock A/B/C, lock PTT) per the TH-D75 CAT reference. \
+                  The API mirrors the wire-level layout 1:1; grouping into a struct would add \
+                  indirection without improving correctness."
+    )]
     pub async fn set_lock_full(
         &mut self,
         locked: bool,
@@ -570,7 +576,13 @@ impl<T: Transport> Radio<T> {
     pub async fn set_beep_via_mcp(&mut self, enabled: bool) -> Result<(), Error> {
         const OFFSET: usize = 0x1071;
         // 0x1071 / 256 = 0x10 = 16, fits in u16.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "OFFSET (0x1071) / 256 = 0x10 is the constant page index in the MCP memory \
+                      map. The division's compile-time result fits trivially in u16; truncation \
+                      can only occur if MCP_SIZE exceeds u16::MAX pages (~16 MB), far beyond the \
+                      D75's 512 KB image."
+        )]
         const PAGE: u16 = (OFFSET / 256) as u16;
         const BYTE_INDEX: usize = OFFSET % 256;
 
@@ -599,7 +611,13 @@ impl<T: Transport> Radio<T> {
     /// writing the page, or exiting programming mode fails.
     pub async fn set_beep_volume_via_mcp(&mut self, volume: u8) -> Result<(), Error> {
         const OFFSET: usize = 0x1072;
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "OFFSET (0x1072) / 256 = 0x10 is the constant page index in the MCP memory \
+                      map. The division's compile-time result fits trivially in u16; truncation \
+                      can only occur if MCP_SIZE exceeds u16::MAX pages (~16 MB), far beyond the \
+                      D75's 512 KB image."
+        )]
         const PAGE: u16 = (OFFSET / 256) as u16;
         const BYTE_INDEX: usize = OFFSET % 256;
 
@@ -639,7 +657,13 @@ impl<T: Transport> Radio<T> {
     pub async fn set_vox_via_mcp(&mut self, enabled: bool) -> Result<(), Error> {
         const OFFSET: usize = 0x101B;
         // 0x101B / 256 = 0x10 = 16, fits in u16.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "OFFSET (0x101B) / 256 = 0x10 is the constant page index in the MCP memory \
+                      map. The division's compile-time result fits trivially in u16; truncation \
+                      can only occur if MCP_SIZE exceeds u16::MAX pages (~16 MB), far beyond the \
+                      D75's 512 KB image."
+        )]
         const PAGE: u16 = (OFFSET / 256) as u16;
         const BYTE_INDEX: usize = OFFSET % 256;
 
@@ -669,7 +693,13 @@ impl<T: Transport> Radio<T> {
     pub async fn set_lock_via_mcp(&mut self, locked: bool) -> Result<(), Error> {
         const OFFSET: usize = 0x1060;
         // 0x1060 / 256 = 0x10 = 16, fits in u16.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "OFFSET (0x1060) / 256 = 0x10 is the constant page index in the MCP memory \
+                      map. The division's compile-time result fits trivially in u16; truncation \
+                      can only occur if MCP_SIZE exceeds u16::MAX pages (~16 MB), far beyond the \
+                      D75's 512 KB image."
+        )]
         const PAGE: u16 = (OFFSET / 256) as u16;
         const BYTE_INDEX: usize = OFFSET % 256;
 
@@ -699,7 +729,13 @@ impl<T: Transport> Radio<T> {
     pub async fn set_bluetooth_via_mcp(&mut self, enabled: bool) -> Result<(), Error> {
         const OFFSET: usize = 0x1078;
         // 0x1078 / 256 = 0x10 = 16, fits in u16.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "OFFSET (0x1078) / 256 = 0x10 is the constant page index in the MCP memory \
+                      map. The division's compile-time result fits trivially in u16; truncation \
+                      can only occur if MCP_SIZE exceeds u16::MAX pages (~16 MB), far beyond the \
+                      D75's 512 KB image."
+        )]
         const PAGE: u16 = (OFFSET / 256) as u16;
         const BYTE_INDEX: usize = OFFSET % 256;
 

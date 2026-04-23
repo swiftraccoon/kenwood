@@ -21,6 +21,15 @@
 //! reference encoder actually emits, so matching it is the only way
 //! to achieve bit-exact `b0` against the OP25 traces.
 
+#![expect(
+    clippy::indexing_slicing,
+    reason = "Pitch quantization: indices into B0_LOOKUP (827 entries, statically sized) \
+              and AmbePlusLtable are bounded by the OP25 walk algorithm — the ±1 step \
+              over `b0_lookup[]` stays within [0, 826] by construction. Rewriting with \
+              `.get()?` would obscure the OP25 reference-implementation traceability \
+              that this module exists to preserve."
+)]
+
 /// OP25 `b0_lookup[]` table — 827 entries (`ambe_encoder.cc:41-146`).
 ///
 /// Indexed by `(ref_pitch >> 5) - 159` where `ref_pitch` is the
@@ -110,11 +119,17 @@ pub(crate) fn pitch_index(ref_pitch_q8_8: u32, target_l: usize, ltable: &[f32]) 
     // avoids the usize→i32 cast lints without a per-site `#[allow]`.
     const LOOKUP_LEN: i32 = 827;
     const LOOKUP_MAX: i32 = LOOKUP_LEN - 1;
-    debug_assert_eq!(B0_LOOKUP.len(), LOOKUP_LEN as usize);
-    #[allow(
-        clippy::cast_possible_truncation,
+    debug_assert_eq!(
+        B0_LOOKUP.len(),
+        LOOKUP_LEN as usize,
+        "B0_LOOKUP length must equal LOOKUP_LEN=827 per OP25 ambe_encoder.cc:41-146 — the \
+         walk algorithm's bounds rely on this invariant"
+    );
+    #[expect(
         clippy::cast_possible_wrap,
-        reason = "ref_pitch_q8_8 < 2^16 (Q8.8 with period < 256); >> 5 gives ≤ 2047; safe in i32"
+        reason = "Initial b0_lookup index: ref_pitch_q8_8 is Q8.8 with period < 256, so the \
+                  value is < 2^16; `>> 5` yields <= 2047, which fits safely in i32 — the \
+                  u32->i32 cast cannot wrap at these magnitudes."
     )]
     let initial = (ref_pitch_q8_8 >> 5) as i32 - 159;
     let mut b0_i: i32 = initial.clamp(0, LOOKUP_MAX);
@@ -126,16 +141,18 @@ pub(crate) fn pitch_index(ref_pitch_q8_8: u32, target_l: usize, ltable: &[f32]) 
     // range, so boundary hits here indicate a pitch the codec can't
     // represent, and returning the closest b0 is the least-bad
     // fallback.
-    #[allow(
+    #[expect(
         clippy::cast_sign_loss,
-        reason = "b0_i clamped to [0, lookup_len - 1] before indexing"
+        reason = "b0_i is clamped to [0, LOOKUP_MAX] on line 120, so the i32-to-usize cast \
+                  cannot lose a sign bit here."
     )]
     let mut b0 = B0_LOOKUP[b0_i as usize];
     let current_l = |b0: u8| -> usize {
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "L_TABLE values are whole numbers 9..=56; truncation is exact"
+            reason = "L_TABLE entries are whole positive integers in 9..=56 stored as f32; \
+                      the f32-to-usize cast is exact within this range."
         )]
         let l = ltable.get(b0 as usize).copied().unwrap_or(0.0) as usize;
         l
@@ -154,7 +171,11 @@ pub(crate) fn pitch_index(ref_pitch_q8_8: u32, target_l: usize, ltable: &[f32]) 
         }
         if b0_i < 0 {
             b0_i = 0;
-            #[allow(clippy::cast_sign_loss, reason = "b0_i clamped to 0 above")]
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "b0_i was just set to 0 on the previous line, so the i32-to-usize \
+                          cast is trivially safe."
+            )]
             {
                 b0 = B0_LOOKUP[b0_i as usize];
             }
@@ -162,18 +183,20 @@ pub(crate) fn pitch_index(ref_pitch_q8_8: u32, target_l: usize, ltable: &[f32]) 
         }
         if b0_i >= LOOKUP_LEN {
             b0_i = LOOKUP_MAX;
-            #[allow(
+            #[expect(
                 clippy::cast_sign_loss,
-                reason = "b0_i clamped to lookup_len - 1 above"
+                reason = "b0_i was just set to LOOKUP_MAX (826), a non-negative integer, so \
+                          the i32-to-usize cast is trivially safe."
             )]
             {
                 b0 = B0_LOOKUP[b0_i as usize];
             }
             break;
         }
-        #[allow(
+        #[expect(
             clippy::cast_sign_loss,
-            reason = "b0_i checked non-negative + below lookup_len on the two bounds above"
+            reason = "b0_i has been verified non-negative (the `< 0` branch above) and \
+                      below LOOKUP_LEN (the `>= LOOKUP_LEN` branch above); cast is safe."
         )]
         {
             b0 = B0_LOOKUP[b0_i as usize];
@@ -215,10 +238,11 @@ mod tests {
     /// Convert an `L_TABLE` float entry to the `usize` the walk
     /// compares against. Factored to centralise the one numeric cast.
     fn l_of(b0: u8) -> usize {
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "L_TABLE entries are whole positive numbers 9..=56; truncation is exact"
+            reason = "L_TABLE entries are whole positive integers in 9..=56 stored as f32; \
+                      the f32-to-usize cast is exact within this range."
         )]
         let v = L_TABLE[b0 as usize] as usize;
         v

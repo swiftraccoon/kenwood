@@ -85,21 +85,20 @@ fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> 
 
 /// Split a `"band,value"` payload into (band, `value_str`).
 fn split_band_value<'a>(payload: &'a str, cmd: &str) -> Result<(Band, &'a str), ProtocolError> {
-    let parts: Vec<&str> = payload.splitn(2, ',').collect();
-    if parts.len() != 2 {
-        return Err(ProtocolError::FieldParse {
+    let (band_str, value) = payload
+        .split_once(',')
+        .ok_or_else(|| ProtocolError::FieldParse {
             command: cmd.to_owned(),
             field: "all".to_owned(),
             detail: format!("expected band,value, got {payload:?}"),
-        });
-    }
-    let band_val = parse_u8_field(parts[0], cmd, "band")?;
+        })?;
+    let band_val = parse_u8_field(band_str, cmd, "band")?;
     let band = Band::try_from(band_val).map_err(|e| ProtocolError::FieldParse {
         command: cmd.to_owned(),
         field: "band".to_owned(),
         detail: e.to_string(),
     })?;
-    Ok((band, parts[1]))
+    Ok((band, value))
 }
 
 /// Parse BL (battery level): bare `"level"` response.

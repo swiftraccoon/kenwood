@@ -16,6 +16,12 @@
 
 #![cfg(feature = "encoder")]
 
+// Dev-dependencies pulled in by sibling tests. Acknowledge them here so
+// `unused_crate_dependencies` stays silent for this compilation unit.
+use proptest as _;
+use realfft as _;
+use wide as _;
+
 use mbelib_rs::{AmbeDecoder, AmbeEncoder};
 
 /// Build a 1 kHz sine wave chunk at -20 dBFS, 160 samples @ 8 kHz
@@ -26,7 +32,11 @@ fn make_sine_chunk(t0_samples: usize) -> [f32; 160] {
     let freq_hz = 1000.0_f32;
     let sr = 8000.0_f32;
     for (i, slot) in buf.iter_mut().enumerate() {
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test sine generator: t0_samples + i stays below f32 mantissa \
+                      precision for the test's frame counts."
+        )]
         let t = (t0_samples + i) as f32;
         *slot = amplitude * (t * 2.0 * std::f32::consts::PI * freq_hz / sr).sin();
     }
@@ -45,9 +55,16 @@ fn rms_i16(pcm: &[i16]) -> f32 {
             x * x
         })
         .sum();
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "test RMS helper: pcm.len() small (one frame = 160 samples), exact in f64."
+    )]
     let mean = sum_sq / pcm.len() as f64;
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test RMS helper: mean is small (normalized PCM), sqrt is bounded, \
+                  f64-to-f32 narrowing is acceptable for the test's comparison."
+    )]
     let rms = mean.sqrt() as f32;
     rms
 }

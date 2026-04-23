@@ -8,6 +8,12 @@
 
 #![cfg(feature = "encoder")]
 
+// Dev-dependencies pulled in by sibling tests. Acknowledge them here so
+// `unused_crate_dependencies` stays silent for this compilation unit.
+use proptest as _;
+use realfft as _;
+use wide as _;
+
 use mbelib_rs::AmbeEncoder;
 
 /// Canonical D-STAR silence bytes. If the encoder is short-circuiting
@@ -25,11 +31,18 @@ fn make_voiced_chunk(t0_samples: usize) -> [f32; 160] {
     let sr = 8000.0_f32;
     let harmonics = [0.3_f32, 0.2, 0.12, 0.06];
     for (i, slot) in buf.iter_mut().enumerate() {
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test voice-like generator: t0_samples + i stays within test frame \
+                      counts and is exact in f32."
+        )]
         let t = (t0_samples + i) as f32;
         let mut s = 0.0_f32;
         for (k, &amp) in harmonics.iter().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "harmonic index: k < 4, usize-to-f32 cast is exact."
+            )]
             let harm_num = (k + 1) as f32;
             s += amp * (t * 2.0 * std::f32::consts::PI * f0_hz * harm_num / sr).sin();
         }
@@ -85,7 +98,10 @@ fn pure_sine_pitch_preserved_through_codec() {
         let f0_hz = 150.0_f32;
         let sr = 8000.0_f32;
         for (i, slot) in buf.iter_mut().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test pure-sine generator: t0 + i stays within test frame counts."
+            )]
             let t = (t0 + i) as f32;
             *slot = 0.3 * (t * 2.0 * std::f32::consts::PI * f0_hz / sr).sin();
         }
@@ -108,7 +124,10 @@ fn pure_sine_pitch_preserved_through_codec() {
         let mut real = 0.0_f32;
         let mut imag = 0.0_f32;
         for (i, &s) in decoded.iter().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test Goertzel: i < decoded.len() = 20*160 = 3200; exact in f32."
+            )]
             let t = i as f32 / sr;
             let x = f32::from(s) / 32768.0;
             let phase = 2.0 * std::f32::consts::PI * freq_hz * t;
@@ -116,7 +135,10 @@ fn pure_sine_pitch_preserved_through_codec() {
             imag += x * phase.sin();
         }
         let n = decoded.len();
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test normalization: n = 3200; exact in f32."
+        )]
         let norm = real.mul_add(real, imag * imag) / (n as f32 * n as f32);
         norm.sqrt()
     };
@@ -168,7 +190,10 @@ fn voiced_input_produces_harmonic_output() {
         let mut real = 0.0_f32;
         let mut imag = 0.0_f32;
         for (i, &s) in decoded.iter().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test Goertzel: i < decoded.len() = 20*160 = 3200; exact in f32."
+            )]
             let t = i as f32 / sr;
             let x = f32::from(s) / 32768.0;
             let phase = 2.0 * std::f32::consts::PI * freq_hz * t;
@@ -177,7 +202,10 @@ fn voiced_input_produces_harmonic_output() {
         }
         let _ = bw_hz;
         let n = decoded.len();
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test normalization: n = 3200; exact in f32."
+        )]
         let norm = real.mul_add(real, imag * imag) / (n as f32 * n as f32);
         norm.sqrt()
     };

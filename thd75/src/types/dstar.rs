@@ -55,7 +55,13 @@ use crate::error::ValidationError;
 /// Covers all settings from the radio's D-STAR menu tree, including
 /// callsign configuration, repeater routing, digital squelch, auto-reply,
 /// and data options. Derived from the capability gap analysis features 40-62.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Mirrors the radio's D-STAR menu tree 1:1 — each bool maps to a discrete on/off menu \
+              item (EMR, auto-reply, data squelch, etc.) that the user can toggle independently. \
+              Consolidating into a bitflags enum would lose the field-by-field self-documenting \
+              layout that matches the user manual's menu structure."
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DstarConfig {
     /// MY callsign (up to 8 characters). This is the station's own
@@ -178,9 +184,11 @@ impl DstarCallsign {
     #[must_use]
     pub fn to_wire_bytes(&self) -> [u8; 8] {
         let mut buf = [b' '; 8];
-        let src = self.0.as_bytes();
-        let len = src.len().min(8);
-        buf[..len].copy_from_slice(&src[..len]);
+        // Zip bounds the iteration by the shorter of the two — buf has exactly 8
+        // bytes so at most 8 source bytes are written; no indexing needed.
+        buf.iter_mut()
+            .zip(self.0.as_bytes().iter())
+            .for_each(|(dst, &src)| *dst = src);
         buf
     }
 
@@ -692,8 +700,13 @@ impl UrCallAction {
         }
 
         // Check single-char commands (7 spaces + command).
-        if bytes[..7] == *b"       " {
-            return match bytes[7] {
+        // `bytes` is `&[u8; 8]`, so `split_last` always yields Some and the
+        // remainder is exactly 7 bytes.
+        let Some((&last, prefix)) = bytes.split_last() else {
+            return Self::Callsign(padded.trim().to_owned());
+        };
+        if prefix == b"       " {
+            return match last {
                 b'E' => Self::Echo,
                 b'U' => Self::Unlink,
                 b'I' => Self::Info,
@@ -703,7 +716,7 @@ impl UrCallAction {
 
         // Check for reflector link: last char is A-Z module letter,
         // and the name portion matches known reflector prefixes.
-        let module = bytes[7];
+        let module = last;
         if module.is_ascii_uppercase() {
             let name = padded[..7].trim();
             if !name.is_empty()
@@ -810,16 +823,20 @@ pub enum QsoDirection {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn dstar_callsign_valid() {
-        let cs = DstarCallsign::new("N0CALL").unwrap();
+    fn dstar_callsign_valid() -> TestResult {
+        let cs = DstarCallsign::new("N0CALL").ok_or("valid callsign rejected")?;
         assert_eq!(cs.as_str(), "N0CALL");
+        Ok(())
     }
 
     #[test]
-    fn dstar_callsign_max_length() {
-        let cs = DstarCallsign::new("JR6YPR A").unwrap();
+    fn dstar_callsign_max_length() -> TestResult {
+        let cs = DstarCallsign::new("JR6YPR A").ok_or("valid 8-char callsign rejected")?;
         assert_eq!(cs.as_str(), "JR6YPR A");
+        Ok(())
     }
 
     #[test]
@@ -828,16 +845,18 @@ mod tests {
     }
 
     #[test]
-    fn dstar_callsign_trims_trailing_spaces() {
-        let cs = DstarCallsign::new("N0CALL  ").unwrap();
+    fn dstar_callsign_trims_trailing_spaces() -> TestResult {
+        let cs = DstarCallsign::new("N0CALL  ").ok_or("padded callsign rejected")?;
         assert_eq!(cs.as_str(), "N0CALL");
+        Ok(())
     }
 
     #[test]
-    fn dstar_callsign_wire_bytes_padded() {
-        let cs = DstarCallsign::new("N0CALL").unwrap();
+    fn dstar_callsign_wire_bytes_padded() -> TestResult {
+        let cs = DstarCallsign::new("N0CALL").ok_or("valid callsign rejected")?;
         let bytes = cs.to_wire_bytes();
         assert_eq!(&bytes, b"N0CALL  ");
+        Ok(())
     }
 
     #[test]
@@ -855,9 +874,10 @@ mod tests {
     }
 
     #[test]
-    fn dstar_suffix_valid() {
-        let s = DstarSuffix::new("/P").unwrap();
+    fn dstar_suffix_valid() -> TestResult {
+        let s = DstarSuffix::new("/P").ok_or("valid suffix rejected")?;
         assert_eq!(s.as_str(), "/P");
+        Ok(())
     }
 
     #[test]
@@ -878,9 +898,10 @@ mod tests {
     }
 
     #[test]
-    fn dstar_message_valid() {
-        let msg = DstarMessage::new("Hello D-STAR").unwrap();
+    fn dstar_message_valid() -> TestResult {
+        let msg = DstarMessage::new("Hello D-STAR").ok_or("valid message rejected")?;
         assert_eq!(msg.as_str(), "Hello D-STAR");
+        Ok(())
     }
 
     #[test]

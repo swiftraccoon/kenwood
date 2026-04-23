@@ -70,11 +70,24 @@ pub(crate) enum RadioCommand {
     SetFmRadio(bool),
     /// Set D-STAR callsign slot (CS write — verified working).
     /// Not yet wired to `adjust_setting` (requires polling current slot first).
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Wire-verified CAT command variant held for the upcoming `adjust_setting` \
+                  hook-up. The worker translates CAT commands in `radio_task.rs` — this \
+                  variant is constructed once that hook-up lands, which needs a preceding \
+                  CS read to capture the current slot index. Keeping the variant means the \
+                  dispatch table shape stays stable and callers compile as soon as the \
+                  read-first logic is wired."
+    )]
     SetCallsignSlot(kenwood_thd75::types::CallsignSlot),
     /// Set D-STAR slot (DS write — verified working).
     /// Not yet wired to `adjust_setting` (requires polling current slot first).
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Wire-verified CAT command variant held for the upcoming `adjust_setting` \
+                  hook-up — same rationale as `SetCallsignSlot` above. Requires a preceding \
+                  DS read to capture the current slot index before we can safely write."
+    )]
     SetDstarSlot(kenwood_thd75::types::DstarSlot),
     /// Set the step size for the given band (SF write — verified working).
     SetStepSize {

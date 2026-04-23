@@ -73,7 +73,10 @@ mod tests {
         // Simulated 500 Hz sine at 8 kHz sample rate, 1000 samples.
         let input: Vec<f32> = (0..1000)
             .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test tone generator: i < 1000 is well within f32 mantissa."
+                )]
                 let t = i as f32;
                 (t * 2.0 * std::f32::consts::PI * 500.0 / 8000.0).sin()
             })
@@ -92,7 +95,10 @@ mod tests {
     }
 
     fn rms(xs: &[f32]) -> f32 {
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test RMS helper: xs.len() = 1000 for this test, exact in f32."
+        )]
         let n = xs.len() as f32;
         (xs.iter().map(|x| x * x).sum::<f32>() / n).sqrt()
     }

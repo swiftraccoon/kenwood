@@ -125,7 +125,10 @@ mod tests {
         let mut state = Biquad2State::new();
         let input: Vec<f32> = (0..4000)
             .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test tone generator: i < 4000, exact in f32."
+                )]
                 let t = i as f32;
                 (t * 2.0 * std::f32::consts::PI * 1000.0 / 8000.0).sin()
             })
@@ -152,7 +155,10 @@ mod tests {
         let mut state = Biquad2State::new();
         let input: Vec<f32> = (0..4000)
             .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test tone generator: i < 4000, exact in f32."
+                )]
                 let t = i as f32;
                 (t * 2.0 * std::f32::consts::PI * 100.0 / 8000.0).sin()
             })
@@ -175,7 +181,10 @@ mod tests {
         let mut state = Biquad2State::new();
         let input: Vec<f32> = (0..16000)
             .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test tone generator: i < 16000, exact in f32."
+                )]
                 let t = i as f32;
                 (t * 2.0 * std::f32::consts::PI * 5.0 / 8000.0).sin()
             })
@@ -192,7 +201,10 @@ mod tests {
     }
 
     fn rms(xs: &[f32]) -> f32 {
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test RMS helper: xs.len() <= 16000 in this module; exact in f32."
+        )]
         let n = xs.len() as f32;
         (xs.iter().map(|x| x * x).sum::<f32>() / n).sqrt()
     }

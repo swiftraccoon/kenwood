@@ -7,7 +7,26 @@
 //! Used by the validation harness that compares our decoder output
 //! against mbelib's for identical AMBE input.
 
-#![allow(clippy::print_stderr)]
+#![expect(
+    clippy::print_stderr,
+    reason = "CLI tool: uses stderr for usage/error messages — standard pattern for a \
+              binary example, not a library."
+)]
+#![expect(
+    clippy::indexing_slicing,
+    reason = "CLI example: reads fixed-size 9-byte AMBE frames from an input file and \
+              directly indexes into the local read buffer to pull out fields for the \
+              trace output. The buffer is always filled before indexing (checked by the \
+              `read_exact` call), so indexing is bounds-safe by construction. A \
+              `.get()?` rewrite would add unwrap noise throughout a thin CLI that exists \
+              specifically to mirror mbelib's trace format byte-for-byte."
+)]
+
+// Dev-dependencies pulled in by sibling test/example targets. Acknowledge them
+// here so `unused_crate_dependencies` stays silent for this compilation unit.
+use proptest as _;
+use realfft as _;
+use wide as _;
 
 use std::io::{Read, Write};
 

@@ -117,15 +117,17 @@ mod tests {
     }
 
     #[test]
-    fn wireless_password_valid() {
-        let pwd = WirelessPassword::new("1234").unwrap();
+    fn wireless_password_valid() -> Result<(), Box<dyn std::error::Error>> {
+        let pwd = WirelessPassword::new("1234").ok_or("valid password rejected")?;
         assert_eq!(pwd.as_str(), "1234");
+        Ok(())
     }
 
     #[test]
-    fn wireless_password_dtmf_chars() {
-        let pwd = WirelessPassword::new("A*#B").unwrap();
+    fn wireless_password_dtmf_chars() -> Result<(), Box<dyn std::error::Error>> {
+        let pwd = WirelessPassword::new("A*#B").ok_or("valid DTMF password rejected")?;
         assert_eq!(pwd.as_str(), "A*#B");
+        Ok(())
     }
 
     #[test]

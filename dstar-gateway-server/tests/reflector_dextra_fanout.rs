@@ -13,14 +13,26 @@
 //! thin wrapper over the same endpoint code path. A separate
 //! smoke test covers `Reflector::new_with_socket` + shutdown.
 
-// Integration tests live in a separate compilation unit from the
-// library crate. Match the library's lint opt-out so test code stays
-// expressive.
-#![allow(
+#![expect(
     clippy::panic,
     clippy::indexing_slicing,
     clippy::unreachable,
-    unused_results
+    unused_results,
+    reason = "Integration test file. Tests live in a separate compilation unit from the \
+              library crate, so the library's internal lint posture does not apply — we \
+              restate the opt-outs here so test code stays expressive while production \
+              code remains strict. `clippy::panic` fires on explicit `panic!()` calls \
+              used as assertion-style failure reporters inside `match` arms and \
+              `tokio::select!` branches where we want to abort the test with a specific \
+              message rather than fall through to a generic `assert!` failure. \
+              `clippy::indexing_slicing` fires on direct buffer indexing against \
+              fixed-size test fixtures (known-length protocol frames) where bounds are \
+              obvious by construction. `clippy::unreachable` fires on `unreachable!()` \
+              used inside `match` arms as assertion-style 'this variant cannot occur \
+              given the test's setup' guards. `unused_results` fires on channel sends, \
+              `tokio::spawn` handles, and other setup calls whose `Result`/`JoinHandle` \
+              is not bound at the call site but is validated later in the test body via \
+              `assert!`/`matches!` on the receiver end."
 )]
 
 use std::sync::Arc;

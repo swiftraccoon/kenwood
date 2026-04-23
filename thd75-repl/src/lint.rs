@@ -243,6 +243,14 @@ fn check_r12_units(line: &str, violations: &mut Vec<Violation>) {
             let offset = search_start + rel_offset;
             search_start = offset + unit.len();
 
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "The `if offset == 0` guard above ensures `offset - 1` is \
+                          non-negative when this branch runs, and `offset` came from \
+                          `find(unit)` on `bytes`, so `offset < bytes.len()` — the index \
+                          is always in-bounds. Using `bytes.get(offset - 1)` and \
+                          unwrapping would add noise without catching a real bug."
+            )]
             let prev = if offset == 0 { b' ' } else { bytes[offset - 1] };
             let next = bytes.get(offset + unit.len()).copied().unwrap_or(b' ');
 

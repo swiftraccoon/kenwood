@@ -7,7 +7,21 @@
 //! Used by the validation harness.
 
 #![cfg(feature = "encoder")]
-#![allow(clippy::print_stderr)]
+#![expect(
+    clippy::print_stderr,
+    clippy::indexing_slicing,
+    reason = "CLI tool. `clippy::print_stderr` fires on stderr usage for CLI messages — \
+              standard pattern for a binary example, not a library. \
+              `clippy::indexing_slicing` fires on direct indexing into fixed-size frame \
+              buffers (9-byte AMBE, 160-sample PCM). The CLI reads exact-size frames \
+              with `read_exact` before indexing, so accesses are always in-bounds."
+)]
+
+// Dev-dependencies pulled in by sibling tests/examples. Acknowledge them here so
+// `unused_crate_dependencies` stays silent for this compilation unit.
+use proptest as _;
+use realfft as _;
+use wide as _;
 
 use std::io::{Read, Write};
 

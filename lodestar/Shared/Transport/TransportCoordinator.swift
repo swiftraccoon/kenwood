@@ -24,6 +24,26 @@ public final class TransportCoordinator {
     public private(set) var radioMode: RadioMode = .unknown
     public private(set) var isProbingMode: Bool = false
 
+    /// When `true`, `tryAutoConnect()` will reconnect on launch to the
+    /// last-used radio (by Bluetooth address). Persisted.
+    public var autoConnectRadio: Bool {
+        didSet { UserDefaults.standard.set(autoConnectRadio, forKey: Self.autoConnectKey) }
+    }
+
+    /// Bluetooth address of the most recently connected radio. Captured
+    /// on every successful `connect()`. Persisted so `tryAutoConnect()`
+    /// can find it on the next launch.
+    public private(set) var rememberedRadioAddress: String? {
+        didSet { UserDefaults.standard.set(rememberedRadioAddress, forKey: Self.rememberedAddressKey) }
+    }
+
+    /// Display name of the most recently connected radio (persisted
+    /// alongside the address so the UI can render "last used: TH-D75"
+    /// without re-scanning when the device isn't paired currently).
+    public private(set) var rememberedRadioName: String? {
+        didSet { UserDefaults.standard.set(rememberedRadioName, forKey: Self.rememberedNameKey) }
+    }
+
     /// Handle to the underlying transport — exposed only so
     /// `RelayCoordinator` can run an `MmdvmReader`/`MmdvmWriter`
     /// alongside the coordinator's own calls. All I/O still serialises
@@ -33,7 +53,16 @@ public final class TransportCoordinator {
     private var transport: RadioTransport?
     private var stateObserver: Task<Void, Never>?
 
-    public init() {}
+    private static let autoConnectKey = "lodestar.autoConnectRadio"
+    private static let rememberedAddressKey = "lodestar.rememberedRadioAddress"
+    private static let rememberedNameKey = "lodestar.rememberedRadioName"
+
+    public init() {
+        let defaults = UserDefaults.standard
+        self.autoConnectRadio = defaults.bool(forKey: Self.autoConnectKey)
+        self.rememberedRadioAddress = defaults.string(forKey: Self.rememberedAddressKey)
+        self.rememberedRadioName = defaults.string(forKey: Self.rememberedNameKey)
+    }
 
     /// Status of the current/most-recent MCP programming-mode operation.
     public enum McpStatus: Equatable, Sendable {
@@ -44,7 +73,11 @@ public final class TransportCoordinator {
     }
 
     public func refreshPairedDevices() {
+        #if os(macOS)
         availableDevices = IOBluetoothTransport.pairedDevices()
+        #else
+        availableDevices = PrivateBluetoothTransport.pairedDevices()
+        #endif
     }
 
     public func select(_ device: BluetoothDevice) {
@@ -57,17 +90,43 @@ public final class TransportCoordinator {
         defer { isBusy = false }
         radioMode = .unknown
 
-        let t = IOBluetoothTransport(device: device)
+        #if os(macOS)
+        let t: RadioTransport = IOBluetoothTransport(device: device)
+        #else
+        let t: RadioTransport = PrivateBluetoothTransport(device: device)
+        #endif
         transport = t
         observeState(of: t)
         do {
             try await t.open()
+            // Remember this radio so `tryAutoConnect()` can find it on
+            // the next launch. Captured unconditionally — the user's
+            // `autoConnectRadio` toggle controls whether we act on it.
+            rememberedRadioAddress = device.address
+            rememberedRadioName = device.name
             // Once open, fire off a mode probe so the UI can show the
             // right affordances (MCP button only if still in CAT mode).
             await probeRadioMode()
         } catch {
             state = .failed(message: String(describing: error))
         }
+    }
+
+    /// Auto-reconnect to the remembered radio on launch, if enabled and
+    /// the remembered device is still paired. Idempotent and silent when
+    /// conditions aren't met — safe to call unconditionally from app
+    /// startup.
+    public func tryAutoConnect() async {
+        guard autoConnectRadio, transport == nil else { return }
+        guard let address = rememberedRadioAddress else { return }
+        refreshPairedDevices()
+        guard let device = availableDevices.first(where: { $0.address == address }) else {
+            log.info("Auto-connect: remembered radio \(address) not in paired list; skipping")
+            return
+        }
+        log.info("Auto-connect: reconnecting to \(device.name) (\(address))")
+        select(device)
+        await connect()
     }
 
     public func disconnect() async {

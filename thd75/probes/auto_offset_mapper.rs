@@ -328,7 +328,16 @@ struct SettingTest {
 
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Hardware probe. The function drives the radio through every CAT-writable \
+              setting (~50+ settings, each with read/write/verify phases) in a single \
+              linear sequence so a reviewer can correlate the test output against the \
+              firmware command dispatch table at ~0xC002E2E0 top-to-bottom. Splitting \
+              into per-setting helpers would obscure the ordering (which matters for \
+              race-free probe runs against live hardware) and hide the shape of the \
+              single-dump-per-setting protocol."
+)]
 async fn map_all_settings() {
     println!("\n=== AUTOMATED OFFSET MAPPER (single-dump per setting) ===\n");
 

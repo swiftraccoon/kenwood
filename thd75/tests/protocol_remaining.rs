@@ -4,6 +4,8 @@
 use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::types::*;
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
 // === Scan (SR write-only, SF band-indexed, BS) ===
 
 #[test]
@@ -35,25 +37,25 @@ fn serialize_sf_read_band_b() {
 }
 
 #[test]
-fn parse_sf_response() {
-    match protocol::parse(b"SF 0,0").unwrap() {
-        Response::StepSize { band, step } => {
-            assert_eq!(band, Band::A);
-            assert_eq!(step, StepSize::Hz5000);
-        }
-        other => panic!("expected StepSize, got {other:?}"),
-    }
+fn parse_sf_response() -> TestResult {
+    let r = protocol::parse(b"SF 0,0")?;
+    let Response::StepSize { band, step } = r else {
+        return Err(format!("expected StepSize, got {r:?}").into());
+    };
+    assert_eq!(band, Band::A);
+    assert_eq!(step, StepSize::Hz5000);
+    Ok(())
 }
 
 #[test]
-fn parse_sf_response_band_b() {
-    match protocol::parse(b"SF 1,5").unwrap() {
-        Response::StepSize { band, step } => {
-            assert_eq!(band, Band::B);
-            assert_eq!(step, StepSize::Hz12500);
-        }
-        other => panic!("expected StepSize, got {other:?}"),
-    }
+fn parse_sf_response_band_b() -> TestResult {
+    let r = protocol::parse(b"SF 1,5")?;
+    let Response::StepSize { band, step } = r else {
+        return Err(format!("expected StepSize, got {r:?}").into());
+    };
+    assert_eq!(band, Band::B);
+    assert_eq!(step, StepSize::Hz12500);
+    Ok(())
 }
 
 #[test]
@@ -73,23 +75,23 @@ fn serialize_bs_read_band_b() {
 }
 
 #[test]
-fn parse_bs_response() {
-    match protocol::parse(b"BS 0").unwrap() {
-        Response::BandScope { band } => {
-            assert_eq!(band, Band::A);
-        }
-        other => panic!("expected BandScope, got {other:?}"),
-    }
+fn parse_bs_response() -> TestResult {
+    let r = protocol::parse(b"BS 0")?;
+    let Response::BandScope { band } = r else {
+        return Err(format!("expected BandScope, got {r:?}").into());
+    };
+    assert_eq!(band, Band::A);
+    Ok(())
 }
 
 #[test]
-fn parse_bs_response_band_b() {
-    match protocol::parse(b"BS 1").unwrap() {
-        Response::BandScope { band } => {
-            assert_eq!(band, Band::B);
-        }
-        other => panic!("expected BandScope, got {other:?}"),
-    }
+fn parse_bs_response_band_b() -> TestResult {
+    let r = protocol::parse(b"BS 1")?;
+    let Response::BandScope { band } = r else {
+        return Err(format!("expected BandScope, got {r:?}").into());
+    };
+    assert_eq!(band, Band::B);
+    Ok(())
 }
 
 // === APRS-related (AS, AE, PT, MS) ===
@@ -100,19 +102,23 @@ fn serialize_as_read() {
 }
 
 #[test]
-fn parse_as_response() {
-    match protocol::parse(b"AS 0").unwrap() {
-        Response::TncBaud { rate } => assert_eq!(rate, TncBaud::Bps1200),
-        other => panic!("expected TncBaud, got {other:?}"),
-    }
+fn parse_as_response() -> TestResult {
+    let r = protocol::parse(b"AS 0")?;
+    let Response::TncBaud { rate } = r else {
+        return Err(format!("expected TncBaud, got {r:?}").into());
+    };
+    assert_eq!(rate, TncBaud::Bps1200);
+    Ok(())
 }
 
 #[test]
-fn parse_as_response_9600() {
-    match protocol::parse(b"AS 1").unwrap() {
-        Response::TncBaud { rate } => assert_eq!(rate, TncBaud::Bps9600),
-        other => panic!("expected TncBaud, got {other:?}"),
-    }
+fn parse_as_response_9600() -> TestResult {
+    let r = protocol::parse(b"AS 1")?;
+    let Response::TncBaud { rate } = r else {
+        return Err(format!("expected TncBaud, got {r:?}").into());
+    };
+    assert_eq!(rate, TncBaud::Bps9600);
+    Ok(())
 }
 
 #[test]
@@ -121,14 +127,14 @@ fn serialize_ae_read() {
 }
 
 #[test]
-fn parse_ae_response_serial_info() {
-    match protocol::parse(b"AE C3C10368,K01").unwrap() {
-        Response::SerialInfo { serial, model_code } => {
-            assert_eq!(serial, "C3C10368");
-            assert_eq!(model_code, "K01");
-        }
-        other => panic!("expected SerialInfo, got {other:?}"),
-    }
+fn parse_ae_response_serial_info() -> TestResult {
+    let r = protocol::parse(b"AE C3C10368,K01")?;
+    let Response::SerialInfo { serial, model_code } = r else {
+        return Err(format!("expected SerialInfo, got {r:?}").into());
+    };
+    assert_eq!(serial, "C3C10368");
+    assert_eq!(model_code, "K01");
+    Ok(())
 }
 
 #[test]
@@ -137,11 +143,13 @@ fn serialize_pt_read() {
 }
 
 #[test]
-fn parse_pt_response() {
-    match protocol::parse(b"PT 2").unwrap() {
-        Response::BeaconType { mode } => assert_eq!(mode, BeaconMode::Ptt),
-        other => panic!("expected BeaconType, got {other:?}"),
-    }
+fn parse_pt_response() -> TestResult {
+    let r = protocol::parse(b"PT 2")?;
+    let Response::BeaconType { mode } = r else {
+        return Err(format!("expected BeaconType, got {r:?}").into());
+    };
+    assert_eq!(mode, BeaconMode::Ptt);
+    Ok(())
 }
 
 #[test]
@@ -160,11 +168,13 @@ fn serialize_ms_write() {
 }
 
 #[test]
-fn parse_ms_response() {
-    match protocol::parse(b"MS 0").unwrap() {
-        Response::PositionSource { source } => assert_eq!(source, 0),
-        other => panic!("expected PositionSource, got {other:?}"),
-    }
+fn parse_ms_response() -> TestResult {
+    let r = protocol::parse(b"MS 0")?;
+    let Response::PositionSource { source } = r else {
+        return Err(format!("expected PositionSource, got {r:?}").into());
+    };
+    assert_eq!(source, 0);
+    Ok(())
 }
 
 // === D-STAR (DS, CS, GW) ===
@@ -175,11 +185,13 @@ fn serialize_ds_read() {
 }
 
 #[test]
-fn parse_ds_response() {
-    match protocol::parse(b"DS 1").unwrap() {
-        Response::DstarSlot { slot } => assert_eq!(slot, DstarSlot::new(1).unwrap()),
-        other => panic!("expected DstarSlot, got {other:?}"),
-    }
+fn parse_ds_response() -> TestResult {
+    let r = protocol::parse(b"DS 1")?;
+    let Response::DstarSlot { slot } = r else {
+        return Err(format!("expected DstarSlot, got {r:?}").into());
+    };
+    assert_eq!(slot, DstarSlot::new(1)?);
+    Ok(())
 }
 
 #[test]
@@ -191,23 +203,24 @@ fn serialize_cs_read() {
 }
 
 #[test]
-fn serialize_cs_write() {
+fn serialize_cs_write() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::SetActiveCallsignSlot {
-            slot: CallsignSlot::new(10).unwrap()
+            slot: CallsignSlot::new(10)?
         }),
         b"CS 10\r"
     );
+    Ok(())
 }
 
 #[test]
-fn parse_cs_response() {
-    match protocol::parse(b"CS 10").unwrap() {
-        Response::ActiveCallsignSlot { slot } => {
-            assert_eq!(slot, CallsignSlot::new(10).unwrap());
-        }
-        other => panic!("expected ActiveCallsignSlot, got {other:?}"),
-    }
+fn parse_cs_response() -> TestResult {
+    let r = protocol::parse(b"CS 10")?;
+    let Response::ActiveCallsignSlot { slot } = r else {
+        return Err(format!("expected ActiveCallsignSlot, got {r:?}").into());
+    };
+    assert_eq!(slot, CallsignSlot::new(10)?);
+    Ok(())
 }
 
 #[test]
@@ -216,11 +229,13 @@ fn serialize_gw_read() {
 }
 
 #[test]
-fn parse_gw_response() {
-    match protocol::parse(b"GW 0").unwrap() {
-        Response::Gateway { value } => assert_eq!(value, DvGatewayMode::Off),
-        other => panic!("expected Gateway, got {other:?}"),
-    }
+fn parse_gw_response() -> TestResult {
+    let r = protocol::parse(b"GW 0")?;
+    let Response::Gateway { value } = r else {
+        return Err(format!("expected Gateway, got {r:?}").into());
+    };
+    assert_eq!(value, DvGatewayMode::Off);
+    Ok(())
 }
 
 // === GPS (GP, GM, GS) ===
@@ -231,31 +246,33 @@ fn serialize_gp_read() {
 }
 
 #[test]
-fn parse_gp_response() {
-    match protocol::parse(b"GP 0,0").unwrap() {
-        Response::GpsConfig {
-            gps_enabled,
-            pc_output,
-        } => {
-            assert!(!gps_enabled);
-            assert!(!pc_output);
-        }
-        other => panic!("expected GpsConfig, got {other:?}"),
-    }
+fn parse_gp_response() -> TestResult {
+    let r = protocol::parse(b"GP 0,0")?;
+    let Response::GpsConfig {
+        gps_enabled,
+        pc_output,
+    } = r
+    else {
+        return Err(format!("expected GpsConfig, got {r:?}").into());
+    };
+    assert!(!gps_enabled);
+    assert!(!pc_output);
+    Ok(())
 }
 
 #[test]
-fn parse_gp_response_enabled() {
-    match protocol::parse(b"GP 1,1").unwrap() {
-        Response::GpsConfig {
-            gps_enabled,
-            pc_output,
-        } => {
-            assert!(gps_enabled);
-            assert!(pc_output);
-        }
-        other => panic!("expected GpsConfig, got {other:?}"),
-    }
+fn parse_gp_response_enabled() -> TestResult {
+    let r = protocol::parse(b"GP 1,1")?;
+    let Response::GpsConfig {
+        gps_enabled,
+        pc_output,
+    } = r
+    else {
+        return Err(format!("expected GpsConfig, got {r:?}").into());
+    };
+    assert!(gps_enabled);
+    assert!(pc_output);
+    Ok(())
 }
 
 #[test]
@@ -264,11 +281,13 @@ fn serialize_gm_read() {
 }
 
 #[test]
-fn parse_gm_response() {
-    match protocol::parse(b"GM 0").unwrap() {
-        Response::GpsMode { mode } => assert_eq!(mode, GpsRadioMode::Normal),
-        other => panic!("expected GpsMode, got {other:?}"),
-    }
+fn parse_gm_response() -> TestResult {
+    let r = protocol::parse(b"GM 0")?;
+    let Response::GpsMode { mode } = r else {
+        return Err(format!("expected GpsMode, got {r:?}").into());
+    };
+    assert_eq!(mode, GpsRadioMode::Normal);
+    Ok(())
 }
 
 #[test]
@@ -277,47 +296,49 @@ fn serialize_gs_read() {
 }
 
 #[test]
-fn parse_gs_response() {
-    match protocol::parse(b"GS 1,1,1,1,1,1").unwrap() {
-        Response::GpsSentences {
-            gga,
-            gll,
-            gsa,
-            gsv,
-            rmc,
-            vtg,
-        } => {
-            assert!(gga);
-            assert!(gll);
-            assert!(gsa);
-            assert!(gsv);
-            assert!(rmc);
-            assert!(vtg);
-        }
-        other => panic!("expected GpsSentences, got {other:?}"),
-    }
+fn parse_gs_response() -> TestResult {
+    let r = protocol::parse(b"GS 1,1,1,1,1,1")?;
+    let Response::GpsSentences {
+        gga,
+        gll,
+        gsa,
+        gsv,
+        rmc,
+        vtg,
+    } = r
+    else {
+        return Err(format!("expected GpsSentences, got {r:?}").into());
+    };
+    assert!(gga);
+    assert!(gll);
+    assert!(gsa);
+    assert!(gsv);
+    assert!(rmc);
+    assert!(vtg);
+    Ok(())
 }
 
 #[test]
-fn parse_gs_response_mixed() {
-    match protocol::parse(b"GS 1,0,1,0,1,0").unwrap() {
-        Response::GpsSentences {
-            gga,
-            gll,
-            gsa,
-            gsv,
-            rmc,
-            vtg,
-        } => {
-            assert!(gga);
-            assert!(!gll);
-            assert!(gsa);
-            assert!(!gsv);
-            assert!(rmc);
-            assert!(!vtg);
-        }
-        other => panic!("expected GpsSentences, got {other:?}"),
-    }
+fn parse_gs_response_mixed() -> TestResult {
+    let r = protocol::parse(b"GS 1,0,1,0,1,0")?;
+    let Response::GpsSentences {
+        gga,
+        gll,
+        gsa,
+        gsv,
+        rmc,
+        vtg,
+    } = r
+    else {
+        return Err(format!("expected GpsSentences, got {r:?}").into());
+    };
+    assert!(gga);
+    assert!(!gll);
+    assert!(gsa);
+    assert!(!gsv);
+    assert!(rmc);
+    assert!(!vtg);
+    Ok(())
 }
 
 // === Bluetooth (BT) ===
@@ -344,19 +365,23 @@ fn serialize_bt_write_off() {
 }
 
 #[test]
-fn parse_bt_response_enabled() {
-    match protocol::parse(b"BT 1").unwrap() {
-        Response::Bluetooth { enabled } => assert!(enabled),
-        other => panic!("expected Bluetooth, got {other:?}"),
-    }
+fn parse_bt_response_enabled() -> TestResult {
+    let r = protocol::parse(b"BT 1")?;
+    let Response::Bluetooth { enabled } = r else {
+        return Err(format!("expected Bluetooth, got {r:?}").into());
+    };
+    assert!(enabled);
+    Ok(())
 }
 
 #[test]
-fn parse_bt_response_disabled() {
-    match protocol::parse(b"BT 0").unwrap() {
-        Response::Bluetooth { enabled } => assert!(!enabled),
-        other => panic!("expected Bluetooth, got {other:?}"),
-    }
+fn parse_bt_response_disabled() -> TestResult {
+    let r = protocol::parse(b"BT 0")?;
+    let Response::Bluetooth { enabled } = r else {
+        return Err(format!("expected Bluetooth, got {r:?}").into());
+    };
+    assert!(!enabled);
+    Ok(())
 }
 
 // === SD (SD) ===
@@ -367,19 +392,23 @@ fn serialize_sd_read() {
 }
 
 #[test]
-fn parse_sd_response_present() {
-    match protocol::parse(b"SD 1").unwrap() {
-        Response::SdCard { present } => assert!(present),
-        other => panic!("expected SdCard, got {other:?}"),
-    }
+fn parse_sd_response_present() -> TestResult {
+    let r = protocol::parse(b"SD 1")?;
+    let Response::SdCard { present } = r else {
+        return Err(format!("expected SdCard, got {r:?}").into());
+    };
+    assert!(present);
+    Ok(())
 }
 
 #[test]
-fn parse_sd_response_absent() {
-    match protocol::parse(b"SD 0").unwrap() {
-        Response::SdCard { present } => assert!(!present),
-        other => panic!("expected SdCard, got {other:?}"),
-    }
+fn parse_sd_response_absent() -> TestResult {
+    let r = protocol::parse(b"SD 0")?;
+    let Response::SdCard { present } = r else {
+        return Err(format!("expected SdCard, got {r:?}").into());
+    };
+    assert!(!present);
+    Ok(())
 }
 
 // === User Settings (US) ===
@@ -390,9 +419,11 @@ fn serialize_us_read() {
 }
 
 #[test]
-fn parse_us_response() {
-    match protocol::parse(b"US 5").unwrap() {
-        Response::UserSettings { value } => assert_eq!(value, 5),
-        other => panic!("expected UserSettings, got {other:?}"),
-    }
+fn parse_us_response() -> TestResult {
+    let r = protocol::parse(b"US 5")?;
+    let Response::UserSettings { value } = r else {
+        return Err(format!("expected UserSettings, got {r:?}").into());
+    };
+    assert_eq!(value, 5);
+    Ok(())
 }

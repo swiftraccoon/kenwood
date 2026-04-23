@@ -304,11 +304,7 @@ impl<'a> SettingsAccess<'a> {
     #[must_use]
     pub fn raw(&self) -> Option<&[u8]> {
         let end = SETTINGS_OFFSET + SETTINGS_SIZE;
-        if end <= self.image.len() {
-            Some(&self.image[SETTINGS_OFFSET..end])
-        } else {
-            None
-        }
+        self.image.get(SETTINGS_OFFSET..end)
     }
 
     /// Get the power-on message (up to 16 characters).
@@ -335,11 +331,7 @@ impl<'a> SettingsAccess<'a> {
     #[must_use]
     pub fn callsign_raw(&self, len: usize) -> Option<&[u8]> {
         let end = CALLSIGN_OFFSET + len;
-        if end <= self.image.len() {
-            Some(&self.image[CALLSIGN_OFFSET..end])
-        } else {
-            None
-        }
+        self.image.get(CALLSIGN_OFFSET..end)
     }
 
     /// Read an arbitrary byte range from the settings region.
@@ -349,11 +341,7 @@ impl<'a> SettingsAccess<'a> {
     #[must_use]
     pub fn read_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
         let end = offset + len;
-        if end <= self.image.len() {
-            Some(&self.image[offset..end])
-        } else {
-            None
-        }
+        self.image.get(offset..end)
     }
 
     // -----------------------------------------------------------------------
@@ -1076,11 +1064,7 @@ impl<'a> SettingsAccess<'a> {
         }
         let offset = VFO_DATA_OFFSET + index * VFO_ENTRY_SIZE;
         let end = offset + VFO_ENTRY_SIZE;
-        if end <= self.image.len() {
-            Some(&self.image[offset..end])
-        } else {
-            None
-        }
+        self.image.get(offset..end)
     }
 
     /// Read the RX frequency from a VFO entry (0-5).
@@ -1096,12 +1080,15 @@ impl<'a> SettingsAccess<'a> {
         if raw.iter().all(|&b| b == 0xFF) {
             return None;
         }
+        // vfo_raw returns exactly VFO_ENTRY_SIZE bytes — destructure the freq prefix.
+        let &[b0, b1, b2, b3, ..] = raw else {
+            return None;
+        };
         // Check for zeroed entry.
-        if raw[..4].iter().all(|&b| b == 0x00) {
+        if b0 == 0 && b1 == 0 && b2 == 0 && b3 == 0 {
             return None;
         }
-        let freq = Frequency::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        Some(freq)
+        Some(Frequency::from_le_bytes([b0, b1, b2, b3]))
     }
 
     /// Read the operating mode from a VFO entry (0-5).
@@ -1117,7 +1104,7 @@ impl<'a> SettingsAccess<'a> {
         if raw.iter().all(|&b| b == 0xFF) {
             return None;
         }
-        let mode_bits = (raw[0x09] >> 4) & 0x07;
+        let mode_bits = (raw.get(0x09).copied()? >> 4) & 0x07;
         MemoryMode::try_from(mode_bits).ok()
     }
 
@@ -1133,8 +1120,10 @@ impl<'a> SettingsAccess<'a> {
         if raw.iter().all(|&b| b == 0xFF) {
             return None;
         }
-        let offset = Frequency::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-        Some(offset)
+        let &[_, _, _, _, b4, b5, b6, b7, ..] = raw else {
+            return None;
+        };
+        Some(Frequency::from_le_bytes([b4, b5, b6, b7]))
     }
 
     /// Get the number of non-empty VFO entries (out of 6).
@@ -1961,13 +1950,14 @@ impl<'a> SettingsWriter<'a> {
 
 /// Extract a null-terminated ASCII string from the image at a given offset.
 fn extract_string(image: &[u8], offset: usize, max_len: usize) -> String {
-    let end = offset + max_len;
-    if end > image.len() {
+    let Some(slice) = image.get(offset..offset + max_len) else {
         return String::new();
-    }
-    let slice = &image[offset..end];
+    };
     let nul = slice.iter().position(|&b| b == 0).unwrap_or(max_len);
-    String::from_utf8_lossy(&slice[..nul]).trim().to_string()
+    let Some(trimmed) = slice.get(..nul) else {
+        return String::new();
+    };
+    String::from_utf8_lossy(trimmed).trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1982,53 +1972,125 @@ mod tests {
         AltitudeRainUnit, AutoPowerOff, KeyLockType, Language, SpeedDistanceUnit, TemperatureUnit,
     };
 
-    fn make_settings_image() -> Vec<u8> {
-        let mut image = vec![0x00_u8; TOTAL_SIZE];
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-        // Write a power-on message at 0x11C0.
-        let msg = b"Hello D75!\0\0\0\0\0\0";
-        image[POWER_ON_MESSAGE_OFFSET..POWER_ON_MESSAGE_OFFSET + 16].copy_from_slice(msg);
+    /// Write a single byte into a mutable slice, returning an error if the offset is out of range.
+    /// Used by tests instead of direct `slice[idx] = val` (banned by workspace `indexing_slicing`).
+    fn set_byte(
+        image: &mut [u8],
+        offset: usize,
+        value: u8,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let img_len = image.len();
+        *image
+            .get_mut(offset)
+            .ok_or_else(|| format!("set_byte: offset {offset} out of range (len={img_len})"))? =
+            value;
+        Ok(())
+    }
 
-        // Write a model name at 0x11D0.
-        let model = b"TH-D75A\0\0\0\0\0\0\0\0\0";
-        image[MODEL_NAME_OFFSET..MODEL_NAME_OFFSET + 16].copy_from_slice(model);
-
+    /// Copy `data` into `image` starting at `offset`, returning an error if the range is out of bounds.
+    /// Used by tests instead of direct `slice[a..b].copy_from_slice(...)` (banned by `indexing_slicing`).
+    fn write_slice(
+        image: &mut [u8],
+        offset: usize,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let end = offset + data.len();
+        let img_len = image.len();
         image
+            .get_mut(offset..end)
+            .ok_or_else(|| {
+                format!("write_slice: range {offset}..{end} out of bounds (len={img_len})")
+            })?
+            .copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Fill `len` bytes in `image` starting at `offset` with `value`, returning an error if the range is out of bounds.
+    fn fill_range(
+        image: &mut [u8],
+        offset: usize,
+        len: usize,
+        value: u8,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let end = offset + len;
+        let img_len = image.len();
+        image
+            .get_mut(offset..end)
+            .ok_or_else(|| {
+                format!("fill_range: range {offset}..{end} out of bounds (len={img_len})")
+            })?
+            .fill(value);
+        Ok(())
+    }
+
+    /// Read a single byte from `image` at `offset`, returning an error if out of range.
+    /// Used by tests asserting raw bytes after writes.
+    fn get_byte(image: &[u8], offset: usize) -> Result<u8, Box<dyn std::error::Error>> {
+        image.get(offset).copied().ok_or_else(|| {
+            format!(
+                "get_byte: offset {offset} out of range (len={})",
+                image.len()
+            )
+            .into()
+        })
+    }
+
+    fn make_settings_image() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut image = vec![0x00_u8; TOTAL_SIZE];
+        write_slice(
+            &mut image,
+            POWER_ON_MESSAGE_OFFSET,
+            b"Hello D75!\0\0\0\0\0\0",
+        )?;
+        write_slice(&mut image, MODEL_NAME_OFFSET, b"TH-D75A\0\0\0\0\0\0\0\0\0")?;
+        Ok(image)
     }
 
     #[test]
-    fn settings_power_on_message() {
-        let image = make_settings_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_power_on_message() -> TestResult {
+        let image = make_settings_image()?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let settings = mi.settings();
         assert_eq!(settings.power_on_message(), "Hello D75!");
+        Ok(())
     }
 
     #[test]
-    fn settings_model_name() {
-        let image = make_settings_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_model_name() -> TestResult {
+        let image = make_settings_image()?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let settings = mi.settings();
         assert_eq!(settings.model_name(), "TH-D75A");
+        Ok(())
     }
 
     #[test]
-    fn settings_raw_not_none() {
-        let image = make_settings_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_raw_not_none() -> TestResult {
+        let image = make_settings_image()?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let settings = mi.settings();
-        let raw = settings.raw().unwrap();
+        let raw = settings
+            .raw()
+            .ok_or("settings raw slice unexpectedly None")?;
         assert_eq!(raw.len(), SETTINGS_SIZE);
+        Ok(())
     }
 
     #[test]
-    fn settings_read_bytes() {
-        let image = make_settings_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_read_bytes() -> TestResult {
+        let image = make_settings_image()?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let settings = mi.settings();
-        // Read the power-on message via raw bytes.
-        let bytes = settings.read_bytes(POWER_ON_MESSAGE_OFFSET, 10).unwrap();
-        assert_eq!(&bytes[..10], b"Hello D75!");
+        let bytes = settings
+            .read_bytes(POWER_ON_MESSAGE_OFFSET, 10)
+            .ok_or("read_bytes returned None for 10-byte power-on message")?;
+        assert_eq!(
+            bytes.get(..10).ok_or("read_bytes returned <10 bytes")?,
+            b"Hello D75!"
+        );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2036,115 +2098,129 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn settings_key_beep() {
-        let mut image = make_settings_image();
-        image[KEY_BEEP_OFFSET] = 1;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_key_beep() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, KEY_BEEP_OFFSET, 1)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.settings().key_beep());
+        Ok(())
     }
 
     #[test]
-    fn settings_key_beep_off() {
-        let image = make_settings_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_key_beep_off() -> TestResult {
+        let image = make_settings_image()?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.settings().key_beep());
+        Ok(())
     }
 
     #[test]
-    fn settings_vox() {
-        let mut image = make_settings_image();
-        image[VOX_ENABLED_OFFSET] = 1;
-        image[VOX_GAIN_OFFSET] = 7;
-        image[VOX_DELAY_OFFSET] = 5;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_vox() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, VOX_ENABLED_OFFSET, 1)?;
+        set_byte(&mut image, VOX_GAIN_OFFSET, 7)?;
+        set_byte(&mut image, VOX_DELAY_OFFSET, 5)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let settings = mi.settings();
         assert!(settings.vox_enabled());
         assert_eq!(settings.vox_gain(), 7);
         assert_eq!(settings.vox_delay(), 5);
+        Ok(())
     }
 
     #[test]
-    fn settings_lock() {
-        let mut image = make_settings_image();
-        image[LOCK_OFFSET] = 1;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_lock() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, LOCK_OFFSET, 1)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.settings().lock());
+        Ok(())
     }
 
     #[test]
-    fn settings_lock_off() {
-        let image = make_settings_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_lock_off() -> TestResult {
+        let image = make_settings_image()?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.settings().lock());
+        Ok(())
     }
 
     #[test]
-    fn settings_dual_band() {
-        let mut image = make_settings_image();
-        image[DUAL_BAND_OFFSET] = 1;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_dual_band() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, DUAL_BAND_OFFSET, 1)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.settings().dual_band());
+        Ok(())
     }
 
     #[test]
-    fn settings_dual_band_off() {
-        let image = make_settings_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_dual_band_off() -> TestResult {
+        let image = make_settings_image()?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.settings().dual_band());
+        Ok(())
     }
 
     #[test]
-    fn settings_attenuator_a() {
-        let mut image = make_settings_image();
-        image[ATTENUATOR_A_OFFSET] = 1;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_attenuator_a() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, ATTENUATOR_A_OFFSET, 1)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.settings().attenuator_a());
+        Ok(())
     }
 
     #[test]
-    fn settings_attenuator_a_off() {
-        let image = make_settings_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_attenuator_a_off() -> TestResult {
+        let image = make_settings_image()?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.settings().attenuator_a());
+        Ok(())
     }
 
     #[test]
-    fn settings_power_level_a() {
-        let mut image = make_settings_image();
-        image[POWER_LEVEL_A_OFFSET] = 2; // Lo
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_power_level_a() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, POWER_LEVEL_A_OFFSET, 2)?; // Lo
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().power_level_a(), PowerLevel::Low);
+        Ok(())
     }
 
     #[test]
-    fn settings_power_level_a_default() {
-        let image = make_settings_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_power_level_a_default() -> TestResult {
+        let image = make_settings_image()?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         // 0x00 maps to High.
         assert_eq!(mi.settings().power_level_a(), PowerLevel::High);
+        Ok(())
     }
 
     #[test]
-    fn settings_power_level_a_invalid_defaults_to_high() {
-        let mut image = make_settings_image();
-        image[POWER_LEVEL_A_OFFSET] = 0xFF;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_power_level_a_invalid_defaults_to_high() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, POWER_LEVEL_A_OFFSET, 0xFF)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().power_level_a(), PowerLevel::High);
+        Ok(())
     }
 
     #[test]
-    fn settings_bluetooth() {
-        let mut image = make_settings_image();
-        image[BLUETOOTH_OFFSET] = 1;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_bluetooth() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, BLUETOOTH_OFFSET, 1)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.settings().bluetooth());
+        Ok(())
     }
 
     #[test]
-    fn settings_bluetooth_off() {
-        let image = make_settings_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_bluetooth_off() -> TestResult {
+        let image = make_settings_image()?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.settings().bluetooth());
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2152,99 +2228,110 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn settings_beep_volume() {
-        let mut image = make_settings_image();
-        image[BEEP_VOLUME_OFFSET] = 5;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_beep_volume() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, BEEP_VOLUME_OFFSET, 5)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().beep_volume(), 5);
+        Ok(())
     }
 
     #[test]
-    fn settings_beep_volume_clamped() {
-        let mut image = make_settings_image();
-        image[BEEP_VOLUME_OFFSET] = 0xFF;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_beep_volume_clamped() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, BEEP_VOLUME_OFFSET, 0xFF)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().beep_volume(), 7);
+        Ok(())
     }
 
     #[test]
-    fn settings_backlight() {
-        let mut image = make_settings_image();
-        image[BACKLIGHT_CONTROL_OFFSET] = 4;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_backlight() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, BACKLIGHT_CONTROL_OFFSET, 4)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().backlight(), 4);
+        Ok(())
     }
 
     #[test]
-    fn settings_auto_power_off() {
-        let mut image = make_settings_image();
-        image[AUTO_POWER_OFF_OFFSET] = 2;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_auto_power_off() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, AUTO_POWER_OFF_OFFSET, 2)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().auto_power_off(), AutoPowerOff::Min60);
+        Ok(())
     }
 
     #[test]
-    fn settings_auto_power_off_unknown_defaults_to_off() {
-        let mut image = make_settings_image();
-        image[AUTO_POWER_OFF_OFFSET] = 0xFF;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_auto_power_off_unknown_defaults_to_off() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, AUTO_POWER_OFF_OFFSET, 0xFF)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().auto_power_off(), AutoPowerOff::Off);
+        Ok(())
     }
 
     #[test]
-    fn settings_battery_saver() {
-        let mut image = make_settings_image();
-        image[BATTERY_SAVER_OFFSET] = 1;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_battery_saver() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, BATTERY_SAVER_OFFSET, 1)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.settings().battery_saver());
+        Ok(())
     }
 
     #[test]
-    fn settings_key_lock_type() {
-        let mut image = make_settings_image();
-        image[KEY_LOCK_TYPE_OFFSET] = 2;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_key_lock_type() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, KEY_LOCK_TYPE_OFFSET, 2)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().key_lock_type(), KeyLockType::KeyPttAndDial);
+        Ok(())
     }
 
     #[test]
-    fn settings_display_units() {
-        let mut image = make_settings_image();
-        image[SPEED_DISTANCE_UNIT_OFFSET] = 1; // km/h
-        image[ALTITUDE_RAIN_UNIT_OFFSET] = 1; // m/mm
-        image[TEMPERATURE_UNIT_OFFSET] = 1; // Celsius
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_display_units() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, SPEED_DISTANCE_UNIT_OFFSET, 1)?; // km/h
+        set_byte(&mut image, ALTITUDE_RAIN_UNIT_OFFSET, 1)?; // m/mm
+        set_byte(&mut image, TEMPERATURE_UNIT_OFFSET, 1)?; // Celsius
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let units = mi.settings().display_units();
         assert_eq!(units.speed_distance, SpeedDistanceUnit::KilometersPerHour);
         assert_eq!(units.altitude_rain, AltitudeRainUnit::MetersMm);
         assert_eq!(units.temperature, TemperatureUnit::Celsius);
+        Ok(())
     }
 
     #[test]
-    fn settings_language() {
-        let mut image = make_settings_image();
-        image[LANGUAGE_OFFSET] = 1;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_language() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, LANGUAGE_OFFSET, 1)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().language(), Language::Japanese);
+        Ok(())
     }
 
     #[test]
-    fn settings_squelch() {
-        let mut image = make_settings_image();
-        image[SQUELCH_A_OFFSET] = 3;
-        image[SQUELCH_B_OFFSET] = 4;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_squelch() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, SQUELCH_A_OFFSET, 3)?;
+        set_byte(&mut image, SQUELCH_B_OFFSET, 4)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let settings = mi.settings();
         assert_eq!(settings.squelch_a(), 3);
         assert_eq!(settings.squelch_b(), 4);
+        Ok(())
     }
 
     #[test]
-    fn settings_squelch_clamped() {
-        let mut image = make_settings_image();
-        image[SQUELCH_A_OFFSET] = 0xFF;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn settings_squelch_clamped() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, SQUELCH_A_OFFSET, 0xFF)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().squelch_a(), 6);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2252,103 +2339,112 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn write_key_beep() {
-        let image = make_settings_image();
-        let mut mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn write_key_beep() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.settings().key_beep());
         mi.settings_mut().set_key_beep(true);
         assert!(mi.settings().key_beep());
         mi.settings_mut().set_key_beep(false);
         assert!(!mi.settings().key_beep());
+        Ok(())
     }
 
     #[test]
-    fn write_vox_enabled() {
-        let image = make_settings_image();
-        let mut mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn write_vox_enabled() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.settings().vox_enabled());
         mi.settings_mut().set_vox_enabled(true);
         assert!(mi.settings().vox_enabled());
         mi.settings_mut().set_vox_enabled(false);
         assert!(!mi.settings().vox_enabled());
+        Ok(())
     }
 
     #[test]
-    fn write_vox_gain() {
-        let image = make_settings_image();
-        let mut mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn write_vox_gain() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
         mi.settings_mut().set_vox_gain(7);
         assert_eq!(mi.settings().vox_gain(), 7);
+        Ok(())
     }
 
     #[test]
-    fn write_vox_gain_clamped() {
-        let image = make_settings_image();
-        let mut mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn write_vox_gain_clamped() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
         mi.settings_mut().set_vox_gain(0xFF);
         assert_eq!(mi.settings().vox_gain(), 9);
+        Ok(())
     }
 
     #[test]
-    fn write_lock() {
-        let image = make_settings_image();
-        let mut mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn write_lock() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.settings().lock());
         mi.settings_mut().set_lock(true);
         assert!(mi.settings().lock());
         mi.settings_mut().set_lock(false);
         assert!(!mi.settings().lock());
+        Ok(())
     }
 
     #[test]
-    fn write_dual_band() {
-        let image = make_settings_image();
-        let mut mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn write_dual_band() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.settings().dual_band());
         mi.settings_mut().set_dual_band(true);
         assert!(mi.settings().dual_band());
         mi.settings_mut().set_dual_band(false);
         assert!(!mi.settings().dual_band());
+        Ok(())
     }
 
     #[test]
-    fn write_attenuator_a() {
-        let image = make_settings_image();
-        let mut mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn write_attenuator_a() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.settings().attenuator_a());
         mi.settings_mut().set_attenuator_a(true);
         assert!(mi.settings().attenuator_a());
         mi.settings_mut().set_attenuator_a(false);
         assert!(!mi.settings().attenuator_a());
+        Ok(())
     }
 
     #[test]
-    fn write_power_level_a() {
-        let image = make_settings_image();
-        let mut mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn write_power_level_a() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
         mi.settings_mut().set_power_level_a(PowerLevel::Low);
         assert_eq!(mi.settings().power_level_a(), PowerLevel::Low);
         mi.settings_mut().set_power_level_a(PowerLevel::ExtraLow);
         assert_eq!(mi.settings().power_level_a(), PowerLevel::ExtraLow);
         mi.settings_mut().set_power_level_a(PowerLevel::High);
         assert_eq!(mi.settings().power_level_a(), PowerLevel::High);
+        Ok(())
     }
 
     #[test]
-    fn write_bluetooth() {
-        let image = make_settings_image();
-        let mut mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn write_bluetooth() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.settings().bluetooth());
         mi.settings_mut().set_bluetooth(true);
         assert!(mi.settings().bluetooth());
         mi.settings_mut().set_bluetooth(false);
         assert!(!mi.settings().bluetooth());
+        Ok(())
     }
 
     #[test]
-    fn write_roundtrip_all_verified() {
-        let image = make_settings_image();
-        let mut mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn write_roundtrip_all_verified() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
 
         // Set everything to non-default values.
         mi.settings_mut().set_key_beep(true);
@@ -2373,14 +2469,15 @@ mod tests {
 
         // Verify raw bytes at the verified offsets.
         let raw = mi.as_raw();
-        assert_eq!(raw[KEY_BEEP_OFFSET], 1);
-        assert_eq!(raw[VOX_ENABLED_OFFSET], 1);
-        assert_eq!(raw[VOX_GAIN_OFFSET], 9);
-        assert_eq!(raw[LOCK_OFFSET], 1);
-        assert_eq!(raw[DUAL_BAND_OFFSET], 1);
-        assert_eq!(raw[ATTENUATOR_A_OFFSET], 1);
-        assert_eq!(raw[POWER_LEVEL_A_OFFSET], 3); // ExtraLow = 3
-        assert_eq!(raw[BLUETOOTH_OFFSET], 1);
+        assert_eq!(get_byte(raw, KEY_BEEP_OFFSET)?, 1);
+        assert_eq!(get_byte(raw, VOX_ENABLED_OFFSET)?, 1);
+        assert_eq!(get_byte(raw, VOX_GAIN_OFFSET)?, 9);
+        assert_eq!(get_byte(raw, LOCK_OFFSET)?, 1);
+        assert_eq!(get_byte(raw, DUAL_BAND_OFFSET)?, 1);
+        assert_eq!(get_byte(raw, ATTENUATOR_A_OFFSET)?, 1);
+        assert_eq!(get_byte(raw, POWER_LEVEL_A_OFFSET)?, 3); // ExtraLow = 3
+        assert_eq!(get_byte(raw, BLUETOOTH_OFFSET)?, 1);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2388,138 +2485,172 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn vfo_raw_accessible() {
-        let mut image = make_settings_image();
+    fn vfo_raw_accessible() -> TestResult {
+        let mut image = make_settings_image()?;
         // Write a known pattern at VFO entry 0.
-        image[VFO_DATA_OFFSET..VFO_DATA_OFFSET + 4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        write_slice(&mut image, VFO_DATA_OFFSET, &[0xDE, 0xAD, 0xBE, 0xEF])?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let settings = mi.settings();
-        let raw = settings.vfo_raw(0).unwrap();
+        let raw = settings.vfo_raw(0).ok_or("vfo_raw(0) returned None")?;
         assert_eq!(raw.len(), VFO_ENTRY_SIZE);
-        assert_eq!(&raw[..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            raw.get(..4).ok_or("vfo_raw too short")?,
+            &[0xDE, 0xAD, 0xBE, 0xEF]
+        );
+        Ok(())
     }
 
     #[test]
-    fn vfo_raw_out_of_range() {
-        let image = make_settings_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn vfo_raw_out_of_range() -> TestResult {
+        let image = make_settings_image()?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.settings().vfo_raw(6).is_none());
+        Ok(())
     }
 
     #[test]
-    fn vfo_frequency_valid() {
-        let mut image = make_settings_image();
+    fn vfo_frequency_valid() -> TestResult {
+        let mut image = make_settings_image()?;
         // VFO entry 0 at offset 0x0020: 146.520 MHz.
         let freq: u32 = 146_520_000;
         let offset = VFO_DATA_OFFSET;
-        image[offset..offset + 4].copy_from_slice(&freq.to_le_bytes());
+        write_slice(&mut image, offset, &freq.to_le_bytes())?;
         // Make the entry non-zero past the frequency.
-        image[offset + 8] = 0x50; // step/shift byte
+        set_byte(&mut image, offset + 8, 0x50)?; // step/shift byte
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
-        let f = mi.settings().vfo_frequency(0).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        let f = mi
+            .settings()
+            .vfo_frequency(0)
+            .ok_or("vfo_frequency(0) returned None")?;
         assert_eq!(f.as_hz(), 146_520_000);
+        Ok(())
     }
 
     #[test]
-    fn vfo_frequency_empty_entry() {
-        let mut image = make_settings_image();
+    fn vfo_frequency_empty_entry() -> TestResult {
+        let mut image = make_settings_image()?;
         // Fill VFO entry 0 with 0xFF (empty).
-        let offset = VFO_DATA_OFFSET;
-        image[offset..offset + VFO_ENTRY_SIZE].fill(0xFF);
+        fill_range(&mut image, VFO_DATA_OFFSET, VFO_ENTRY_SIZE, 0xFF)?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.settings().vfo_frequency(0).is_none());
+        Ok(())
     }
 
     #[test]
-    fn vfo_frequency_zeroed_entry() {
-        let image = make_settings_image(); // All zeros.
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn vfo_frequency_zeroed_entry() -> TestResult {
+        let image = make_settings_image()?; // All zeros.
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         // Frequency bytes are all zero -> returns None.
         assert!(mi.settings().vfo_frequency(0).is_none());
+        Ok(())
     }
 
     #[test]
-    fn vfo_mode_fm() {
-        let mut image = make_settings_image();
+    fn vfo_mode_fm() -> TestResult {
+        let mut image = make_settings_image()?;
         let offset = VFO_DATA_OFFSET;
         // Non-empty entry with some frequency data.
-        image[offset..offset + 4].copy_from_slice(&146_520_000_u32.to_le_bytes());
+        write_slice(&mut image, offset, &146_520_000_u32.to_le_bytes())?;
         // Byte 0x09: mode bits [6:4] = 0 (FM).
-        image[offset + 0x09] = 0x00;
+        set_byte(&mut image, offset + 0x09, 0x00)?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
-        let mode = mi.settings().vfo_mode(0).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        let mode = mi
+            .settings()
+            .vfo_mode(0)
+            .ok_or("vfo_mode(0) returned None")?;
         assert_eq!(mode, MemoryMode::Fm);
+        Ok(())
     }
 
     #[test]
-    fn vfo_mode_am() {
-        let mut image = make_settings_image();
+    fn vfo_mode_am() -> TestResult {
+        let mut image = make_settings_image()?;
         let offset = VFO_DATA_OFFSET;
-        image[offset..offset + 4].copy_from_slice(&7_100_000_u32.to_le_bytes());
+        write_slice(&mut image, offset, &7_100_000_u32.to_le_bytes())?;
         // Byte 0x09: mode bits [6:4] = 2 (AM in flash encoding).
-        image[offset + 0x09] = 0x20;
+        set_byte(&mut image, offset + 0x09, 0x20)?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
-        let mode = mi.settings().vfo_mode(0).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        let mode = mi
+            .settings()
+            .vfo_mode(0)
+            .ok_or("vfo_mode(0) returned None")?;
         assert_eq!(mode, MemoryMode::Am);
+        Ok(())
     }
 
     #[test]
-    fn vfo_mode_lsb() {
-        let mut image = make_settings_image();
+    fn vfo_mode_lsb() -> TestResult {
+        let mut image = make_settings_image()?;
         let offset = VFO_DATA_OFFSET;
-        image[offset..offset + 4].copy_from_slice(&7_100_000_u32.to_le_bytes());
+        write_slice(&mut image, offset, &7_100_000_u32.to_le_bytes())?;
         // Byte 0x09: mode bits [6:4] = 3 (LSB in flash encoding).
-        image[offset + 0x09] = 0x30;
+        set_byte(&mut image, offset + 0x09, 0x30)?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
-        let mode = mi.settings().vfo_mode(0).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        let mode = mi
+            .settings()
+            .vfo_mode(0)
+            .ok_or("vfo_mode(0) returned None")?;
         assert_eq!(mode, MemoryMode::Lsb);
+        Ok(())
     }
 
     #[test]
-    fn vfo_tx_offset() {
-        let mut image = make_settings_image();
+    fn vfo_tx_offset() -> TestResult {
+        let mut image = make_settings_image()?;
         let offset = VFO_DATA_OFFSET;
-        image[offset..offset + 4].copy_from_slice(&146_520_000_u32.to_le_bytes());
-        image[offset + 4..offset + 8].copy_from_slice(&600_000_u32.to_le_bytes());
+        write_slice(&mut image, offset, &146_520_000_u32.to_le_bytes())?;
+        write_slice(&mut image, offset + 4, &600_000_u32.to_le_bytes())?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
-        let tx_off = mi.settings().vfo_tx_offset(0).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        let tx_off = mi
+            .settings()
+            .vfo_tx_offset(0)
+            .ok_or("vfo_tx_offset(0) returned None")?;
         assert_eq!(tx_off.as_hz(), 600_000);
+        Ok(())
     }
 
     #[test]
-    fn vfo_count_none_populated() {
-        let image = make_settings_image(); // All zeros.
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+    fn vfo_count_none_populated() -> TestResult {
+        let image = make_settings_image()?; // All zeros.
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().vfo_count(), 0);
+        Ok(())
     }
 
     #[test]
-    fn vfo_count_with_entries() {
-        let mut image = make_settings_image();
+    fn vfo_count_with_entries() -> TestResult {
+        let mut image = make_settings_image()?;
         // Populate VFO entries 0 and 2.
-        let offset0 = VFO_DATA_OFFSET;
-        image[offset0..offset0 + 4].copy_from_slice(&146_520_000_u32.to_le_bytes());
-        let offset2 = VFO_DATA_OFFSET + 2 * VFO_ENTRY_SIZE;
-        image[offset2..offset2 + 4].copy_from_slice(&446_000_000_u32.to_le_bytes());
+        write_slice(&mut image, VFO_DATA_OFFSET, &146_520_000_u32.to_le_bytes())?;
+        write_slice(
+            &mut image,
+            VFO_DATA_OFFSET + 2 * VFO_ENTRY_SIZE,
+            &446_000_000_u32.to_le_bytes(),
+        )?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().vfo_count(), 2);
+        Ok(())
     }
 
     #[test]
-    fn vfo_second_entry_frequency() {
-        let mut image = make_settings_image();
+    fn vfo_second_entry_frequency() -> TestResult {
+        let mut image = make_settings_image()?;
         let offset = VFO_DATA_OFFSET + VFO_ENTRY_SIZE; // Entry 1.
-        image[offset..offset + 4].copy_from_slice(&222_100_000_u32.to_le_bytes());
+        write_slice(&mut image, offset, &222_100_000_u32.to_le_bytes())?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
-        let f = mi.settings().vfo_frequency(1).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        let f = mi
+            .settings()
+            .vfo_frequency(1)
+            .ok_or("vfo_frequency(1) returned None")?;
         assert_eq!(f.as_hz(), 222_100_000);
+        Ok(())
     }
 }

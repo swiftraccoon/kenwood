@@ -62,6 +62,12 @@ pub(crate) fn render_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Channel detail view renders every MCP channel field (frequency, offset, \
+              shift, tone, CTCSS, DCS, etc.) inline as Ratatui spans. Splitting per-field \
+              helpers would obscure the channel memory layout that this view visualizes."
+)]
 pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()
         .title(" Detail ")

@@ -18,19 +18,33 @@
 // The trace must include `prev_log2Ml` / `prev_L` lines (added via
 // `#define private public` access to `ambe_encoder::prev_mp`).
 
-#![allow(
+#![expect(
     clippy::print_stdout,
     clippy::print_stderr,
     clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation,
     clippy::uninlined_format_args,
     clippy::collapsible_if,
     clippy::cast_lossless,
     clippy::too_many_lines,
+    clippy::expect_used,
+    clippy::indexing_slicing,
     dead_code,
-    missing_docs
+    missing_docs,
+    reason = "Stages 5-8 quantize A/B harness (OP25 trace -> Rust-port match rates). \
+              Prints diagnostics; DSP precision casts are unavoidable in the PRBA/HOC \
+              codebook search. `.expect()` is used on trace-parse results because this \
+              is validation scratchwork — a malformed fixture should abort the example \
+              with a specific message rather than propagating errors through a \
+              library-shaped API. `clippy::indexing_slicing` fires on direct indexing \
+              into the parsed-trace fixed-size arrays (`b[0..8]`, `prev_mp.log2_ml[0..56]`, \
+              etc.) — bounds are IMBE-spec constants enforced at trace parse time."
 )]
+
+// Dev-dependencies pulled in by sibling tests/examples. Acknowledge them here so
+// `unused_crate_dependencies` stays silent for this compilation unit.
+use proptest as _;
+use realfft as _;
+use wide as _;
 
 use mbelib_rs::validation::{PrevFrameState, quantize};
 use mbelib_rs::{MAX_BANDS, MAX_HARMONICS, PitchEstimate, SpectralAmplitudes, VuvDecisions};
@@ -166,7 +180,11 @@ fn amps_from_op25(sa: &[i32], num_harms: usize) -> SpectralAmplitudes {
         // then multiplies by SA_SCALE=32768 then `log2` — but OP25 is
         // already at the int16 scale (log2 ready), so divide first so
         // the round-trip through `sa * SA_SCALE` lands at OP25's value.
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "OP25 sa values are int16-scaled (~0..32767); i32-to-f32 cast is \
+                      exact within int16 range where real values land."
+        )]
         let f = v as f32 / 32768.0;
         magnitudes[i] = f;
     }

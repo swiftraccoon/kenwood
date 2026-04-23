@@ -23,6 +23,15 @@
 //!   harmonic log-spectral amplitudes.
 //! - **`b3..b8` (spectral envelope):** block-DCT on the prediction
 //!   residual `T = lsa - 0.65·interp(prev_log2_ml)`; assemble R
+#![expect(
+    clippy::indexing_slicing,
+    reason = "Parameter quantization: indices into fixed-size AMBE codebooks \
+              (W0_TABLE=128, L_TABLE=56, VUV_TABLE=16 rows × L bands, DG_TABLE=64, \
+              HOC_B*_TABLE variable) and per-band sub-arrays of SA/log-amplitudes \
+              (bounded by L_TABLE[b0] <= 56). All ranges are IMBE-spec invariants \
+              enforced by the analysis stage. A `.get()?` rewrite would add unwrap \
+              noise to every codebook lookup."
+)]
 //!   pairs from block DC + first AC coefficients; inverse 8-pt DCT
 //!   → G[8]; PRBA24 / PRBA58 codebook search (b3, b4); per-block
 //!   HOC codebook search (b5..b8). `b8` uses stride-2 search —
@@ -273,10 +282,6 @@ pub fn quantize(
     }
 
     // b3 (9 bits, u16 because it's 0..=511).
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "low-bit mask; always 0 or 1"
-    )]
     {
         write_bit(&mut out, 10, ((b3 >> 8) & 1) as u8);
         write_bit(&mut out, 11, ((b3 >> 7) & 1) as u8);
@@ -371,9 +376,10 @@ fn compute_lsa(b0: u8, vuv: &VuvDecisions, amps: &SpectralAmplitudes) -> [f32; 5
     if amps.num_harmonics == 0 {
         return lsa;
     }
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
-        reason = "num_harmonics ≤ 56, well inside f32 mantissa"
+        reason = "num_harmonics is bounded by MAX_HARMONICS (56) per the AMBE 3600x2400 \
+                  spec; the usize-to-f32 cast is exact within the f32 mantissa (24 bits)."
     )]
     let num_harms_f = amps.num_harmonics as f32;
     let log_l_2 = 0.5 * num_harms_f.log2();
@@ -439,9 +445,10 @@ fn compute_spectral_residuals(lsa: &[f32; 57], n: usize, prev: &PrevFrameState) 
     // rate observed before this fix.
     let mut prev_log2_ml = prev.log2_ml;
     prev_log2_ml[0] = prev_log2_ml[1];
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
-        reason = "L values bounded by 56 (MAX_BANDS)"
+        reason = "Band-ratio interpolation for DCT inputs. prev.l and n are both bounded by \
+                  MAX_BANDS (56); casts from usize to f32 are exact in the f32 mantissa."
     )]
     let l_prev_l = if n == 0 {
         0.0
@@ -449,15 +456,24 @@ fn compute_spectral_residuals(lsa: &[f32; 57], n: usize, prev: &PrevFrameState) 
         prev.l as f32 / n as f32
     };
     for i in 0..n {
-        #[allow(clippy::cast_precision_loss, reason = "i bounded by 56")]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "i is bounded by n (<= MAX_HARMONICS 56); usize-to-f32 cast is exact."
+        )]
         let kl = l_prev_l * (i + 1) as f32;
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "kl is positive; truncation is the intended floor"
+            reason = "kl is non-negative (product of non-negative terms); f32-to-usize \
+                      cast performs the intended floor, and the result is clamped to \
+                      prev_log2_ml bounds below via `.min(56)`."
         )]
         let kl_floor = kl as usize;
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "kl_floor is bounded by the same interpolation index, <= 56 — well \
+                      within f32 mantissa precision."
+        )]
         let kl_frac = kl - kl_floor as f32;
         let p0 = *prev_log2_ml.get(kl_floor.min(56)).unwrap_or(&0.0);
         let p1 = *prev_log2_ml.get((kl_floor + 1).min(56)).unwrap_or(&0.0);
@@ -497,10 +513,12 @@ fn quantize_pitch(pitch: PitchEstimate, target_l: usize) -> u8 {
     // valid index range inside `pitch_index`, which is the
     // least-bad fallback — the caller should have silenced the
     // frame if the pitch were that far out.
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "period ∈ (0, 256) for valid pitches; multiplying by 256 keeps it in u32 range"
+        reason = "Pitch period conversion to Q8.8 fixed-point (OP25's ref_pitch format): \
+                  valid periods are in (0, 256) samples, so `period * 256` stays well within \
+                  u32 range; the `.max(0.0)` clamp makes the sign-loss cast safe."
     )]
     let ref_pitch_q8_8 = (pitch.period_samples * 256.0).round().max(0.0) as u32;
     crate::encode::pitch_quant::pitch_index(ref_pitch_q8_8, target_l, &tables::L_TABLE)
@@ -545,11 +563,15 @@ fn quantize_vuv(pitch: &PitchEstimate, vuv: &VuvDecisions, amps: &SpectralAmplit
     for (idx, row) in tables::VUV_TABLE.iter().enumerate() {
         let mut en = 0.0_f32;
         for l in 1..=amps.num_harmonics {
-            #[allow(
+            #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
                 clippy::cast_precision_loss,
-                reason = "l ≤ 56, 16*w0*l small-positive, floor-to-usize is intentional"
+                reason = "VUV slot mapping: `l` is bounded by MAX_HARMONICS (56) and w0 is \
+                          the normalized fundamental in [0, 0.5), so `16*w0*l` stays under \
+                          ~28; the floor cast to usize is intentional (`jl` indexes the \
+                          8-slot VUV row), and precision loss at these magnitudes is \
+                          negligible."
             )]
             let jl = ((l as f32) * 16.0 * w0) as usize;
             let row_slot = row.get(jl.min(7)).copied().unwrap_or(0) == 1;
@@ -567,7 +589,10 @@ fn quantize_vuv(pitch: &PitchEstimate, vuv: &VuvDecisions, amps: &SpectralAmplit
         }
         if en < best_en {
             best_en = en;
-            #[allow(clippy::cast_possible_truncation, reason = "VUV_TABLE has 16 rows")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "VUV_TABLE has 16 rows so idx is always 0..=15, fitting safely in u8."
+            )]
             {
                 best_idx = idx as u8;
             }
@@ -649,7 +674,10 @@ fn quantize_gain(pitch: &PitchEstimate, vuv: &VuvDecisions, amps: &SpectralAmpli
         let err = (v - gain).abs();
         if err < best_err {
             best_err = err;
-            #[allow(clippy::cast_possible_truncation, reason = "DG_TABLE has 64 entries")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "DG_TABLE has 64 entries so idx is always 0..=63, fitting safely in u8."
+            )]
             {
                 best_idx = idx as u8;
             }
@@ -669,9 +697,10 @@ fn compute_gain_from_amps(
     if amps.num_harmonics == 0 {
         return 0.0;
     }
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
-        reason = "num_harmonics ≤ 56, well inside f32 mantissa"
+        reason = "num_harmonics is bounded by MAX_HARMONICS (56) per the AMBE 3600x2400 \
+                  spec; the usize-to-f32 cast is exact within the f32 mantissa (24 bits)."
     )]
     let num_harms_f = amps.num_harmonics as f32;
     let log_l_2 = 0.5 * num_harms_f.log2();
@@ -720,13 +749,18 @@ struct QuantizedSpectrum {
 ///    Ri pairs per the decoder's reconstruction formulas.
 /// 5. Inverse 8-point DCT of Ri → Gm\[1..=8\] for PRBA codebooks.
 /// 6. Remaining Cik\[blk\]\[3..\] coefficients → HOC codebooks.
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
-    reason = "all indices bounded by Ji (max 17) or PRBA_BLOCKS (8); safe for f32"
+    reason = "Spectral quantization DCT/IDCT loops: all usize-to-f32 casts are of indices \
+              bounded by Ji (<= 17 per block) or the PRBA_BLOCKS constant (8). These tiny \
+              magnitudes are exact within f32 mantissa precision."
 )]
-#[allow(
+#[expect(
     clippy::too_many_lines,
-    reason = "Linear top-to-bottom pipeline; splitting obscures the data flow."
+    reason = "Linear top-to-bottom pipeline covering LMPRBL block partition, per-block DCT, \
+              PRBA codebook lookup, and HOC codebook lookup. Splitting further obscures the \
+              data flow — OP25's `ambe_encoder.cc::encode_envelope()` is structured the same \
+              way."
 )]
 fn quantize_spectrum(t_residuals: &[f32; 57], n: usize) -> QuantizedSpectrum {
     let zero = QuantizedSpectrum {
@@ -913,9 +947,10 @@ fn lookup_ji(big_l: usize) -> [usize; IDCT_BLOCKS + 1] {
     let row = tables::LMPRBL_TABLE.get(big_l);
     for idx in 0..IDCT_BLOCKS {
         if let Some(slot) = ji.get_mut(idx + 1) {
-            #[allow(
+            #[expect(
                 clippy::cast_sign_loss,
-                reason = "LMPRBL_TABLE values are always 2..=17"
+                reason = "LMPRBL_TABLE values are i32 but always in 2..=17 (per-block \
+                          harmonic counts), so the sign-loss i32-to-usize cast is safe."
             )]
             {
                 *slot = row.and_then(|r| r.get(idx)).copied().unwrap_or(0) as usize;
@@ -938,9 +973,10 @@ fn lookup_ji(big_l: usize) -> [usize; IDCT_BLOCKS + 1] {
 ///
 /// The other HOC tables (`B5`/`B6`/`B7`) are 16 rows × 4 bits — the
 /// full index range is addressable, so they use `stride == 1`.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
-    reason = "HOC tables have at most 16 entries; idx fits in u8"
+    reason = "HOC codebook search: every HOC_B5/B6/B7/B8_TABLE has at most 16 entries, so \
+              `idx` is always in 0..=15 and fits trivially in u8."
 )]
 fn nearest_hoc(table: &[[f32; 4]], target: &[f32; 4], dims: usize, stride: usize) -> u8 {
     debug_assert!(stride == 1 || stride == 2, "stride must be 1 or 2");
@@ -990,9 +1026,10 @@ fn nearest_hoc(table: &[[f32; 4]], target: &[f32; 4], dims: usize, stride: usize
 /// doubled it again, and the reconstructed `Ri` AC terms arrived at
 /// the synthesis with a 4× boost — audibly a "loud but not-voice"
 /// spectrum envelope.
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
-    reason = "all indices bounded by PRBA_BLOCKS=8; well within f32 mantissa"
+    reason = "Inverse 8-point DCT: loop indices `m` and `i` are both bounded by \
+              PRBA_BLOCKS (8); usize-to-f32 casts at these tiny magnitudes are exact."
 )]
 fn inverse_dct_8(ri: &[f32; PRBA_BLOCKS + 1]) -> [f32; PRBA_BLOCKS + 1] {
     let mut gm = [0.0_f32; PRBA_BLOCKS + 1];
@@ -1009,9 +1046,10 @@ fn inverse_dct_8(ri: &[f32; PRBA_BLOCKS + 1]) -> [f32; PRBA_BLOCKS + 1] {
 }
 
 /// Nearest-neighbor search against `PRBA24_TABLE` (3-D, 512 entries).
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
-    reason = "PRBA24_TABLE has 512 entries; idx fits in u16"
+    reason = "PRBA24 codebook search: PRBA24_TABLE has 512 entries so idx is always \
+              0..=511, fitting safely in u16."
 )]
 fn nearest_prba24(target: &[f32; 3]) -> u16 {
     let mut best_idx: u16 = 0;
@@ -1031,9 +1069,10 @@ fn nearest_prba24(target: &[f32; 3]) -> u16 {
 }
 
 /// Nearest-neighbor search against `PRBA58_TABLE` (4-D, 128 entries).
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
-    reason = "PRBA58_TABLE has 128 entries; idx fits in u8"
+    reason = "PRBA58 codebook search: PRBA58_TABLE has 128 entries so idx is always \
+              0..=127, fitting safely in u8."
 )]
 fn nearest_prba58(target: &[f32; 4]) -> u8 {
     let mut best_idx: u8 = 0;
@@ -1130,15 +1169,24 @@ mod tests {
         // decoder's (j-0.5) with j=1..=N.
         let mut cik = [0.0_f32; 12];
         for (k_idx, cik_slot) in cik.iter_mut().enumerate().take(n) {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test DCT: n = 12, k_idx < n; usize-to-f32 cast is exact."
+            )]
             let step = std::f32::consts::PI * k_idx as f32 / n as f32;
             let mut sum = 0.0_f32;
             for (j_idx, &v) in log_m_in.iter().enumerate().take(n) {
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test DCT: j_idx < n = 12; usize-to-f32 cast is exact."
+                )]
                 let angle = step * (j_idx as f32 + 0.5);
                 sum += v * angle.cos();
             }
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test DCT: n = 12; usize-to-f32 cast is exact."
+            )]
             {
                 *cik_slot = sum / n as f32;
             }
@@ -1147,12 +1195,18 @@ mod tests {
         // Decoder inverse: Tl[l] = Σ_k ak · Cik[k] · cos(π·(k−1)·(l−0.5)/N).
         let mut tl = [0.0_f32; 12];
         for (l_minus_1, tl_slot) in tl.iter_mut().enumerate().take(n) {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test inverse DCT: n = 12, l_minus_1 < n; cast is exact."
+            )]
             let step = std::f32::consts::PI * (l_minus_1 as f32 + 0.5) / n as f32;
             let mut sum = 0.0_f32;
             for (k_idx, &c) in cik.iter().enumerate().take(n) {
                 let ak: f32 = if k_idx == 0 { 1.0 } else { 2.0 };
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test inverse DCT: k_idx < n = 12; cast is exact."
+                )]
                 let angle = step * k_idx as f32;
                 sum += ak * c * angle.cos();
             }
@@ -1190,11 +1244,17 @@ mod tests {
         // to the decode module.
         let mut ri = [0.0_f32; 9];
         for (i, ri_slot) in ri.iter_mut().enumerate().take(9).skip(1) {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test forward DCT: i < 9; usize-to-f32 cast is exact."
+            )]
             let step = std::f32::consts::PI * (i as f32 - 0.5) / 8.0;
             let mut sum = 0.0_f32;
             for (m, &gm_val) in gm_in.iter().enumerate().take(9).skip(1) {
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test forward DCT: m < 9; usize-to-f32 cast is exact."
+                )]
                 let angle = step * (m as f32 - 1.0);
                 let am: f32 = if m == 1 { 1.0 } else { 2.0 };
                 sum += am * gm_val * angle.cos();
@@ -1414,7 +1474,12 @@ mod tests {
         // L-constrained search.
         for target_l in [18_usize, 24, 30, 40] {
             let b0 = quantize_pitch(est, target_l);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "L_TABLE entries are small positive integer harmonic counts \
+                          (1..=56) stored as f32; the f32-to-usize cast is exact."
+            )]
             let got_l = L_TABLE[b0 as usize] as usize;
             assert_eq!(
                 got_l, target_l,

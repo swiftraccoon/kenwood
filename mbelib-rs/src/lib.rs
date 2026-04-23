@@ -62,6 +62,41 @@
 //! 9. **Output conversion** — float PCM → i16 with SIMD-vectorized
 //!    gain and clamping
 
+#![cfg_attr(
+    test,
+    expect(
+        clippy::indexing_slicing,
+        reason = "Unit tests throughout this crate construct fixed-size fixture arrays \
+                  and index directly with `arr[n]` to assert per-sample invariants against \
+                  reference implementations (mbelib, JMBE, OP25 encoders). The DSP \
+                  algorithms under test are defined in terms of indexed arrays, so the \
+                  tests mirror that shape directly — rewriting with `.get()?` would add \
+                  unwrap noise to every assertion without improving test quality, and \
+                  any out-of-bounds access would correctly panic the test."
+    )
+)]
+// `.expect()` usage is more localized — it only appears in encoder-gated test code
+// (feature `encoder` tests parse OP25 trace fixtures and use `.expect()` on fields that
+// are guaranteed present by the trace format). Scoping this opt-out to
+// `all(test, feature = "encoder")` avoids an unfulfilled-expectation warning under the
+// default-features build where no test uses `.expect()`.
+#![cfg_attr(
+    all(test, feature = "encoder"),
+    expect(
+        clippy::expect_used,
+        reason = "Encoder-feature test fixtures parse OP25 traces and use `.expect()` on \
+                  fields the trace format guarantees present; a malformed fixture should \
+                  panic the test with the specific missing-field message rather than \
+                  propagate a Result."
+    )
+)]
+
+// Dev-dependency `proptest` is used only inside the `encoder` feature module
+// (`src/encode/pack.rs`). Acknowledge it at the lib level so
+// `unused_crate_dependencies` stays silent in the default-features build.
+#[cfg(all(test, not(feature = "encoder")))]
+use proptest as _;
+
 mod adaptive;
 mod decode;
 mod ecc;
@@ -139,7 +174,13 @@ pub fn decode_trace(ambe: &[u8; 9]) -> ([usize; 9], f32, usize, [u8; 49]) {
     let b = [b0, b1, b2, b3, b4, b5, b6, b7, b8];
     let f0 = *tables::W0_TABLE.get(b0).unwrap_or(&0.0);
     let w0 = f0 * std::f32::consts::TAU;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "L_TABLE entries are small positive integers stored as f32 (harmonic count \
+                  1..=56). The f32-to-usize cast is exact by construction; truncation and \
+                  sign loss cannot occur within the defined table range."
+    )]
     let big_l = *tables::L_TABLE.get(b0).unwrap_or(&0.0) as usize;
     (b, w0, big_l, ambe_d)
 }

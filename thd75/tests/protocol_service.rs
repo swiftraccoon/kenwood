@@ -3,6 +3,8 @@
 
 use kenwood_thd75::protocol::{self, Command, Response};
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
 // ============================================================================
 // 0G — Enter / Exit service mode
 // ============================================================================
@@ -20,21 +22,23 @@ fn serialize_exit_service_mode() {
 }
 
 #[test]
-fn parse_enter_service_mode_response() {
-    let r = protocol::parse(b"0G").unwrap();
-    match r {
-        Response::ServiceMode { data } => assert_eq!(data, ""),
-        other => panic!("expected ServiceMode, got {other:?}"),
-    }
+fn parse_enter_service_mode_response() -> TestResult {
+    let r = protocol::parse(b"0G")?;
+    let Response::ServiceMode { data } = r else {
+        return Err(format!("expected ServiceMode, got {r:?}").into());
+    };
+    assert_eq!(data, "");
+    Ok(())
 }
 
 #[test]
-fn parse_enter_service_mode_with_payload() {
-    let r = protocol::parse(b"0G OK").unwrap();
-    match r {
-        Response::ServiceMode { data } => assert_eq!(data, "OK"),
-        other => panic!("expected ServiceMode, got {other:?}"),
-    }
+fn parse_enter_service_mode_with_payload() -> TestResult {
+    let r = protocol::parse(b"0G OK")?;
+    let Response::ServiceMode { data } = r else {
+        return Err(format!("expected ServiceMode, got {r:?}").into());
+    };
+    assert_eq!(data, "OK");
+    Ok(())
 }
 
 // ============================================================================
@@ -51,12 +55,13 @@ fn serialize_service_get_version() {
 }
 
 #[test]
-fn parse_service_version_response() {
-    let r = protocol::parse(b"2V EX-5210").unwrap();
-    match r {
-        Response::ServiceVersion { data } => assert_eq!(data, "EX-5210"),
-        other => panic!("expected ServiceVersion, got {other:?}"),
-    }
+fn parse_service_version_response() -> TestResult {
+    let r = protocol::parse(b"2V EX-5210")?;
+    let Response::ServiceVersion { data } = r else {
+        return Err(format!("expected ServiceVersion, got {r:?}").into());
+    };
+    assert_eq!(data, "EX-5210");
+    Ok(())
 }
 
 // ============================================================================
@@ -70,10 +75,11 @@ fn serialize_read_calibration_data() {
 }
 
 #[test]
-fn parse_calibration_data_response() {
-    let r = protocol::parse(b"0S AABBCCDD").unwrap();
-    match r {
-        Response::ServiceCalibrationData { data } => assert_eq!(data, "AABBCCDD"),
-        other => panic!("expected ServiceCalibrationData, got {other:?}"),
-    }
+fn parse_calibration_data_response() -> TestResult {
+    let r = protocol::parse(b"0S AABBCCDD")?;
+    let Response::ServiceCalibrationData { data } = r else {
+        return Err(format!("expected ServiceCalibrationData, got {r:?}").into());
+    };
+    assert_eq!(data, "AABBCCDD");
+    Ok(())
 }

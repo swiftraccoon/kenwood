@@ -186,7 +186,9 @@ impl Transport for SerialTransport {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
         let n = self.port.read(buf).await.map_err(TransportError::Read)?;
         tracing::debug!(bytes = n, "read from transport");
-        tracing::trace!(raw = ?&buf[..n], "raw bytes received");
+        if let Some(chunk) = buf.get(..n) {
+            tracing::trace!(raw = ?chunk, "raw bytes received");
+        }
         Ok(n)
     }
 

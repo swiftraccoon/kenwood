@@ -49,7 +49,16 @@ expecting stability.
 | [`mmdvm/`](mmdvm/) | Tokio async shell for MMDVM modems | experimental |
 | [`mbelib-rs/`](mbelib-rs/) | AMBE 3600×2400 voice codec (decoder default; encoder behind `--features encoder`) | experimental |
 | [`sextant/`](sextant/) | GUI D-STAR reflector client — exercises the laptop-only encode/decode pipeline against a local `polaris` reflector | experimental |
-| [`stargazer/`](stargazer/) | Tracing / metrics / observability scaffolding | experimental |
+| [`stargazer/`](stargazer/) | D-STAR network observatory — reflector monitoring and voice capture with Postgres + HTTP API | experimental |
+| [`lodestar-core/`](lodestar-core/) | UniFFI Rust core for the Lodestar iOS/macOS app | experimental |
+
+## App
+
+| App | Platform | Source | Status |
+|-----|----------|--------|--------|
+| Lodestar | iOS, iPadOS, macOS | [`lodestar/`](lodestar/) (Xcode) + [`lodestar-core/`](lodestar-core/) (Rust via UniFFI) | experimental |
+
+Lodestar is a D-STAR gateway app that bridges a TH-D75 over Bluetooth RFCOMM to DPlus / DExtra / DCS reflectors. SwiftUI front-end, native macOS `IOBluetooth` transport, iOS private-framework `BluetoothManager` transport (sideload-only). Build via XcodeGen: `(cd lodestar && xcodegen generate && open Lodestar.xcodeproj)`.
 
 ## Building
 

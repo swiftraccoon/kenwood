@@ -50,25 +50,25 @@ fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> 
 ///
 /// Firmware-verified: SF = Step Size. `SF band\r` returns `SF band,step`.
 fn parse_sf(payload: &str) -> Result<Response, ProtocolError> {
-    let parts: Vec<&str> = payload.splitn(2, ',').collect();
-    if parts.len() != 2 {
-        return Err(ProtocolError::FieldParse {
-            command: "SF".to_owned(),
-            field: "all".to_owned(),
-            detail: format!("expected band,step, got {payload:?}"),
-        });
-    }
-    let band_val = parse_u8_field(parts[0], "SF", "band")?;
+    let (band_str, step_str) =
+        payload
+            .split_once(',')
+            .ok_or_else(|| ProtocolError::FieldParse {
+                command: "SF".to_owned(),
+                field: "all".to_owned(),
+                detail: format!("expected band,step, got {payload:?}"),
+            })?;
+    let band_val = parse_u8_field(band_str, "SF", "band")?;
     let band = Band::try_from(band_val).map_err(|e| ProtocolError::FieldParse {
         command: "SF".to_owned(),
         field: "band".to_owned(),
         detail: e.to_string(),
     })?;
     // Step value uses hex (TABLE C: A=50kHz, B=100kHz, confirmed by ARFC RE)
-    let step_val = u8::from_str_radix(parts[1], 16).map_err(|_| ProtocolError::FieldParse {
+    let step_val = u8::from_str_radix(step_str, 16).map_err(|_| ProtocolError::FieldParse {
         command: "SF".to_owned(),
         field: "step".to_owned(),
-        detail: format!("invalid hex step: {:?}", parts[1]),
+        detail: format!("invalid hex step: {step_str:?}"),
     })?;
     let step = StepSize::try_from(step_val).map_err(|e| ProtocolError::FieldParse {
         command: "SF".to_owned(),

@@ -131,7 +131,12 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the initial connection setup fails.
-    #[allow(clippy::unused_async)]
+    #[expect(
+        clippy::unused_async,
+        reason = "Public API contract: `connect` is async so callers can `.await` it uniformly \
+                  with sibling constructors like `connect_with_tnc_exit` which do perform I/O. \
+                  Keeping both async lets users swap constructors without changing call sites."
+    )]
     pub async fn connect(transport: T) -> Result<Self, Error> {
         tracing::info!("connecting to radio");
         let (tx, _rx) = tokio::sync::broadcast::channel(64);
@@ -317,7 +322,9 @@ impl<T: Transport> Radio<T> {
                         )),
                     ));
                 }
-                self.codec.feed(&buf[..n]);
+                if let Some(chunk) = buf.get(..n) {
+                    self.codec.feed(chunk);
+                }
                 while let Some(frame) = self.codec.next_frame() {
                     // Frames are CR-terminated ASCII: "MNEMONIC PAYLOAD\r"
                     // e.g. "FQ 0,0145520000\r", "BY 1,1\r", "?\r", "N\r".
@@ -498,95 +505,113 @@ mod tests {
     use crate::types::Band;
     use std::time::Duration;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[tokio::test]
-    async fn radio_connect_and_identify() {
+    async fn radio_connect_and_identify() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"ID\r", b"ID TH-D75\r");
-        let mut radio = Radio::connect(mock).await.unwrap();
-        let info = radio.identify().await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        let info = radio.identify().await?;
         assert!(info.model.contains("TH-D75"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn radio_execute_raw_command() {
+    async fn radio_execute_raw_command() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"FV\r", b"FV 1.03.000\r");
-        let mut radio = Radio::connect(mock).await.unwrap();
-        let response = radio.execute(Command::GetFirmwareVersion).await.unwrap();
-        match response {
-            Response::FirmwareVersion { version } => assert_eq!(version, "1.03.000"),
-            other => panic!("expected FirmwareVersion, got {other:?}"),
-        }
+        let mut radio = Radio::connect(mock).await?;
+        let response = radio.execute(Command::GetFirmwareVersion).await?;
+        let Response::FirmwareVersion { version } = &response else {
+            return Err(format!("expected FirmwareVersion, got {response:?}").into());
+        };
+        assert_eq!(version, "1.03.000");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn radio_error_response() {
+    async fn radio_error_response() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"FQ 0\r", b"?\r");
-        let mut radio = Radio::connect(mock).await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
         let result = radio.execute(Command::GetFrequency { band: Band::A }).await;
-        assert!(matches!(result, Err(Error::RadioError)));
+        assert!(
+            matches!(result, Err(Error::RadioError)),
+            "expected RadioError, got {result:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn radio_disconnect() {
+    async fn radio_disconnect() -> TestResult {
         let mock = MockTransport::new();
-        let radio = Radio::connect(mock).await.unwrap();
-        radio.disconnect().await.unwrap();
+        let radio = Radio::connect(mock).await?;
+        radio.disconnect().await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn subscribe_returns_receiver() {
+    async fn subscribe_returns_receiver() -> TestResult {
         let mock = MockTransport::new();
-        let radio = Radio::connect(mock).await.unwrap();
+        let radio = Radio::connect(mock).await?;
         let _rx = radio.subscribe();
         // Just verify it compiles and doesn't panic
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_auto_info_sends_command() {
+    async fn set_auto_info_sends_command() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"AI 1\r", b"AI 1\r");
-        let mut radio = Radio::connect(mock).await.unwrap();
-        radio.set_auto_info(true).await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        radio.set_auto_info(true).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn multiple_subscribers_receive_notifications() {
+    async fn multiple_subscribers_receive_notifications() -> TestResult {
         let mock = MockTransport::new();
-        let radio = Radio::connect(mock).await.unwrap();
+        let radio = Radio::connect(mock).await?;
         let _rx1 = radio.subscribe();
         let _rx2 = radio.subscribe();
         // Sending to the broadcast channel should succeed with 2 receivers
-        let sent = radio
+        let receiver_count = radio
             .notifications
-            .send(Response::AutoInfo { enabled: true });
-        assert!(sent.is_ok());
-        assert_eq!(sent.unwrap(), 2);
+            .send(Response::AutoInfo { enabled: true })
+            .map_err(|e| format!("broadcast send failed: {e}"))?;
+        assert_eq!(receiver_count, 2);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn debug_impl_works() {
+    async fn debug_impl_works() -> TestResult {
         let mock = MockTransport::new();
-        let radio = Radio::connect(mock).await.unwrap();
+        let radio = Radio::connect(mock).await?;
         let debug_str = format!("{radio:?}");
         assert!(debug_str.contains("Radio"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn radio_not_available_response() {
+    async fn radio_not_available_response() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"BE\r", b"N\r");
-        let mut radio = Radio::connect(mock).await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
         let result = radio.execute(Command::GetBeep).await;
-        assert!(matches!(result, Err(Error::NotAvailable)));
+        assert!(
+            matches!(result, Err(Error::NotAvailable)),
+            "expected NotAvailable, got {result:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_timeout_configurable() {
+    async fn set_timeout_configurable() -> TestResult {
         let mock = MockTransport::new();
-        let mut radio = Radio::connect(mock).await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
         radio.set_timeout(Duration::from_millis(100));
         assert_eq!(radio.timeout, Duration::from_millis(100));
+        Ok(())
     }
 }

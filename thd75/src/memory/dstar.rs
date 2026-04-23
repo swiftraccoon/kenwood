@@ -98,11 +98,7 @@ impl<'a> DstarAccess<'a> {
     #[must_use]
     pub fn channel_info(&self) -> Option<&[u8]> {
         let end = DSTAR_CHANNEL_INFO_OFFSET + DSTAR_CHANNEL_INFO_SIZE;
-        if end <= self.image.len() {
-            Some(&self.image[DSTAR_CHANNEL_INFO_OFFSET..end])
-        } else {
-            None
-        }
+        self.image.get(DSTAR_CHANNEL_INFO_OFFSET..end)
     }
 
     /// Get the raw repeater/callsign list region.
@@ -112,11 +108,7 @@ impl<'a> DstarAccess<'a> {
     /// callsign list.
     #[must_use]
     pub fn repeater_callsign_region(&self) -> Option<&[u8]> {
-        if DSTAR_END_OFFSET <= self.image.len() {
-            Some(&self.image[DSTAR_RPT_OFFSET..DSTAR_END_OFFSET])
-        } else {
-            None
-        }
+        self.image.get(DSTAR_RPT_OFFSET..DSTAR_END_OFFSET)
     }
 
     /// Get the total size of the D-STAR repeater/callsign region in bytes.
@@ -133,11 +125,10 @@ impl<'a> DstarAccess<'a> {
     pub fn repeater_record(&self, index: usize) -> Option<&[u8]> {
         let offset = DSTAR_RPT_OFFSET + index * REPEATER_RECORD_SIZE;
         let end = offset + REPEATER_RECORD_SIZE;
-        if end <= self.image.len() && end <= DSTAR_END_OFFSET {
-            Some(&self.image[offset..end])
-        } else {
-            None
+        if end > DSTAR_END_OFFSET {
+            return None;
         }
+        self.image.get(offset..end)
     }
 
     /// Read an arbitrary byte range from the D-STAR region.
@@ -147,11 +138,7 @@ impl<'a> DstarAccess<'a> {
     #[must_use]
     pub fn read_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
         let end = offset + len;
-        if end <= self.image.len() {
-            Some(&self.image[offset..end])
-        } else {
-            None
-        }
+        self.image.get(offset..end)
     }
 
     // -----------------------------------------------------------------------
@@ -172,11 +159,9 @@ impl<'a> DstarAccess<'a> {
     #[must_use]
     pub fn my_callsign(&self) -> String {
         let offset = DSTAR_MY_CALLSIGN_OFFSET;
-        let end = offset + DstarCallsign::WIRE_LEN;
-        if end > self.image.len() {
+        let Some(slice) = self.image.get(offset..offset + DstarCallsign::WIRE_LEN) else {
             return String::new();
-        }
-        let slice = &self.image[offset..end];
+        };
         // D-STAR callsigns are space-padded; also handle null bytes.
         let s = std::str::from_utf8(slice).unwrap_or("");
         s.trim_end_matches([' ', '\0']).to_owned()
@@ -232,21 +217,21 @@ impl<'a> DstarAccess<'a> {
             return None;
         }
 
-        let rpt1 = extract_dstar_callsign(&record[RPT_RPT1_OFFSET..RPT_RPT1_OFFSET + 8]);
-        let rpt2 = extract_dstar_callsign(&record[RPT_RPT2_OFFSET..RPT_RPT2_OFFSET + 8]);
+        let rpt1 = record
+            .get(RPT_RPT1_OFFSET..RPT_RPT1_OFFSET + 8)
+            .map(extract_dstar_callsign)
+            .unwrap_or_default();
+        let rpt2 = record
+            .get(RPT_RPT2_OFFSET..RPT_RPT2_OFFSET + 8)
+            .map(extract_dstar_callsign)
+            .unwrap_or_default();
         let name = extract_string_field(record, RPT_NAME_OFFSET, 16);
         let sub_name = extract_string_field(record, RPT_AREA_OFFSET, 16);
 
-        let frequency = if RPT_FREQ_OFFSET + 4 <= record.len() {
-            u32::from_le_bytes([
-                record[RPT_FREQ_OFFSET],
-                record[RPT_FREQ_OFFSET + 1],
-                record[RPT_FREQ_OFFSET + 2],
-                record[RPT_FREQ_OFFSET + 3],
-            ])
-        } else {
-            0
-        };
+        let frequency = record
+            .get(RPT_FREQ_OFFSET..RPT_FREQ_OFFSET + 4)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .map_or(0, u32::from_le_bytes);
 
         Some(RepeaterEntry {
             group_name: String::new(), // Group name not in the 108-byte record
@@ -284,11 +269,10 @@ impl<'a> DstarAccess<'a> {
 
 /// Extract a D-STAR callsign from the first 8 bytes of a slice.
 fn extract_dstar_callsign(slice: &[u8]) -> DstarCallsign {
-    if slice.len() < 8 {
+    let Some(prefix) = slice.first_chunk::<8>() else {
         return DstarCallsign::default();
-    }
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&slice[..8]);
+    };
+    let mut bytes = *prefix;
     // Replace null bytes with spaces for D-STAR wire format.
     for b in &mut bytes {
         if *b == 0 {
@@ -301,12 +285,14 @@ fn extract_dstar_callsign(slice: &[u8]) -> DstarCallsign {
 /// Extract a null-terminated string field from a record.
 fn extract_string_field(record: &[u8], offset: usize, max_len: usize) -> String {
     let end = (offset + max_len).min(record.len());
-    if offset >= record.len() {
+    let Some(slice) = record.get(offset..end) else {
         return String::new();
-    }
-    let slice = &record[offset..end];
+    };
     let nul = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
-    String::from_utf8_lossy(&slice[..nul]).trim().to_string()
+    let Some(trimmed) = slice.get(..nul) else {
+        return String::new();
+    };
+    String::from_utf8_lossy(trimmed).trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -318,148 +304,190 @@ mod tests {
     use super::*;
     use crate::protocol::programming::TOTAL_SIZE;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type BoxErr = Box<dyn std::error::Error>;
+
+    fn write_slice(image: &mut [u8], offset: usize, data: &[u8]) -> Result<(), BoxErr> {
+        let end = offset + data.len();
+        let img_len = image.len();
+        image
+            .get_mut(offset..end)
+            .ok_or_else(|| {
+                format!("write_slice: range {offset}..{end} out of bounds (len={img_len})")
+            })?
+            .copy_from_slice(data);
+        Ok(())
+    }
+
     fn make_dstar_image() -> Vec<u8> {
         vec![0u8; TOTAL_SIZE]
     }
 
     #[test]
-    fn dstar_channel_info_accessible() {
+    fn dstar_channel_info_accessible() -> TestResult {
         let mut image = make_dstar_image();
         // Write a known pattern at the D-STAR channel info offset.
-        image[DSTAR_CHANNEL_INFO_OFFSET..DSTAR_CHANNEL_INFO_OFFSET + 4]
-            .copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        write_slice(
+            &mut image,
+            DSTAR_CHANNEL_INFO_OFFSET,
+            &[0xDE, 0xAD, 0xBE, 0xEF],
+        )?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
-        let info = dstar.channel_info().unwrap();
+        let info = dstar.channel_info().ok_or("channel_info returned None")?;
         assert_eq!(info.len(), DSTAR_CHANNEL_INFO_SIZE);
-        assert_eq!(&info[..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            info.get(..4).ok_or("info too short")?,
+            &[0xDE, 0xAD, 0xBE, 0xEF]
+        );
+        Ok(())
     }
 
     #[test]
-    fn dstar_repeater_region_accessible() {
+    fn dstar_repeater_region_accessible() -> TestResult {
         let image = make_dstar_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
-        let region = dstar.repeater_callsign_region().unwrap();
+        let region = dstar
+            .repeater_callsign_region()
+            .ok_or("repeater_callsign_region returned None")?;
         assert!(!region.is_empty());
         assert_eq!(region.len(), dstar.region_size());
+        Ok(())
     }
 
     #[test]
-    fn dstar_repeater_record() {
+    fn dstar_repeater_record() -> TestResult {
         let mut image = make_dstar_image();
         // Write a pattern at the first repeater record.
-        let offset = DSTAR_RPT_OFFSET;
-        image[offset..offset + 8].copy_from_slice(b"JR6YPR B");
+        write_slice(&mut image, DSTAR_RPT_OFFSET, b"JR6YPR B")?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
-        let record = dstar.repeater_record(0).unwrap();
+        let record = dstar
+            .repeater_record(0)
+            .ok_or("repeater_record(0) returned None")?;
         assert_eq!(record.len(), REPEATER_RECORD_SIZE);
-        assert_eq!(&record[..8], b"JR6YPR B");
+        assert_eq!(record.get(..8).ok_or("record too short")?, b"JR6YPR B");
+        Ok(())
     }
 
     #[test]
-    fn dstar_region_size_positive() {
+    fn dstar_region_size_positive() -> TestResult {
         let image = make_dstar_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
         // D-STAR region should be substantial (>100 KB).
         assert!(dstar.region_size() > 100_000);
+        Ok(())
     }
 
     #[test]
-    fn dstar_my_callsign() {
+    fn dstar_my_callsign() -> TestResult {
         let mut image = make_dstar_image();
-        image[DSTAR_MY_CALLSIGN_OFFSET..DSTAR_MY_CALLSIGN_OFFSET + 8].copy_from_slice(b"N0CALL  ");
+        write_slice(&mut image, DSTAR_MY_CALLSIGN_OFFSET, b"N0CALL  ")?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
         assert_eq!(dstar.my_callsign(), "N0CALL");
+        Ok(())
     }
 
     #[test]
-    fn dstar_my_callsign_typed() {
+    fn dstar_my_callsign_typed() -> TestResult {
         let mut image = make_dstar_image();
-        image[DSTAR_MY_CALLSIGN_OFFSET..DSTAR_MY_CALLSIGN_OFFSET + 8].copy_from_slice(b"W1AW    ");
+        write_slice(&mut image, DSTAR_MY_CALLSIGN_OFFSET, b"W1AW    ")?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
-        let typed = dstar.my_callsign_typed().unwrap();
+        let typed = dstar
+            .my_callsign_typed()
+            .ok_or("my_callsign_typed returned None")?;
         assert_eq!(typed.as_str(), "W1AW");
+        Ok(())
     }
 
     #[test]
-    fn dstar_my_callsign_empty() {
+    fn dstar_my_callsign_empty() -> TestResult {
         let image = make_dstar_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
         assert_eq!(dstar.my_callsign(), "");
         assert!(dstar.my_callsign_typed().is_none());
+        Ok(())
     }
 
     #[test]
-    fn dstar_repeater_entry_empty_record() {
+    fn dstar_repeater_entry_empty_record() -> TestResult {
         let image = make_dstar_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
         // All-zero record should be None.
         assert!(dstar.repeater_entry(0).is_none());
+        Ok(())
     }
 
     #[test]
-    fn dstar_repeater_entry_populated() {
+    fn dstar_repeater_entry_populated() -> TestResult {
         let mut image = make_dstar_image();
         let offset = DSTAR_RPT_OFFSET;
 
         // Write RPT1 callsign at record offset 0x00.
-        image[offset..offset + 8].copy_from_slice(b"JR6YPR B");
+        write_slice(&mut image, offset, b"JR6YPR B")?;
         // Write RPT2/gateway at record offset 0x10.
-        image[offset + 0x10..offset + 0x18].copy_from_slice(b"JR6YPR G");
+        write_slice(&mut image, offset + 0x10, b"JR6YPR G")?;
         // Write name at record offset 0x20.
-        let name = b"Test Rptr\0\0\0\0\0\0\0";
-        image[offset + 0x20..offset + 0x30].copy_from_slice(name);
+        write_slice(&mut image, offset + 0x20, b"Test Rptr\0\0\0\0\0\0\0")?;
         // Write frequency at record offset 0x58: 439.01 MHz = 439010000 Hz.
         let freq: u32 = 439_010_000;
-        image[offset + 0x58..offset + 0x5C].copy_from_slice(&freq.to_le_bytes());
+        write_slice(&mut image, offset + 0x58, &freq.to_le_bytes())?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
-        let entry = dstar.repeater_entry(0).unwrap();
+        let entry = dstar
+            .repeater_entry(0)
+            .ok_or("repeater_entry(0) returned None")?;
         assert_eq!(entry.callsign_rpt1.as_str(), "JR6YPR B");
         assert_eq!(entry.gateway_rpt2.as_str(), "JR6YPR G");
         assert_eq!(entry.name, "Test Rptr");
         assert_eq!(entry.frequency, 439_010_000);
+        Ok(())
     }
 
     #[test]
-    fn dstar_repeater_entry_out_of_range() {
+    fn dstar_repeater_entry_out_of_range() -> TestResult {
         let image = make_dstar_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
         assert!(dstar.repeater_entry(MAX_REPEATER_ENTRIES).is_none());
+        Ok(())
     }
 
     #[test]
-    fn dstar_repeater_count_all_empty() {
+    fn dstar_repeater_count_all_empty() -> TestResult {
         let image = make_dstar_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
         assert_eq!(dstar.repeater_count(), 0);
+        Ok(())
     }
 
     #[test]
-    fn dstar_repeater_count_with_entries() {
+    fn dstar_repeater_count_with_entries() -> TestResult {
         let mut image = make_dstar_image();
         // Populate 3 repeater entries.
         for i in 0..3 {
-            let offset = DSTAR_RPT_OFFSET + i * REPEATER_RECORD_SIZE;
-            image[offset..offset + 8].copy_from_slice(b"TESTCALL");
+            write_slice(
+                &mut image,
+                DSTAR_RPT_OFFSET + i * REPEATER_RECORD_SIZE,
+                b"TESTCALL",
+            )?;
         }
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
         assert_eq!(dstar.repeater_count(), 3);
+        Ok(())
     }
 }

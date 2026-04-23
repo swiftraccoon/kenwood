@@ -65,14 +65,12 @@ impl Frequency {
 
     /// Returns the frequency in kHz as a floating-point value.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
     pub fn as_khz(self) -> f64 {
         f64::from(self.0) / 1_000.0
     }
 
     /// Returns the frequency in MHz as a floating-point value.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
     pub fn as_mhz(self) -> f64 {
         f64::from(self.0) / 1_000_000.0
     }
@@ -162,9 +160,10 @@ mod tests {
     }
 
     #[test]
-    fn frequency_from_wire() {
-        let f = Frequency::from_wire_string("0145000000").unwrap();
+    fn frequency_from_wire() -> Result<(), Box<dyn std::error::Error>> {
+        let f = Frequency::from_wire_string("0145000000")?;
         assert_eq!(f.as_hz(), 145_000_000);
+        Ok(())
     }
 
     #[test]

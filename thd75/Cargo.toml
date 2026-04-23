@@ -51,5 +51,18 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
-cargo_common_metadata = "allow"
+restriction = { level = "allow", priority = -1 }
+# Ban `#[allow]` — every suppression must be `#[expect(..., reason = "...")]`.
+# Mirrors the root `[workspace.lints.clippy]` ban; restated here because this crate's
+# `[lints]` block replaces the workspace one entirely (cargo does not merge).
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+# Restriction-lint denies mirror the workspace — no divergence.
+undocumented_unsafe_blocks = "deny"
+missing_assert_message = "deny"
+missing_const_for_fn = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
 multiple_crate_versions = "allow"

@@ -52,34 +52,35 @@ fn open_explicit(
     Ok((path.to_string(), EitherTransport::Serial(transport)))
 }
 
-/// Open a Bluetooth connection with platform-appropriate handling.
+/// Open a Bluetooth connection using native `IOBluetooth` RFCOMM.
 ///
-/// macOS: native `IOBluetooth` RFCOMM with one retry (covers stale
-/// RFCOMM channel from a prior session that didn't call `disconnect()`).
-///
-/// Linux/Windows: serial BT SPP port discovery.
-#[allow(clippy::needless_return, unused_variables)]
-fn open_bluetooth(baud: u32) -> Result<(String, EitherTransport), Box<dyn std::error::Error>> {
-    #[cfg(target_os = "macos")]
-    {
-        let bt = kenwood_thd75::BluetoothTransport::open(None).map_err(|e| {
-            format!(
-                "Error: Bluetooth connection failed: {e}. \
-                 If the previous session did not exit cleanly, \
-                 wait a few seconds or run: sudo pkill bluetoothd"
-            )
-        })?;
-        return Ok(("bluetooth:TH-D75".into(), EitherTransport::Bluetooth(bt)));
-    }
+/// `_baud` is ignored: the native macOS RFCOMM path negotiates its own
+/// line parameters. One retry is built in to cover a stale RFCOMM channel
+/// from a prior session that didn't call `disconnect()`.
+#[cfg(target_os = "macos")]
+fn open_bluetooth(_baud: u32) -> Result<(String, EitherTransport), Box<dyn std::error::Error>> {
+    let bt = kenwood_thd75::BluetoothTransport::open(None).map_err(|e| {
+        format!(
+            "Error: Bluetooth connection failed: {e}. \
+             If the previous session did not exit cleanly, \
+             wait a few seconds or run: sudo pkill bluetoothd"
+        )
+    })?;
+    Ok(("bluetooth:TH-D75".into(), EitherTransport::Bluetooth(bt)))
+}
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        let bt_ports = SerialTransport::discover_bluetooth()?;
-        if let Some(info) = bt_ports.first() {
-            let path = info.port_name.clone();
-            let transport = SerialTransport::open(&path, baud)?;
-            return Ok((path, EitherTransport::Serial(transport)));
-        }
-        Err("Error: no TH-D75 found on USB or Bluetooth. Use --port to specify.".into())
+/// Open a Bluetooth connection via serial BT SPP port discovery.
+///
+/// On Linux/Windows there is no native `IOBluetooth` equivalent — we
+/// enumerate serial ports that look like Bluetooth TH-D75 pairings and
+/// open the first one at the requested baud rate.
+#[cfg(not(target_os = "macos"))]
+fn open_bluetooth(baud: u32) -> Result<(String, EitherTransport), Box<dyn std::error::Error>> {
+    let bt_ports = SerialTransport::discover_bluetooth()?;
+    if let Some(info) = bt_ports.first() {
+        let path = info.port_name.clone();
+        let transport = SerialTransport::open(&path, baud)?;
+        return Ok((path, EitherTransport::Serial(transport)));
     }
+    Err("Error: no TH-D75 found on USB or Bluetooth. Use --port to specify.".into())
 }

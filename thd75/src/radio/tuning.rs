@@ -199,6 +199,8 @@ mod tests {
     use super::*;
     use crate::transport::MockTransport;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     /// A typical FO response for Band A at 145.000 MHz.
     /// Field layout verified against real D75 hardware (see `probes/fo_field_map.rs`).
     const FO_RESPONSE_145: &[u8] =
@@ -217,7 +219,7 @@ mod tests {
     const FQ_RESPONSE_146520: &[u8] = b"FQ 0,0146520000\r";
 
     #[tokio::test]
-    async fn tune_frequency_already_in_vfo_mode() {
+    async fn tune_frequency_already_in_vfo_mode() -> TestResult {
         let mut mock = MockTransport::new();
         // ensure_mode: query VM -> already VFO (0)
         mock.expect(b"VM 0\r", b"VM 0,0\r");
@@ -228,15 +230,15 @@ mod tests {
         // get_frequency: verify readback
         mock.expect(b"FQ 0\r", FQ_RESPONSE_146520);
 
-        let mut radio = Radio::connect(mock).await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
         radio
             .tune_frequency(Band::A, Frequency::new(146_520_000))
-            .await
-            .unwrap();
+            .await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn tune_channel_switches_to_memory_mode() {
+    async fn tune_channel_switches_to_memory_mode() -> TestResult {
         let mut mock = MockTransport::new();
         // read_channel: ME read to verify channel is populated
         mock.expect(
@@ -250,12 +252,13 @@ mod tests {
         // recall_channel: MR action
         mock.expect(b"MR 0,021\r", b"MR 0,021\r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
-        radio.tune_channel(Band::A, 21).await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        radio.tune_channel(Band::A, 21).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn tune_channel_already_in_memory_mode() {
+    async fn tune_channel_already_in_memory_mode() -> TestResult {
         let mut mock = MockTransport::new();
         // read_channel: ME read to verify channel is populated
         mock.expect(
@@ -267,12 +270,13 @@ mod tests {
         // recall_channel: MR action
         mock.expect(b"MR 0,005\r", b"MR 0,005\r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
-        radio.tune_channel(Band::A, 5).await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        radio.tune_channel(Band::A, 5).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn quick_tune_sets_freq_mode_step() {
+    async fn quick_tune_sets_freq_mode_step() -> TestResult {
         let mut mock = MockTransport::new();
         // tune_frequency internals:
         //   ensure_mode: query VM -> already VFO (0)
@@ -288,10 +292,10 @@ mod tests {
         // set_step_size: SF write (Hz5000 = 0x0)
         mock.expect(b"SF 0,0\r", b"SF 0,0\r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
         radio
             .quick_tune(Band::A, 146_520_000, Mode::Fm, StepSize::Hz5000)
-            .await
-            .unwrap();
+            .await?;
+        Ok(())
     }
 }

@@ -4,6 +4,33 @@
 //! captured output alone. Instead this test scans the REPL's source
 //! files for forbidden patterns. Runs as part of `cargo test`.
 
+#![expect(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "Static rules integration test. Walks the crate's own source tree and \
+              asserts forbidden patterns don't appear. Uses `.expect()` on filesystem \
+              operations (CARGO_MANIFEST_DIR always exists at test time) and direct \
+              `lines[..=line_no]` slicing to scan source file prefixes — the `line_no` \
+              index always comes from the same file's `.lines().enumerate()` so the \
+              slice is always in-bounds."
+)]
+
+// Dev-dependencies pulled in by sibling integration tests. Acknowledge them here so
+// `unused_crate_dependencies` stays silent for this compilation unit.
+use clap as _;
+use dirs_next as _;
+use dstar_gateway as _;
+use dstar_gateway_core as _;
+use kenwood_thd75 as _;
+use proptest as _;
+use rustyline as _;
+use thd75_repl as _;
+use time as _;
+use tokio as _;
+use tracing as _;
+use tracing_appender as _;
+use tracing_subscriber as _;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

@@ -11,6 +11,12 @@
 
 use mbelib_rs::AmbeDecoder;
 
+// Dev-dependencies pulled in by sibling test targets. Acknowledge them here so
+// `unused_crate_dependencies` stays silent for this compilation unit.
+use proptest as _;
+use realfft as _;
+use wide as _;
+
 /// D-STAR AMBE silence frame bytes.
 ///
 /// These are the "comfort noise" bytes transmitted in EOT packets and

@@ -59,25 +59,38 @@ pub fn parse_repeater_list(data: &[u8]) -> Result<Vec<RepeaterEntry>, SdCardErro
 
         let line_num = line_idx + 1;
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < EXPECTED_COLUMNS {
+        let actual = cols.len();
+        // Slice-pattern destructure: requires >= EXPECTED_COLUMNS; `..` ignores extras.
+        let &[
+            group_name,
+            name,
+            sub_name,
+            callsign_rpt1,
+            callsign_rpt2,
+            freq_s,
+            duplex,
+            offset_s,
+            ..,
+        ] = cols.as_slice()
+        else {
             return Err(SdCardError::ColumnCount {
                 line: line_num,
                 expected: EXPECTED_COLUMNS,
-                actual: cols.len(),
+                actual,
             });
-        }
+        };
 
-        let frequency = parse_frequency_mhz(cols[5], line_num, "Frequency")?;
-        let offset = parse_frequency_mhz(cols[7], line_num, "Offset")?;
+        let frequency = parse_frequency_mhz(freq_s, line_num, "Frequency")?;
+        let offset = parse_frequency_mhz(offset_s, line_num, "Offset")?;
 
         entries.push(RepeaterEntry {
-            group_name: cols[0].to_owned(),
-            name: cols[1].to_owned(),
-            sub_name: cols[2].to_owned(),
-            callsign_rpt1: cols[3].to_owned(),
-            callsign_rpt2: cols[4].to_owned(),
+            group_name: group_name.to_owned(),
+            name: name.to_owned(),
+            sub_name: sub_name.to_owned(),
+            callsign_rpt1: callsign_rpt1.to_owned(),
+            callsign_rpt2: callsign_rpt2.to_owned(),
             frequency,
-            duplex: cols[6].to_owned(),
+            duplex: duplex.to_owned(),
             offset,
         });
     }
@@ -133,7 +146,14 @@ fn parse_frequency_mhz(s: &str, line: usize, column: &str) -> Result<u32, SdCard
         detail: format!("invalid frequency: {trimmed:?}"),
     })?;
     // Convert MHz to Hz, rounding to nearest integer.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Parses MHz frequencies from D75 SD-card .tsv repeater lists. The D75 tunes \
+                  0.5-1300 MHz, so `mhz * 1_000_000` stays well within u32 range and is always \
+                  non-negative. `.round()` produces an integral f64 whose truncation to u32 is \
+                  the intended conversion."
+    )]
     let hz = (mhz * 1_000_000.0).round() as u32;
     Ok(hz)
 }
@@ -146,21 +166,22 @@ fn format_frequency_mhz(hz: u32) -> String {
 
 /// Decodes a UTF-16LE byte sequence with a leading BOM into a `String`.
 fn decode_utf16le_bom(data: &[u8]) -> Result<String, SdCardError> {
-    if data.len() < 2 {
+    let Some((bom, payload)) = data.split_first_chunk::<2>() else {
         return Err(SdCardError::MissingBom);
-    }
-    if data[0] != 0xFF || data[1] != 0xFE {
+    };
+    if *bom != [0xFF, 0xFE] {
         return Err(SdCardError::MissingBom);
     }
 
-    let payload = &data[2..];
     if !payload.len().is_multiple_of(2) {
         return Err(SdCardError::InvalidUtf16Length { len: payload.len() });
     }
 
+    // `chunks_exact(2)` yields exactly-2-byte slices; `try_into` is infallible
+    // for a slice of the known length, so this is `.unwrap_or_default`-safe.
     let code_units: Vec<u16> = payload
         .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .map(|pair| u16::from_le_bytes(pair.try_into().unwrap_or([0, 0])))
         .collect();
 
     String::from_utf16(&code_units).map_err(|e| SdCardError::Utf16Decode {
@@ -176,9 +197,7 @@ fn encode_utf16le_bom(text: &str) -> Vec<u8> {
     out.push(0xFE);
     // UTF-16LE payload
     for unit in text.encode_utf16() {
-        let bytes = unit.to_le_bytes();
-        out.push(bytes[0]);
-        out.push(bytes[1]);
+        out.extend_from_slice(&unit.to_le_bytes());
     }
     out
 }
@@ -187,38 +206,49 @@ fn encode_utf16le_bom(text: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn decode_utf16le_bom_basic() {
+    fn decode_utf16le_bom_basic() -> TestResult {
         let text = "hello";
         let encoded = encode_utf16le_bom(text);
-        let decoded = decode_utf16le_bom(&encoded).unwrap();
+        let decoded = decode_utf16le_bom(&encoded)?;
         assert_eq!(decoded, "hello");
+        Ok(())
     }
 
     #[test]
     fn decode_utf16le_missing_bom() {
-        let err = decode_utf16le_bom(&[0x00, 0x00]).unwrap_err();
-        assert!(matches!(err, SdCardError::MissingBom));
+        let result = decode_utf16le_bom(&[0x00, 0x00]);
+        assert!(
+            matches!(result, Err(SdCardError::MissingBom)),
+            "expected MissingBom, got {result:?}"
+        );
     }
 
     #[test]
     fn decode_utf16le_odd_length() {
-        let err = decode_utf16le_bom(&[0xFF, 0xFE, 0x41]).unwrap_err();
-        assert!(matches!(err, SdCardError::InvalidUtf16Length { .. }));
+        let result = decode_utf16le_bom(&[0xFF, 0xFE, 0x41]);
+        assert!(
+            matches!(result, Err(SdCardError::InvalidUtf16Length { .. })),
+            "expected InvalidUtf16Length, got {result:?}"
+        );
     }
 
     #[test]
-    fn format_frequency_round_trip() {
+    fn format_frequency_round_trip() -> TestResult {
         let hz = 145_000_000u32;
         let s = format_frequency_mhz(hz);
         assert_eq!(s, "145.000000");
-        let back = parse_frequency_mhz(&s, 1, "test").unwrap();
+        let back = parse_frequency_mhz(&s, 1, "test")?;
         assert_eq!(back, hz);
+        Ok(())
     }
 
     #[test]
-    fn parse_frequency_empty() {
-        let hz = parse_frequency_mhz("", 1, "test").unwrap();
+    fn parse_frequency_empty() -> TestResult {
+        let hz = parse_frequency_mhz("", 1, "test")?;
         assert_eq!(hz, 0);
+        Ok(())
     }
 }

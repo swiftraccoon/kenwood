@@ -104,11 +104,7 @@ impl<'a> AprsAccess<'a> {
     #[must_use]
     pub fn status_header(&self) -> Option<&[u8]> {
         let end = APRS_STATUS_OFFSET + programming::PAGE_SIZE;
-        if end <= self.image.len() {
-            Some(&self.image[APRS_STATUS_OFFSET..end])
-        } else {
-            None
-        }
+        self.image.get(APRS_STATUS_OFFSET..end)
     }
 
     /// Get the raw APRS data region (pages `0x0152` through the start of
@@ -118,11 +114,7 @@ impl<'a> AprsAccess<'a> {
     /// `SmartBeaconing` parameters, digipeater config, and more.
     #[must_use]
     pub fn data_region(&self) -> Option<&[u8]> {
-        if APRS_END_OFFSET <= self.image.len() {
-            Some(&self.image[APRS_DATA_OFFSET..APRS_END_OFFSET])
-        } else {
-            None
-        }
+        self.image.get(APRS_DATA_OFFSET..APRS_END_OFFSET)
     }
 
     /// Read an arbitrary byte range from the APRS region.
@@ -132,11 +124,7 @@ impl<'a> AprsAccess<'a> {
     #[must_use]
     pub fn read_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
         let end = offset + len;
-        if end <= self.image.len() {
-            Some(&self.image[offset..end])
-        } else {
-            None
-        }
+        self.image.get(offset..end)
     }
 
     /// Get the total size of the APRS region in bytes.
@@ -165,17 +153,17 @@ impl<'a> AprsAccess<'a> {
     #[must_use]
     pub fn my_callsign(&self) -> String {
         let offset = APRS_DATA_OFFSET + APRS_MY_CALLSIGN_REL;
-        let end = offset + APRS_CALLSIGN_FIELD_LEN;
-        if end > self.image.len() {
+        let Some(slice) = self.image.get(offset..offset + APRS_CALLSIGN_FIELD_LEN) else {
             return String::new();
-        }
-        let slice = &self.image[offset..end];
+        };
         let nul = slice
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(APRS_CALLSIGN_FIELD_LEN);
-        let s = std::str::from_utf8(&slice[..nul]).unwrap_or("").trim();
-        s.to_owned()
+        let Some(trimmed) = slice.get(..nul) else {
+            return String::new();
+        };
+        std::str::from_utf8(trimmed).unwrap_or("").trim().to_owned()
     }
 
     /// Read the APRS MY callsign as a typed [`AprsCallsign`].
@@ -213,10 +201,10 @@ impl<'a> AprsAccess<'a> {
     #[must_use]
     pub fn beacon_interval(&self) -> u16 {
         let offset = APRS_DATA_OFFSET + APRS_BEACON_INTERVAL_REL;
-        if offset + 2 > self.image.len() {
-            return 0;
-        }
-        u16::from_le_bytes([self.image[offset], self.image[offset + 1]])
+        self.image
+            .get(offset..offset + 2)
+            .and_then(|s| <[u8; 2]>::try_from(s).ok())
+            .map_or(0, u16::from_le_bytes)
     }
 
     /// Read the packet path selection index.
@@ -275,11 +263,7 @@ impl<'a> AprsAccess<'a> {
     #[must_use]
     pub fn position_data_region(&self) -> Option<&[u8]> {
         let end = APRS_POSITION_DATA_OFFSET + APRS_POSITION_DATA_SIZE;
-        if end <= self.image.len() {
-            Some(&self.image[APRS_POSITION_DATA_OFFSET..end])
-        } else {
-            None
-        }
+        self.image.get(APRS_POSITION_DATA_OFFSET..end)
     }
 
     /// Get the total size of the APRS/GPS position data region in bytes.
@@ -301,12 +285,7 @@ impl<'a> AprsAccess<'a> {
             return None;
         }
         let abs_offset = APRS_POSITION_DATA_OFFSET + rel_offset;
-        let end = abs_offset + len;
-        if end <= self.image.len() {
-            Some(&self.image[abs_offset..end])
-        } else {
-            None
-        }
+        self.image.get(abs_offset..abs_offset + len)
     }
 
     /// Check if the APRS/GPS position data region contains any non-zero data.
@@ -329,122 +308,177 @@ mod tests {
     use super::*;
     use crate::protocol::programming::TOTAL_SIZE;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type BoxErr = Box<dyn std::error::Error>;
+
+    fn set_byte(image: &mut [u8], offset: usize, value: u8) -> Result<(), BoxErr> {
+        let img_len = image.len();
+        *image
+            .get_mut(offset)
+            .ok_or_else(|| format!("set_byte: offset {offset} out of range (len={img_len})"))? =
+            value;
+        Ok(())
+    }
+
+    fn write_slice(image: &mut [u8], offset: usize, data: &[u8]) -> Result<(), BoxErr> {
+        let end = offset + data.len();
+        let img_len = image.len();
+        image
+            .get_mut(offset..end)
+            .ok_or_else(|| {
+                format!("write_slice: range {offset}..{end} out of bounds (len={img_len})")
+            })?
+            .copy_from_slice(data);
+        Ok(())
+    }
+
+    fn fill_range(image: &mut [u8], offset: usize, len: usize, value: u8) -> Result<(), BoxErr> {
+        let end = offset + len;
+        let img_len = image.len();
+        image
+            .get_mut(offset..end)
+            .ok_or_else(|| {
+                format!("fill_range: range {offset}..{end} out of bounds (len={img_len})")
+            })?
+            .fill(value);
+        Ok(())
+    }
+
     fn make_aprs_image() -> Vec<u8> {
         vec![0u8; TOTAL_SIZE]
     }
 
     #[test]
-    fn aprs_status_header_accessible() {
+    fn aprs_status_header_accessible() -> TestResult {
         let image = vec![0xAA_u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let aprs = mi.aprs();
-        let header = aprs.status_header().unwrap();
+        let header = aprs
+            .status_header()
+            .ok_or("aprs.status_header() returned None")?;
         assert_eq!(header.len(), programming::PAGE_SIZE);
         assert!(header.iter().all(|&b| b == 0xAA));
+        Ok(())
     }
 
     #[test]
-    fn aprs_data_region_accessible() {
+    fn aprs_data_region_accessible() -> TestResult {
         let image = vec![0u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let aprs = mi.aprs();
-        let data = aprs.data_region().unwrap();
+        let data = aprs
+            .data_region()
+            .ok_or("aprs.data_region() returned None")?;
         assert!(!data.is_empty());
         // Region should span from APRS_DATA_OFFSET to APRS_END_OFFSET.
         let expected_size = APRS_END_OFFSET - APRS_DATA_OFFSET;
         assert_eq!(data.len(), expected_size);
+        Ok(())
     }
 
     #[test]
-    fn aprs_region_size() {
+    fn aprs_region_size() -> TestResult {
         let image = vec![0u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let aprs = mi.aprs();
         // Region should be non-trivial (several KB).
         assert!(aprs.region_size() > 1000);
+        Ok(())
     }
 
     #[test]
-    fn aprs_my_callsign() {
+    fn aprs_my_callsign() -> TestResult {
         let mut image = make_aprs_image();
-        let offset = APRS_DATA_OFFSET + APRS_MY_CALLSIGN_REL;
-        let cs = b"N0CALL-9\0\0";
-        image[offset..offset + 10].copy_from_slice(cs);
+        write_slice(
+            &mut image,
+            APRS_DATA_OFFSET + APRS_MY_CALLSIGN_REL,
+            b"N0CALL-9\0\0",
+        )?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let aprs = mi.aprs();
         assert_eq!(aprs.my_callsign(), "N0CALL-9");
+        Ok(())
     }
 
     #[test]
-    fn aprs_my_callsign_typed() {
+    fn aprs_my_callsign_typed() -> TestResult {
         let mut image = make_aprs_image();
-        let offset = APRS_DATA_OFFSET + APRS_MY_CALLSIGN_REL;
-        let cs = b"W1AW-7\0\0\0\0";
-        image[offset..offset + 10].copy_from_slice(cs);
+        write_slice(
+            &mut image,
+            APRS_DATA_OFFSET + APRS_MY_CALLSIGN_REL,
+            b"W1AW-7\0\0\0\0",
+        )?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let aprs = mi.aprs();
-        let typed = aprs.my_callsign_typed().unwrap();
+        let typed = aprs
+            .my_callsign_typed()
+            .ok_or("my_callsign_typed returned None")?;
         assert_eq!(typed.as_str(), "W1AW-7");
+        Ok(())
     }
 
     #[test]
-    fn aprs_my_callsign_empty() {
+    fn aprs_my_callsign_empty() -> TestResult {
         let image = make_aprs_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let aprs = mi.aprs();
         assert_eq!(aprs.my_callsign(), "");
         assert!(aprs.my_callsign_typed().is_none());
+        Ok(())
     }
 
     #[test]
-    fn aprs_beacon_interval() {
+    fn aprs_beacon_interval() -> TestResult {
         let mut image = make_aprs_image();
         let offset = APRS_DATA_OFFSET + APRS_BEACON_INTERVAL_REL;
         // 180 seconds = 0x00B4 little-endian
-        image[offset] = 0xB4;
-        image[offset + 1] = 0x00;
+        set_byte(&mut image, offset, 0xB4)?;
+        set_byte(&mut image, offset + 1, 0x00)?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let aprs = mi.aprs();
         assert_eq!(aprs.beacon_interval(), 180);
+        Ok(())
     }
 
     #[test]
-    fn aprs_beacon_interval_zero() {
+    fn aprs_beacon_interval_zero() -> TestResult {
         let image = make_aprs_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.aprs().beacon_interval(), 0);
+        Ok(())
     }
 
     #[test]
-    fn aprs_packet_path() {
+    fn aprs_packet_path() -> TestResult {
         let mut image = make_aprs_image();
-        let offset = APRS_DATA_OFFSET + APRS_PACKET_PATH_REL;
-        image[offset] = 2; // WIDE1-1,WIDE2-1
+        set_byte(&mut image, APRS_DATA_OFFSET + APRS_PACKET_PATH_REL, 2)?; // WIDE1-1,WIDE2-1
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let aprs = mi.aprs();
         assert_eq!(aprs.packet_path_index(), 2);
         assert_eq!(aprs.packet_path(), "WIDE1-1,WIDE2-1");
+        Ok(())
     }
 
     #[test]
-    fn aprs_packet_path_off() {
+    fn aprs_packet_path_off() -> TestResult {
         let image = make_aprs_image();
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.aprs().packet_path(), "Off");
+        Ok(())
     }
 
     #[test]
-    fn aprs_packet_path_unknown() {
+    fn aprs_packet_path_unknown() -> TestResult {
         let mut image = make_aprs_image();
-        let offset = APRS_DATA_OFFSET + APRS_PACKET_PATH_REL;
-        image[offset] = 0xFF;
+        set_byte(&mut image, APRS_DATA_OFFSET + APRS_PACKET_PATH_REL, 0xFF)?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.aprs().packet_path(), "Unknown");
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -452,69 +486,87 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn aprs_position_data_region_accessible() {
+    fn aprs_position_data_region_accessible() -> TestResult {
         let image = vec![0u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let aprs = mi.aprs();
-        let region = aprs.position_data_region().unwrap();
+        let region = aprs
+            .position_data_region()
+            .ok_or("position_data_region returned None")?;
         assert_eq!(region.len(), APRS_POSITION_DATA_SIZE);
+        Ok(())
     }
 
     #[test]
-    fn aprs_position_data_size() {
+    fn aprs_position_data_size() -> TestResult {
         let image = vec![0u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.aprs().position_data_size(), 0x4B00);
+        Ok(())
     }
 
     #[test]
-    fn aprs_position_data_bytes() {
+    fn aprs_position_data_bytes() -> TestResult {
         let mut image = vec![0u8; TOTAL_SIZE];
         // Write known data at the start of the position data region.
-        image[APRS_POSITION_DATA_OFFSET..APRS_POSITION_DATA_OFFSET + 4]
-            .copy_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        write_slice(
+            &mut image,
+            APRS_POSITION_DATA_OFFSET,
+            &[0x01, 0x02, 0x03, 0x04],
+        )?;
 
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         let aprs = mi.aprs();
-        let bytes = aprs.position_data_bytes(0, 4).unwrap();
+        let bytes = aprs
+            .position_data_bytes(0, 4)
+            .ok_or("position_data_bytes(0, 4) returned None")?;
         assert_eq!(bytes, &[0x01, 0x02, 0x03, 0x04]);
+        Ok(())
     }
 
     #[test]
-    fn aprs_position_data_bytes_past_region() {
+    fn aprs_position_data_bytes_past_region() -> TestResult {
         let image = vec![0u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         // Try to read past the end of the position data region.
         assert!(
             mi.aprs()
                 .position_data_bytes(APRS_POSITION_DATA_SIZE, 1)
                 .is_none()
         );
+        Ok(())
     }
 
     #[test]
-    fn aprs_has_position_data_empty() {
+    fn aprs_has_position_data_empty() -> TestResult {
         let image = vec![0u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.aprs().has_position_data());
+        Ok(())
     }
 
     #[test]
-    fn aprs_has_position_data_populated() {
+    fn aprs_has_position_data_populated() -> TestResult {
         let mut image = vec![0u8; TOTAL_SIZE];
         // Write non-zero data in the position data region.
-        image[APRS_POSITION_DATA_OFFSET + 100] = 0x42;
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        set_byte(&mut image, APRS_POSITION_DATA_OFFSET + 100, 0x42)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.aprs().has_position_data());
+        Ok(())
     }
 
     #[test]
-    fn aprs_has_position_data_all_ff() {
+    fn aprs_has_position_data_all_ff() -> TestResult {
         let mut image = vec![0u8; TOTAL_SIZE];
         // Fill with 0xFF (common empty marker) -- should not count.
-        let end = APRS_POSITION_DATA_OFFSET + APRS_POSITION_DATA_SIZE;
-        image[APRS_POSITION_DATA_OFFSET..end].fill(0xFF);
-        let mi = crate::memory::MemoryImage::from_raw(image).unwrap();
+        fill_range(
+            &mut image,
+            APRS_POSITION_DATA_OFFSET,
+            APRS_POSITION_DATA_SIZE,
+            0xFF,
+        )?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(!mi.aprs().has_position_data());
+        Ok(())
     }
 }

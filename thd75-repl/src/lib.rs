@@ -15,7 +15,46 @@
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
 #![deny(clippy::nursery)]
-#![allow(clippy::module_name_repetitions)]
+#![expect(
+    clippy::module_name_repetitions,
+    reason = "REPL crate exposes types like `AprsClient`, `DStarSession`, and helpers whose names \
+              deliberately repeat module names so call sites read naturally. Suppressing crate-wide \
+              keeps the public surface ergonomic without adding per-item attributes."
+)]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "Unit tests in this crate use `.unwrap()` / `.unwrap_err()` on `Result` values \
+                  returned by the REPL's own validators (lint, script, confirm) to assert the \
+                  expected Ok/Err split, use `.expect()` on known-valid constructor outputs, \
+                  and use `panic!` as assertion-style reporters. All are safe because the \
+                  tests' setup guarantees the accessed values exist — any violation correctly \
+                  fails the test."
+    )
+)]
+
+// Dev-dependencies / optional deps pulled in only by `src/main.rs` (the binary target).
+// Acknowledge at the lib level so `unused_crate_dependencies` stays silent for the lib
+// compilation unit. When this crate's lib grows to use one of these directly, delete the
+// corresponding `use X as _;` line.
+use clap as _;
+use dirs_next as _;
+use dstar_gateway as _;
+use dstar_gateway_core as _;
+use rustyline as _;
+use time as _;
+use tokio as _;
+use tracing as _;
+use tracing_appender as _;
+use tracing_subscriber as _;
+
+// proptest is a dev-dependency, not referenced in the library source. Acknowledge under
+// `cfg(test)` so `unused_crate_dependencies` stays silent for the lib's test build.
+#[cfg(test)]
+use proptest as _;
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -113,7 +152,7 @@ pub fn set_history_capacity(n: usize) {
     HISTORY_CAPACITY.store(n, Ordering::Relaxed);
     if let Ok(mut buf) = last_output().lock() {
         while buf.len() > n {
-            let _ = buf.pop_front();
+            drop(buf.pop_front());
         }
     }
 }
@@ -128,7 +167,7 @@ pub fn record_output(line: String) {
     }
     if let Ok(mut buf) = last_output().lock() {
         while buf.len() >= cap {
-            let _ = buf.pop_front();
+            drop(buf.pop_front());
         }
         buf.push_back(line);
     }
@@ -174,7 +213,11 @@ macro_rules! aprintln {
         let line = if $crate::TIMESTAMPS.load(
             ::std::sync::atomic::Ordering::Relaxed,
         ) {
-            #[allow(clippy::cast_possible_wrap)]
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "u64 seconds since the epoch will not exceed i64::MAX for billions of \
+                          years, so the cast to i64 is safe for all realistic clock values."
+            )]
             let utc_secs = ::std::time::SystemTime::now()
                 .duration_since(::std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -183,7 +226,11 @@ macro_rules! aprintln {
                 $crate::UTC_OFFSET_SECS.load(::std::sync::atomic::Ordering::Relaxed),
             );
             let local_secs_signed = utc_secs + offset;
-            #[allow(clippy::cast_sign_loss)]
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "The branch explicitly gates on `local_secs_signed < 0`, so the `as u64` \
+                          cast only runs when the value is non-negative."
+            )]
             let local_secs = if local_secs_signed < 0 {
                 0u64
             } else {

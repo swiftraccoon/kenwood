@@ -77,6 +77,10 @@ impl ToneCode {
     /// Maximum valid tone code index (inclusive).
     pub const MAX_INDEX: u8 = 50;
 
+    /// 100.0 Hz CTCSS tone (index 12 in the TH-D75 codebook) — the APRS
+    /// voice-alert default per TH-D75 Operating Tips §5.13.
+    pub const TONE_100HZ: Self = Self(12);
+
     /// Creates a new `ToneCode` from a raw index.
     ///
     /// # Errors
@@ -98,12 +102,25 @@ impl ToneCode {
 
     /// Returns the CTCSS frequency in Hz for this tone code.
     #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`ToneCode::new` validates `self.0 <= MAX_INDEX == 50` and \
+                  CTCSS_FREQUENCIES has 51 entries, so this const-fn index is always \
+                  in-bounds. Kept as indexed access (not `.get(...)`) because `const fn` \
+                  cannot unwrap Option yet and the invariant is type-enforced."
+    )]
     pub const fn frequency_hz(self) -> f64 {
         CTCSS_FREQUENCIES[self.0 as usize]
     }
 }
 
 impl std::fmt::Display for ToneCode {
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "Same invariant as `frequency_hz`: `self.0 <= MAX_INDEX == 50` by \
+                  construction via `ToneCode::new`, so `CTCSS_FREQUENCIES[self.0]` is \
+                  always in-bounds."
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({} Hz)", self.0, CTCSS_FREQUENCIES[self.0 as usize])
     }
@@ -144,12 +161,23 @@ impl DcsCode {
 
     /// Returns the DCS code value for this index.
     #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`DcsCode::new` validates `self.0 < COUNT == 104` and DCS_CODES has 104 \
+                  entries, so this const-fn index is always in-bounds. Kept as indexed \
+                  access because `const fn` cannot unwrap Option yet."
+    )]
     pub const fn code_value(self) -> u16 {
         DCS_CODES[self.0 as usize]
     }
 }
 
 impl std::fmt::Display for DcsCode {
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "Same invariant as `code_value`: `self.0 < COUNT == 104` by construction \
+                  via `DcsCode::new`, so `DCS_CODES[self.0]` is always in-bounds."
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "D{:03}", DCS_CODES[self.0 as usize])
     }
@@ -353,12 +381,26 @@ impl From<LockoutMode> for u8 {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type BoxErr = Box<dyn std::error::Error>;
+
+    fn table_entry(table: &[f64], idx: usize) -> Result<f64, BoxErr> {
+        table.get(idx).copied().ok_or_else(|| {
+            format!(
+                "CTCSS_FREQUENCIES[{idx}] out of range (len={})",
+                table.len()
+            )
+            .into()
+        })
+    }
+
     #[test]
-    fn tone_code_valid_range() {
+    fn tone_code_valid_range() -> TestResult {
         for i in 0u8..=ToneCode::MAX_INDEX {
-            let val = ToneCode::new(i).unwrap();
+            let val = ToneCode::new(i)?;
             assert_eq!(val.index(), i, "ToneCode round-trip failed at {i}");
         }
+        Ok(())
     }
 
     #[test]
@@ -368,26 +410,28 @@ mod tests {
     }
 
     #[test]
-    fn tone_code_frequency_lookup() {
-        let tc = ToneCode::new(0).unwrap();
+    fn tone_code_frequency_lookup() -> TestResult {
+        let tc = ToneCode::new(0)?;
         assert!((tc.frequency_hz() - 67.0).abs() < f64::EPSILON);
-        let tc = ToneCode::new(42).unwrap();
+        let tc = ToneCode::new(42)?;
         assert!((tc.frequency_hz() - 210.7).abs() < f64::EPSILON);
-        let tc = ToneCode::new(49).unwrap();
+        let tc = ToneCode::new(49)?;
         assert!((tc.frequency_hz() - 254.1).abs() < f64::EPSILON);
         // Code 50: 1750 Hz tone burst (European repeater access).
-        let tc = ToneCode::new(50).unwrap();
+        let tc = ToneCode::new(50)?;
         assert!((tc.frequency_hz() - 1750.0).abs() < f64::EPSILON);
+        Ok(())
     }
 
     #[test]
-    fn ctcss_table_completeness() {
+    fn ctcss_table_completeness() -> TestResult {
         assert_eq!(CTCSS_FREQUENCIES.len(), 51);
-        assert!((CTCSS_FREQUENCIES[0] - 67.0).abs() < f64::EPSILON);
-        assert!((CTCSS_FREQUENCIES[42] - 210.7).abs() < f64::EPSILON);
-        assert!((CTCSS_FREQUENCIES[43] - 218.1).abs() < f64::EPSILON);
-        assert!((CTCSS_FREQUENCIES[49] - 254.1).abs() < f64::EPSILON);
-        assert!((CTCSS_FREQUENCIES[50] - 1750.0).abs() < f64::EPSILON);
+        assert!((table_entry(&CTCSS_FREQUENCIES, 0)? - 67.0).abs() < f64::EPSILON);
+        assert!((table_entry(&CTCSS_FREQUENCIES, 42)? - 210.7).abs() < f64::EPSILON);
+        assert!((table_entry(&CTCSS_FREQUENCIES, 43)? - 218.1).abs() < f64::EPSILON);
+        assert!((table_entry(&CTCSS_FREQUENCIES, 49)? - 254.1).abs() < f64::EPSILON);
+        assert!((table_entry(&CTCSS_FREQUENCIES, 50)? - 1750.0).abs() < f64::EPSILON);
+        Ok(())
     }
 
     #[test]
@@ -403,24 +447,27 @@ mod tests {
     }
 
     #[test]
-    fn dcs_code_table_completeness() {
+    fn dcs_code_table_completeness() -> TestResult {
         assert_eq!(DCS_CODES.len(), 104);
-        assert_eq!(DCS_CODES[0], 23);
-        assert_eq!(DCS_CODES[103], 754);
+        assert_eq!(*DCS_CODES.first().ok_or("DCS_CODES[0] missing")?, 23);
+        assert_eq!(*DCS_CODES.get(103).ok_or("DCS_CODES[103] missing")?, 754);
+        Ok(())
     }
 
     #[test]
-    fn dcs_code_value_lookup() {
-        let dc = DcsCode::new(0).unwrap();
+    fn dcs_code_value_lookup() -> TestResult {
+        let dc = DcsCode::new(0)?;
         assert_eq!(dc.code_value(), 23);
+        Ok(())
     }
 
     #[test]
-    fn tone_mode_valid_range() {
+    fn tone_mode_valid_range() -> TestResult {
         for i in 0u8..ToneMode::COUNT {
-            let val = ToneMode::try_from(i).unwrap();
+            let val = ToneMode::try_from(i)?;
             assert_eq!(u8::from(val), i, "ToneMode round-trip failed at {i}");
         }
+        Ok(())
     }
 
     #[test]
@@ -429,29 +476,32 @@ mod tests {
     }
 
     #[test]
-    fn data_speed_valid() {
+    fn data_speed_valid() -> TestResult {
         for i in 0u8..DataSpeed::COUNT {
-            let val = DataSpeed::try_from(i).unwrap();
+            let val = DataSpeed::try_from(i)?;
             assert_eq!(u8::from(val), i, "DataSpeed round-trip failed at {i}");
         }
         assert!(DataSpeed::try_from(DataSpeed::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn lockout_mode_valid() {
+    fn lockout_mode_valid() -> TestResult {
         for i in 0u8..LockoutMode::COUNT {
-            let val = LockoutMode::try_from(i).unwrap();
+            let val = LockoutMode::try_from(i)?;
             assert_eq!(u8::from(val), i, "LockoutMode round-trip failed at {i}");
         }
         assert!(LockoutMode::try_from(LockoutMode::COUNT).is_err());
+        Ok(())
     }
 
     #[test]
-    fn ctcss_mode_valid() {
+    fn ctcss_mode_valid() -> TestResult {
         for i in 0u8..CtcssMode::COUNT {
-            let val = CtcssMode::try_from(i).unwrap();
+            let val = CtcssMode::try_from(i)?;
             assert_eq!(u8::from(val), i, "CtcssMode round-trip failed at {i}");
         }
         assert!(CtcssMode::try_from(CtcssMode::COUNT).is_err());
+        Ok(())
     }
 }

@@ -130,7 +130,12 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    #[allow(clippy::fn_params_excessive_bools, clippy::similar_names)]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "CAT `GS band,gga,gll,gsa,gsv,rmc,vtg` is a 6-boolean fixed-format command — the \
+                  API mirrors the wire layout 1:1. Grouping into a struct would add indirection \
+                  without improving clarity since each bool names one NMEA sentence type."
+    )]
     pub async fn set_gps_sentences(
         &mut self,
         gga: bool,

@@ -394,111 +394,124 @@ mod tests {
     use super::*;
     use crate::transport::MockTransport;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     // DC wire format: "DC slot,callsign,suffix\r"
     // Response echoes the same format back.
 
     #[tokio::test]
-    async fn get_urcall_reads_slot_1() {
+    async fn get_urcall_reads_slot_1() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"DC 1\r", b"DC 1,CQCQCQ  ,    \r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
-        let (callsign, suffix) = radio.get_urcall().await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        let (callsign, suffix) = radio.get_urcall().await?;
         assert_eq!(callsign, "CQCQCQ  ");
         assert_eq!(suffix, "    ");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_urcall_pads_and_writes_slot_1() {
+    async fn set_urcall_pads_and_writes_slot_1() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"DC 1,KQ4NIT  ,    \r", b"DC 1,KQ4NIT  ,    \r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
-        radio.set_urcall("KQ4NIT", "").await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        radio.set_urcall("KQ4NIT", "").await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn get_rpt1_reads_slot_2() {
+    async fn get_rpt1_reads_slot_2() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"DC 2\r", b"DC 2,W4BFB  C,    \r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
-        let (callsign, _suffix) = radio.get_rpt1().await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        let (callsign, _suffix) = radio.get_rpt1().await?;
         assert_eq!(callsign, "W4BFB  C");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_rpt1_pads_and_writes_slot_2() {
+    async fn set_rpt1_pads_and_writes_slot_2() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"DC 2,W4BFB  C,    \r", b"DC 2,W4BFB  C,    \r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
-        radio.set_rpt1("W4BFB  C", "").await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        radio.set_rpt1("W4BFB  C", "").await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn get_rpt2_reads_slot_3() {
+    async fn get_rpt2_reads_slot_3() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"DC 3\r", b"DC 3,W4BFB  G,    \r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
-        let (callsign, _suffix) = radio.get_rpt2().await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        let (callsign, _suffix) = radio.get_rpt2().await?;
         assert_eq!(callsign, "W4BFB  G");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_rpt2_pads_and_writes_slot_3() {
+    async fn set_rpt2_pads_and_writes_slot_3() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"DC 3,W4BFB  G,    \r", b"DC 3,W4BFB  G,    \r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
-        radio.set_rpt2("W4BFB  G", "").await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        radio.set_rpt2("W4BFB  G", "").await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn connect_reflector_sets_urcall_with_link_suffix() {
+    async fn connect_reflector_sets_urcall_with_link_suffix() -> TestResult {
         let mut mock = MockTransport::new();
         // "REF030" padded to 8 = "REF030  ", suffix "CL" padded to 4 = "CL  "
         mock.expect(b"DC 1,REF030  ,CL  \r", b"DC 1,REF030  ,CL  \r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
-        radio.connect_reflector("REF030", 'C').await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        radio.connect_reflector("REF030", 'C').await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn disconnect_reflector_sets_unlink_urcall() {
+    async fn disconnect_reflector_sets_unlink_urcall() -> TestResult {
         let mut mock = MockTransport::new();
         // "       U" is already 8 chars, suffix "" padded to "    "
         mock.expect(b"DC 1,       U,    \r", b"DC 1,       U,    \r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
-        radio.disconnect_reflector().await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        radio.disconnect_reflector().await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_cq_sets_cqcqcq() {
+    async fn set_cq_sets_cqcqcq() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"DC 1,CQCQCQ  ,    \r", b"DC 1,CQCQCQ  ,    \r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
-        radio.set_cq().await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        radio.set_cq().await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn route_to_callsign_sets_urcall() {
+    async fn route_to_callsign_sets_urcall() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"DC 1,KQ4NIT  ,    \r", b"DC 1,KQ4NIT  ,    \r");
 
-        let mut radio = Radio::connect(mock).await.unwrap();
-        radio.route_to_callsign("KQ4NIT").await.unwrap();
+        let mut radio = Radio::connect(mock).await?;
+        radio.route_to_callsign("KQ4NIT").await?;
+        Ok(())
     }
 
     #[test]
-    fn pad_callsign_valid() {
-        assert_eq!(pad_callsign("CQCQCQ").unwrap(), "CQCQCQ  ");
-        assert_eq!(pad_callsign("KQ4NIT").unwrap(), "KQ4NIT  ");
-        assert_eq!(pad_callsign("       U").unwrap(), "       U");
-        assert_eq!(pad_callsign("").unwrap(), "        ");
+    fn pad_callsign_valid() -> TestResult {
+        assert_eq!(pad_callsign("CQCQCQ")?, "CQCQCQ  ");
+        assert_eq!(pad_callsign("KQ4NIT")?, "KQ4NIT  ");
+        assert_eq!(pad_callsign("       U")?, "       U");
+        assert_eq!(pad_callsign("")?, "        ");
+        Ok(())
     }
 
     #[test]
@@ -507,10 +520,11 @@ mod tests {
     }
 
     #[test]
-    fn pad_suffix_valid() {
-        assert_eq!(pad_suffix("").unwrap(), "    ");
-        assert_eq!(pad_suffix("CL").unwrap(), "CL  ");
-        assert_eq!(pad_suffix("D75A").unwrap(), "D75A");
+    fn pad_suffix_valid() -> TestResult {
+        assert_eq!(pad_suffix("")?, "    ");
+        assert_eq!(pad_suffix("CL")?, "CL  ");
+        assert_eq!(pad_suffix("D75A")?, "D75A");
+        Ok(())
     }
 
     #[test]

@@ -144,7 +144,9 @@ impl Transport for MockTransport {
         })?;
 
         let len = response.len().min(buf.len());
-        buf[..len].copy_from_slice(&response[..len]);
+        if let (Some(dst), Some(src)) = (buf.get_mut(..len), response.get(..len)) {
+            dst.copy_from_slice(src);
+        }
         tracing::debug!(bytes = len, "mock: read");
         Ok(len)
     }
@@ -161,15 +163,25 @@ impl Transport for MockTransport {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type BoxErr = Box<dyn std::error::Error>;
+
+    /// Return `&buf[..n]` or an error if `n` exceeds buffer length.
+    fn read_prefix(buf: &[u8], n: usize) -> Result<&[u8], BoxErr> {
+        buf.get(..n)
+            .ok_or_else(|| format!("read_prefix: len {n} exceeds buffer len {}", buf.len()).into())
+    }
+
     #[tokio::test]
-    async fn basic_exchange() {
+    async fn basic_exchange() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"ID\r", b"ID TH-D75\r");
-        mock.write(b"ID\r").await.unwrap();
+        mock.write(b"ID\r").await?;
         let mut buf = [0u8; 64];
-        let n = mock.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ID TH-D75\r");
+        let n = mock.read(&mut buf).await?;
+        assert_eq!(read_prefix(&buf, n)?, b"ID TH-D75\r");
         mock.assert_complete();
+        Ok(())
     }
 
     #[tokio::test]
@@ -177,42 +189,46 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.expect(b"ID\r", b"ID TH-D75\r");
         let result = mock.write(b"FV\r").await;
-        assert!(result.is_err());
+        assert!(
+            result.is_err(),
+            "expected write to unexpected cmd to fail: {result:?}"
+        );
     }
 
     #[tokio::test]
-    async fn multiple_exchanges() {
+    async fn multiple_exchanges() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"ID\r", b"ID TH-D75\r");
         mock.expect(b"FV\r", b"FV 1.03.000\r");
 
-        mock.write(b"ID\r").await.unwrap();
+        mock.write(b"ID\r").await?;
         let mut buf = [0u8; 64];
-        let n = mock.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ID TH-D75\r");
+        let n = mock.read(&mut buf).await?;
+        assert_eq!(read_prefix(&buf, n)?, b"ID TH-D75\r");
 
-        mock.write(b"FV\r").await.unwrap();
-        let n = mock.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"FV 1.03.000\r");
+        mock.write(b"FV\r").await?;
+        let n = mock.read(&mut buf).await?;
+        assert_eq!(read_prefix(&buf, n)?, b"FV 1.03.000\r");
 
         mock.assert_complete();
+        Ok(())
     }
 
     #[tokio::test]
-    async fn from_fixture_file() {
-        let mut mock =
-            MockTransport::from_fixture(Path::new("tests/fixtures/identify.txt")).unwrap();
+    async fn from_fixture_file() -> TestResult {
+        let mut mock = MockTransport::from_fixture(Path::new("tests/fixtures/identify.txt"))?;
 
-        mock.write(b"ID\r").await.unwrap();
+        mock.write(b"ID\r").await?;
         let mut buf = [0u8; 64];
-        let n = mock.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ID TH-D75\r");
+        let n = mock.read(&mut buf).await?;
+        assert_eq!(read_prefix(&buf, n)?, b"ID TH-D75\r");
 
-        mock.write(b"FV\r").await.unwrap();
-        let n = mock.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"FV 1.03.000\r");
+        mock.write(b"FV\r").await?;
+        let n = mock.read(&mut buf).await?;
+        assert_eq!(read_prefix(&buf, n)?, b"FV 1.03.000\r");
 
         mock.assert_complete();
+        Ok(())
     }
 
     #[tokio::test]
@@ -220,14 +236,20 @@ mod tests {
         let mut mock = MockTransport::new();
         let mut buf = [0u8; 64];
         let result = mock.read(&mut buf).await;
-        assert!(result.is_err());
+        assert!(
+            result.is_err(),
+            "expected read-before-write to fail: {result:?}"
+        );
     }
 
     #[tokio::test]
     async fn write_with_no_exchanges_errors() {
         let mut mock = MockTransport::new();
         let result = mock.write(b"ID\r").await;
-        assert!(result.is_err());
+        assert!(
+            result.is_err(),
+            "expected write with no expectations to fail: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -237,10 +259,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_clears_state() {
+    async fn close_clears_state() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"ID\r", b"ID TH-D75\r");
-        mock.close().await.unwrap();
+        mock.close().await?;
         mock.assert_complete();
+        Ok(())
     }
 }

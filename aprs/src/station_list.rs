@@ -55,7 +55,6 @@ pub struct StationEntry {
 impl StationList {
     /// Create a new station list with the given capacity and age limits.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // HashMap::new() is not const
     pub fn new(max_entries: usize, max_age: Duration) -> Self {
         Self {
             stations: HashMap::new(),

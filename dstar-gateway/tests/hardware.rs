@@ -33,10 +33,13 @@
 //! required for any test that transmits. Remove none of these gates.
 
 #![cfg(feature = "hardware-tests")]
-#![allow(
+#![expect(
     clippy::indexing_slicing,
-    clippy::too_many_lines,
-    reason = "integration test — recv_from returns n within buf; test functions are necessarily long"
+    reason = "Hardware-in-the-loop integration test file. `clippy::indexing_slicing` fires \
+              on `&buf[..n]` slices taken after `UdpSocket::recv_from` returns a byte count; \
+              this is safe because `recv_from`'s contract guarantees `n <= buf.len()` on \
+              success, so the slice is always in-bounds. Using `buf.get(..n)` would force \
+              either an `.expect()` or `.unwrap()` at every recv site with no added safety."
 )]
 
 use std::net::SocketAddr;

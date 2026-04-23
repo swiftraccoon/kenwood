@@ -232,16 +232,21 @@ impl fmt::Display for SdCardError {
 impl std::error::Error for SdCardError {}
 
 /// Read a little-endian `u16` from a byte slice at the given offset.
+///
+/// Returns `0` if the slice is too short — callers are expected to have
+/// validated the buffer length against their wire-format constants.
 pub(crate) fn read_u16_le(data: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([data[offset], data[offset + 1]])
+    data.get(offset..offset + 2)
+        .and_then(|s| <[u8; 2]>::try_from(s).ok())
+        .map_or(0, u16::from_le_bytes)
 }
 
 /// Read a little-endian `u32` from a byte slice at the given offset.
+///
+/// Returns `0` if the slice is too short — callers are expected to have
+/// validated the buffer length against their wire-format constants.
 pub(crate) fn read_u32_le(data: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-    ])
+    data.get(offset..offset + 4)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .map_or(0, u32::from_le_bytes)
 }
