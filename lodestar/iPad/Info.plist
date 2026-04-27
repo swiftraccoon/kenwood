@@ -22,14 +22,6 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Lodestar uses Bluetooth to reach a Kenwood TH-D75 handheld radio for D-STAR relay.</string>
-	<key>NSBluetoothPeripheralUsageDescription</key>
-	<string>Lodestar uses Bluetooth to reach a Kenwood TH-D75 handheld radio for D-STAR relay.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Lodestar can use the microphone to transmit voice directly to a D-STAR reflector.</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>Lodestar connects to D-STAR reflectors over the internet.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -42,12 +34,6 @@
 		<string>arm64</string>
 	</array>
 	<key>UISupportedInterfaceOrientations</key>
-	<array>
-		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
-		<string>UIInterfaceOrientationLandscapeRight</string>
-	</array>
-	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 		<string>UIInterfaceOrientationPortraitUpsideDown</string>

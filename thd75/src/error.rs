@@ -36,6 +36,7 @@ use thiserror::Error;
 
 /// Top-level error type for all radio operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// A transport-layer (serial/Bluetooth) error occurred.
     #[error(transparent)]
@@ -93,6 +94,7 @@ pub enum Error {
 
 /// Errors originating from the transport layer (serial port / Bluetooth).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TransportError {
     /// Failed to open the serial port at the given path.
     #[error("failed to open serial port at {path}")]
@@ -111,6 +113,7 @@ pub enum TransportError {
     #[error("serial connection lost")]
     Disconnected(
         /// The underlying I/O error.
+        #[source]
         std::io::Error,
     ),
 
@@ -118,6 +121,7 @@ pub enum TransportError {
     #[error("serial write failed")]
     Write(
         /// The underlying I/O error.
+        #[source]
         std::io::Error,
     ),
 
@@ -125,12 +129,14 @@ pub enum TransportError {
     #[error("serial read failed")]
     Read(
         /// The underlying I/O error.
+        #[source]
         std::io::Error,
     ),
 }
 
 /// Errors in the CAT protocol layer (framing, field parsing, etc.).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ProtocolError {
     /// The radio returned an unknown command identifier.
     #[error("unknown command: {0}")]
@@ -176,10 +182,27 @@ pub enum ProtocolError {
         /// The raw bytes of the malformed frame.
         Vec<u8>,
     ),
+
+    /// An MCP `W` write response was shorter than the required frame size.
+    #[error("W response too short: {actual} bytes, expected {expected}")]
+    WriteResponseTooShort {
+        /// The actual byte count received.
+        actual: usize,
+        /// The minimum byte count required (marker + 4-byte address + page).
+        expected: usize,
+    },
+
+    /// An MCP write response carried a marker byte other than `'W'`.
+    #[error("expected W response marker, got 0x{got:02X}")]
+    WriteResponseBadMarker {
+        /// The byte received in place of the `W` marker.
+        got: u8,
+    },
 }
 
 /// Errors raised when a user-supplied value fails validation.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ValidationError {
     /// The CTCSS tone code is outside the valid range 0-49.
     #[error("tone code {0} out of range (must be 0-49)")]

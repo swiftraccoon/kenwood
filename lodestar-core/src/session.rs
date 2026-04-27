@@ -299,6 +299,7 @@ pub trait ReflectorObserver: Send + Sync + std::fmt::Debug {
 
 /// Error variants surfaced across the FFI boundary.
 #[derive(Debug, Error, uniffi::Error)]
+#[non_exhaustive]
 pub enum ReflectorError {
     /// Caller-supplied callsign is not a valid D-STAR callsign.
     #[error("invalid callsign: {0}")]
@@ -789,6 +790,14 @@ impl StreamSlowDataState {
     /// Ingest one voice-frame slow-data fragment. `seq` is the reflector
     /// frame index (0 every 21 frames → D-STAR superframe sync).
     fn push(&mut self, slow_data: [u8; 3], seq: u8) -> SlowDataDelta {
+        tracing::trace!(
+            target: "lodestar_core::session::slow_data",
+            seq,
+            bytes = ?slow_data,
+            phase = ?self.block_phase,
+            "slow-data frame"
+        );
+
         // D-STAR superframe sync: slow_data is filler (0x55 0x55 0x55).
         // Any partial block is discarded protocol-wide.
         if seq == 0 {
@@ -827,6 +836,18 @@ impl StreamSlowDataState {
     fn commit_block(&mut self) -> SlowDataDelta {
         let type_byte = self.block_buffer.first().copied().unwrap_or(0);
         let type_high = type_byte & SLOW_DATA_TYPE_MASK;
+
+        tracing::debug!(
+            target: "lodestar_core::session::slow_data",
+            type_byte = format_args!("0x{:02X}", type_byte),
+            block = format_args!(
+                "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                self.block_buffer[0], self.block_buffer[1], self.block_buffer[2],
+                self.block_buffer[3], self.block_buffer[4], self.block_buffer[5]
+            ),
+            payload_ascii = ?String::from_utf8_lossy(&self.block_buffer[1..6]),
+            "6-byte slow-data block assembled"
+        );
 
         let mut delta = SlowDataDelta::default();
         match type_high {
@@ -1488,5 +1509,171 @@ async fn connect_dplus(
                 Err(e)
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — end-to-end slow-data GPS decoder
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation,
+    clippy::drop_non_drop,
+    reason = "test fixtures use fixed-size buffers and known-valid IDs; \
+              panicking on violation is the intended failure signal. \
+              `drop(delta)` is the clippy-compliant way to silence \
+              unused_results on SlowDataDelta in this strict crate."
+)]
+mod slow_data_gps_tests {
+    use super::*;
+    use dstar_gateway_core::StreamId;
+    use dstar_gateway_core::slowdata::scramble;
+
+    /// Re-implement ircDDBGateway's `CSlowDataEncoder::setGPSData` + `getData`
+    /// pair to produce the exact wire bytes (scrambled, in 3-byte frames)
+    /// a Kenwood radio / hotspot would emit for the given DPRS sentence.
+    ///
+    /// Layout (from `SlowDataEncoder.cpp:329-357`):
+    ///
+    /// ```text
+    /// for each chunk of up to 5 chars:
+    ///     emit byte: (SLOW_DATA_TYPE_GPS=0x30) | dataLen
+    ///     emit `dataLen` chars
+    /// pad remaining buffer up to the nearest 60-byte multiple; the
+    /// padding itself is emitted through the `(0x30 | 0) = 0x30`
+    /// short-chunk path, so the tail of the stream is a run of 0x30
+    /// bytes.
+    /// ```
+    fn encode_dprs_to_scrambled_frames(sentence: &str) -> Vec<[u8; 3]> {
+        const TYPE_GPS: u8 = 0x30;
+        const BLOCK_SIZE: usize = 6;
+        const FULL_BLOCK_SIZE: usize = BLOCK_SIZE * 10;
+
+        let bytes = sentence.as_bytes();
+        let data_size = 1 + bytes.len().saturating_sub(1) / BLOCK_SIZE + bytes.len();
+        let full_size = FULL_BLOCK_SIZE * (1 + (data_size.saturating_sub(1)) / FULL_BLOCK_SIZE);
+
+        let mut buf = vec![b'f'; full_size];
+        let mut str_pos = 0usize;
+        let mut pos = 0usize;
+        while pos < full_size {
+            let data_len = (bytes.len() - str_pos).min(5);
+            buf[pos] = TYPE_GPS | (data_len as u8);
+            pos += 1;
+            for _ in 0..data_len {
+                if pos >= full_size {
+                    break;
+                }
+                buf[pos] = bytes[str_pos];
+                pos += 1;
+                str_pos += 1;
+            }
+        }
+
+        let mut frames: Vec<[u8; 3]> = Vec::new();
+        for chunk in buf.chunks_exact(3) {
+            let mut tri = [0u8; 3];
+            tri.copy_from_slice(chunk);
+            frames.push(scramble(tri));
+        }
+        frames
+    }
+
+    /// Feed the given scrambled frames through the real
+    /// `StreamSlowDataState.push` pipeline and return the extracted
+    /// latest position, if any.
+    fn decode_frames(frames: &[[u8; 3]]) -> Option<GpsPosition> {
+        let sid = StreamId::new(0x1234).unwrap();
+        let mut state = StreamSlowDataState::new(sid);
+
+        let mut seq: u8 = 1;
+        for &frame in frames {
+            drop(state.push(frame, seq));
+            seq = seq.wrapping_add(1);
+            if seq == 0 {
+                seq = 1;
+            }
+        }
+        state.latest_position
+    }
+
+    #[test]
+    fn decodes_dprs_sentence_with_cr_terminator() {
+        let sentence = "$$CRC1234,W1AW    >APDPRS,DSTAR*:!4321.12N/07123.45W>Test\r";
+        let frames = encode_dprs_to_scrambled_frames(sentence);
+        assert!(
+            frames.len() >= 20,
+            "encoder should produce at least one full 60-byte row, got {}",
+            frames.len()
+        );
+
+        let pos = decode_frames(&frames).expect("decoder should recover position");
+        assert_eq!(pos.callsign.trim(), "W1AW");
+        let expected_lat = 43.0 + 21.12 / 60.0;
+        let expected_lon = -(71.0 + 23.45 / 60.0);
+        assert!(
+            (pos.latitude - expected_lat).abs() < 0.01,
+            "lat {} not near {}",
+            pos.latitude,
+            expected_lat
+        );
+        assert!(
+            (pos.longitude - expected_lon).abs() < 0.01,
+            "lon {} not near {}",
+            pos.longitude,
+            expected_lon
+        );
+    }
+
+    #[test]
+    fn no_terminator_means_no_position() {
+        let sentence = "$$CRC1234,W1AW    >APDPRS,DSTAR*:!4321.12N/07123.45W>Test";
+        let frames = encode_dprs_to_scrambled_frames(sentence);
+        assert!(decode_frames(&frames).is_none());
+    }
+
+    #[test]
+    fn nmea_rmc_sentence_decodes() {
+        let sentence = "$GPRMC,123456.00,A,4321.1200,N,07123.4500,W,0.0,0.0,010125,,*31\n";
+        let frames = encode_dprs_to_scrambled_frames(sentence);
+        let pos = decode_frames(&frames).expect("decoder should recover GPRMC");
+        let expected_lat = 43.0 + 21.12 / 60.0;
+        assert!(
+            (pos.latitude - expected_lat).abs() < 0.01,
+            "lat {}",
+            pos.latitude
+        );
+    }
+
+    #[test]
+    fn test_scrambler_roundtrip_with_real_sentence() {
+        let sentence = "$$CRC0001,XXX\r";
+        let frames = encode_dprs_to_scrambled_frames(sentence);
+        let plain0 = dstar_gateway_core::slowdata::descramble(frames[0]);
+        let plain1 = dstar_gateway_core::slowdata::descramble(frames[1]);
+        let mut block = [0u8; 6];
+        block[0..3].copy_from_slice(&plain0);
+        block[3..6].copy_from_slice(&plain1);
+        assert_eq!(
+            block[0], 0x35,
+            "first block type byte should be 0x35 (GPS|5)"
+        );
+        assert_eq!(&block[1..6], b"$$CRC");
+    }
+
+    /// Exercise the block-phase alignment: if we "join mid-stream"
+    /// by skipping the first frame, every downstream block read is
+    /// shifted by 3 bytes — the type nibble will be whatever byte 4
+    /// of the original block was, never 0x3X. No GPS should decode.
+    #[test]
+    fn misaligned_stream_join_drops_gps() {
+        let sentence = "$$CRC1234,W1AW    >APDPRS,DSTAR*:!4321.12N/07123.45W>\r";
+        let frames = encode_dprs_to_scrambled_frames(sentence);
+        let shifted = &frames[1..];
+        assert!(decode_frames(shifted).is_none());
     }
 }

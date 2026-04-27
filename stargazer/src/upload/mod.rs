@@ -101,6 +101,14 @@ pub(crate) async fn run(
     // skip missed ticks instead of trying to catch up.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    #[expect(
+        clippy::infinite_loop,
+        reason = "Daemon main loop — runs for the lifetime of the upload service. \
+                  Termination is by process exit (SIGINT/SIGTERM); there is no \
+                  clean-shutdown signal in the upload pipeline because the next \
+                  `interval.tick().await` is the only blocking point and tokio \
+                  cancels the future on runtime shutdown."
+    )]
     loop {
         let _instant = interval.tick().await;
         process_pending(&client, &pool, &config).await;

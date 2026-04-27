@@ -231,6 +231,12 @@ fn transcode_dcs(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::indexing_slicing,
+        reason = "Tests build fixed-size voice frames and assert per-byte invariants \
+                  via direct indexing; bounds are obvious by construction."
+    )]
+
     use super::*;
     use dstar_gateway_core::types::{Callsign, Suffix};
 

@@ -14,6 +14,8 @@ use std::num::NonZeroU16;
 /// any code path holding a `StreamId` is statically guaranteed not
 /// to be carrying a malformed stream id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[doc(alias = "stream-id")]
+#[doc(alias = "voice-stream-id")]
 pub struct StreamId(NonZeroU16);
 
 impl StreamId {

@@ -21,20 +21,10 @@
               deliberately repeat module names so call sites read naturally. Suppressing crate-wide \
               keeps the public surface ergonomic without adding per-item attributes."
 )]
-#![cfg_attr(
-    test,
-    expect(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        reason = "Unit tests in this crate use `.unwrap()` / `.unwrap_err()` on `Result` values \
-                  returned by the REPL's own validators (lint, script, confirm) to assert the \
-                  expected Ok/Err split, use `.expect()` on known-valid constructor outputs, \
-                  and use `panic!` as assertion-style reporters. All are safe because the \
-                  tests' setup guarantees the accessed values exist — any violation correctly \
-                  fails the test."
-    )
-)]
+// Note: `unwrap_used`, `expect_used`, and `panic` are already allowed crate-wide via
+// `[lints.clippy]` in `Cargo.toml`. A previous `cfg_attr(test, expect(...))` block was
+// removed because the workspace policy bans that form (it gates suppression on the
+// build predicate, not on whether the annotated item is actually a test).
 
 // Dev-dependencies / optional deps pulled in only by `src/main.rs` (the binary target).
 // Acknowledge at the lib level so `unused_crate_dependencies` stays silent for the lib

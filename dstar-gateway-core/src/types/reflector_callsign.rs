@@ -17,6 +17,8 @@ use super::type_error::TypeError;
 ///   `XRF`, `XLX`, `DCS`.
 /// - The associated [`ProtocolKind`] is cached at construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[doc(alias = "reflector")]
+#[doc(alias = "reflector-name")]
 pub struct ReflectorCallsign {
     callsign: Callsign,
     protocol: ProtocolKind,

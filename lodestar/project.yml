@@ -33,21 +33,27 @@ settings:
     CODE_SIGNING_REQUIRED: YES
 
 targets:
-  LodestarIOS:
+  LodestarIPad:
     type: application
     platform: iOS
     sources:
       - path: Shared
-      - path: iOS
+      - path: iPad
         excludes:
           - Info.plist
+          - Lodestar.entitlements
       - path: Generated
         optional: true
     dependencies:
       - framework: LodestarKit.xcframework
         embed: false
+      # Embed the dext at <App>.app/SystemExtensions/<dext>.dext.
+      # iPadOS auto-loads it when the matching USB device is plugged in.
+      - target: LodestarDriver
+        embed: true
+        codeSign: true
     info:
-      path: iOS/Info.plist
+      path: iPad/Info.plist
       properties:
         CFBundleDisplayName: Lodestar
         CFBundleShortVersionString: $(MARKETING_VERSION)
@@ -59,24 +65,58 @@ targets:
         UIRequiredDeviceCapabilities: [arm64]
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-          - UIInterfaceOrientationLandscapeLeft
-          - UIInterfaceOrientationLandscapeRight
-        "UISupportedInterfaceOrientations~ipad":
-          - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
     settings:
       base:
-        TARGETED_DEVICE_FAMILY: "1,2"
+        # iPad-only. iPhone has no path to the radio (no MFi, no
+        # DriverKit, BT-Classic SPP behind private framework). M-series
+        # iPad Pros/Air get USB-C CDC via the embedded LodestarDriver
+        # dext.
+        TARGETED_DEVICE_FAMILY: "2"
         PRODUCT_MODULE_NAME: Lodestar
-        PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.lodestar
+        PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.lodestar.ipad
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        # Prevent this iOS binary from launching on Apple Silicon Macs
+        CODE_SIGN_ENTITLEMENTS: iPad/Lodestar.entitlements
+        # Prevent this iPad binary from launching on Apple Silicon Macs
         # as "Designed for iPad". Users should run LodestarMac instead,
         # which is the real native macOS build with IOBluetooth access.
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
         SUPPORTS_MACCATALYST: NO
+
+  LodestarDriver:
+    type: driver-extension
+    # DriverKit dexts compile against the `driverkit` SDK, NOT
+    # `iphoneos` — they're a separate toolchain even though they run
+    # on iPadOS. xcodegen's `platform:` field maps to SUPPORTED_PLATFORMS
+    # so we override below.
+    platform: iOS
+    sources:
+      - path: Driver
+        excludes:
+          - Driver.entitlements
+    dependencies:
+      - sdk: DriverKit.framework
+      - sdk: USBDriverKit.framework
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "2"
+        PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.lodestar.ipad.driver
+        # The dext's hand-written Info.plist holds the IOKitPersonalities
+        # dict matching TH-D75 — too nested to express in project.yml's
+        # `info.properties`, so reference it directly.
+        INFOPLIST_FILE: Driver/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Driver/Driver.entitlements
+        # DriverKit dexts use the `driverkit` SDK (Xcode 26.5 ships
+        # `DriverKit25.5.sdk`). The same SDK builds for both macOS and
+        # iPadOS targets — iPadOS-vs-macOS distinction is at runtime
+        # via the deployment target rather than a separate sub-SDK.
+        SDKROOT: driverkit
+        SUPPORTED_PLATFORMS: driverkit
+        CLANG_CXX_LANGUAGE_STANDARD: gnu++17
+        CLANG_CXX_LIBRARY: libc++
+        DRIVERKIT_DEPLOYMENT_TARGET: "23.0"
 
   LodestarMac:
     type: application
@@ -133,9 +173,9 @@ schemes:
         - LodestarTests
     run:
       config: Debug
-  LodestarIOS:
+  LodestarIPad:
     build:
       targets:
-        LodestarIOS: all
+        LodestarIPad: all
     run:
       config: Debug

@@ -203,7 +203,7 @@ run_inline "unsafe audit (workspace-wide)" check_unsafe_audit
 check_required_tools() {
     local missing=()
     local tool
-    for tool in cargo-audit cargo-deny cargo-machete; do
+    for tool in cargo-audit cargo-deny cargo-machete shellcheck taplo; do
         if ! command -v "$tool" &>/dev/null; then
             missing+=("$tool")
         fi
@@ -212,7 +212,11 @@ check_required_tools() {
         echo "ERROR: required lint-gate tools are missing: ${missing[*]}"
         echo "Install with:"
         for tool in "${missing[@]}"; do
-            echo "  cargo install $tool"
+            case "$tool" in
+                shellcheck) echo "  brew install shellcheck   # or: apt install shellcheck" ;;
+                taplo)      echo "  cargo install taplo-cli --locked" ;;
+                *)          echo "  cargo install $tool" ;;
+            esac
         done
         return 1
     fi
@@ -259,6 +263,15 @@ run cargo fmt --all -- --check
 run cargo audit --file Cargo.lock
 run cargo deny check
 run cargo machete .
+
+# Static-analyze the lint gate scripts themselves. Both files contain
+# trap handlers, kubectl heredocs, and pipefail-sensitive pipelines;
+# shellcheck catches the bash foot-guns those introduce.
+run shellcheck lint.sh ci-local.sh
+
+# Verify every workspace `Cargo.toml` is taplo-formatted. Catches manifest
+# drift (trailing whitespace, key reordering) before it reaches review.
+run taplo fmt --check Cargo.toml '*/Cargo.toml'
 
 # ---------- summary ----------
 echo

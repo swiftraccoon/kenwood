@@ -38,7 +38,11 @@ fn main() -> std::io::Result<()> {
         Some("-") | None => None,
         Some(p) => Some(std::fs::File::create(p)?),
     };
-    let mut enc = mbelib_rs::AmbeEncoder::new();
+    let mut enc = if std::env::var_os("MBELIB_LOOKAHEAD").is_some() {
+        mbelib_rs::AmbeEncoder::new_with_lookahead()
+    } else {
+        mbelib_rs::AmbeEncoder::new()
+    };
 
     let mut pcm_bytes = [0u8; 320];
     let mut frame_idx = 0_usize;

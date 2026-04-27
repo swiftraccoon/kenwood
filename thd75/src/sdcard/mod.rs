@@ -68,6 +68,7 @@ use std::fmt;
 
 /// Errors that can occur when parsing SD card files.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SdCardError {
     /// The file is too small to contain the expected data.
     FileTooSmall {

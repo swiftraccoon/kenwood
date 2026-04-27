@@ -1,9 +1,14 @@
-# Lodestar — native macOS + iOS / iPadOS app
+# Lodestar — native macOS + iPadOS app
 
-D-STAR gateway app for the Kenwood TH-D75. Runs on iPhone (iOS 17+),
-iPad (iPadOS 17+), and Mac (native macOS 14+). Bluetooth Classic SPP
-to the radio is macOS-only right now because `IOBluetoothDevice` is
-unavailable on Mac Catalyst and iOS Core Bluetooth Classic is GATT-only.
+D-STAR gateway app for the Kenwood TH-D75. Runs on iPad (iPadOS 17+)
+and Mac (native macOS 14+).
+
+- macOS connects to the radio over Bluetooth Classic SPP via `IOBluetooth`.
+- iPad direct radio access uses USB-C CDC via an embedded DriverKit driver
+  extension (M-series iPads only). The Swift transport scaffolding ships;
+  the dext implementation is iterating on real hardware.
+- iPhone is out of scope — Apple offers no public path from iPhone to a
+  non-MFi USB-C or Bluetooth Classic SPP accessory.
 
 ![lodestar_macos](../lodestar_macos.png)
 

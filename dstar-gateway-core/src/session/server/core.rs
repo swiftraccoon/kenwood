@@ -250,7 +250,7 @@ impl ServerSessionCore {
         match self.kind {
             ProtocolKind::DExtra => self.handle_dextra_input(now, bytes),
             ProtocolKind::DPlus => self.handle_dplus_input(now, bytes),
-            ProtocolKind::Dcs => self.handle_dcs_input(bytes),
+            ProtocolKind::Dcs => self.handle_dcs_input(now, bytes),
         }
     }
 
@@ -570,7 +570,7 @@ impl ServerSessionCore {
 
     // ─── DCS server handshake ─────────────────────────────────────
 
-    fn handle_dcs_input(&mut self, bytes: &[u8]) -> Result<(), Error> {
+    fn handle_dcs_input(&mut self, now: Instant, bytes: &[u8]) -> Result<(), Error> {
         let packet = decode_dcs_client_to_server(bytes, &mut self.diagnostics)
             .map_err(|e| Error::Protocol(ProtocolError::Dcs(e)))?;
         match packet {
@@ -579,7 +579,7 @@ impl ServerSessionCore {
                 client_module,
                 reflector_module,
                 ..
-            } => self.on_dcs_link(callsign, client_module, reflector_module),
+            } => self.on_dcs_link(now, callsign, client_module, reflector_module),
             DcsClientPacket::Unlink { callsign, .. } => {
                 self.on_dcs_unlink(callsign);
                 Ok(())
@@ -587,7 +587,7 @@ impl ServerSessionCore {
             DcsClientPacket::Poll {
                 callsign,
                 reflector_callsign,
-            } => self.on_dcs_poll(callsign, reflector_callsign),
+            } => self.on_dcs_poll(now, callsign, reflector_callsign),
             DcsClientPacket::Voice {
                 header,
                 stream_id,
@@ -603,6 +603,7 @@ impl ServerSessionCore {
 
     fn on_dcs_link(
         &mut self,
+        now: Instant,
         callsign: Callsign,
         client_module: Module,
         reflector_module: Module,
@@ -632,7 +633,7 @@ impl ServerSessionCore {
         self.outbox.enqueue(OutboundPacket {
             dst: self.peer,
             payload,
-            not_before: Instant::now(),
+            not_before: now,
         });
         Ok(())
     }
@@ -648,6 +649,7 @@ impl ServerSessionCore {
 
     fn on_dcs_poll(
         &mut self,
+        now: Instant,
         callsign: Callsign,
         reflector_callsign: Callsign,
     ) -> Result<(), Error> {
@@ -664,7 +666,7 @@ impl ServerSessionCore {
         self.outbox.enqueue(OutboundPacket {
             dst: self.peer,
             payload,
-            not_before: Instant::now(),
+            not_before: now,
         });
         Ok(())
     }

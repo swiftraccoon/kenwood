@@ -6,6 +6,7 @@ use thiserror::Error;
 
 /// Errors produced by AX.25 frame encode/decode and address construction.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum Ax25Error {
     /// Packet is too short to contain required AX.25 fields.
     #[error("AX.25 packet too short")]

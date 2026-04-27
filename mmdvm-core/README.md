@@ -13,7 +13,7 @@ Sans-io codec for the MMDVM ham-radio digital-voice modem protocol. Runtime-agno
 
 ## Reference implementation
 
-Tracks the C++ `MMDVMHost` codec at `ref/MMDVMHost/Modem.cpp` / `Modem.h` (GPL-2.0-or-later) byte for byte. Divergence is a bug.
+Tracks the C++ `MMDVMHost` codec ([`Modem.cpp`](https://github.com/g4klx/MMDVMHost/blob/master/Modem.cpp) / [`Modem.h`](https://github.com/g4klx/MMDVMHost/blob/master/Modem.h), GPL-2.0-or-later) byte for byte. Divergence is a bug.
 
 Portions of this code are derived from MMDVMHost by Jonathan Naylor G4KLX, 2015–2026, GPL-2.0-or-later.
 

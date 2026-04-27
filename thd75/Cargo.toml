@@ -66,3 +66,13 @@ unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
 multiple_crate_versions = "allow"
+
+# Mirrors the workspace `[lints.rustdoc]` block; restated here because this crate's
+# `[lints]` block replaces the workspace one entirely.
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+missing_crate_level_docs = "deny"
+invalid_codeblock_attributes = "deny"
+bare_urls = "deny"
+unescaped_backticks = "deny"

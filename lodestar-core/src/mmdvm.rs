@@ -32,6 +32,7 @@ pub const MMDVM_CMD_GET_VERSION: u8 = MMDVM_GET_VERSION;
 
 /// Errors surfaced by the MMDVM primitives.
 #[derive(Debug, Clone, Error, PartialEq, Eq, uniffi::Error)]
+#[non_exhaustive]
 pub enum MmdvmFrameError {
     /// Payload is longer than a single-byte length field can address.
     #[error("payload too large: {len} bytes (max {max})")]

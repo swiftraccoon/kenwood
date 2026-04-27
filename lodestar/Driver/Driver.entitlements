@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Base DriverKit family entitlement. Required for any dext. -->
+	<key>com.apple.developer.driverkit</key>
+	<true/>
+
+	<!-- USB transport entitlement. Apple manually approves this — the
+	     production array must list { idVendor, idProduct } for each
+	     supported device. We use the wildcard "*" for development; for
+	     distribution swap in:
+	         <dict>
+	             <key>idVendor</key>
+	             <integer>8550</integer>
+	             <key>idProduct</key>
+	             <integer>36899</integer>
+	         </dict>
+	     after Apple grants the entitlement request. -->
+	<key>com.apple.developer.driverkit.transport.usb</key>
+	<array>
+		<string>*</string>
+	</array>
+
+	<!-- Allow the host app (and any third-party app the user installs
+	     in development) to open user-clients to this dext. -->
+	<key>com.apple.developer.driverkit.userclient-access</key>
+	<array>
+		<string>org.swiftraccoon.lodestar.ipad</string>
+	</array>
+
+	<!-- Allow third-party userclients during development. Not used in
+	     distribution builds. -->
+	<key>com.apple.developer.driverkit.allow-third-party-userclients</key>
+	<true/>
+</dict>
+</plist>

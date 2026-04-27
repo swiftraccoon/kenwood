@@ -1,0 +1,51 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Swift Raccoon
+ * SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
+ *
+ * IOKit Interface Generator declaration for the LodestarUSBSerialDriver
+ * dext class. The `iig` tool processes this file at build time to emit
+ * the C++ header with IPC trampolines.
+ *
+ * Architecture: a USB-CDC bulk-endpoint pump that exposes its byte
+ * stream to the host app via a custom IOUserClient. Matched to the
+ * TH-D75 by VID 0x2166 PID 0x9023 on the CDC ACM control interface.
+ */
+
+#ifndef LodestarUSBSerialDriver_h
+#define LodestarUSBSerialDriver_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+#include <DriverKit/IOUserClient.iig>
+#include <USBDriverKit/IOUSBHostInterface.iig>
+#include <USBDriverKit/IOUSBHostPipe.iig>
+
+class LodestarUSBSerialDriver: public IOService
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+
+    virtual kern_return_t NewUserClient(uint32_t type, IOUserClient **userClient) override;
+
+    /// Write `data` (length `length`) to the radio. Internal — called
+    /// by the user client. `LOCALONLY` keeps it out of the IPC table.
+    kern_return_t WriteToRadio(const uint8_t *data, size_t length) LOCALONLY;
+
+    /// Read up to `maxBytes` from the most recent USB IN-pipe completion.
+    /// Returns `kIOReturnNoData` if no bytes are available.
+    kern_return_t ReadFromRadio(uint8_t *out, size_t maxBytes, size_t *actualBytes) LOCALONLY;
+
+    /// Background scheduler for async USB reads. Free-run loop kept fed
+    /// in `bulkInRead` completion callback. Declared virtual so iig
+    /// generates the trampoline + CreateActionbulkInRead helper.
+    virtual void bulkInRead(OSAction *action,
+                            IOReturn status,
+                            uint32_t actualByteCount,
+                            uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
+};
+
+#endif /* LodestarUSBSerialDriver_h */

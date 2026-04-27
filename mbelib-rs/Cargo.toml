@@ -75,6 +75,10 @@ name = "diagnostic_voice_pipeline"
 required-features = ["encoder"]
 
 [[test]]
+name = "bit_layer_roundtrip"
+required-features = ["encoder"]
+
+[[test]]
 name = "kenwood_tables_integrity"
 required-features = ["kenwood-tables"]
 

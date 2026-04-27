@@ -358,6 +358,27 @@ pub fn detect_vuv_and_sa(
         magnitudes: sa,
         num_harmonics: num_harms,
     };
+    if std::env::var_os("MBELIB_DUMP_OURS").is_some() {
+        eprintln!(
+            "  pitch_period={:.2} num_harms={num_harms} num_bands={num_bands}",
+            256.0 / f0_bin
+        );
+        eprint!("  sa[]=");
+        for x in sa.iter().take(num_harms) {
+            eprint!(" {x:.5}");
+        }
+        eprintln!();
+        eprint!("  m_num[]=");
+        for x in m_num.iter().take(num_harms) {
+            eprint!(" {x:.4e}");
+        }
+        eprintln!();
+        eprint!("  v_uv_dsn[]=");
+        for v in voiced.iter().take(num_bands) {
+            eprint!(" {}", u8::from(*v));
+        }
+        eprintln!();
+    }
     (vuv, amps)
 }
 
@@ -396,27 +417,42 @@ fn wr_sp_sample(bin: usize, harmonic_center: f32) -> f32 {
 /// normalized by the window-self-energy. Float port of OP25's
 /// `voiced_sa_calc(M_num, M_den)` where `M_den` is `sc_coef =
 /// 1 / Σ wr_sp²`.
+///
+/// **OP25-exact port (April 2026):** the prior pure-`sqrt(num/den)` form
+/// produced sa values 800× smaller than OP25's int16-scale sa[]. The
+/// downstream `compute_lsa` then needed `SA_SCALE = 32768` to inflate
+/// log2(sa) into OP25's working range — but that pre-multiplication
+/// inflates strong AND weak harmonics non-uniformly relative to
+/// OP25's M_den-dependent scaling. Direct frame-by-frame diff against
+/// OP25's `imbe_param->sa[]` (via the standalone `op25_dump` harness)
+/// showed our voiced-harmonic values trail OP25's by exactly the
+/// factor `512 * sqrt(2) / M_den`, the magnitude of OP25's
+/// `voiced_sa_calc(num, den) = (Word16)(2*256*sqrt(2*num/den))`
+/// formula. Restoring that factor here aligns voiced sa with OP25
+/// and lets `SA_SCALE` drop to 1 in the lsa stage.
 #[inline]
 fn voiced_sa_calc(m_num: f32, sc: f32) -> f32 {
-    // OP25 comment: `2 * 256 * sqrt(2 * num / den)` — but den there
-    // is `sc_coef = 1/M_den_sum`, so `2*num/den = 2*num*M_den_sum`.
-    // In float that's `sqrt(2 · m_num · sc⁻¹) · 512`. For unit
-    // harmonic amplitude (the fitted-sinusoid case) this reduces
-    // algebraically to `fitted_amplitude · √(m_den_sum) · 512`.
-    // We just compute `sqrt(m_num * sc⁻¹)` directly — the downstream
-    // quantizer's SA_SCALE handles absolute scaling.
+    // OP25 fixed-point form: `(Word16)(2 * 256 * sqrt(2 * num / den))`
+    // where `den = M_den_sum` (the window-energy normalizer) and our
+    // pipeline carries `sc = 1/den` ("sc_coef"). So `2*num/den =
+    // 2*num*sc⁻¹` in our convention.
     if sc < 1e-12 {
         return 0.0;
     }
-    (m_num / sc).sqrt()
+    let num_over_den = m_num / sc;
+    if num_over_den < 0.0 {
+        return 0.0;
+    }
+    512.0 * (2.0 * num_over_den).sqrt()
 }
 
-/// Unvoiced spectral amplitude: RMS per-bin observed energy scaled
-/// by 0.1454 (compensates for unvoiced-synthesis overshoot). Float
-/// port of OP25's `unvoiced_sa_calc(M_num, bin_count)`.
+/// Unvoiced spectral amplitude — float port of OP25's
+/// `unvoiced_sa_calc(num, bin_count)` =
+/// `(Word16)(2 * 0.1454 * sqrt(2 * 256 * num / den))` =
+/// `0.2908 * sqrt(512 * num / den)`.
 #[inline]
 fn unvoiced_sa_calc(m_num: f32, bin_count: usize) -> f32 {
-    if bin_count == 0 {
+    if bin_count == 0 || m_num < 0.0 {
         return 0.0;
     }
     #[expect(
@@ -425,7 +461,7 @@ fn unvoiced_sa_calc(m_num: f32, bin_count: usize) -> f32 {
                   (half of 256-pt real FFT); usize-to-f32 cast is exact."
     )]
     let n = bin_count as f32;
-    0.1454 * (m_num / n).sqrt() * (2.0_f32).sqrt()
+    0.2908 * (512.0 * m_num / n).sqrt()
 }
 
 #[cfg(test)]

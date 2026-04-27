@@ -15,7 +15,7 @@ Wire-format codec lives in [`mmdvm-core`](../mmdvm-core/). This crate is I/O and
 
 ## Reference
 
-Mirrors the C++ `MMDVMHost` main loop at `ref/MMDVMHost/` (GPL-2.0-or-later). Portions are derived from MMDVMHost by Jonathan Naylor G4KLX, 2015–2026.
+Mirrors the C++ `MMDVMHost` main loop (GPL-2.0-or-later). Portions are derived from MMDVMHost by Jonathan Naylor G4KLX, 2015–2026.
 
 - MMDVMHost: <https://github.com/g4klx/MMDVMHost>
 

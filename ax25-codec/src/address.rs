@@ -26,6 +26,8 @@ use crate::error::Ax25Error;
 /// address. For APRS-IS login strings or display, format with `-` between
 /// callsign and SSID (e.g. `"N0CALL-7"`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[doc(alias = "call-sign")]
+#[doc(alias = "operator")]
 pub struct Callsign(String);
 
 impl Callsign {
@@ -189,6 +191,8 @@ impl PartialEq<Callsign> for String {
 /// - `9` — mobile (car)
 /// - `15` — generic / other
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[doc(alias = "SSID")]
+#[doc(alias = "callsign-ssid")]
 pub struct Ssid(u8);
 
 impl Ssid {

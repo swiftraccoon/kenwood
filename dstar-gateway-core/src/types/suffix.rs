@@ -9,6 +9,8 @@ use super::type_error::TypeError;
 
 /// 4-byte D-STAR callsign suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[doc(alias = "callsign-suffix")]
+#[doc(alias = "operator-suffix")]
 pub struct Suffix([u8; 4]);
 
 impl Suffix {

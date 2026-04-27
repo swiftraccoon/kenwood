@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Errors that can occur during KISS frame processing.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum KissError {
     /// Frame is too short to contain a valid KISS header.
     #[error("KISS frame too short")]

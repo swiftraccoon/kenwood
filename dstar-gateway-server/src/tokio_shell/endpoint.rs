@@ -1330,6 +1330,12 @@ impl<P: Protocol> ProtocolEndpoint<P> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::indexing_slicing,
+        reason = "Tests slice fixed-size voice frames and protocol fixtures where bounds \
+                  are obvious by construction; out-of-range access correctly fails the test."
+    )]
+
     use super::{EndpointOutcome, ProtocolEndpoint};
     use crate::reflector::{
         AllowAllAuthorizer, ClientAuthorizer, DenyAllAuthorizer, ReadOnlyAuthorizer,

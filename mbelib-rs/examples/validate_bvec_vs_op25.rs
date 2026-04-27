@@ -191,6 +191,7 @@ fn main() {
     let mut prev = PrevFrameState {
         log2_ml: [0.0_f32; 57],
         l: 0,
+        prev_gamma: 0.0,
     };
     // Ignore AmbeEncoder here: it would short-circuit to silence on
     // low-confidence pitch, which hides the b_vec values for silence.
@@ -249,6 +250,7 @@ fn main() {
         prev = PrevFrameState {
             log2_ml: outcome.prev_log2_ml,
             l: outcome.prev_l,
+            prev_gamma: outcome.prev_gamma,
         };
         let ours = reassemble_b_vec(&outcome.ambe_d);
         let op25_idx = emit_idx;

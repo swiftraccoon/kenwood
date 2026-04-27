@@ -323,6 +323,24 @@ fn decode_spectral_offsets(ambe_d: &[u8; AMBE_DATA_BITS], big_l: usize) -> [f32;
     // Look up IDCT block lengths Ji[1..4] from LMPRBL table.
     let ji = lookup_ji(big_l);
 
+    // Optional env-gated diagnostic. `MBELIB_DUMP_DECODE=1` prints the
+    // 9 codebook indices the decoder pulled out of `ambe_d` plus the
+    // partially-reconstructed `cik[2]` (block 2 mean + first AC, before
+    // HOC fill). Used to compare against `MBELIB_DUMP_QUANTIZE=1`'s
+    // emitter output frame-by-frame — caught the FEC double-modulation
+    // bug (April 2026) by showing decoder b3 = 304 where the encoder
+    // had written b3 = 368 for the same input.
+    if std::env::var_os("MBELIB_DUMP_DECODE").is_some() {
+        eprintln!(
+            "  DEC b3={b3} b4={b4} b5={b5} b6={b6} b7={b7} b8={b8} L={big_l} ji={:?}",
+            &ji[1..]
+        );
+        eprintln!(
+            "  DEC cik[2]_pre_hoc=[{:.4}, {:.4}, _, _, _, _]",
+            cik[2][1], cik[2][2]
+        );
+    }
+
     // Fill HOC coefficients into Cik blocks.
     let hoc_tables: [&[[f32; 4]]; 4] = [
         &tables::HOC_B5_TABLE,

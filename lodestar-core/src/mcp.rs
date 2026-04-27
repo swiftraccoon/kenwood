@@ -70,6 +70,7 @@ pub const GATEWAY_MODE_ACCESS_POINT: u8 = 2;
 
 /// Errors surfaced by the MCP primitives.
 #[derive(Debug, Clone, Error, PartialEq, Eq, uniffi::Error)]
+#[non_exhaustive]
 pub enum McpError {
     /// Page number is in the factory calibration region and must not be written.
     #[error("page {page} is in factory calibration region (max writable is {max})")]

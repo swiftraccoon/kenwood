@@ -8,8 +8,9 @@ import IOBluetooth
 
 /// macOS transport using `IOBluetooth` RFCOMM (Serial Port Profile).
 ///
-/// On iOS / iPadOS this type still compiles but every operation throws
-/// `RadioTransportError.notAvailableOnPlatform`.
+/// On iPadOS this type still compiles but every operation throws
+/// `RadioTransportError.notAvailableOnPlatform` — iPad direct-radio
+/// support requires the (yet-to-land) USB-CDC DriverKit transport.
 ///
 /// `IOBluetoothDevice` is a macOS-only framework — Mac Catalyst cannot
 /// reach it (classes are marked unavailable on Catalyst). Lodestar ships
@@ -36,7 +37,7 @@ public actor IOBluetoothTransport: RadioTransport {
 
     public var state: RadioTransportState { _state }
 
-    /// Enumerate paired Bluetooth devices. On iOS returns an empty list.
+    /// Enumerate paired Bluetooth devices. On iPad returns an empty list.
     public nonisolated static func pairedDevices() -> [BluetoothDevice] {
         #if os(macOS)
         guard let devices = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else {
@@ -76,7 +77,7 @@ public actor IOBluetoothTransport: RadioTransport {
         }
         #else
         throw RadioTransportError.notAvailableOnPlatform(
-            reason: "Bluetooth Classic SPP is not available on iOS/iPadOS. Use the macOS build."
+            reason: "Direct radio access on iPad needs USB-C (DriverKit) — not yet implemented. Use the macOS build, or stay reflector-only on iPad."
         )
         #endif
     }
@@ -104,7 +105,7 @@ public actor IOBluetoothTransport: RadioTransport {
         }
         try await bridge.write(bytes)
         #else
-        throw RadioTransportError.notAvailableOnPlatform(reason: "No IOBluetooth on iOS.")
+        throw RadioTransportError.notAvailableOnPlatform(reason: "No IOBluetooth on iPad.")
         #endif
     }
 
@@ -123,7 +124,7 @@ public actor IOBluetoothTransport: RadioTransport {
             readContinuations.append(c)
         }
         #else
-        throw RadioTransportError.notAvailableOnPlatform(reason: "No IOBluetooth on iOS.")
+        throw RadioTransportError.notAvailableOnPlatform(reason: "No IOBluetooth on iPad.")
         #endif
     }
 

@@ -22,6 +22,8 @@ use super::type_error::TypeError;
 ///   verbatim. Used on the receive path where real reflectors emit
 ///   non-printable bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[doc(alias = "call-sign")]
+#[doc(alias = "operator")]
 pub struct Callsign([u8; 8]);
 
 impl Callsign {

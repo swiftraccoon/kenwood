@@ -1,0 +1,36 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Swift Raccoon
+ * SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
+ *
+ * IOUserClient subclass — exposes the LodestarUSBSerialDriver byte
+ * stream to the iPad app via external method calls.
+ *
+ * App uses `IOServiceOpen` to instantiate this user client, then
+ * `IOConnectCallStructMethod(connection, selector, ...)` for each
+ * read/write.
+ */
+
+#ifndef LodestarUserClient_h
+#define LodestarUserClient_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+#include <DriverKit/IOUserClient.iig>
+
+class LodestarUSBSerialDriver;
+
+class LodestarUserClient: public IOUserClient
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+
+    // ExternalMethod IPC dispatch is deferred — the iig-generated args
+    // struct shape needs hardware-iteration to verify. For the
+    // scaffolding pass the inherited IOUserClient default is fine.
+};
+
+#endif /* LodestarUserClient_h */

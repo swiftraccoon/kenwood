@@ -67,7 +67,6 @@ use crate::encode::pitch::{PITCH_CANDIDATES, PitchTracker, compute_e_p};
 use crate::encode::quantize::quantize;
 use crate::encode::state::{EncoderBuffers, FFT_LENGTH, FRAME};
 use crate::encode::vuv::{VuvState, detect_vuv_and_sa};
-use crate::unpack::demodulate_c1;
 use realfft::num_complex::Complex;
 
 /// Per-frame snapshot buffered by the 2-frame look-ahead pipeline.
@@ -122,6 +121,14 @@ pub struct AmbeEncoder {
     /// mapping `kl = (prev_l / cur_l) * l` that drives the prev-frame
     /// log-magnitude interpolation.
     prev_l: usize,
+    /// Previous frame's reconstructed gamma (mean log-magnitude).
+    ///
+    /// The D-STAR decoder reconstructs `gamma_cur = DG_TABLE[b2] + 0.5 *
+    /// gamma_prev`. Carrying this state on the encoder side lets
+    /// `quantize_gain` emit the predictive *delta* instead of the
+    /// absolute log-magnitude; without it the receiver's gamma
+    /// drifts to saturation over a few frames.
+    prev_gamma: f32,
     /// 2-slot ring buffer holding analysis output for frames `N-2`
     /// and `N-1`. On `encode_frame(N)` we compute `E(p)_N`, run the
     /// DP on `(E(p)_{N-2}, E(p)_{N-1}, E(p)_N)` to commit pitch for
@@ -179,6 +186,7 @@ impl AmbeEncoder {
             fft_out: vec![Complex::new(0.0, 0.0); FFT_LENGTH / 2 + 1],
             prev_log2_ml: [0.0_f32; 57],
             prev_l: 0,
+            prev_gamma: 0.0,
             pending: None,
             vuv_state: VuvState::new(),
         }
@@ -199,6 +207,7 @@ impl AmbeEncoder {
             fft_out: vec![Complex::new(0.0, 0.0); FFT_LENGTH / 2 + 1],
             prev_log2_ml: [0.0_f32; 57],
             prev_l: 0,
+            prev_gamma: 0.0,
             pending: Some(Vec::with_capacity(2)),
             vuv_state: VuvState::new(),
         }
@@ -223,6 +232,13 @@ impl AmbeEncoder {
     const fn reset_prev_state_after_silence(&mut self) {
         self.prev_log2_ml = [0.0_f32; 57];
         self.prev_l = 14;
+        // Silence frames carry b2 = 0 in the canonical AMBE_SILENCE
+        // byte pattern, so a stream of silence frames drives
+        // `gamma = DG_TABLE[0] + 0.5 * prev_gamma` = 0.5 * prev_gamma,
+        // decaying toward zero. Pin it at zero so the first voice
+        // frame after silence sees the same state the decoder will
+        // have reconstructed from the silence stream on its side.
+        self.prev_gamma = 0.0;
     }
 
     /// Encode one 20 ms PCM frame into a 9-byte AMBE wire frame.
@@ -347,15 +363,28 @@ impl AmbeEncoder {
         let prev = crate::encode::quantize::PrevFrameState {
             log2_ml: self.prev_log2_ml,
             l: self.prev_l,
+            prev_gamma: self.prev_gamma,
         };
         let outcome = quantize(pitch, vuv, &amps, &prev);
         self.prev_log2_ml = outcome.prev_log2_ml;
         self.prev_l = outcome.prev_l;
+        self.prev_gamma = outcome.prev_gamma;
         let ambe_d = outcome.ambe_d;
 
         let mut ambe_fr = [0u8; AMBE_FRAME_BITS];
         ecc_encode(&ambe_d, &mut ambe_fr);
-        demodulate_c1(&mut ambe_fr);
+        // Note: do NOT call `demodulate_c1` here. `pack_frame` performs
+        // the C1 modulation step internally before laying bits on the
+        // wire (the doc comment on `pack_frame` documents that it
+        // expects already-demodulated `ambe_fr` and re-modulates as
+        // part of the packing). An explicit `demodulate_c1` call
+        // *before* `pack_frame` cancels with the one inside, leaving
+        // the wire bytes in unmodulated form — which the decoder's
+        // single `demodulate_c1` then incorrectly XORs back into the
+        // modulated state. Net effect: 7 of 49 `ambe_d` bits flip
+        // through the round-trip (b3 was reading 304 instead of 368
+        // for the 1 kHz sine, scrambling the spectral envelope and
+        // pinning decoded peaks at the wrong harmonic).
         pack_frame(&ambe_fr)
     }
 

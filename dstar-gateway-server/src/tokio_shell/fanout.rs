@@ -130,6 +130,12 @@ pub async fn fan_out_voice_at<P: Protocol>(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::indexing_slicing,
+        reason = "Tests slice fixed-size fixture buffers where bounds are obvious by \
+                  construction; out-of-range access correctly fails the test."
+    )]
+
     use super::fan_out_voice;
     use crate::client_pool::{
         ClientHandle, ClientPool, DEFAULT_UNHEALTHY_THRESHOLD, UnhealthyOutcome,

@@ -44,6 +44,44 @@ public final class ReflectorCoordinator: ReflectorObserver {
         didSet { UserDefaults.standard.set(rememberedReflectorName, forKey: Self.rememberedNameKey) }
     }
 
+    /// User's starred reflectors, persisted. Surfaced ahead of the
+    /// curated "Featured" list in the picker.
+    public private(set) var favoriteReflectorNames: [String] {
+        didSet { UserDefaults.standard.set(favoriteReflectorNames, forKey: Self.favoritesKey) }
+    }
+
+    /// When `true`, the recently-heard list is saved to
+    /// `UserDefaults` on every mutation and restored on launch so
+    /// the history survives quits and reboots.
+    public var persistRecentlyHeard: Bool {
+        didSet {
+            UserDefaults.standard.set(persistRecentlyHeard, forKey: Self.persistHeardKey)
+            if persistRecentlyHeard {
+                saveHeardHistory()
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.heardHistoryKey)
+            }
+        }
+    }
+
+    /// Cap on how many heard rows render inline on the dashboard.
+    /// Overflow lives behind the "Show all" sheet. Persisted.
+    public var inlineHeardLimit: Int {
+        didSet { UserDefaults.standard.set(inlineHeardLimit, forKey: Self.inlineHeardLimitKey) }
+    }
+
+    public func toggleFavorite(name: String) {
+        if let idx = favoriteReflectorNames.firstIndex(of: name) {
+            favoriteReflectorNames.remove(at: idx)
+        } else {
+            favoriteReflectorNames.append(name)
+        }
+    }
+
+    public func isFavorite(_ name: String) -> Bool {
+        favoriteReflectorNames.contains(name)
+    }
+
     // MARK: - Runtime state
 
     public private(set) var state: State = .disconnected
@@ -66,11 +104,25 @@ public final class ReflectorCoordinator: ReflectorObserver {
 
     private var session: ReflectorSession?
 
+    /// `true` when the user just tapped "Disconnect reflector" — so
+    /// the subsequent `.disconnected` event is expected and the
+    /// auto-reconnect scheduler should NOT fire. Cleared once the
+    /// event is applied.
+    private var userInitiatedDisconnect: Bool = false
+
+    /// Scheduled auto-reconnect task, held so we can cancel it on
+    /// manual user actions (e.g. picking a different reflector).
+    private var reconnectTask: Task<Void, Never>?
+
     private static let callsignKey = "lodestar.callsign"
     private static let localModuleKey = "lodestar.localModule"
     private static let reflectorModuleKey = "lodestar.reflectorModule"
     private static let autoConnectKey = "lodestar.autoConnectReflector"
     private static let rememberedNameKey = "lodestar.rememberedReflectorName"
+    private static let favoritesKey = "lodestar.favoriteReflectors"
+    private static let persistHeardKey = "lodestar.persistRecentlyHeard"
+    private static let heardHistoryKey = "lodestar.recentlyHeardArchive"
+    private static let inlineHeardLimitKey = "lodestar.inlineHeardLimit"
 
     // MARK: - Init
 
@@ -81,6 +133,15 @@ public final class ReflectorCoordinator: ReflectorObserver {
         self.reflectorModule = defaults.string(forKey: Self.reflectorModuleKey) ?? "C"
         self.autoConnectReflector = defaults.bool(forKey: Self.autoConnectKey)
         self.rememberedReflectorName = defaults.string(forKey: Self.rememberedNameKey)
+        self.favoriteReflectorNames = defaults.stringArray(forKey: Self.favoritesKey) ?? []
+        self.persistRecentlyHeard = defaults.bool(forKey: Self.persistHeardKey)
+        // Default inline limit = 5; clamp 1…50 on load in case an old
+        // value got out of range.
+        let storedLimit = defaults.integer(forKey: Self.inlineHeardLimitKey)
+        self.inlineHeardLimit = max(1, min(50, storedLimit == 0 ? 5 : storedLimit))
+        if persistRecentlyHeard {
+            self.recentlyHeard = Self.loadHeardHistory()
+        }
     }
 
     // MARK: - Actions
@@ -195,6 +256,9 @@ public final class ReflectorCoordinator: ReflectorObserver {
 
     public func disconnect() async {
         guard let s = session else { return }
+        userInitiatedDisconnect = true
+        reconnectTask?.cancel()
+        reconnectTask = nil
         isBusy = true
         defer { isBusy = false }
         do {
@@ -210,6 +274,9 @@ public final class ReflectorCoordinator: ReflectorObserver {
 
     public func clearHeardHistory() {
         recentlyHeard.removeAll()
+        if persistRecentlyHeard {
+            UserDefaults.standard.removeObject(forKey: Self.heardHistoryKey)
+        }
     }
 
     /// Insert a recently-heard entry for a transmission that originated
@@ -267,8 +334,14 @@ public final class ReflectorCoordinator: ReflectorObserver {
 
         case .disconnected(let reason):
             state = .disconnected
+            let wasUserInitiated = userInitiatedDisconnect
+            userInitiatedDisconnect = false
             lastError = "reflector disconnected: \(reason)"
             finalizeCurrentStream(reason: reason)
+            if !wasUserInitiated {
+                NotificationManager.shared.reflectorDisconnected(reason: reason)
+                scheduleUnexpectedReconnect()
+            }
 
         case .pollEcho:
             break
@@ -356,6 +429,120 @@ public final class ReflectorCoordinator: ReflectorObserver {
         // Cap so the list doesn't grow unbounded in long sessions.
         if recentlyHeard.count > 100 {
             recentlyHeard.removeLast()
+        }
+        if persistRecentlyHeard {
+            saveHeardHistory()
+        }
+    }
+
+    // MARK: - Heard-history persistence
+
+    /// Codable projection of `HeardEntry` for UserDefaults archival.
+    /// We can't directly encode `HeardEntry` because it embeds
+    /// `GpsPosition` (a UniFFI-generated type without Codable);
+    /// also, UUID `id` regeneration is fine since persistence is
+    /// read-only after load.
+    private struct PersistedHeard: Codable {
+        let mycall: String
+        let suffix: String
+        let urcall: String
+        let endedAt: Date
+        let duration: TimeInterval
+        let frames: UInt32
+        let endReason: String
+        let text: String?
+        let lat: Double?
+        let lon: Double?
+        let callsign: String?
+        let symbol: String?
+        let comment: String?
+
+        init(from entry: HeardEntry) {
+            self.mycall = entry.mycall
+            self.suffix = entry.suffix
+            self.urcall = entry.urcall
+            self.endedAt = entry.endedAt
+            self.duration = entry.duration
+            self.frames = entry.frames
+            self.endReason = entry.endReason
+            self.text = entry.text
+            self.lat = entry.position?.latitude
+            self.lon = entry.position?.longitude
+            self.callsign = entry.position?.callsign
+            self.symbol = entry.position?.symbol
+            self.comment = entry.position?.comment
+        }
+
+        func toEntry() -> HeardEntry {
+            let position: GpsPosition?
+            if let lat, let lon {
+                position = GpsPosition(
+                    callsign: callsign ?? "",
+                    latitude: lat,
+                    longitude: lon,
+                    symbol: symbol ?? "",
+                    comment: comment
+                )
+            } else {
+                position = nil
+            }
+            return HeardEntry(
+                mycall: mycall,
+                suffix: suffix,
+                urcall: urcall,
+                endedAt: endedAt,
+                duration: duration,
+                frames: frames,
+                endReason: endReason,
+                text: text,
+                position: position
+            )
+        }
+    }
+
+    private func saveHeardHistory() {
+        let archive = recentlyHeard.map(PersistedHeard.init(from:))
+        guard let data = try? JSONEncoder().encode(archive) else { return }
+        UserDefaults.standard.set(data, forKey: Self.heardHistoryKey)
+    }
+
+    private static func loadHeardHistory() -> [HeardEntry] {
+        guard let data = UserDefaults.standard.data(forKey: Self.heardHistoryKey),
+              let archive = try? JSONDecoder().decode([PersistedHeard].self, from: data)
+        else {
+            return []
+        }
+        return archive.map { $0.toEntry() }
+    }
+
+    /// Schedule a best-effort reconnect after the reflector drops us
+    /// unexpectedly (network blip, reflector restart, keepalive
+    /// timeout). Backoff: 5s / 15s / 45s — mirrors the pattern
+    /// `tryAutoConnect` uses for launch-time stale-session recovery.
+    ///
+    /// Only fires when the previous link was a user-picked reflector
+    /// (so we know where to reconnect to). Cancels any prior pending
+    /// reconnect task before scheduling — prevents stacked retries
+    /// during a rapid flap.
+    private func scheduleUnexpectedReconnect() {
+        guard let reflector = connectedReflector else { return }
+        reconnectTask?.cancel()
+        reconnectTask = Task { @MainActor [weak self] in
+            let delays: [UInt64] = [5_000_000_000, 15_000_000_000, 45_000_000_000]
+            for delay in delays {
+                try? await Task.sleep(nanoseconds: delay)
+                guard let self else { return }
+                guard Task.isCancelled == false else { return }
+                // User may have picked a different reflector, or
+                // toggled off auto-reconnect preconditions. Re-check.
+                guard self.session == nil else { return }
+                guard case .disconnected = self.state else { return }
+                await self.connect(to: reflector)
+                if case .connected = self.state {
+                    NotificationManager.shared.reflectorReconnected(name: reflector.name)
+                    return
+                }
+            }
         }
     }
 

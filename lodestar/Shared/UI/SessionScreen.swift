@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
 import SwiftUI
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 
 /// Single primary screen. Shows the full chain — radio, reflector,
 /// live stream — as one coherent flow. The relay runs automatically
@@ -13,9 +18,9 @@ struct SessionScreen: View {
     @State private var showDevicePicker = false
     @State private var showHeardHistory = false
 
-    /// Max heard entries shown inline on the dashboard. Rest live
-    /// behind the "Show all" sheet to keep this view bounded.
-    private let inlineHeardLimit = 5
+    /// Max heard entries shown inline on the dashboard. User-configurable
+    /// via Settings → Diagnostics; rest live behind the "Show all" sheet.
+    private var inlineHeardLimit: Int { reflector.inlineHeardLimit }
 
     private var transport: TransportCoordinator { session.transport }
     private var reflector: ReflectorCoordinator { session.reflector }
@@ -49,6 +54,15 @@ struct SessionScreen: View {
         }
         .sheet(isPresented: $showHeardHistory) {
             HeardHistorySheet(coordinator: reflector)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .lodestarShowDevicePicker)) { _ in
+            showDevicePicker = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .lodestarShowReflectorPicker)) { _ in
+            showPicker = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .lodestarShowHeardHistory)) { _ in
+            showHeardHistory = true
         }
     }
 
@@ -111,6 +125,26 @@ struct SessionScreen: View {
             Spacer()
             radioActions
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(a11yRadioLabel)
+    }
+
+    private var a11yRadioLabel: String {
+        var parts: [String] = ["Radio"]
+        switch transport.state {
+        case .disconnected: parts.append("not connected")
+        case .connecting:   parts.append("connecting")
+        case .failed(let m): parts.append("failed: \(m)")
+        case .connected:
+            parts.append(transport.selectedDevice?.name ?? "TH-D75")
+            switch transport.radioMode {
+            case .mmdvm:        parts.append("MMDVM mode, ready to relay")
+            case .cat:          parts.append("CAT mode")
+            case .unknown:      parts.append("mode unknown")
+            case .unrecognized: parts.append("mode unrecognized")
+            }
+        }
+        return parts.joined(separator: ", ")
     }
 
     @ViewBuilder
@@ -220,6 +254,24 @@ struct SessionScreen: View {
             Spacer()
             reflectorActions
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(a11yReflectorLabel)
+    }
+
+    private var a11yReflectorLabel: String {
+        var parts: [String] = ["Reflector"]
+        switch reflector.state {
+        case .disconnected:  parts.append("not linked")
+        case .connecting:    parts.append("linking")
+        case .failed(let m): parts.append("failed: \(m)")
+        case .connected:
+            if let r = reflector.connectedReflector {
+                parts.append("\(r.name) module \(reflector.reflectorModule)")
+            } else {
+                parts.append("linked")
+            }
+        }
+        return parts.joined(separator: ", ")
     }
 
     @ViewBuilder
@@ -272,10 +324,20 @@ struct SessionScreen: View {
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                             .labelStyle(.titleAndIcon)
+                            .symbolEffect(
+                                .bounce.up,
+                                options: .nonRepeating,
+                                value: relay.framesFromRadio
+                            )
                         Label("\(relay.framesFromReflector)", systemImage: "arrow.down.left")
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                             .labelStyle(.titleAndIcon)
+                            .symbolEffect(
+                                .bounce.down,
+                                options: .nonRepeating,
+                                value: relay.framesFromReflector
+                            )
                     }
                 } else if let msg = relayExplainer {
                     Text(msg).font(.caption).foregroundStyle(.secondary)
@@ -283,6 +345,19 @@ struct SessionScreen: View {
             }
             Spacer()
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(a11yRelayLabel)
+    }
+
+    private var a11yRelayLabel: String {
+        var parts: [String] = ["Relay", relayTitle]
+        if relay.state == .running {
+            parts.append("radio to reflector frames \(relay.framesFromRadio)")
+            parts.append("reflector to radio frames \(relay.framesFromReflector)")
+        } else if let msg = relayExplainer {
+            parts.append(msg)
+        }
+        return parts.joined(separator: ", ")
     }
 
     @ViewBuilder
@@ -463,19 +538,11 @@ private struct DevicePickerSheet: View {
     let coordinator: TransportCoordinator
     @Environment(\.dismiss) private var dismiss
 
-    @State private var diagnosticText: String?
-    #if os(iOS)
-    @State private var discovered: [DiscoveredBluetoothDevice] = []
-    @State private var isScanning = false
-    @State private var pairingAddress: String?
-    @State private var pairingError: String?
-    #endif
-
     var body: some View {
         NavigationStack {
             Group {
                 #if os(iOS)
-                iosBody
+                ipadBody
                 #else
                 macBody
                 #endif
@@ -486,9 +553,6 @@ private struct DevicePickerSheet: View {
             #endif
             .toolbar { toolbar }
             .onAppear { coordinator.refreshPairedDevices() }
-            #if os(iOS)
-            .onDisappear { PrivateBluetoothBridge.stopInquiry() }
-            #endif
         }
         #if os(macOS)
         .frame(minWidth: 420, minHeight: 360)
@@ -498,13 +562,9 @@ private struct DevicePickerSheet: View {
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItem(placement: .cancellationAction) {
-            Button("Close") {
-                #if os(iOS)
-                PrivateBluetoothBridge.stopInquiry()
-                #endif
-                dismiss()
-            }
+            Button("Close") { dismiss() }
         }
+        #if os(macOS)
         ToolbarItem {
             Button {
                 coordinator.refreshPairedDevices()
@@ -512,6 +572,7 @@ private struct DevicePickerSheet: View {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
         }
+        #endif
     }
 
     #if os(macOS)
@@ -537,152 +598,18 @@ private struct DevicePickerSheet: View {
     #endif
 
     #if os(iOS)
+    /// iPad direct-radio access requires the USB-CDC DriverKit transport
+    /// (planned). Until that ships the iPad build is reflector-only —
+    /// surface a clear placeholder rather than an empty list.
     @ViewBuilder
-    private var iosBody: some View {
-        List {
-            Section {
-                scanControls
-            } header: {
-                Text("Scan for nearby radios")
-            } footer: {
-                Text("iOS Settings doesn't surface Classic Bluetooth pairing for non-MFi accessories, so Lodestar drives the pair flow itself through the private BluetoothManager framework. Put the TH-D75 in pairing mode (menu 934), then tap Scan.")
-            }
-
-            if !discovered.isEmpty {
-                Section("Discovered") {
-                    ForEach(discovered) { dev in
-                        Button {
-                            beginPair(with: dev)
-                        } label: {
-                            discoveredRow(dev)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-
-            if !coordinator.availableDevices.isEmpty {
-                Section("Already paired") {
-                    ForEach(coordinator.availableDevices) { dev in
-                        deviceButton(dev)
-                    }
-                }
-            }
-
-            if let err = pairingError {
-                Section {
-                    Label(err, systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.red)
-                        .font(.callout)
-                }
-            }
-
-            Section("Diagnostics") {
-                Button("Run framework probe") {
-                    diagnosticText = PrivateBluetoothBridge.diagnostic()
-                }
-                if let diag = diagnosticText {
-                    Text(diag)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                }
-            }
-        }
-    }
-
-    private var scanControls: some View {
-        HStack {
-            if isScanning {
-                ProgressView().controlSize(.small)
-                Text("Scanning… \(discovered.count) seen")
-                    .font(.callout)
-                Spacer()
-                Button("Stop") { stopScan() }
-            } else {
-                Button {
-                    startScan()
-                } label: {
-                    Label("Scan", systemImage: "dot.radiowaves.left.and.right")
-                }
+    private var ipadBody: some View {
+        ContentUnavailableView {
+            Label("Direct radio access — coming soon", systemImage: "cable.connector")
+        } description: {
+            Text("On iPad, connecting directly to a TH-D75 requires a USB-C cable and a Lodestar DriverKit extension that's still in development. In the meantime, use **Reflectors** to TX/RX over IP.")
+        } actions: {
+            Button("Close") { dismiss() }
                 .buttonStyle(.borderedProminent)
-                Spacer()
-                Text("\(discovered.count) seen")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private func discoveredRow(_ dev: DiscoveredBluetoothDevice) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: "antenna.radiowaves.left.and.right")
-                .foregroundStyle(.blue)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(dev.name).font(.headline)
-                    if pairingAddress == dev.address {
-                        ProgressView().controlSize(.small)
-                    }
-                }
-                Text(dev.address)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            if let r = dev.rssi {
-                Text("\(r) dBm")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .contentShape(.rect)
-    }
-
-    private func startScan() {
-        pairingError = nil
-        discovered.removeAll()
-        let ok = PrivateBluetoothBridge.startInquiry { dev in
-            DispatchQueue.main.async {
-                if !discovered.contains(where: { $0.address == dev.address }) {
-                    discovered.append(dev)
-                }
-            }
-        }
-        if ok {
-            isScanning = true
-        } else {
-            pairingError = "Scan request refused — private framework probably isn't callable on this iOS / signing combination. Run the framework probe for details."
-        }
-    }
-
-    private func stopScan() {
-        PrivateBluetoothBridge.stopInquiry()
-        isScanning = false
-    }
-
-    private func beginPair(with dev: DiscoveredBluetoothDevice) {
-        pairingError = nil
-        pairingAddress = dev.address
-        PrivateBluetoothBridge.pair(address: dev.address) { result in
-            DispatchQueue.main.async {
-                pairingAddress = nil
-                switch result {
-                case .success:
-                    let bt = BluetoothDevice(id: dev.address, name: dev.name, address: dev.address)
-                    coordinator.select(bt)
-                    Task {
-                        await coordinator.connect()
-                        dismiss()
-                    }
-                case .denied(let reason):
-                    pairingError = "Pair denied: \(reason)"
-                case .cancelled:
-                    pairingError = "Pairing cancelled."
-                case .timeout:
-                    pairingError = "Pairing timed out — is the radio in pairing mode (menu 934)?"
-                }
-            }
         }
     }
     #endif
@@ -864,6 +791,18 @@ private struct HeardRow: View {
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
+        .accessibilityLabel(a11yLabel)
+        .contextMenu {
+            HeardEntryContextMenu(entry: entry)
+        }
+    }
+
+    private var a11yLabel: String {
+        var parts: [String] = ["\(entry.mycall) \(entry.suffix)", "to \(entry.urcall)"]
+        if let text = entry.text, !text.isEmpty { parts.append("message: \(text)") }
+        if let pos = entry.position { parts.append("position \(GpsFormat.coordinate(pos))") }
+        parts.append(durationString(entry.duration))
+        return parts.joined(separator: ", ")
     }
 
     private func durationString(_ seconds: TimeInterval) -> String {
@@ -871,3 +810,74 @@ private struct HeardRow: View {
         return String(format: "%d:%02d", s / 60, s % 60)
     }
 }
+
+/// Context-menu actions for a `HeardEntry`. Apple-HIG style: verbs
+/// ordered from most to least expected; destructive at the bottom
+/// if any. Copy + look-up are both idempotent and don't require
+/// confirmation.
+private struct HeardEntryContextMenu: View {
+    let entry: ReflectorCoordinator.HeardEntry
+
+    var body: some View {
+        Button {
+            copyToPasteboard(entry.mycall)
+        } label: {
+            Label("Copy Callsign", systemImage: "doc.on.doc")
+        }
+
+        Button {
+            if let url = URL(string: "https://www.qrz.com/db/\(entry.mycall)") {
+                openURL(url)
+            }
+        } label: {
+            Label("Look Up on QRZ.com", systemImage: "person.text.rectangle")
+        }
+
+        if let text = entry.text, !text.isEmpty {
+            Divider()
+            Button {
+                copyToPasteboard(text)
+            } label: {
+                Label("Copy TX Message", systemImage: "text.bubble")
+            }
+        }
+
+        if let pos = entry.position {
+            Divider()
+            Button {
+                copyToPasteboard(GpsFormat.coordinate(pos))
+            } label: {
+                Label("Copy Coordinates", systemImage: "location")
+            }
+            Button {
+                let lat = pos.latitude
+                let lon = pos.longitude
+                if let url = URL(string: "https://maps.apple.com/?ll=\(lat),\(lon)&q=\(entry.mycall)") {
+                    openURL(url)
+                }
+            } label: {
+                Label("Show on Map", systemImage: "map")
+            }
+        }
+    }
+
+    private func copyToPasteboard(_ s: String) {
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(s, forType: .string)
+        #else
+        UIPasteboard.general.string = s
+        #endif
+    }
+
+    private func openURL(_ url: URL) {
+        #if os(macOS)
+        NSWorkspace.shared.open(url)
+        #else
+        // SwiftUI's openURL action would need @Environment injection;
+        // at context-menu invocation time UIApplication.open works.
+        UIApplication.shared.open(url)
+        #endif
+    }
+}
+

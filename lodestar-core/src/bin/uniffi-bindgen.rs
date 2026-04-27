@@ -17,6 +17,7 @@ use mmdvm_core as _;
 use thiserror as _;
 use tokio as _;
 use tracing as _;
+use tracing_subscriber as _;
 
 fn main() {
     uniffi::uniffi_bindgen_main();

@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Errors produced by APRS parsing, building, and stateful algorithms.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum AprsError {
     /// The info field is too short or has an unrecognized data type.
     #[error("invalid APRS format")]

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Lodestar TH-D75 Driver</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>DEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>OSBundleUsageDescription</key>
+	<string>Lodestar uses this driver to communicate with your Kenwood TH-D75 transceiver over USB-C.</string>
+
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>LodestarTHD75</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+
+			<!-- The kernel-side stub class. IOUserService is the
+			     standard IOClass for user-space DriverKit drivers. -->
+			<key>IOClass</key>
+			<string>IOUserService</string>
+
+			<!-- The user-space DriverKit class that actually runs.
+			     Must match the C++ class name in the .iig. -->
+			<key>IOUserClass</key>
+			<string>LodestarUSBSerialDriver</string>
+
+			<!-- The user-server name; pairs the dext executable to its
+			     IOService instance. By convention the bundle ID. -->
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+
+			<key>IOMatchCategory</key>
+			<string>com.apple.developer.driverkit.transport.usb</string>
+
+			<!-- Match the CDC ACM control interface on the TH-D75.
+			     bInterfaceClass=0x02 (CDC Communications),
+			     bInterfaceSubClass=0x02 (Abstract Control Model).
+			     Verified TH-D75 IDs: VID 0x2166 PID 0x9023. -->
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<key>idVendor</key>
+			<integer>8550</integer>
+			<key>idProduct</key>
+			<integer>36899</integer>
+			<key>bInterfaceClass</key>
+			<integer>2</integer>
+			<key>bInterfaceSubClass</key>
+			<integer>2</integer>
+		</dict>
+	</dict>
+</dict>
+</plist>

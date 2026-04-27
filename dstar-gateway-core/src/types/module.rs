@@ -16,6 +16,8 @@ use super::type_error::TypeError;
 ///
 /// The wrapped byte is always in `b'A'..=b'Z'`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[doc(alias = "channel-module")]
+#[doc(alias = "module-letter")]
 pub struct Module(u8);
 
 impl Module {

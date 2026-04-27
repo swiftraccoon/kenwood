@@ -18,6 +18,8 @@
 //!
 //! The `0M` handler is at firmware address `0xC002F01C`.
 
+use crate::error::ProtocolError;
+
 /// Entry command to enter programming mode (ASCII).
 pub const ENTER_PROGRAMMING: &[u8] = b"0M PROGRAM\r";
 
@@ -197,23 +199,29 @@ pub const fn is_factory_calibration_page(page: u16) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error string if the response is too short or has an
-/// invalid marker byte.
-pub fn parse_write_response(buf: &[u8]) -> Result<(u16, &[u8]), String> {
+/// - [`ProtocolError::WriteResponseTooShort`] if the buffer is shorter
+///   than [`W_RESPONSE_SIZE`].
+/// - [`ProtocolError::WriteResponseBadMarker`] if the first byte is not
+///   `'W'`.
+pub fn parse_write_response(buf: &[u8]) -> Result<(u16, &[u8]), ProtocolError> {
     // W response layout: `W` marker + 4-byte address + PAGE_SIZE bytes.
     let actual = buf.len();
     let &[marker, page_hi, page_lo, _off_hi, _off_lo, ..] = buf else {
-        return Err(format!(
-            "W response too short: {actual} bytes, expected {W_RESPONSE_SIZE}"
-        ));
+        return Err(ProtocolError::WriteResponseTooShort {
+            actual,
+            expected: W_RESPONSE_SIZE,
+        });
     };
     if marker != b'W' {
-        return Err(format!("expected W response marker, got 0x{marker:02X}"));
+        return Err(ProtocolError::WriteResponseBadMarker { got: marker });
     }
     let page = u16::from_be_bytes([page_hi, page_lo]);
-    let data = buf.get(5..5 + PAGE_SIZE).ok_or_else(|| {
-        format!("W response too short: {actual} bytes, expected {W_RESPONSE_SIZE}")
-    })?;
+    let data = buf
+        .get(5..5 + PAGE_SIZE)
+        .ok_or(ProtocolError::WriteResponseTooShort {
+            actual,
+            expected: W_RESPONSE_SIZE,
+        })?;
     Ok((page, data))
 }
 
@@ -383,19 +391,34 @@ mod tests {
     fn parse_write_response_invalid_marker() {
         let mut resp = vec![b'X', 0x01, 0x00, 0x00, 0x00];
         resp.extend_from_slice(&[0u8; 256]);
-        assert!(parse_write_response(&resp).is_err());
+        let result = parse_write_response(&resp);
+        assert!(
+            matches!(
+                result,
+                Err(ProtocolError::WriteResponseBadMarker { got: b'X' })
+            ),
+            "expected WriteResponseBadMarker, got {result:?}"
+        );
     }
 
     #[test]
     fn parse_write_response_empty() {
         let resp: Vec<u8> = vec![];
-        assert!(parse_write_response(&resp).is_err());
+        let result = parse_write_response(&resp);
+        assert!(
+            matches!(result, Err(ProtocolError::WriteResponseTooShort { .. })),
+            "expected WriteResponseTooShort, got {result:?}"
+        );
     }
 
     #[test]
     fn parse_write_response_too_short() {
         let resp = vec![b'W', 0x01, 0x00, 0x00, 0x00, 0x41]; // only 6 bytes
-        assert!(parse_write_response(&resp).is_err());
+        let result = parse_write_response(&resp);
+        assert!(
+            matches!(result, Err(ProtocolError::WriteResponseTooShort { .. })),
+            "expected WriteResponseTooShort, got {result:?}"
+        );
     }
 
     #[test]

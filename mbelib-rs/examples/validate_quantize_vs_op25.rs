@@ -222,11 +222,19 @@ fn main() {
             PrevFrameState {
                 log2_ml: [0.0_f32; 57],
                 l: 0,
+                // OP25 trace format predates the `prev_gamma` predictor
+                // subtraction. Use zero here; tests that exercise the
+                // gain path beyond frame 0 will diverge from OP25
+                // (which emits absolute gain, not the decoder-matching
+                // delta) and that divergence is the whole reason this
+                // field now exists.
+                prev_gamma: 0.0,
             }
         } else {
             PrevFrameState {
                 log2_ml: frames[i - 1].prev_log2_ml,
                 l: frames[i - 1].prev_l,
+                prev_gamma: 0.0,
             }
         };
         let pitch = pitch_from_op25(f.ref_pitch_q88, 0.5);

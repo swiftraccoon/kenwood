@@ -66,6 +66,8 @@ use crate::error::ValidationError;
 /// `Vx220M`, `220MxV`, `Ux220M` (TH-D75A only). D-STAR 2-wave simultaneous
 /// reception is also supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[doc(alias = "band-index")]
+#[doc(alias = "rf-band")]
 pub enum Band {
     /// Band A — amateur TX/RX (144/220/430 MHz). Index 0.
     A = 0,

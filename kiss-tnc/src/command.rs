@@ -124,6 +124,8 @@ impl KissCommand {
 /// up to 16 TNC ports. The TH-D75 is always port 0; [`KissPort::TH_D75`]
 /// is a convenience constant for that common case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[doc(alias = "tnc-port")]
+#[doc(alias = "kiss-port")]
 pub struct KissPort(u8);
 
 impl KissPort {

@@ -105,6 +105,16 @@ struct ReflectorPickerSheet: View {
                 }
             }
 
+            // Favorites always first when present + not searching.
+            if !favorites.isEmpty && search.isEmpty {
+                Section {
+                    ForEach(favorites, id: \.name) { r in row(r) }
+                } header: {
+                    Label("Favorites", systemImage: "heart.fill")
+                        .foregroundStyle(.red)
+                }
+            }
+
             if canShowFeatured {
                 Section {
                     ForEach(displayed(), id: \.name) { r in row(r) }
@@ -153,6 +163,11 @@ struct ReflectorPickerSheet: View {
         #endif
     }
 
+    private var favorites: [Reflector] {
+        let names = Set(coordinator.favoriteReflectorNames)
+        return all.filter { names.contains($0.name) }
+    }
+
     // MARK: - Helpers
 
     private var canShowFeatured: Bool {
@@ -198,6 +213,12 @@ struct ReflectorPickerSheet: View {
                             .background(r.protocol.accentColor.opacity(0.15))
                             .foregroundStyle(r.protocol.accentColor)
                             .clipShape(Capsule())
+                        if coordinator.isFavorite(r.name) {
+                            Image(systemName: "heart.fill")
+                                .foregroundStyle(.red)
+                                .font(.caption2)
+                                .accessibilityLabel("Favorite")
+                        }
                     }
                     Text("\(r.host):\(String(r.port))")
                         .font(.caption.monospaced())
@@ -215,5 +236,16 @@ struct ReflectorPickerSheet: View {
         .buttonStyle(.plain)
         .disabled(coordinator.isBusy || coordinator.callsign.isEmpty)
         .accessibilityLabel("Connect to \(r.name) on \(r.host)")
+        .contextMenu {
+            Button {
+                coordinator.toggleFavorite(name: r.name)
+            } label: {
+                if coordinator.isFavorite(r.name) {
+                    Label("Remove from Favorites", systemImage: "heart.slash")
+                } else {
+                    Label("Add to Favorites", systemImage: "heart")
+                }
+            }
+        }
     }
 }

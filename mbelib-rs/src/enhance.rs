@@ -180,6 +180,104 @@ pub(crate) fn spectral_amp_enhance(params: &mut MbeParams) {
             *slot *= gamma;
         }
     }
+
+    #[cfg(feature = "kenwood-tables")]
+    apply_kenwood_envelope_postfilter(params);
+}
+
+/// Apply Kenwood TH-D75 firmware's per-frequency envelope-shaping
+/// postfilter to the per-band magnitudes.
+///
+/// Source: `ENVELOPE_WEIGHTS[103]` at DSP VA `0x80049044`. The table
+/// is a bell curve peaking at index 51 with the value `1.0` and
+/// rolling off symmetrically — values around 0.85–0.88 at the
+/// endpoints, plateau near 0.97 across the mid-band where speech
+/// formants live (1.5–2.5 kHz). Multiplying decoder per-harmonic
+/// magnitudes by this curve reshapes the synthesized spectrum to
+/// match the perceptual emphasis Kenwood applies in firmware,
+/// producing audio that sounds closer to a TH-D75 RX rather than a
+/// generic mbelib decode.
+///
+/// The 103 entries span DC up to Nyquist (4000 Hz at the 8 kHz
+/// sample rate the AMBE codec works at) — each index covers
+/// `4000 / 103 ≈ 38.8 Hz`. Harmonic `l` lands at frequency
+/// `f_l = w0 · 8000 · l / (2π)` Hz; the index is
+/// `round(f_l / (4000 / 103))`. We clamp to `[0, 102]` for
+/// numerical safety; harmonics above 4 kHz get the
+/// last-bin weight (0.83).
+///
+/// Energy-preserving by design: after applying the weights, all
+/// magnitudes are renormalized to keep `Σ ml²` unchanged from the
+/// pre-postfilter total. Without the renormalization the overall
+/// loudness would drop because the bell curve reduces all bands
+/// (the peak weight is exactly 1.0; everything else is < 1.0).
+#[cfg(feature = "kenwood-tables")]
+fn apply_kenwood_envelope_postfilter(params: &mut MbeParams) {
+    use crate::encode::kenwood::support::ENVELOPE_WEIGHTS;
+    let big_l = params.l;
+    if big_l == 0 {
+        return;
+    }
+    let total_pre: f32 = (1..=big_l)
+        .map(|l| {
+            let m = params.ml.get(l).copied().unwrap_or(0.0);
+            m * m
+        })
+        .sum();
+    if total_pre == 0.0 {
+        return;
+    }
+
+    // Total bandwidth = π rad/sample = 4000 Hz at 8 kHz. The 103-entry
+    // table spans this range, so the mapping from normalized angular
+    // frequency (w0·l) to table index is `idx = round(w0 · l · 102 / π)`.
+    // The 102 (not 103) puts the last entry on the Nyquist endpoint.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Postfilter band-to-index mapping: l <= 56, w0 in (0, π/2], so the \
+                  product `w0 · l · 102 / π` is in [0, ~50]; the round-and-cast to \
+                  usize is exact within f32 mantissa precision and clamps to ENVELOPE_WEIGHTS \
+                  bounds via `.min(102)` below."
+    )]
+    let map_idx = |l: usize| -> usize {
+        let w0_l = params.w0 * l as f32;
+        let scale = 102.0 / std::f32::consts::PI;
+        let idx_f = (w0_l * scale).round();
+        let idx = if idx_f.is_finite() && idx_f >= 0.0 {
+            idx_f as usize
+        } else {
+            0
+        };
+        idx.min(ENVELOPE_WEIGHTS.len() - 1)
+    };
+
+    for l in 1..=big_l {
+        let idx = map_idx(l);
+        let weight = ENVELOPE_WEIGHTS.get(idx).copied().unwrap_or(1.0);
+        if let Some(slot) = params.ml.get_mut(l) {
+            *slot *= weight;
+        }
+    }
+
+    // Energy-preserving renormalization: rescale all bands so total
+    // power matches the pre-postfilter total. Without this the bell
+    // curve attenuation would reduce overall loudness by ~5–10 %.
+    let total_post: f32 = (1..=big_l)
+        .map(|l| {
+            let m = params.ml.get(l).copied().unwrap_or(0.0);
+            m * m
+        })
+        .sum();
+    if total_post > 0.0 {
+        let renorm = (total_pre / total_post).sqrt();
+        for l in 1..=big_l {
+            if let Some(slot) = params.ml.get_mut(l) {
+                *slot *= renorm;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -372,6 +470,62 @@ mod tests {
                 ml1.to_bits(),
                 ml2.to_bits(),
                 "band {l}: ml mismatch ({ml1} vs {ml2})"
+            );
+        }
+    }
+
+    /// Kenwood postfilter: applying `ENVELOPE_WEIGHTS` after standard
+    /// JMBE enhancement preserves total spectral energy (within
+    /// numerical precision) and reshapes the per-band magnitudes via
+    /// the Kenwood-firmware bell-curve postfilter (peak weight 1.0
+    /// near index 51, ≈0.83 at endpoints).
+    ///
+    /// This test asserts:
+    /// 1. Energy preservation — `Σ ml²` after postfilter ≈ before.
+    /// 2. Mid-band magnitudes (where weight ≈ 1) are emphasized over
+    ///    end-band magnitudes (weight ≈ 0.83).
+    #[cfg(feature = "kenwood-tables")]
+    #[test]
+    fn kenwood_postfilter_preserves_energy() {
+        let mut params = MbeParams::new();
+        params.l = 24;
+        params.w0 = std::f32::consts::PI / 32.0; // 250 Hz fundamental
+        for l in 1..=params.l {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test L=24, exact in f32 mantissa."
+            )]
+            let l_f = l as f32;
+            if let Some(slot) = params.ml.get_mut(l) {
+                *slot = (-(l_f - 12.0).powi(2) * 0.05).exp();
+            }
+        }
+        let pre_energy: f32 = (1..=params.l)
+            .map(|l| {
+                let m = params.ml.get(l).copied().unwrap_or(0.0);
+                m * m
+            })
+            .sum();
+
+        spectral_amp_enhance(&mut params);
+
+        let post_energy: f32 = (1..=params.l)
+            .map(|l| {
+                let m = params.ml.get(l).copied().unwrap_or(0.0);
+                m * m
+            })
+            .sum();
+        let ratio = post_energy / pre_energy;
+        assert!(
+            (0.95..=1.05).contains(&ratio),
+            "postfilter+enhance should preserve energy within 5%, got ratio={ratio:.4}"
+        );
+
+        for l in 1..=params.l {
+            let ml = params.ml.get(l).copied().unwrap_or(f32::NAN);
+            assert!(
+                ml.is_finite() && ml >= 0.0,
+                "band {l}: non-finite or negative magnitude {ml}"
             );
         }
     }

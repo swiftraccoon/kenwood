@@ -15,8 +15,9 @@ public enum RadioTransportState: Sendable, Equatable {
 ///
 /// Implementations:
 /// - `IOBluetoothTransport` (native macOS, via IOBluetooth RFCOMM).
+/// - `USBSerialTransport` (iPad, via the embedded `LodestarDriver`
+///   DriverKit extension; M-series iPads only).
 /// - `MockRadioTransport` (unit tests, in-memory).
-/// - Future: `USBCDCTransport` (iPadOS + iPhone 15+ + Mac, via IOUSBHost).
 public protocol RadioTransport: Sendable {
     /// The device this transport talks to.
     var device: BluetoothDevice { get }

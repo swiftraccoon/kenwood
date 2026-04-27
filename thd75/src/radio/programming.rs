@@ -984,8 +984,8 @@ impl<T: Transport> Radio<T> {
         result?;
 
         // Parse: W(1) + addr(4) + data(256).
-        let (_page_addr, data) = programming::parse_write_response(&received)
-            .map_err(|e| Error::Protocol(ProtocolError::MalformedFrame(e.into_bytes())))?;
+        let (_page_addr, data) =
+            programming::parse_write_response(&received).map_err(Error::Protocol)?;
 
         // Copy into a fixed-size array.
         let mut page_data = [0u8; programming::PAGE_SIZE];

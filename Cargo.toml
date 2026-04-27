@@ -57,6 +57,13 @@ indexing_slicing = "deny"
 # is visible at the suppression site.
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
+# Forward-protection lints — zero current violations, prevent regressions:
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+format_push_string = "deny"
+infinite_loop = "deny"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
 # Every crate in this workspace has at least one `pub(crate)` private module — that's

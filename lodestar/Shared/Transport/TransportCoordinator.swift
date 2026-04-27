@@ -76,7 +76,7 @@ public final class TransportCoordinator {
         #if os(macOS)
         availableDevices = IOBluetoothTransport.pairedDevices()
         #else
-        availableDevices = PrivateBluetoothTransport.pairedDevices()
+        availableDevices = USBSerialTransport.availableDevices()
         #endif
     }
 
@@ -93,7 +93,9 @@ public final class TransportCoordinator {
         #if os(macOS)
         let t: RadioTransport = IOBluetoothTransport(device: device)
         #else
-        let t: RadioTransport = PrivateBluetoothTransport(device: device)
+        // iPad uses USBSerialTransport; the device picker passes a
+        // synthetic descriptor since the USB path is one-cable-one-radio.
+        let t: RadioTransport = USBSerialTransport(device: device)
         #endif
         transport = t
         observeState(of: t)

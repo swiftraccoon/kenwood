@@ -37,6 +37,7 @@ use crate::sdcard::config::{self as d75, ConfigHeader};
 
 /// Errors that can occur when working with a memory image.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MemoryError {
     /// The raw data is not the expected size.
     InvalidSize {

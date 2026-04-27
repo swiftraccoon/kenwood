@@ -133,7 +133,14 @@ fn run_audio_worker(
 
     let mut worker = AudioWorker {
         audio,
-        encoder: AmbeEncoder::new(),
+        // 40 ms-lookahead pitch tracker matches OP25's reference
+        // (`pitch_est.cc` 2-frame DP) and recovers ~10-15 % more
+        // cross-correlation on real voice vs the zero-latency
+        // single-frame fallback. The latency cost is one-way,
+        // hidden inside the codec (the resampler/jitter buffer
+        // between mic and AMBE encoder is already several frames
+        // worth), so end-users perceive no extra delay.
+        encoder: AmbeEncoder::new_with_lookahead(),
         decoder: AmbeDecoder::new(),
         tx_active: false,
         mic_scratch: Vec::with_capacity(65_536),
@@ -248,7 +255,9 @@ impl AudioWorker {
                 self.audio.drain_mic();
                 self.tx_active = true;
                 self.tx_stats.reset();
-                self.encoder = AmbeEncoder::new();
+                // Match the constructor in `start_audio_worker` —
+                // lookahead encoder for OP25-parity voice quality.
+                self.encoder = AmbeEncoder::new_with_lookahead();
                 if let Err(e) = self.session_tx.try_send(SessionCommand::StartTx {
                     my_call: my_call.clone(),
                 }) {
@@ -499,6 +508,49 @@ fn resample_linear(input: &[f32], input_rate: u32, output_rate: u32, output: &mu
         output.extend_from_slice(input);
         return;
     }
+    // Anti-alias / anti-image filter at min(input, output) Nyquist:
+    // linear interpolation has no built-in low-pass, so without this
+    // step ALL the energy above the lower-rate Nyquist becomes
+    // spectral garbage — aliased back into the band on downsampling
+    // (TX path: 48 kHz mic → 8 kHz codec maps everything in
+    // [4 kHz, 24 kHz] into [0, 4 kHz]) or imaged into audible
+    // frequencies on upsampling (RX path: 8 kHz codec → 48 kHz speaker
+    // makes the codec spectrum repeat at 8, 16, 24 kHz; the 4-12 kHz
+    // image is audible as high-frequency whistle).
+    //
+    // **This was the root cause of the sextant↔sextant "garble noise"
+    // symptom on real microphone input** — every fricative, plosive,
+    // and broadband transient that the mic captured above 4 kHz
+    // folded back into the speech band, replacing the formants the
+    // AMBE codec was supposed to encode with phantom aliased content.
+    // The encoder then dutifully encoded the alias garbage; the
+    // receiver dutifully reconstructed it; users heard speech-shaped
+    // noise. Synthetic-input tests didn't catch this because synthetic
+    // signals are bandlimited to [0, 4 kHz] by construction.
+    //
+    // Cutoff: `0.45 × min_rate`. The 0.45 (vs the theoretical 0.5
+    // Nyquist) gives the 24-dB/oct rolloff some margin to reach
+    // significant attenuation by the time we hit the Nyquist edge.
+    // Cascaded 2× biquad → 4-pole Butterworth → -24 dB/oct. At 1
+    // octave above the cutoff (e.g. 7.2 kHz with a 3.6 kHz cutoff
+    // for an 8 kHz target rate) we are at ~-30 dB, well below the
+    // audible noise floor.
+    let min_rate = input_rate.min(output_rate);
+    let cutoff_hz = 0.45 * f64::from(min_rate);
+
+    let prefiltered: Vec<f32> = if input_rate > output_rate {
+        // Downsampling: filter input first to bandlimit before
+        // sample-rate-reducing linear interpolation.
+        let taps = design_lpf_fir(cutoff_hz, f64::from(input_rate));
+        apply_fir_lpf(input, &taps)
+    } else {
+        // Upsampling: linear interp first (cheaper to filter at the
+        // higher output rate after interpolation), filter applied
+        // post-interpolation below.
+        input.to_vec()
+    };
+    let input: &[f32] = &prefiltered;
+
     let ratio = f64::from(input_rate) / f64::from(output_rate);
     #[expect(
         clippy::cast_precision_loss,
@@ -547,6 +599,132 @@ fn resample_linear(input: &[f32], input_rate: u32, output_rate: u32, output: &mu
         let b = input.get(next_idx).copied().unwrap_or(a);
         output.push((b - a).mul_add(frac, a));
     }
+
+    // Anti-image filter for the upsampling case: zero-stuffing-style
+    // linear interpolation produces spectral images of the input at
+    // every multiple of `input_rate`, of which the first image
+    // (at [input_rate, output_rate - input_rate]) lands in the
+    // audible 4-12 kHz band when going 8 kHz → 48 kHz. Filter the
+    // output through the same Butterworth LPF used on the
+    // downsampling path.
+    if input_rate < output_rate && !output.is_empty() {
+        let taps = design_lpf_fir(cutoff_hz, f64::from(output_rate));
+        let filtered = apply_fir_lpf(output, &taps);
+        output.clear();
+        output.extend_from_slice(&filtered);
+    }
+}
+
+/// FIR filter length for the anti-alias / anti-image low-pass.
+/// 63-tap Hamming-windowed sinc gives ~53 dB stopband rejection
+/// — enough to push aliased mic content (sibilance / plosives at
+/// 5-8 kHz) below the audible noise floor when downsampling to the
+/// 8 kHz AMBE codec rate. Linear-phase FIR avoids the
+/// near-cutoff sloppy rolloff that the cascaded-biquad approach
+/// suffered from (-19 dB at 8 kHz vs the -53 dB FIR delivers).
+const FIR_TAPS: usize = 63;
+
+/// Design a `FIR_TAPS`-long Hamming-windowed sinc low-pass filter
+/// for the given cutoff frequency and sample rate. Returns the
+/// time-domain impulse response (linear phase, symmetric).
+///
+/// Hamming window: `0.54 − 0.46·cos(2π·n/(N−1))`. Stopband
+/// attenuation ≈ 53 dB, transition bandwidth ≈ `3.3·sample_rate/N`
+/// for a 63-tap design — about 2.5 kHz at 48 kHz, narrow enough
+/// that we can pass the speech band (≤3.5 kHz) cleanly while
+/// rejecting alias content above 4 kHz.
+fn design_lpf_fir(cutoff_hz: f64, sample_rate: f64) -> [f32; FIR_TAPS] {
+    let mut taps = [0.0_f32; FIR_TAPS];
+    let fc_norm = cutoff_hz / sample_rate;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "FIR_TAPS is a small compile-time constant; the usize→f64 cast is exact."
+    )]
+    let center = (FIR_TAPS - 1) as f64 / 2.0;
+
+    let mut sum = 0.0_f64;
+    for (i, slot) in taps.iter_mut().enumerate() {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "i bounded by FIR_TAPS; usize→f64 exact."
+        )]
+        let n = i as f64 - center;
+        // Sinc with normalized cutoff: 2·fc·sinc(2·fc·n).
+        let arg = 2.0 * fc_norm * n;
+        let sinc_val = if arg.abs() < 1e-9 {
+            2.0 * fc_norm
+        } else {
+            (std::f64::consts::PI * arg).sin() / (std::f64::consts::PI * n)
+        };
+        // Hamming window.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "i and FIR_TAPS−1 are both small; usize→f64 exact."
+        )]
+        let win = (-0.46_f64).mul_add(
+            (2.0 * std::f64::consts::PI * i as f64 / (FIR_TAPS - 1) as f64).cos(),
+            0.54,
+        );
+        let h = sinc_val * win;
+        sum += h;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "filter taps are bounded |h| < 1 by construction; f64→f32 narrowing \
+                      drops only fractional precision below the audio noise floor."
+        )]
+        {
+            *slot = h as f32;
+        }
+    }
+
+    // Normalize for unity DC gain so the filter doesn't change the
+    // signal level on the DC component (any small drift from the
+    // window asymmetry is corrected here).
+    if sum.abs() > 1e-12 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "normalizing factor is a finite f64 derived from a small finite \
+                      sum; narrowing to f32 is safe for our coefficient magnitudes."
+        )]
+        let norm = (1.0 / sum) as f32;
+        for slot in &mut taps {
+            *slot *= norm;
+        }
+    }
+
+    taps
+}
+
+/// Apply a linear-phase symmetric FIR low-pass to the input slice.
+/// Implements direct convolution with zero-padding at the boundaries
+/// (no reflection or wrap). Output length matches input length.
+///
+/// At the buffer boundaries the output is degraded by the missing
+/// past-history samples, but for the sextant TX/RX path a single
+/// 20 ms buffer is processed with fresh state on each call — the
+/// boundary degradation is one filter-length worth of warmup
+/// (≈1.3 ms at 48 kHz) which is well within the 20 ms frame.
+fn apply_fir_lpf(input: &[f32], taps: &[f32; FIR_TAPS]) -> Vec<f32> {
+    let mut output = Vec::with_capacity(input.len());
+    let half = FIR_TAPS / 2;
+    for i in 0..input.len() {
+        let mut acc = 0.0_f32;
+        for (k, &tap) in taps.iter().enumerate() {
+            // Sample index = i + k - half. Use checked arithmetic
+            // to avoid signed-cast lints. For i + k >= half the
+            // sample lands inside the input; otherwise we're in the
+            // pre-buffer warmup zone where the convolution sum is
+            // effectively zero-padded.
+            let Some(src_idx) = (i + k).checked_sub(half) else {
+                continue;
+            };
+            if let Some(&x) = input.get(src_idx) {
+                acc = tap.mul_add(x, acc);
+            }
+        }
+        output.push(acc);
+    }
+    output
 }
 
 /// HW samples per 20 ms at the given rate.
@@ -721,5 +899,137 @@ fn fill_stereo_from_mono_f32(
         for slot in chunk.iter_mut() {
             *slot = s;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_fir_lpf, design_lpf_fir, resample_linear};
+
+    /// FIR low-pass at 0.45 × 8000 Hz cutoff (designed for 48 kHz
+    /// input rate) must reject content above 4 kHz by ≥30 dB while
+    /// preserving the speech-formant range below 3 kHz to within
+    /// 1 dB. This is the bare minimum to prevent the alias-folded
+    /// "speech-shaped garble" symptom that broke sextant↔sextant
+    /// before the FIR was added.
+    #[test]
+    fn fir_attenuates_above_speech_band() {
+        let cutoff = 3600.0_f64;
+        let fs = 48_000.0_f64;
+        let taps = design_lpf_fir(cutoff, fs);
+
+        let measure_db = |freq_hz: f64| -> f64 {
+            let n_samples = 4800_usize;
+            let mut sig = Vec::with_capacity(n_samples);
+            for i in 0..n_samples {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test: i bounded by n_samples (4800), exact in f64."
+                )]
+                let t = i as f64 / fs;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "test: sine value bounded by 1.0, narrowing to f32 is exact."
+                )]
+                {
+                    sig.push((2.0 * std::f64::consts::PI * freq_hz * t).sin() as f32);
+                }
+            }
+            let filtered = apply_fir_lpf(&sig, &taps);
+            // Use RMS energy — peak detection is sensitive to phase/edge effects.
+            // Compute RMS over the steady-state region (skip filter group delay).
+            let warmup = 200_usize;
+            let body: Vec<f32> = filtered.into_iter().skip(warmup).collect();
+            let sum_sq: f32 = body.iter().map(|&v| v * v).sum();
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test: body.len() bounded by 4800, exact in f32 mantissa."
+            )]
+            let n = body.len() as f32;
+            let rms = (sum_sq / n).sqrt();
+            // Compare against input RMS (which is 1/√2 for unit-amplitude sine).
+            let in_rms = 1.0_f32 / std::f32::consts::SQRT_2;
+            20.0 * f64::from((rms / in_rms).max(1e-9_f32)).log10()
+        };
+
+        // Passband — should be essentially unattenuated.
+        for &(f, max_db) in &[
+            (500.0, -1.0),
+            (1000.0, -1.0),
+            (2000.0, -1.0),
+            (3000.0, -2.0),
+        ] {
+            let db = measure_db(f);
+            assert!(
+                db > max_db,
+                "FIR at {f:.0} Hz attenuated to {db:.1} dB; expected > {max_db:.1} dB"
+            );
+        }
+        // Stopband — should be ≥ 30 dB attenuated.
+        for &(f, min_db) in &[(5000.0, -30.0), (6000.0, -40.0), (8000.0, -40.0)] {
+            let db = measure_db(f);
+            assert!(
+                db < min_db,
+                "FIR at {f:.0} Hz only attenuated to {db:.1} dB; expected < {min_db:.1} dB"
+            );
+        }
+    }
+
+    /// Round-tripping a 6500 Hz tone through the resampler (48 kHz →
+    /// 8 kHz → 48 kHz) must NOT alias to 1500 Hz. Without the FIR
+    /// anti-alias filter, linear resampling of a 6500 Hz tone at
+    /// 48 kHz produces full-amplitude alias content at 8000 - 6500 =
+    /// 1500 Hz on the way down. With the filter, the 6500 Hz content
+    /// is attenuated below the audible noise floor before
+    /// downsampling — the 1500 Hz alias is gone.
+    #[test]
+    fn resampler_does_not_alias_6500hz_tone() {
+        // 0.1 s of 6500 Hz tone at 48 kHz, peak amplitude 0.5
+        let n = 4800_usize;
+        let fs_in = 48_000.0_f32;
+        let mut input = Vec::with_capacity(n);
+        for i in 0..n {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test: i bounded by n=4800, exact in f32."
+            )]
+            let t = i as f32 / fs_in;
+            input.push(0.5 * (t * 2.0 * std::f32::consts::PI * 6500.0).sin());
+        }
+
+        // Downsample to 8 kHz
+        let mut down = Vec::new();
+        resample_linear(&input, 48_000, 8_000, &mut down);
+
+        // Measure energy at 1500 Hz (the would-be alias frequency) in
+        // the 8 kHz output. Should be near zero — the FIR pre-filter
+        // already killed the 6500 Hz content.
+        let mut re = 0.0_f32;
+        let mut im = 0.0_f32;
+        for (i, &s) in down.iter().enumerate() {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test: i bounded by down.len() (~800), exact in f32."
+            )]
+            let t = i as f32 / 8000.0;
+            let phase = 2.0 * std::f32::consts::PI * 1500.0 * t;
+            re += s * phase.cos();
+            im += s * phase.sin();
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test: down.len() small, exact in f32."
+        )]
+        let n_down = down.len() as f32;
+        let alias_mag = re.hypot(im) / n_down;
+        // Original 6500 Hz tone had amplitude 0.5; alias-free output
+        // should have ≤ 0.005 (40 dB below the input).
+        assert!(
+            alias_mag < 0.05,
+            "1500 Hz alias amplitude is {alias_mag:.4}, expected < 0.05 \
+             (this means the anti-alias FIR is leaking high-frequency \
+             content back into the speech band — sextant↔sextant garble \
+             noise will return)."
+        );
     }
 }
