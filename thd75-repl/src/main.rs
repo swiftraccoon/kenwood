@@ -1611,12 +1611,20 @@ async fn run_igate(client: &mut AprsClient<EitherTransport>, filter: &str) {
             // Poll APRS-IS for incoming packets.
             is_result = is_client.next_event() => {
                 match is_result {
-                    Ok(AprsIsEvent::Packet(line)) => {
-                        aprintln!("{}", thd75_repl::output::aprs_is_incoming(&line));
+                    Ok(AprsIsEvent::Packet(pkt)) => {
+                        // `pkt.line` is the lossy UTF-8 view (any
+                        // non-UTF-8 bytes appear as U+FFFD). For REPL
+                        // display and the existing gate_from_is helper
+                        // (which takes &str) the lossy form is the
+                        // right input — both are display- and parse-
+                        // oriented operations. Callers needing byte-
+                        // exact wire fidelity (capture file, full
+                        // third-party rewrap) would use `pkt.raw`.
+                        aprintln!("{}", thd75_repl::output::aprs_is_incoming(&pkt.line));
                         // Gate to RF if appropriate. The helper checks
                         // whether the packet should be forwarded per
                         // IGate rules (station heard on RF recently, etc).
-                        if let Err(e) = client.gate_from_is(&line).await {
+                        if let Err(e) = client.gate_from_is(&pkt.line).await {
                             println!("Error: gate to RF: {e}");
                         }
                     }
@@ -3360,6 +3368,55 @@ fn rand_stream_id() -> StreamId {
     StreamId::new(id).expect("low bit forced to 1 guarantees non-zero")
 }
 
+/// Build the header to send to the radio's MMDVM modem when relaying
+/// a reflector voice frame.
+///
+/// Convention matches `MMDVMHost`'s `m_remoteGateway` network-to-RF
+/// path in `ref/MMDVMHost/DStarControl.cpp:749-754` — `thd75-repl` is a
+/// remote gateway in front of the modem:
+/// - `flag1` |= `0x40` (`DSTAR_REPEATER_MASK`) per
+///   `ref/MMDVMHost/DStarDefines.h:62`.
+/// - `rpt1` = local station callsign (7 bytes) + local module letter.
+/// - `rpt2` = same as `rpt1` (callsign + module). `MMDVMHost` uses
+///   `rpt2 = m_callsign` (NOT `m_gateway`) in remote-gateway mode.
+/// - `ur_call` = `"CQCQCQ  "` — the standard "calling all stations"
+///   destination for relayed voice.
+/// - `my_call` / `my_suffix` = passed through from the original sender.
+fn build_radio_header(
+    station_callsign: Callsign,
+    local_module: Module,
+    header: &DStarHeader,
+) -> DStarHeader {
+    const DSTAR_REPEATER_MASK: u8 = 0x40;
+
+    let cs_bytes = station_callsign.as_bytes();
+
+    let mut rpt_buf = [b' '; 8];
+    if let Some(dst) = rpt_buf.get_mut(..7)
+        && let Some(src) = cs_bytes.get(..7)
+    {
+        dst.copy_from_slice(src);
+    }
+    if let Some(slot) = rpt_buf.get_mut(7) {
+        *slot = local_module.as_byte();
+    }
+    let rpt = Callsign::from_wire_bytes(rpt_buf);
+
+    let ur_call = Callsign::try_from_str("CQCQCQ")
+        .unwrap_or_else(|_| Callsign::from_wire_bytes(*b"CQCQCQ  "));
+
+    DStarHeader {
+        flag1: header.flag1 | DSTAR_REPEATER_MASK,
+        flag2: header.flag2,
+        flag3: header.flag3,
+        rpt2: rpt,
+        rpt1: rpt,
+        ur_call,
+        my_call: header.my_call,
+        my_suffix: header.my_suffix,
+    }
+}
+
 /// Relay a reflector event to the radio MMDVM modem.
 async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEvent) {
     let gw = &mut session.gateway;
@@ -3392,9 +3449,24 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             session.last_rx_voice_frame = None;
             session.last_relay_at = None;
             session.pad_frames_emitted = 0;
-            // Radio-side gateway now takes the same core DStarHeader —
-            // no translation needed.
-            if let Err(e) = gw.send_header(header).await {
+            // Rewrite rpt1/rpt2/flag1 per `MMDVMHost`'s
+            // `m_remoteGateway` convention before forwarding (see
+            // `build_radio_header` doc).
+            let radio_header = build_radio_header(session.callsign, session.local_module, header);
+            // Diagnostic: print the exact header fields going to the
+            // radio's MMDVM modem so the operator can confirm the
+            // relay path is firing AND see what the radio's TX header
+            // validator is actually being asked to accept.
+            aprintln!(
+                "Relay → radio: my={}/{} ur={} rpt1={} rpt2={} flag1=0x{:02X}",
+                radio_header.my_call.as_str(),
+                radio_header.my_suffix.as_str(),
+                radio_header.ur_call.as_str(),
+                radio_header.rpt1.as_str(),
+                radio_header.rpt2.as_str(),
+                radio_header.flag1,
+            );
+            if let Err(e) = gw.send_header(&radio_header).await {
                 println!(
                     "{}",
                     thd75_repl::output::error(format_args!("relaying header to radio: {e}"))
@@ -3517,6 +3589,11 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             session.last_rx_voice_frame = None;
             session.last_relay_at = None;
             session.pad_frames_emitted = 0;
+            // Diagnostic: matches the `Relay → radio: my=...` line emitted
+            // on `VoiceStart` so the operator can confirm the EOT
+            // closes the stream — and that the relay is calling
+            // `send_eot` (not silently failing earlier in the path).
+            aprintln!("Relay → radio: EOT");
             if let Err(e) = gw.send_eot().await {
                 println!(
                     "{}",

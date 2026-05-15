@@ -44,14 +44,20 @@ mod units;
 mod weather;
 
 pub use build::{
-    build_aprs_item, build_aprs_item_packet, build_aprs_message, build_aprs_message_checked,
+    build_aprs_item, build_aprs_item_checked, build_aprs_item_checked_packet,
+    build_aprs_item_packet, build_aprs_message, build_aprs_message_checked,
     build_aprs_message_packet, build_aprs_mice, build_aprs_mice_with_message,
     build_aprs_mice_with_message_packet, build_aprs_object, build_aprs_object_with_timestamp,
+    build_aprs_object_with_timestamp_checked, build_aprs_object_with_timestamp_checked_packet,
     build_aprs_object_with_timestamp_packet, build_aprs_position_compressed,
     build_aprs_position_compressed_packet, build_aprs_position_report,
     build_aprs_position_report_packet, build_aprs_position_weather,
     build_aprs_position_weather_packet, build_aprs_status, build_aprs_status_packet,
-    build_aprs_weather, build_aprs_weather_packet, build_query_response_position,
+    build_aprs_telemetry, build_aprs_telemetry_bits, build_aprs_telemetry_bits_packet,
+    build_aprs_telemetry_eqns, build_aprs_telemetry_eqns_packet, build_aprs_telemetry_packet,
+    build_aprs_telemetry_parm, build_aprs_telemetry_parm_packet, build_aprs_telemetry_unit,
+    build_aprs_telemetry_unit_packet, build_aprs_weather, build_aprs_weather_packet,
+    build_query_response_position,
 };
 pub use digipeater::{
     DEFAULT_DEDUP_TTL, DEFAULT_VISCOUS_DELAY, DigiAction, DigipeaterAlias, DigipeaterConfig,
@@ -67,7 +73,7 @@ pub use messenger::{
 pub use mic_e::{MiceMessage, mice_message_bits, parse_aprs_data_full, parse_mice_position};
 pub use packet::{
     AprsData, AprsDataExtension, AprsPacket, AprsTimestamp, MessageKind, ParseContext, Phg,
-    PositionAmbiguity, TelemetryDefinition, TelemetryParameters, parse_aprs_data,
+    PhgDirectivity, PositionAmbiguity, TelemetryDefinition, TelemetryParameters, parse_aprs_data,
     parse_aprs_extensions,
 };
 pub use position::{
@@ -76,7 +82,7 @@ pub use position::{
 };
 pub use smart_beaconing::{BeaconReason, BeaconState, SmartBeaconing, SmartBeaconingConfig};
 pub use station_list::{StationEntry, StationList};
-pub use status::{AprsStatus, parse_aprs_status};
+pub use status::{AprsStatus, MAX_APRS_STATUS_TEXT_LEN, parse_aprs_status};
 pub use telemetry::{AprsTelemetry, parse_aprs_telemetry};
 pub use units::{
     AprsSymbol, Course, Fahrenheit, Latitude, Longitude, MessageId, Speed, SymbolTable, Tocall,

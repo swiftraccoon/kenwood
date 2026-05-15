@@ -35,7 +35,7 @@ pub mod client;
 pub mod mcp_bridge;
 
 use aprs::AprsError;
-use ax25_codec::{Ax25Address, Ax25Packet, build_ax25};
+use ax25_codec::{Ax25Address, Ax25Packet, CommandResponse, RouteEntry, build_ax25};
 use kiss_tnc::{KissFrame, encode_kiss_frame};
 
 // ---------------------------------------------------------------------------
@@ -52,13 +52,14 @@ use kiss_tnc::{KissFrame, encode_kiss_frame};
 pub const fn ax25_ui_frame(
     source: Ax25Address,
     destination: Ax25Address,
-    path: Vec<Ax25Address>,
+    path: Vec<RouteEntry>,
     info: Vec<u8>,
 ) -> Ax25Packet {
     Ax25Packet {
         source,
         destination,
         digipeaters: path,
+        command_or_response: Some(CommandResponse::Command),
         control: 0x03,
         protocol: 0xF0,
         info,
@@ -100,12 +101,12 @@ const DEFAULT_DIGIPEATERS: &[(&str, u8)] = &[("WIDE1", 1), ("WIDE2", 1)];
 ///
 /// ```
 /// use kenwood_thd75::aprs::parse_digipeater_path;
-/// let path = parse_digipeater_path("WIDE1-1,WIDE2-2").unwrap();
+/// let path = parse_digipeater_path("WIDE1-1,WIDE2-2").expect("static input is valid");
 /// assert_eq!(path.len(), 2);
-/// assert_eq!(path[0].callsign, "WIDE1");
-/// assert_eq!(path[0].ssid, 1);
+/// assert_eq!(path[0].address.callsign, "WIDE1");
+/// assert_eq!(path[0].address.ssid, 1);
 /// ```
-pub fn parse_digipeater_path(s: &str) -> Result<Vec<Ax25Address>, AprsError> {
+pub fn parse_digipeater_path(s: &str) -> Result<Vec<RouteEntry>, AprsError> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
@@ -130,18 +131,20 @@ pub fn parse_digipeater_path(s: &str) -> Result<Vec<Ax25Address>, AprsError> {
         if callsign.is_empty() || callsign.len() > 6 {
             return Err(AprsError::InvalidPath(s.to_owned()));
         }
-        result.push(Ax25Address::new(callsign, ssid));
+        let route =
+            RouteEntry::new(callsign, ssid).map_err(|_| AprsError::InvalidPath(s.to_owned()))?;
+        result.push(route);
     }
     Ok(result)
 }
 
-/// Build the default digipeater path as [`Ax25Address`] entries
+/// Build the default digipeater path as [`RouteEntry`] entries
 /// (`WIDE1-1,WIDE2-1`).
 #[must_use]
-pub fn default_digipeater_path() -> Vec<Ax25Address> {
+pub fn default_digipeater_path() -> Vec<RouteEntry> {
     DEFAULT_DIGIPEATERS
         .iter()
-        .map(|(call, ssid)| Ax25Address::new(call, *ssid))
+        .filter_map(|(call, ssid)| RouteEntry::new(call, *ssid).ok())
         .collect()
 }
 
@@ -158,8 +161,8 @@ mod tests {
 
     #[test]
     fn parse_digipeater_path_empty_is_ok() -> TestResult {
-        assert_eq!(parse_digipeater_path("")?, Vec::<Ax25Address>::new());
-        assert_eq!(parse_digipeater_path("   ")?, Vec::<Ax25Address>::new());
+        assert_eq!(parse_digipeater_path("")?, Vec::<RouteEntry>::new());
+        assert_eq!(parse_digipeater_path("   ")?, Vec::<RouteEntry>::new());
         Ok(())
     }
 
@@ -168,8 +171,8 @@ mod tests {
         let path = parse_digipeater_path("WIDE1-1")?;
         assert_eq!(path.len(), 1);
         let first = path.first().ok_or("path[0] missing")?;
-        assert_eq!(first.callsign, "WIDE1");
-        assert_eq!(first.ssid, 1);
+        assert_eq!(first.address.callsign, "WIDE1");
+        assert_eq!(first.address.ssid, 1);
         Ok(())
     }
 
@@ -177,10 +180,13 @@ mod tests {
     fn parse_digipeater_path_multiple() -> TestResult {
         let path = parse_digipeater_path("WIDE1-1,WIDE2-2")?;
         assert_eq!(path.len(), 2);
-        assert_eq!(path.first().ok_or("path[0] missing")?.callsign, "WIDE1");
+        assert_eq!(
+            path.first().ok_or("path[0] missing")?.address.callsign,
+            "WIDE1",
+        );
         let second = path.get(1).ok_or("path[1] missing")?;
-        assert_eq!(second.callsign, "WIDE2");
-        assert_eq!(second.ssid, 2);
+        assert_eq!(second.address.callsign, "WIDE2");
+        assert_eq!(second.address.ssid, 2);
         Ok(())
     }
 
@@ -188,7 +194,7 @@ mod tests {
     fn parse_digipeater_path_no_ssid() -> TestResult {
         let path = parse_digipeater_path("WIDE1")?;
         assert_eq!(path.len(), 1);
-        assert_eq!(path.first().ok_or("path[0] missing")?.ssid, 0);
+        assert_eq!(path.first().ok_or("path[0] missing")?.address.ssid, 0);
         Ok(())
     }
 
@@ -208,19 +214,19 @@ mod tests {
         let path = default_digipeater_path();
         assert_eq!(path.len(), 2);
         let first = path.first().ok_or("path[0] missing")?;
-        assert_eq!(first.callsign, "WIDE1");
-        assert_eq!(first.ssid, 1);
+        assert_eq!(first.address.callsign, "WIDE1");
+        assert_eq!(first.address.ssid, 1);
         let second = path.get(1).ok_or("path[1] missing")?;
-        assert_eq!(second.callsign, "WIDE2");
-        assert_eq!(second.ssid, 1);
+        assert_eq!(second.address.callsign, "WIDE2");
+        assert_eq!(second.address.ssid, 1);
         Ok(())
     }
 
     #[test]
-    fn ax25_ui_frame_sets_control_and_pid() {
+    fn ax25_ui_frame_sets_control_and_pid() -> TestResult {
         let packet = ax25_ui_frame(
-            Ax25Address::new("N0CALL", 7),
-            Ax25Address::new("APRS", 0),
+            Ax25Address::new("N0CALL", 7)?,
+            Ax25Address::new("APRS", 0)?,
             vec![],
             b"!test".to_vec(),
         );
@@ -229,13 +235,14 @@ mod tests {
         assert_eq!(packet.source.callsign, "N0CALL");
         assert_eq!(packet.destination.callsign, "APRS");
         assert_eq!(&packet.info, b"!test");
+        Ok(())
     }
 
     #[test]
-    fn ax25_to_kiss_wire_produces_valid_kiss_frame() {
+    fn ax25_to_kiss_wire_produces_valid_kiss_frame() -> TestResult {
         let packet = ax25_ui_frame(
-            Ax25Address::new("N0CALL", 7),
-            Ax25Address::new("APRS", 0),
+            Ax25Address::new("N0CALL", 7)?,
+            Ax25Address::new("APRS", 0)?,
             vec![],
             b"!test".to_vec(),
         );
@@ -243,5 +250,6 @@ mod tests {
         // KISS frame starts and ends with FEND (0xC0).
         assert_eq!(wire.first(), Some(&FEND));
         assert_eq!(wire.last(), Some(&FEND));
+        Ok(())
     }
 }

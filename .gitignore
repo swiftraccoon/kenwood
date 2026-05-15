@@ -19,6 +19,7 @@ thd75_re/
 *.pdf
 *.md
 *.csv
+*.ambe
 
 !README.md
 
@@ -38,6 +39,7 @@ dstar-gateway/book/book/
 
 ref/
 ref_tools/
+refs/
 
 # Lodestar build artifacts (xcframework, generated Swift, Xcode-generated project)
 lodestar/LodestarKit.xcframework/

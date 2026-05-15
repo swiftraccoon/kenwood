@@ -303,6 +303,7 @@ fn sine_roundtrip_has_nonzero_correlation_with_input() {
         best
     };
 
+    eprintln!("baseline_ncc_1khz = {max_ncc:.4}");
     assert!(
         max_ncc >= 0.10,
         "round-trip cross-correlation with input is essentially zero: \
@@ -310,6 +311,175 @@ fn sine_roundtrip_has_nonzero_correlation_with_input() {
          with the input — spectral-envelope encoder bug (b3/b4/b5-b8). \
          Fix the spectral path; loosen this threshold only as a \
          regression tightening, not a regression loosening."
+    );
+}
+
+/// Voice-band roundtrip — 200 Hz fundamental with 4 decaying harmonics
+/// (a synthetic "voice" signal sitting squarely inside the AMBE codec's
+/// design range). 1 kHz is OUT-OF-RANGE for AMBE 3600x2400 (which
+/// targets human speech, F0 ≈ 80–400 Hz), so the existing 1 kHz
+/// `sine_roundtrip_*` test is dominated by sub-multiple selection
+/// noise rather than encoder spectral-envelope quality. This test
+/// uses an in-range tonal complex so the cross-correlation actually
+/// reflects spectral-envelope reconstruction fidelity.
+///
+/// Per-frame b-vec is dumped so encoder fixes can be bisected by
+/// comparing what `b3..b8` change from one revision to the next.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Linear voice-band roundtrip test: synth → 40 frames encode→decode → \
+              cross-correlate. Splitting helpers obscures the data flow; the test reads \
+              top-to-bottom like the existing 1 kHz sine_roundtrip test."
+)]
+#[test]
+fn voice_band_200hz_roundtrip_correlation() {
+    fn make_voice_chunk(t0_samples: usize) -> [f32; 160] {
+        let mut buf = [0.0_f32; 160];
+        // Lower amplitude (0.02 = -34 dBFS) keeps the encoder's gain
+        // calculation away from DG_TABLE saturation. At 0.1 amp the
+        // FFT magnitudes drove `gain ≈ 12` while DG_TABLE max is
+        // ~5.35, so b2 was pinning at 62/63 and the closed-loop
+        // reconstructed_gamma converged to 10.7 instead of 12 — a
+        // 1.3-bit scale offset that propagated through `interp_prev`
+        // and corrupted every subsequent frame's `T = lsa - 0.65*ip + Sum43`.
+        let amplitude = 0.02_f32;
+        // Pick a frequency that lands EXACTLY on W0_TABLE[46] (0.02497
+        // cycles/sample × 8000 = 199.79 Hz) so the encoder's pitch
+        // quantization can't introduce a sub-Hz frequency error that
+        // accumulates phase drift over the 800 ms test window. With a
+        // 200.0 Hz target the pitch tracker rounds to W0_TABLE[45] =
+        // 205.5 Hz, and the resulting +5.5 Hz error drifts ~4 cycles
+        // over 0.8 s, dominating the cross-correlation metric.
+        let f0_hz = 199.79_f32;
+        let sr = 8000.0_f32;
+        // Continuous voice envelope: 18 harmonics with 1/k formant
+        // decay (moderate vowel /a/-like). Continuous coverage from
+        // k=1 to k=18 avoids the artificial voiced/unvoiced cliff that
+        // a sparse 4-harmonic signal creates — that cliff makes Gm
+        // saturate the PRBA24 codebook because real voice doesn't
+        // have the abrupt magnitude drop our short stack produces.
+        let n_harmonics = 18_usize;
+        for (i, slot) in buf.iter_mut().enumerate() {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test sample-time generator: i+t0 well below f32 mantissa precision."
+            )]
+            let t = (t0_samples + i) as f32;
+            let mut s = 0.0_f32;
+            for k_idx in 0..n_harmonics {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "harmonic index 1..=18 fits exactly in f32."
+                )]
+                let k = (k_idx + 1) as f32;
+                let amp = 1.0 / k; // 1/k decay = pink-spectrum-like envelope
+                s += amp * (t * 2.0 * std::f32::consts::PI * f0_hz * k / sr).sin();
+            }
+            *slot = amplitude * s;
+        }
+        buf
+    }
+
+    let mut enc = AmbeEncoder::new();
+    let mut dec = AmbeDecoder::new();
+
+    let frames = 40_usize;
+    let mut input_pcm: Vec<f32> = Vec::with_capacity(frames * 160);
+    let mut output_pcm: Vec<f32> = Vec::with_capacity(frames * 160);
+
+    let mut t0 = 0_usize;
+    for f in 0..frames {
+        let chunk = make_voice_chunk(t0);
+        input_pcm.extend_from_slice(&chunk);
+        let ambe = enc.encode_frame(&chunk);
+        // Diagnostic: dump first 5 stable-state frames after warm-up.
+        if (10..15).contains(&f) {
+            let (b, w0, big_l, _) = mbelib_rs::decode_trace(&ambe);
+            let f0_hz = w0 * 8000.0 / (2.0 * std::f32::consts::PI);
+            eprintln!(
+                "voice frame {}: b0={} (f0={:.0}Hz, L={}), b1={}, b2={}, b3={}, b4={}, b5..b8={},{},{},{}",
+                f, b[0], f0_hz, big_l, b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]
+            );
+        }
+        let pcm_out = dec.decode_frame(&ambe);
+        output_pcm.extend(pcm_out.iter().map(|&s| f32::from(s) / 32768.0));
+        t0 += 160;
+    }
+
+    let warmup = 10 * 160;
+    let a = input_pcm.get(warmup..).unwrap_or(&[]);
+    let b = output_pcm.get(warmup..).unwrap_or(&[]);
+
+    let rms = |x: &[f32]| -> f32 {
+        let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "x.len() bounded by frames*160 ≤ 16000, exact in f32."
+        )]
+        let n = x.len() as f32;
+        (sum_sq / n).sqrt()
+    };
+
+    let max_ncc = {
+        let mut best: f32 = -1.0;
+        for lag in (-200_i32..=200_i32).step_by(2) {
+            let (ax, bx) = if lag >= 0 {
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "lag >= 0 branch; sign-loss cast is safe."
+                )]
+                let l = lag as usize;
+                (
+                    a.get(l..a.len().min(b.len() + l)).unwrap_or(&[]),
+                    b.get(..b.len().min(a.len().saturating_sub(l)))
+                        .unwrap_or(&[]),
+                )
+            } else {
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "lag < 0 branch; -lag is positive so sign-loss is safe."
+                )]
+                let l = (-lag) as usize;
+                (
+                    a.get(..a.len().min(b.len().saturating_sub(l)))
+                        .unwrap_or(&[]),
+                    b.get(l..b.len().min(a.len() + l)).unwrap_or(&[]),
+                )
+            };
+            let n = ax.len().min(bx.len());
+            if n == 0 {
+                continue;
+            }
+            let ax_slice = ax.get(..n).unwrap_or(&[]);
+            let bx_slice = bx.get(..n).unwrap_or(&[]);
+            let ra = rms(ax_slice);
+            let rb = rms(bx_slice);
+            if ra * rb <= 0.0 {
+                continue;
+            }
+            let dot: f32 = ax_slice
+                .iter()
+                .zip(bx_slice.iter())
+                .map(|(x, y)| x * y)
+                .sum();
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "n ≤ frames*160 = 6400, exact in f32 mantissa."
+            )]
+            let n_f = n as f32;
+            let ncc = dot / (n_f * ra * rb);
+            if ncc > best {
+                best = ncc;
+            }
+        }
+        best
+    };
+
+    eprintln!("voice_200hz_ncc = {max_ncc:.4}");
+    // Initial gate is loose; tighten as encoder fixes land.
+    assert!(
+        max_ncc > 0.0,
+        "voice-band encode→decode produced zero or anti-correlated output: {max_ncc:.4}"
     );
 }
 

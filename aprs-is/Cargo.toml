@@ -13,6 +13,7 @@ publish = false
 
 [dependencies]
 aprs = { path = "../aprs" }
+ax25-codec = { path = "../ax25-codec" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros"] }
 tracing = "0.1"

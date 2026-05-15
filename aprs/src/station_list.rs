@@ -110,9 +110,15 @@ impl StationList {
             | AprsData::StationCapabilities(_)
             | AprsData::AgreloDfJr(_)
             | AprsData::UserDefined { .. }
-            | AprsData::InvalidOrTest(_) => {
+            | AprsData::InvalidOrTest(_)
+            | AprsData::RawWeather { .. } => {
                 // These frame types don't update the station's own
-                // position or status.
+                // position or status. RawWeather is the legacy
+                // Peet Bros `#`/`*` format — we tolerate it on the
+                // wire but don't attempt to decode the proprietary
+                // ASCII-hex payload; if a downstream caller wants
+                // weather data from it, they can re-parse the payload
+                // via a dedicated decoder.
             }
             AprsData::Weather(wx) => {
                 entry.last_weather = Some(wx.clone());
@@ -232,6 +238,7 @@ mod tests {
     fn make_status(text: &str) -> AprsData {
         AprsData::Status(AprsStatus {
             text: text.to_owned(),
+            ..AprsStatus::default()
         })
     }
 

@@ -250,52 +250,22 @@ impl PartialOrd<u8> for Ssid {
 // Ax25Address
 // ---------------------------------------------------------------------------
 
-/// An AX.25 v2.2 address: a 1-6 char callsign plus a 0-15 SSID, with
-/// the has-been-repeated (H-bit) and command/response (C-bit) flags
-/// that ride on the wire SSID byte.
+/// An AX.25 address: validated callsign plus SSID.
 ///
-/// Both fields use the validated newtypes [`Callsign`] and [`Ssid`].
-/// `Callsign` derefs to `&str` and compares against `&str`/`String`,
-/// so most existing code that reads `addr.callsign` continues to work.
-/// `Ssid` compares against `u8` and provides `.get()` for arithmetic.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Used for source and destination address slots in [`crate::Ax25Packet`].
+/// Digipeater slots use [`RouteEntry`], which wraps an `Ax25Address` with
+/// a `has_repeated` flag for the AX.25 v2.2 §3.12.1 H-bit. The single
+/// physical wire bit at SSID-byte bit 7 is reconstructed at encode/decode
+/// time from frame-level context — it is *not* a field on this struct.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Ax25Address {
     /// Station callsign (1-6 uppercase ASCII alphanumerics).
     pub callsign: Callsign,
     /// Secondary Station Identifier (0-15).
     pub ssid: Ssid,
-    /// Has-been-repeated flag (H-bit).
-    ///
-    /// For digipeater addresses, indicates this hop has already been
-    /// consumed. Encoded as bit 7 of the SSID byte in AX.25 wire format.
-    pub repeated: bool,
-    /// AX.25 v2.2 Command/Response bit (bit 7 of the SSID byte for
-    /// destination/source addresses; the H-bit for digipeaters). Stored
-    /// at parse time so callers can reconstruct the command/response
-    /// classification of the original frame; ignored when building a
-    /// frame (build always emits 0).
-    pub c_bit: bool,
 }
 
 impl Ax25Address {
-    /// Create a new address with the H-bit unset (not yet repeated).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `callsign` is empty, longer than 6 characters, contains
-    /// non-alphanumeric characters, or if `ssid > 15`. Use
-    /// [`Self::try_new`] for fallible construction from untrusted input.
-    /// This infallible constructor exists for test helpers and internal
-    /// code paths that already know the values are well-formed.
-    #[must_use]
-    #[expect(
-        clippy::expect_used,
-        reason = "documented panic contract for internal/test use; fallible path is try_new"
-    )]
-    pub fn new(callsign: &str, ssid: u8) -> Self {
-        Self::try_new(callsign, ssid).expect("Ax25Address::new called with invalid callsign/ssid")
-    }
-
     /// Create a new address with validation.
     ///
     /// Rejects empty or malformed callsigns (must be 1-6 uppercase ASCII
@@ -306,29 +276,93 @@ impl Ax25Address {
     ///
     /// Returns [`Ax25Error::InvalidCallsign`] or [`Ax25Error::InvalidSsid`]
     /// if either field fails its validation rules.
-    pub fn try_new(callsign: &str, ssid: u8) -> Result<Self, Ax25Error> {
+    pub fn new(callsign: &str, ssid: u8) -> Result<Self, Ax25Error> {
         Ok(Self {
             callsign: Callsign::new_case_insensitive(callsign)?,
             ssid: Ssid::new(ssid)?,
-            repeated: false,
-            c_bit: false,
         })
+    }
+
+    /// Infallible constructor from already-validated parts.
+    #[must_use]
+    pub const fn from_parts(callsign: Callsign, ssid: Ssid) -> Self {
+        Self { callsign, ssid }
     }
 }
 
 impl fmt::Display for Ax25Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.ssid == 0 {
-            if self.repeated {
-                write!(f, "{}*", self.callsign)
-            } else {
-                write!(f, "{}", self.callsign)
-            }
-        } else if self.repeated {
-            write!(f, "{}-{}*", self.callsign, self.ssid)
+        if self.ssid.get() == 0 {
+            write!(f, "{}", self.callsign)
         } else {
             write!(f, "{}-{}", self.callsign, self.ssid)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RouteEntry
+// ---------------------------------------------------------------------------
+
+/// A single hop in an AX.25 frame's digipeater path.
+///
+/// AX.25 v2.2 §3.12.1 places the "has been repeated" (H) bit on each
+/// repeater address's SSID byte. The bit indicates that the named
+/// repeater has already retransmitted the frame. Each digipeater slot
+/// in an [`crate::Ax25Packet`] is a `RouteEntry`, distinguishing it
+/// structurally from endpoint addresses (which use [`Ax25Address`]
+/// directly and carry no H-bit at all).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RouteEntry {
+    /// Repeater callsign + SSID.
+    pub address: Ax25Address,
+    /// AX.25 v2.2 §3.12.1 H-bit ("has been repeated"). Set by the
+    /// repeater station when it retransmits the frame.
+    pub has_repeated: bool,
+}
+
+impl RouteEntry {
+    /// Build a fresh (unrepeated) route entry from a raw callsign / SSID.
+    ///
+    /// # Errors
+    ///
+    /// Forwards [`Ax25Error::InvalidCallsign`] / [`Ax25Error::InvalidSsid`]
+    /// from [`Ax25Address::new`].
+    pub fn new(callsign: &str, ssid: u8) -> Result<Self, Ax25Error> {
+        Ok(Self {
+            address: Ax25Address::new(callsign, ssid)?,
+            has_repeated: false,
+        })
+    }
+
+    /// Infallible constructor from an already-validated address.
+    #[must_use]
+    pub const fn from_address(address: Ax25Address) -> Self {
+        Self {
+            address,
+            has_repeated: false,
+        }
+    }
+
+    /// Return a copy of this entry with the H-bit set ("has been
+    /// repeated"). Borrows-and-clones so callers with `&RouteEntry`
+    /// can use it ergonomically.
+    #[must_use]
+    pub fn marked_used(&self) -> Self {
+        Self {
+            address: self.address.clone(),
+            has_repeated: true,
+        }
+    }
+}
+
+impl fmt::Display for RouteEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.address)?;
+        if self.has_repeated {
+            f.write_str("*")?;
+        }
+        Ok(())
     }
 }
 

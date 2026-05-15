@@ -134,27 +134,7 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
     let west = mice_dest_is_custom(dest5);
     let longitude = if west { -longitude_abs } else { longitude_abs };
 
-    // --- Speed and course from info[4..7] (per APRS101 Chapter 10) ---
-    // SP+28 = info[4], DC+28 = info[5], SE+28 = info[6]
-    // Speed = (SP - 28) * 10 + (DC - 28) / 10  (integer division)
-    // Course = ((DC - 28) mod 10) * 100 + (SE - 28)
-    let (speed_knots, course_degrees) = match (header.get(4), header.get(5), header.get(6)) {
-        (Some(&speed_raw), Some(&course_hi), Some(&course_lo)) => {
-            let sp = u16::from(speed_raw).saturating_sub(28);
-            let dc = u16::from(course_hi).saturating_sub(28);
-            let se = u16::from(course_lo).saturating_sub(28);
-            let speed = sp * 10 + dc / 10;
-            let course_raw = (dc % 10) * 100 + se;
-            let speed_opt = if speed < 800 { Some(speed) } else { None };
-            let course_opt = if course_raw > 0 && course_raw <= 360 {
-                Some(course_raw)
-            } else {
-                None
-            };
-            (speed_opt, course_opt)
-        }
-        _ => (None, None),
-    };
+    let (speed_knots, course_degrees) = decode_mice_speed_course(header);
 
     // Symbol: info[7] = symbol code, info[8] = symbol table
     let symbol_code = header.get(7).map_or('/', |&b| b as char);
@@ -192,6 +172,67 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
         // Mic-E positions are not subject to §8.1.6 ambiguity masking.
         ambiguity: PositionAmbiguity::None,
     })
+}
+
+/// Decode Mic-E speed and course from the 3-byte SP/DC/SE block
+/// `info[4..=6]`, per APRS 1.0.1 §10.
+///
+/// The decoder first computes the raw values as if both fields were
+/// unmodulated:
+///
+/// ```text
+///   speed_raw  = (SP-28) × 10 + (DC-28) / 10        (knots, 0..1999)
+///   course_raw = ((DC-28) mod 10) × 100 + (SE-28)   (degrees, 0..999)
+/// ```
+///
+/// §10 p.52 then specifies two **alt-encoding adjustments**:
+///
+/// - if `speed_raw  >= 800` → `speed  = speed_raw  - 800`
+/// - if `course_raw >= 400` → `course = course_raw - 400`
+///
+/// These are not optional. The spec's own decoding worked example on
+/// p.53 (info bytes `` `(_fn"Oj/ `` decoding to speed = 20 kt and
+/// course = 251°) depends on subtracting 800 and 400 respectively.
+/// Spec-compliant transmitters routinely use the alt range to expand
+/// the encodable space for low speeds and back-quadrant courses;
+/// refusing to apply the subtraction silently drops these decodes
+/// (earlier code generations did exactly that — see CB-B-1/B-2).
+///
+/// After adjustment, the returned tuple has:
+///
+/// - `speed`  is `Some(0..=799)` knots, or `None` if the raw value is
+///   outside the spec's representable range (impossible from a
+///   spec-conformant transmitter).
+/// - `course` is `Some(1..=360)` degrees, or `None` if the value is
+///   `0` (the spec's "unknown / not relevant" sentinel — §10 p.49).
+///
+/// The byte-range guard (each of SP/DC/SE must be ≥ 28 per §10 p.47)
+/// is enforced; a byte < 28 yields `(None, None)` rather than wrapping
+/// via `saturating_sub`, which would silently produce a junk decode.
+fn decode_mice_speed_course(header: &[u8]) -> (Option<u16>, Option<u16>) {
+    let (Some(&speed_high), Some(&speed_course), Some(&course_low)) =
+        (header.get(4), header.get(5), header.get(6))
+    else {
+        return (None, None);
+    };
+    if speed_high < 28 || speed_course < 28 || course_low < 28 {
+        return (None, None);
+    }
+    let sp = u16::from(speed_high - 28);
+    let dc = u16::from(speed_course - 28);
+    let se = u16::from(course_low - 28);
+    let mut speed_raw = sp * 10 + dc / 10;
+    let mut course_raw = (dc % 10) * 100 + se;
+    // Alt-encoding fold per §10 p.52.
+    if speed_raw >= 800 {
+        speed_raw -= 800;
+    }
+    if course_raw >= 400 {
+        course_raw -= 400;
+    }
+    let speed_opt = (speed_raw < 800).then_some(speed_raw);
+    let course_opt = (course_raw > 0 && course_raw <= 360).then_some(course_raw);
+    (speed_opt, course_opt)
 }
 
 /// Extract a digit (0-9) from a Mic-E destination character.
@@ -405,13 +446,43 @@ mod tests {
     }
 
     #[test]
-    fn parse_mice_speed_ge_800_rejected() -> TestResult {
+    fn parse_mice_speed_alt_encoding_subtracts_800() -> TestResult {
+        // APRS 1.0.1 §10 p.52 alt encoding: speed_raw ≥ 800 → speed -= 800.
         // SP = 108-28 = 80, DC = 28-28 = 0, SE = 28-28 = 0
-        // speed = 80*10 + 0/10 = 800 → should be rejected (>= 800)
+        // speed_raw = 80×10 + 0/10 = 800 → after subtract 800 = 0 knots.
         let dest = "SUQU5P";
         let info: &[u8] = &[0x60, 125, 73, 58, 108, 28, 28, b'>', b'/'];
         let pos = parse_mice_position(dest, info)?;
-        assert_eq!(pos.speed_knots, None);
+        assert_eq!(pos.speed_knots, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_mice_speed_alt_encoding_decodes_20kt() -> TestResult {
+        // Targeted regression for the APRS 1.0.1 §10 p.53 walked example.
+        // Byte 4 = `n` (110): SP = 82, speed_raw = 820, after fold = 20 kt.
+        // Use a same-row DC byte (still ≥ 28) that keeps course alt-fold
+        // exercised: DC = 28 → dc = 0 → course_raw = 0, surfaces as None.
+        let dest = "SUQU5P";
+        let info: &[u8] = &[0x60, 125, 73, 58, b'n', 28, 28, b'>', b'/'];
+        let pos = parse_mice_position(dest, info)?;
+        assert_eq!(pos.speed_knots, Some(20));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_mice_course_alt_encoding_subtracts_400() -> TestResult {
+        // APRS 1.0.1 §10 p.52 alt encoding: course_raw ≥ 400 → course -= 400.
+        // From the spec's p.53 walked example: DC = '"' (34), SE = 'O' (79).
+        // dc = 6, se = 51, course_raw = 6×100 + 51 = 651,
+        // after fold = 651 - 400 = 251°.
+        let dest = "SUQU5P";
+        // Build a frame whose speed/course bytes are exactly those of the
+        // spec example (`n`, `"`, `O` → 110, 34, 79).
+        let info: &[u8] = &[0x60, 125, 73, 58, b'n', b'"', b'O', b'j', b'/'];
+        let pos = parse_mice_position(dest, info)?;
+        assert_eq!(pos.speed_knots, Some(20), "spec p.53 speed");
+        assert_eq!(pos.course_degrees, Some(251), "spec p.53 course");
         Ok(())
     }
 
@@ -501,6 +572,33 @@ mod tests {
         let dest = "SUQU5P";
         let info: &[u8] = &[0x60, 28, 28, 28, 40, 40, 40, b'>', b'/'];
         assert!(parse_mice_position(dest, info).is_ok(), "min bytes ok");
+    }
+
+    #[test]
+    fn mice_speed_byte_below_28_yields_none() -> TestResult {
+        // §10 p.47 IMPORTANT NOTE: SP/DC/SE bytes must be ≥ 28
+        // (the wire offset). Earlier code used `saturating_sub`
+        // which would silently fold an invalid byte to 0 and produce
+        // a fake decode. Post-fix the parser surfaces these as
+        // `None` for the affected field.
+        let dest = "SUQU5P";
+        // Byte 4 = 27 (SP+28 with SP < 0 — impossible, must reject).
+        let info: &[u8] = &[0x60, 125, 73, 58, 27, 40, 40, b'>', b'/'];
+        let pos = parse_mice_position(dest, info)?;
+        assert_eq!(pos.speed_knots, None);
+        assert_eq!(pos.course_degrees, None);
+        Ok(())
+    }
+
+    #[test]
+    fn mice_course_byte_below_28_yields_none() -> TestResult {
+        let dest = "SUQU5P";
+        // Byte 6 = 27 (SE byte below valid range).
+        let info: &[u8] = &[0x60, 125, 73, 58, 40, 40, 27, b'>', b'/'];
+        let pos = parse_mice_position(dest, info)?;
+        assert_eq!(pos.speed_knots, None);
+        assert_eq!(pos.course_degrees, None);
+        Ok(())
     }
 
     // ---- parse_aprs_data_full tests ----

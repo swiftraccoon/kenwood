@@ -14,8 +14,29 @@
 /// Reference: `g4klx/MMDVMHost/DStarDefines.h:44` (`NULL_AMBE_DATA_BYTES`).
 pub const AMBE_SILENCE: [u8; 9] = [0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8];
 
-/// D-STAR sync bytes (3 bytes) — slow data filler for sync frames.
-pub const DSTAR_SYNC_BYTES: [u8; 3] = [0x55, 0x55, 0x55];
+/// D-STAR slow-data sync pattern (3 bytes).
+///
+/// Placed in the slow-data field at frame 0 of every 21-frame
+/// superframe. The receiver locks onto this pattern to align
+/// superframe boundaries; without it the MMDVM modem firmware
+/// (TH-D75 included) gets the voice header but never enters audio
+/// decode for the network voice stream — the listener hears nothing.
+///
+/// Reference: `g4klx/MMDVMHost/DStarDefines.h:73` (`DSTAR_SYNC_BYTES`),
+/// matched against `DSTAR_NULL_SLOW_SYNC_BYTES` at line 34.
+pub const DSTAR_SYNC_BYTES: [u8; 3] = [0x55, 0x2D, 0x16];
+
+/// D-STAR slow-data null filler (3 bytes).
+///
+/// Placed in the slow-data field at frames 1-20 of each superframe
+/// when no real text / GPS / DPRS payload is available. This is the
+/// canonical XOR-scrambled "no data" pattern: descrambling with
+/// `[0x70, 0x4F, 0x93]` yields `[0x66, 0x66, 0x66]`, the slow-data
+/// idle pattern.
+///
+/// Reference: `g4klx/MMDVMHost/DStarDefines.h:36`
+/// (`DSTAR_NULL_SLOW_DATA_BYTES`).
+pub const DSTAR_NULL_SLOW_DATA_BYTES: [u8; 3] = [0x16, 0x29, 0xF5];
 
 /// A D-STAR voice data frame (9 bytes AMBE + 3 bytes slow data).
 ///
@@ -60,8 +81,18 @@ mod tests {
     }
 
     #[test]
-    fn dstar_sync_bytes_are_0x555555() {
-        assert_eq!(DSTAR_SYNC_BYTES, [0x55, 0x55, 0x55]);
+    fn dstar_sync_bytes_match_mmdvmhost() {
+        // Reference: g4klx/MMDVMHost/DStarDefines.h:73 — slow-data
+        // sync pattern that the modem looks for at frame 0 of every
+        // 21-frame superframe to align audio decode.
+        assert_eq!(DSTAR_SYNC_BYTES, [0x55, 0x2D, 0x16]);
+    }
+
+    #[test]
+    fn dstar_null_slow_data_bytes_match_mmdvmhost() {
+        // Reference: g4klx/MMDVMHost/DStarDefines.h:36 —
+        // XOR-scrambled "no data" filler for slow-data frames 1-20.
+        assert_eq!(DSTAR_NULL_SLOW_DATA_BYTES, [0x16, 0x29, 0xF5]);
     }
 
     #[test]

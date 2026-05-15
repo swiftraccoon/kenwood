@@ -136,18 +136,20 @@ pub enum UnnumberedKind {
     Other(u8),
 }
 
-/// Command/Response classification of an AX.25 address pair.
+/// Command/Response classification of an AX.25 frame.
 ///
-/// Per AX.25 v2.2 §4.3.1.2, bit 7 of the destination SSID byte and bit 7
-/// of the source SSID byte together encode whether the frame is a command
-/// or response. APRS only sends commands, but we parse both for
-/// completeness.
+/// Per AX.25 v2.2 §6.1.2, the C-bit on the destination SSID byte and
+/// the C-bit on the source SSID byte together encode whether a frame
+/// is a command or a response:
+///
+/// - `(dest_c=1, src_c=0)` → [`Self::Command`] (APRS frames)
+/// - `(dest_c=0, src_c=1)` → [`Self::Response`]
+/// - both equal → legacy v2.0 / unknown, represented in
+///   [`crate::Ax25Packet::command_or_response`] as `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandResponse {
-    /// AX.25 v2.2 Command frame (dest C-bit=1, source C-bit=0).
+    /// AX.25 v2.2 Command frame.
     Command,
-    /// AX.25 v2.2 Response frame (dest C-bit=0, source C-bit=1).
+    /// AX.25 v2.2 Response frame.
     Response,
-    /// Legacy AX.25 v2.0 or unknown (both C-bits equal).
-    Legacy,
 }

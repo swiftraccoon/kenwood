@@ -237,6 +237,12 @@ fn dump_quantize_gm(ri: &[f32; PRBA_BLOCKS + 1], gm: &[f32; PRBA_BLOCKS + 1]) {
 
 #[must_use]
 #[doc(hidden)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Top-level encoder pipeline: lsa → residual → mean-center → quantize → \
+              bit-pack → closed-loop decode. Splitting helpers obscures the data flow \
+              that line-by-line mirrors `MMDVMHost`-style block diagrams."
+)]
 pub fn quantize(
     pitch: PitchEstimate,
     vuv: VuvDecisions,
@@ -286,7 +292,31 @@ pub fn quantize(
     if dump_enabled() {
         dump_quantize_lsa(&lsa, amps.num_harmonics, &pitch, &vuv, amps, b2);
     }
-    let t_residuals = compute_spectral_residuals(&lsa, amps.num_harmonics, prev);
+    let mut t_residuals = compute_spectral_residuals(&lsa, amps.num_harmonics, prev);
+    // Mean-center T before block-DCT so the spectral codebooks
+    // (PRBA24/58) operate on a residual whose overall mean is zero —
+    // mirroring the BigGamma subtraction the decoder applies on the
+    // way back. The decoder's `big_gamma = cur.gamma - 0.5*log2(L) - sum42`
+    // includes a `-sum42` term that compensates the encoder's mean
+    // offset, so a non-mean-centered encoder gives the codebook search
+    // a target with a DC bias the decoder absorbs into `gamma`. With
+    // the encoder-side mean-center, the target is in the codebook's
+    // designed range and `gamma_cur` correctly tracks the input level.
+    if amps.num_harmonics > 0 {
+        let mut mean_t = 0.0_f32;
+        for &v in t_residuals.iter().take(amps.num_harmonics) {
+            mean_t += v;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "amps.num_harmonics bounded by MAX_HARMONICS (56); usize→f32 exact."
+        )]
+        let n_f = amps.num_harmonics as f32;
+        mean_t /= n_f;
+        for slot in t_residuals.iter_mut().take(amps.num_harmonics) {
+            *slot -= mean_t;
+        }
+    }
     if dump_enabled() {
         dump_quantize_t(&t_residuals, amps.num_harmonics, prev);
     }
@@ -446,12 +476,24 @@ fn compute_lsa(b0: u8, vuv: &VuvDecisions, amps: &SpectralAmplitudes) -> [f32; 5
     lsa
 }
 
-/// Compute the prediction residual `T[i] = lsa[i] - 0.65 * interp_prev[i]`
+/// Compute the prediction residual `T[i] = lsa[i] - 0.65 * interp_prev[i] + Sum43`
 /// for each of the `n` harmonics in the current frame.
 ///
 /// `interp_prev[i]` is the band-ratio-interpolated previous-frame
 /// log-magnitude at the position this frame's harmonic `i+1` projects
-/// onto. Mirrors `ambe_encoder.cc:275-291`.
+/// onto.
+///
+/// `Sum43 = (0.65 / L) * sum_l interp_prev[l]` — the **DC bias correction**
+/// from `mbe_decodeAmbe2450Parms` (eq. 43 in the AMBE spec). The decoder
+/// reconstructs `log2Ml[l] = T[l] + 0.65 * interp_prev[l] - Sum43 + BigGamma`,
+/// so the encoder MUST add `Sum43` to keep `T[l]` consistent with the
+/// decoder's reconstruction. Without this term, every PRBA24 / PRBA58
+/// codebook lookup gets an offset block-mean and selects the wrong entry —
+/// the documented spectral-envelope encoder bug at
+/// `tests/encoder_roundtrip.rs::sine_roundtrip_has_nonzero_correlation_with_input`.
+///
+/// Reference: `mbelib`'s own `ambe3600x2450.c` inverse formula carries
+/// the matching `-Sum43` term.
 fn compute_spectral_residuals(lsa: &[f32; 57], n: usize, prev: &PrevFrameState) -> [f32; 57] {
     let mut t = [0.0_f32; 57];
     if n == 0 {
@@ -459,13 +501,6 @@ fn compute_spectral_residuals(lsa: &[f32; 57], n: usize, prev: &PrevFrameState) 
     }
     // Boundary mirror: OP25 `ambe_encoder.cc:277` does
     // `prev_mp->log2Ml[0] = prev_mp->log2Ml[1]` before interpolation.
-    // Without this, the interpolation for the first harmonic (kl_floor=0)
-    // reads log2Ml[0] as zero — producing a systematic `0.65 * prev[1]`
-    // bias in `T[0]` that cascades into every block-0 DCT coefficient.
-    // Empirically (2026-04 validation run) this bias was 0.6–0.7 per
-    // voiced frame, which shifted block-0 mean `C[0][0]` enough to
-    // pick a different PRBA24 codebook entry — hence the 56% b3 match
-    // rate observed before this fix.
     let mut prev_log2_ml = prev.log2_ml;
     prev_log2_ml[0] = prev_log2_ml[1];
     #[expect(
@@ -478,33 +513,46 @@ fn compute_spectral_residuals(lsa: &[f32; 57], n: usize, prev: &PrevFrameState) 
     } else {
         prev.l as f32 / n as f32
     };
-    for i in 0..n {
+
+    // Two-pass: first pass computes interp_prev[i] and accumulates
+    // sum_interp; second pass writes T[i] = lsa[i] - 0.65*interp + Sum43.
+    let mut interp_prev = [0.0_f32; 57];
+    let mut sum_interp = 0.0_f32;
+    for (idx, slot) in interp_prev.iter_mut().enumerate().take(n) {
         #[expect(
             clippy::cast_precision_loss,
-            reason = "i is bounded by n (<= MAX_HARMONICS 56); usize-to-f32 cast is exact."
+            reason = "idx bounded by n (<= MAX_HARMONICS 56); usize→f32 is exact."
         )]
-        let kl = l_prev_l * (i + 1) as f32;
+        let kl = l_prev_l * (idx + 1) as f32;
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "kl is non-negative (product of non-negative terms); f32-to-usize \
-                      cast performs the intended floor, and the result is clamped to \
-                      prev_log2_ml bounds below via `.min(56)`."
+            reason = "kl is non-negative (product of non-negative terms); f32→usize \
+                      truncation is the intended floor, clamped via `.min(56)` below."
         )]
         let kl_floor = kl as usize;
         #[expect(
             clippy::cast_precision_loss,
-            reason = "kl_floor is bounded by the same interpolation index, <= 56 — well \
-                      within f32 mantissa precision."
+            reason = "kl_floor <= 56; usize→f32 is exact."
         )]
         let kl_frac = kl - kl_floor as f32;
         let p0 = *prev_log2_ml.get(kl_floor.min(56)).unwrap_or(&0.0);
         let p1 = *prev_log2_ml.get((kl_floor + 1).min(56)).unwrap_or(&0.0);
         let interp = (1.0 - kl_frac).mul_add(p0, kl_frac * p1);
-        let lsa_i = lsa.get(i).copied().unwrap_or(0.0);
-        if let Some(slot) = t.get_mut(i) {
-            *slot = 0.65_f32.mul_add(-interp, lsa_i);
-        }
+        *slot = interp;
+        sum_interp += interp;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "n bounded by MAX_HARMONICS (56); usize→f32 cast is exact."
+    )]
+    let n_f = n as f32;
+    let sum43 = (0.65_f32 / n_f) * sum_interp;
+    for (idx, slot) in t.iter_mut().enumerate().take(n) {
+        let lsa_i = lsa.get(idx).copied().unwrap_or(0.0);
+        // T[i] = lsa[i] - 0.65*interp_prev[i] + Sum43
+        let prediction = 0.65_f32 * interp_prev.get(idx).copied().unwrap_or(0.0);
+        *slot = lsa_i - prediction + sum43;
     }
     t
 }
@@ -697,6 +745,12 @@ const SA_SCALE: f32 = 1.0;
 /// (peak = `SOFT_CLIP_FLOAT × 7 = 31129`), generating square-wave
 /// distortion in production — exactly the "garble noise" symptom.
 ///
+/// **May 2026 attempt at 0.0:** synthetic sweep against TH-D75 anchors
+/// suggested 0.0 minimized Hamming distance and took the sine
+/// roundtrip correlation from 0.04 to 0.20 — but real-voice
+/// sextant-to-sextant testing confirmed garbled output, exactly the
+/// hard-clip symptom CLAUDE.md warned about. Reverted to 7.5.
+///
 /// The synthetic-vs-real-voice difference: synthetic test signals
 /// (clean harmonic stacks at exact frequencies) have near-zero
 /// `m_num` at unvoiced harmonics, so `unvoiced_sa < 1.0` clamps to
@@ -708,7 +762,9 @@ const SA_SCALE: f32 = 1.0;
 ///
 /// Treat changes here with extreme suspicion — verify against real
 /// microphone audio before adjusting, never tune purely against
-/// synthetic test signals.
+/// synthetic test signals or the Kenwood capture anchors. The synth
+/// correlation test does NOT validate real-voice fidelity; sextant↔
+/// sextant listening test is the only actual gate.
 const D_STAR_GAIN_ADJUST: f32 = 7.5;
 
 /// Quantize the frame's mean log-magnitude against the 6-bit D-STAR

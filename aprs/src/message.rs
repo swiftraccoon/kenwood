@@ -37,6 +37,24 @@ pub struct AprsMessage {
 impl AprsMessage {
     /// Classify this message by addressee / text pattern per APRS 1.0.1
     /// §14 and bulletin conventions.
+    ///
+    /// The classification ladder, in spec-mandated precedence order:
+    ///
+    /// 1. **`AckRej`** — text begins with `ack`/`rej` + 1-5 alnum
+    ///    (control frames use a regular station addressee but the text
+    ///    shape disambiguates).
+    /// 2. **`NwsBulletin`** — addressee starts with `NWS-`, `SKY-`,
+    ///    `CWA-`, or `BOM-` per APRS 1.0.1 §14 p.74.
+    /// 3. **`Bulletin { number }`** — addressee is exactly `BLN<digit>`
+    ///    (general bulletin) per APRS 1.0.1 §14 p.73.
+    /// 4. **`Announcement { letter }`** — addressee is exactly
+    ///    `BLN<uppercase letter>` per APRS 1.0.1 §14 p.73.
+    /// 5. **`GroupBulletin { group }`** — addressee is `BLN` + 1-5
+    ///    alnum chars not matched by (3) or (4), per APRS 1.0.1 §14
+    ///    p.74 (the spec's canonical form is `BLN<digit><group>` but
+    ///    in-the-wild traffic uses many variations, so we accept any
+    ///    multi-char tail).
+    /// 6. **`Direct`** — anything else.
     #[must_use]
     pub fn kind(&self) -> MessageKind {
         let addr = self.addressee.trim();
@@ -53,16 +71,24 @@ impl AprsMessage {
         {
             return MessageKind::NwsBulletin;
         }
-        // Numeric bulletin: BLN0-BLN9 exactly.
+        // BLN-family classification: order matters. Single digit →
+        // numeric bulletin; single uppercase letter → announcement;
+        // multi-char tail → group bulletin.
         if let Some(rest) = addr.strip_prefix("BLN") {
             if rest.len() == 1
-                && let Some(n) = rest.bytes().next()
-                && n.is_ascii_digit()
+                && let Some(b) = rest.bytes().next()
             {
-                return MessageKind::Bulletin { number: n - b'0' };
+                if b.is_ascii_digit() {
+                    return MessageKind::Bulletin { number: b - b'0' };
+                }
+                if b.is_ascii_uppercase() {
+                    return MessageKind::Announcement { letter: b as char };
+                }
             }
-            // Group bulletin: BLN<group> where group is 1-5 alnum.
-            if (1..=5).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            // Group bulletin: BLN + 2..=5 alphanumeric chars (the
+            // length-1 single-letter / single-digit cases are handled
+            // above as Announcement / Bulletin respectively).
+            if (2..=5).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_alphanumeric()) {
                 return MessageKind::GroupBulletin {
                     group: rest.to_owned(),
                 };
@@ -305,6 +331,48 @@ mod tests {
             MessageKind::GroupBulletin {
                 group: "WX".to_owned()
             }
+        );
+    }
+
+    #[test]
+    fn message_kind_announcement() {
+        // Regression guard for CB-C-10 (APRS 1.0.1 §14 p.73): a
+        // `BLN<single letter>` addressee is an Announcement, structurally
+        // distinct from a `BLN<single digit>` general bulletin and from
+        // a `BLN<group>` (multi-char) group bulletin. Earlier code
+        // generations collapsed announcements into `GroupBulletin`.
+        for letter in 'A'..='Z' {
+            let addressee = format!("BLN{letter}");
+            let msg = AprsMessage {
+                addressee,
+                text: "evening net at 8pm".to_owned(),
+                message_id: None,
+                reply_ack: None,
+            };
+            assert_eq!(
+                msg.kind(),
+                MessageKind::Announcement { letter },
+                "BLN{letter} should classify as Announcement",
+            );
+        }
+    }
+
+    #[test]
+    fn message_kind_group_bulletin_requires_multichar_tail() {
+        // After the CB-C-10 fix, a single-character tail is *not* a
+        // group bulletin — it's either a Bulletin (digit) or
+        // Announcement (letter). Group bulletins use 2-5 char tails.
+        let msg = AprsMessage {
+            addressee: "BLNWX".to_owned(),
+            text: "wx watch".to_owned(),
+            message_id: None,
+            reply_ack: None,
+        };
+        assert_eq!(
+            msg.kind(),
+            MessageKind::GroupBulletin {
+                group: "WX".to_owned(),
+            },
         );
     }
 

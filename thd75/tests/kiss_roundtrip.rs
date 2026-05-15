@@ -18,7 +18,7 @@ use aprs::{
     build_aprs_position_report_packet, build_aprs_status_packet, build_aprs_weather_packet,
     parse_aprs_data, parse_aprs_position, parse_mice_position,
 };
-use ax25_codec::{Ax25Address, Ax25Packet, build_ax25, parse_ax25};
+use ax25_codec::{Ax25Address, Ax25Packet, CommandResponse, RouteEntry, build_ax25, parse_ax25};
 use kenwood_thd75::aprs::ax25_to_kiss_wire;
 use kiss_tnc::decode_kiss_frame;
 
@@ -51,11 +51,23 @@ fn arb_ssid() -> impl Strategy<Value = u8> {
 }
 
 fn arb_ax25_address() -> impl Strategy<Value = Ax25Address> {
-    (arb_callsign(), arb_ssid()).prop_map(|(c, s)| Ax25Address::new(&c, s))
+    (arb_callsign(), arb_ssid())
+        .prop_filter_map("Ax25Address::new", |(c, s)| Ax25Address::new(&c, s).ok())
 }
 
-fn arb_digi_path() -> impl Strategy<Value = Vec<Ax25Address>> {
-    prop::collection::vec(arb_ax25_address(), 0..=4)
+fn arb_route_entry() -> impl Strategy<Value = RouteEntry> {
+    (arb_callsign(), arb_ssid(), any::<bool>()).prop_filter_map(
+        "RouteEntry::new",
+        |(c, s, has_repeated)| {
+            let mut r = RouteEntry::new(&c, s).ok()?;
+            r.has_repeated = has_repeated;
+            Some(r)
+        },
+    )
+}
+
+fn arb_digi_path() -> impl Strategy<Value = Vec<RouteEntry>> {
+    prop::collection::vec(arb_route_entry(), 0..=4)
 }
 
 fn arb_latitude() -> impl Strategy<Value = f64> {
@@ -119,6 +131,7 @@ proptest! {
             source: source.clone(),
             destination: dest.clone(),
             digipeaters: digis.clone(),
+            command_or_response: Some(CommandResponse::Command),
             control: 0x03,
             protocol: 0xF0,
             info: info.clone(),

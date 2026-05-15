@@ -1,10 +1,11 @@
 //! `SmartBeaconing` algorithm for adaptive APRS beacon timing.
 //!
-//! Implements the `HamHUD` `SmartBeaconing` algorithm v2.1 by Tony Arnerich
-//! (KD7TA) and Jason Townsend (KD7TA), which adjusts beacon interval based
-//! on speed and course changes:
-//! - Stopped or slow: beacon every `slow_rate` seconds
-//! - Fast: beacon every `fast_rate` seconds (linearly interpolated)
+//! Implements the `HamHUD` `SmartBeaconing` algorithm v2.1 originated
+//! by Tony Arnerich (KD7TA) and refined by Steve Bragg (KA9MVA), which
+//! adjusts beacon interval based on speed and course changes:
+//!
+//! - Stopped or slow: beacon every `slow_rate` seconds.
+//! - Fast: beacon every `fast_rate` seconds (linearly interpolated).
 //! - Course change: immediate beacon if heading changed more than the
 //!   **speed-dependent** turn threshold, computed as:
 //!
@@ -13,21 +14,27 @@
 //!   ```
 //!
 //! This makes slow-moving stations less likely to emit turn-triggered
-//! beacons from small steering inputs, while fast-moving stations beacon
-//! on relatively small heading changes.
+//! beacons from small steering inputs, while fast-moving stations
+//! beacon on relatively small heading changes.
 //!
-//! Per Operating Tips §14 and User Manual Chapter 14, the TH-D75 exposes
-//! eight parameters via Menu 540-547:
+//! Per Operating Tips §14 and User Manual Chapter 14, the TH-D75
+//! exposes the seven `SmartBeaconing` parameters via Menu 540-546:
 //!
-//! | Menu | Name | Default | Our field |
-//! |-----:|------|--------:|-----------|
-//! | 540 | L Spd        | 5 km/h   | `low_speed_kmh` |
-//! | 541 | H Spd        | 70 km/h  | `high_speed_kmh` |
-//! | 542 | L Rate       | 30 min   | `slow_rate_secs` |
-//! | 543 | H Rate       | 180 s    | `fast_rate_secs` |
-//! | 544 | Turn Slope   | 26       | `turn_slope` |
-//! | 545 | Turn Thresh  | 28°      | `turn_min_deg` |
-//! | 546 | Turn Time    | 30 s     | `turn_time_secs` |
+//! | Menu | Name         | Default  | Our field         |
+//! |-----:|--------------|---------:|-------------------|
+//! | 540  | L Spd        | 5 km/h   | `low_speed_kmh`   |
+//! | 541  | H Spd        | 70 km/h  | `high_speed_kmh`  |
+//! | 542  | L Rate       | 30 min   | `slow_rate_secs`  |
+//! | 543  | H Rate       | 180 s    | `fast_rate_secs`  |
+//! | 544  | Turn Slope   | 26       | `turn_slope`      |
+//! | 545  | Turn Thresh  | 28°      | `turn_min_deg`    |
+//! | 546  | Turn Time    | 15 s     | `turn_time_secs`  |
+//!
+//! Earlier code generations carried documentation drift in this table —
+//! the prose claimed "eight parameters via Menu 540-547" while only
+//! seven menu rows existed, and the Turn Time row stated `30 s` while
+//! the algorithm's `Default` impl shipped `15 s` (which matches the
+//! `HamHUD` v2.1 reference and modern community defaults). See CB-G.
 //!
 //! # Time handling
 //!

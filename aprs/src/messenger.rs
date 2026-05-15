@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use ax25_codec::Ax25Address;
+use ax25_codec::{Ax25Address, RouteEntry};
 
 use crate::build::build_aprs_message;
 use crate::error::AprsError;
@@ -82,7 +82,7 @@ pub struct AprsMessenger {
     /// This station's callsign/SSID.
     my_callsign: Ax25Address,
     /// Digipeater path used for outgoing message frames.
-    digipeater_path: Vec<Ax25Address>,
+    digipeater_path: Vec<RouteEntry>,
     /// Messages awaiting acknowledgement.
     pending_messages: Vec<PendingMessage>,
     /// Counter for generating unique message IDs.
@@ -96,7 +96,7 @@ pub struct AprsMessenger {
 impl AprsMessenger {
     /// Create a new messenger with the default config.
     #[must_use]
-    pub fn new(callsign: Ax25Address, digipeater_path: Vec<Ax25Address>) -> Self {
+    pub fn new(callsign: Ax25Address, digipeater_path: Vec<RouteEntry>) -> Self {
         Self::with_config(callsign, digipeater_path, MessengerConfig::default())
     }
 
@@ -104,7 +104,7 @@ impl AprsMessenger {
     #[must_use]
     pub fn with_config(
         callsign: Ax25Address,
-        digipeater_path: Vec<Ax25Address>,
+        digipeater_path: Vec<RouteEntry>,
         config: MessengerConfig,
     ) -> Self {
         Self {
@@ -308,10 +308,16 @@ mod tests {
 
     fn test_callsign() -> Ax25Address {
         Ax25Address::new("N0CALL", 7)
+            .unwrap_or_else(|_| unreachable!("N0CALL-7 is statically valid"))
     }
 
-    fn default_digipeater_path() -> Vec<Ax25Address> {
-        vec![Ax25Address::new("WIDE1", 1), Ax25Address::new("WIDE2", 1)]
+    fn default_digipeater_path() -> Vec<RouteEntry> {
+        vec![
+            RouteEntry::new("WIDE1", 1)
+                .unwrap_or_else(|_| unreachable!("WIDE1-1 is statically valid")),
+            RouteEntry::new("WIDE2", 1)
+                .unwrap_or_else(|_| unreachable!("WIDE2-1 is statically valid")),
+        ]
     }
 
     fn test_messenger() -> AprsMessenger {

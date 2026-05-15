@@ -17,9 +17,11 @@ pub enum Ax25Error {
     /// Control/protocol fields are missing after the address block.
     #[error("AX.25 missing control/protocol fields after address block")]
     MissingControlFields,
-    /// Packet carries more than 8 digipeater addresses (the AX.25 v2.2
-    /// §2.2.13 maximum).
-    #[error("AX.25 packet has more than 8 digipeater addresses (AX.25 v2.2 §2.2.13 max)")]
+    /// Packet carries more than 8 digipeater addresses. AX.25 v2.0 / APRS
+    /// convention; matches Linux kernel `AX25_MAX_DIGIS`. AX.25 v2.2
+    /// §3.12.5 reduced this to 2 but APRS networks do not respect that
+    /// limit.
+    #[error("AX.25 packet has more than 8 digipeater addresses (APRS/v2.0 convention)")]
     TooManyDigipeaters,
     /// A callsign byte decoded to something other than an ASCII
     /// alphanumeric character or space padding.

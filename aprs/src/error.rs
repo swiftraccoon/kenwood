@@ -62,4 +62,21 @@ pub enum AprsError {
     /// Digipeater alias failed validation (empty, non-ASCII).
     #[error("invalid digipeater alias: {0}")]
     InvalidDigipeaterAlias(&'static str),
+
+    /// Object name does not satisfy the APRS 1.0.1 §11 p.58 rule of
+    /// "fixed 9-character" identifier (≤ 9 bytes of printable ASCII).
+    #[error("invalid APRS object name: {0}")]
+    InvalidObjectName(&'static str),
+
+    /// Item name does not satisfy the APRS 1.0.1 §11 p.59 rule of
+    /// "3-9 characters … any printable ASCII characters except `!` or
+    /// `_`".
+    #[error("invalid APRS item name: {0}")]
+    InvalidItemName(&'static str),
+
+    /// Object or item timestamp wire string failed to parse as one of
+    /// the three APRS 1.0.1 §6 forms (DHM `z`, DHM `/`, HMS `h`, or
+    /// MDHM unsuffixed).
+    #[error("invalid APRS timestamp: {0}")]
+    InvalidTimestamp(&'static str),
 }

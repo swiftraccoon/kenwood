@@ -3,8 +3,8 @@
 //! This module contains the top-level [`AprsData`] enum (one variant per
 //! APRS data type identifier), the [`parse_aprs_data`] dispatcher, and a
 //! handful of shared primitive types: [`AprsDataExtension`], [`Phg`],
-//! [`PositionAmbiguity`], [`ParseContext`], [`AprsTimestamp`],
-//! [`TelemetryDefinition`], and [`TelemetryParameters`].
+//! [`PhgDirectivity`], [`PositionAmbiguity`], [`ParseContext`],
+//! [`AprsTimestamp`], [`TelemetryDefinition`], and [`TelemetryParameters`].
 
 use core::fmt;
 
@@ -184,25 +184,262 @@ impl AprsTimestamp {
             }
         }
     }
+
+    /// Parse an APRS timestamp from its wire-format string.
+    ///
+    /// Accepts the four spec-defined forms (APRS 1.0.1 §6 pp.22-23):
+    ///
+    /// | Length | Suffix | Variant                  | Spec form  |
+    /// |-------:|--------|--------------------------|------------|
+    /// | 7      | `z`    | [`Self::DhmZulu`]        | `DDHHMMz`  |
+    /// | 7      | `/`    | [`Self::DhmLocal`]       | `DDHHMM/`  |
+    /// | 7      | `h`    | [`Self::Hms`]            | `HHMMSSh`  |
+    /// | 8      | (none) | [`Self::Mdhm`]           | `MMDDHHMM` |
+    ///
+    /// All non-suffix bytes must be ASCII digits. Range checks per
+    /// spec: day 1..=31, hour 0..=23, minute 0..=59, second 0..=59,
+    /// month 1..=12. Zero day/month and out-of-range hour/minute
+    /// values yield `None` so the parser can reject malformed input
+    /// instead of surfacing a wrong-looking `AprsTimestamp`. Earlier
+    /// code generations stored object timestamps as raw `String`
+    /// because no parser existed; see CB-C-18 / D-3.
+    #[must_use]
+    pub fn parse(wire: &str) -> Option<Self> {
+        // Helper: parse two ASCII digits at byte offset.
+        fn pair(s: &str, idx: usize) -> Option<u8> {
+            let bytes = s.as_bytes();
+            let hi = *bytes.get(idx)?;
+            let lo = *bytes.get(idx + 1)?;
+            if !hi.is_ascii_digit() || !lo.is_ascii_digit() {
+                return None;
+            }
+            Some((hi - b'0') * 10 + (lo - b'0'))
+        }
+        match wire.len() {
+            7 => {
+                let p0 = pair(wire, 0)?;
+                let p1 = pair(wire, 2)?;
+                let p2 = pair(wire, 4)?;
+                match wire.as_bytes().get(6).copied()? {
+                    b'z' => {
+                        // DHM Zulu: DD HH MM z
+                        if !(1..=31).contains(&p0) {
+                            return None;
+                        }
+                        if p1 > 23 || p2 > 59 {
+                            return None;
+                        }
+                        Some(Self::DhmZulu {
+                            day: p0,
+                            hour: p1,
+                            minute: p2,
+                        })
+                    }
+                    b'/' => {
+                        // DHM local: DD HH MM /
+                        if !(1..=31).contains(&p0) {
+                            return None;
+                        }
+                        if p1 > 23 || p2 > 59 {
+                            return None;
+                        }
+                        Some(Self::DhmLocal {
+                            day: p0,
+                            hour: p1,
+                            minute: p2,
+                        })
+                    }
+                    b'h' => {
+                        // HMS Zulu: HH MM SS h
+                        if p0 > 23 || p1 > 59 || p2 > 59 {
+                            return None;
+                        }
+                        Some(Self::Hms {
+                            hour: p0,
+                            minute: p1,
+                            second: p2,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            8 => {
+                // MDHM unsuffixed: MM DD HH MM (typically Zulu;
+                // spec leaves zone implementation-defined).
+                let month = pair(wire, 0)?;
+                let day = pair(wire, 2)?;
+                let hour = pair(wire, 4)?;
+                let minute = pair(wire, 6)?;
+                if !(1..=12).contains(&month) {
+                    return None;
+                }
+                if !(1..=31).contains(&day) {
+                    return None;
+                }
+                if hour > 23 || minute > 59 {
+                    return None;
+                }
+                Some(Self::Mdhm {
+                    month,
+                    day,
+                    hour,
+                    minute,
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Phg and AprsDataExtension
 // ---------------------------------------------------------------------------
 
-/// Power-Height-Gain-Directivity data (APRS101 Chapter 7).
+/// Antenna directivity code from a PHG extension.
 ///
-/// PHG provides station RF characteristics for range circle calculations.
+/// APRS 1.0.1 §7.1 reserves the 4th digit of a `PHGNhgd` field for
+/// directivity, with the following mapping (paraphrased from the spec's
+/// Table 7-2):
+///
+/// | Code | Direction                  | Degrees |
+/// |------|----------------------------|---------|
+/// | `0`  | Omni-directional           | —       |
+/// | `1`  | North-East                 | 45      |
+/// | `2`  | East                       | 90      |
+/// | `3`  | South-East                 | 135     |
+/// | `4`  | South                      | 180     |
+/// | `5`  | South-West                 | 225     |
+/// | `6`  | West                       | 270     |
+/// | `7`  | North-West                 | 315     |
+/// | `8`  | North                      | 360     |
+/// | `9`  | Undefined (treat as omni)  | —       |
+///
+/// The 45° step is the canonical interpretation in every published
+/// reference implementation (`aprx`, `Xastir`, `aprs.fi`). The bug fixed
+/// in commit history was an incorrect 20° step table.
+///
+/// Use [`Self::from_code`] to construct from the raw `0..=9` ASCII
+/// digit value, [`Self::to_degrees`] to recover degrees from cardinal
+/// codes, and [`Self::is_omni`] to test for omni semantics
+/// (both [`Self::Omni`] and [`Self::Undefined`] are treated as omni
+/// in receive-side range-circle code).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PhgDirectivity {
+    /// Omni-directional antenna (code `0`).
+    Omni,
+    /// Directional antenna, 45° (north-east, code `1`).
+    NorthEast,
+    /// Directional antenna, 90° (east, code `2`).
+    East,
+    /// Directional antenna, 135° (south-east, code `3`).
+    SouthEast,
+    /// Directional antenna, 180° (south, code `4`).
+    South,
+    /// Directional antenna, 225° (south-west, code `5`).
+    SouthWest,
+    /// Directional antenna, 270° (west, code `6`).
+    West,
+    /// Directional antenna, 315° (north-west, code `7`).
+    NorthWest,
+    /// Directional antenna, 360° (north, code `8`). Equivalent to 0° on
+    /// the compass; spec preserves the literal "360" reading from the
+    /// wire so receivers can distinguish a station that filled in the
+    /// `8` digit from one that filled in `0` (omni).
+    North,
+    /// Spec-reserved "undefined" directivity (code `9`). Treat as omni
+    /// for range-circle calculations; surface for diagnostic logging.
+    Undefined,
+}
+
+impl PhgDirectivity {
+    /// Parse a directivity code (`0..=9`) into the typed enum.
+    ///
+    /// Returns `None` for any code outside that range.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Omni),
+            1 => Some(Self::NorthEast),
+            2 => Some(Self::East),
+            3 => Some(Self::SouthEast),
+            4 => Some(Self::South),
+            5 => Some(Self::SouthWest),
+            6 => Some(Self::West),
+            7 => Some(Self::NorthWest),
+            8 => Some(Self::North),
+            9 => Some(Self::Undefined),
+            _ => None,
+        }
+    }
+
+    /// Recover the directivity in compass degrees.
+    ///
+    /// Returns `None` for [`Self::Omni`] and [`Self::Undefined`] (no
+    /// single bearing applies). All other variants return the spec-
+    /// defined 45° increments.
+    #[must_use]
+    pub const fn to_degrees(self) -> Option<u16> {
+        match self {
+            Self::Omni | Self::Undefined => None,
+            Self::NorthEast => Some(45),
+            Self::East => Some(90),
+            Self::SouthEast => Some(135),
+            Self::South => Some(180),
+            Self::SouthWest => Some(225),
+            Self::West => Some(270),
+            Self::NorthWest => Some(315),
+            Self::North => Some(360),
+        }
+    }
+
+    /// Whether range-circle calculators should treat this directivity as
+    /// omni-directional. Both [`Self::Omni`] (explicit) and
+    /// [`Self::Undefined`] (spec-reserved code `9`) return `true`.
+    #[must_use]
+    pub const fn is_omni(self) -> bool {
+        matches!(self, Self::Omni | Self::Undefined)
+    }
+}
+
+impl fmt::Display for PhgDirectivity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Omni => "omni",
+            Self::NorthEast => "NE",
+            Self::East => "E",
+            Self::SouthEast => "SE",
+            Self::South => "S",
+            Self::SouthWest => "SW",
+            Self::West => "W",
+            Self::NorthWest => "NW",
+            Self::North => "N",
+            Self::Undefined => "undef",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Power-Height-Gain-Directivity data (APRS 1.0.1 Chapter 7).
+///
+/// PHG provides station RF characteristics for range-circle calculations.
+/// The four single-digit codes in a `PHGNhgd` extension map to physical
+/// quantities via the spec's Table 7-1 / 7-2:
+///
+/// - `N` (power) → `N² watts` (e.g. `5` → 25 W).
+/// - `h` (height) → `10 × 2ʰ feet` AGL (e.g. `3` → 80 ft).
+/// - `g` (gain) → `g dB` direct (no scaling).
+/// - `d` (directivity) → see [`PhgDirectivity`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Phg {
-    /// Effective radiated power in watts.
+    /// Effective radiated power in watts (`N²` for code `N` in `0..=9`).
     pub power_watts: u32,
-    /// Antenna height above average terrain in feet.
+    /// Antenna height above average terrain in feet (`10 × 2ʰ` for code
+    /// `h` in `0..=9`).
     pub height_feet: u32,
-    /// Antenna gain in dB.
+    /// Antenna gain in dB (single-digit `0..=9`, direct).
     pub gain_db: u8,
-    /// Antenna directivity in degrees (0 = omni).
-    pub directivity_deg: u16,
+    /// Typed antenna directivity. See [`PhgDirectivity`].
+    pub directivity: PhgDirectivity,
 }
 
 /// Parsed APRS data extensions from the position comment field.
@@ -273,34 +510,91 @@ fn parse_cse_spd(comment: &str) -> Option<(u16, u16)> {
     Some((course, speed))
 }
 
-/// PHG power codes: index^2 watts. Per APRS101 Table on p.28.
+/// PHG power-code lookup: `N²` watts for code `N` in `0..=9`.
+///
+/// Per APRS 1.0.1 Table 7-1, the power digit encodes effective radiated
+/// power as the square of the digit (`0`=0 W, `1`=1 W, `2`=4 W, … `9`=81 W).
 const PHG_POWER: [u32; 10] = [0, 1, 4, 9, 16, 25, 36, 49, 64, 81];
-/// PHG height codes: 10 * 2^N feet.
-const PHG_HEIGHT: [u32; 10] = [10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5120];
-/// PHG directivity codes: 0=omni, then 20, 40, ..., 320 degrees.
-const PHG_DIR: [u16; 10] = [0, 20, 40, 60, 80, 100, 120, 140, 160, 180];
+
+/// Maximum legal PHG height digit value (yields `10 × 2²⁸` feet =
+/// ~2.68 billion ft, the largest height that fits a `u32`).
+///
+/// In practice values above ~20 are unphysical (10 × 2²⁰ ≈ 3 200 km
+/// AGL, well beyond LEO). The spec deliberately leaves the upper bound
+/// open; we cap at the u32 boundary to keep the cast safe.
+const PHG_HEIGHT_MAX_DIGIT: u32 = 28;
+
+/// Decode a PHG height code into feet above average terrain.
+///
+/// Per APRS 1.0.1 §7 p.28: "The height code may in fact be any ASCII
+/// character `0` and above. This is so that larger heights for
+/// balloons, aircraft or satellites may be specified." The encoding
+/// is `10 × 2ʰ` feet where `h` is the digit value `byte - b'0'`:
+///
+/// | Wire byte | `h` | Feet AGL |
+/// |-----------|-----|----------|
+/// | `'0'`     | 0   | 10       |
+/// | `'9'`     | 9   | 5 120    |
+/// | `':'`     | 10  | 10 240   |
+/// | `';'`     | 11  | 20 480   |
+/// | `'<'`     | 12  | 40 960   |
+/// | …         | …   | …        |
+///
+/// Returns `None` for bytes below ASCII `'0'` or above the `u32`-safe
+/// cap [`PHG_HEIGHT_MAX_DIGIT`]; both pre-`'0'` and absurd-height
+/// inputs are spec-disallowed.
+const fn phg_decode_height(byte: u8) -> Option<u32> {
+    if byte < b'0' {
+        return None;
+    }
+    let digit = (byte - b'0') as u32;
+    if digit > PHG_HEIGHT_MAX_DIGIT {
+        return None;
+    }
+    // 10 × 2^digit. Bounded by `digit <= 28` so no overflow.
+    Some(10u32 << digit)
+}
 
 /// Parse a PHG extension from the comment string.
 ///
-/// Format: `PHGNhgd` anywhere in the comment, where each of N, h, g, d
-/// is a single ASCII digit (0-9).
+/// Format: `PHGNhgd` anywhere in the comment, where:
+///
+/// - `N` is an ASCII digit `'0'..='9'` (power). Mapped via [`PHG_POWER`].
+/// - `h` is any ASCII character `'0'` and above (height), spec-allowed
+///   to extend beyond `'9'` for balloons, aircraft, and satellites.
+///   Decoded via [`phg_decode_height`].
+/// - `g` is an ASCII digit `'0'..='9'` (gain, direct in dB).
+/// - `d` is an ASCII digit `'0'..='9'` (directivity); mapped via
+///   [`PhgDirectivity::from_code`].
+///
+/// Returns `None` if `PHG` is absent or any field fails its validation
+/// rule. Note the height field's relaxed acceptance — earlier code
+/// generations rejected `':'` (10 240 ft, common in balloon trackers),
+/// which produced silent loss of PHG data on receive. See CB-C-2.
 fn parse_phg(comment: &str) -> Option<Phg> {
     let idx = comment.find("PHG")?;
     let rest = comment.get(idx + 3..)?;
     let first_four = rest.get(..4)?.as_bytes();
-    if !first_four.iter().all(u8::is_ascii_digit) {
+
+    // Power, gain, and directivity must be ASCII digits; only the
+    // height byte is allowed to extend beyond `'9'` per spec.
+    let p_byte = *first_four.first()?;
+    let h_byte = *first_four.get(1)?;
+    let g_byte = *first_four.get(2)?;
+    let d_byte = *first_four.get(3)?;
+    if !p_byte.is_ascii_digit() || !g_byte.is_ascii_digit() || !d_byte.is_ascii_digit() {
         return None;
     }
-    let p = (*first_four.first()? - b'0') as usize;
-    let h = (*first_four.get(1)? - b'0') as usize;
-    let g = *first_four.get(2)? - b'0';
-    let d = (*first_four.get(3)? - b'0') as usize;
+
+    let p = (p_byte - b'0') as usize;
+    let g = g_byte - b'0';
+    let d = d_byte - b'0';
 
     Some(Phg {
-        power_watts: PHG_POWER.get(p).copied().unwrap_or(0),
-        height_feet: PHG_HEIGHT.get(h).copied().unwrap_or(10),
+        power_watts: *PHG_POWER.get(p)?,
+        height_feet: phg_decode_height(h_byte)?,
         gain_db: g,
-        directivity_deg: PHG_DIR.get(d).copied().unwrap_or(0),
+        directivity: PhgDirectivity::from_code(d)?,
     })
 }
 
@@ -363,21 +657,42 @@ fn parse_dao(comment: &str) -> Option<(f64, f64)> {
 /// APRS message kind (per APRS 1.0.1 §14 and bulletin sections).
 ///
 /// Distinguishes direct station-to-station messages from the various
-/// bulletin forms based on the addressee prefix.
+/// bulletin and announcement forms based on the addressee prefix. The
+/// spec defines five distinct bulletin-family forms at §14 pp.73-74,
+/// and a "BLN" addressee that starts with a *letter* (announcement)
+/// is structurally different from one that starts with a *digit*
+/// (general or group bulletin). Earlier code generations collapsed
+/// announcements into `GroupBulletin`; see CB-C-10.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MessageKind {
     /// Direct station-to-station message.
     Direct,
-    /// Generic bulletin (addressee `BLN0`-`BLN9`).
+    /// Numeric general bulletin (addressee `BLN0`-`BLN9` — exactly the
+    /// `BLN` prefix followed by a single ASCII digit).
     Bulletin {
         /// Bulletin number (0-9).
         number: u8,
     },
-    /// Group bulletin (addressee `BLN<group>` where group is an alpha
-    /// identifier, e.g. `BLNWX` for weather group).
+    /// Group bulletin (addressee `BLN<digit><group>` per APRS 1.0.1
+    /// §14 p.74 — `BLN` prefix, then a single digit ID, then a 1-5
+    /// character group name, e.g. `BLN4WX___` for weather group
+    /// bulletin number 4). The current parser accepts the looser
+    /// "BLN + 1-5 alnum starting with anything except a single digit
+    /// or single letter" form for tolerance; canonical spec form has
+    /// digit-then-name.
     GroupBulletin {
         /// Group identifier (1-5 alphanumeric characters).
         group: String,
+    },
+    /// Announcement (addressee `BLNA`-`BLNZ` — exactly the `BLN`
+    /// prefix followed by a single uppercase ASCII letter). Per APRS
+    /// 1.0.1 §14 p.73, announcements are transmitted less frequently
+    /// than general bulletins and are intended for less time-sensitive
+    /// content. Distinct from `GroupBulletin` (which has a multi-char
+    /// group identifier) and `Bulletin` (which is numeric).
+    Announcement {
+        /// Announcement letter (A-Z).
+        letter: char,
     },
     /// National Weather Service bulletin (addressee `NWS-*`, `SKY-*`,
     /// `CWA-*`, `BOM-*`).
@@ -481,19 +796,35 @@ fn parse_telemetry_labels(s: &str) -> TelemetryParameters {
     params
 }
 
-/// Parse a `EQNS.` coefficient list into 5 `(a, b, c)` tuples.
+/// Parse an `EQNS.` coefficient list into 5 `(a, b, c)` tuples.
+///
+/// The wire format is 15 comma-separated decimal values per APRS 1.0.1
+/// §13 p.70 — three coefficients (a, b, c) for each of five analog
+/// telemetry channels. The equation is `y = a·v² + b·v + c` where `v`
+/// is the raw channel value.
+///
+/// **Strictness**: every coefficient is parsed via [`str::parse::<f64>`].
+/// If *any* of the three coefficients for a slot fails to parse (the
+/// field is empty, contains non-numeric text, or is missing entirely),
+/// that slot remains `None`. Earlier code generations substituted
+/// `0.0` for parse failures, which produced all-zero coefficients on
+/// malformed input — silently coercing a parsing bug into a "valid"
+/// equation `y = 0·v² + 0·v + 0 = 0`. See CB-C-17.
 fn parse_telemetry_equations(s: &str) -> [Option<(f64, f64, f64)>; 5] {
-    let values: Vec<f64> = s
-        .split(',')
-        .map(str::trim)
-        .map(|v| v.parse::<f64>().unwrap_or(0.0))
-        .collect();
+    // Parse each comma-separated field into `Option<f64>`; we deliberately
+    // do NOT fall through to 0.0 on parse failure — a missing/bad value
+    // disables the whole slot.
+    let values: Vec<Option<f64>> = s.split(',').map(|v| v.trim().parse::<f64>().ok()).collect();
     let mut out: [Option<(f64, f64, f64)>; 5] = [None, None, None, None, None];
     for (i, slot) in out.iter_mut().enumerate() {
         let base = i * 3;
-        if let (Some(&a), Some(&b), Some(&c)) =
-            (values.get(base), values.get(base + 1), values.get(base + 2))
-        {
+        // All three coefficients (a, b, c) must be present AND parsed
+        // successfully for the slot to be populated.
+        if let (Some(Some(a)), Some(Some(b)), Some(Some(c))) = (
+            values.get(base).copied(),
+            values.get(base + 1).copied(),
+            values.get(base + 2).copied(),
+        ) {
             *slot = Some((a, b, c));
         }
     }
@@ -575,6 +906,22 @@ pub enum AprsData {
     /// Used for test beacons and frames that should be ignored by
     /// normal receivers. We preserve the payload for diagnostics.
     InvalidOrTest(Vec<u8>),
+    /// Raw weather data from legacy commercial weather stations
+    /// (data types `#` Peet Bros U-II, `*` Peet Bros U-II under a
+    /// different ID per APRS 1.0.1 §12 p.62 Table).
+    ///
+    /// Addendum 1.1 deprecates these formats ("not recommended on RF
+    /// — please use the Complete Weather Report format instead") but
+    /// receivers must tolerate them. The library does not attempt to
+    /// parse the proprietary ASCII-hex payload; downstream code can
+    /// either decode it via a dedicated Peet Bros parser or log it
+    /// for diagnostic purposes. See CB-C-14.
+    RawWeather {
+        /// Original data-type identifier byte (`b'#'` or `b'*'`).
+        data_type: u8,
+        /// Everything after the type byte, byte-for-byte.
+        payload: Vec<u8>,
+    },
 }
 
 /// A parsed APRS packet. Currently just a thin wrapper over [`AprsData`];
@@ -653,6 +1000,18 @@ pub fn parse_aprs_data(info: &[u8]) -> Result<AprsData, AprsError> {
         b',' => Ok(AprsData::InvalidOrTest(
             info.get(1..).unwrap_or(&[]).to_vec(),
         )),
+        // Raw weather formats from legacy commercial stations
+        // (APRS 1.0.1 §12 p.62 Table — `#` Peet Bros U-II, `*` Peet
+        // Bros U-II again under a different ID, second `$` Ultimeter
+        // 2000). Addendum 1.1 line 156-157 deprecates these
+        // ("not recommended on RF") but says receivers MUST tolerate
+        // them. We surface the raw payload via `RawWeather` so
+        // downstream code can choose to parse Peet Bros format
+        // separately or just log the bytes. See CB-C-14.
+        b'#' | b'*' => Ok(AprsData::RawWeather {
+            data_type: first,
+            payload: info.get(1..).unwrap_or(&[]).to_vec(),
+        }),
         // Mic-E (` ' 0x1C 0x1D) needs destination address — use parse_mice_position().
         b'`' | b'\'' | 0x1C | 0x1D => Err(AprsError::MicERequiresDestination),
         // All other types are unrecognized.
@@ -964,6 +1323,40 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_raw_weather_peet_bros_hash() -> TestResult {
+        // CB-C-14: Peet Bros U-II raw weather format `#...`.
+        // Receivers must tolerate per APRS 1.1; the library surfaces
+        // it as RawWeather rather than rejecting with InvalidFormat.
+        let info = b"#0123*4567";
+        let result = parse_aprs_data(info)?;
+        assert!(
+            matches!(
+                &result,
+                AprsData::RawWeather { data_type, payload }
+                    if *data_type == b'#' && payload == b"0123*4567"
+            ),
+            "expected RawWeather(#), got {result:?}",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_raw_weather_peet_bros_star() -> TestResult {
+        // Second Peet Bros identifier (`*`) — same tolerance rule.
+        let info = b"*0123 4567";
+        let result = parse_aprs_data(info)?;
+        assert!(
+            matches!(
+                &result,
+                AprsData::RawWeather { data_type, payload }
+                    if *data_type == b'*' && payload == b"0123 4567"
+            ),
+            "expected RawWeather(*), got {result:?}",
+        );
+        Ok(())
+    }
+
+    #[test]
     fn dispatch_mice_returns_error() {
         // Mic-E needs destination address, can't parse from info alone
         let info = &[0x60u8, 125, 73, 58, 40, 40, 40, b'>', b'/'];
@@ -1048,23 +1441,30 @@ mod tests {
 
     #[test]
     fn parse_extensions_phg() -> TestResult {
+        // PHG5132: power=5²=25 W, height=10×2²=40 ft? No: '1' → 20 ft.
+        // gain=3 dB, directivity code 2 → East (90°).
         let ext = parse_aprs_extensions("PHG5132");
         let phg = ext.phg.ok_or("phg missing")?;
         assert_eq!(phg.power_watts, 25);
         assert_eq!(phg.height_feet, 20);
         assert_eq!(phg.gain_db, 3);
-        assert_eq!(phg.directivity_deg, 40);
+        assert_eq!(phg.directivity, PhgDirectivity::East);
+        assert_eq!(phg.directivity.to_degrees(), Some(90));
         Ok(())
     }
 
     #[test]
     fn parse_extensions_phg_omni() -> TestResult {
+        // PHG2360: power=2²=4 W, height=10×2³=80 ft, gain=6 dB,
+        // directivity code 0 → Omni.
         let ext = parse_aprs_extensions("PHG2360");
         let phg = ext.phg.ok_or("phg missing")?;
         assert_eq!(phg.power_watts, 4);
         assert_eq!(phg.height_feet, 80);
         assert_eq!(phg.gain_db, 6);
-        assert_eq!(phg.directivity_deg, 0);
+        assert_eq!(phg.directivity, PhgDirectivity::Omni);
+        assert_eq!(phg.directivity.to_degrees(), None);
+        assert!(phg.directivity.is_omni());
         Ok(())
     }
 
@@ -1074,6 +1474,209 @@ mod tests {
         let phg = ext.phg.ok_or("phg missing")?;
         assert_eq!(phg.power_watts, 25);
         Ok(())
+    }
+
+    #[test]
+    fn phg_directivity_undefined_is_omni() {
+        // Spec code 9 maps to Undefined, which displays as "undef"
+        // but should be treated as omni for range-circle math.
+        let d = PhgDirectivity::Undefined;
+        assert_eq!(d.to_degrees(), None);
+        assert!(d.is_omni());
+    }
+
+    #[test]
+    fn phg_directivity_all_codes_round_trip() -> TestResult {
+        // Verify the spec table: every code in 0..=9 decodes to a known
+        // variant and re-encodes to the same direction string. Catches
+        // the previous-generation bug where 20° increments were used
+        // instead of 45° increments.
+        let expectations: [(u8, PhgDirectivity, Option<u16>, &str); 10] = [
+            (0, PhgDirectivity::Omni, None, "omni"),
+            (1, PhgDirectivity::NorthEast, Some(45), "NE"),
+            (2, PhgDirectivity::East, Some(90), "E"),
+            (3, PhgDirectivity::SouthEast, Some(135), "SE"),
+            (4, PhgDirectivity::South, Some(180), "S"),
+            (5, PhgDirectivity::SouthWest, Some(225), "SW"),
+            (6, PhgDirectivity::West, Some(270), "W"),
+            (7, PhgDirectivity::NorthWest, Some(315), "NW"),
+            (8, PhgDirectivity::North, Some(360), "N"),
+            (9, PhgDirectivity::Undefined, None, "undef"),
+        ];
+        for (code, expected, degrees, label) in expectations {
+            let parsed = PhgDirectivity::from_code(code)
+                .ok_or_else(|| format!("code {code} did not parse"))?;
+            assert_eq!(parsed, expected, "code {code} parsed to wrong variant");
+            assert_eq!(parsed.to_degrees(), degrees, "code {code} wrong degrees");
+            assert_eq!(format!("{parsed}"), label, "code {code} wrong display");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn phg_directivity_rejects_out_of_range() {
+        assert!(PhgDirectivity::from_code(10).is_none());
+        assert!(PhgDirectivity::from_code(99).is_none());
+        assert!(PhgDirectivity::from_code(u8::MAX).is_none());
+    }
+
+    #[test]
+    fn phg_height_extends_beyond_9() -> TestResult {
+        // Regression guard for CB-C-2 (APRS 1.0.1 §7 p.28): the height
+        // digit may be any ASCII character `'0'` and above, allowing
+        // balloons/satellites to encode heights beyond 5 120 ft (the
+        // `'9'` cap). Earlier code rejected `':'` via `is_ascii_digit`.
+        let ext = parse_aprs_extensions("PHG5:30");
+        let phg = ext.phg.ok_or("phg missing")?;
+        assert_eq!(phg.height_feet, 10_240, "':' should decode to 10240 ft");
+        Ok(())
+    }
+
+    #[test]
+    fn phg_height_balloon_range() -> TestResult {
+        // `';'` (h=11) → 20 480 ft AGL — high-altitude balloon territory.
+        let ext = parse_aprs_extensions("PHG3;30");
+        let phg = ext.phg.ok_or("phg missing")?;
+        assert_eq!(phg.height_feet, 20_480);
+        Ok(())
+    }
+
+    #[test]
+    fn phg_height_rejects_below_zero_ascii() {
+        // Bytes below ASCII `'0'` (e.g. ` ` = 32) are not valid PHG
+        // height codes and must produce None.
+        let ext = parse_aprs_extensions("PHG5 30");
+        assert!(ext.phg.is_none(), "space height should be rejected");
+    }
+
+    // ---- AprsTimestamp::parse round-trip ----
+
+    #[test]
+    fn aprs_timestamp_parse_dhm_zulu() -> TestResult {
+        let ts = AprsTimestamp::parse("092345z").ok_or("expected valid DHM Zulu")?;
+        assert_eq!(
+            ts,
+            AprsTimestamp::DhmZulu {
+                day: 9,
+                hour: 23,
+                minute: 45,
+            },
+        );
+        assert_eq!(ts.to_wire_string(), "092345z");
+        Ok(())
+    }
+
+    #[test]
+    fn aprs_timestamp_parse_dhm_local() -> TestResult {
+        let ts = AprsTimestamp::parse("110000/").ok_or("expected valid DHM local")?;
+        assert_eq!(
+            ts,
+            AprsTimestamp::DhmLocal {
+                day: 11,
+                hour: 0,
+                minute: 0,
+            },
+        );
+        assert_eq!(ts.to_wire_string(), "110000/");
+        Ok(())
+    }
+
+    #[test]
+    fn aprs_timestamp_parse_hms() -> TestResult {
+        let ts = AprsTimestamp::parse("234517h").ok_or("expected valid HMS")?;
+        assert_eq!(
+            ts,
+            AprsTimestamp::Hms {
+                hour: 23,
+                minute: 45,
+                second: 17,
+            },
+        );
+        assert_eq!(ts.to_wire_string(), "234517h");
+        Ok(())
+    }
+
+    #[test]
+    fn aprs_timestamp_parse_mdhm() -> TestResult {
+        let ts = AprsTimestamp::parse("10092345").ok_or("expected valid MDHM")?;
+        assert_eq!(
+            ts,
+            AprsTimestamp::Mdhm {
+                month: 10,
+                day: 9,
+                hour: 23,
+                minute: 45,
+            },
+        );
+        assert_eq!(ts.to_wire_string(), "10092345");
+        Ok(())
+    }
+
+    #[test]
+    fn aprs_timestamp_parse_rejects_malformed() {
+        // Wrong length
+        assert!(AprsTimestamp::parse("123456").is_none());
+        assert!(AprsTimestamp::parse("1234567890").is_none());
+        // Unknown suffix
+        assert!(AprsTimestamp::parse("123456X").is_none());
+        // Non-digit
+        assert!(AprsTimestamp::parse("1A2345z").is_none());
+        // Out-of-range day (0 or > 31)
+        assert!(AprsTimestamp::parse("002345z").is_none());
+        assert!(AprsTimestamp::parse("322345z").is_none());
+        // Out-of-range hour
+        assert!(AprsTimestamp::parse("092445z").is_none());
+        // Out-of-range minute
+        assert!(AprsTimestamp::parse("092360z").is_none());
+        // MDHM: month 0 / month 13
+        assert!(AprsTimestamp::parse("00091234").is_none());
+        assert!(AprsTimestamp::parse("13091234").is_none());
+    }
+
+    #[test]
+    fn aprs_timestamp_round_trip_all_variants() -> TestResult {
+        // Build each variant, format to wire, parse back, expect identity.
+        let cases = [
+            AprsTimestamp::DhmZulu {
+                day: 9,
+                hour: 23,
+                minute: 45,
+            },
+            AprsTimestamp::DhmLocal {
+                day: 15,
+                hour: 12,
+                minute: 0,
+            },
+            AprsTimestamp::Hms {
+                hour: 23,
+                minute: 45,
+                second: 17,
+            },
+            AprsTimestamp::Mdhm {
+                month: 7,
+                day: 4,
+                hour: 8,
+                minute: 30,
+            },
+        ];
+        for original in cases {
+            let wire = original.to_wire_string();
+            let parsed = AprsTimestamp::parse(&wire)
+                .ok_or_else(|| format!("parse({wire}) returned None for {original:?}"))?;
+            assert_eq!(parsed, original, "round-trip mismatch for {original:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn phg_height_rejects_overflow_digit() {
+        // The u32-safe cap is `digit <= 28` → byte `'0' + 28 = 'L'`.
+        // A byte at `'M'` would overflow on `10 << 29` and is rejected.
+        let ext = parse_aprs_extensions("PHG5M30");
+        assert!(
+            ext.phg.is_none(),
+            "height byte beyond u32-safe cap should be rejected"
+        );
     }
 
     #[test]
@@ -1171,6 +1774,40 @@ mod tests {
         assert_eq!(eqs.first(), Some(&Some((0.0, 0.1, 0.0))));
         assert_eq!(eqs.get(1), Some(&Some((0.0, 0.5, 0.0))));
         assert_eq!(eqs.get(4), Some(&Some((0.0, 3.0, 0.0))));
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_definition_eqns_strict_rejects_malformed_slot() -> TestResult {
+        // Regression guard for CB-C-17: a non-numeric field must
+        // disable the affected slot rather than substituting 0.0
+        // (which would silently produce a valid-looking equation).
+        // Here channel 1 has a bad `b` coefficient ('hello') — the
+        // entire slot must be None.
+        let def = TelemetryDefinition::from_text("EQNS.0,0.1,0,0,hello,0,0,1,0,0,2,0,0,3,0")
+            .ok_or("missing")?;
+        let TelemetryDefinition::Equations(eqs) = def else {
+            return Err("expected Equations".into());
+        };
+        assert_eq!(eqs.first(), Some(&Some((0.0, 0.1, 0.0))), "slot 0 OK");
+        assert_eq!(eqs.get(1), Some(&None), "slot 1 must be None on bad coeff");
+        assert_eq!(eqs.get(2), Some(&Some((0.0, 1.0, 0.0))), "slot 2 OK");
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_definition_eqns_strict_rejects_missing_slot() -> TestResult {
+        // A short input (fewer than 15 fields) leaves later slots None,
+        // never coerces missing fields to 0.0.
+        let def = TelemetryDefinition::from_text("EQNS.0,0.1,0,0,0.5,0").ok_or("missing")?;
+        let TelemetryDefinition::Equations(eqs) = def else {
+            return Err("expected Equations".into());
+        };
+        assert_eq!(eqs.first(), Some(&Some((0.0, 0.1, 0.0))));
+        assert_eq!(eqs.get(1), Some(&Some((0.0, 0.5, 0.0))));
+        for i in 2..5 {
+            assert_eq!(eqs.get(i), Some(&None), "slot {i} must be None");
+        }
         Ok(())
     }
 

@@ -92,10 +92,10 @@ pub use memory::{MemoryError, MemoryImage};
 pub use ::aprs::{
     AprsData, AprsDataExtension, AprsError, AprsItem, AprsMessage, AprsMessenger, AprsObject,
     AprsPosition, AprsQuery, AprsStatus, AprsTelemetry, AprsWeather, DigiAction, DigipeaterConfig,
-    Phg, SmartBeaconing, SmartBeaconingConfig, StationEntry, StationList, build_aprs_item,
-    build_aprs_message, build_aprs_mice, build_aprs_object, build_aprs_position_compressed,
-    build_aprs_position_report, build_aprs_status, build_aprs_weather,
-    build_query_response_position, parse_aprs_extensions,
+    Phg, PhgDirectivity, SmartBeaconing, SmartBeaconingConfig, StationEntry, StationList,
+    build_aprs_item, build_aprs_message, build_aprs_mice, build_aprs_object,
+    build_aprs_position_compressed, build_aprs_position_report, build_aprs_status,
+    build_aprs_weather, build_query_response_position, parse_aprs_extensions,
 };
 pub use aprs_is::{
     AprsIsClient, AprsIsConfig, AprsIsError, AprsIsEvent, aprs_is_passcode, build_login_string,

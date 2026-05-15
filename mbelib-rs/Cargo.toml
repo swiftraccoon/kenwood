@@ -82,5 +82,9 @@ required-features = ["encoder"]
 name = "kenwood_tables_integrity"
 required-features = ["kenwood-tables"]
 
+[[test]]
+name = "kenwood_hitl_anchors"
+required-features = ["kenwood-tables"]
+
 [lints]
 workspace = true

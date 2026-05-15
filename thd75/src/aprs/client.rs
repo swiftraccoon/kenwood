@@ -73,7 +73,7 @@ use aprs::{
     build_aprs_position_compressed, build_aprs_position_report, build_aprs_status,
     build_query_response_position, classify_ack_rej, parse_aprs_data_full,
 };
-use ax25_codec::{Ax25Address, Ax25Packet, build_ax25, parse_ax25};
+use ax25_codec::{Ax25Address, Ax25Packet, CommandResponse, RouteEntry, build_ax25, parse_ax25};
 use kiss_tnc::{CMD_DATA, KissFrame, encode_kiss_frame};
 
 use crate::aprs::ax25_to_kiss_wire;
@@ -128,7 +128,7 @@ pub struct AprsClientConfig {
     /// Default: `WIDE1-1,WIDE2-1` (standard 2-hop path). Use an empty
     /// vector for direct transmission with no digipeating. Parse from
     /// a string with [`crate::aprs::parse_digipeater_path`].
-    pub digipeater_path: Vec<Ax25Address>,
+    pub digipeater_path: Vec<RouteEntry>,
     /// Automatically respond to `?APRSP` position queries addressed to us.
     ///
     /// When set and an incoming message contains `?APRSP`, the client
@@ -176,6 +176,7 @@ impl AprsClientConfig {
     /// Build the [`Ax25Address`] for this station.
     fn my_address(&self) -> Ax25Address {
         Ax25Address::new(&self.callsign, self.ssid)
+            .unwrap_or_else(|_| unreachable!("config validated callsign + ssid at construction"))
     }
 
     /// Start building a configuration with the fluent builder.
@@ -214,7 +215,7 @@ pub struct AprsClientConfigBuilder {
     max_stations: usize,
     station_timeout_secs: u64,
     auto_ack: bool,
-    digipeater_path: Vec<Ax25Address>,
+    digipeater_path: Vec<RouteEntry>,
     auto_query_response: bool,
     auto_query_position: Option<(f64, f64)>,
 }
@@ -300,7 +301,7 @@ impl AprsClientConfigBuilder {
 
     /// Replace the outgoing digipeater path.
     #[must_use]
-    pub fn digipeater_path(mut self, path: Vec<Ax25Address>) -> Self {
+    pub fn digipeater_path(mut self, path: Vec<RouteEntry>) -> Self {
         self.digipeater_path = path;
         self
     }
@@ -327,11 +328,11 @@ impl AprsClientConfigBuilder {
     /// fails validation, the SSID is out of range, or the symbol table
     /// byte is outside the APRS-defined set (`/`, `\\`, 0-9, A-Z).
     pub fn build(self) -> Result<AprsClientConfig, crate::error::ValidationError> {
-        // Callsign + SSID validation (same rules as Ax25Address::try_new).
-        // `Ax25Address::try_new` now returns `Ax25Error` from the
-        // `ax25-codec` crate; map to this crate's `ValidationError` at the
-        // boundary so callers keep the stable error type.
-        let _ = Ax25Address::try_new(&self.callsign, self.ssid).map_err(|_| {
+        // Callsign + SSID validation. `Ax25Address::new` returns
+        // `Ax25Error` from the `ax25-codec` crate; map to this crate's
+        // `ValidationError` at the boundary so callers keep the stable
+        // error type.
+        let _check = Ax25Address::new(&self.callsign, self.ssid).map_err(|_| {
             crate::error::ValidationError::AprsWireOutOfRange {
                 field: "callsign",
                 detail: "callsign must be 1-6 A-Z/0-9 and SSID 0-15",
@@ -654,23 +655,41 @@ impl<T: Transport> AprsClient<T> {
         match aprs_data {
             AprsData::Position(pos) => {
                 let source: String = packet.source.callsign.as_str().to_owned();
-                if let Some(wx) = pos.weather.clone() {
-                    if let Some(entry) = self.stations.get(&source).cloned() {
-                        self.pending_events
-                            .push_back(AprsEvent::StationHeard(entry));
+                let weather = pos.weather.clone();
+                let entry = self.stations.get(&source).cloned();
+
+                // Observation-order contract (matches every other arm in
+                // this match): `StationHeard` is the *primary* event when
+                // the station list has an entry — it carries the "we just
+                // heard from this station" signal that callers use for UI
+                // refresh and IGate timing. Any data-bearing sub-event
+                // (weather, position) is queued for the *next* call to
+                // [`AprsClient::next_event`] so the caller sees them in
+                // arrival order: heard-then-data.
+                //
+                // Earlier code generations returned `WeatherReceived`
+                // first and queued `StationHeard` — that violated the
+                // sibling-arm convention and would *lose* the StationHeard
+                // event entirely if the caller stopped polling between
+                // the two. See git history for CB-7.
+                match (entry, weather) {
+                    (Some(entry_ev), Some(wx)) => {
+                        self.pending_events.push_back(AprsEvent::WeatherReceived {
+                            source,
+                            weather: wx,
+                        });
+                        Ok(Some(AprsEvent::StationHeard(entry_ev)))
                     }
-                    return Ok(Some(AprsEvent::WeatherReceived {
+                    (Some(entry_ev), None) => Ok(Some(AprsEvent::StationHeard(entry_ev))),
+                    (None, Some(wx)) => Ok(Some(AprsEvent::WeatherReceived {
                         source,
                         weather: wx,
-                    }));
-                }
-                self.stations.get(&source).cloned().map_or(
-                    Ok(Some(AprsEvent::PositionReceived {
+                    })),
+                    (None, None) => Ok(Some(AprsEvent::PositionReceived {
                         source,
                         position: pos,
                     })),
-                    |entry| Ok(Some(AprsEvent::StationHeard(entry))),
-                )
+                }
             }
             AprsData::Weather(wx) => Ok(Some(AprsEvent::WeatherReceived {
                 source: packet.source.callsign.as_str().to_owned(),
@@ -685,7 +704,8 @@ impl<T: Transport> AprsClient<T> {
             | AprsData::StationCapabilities(_)
             | AprsData::AgreloDfJr(_)
             | AprsData::UserDefined { .. }
-            | AprsData::InvalidOrTest(_) => self
+            | AprsData::InvalidOrTest(_)
+            | AprsData::RawWeather { .. } => self
                 .stations
                 .get(&packet.source.callsign)
                 .cloned()
@@ -723,10 +743,17 @@ impl<T: Transport> AprsClient<T> {
         Ok(message_id)
     }
 
-    /// Beacon current position using uncompressed format.
+    /// Beacon current position using uncompressed format, sampling the
+    /// wall clock implicitly.
     ///
-    /// Builds an APRS position report and transmits it via KISS.
-    /// Updates the `SmartBeaconing` timer.
+    /// Convenience wrapper around [`Self::beacon_position_at`]. Reads
+    /// `Instant::now()` exactly once and threads the same value through
+    /// the wire send and the `SmartBeaconing` timer update.
+    ///
+    /// Prefer [`Self::beacon_position_at`] from within larger state-
+    /// machine iterations (e.g. [`Self::update_motion`]) so a single
+    /// captured `now` flows through every clock-reading operation that
+    /// shares the iteration's semantic timestamp.
     ///
     /// # Errors
     ///
@@ -736,6 +763,30 @@ impl<T: Transport> AprsClient<T> {
         lat: f64,
         lon: f64,
         comment: &str,
+    ) -> Result<(), Error> {
+        self.beacon_position_at(lat, lon, comment, Instant::now())
+            .await
+    }
+
+    /// Beacon current position using uncompressed format, with an
+    /// explicit clock sample.
+    ///
+    /// `now` is used to update the `SmartBeaconing` "last beacon" timer
+    /// after the wire send completes. Callers participating in a larger
+    /// state-machine iteration (notably [`Self::update_motion`]) should
+    /// thread their captured `Instant::now()` here rather than letting
+    /// this method re-sample, so that `should_beacon`, the wire send,
+    /// and `beacon_sent` observe the same semantic timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transmission fails.
+    pub async fn beacon_position_at(
+        &mut self,
+        lat: f64,
+        lon: f64,
+        comment: &str,
+        now: Instant,
     ) -> Result<(), Error> {
         let source = self.config.my_address();
         let wire = build_aprs_position_report(
@@ -748,14 +799,18 @@ impl<T: Transport> AprsClient<T> {
             &self.config.digipeater_path,
         );
         self.session.send_wire(&wire).await?;
-        self.beaconing.beacon_sent(Instant::now());
+        self.beaconing.beacon_sent(now);
         Ok(())
     }
 
-    /// Beacon position using compressed format (smaller packet).
+    /// Beacon position using compressed format (smaller packet), sampling
+    /// the wall clock implicitly.
     ///
-    /// Uses base-91 encoding per APRS101 Chapter 9. Produces smaller
-    /// packets than [`beacon_position`](Self::beacon_position).
+    /// Uses base-91 encoding per APRS 1.0.1 Chapter 9. Produces smaller
+    /// packets than [`Self::beacon_position`]. Convenience wrapper around
+    /// [`Self::beacon_position_compressed_at`]; prefer the `_at` variant
+    /// inside larger state-machine iterations to share a single clock
+    /// sample with sibling clock-reading operations.
     ///
     /// # Errors
     ///
@@ -765,6 +820,26 @@ impl<T: Transport> AprsClient<T> {
         lat: f64,
         lon: f64,
         comment: &str,
+    ) -> Result<(), Error> {
+        self.beacon_position_compressed_at(lat, lon, comment, Instant::now())
+            .await
+    }
+
+    /// Beacon position using compressed format, with an explicit clock
+    /// sample.
+    ///
+    /// See [`Self::beacon_position_at`] for the rationale on threading
+    /// `now` from a caller-managed iteration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transmission fails.
+    pub async fn beacon_position_compressed_at(
+        &mut self,
+        lat: f64,
+        lon: f64,
+        comment: &str,
+        now: Instant,
     ) -> Result<(), Error> {
         let source = self.config.my_address();
         let wire = build_aprs_position_compressed(
@@ -777,7 +852,7 @@ impl<T: Transport> AprsClient<T> {
             &self.config.digipeater_path,
         );
         self.session.send_wire(&wire).await?;
-        self.beaconing.beacon_sent(Instant::now());
+        self.beaconing.beacon_sent(now);
         Ok(())
     }
 
@@ -837,6 +912,19 @@ impl<T: Transport> AprsClient<T> {
     /// transmitted and this method returns `Ok(true)`. Otherwise returns
     /// `Ok(false)`.
     ///
+    /// # Clock discipline
+    ///
+    /// This method samples `Instant::now()` exactly once and threads the
+    /// captured value through every clock-reading call it makes:
+    /// [`SmartBeaconing::should_beacon`], [`Self::beacon_position_at`]
+    /// (which forwards to [`SmartBeaconing::beacon_sent`]), and
+    /// [`SmartBeaconing::beacon_sent_with`]. This guarantees the three
+    /// state-machine decisions in one iteration observe the same
+    /// semantic timestamp; an earlier code generation called
+    /// [`Instant::now`] three times here and could record a
+    /// `beacon_sent_with` slightly later than the `should_beacon` it was
+    /// answering.
+    ///
     /// # Errors
     ///
     /// Returns an error if the beacon transmission fails.
@@ -849,8 +937,8 @@ impl<T: Transport> AprsClient<T> {
     ) -> Result<bool, Error> {
         let now = Instant::now();
         if self.beaconing.should_beacon(speed_kmh, course_deg, now) {
-            let comment = &self.config.beacon_comment.clone();
-            self.beacon_position(lat, lon, comment).await?;
+            let comment = self.config.beacon_comment.clone();
+            self.beacon_position_at(lat, lon, &comment, now).await?;
             self.beaconing.beacon_sent_with(speed_kmh, course_deg, now);
             Ok(true)
         } else {
@@ -901,39 +989,103 @@ impl<T: Transport> AprsClient<T> {
         )
     }
 
+    /// Build the AX.25 wrap frame that this `IGate` would transmit for a
+    /// given APRS-IS line, **without** sending it.
+    ///
+    /// Returns `None` if the line fails `IGate` gating rules
+    /// ([`Self::should_gate_to_rf`]) or if its TNC2 form is malformed
+    /// (missing `:`). Exposed at module-private scope as a pure helper
+    /// so unit tests can assert wire-format properties (outer path,
+    /// `,I` marker, etc.) without driving the mock transport.
+    fn build_gate_from_is_packet(&self, is_packet: &str) -> Option<Ax25Packet> {
+        if !self.should_gate_to_rf(is_packet) {
+            return None;
+        }
+
+        // Parse `ORIGSRC>ORIGDEST,ORIGPATH:data`. The split at the first
+        // `:` is correct for TNC2 format because the source/destination
+        // and digi path are ASCII per spec and cannot contain a colon.
+        let (header, data) = is_packet.split_once(':')?;
+
+        // Build the inner third-party payload, appending the IGate's
+        // own callsign and the `,I` marker per IGating.aspx. This is
+        // what distinguishes an Internet→RF gated packet from one that
+        // was already on RF; receivers look for `,I` to skip re-gating
+        // and to know who introduced the packet.
+        let igate_call = self.config.my_address();
+        let third_party_payload = format!("}}{header},{igate_call},I:{data}");
+
+        // Outer AX.25 frame:
+        //   source = IGate callsign
+        //   destination = TH-D75 tocall (matches this crate's other
+        //     beacon-style transmissions)
+        //   digipeaters = IGate's configured RF path so the gated
+        //     packet propagates beyond the IGate's footprint
+        let destination = Ax25Address::new("APK005", 0).ok()?;
+        Some(Ax25Packet {
+            source: igate_call,
+            destination,
+            digipeaters: self.config.digipeater_path.clone(),
+            command_or_response: Some(CommandResponse::Command),
+            control: 0x03,
+            protocol: 0xF0,
+            info: third_party_payload.into_bytes(),
+        })
+    }
+
     /// Parse an APRS-IS packet and transmit it on RF via KISS.
     ///
-    /// Only transmits if the packet passes the third-party header check
-    /// (avoids RF loops). The packet is wrapped in a third-party header
-    /// `}` before transmission per APRS101 Chapter 17.
+    /// Wraps the IS packet in a third-party header and broadcasts it on
+    /// the configured RF digipeater path, following the canonical
+    /// IGate-to-RF format documented at
+    /// <http://www.aprs-is.net/IGating.aspx> and APRS 1.0.1 Chapter 17.
     ///
-    /// Returns `true` if the packet was transmitted, `false` if it was
-    /// filtered out.
+    /// # Wire shape
+    ///
+    /// Given an inbound IS line of the form:
+    ///
+    /// ```text
+    /// ORIGSRC>ORIGDEST,ORIGPATH:data
+    /// ```
+    ///
+    /// the function emits an outer AX.25 frame:
+    ///
+    /// ```text
+    /// MYCALL>APK005,RF_PATH:}ORIGSRC>ORIGDEST,ORIGPATH,MYCALL,I:data
+    /// ```
+    ///
+    /// where
+    /// - `MYCALL` is the `IGate`'s configured callsign + SSID
+    ///   (`self.config.my_address()`),
+    /// - `APK005` is the TH-D75 tocall (matching this crate's beacon
+    ///   destination), and
+    /// - `RF_PATH` is the `IGate`'s configured digipeater path
+    ///   (`self.config.digipeater_path`) so the gated packet reaches
+    ///   beyond the `IGate`'s immediate footprint via existing RF
+    ///   digipeaters.
+    /// - The inner third-party payload appends `,MYCALL,I` to the
+    ///   original IS-side path. `,I` is the spec-mandated marker
+    ///   identifying the packet as crossing the Internet→RF boundary
+    ///   at `MYCALL`. Receivers use this to detect `IGated` traffic and
+    ///   avoid re-gating it.
+    ///
+    /// Pre-2026 versions used a hard-coded `[TCPIP-0]` outer path and
+    /// did not append `,I`, which made the wire frame indistinguishable
+    /// from an internet-originated packet that had never touched RF.
+    /// See M5 in the project history.
+    ///
+    /// # Filtering
+    ///
+    /// Only transmits if [`Self::should_gate_to_rf`] returns `true`.
+    /// Returns `Ok(false)` if the packet was filtered out, `Ok(true)`
+    /// if it was transmitted.
     ///
     /// # Errors
     ///
     /// Returns an error if the KISS transmission fails.
     pub async fn gate_from_is(&mut self, is_packet: &str) -> Result<bool, Error> {
-        if !self.should_gate_to_rf(is_packet) {
+        let Some(packet) = self.build_gate_from_is_packet(is_packet) else {
             return Ok(false);
-        }
-
-        // Parse source>dest,path:data
-        let Some((header, data)) = is_packet.split_once(':') else {
-            return Ok(false);
-        };
-
-        // Wrap in third-party header: }original_packet
-        let third_party_payload = format!("}}{header}:{data}");
-        let source = self.config.my_address();
-        let dest = Ax25Address::new("APRS", 0);
-        let packet = Ax25Packet {
-            source,
-            destination: dest,
-            digipeaters: vec![Ax25Address::new("TCPIP", 0)],
-            control: 0x03,
-            protocol: 0xF0,
-            info: third_party_payload.into_bytes(),
         };
         let ax25_bytes = build_ax25(&packet);
         let wire = encode_kiss_frame(&KissFrame {
@@ -949,13 +1101,22 @@ impl<T: Transport> AprsClient<T> {
     ///
     /// Applies standard `IGate` rules:
     /// - Don't gate packets from TCPIP/TCPXX sources
-    /// - Don't gate third-party packets (}prefix)
+    /// - Don't gate third-party packets (`}` prefix)
     /// - Don't gate packets with NOGATE/RFONLY in path
+    ///
+    /// All callsign comparisons here are case-sensitive against the
+    /// uppercase form because `ax25_codec::Callsign::new` already
+    /// enforces uppercase ASCII alphanumeric at validation time — every
+    /// `Callsign` in a parsed `Ax25Packet` is therefore already in
+    /// canonical case, and a runtime `.to_uppercase()` would allocate
+    /// without semantic effect.
     #[must_use]
     pub fn should_gate_to_is(packet: &Ax25Packet) -> bool {
-        // Don't gate packets originating from the internet.
-        let src_upper = packet.source.callsign.to_uppercase();
-        if src_upper == "TCPIP" || src_upper == "TCPXX" {
+        // Don't gate packets originating from the internet. `Callsign`
+        // values are uppercase by validation invariant; direct PartialEq
+        // against the spec-form literal is sufficient.
+        let src = packet.source.callsign.as_str();
+        if src == "TCPIP" || src == "TCPXX" {
             return false;
         }
 
@@ -967,8 +1128,8 @@ impl<T: Transport> AprsClient<T> {
 
         // Don't gate packets with NOGATE or RFONLY in the digipeater path.
         for digi in &packet.digipeaters {
-            let upper = digi.callsign.to_uppercase();
-            if upper == "NOGATE" || upper == "RFONLY" {
+            let call = digi.address.callsign.as_str();
+            if call == "NOGATE" || call == "RFONLY" {
                 return false;
             }
         }
@@ -1112,6 +1273,7 @@ mod tests {
 
     fn test_address() -> Ax25Address {
         Ax25Address::new("N0CALL", 7)
+            .unwrap_or_else(|_| unreachable!("N0CALL-7 is statically valid"))
     }
 
     #[tokio::test]
@@ -1327,18 +1489,19 @@ mod tests {
 
     fn make_test_packet(source: &str, dest: &str, digis: &[&str], info: &[u8]) -> Ax25Packet {
         // Parse each digi string as "CALL-SSID" or bare "CALL".
-        let parse_digi = |s: &str| -> Ax25Address {
-            if let Some((call, ssid)) = s.split_once('-') {
-                let ssid: u8 = ssid.parse().unwrap_or(0);
-                Ax25Address::new(call, ssid)
-            } else {
-                Ax25Address::new(s, 0)
-            }
+        let parse_digi = |s: &str| -> Option<RouteEntry> {
+            let (call, ssid) = s
+                .split_once('-')
+                .map_or((s, 0u8), |(c, ssid_str)| (c, ssid_str.parse().unwrap_or(0)));
+            RouteEntry::new(call, ssid).ok()
         };
         Ax25Packet {
-            source: Ax25Address::new(source, 0),
-            destination: Ax25Address::new(dest, 0),
-            digipeaters: digis.iter().map(|d| parse_digi(d)).collect(),
+            source: Ax25Address::new(source, 0)
+                .unwrap_or_else(|_| unreachable!("test fixture source is valid")),
+            destination: Ax25Address::new(dest, 0)
+                .unwrap_or_else(|_| unreachable!("test fixture dest is valid")),
+            digipeaters: digis.iter().filter_map(|d| parse_digi(d)).collect(),
+            command_or_response: Some(CommandResponse::Command),
             control: 0x03,
             protocol: 0xF0,
             info: info.to_vec(),
@@ -1455,6 +1618,7 @@ mod tests {
             "KQ4NIT",
             &AprsData::Status(aprs::AprsStatus {
                 text: "on air".to_owned(),
+                ..aprs::AprsStatus::default()
             }),
             &[],
             Instant::now(),
@@ -1479,6 +1643,7 @@ mod tests {
             "KQ4NIT",
             &AprsData::Status(aprs::AprsStatus {
                 text: "on air".to_owned(),
+                ..aprs::AprsStatus::default()
             }),
             &[],
             Instant::now(),
@@ -1499,6 +1664,7 @@ mod tests {
             "KQ4NIT",
             &AprsData::Status(aprs::AprsStatus {
                 text: "on air".to_owned(),
+                ..aprs::AprsStatus::default()
             }),
             &[],
             Instant::now(),
@@ -1513,6 +1679,76 @@ mod tests {
             .gate_from_is("W1AW>APK005,qAC,SRV::KQ4NIT   :Hello{123")
             .await?;
         assert!(result);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gate_from_is_packet_wire_shape() -> TestResult {
+        // Regression guard for M5: the outer AX.25 frame must carry the
+        // IGate's configured RF path (not the old hard-coded
+        // `[TCPIP-0]`), and the inner third-party payload must end with
+        // `,MYCALL,I:` per APRS 1.0.1 §17 + IGating.aspx. Verified
+        // structurally by inspecting the built packet's fields rather
+        // than the encoded KISS bytes — fewer brittle assertions, same
+        // protocol coverage.
+        let radio = mock_radio(TncBaud::Bps1200).await?;
+        let config = test_config();
+        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+
+        // Simulate hearing the addressee on RF so gating is allowed.
+        client.stations.update(
+            "KQ4NIT",
+            &AprsData::Status(aprs::AprsStatus {
+                text: "on air".to_owned(),
+                ..aprs::AprsStatus::default()
+            }),
+            &[],
+            Instant::now(),
+        );
+
+        let is_line = "W1AW>APK005,qAC,SRV::KQ4NIT   :Hello{123";
+        let packet = client
+            .build_gate_from_is_packet(is_line)
+            .ok_or("gate packet not built — expected Some")?;
+
+        // Outer source is the IGate's callsign + SSID.
+        assert_eq!(packet.source.callsign.as_str(), "N0CALL");
+        assert_eq!(packet.source.ssid.get(), 7);
+        // Outer destination is the TH-D75 tocall, matching this crate's
+        // other beacon transmissions.
+        assert_eq!(packet.destination.callsign.as_str(), "APK005");
+        // Outer path is the IGate's configured RF path (default
+        // WIDE1-1,WIDE2-1 from AprsClientConfig::new). It is NOT the
+        // bogus `[TCPIP-0]` singleton used by pre-fix code.
+        assert!(
+            !packet.digipeaters.is_empty(),
+            "expected non-empty RF path, got empty"
+        );
+        for digi in &packet.digipeaters {
+            assert_ne!(
+                digi.address.callsign.as_str(),
+                "TCPIP",
+                "TCPIP must not appear in the outer RF path"
+            );
+        }
+        // Inner third-party payload starts with `}`, ends with
+        // `,MYCALL,I:data`. Decoding via lossy is safe — the payload is
+        // ASCII by construction here.
+        let info_str = String::from_utf8_lossy(&packet.info);
+        assert!(
+            info_str.starts_with('}'),
+            "expected `}}` prefix: {info_str}"
+        );
+        let expected_marker = ",N0CALL-7,I:";
+        assert!(
+            info_str.contains(expected_marker),
+            "expected `{expected_marker}` marker in info: {info_str}"
+        );
+        // Original payload data ("Hello{123") survives unchanged.
+        assert!(
+            info_str.ends_with("Hello{123"),
+            "expected unchanged trailing data: {info_str}"
+        );
         Ok(())
     }
 
@@ -1537,9 +1773,12 @@ mod tests {
     /// Build a KISS-encoded data frame from a source callsign and APRS info.
     fn build_kiss_data_frame(source: &str, ssid: u8, info: &[u8]) -> Vec<u8> {
         let packet = Ax25Packet {
-            source: Ax25Address::new(source, ssid),
-            destination: Ax25Address::new("APK005", 0),
+            source: Ax25Address::new(source, ssid)
+                .unwrap_or_else(|_| unreachable!("test fixture source is valid")),
+            destination: Ax25Address::new("APK005", 0)
+                .unwrap_or_else(|_| unreachable!("APK005 is statically valid")),
             digipeaters: vec![],
+            command_or_response: Some(CommandResponse::Command),
             control: 0x03,
             protocol: 0xF0,
             info: info.to_vec(),
@@ -1594,13 +1833,31 @@ mod tests {
         let wire = build_kiss_data_frame("WX1STA", 0, info);
         client.session.transport.queue_read(&wire);
 
-        let event = client
+        // Observation-order contract (see `dispatch_event` for the
+        // rationale): a position-with-weather packet emits two events
+        // — `StationHeard` first ("we saw this station"), then
+        // `WeatherReceived` ("here is the payload"). Earlier code
+        // generations emitted these in the opposite order; the
+        // current order matches every other arm of `dispatch_event`
+        // and avoids losing `StationHeard` if the caller stops
+        // polling between the two events.
+        let first = client
             .next_event()
             .await?
-            .ok_or("next_event returned Ok(None), expected a weather event")?;
-        let debug_dump = format!("{event:?}");
-        let AprsEvent::WeatherReceived { source, weather } = event else {
-            return Err(format!("expected WeatherReceived, got {debug_dump}").into());
+            .ok_or("next_event returned Ok(None) for first event")?;
+        let first_dump = format!("{first:?}");
+        let AprsEvent::StationHeard(entry) = first else {
+            return Err(format!("expected StationHeard first, got {first_dump}").into());
+        };
+        assert_eq!(entry.callsign, "WX1STA");
+
+        let second = client
+            .next_event()
+            .await?
+            .ok_or("next_event returned Ok(None) for second event")?;
+        let second_dump = format!("{second:?}");
+        let AprsEvent::WeatherReceived { source, weather } = second else {
+            return Err(format!("expected WeatherReceived second, got {second_dump}").into());
         };
         assert_eq!(source, "WX1STA");
         assert_eq!(weather.wind_direction, Some(90));

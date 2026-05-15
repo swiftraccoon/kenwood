@@ -5,15 +5,47 @@
 //! page `0x0151`), followed by APRS messages, settings, and extended
 //! configuration data.
 //!
-//! # Offset confidence
+//! # Verification status
 //!
-//! The APRS region boundaries (page `0x0151` for the status header,
-//! page `0x0152` for the data region) are confirmed from D74 development
-//! notes. Individual field offsets within the data region are estimated
-//! and marked with `# Verification` in the doc comments.
+//! ⚠ **Field-level offsets inside the APRS data region are not
+//! hardware-verified on a TH-D75.** This module exposes only the region-
+//! boundary readers (`status_header`, `data_region`, `position_data_*`)
+//! and a generic `read_bytes` accessor. Field-level typed accessors —
+//! `my_callsign`, `beacon_interval`, `packet_path` — were previously
+//! present but **have been removed**: their offsets were ported from
+//! TH-D74 development notes during the April 2026 extraction, and the
+//! project workspace `CLAUDE.md` is explicit that D74 confirmations are
+//! not confirmations on D75. Returning typed values from unverified
+//! offsets violates the validation contract — the type system promised
+//! "this is the callsign" while in practice the bytes might come from
+//! a completely unrelated field.
+//!
+//! ## How to reintroduce typed accessors
+//!
+//! Each field needs *both* of the following before a typed accessor is
+//! added back:
+//!
+//! 1. **Firmware-RE confirmation.** Query `GhydraMCP` at
+//!    `http://localhost:8192/functions?limit=8500` for the MCP
+//!    address-decoder function. Confirm the offset matches D75 binary
+//!    `0_FIRMWARE_0x00200000.bin`, not a D74 trace.
+//! 2. **Hardware round-trip.** Capture an MCP image from a known-state
+//!    radio (cached at `~/Library/Caches/thd75-tui/mcp.bin`), set the
+//!    field via the menu, re-capture, diff the byte at the candidate
+//!    offset, confirm it tracks the change.
+//!
+//! Only when both pass should a typed accessor land — with the source
+//! comment naming the `GhydraMCP` function address and the hardware
+//! capture date that verified it. See git history for CB-6.
+//!
+//! # Cross-references
+//!
+//! The region-boundary constants (`APRS_STATUS_PAGE`, `APRS_START`,
+//! `DSTAR_RPT_START`) live in [`crate::protocol::programming`] and are
+//! considered verified at the page level. Only sub-page field offsets
+//! were unverified.
 
 use crate::protocol::programming;
-use crate::types::aprs::AprsCallsign;
 
 /// Byte offset of the APRS message status header (`0x15100`).
 pub const APRS_STATUS_OFFSET: usize =
@@ -26,32 +58,14 @@ pub const APRS_DATA_OFFSET: usize = programming::APRS_START as usize * programmi
 pub const APRS_END_OFFSET: usize = programming::DSTAR_RPT_START as usize * programming::PAGE_SIZE;
 
 // ---------------------------------------------------------------------------
-// Estimated field offsets within the APRS data region
+// Sub-page field offsets within the APRS data region
 //
-// The APRS data region starts at 0x15200.  Field offsets below are
-// relative to that base and are estimated from D74 layout conventions.
-// None of these offsets have been hardware-verified on a D75 yet.
+// Intentionally empty. See the module-level "Verification status"
+// section: typed field accessors were removed when their offsets could
+// not be confirmed against D75 firmware RE or hardware. Add `const`
+// offsets back here only when the corresponding accessor has both a
+// firmware-RE citation and a hardware-capture date.
 // ---------------------------------------------------------------------------
-
-/// Estimated offset of the APRS MY callsign (10 bytes, null-terminated
-/// ASCII including SSID, e.g. "N0CALL-9\0").
-///
-/// Relative to the start of the APRS data region (`0x15200`).
-const APRS_MY_CALLSIGN_REL: usize = 0x0000;
-
-/// Maximum callsign field length including null terminator.
-const APRS_CALLSIGN_FIELD_LEN: usize = 10;
-
-/// Estimated offset of the beacon interval (2 bytes, little-endian,
-/// value in seconds).
-///
-/// Relative to the start of the APRS data region (`0x15200`).
-const APRS_BEACON_INTERVAL_REL: usize = 0x000A;
-
-/// Estimated offset of the packet path selection (1 byte, enum index).
-///
-/// Relative to the start of the APRS data region (`0x15200`).
-const APRS_PACKET_PATH_REL: usize = 0x000C;
 
 // ---------------------------------------------------------------------------
 // APRS/GPS position data region
@@ -74,18 +88,21 @@ pub const APRS_POSITION_DATA_SIZE: usize = 0x4B00;
 
 /// Read-only access to the APRS configuration region.
 ///
-/// Provides raw byte access and typed field accessors for the APRS
-/// settings region at pages `0x0151`+. The region boundaries are
-/// confirmed from D74 development notes; individual field offsets within
-/// the data region are estimated.
+/// Provides **region-boundary** byte access for the APRS settings
+/// region at pages `0x0151`+. The page-level layout (status header,
+/// data region, position data region) is verified; sub-page field
+/// offsets are not — see the module-level "Verification status" section
+/// for what was removed and why, and for the criteria a typed accessor
+/// must meet before it can be reintroduced.
 ///
 /// # Known sub-regions
 ///
-/// | MCP Offset | Content |
-/// |-----------|---------|
-/// | `0x15100` | APRS message status header (256 bytes) |
-/// | `0x15200` | APRS messages and settings (~16 KB) |
-/// | ~`0x19000` | APRS extended config / GPS settings |
+/// | MCP Offset | Content                                        | Status         |
+/// |------------|------------------------------------------------|----------------|
+/// | `0x15100`  | APRS message status header (256 bytes)         | page-verified  |
+/// | `0x15200`  | APRS messages and settings (~16 KB)            | page-verified  |
+/// | `0x25100`  | APRS/GPS position data region (0x4B00 bytes)   | page-verified  |
+/// | (any sub-page field)                                        | **unverified** |
 #[derive(Debug)]
 pub struct AprsAccess<'a> {
     image: &'a [u8],
@@ -134,124 +151,23 @@ impl<'a> AprsAccess<'a> {
     }
 
     // -----------------------------------------------------------------------
-    // Typed APRS accessors (estimated offsets)
+    // Typed sub-page field accessors — REMOVED pending verification.
+    //
+    // `my_callsign`, `my_callsign_typed`, `beacon_interval`,
+    // `packet_path_index`, and `packet_path` previously lived here.
+    // They were removed because the sub-page offsets they relied on
+    // were imported from D74 development notes and never confirmed
+    // against D75 firmware or hardware. See the module-level
+    // "Verification status" section for the criteria to reintroduce
+    // any of them.
+    //
+    // Callers needing field-level access today should use
+    // [`AprsAccess::read_bytes`] with an absolute offset they have
+    // verified themselves, then parse the bytes locally.
     // -----------------------------------------------------------------------
 
-    /// Read the APRS MY callsign (station callsign with optional SSID).
-    ///
-    /// Returns the callsign as a string (up to 9 characters, e.g.
-    /// "N0CALL-9"). Returns an empty string if unreadable.
-    ///
-    /// # Offset
-    ///
-    /// Estimated at `0x15200` (first bytes of the APRS data region)
-    /// based on D74 layout analysis.
-    ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
-    #[must_use]
-    pub fn my_callsign(&self) -> String {
-        let offset = APRS_DATA_OFFSET + APRS_MY_CALLSIGN_REL;
-        let Some(slice) = self.image.get(offset..offset + APRS_CALLSIGN_FIELD_LEN) else {
-            return String::new();
-        };
-        let nul = slice
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(APRS_CALLSIGN_FIELD_LEN);
-        let Some(trimmed) = slice.get(..nul) else {
-            return String::new();
-        };
-        std::str::from_utf8(trimmed).unwrap_or("").trim().to_owned()
-    }
-
-    /// Read the APRS MY callsign as a typed [`AprsCallsign`].
-    ///
-    /// Returns `None` if the callsign is empty or too long.
-    ///
-    /// # Offset
-    ///
-    /// Estimated at `0x15200` (first bytes of the APRS data region).
-    ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
-    #[must_use]
-    pub fn my_callsign_typed(&self) -> Option<AprsCallsign> {
-        let raw = self.my_callsign();
-        if raw.is_empty() {
-            return None;
-        }
-        AprsCallsign::new(&raw)
-    }
-
-    /// Read the beacon interval in seconds.
-    ///
-    /// Returns the interval as a 16-bit value (range 30-9999 in normal
-    /// operation). Returns 0 if unreadable.
-    ///
-    /// # Offset
-    ///
-    /// Estimated at `0x1520A` (APRS data region + 0x0A) based on D74 layout analysis.
-    ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
-    #[must_use]
-    pub fn beacon_interval(&self) -> u16 {
-        let offset = APRS_DATA_OFFSET + APRS_BEACON_INTERVAL_REL;
-        self.image
-            .get(offset..offset + 2)
-            .and_then(|s| <[u8; 2]>::try_from(s).ok())
-            .map_or(0, u16::from_le_bytes)
-    }
-
-    /// Read the packet path selection index.
-    ///
-    /// Returns a raw index value (0 = Off, 1 = WIDE1-1, 2 = WIDE1-1
-    /// WIDE2-1, etc.). Returns 0 if unreadable.
-    ///
-    /// # Offset
-    ///
-    /// Estimated at `0x1520C` (APRS data region + 0x0C) based on D74 layout analysis.
-    ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
-    #[must_use]
-    pub fn packet_path_index(&self) -> u8 {
-        let offset = APRS_DATA_OFFSET + APRS_PACKET_PATH_REL;
-        self.image.get(offset).copied().unwrap_or(0)
-    }
-
-    /// Read the packet path as a display string.
-    ///
-    /// Translates the raw index into a human-readable path string.
-    ///
-    /// # Offset
-    ///
-    /// Estimated at `0x1520C` (APRS data region + 0x0C).
-    ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
-    #[must_use]
-    pub fn packet_path(&self) -> String {
-        match self.packet_path_index() {
-            0 => "Off".to_owned(),
-            1 => "WIDE1-1".to_owned(),
-            2 => "WIDE1-1,WIDE2-1".to_owned(),
-            3 => "WIDE1-1,WIDE2-2".to_owned(),
-            4 => "User 1".to_owned(),
-            5 => "User 2".to_owned(),
-            6 => "User 3".to_owned(),
-            _ => "Unknown".to_owned(),
-        }
-    }
-
     // -----------------------------------------------------------------------
-    // APRS/GPS position data region (confirmed address)
+    // APRS/GPS position data region (page-verified address)
     // -----------------------------------------------------------------------
 
     /// Get the raw APRS/GPS position data region (0x4B00 bytes at `0x25100`).
@@ -344,10 +260,6 @@ mod tests {
         Ok(())
     }
 
-    fn make_aprs_image() -> Vec<u8> {
-        vec![0u8; TOTAL_SIZE]
-    }
-
     #[test]
     fn aprs_status_header_accessible() -> TestResult {
         let image = vec![0xAA_u8; TOTAL_SIZE];
@@ -386,103 +298,17 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn aprs_my_callsign() -> TestResult {
-        let mut image = make_aprs_image();
-        write_slice(
-            &mut image,
-            APRS_DATA_OFFSET + APRS_MY_CALLSIGN_REL,
-            b"N0CALL-9\0\0",
-        )?;
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let aprs = mi.aprs();
-        assert_eq!(aprs.my_callsign(), "N0CALL-9");
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_my_callsign_typed() -> TestResult {
-        let mut image = make_aprs_image();
-        write_slice(
-            &mut image,
-            APRS_DATA_OFFSET + APRS_MY_CALLSIGN_REL,
-            b"W1AW-7\0\0\0\0",
-        )?;
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let aprs = mi.aprs();
-        let typed = aprs
-            .my_callsign_typed()
-            .ok_or("my_callsign_typed returned None")?;
-        assert_eq!(typed.as_str(), "W1AW-7");
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_my_callsign_empty() -> TestResult {
-        let image = make_aprs_image();
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let aprs = mi.aprs();
-        assert_eq!(aprs.my_callsign(), "");
-        assert!(aprs.my_callsign_typed().is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_beacon_interval() -> TestResult {
-        let mut image = make_aprs_image();
-        let offset = APRS_DATA_OFFSET + APRS_BEACON_INTERVAL_REL;
-        // 180 seconds = 0x00B4 little-endian
-        set_byte(&mut image, offset, 0xB4)?;
-        set_byte(&mut image, offset + 1, 0x00)?;
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let aprs = mi.aprs();
-        assert_eq!(aprs.beacon_interval(), 180);
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_beacon_interval_zero() -> TestResult {
-        let image = make_aprs_image();
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.aprs().beacon_interval(), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_packet_path() -> TestResult {
-        let mut image = make_aprs_image();
-        set_byte(&mut image, APRS_DATA_OFFSET + APRS_PACKET_PATH_REL, 2)?; // WIDE1-1,WIDE2-1
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let aprs = mi.aprs();
-        assert_eq!(aprs.packet_path_index(), 2);
-        assert_eq!(aprs.packet_path(), "WIDE1-1,WIDE2-1");
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_packet_path_off() -> TestResult {
-        let image = make_aprs_image();
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.aprs().packet_path(), "Off");
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_packet_path_unknown() -> TestResult {
-        let mut image = make_aprs_image();
-        set_byte(&mut image, APRS_DATA_OFFSET + APRS_PACKET_PATH_REL, 0xFF)?;
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.aprs().packet_path(), "Unknown");
-        Ok(())
-    }
+    // Tests for typed sub-page accessors (my_callsign, beacon_interval,
+    // packet_path) were removed alongside the accessors themselves —
+    // they exercised synthetic round-trips at unverified offsets, which
+    // is exactly the failure mode the deletion was meant to prevent
+    // (a green test passing on a wrong offset is worse than no test
+    // because it manufactures false confidence). See the module-level
+    // "Verification status" section for the criteria a reintroduced
+    // accessor and its test must meet.
 
     // -----------------------------------------------------------------------
-    // APRS/GPS position data region tests (confirmed address)
+    // APRS/GPS position data region tests (page-verified address)
     // -----------------------------------------------------------------------
 
     #[test]

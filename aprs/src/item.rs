@@ -1,6 +1,7 @@
 //! APRS item reports, object reports, and queries (APRS 1.0.1 ch. 11 & 15).
 
 use crate::error::AprsError;
+use crate::packet::AprsTimestamp;
 use crate::position::{AprsPosition, parse_compressed_body, parse_uncompressed_body};
 
 /// An APRS object report (data type `;`).
@@ -17,8 +18,17 @@ pub struct AprsObject {
     pub name: String,
     /// Whether the object is live (`true`) or killed (`false`).
     pub live: bool,
-    /// DHM or HMS timestamp from the object report (7 characters).
+    /// Raw 7-byte timestamp string as observed on the wire.
+    ///
+    /// Preserved verbatim for round-trip fidelity. For most callers
+    /// the typed [`Self::timestamp_parsed`] view is more useful.
     pub timestamp: String,
+    /// Typed timestamp, parsed from [`Self::timestamp`] via
+    /// [`AprsTimestamp::parse`]. `None` when the wire bytes do not
+    /// satisfy any of the four spec-defined timestamp shapes
+    /// (DHM Zulu, DHM local, HMS, MDHM). The raw form is still
+    /// available in [`Self::timestamp`] for diagnostics.
+    pub timestamp_parsed: Option<AprsTimestamp>,
     /// Position data.
     pub position: AprsPosition,
 }
@@ -93,6 +103,9 @@ pub fn parse_aprs_object(info: &[u8]) -> Result<AprsObject, AprsError> {
     let pos_body = info.get(11..).ok_or(AprsError::InvalidFormat)?;
     let ts_bytes = pos_body.get(..7).ok_or(AprsError::InvalidFormat)?;
     let timestamp = String::from_utf8_lossy(ts_bytes).to_string();
+    // Try to surface the typed AprsTimestamp for callers that want it;
+    // the raw `timestamp` is always kept for round-trip fidelity.
+    let timestamp_parsed = AprsTimestamp::parse(&timestamp);
     let pos_data = pos_body.get(7..).ok_or(AprsError::InvalidFormat)?;
 
     let first = *pos_data.first().ok_or(AprsError::InvalidFormat)?;
@@ -106,6 +119,7 @@ pub fn parse_aprs_object(info: &[u8]) -> Result<AprsObject, AprsError> {
         name,
         live,
         timestamp,
+        timestamp_parsed,
         position,
     })
 }

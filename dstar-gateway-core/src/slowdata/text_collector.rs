@@ -13,9 +13,12 @@
 //!
 //! Each 6-byte block is transmitted as two consecutive 3-byte slow-data
 //! halves in voice-frame slow-data fields. Sync frames (frame index 0)
-//! carry `[0x55, 0x55, 0x55]` filler and must not be fed into the
-//! collector — they break half-block alignment. Callers either skip
-//! them or pass `frame_index == 0` to trigger automatic resync.
+//! carry the slow-data sync pattern [`DSTAR_SYNC_BYTES`] and must not
+//! be fed into the collector — they break half-block alignment.
+//! Callers either skip them or pass `frame_index == 0` to trigger
+//! automatic resync.
+//!
+//! [`DSTAR_SYNC_BYTES`]: crate::voice::DSTAR_SYNC_BYTES
 //!
 //! [`SlowDataAssembler`]: super::SlowDataAssembler
 

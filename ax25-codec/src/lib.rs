@@ -11,7 +11,7 @@
 //! - [`Ax25Control`] decoding (Information / Supervisory / Unnumbered).
 //! - [`Ax25Pid`] PID byte decoding (15 canonical values).
 //! - FCS (frame check sequence) calculation via [`ax25_fcs`].
-//! - Command/Response classification per AX.25 v2.2 §4.3.1.2.
+//! - Command/Response classification per AX.25 v2.2 §6.1.2.
 //!
 //! Non-goals: APRS parsing (see `aprs`), KISS framing (see `kiss-tnc`),
 //! any I/O.
@@ -30,14 +30,8 @@ mod error;
 mod frame;
 mod pid;
 
-pub use address::{Ax25Address, Callsign, Ssid};
+pub use address::{Ax25Address, Callsign, RouteEntry, Ssid};
 pub use control::{Ax25Control, CommandResponse, SupervisoryKind, UnnumberedKind};
 pub use error::Ax25Error;
 pub use frame::{Ax25Packet, MAX_DIGIPEATERS, ax25_fcs, build_ax25, parse_ax25};
 pub use pid::Ax25Pid;
-
-// `proptest` is a dev-dependency used only in the integration test
-// suites. Acknowledge it here to keep `-D unused-crate-dependencies`
-// happy when the lib test crate compiles with dev-deps in scope.
-#[cfg(test)]
-use proptest as _;

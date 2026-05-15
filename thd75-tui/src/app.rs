@@ -3320,23 +3320,20 @@ impl App {
     fn toggle_aprs_mode(&mut self) {
         match self.aprs_mode {
             AprsMode::Inactive => {
-                // Build APRS config from MCP data if available, else use defaults.
-                let (callsign, ssid) = if let McpState::Loaded { ref image, .. } = self.mcp {
-                    let cs = image.aprs().my_callsign();
-                    if cs.is_empty() {
-                        ("N0CALL".to_string(), 7u8)
-                    } else {
-                        // Parse SSID from callsign if present (e.g., "KQ4NIT-9").
-                        if let Some((call, ssid_str)) = cs.split_once('-') {
-                            let ssid = ssid_str.parse::<u8>().unwrap_or(7);
-                            (call.to_string(), ssid)
-                        } else {
-                            (cs, 7)
-                        }
-                    }
-                } else {
-                    ("N0CALL".to_string(), 7)
-                };
+                // Source the operator's callsign+SSID from defaults
+                // rather than from a sub-page MCP offset. The previous
+                // implementation read `image.aprs().my_callsign()`, but
+                // that accessor was removed from `kenwood_thd75::memory`
+                // when its offset (imported from D74 development notes)
+                // could not be verified against D75 firmware or
+                // hardware — see CB-6 in the project history.
+                //
+                // TODO: replace this default with a CAT-side `MY?` read
+                // once that wraps the live value, or with an MCP read
+                // once a verified offset is available. Tracking the
+                // verification work belongs in `thd75/src/memory/aprs.rs`
+                // module docs.
+                let (callsign, ssid) = ("N0CALL".to_string(), 7u8);
 
                 let config = Box::new(kenwood_thd75::AprsClientConfig::new(&callsign, ssid));
                 if let Some(ref tx) = self.cmd_tx {

@@ -297,41 +297,44 @@ fn render_mcp_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
     // -------------------------------------------------------------------------
     // Left pane: APRS config fields
     // -------------------------------------------------------------------------
-    let mut lines: Vec<Line<'_>> = Vec::new();
-
-    lines.push(Line::from(Span::styled(
-        " APRS Configuration",
-        Style::default().fg(Color::Yellow),
-    )));
-    lines.push(Line::from(""));
-
-    {
-        let cs = aprs.my_callsign();
-        let (disp, col) = if cs.is_empty() {
-            ("<not set>".into(), Color::DarkGray)
-        } else {
-            (cs, Color::Cyan)
-        };
-        lines.push(kv_line("My callsign", disp, col));
-    }
-
-    {
-        let interval = aprs.beacon_interval();
-        let (disp, col) = if interval == 0 {
-            ("Off".into(), Color::DarkGray)
-        } else {
-            (format!("{interval} s"), Color::White)
-        };
-        lines.push(kv_line("Beacon interval", disp, col));
-    }
-
-    lines.push(kv_line("Packet path", aprs.packet_path(), Color::White));
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " Press [a] to enter live APRS mode.",
-        Style::default().fg(Color::Cyan),
-    )));
+    // Field-level APRS settings (My callsign / Beacon interval / Packet
+    // path) used to be displayed here, sourced from `aprs.my_callsign()`,
+    // `aprs.beacon_interval()`, `aprs.packet_path()`. Those accessors
+    // were removed from `thd75::memory::AprsAccess` because their
+    // sub-page offsets were imported from D74 development notes and
+    // never verified against D75 firmware or hardware. See
+    // `thd75/src/memory/aprs.rs` module docs for the verification
+    // criteria to reintroduce them.
+    //
+    // Until a verified offset map lands, surface the gap to the user
+    // rather than displaying potentially-wrong values.
+    let lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled(
+            " APRS Configuration",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+        kv_line(
+            "My callsign",
+            "<offset unverified — use CAT MY for live value>".to_owned(),
+            Color::DarkGray,
+        ),
+        kv_line(
+            "Beacon interval",
+            "<offset unverified>".to_owned(),
+            Color::DarkGray,
+        ),
+        kv_line(
+            "Packet path",
+            "<offset unverified>".to_owned(),
+            Color::DarkGray,
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Press [a] to enter live APRS mode.",
+            Style::default().fg(Color::Cyan),
+        )),
+    ];
 
     frame.render_widget(Paragraph::new(lines).block(block), list_area);
 

@@ -5,7 +5,9 @@
 //! `_packet` variant returns the unencoded [`Ax25Packet`] so callers can
 //! inspect, log, or route it before wrapping it in KISS framing.
 
-use ax25_codec::{Ax25Address, Ax25Packet, build_ax25};
+use ax25_codec::{
+    Ax25Address, Ax25Packet, Callsign, CommandResponse, RouteEntry, Ssid, build_ax25,
+};
 use kiss_tnc::{KissFrame, encode_kiss_frame};
 
 use crate::error::AprsError;
@@ -21,18 +23,27 @@ use crate::weather::AprsWeather;
 /// APRS tocall for the Kenwood TH-D75 (per APRS tocall registry).
 const APRS_TOCALL: &str = "APK005";
 
+/// Canonical APRS tocall destination address. The callsign and SSID are
+/// statically valid, so the panic branch is unreachable.
+fn aprs_tocall() -> Ax25Address {
+    Ax25Address::new(APRS_TOCALL, 0)
+        .unwrap_or_else(|_| unreachable!("APRS_TOCALL is statically valid"))
+}
+
 /// Build a minimal APRS UI frame with the given source, destination, path,
-/// and info field. Control = 0x03, PID = 0xF0.
+/// and info field. Control = 0x03, PID = 0xF0. Marks the frame as a
+/// command (APRS convention per APRS 1.0.1).
 const fn ax25_ui_frame(
     source: Ax25Address,
     destination: Ax25Address,
-    path: Vec<Ax25Address>,
+    path: Vec<RouteEntry>,
     info: Vec<u8>,
 ) -> Ax25Packet {
     Ax25Packet {
         source,
         destination,
         digipeaters: path,
+        command_or_response: Some(CommandResponse::Command),
         control: 0x03,
         protocol: 0xF0,
         info,
@@ -138,7 +149,7 @@ pub fn build_aprs_position_report(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Vec<u8> {
     ax25_to_kiss_wire(&build_aprs_position_report_packet(
         source,
@@ -162,14 +173,14 @@ pub fn build_aprs_position_report_packet(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Ax25Packet {
     let lat_str = format_aprs_latitude(latitude);
     let lon_str = format_aprs_longitude(longitude);
     let info = format!("!{lat_str}{symbol_table}{lon_str}{symbol_code}{comment}");
     ax25_ui_frame(
         source.clone(),
-        Ax25Address::new(APRS_TOCALL, 0),
+        aprs_tocall(),
         path.to_vec(),
         info.into_bytes(),
     )
@@ -204,7 +215,7 @@ pub fn build_aprs_message(
     addressee: &str,
     text: &str,
     message_id: Option<&str>,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Vec<u8> {
     ax25_to_kiss_wire(&build_aprs_message_packet(
         source, addressee, text, message_id, path,
@@ -218,7 +229,7 @@ pub fn build_aprs_message_packet(
     addressee: &str,
     text: &str,
     message_id: Option<&str>,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Ax25Packet {
     // Pad addressee to exactly 9 characters.
     let padded_addressee = format!("{addressee:<9}");
@@ -242,7 +253,7 @@ pub fn build_aprs_message_packet(
 
     ax25_ui_frame(
         source.clone(),
-        Ax25Address::new(APRS_TOCALL, 0),
+        aprs_tocall(),
         path.to_vec(),
         info.into_bytes(),
     )
@@ -259,7 +270,7 @@ pub fn build_aprs_message_checked(
     addressee: &str,
     text: &str,
     message_id: Option<&str>,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Result<Vec<u8>, AprsError> {
     if text.len() > MAX_APRS_MESSAGE_TEXT_LEN {
         return Err(AprsError::MessageTooLong(text.len()));
@@ -308,7 +319,7 @@ pub fn build_aprs_object(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Vec<u8> {
     // Use a placeholder DHM zulu timestamp `000000z`. Callers needing a
     // real timestamp should use [`build_aprs_object_with_timestamp`].
@@ -350,7 +361,7 @@ pub fn build_aprs_object_with_timestamp(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Vec<u8> {
     ax25_to_kiss_wire(&build_aprs_object_with_timestamp_packet(
         source,
@@ -368,6 +379,16 @@ pub fn build_aprs_object_with_timestamp(
 
 /// Like [`build_aprs_object_with_timestamp`] but returns the unencoded
 /// [`Ax25Packet`] for callers that want to inspect or route it.
+///
+/// The object `name` must satisfy APRS 1.0.1 §11 p.58 "fixed
+/// 9-character" rule: 1..=9 bytes of printable ASCII. Names shorter
+/// than 9 bytes are space-padded; names longer than 9 bytes are
+/// **silently truncated** to the first 9 bytes (the wire frame then
+/// identifies a *different* object than the caller intended). Prefer
+/// [`build_aprs_object_with_timestamp_checked`] / its `_packet`
+/// variant when caller input is uncontrolled — they return
+/// [`AprsError::InvalidObjectName`] for malformed input instead. See
+/// CB-C-15.
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
@@ -383,7 +404,7 @@ pub fn build_aprs_object_with_timestamp_packet(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Ax25Packet {
     let padded_name = format!("{name:<9}");
     let padded_name = padded_name.get(..9).unwrap_or(&padded_name);
@@ -398,10 +419,111 @@ pub fn build_aprs_object_with_timestamp_packet(
 
     ax25_ui_frame(
         source.clone(),
-        Ax25Address::new(APRS_TOCALL, 0),
+        aprs_tocall(),
         path.to_vec(),
         info.into_bytes(),
     )
+}
+
+/// Validate that an APRS object name satisfies APRS 1.0.1 §11 p.58:
+/// 1..=9 bytes of printable ASCII (0x20..=0x7E).
+///
+/// Empty names are rejected (the spec implicitly requires at least one
+/// non-space character — a 9-space name would render as a blank
+/// identifier). Names over 9 bytes are rejected to prevent the silent
+/// truncation that the unchecked builder performs.
+fn validate_object_name(name: &str) -> Result<(), AprsError> {
+    if name.is_empty() {
+        return Err(AprsError::InvalidObjectName(
+            "object name must not be empty",
+        ));
+    }
+    if name.len() > 9 {
+        return Err(AprsError::InvalidObjectName(
+            "object name must be at most 9 bytes",
+        ));
+    }
+    if !name.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+        return Err(AprsError::InvalidObjectName(
+            "object name must be printable ASCII",
+        ));
+    }
+    Ok(())
+}
+
+/// Validating counterpart of [`build_aprs_object_with_timestamp`].
+///
+/// Returns [`AprsError::InvalidObjectName`] if `name` fails the
+/// 1..=9-byte printable-ASCII contract from APRS 1.0.1 §11 p.58.
+///
+/// # Errors
+///
+/// As above.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "APRS object wire fields are fundamentally positional"
+)]
+pub fn build_aprs_object_with_timestamp_checked(
+    source: &Ax25Address,
+    name: &str,
+    live: bool,
+    timestamp: AprsTimestamp,
+    latitude: f64,
+    longitude: f64,
+    symbol_table: char,
+    symbol_code: char,
+    comment: &str,
+    path: &[RouteEntry],
+) -> Result<Vec<u8>, AprsError> {
+    validate_object_name(name)?;
+    Ok(build_aprs_object_with_timestamp(
+        source,
+        name,
+        live,
+        timestamp,
+        latitude,
+        longitude,
+        symbol_table,
+        symbol_code,
+        comment,
+        path,
+    ))
+}
+
+/// Validating counterpart of [`build_aprs_object_with_timestamp_packet`].
+///
+/// # Errors
+///
+/// Returns [`AprsError::InvalidObjectName`] if `name` fails validation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "APRS object wire fields are fundamentally positional"
+)]
+pub fn build_aprs_object_with_timestamp_checked_packet(
+    source: &Ax25Address,
+    name: &str,
+    live: bool,
+    timestamp: AprsTimestamp,
+    latitude: f64,
+    longitude: f64,
+    symbol_table: char,
+    symbol_code: char,
+    comment: &str,
+    path: &[RouteEntry],
+) -> Result<Ax25Packet, AprsError> {
+    validate_object_name(name)?;
+    Ok(build_aprs_object_with_timestamp_packet(
+        source,
+        name,
+        live,
+        timestamp,
+        latitude,
+        longitude,
+        symbol_table,
+        symbol_code,
+        comment,
+        path,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +565,7 @@ pub fn build_aprs_item(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Vec<u8> {
     ax25_to_kiss_wire(&build_aprs_item_packet(
         source,
@@ -459,6 +581,14 @@ pub fn build_aprs_item(
 }
 
 /// Like [`build_aprs_item`] but returns the unencoded [`Ax25Packet`].
+///
+/// The `name` must be 3-9 bytes of printable ASCII excluding `!` and
+/// `_` per APRS 1.0.1 §11 p.59. This unchecked entry point performs
+/// **no validation** — passing a name shorter than 3 chars, longer
+/// than 9 chars, or containing `!`/`_` will produce a malformed item
+/// that no spec-compliant parser will accept. Prefer
+/// [`build_aprs_item_checked`] / its `_packet` variant when caller
+/// input is uncontrolled. See CB-C-16.
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
@@ -473,7 +603,7 @@ pub fn build_aprs_item_packet(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Ax25Packet {
     let live_char = if live { '!' } else { '_' };
     let lat_str = format_aprs_latitude(lat);
@@ -481,10 +611,112 @@ pub fn build_aprs_item_packet(
     let info = format!("){name}{live_char}{lat_str}{symbol_table}{lon_str}{symbol_code}{comment}");
     ax25_ui_frame(
         source.clone(),
-        Ax25Address::new(APRS_TOCALL, 0),
+        aprs_tocall(),
         path.to_vec(),
         info.into_bytes(),
     )
+}
+
+/// Validate that an APRS item name satisfies APRS 1.0.1 §11 p.59:
+///
+/// - 3..=9 bytes long, and
+/// - every byte is printable ASCII (0x20..=0x7E), and
+/// - no byte is `!` (0x21) or `_` (0x5F) — these would terminate the
+///   name field on the wire and produce a malformed item.
+fn validate_item_name(name: &str) -> Result<(), AprsError> {
+    if name.len() < 3 {
+        return Err(AprsError::InvalidItemName(
+            "item name must be at least 3 bytes",
+        ));
+    }
+    if name.len() > 9 {
+        return Err(AprsError::InvalidItemName(
+            "item name must be at most 9 bytes",
+        ));
+    }
+    for b in name.bytes() {
+        if !(0x20..=0x7E).contains(&b) {
+            return Err(AprsError::InvalidItemName(
+                "item name must be printable ASCII",
+            ));
+        }
+        if b == b'!' || b == b'_' {
+            return Err(AprsError::InvalidItemName(
+                "item name must not contain '!' or '_' (terminator bytes)",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validating counterpart of [`build_aprs_item`].
+///
+/// # Errors
+///
+/// Returns [`AprsError::InvalidItemName`] if `name` violates the
+/// APRS 1.0.1 §11 p.59 rules (length 3-9, printable ASCII, no `!`/`_`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "APRS item wire fields are fundamentally positional"
+)]
+pub fn build_aprs_item_checked(
+    source: &Ax25Address,
+    name: &str,
+    live: bool,
+    lat: f64,
+    lon: f64,
+    symbol_table: char,
+    symbol_code: char,
+    comment: &str,
+    path: &[RouteEntry],
+) -> Result<Vec<u8>, AprsError> {
+    validate_item_name(name)?;
+    Ok(build_aprs_item(
+        source,
+        name,
+        live,
+        lat,
+        lon,
+        symbol_table,
+        symbol_code,
+        comment,
+        path,
+    ))
+}
+
+/// Validating counterpart of [`build_aprs_item_packet`].
+///
+/// # Errors
+///
+/// Returns [`AprsError::InvalidItemName`] if `name` violates the
+/// APRS 1.0.1 §11 p.59 rules.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "APRS item wire fields are fundamentally positional"
+)]
+pub fn build_aprs_item_checked_packet(
+    source: &Ax25Address,
+    name: &str,
+    live: bool,
+    lat: f64,
+    lon: f64,
+    symbol_table: char,
+    symbol_code: char,
+    comment: &str,
+    path: &[RouteEntry],
+) -> Result<Ax25Packet, AprsError> {
+    validate_item_name(name)?;
+    Ok(build_aprs_item_packet(
+        source,
+        name,
+        live,
+        lat,
+        lon,
+        symbol_table,
+        symbol_code,
+        comment,
+        path,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +742,7 @@ pub fn build_aprs_item_packet(
 pub fn build_aprs_weather(
     source: &Ax25Address,
     weather: &AprsWeather,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Vec<u8> {
     ax25_to_kiss_wire(&build_aprs_weather_packet(source, weather, path))
 }
@@ -529,7 +761,7 @@ pub fn build_aprs_position_weather(
     longitude: f64,
     symbol_table: char,
     weather: &AprsWeather,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Vec<u8> {
     ax25_to_kiss_wire(&build_aprs_position_weather_packet(
         source,
@@ -550,7 +782,7 @@ pub fn build_aprs_position_weather_packet(
     longitude: f64,
     symbol_table: char,
     weather: &AprsWeather,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Ax25Packet {
     use std::fmt::Write as _;
 
@@ -592,7 +824,7 @@ pub fn build_aprs_position_weather_packet(
 
     ax25_ui_frame(
         source.clone(),
-        Ax25Address::new(APRS_TOCALL, 0),
+        aprs_tocall(),
         path.to_vec(),
         info.into_bytes(),
     )
@@ -603,7 +835,7 @@ pub fn build_aprs_position_weather_packet(
 pub fn build_aprs_weather_packet(
     source: &Ax25Address,
     weather: &AprsWeather,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Ax25Packet {
     use std::fmt::Write as _;
 
@@ -640,7 +872,7 @@ pub fn build_aprs_weather_packet(
 
     ax25_ui_frame(
         source.clone(),
-        Ax25Address::new(APRS_TOCALL, 0),
+        aprs_tocall(),
         path.to_vec(),
         info.into_bytes(),
     )
@@ -681,7 +913,7 @@ pub fn build_aprs_position_compressed(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Vec<u8> {
     ax25_to_kiss_wire(&build_aprs_position_compressed_packet(
         source,
@@ -694,8 +926,33 @@ pub fn build_aprs_position_compressed(
     ))
 }
 
+/// Sanitize a coordinate to a finite value clamped to `[min, max]`.
+///
+/// Used as the input filter to the compressed-position encoder so that
+/// out-of-range or non-finite (`NaN`, `±∞`) input never silently
+/// produces a wrong-but-valid-looking wire encoding. Non-finite input
+/// falls through to `0.0` (the geographic centre on the relevant axis)
+/// rather than the clamped extremum to surface "value missing" more
+/// distinctively in downstream decoding.
+const fn sanitize_coord(value: f64, min: f64, max: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        0.0
+    }
+}
+
 /// Like [`build_aprs_position_compressed`] but returns the unencoded
 /// [`Ax25Packet`].
+///
+/// # Input sanitisation
+///
+/// `latitude` and `longitude` are clamped to `±90` / `±180`
+/// respectively, matching the sibling uncompressed builder. Non-finite
+/// inputs (`NaN`, `±∞`) fall through to `0.0`. This is the equivalent
+/// of pre-validating via [`crate::Latitude`] / [`crate::Longitude`]
+/// newtypes; the boundary here exists because this builder accepts
+/// `f64` for ergonomic interop with raw GPS samples.
 #[must_use]
 pub fn build_aprs_position_compressed_packet(
     source: &Ax25Address,
@@ -704,18 +961,25 @@ pub fn build_aprs_position_compressed_packet(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Ax25Packet {
+    let latitude = sanitize_coord(latitude, -90.0, 90.0);
+    let longitude = sanitize_coord(longitude, -180.0, 180.0);
+    // After clamping, both expressions are bounded:
+    //   lat_val ∈ [0, 380_926 × 180]  = [0, 68_566_680]
+    //   lon_val ∈ [0, 190_463 × 360]  = [0, 68_566_680]
+    // Both fit comfortably in u32. The casts cannot truncate or
+    // sign-flip because the input is non-negative by construction.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "APRS compressed position encoding scales f64 decimal degrees into u32-ranged integers per APRS101 §9"
+        reason = "input is clamped to a non-negative range that fits u32"
     )]
     let lat_val = (380_926.0 * (90.0 - latitude)) as u32;
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "APRS compressed position encoding scales f64 decimal degrees into u32-ranged integers per APRS101 §9"
+        reason = "input is clamped to a non-negative range that fits u32"
     )]
     let lon_val = (190_463.0 * (longitude + 180.0)) as u32;
     let lat_encoded = encode_base91_4(lat_val);
@@ -732,12 +996,7 @@ pub fn build_aprs_position_compressed_packet(
     info.push(b' '); // t: compression type = no data
     info.extend_from_slice(comment.as_bytes());
 
-    ax25_ui_frame(
-        source.clone(),
-        Ax25Address::new(APRS_TOCALL, 0),
-        path.to_vec(),
-        info,
-    )
+    ax25_ui_frame(source.clone(), aprs_tocall(), path.to_vec(), info)
 }
 
 // ---------------------------------------------------------------------------
@@ -757,7 +1016,7 @@ pub fn build_aprs_position_compressed_packet(
 /// - `text`: Status text content.
 /// - `path`: Digipeater path.
 #[must_use]
-pub fn build_aprs_status(source: &Ax25Address, text: &str, path: &[Ax25Address]) -> Vec<u8> {
+pub fn build_aprs_status(source: &Ax25Address, text: &str, path: &[RouteEntry]) -> Vec<u8> {
     ax25_to_kiss_wire(&build_aprs_status_packet(source, text, path))
 }
 
@@ -766,18 +1025,13 @@ pub fn build_aprs_status(source: &Ax25Address, text: &str, path: &[Ax25Address])
 pub fn build_aprs_status_packet(
     source: &Ax25Address,
     text: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Ax25Packet {
     let mut info = Vec::with_capacity(1 + text.len() + 1);
     info.push(b'>');
     info.extend_from_slice(text.as_bytes());
     info.push(b'\r');
-    ax25_ui_frame(
-        source.clone(),
-        Ax25Address::new(APRS_TOCALL, 0),
-        path.to_vec(),
-        info,
-    )
+    ax25_ui_frame(source.clone(), aprs_tocall(), path.to_vec(), info)
 }
 
 // ---------------------------------------------------------------------------
@@ -822,7 +1076,7 @@ pub fn build_aprs_mice(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Vec<u8> {
     // Default to Off Duty for backwards compat with the old signature.
     build_aprs_mice_with_message(
@@ -861,7 +1115,7 @@ pub fn build_aprs_mice_with_message(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Vec<u8> {
     ax25_to_kiss_wire(&build_aprs_mice_with_message_packet(
         source,
@@ -895,11 +1149,17 @@ pub fn build_aprs_mice_with_message_packet(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Ax25Packet {
-    // Clamp position so the wire fields never overflow.
-    let latitude = latitude.clamp(-90.0, 90.0);
-    let longitude = longitude.clamp(-180.0, 180.0);
+    // Sanitise position so the wire fields never overflow and a
+    // non-finite input (`NaN`, `±∞`) cannot saturate the integer
+    // casts below into a wrong-looking-but-encodable value. This
+    // matches the policy of [`build_aprs_position_report_packet`]
+    // and [`build_aprs_position_compressed_packet`]; the Mic-E
+    // builder used to clamp without the `is_finite()` guard, which
+    // silently produced byte 0 for both `NaN` inputs. See CB-C-1.
+    let latitude = sanitize_coord(latitude, -90.0, 90.0);
+    let longitude = sanitize_coord(longitude, -180.0, 180.0);
     let north = latitude >= 0.0;
     let west = longitude < 0.0;
     let lat_abs = latitude.abs();
@@ -943,7 +1203,21 @@ pub fn build_aprs_mice_with_message_packet(
 
     // Encode destination address characters. Chars 0-2 carry message
     // bits A/B/C: if the bit is 1, pick from P-Y; otherwise 0-9.
-    let lon_offset = lon_abs >= 100.0;
+    //
+    // The "longitude offset" flag carried on char 4 of the destination
+    // is **set** in two non-contiguous ranges per APRS 1.0.1 §10 p.47:
+    //
+    //   - longitude in 0..10°    (so the info-field d-byte can use
+    //                            the high column 118-127 / `v`-`DEL`),
+    //   - longitude in 100..180° (so the info-field d-byte can use the
+    //                            low column 108-117 or 38-107 per the
+    //                            1.1 correction).
+    //
+    // Earlier code generations only set the bit for ≥100°, which left
+    // 0-9° longitudes encoded into the info-field byte range 28..37
+    // — outside the spec-listed valid encodings. Spec-strict receivers
+    // would mis-decode. See CB-B-3.
+    let lon_offset = !(10.0..100.0).contains(&lon_abs);
     let dest_chars: [u8; 6] = [
         if msg_a { b'P' + d0 } else { b'0' + d0 },
         if msg_b { b'P' + d1 } else { b'0' + d1 },
@@ -958,13 +1232,16 @@ pub fn build_aprs_mice_with_message_packet(
         unreachable!("Mic-E destination chars are ASCII by construction")
     };
 
-    // Longitude degrees encoding per APRS 1.0.1 §10.3.3:
-    //   No offset (0-99°):    d = degrees
-    //   Offset set (≥100°):
-    //     100-109°:           d = degrees - 20    (decoder hits 180-189 → subtract 80)
-    //     110-179°:           d = degrees - 100   (decoder passes through)
+    // Longitude-degrees encoding per APRS 1.0.1 §10 p.47 (as corrected
+    // by addendum 1.1):
     //
-    // Byte on the wire is always d + 28.
+    //   - 0..=9°    offset set, `d = degrees + 90`,  byte 118-127
+    //   - 10..=99°  no offset,  `d = degrees`,       byte 38-127
+    //   - 100..=109° offset set, `d = degrees - 20`, byte 108-117
+    //   - 110..=179° offset set, `d = degrees - 100`, byte 38-107
+    //
+    // Byte on the wire is always `d + 28`. Each range is laid out so
+    // the d-byte is in 0..=99 (fits u8 without truncation).
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -973,16 +1250,20 @@ pub fn build_aprs_mice_with_message_packet(
     let lon_deg_raw = lon_abs as u16;
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "lon_deg_raw subtraction always yields a value that fits u8 for valid APRS longitudes"
+        reason = "every branch yields a value in 0..=99 by spec-table construction; the casts cannot truncate"
     )]
-    let d = if lon_offset {
-        if lon_deg_raw >= 110 {
-            (lon_deg_raw - 100) as u8
-        } else {
-            (lon_deg_raw - 20) as u8
-        }
-    } else {
+    let d = if lon_deg_raw < 10 {
+        // 0-9° with offset bit set: d = degrees + 90.
+        (lon_deg_raw + 90) as u8
+    } else if lon_deg_raw < 100 {
+        // 10-99° no offset: d = degrees.
         lon_deg_raw as u8
+    } else if lon_deg_raw < 110 {
+        // 100-109° with offset: d = degrees - 20.
+        (lon_deg_raw - 20) as u8
+    } else {
+        // 110-179° with offset: d = degrees - 100.
+        (lon_deg_raw - 100) as u8
     };
 
     #[expect(
@@ -997,12 +1278,19 @@ pub fn build_aprs_mice_with_message_packet(
         reason = "lon_min_f is in 0..60"
     )]
     let lon_min_int = lon_min_f as u8;
+    // Hundredths of a minute. Rounding `0.999... * 100.0` can yield 100,
+    // which when added to the wire offset of 28 would produce byte 128 —
+    // outside the spec-mandated Mic-E receivable range of 28..=127
+    // (APRS 1.0.1 §10.3.3). Clamp to 0..=99 to keep the wire byte legal;
+    // the latitude-side computation at `lat_hundredths` uses the same
+    // pattern.
+    let lon_hundredths_f = ((lon_min_f - f64::from(lon_min_int)) * 100.0).round();
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "rounded value is 0..=100"
+        reason = "lon_hundredths_f rounds to an integer in 0..=100; clamped to 0..=99 below"
     )]
-    let lon_hundredths = ((lon_min_f - f64::from(lon_min_int)) * 100.0).round() as u8;
+    let lon_hundredths = (lon_hundredths_f as u32).min(99) as u8;
 
     // Minutes encoding: if < 10, add 60.
     let m = if lon_min_int < 10 {
@@ -1041,12 +1329,340 @@ pub fn build_aprs_mice_with_message_packet(
     info.push(symbol_table as u8);
     info.extend_from_slice(comment.as_bytes());
 
+    // The 6 destination bytes were assembled above from `b'0' + digit`
+    // (ranges 0x30..=0x39) and `b'P' + digit` (ranges 0x50..=0x59), so
+    // every byte is in the AX.25 v2.2 §3.12.2 callsign-character set
+    // (uppercase ASCII alphanumeric). `Callsign::new` therefore cannot
+    // fail; the `unreachable!` guards the invariant explicitly rather
+    // than silently substituting a wrong destination — which would
+    // corrupt the Mic-E latitude carried in the address slot.
+    let dest_callsign_typed = Callsign::new(dest_callsign).unwrap_or_else(|err| {
+        unreachable!("Mic-E destination digits violated their construction invariant: {err}")
+    });
+    let destination = Ax25Address::from_parts(dest_callsign_typed, Ssid::ZERO);
+    ax25_ui_frame(source.clone(), destination, path.to_vec(), info)
+}
+
+// ---------------------------------------------------------------------------
+// APRS telemetry builders (APRS 1.0.1 §13 pp.68-70)
+// ---------------------------------------------------------------------------
+
+/// Maximum sequence number for an APRS telemetry frame (§13 p.68: "the
+/// data sequence number may be in the range 000 to 999").
+const APRS_TELEMETRY_MAX_SEQUENCE: u16 = 999;
+
+/// Maximum analog value per APRS 1.2 expansion (§13 p.68 + addendum:
+/// "the analog values may be in the range 000 to 999"). The 1.0.1 base
+/// spec uses 000-255 but addendum 1.2 widens this to 000-999; the
+/// parser at [`crate::parse_aprs_telemetry`] already accepts the
+/// expanded range so the builder matches.
+const APRS_TELEMETRY_MAX_ANALOG: u16 = 999;
+
+/// Maximum analog-channel label length per APRS 1.0.1 §13 p.69 (field
+/// widths A1=7, A2=7, A3=6, A4=6, A5=5 — the longest is 7). The
+/// builder uses 7 as the conservative cap for all analog labels.
+const APRS_TELEMETRY_MAX_ANALOG_LABEL: usize = 7;
+
+/// Maximum digital-channel label length per APRS 1.0.1 §13 p.69 (B1=6,
+/// B2=5, B3=4, B4=4, B5=4, B6=3, B7=3, B8=3 — the longest is 6).
+const APRS_TELEMETRY_MAX_DIGITAL_LABEL: usize = 6;
+
+/// Build a KISS-encoded APRS telemetry frame.
+///
+/// Composes an AX.25 UI frame with the APRS telemetry format from
+/// §13 p.68:
+///
+/// ```text
+/// T#NNN,aaa,aaa,aaa,aaa,aaa,bbbbbbbb
+/// ```
+///
+/// where `NNN` is the sequence number (000-999 or the literal `MIC`
+/// for the spec's "Manual Input Command" sentinel), `aaa` is each
+/// analog channel value (000-999 per addendum 1.2; base spec
+/// 000-255), and `bbbbbbbb` is the digital field (exactly 8 ASCII
+/// `0`/`1` characters).
+///
+/// `sequence` is clamped to `0..=999`. `analogs` provides up to five
+/// channel values; values are clamped to `0..=999`. `digital` is the
+/// 8-bit binary status word; only the low 8 bits are formatted.
+///
+/// Returns wire-ready bytes (FEND-delimited KISS frame). The parser
+/// counterpart is [`crate::parse_aprs_telemetry`].
+///
+/// # Parameters
+///
+/// - `source`: The sender's callsign and SSID.
+/// - `sequence`: Sequence number `0..=999`.
+/// - `analogs`: Up to five analog channel values; missing channels
+///   become `000` on the wire.
+/// - `digital`: 8-bit digital status word.
+/// - `path`: Digipeater path.
+#[must_use]
+pub fn build_aprs_telemetry(
+    source: &Ax25Address,
+    sequence: u16,
+    analogs: [u16; 5],
+    digital: u8,
+    path: &[RouteEntry],
+) -> Vec<u8> {
+    ax25_to_kiss_wire(&build_aprs_telemetry_packet(
+        source, sequence, analogs, digital, path,
+    ))
+}
+
+/// Like [`build_aprs_telemetry`] but returns the unencoded
+/// [`Ax25Packet`].
+#[must_use]
+pub fn build_aprs_telemetry_packet(
+    source: &Ax25Address,
+    sequence: u16,
+    analogs: [u16; 5],
+    digital: u8,
+    path: &[RouteEntry],
+) -> Ax25Packet {
+    let seq = sequence.min(APRS_TELEMETRY_MAX_SEQUENCE);
+    let a = analogs.map(|v| v.min(APRS_TELEMETRY_MAX_ANALOG));
+    // §13 p.68: digital is exactly 8 bits, MSB first.
+    let info = format!(
+        "T#{seq:03},{:03},{:03},{:03},{:03},{:03},{:08b}",
+        a[0], a[1], a[2], a[3], a[4], digital,
+    );
     ax25_ui_frame(
         source.clone(),
-        Ax25Address::new(dest_callsign, 0),
+        aprs_tocall(),
         path.to_vec(),
-        info,
+        info.into_bytes(),
     )
+}
+
+/// Build a KISS-encoded APRS telemetry **parameter-name** definition
+/// message (`:DEST    :PARM.A1,A2,A3,A4,A5,B1,B2,B3,B4,B5,B6,B7,B8`).
+///
+/// Per APRS 1.0.1 §13 p.69, parameter-name definitions are sent as
+/// regular APRS messages addressed to the originator's *own* callsign
+/// (so other stations infer ownership from the source field). The
+/// helper accepts a separate `addressee` to make this explicit; pass
+/// the source callsign for the canonical form. Each label is
+/// truncated to its spec-mandated max length per channel position.
+///
+/// `analog_labels` carries up to 5 entries (A1..A5); `digital_labels`
+/// up to 8 (B1..B8). Missing entries become empty fields on the wire.
+///
+/// # Parameters
+///
+/// - `source`: The sender's callsign and SSID.
+/// - `addressee`: 1..=9 char callsign the message is addressed to
+///   (typically equal to the source callsign).
+/// - `analog_labels`: Up to 5 channel labels.
+/// - `digital_labels`: Up to 8 channel labels.
+/// - `path`: Digipeater path.
+#[must_use]
+pub fn build_aprs_telemetry_parm(
+    source: &Ax25Address,
+    addressee: &str,
+    analog_labels: &[&str],
+    digital_labels: &[&str],
+    path: &[RouteEntry],
+) -> Vec<u8> {
+    ax25_to_kiss_wire(&build_aprs_telemetry_parm_packet(
+        source,
+        addressee,
+        analog_labels,
+        digital_labels,
+        path,
+    ))
+}
+
+/// Like [`build_aprs_telemetry_parm`] but returns the unencoded
+/// [`Ax25Packet`].
+#[must_use]
+pub fn build_aprs_telemetry_parm_packet(
+    source: &Ax25Address,
+    addressee: &str,
+    analog_labels: &[&str],
+    digital_labels: &[&str],
+    path: &[RouteEntry],
+) -> Ax25Packet {
+    let body = format_telemetry_definition_body(
+        "PARM.",
+        analog_labels,
+        digital_labels,
+        APRS_TELEMETRY_MAX_ANALOG_LABEL,
+        APRS_TELEMETRY_MAX_DIGITAL_LABEL,
+    );
+    build_aprs_message_packet(source, addressee, &body, None, path)
+}
+
+/// Build a KISS-encoded APRS telemetry **unit-label** definition message
+/// (`:DEST    :UNIT.unit1,unit2,…`). See [`build_aprs_telemetry_parm`].
+#[must_use]
+pub fn build_aprs_telemetry_unit(
+    source: &Ax25Address,
+    addressee: &str,
+    analog_units: &[&str],
+    digital_units: &[&str],
+    path: &[RouteEntry],
+) -> Vec<u8> {
+    ax25_to_kiss_wire(&build_aprs_telemetry_unit_packet(
+        source,
+        addressee,
+        analog_units,
+        digital_units,
+        path,
+    ))
+}
+
+/// Like [`build_aprs_telemetry_unit`] but returns the unencoded
+/// [`Ax25Packet`].
+#[must_use]
+pub fn build_aprs_telemetry_unit_packet(
+    source: &Ax25Address,
+    addressee: &str,
+    analog_units: &[&str],
+    digital_units: &[&str],
+    path: &[RouteEntry],
+) -> Ax25Packet {
+    let body = format_telemetry_definition_body(
+        "UNIT.",
+        analog_units,
+        digital_units,
+        APRS_TELEMETRY_MAX_ANALOG_LABEL,
+        APRS_TELEMETRY_MAX_DIGITAL_LABEL,
+    );
+    build_aprs_message_packet(source, addressee, &body, None, path)
+}
+
+/// Build a KISS-encoded APRS telemetry **equation-coefficients**
+/// definition message
+/// (`:DEST    :EQNS.a1,b1,c1,a2,b2,c2,a3,b3,c3,a4,b4,c4,a5,b5,c5`).
+///
+/// `equations` provides up to 5 `(a, b, c)` tuples for the linear
+/// equation `y = a·v² + b·v + c` applied to each analog channel.
+/// `None` slots emit empty fields on the wire.
+#[must_use]
+pub fn build_aprs_telemetry_eqns(
+    source: &Ax25Address,
+    addressee: &str,
+    equations: [Option<(f64, f64, f64)>; 5],
+    path: &[RouteEntry],
+) -> Vec<u8> {
+    ax25_to_kiss_wire(&build_aprs_telemetry_eqns_packet(
+        source, addressee, equations, path,
+    ))
+}
+
+/// Like [`build_aprs_telemetry_eqns`] but returns the unencoded
+/// [`Ax25Packet`].
+#[must_use]
+pub fn build_aprs_telemetry_eqns_packet(
+    source: &Ax25Address,
+    addressee: &str,
+    equations: [Option<(f64, f64, f64)>; 5],
+    path: &[RouteEntry],
+) -> Ax25Packet {
+    // Flatten the 5 (a, b, c) tuples to 15 individual coefficients,
+    // formatting each one. Missing slots emit `0,0,0`.
+    let mut coeffs: Vec<f64> = Vec::with_capacity(15);
+    for slot in equations {
+        let abc = slot.unwrap_or((0.0, 0.0, 0.0));
+        coeffs.push(abc.0);
+        coeffs.push(abc.1);
+        coeffs.push(abc.2);
+    }
+    let formatted: Vec<String> = coeffs.iter().copied().map(format_telemetry_float).collect();
+    let parts: Vec<String> = vec!["EQNS.".to_owned(), formatted.join(",")];
+    let body: String = parts.concat();
+    build_aprs_message_packet(source, addressee, &body, None, path)
+}
+
+/// Build a KISS-encoded APRS telemetry **bit-sense + project-name**
+/// definition message (`:DEST    :BITS.11111111,Project name`).
+///
+/// `bit_sense` is the 8-bit polarity word — each bit indicates whether
+/// the corresponding digital channel is normally `1` (set bit) or `0`
+/// (clear bit). `project` is a free-form ≤23-byte title per §13 p.70.
+#[must_use]
+pub fn build_aprs_telemetry_bits(
+    source: &Ax25Address,
+    addressee: &str,
+    bit_sense: u8,
+    project: &str,
+    path: &[RouteEntry],
+) -> Vec<u8> {
+    ax25_to_kiss_wire(&build_aprs_telemetry_bits_packet(
+        source, addressee, bit_sense, project, path,
+    ))
+}
+
+/// Like [`build_aprs_telemetry_bits`] but returns the unencoded
+/// [`Ax25Packet`].
+#[must_use]
+pub fn build_aprs_telemetry_bits_packet(
+    source: &Ax25Address,
+    addressee: &str,
+    bit_sense: u8,
+    project: &str,
+    path: &[RouteEntry],
+) -> Ax25Packet {
+    let body = format!("BITS.{bit_sense:08b},{project}");
+    build_aprs_message_packet(source, addressee, &body, None, path)
+}
+
+/// Format a single coefficient for the EQNS message body. APRS 1.0.1
+/// §13 p.70 doesn't mandate a specific float format; we emit the
+/// shortest round-trip-faithful representation (`{:?}`) trimmed of
+/// trailing zeros after the decimal point.
+fn format_telemetry_float(v: f64) -> String {
+    // `{:?}` produces e.g. "0.5", "3.0", "1.23e10". For the common
+    // case of small integer-valued coefficients we want "0" rather
+    // than "0.0" to match the spec's example syntax.
+    if v.fract() == 0.0 && v.is_finite() && v.abs() < 1e15 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "v.fract() == 0 and abs < 1e15 implies v fits an i64 exactly"
+        )]
+        let i = v as i64;
+        return i.to_string();
+    }
+    format!("{v}")
+}
+
+/// Compose a `KIND.f1,f2,…,fN` definition body where the first 5
+/// fields are analog labels and the next 8 are digital labels, each
+/// truncated to its spec maximum.
+fn format_telemetry_definition_body(
+    kind: &str,
+    analog_labels: &[&str],
+    digital_labels: &[&str],
+    analog_max: usize,
+    digital_max: usize,
+) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(13);
+    for i in 0..5 {
+        let label = analog_labels.get(i).copied().unwrap_or("");
+        parts.push(truncate_at_char_boundary(label, analog_max));
+    }
+    for i in 0..8 {
+        let label = digital_labels.get(i).copied().unwrap_or("");
+        parts.push(truncate_at_char_boundary(label, digital_max));
+    }
+    let joined: String = parts.join(",");
+    format!("{kind}{joined}")
+}
+
+/// Truncate `s` to `max_bytes` while staying on a UTF-8 character
+/// boundary. APRS telemetry labels are spec-restricted to printable
+/// ASCII so this is normally a no-op, but the boundary check guards
+/// against mid-codepoint truncation if a caller passes non-ASCII text.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.get(..end).unwrap_or("").to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,7 +1682,7 @@ pub fn build_query_response_position(
     symbol_table: char,
     symbol_code: char,
     comment: &str,
-    path: &[Ax25Address],
+    path: &[RouteEntry],
 ) -> Vec<u8> {
     // A query response is just a normal position report.
     build_aprs_position_report(source, lat, lon, symbol_table, symbol_code, comment, path)
@@ -1093,11 +1709,17 @@ mod tests {
 
     fn test_source() -> Ax25Address {
         Ax25Address::new("N0CALL", 7)
+            .unwrap_or_else(|_| unreachable!("N0CALL-7 is statically valid"))
     }
 
     /// Default APRS digipeater path: WIDE1-1, WIDE2-1.
-    fn default_digipeater_path() -> Vec<Ax25Address> {
-        vec![Ax25Address::new("WIDE1", 1), Ax25Address::new("WIDE2", 1)]
+    fn default_digipeater_path() -> Vec<RouteEntry> {
+        vec![
+            RouteEntry::new("WIDE1", 1)
+                .unwrap_or_else(|_| unreachable!("WIDE1-1 is statically valid")),
+            RouteEntry::new("WIDE2", 1)
+                .unwrap_or_else(|_| unreachable!("WIDE2-1 is statically valid")),
+        ]
     }
 
     // ---- format_aprs_latitude / format_aprs_longitude ----
@@ -1161,10 +1783,10 @@ mod tests {
         assert_eq!(packet.digipeaters.len(), 2);
         let digi0 = packet.digipeaters.first().ok_or("digipeater 0 missing")?;
         let digi1 = packet.digipeaters.get(1).ok_or("digipeater 1 missing")?;
-        assert_eq!(digi0.callsign, "WIDE1");
-        assert_eq!(digi0.ssid, 1);
-        assert_eq!(digi1.callsign, "WIDE2");
-        assert_eq!(digi1.ssid, 1);
+        assert_eq!(digi0.address.callsign, "WIDE1");
+        assert_eq!(digi0.address.ssid, 1);
+        assert_eq!(digi1.address.callsign, "WIDE2");
+        assert_eq!(digi1.address.ssid, 1);
         assert_eq!(packet.control, 0x03);
         assert_eq!(packet.protocol, 0xF0);
 
@@ -1629,6 +2251,197 @@ mod tests {
         assert_eq!(encoded, [b'!', b'!', b'!', b'!']);
     }
 
+    #[test]
+    fn build_compressed_position_clamps_out_of_range() -> TestResult {
+        // Regression guard for CB-3: out-of-range coordinates must clamp
+        // rather than wrap. Pre-fix, a latitude of 200° would compute
+        // 380_926 × (90 - 200) = -41_901_860 which `as u32` reinterprets
+        // to ~4.25 billion — silently producing a "valid" but absurd
+        // wire encoding. Post-fix the input clamps to 90.0 first.
+        let source = test_source();
+        let wire = build_aprs_position_compressed(
+            &source,
+            200.0,  // out of range high
+            -300.0, // out of range low
+            '/',
+            '>',
+            "clamped",
+            &default_digipeater_path(),
+        );
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+        let data = parse_aprs_data(&packet.info)?;
+        let AprsData::Position(pos) = data else {
+            return Err(format!("expected Position, got {data:?}").into());
+        };
+        // 200 → clamped to 90; 380_926 × 0 → lat_val 0 → decodes to 90.
+        assert!(
+            (pos.latitude - 90.0).abs() < 0.01,
+            "out-of-range lat should clamp to 90; got {}",
+            pos.latitude,
+        );
+        // -300 → clamped to -180; 190_463 × 0 → lon_val 0 → decodes to -180.
+        assert!(
+            (pos.longitude - (-180.0)).abs() < 0.01,
+            "out-of-range lon should clamp to -180; got {}",
+            pos.longitude,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_compressed_position_handles_nan() -> TestResult {
+        // NaN / ±∞ inputs must fall through to 0.0 (the geographic
+        // centre on each axis) rather than producing garbage bytes via
+        // `as u32` saturation.
+        let source = test_source();
+        let cases: &[(f64, f64, &str)] = &[
+            (f64::NAN, 12.0, "nan-lat"),
+            (45.0, f64::NAN, "nan-lon"),
+            (f64::INFINITY, 0.0, "inf-lat"),
+            (0.0, f64::NEG_INFINITY, "neg-inf-lon"),
+        ];
+        for (lat_in, lon_in, label) in cases {
+            let wire = build_aprs_position_compressed(
+                &source,
+                *lat_in,
+                *lon_in,
+                '/',
+                '>',
+                label,
+                &default_digipeater_path(),
+            );
+            let kiss = decode_kiss_frame(&wire)?;
+            let packet = parse_ax25(&kiss.data)?;
+            let data = parse_aprs_data(&packet.info)?;
+            let AprsData::Position(_) = data else {
+                return Err(format!("{label}: expected Position, got {data:?}").into());
+            };
+        }
+        Ok(())
+    }
+
+    // ---- build_aprs_telemetry (D-1) ----
+
+    #[test]
+    fn build_telemetry_frame_round_trip() -> TestResult {
+        // Builder ↔ parser symmetry: a T#NNN frame written by the
+        // builder must decode back to the same channel values via
+        // the existing `parse_aprs_telemetry` parser.
+        let source = test_source();
+        let wire = build_aprs_telemetry(
+            &source,
+            42,
+            [100, 200, 300, 400, 500],
+            0b1010_1100,
+            &default_digipeater_path(),
+        );
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+        let data = parse_aprs_data(&packet.info)?;
+        let AprsData::Telemetry(t) = data else {
+            return Err(format!("expected Telemetry, got {data:?}").into());
+        };
+        assert_eq!(t.sequence, "042");
+        assert_eq!(
+            t.analog,
+            [Some(100), Some(200), Some(300), Some(400), Some(500)]
+        );
+        assert_eq!(t.digital, 0b1010_1100);
+        Ok(())
+    }
+
+    #[test]
+    fn build_telemetry_clamps_sequence_and_analogs() -> TestResult {
+        // Sequence > 999 must clamp to 999; analog > 999 must clamp.
+        // Tests the spec-mandated range enforcement on encode.
+        let source = test_source();
+        let wire = build_aprs_telemetry(
+            &source,
+            12_345,
+            [9_999, 9_999, 9_999, 9_999, 9_999],
+            0xFF,
+            &default_digipeater_path(),
+        );
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+        let info = std::str::from_utf8(&packet.info)?;
+        assert!(
+            info.starts_with("T#999,999,999,999,999,999,11111111"),
+            "out-of-range inputs must clamp to spec maxima: {info}",
+        );
+        Ok(())
+    }
+
+    // ---- build_aprs_telemetry_parm / unit / eqns / bits (D-2) ----
+
+    #[test]
+    fn build_telemetry_parm_emits_canonical_form() -> TestResult {
+        let source = test_source();
+        let wire = build_aprs_telemetry_parm(
+            &source,
+            "N0CALL-7",
+            &["Vbatt", "Temp", "RSSI"],
+            &["Door", "PIR"],
+            &default_digipeater_path(),
+        );
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+        let data = parse_aprs_data(&packet.info)?;
+        let AprsData::Message(msg) = data else {
+            return Err(format!("expected Message, got {data:?}").into());
+        };
+        // Spec form: PARM.A1,A2,A3,A4,A5,B1,B2,B3,B4,B5,B6,B7,B8
+        // Trailing slots are empty (caller provided only 3 analog + 2 digital).
+        assert_eq!(msg.text, "PARM.Vbatt,Temp,RSSI,,,Door,PIR,,,,,,");
+        Ok(())
+    }
+
+    #[test]
+    fn build_telemetry_eqns_emits_coefficients() -> TestResult {
+        let source = test_source();
+        let wire = build_aprs_telemetry_eqns(
+            &source,
+            "N0CALL-7",
+            [
+                Some((0.0, 0.1, 0.0)),
+                Some((0.0, 0.5, 0.0)),
+                None,
+                None,
+                None,
+            ],
+            &default_digipeater_path(),
+        );
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+        let data = parse_aprs_data(&packet.info)?;
+        let AprsData::Message(msg) = data else {
+            return Err(format!("expected Message, got {data:?}").into());
+        };
+        assert_eq!(msg.text, "EQNS.0,0.1,0,0,0.5,0,0,0,0,0,0,0,0,0,0");
+        Ok(())
+    }
+
+    #[test]
+    fn build_telemetry_bits_emits_canonical_form() -> TestResult {
+        let source = test_source();
+        let wire = build_aprs_telemetry_bits(
+            &source,
+            "N0CALL-7",
+            0b1010_1100,
+            "Weather station",
+            &default_digipeater_path(),
+        );
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+        let data = parse_aprs_data(&packet.info)?;
+        let AprsData::Message(msg) = data else {
+            return Err(format!("expected Message, got {data:?}").into());
+        };
+        assert_eq!(msg.text, "BITS.10101100,Weather station");
+        Ok(())
+    }
+
     // ---- build_aprs_status ----
 
     #[test]
@@ -1815,6 +2628,152 @@ mod tests {
         assert_eq!(pos.speed_knots, Some(0));
         // Course 0 = unknown → None in the decoder.
         assert_eq!(pos.course_degrees, None);
+        Ok(())
+    }
+
+    #[test]
+    fn build_mice_lon_0_to_9_sets_offset_and_high_column() -> TestResult {
+        // Regression guard for CB-B-3 (APRS 1.0.1 §10 p.47): a longitude
+        // in 0..10° must (a) set the offset bit on destination char 4,
+        // and (b) emit an info-field d-byte in the high column 118-127
+        // (`v` through `DEL`). Pre-fix the builder emitted bytes 28-37
+        // and left the offset bit clear — outside the spec table.
+        let source = test_source();
+        // London-area longitude 0.1°W: lon_abs = 0.1, lon_deg_raw = 0,
+        // expected d = 0 + 90 = 90, expected info[1] = 90 + 28 = 118 (`v`).
+        let wire = build_aprs_mice(
+            &source,
+            51.5,
+            -0.1,
+            0,
+            0,
+            '/',
+            '-',
+            "",
+            &default_digipeater_path(),
+        );
+
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+
+        // info[1] is the lon-degrees d-byte. Must sit in 118..=127 for
+        // a 0..10° longitude.
+        let d_byte = *packet.info.get(1).ok_or("info[1] missing")?;
+        assert!(
+            (118..=127).contains(&d_byte),
+            "lon d-byte {d_byte} outside spec column 118..=127 for 0-9°",
+        );
+
+        // Destination char 4 carries the lon-offset flag. For a
+        // 0..10° longitude the offset bit must be set, so the char
+        // must be in `P..=Y`.
+        let dest_str = packet.destination.callsign.as_str();
+        let char_4 = dest_str
+            .as_bytes()
+            .get(4)
+            .copied()
+            .ok_or("dest[4] missing")?;
+        assert!(
+            (b'P'..=b'Y').contains(&char_4),
+            "dest char 4 {} not P-Y; lon-offset bit not set for 0-9°",
+            char_4 as char,
+        );
+
+        // Round-trip the decode to confirm the parser recovers 0.1°W.
+        let pos = parse_mice_position(&packet.destination.callsign, &packet.info)?;
+        assert!(
+            (pos.longitude - (-0.1)).abs() < 0.02,
+            "decoded lon={} should be within 0.02° of -0.1",
+            pos.longitude,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_mice_handles_non_finite_inputs() -> TestResult {
+        // Regression guard for CB-C-1: Mic-E builder must reject NaN/inf
+        // via the shared `sanitize_coord` helper rather than silently
+        // saturating to 0 through `as u32`. Equivalent to the
+        // compressed-position guard added in CB-3.
+        let source = test_source();
+        let path = default_digipeater_path();
+        let cases: &[(f64, f64, &str)] = &[
+            (f64::NAN, 12.0, "nan-lat"),
+            (45.0, f64::NAN, "nan-lon"),
+            (f64::INFINITY, 0.0, "inf-lat"),
+            (0.0, f64::NEG_INFINITY, "neg-inf-lon"),
+        ];
+        for (lat_in, lon_in, label) in cases {
+            // Build must not panic and must produce a valid Mic-E frame.
+            let wire = build_aprs_mice(&source, *lat_in, *lon_in, 0, 0, '/', '>', label, &path);
+            let kiss = decode_kiss_frame(&wire)?;
+            let packet = parse_ax25(&kiss.data)?;
+            // Every Mic-E byte (info[1..7]) must be in the spec range
+            // 28..=127 regardless of the bad input.
+            for (idx, byte) in packet
+                .info
+                .get(1..7)
+                .ok_or("info too short")?
+                .iter()
+                .enumerate()
+            {
+                assert!(
+                    (28..=127).contains(byte),
+                    "{label}: info[{}] = {byte} outside Mic-E range 28..=127",
+                    idx + 1,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn build_mice_lon_hundredths_boundary_clamped() -> TestResult {
+        // Regression guard for CB-2: a longitude whose minutes-fraction
+        // rounds to 100 hundredths must not produce a wire byte outside
+        // the spec-mandated Mic-E range of 28..=127 (APRS 1.0.1 §10.3.3).
+        //
+        // For lon = -97.999_983_3°:
+        //   lon_abs       = 97.999_983_3
+        //   lon_deg       = 97
+        //   lon_min_f     = 59.998_998   (= 0.999_983_3 × 60)
+        //   lon_min_int   = 59
+        //   hundredths_f  = round(99.899_8) = 100  ← triggers the clamp
+        //
+        // Pre-fix this would emit 100 + 28 = 128 (illegal). Post-fix
+        // it emits 99 + 28 = 127 ('DEL'), which is valid spec-side.
+        let source = test_source();
+        let wire = build_aprs_mice(
+            &source,
+            35.0,
+            -97.999_983_3,
+            0,
+            0,
+            '/',
+            '>',
+            "",
+            &default_digipeater_path(),
+        );
+
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+
+        // info[3] is the longitude-hundredths byte. Verify it sits in
+        // the valid Mic-E receivable range.
+        let hundredths_byte = *packet.info.get(3).ok_or("info[3] missing")?;
+        assert!(
+            (28..=127).contains(&hundredths_byte),
+            "lon_hundredths byte {hundredths_byte} outside spec range 28..=127",
+        );
+
+        // The decoded longitude should still be within ~0.001° of the
+        // input (we lose at most one hundredth of a minute ≈ 18 m).
+        let pos = parse_mice_position(&packet.destination.callsign, &packet.info)?;
+        assert!(
+            (pos.longitude - (-97.999_983_3)).abs() < 0.001,
+            "decoded lon={} should be within 0.001° of input",
+            pos.longitude,
+        );
         Ok(())
     }
 

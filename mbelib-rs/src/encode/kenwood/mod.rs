@@ -71,6 +71,7 @@
               the canonical dump produced by scripts/15_gen_rust_tables.py."
 )]
 
+pub mod anchors;
 pub mod biquads;
 pub(crate) mod filter;
 pub mod inline_codebooks;

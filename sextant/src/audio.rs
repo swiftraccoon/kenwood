@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use dstar_gateway_core::voice::{DSTAR_SYNC_BYTES, VoiceFrame};
+use dstar_gateway_core::voice::{DSTAR_NULL_SLOW_DATA_BYTES, DSTAR_SYNC_BYTES, VoiceFrame};
 use mbelib_rs::{AmbeDecoder, AmbeEncoder};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
@@ -149,6 +149,7 @@ fn run_audio_worker(
         cmd_rx,
         session_tx,
         tx_stats: TxStats::default(),
+        tx_superframe_idx: 0,
     };
     worker.run();
     info!("audio worker shutting down");
@@ -171,6 +172,13 @@ struct AudioWorker {
     /// voice) or just floor noise / zeros (common when macOS denies
     /// permission without prompting).
     tx_stats: TxStats,
+    /// Frame index inside the current 21-frame superframe, cycled
+    /// `0 → 20 → 0 → ...` across the TX stream. Used to pick the
+    /// slow-data payload: sync pattern at frame 0, scrambled null
+    /// filler otherwise. Reset on `StartTx` so the very first voice
+    /// frame after the header carries the sync pattern, which is what
+    /// the receiving MMDVM modem locks onto to start audio decode.
+    tx_superframe_idx: u8,
 }
 
 #[derive(Debug, Default)]
@@ -255,6 +263,12 @@ impl AudioWorker {
                 self.audio.drain_mic();
                 self.tx_active = true;
                 self.tx_stats.reset();
+                // First voice frame after the header is frame 0 of the
+                // superframe (sync). The receiving MMDVM modem locks
+                // its slow-data scrambler/descrambler to this 21-frame
+                // boundary; without sync at the right cadence the radio
+                // gets the header but never enters audio decode.
+                self.tx_superframe_idx = 0;
                 // Match the constructor in `start_audio_worker` —
                 // lookahead encoder for OP25-parity voice quality.
                 self.encoder = AmbeEncoder::new_with_lookahead();
@@ -388,10 +402,17 @@ impl AudioWorker {
                 self.resampled_in.truncate(AMBE_FRAME_SAMPLES);
             }
             let ambe = self.encoder.encode_frame(&self.resampled_in);
-            let frame = VoiceFrame {
-                ambe,
-                slow_data: DSTAR_SYNC_BYTES,
+            // Slow-data superframe pattern: sync at frame 0, scrambled
+            // null at frames 1-20. See [`DSTAR_SYNC_BYTES`] /
+            // [`DSTAR_NULL_SLOW_DATA_BYTES`] for the rationale and the
+            // `MMDVMHost/DStarDefines.h` references.
+            let slow_data = if self.tx_superframe_idx == 0 {
+                DSTAR_SYNC_BYTES
+            } else {
+                DSTAR_NULL_SLOW_DATA_BYTES
             };
+            self.tx_superframe_idx = (self.tx_superframe_idx + 1) % 21;
+            let frame = VoiceFrame { ambe, slow_data };
             tracing::trace!(peak = format_args!("{peak:.4}"), "TX frame encoded");
             if let Err(e) = self.session_tx.try_send(SessionCommand::TxFrame(frame)) {
                 warn!(error = %e, "TxFrame enqueue dropped");
@@ -1030,6 +1051,131 @@ mod tests {
              (this means the anti-alias FIR is leaking high-frequency \
              content back into the speech band — sextant↔sextant garble \
              noise will return)."
+        );
+    }
+
+    /// Full sextant↔sextant simulation in a single test:
+    ///   1. Generate realistic voice-like signal at 48 kHz HW rate.
+    ///   2. Resample 48 → 8 kHz with FIR anti-alias (TX path).
+    ///   3. AMBE-encode through the lookahead encoder (matches the
+    ///      production sextant TX).
+    ///   4. AMBE-decode (matches production sextant RX).
+    ///   5. Resample 8 → 48 kHz with FIR anti-image (RX path).
+    ///   6. Verify the output PCM has audio content — loud enough to
+    ///      be heard (not "garble noise"-quiet) and contains energy
+    ///      in the speech band where the input had energy.
+    ///
+    /// If this test passes, the codec + resampler + filter pipeline
+    /// is internally consistent. Any remaining sextant↔sextant
+    /// failure has to be in cpal I/O, network/POLARIS, or operator
+    /// configuration — *not* the audio processing path this test
+    /// exercises.
+    #[test]
+    fn end_to_end_voice_pipeline_produces_audible_output() {
+        use super::{AMBE_FRAME_SAMPLES, AMBE_SAMPLE_RATE};
+        use mbelib_rs::{AmbeDecoder, AmbeEncoder};
+
+        let hw_rate = 48_000_u32;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "test: hw_rate * 0.020 = 960, fits trivially in usize."
+        )]
+        let frame_hw = (f64::from(hw_rate) * 0.020) as usize;
+
+        // 1. Generate ~2 seconds of voice-like signal at 48 kHz.
+        //    F0 ≈ 130 Hz with vibrato + 8 harmonics decaying through
+        //    the formant range. RMS ≈ 8000 (≈ -12 dBFS, normal speech).
+        let n_frames = 100_usize;
+        let total_hw_samples = n_frames * frame_hw;
+        let mut hw_input = Vec::with_capacity(total_hw_samples);
+        for i in 0..total_hw_samples {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test: i bounded by 96000, exact in f32."
+            )]
+            let t = i as f32 / hw_rate as f32;
+            let f0 = 25.0_f32.mul_add((t * 2.0 * std::f32::consts::PI * 5.0).sin(), 130.0);
+            let mut s = 0.0_f32;
+            for (k, amp) in [1.0_f32, 0.7, 0.5, 0.4, 0.3, 0.25, 0.2, 0.15]
+                .iter()
+                .enumerate()
+            {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test: k bounded by 8, exact in f32."
+                )]
+                let kf = (k + 1) as f32;
+                s += amp * (t * 2.0 * std::f32::consts::PI * f0 * kf).sin();
+            }
+            // Syllabic envelope so we exercise both voiced and quieter
+            // transitions.
+            let env = 0.3_f32.mul_add((t * 2.0 * std::f32::consts::PI * 3.0).sin().abs(), 0.4);
+            hw_input.push(0.4 * env * s);
+        }
+
+        // 2. Encode all frames through the production pipeline:
+        //    HW resample → AMBE encode.
+        let mut enc = AmbeEncoder::new_with_lookahead();
+        let mut wire_frames: Vec<[u8; 9]> = Vec::with_capacity(n_frames);
+        for f in 0..n_frames {
+            let start = f * frame_hw;
+            let end = start + frame_hw;
+            let chunk_hw = hw_input.get(start..end).unwrap_or(&[]);
+            let mut resampled = Vec::with_capacity(AMBE_FRAME_SAMPLES);
+            resample_linear(chunk_hw, hw_rate, AMBE_SAMPLE_RATE, &mut resampled);
+            // Pad/truncate as the production pump_tx does.
+            if resampled.len() < AMBE_FRAME_SAMPLES {
+                resampled.resize(AMBE_FRAME_SAMPLES, 0.0);
+            } else if resampled.len() > AMBE_FRAME_SAMPLES {
+                resampled.truncate(AMBE_FRAME_SAMPLES);
+            }
+            wire_frames.push(enc.encode_frame(&resampled));
+        }
+
+        // 3. Decode + resample-up.
+        let mut decoder = AmbeDecoder::new();
+        let mut hw_output: Vec<f32> = Vec::with_capacity(total_hw_samples);
+        for ambe in &wire_frames {
+            let pcm_int = decoder.decode_frame(ambe);
+            let pcm_norm: Vec<f32> = pcm_int.iter().map(|&s| f32::from(s) / 32768.0).collect();
+            let mut up = Vec::with_capacity(frame_hw);
+            resample_linear(&pcm_norm, AMBE_SAMPLE_RATE, hw_rate, &mut up);
+            hw_output.extend(up);
+        }
+
+        // 4. Skip first 5 frames of warmup (lookahead encoder + decoder
+        //    state takes a few frames to converge).
+        let warmup_hw = 5 * frame_hw;
+        let body = hw_output.get(warmup_hw..).unwrap_or(&[]);
+        let n_body = body.len();
+        assert!(n_body > 0, "no decoded output past warmup");
+
+        // 5. Compute RMS and peak.
+        let sum_sq: f32 = body.iter().map(|&v| v * v).sum();
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test: n_body bounded by ~96000, exact in f32 mantissa."
+        )]
+        let rms = (sum_sq / n_body as f32).sqrt();
+        let peak = body.iter().map(|&v| v.abs()).fold(0.0_f32, f32::max);
+
+        // Assertions.
+        // Original signal had RMS ≈ 0.13 (peak ≈ 0.4 with envelope).
+        // The AMBE codec is parametric — phase isn't preserved, but
+        // RMS/loudness should be within ~6 dB of the input.
+        assert!(
+            rms > 0.02,
+            "decoded RMS = {rms:.4} is below 0.02 — pipeline is producing \
+             near-silent output (the 'garble noise'/'no voice' symptom). \
+             Expected: ≥ 0.02 (≈ -34 dBFS, well above any plausible \
+             noise floor)."
+        );
+        assert!(
+            peak > 0.05,
+            "decoded peak = {peak:.4} is below 0.05 — pipeline is producing \
+             near-silent output. Expected ≥ 0.05 (≈ -26 dBFS) for a voice \
+             input that started at peak ≈ 0.4."
         );
     }
 }

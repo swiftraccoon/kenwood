@@ -18,7 +18,7 @@
 //!
 //! loop {
 //!     match client.next_event().await? {
-//!         AprsIsEvent::Packet(line) => println!("Got: {line}"),
+//!         AprsIsEvent::Packet(pkt) => println!("Got: {}", pkt.line),
 //!         AprsIsEvent::Comment(line) => println!("Server: {line}"),
 //!         AprsIsEvent::LoggedIn { server } => {
 //!             println!("Authenticated (server {server:?})");
@@ -54,7 +54,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::error::AprsIsError;
-use crate::events::AprsIsEvent;
+use crate::events::{AprsIsEvent, AprsIsPacket};
 use crate::line::{format_is_packet, parse_is_line};
 use crate::login::{AprsIsConfig, build_login_string};
 
@@ -80,6 +80,15 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Default connect timeout for the initial TCP handshake + login.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum APRS-IS line length on the wire, in bytes — **including**
+/// the trailing `\r\n`.
+///
+/// Per <http://www.aprs-is.net/Connecting.aspx>: "No line may exceed
+/// 512 bytes including the CR/LF sequence." Servers silently truncate
+/// lines that exceed this limit; rejecting the send up-front turns the
+/// truncation into a visible error.
+pub const MAX_IS_LINE_BYTES: usize = 512;
 
 /// Keepalive comment text (sent as `# aprs-is keepalive\r\n`).
 const KEEPALIVE_COMMENT: &str = "# aprs-is keepalive";
@@ -118,7 +127,15 @@ pub struct AprsIsClient {
     config: AprsIsConfig,
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
-    line_buf: String,
+    /// Persistent byte buffer for `read_until`. We deliberately read
+    /// bytes (not `String` via `read_line`) so non-UTF-8 sequences in
+    /// APRS info fields (Mic-E, raw weather, Latin-1 comments) do not
+    /// surface as `io::ErrorKind::InvalidData` and tear down the
+    /// long-lived TCP session. The bytes are decoded via
+    /// `String::from_utf8_lossy` at the event boundary; callers that
+    /// need byte-exact fidelity get the raw bytes in
+    /// [`AprsIsPacket::raw`]. See CB-4 in the project history.
+    line_buf: Vec<u8>,
     last_write: Instant,
     logged_in_emitted: bool,
 }
@@ -151,6 +168,17 @@ impl AprsIsClient {
             })?
             .map_err(AprsIsError::Connect)?;
 
+        // Disable Nagle's algorithm per the explicit recommendation at
+        // <http://www.aprs-is.net/Connecting.aspx>: "If your client
+        // software is bidirectional (sends and receives), turn off the
+        // Nagle algorithm when connecting to APRS-IS as it can
+        // introduce significant delays (TCP_NODELAY)." APRS lines are
+        // short and latency-sensitive (ack/rej + IGate forwarding);
+        // leaving Nagle on would batch a single-frame send with the
+        // following keepalive write, adding hundreds of milliseconds
+        // round-trip. See CB-C-7.
+        stream.set_nodelay(true).map_err(AprsIsError::Connect)?;
+
         let (read_half, mut write_half) = stream.into_split();
 
         // Send login string.
@@ -167,7 +195,7 @@ impl AprsIsClient {
             config,
             reader: BufReader::new(read_half),
             writer: write_half,
-            line_buf: String::with_capacity(512),
+            line_buf: Vec::with_capacity(512),
             last_write: Instant::now(),
             logged_in_emitted: false,
         })
@@ -235,6 +263,19 @@ impl AprsIsClient {
     /// This is a blocking read — wrap in a `tokio::select!` with a
     /// keepalive timer if you need concurrency.
     ///
+    /// # Encoding policy
+    ///
+    /// Bytes are read with [`AsyncBufReadExt::read_until`] (not
+    /// `read_line`) so that non-UTF-8 sequences common in APRS info
+    /// fields (Mic-E, raw weather data, Latin-1 comments) do not return
+    /// `io::ErrorKind::InvalidData` and tear down the connection.
+    /// Decoding to a Rust `String` happens via [`String::from_utf8_lossy`];
+    /// any non-UTF-8 byte becomes a U+FFFD replacement character in the
+    /// parsed view. For packet lines the original bytes are preserved
+    /// in [`AprsIsPacket::raw`] so callers needing byte-exact fidelity
+    /// (`IGate` forwarding, packet capture) can recover the wire-truth
+    /// form. See CB-4 in the project history.
+    ///
     /// # Errors
     ///
     /// Returns [`AprsIsError::Read`] on socket errors.
@@ -242,7 +283,7 @@ impl AprsIsClient {
         self.line_buf.clear();
         let bytes = self
             .reader
-            .read_line(&mut self.line_buf)
+            .read_until(b'\n', &mut self.line_buf)
             .await
             .map_err(AprsIsError::Read)?;
 
@@ -251,10 +292,33 @@ impl AprsIsClient {
             return Ok(AprsIsEvent::Disconnected);
         }
 
-        let line = self.line_buf.trim_end_matches(['\r', '\n']);
+        // Strip CRLF / LF / lone CR from the tail. `raw_len` is bounded
+        // by the buffer length by construction (rposition can only
+        // return an in-bounds index), so the `get(..raw_len)` lookup is
+        // guaranteed to return `Some`. We still go through `get` to
+        // satisfy `-D clippy::indexing-slicing` and document the
+        // invariant explicitly.
+        let raw_len = self
+            .line_buf
+            .iter()
+            .rposition(|&b| b != b'\r' && b != b'\n')
+            .map_or(0, |i| i + 1);
+        let raw_bytes = self.line_buf.get(..raw_len).unwrap_or_else(|| {
+            unreachable!("raw_len is bounded by line_buf.len() by construction")
+        });
+
+        // Lossy decode — every non-UTF-8 byte becomes U+FFFD. Used for
+        // line-level parsing (TNC2 monitor format) and the human-
+        // readable view; the raw bytes are kept separately for the
+        // packet event so wire-truth is recoverable downstream.
+        let line_str = String::from_utf8_lossy(raw_bytes);
+        let line: &str = line_str.as_ref();
 
         if let Some(packet) = parse_is_line(line) {
-            return Ok(AprsIsEvent::Packet(packet.to_owned()));
+            return Ok(AprsIsEvent::Packet(AprsIsPacket {
+                raw: raw_bytes.to_vec(),
+                line: packet.to_owned(),
+            }));
         }
 
         // Comment line. Check for login response on first one.
@@ -306,10 +370,27 @@ impl AprsIsClient {
     ///
     /// Use this for custom formatting or to forward packets from RF.
     ///
+    /// # Length limit
+    ///
+    /// Per APRS-IS spec at <http://www.aprs-is.net/Connecting.aspx>,
+    /// "No line may exceed 512 bytes including the CR/LF sequence."
+    /// This method enforces the limit and returns
+    /// [`AprsIsError::LineTooLong`] for over-length input rather than
+    /// letting the server silently truncate the wire bytes. See
+    /// [`MAX_IS_LINE_BYTES`].
+    ///
     /// # Errors
     ///
-    /// Returns [`AprsIsError::Write`] if the write fails.
+    /// Returns [`AprsIsError::LineTooLong`] if `line.len() >
+    /// MAX_IS_LINE_BYTES`, or [`AprsIsError::Write`] if the underlying
+    /// socket write fails.
     pub async fn send_raw_line(&mut self, line: &str) -> Result<(), AprsIsError> {
+        if line.len() > MAX_IS_LINE_BYTES {
+            return Err(AprsIsError::LineTooLong {
+                actual: line.len(),
+                max: MAX_IS_LINE_BYTES,
+            });
+        }
         self.writer
             .write_all(line.as_bytes())
             .await
@@ -458,9 +539,62 @@ mod tests {
 
         let mut client = AprsIsClient::connect(test_config(addr)).await?;
         let event = client.next_event().await?;
+        let AprsIsEvent::Packet(ref pkt) = event else {
+            return Err(format!("expected Packet, got {event:?}").into());
+        };
+        assert_eq!(pkt.line, "N0CALL>APK005:!4903.50N/07201.75W-Test");
+        assert_eq!(pkt.raw, b"N0CALL>APK005:!4903.50N/07201.75W-Test");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_event_survives_non_utf8_in_packet() -> TestResult {
+        // Regression guard for CB-4: pre-fix, BufReader::read_line
+        // returned io::ErrorKind::InvalidData on the first non-UTF-8
+        // byte and disconnected the session. Mic-E and raw weather
+        // packets routinely carry bytes ≥ 0x80, so a strict UTF-8 read
+        // would kill the connection on the first such packet.
+        //
+        // Post-fix the lossy decoder replaces invalid bytes with
+        // U+FFFD in the `line` view, while the original bytes are
+        // preserved in `raw`.
+        let payload: &[u8] = &[
+            b'N', b'0', b'C', b'A', b'L', b'L', b'>', b'A', b'P', b'K', b'0', b'0', b'5', b':',
+            b'`', // Mic-E type byte
+            0xC1, 0x82, 0x91, // bytes that are illegal as a UTF-8 sequence
+            b'\r', b'\n',
+        ];
+        let payload_owned: Vec<u8> = payload.to_vec();
+        let addr = spawn_mock_server(move |mut stream| async move {
+            let mut buf = [0u8; 512];
+            let _ = read_some(&mut stream, &mut buf).await;
+            write_all_ignore(&mut stream, &payload_owned).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        })
+        .await?;
+
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        let event = client.next_event().await?;
+        let AprsIsEvent::Packet(ref pkt) = event else {
+            return Err(format!("expected Packet, got {event:?}").into());
+        };
+        // Raw bytes are byte-identical (minus the CRLF that the reader
+        // strips on every line).
+        let expected_raw = payload
+            .get(..payload.len().saturating_sub(2))
+            .ok_or("payload too short")?;
+        assert_eq!(pkt.raw.as_slice(), expected_raw);
+        // The lossy view contains U+FFFD replacement characters for the
+        // invalid UTF-8 bytes but is otherwise the original ASCII.
         assert!(
-            matches!(event, AprsIsEvent::Packet(ref line) if line == "N0CALL>APK005:!4903.50N/07201.75W-Test"),
-            "expected Packet, got {event:?}"
+            pkt.line.contains('\u{FFFD}'),
+            "expected U+FFFD in lossy view, got {:?}",
+            pkt.line
+        );
+        assert!(
+            pkt.line.starts_with("N0CALL>APK005:`"),
+            "ASCII prefix should survive: {:?}",
+            pkt.line
         );
         Ok(())
     }

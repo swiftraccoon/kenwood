@@ -10,7 +10,7 @@
 //! positions with synthetic values.
 
 use aprs::{AprsData, MessageKind, MiceMessage, parse_aprs_data, parse_aprs_data_full};
-use ax25_codec::{Ax25Packet, build_ax25, parse_ax25};
+use ax25_codec::{Ax25Packet, CommandResponse, RouteEntry, build_ax25, parse_ax25};
 use kenwood_thd75::aprs::ax25_to_kiss_wire;
 use kiss_tnc::{KissFrame, decode_kiss_frame, encode_kiss_frame};
 
@@ -21,10 +21,19 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 /// TNC emits.
 fn make_wire_frame(src: &str, dst: &str, digis: &[&str], info: &[u8]) -> Vec<u8> {
     use ax25_codec::Ax25Address;
+    let source =
+        Ax25Address::new(src, 0).unwrap_or_else(|_| unreachable!("test fixture src is valid"));
+    let destination =
+        Ax25Address::new(dst, 0).unwrap_or_else(|_| unreachable!("test fixture dst is valid"));
+    let digipeaters: Vec<RouteEntry> = digis
+        .iter()
+        .filter_map(|d| RouteEntry::new(d, 0).ok())
+        .collect();
     let packet = Ax25Packet {
-        source: Ax25Address::new(src, 0),
-        destination: Ax25Address::new(dst, 0),
-        digipeaters: digis.iter().map(|d| Ax25Address::new(d, 0)).collect(),
+        source,
+        destination,
+        digipeaters,
+        command_or_response: Some(CommandResponse::Command),
         control: 0x03,
         protocol: 0xF0,
         info: info.to_vec(),
@@ -70,7 +79,8 @@ fn real_capture_mice_emergency() -> TestResult {
     // Actually the simplest: construct via the builder and verify parse.
     use aprs::build_aprs_mice_with_message_packet;
     use ax25_codec::Ax25Address;
-    let source = Ax25Address::new("N0CALL", 7);
+    let source =
+        Ax25Address::new("N0CALL", 7).unwrap_or_else(|_| unreachable!("N0CALL-7 is valid"));
     let packet = build_aprs_mice_with_message_packet(
         &source,
         35.25,

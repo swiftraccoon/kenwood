@@ -357,6 +357,13 @@ pub struct DStarGateway<T: Transport + Unpin + 'static> {
     echo_active: bool,
     /// Per-event poll timeout (configurable via [`Self::set_event_timeout`]).
     event_timeout: Duration,
+    /// Last observed TX state from the modem's status responses. Used
+    /// to emit a `StatusUpdate` event only on rising / falling edges
+    /// — keeps the event channel from being flooded with the modem's
+    /// 4 Hz status stream while still surfacing the moment the radio
+    /// keys (`tx() = true`) or stops transmitting (`tx() = false`).
+    /// `None` until the first status response arrives.
+    last_tx_active: Option<bool>,
 }
 
 impl<T: Transport + Unpin + 'static> std::fmt::Debug for DStarGateway<T> {
@@ -482,6 +489,7 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
             echo_frames: Vec::new(),
             echo_active: false,
             event_timeout: EVENT_POLL_TIMEOUT,
+            last_tx_active: None,
         })
     }
 
@@ -594,10 +602,30 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
                     "MMDVM transport closed",
                 )),
             )),
-            // Everything else is non-fatal noise — status updates,
-            // init-handshake artefacts, debug frames, unhandled
-            // commands, and `#[non_exhaustive]` variants the mmdvm
-            // crate may add in the future.
+            // Status events are 4 Hz noise — but the TX flag inside
+            // them is the single most useful diagnostic for the
+            // network → radio voice path: did the radio actually key
+            // the transmitter after we sent it a header + voice
+            // frames? We swallow the steady stream as before, but
+            // surface a `StatusUpdate` event whenever the TX flag
+            // *changes* state. That keeps the channel from flooding
+            // while still telling the operator (and any UI) the
+            // exact moment the radio enters / leaves TX.
+            Event::Status(status) => {
+                log_noise_event(&Event::Status(status));
+                let tx_now = status.tx();
+                let edge = self.last_tx_active != Some(tx_now);
+                self.last_tx_active = Some(tx_now);
+                if edge {
+                    Ok(Some(DStarEvent::StatusUpdate(status)))
+                } else {
+                    Ok(None)
+                }
+            }
+            // Everything else is non-fatal noise — init-handshake
+            // artefacts, debug frames, unhandled commands, and
+            // `#[non_exhaustive]` variants the mmdvm crate may add
+            // in the future.
             other => {
                 log_noise_event(&other);
                 Ok(None)
