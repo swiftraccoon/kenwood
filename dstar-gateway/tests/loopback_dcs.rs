@@ -5,6 +5,9 @@
 //! voice packet is 100 bytes and embeds the full D-STAR header, so
 //! there is no separate "voice header" packet length on the wire.
 
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
+
 mod common;
 
 use std::sync::Arc;

@@ -202,7 +202,7 @@ impl AprsTimestamp {
     /// values yield `None` so the parser can reject malformed input
     /// instead of surfacing a wrong-looking `AprsTimestamp`. Earlier
     /// code generations stored object timestamps as raw `String`
-    /// because no parser existed; see CB-C-18 / D-3.
+    /// because no parser existed.
     #[must_use]
     pub fn parse(wire: &str) -> Option<Self> {
         // Helper: parse two ASCII digits at byte offset.
@@ -570,7 +570,7 @@ const fn phg_decode_height(byte: u8) -> Option<u32> {
 /// Returns `None` if `PHG` is absent or any field fails its validation
 /// rule. Note the height field's relaxed acceptance — earlier code
 /// generations rejected `':'` (10 240 ft, common in balloon trackers),
-/// which produced silent loss of PHG data on receive. See CB-C-2.
+/// which produced silent loss of PHG data on receive.
 fn parse_phg(comment: &str) -> Option<Phg> {
     let idx = comment.find("PHG")?;
     let rest = comment.get(idx + 3..)?;
@@ -662,7 +662,7 @@ fn parse_dao(comment: &str) -> Option<(f64, f64)> {
 /// and a "BLN" addressee that starts with a *letter* (announcement)
 /// is structurally different from one that starts with a *digit*
 /// (general or group bulletin). Earlier code generations collapsed
-/// announcements into `GroupBulletin`; see CB-C-10.
+/// announcements into `GroupBulletin`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MessageKind {
     /// Direct station-to-station message.
@@ -809,7 +809,7 @@ fn parse_telemetry_labels(s: &str) -> TelemetryParameters {
 /// that slot remains `None`. Earlier code generations substituted
 /// `0.0` for parse failures, which produced all-zero coefficients on
 /// malformed input — silently coercing a parsing bug into a "valid"
-/// equation `y = 0·v² + 0·v + 0 = 0`. See CB-C-17.
+/// equation `y = 0·v² + 0·v + 0 = 0`.
 fn parse_telemetry_equations(s: &str) -> [Option<(f64, f64, f64)>; 5] {
     // Parse each comma-separated field into `Option<f64>`; we deliberately
     // do NOT fall through to 0.0 on parse failure — a missing/bad value
@@ -915,7 +915,7 @@ pub enum AprsData {
     /// receivers must tolerate them. The library does not attempt to
     /// parse the proprietary ASCII-hex payload; downstream code can
     /// either decode it via a dedicated Peet Bros parser or log it
-    /// for diagnostic purposes. See CB-C-14.
+    /// for diagnostic purposes.
     RawWeather {
         /// Original data-type identifier byte (`b'#'` or `b'*'`).
         data_type: u8,
@@ -1007,7 +1007,7 @@ pub fn parse_aprs_data(info: &[u8]) -> Result<AprsData, AprsError> {
         // ("not recommended on RF") but says receivers MUST tolerate
         // them. We surface the raw payload via `RawWeather` so
         // downstream code can choose to parse Peet Bros format
-        // separately or just log the bytes. See CB-C-14.
+        // separately or just log the bytes.
         b'#' | b'*' => Ok(AprsData::RawWeather {
             data_type: first,
             payload: info.get(1..).unwrap_or(&[]).to_vec(),
@@ -1324,7 +1324,7 @@ mod tests {
 
     #[test]
     fn dispatch_raw_weather_peet_bros_hash() -> TestResult {
-        // CB-C-14: Peet Bros U-II raw weather format `#...`.
+        // Peet Bros U-II raw weather format `#...`.
         // Receivers must tolerate per APRS 1.1; the library surfaces
         // it as RawWeather rather than rejecting with InvalidFormat.
         let info = b"#0123*4567";
@@ -1522,7 +1522,7 @@ mod tests {
 
     #[test]
     fn phg_height_extends_beyond_9() -> TestResult {
-        // Regression guard for CB-C-2 (APRS 1.0.1 §7 p.28): the height
+        // Regression guard (APRS 1.0.1 §7 p.28): the height
         // digit may be any ASCII character `'0'` and above, allowing
         // balloons/satellites to encode heights beyond 5 120 ft (the
         // `'9'` cap). Earlier code rejected `':'` via `is_ascii_digit`.
@@ -1779,7 +1779,7 @@ mod tests {
 
     #[test]
     fn telemetry_definition_eqns_strict_rejects_malformed_slot() -> TestResult {
-        // Regression guard for CB-C-17: a non-numeric field must
+        // Regression guard: a non-numeric field must
         // disable the affected slot rather than substituting 0.0
         // (which would silently produce a valid-looking equation).
         // Here channel 1 has a bad `b` coefficient ('hello') — the

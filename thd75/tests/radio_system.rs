@@ -31,7 +31,7 @@ fn mock_modify_page_sequence(
     expected: &[u8; 256],
 ) -> Result<(), BoxErr> {
     // Enter programming mode.
-    mock.expect(b"0M PROGRAM\r", b"0M\r");
+    mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
     // Read page.
     let read_cmd = programming::build_read_command(page);

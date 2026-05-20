@@ -5,7 +5,7 @@
 //! Per-mode TX queue that only releases frames when the modem's
 //! reported FIFO has enough slot space.
 //!
-//! Mirrors the `m_tx<MODE>Data` rings in `ref/MMDVMHost/Modem.cpp`
+//! Mirrors the `m_tx<MODE>Data` rings in `MMDVMHost/Modem.cpp`
 //! (`Modem.cpp:288-315` for the per-mode ring buffers and
 //! `Modem.cpp:1049-1220` for the space-gated drain logic).
 

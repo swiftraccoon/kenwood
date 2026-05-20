@@ -96,13 +96,16 @@ fn main() {
 
 /// Top-level async entry point.
 ///
-/// Connects to Postgres, runs migrations, spawns all tier orchestrators
-/// and the upload processor, starts the HTTP API, then waits for a
-/// shutdown signal (SIGTERM / ctrl-c).
+/// Connects to Postgres, runs migrations, spawns all tier orchestrators and
+/// the upload processor, starts the HTTP API, then waits for either a
+/// shutdown signal (SIGTERM / ctrl-c) or any subsystem task to exit.
 ///
-/// Each tier runs as an independent tokio task — a crash in Tier 2
-/// does not affect Tier 3. On shutdown, all tasks are aborted
-/// (graceful drain will be refined later).
+/// Each tier runs as an independent tokio task. A tier task is expected to
+/// run for the lifetime of the process; if one returns or panics, the entry
+/// point logs the fault and proceeds to shutdown so the orchestrator restarts
+/// the whole process instead of leaving a pod with a dead subsystem. On
+/// shutdown the remaining tasks are aborted (graceful drain will be refined
+/// later).
 async fn run(config: config::Config) {
     tracing::info!(
         postgres_url = %config.postgres.url,
@@ -129,25 +132,53 @@ async fn run(config: config::Config) {
 
     // Spawn each tier as an independent tokio task so that a failure
     // in one does not take down the others.
-    let api_handle = tokio::spawn(api::serve(config.server.listen, pool.clone()));
-    let t1_handle = tokio::spawn(tier1::run(config.tier1, pool.clone()));
-    let t2_handle = tokio::spawn(tier2::run(config.tier2, pool.clone()));
-    let t3_handle = tokio::spawn(tier3::run(config.tier3, config.audio, pool.clone()));
-    let upload_handle = tokio::spawn(upload::run(config.rdio, pool.clone()));
+    let mut api_handle = tokio::spawn(api::serve(config.server.listen, pool.clone()));
+    let mut t1_handle = tokio::spawn(tier1::run(config.tier1, pool.clone()));
+    let mut t2_handle = tokio::spawn(tier2::run(config.tier2, pool.clone()));
+    let mut t3_handle = tokio::spawn(tier3::run(config.tier3, config.audio, pool.clone()));
+    let mut upload_handle = tokio::spawn(upload::run(config.rdio, pool.clone()));
 
     tracing::info!("all tiers started");
 
-    // Wait for shutdown signal.
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => tracing::info!("received ctrl-c, shutting down"),
-        Err(e) => tracing::error!(error = %e, "failed to listen for ctrl-c"),
+    // Wait for either a shutdown signal or any subsystem task to exit. A tier
+    // task is expected to run for the lifetime of the process; if one returns
+    // or panics, that is a fault — log it and fall through to shutdown so the
+    // orchestrator restarts the whole process instead of leaving a pod with a
+    // dead subsystem.
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => match signal {
+            Ok(()) => tracing::info!("received ctrl-c, shutting down"),
+            Err(e) => tracing::error!(error = %e, "failed to listen for ctrl-c"),
+        },
+        outcome = &mut api_handle => report_exit("api", outcome),
+        outcome = &mut t1_handle => report_exit("tier1", outcome),
+        outcome = &mut t2_handle => report_exit("tier2", outcome),
+        outcome = &mut t3_handle => report_exit("tier3", outcome),
+        outcome = &mut upload_handle => report_exit("upload", outcome),
     }
 
-    // Abort all tasks. Graceful shutdown (flush pending writes,
-    // disconnect sessions, drain upload queue) will be added later.
+    // Abort whatever is still running. Graceful shutdown (flush pending
+    // writes, disconnect sessions, drain upload queue) will be added later.
     api_handle.abort();
     t1_handle.abort();
     t2_handle.abort();
     t3_handle.abort();
     upload_handle.abort();
+}
+
+/// Outcome of awaiting a spawned subsystem task: the inner `Result` is the
+/// task's own return value, the outer layer captures a panic or cancellation.
+type TaskOutcome =
+    Result<Result<(), Box<dyn std::error::Error + Send + Sync>>, tokio::task::JoinError>;
+
+/// Logs why a subsystem task exited.
+///
+/// Tier tasks are expected to run for the lifetime of the process, so every
+/// exit path here is a fault and is logged at `error` level.
+fn report_exit(name: &str, outcome: TaskOutcome) {
+    match outcome {
+        Ok(Ok(())) => tracing::error!(task = name, "subsystem task exited unexpectedly"),
+        Ok(Err(e)) => tracing::error!(task = name, error = %e, "subsystem task failed"),
+        Err(e) => tracing::error!(task = name, error = %e, "subsystem task panicked"),
+    }
 }

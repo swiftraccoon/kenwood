@@ -46,6 +46,7 @@ use thd75_repl::aprintln;
 
 use clap::Parser;
 use dstar_gateway_core::slowdata::{SlowDataTextCollector, encode_text_message};
+use kenwood_thd75::LinkDiagnosis;
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::{AprsClient, AprsClientConfig, AprsEvent};
@@ -226,6 +227,12 @@ struct Cli {
     /// where the operator does not want to be asked every time.
     #[arg(long)]
     yes: bool,
+
+    /// If the radio is found in Reflector Terminal Mode, guide an exit
+    /// (prompt for the Menu 650 change) and reconnect, instead of
+    /// offering D-STAR mode.
+    #[arg(long)]
+    exit_terminal_mode: bool,
 
     /// Command to run on startup (e.g. "dstar start KQ4NIT REF030C").
     ///
@@ -617,6 +624,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             script,
             script_strict,
             in_script_mode,
+            cli.exit_terminal_mode,
         ),
     )?;
 
@@ -950,12 +958,15 @@ impl ReflectorSession {
 #[expect(
     clippy::cognitive_complexity,
     clippy::too_many_lines,
+    clippy::too_many_arguments,
     reason = "`run_repl` is the single state-machine owner for CAT/APRS/D-STAR modes: it fetches \
               input from the appropriate queue (pending command, script queue, or rustyline), \
               dispatches to the active mode, handles mode transitions, and unwinds on quit. \
               Extracting the three dispatch arms would require threading every mode's session \
               type through helpers and would not meaningfully reduce the function's inherent \
-              complexity — the branching is the algorithm."
+              complexity — the branching is the algorithm. The argument list carries the CLI \
+              flags the state machine needs; bundling them into a struct would only move the \
+              same fields behind one more indirection."
 )]
 async fn run_repl(
     transport: EitherTransport,
@@ -965,6 +976,7 @@ async fn run_repl(
     script: Option<thd75_repl::script::Script>,
     script_strict: bool,
     in_script_mode: bool,
+    exit_terminal_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // `script_strict` is reserved for a future enhancement that halts
     // the REPL loop on the first command error. Silencing the
@@ -987,16 +999,31 @@ async fn run_repl(
             ReplState::Cat(radio)
         }
         Err(_) => {
-            // CAT failed. Check if radio is in MMDVM/gateway mode.
-            if detect_mmdvm_mode(&mut radio).await {
-                println!("Radio is in D-STAR Reflector Terminal Mode.");
-                println!("Type dstar start <callsign> [reflector] to begin, or quit to exit.");
-                println!("Example: dstar start W1AW REF030C");
-                ReplState::Cat(radio)
-            } else {
-                return Err(
-                    "Error: could not identify radio. Check connection and radio mode.".into(),
-                );
+            // CAT identification failed — probe the link to find out why.
+            match radio.diagnose_link().await {
+                LinkDiagnosis::MmdvmMode if exit_terminal_mode => {
+                    // The operator asked for CAT, not D-STAR: guide them
+                    // out of Reflector Terminal Mode, then reconnect.
+                    radio = guide_exit_terminal_mode(radio, cli_port.as_deref(), cli_baud).await?;
+                    let model = radio
+                        .identify()
+                        .await
+                        .map(|info| info.model)
+                        .unwrap_or_default();
+                    let fw = radio.get_firmware_version().await.unwrap_or_default();
+                    println!("{}", thd75_repl::output::startup_identified(&model, &fw));
+                    println!("{}", thd75_repl::output::type_help_hint());
+                    ReplState::Cat(radio)
+                }
+                LinkDiagnosis::MmdvmMode => {
+                    println!("Radio is in D-STAR Reflector Terminal Mode.");
+                    println!("Type dstar start <callsign> [reflector] to begin, or quit to exit.");
+                    println!("Example: dstar start W1AW REF030C");
+                    ReplState::Cat(radio)
+                }
+                LinkDiagnosis::Unresponsive => {
+                    return Err(LinkDiagnosis::Unresponsive.guidance().into());
+                }
             }
         }
     };
@@ -1767,25 +1794,39 @@ fn print_aprs_event(event: &AprsEvent) {
 // D-STAR mode
 // ---------------------------------------------------------------------------
 
-/// Detect whether the radio is currently in MMDVM mode by sending
-/// an MMDVM `GET_VERSION` frame and checking for an `0xE0` response.
-async fn detect_mmdvm_mode(radio: &mut Radio<EitherTransport>) -> bool {
-    // Send MMDVM GET_VERSION: E0 03 00
-    let get_version = [0xE0, 0x03, 0x00];
-    if radio.transport_write(&get_version).await.is_err() {
-        return false;
-    }
+/// Guide the operator out of Reflector Terminal Mode and reconnect.
+///
+/// Prints the link guidance, waits for the operator to switch Menu 650
+/// off, then reconnects and re-checks. Loops until CAT control is
+/// restored; returns an error only if the radio cannot be reopened.
+async fn guide_exit_terminal_mode(
+    mut radio: Radio<EitherTransport>,
+    cli_port: Option<&str>,
+    cli_baud: u32,
+) -> Result<Radio<EitherTransport>, String> {
+    loop {
+        println!("{}", LinkDiagnosis::MmdvmMode.guidance());
+        println!();
+        println!("Set Menu 650 to Off on the radio, then press Enter when done (Ctrl-C to quit).");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
 
-    // Read with short timeout — MMDVM responds in ~20ms, CAT won't respond.
-    let mut buf = [0u8; 64];
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            radio.transport_read(&mut buf),
-        )
-        .await,
-        Ok(Ok(n)) if n > 0 && buf[0] == 0xE0
-    )
+        let _ = radio.disconnect().await;
+        println!("Reconnecting...");
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+        let (_path, transport) = transport::discover_and_open(cli_port, cli_baud)
+            .map_err(|e| format!("Reconnect failed: {e}"))?;
+        radio = Radio::connect_safe(transport)
+            .await
+            .map_err(|e| format!("Connect failed: {e}"))?;
+
+        if radio.identify().await.is_ok() {
+            println!("Radio restored to CAT control mode.");
+            return Ok(radio);
+        }
+        println!("The radio is still in Reflector Terminal Mode. Try again.");
+    }
 }
 
 /// MCP offset for DV Gateway mode setting (0=Off, 1=Reflector Terminal, 2=Access Point).
@@ -1818,7 +1859,7 @@ async fn enter_dstar(
     // Check if radio is already in MMDVM/gateway mode by probing.
     // Send MMDVM GET_VERSION — if we get an E0 response, skip MCP write.
     println!("Checking if radio is already in D-STAR gateway mode.");
-    let already_mmdvm = detect_mmdvm_mode(&mut radio).await;
+    let already_mmdvm = radio.diagnose_link().await == LinkDiagnosis::MmdvmMode;
 
     if already_mmdvm {
         println!("Radio is already in Reflector Terminal Mode.");
@@ -3052,29 +3093,10 @@ const ECHO_REPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(5
 /// `rpt1` / `rpt2` both set to the literal string `"DIRECT  "` as
 /// placeholders — the radio knows it's talking to a local gateway
 /// but doesn't know the gateway's callsign. This function is the
-/// gateway half of that contract: we rewrite those placeholders
-/// into the real `rpt1` / `rpt2` that a `DPlus` / `DExtra` / `DCS`
-/// reflector expects.
-///
-/// The D-STAR hotspot convention (per
-/// `ircDDBGateway/Common/DPlusHandler.cpp:77-79` and `:865`, and
-/// `Common/HeaderData.cpp::getDPlusData`) is:
-///
-/// - `rpt1[0..7]` = operator's own callsign (first 7 bytes,
-///   space-padded)
-/// - `rpt1[7]`   = operator's local module letter (A–E)
-/// - `rpt2[0..7]` = reflector callsign (e.g. `"REF030 "`)
-/// - `rpt2[7]`   = reflector module letter (A–E)
-///
-/// **Critical: both rpt1[7] and rpt2[7] are actual module letters,
-/// NEVER the literal `'G'`.** xlxd's `cdplusprotocol.cpp:209` reads
-/// rpt1's byte 7 as the module letter and silently drops the
-/// packet if `IsValidModule` fails — `'G'` is not a valid module
-/// so any packet we send with `rpt1 = "KQ4NIT G"` is discarded by
-/// the reflector with no NAK, no log line, no retry. Pre-fix we
-/// were building exactly that, which is why the operator's TX was
-/// received by every peer's tokio socket but never echoed back by
-/// the reflector to any other client.
+/// gateway half of that contract: we rewrite those placeholders into
+/// the canonical relay header via [`DStarHeader::for_relay`], then
+/// preserve the source flag bytes (the radio may set repeater flag
+/// bits the reflector cares about).
 fn build_reflector_header(
     station_callsign: Callsign,
     local_module: Module,
@@ -3082,39 +3104,21 @@ fn build_reflector_header(
     reflector_module: Module,
     header: &DStarHeader,
 ) -> DStarHeader {
-    // rpt1 = operator's own callsign + local module letter.
-    let mut rpt1_buf = [b' '; 8];
-    let cs_bytes = station_callsign.as_bytes();
-    rpt1_buf[..7].copy_from_slice(&cs_bytes[..7]);
-    rpt1_buf[7] = local_module.as_byte();
-    // Infallible: bytes came from a validated Callsign + Module, so
-    // every byte is already ASCII and the 8-byte form is well-formed.
-    let rpt1 = Callsign::from_wire_bytes(rpt1_buf);
-
-    // rpt2 = reflector callsign + reflector module letter.
-    let mut rpt2_buf = [b' '; 8];
-    let refl_bytes = reflector_callsign.as_bytes();
-    rpt2_buf[..7].copy_from_slice(&refl_bytes[..7]);
-    rpt2_buf[7] = reflector_module.as_byte();
-    let rpt2 = Callsign::from_wire_bytes(rpt2_buf);
-
-    // The source header already carries typed Callsign/Suffix fields,
-    // so my_call / my_suffix pass through unchanged. ur_call is forced
-    // to CQCQCQ per the hotspot-to-reflector relay convention.
-    let my_call = header.my_call;
-    let my_suffix = header.my_suffix;
-    let ur_call = Callsign::try_from_str("CQCQCQ").expect("static constant");
-
-    DStarHeader {
-        flag1: header.flag1,
-        flag2: header.flag2,
-        flag3: header.flag3,
-        rpt2,
-        rpt1,
-        ur_call,
-        my_call,
-        my_suffix,
-    }
+    let mut hdr = DStarHeader::for_relay(
+        station_callsign,
+        local_module,
+        reflector_callsign,
+        reflector_module,
+        header.my_call,
+        header.my_suffix,
+    );
+    // Preserve the radio's flag bytes — the helper zeroes them by
+    // default, which is correct for sextant's TX-from-scratch path
+    // but loses any repeater flags the radio sets in this relay path.
+    hdr.flag1 = header.flag1;
+    hdr.flag2 = header.flag2;
+    hdr.flag3 = header.flag3;
+    hdr
 }
 
 /// Relay a radio MMDVM event to the reflector, or record for echo test.
@@ -3372,10 +3376,10 @@ fn rand_stream_id() -> StreamId {
 /// a reflector voice frame.
 ///
 /// Convention matches `MMDVMHost`'s `m_remoteGateway` network-to-RF
-/// path in `ref/MMDVMHost/DStarControl.cpp:749-754` — `thd75-repl` is a
+/// path in `MMDVMHost/DStarControl.cpp:749-754` — `thd75-repl` is a
 /// remote gateway in front of the modem:
 /// - `flag1` |= `0x40` (`DSTAR_REPEATER_MASK`) per
-///   `ref/MMDVMHost/DStarDefines.h:62`.
+///   `MMDVMHost/DStarDefines.h:62`.
 /// - `rpt1` = local station callsign (7 bytes) + local module letter.
 /// - `rpt2` = same as `rpt1` (callsign + module). `MMDVMHost` uses
 ///   `rpt2 = m_callsign` (NOT `m_gateway`) in remote-gateway mode.
@@ -3453,18 +3457,23 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             // `m_remoteGateway` convention before forwarding (see
             // `build_radio_header` doc).
             let radio_header = build_radio_header(session.callsign, session.local_module, header);
-            // Diagnostic: print the exact header fields going to the
-            // radio's MMDVM modem so the operator can confirm the
-            // relay path is firing AND see what the radio's TX header
-            // validator is actually being asked to accept.
-            aprintln!(
-                "Relay → radio: my={}/{} ur={} rpt1={} rpt2={} flag1=0x{:02X}",
-                radio_header.my_call.as_str(),
-                radio_header.my_suffix.as_str(),
-                radio_header.ur_call.as_str(),
-                radio_header.rpt1.as_str(),
-                radio_header.rpt2.as_str(),
-                radio_header.flag1,
+            // Diagnostic: log the exact header fields going to the
+            // radio's MMDVM modem at TRACE so the session log confirms
+            // the relay path is firing AND records what the radio's TX
+            // header validator is being asked to accept — without
+            // cluttering the operator's REPL output.
+            tracing::trace!(
+                target: "thd75_repl::reflector",
+                my = format_args!(
+                    "{}/{}",
+                    radio_header.my_call.as_str(),
+                    radio_header.my_suffix.as_str(),
+                ),
+                ur = %radio_header.ur_call.as_str(),
+                rpt1 = %radio_header.rpt1.as_str(),
+                rpt2 = %radio_header.rpt2.as_str(),
+                flag1 = format_args!("{:#04x}", radio_header.flag1),
+                "relay → radio: header"
             );
             if let Err(e) = gw.send_header(&radio_header).await {
                 println!(
@@ -3504,7 +3513,7 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             }
 
             // Use send_voice_unpaced — no host-side pacing. The
-            // correct pattern per `ref/MMDVMHost/Modem.cpp:1049` is
+            // correct pattern per `MMDVMHost/Modem.cpp:1049` is
             // to query the modem's `dstarSpace` status field and
             // only write when the modem reports buffer room,
             // letting the modem's own buffer state drive the rate.
@@ -3589,11 +3598,11 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             session.last_rx_voice_frame = None;
             session.last_relay_at = None;
             session.pad_frames_emitted = 0;
-            // Diagnostic: matches the `Relay → radio: my=...` line emitted
-            // on `VoiceStart` so the operator can confirm the EOT
-            // closes the stream — and that the relay is calling
+            // Diagnostic: pairs with the `relay → radio: header` trace
+            // emitted on `VoiceStart` so the session log confirms the
+            // EOT closes the stream — and that the relay is calling
             // `send_eot` (not silently failing earlier in the path).
-            aprintln!("Relay → radio: EOT");
+            tracing::trace!(target: "thd75_repl::reflector", "relay → radio: EOT");
             if let Err(e) = gw.send_eot().await {
                 println!(
                     "{}",
@@ -3886,7 +3895,9 @@ fn print_dstar_event(event: &DStarEvent) {
             aprintln!("{s}");
         }
         DStarEvent::StatusUpdate(status) => {
-            println!(
+            // Modem buffer / TX state is an audio-pipeline diagnostic, not a
+            // user-facing monitor event — route it to the trace log only.
+            tracing::debug!(
                 "{}",
                 thd75_repl::output::dstar_modem_status(status.dstar_space, status.tx())
             );

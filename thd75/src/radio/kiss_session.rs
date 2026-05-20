@@ -20,8 +20,8 @@
 //! let mut kiss = radio.enter_kiss(TncBaud::Bps1200).await.map_err(|(_, e)| e)?;
 //!
 //! // Send and receive KISS frames.
-//! use kiss_tnc::{KissFrame, CMD_DATA};
-//! let frame = KissFrame { port: 0, command: CMD_DATA, data: vec![/* AX.25 */ ] };
+//! use kiss_tnc::KissFrame;
+//! let frame = KissFrame::data(vec![/* AX.25 */]);
 //! kiss.send_frame(&frame).await?;
 //!
 //! // Exit KISS mode (returns the Radio).
@@ -32,10 +32,7 @@
 
 use std::time::Duration;
 
-use kiss_tnc::{
-    CMD_DATA, CMD_FULL_DUPLEX, CMD_PERSISTENCE, CMD_RETURN, CMD_SET_HARDWARE, CMD_SLOT_TIME,
-    CMD_TX_DELAY, CMD_TX_TAIL, FEND, KissFrame, decode_kiss_frame, encode_kiss_frame,
-};
+use kiss_tnc::{FEND, KissCommand, KissFrame, KissPort, decode_kiss_frame, encode_kiss_frame};
 
 use crate::error::{Error, ProtocolError, TransportError};
 use crate::protocol::{Codec, Command, Response};
@@ -181,7 +178,7 @@ impl<T: Transport> KissSession<T> {
     pub async fn send_frame(&mut self, frame: &KissFrame) -> Result<(), Error> {
         let wire = encode_kiss_frame(frame);
         tracing::debug!(
-            command = frame.command,
+            command = ?frame.command,
             data_len = frame.data.len(),
             wire_len = wire.len(),
             "KISS TX"
@@ -257,7 +254,7 @@ impl<T: Transport> KissSession<T> {
         match decode_kiss_frame(&frame_bytes) {
             Ok(frame) => {
                 tracing::debug!(
-                    command = frame.command,
+                    command = ?frame.command,
                     data_len = frame.data.len(),
                     "KISS RX"
                 );
@@ -281,8 +278,8 @@ impl<T: Transport> KissSession<T> {
     pub async fn set_tx_delay(&mut self, tens_of_ms: u8) -> Result<(), Error> {
         tracing::debug!(tens_of_ms, "setting KISS TX delay");
         self.send_frame(&KissFrame {
-            port: 0,
-            command: CMD_TX_DELAY,
+            port: KissPort::TH_D75,
+            command: KissCommand::TxDelay,
             data: vec![tens_of_ms],
         })
         .await
@@ -299,8 +296,8 @@ impl<T: Transport> KissSession<T> {
     pub async fn set_persistence(&mut self, value: u8) -> Result<(), Error> {
         tracing::debug!(value, "setting KISS persistence");
         self.send_frame(&KissFrame {
-            port: 0,
-            command: CMD_PERSISTENCE,
+            port: KissPort::TH_D75,
+            command: KissCommand::Persistence,
             data: vec![value],
         })
         .await
@@ -316,8 +313,8 @@ impl<T: Transport> KissSession<T> {
     pub async fn set_slot_time(&mut self, tens_of_ms: u8) -> Result<(), Error> {
         tracing::debug!(tens_of_ms, "setting KISS slot time");
         self.send_frame(&KissFrame {
-            port: 0,
-            command: CMD_SLOT_TIME,
+            port: KissPort::TH_D75,
+            command: KissCommand::SlotTime,
             data: vec![tens_of_ms],
         })
         .await
@@ -333,8 +330,8 @@ impl<T: Transport> KissSession<T> {
     pub async fn set_tx_tail(&mut self, tens_of_ms: u8) -> Result<(), Error> {
         tracing::debug!(tens_of_ms, "setting KISS TX tail");
         self.send_frame(&KissFrame {
-            port: 0,
-            command: CMD_TX_TAIL,
+            port: KissPort::TH_D75,
+            command: KissCommand::TxTail,
             data: vec![tens_of_ms],
         })
         .await
@@ -350,8 +347,8 @@ impl<T: Transport> KissSession<T> {
     pub async fn set_full_duplex(&mut self, full_duplex: bool) -> Result<(), Error> {
         tracing::debug!(full_duplex, "setting KISS duplex mode");
         self.send_frame(&KissFrame {
-            port: 0,
-            command: CMD_FULL_DUPLEX,
+            port: KissPort::TH_D75,
+            command: KissCommand::FullDuplex,
             data: vec![u8::from(full_duplex)],
         })
         .await
@@ -370,8 +367,8 @@ impl<T: Transport> KissSession<T> {
         let value = if baud_1200 { 0x00 } else { 0x05 };
         tracing::debug!(baud_1200, value, "setting KISS hardware baud");
         self.send_frame(&KissFrame {
-            port: 0,
-            command: CMD_SET_HARDWARE,
+            port: KissPort::TH_D75,
+            command: KissCommand::SetHardware,
             data: vec![value],
         })
         .await
@@ -386,12 +383,7 @@ impl<T: Transport> KissSession<T> {
     ///
     /// Returns [`Error::Transport`] if the write fails.
     pub async fn send_data(&mut self, ax25_bytes: &[u8]) -> Result<(), Error> {
-        self.send_frame(&KissFrame {
-            port: 0,
-            command: CMD_DATA,
-            data: ax25_bytes.to_vec(),
-        })
-        .await
+        self.send_frame(&KissFrame::data(ax25_bytes.to_vec())).await
     }
 
     /// Exit KISS mode by sending the `CMD_RETURN` (`0xFF`) frame.
@@ -403,12 +395,7 @@ impl<T: Transport> KissSession<T> {
     /// Returns [`Error::Transport`] if the write fails.
     pub async fn exit(mut self) -> Result<Radio<T>, Error> {
         tracing::info!("exiting KISS mode");
-        self.send_frame(&KissFrame {
-            port: 0,
-            command: CMD_RETURN,
-            data: vec![],
-        })
-        .await?;
+        self.send_frame(&KissFrame::return_command()).await?;
 
         // Small delay to let the TNC switch back to CAT mode.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -432,7 +419,7 @@ mod tests {
     use super::*;
     use crate::transport::MockTransport;
     use crate::types::TncBaud;
-    use kiss_tnc::{CMD_DATA, FEND};
+    use kiss_tnc::FEND;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;
@@ -482,11 +469,7 @@ mod tests {
             .transport
             .expect(&[FEND, 0x00, 0xAA, 0xBB, FEND], &[]);
 
-        let frame = KissFrame {
-            port: 0,
-            command: CMD_DATA,
-            data: vec![0xAA, 0xBB],
-        };
+        let frame = KissFrame::data(vec![0xAA, 0xBB]);
         session.send_frame(&frame).await?;
         Ok(())
     }
@@ -626,7 +609,7 @@ mod tests {
         let mut buf = vec![FEND, 0x00, 0xAA, FEND];
         let frame = KissSession::<MockTransport>::try_extract_frame(&mut buf)
             .ok_or("try_extract_frame returned None for complete frame")?;
-        assert_eq!(frame.command, CMD_DATA);
+        assert_eq!(frame.command, KissCommand::Data);
         assert_eq!(frame.data, vec![0xAA]);
         assert!(buf.is_empty());
         Ok(())
@@ -646,7 +629,7 @@ mod tests {
         let mut buf = vec![FEND, FEND, FEND, 0x00, 0xBB, FEND];
         let frame = KissSession::<MockTransport>::try_extract_frame(&mut buf)
             .ok_or("try_extract_frame returned None for frame with leading FENDs")?;
-        assert_eq!(frame.command, CMD_DATA);
+        assert_eq!(frame.command, KissCommand::Data);
         assert_eq!(frame.data, vec![0xBB]);
         Ok(())
     }

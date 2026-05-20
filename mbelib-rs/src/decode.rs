@@ -19,7 +19,7 @@
 //!
 //! The 49 data bits are partitioned into 9 sub-fields (b0 through b8). The
 //! bit positions below are the D-STAR 2400 layout; every position is taken
-//! directly from `ref/mbelib/ambe3600x2400.c` and matches the bit layout
+//! directly from `mbelib/ambe3600x2400.c` and matches the bit layout
 //! OP25's `ambe_encoder.cc` produces in its `dstar` branch.
 //!
 //! 1. **b0 (7 bits)** -- fundamental frequency (w0) and harmonic count (L).
@@ -155,7 +155,7 @@ pub(crate) fn decode_params(
     prev: &MbeParams,
 ) -> FrameStatus {
     // -- b0: fundamental frequency (7 bits, D-STAR 2400 layout) --
-    // Reference: `ref/mbelib/ambe3600x2400.c:167-174`.
+    // Reference: `mbelib/ambe3600x2400.c:167-174`.
     let b0: usize = (bit(ambe_d, 0) << 6)
         | (bit(ambe_d, 1) << 5)
         | (bit(ambe_d, 2) << 4)
@@ -182,7 +182,7 @@ pub(crate) fn decode_params(
     decode_vuv(ambe_d, f0, silence, cur);
 
     // -- b2: gain delta (6 bits, D-STAR 2400 layout) --
-    // Reference: `ref/mbelib/ambe3600x2400.c:325-331`. Indexes the
+    // Reference: `mbelib/ambe3600x2400.c:325-331`. Indexes the
     // 64-entry AmbePlusDg table (re-exported here as DG_TABLE).
     let b2: usize = (bit(ambe_d, 6) << 5)
         | (bit(ambe_d, 7) << 4)
@@ -231,7 +231,7 @@ fn decode_frequency(b0: usize, silence: bool, cur: &mut MbeParams) -> f32 {
 /// frequency-proportional index: `jl = floor(l * 16 * f0)`.
 fn decode_vuv(ambe_d: &[u8; AMBE_DATA_BITS], f0: f32, silence: bool, cur: &mut MbeParams) {
     // D-STAR 2400 V/UV index is 4 bits, read from ambe_d[38..42].
-    // Reference: `ref/mbelib/ambe3600x2400.c:298-302`.
+    // Reference: `mbelib/ambe3600x2400.c:298-302`.
     let b1: usize =
         (bit(ambe_d, 38) << 3) | (bit(ambe_d, 39) << 2) | (bit(ambe_d, 40) << 1) | bit(ambe_d, 41);
 
@@ -261,7 +261,7 @@ fn decode_vuv(ambe_d: &[u8; AMBE_DATA_BITS], f0: f32, silence: bool, cur: &mut M
 /// HOC, and runs inverse DCT to produce per-band spectral offsets Tl.
 fn decode_spectral_offsets(ambe_d: &[u8; AMBE_DATA_BITS], big_l: usize) -> [f32; MAX_BANDS] {
     // -- b3: low-band PRBA (9 bits, D-STAR 2400 layout) --
-    // Reference: `ref/mbelib/ambe3600x2400.c:345-353`.
+    // Reference: `mbelib/ambe3600x2400.c:345-353`.
     let b3: usize = (bit(ambe_d, 10) << 8)
         | (bit(ambe_d, 11) << 7)
         | (bit(ambe_d, 12) << 6)
@@ -273,7 +273,7 @@ fn decode_spectral_offsets(ambe_d: &[u8; AMBE_DATA_BITS], big_l: usize) -> [f32;
         | bit(ambe_d, 45);
 
     // -- b4: high-band PRBA (7 bits, D-STAR 2400 layout) --
-    // Reference: `ref/mbelib/ambe3600x2400.c:360-366`.
+    // Reference: `mbelib/ambe3600x2400.c:360-366`.
     let b4: usize = (bit(ambe_d, 17) << 6)
         | (bit(ambe_d, 18) << 5)
         | (bit(ambe_d, 19) << 4)
@@ -305,7 +305,7 @@ fn decode_spectral_offsets(ambe_d: &[u8; AMBE_DATA_BITS], big_l: usize) -> [f32;
     }
 
     // -- b5-b8: HOC coefficients (D-STAR 2400 layout) --
-    // Reference: `ref/mbelib/ambe3600x2400.c:414-439`.
+    // Reference: `mbelib/ambe3600x2400.c:414-439`.
     //
     // b5 is 4 bits at `[22, 23, 25, 26]` — bit 24 is deliberately
     // skipped (the only unused ambe_d position in D-STAR).

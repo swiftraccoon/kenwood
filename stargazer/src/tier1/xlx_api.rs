@@ -124,3 +124,43 @@ pub(crate) async fn fetch_and_store(
     tracing::info!(count, "xlx-api: upserted reflectors");
     Ok(count)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn deserializes_xlx_reflector_list() -> TestResult {
+        let xml = concat!(
+            "<XLXAPI><answer><reflectorlist>",
+            "<reflector><name>XLX320</name><lastip>1.2.3.4</lastip>",
+            "<dashboardurl>http://xlx320.example</dashboardurl>",
+            "<country>USA</country></reflector>",
+            "<reflector><name>XLX555</name><lastip>5.6.7.8</lastip>",
+            "<dashboardurl>http://xlx555.example</dashboardurl>",
+            "<country>Germany</country></reflector>",
+            "</reflectorlist></answer></XLXAPI>",
+        );
+        let response: XlxApiResponse = quick_xml::de::from_str(xml)?;
+        let reflectors = &response.answer.reflectorlist.reflector;
+        assert_eq!(reflectors.len(), 2);
+        let first = reflectors.first().ok_or("missing reflector")?;
+        assert_eq!(first.name, "XLX320");
+        assert_eq!(first.lastip, "1.2.3.4");
+        assert_eq!(first.dashboardurl.as_deref(), Some("http://xlx320.example"));
+        assert_eq!(first.country.as_deref(), Some("USA"));
+        Ok(())
+    }
+
+    #[test]
+    fn deserializes_empty_reflector_list() -> TestResult {
+        // `#[serde(default)]` on the `reflector` field must yield an empty Vec
+        // rather than a deserialization error.
+        let xml = "<XLXAPI><answer><reflectorlist></reflectorlist></answer></XLXAPI>";
+        let response: XlxApiResponse = quick_xml::de::from_str(xml)?;
+        assert!(response.answer.reflectorlist.reflector.is_empty());
+        Ok(())
+    }
+}

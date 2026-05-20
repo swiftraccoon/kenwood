@@ -56,7 +56,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::config::RdioConfig;
-use crate::db::streams::StreamRow;
+use crate::db::streams::PendingUploadRow;
 use crate::db::uploads;
 use rdio::{UploadError, UploadFields};
 
@@ -146,11 +146,18 @@ async fn process_pending(client: &reqwest::Client, pool: &PgPool, config: &RdioC
 /// Errors from either the HTTP upload or the status-transition query are
 /// logged but never propagated — the caller iterates over a batch and we
 /// do not want one bad row to abort the rest.
-async fn process_one(client: &reqwest::Client, pool: &PgPool, config: &RdioConfig, row: StreamRow) {
+async fn process_one(
+    client: &reqwest::Client,
+    pool: &PgPool,
+    config: &RdioConfig,
+    mut row: PendingUploadRow,
+) {
     // Guard: `get_pending` already filters on `audio_mp3 IS NOT NULL`, but
     // the column is Option<Vec<u8>> at the type level. If somehow the row
     // is incomplete we log and mark it failed so it does not spin forever.
-    let Some(audio_mp3) = row.audio_mp3.clone() else {
+    // `take()` moves the blob out without cloning and leaves the rest of
+    // `row` intact for the field reads and `handle_upload_failure` below.
+    let Some(audio_mp3) = row.audio_mp3.take() else {
         tracing::warn!(
             id = row.id,
             "upload: pending row has no audio_mp3 — marking failed"
@@ -209,7 +216,7 @@ async fn process_one(client: &reqwest::Client, pool: &PgPool, config: &RdioConfi
 async fn handle_upload_failure(
     pool: &PgPool,
     config: &RdioConfig,
-    row: &StreamRow,
+    row: &PendingUploadRow,
     error: &UploadError,
 ) {
     // attempts_so_far counts attempts BEFORE this one. The database will

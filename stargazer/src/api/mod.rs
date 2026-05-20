@@ -53,16 +53,14 @@ use tokio::net::TcpListener;
 /// # Errors
 ///
 /// Returns an error if:
-/// - `listen` is not a valid `SocketAddr` (e.g. missing port).
 /// - The TCP listener cannot bind (port in use, permission denied).
 /// - `axum::serve` returns an I/O error (effectively never — see the
 ///   axum docs, the underlying future currently never completes).
 pub(crate) async fn serve(
-    listen: String,
+    listen: SocketAddr,
     pool: sqlx::PgPool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr: SocketAddr = listen.parse()?;
-    let listener = TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(listen).await?;
     let bound = listener.local_addr()?;
     tracing::info!(listen = %bound, "HTTP API server listening");
 
@@ -73,10 +71,9 @@ pub(crate) async fn serve(
 
 /// Builds the axum `Router` with all routes and shared state.
 ///
-/// Extracted from [`serve`] so it can be exercised without standing up
-/// a TCP listener — useful for route-table regression tests and for
-/// driving the handlers via `tower::ServiceExt::oneshot` in integration
-/// tests.
+/// Extracted from [`serve`] so the route table can be exercised without
+/// standing up a TCP listener — the unit tests drive it with
+/// `tower::ServiceExt::oneshot`.
 fn build_router(pool: sqlx::PgPool) -> Router {
     Router::new()
         .route("/health", get(routes::health))
@@ -99,4 +96,30 @@ fn build_router(pool: sqlx::PgPool) -> Router {
             delete(routes::tier3_disconnect),
         )
         .with_state(pool)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use sqlx::postgres::PgPoolOptions;
+    use tower::ServiceExt;
+
+    use super::build_router;
+
+    #[tokio::test]
+    async fn router_routes_health_endpoint() -> Result<(), Box<dyn std::error::Error>> {
+        // A lazy pool never opens a connection until a query runs, and the
+        // `/health` handler issues none — so this drives the real route table
+        // and handler end to end without a live Postgres.
+        let pool = PgPoolOptions::new().connect_lazy("postgres://stargazer@localhost/stargazer")?;
+        let router = build_router(pool);
+
+        let response = router
+            .oneshot(Request::builder().uri("/health").body(Body::empty())?)
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
 }

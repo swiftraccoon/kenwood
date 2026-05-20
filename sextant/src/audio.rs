@@ -10,17 +10,17 @@
 //! each direction, and processes audio in its main loop:
 //!
 //! - RX: pull incoming [`VoiceFrame`]s from the command channel,
-//!   decode to 160-sample PCM, linear-resample to HW rate, push to
+//!   decode to 160-sample PCM, sinc-resample to HW rate, push to
 //!   the speaker ringbuffer which the cpal output callback drains.
 //! - TX: while PTT is active, drain 20 ms of HW-rate mic samples,
-//!   linear-resample to 8 kHz, feed through [`AmbeEncoder`], wrap the
+//!   sinc-resample to 8 kHz, feed through [`AmbeEncoder`], wrap the
 //!   resulting 9-byte AMBE in a [`VoiceFrame`], and push into the
 //!   session command channel via [`SessionCommand::TxFrame`].
 //!
-//! Resampling is linear interpolation — quality is adequate for
-//! speech intelligibility testing but not broadcast-quality.
-//! Upgrading to `rubato` is a drop-in replacement once the
-//! end-to-end path is validated.
+//! Sample-rate conversion uses `rubato`'s windowed-sinc resampler,
+//! which bandlimits as it resamples — no separate anti-alias filter
+//! is needed. The input / output devices and the recording /
+//! playback paths are all driven from here.
 
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
@@ -28,13 +28,20 @@ use std::time::Duration;
 
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use dstar_gateway_core::dprs::{DprsReport, Latitude, Longitude, encode_dprs};
+use dstar_gateway_core::slowdata::{encode_text_message, scramble};
+use dstar_gateway_core::types::Callsign;
 use dstar_gateway_core::voice::{DSTAR_NULL_SLOW_DATA_BYTES, DSTAR_SYNC_BYTES, VoiceFrame};
 use mbelib_rs::{AmbeDecoder, AmbeEncoder};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use rubato::{
+    Resampler as _, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{error, info, warn};
 
+use crate::geo::TxPosition;
 use crate::session::SessionCommand;
 
 /// AMBE native sample rate.
@@ -74,6 +81,149 @@ pub(crate) enum AudioCommand {
     RxStart,
     /// One voice frame arrived from the reflector — decode + play.
     RxFrame(VoiceFrame),
+    /// Set the operator's slow-data text and/or GPS beacon. Either
+    /// field may be `None`. Takes effect on the next TX frame.
+    SetSlowData {
+        /// Slow-data text message (≤20 chars; longer is truncated).
+        text: Option<String>,
+        /// Manual GPS position to beacon.
+        gps: Option<TxPosition>,
+    },
+    /// Re-enumerate audio devices; the worker replies via
+    /// `AudioStatus::DeviceList`.
+    EnumerateDevices,
+    /// Rebuild audio I/O on the named devices (`None` = host default).
+    SelectDevices {
+        /// Input device name.
+        input: Option<String>,
+        /// Output device name.
+        output: Option<String>,
+    },
+    /// Start recording received audio to a WAV file.
+    StartRecording,
+    /// Stop the active recording.
+    StopRecording,
+    /// Play a WAV file to the speakers locally (not transmitted).
+    PlayFile {
+        /// Path to a WAV file.
+        path: std::path::PathBuf,
+    },
+    /// Transmit a WAV file as an outgoing voice stream.
+    TransmitFile {
+        /// Path to a WAV file.
+        path: std::path::PathBuf,
+    },
+}
+
+/// Status pushed from the audio worker to the GUI. Drained every
+/// frame by `App::drain_audio_status`.
+#[derive(Debug, Clone)]
+pub(crate) enum AudioStatus {
+    /// Enumerated device names (input list, output list).
+    DeviceList {
+        /// Input device names.
+        inputs: Vec<String>,
+        /// Output device names.
+        outputs: Vec<String>,
+    },
+    /// Live peak levels in `0.0..=1.0` (TX mic, RX decoded).
+    Levels {
+        /// TX mic peak this tick.
+        tx_peak: f32,
+        /// RX decoded-audio peak this tick.
+        rx_peak: f32,
+    },
+    /// Recording started (`true`) or stopped (`false`).
+    Recording(bool),
+}
+
+/// Cyclic slow-data fragment scheduler for the TX path.
+///
+/// Holds the scrambled 3-byte fragments for the operator's current
+/// text message and/or GPS beacon. `pump_tx` pulls one fragment per
+/// non-sync superframe slot, cycling so the message + position repeat
+/// for the duration of the transmission — the cadence a receiving
+/// station expects.
+#[derive(Debug, Default)]
+struct TxSlowData {
+    /// Scrambled fragments; empty means "send null filler".
+    fragments: Vec<[u8; 3]>,
+    /// Next index into `fragments`.
+    cursor: usize,
+}
+
+impl TxSlowData {
+    /// Rebuild the fragment sequence from the operator's current text
+    /// and position. `my_call` names the DPRS sentence's station.
+    fn set(&mut self, text: Option<&str>, gps: Option<&TxPosition>, my_call: &str) {
+        let mut fragments = Vec::new();
+        if let Some(t) = text
+            && !t.is_empty()
+        {
+            fragments.extend(encode_text_message(t));
+        }
+        if let Some(pos) = gps.and_then(TxPosition::validated) {
+            fragments.extend(encode_gps_fragments(pos, my_call));
+        }
+        self.fragments = fragments;
+        self.cursor = 0;
+    }
+
+    /// Next fragment for a non-sync frame, or `None` when nothing is
+    /// scheduled (caller then sends the null-filler pattern).
+    fn next_fragment(&mut self) -> Option<[u8; 3]> {
+        let frag = self.fragments.get(self.cursor).copied()?;
+        self.cursor = (self.cursor + 1) % self.fragments.len();
+        Some(frag)
+    }
+}
+
+/// Fragment a DPRS sentence for `pos` into scrambled `0x3X` slow-data
+/// blocks (Kenwood layout: type byte + 5 payload bytes per 6-byte
+/// block, two 3-byte halves). Returns an empty vec if the position or
+/// callsign can't be encoded — lenient, never panics.
+fn encode_gps_fragments(pos: &TxPosition, my_call: &str) -> Vec<[u8; 3]> {
+    let Ok(callsign) = Callsign::try_from_str(my_call) else {
+        return Vec::new();
+    };
+    let (Ok(latitude), Ok(longitude)) = (
+        Latitude::try_new(pos.latitude),
+        Longitude::try_new(pos.longitude),
+    ) else {
+        return Vec::new();
+    };
+    let report = DprsReport {
+        callsign,
+        latitude,
+        longitude,
+        symbol: pos.symbol,
+        comment: if pos.comment.is_empty() {
+            None
+        } else {
+            Some(pos.comment.clone())
+        },
+    };
+    let mut sentence = String::new();
+    if encode_dprs(&report, &mut sentence).is_err() {
+        return Vec::new();
+    }
+    // DPRS sentences terminate with CR — the RX assembler scans for it.
+    sentence.push('\r');
+
+    let mut out = Vec::new();
+    for chunk in sentence.as_bytes().chunks(5) {
+        let mut block = [0u8; 6];
+        block[0] = 0x30; // GPS NMEA-passthrough type nibble.
+        for (slot, &b) in block.iter_mut().skip(1).zip(chunk) {
+            *slot = b;
+        }
+        for half in block.chunks(3) {
+            let mut frag = [0u8; 3];
+            frag.copy_from_slice(half);
+            out.push(scramble(frag));
+        }
+    }
+    out
 }
 
 impl AudioHandle {
@@ -82,8 +232,11 @@ impl AudioHandle {
     /// `session_tx` is used to push `StartTx` / `TxFrame` / `EndTx`
     /// commands at the session task; those are distinct from the
     /// `AudioCommand`s the GUI sends to the worker itself.
-    pub(crate) fn start(session_tx: tokio_mpsc::Sender<SessionCommand>) -> Self {
+    pub(crate) fn start(
+        session_tx: tokio_mpsc::Sender<SessionCommand>,
+    ) -> (Self, std_mpsc::Receiver<AudioStatus>) {
         let (cmd_tx, cmd_rx) = std_mpsc::channel();
+        let (status_tx, status_rx) = std_mpsc::channel();
         #[expect(
             clippy::expect_used,
             reason = "Thread spawn can only fail from OS resource exhaustion (PTHREAD_CREATE \
@@ -94,12 +247,15 @@ impl AudioHandle {
         )]
         let worker = std::thread::Builder::new()
             .name("sextant-audio".into())
-            .spawn(move || run_audio_worker(cmd_rx, session_tx))
+            .spawn(move || run_audio_worker(cmd_rx, session_tx, status_tx))
             .expect("spawn audio thread");
-        Self {
-            cmd_tx,
-            _worker: std::sync::Arc::new(worker),
-        }
+        (
+            Self {
+                cmd_tx,
+                _worker: std::sync::Arc::new(worker),
+            },
+            status_rx,
+        )
     }
 
     /// Send a command to the audio worker. Drops silently if the
@@ -112,24 +268,33 @@ impl AudioHandle {
 fn run_audio_worker(
     cmd_rx: std_mpsc::Receiver<AudioCommand>,
     session_tx: tokio_mpsc::Sender<SessionCommand>,
+    status_tx: std_mpsc::Sender<AudioStatus>,
 ) {
+    // Init failure is no longer fatal — the worker keeps running with
+    // no device so the operator can pick a working one from the audio
+    // panel. The error is still surfaced to the GUI.
     let audio = match AudioIo::init() {
-        Ok(a) => a,
+        Ok(a) => {
+            info!(
+                in_rate = a.input_rate,
+                in_chs = a.input_channels,
+                out_rate = a.output_rate,
+                out_chs = a.output_channels,
+                "audio initialised"
+            );
+            Some(a)
+        }
         Err(e) => {
-            error!(error = %e, "audio init failed — TX/RX disabled");
-            // Keep draining commands so the GUI doesn't deadlock on
-            // a full channel.
-            while let Ok(_cmd) = cmd_rx.recv() {}
-            return;
+            error!(error = %e, "audio init failed — TX/RX disabled until a device is selected");
+            // Surface to the GUI via the session task so the user sees
+            // a real error banner. `try_send` because the session task
+            // may not yet be polling — the bounded channel queues it.
+            if let Err(send_err) = session_tx.try_send(SessionCommand::AudioInitError(e)) {
+                error!(error = %send_err, "could not surface audio init error to GUI");
+            }
+            None
         }
     };
-    info!(
-        in_rate = audio.input_rate,
-        in_chs = audio.input_channels,
-        out_rate = audio.output_rate,
-        out_chs = audio.output_channels,
-        "audio initialised"
-    );
 
     let mut worker = AudioWorker {
         audio,
@@ -148,15 +313,32 @@ fn run_audio_worker(
         resampled_out: Vec::with_capacity(65_536),
         cmd_rx,
         session_tx,
+        status_tx,
         tx_stats: TxStats::default(),
         tx_superframe_idx: 0,
+        tx_slow_data: TxSlowData::default(),
+        tx_my_call: String::new(),
+        tx_peak: 0.0,
+        rx_peak: 0.0,
+        level_tick: 0,
+        recorder: None,
+        tx_file: None,
     };
+    // Enumerate devices once at startup so the GUI's pickers populate
+    // without waiting for an explicit EnumerateDevices command.
+    let (inputs, outputs) = enumerate_devices();
+    let _unused = worker
+        .status_tx
+        .send(AudioStatus::DeviceList { inputs, outputs });
     worker.run();
     info!("audio worker shutting down");
 }
 
 struct AudioWorker {
-    audio: AudioIo,
+    /// `None` when no audio device is open (init failed, or a device
+    /// switch is mid-flight). TX/RX silently no-op until a device
+    /// is (re)selected.
+    audio: Option<AudioIo>,
     encoder: AmbeEncoder,
     decoder: AmbeDecoder,
     tx_active: bool,
@@ -165,6 +347,9 @@ struct AudioWorker {
     resampled_out: Vec<f32>,
     cmd_rx: std_mpsc::Receiver<AudioCommand>,
     session_tx: tokio_mpsc::Sender<SessionCommand>,
+    /// Channel for pushing device lists, level meters, and recording
+    /// state to the GUI.
+    status_tx: std_mpsc::Sender<AudioStatus>,
     /// Mic-level statistics for the current TX session, reset on
     /// `StartTx` and logged on `StopTx`.  A summary at TX end tells
     /// us unambiguously whether the mic is producing meaningful
@@ -179,6 +364,23 @@ struct AudioWorker {
     /// frame after the header carries the sync pattern, which is what
     /// the receiving MMDVM modem locks onto to start audio decode.
     tx_superframe_idx: u8,
+    /// Operator's TX slow-data schedule (text + GPS beacon).
+    tx_slow_data: TxSlowData,
+    /// Operator callsign captured on `StartTx`, used for the DPRS
+    /// sentence in `tx_slow_data`.
+    tx_my_call: String,
+    /// Rolling TX mic peak (`0.0..=1.0`) since the last level push.
+    tx_peak: f32,
+    /// Rolling RX decoded-audio peak since the last level push.
+    rx_peak: f32,
+    /// `run`-loop ticks since the last `AudioStatus::Levels` push.
+    level_tick: u8,
+    /// Active WAV recording writer, `Some` while recording RX audio.
+    recorder: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>,
+    /// 8 kHz mono samples of a file being transmitted, `Some` while a
+    /// transmit-from-file is in progress. `pump_tx` pulls frames from
+    /// here instead of the mic.
+    tx_file: Option<std::vec::IntoIter<f32>>,
 }
 
 #[derive(Debug, Default)]
@@ -248,6 +450,17 @@ impl AudioWorker {
                 break;
             }
             self.pump_tx();
+            // Push level meters to the GUI ~every 50 ms (10 ticks).
+            self.level_tick += 1;
+            if self.level_tick >= 10 {
+                self.level_tick = 0;
+                let _unused = self.status_tx.send(AudioStatus::Levels {
+                    tx_peak: self.tx_peak,
+                    rx_peak: self.rx_peak,
+                });
+                self.tx_peak = 0.0;
+                self.rx_peak = 0.0;
+            }
             // ~5 ms tick keeps CPU low while the 20 ms TX cadence
             // stays responsive. Output-path jitter is absorbed by
             // the speaker ringbuf (~1 s of headroom at HW rate).
@@ -260,7 +473,9 @@ impl AudioWorker {
             AudioCommand::StartTx { my_call } => {
                 // Purge any stale mic samples so each keying starts
                 // fresh. `AudioIo::drain_mic` is non-blocking.
-                self.audio.drain_mic();
+                if let Some(audio) = self.audio.as_mut() {
+                    audio.drain_mic();
+                }
                 self.tx_active = true;
                 self.tx_stats.reset();
                 // First voice frame after the header is frame 0 of the
@@ -272,6 +487,8 @@ impl AudioWorker {
                 // Match the constructor in `start_audio_worker` —
                 // lookahead encoder for OP25-parity voice quality.
                 self.encoder = AmbeEncoder::new_with_lookahead();
+                // Remember the callsign for the DPRS slow-data sentence.
+                self.tx_my_call.clone_from(&my_call);
                 if let Err(e) = self.session_tx.try_send(SessionCommand::StartTx {
                     my_call: my_call.clone(),
                 }) {
@@ -279,49 +496,24 @@ impl AudioWorker {
                 }
                 tracing::info!(my_call, "TX path enabled — mic capture active");
             }
-            AudioCommand::StopTx => {
-                if self.tx_active {
-                    self.tx_active = false;
-                    // Emit a clear mic-health verdict at info so the
-                    // operator (and future-me reading a support log)
-                    // can tell in one line whether the mic was alive
-                    // this session.
-                    let stats = &self.tx_stats;
-                    let mean = stats.mean_peak();
-                    let silence_ratio = if stats.frames == 0 {
-                        0.0
-                    } else {
-                        f64::from(stats.silent_frames) / f64::from(stats.frames)
-                    };
-                    let diagnosis = if stats.peak_max < 0.001 {
-                        "MIC LIKELY DENIED — peak never exceeded -60 dBFS; \
-                         cpal is receiving zeros. macOS permission not granted. \
-                         Run via `open target/Sextant.app` (rebuild the bundle first)."
-                    } else if stats.peak_max < 0.02 {
-                        "MIC VERY QUIET — peak never exceeded -34 dBFS. Either \
-                         the mic is muted, the input device is wrong, or the \
-                         gain is set very low. The AMBE encoder will treat \
-                         this as silence."
-                    } else if silence_ratio > 0.7 {
-                        "MIC MOSTLY SILENT — <30% of frames had usable audio. \
-                         Speak louder/closer to the mic."
-                    } else {
-                        "MIC OK — producing signal above the floor-noise threshold."
-                    };
-                    tracing::info!(
-                        frames = stats.frames,
-                        peak_max = format_args!("{:.4}", stats.peak_max),
-                        peak_mean = format_args!("{mean:.4}"),
-                        silent_frames = stats.silent_frames,
-                        silence_ratio = format_args!("{:.1}%", silence_ratio * 100.0),
-                        "TX mic-level summary: {diagnosis}"
-                    );
-                    if let Err(e) = self.session_tx.try_send(SessionCommand::EndTx) {
-                        warn!(error = %e, "session EndTx enqueue failed");
-                    }
-                    tracing::info!("TX path disabled — mic capture stopped");
-                }
+            AudioCommand::SetSlowData { text, gps } => {
+                self.tx_slow_data
+                    .set(text.as_deref(), gps.as_ref(), &self.tx_my_call);
             }
+            AudioCommand::EnumerateDevices => {
+                let (inputs, outputs) = enumerate_devices();
+                let _unused = self
+                    .status_tx
+                    .send(AudioStatus::DeviceList { inputs, outputs });
+            }
+            AudioCommand::SelectDevices { input, output } => {
+                self.select_devices(input.as_deref(), output.as_deref());
+            }
+            AudioCommand::StartRecording => self.start_recording(),
+            AudioCommand::StopRecording => self.stop_recording(),
+            AudioCommand::PlayFile { path } => self.play_file(&path),
+            AudioCommand::TransmitFile { path } => self.transmit_file(&path),
+            AudioCommand::StopTx => self.stop_tx_capture(),
             AudioCommand::RxStart => {
                 tracing::info!("RX stream starting — decoder reset");
                 self.decoder = AmbeDecoder::new();
@@ -333,87 +525,247 @@ impl AudioWorker {
                 );
                 // Decode the 9-byte AMBE into 160 i16 samples @ 8 kHz.
                 let pcm_i16 = self.decoder.decode_frame(&frame.ambe);
+                // While recording, tee the decoded 8 kHz PCM straight
+                // to the WAV (the codec's native rate — no resampling).
+                if let Some(writer) = self.recorder.as_mut() {
+                    for &s in &pcm_i16 {
+                        let _unused = writer.write_sample(s);
+                    }
+                }
                 // Convert to f32 for resampling.
                 self.resampled_in.clear();
                 self.resampled_in
                     .extend(pcm_i16.iter().map(|&s| f32::from(s) / 32768.0));
+                // Track the RX peak for the level meter.
+                let rx_pk = self
+                    .resampled_in
+                    .iter()
+                    .fold(0.0_f32, |acc, &s| acc.max(s.abs()));
+                self.rx_peak = self.rx_peak.max(rx_pk);
                 // Resample to HW output rate, push to speaker ringbuf.
-                self.resampled_out.clear();
-                resample_linear(
-                    &self.resampled_in,
-                    AMBE_SAMPLE_RATE,
-                    self.audio.output_rate,
-                    &mut self.resampled_out,
-                );
-                self.audio.push_speaker(&self.resampled_out);
+                if let Some(audio) = self.audio.as_mut() {
+                    self.resampled_out = audio.rx_resampler.process(&self.resampled_in);
+                    audio.push_speaker(&self.resampled_out);
+                }
             }
         }
     }
 
-    /// Drain the mic ringbuf in 20-ms-at-8 kHz chunks; encode each;
-    /// forward to the session task as `TxFrame` commands.
+    /// Rebuild audio I/O on the named devices, surfacing any failure
+    /// to the GUI. Tears the old streams down first.
+    fn select_devices(&mut self, input: Option<&str>, output: Option<&str>) {
+        // Some hosts allow only one stream per device — drop the old
+        // `AudioIo` before opening the new one.
+        self.audio = None;
+        match AudioIo::init_with(input, output) {
+            Ok(io) => self.audio = Some(io),
+            Err(e) => {
+                error!(error = %e, "device switch failed");
+                if let Err(send_err) = self.session_tx.try_send(SessionCommand::AudioInitError(e)) {
+                    error!(error = %send_err, "could not surface device error");
+                }
+            }
+        }
+    }
+
+    /// Open a WAV recording, surfacing any failure to the GUI.
+    fn start_recording(&mut self) {
+        match open_recording_writer() {
+            Ok(w) => {
+                self.recorder = Some(w);
+                let _unused = self.status_tx.send(AudioStatus::Recording(true));
+            }
+            Err(e) => {
+                error!(error = %e, "could not start recording");
+                if let Err(se) = self.session_tx.try_send(SessionCommand::AudioInitError(e)) {
+                    error!(error = %se, "recording error not surfaced");
+                }
+            }
+        }
+    }
+
+    /// Finalize and close the active recording, if any.
+    fn stop_recording(&mut self) {
+        if let Some(w) = self.recorder.take() {
+            if let Err(e) = w.finalize() {
+                error!(error = %e, "finalize recording");
+            }
+            let _unused = self.status_tx.send(AudioStatus::Recording(false));
+        }
+    }
+
+    /// Stop a live mic transmission and log a one-line mic-health
+    /// verdict so the operator can tell whether the mic was alive.
+    fn stop_tx_capture(&mut self) {
+        if !self.tx_active {
+            return;
+        }
+        self.tx_active = false;
+        let stats = &self.tx_stats;
+        let mean = stats.mean_peak();
+        let silence_ratio = if stats.frames == 0 {
+            0.0
+        } else {
+            f64::from(stats.silent_frames) / f64::from(stats.frames)
+        };
+        let diagnosis = if stats.peak_max < 0.001 {
+            "MIC LIKELY DENIED — peak never exceeded -60 dBFS; \
+             cpal is receiving zeros. macOS permission not granted. \
+             Run via `open target/Sextant.app` (rebuild the bundle first)."
+        } else if stats.peak_max < 0.02 {
+            "MIC VERY QUIET — peak never exceeded -34 dBFS. Either \
+             the mic is muted, the input device is wrong, or the \
+             gain is set very low. The AMBE encoder will treat \
+             this as silence."
+        } else if silence_ratio > 0.7 {
+            "MIC MOSTLY SILENT — <30% of frames had usable audio. \
+             Speak louder/closer to the mic."
+        } else {
+            "MIC OK — producing signal above the floor-noise threshold."
+        };
+        tracing::info!(
+            frames = stats.frames,
+            peak_max = format_args!("{:.4}", stats.peak_max),
+            peak_mean = format_args!("{mean:.4}"),
+            silent_frames = stats.silent_frames,
+            silence_ratio = format_args!("{:.1}%", silence_ratio * 100.0),
+            "TX mic-level summary: {diagnosis}"
+        );
+        if let Err(e) = self.session_tx.try_send(SessionCommand::EndTx) {
+            warn!(error = %e, "session EndTx enqueue failed");
+        }
+        tracing::info!("TX path disabled — mic capture stopped");
+    }
+
+    /// Play a WAV file to the speakers locally (not transmitted).
+    fn play_file(&mut self, path: &std::path::Path) {
+        let Some(audio) = self.audio.as_mut() else {
+            return;
+        };
+        match load_wav_resampled(path, audio.output_rate) {
+            Ok(samples) => audio.push_speaker(&samples),
+            Err(e) => {
+                error!(error = %e, "play-file: load failed");
+                if let Err(se) = self.session_tx.try_send(SessionCommand::AudioInitError(e)) {
+                    error!(error = %se, "file error not surfaced");
+                }
+            }
+        }
+    }
+
+    /// Begin transmitting a WAV file as an outgoing voice stream.
+    /// Refused while a live-mic TX is already active.
+    fn transmit_file(&mut self, path: &std::path::Path) {
+        if self.tx_active {
+            warn!("transmit-from-file ignored — already transmitting");
+            return;
+        }
+        let samples = match load_wav_resampled(path, AMBE_SAMPLE_RATE) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "transmit-from-file: load failed");
+                if let Err(se) = self.session_tx.try_send(SessionCommand::AudioInitError(e)) {
+                    error!(error = %se, "file error not surfaced");
+                }
+                return;
+            }
+        };
+        self.tx_superframe_idx = 0;
+        self.encoder = AmbeEncoder::new_with_lookahead();
+        self.tx_file = Some(samples.into_iter());
+        self.tx_active = true;
+        if let Err(e) = self.session_tx.try_send(SessionCommand::StartTx {
+            my_call: self.tx_my_call.clone(),
+        }) {
+            warn!(error = %e, "file-transmit StartTx enqueue failed");
+        }
+    }
+
+    /// Pull the next 160-sample frame from a transmit-from-file, or
+    /// `None` when the file is exhausted (which ends the stream).
+    fn next_file_frame(&mut self) -> Option<Vec<f32>> {
+        let chunk: Vec<f32> = self
+            .tx_file
+            .as_mut()
+            .map_or_else(Vec::new, |f| f.by_ref().take(AMBE_FRAME_SAMPLES).collect());
+        if chunk.is_empty() {
+            // File exhausted — end the outgoing stream.
+            self.tx_file = None;
+            self.tx_active = false;
+            if let Err(e) = self.session_tx.try_send(SessionCommand::EndTx) {
+                warn!(error = %e, "file-transmit EndTx enqueue failed");
+            }
+            return None;
+        }
+        Some(chunk)
+    }
+
+    /// Pull one 20-ms mic frame, resampled to the 8 kHz codec rate, or
+    /// `None` when the mic ringbuf hasn't a full frame ready yet.
+    fn next_mic_frame(&mut self) -> Option<Vec<f32>> {
+        let audio = self.audio.as_mut()?;
+        let hw_per_frame = hw_samples_per_frame(audio.input_rate);
+        self.mic_scratch.clear();
+        if !audio.pop_mic(hw_per_frame, &mut self.mic_scratch) {
+            return None;
+        }
+        // Raw HW-rate mic peak — feeds the mic-health verdict.
+        let mic_peak = self
+            .mic_scratch
+            .iter()
+            .fold(0.0_f32, |acc, &s| acc.max(s.abs()));
+        let first_frame = self.tx_stats.record(mic_peak);
+        if !first_frame.peak.is_nan() {
+            tracing::info!(
+                first_peak = format_args!("{:.4}", first_frame.peak),
+                "TX: first mic-chunk peak captured"
+            );
+        }
+        Some(audio.tx_resampler.process(&self.mic_scratch))
+    }
+
+    /// Source 20-ms voice frames (mic or file), encode each, attach
+    /// the slow-data fragment, and forward to the session task.
     fn pump_tx(&mut self) {
         if !self.tx_active {
             // Avoid letting the mic ringbuf bloat while not transmitting.
-            self.audio.drain_mic();
+            if let Some(audio) = self.audio.as_mut() {
+                audio.drain_mic();
+            }
             return;
         }
-        // Samples per 20 ms at HW rate.
-        let hw_per_frame = hw_samples_per_frame(self.audio.input_rate);
         loop {
-            self.mic_scratch.clear();
-            if !self.audio.pop_mic(hw_per_frame, &mut self.mic_scratch) {
+            let from_file = self.tx_file.is_some();
+            let Some(mut codec_frame) = (if from_file {
+                self.next_file_frame()
+            } else {
+                self.next_mic_frame()
+            }) else {
                 break;
-            }
-            // Diagnostic: peak mic amplitude. This is the raw
-            // amplitude of the HW-rate mic samples before any
-            // resampling or encoding — so it reflects what cpal is
-            // actually delivering from CoreAudio.
-            let peak = self
-                .mic_scratch
-                .iter()
-                .fold(0.0_f32, |acc, &s| acc.max(s.abs()));
-            let first_frame = self.tx_stats.record(peak);
-            if !first_frame.peak.is_nan() {
-                // Info-level so the operator sees the very first
-                // frame's mic level immediately, without having to
-                // wait for the TX-end summary. If this is 0.0000
-                // the mic has been denied by macOS. If it's real
-                // (>0.01 for spoken voice), TX is at least feeding
-                // the encoder.
-                tracing::info!(
-                    first_peak = format_args!("{:.4}", first_frame.peak),
-                    "TX: first mic-chunk peak captured"
-                );
-            }
+            };
 
-            self.resampled_in.clear();
-            resample_linear(
-                &self.mic_scratch,
-                self.audio.input_rate,
-                AMBE_SAMPLE_RATE,
-                &mut self.resampled_in,
-            );
-            // Pad / truncate to exactly AMBE_FRAME_SAMPLES — linear
-            // resampling can produce N-1 or N+1 depending on rounding.
-            if self.resampled_in.len() < AMBE_FRAME_SAMPLES {
-                self.resampled_in.resize(AMBE_FRAME_SAMPLES, 0.0);
-            } else if self.resampled_in.len() > AMBE_FRAME_SAMPLES {
-                self.resampled_in.truncate(AMBE_FRAME_SAMPLES);
+            // Pad / truncate to exactly one codec frame.
+            if codec_frame.len() < AMBE_FRAME_SAMPLES {
+                codec_frame.resize(AMBE_FRAME_SAMPLES, 0.0);
+            } else if codec_frame.len() > AMBE_FRAME_SAMPLES {
+                codec_frame.truncate(AMBE_FRAME_SAMPLES);
             }
-            let ambe = self.encoder.encode_frame(&self.resampled_in);
-            // Slow-data superframe pattern: sync at frame 0, scrambled
-            // null at frames 1-20. See [`DSTAR_SYNC_BYTES`] /
-            // [`DSTAR_NULL_SLOW_DATA_BYTES`] for the rationale and the
-            // `MMDVMHost/DStarDefines.h` references.
+            let frame_peak = codec_frame.iter().fold(0.0_f32, |acc, &s| acc.max(s.abs()));
+            self.tx_peak = self.tx_peak.max(frame_peak);
+
+            let ambe = self.encoder.encode_frame(&codec_frame);
+            // Slow-data superframe pattern: sync at frame 0, then the
+            // operator's scheduled slow-data fragment (text / GPS) at
+            // frames 1-20, or the scrambled null filler otherwise.
             let slow_data = if self.tx_superframe_idx == 0 {
                 DSTAR_SYNC_BYTES
             } else {
-                DSTAR_NULL_SLOW_DATA_BYTES
+                self.tx_slow_data
+                    .next_fragment()
+                    .unwrap_or(DSTAR_NULL_SLOW_DATA_BYTES)
             };
             self.tx_superframe_idx = (self.tx_superframe_idx + 1) % 21;
             let frame = VoiceFrame { ambe, slow_data };
-            tracing::trace!(peak = format_args!("{peak:.4}"), "TX frame encoded");
             if let Err(e) = self.session_tx.try_send(SessionCommand::TxFrame(frame)) {
                 warn!(error = %e, "TxFrame enqueue dropped");
             }
@@ -433,17 +785,125 @@ struct AudioIo {
     input_channels: u16,
     output_rate: u32,
     output_channels: u16,
+    /// HW-rate mic frame → 8 kHz codec rate.
+    tx_resampler: Resampler,
+    /// 8 kHz codec rate → HW-rate speaker.
+    rx_resampler: Resampler,
+}
+
+/// Resample a whole buffer with a fixed-chunk sinc resampler. The
+/// final chunk is zero-padded. Empty on resampler-build failure.
+fn resample_buffer(samples: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
+    const CHUNK: usize = 1024;
+    if in_rate == out_rate || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let Some(mut rs) = Resampler::new(in_rate, out_rate, CHUNK) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for window in samples.chunks(CHUNK) {
+        let mut frame = window.to_vec();
+        frame.resize(CHUNK, 0.0);
+        out.extend(rs.process(&frame));
+    }
+    out
+}
+
+/// Read a WAV file as mono `f32` resampled to `target_rate`.
+///
+/// 16-bit PCM only — samples that don't decode as `i16` are dropped
+/// (a non-16-bit file therefore plays as silence rather than an
+/// error). Multi-channel input is folded to mono.
+fn load_wav_resampled(path: &std::path::Path, target_rate: u32) -> Result<Vec<f32>, String> {
+    let mut reader = hound::WavReader::open(path).map_err(|e| format!("open wav: {e}"))?;
+    let spec = reader.spec();
+    let channels = usize::from(spec.channels.max(1));
+    let raw: Vec<i16> = reader.samples::<i16>().filter_map(Result::ok).collect();
+    let mono: Vec<f32> = raw
+        .chunks(channels)
+        .map(|frame| {
+            let sum: f32 = frame.iter().map(|&s| f32::from(s) / 32768.0).sum();
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "channel count is a tiny integer (1..=8); exact in f32."
+            )]
+            let n = frame.len().max(1) as f32;
+            sum / n
+        })
+        .collect();
+    Ok(resample_buffer(&mono, spec.sample_rate, target_rate))
+}
+
+/// Open a new timestamped 8 kHz mono 16-bit WAV recording writer in
+/// `<config dir>/sextant/recordings/`.
+fn open_recording_writer() -> Result<hound::WavWriter<std::io::BufWriter<std::fs::File>>, String> {
+    let mut dir = dirs_next::config_dir().ok_or("no config dir")?;
+    dir.push("sextant");
+    dir.push("recordings");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create recordings dir: {e}"))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let path = dir.join(format!("rx-{stamp}.wav"));
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: AMBE_SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    hound::WavWriter::create(&path, spec).map_err(|e| format!("create wav: {e}"))
+}
+
+/// Enumerate cpal device names. Returns `(input names, output names)`.
+/// Devices whose name can't be read are skipped.
+fn enumerate_devices() -> (Vec<String>, Vec<String>) {
+    let host = cpal::default_host();
+    let inputs = host
+        .input_devices()
+        .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default();
+    let outputs = host
+        .output_devices()
+        .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default();
+    (inputs, outputs)
+}
+
+/// Find a device by name, or the host default. `is_input` selects
+/// which device list / default to consult.
+fn pick_device(host: &cpal::Host, name: Option<&str>, is_input: bool) -> Option<cpal::Device> {
+    if let Some(want) = name {
+        let devices = if is_input {
+            host.input_devices().ok()
+        } else {
+            host.output_devices().ok()
+        };
+        if let Some(found) =
+            devices.and_then(|mut d| d.find(|dev| dev.name().is_ok_and(|n| n == want)))
+        {
+            return Some(found);
+        }
+    }
+    if is_input {
+        host.default_input_device()
+    } else {
+        host.default_output_device()
+    }
 }
 
 impl AudioIo {
     fn init() -> Result<Self, String> {
+        Self::init_with(None, None)
+    }
+
+    /// Open the named input / output devices, falling back to the host
+    /// default when a name is `None` or not found.
+    fn init_with(input_name: Option<&str>, output_name: Option<&str>) -> Result<Self, String> {
         let host = cpal::default_host();
-        let input_device = host
-            .default_input_device()
-            .ok_or("no default audio input device")?;
-        let output_device = host
-            .default_output_device()
-            .ok_or("no default audio output device")?;
+        let input_device = pick_device(&host, input_name, true).ok_or("no audio input device")?;
+        let output_device =
+            pick_device(&host, output_name, false).ok_or("no audio output device")?;
 
         let input_cfg = input_device
             .default_input_config()
@@ -475,6 +935,18 @@ impl AudioIo {
             .play()
             .map_err(|e| format!("start output stream: {e}"))?;
 
+        // Per-direction sinc resamplers. The TX resampler consumes one
+        // 20 ms HW-rate mic frame; the RX resampler consumes one 160-
+        // sample (8 kHz) decoded voice frame.
+        let tx_resampler = Resampler::new(
+            input_rate,
+            AMBE_SAMPLE_RATE,
+            hw_samples_per_frame(input_rate),
+        )
+        .ok_or("build TX resampler")?;
+        let rx_resampler = Resampler::new(AMBE_SAMPLE_RATE, output_rate, AMBE_FRAME_SAMPLES)
+            .ok_or("build RX resampler")?;
+
         Ok(Self {
             _input_stream: input_stream,
             _output_stream: output_stream,
@@ -484,6 +956,8 @@ impl AudioIo {
             input_channels,
             output_rate,
             output_channels,
+            tx_resampler,
+            rx_resampler,
         })
     }
 
@@ -517,235 +991,43 @@ impl AudioIo {
     }
 }
 
-/// Linear interpolation resampler. `input_rate` → `output_rate`.
+/// Sinc resampler for one mono direction, wrapping `rubato::SincFixedIn`.
 ///
-/// Adequate for speech but not broadcast-quality. A future pass can
-/// swap in `rubato::SincFixedIn` for aliasing-free conversion.
-fn resample_linear(input: &[f32], input_rate: u32, output_rate: u32, output: &mut Vec<f32>) {
-    if input.is_empty() || input_rate == 0 || output_rate == 0 {
-        return;
-    }
-    if input_rate == output_rate {
-        output.extend_from_slice(input);
-        return;
-    }
-    // Anti-alias / anti-image filter at min(input, output) Nyquist:
-    // linear interpolation has no built-in low-pass, so without this
-    // step ALL the energy above the lower-rate Nyquist becomes
-    // spectral garbage — aliased back into the band on downsampling
-    // (TX path: 48 kHz mic → 8 kHz codec maps everything in
-    // [4 kHz, 24 kHz] into [0, 4 kHz]) or imaged into audible
-    // frequencies on upsampling (RX path: 8 kHz codec → 48 kHz speaker
-    // makes the codec spectrum repeat at 8, 16, 24 kHz; the 4-12 kHz
-    // image is audible as high-frequency whistle).
-    //
-    // **This was the root cause of the sextant↔sextant "garble noise"
-    // symptom on real microphone input** — every fricative, plosive,
-    // and broadband transient that the mic captured above 4 kHz
-    // folded back into the speech band, replacing the formants the
-    // AMBE codec was supposed to encode with phantom aliased content.
-    // The encoder then dutifully encoded the alias garbage; the
-    // receiver dutifully reconstructed it; users heard speech-shaped
-    // noise. Synthetic-input tests didn't catch this because synthetic
-    // signals are bandlimited to [0, 4 kHz] by construction.
-    //
-    // Cutoff: `0.45 × min_rate`. The 0.45 (vs the theoretical 0.5
-    // Nyquist) gives the 24-dB/oct rolloff some margin to reach
-    // significant attenuation by the time we hit the Nyquist edge.
-    // Cascaded 2× biquad → 4-pole Butterworth → -24 dB/oct. At 1
-    // octave above the cutoff (e.g. 7.2 kHz with a 3.6 kHz cutoff
-    // for an 8 kHz target rate) we are at ~-30 dB, well below the
-    // audible noise floor.
-    let min_rate = input_rate.min(output_rate);
-    let cutoff_hz = 0.45 * f64::from(min_rate);
-
-    let prefiltered: Vec<f32> = if input_rate > output_rate {
-        // Downsampling: filter input first to bandlimit before
-        // sample-rate-reducing linear interpolation.
-        let taps = design_lpf_fir(cutoff_hz, f64::from(input_rate));
-        apply_fir_lpf(input, &taps)
-    } else {
-        // Upsampling: linear interp first (cheaper to filter at the
-        // higher output rate after interpolation), filter applied
-        // post-interpolation below.
-        input.to_vec()
-    };
-    let input: &[f32] = &prefiltered;
-
-    let ratio = f64::from(input_rate) / f64::from(output_rate);
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "input.len() as f64 is a precision-loss-only lint; audio buffers are \
-                  small (voice frames, thousands of samples max) so f64's 52-bit \
-                  mantissa represents them exactly."
-    )]
-    let out_len_f = input.len() as f64 / ratio;
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "out_len_f is .round()ed from a positive product of small usize/audio \
-                  rates, always fits a usize and is non-negative."
-    )]
-    let out_len = out_len_f.round() as usize;
-    output.reserve(out_len);
-    for i in 0..out_len {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "i is bounded by out_len (small); i as f64 is exact for all audio \
-                      buffer sizes we will ever process."
-        )]
-        let src_pos = i as f64 * ratio;
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "src_pos is i*ratio where i>=0 and ratio>0, so src_pos is \
-                      non-negative and bounded by input.len() in the typical case; the \
-                      bounds check below protects against overshoot."
-        )]
-        let src_idx = src_pos as usize;
-        if src_idx >= input.len() {
-            break;
-        }
-        let next_idx = (src_idx + 1).min(input.len() - 1);
-        #[expect(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            reason = "src_idx as f64 is exact for small audio indices. The difference \
-                      (src_pos - src_idx) is in [0.0, 1.0); narrowing from f64 to f32 \
-                      loses only fractional precision that is inaudible in linear \
-                      interpolation weighting."
-        )]
-        let frac = (src_pos - src_idx as f64) as f32;
-        let a = input.get(src_idx).copied().unwrap_or(0.0);
-        let b = input.get(next_idx).copied().unwrap_or(a);
-        output.push((b - a).mul_add(frac, a));
-    }
-
-    // Anti-image filter for the upsampling case: zero-stuffing-style
-    // linear interpolation produces spectral images of the input at
-    // every multiple of `input_rate`, of which the first image
-    // (at [input_rate, output_rate - input_rate]) lands in the
-    // audible 4-12 kHz band when going 8 kHz → 48 kHz. Filter the
-    // output through the same Butterworth LPF used on the
-    // downsampling path.
-    if input_rate < output_rate && !output.is_empty() {
-        let taps = design_lpf_fir(cutoff_hz, f64::from(output_rate));
-        let filtered = apply_fir_lpf(output, &taps);
-        output.clear();
-        output.extend_from_slice(&filtered);
-    }
+/// `SincFixedIn` consumes a fixed input chunk and bandlimits with its
+/// own windowed-sinc filter, so it both resamples and anti-aliases in
+/// one step — replacing the previous hand-rolled linear-interpolation
+/// and FIR cascade. Both sextant directions resample fixed-size
+/// frames (160 samples at 8 kHz on RX, one HW-rate frame on TX),
+/// which is exactly the fixed-input contract `SincFixedIn` wants.
+struct Resampler {
+    inner: SincFixedIn<f32>,
 }
 
-/// FIR filter length for the anti-alias / anti-image low-pass.
-/// 63-tap Hamming-windowed sinc gives ~53 dB stopband rejection
-/// — enough to push aliased mic content (sibilance / plosives at
-/// 5-8 kHz) below the audible noise floor when downsampling to the
-/// 8 kHz AMBE codec rate. Linear-phase FIR avoids the
-/// near-cutoff sloppy rolloff that the cascaded-biquad approach
-/// suffered from (-19 dB at 8 kHz vs the -53 dB FIR delivers).
-const FIR_TAPS: usize = 63;
-
-/// Design a `FIR_TAPS`-long Hamming-windowed sinc low-pass filter
-/// for the given cutoff frequency and sample rate. Returns the
-/// time-domain impulse response (linear phase, symmetric).
-///
-/// Hamming window: `0.54 − 0.46·cos(2π·n/(N−1))`. Stopband
-/// attenuation ≈ 53 dB, transition bandwidth ≈ `3.3·sample_rate/N`
-/// for a 63-tap design — about 2.5 kHz at 48 kHz, narrow enough
-/// that we can pass the speech band (≤3.5 kHz) cleanly while
-/// rejecting alias content above 4 kHz.
-fn design_lpf_fir(cutoff_hz: f64, sample_rate: f64) -> [f32; FIR_TAPS] {
-    let mut taps = [0.0_f32; FIR_TAPS];
-    let fc_norm = cutoff_hz / sample_rate;
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "FIR_TAPS is a small compile-time constant; the usize→f64 cast is exact."
-    )]
-    let center = (FIR_TAPS - 1) as f64 / 2.0;
-
-    let mut sum = 0.0_f64;
-    for (i, slot) in taps.iter_mut().enumerate() {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "i bounded by FIR_TAPS; usize→f64 exact."
-        )]
-        let n = i as f64 - center;
-        // Sinc with normalized cutoff: 2·fc·sinc(2·fc·n).
-        let arg = 2.0 * fc_norm * n;
-        let sinc_val = if arg.abs() < 1e-9 {
-            2.0 * fc_norm
-        } else {
-            (std::f64::consts::PI * arg).sin() / (std::f64::consts::PI * n)
+impl Resampler {
+    /// Build a resampler from `in_rate` to `out_rate` for fixed input
+    /// chunks of `chunk` samples. `None` if rubato rejects the params.
+    fn new(in_rate: u32, out_rate: u32, chunk: usize) -> Option<Self> {
+        let params = SincInterpolationParameters {
+            sinc_len: 128,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 128,
+            window: WindowFunction::BlackmanHarris2,
         };
-        // Hamming window.
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "i and FIR_TAPS−1 are both small; usize→f64 exact."
-        )]
-        let win = (-0.46_f64).mul_add(
-            (2.0 * std::f64::consts::PI * i as f64 / (FIR_TAPS - 1) as f64).cos(),
-            0.54,
-        );
-        let h = sinc_val * win;
-        sum += h;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "filter taps are bounded |h| < 1 by construction; f64→f32 narrowing \
-                      drops only fractional precision below the audio noise floor."
-        )]
-        {
-            *slot = h as f32;
-        }
+        let ratio = f64::from(out_rate) / f64::from(in_rate);
+        let inner = SincFixedIn::new(ratio, 1.0, params, chunk, 1).ok()?;
+        Some(Self { inner })
     }
 
-    // Normalize for unity DC gain so the filter doesn't change the
-    // signal level on the DC component (any small drift from the
-    // window asymmetry is corrected here).
-    if sum.abs() > 1e-12 {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "normalizing factor is a finite f64 derived from a small finite \
-                      sum; narrowing to f32 is safe for our coefficient magnitudes."
-        )]
-        let norm = (1.0 / sum) as f32;
-        for slot in &mut taps {
-            *slot *= norm;
-        }
+    /// Resample one fixed-size chunk. `input.len()` must equal the
+    /// `chunk` the resampler was built with; a mismatch yields an
+    /// empty result rather than a panic.
+    fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        self.inner.process(&[input], None).map_or_else(
+            |_| Vec::new(),
+            |out| out.into_iter().next().unwrap_or_default(),
+        )
     }
-
-    taps
-}
-
-/// Apply a linear-phase symmetric FIR low-pass to the input slice.
-/// Implements direct convolution with zero-padding at the boundaries
-/// (no reflection or wrap). Output length matches input length.
-///
-/// At the buffer boundaries the output is degraded by the missing
-/// past-history samples, but for the sextant TX/RX path a single
-/// 20 ms buffer is processed with fresh state on each call — the
-/// boundary degradation is one filter-length worth of warmup
-/// (≈1.3 ms at 48 kHz) which is well within the 20 ms frame.
-fn apply_fir_lpf(input: &[f32], taps: &[f32; FIR_TAPS]) -> Vec<f32> {
-    let mut output = Vec::with_capacity(input.len());
-    let half = FIR_TAPS / 2;
-    for i in 0..input.len() {
-        let mut acc = 0.0_f32;
-        for (k, &tap) in taps.iter().enumerate() {
-            // Sample index = i + k - half. Use checked arithmetic
-            // to avoid signed-cast lints. For i + k >= half the
-            // sample lands inside the input; otherwise we're in the
-            // pre-buffer warmup zone where the convolution sum is
-            // effectively zero-padded.
-            let Some(src_idx) = (i + k).checked_sub(half) else {
-                continue;
-            };
-            if let Some(&x) = input.get(src_idx) {
-                acc = tap.mul_add(x, acc);
-            }
-        }
-        output.push(acc);
-    }
-    output
 }
 
 /// HW samples per 20 ms at the given rate.
@@ -925,114 +1207,46 @@ fn fill_stereo_from_mono_f32(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_fir_lpf, design_lpf_fir, resample_linear};
+    use super::Resampler;
 
-    /// FIR low-pass at 0.45 × 8000 Hz cutoff (designed for 48 kHz
-    /// input rate) must reject content above 4 kHz by ≥30 dB while
-    /// preserving the speech-formant range below 3 kHz to within
-    /// 1 dB. This is the bare minimum to prevent the alias-folded
-    /// "speech-shaped garble" symptom that broke sextant↔sextant
-    /// before the FIR was added.
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// rubato's sinc resampler must not alias: a 6500 Hz tone
+    /// resampled 48 kHz → 8 kHz must not produce 1500 Hz content
+    /// (6500 folds to 8000 − 6500 = 1500 without an anti-alias
+    /// filter). rubato's windowed-sinc kernel bandlimits before
+    /// downsampling — this guards the property the old hand-rolled
+    /// FIR provided; losing it brings sextant↔sextant "garble noise"
+    /// back.
     #[test]
-    fn fir_attenuates_above_speech_band() {
-        let cutoff = 3600.0_f64;
-        let fs = 48_000.0_f64;
-        let taps = design_lpf_fir(cutoff, fs);
+    fn resampler_does_not_alias_6500hz_tone() -> TestResult {
+        let chunk = 960_usize; // one 20 ms frame at 48 kHz
+        let mut rs = Resampler::new(48_000, 8_000, chunk).ok_or("build resampler")?;
 
-        let measure_db = |freq_hz: f64| -> f64 {
-            let n_samples = 4800_usize;
-            let mut sig = Vec::with_capacity(n_samples);
-            for i in 0..n_samples {
+        // 10 chunks of a 6500 Hz tone at 48 kHz, peak amplitude 0.5.
+        let mut down: Vec<f32> = Vec::new();
+        for c in 0..10_usize {
+            let mut frame = Vec::with_capacity(chunk);
+            for i in 0..chunk {
                 #[expect(
                     clippy::cast_precision_loss,
-                    reason = "test: i bounded by n_samples (4800), exact in f64."
+                    reason = "test: sample index bounded by 9600, exact in f32."
                 )]
-                let t = i as f64 / fs;
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "test: sine value bounded by 1.0, narrowing to f32 is exact."
-                )]
-                {
-                    sig.push((2.0 * std::f64::consts::PI * freq_hz * t).sin() as f32);
-                }
+                let t = (c * chunk + i) as f32 / 48_000.0;
+                frame.push(0.5 * (t * 2.0 * std::f32::consts::PI * 6500.0).sin());
             }
-            let filtered = apply_fir_lpf(&sig, &taps);
-            // Use RMS energy — peak detection is sensitive to phase/edge effects.
-            // Compute RMS over the steady-state region (skip filter group delay).
-            let warmup = 200_usize;
-            let body: Vec<f32> = filtered.into_iter().skip(warmup).collect();
-            let sum_sq: f32 = body.iter().map(|&v| v * v).sum();
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "test: body.len() bounded by 4800, exact in f32 mantissa."
-            )]
-            let n = body.len() as f32;
-            let rms = (sum_sq / n).sqrt();
-            // Compare against input RMS (which is 1/√2 for unit-amplitude sine).
-            let in_rms = 1.0_f32 / std::f32::consts::SQRT_2;
-            20.0 * f64::from((rms / in_rms).max(1e-9_f32)).log10()
-        };
-
-        // Passband — should be essentially unattenuated.
-        for &(f, max_db) in &[
-            (500.0, -1.0),
-            (1000.0, -1.0),
-            (2000.0, -1.0),
-            (3000.0, -2.0),
-        ] {
-            let db = measure_db(f);
-            assert!(
-                db > max_db,
-                "FIR at {f:.0} Hz attenuated to {db:.1} dB; expected > {max_db:.1} dB"
-            );
-        }
-        // Stopband — should be ≥ 30 dB attenuated.
-        for &(f, min_db) in &[(5000.0, -30.0), (6000.0, -40.0), (8000.0, -40.0)] {
-            let db = measure_db(f);
-            assert!(
-                db < min_db,
-                "FIR at {f:.0} Hz only attenuated to {db:.1} dB; expected < {min_db:.1} dB"
-            );
-        }
-    }
-
-    /// Round-tripping a 6500 Hz tone through the resampler (48 kHz →
-    /// 8 kHz → 48 kHz) must NOT alias to 1500 Hz. Without the FIR
-    /// anti-alias filter, linear resampling of a 6500 Hz tone at
-    /// 48 kHz produces full-amplitude alias content at 8000 - 6500 =
-    /// 1500 Hz on the way down. With the filter, the 6500 Hz content
-    /// is attenuated below the audible noise floor before
-    /// downsampling — the 1500 Hz alias is gone.
-    #[test]
-    fn resampler_does_not_alias_6500hz_tone() {
-        // 0.1 s of 6500 Hz tone at 48 kHz, peak amplitude 0.5
-        let n = 4800_usize;
-        let fs_in = 48_000.0_f32;
-        let mut input = Vec::with_capacity(n);
-        for i in 0..n {
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "test: i bounded by n=4800, exact in f32."
-            )]
-            let t = i as f32 / fs_in;
-            input.push(0.5 * (t * 2.0 * std::f32::consts::PI * 6500.0).sin());
+            down.extend(rs.process(&frame));
         }
 
-        // Downsample to 8 kHz
-        let mut down = Vec::new();
-        resample_linear(&input, 48_000, 8_000, &mut down);
-
-        // Measure energy at 1500 Hz (the would-be alias frequency) in
-        // the 8 kHz output. Should be near zero — the FIR pre-filter
-        // already killed the 6500 Hz content.
+        // Single-bin DFT at 1500 Hz (the would-be alias frequency).
         let mut re = 0.0_f32;
         let mut im = 0.0_f32;
         for (i, &s) in down.iter().enumerate() {
             #[expect(
                 clippy::cast_precision_loss,
-                reason = "test: i bounded by down.len() (~800), exact in f32."
+                reason = "test: i bounded by down.len() (~1600), exact in f32."
             )]
-            let t = i as f32 / 8000.0;
+            let t = i as f32 / 8_000.0;
             let phase = 2.0 * std::f32::consts::PI * 1500.0 * t;
             re += s * phase.cos();
             im += s * phase.sin();
@@ -1041,55 +1255,42 @@ mod tests {
             clippy::cast_precision_loss,
             reason = "test: down.len() small, exact in f32."
         )]
-        let n_down = down.len() as f32;
+        let n_down = down.len().max(1) as f32;
         let alias_mag = re.hypot(im) / n_down;
-        // Original 6500 Hz tone had amplitude 0.5; alias-free output
-        // should have ≤ 0.005 (40 dB below the input).
         assert!(
             alias_mag < 0.05,
-            "1500 Hz alias amplitude is {alias_mag:.4}, expected < 0.05 \
-             (this means the anti-alias FIR is leaking high-frequency \
-             content back into the speech band — sextant↔sextant garble \
-             noise will return)."
+            "1500 Hz alias amplitude {alias_mag:.4} exceeds 0.05 — the \
+             resampler is leaking high-frequency content into the speech \
+             band (sextant↔sextant garble noise)."
         );
+        Ok(())
     }
 
-    /// Full sextant↔sextant simulation in a single test:
-    ///   1. Generate realistic voice-like signal at 48 kHz HW rate.
-    ///   2. Resample 48 → 8 kHz with FIR anti-alias (TX path).
-    ///   3. AMBE-encode through the lookahead encoder (matches the
-    ///      production sextant TX).
-    ///   4. AMBE-decode (matches production sextant RX).
-    ///   5. Resample 8 → 48 kHz with FIR anti-image (RX path).
-    ///   6. Verify the output PCM has audio content — loud enough to
-    ///      be heard (not "garble noise"-quiet) and contains energy
-    ///      in the speech band where the input had energy.
-    ///
-    /// If this test passes, the codec + resampler + filter pipeline
-    /// is internally consistent. Any remaining sextant↔sextant
-    /// failure has to be in cpal I/O, network/POLARIS, or operator
-    /// configuration — *not* the audio processing path this test
-    /// exercises.
+    /// Full sextant↔sextant simulation: generate a voice-like signal,
+    /// resample 48 → 8 kHz (TX), AMBE-encode, AMBE-decode, resample
+    /// 8 → 48 kHz (RX), and verify the output is audible — not the
+    /// "garble noise" / "no voice" symptom. If this passes, the codec
+    /// and resampler pipeline is internally consistent; any remaining
+    /// sextant↔sextant failure is in cpal I/O, the network, or
+    /// operator configuration.
     #[test]
-    fn end_to_end_voice_pipeline_produces_audible_output() {
+    fn end_to_end_voice_pipeline_produces_audible_output() -> TestResult {
         use super::{AMBE_FRAME_SAMPLES, AMBE_SAMPLE_RATE};
         use mbelib_rs::{AmbeDecoder, AmbeEncoder};
 
         let hw_rate = 48_000_u32;
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "test: hw_rate * 0.020 = 960, fits trivially in usize."
-        )]
-        let frame_hw = (f64::from(hw_rate) * 0.020) as usize;
+        let frame_hw = 960_usize; // 20 ms at 48 kHz
+        let mut tx_rs =
+            Resampler::new(hw_rate, AMBE_SAMPLE_RATE, frame_hw).ok_or("build TX resampler")?;
+        let mut rx_rs = Resampler::new(AMBE_SAMPLE_RATE, hw_rate, AMBE_FRAME_SAMPLES)
+            .ok_or("build RX resampler")?;
 
-        // 1. Generate ~2 seconds of voice-like signal at 48 kHz.
-        //    F0 ≈ 130 Hz with vibrato + 8 harmonics decaying through
-        //    the formant range. RMS ≈ 8000 (≈ -12 dBFS, normal speech).
+        // 1. ~2 s of voice-like signal at 48 kHz: F0 ≈ 130 Hz with
+        //    vibrato + 8 decaying harmonics and a syllabic envelope.
         let n_frames = 100_usize;
-        let total_hw_samples = n_frames * frame_hw;
-        let mut hw_input = Vec::with_capacity(total_hw_samples);
-        for i in 0..total_hw_samples {
+        let total_hw = n_frames * frame_hw;
+        let mut hw_input = Vec::with_capacity(total_hw);
+        for i in 0..total_hw {
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "test: i bounded by 96000, exact in f32."
@@ -1108,74 +1309,87 @@ mod tests {
                 let kf = (k + 1) as f32;
                 s += amp * (t * 2.0 * std::f32::consts::PI * f0 * kf).sin();
             }
-            // Syllabic envelope so we exercise both voiced and quieter
-            // transitions.
             let env = 0.3_f32.mul_add((t * 2.0 * std::f32::consts::PI * 3.0).sin().abs(), 0.4);
             hw_input.push(0.4 * env * s);
         }
 
-        // 2. Encode all frames through the production pipeline:
-        //    HW resample → AMBE encode.
+        // 2. TX: resample 48 → 8 kHz, AMBE-encode.
         let mut enc = AmbeEncoder::new_with_lookahead();
-        let mut wire_frames: Vec<[u8; 9]> = Vec::with_capacity(n_frames);
+        let mut wire: Vec<[u8; 9]> = Vec::with_capacity(n_frames);
         for f in 0..n_frames {
             let start = f * frame_hw;
-            let end = start + frame_hw;
-            let chunk_hw = hw_input.get(start..end).unwrap_or(&[]);
-            let mut resampled = Vec::with_capacity(AMBE_FRAME_SAMPLES);
-            resample_linear(chunk_hw, hw_rate, AMBE_SAMPLE_RATE, &mut resampled);
-            // Pad/truncate as the production pump_tx does.
+            let chunk = hw_input.get(start..start + frame_hw).unwrap_or(&[]);
+            let mut resampled = tx_rs.process(chunk);
+            // Pad / truncate to exactly one codec frame.
             if resampled.len() < AMBE_FRAME_SAMPLES {
                 resampled.resize(AMBE_FRAME_SAMPLES, 0.0);
             } else if resampled.len() > AMBE_FRAME_SAMPLES {
                 resampled.truncate(AMBE_FRAME_SAMPLES);
             }
-            wire_frames.push(enc.encode_frame(&resampled));
+            wire.push(enc.encode_frame(&resampled));
         }
 
-        // 3. Decode + resample-up.
-        let mut decoder = AmbeDecoder::new();
-        let mut hw_output: Vec<f32> = Vec::with_capacity(total_hw_samples);
-        for ambe in &wire_frames {
-            let pcm_int = decoder.decode_frame(ambe);
-            let pcm_norm: Vec<f32> = pcm_int.iter().map(|&s| f32::from(s) / 32768.0).collect();
-            let mut up = Vec::with_capacity(frame_hw);
-            resample_linear(&pcm_norm, AMBE_SAMPLE_RATE, hw_rate, &mut up);
-            hw_output.extend(up);
+        // 3. RX: AMBE-decode, resample 8 → 48 kHz.
+        let mut dec = AmbeDecoder::new();
+        let mut hw_output: Vec<f32> = Vec::with_capacity(total_hw);
+        for ambe in &wire {
+            let pcm = dec.decode_frame(ambe);
+            let norm: Vec<f32> = pcm.iter().map(|&s| f32::from(s) / 32768.0).collect();
+            hw_output.extend(rx_rs.process(&norm));
         }
 
-        // 4. Skip first 5 frames of warmup (lookahead encoder + decoder
-        //    state takes a few frames to converge).
-        let warmup_hw = 5 * frame_hw;
-        let body = hw_output.get(warmup_hw..).unwrap_or(&[]);
-        let n_body = body.len();
-        assert!(n_body > 0, "no decoded output past warmup");
+        // 4. Skip warmup — encoder, decoder, and both resamplers take
+        //    a few frames to converge.
+        let warmup = 8 * frame_hw;
+        let body = hw_output.get(warmup..).unwrap_or(&[]);
+        assert!(!body.is_empty(), "no decoded output past warmup");
 
-        // 5. Compute RMS and peak.
+        // 5. RMS / peak. The parametric codec doesn't preserve phase,
+        //    but loudness should land within ~6 dB of the input.
         let sum_sq: f32 = body.iter().map(|&v| v * v).sum();
         #[expect(
             clippy::cast_precision_loss,
-            reason = "test: n_body bounded by ~96000, exact in f32 mantissa."
+            reason = "test: body.len() bounded by ~96000, exact in f32 mantissa."
         )]
-        let rms = (sum_sq / n_body as f32).sqrt();
+        let rms = (sum_sq / body.len() as f32).sqrt();
         let peak = body.iter().map(|&v| v.abs()).fold(0.0_f32, f32::max);
-
-        // Assertions.
-        // Original signal had RMS ≈ 0.13 (peak ≈ 0.4 with envelope).
-        // The AMBE codec is parametric — phase isn't preserved, but
-        // RMS/loudness should be within ~6 dB of the input.
         assert!(
             rms > 0.02,
-            "decoded RMS = {rms:.4} is below 0.02 — pipeline is producing \
-             near-silent output (the 'garble noise'/'no voice' symptom). \
-             Expected: ≥ 0.02 (≈ -34 dBFS, well above any plausible \
-             noise floor)."
+            "decoded RMS {rms:.4} below 0.02 — pipeline producing near-silent output."
         );
         assert!(
             peak > 0.05,
-            "decoded peak = {peak:.4} is below 0.05 — pipeline is producing \
-             near-silent output. Expected ≥ 0.05 (≈ -26 dBFS) for a voice \
-             input that started at peak ≈ 0.4."
+            "decoded peak {peak:.4} below 0.05 — pipeline producing near-silent output."
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tx_slow_data_text_roundtrips_through_collector() {
+        use dstar_gateway_core::slowdata::SlowDataTextCollector;
+
+        let mut sched = super::TxSlowData::default();
+        sched.set(Some("CQ TEST"), None, "W1AW");
+        // `encode_text_message` yields exactly 8 fragments for non-empty
+        // text — pull them and feed the RX collector at seq 1..=8.
+        let mut collector = SlowDataTextCollector::new();
+        for seq in 1u8..=8 {
+            let Some(frag) = sched.next_fragment() else {
+                break;
+            };
+            collector.push(frag, seq);
+        }
+        let msg = collector.take_message();
+        assert!(
+            matches!(&msg, Some(m) if m.starts_with(b"CQ TEST")),
+            "TX-scheduled text must decode back through the RX collector, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn tx_slow_data_empty_yields_no_fragments() {
+        let mut sched = super::TxSlowData::default();
+        sched.set(None, None, "W1AW");
+        assert!(sched.next_fragment().is_none());
     }
 }

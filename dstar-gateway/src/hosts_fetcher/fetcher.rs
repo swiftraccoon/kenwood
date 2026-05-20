@@ -1,24 +1,11 @@
-//! Downloads and parses Pi-Star reflector host files.
+//! Downloads and parses the XLX reflector directory.
 
-use dstar_gateway_core::hosts::HostFile;
+use dstar_gateway_core::hosts::{HostEntry, parse_xlx_directory};
+use dstar_gateway_core::types::ProtocolKind;
 
-/// Canonical Pi-Star URL for the `DPlus` (REF) reflector host list.
-const REF_HOSTS_URL: &str = "https://hosts.pistar.uk/hosts/REFHosts.txt";
-
-/// Canonical Pi-Star URL for the `DExtra` (XRF) reflector host list.
-const XRF_HOSTS_URL: &str = "https://hosts.pistar.uk/hosts/XRFHosts.txt";
-
-/// Canonical Pi-Star URL for the `DCS` reflector host list.
-const DCS_HOSTS_URL: &str = "https://hosts.pistar.uk/hosts/DCSHosts.txt";
-
-/// Default UDP port for `DPlus` (REF) reflectors.
-const DEFAULT_DPLUS_PORT: u16 = 20001;
-
-/// Default UDP port for `DExtra` (XRF) reflectors.
-const DEFAULT_DEXTRA_PORT: u16 = 30001;
-
-/// Default UDP port for `DCS` reflectors.
-const DEFAULT_DCS_PORT: u16 = 30051;
+/// XLX self-registration registry — the live, auto-generated reflector
+/// directory. Emits `REF` / `XRF` / `DCS` entries for every reflector.
+const XLX_DIRECTORY_URL: &str = "http://xlxapi.rlx.lu/api.php?do=GetReflectorHostname";
 
 /// Errors returned by [`HostsFetcher`].
 #[derive(Debug, thiserror::Error)]
@@ -29,17 +16,9 @@ pub enum FetcherError {
     Http(#[from] reqwest::Error),
 }
 
-/// Downloads Pi-Star reflector host files and parses them into
-/// [`HostFile`] values.
-///
-/// Default URLs:
-/// - `DPlus` (REF): <https://hosts.pistar.uk/hosts/REFHosts.txt>
-/// - `DExtra` (XRF): <https://hosts.pistar.uk/hosts/XRFHosts.txt>
-/// - `DCS`: <https://hosts.pistar.uk/hosts/DCSHosts.txt>
-///
-/// The fetched text is parsed via
-/// [`dstar_gateway_core::hosts::HostFile::parse`], which tolerates the
-/// slightly different column layouts of each file.
+/// Downloads the XLX reflector directory and parses it into
+/// protocol-tagged [`HostEntry`] values via
+/// [`dstar_gateway_core::hosts::parse_xlx_directory`].
 #[derive(Debug, Default, Clone)]
 pub struct HostsFetcher {
     client: reqwest::Client,
@@ -52,7 +31,10 @@ impl HostsFetcher {
         Self::default()
     }
 
-    /// Fetch and parse the `DPlus` (REF) host list.
+    /// Fetch and parse the XLX reflector directory.
+    ///
+    /// Returns one `(protocol, entry)` pair per reflector per protocol
+    /// prefix — the same reflector appears as `REF`, `XRF`, and `DCS`.
     ///
     /// # Errors
     ///
@@ -61,72 +43,21 @@ impl HostsFetcher {
     ///
     /// # Cancellation safety
     ///
-    /// This method is cancel-safe. Dropping the future mid-request
-    /// cancels the underlying `reqwest` call cleanly; the cached
-    /// reqwest `Client` is unaffected and the next call can start a
-    /// fresh request.
-    pub async fn fetch_dplus(&self) -> Result<HostFile, FetcherError> {
+    /// Cancel-safe. Dropping the future mid-request cancels the
+    /// underlying `reqwest` call cleanly; the cached `Client` is
+    /// unaffected and the next call starts a fresh request.
+    pub async fn fetch_xlx_directory(
+        &self,
+    ) -> Result<Vec<(ProtocolKind, HostEntry)>, FetcherError> {
         let body = self
             .client
-            .get(REF_HOSTS_URL)
+            .get(XLX_DIRECTORY_URL)
             .send()
             .await?
             .error_for_status()?
             .text()
             .await?;
-        let mut hf = HostFile::new();
-        hf.parse(&body, DEFAULT_DPLUS_PORT);
-        Ok(hf)
-    }
-
-    /// Fetch and parse the `DExtra` (XRF) host list.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FetcherError::Http`] on network failure or a non-2xx
-    /// HTTP response.
-    ///
-    /// # Cancellation safety
-    ///
-    /// This method is cancel-safe. See [`Self::fetch_dplus`] for
-    /// details.
-    pub async fn fetch_dextra(&self) -> Result<HostFile, FetcherError> {
-        let body = self
-            .client
-            .get(XRF_HOSTS_URL)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        let mut hf = HostFile::new();
-        hf.parse(&body, DEFAULT_DEXTRA_PORT);
-        Ok(hf)
-    }
-
-    /// Fetch and parse the `DCS` host list.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FetcherError::Http`] on network failure or a non-2xx
-    /// HTTP response.
-    ///
-    /// # Cancellation safety
-    ///
-    /// This method is cancel-safe. See [`Self::fetch_dplus`] for
-    /// details.
-    pub async fn fetch_dcs(&self) -> Result<HostFile, FetcherError> {
-        let body = self
-            .client
-            .get(DCS_HOSTS_URL)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        let mut hf = HostFile::new();
-        hf.parse(&body, DEFAULT_DCS_PORT);
-        Ok(hf)
+        Ok(parse_xlx_directory(&body))
     }
 }
 
@@ -136,13 +67,9 @@ mod tests {
 
     #[test]
     fn fetcher_new_builds_default_client() {
-        // No actual network calls in unit tests. The default client
-        // constructor never fails for the in-memory defaults.
+        // No network calls in unit tests. Round-trip through Clone
+        // proves the derive holds — the inner reqwest::Client is Clone.
         let fetcher = HostsFetcher::new();
-        // Round-trip through Clone proves the derive holds — the
-        // inner reqwest::Client is itself `Clone`. Both bindings
-        // are kept live by the debug-print below so clippy's
-        // `redundant_clone` doesn't fire.
         let cloned = fetcher.clone();
         assert_eq!(format!("{fetcher:?}"), format!("{cloned:?}"));
     }
@@ -154,10 +81,6 @@ mod tests {
     }
 
     /// Compile-time exhaustive match over [`FetcherError`] variants.
-    ///
-    /// If a new variant is added without updating this arm, the
-    /// compiler will force us to handle it here too. That's the
-    /// test — the function body never runs.
     const fn _exhaustive_variant_check(err: &FetcherError) {
         match *err {
             FetcherError::Http(_) => {}

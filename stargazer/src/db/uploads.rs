@@ -23,7 +23,7 @@
 use chrono::Utc;
 use sqlx::PgPool;
 
-use super::streams::StreamRow;
+use super::streams::{PendingUploadRow, StreamSummaryRow};
 
 /// Returns streams awaiting upload, ordered by creation time.
 ///
@@ -35,15 +35,15 @@ use super::streams::StreamRow;
 /// # Errors
 ///
 /// Returns `sqlx::Error` on query failure.
-pub(crate) async fn get_pending(pool: &PgPool, limit: i64) -> Result<Vec<StreamRow>, sqlx::Error> {
+pub(crate) async fn get_pending(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<PendingUploadRow>, sqlx::Error> {
     // Only select streams that have completed MP3 encoding (audio_mp3 IS NOT
     // NULL) and are still in pending state. Ordered by created_at ASC for FIFO.
-    sqlx::query_as::<_, StreamRow>(
-        "SELECT id, reflector, module, protocol, stream_id, callsign,
-                suffix, ur_call, dstar_text, dprs_lat, dprs_lon,
-                started_at, ended_at, frame_count, audio_mp3,
-                upload_status, upload_attempts, last_upload_error,
-                uploaded_at, created_at
+    sqlx::query_as::<_, PendingUploadRow>(
+        "SELECT id, reflector, module, protocol, callsign, suffix,
+                dstar_text, started_at, audio_mp3, upload_attempts
          FROM streams
          WHERE upload_status = 'pending' AND audio_mp3 IS NOT NULL
          ORDER BY created_at ASC
@@ -54,20 +54,52 @@ pub(crate) async fn get_pending(pool: &PgPool, limit: i64) -> Result<Vec<StreamR
     .await
 }
 
-/// Marks a stream as successfully uploaded.
+/// Returns pending uploads for the HTTP `/api/upload-queue` view.
 ///
-/// Sets `upload_status = 'uploaded'` and records the current timestamp in
-/// `uploaded_at`. Called by the upload processor after a successful Rdio API
+/// Same filter and ordering as [`get_pending`], but projects to
+/// [`StreamSummaryRow`]: the operational view never needs the MP3 blob, and
+/// loading it for a listing of up to 500 rows would transfer it for nothing.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` on query failure.
+pub(crate) async fn list_pending(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<StreamSummaryRow>, sqlx::Error> {
+    sqlx::query_as::<_, StreamSummaryRow>(
+        "SELECT id, reflector, module, protocol, stream_id, callsign,
+                suffix, ur_call, dstar_text, dprs_lat, dprs_lon,
+                started_at, ended_at, frame_count,
+                upload_status, last_upload_error, uploaded_at, created_at
+         FROM streams
+         WHERE upload_status = 'pending' AND audio_mp3 IS NOT NULL
+         ORDER BY created_at ASC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Marks a stream as successfully uploaded and reclaims its audio blob.
+///
+/// Sets `upload_status = 'uploaded'`, records the current timestamp in
+/// `uploaded_at`, and clears `audio_mp3` to `NULL`. Once the Rdio server holds
+/// the recording, stargazer's copy is pure redundancy; keeping it would grow
+/// Postgres without bound (the metadata row is retained for the operational
+/// history). Called by the upload processor after a successful Rdio API
 /// response.
 ///
 /// # Errors
 ///
 /// Returns `sqlx::Error` on query failure.
 pub(crate) async fn mark_uploaded(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
-    // Transition to terminal 'uploaded' state with timestamp.
+    // Transition to terminal 'uploaded' state, stamp the time, and drop the
+    // now-redundant MP3 blob so the durable spool drains.
     let _result = sqlx::query(
         "UPDATE streams
-         SET upload_status = 'uploaded', uploaded_at = $1
+         SET upload_status = 'uploaded', uploaded_at = $1, audio_mp3 = NULL
          WHERE id = $2",
     )
     .bind(Utc::now())

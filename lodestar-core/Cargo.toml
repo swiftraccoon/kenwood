@@ -31,7 +31,14 @@ dstar-gateway = { path = "../dstar-gateway" }
 # Sans-io MMDVM wire-frame codec (`[0xE0, len, cmd, payload...]`).
 mmdvm-core = { path = "../mmdvm-core" }
 # Runtime: reused across FFI calls that drive reflector I/O.
-tokio = { version = "1", features = ["net", "time", "sync", "rt", "macros", "io-util"] }
+tokio = { version = "1", features = [
+  "net",
+  "time",
+  "sync",
+  "rt",
+  "macros",
+  "io-util",
+] }
 # Error wrapping for the FFI-visible ReflectorError enum.
 thiserror = "2"
 # Tracing for diagnostics inside the async session tasks.

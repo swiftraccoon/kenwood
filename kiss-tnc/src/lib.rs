@@ -21,15 +21,20 @@
 //! # Example
 //!
 //! ```
-//! use kiss_tnc::{CMD_DATA, FEND, KissDecoder};
+//! use kiss_tnc::{FEND, KissCommand, KissDecoder, KissPort};
 //!
+//! // A complete KISS data frame on the wire: FEND, type byte 0x00
+//! // (port 0, command Data), one payload byte 0x41, FEND.
 //! let mut decoder = KissDecoder::new();
-//! let bytes = &[FEND, 0x00, 0x01, FEND];
-//! decoder.push(bytes);
-//! // In the real crate this returns the decoded frame; the scaffold
-//! // stub returns an error, so we only demonstrate the API shape here.
-//! let _ = decoder.next_frame();
-//! let _ = (CMD_DATA, FEND);
+//! decoder.push(&[FEND, 0x00, 0x41, FEND]);
+//!
+//! let frame = decoder
+//!     .next_frame()?
+//!     .expect("the pushed bytes form one complete frame");
+//! assert_eq!(frame.port, KissPort::TH_D75);
+//! assert_eq!(frame.command, KissCommand::Data);
+//! assert_eq!(frame.data, [0x41]);
+//! # Ok::<(), kiss_tnc::KissError>(())
 //! ```
 //!
 //! # References
@@ -50,7 +55,7 @@ pub use command::{
     CMD_DATA, CMD_FULL_DUPLEX, CMD_PERSISTENCE, CMD_RETURN, CMD_SET_HARDWARE, CMD_SLOT_TIME,
     CMD_TX_DELAY, CMD_TX_TAIL, FEND, FESC, KissCommand, KissPort, TFEND, TFESC,
 };
-pub use decoder::KissDecoder;
+pub use decoder::{DEFAULT_MAX_FRAME_LEN, KissDecoder};
 pub use error::KissError;
 pub use frame::{KissFrame, decode_kiss_frame, encode_kiss_frame, encode_kiss_frame_into};
 

@@ -255,7 +255,7 @@ fn mock_modify_page_sequence(
     original: &[u8; 256],
     expected: &[u8; 256],
 ) -> Result<(), BoxErr> {
-    mock.expect(b"0M PROGRAM\r", b"0M\r");
+    mock.expect(b"\r0M PROGRAM\r", b"0M\r");
     let read_cmd = programming::build_read_command(page);
     mock.expect(&read_cmd, &build_w_response(page, original)?);
     mock.expect(&[programming::ACK], &[programming::ACK]);

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use kenwood_thd75::LinkDiagnosis;
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::transport::SerialTransport;
@@ -15,6 +16,41 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Reconnect poll interval after disconnect.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A failure to bring the radio up into CAT control mode.
+///
+/// Produced by `spawn_with_transport`. The `message` is fully rendered
+/// and ready to print as-is; `diagnosis` is set when an identify
+/// attempt failed and the link could be probed.
+pub(crate) struct ConnectFailure {
+    /// Operator-facing failure text, ready to print.
+    pub(crate) message: String,
+    /// Link diagnosis, when a probe ran; `None` for failures that occur
+    /// before the link can be probed (e.g. no radio found).
+    pub(crate) diagnosis: Option<LinkDiagnosis>,
+}
+
+impl ConnectFailure {
+    /// A failure with no specific link diagnosis.
+    pub(crate) const fn generic(message: String) -> Self {
+        Self {
+            message,
+            diagnosis: None,
+        }
+    }
+
+    /// A failure backed by a `LinkDiagnosis` probe — the message is
+    /// built from the diagnosis's operator guidance.
+    pub(crate) fn diagnosed(diagnosis: LinkDiagnosis) -> Self {
+        Self {
+            message: format!(
+                "Could not establish CAT control with the TH-D75.\n\n{}",
+                diagnosis.guidance()
+            ),
+            diagnosis: Some(diagnosis),
+        }
+    }
+}
 
 /// Open a transport on the calling thread (must be main for BT).
 ///
@@ -78,30 +114,36 @@ pub(crate) async fn spawn_with_transport(
     mut cmd_rx: mpsc::UnboundedReceiver<crate::event::RadioCommand>,
     bt_req_tx: std::sync::mpsc::Sender<(Option<String>, u32)>,
     bt_resp_rx: std::sync::mpsc::Receiver<Result<(String, EitherTransport), String>>,
-) -> Result<String, String> {
+) -> Result<String, ConnectFailure> {
     let baud = SerialTransport::DEFAULT_BAUD;
-    let mut radio = Radio::connect(transport)
-        .await
-        .map_err(|e| format!("Connect failed: {e}"))?;
+    // connect_safe sends a TNC-exit preamble, recovering a radio that a
+    // crashed application left stuck in KISS mode.
+    let mut radio = Radio::connect_safe(transport).await.map_err(|e| {
+        ConnectFailure::generic(format!("Could not initialise the radio link: {e}"))
+    })?;
 
     if mcp_speed == "fast" {
         radio.set_mcp_speed(kenwood_thd75::McpSpeed::Fast);
     }
 
-    // Verify identity and read static info
-    let _info = radio
-        .identify()
-        .await
-        .map_err(|e| format!("Identify failed: {e}"))?;
+    // Verify identity. A failure here — most often a timeout — means the
+    // radio is not answering CAT control: it is in Reflector Terminal
+    // Mode, or otherwise unresponsive. Probe the link so the operator
+    // gets actionable guidance instead of a bare "command timed out".
+    if radio.identify().await.is_err() {
+        let diagnosis = radio.diagnose_link().await;
+        return Err(ConnectFailure::diagnosed(diagnosis));
+    }
 
     // Enable AI (Auto Information) mode — radio pushes BY/FQ/MD notifications
     // instead of requiring polling. This is critical for reliable S-meter:
     // AI-pushed BY notifications go through the radio's internal squelch
     // debouncing, while polled BY reads raw hardware state with spurious spikes.
-    radio
-        .set_auto_info(true)
-        .await
-        .map_err(|e| format!("AI mode failed: {e}"))?;
+    radio.set_auto_info(true).await.map_err(|e| {
+        ConnectFailure::generic(format!(
+            "Radio connected, but enabling Auto-Information mode failed: {e}"
+        ))
+    })?;
 
     // Subscribe to unsolicited notifications from AI mode
     let mut notifications = radio.subscribe();

@@ -6,11 +6,13 @@
 //!
 //! Lines starting with `#` are comments. Empty lines are skipped.
 //!
-//! Sources for host files:
-//! - <https://hosts.pistar.uk/hosts/>
-//! - Local reflector operators
+//! Host lists come from the XLX self-registration registry
+//! (`xlxapi.rlx.lu`) and the `DPlus` auth server; see
+//! [`parse_xlx_directory`] for the registry format.
 
 use std::collections::HashMap;
+
+use crate::types::ProtocolKind;
 
 /// A resolved reflector host entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +112,58 @@ impl HostFile {
     }
 }
 
+/// Default UDP port for `DPlus` (`REF`) reflectors.
+const XLX_DPLUS_PORT: u16 = 20001;
+/// Default UDP port for `DExtra` (`XRF`) reflectors.
+const XLX_DEXTRA_PORT: u16 = 30001;
+/// Default UDP port for `DCS` reflectors.
+const XLX_DCS_PORT: u16 = 30051;
+
+/// Parse the XLX reflector directory into protocol-tagged host entries.
+///
+/// This is the `xlxapi.rlx.lu/api.php?do=GetReflectorHostname` format:
+/// one `name<whitespace>address` entry per line, grouped under `#`
+/// comment headers. The same reflector appears once per protocol
+/// prefix (`REF`, `XRF`, `DCS`), all pointing at one address — those
+/// prefixes are protocols, not separate networks.
+///
+/// Protocol family and UDP port are derived from the name prefix.
+/// Lines with an unrecognised prefix, comment lines (`#`), blank
+/// lines, and lines with fewer than two fields are skipped.
+#[must_use]
+pub fn parse_xlx_directory(content: &str) -> Vec<(ProtocolKind, HostEntry)> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(name_raw), Some(address)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let name = name_raw.to_ascii_uppercase();
+        let (protocol, port) = if name.starts_with("REF") {
+            (ProtocolKind::DPlus, XLX_DPLUS_PORT)
+        } else if name.starts_with("XRF") {
+            (ProtocolKind::DExtra, XLX_DEXTRA_PORT)
+        } else if name.starts_with("DCS") {
+            (ProtocolKind::Dcs, XLX_DCS_PORT)
+        } else {
+            continue;
+        };
+        out.push((
+            protocol,
+            HostEntry {
+                name,
+                address: address.to_owned(),
+                port,
+            },
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +236,64 @@ mod tests {
         let mut hf = HostFile::new();
         hf.parse("REF001\n", 0);
         assert_eq!(hf.len(), 0);
+    }
+
+    #[test]
+    fn xlx_directory_routes_prefix_to_protocol_and_port() {
+        let sample = "\
+# XLX live Reflector host file.
+#
+# XLX-DCS Reflectors
+#
+DCS030\t185.230.132.103
+
+# XLX-XRF Reflectors
+XRF030\t185.230.132.103
+
+# XLX-REF Reflectors
+REF030\t185.230.132.103
+";
+        let parsed = parse_xlx_directory(sample);
+        assert_eq!(parsed.len(), 3, "three reflectors parsed, got {parsed:?}");
+        assert!(parsed.contains(&(
+            ProtocolKind::Dcs,
+            HostEntry {
+                name: "DCS030".to_owned(),
+                address: "185.230.132.103".to_owned(),
+                port: 30051,
+            },
+        )));
+        assert!(parsed.contains(&(
+            ProtocolKind::DExtra,
+            HostEntry {
+                name: "XRF030".to_owned(),
+                address: "185.230.132.103".to_owned(),
+                port: 30001,
+            },
+        )));
+        assert!(parsed.contains(&(
+            ProtocolKind::DPlus,
+            HostEntry {
+                name: "REF030".to_owned(),
+                address: "185.230.132.103".to_owned(),
+                port: 20001,
+            },
+        )));
+    }
+
+    #[test]
+    fn xlx_directory_skips_unknown_prefix_and_short_lines() -> TestResult {
+        // `XLX307` (the registry emits no bare XLX prefix), a
+        // one-field line, and a comment must all be skipped.
+        let sample = "XLX307\t1.2.3.4\nREF001\nDCS001\t9.9.9.9\n# trailer\n";
+        let parsed = parse_xlx_directory(sample);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "only DCS001 is a valid 2-field known-prefix line"
+        );
+        let entry = parsed.first().ok_or("one entry parsed")?;
+        assert_eq!(entry.1.name, "DCS001");
+        Ok(())
     }
 }

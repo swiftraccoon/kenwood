@@ -7,6 +7,9 @@
 //! `UdpSocket`. The paired [`FakeReflector`] replies to the 11-byte
 //! LINK and records every datagram the shell emits.
 
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
+
 mod common;
 
 use std::sync::Arc;

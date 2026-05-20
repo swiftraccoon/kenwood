@@ -58,6 +58,7 @@ const MIN_COLUMNS: usize = 7;
 /// All HTML parsing happens synchronously (no `.await`) to avoid holding
 /// non-`Send` scraper types across await points. The observations are collected
 /// into a `Vec` first, then written to the database in a second pass.
+#[derive(Debug)]
 struct Observation {
     /// Operator callsign from column 1.
     callsign: String,
@@ -251,5 +252,128 @@ fn infer_protocol(callsign: &str) -> &'static str {
         // Unknown prefix — default to dextra as it is the most common
         // protocol for non-standard reflectors.
         "dextra"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn infer_protocol_maps_known_prefixes() {
+        assert_eq!(infer_protocol("REF030"), "dplus");
+        assert_eq!(infer_protocol("DCS001"), "dcs");
+        assert_eq!(infer_protocol("XRF310"), "dextra");
+        assert_eq!(infer_protocol("XLX320"), "dextra");
+    }
+
+    #[test]
+    fn infer_protocol_defaults_unknown_to_dextra() {
+        assert_eq!(infer_protocol("ZZZ999"), "dextra");
+        assert_eq!(infer_protocol(""), "dextra");
+    }
+
+    #[test]
+    fn parse_rptr_field_splits_callsign_and_module() {
+        assert_eq!(
+            parse_rptr_field("REF030 C"),
+            (Some("REF030".to_owned()), Some("C".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parse_rptr_field_trims_surrounding_whitespace() {
+        assert_eq!(
+            parse_rptr_field("  REF030 C  "),
+            (Some("REF030".to_owned()), Some("C".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parse_rptr_field_no_space_is_callsign_only() {
+        assert_eq!(
+            parse_rptr_field("REF030"),
+            (Some("REF030".to_owned()), None)
+        );
+    }
+
+    #[test]
+    fn parse_rptr_field_empty_is_none() {
+        assert_eq!(parse_rptr_field(""), (None, None));
+        assert_eq!(parse_rptr_field("   "), (None, None));
+    }
+
+    #[test]
+    fn parse_rptr_field_rejects_non_single_uppercase_module() {
+        // Lowercase or multi-character trailing tokens are not module letters,
+        // so only the callsign is recovered.
+        assert_eq!(
+            parse_rptr_field("REF030 c"),
+            (Some("REF030".to_owned()), None)
+        );
+        assert_eq!(
+            parse_rptr_field("REF030 BC"),
+            (Some("REF030".to_owned()), None)
+        );
+    }
+
+    /// A minimal ircDDB last-heard page: one `<table>` whose data rows carry
+    /// the eight columns the scraper expects — callsign at index 1, the
+    /// destination repeater at index 6.
+    const SAMPLE_PAGE: &str = concat!(
+        "<html><body><table>",
+        "<tr><td>2024-01-15 14:30:00</td><td>W1AW</td><td>D75</td>",
+        "<td>W1AW  B</td><td>REF001 B</td><td>CQCQCQ</td>",
+        "<td>REF030 C</td><td>Hello</td></tr>",
+        "<tr><td>2024-01-15 14:31:00</td><td>K1ABC</td><td></td>",
+        "<td>K1ABC A</td><td>XLX320 A</td><td>CQCQCQ</td>",
+        "<td>XLX320 A</td><td></td></tr>",
+        "</table></body></html>",
+    );
+
+    #[test]
+    fn parse_observations_extracts_each_data_row() -> TestResult {
+        let observations = parse_observations(SAMPLE_PAGE)?;
+        assert_eq!(observations.len(), 2, "two data rows expected");
+
+        let first = observations.first().ok_or("missing first observation")?;
+        assert_eq!(first.callsign, "W1AW");
+        assert_eq!(first.reflector, "REF030");
+        assert_eq!(first.module.as_deref(), Some("C"));
+        assert_eq!(first.protocol, "dplus");
+
+        let second = observations.get(1).ok_or("missing second observation")?;
+        assert_eq!(second.callsign, "K1ABC");
+        assert_eq!(second.reflector, "XLX320");
+        assert_eq!(second.protocol, "dextra");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_observations_skips_rows_with_too_few_columns() -> TestResult {
+        // The second row has only two cells — a header/separator row — and
+        // must not produce an observation.
+        let page = concat!(
+            "<html><body><table>",
+            "<tr><td>2024-01-15 14:30:00</td><td>W1AW</td><td>D75</td>",
+            "<td>W1AW  B</td><td>REF001 B</td><td>CQCQCQ</td>",
+            "<td>REF030 C</td><td>Hi</td></tr>",
+            "<tr><td>Date</td><td>Callsign</td></tr>",
+            "</table></body></html>",
+        );
+        let observations = parse_observations(page)?;
+        assert_eq!(observations.len(), 1, "the 2-column row must be skipped");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_observations_without_table_is_an_error() {
+        let result = parse_observations("<html><body>no table here</body></html>");
+        assert!(
+            matches!(result, Err(FetchError::Html(_))),
+            "a page with no <table> must be a Html error, got {result:?}"
+        );
     }
 }

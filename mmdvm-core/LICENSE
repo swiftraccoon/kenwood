@@ -41,9 +41,9 @@ mode enumeration, status-payload parser, version-handshake parser,
 NAK reason codes, hardware-type detection, and configuration builder
 as described in the upstream files:
 
-    ref/MMDVMHost/Modem.cpp
-    ref/MMDVMHost/Modem.h
-    ref/MMDVMHost/Defines.h
+    MMDVMHost/Modem.cpp
+    MMDVMHost/Modem.h
+    MMDVMHost/Defines.h
 
 Copyright (c) 2015-2026 Jonathan Naylor, G4KLX
     (https://github.com/g4klx)
@@ -63,7 +63,7 @@ what preserves the outgoing "or later" grant.
 
 No code from MMDVMHost is copied verbatim into this crate. The
 derivation is documented inline in each affected module via
-"//! Mirrors ref/MMDVMHost/<file>:<line>" comments; those pointers
+"//! Mirrors MMDVMHost/<file>:<line>" comments; those pointers
 are the audit trail, not copy-paste.
 
 ================================================================

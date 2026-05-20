@@ -50,7 +50,11 @@ pub(crate) struct ReflectorRow {
 ///
 /// Executes an `INSERT ... ON CONFLICT (callsign) DO UPDATE` so that repeated
 /// discovery sweeps refresh metadata without requiring a separate
-/// existence check.
+/// existence check. The nullable metadata columns (`ip_address`,
+/// `dashboard_url`, `country`) are updated with `COALESCE`, so a caller that
+/// passes `None` preserves whatever a richer source already stored instead of
+/// erasing it — the ircDDB scraper, which has only a callsign, must not wipe
+/// the IP that Pi-Star supplied.
 ///
 /// # Errors
 ///
@@ -63,17 +67,20 @@ pub(crate) async fn upsert(
     dashboard_url: Option<&str>,
     country: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    // ON CONFLICT UPDATE refreshes all mutable metadata columns and bumps
-    // last_seen to the current time. The callsign (PK) and created_at are
-    // left unchanged.
+    // On conflict, COALESCE(EXCLUDED.col, reflectors.col) keeps the stored
+    // value whenever this caller supplied NULL — so a metadata-poor source
+    // cannot erase data a richer source populated. A non-NULL value still
+    // wins, so genuine changes propagate. `protocol` is overwritten
+    // unconditionally: it is NOT NULL, and every source infers it identically
+    // from the callsign prefix. callsign (PK) and created_at are never touched.
     let _result = sqlx::query(
         "INSERT INTO reflectors (callsign, protocol, ip_address, dashboard_url, country, last_seen)
          VALUES ($1, $2, $3::INET, $4, $5, now())
          ON CONFLICT (callsign) DO UPDATE SET
              protocol      = EXCLUDED.protocol,
-             ip_address    = EXCLUDED.ip_address,
-             dashboard_url = EXCLUDED.dashboard_url,
-             country       = EXCLUDED.country,
+             ip_address    = COALESCE(EXCLUDED.ip_address, reflectors.ip_address),
+             dashboard_url = COALESCE(EXCLUDED.dashboard_url, reflectors.dashboard_url),
+             country       = COALESCE(EXCLUDED.country, reflectors.country),
              last_seen     = now()",
     )
     .bind(callsign)
@@ -86,11 +93,13 @@ pub(crate) async fn upsert(
     Ok(())
 }
 
-/// Returns all reflectors that have been seen since the given timestamp.
+/// Returns reflectors with at least one activity observation since `since`.
 ///
-/// Used by Tier 2 to select reflectors with recent activity for live
-/// monitoring. Results are ordered by `last_seen DESC` so the most recently
-/// active reflectors appear first.
+/// Used by the HTTP API (`GET /api/reflectors`). A reflector that only
+/// appears in directory sweeps but has never been heard does not qualify:
+/// eligibility is driven by the `activity_log` table, not by `last_seen`
+/// (which every discovery sweep bumps). Results are ordered most-recently-
+/// active first.
 ///
 /// # Errors
 ///
@@ -99,13 +108,20 @@ pub(crate) async fn get_active(
     pool: &PgPool,
     since: DateTime<Utc>,
 ) -> Result<Vec<ReflectorRow>, sqlx::Error> {
-    // Filters on last_seen >= $1 and orders by recency.
+    // "Active" means a real heard-event, so join against the most recent
+    // activity_log observation per reflector within the window rather than
+    // trusting reflectors.last_seen (bumped by directory sweeps too).
     sqlx::query_as::<_, ReflectorRow>(
-        "SELECT callsign, protocol, ip_address, dashboard_url, country,
-                last_seen, tier2_available, created_at
-         FROM reflectors
-         WHERE last_seen >= $1
-         ORDER BY last_seen DESC",
+        "SELECT r.callsign, r.protocol, r.ip_address, r.dashboard_url,
+                r.country, r.last_seen, r.tier2_available, r.created_at
+         FROM reflectors r
+         JOIN (
+             SELECT reflector, MAX(observed_at) AS last_activity
+             FROM activity_log
+             WHERE observed_at >= $1
+             GROUP BY reflector
+         ) a ON a.reflector = r.callsign
+         ORDER BY a.last_activity DESC",
     )
     .bind(since)
     .fetch_all(pool)
@@ -114,12 +130,15 @@ pub(crate) async fn get_active(
 
 /// Returns reflectors eligible for Tier 2 monitoring.
 ///
-/// Filters for reflectors where `tier2_available = true` (supports the XLX UDP
-/// JSON monitor protocol) AND `last_seen >= since` (has recent activity). The
-/// additional `ip_address IS NOT NULL` check ensures we have a usable endpoint.
+/// A reflector qualifies when it supports the XLX UDP JSON monitor protocol
+/// (`tier2_available = true`), has a usable endpoint (`ip_address IS NOT
+/// NULL`), and has produced at least one `activity_log` observation since
+/// `since` — real heard activity, not mere presence in a directory listing.
+/// Every discovery sweep bumps `last_seen`, so that column cannot tell the
+/// two apart; the `activity_log` join can.
 ///
-/// Results are ordered by `last_seen DESC` and capped at `limit` rows so the
-/// orchestrator can respect its `max_concurrent_monitors` cap.
+/// Results are ordered most-recently-active first and capped at `limit` rows
+/// so the orchestrator can respect its `max_concurrent_monitors` cap.
 ///
 /// # Errors
 ///
@@ -130,13 +149,18 @@ pub(crate) async fn get_tier2_eligible(
     limit: i64,
 ) -> Result<Vec<ReflectorRow>, sqlx::Error> {
     sqlx::query_as::<_, ReflectorRow>(
-        "SELECT callsign, protocol, ip_address, dashboard_url, country,
-                last_seen, tier2_available, created_at
-         FROM reflectors
-         WHERE tier2_available = true
-           AND last_seen >= $1
-           AND ip_address IS NOT NULL
-         ORDER BY last_seen DESC
+        "SELECT r.callsign, r.protocol, r.ip_address, r.dashboard_url,
+                r.country, r.last_seen, r.tier2_available, r.created_at
+         FROM reflectors r
+         JOIN (
+             SELECT reflector, MAX(observed_at) AS last_activity
+             FROM activity_log
+             WHERE observed_at >= $1
+             GROUP BY reflector
+         ) a ON a.reflector = r.callsign
+         WHERE r.tier2_available = true
+           AND r.ip_address IS NOT NULL
+         ORDER BY a.last_activity DESC
          LIMIT $2",
     )
     .bind(since)

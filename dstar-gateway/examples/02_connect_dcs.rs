@@ -17,6 +17,9 @@
 //! header, so `send_header` caches the header internally and
 //! `send_voice` pulls it back out on every frame.
 
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

@@ -66,7 +66,7 @@ pub struct Reflector {
     pub description: String,
 }
 
-/// Bundled hosts files from `ref/ircDDBGateway/Data/`. Small enough
+/// Bundled hosts files from `ircDDBGateway/Data/`. Small enough
 /// (1309 lines total) to embed in the binary — saves a network fetch
 /// on first launch and means the list always works offline.
 const DPLUS_HOSTS: &str = include_str!("../data/DPlus_Hosts.txt");

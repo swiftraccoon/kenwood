@@ -18,6 +18,9 @@
 //! attaches an empty `HostList` as a placeholder, mirroring the
 //! `tests/loopback_dplus.rs` integration test.
 
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

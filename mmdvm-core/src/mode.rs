@@ -4,7 +4,7 @@
 
 //! MMDVM modem operating mode.
 //!
-//! Mirrors the `MODE_*` constants in `ref/MMDVMHost/Defines.h:31-44`.
+//! Mirrors the `MODE_*` constants in `MMDVMHost/Defines.h:31-44`.
 //! The byte values are the same ones used in `SetMode` requests and
 //! in the status response's mode field.
 

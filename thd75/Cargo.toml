@@ -14,7 +14,14 @@ documentation = "https://swiftraccoon.github.io/kenwood/"
 publish = false
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "net", "time"] }
+tokio = { version = "1", features = [
+  "rt",
+  "macros",
+  "sync",
+  "io-util",
+  "net",
+  "time",
+] }
 tokio-serial = "5"
 thiserror = "2"
 tracing = "0.1"

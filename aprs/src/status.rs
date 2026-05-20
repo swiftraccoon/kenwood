@@ -12,7 +12,7 @@
 //!    and a 1-char power letter (table on p.81). Not yet implemented.
 //!
 //! Earlier code generations parsed only sub-format (1), discarding the
-//! structural data of the others. See CB-C-11.
+//! structural data of the others.
 
 use crate::error::AprsError;
 use crate::packet::AprsTimestamp;
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn parse_status_with_dhm_zulu_timestamp() -> TestResult {
-        // CB-C-11 sub-format 2: DHM-Zulu timestamp followed by free text.
+        // Sub-format 2: DHM-Zulu timestamp followed by free text.
         let info = b">092345zOn the air";
         let status = parse_aprs_status(info)?;
         assert_eq!(
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn parse_status_with_grid_locator_and_symbol() -> TestResult {
-        // CB-C-11 sub-format 3: spec example from §16 p.81.
+        // Sub-format 3: spec example from §16 p.81.
         let info = b">IO91SX/G";
         let status = parse_aprs_status(info)?;
         assert_eq!(status.grid_locator.as_deref(), Some("IO91SX"));

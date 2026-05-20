@@ -10,7 +10,7 @@
 //!
 //! The top-level entry point is [`tokio_shell::AsyncModem::spawn`].
 //!
-//! Mirrors the reference C++ implementation at `ref/MMDVMHost/`:
+//! Mirrors the reference C++ implementation at `MMDVMHost/`:
 //! periodic 250 ms `GetStatus` polls correct local buffer-space
 //! estimates, and per-mode TX queues are drained only when the
 //! modem reports FIFO slot availability.

@@ -28,7 +28,7 @@
 //! and `ircDDBGateway/Common/CCITTChecksum.cpp` for the reference
 //! implementation this module mirrors.
 
-use crate::types::{Callsign, Suffix};
+use crate::types::{Callsign, Module, Suffix};
 
 /// Size of the encoded header on the wire (including CRC).
 pub const ENCODED_LEN: usize = 41;
@@ -111,6 +111,57 @@ impl DStarHeader {
         h.encode()
     }
 
+    /// Build a header for the reflector-relay path.
+    ///
+    /// This is the canonical builder for any client (sextant,
+    /// thd75-repl, future hotspot crates) sending voice into a
+    /// `DPlus` / `DExtra` / `DCS` reflector. Per the convention
+    /// validated against `ircDDBGateway/Common/DPlusHandler.cpp:77-79`
+    /// and xlxd's `cdplusprotocol.cpp:209`:
+    ///
+    /// - `rpt1[0..7]` = `operator` callsign (first 7 bytes,
+    ///   space-padded)
+    /// - `rpt1[7]`   = `local_module` letter (A-Z, NEVER `'G'`)
+    /// - `rpt2[0..7]` = `reflector` callsign (first 7 bytes,
+    ///   space-padded)
+    /// - `rpt2[7]`   = `reflector_module` letter (A-Z, NEVER `'G'`)
+    /// - `ur_call`    = `CQCQCQ`
+    /// - `flag1`/`flag2`/`flag3` = 0
+    ///
+    /// Both `rpt1[7]` and `rpt2[7]` are real module letters. xlxd's
+    /// `IsValidModule` rejects `'G'` and silently drops the packet —
+    /// no NAK, no log line, no retry — so any header with `rpt1[7]`
+    /// outside `b'A'..=b'Z'` will be invisible to other clients.
+    /// The `Module` type's invariant (`b'A'..=b'Z'`) is what makes
+    /// this safe to express infallibly.
+    ///
+    /// `my_call` and `my_suffix` carry the operator's identity into
+    /// the stream, surfaced to other clients as the speaker.
+    ///
+    /// Callers that need to preserve the original flag bytes (e.g.
+    /// `thd75-repl` relaying a radio's TX header) can mutate
+    /// `flag1`/`flag2`/`flag3` after construction.
+    #[must_use]
+    pub fn for_relay(
+        operator: Callsign,
+        local_module: Module,
+        reflector: Callsign,
+        reflector_module: Module,
+        my_call: Callsign,
+        my_suffix: Suffix,
+    ) -> Self {
+        Self {
+            flag1: 0,
+            flag2: 0,
+            flag3: 0,
+            rpt2: rpt_field(reflector, reflector_module),
+            rpt1: rpt_field(operator, local_module),
+            ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
+            my_call,
+            my_suffix,
+        }
+    }
+
     /// Decode a 41-byte header.
     ///
     /// **Infallible.** Mirrors `ircDDBGateway`'s `setDPlusData` /
@@ -153,6 +204,18 @@ impl DStarHeader {
             my_suffix: Suffix::from_wire_bytes(suffix_bytes),
         }
     }
+}
+
+/// Build an `rpt1`/`rpt2` field: 7-byte callsign + 1-byte module
+/// letter at index 7. The `Module` type's `b'A'..=b'Z'` invariant is
+/// what guarantees byte 7 is a valid module letter — no runtime check
+/// needed.
+fn rpt_field(callsign: Callsign, module: Module) -> Callsign {
+    let cs = callsign.as_bytes();
+    let mut buf = [b' '; 8];
+    buf[..7].copy_from_slice(&cs[..7]);
+    buf[7] = module.as_byte();
+    Callsign::from_wire_bytes(buf)
 }
 
 /// CRC-CCITT (reflected polynomial 0x8408, init 0xFFFF, final XOR 0xFFFF).
@@ -268,6 +331,120 @@ mod tests {
         }
         let crc = crc_ccitt(&body);
         assert_eq!(crc, 0x1073);
+    }
+
+    #[test]
+    fn for_relay_rpt1_carries_local_module_byte() {
+        let header = DStarHeader::for_relay(
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            Module::C,
+            Callsign::from_wire_bytes(*b"REF030  "),
+            Module::B,
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            Suffix::EMPTY,
+        );
+        assert_eq!(
+            header.rpt1.as_bytes()[7],
+            b'C',
+            "rpt1[7] must be the local module letter; xlxd silently drops if invalid"
+        );
+        assert_eq!(
+            &header.rpt1.as_bytes()[..7],
+            b"W1AW   ",
+            "rpt1[0..7] must be the operator callsign space-padded to 7 bytes"
+        );
+    }
+
+    #[test]
+    fn for_relay_rpt2_carries_reflector_module_byte() {
+        let header = DStarHeader::for_relay(
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            Module::C,
+            Callsign::from_wire_bytes(*b"REF030  "),
+            Module::B,
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            Suffix::EMPTY,
+        );
+        assert_eq!(
+            header.rpt2.as_bytes()[7],
+            b'B',
+            "rpt2[7] must be the reflector module letter"
+        );
+        assert_eq!(
+            &header.rpt2.as_bytes()[..7],
+            b"REF030 ",
+            "rpt2[0..7] must be the reflector callsign space-padded to 7 bytes"
+        );
+    }
+
+    #[test]
+    fn for_relay_ur_call_is_cqcqcq() {
+        let header = DStarHeader::for_relay(
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            Module::C,
+            Callsign::from_wire_bytes(*b"REF030  "),
+            Module::B,
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            Suffix::EMPTY,
+        );
+        assert_eq!(
+            header.ur_call.as_bytes(),
+            b"CQCQCQ  ",
+            "ur_call must be CQCQCQ space-padded for relay headers"
+        );
+    }
+
+    #[test]
+    fn for_relay_zeroes_flag_bytes() {
+        let header = DStarHeader::for_relay(
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            Module::C,
+            Callsign::from_wire_bytes(*b"REF030  "),
+            Module::B,
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            Suffix::EMPTY,
+        );
+        assert_eq!(header.flag1, 0);
+        assert_eq!(header.flag2, 0);
+        assert_eq!(header.flag3, 0);
+    }
+
+    #[test]
+    fn for_relay_passes_through_my_call_and_suffix() {
+        let header = DStarHeader::for_relay(
+            Callsign::from_wire_bytes(*b"GATEWAY "),
+            Module::C,
+            Callsign::from_wire_bytes(*b"REF030  "),
+            Module::B,
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            Suffix::from_wire_bytes(*b"ECHO"),
+        );
+        assert_eq!(
+            header.my_call.as_bytes(),
+            b"W1AW    ",
+            "my_call distinct from operator (relay scenario)"
+        );
+        assert_eq!(header.my_suffix.as_bytes(), b"ECHO");
+    }
+
+    #[test]
+    fn for_relay_truncates_callsign_to_7_bytes_for_rpt() {
+        // Even with a fully-populated 8-byte callsign, only the first
+        // 7 bytes feed rpt1 — byte 7 is reserved for the module letter.
+        // (Real callsigns are ≤6 chars so this only matters for
+        // adversarial inputs, but the invariant must hold.)
+        let header = DStarHeader::for_relay(
+            Callsign::from_wire_bytes(*b"OPERATOR"),
+            Module::A,
+            Callsign::from_wire_bytes(*b"REFCALLR"),
+            Module::E,
+            Callsign::from_wire_bytes(*b"OPERATOR"),
+            Suffix::EMPTY,
+        );
+        assert_eq!(&header.rpt1.as_bytes()[..7], b"OPERATO");
+        assert_eq!(header.rpt1.as_bytes()[7], b'A');
+        assert_eq!(&header.rpt2.as_bytes()[..7], b"REFCALL");
+        assert_eq!(header.rpt2.as_bytes()[7], b'E');
     }
 
     #[test]

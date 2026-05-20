@@ -191,13 +191,21 @@ const fn bitrate_from_kbps(kbps: u32) -> Result<Bitrate, DecodeError> {
     }
 }
 
+/// Returns whether `kbps` is a CBR bitrate the MP3 encoder supports.
+///
+/// Lets configuration loading reject an invalid `audio.mp3_bitrate` at
+/// startup instead of failing on the first captured stream.
+pub(crate) const fn is_supported_bitrate(kbps: u32) -> bool {
+    bitrate_from_kbps(kbps).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// AMBE silence frame (same as `dstar_gateway_core::voice::AMBE_SILENCE`).
-    /// Decodes to near-zero PCM samples.
-    const AMBE_SILENCE: [u8; 9] = [0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8];
+    // The canonical AMBE silence frame, imported from the codec crate so the
+    // test fixture cannot drift from it. Decodes to near-zero PCM samples.
+    use dstar_gateway_core::AMBE_SILENCE;
 
     #[test]
     fn empty_input_returns_error() {

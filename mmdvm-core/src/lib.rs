@@ -11,7 +11,7 @@
 //! `MMDVM_HS_Hat`, etc.).
 //!
 //! The crate mirrors the reference C++ implementation at
-//! `ref/MMDVMHost/Modem.cpp` / `ref/MMDVMHost/Modem.h` (GPL-2.0) which
+//! `MMDVMHost/Modem.cpp` / `MMDVMHost/Modem.h` (GPL-2.0) which
 //! is treated as the protocol's ground truth. D-STAR is the primary
 //! target because of the TH-D75's internal modem, but the command
 //! byte constants and the frame codec itself are multi-mode (DMR,

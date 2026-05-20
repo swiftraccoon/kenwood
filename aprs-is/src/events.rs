@@ -15,7 +15,7 @@
 /// Pre-2026 versions of this crate decoded via `BufReader::read_line`,
 /// which returns `Err(io::Error::InvalidData)` on the first non-UTF-8
 /// byte. That error tore down the long-lived TCP session on the first
-/// real binary-bearing packet — see git history for CB-4.
+/// real binary-bearing packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AprsIsPacket {
     /// Wire-truth bytes for the packet line, **without** the trailing

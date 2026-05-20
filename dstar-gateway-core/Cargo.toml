@@ -14,7 +14,9 @@ publish = false
 
 [dependencies]
 thiserror = "2"
-tracing = { version = "0.1", default-features = false, features = ["attributes"] }
+tracing = { version = "0.1", default-features = false, features = [
+  "attributes",
+] }
 
 [dev-dependencies]
 proptest = "1"

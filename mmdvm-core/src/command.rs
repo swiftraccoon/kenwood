@@ -8,8 +8,8 @@
 //! response IDs, mode bytes, and capability bitfield masks.
 //!
 //! Mirrors the `MMDVM_*` constants at the top of
-//! `ref/MMDVMHost/Modem.cpp:42-113` and the `MODE_*` constants in
-//! `ref/MMDVMHost/Defines.h:31-44`.
+//! `MMDVMHost/Modem.cpp:42-113` and the `MODE_*` constants in
+//! `MMDVMHost/Defines.h:31-44`.
 
 // ---------------------------------------------------------------------------
 // Framing

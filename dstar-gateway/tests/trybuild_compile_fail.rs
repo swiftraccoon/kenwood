@@ -15,6 +15,8 @@
 use dstar_gateway as _;
 use dstar_gateway_core as _;
 use pcap_parser as _;
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
 use thiserror as _;
 use tokio as _;
 use tracing as _;

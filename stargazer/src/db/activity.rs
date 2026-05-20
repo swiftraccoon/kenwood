@@ -104,11 +104,12 @@ pub(crate) async fn get_recent(
     .await
 }
 
-/// Returns activity for a specific reflector since the given timestamp.
+/// Returns recent activity for a specific reflector since the given
+/// timestamp, newest first and capped at `limit` rows.
 ///
-/// Results are ordered by `observed_at DESC` (most recent first). Used by
-/// the HTTP API and Tier 2 promotion logic to assess per-reflector activity
-/// levels.
+/// Used by the HTTP API (`GET /api/reflectors/{callsign}/activity`). The row
+/// cap stops a busy reflector over a long window from materialising an
+/// unbounded result set.
 ///
 /// # Errors
 ///
@@ -117,6 +118,7 @@ pub(crate) async fn get_for_reflector(
     pool: &PgPool,
     reflector: &str,
     since: DateTime<Utc>,
+    limit: i64,
 ) -> Result<Vec<ActivityRow>, sqlx::Error> {
     // Filters by reflector callsign and time window; uses the
     // idx_activity_log_lookup composite index (reflector, module, observed_at).
@@ -124,10 +126,12 @@ pub(crate) async fn get_for_reflector(
         "SELECT id, reflector, module, callsign, source, observed_at
          FROM activity_log
          WHERE reflector = $1 AND observed_at >= $2
-         ORDER BY observed_at DESC",
+         ORDER BY observed_at DESC
+         LIMIT $3",
     )
     .bind(reflector)
     .bind(since)
+    .bind(limit)
     .fetch_all(pool)
     .await
 }

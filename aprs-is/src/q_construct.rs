@@ -24,7 +24,7 @@
 //!
 //! Earlier versions of this crate advertised "`IGate` path rewriting"
 //! while shipping only the naive append helper. The strict rewriter
-//! lives in [`igate_format_for_is`] as of CB-5.
+//! lives in [`igate_format_for_is`].
 
 use std::borrow::Cow;
 

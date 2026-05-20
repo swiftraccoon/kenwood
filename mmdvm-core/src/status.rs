@@ -10,7 +10,7 @@
 //! caller is expected to know which version the modem speaks
 //! (established via the `GetVersion` handshake).
 //!
-//! Payload layouts mirror `ref/MMDVMHost/Modem.cpp:818-946`.
+//! Payload layouts mirror `MMDVMHost/Modem.cpp:818-946`.
 
 use crate::error::MmdvmError;
 use crate::mode::ModemMode;
@@ -274,7 +274,7 @@ impl ModemStatus {
 
 /// Emit a `tracing::warn!` event for each overflow flag that's set,
 /// mirroring the `LogError` calls in
-/// `ref/MMDVMHost/Modem.cpp:826-837,883-894`. Keeping the logging in
+/// `MMDVMHost/Modem.cpp:826-837,883-894`. Keeping the logging in
 /// the sans-io core is fine because `tracing` is a passive facade —
 /// no subscriber means no I/O.
 fn log_overflow_warnings(status: ModemStatus) {

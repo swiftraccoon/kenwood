@@ -23,7 +23,7 @@ pub const TFESC: u8 = 0xDD;
 /// Data frame command. Payload is an AX.25 frame.
 pub const CMD_DATA: u8 = 0x00;
 
-/// Set TX delay (units of 10 ms). TH-D75 range: 0-120 (0-1200 ms).
+/// Set TX delay, in units of 10 ms.
 pub const CMD_TX_DELAY: u8 = 0x01;
 
 /// Set persistence parameter for CSMA. Range: 0-255.
@@ -38,8 +38,8 @@ pub const CMD_TX_TAIL: u8 = 0x04;
 /// Set full/half duplex. 0 = half duplex, nonzero = full duplex.
 pub const CMD_FULL_DUPLEX: u8 = 0x05;
 
-/// Set hardware-specific parameter. TH-D75 uses this for baud rate switching:
-/// 0 or 0x23 (35 decimal) = 1200 bps, 0x05 or 0x26 (38 decimal) = 9600 bps.
+/// Set a TNC-defined hardware parameter. The KISS spec leaves the
+/// payload semantics entirely up to the TNC.
 pub const CMD_SET_HARDWARE: u8 = 0x06;
 
 /// Exit KISS mode and return to command/normal mode.
@@ -59,7 +59,7 @@ pub const CMD_RETURN: u8 = 0xFF;
 pub enum KissCommand {
     /// `0x00` — data frame (payload is an AX.25 frame).
     Data,
-    /// `0x01` — TX delay in 10 ms units (0-120 on TH-D75).
+    /// `0x01` — TX delay in 10 ms units.
     TxDelay,
     /// `0x02` — CSMA persistence (0-255).
     Persistence,
@@ -69,7 +69,7 @@ pub enum KissCommand {
     TxTail,
     /// `0x05` — full duplex (0 = half, nonzero = full).
     FullDuplex,
-    /// `0x06` — `SetHardware` (TH-D75 uses this for baud switching).
+    /// `0x06` — `SetHardware`, a TNC-defined hardware parameter.
     SetHardware,
     /// `0xFF` — full-byte return command (exit KISS mode).
     Return,
@@ -118,7 +118,7 @@ impl KissCommand {
     }
 }
 
-/// A KISS TNC port number, validated to `0..=15` (the low nibble range).
+/// A KISS TNC port number, validated to `0..=15` (a 4-bit nibble).
 ///
 /// Per the KISS spec, the high nibble of the type byte addresses one of
 /// up to 16 TNC ports. The TH-D75 is always port 0; [`KissPort::TH_D75`]
@@ -132,15 +132,27 @@ impl KissPort {
     /// The TH-D75 always uses port 0.
     pub const TH_D75: Self = Self(0);
 
-    /// Maximum valid port (the nibble only holds 4 bits).
-    pub const MAX: u8 = 15;
+    /// The maximum valid port — the type byte's port nibble holds 4 bits.
+    pub const MAX: Self = Self(15);
 
-    /// Create a port from a raw `u8`, validating `0..=15`.
+    /// Create a port from a raw `u8`, validating the `0..=15` range.
     ///
     /// Returns `None` for values outside the nibble range.
     #[must_use]
     pub const fn new(n: u8) -> Option<Self> {
-        if n <= Self::MAX { Some(Self(n)) } else { None }
+        if n <= Self::MAX.get() {
+            Some(Self(n))
+        } else {
+            None
+        }
+    }
+
+    /// Extract the port from a KISS type byte — its high nibble.
+    ///
+    /// Always succeeds: a 4-bit nibble is intrinsically within `0..=15`.
+    #[must_use]
+    pub const fn from_type_byte(type_byte: u8) -> Self {
+        Self(type_byte >> 4)
     }
 
     /// Return the raw port value.

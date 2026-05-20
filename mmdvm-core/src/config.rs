@@ -8,7 +8,7 @@
 //! legacy payload used by the earliest MMDVM boards) and protocol v2
 //! (much larger, multi-mode configuration with per-protocol deviation,
 //! colour codes, hang timers, etc.). Mirroring
-//! `ref/MMDVMHost/Modem.cpp:2100-2260` requires careful handling of
+//! `MMDVMHost/Modem.cpp:2100-2260` requires careful handling of
 //! every optional mode.
 //!
 //! This module exposes the configuration type so downstream crates can

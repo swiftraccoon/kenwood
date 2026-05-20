@@ -1,7 +1,7 @@
 //! Pi-Star JSON host file fetcher.
 //!
 //! Fetches the canonical D-STAR reflector host list from
-//! `http://www.pistar.uk/downloads/DStar_Hosts.json` and upserts each
+//! `https://www.pistar.uk/downloads/DStar_Hosts.json` and upserts each
 //! reflector into the `reflectors` Postgres table.
 //!
 //! The Pi-Star host file is the most comprehensive public registry of D-STAR
@@ -17,7 +17,7 @@ use super::error::FetchError;
 use crate::db;
 
 /// Pi-Star host file download URL.
-const PISTAR_URL: &str = "http://www.pistar.uk/downloads/DStar_Hosts.json";
+const PISTAR_URL: &str = "https://www.pistar.uk/downloads/DStar_Hosts.json";
 
 /// Top-level JSON envelope returned by the Pi-Star host endpoint.
 ///
@@ -108,4 +108,43 @@ pub(crate) async fn fetch_and_store(
 
     tracing::info!(count, "pi-star: upserted reflectors");
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn map_protocol_maps_known_types() {
+        assert_eq!(map_protocol("REF"), Some("dplus"));
+        assert_eq!(map_protocol("XRF"), Some("dextra"));
+        assert_eq!(map_protocol("DCS"), Some("dcs"));
+    }
+
+    #[test]
+    fn map_protocol_rejects_unknown_types() {
+        // Anything outside the three known labels is skipped by the caller.
+        assert_eq!(map_protocol("XLX"), None);
+        assert_eq!(map_protocol("ref"), None);
+        assert_eq!(map_protocol(""), None);
+    }
+
+    #[test]
+    fn deserializes_pistar_host_file() -> TestResult {
+        let json = r#"{
+            "reflectors": [
+                {"name": "REF001", "reflector_type": "REF", "ipv4": "1.2.3.4"},
+                {"name": "DCS030", "reflector_type": "DCS", "ipv4": "5.6.7.8"}
+            ]
+        }"#;
+        let response: PiStarResponse = serde_json::from_str(json)?;
+        assert_eq!(response.reflectors.len(), 2);
+        let first = response.reflectors.first().ok_or("missing reflector")?;
+        assert_eq!(first.name, "REF001");
+        assert_eq!(first.reflector_type, "REF");
+        assert_eq!(first.ipv4, "1.2.3.4");
+        Ok(())
+    }
 }

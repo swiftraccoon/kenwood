@@ -8,7 +8,7 @@
 // output via `decode_dstar`, rather than exposing the quantizer's
 // internal values directly.
 //
-// Bit layout reference: `ref/mbelib/ambe3600x2400_const.h` and the
+// Bit layout reference: `mbelib/ambe3600x2400_const.h` and the
 // TIA-102.BABA-1 § Annex tables for widths. The field positions
 // themselves (which `ambe_d[]` index each bit lives at) are the
 // mbelib/DSD D-STAR convention, documented in-repo at

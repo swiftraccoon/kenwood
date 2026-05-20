@@ -74,6 +74,7 @@ pub mod types;
 // Convenience re-exports for the most commonly used types.
 pub use error::Error;
 pub use radio::Radio;
+pub use radio::diagnostics::LinkDiagnosis;
 pub use radio::programming::McpSpeed;
 #[cfg(target_os = "macos")]
 pub use transport::BluetoothTransport;

@@ -17,7 +17,7 @@
 //! disconnected since the last update are removed.
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 
 /// A single row from the `connected_nodes` table.
 ///
@@ -45,21 +45,31 @@ pub(crate) struct ConnectedNodeRow {
 
 /// Upserts a single connected node entry.
 ///
-/// Inserts a new node or updates the existing entry's `module`, `last_heard`,
-/// and `connected_since` if the node is already tracked for this reflector.
-/// The composite primary key `(reflector, node_callsign)` prevents duplicates.
+/// Inserts a new node, or updates an existing entry's `module` and
+/// `last_heard` if the node is already tracked for this reflector. The
+/// composite primary key `(reflector, node_callsign)` prevents duplicates.
+///
+/// The `connected_since` and `protocol` columns are never written — the XLX
+/// monitor's node payload carries no machine-parseable connect time and no
+/// per-node link protocol — so both remain `NULL`.
+///
+/// Accepts any sqlx executor (`&PgPool`, or a `&mut` transaction) so a caller
+/// can group a clear-and-repopulate cycle into one transaction.
 ///
 /// # Errors
 ///
 /// Returns `sqlx::Error` on connection or foreign-key constraint failures
 /// (the referenced reflector must exist in the `reflectors` table).
-pub(crate) async fn upsert_node(
-    pool: &PgPool,
+pub(crate) async fn upsert_node<'e, E>(
+    executor: E,
     reflector: &str,
     node_callsign: &str,
     module: Option<&str>,
     now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: PgExecutor<'e>,
+{
     let _result = sqlx::query(
         "INSERT INTO connected_nodes (reflector, node_callsign, module, last_heard)
          VALUES ($1, $2, $3, $4)
@@ -71,7 +81,7 @@ pub(crate) async fn upsert_node(
     .bind(node_callsign)
     .bind(module)
     .bind(now)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -82,13 +92,22 @@ pub(crate) async fn upsert_node(
 /// disconnected since the last update are removed. This simple
 /// delete-then-reinsert pattern avoids the complexity of diff-based eviction.
 ///
+/// Accepts any sqlx executor so the delete and the following upserts can run
+/// in one transaction — a reader then never observes an empty node list.
+///
 /// # Errors
 ///
 /// Returns `sqlx::Error` on query failure.
-pub(crate) async fn clear_for_reflector(pool: &PgPool, reflector: &str) -> Result<(), sqlx::Error> {
+pub(crate) async fn clear_for_reflector<'e, E>(
+    executor: E,
+    reflector: &str,
+) -> Result<(), sqlx::Error>
+where
+    E: PgExecutor<'e>,
+{
     let _result = sqlx::query("DELETE FROM connected_nodes WHERE reflector = $1")
         .bind(reflector)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }

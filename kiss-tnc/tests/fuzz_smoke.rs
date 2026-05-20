@@ -1,26 +1,21 @@
 //! Smoke fuzzing for the KISS codec.
 //!
-//! Split from `thd75/tests/kiss_fuzz_smoke.rs` during PR 1 of the
-//! KISS extraction. Only the pure-KISS decode fuzz case lives here;
-//! the AX.25 and APRS fuzz cases stay in thd75 until those layers
-//! are extracted (PRs 2 and 3).
-//!
 //! This is not a real `cargo-fuzz` harness — that requires nightly.
-//! Instead, we feed the decoder a large number of pseudo-random byte
-//! sequences and assert that none of them panic. The seed is fixed
-//! so the test is reproducible.
+//! Instead, both the one-shot `decode_kiss_frame` and the streaming
+//! `KissDecoder` are fed many pseudo-random byte sequences, asserting
+//! that none of them panic. The seeds are fixed so the runs are
+//! reproducible.
 //!
-//! For real fuzzing (libfuzzer/AFL), the same body can be lifted into
+//! For real fuzzing (libfuzzer/AFL), the same bodies can be lifted into
 //! a `fuzz_targets/` crate.
 
-// Integration tests are separate compilation units and re-evaluate
-// workspace deps. Suppress `unused_crate_dependencies` for the
-// transitively-reachable lib dep that this test file does not use
-// directly.
+// Integration tests are separate compilation units that re-evaluate
+// workspace deps; acknowledge the transitively-reachable lib deps these
+// tests do not name directly.
 use proptest as _;
 use thiserror as _;
 
-use kiss_tnc::decode_kiss_frame;
+use kiss_tnc::{KissDecoder, decode_kiss_frame};
 
 /// Tiny xorshift32 RNG — deterministic, no `rand` dependency.
 struct Xor32(u32);
@@ -34,6 +29,7 @@ impl Xor32 {
         self.0 = x;
         x
     }
+
     fn fill(&mut self, buf: &mut [u8]) {
         for chunk in buf.chunks_mut(4) {
             let bytes = self.next_u32().to_le_bytes();
@@ -51,14 +47,34 @@ fn fuzz_kiss_decode_no_panic() {
         for _ in 0..50 {
             let mut buf = vec![0u8; size];
             rng.fill(&mut buf);
-            // Result doesn't matter — we just want to make sure
-            // decoding doesn't panic on arbitrary input. `matches!`
-            // consumes the value and documents the "just don't panic"
-            // intent while satisfying `let_underscore_drop`.
+            // The result does not matter — decoding arbitrary input must
+            // return a `Result`, never panic. `matches!` consumes the
+            // value and documents the "just don't panic" intent.
             assert!(
                 matches!(decode_kiss_frame(&buf), Ok(_) | Err(_)),
-                "decoder must return a Result, not panic"
+                "decoder must return a Result, not panic",
             );
+        }
+    }
+}
+
+#[test]
+fn fuzz_kiss_decoder_stream_no_panic() {
+    let mut rng = Xor32(0x5EED_1234);
+    for size in 0..=128 {
+        for _ in 0..50 {
+            let mut buf = vec![0u8; size];
+            rng.fill(&mut buf);
+            let mut decoder = KissDecoder::new();
+            decoder.push(&buf);
+            // Drain the decoder. Every call must return a `Result`, never
+            // panic; the loop is bounded because each non-`None` result
+            // consumes buffer bytes.
+            for _ in 0..=size {
+                if matches!(decoder.next_frame(), Ok(None)) {
+                    break;
+                }
+            }
         }
     }
 }

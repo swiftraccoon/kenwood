@@ -30,7 +30,16 @@ kenwood-thd75 = { path = "../thd75" }
 dstar-gateway = { path = "../dstar-gateway" }
 dstar-gateway-core = { path = "../dstar-gateway-core" }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std", "process", "signal"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+  "io-util",
+  "io-std",
+  "process",
+  "signal",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
@@ -40,7 +49,10 @@ tracing-appender = "0.2"
 # users can copy-paste the real filename for bug reports. Matching
 # tracing-appender's internal UTC-based rotation means the date we
 # print will always equal the rotation suffix at that moment.
-time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
+time = { version = "0.3", default-features = false, features = [
+  "formatting",
+  "macros",
+] }
 rustyline = "18"
 dirs-next = "2"
 

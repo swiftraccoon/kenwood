@@ -323,8 +323,43 @@ proptest! {
             prop_assert!(false, "expected status variant");
             return Ok(());
         };
-        // The parser trims leading/trailing whitespace to match the
-        // APRS convention of right-padded status strings.
-        prop_assert_eq!(parsed.text.as_str(), text.trim());
+        // The APRS status wire format is ambiguous: text that begins
+        // with a 7-char timestamp or a Maidenhead grid + `/symbol` is,
+        // per spec, indistinguishable from a structured status, so the
+        // parser reinterprets it. The plain-text round-trip property
+        // only holds when no structured prefix was detected.
+        //
+        // The builder appends the APRS `\r` terminator and the parser
+        // strips only *trailing* whitespace (that `\r` plus any right
+        // padding); leading whitespace is preserved as content. The
+        // comparison is therefore `trim_end`, not `trim`.
+        if parsed.timestamp.is_none() && parsed.grid_locator.is_none() {
+            prop_assert_eq!(parsed.text.as_str(), text.trim_end());
+        }
     }
+}
+
+/// Regression: a status whose text carries leading whitespace must
+/// round-trip with that space intact. `parse_aprs_status` strips only
+/// trailing whitespace (the `\r` terminator and right padding) —
+/// leading whitespace is content, as the parser's own grid+comment
+/// handling relies on. The `status_roundtrip` proptest previously
+/// compared against `text.trim()`, which also stripped the leading
+/// space and failed for minimal inputs such as `" A"`.
+#[test]
+fn status_roundtrip_preserves_leading_whitespace() -> Result<(), Box<dyn std::error::Error>> {
+    let source = Ax25Address::new("A", 0)?;
+    let packet = build_aprs_status_packet(&source, " A", &[]);
+    let wire = ax25_to_kiss_wire(&packet);
+    let kiss = decode_kiss_frame(&wire)?;
+    let parsed_packet = parse_ax25(&kiss.data)?;
+    let data = parse_aprs_data(&parsed_packet.info)?;
+    let AprsData::Status(parsed) = data else {
+        return Err("expected status variant".into());
+    };
+    assert_eq!(
+        parsed.text, " A",
+        "leading whitespace is status content, not strippable padding"
+    );
+    Ok(())
 }

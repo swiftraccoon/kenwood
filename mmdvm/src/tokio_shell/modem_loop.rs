@@ -46,12 +46,12 @@ use super::{Command, Event, TxQueue};
 
 /// Period between automatic `GetStatus` polls.
 ///
-/// Mirrors `m_statusTimer(1000, 0, 250)` in `ref/MMDVMHost/Modem.cpp:245`.
+/// Mirrors `m_statusTimer(1000, 0, 250)` in `MMDVMHost/Modem.cpp:245`.
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Period between TX-queue playout drains.
 ///
-/// Mirrors `m_playoutTimer(1000, 0, 10)` in `ref/MMDVMHost/Modem.cpp:247`.
+/// Mirrors `m_playoutTimer(1000, 0, 10)` in `MMDVMHost/Modem.cpp:247`.
 const PLAYOUT_INTERVAL: Duration = Duration::from_millis(10);
 
 /// RX buffer grow-as-needed chunk size, aligned with maximum MMDVM

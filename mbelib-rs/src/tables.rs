@@ -4,7 +4,7 @@
 //
 // AMBE 3600x2400 codec tables (D-STAR voice).
 //
-// Values transcribed from `ref/mbelib/ambe3600x2400_const.h` (szechyjs'
+// Values transcribed from `mbelib/ambe3600x2400_const.h` (szechyjs'
 // mbelib, originally ISC-licensed, relicensed to GPL-2.0-or-later via
 // mbelib-neo per its LICENSE/NOTICE). The C file stores them under the
 // `AmbePlus` prefix — this file strips that prefix and renames each

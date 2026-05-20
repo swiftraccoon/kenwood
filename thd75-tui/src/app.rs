@@ -3326,7 +3326,7 @@ impl App {
                 // that accessor was removed from `kenwood_thd75::memory`
                 // when its offset (imported from D74 development notes)
                 // could not be verified against D75 firmware or
-                // hardware — see CB-6 in the project history.
+                // hardware.
                 //
                 // TODO: replace this default with a CAT-side `MY?` read
                 // once that wraps the live value, or with an MCP read

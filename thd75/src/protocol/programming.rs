@@ -20,8 +20,15 @@
 
 use crate::error::ProtocolError;
 
-/// Entry command to enter programming mode (ASCII).
-pub const ENTER_PROGRAMMING: &[u8] = b"0M PROGRAM\r";
+/// Command to enter MCP programming mode (ASCII).
+///
+/// The leading carriage return terminates any stale, unterminated
+/// command sitting in the radio's CAT line buffer — for example an
+/// MMDVM-detection probe (`E0 03 00`) sent just before — so it cannot
+/// be prepended to `0M PROGRAM` and corrupt the handshake. This mirrors
+/// the `\r`-prefixed preamble `Radio::connect_safe` uses; the radio
+/// treats the empty leading line as a no-op.
+pub const ENTER_PROGRAMMING: &[u8] = b"\r0M PROGRAM\r";
 
 /// Expected response when entering programming mode (ASCII).
 pub const ENTER_RESPONSE: &[u8] = b"0M\r";
@@ -486,10 +493,25 @@ mod tests {
 
     #[test]
     fn constants_consistent() {
-        assert_eq!(ENTER_PROGRAMMING, b"0M PROGRAM\r");
+        assert_eq!(ENTER_PROGRAMMING, b"\r0M PROGRAM\r");
         assert_eq!(ENTER_RESPONSE, b"0M\r");
         assert_eq!(ACK, 0x06);
         assert_eq!(EXIT, b'E');
+    }
+
+    #[test]
+    fn enter_programming_leads_with_cr_to_flush_stale_input() {
+        // The leading CR terminates any unterminated fragment left in
+        // the radio's CAT line buffer (e.g. an MMDVM-detection probe)
+        // so it cannot be prepended to `0M PROGRAM` and corrupt entry.
+        assert!(
+            ENTER_PROGRAMMING.starts_with(b"\r"),
+            "ENTER_PROGRAMMING must lead with a flushing CR: {ENTER_PROGRAMMING:?}"
+        );
+        assert!(
+            ENTER_PROGRAMMING.ends_with(b"0M PROGRAM\r"),
+            "ENTER_PROGRAMMING must still carry the 0M PROGRAM command"
+        );
     }
 
     #[test]

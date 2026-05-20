@@ -35,7 +35,7 @@ These modules mirror the periodic-GetStatus poll cadence, the per-mode
 TX ring buffers, and the space-gated drain logic described in the
 upstream file:
 
-    ref/MMDVMHost/Modem.cpp
+    MMDVMHost/Modem.cpp
 
 Specifically mirrored regions (see the //! doc comments in each file
 for exact line references):
@@ -54,7 +54,7 @@ therefore inherits the "or later" grant.
 
 No code from MMDVMHost is copied verbatim into this crate. The
 derivation is documented inline in each affected module via
-"//! Mirrors ref/MMDVMHost/Modem.cpp:<line>" comments; those pointers
+"//! Mirrors MMDVMHost/Modem.cpp:<line>" comments; those pointers
 are the audit trail, not copy-paste. The Rust implementations use
 tokio channels, VecDeque, and tokio::time::Interval in place of the
 upstream CThread / CRingBuffer / CTimer primitives.

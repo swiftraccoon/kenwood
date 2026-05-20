@@ -181,7 +181,7 @@ fi
 check_unsafe_audit() {
     local violations
     violations=$(grep -rn 'allow(unsafe_code)' \
-        */src/ \
+        ./*/src/ \
         --include='*.rs' \
         2>/dev/null | \
         grep -v 'transport/bluetooth.rs' | \
@@ -266,7 +266,7 @@ run cargo machete .
 
 # Static-analyze the lint gate scripts themselves. Both files contain
 # trap handlers, kubectl heredocs, and pipefail-sensitive pipelines;
-# shellcheck catches the bash foot-guns those introduce.
+# running shellcheck catches the bash foot-guns those introduce.
 run shellcheck lint.sh ci-local.sh
 
 # Verify every workspace `Cargo.toml` is taplo-formatted. Catches manifest

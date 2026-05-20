@@ -6,6 +6,9 @@
 //! drive two recv/enqueue round trips on the client side before it
 //! can promote to `Connected`.
 
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
+
 mod common;
 
 use std::sync::Arc;

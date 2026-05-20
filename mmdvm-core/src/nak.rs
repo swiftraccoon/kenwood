@@ -6,7 +6,7 @@
 //!
 //! The MMDVM firmware rejects a command with `[0xE0, len, 0x7F, cmd,
 //! reason]`. The reason codes below are approximated from
-//! `ref/MMDVMHost/Modem.cpp:970-971` and the historical MMDVM
+//! `MMDVMHost/Modem.cpp:970-971` and the historical MMDVM
 //! specification — unknown codes are preserved in [`NakReason::Unknown`]
 //! rather than turning into a hard error, so callers can log and
 //! continue.

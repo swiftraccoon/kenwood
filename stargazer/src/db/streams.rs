@@ -17,72 +17,90 @@
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-/// A single row from the `streams` table.
+/// A pending stream's data, as the upload processor needs it to build one
+/// Rdio API call.
 ///
-/// Maps directly to the table columns via `sqlx::FromRow`. The `audio_mp3`
-/// field is `Option<Vec<u8>>` because it starts as `NULL` and is filled in
-/// after MP3 encoding completes.
+/// This projection of the `streams` table includes the `audio_mp3` blob
+/// (which the HTTP read paths deliberately omit — see [`StreamSummaryRow`])
+/// and only the header fields that map onto Rdio form fields.
 #[derive(Debug, sqlx::FromRow)]
-pub(crate) struct StreamRow {
-    /// Auto-generated row identifier, used as the stream's database primary key.
+pub(crate) struct PendingUploadRow {
+    /// Database row id — the upload's primary key for status transitions.
     pub(crate) id: i64,
 
-    /// Reflector callsign where this stream was captured.
+    /// Reflector callsign — drives the Rdio `system` id and labels.
     pub(crate) reflector: String,
 
-    /// Module letter (A-Z) the stream was received on.
+    /// Module letter — drives the Rdio `talkgroup`.
     pub(crate) module: String,
 
     /// D-STAR protocol used: `"dplus"`, `"dextra"`, or `"dcs"`.
     pub(crate) protocol: String,
 
-    /// D-STAR stream ID (non-zero u16 on wire, stored as i32 for Postgres
-    /// `INTEGER` compatibility).
-    pub(crate) stream_id: i32,
-
-    /// Operator callsign extracted from the D-STAR header `my_callsign` field.
+    /// Operator callsign from the D-STAR header `my_callsign` field.
     pub(crate) callsign: String,
 
     /// Operator suffix (4 bytes from `my_suffix`), if present.
     pub(crate) suffix: Option<String>,
 
-    /// `UR` (destination) callsign from the D-STAR header.
-    pub(crate) ur_call: Option<String>,
-
-    /// Slow-data text message decoded from the voice frames.
+    /// Slow-data text message decoded from the voice frames, mapped to the
+    /// Rdio `talkgroupTag`.
     pub(crate) dstar_text: Option<String>,
 
-    /// DPRS latitude, if a position report was embedded in the slow data.
-    pub(crate) dprs_lat: Option<f64>,
-
-    /// DPRS longitude, if a position report was embedded in the slow data.
-    pub(crate) dprs_lon: Option<f64>,
-
-    /// When the first voice frame was received.
+    /// When the first voice frame was received — the Rdio `dateTime` and the
+    /// audio filename stamp.
     pub(crate) started_at: DateTime<Utc>,
 
-    /// When the stream ended (EOT received or timeout). `None` while the
-    /// stream is still in progress.
-    pub(crate) ended_at: Option<DateTime<Utc>>,
-
-    /// Number of voice frames captured.
-    pub(crate) frame_count: Option<i32>,
-
-    /// Decoded MP3 audio blob. `None` until encoding completes.
+    /// Decoded MP3 audio blob. `get_pending` filters on `IS NOT NULL`, so in
+    /// practice this is always `Some` for a row the processor receives.
     pub(crate) audio_mp3: Option<Vec<u8>>,
 
+    /// Number of upload attempts made so far, for the retry/give-up decision.
+    pub(crate) upload_attempts: Option<i32>,
+}
+
+/// A `streams` row without the `audio_mp3` blob.
+///
+/// The HTTP listing endpoints never serve audio: selecting `audio_mp3` would
+/// pull the full MP3 of every listed stream out of Postgres only for the JSON
+/// view to discard it. This projection is the row type for those read paths;
+/// [`PendingUploadRow`] (with the blob) is reserved for the upload processor.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct StreamSummaryRow {
+    /// Auto-generated row identifier.
+    pub(crate) id: i64,
+    /// Reflector callsign where this stream was captured.
+    pub(crate) reflector: String,
+    /// Module letter (A-Z) the stream was received on.
+    pub(crate) module: String,
+    /// D-STAR protocol used: `"dplus"`, `"dextra"`, or `"dcs"`.
+    pub(crate) protocol: String,
+    /// D-STAR stream ID (stored as i32 for Postgres `INTEGER` compatibility).
+    pub(crate) stream_id: i32,
+    /// Operator callsign from the D-STAR header `my_callsign` field.
+    pub(crate) callsign: String,
+    /// Operator suffix, if present.
+    pub(crate) suffix: Option<String>,
+    /// `UR` (destination) callsign from the D-STAR header.
+    pub(crate) ur_call: Option<String>,
+    /// Slow-data text message decoded from the voice frames.
+    pub(crate) dstar_text: Option<String>,
+    /// DPRS latitude, if a position report was embedded in the slow data.
+    pub(crate) dprs_lat: Option<f64>,
+    /// DPRS longitude, if a position report was embedded in the slow data.
+    pub(crate) dprs_lon: Option<f64>,
+    /// When the first voice frame was received.
+    pub(crate) started_at: DateTime<Utc>,
+    /// When the stream ended (EOT or timeout); `None` while in progress.
+    pub(crate) ended_at: Option<DateTime<Utc>>,
+    /// Number of voice frames captured.
+    pub(crate) frame_count: Option<i32>,
     /// Upload lifecycle state: `"pending"`, `"uploaded"`, or `"failed"`.
     pub(crate) upload_status: Option<String>,
-
-    /// Number of upload attempts made so far.
-    pub(crate) upload_attempts: Option<i32>,
-
     /// Error message from the most recent failed upload attempt.
     pub(crate) last_upload_error: Option<String>,
-
     /// When the stream was successfully uploaded to the Rdio API.
     pub(crate) uploaded_at: Option<DateTime<Utc>>,
-
     /// When this row was first inserted.
     pub(crate) created_at: Option<DateTime<Utc>>,
 }
@@ -220,8 +238,10 @@ pub(crate) struct StreamStatusCounts {
 
 /// Returns aggregated upload-status counts for the `streams` table.
 ///
-/// Runs a single `GROUP BY upload_status` query so this is cheap even with
-/// millions of rows — the planner uses the `idx_streams_upload` index.
+/// Runs a single `GROUP BY upload_status` query. It aggregates over every row
+/// in `streams`; `idx_streams_upload` lets Postgres satisfy it with an index
+/// scan rather than a heap scan, but the cost still grows with the table —
+/// this is an operational snapshot, not an O(1) lookup.
 ///
 /// # Errors
 ///
@@ -250,7 +270,8 @@ pub(crate) async fn count_by_status(pool: &PgPool) -> Result<StreamStatusCounts,
 ///
 /// Used by the HTTP API to serve the stream listing endpoint. When
 /// `reflector_filter` is `Some`, only streams from that reflector are returned.
-/// Results are ordered by `started_at DESC` (most recent first).
+/// Results are ordered by `started_at DESC` (most recent first). The
+/// `audio_mp3` blob is not selected — see [`StreamSummaryRow`].
 ///
 /// # Errors
 ///
@@ -260,16 +281,16 @@ pub(crate) async fn query(
     reflector_filter: Option<&str>,
     since: DateTime<Utc>,
     limit: i64,
-) -> Result<Vec<StreamRow>, sqlx::Error> {
-    // Two query paths: filtered by reflector, or all reflectors.
-    // Both are time-bounded and row-limited, using idx_streams_lookup.
+) -> Result<Vec<StreamSummaryRow>, sqlx::Error> {
+    // Two query paths: filtered by reflector, or all reflectors. Both are
+    // time-bounded and row-limited, using idx_streams_lookup. audio_mp3 is
+    // deliberately omitted from the projection.
     if let Some(reflector) = reflector_filter {
-        sqlx::query_as::<_, StreamRow>(
+        sqlx::query_as::<_, StreamSummaryRow>(
             "SELECT id, reflector, module, protocol, stream_id, callsign,
                     suffix, ur_call, dstar_text, dprs_lat, dprs_lon,
-                    started_at, ended_at, frame_count, audio_mp3,
-                    upload_status, upload_attempts, last_upload_error,
-                    uploaded_at, created_at
+                    started_at, ended_at, frame_count,
+                    upload_status, last_upload_error, uploaded_at, created_at
              FROM streams
              WHERE reflector = $1 AND started_at >= $2
              ORDER BY started_at DESC
@@ -281,12 +302,11 @@ pub(crate) async fn query(
         .fetch_all(pool)
         .await
     } else {
-        sqlx::query_as::<_, StreamRow>(
+        sqlx::query_as::<_, StreamSummaryRow>(
             "SELECT id, reflector, module, protocol, stream_id, callsign,
                     suffix, ur_call, dstar_text, dprs_lat, dprs_lon,
-                    started_at, ended_at, frame_count, audio_mp3,
-                    upload_status, upload_attempts, last_upload_error,
-                    uploaded_at, created_at
+                    started_at, ended_at, frame_count,
+                    upload_status, last_upload_error, uploaded_at, created_at
              FROM streams
              WHERE started_at >= $1
              ORDER BY started_at DESC

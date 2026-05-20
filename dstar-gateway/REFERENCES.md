@@ -13,10 +13,10 @@ an issue with the line number you inspected.
 
 ## Pinned versions
 
-| Project | Commit | Clone path |
-|---------|--------|-----------|
-| `g4klx/ircDDBGateway` | [`f5ab9f7c93c6f28147b84a8f9667f6cc4c027eaa`](https://github.com/g4klx/ircDDBGateway/commit/f5ab9f7c93c6f28147b84a8f9667f6cc4c027eaa) | `ref/ircDDBGateway/` (gitignored) |
-| `LX3JL/xlxd` | [`bf5d0148dbdf2534af129ca3cc034c5051dcfc8d`](https://github.com/LX3JL/xlxd/commit/bf5d0148dbdf2534af129ca3cc034c5051dcfc8d) | `ref/xlxd/` (gitignored) |
+| Project | Commit |
+|---------|--------|
+| `g4klx/ircDDBGateway` | [`f5ab9f7c93c6f28147b84a8f9667f6cc4c027eaa`](https://github.com/g4klx/ircDDBGateway/commit/f5ab9f7c93c6f28147b84a8f9667f6cc4c027eaa) |
+| `LX3JL/xlxd` | [`bf5d0148dbdf2534af129ca3cc034c5051dcfc8d`](https://github.com/LX3JL/xlxd/commit/bf5d0148dbdf2534af129ca3cc034c5051dcfc8d) |
 
 Both are GPL-2.0. `dstar-gateway` is also licensed under GPL-2.0-or-later
 for this reason.
@@ -25,9 +25,8 @@ for this reason.
 
 ### g4klx/ircDDBGateway
 
-All paths below are relative to the project root (e.g.
-`Common/DPlusProtocolHandler.cpp` lives at
-`ref/ircDDBGateway/Common/DPlusProtocolHandler.cpp`).
+All paths below are relative to the root of the upstream
+`g4klx/ircDDBGateway` checkout (e.g. `Common/DPlusProtocolHandler.cpp`).
 
 #### DPlus (REF port 20001)
 
@@ -122,13 +121,8 @@ pick the more widely deployed behavior).
 
 ## How to update this file
 
-1. Re-sync the local clones:
-   ```bash
-   git -C ref/ircDDBGateway pull
-   git -C ref/xlxd pull
-   git -C ref/ircDDBGateway rev-parse HEAD
-   git -C ref/xlxd rev-parse HEAD
-   ```
+1. Pull the latest `g4klx/ircDDBGateway` and `LX3JL/xlxd`, and note
+   their new HEAD commit hashes.
 2. Update the **Pinned versions** table with the new hashes.
 3. For any new reference that was added to the code since the last
    update, grep for `ircDDBGateway` and `xlxd` in the three crates

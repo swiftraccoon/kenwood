@@ -13,7 +13,14 @@ readme = "README.md"
 publish = false
 
 [dependencies]
-tokio = { version = "1", features = ["net", "time", "sync", "macros", "io-util", "rt"] }
+tokio = { version = "1", features = [
+  "net",
+  "time",
+  "sync",
+  "macros",
+  "io-util",
+  "rt",
+] }
 tracing = "0.1"
 thiserror = "2"
 dstar-gateway-core = { path = "../dstar-gateway-core" }
@@ -22,7 +29,9 @@ dstar-gateway-core = { path = "../dstar-gateway-core" }
 # `rustls-platform-verifier` which pulls in the `jni` crate (for Android
 # cert verification) and its Windows platform shims, causing duplicate
 # windows_x86_64_msvc versions under cargo-deny. Pin to 0.12 to avoid.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+], optional = true }
 
 [features]
 default = []
@@ -40,7 +49,9 @@ examples-network = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "fmt",
+] }
 trybuild = "1"
 # Legacy pcap reader for the conformance replay tests. Dev-only; the
 # main library never pulls pcap-parser or its transitive nom stack.

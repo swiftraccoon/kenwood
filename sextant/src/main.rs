@@ -19,7 +19,12 @@
 
 mod app;
 mod audio;
+mod geo;
+mod heard;
+mod hosts;
 mod session;
+mod settings;
+mod ui;
 
 use std::env;
 use std::path::PathBuf;
@@ -56,21 +61,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (bypassing the GUI) so decode + playback aren't gated by the
     // egui redraw cadence (~50 ms → would mangle the 50 fps voice
     // stream otherwise).
-    let audio = audio::AudioHandle::start(cmd_tx.clone());
+    let (audio, audio_status_rx) = audio::AudioHandle::start(cmd_tx.clone());
     let audio_for_session = audio.clone();
     let _session_handle = runtime.spawn(session::run(cmd_rx, evt_tx, audio_for_session));
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Sextant — D-STAR Client")
-            .with_inner_size([720.0, 520.0]),
+            .with_inner_size([960.0, 680.0]),
         ..Default::default()
     };
 
     eframe::run_native(
         "sextant",
         native_options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, cmd_tx, evt_rx, audio, runtime)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::App::new(
+                cc,
+                cmd_tx,
+                evt_rx,
+                audio,
+                audio_status_rx,
+                runtime,
+            )))
+        }),
     )
     .map_err(|e| format!("eframe error: {e}").into())
 }

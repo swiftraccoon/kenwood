@@ -7,6 +7,9 @@
 //! spawn a session loop: the typestate `.promote()` call fails
 //! because the session is in `Closed`, not `Connected`.
 
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
+
 mod common;
 
 use std::sync::Arc;

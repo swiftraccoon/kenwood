@@ -134,7 +134,7 @@ pub struct AprsIsClient {
     /// long-lived TCP session. The bytes are decoded via
     /// `String::from_utf8_lossy` at the event boundary; callers that
     /// need byte-exact fidelity get the raw bytes in
-    /// [`AprsIsPacket::raw`]. See CB-4 in the project history.
+    /// [`AprsIsPacket::raw`].
     line_buf: Vec<u8>,
     last_write: Instant,
     logged_in_emitted: bool,
@@ -176,7 +176,7 @@ impl AprsIsClient {
         // short and latency-sensitive (ack/rej + IGate forwarding);
         // leaving Nagle on would batch a single-frame send with the
         // following keepalive write, adding hundreds of milliseconds
-        // round-trip. See CB-C-7.
+        // round-trip.
         stream.set_nodelay(true).map_err(AprsIsError::Connect)?;
 
         let (read_half, mut write_half) = stream.into_split();
@@ -274,7 +274,7 @@ impl AprsIsClient {
     /// parsed view. For packet lines the original bytes are preserved
     /// in [`AprsIsPacket::raw`] so callers needing byte-exact fidelity
     /// (`IGate` forwarding, packet capture) can recover the wire-truth
-    /// form. See CB-4 in the project history.
+    /// form.
     ///
     /// # Errors
     ///
@@ -549,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_event_survives_non_utf8_in_packet() -> TestResult {
-        // Regression guard for CB-4: pre-fix, BufReader::read_line
+        // Regression guard: pre-fix, BufReader::read_line
         // returned io::ErrorKind::InvalidData on the first non-UTF-8
         // byte and disconnected the session. Mic-E and raw weather
         // packets routinely carry bytes ≥ 0x80, so a strict UTF-8 read

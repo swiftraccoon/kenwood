@@ -12,9 +12,19 @@ dstar-gateway = { path = "../dstar-gateway" }
 dstar-gateway-core = { path = "../dstar-gateway-core" }
 mbelib-rs = { path = "../mbelib-rs" }
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "tls-rustls", "macros"] }
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio",
+  "postgres",
+  "chrono",
+  "tls-rustls",
+  "macros",
+] }
 axum = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "multipart",
+  "rustls-tls",
+] }
 mp3lame-encoder = { version = "0.2", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,6 +36,9 @@ clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

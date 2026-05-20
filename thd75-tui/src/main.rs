@@ -13,7 +13,8 @@ mod event;
 mod radio_task;
 mod ui;
 
-use std::io;
+use std::io::{self, Write};
+use std::time::Duration;
 
 use app::App;
 use clap::Parser;
@@ -21,6 +22,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use kenwood_thd75::LinkDiagnosis;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -39,6 +41,21 @@ struct Cli {
     /// MCP transfer speed: safe or fast.
     #[arg(long, default_value = "safe")]
     mcp_speed: String,
+
+    /// If the radio is found in Reflector Terminal Mode, guide an exit
+    /// (prompt for the Menu 650 change) and reconnect, instead of just
+    /// reporting it and quitting.
+    #[arg(long)]
+    exit_terminal_mode: bool,
+}
+
+/// What [`run_app`] did before returning control to `main`.
+enum RunOutcome {
+    /// The dashboard ran and the operator quit.
+    Quit,
+    /// The radio connection was never established. Carries the rendered
+    /// failure message and, when available, the link diagnosis.
+    ConnectFailed(radio_task::ConnectFailure),
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -62,92 +79,130 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         original_hook(panic_info);
     }));
 
-    // Open BT connection on the main thread (IOBluetooth needs main CFRunLoop).
-    let transport = radio_task::discover_and_open_transport(cli.port.as_deref(), cli.baud);
+    // Connection-attempt loop. The body brings up the dashboard once; it
+    // repeats only when `--exit-terminal-mode` is set and the radio is
+    // found in Reflector Terminal Mode, after the operator has been
+    // guided through the Menu 650 change.
+    'retry: loop {
+        // Open BT connection on the main thread (IOBluetooth needs main CFRunLoop).
+        let transport = radio_task::discover_and_open_transport(cli.port.as_deref(), cli.baud);
 
-    // Terminal setup on main thread before spawning
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+        // Terminal setup on main thread before spawning
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
 
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<RunOutcome, String>>();
 
-    // Channel for BT reconnect requests from the tokio thread.
-    // IOBluetooth RFCOMM must be opened on the main thread (needs CFRunLoop).
-    // The tokio thread sends (port, baud) and the main thread replies with the transport.
-    let (bt_req_tx, bt_req_rx) = std::sync::mpsc::channel::<(Option<String>, u32)>();
-    let (bt_resp_tx, bt_resp_rx) = std::sync::mpsc::channel::<BtResult>();
+        // Channel for BT reconnect requests from the tokio thread.
+        // IOBluetooth RFCOMM must be opened on the main thread (needs CFRunLoop).
+        // The tokio thread sends (port, baud) and the main thread replies with the transport.
+        let (bt_req_tx, bt_req_rx) = std::sync::mpsc::channel::<(Option<String>, u32)>();
+        let (bt_resp_tx, bt_resp_rx) = std::sync::mpsc::channel::<BtResult>();
 
-    let mcp_speed = cli.mcp_speed;
+        let mcp_speed = cli.mcp_speed.clone();
 
-    let _thread = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build tokio runtime");
+        let _thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
 
-        let result = rt.block_on(async {
-            run_app(&mut terminal, transport, mcp_speed, bt_req_tx, bt_resp_rx)
-                .await
-                .map_err(|e| e.to_string())
+            let result = rt.block_on(async {
+                run_app(&mut terminal, transport, mcp_speed, bt_req_tx, bt_resp_rx)
+                    .await
+                    .map_err(|e| e.to_string())
+            });
+
+            let _ = disable_raw_mode();
+            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+            let _ = terminal.show_cursor();
+
+            let _ = done_tx.send(result);
         });
 
-        let _ = disable_raw_mode();
-        let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-        let _ = terminal.show_cursor();
-
-        let _ = done_tx.send(result);
-    });
-
-    // Main thread: pump CFRunLoop for IOBluetooth callbacks
-    loop {
-        #[cfg(target_os = "macos")]
-        #[expect(
-            unsafe_code,
-            reason = "macOS IOBluetooth RFCOMM delivers packet callbacks on the main \
-                      thread's CFRunLoop, so a non-Cocoa binary must pump that run loop \
-                      itself — otherwise incoming BT frames never arrive. The Rust \
-                      ecosystem has no safe wrapper for CFRunLoopRunInMode; this is \
-                      Apple's only documented API for pumping the run loop from a \
-                      non-Cocoa binary. `seconds=0.01` keeps the main thread responsive \
-                      while yielding to IOBluetooth's internal queue. `unsafe_code` fires \
-                      here because the FFI block transits through Apple's C ABI; the \
-                      signatures are verified against the CoreFoundation headers in this \
-                      machine's SDK."
-        )]
-        unsafe {
-            unsafe extern "C" {
-                fn CFRunLoopRunInMode(
-                    mode: *const std::ffi::c_void,
-                    seconds: f64,
-                    returnAfterSourceHandled: u8,
-                ) -> i32;
-                static kCFRunLoopDefaultMode: *const std::ffi::c_void;
+        // Main thread: pump CFRunLoop for IOBluetooth callbacks until the
+        // tokio thread reports its outcome.
+        let outcome = loop {
+            #[cfg(target_os = "macos")]
+            #[expect(
+                unsafe_code,
+                reason = "macOS IOBluetooth RFCOMM delivers packet callbacks on the main \
+                          thread's CFRunLoop, so a non-Cocoa binary must pump that run loop \
+                          itself — otherwise incoming BT frames never arrive. The Rust \
+                          ecosystem has no safe wrapper for CFRunLoopRunInMode; this is \
+                          Apple's only documented API for pumping the run loop from a \
+                          non-Cocoa binary. `seconds=0.01` keeps the main thread responsive \
+                          while yielding to IOBluetooth's internal queue. `unsafe_code` fires \
+                          here because the FFI block transits through Apple's C ABI; the \
+                          signatures are verified against the CoreFoundation headers in this \
+                          machine's SDK."
+            )]
+            unsafe {
+                unsafe extern "C" {
+                    fn CFRunLoopRunInMode(
+                        mode: *const std::ffi::c_void,
+                        seconds: f64,
+                        returnAfterSourceHandled: u8,
+                    ) -> i32;
+                    static kCFRunLoopDefaultMode: *const std::ffi::c_void;
+                }
+                let _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, 0);
             }
-            let _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, 0);
-        }
 
-        #[cfg(not(target_os = "macos"))]
-        std::thread::sleep(std::time::Duration::from_millis(10));
+            #[cfg(not(target_os = "macos"))]
+            std::thread::sleep(Duration::from_millis(10));
 
-        // Handle BT reconnect requests from the tokio thread.
-        // BluetoothTransport::open() must happen on the main thread.
-        if let Ok((port, baud)) = bt_req_rx.try_recv() {
-            let result = radio_task::discover_and_open_transport(port.as_deref(), baud);
-            let _ = bt_resp_tx.send(result);
-        }
+            // Handle BT reconnect requests from the tokio thread.
+            // BluetoothTransport::open() must happen on the main thread.
+            if let Ok((port, baud)) = bt_req_rx.try_recv() {
+                let result = radio_task::discover_and_open_transport(port.as_deref(), baud);
+                let _ = bt_resp_tx.send(result);
+            }
 
-        if let Ok(result) = done_rx.try_recv() {
-            if let Err(e) = result {
+            if let Ok(result) = done_rx.try_recv() {
+                break result;
+            }
+        };
+
+        match outcome {
+            Ok(RunOutcome::Quit) => break 'retry,
+            Ok(RunOutcome::ConnectFailed(failure)) => {
+                // The teardown above already restored the terminal, so the
+                // guidance and prompt below print to a plain screen.
+                if cli.exit_terminal_mode && failure.diagnosis == Some(LinkDiagnosis::MmdvmMode) {
+                    guide_terminal_mode_exit(&failure.message);
+                    continue 'retry;
+                }
+                eprintln!("{}", failure.message);
+                break 'retry;
+            }
+            Err(e) => {
                 eprintln!("Error: {e}");
+                break 'retry;
             }
-            break;
         }
     }
 
     Ok(())
+}
+
+/// Print the Reflector Terminal Mode guidance, then block until the
+/// operator confirms they have changed Menu 650.
+///
+/// Used only under `--exit-terminal-mode`: the caller retries the
+/// connection once this returns. A short delay covers the radio's
+/// reboot after the menu change (USB re-enumerates).
+fn guide_terminal_mode_exit(message: &str) {
+    println!("\n{message}\n");
+    print!("Set Menu 650 to Off on the radio, then press Enter to retry (Ctrl-C to quit)... ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
+    println!("Reconnecting...");
+    std::thread::sleep(Duration::from_secs(4));
 }
 
 async fn run_app(
@@ -158,12 +213,19 @@ async fn run_app(
     bt_resp_rx: std::sync::mpsc::Receiver<
         Result<(String, kenwood_thd75::transport::EitherTransport), String>,
     >,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<RunOutcome, Box<dyn std::error::Error>> {
     let mut events = event::EventHandler::new();
     let tx = events.sender();
     let cmd_rx = events.take_command_receiver();
 
-    let (path, transport) = transport.map_err(|e| format!("Could not connect to radio: {e}"))?;
+    let (path, transport) = match transport {
+        Ok(found) => found,
+        Err(e) => {
+            return Ok(RunOutcome::ConnectFailed(
+                radio_task::ConnectFailure::generic(format!("Could not find the radio: {e}")),
+            ));
+        }
+    };
 
     let port_display = match radio_task::spawn_with_transport(
         path, transport, mcp_speed, tx, cmd_rx, bt_req_tx, bt_resp_rx,
@@ -171,7 +233,7 @@ async fn run_app(
     .await
     {
         Ok(p) => p,
-        Err(e) => return Err(format!("Could not connect to radio: {e}").into()),
+        Err(failure) => return Ok(RunOutcome::ConnectFailed(failure)),
     };
 
     let mut app = App::new(port_display);
@@ -191,5 +253,5 @@ async fn run_app(
         }
     }
 
-    Ok(())
+    Ok(RunOutcome::Quit)
 }

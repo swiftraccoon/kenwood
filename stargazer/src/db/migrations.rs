@@ -56,6 +56,11 @@ CREATE TABLE IF NOT EXISTS activity_log (
 -- reflector/module within a time window.
 CREATE INDEX IF NOT EXISTS idx_activity_log_lookup
     ON activity_log (reflector, module, observed_at);
+-- Index for time-window scans: the global activity feed and the
+-- activity-derived 'is this reflector active?' join both filter on
+-- observed_at without a leading reflector predicate.
+CREATE INDEX IF NOT EXISTS idx_activity_log_observed
+    ON activity_log (observed_at);
 
 -- Snapshot of nodes currently linked to each reflector module. Updated by
 -- Tier 2 monitors; stale entries are evicted when a monitor reconnects.

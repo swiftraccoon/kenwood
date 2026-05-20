@@ -43,10 +43,9 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "usb-
 ///
 /// This Swift side is scaffolded. The dext source (`lodestar/Driver/`)
 /// is **not yet implemented** — `open()` throws clearly until it's
-/// built, signed, and matched. See `lodestar/CLAUDE.md` for the
-/// "iPad Direct-Radio (DriverKit USB-CDC)" plan and prerequisites
-/// (Apple Developer Program, M-series iPad, transport entitlement
-/// approval).
+/// built, signed, and matched. Shipping the DriverKit USB-CDC path
+/// additionally requires an Apple Developer Program membership, an
+/// M-series iPad, and Apple approval of the USB transport entitlement.
 public actor USBSerialTransport: RadioTransport {
     public let device: BluetoothDevice
     private var _state: RadioTransportState = .disconnected

@@ -37,7 +37,7 @@ use crate::db;
 use crate::db::activity::ActivityRow;
 use crate::db::connected_nodes::ConnectedNodeRow;
 use crate::db::reflectors::ReflectorRow;
-use crate::db::streams::{StreamRow, StreamStatusCounts};
+use crate::db::streams::{StreamStatusCounts, StreamSummaryRow};
 
 /// Default time window for `/api/reflectors` when `since` is missing.
 ///
@@ -80,6 +80,9 @@ pub(crate) struct ReflectorQuery {
 pub(crate) struct ActivityQuery {
     /// Relative time window, e.g. `"1h"`, `"24h"`, `"7d"`. Defaults to 6h.
     pub(crate) since: Option<String>,
+
+    /// Row cap. Clamped to a max of 500 rows per response; defaults to 50.
+    pub(crate) limit: Option<i64>,
 }
 
 /// Query parameters for the `/api/streams` endpoint.
@@ -296,8 +299,8 @@ pub(crate) struct StreamView {
     pub(crate) created_at: Option<DateTime<Utc>>,
 }
 
-impl From<StreamRow> for StreamView {
-    fn from(row: StreamRow) -> Self {
+impl From<StreamSummaryRow> for StreamView {
+    fn from(row: StreamSummaryRow) -> Self {
         Self {
             id: row.id,
             reflector: row.reflector,
@@ -378,16 +381,22 @@ impl From<ConnectedNodeRow> for ConnectedNodeView {
 /// overflow). Callers fall back to endpoint-specific defaults.
 fn parse_duration_string(s: &str) -> Option<Duration> {
     let s = s.trim();
-    let (num_str, unit) = s.split_at(s.len().checked_sub(1)?);
+    // Split off the final character as the unit by iterating `chars`, not by
+    // byte-slicing at `len - 1`: `since` is untrusted query input and
+    // `str::split_at` panics when the index lands inside a multi-byte
+    // codepoint (e.g. `since=1°`).
+    let mut chars = s.chars();
+    let unit = chars.next_back()?;
+    let num_str = chars.as_str();
     if num_str.is_empty() {
         return None;
     }
     let n: u64 = num_str.parse().ok()?;
     let secs = match unit {
-        "s" => n,
-        "m" => n.checked_mul(60)?,
-        "h" => n.checked_mul(3600)?,
-        "d" => n.checked_mul(86_400)?,
+        's' => n,
+        'm' => n.checked_mul(60)?,
+        'h' => n.checked_mul(3600)?,
+        'd' => n.checked_mul(86_400)?,
         _ => return None,
     };
     Some(Duration::from_secs(secs))
@@ -489,14 +498,16 @@ pub(crate) async fn list_reflectors(
 /// `GET /api/reflectors/{callsign}/activity` — recent activity for one reflector.
 ///
 /// Returns the `activity_log` rows for `callsign` within the `since`
-/// window (default 6h), ordered most-recent-first.
+/// window (default 6h), ordered most-recent-first and capped at `limit`
+/// rows (default 50, max 500).
 pub(crate) async fn reflector_activity(
     State(pool): State<PgPool>,
     Path(callsign): Path<String>,
     Query(params): Query<ActivityQuery>,
 ) -> Result<Json<Vec<ActivityView>>, StatusCode> {
     let since = parse_since(params.since.as_deref(), DEFAULT_ACTIVITY_WINDOW);
-    let rows = db::activity::get_for_reflector(&pool, &callsign, since)
+    let limit = clamp_limit(params.limit, DEFAULT_ACTIVITY_LIMIT, MAX_LIMIT);
+    let rows = db::activity::get_for_reflector(&pool, &callsign, since, limit)
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, callsign = %callsign, "reflector_activity: query failed");
@@ -535,7 +546,7 @@ pub(crate) async fn upload_queue(
     Query(params): Query<UploadQueueQuery>,
 ) -> Result<Json<Vec<StreamView>>, StatusCode> {
     let limit = clamp_limit(params.limit, DEFAULT_UPLOAD_LIMIT, MAX_LIMIT);
-    let rows = db::uploads::get_pending(&pool, limit).await.map_err(|e| {
+    let rows = db::uploads::list_pending(&pool, limit).await.map_err(|e| {
         tracing::warn!(error = %e, "upload_queue: query failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -615,7 +626,7 @@ mod tests {
     };
     use crate::db::activity::ActivityRow;
     use crate::db::reflectors::ReflectorRow;
-    use crate::db::streams::StreamRow;
+    use crate::db::streams::StreamSummaryRow;
     use chrono::{TimeZone, Utc};
     use std::time::Duration;
 
@@ -678,6 +689,16 @@ mod tests {
     fn parse_duration_handles_overflow() {
         // 2^64 / 86400 ≈ 2.1e14; feed a value that overflows u64 * 86400.
         assert_eq!(parse_duration_string("999999999999999999d"), None);
+    }
+
+    #[test]
+    fn parse_duration_rejects_trailing_multibyte_char() {
+        // `since` is attacker-controlled query input. A value whose final
+        // character is multi-byte UTF-8 must be rejected, not panic: slicing
+        // off the unit by byte index would land inside a codepoint.
+        assert_eq!(parse_duration_string("°"), None);
+        assert_eq!(parse_duration_string("1😀"), None);
+        assert_eq!(parse_duration_string("30s€"), None);
     }
 
     #[test]
@@ -821,14 +842,15 @@ mod tests {
     }
 
     #[test]
-    fn stream_view_from_row_omits_audio_blob() -> Result<(), Box<dyn std::error::Error>> {
-        // The HTTP view intentionally drops audio_mp3; confirm it is not
-        // accidentally added back (the field isn't present in StreamView).
+    fn stream_view_from_summary_row_maps_fields() -> Result<(), Box<dyn std::error::Error>> {
+        // StreamSummaryRow is the blob-free projection the HTTP listing
+        // endpoints query; confirm the view maps every field and the JSON
+        // wire contract never grows an audio_mp3 key.
         let ts = Utc
             .with_ymd_and_hms(2026, 4, 12, 12, 0, 0)
             .single()
             .ok_or("fixed timestamp must be unambiguous")?;
-        let row = StreamRow {
+        let row = StreamSummaryRow {
             id: 7,
             reflector: "REF030".to_owned(),
             module: "C".to_owned(),
@@ -843,9 +865,7 @@ mod tests {
             started_at: ts,
             ended_at: Some(ts),
             frame_count: Some(100),
-            audio_mp3: Some(vec![0xFF; 1024]),
             upload_status: Some("pending".to_owned()),
-            upload_attempts: Some(0),
             last_upload_error: None,
             uploaded_at: None,
             created_at: Some(ts),
@@ -860,17 +880,13 @@ mod tests {
         assert_eq!(view.frame_count, Some(100));
         assert_eq!(view.upload_status.as_deref(), Some("pending"));
 
-        // Serialize to JSON and confirm audio_mp3 is absent. This is the
-        // real "system" test — the view's serialization is the HTTP
-        // wire contract. Every other row field is surfaced in the view,
-        // so this is the single exclusion we guard.
+        // The view's serialization is the HTTP wire contract. Guard that
+        // audio_mp3 never appears and that the operator-facing fields do.
         let json = serde_json::to_string(&view)?;
         assert!(
             !json.contains("audio_mp3"),
             "audio_mp3 must not appear in the JSON output: {json}"
         );
-        // ur_call, dprs_lat, dprs_lon, last_upload_error, uploaded_at,
-        // created_at, and stream_id are surfaced for operator visibility.
         assert!(
             json.contains("\"ur_call\":\"CQCQCQ\""),
             "ur_call must appear in the JSON output: {json}"

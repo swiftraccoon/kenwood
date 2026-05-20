@@ -9,7 +9,7 @@ use proptest::test_runner::TestCaseError;
 use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::types::tone::{CtcssMode, DcsCode, ToneCode};
 use kenwood_thd75::types::*;
-use kiss_tnc::{KissFrame, decode_kiss_frame, encode_kiss_frame};
+use kiss_tnc::{KissCommand, KissFrame, KissPort, decode_kiss_frame, encode_kiss_frame};
 
 /// Convert any debug-printable error into a `TestCaseError` so `?` can be used
 /// in proptest blocks without violating workspace `unwrap_used` policy.
@@ -252,16 +252,16 @@ proptest! {
         prop_assert_eq!(l, level);
     }
 
-    // 16. KISS frame encode/decode round-trip
+    // 16. KISS frame encode/decode round-trip.
     //
-    // The type byte (port<<4 | command) is NOT escaped in KISS framing,
-    // so combinations producing 0xC0 (FEND) or 0xDB (FESC) as the type
-    // byte cannot round-trip. We restrict to port 0 (the only port the
-    // TH-D75 uses) and command 0..7 (the defined KISS commands), which
-    // keeps the type byte in the safe 0x00-0x07 range.
+    // The TH-D75 only ever uses port 0; this exercises every defined
+    // nibble-encoded KISS command with arbitrary payload data.
     #[test]
-    fn kiss_frame_round_trip(command in 0u8..7, data in proptest::collection::vec(any::<u8>(), 0..100)) {
-        let frame = KissFrame { port: 0, command, data };
+    fn kiss_frame_round_trip(
+        command in (0u8..7).prop_filter_map("known command", KissCommand::from_byte),
+        data in proptest::collection::vec(any::<u8>(), 0..100),
+    ) {
+        let frame = KissFrame { port: KissPort::TH_D75, command, data };
         let encoded = encode_kiss_frame(&frame);
         let decoded = decode_kiss_frame(&encoded).map_err(to_test_err)?;
         prop_assert_eq!(decoded, frame);

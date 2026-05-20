@@ -703,9 +703,11 @@ impl<T: Transport> Radio<T> {
 
     /// Enter programming mode (`0M PROGRAM`).
     ///
-    /// Switches to 9600 baud and sends `0M PROGRAM\r`. The radio
-    /// responds with `0M\r` and enters MCP mode. The session stays
-    /// at 9600 baud for all subsequent R/W/ACK exchanges.
+    /// Switches to 9600 baud and sends the `0M PROGRAM` entry command.
+    /// The command is carriage-return prefixed so a stale partial
+    /// command in the radio's input buffer cannot corrupt the handshake.
+    /// The radio responds with `0M\r` and enters MCP mode. The session
+    /// stays at 9600 baud for all subsequent R/W/ACK exchanges.
     ///
     /// The radio stops responding to normal CAT commands and displays
     /// "PROG MCP" until [`exit_programming_mode`](Self::exit_programming_mode)
@@ -1193,7 +1195,7 @@ mod tests {
         let mut mock = MockTransport::new();
 
         // Enter programming mode (no baud switch, no sync byte).
-        mock.expect(b"0M PROGRAM\r", b"0M\r");
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
         // First page (256): has real names in slots 0-3.
         let first_page_data = build_name_page(&["ForestCityPD", "RPT1", "", "NOAA WX"])?;
@@ -1236,7 +1238,7 @@ mod tests {
         let mut mock = MockTransport::new();
 
         // Enter.
-        mock.expect(b"0M PROGRAM\r", b"0M\r");
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
         // Read page 0x0020.
         let page: u16 = 0x0020;
@@ -1263,7 +1265,7 @@ mod tests {
         let mut mock = MockTransport::new();
 
         // Enter.
-        mock.expect(b"0M PROGRAM\r", b"0M\r");
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
         // Write page 0x0100.
         let page: u16 = 0x0100;
@@ -1318,7 +1320,7 @@ mod tests {
         let mut mock = MockTransport::new();
 
         // Enter.
-        mock.expect(b"0M PROGRAM\r", b"0M\r");
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
         // Read 2 pages starting at 0x0040.
         for i in 0..2u16 {
@@ -1378,7 +1380,7 @@ mod tests {
         let mut mock = MockTransport::new();
 
         // Enter.
-        mock.expect(b"0M PROGRAM\r", b"0M\r");
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
         // Channel flags span pages 0x0020 through 0x0032 (19 pages).
         let page_count = programming::CHANNEL_FLAGS_END - programming::CHANNEL_FLAGS_START + 1;
@@ -1437,7 +1439,7 @@ mod tests {
         let mut mock = MockTransport::new();
 
         // Enter.
-        mock.expect(b"0M PROGRAM\r", b"0M\r");
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
         // Read 3 pages.
         for i in 0..3u16 {
@@ -1478,7 +1480,7 @@ mod tests {
         set_byte(&mut expected_data, byte_index, 0x01)?;
 
         // Enter programming mode.
-        mock.expect(b"0M PROGRAM\r", b"0M\r");
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
         // Read page.
         let read_cmd = programming::build_read_command(page);
@@ -1545,7 +1547,7 @@ mod tests {
         write_slice(&mut expected_data, offset, name)?;
 
         // Enter programming mode.
-        mock.expect(b"0M PROGRAM\r", b"0M\r");
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
         // Read page.
         let read_cmd = programming::build_read_command(page);
@@ -1601,7 +1603,7 @@ mod tests {
             .ok_or("long_name shorter than 15 bytes")?;
         write_slice(&mut expected_data, 0, truncated)?;
 
-        mock.expect(b"0M PROGRAM\r", b"0M\r");
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
         let read_cmd = programming::build_read_command(page);
         mock.expect(&read_cmd, &build_w_response(page, &original_data)?);
         mock.expect(&[programming::ACK], &[programming::ACK]);
@@ -1620,7 +1622,7 @@ mod tests {
         let mut mock = MockTransport::new();
 
         // Enter programming mode.
-        mock.expect(b"0M PROGRAM\r", b"0M\r");
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
         // First page has some names.
         let first_page_data = build_name_page(&["AllCh0", "AllCh1"])?;

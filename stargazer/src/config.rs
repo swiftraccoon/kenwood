@@ -21,7 +21,7 @@
 //! | `STARGAZER_TIER3_DPLUS_CALLSIGN` | `tier3.dplus_callsign` |
 //! | `STARGAZER_SERVER_LISTEN` | `server.listen` |
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -285,9 +285,12 @@ impl Default for AudioConfig {
 pub(crate) struct ServerConfig {
     /// Socket address to bind the HTTP API server to.
     ///
-    /// Default: `"0.0.0.0:8080"`
+    /// Parsed as a `SocketAddr` at load time, so an invalid value in the TOML
+    /// file is rejected immediately rather than at bind time.
+    ///
+    /// Default: `0.0.0.0:8080`
     #[serde(default = "default_listen")]
-    pub(crate) listen: String,
+    pub(crate) listen: SocketAddr,
 }
 
 impl Default for ServerConfig {
@@ -374,8 +377,8 @@ const fn default_mp3_bitrate() -> u32 {
     64
 }
 
-fn default_listen() -> String {
-    String::from("0.0.0.0:8080")
+const fn default_listen() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080)
 }
 
 /// Loads configuration from a TOML file, then applies environment variable
@@ -394,9 +397,9 @@ fn default_listen() -> String {
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be read or contains invalid TOML, or
-/// if the `STARGAZER_SERVER_LISTEN` environment variable contains an invalid
-/// socket address.
+/// Returns an error if the file cannot be read or contains invalid TOML, if
+/// `server.listen` (from the file or `STARGAZER_SERVER_LISTEN`) is not a valid
+/// socket address, or if `audio.format` / `audio.mp3_bitrate` is unsupported.
 pub(crate) fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
     let contents = std::fs::read_to_string(path)?;
     let mut config: Config = toml::from_str(&contents)?;
@@ -415,9 +418,26 @@ pub(crate) fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
         config.tier3.dplus_callsign = val;
     }
     if let Ok(val) = std::env::var("STARGAZER_SERVER_LISTEN") {
-        // Validate the override is a valid socket address early.
-        let _: SocketAddr = val.parse()?;
-        config.server.listen = val;
+        config.server.listen = val.parse()?;
+    }
+
+    // Validate audio settings up front so a typo fails fast at startup rather
+    // than on the first captured stream (Tier 3 is the only consumer).
+    if config.audio.format != "mp3" {
+        return Err(format!(
+            "unsupported audio.format {:?}: only \"mp3\" is supported",
+            config.audio.format
+        )
+        .into());
+    }
+    if !crate::tier3::decoder::is_supported_bitrate(config.audio.mp3_bitrate) {
+        return Err(format!(
+            "unsupported audio.mp3_bitrate {}: must be a valid MP3 CBR bitrate \
+             (one of 8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128, 160, 192, \
+             224, 256, 320)",
+            config.audio.mp3_bitrate
+        )
+        .into());
     }
 
     Ok(config)

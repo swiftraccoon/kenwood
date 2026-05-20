@@ -17,6 +17,9 @@
 //! 29-byte voice data layout rather than DCS's single 100-byte
 //! combined frame.
 
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

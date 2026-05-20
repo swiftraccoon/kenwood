@@ -8,7 +8,7 @@
 //! (for protocol v2) the CAP1/CAP2 bytes and a CPU/UDID block, then
 //! a human-readable description string.
 //!
-//! Mirrors the parsing in `ref/MMDVMHost/Modem.cpp:1996-2049`.
+//! Mirrors the parsing in `MMDVMHost/Modem.cpp:1996-2049`.
 
 use crate::capabilities::Capabilities;
 use crate::error::MmdvmError;

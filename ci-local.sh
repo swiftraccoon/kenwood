@@ -99,6 +99,11 @@ ci_pod() {
     # this with `|| failed=1`, but since ci_pod runs in a subshell
     # the assignment was local-only and every pod failure was
     # silently swallowed (the script always printed "CI PASSED").
+    #
+    # The pod script is single-quoted on purpose: its variable
+    # references must reach the pod literally and expand inside the
+    # pod, not in this shell. SC2016 does not apply here.
+    # shellcheck disable=SC2016
     kubectl exec "ci-$name" -- bash -c '
         set -eo pipefail
         [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
@@ -147,7 +152,7 @@ ci_pod() {
         step "clippy +encoder"       cargo clippy -p mbelib-rs --all-targets --features encoder -- -D warnings
         step "clippy +kenwood"       cargo clippy -p mbelib-rs --all-targets --features kenwood-tables -- -D warnings
         # Some thd75 integration tests depend on gitignored spec
-        # fixtures that aren't shipped in CI, so stick to --lib here.
+        # fixtures that are not shipped in CI, so stick to --lib here.
         step "test workspace (lib)"  cargo test --workspace --lib
         step "test +encoder"         cargo test -p mbelib-rs --features encoder --lib
         step "test +kenwood"         cargo test -p mbelib-rs --features kenwood-tables --lib

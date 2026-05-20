@@ -74,7 +74,7 @@ use aprs::{
     build_query_response_position, classify_ack_rej, parse_aprs_data_full,
 };
 use ax25_codec::{Ax25Address, Ax25Packet, CommandResponse, RouteEntry, build_ax25, parse_ax25};
-use kiss_tnc::{CMD_DATA, KissFrame, encode_kiss_frame};
+use kiss_tnc::{KissCommand, KissFrame, encode_kiss_frame};
 
 use crate::aprs::ax25_to_kiss_wire;
 use crate::error::Error;
@@ -591,7 +591,7 @@ impl<T: Transport> AprsClient<T> {
             }
             Err(e) => return Err(e),
         };
-        if frame.command != CMD_DATA {
+        if frame.command != KissCommand::Data {
             return Ok(None);
         }
         Ok(parse_ax25(&frame.data).ok())
@@ -671,7 +671,7 @@ impl<T: Transport> AprsClient<T> {
                 // first and queued `StationHeard` — that violated the
                 // sibling-arm convention and would *lose* the StationHeard
                 // event entirely if the caller stopped polling between
-                // the two. See git history for CB-7.
+                // the two.
                 match (entry, weather) {
                     (Some(entry_ev), Some(wx)) => {
                         self.pending_events.push_back(AprsEvent::WeatherReceived {
@@ -1072,7 +1072,6 @@ impl<T: Transport> AprsClient<T> {
     /// Pre-2026 versions used a hard-coded `[TCPIP-0]` outer path and
     /// did not append `,I`, which made the wire frame indistinguishable
     /// from an internet-originated packet that had never touched RF.
-    /// See M5 in the project history.
     ///
     /// # Filtering
     ///
@@ -1088,11 +1087,7 @@ impl<T: Transport> AprsClient<T> {
             return Ok(false);
         };
         let ax25_bytes = build_ax25(&packet);
-        let wire = encode_kiss_frame(&KissFrame {
-            port: 0,
-            command: CMD_DATA,
-            data: ax25_bytes,
-        });
+        let wire = encode_kiss_frame(&KissFrame::data(ax25_bytes));
         self.session.send_wire(&wire).await?;
         Ok(true)
     }
@@ -1784,11 +1779,7 @@ mod tests {
             info: info.to_vec(),
         };
         let ax25_bytes = build_ax25(&packet);
-        encode_kiss_frame(&KissFrame {
-            port: 0,
-            command: CMD_DATA,
-            data: ax25_bytes,
-        })
+        encode_kiss_frame(&KissFrame::data(ax25_bytes))
     }
 
     #[tokio::test]

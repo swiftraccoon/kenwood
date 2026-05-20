@@ -143,20 +143,28 @@ pub(crate) async fn process_completed_stream(
         return Ok(());
     }
 
-    // Encode AMBE frames to MP3. This is CPU-bound but short (typically
-    // a few milliseconds even for a 30-second transmission); inline is
-    // fine rather than `spawn_blocking`.
-    let mp3_bytes = decoder::decode_to_mp3(&capture.ambe_frames, mp3_bitrate).map_err(|e| {
-        tracing::warn!(
-            reflector = %capture.reflector,
-            module = %capture.module,
-            stream_id = capture.stream_id,
-            frame_count,
-            error = %e,
-            "failed to encode captured stream to MP3"
-        );
-        e
-    })?;
+    // Encode AMBE frames to MP3 on a blocking thread. Decoding the frames
+    // through mbelib and running LAME is CPU-bound and can take tens of
+    // milliseconds for a long transmission — enough to stall other tasks if
+    // run on an async worker — so it goes to the blocking pool.
+    let frames = capture.ambe_frames;
+    let encoded =
+        tokio::task::spawn_blocking(move || decoder::decode_to_mp3(&frames, mp3_bitrate)).await;
+    let mp3_bytes = match encoded {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                reflector = %capture.reflector,
+                module = %capture.module,
+                stream_id = capture.stream_id,
+                frame_count,
+                error = %e,
+                "failed to encode captured stream to MP3"
+            );
+            return Err(e.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     // Insert the row with header metadata. `audio_mp3` starts NULL; the
     // second query (`update_audio`) fills it in.

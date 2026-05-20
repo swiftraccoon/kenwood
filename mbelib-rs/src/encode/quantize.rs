@@ -68,7 +68,7 @@ const MAX_HOC_TERMS: usize = 6;
 /// Uses the D-STAR AMBE 3600x2400 bit layout — every position below
 /// is the exact mirror of what `crate::decode::decode_params` reads,
 /// which in turn matches `mbe_decodeAmbe2400Parms` in
-/// `ref/mbelib/ambe3600x2400.c`.
+/// `mbelib/ambe3600x2400.c`.
 ///
 /// # Bit layout
 ///
@@ -735,7 +735,7 @@ const SA_SCALE: f32 = 1.0;
 ///
 /// OP25's `ambe_encoder.cc:256` does `diff_gain -= gain_adjust;` where
 /// the D-STAR per-protocol value is **7.5** (see
-/// `ref/op25/op25/gr-op25_repeater/apps/tx/dv_tx.py:49-53` —
+/// `op25/op25/gr-op25_repeater/apps/tx/dv_tx.py:49-53` —
 /// `gain_adjust = {'dmr': 3.0, 'dstar': 7.5, 'ysf': 4.0}`).
 ///
 /// **Calibration history.** April 2026: temporarily lowered to 3.0
@@ -749,7 +749,7 @@ const SA_SCALE: f32 = 1.0;
 /// suggested 0.0 minimized Hamming distance and took the sine
 /// roundtrip correlation from 0.04 to 0.20 — but real-voice
 /// sextant-to-sextant testing confirmed garbled output, exactly the
-/// hard-clip symptom CLAUDE.md warned about. Reverted to 7.5.
+/// hard-clip symptom described above. Reverted to 7.5.
 ///
 /// The synthetic-vs-real-voice difference: synthetic test signals
 /// (clean harmonic stacks at exact frequencies) have near-zero
@@ -1046,7 +1046,7 @@ fn quantize_spectrum(t_residuals: &[f32; 57], n: usize) -> QuantizedSpectrum {
     //
     // Our wire format is mbelib's: `ambe_d[35..=37]` hold bits 3, 2,
     // 1 of the 4-bit index, with bit 0 forced to 0
-    // (`ref/mbelib/ambe3600x2400.c:436-440`). Reconstruction uses
+    // (`mbelib/ambe3600x2400.c:436-440`). Reconstruction uses
     // the MIDDLE 3 bits, not the LOW 3.
     //
     // Consequence: if we'd done the stride=1 full-row search, an

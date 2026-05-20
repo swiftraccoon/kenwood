@@ -25,56 +25,156 @@
 //! - Event log: append-only list of recent session events.
 
 use std::net::SocketAddr;
+use std::sync::mpsc as std_mpsc;
 
 use dstar_gateway_core::types::{Callsign, Module, ProtocolKind};
 use eframe::egui;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-use crate::audio::{AudioCommand, AudioHandle};
+use crate::audio::{AudioCommand, AudioHandle, AudioStatus};
+use crate::geo::TxPosition;
+use crate::heard::HeardList;
+use crate::hosts::{DirectoryUpdate, ReflectorDirectory};
 use crate::session::{ConnStatus, ConnectConfig, SessionCommand, SessionEvent};
+use crate::settings::Settings;
+use crate::ui;
 
 /// Maximum lines kept in the event-log buffer. Older lines drop off
 /// the top when this cap is exceeded.
 const LOG_CAPACITY: usize = 500;
 
 /// GUI app state + wiring to the async session task.
+///
+/// Fields are `pub(crate)` so the per-panel `show` functions in
+/// [`crate::ui`] can render and mutate them directly.
 pub(crate) struct App {
     // --- form state (what the user is currently editing) ---
-    callsign: String,
-    reflector_host: String,
-    reflector_port: String,
-    reflector_callsign: String,
-    protocol: ProtocolKind,
-    local_module: char,
-    reflector_module: char,
+    pub(crate) callsign: String,
+    pub(crate) reflector_host: String,
+    pub(crate) reflector_port: String,
+    pub(crate) reflector_callsign: String,
+    pub(crate) protocol: ProtocolKind,
+    pub(crate) local_module: char,
+    pub(crate) reflector_module: char,
+    /// Auto-reconnect after a reflector-driven disconnect.
+    pub(crate) reconnect_on_drop: bool,
+    /// Persist the heard-list across launches.
+    pub(crate) persist_heard_list: bool,
+
+    // --- transmit slow-data inputs (operator-entered) ---
+    /// Slow-data text message the operator wants to transmit.
+    pub(crate) tx_slow_text: String,
+    /// Manual GPS-beacon entry form.
+    pub(crate) tx_gps: TxGpsForm,
 
     // --- session state (what the session task has told us) ---
-    status: ConnStatus,
-    log: Vec<LogLine>,
-    last_error: Option<String>,
-    active_tx: bool,
+    pub(crate) status: ConnStatus,
+    pub(crate) log: Vec<LogLine>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) active_tx: bool,
+    /// Most recent D-STAR slow-data text message (20 chars max,
+    /// trailing whitespace trimmed). Cleared on Disconnect; kept
+    /// across streams so a viewer can read the last thing they
+    /// missed even after the speaker stops talking.
+    pub(crate) last_slow_data: Option<String>,
+    /// Stations heard this session.
+    pub(crate) heard: HeardList,
+    /// Most recent decoded RX position (latitude, longitude).
+    pub(crate) last_gps: Option<(f64, f64)>,
+    /// Callsign of the currently-active incoming stream, captured from
+    /// `VoiceStart` so the slow-data / GPS that arrive mid-stream can
+    /// be attributed to the right heard-station.
+    current_rx_callsign: Option<String>,
+
+    /// Audio-worker status mirrored from the `AudioStatus` channel.
+    pub(crate) audio_state: AudioState,
+    /// Selected audio input device name (empty = host default).
+    pub(crate) input_device: String,
+    /// Selected audio output device name (empty = host default).
+    pub(crate) output_device: String,
+    /// WAV file path for the play / transmit-from-file controls.
+    pub(crate) wav_path: String,
+
+    /// The reflector directory shown in the connection panel's picker.
+    pub(crate) directory: ReflectorDirectory,
+    /// Current search query in the reflector picker.
+    pub(crate) directory_query: String,
 
     // --- channels ---
     cmd_tx: mpsc::Sender<SessionCommand>,
     evt_rx: mpsc::Receiver<SessionEvent>,
     audio: AudioHandle,
+    /// Status channel from the audio worker.
+    audio_status_rx: std_mpsc::Receiver<AudioStatus>,
+    /// Result channel for background directory fetches.
+    directory_rx: std_mpsc::Receiver<DirectoryUpdate>,
+    /// Sender cloned into each spawned fetch task.
+    directory_tx: std_mpsc::Sender<DirectoryUpdate>,
 
-    // Owns the runtime so it lives for the whole app lifetime.
-    _runtime: Runtime,
+    // Owns the runtime so it lives for the whole app lifetime; also
+    // used to spawn background directory fetches.
+    runtime: Runtime,
 }
 
+/// One line in the event log.
 #[derive(Debug, Clone)]
-struct LogLine {
-    level: LogLevel,
-    text: String,
+pub(crate) struct LogLine {
+    pub(crate) level: LogLevel,
+    pub(crate) text: String,
 }
 
+/// Severity of an event-log line, used to colour it.
 #[derive(Debug, Clone, Copy)]
-enum LogLevel {
+pub(crate) enum LogLevel {
     Info,
     Event,
     Error,
+}
+
+/// Audio-worker status mirrored into the GUI from the `AudioStatus`
+/// channel — device lists, live levels, and recording state.
+#[derive(Debug, Default)]
+pub(crate) struct AudioState {
+    /// Enumerated input device names.
+    pub(crate) inputs: Vec<String>,
+    /// Enumerated output device names.
+    pub(crate) outputs: Vec<String>,
+    /// Live TX mic peak level (`0.0..=1.0`).
+    pub(crate) tx_level: f32,
+    /// Live RX decoded-audio peak level (`0.0..=1.0`).
+    pub(crate) rx_level: f32,
+    /// True while a recording is active.
+    pub(crate) recording: bool,
+}
+
+/// The operator's manual GPS-beacon entry form. Latitude / longitude
+/// are kept as edit strings so partial input round-trips; they're
+/// parsed only when the beacon is pushed to the audio worker.
+#[derive(Debug)]
+pub(crate) struct TxGpsForm {
+    /// True when the GPS beacon is enabled.
+    pub(crate) enabled: bool,
+    /// Latitude edit string.
+    pub(crate) lat: String,
+    /// Longitude edit string.
+    pub(crate) lon: String,
+    /// APRS symbol glyph.
+    pub(crate) symbol: String,
+    /// Free-text comment.
+    pub(crate) comment: String,
+}
+
+impl Default for TxGpsForm {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            lat: String::new(),
+            lon: String::new(),
+            symbol: "/".into(),
+            comment: String::new(),
+        }
+    }
 }
 
 impl App {
@@ -86,25 +186,128 @@ impl App {
         cmd_tx: mpsc::Sender<SessionCommand>,
         evt_rx: mpsc::Receiver<SessionEvent>,
         audio: AudioHandle,
+        audio_status_rx: std_mpsc::Receiver<AudioStatus>,
         runtime: Runtime,
     ) -> Self {
+        let settings = Settings::load_or_default();
+        let protocol = match settings.protocol.as_str() {
+            "DPlus" => ProtocolKind::DPlus,
+            "Dcs" | "DCS" => ProtocolKind::Dcs,
+            // DExtra is the historical default — also the fallback for
+            // unknown / future protocol strings so a forward-compat
+            // settings file can't brick the GUI.
+            _ => ProtocolKind::DExtra,
+        };
+        // Apply a persisted device choice on launch — the audio worker
+        // starts on host defaults, so re-select only if a name is set.
+        if !settings.input_device.is_empty() || !settings.output_device.is_empty() {
+            audio.send(AudioCommand::SelectDevices {
+                input: (!settings.input_device.is_empty()).then(|| settings.input_device.clone()),
+                output: (!settings.output_device.is_empty())
+                    .then(|| settings.output_device.clone()),
+            });
+        }
+        // Load the reflector directory from cache, then kick off a
+        // background refresh so the picker is populated immediately
+        // and updated when the network call returns.
+        let directory = ReflectorDirectory::load_cached();
+        let (directory_tx, directory_rx) = std_mpsc::channel();
+        {
+            let tx = directory_tx.clone();
+            let _join = runtime.spawn(async move {
+                let _send = tx.send(crate::hosts::fetch_directory().await);
+            });
+        }
         Self {
-            callsign: "W1TEST".into(),
-            reflector_host: "127.0.0.1".into(),
-            reflector_port: "30001".into(),
-            reflector_callsign: "POLARIS".into(),
-            protocol: ProtocolKind::DExtra,
-            local_module: 'C',
-            reflector_module: 'C',
+            callsign: settings.callsign,
+            reflector_host: settings.reflector_host,
+            reflector_port: settings.reflector_port,
+            reflector_callsign: settings.reflector_callsign,
+            protocol,
+            local_module: settings.local_module,
+            reflector_module: settings.reflector_module,
+            reconnect_on_drop: settings.reconnect_on_drop,
+            persist_heard_list: settings.persist_heard_list,
+            tx_slow_text: String::new(),
+            tx_gps: TxGpsForm::default(),
             status: ConnStatus::Disconnected,
             log: Vec::new(),
             last_error: None,
             active_tx: false,
+            last_slow_data: None,
+            heard: if settings.persist_heard_list {
+                HeardList::load(std::time::Instant::now())
+            } else {
+                HeardList::default()
+            },
+            last_gps: None,
+            current_rx_callsign: None,
+            audio_state: AudioState::default(),
+            input_device: settings.input_device,
+            output_device: settings.output_device,
+            wav_path: String::new(),
+            directory,
+            directory_query: String::new(),
             cmd_tx,
             evt_rx,
             audio,
-            _runtime: runtime,
+            audio_status_rx,
+            directory_rx,
+            directory_tx,
+            runtime,
         }
+    }
+
+    /// Drain pending [`AudioStatus`] messages from the audio worker
+    /// into the GUI's audio-state fields.
+    fn drain_audio_status(&mut self) {
+        while let Ok(status) = self.audio_status_rx.try_recv() {
+            match status {
+                AudioStatus::DeviceList { inputs, outputs } => {
+                    self.audio_state.inputs = inputs;
+                    self.audio_state.outputs = outputs;
+                }
+                AudioStatus::Levels { tx_peak, rx_peak } => {
+                    self.audio_state.tx_level = tx_peak;
+                    self.audio_state.rx_level = rx_peak;
+                }
+                AudioStatus::Recording(active) => {
+                    self.audio_state.recording = active;
+                }
+            }
+        }
+    }
+
+    /// Drain pending [`DirectoryUpdate`]s from background fetches into
+    /// the directory, refreshing the on-disk cache on success.
+    fn drain_directory(&mut self) {
+        while let Ok(update) = self.directory_rx.try_recv() {
+            match update {
+                DirectoryUpdate::Loaded { hosts, when } => {
+                    self.directory.replace_fetched(hosts, &when);
+                    self.directory.save_cache(&when);
+                }
+                DirectoryUpdate::Failed(err) => {
+                    self.directory.set_status(format!(
+                        "reflector list: fetch failed ({err}) — using cache"
+                    ));
+                    self.append_log(LogLine {
+                        level: LogLevel::Error,
+                        text: format!("reflector directory fetch failed: {err}"),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Spawn an on-demand reflector-directory refresh.
+    pub(crate) fn refresh_directory(&mut self) {
+        self.directory
+            .set_status("reflector list: fetching…".into());
+        let tx = self.directory_tx.clone();
+        let _join = self.runtime.spawn(async move {
+            let _send = tx.send(crate::hosts::fetch_directory().await);
+        });
     }
 
     fn append_log(&mut self, line: LogLine) {
@@ -122,7 +325,7 @@ impl App {
                 SessionEvent::Status(s) => {
                     self.append_log(LogLine {
                         level: LogLevel::Info,
-                        text: format!("status: {}", fmt_status(&s)),
+                        text: format!("status: {}", ui::fmt_status(&s)),
                     });
                     // When we disconnect, make sure the PTT toggle
                     // resets so the GUI can't get stuck "transmitting"
@@ -130,8 +333,19 @@ impl App {
                     if matches!(s, ConnStatus::Disconnected) {
                         self.active_tx = false;
                         self.audio.send(AudioCommand::StopTx);
+                        // Clear stale RX state from the prior session —
+                        // a new session will populate fresh values.
+                        self.last_slow_data = None;
+                        self.last_gps = None;
+                        self.current_rx_callsign = None;
                     }
                     self.status = s;
+                    // On reaching Connected, push the operator's
+                    // slow-data so a beacon configured before connecting
+                    // takes effect immediately.
+                    if matches!(self.status, ConnStatus::Connected { .. }) {
+                        self.push_slow_data();
+                    }
                 }
                 SessionEvent::Log(t) => self.append_log(LogLine {
                     level: LogLevel::Info,
@@ -145,6 +359,10 @@ impl App {
                         level: LogLevel::Event,
                         text: format!("VoiceStart sid=0x{stream_id:04X} from={from}"),
                     });
+                    let callsign = from.trim().to_owned();
+                    self.heard
+                        .record_stream(&callsign, std::time::Instant::now());
+                    self.current_rx_callsign = Some(callsign);
                 }
                 SessionEvent::VoiceEnd {
                     stream_id,
@@ -161,11 +379,52 @@ impl App {
                         text: e,
                     });
                 }
+                SessionEvent::SlowDataMessage { stream_id, text } => {
+                    self.append_log(LogLine {
+                        level: LogLevel::Event,
+                        text: format!("SlowData sid=0x{stream_id:04X}: {text:?}"),
+                    });
+                    if let Some(callsign) = self.current_rx_callsign.clone() {
+                        self.heard.record_message(&callsign, text.clone());
+                    }
+                    self.last_slow_data = Some(text);
+                }
+                SessionEvent::GpsPosition {
+                    stream_id,
+                    latitude,
+                    longitude,
+                } => {
+                    self.append_log(LogLine {
+                        level: LogLevel::Event,
+                        text: format!("GPS sid=0x{stream_id:04X} {latitude:.4},{longitude:.4}"),
+                    });
+                    if let Some(callsign) = self.current_rx_callsign.clone() {
+                        self.heard.record_gps(&callsign, latitude, longitude);
+                    }
+                    self.last_gps = Some((latitude, longitude));
+                }
+                SessionEvent::ReflectorHosts(hosts) => {
+                    let count = hosts.len();
+                    let merged = hosts
+                        .into_iter()
+                        .map(|(callsign, addr)| crate::hosts::ReflectorHost {
+                            callsign,
+                            host: addr.to_string(),
+                            port: 20001,
+                            protocol: ProtocolKind::DPlus,
+                        })
+                        .collect();
+                    self.directory.merge_hosts(merged);
+                    self.append_log(LogLine {
+                        level: LogLevel::Info,
+                        text: format!("merged {count} REF hosts from DPlus auth"),
+                    });
+                }
             }
         }
     }
 
-    fn try_connect(&mut self) {
+    pub(crate) fn try_connect(&mut self) {
         let cfg = match self.build_connect_config() {
             Ok(c) => c,
             Err(e) => {
@@ -180,11 +439,34 @@ impl App {
         let _unused = self.cmd_tx.try_send(SessionCommand::Connect(cfg));
     }
 
-    fn try_disconnect(&self) {
+    pub(crate) fn try_disconnect(&self) {
         let _unused = self.cmd_tx.try_send(SessionCommand::Disconnect);
+        // Persist current form state when the user voluntarily
+        // disconnects — this is the natural checkpoint where they're
+        // most likely to have settled on the values they want next time.
+        self.snapshot_settings().save();
+        if self.persist_heard_list {
+            self.heard.save();
+        }
     }
 
-    fn toggle_ptt(&mut self) {
+    fn snapshot_settings(&self) -> Settings {
+        Settings {
+            callsign: self.callsign.clone(),
+            reflector_host: self.reflector_host.clone(),
+            reflector_port: self.reflector_port.clone(),
+            reflector_callsign: self.reflector_callsign.clone(),
+            protocol: format!("{:?}", self.protocol),
+            local_module: self.local_module,
+            reflector_module: self.reflector_module,
+            reconnect_on_drop: self.reconnect_on_drop,
+            persist_heard_list: self.persist_heard_list,
+            input_device: self.input_device.clone(),
+            output_device: self.output_device.clone(),
+        }
+    }
+
+    pub(crate) fn toggle_ptt(&mut self) {
         if self.active_tx {
             self.active_tx = false;
             self.audio.send(AudioCommand::StopTx);
@@ -201,10 +483,112 @@ impl App {
         }
     }
 
-    fn tx_silence_test(&self) {
+    /// Push-to-talk via the spacebar. Press = key down (TX on), release
+    /// = key up (TX off + EOT). Suppressed while a text field has
+    /// focus so typing a space in the callsign / host fields doesn't
+    /// inadvertently key up the radio.
+    fn handle_ptt_keybinding(&mut self, ctx: &egui::Context) {
+        let typing = ctx.memory(|m| m.focused().is_some());
+        if typing {
+            return;
+        }
+        let connected = matches!(self.status, ConnStatus::Connected { .. });
+        let (pressed, released) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Space),
+                i.key_released(egui::Key::Space),
+            )
+        });
+        if pressed && connected && !self.active_tx {
+            self.active_tx = true;
+            self.audio.send(AudioCommand::StartTx {
+                my_call: self.callsign.clone(),
+            });
+        }
+        if released && self.active_tx {
+            self.active_tx = false;
+            self.audio.send(AudioCommand::StopTx);
+        }
+    }
+
+    pub(crate) fn tx_silence_test(&self) {
         let _unused = self
             .cmd_tx
             .try_send(SessionCommand::TxSilence { seconds: 2.0 });
+    }
+
+    /// Apply the selected audio devices to the worker and persist the
+    /// choice. Called when the operator changes a device in the panel.
+    pub(crate) fn apply_audio_devices(&self) {
+        self.audio.send(AudioCommand::SelectDevices {
+            input: (!self.input_device.is_empty()).then(|| self.input_device.clone()),
+            output: (!self.output_device.is_empty()).then(|| self.output_device.clone()),
+        });
+        self.snapshot_settings().save();
+    }
+
+    /// Ask the audio worker to re-enumerate available devices.
+    pub(crate) fn refresh_devices(&self) {
+        self.audio.send(AudioCommand::EnumerateDevices);
+    }
+
+    /// Start recording received audio to a WAV file.
+    pub(crate) fn start_recording(&self) {
+        self.audio.send(AudioCommand::StartRecording);
+    }
+
+    /// Stop the active recording.
+    pub(crate) fn stop_recording(&self) {
+        self.audio.send(AudioCommand::StopRecording);
+    }
+
+    /// Play the WAV at `wav_path` to the speakers locally.
+    pub(crate) fn play_wav(&self) {
+        let path = self.wav_path.trim();
+        if !path.is_empty() {
+            self.audio
+                .send(AudioCommand::PlayFile { path: path.into() });
+        }
+    }
+
+    /// Transmit the WAV at `wav_path` as an outgoing voice stream.
+    pub(crate) fn transmit_wav(&self) {
+        let path = self.wav_path.trim();
+        if !path.is_empty() {
+            self.audio
+                .send(AudioCommand::TransmitFile { path: path.into() });
+        }
+    }
+
+    /// Push the current slow-data text + GPS beacon to the audio
+    /// worker. Called whenever the operator edits a slow-data field.
+    pub(crate) fn push_slow_data(&self) {
+        let text = if self.tx_slow_text.is_empty() {
+            None
+        } else {
+            Some(self.tx_slow_text.clone())
+        };
+        let gps = if self.tx_gps.enabled {
+            self.parse_tx_gps()
+        } else {
+            None
+        };
+        self.audio.send(AudioCommand::SetSlowData { text, gps });
+    }
+
+    /// Parse the manual GPS fields into a [`TxPosition`], or `None` if
+    /// the latitude / longitude fields aren't valid in-range numbers.
+    fn parse_tx_gps(&self) -> Option<TxPosition> {
+        let latitude: f64 = self.tx_gps.lat.trim().parse().ok()?;
+        let longitude: f64 = self.tx_gps.lon.trim().parse().ok()?;
+        let symbol = self.tx_gps.symbol.chars().next().unwrap_or('/');
+        let pos = TxPosition {
+            latitude,
+            longitude,
+            symbol,
+            comment: self.tx_gps.comment.clone(),
+        };
+        pos.validated().cloned()
     }
 
     fn build_connect_config(&self) -> Result<ConnectConfig, String> {
@@ -232,172 +616,71 @@ impl App {
             reflector_callsign,
             reflector_module,
             peer,
+            reconnect_on_drop: self.reconnect_on_drop,
         })
     }
 }
 
 impl eframe::App for App {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "immediate-mode GUI layout code is naturally long; splitting panels into helpers hurts readability"
-    )]
+    /// Persist form state when the window closes — covers the common
+    /// case of quitting without an explicit disconnect.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.snapshot_settings().save();
+        if self.persist_heard_list {
+            self.heard.save();
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.drain_audio_status();
+        self.drain_directory();
+        self.handle_ptt_keybinding(ctx);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("SEXTANT — D-STAR client");
-            ui.separator();
-
-            // Connection form.
-            egui::Grid::new("conn_form")
-                .num_columns(2)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label("Callsign");
-                    ui.text_edit_singleline(&mut self.callsign);
-                    ui.end_row();
-
-                    ui.label("Reflector host");
-                    ui.text_edit_singleline(&mut self.reflector_host);
-                    ui.end_row();
-
-                    ui.label("Reflector port");
-                    ui.text_edit_singleline(&mut self.reflector_port);
-                    ui.end_row();
-
-                    ui.label("Reflector callsign");
-                    ui.text_edit_singleline(&mut self.reflector_callsign);
-                    ui.end_row();
-
-                    ui.label("Protocol");
-                    egui::ComboBox::from_id_salt("protocol_select")
-                        .selected_text(format!("{:?}", self.protocol))
-                        .show_ui(ui, |ui| {
-                            let _unused = ui.selectable_value(
-                                &mut self.protocol,
-                                ProtocolKind::DExtra,
-                                "DExtra",
-                            );
-                            let _unused = ui.selectable_value(
-                                &mut self.protocol,
-                                ProtocolKind::DPlus,
-                                "DPlus",
-                            );
-                            let _unused =
-                                ui.selectable_value(&mut self.protocol, ProtocolKind::Dcs, "DCS");
+        // Persistent status + PTT — always on screen, never tab-gated.
+        egui::TopBottomPanel::top("status_bar").show(ctx, |ui| {
+            ui::top_bar(self, ui);
+        });
+        // Connection form on the left.
+        egui::SidePanel::left("connection_panel")
+            .resizable(true)
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Connection");
+                    ui::connection::show(self, ui);
+                    ui.separator();
+                    egui::CollapsingHeader::new("Audio")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui::audio_panel::show(self, ui);
                         });
-                    ui.end_row();
-
-                    ui.label("Local module");
-                    module_picker(ui, "local_mod", &mut self.local_module);
-                    ui.end_row();
-
-                    ui.label("Reflector module");
-                    module_picker(ui, "remote_mod", &mut self.reflector_module);
-                    ui.end_row();
                 });
-
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                let connected = matches!(self.status, ConnStatus::Connected { .. });
-                let busy = matches!(
-                    self.status,
-                    ConnStatus::Connecting { .. } | ConnStatus::Disconnecting
-                );
-                if ui
-                    .add_enabled(!connected && !busy, egui::Button::new("Connect"))
-                    .clicked()
-                {
-                    self.try_connect();
-                }
-                if ui
-                    .add_enabled(connected && !busy, egui::Button::new("Disconnect"))
-                    .clicked()
-                {
-                    self.try_disconnect();
-                }
-                ui.label(format!("Status: {}", fmt_status(&self.status)));
             });
-
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                let connected = matches!(self.status, ConnStatus::Connected { .. });
-                let ptt_label = if self.active_tx {
-                    "PTT ON (click to stop)"
-                } else {
-                    "PTT"
-                };
-                let colour = if self.active_tx {
-                    egui::Color32::from_rgb(180, 40, 40)
-                } else {
-                    egui::Color32::DARK_GRAY
-                };
-                let ptt_btn =
-                    egui::Button::new(egui::RichText::new(ptt_label).color(egui::Color32::WHITE))
-                        .fill(colour)
-                        .min_size(egui::vec2(180.0, 40.0));
-                if ui.add_enabled(connected, ptt_btn).clicked() {
-                    self.toggle_ptt();
-                }
-                if ui
-                    .add_enabled(
-                        connected && !self.active_tx,
-                        egui::Button::new("TX silence (2 s)"),
-                    )
-                    .clicked()
-                {
-                    self.tx_silence_test();
+        // Event log along the bottom.
+        egui::TopBottomPanel::bottom("log_panel")
+            .resizable(true)
+            .default_height(220.0)
+            .show(ctx, |ui| {
+                ui::log::show(self, ui);
+            });
+        // Transmit + Receive fill the centre as two columns.
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.columns(2, |cols| {
+                // `columns(2, ..)` always yields exactly two `Ui`s, so
+                // the slice pattern always matches; the pattern (rather
+                // than `cols[0]`) keeps clear of `indexing_slicing`.
+                if let [transmit_col, receive_col] = cols {
+                    transmit_col.heading("Transmit");
+                    ui::transmit::show(self, transmit_col);
+                    receive_col.heading("Receive");
+                    ui::receive::show(self, receive_col);
                 }
             });
-
-            if let Some(err) = &self.last_error {
-                ui.colored_label(egui::Color32::LIGHT_RED, format!("Last error: {err}"));
-            }
-
-            ui.separator();
-
-            ui.label("Event log");
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .max_height(220.0)
-                .show(ui, |ui| {
-                    for line in &self.log {
-                        let colour = match line.level {
-                            LogLevel::Info => egui::Color32::from_gray(200),
-                            LogLevel::Event => egui::Color32::LIGHT_BLUE,
-                            LogLevel::Error => egui::Color32::LIGHT_RED,
-                        };
-                        ui.colored_label(colour, &line.text);
-                    }
-                });
         });
 
         // Repaint frequently so log lines and voice events appear
         // within a few frames of arrival.
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
-    }
-}
-
-fn module_picker(ui: &mut egui::Ui, id: &str, value: &mut char) {
-    egui::ComboBox::from_id_salt(id)
-        .selected_text(String::from(*value))
-        .show_ui(ui, |ui| {
-            for ch in ['A', 'B', 'C', 'D', 'E'] {
-                let _unused = ui.selectable_value(value, ch, String::from(ch));
-            }
-        });
-}
-
-fn fmt_status(s: &ConnStatus) -> String {
-    match s {
-        ConnStatus::Disconnected => "disconnected".into(),
-        ConnStatus::Connecting { peer } => format!("connecting to {peer}"),
-        ConnStatus::Connected { reflector, module } => {
-            format!("connected — {reflector} / {module}")
-        }
-        ConnStatus::Disconnecting => "disconnecting…".into(),
     }
 }

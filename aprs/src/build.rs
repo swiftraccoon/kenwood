@@ -387,8 +387,7 @@ pub fn build_aprs_object_with_timestamp(
 /// identifies a *different* object than the caller intended). Prefer
 /// [`build_aprs_object_with_timestamp_checked`] / its `_packet`
 /// variant when caller input is uncontrolled — they return
-/// [`AprsError::InvalidObjectName`] for malformed input instead. See
-/// CB-C-15.
+/// [`AprsError::InvalidObjectName`] for malformed input instead.
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
@@ -588,7 +587,7 @@ pub fn build_aprs_item(
 /// than 9 chars, or containing `!`/`_` will produce a malformed item
 /// that no spec-compliant parser will accept. Prefer
 /// [`build_aprs_item_checked`] / its `_packet` variant when caller
-/// input is uncontrolled. See CB-C-16.
+/// input is uncontrolled.
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
@@ -1157,7 +1156,7 @@ pub fn build_aprs_mice_with_message_packet(
     // matches the policy of [`build_aprs_position_report_packet`]
     // and [`build_aprs_position_compressed_packet`]; the Mic-E
     // builder used to clamp without the `is_finite()` guard, which
-    // silently produced byte 0 for both `NaN` inputs. See CB-C-1.
+    // silently produced byte 0 for both `NaN` inputs.
     let latitude = sanitize_coord(latitude, -90.0, 90.0);
     let longitude = sanitize_coord(longitude, -180.0, 180.0);
     let north = latitude >= 0.0;
@@ -1696,7 +1695,7 @@ pub fn build_query_response_position(
 mod tests {
     use super::*;
     use ax25_codec::parse_ax25;
-    use kiss_tnc::{CMD_DATA, decode_kiss_frame};
+    use kiss_tnc::{KissCommand, decode_kiss_frame};
 
     use crate::item::{parse_aprs_item, parse_aprs_object};
     use crate::message::parse_aprs_message;
@@ -1772,7 +1771,11 @@ mod tests {
 
         // Decode the KISS frame.
         let kiss = decode_kiss_frame(&wire)?;
-        assert_eq!(kiss.command, CMD_DATA, "KISS command should be data");
+        assert_eq!(
+            kiss.command,
+            KissCommand::Data,
+            "KISS command should be data"
+        );
 
         // Decode the AX.25 packet.
         let packet = parse_ax25(&kiss.data)?;
@@ -2253,7 +2256,7 @@ mod tests {
 
     #[test]
     fn build_compressed_position_clamps_out_of_range() -> TestResult {
-        // Regression guard for CB-3: out-of-range coordinates must clamp
+        // Regression guard: out-of-range coordinates must clamp
         // rather than wrap. Pre-fix, a latitude of 200° would compute
         // 380_926 × (90 - 200) = -41_901_860 which `as u32` reinterprets
         // to ~4.25 billion — silently producing a "valid" but absurd
@@ -2321,7 +2324,7 @@ mod tests {
         Ok(())
     }
 
-    // ---- build_aprs_telemetry (D-1) ----
+    // ---- build_aprs_telemetry ----
 
     #[test]
     fn build_telemetry_frame_round_trip() -> TestResult {
@@ -2373,7 +2376,7 @@ mod tests {
         Ok(())
     }
 
-    // ---- build_aprs_telemetry_parm / unit / eqns / bits (D-2) ----
+    // ---- build_aprs_telemetry_parm / unit / eqns / bits ----
 
     #[test]
     fn build_telemetry_parm_emits_canonical_form() -> TestResult {
@@ -2691,10 +2694,10 @@ mod tests {
 
     #[test]
     fn build_mice_handles_non_finite_inputs() -> TestResult {
-        // Regression guard for CB-C-1: Mic-E builder must reject NaN/inf
+        // Regression guard: Mic-E builder must reject NaN/inf
         // via the shared `sanitize_coord` helper rather than silently
         // saturating to 0 through `as u32`. Equivalent to the
-        // compressed-position guard added in CB-3.
+        // compressed-position out-of-range clamp guard.
         let source = test_source();
         let path = default_digipeater_path();
         let cases: &[(f64, f64, &str)] = &[
@@ -2729,7 +2732,7 @@ mod tests {
 
     #[test]
     fn build_mice_lon_hundredths_boundary_clamped() -> TestResult {
-        // Regression guard for CB-2: a longitude whose minutes-fraction
+        // Regression guard: a longitude whose minutes-fraction
         // rounds to 100 hundredths must not produce a wire byte outside
         // the spec-mandated Mic-E range of 28..=127 (APRS 1.0.1 §10.3.3).
         //

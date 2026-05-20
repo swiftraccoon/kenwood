@@ -4,8 +4,8 @@
 
 //! Modem hardware family, inferred from the `GetVersion` description.
 //!
-//! Mirrors `enum class HW_TYPE` in `ref/MMDVMHost/Defines.h:54-67` and
-//! the memcmp-based detection in `ref/MMDVMHost/Modem.cpp:1997-2020`.
+//! Mirrors `enum class HW_TYPE` in `MMDVMHost/Defines.h:54-67` and
+//! the memcmp-based detection in `MMDVMHost/Modem.cpp:1997-2020`.
 
 /// Hardware type enum matching `HW_TYPE` in `MMDVMHost`.
 #[non_exhaustive]
@@ -41,7 +41,7 @@ impl HwType {
     /// Guess the hardware type from a `GetVersion` description string.
     ///
     /// The description is matched against the same set of prefixes that
-    /// `ref/MMDVMHost/Modem.cpp:1997-2020` uses. Unknown descriptions
+    /// `MMDVMHost/Modem.cpp:1997-2020` uses. Unknown descriptions
     /// — including the TH-D75's internal modem — return
     /// [`HwType::Unknown`].
     #[must_use]

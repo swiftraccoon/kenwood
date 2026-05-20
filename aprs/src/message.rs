@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn message_kind_announcement() {
-        // Regression guard for CB-C-10 (APRS 1.0.1 §14 p.73): a
+        // Regression guard (APRS 1.0.1 §14 p.73): a
         // `BLN<single letter>` addressee is an Announcement, structurally
         // distinct from a `BLN<single digit>` general bulletin and from
         // a `BLN<group>` (multi-char) group bulletin. Earlier code
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn message_kind_group_bulletin_requires_multichar_tail() {
-        // After the CB-C-10 fix, a single-character tail is *not* a
+        // A single-character tail is *not* a
         // group bulletin — it's either a Bulletin (digit) or
         // Announcement (letter). Group bulletins use 2-5 char tails.
         let msg = AprsMessage {

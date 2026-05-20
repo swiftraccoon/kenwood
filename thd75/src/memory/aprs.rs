@@ -13,9 +13,9 @@
 //! and a generic `read_bytes` accessor. Field-level typed accessors —
 //! `my_callsign`, `beacon_interval`, `packet_path` — were previously
 //! present but **have been removed**: their offsets were ported from
-//! TH-D74 development notes during the April 2026 extraction, and the
-//! project workspace `CLAUDE.md` is explicit that D74 confirmations are
-//! not confirmations on D75. Returning typed values from unverified
+//! TH-D74 development notes during the April 2026 extraction, and
+//! D74 confirmations are not confirmations on D75. Returning typed
+//! values from unverified
 //! offsets violates the validation contract — the type system promised
 //! "this is the callsign" while in practice the bytes might come from
 //! a completely unrelated field.
@@ -25,18 +25,16 @@
 //! Each field needs *both* of the following before a typed accessor is
 //! added back:
 //!
-//! 1. **Firmware-RE confirmation.** Query `GhydraMCP` at
-//!    `http://localhost:8192/functions?limit=8500` for the MCP
-//!    address-decoder function. Confirm the offset matches D75 binary
-//!    `0_FIRMWARE_0x00200000.bin`, not a D74 trace.
+//! 1. **Firmware-RE confirmation.** Trace the MCP address-decoder
+//!    function in the TH-D75 firmware and confirm the candidate offset
+//!    is a D75 finding, not a D74 trace.
 //! 2. **Hardware round-trip.** Capture an MCP image from a known-state
-//!    radio (cached at `~/Library/Caches/thd75-tui/mcp.bin`), set the
-//!    field via the menu, re-capture, diff the byte at the candidate
-//!    offset, confirm it tracks the change.
+//!    radio, set the field via the menu, re-capture, then diff the byte
+//!    at the candidate offset and confirm it tracks the change.
 //!
 //! Only when both pass should a typed accessor land — with the source
-//! comment naming the `GhydraMCP` function address and the hardware
-//! capture date that verified it. See git history for CB-6.
+//! comment recording the firmware function address and the hardware
+//! capture date that verified it.
 //!
 //! # Cross-references
 //!

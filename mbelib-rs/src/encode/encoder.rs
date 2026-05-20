@@ -155,7 +155,7 @@ pub struct AmbeEncoder {
 /// essentially-no-signal (confidence below this), emit the canonical
 /// D-STAR silence pattern directly (`MMDVMHost` / DVSI convention)
 /// rather than trying to quantize zeros. Reference:
-/// `NULL_AMBE_DATA_BYTES` in `ref/MMDVMHost/DStarDefines.h:44`.
+/// `NULL_AMBE_DATA_BYTES` in `MMDVMHost/DStarDefines.h:44`.
 const SILENCE_CONFIDENCE: f32 = 0.05;
 
 /// Canonical 9-byte AMBE silence frame returned for inputs that fall

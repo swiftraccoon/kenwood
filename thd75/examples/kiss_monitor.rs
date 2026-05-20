@@ -55,10 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Decode the KISS frame.
             match kiss_tnc::decode_kiss_frame(&frame_data) {
                 Ok(kiss_frame) => {
-                    if kiss_frame.command != kiss_tnc::CMD_DATA {
+                    if kiss_frame.command != kiss_tnc::KissCommand::Data {
                         println!(
                             "KISS cmd=0x{:02X} ({} bytes)",
-                            kiss_frame.command,
+                            kiss_frame.command.as_byte(),
                             kiss_frame.data.len()
                         );
                         continue;

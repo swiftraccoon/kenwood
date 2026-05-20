@@ -24,6 +24,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use chrono::Utc;
+use tokio::task::{Id, JoinSet};
 
 use crate::config::Tier2Config;
 use crate::db;
@@ -40,42 +41,28 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Runs the Tier 2 XLX monitoring loop.
 ///
-/// Manages a pool of UDP JSON monitor connections, connecting and disconnecting
-/// based on Tier 1 activity data. Runs until cancelled.
+/// Spawns one tokio task per monitored reflector and runs until cancelled.
 ///
-/// # Startup behavior
+/// # Design
 ///
-/// On startup, queries the database for XLX reflectors with
-/// `tier2_available = true` and recent activity (within `activity_threshold_secs`).
-/// Connects to up to `max_concurrent_monitors` of the most recently active
-/// reflectors.
+/// Each reflector is monitored by an independent [`monitor_loop`] task that
+/// owns its own UDP socket. A reflector pushing a burst of events therefore
+/// cannot delay another reflector's events, and a slow database write blocks
+/// only the monitor that issued it. Tasks live in a [`JoinSet`]; when one
+/// ends — the reflector went unresponsive, or (unexpectedly) the task
+/// panicked — its pool slot is freed for the next refresh to reuse.
 ///
-/// # Main loop
+/// # Startup and refresh
 ///
-/// The main loop uses `tokio::select!` to multiplex across:
-///
-/// 1. **Monitor recv**: each active monitor's `recv()` future is polled. When
-///    a message arrives, it is dispatched by type:
-///    - `Nodes`: upserts to `connected_nodes` table.
-///    - `Stations`: inserts observations to `activity_log`.
-///    - `OnAir`/`OffAir`: logged via tracing (potential Tier 3 trigger point).
-///    - `Reflector`: logged once on connect, otherwise ignored.
-///    - `Unknown`: logged at debug level for diagnostics.
-///
-/// 2. **Refresh timer**: every 60 seconds, re-queries the database for newly
-///    eligible reflectors and connects any that are not already monitored.
-///
-/// # Error handling
-///
-/// Individual monitor failures (recv timeout, parse errors) are logged and
-/// the monitor is removed from the pool. The orchestrator continues running
-/// with the remaining monitors. Only a fatal error (e.g., database pool
-/// closed) causes the function to return.
+/// On startup, and then every [`REFRESH_INTERVAL`], the orchestrator queries
+/// the database for XLX reflectors with `tier2_available = true` and recent
+/// `activity_log` activity, and spawns a monitor task for each not already
+/// running — up to `max_concurrent_monitors`.
 ///
 /// # Errors
 ///
-/// Returns an error if a fatal, non-retryable failure occurs (e.g., the
-/// database pool is closed or initial reflector query fails).
+/// Returns an error only on a fatal, non-retryable failure. The current
+/// implementation runs indefinitely until the task is cancelled.
 pub(crate) async fn run(
     config: Tier2Config,
     pool: sqlx::PgPool,
@@ -87,69 +74,66 @@ pub(crate) async fn run(
         "tier2 XLX monitoring starting"
     );
 
-    let mut monitors: HashMap<String, XlxMonitor> = HashMap::new();
-    let mut refresh_interval = tokio::time::interval(REFRESH_INTERVAL);
+    // One task per monitored reflector. `task_reflectors` maps each task's
+    // id back to its reflector callsign so a finished or panicked task frees
+    // the correct pool slot.
+    let mut monitors: JoinSet<()> = JoinSet::new();
+    let mut task_reflectors: HashMap<Id, String> = HashMap::new();
+    let mut refresh = tokio::time::interval(REFRESH_INTERVAL);
 
-    // Initial connect pass: query eligible reflectors and connect monitors.
-    connect_eligible_monitors(&config, &pool, &mut monitors).await;
-
+    // Initial connect pass.
+    spawn_eligible_monitors(&config, &pool, &mut monitors, &mut task_reflectors).await;
     tracing::info!(
-        active_monitors = monitors.len(),
+        active_monitors = task_reflectors.len(),
         "tier2 initial monitor pool established"
     );
 
-    // Main event loop: multiplex monitor recv and periodic refresh.
     loop {
-        // If we have no active monitors, just wait for the refresh timer
-        // to try connecting new ones.
-        if monitors.is_empty() {
-            let _tick = refresh_interval.tick().await;
-            connect_eligible_monitors(&config, &pool, &mut monitors).await;
-            continue;
-        }
-
-        // Poll all active monitors concurrently. We collect the callsigns
-        // into a Vec first to avoid borrow conflicts with the HashMap.
-        let callsigns: Vec<String> = monitors.keys().cloned().collect();
-
         tokio::select! {
-            // Refresh timer: check for newly eligible reflectors.
-            _ = refresh_interval.tick() => {
-                connect_eligible_monitors(&config, &pool, &mut monitors).await;
+            // Refresh timer: spawn monitors for newly eligible reflectors.
+            _ = refresh.tick() => {
+                spawn_eligible_monitors(&config, &pool, &mut monitors, &mut task_reflectors).await;
             }
 
-            // Monitor recv: process the first message from any monitor.
-            // We use a helper that polls all monitors and returns the first
-            // result along with the reflector callsign.
-            result = poll_any_monitor(&callsigns, &monitors) => {
-                let (callsign, message) = result;
-
-                if let Some(msg) = message {
-                    handle_message(&callsign, &msg, &pool).await;
-                } else {
-                    // Recv returned None — timeout or error. Remove the
-                    // monitor so it can be reconnected on the next refresh.
-                    tracing::info!(
-                        reflector = %callsign,
-                        "tier2 monitor unresponsive, removing from pool"
-                    );
-                    // Drop sends best-effort "bye".
-                    let _removed = monitors.remove(&callsign);
+            // A monitor task finished. `join_next_with_id` yields `None` when
+            // the set is empty, which disables this branch so `select!` just
+            // waits for the next refresh.
+            Some(joined) = monitors.join_next_with_id() => {
+                let (id, panic) = match joined {
+                    Ok((id, ())) => (id, None),
+                    Err(e) => (e.id(), Some(e)),
+                };
+                if let Some(reflector) = task_reflectors.remove(&id) {
+                    match panic {
+                        None => tracing::info!(
+                            reflector = %reflector,
+                            "tier2 monitor stopped, slot freed"
+                        ),
+                        Some(e) => tracing::warn!(
+                            reflector = %reflector,
+                            error = %e,
+                            "tier2 monitor task panicked, slot freed"
+                        ),
+                    }
                 }
             }
         }
     }
 }
 
-/// Queries the database for tier2-eligible reflectors and connects monitors
-/// for any that are not already in the pool.
+/// Queries the database for tier2-eligible reflectors and spawns a monitor
+/// task for any that are not already being monitored.
 ///
-/// Respects the `max_concurrent_monitors` cap. Only connects to reflectors
-/// that have a valid IP address, `tier2_available = true`, and recent activity.
-async fn connect_eligible_monitors(
+/// Respects the `max_concurrent_monitors` cap. Only spawns for reflectors
+/// that have a valid IP address, `tier2_available = true`, and recent
+/// activity. A reflector that already has a live task is skipped — xlxd's
+/// JSON monitor is single-client per reflector, so a second socket would
+/// fight the first for the feed.
+async fn spawn_eligible_monitors(
     config: &Tier2Config,
     pool: &sqlx::PgPool,
-    monitors: &mut HashMap<String, XlxMonitor>,
+    monitors: &mut JoinSet<()>,
+    task_reflectors: &mut HashMap<Id, String>,
 ) {
     let since = Utc::now()
         - chrono::Duration::seconds(
@@ -165,14 +149,18 @@ async fn connect_eligible_monitors(
         }
     };
 
+    // Reflectors that already have a live monitor task. Owned strings, so the
+    // set does not borrow `task_reflectors` — which `spawn` mutates below.
+    let monitored: std::collections::HashSet<String> = task_reflectors.values().cloned().collect();
+
     for row in &reflectors {
         // Skip if already monitored.
-        if monitors.contains_key(&row.callsign) {
+        if monitored.contains(&row.callsign) {
             continue;
         }
 
         // Respect the concurrency cap.
-        if monitors.len() >= config.max_concurrent_monitors {
+        if task_reflectors.len() >= config.max_concurrent_monitors {
             break;
         }
 
@@ -198,69 +186,48 @@ async fn connect_eligible_monitors(
             }
         };
 
-        // Attempt to connect the monitor.
-        match XlxMonitor::connect(ip, row.callsign.clone()).await {
-            Ok(mon) => {
-                tracing::info!(
-                    reflector = %row.callsign,
-                    peer = %mon.peer(),
-                    "tier2 monitor connected"
-                );
-                let _prev = monitors.insert(row.callsign.clone(), mon);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    reflector = %row.callsign,
-                    ip = %ip,
-                    error = %e,
-                    "tier2: failed to connect monitor"
-                );
-            }
-        }
+        // Spawn an independent monitor task and remember which reflector it
+        // belongs to so its slot can be freed when it ends.
+        let reflector = row.callsign.clone();
+        let handle = monitors.spawn(monitor_loop(reflector.clone(), ip, pool.clone()));
+        let _prev = task_reflectors.insert(handle.id(), reflector);
     }
 }
 
-/// Polls all monitors via round-robin and returns the first message received
-/// along with the reflector callsign that produced it.
+/// Per-reflector monitor task: connect, then receive and dispatch messages
+/// until the reflector becomes unresponsive.
 ///
-/// Each monitor is given a 500ms window to produce a message. If no monitor
-/// has data in the quick-poll pass, falls back to a full blocking recv on
-/// the first monitor (which uses the standard 30-second timeout).
-///
-/// With up to 100 monitors, the round-robin worst case is 50 seconds, but in
-/// practice monitors with pending data return immediately.
-async fn poll_any_monitor(
-    callsigns: &[String],
-    monitors: &HashMap<String, XlxMonitor>,
-) -> (String, Option<MonitorMessage>) {
-    // Round-robin poll with 500ms per-monitor timeout. Most monitors with
-    // pending data return immediately; the timeout only fires for idle ones.
-    let poll_timeout = Duration::from_millis(500);
-
-    for callsign in callsigns {
-        if let Some(monitor) = monitors.get(callsign)
-            && let Ok(msg) = tokio::time::timeout(poll_timeout, monitor.recv()).await
-        {
-            return (callsign.clone(), msg);
+/// [`XlxMonitor::recv`] applies its own 30-second timeout and returns `None`
+/// on timeout or socket error; the first `None` ends the loop. The task then
+/// returns, the `XlxMonitor` is dropped (sending a best-effort `"bye"`), and
+/// the orchestrator's next refresh re-spawns the reflector if it is still
+/// eligible.
+async fn monitor_loop(reflector: String, ip: IpAddr, pool: sqlx::PgPool) {
+    let monitor = match XlxMonitor::connect(ip, reflector.clone()).await {
+        Ok(mon) => {
+            tracing::info!(
+                reflector = %reflector,
+                peer = %mon.peer(),
+                "tier2 monitor connected"
+            );
+            mon
         }
-        // This monitor had no data within the poll window — try the next.
+        Err(e) => {
+            tracing::warn!(
+                reflector = %reflector,
+                ip = %ip,
+                error = %e,
+                "tier2: failed to connect monitor"
+            );
+            return;
+        }
+    };
+
+    while let Some(msg) = monitor.recv().await {
+        handle_message(&reflector, &msg, &pool).await;
     }
 
-    // All monitors timed out in the quick-poll pass. Do a full blocking recv
-    // on the first monitor (uses the standard 30-second timeout) to avoid
-    // busy-spinning when all monitors are idle.
-    if let Some(callsign) = callsigns.first()
-        && let Some(monitor) = monitors.get(callsign)
-    {
-        let msg = monitor.recv().await;
-        return (callsign.clone(), msg);
-    }
-
-    // Unreachable when callsigns is non-empty (caller checks monitors.is_empty()),
-    // but we must return something for exhaustiveness.
-    callsigns
-        .first()
-        .map_or_else(|| (String::new(), None), |cs| (cs.clone(), None))
+    tracing::info!(reflector = %reflector, "tier2 monitor unresponsive, stopping");
 }
 
 /// Dispatches a parsed monitor message to the appropriate handler.
@@ -307,7 +274,8 @@ async fn handle_message(reflector: &str, msg: &MonitorMessage, pool: &sqlx::PgPo
     }
 }
 
-/// Processes a nodes update: clears stale entries and upserts the fresh snapshot.
+/// Processes a nodes update: clears stale entries and upserts the fresh
+/// snapshot, all in one transaction so a reader never sees an empty list.
 async fn handle_nodes_update(reflector: &str, nodes: &[protocol::NodeInfo], pool: &sqlx::PgPool) {
     tracing::debug!(
         reflector = %reflector,
@@ -315,9 +283,23 @@ async fn handle_nodes_update(reflector: &str, nodes: &[protocol::NodeInfo], pool
         "tier2: nodes update"
     );
 
-    // Clear stale nodes for this reflector, then upsert the fresh snapshot.
-    // This simple delete-then-reinsert avoids diff logic.
-    if let Err(e) = db::connected_nodes::clear_for_reflector(pool, reflector).await {
+    // Clear-then-reinsert inside a transaction: on commit the swap is atomic,
+    // so a concurrent reader sees either the old snapshot or the new one,
+    // never the empty gap between the DELETE and the re-INSERTs. Any error
+    // returns early, dropping `tx`, which rolls the whole update back.
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(
+                reflector = %reflector,
+                error = %e,
+                "tier2: failed to begin nodes transaction"
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = db::connected_nodes::clear_for_reflector(&mut *tx, reflector).await {
         tracing::warn!(
             reflector = %reflector,
             error = %e,
@@ -336,7 +318,7 @@ async fn handle_nodes_update(reflector: &str, nodes: &[protocol::NodeInfo], pool
         };
 
         if let Err(e) =
-            db::connected_nodes::upsert_node(pool, reflector, &node.callsign, module, now).await
+            db::connected_nodes::upsert_node(&mut *tx, reflector, &node.callsign, module, now).await
         {
             tracing::warn!(
                 reflector = %reflector,
@@ -344,7 +326,16 @@ async fn handle_nodes_update(reflector: &str, nodes: &[protocol::NodeInfo], pool
                 error = %e,
                 "tier2: failed to upsert connected node"
             );
+            return;
         }
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(
+            reflector = %reflector,
+            error = %e,
+            "tier2: failed to commit nodes update"
+        );
     }
 }
 

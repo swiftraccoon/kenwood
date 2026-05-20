@@ -1,28 +1,43 @@
-//! Pure KISS codec proptest round-trips.
-//!
-//! Split from `thd75/tests/kiss_roundtrip.rs` during PR 1 of the
-//! KISS extraction. The AX.25 and APRS round-trip cases stay in
-//! thd75 until those layers are extracted (PRs 2 and 3).
+//! Property-based KISS codec round-trips.
 
-// Integration tests are separate compilation units and re-evaluate
-// workspace deps. Suppress `unused_crate_dependencies` for the
-// transitively-reachable lib dep that this test file does not use
-// directly.
+// Integration tests are separate compilation units that re-evaluate
+// workspace deps; acknowledge the transitively-reachable lib dep this
+// file does not name directly.
 use thiserror as _;
 
-use kiss_tnc::{KissFrame, decode_kiss_frame, encode_kiss_frame};
+use kiss_tnc::{KissCommand, KissFrame, KissPort, decode_kiss_frame, encode_kiss_frame};
 use proptest::prelude::*;
 
+/// Strategy producing any of the seven nibble-encoded KISS commands.
+fn nibble_command() -> impl Strategy<Value = KissCommand> {
+    prop_oneof![
+        Just(KissCommand::Data),
+        Just(KissCommand::TxDelay),
+        Just(KissCommand::Persistence),
+        Just(KissCommand::SlotTime),
+        Just(KissCommand::TxTail),
+        Just(KissCommand::FullDuplex),
+        Just(KissCommand::SetHardware),
+    ]
+}
+
 proptest! {
+    /// Every valid port, every nibble command, and arbitrary payload
+    /// data round-trips through encode -> decode unchanged.
     #[test]
-    fn kiss_codec_roundtrip(data in prop::collection::vec(any::<u8>(), 0..256)) {
+    fn kiss_codec_roundtrip(
+        port in (0u8..=15).prop_filter_map("valid port", KissPort::new),
+        command in nibble_command(),
+        data in prop::collection::vec(any::<u8>(), 0..256),
+    ) {
         let frame = KissFrame {
-            port: 0,
-            command: 0x00,
+            port,
+            command,
             data: data.clone(),
         };
-        let wire = encode_kiss_frame(&frame);
-        let decoded = decode_kiss_frame(&wire)?;
+        let decoded = decode_kiss_frame(&encode_kiss_frame(&frame))?;
+        prop_assert_eq!(decoded.port, port);
+        prop_assert_eq!(decoded.command, command);
         prop_assert_eq!(decoded.data, data);
     }
 }
