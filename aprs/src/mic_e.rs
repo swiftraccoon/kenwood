@@ -79,22 +79,24 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
     let mut north = true;
     let mut lon_offset = 0i16;
 
+    // Per APRS 1.0.1 §10 destination table (document p.44), chars 3-5
+    // carry hemisphere/offset flags. `mice_dest_digit` returns the
+    // North/+100/West indicator (true only for the std-set chars P-Z).
     for (i, &ch) in dest_head.iter().enumerate() {
-        let (digit, is_custom) = mice_dest_digit(ch)?;
+        let (digit, north_offset_west) = mice_dest_digit(ch)?;
         if let Some(slot) = lat_digits.get_mut(i) {
             *slot = digit;
         }
 
-        // Chars 0-3: if custom (A-L), set message bits (we don't use them for position)
-        // Char 3: N/S flag — custom = North
+        // Char 3: N/S flag — P-Z = North, otherwise (0-9, L) = South.
         if i == 3 {
-            north = is_custom;
+            north = north_offset_west;
         }
-        // Char 4: longitude offset — custom = +100 degrees
-        if i == 4 && is_custom {
+        // Char 4: longitude offset — P-Z = +100 degrees, otherwise +0.
+        if i == 4 && north_offset_west {
             lon_offset = 100;
         }
-        // Char 5: W/E flag — custom = West (negate longitude)
+        // Char 5: W/E flag — P-Z = West (negate longitude), otherwise East.
     }
 
     let d0 = f64::from(*lat_digits.first().ok_or(AprsError::InvalidCoordinates)?);
@@ -235,25 +237,41 @@ fn decode_mice_speed_course(header: &[u8]) -> (Option<u16>, Option<u16>) {
     (speed_opt, course_opt)
 }
 
-/// Extract a digit (0-9) from a Mic-E destination character.
+/// Extract a latitude digit (0-9, or 0 for a space) from a Mic-E
+/// destination character, plus the North/+100/West indicator flag.
 ///
-/// Returns `(digit, is_custom)` where `is_custom` is true for A-K/L
-/// (used for N/S, lon offset, and W/E flags).
+/// Returns `(digit, north_west_offset)`. The boolean is the bytes-4-6
+/// indicator from the APRS 1.0.1 §10 destination table (document p.44):
+/// it is `true` only for the standard-set characters that decode N/S =
+/// North, Long Offset = +100, and W/E = West — namely `P`-`Z`. Digits
+/// `0`-`9` and the ambiguity space `L` decode South / +0 / East, so the
+/// flag is `false` for them. The custom-message range `A`-`K` is never
+/// used in bytes 4-6 (the spec's "ASCII characters A-K are not used in
+/// address bytes 4-6"), so its flag is `false` as well; those characters
+/// still carry a latitude digit (A=0..J=9, K=space) for bytes 1-3.
 const fn mice_dest_digit(ch: u8) -> Result<(u8, bool), AprsError> {
     match ch {
         b'0'..=b'9' => Ok((ch - b'0', false)),
-        b'A'..=b'J' => Ok((ch - b'A', true)), // A=0, B=1, ..., J=9
-        b'K' | b'L' | b'Z' => Ok((0, true)),  // K, L, Z map to space (0)
-        b'P'..=b'Y' => Ok((ch - b'P', true)), // P=0, Q=1, ..., Y=9
+        b'A'..=b'J' => Ok((ch - b'A', false)), // A=0..J=9; custom msg, not used in bytes 4-6
+        // K = space digit, custom msg (not used in bytes 4-6); L = space
+        // digit, Std (South/+0/East per doc p.44). Both clear the flag.
+        b'K' | b'L' => Ok((0, false)),
+        b'P'..=b'Y' => Ok((ch - b'P', true)), // P=0..Y=9; Std, North/+100/West
+        b'Z' => Ok((0, true)),                // space digit; Std, North/+100/West
         _ => Err(AprsError::InvalidCoordinates),
     }
 }
 
-/// Check if a Mic-E destination character is an uppercase letter.
+/// Check whether a Mic-E destination character carries the
+/// North / +100-longitude-offset / West indicator.
 ///
-/// Used by chars 3-5 for N/S, +100 lon offset, and W/E flag decoding.
+/// Used by destination chars 3-5 for N/S, +100 lon offset, and W/E flag
+/// decoding. Per the APRS 1.0.1 §10 destination table (document p.44),
+/// only the standard-set characters `P`-`Z` decode North/+100/West;
+/// digits `0`-`9` and the ambiguity space `L` decode South/+0/East. The
+/// custom-message range `A`-`K` is not used in bytes 4-6.
 const fn mice_dest_is_custom(ch: u8) -> bool {
-    matches!(ch, b'A'..=b'L' | b'P'..=b'Z')
+    matches!(ch, b'P'..=b'Z')
 }
 
 /// Mic-E message-bit classification for destination chars 0-2.
@@ -335,9 +353,10 @@ pub const fn mice_message_bits(msg: MiceMessage) -> (bool, bool, bool) {
 /// Decode Mic-E altitude from the comment field.
 ///
 /// Per APRS 1.0.1 §10.1.1, altitude is optionally encoded as three
-/// base-91 characters (33-126, value = byte - 33) followed by a literal
-/// `}`. The decoded value is metres, offset from -10000 (so the wire
-/// value 10000 = sea level).
+/// base-91 characters (digits 0-90, ASCII `33..=123`, i.e. `'!'` to
+/// `'{'`; value = byte - 33) followed by a literal `}`. The decoded
+/// value is metres, offset from -10000 (so the wire value 10000 = sea
+/// level).
 ///
 /// Searches the comment for the first occurrence of the `ccc}` pattern
 /// where each `c` is a valid base-91 printable character.
@@ -354,7 +373,9 @@ fn mice_decode_altitude(comment: &str) -> Option<i32> {
         let b0 = *window.first()?;
         let b1 = *window.get(1)?;
         let b2 = *window.get(2)?;
-        if !(33..=126).contains(&b0) || !(33..=126).contains(&b1) || !(33..=126).contains(&b2) {
+        // base-91 digits 0..=90 encode to ASCII 33..=123 ('!'..='{');
+        // bytes above '{' are not valid base-91 and must not be accepted.
+        if !(33..=123).contains(&b0) || !(33..=123).contains(&b1) || !(33..=123).contains(&b2) {
             continue;
         }
         let val = i32::from(b0 - 33) * 91 * 91 + i32::from(b1 - 33) * 91 + i32::from(b2 - 33);
@@ -426,6 +447,65 @@ mod tests {
         assert_eq!(pos.symbol_table, '/');
         assert_eq!(pos.speed_knots, Some(121));
         assert_eq!(pos.course_degrees, Some(212));
+        Ok(())
+    }
+
+    #[test]
+    fn mice_dest_char_l_is_standard_not_custom() -> TestResult {
+        // APRS 1.0.1 §10 destination table (document p.44): 'L' is the
+        // standard-set ambiguity/space code — N/S = South, Long Offset =
+        // +0, W/E = East — NOT a North/+100/West (custom) indicator.
+        assert!(!mice_dest_is_custom(b'L'), "L must decode East/South/+0");
+        assert_eq!(mice_dest_digit(b'L')?, (0, false), "L: space digit, Std");
+        // Spot-check the rest of the table's bytes-4-6 classification.
+        assert!(!mice_dest_is_custom(b'0'), "0-9 decode East/South/+0");
+        assert!(!mice_dest_is_custom(b'9'), "0-9 decode East/South/+0");
+        assert!(mice_dest_is_custom(b'P'), "P-Z decode West/North/+100");
+        assert!(mice_dest_is_custom(b'Z'), "P-Z decode West/North/+100");
+        assert_eq!(mice_dest_digit(b'Z')?, (0, true), "Z: space digit, Std-1");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_mice_l_decodes_east_hemisphere() -> TestResult {
+        // Same frame as `parse_mice_basic` but destination char 5 is 'L'
+        // instead of 'P'. Per document p.44, 'L' = East, so the longitude
+        // must come out positive (East) — the magnitude matches the West
+        // 'P' case from `parse_mice_basic` (~ -97.755) with flipped sign.
+        let dest = "SUQU5L";
+        let info: &[u8] = &[0x60, 125, 73, 58, 40, 40, 40, b'>', b'/'];
+        let pos = parse_mice_position(dest, info)?;
+        assert!(
+            pos.longitude > 0.0,
+            "expected East (positive) for 'L', got lon={}",
+            pos.longitude
+        );
+        assert!(
+            (pos.longitude - 97.755).abs() < 0.01,
+            "lon={}",
+            pos.longitude
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_mice_l_decodes_south_and_east() -> TestResult {
+        // Destination "350L5L": char 3 = 'L' (N/S = South), char 5 = 'L'
+        // (W/E = East) per document p.44. Latitude must be negative
+        // (South) and longitude positive (East).
+        let dest = "350L5L";
+        let info: &[u8] = &[0x60, 125, 73, 58, 40, 40, 40, b'>', b'/'];
+        let pos = parse_mice_position(dest, info)?;
+        assert!(
+            pos.latitude < 0.0,
+            "expected South (negative) for 'L' at char 3, got lat={}",
+            pos.latitude
+        );
+        assert!(
+            pos.longitude > 0.0,
+            "expected East (positive) for 'L' at char 5, got lon={}",
+            pos.longitude
+        );
         Ok(())
     }
 

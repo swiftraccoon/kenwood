@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Full-workspace gate. Use workspace-level cargo invocations wherever
 # possible so new crates added under `[workspace] members` are picked
-# up automatically without editing this file.
+# up automatically without editing this file. `-p <crate>` narrows the
+# heavy cargo steps to one package for the edit loop; the full gate is
+# still the pre-commit bar.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -9,10 +11,20 @@ cd "$(dirname "$0")"
 # ---------- args ----------
 QUIET=0
 FIX=0
-for arg in "$@"; do
-    case "$arg" in
+PKG=""
+while [ $# -gt 0 ]; do
+    case "$1" in
         -q|--quiet) QUIET=1 ;;
         --fix)      FIX=1 ;;
+        -p|--package)
+            if [ $# -lt 2 ]; then
+                echo "Missing crate name after $1" >&2
+                echo "Try '$(basename "$0") --help'" >&2
+                exit 2
+            fi
+            PKG="$2"
+            shift
+            ;;
         -h|--help)
             cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
@@ -28,12 +40,24 @@ Options:
                  "✗ step (<elapsed>s)" on failure. The final
                  OK/FAILED summary still prints.
 
+  -p, --package CRATE
+                 Narrow the slow cargo steps (clippy, test, doc)
+                 to one package for a fast edit loop. Use the
+                 PACKAGE name (kenwood-thd75, not thd75). The
+                 mbelib-rs feature-matrix steps run only when the
+                 target is mbelib-rs. Cheap workspace-wide steps
+                 (unsafe audit, fmt, audit/deny/machete, shellcheck,
+                 taplo) always run. A scoped pass does NOT lint the
+                 crates that depend on the target — run the full
+                 gate before committing.
+
   --fix          Auto-apply mechanical fixes BEFORE running the
                  gate: 'cargo fmt --all' and
                  'cargo clippy --fix --allow-dirty' across the
-                 workspace and the mbelib-rs feature matrix.
-                 The full gate then runs unchanged so you can
-                 confirm the edits produced a clean build.
+                 workspace (or the -p target) and the mbelib-rs
+                 feature matrix. The full gate then runs unchanged
+                 so you can confirm the edits produced a clean
+                 build.
 
   -h, --help     Show this help.
 
@@ -48,12 +72,28 @@ EOF
             exit 0
             ;;
         *)
-            echo "Unknown argument: $arg" >&2
+            echo "Unknown argument: $1" >&2
             echo "Try '$(basename "$0") --help'" >&2
             exit 2
             ;;
     esac
+    shift
 done
+
+# Cargo scope for the slow steps: the whole workspace by default,
+# a single package when -p was given.
+if [ -n "$PKG" ]; then
+    SCOPE=(-p "$PKG")
+else
+    SCOPE=(--workspace)
+fi
+
+# The mbelib-rs feature matrix only adds signal when mbelib-rs is in
+# scope — skip it when the gate is narrowed to some other crate.
+MBELIB_MATRIX=1
+if [ -n "$PKG" ] && [ "$PKG" != "mbelib-rs" ]; then
+    MBELIB_MATRIX=0
+fi
 
 # ---------- failure log preservation ----------
 FAIL_DIR=.lint-failures
@@ -168,9 +208,11 @@ run_inline() {
 # "edit, lint.sh --fix, review diff, commit".
 if [ "$FIX" -eq 1 ]; then
     run cargo fmt --all
-    run cargo clippy --fix --allow-dirty --workspace --all-targets
-    run cargo clippy --fix --allow-dirty -p mbelib-rs --all-targets --features encoder
-    run cargo clippy --fix --allow-dirty -p mbelib-rs --all-targets --features kenwood-tables
+    run cargo clippy --fix --allow-dirty "${SCOPE[@]}" --all-targets
+    if [ "$MBELIB_MATRIX" -eq 1 ]; then
+        run cargo clippy --fix --allow-dirty -p mbelib-rs --all-targets --features encoder
+        run cargo clippy --fix --allow-dirty -p mbelib-rs --all-targets --features kenwood-tables
+    fi
 fi
 
 # ---------- unsafe audit ----------
@@ -227,30 +269,34 @@ run_inline "required tools present" check_required_tools
 
 # ---------- cargo gates ----------
 
-# Clippy: workspace-wide, every target. `--workspace --all-targets`
-# iterates every crate in `[workspace] members`, including tests,
-# examples, and benches.
-run cargo clippy --workspace --all-targets -- -D warnings
+# Clippy: every target in scope. `--all-targets` covers tests,
+# examples, and benches; the scope is the workspace by default or a
+# single `-p` package for the edit loop.
+run cargo clippy "${SCOPE[@]}" --all-targets -- -D warnings
 
 # Feature-specific clippy: the `encoder` and `kenwood-tables` gates on
 # mbelib-rs compile additional modules (encode/, encode/kenwood/)
 # that default clippy wouldn't see. Run once per non-default feature
 # set that the crate advertises.
-run cargo clippy -p mbelib-rs --all-targets --features encoder -- -D warnings
-run cargo clippy -p mbelib-rs --all-targets --features kenwood-tables -- -D warnings
+if [ "$MBELIB_MATRIX" -eq 1 ]; then
+    run cargo clippy -p mbelib-rs --all-targets --features encoder -- -D warnings
+    run cargo clippy -p mbelib-rs --all-targets --features kenwood-tables -- -D warnings
+fi
 
-# Tests: workspace-wide. `--workspace` walks every crate; local
-# checkouts have the integration-test fixtures (the ci/docs-workflow
-# variant restricts to `--lib`). Default + feature matrix mirrors
-# the clippy matrix so feature-gated tests are exercised.
-run cargo test --workspace
-run cargo test -p mbelib-rs --features encoder
-run cargo test -p mbelib-rs --features kenwood-tables
+# Tests: same scope as clippy. Local checkouts have the
+# integration-test fixtures (the ci/docs-workflow variant restricts
+# to `--lib`). Default + feature matrix mirrors the clippy matrix so
+# feature-gated tests are exercised.
+run cargo test "${SCOPE[@]}"
+if [ "$MBELIB_MATRIX" -eq 1 ]; then
+    run cargo test -p mbelib-rs --features encoder
+    run cargo test -p mbelib-rs --features kenwood-tables
+fi
 
-# Docs: workspace build with `-D warnings` so broken doc links (e.g.
+# Docs: scoped build with `-D warnings` so broken doc links (e.g.
 # a `[`priv_fn`]` link from a pub item) hard-fail instead of printing
 # a yellow warning.
-RUSTDOCFLAGS="-D warnings" run cargo doc --workspace --no-deps
+RUSTDOCFLAGS="-D warnings" run cargo doc "${SCOPE[@]}" --no-deps
 
 # Format: workspace-wide via `--all`. When `--fix` was passed we
 # already ran `cargo fmt --all` in apply mode above, so this is the

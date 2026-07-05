@@ -16,10 +16,10 @@ use crate::ui::{fmt_status, module_picker};
 /// search box rather than scrolling all of them.
 const MAX_PICKER_ROWS: usize = 200;
 
-/// Render the connection form and the connect/disconnect controls.
-pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
-    // Reflector directory: type to filter, click an entry to fill the
-    // form below. The directory is fetched and cached in the background.
+/// Reflector directory picker: type to filter, click an entry to
+/// fill the connection form. The directory is fetched and cached in
+/// the background.
+fn directory_picker(app: &mut App, ui: &mut egui::Ui) {
     ui.label("Reflector directory");
     ui.horizontal(|ui| {
         ui.label("Search");
@@ -28,23 +28,37 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
             app.refresh_directory();
         }
     });
-    {
-        // Clone the matched entries out so the click handler can mutate
-        // `app` without holding a borrow of the directory.
-        let matches: Vec<hosts::ReflectorHost> = app
-            .directory
-            .search(&app.directory_query)
-            .into_iter()
-            .take(MAX_PICKER_ROWS)
-            .cloned()
-            .collect();
-        egui::ScrollArea::vertical()
-            .max_height(140.0)
-            .show(ui, |ui| {
-                for host in &matches {
+    // Clone the matched entries out so the click handler can mutate
+    // `app` without holding a borrow of the directory.
+    let mut matches: Vec<hosts::ReflectorHost> = app
+        .directory
+        .search(&app.directory_query)
+        .into_iter()
+        .take(MAX_PICKER_ROWS)
+        .cloned()
+        .collect();
+    // Stable sort: favorites float to the top, directory order
+    // preserved within each group.
+    matches.sort_by_key(|h| !app.is_favorite(h));
+    egui::ScrollArea::vertical()
+        .max_height(140.0)
+        .show(ui, |ui| {
+            for host in &matches {
+                ui.horizontal(|ui| {
+                    let star = if app.is_favorite(host) { "★" } else { "☆" };
+                    if ui
+                        .small_button(star)
+                        .on_hover_text("Pin to top of the directory")
+                        .clicked()
+                    {
+                        app.toggle_favorite(host);
+                    }
                     let label = format!(
-                        "{}  ·  {:?}  ·  {}",
-                        host.callsign, host.protocol, host.host
+                        "{}  ·  {:?}  ·  {}  ·  {}",
+                        host.callsign,
+                        host.protocol,
+                        host.host,
+                        host.source.label()
                     );
                     if ui.selectable_label(false, label).clicked() {
                         app.reflector_callsign.clone_from(&host.callsign);
@@ -52,10 +66,39 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                         app.reflector_port = host.port.to_string();
                         app.protocol = host.protocol;
                     }
-                }
-            });
-    }
+                });
+            }
+        });
     ui.label(app.directory.status());
+}
+
+/// One-click reconnect strip for recently used reflectors.
+fn recents_strip(app: &mut App, ui: &mut egui::Ui) {
+    if app.recents.is_empty() {
+        return;
+    }
+    ui.label("Recent");
+    ui.horizontal_wrapped(|ui| {
+        let recents = app.recents.clone();
+        for r in &recents {
+            let label = format!("{} · {}", r.callsign, r.protocol);
+            if ui
+                .button(label)
+                .on_hover_text(format!("{}:{} module {}", r.host, r.port, r.module))
+                .clicked()
+            {
+                app.apply_saved_host(r);
+                app.try_connect();
+            }
+        }
+    });
+    ui.separator();
+}
+
+/// Render the connection form and the connect/disconnect controls.
+pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
+    recents_strip(app, ui);
+    directory_picker(app, ui);
     ui.separator();
 
     egui::Grid::new("conn_form")
@@ -119,7 +162,10 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         {
             app.try_disconnect();
         }
-        ui.label(format!("Status: {}", fmt_status(&app.status)));
+        let heard = app
+            .link_last_heard_secs
+            .map_or_else(String::new, |s| format!(" · heard {s:.0}s ago"));
+        ui.label(format!("Status: {}{heard}", fmt_status(&app.status)));
     });
 
     ui.separator();

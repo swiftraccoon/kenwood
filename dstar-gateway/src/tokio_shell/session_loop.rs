@@ -18,7 +18,7 @@ use dstar_gateway_core::error::{Error as CoreError, IoOperation};
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{Connected, Event, Protocol, Session};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::{Command, ShellError};
 
@@ -45,6 +45,9 @@ pub(crate) struct SessionLoop<P: Protocol> {
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) event_tx: mpsc::Sender<Event<P>>,
     pub(crate) command_rx: mpsc::Receiver<Command>,
+    /// Publishes the arrival instant of every inbound datagram for
+    /// link-health consumers on the handle side.
+    pub(crate) activity_tx: watch::Sender<Instant>,
 }
 
 impl<P: Protocol> SessionLoop<P> {
@@ -143,6 +146,10 @@ impl<P: Protocol> SessionLoop<P> {
                             }));
                         }
                     };
+                    // Refresh the peer-activity watch for link-health
+                    // consumers. Send only fails when every receiver
+                    // is gone — harmless here.
+                    let _unused = self.activity_tx.send(Instant::now());
                     let slice = rx_buf.get(..n).unwrap_or(&[]);
                     if let Err(e) = self.session.handle_input(Instant::now(), peer, slice) {
                         tracing::warn!(

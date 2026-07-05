@@ -32,6 +32,35 @@ ignore = [
     #
     # Recheck when `scraper` ships a version that migrates to rustc-hash.
     { id = "RUSTSEC-2025-0057", reason = "fxhash is an unmaintained tiny hash-function crate pulled transitively by scraper/selectors; no known vulnerability, no safe upgrade; upstream recommendation (rustc-hash) requires a scraper upstream change" },
+
+    # RUSTSEC-2026-0192: ttf-parser is unmaintained.
+    #
+    # ttf-parser is a TrueType/OpenType font parser pulled in transitively
+    # by egui's default text stack for the sextant GUI. The author has
+    # declared the crate unmaintained and recommends skrifa (Google Fonts
+    # "oxidize"/fontations project).
+    #
+    # "Unmaintained" here is a maintenance concern, not a security concern:
+    # there is no known vulnerability and no safe upgrade path — no egui
+    # release has migrated off ttf-parser yet.
+    #
+    # Dependency path:
+    #   ttf-parser ← owned_ttf_parser ← ab_glyph ← epaint ← egui ← eframe ← sextant
+    #
+    # Recheck when egui/ab_glyph migrate to skrifa.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser is an unmaintained font parser pulled transitively by egui/eframe for the sextant GUI; no known vulnerability, no safe upgrade; the fix requires egui migrating to skrifa upstream" },
+
+    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml < 0.41 DoS.
+    #
+    # stargazer's direct quick-xml is on 0.41 (fixed). The remaining
+    # vulnerable copy is pinned by wayland-scanner, a Linux-only
+    # BUILD-TIME proc-macro (winit → smithay → eframe → sextant) that
+    # parses only the local, trusted Wayland protocol XML shipped in
+    # the crate — no attacker-controlled XML can reach it and no
+    # runtime code ships. Recheck when winit/smithay bump
+    # wayland-scanner onto quick-xml 0.41.
+    { id = "RUSTSEC-2026-0194", reason = "vulnerable quick-xml copy is only reachable from wayland-scanner, a Linux build-time proc-macro parsing trusted local protocol XML; no runtime exposure" },
+    { id = "RUSTSEC-2026-0195", reason = "vulnerable quick-xml copy is only reachable from wayland-scanner, a Linux build-time proc-macro parsing trusted local protocol XML; no runtime exposure" },
 ]
 
 [licenses]
@@ -258,8 +287,17 @@ skip = [
     { crate = "rustix@0.38.44" },
     { crate = "linux-raw-sys@0.4.15" },
 
-    # quick-xml 0.37 from cpal-alsa (Linux); egui_extras uses 0.39.
-    { crate = "quick-xml@0.37.5" },
+    # quick-xml 0.39.x from wayland-scanner (Linux build-time
+    # proc-macro); stargazer's direct dep is on 0.41 (DoS fixes).
+    # Skip the whole 0.39 minor so a fresh CI lockfile resolving a
+    # different 0.39 patch (Cargo.lock is gitignored) stays covered.
+    { crate = "quick-xml@0.39" },
+
+    # shlex two-major duplicate, both BUILD-TIME only: bindgen pulls
+    # shlex 1.x, cc pulls shlex 2.x. No runtime code. Skip the older
+    # 1.x side; dropable when bindgen upgrades to shlex 2. Skip the
+    # whole major so patch bumps in a fresh lockfile stay covered.
+    { crate = "shlex@1" },
 
     # windows-sys family 0.59 / 0.60 coexist with 0.61 from newer deps.
     # 0.59 from accesskit/winit, 0.60 from other winit-adjacent crates.

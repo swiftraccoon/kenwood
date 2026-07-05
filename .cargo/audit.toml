@@ -51,4 +51,18 @@ ignore = [
     # `pastey` or similar; sextant's egui/wgpu versions don't ship
     # that yet. Recheck on the next eframe/wgpu bump.
     "RUSTSEC-2024-0436",
+
+    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml < 0.41 DoS
+    # (quadratic duplicate-attribute check; unbounded namespace
+    # allocation in NsReader).
+    #
+    # stargazer's direct quick-xml is on 0.41 (fixed). The remaining
+    # vulnerable copy (0.39.x) is pinned by `wayland-scanner`, a
+    # Linux-only BUILD-TIME proc-macro (winit → smithay → eframe →
+    # sextant) that parses the local, trusted Wayland protocol XML
+    # shipped inside the crate itself. No attacker-controlled XML can
+    # reach it and no runtime code ships. Recheck when winit/smithay
+    # bump wayland-scanner to a quick-xml 0.41 release.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]

@@ -125,16 +125,28 @@ const LFSR_THRESHOLD: u16 = 32768;
 
 /// Unpacks a 9-byte AMBE frame into the bit-field array used by FEC.
 ///
-/// Each of the 72 input bits (extracted MSB-first from the 9-byte
+/// Each of the 72 input bits (extracted LSB-first from the 9-byte
 /// frame) is placed into its corresponding FEC codeword position
 /// according to the D-STAR interleave pattern. The interleave spreads
 /// bits from each codec parameter across multiple codewords so that
 /// burst errors on the RF channel do not concentrate in one parameter.
 ///
+/// # Bit order (LSB-first)
+///
+/// DVSI wire frames pack the on-air bit stream LSB-first within each
+/// byte: the first transmitted bit is bit 0 of byte 0, the eighth is
+/// bit 7 of byte 0, the ninth is bit 0 of byte 1, and so on. This is
+/// the convention proven by dsdcc (`dstar.cpp:566`, "store bits in
+/// order in DVSI frame LSB first") and verified against live
+/// reflector captures: LSB-first extraction yields zero FEC
+/// corrections on frames relayed from real radios, while MSB-first
+/// extraction produced a fixed lattice of phantom "errors" on every
+/// frame (and silently scrambled the unprotected C2/C3 bits).
+///
 /// # Algorithm
 ///
-/// 1. Extract bits MSB-first from the 9-byte input (bit 7 of byte 0
-///    is input bit 0, bit 0 of byte 0 is input bit 7, etc.).
+/// 1. Extract bits LSB-first from the 9-byte input (bit 0 of byte 0
+///    is input bit 0, bit 7 of byte 0 is input bit 7, etc.).
 /// 2. For each input bit `i`, write it to `ambe_fr[INTERLEAVE[i]]`.
 ///
 /// The output array is zeroed by the caller; only `1` bits are written.
@@ -146,9 +158,9 @@ const LFSR_THRESHOLD: u16 = 32768;
 ///   codeword order (C0 at 0..24, C1 at 24..47, C2 at 47..58, C3 at
 ///   58..72).
 pub(crate) fn unpack_frame(ambe: &[u8; 9], ambe_fr: &mut [u8; AMBE_FRAME_BITS]) {
-    // Process each of the 72 input bits. The bits are packed MSB-first
-    // in the 9-byte input: bit 7 of byte 0 is the first bit transmitted,
-    // bit 0 of byte 8 is the last.
+    // Process each of the 72 input bits. The bits are packed LSB-first
+    // in the 9-byte input: bit 0 of byte 0 is the first bit transmitted,
+    // bit 7 of byte 8 is the last.
     let mut input_bit: usize = 0;
     let mut byte_idx: usize = 0;
 
@@ -158,8 +170,8 @@ pub(crate) fn unpack_frame(ambe: &[u8; 9], ambe_fr: &mut [u8; AMBE_FRAME_BITS]) 
             None => 0,
         };
 
-        // Extract 8 bits from this byte, MSB first (bit 7 down to bit 0).
-        let mut bit_pos: u8 = 7;
+        // Extract 8 bits from this byte, LSB first (bit 0 up to bit 7).
+        let mut bit_pos: u8 = 0;
         loop {
             // Extract the single bit at position `bit_pos`.
             let bit = (byte_val >> bit_pos) & 1;
@@ -173,10 +185,10 @@ pub(crate) fn unpack_frame(ambe: &[u8; 9], ambe_fr: &mut [u8; AMBE_FRAME_BITS]) 
 
             input_bit += 1;
 
-            if bit_pos == 0 {
+            if bit_pos == 7 {
                 break;
             }
-            bit_pos -= 1;
+            bit_pos += 1;
         }
 
         byte_idx += 1;
@@ -330,7 +342,9 @@ mod tests {
     fn unpack_single_bit_positions() {
         for input_bit in 0..72_usize {
             let byte_idx = input_bit / 8;
-            let bit_pos = 7 - (input_bit % 8);
+            // LSB-first wire convention: input bit i is bit (i % 8)
+            // of byte (i / 8).
+            let bit_pos = input_bit % 8;
 
             // Build a 9-byte frame with only this one bit set.
             let mut ambe = [0u8; 9];
@@ -653,10 +667,11 @@ mod tests {
         let mut ambe_fr = [0u8; AMBE_FRAME_BITS];
         unpack_frame(&ambe, &mut ambe_fr);
 
-        // Verify each input bit. For 0xAA, even-indexed input bits
-        // (0, 2, 4, ...) are 1, odd-indexed (1, 3, 5, ...) are 0.
+        // Verify each input bit. LSB-first: input bit i is bit (i % 8)
+        // of its byte, and 0xAA has odd bit positions set — so
+        // odd-indexed input bits are 1, even-indexed are 0.
         for input_bit in 0..72_usize {
-            let is_set = (input_bit % 2) == 0; // MSB of each byte pair
+            let is_set = (input_bit % 2) == 1;
             let expected = u8::from(is_set);
 
             let target = match INTERLEAVE.get(input_bit) {

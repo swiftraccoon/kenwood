@@ -14,6 +14,37 @@ use std::fmt::Write as _;
 
 use dstar_gateway_core::types::ProtocolKind;
 
+/// Where a directory entry came from. Decides dedup precedence and
+/// is shown in the picker so a surprising address is explainable.
+///
+/// The `REFnnn` namespace is ambiguous: the dstargateway auth server
+/// lists the legacy US-network REF reflectors, while the XLX
+/// self-registration registry lists `REFnnn` as the DPlus-protocol
+/// alias of XLX reflector `nnn` — a different server entirely. The
+/// auth server is authoritative for `REF` names, so its entries must
+/// win the dedup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostSource {
+    /// Compiled-in (the POLARIS test reflector).
+    Bundled,
+    /// The `DPlus` auth server's host list — authoritative for `REF`.
+    DPlusAuth,
+    /// XLX self-registration registry. A `REFnnn` from here is an
+    /// XLX in `DPlus`-compat mode, not a dstargateway REF.
+    XlxRegistry,
+}
+
+impl HostSource {
+    /// Short provenance tag for the directory picker row.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Bundled => "bundled",
+            Self::DPlusAuth => "dstargateway",
+            Self::XlxRegistry => "xlx registry",
+        }
+    }
+}
+
 /// One reflector the connection panel can pre-fill.
 #[derive(Debug, Clone)]
 pub(crate) struct ReflectorHost {
@@ -25,6 +56,8 @@ pub(crate) struct ReflectorHost {
     pub(crate) port: u16,
     /// Protocol family.
     pub(crate) protocol: ProtocolKind,
+    /// Which directory source provided this entry.
+    pub(crate) source: HostSource,
 }
 
 /// The bundled host list — just the local POLARIS test reflector,
@@ -35,6 +68,7 @@ pub(crate) fn bundled() -> Vec<ReflectorHost> {
         host: "127.0.0.1".into(),
         port: 30001,
         protocol: ProtocolKind::DExtra,
+        source: HostSource::Bundled,
     }]
 }
 
@@ -42,12 +76,19 @@ pub(crate) fn bundled() -> Vec<ReflectorHost> {
 /// the directory channel.
 #[derive(Debug)]
 pub(crate) enum DirectoryUpdate {
-    /// A fetch succeeded — the parsed hosts and a display timestamp.
+    /// An XLX-registry fetch succeeded — the parsed hosts and a
+    /// display timestamp.
     Loaded {
         /// Reflectors parsed from the registry.
         hosts: Vec<ReflectorHost>,
         /// ISO-date display string for the fetch time.
         when: String,
+    },
+    /// A `DPlus` auth-server fetch succeeded — the authoritative REF
+    /// host list, merged at higher precedence than the XLX registry.
+    AuthLoaded {
+        /// REF reflectors from the auth server.
+        hosts: Vec<ReflectorHost>,
     },
     /// A fetch failed — the error text for the status line.
     Failed(String),
@@ -73,6 +114,7 @@ pub(crate) async fn fetch_directory() -> DirectoryUpdate {
                     host: entry.address,
                     port: entry.port,
                     protocol,
+                    source: HostSource::XlxRegistry,
                 })
                 .collect();
             DirectoryUpdate::Loaded {
@@ -81,6 +123,38 @@ pub(crate) async fn fetch_directory() -> DirectoryUpdate {
             }
         }
         Err(e) => DirectoryUpdate::Failed(e.to_string()),
+    }
+}
+
+/// Fetch the authoritative REF host list from the `DPlus` auth
+/// server (the same TCP exchange every `DPlus` dongle performs at
+/// startup). Runs on the tokio runtime; the caller forwards the
+/// returned [`DirectoryUpdate`] to the GUI. Failures are reported
+/// but harmless — the directory keeps its other sources.
+pub(crate) async fn fetch_auth_directory(callsign: String) -> DirectoryUpdate {
+    let callsign = match dstar_gateway_core::types::Callsign::try_from_str(callsign.trim()) {
+        Ok(c) => c,
+        Err(e) => return DirectoryUpdate::Failed(format!("auth callsign {callsign:?}: {e}")),
+    };
+    match dstar_gateway::auth::AuthClient::new()
+        .authenticate(callsign)
+        .await
+    {
+        Ok(host_list) => {
+            let hosts = host_list
+                .hosts()
+                .iter()
+                .map(|h| ReflectorHost {
+                    callsign: h.callsign.clone(),
+                    host: h.address.to_string(),
+                    port: 20001,
+                    protocol: ProtocolKind::DPlus,
+                    source: HostSource::DPlusAuth,
+                })
+                .collect();
+            DirectoryUpdate::AuthLoaded { hosts }
+        }
+        Err(e) => DirectoryUpdate::Failed(format!("dstargateway auth list: {e}")),
     }
 }
 
@@ -121,17 +195,21 @@ impl ReflectorDirectory {
     }
 
     /// Merge additional entries (the `DPlus` auth `HostList`) in.
+    /// Merged entries outrank the XLX-fetched ones on rebuild.
     pub(crate) fn merge_hosts(&mut self, extra: Vec<ReflectorHost>) {
         self.merged.extend(extra);
         self.rebuild();
     }
 
-    /// Rebuild the combined view: bundled, then fetched, then merged,
-    /// deduplicated by `(callsign, protocol)` — the earliest wins.
+    /// Rebuild the combined view: bundled, then auth-merged, then
+    /// XLX-fetched, deduplicated by `(callsign, protocol)` — the
+    /// earliest wins. Auth entries outrank the XLX registry because
+    /// XLX self-registrations reuse `REFnnn` names that collide with
+    /// the genuine dstargateway reflectors of the same name.
     fn rebuild(&mut self) {
         let mut all = bundled();
-        all.extend(self.fetched.iter().cloned());
         all.extend(self.merged.iter().cloned());
+        all.extend(self.fetched.iter().cloned());
         dedup_hosts(&mut all);
         self.hosts = all;
     }
@@ -257,6 +335,8 @@ fn from_tsv(content: &str) -> (Vec<ReflectorHost>, Option<String>) {
             host: host.to_owned(),
             port,
             protocol,
+            // The cache persists only XLX-registry fetches.
+            source: HostSource::XlxRegistry,
         });
     }
     (hosts, when)
@@ -264,7 +344,7 @@ fn from_tsv(content: &str) -> (Vec<ReflectorHost>, Option<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReflectorDirectory, ReflectorHost, bundled};
+    use super::{HostSource, ReflectorDirectory, ReflectorHost, bundled};
     use dstar_gateway_core::types::ProtocolKind;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -275,6 +355,7 @@ mod tests {
             host: addr.to_owned(),
             port,
             protocol,
+            source: HostSource::XlxRegistry,
         }
     }
 
@@ -321,18 +402,27 @@ mod tests {
         assert_eq!(dir.search("REF030").len(), 1, "fetched entry present");
     }
 
+    /// The `REFnnn` namespace collides: XLX self-registrations reuse
+    /// names of genuine dstargateway reflectors. The auth-merged
+    /// entry (authoritative for REF) must win the dedup, or "REF030"
+    /// routes to an unrelated XLX in DPlus-compat mode.
     #[test]
-    fn dedup_prefers_fetched_over_merged() -> TestResult {
+    fn dedup_prefers_auth_merged_over_fetched() -> TestResult {
         let mut dir = ReflectorDirectory::bundled_only();
         dir.replace_fetched(
-            vec![host("REF030", ProtocolKind::DPlus, 20001, "fetched")],
+            vec![host("REF030", ProtocolKind::DPlus, 20001, "xlx-imposter")],
             "2026-05-16",
         );
-        dir.merge_hosts(vec![host("REF030", ProtocolKind::DPlus, 20001, "merged")]);
+        let mut authoritative = host("REF030", ProtocolKind::DPlus, 20001, "dstargateway");
+        authoritative.source = HostSource::DPlusAuth;
+        dir.merge_hosts(vec![authoritative]);
         let hits = dir.search("REF030");
         assert_eq!(hits.len(), 1, "deduped to one entry, got {hits:?}");
         let first = hits.first().ok_or("one REF030 hit")?;
-        assert_eq!(first.host, "fetched", "the XLX-fetched entry wins the tie");
+        assert_eq!(
+            first.host, "dstargateway",
+            "the auth-merged entry wins the tie"
+        );
         Ok(())
     }
 

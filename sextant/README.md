@@ -5,20 +5,26 @@ Companion to the POLARIS test reflector — exercises the full
 laptop-only `dstar-gateway` + `mbelib-rs` encode/decode pipeline with
 no radio in the loop.
 
-**WIP — API, UI, and audio quality will churn. Not intended for
-on-air use yet.**
+**WIP — protocol details and audio quality still churn. Fine for
+listening; treat transmit as experimental.**
 
-## Scope
+## Features
 
-- Connect to a reflector (UDP handshake, keepalives, clean disconnect).
-- Receive voice: AMBE 3600×2400 frames → PCM → default audio output.
-- Transmit voice: default audio input → AMBE 3600×2400 → reflector.
-- Linear-interpolation resampling between HW audio rate and 8 kHz AMBE.
-- Single window, immediate-mode (egui).
-
-Out of scope: slow-data display, header editing, reflector host-file
-browser, recording / playback, device selection UI, high-quality
-resampling. File issues or PRs if any of these would be useful.
+- Connect to DExtra / DPlus / DCS reflectors: searchable directory
+  (XLX registry + DPlus host list), favorites, recent-connection
+  shortcuts, auto-reconnect with backoff.
+- Receive voice: AMBE decode with packet-loss concealment, playback
+  priming against network jitter, click-free stream boundaries, and
+  per-stream loss statistics.
+- Transmit voice: PTT button or spacebar, mic level metering, TX
+  silence test, transmit-from-WAV.
+- Slow data both ways: text messages and GPS (DPRS / NMEA) decoded
+  and displayed; operator text + GPS beacon on transmit.
+- Heard-station list (optionally persisted), event log, link-health
+  readout (reflector last-heard age).
+- Audio device selection, RX recording to WAV, local WAV playback.
+- Windowed-sinc resampling between the hardware rate and the 8 kHz
+  codec rate (anti-aliasing built in).
 
 ## Usage
 
@@ -88,8 +94,8 @@ App::update()               session::run()              audio::run_audio_worker(
   │    StartTx/TxFrame/EndTx) │                            │   (drains speaker ringbuf)
   │   ───────────────────►    ├─ sends voice frames        ├─ AmbeEncoder (TX path)
   ├─ sends AudioCommand ───►  └─ receives voice frames ─►  ├─ AmbeDecoder (RX path)
-  │   (StartTx/StopTx/                                      └─ linear resampler
-  │    RxFrame)
+  │   (StartTx/StopTx/                                      └─ sinc resampler
+  │    RxFrame/RxLost/RxEnd)
   └─ drains SessionEvent
 ```
 
@@ -103,15 +109,6 @@ App::update()               session::run()              audio::run_audio_worker(
 - `let _unused = ` on GUI channel sends is intentional: if the
   session task has gone away (shutdown), dropping the send is the
   right thing to do.
-
-## Audio quality caveat
-
-Resampling is linear interpolation — fast, cheap, intelligible for
-speech, not bit-accurate. Downsampling from 48 kHz to 8 kHz without
-an anti-aliasing filter folds content above 4 kHz back into the
-passband. For voice it sounds slightly duller than direct 8 kHz
-capture but remains intelligible. A future pass will swap in
-`rubato::SincFixedIn` once the end-to-end flow is validated.
 
 ## License
 

@@ -763,6 +763,13 @@ impl TelemetryDefinition {
         }
         if let Some(rest) = trimmed.strip_prefix("BITS.") {
             let (bits, title) = rest.split_once(',').unwrap_or((rest, ""));
+            // APRS 1.0.1 §13 p.70: the bit-sense field is exactly 8 binary
+            // digits (`b1..b8`). Reject any other length (e.g. an empty
+            // mask from a bare "BITS.") or non-binary content rather than
+            // surfacing a malformed zero-length active-bit mask.
+            if bits.len() != 8 || !bits.bytes().all(|b| b == b'0' || b == b'1') {
+                return None;
+            }
             return Some(Self::Bits {
                 bits: bits.to_owned(),
                 title: title.to_owned(),
@@ -1053,12 +1060,21 @@ fn parse_aprs_grid(info: &[u8]) -> Result<AprsData, AprsError> {
     let body = String::from_utf8_lossy(tail)
         .trim_end_matches(['\r', '\n', ' '])
         .to_owned();
-    if !(4..=6).contains(&body.len()) {
+    // Maidenhead locators are built in 2-char pairs, so only even lengths
+    // are well-formed. Accept the 4-char (field+square) and 6-char
+    // (+sub-square) forms; reject 5 (the old `4..=6` guard let a 5-char
+    // body through and never validated its trailing byte) and any other
+    // length.
+    if !matches!(body.len(), 4 | 6) {
         return Err(AprsError::InvalidFormat);
     }
     let bytes = body.as_bytes();
     // First two: letters A-R. Next two: digits 0-9. Last two (optional):
-    // letters a-x.
+    // letters a-x. Every byte of whatever length we accept must be
+    // validated — an odd length leaves a trailing byte unchecked, so only
+    // the even Maidenhead pair-lengths {4, 6} are valid here. (The spec
+    // also defines an 8-char extended-square locator, but this `[` data
+    // type dispatcher only emits 4-/6-char grids, so 8 is rejected too.)
     let b0 = *bytes.first().ok_or(AprsError::InvalidFormat)?;
     let b1 = *bytes.get(1).ok_or(AprsError::InvalidFormat)?;
     let b2 = *bytes.get(2).ok_or(AprsError::InvalidFormat)?;
@@ -1072,7 +1088,10 @@ fn parse_aprs_grid(info: &[u8]) -> Result<AprsData, AprsError> {
     {
         return Err(AprsError::InvalidFormat);
     }
-    if bytes.len() == 6 {
+    // 6-char form carries a sub-square pair (letters a-x). The length guard
+    // above guarantees a 6-char body has both bytes present, so a 5-char
+    // body can no longer slip past with an unchecked byte 4.
+    if body.len() == 6 {
         let b4 = *bytes.get(4).ok_or(AprsError::InvalidFormat)?;
         let b5 = *bytes.get(5).ok_or(AprsError::InvalidFormat)?;
         if !b4.is_ascii_lowercase() || !b5.is_ascii_lowercase() || b4 > b'x' || b5 > b'x' {
@@ -1249,6 +1268,47 @@ mod tests {
     fn dispatch_grid_invalid_rejected() {
         assert!(parse_aprs_data(b"[XX12").is_err(), "X > R rejected");
         assert!(parse_aprs_data(b"[AB").is_err(), "too short rejected");
+    }
+
+    #[test]
+    fn dispatch_grid_five_char_rejected() {
+        // Verified bug: a 5-char locator passed the old `4..=6` length
+        // guard but its 5th byte was never validated, so "[AA00!" was
+        // accepted as Grid("AA00!"). Maidenhead locators are even-length
+        // pairs; 5 is invalid.
+        assert!(
+            parse_aprs_data(b"[AA00!").is_err(),
+            "5-char locator must be rejected",
+        );
+    }
+
+    #[test]
+    fn dispatch_grid_four_char_accepted() -> TestResult {
+        let result = parse_aprs_data(b"[AA00")?;
+        assert!(
+            matches!(&result, AprsData::Grid(g) if g == "AA00"),
+            "expected Grid(AA00), got {result:?}",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_grid_six_char_accepted() -> TestResult {
+        let result = parse_aprs_data(b"[FN20qa")?;
+        assert!(
+            matches!(&result, AprsData::Grid(g) if g == "FN20qa"),
+            "expected Grid(FN20qa), got {result:?}",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_grid_six_char_bad_subsquare_rejected() {
+        // Right length but the sub-square pair is not a-x letters.
+        assert!(
+            parse_aprs_data(b"[AA00!!").is_err(),
+            "6-char with non-letter sub-square must be rejected",
+        );
     }
 
     #[test]
@@ -1821,6 +1881,38 @@ mod tests {
         assert_eq!(bits, "11111111");
         assert_eq!(title, "WX station telemetry");
         Ok(())
+    }
+
+    #[test]
+    fn telemetry_definition_bits_exactly_eight() -> TestResult {
+        // APRS 1.0.1 §13 p.70: the bit-sense field is exactly 8 binary
+        // digits. A correct 8-digit mask parses.
+        let def = TelemetryDefinition::from_text("BITS.10110000,Title").ok_or("expected Bits")?;
+        let TelemetryDefinition::Bits { bits, title } = def else {
+            return Err("expected Bits".into());
+        };
+        assert_eq!(bits, "10110000");
+        assert_eq!(title, "Title");
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_definition_bits_rejects_empty_mask() {
+        // Verified bug: a bare "BITS." previously yielded a zero-length
+        // active-bit mask. It must now be rejected.
+        assert!(TelemetryDefinition::from_text("BITS.").is_none());
+    }
+
+    #[test]
+    fn telemetry_definition_bits_rejects_short_mask() {
+        // Fewer than 8 digits is malformed.
+        assert!(TelemetryDefinition::from_text("BITS.101").is_none());
+    }
+
+    #[test]
+    fn telemetry_definition_bits_rejects_non_binary() {
+        // Right length but a non-binary digit is malformed.
+        assert!(TelemetryDefinition::from_text("BITS.10110002,Title").is_none());
     }
 
     #[test]

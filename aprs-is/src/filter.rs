@@ -57,22 +57,24 @@ pub enum AprsIsFilter {
     /// but enforces 9-char object names and must be the last clause
     /// on the filter line per javAPRSFilter.html.
     StrictObject(Vec<String>),
-    /// Type filter `t/poimntqsuhwc` — single-string of frame-type
+    /// Type filter `t/poimqstunw` — single-string of frame-type
     /// characters selecting which packet types to include.
     ///
-    /// Character meanings (javAPRSFilter.html "t" table):
-    /// - `p` position
-    /// - `o` object
-    /// - `i` item
+    /// The spec set is exactly `p o i m q s t u n w` per the
+    /// javAPRSFilter.html "t" table (`t/poimqstunw`):
+    /// - `p` position packets
+    /// - `o` objects
+    /// - `i` items
     /// - `m` message
     /// - `q` query
-    /// - `c` station capabilities
     /// - `s` status
     /// - `t` telemetry
     /// - `u` user-defined
-    /// - `n` NWS bulletin
+    /// - `n` NWS-format messages and objects
     /// - `w` weather
-    /// - `h` third-party
+    ///
+    /// The string is passed through verbatim, so only these characters
+    /// match server-side; any other letter selects nothing.
     Type(String),
     /// Station-centric type filter `t/poimqstuw/call/km` — like
     /// [`Self::Type`] but restricted to stations within `distance_km`
@@ -329,5 +331,15 @@ mod tests {
         let once = AprsIsFilter::negated(inner);
         let twice = AprsIsFilter::negated(once);
         assert_eq!(twice.as_wire(), "p/CW");
+    }
+
+    #[test]
+    fn aprs_is_filter_type_spec_set_round_trips() {
+        // Guards the doc-conformance fix: the javAPRSFilter.html "t"
+        // table set is exactly `poimqstunw` (no `c`/`h`). The variant
+        // passes its string through verbatim, so a clause built from the
+        // documented set must round-trip unchanged.
+        let f = AprsIsFilter::Type("poimqstunw".to_owned());
+        assert_eq!(f.as_wire(), "t/poimqstunw");
     }
 }

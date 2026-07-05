@@ -61,7 +61,12 @@ fn ax25_to_kiss_wire(packet: &Ax25Packet) -> Vec<u8> {
 ///
 /// Clamps out-of-range or non-finite input to `±90.0` so the output is
 /// always a well-formed 8-byte APRS latitude field instead of garbage
-/// like `"950000.00N"`.
+/// like `"950000.00N"`. The `DDMM.hh` core is produced by the shared
+/// [`crate::units::format_ddmm_hundredths`] helper, which carries
+/// minute/degree overflow so the minutes field is whole minutes
+/// `00..=59` plus hundredths `00..=99` per APRS 1.0.1 §6 p.23 — never
+/// the malformed `60.00` that a fixed-precision `format!` of
+/// `59.9999` minutes would emit.
 fn format_aprs_latitude(lat: f64) -> String {
     let lat = if lat.is_finite() {
         lat.clamp(-90.0, 90.0)
@@ -69,20 +74,18 @@ fn format_aprs_latitude(lat: f64) -> String {
         0.0
     };
     let hemisphere = if lat >= 0.0 { 'N' } else { 'S' };
-    let lat_abs = lat.abs();
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "lat_abs is clamped to 0..=90 so the cast to u32 is safe"
-    )]
-    let degrees = lat_abs as u32;
-    let minutes = (lat_abs - f64::from(degrees)) * 60.0;
-    format!("{degrees:02}{minutes:05.2}{hemisphere}")
+    let core = crate::units::format_ddmm_hundredths(lat.abs(), 2);
+    format!("{core}{hemisphere}")
 }
 
 /// Format longitude as APRS uncompressed `DDDMM.HHE` (9 bytes).
 ///
-/// Clamps out-of-range or non-finite input to `±180.0`.
+/// Clamps out-of-range or non-finite input to `±180.0`. The `DDDMM.hh`
+/// core is produced by the shared
+/// [`crate::units::format_ddmm_hundredths`] helper, which carries
+/// minute/degree overflow so the minutes field is whole minutes
+/// `00..=59` plus hundredths `00..=99` per APRS 1.0.1 §6 p.24 — never
+/// the malformed `60.00`.
 fn format_aprs_longitude(lon: f64) -> String {
     let lon = if lon.is_finite() {
         lon.clamp(-180.0, 180.0)
@@ -90,15 +93,8 @@ fn format_aprs_longitude(lon: f64) -> String {
         0.0
     };
     let hemisphere = if lon >= 0.0 { 'E' } else { 'W' };
-    let lon_abs = lon.abs();
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "lon_abs is clamped to 0..=180 so the cast to u32 is safe"
-    )]
-    let degrees = lon_abs as u32;
-    let minutes = (lon_abs - f64::from(degrees)) * 60.0;
-    format!("{degrees:03}{minutes:05.2}{hemisphere}")
+    let core = crate::units::format_ddmm_hundredths(lon.abs(), 3);
+    format!("{core}{hemisphere}")
 }
 
 /// Encode a `u32` value as 4 bytes of base-91.
@@ -290,7 +286,13 @@ pub fn build_aprs_message_checked(
 /// `;name_____*DDHHMMzDDMM.HHN/DDDMM.HHEscomment`
 ///
 /// The object name is padded to exactly 9 characters per the APRS spec.
-/// The timestamp uses the current UTC time in DHM zulu format.
+///
+/// This convenience builder emits a **placeholder zero DHM-zulu
+/// timestamp** (`000000z`, day 0) — it is sans-io and cannot read the
+/// clock. Day 0 is outside the spec-valid `01..=31` range and is
+/// rejected by [`AprsTimestamp::parse`]. Callers that need a real
+/// timestamp must use [`build_aprs_object_with_timestamp`], which takes
+/// an explicit [`AprsTimestamp`].
 ///
 /// Returns wire-ready bytes (FEND-delimited KISS frame).
 ///
@@ -722,6 +724,66 @@ pub fn build_aprs_item_checked_packet(
 // APRS weather builders
 // ---------------------------------------------------------------------------
 
+/// Append the shared 7-field weather tail — gust, temperature, rain
+/// (1 h / 24 h / since-midnight), humidity, barometric pressure — to an
+/// info field, clamping every value to its APRS 1.0.1 §12 p.64 field
+/// width before formatting.
+///
+/// Both the complete-weather-report builder
+/// ([`build_aprs_position_weather_packet`]) and the positionless one
+/// ([`build_aprs_weather_packet`]) emit a byte-identical tail after
+/// their respective wind direction/speed prefixes; this helper is the
+/// single place that tail (and its range clamping) lives.
+///
+/// # Clamping (APRS 1.0.1 §12 p.64)
+///
+/// - gust `g`, rain `r`/`p`/`P`: 3-digit fields → saturate to `0..=999`.
+/// - temperature `t`: 3 columns, negatives written sign + 2 digits, so
+///   the spec range is `-99..=999` → saturate to that range.
+/// - humidity `h`: 2-digit field where `00` means 100 %; the spec range
+///   is `1..=100` → saturate to that range *before* the `100 → "00"`
+///   substitution (so `0 → 1 → "01"` and `>100 → 100 → "00"`).
+/// - pressure `b`: 5-digit field (tenths of hPa) → saturate to
+///   `0..=99999`.
+///
+/// Unclamped values would overflow the fixed field width and the
+/// crate's own parser then drops every following field; clamping keeps
+/// each field within spec width.
+fn write_weather_tail(info: &mut String, weather: &AprsWeather) {
+    use std::fmt::Write as _;
+
+    if let Some(gust) = weather.wind_gust {
+        let gust = gust.min(999);
+        let _ = write!(info, "g{gust:03}");
+    }
+    if let Some(temp) = weather.temperature {
+        let temp = temp.clamp(-99, 999);
+        let _ = write!(info, "t{temp:03}");
+    }
+    if let Some(rain) = weather.rain_1h {
+        let rain = rain.min(999);
+        let _ = write!(info, "r{rain:03}");
+    }
+    if let Some(rain) = weather.rain_24h {
+        let rain = rain.min(999);
+        let _ = write!(info, "p{rain:03}");
+    }
+    if let Some(rain) = weather.rain_since_midnight {
+        let rain = rain.min(999);
+        let _ = write!(info, "P{rain:03}");
+    }
+    if let Some(hum) = weather.humidity {
+        // Spec range 1..=100; APRS encodes 100 % as "00".
+        let hum = hum.clamp(1, 100);
+        let hum_val = if hum == 100 { 0 } else { hum };
+        let _ = write!(info, "h{hum_val:02}");
+    }
+    if let Some(pres) = weather.pressure {
+        let pres = pres.min(99_999);
+        let _ = write!(info, "b{pres:05}");
+    }
+}
+
 /// Build a KISS-encoded positionless APRS weather report.
 ///
 /// Composes an AX.25 UI frame with the APRS positionless weather format:
@@ -783,43 +845,22 @@ pub fn build_aprs_position_weather_packet(
     weather: &AprsWeather,
     path: &[RouteEntry],
 ) -> Ax25Packet {
-    use std::fmt::Write as _;
-
     let lat_str = format_aprs_latitude(latitude);
     let lon_str = format_aprs_longitude(longitude);
     // Symbol code is always `_` (weather station) for this format.
     // Wind direction and speed go into the CSE/SPD slot (`DDD/SSS`),
-    // with "..." for missing values.
+    // with "..." for missing values. Both are 3-digit fields (APRS
+    // 1.0.1 §12 p.65); clamp to `0..=999` so an out-of-range value
+    // cannot overflow the field width and corrupt the following tail.
     let wind_dir = weather
         .wind_direction
-        .map_or_else(|| "...".to_owned(), |d| format!("{d:03}"));
+        .map_or_else(|| "...".to_owned(), |d| format!("{:03}", d.min(999)));
     let wind_spd = weather
         .wind_speed
-        .map_or_else(|| "...".to_owned(), |s| format!("{s:03}"));
+        .map_or_else(|| "...".to_owned(), |s| format!("{:03}", s.min(999)));
 
     let mut info = format!("!{lat_str}{symbol_table}{lon_str}_{wind_dir}/{wind_spd}");
-    if let Some(gust) = weather.wind_gust {
-        let _ = write!(info, "g{gust:03}");
-    }
-    if let Some(temp) = weather.temperature {
-        let _ = write!(info, "t{temp:03}");
-    }
-    if let Some(rain) = weather.rain_1h {
-        let _ = write!(info, "r{rain:03}");
-    }
-    if let Some(rain) = weather.rain_24h {
-        let _ = write!(info, "p{rain:03}");
-    }
-    if let Some(rain) = weather.rain_since_midnight {
-        let _ = write!(info, "P{rain:03}");
-    }
-    if let Some(hum) = weather.humidity {
-        let hum_val = if hum == 100 { 0 } else { hum };
-        let _ = write!(info, "h{hum_val:02}");
-    }
-    if let Some(pres) = weather.pressure {
-        let _ = write!(info, "b{pres:05}");
-    }
+    write_weather_tail(&mut info, weather);
 
     ax25_ui_frame(
         source.clone(),
@@ -840,34 +881,17 @@ pub fn build_aprs_weather_packet(
 
     let mut info = String::from("_00000000");
 
+    // Wind direction `c` and speed `s` are 3-digit fields (APRS 1.0.1
+    // §12 p.64); clamp to `0..=999` so an out-of-range value cannot
+    // overflow the field width and corrupt the shared tail. The
+    // gust→pressure tail is emitted by `write_weather_tail`.
     if let Some(dir) = weather.wind_direction {
-        let _ = write!(info, "c{dir:03}");
+        let _ = write!(info, "c{:03}", dir.min(999));
     }
     if let Some(spd) = weather.wind_speed {
-        let _ = write!(info, "s{spd:03}");
+        let _ = write!(info, "s{:03}", spd.min(999));
     }
-    if let Some(gust) = weather.wind_gust {
-        let _ = write!(info, "g{gust:03}");
-    }
-    if let Some(temp) = weather.temperature {
-        let _ = write!(info, "t{temp:03}");
-    }
-    if let Some(rain) = weather.rain_1h {
-        let _ = write!(info, "r{rain:03}");
-    }
-    if let Some(rain) = weather.rain_24h {
-        let _ = write!(info, "p{rain:03}");
-    }
-    if let Some(rain) = weather.rain_since_midnight {
-        let _ = write!(info, "P{rain:03}");
-    }
-    if let Some(hum) = weather.humidity {
-        let hum_val = if hum == 100 { 0 } else { hum };
-        let _ = write!(info, "h{hum_val:02}");
-    }
-    if let Some(pres) = weather.pressure {
-        let _ = write!(info, "b{pres:05}");
-    }
+    write_weather_tail(&mut info, weather);
 
     ax25_ui_frame(
         source.clone(),
@@ -1298,18 +1322,28 @@ pub fn build_aprs_mice_with_message_packet(
         lon_min_int
     };
 
-    // Speed/course encoding per APRS101.
+    // Speed/course encoding per APRS 1.0.1 §10 p.52.
     // SP = speed / 10, remainder from DC.
     // DC = (speed % 10) * 10 + course / 100
     // SE = course % 100
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "speed_knots is u16, speed_knots / 10 fits u8 for typical APRS speeds"
-    )]
+    //
+    // Clamp to the spec-legal ranges *before* the arithmetic: speed
+    // 0..=799 knots and course 0..=360°. The decode side adjusts "if
+    // speed >= 800 subtract 800" / "if course >= 400 subtract 400", so
+    // these are the maximum representable values. Without the clamp an
+    // out-of-range speed (e.g. 2280 kt → SP = 228, byte 228 + 28 = 256)
+    // overflows the `+ 28` wire offset — a debug panic under
+    // overflow-checks and an undecodable byte > 127 in release. This
+    // mirrors the longitude-hundredths `.min(99)` clamp above.
+    let speed_knots = speed_knots.min(799);
+    let course_deg = course_deg.min(360);
+    // After the clamp, `speed_knots / 10` is in 0..=79 and fits u8
+    // without truncation, so no cast suppression is needed here.
     let sp = (speed_knots / 10) as u8;
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "combined value stays in u8 range for valid APRS inputs"
+        reason = "speed_knots % 10 is 0..=9 and course_deg / 100 is 0..=3 (course clamped to 360), \
+                  so the combined value is in 0..=93 and fits u8"
     )]
     let dc = ((speed_knots % 10) * 10 + course_deg / 100) as u8;
     // course_deg % 100 is in 0..100 so truncating to u8 is safe.
@@ -1754,6 +1788,35 @@ mod tests {
         assert!(s.starts_with("072"), "zero-padded 72-degree prefix");
     }
 
+    #[test]
+    fn format_latitude_normal_value_exact() {
+        // Spec worked example: 49.058333° → 4903.50N.
+        let s = format_aprs_latitude(49.058_333);
+        assert_eq!(s, "4903.50N", "expected 4903.50N, got {s}");
+    }
+
+    #[test]
+    fn format_latitude_carry_boundary_no_60_minutes() {
+        // 33.999999° must carry to 3400.00N, never the malformed
+        // 3360.00N (minutes rounding to 60.00 with no carry).
+        let s = format_aprs_latitude(33.999_999);
+        assert_eq!(s, "3400.00N", "expected carry to 3400.00N, got {s}");
+        // 89.999999° must carry to the pole.
+        let s = format_aprs_latitude(89.999_999);
+        assert_eq!(s, "9000.00N", "expected carry to 9000.00N, got {s}");
+    }
+
+    #[test]
+    fn format_longitude_carry_boundary_no_60_minutes() {
+        // 97.999983° must carry to 09800.00, never the malformed
+        // 09760.00.
+        let s = format_aprs_longitude(97.999_983);
+        assert_eq!(s, "09800.00E", "expected carry to 09800.00E, got {s}");
+        // 179.999999° must carry to the date line.
+        let s = format_aprs_longitude(179.999_999);
+        assert_eq!(s, "18000.00E", "expected carry to 18000.00E, got {s}");
+    }
+
     // ---- build_aprs_position_report ----
 
     #[test]
@@ -2125,6 +2188,103 @@ mod tests {
         assert_eq!(weather.temperature, Some(72));
         assert_eq!(weather.humidity, Some(55));
         assert_eq!(weather.pressure, Some(10135));
+        Ok(())
+    }
+
+    #[test]
+    fn build_weather_clamps_overflowing_fields() -> TestResult {
+        // Regression guard (APRS 1.0.1 §12 p.64): out-of-range weather
+        // values must clamp to their spec field width before formatting.
+        // Pre-fix, temperature=-100 emitted "t-100" (4 chars, overflows
+        // the 3-digit field) and pressure=100000 emitted "b100000"
+        // (6 chars), causing the crate's own parser to drop every
+        // following field. After the clamp the downstream parse must
+        // recover ALL fields with each within spec width.
+        let source = test_source();
+        let wx = AprsWeather {
+            wind_direction: Some(180),
+            wind_speed: Some(10),
+            wind_gust: Some(25),
+            temperature: Some(-100), // below the -99 spec floor
+            rain_1h: Some(5),
+            rain_24h: Some(50),
+            rain_since_midnight: Some(20),
+            humidity: Some(55),
+            pressure: Some(100_000), // above the 5-digit field max
+        };
+
+        let wire = build_aprs_weather(&source, &wx, &default_digipeater_path());
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+
+        // Inspect the raw info field: temperature must be exactly "t-99"
+        // (sign + 2 digits) and pressure exactly "b99999" (5 digits).
+        let info = std::str::from_utf8(&packet.info)?;
+        assert!(
+            info.contains("t-99"),
+            "temperature must clamp to -99: {info}"
+        );
+        assert!(
+            info.contains("b99999"),
+            "pressure must clamp to 5-digit 99999: {info}",
+        );
+
+        // Every field must still round-trip — nothing dropped.
+        let parsed = parse_aprs_weather_positionless(&packet.info)?;
+        assert_eq!(parsed.wind_direction, Some(180));
+        assert_eq!(parsed.wind_speed, Some(10));
+        assert_eq!(parsed.wind_gust, Some(25));
+        assert_eq!(parsed.temperature, Some(-99), "temp clamped to -99");
+        assert_eq!(parsed.rain_1h, Some(5));
+        assert_eq!(parsed.rain_24h, Some(50));
+        assert_eq!(parsed.rain_since_midnight, Some(20));
+        assert_eq!(parsed.humidity, Some(55));
+        assert_eq!(parsed.pressure, Some(99_999), "pressure clamped to 99999");
+        Ok(())
+    }
+
+    #[test]
+    fn build_weather_humidity_zero_does_not_become_100() -> TestResult {
+        // Regression guard (BUG 4): humidity Some(0) must NOT round-trip
+        // to 100. Pre-fix the builder emitted 0 verbatim ("h00") and the
+        // parser maps "00" → 100. Clamping to the 1..=100 spec range maps
+        // 0 → 1 → "h01" → parses back to 1.
+        let source = test_source();
+        let wx = AprsWeather {
+            humidity: Some(0),
+            ..AprsWeather::default()
+        };
+        let wire = build_aprs_weather(&source, &wx, &default_digipeater_path());
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+        let parsed = parse_aprs_weather_positionless(&packet.info)?;
+        assert_eq!(
+            parsed.humidity,
+            Some(1),
+            "humidity 0 must clamp to 1, not round-trip to 100",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_weather_humidity_over_100_clamps() -> TestResult {
+        // Humidity Some(150) must clamp to 100 (encoded "h00", which the
+        // parser maps back to 100) rather than emitting a 3-digit field.
+        let source = test_source();
+        let wx = AprsWeather {
+            humidity: Some(150),
+            ..AprsWeather::default()
+        };
+        let wire = build_aprs_weather(&source, &wx, &default_digipeater_path());
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+        let info = std::str::from_utf8(&packet.info)?;
+        assert!(
+            info.contains("h00"),
+            "humidity 150 must clamp to 100 → h00: {info}"
+        );
+        let parsed = parse_aprs_weather_positionless(&packet.info)?;
+        assert_eq!(parsed.humidity, Some(100), "humidity clamps to 100");
         Ok(())
     }
 
@@ -2602,6 +2762,74 @@ mod tests {
             &default_digipeater_path(),
         );
 
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+        let pos = parse_mice_position(&packet.destination.callsign, &packet.info)?;
+        assert_eq!(pos.speed_knots, Some(55));
+        assert_eq!(pos.course_degrees, Some(270));
+        Ok(())
+    }
+
+    #[test]
+    fn build_mice_speed_course_clamped_no_overflow() -> TestResult {
+        // Regression guard (APRS 1.0.1 §10 p.52): speed > 799 kt and
+        // course > 360° must clamp before the SP/DC/SE arithmetic.
+        // Pre-fix, speed_knots=2280 computed SP=228, 228 + 28 = 256
+        // which panics under debug overflow-checks (and emits an
+        // undecodable byte > 127 in release). The build must not panic
+        // and every Mic-E info byte must land in the legal 28..=127.
+        let source = test_source();
+        let wire = build_aprs_mice(
+            &source,
+            35.0,
+            -97.0,
+            2280, // out-of-range high speed
+            720,  // out-of-range high course
+            '/',
+            '>',
+            "",
+            &default_digipeater_path(),
+        );
+        let kiss = decode_kiss_frame(&wire)?;
+        let packet = parse_ax25(&kiss.data)?;
+        // info[1..7] are the d/m/hundredths/SP/DC/SE Mic-E bytes.
+        for (idx, byte) in packet
+            .info
+            .get(1..7)
+            .ok_or("info too short")?
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                (28..=127).contains(byte),
+                "info[{}] = {byte} outside Mic-E range 28..=127 after clamp",
+                idx + 1,
+            );
+        }
+        // The clamped speed (799) and course (360) should decode back to
+        // their saturated values.
+        let pos = parse_mice_position(&packet.destination.callsign, &packet.info)?;
+        assert_eq!(pos.speed_knots, Some(799), "speed should clamp to 799");
+        assert_eq!(pos.course_degrees, Some(360), "course should clamp to 360");
+        Ok(())
+    }
+
+    #[test]
+    fn build_mice_normal_speed_course_unaffected_by_clamp() -> TestResult {
+        // A normal in-range speed/course must still encode losslessly
+        // after adding the clamp.
+        let source = test_source();
+        let wire = build_aprs_mice(
+            &source,
+            35.0,
+            -97.0,
+            55,
+            270,
+            '/',
+            '>',
+            "",
+            &default_digipeater_path(),
+        );
         let kiss = decode_kiss_frame(&wire)?;
         let packet = parse_ax25(&kiss.data)?;
         let pos = parse_mice_position(&packet.destination.callsign, &packet.info)?;

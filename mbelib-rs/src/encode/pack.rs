@@ -66,11 +66,12 @@ pub fn pack_frame(ambe_fr: &[u8; AMBE_FRAME_BITS]) -> [u8; 9] {
     let mut working = *ambe_fr;
     demodulate_c1(&mut working);
 
-    // Step 2: pack 72 codeword bits back into 9 bytes, MSB-first.
+    // Step 2: pack 72 codeword bits back into 9 bytes, LSB-first —
+    // the DVSI wire convention (first transmitted bit is bit 0 of
+    // byte 0; see `unpack_frame` for the verification history).
     // Iterate over every `ambe_fr` position paired with its
     // wire-order input-bit index from `INVERSE`. That bit lands at
-    // byte `input_bit / 8`, bit position `7 - (input_bit % 8)`
-    // (MSB-first within each byte).
+    // byte `input_bit / 8`, bit position `input_bit % 8`.
     let mut out = [0u8; 9];
     for (&bit_val, &input_bit_u8) in working.iter().zip(INVERSE.iter()) {
         if bit_val == 0 {
@@ -78,7 +79,7 @@ pub fn pack_frame(ambe_fr: &[u8; AMBE_FRAME_BITS]) -> [u8; 9] {
         }
         let input_bit = input_bit_u8 as usize;
         let byte_idx = input_bit / 8;
-        let bit_pos = 7 - (input_bit % 8);
+        let bit_pos = input_bit % 8;
         if let Some(b) = out.get_mut(byte_idx) {
             *b |= 1 << bit_pos;
         }

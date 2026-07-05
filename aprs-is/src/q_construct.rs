@@ -14,13 +14,16 @@
 //!   that simply appends `,qXX,GATE` to a path. Suitable when the
 //!   caller has already computed the correct construct and gate
 //!   callsign; not a full `IGate`.
-//! - [`igate_format_for_is`] — a *strict* `IGate` path rewriter that
-//!   implements the full <http://www.aprs-is.net/q.aspx> algorithm:
-//!   refuses to gate when the sender opted out, strips the
-//!   has-been-repeated (`*`) markers from the RF path, drops
-//!   un-used digipeater slots, picks `qAR` or `qAr` based on the
-//!   `IGate`'s verification status, and appends the `IGate` callsign as
-//!   the new path tail.
+//! - [`igate_format_for_is`] — a *strict*, append-only `IGate` path
+//!   rewriter that implements the <http://www.aprs-is.net/q.aspx> and
+//!   <http://www.aprs-is.net/IGating.aspx> algorithm: refuses to gate
+//!   when the sender opted out, then gates the heard path **verbatim**
+//!   (every hop preserved, including its has-been-repeated `*` marker)
+//!   and appends exactly `,<qconstruct>,<IGATECALL>` to the end. The
+//!   q-construct is `qAR` for a verified login and `qAO` for a
+//!   receive-only login. IGating.aspx is explicit: "No modification of
+//!   the TNC2 format line should be made except to add ,qAR,IGATECALL
+//!   to the end of the path."
 //!
 //! Earlier versions of this crate advertised "`IGate` path rewriting"
 //! while shipping only the naive append helper. The strict rewriter
@@ -213,24 +216,31 @@ impl std::fmt::Display for IGateError {
 impl std::error::Error for IGateError {}
 
 /// Pick the Q-construct to insert when gating an RF-heard packet into
-/// APRS-IS, per <http://www.aprs-is.net/q.aspx>.
+/// APRS-IS, per the "Client Generated" table at
+/// <http://www.aprs-is.net/q.aspx>.
 ///
 /// The choice depends solely on the `IGate`'s login state:
 ///
 /// - A verified login (real callsign + valid passcode) uses
-///   [`QConstruct::QAR`].
-/// - An unverified login (receive-only or wrong passcode) uses
-///   [`QConstruct::QAr`].
+///   [`QConstruct::QAR`] — q.aspx: "qAR - Gated packet from RF. Packet
+///   is placed on APRS-IS by an `IGate` from RF."
+/// - A receive-only login uses [`QConstruct::QAO`] (capital letter O) —
+///   q.aspx: "qAO - (letter O) Gated packet from RF without messaging…
+///   Receive-only `IGates` will use this exclusively for all packets
+///   gated to APRS-IS."
 ///
-/// The spec defines additional q-constructs for server-side traffic
-/// (`qAS`, `qAo`, `qAO`, `qAZ`) and for client-originated packets
-/// (`qAC`, `qAX`, `qAU`); those are not selectable for an `IGate`
-/// rewriting RF-to-IS traffic and are therefore not enumerated here.
+/// Note: `qAr` (lowercase r) and `qAo` (lowercase o) are *server-side*
+/// constructs for packets that arrived **indirectly** via the legacy
+/// `,I` path from a remote `IGate` (q.aspx "Server Generated" table) —
+/// they are never inserted by the `IGate` that heard the packet on RF,
+/// so they are not selectable here. The other constructs (`qAS`,
+/// `qAC`, `qAX`, `qAU`, `qAZ`, `qAI`) are likewise not applicable to an
+/// `IGate` placing RF traffic onto APRS-IS.
 #[must_use]
 const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
     match passcode {
         Passcode::Verified(_) => QConstruct::QAR,
-        Passcode::ReceiveOnly => QConstruct::QAr,
+        Passcode::ReceiveOnly => QConstruct::QAO,
     }
 }
 
@@ -251,20 +261,19 @@ const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
 ///      ([`IGateError::PathAlreadyGated`]),
 ///    - `rf_path` contains the `IGate`'s own callsign
 ///      ([`IGateError::LoopDetected`]).
-/// 2. **Build the rewritten path**:
-///    - Drop digipeater entries that have not been used
-///      (`has_repeated == false`). Per the spec, only the
-///      digipeaters that actually retransmitted the packet belong on
-///      the IS-side path; an unused slot would mislead receivers about
-///      the propagation history.
-///    - Drop any existing q-construct (the `IGate` is the authority for
-///      this packet's q-construct).
-///    - Strip trailing `*` (has-been-repeated marker) from each
-///      retained element; that marker is RF-only and is omitted on the
-///      IS side.
+/// 2. **Gate the heard path verbatim.** Every hop in `rf_path` is
+///    preserved exactly as heard, **including its trailing `*`
+///    has-been-repeated marker**. IGating.aspx is explicit: "No
+///    modification of the TNC2 format line should be made except to add
+///    ,qAR,IGATECALL to the end of the path." q.aspx's RF-gating
+///    example confirms the marker survives — `AE5PL>APRS,WIDE1*` gates
+///    to `AE5PL>APRS,WIDE1*,qAR,AE5PL-10`. Unused hops are **not**
+///    dropped and `*` is **not** stripped; doing either would mislead
+///    receivers about the propagation history and violate the
+///    append-only rule.
 /// 3. **Append the q-construct + `IGate` callsign** at the end. The
 ///    construct is [`QConstruct::QAR`] for a verified login,
-///    [`QConstruct::QAr`] for receive-only.
+///    [`QConstruct::QAO`] (letter O) for a receive-only login.
 /// 4. **Serialise** as a CRLF-terminated TNC2 line via the existing
 ///    [`crate::format_is_packet`] helper.
 ///
@@ -273,15 +282,14 @@ const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
 /// - `source`: AX.25 source address of the RF packet.
 /// - `destination`: AX.25 destination address (typically an `APxxxx`
 ///   tocall).
-/// - `rf_path`: Digipeater path slots from the RF frame. The
-///   has-been-repeated bit on each entry determines whether it
-///   survives into the IS-side path.
+/// - `rf_path`: Digipeater path slots from the RF frame. Each slot is
+///   gated verbatim, preserving its has-been-repeated `*` marker.
 /// - `info`: Packet info field bytes. Decoded losslessly for the
 ///   data portion of the IS line; non-UTF-8 bytes become U+FFFD.
 /// - `igate`: This `IGate`'s callsign + SSID, as appears on the wire
 ///   after the q-construct.
 /// - `passcode`: The `IGate`'s login state. Verified → `qAR`,
-///   receive-only → `qAr`.
+///   receive-only → `qAO` (letter O).
 ///
 /// # Errors
 ///
@@ -308,9 +316,11 @@ const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
 ///     b"!4903.50N/07201.75W-",
 ///     &igate, pass,
 /// ).unwrap();
+/// // The heard `WIDE1-1*` is preserved verbatim (marker and all);
+/// // only `,qAR,N0CALL-7` is appended.
 /// assert_eq!(
 ///     line,
-///     "W1AW>APK005,WIDE1-1,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n",
+///     "W1AW>APK005,WIDE1-1*,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n",
 /// );
 /// ```
 ///
@@ -351,27 +361,22 @@ pub fn igate_format_for_is(
         }
     }
 
-    // Build the rewritten path:
-    // - Keep only entries whose H-bit (has_repeated) is set,
-    // - Skip any existing q-construct (we replace it),
-    // - Strip the leading callsign-string formatting (already
-    //   `Ax25Address::Display` impl: "CALL[-SSID]", no `*`).
-    let mut path_parts: Vec<String> = Vec::with_capacity(rf_path.len());
-    for entry in rf_path {
-        if !entry.has_repeated {
-            continue;
-        }
-        let entry_str = entry.address.to_string();
-        if QConstruct::from_path_element(&entry_str).is_some() {
-            // An existing q-construct on the wire must be dropped
-            // before our IGate-authoritative one is appended.
-            continue;
-        }
-        path_parts.push(entry_str);
-    }
-
-    // Append q-construct + IGate callsign per IGating.aspx.
+    // Gate the heard path verbatim, then append the q-construct +
+    // IGate callsign. IGating.aspx: "No modification of the TNC2 format
+    // line should be made except to add ,qAR,IGATECALL to the end of
+    // the path." Each hop is serialised via `RouteEntry::Display`,
+    // which preserves the trailing `*` has-been-repeated marker (the
+    // q.aspx example keeps `WIDE1*`). Unused hops are *not* dropped and
+    // `*` is *not* stripped. A real RF AX.25 frame never carries a
+    // q-construct on the wire (q-constructs only exist on APRS-IS), and
+    // `RouteEntry` callsigns are validated uppercase alphanumerics, so
+    // `qAR`/`qAr`/… can never appear as a heard hop — no q-construct
+    // filtering is needed here.
     let qconstruct = qconstruct_for_igate(passcode);
+    let mut path_parts: Vec<String> = Vec::with_capacity(rf_path.len() + 2);
+    for entry in rf_path {
+        path_parts.push(entry.to_string());
+    }
     path_parts.push(qconstruct.as_str().to_owned());
     path_parts.push(igate.to_string());
 
@@ -420,9 +425,9 @@ pub fn igate_format_packet_for_is(
 ///
 /// Exposed for callers that want to log or inspect the path before
 /// serialising. The returned vector contains everything between the
-/// `>DEST` and the `:` colon in the IS line: digipeaters that
-/// retransmitted the packet (without `*`), the q-construct, and the
-/// `IGate` callsign.
+/// `>DEST` and the `:` colon in the IS line: the heard digipeater
+/// path verbatim (each hop keeping its `*` has-been-repeated marker),
+/// followed by the q-construct and the `IGate` callsign.
 ///
 /// # Errors
 ///
@@ -452,18 +457,14 @@ pub fn igate_rewritten_path(
         }
     }
 
-    let mut path_parts: Vec<String> = Vec::with_capacity(rf_path.len());
-    for entry in rf_path {
-        if !entry.has_repeated {
-            continue;
-        }
-        let entry_str = entry.address.to_string();
-        if QConstruct::from_path_element(&entry_str).is_some() {
-            continue;
-        }
-        path_parts.push(entry_str);
-    }
+    // Append-only: gate the heard path verbatim (preserving each `*`),
+    // then add the q-construct + IGate callsign. See
+    // `igate_format_for_is` for the IGating.aspx / q.aspx rationale.
     let qconstruct = qconstruct_for_igate(passcode);
+    let mut path_parts: Vec<String> = Vec::with_capacity(rf_path.len() + 2);
+    for entry in rf_path {
+        path_parts.push(entry.to_string());
+    }
     path_parts.push(qconstruct.as_str().to_owned());
     path_parts.push(igate.to_string());
     Ok(path_parts)
@@ -549,6 +550,8 @@ mod tests {
 
     #[test]
     fn igate_format_verified_appends_qar() -> TestResult {
+        // A heard (H-bit set) hop is gated verbatim with its `*`
+        // marker; only `,qAR,N0CALL-7` is appended.
         let src = addr("W1AW", 0);
         let dst = addr("APK005", 0);
         let path = vec![used_digi("WIDE1", 1)];
@@ -558,14 +561,15 @@ mod tests {
         let line = igate_format_for_is(&src, &dst, &path, b"!4903.50N/07201.75W-", &igate, pass)?;
         assert_eq!(
             line,
-            "W1AW>APK005,WIDE1-1,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n"
+            "W1AW>APK005,WIDE1-1*,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n"
         );
         Ok(())
     }
 
     #[test]
-    fn igate_format_unverified_appends_qar_lowercase() -> TestResult {
-        // Receive-only login uses the lowercase `qAr` per q.aspx.
+    fn igate_format_receive_only_appends_qao() -> TestResult {
+        // q.aspx: "Receive-only IGates will use [qAO] exclusively for
+        // all packets gated to APRS-IS." Capital letter O, not qAr.
         let src = addr("W1AW", 0);
         let dst = addr("APK005", 0);
         let path = vec![used_digi("WIDE1", 1)];
@@ -575,15 +579,44 @@ mod tests {
         let line = igate_format_for_is(&src, &dst, &path, b"!4903.50N/07201.75W-", &igate, pass)?;
         assert_eq!(
             line,
-            "W1AW>APK005,WIDE1-1,qAr,N0CALL-7:!4903.50N/07201.75W-\r\n"
+            "W1AW>APK005,WIDE1-1*,qAO,N0CALL-7:!4903.50N/07201.75W-\r\n"
+        );
+        // Guard against the qAO/qAr and qAO/qAo confusions.
+        assert!(line.contains(",qAO,"), "expected capital-O qAO: {line}");
+        assert!(!line.contains(",qAr,"), "must not emit server qAr: {line}");
+        assert!(!line.contains(",qAo,"), "must not emit server qAo: {line}");
+        Ok(())
+    }
+
+    #[test]
+    fn igate_format_preserves_heard_path_verbatim() -> TestResult {
+        // IGating.aspx: append-only. The full heard path — including a
+        // *later* unrepeated hop — is preserved verbatim, with the
+        // has-been-repeated `*` on the hops that carry it. Only
+        // `,qAR,N0CALL-7` is appended.
+        let src = addr("W1AW", 0);
+        let dst = addr("APK005", 0);
+        let path = vec![
+            used_digi("WIDE1", 1),
+            used_digi("WIDE2", 2),
+            unused_digi("WIDE3", 3),
+        ];
+        let igate = addr("N0CALL", 7);
+        let pass = Passcode::Verified(12_345);
+
+        let line = igate_format_for_is(&src, &dst, &path, b"!data", &igate, pass)?;
+        assert_eq!(
+            line,
+            "W1AW>APK005,WIDE1-1*,WIDE2-2*,WIDE3-3,qAR,N0CALL-7:!data\r\n"
         );
         Ok(())
     }
 
     #[test]
-    fn igate_format_drops_unused_digipeaters() -> TestResult {
-        // Per q.aspx, only digipeaters that actually retransmitted the
-        // packet (H-bit set) survive into the IS-side path.
+    fn igate_format_preserves_unused_digipeaters() -> TestResult {
+        // Append-only gating keeps every heard hop, even ones whose
+        // H-bit is clear — the older "drop unused slots" behavior
+        // violated IGating.aspx and is gone.
         let src = addr("W1AW", 0);
         let dst = addr("APK005", 0);
         let path = vec![used_digi("WIDE1", 1), unused_digi("WIDE2", 1)];
@@ -591,38 +624,28 @@ mod tests {
         let pass = Passcode::Verified(12_345);
 
         let line = igate_format_for_is(&src, &dst, &path, b"test", &igate, pass)?;
+        // Heard hop keeps `*`; unrepeated hop is kept without `*`.
         assert!(
-            line.contains(",WIDE1-1,qAR,"),
-            "WIDE1-1 should survive: {line}"
-        );
-        assert!(
-            !line.contains("WIDE2"),
-            "unused WIDE2 should be stripped: {line}"
+            line.contains(",WIDE1-1*,WIDE2-1,qAR,"),
+            "full heard path should be preserved: {line}"
         );
         Ok(())
     }
 
     #[test]
-    fn igate_format_drops_existing_q_construct() -> TestResult {
-        // If an upstream packet already carries a q-construct (e.g. an
-        // IS-to-IS forward), the IGate must replace it with its own.
+    fn igate_format_emits_single_qconstruct() -> TestResult {
+        // A heard RF frame can never carry a q-construct: q-constructs
+        // only exist on APRS-IS (q.aspx), and `RouteEntry` callsigns are
+        // validated uppercase ASCII alphanumerics, so `qAR`/`qAS`/… can
+        // never appear as a heard hop. The only q-construct in the
+        // output is therefore the IGate-authoritative one, exactly once.
         let src = addr("W1AW", 0);
         let dst = addr("APK005", 0);
-        // Synthesise a path with an upstream qAS marker. RouteEntry
-        // requires uppercase ASCII alphanumeric for the callsign field,
-        // and `qAS` doesn't satisfy that — but on the wire it always
-        // appears as a path *element* after a comma split, not as a
-        // proper digipeater address. The rewriter therefore never sees
-        // a q-construct as a RouteEntry; we test the path-string
-        // detection separately at `qconstruct_round_trip` /
-        // `qconstruct_from_path_element_strips_star`. Here we verify
-        // that a plain used digipeater survives.
         let path = vec![used_digi("WIDE1", 1)];
         let igate = addr("N0CALL", 7);
         let pass = Passcode::Verified(12_345);
 
         let line = igate_format_for_is(&src, &dst, &path, b"test", &igate, pass)?;
-        // The IGate's qAR appears exactly once.
         assert_eq!(line.matches(",qAR,").count(), 1, "exactly one qAR: {line}");
         Ok(())
     }
@@ -766,13 +789,28 @@ mod tests {
 
     #[test]
     fn igate_rewritten_path_returns_components() -> TestResult {
+        // Append-only: the heard path is preserved verbatim (with `*`
+        // on the heard hop and the unrepeated hop kept), then the
+        // q-construct and IGate callsign follow.
         let src = addr("W1AW", 0);
         let path = vec![used_digi("WIDE1", 1), unused_digi("WIDE2", 1)];
         let igate = addr("N0CALL", 7);
         let pass = Passcode::Verified(12_345);
 
         let parts = igate_rewritten_path(&src, &path, b"test", &igate, pass)?;
-        assert_eq!(parts, vec!["WIDE1-1", "qAR", "N0CALL-7"]);
+        assert_eq!(parts, vec!["WIDE1-1*", "WIDE2-1", "qAR", "N0CALL-7"]);
+        Ok(())
+    }
+
+    #[test]
+    fn igate_rewritten_path_receive_only_uses_qao() -> TestResult {
+        let src = addr("W1AW", 0);
+        let path = vec![used_digi("WIDE1", 1)];
+        let igate = addr("N0CALL", 7);
+        let pass = Passcode::ReceiveOnly;
+
+        let parts = igate_rewritten_path(&src, &path, b"test", &igate, pass)?;
+        assert_eq!(parts, vec!["WIDE1-1*", "qAO", "N0CALL-7"]);
         Ok(())
     }
 }

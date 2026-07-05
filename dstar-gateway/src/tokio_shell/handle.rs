@@ -2,13 +2,14 @@
 
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Instant;
 
 use dstar_gateway_core::header::DStarHeader;
 use dstar_gateway_core::session::client::{Connected, Event, Protocol, Session};
 use dstar_gateway_core::types::StreamId;
 use dstar_gateway_core::voice::VoiceFrame;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::{Command, SessionLoop, ShellError};
 
@@ -44,6 +45,9 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 pub struct AsyncSession<P: Protocol> {
     pub(crate) command_tx: mpsc::Sender<Command>,
     pub(crate) event_rx: mpsc::Receiver<Event<P>>,
+    /// Instant of the most recent datagram from the peer, published
+    /// by the session loop. Cloned out via [`Self::activity`].
+    pub(crate) activity_rx: watch::Receiver<Instant>,
     pub(crate) _protocol: PhantomData<P>,
 }
 
@@ -82,12 +86,14 @@ impl<P: Protocol> AsyncSession<P> {
     {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (activity_tx, activity_rx) = watch::channel(Instant::now());
 
         let inner_loop = SessionLoop {
             session,
             socket,
             event_tx,
             command_rx,
+            activity_tx,
         };
 
         drop(tokio::spawn(async move {
@@ -100,8 +106,21 @@ impl<P: Protocol> AsyncSession<P> {
         Self {
             command_tx,
             event_rx,
+            activity_rx,
             _protocol: PhantomData,
         }
+    }
+
+    /// Watch channel holding the instant the most recent datagram
+    /// arrived from the peer (keepalives included). Borrow the
+    /// receiver and compare against `Instant::now()` to compute the
+    /// link-inactivity age for health displays.
+    ///
+    /// The initial value is the spawn instant, so the age is well
+    /// defined before the first datagram arrives.
+    #[must_use]
+    pub fn activity(&self) -> watch::Receiver<Instant> {
+        self.activity_rx.clone()
     }
 
     /// Pull the next event from the inbound stream.

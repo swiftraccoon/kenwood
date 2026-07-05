@@ -285,3 +285,99 @@ fn frame_repeat_after_errors() {
         );
     }
 }
+
+/// Largest absolute sample in a decoded frame.
+fn frame_peak(pcm: &[i16]) -> i32 {
+    pcm.iter().map(|&s| i32::from(s).abs()).max().unwrap_or(0)
+}
+
+/// Concealment on a fresh decoder repeats the initial silence
+/// parameters — the output must be near-silent, not garbage.
+#[test]
+fn conceal_on_fresh_decoder_is_near_silence() {
+    let mut dec = AmbeDecoder::new();
+    let pcm = dec.conceal_frame();
+    let peak = frame_peak(&pcm);
+    assert!(
+        peak < 1000,
+        "fresh-decoder concealment should be near-silent, peak={peak}"
+    );
+}
+
+/// Concealment after decoded audio repeats the previous frame's
+/// parameters — output stays in the same amplitude regime as the
+/// stream it patches, with no energy blow-up.
+#[test]
+fn conceal_after_voice_is_bounded_repeat() {
+    let mut dec = AmbeDecoder::new();
+    let mut decoded_peak = 0_i32;
+    for _ in 0..5 {
+        let pcm = dec.decode_frame(&AMBE_SILENCE);
+        decoded_peak = decoded_peak.max(frame_peak(&pcm));
+    }
+    let concealed_peak = frame_peak(&dec.conceal_frame());
+    assert!(
+        concealed_peak <= decoded_peak.saturating_mul(4).saturating_add(1000),
+        "concealment must not exceed the stream's regime: \
+         concealed={concealed_peak} decoded={decoded_peak}"
+    );
+}
+
+/// A genuine TH-D75 tone-frame capture must synthesize an audible
+/// tone, not silence.
+///
+/// DVSI hardware encoders emit AMBE tone frames (b0 = 126/127) for
+/// any pure-tone input — a 440 Hz test tone into a TH-D75 mic
+/// produced this frame (tone index 14 = 437.5 Hz) on nearly every
+/// frame of the capture. A decoder that mutes tone frames fails
+/// legitimate hardware traffic.
+#[test]
+fn dvsi_tone_frame_synthesizes_the_tone() {
+    // Steady-state frame from a 2026-07-05 TH-D75 wire capture
+    // (LSB-first byte order, zero FEC corrections).
+    const TONE_FRAME: [u8; 9] = [0xD2, 0x4B, 0x28, 0xB2, 0x57, 0x44, 0xE4, 0x08, 0x1C];
+    let mut dec = AmbeDecoder::new();
+    // Two consecutive frames — the sine must be phase-continuous
+    // across the boundary (a discontinuity would distort the
+    // zero-crossing count).
+    let mut pcm = Vec::new();
+    for _ in 0..2 {
+        pcm.extend_from_slice(&dec.decode_frame(&TONE_FRAME));
+    }
+    let peak = frame_peak(&pcm);
+    let mut crossings = 0u32;
+    for pair in pcm.windows(2) {
+        if let [a, b] = pair
+            && (*a > 0) != (*b > 0)
+        {
+            crossings += 1;
+        }
+    }
+    // 437.5 Hz over 320 samples at 8 kHz = 17.5 cycles ≈ 35 sign
+    // changes; allow slack for the first partial cycle.
+    assert!(
+        (30..=40).contains(&crossings),
+        "expected ~35 zero crossings for a 437.5 Hz tone, got {crossings}"
+    );
+    assert!(peak > 3000, "tone should be audible, peak={peak}");
+}
+
+/// Sustained concealment crosses the repeat-count muting threshold
+/// and degrades to bounded comfort noise — it must never accumulate
+/// energy across consecutive concealed frames.
+#[test]
+fn sustained_conceal_stays_bounded() {
+    let mut dec = AmbeDecoder::new();
+    for _ in 0..5 {
+        let _pcm = dec.decode_frame(&AMBE_SILENCE);
+    }
+    let mut peaks = Vec::new();
+    for _ in 0..10 {
+        peaks.push(frame_peak(&dec.conceal_frame()));
+    }
+    let max_peak = peaks.iter().copied().max().unwrap_or(0);
+    assert!(
+        max_peak < 8000,
+        "sustained concealment must stay bounded, peaks={peaks:?}"
+    );
+}

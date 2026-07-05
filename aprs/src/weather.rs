@@ -45,6 +45,7 @@ pub struct AprsWeather {
 ///
 /// Returns `None` if the symbol is not `_` or the comment does not start
 /// with a valid `DDD/SSS` extension.
+#[must_use]
 pub fn extract_position_weather(symbol_code: char, comment: &str) -> Option<AprsWeather> {
     if symbol_code != '_' {
         return None;
@@ -54,17 +55,23 @@ pub fn extract_position_weather(symbol_code: char, comment: &str) -> Option<Aprs
     if header.get(3) != Some(&b'/') {
         return None;
     }
+    // Per APRS 1.0.1 §12.2 (p.64), wind direction/speed may be reported
+    // as dots or spaces when the station has no wind sensor (spec example
+    // `_10090556c...s...g...t...P012Jim`). A `.`/space placeholder in the
+    // `DDD/SSS` extension means "no data" for that field, NOT a malformed
+    // report — the remaining weather fields (gust/temp/humidity/pressure)
+    // must still be parsed. `parse_weather_value` maps an all-dots/spaces
+    // run to `None`; any other non-digit content is genuinely invalid and
+    // aborts the whole parse (a position-with-`_`-symbol comment whose
+    // first 7 bytes are not a `DDD/SSS` extension is not a weather report).
     let dir_bytes = header.get(..3)?;
     let spd_bytes = header.get(4..7)?;
-    if !dir_bytes.iter().all(u8::is_ascii_digit) || !spd_bytes.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let wind_dir: u16 = comment.get(..3)?.parse().ok()?;
-    let wind_spd: u16 = comment.get(4..7)?.parse().ok()?;
+    let wind_dir = parse_wind_field(dir_bytes)?.into_option();
+    let wind_spd = parse_wind_field(spd_bytes)?.into_option();
     let tail = bytes.get(7..)?;
     let mut wx = parse_weather_fields(tail);
-    wx.wind_direction = Some(wind_dir);
-    wx.wind_speed = Some(wind_spd);
+    wx.wind_direction = wind_dir;
+    wx.wind_speed = wind_spd;
     Some(wx)
 }
 
@@ -175,6 +182,53 @@ fn parse_weather_value(bytes: &[u8]) -> Option<i32> {
     s.trim().parse().ok()
 }
 
+/// A `DDD` / `SSS` wind-direction / wind-speed field, classified into the
+/// two non-error outcomes the spec permits.
+///
+/// The error case (the bytes are neither a number nor a dots/spaces
+/// placeholder, so the comment is not a `DDD/SSS` extension at all) is
+/// modelled by the surrounding [`Option`] from [`parse_wind_field`], so
+/// the caller can use `?` to abort the whole parse.
+enum WindField {
+    /// All ASCII digits, parsed and range-checked to a `u16` degree/mph
+    /// value.
+    Value(u16),
+    /// All dots or spaces — the spec "no data" sentinel (APRS 1.0.1 §12.2
+    /// p.64). The field is unknown but the surrounding report is valid and
+    /// the remaining weather fields must still be parsed.
+    Unknown,
+}
+
+impl WindField {
+    /// Map to the `Option<u16>` representation used by [`AprsWeather`]'s
+    /// wind fields (`None` for the spec "no data" sentinel).
+    const fn into_option(self) -> Option<u16> {
+        match self {
+            Self::Value(v) => Some(v),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// Classify a fixed-width `DDD` / `SSS` extension field.
+///
+/// Returns `None` (so the caller aborts via `?`) when the bytes are
+/// neither all digits nor all dots/spaces — such a prefix is not a
+/// `DDD/SSS` extension and the comment is not a weather report. A digit
+/// run that parses but overflows `u16` (an impossible 4+ digit value in a
+/// 3-byte field, but defended anyway) also yields `None`.
+fn parse_wind_field(bytes: &[u8]) -> Option<WindField> {
+    if bytes.iter().all(u8::is_ascii_digit) {
+        let s = std::str::from_utf8(bytes).ok()?;
+        let raw: i32 = s.parse().ok()?;
+        return Some(WindField::Value(convert_u16(raw)?));
+    }
+    if bytes.iter().all(|&b| b == b'.' || b == b' ') {
+        return Some(WindField::Unknown);
+    }
+    None
+}
+
 /// Lossless widening from `i32` to `u16` for weather values.
 #[expect(
     clippy::cast_possible_truncation,
@@ -282,5 +336,57 @@ mod tests {
         let wx = parse_weather_fields(b"t072 b is not pressure");
         assert_eq!(wx.temperature, Some(72));
         assert_eq!(wx.pressure, None);
+    }
+
+    #[test]
+    fn extract_position_weather_dotted_wind_keeps_other_fields() -> TestResult {
+        // APRS 1.0.1 §12.2 p.64: a station with no wind sensor reports the
+        // `DDD/SSS` extension as dots. The old guard returned None for the
+        // whole report; the fix surfaces wind=None and parses the rest.
+        let wx = extract_position_weather('_', ".../...g005t072h50b10132")
+            .ok_or("dotted wind must still parse as a weather report")?;
+        assert_eq!(wx.wind_direction, None);
+        assert_eq!(wx.wind_speed, None);
+        assert_eq!(wx.wind_gust, Some(5));
+        assert_eq!(wx.temperature, Some(72));
+        assert_eq!(wx.humidity, Some(50));
+        assert_eq!(wx.pressure, Some(10132));
+        Ok(())
+    }
+
+    #[test]
+    fn extract_position_weather_real_wind_still_parses() -> TestResult {
+        // Spec p.65 example `_220/004g005t077...` (digits, not dots): the
+        // populated path must keep working alongside the dotted path.
+        let wx = extract_position_weather('_', "220/004g005t077r000p000P000h50b09900")
+            .ok_or("digit wind must parse")?;
+        assert_eq!(wx.wind_direction, Some(220));
+        assert_eq!(wx.wind_speed, Some(4));
+        assert_eq!(wx.wind_gust, Some(5));
+        assert_eq!(wx.temperature, Some(77));
+        assert_eq!(wx.pressure, Some(9900));
+        Ok(())
+    }
+
+    #[test]
+    fn extract_position_weather_rejects_non_extension_comment() {
+        // A `_`-symbol comment whose first 7 bytes are neither digits nor
+        // a dots placeholder is not a `DDD/SSS` extension at all.
+        assert_eq!(extract_position_weather('_', "abc/defghi"), None);
+    }
+
+    #[test]
+    fn parse_weather_fully_dotted_spec_example() -> TestResult {
+        // Spec p.64 example `_10090556c...s...g...t...P012Jim`: every
+        // mandatory field is dots except rain-since-midnight. The non-wind
+        // field (P012) must survive; nothing is lost because the wind
+        // fields are unknown.
+        let wx = parse_aprs_weather_positionless(b"_10090556c...s...g...t...P012Jim")?;
+        assert_eq!(wx.wind_direction, None);
+        assert_eq!(wx.wind_speed, None);
+        assert_eq!(wx.wind_gust, None);
+        assert_eq!(wx.temperature, None);
+        assert_eq!(wx.rain_since_midnight, Some(12));
+        Ok(())
     }
 }

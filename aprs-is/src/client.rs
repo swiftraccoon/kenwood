@@ -90,8 +90,122 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// truncation into a visible error.
 pub const MAX_IS_LINE_BYTES: usize = 512;
 
+/// Maximum length, in bytes, of a single inbound line read from the
+/// server before the reader gives up and resynchronises.
+///
+/// The client connects to arbitrary internet servers, so a malicious or
+/// buggy peer can stream bytes without ever sending a `\n`; an unbounded
+/// `read_until(b'\n', ..)` would grow the line buffer until the process
+/// runs out of memory (a denial-of-service). This cap bounds the buffer.
+///
+/// The value is double [`MAX_IS_LINE_BYTES`] (the *outbound* 512-byte
+/// spec limit including `CRLF`). APRS-IS payloads sit well under 512
+/// bytes, but inbound lines can legitimately carry a verbose server
+/// comment or a long path, so the doubled headroom avoids rejecting any
+/// valid line while still capping memory at a fixed, small bound. A line
+/// that reaches this length without a terminating newline yields
+/// [`AprsIsError::ReadLineTooLong`].
+pub const MAX_IS_READ_LINE_BYTES: usize = 1024;
+
 /// Keepalive comment text (sent as `# aprs-is keepalive\r\n`).
 const KEEPALIVE_COMMENT: &str = "# aprs-is keepalive";
+
+/// Read one newline-terminated line from `reader` into `buf`, bounding
+/// the line length at `max` bytes.
+///
+/// On success returns `Ok(n)` where `n` is the number of bytes appended
+/// to `buf` (including the terminating `\n`, if any). `Ok(0)` signals
+/// clean EOF. `buf` is **not** cleared — the caller clears it.
+///
+/// Unlike [`AsyncBufReadExt::read_until`], this caps the amount of data
+/// buffered for a single line: if `max` bytes accumulate without a `\n`,
+/// the function drains and discards the rest of the oversized line up to
+/// (and including) the next newline so the stream stays framed, then
+/// returns [`AprsIsError::ReadLineTooLong`]. This prevents a server that
+/// never sends a newline from growing `buf` without bound.
+async fn read_is_line<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> Result<usize, AprsIsError>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    let mut copied = 0usize;
+    loop {
+        let chunk = reader.fill_buf().await.map_err(AprsIsError::Read)?;
+        if chunk.is_empty() {
+            // EOF. Anything already copied is an unterminated final line;
+            // surface what we have so the caller can parse it (or detect
+            // a clean `Ok(0)` close).
+            return Ok(copied);
+        }
+
+        // Newline found in this chunk: the line ends at `pos`, and this
+        // arm always returns (Ok on accept, Err on over-cap reject).
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            // `pos` is in-bounds, so `get(..=pos)` is `Some`.
+            let upto = chunk
+                .get(..=pos)
+                .unwrap_or_else(|| unreachable!("newline position is within the fill_buf slice"));
+            // Always consume through the newline so the stream stays
+            // framed regardless of whether we accept or reject.
+            let consume_n = pos + 1;
+            let fits = copied.saturating_add(upto.len()) <= max;
+            if fits {
+                buf.extend_from_slice(upto);
+                copied += upto.len();
+            }
+            reader.consume(consume_n);
+            if fits {
+                return Ok(copied);
+            }
+            // Over the cap: the oversized line has now been drained up to
+            // and including its newline, so the next read starts cleanly
+            // on the following line.
+            return Err(AprsIsError::ReadLineTooLong { max });
+        }
+
+        // No newline yet: copy what still fits under the cap, discard the
+        // rest, and keep looping until the newline arrives so a
+        // newline-less flood resynchronises instead of wedging.
+        let remaining = max.saturating_sub(copied);
+        let take = remaining.min(chunk.len());
+        if take > 0 {
+            let head = chunk.get(..take).unwrap_or_else(|| {
+                unreachable!("take is bounded by chunk.len() via the min above")
+            });
+            buf.extend_from_slice(head);
+            copied += take;
+        }
+        let consume_n = chunk.len();
+        reader.consume(consume_n);
+        // `copied` never exceeds `max`; once it reaches `max` we keep
+        // draining subsequent chunks (take == 0) until the newline, then
+        // return ReadLineTooLong above.
+    }
+}
+
+/// `true` if `line` has a `\r` or `\n` anywhere except as a single
+/// trailing line terminator.
+///
+/// APRS-IS frames each line with a trailing `CRLF`; a `\r`/`\n` embedded
+/// in the body would split one write into two lines, the second forged.
+/// Callers pass lines that already carry their own terminator (`\n` or
+/// `\r\n`), so this strips at most one trailing terminator and then
+/// checks the remaining body. Examples:
+/// - `"data\r\n"` → body `"data"` → `false` (allowed).
+/// - `"data\n"` → body `"data"` → `false` (allowed).
+/// - `"data"` → body `"data"` → `false` (allowed, unterminated).
+/// - `"a\r\nN0CALL>X:forged\r\n"` → body `"a\r\nN0CALL>X:forged"`
+///   contains an embedded `\r\n` → `true` (rejected).
+fn line_body_has_embedded_newline(line: &str) -> bool {
+    // Strip a single trailing terminator: an optional `\n`, then an
+    // optional `\r` that immediately preceded it.
+    let body = line.strip_suffix('\n').unwrap_or(line);
+    let body = body.strip_suffix('\r').unwrap_or(body);
+    body.contains('\r') || body.contains('\n')
+}
 
 /// Async TCP client for APRS-IS.
 ///
@@ -152,11 +266,18 @@ impl AprsIsClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AprsIsError::Connect`] if TCP connect fails or times out,
-    /// or [`AprsIsError::Write`] if the login string cannot be sent.
+    /// Returns [`AprsIsError::InvalidLoginField`] if a login field
+    /// (callsign / software name / version / filter) is invalid,
+    /// [`AprsIsError::Connect`] if TCP connect fails or times out, or
+    /// [`AprsIsError::Write`] if the login string cannot be sent.
     pub async fn connect(config: AprsIsConfig) -> Result<Self, AprsIsError> {
         let addr = format!("{}:{}", config.server, config.port);
         tracing::info!(server = %addr, callsign = %config.callsign, "APRS-IS connecting");
+
+        // Build + validate the login line before opening the socket so an
+        // invalid field (whitespace/CRLF that could corrupt or inject the
+        // handshake) fails fast without a wasted TCP connection.
+        let login = build_login_string(&config)?;
 
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
             .await
@@ -181,8 +302,7 @@ impl AprsIsClient {
 
         let (read_half, mut write_half) = stream.into_split();
 
-        // Send login string.
-        let login = build_login_string(&config);
+        // Send the login string built+validated above.
         write_half
             .write_all(login.as_bytes())
             .await
@@ -265,7 +385,7 @@ impl AprsIsClient {
     ///
     /// # Encoding policy
     ///
-    /// Bytes are read with [`AsyncBufReadExt::read_until`] (not
+    /// Bytes are read with a bounded byte-oriented reader (not
     /// `read_line`) so that non-UTF-8 sequences common in APRS info
     /// fields (Mic-E, raw weather data, Latin-1 comments) do not return
     /// `io::ErrorKind::InvalidData` and tear down the connection.
@@ -278,14 +398,20 @@ impl AprsIsClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AprsIsError::Read`] on socket errors.
+    /// Returns [`AprsIsError::Read`] on socket errors, or
+    /// [`AprsIsError::ReadLineTooLong`] if the server sends more than
+    /// [`MAX_IS_READ_LINE_BYTES`] without a terminating newline (the
+    /// oversized line is discarded and the stream resynchronises, so the
+    /// caller may continue calling `next_event`).
     pub async fn next_event(&mut self) -> Result<AprsIsEvent, AprsIsError> {
         self.line_buf.clear();
-        let bytes = self
-            .reader
-            .read_until(b'\n', &mut self.line_buf)
-            .await
-            .map_err(AprsIsError::Read)?;
+        // Bounded read: a malicious/buggy server could otherwise stream
+        // bytes with no `\n` and grow `line_buf` until OOM. See
+        // `read_is_line` and `MAX_IS_READ_LINE_BYTES`. On overflow the
+        // helper drains the oversized line up to the next newline and
+        // returns `ReadLineTooLong`, leaving the stream resynchronised.
+        let bytes =
+            read_is_line(&mut self.reader, &mut self.line_buf, MAX_IS_READ_LINE_BYTES).await?;
 
         if bytes == 0 {
             tracing::info!("APRS-IS connection closed by server");
@@ -369,6 +495,23 @@ impl AprsIsClient {
     /// Send a raw line to the server (must already be CRLF-terminated).
     ///
     /// Use this for custom formatting or to forward packets from RF.
+    /// This is the single send choke point: every outbound line — packet
+    /// formatting, keepalives, and direct raw forwarding — funnels
+    /// through here, so the CR/LF-injection guard below covers all of
+    /// them regardless of who built the string.
+    ///
+    /// # CRLF-injection guard
+    ///
+    /// APRS-IS lines are framed by a trailing `CRLF`. A `\r` or `\n`
+    /// embedded in the **body** of the line (anything before a single
+    /// trailing terminator) would split the write into a second, forged
+    /// packet on the uplink stream. Because the client may forward
+    /// caller- or RF-supplied content (e.g. an AX.25 info field decoded
+    /// via `from_utf8_lossy`, which can contain a raw `0x0A`), this
+    /// method rejects any line whose body contains an embedded `\r`/`\n`
+    /// with [`AprsIsError::EmbeddedNewline`] rather than writing it. A
+    /// single trailing terminator (`\n` or `\r\n`) is permitted, since
+    /// that is the line's own framing.
     ///
     /// # Length limit
     ///
@@ -381,10 +524,14 @@ impl AprsIsClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AprsIsError::LineTooLong`] if `line.len() >
-    /// MAX_IS_LINE_BYTES`, or [`AprsIsError::Write`] if the underlying
-    /// socket write fails.
+    /// Returns [`AprsIsError::EmbeddedNewline`] if the line body contains
+    /// an embedded `\r`/`\n`; [`AprsIsError::LineTooLong`] if the line
+    /// exceeds [`MAX_IS_LINE_BYTES`]; or [`AprsIsError::Write`] if the
+    /// underlying socket write fails.
     pub async fn send_raw_line(&mut self, line: &str) -> Result<(), AprsIsError> {
+        if line_body_has_embedded_newline(line) {
+            return Err(AprsIsError::EmbeddedNewline);
+        }
         if line.len() > MAX_IS_LINE_BYTES {
             return Err(AprsIsError::LineTooLong {
                 actual: line.len(),
@@ -789,6 +936,193 @@ mod tests {
         if let Ok(r) = result {
             assert!(r.is_err(), "expected connect to fail, got Ok");
         }
+        Ok(())
+    }
+
+    // --- Bounded inbound read (BUG 1: unbounded line-read DoS) ---
+
+    #[test]
+    fn line_body_embedded_newline_detection() {
+        // Trailing terminators are allowed; embedded CR/LF is not.
+        assert!(!line_body_has_embedded_newline("data\r\n"));
+        assert!(!line_body_has_embedded_newline("data\n"));
+        assert!(!line_body_has_embedded_newline("data"));
+        assert!(line_body_has_embedded_newline("a\r\nN0CALL>X:forged\r\n"));
+        assert!(line_body_has_embedded_newline("a\nb\n"));
+        assert!(line_body_has_embedded_newline("mid\rline\r\n"));
+    }
+
+    #[tokio::test]
+    async fn read_is_line_reads_a_normal_line() -> TestResult {
+        let data: &[u8] = b"N0CALL>APK005:hello\r\nnext line\n";
+        let mut reader = BufReader::new(data);
+        let mut buf = Vec::new();
+        let n = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await?;
+        assert_eq!(n, buf.len());
+        assert_eq!(buf.as_slice(), b"N0CALL>APK005:hello\r\n");
+        // The next line is still readable (consume positioned correctly).
+        buf.clear();
+        let _ = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await?;
+        assert_eq!(buf.as_slice(), b"next line\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_is_line_accepts_long_but_valid_line() -> TestResult {
+        // 600 bytes of payload + CRLF: under the 1024 cap, must parse in
+        // full without truncation.
+        let mut data = vec![b'X'; 600];
+        data.extend_from_slice(b"\r\n");
+        let mut reader = BufReader::new(data.as_slice());
+        let mut buf = Vec::new();
+        let n = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await?;
+        assert_eq!(n, 602, "long valid line should be returned whole");
+        assert_eq!(buf.len(), 602);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_is_line_bounds_huge_no_newline_chunk() -> TestResult {
+        // A server streams far more than the cap with NO newline, then
+        // EOF. The buffer must stay bounded by the cap rather than
+        // growing to the input size (the OOM vector).
+        let data = vec![b'A'; MAX_IS_READ_LINE_BYTES * 64];
+        let mut reader = BufReader::new(data.as_slice());
+        let mut buf = Vec::new();
+        let n = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await?;
+        assert!(
+            buf.len() <= MAX_IS_READ_LINE_BYTES,
+            "buffer grew past the cap: {} > {}",
+            buf.len(),
+            MAX_IS_READ_LINE_BYTES
+        );
+        assert_eq!(n, buf.len());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_is_line_errors_then_resyncs_on_overflow() -> TestResult {
+        // A line that exceeds the cap *and* is eventually terminated must
+        // return ReadLineTooLong (not a silent truncate-then-misparse),
+        // leave the buffer bounded, and resync so the *next* line parses.
+        let mut data = vec![b'B'; MAX_IS_READ_LINE_BYTES + 50];
+        data.extend_from_slice(b"\r\n");
+        data.extend_from_slice(b"N0CALL>APK005:ok\r\n");
+        let mut reader = BufReader::new(data.as_slice());
+
+        let mut buf = Vec::new();
+        let first = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await;
+        assert!(
+            matches!(first, Err(AprsIsError::ReadLineTooLong { max }) if max == MAX_IS_READ_LINE_BYTES),
+            "expected ReadLineTooLong, got {first:?}"
+        );
+        assert!(
+            buf.len() <= MAX_IS_READ_LINE_BYTES,
+            "overflow buffer not bounded: {}",
+            buf.len()
+        );
+
+        // Resync: the following well-formed line is delivered intact.
+        buf.clear();
+        let _ = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await?;
+        assert_eq!(buf.as_slice(), b"N0CALL>APK005:ok\r\n");
+        Ok(())
+    }
+
+    // --- CRLF injection on the uplink (BUG 2) ---
+
+    #[tokio::test]
+    async fn send_packet_rejects_crlf_injection_in_data() -> TestResult {
+        // The mock server records every byte it receives after the login
+        // line so we can prove no forged second line is written.
+        let addr = spawn_mock_server(|mut stream| async move {
+            let mut buf = [0u8; 1024];
+            // Drain the login line.
+            let _ = read_some(&mut stream, &mut buf).await;
+            // Give the client time to attempt (and reject) the send.
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        })
+        .await?;
+
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        // A data field carrying a forged second packet must be rejected
+        // at the send choke point.
+        let result = client
+            .send_packet("N0CALL", "APK005", &[], "a\r\nN0CALL>X:forged")
+            .await;
+        assert!(
+            matches!(result, Err(AprsIsError::EmbeddedNewline)),
+            "expected EmbeddedNewline, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_raw_line_rejects_embedded_newline_but_allows_terminator() -> TestResult {
+        let addr = spawn_mock_server(|mut stream| async move {
+            let mut buf = [0u8; 1024];
+            let _ = read_some(&mut stream, &mut buf).await;
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        })
+        .await?;
+
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        // Embedded newline in the body → rejected.
+        let injected = client.send_raw_line("good\r\nEVIL>X:forged\r\n").await;
+        assert!(
+            matches!(injected, Err(AprsIsError::EmbeddedNewline)),
+            "expected EmbeddedNewline, got {injected:?}"
+        );
+        // A normal CRLF-terminated line (no embedded newline) → accepted.
+        client.send_raw_line("N0CALL>APK005:ok\r\n").await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_packet_normal_still_sends() -> TestResult {
+        let addr = spawn_mock_server(|mut stream| async move {
+            let mut buf = [0u8; 1024];
+            let _ = read_some(&mut stream, &mut buf).await;
+            let Some(n) = read_some(&mut stream, &mut buf).await else {
+                return;
+            };
+            let Ok(pkt) = std::str::from_utf8(buf.get(..n).unwrap_or(&[])) else {
+                return;
+            };
+            assert_eq!(
+                pkt, "N0CALL>APK005:!4903.50N/07201.75W-Test\r\n",
+                "unexpected packet: {pkt:?}"
+            );
+        })
+        .await?;
+
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        client
+            .send_packet("N0CALL", "APK005", &[], "!4903.50N/07201.75W-Test")
+            .await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok(())
+    }
+
+    // --- Login validation (BUG 3) reaches connect() ---
+
+    #[tokio::test]
+    async fn connect_rejects_invalid_login_field() -> TestResult {
+        // A software_name with a space must fail before any socket work.
+        let mut config = AprsIsConfig::new("N0CALL");
+        config.software_name = "my app".to_owned();
+        let result = AprsIsClient::connect(config).await;
+        assert!(
+            matches!(
+                result,
+                Err(AprsIsError::InvalidLoginField {
+                    field: "software_name",
+                    ..
+                })
+            ),
+            "expected InvalidLoginField(software_name), got {:?}",
+            result.map(|_| "Ok(client)")
+        );
         Ok(())
     }
 }

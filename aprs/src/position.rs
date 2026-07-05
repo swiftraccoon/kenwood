@@ -259,7 +259,8 @@ pub fn parse_uncompressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
 /// Parse compressed APRS position body (APRS101.PDF Chapter 9).
 ///
 /// Format: `sym_table(1) YYYY(4) XXXX(4) sym_code(1) cs(1) s(1) t(1)` = 13 bytes.
-/// YYYY and XXXX are base-91 encoded (each byte = ASCII 33-124, value = byte - 33).
+/// YYYY and XXXX are base-91 encoded (each byte = ASCII `33..=123`,
+/// `'!'` to `'{'`, value = byte - 33).
 ///
 /// Latitude:  `90 - (YYYY / 380926.0)` degrees
 /// Longitude: `-180 + (XXXX / 190463.0)` degrees
@@ -268,7 +269,7 @@ pub fn parse_uncompressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
 ///
 /// Returns [`AprsError::InvalidFormat`] if the body is shorter than 13
 /// bytes or [`AprsError::InvalidCoordinates`] if the base-91 lat/lon
-/// fields contain bytes outside the `33..=124` range.
+/// fields contain bytes outside the `33..=123` range.
 pub fn parse_compressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
     // Require the full 13-byte compressed body upfront.
     let header = body.get(..13).ok_or(AprsError::InvalidFormat)?;
@@ -389,18 +390,21 @@ fn decode_compressed_tail(cs: u8, s: u8, t: u8) -> (Option<i32>, Option<(u16, u1
 
 /// Decode a 4-byte base-91 value.
 ///
-/// Each byte is in the ASCII range 33-124. The value is:
+/// Each byte is a base-91 digit `0..=90`, encoded as ASCII `33..=123`
+/// (`'!'` to `'{'`). The value is:
 /// `b[0]*91^3 + b[1]*91^2 + b[2]*91 + b[3]`
 ///
 /// # Errors
 ///
 /// Returns [`AprsError::InvalidCoordinates`] if `bytes` is shorter than
-/// 4 bytes or any byte is outside the `33..=124` base-91 range.
+/// 4 bytes or any byte is outside the `33..=123` base-91 range. ASCII
+/// `'|'` (124) and above are not valid base-91 digits (they would encode
+/// digit 91, one past the legal maximum) and are rejected.
 pub fn decode_base91_4(bytes: &[u8]) -> Result<u32, AprsError> {
     let window = bytes.get(..4).ok_or(AprsError::InvalidCoordinates)?;
     let mut val: u32 = 0;
     for &b in window {
-        if !(33..=124).contains(&b) {
+        if !(33..=123).contains(&b) {
             return Err(AprsError::InvalidCoordinates);
         }
         val = val * 91 + u32::from(b - 33);
@@ -552,10 +556,28 @@ mod tests {
 
     #[test]
     fn base91_decode_max() -> TestResult {
-        let val = decode_base91_4(b"||||")?;
-        let expected = 91_u32 * 753_571 + 91 * 8281 + 91 * 91 + 91;
-        assert_eq!(val, expected);
+        // base-91 digits run 0..=90 (ASCII 33..=123, '!'..='{'). The true
+        // maximum 4-digit value is all-90s, i.e. b"{{{{" (byte 123).
+        let val = decode_base91_4(b"{{{{")?;
+        let expected = 90_u32 * (753_571 + 8_281 + 91 + 1);
+        assert_eq!(val, expected, "max base-91 value is 68_574_960");
+        assert_eq!(val, 68_574_960);
         Ok(())
+    }
+
+    #[test]
+    fn base91_decode_rejects_pipe_byte() {
+        // ASCII '|' (124) is one past the legal base-91 range and would
+        // encode digit 91 (one past the max 90) — it must be rejected, not
+        // decoded to 68_574_961.
+        assert!(
+            decode_base91_4(b"||||").is_err(),
+            "'|' (124) is above the valid base-91 range"
+        );
+        assert!(
+            decode_base91_4(b"|!!!").is_err(),
+            "leading '|' (124) is above the valid base-91 range"
+        );
     }
 
     #[test]

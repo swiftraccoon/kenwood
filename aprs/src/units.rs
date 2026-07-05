@@ -11,6 +11,55 @@ use ax25_codec::Callsign;
 use crate::error::AprsError;
 
 // ---------------------------------------------------------------------------
+// Shared DDMM.hh formatter
+// ---------------------------------------------------------------------------
+
+/// Format the magnitude of a coordinate as the APRS uncompressed
+/// `DDMM.hh` core (degrees + whole minutes + hundredths of a minute),
+/// zero-padding the degree field to `deg_width` columns.
+///
+/// Per APRS 1.0.1 §6 p.23-24, the minutes field is **whole minutes
+/// `00..=59` plus hundredths `00..=99`** — never `60.00`. A naive
+/// `format!("{minutes:05.2}")` on a value like `59.9999` rounds the
+/// printed minutes up to `60.00` with no carry into the degree field,
+/// emitting a malformed coordinate that decodes a full degree off (or
+/// is rejected outright).
+///
+/// This helper instead computes integer degrees, integer whole-minutes,
+/// and integer hundredths-of-a-minute, **rounding the hundredths and
+/// carrying any overflow upward**: hundredths `100` rolls into `+1`
+/// minute, and minute `60` rolls into `+1` degree. The result always
+/// satisfies `minutes < 60` and `hundredths < 100`.
+///
+/// `value_abs` must already be the non-negative magnitude of an
+/// in-range coordinate (callers clamp / validate first).
+pub(crate) fn format_ddmm_hundredths(value_abs: f64, deg_width: usize) -> String {
+    // Total hundredths-of-a-minute across the whole value, rounded to
+    // the nearest integer. For a clamped latitude (<=90) this is at
+    // most 90 * 60 * 100 = 540_000; for longitude (<=180) at most
+    // 1_080_000 — both far inside u32.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "value_abs is a non-negative, range-clamped coordinate magnitude, so \
+                  value_abs * 6000 is in 0..=1_080_000 and the rounded cast to u32 cannot \
+                  truncate or sign-flip"
+    )]
+    let total_hundredths = (value_abs * 6000.0).round() as u32;
+
+    // Decompose, carrying overflow upward so the printed minute field is
+    // always whole-minutes 00..=59 plus hundredths 00..=99.
+    let hundredths = total_hundredths % 100;
+    let total_minutes = total_hundredths / 100;
+    let minutes = total_minutes % 60;
+    let degrees = total_minutes / 60;
+
+    // `deg_width` is the zero-padded degree-field width (2 for latitude,
+    // 3 for longitude).
+    format!("{degrees:0deg_width$}{minutes:02}.{hundredths:02}")
+}
+
+// ---------------------------------------------------------------------------
 // Latitude / Longitude
 // ---------------------------------------------------------------------------
 
@@ -67,23 +116,16 @@ impl Latitude {
 
     /// Format this latitude as the standard APRS uncompressed 8-byte
     /// field `DDMM.HHN` (or `…S` for southern hemisphere).
+    ///
+    /// The `DDMM.hh` core is produced by `format_ddmm_hundredths`,
+    /// which carries minute/degree overflow correctly so the minutes
+    /// field is always whole minutes `00..=59` plus hundredths
+    /// `00..=99` per APRS 1.0.1 §6 p.23 (never the malformed `60.00`).
     #[must_use]
     pub fn as_aprs_uncompressed(self) -> String {
         let hemisphere = if self.0 >= 0.0 { 'N' } else { 'S' };
-        let lat_abs = self.0.abs();
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "`lat_abs` is in [0.0, 90.0] by the Latitude invariant (validated at \
-                      construction via `Latitude::new` / `Latitude::new_clamped`), so the \
-                      `as u32` cast is always lossless. `cast_possible_truncation` fires \
-                      because clippy can't prove the f64 range from the surrounding code; \
-                      `cast_sign_loss` fires because f64→u32 drops the sign bit even though \
-                      `.abs()` two lines above guarantees non-negative input."
-        )]
-        let degrees = lat_abs as u32;
-        let minutes = (lat_abs - f64::from(degrees)) * 60.0;
-        format!("{degrees:02}{minutes:05.2}{hemisphere}")
+        let core = format_ddmm_hundredths(self.0.abs(), 2);
+        format!("{core}{hemisphere}")
     }
 }
 
@@ -137,23 +179,16 @@ impl Longitude {
 
     /// Format this longitude as the standard APRS uncompressed 9-byte
     /// field `DDDMM.HHE` (or `…W` for western hemisphere).
+    ///
+    /// The `DDDMM.hh` core is produced by `format_ddmm_hundredths`,
+    /// which carries minute/degree overflow correctly so the minutes
+    /// field is always whole minutes `00..=59` plus hundredths
+    /// `00..=99` per APRS 1.0.1 §6 p.24 (never the malformed `60.00`).
     #[must_use]
     pub fn as_aprs_uncompressed(self) -> String {
         let hemisphere = if self.0 >= 0.0 { 'E' } else { 'W' };
-        let lon_abs = self.0.abs();
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "`lon_abs` is in [0.0, 180.0] by the Longitude invariant (validated at \
-                      construction via `Longitude::new` / `Longitude::new_clamped`), so the \
-                      `as u32` cast is always lossless. `cast_possible_truncation` fires \
-                      because clippy can't prove the f64 range from the surrounding code; \
-                      `cast_sign_loss` fires because f64→u32 drops the sign bit even though \
-                      `.abs()` two lines above guarantees non-negative input."
-        )]
-        let degrees = lon_abs as u32;
-        let minutes = (lon_abs - f64::from(degrees)) * 60.0;
-        format!("{degrees:03}{minutes:05.2}{hemisphere}")
+        let core = format_ddmm_hundredths(self.0.abs(), 3);
+        format!("{core}{hemisphere}")
     }
 }
 
@@ -698,6 +733,116 @@ mod tests {
         let s = lon.as_aprs_uncompressed();
         assert!(s.ends_with('E'));
         assert!(s.starts_with("151"));
+        Ok(())
+    }
+
+    // ---- format_ddmm_hundredths carry correctness (APRS 1.0.1 §6) ----
+
+    /// Split a `DDMM.hh` core into its (degrees, minutes, hundredths)
+    /// integer components for boundary assertions. `deg_width` is the
+    /// number of leading degree digits (2 for latitude, 3 for
+    /// longitude).
+    fn split_ddmm(
+        core: &str,
+        deg_width: usize,
+    ) -> Result<(u32, u32, u32), Box<dyn std::error::Error>> {
+        let degrees: u32 = core
+            .get(..deg_width)
+            .ok_or("degree field missing")?
+            .parse()?;
+        let minutes: u32 = core
+            .get(deg_width..deg_width + 2)
+            .ok_or("minute field missing")?
+            .parse()?;
+        // Skip the '.' separator between minutes and hundredths.
+        let hundredths: u32 = core
+            .get(deg_width + 3..deg_width + 5)
+            .ok_or("hundredths field missing")?
+            .parse()?;
+        Ok((degrees, minutes, hundredths))
+    }
+
+    #[test]
+    fn ddmm_normal_value_formats_exactly() {
+        // 49.058333° → 49° 03.50' (the spec's worked example).
+        let core = format_ddmm_hundredths(49.058_333, 2);
+        assert_eq!(core, "4903.50", "expected 4903.50, got {core}");
+    }
+
+    #[test]
+    fn ddmm_latitude_carry_boundary_33_999999() -> TestResult {
+        // 33.999999° used to print "3360.00" (minutes rounded to 60.00
+        // with no carry). The carry-correct helper must roll to 34° 00.00'.
+        let core = format_ddmm_hundredths(33.999_999, 2);
+        let (deg, min, hun) = split_ddmm(&core, 2)?;
+        assert!(min < 60, "minutes must stay < 60, got {min} in {core}");
+        assert_eq!(
+            (deg, min, hun),
+            (34, 0, 0),
+            "carry into degree wrong: {core}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ddmm_latitude_carry_boundary_89_999999() -> TestResult {
+        // Just under the North Pole: must carry to 90° 00.00', not 89° 60.00'.
+        let core = format_ddmm_hundredths(89.999_999, 2);
+        let (deg, min, hun) = split_ddmm(&core, 2)?;
+        assert!(min < 60, "minutes must stay < 60, got {min} in {core}");
+        assert_eq!(
+            (deg, min, hun),
+            (90, 0, 0),
+            "carry into degree wrong: {core}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ddmm_longitude_carry_boundary_179_999999() -> TestResult {
+        // Just under the date line (3-digit degree field).
+        let core = format_ddmm_hundredths(179.999_999, 3);
+        let (deg, min, hun) = split_ddmm(&core, 3)?;
+        assert!(min < 60, "minutes must stay < 60, got {min} in {core}");
+        assert_eq!(
+            (deg, min, hun),
+            (180, 0, 0),
+            "carry into degree wrong: {core}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ddmm_longitude_carry_boundary_97_999983() -> TestResult {
+        // 97.999983° used to print "09760.00" — must carry to 98° 00.00'.
+        let core = format_ddmm_hundredths(97.999_983, 3);
+        let (deg, min, hun) = split_ddmm(&core, 3)?;
+        assert!(min < 60, "minutes must stay < 60, got {min} in {core}");
+        assert_eq!(
+            (deg, min, hun),
+            (98, 0, 0),
+            "carry into degree wrong: {core}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn latitude_newtype_carry_boundary_no_60_minutes() -> TestResult {
+        // The Latitude newtype method must also carry correctly.
+        let lat = Latitude::new(33.999_999)?;
+        let s = lat.as_aprs_uncompressed();
+        assert_eq!(s, "3400.00N", "expected carry to 3400.00N, got {s}");
+        assert_eq!(s.len(), 8, "latitude field is 8 bytes");
+        Ok(())
+    }
+
+    #[test]
+    fn longitude_newtype_carry_boundary_no_60_minutes() -> TestResult {
+        // The Longitude newtype method (western hemisphere) must carry.
+        let lon = Longitude::new(-97.999_983)?;
+        let s = lon.as_aprs_uncompressed();
+        assert_eq!(s, "09800.00W", "expected carry to 09800.00W, got {s}");
+        assert_eq!(s.len(), 9, "longitude field is 9 bytes");
         Ok(())
     }
 }

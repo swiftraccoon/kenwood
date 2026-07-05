@@ -37,7 +37,7 @@ use crate::geo::TxPosition;
 use crate::heard::HeardList;
 use crate::hosts::{DirectoryUpdate, ReflectorDirectory};
 use crate::session::{ConnStatus, ConnectConfig, SessionCommand, SessionEvent};
-use crate::settings::Settings;
+use crate::settings::{self, SavedHost, Settings};
 use crate::ui;
 
 /// Maximum lines kept in the event-log buffer. Older lines drop off
@@ -82,6 +82,10 @@ pub(crate) struct App {
     pub(crate) heard: HeardList,
     /// Most recent decoded RX position (latitude, longitude).
     pub(crate) last_gps: Option<(f64, f64)>,
+    /// Loss counters for the current (or most recent) RX stream.
+    pub(crate) last_rx_stats: Option<RxStreamStats>,
+    /// Seconds since the reflector was last heard from (1 Hz sample).
+    pub(crate) link_last_heard_secs: Option<f32>,
     /// Callsign of the currently-active incoming stream, captured from
     /// `VoiceStart` so the slow-data / GPS that arrive mid-stream can
     /// be attributed to the right heard-station.
@@ -100,6 +104,10 @@ pub(crate) struct App {
     pub(crate) directory: ReflectorDirectory,
     /// Current search query in the reflector picker.
     pub(crate) directory_query: String,
+    /// Starred reflectors, pinned atop the directory picker.
+    pub(crate) favorites: Vec<SavedHost>,
+    /// Recent successful connections, most recent first.
+    pub(crate) recents: Vec<SavedHost>,
 
     // --- channels ---
     cmd_tx: mpsc::Sender<SessionCommand>,
@@ -130,6 +138,17 @@ pub(crate) enum LogLevel {
     Info,
     Event,
     Error,
+}
+
+/// Per-stream RX loss counters mirrored from the session task.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RxStreamStats {
+    /// Voice frames received and played.
+    pub(crate) received: u32,
+    /// Frames lost to sequence gaps.
+    pub(crate) lost: u32,
+    /// Frames dropped for arriving late.
+    pub(crate) late: u32,
 }
 
 /// Audio-worker status mirrored into the GUI from the `AudioStatus`
@@ -218,6 +237,17 @@ impl App {
                 let _send = tx.send(crate::hosts::fetch_directory().await);
             });
         }
+        {
+            // Authoritative REF list from the DPlus auth server — the
+            // same startup exchange every DPlus dongle performs. Must
+            // outrank the XLX registry's REF-alias entries, which
+            // point at unrelated XLX reflectors.
+            let tx = directory_tx.clone();
+            let callsign = settings.callsign.clone();
+            let _join = runtime.spawn(async move {
+                let _send = tx.send(crate::hosts::fetch_auth_directory(callsign).await);
+            });
+        }
         Self {
             callsign: settings.callsign,
             reflector_host: settings.reflector_host,
@@ -241,6 +271,8 @@ impl App {
                 HeardList::default()
             },
             last_gps: None,
+            last_rx_stats: None,
+            link_last_heard_secs: None,
             current_rx_callsign: None,
             audio_state: AudioState::default(),
             input_device: settings.input_device,
@@ -248,6 +280,8 @@ impl App {
             wav_path: String::new(),
             directory,
             directory_query: String::new(),
+            favorites: settings.favorites,
+            recents: settings.recents,
             cmd_tx,
             evt_rx,
             audio,
@@ -287,6 +321,14 @@ impl App {
                     self.directory.replace_fetched(hosts, &when);
                     self.directory.save_cache(&when);
                 }
+                DirectoryUpdate::AuthLoaded { hosts } => {
+                    let count = hosts.len();
+                    self.directory.merge_hosts(hosts);
+                    self.append_log(LogLine {
+                        level: LogLevel::Info,
+                        text: format!("merged {count} REF hosts from the dstargateway auth server"),
+                    });
+                }
                 DirectoryUpdate::Failed(err) => {
                     self.directory.set_status(format!(
                         "reflector list: fetch failed ({err}) — using cache"
@@ -300,13 +342,19 @@ impl App {
         }
     }
 
-    /// Spawn an on-demand reflector-directory refresh.
+    /// Spawn an on-demand reflector-directory refresh (both the XLX
+    /// registry and the authoritative dstargateway REF list).
     pub(crate) fn refresh_directory(&mut self) {
         self.directory
             .set_status("reflector list: fetching…".into());
         let tx = self.directory_tx.clone();
         let _join = self.runtime.spawn(async move {
             let _send = tx.send(crate::hosts::fetch_directory().await);
+        });
+        let tx = self.directory_tx.clone();
+        let callsign = self.callsign.clone();
+        let _join = self.runtime.spawn(async move {
+            let _send = tx.send(crate::hosts::fetch_auth_directory(callsign).await);
         });
     }
 
@@ -319,34 +367,51 @@ impl App {
         self.log.push(line);
     }
 
+    /// Apply a connection-status change: log it, reset TX and stale
+    /// RX state on disconnect, and push the operator's slow-data once
+    /// the link comes up.
+    fn handle_status(&mut self, s: ConnStatus) {
+        self.append_log(LogLine {
+            level: LogLevel::Info,
+            text: format!("status: {}", ui::fmt_status(&s)),
+        });
+        // When we disconnect, make sure the PTT toggle resets so the
+        // GUI can't get stuck "transmitting" without an active session.
+        if matches!(s, ConnStatus::Disconnected) {
+            self.active_tx = false;
+            self.audio.send(AudioCommand::StopTx);
+            // Clear stale RX state from the prior session —
+            // a new session will populate fresh values.
+            self.last_slow_data = None;
+            self.last_gps = None;
+            self.last_rx_stats = None;
+            self.link_last_heard_secs = None;
+            self.current_rx_callsign = None;
+        }
+        self.status = s;
+        // On reaching Connected, push the operator's slow-data so a
+        // beacon configured before connecting takes effect immediately.
+        if matches!(self.status, ConnStatus::Connected { .. }) {
+            self.push_slow_data();
+            // Remember the connection and persist — a successful
+            // connect is a natural checkpoint, and saving here means
+            // recents survive a crash.
+            let entry = SavedHost {
+                callsign: self.reflector_callsign.trim().to_uppercase(),
+                host: self.reflector_host.clone(),
+                port: self.reflector_port.clone(),
+                protocol: format!("{:?}", self.protocol),
+                module: self.reflector_module,
+            };
+            settings::push_recent(&mut self.recents, entry);
+            self.snapshot_settings().save();
+        }
+    }
+
     fn drain_events(&mut self) {
         while let Ok(evt) = self.evt_rx.try_recv() {
             match evt {
-                SessionEvent::Status(s) => {
-                    self.append_log(LogLine {
-                        level: LogLevel::Info,
-                        text: format!("status: {}", ui::fmt_status(&s)),
-                    });
-                    // When we disconnect, make sure the PTT toggle
-                    // resets so the GUI can't get stuck "transmitting"
-                    // without an active session.
-                    if matches!(s, ConnStatus::Disconnected) {
-                        self.active_tx = false;
-                        self.audio.send(AudioCommand::StopTx);
-                        // Clear stale RX state from the prior session —
-                        // a new session will populate fresh values.
-                        self.last_slow_data = None;
-                        self.last_gps = None;
-                        self.current_rx_callsign = None;
-                    }
-                    self.status = s;
-                    // On reaching Connected, push the operator's
-                    // slow-data so a beacon configured before connecting
-                    // takes effect immediately.
-                    if matches!(self.status, ConnStatus::Connected { .. }) {
-                        self.push_slow_data();
-                    }
-                }
+                SessionEvent::Status(s) => self.handle_status(s),
                 SessionEvent::Log(t) => self.append_log(LogLine {
                     level: LogLevel::Info,
                     text: t,
@@ -403,6 +468,23 @@ impl App {
                     }
                     self.last_gps = Some((latitude, longitude));
                 }
+                SessionEvent::RxStats {
+                    received,
+                    lost,
+                    late,
+                } => {
+                    // No log line — this fires up to once per second;
+                    // VoiceEnd already logs the final frame count.
+                    self.last_rx_stats = Some(RxStreamStats {
+                        received,
+                        lost,
+                        late,
+                    });
+                }
+                SessionEvent::LinkHealth { last_heard_secs } => {
+                    // 1 Hz sample — display-only, never logged.
+                    self.link_last_heard_secs = Some(last_heard_secs);
+                }
                 SessionEvent::ReflectorHosts(hosts) => {
                     let count = hosts.len();
                     let merged = hosts
@@ -412,6 +494,7 @@ impl App {
                             host: addr.to_string(),
                             port: 20001,
                             protocol: ProtocolKind::DPlus,
+                            source: crate::hosts::HostSource::DPlusAuth,
                         })
                         .collect();
                     self.directory.merge_hosts(merged);
@@ -463,7 +546,52 @@ impl App {
             persist_heard_list: self.persist_heard_list,
             input_device: self.input_device.clone(),
             output_device: self.output_device.clone(),
+            favorites: self.favorites.clone(),
+            recents: self.recents.clone(),
         }
+    }
+
+    /// True when `host` is starred (matched by callsign + protocol,
+    /// the same key the directory dedupes on).
+    pub(crate) fn is_favorite(&self, host: &crate::hosts::ReflectorHost) -> bool {
+        let proto = format!("{:?}", host.protocol);
+        self.favorites
+            .iter()
+            .any(|f| f.callsign.eq_ignore_ascii_case(&host.callsign) && f.protocol == proto)
+    }
+
+    /// Star / unstar a directory entry and persist immediately.
+    pub(crate) fn toggle_favorite(&mut self, host: &crate::hosts::ReflectorHost) {
+        let proto = format!("{:?}", host.protocol);
+        if let Some(pos) = self
+            .favorites
+            .iter()
+            .position(|f| f.callsign.eq_ignore_ascii_case(&host.callsign) && f.protocol == proto)
+        {
+            let _removed = self.favorites.remove(pos);
+        } else {
+            self.favorites.push(SavedHost {
+                callsign: host.callsign.clone(),
+                host: host.host.clone(),
+                port: host.port.to_string(),
+                protocol: proto,
+                module: self.reflector_module,
+            });
+        }
+        self.snapshot_settings().save();
+    }
+
+    /// Fill the connection form from a saved favorite / recent.
+    pub(crate) fn apply_saved_host(&mut self, saved: &SavedHost) {
+        self.reflector_callsign.clone_from(&saved.callsign);
+        self.reflector_host.clone_from(&saved.host);
+        self.reflector_port.clone_from(&saved.port);
+        self.protocol = match saved.protocol.as_str() {
+            "DPlus" => ProtocolKind::DPlus,
+            "Dcs" | "DCS" => ProtocolKind::Dcs,
+            _ => ProtocolKind::DExtra,
+        };
+        self.reflector_module = saved.module;
     }
 
     pub(crate) fn toggle_ptt(&mut self) {

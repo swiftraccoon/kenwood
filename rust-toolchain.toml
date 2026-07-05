@@ -1,0 +1,7 @@
+# Pin the workspace to the Rust version CI uses (dtolnay/rust-toolchain
+# in .github/workflows pins 1.94.0). Without this file, a local
+# `rustup update` moves the default stable ahead of CI and ./lint.sh
+# fails on clippy lints that don't exist in CI's toolchain.
+[toolchain]
+channel = "1.94.0"
+components = ["clippy", "rustfmt"]

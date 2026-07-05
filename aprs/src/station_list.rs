@@ -85,7 +85,12 @@ impl StationList {
 
         entry.last_heard = now;
         entry.packet_count = entry.packet_count.saturating_add(1);
-        entry.last_path = path.to_vec();
+        // Only reallocate the path when it actually changed — a station's
+        // digipeater path is usually identical packet-to-packet, so the
+        // per-update `to_vec()` was a pure waste otherwise.
+        if entry.last_path != path {
+            entry.last_path = path.to_vec();
+        }
 
         match data {
             AprsData::Position(pos) => {
@@ -281,6 +286,32 @@ mod tests {
         sl.update("N0CALL", &pos, &[], t0);
         let entry = sl.get("N0CALL").ok_or("expected N0CALL entry")?;
         assert_eq!(entry.packet_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn update_tracks_latest_path_with_and_without_change() -> TestResult {
+        // BUG-3: the per-packet path is only re-cloned when it changed,
+        // but last_path must always reflect the most recent path heard.
+        let mut sl = StationList::new(100, Duration::from_secs(3600));
+        let pos = make_position(35.0, -97.0);
+        let t0 = Instant::now();
+
+        let path_a = vec!["WIDE1-1".to_owned(), "WIDE2-1".to_owned()];
+        sl.update("N0CALL", &pos, &path_a, t0);
+        let entry = sl.get("N0CALL").ok_or("expected N0CALL entry")?;
+        assert_eq!(entry.last_path, path_a);
+
+        // Same path again — value must remain correct (skip-clone path).
+        sl.update("N0CALL", &pos, &path_a, t0);
+        let entry = sl.get("N0CALL").ok_or("expected N0CALL entry")?;
+        assert_eq!(entry.last_path, path_a);
+
+        // Changed path — value must update.
+        let path_b = vec!["WIDE2-2".to_owned()];
+        sl.update("N0CALL", &pos, &path_b, t0);
+        let entry = sl.get("N0CALL").ok_or("expected N0CALL entry")?;
+        assert_eq!(entry.last_path, path_b);
         Ok(())
     }
 

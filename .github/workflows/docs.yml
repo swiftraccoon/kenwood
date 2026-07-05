@@ -10,7 +10,7 @@ jobs:
       pages: write
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.94.0
       # sextant (our GUI D-STAR client) pulls in cpal → alsa-sys on
       # Linux, which requires the ALSA development headers at build
@@ -53,7 +53,7 @@ jobs:
           </body>
           </html>
           HTML
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: target/doc
-      - uses: actions/deploy-pages@v4
+      - uses: actions/deploy-pages@v5

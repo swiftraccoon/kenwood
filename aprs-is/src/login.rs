@@ -6,6 +6,8 @@
 //! using a well-known hash algorithm. Use [`aprs_is_passcode`] to
 //! compute it.
 
+use crate::error::AprsIsError;
+
 /// APRS-IS authentication passcode.
 ///
 /// Per the APRS-IS authentication spec, a valid passcode is a 15-bit
@@ -150,13 +152,76 @@ pub fn aprs_is_passcode(callsign: &str) -> i32 {
     i32::from(hash & 0x7FFF)
 }
 
+/// Validate a login field that must be a single non-empty "word".
+///
+/// Per <http://www.aprs-is.net/Connecting.aspx>, the software name and
+/// version must each be one word ("Do not use spaces"), and a
+/// login/callsign is "alphanumeric ASCII characters only" with at most a
+/// single hyphen-SSID. The login line is space-delimited, so any
+/// embedded whitespace (space, tab, …) or `CRLF`/control character in
+/// these fields would either shift the keyword parsing or — for a raw
+/// `\n` — inject a second handshake line. We reject the whole class of
+/// ASCII whitespace and control characters here rather than enumerating
+/// the exact callsign grammar, which is stricter than necessary but
+/// never rejects a valid value.
+fn validate_login_word(field: &'static str, value: &str) -> Result<(), AprsIsError> {
+    if value.is_empty() {
+        return Err(AprsIsError::InvalidLoginField {
+            field,
+            reason: "must not be empty",
+        });
+    }
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(AprsIsError::InvalidLoginField {
+            field,
+            reason: "must be one word with no whitespace or control characters",
+        });
+    }
+    Ok(())
+}
+
+/// Validate the filter clause, which legitimately contains spaces
+/// between sub-clauses but must not carry a `CR`/`LF`.
+///
+/// Per <http://www.aprs-is.net/Connecting.aspx> the `servercommand`
+/// (e.g. `filter r/33/-96/25`) allows spaces, so unlike the software
+/// name/version we only reject the line terminators: a `\r`/`\n` inside
+/// the filter would inject a second handshake line.
+fn validate_filter(value: &str) -> Result<(), AprsIsError> {
+    if value.contains('\r') || value.contains('\n') {
+        return Err(AprsIsError::InvalidLoginField {
+            field: "filter",
+            reason: "must not contain a carriage return or line feed",
+        });
+    }
+    Ok(())
+}
+
 /// Build the APRS-IS login string.
 ///
 /// Format: `user CALL pass PASSCODE vers SOFTNAME SOFTVER filter FILTER\r\n`
 ///
 /// If the filter is empty, the `filter` clause is omitted.
-#[must_use]
-pub fn build_login_string(config: &AprsIsConfig) -> String {
+///
+/// The callsign, software name, and software version are validated as
+/// single whitespace-free words and the filter is checked for embedded
+/// `CRLF` before the line is assembled. This is the choke point for the
+/// handshake: an unvalidated value could otherwise corrupt the
+/// space-delimited login line or inject a second handshake line onto the
+/// stream. See <http://www.aprs-is.net/Connecting.aspx> ("Login Format
+/// Rules"; software name/version "Do not use spaces").
+///
+/// # Errors
+///
+/// Returns [`AprsIsError::InvalidLoginField`] if the callsign, software
+/// name, or software version contains whitespace or a control character
+/// (or is empty), or if the filter contains a `\r`/`\n`.
+pub fn build_login_string(config: &AprsIsConfig) -> Result<String, AprsIsError> {
+    validate_login_word("callsign", &config.callsign)?;
+    validate_login_word("software_name", &config.software_name)?;
+    validate_login_word("software_version", &config.software_version)?;
+    validate_filter(&config.filter)?;
+
     let mut login = format!(
         "user {} pass {} vers {} {}",
         config.callsign, config.passcode, config.software_name, config.software_version,
@@ -168,7 +233,7 @@ pub fn build_login_string(config: &AprsIsConfig) -> String {
     }
 
     login.push_str("\r\n");
-    login
+    Ok(login)
 }
 
 #[cfg(test)]
@@ -248,9 +313,9 @@ mod tests {
     }
 
     #[test]
-    fn login_string_no_filter() {
+    fn login_string_no_filter() -> Result<(), Box<dyn std::error::Error>> {
         let config = AprsIsConfig::new("N0CALL");
-        let login = build_login_string(&config);
+        let login = build_login_string(&config)?;
         assert!(
             login.starts_with("user N0CALL pass 13023 vers aprs-is "),
             "unexpected login prefix: {login:?}"
@@ -260,17 +325,110 @@ mod tests {
             !login.contains("filter"),
             "filter clause unexpectedly present: {login:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn login_string_with_filter() {
+    fn login_string_with_filter() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = AprsIsConfig::new("N0CALL");
         config.filter = "r/35.25/-97.75/100".to_owned();
-        let login = build_login_string(&config);
+        let login = build_login_string(&config)?;
         assert!(
             login.contains("filter r/35.25/-97.75/100"),
             "filter not in login string: {login:?}"
         );
         assert!(login.ends_with("\r\n"), "missing CRLF: {login:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn login_string_rejects_software_name_with_space() {
+        // Connecting.html: "softwarename=one word name of the client
+        // software. Do not use spaces." A space would shift the
+        // space-delimited keyword parsing.
+        let mut config = AprsIsConfig::new("N0CALL");
+        config.software_name = "my app".to_owned();
+        let result = build_login_string(&config);
+        assert!(
+            matches!(
+                result,
+                Err(AprsIsError::InvalidLoginField {
+                    field: "software_name",
+                    ..
+                })
+            ),
+            "expected InvalidLoginField(software_name), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn login_string_rejects_software_version_with_space() {
+        // Connecting.html: "softwarevers=version number of the client
+        // software. Do not use spaces."
+        let mut config = AprsIsConfig::new("N0CALL");
+        config.software_version = "1 0".to_owned();
+        let result = build_login_string(&config);
+        assert!(
+            matches!(
+                result,
+                Err(AprsIsError::InvalidLoginField {
+                    field: "software_version",
+                    ..
+                })
+            ),
+            "expected InvalidLoginField(software_version), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn login_string_rejects_filter_with_crlf() {
+        // A `\r\n` in the filter would inject a second handshake line
+        // onto the stream after the login line.
+        let mut config = AprsIsConfig::new("N0CALL");
+        config.filter = "r/1/2/3\r\ninject".to_owned();
+        let result = build_login_string(&config);
+        assert!(
+            matches!(
+                result,
+                Err(AprsIsError::InvalidLoginField {
+                    field: "filter",
+                    ..
+                })
+            ),
+            "expected InvalidLoginField(filter), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn login_string_rejects_callsign_with_whitespace() {
+        // A space/CRLF in the callsign would corrupt the `user CALL`
+        // keyword pair.
+        let mut config = AprsIsConfig::new("N0CALL");
+        config.callsign = "N0 CALL".to_owned();
+        let result = build_login_string(&config);
+        assert!(
+            matches!(
+                result,
+                Err(AprsIsError::InvalidLoginField {
+                    field: "callsign",
+                    ..
+                })
+            ),
+            "expected InvalidLoginField(callsign), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn login_string_allows_filter_with_internal_spaces() -> Result<(), Box<dyn std::error::Error>> {
+        // Filters legitimately separate sub-clauses with spaces; only
+        // CR/LF is rejected.
+        let mut config = AprsIsConfig::new("N0CALL");
+        config.filter = "m/200 -p/CW".to_owned();
+        let login = build_login_string(&config)?;
+        assert!(
+            login.contains("filter m/200 -p/CW"),
+            "multi-clause filter not preserved: {login:?}"
+        );
+        Ok(())
     }
 }

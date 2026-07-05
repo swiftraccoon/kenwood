@@ -24,6 +24,23 @@ pub(crate) fn show(app: &App, ui: &mut egui::Ui) {
         ui.colored_label(egui::Color32::LIGHT_GREEN, text);
     });
 
+    ui.horizontal(|ui| {
+        ui.label("Stream loss:");
+        let text = app.last_rx_stats.map_or_else(
+            || "—".to_owned(),
+            |s| {
+                let total = s.received.saturating_add(s.lost);
+                let pct = if total == 0 {
+                    0.0
+                } else {
+                    f64::from(s.lost) * 100.0 / f64::from(total)
+                };
+                format!("{} lost / {} late of {total} ({pct:.1}%)", s.lost, s.late)
+            },
+        );
+        ui.colored_label(egui::Color32::LIGHT_GREEN, text);
+    });
+
     ui.separator();
     ui.label("Heard stations");
     egui::ScrollArea::vertical()

@@ -96,15 +96,13 @@ use crate::tables;
 
 /// Result of decoding a single AMBE parameter vector.
 ///
-/// For D-STAR, only [`FrameStatus::Voice`] produces synthesizable
-/// parameters; the other two variants signal that the caller should
-/// fall back to error concealment (reuse previous frame's parameters
-/// and increment the repeat counter).
-///
-/// D-STAR does not use codec-level tone signaling (DTMF and similar
-/// run over slow-data, not via AMBE tones), so in this crate
-/// [`FrameStatus::Tone`] is treated identically to erasure rather than
-/// being synthesized as a tone.
+/// Only [`FrameStatus::Voice`] produces synthesizable speech-model
+/// parameters. [`FrameStatus::Tone`] carries the decoded tone
+/// descriptor for the caller to synthesize directly — DVSI hardware
+/// encoders emit tone frames whenever the input is a pure tone (a
+/// TH-D75 fed a 440 Hz test tone encodes `index = 14`, 437.5 Hz, on
+/// nearly every frame), so a decoder that mutes them fails real
+/// captures. [`FrameStatus::Erasure`] signals an unrecoverable frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrameStatus {
     /// Valid speech frame with fully decoded parameters.
@@ -112,8 +110,15 @@ pub(crate) enum FrameStatus {
     /// Erasure frame (b0 in 120..=123). The encoder explicitly signals
     /// that this frame is unrecoverable.
     Erasure,
-    /// Tone signaling frame (b0 in 126..=127). Unused by D-STAR.
-    Tone,
+    /// Tone signaling frame (b0 in 126..=127).
+    Tone {
+        /// Tone-table index. `5..=122` is a single tone at
+        /// `index × 31.25 Hz`; `128..=163` is a dual tone (table
+        /// undocumented for D-STAR); anything else is invalid.
+        index: u8,
+        /// Tone amplitude byte (0-255, linear).
+        volume: u8,
+    },
 }
 
 /// Number of PRBA coefficient blocks used in the forward/inverse DCT.
@@ -145,10 +150,9 @@ const SILENCE_L: usize = 14;
 /// See the [module-level documentation](self) for a full description of the
 /// decode pipeline.
 ///
-/// Returns [`FrameStatus::Voice`] for a normal speech frame. For erasure
-/// or tone frames (which D-STAR treats identically — see [`FrameStatus`]
-/// docs), returns early without modifying `cur`, so the caller can
-/// safely reuse the previous frame's parameters.
+/// Returns [`FrameStatus::Voice`] for a normal speech frame. For
+/// erasure and tone frames, returns early without modifying `cur`,
+/// so the caller can silence, reset, or synthesize as appropriate.
 pub(crate) fn decode_params(
     ambe_d: &[u8; AMBE_DATA_BITS],
     cur: &mut MbeParams,
@@ -165,10 +169,11 @@ pub(crate) fn decode_params(
         | bit(ambe_d, 48);
 
     // Tone detection: mbelib 2400 treats `(b0 & 0x7E) == 0x7E` (i.e.
-    // b0 ∈ {126, 127}) as tone, which we surface as `FrameStatus::Tone`
-    // since D-STAR doesn't do in-band tones through the voice codec.
+    // b0 ∈ {126, 127}) as a tone frame. Decode the tone descriptor so
+    // the caller can synthesize it — DVSI encoders emit these for any
+    // pure-tone input.
     if (b0 & 0x7E) == 0x7E {
-        return FrameStatus::Tone;
+        return decode_tone(ambe_d);
     }
     if (120..=123).contains(&b0) {
         return FrameStatus::Erasure;
@@ -633,6 +638,48 @@ fn bit(ambe_d: &[u8; AMBE_DATA_BITS], index: usize) -> usize {
     ambe_d.get(index).copied().unwrap_or(0) as usize
 }
 
+/// Decode a tone frame's index and volume bytes.
+///
+/// Bit layout ported from `mbelib/ambe3600x2400.c:176-218` (the
+/// reference decodes these fields for diagnostics only; the positions
+/// marked "verified" there were confirmed against hardware captures).
+/// The index's top three bits come through a 3-bit-keyed lookup on
+/// `ambe_d[6..9]`; the remaining index and volume bits sit at
+/// scattered `ambe_d` positions.
+fn decode_tone(ambe_d: &[u8; AMBE_DATA_BITS]) -> FrameStatus {
+    /// Top-three-index-bit tables, keyed by `ambe_d[6..9]` as a 3-bit value.
+    const T7: [usize; 8] = [1, 0, 0, 0, 0, 1, 1, 1];
+    const T6: [usize; 8] = [0, 0, 0, 1, 1, 1, 1, 0];
+    const T5: [usize; 8] = [0, 0, 1, 0, 1, 1, 0, 1];
+
+    let key = (bit(ambe_d, 6) << 2) | (bit(ambe_d, 7) << 1) | bit(ambe_d, 8);
+    let index = (T7.get(key).copied().unwrap_or(0) << 7)
+        | (T6.get(key).copied().unwrap_or(0) << 6)
+        | (T5.get(key).copied().unwrap_or(0) << 5)
+        | (bit(ambe_d, 9) << 4)
+        | (bit(ambe_d, 42) << 3)
+        | (bit(ambe_d, 43) << 2)
+        | (bit(ambe_d, 10) << 1)
+        | bit(ambe_d, 11);
+    let volume = (bit(ambe_d, 12) << 7)
+        | (bit(ambe_d, 13) << 6)
+        | (bit(ambe_d, 14) << 5)
+        | (bit(ambe_d, 15) << 4)
+        | (bit(ambe_d, 16) << 3)
+        | (bit(ambe_d, 44) << 2)
+        | (bit(ambe_d, 45) << 1)
+        | bit(ambe_d, 17);
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "index and volume are assembled from 8 single-bit values each — always < 256"
+    )]
+    FrameStatus::Tone {
+        index: index as u8,
+        volume: volume as u8,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,7 +809,50 @@ mod tests {
         }
 
         let status = decode_params(&ambe_d, &mut cur, &prev);
-        assert_eq!(status, FrameStatus::Tone, "b0=127 should be tone");
+        assert!(
+            matches!(status, FrameStatus::Tone { .. }),
+            "b0=127 should be tone, got {status:?}"
+        );
+    }
+
+    /// The tone descriptor's index and volume bits decode per the
+    /// mbelib layout: with `ambe_d[6..9] = 001` the index's top three
+    /// bits are 000, and the scattered low bits assemble the rest.
+    #[test]
+    fn tone_frame_index_and_volume_bits() {
+        let prev = MbeParams::new();
+        let mut cur = MbeParams::new();
+        let mut ambe_d = [0u8; AMBE_DATA_BITS];
+        // b0 = 126 (bits 0..=5 set, bit 48 clear).
+        for idx in [0, 1, 2, 3, 4, 5] {
+            if let Some(b) = ambe_d.get_mut(idx) {
+                *b = 1;
+            }
+        }
+        // Index 14 = 0b0000_1110: key 001 → top bits 000; then
+        // t4=d[9]=0, t3=d[42]=1, t2=d[43]=1, t1=d[10]=1, t0=d[11]=0.
+        for idx in [8, 42, 43, 10] {
+            if let Some(b) = ambe_d.get_mut(idx) {
+                *b = 1;
+            }
+        }
+        // Volume 100 = 0b0110_0100: v6=d[13], v5=d[14], v2=d[44].
+        for idx in [13, 14, 44] {
+            if let Some(b) = ambe_d.get_mut(idx) {
+                *b = 1;
+            }
+        }
+        let status = decode_params(&ambe_d, &mut cur, &prev);
+        assert!(
+            matches!(
+                status,
+                FrameStatus::Tone {
+                    index: 14,
+                    volume: 100
+                }
+            ),
+            "expected index 14 / volume 100, got {status:?}"
+        );
     }
 
     /// Silence frames (b0 = 124 or 125) should produce valid voice

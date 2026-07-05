@@ -450,6 +450,16 @@ pub struct AprsClient<T: Transport> {
     /// one event (e.g. several retry timers expired at once). Drained at
     /// the top of each `next_event` before any new I/O is performed.
     pending_events: VecDeque<AprsEvent>,
+    /// The raw AX.25 frame received during the current [`Self::next_event`]
+    /// call, if any.
+    ///
+    /// Set to `Some` whenever a cycle receives a frame off the air (before
+    /// digipeater and typed-event dispatch) and cleared at the top of the
+    /// next cycle. An `IGate` consumer takes this with
+    /// [`Self::take_last_rf_packet`] to gate *every* heard packet to
+    /// APRS-IS, not just the ones that fall through to
+    /// [`AprsEvent::RawPacket`].
+    last_rf_packet: Option<Ax25Packet>,
 }
 
 impl<T: Transport> std::fmt::Debug for AprsClient<T> {
@@ -498,6 +508,7 @@ impl<T: Transport> AprsClient<T> {
             stations,
             beaconing,
             pending_events: VecDeque::new(),
+            last_rf_packet: None,
         })
     }
 
@@ -528,6 +539,11 @@ impl<T: Transport> AprsClient<T> {
     ///
     /// Returns an error on transport failures.
     pub async fn next_event(&mut self) -> Result<Option<AprsEvent>, Error> {
+        // Clear the previous cycle's captured frame so a stale packet is
+        // never gated against an event from a later cycle. It is set again
+        // below only if this cycle actually receives a frame.
+        self.last_rf_packet = None;
+
         // 0. Drain any events produced by a prior call.
         if let Some(ev) = self.pending_events.pop_front() {
             return Ok(Some(ev));
@@ -546,10 +562,28 @@ impl<T: Transport> AprsClient<T> {
             return Ok(Some(ev));
         }
 
+        // 1b. Transmit any viscous-delayed digipeats whose hold time has
+        // elapsed. This runs every cycle (even when idle) because a
+        // deferred relay becomes due on a timer, not on a new receive.
+        self.process_viscous_digipeater(now).await?;
+        if let Some(ev) = self.pending_events.pop_front() {
+            return Ok(Some(ev));
+        }
+
+        // 1c. Drop stations not heard within the configured timeout so
+        // "heard recently" decisions (notably IGate RF-gating eligibility)
+        // act on fresh data instead of stale entries that linger until
+        // capacity eviction.
+        self.stations.purge_expired(now);
+
         // 2. Try to receive a KISS data frame.
         let Some(packet) = self.recv_one_frame().await? else {
             return Ok(None);
         };
+
+        // Capture the raw frame so an IGate can gate it regardless of how
+        // it later classifies (typed event vs `RawPacket`).
+        self.last_rf_packet = Some(packet.clone());
 
         // 3. Run digipeater logic before consuming the packet.
         if let Some(ev) = self.process_digipeater(&packet, now).await? {
@@ -615,6 +649,50 @@ impl<T: Transport> AprsClient<T> {
             }));
         }
         Ok(None)
+    }
+
+    /// Phase 1b: transmit any viscous-delayed digipeats whose hold time
+    /// has elapsed.
+    ///
+    /// When the digipeater runs with a non-zero viscous delay, a relay is
+    /// not sent immediately — [`DigipeaterConfig::process`] returns
+    /// [`DigiAction::Drop`] and stashes the modified frame internally. The
+    /// frame is only released once the delay elapses (and no other station
+    /// digipeated it first), via
+    /// [`DigipeaterConfig::drain_ready_viscous`]. Without this drain the
+    /// deferred relays would never be transmitted, so every viscous
+    /// digipeat would be silently swallowed.
+    ///
+    /// Each released frame is sent and reported as a
+    /// [`AprsEvent::PacketDigipeated`].
+    async fn process_viscous_digipeater(&mut self, now: Instant) -> Result<(), Error> {
+        // Drain first so the mutable borrow of `config` ends before the
+        // send loop needs `&mut self.session`.
+        let ready = match self.config.digipeater.as_mut() {
+            Some(digi_config) => digi_config.drain_ready_viscous(now),
+            None => return Ok(()),
+        };
+        for packet in ready {
+            let wire = ax25_to_kiss_wire(&packet);
+            let source = packet.source.callsign.as_str().to_owned();
+            self.session.send_wire(&wire).await?;
+            self.pending_events
+                .push_back(AprsEvent::PacketDigipeated { source });
+        }
+        Ok(())
+    }
+
+    /// Take the raw AX.25 frame received during the most recent
+    /// [`Self::next_event`] cycle, leaving `None` behind.
+    ///
+    /// Returns `Some` only when the cycle that produced the current event
+    /// also received a frame off the air. An `IGate` uses this to forward
+    /// **every** heard packet to APRS-IS — including ones that surfaced as
+    /// typed events (`PositionReceived`, `StationHeard`, …) rather than
+    /// [`AprsEvent::RawPacket`] — by pairing it with
+    /// [`Self::format_for_is`].
+    pub const fn take_last_rf_packet(&mut self) -> Option<Ax25Packet> {
+        self.last_rf_packet.take()
     }
 
     /// Phase 4: parse the APRS info field, update the station list,
@@ -1967,6 +2045,58 @@ mod tests {
             return Err(format!("expected RawPacket, got {event:?}").into());
         };
         assert_eq!(pkt.source.callsign, "W1AW");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn typed_event_still_exposes_raw_frame_for_igate() -> TestResult {
+        // Regression: an IGate must gate EVERY heard packet, but a standard
+        // position report surfaces as a typed event (StationHeard /
+        // PositionReceived), not RawPacket. `take_last_rf_packet` must still
+        // hand back the underlying frame so the IGate can forward it.
+        let radio = mock_radio(TncBaud::Bps1200).await?;
+        let config = test_config();
+        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+
+        let info = b"!3515.00N/09745.00W>mobile";
+        let wire = build_kiss_data_frame("W1AW", 7, info);
+        client.session.transport.queue_read(&wire);
+
+        let event = client
+            .next_event()
+            .await?
+            .ok_or("next_event returned Ok(None), expected a typed event")?;
+        assert!(
+            !matches!(event, AprsEvent::RawPacket(_)),
+            "a plain position must classify as a typed event, got {event:?}"
+        );
+
+        // The raw frame for this cycle is available for gating, and taking
+        // it leaves None behind.
+        let pkt = client
+            .take_last_rf_packet()
+            .ok_or("take_last_rf_packet returned None after a received frame")?;
+        assert_eq!(pkt.source.callsign, "W1AW");
+        assert_eq!(pkt.source.ssid.get(), 7);
+        assert!(
+            client.take_last_rf_packet().is_none(),
+            "take_last_rf_packet must consume the frame"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_cycle_leaves_no_raw_frame_to_gate() -> TestResult {
+        // An idle cycle (no frame received) must not leave a stale frame
+        // that an IGate would re-gate against an unrelated event.
+        let radio = mock_radio(TncBaud::Bps1200).await?;
+        let config = test_config();
+        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let _ = client.next_event().await?;
+        assert!(
+            client.take_last_rf_packet().is_none(),
+            "idle cycle must not expose a frame to gate"
+        );
         Ok(())
     }
 

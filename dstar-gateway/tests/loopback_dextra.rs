@@ -177,3 +177,44 @@ async fn dextra_async_session_observes_connected_event() -> Result<(), Box<dyn s
 
     Ok(())
 }
+
+/// The activity watch must advance when a datagram arrives from the
+/// reflector after the session task is spawned.
+#[tokio::test]
+async fn activity_watch_updates_on_inbound_datagram() -> Result<(), Box<dyn std::error::Error>> {
+    let fake = FakeReflector::spawn_dextra().await?;
+    let reflector_addr = fake.local_addr()?;
+    let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let session: Session<DExtra, Configured> = Session::<DExtra, Configured>::builder()
+        .callsign(Callsign::from_wire_bytes(*b"W1AW    "))
+        .local_module(Module::B)
+        .reflector_module(Module::C)
+        .peer(reflector_addr)
+        .build();
+    let now = Instant::now();
+    let mut connecting = session.connect(now)?;
+    {
+        let tx = connecting.poll_transmit(now).ok_or("LINK not ready")?;
+        let _ = client_sock.send_to(tx.payload, tx.dst).await?;
+    }
+    let mut buf = [0u8; 64];
+    let (n, peer) = timeout(Duration::from_secs(2), client_sock.recv_from(&mut buf)).await??;
+    connecting.handle_input(Instant::now(), peer, buf.get(..n).ok_or("n out of bounds")?)?;
+    let connected = connecting.promote()?;
+    let mut async_session = AsyncSession::spawn(connected, Arc::clone(&client_sock));
+
+    let mut activity = async_session.activity();
+    let before = *activity.borrow_and_update();
+
+    // A DExtra keepalive from the reflector: 8-char callsign + NUL.
+    // Any inbound datagram must refresh the activity instant.
+    fake.send_to_peer(b"XRF030  \0").await?;
+
+    timeout(Duration::from_secs(2), activity.changed()).await??;
+    assert!(
+        *activity.borrow() > before,
+        "activity instant must advance past the pre-datagram value"
+    );
+    async_session.disconnect().await?;
+    Ok(())
+}

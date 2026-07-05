@@ -49,6 +49,15 @@ const AMBE_SAMPLE_RATE: u32 = 8000;
 /// Samples per AMBE frame (20 ms at 8 kHz).
 const AMBE_FRAME_SAMPLES: usize = 160;
 
+/// Frames of resampled RX audio accumulated before the first push to
+/// the speaker ring buffer (~60 ms). The headroom rides through the
+/// stream, absorbing network jitter that would otherwise underrun.
+const RX_PRIME_FRAMES: usize = 3;
+
+/// Samples of raised-cosine ramp at 8 kHz (10 ms) applied to each
+/// stream's first frame (fade-in) and final frame (fade-out).
+const RX_FADE_SAMPLES: usize = 80;
+
 /// Handle the GUI (and session task) holds; forwards user intent
 /// and RX frames to the audio worker thread.
 ///
@@ -81,6 +90,14 @@ pub(crate) enum AudioCommand {
     RxStart,
     /// One voice frame arrived from the reflector — decode + play.
     RxFrame(VoiceFrame),
+    /// A voice frame was lost upstream (UDP sequence gap) —
+    /// synthesize one concealment frame so the hole plays as a
+    /// parameter-repeat instead of a 20 ms silence gap.
+    RxLost,
+    /// The RX stream ended (EOT, inactivity, or link loss) — fade
+    /// out and flush the held-back tail frame, then reset playback
+    /// state for the next stream.
+    RxEnd,
     /// Set the operator's slow-data text and/or GPS beacon. Either
     /// field may be `None`. Takes effect on the next TX frame.
     SetSlowData {
@@ -135,6 +152,85 @@ pub(crate) enum AudioStatus {
     },
     /// Recording started (`true`) or stopped (`false`).
     Recording(bool),
+}
+
+/// Direction of a raised-cosine amplitude ramp.
+#[derive(Debug, Clone, Copy)]
+enum FadeDirection {
+    /// Ramp the first `RX_FADE_SAMPLES` from 0 → 1.
+    In,
+    /// Ramp the last `RX_FADE_SAMPLES` from 1 → 0.
+    Out,
+}
+
+/// Apply a 10 ms raised-cosine ramp in place to one 8 kHz frame.
+fn apply_fade(pcm: &mut [i16; AMBE_FRAME_SAMPLES], direction: FadeDirection) {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "RX_FADE_SAMPLES is 80 — exact in f32"
+    )]
+    let ramp_len = RX_FADE_SAMPLES as f32;
+    for i in 0..RX_FADE_SAMPLES {
+        #[expect(clippy::cast_precision_loss, reason = "i < 80 — exact in f32")]
+        let rising = 0.5 * (1.0 - (std::f32::consts::PI * i as f32 / ramp_len).cos());
+        let (idx, gain) = match direction {
+            FadeDirection::In => (i, rising),
+            FadeDirection::Out => (AMBE_FRAME_SAMPLES - RX_FADE_SAMPLES + i, 1.0 - rising),
+        };
+        if let Some(s) = pcm.get_mut(idx) {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "gain ≤ 1.0 keeps the product inside i16 range"
+            )]
+            {
+                *s = (f32::from(*s) * gain) as i16;
+            }
+        }
+    }
+}
+
+/// One-frame holdback for RX playback.
+///
+/// The most recent decoded frame waits here and is released only
+/// when its successor arrives, so end-of-stream can fade the final
+/// frame's tail before it reaches the speaker. Costs one frame
+/// (20 ms) of RX latency — inaudible for reflector listening.
+#[derive(Debug, Default)]
+struct RxPlayback {
+    /// Held-back most recent frame (8 kHz, pre-resample).
+    hold: Option<[i16; AMBE_FRAME_SAMPLES]>,
+    /// Frames released from holdback so far this stream.
+    emitted: usize,
+}
+
+impl RxPlayback {
+    /// Reset for a new stream, discarding any unflushed holdback
+    /// (the previous stream ended without EOT — its tail is stale).
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Feed one decoded/concealed frame; returns the previous frame,
+    /// now due for emission. The stream's first frame is faded in.
+    fn push(&mut self, mut pcm: [i16; AMBE_FRAME_SAMPLES]) -> Option<[i16; AMBE_FRAME_SAMPLES]> {
+        if self.hold.is_none() && self.emitted == 0 {
+            apply_fade(&mut pcm, FadeDirection::In);
+        }
+        let due = self.hold.replace(pcm);
+        if due.is_some() {
+            self.emitted = self.emitted.saturating_add(1);
+        }
+        due
+    }
+
+    /// End of stream: returns the held final frame with its tail
+    /// faded out, or `None` when nothing is held.
+    fn finish(&mut self) -> Option<[i16; AMBE_FRAME_SAMPLES]> {
+        let mut last = self.hold.take()?;
+        apply_fade(&mut last, FadeDirection::Out);
+        self.emitted = self.emitted.saturating_add(1);
+        Some(last)
+    }
 }
 
 /// Cyclic slow-data fragment scheduler for the TX path.
@@ -323,6 +419,10 @@ fn run_audio_worker(
         level_tick: 0,
         recorder: None,
         tx_file: None,
+        rx_playback: RxPlayback::default(),
+        rx_prime: Vec::with_capacity(65_536),
+        rx_prime_frames: 0,
+        rx_primed: false,
     };
     // Enumerate devices once at startup so the GUI's pickers populate
     // without waiting for an explicit EnumerateDevices command.
@@ -381,6 +481,15 @@ struct AudioWorker {
     /// transmit-from-file is in progress. `pump_tx` pulls frames from
     /// here instead of the mic.
     tx_file: Option<std::vec::IntoIter<f32>>,
+    /// RX one-frame holdback + fade bookkeeping.
+    rx_playback: RxPlayback,
+    /// Resampled PCM accumulated during stream-start priming.
+    rx_prime: Vec<f32>,
+    /// Frames accumulated into `rx_prime` so far this stream.
+    rx_prime_frames: usize,
+    /// True once priming has flushed — frames then push straight
+    /// through to the speaker.
+    rx_primed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -515,9 +624,14 @@ impl AudioWorker {
             AudioCommand::TransmitFile { path } => self.transmit_file(&path),
             AudioCommand::StopTx => self.stop_tx_capture(),
             AudioCommand::RxStart => {
-                tracing::info!("RX stream starting — decoder reset");
+                tracing::info!("RX stream starting — decoder + playback reset");
                 self.decoder = AmbeDecoder::new();
+                self.rx_playback.reset();
+                self.rx_prime.clear();
+                self.rx_prime_frames = 0;
+                self.rx_primed = false;
             }
+            AudioCommand::RxEnd => self.finish_rx_stream(),
             AudioCommand::RxFrame(frame) => {
                 tracing::trace!(
                     ambe = format_args!("{:02x?}", frame.ambe),
@@ -525,30 +639,86 @@ impl AudioWorker {
                 );
                 // Decode the 9-byte AMBE into 160 i16 samples @ 8 kHz.
                 let pcm_i16 = self.decoder.decode_frame(&frame.ambe);
-                // While recording, tee the decoded 8 kHz PCM straight
-                // to the WAV (the codec's native rate — no resampling).
-                if let Some(writer) = self.recorder.as_mut() {
-                    for &s in &pcm_i16 {
-                        let _unused = writer.write_sample(s);
-                    }
-                }
-                // Convert to f32 for resampling.
-                self.resampled_in.clear();
-                self.resampled_in
-                    .extend(pcm_i16.iter().map(|&s| f32::from(s) / 32768.0));
-                // Track the RX peak for the level meter.
-                let rx_pk = self
-                    .resampled_in
-                    .iter()
-                    .fold(0.0_f32, |acc, &s| acc.max(s.abs()));
-                self.rx_peak = self.rx_peak.max(rx_pk);
-                // Resample to HW output rate, push to speaker ringbuf.
-                if let Some(audio) = self.audio.as_mut() {
-                    self.resampled_out = audio.rx_resampler.process(&self.resampled_in);
-                    audio.push_speaker(&self.resampled_out);
-                }
+                self.handle_rx_pcm(&pcm_i16);
+            }
+            AudioCommand::RxLost => {
+                let pcm_i16 = self.decoder.conceal_frame();
+                self.handle_rx_pcm(&pcm_i16);
             }
         }
+    }
+
+    /// Route one decoded (or concealed) 8 kHz frame into the
+    /// holdback; emit whichever frame the holdback releases.
+    fn handle_rx_pcm(&mut self, pcm_i16: &[i16; AMBE_FRAME_SAMPLES]) {
+        if let Some(due) = self.rx_playback.push(*pcm_i16) {
+            self.emit_rx_frame(&due);
+        }
+    }
+
+    /// Stream end: flush the faded tail and any un-flushed priming
+    /// buffer (streams shorter than the priming depth), then reset.
+    fn finish_rx_stream(&mut self) {
+        if let Some(last) = self.rx_playback.finish() {
+            self.emit_rx_frame(&last);
+        }
+        self.flush_rx_prime();
+        self.rx_playback.reset();
+        self.rx_prime_frames = 0;
+        self.rx_primed = false;
+    }
+
+    /// Emit one frame down the RX output path: recorder tee, level
+    /// meter, resample, then prime-or-push to the speaker.
+    fn emit_rx_frame(&mut self, pcm_i16: &[i16; AMBE_FRAME_SAMPLES]) {
+        // While recording, tee the decoded 8 kHz PCM straight
+        // to the WAV (the codec's native rate — no resampling).
+        if let Some(writer) = self.recorder.as_mut() {
+            for &s in pcm_i16 {
+                let _unused = writer.write_sample(s);
+            }
+        }
+        // Convert to f32 for resampling.
+        self.resampled_in.clear();
+        self.resampled_in
+            .extend(pcm_i16.iter().map(|&s| f32::from(s) / 32768.0));
+        // Track the RX peak for the level meter.
+        let rx_pk = self
+            .resampled_in
+            .iter()
+            .fold(0.0_f32, |acc, &s| acc.max(s.abs()));
+        self.rx_peak = self.rx_peak.max(rx_pk);
+        // Resample to HW output rate.
+        if let Some(audio) = self.audio.as_mut() {
+            self.resampled_out = audio.rx_resampler.process(&self.resampled_in);
+        } else {
+            return;
+        }
+        if self.rx_primed {
+            if let Some(audio) = self.audio.as_mut() {
+                audio.push_speaker(&self.resampled_out);
+            }
+        } else {
+            // Accumulate the stream's first frames so playback opens
+            // with jitter headroom instead of racing the network.
+            self.rx_prime.extend_from_slice(&self.resampled_out);
+            self.rx_prime_frames = self.rx_prime_frames.saturating_add(1);
+            if self.rx_prime_frames >= RX_PRIME_FRAMES {
+                self.flush_rx_prime();
+            }
+        }
+    }
+
+    /// Push the accumulated priming buffer to the speaker and switch
+    /// to pass-through.
+    fn flush_rx_prime(&mut self) {
+        if !self.rx_prime.is_empty()
+            && let Some(audio) = self.audio.as_mut()
+        {
+            audio.push_speaker(&self.rx_prime);
+        }
+        self.rx_prime.clear();
+        self.rx_primed = true;
     }
 
     /// Rebuild audio I/O on the named devices, surfacing any failure
@@ -1391,5 +1561,80 @@ mod tests {
         let mut sched = super::TxSlowData::default();
         sched.set(None, None, "W1AW");
         assert!(sched.next_fragment().is_none());
+    }
+
+    /// Fade-in silences the very first sample and leaves everything
+    /// past the ramp untouched.
+    #[test]
+    fn fade_in_silences_frame_start() -> TestResult {
+        use super::{AMBE_FRAME_SAMPLES, FadeDirection, RX_FADE_SAMPLES, apply_fade};
+        let mut pcm = [10_000_i16; AMBE_FRAME_SAMPLES];
+        apply_fade(&mut pcm, FadeDirection::In);
+        assert_eq!(pcm.first().copied(), Some(0), "first sample must be 0");
+        let past_ramp = pcm.get(RX_FADE_SAMPLES..).ok_or("ramp within frame")?;
+        assert!(
+            past_ramp.iter().all(|&s| s == 10_000),
+            "samples past the ramp must be untouched"
+        );
+        Ok(())
+    }
+
+    /// Fade-out takes the final sample to (near) zero and leaves the
+    /// frame's start untouched.
+    #[test]
+    fn fade_out_silences_frame_end() -> TestResult {
+        use super::{AMBE_FRAME_SAMPLES, FadeDirection, RX_FADE_SAMPLES, apply_fade};
+        let mut pcm = [100_i16; AMBE_FRAME_SAMPLES];
+        apply_fade(&mut pcm, FadeDirection::Out);
+        let last = pcm.last().copied().ok_or("non-empty frame")?;
+        assert!(last.abs() <= 1, "final sample must be ~0, got {last}");
+        let before_ramp = pcm
+            .get(..AMBE_FRAME_SAMPLES - RX_FADE_SAMPLES)
+            .ok_or("ramp within frame")?;
+        assert!(
+            before_ramp.iter().all(|&s| s == 100),
+            "samples before the ramp must be untouched"
+        );
+        Ok(())
+    }
+
+    /// The holdback delays every frame by exactly one slot and
+    /// fades the stream's first frame in.
+    #[test]
+    fn holdback_delays_by_one_frame() -> TestResult {
+        use super::{AMBE_FRAME_SAMPLES, RxPlayback};
+        let mut rx = RxPlayback::default();
+        assert!(
+            rx.push([100; AMBE_FRAME_SAMPLES]).is_none(),
+            "first frame is held"
+        );
+        let due = rx
+            .push([200; AMBE_FRAME_SAMPLES])
+            .ok_or("second push releases the first frame")?;
+        assert_eq!(
+            due.first().copied(),
+            Some(0),
+            "released first frame is faded in"
+        );
+        assert_eq!(
+            due.last().copied(),
+            Some(100),
+            "released frame is the first one pushed"
+        );
+        Ok(())
+    }
+
+    /// Finish releases the held tail faded out; a second finish has
+    /// nothing left.
+    #[test]
+    fn finish_fades_out_the_held_tail() -> TestResult {
+        use super::{AMBE_FRAME_SAMPLES, RxPlayback};
+        let mut rx = RxPlayback::default();
+        let _held = rx.push([100; AMBE_FRAME_SAMPLES]);
+        let last = rx.finish().ok_or("held frame flushed on finish")?;
+        let tail = last.last().copied().ok_or("non-empty frame")?;
+        assert!(tail.abs() <= 1, "tail must be faded to ~0, got {tail}");
+        assert!(rx.finish().is_none(), "nothing left after finish");
+        Ok(())
     }
 }

@@ -249,6 +249,10 @@ pub struct AmbeDecoder {
     prev_enhanced: MbeParams,
     /// Per-stream RNG state for comfort noise output during muting.
     comfort_noise_state: u64,
+    /// Running oscillator phase for tone-frame synthesis, in radians.
+    /// Carried across consecutive tone frames so the sine is
+    /// continuous at frame boundaries.
+    tone_phase: f32,
 }
 
 impl AmbeDecoder {
@@ -264,6 +268,7 @@ impl AmbeDecoder {
             prev: MbeParams::new(),
             prev_enhanced: MbeParams::new(),
             comfort_noise_state: adaptive::COMFORT_NOISE_INIT_SEED,
+            tone_phase: 0.0,
         }
     }
 
@@ -287,31 +292,67 @@ impl AmbeDecoder {
         unpack::demodulate_c1(&mut ambe_fr);
         let other_errors = ecc::ecc_data(&ambe_fr, &mut ambe_d);
 
-        // Error concealment: three conditions trigger "reuse previous
-        // frame's parameters + increment repeat_count" for the current
-        // frame. `repeat_count` accumulates across consecutive bad
-        // frames; sustained failures (≥3) trigger muting downstream.
+        // Frame disposition — ports mbelib's `mbe_processAmbe2400Dataf`
+        // (`mbelib/ambe3600x2400.c:655-713`) exactly:
         //
-        // 1. C0-uncorrectable (Golay(23,12) exceeded its 3-error
-        //    correction capacity). b0 and the other C0 data bits are
-        //    untrustworthy, so decode_params shouldn't even run.
-        // 2. decode_params returned `Erasure`: b0 in 120..=123 is the
-        //    AMBE codec's explicit "unrecoverable frame" signal.
-        // 3. decode_params returned `Tone`: b0 in 126..=127 signals a
-        //    codec-level tone. D-STAR doesn't use codec tones (DTMF
-        //    goes over slow-data), so we treat this as erasure too.
-        let mut reuse_prev = c0_errors > adaptive::GOLAY_C0_CAPACITY;
-        if !reuse_prev {
-            reuse_prev = decode::decode_params(&ambe_d, &mut self.cur, &self.prev)
-                != decode::FrameStatus::Voice;
+        // 1. Erasure (b0 in 120..=123) or tone (b0 in 126..=127, unused
+        //    by D-STAR): output silence and RE-INITIALIZE the decoder
+        //    state — the reference calls `mbe_initMbeParms` here, so
+        //    the next voice frame predicts from defaults, not from
+        //    whatever preceded the erasure.
+        // 2. More than 3 total FEC-corrected bits (`errs2 > 3`): the
+        //    corrections nominally succeeded, but Golay mis-corrects
+        //    silently at these error densities, so the decoded
+        //    parameters can't be trusted. Reuse the previous frame's
+        //    RAW parameters (`mbe_useLastMbeParms` copies `prev_mp`,
+        //    not the enhanced snapshot) and increment the repeat
+        //    counter. Real-world reflector uplinks sit in this zone
+        //    for a large fraction of frames — decoding them fresh is
+        //    what turned noisy-but-intelligible speech into garble.
+        // 3. More than 3 consecutive repeats: mute (comfort noise
+        //    downstream) and re-initialize, per the reference's
+        //    `cur_mp->repeat <= 3` gate.
+        let errs2 = c0_errors + other_errors;
+        let status = decode::decode_params(&ambe_d, &mut self.cur, &self.prev);
+        match status {
+            decode::FrameStatus::Voice => {}
+            decode::FrameStatus::Tone { index, volume } if (5..=122).contains(&index) => {
+                // Single tone at index × 31.25 Hz. No open reference
+                // implements tone synthesis (mbelib decodes the
+                // descriptor for diagnostics and outputs silence), but
+                // real DVSI decoders render the tone — and hardware
+                // encoders emit tone frames for any pure-tone input,
+                // so muting them fails legitimate captures. The
+                // amplitude mapping (`volume × 32`) is empirical:
+                // volume ≈ 172 (a TH-D75 fed a strong test tone)
+                // lands at speech-typical peaks (~5500).
+                return self.synthesize_tone(index, volume);
+            }
+            _ => {
+                // Erasure, invalid tone index, or dual tone (the
+                // D-STAR dual-tone table is undocumented): silence +
+                // full state reset, mirroring the reference's tone/
+                // erasure disposition.
+                *self = Self::new();
+                return [0_i16; FRAME_SAMPLES];
+            }
         }
-
-        if reuse_prev {
-            let prev_repeat = self.prev_enhanced.repeat_count;
-            self.cur.copy_from(&self.prev_enhanced);
+        if errs2 > adaptive::MAX_CORRECTED_BITS {
+            let prev_repeat = self.prev.repeat_count;
+            self.cur.copy_from(&self.prev);
             self.cur.repeat_count = prev_repeat + 1;
         } else {
             self.cur.repeat_count = 0;
+        }
+        if self.cur.repeat_count > adaptive::MAX_FRAME_REPEATS {
+            // Sustained repeats: comfort noise + full state reset so
+            // the next good frame starts from a clean prediction.
+            let mut pcm_f = [0.0_f32; FRAME_SAMPLES];
+            adaptive::synthesize_comfort_noise(&mut pcm_f, &mut self.comfort_noise_state);
+            let noise_state = self.comfort_noise_state;
+            *self = Self::new();
+            self.comfort_noise_state = noise_state;
+            return float_to_i16(&pcm_f);
         }
 
         // Update error tracking for adaptive smoothing and muting.
@@ -331,6 +372,80 @@ impl AmbeDecoder {
             self.cur.error_rate = self.cur.error_count_total as f32 / FRAME_BITS;
         }
 
+        self.synthesize_current()
+    }
+
+    /// Synthesizes one 20 ms concealment frame for a frame known to
+    /// be missing (e.g. a UDP sequence gap on a network transport).
+    ///
+    /// Runs the same repeat path as an uncorrectable or wire-erasure
+    /// frame: the previous frame's enhanced parameters are reused and
+    /// the repeat counter increments, so sustained loss degrades to
+    /// comfort noise exactly like sustained RF errors (JMBE-
+    /// compatible). Call once per missing frame, in stream order,
+    /// interleaved with [`Self::decode_frame`] calls for the frames
+    /// that did arrive.
+    #[must_use]
+    pub fn conceal_frame(&mut self) -> [i16; FRAME_SAMPLES] {
+        // Same repeat semantics as an untrustworthy wire frame: copy
+        // the previous frame's RAW parameters (the reference's
+        // `mbe_useLastMbeParms` copies `prev_mp`, not the enhanced
+        // snapshot — repeats must not re-enhance already-enhanced
+        // spectra) and increment the repeat counter.
+        let prev_repeat = self.prev.repeat_count;
+        self.cur.copy_from(&self.prev);
+        self.cur.repeat_count = prev_repeat + 1;
+        if self.cur.repeat_count > adaptive::MAX_FRAME_REPEATS {
+            // Sustained loss: comfort noise + full state reset, the
+            // same degradation as sustained wire errors.
+            let mut pcm_f = [0.0_f32; FRAME_SAMPLES];
+            adaptive::synthesize_comfort_noise(&mut pcm_f, &mut self.comfort_noise_state);
+            let noise_state = self.comfort_noise_state;
+            *self = Self::new();
+            self.comfort_noise_state = noise_state;
+            return float_to_i16(&pcm_f);
+        }
+        // No bits arrived, so there are no FEC error statistics.
+        self.cur.error_count_total = 0;
+        self.cur.error_rate = 0.0;
+        self.synthesize_current()
+    }
+
+    /// Synthesizes one 20 ms single-tone frame: a phase-continuous
+    /// sine at `index × 31.25 Hz`, amplitude `volume × 32`.
+    ///
+    /// The speech-model state resets afterwards (the next voice frame
+    /// predicts from defaults, as after any non-voice frame) while the
+    /// oscillator phase persists so back-to-back tone frames join
+    /// without a discontinuity.
+    fn synthesize_tone(&mut self, index: u8, volume: u8) -> [i16; FRAME_SAMPLES] {
+        let step = core::f32::consts::TAU * f32::from(index) * 31.25 / 8000.0;
+        let amp = f32::from(volume) * 32.0;
+        let mut pcm = [0_i16; FRAME_SAMPLES];
+        for slot in &mut pcm {
+            self.tone_phase = (self.tone_phase + step) % core::f32::consts::TAU;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "amp ≤ 255 × 32 = 8160, well inside i16 range"
+            )]
+            {
+                *slot = (self.tone_phase.sin() * amp) as i16;
+            }
+        }
+        let phase = self.tone_phase;
+        let noise_state = self.comfort_noise_state;
+        *self = Self::new();
+        self.tone_phase = phase;
+        self.comfort_noise_state = noise_state;
+        pcm
+    }
+
+    /// Runs the post-parameter half of the decode pipeline on
+    /// `self.cur`: prediction-reference snapshot, spectral
+    /// enhancement, adaptive smoothing, the muting decision, speech
+    /// (or comfort-noise) synthesis, and the enhanced-parameter
+    /// snapshot for the next frame's cross-fade.
+    fn synthesize_current(&mut self) -> [i16; FRAME_SAMPLES] {
         // Snapshot raw parameters as prediction reference for next frame.
         self.prev.copy_from(&self.cur);
 

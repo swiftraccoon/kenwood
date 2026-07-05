@@ -160,6 +160,22 @@ pub(crate) enum SessionEvent {
     /// Reflector hosts learned from the `DPlus` auth server, forwarded
     /// so the GUI can merge them into the reflector directory.
     ReflectorHosts(Vec<(String, std::net::IpAddr)>),
+    /// Per-stream RX link-quality counters. Emitted when a stream
+    /// ends (final values) and once per second while one is active.
+    RxStats {
+        /// Voice frames received and played.
+        received: u32,
+        /// Frames lost to sequence gaps.
+        lost: u32,
+        /// Frames dropped for arriving late.
+        late: u32,
+    },
+    /// Periodic (1 Hz) link-health sample while connected.
+    LinkHealth {
+        /// Seconds since the last datagram arrived from the
+        /// reflector (keepalives included).
+        last_heard_secs: f32,
+    },
 }
 
 /// Protocol-generic wrapper over `AsyncSession<P>`. Borrowed verbatim
@@ -177,6 +193,16 @@ impl RuntimeSession {
             Self::DPlus(s) => s.next_event().await.map(RuntimeEvent::from_dplus),
             Self::DExtra(s) => s.next_event().await.map(RuntimeEvent::from_dextra),
             Self::Dcs(s) => s.next_event().await.map(RuntimeEvent::from_dcs),
+        }
+    }
+
+    /// Watch receiver for the instant of the last datagram from the
+    /// reflector — see [`AsyncSession::activity`].
+    fn activity(&self) -> tokio::sync::watch::Receiver<Instant> {
+        match self {
+            Self::DPlus(s) => s.activity(),
+            Self::DExtra(s) => s.activity(),
+            Self::Dcs(s) => s.activity(),
         }
     }
 
@@ -235,6 +261,46 @@ struct TxStream {
 /// D-STAR superframe length — seq wraps mod this value.
 const SUPERFRAME_LEN: u8 = 21;
 
+/// Longest sequence gap concealed frame-by-frame (10 frames =
+/// 200 ms). Beyond this, repeating one voice posture sounds worse
+/// than a clean dropout, so the stream resyncs instead.
+const MAX_CONCEAL: u8 = 10;
+
+/// Frames within this distance BEHIND the expected sequence are
+/// treated as late/reordered duplicates and dropped. The wire
+/// counter is mod-21, so "slightly behind" and "far ahead" are the
+/// same number — this window is how the two are told apart.
+const REORDER_WINDOW: u8 = 3;
+
+/// Where an arriving frame's sequence lands relative to expectation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GapClass {
+    /// Exactly the expected sequence.
+    InOrder,
+    /// This many frames were lost — conceal them, then play the frame.
+    Conceal(u8),
+    /// Too many frames lost to conceal — resync and play the frame.
+    Dropout(u8),
+    /// Behind the expected sequence — drop the frame, never
+    /// double-play.
+    Late,
+}
+
+/// Classify `seq` against the `expected` next sequence on the mod-21
+/// superframe ring.
+const fn classify_gap(expected: u8, seq: u8) -> GapClass {
+    let gap = (seq + SUPERFRAME_LEN - expected) % SUPERFRAME_LEN;
+    if gap == 0 {
+        GapClass::InOrder
+    } else if gap <= MAX_CONCEAL {
+        GapClass::Conceal(gap)
+    } else if gap >= SUPERFRAME_LEN - REORDER_WINDOW {
+        GapClass::Late
+    } else {
+        GapClass::Dropout(gap)
+    }
+}
+
 #[derive(Debug)]
 enum RuntimeEvent {
     VoiceStart {
@@ -258,6 +324,11 @@ enum RuntimeEvent {
     /// and tell the GUI the link is dead, instead of leaving a stale
     /// `Connected` indicator while every TX silently fails.
     Disconnected { reason: String },
+    /// Keepalive echo from the reflector. Liveness is already
+    /// surfaced through the activity watch (the status line's
+    /// "heard Ns ago"), so these stay out of the event log — at
+    /// poll cadence they'd drown every operator-relevant line.
+    Keepalive,
     /// Anything else — logged as a debug line, not surfaced to the GUI
     /// explicitly.
     Other(String),
@@ -287,6 +358,7 @@ impl RuntimeEvent {
             Event::Disconnected { reason } => Self::Disconnected {
                 reason: format!("{reason:?}"),
             },
+            Event::PollEcho { .. } => Self::Keepalive,
             other => Self::Other(format!("{other:?}")),
         }
     }
@@ -373,6 +445,15 @@ struct EventState {
     /// `SlowDataMessage` event can correlate with the originating
     /// `VoiceStart` in the GUI log.
     rx_stream_id: u16,
+    /// Next expected wire seq (0..21) on the active RX stream;
+    /// `None` until the stream's first frame arrives (and between
+    /// streams).
+    expected_seq: Option<u8>,
+    /// Frames lost to sequence gaps this stream (concealed or
+    /// skipped in a dropout resync).
+    frames_lost: u32,
+    /// Frames dropped for arriving behind the expected sequence.
+    frames_late: u32,
 }
 
 /// One decision the run loop should act on after processing a runtime
@@ -386,6 +467,12 @@ enum EventDecision {
     AudioRxStart,
     /// Hand a decoded voice frame to the audio worker.
     AudioRxFrame(VoiceFrame),
+    /// A frame was lost upstream — tell the audio worker to
+    /// synthesize one concealment frame.
+    AudioRxLost,
+    /// The RX stream ended — tell the audio worker to fade out and
+    /// flush its held-back tail frame.
+    AudioRxEnd,
     /// Clear the active session — the reflector booted us or the
     /// underlying transport died. The run loop sets `session = None`.
     ClearSession,
@@ -400,6 +487,39 @@ impl PartialEq for EventDecision {
     }
 }
 
+/// Apply the sequence-gap policy for one arriving frame: queue
+/// concealment decisions for small gaps, resync silently on
+/// dropouts, and update the loss/late counters.
+///
+/// Returns `false` when the frame is a late duplicate that the
+/// caller must drop (the stream already played past its slot —
+/// playing it now would double-play 20 ms of audio).
+fn apply_gap_policy(state: &mut EventState, seq: u8, decisions: &mut Vec<EventDecision>) -> bool {
+    match state
+        .expected_seq
+        .map(|expected| classify_gap(expected, seq))
+    {
+        Some(GapClass::Late) => {
+            state.frames_late = state.frames_late.saturating_add(1);
+            return false;
+        }
+        Some(GapClass::Conceal(n)) => {
+            state.frames_lost = state.frames_lost.saturating_add(u32::from(n));
+            for _ in 0..n {
+                decisions.push(EventDecision::AudioRxLost);
+            }
+        }
+        Some(GapClass::Dropout(n)) => {
+            // Too long to conceal without smearing one voice
+            // posture across the hole — count it and resync.
+            tracing::debug!(lost = n, seq, "RX dropout — resyncing without concealment");
+            state.frames_lost = state.frames_lost.saturating_add(u32::from(n));
+        }
+        Some(GapClass::InOrder) | None => {}
+    }
+    true
+}
+
 /// Translate a runtime event into a list of decisions for the run
 /// loop to execute. Pure function; mutates only the supplied
 /// `EventState` counter and slow-data collector.
@@ -408,6 +528,9 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
         RuntimeEvent::VoiceStart { stream_id, my_call } => {
             state.rx_frame_count = 0;
             state.rx_stream_id = stream_id.get();
+            state.expected_seq = None;
+            state.frames_lost = 0;
+            state.frames_late = 0;
             // Reset slow-data assembly so half-block state from a
             // previous stream can't bleed into the new message.
             state.slow_data.reset();
@@ -421,6 +544,13 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
             ]
         }
         RuntimeEvent::VoiceFrame { seq, frame } => {
+            let mut decisions = Vec::new();
+            if !apply_gap_policy(state, seq, &mut decisions) {
+                // Late duplicate — dropped whole, including its
+                // slow-data fragment (its superframe slot has passed).
+                return decisions;
+            }
+            state.expected_seq = Some((seq + 1) % SUPERFRAME_LEN);
             state.rx_frame_count = state.rx_frame_count.saturating_add(1);
             // `slow_data` is `[u8; 3]` (`Copy`) — read it out before
             // `frame` is moved into the `AudioRxFrame` decision so both
@@ -428,7 +558,7 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
             let slow = frame.slow_data;
             state.slow_data.push(slow, seq);
             let gps = state.gps.push(slow, seq);
-            let mut decisions = vec![EventDecision::AudioRxFrame(frame)];
+            decisions.push(EventDecision::AudioRxFrame(frame));
             if let Some(msg_bytes) = state.slow_data.take_message() {
                 let text = String::from_utf8_lossy(&msg_bytes).trim_end().to_string();
                 if !text.is_empty() {
@@ -451,27 +581,47 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
         }
         RuntimeEvent::VoiceEnd { stream_id, reason } => {
             let frames = state.rx_frame_count;
+            let lost = state.frames_lost;
+            let late = state.frames_late;
             state.rx_frame_count = 0;
+            state.expected_seq = None;
+            state.frames_lost = 0;
+            state.frames_late = 0;
             // EOT — drop any partial slow-data half-blocks; the next
             // stream restarts assembly cleanly.
             state.slow_data.reset();
             state.gps.reset();
-            vec![EventDecision::EmitSessionEvent(SessionEvent::VoiceEnd {
-                stream_id: stream_id.get(),
-                frames,
-                reason: format!("{reason:?}"),
-            })]
+            vec![
+                EventDecision::AudioRxEnd,
+                EventDecision::EmitSessionEvent(SessionEvent::RxStats {
+                    received: frames,
+                    lost,
+                    late,
+                }),
+                EventDecision::EmitSessionEvent(SessionEvent::VoiceEnd {
+                    stream_id: stream_id.get(),
+                    frames,
+                    reason: format!("{reason:?}"),
+                }),
+            ]
         }
         RuntimeEvent::Disconnected { reason } => {
             state.slow_data.reset();
             state.gps.reset();
             vec![
+                // A link drop mid-stream must still flush the audio
+                // worker's held-back tail frame.
+                EventDecision::AudioRxEnd,
                 EventDecision::EmitSessionEvent(SessionEvent::Log(format!(
                     "session disconnected by reflector: {reason}"
                 ))),
                 EventDecision::ClearSession,
                 EventDecision::EmitSessionEvent(SessionEvent::Status(ConnStatus::Disconnected)),
             ]
+        }
+        RuntimeEvent::Keepalive => {
+            tracing::trace!("reflector keepalive echo");
+            Vec::new()
         }
         RuntimeEvent::Other(s) => vec![EventDecision::EmitSessionEvent(SessionEvent::Log(
             format!("event: {s}"),
@@ -505,6 +655,10 @@ pub(crate) async fn run(
     // Pending reconnect: (when to fire, attempt index). `None` when no
     // reconnect is scheduled.
     let mut reconnect_at: Option<(tokio::time::Instant, u8)> = None;
+    // 1 Hz link-health cadence. Skipped ticks (e.g. during a slow
+    // connect) don't burst-catch-up.
+    let mut health_tick = tokio::time::interval(Duration::from_secs(1));
+    health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -696,6 +850,12 @@ pub(crate) async fn run(
                         EventDecision::AudioRxFrame(frame) => {
                             audio.send(AudioCommand::RxFrame(frame));
                         }
+                        EventDecision::AudioRxLost => {
+                            audio.send(AudioCommand::RxLost);
+                        }
+                        EventDecision::AudioRxEnd => {
+                            audio.send(AudioCommand::RxEnd);
+                        }
                         EventDecision::ClearSession => {
                             session = None;
                             // Schedule an auto-reconnect if the link was
@@ -715,6 +875,27 @@ pub(crate) async fn run(
                                     .await;
                             }
                         }
+                    }
+                }
+            }
+            _ = health_tick.tick(), if session.is_some() => {
+                if let Some(active) = session.as_ref() {
+                    let age = active.runtime.activity().borrow().elapsed();
+                    let _unused = evt_tx
+                        .send(SessionEvent::LinkHealth {
+                            last_heard_secs: age.as_secs_f32(),
+                        })
+                        .await;
+                    // Live per-stream counters while a stream is up —
+                    // the final values still arrive via VoiceEnd.
+                    if rx_state.expected_seq.is_some() {
+                        let _unused = evt_tx
+                            .send(SessionEvent::RxStats {
+                                received: rx_state.rx_frame_count,
+                                lost: rx_state.frames_lost,
+                                late: rx_state.frames_late,
+                            })
+                            .await;
                     }
                 }
             }
@@ -1111,7 +1292,8 @@ fn rand_stream_id() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnStatus, EventDecision, EventState, RuntimeEvent, SessionEvent, decide_runtime_event,
+        ConnStatus, EventDecision, EventState, GapClass, RuntimeEvent, SessionEvent, classify_gap,
+        decide_runtime_event,
     };
     use dstar_gateway_core::session::client::VoiceEndReason;
     use dstar_gateway_core::types::StreamId;
@@ -1158,27 +1340,35 @@ mod tests {
         );
         assert_eq!(
             decisions.len(),
-            3,
-            "expected 3 decisions, got {decisions:?}"
+            4,
+            "expected 4 decisions, got {decisions:?}"
         );
         let first = decisions.first().ok_or("no decisions emitted")?;
         assert!(
-            matches!(first, EventDecision::EmitSessionEvent(SessionEvent::Log(_))),
-            "first decision must be a log line, got {first:?}",
+            matches!(first, EventDecision::AudioRxEnd),
+            "first decision must flush the audio holdback, got {first:?}",
         );
         let second = decisions.get(1).ok_or("missing second decision")?;
         assert!(
-            matches!(second, EventDecision::ClearSession),
-            "second decision must clear the session so subsequent commands fail loudly, \
-             got {second:?}",
+            matches!(
+                second,
+                EventDecision::EmitSessionEvent(SessionEvent::Log(_))
+            ),
+            "second decision must be a log line, got {second:?}",
         );
         let third = decisions.get(2).ok_or("missing third decision")?;
         assert!(
+            matches!(third, EventDecision::ClearSession),
+            "third decision must clear the session so subsequent commands fail loudly, \
+             got {third:?}",
+        );
+        let fourth = decisions.get(3).ok_or("missing fourth decision")?;
+        assert!(
             matches!(
-                third,
+                fourth,
                 EventDecision::EmitSessionEvent(SessionEvent::Status(ConnStatus::Disconnected))
             ),
-            "third decision must flip ConnStatus to Disconnected, got {third:?}",
+            "fourth decision must flip ConnStatus to Disconnected, got {fourth:?}",
         );
         Ok(())
     }
@@ -1383,12 +1573,14 @@ mod tests {
             &mut state,
         );
         assert_eq!(state.rx_frame_count, 0, "VoiceEnd resets the counter");
-        let first = decisions.first().ok_or("no decisions emitted")?;
+        // Index 2: AudioRxEnd and the per-stream RxStats decision
+        // precede VoiceEnd.
+        let third = decisions.get(2).ok_or("missing VoiceEnd decision")?;
         let EventDecision::EmitSessionEvent(SessionEvent::VoiceEnd {
             stream_id, frames, ..
-        }) = first
+        }) = third
         else {
-            return Err(format!("expected VoiceEnd decision, got {first:?}").into());
+            return Err(format!("expected VoiceEnd decision, got {third:?}").into());
         };
         assert_eq!(*stream_id, 0x9ABC);
         assert_eq!(
@@ -1402,7 +1594,7 @@ mod tests {
     fn other_events_emit_log_line() -> TestResult {
         let mut state = EventState::default();
         let decisions = decide_runtime_event(
-            RuntimeEvent::Other("PollEcho { peer: 127.0.0.1:30001 }".into()),
+            RuntimeEvent::Other("HostList { hosts: [] }".into()),
             &mut state,
         );
         assert_eq!(decisions.len(), 1);
@@ -1412,6 +1604,19 @@ mod tests {
             EventDecision::EmitSessionEvent(SessionEvent::Log(_))
         ));
         Ok(())
+    }
+
+    /// Keepalive echoes arrive at poll cadence — they must stay out
+    /// of the event log entirely (liveness is shown by the status
+    /// line's last-heard age instead).
+    #[test]
+    fn keepalive_emits_no_decisions() {
+        let mut state = EventState::default();
+        let decisions = decide_runtime_event(RuntimeEvent::Keepalive, &mut state);
+        assert!(
+            decisions.is_empty(),
+            "keepalive must be silent, got {decisions:?}"
+        );
     }
 
     /// Feeding the fixed-6-byte-block GPS slow-data for a complete
@@ -1469,6 +1674,194 @@ mod tests {
             lon > -84.0 && lon < -81.0,
             "Asheville longitude {lon} out of expected band"
         );
+        Ok(())
+    }
+
+    /// The mod-21 ring is split into zones: exact match, concealable
+    /// gap (1..=10 ahead), dropout (11..=17 ahead), and late
+    /// (within 3 behind).
+    #[test]
+    fn classify_gap_zones() {
+        assert_eq!(classify_gap(5, 5), GapClass::InOrder);
+        assert_eq!(classify_gap(5, 6), GapClass::Conceal(1));
+        assert_eq!(classify_gap(5, 15), GapClass::Conceal(10));
+        assert_eq!(classify_gap(5, 16), GapClass::Dropout(11));
+        assert_eq!(classify_gap(5, 1), GapClass::Dropout(17));
+        assert_eq!(classify_gap(5, 2), GapClass::Late);
+        assert_eq!(classify_gap(5, 4), GapClass::Late);
+        // Wrap-around cases.
+        assert_eq!(classify_gap(20, 0), GapClass::Conceal(1));
+        assert_eq!(classify_gap(0, 20), GapClass::Late);
+        assert_eq!(classify_gap(0, 0), GapClass::InOrder);
+    }
+
+    /// A two-frame sequence gap must emit two concealment decisions
+    /// ahead of the real frame and count the loss.
+    #[test]
+    fn sequence_gap_emits_concealment_decisions() {
+        let mut state = EventState::default();
+        // First frame of the stream initializes the expectation.
+        let _first = decide_runtime_event(
+            RuntimeEvent::VoiceFrame {
+                seq: 0,
+                frame: sample_frame(),
+            },
+            &mut state,
+        );
+        // seq 1 and 2 were lost; seq 3 arrives.
+        let decisions = decide_runtime_event(
+            RuntimeEvent::VoiceFrame {
+                seq: 3,
+                frame: sample_frame(),
+            },
+            &mut state,
+        );
+        assert_eq!(state.frames_lost, 2);
+        assert_eq!(
+            decisions.len(),
+            3,
+            "two conceal + one frame, got {decisions:?}"
+        );
+        assert!(matches!(
+            decisions.first(),
+            Some(EventDecision::AudioRxLost)
+        ));
+        assert!(matches!(decisions.get(1), Some(EventDecision::AudioRxLost)));
+        assert!(matches!(
+            decisions.get(2),
+            Some(EventDecision::AudioRxFrame(_))
+        ));
+    }
+
+    /// Sequence wrap 19 → 20 → 0 is in-order: no concealment, no
+    /// loss counted.
+    #[test]
+    fn seq_wrap_without_gap_is_clean() {
+        let mut state = EventState::default();
+        for seq in [19_u8, 20, 0] {
+            let decisions = decide_runtime_event(
+                RuntimeEvent::VoiceFrame {
+                    seq,
+                    frame: sample_frame(),
+                },
+                &mut state,
+            );
+            assert_eq!(decisions.len(), 1, "seq {seq}: got {decisions:?}");
+        }
+        assert_eq!(state.frames_lost, 0);
+    }
+
+    /// A frame arriving behind the expected sequence was already
+    /// concealed past — playing it now would double-play 20 ms.
+    #[test]
+    fn late_frame_is_dropped_not_double_played() {
+        let mut state = EventState::default();
+        let _first = decide_runtime_event(
+            RuntimeEvent::VoiceFrame {
+                seq: 5,
+                frame: sample_frame(),
+            },
+            &mut state,
+        );
+        let late = decide_runtime_event(
+            RuntimeEvent::VoiceFrame {
+                seq: 4,
+                frame: sample_frame(),
+            },
+            &mut state,
+        );
+        assert!(
+            late.is_empty(),
+            "late frame must produce no decisions, got {late:?}"
+        );
+        assert_eq!(state.frames_late, 1);
+        // The stream recovers: the genuinely-next frame is in order.
+        let next = decide_runtime_event(
+            RuntimeEvent::VoiceFrame {
+                seq: 6,
+                frame: sample_frame(),
+            },
+            &mut state,
+        );
+        assert_eq!(next.len(), 1, "got {next:?}");
+    }
+
+    /// Gaps beyond the conceal cap resync without concealment so a
+    /// long outage doesn't smear one voice posture across seconds.
+    #[test]
+    fn long_gap_resyncs_without_concealment() {
+        let mut state = EventState::default();
+        let _first = decide_runtime_event(
+            RuntimeEvent::VoiceFrame {
+                seq: 0,
+                frame: sample_frame(),
+            },
+            &mut state,
+        );
+        // seq 1..=14 lost — beyond MAX_CONCEAL.
+        let decisions = decide_runtime_event(
+            RuntimeEvent::VoiceFrame {
+                seq: 15,
+                frame: sample_frame(),
+            },
+            &mut state,
+        );
+        assert_eq!(
+            decisions.len(),
+            1,
+            "no concealment on a dropout, got {decisions:?}"
+        );
+        assert!(matches!(
+            decisions.first(),
+            Some(EventDecision::AudioRxFrame(_))
+        ));
+        assert_eq!(state.frames_lost, 14);
+    }
+
+    /// `VoiceEnd` must report the stream's loss counters ahead of the
+    /// `VoiceEnd` event itself.
+    #[test]
+    fn voice_end_reports_stream_stats() -> TestResult {
+        let mut state = EventState::default();
+        let _f0 = decide_runtime_event(
+            RuntimeEvent::VoiceFrame {
+                seq: 0,
+                frame: sample_frame(),
+            },
+            &mut state,
+        );
+        let _f3 = decide_runtime_event(
+            RuntimeEvent::VoiceFrame {
+                seq: 3,
+                frame: sample_frame(),
+            },
+            &mut state,
+        );
+        let decisions = decide_runtime_event(
+            RuntimeEvent::VoiceEnd {
+                stream_id: sid(0x1234),
+                reason: VoiceEndReason::Eot,
+            },
+            &mut state,
+        );
+        let first = decisions.first().ok_or("no decisions")?;
+        assert!(
+            matches!(first, EventDecision::AudioRxEnd),
+            "expected the audio holdback flush first, got {first:?}"
+        );
+        let second = decisions.get(1).ok_or("missing RxStats decision")?;
+        assert!(
+            matches!(
+                second,
+                EventDecision::EmitSessionEvent(SessionEvent::RxStats {
+                    received: 2,
+                    lost: 2,
+                    late: 0,
+                })
+            ),
+            "expected RxStats second, got {second:?}"
+        );
+        assert_eq!(state.frames_lost, 0, "counters reset after VoiceEnd");
         Ok(())
     }
 }

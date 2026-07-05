@@ -67,8 +67,15 @@ struct PendingMessage {
     wire_frame: Vec<u8>,
     /// Number of transmission attempts so far.
     attempts: u8,
-    /// Timestamp of the most recent transmission.
-    last_sent: Instant,
+    /// Timestamp of the most recent transmission, or `None` if the
+    /// message has never been sent yet (in which case it is immediately
+    /// eligible). Representing "never sent" explicitly — rather than by
+    /// backdating `last_sent` into the past — keeps first-send eligibility
+    /// independent of the monotonic clock's origin (on Linux
+    /// `CLOCK_MONOTONIC` is boot-relative, so subtracting the retry
+    /// interval from an early `Instant` would saturate and spuriously
+    /// withhold the first transmission).
+    last_sent: Option<Instant>,
 }
 
 /// Manages APRS message send/receive with automatic ack/retry.
@@ -125,11 +132,12 @@ impl AprsMessenger {
     /// truncated; use [`Self::send_message_checked`] if you want a hard
     /// error instead.
     ///
-    /// `now` is used to initialise the message's `last_sent` timestamp to
-    /// a time in the past so the message is immediately eligible for
-    /// transmission on the next call to
-    /// [`next_frame_to_send`](Self::next_frame_to_send).
-    pub fn send_message(&mut self, addressee: &str, text: &str, now: Instant) -> String {
+    /// The freshly-queued message records no `last_sent` time (`None`),
+    /// which marks it immediately eligible for transmission on the next
+    /// call to [`next_frame_to_send`](Self::next_frame_to_send),
+    /// regardless of the monotonic clock's origin. `now` is accepted for
+    /// API consistency with the other time-aware methods.
+    pub fn send_message(&mut self, addressee: &str, text: &str, _now: Instant) -> String {
         // Pick a fresh ID, skipping any that clash with still-pending
         // messages. The ID space is `1..=u16::MAX` (65 535 slots), far
         // more than MAX_RETRIES of in-flight messages, so this loop
@@ -157,14 +165,16 @@ impl AprsMessenger {
             &self.digipeater_path,
         );
 
-        // Use a time in the past so the message is immediately eligible.
-        let past = now.checked_sub(self.config.retry_interval).unwrap_or(now);
-
+        // `last_sent: None` marks the message as never-sent, hence
+        // immediately eligible on the next `next_frame_to_send`. This
+        // avoids backdating into the past, which would saturate (and so
+        // spuriously withhold the first send) near the monotonic clock's
+        // origin.
         self.pending_messages.push(PendingMessage {
             message_id: message_id.clone(),
             wire_frame,
             attempts: 0,
-            last_sent: past,
+            last_sent: None,
         });
 
         message_id
@@ -183,9 +193,18 @@ impl AprsMessenger {
         let max_retries = self.config.max_retries;
         let retry_interval = self.config.retry_interval;
         for msg in &mut self.pending_messages {
-            if msg.attempts < max_retries && now.duration_since(msg.last_sent) >= retry_interval {
+            if msg.attempts >= max_retries {
+                continue;
+            }
+            // A never-sent message (`last_sent == None`) is eligible
+            // immediately; a previously-sent one only once the retry
+            // interval has elapsed.
+            let eligible = msg
+                .last_sent
+                .is_none_or(|last| now.duration_since(last) >= retry_interval);
+            if eligible {
                 msg.attempts += 1;
-                msg.last_sent = now;
+                msg.last_sent = Some(now);
                 return Some(msg.wire_frame.clone());
             }
         }
@@ -236,18 +255,45 @@ impl AprsMessenger {
         true
     }
 
-    /// Process an incoming APRS message.
+    /// Process an incoming APRS message for acknowledgements of our own
+    /// outbound traffic.
     ///
-    /// If the text is an ack or rej control frame (per [`classify_ack_rej`])
-    /// for a pending message, removes the pending entry and returns `true`.
-    /// Returns `false` for regular messages, including ones that happen to
-    /// start with the letters `ack`/`rej` but aren't valid control frames.
+    /// Two acknowledgement carriers are recognised, and both clear the
+    /// matching pending message:
+    ///
+    /// 1. A standalone ack/rej control frame (per [`classify_ack_rej`]):
+    ///    text of the exact form `ack<id>` / `rej<id>`.
+    /// 2. An APRS 1.1/1.2 reply-ack (`msg.reply_ack`): an ordinary
+    ///    message whose trailer was `{MM}AA`, where `AA` acknowledges our
+    ///    previously-sent message number. Modern clients (`APRSdroid`,
+    ///    `YAAC`, `aprs.fi`) bundle the ack this way instead of sending a
+    ///    separate `ackNN` frame.
+    ///
+    /// Returns `true` if at least one pending message was cleared. Note a
+    /// reply-ack-bearing message is *also* a new inbound message in its own
+    /// right (it carries `msg.message_id` "MM" and display text); callers
+    /// must still route it through [`is_new_incoming`](Self::is_new_incoming)
+    /// and surface it to the operator. This method only handles the
+    /// outbound-ack side and never suppresses that.
+    ///
+    /// Returns `false` for regular messages with no acknowledgement,
+    /// including ones that merely start with the letters `ack`/`rej` but
+    /// aren't valid control frames.
     pub fn process_incoming(&mut self, msg: &AprsMessage) -> bool {
-        let Some((_is_ack, id)) = classify_ack_rej(&msg.text) else {
-            return false;
-        };
         let before = self.pending_messages.len();
-        self.pending_messages.retain(|p| p.message_id != id);
+
+        // (1) Standalone ack/rej control frame: `ack<id>` / `rej<id>`.
+        if let Some((_is_ack, id)) = classify_ack_rej(&msg.text) {
+            self.pending_messages.retain(|p| p.message_id != id);
+        }
+
+        // (2) APRS 1.1/1.2 reply-ack: the `{MM}AA` trailer's `AA` field
+        // acknowledges our outbound message number. Compared verbatim,
+        // matching the format the standalone-ack path uses.
+        if let Some(ref acked) = msg.reply_ack {
+            self.pending_messages.retain(|p| &p.message_id != acked);
+        }
+
         self.pending_messages.len() < before
     }
 
@@ -540,6 +586,119 @@ mod tests {
         };
         assert!(!m.process_incoming(&false_ack));
         assert_eq!(m.pending_count(), 1);
+    }
+
+    #[test]
+    fn process_incoming_reply_ack_clears_pending() {
+        let t0 = Instant::now();
+        let mut m = test_messenger();
+        // Pending outbound message "1".
+        let id = m.send_message("W1AW", "ping", t0);
+        assert_eq!(id, "1");
+        assert_eq!(m.pending_count(), 1);
+
+        // Incoming ":N0CALL   :hi{05}1" — a *new* inbound message id "05"
+        // whose reply-ack "1" acknowledges our pending "1". Mirrors what
+        // parse_aprs_message yields for that wire form.
+        let reply_ack = AprsMessage {
+            addressee: "N0CALL".to_owned(),
+            text: "hi".to_owned(),
+            message_id: Some("05".to_owned()),
+            reply_ack: Some(id),
+        };
+        assert!(
+            m.process_incoming(&reply_ack),
+            "reply-ack should clear the matching pending message",
+        );
+        assert_eq!(m.pending_count(), 0);
+    }
+
+    #[test]
+    fn process_incoming_reply_ack_message_is_still_new_incoming() {
+        let t0 = Instant::now();
+        let mut m = test_messenger();
+        let id = m.send_message("W1AW", "ping", t0);
+
+        // A reply-ack message acks our outbound AND is a fresh inbound
+        // message in its own right — is_new_incoming must still surface it.
+        let reply_ack = AprsMessage {
+            addressee: "N0CALL".to_owned(),
+            text: "hi".to_owned(),
+            message_id: Some("05".to_owned()),
+            reply_ack: Some(id),
+        };
+        assert!(
+            m.is_new_incoming("W1AW", &reply_ack, t0),
+            "reply-ack message id 05 must be surfaced as a new incoming",
+        );
+        assert!(m.process_incoming(&reply_ack));
+        assert_eq!(m.pending_count(), 0);
+        // Same message arriving again is a duplicate by (source, msgno).
+        assert!(!m.is_new_incoming("W1AW", &reply_ack, t0));
+    }
+
+    #[test]
+    fn process_incoming_reply_ack_no_match_does_not_panic() {
+        let t0 = Instant::now();
+        let mut m = test_messenger();
+        let _id = m.send_message("W1AW", "ping", t0); // pending "1"
+
+        // Reply-ack "99" matches no pending message: must not panic, must
+        // not clear anything, and the message is still a new incoming.
+        let reply_ack = AprsMessage {
+            addressee: "N0CALL".to_owned(),
+            text: "unrelated".to_owned(),
+            message_id: Some("07".to_owned()),
+            reply_ack: Some("99".to_owned()),
+        };
+        assert!(
+            !m.process_incoming(&reply_ack),
+            "reply-ack with no matching pending clears nothing",
+        );
+        assert_eq!(m.pending_count(), 1);
+        assert!(
+            m.is_new_incoming("W1AW", &reply_ack, t0),
+            "non-matching reply-ack message is still surfaced as new incoming",
+        );
+    }
+
+    #[test]
+    fn first_frame_emitted_immediately_then_second_waits() {
+        // BUG-2 regression: the first transmission must be eligible at the
+        // very same `now` the message was queued, independent of the
+        // monotonic clock's origin (no checked_sub backdating). The second
+        // send must still wait a full retry_interval.
+        let t0 = Instant::now();
+        let mut m = test_messenger();
+        let _id = m.send_message("W1AW", "ping", t0);
+
+        // First frame: emitted immediately at t0.
+        let first = m.next_frame_to_send(t0);
+        assert!(
+            first.is_some(),
+            "first frame must be eligible at the queue time regardless of clock origin",
+        );
+
+        // Still within the retry interval → nothing more to send yet.
+        assert!(
+            m.next_frame_to_send(t0).is_none(),
+            "second send must not fire before retry_interval elapses",
+        );
+        // A probe a hair into the window (well below RETRY_INTERVAL) is
+        // still too early for the retry. Built by addition to avoid any
+        // Duration subtraction.
+        let within = t0 + Duration::from_millis(1);
+        assert!(
+            m.next_frame_to_send(within).is_none(),
+            "second send must still be withheld before retry_interval elapses",
+        );
+
+        // Exactly at retry_interval → the retry fires.
+        let due = t0 + RETRY_INTERVAL;
+        assert!(
+            m.next_frame_to_send(due).is_some(),
+            "second send must fire once retry_interval has elapsed",
+        );
     }
 
     #[test]

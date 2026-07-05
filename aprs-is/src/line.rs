@@ -83,8 +83,9 @@ impl AprsIsLine {
     #[must_use]
     pub fn has_no_gate_marker(&self) -> bool {
         self.path.iter().any(|p| {
-            let upper = p.to_ascii_uppercase();
-            matches!(upper.as_str(), "NOGATE" | "RFONLY" | "TCPIP" | "TCPXX")
+            ["NOGATE", "RFONLY", "TCPIP", "TCPXX"]
+                .iter()
+                .any(|marker| p.eq_ignore_ascii_case(marker))
         })
     }
 }

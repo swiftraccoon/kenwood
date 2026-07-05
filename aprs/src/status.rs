@@ -31,9 +31,13 @@ pub struct AprsStatus {
     /// stripped). When the status carries no structured prefix this
     /// is the entire body.
     pub text: String,
-    /// Optional 7-byte timestamp prefix (DHM Zulu / DHM local / HMS),
-    /// parsed via [`AprsTimestamp::parse`]. `None` when the body did
-    /// not begin with a well-formed 7-byte timestamp.
+    /// Optional 7-byte DHM-Zulu timestamp prefix (`DDHHMMz`), parsed via
+    /// [`AprsTimestamp::parse`]. Per APRS 1.0.1 §16 p.80 a status report's
+    /// timestamp can *only* be DHM-Zulu, so this is always the
+    /// [`AprsTimestamp::DhmZulu`] variant when present. `None` when the
+    /// body did not begin with a well-formed DHM-Zulu timestamp (an HMS or
+    /// DHM-local 7-byte prefix is treated as status text, not a
+    /// timestamp).
     pub timestamp: Option<AprsTimestamp>,
     /// Optional Maidenhead grid locator prefix (4 or 6 ASCII chars
     /// per APRS 1.0.1 §6 grid-square rules).
@@ -59,9 +63,11 @@ pub const MAX_APRS_STATUS_TEXT_LEN: usize = 62;
 /// Recognises the four spec-defined sub-formats described in
 /// [`AprsStatus`]. The dispatch order is:
 ///
-/// 1. If the body starts with a 7-byte string parsing as
-///    [`AprsTimestamp`], strip the prefix and surface it in the
-///    `timestamp` field.
+/// 1. If the body starts with a 7-byte DHM-Zulu timestamp
+///    (`DDHHMMz` — the only timestamp form a status report may carry,
+///    APRS 1.0.1 §16 p.80), strip the prefix and surface it in the
+///    `timestamp` field. A 7-byte HMS or DHM-local prefix is *not* a
+///    valid status timestamp and is left as status text.
 /// 2. Otherwise, if the body starts with a 6- or 4-char Maidenhead
 ///    grid locator followed by `/` and one byte (symbol code), strip
 ///    the grid+symbol prefix and surface them.
@@ -78,9 +84,18 @@ pub fn parse_aprs_status(info: &[u8]) -> Result<AprsStatus, AprsError> {
     let body = info.get(1..).unwrap_or(&[]);
     let body_str = String::from_utf8_lossy(body);
 
-    // Sub-format 2: DHM/HMS timestamp prefix (7 bytes).
+    // Sub-format 2: DHM-Zulu timestamp prefix (7 bytes).
+    //
+    // APRS 1.0.1 §16 p.80: "The timestamp can only be in DHM zulu format."
+    // Unlike position/object reports, a status report MUST NOT carry an
+    // HMS (`HHMMSSh`) or DHM-local (`DDHHMM/`) timestamp. `AprsTimestamp::
+    // parse` happily accepts those other forms, so a free-text status like
+    // ">120000hrs since reset" would otherwise mis-parse "120000h" as an
+    // HMS timestamp and silently truncate the text to "rs since reset".
+    // Only strip the prefix when it is the spec-legal `DhmZulu` variant;
+    // any other parse result means the leading bytes are status text.
     if let Some(prefix) = body_str.get(..7)
-        && let Some(ts) = AprsTimestamp::parse(prefix)
+        && let Some(ts @ AprsTimestamp::DhmZulu { .. }) = AprsTimestamp::parse(prefix)
     {
         let rest = body_str.get(7..).unwrap_or("").trim_end().to_owned();
         return Ok(AprsStatus {
@@ -241,18 +256,53 @@ mod tests {
     }
 
     #[test]
-    fn parse_status_with_hms_timestamp() -> TestResult {
+    fn parse_status_rejects_hms_timestamp() -> TestResult {
+        // APRS 1.0.1 §16 p.80: a status timestamp can ONLY be DHM-Zulu.
+        // A 7-byte HMS prefix (`234517h`) must be treated as status text,
+        // not stripped as a timestamp.
         let info = b">234517hLate-night net";
+        let status = parse_aprs_status(info)?;
+        assert_eq!(status.timestamp, None);
+        assert_eq!(status.text, "234517hLate-night net");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_status_rejects_dhm_local_timestamp() -> TestResult {
+        // DHM-local (`DDHHMM/`) is likewise not a valid status timestamp.
+        let info = b">110000/Local time status";
+        let status = parse_aprs_status(info)?;
+        assert_eq!(status.timestamp, None);
+        assert_eq!(status.text, "110000/Local time status");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_status_hms_lookalike_freetext_not_truncated() -> TestResult {
+        // Verified bug: ">120000hrs since reset" must keep its full text;
+        // the old parser mis-read "120000h" as an HMS timestamp and
+        // truncated the text to "rs since reset".
+        let info = b">120000hrs since reset";
+        let status = parse_aprs_status(info)?;
+        assert_eq!(status.timestamp, None);
+        assert_eq!(status.text, "120000hrs since reset");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_status_dhm_zulu_still_stripped() -> TestResult {
+        // The one legal form must still be recognised and stripped.
+        let info = b">092345zReal status";
         let status = parse_aprs_status(info)?;
         assert_eq!(
             status.timestamp,
-            Some(AprsTimestamp::Hms {
+            Some(AprsTimestamp::DhmZulu {
+                day: 9,
                 hour: 23,
                 minute: 45,
-                second: 17,
             }),
         );
-        assert_eq!(status.text, "Late-night net");
+        assert_eq!(status.text, "Real status");
         Ok(())
     }
 

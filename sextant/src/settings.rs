@@ -25,6 +25,61 @@ use std::path::PathBuf;
 
 use tracing::{debug, warn};
 
+/// Maximum entries kept in the recent-connections list.
+pub(crate) const RECENTS_CAP: usize = 8;
+
+/// One remembered reflector connection (a favorite or a recent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SavedHost {
+    /// Reflector callsign (e.g. `REF030`).
+    pub(crate) callsign: String,
+    /// Host name or IP.
+    pub(crate) host: String,
+    /// UDP port (string form, matching the form fields it fills).
+    pub(crate) port: String,
+    /// Protocol family as its `Debug` repr (`DExtra`, `DPlus`, `Dcs`).
+    pub(crate) protocol: String,
+    /// Reflector module letter.
+    pub(crate) module: char,
+}
+
+/// Insert (or promote) `entry` at the front of `recents`,
+/// deduplicating and truncating to [`RECENTS_CAP`].
+pub(crate) fn push_recent(recents: &mut Vec<SavedHost>, entry: SavedHost) {
+    recents.retain(|e| e != &entry);
+    recents.insert(0, entry);
+    recents.truncate(RECENTS_CAP);
+}
+
+/// `callsign|host|port|protocol|module` — `|` never appears in
+/// callsigns, hostnames, ports, or protocol names.
+fn encode_saved(s: &SavedHost) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        s.callsign, s.host, s.port, s.protocol, s.module
+    )
+}
+
+/// Parse the [`encode_saved`] format; `None` on any shape mismatch.
+fn decode_saved(v: &str) -> Option<SavedHost> {
+    let mut parts = v.split('|');
+    let callsign = parts.next()?.to_owned();
+    let host = parts.next()?.to_owned();
+    let port = parts.next()?.to_owned();
+    let protocol = parts.next()?.to_owned();
+    let module = parts.next()?.chars().next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(SavedHost {
+        callsign,
+        host,
+        port,
+        protocol,
+        module,
+    })
+}
+
 /// User-editable form state that survives across app launches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Settings {
@@ -50,6 +105,10 @@ pub(crate) struct Settings {
     pub(crate) input_device: String,
     /// Audio output device name (empty = host default).
     pub(crate) output_device: String,
+    /// Starred reflectors, pinned atop the directory picker.
+    pub(crate) favorites: Vec<SavedHost>,
+    /// Recent successful connections, most recent first.
+    pub(crate) recents: Vec<SavedHost>,
 }
 
 impl Default for Settings {
@@ -68,6 +127,8 @@ impl Default for Settings {
             persist_heard_list: false,
             input_device: String::new(),
             output_device: String::new(),
+            favorites: Vec::new(),
+            recents: Vec::new(),
         }
     }
 }
@@ -149,6 +210,12 @@ fn serialize(s: &Settings) -> String {
     push_bool(&mut out, "persist_heard_list", s.persist_heard_list);
     push_string(&mut out, "input_device", &s.input_device);
     push_string(&mut out, "output_device", &s.output_device);
+    for (i, f) in s.favorites.iter().enumerate() {
+        push_string(&mut out, &format!("favorite.{i}"), &encode_saved(f));
+    }
+    for (i, r) in s.recents.iter().enumerate() {
+        push_string(&mut out, &format!("recent.{i}"), &encode_saved(r));
+    }
     out
 }
 
@@ -181,6 +248,22 @@ fn parse(raw: &str) -> Result<Settings, String> {
         }
         let (key, value) = split_kv(trimmed)
             .ok_or_else(|| format!("line {}: not a `key = value` pair", lineno + 1))?;
+        // Saved-host lists use numbered keys (`favorite.N`,
+        // `recent.N`); entries load in file order, which is the
+        // order `serialize` wrote them.
+        if key.starts_with("favorite.") || key.starts_with("recent.") {
+            let value = parse_quoted(value).ok_or_else(|| {
+                format!("line {}: value must be a double-quoted string", lineno + 1)
+            })?;
+            match decode_saved(&value) {
+                Some(entry) if key.starts_with("favorite.") => out.favorites.push(entry),
+                Some(entry) => out.recents.push(entry),
+                // Malformed entries are skipped, not fatal — one bad
+                // line must not cost the user their whole settings.
+                None => warn!(key, "skipping malformed saved-host entry"),
+            }
+            continue;
+        }
         // Boolean keys carry a bare `true` / `false`, not a quoted
         // string — handle them before the quoted-string parse.
         if key == "reconnect_on_drop" || key == "persist_heard_list" {
@@ -257,7 +340,7 @@ fn parse_quoted(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Settings, parse, serialize};
+    use super::{RECENTS_CAP, SavedHost, Settings, parse, push_recent, serialize};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -287,6 +370,8 @@ mod tests {
             persist_heard_list: true,
             input_device: "Built-in Microphone".into(),
             output_device: "External Headphones".into(),
+            favorites: vec![saved("REF001")],
+            recents: vec![saved("XRF757")],
         };
         let serialized = serialize(&original);
         let parsed = parse(&serialized).map_err(|e| format!("parse: {e}"))?;
@@ -318,6 +403,62 @@ mod tests {
         let parsed = parse(raw).map_err(|e| format!("parse: {e}"))?;
         assert_eq!(parsed.callsign, "W1AW");
         Ok(())
+    }
+
+    fn saved(callsign: &str) -> SavedHost {
+        SavedHost {
+            callsign: callsign.to_owned(),
+            host: "example.org".into(),
+            port: "20001".into(),
+            protocol: "DPlus".into(),
+            module: 'C',
+        }
+    }
+
+    #[test]
+    fn favorites_and_recents_roundtrip() -> TestResult {
+        let original = Settings {
+            favorites: vec![saved("REF030"), saved("XRF757")],
+            recents: vec![saved("DCS001")],
+            ..Settings::default()
+        };
+        let parsed = parse(&serialize(&original)).map_err(|e| format!("parse: {e}"))?;
+        assert_eq!(parsed.favorites, original.favorites);
+        assert_eq!(parsed.recents, original.recents);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_saved_host_is_skipped_not_fatal() -> TestResult {
+        let raw = "callsign = \"W1AW\"\nfavorite.0 = \"only|three|fields\"\n";
+        let parsed = parse(raw).map_err(|e| format!("parse: {e}"))?;
+        assert!(parsed.favorites.is_empty(), "malformed entry skipped");
+        assert_eq!(parsed.callsign, "W1AW", "rest of the file still parses");
+        Ok(())
+    }
+
+    #[test]
+    fn push_recent_promotes_dedupes_and_caps() {
+        let mut recents = Vec::new();
+        for i in 0..10 {
+            push_recent(&mut recents, saved(&format!("REF{i:03}")));
+        }
+        assert_eq!(recents.len(), RECENTS_CAP, "capped at {RECENTS_CAP}");
+        assert_eq!(
+            recents.first().map(|r| r.callsign.as_str()),
+            Some("REF009"),
+            "most recent first"
+        );
+        // Re-connecting to an existing entry promotes, not duplicates.
+        push_recent(&mut recents, saved("REF005"));
+        assert_eq!(recents.len(), RECENTS_CAP);
+        assert_eq!(
+            recents.first().map(|r| r.callsign.as_str()),
+            Some("REF005"),
+            "existing entry promoted to front"
+        );
+        let count = recents.iter().filter(|r| r.callsign == "REF005").count();
+        assert_eq!(count, 1, "no duplicate entries");
     }
 
     #[test]

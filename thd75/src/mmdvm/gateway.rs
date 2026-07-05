@@ -96,32 +96,6 @@ use crate::types::dstar::UrCallAction;
 /// work between polls on a quiet channel.
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Reverses the bit order within a byte (MSB ↔ LSB).
-///
-/// The TH-D75's MMDVM firmware assembles serial bytes LSB-first — bit 0
-/// of each delivered byte is the earliest-in-time bit that came off the
-/// wire. Every other MMDVM-standard D-STAR tooling (mbelib, DSD,
-/// `dstar-gateway-core`) expects the MSB-first convention where bit 7
-/// is earliest. Bit-reversing each D-STAR-voice byte at the TH-D75
-/// gateway boundary translates between the two conventions so
-/// downstream decoders see standards-compliant bytes.
-///
-/// Discovered empirically (bit-reversal experiment on a captured
-/// "chip hello" AMBE frame, 2026-04): applying this transform to
-/// captured `DStarData`
-/// payloads eliminated all spurious tone/erasure frames and dropped
-/// the mean per-frame `b0` jump from 38 to 6.6, consistent with real
-/// speech. The fix applies symmetrically on TX so what we hand to the
-/// radio for air transmission matches what the DVSI expects.
-#[inline]
-const fn bit_reverse(byte: u8) -> u8 {
-    let mut b = byte;
-    b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
-    b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
-    b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
-    b
-}
-
 /// Default maximum entries in the last-heard list.
 const DEFAULT_MAX_LAST_HEARD: usize = 100;
 
@@ -572,19 +546,21 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
                 Ok(Some(DStarEvent::VoiceStart(header)))
             }
             Event::DStarDataRx { bytes } => {
-                // The TH-D75 firmware hands us each byte bit-reversed.
-                // See `bit_reverse` for the full rationale.
+                // The radio's MMDVM firmware delivers D-STAR voice
+                // payloads in on-wire byte order — the same LSB-first
+                // convention reflectors relay and mbelib-rs reads
+                // natively (since 2026-07-04). A historical per-byte
+                // bit reversal here was compensating for the decoder's
+                // then-wrong MSB-first unpack; with the decoder fixed,
+                // the bytes pass through untouched, matching the TX
+                // path (which was always raw passthrough).
                 let mut ambe = [0u8; 9];
                 if let Some(src) = bytes.get(..9) {
-                    for (dst, &b) in ambe.iter_mut().zip(src.iter()) {
-                        *dst = bit_reverse(b);
-                    }
+                    ambe.copy_from_slice(src);
                 }
                 let mut slow_data = [0u8; 3];
                 if let Some(src) = bytes.get(9..12) {
-                    for (dst, &b) in slow_data.iter_mut().zip(src.iter()) {
-                        *dst = bit_reverse(b);
-                    }
+                    slow_data.copy_from_slice(src);
                 }
                 let frame = VoiceFrame { ambe, slow_data };
                 self.handle_voice_data(frame);
@@ -724,22 +700,12 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
     ///
     /// Returns [`Error::Transport`] if the modem loop has exited.
     pub async fn send_voice(&mut self, frame: &VoiceFrame) -> Result<(), Error> {
-        // Do NOT bit-reverse on TX.
-        //
-        // Originally this path mirrored the RX bit-reversal for
-        // symmetry, but the TH-D75's MMDVM firmware turns out to
-        // handle TX and RX asymmetrically — the RX path delivers
-        // bytes LSB-first (hence `dispatch_event`'s reversal to
-        // restore MSB-first spec convention), but the TX path
-        // accepts bytes in the on-wire MSB-first order directly.
-        // User-confirmed regression: adding TX reversal broke
-        // thd75-repl's D-STAR audio forwarding — the radio
-        // received the D-STAR header (text message popped up on the
-        // LCD) but couldn't decode any voice frames because the
-        // byte layout no longer matched what the DVSI chip expected.
-        // Reverting the TX path to raw passthrough restores
-        // thd75-repl audio forwarding while keeping the RX fix that
-        // made radio→sextant intelligible.
+        // Raw passthrough: the radio accepts D-STAR voice payloads in
+        // on-wire byte order, the same order reflectors relay. (The
+        // "TX and RX are asymmetric" theory this comment used to
+        // record was an artifact of the decoder's old MSB-first
+        // unpack bug — TX passthrough always worked precisely BECAUSE
+        // the radio is wire-order in both directions.)
         let mut data = [0u8; 12];
         if let Some(dst) = data.get_mut(..9) {
             dst.copy_from_slice(&frame.ambe);
@@ -1302,34 +1268,6 @@ mod tests {
         };
         let b = a;
         assert_eq!(a, b);
-    }
-
-    // -------------------------------------------------------------------
-    // Bit-reversal tests (TH-D75 MMDVM byte-order quirk)
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn bit_reverse_identities() {
-        // Known bit-reverse cases from the D75 serial-byte convention.
-        assert_eq!(bit_reverse(0x00), 0x00);
-        assert_eq!(bit_reverse(0xFF), 0xFF);
-        assert_eq!(bit_reverse(0x80), 0x01);
-        assert_eq!(bit_reverse(0x01), 0x80);
-        assert_eq!(bit_reverse(0xAA), 0x55);
-        assert_eq!(bit_reverse(0x55), 0xAA);
-    }
-
-    #[test]
-    fn bit_reverse_is_involution() {
-        // Applying bit-reversal twice must return the original byte —
-        // guarantees RX reverse and TX reverse are mirror operations.
-        for b in 0u8..=255 {
-            assert_eq!(
-                bit_reverse(bit_reverse(b)),
-                b,
-                "double-reverse should restore {b:#04x}"
-            );
-        }
     }
 
     // -------------------------------------------------------------------

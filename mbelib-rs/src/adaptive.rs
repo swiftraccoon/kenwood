@@ -59,13 +59,17 @@ const AMPLITUDE_BASE: i32 = 6_000;
 /// uses 8.75% instead, but this crate is AMBE-only (D-STAR).
 const MUTING_THRESHOLD_AMBE: f32 = 0.096;
 
-/// Maximum consecutive C0-uncorrectable frames before muting.
-const MAX_FRAME_REPEATS: i32 = 3;
+/// Maximum consecutive frame repeats before muting. Mirrors the
+/// reference's `cur_mp->repeat <= 3` synthesis gate
+/// (`mbelib/ambe3600x2400.c:694`).
+pub(crate) const MAX_FRAME_REPEATS: i32 = 3;
 
-/// C0 Golay(23,12) error-correction capacity. Above this, the C0
-/// codeword is too corrupt to trust; the decoder should reuse the
-/// previous frame's parameters and increment `repeat_count`.
-pub(crate) const GOLAY_C0_CAPACITY: u32 = 3;
+/// Maximum total FEC-corrected bits per frame before the decoded
+/// parameters are considered untrustworthy and the previous frame is
+/// repeated instead. Golay mis-corrects silently at higher error
+/// densities, so "successfully corrected" stops meaning "correct".
+/// Mirrors the reference's `*errs2 > 3` (`mbelib/ambe3600x2400.c:680`).
+pub(crate) const MAX_CORRECTED_BITS: u32 = 3;
 
 /// Returns true if frame muting should be applied based on the error
 /// rate threshold OR sustained C0-uncorrectable frames.

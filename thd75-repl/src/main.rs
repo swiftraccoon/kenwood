@@ -418,22 +418,24 @@ fn init_logging(cli: &Cli) -> LoggingGuard {
 /// Open a real hardware transport (USB serial or macOS Bluetooth)
 /// and return it alongside a fresh tokio runtime.
 ///
-/// Tries Bluetooth first on macOS (synchronously, no tokio reactor
-/// needed) and falls back to serial discovery via the async path.
+/// The runtime is created first and discovery runs under its reactor
+/// context: the Bluetooth path is synchronous and ignores it, but the
+/// serial path registers a `tokio::io::AsyncFd`, and `tokio-serial`
+/// PANICS (rather than erroring) when no reactor exists. Discovering
+/// before creating the runtime therefore crashes whenever Bluetooth
+/// is unavailable and a serial port is present — an error-driven
+/// fallback branch never gets the chance to run.
 /// Factored out of `main` so the mock + real transport branches stay
 /// symmetric: both return the same `(path, transport, runtime)` shape.
 fn open_real_transport(
     cli_port: Option<&str>,
     cli_baud: u32,
 ) -> Result<(String, EitherTransport, tokio::runtime::Runtime), Box<dyn std::error::Error>> {
-    if let Ok((path, transport)) = transport::discover_and_open(cli_port, cli_baud) {
-        let rt = tokio::runtime::Runtime::new()?;
-        return Ok((path, transport, rt));
-    }
-    // BT failed or unavailable — serial needs a tokio reactor.
     let rt = tokio::runtime::Runtime::new()?;
-    let (path, transport) =
-        rt.block_on(async { transport::discover_and_open(cli_port, cli_baud) })?;
+    let (path, transport) = {
+        let _reactor = rt.enter();
+        transport::discover_and_open(cli_port, cli_baud)?
+    };
     Ok((path, transport, rt))
 }
 
@@ -505,7 +507,21 @@ const fn detect_utc_offset_seconds() -> Option<i32> {
     None
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    // Render fatal errors with `Display`, not the runtime's `Debug`
+    // formatting: multi-line guidance must reach the operator as real
+    // newlines, never as literal `\n` escapes (which screen readers
+    // announce as noise).
+    match run_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Subcommands bypass the REPL loop entirely. `check` runs a
@@ -1021,6 +1037,16 @@ async fn run_repl(
                     println!("Example: dstar start W1AW REF030C");
                     ReplState::Cat(radio)
                 }
+                LinkDiagnosis::Unresponsive if std::env::var_os(RELAUNCH_GUARD_ENV).is_some() => {
+                    // This process is the relaunch that follows a
+                    // terminal-mode enable, and the radio engages that
+                    // mode SLOWLY: mid-transition the CAT parser is
+                    // already gone but MMDVM is not up yet. Proceed to
+                    // the REPL so the initial `dstar start` command can
+                    // poll for engagement instead of dying here.
+                    println!("Radio is still rebooting into Reflector Terminal Mode.");
+                    ReplState::Cat(radio)
+                }
                 LinkDiagnosis::Unresponsive => {
                     return Err(LinkDiagnosis::Unresponsive.guidance().into());
                 }
@@ -1275,7 +1301,7 @@ async fn run_repl(
                         println!("Example: dstar start W1AW XRF030C");
                         ReplState::Cat(radio)
                     } else {
-                        match enter_dstar(radio, &parts[2..], cli_port.as_deref(), cli_baud).await {
+                        match enter_dstar(radio, &parts[2..]).await {
                             Ok(mut session) => {
                                 // If a reflector was connected, auto-enter monitor.
                                 if session.reflector.is_some() {
@@ -1681,17 +1707,24 @@ async fn run_igate(client: &mut AprsClient<EitherTransport>, filter: &str) {
             // Poll RF for incoming packets.
             rf_result = client.next_event() => {
                 match rf_result {
-                    Ok(Some(event)) => {
-                        print_aprs_event(&event);
-                        // Forward raw packets to APRS-IS.
-                        if let AprsEvent::RawPacket(ref pkt) = event {
-                            let is_line = client.format_for_is(pkt);
+                    Ok(maybe_event) => {
+                        if let Some(event) = &maybe_event {
+                            print_aprs_event(event);
+                        }
+                        // Gate EVERY packet heard on RF to APRS-IS, not only
+                        // the ones that surface as `RawPacket`. Typed events
+                        // (PositionReceived, StationHeard, WeatherReceived,
+                        // ...) carry the same underlying frame, which
+                        // `take_last_rf_packet` exposes for this cycle; it is
+                        // `Some` only when this cycle actually received a
+                        // frame off the air.
+                        if let Some(pkt) = client.take_last_rf_packet() {
+                            let is_line = client.format_for_is(&pkt);
                             if let Err(e) = is_client.send_raw_line(&is_line).await {
                                 println!("Error: gate to IS: {e}");
                             }
                         }
                     }
-                    Ok(None) => {}
                     Err(e) => {
                         println!("Error: RF: {e}");
                     }
@@ -1839,57 +1872,157 @@ const GATEWAY_MODE_PAGE: u16 = GATEWAY_MODE_MCP_OFFSET / 256;
 /// Byte index within the page.
 const GATEWAY_MODE_BYTE: usize = (GATEWAY_MODE_MCP_OFFSET % 256) as usize;
 
+/// Re-execute this process with the same command-line arguments.
+///
+/// Used after enabling Reflector Terminal Mode: the radio reboots, and a
+/// fresh process connects cleanly where an in-process Bluetooth reconnect
+/// does not (macOS `IOBluetooth` keeps per-process RFCOMM state that
+/// wedges when the channel is reopened to a just-rebooted radio). `exec`
+/// replaces the current process image — same PID, same controlling
+/// terminal, fresh framework state — so on success this never returns.
+/// The returned string is the failure message if the new image could not
+/// be started. Same pattern `rustup` uses in its shims.
+///
+/// The [`RELAUNCH_GUARD_ENV`] marker tells the relaunched image it exists
+/// BECAUSE terminal mode was just enabled — if the mode probe still fails
+/// there, it must not rewrite the flag and reboot-loop.
+#[cfg(unix)]
+fn relaunch_self() -> String {
+    use std::os::unix::process::CommandExt as _;
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(e) => return format!("could not locate own executable: {e}"),
+    };
+    // `exec` replaces the process image; it only returns on failure.
+    let err = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(RELAUNCH_GUARD_ENV, "1")
+        .exec();
+    format!("could not relaunch: {err}")
+}
+
+/// Non-Unix fallback: there is no `exec` to replace the process image, so
+/// spawn a fresh child with the same arguments, wait for it, and exit with
+/// its status code so the shell still sees one logical run. Returns a
+/// message only if the child could not be spawned. (Reflector Terminal
+/// Mode is macOS-only in practice; this path exists so the crate builds on
+/// every target.)
+#[cfg(not(unix))]
+fn relaunch_self() -> String {
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(e) => return format!("could not locate own executable: {e}"),
+    };
+    match std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(RELAUNCH_GUARD_ENV, "1")
+        .status()
+    {
+        Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+        Err(e) => format!("could not relaunch: {e}"),
+    }
+}
+
+/// Environment marker set on the re-exec'd image by [`relaunch_self`].
+///
+/// Its presence means "this process is the relaunch that follows an
+/// MCP terminal-mode enable". If the gateway-mode probe STILL fails in
+/// such a process, writing the flag again would reboot the radio in an
+/// endless loop — the failure needs an operator, not a retry.
+const RELAUNCH_GUARD_ENV: &str = "THD75_REPL_RELAUNCH_GUARD";
+
+/// Ensure the radio is in Reflector Terminal Mode, returning it once
+/// its link speaks MMDVM.
+///
+/// If the MMDVM probe already answers, the radio is returned as-is.
+/// Otherwise Reflector Terminal Mode is enabled via an MCP write —
+/// which reboots the radio — and the process re-execs itself so a
+/// fresh image connects cleanly to the rebooted radio (this path
+/// never returns on success). A relaunched image whose probe STILL
+/// fails refuses to write again: rewriting would reboot the radio in
+/// an endless loop, and the usual cause is the radio's DV Gateway
+/// interface (Menu 985) bound to the other port — the radio shows
+/// TERM and answers CAT here, while MMDVM flows on the port we are
+/// not connected to.
+async fn ensure_terminal_mode(
+    mut radio: Radio<EitherTransport>,
+) -> Result<Radio<EitherTransport>, (Option<Radio<EitherTransport>>, String)> {
+    // Send MMDVM GET_VERSION — if we get an E0 response, skip MCP write.
+    println!("Checking if radio is already in D-STAR gateway mode.");
+    if radio.diagnose_link().await == LinkDiagnosis::MmdvmMode {
+        println!("Radio is already in Reflector Terminal Mode.");
+        return Ok(radio);
+    }
+
+    if std::env::var_os(RELAUNCH_GUARD_ENV).is_some() {
+        // Terminal mode was just enabled, and it engages SLOWLY: the
+        // radio first boots its normal firmware (CAT answers for tens
+        // of seconds) before the gateway app takes over the port.
+        // Observed on USB: CAT alive at +10 s, dead at +49 s, MMDVM
+        // answering shortly after. Poll instead of judging on one
+        // probe — a single early probe misreads "still booting" as
+        // "not in terminal mode".
+        println!("Waiting for Reflector Terminal Mode to engage (up to 90 seconds).");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if radio.diagnose_link().await == LinkDiagnosis::MmdvmMode {
+                println!("Radio is in Reflector Terminal Mode.");
+                return Ok(radio);
+            }
+            println!("Not yet. Probing again.");
+        }
+        return Err((
+            Some(radio),
+            "Terminal mode was enabled, but the radio did not start \
+             answering MMDVM probes on this link within 90 seconds.\n\
+             If the radio's screen shows TERM, check Menu 985 (DV Gateway \
+             PC Input/Output): it must be set to the interface you are \
+             connected through (USB or Bluetooth).\n\
+             Not retrying the memory write — another attempt would only \
+             reboot the radio again."
+                .into(),
+        ));
+    }
+
+    // Enabling Reflector Terminal Mode via an MCP write reboots the
+    // radio, dropping the connection. Reconnecting in-process is
+    // unreliable — IOBluetooth wedges its run loop on a channel
+    // reopened to a just-rebooted radio — but a fresh process
+    // connects cleanly, so re-exec ourselves once the radio is back.
+    println!("Enabling D-STAR Reflector Terminal Mode via memory write.");
+    if let Err(e) = radio
+        .modify_memory_page(GATEWAY_MODE_PAGE, |data| {
+            data[GATEWAY_MODE_BYTE] = 1; // ReflectorTerminal
+        })
+        .await
+    {
+        return Err((Some(radio), format!("MCP write failed: {e}")));
+    }
+
+    // Release the now-dead transport, wait out the ~5 s reboot, then
+    // relaunch — the fresh process picks up the radio in gateway mode.
+    let _ = radio.disconnect().await;
+    println!("Radio is rebooting into Reflector Terminal Mode. Relaunching...");
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    Err((None, relaunch_self()))
+}
+
 /// Enter D-STAR gateway (MMDVM) mode.
 ///
-/// Enables Reflector Terminal Mode via MCP write to offset 0x1CA0,
-/// which causes the connection to drop. After reconnecting, the
-/// radio's BT SPP speaks MMDVM binary framing (no TN command needed).
+/// Ensures Reflector Terminal Mode via [`ensure_terminal_mode`] (which
+/// may re-exec the process), then starts the MMDVM gateway.
 ///
 /// On error, returns the radio so the REPL can continue in CAT mode.
 async fn enter_dstar(
-    mut radio: Radio<EitherTransport>,
+    radio: Radio<EitherTransport>,
     args: &[&str],
-    cli_port: Option<&str>,
-    cli_baud: u32,
 ) -> Result<DStarSession, (Option<Radio<EitherTransport>>, String)> {
     let callsign = args[0];
     // Optional reflector argument: e.g. "XRF030C" → name="XRF030", module='C'
     let reflector_arg = args.get(1).copied();
 
-    // Check if radio is already in MMDVM/gateway mode by probing.
-    // Send MMDVM GET_VERSION — if we get an E0 response, skip MCP write.
-    println!("Checking if radio is already in D-STAR gateway mode.");
-    let already_mmdvm = radio.diagnose_link().await == LinkDiagnosis::MmdvmMode;
-
-    if already_mmdvm {
-        println!("Radio is already in Reflector Terminal Mode.");
-    } else {
-        // Enable Reflector Terminal Mode via MCP write.
-        println!("Enabling D-STAR Reflector Terminal Mode via memory write.");
-        if let Err(e) = radio
-            .modify_memory_page(GATEWAY_MODE_PAGE, |data| {
-                data[GATEWAY_MODE_BYTE] = 1; // ReflectorTerminal
-            })
-            .await
-        {
-            return Err((Some(radio), format!("MCP write failed: {e}")));
-        }
-
-        // Connection dropped after MCP exit. Close and wait for reboot.
-        println!("Closing connection. Waiting for radio to reboot into gateway mode.");
-        let _ = radio.disconnect().await;
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        println!("Reconnecting.");
-
-        let (_path, new_transport) = match transport::discover_and_open(cli_port, cli_baud) {
-            Ok(t) => t,
-            Err(e) => return Err((None, format!("Reconnect failed: {e}"))),
-        };
-        radio = match Radio::connect(new_transport).await {
-            Ok(r) => r,
-            Err(e) => return Err((None, format!("Connect failed: {e}"))),
-        };
-    }
+    let radio = ensure_terminal_mode(radio).await?;
 
     // Radio is now in MMDVM mode. Start the gateway.
     println!("Starting D-STAR gateway as {callsign}.");

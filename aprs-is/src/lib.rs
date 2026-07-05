@@ -46,7 +46,9 @@ mod line;
 mod login;
 mod q_construct;
 
-pub use client::{AprsIsClient, CONNECT_TIMEOUT, KEEPALIVE_INTERVAL, MAX_IS_LINE_BYTES};
+pub use client::{
+    AprsIsClient, CONNECT_TIMEOUT, KEEPALIVE_INTERVAL, MAX_IS_LINE_BYTES, MAX_IS_READ_LINE_BYTES,
+};
 pub use error::AprsIsError;
 pub use events::{AprsIsEvent, AprsIsPacket};
 pub use filter::AprsIsFilter;
