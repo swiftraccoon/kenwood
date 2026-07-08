@@ -59,6 +59,12 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSRequiresIPhoneOS: true
+        # The XLX reflector registry is http-only; exception scoped to
+        # that single host.
+        NSAppTransportSecurity:
+          NSExceptionDomains:
+            xlxapi.rlx.lu:
+              NSExceptionAllowsInsecureHTTPLoads: true
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: true
@@ -141,6 +147,12 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
         LSApplicationCategoryType: public.app-category.utilities
+        # The XLX reflector registry is http-only; exception scoped to
+        # that single host.
+        NSAppTransportSecurity:
+          NSExceptionDomains:
+            xlxapi.rlx.lu:
+              NSExceptionAllowsInsecureHTTPLoads: true
         NSBluetoothAlwaysUsageDescription: "Lodestar uses Bluetooth to connect to your Kenwood TH-D75 transceiver and exchange CAT commands."
         NSBluetoothPeripheralUsageDescription: "Lodestar uses Bluetooth to connect to your Kenwood TH-D75 transceiver and exchange CAT commands."
         NSPrincipalClass: NSApplication

@@ -30,4 +30,10 @@ final class ReflectorFFITests: XCTestCase {
             XCTAssertEqual(r.name, r.name.uppercased(), "\(r.name) should be uppercase")
         }
     }
+
+    func testEveryFeaturedNameResolvesAgainstBundledDirectory() {
+        let resolved = FeaturedReflectors.resolve(from: defaultReflectors())
+        XCTAssertEqual(resolved.count, FeaturedReflectors.names.count,
+                       "a featured name drifted out of the bundled hosts files")
+    }
 }

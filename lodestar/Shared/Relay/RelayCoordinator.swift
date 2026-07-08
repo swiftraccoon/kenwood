@@ -50,6 +50,11 @@ public final class RelayCoordinator {
     private var mmdvmReader: MmdvmReader?
     private var readerTask: Task<Void, Never>?
 
+    /// Reflector→radio mailbox: the relay hook yields here and ONE
+    /// task drains it, preserving header→data→EOT write order.
+    private var relayEventContinuation: AsyncStream<ReflectorEvent>.Continuation?
+    private var relayEventPump: Task<Void, Never>?
+
     /// Outbound (radio→reflector) stream state. `nil` between streams.
     private var outboundStreamId: UInt16?
     private var outboundSeq: UInt8 = 0
@@ -87,7 +92,7 @@ public final class RelayCoordinator {
             failWith("radio is not in MMDVM mode (current: \(transportCoordinator.radioMode))")
             return
         }
-        guard let session = reflectorCoordinator.activeSession else {
+        guard reflectorCoordinator.activeSession != nil else {
             failWith("no active reflector session")
             return
         }
@@ -96,56 +101,64 @@ public final class RelayCoordinator {
             return
         }
 
-        // Reflector→radio: install the hook and remember to clear it on stop.
-        reflectorCoordinator.relayHook = { [weak self] event in
-            guard let self else { return }
-            Task { @MainActor in
+        // Reflector→radio: drain hook events through a serial mailbox
+        // so header→data→EOT MMDVM writes never reorder. The hook only
+        // yields; ONE pump task performs the (awaiting) transport writes.
+        var continuation: AsyncStream<ReflectorEvent>.Continuation!
+        let events = AsyncStream<ReflectorEvent>(bufferingPolicy: .unbounded) { c in
+            continuation = c
+        }
+        relayEventContinuation = continuation
+        relayEventPump = Task { [weak self] in
+            for await event in events {
+                guard let self else { return }
                 await self.handleReflectorEvent(event, transport: transport)
             }
         }
+        reflectorCoordinator.relayHook = { [weak self] event in
+            self?.relayEventContinuation?.yield(event)
+        }
 
         // Radio→reflector: start the MMDVM reader.
+        await startReader(on: transport)
+
+        state = .running
+        // The radio speaker now owns the audio path — silence the
+        // on-device monitor so reflector voice doesn't play twice.
+        reflectorCoordinator.suppressMonitorForRelay = true
+        log.info("Relay: running")
+    }
+
+    /// Start the MMDVM reader and pump its frames into the reflector
+    /// session until the stream ends, then run full teardown. Extracted
+    /// from `start()` so the DEBUG test helper can exercise the
+    /// reader-ended teardown path without a live reflector session;
+    /// `activeSession` is re-read here (rather than captured by the
+    /// caller) so it can legitimately be `nil` under the test helper.
+    private func startReader(on transport: RadioTransport) async {
         let reader = MmdvmReader(transport: transport)
         self.mmdvmReader = reader
         await reader.start()
         let frames = await reader.frames
+        let session = reflectorCoordinator.activeSession
         readerTask = Task { [weak self] in
             for await frame in frames {
+                guard let session else {
+                    log.warning("Relay: no active reflector session — stopping reader")
+                    break
+                }
                 await self?.handleRadioFrame(frame, session: session, transport: transport)
             }
             // Stream ended (transport closed or reader stopped).
             await self?.markStopped()
         }
-
-        state = .running
-        log.info("Relay: running")
     }
 
     /// Stop the relay. Idempotent.
     public func stop() async {
-        reflectorCoordinator.relayHook = nil
-        readerTask?.cancel()
-        readerTask = nil
-        if let r = mmdvmReader {
-            await r.stop()
-        }
-        mmdvmReader = nil
-        outboundStreamId = nil
-        outboundSeq = 0
-        // Flush any in-progress TX so it still shows up in Recently heard.
-        if let tx = localTx {
-            reflectorCoordinator.logLocalTransmission(
-                mycall: tx.mycall,
-                suffix: tx.suffix,
-                urcall: tx.urcall,
-                startedAt: tx.startedAt,
-                frames: tx.frames,
-                text: nil
-            )
-            localTx = nil
-        }
+        if let r = mmdvmReader { await r.stop() }
+        markStopped()
         state = .stopped
-        log.info("Relay: stopped")
     }
 
     // MARK: - Internal
@@ -218,9 +231,11 @@ public final class RelayCoordinator {
                 // informational at the relay layer — skip.
                 break
             }
+            // Frames are flowing again — clear any stale relay error.
+            lastError = nil
         } catch {
             log.error("Relay: radio → reflector failed: \(error)")
-            lastError = String(describing: error)
+            lastError = error.displayMessage
         }
     }
 
@@ -238,7 +253,7 @@ public final class RelayCoordinator {
             case .voiceEnd:
                 try await writer.send(command: MmdvmCmd.dstarEot, payload: Data())
                 log.info("Relay: reflector → radio EOT")
-            case .connected, .disconnected, .pollEcho, .slowDataUpdate, .ended:
+            case .connected, .disconnected, .pollEcho, .slowDataUpdate, .ended, .unknown:
                 // Slow-data text / GPS is surfaced by the reflector
                 // coordinator for the UI; it isn't relayed to the
                 // radio as a standalone frame (the text/GPS bytes
@@ -247,14 +262,37 @@ public final class RelayCoordinator {
             }
         } catch {
             log.error("Relay: reflector → radio failed: \(error)")
-            lastError = String(describing: error)
+            lastError = error.displayMessage
         }
     }
 
+    /// Teardown shared by `stop()` and the reader-ended path. Clears
+    /// the reflector→radio hook so a dead transport can't keep
+    /// receiving events, and flushes any in-progress local TX.
     private func markStopped() {
-        if state == .running {
+        relayEventContinuation?.finish()
+        relayEventContinuation = nil
+        relayEventPump?.cancel()
+        relayEventPump = nil
+        reflectorCoordinator.relayHook = nil
+        // Relay no longer owns the audio path — let the on-device
+        // monitor resume (subject to the user's monitor toggle).
+        reflectorCoordinator.suppressMonitorForRelay = false
+        readerTask?.cancel()
+        readerTask = nil
+        mmdvmReader = nil
+        outboundStreamId = nil
+        outboundSeq = 0
+        if let tx = localTx {
+            reflectorCoordinator.logLocalTransmission(
+                mycall: tx.mycall, suffix: tx.suffix, urcall: tx.urcall,
+                startedAt: tx.startedAt, frames: tx.frames, text: nil
+            )
+            localTx = nil
+        }
+        if state == .running || state == .starting {
             state = .stopped
-            log.info("Relay: reader stream ended — stopping")
+            log.info("Relay: stopped (reader ended or stop())")
         }
     }
 
@@ -274,4 +312,14 @@ public final class RelayCoordinator {
         } while sid == 0
         return sid
     }
+
+    #if DEBUG
+    /// Test-only: enter `.running` with a live reader but no session,
+    /// so teardown paths can be exercised without a reflector.
+    public func simulateRunningForTests() {
+        guard let transport = transportCoordinator.relayTransport else { return }
+        state = .running
+        Task { await self.startReader(on: transport) }
+    }
+    #endif
 }

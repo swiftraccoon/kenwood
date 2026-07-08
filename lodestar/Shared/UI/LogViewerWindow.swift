@@ -110,7 +110,7 @@ public struct LogViewerWindow: View {
             ContentUnavailableView(
                 "No log entries",
                 systemImage: "doc.text",
-                description: Text("Nothing has been logged under this subsystem in the last 5 minutes.")
+                description: Text("Nothing has been logged under this subsystem in the last \(Int(scanWindow) / 60) minute\(Int(scanWindow) == 60 ? "" : "s").")
             )
         } else {
             // One single monospaced text block inside a ScrollView.
@@ -203,7 +203,7 @@ public struct LogViewerWindow: View {
                 }
                 return Outcome(rows: rows, error: nil)
             } catch {
-                return Outcome(rows: [], error: String(describing: error))
+                return Outcome(rows: [], error: error.displayMessage)
             }
         }.value
 

@@ -8,13 +8,14 @@ import SwiftUI
 /// Pi-Star list, rendered with a lazy `List` so scrolling stays smooth.
 struct ReflectorPickerSheet: View {
     @Bindable var coordinator: ReflectorCoordinator
+    @Environment(ReflectorDirectoryStore.self) private var directory
     @Environment(\.dismiss) private var dismiss
 
     @State private var search: String = ""
     @State private var showAll: Bool = false
     @State private var protocolFilter: ReflectorProtocol? = nil
 
-    private let all: [Reflector] = defaultReflectors()
+    private var all: [Reflector] { directory.reflectors }
     private let modules: [String] = ["A", "B", "C", "D", "E"]
 
     var body: some View {
@@ -23,6 +24,8 @@ struct ReflectorPickerSheet: View {
                 settingsBar
                 Divider()
                 list
+                Divider()
+                directoryFooter
             }
             .navigationTitle("Choose reflector")
             #if os(iOS)
@@ -31,6 +34,21 @@ struct ReflectorPickerSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { dismiss() }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        Task { await directory.refresh(callsign: coordinator.callsign) }
+                    } label: {
+                        if directory.isRefreshing {
+                            Label("Refreshing…", systemImage: "arrow.clockwise")
+                        } else {
+                            Label("Refresh directory", systemImage: "arrow.clockwise")
+                        }
+                    }
+                    .disabled(directory.isRefreshing)
+                    .accessibilityLabel(
+                        directory.isRefreshing ? "Refreshing directory" : "Refresh directory"
+                    )
                 }
             }
             .searchable(text: $search, prompt: "Search 200+ reflectors")
@@ -161,6 +179,24 @@ struct ReflectorPickerSheet: View {
         #else
         .listStyle(.insetGrouped)
         #endif
+    }
+
+    /// Provenance line under the list: entry count + where the
+    /// directory came from (bundled list / last fetch time / fetch
+    /// problems), straight from the store.
+    private var directoryFooter: some View {
+        HStack(spacing: 6) {
+            if directory.isRefreshing {
+                ProgressView()
+                    .controlSize(.mini)
+            }
+            Text(directory.statusLine)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 6)
     }
 
     private var favorites: [Reflector] {

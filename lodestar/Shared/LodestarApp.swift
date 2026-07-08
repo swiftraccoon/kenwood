@@ -19,12 +19,16 @@ struct LodestarApp: App {
     @State private var transport: TransportCoordinator
     @State private var reflector: ReflectorCoordinator
     @State private var session: SessionCoordinator
+    @State private var directory: ReflectorDirectoryStore
 
     init() {
         // Install the Rust → os_log bridge BEFORE any FFI call so
         // the first tokio runtime spin-up + reflector connect events
         // are captured. Idempotent — tracing's global dispatcher
         // accepts the first installer and ignores later ones.
+        // (This is why every store is constructed HERE, not as a
+        // stored-property default — defaults evaluate before init
+        // bodies, and the directory store calls FFI on construction.)
         installRustLogBridge()
 
         let transport = TransportCoordinator()
@@ -34,6 +38,7 @@ struct LodestarApp: App {
         _transport = State(initialValue: transport)
         _reflector = State(initialValue: reflector)
         _session = State(initialValue: session)
+        _directory = State(initialValue: ReflectorDirectoryStore())
     }
 
     var body: some Scene {
@@ -75,6 +80,7 @@ struct LodestarApp: App {
                 .environment(transport)
                 .environment(reflector)
                 .environment(session)
+                .environment(directory)
         }
     }
 

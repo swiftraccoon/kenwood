@@ -7,25 +7,32 @@
 //! Surfaces to Swift via `UniFFI`:
 //!
 //! - `version()` — crate semver.
+//! - [`audio`] — `RxAudioPipeline`: AMBE-decodes reflector voice frames
+//!   into 8 kHz PCM with loss concealment, reorder rejection, and
+//!   click-free stream edges for on-device monitoring.
 //! - [`cat`] — minimal CAT codec covering the `ID` identify command.
 //! - [`mcp`] — programming-protocol primitives for flipping menu 650
 //!   (DV Gateway) into Reflector Terminal Mode.
 //! - [`mmdvm`] — MMDVM frame codec and the `GetVersion` probe used for
 //!   radio-mode detection.
 //! - [`reflector`] — `DPlus` / `DExtra` / `DCS` reflector list loaded
-//!   from bundled `ircDDBGateway` host files.
+//!   from bundled `ircDDBGateway` host files, plus live-directory
+//!   support: Pi-Star hosts-text and XLX-registry parsers and a
+//!   provenance-aware merge over bundled, auth-server, and XLX sources.
 //! - [`session`] — async `connect_reflector` + [`session::ReflectorSession`]
 //!   driving the full radio-to-reflector voice loop, plus the
 //!   [`session::ReflectorObserver`] callback trait Swift implements to
 //!   receive voice events, slow-data text updates, and parsed GPS
 //!   positions.
 
+pub mod audio;
 pub mod cat;
 pub mod mcp;
 pub mod mmdvm;
 pub mod reflector;
 pub mod session;
 
+pub use audio::{RxAudioPipeline, RxStreamEnd, RxStreamStats};
 pub use cat::{CatCommand, CatResponse, encode_cat, parse_cat_line};
 pub use mcp::{
     GATEWAY_MODE_ACCESS_POINT, GATEWAY_MODE_OFF, GATEWAY_MODE_OFFSET,
@@ -36,8 +43,14 @@ pub use mmdvm::{
     MMDVM_CMD_GET_VERSION, MMDVM_START_BYTE, MmdvmDecodeResult, MmdvmFrame, MmdvmFrameError,
     build_mmdvm_frame, decode_mmdvm_bytes, looks_like_mmdvm_response, mmdvm_get_version_probe,
 };
-pub use reflector::{Reflector, ReflectorProtocol, default_reflectors};
-pub use session::{ReflectorError, ReflectorSession, connect_reflector};
+pub use reflector::{
+    DirectoryEntry, DirectorySource, Reflector, ReflectorProtocol, default_reflectors,
+    merge_directories, parse_hosts_text, parse_xlx_text, xlx_directory_url,
+};
+pub use session::{
+    DisconnectCause, ReflectorError, ReflectorSession, VoiceEndCause, connect_reflector,
+    fetch_dplus_directory,
+};
 
 uniffi::include_scaffolding!("lodestar");
 

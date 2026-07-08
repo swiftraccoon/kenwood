@@ -35,8 +35,19 @@ enum FeaturedReflectors {
 
     /// Resolve featured names against the live list returned by
     /// `defaultReflectors()`. Preserves the curated ordering above.
+    /// A name that drifts out of the directory trips an assertion in
+    /// debug builds (and a unit test) instead of silently vanishing
+    /// from the Featured section.
     static func resolve(from all: [Reflector]) -> [Reflector] {
-        let byName = Dictionary(uniqueKeysWithValues: all.map { ($0.name, $0) })
-        return names.compactMap { byName[$0] }
+        // `all` can now include network-fetched rows — tolerate a
+        // duplicate name rather than trapping on it.
+        let byName = Dictionary(all.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+        return names.compactMap { name in
+            guard let found = byName[name] else {
+                assertionFailure("Featured reflector \(name) missing from directory")
+                return nil
+            }
+            return found
+        }
     }
 }

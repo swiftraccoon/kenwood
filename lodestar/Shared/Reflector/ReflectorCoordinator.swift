@@ -3,6 +3,9 @@
 
 import Foundation
 import Observation
+import OSLog
+
+private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "reflector")
 
 /// UI-facing state store for the active D-STAR reflector session.
 ///
@@ -82,6 +85,33 @@ public final class ReflectorCoordinator: ReflectorObserver {
         favoriteReflectorNames.contains(name)
     }
 
+    /// When `true`, reflector voice plays through this device's
+    /// speakers (decoded on-device). Persisted. Automatically
+    /// suppressed while the radio relay is running so audio doesn't
+    /// play twice.
+    public var monitorAudioEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(monitorAudioEnabled, forKey: Self.monitorAudioKey)
+            updateMonitorSuspension()
+        }
+    }
+
+    /// Set by the relay while it owns the audio path (radio speaker).
+    public var suppressMonitorForRelay: Bool = false {
+        didSet { updateMonitorSuspension() }
+    }
+
+    /// Loss statistics for the most recently ended stream, if any.
+    public private(set) var lastStreamStats: RxStreamStats?
+
+    /// On-device playback engine for decoded reflector voice.
+    public let audioPlayer = ReflectorAudioPlayer()
+    private let rxPipeline = RxAudioPipeline()
+
+    private func updateMonitorSuspension() {
+        audioPlayer.isSuspended = !monitorAudioEnabled || suppressMonitorForRelay
+    }
+
     // MARK: - Runtime state
 
     public private(set) var state: State = .disconnected
@@ -104,6 +134,13 @@ public final class ReflectorCoordinator: ReflectorObserver {
 
     private var session: ReflectorSession?
 
+    /// Serial event mailbox. The Rust callback thread yields into the
+    /// continuation; ONE main-actor pump task applies events in
+    /// arrival order. Independent `Task {}` spawns per event would
+    /// race each other and could apply voiceFrame before voiceStart.
+    private let eventContinuation: AsyncStream<ReflectorEvent>.Continuation
+    private var eventPump: Task<Void, Never>?
+
     /// `true` when the user just tapped "Disconnect reflector" — so
     /// the subsequent `.disconnected` event is expected and the
     /// auto-reconnect scheduler should NOT fire. Cleared once the
@@ -123,10 +160,17 @@ public final class ReflectorCoordinator: ReflectorObserver {
     private static let persistHeardKey = "lodestar.persistRecentlyHeard"
     private static let heardHistoryKey = "lodestar.recentlyHeardArchive"
     private static let inlineHeardLimitKey = "lodestar.inlineHeardLimit"
+    private static let monitorAudioKey = "lodestar.monitorAudio"
 
     // MARK: - Init
 
     public init() {
+        var continuation: AsyncStream<ReflectorEvent>.Continuation!
+        let stream = AsyncStream<ReflectorEvent>(bufferingPolicy: .unbounded) { c in
+            continuation = c
+        }
+        self.eventContinuation = continuation
+
         let defaults = UserDefaults.standard
         self.callsign = defaults.string(forKey: Self.callsignKey) ?? ""
         self.localModule = defaults.string(forKey: Self.localModuleKey) ?? "C"
@@ -139,9 +183,26 @@ public final class ReflectorCoordinator: ReflectorObserver {
         // value got out of range.
         let storedLimit = defaults.integer(forKey: Self.inlineHeardLimitKey)
         self.inlineHeardLimit = max(1, min(50, storedLimit == 0 ? 5 : storedLimit))
+        self.monitorAudioEnabled = defaults.object(forKey: Self.monitorAudioKey) as? Bool ?? true
         if persistRecentlyHeard {
             self.recentlyHeard = Self.loadHeardHistory()
         }
+
+        eventPump = Task { @MainActor [weak self] in
+            for await event in stream {
+                guard let self else { return }
+                self.apply(event)
+            }
+        }
+
+        updateMonitorSuspension()
+    }
+
+    deinit {
+        // The pump task holds the stream strongly, so dropping the
+        // continuation alone never terminates it — finish explicitly
+        // or the parked pump task leaks per coordinator instance.
+        eventContinuation.finish()
     }
 
     // MARK: - Actions
@@ -183,7 +244,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
             // `autoConnectReflector` toggle controls whether we act on it.
             rememberedReflectorName = reflector.name
         } catch {
-            let msg = String(describing: error)
+            let msg = error.displayMessage
             state = .failed(msg)
             lastError = msg
             connectedReflector = nil
@@ -252,6 +313,9 @@ public final class ReflectorCoordinator: ReflectorObserver {
         }
         // All attempts failed; whatever `connect(to:)` left in
         // `state` / `lastError` is the final answer.
+        if case .failed(let message) = state {
+            NotificationManager.shared.autoConnectFailed(what: "Reflector", reason: message)
+        }
     }
 
     public func disconnect() async {
@@ -264,7 +328,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
         do {
             try await s.disconnect()
         } catch {
-            lastError = "disconnect: \(error)"
+            lastError = "disconnect: \(error.displayMessage)"
         }
         session = nil
         connectedReflector = nil
@@ -308,16 +372,20 @@ public final class ReflectorCoordinator: ReflectorObserver {
         if recentlyHeard.count > 100 {
             recentlyHeard.removeLast()
         }
+        if persistRecentlyHeard {
+            saveHeardHistory()
+        }
     }
 
     // MARK: - ReflectorObserver (callback from tokio background task)
 
     public nonisolated func onEvent(event: ReflectorEvent) {
-        // Hop onto the main actor so `@Observable` change tracking
-        // fires on the same actor SwiftUI is rendering on.
-        Task { @MainActor [weak self] in
-            self?.apply(event)
-        }
+        // Yield into the serial mailbox; the single main-actor pump
+        // task (started in `init`) applies events strictly in arrival
+        // order so `@Observable` change tracking fires on the same
+        // actor SwiftUI is rendering on and voiceFrame can never
+        // overtake its voiceStart.
+        eventContinuation.yield(event)
     }
 
     // MARK: - Event application
@@ -336,10 +404,14 @@ public final class ReflectorCoordinator: ReflectorObserver {
             state = .disconnected
             let wasUserInitiated = userInitiatedDisconnect
             userInitiatedDisconnect = false
-            lastError = "reflector disconnected: \(reason)"
-            finalizeCurrentStream(reason: reason)
+            let reasonText = reason.displayText
+            lastError = "reflector disconnected: \(reasonText)"
+            // Flush decoder state; the tail PCM is discarded because the
+            // link is gone and there's nothing left to play through.
+            _ = rxPipeline.endStream()
+            finalizeCurrentStream(reason: reasonText)
             if !wasUserInitiated {
-                NotificationManager.shared.reflectorDisconnected(reason: reason)
+                NotificationManager.shared.reflectorDisconnected(reason: reasonText)
                 scheduleUnexpectedReconnect()
             }
 
@@ -350,6 +422,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
             // `_` = headerBytes. ReflectorCoordinator shows metadata
             // only; `RelayCoordinator` consumes the raw header to
             // forward to the radio as an MMDVM DStarHeader frame.
+            rxPipeline.startStream()
             currentStream = StreamSnapshot(
                 id: streamId,
                 mycall: mycall,
@@ -363,11 +436,13 @@ public final class ReflectorCoordinator: ReflectorObserver {
                 latestPosition: nil
             )
 
-        case .voiceFrame(let streamId, _, _):
+        case .voiceFrame(let streamId, let seq, let voiceBytes):
             if var s = currentStream, s.id == streamId {
                 s.framesReceived &+= 1
                 currentStream = s
             }
+            let pcm = rxPipeline.pushVoice(seq: seq, voiceBytes: voiceBytes)
+            audioPlayer.enqueue(pcm)
 
         case .slowDataUpdate(let streamId, let text, let position):
             if var s = currentStream, s.id == streamId {
@@ -377,17 +452,27 @@ public final class ReflectorCoordinator: ReflectorObserver {
             }
 
         case .voiceEnd(let streamId, let reason, let text, let position):
+            let streamEnd = rxPipeline.endStream()
+            audioPlayer.enqueue(streamEnd.tailPcm)
+            lastStreamStats = streamEnd.stats
             if let s = currentStream, s.id == streamId {
                 // Prefer the authoritative values carried on VoiceEnd;
                 // fall back to whatever the snapshot last saw.
+                var endReason = reason.displayText
+                if streamEnd.stats.lost > 0 {
+                    endReason += " · \(streamEnd.stats.lost) lost"
+                }
                 appendHeard(
                     from: s,
-                    endReason: reason,
+                    endReason: endReason,
                     text: text ?? s.latestText,
                     position: position ?? s.latestPosition
                 )
             }
             currentStream = nil
+
+        case .unknown(let detail):
+            log.warning("Unrecognised reflector event: \(detail)")
 
         case .ended:
             state = .disconnected
@@ -439,10 +524,11 @@ public final class ReflectorCoordinator: ReflectorObserver {
 
     /// Codable projection of `HeardEntry` for UserDefaults archival.
     /// We can't directly encode `HeardEntry` because it embeds
-    /// `GpsPosition` (a UniFFI-generated type without Codable);
-    /// also, UUID `id` regeneration is fine since persistence is
-    /// read-only after load.
+    /// `GpsPosition` (a UniFFI-generated type without Codable).
+    /// `id` is optional so archives written before it existed still
+    /// decode (they get fresh UUIDs on load, once).
     private struct PersistedHeard: Codable {
+        let id: UUID?
         let mycall: String
         let suffix: String
         let urcall: String
@@ -458,6 +544,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
         let comment: String?
 
         init(from entry: HeardEntry) {
+            self.id = entry.id
             self.mycall = entry.mycall
             self.suffix = entry.suffix
             self.urcall = entry.urcall
@@ -487,6 +574,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
                 position = nil
             }
             return HeardEntry(
+                id: id ?? UUID(),
                 mycall: mycall,
                 suffix: suffix,
                 urcall: urcall,
@@ -577,7 +665,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
     }
 
     public struct HeardEntry: Identifiable, Equatable, Sendable {
-        public let id: UUID = UUID()
+        public let id: UUID
         public let mycall: String
         public let suffix: String
         public let urcall: String
@@ -591,5 +679,32 @@ public final class ReflectorCoordinator: ReflectorObserver {
         public let text: String?
         /// Final DPRS position reported during the stream, if any.
         public let position: GpsPosition?
+
+        /// `id` defaults to a fresh UUID for newly-heard entries; the
+        /// persistence layer passes the stored one back in so SwiftUI
+        /// list identity survives quits and relaunches.
+        public init(
+            id: UUID = UUID(),
+            mycall: String,
+            suffix: String,
+            urcall: String,
+            endedAt: Date,
+            duration: TimeInterval,
+            frames: UInt32,
+            endReason: String,
+            text: String?,
+            position: GpsPosition?
+        ) {
+            self.id = id
+            self.mycall = mycall
+            self.suffix = suffix
+            self.urcall = urcall
+            self.endedAt = endedAt
+            self.duration = duration
+            self.frames = frames
+            self.endReason = endReason
+            self.text = text
+            self.position = position
+        }
     }
 }

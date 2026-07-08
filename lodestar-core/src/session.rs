@@ -209,17 +209,44 @@ pub struct GpsPosition {
     pub comment: Option<String>,
 }
 
+/// Why the reflector link ended — typed so Swift can pattern-match
+/// instead of string-matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum DisconnectCause {
+    /// Reflector rejected our LINK request.
+    Rejected,
+    /// Reflector acknowledged our unlink (expected after `disconnect`).
+    UnlinkAcked,
+    /// No keepalive traffic inside the timeout window.
+    KeepaliveTimeout,
+    /// Reflector did not acknowledge our disconnect in time.
+    DisconnectTimeout,
+    /// A cause added upstream that this build doesn't know yet.
+    Unknown,
+}
+
+/// Why a voice stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum VoiceEndCause {
+    /// Real end-of-transmission frame arrived.
+    Eot,
+    /// The stream went silent past the inactivity window.
+    Inactivity,
+    /// A cause added upstream that this build doesn't know yet.
+    Unknown,
+}
+
 /// Translated reflector event surfaced to the Swift observer.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum ReflectorEvent {
     /// The reflector acknowledged our LINK/CONNECT and we are live.
     Connected,
-    /// Connection ended. `reason` is a human-readable rendering of
-    /// [`DisconnectReason`] (rejected, unlink-acked, keepalive-timeout,
-    /// disconnect-timeout).
+    /// Connection ended. `reason` is a typed [`DisconnectCause`]
+    /// (rejected, unlink-acked, keepalive-timeout, disconnect-timeout,
+    /// or unknown) so Swift can pattern-match instead of string-matching.
     Disconnected {
-        /// Human-readable disconnect reason.
-        reason: String,
+        /// Typed disconnect reason.
+        reason: DisconnectCause,
     },
     /// `DPlus` keepalive bounce — useful as a "still alive" signal.
     PollEcho,
@@ -270,8 +297,8 @@ pub enum ReflectorEvent {
     VoiceEnd {
         /// Stream identifier that ended.
         stream_id: u16,
-        /// Why the stream ended — `"eot"` (real EOT) or `"inactivity"`.
-        reason: String,
+        /// Typed reason the stream ended (EOT, inactivity, or unknown).
+        reason: VoiceEndCause,
         /// Slow-data text assembled over the stream, if a complete
         /// 20-byte message arrived. This is the "TX message" operators
         /// set on their radios (Kenwood's stored comment field) and
@@ -283,6 +310,12 @@ pub enum ReflectorEvent {
     },
     /// The background task ended — session is finished, no further events.
     Ended,
+    /// An event variant this build doesn't recognise — surfaced for
+    /// diagnostics instead of being conflated with session teardown.
+    Unknown {
+        /// Debug rendering of the unrecognised event.
+        detail: String,
+    },
 }
 
 /// Foreign-implemented trait that receives translated reflector events.
@@ -653,6 +686,36 @@ pub async fn connect_reflector(
     }))
 }
 
+/// Fetch the authoritative `DPlus` REF directory from the auth server.
+/// Requires a registered callsign; returns `AuthFailed` when the
+/// server rejects it or the TCP exchange fails.
+///
+/// # Errors
+///
+/// - [`ReflectorError::InvalidCallsign`] if `callsign` is not a valid
+///   D-STAR callsign.
+/// - [`ReflectorError::AuthFailed`] if the auth-server handshake fails.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn fetch_dplus_directory(callsign: String) -> Result<Vec<Reflector>, ReflectorError> {
+    let cs = Callsign::try_from_str(&callsign)
+        .map_err(|e| ReflectorError::InvalidCallsign(format!("{callsign}: {e}")))?;
+    let list = AuthClient::new()
+        .authenticate(cs)
+        .await
+        .map_err(|e| ReflectorError::AuthFailed(format!("{e}")))?;
+    Ok(list
+        .hosts()
+        .iter()
+        .map(|h| Reflector {
+            name: h.callsign.clone(),
+            host: h.address.to_string(),
+            port: dstar_gateway_core::codec::dplus::consts::DEFAULT_PORT,
+            protocol: ReflectorProtocol::DPlus,
+            description: String::new(),
+        })
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Background task
 // ---------------------------------------------------------------------------
@@ -907,7 +970,7 @@ async fn run_session_task<P>(
     mut tx_rx: tokio::sync::mpsc::Receiver<TxCommand>,
 ) -> Result<(), String>
 where
-    P: dstar_gateway_core::session::client::Protocol,
+    P: dstar_gateway_core::session::client::Protocol + std::fmt::Debug,
 {
     let mut slow_state: Option<StreamSlowDataState> = None;
 
@@ -983,7 +1046,7 @@ fn handle_event<P>(
     observer: &Arc<dyn ReflectorObserver>,
     slow_state: &mut Option<StreamSlowDataState>,
 ) where
-    P: dstar_gateway_core::session::client::Protocol,
+    P: dstar_gateway_core::session::client::Protocol + std::fmt::Debug,
 {
     match event {
         Event::VoiceStart { stream_id, .. } => {
@@ -1021,7 +1084,7 @@ fn handle_event<P>(
                 .map_or((None, None), |s| (s.latest_text, s.latest_position));
             observer.on_event(ReflectorEvent::VoiceEnd {
                 stream_id: stream_id.get(),
-                reason: render_voice_end_reason(*reason),
+                reason: map_voice_end_reason(*reason),
                 text,
                 position,
             });
@@ -1229,12 +1292,12 @@ fn clean_slow_data_text(bytes: &[u8; 20]) -> Option<String> {
 /// [`ReflectorEvent`].
 fn translate_event<P>(event: &Event<P>) -> ReflectorEvent
 where
-    P: dstar_gateway_core::session::client::Protocol,
+    P: dstar_gateway_core::session::client::Protocol + std::fmt::Debug,
 {
     match event {
         Event::Connected { .. } => ReflectorEvent::Connected,
         Event::Disconnected { reason } => ReflectorEvent::Disconnected {
-            reason: render_disconnect_reason(*reason),
+            reason: map_disconnect_reason(*reason),
         },
         Event::PollEcho { .. } => ReflectorEvent::PollEcho,
         Event::VoiceStart {
@@ -1265,7 +1328,7 @@ where
         }
         Event::VoiceEnd { stream_id, reason } => ReflectorEvent::VoiceEnd {
             stream_id: stream_id.get(),
-            reason: render_voice_end_reason(*reason),
+            reason: map_voice_end_reason(*reason),
             // `handle_event` always produces the authoritative VoiceEnd
             // with the assembled text + GPS — this fallback only fires
             // for callers that bypass the state machine.
@@ -1273,28 +1336,36 @@ where
             position: None,
         },
         // `Event` is `#[non_exhaustive]` and carries a private
-        // `__Phantom` variant to thread `P`. Map anything future to
-        // `Ended` so we don't panic but still signal "something we
-        // don't recognise arrived".
-        _ => ReflectorEvent::Ended,
+        // `__Phantom` variant to thread `P`. Surface anything future as
+        // `Unknown` with its debug rendering instead of conflating it
+        // with session teardown.
+        other => ReflectorEvent::Unknown {
+            detail: format!("{other:?}"),
+        },
     }
 }
 
-fn render_disconnect_reason(reason: DisconnectReason) -> String {
+/// Map a `dstar-gateway-core` [`DisconnectReason`] to the FFI-visible
+/// [`DisconnectCause`]. The catch-all covers `#[non_exhaustive]` causes
+/// added upstream that this build doesn't know yet.
+const fn map_disconnect_reason(reason: DisconnectReason) -> DisconnectCause {
     match reason {
-        DisconnectReason::Rejected => "rejected".to_owned(),
-        DisconnectReason::UnlinkAcked => "unlink-acked".to_owned(),
-        DisconnectReason::KeepaliveInactivity => "keepalive-timeout".to_owned(),
-        DisconnectReason::DisconnectTimeout => "disconnect-timeout".to_owned(),
-        _ => "unknown".to_owned(),
+        DisconnectReason::Rejected => DisconnectCause::Rejected,
+        DisconnectReason::UnlinkAcked => DisconnectCause::UnlinkAcked,
+        DisconnectReason::KeepaliveInactivity => DisconnectCause::KeepaliveTimeout,
+        DisconnectReason::DisconnectTimeout => DisconnectCause::DisconnectTimeout,
+        _ => DisconnectCause::Unknown,
     }
 }
 
-fn render_voice_end_reason(reason: VoiceEndReason) -> String {
+/// Map a `dstar-gateway-core` [`VoiceEndReason`] to the FFI-visible
+/// [`VoiceEndCause`]. The catch-all covers `#[non_exhaustive]` reasons
+/// added upstream that this build doesn't know yet.
+const fn map_voice_end_reason(reason: VoiceEndReason) -> VoiceEndCause {
     match reason {
-        VoiceEndReason::Eot => "eot".to_owned(),
-        VoiceEndReason::Inactivity => "inactivity".to_owned(),
-        _ => "unknown".to_owned(),
+        VoiceEndReason::Eot => VoiceEndCause::Eot,
+        VoiceEndReason::Inactivity => VoiceEndCause::Inactivity,
+        _ => VoiceEndCause::Unknown,
     }
 }
 
@@ -1675,5 +1746,45 @@ mod slow_data_gps_tests {
         let frames = encode_dprs_to_scrambled_frames(sentence);
         let shifted = &frames[1..];
         assert!(decode_frames(shifted).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cause_mapping_tests {
+    use super::{
+        DisconnectCause, DisconnectReason, VoiceEndCause, VoiceEndReason, map_disconnect_reason,
+        map_voice_end_reason,
+    };
+
+    #[test]
+    fn disconnect_reasons_map_to_typed_causes() {
+        assert_eq!(
+            map_disconnect_reason(DisconnectReason::Rejected),
+            DisconnectCause::Rejected
+        );
+        assert_eq!(
+            map_disconnect_reason(DisconnectReason::UnlinkAcked),
+            DisconnectCause::UnlinkAcked
+        );
+        assert_eq!(
+            map_disconnect_reason(DisconnectReason::KeepaliveInactivity),
+            DisconnectCause::KeepaliveTimeout
+        );
+        assert_eq!(
+            map_disconnect_reason(DisconnectReason::DisconnectTimeout),
+            DisconnectCause::DisconnectTimeout
+        );
+    }
+
+    #[test]
+    fn voice_end_reasons_map_to_typed_causes() {
+        assert_eq!(
+            map_voice_end_reason(VoiceEndReason::Eot),
+            VoiceEndCause::Eot
+        );
+        assert_eq!(
+            map_voice_end_reason(VoiceEndReason::Inactivity),
+            VoiceEndCause::Inactivity
+        );
     }
 }

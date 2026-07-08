@@ -22,7 +22,9 @@ public final class SessionCoordinator {
     public let reflector: ReflectorCoordinator
     public let relay: RelayCoordinator
 
-    private var preconditionsTask: Task<Void, Never>?
+    /// `true` between `activate()` and `deactivate()` — gates the
+    /// observation re-arm loop below.
+    private var preconditionsActive = false
 
     public init(
         transport: TransportCoordinator,
@@ -40,7 +42,8 @@ public final class SessionCoordinator {
     /// is off, when a session is already live, or when the remembered
     /// identifier isn't available on the device.
     public func activate() {
-        guard preconditionsTask == nil else { return }
+        guard !preconditionsActive else { return }
+        preconditionsActive = true
         // Kick off auto-connect in the background — it guards on its
         // own preconditions, so this is safe to call unconditionally
         // every time the view reappears.
@@ -51,23 +54,17 @@ public final class SessionCoordinator {
             await reflector.tryAutoConnect()
         }
 
-        // Poll the two coordinators at a low duty cycle and reconcile
-        // the relay state. `@MainActor` isolation makes the reads
-        // trivial; `reconcileRelay` is idempotent so there's no harm
-        // in checking on every tick even when nothing changed.
-        preconditionsTask = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-                await self.reconcileRelay()
-                try? await Task.sleep(nanoseconds: 200_000_000)
-            }
+        // Reconcile once for the current state, then react to changes
+        // via observation tracking instead of a polling loop.
+        Task { @MainActor [weak self] in
+            await self?.reconcileRelay()
         }
+        observePreconditions()
     }
 
     /// Stop watching. Idempotent.
     public func deactivate() {
-        preconditionsTask?.cancel()
-        preconditionsTask = nil
+        preconditionsActive = false
     }
 
     /// Graceful shutdown: send the reflector unlink packet and close
@@ -126,6 +123,27 @@ public final class SessionCoordinator {
     }
 
     // MARK: - Private
+
+    /// Re-arm `withObservationTracking` around the relay's inputs.
+    /// Each change runs one reconcile and re-arms; `reconcileRelay`
+    /// is idempotent so redundant wakeups are harmless. Observation
+    /// fires once per registration, hence the explicit re-arm after
+    /// every change.
+    private func observePreconditions() {
+        guard preconditionsActive else { return }
+        withObservationTracking {
+            _ = transport.radioMode
+            _ = transport.state
+            _ = reflector.state
+            _ = relay.state
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.preconditionsActive else { return }
+                await self.reconcileRelay()
+                self.observePreconditions()
+            }
+        }
+    }
 
     /// Compare preconditions (`wantsRelay`) against the relay's
     /// current state and start/stop as needed. Idempotent — safe to

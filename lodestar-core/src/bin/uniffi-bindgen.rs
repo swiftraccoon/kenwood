@@ -13,6 +13,7 @@
 use dstar_gateway as _;
 use dstar_gateway_core as _;
 use lodestar_core as _;
+use mbelib_rs as _;
 use mmdvm_core as _;
 use thiserror as _;
 use tokio as _;

@@ -50,8 +50,23 @@ public final class TransportCoordinator {
     /// through the transport actor.
     public var relayTransport: RadioTransport? { transport }
 
+    /// Builds the concrete transport for a device. Overridable so tests
+    /// can substitute `MockRadioTransport`; defaults to the platform
+    /// transport (IOBluetooth on macOS, USB serial on iPad).
+    public var transportFactory: @MainActor (BluetoothDevice) -> RadioTransport = { device in
+        #if os(macOS)
+        IOBluetoothTransport(device: device)
+        #else
+        USBSerialTransport(device: device)
+        #endif
+    }
+
+    /// Backoff schedule for post-drop reconnects. Overridable in tests.
+    public var reconnectDelaysNs: [UInt64] = [3_000_000_000, 10_000_000_000, 30_000_000_000]
+
     private var transport: RadioTransport?
     private var stateObserver: Task<Void, Never>?
+    private var radioReconnectTask: Task<Void, Never>?
 
     private static let autoConnectKey = "lodestar.autoConnectRadio"
     private static let rememberedAddressKey = "lodestar.rememberedRadioAddress"
@@ -84,19 +99,24 @@ public final class TransportCoordinator {
         selectedDevice = device
     }
 
+    /// User-driven connect. Cancels any pending post-drop reconnect (the
+    /// user's explicit action takes precedence) then performs the open.
     public func connect() async {
+        radioReconnectTask?.cancel()
+        radioReconnectTask = nil
+        await performConnect()
+    }
+
+    /// The actual open/observe/probe sequence, shared by the public
+    /// `connect()` and the reconnect task. Kept free of the reconnect
+    /// cancel so the reconnect task can call it without cancelling itself.
+    private func performConnect() async {
         guard let device = selectedDevice else { return }
         isBusy = true
         defer { isBusy = false }
         radioMode = .unknown
 
-        #if os(macOS)
-        let t: RadioTransport = IOBluetoothTransport(device: device)
-        #else
-        // iPad uses USBSerialTransport; the device picker passes a
-        // synthetic descriptor since the USB path is one-cable-one-radio.
-        let t: RadioTransport = USBSerialTransport(device: device)
-        #endif
+        let t = transportFactory(device)
         transport = t
         observeState(of: t)
         do {
@@ -110,7 +130,10 @@ public final class TransportCoordinator {
             // right affordances (MCP button only if still in CAT mode).
             await probeRadioMode()
         } catch {
-            state = .failed(message: String(describing: error))
+            state = .failed(message: error.displayMessage)
+            stateObserver?.cancel()
+            stateObserver = nil
+            transport = nil
         }
     }
 
@@ -129,13 +152,18 @@ public final class TransportCoordinator {
         log.info("Auto-connect: reconnecting to \(device.name) (\(address))")
         select(device)
         await connect()
+        if case .failed(let message) = state {
+            NotificationManager.shared.autoConnectFailed(what: "Radio", reason: message)
+        }
     }
 
     public func disconnect() async {
-        await transport?.close()
-        transport = nil
+        radioReconnectTask?.cancel()
+        radioReconnectTask = nil
         stateObserver?.cancel()
         stateObserver = nil
+        await transport?.close()
+        transport = nil
         state = .disconnected
         radioMode = .unknown
     }
@@ -200,7 +228,7 @@ public final class TransportCoordinator {
             }
         } catch {
             log.error("Send ID failed: \(error)")
-            lastResponseText = "Error: \(error)"
+            lastResponseText = "Error: \(error.displayMessage)"
         }
     }
 
@@ -241,10 +269,10 @@ public final class TransportCoordinator {
             try await session.exitProgramming()
 
             // Radio will drop the connection; force our local state to match.
-            await transport?.close()
-            transport = nil
             stateObserver?.cancel()
             stateObserver = nil
+            await transport?.close()
+            transport = nil
             state = .disconnected
             radioMode = .unknown
             mcpStatus = .succeededRebooting
@@ -252,7 +280,7 @@ public final class TransportCoordinator {
             log.info("MCP: enable Reflector Terminal Mode succeeded")
         } catch {
             log.error("MCP: enable Reflector Terminal Mode failed: \(error)")
-            mcpStatus = .failed(String(describing: error))
+            mcpStatus = .failed(error.displayMessage)
             isBusy = false
         }
     }
@@ -288,11 +316,52 @@ public final class TransportCoordinator {
     private func observeState(of transport: RadioTransport) {
         stateObserver?.cancel()
         let stream = transport.stateStream
-        stateObserver = Task { [weak self] in
+        stateObserver = Task { @MainActor [weak self] in
             for await s in stream {
-                await MainActor.run {
-                    self?.state = s
-                }
+                guard let self else { return }
+                self.applyTransportState(s)
+            }
+        }
+    }
+
+    /// Apply a state yielded by the transport's own stream. A
+    /// `.connected → .disconnected` transition seen HERE is always
+    /// unexpected: user-initiated paths cancel the observer before
+    /// closing the transport.
+    private func applyTransportState(_ s: RadioTransportState) {
+        let previous = state
+        state = s
+        switch s {
+        case .failed:
+            radioMode = .unknown
+        case .disconnected:
+            guard case .connected = previous else { return }
+            log.warning("Transport dropped unexpectedly")
+            radioMode = .unknown
+            transport = nil
+            NotificationManager.shared.radioDisconnected()
+            scheduleRadioReconnect()
+        case .connecting, .connected:
+            break
+        }
+    }
+
+    /// Best-effort reconnect after an unexpected drop. Mirrors the
+    /// reflector coordinator's backoff so a BT blip mid-QSO heals
+    /// without user action. Cancelled by `disconnect()` and by any
+    /// fresh manual `connect()`.
+    private func scheduleRadioReconnect() {
+        guard selectedDevice != nil else { return }
+        radioReconnectTask?.cancel()
+        radioReconnectTask = Task { @MainActor [weak self] in
+            guard let delays = self?.reconnectDelaysNs else { return }
+            for delay in delays {
+                try? await Task.sleep(nanoseconds: delay)
+                guard let self, !Task.isCancelled else { return }
+                // The real serialization point: cancellation is cooperative and an in-flight attempt runs to completion, but a live transport always makes the next attempt bail here.
+                guard self.transport == nil else { return }
+                await self.performConnect()
+                if case .connected = self.state { return }
             }
         }
     }

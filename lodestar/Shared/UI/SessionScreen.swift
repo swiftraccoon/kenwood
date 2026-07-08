@@ -17,6 +17,7 @@ struct SessionScreen: View {
     @State private var showPicker = false
     @State private var showDevicePicker = false
     @State private var showHeardHistory = false
+    @State private var showSettings = false
 
     /// Max heard entries shown inline on the dashboard. User-configurable
     /// via Settings → Diagnostics; rest live behind the "Show all" sheet.
@@ -40,6 +41,19 @@ struct SessionScreen: View {
                     // link is live. Fields show placeholders while
                     // nobody's transmitting.
                     StreamNowPlayingCard(stream: reflector.currentStream)
+                    if !reflector.monitorAudioEnabled {
+                        // Tappable so the muted state is never a dead end —
+                        // the menu toggle exists too, but this is the spot
+                        // the operator is already looking at.
+                        Button {
+                            reflector.monitorAudioEnabled = true
+                        } label: {
+                            Label("Monitor muted — unmute", systemImage: "speaker.slash")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityHint("Turns reflector audio monitoring back on")
+                    }
                 }
                 heardHistory
             }
@@ -55,6 +69,21 @@ struct SessionScreen: View {
         .sheet(isPresented: $showHeardHistory) {
             HeardHistorySheet(coordinator: reflector)
         }
+        #if os(iOS)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .accessibilityLabel("Settings")
+            }
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsSheet()
+        }
+        #endif
         .onReceive(NotificationCenter.default.publisher(for: .lodestarShowDevicePicker)) { _ in
             showDevicePicker = true
         }
@@ -294,6 +323,10 @@ struct SessionScreen: View {
                     get: { reflector.autoConnectReflector },
                     set: { reflector.autoConnectReflector = $0 }
                 ))
+                Toggle("Monitor audio on this device", isOn: Binding(
+                    get: { reflector.monitorAudioEnabled },
+                    set: { reflector.monitorAudioEnabled = $0 }
+                ))
                 Divider()
                 Button(role: .destructive) {
                     Task { await reflector.disconnect() }
@@ -339,6 +372,12 @@ struct SessionScreen: View {
                                 value: relay.framesFromReflector
                             )
                     }
+                    if let err = relay.lastError {
+                        Label(err, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .lineLimit(2)
+                    }
                 } else if let msg = relayExplainer {
                     Text(msg).font(.caption).foregroundStyle(.secondary)
                 }
@@ -354,6 +393,9 @@ struct SessionScreen: View {
         if relay.state == .running {
             parts.append("radio to reflector frames \(relay.framesFromRadio)")
             parts.append("reflector to radio frames \(relay.framesFromReflector)")
+            if let err = relay.lastError {
+                parts.append("relay error: \(err)")
+            }
         } else if let msg = relayExplainer {
             parts.append(msg)
         }
