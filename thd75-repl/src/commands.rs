@@ -128,9 +128,7 @@ pub(crate) async fn squelch<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     let band = parse_band(args.first());
 
     // Second arg present and numeric = set squelch.
-    if args.len() >= 2
-        && let Ok(level) = args[1].parse::<u8>()
-    {
+    if let Some(Ok(level)) = args.get(1).map(|s| s.parse::<u8>()) {
         match kenwood_thd75::types::SquelchLevel::try_from(level) {
             Ok(sq) => match radio.set_squelch(band, sq).await {
                 Ok(()) => aprintln!("{}", thd75_repl::output::squelch_set(band, level)),
@@ -267,7 +265,9 @@ pub(crate) async fn tune<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     }
 
     let band = parse_band(args.first());
-    let freq_str = args[1];
+    let Some(&freq_str) = args.get(1) else {
+        return;
+    };
 
     let Ok(mhz) = freq_str.parse::<f64>() else {
         aprintln!("Error: invalid frequency: {freq_str}");
@@ -421,7 +421,10 @@ pub(crate) async fn set_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) 
     }
 
     let band = parse_band(args.first());
-    let mode = match args[1].to_lowercase().as_str() {
+    let Some(&mode_arg) = args.get(1) else {
+        return;
+    };
+    let mode = match mode_arg.to_lowercase().as_str() {
         "fm" => Mode::Fm,
         "nfm" => Mode::Nfm,
         "am" => Mode::Am,
@@ -464,7 +467,10 @@ pub(crate) async fn set_power<T: Transport>(radio: &mut Radio<T>, args: &[&str])
     }
 
     let band = parse_band(args.first());
-    let level = match args[1].to_lowercase().as_str() {
+    let Some(&level_arg) = args.get(1) else {
+        return;
+    };
+    let level = match level_arg.to_lowercase().as_str() {
         "high" | "h" => kenwood_thd75::types::PowerLevel::High,
         "medium" | "med" | "m" => kenwood_thd75::types::PowerLevel::Medium,
         "low" | "l" => kenwood_thd75::types::PowerLevel::Low,
@@ -641,8 +647,11 @@ pub(crate) async fn recall<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     }
 
     let band = parse_band(args.first());
-    let Ok(ch) = args[1].parse::<u16>() else {
-        aprintln!("Error: invalid channel number: {}", args[1]);
+    let Some(&ch_str) = args.get(1) else {
+        return;
+    };
+    let Ok(ch) = ch_str.parse::<u16>() else {
+        aprintln!("Error: invalid channel number: {ch_str}");
         return;
     };
 
@@ -666,11 +675,11 @@ pub(crate) async fn gps<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
         return;
     }
 
-    let Some(gps_on) = parse_bool(args[0]) else {
+    let Some(gps_on) = args.first().and_then(|s| parse_bool(s)) else {
         aprintln!("Error: first argument must be on or off");
         return;
     };
-    let Some(pc_on) = parse_bool(args[1]) else {
+    let Some(pc_on) = args.get(1).and_then(|s| parse_bool(s)) else {
         aprintln!("Error: second argument must be on or off");
         return;
     };
@@ -700,7 +709,9 @@ pub(crate) async fn urcall<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
         return;
     }
 
-    let callsign = args[0];
+    let Some(&callsign) = args.first() else {
+        return;
+    };
     let suffix = args.get(1).unwrap_or(&"");
     match radio.set_urcall(callsign, suffix).await {
         Ok(()) => aprintln!("{}", thd75_repl::output::urcall_set(callsign)),
@@ -728,8 +739,10 @@ pub(crate) async fn reflector<T: Transport>(radio: &mut Radio<T>, args: &[&str])
         return;
     }
 
-    let name = args[0];
-    let module = args[1].chars().next().unwrap_or('A');
+    let (Some(&name), Some(&module_arg)) = (args.first(), args.get(1)) else {
+        return;
+    };
+    let module = module_arg.chars().next().unwrap_or('A');
     match radio.connect_reflector(name, module).await {
         Ok(()) => aprintln!("{}", thd75_repl::output::reflector_connected(name, module)),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),

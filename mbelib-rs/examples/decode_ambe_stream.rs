@@ -12,15 +12,6 @@
     reason = "CLI tool: uses stderr for usage/error messages — standard pattern for a \
               binary example, not a library."
 )]
-#![expect(
-    clippy::indexing_slicing,
-    reason = "CLI example: reads fixed-size 9-byte AMBE frames from an input file and \
-              directly indexes into the local read buffer to pull out fields for the \
-              trace output. The buffer is always filled before indexing (checked by the \
-              `read_exact` call), so indexing is bounds-safe by construction. A \
-              `.get()?` rewrite would add unwrap noise throughout a thin CLI that exists \
-              specifically to mirror mbelib's trace format byte-for-byte."
-)]
 
 // Dev-dependencies pulled in by sibling test/example targets. Acknowledge them
 // here so `unused_crate_dependencies` stays silent for this compilation unit.
@@ -31,14 +22,21 @@ use wide as _;
 use std::io::{Read, Write};
 
 fn main() -> std::io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 || args.len() > 4 {
-        eprintln!("usage: {} <in.ambe> <out.s16> [out.trace]", args[0]);
+    let mut args = std::env::args();
+    let prog = args
+        .next()
+        .unwrap_or_else(|| "decode_ambe_stream".to_owned());
+    let (Some(in_path), Some(out_path)) = (args.next(), args.next()) else {
+        eprintln!("usage: {prog} <in.ambe> <out.s16> [out.trace]");
+        std::process::exit(2);
+    };
+    let trace_path = args.next();
+    if args.next().is_some() {
+        eprintln!("usage: {prog} <in.ambe> <out.s16> [out.trace]");
         std::process::exit(2);
     }
-    let trace_path = args.get(3).cloned();
-    let mut input = std::fs::File::open(&args[1])?;
-    let mut output = std::fs::File::create(&args[2])?;
+    let mut input = std::fs::File::open(&in_path)?;
+    let mut output = std::fs::File::create(&out_path)?;
     let mut trace = match trace_path.as_deref() {
         Some("-") | None => None,
         Some(p) => Some(std::fs::File::create(p)?),
@@ -76,10 +74,8 @@ fn main() -> std::io::Result<()> {
         }
         let pcm = dec.decode_frame(&frame);
         let mut bytes = [0u8; 320];
-        for (i, &s) in pcm.iter().enumerate() {
-            let le = s.to_le_bytes();
-            bytes[i * 2] = le[0];
-            bytes[i * 2 + 1] = le[1];
+        for (chunk, &s) in bytes.chunks_exact_mut(2).zip(pcm.iter()) {
+            chunk.copy_from_slice(&s.to_le_bytes());
         }
         output.write_all(&bytes)?;
         frame_idx += 1;

@@ -19,23 +19,6 @@
 //!   MMDVM mode and D-STAR events (voice, text messages, stations heard)
 //!   are announced. Exit with `dstar stop`.
 
-#![expect(
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    let_underscore_drop,
-    reason = "Interactive REPL binary. The REPL's `main.rs` (and its `commands`/`transport` \
-              submodules) parses user input line-by-line and drives the radio via the \
-              async `Radio<T>` API. CLI patterns like `.expect()` on channel sends whose \
-              receiver is known live, direct `line[..n]` slicing on pre-validated input, \
-              and `let _ = stdout().flush()` (flush failures don't affect the \
-              already-queued `println!` output) are the correct level of abstraction for \
-              an operator REPL — a `Result`-propagating version would noise up the \
-              command loop without catching real bugs. Any failure of these assumptions \
-              would correctly abort the REPL with a useful message. This opt-out is \
-              restated in source at the bin target's entry point so it is visible to \
-              anyone reading the REPL code, rather than buried in Cargo.toml."
-)]
-
 mod commands;
 mod transport;
 
@@ -464,9 +447,9 @@ fn parse_utc_offset(s: &str) -> Result<i32, String> {
         return Err("contains non-ASCII characters".to_string());
     }
     let bytes = s.as_bytes();
-    let (sign, rest) = match bytes[0] {
-        b'+' => (1i32, &s[1..]),
-        b'-' => (-1i32, &s[1..]),
+    let (sign, rest) = match bytes.first() {
+        Some(b'+') => (1i32, s.get(1..).unwrap_or("")),
+        Some(b'-') => (-1i32, s.get(1..).unwrap_or("")),
         _ => (1i32, s),
     };
     let rest = rest.trim_start_matches(':');
@@ -1122,7 +1105,7 @@ async fn run_repl(
                 ReplState::Aprs(c) => c.stop().await.ok(),
                 ReplState::Dstar(mut s) => {
                     if let Some(ref mut r) = s.reflector {
-                        let _ = r.disconnect().await;
+                        drop(r.disconnect().await);
                     }
                     let radio = s.gateway.stop().await.ok();
                     // Mirror the guidance the interactive quit path
@@ -1136,7 +1119,7 @@ async fn run_repl(
                 }
             };
             if let Some(r) = radio {
-                let _ = r.disconnect().await;
+                drop(r.disconnect().await);
             }
             println!("{}", thd75_repl::output::goodbye());
             return Ok(());
@@ -1146,14 +1129,14 @@ async fn run_repl(
         if line.is_empty() {
             continue;
         }
-        let _ = rl.add_history_entry(&line);
+        drop(rl.add_history_entry(&line));
 
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
+        let Some(first_word) = parts.first() else {
             continue;
-        }
+        };
 
-        let cmd = parts[0].to_lowercase();
+        let cmd = first_word.to_lowercase();
 
         // Global commands available in any mode.
         match cmd.as_str() {
@@ -1197,7 +1180,7 @@ async fn run_repl(
                     ReplState::Dstar(mut session) => {
                         println!("Exiting D-STAR mode and restoring normal radio mode.");
                         if let Some(ref mut refl) = session.reflector {
-                            let _ = refl.disconnect().await;
+                            drop(refl.disconnect().await);
                         }
                         match exit_dstar(session.gateway, cli_port.as_deref(), cli_baud).await {
                             Ok(r) => Some(r),
@@ -1215,7 +1198,7 @@ async fn run_repl(
                     ReplState::Cat(r) => Some(r),
                 };
                 if let Some(r) = radio {
-                    let _ = r.disconnect().await;
+                    drop(r.disconnect().await);
                 }
                 println!("{}", thd75_repl::output::goodbye());
                 return Ok(());
@@ -1320,7 +1303,7 @@ async fn run_repl(
                         println!("Example: aprs start W1AW 7");
                         ReplState::Cat(radio)
                     } else {
-                        match enter_aprs(radio, &parts[2..]).await {
+                        match enter_aprs(radio, parts.get(2..).unwrap_or(&[])).await {
                             Ok(client) => ReplState::Aprs(Box::new(client)),
                             Err((radio_back, e)) => {
                                 println!(
@@ -1341,7 +1324,7 @@ async fn run_repl(
                         println!("Example: dstar start W1AW XRF030C");
                         ReplState::Cat(radio)
                     } else {
-                        match enter_dstar(radio, &parts[2..]).await {
+                        match enter_dstar(radio, parts.get(2..).unwrap_or(&[])).await {
                             Ok(mut session) => {
                                 // If a reflector was connected, auto-enter monitor.
                                 if session.reflector.is_some() {
@@ -1399,7 +1382,7 @@ async fn run_repl(
             ReplState::Dstar(mut session) => {
                 if cmd == "dstar" && parts.get(1).is_some_and(|s| *s == "stop") {
                     if let Some(ref mut refl) = session.reflector {
-                        let _ = refl.disconnect().await;
+                        drop(refl.disconnect().await);
                     }
                     match exit_dstar(session.gateway, cli_port.as_deref(), cli_baud).await {
                         Ok(radio) => {
@@ -1448,33 +1431,34 @@ async fn run_repl(
               the dispatch into a per-command map without reducing real complexity."
 )]
 async fn dispatch_cat(radio: &mut Radio<EitherTransport>, cmd: &str, parts: &[&str]) {
+    let args = parts.get(1..).unwrap_or(&[]);
     match cmd {
         "id" | "identify" => commands::identify(radio).await,
-        "freq" | "frequency" => commands::frequency(radio, &parts[1..]).await,
-        "mode" => commands::set_mode(radio, &parts[1..]).await,
-        "squelch" | "sq" => commands::squelch(radio, &parts[1..]).await,
-        "power" | "pwr" => commands::set_power(radio, &parts[1..]).await,
+        "freq" | "frequency" => commands::frequency(radio, args).await,
+        "mode" => commands::set_mode(radio, args).await,
+        "squelch" | "sq" => commands::squelch(radio, args).await,
+        "power" | "pwr" => commands::set_power(radio, args).await,
         "battery" | "bat" => commands::battery(radio).await,
-        "lock" => commands::lock(radio, &parts[1..]).await,
-        "dualband" | "dual" => commands::dual_band(radio, &parts[1..]).await,
-        "bluetooth" | "bt" => commands::bluetooth(radio, &parts[1..]).await,
-        "vox" => commands::vox(radio, &parts[1..]).await,
-        "fm" => commands::fm_radio(radio, &parts[1..]).await,
-        "attenuator" | "att" => commands::attenuator(radio, &parts[1..]).await,
-        "step" => commands::step_size(radio, &parts[1..]).await,
-        "up" => commands::step_up(radio, &parts[1..]).await,
-        "down" => commands::step_down(radio, &parts[1..]).await,
-        "channel" | "ch" => commands::channel(radio, &parts[1..]).await,
-        "channels" => commands::channels(radio, &parts[1..]).await,
-        "tune" => commands::tune(radio, &parts[1..]).await,
-        "recall" => commands::recall(radio, &parts[1..]).await,
-        "meter" | "smeter" => commands::smeter(radio, &parts[1..]).await,
-        "vfo" => commands::vfo(radio, &parts[1..]).await,
+        "lock" => commands::lock(radio, args).await,
+        "dualband" | "dual" => commands::dual_band(radio, args).await,
+        "bluetooth" | "bt" => commands::bluetooth(radio, args).await,
+        "vox" => commands::vox(radio, args).await,
+        "fm" => commands::fm_radio(radio, args).await,
+        "attenuator" | "att" => commands::attenuator(radio, args).await,
+        "step" => commands::step_size(radio, args).await,
+        "up" => commands::step_up(radio, args).await,
+        "down" => commands::step_down(radio, args).await,
+        "channel" | "ch" => commands::channel(radio, args).await,
+        "channels" => commands::channels(radio, args).await,
+        "tune" => commands::tune(radio, args).await,
+        "recall" => commands::recall(radio, args).await,
+        "meter" | "smeter" => commands::smeter(radio, args).await,
+        "vfo" => commands::vfo(radio, args).await,
         "clock" | "time" => commands::clock(radio).await,
-        "gps" => commands::gps(radio, &parts[1..]).await,
-        "urcall" | "ur" => commands::urcall(radio, &parts[1..]).await,
+        "gps" => commands::gps(radio, args).await,
+        "urcall" | "ur" => commands::urcall(radio, args).await,
         "cq" => commands::cq(radio).await,
-        "reflector" | "ref" => commands::reflector(radio, &parts[1..]).await,
+        "reflector" | "ref" => commands::reflector(radio, args).await,
         "unreflector" | "unref" | "unlink" => commands::unreflector(radio).await,
         "status" => commands::status(radio).await,
         "aprs" => {
@@ -1510,7 +1494,10 @@ async fn enter_aprs(
 ) -> Result<AprsClient<EitherTransport>, (Radio<EitherTransport>, String)> {
     // AX.25 callsigns are upper-case on the wire; normalize here so
     // a lower-case `aprs start w1aw` behaves like the intended call.
-    let callsign = args[0].to_ascii_uppercase();
+    let Some(raw_callsign) = args.first() else {
+        return Err((radio, "callsign required".to_string()));
+    };
+    let callsign = raw_callsign.to_ascii_uppercase();
     let ssid: u8 = match args.get(1) {
         None => 0,
         // Reject rather than silently beaconing as SSID 0 when the
@@ -1565,8 +1552,10 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
             if !thd75_repl::confirm::tx_confirm() {
                 return;
             }
-            let addressee = parts[1];
-            let text = parts[2..].join(" ");
+            let Some(&addressee) = parts.get(1) else {
+                return;
+            };
+            let text = parts.get(2..).unwrap_or(&[]).join(" ");
             match client.send_message(addressee, &text).await {
                 Ok(msg_id) => println!("Message queued to {addressee}: {text} (ID: {msg_id})"),
                 Err(e) => println!(
@@ -1593,22 +1582,18 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
                 println!("  Example: position 35.30 -82.46 Portable");
                 return;
             }
-            let Ok(lat) = parts[1].parse::<f64>() else {
+            let Some(Ok(lat)) = parts.get(1).map(|s| s.parse::<f64>()) else {
                 println!("Error: invalid latitude. Use decimal degrees (e.g. 35.30).");
                 return;
             };
-            let Ok(lon) = parts[2].parse::<f64>() else {
+            let Some(Ok(lon)) = parts.get(2).map(|s| s.parse::<f64>()) else {
                 println!("Error: invalid longitude. Use decimal degrees (e.g. -82.46).");
                 return;
             };
             if !thd75_repl::confirm::tx_confirm() {
                 return;
             }
-            let comment = if parts.len() > 3 {
-                parts[3..].join(" ")
-            } else {
-                String::new()
-            };
+            let comment = parts.get(3..).unwrap_or(&[]).join(" ");
             match client.beacon_position(lat, lon, &comment).await {
                 Ok(()) => println!(
                     "Position beacon sent: {lat:.4}, {lon:.4}{}.",
@@ -1654,7 +1639,7 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
                 println!("  Press Ctrl-C to disconnect.");
                 return;
             }
-            let filter = parts[1..].join(" ");
+            let filter = parts.get(1..).unwrap_or(&[]).join(" ");
             run_igate(client, &filter).await;
         }
         _ => println!(
@@ -1705,7 +1690,7 @@ async fn run_igate(client: &mut AprsClient<EitherTransport>, filter: &str) {
         tokio::select! {
             _ = &mut ctrl_c => {
                 println!("IGate stopping.");
-                let _ = is_client.shutdown().await;
+                drop(is_client.shutdown().await);
                 break;
             }
             // Poll APRS-IS for incoming packets.
@@ -1889,9 +1874,9 @@ async fn guide_exit_terminal_mode(
         println!();
         println!("Set Menu 650 to Off on the radio, then press Enter when done (Ctrl-C to quit).");
         let mut line = String::new();
-        let _ = std::io::stdin().read_line(&mut line);
+        drop(std::io::stdin().read_line(&mut line));
 
-        let _ = radio.disconnect().await;
+        drop(radio.disconnect().await);
         println!("Reconnecting...");
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 
@@ -2049,7 +2034,7 @@ async fn ensure_terminal_mode(
 
     // Release the now-dead transport, wait out the ~5 s reboot, then
     // relaunch — the fresh process picks up the radio in gateway mode.
-    let _ = radio.disconnect().await;
+    drop(radio.disconnect().await);
     println!("Radio is rebooting into Reflector Terminal Mode. Relaunching...");
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     Err((None, relaunch_self()))
@@ -2068,7 +2053,10 @@ async fn enter_dstar(
     // D-STAR callsigns are upper-case on the wire (headers and DPlus
     // authentication); normalize so `dstar start w1aw` works as the
     // operator intended.
-    let callsign = args[0].to_ascii_uppercase();
+    let Some(raw_callsign) = args.first() else {
+        return Err((Some(radio), "callsign required".to_string()));
+    };
+    let callsign = raw_callsign.to_ascii_uppercase();
     // Optional reflector argument: e.g. "XRF030C" → name="XRF030", module='C'
     let reflector_arg = args.get(1).copied();
 
@@ -2303,7 +2291,7 @@ async fn ensure_host_files() {
     }
 
     println!("Downloading host files.");
-    let _ = std::fs::create_dir_all(&dir);
+    drop(std::fs::create_dir_all(&dir));
 
     for (name, url, _) in HOST_FILES {
         let path = dir.join(name);
@@ -2330,7 +2318,7 @@ async fn ensure_host_files() {
                 // before the failure; remove it so the presence
                 // check above retries the download next time
                 // instead of treating the stub as installed.
-                let _ = std::fs::remove_file(&path);
+                drop(std::fs::remove_file(&path));
                 println!(
                     "Error: failed to download {name}: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
@@ -2377,7 +2365,7 @@ fn load_host_files() -> HostFile {
     // Seed + load the local/vanity host file.
     let local_path = dir.join(LOCAL_HOSTS_FILE);
     if !local_path.exists() {
-        let _ = std::fs::create_dir_all(&dir);
+        drop(std::fs::create_dir_all(&dir));
         if let Err(e) = std::fs::write(&local_path, LOCAL_HOSTS_SEED) {
             tracing::warn!(error = %e, "failed to seed Local_Hosts.txt");
         }
@@ -2743,7 +2731,7 @@ async fn exit_dstar(
         .map_err(|e| format!("Gateway stop failed: {e}"))?;
 
     // Disconnect BT to release the RFCOMM channel.
-    let _ = radio.disconnect().await;
+    drop(radio.disconnect().await);
 
     // The radio is still in Reflector Terminal Mode. We cannot
     // MCP-write it back to Off because MCP requires CAT mode, but
@@ -2759,7 +2747,7 @@ async fn exit_dstar(
     // Enter is the only way past this prompt. Don't advertise Ctrl-C
     // here.
     let mut input = String::new();
-    let _ = std::io::stdin().read_line(&mut input);
+    drop(std::io::stdin().read_line(&mut input));
 
     // Reconnect — should be in CAT mode now if user changed Menu 650.
     println!("Reconnecting.");
@@ -3145,7 +3133,10 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
                 );
                 return;
             }
-            let link = match parse_link_arg(parts[1]) {
+            let Some(&link_arg) = parts.get(1) else {
+                return;
+            };
+            let link = match parse_link_arg(link_arg) {
                 Ok(l) => l,
                 Err(e) => {
                     println!("Error: {e}");
@@ -3250,13 +3241,16 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
                 println!("  text clear: Remove the outgoing text.");
                 return;
             }
-            if parts[1] == "clear" || parts[1] == "off" || parts[1] == "none" {
+            let Some(&first_arg) = parts.get(1) else {
+                return;
+            };
+            if first_arg == "clear" || first_arg == "off" || first_arg == "none" {
                 session.tx_text = None;
                 session.tx_slow_data.clear();
                 session.tx_slow_data_idx = 0;
                 println!("Outgoing text cleared.");
             } else {
-                let text = parts[1..].join(" ");
+                let text = parts.get(1..).unwrap_or(&[]).join(" ");
                 let truncated = truncate_slow_data_text(&text);
                 if truncated.len() < text.len() {
                     println!("Text truncated to fit 20 bytes.");
@@ -3451,8 +3445,11 @@ async fn relay_radio_to_reflector(session: &mut DStarSession, event: &DStarEvent
             let slow_data = if session.tx_slow_data.is_empty() {
                 frame.slow_data
             } else {
-                let sd =
-                    session.tx_slow_data[session.tx_slow_data_idx % session.tx_slow_data.len()];
+                let sd = session
+                    .tx_slow_data
+                    .get(session.tx_slow_data_idx % session.tx_slow_data.len())
+                    .copied()
+                    .unwrap_or(frame.slow_data);
                 session.tx_slow_data_idx += 1;
                 sd
             };
@@ -3608,7 +3605,8 @@ fn rand_stream_id() -> StreamId {
                   unique ID. Only the low 16 bits of entropy matter here."
     )]
     let id = ((t.subsec_nanos() ^ (t.as_secs() as u32)) as u16) | 0x0001;
-    StreamId::new(id).expect("low bit forced to 1 guarantees non-zero")
+    StreamId::new(id)
+        .unwrap_or_else(|| unreachable!("low bit forced to 1 guarantees a non-zero stream id"))
 }
 
 /// Build the header to send to the radio's MMDVM modem when relaying
@@ -4147,29 +4145,36 @@ fn print_dstar_event(event: &DStarEvent) {
 mod offset_tests {
     use super::parse_utc_offset;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn parses_plus_hhmm_colon() {
-        assert_eq!(parse_utc_offset("+05:30").unwrap(), 5 * 3600 + 30 * 60);
+    fn parses_plus_hhmm_colon() -> TestResult {
+        assert_eq!(parse_utc_offset("+05:30")?, 5 * 3600 + 30 * 60);
+        Ok(())
     }
 
     #[test]
-    fn parses_minus_hhmm_colon() {
-        assert_eq!(parse_utc_offset("-08:00").unwrap(), -8 * 3600);
+    fn parses_minus_hhmm_colon() -> TestResult {
+        assert_eq!(parse_utc_offset("-08:00")?, -8 * 3600);
+        Ok(())
     }
 
     #[test]
-    fn parses_plus_hhmm_no_colon() {
-        assert_eq!(parse_utc_offset("+0530").unwrap(), 5 * 3600 + 30 * 60);
+    fn parses_plus_hhmm_no_colon() -> TestResult {
+        assert_eq!(parse_utc_offset("+0530")?, 5 * 3600 + 30 * 60);
+        Ok(())
     }
 
     #[test]
-    fn parses_plus_h() {
-        assert_eq!(parse_utc_offset("+5").unwrap(), 5 * 3600);
+    fn parses_plus_h() -> TestResult {
+        assert_eq!(parse_utc_offset("+5")?, 5 * 3600);
+        Ok(())
     }
 
     #[test]
-    fn parses_no_sign_positive() {
-        assert_eq!(parse_utc_offset("03:00").unwrap(), 3 * 3600);
+    fn parses_no_sign_positive() -> TestResult {
+        assert_eq!(parse_utc_offset("03:00")?, 3 * 3600);
+        Ok(())
     }
 
     #[test]
@@ -4188,9 +4193,10 @@ mod offset_tests {
     }
 
     #[test]
-    fn parses_zero_offset() {
-        assert_eq!(parse_utc_offset("+00:00").unwrap(), 0);
-        assert_eq!(parse_utc_offset("-00:00").unwrap(), 0);
+    fn parses_zero_offset() -> TestResult {
+        assert_eq!(parse_utc_offset("+00:00")?, 0);
+        assert_eq!(parse_utc_offset("-00:00")?, 0);
+        Ok(())
     }
 
     #[test]

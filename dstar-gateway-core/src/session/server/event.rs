@@ -166,7 +166,11 @@ mod tests {
     const ADDR_DPLUS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20001);
     const ADDR_DCS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30051);
 
-    #[expect(clippy::unwrap_used, reason = "const-validated: n is non-zero")]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test helper: every call site passes a non-zero literal, so the \
+                  unwrap cannot fire; a zero would panic only this test, at runtime"
+    )]
     const fn sid(n: u16) -> StreamId {
         StreamId::new(n).unwrap()
     }

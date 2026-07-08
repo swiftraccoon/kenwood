@@ -318,7 +318,11 @@ mod tests {
         Callsign::from_wire_bytes(bytes)
     }
 
-    #[expect(clippy::unwrap_used, reason = "compile-time validated: n != 0")]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test helper: every call site passes a non-zero literal, so the \
+                  unwrap cannot fire; a zero would panic only this test, at runtime"
+    )]
     const fn sid(n: u16) -> StreamId {
         StreamId::new(n).unwrap()
     }

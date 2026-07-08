@@ -2193,7 +2193,7 @@ mod tests {
         let radio = mock_radio(TncBaud::Bps1200).await?;
         let config = test_config();
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
-        let _ = client.next_event().await?;
+        let _idle_event = client.next_event().await?;
         assert!(
             client.take_last_rf_packet().is_none(),
             "idle cycle must not expose a frame to gate"

@@ -9,14 +9,6 @@
 //! (`Modem.cpp:288-315` for the per-mode ring buffers and
 //! `Modem.cpp:1049-1220` for the space-gated drain logic).
 
-// TxQueue is crate-internal: the handle never sees it. The `pub(crate)`
-// surface is required so the sibling `modem_loop.rs` can construct
-// and drive it, but it's not intended to leak into the public API.
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "TxQueue and friends are crate-internal infrastructure"
-)]
-
 use std::collections::VecDeque;
 
 use mmdvm_core::{MMDVM_DSTAR_DATA, MMDVM_DSTAR_EOT, MMDVM_DSTAR_HEADER, ModemMode};

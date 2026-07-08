@@ -6,17 +6,10 @@
 #![expect(
     clippy::print_stdout,
     clippy::cast_precision_loss,
-    clippy::indexing_slicing,
     missing_docs,
-    unused_results,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "Single-frame vs DP pitch-tracker A/B harness. Prints diagnostic output, \
-              allows panics on malformed fixtures (validation scratchwork). DSP precision \
-              casts and direct indexing into fixed-size PCM / FFT arrays are unavoidable \
-              in pitch search. The binary exists to produce bit-level comparisons against \
-              an OP25 reference trace — any bounds violation would surface during the \
-              fixture load and correctly abort the example."
+    reason = "Single-frame vs DP pitch-tracker A/B harness: a diagnostic CLI that \
+              prints its comparison table to stdout; the percentage math casts \
+              frame counts to f64 for display only."
 )]
 
 // Dev-dependencies pulled in by sibling tests/examples. Acknowledge them here so
@@ -28,36 +21,37 @@ use mbelib_rs::{EncoderBuffers, FftPlan, PitchTracker, analyze_frame, compute_e_
 use realfft::num_complex::Complex;
 use std::io::{BufRead, BufReader, Read};
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pcm_path = std::env::args()
         .nth(1)
-        .expect("usage: validate_dp <pcm> <trace>");
+        .ok_or("usage: validate_dp <pcm> <trace>")?;
     let trace_path = std::env::args()
         .nth(2)
-        .expect("usage: validate_dp <pcm> <trace>");
+        .ok_or("usage: validate_dp <pcm> <trace>")?;
 
     let pcm: Vec<f32> = {
-        let mut f = std::fs::File::open(&pcm_path).unwrap();
+        let mut f = std::fs::File::open(&pcm_path)?;
         let mut buf = Vec::new();
-        f.read_to_end(&mut buf).unwrap();
+        let _len = f.read_to_end(&mut buf)?;
         buf.chunks_exact(2)
-            .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0)
+            .filter_map(|b| match *b {
+                [lo, hi] => Some(f32::from(i16::from_le_bytes([lo, hi])) / 32768.0),
+                _ => None,
+            })
             .collect()
     };
 
     // Parse OP25 trace for ref_pitch per frame.
     let op25_pitch: Vec<f32> = {
-        let f = std::fs::File::open(&trace_path).unwrap();
+        let f = std::fs::File::open(&trace_path)?;
         let r = BufReader::new(f);
         let mut out = Vec::new();
         for line in r.lines().map_while(Result::ok) {
             if let Some(rest) = line.trim_start().strip_prefix("ref_pitch = ") {
-                let q88 = rest
-                    .split_whitespace()
-                    .next()
-                    .unwrap()
-                    .parse::<u16>()
-                    .unwrap();
+                let Some(token) = rest.split_whitespace().next() else {
+                    continue;
+                };
+                let q88: u16 = token.parse()?;
                 out.push(f32::from(q88) / 256.0);
             }
         }
@@ -89,10 +83,10 @@ fn main() {
 
         // DP: buffer 3 e_p arrays.
         ring.push(e_p);
-        if ring.len() == 3 {
-            let est = dp.estimate_with_lookahead(&ring[0], &ring[1], &ring[2]);
+        if let [r0, r1, r2] = ring.as_slice() {
+            let est = dp.estimate_with_lookahead(r0, r1, r2);
             dp_periods.push(est.period_samples);
-            ring.remove(0);
+            let _oldest = ring.remove(0);
         } else {
             dp_periods.push(0.0); // warmup
         }
@@ -127,4 +121,5 @@ fn main() {
         dp_diffs.len(),
         100.0 * within(&dp_diffs) as f64 / dp_diffs.len() as f64
     );
+    Ok(())
 }

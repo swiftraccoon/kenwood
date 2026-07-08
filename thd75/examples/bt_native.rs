@@ -1,5 +1,26 @@
 //! Test native Bluetooth RFCOMM transport.
 
+// Deps visible to every kenwood-thd75 example target but unused here.
+// Acknowledged so `unused_crate_dependencies` stays silent without
+// weakening the lint.
+use aprs as _;
+use aprs_is as _;
+use ax25_codec as _;
+use dstar_gateway_core as _;
+use kiss_tnc as _;
+use mmdvm as _;
+use mmdvm_core as _;
+use proptest as _;
+use serde_json as _;
+use thiserror as _;
+use tokio_serial as _;
+use tracing as _;
+
+// Used only by the macOS `main` below; on other targets the stub `main` leaves
+// them unused, so acknowledge them there to keep `unused_crate_dependencies` quiet.
+#[cfg(not(target_os = "macos"))]
+use {kenwood_thd75 as _, tokio as _};
+
 #[cfg(target_os = "macos")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

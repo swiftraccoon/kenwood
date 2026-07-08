@@ -1,12 +1,3 @@
-#![expect(
-    clippy::too_many_lines,
-    reason = "APRS pane render functions draw complete UI sections (station list with \
-              columns, message history with statuses, digipeater path spans) — Ratatui's \
-              immediate-mode API means each visible cell is an explicit construction \
-              call. Splitting per-section helpers would move the layout logic away from \
-              the constraints that bound it, making the view harder to read end-to-end."
-)]
-
 use std::time::Instant;
 
 use ratatui::Frame;
@@ -61,6 +52,13 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
 // Live APRS view (KISS mode active)
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Draws the complete APRS station list with columns and selection state — \
+              Ratatui's immediate-mode API means each visible cell is an explicit \
+              construction call; splitting would move layout logic away from the \
+              constraints that bound it."
+)]
 fn render_live(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     // --- Left pane: station list ---
     let station_count = app.aprs_stations.len();
@@ -88,7 +86,13 @@ fn render_live(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: R
         };
         let end = (start + visible_height).min(station_count);
 
-        for (i, station) in app.aprs_stations[start..end].iter().enumerate() {
+        for (i, station) in app
+            .aprs_stations
+            .get(start..end)
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+        {
             let idx = start + i;
             let is_selected = idx == app.aprs_station_index;
 
@@ -263,6 +267,13 @@ fn render_live(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: R
 // MCP config view (KISS not active)
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Draws the complete APRS MCP-config section row-by-row — Ratatui's \
+              immediate-mode API means each visible cell is an explicit construction \
+              call; splitting would move layout logic away from the constraints that \
+              bound it."
+)]
 fn render_mcp_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     let block = Block::default()
         .title(" APRS ")

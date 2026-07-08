@@ -68,27 +68,6 @@ pub(crate) enum RadioCommand {
     SetGpsConfig(bool, bool),
     /// Set FM radio on/off (FR write — verified working).
     SetFmRadio(bool),
-    /// Set D-STAR callsign slot (CS write — verified working).
-    /// Not yet wired to `adjust_setting` (requires polling current slot first).
-    #[expect(
-        dead_code,
-        reason = "Wire-verified CAT command variant held for the upcoming `adjust_setting` \
-                  hook-up. The worker translates CAT commands in `radio_task.rs` — this \
-                  variant is constructed once that hook-up lands, which needs a preceding \
-                  CS read to capture the current slot index. Keeping the variant means the \
-                  dispatch table shape stays stable and callers compile as soon as the \
-                  read-first logic is wired."
-    )]
-    SetCallsignSlot(kenwood_thd75::types::CallsignSlot),
-    /// Set D-STAR slot (DS write — verified working).
-    /// Not yet wired to `adjust_setting` (requires polling current slot first).
-    #[expect(
-        dead_code,
-        reason = "Wire-verified CAT command variant held for the upcoming `adjust_setting` \
-                  hook-up — same rationale as `SetCallsignSlot` above. Requires a preceding \
-                  DS read to capture the current slot index before we can safely write."
-    )]
-    SetDstarSlot(kenwood_thd75::types::DstarSlot),
     /// Set the step size for the given band (SF write — verified working).
     SetStepSize {
         band: kenwood_thd75::types::Band,
@@ -176,16 +155,33 @@ impl EventHandler {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         // Spawn a dedicated thread for blocking crossterm event polling.
-        // This avoids blocking a tokio worker thread.
+        // This avoids blocking a tokio worker thread. A poll/read error
+        // (terminal detached, tty closed) means keyboard input is gone
+        // for good — request an app quit rather than dying silently in
+        // this background thread.
         let input_tx = tx.clone();
         let _handle = std::thread::spawn(move || {
             loop {
-                if event::poll(TICK_RATE).expect("event poll failed")
-                    && let Event::Key(key) = event::read().expect("event read failed")
-                    && key.kind == KeyEventKind::Press
-                    && input_tx.send(Message::Key(key)).is_err()
-                {
-                    return;
+                match event::poll(TICK_RATE) {
+                    Ok(false) => {}
+                    Ok(true) => match event::read() {
+                        Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                            if input_tx.send(Message::Key(key)).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::error!("terminal event read failed: {err}");
+                            let _send = input_tx.send(Message::Quit);
+                            return;
+                        }
+                    },
+                    Err(err) => {
+                        tracing::error!("terminal event poll failed: {err}");
+                        let _send = input_tx.send(Message::Quit);
+                        return;
+                    }
                 }
             }
         });
@@ -213,8 +209,10 @@ impl EventHandler {
     /// # Panics
     ///
     /// Panics if the command receiver has already been taken.
-    pub(crate) const fn take_command_receiver(&mut self) -> mpsc::UnboundedReceiver<RadioCommand> {
-        self.cmd_rx.take().expect("command receiver already taken")
+    pub(crate) fn take_command_receiver(&mut self) -> mpsc::UnboundedReceiver<RadioCommand> {
+        self.cmd_rx
+            .take()
+            .unwrap_or_else(|| unreachable!("command receiver already taken"))
     }
 
     /// Wait for the next message from any source (terminal input or background tasks).

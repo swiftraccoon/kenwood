@@ -33,14 +33,6 @@
 //! required for any test that transmits. Remove none of these gates.
 
 #![cfg(feature = "hardware-tests")]
-#![expect(
-    clippy::indexing_slicing,
-    reason = "Hardware-in-the-loop integration test file. `clippy::indexing_slicing` fires \
-              on `&buf[..n]` slices taken after `UdpSocket::recv_from` returns a byte count; \
-              this is safe because `recv_from`'s contract guarantees `n <= buf.len()` on \
-              success, so the slice is always in-bounds. Using `buf.get(..n)` would force \
-              either an `.expect()` or `.unwrap()` at every recv site with no added safety."
-)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -146,7 +138,11 @@ where
 
     let mut buf = [0u8; 2048];
     let (n, peer) = timeout(HANDSHAKE_TIMEOUT, client_sock.recv_from(&mut buf)).await??;
-    connecting.handle_input(Instant::now(), peer, &buf[..n])?;
+    connecting.handle_input(
+        Instant::now(),
+        peer,
+        buf.get(..n).ok_or("recv length exceeds buffer")?,
+    )?;
     Ok(())
 }
 
@@ -167,7 +163,11 @@ async fn drive_dplus_handshake(
 
     let mut buf = [0u8; 2048];
     let (n, peer) = timeout(HANDSHAKE_TIMEOUT, client_sock.recv_from(&mut buf)).await??;
-    connecting.handle_input(Instant::now(), peer, &buf[..n])?;
+    connecting.handle_input(
+        Instant::now(),
+        peer,
+        buf.get(..n).ok_or("recv length exceeds buffer")?,
+    )?;
 
     // Handling the LINK1_ACK causes the core to enqueue LINK2.
     let tx = connecting
@@ -177,7 +177,11 @@ async fn drive_dplus_handshake(
 
     // Round 2: wait for the LINK2 reply (OKRW or BUSY).
     let (n, peer) = timeout(HANDSHAKE_TIMEOUT, client_sock.recv_from(&mut buf)).await??;
-    connecting.handle_input(Instant::now(), peer, &buf[..n])?;
+    connecting.handle_input(
+        Instant::now(),
+        peer,
+        buf.get(..n).ok_or("recv length exceeds buffer")?,
+    )?;
     Ok(())
 }
 

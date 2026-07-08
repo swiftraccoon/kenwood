@@ -217,21 +217,42 @@ fi
 
 # ---------- unsafe audit ----------
 
-# `allow(unsafe_code)` must appear ONLY in the known-required spots.
-# Globs cover every crate's `src/`; add new exclusions as deliberate
-# design decisions, never blanket-whitelist.
+# Two-layer source-tree check. Cargo enforces `unsafe_code = "forbid"`
+# for every `[lints] workspace = true` crate, but the override crates
+# (thd75, thd75-tui, lodestar-core) weaken or omit that lint, and
+# thd75's source-level `#![deny(unsafe_code)]` guards only its lib
+# target — probes/examples/tests are separate compilation units. This
+# audit closes those gaps by scanning the tree directly:
+#
+# 1. `unsafe_code` suppression markers — `allow(unsafe_code)` or
+#    `expect(unsafe_code)` in any form, including the multi-line
+#    attribute style where `unsafe_code,` sits on its own line.
+# 2. The `unsafe` keyword itself (blocks, fns, extern, attributes).
+#    Comment-only lines are excluded; a mention inside a string still
+#    trips the audit — a loud false positive beats a silent miss.
+#
+# Allowlist (each entry is a deliberate design decision):
+#   thd75/src/transport/bluetooth.rs — IOBluetooth RFCOMM FFI
+#   thd75-tui/src/main.rs            — CFRunLoop pump for IOBluetooth
 check_unsafe_audit() {
-    local violations
-    violations=$(grep -rn 'allow(unsafe_code)' \
-        ./*/src/ \
+    local allowlist='thd75/src/transport/bluetooth\.rs|thd75-tui/src/main\.rs'
+    local suppressions keyword
+    suppressions=$(grep -rnE \
+        '(allow|expect)[[:space:]]*\([[:space:]]*unsafe_code|^[[:space:]]*unsafe_code[[:space:]]*,?[[:space:]]*$' \
+        ./*/src/ ./*/probes/ ./*/examples/ ./*/tests/ \
         --include='*.rs' \
         2>/dev/null | \
-        grep -v 'transport/bluetooth.rs' | \
-        grep -v 'thd75-tui/src/main.rs' | \
-        grep -v 'mmdvm_gateway_probe' || true)
-    if [ -n "$violations" ]; then
-        echo "ERROR: allow(unsafe_code) found outside the allowlist:"
-        echo "$violations"
+        grep -vE "$allowlist" || true)
+    keyword=$(grep -rnE '(^|[^A-Za-z0-9_])unsafe($|[^A-Za-z0-9_])' \
+        ./*/src/ ./*/probes/ ./*/examples/ ./*/tests/ \
+        --include='*.rs' \
+        2>/dev/null | \
+        grep -vE "$allowlist" | \
+        grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|\*)' || true)
+    if [ -n "$suppressions" ] || [ -n "$keyword" ]; then
+        echo "ERROR: unsafe usage or unsafe_code suppression outside the allowlist:"
+        if [ -n "$suppressions" ]; then echo "$suppressions"; fi
+        if [ -n "$keyword" ]; then echo "$keyword"; fi
         return 1
     fi
     return 0

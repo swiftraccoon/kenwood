@@ -229,40 +229,14 @@ fn parse_wind_field(bytes: &[u8]) -> Option<WindField> {
     None
 }
 
-/// Lossless widening from `i32` to `u16` for weather values.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "The function checks `v < 0 || v > u16::MAX as i32` before casting, so the \
-              `v as u16` in the else branch is always lossless. `cast_possible_truncation` \
-              and `cast_sign_loss` fire because clippy doesn't follow the surrounding \
-              `if` guard to prove the range. A `u16::try_from(v).ok()` rewrite would \
-              eliminate both the casts and the suppressions — tracked as a fix-the-code \
-              candidate."
-)]
-const fn convert_u16(v: i32) -> Option<u16> {
-    if v < 0 || v > u16::MAX as i32 {
-        None
-    } else {
-        Some(v as u16)
-    }
+/// Lossless narrowing from `i32` to `u16` for weather values.
+fn convert_u16(v: i32) -> Option<u16> {
+    u16::try_from(v).ok()
 }
 
-/// Lossless widening from `i32` to `i16` for signed weather values.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "The function checks `v < i16::MIN as i32 || v > i16::MAX as i32` before \
-              casting, so the `v as i16` in the else branch is always lossless. \
-              `cast_possible_truncation` fires because clippy doesn't follow the \
-              surrounding guard to prove the range. A `i16::try_from(v).ok()` rewrite \
-              would eliminate the cast — tracked as a fix-the-code candidate."
-)]
-const fn convert_i16(v: i32) -> Option<i16> {
-    if v < i16::MIN as i32 || v > i16::MAX as i32 {
-        None
-    } else {
-        Some(v as i16)
-    }
+/// Lossless narrowing from `i32` to `i16` for signed weather values.
+fn convert_i16(v: i32) -> Option<i16> {
+    i16::try_from(v).ok()
 }
 
 // ---------------------------------------------------------------------------

@@ -28,14 +28,10 @@ pub enum ReflectorProtocol {
 
 impl From<CoreProtocolKind> for ReflectorProtocol {
     fn from(value: CoreProtocolKind) -> Self {
-        #[expect(
-            clippy::match_same_arms,
-            reason = "explicit DPlus arm + fallback wildcard is intentional for future-proofing"
-        )]
         match value {
-            CoreProtocolKind::DPlus => Self::DPlus,
             CoreProtocolKind::DExtra => Self::DExtra,
             CoreProtocolKind::Dcs => Self::Dcs,
+            // DPlus, plus any future core protocol kinds, map to DPlus.
             _ => Self::DPlus,
         }
     }

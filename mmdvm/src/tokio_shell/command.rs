@@ -1,15 +1,6 @@
 //! `Command` enum for the channel between an [`super::AsyncModem`]
 //! handle and the spawned [`super::ModemLoop`] task.
 
-// These types are crate-internal: the handle sends them over an
-// mpsc channel to the loop. Marking them `pub` would leak types
-// the public API should not expose, but `pub(crate)` inside a
-// private module trips `clippy::redundant_pub_crate`.
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "Command and its variants are crate-internal infrastructure"
-)]
-
 use mmdvm_core::ModemMode;
 use tokio::sync::oneshot;
 

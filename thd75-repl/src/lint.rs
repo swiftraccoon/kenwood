@@ -379,6 +379,17 @@ pub fn check_output(output: &str) -> Result<(), Vec<Violation>> {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// The violations of a line that must fail the lint; `Err` if the
+    /// line unexpectedly passed.
+    fn violations_of(line: &str) -> Result<Vec<Violation>, String> {
+        match check_line(line) {
+            Err(violations) => Ok(violations),
+            Ok(()) => Err(format!("expected lint violations for {line:?}")),
+        }
+    }
+
     #[test]
     fn stub_check_line_accepts_empty() {
         assert!(check_line("").is_ok());
@@ -484,10 +495,14 @@ mod tests {
     }
 
     #[test]
-    fn r1_violation_includes_byte_offset() {
-        let err = check_line("hi \u{2192} there").unwrap_err();
-        let v = err.iter().find(|v| v.rule == Rule::AsciiOnly).unwrap();
+    fn r1_violation_includes_byte_offset() -> TestResult {
+        let err = violations_of("hi \u{2192} there")?;
+        let v = err
+            .iter()
+            .find(|v| v.rule == Rule::AsciiOnly)
+            .ok_or("AsciiOnly violation missing")?;
         assert!(v.message.contains("offset 3"));
+        Ok(())
     }
 
     #[test]
@@ -497,30 +512,37 @@ mod tests {
     }
 
     #[test]
-    fn r2_rejects_81_char_line() {
+    fn r2_rejects_81_char_line() -> TestResult {
         let s = "a".repeat(81);
-        let err = check_line(&s).unwrap_err();
+        let err = violations_of(&s)?;
         assert!(err.iter().any(|v| v.rule == Rule::LineLength));
+        Ok(())
     }
 
     #[test]
-    fn r2_violation_reports_actual_length() {
+    fn r2_violation_reports_actual_length() -> TestResult {
         let s = "a".repeat(83);
-        let err = check_line(&s).unwrap_err();
-        let v = err.iter().find(|v| v.rule == Rule::LineLength).unwrap();
+        let err = violations_of(&s)?;
+        let v = err
+            .iter()
+            .find(|v| v.rule == Rule::LineLength)
+            .ok_or("LineLength violation missing")?;
         assert!(v.message.contains("83"));
+        Ok(())
     }
 
     #[test]
-    fn r3_rejects_ansi_color() {
-        let err = check_line("\x1b[31mError\x1b[0m").unwrap_err();
+    fn r3_rejects_ansi_color() -> TestResult {
+        let err = violations_of("\x1b[31mError\x1b[0m")?;
         assert!(err.iter().any(|v| v.rule == Rule::NoAnsi));
+        Ok(())
     }
 
     #[test]
-    fn r3_rejects_cursor_move() {
-        let err = check_line("\x1b[2J").unwrap_err();
+    fn r3_rejects_cursor_move() -> TestResult {
+        let err = violations_of("\x1b[2J")?;
         assert!(err.iter().any(|v| v.rule == Rule::NoAnsi));
+        Ok(())
     }
 
     #[test]
@@ -540,15 +562,17 @@ mod tests {
     }
 
     #[test]
-    fn r4_rejects_missing_prefix_on_error_line() {
-        let err = check_line("error: bad thing happened").unwrap_err();
+    fn r4_rejects_missing_prefix_on_error_line() -> TestResult {
+        let err = violations_of("error: bad thing happened")?;
         assert!(err.iter().any(|v| v.rule == Rule::ErrorPrefix));
+        Ok(())
     }
 
     #[test]
-    fn r4_rejects_uppercase_no_colon() {
-        let err = check_line("Error invalid frequency").unwrap_err();
+    fn r4_rejects_uppercase_no_colon() -> TestResult {
+        let err = violations_of("Error invalid frequency")?;
         assert!(err.iter().any(|v| v.rule == Rule::ErrorPrefix));
+        Ok(())
     }
 
     #[test]
@@ -562,15 +586,17 @@ mod tests {
     }
 
     #[test]
-    fn r5_rejects_lowercase_warning() {
-        let err = check_line("warning: auth failed").unwrap_err();
+    fn r5_rejects_lowercase_warning() -> TestResult {
+        let err = violations_of("warning: auth failed")?;
         assert!(err.iter().any(|v| v.rule == Rule::WarningPrefix));
+        Ok(())
     }
 
     #[test]
-    fn r5_rejects_missing_colon() {
-        let err = check_line("Warning auth failed").unwrap_err();
+    fn r5_rejects_missing_colon() -> TestResult {
+        let err = violations_of("Warning auth failed")?;
         assert!(err.iter().any(|v| v.rule == Rule::WarningPrefix));
+        Ok(())
     }
 
     #[test]
@@ -580,15 +606,17 @@ mod tests {
     }
 
     #[test]
-    fn r9_rejects_true() {
-        let err = check_line("Key lock: true").unwrap_err();
+    fn r9_rejects_true() -> TestResult {
+        let err = violations_of("Key lock: true")?;
         assert!(err.iter().any(|v| v.rule == Rule::BooleanWords));
+        Ok(())
     }
 
     #[test]
-    fn r9_rejects_false() {
-        let err = check_line("Bluetooth: false").unwrap_err();
+    fn r9_rejects_false() -> TestResult {
+        let err = violations_of("Bluetooth: false")?;
         assert!(err.iter().any(|v| v.rule == Rule::BooleanWords));
+        Ok(())
     }
 
     #[test]
@@ -603,21 +631,24 @@ mod tests {
     }
 
     #[test]
-    fn r12_rejects_mhz_shorthand() {
-        let err = check_line("146.52 MHz").unwrap_err();
+    fn r12_rejects_mhz_shorthand() -> TestResult {
+        let err = violations_of("146.52 MHz")?;
         assert!(err.iter().any(|v| v.rule == Rule::UnitsSpelledOut));
+        Ok(())
     }
 
     #[test]
-    fn r12_rejects_khz_shorthand() {
-        let err = check_line("step 25 kHz").unwrap_err();
+    fn r12_rejects_khz_shorthand() -> TestResult {
+        let err = violations_of("step 25 kHz")?;
         assert!(err.iter().any(|v| v.rule == Rule::UnitsSpelledOut));
+        Ok(())
     }
 
     #[test]
-    fn r12_rejects_db_shorthand() {
-        let err = check_line("signal -110 dB").unwrap_err();
+    fn r12_rejects_db_shorthand() -> TestResult {
+        let err = violations_of("signal -110 dB")?;
         assert!(err.iter().any(|v| v.rule == Rule::UnitsSpelledOut));
+        Ok(())
     }
 
     #[test]
@@ -637,8 +668,9 @@ mod tests {
     }
 
     #[test]
-    fn r8_rejects_labeled_line_without_colon() {
-        let err = check_line("Band A frequency 146.52 megahertz").unwrap_err();
+    fn r8_rejects_labeled_line_without_colon() -> TestResult {
+        let err = violations_of("Band A frequency 146.52 megahertz")?;
         assert!(err.iter().any(|v| v.rule == Rule::LabelColonValue));
+        Ok(())
     }
 }

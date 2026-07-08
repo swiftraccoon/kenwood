@@ -153,7 +153,7 @@ impl<T: Transport + 'static> MmdvmTransportAdapter<T> {
         ));
         // Also drop the read receiver so the pump doesn't block
         // trying to send a final read result on shutdown.
-        let _ = std::mem::replace(&mut self.read_rx, mpsc::channel(1).1);
+        drop(std::mem::replace(&mut self.read_rx, mpsc::channel(1).1));
 
         let pump = self
             .pump
@@ -220,7 +220,7 @@ async fn pump_task<T: Transport>(
                         error = %e,
                         "transport write failed; pump task exiting"
                     );
-                    let _ = read_tx.send(Err(transport_err_to_io(e))).await;
+                    drop(read_tx.send(Err(transport_err_to_io(e))).await);
                     return transport;
                 }
                 tracing::trace!(target: "mmdvm::hang_hunt", "pump: transport.write returned");
@@ -233,12 +233,14 @@ async fn pump_task<T: Transport>(
                             target: "kenwood_thd75::transport::mmdvm_adapter",
                             "transport read returned EOF; pump exiting"
                         );
-                        let _ = read_tx
-                            .send(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "transport EOF",
-                            )))
-                            .await;
+                        drop(
+                            read_tx
+                                .send(Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "transport EOF",
+                                )))
+                                .await,
+                        );
                         return transport;
                     }
                     Ok(n) => {
@@ -273,7 +275,7 @@ async fn pump_task<T: Transport>(
                             error = %e,
                             "transport read failed; pump exiting"
                         );
-                        let _ = read_tx.send(Err(transport_err_to_io(e))).await;
+                        drop(read_tx.send(Err(transport_err_to_io(e))).await);
                         return transport;
                     }
                 }

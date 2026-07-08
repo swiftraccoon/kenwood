@@ -127,13 +127,13 @@ mod tests {
 
     #[test]
     fn half_window_is_monotonic() {
-        for i in 1..WR_HALF_LEN - 1 {
-            assert!(
-                WR_HALF[i] >= WR_HALF[i - 1],
-                "non-monotonic at {i}: {} vs {}",
-                WR_HALF[i - 1],
-                WR_HALF[i],
-            );
+        // Matches the original index walk `1..WR_HALF_LEN - 1`: the
+        // final (peak) pair is deliberately excluded.
+        for (i, pair) in WR_HALF.windows(2).take(WR_HALF_LEN - 2).enumerate() {
+            let [prev, next] = pair else {
+                continue;
+            };
+            assert!(next >= prev, "non-monotonic at {}: {prev} vs {next}", i + 1,);
         }
     }
 
@@ -150,10 +150,9 @@ mod tests {
 
     #[test]
     fn pitch_window_is_symmetric() {
-        // wi[] is symmetric around the center index 150.
-        for i in 0..150 {
-            let left = WI[i];
-            let right = WI[300 - i];
+        // wi[] is symmetric around the center index 150: pair index
+        // `i` (forward) with index `300 - i` (reverse iteration).
+        for (i, (left, right)) in WI.iter().zip(WI.iter().rev()).take(150).enumerate() {
             assert!(
                 (left - right).abs() < 1e-9,
                 "asymmetry at {i}: {left} vs {right}",

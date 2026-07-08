@@ -27,8 +27,17 @@ tokio = { version = "1", features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# KNOWN DIVERGENCE FROM WORKSPACE (this block replaces, never merges with,
+# the workspace `[lints.rust]`):
+# - `unsafe_code` is weakened from the workspace `forbid` to `deny`: the
+#   binary must pump the macOS CFRunLoop for IOBluetooth callbacks, which
+#   requires one FFI block in `src/main.rs` under a scoped
+#   `#[expect(unsafe_code, reason = ...)]`. `deny` + scoped expect is the
+#   same pattern the `thd75` crate uses for its IOBluetooth module.
+# - Everything else mirrors the workspace block.
 [lints.rust]
 unsafe_code = "deny"
+missing_docs = "deny"
 missing_debug_implementations = "deny"
 unreachable_pub = "deny"
 unused_results = "deny"
@@ -37,17 +46,29 @@ trivial_casts = "deny"
 trivial_numeric_casts = "deny"
 unused_import_braces = "deny"
 unused_qualifications = "deny"
+non_ascii_idents = "deny"
+single_use_lifetimes = "deny"
+let_underscore_drop = "deny"
+unused_crate_dependencies = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
+restriction = { level = "allow", priority = -1 }
 # Ban `#[allow]` — every suppression must be `#[expect(..., reason = "...")]`.
 # Mirrors the root `[workspace.lints.clippy]` ban; restated here because this crate's
 # `[lints]` block replaces the workspace one entirely (cargo does not merge).
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
+# Forward-protection lints — mirror the workspace block exactly.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+format_push_string = "deny"
+infinite_loop = "deny"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
 # Binary crate with private modules: `pub(crate)` satisfies `unreachable_pub` but
@@ -55,21 +76,14 @@ multiple_crate_versions = "allow"
 # and would ordinarily inherit from workspace, but this block replaces workspace
 # entirely so we restate it here.
 redundant_pub_crate = "allow"
-# KNOWN DIVERGENCE FROM WORKSPACE:
-#
-# The workspace denies these restriction lints (not repeated here):
-#   undocumented_unsafe_blocks, missing_assert_message, missing_const_for_fn,
-#   panic, unwrap_used, expect_used, indexing_slicing
-#
-# The TUI binary uses patterns these rules forbid (`.unwrap()` on channel sends to
-# live receivers, direct buffer indexing in the Ratatui render loop, `.expect()` on
-# known-connected transports, etc.) — adopting them would surface hundreds of sites,
-# tracked separately.
-#
-# Previously this block also allowed `cast_possible_truncation`, `cast_sign_loss`,
-# and `too_many_lines` at the crate level — removed so the workspace pedantic policy
-# applies. The sites that genuinely need those suppressions now carry documented
-# per-site `#[expect(..., reason = "...")]`.
+# Restriction-lint denies mirror the workspace — no divergence.
+undocumented_unsafe_blocks = "deny"
+missing_assert_message = "deny"
+missing_const_for_fn = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
 
 # Mirrors the workspace `[lints.rustdoc]` block; restated here because this crate's
 # `[lints]` block replaces the workspace one entirely.

@@ -60,6 +60,10 @@ trivial_casts = "deny"
 trivial_numeric_casts = "deny"
 unused_import_braces = "deny"
 unused_qualifications = "deny"
+non_ascii_idents = "deny"
+single_use_lifetimes = "deny"
+let_underscore_drop = "deny"
+unused_crate_dependencies = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
@@ -80,7 +84,16 @@ panic = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
+# Forward-protection lints — mirror the workspace block exactly.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+format_push_string = "deny"
+infinite_loop = "deny"
+module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
+redundant_pub_crate = "allow"
 
 # Mirrors the workspace `[lints.rustdoc]` block; restated here because this crate's
 # `[lints]` block replaces the workspace one entirely.

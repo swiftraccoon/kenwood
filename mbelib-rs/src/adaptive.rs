@@ -236,8 +236,9 @@ mod tests {
         cur.l = 12;
         cur.error_rate = 0.0;
         cur.error_count_total = 0;
-        for l in 1..=cur.l {
-            cur.ml[l] = 0.5;
+        let l = cur.l;
+        for slot in cur.ml.iter_mut().skip(1).take(l) {
+            *slot = 0.5;
         }
         let original = cur.ml;
 
@@ -267,8 +268,9 @@ mod tests {
         cur.l = 20;
         cur.error_rate = 0.05; // 5% - well above entry threshold
         cur.error_count_total = 10;
-        for l in 1..=cur.l {
-            cur.ml[l] = 1000.0; // huge magnitudes to trigger Tm scaling
+        let l = cur.l;
+        for slot in cur.ml.iter_mut().skip(1).take(l) {
+            *slot = 1000.0; // huge magnitudes to trigger Tm scaling
         }
 
         apply_adaptive_smoothing(&mut cur, &prev, Some(20_000_000.0));

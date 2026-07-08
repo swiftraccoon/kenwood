@@ -16,6 +16,22 @@
 use aprs::{parse_aprs_data, parse_aprs_position};
 use ax25_codec::parse_ax25;
 
+// Deps visible to every kenwood-thd75 test target but unused here.
+// Acknowledged so `unused_crate_dependencies` stays silent without
+// weakening the lint.
+use aprs_is as _;
+use dstar_gateway_core as _;
+use kenwood_thd75 as _;
+use kiss_tnc as _;
+use mmdvm as _;
+use mmdvm_core as _;
+use proptest as _;
+use serde_json as _;
+use thiserror as _;
+use tokio as _;
+use tokio_serial as _;
+use tracing as _;
+
 /// Tiny xorshift32 RNG — deterministic, no `rand` dependency.
 struct Xor32(u32);
 
@@ -45,7 +61,7 @@ fn fuzz_parse_ax25_no_panic() {
         for _ in 0..50 {
             let mut buf = vec![0u8; size];
             rng.fill(&mut buf);
-            let _ = parse_ax25(&buf);
+            drop(parse_ax25(&buf));
         }
     }
 }
@@ -57,7 +73,7 @@ fn fuzz_parse_aprs_data_no_panic() {
         for _ in 0..50 {
             let mut buf = vec![0u8; size];
             rng.fill(&mut buf);
-            let _ = parse_aprs_data(&buf);
+            drop(parse_aprs_data(&buf));
         }
     }
 }
@@ -79,7 +95,7 @@ fn fuzz_parse_aprs_position_no_panic() {
                     _ => b'@',
                 };
             }
-            let _ = parse_aprs_position(&buf);
+            drop(parse_aprs_position(&buf));
         }
     }
 }
@@ -96,7 +112,7 @@ fn fuzz_parse_aprs_position_with_spaces() {
         b"!4 03.50N/07201.75W>",
     ];
     for tpl in templates {
-        let _ = parse_aprs_position(tpl);
+        drop(parse_aprs_position(tpl));
     }
 }
 
@@ -117,7 +133,7 @@ fn fuzz_parse_aprs_data_known_first_bytes() {
             {
                 rng.fill(tail);
             }
-            let _ = parse_aprs_data(&buf);
+            drop(parse_aprs_data(&buf));
         }
     }
 }

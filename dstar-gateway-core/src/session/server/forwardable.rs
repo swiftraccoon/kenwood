@@ -81,7 +81,11 @@ impl<'a> ForwardableFrame<'a> {
 mod tests {
     use super::{ForwardableFrame, ProtocolKind, StreamId};
 
-    #[expect(clippy::unwrap_used, reason = "const-validated: n is non-zero")]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test helper: every call site passes a non-zero literal, so the \
+                  unwrap cannot fire; a zero would panic only this test, at runtime"
+    )]
     const fn sid(n: u16) -> StreamId {
         StreamId::new(n).unwrap()
     }

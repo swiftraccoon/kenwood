@@ -380,6 +380,23 @@ mod tests {
     use super::*;
     use crate::params::MbeParams;
 
+    /// Fill `ml[1..=p.l]` / `vl[1..=p.l]` (and `phi_l[1..=p.l]` when
+    /// given) on a fixture without per-slot indexing.
+    fn fill_harmonics(p: &mut MbeParams, ml: f32, voiced: fn(usize) -> bool, phi: Option<f32>) {
+        let l = p.l;
+        for slot in p.ml.iter_mut().skip(1).take(l) {
+            *slot = ml;
+        }
+        for (idx, slot) in p.vl.iter_mut().enumerate().skip(1).take(l) {
+            *slot = voiced(idx);
+        }
+        if let Some(phi) = phi {
+            for slot in p.phi_l.iter_mut().skip(1).take(l) {
+                *slot = phi;
+            }
+        }
+    }
+
     /// Silence parameters (all-zero magnitudes) should produce silence.
     #[test]
     fn silence_params_produce_silence() {
@@ -411,10 +428,7 @@ mod tests {
             p.l = 12;
             p.w0 = 0.04;
             p.noise_seed = 100.0;
-            for l in 1..=p.l {
-                p.ml[l] = 1.0;
-                p.vl[l] = l <= 8;
-            }
+            fill_harmonics(&mut p, 1.0, |l| l <= 8, None);
             p
         };
 
@@ -472,18 +486,12 @@ mod tests {
         cur.l = 10;
         cur.w0 = 0.03;
         cur.noise_seed = 100.0;
-        for l in 1..=cur.l {
-            cur.ml[l] = 1.0;
-            cur.vl[l] = false;
-        }
+        fill_harmonics(&mut cur, 1.0, |_| false, None);
 
         let mut prev = MbeParams::new();
         prev.l = 10;
         prev.w0 = 0.03;
-        for l in 1..=prev.l {
-            prev.ml[l] = 1.0;
-            prev.vl[l] = false;
-        }
+        fill_harmonics(&mut prev, 1.0, |_| false, None);
 
         // Run two frames so WOLA has previous-frame data to combine.
         synthesize_speech(&mut pcm, &mut cur, &mut prev);
@@ -503,10 +511,7 @@ mod tests {
         cur.l = 5;
         cur.w0 = 0.04;
         cur.noise_seed = 100.0;
-        for l in 1..=cur.l {
-            cur.ml[l] = 1.0;
-            cur.vl[l] = true;
-        }
+        fill_harmonics(&mut cur, 1.0, |_| true, None);
 
         let mut prev = MbeParams::new();
         prev.l = 5;
@@ -527,18 +532,12 @@ mod tests {
         cur.l = 15;
         cur.w0 = 0.03;
         cur.noise_seed = 100.0;
-        for l in 1..=cur.l {
-            cur.ml[l] = 0.5;
-            cur.vl[l] = true;
-        }
+        fill_harmonics(&mut cur, 0.5, |_| true, None);
 
         let mut prev = MbeParams::new();
         prev.l = 10;
         prev.w0 = 0.04;
-        for l in 1..=prev.l {
-            prev.ml[l] = 0.5;
-            prev.vl[l] = true;
-        }
+        fill_harmonics(&mut prev, 0.5, |_| true, None);
 
         synthesize_speech(&mut pcm, &mut cur, &mut prev);
 
@@ -553,25 +552,18 @@ mod tests {
     fn soft_clipping_bounds_output() {
         let mut pcm = [0.0_f32; FRAME_SAMPLES];
 
-        // Drive the synthesis hard: all bands voiced, large magnitudes.
+        // Drive the synthesis hard: all bands voiced, very loud
+        // magnitudes, phases aligned for maximum amplitude.
         let mut cur = MbeParams::new();
         cur.l = 50;
         cur.w0 = 0.02;
         cur.noise_seed = 100.0;
-        for l in 1..=cur.l {
-            cur.ml[l] = 1000.0; // very loud
-            cur.vl[l] = true;
-            cur.phi_l[l] = 0.0; // align phases for max amplitude
-        }
+        fill_harmonics(&mut cur, 1000.0, |_| true, Some(0.0));
 
         let mut prev = MbeParams::new();
         prev.l = 50;
         prev.w0 = 0.02;
-        for l in 1..=prev.l {
-            prev.ml[l] = 1000.0;
-            prev.vl[l] = true;
-            prev.phi_l[l] = 0.0;
-        }
+        fill_harmonics(&mut prev, 1000.0, |_| true, Some(0.0));
 
         synthesize_speech(&mut pcm, &mut cur, &mut prev);
 

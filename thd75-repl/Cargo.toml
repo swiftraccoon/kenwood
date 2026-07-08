@@ -56,13 +56,11 @@ time = { version = "0.3", default-features = false, features = [
 rustyline = "18"
 dirs-next = "2"
 
-# KNOWN DIVERGENCE FROM WORKSPACE — a crate-local [lints.<group>] block fully
-# REPLACES the workspace block (no merge), so every difference is listed here:
-# - [lints.clippy]: unwrap_used / expect_used / panic are allowed crate-wide
-#   (interactive REPL shape — see the comment on those lines below), plus
-#   module_name_repetitions, multiple_crate_versions, redundant_pub_crate.
-# - [lints.rust]: restates the workspace block in full, including
-#   unsafe_code = "forbid" and unused_crate_dependencies = "deny".
+# A crate-local [lints.<group>] block fully REPLACES the workspace block
+# (no merge). Both blocks below restate the workspace policy in full —
+# the only differences are the workspace-allowed lints restated
+# explicitly (module_name_repetitions, multiple_crate_versions,
+# redundant_pub_crate).
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"
@@ -93,15 +91,16 @@ indexing_slicing = "deny"
 # `#[allow]` ban — see root workspace.lints.clippy for rationale.
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
-# Interactive REPL code legitimately uses `.unwrap()`/`.expect()`/`panic!` on
-# grammar-guaranteed parsed tokens and channel sends to a known-live receiver — propagating
-# Result through the command loop would add error-handling ceremony without catching real
-# bugs. The bin target's `main.rs` carries a crate-level `#![expect(...)]` block restating
-# and documenting each specific usage. Workspace denies these, we relax here because the
-# REPL's interactive-CLI shape is the exception that proves the rule.
-unwrap_used = "allow"
-expect_used = "allow"
-panic = "allow"
+# Forward-protection lints — mirror the workspace block exactly.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+format_push_string = "deny"
+infinite_loop = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
 redundant_pub_crate = "allow"

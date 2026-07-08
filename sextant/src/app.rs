@@ -1,17 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-// egui's immediate-mode API returns `Response` / `InnerResponse` from
-// nearly every widget method. Idiomatic egui code doesn't use those
-// return values for simple layouts — every `.label()`, `.heading()`,
-// `.separator()` etc. would otherwise need a `let _unused = ` prefix,
-// tripling the GUI code. Scoping the expectation to this module
-// (rather than the workspace) keeps the escape hatch narrow.
-#![expect(
-    unused_results,
-    reason = "egui widget methods return Response; not using the layout-chaining return value is idiomatic for immediate-mode GUI code"
-)]
-
 //! egui front-end.
 //!
 //! Single-window layout:
@@ -827,7 +816,7 @@ impl App {
     /// Operator page: interim composition re-homing the existing
     /// panels until the deck components land.
     fn show_operator_page(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("tx_strip")
+        let _unused = egui::TopBottomPanel::bottom("tx_strip")
             .frame(
                 egui::Frame::none()
                     .fill(crate::theme::BG_INSET)
@@ -836,7 +825,7 @@ impl App {
             .show(ctx, |ui| {
                 ui::operator::tx_strip::show(self, ui);
             });
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let _unused = egui::CentralPanel::default().show(ctx, |ui| {
             ui::operator::show_deck(self, ui);
         });
     }
@@ -892,7 +881,7 @@ impl eframe::App for App {
         self.drain_directory();
         self.handle_ptt_keybinding(ctx);
 
-        egui::TopBottomPanel::top("header")
+        let _unused = egui::TopBottomPanel::top("header")
             .frame(
                 egui::Frame::none()
                     .fill(crate::theme::BG_WINDOW)
@@ -902,7 +891,7 @@ impl eframe::App for App {
                 ui::header(self, ui);
             });
         if self.last_error.is_some() {
-            egui::TopBottomPanel::top("error_strip")
+            let _unused = egui::TopBottomPanel::top("error_strip")
                 .frame(egui::Frame::none())
                 .show(ctx, |ui| {
                     ui::error_strip(self, ui);

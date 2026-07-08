@@ -23,15 +23,6 @@
 //!   harmonic log-spectral amplitudes.
 //! - **`b3..b8` (spectral envelope):** block-DCT on the prediction
 //!   residual `T = lsa - 0.65·interp(prev_log2_ml)`; assemble R
-#![expect(
-    clippy::indexing_slicing,
-    reason = "Parameter quantization: indices into fixed-size AMBE codebooks \
-              (W0_TABLE=128, L_TABLE=56, VUV_TABLE=16 rows × L bands, DG_TABLE=64, \
-              HOC_B*_TABLE variable) and per-band sub-arrays of SA/log-amplitudes \
-              (bounded by L_TABLE[b0] <= 56). All ranges are IMBE-spec invariants \
-              enforced by the analysis stage. A `.get()?` rewrite would add unwrap \
-              noise to every codebook lookup."
-)]
 //!   pairs from block DC + first AC coefficients; inverse 8-pt DCT
 //!   → G[8]; PRBA24 / PRBA58 codebook search (b3, b4); per-block
 //!   HOC codebook search (b5..b8). `b8` uses stride-2 search —
@@ -175,7 +166,12 @@ fn dump_quantize_lsa(
     eprintln!("  OURS gain = {gain:.4}");
     eprintln!(
         "  OURS b2 chosen = {b2}  (DG_TABLE[{b2}] = {:.4})",
-        tables::DG_TABLE[b2 as usize]
+        // NaN in the dump flags an out-of-range b2 without panicking
+        // the diagnostic path.
+        tables::DG_TABLE
+            .get(b2 as usize)
+            .copied()
+            .unwrap_or(f32::NAN)
     );
 }
 
@@ -914,8 +910,8 @@ fn quantize_spectrum(t_residuals: &[f32; 57], n: usize) -> QuantizedSpectrum {
     // 0.65-weighted prev-interp subtracted, so this is the input the
     // PRBA/HOC codebooks expect.
     let mut log_m = [0.0_f32; 56];
-    for (i, &v) in t_residuals.iter().enumerate().take(n.min(56)) {
-        log_m[i] = v;
+    for (slot, &v) in log_m.iter_mut().zip(t_residuals.iter().take(n)) {
+        *slot = v;
     }
 
     // Step 2: block partitioning via LMPRBL[L]. Row big_l = L.
@@ -935,16 +931,19 @@ fn quantize_spectrum(t_residuals: &[f32; 57], n: usize) -> QuantizedSpectrum {
         if block_len == 0 {
             continue;
         }
+        let Some(block) = log_m.get(base..block_end) else {
+            continue;
+        };
         // Forward DCT on this block: Cik[blk][k] = Σ_j log_m[base+j]·cos(π·(k−1)·(j+0.5)/ji_val)
         // Matches decode's inverse_dct_blocks formula with j=k and ji_val=N.
         for k in 1..=ji_val.min(MAX_HOC_TERMS) {
             let mut sum = 0.0_f32;
             let step = std::f32::consts::PI * (k as f32 - 1.0) / ji_val as f32;
-            for j in 0..block_len {
+            for (j, &m) in block.iter().enumerate() {
                 // Decode uses (j - 0.5) for j=1..=ji_val; our offset
                 // with j=0..ji_val uses (j + 0.5).
                 let angle = step * (j as f32 + 0.5);
-                sum += log_m[base + j] * angle.cos();
+                sum += m * angle.cos();
             }
             // Normalization: the decoder's inverse_dct_blocks
             // applies `ak` = 1 for k=1, 2 for k≥2. Our forward pass
@@ -976,8 +975,12 @@ fn quantize_spectrum(t_residuals: &[f32; 57], n: usize) -> QuantizedSpectrum {
         let c2 = *cik.get(blk).and_then(|b| b.get(2)).unwrap_or(&0.0);
         let r_odd = sqrt2.mul_add(c2, c1);
         let r_even = sqrt2.mul_add(-c2, c1);
-        ri[2 * blk - 1] = r_odd;
-        ri[2 * blk] = r_even;
+        if let Some(slot) = ri.get_mut(2 * blk - 1) {
+            *slot = r_odd;
+        }
+        if let Some(slot) = ri.get_mut(2 * blk) {
+            *slot = r_even;
+        }
     }
 
     // Step 5: inverse 8-point DCT → Gm → PRBA codebooks.
@@ -1119,8 +1122,8 @@ fn nearest_hoc(table: &[[f32; 4]], target: &[f32; 4], dims: usize, stride: usize
     let mut best_err = f32::INFINITY;
     for (idx, row) in table.iter().enumerate().step_by(stride) {
         let mut err = 0.0_f32;
-        for k in 0..dims {
-            let d = row[k] - target[k];
+        for (r, t) in row.iter().zip(target.iter()).take(dims) {
+            let d = r - t;
             err += d * d;
         }
         if err < best_err {
@@ -1190,8 +1193,8 @@ fn nearest_prba24(target: &[f32; 3]) -> u16 {
     let mut best_err = f32::INFINITY;
     for (idx, row) in tables::PRBA24_TABLE.iter().enumerate() {
         let mut err = 0.0_f32;
-        for k in 0..3 {
-            let d = row[k] - target[k];
+        for (r, t) in row.iter().zip(target.iter()) {
+            let d = r - t;
             err += d * d;
         }
         if err < best_err {
@@ -1213,8 +1216,8 @@ fn nearest_prba58(target: &[f32; 4]) -> u8 {
     let mut best_err = f32::INFINITY;
     for (idx, row) in tables::PRBA58_TABLE.iter().enumerate() {
         let mut err = 0.0_f32;
-        for k in 0..4 {
-            let d = row[k] - target[k];
+        for (r, t) in row.iter().zip(target.iter()) {
+            let d = r - t;
             err += d * d;
         }
         if err < best_err {
@@ -1461,7 +1464,7 @@ mod tests {
 
         // Extract b3 from the emitted ambe_d.
         let a = &outcome.ambe_d;
-        let bit = |k: usize| u16::from(a[k] != 0);
+        let bit = |k: usize| u16::from(a.get(k).is_some_and(|&b| b != 0));
         let b3_written = (bit(10) << 8)
             | (bit(11) << 7)
             | (bit(12) << 6)
@@ -1496,7 +1499,7 @@ mod tests {
         let mut ambe_d_rt = [0u8; crate::ecc::AMBE_DATA_BITS];
         let _ = crate::ecc::ecc_data(&ambe_fr_dec, &mut ambe_d_rt);
 
-        let bit_rt = |k: usize| u16::from(ambe_d_rt[k] != 0);
+        let bit_rt = |k: usize| u16::from(ambe_d_rt.get(k).is_some_and(|&b| b != 0));
         let b3_read = (bit_rt(10) << 8)
             | (bit_rt(11) << 7)
             | (bit_rt(12) << 6)
@@ -1629,7 +1632,7 @@ mod tests {
         let outcome = quantize(pitch, vuv, &amps, &prev);
         // Extract b2 from the emitted ambe_d.
         let a = &outcome.ambe_d;
-        let bit = |k: usize| u8::from(a[k] != 0);
+        let bit = |k: usize| u8::from(a.get(k).is_some_and(|&b| b != 0));
         let b2 = (bit(6) << 5)
             | (bit(7) << 4)
             | (bit(8) << 3)
@@ -1765,7 +1768,7 @@ mod tests {
         // bug (voiced[i] read per-harmonic), harmonics 10..=29 report
         // unvoiced, pulling the search toward a mid-voiced row.
         let a = &outcome.ambe_d;
-        let bit = |k: usize| u8::from(a[k] != 0);
+        let bit = |k: usize| u8::from(a.get(k).is_some_and(|&b| b != 0));
         let b1 = (bit(38) << 3) | (bit(39) << 2) | (bit(40) << 1) | bit(41);
         assert_eq!(
             b1, 15,
@@ -1800,7 +1803,7 @@ mod tests {
                 reason = "L_TABLE entries are small positive integer harmonic counts \
                           (1..=56) stored as f32; the f32-to-usize cast is exact."
             )]
-            let got_l = L_TABLE[b0 as usize] as usize;
+            let got_l = L_TABLE.get(b0 as usize).copied().unwrap_or(0.0) as usize;
             assert_eq!(
                 got_l, target_l,
                 "L_TABLE[b0={b0}]={got_l} does not match target_l={target_l} \

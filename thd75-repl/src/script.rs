@@ -74,43 +74,51 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn parse(text: &str) -> Script {
-        Script::from_reader(Cursor::new(text.as_bytes())).expect("parse script")
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn parse(text: &str) -> Result<Script, std::io::Error> {
+        Script::from_reader(Cursor::new(text.as_bytes()))
     }
 
     #[test]
-    fn skips_comments() {
-        let s = parse("# first\nid\n# second\nbattery\n");
+    fn skips_comments() -> TestResult {
+        let s = parse("# first\nid\n# second\nbattery\n")?;
         assert_eq!(s.commands, vec!["id".to_string(), "battery".to_string()]);
+        Ok(())
     }
 
     #[test]
-    fn skips_blank_lines() {
-        let s = parse("id\n\n\nbattery\n");
+    fn skips_blank_lines() -> TestResult {
+        let s = parse("id\n\n\nbattery\n")?;
         assert_eq!(s.commands, vec!["id".to_string(), "battery".to_string()]);
+        Ok(())
     }
 
     #[test]
-    fn trims_whitespace() {
-        let s = parse("  id  \n\tbattery\n");
+    fn trims_whitespace() -> TestResult {
+        let s = parse("  id  \n\tbattery\n")?;
         assert_eq!(s.commands, vec!["id".to_string(), "battery".to_string()]);
+        Ok(())
     }
 
     #[test]
-    fn preserves_order() {
-        let s = parse("one\ntwo\nthree\n");
+    fn preserves_order() -> TestResult {
+        let s = parse("one\ntwo\nthree\n")?;
         assert_eq!(s.commands, vec!["one", "two", "three"]);
+        Ok(())
     }
 
     #[test]
-    fn empty_file_is_valid() {
-        let s = parse("");
+    fn empty_file_is_valid() -> TestResult {
+        let s = parse("")?;
         assert!(s.commands.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn only_comments_is_valid() {
-        let s = parse("# foo\n# bar\n\n");
+    fn only_comments_is_valid() -> TestResult {
+        let s = parse("# foo\n# bar\n\n")?;
         assert!(s.commands.is_empty());
+        Ok(())
     }
 }

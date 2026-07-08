@@ -205,14 +205,7 @@ mod tests {
     /// them first (so the collector sees real wire form) and assigning
     /// non-zero frame indices.
     fn feed(collector: &mut SlowDataTextCollector, halves: &[[u8; 3]]) {
-        for (i, h) in halves.iter().enumerate() {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "Test helper. `i` comes from `.enumerate()` over test-constructed \
-                          fixtures of at most 8 halves (D-STAR slow-data encodes 20 chars \
-                          as 4 packets × 2 halves), so `i as u8` is always lossless."
-            )]
-            let idx = (i as u8).wrapping_add(1);
+        for (idx, h) in (1u8..).zip(halves.iter()) {
             collector.push(scramble(*h), idx);
         }
     }

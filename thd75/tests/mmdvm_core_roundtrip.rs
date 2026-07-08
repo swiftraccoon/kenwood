@@ -11,10 +11,18 @@ use mmdvm_core::{
 
 // Acknowledge dev-deps the integration test binary pulls transitively
 // so `-D unused-crate-dependencies` doesn't fire.
+use aprs as _;
+use aprs_is as _;
+use ax25_codec as _;
 use kenwood_thd75 as _;
+use kiss_tnc as _;
+use mmdvm as _;
 use proptest as _;
 use serde_json as _;
+use thiserror as _;
 use tokio as _;
+use tokio_serial as _;
+use tracing as _;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

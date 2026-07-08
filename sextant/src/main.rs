@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (bypassing the GUI) so decode + playback aren't gated by the
     // egui redraw cadence (~50 ms → would mangle the 50 fps voice
     // stream otherwise).
-    let (audio, audio_status_rx) = audio::AudioHandle::start(cmd_tx.clone());
+    let (audio, audio_status_rx) = audio::AudioHandle::start(cmd_tx.clone())?;
     let audio_for_session = audio.clone();
     let _session_handle = runtime.spawn(session::run(cmd_rx, evt_tx, audio_for_session));
 

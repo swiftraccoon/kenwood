@@ -1330,12 +1330,6 @@ impl<P: Protocol> ProtocolEndpoint<P> {
 
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::indexing_slicing,
-        reason = "Tests slice fixed-size voice frames and protocol fixtures where bounds \
-                  are obvious by construction; out-of-range access correctly fails the test."
-    )]
-
     use super::{EndpointOutcome, ProtocolEndpoint};
     use crate::reflector::{
         AllowAllAuthorizer, ClientAuthorizer, DenyAllAuthorizer, ReadOnlyAuthorizer,
@@ -1734,9 +1728,9 @@ mod tests {
 
     fn test_header(cs_my: &str) -> DStarHeader {
         let mut my_bytes = *b"        ";
-        let src = cs_my.as_bytes();
-        let len = src.len().min(8);
-        my_bytes[..len].copy_from_slice(&src[..len]);
+        for (dst, byte) in my_bytes.iter_mut().zip(cs_my.bytes().take(8)) {
+            *dst = byte;
+        }
         DStarHeader {
             flag1: 0,
             flag2: 0,

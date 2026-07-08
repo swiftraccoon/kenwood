@@ -1,5 +1,22 @@
 //! Integration tests for SD card file format parsers.
 
+// Deps visible to every kenwood-thd75 test target but unused here.
+// Acknowledged so `unused_crate_dependencies` stays silent without
+// weakening the lint.
+use aprs as _;
+use aprs_is as _;
+use ax25_codec as _;
+use dstar_gateway_core as _;
+use kiss_tnc as _;
+use mmdvm as _;
+use mmdvm_core as _;
+use proptest as _;
+use serde_json as _;
+use thiserror as _;
+use tokio as _;
+use tokio_serial as _;
+use tracing as _;
+
 use kenwood_thd75::sdcard::SdCardError;
 use kenwood_thd75::sdcard::callsign_list::{
     CallsignEntry, parse_callsign_list, write_callsign_list,

@@ -62,35 +62,6 @@
 //! 9. **Output conversion** — float PCM → i16 with SIMD-vectorized
 //!    gain and clamping
 
-#![cfg_attr(
-    test,
-    expect(
-        clippy::indexing_slicing,
-        reason = "Unit tests throughout this crate construct fixed-size fixture arrays \
-                  and index directly with `arr[n]` to assert per-sample invariants against \
-                  reference implementations (mbelib, JMBE, OP25 encoders). The DSP \
-                  algorithms under test are defined in terms of indexed arrays, so the \
-                  tests mirror that shape directly — rewriting with `.get()?` would add \
-                  unwrap noise to every assertion without improving test quality, and \
-                  any out-of-bounds access would correctly panic the test."
-    )
-)]
-// `.expect()` usage is more localized — it only appears in encoder-gated test code
-// (feature `encoder` tests parse OP25 trace fixtures and use `.expect()` on fields that
-// are guaranteed present by the trace format). Scoping this opt-out to
-// `all(test, feature = "encoder")` avoids an unfulfilled-expectation warning under the
-// default-features build where no test uses `.expect()`.
-#![cfg_attr(
-    all(test, feature = "encoder"),
-    expect(
-        clippy::expect_used,
-        reason = "Encoder-feature test fixtures parse OP25 traces and use `.expect()` on \
-                  fields the trace format guarantees present; a malformed fixture should \
-                  panic the test with the specific missing-field message rather than \
-                  propagate a Result."
-    )
-)]
-
 // Dev-dependency `proptest` is used only inside the `encoder` feature module
 // (`src/encode/pack.rs`). Acknowledge it at the lib level so
 // `unused_crate_dependencies` stays silent in the default-features build.
@@ -555,8 +526,8 @@ mod tests {
 
         let simd_out = float_to_i16(&input);
 
-        for (n, &got) in simd_out.iter().enumerate() {
-            let expected = (input[n] * GAIN).clamp(-CLAMP_MAX, CLAMP_MAX).round();
+        for (n, (&got, &inp)) in simd_out.iter().zip(input.iter()).enumerate() {
+            let expected = (inp * GAIN).clamp(-CLAMP_MAX, CLAMP_MAX).round();
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "expected is in i16 range due to clamp"
@@ -565,8 +536,7 @@ mod tests {
             let diff = (i32::from(got) - i32::from(expected_i16)).abs();
             assert!(
                 diff <= 1,
-                "sample {n}: got {got}, expected {expected_i16} (input={})",
-                input[n]
+                "sample {n}: got {got}, expected {expected_i16} (input={inp})"
             );
         }
     }

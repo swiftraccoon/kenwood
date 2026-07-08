@@ -101,9 +101,16 @@ mod tests {
 
     #[test]
     fn wr_sp_is_symmetric_around_center() {
-        for i in 0..WR_SP_CENTER {
-            let left = WR_SP[WR_SP_CENTER - i];
-            let right = WR_SP[WR_SP_CENTER + i];
+        // Walk outward from the center in both directions: the
+        // reversed prefix iterator yields WR_SP[CENTER - i] while the
+        // skipped iterator yields WR_SP[CENTER + i].
+        let outward_left = WR_SP.iter().take(WR_SP_CENTER + 1).rev();
+        let outward_right = WR_SP.iter().skip(WR_SP_CENTER);
+        for (i, (left, right)) in outward_left
+            .zip(outward_right)
+            .take(WR_SP_CENTER)
+            .enumerate()
+        {
             assert!(
                 (left - right).abs() < 1e-6,
                 "asymmetry at ±{i}: {left} vs {right}"

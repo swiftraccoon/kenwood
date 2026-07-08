@@ -22,6 +22,19 @@ use ax25_codec::{Ax25Address, Ax25Packet, CommandResponse, RouteEntry, build_ax2
 use kenwood_thd75::aprs::ax25_to_kiss_wire;
 use kiss_tnc::decode_kiss_frame;
 
+// Deps visible to every kenwood-thd75 test target but unused here.
+// Acknowledged so `unused_crate_dependencies` stays silent without
+// weakening the lint.
+use aprs_is as _;
+use dstar_gateway_core as _;
+use mmdvm as _;
+use mmdvm_core as _;
+use serde_json as _;
+use thiserror as _;
+use tokio as _;
+use tokio_serial as _;
+use tracing as _;
+
 /// Convert any debug-printable error into a `TestCaseError` so `?` can be used
 /// in proptest blocks without violating workspace `unwrap_used` policy.
 fn to_test_err<E: std::fmt::Debug>(e: E) -> TestCaseError {

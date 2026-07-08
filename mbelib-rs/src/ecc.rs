@@ -526,12 +526,10 @@ mod tests {
         // Compute parity: only generator[0] contributes (data bit 11).
         let data: i32 = 0x001; // 12-bit data value
         let mut parity: i32 = 0;
-        let mut i = 0;
-        while i < 12 {
+        for (i, &g) in tables::GOLAY_GENERATOR.iter().enumerate().take(12) {
             if (data & (1 << (11 - i))) != 0 {
-                parity ^= tables::GOLAY_GENERATOR[i];
+                parity ^= g;
             }
-            i += 1;
         }
 
         // Pack into 23-bit codeword: [22..11] = data, [10..0] = parity.
@@ -539,10 +537,8 @@ mod tests {
 
         // Unpack to bit array (LSB-first).
         let mut in_bits = [0u8; 23];
-        let mut bi = 0;
-        while bi < 23 {
-            in_bits[bi] = bit_at(codeword, bi);
-            bi += 1;
+        for (bi, slot) in in_bits.iter_mut().enumerate() {
+            *slot = bit_at(codeword, bi);
         }
 
         let (out_bits, errs) = golay_decode(&in_bits);
@@ -550,13 +546,8 @@ mod tests {
         assert_eq!(errs, 0, "expected zero errors for a valid codeword");
 
         // Data bits (indices 11..23) should be unchanged.
-        let mut di = 11;
-        while di < 23 {
-            assert_eq!(
-                out_bits[di], in_bits[di],
-                "data bit {di} should be unchanged"
-            );
-            di += 1;
+        for (di, (out_bit, in_bit)) in out_bits.iter().zip(in_bits.iter()).enumerate().skip(11) {
+            assert_eq!(out_bit, in_bit, "data bit {di} should be unchanged");
         }
     }
 
@@ -567,22 +558,18 @@ mod tests {
         // Encode data = 0xABC (12 bits: 1010_1011_1100).
         let data: i32 = 0xABC;
         let mut parity: i32 = 0;
-        let mut i = 0;
-        while i < 12 {
+        for (i, &g) in tables::GOLAY_GENERATOR.iter().enumerate().take(12) {
             if (data & (1 << (11 - i))) != 0 {
-                parity ^= tables::GOLAY_GENERATOR[i];
+                parity ^= g;
             }
-            i += 1;
         }
 
         let codeword: i32 = (data << 11) | parity;
 
         // Unpack to bit array.
         let mut in_bits = [0u8; 23];
-        let mut bi = 0;
-        while bi < 23 {
-            in_bits[bi] = bit_at(codeword, bi);
-            bi += 1;
+        for (bi, slot) in in_bits.iter_mut().enumerate() {
+            *slot = bit_at(codeword, bi);
         }
 
         // Flip a data bit (bit 15, which is data bit 4).
@@ -592,19 +579,12 @@ mod tests {
 
         assert_eq!(errs, 1, "expected exactly 1 corrected error");
 
-        // Reconstruct the corrected data from out_bits.
+        // Reconstruct the corrected data from out_bits, MSB (bit 22)
+        // first down to bit 11.
         let mut corrected_data: i32 = 0;
-        let mut di = 22;
-        loop {
-            if di < 11 {
-                break;
-            }
+        for &bit in out_bits.iter().skip(11).rev() {
             corrected_data <<= 1;
-            corrected_data |= i32::from(out_bits[di]);
-            if di == 11 {
-                break;
-            }
-            di -= 1;
+            corrected_data |= i32::from(bit);
         }
 
         assert_eq!(corrected_data, data, "corrected data should match original");
@@ -652,18 +632,14 @@ mod tests {
         // Bit 22 set in C1 means data = 0x800, compute parity.
         let c1_data: i32 = 0x800;
         let mut c1_parity: i32 = 0;
-        let mut i = 0;
-        while i < 12 {
+        for (i, &g) in tables::GOLAY_GENERATOR.iter().enumerate().take(12) {
             if (c1_data & (1 << (11 - i))) != 0 {
-                c1_parity ^= tables::GOLAY_GENERATOR[i];
+                c1_parity ^= g;
             }
-            i += 1;
         }
         let c1_codeword = (c1_data << 11) | c1_parity;
-        let mut bi = 0;
-        while bi < 23 {
-            ambe_fr[C1_OFFSET + bi] = bit_at(c1_codeword, bi);
-            bi += 1;
+        for (bi, slot) in ambe_fr.iter_mut().skip(C1_OFFSET).take(23).enumerate() {
+            *slot = bit_at(c1_codeword, bi);
         }
 
         let mut ambe_d = [0u8; AMBE_DATA_BITS];
@@ -694,10 +670,8 @@ mod tests {
         assert_eq!(errs, 3, "expected 3 corrected errors");
 
         // All data bits (indices 11..23) should be corrected back to 0.
-        let mut di = 11;
-        while di < 23 {
-            assert_eq!(out_bits[di], 0, "data bit {di} should be corrected to 0");
-            di += 1;
+        for (di, &bit) in out_bits.iter().enumerate().skip(11) {
+            assert_eq!(bit, 0, "data bit {di} should be corrected to 0");
         }
     }
 }

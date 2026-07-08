@@ -7,6 +7,22 @@ use kenwood_thd75::types::{
     TncBaud, VfoMemoryMode,
 };
 
+// Deps visible to every kenwood-thd75 test target but unused here.
+// Acknowledged so `unused_crate_dependencies` stays silent without
+// weakening the lint.
+use aprs as _;
+use aprs_is as _;
+use ax25_codec as _;
+use dstar_gateway_core as _;
+use kiss_tnc as _;
+use mmdvm as _;
+use mmdvm_core as _;
+use proptest as _;
+use serde_json as _;
+use thiserror as _;
+use tokio_serial as _;
+use tracing as _;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 // ---- BC: get_band / set_band ----

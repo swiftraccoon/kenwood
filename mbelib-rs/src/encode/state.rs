@@ -143,20 +143,29 @@ mod tests {
             clippy::cast_precision_loss,
             reason = "test position-indexing: i < PITCH_EST_BUF_SIZE (320), exact in f32."
         )]
-        for i in 0..PITCH_EST_BUF_SIZE {
-            b.pitch_est_buf[i] = i as f32;
-            b.pitch_ref_buf[i] = i as f32;
+        for (i, (est, refb)) in b
+            .pitch_est_buf
+            .iter_mut()
+            .zip(b.pitch_ref_buf.iter_mut())
+            .enumerate()
+        {
+            *est = i as f32;
+            *refb = i as f32;
         }
         b.shift_pitch_history();
         // After shift: position `i` should now hold what was at
         // `i + FRAME` (for `i + FRAME < PITCH_EST_BUF_SIZE`).
-        for i in 0..(PITCH_EST_BUF_SIZE - FRAME) {
+        for (i, &got) in b
+            .pitch_est_buf
+            .iter()
+            .enumerate()
+            .take(PITCH_EST_BUF_SIZE - FRAME)
+        {
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "test position-indexing: i + FRAME < PITCH_EST_BUF_SIZE (320)."
             )]
             let expected = (i + FRAME) as f32;
-            let got = b.pitch_est_buf[i];
             assert!(
                 (got - expected).abs() < f32::EPSILON,
                 "pitch_est_buf[{i}] = {got}, expected {expected}",

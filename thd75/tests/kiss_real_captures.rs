@@ -14,6 +14,20 @@ use ax25_codec::{Ax25Packet, CommandResponse, RouteEntry, build_ax25, parse_ax25
 use kenwood_thd75::aprs::ax25_to_kiss_wire;
 use kiss_tnc::{KissFrame, decode_kiss_frame, encode_kiss_frame};
 
+// Deps visible to every kenwood-thd75 test target but unused here.
+// Acknowledged so `unused_crate_dependencies` stays silent without
+// weakening the lint.
+use aprs_is as _;
+use dstar_gateway_core as _;
+use mmdvm as _;
+use mmdvm_core as _;
+use proptest as _;
+use serde_json as _;
+use thiserror as _;
+use tokio as _;
+use tokio_serial as _;
+use tracing as _;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Build a KISS-wrapped AX.25 UI frame from (src, dst, path, info)

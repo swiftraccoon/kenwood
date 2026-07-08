@@ -13,28 +13,6 @@
 //! thin wrapper over the same endpoint code path. A separate
 //! smoke test covers `Reflector::new_with_socket` + shutdown.
 
-#![expect(
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::unreachable,
-    unused_results,
-    reason = "Integration test file. Tests live in a separate compilation unit from the \
-              library crate, so the library's internal lint posture does not apply — we \
-              restate the opt-outs here so test code stays expressive while production \
-              code remains strict. `clippy::panic` fires on explicit `panic!()` calls \
-              used as assertion-style failure reporters inside `match` arms and \
-              `tokio::select!` branches where we want to abort the test with a specific \
-              message rather than fall through to a generic `assert!` failure. \
-              `clippy::indexing_slicing` fires on direct buffer indexing against \
-              fixed-size test fixtures (known-length protocol frames) where bounds are \
-              obvious by construction. `clippy::unreachable` fires on `unreachable!()` \
-              used inside `match` arms as assertion-style 'this variant cannot occur \
-              given the test's setup' guards. `unused_results` fires on channel sends, \
-              `tokio::spawn` handles, and other setup calls whose `Result`/`JoinHandle` \
-              is not bound at the call site but is validated later in the test body via \
-              `assert!`/`matches!` on the receiver end."
-)]
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,10 +59,28 @@ const fn header_for(my: [u8; 8]) -> DStarHeader {
     }
 }
 
+/// Send the first `n` encoded bytes of `buf` to `dst`, bounds-checked.
+async fn send_frame(
+    sock: &UdpSocket,
+    buf: &[u8],
+    n: usize,
+    dst: std::net::SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _sent = sock
+        .send_to(buf.get(..n).ok_or("frame length exceeds buffer")?, dst)
+        .await?;
+    Ok(())
+}
+
 async fn drain_one(sock: &UdpSocket, buf: &mut [u8], label: &str) -> Result<usize, std::io::Error> {
     tokio::time::timeout(Duration::from_secs(1), sock.recv_from(buf))
         .await
-        .unwrap_or_else(|_| panic!("{label} recv_from timed out"))
+        .map_err(|elapsed| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{label} recv_from timed out: {elapsed}"),
+            )
+        })?
         .map(|(n, _)| n)
 }
 
@@ -123,7 +119,7 @@ async fn three_clients_fan_out_voice_without_echo() -> Result<(), Box<dyn std::e
     ] {
         let mut link_buf = [0u8; 16];
         let n = encode_connect_link(&mut link_buf, &callsign, Module::C, Module::B)?;
-        sock.send_to(&link_buf[..n], endpoint_addr).await?;
+        send_frame(sock, &link_buf, n, endpoint_addr).await?;
     }
 
     // Each client receives its own LINK ACK (14 bytes, tag "ACK").
@@ -139,7 +135,11 @@ async fn three_clients_fan_out_voice_without_echo() -> Result<(), Box<dyn std::e
         let n = drain_one(sock, &mut ack_buf, label).await?;
         assert_eq!(n, 14, "{label}: DExtra ACK is 14 bytes");
         assert!(
-            ack_buf[..n].windows(3).any(|w| w == b"ACK"),
+            ack_buf
+                .get(..n)
+                .ok_or("ACK length exceeds buffer")?
+                .windows(3)
+                .any(|w| w == b"ACK"),
             "{label}: payload must contain ACK tag"
         );
     }
@@ -149,24 +149,28 @@ async fn three_clients_fan_out_voice_without_echo() -> Result<(), Box<dyn std::e
     let hdr = header_for(*b"W1AW    ");
     let mut hdr_buf = [0u8; 64];
     let hdr_len = encode_voice_header(&mut hdr_buf, sid(), &hdr)?;
-    client_a.send_to(&hdr_buf[..hdr_len], endpoint_addr).await?;
+    send_frame(&client_a, &hdr_buf, hdr_len, endpoint_addr).await?;
 
     let frame = VoiceFrame::silence();
     let mut data_buf = [0u8; 64];
     for seq in 0_u8..2 {
         let n = encode_voice_data(&mut data_buf, sid(), seq, &frame)?;
-        client_a.send_to(&data_buf[..n], endpoint_addr).await?;
+        send_frame(&client_a, &data_buf, n, endpoint_addr).await?;
     }
     let mut eot_buf = [0u8; 64];
     let eot_len = encode_voice_eot(&mut eot_buf, sid(), 0x40 | 2)?;
-    client_a.send_to(&eot_buf[..eot_len], endpoint_addr).await?;
+    send_frame(&client_a, &eot_buf, eot_len, endpoint_addr).await?;
 
     // Clients B and C each receive 4 fan-out packets.
     for (sock, label) in [(&client_b, "client_b voice"), (&client_c, "client_c voice")] {
         let mut buf = [0u8; 128];
         let n1 = drain_one(sock, &mut buf, &format!("{label} header")).await?;
         assert_eq!(n1, hdr_len, "{label}: header size");
-        assert_eq!(&buf[..n1], &hdr_buf[..hdr_len], "{label}: header bytes");
+        assert_eq!(
+            buf.get(..n1),
+            hdr_buf.get(..hdr_len),
+            "{label}: header bytes"
+        );
 
         let n2 = drain_one(sock, &mut buf, &format!("{label} data0")).await?;
         assert_eq!(n2, 27, "{label}: data frame size");
@@ -233,8 +237,10 @@ async fn reflector_new_with_socket_shutdown_smoke_test() -> Result<(), Box<dyn s
         tokio::time::timeout(Duration::from_secs(2), reflector.run()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => panic!("reflector errored: {e:?}"),
-        Err(elapsed) => panic!("reflector.run did not exit within 2s: {elapsed}"),
+        Ok(Err(e)) => return Err(format!("reflector errored: {e:?}").into()),
+        Err(elapsed) => {
+            return Err(format!("reflector.run did not exit within 2s: {elapsed}").into());
+        }
     }
     Ok(())
 }

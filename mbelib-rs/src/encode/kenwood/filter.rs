@@ -136,8 +136,8 @@ mod tests {
         let mut output = vec![0.0_f32; input.len()];
         biquad_df1_section(&HPF_345HZ_COEFFS, &input, &mut output, &mut state);
         // Skip first 200 samples to let the transient die.
-        let rms_in = rms(&input[200..]);
-        let rms_out = rms(&output[200..]);
+        let rms_in = rms(input.split_at(200).1);
+        let rms_out = rms(output.split_at(200).1);
         let ratio = rms_out / rms_in;
         assert!(
             (0.85..1.15).contains(&ratio),
@@ -165,8 +165,8 @@ mod tests {
             .collect();
         let mut output = vec![0.0_f32; input.len()];
         biquad_df1_section(&HPF_345HZ_COEFFS, &input, &mut output, &mut state);
-        let rms_in = rms(&input[200..]);
-        let rms_out = rms(&output[200..]);
+        let rms_in = rms(input.split_at(200).1);
+        let rms_out = rms(output.split_at(200).1);
         let ratio = rms_out / rms_in;
         assert!(
             (0.9..1.1).contains(&ratio),
@@ -191,8 +191,8 @@ mod tests {
             .collect();
         let mut output = vec![0.0_f32; input.len()];
         biquad_df1_section(&HPF_345HZ_COEFFS, &input, &mut output, &mut state);
-        let rms_in = rms(&input[4000..]);
-        let rms_out = rms(&output[4000..]);
+        let rms_in = rms(input.split_at(4000).1);
+        let rms_out = rms(output.split_at(4000).1);
         let ratio = rms_out / rms_in;
         assert!(
             ratio < 0.5,

@@ -185,15 +185,12 @@ impl FftPlan {
             reason = "FRAME_LEN is 160; fits in i32"
         )]
         let frame_len_i32 = FRAME_LEN as i32;
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "Filling three fixed-size WOLA buffers of exactly FRAME_LEN elements \
-                      inside a bounded `0..FRAME_LEN` loop — indexing is always in-bounds \
-                      by construction. Rewriting as a three-way zip would obscure the \
-                      parallel per-sample write pattern that mirrors the WOLA reference \
-                      algorithm."
-        )]
-        for n in 0..FRAME_LEN {
+        for (n, ((wp, wc), wd)) in wola_w_prev
+            .iter_mut()
+            .zip(wola_w_curr.iter_mut())
+            .zip(wola_denom.iter_mut())
+            .enumerate()
+        {
             #[expect(
                 clippy::cast_possible_wrap,
                 clippy::cast_possible_truncation,
@@ -202,9 +199,9 @@ impl FftPlan {
             let n_i32 = n as i32;
             let w_prev = synthesis_window(n_i32);
             let w_curr = synthesis_window(n_i32 - frame_len_i32);
-            wola_w_prev[n] = w_prev;
-            wola_w_curr[n] = w_curr;
-            wola_denom[n] = w_prev.mul_add(w_prev, w_curr * w_curr);
+            *wp = w_prev;
+            *wc = w_curr;
+            *wd = w_prev.mul_add(w_prev, w_curr * w_curr);
         }
 
         Self {
@@ -550,9 +547,12 @@ mod tests {
         cur.l = 20;
         cur.w0 = 0.05;
         cur.noise_seed = 100.0; // skip cold start
-        for l in 1..=cur.l {
-            cur.vl[l] = true;
-            cur.ml[l] = 1.0;
+        let l = cur.l;
+        for slot in cur.vl.iter_mut().skip(1).take(l) {
+            *slot = true;
+        }
+        for slot in cur.ml.iter_mut().skip(1).take(l) {
+            *slot = 1.0;
         }
 
         let noise = make_noise_buffer(&mut cur);

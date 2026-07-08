@@ -10,20 +10,13 @@
 //! Public modules here are part of the REPL's internal API, not a
 //! stable library API for external consumers.
 
-// `unsafe_code = "forbid"` comes from this crate's `[lints.rust]` block in
-// Cargo.toml, which covers every target (lib, bin, integration tests). A
-// source-level attribute here would be a compile error: changing the level
-// of a forbidden lint — even to `deny` — is rejected by rustc.
-#![deny(missing_docs)]
-#![deny(clippy::all)]
-#![deny(clippy::pedantic)]
-#![deny(clippy::nursery)]
-#![expect(
-    clippy::module_name_repetitions,
-    reason = "REPL crate exposes types like `AprsClient`, `DStarSession`, and helpers whose names \
-              deliberately repeat module names so call sites read naturally. Suppressing crate-wide \
-              keeps the public surface ergonomic without adding per-item attributes."
-)]
+// `unsafe_code = "forbid"` and every deny-level lint (missing_docs, the
+// clippy all/pedantic/nursery groups, ...) come from this crate's
+// `[lints.*]` blocks in Cargo.toml, which cover every target (lib, bin,
+// integration tests). No source-level restatement: a crate attribute like
+// `#![deny(clippy::pedantic)]` would re-arm whole groups at a higher
+// precedence than the manifest and silently clobber the manifest's
+// documented per-lint tuning.
 // Note: `unwrap_used`, `expect_used`, and `panic` are already allowed crate-wide via
 // `[lints.clippy]` in `Cargo.toml`. A previous `cfg_attr(test, expect(...))` block was
 // removed because the workspace policy bans that form (it gates suppression on the

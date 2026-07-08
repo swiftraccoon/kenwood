@@ -15,6 +15,19 @@
 //!
 //! Press Ctrl+C to stop.
 
+// Deps visible to every kenwood-thd75 example target but unused here.
+// Acknowledged so `unused_crate_dependencies` stays silent without
+// weakening the lint.
+use aprs_is as _;
+use dstar_gateway_core as _;
+use mmdvm as _;
+use mmdvm_core as _;
+use proptest as _;
+use serde_json as _;
+use thiserror as _;
+use tokio_serial as _;
+use tracing as _;
+
 use kenwood_thd75::Transport;
 use kenwood_thd75::transport::SerialTransport;
 

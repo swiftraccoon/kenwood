@@ -98,13 +98,23 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_y) / 2),
         ])
         .split(area);
+    // `Layout::split` returns exactly one `Rect` per constraint, so
+    // both destructures always match; the fallbacks only guard the
+    // impossible shape.
+    let [_, middle, _] = *vertical else {
+        return area;
+    };
 
-    Layout::default()
+    let horizontal = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage((100 - percent_x) / 2),
             Constraint::Percentage(percent_x),
             Constraint::Percentage((100 - percent_x) / 2),
         ])
-        .split(vertical[1])[1]
+        .split(middle);
+    let [_, centered, _] = *horizontal else {
+        return area;
+    };
+    centered
 }

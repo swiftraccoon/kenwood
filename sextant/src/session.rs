@@ -1492,12 +1492,7 @@ mod tests {
             [b' ', b' ', b' '],
         ];
         let mut emitted_message: Option<String> = None;
-        for (i, half) in halves.iter().enumerate() {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "Test fixture: i is bounded by halves.len()=8, fits in u8."
-            )]
-            let seq = (i as u8).wrapping_add(1);
+        for (seq, half) in (1u8..).zip(halves.iter()) {
             let frame = VoiceFrame {
                 ambe: AMBE_SILENCE,
                 slow_data: scramble(*half),
@@ -1529,15 +1524,7 @@ mod tests {
         let mut state = EventState::default();
         // Push half a message, then start a new stream — the collector
         // must drop the partial state.
-        for (i, half) in [[0x40_u8, b'X', b'X'], [b'X', b'X', b'X']]
-            .iter()
-            .enumerate()
-        {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "Test fixture: i bounded by 2, fits in u8."
-            )]
-            let seq = (i as u8).wrapping_add(1);
+        for (seq, half) in (1u8..).zip([[0x40_u8, b'X', b'X'], [b'X', b'X', b'X']].iter()) {
             let _unused = decide_runtime_event(
                 RuntimeEvent::VoiceFrame {
                     seq,
@@ -1571,12 +1558,7 @@ mod tests {
             [b' ', b' ', b' '],
         ];
         let mut text: Option<String> = None;
-        for (i, half) in halves.iter().enumerate() {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "Test fixture: i bounded by 8, fits in u8."
-            )]
-            let seq = (i as u8).wrapping_add(1);
+        for (seq, half) in (1u8..).zip(halves.iter()) {
             let decisions = decide_runtime_event(
                 RuntimeEvent::VoiceFrame {
                     seq,

@@ -1,16 +1,5 @@
 //! Tokio event loop driving a sans-io `Session<P, Connected>` over a real `UdpSocket`.
 
-// `SessionLoop` is `pub(crate)` because the handle / spawn constructor
-// in `handle.rs` needs to reference it from its sibling submodule,
-// but it must not be part of the crate's public API. Clippy's
-// `redundant_pub_crate` lint wants us to drop the `(crate)`; that's a
-// spurious suggestion for a genuinely crate-private item that merely
-// happens to live inside a private module.
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "SessionLoop is crate-internal infrastructure; pub(crate) documents the intent"
-)]
-
 use std::sync::Arc;
 use std::time::Instant;
 

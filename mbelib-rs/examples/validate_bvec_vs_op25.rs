@@ -20,18 +20,13 @@
 #![expect(
     clippy::print_stdout,
     clippy::uninlined_format_args,
-    clippy::expect_used,
-    clippy::indexing_slicing,
     clippy::missing_docs_in_private_items,
     clippy::cast_precision_loss,
     missing_docs,
-    unused_results,
     reason = "Debugging example binary that parses OP25 trace files and compares b-vector \
-              quantization to the Rust port. Uses stdout for diagnostics, allows panics \
-              on malformed input (`.expect()` on parse, direct indexing into \
-              deterministic-length byte arrays). This is validation scratchwork, not \
-              library code. Skips docs since the tool is internal. DSP casts are \
-              unavoidable here."
+              quantization to the Rust port. Uses stdout for diagnostics and casts frame \
+              counts to f64 for percentage display; docs are skipped since the tool is \
+              internal validation harness, not library code."
 )]
 
 // Dev-dependencies pulled in by sibling tests/examples. Acknowledge them here so
@@ -68,20 +63,21 @@ const B_POS: [&[usize]; 9] = [
 /// to the 4-bit half-rate form); the shift is applied at decode time.
 fn reassemble_b_vec(ambe_d: &[u8]) -> [u16; 9] {
     let mut b = [0_u16; 9];
-    for (field_idx, positions) in B_POS.iter().enumerate() {
+    for (slot, positions) in b.iter_mut().zip(B_POS.iter()) {
         let mut v = 0_u16;
         for &p in *positions {
-            v = (v << 1) | u16::from(ambe_d[p] & 1);
+            // B_POS entries are compile-time constants < 49; a zero
+            // fallback on a short ambe_d shows up as a b-vec mismatch
+            // in the comparison output.
+            v = (v << 1) | u16::from(ambe_d.get(p).copied().unwrap_or(0) & 1);
         }
-        b[field_idx] = v;
+        *slot = v;
     }
     b
 }
 
 #[derive(Debug, Clone, Default)]
 struct Op25Frame {
-    #[expect(dead_code, reason = "kept for future diagnostics")]
-    index: usize,
     b: [i32; 9],
 }
 
@@ -94,22 +90,18 @@ struct DpSlot {
     fft_out: Vec<Complex<f32>>,
 }
 
-fn parse_trace(path: &str) -> Vec<Op25Frame> {
-    let file = std::fs::File::open(path).expect("open trace");
+fn parse_trace(path: &str) -> Result<Vec<Op25Frame>, std::io::Error> {
+    let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut frames: Vec<Op25Frame> = Vec::new();
     let mut cur: Option<Op25Frame> = None;
     for line in reader.lines().map_while(Result::ok) {
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("FRAME ") {
+        if trimmed.strip_prefix("FRAME ").is_some() {
             if let Some(f) = cur.take() {
                 frames.push(f);
             }
-            let idx: usize = rest.trim().parse().unwrap_or(0);
-            cur = Some(Op25Frame {
-                index: idx,
-                ..Default::default()
-            });
+            cur = Some(Op25Frame::default());
         } else if let Some(f) = cur.as_mut()
             && let Some(rest) = trimmed.strip_prefix("b0..b8 = ")
         {
@@ -118,26 +110,28 @@ fn parse_trace(path: &str) -> Vec<Op25Frame> {
                 .take(9)
                 .filter_map(|s| s.parse().ok())
                 .collect();
-            for (i, v) in parts.iter().enumerate() {
-                if i < 9 {
-                    f.b[i] = *v;
-                }
+            for (slot, &v) in f.b.iter_mut().zip(parts.iter()) {
+                *slot = v;
             }
         }
     }
     if let Some(f) = cur {
         frames.push(f);
     }
-    frames
+    Ok(frames)
 }
 
-fn load_pcm(path: &str) -> Vec<f32> {
-    let mut file = std::fs::File::open(path).expect("open pcm");
+fn load_pcm(path: &str) -> Result<Vec<f32>, std::io::Error> {
+    let mut file = std::fs::File::open(path)?;
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).expect("read");
-    buf.chunks_exact(2)
-        .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0)
-        .collect()
+    let _len = file.read_to_end(&mut buf)?;
+    Ok(buf
+        .chunks_exact(2)
+        .filter_map(|b| match *b {
+            [lo, hi] => Some(f32::from(i16::from_le_bytes([lo, hi])) / 32768.0),
+            _ => None,
+        })
+        .collect())
 }
 
 #[expect(
@@ -145,7 +139,7 @@ fn load_pcm(path: &str) -> Vec<f32> {
     reason = "A/B harness with inline option parsing + pipeline + summary output; \
               splitting adds indirection without clarifying what each section does."
 )]
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     // Parse args: [--dp] <pcm> <trace>
     let mut use_dp = false;
@@ -165,8 +159,8 @@ fn main() {
         eprintln!("  --dp: use 2-frame lookahead DP pitch tracker (mirrors OP25 pitch_est)");
         std::process::exit(2);
     };
-    let pcm = load_pcm(pcm_path);
-    let op25 = parse_trace(trace_path);
+    let pcm = load_pcm(pcm_path)?;
+    let op25 = parse_trace(trace_path)?;
     eprintln!(
         "PCM: {} samples ({:.2}s), OP25 trace: {} frames, pitch path: {}",
         pcm.len(),
@@ -227,11 +221,11 @@ fn main() {
                 dp_slots.push(slot);
                 continue;
             }
-            let p = tracker_state.estimate_with_lookahead(
-                &dp_slots[0].e_p,
-                &dp_slots[1].e_p,
-                &slot.e_p,
-            );
+            let p = if let [s0, s1] = dp_slots.as_slice() {
+                tracker_state.estimate_with_lookahead(&s0.e_p, &s1.e_p, &slot.e_p)
+            } else {
+                unreachable!("dp_slots holds exactly 2 slots after the `< 2` guard above")
+            };
             let oldest = dp_slots.remove(0);
             let target = oldest.fft_out;
             dp_slots.push(slot);
@@ -260,14 +254,20 @@ fn main() {
         };
         total += 1;
         let mut frame_ok = true;
-        for (i, (&op25_v, &our_v)) in op25_f.b.iter().zip(ours.iter()).enumerate() {
+        for (((&op25_v, &our_v), count), first) in op25_f
+            .b
+            .iter()
+            .zip(ours.iter())
+            .zip(per_field_match.iter_mut())
+            .zip(first_mismatch_by_field.iter_mut())
+        {
             let our_as_i32 = i32::from(our_v);
             if op25_v == our_as_i32 {
-                per_field_match[i] += 1;
+                *count += 1;
             } else {
                 frame_ok = false;
-                if first_mismatch_by_field[i].is_none() {
-                    first_mismatch_by_field[i] = Some(op25_idx);
+                if first.is_none() {
+                    *first = Some(op25_idx);
                 }
             }
         }
@@ -304,9 +304,13 @@ fn main() {
         total,
         100.0 * exact_frame_match as f64 / total.max(1) as f64
     );
-    for (i, count) in per_field_match.iter().enumerate() {
-        let first = first_mismatch_by_field[i]
-            .map_or_else(|| "—".to_string(), |f| format!("first diverge at F{f}"));
+    for (i, (count, first_mismatch)) in per_field_match
+        .iter()
+        .zip(first_mismatch_by_field.iter())
+        .enumerate()
+    {
+        let first =
+            first_mismatch.map_or_else(|| "—".to_string(), |f| format!("first diverge at F{f}"));
         println!(
             "  b{i}: {:3}/{} ({:5.1}%)  [{}]",
             count,
@@ -315,4 +319,5 @@ fn main() {
             first
         );
     }
+    Ok(())
 }

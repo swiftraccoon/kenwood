@@ -33,18 +33,12 @@
 
 #![cfg(feature = "kenwood-tables")]
 #![expect(
-    clippy::expect_used,
-    clippy::indexing_slicing,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::panic,
-    reason = "HITL test file. Reads fixed-shape capture files from \
-              tests/fixtures/thd75/, indexing into known-size byte \
-              regions and known-size frame buffers. `expect()` and \
-              `panic!` are used on filesystem reads where a missing \
-              fixture is a setup error that should panic loudly. \
-              Numeric casts are inside tone-synthesis math where \
-              bounds are guaranteed by the input parameters."
+    reason = "Tone-synthesis and lock-quality math throughout this file casts sample \
+              indices, frame counts, and clamped f32 samples between numeric types; \
+              bounds are guaranteed by the synthesis parameters (amplitudes <= i16::MAX, \
+              counts <= a few hundred frames)."
 )]
 
 // Dev-dependencies pulled in by sibling tests. Acknowledge them here
@@ -63,6 +57,8 @@ use mbelib_rs::kenwood::anchors::{
     hamming_distance, mask_stable_bits,
 };
 
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
 // ─── fixture loading ────────────────────────────────────────────────
 
 fn fixtures_dir() -> PathBuf {
@@ -72,11 +68,9 @@ fn fixtures_dir() -> PathBuf {
         .join("thd75")
 }
 
-fn load_capture(name: &str) -> Vec<u8> {
+fn load_capture(name: &str) -> Result<Vec<u8>, String> {
     let path = fixtures_dir().join(name);
-    fs::read(&path).unwrap_or_else(|err| {
-        panic!("failed to read fixture {}: {err}", path.display());
-    })
+    fs::read(&path).map_err(|err| format!("failed to read fixture {}: {err}", path.display()))
 }
 
 /// Parse a capture file into 9-byte frames. Captures are raw AMBE byte
@@ -87,15 +81,11 @@ fn parse_frames(raw: &[u8]) -> Option<Vec<[u8; FRAME_LEN]>> {
     if raw.is_empty() {
         return None;
     }
-    let n = raw.len() / FRAME_LEN;
-    let mut frames = Vec::with_capacity(n);
-    for i in 0..n {
-        let start = i * FRAME_LEN;
-        let mut frame = [0_u8; FRAME_LEN];
-        frame.copy_from_slice(&raw[start..start + FRAME_LEN]);
-        frames.push(frame);
-    }
-    Some(frames)
+    Some(
+        raw.chunks_exact(FRAME_LEN)
+            .filter_map(|chunk| chunk.try_into().ok())
+            .collect(),
+    )
 }
 
 /// Apply [`STABLE_BIT_MASK`] to a frame.
@@ -105,24 +95,21 @@ fn mask(frame: [u8; FRAME_LEN]) -> [u8; FRAME_LEN] {
 
 /// Count occurrences of each masked frame in the second half of the
 /// stream (skipping the encoder's transient).
-fn dominant_in_second_half(frames: &[[u8; FRAME_LEN]]) -> ([u8; FRAME_LEN], usize, usize) {
+fn dominant_in_second_half(frames: &[[u8; FRAME_LEN]]) -> Option<([u8; FRAME_LEN], usize, usize)> {
     let half = frames.len() / 2;
-    let second = &frames[half..];
+    let second = frames.split_at(half).1;
     let mut counts: HashMap<[u8; FRAME_LEN], usize> = HashMap::new();
     for &frame in second {
         *counts.entry(mask(frame)).or_insert(0) += 1;
     }
-    let (dom_frame, dom_count) = counts
-        .into_iter()
-        .max_by_key(|&(_, n)| n)
-        .expect("non-empty 2nd half");
-    (dom_frame, dom_count, second.len())
+    let (dom_frame, dom_count) = counts.into_iter().max_by_key(|&(_, n)| n)?;
+    Some((dom_frame, dom_count, second.len()))
 }
 
 // ─── capture-integrity tests (always enabled with feature) ──────────
 
 #[test]
-fn captures_have_no_header_and_divide_by_nine() {
+fn captures_have_no_header_and_divide_by_nine() -> TestResult {
     // Each capture is a raw AMBE byte stream — no header, frames
     // begin at byte 0. File sizes divide evenly by 9 (one frame).
     let names = [
@@ -138,7 +125,7 @@ fn captures_have_no_header_and_divide_by_nine() {
         "capture_10_mic_covered.ambe",
     ];
     for name in names {
-        let raw = load_capture(name);
+        let raw = load_capture(name)?;
         assert_eq!(
             raw.len() % FRAME_LEN,
             0,
@@ -146,26 +133,28 @@ fn captures_have_no_header_and_divide_by_nine() {
             raw.len()
         );
     }
+    Ok(())
 }
 
 #[test]
-fn empty_capture_for_too_short_keying() {
+fn empty_capture_for_too_short_keying() -> TestResult {
     // capture_6 was an intentional very-brief key-up; the encoder
     // didn't get to flush any frames. Documents the firmware behaviour.
-    let raw = load_capture("capture_6_shorter_keying.ambe");
+    let raw = load_capture("capture_6_shorter_keying.ambe")?;
     assert_eq!(
         raw.len(),
         0,
         "capture_6 expected to be empty (TX too short to flush encoder)"
     );
+    Ok(())
 }
 
 #[test]
-fn frame_stride_is_nine_bytes() {
+fn frame_stride_is_nine_bytes() -> TestResult {
     // The 440 Hz capture is the strongest demonstration: 107/196
     // frames are byte-identical when sliced at stride 9.
     let frames =
-        parse_frames(&load_capture("capture_2_440Hz_tone.ambe")).expect("440 Hz capture parses");
+        parse_frames(&load_capture("capture_2_440Hz_tone.ambe")?).ok_or("440 Hz capture parses")?;
     let mut counts: HashMap<[u8; FRAME_LEN], usize> = HashMap::new();
     for &frame in &frames {
         *counts.entry(frame).or_insert(0) += 1;
@@ -173,15 +162,16 @@ fn frame_stride_is_nine_bytes() {
     let (_, dom_count) = counts
         .iter()
         .max_by_key(|&(_, &n)| n)
-        .expect("non-empty capture");
+        .ok_or("non-empty capture")?;
     assert!(
         *dom_count >= 100,
         "expected >=100 byte-identical frames at stride 9, got {dom_count}"
     );
+    Ok(())
 }
 
 #[test]
-fn pitch_anchors_match_capture_steady_state() {
+fn pitch_anchors_match_capture_steady_state() -> TestResult {
     // For each anchor, the corresponding capture's 2nd-half-dominant
     // masked frame must match the codified anchor.frame, at no less
     // than the documented lock_quality.
@@ -192,10 +182,10 @@ fn pitch_anchors_match_capture_steady_state() {
         (660.0, "capture_8_660Hz_tone.ambe"),
     ];
     for &(freq, file) in anchor_files {
-        let frames = parse_frames(&load_capture(file)).expect("capture parses");
-        let (dom, count, total) = dominant_in_second_half(&frames);
+        let frames = parse_frames(&load_capture(file)?).ok_or("capture parses")?;
+        let (dom, count, total) = dominant_in_second_half(&frames).ok_or("non-empty 2nd half")?;
         let measured_quality = count as f32 / total as f32;
-        let anchor = anchor_for(freq).expect("anchor exists");
+        let anchor = anchor_for(freq).ok_or("anchor exists")?;
         assert_eq!(
             dom, anchor.frame,
             "{freq} Hz: 2nd-half dominant masked frame {dom:02x?} != codified anchor {:02x?}",
@@ -207,50 +197,55 @@ fn pitch_anchors_match_capture_steady_state() {
             anchor.lock_quality
         );
     }
+    Ok(())
 }
 
 #[test]
-fn unsupported_pitches_do_not_lock() {
+fn unsupported_pitches_do_not_lock() -> TestResult {
     // 100 Hz and 320 Hz captures exist but didn't lock — phone-speaker
     // limitations, not codec behaviour. Document this explicitly so
     // future sessions don't try to derive anchors from these files.
     for file in ["capture_5_100Hz_tone.ambe", "capture_3_320Hz_tone.ambe"] {
-        let frames = parse_frames(&load_capture(file)).expect("capture parses");
-        let (_, count, total) = dominant_in_second_half(&frames);
+        let frames = parse_frames(&load_capture(file)?).ok_or("capture parses")?;
+        let (_, count, total) = dominant_in_second_half(&frames).ok_or("non-empty 2nd half")?;
         let quality = count as f32 / total as f32;
         assert!(
             quality < 0.5,
             "{file}: unexpected lock at quality {quality:.2} — anchor may be derivable"
         );
     }
+    Ok(())
 }
 
 #[test]
-fn mic_covered_captures_show_no_silence_anchor() {
+fn mic_covered_captures_show_no_silence_anchor() -> TestResult {
     // Both mic-covered captures still produce 100% unique frames in
     // the 2nd half. Documents that this radio has no quiescent silence
     // pattern — mic noise always drives V/UV decisions.
     for file in ["capture_9_mic_covered.ambe", "capture_10_mic_covered.ambe"] {
-        let frames = parse_frames(&load_capture(file)).expect("capture parses");
-        let (_, count, _total) = dominant_in_second_half(&frames);
+        let frames = parse_frames(&load_capture(file)?).ok_or("capture parses")?;
+        let (_, count, _total) = dominant_in_second_half(&frames).ok_or("non-empty 2nd half")?;
         assert!(
             count <= 2,
             "{file}: mic-covered capture showed unexpected repetition (count={count})"
         );
     }
+    Ok(())
 }
 
 #[test]
-fn volatile_bits_are_actually_volatile_in_440hz_capture() {
+fn volatile_bits_are_actually_volatile_in_440hz_capture() -> TestResult {
     // For each bit position in VOLATILE_BIT_MASK, at least 5% of 440
     // Hz frames must show that bit differing from the dominant — that's
     // why we classified it as volatile. Catches mask drift.
     let frames =
-        parse_frames(&load_capture("capture_2_440Hz_tone.ambe")).expect("440 Hz capture parses");
-    let ref_frame = frames[60]; // mid-stream, deep in steady state
+        parse_frames(&load_capture("capture_2_440Hz_tone.ambe")?).ok_or("440 Hz capture parses")?;
+    // Mid-stream reference frame, deep in steady state.
+    let ref_frame = *frames.get(60).ok_or("capture has at least 61 frames")?;
     let n = frames.len();
-    for byte_idx in 0..FRAME_LEN {
-        let volatile = VOLATILE_BIT_MASK[byte_idx];
+    for (byte_idx, (&volatile, &ref_byte)) in
+        VOLATILE_BIT_MASK.iter().zip(ref_frame.iter()).enumerate()
+    {
         for bit in 0_u8..8 {
             if volatile & (1 << bit) == 0 {
                 continue;
@@ -258,7 +253,10 @@ fn volatile_bits_are_actually_volatile_in_440hz_capture() {
             let mask_bit = 1 << bit;
             let differ = frames
                 .iter()
-                .filter(|f| f[byte_idx] & mask_bit != ref_frame[byte_idx] & mask_bit)
+                .filter(|f| {
+                    f.get(byte_idx)
+                        .is_some_and(|&b| b & mask_bit != ref_byte & mask_bit)
+                })
                 .count();
             let pct = 100 * differ / n;
             assert!(
@@ -267,18 +265,18 @@ fn volatile_bits_are_actually_volatile_in_440hz_capture() {
             );
         }
     }
+    Ok(())
 }
 
 #[test]
-fn stable_bits_are_actually_stable_in_440hz_capture() {
+fn stable_bits_are_actually_stable_in_440hz_capture() -> TestResult {
     // For each bit in STABLE_BIT_MASK, < 5% of 440 Hz frames may differ
     // from the dominant masked frame. Confirms our partition is correct.
     let frames =
-        parse_frames(&load_capture("capture_2_440Hz_tone.ambe")).expect("440 Hz capture parses");
-    let dom = anchor_for(440.0).expect("440 Hz anchor").frame;
+        parse_frames(&load_capture("capture_2_440Hz_tone.ambe")?).ok_or("440 Hz capture parses")?;
+    let dom = anchor_for(440.0).ok_or("440 Hz anchor")?.frame;
     let n = frames.len();
-    for byte_idx in 0..FRAME_LEN {
-        let stable = STABLE_BIT_MASK[byte_idx];
+    for (byte_idx, (&stable, &dom_byte)) in STABLE_BIT_MASK.iter().zip(dom.iter()).enumerate() {
         for bit in 0_u8..8 {
             if stable & (1 << bit) == 0 {
                 continue;
@@ -286,7 +284,10 @@ fn stable_bits_are_actually_stable_in_440hz_capture() {
             let mask_bit = 1 << bit;
             let differ = frames
                 .iter()
-                .filter(|f| f[byte_idx] & mask_bit != dom[byte_idx] & mask_bit)
+                .filter(|f| {
+                    f.get(byte_idx)
+                        .is_some_and(|&b| b & mask_bit != dom_byte & mask_bit)
+                })
                 .count();
             let pct = 100 * differ / n;
             assert!(
@@ -295,6 +296,7 @@ fn stable_bits_are_actually_stable_in_440hz_capture() {
             );
         }
     }
+    Ok(())
 }
 
 // ─── encoder-vs-anchor tests (ignored until encoder is Kenwood-perfect) ─
@@ -376,10 +378,11 @@ fn encode_to_ambe_frames(pcm: &[i16]) -> Vec<[u8; FRAME_LEN]> {
 /// V-path milestone.
 #[test]
 #[ignore = "encoder not yet Kenwood-exact; gates the V-path milestone (210 Hz only)"]
-fn rust_encoder_matches_pitch_anchors() {
+fn rust_encoder_matches_pitch_anchors() -> TestResult {
     for anchor in PITCH_ANCHORS.iter().filter(|a| a.in_op25_pitch_range) {
-        rust_encoder_matches_one_anchor(anchor);
+        rust_encoder_matches_one_anchor(anchor)?;
     }
+    Ok(())
 }
 
 /// Aspirational test for full IMBE pitch range support. Currently
@@ -387,10 +390,11 @@ fn rust_encoder_matches_pitch_anchors() {
 /// full-range encoder rewrite.
 #[test]
 #[ignore = "blocked on widening PITCH_CANDIDATES to full IMBE range (~50-625 Hz)"]
-fn rust_encoder_matches_high_pitch_anchors() {
+fn rust_encoder_matches_high_pitch_anchors() -> TestResult {
     for anchor in PITCH_ANCHORS.iter().filter(|a| !a.in_op25_pitch_range) {
-        rust_encoder_matches_one_anchor(anchor);
+        rust_encoder_matches_one_anchor(anchor)?;
     }
+    Ok(())
 }
 
 /// Distinguish "ECC fallback" from "real encoding" by decoding MANY
@@ -403,20 +407,20 @@ fn rust_encoder_matches_high_pitch_anchors() {
 /// dewhiten_variance_within_one_capture`.
 #[test]
 #[ignore = "diagnostic; tests if dewhitening is real or ECC fallback"]
-fn dewhiten_variance_within_one_capture() {
+fn dewhiten_variance_within_one_capture() -> TestResult {
     use mbelib_rs::decode_trace;
     let whiten: [u8; 4] = [0x70, 0x4F, 0x93, 0x40];
 
-    let raw = load_capture("capture_4_210Hz_tone.ambe");
-    let frames = parse_frames(&raw).expect("210 Hz capture parses");
+    let raw = load_capture("capture_4_210Hz_tone.ambe")?;
+    let frames = parse_frames(&raw).ok_or("210 Hz capture parses")?;
 
     println!();
     println!("Decoding 20 distinct dewhitened frames from 210 Hz capture:");
     let mut seen = HashMap::<(usize, usize, usize), usize>::new();
     for (idx, &raw_frame) in frames.iter().enumerate().step_by(5).take(40) {
         let mut dewhitened = raw_frame;
-        for i in 0..FRAME_LEN {
-            dewhitened[i] ^= whiten[i % 4];
+        for (byte, &w) in dewhitened.iter_mut().zip(whiten.iter().cycle()) {
+            *byte ^= w;
         }
         let (b, _, l, _) = decode_trace(&dewhitened);
         let key = (b[0], b[1], l);
@@ -438,6 +442,7 @@ fn dewhiten_variance_within_one_capture() {
     for ((b0, b1, l), n) in &seen {
         println!("  ({b0:>3}, {b1:>2}, {l:>2}) × {n}");
     }
+    Ok(())
 }
 
 /// Verify the firmware whitening hypothesis on ALL 4 anchors. If
@@ -460,8 +465,8 @@ fn confirm_whitener_on_all_anchors() {
     );
     for anchor in PITCH_ANCHORS {
         let mut dewhitened = anchor.raw_dominant_frame;
-        for i in 0..FRAME_LEN {
-            dewhitened[i] ^= whiten[i % 4];
+        for (byte, &w) in dewhitened.iter_mut().zip(whiten.iter().cycle()) {
+            *byte ^= w;
         }
         let (b, _, l, _) = decode_trace(&dewhitened);
 
@@ -507,9 +512,9 @@ fn confirm_whitener_on_all_anchors() {
 /// Run with `cargo test ... -- --ignored --nocapture probe_kenwood_wire_format`.
 #[test]
 #[ignore = "diagnostic; brute-search simple wire-format permutations"]
-fn probe_kenwood_wire_format() {
+fn probe_kenwood_wire_format() -> TestResult {
     use mbelib_rs::decode_trace;
-    let kenwood_raw = anchor_for(210.0).expect("anchor").raw_dominant_frame;
+    let kenwood_raw = anchor_for(210.0).ok_or("anchor")?.raw_dominant_frame;
     println!();
     println!("Probing simple wire-format permutations of Kenwood 210 Hz capture:");
     println!("  raw bytes: {}", hex9(&kenwood_raw));
@@ -542,32 +547,36 @@ fn probe_kenwood_wire_format() {
 
     // 3. Bit-reverse each byte (MSB↔LSB within byte)
     let mut bit_rev = [0_u8; 9];
-    for (i, &b) in kenwood_raw.iter().enumerate() {
-        bit_rev[i] = b.reverse_bits();
+    for (dst, &b) in bit_rev.iter_mut().zip(kenwood_raw.iter()) {
+        *dst = b.reverse_bits();
     }
     try_one("bit-reversed-per-byte", bit_rev);
 
     // 4. Bit-reverse all 72 bits as one stream
     let mut all_bits_rev = [0_u8; 9];
-    for i in 0..9 {
-        all_bits_rev[8 - i] = kenwood_raw[i].reverse_bits();
+    for (dst, &b) in all_bits_rev.iter_mut().rev().zip(kenwood_raw.iter()) {
+        *dst = b.reverse_bits();
     }
     try_one("bits-reversed-all", all_bits_rev);
 
     // 5. XOR with 0x704F9340 cycled (firmware whitening pattern)
     let whiten: [u8; 4] = [0x70, 0x4F, 0x93, 0x40];
     let mut whitened = [0_u8; 9];
-    for i in 0..9 {
-        whitened[i] = kenwood_raw[i] ^ whiten[i % 4];
+    for (dst, (&b, &w)) in whitened
+        .iter_mut()
+        .zip(kenwood_raw.iter().zip(whiten.iter().cycle()))
+    {
+        *dst = b ^ w;
     }
     try_one("XOR 0x704F9340 cycled", whitened);
 
     // 6. Swap nibbles per byte
     let mut nib_swap = [0_u8; 9];
-    for (i, &b) in kenwood_raw.iter().enumerate() {
-        nib_swap[i] = b.rotate_left(4);
+    for (dst, &b) in nib_swap.iter_mut().zip(kenwood_raw.iter()) {
+        *dst = b.rotate_left(4);
     }
     try_one("nibble-swapped-per-byte", nib_swap);
+    Ok(())
 }
 
 /// Sanity check: decode our OWN encoder output and confirm it round-trips
@@ -578,7 +587,7 @@ fn probe_kenwood_wire_format() {
 /// Run with `cargo test ... -- --ignored --nocapture self_round_trip_b_fields`.
 #[test]
 #[ignore = "diagnostic; verifies our encoder→decoder round-trip"]
-fn self_round_trip_b_fields() {
+fn self_round_trip_b_fields() -> TestResult {
     use mbelib_rs::decode_trace;
 
     println!();
@@ -586,10 +595,12 @@ fn self_round_trip_b_fields() {
     let pcm = synthesize_tone_pcm(210.0, 150, 16384);
     let frames = encode_to_ambe_frames(&pcm);
     if frames.is_empty() {
-        return;
+        return Ok(());
     }
     // Mid-stream frame
-    let mid = &frames[100];
+    let mid = frames
+        .get(100)
+        .ok_or("encoder emitted at least 101 frames")?;
     let (b, w0, l, _) = decode_trace(mid);
     println!("  raw frame: {}", hex9(mid));
     println!(
@@ -599,7 +610,7 @@ fn self_round_trip_b_fields() {
     println!("  w0={w0:.4} L={l}");
     println!();
     println!("Same operation on Kenwood 210 Hz capture's dominant frame:");
-    let kenwood = anchor_for(210.0).expect("anchor").raw_dominant_frame;
+    let kenwood = anchor_for(210.0).ok_or("anchor")?.raw_dominant_frame;
     let (b, w0, l, _) = decode_trace(&kenwood);
     println!("  raw frame: {}", hex9(&kenwood));
     println!(
@@ -607,6 +618,7 @@ fn self_round_trip_b_fields() {
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8]
     );
     println!("  w0={w0:.4} L={l}");
+    Ok(())
 }
 
 /// Confirm whether b2=0 is universal (encoder bug) or specific to pure
@@ -630,10 +642,13 @@ fn probe_b2_with_varied_inputs() {
         }
         let half = frames.len() / 2;
         let mut counts: HashMap<[u8; FRAME_LEN], usize> = HashMap::new();
-        for &f in &frames[half..] {
+        for &f in frames.split_at(half).1 {
             *counts.entry(f).or_insert(0) += 1;
         }
-        let (dom, _) = counts.iter().max_by_key(|&(_, &n)| n).expect("non-empty");
+        let Some((dom, _)) = counts.iter().max_by_key(|&(_, &n)| n) else {
+            println!("  {label:<26} | empty second half");
+            return;
+        };
         let (b, _, l, _) = decode_trace(dom);
         println!(
             "  {label:<26} |   {:>3} {:>2} {:>2} {:>3} {:>2}",
@@ -717,10 +732,12 @@ fn sweep_noise_floor() {
         }
         let half = frames.len() / 2;
         let mut counts: HashMap<[u8; FRAME_LEN], usize> = HashMap::new();
-        for &f in &frames[half..] {
+        for &f in frames.split_at(half).1 {
             *counts.entry(f).or_insert(0) += 1;
         }
-        let (dom, _) = counts.iter().max_by_key(|&(_, &n)| n).expect("non-empty");
+        let Some((dom, _)) = counts.iter().max_by_key(|&(_, &n)| n) else {
+            continue;
+        };
         let (b, _, l, _) = decode_trace(dom);
         println!(
             "  {:>5} | {:>6.1}  | {:>3} {:>2} {:>2} {:>3} {:>3} {:>2}",
@@ -755,10 +772,12 @@ fn sweep_amplitude_for_b2_match() {
         }
         let half = frames.len() / 2;
         let mut counts: HashMap<[u8; FRAME_LEN], usize> = HashMap::new();
-        for &f in &frames[half..] {
+        for &f in frames.split_at(half).1 {
             *counts.entry(f).or_insert(0) += 1;
         }
-        let (dom, _) = counts.iter().max_by_key(|&(_, &n)| n).expect("non-empty");
+        let Some((dom, _)) = counts.iter().max_by_key(|&(_, &n)| n) else {
+            continue;
+        };
         let (b, _, l, _) = decode_trace(dom);
         let dist = i32::try_from(b[2]).unwrap_or(0) - i32::try_from(KENWOOD_B2).unwrap_or(0);
         let marker = if b[2] == KENWOOD_B2 { " ← MATCH" } else { "" };
@@ -778,7 +797,7 @@ fn sweep_amplitude_for_b2_match() {
 /// trace_210hz_b_fields`.
 #[test]
 #[ignore = "diagnostic; decodes 210 Hz Rust output to b0..b8 fields"]
-fn trace_210hz_b_fields() {
+fn trace_210hz_b_fields() -> TestResult {
     use mbelib_rs::decode_trace;
 
     println!();
@@ -786,23 +805,23 @@ fn trace_210hz_b_fields() {
     let frames = encode_to_ambe_frames(&pcm);
     if frames.is_empty() {
         println!("encoder produced no frames");
-        return;
+        return Ok(());
     }
     let half = frames.len() / 2;
     let mut counts: HashMap<[u8; FRAME_LEN], usize> = HashMap::new();
-    for &f in &frames[half..] {
+    for &f in frames.split_at(half).1 {
         *counts.entry(f).or_insert(0) += 1;
     }
     let (rust_dominant_raw, rust_count) = counts
         .iter()
         .max_by_key(|&(_, &n)| n)
-        .expect("non-empty encoder output");
+        .ok_or("non-empty encoder output")?;
 
     let (rust_b, _, rust_l, _) = decode_trace(rust_dominant_raw);
     // Dewhiten the Kenwood capture before decoding (firmware applies
     // XOR 0x704F9340 cycled on the wire). Without this, ECC sees
     // garbage and decode_trace produces erasure/silence values.
-    let anchor = anchor_for(210.0).expect("210 Hz anchor");
+    let anchor = anchor_for(210.0).ok_or("210 Hz anchor")?;
     let kenwood_dewhit = mbelib_rs::kenwood::anchors::apply_whitening(anchor.raw_dominant_frame);
     let (anchor_b, _, anchor_l, _) = decode_trace(&kenwood_dewhit);
 
@@ -824,9 +843,7 @@ fn trace_210hz_b_fields() {
     let names = [
         "b0_pitch", "b1_vuv", "b2_gain", "b3", "b4", "b5", "b6", "b7", "b8",
     ];
-    for (i, name) in names.iter().enumerate() {
-        let r = rust_b[i];
-        let a = anchor_b[i];
+    for (name, (&r, &a)) in names.iter().zip(rust_b.iter().zip(anchor_b.iter())) {
         let ok = if r == a { "yes" } else { "NO " };
         let delta = i32::try_from(r).unwrap_or(0) - i32::try_from(a).unwrap_or(0);
         println!("  {name:<7}|  {r:>4}  |  {a:>4}  | {ok}   | {delta:>+4}");
@@ -835,6 +852,7 @@ fn trace_210hz_b_fields() {
         "  L     |  {rust_l:>4}  |  {anchor_l:>4}  | {}   |",
         if rust_l == anchor_l { "yes" } else { "NO " }
     );
+    Ok(())
 }
 
 /// Pitch-tracker diagnostic: runs each anchor's tone PCM through the
@@ -904,13 +922,12 @@ fn rust_encoder_distance_with_whitener() {
         }
         let half = frames.len() / 2;
         let mut counts: HashMap<[u8; FRAME_LEN], usize> = HashMap::new();
-        for &f in &frames[half..] {
+        for &f in frames.split_at(half).1 {
             *counts.entry(f).or_insert(0) += 1;
         }
-        let (rust_dom, _) = counts
-            .iter()
-            .max_by_key(|&(_, &n)| n)
-            .expect("non-empty encoder output");
+        let Some((rust_dom, _)) = counts.iter().max_by_key(|&(_, &n)| n) else {
+            continue;
+        };
         let rust_whitened = apply_whitening(*rust_dom);
         let kenwood_raw = anchor.raw_dominant_frame;
 
@@ -958,13 +975,12 @@ fn rust_encoder_distance_baseline() {
         }
         let half = frames.len() / 2;
         let mut counts: HashMap<[u8; FRAME_LEN], usize> = HashMap::new();
-        for &f in &frames[half..] {
+        for &f in frames.split_at(half).1 {
             *counts.entry(mask(f)).or_insert(0) += 1;
         }
-        let (rust_dominant, _) = counts
-            .iter()
-            .max_by_key(|&(_, &n)| n)
-            .expect("non-empty encoder output");
+        let Some((rust_dominant, _)) = counts.iter().max_by_key(|&(_, &n)| n) else {
+            continue;
+        };
         let dist = hamming_distance(*rust_dominant, anchor.frame);
         total += dist;
         println!(
@@ -992,6 +1008,39 @@ const fn field_of(pre: u8) -> &'static str {
     }
 }
 
+/// Attribute every wrong stable bit of `rust_dominant` (vs the anchor
+/// frame) to the pre-interleave AMBE field it belongs to.
+fn attribute_wrong_bits(
+    rust_dominant: &[u8; FRAME_LEN],
+    anchor_frame: &[u8; FRAME_LEN],
+    inverse: &[u8; 72],
+) -> HashMap<&'static str, u32> {
+    let mut local: HashMap<&'static str, u32> = HashMap::new();
+    for (byte_idx, ((&rust_byte, &anchor_byte), &volatile)) in rust_dominant
+        .iter()
+        .zip(anchor_frame.iter())
+        .zip(VOLATILE_BIT_MASK.iter())
+        .enumerate()
+    {
+        let xor_byte = rust_byte ^ anchor_byte;
+        for bit_lsb in 0_u8..8 {
+            let bit_mask = 1 << bit_lsb;
+            if xor_byte & bit_mask == 0 {
+                continue;
+            }
+            // Skip volatile bits (already not in the stable comparison).
+            if volatile & bit_mask != 0 {
+                continue;
+            }
+            // MSB-first within byte → ambe_fr index
+            let ambe_fr = byte_idx * 8 + (7 - usize::from(bit_lsb));
+            let pre = inverse.get(ambe_fr).copied().unwrap_or(u8::MAX);
+            *local.entry(field_of(pre)).or_insert(0) += 1;
+        }
+    }
+    local
+}
+
 /// Field-level diagnostic: traces every wrong bit back through the
 /// DSD interleaver to its pre-interleave AMBE codeword position, then
 /// categorizes by the field it belongs to (Golay #0 data/parity, Golay
@@ -1005,7 +1054,7 @@ const fn field_of(pre: u8) -> &'static str {
 /// rust_encoder_field_breakdown`.
 #[test]
 #[ignore = "diagnostic; categorizes Hamming errors by AMBE field"]
-fn rust_encoder_field_breakdown() {
+fn rust_encoder_field_breakdown() -> TestResult {
     // DSD INVERSE table: INVERSE[ambe_fr_index] = pre-interleave input bit.
     // Built once at startup from the FORWARD table that lives in the
     // private encode::interleave module — duplicated literally here so
@@ -1018,7 +1067,10 @@ fn rust_encoder_field_breakdown() {
     ];
     let mut inverse = [0_u8; 72];
     for (input_bit, &target) in FORWARD.iter().enumerate() {
-        inverse[target as usize] = u8::try_from(input_bit).expect("input_bit < 72");
+        let slot = inverse
+            .get_mut(target as usize)
+            .ok_or("FORWARD entries are < 72")?;
+        *slot = u8::try_from(input_bit)?;
     }
 
     let mut counters: HashMap<&'static str, u32> = HashMap::new();
@@ -1033,35 +1085,18 @@ fn rust_encoder_field_breakdown() {
         }
         let half = frames.len() / 2;
         let mut counts: HashMap<[u8; FRAME_LEN], usize> = HashMap::new();
-        for &f in &frames[half..] {
+        for &f in frames.split_at(half).1 {
             *counts.entry(mask(f)).or_insert(0) += 1;
         }
-        let (rust_dominant, _) = counts
-            .iter()
-            .max_by_key(|&(_, &n)| n)
-            .expect("non-empty encoder output");
+        let Some((rust_dominant, _)) = counts.iter().max_by_key(|&(_, &n)| n) else {
+            continue;
+        };
 
         // For each post-interleave bit position, if it's wrong AND in the
         // stable mask, attribute it to the source field.
-        let mut local: HashMap<&'static str, u32> = HashMap::new();
-        for byte_idx in 0..FRAME_LEN {
-            let xor_byte = rust_dominant[byte_idx] ^ anchor.frame[byte_idx];
-            for bit_lsb in 0_u8..8 {
-                let bit_mask = 1 << bit_lsb;
-                if xor_byte & bit_mask == 0 {
-                    continue;
-                }
-                // Skip volatile bits (already not in the stable comparison).
-                if VOLATILE_BIT_MASK[byte_idx] & bit_mask != 0 {
-                    continue;
-                }
-                // MSB-first within byte → ambe_fr index
-                let ambe_fr = byte_idx * 8 + (7 - usize::from(bit_lsb));
-                let pre = inverse[ambe_fr];
-                let field = field_of(pre);
-                *counters.entry(field).or_insert(0) += 1;
-                *local.entry(field).or_insert(0) += 1;
-            }
+        let local = attribute_wrong_bits(rust_dominant, &anchor.frame, &inverse);
+        for (&field, &n) in &local {
+            *counters.entry(field).or_insert(0) += n;
         }
         per_anchor.push((anchor.frequency_hz, local));
     }
@@ -1117,6 +1152,7 @@ fn rust_encoder_field_breakdown() {
     println!(
         "    spectral   : pre-interleave bits 47-71  (b3-b8 spectral magnitudes, unprotected)"
     );
+    Ok(())
 }
 
 fn hex9(frame: &[u8; FRAME_LEN]) -> String {
@@ -1127,7 +1163,7 @@ fn hex9(frame: &[u8; FRAME_LEN]) -> String {
     s
 }
 
-fn rust_encoder_matches_one_anchor(anchor: &PitchAnchor) {
+fn rust_encoder_matches_one_anchor(anchor: &PitchAnchor) -> TestResult {
     // ~3 seconds of audio = 150 frames @ 50 frame/s. Anchor lock
     // typically occurs around frame 50 (encoder transient is ~50
     // frames). Take the dominant masked frame from the 2nd half.
@@ -1141,13 +1177,13 @@ fn rust_encoder_matches_one_anchor(anchor: &PitchAnchor) {
 
     let half = frames.len() / 2;
     let mut counts: HashMap<[u8; FRAME_LEN], usize> = HashMap::new();
-    for &f in &frames[half..] {
+    for &f in frames.split_at(half).1 {
         *counts.entry(mask(f)).or_insert(0) += 1;
     }
     let (rust_dominant, rust_count) = counts
         .iter()
         .max_by_key(|&(_, &n)| n)
-        .expect("non-empty encoder output");
+        .ok_or("non-empty encoder output")?;
 
     let dist = hamming_distance(*rust_dominant, anchor.frame);
     assert_eq!(
@@ -1162,4 +1198,5 @@ fn rust_encoder_matches_one_anchor(anchor: &PitchAnchor) {
         rust_count,
         frames.len() - half
     );
+    Ok(())
 }

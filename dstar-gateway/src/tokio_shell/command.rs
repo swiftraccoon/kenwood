@@ -55,7 +55,11 @@ mod tests {
     use super::*;
     use dstar_gateway_core::types::StreamId;
 
-    #[expect(clippy::unwrap_used, reason = "const-validated: 0x1234 is non-zero")]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test helper: every call site passes a non-zero literal, so the \
+                  unwrap cannot fire; a zero would panic only this test, at runtime"
+    )]
     const fn sid(n: u16) -> StreamId {
         StreamId::new(n).unwrap()
     }

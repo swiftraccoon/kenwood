@@ -1,5 +1,12 @@
 //! Build script — compiles the macOS `IOBluetooth` RFCOMM wrapper.
 
+// `cc` is only exercised on macOS (see the `cfg` block below). On every other
+// target the build script is a no-op, so the `cc` build-dependency would trip
+// `unused_crate_dependencies`. Mark it used with an anonymous import there; on
+// macOS `cc::Build` itself satisfies the lint, so the import is cfg'd out.
+#[cfg(not(target_os = "macos"))]
+use cc as _;
+
 fn main() {
     #[cfg(target_os = "macos")]
     {

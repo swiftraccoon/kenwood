@@ -228,7 +228,10 @@ mod tests {
             ScanType::CallScan,
         ];
         for t in types {
-            let _ = format!("{t:?}");
+            assert!(
+                !format!("{t:?}").is_empty(),
+                "Debug output for {t:?} must be non-empty"
+            );
         }
     }
 }

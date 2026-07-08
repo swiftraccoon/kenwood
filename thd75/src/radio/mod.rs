@@ -232,11 +232,13 @@ impl<T: Transport> Radio<T> {
 
         // Drain any buffered responses from the mode exit commands.
         let mut drain_buf = [0u8; 4096];
-        let _ = tokio::time::timeout(
-            Duration::from_millis(500),
-            radio.transport.read(&mut drain_buf),
-        )
-        .await;
+        drop(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                radio.transport.read(&mut drain_buf),
+            )
+            .await,
+        );
 
         Ok(radio)
     }
@@ -439,7 +441,7 @@ impl<T: Transport> Radio<T> {
                                 got = frame_mnemonic,
                                 "unsolicited AI notification"
                             );
-                            let _ = self.notifications.send(unsolicited);
+                            drop(self.notifications.send(unsolicited));
                         }
                         Err(e) => {
                             tracing::debug!(
@@ -468,7 +470,7 @@ impl<T: Transport> Radio<T> {
                         got_band = ?resp_band,
                         "band-mismatched push routed as unsolicited"
                     );
-                    let _ = self.notifications.send(response);
+                    drop(self.notifications.send(response));
                     continue;
                 }
 
@@ -505,7 +507,7 @@ impl<T: Transport> Radio<T> {
                         frame = ?String::from_utf8_lossy(&frame).trim(),
                         "rerouting stale response received after a timeout"
                     );
-                    let _ = self.notifications.send(stale);
+                    drop(self.notifications.send(stale));
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "dropping stale unparseable frame");

@@ -35,12 +35,16 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
 
             frame.render_widget(block, list_area);
 
-            let gauge = Gauge::default()
-                .block(Block::default().title(format!(" {label} ")))
-                .gauge_style(Style::default().fg(Color::Cyan))
-                .ratio(pct)
-                .label(format!("{}/{} ({:.0}%)", page, total, pct * 100.0));
-            frame.render_widget(gauge, inner[0]);
+            // `Layout::split` returns exactly one `Rect` per
+            // constraint; the guard covers the impossible shape.
+            if let [gauge_area, _] = *inner {
+                let gauge = Gauge::default()
+                    .block(Block::default().title(format!(" {label} ")))
+                    .gauge_style(Style::default().fg(Color::Cyan))
+                    .ratio(pct)
+                    .label(format!("{}/{} ({:.0}%)", page, total, pct * 100.0));
+                frame.render_widget(gauge, gauge_area);
+            }
         }
         McpState::Loaded { modified, .. } => {
             let status = if *modified { " (modified)" } else { "" };

@@ -1,13 +1,3 @@
-#![expect(
-    clippy::too_many_lines,
-    reason = "Settings pane render functions walk the CAT / MCP settings tables and \
-              build a list widget row-by-row, where each row's rendering depends on the \
-              setting's type (bool, enum, numeric, etc.). Splitting per-setting-type \
-              would require threading a `row_idx`+`setting` context through multiple \
-              helpers for no reader benefit; the inline match stays aligned with the \
-              settings-table order."
-)]
-
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -56,6 +46,14 @@ pub(crate) fn render_mcp(app: &App, frame: &mut Frame<'_>, list_area: Rect, deta
     );
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Walks the CAT/MCP settings table and builds the list widget row-by-row, \
+              where each row's rendering depends on the setting's type. Splitting \
+              per-setting-type would thread a row+setting context through multiple \
+              helpers for no reader benefit; the inline match stays aligned with the \
+              settings-table order."
+)]
 fn render_settings_list(
     app: &App,
     frame: &mut Frame<'_>,
@@ -257,6 +255,12 @@ fn render_settings_list(
 }
 
 /// Get the display value and color for a settings row.
+#[expect(
+    clippy::too_many_lines,
+    reason = "One match arm per settings-table row: each arm formats a different radio \
+              parameter type. The flat match mirrors the settings-table order; splitting \
+              per-type adds indirection without reducing real complexity."
+)]
 fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
     match row {
         // --- RX (live CAT for squelch, MCP for filters) ---

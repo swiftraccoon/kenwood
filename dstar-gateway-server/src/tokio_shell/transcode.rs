@@ -231,12 +231,6 @@ fn transcode_dcs(
 
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::indexing_slicing,
-        reason = "Tests build fixed-size voice frames and assert per-byte invariants \
-                  via direct indexing; bounds are obvious by construction."
-    )]
-
     use super::*;
     use dstar_gateway_core::types::{Callsign, Suffix};
 
@@ -284,7 +278,7 @@ mod tests {
         let mut reference = [0u8; 128];
         let m = dplus::encode_voice_header(&mut reference, sid(), &header)?;
         assert_eq!(m, n);
-        assert_eq!(&out[..n], &reference[..m]);
+        assert_eq!(out.get(..n), reference.get(..m));
         Ok(())
     }
 
@@ -315,11 +309,11 @@ mod tests {
         let n = transcode_voice(ProtocolKind::DExtra, &event, None, &mut out)?;
         assert_eq!(n, 27, "DExtra voice data is 27 bytes");
         // AMBE bytes live at [15..24] in DExtra voice data.
-        assert_eq!(&out[15..24], &frame.ambe);
+        assert_eq!(out.get(15..24), Some(frame.ambe.as_slice()));
         // Slow data at [24..27].
-        assert_eq!(&out[24..27], &frame.slow_data);
+        assert_eq!(out.get(24..27), Some(frame.slow_data.as_slice()));
         // Seq at [14].
-        assert_eq!(out[14], 5);
+        assert_eq!(out.get(14), Some(&5));
         Ok(())
     }
 
@@ -335,9 +329,9 @@ mod tests {
         let n = transcode_voice(ProtocolKind::DExtra, &event, None, &mut out)?;
         assert_eq!(n, 27);
         // Stream id at [12..14] little-endian.
-        assert_eq!(out[12], 0xFE);
-        assert_eq!(out[13], 0xCA);
-        assert_eq!(out[14], 7);
+        assert_eq!(out.get(12), Some(&0xFE));
+        assert_eq!(out.get(13), Some(&0xCA));
+        assert_eq!(out.get(14), Some(&7));
         Ok(())
     }
 
@@ -354,16 +348,16 @@ mod tests {
         let n = transcode_voice(ProtocolKind::Dcs, &event, Some(&header), &mut out)?;
         assert_eq!(n, 100, "DCS voice is 100 bytes");
         // Magic at [0..4].
-        assert_eq!(&out[..4], b"0001");
+        assert_eq!(out.get(..4), Some(b"0001".as_slice()));
         // MY callsign at [31..39].
-        assert_eq!(&out[31..39], header.my_call.as_bytes());
+        assert_eq!(out.get(31..39), Some(header.my_call.as_bytes().as_slice()));
         // Stream id at [43..45] little-endian.
-        assert_eq!(out[43], 0xFE);
-        assert_eq!(out[44], 0xCA);
+        assert_eq!(out.get(43), Some(&0xFE));
+        assert_eq!(out.get(44), Some(&0xCA));
         // Seq at [45].
-        assert_eq!(out[45], 4);
+        assert_eq!(out.get(45), Some(&4));
         // AMBE at [46..55].
-        assert_eq!(&out[46..55], &frame.ambe);
+        assert_eq!(out.get(46..55), Some(frame.ambe.as_slice()));
         Ok(())
     }
 
@@ -376,7 +370,11 @@ mod tests {
         let mut out = [0u8; 128];
         let n = transcode_voice(ProtocolKind::DExtra, &event, None, &mut out)?;
         assert_eq!(n, 27);
-        assert_eq!(out[14] & 0x40, 0x40, "EOT bit set on seq byte");
+        assert_eq!(
+            out.get(14).map(|b| b & 0x40),
+            Some(0x40),
+            "EOT bit set on seq byte"
+        );
         Ok(())
     }
 

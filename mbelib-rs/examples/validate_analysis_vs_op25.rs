@@ -21,20 +21,13 @@
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    clippy::cast_lossless,
     clippy::uninlined_format_args,
     clippy::too_many_lines,
-    clippy::indexing_slicing,
-    clippy::expect_used,
-    dead_code,
-    unused_results,
     missing_docs,
-    reason = "Stages 1-4 analysis A/B harness (PCM + OP25 trace -> metrics). Validation \
-              scratchwork, not library code. Prints diagnostics, allows panics on \
-              malformed fixtures (`.expect()` on trace parse, indexing into fixed-size \
-              PCM/FFT arrays). DSP casts are unavoidable in spectral/pitch analysis. \
-              Any bounds violation would surface during fixture load and correctly abort \
-              the example."
+    reason = "Stages 1-4 analysis A/B harness (PCM + OP25 trace -> metrics): a \
+              diagnostic CLI that prints its comparison tables to stdout/stderr; the \
+              summary math casts frame counts and harmonic deltas for display only. \
+              Docs are skipped since the tool is an internal validation harness."
 )]
 
 // Dev-dependencies pulled in by sibling tests/examples. Acknowledge them here so
@@ -50,30 +43,23 @@ use std::io::{BufRead, BufReader, Read};
 
 #[derive(Debug, Clone, Default)]
 struct Op25Frame {
-    index: usize,
     ref_pitch_q88: u16,
     num_harms: usize,
-    sa: Vec<i32>,
     v_uv_dsn: Vec<bool>,
-    b0: i32,
 }
 
-fn parse_trace(path: &str) -> Vec<Op25Frame> {
-    let file = std::fs::File::open(path).expect("open trace file");
+fn parse_trace(path: &str) -> Result<Vec<Op25Frame>, std::io::Error> {
+    let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut frames: Vec<Op25Frame> = Vec::new();
     let mut cur: Option<Op25Frame> = None;
     for line in reader.lines().map_while(Result::ok) {
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("FRAME ") {
+        if trimmed.strip_prefix("FRAME ").is_some() {
             if let Some(f) = cur.take() {
                 frames.push(f);
             }
-            let idx: usize = rest.trim().parse().unwrap_or(0);
-            cur = Some(Op25Frame {
-                index: idx,
-                ..Default::default()
-            });
+            cur = Some(Op25Frame::default());
         } else if let Some(f) = cur.as_mut() {
             if let Some(rest) = trimmed.strip_prefix("ref_pitch = ") {
                 let parts: Vec<&str> = rest.split_whitespace().collect();
@@ -83,44 +69,34 @@ fn parse_trace(path: &str) -> Vec<Op25Frame> {
                         f.num_harms = parts.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(0);
                     }
                 }
-            } else if let Some(rest) = trimmed.strip_prefix("sa[] = ") {
-                f.sa = rest
-                    .split_whitespace()
-                    .filter_map(|s| s.parse().ok())
-                    .collect();
             } else if let Some(rest) = trimmed.strip_prefix("v_uv_dsn[] = ") {
                 f.v_uv_dsn = rest
                     .split_whitespace()
                     .map(|s| s.parse::<i32>().unwrap_or(0) != 0)
                     .collect();
-            } else if let Some(rest) = trimmed.strip_prefix("b0..b8 = ") {
-                let parts: Vec<i32> = rest
-                    .split_whitespace()
-                    .take(9)
-                    .filter_map(|s| s.parse().ok())
-                    .collect();
-                if let Some(&v) = parts.first() {
-                    f.b0 = v;
-                }
             }
         }
     }
     if let Some(f) = cur {
         frames.push(f);
     }
-    frames
+    Ok(frames)
 }
 
-fn load_pcm(path: &str) -> Vec<f32> {
-    let mut file = std::fs::File::open(path).expect("open PCM");
+fn load_pcm(path: &str) -> Result<Vec<f32>, std::io::Error> {
+    let mut file = std::fs::File::open(path)?;
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).expect("read");
-    buf.chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
-        .collect()
+    let _len = file.read_to_end(&mut buf)?;
+    Ok(buf
+        .chunks_exact(2)
+        .filter_map(|b| match *b {
+            [lo, hi] => Some(f32::from(i16::from_le_bytes([lo, hi])) / 32768.0),
+            _ => None,
+        })
+        .collect())
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let (Some(pcm_path), Some(trace_path)) = (args.get(1), args.get(2)) else {
         eprintln!(
@@ -130,8 +106,8 @@ fn main() {
         std::process::exit(2);
     };
 
-    let pcm = load_pcm(pcm_path);
-    let op25 = parse_trace(trace_path);
+    let pcm = load_pcm(pcm_path)?;
+    let op25 = parse_trace(trace_path)?;
     println!(
         "PCM: {} samples ({:.1}s), OP25 trace: {} frames",
         pcm.len(),
@@ -165,8 +141,10 @@ fn main() {
         let (vuv, amps) = detect_vuv_and_sa(&fft_out, f0_bin, &mut vuv_state, e_p);
         let our_l = amps.num_harmonics;
 
-        let op25_f = &op25[frame_idx];
-        let op25_period = op25_f.ref_pitch_q88 as f32 / 256.0;
+        let Some(op25_f) = op25.get(frame_idx) else {
+            break;
+        };
+        let op25_period = f32::from(op25_f.ref_pitch_q88) / 256.0;
         let period_diff = pitch.period_samples - op25_period;
         let l_diff = our_l as i32 - op25_f.num_harms as i32;
         pitch_period_diffs.push(period_diff);
@@ -213,7 +191,7 @@ fn main() {
         .iter()
         .map(|x| x.abs())
         .fold(0.0_f32, f32::max);
-    let mean_l_diff = l_diffs.iter().sum::<i32>() as f64 / l_diffs.len().max(1) as f64;
+    let mean_l_diff = f64::from(l_diffs.iter().sum::<i32>()) / l_diffs.len().max(1) as f64;
     let l_match = l_diffs.iter().filter(|&&d| d == 0).count();
     let pitch_close = pitch_period_diffs
         .iter()
@@ -239,4 +217,5 @@ fn main() {
         100.0 * l_match as f64 / l_diffs.len().max(1) as f64,
         mean_l_diff
     );
+    Ok(())
 }

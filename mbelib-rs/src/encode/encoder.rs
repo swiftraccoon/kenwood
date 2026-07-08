@@ -23,14 +23,6 @@
 //! follows mbelib's decoder convention (the DVSI implementation).
 //!
 //! Stages 1..4 (analysis: pitch / `num_harms` / V/UV / sa from FFT)
-#![expect(
-    clippy::indexing_slicing,
-    reason = "Top-level encoder: orchestrates fixed-size IMBE arrays (9-byte ambe_fr, \
-              49-bit ambe_d, FRAME_LEN=160 PCM samples) through the analysis → \
-              quantize → pack pipeline. Indices are bounded by IMBE-spec constants \
-              known at compile time; `.get()?` chains would add unwrap noise on every \
-              array access inside the per-stage driver functions."
-)]
 //! still diverge from OP25 during pitch transitions. The pitch
 //! tracker ports OP25's exact E(p) detectability function plus
 //! look-back tracking (`pitch_est.cc:200–226`) and sub-multiples
@@ -270,33 +262,20 @@ impl AmbeEncoder {
         analyze_frame(pcm, &mut self.bufs, &mut self.plan, &mut self.fft_out);
         let e_p_current = compute_e_p(&self.bufs.pitch_est_buf);
 
-        if self.pending.is_none() {
+        // Look-ahead path: buffer the e_p array + a copy of the FFT
+        // spectrum, then emit bytes only once we have 3 frames. The
+        // `let-else` binds the pending queue directly, so there is no
+        // separate is-Some check to fall out of sync with.
+        let Some(pending) = self.pending.as_mut() else {
             // Zero-latency path: commit pitch for the just-received
             // frame via single-frame look-back + sub-multiples.
             let pitch = self.pitch.estimate(&self.bufs.pitch_est_buf);
             return self.quantize_and_pack(pitch);
-        }
-
-        // Look-ahead path: buffer the e_p array + a copy of the FFT
-        // spectrum, then emit bytes only once we have 3 frames.
+        };
         let slot = FrameSlot {
             e_p: e_p_current,
             fft_out: self.fft_out.clone(),
         };
-        // Construction invariant: `self.pending.is_some()` here
-        // because we returned early above when it was None.
-        #[expect(
-            clippy::expect_used,
-            reason = "Early return above guarantees `self.pending.is_some()` at this point \
-                      (see # Panics section in the method docs). The `.expect()` documents \
-                      the invariant at the use site so a future refactor that drops the \
-                      early return will trigger it immediately in tests rather than \
-                      silently producing None."
-        )]
-        let pending = self
-            .pending
-            .as_mut()
-            .expect("checked Some above; see # Panics");
         if pending.len() < 2 {
             pending.push(slot);
             // Pipeline not full yet — emit silence and keep the
@@ -309,9 +288,12 @@ impl AmbeEncoder {
         // Three frames now on hand: pending[0]=N-2, pending[1]=N-1,
         // slot=N. Run the DP against pending[0]'s e_p, using the
         // next two as lookahead.
-        let pitch = self
-            .pitch
-            .estimate_with_lookahead(&pending[0].e_p, &pending[1].e_p, &slot.e_p);
+        let pitch = if let [n_minus_2, n_minus_1, ..] = pending.as_slice() {
+            self.pitch
+                .estimate_with_lookahead(&n_minus_2.e_p, &n_minus_1.e_p, &slot.e_p)
+        } else {
+            unreachable!("pending holds two slots after the `< 2` early return above")
+        };
         // Swap out the oldest slot so we can take ownership of its
         // FFT output without cloning; push the newly-arrived slot.
         let oldest = pending.remove(0);

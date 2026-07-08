@@ -654,9 +654,8 @@ mod tests {
     use kenwood_thd75::types::Band;
 
     fn assert_lint(s: &str) {
-        lint::check_output(s).unwrap_or_else(|v| {
-            panic!("line {s:?} failed lint: {v:?}");
-        });
+        let result = lint::check_output(s);
+        assert!(result.is_ok(), "line {s:?} failed lint: {result:?}");
     }
 
     #[test]
@@ -1142,7 +1141,8 @@ mod tests {
         #[test]
         fn frequency_always_lints(hz in 0u32..=1_300_000_000u32) {
             let s = frequency(Band::A, hz);
-            lint::check_line(&s).unwrap_or_else(|v| panic!("{s:?}: {v:?}"));
+            let lint_result = lint::check_line(&s);
+            proptest::prop_assert!(lint_result.is_ok(), "{s:?}: {lint_result:?}");
             proptest::prop_assert!(s.chars().count() <= 80);
         }
     }

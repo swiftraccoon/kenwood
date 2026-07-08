@@ -772,8 +772,8 @@ impl Default for BandState {
         Self {
             frequency: Frequency::new(145_000_000),
             mode: Mode::Fm,
-            s_meter: SMeterReading::new(0).unwrap(),
-            squelch: SquelchLevel::new(0).unwrap(),
+            s_meter: SMeterReading::ZERO,
+            squelch: SquelchLevel::OPEN,
             power_level: PowerLevel::High,
             busy: false,
             attenuator: false,
@@ -852,8 +852,8 @@ impl Default for RadioState {
             dual_band: false,
             bluetooth: false,
             vox: false,
-            vox_gain: VoxGain::new(0).unwrap(),
-            vox_delay: VoxDelay::new(0).unwrap(),
+            vox_gain: VoxGain::ZERO,
+            vox_delay: VoxDelay::ZERO,
             af_gain: AfGainLevel::new(0),
             firmware_version: String::new(),
             radio_type: String::new(),
@@ -907,15 +907,6 @@ pub(crate) struct AprsMessageStatus {
     pub text: String,
     /// Message ID from the messenger.
     pub message_id: String,
-    /// When the message was sent.
-    #[expect(
-        dead_code,
-        reason = "`sent_at` is populated at construction time so an upcoming \"pending \
-                  messages timeout\" UI view can age entries out of the list. It's not yet \
-                  read anywhere because that UI hasn't landed; keeping the field means the \
-                  constructor callers don't need to change when the feature ships."
-    )]
-    pub sent_at: Instant,
     /// Delivery state.
     pub state: AprsMessageState,
 }
@@ -1276,7 +1267,9 @@ impl App {
                 // was just written via MCP, so the TUI stays in sync without
                 // requiring a full re-read after reconnect.
                 if let McpState::Loaded { ref mut image, .. } = self.mcp {
-                    image.as_raw_mut()[offset as usize] = value;
+                    if let Some(byte) = image.as_raw_mut().get_mut(offset as usize) {
+                        *byte = value;
+                    }
                     save_cache(image.as_raw());
                 }
                 true
@@ -1313,7 +1306,6 @@ impl App {
                     addressee,
                     text,
                     message_id,
-                    sent_at: Instant::now(),
                     state: AprsMessageState::Pending,
                 });
                 true
@@ -1407,7 +1399,7 @@ impl App {
                         && let Some(ref tx) = self.cmd_tx
                     {
                         let addressee = station.callsign.clone();
-                        let _ = tx.send(crate::event::RadioCommand::SendAprsMessage {
+                        let _send = tx.send(crate::event::RadioCommand::SendAprsMessage {
                             addressee: addressee.clone(),
                             text: text.clone(),
                         });
@@ -1437,7 +1429,7 @@ impl App {
                     if !input.is_empty()
                         && let Some(ref tx) = self.cmd_tx
                     {
-                        let _ = tx.send(crate::event::RadioCommand::SetUrcall {
+                        let _send = tx.send(crate::event::RadioCommand::SetUrcall {
                             callsign: input.clone(),
                             suffix: String::new(),
                         });
@@ -1468,8 +1460,11 @@ impl App {
                     self.dstar_reflector_input = None;
                     // Parse "REF030 C" or "REF030C"
                     let parts: Vec<&str> = input.split_whitespace().collect();
-                    let (name, module) = if parts.len() >= 2 {
-                        (parts[0].to_string(), parts[1].chars().next().unwrap_or('A'))
+                    let (name, module) = if let [name_part, module_part, ..] = parts.as_slice() {
+                        (
+                            (*name_part).to_string(),
+                            module_part.chars().next().unwrap_or('A'),
+                        )
                     } else if input.len() > 1 {
                         let module = input.chars().last().unwrap_or('A');
                         let name = &input[..input.len() - 1];
@@ -1479,7 +1474,7 @@ impl App {
                         return true;
                     };
                     if let Some(ref tx) = self.cmd_tx {
-                        let _ = tx.send(crate::event::RadioCommand::ConnectReflector {
+                        let _send = tx.send(crate::event::RadioCommand::ConnectReflector {
                             name: name.clone(),
                             module,
                         });
@@ -1540,20 +1535,25 @@ impl App {
                     self.input_mode = InputMode::Normal;
                 }
                 KeyCode::Enter => {
-                    // Parse as MHz (e.g. "145.19" -> 145_190_000 Hz)
-                    if let Ok(mhz) = buf.parse::<f64>() {
+                    // Parse as MHz (e.g. "145.19" -> 145_190_000 Hz).
+                    // `parse::<f64>` accepts negatives, NaN, and infinity;
+                    // an unguarded `as u32` would silently saturate those,
+                    // so reject anything outside the D75 tuning range
+                    // (~0.1..=1300 MHz) before casting.
+                    if let Ok(mhz) = buf.parse::<f64>()
+                        && mhz.is_finite()
+                        && (0.0..=1300.0).contains(&mhz)
+                    {
                         #[expect(
                             clippy::cast_possible_truncation,
                             clippy::cast_sign_loss,
-                            reason = "User-entered MHz value (bounded by D75 tuning range \
-                                      ~30..=1300 MHz per hardware spec) multiplied by 1e6 \
-                                      fits easily in u32. The lint fires because clippy \
-                                      can't prove the f64 range from the local `parse::<f64>()`; \
-                                      a pre-validated input makes the `as u32` cast safe."
+                            reason = "The guard above rejects non-finite, negative, and \
+                                      > 1300 MHz inputs, so `mhz * 1e6` is within 0..=1.3e9 \
+                                      and the `as u32` cast cannot saturate or lose sign."
                         )]
                         let hz = (mhz * 1_000_000.0) as u32;
                         if let Some(ref tx) = self.cmd_tx {
-                            let _ = tx.send(crate::event::RadioCommand::TuneFreq {
+                            let _send = tx.send(crate::event::RadioCommand::TuneFreq {
                                 band: self.target_band,
                                 freq: hz,
                             });
@@ -1784,14 +1784,14 @@ impl App {
                     },
                     Pane::BandA => {
                         if let Some(ref tx) = self.cmd_tx {
-                            let _ = tx.send(crate::event::RadioCommand::FreqDown(
+                            let _send = tx.send(crate::event::RadioCommand::FreqDown(
                                 kenwood_thd75::types::Band::A,
                             ));
                         }
                     }
                     Pane::BandB => {
                         if let Some(ref tx) = self.cmd_tx {
-                            let _ = tx.send(crate::event::RadioCommand::FreqDown(
+                            let _send = tx.send(crate::event::RadioCommand::FreqDown(
                                 kenwood_thd75::types::Band::B,
                             ));
                         }
@@ -1823,14 +1823,14 @@ impl App {
                     },
                     Pane::BandA => {
                         if let Some(ref tx) = self.cmd_tx {
-                            let _ = tx.send(crate::event::RadioCommand::FreqUp(
+                            let _send = tx.send(crate::event::RadioCommand::FreqUp(
                                 kenwood_thd75::types::Band::A,
                             ));
                         }
                     }
                     Pane::BandB => {
                         if let Some(ref tx) = self.cmd_tx {
-                            let _ = tx.send(crate::event::RadioCommand::FreqUp(
+                            let _send = tx.send(crate::event::RadioCommand::FreqUp(
                                 kenwood_thd75::types::Band::B,
                             ));
                         }
@@ -1849,7 +1849,7 @@ impl App {
                     } else {
                         "A"
                     };
-                    let _ = tx.send(crate::event::RadioCommand::TuneChannel {
+                    let _send = tx.send(crate::event::RadioCommand::TuneChannel {
                         band: self.target_band,
                         channel: ch_num,
                     });
@@ -1907,7 +1907,7 @@ impl App {
                     PowerLevel::ExtraLow => PowerLevel::High,
                 };
                 if let Some(ref tx) = self.cmd_tx {
-                    let _ = tx.send(crate::event::RadioCommand::SetPower { band, level: next });
+                    let _send = tx.send(crate::event::RadioCommand::SetPower { band, level: next });
                 }
                 true
             }
@@ -1919,7 +1919,7 @@ impl App {
                     (kenwood_thd75::types::Band::B, self.state.band_b.attenuator)
                 };
                 if let Some(ref tx) = self.cmd_tx {
-                    let _ = tx.send(crate::event::RadioCommand::SetAttenuator {
+                    let _send = tx.send(crate::event::RadioCommand::SetAttenuator {
                         band,
                         enabled: !cur,
                     });
@@ -1942,7 +1942,7 @@ impl App {
                 };
                 let next = cur.saturating_sub(1);
                 if let (Some(tx), Ok(level)) = (&self.cmd_tx, SquelchLevel::new(next)) {
-                    let _ = tx.send(crate::event::RadioCommand::SetSquelch { band, level });
+                    let _send = tx.send(crate::event::RadioCommand::SetSquelch { band, level });
                     self.status_message = Some(format!("Squelch → {next}"));
                 }
                 true
@@ -1961,7 +1961,7 @@ impl App {
                 };
                 let next = cur.saturating_add(1).min(6);
                 if let (Some(tx), Ok(level)) = (&self.cmd_tx, SquelchLevel::new(next)) {
-                    let _ = tx.send(crate::event::RadioCommand::SetSquelch { band, level });
+                    let _send = tx.send(crate::event::RadioCommand::SetSquelch { band, level });
                     self.status_message = Some(format!("Squelch → {next}"));
                 }
                 true
@@ -1997,7 +1997,7 @@ impl App {
             {
                 if let Some(ref tx) = self.cmd_tx {
                     // Use 0,0 as placeholder — real GPS position would come from the radio.
-                    let _ = tx.send(crate::event::RadioCommand::BeaconPosition {
+                    let _send = tx.send(crate::event::RadioCommand::BeaconPosition {
                         lat: 0.0,
                         lon: 0.0,
                         comment: String::new(),
@@ -2014,7 +2014,7 @@ impl App {
                     };
                     self.status_message = Some("Starting MCP read...".into());
                     if let Some(ref tx) = self.cmd_tx {
-                        let _ = tx.send(crate::event::RadioCommand::ReadMemory);
+                        let _send = tx.send(crate::event::RadioCommand::ReadMemory);
                     }
                 }
                 true
@@ -2028,7 +2028,7 @@ impl App {
                     };
                     self.status_message = Some("Starting MCP write...".into());
                     if let Some(ref tx) = self.cmd_tx {
-                        let _ = tx.send(crate::event::RadioCommand::WriteMemory(data));
+                        let _send = tx.send(crate::event::RadioCommand::WriteMemory(data));
                     }
                 }
                 true
@@ -2040,7 +2040,7 @@ impl App {
                     && self.dstar_mode == DStarMode::Inactive =>
             {
                 if let Some(ref tx) = self.cmd_tx {
-                    let _ = tx.send(crate::event::RadioCommand::SetCQ);
+                    let _send = tx.send(crate::event::RadioCommand::SetCQ);
                     self.status_message = Some("URCALL set to CQCQCQ".into());
                 }
                 true
@@ -2070,7 +2070,7 @@ impl App {
                     && self.dstar_mode == DStarMode::Inactive =>
             {
                 if let Some(ref tx) = self.cmd_tx {
-                    let _ = tx.send(crate::event::RadioCommand::DisconnectReflector);
+                    let _send = tx.send(crate::event::RadioCommand::DisconnectReflector);
                     self.status_message = Some("Unlinking reflector...".into());
                 }
                 true
@@ -2104,31 +2104,31 @@ impl App {
             match row {
                 SettingRow::Lock => {
                     let next = !self.state.lock;
-                    let _ = tx.send(crate::event::RadioCommand::SetLock(next));
+                    let _send = tx.send(crate::event::RadioCommand::SetLock(next));
                     self.status_message = Some(format!("Lock → {}", on_off(next)));
                     return;
                 }
                 SettingRow::DualBand => {
                     let next = !self.state.dual_band;
-                    let _ = tx.send(crate::event::RadioCommand::SetDualBand(next));
+                    let _send = tx.send(crate::event::RadioCommand::SetDualBand(next));
                     self.status_message = Some(format!("Dual band → {}", on_off(next)));
                     return;
                 }
                 SettingRow::Bluetooth => {
                     let next = !self.state.bluetooth;
-                    let _ = tx.send(crate::event::RadioCommand::SetBluetooth(next));
+                    let _send = tx.send(crate::event::RadioCommand::SetBluetooth(next));
                     self.status_message = Some(format!("Bluetooth → {}", on_off(next)));
                     return;
                 }
                 SettingRow::VoxEnabled => {
                     let next = !self.state.vox;
-                    let _ = tx.send(crate::event::RadioCommand::SetVox(next));
+                    let _send = tx.send(crate::event::RadioCommand::SetVox(next));
                     self.status_message = Some(format!("VOX → {}", on_off(next)));
                     return;
                 }
                 SettingRow::AttenuatorA => {
                     let next = !self.state.band_a.attenuator;
-                    let _ = tx.send(crate::event::RadioCommand::SetAttenuator {
+                    let _send = tx.send(crate::event::RadioCommand::SetAttenuator {
                         band: kenwood_thd75::types::Band::A,
                         enabled: next,
                     });
@@ -2137,7 +2137,7 @@ impl App {
                 }
                 SettingRow::AttenuatorB => {
                     let next = !self.state.band_b.attenuator;
-                    let _ = tx.send(crate::event::RadioCommand::SetAttenuator {
+                    let _send = tx.send(crate::event::RadioCommand::SetAttenuator {
                         band: kenwood_thd75::types::Band::B,
                         enabled: next,
                     });
@@ -2145,14 +2145,14 @@ impl App {
                     return;
                 }
                 SettingRow::FmRadio => {
-                    let _ = tx.send(crate::event::RadioCommand::SetFmRadio(true));
+                    let _send = tx.send(crate::event::RadioCommand::SetFmRadio(true));
                     self.status_message =
                         Some("FM Radio: enabled (read-back not available)".into());
                     return;
                 }
                 SettingRow::GpsEnabled => {
                     let next = !self.state.gps_enabled;
-                    let _ = tx.send(crate::event::RadioCommand::SetGpsConfig(next, false));
+                    let _send = tx.send(crate::event::RadioCommand::SetGpsConfig(next, false));
                     self.status_message = Some(format!("GPS → {}", on_off(next)));
                     return;
                 }
@@ -2189,7 +2189,7 @@ impl App {
             ($getter:ident, $setter:ident, $label:expr) => {{
                 let new_val = !image.settings().$getter();
                 if let Some((offset, value)) = image.modify_setting(|w| w.$setter(new_val)) {
-                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message =
                         Some(format!("{} → {} — applying...", $label, on_off(new_val)));
                 }
@@ -2279,7 +2279,7 @@ impl App {
                         cur.saturating_sub(1)
                     };
                     if let Ok(level) = SquelchLevel::new(next) {
-                        let _ = tx.send(crate::event::RadioCommand::SetSquelch {
+                        let _send = tx.send(crate::event::RadioCommand::SetSquelch {
                             band: kenwood_thd75::types::Band::A,
                             level,
                         });
@@ -2295,7 +2295,7 @@ impl App {
                         cur.saturating_sub(1)
                     };
                     if let Ok(level) = SquelchLevel::new(next) {
-                        let _ = tx.send(crate::event::RadioCommand::SetSquelch {
+                        let _send = tx.send(crate::event::RadioCommand::SetSquelch {
                             band: kenwood_thd75::types::Band::B,
                             level,
                         });
@@ -2311,7 +2311,7 @@ impl App {
                         cur.saturating_sub(1)
                     };
                     if let Ok(gain) = VoxGain::new(next) {
-                        let _ = tx.send(crate::event::RadioCommand::SetVoxGain(gain));
+                        let _send = tx.send(crate::event::RadioCommand::SetVoxGain(gain));
                     }
                     self.status_message = Some(format!("VOX Gain → {next}"));
                     return;
@@ -2324,7 +2324,7 @@ impl App {
                         cur.saturating_sub(1)
                     };
                     if let Ok(delay) = VoxDelay::new(next) {
-                        let _ = tx.send(crate::event::RadioCommand::SetVoxDelay(delay));
+                        let _send = tx.send(crate::event::RadioCommand::SetVoxDelay(delay));
                     }
                     self.status_message = Some(format!("VOX Delay → {next}"));
                     return;
@@ -2356,8 +2356,10 @@ impl App {
                     } else {
                         cur_idx.saturating_sub(1)
                     };
-                    let next = steps[next_idx];
-                    let _ = tx.send(crate::event::RadioCommand::SetStepSize {
+                    let Some(&next) = steps.get(next_idx) else {
+                        return;
+                    };
+                    let _send = tx.send(crate::event::RadioCommand::SetStepSize {
                         band: kenwood_thd75::types::Band::A,
                         step: next,
                     });
@@ -2391,8 +2393,10 @@ impl App {
                     } else {
                         cur_idx.saturating_sub(1)
                     };
-                    let next = steps[next_idx];
-                    let _ = tx.send(crate::event::RadioCommand::SetStepSize {
+                    let Some(&next) = steps.get(next_idx) else {
+                        return;
+                    };
+                    let _send = tx.send(crate::event::RadioCommand::SetStepSize {
                         band: kenwood_thd75::types::Band::B,
                         step: next,
                     });
@@ -2426,8 +2430,10 @@ impl App {
                     } else {
                         (cur_idx + methods.len() - 1) % methods.len()
                     };
-                    let next = methods[next_idx];
-                    let _ = tx.send(crate::event::RadioCommand::SetScanResumeCat(next));
+                    let Some(&next) = methods.get(next_idx) else {
+                        return;
+                    };
+                    let _send = tx.send(crate::event::RadioCommand::SetScanResumeCat(next));
                     self.state.scan_resume_cat = Some(next);
                     let label = match next {
                         ScanResumeMethod::TimeOperated => "Time",
@@ -2444,7 +2450,7 @@ impl App {
                         PowerLevel::Low => PowerLevel::ExtraLow,
                         PowerLevel::ExtraLow => PowerLevel::High,
                     };
-                    let _ = tx.send(crate::event::RadioCommand::SetPower {
+                    let _send = tx.send(crate::event::RadioCommand::SetPower {
                         band: kenwood_thd75::types::Band::A,
                         level: next,
                     });
@@ -2458,7 +2464,7 @@ impl App {
                         PowerLevel::Low => PowerLevel::ExtraLow,
                         PowerLevel::ExtraLow => PowerLevel::High,
                     };
-                    let _ = tx.send(crate::event::RadioCommand::SetPower {
+                    let _send = tx.send(crate::event::RadioCommand::SetPower {
                         band: kenwood_thd75::types::Band::B,
                         level: next,
                     });
@@ -2479,7 +2485,7 @@ impl App {
                         Mode::Wfm => Mode::CwReverse,
                         Mode::CwReverse => Mode::Fm,
                     };
-                    let _ = tx.send(crate::event::RadioCommand::SetMode {
+                    let _send = tx.send(crate::event::RadioCommand::SetMode {
                         band: kenwood_thd75::types::Band::A,
                         mode: next,
                     });
@@ -2500,7 +2506,7 @@ impl App {
                         Mode::Wfm => Mode::CwReverse,
                         Mode::CwReverse => Mode::Fm,
                     };
-                    let _ = tx.send(crate::event::RadioCommand::SetMode {
+                    let _send = tx.send(crate::event::RadioCommand::SetMode {
                         band: kenwood_thd75::types::Band::B,
                         mode: next,
                     });
@@ -2526,7 +2532,7 @@ impl App {
                     } else {
                         kenwood_thd75::types::TncBaud::Bps1200
                     };
-                    let _ = tx.send(crate::event::RadioCommand::SetTncBaud(baud));
+                    let _send = tx.send(crate::event::RadioCommand::SetTncBaud(baud));
                     self.status_message = Some(format!("TNC Baud → {baud}"));
                     return;
                 }
@@ -2538,7 +2544,7 @@ impl App {
                         cur.saturating_sub(1)
                     };
                     if let Ok(mode) = BeaconMode::try_from(next) {
-                        let _ = tx.send(crate::event::RadioCommand::SetBeaconType(mode));
+                        let _send = tx.send(crate::event::RadioCommand::SetBeaconType(mode));
                         self.status_message = Some(format!("Beacon Type → {mode}"));
                     }
                     return;
@@ -2573,7 +2579,7 @@ impl App {
             ($getter:ident, $setter:ident, $label:expr, $image:expr, $delta:expr, $tx:expr) => {{
                 let new_val = $image.settings().$getter().saturating_add_signed($delta);
                 if let Some((offset, value)) = $image.modify_setting(|w| w.$setter(new_val)) {
-                    let _ = $tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    let _send = $tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message =
                         Some(format!("{} → {} — applying...", $label, new_val));
                 }
@@ -2735,7 +2741,7 @@ impl App {
                 if let Some((offset, value)) =
                     image.modify_setting(|w| w.set_key_lock_type_raw(new_val))
                 {
-                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!("Lock Type → {new_val} — applying..."));
                 }
             }
@@ -2841,7 +2847,7 @@ impl App {
                 };
                 if let Some((offset, value)) = image.modify_setting(|w| w.set_beep_volume(new_val))
                 {
-                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!("Beep Vol → {new_val} — applying..."));
                 }
             }
@@ -2888,7 +2894,7 @@ impl App {
                 if let Some((offset, value)) =
                     image.modify_setting(|w| w.set_speed_distance_unit_raw(new_val))
                 {
-                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
                         "Speed Unit → {} — applying...",
                         ["mph", "km/h", "knots"]
@@ -2910,7 +2916,7 @@ impl App {
                 if let Some((offset, value)) =
                     image.modify_setting(|w| w.set_altitude_rain_unit_raw(new_val))
                 {
-                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
                         "Alt Unit → {} — applying...",
                         if new_val == 0 { "ft/in" } else { "m/mm" }
@@ -2930,7 +2936,7 @@ impl App {
                 if let Some((offset, value)) =
                     image.modify_setting(|w| w.set_temperature_unit_raw(new_val))
                 {
-                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
                         "Temp Unit → {} — applying...",
                         if new_val == 0 { "°F" } else { "°C" }
@@ -2980,7 +2986,7 @@ impl App {
                 if let Some((offset, value)) =
                     image.modify_setting(|w| w.set_auto_power_off_raw(new_val))
                 {
-                    let _ = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
                         "Auto PwrOff → {} — applying...",
                         ["Off", "30m", "60m", "90m", "120m"]
@@ -3004,20 +3010,23 @@ impl App {
             }
             AprsEvent::PositionReceived { source, position } => {
                 // Build a minimal cache entry from position data.
-                let idx = self.aprs_stations.iter().position(|s| s.callsign == source);
-                if let Some(idx) = idx {
-                    let cached = &mut self.aprs_stations[idx];
-                    cached.latitude = Some(position.latitude);
-                    cached.longitude = Some(position.longitude);
-                    cached.speed_knots = position.speed_knots;
-                    cached.course_degrees = position.course_degrees;
-                    cached.symbol_table = Some(position.symbol_table);
-                    cached.symbol_code = Some(position.symbol_code);
-                    if !position.comment.is_empty() {
-                        cached.comment = Some(position.comment);
+                let known = self.aprs_stations.iter().any(|s| s.callsign == source);
+                if known {
+                    if let Some(cached) =
+                        self.aprs_stations.iter_mut().find(|s| s.callsign == source)
+                    {
+                        cached.latitude = Some(position.latitude);
+                        cached.longitude = Some(position.longitude);
+                        cached.speed_knots = position.speed_knots;
+                        cached.course_degrees = position.course_degrees;
+                        cached.symbol_table = Some(position.symbol_table);
+                        cached.symbol_code = Some(position.symbol_code);
+                        if !position.comment.is_empty() {
+                            cached.comment = Some(position.comment);
+                        }
+                        cached.last_heard = Instant::now();
+                        cached.packet_count = cached.packet_count.saturating_add(1);
                     }
-                    cached.last_heard = Instant::now();
-                    cached.packet_count = cached.packet_count.saturating_add(1);
                 } else {
                     self.aprs_stations.push(AprsStationCache {
                         callsign: source,
@@ -3101,7 +3110,9 @@ impl App {
             .iter()
             .position(|s| s.callsign == cached.callsign)
         {
-            self.aprs_stations[idx] = cached;
+            if let Some(slot) = self.aprs_stations.get_mut(idx) {
+                *slot = cached;
+            }
         } else {
             self.aprs_stations.push(cached);
         }
@@ -3143,7 +3154,7 @@ impl App {
                     .iter()
                     .position(|e| e.callsign == entry.callsign)
                 {
-                    let _ = self.dstar_last_heard.remove(idx);
+                    let _removed = self.dstar_last_heard.remove(idx);
                 }
                 self.dstar_last_heard.insert(0, entry);
                 // Limit to 100 entries.
@@ -3161,7 +3172,7 @@ impl App {
     fn toggle_gps(&mut self) {
         let next = !self.state.gps_enabled;
         if let Some(ref tx) = self.cmd_tx {
-            let _ = tx.send(crate::event::RadioCommand::SetGpsConfig(
+            let _send = tx.send(crate::event::RadioCommand::SetGpsConfig(
                 next,
                 self.state.gps_pc_output,
             ));
@@ -3173,7 +3184,7 @@ impl App {
     fn toggle_gps_pc_output(&mut self) {
         let next = !self.state.gps_pc_output;
         if let Some(ref tx) = self.cmd_tx {
-            let _ = tx.send(crate::event::RadioCommand::SetGpsConfig(
+            let _send = tx.send(crate::event::RadioCommand::SetGpsConfig(
                 self.state.gps_enabled,
                 next,
             ));
@@ -3201,13 +3212,13 @@ impl App {
 
                 let config = kenwood_thd75::DStarGatewayConfig::new(&callsign);
                 if let Some(ref tx) = self.cmd_tx {
-                    let _ = tx.send(crate::event::RadioCommand::EnterDStar { config });
+                    let _send = tx.send(crate::event::RadioCommand::EnterDStar { config });
                     self.status_message = Some("Entering D-STAR gateway mode...".into());
                 }
             }
             DStarMode::Active => {
                 if let Some(ref tx) = self.cmd_tx {
-                    let _ = tx.send(crate::event::RadioCommand::ExitDStar);
+                    let _send = tx.send(crate::event::RadioCommand::ExitDStar);
                     self.status_message = Some("Exiting D-STAR gateway mode...".into());
                 }
             }
@@ -3217,7 +3228,7 @@ impl App {
     fn toggle_fm_radio(&mut self) {
         let next = !self.fm_radio_on;
         if let Some(ref tx) = self.cmd_tx {
-            let _ = tx.send(crate::event::RadioCommand::SetFmRadio(next));
+            let _send = tx.send(crate::event::RadioCommand::SetFmRadio(next));
             self.fm_radio_on = next;
             self.status_message = Some(format!(
                 "FM Radio {}",
@@ -3244,20 +3255,24 @@ impl App {
 
         match field {
             ChannelEditField::Frequency => {
-                // Parse as MHz, tune via CAT
-                if let Ok(mhz) = buf.parse::<f64>() {
+                // Parse as MHz, tune via CAT. `parse::<f64>` accepts
+                // negatives, NaN, and infinity; an unguarded `as u32`
+                // would silently saturate those, so reject anything
+                // outside the D75 tuning range before casting.
+                if let Ok(mhz) = buf.parse::<f64>()
+                    && mhz.is_finite()
+                    && (0.0..=1300.0).contains(&mhz)
+                {
                     #[expect(
                         clippy::cast_possible_truncation,
                         clippy::cast_sign_loss,
-                        reason = "User-entered MHz value (bounded by D75 tuning range \
-                                  ~30..=1300 MHz per hardware spec) multiplied by 1e6 \
-                                  fits easily in u32. The lint fires because clippy can't \
-                                  prove the f64 range from the local `parse::<f64>()`; a \
-                                  pre-validated input makes the `as u32` cast safe."
+                        reason = "The guard above rejects non-finite, negative, and \
+                                  > 1300 MHz inputs, so `mhz * 1e6` is within 0..=1.3e9 \
+                                  and the `as u32` cast cannot saturate or lose sign."
                     )]
                     let hz = (mhz * 1_000_000.0) as u32;
                     if let Some(ref tx) = self.cmd_tx {
-                        let _ = tx.send(crate::event::RadioCommand::TuneFreq {
+                        let _send = tx.send(crate::event::RadioCommand::TuneFreq {
                             band: self.target_band,
                             freq: hz,
                         });
@@ -3290,7 +3305,7 @@ impl App {
                         _ => None,
                     };
                     if let Some(mode) = mode {
-                        let _ = tx.send(crate::event::RadioCommand::SetMode {
+                        let _send = tx.send(crate::event::RadioCommand::SetMode {
                             band: self.target_band,
                             mode,
                         });
@@ -3337,13 +3352,13 @@ impl App {
 
                 let config = Box::new(kenwood_thd75::AprsClientConfig::new(&callsign, ssid));
                 if let Some(ref tx) = self.cmd_tx {
-                    let _ = tx.send(crate::event::RadioCommand::EnterAprs { config });
+                    let _send = tx.send(crate::event::RadioCommand::EnterAprs { config });
                     self.status_message = Some("Entering APRS mode...".into());
                 }
             }
             AprsMode::Active => {
                 if let Some(ref tx) = self.cmd_tx {
-                    let _ = tx.send(crate::event::RadioCommand::ExitAprs);
+                    let _send = tx.send(crate::event::RadioCommand::ExitAprs);
                     self.status_message = Some("Exiting APRS mode...".into());
                 }
             }

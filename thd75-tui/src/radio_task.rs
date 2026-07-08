@@ -155,7 +155,7 @@ pub(crate) async fn spawn_with_transport(
         .map(|(region, variant)| format!("{region} v{variant}"))
         .unwrap_or_default();
 
-    let _ = tx.send(Message::RadioUpdate(RadioState {
+    let _send = tx.send(Message::RadioUpdate(RadioState {
         firmware_version,
         radio_type,
         ..RadioState::default()
@@ -168,8 +168,8 @@ pub(crate) async fn spawn_with_transport(
         // from the radio (AI mode) rather than polling. This reduces USB traffic,
         // provides instant updates, and avoids firmware quirks (e.g., spurious
         // SM/BY spikes on Band B when polled directly).
-        let mut s_meter_a = SMeterReading::new(0).unwrap();
-        let mut s_meter_b = SMeterReading::new(0).unwrap();
+        let mut s_meter_a = SMeterReading::ZERO;
+        let mut s_meter_b = SMeterReading::ZERO;
         let mut busy_a = false;
         let mut busy_b = false;
 
@@ -198,18 +198,18 @@ pub(crate) async fn spawn_with_transport(
                             tracing::warn!("AI mode after APRS exit: {e}");
                         }
                         notifications = r.subscribe();
-                        s_meter_a = SMeterReading::new(0).unwrap();
-                        s_meter_b = SMeterReading::new(0).unwrap();
+                        s_meter_a = SMeterReading::ZERO;
+                        s_meter_b = SMeterReading::ZERO;
                         busy_a = false;
                         busy_b = false;
                         radio_opt = Some(r);
-                        let _ = tx.send(Message::AprsStopped);
+                        let _send = tx.send(Message::AprsStopped);
                         continue 'outer;
                     }
                     Err(EnterAprsError::KissExitFailed(msg)) => {
-                        let _ = tx.send(Message::AprsError(msg));
-                        let _ = tx.send(Message::AprsStopped);
-                        let _ = tx.send(Message::Disconnected);
+                        let _send = tx.send(Message::AprsError(msg));
+                        let _send = tx.send(Message::AprsStopped);
+                        let _send = tx.send(Message::Disconnected);
                         // radio_opt is None — fall through to reconnect.
                     }
                 }
@@ -226,18 +226,18 @@ pub(crate) async fn spawn_with_transport(
                             tracing::warn!("AI mode after D-STAR exit: {e}");
                         }
                         notifications = r.subscribe();
-                        s_meter_a = SMeterReading::new(0).unwrap();
-                        s_meter_b = SMeterReading::new(0).unwrap();
+                        s_meter_a = SMeterReading::ZERO;
+                        s_meter_b = SMeterReading::ZERO;
                         busy_a = false;
                         busy_b = false;
                         radio_opt = Some(r);
-                        let _ = tx.send(Message::DStarStopped);
+                        let _send = tx.send(Message::DStarStopped);
                         continue 'outer;
                     }
                     Err(EnterDStarError::MmdvmExitFailed(msg)) => {
-                        let _ = tx.send(Message::DStarError(msg));
-                        let _ = tx.send(Message::DStarStopped);
-                        let _ = tx.send(Message::Disconnected);
+                        let _send = tx.send(Message::DStarError(msg));
+                        let _send = tx.send(Message::DStarStopped);
+                        let _send = tx.send(Message::Disconnected);
                         // radio_opt is None — fall through to reconnect.
                     }
                 }
@@ -256,12 +256,12 @@ pub(crate) async fn spawn_with_transport(
                                     }
                                 }
                                 Err(PollError::Transport(e)) => {
-                                    let _ = tx.send(Message::RadioError(e));
+                                    let _send = tx.send(Message::RadioError(e));
                                     break; // Go to reconnect
                                 }
                                 Err(PollError::Protocol(e)) => {
                                     // Parse errors are non-fatal — skip this poll cycle
-                                    let _ = tx.send(Message::RadioError(e));
+                                    let _send = tx.send(Message::RadioError(e));
                                 }
                             }
                         }
@@ -294,7 +294,7 @@ pub(crate) async fn spawn_with_transport(
                                         }
                                     }
                                 } else {
-                                    let zero = SMeterReading::new(0).unwrap();
+                                    let zero = SMeterReading::ZERO;
                                     match band {
                                         Band::A => { s_meter_a = zero; busy_a = false; }
                                         Band::B => { s_meter_b = zero; busy_b = false; }
@@ -308,48 +308,48 @@ pub(crate) async fn spawn_with_transport(
                                 crate::event::RadioCommand::ReadMemory => {
                                     let tx2 = tx.clone();
                                     let result = radio.read_memory_image_with_progress(move |page, total| {
-                                        let _ = tx2.send(Message::McpProgress { page, total });
+                                        let _send = tx2.send(Message::McpProgress { page, total });
                                     }).await;
                                     match result {
                                         Ok(data) => {
-                                            let _ = tx.send(Message::McpReadComplete(data));
+                                            let _send = tx.send(Message::McpReadComplete(data));
                                         }
                                         Err(e) => {
-                                            let _ = tx.send(Message::McpError(format!("{e}")));
+                                            let _send = tx.send(Message::McpError(format!("{e}")));
                                         }
                                     }
                                     // The TH-D75's USB stack always resets when exiting MCP
                                     // programming mode. The connection is guaranteed to drop.
-                                    let _ = tx.send(Message::Disconnected);
+                                    let _send = tx.send(Message::Disconnected);
                                     break; // Go to reconnect
                                 }
                                 crate::event::RadioCommand::WriteMemory(data) => {
                                     let tx2 = tx.clone();
                                     let result = radio.write_memory_image_with_progress(&data, move |page, total| {
-                                        let _ = tx2.send(Message::McpProgress { page, total });
+                                        let _send = tx2.send(Message::McpProgress { page, total });
                                     }).await;
                                     match result {
                                         Ok(()) => {
-                                            let _ = tx.send(Message::McpWriteComplete);
+                                            let _send = tx.send(Message::McpWriteComplete);
                                         }
                                         Err(e) => {
-                                            let _ = tx.send(Message::McpError(format!("{e}")));
+                                            let _send = tx.send(Message::McpError(format!("{e}")));
                                         }
                                     }
                                     // The TH-D75's USB stack always resets when exiting MCP
                                     // programming mode. The connection is guaranteed to drop.
-                                    let _ = tx.send(Message::Disconnected);
+                                    let _send = tx.send(Message::Disconnected);
                                     break; // Go to reconnect
                                 }
                                 crate::event::RadioCommand::TuneChannel { band, channel } => {
                                     if let Err(e) = radio.tune_channel(band, channel).await {
-                                        let _ = tx.send(Message::RadioError(format!("Tune failed: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Tune failed: {e}")));
                                     }
                                     // Don't break — stay in poll loop, radio is still connected
                                 }
                                 crate::event::RadioCommand::FreqUp(band) => {
                                     if let Err(e) = radio.frequency_up(band).await {
-                                        let _ = tx.send(Message::RadioError(format!("Freq up: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Freq up: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::FreqDown(band) => {
@@ -360,104 +360,94 @@ pub(crate) async fn spawn_with_transport(
                                     match freq_down(radio, band).await {
                                         Ok(()) => {}
                                         Err(e) => {
-                                            let _ = tx.send(Message::RadioError(format!("Freq down: {e}")));
+                                            let _send = tx.send(Message::RadioError(format!("Freq down: {e}")));
                                         }
                                     }
                                 }
                                 crate::event::RadioCommand::TuneFreq { band, freq } => {
                                     let f = kenwood_thd75::types::Frequency::new(freq);
                                     if let Err(e) = radio.tune_frequency(band, f).await {
-                                        let _ = tx.send(Message::RadioError(format!("Tune freq: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Tune freq: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetSquelch { band, level } => {
                                     if let Err(e) = radio.set_squelch(band, level).await {
-                                        let _ = tx.send(Message::RadioError(format!("Set squelch: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Set squelch: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetAttenuator { band, enabled } => {
                                     if let Err(e) = radio.set_attenuator(band, enabled).await {
-                                        let _ = tx.send(Message::RadioError(format!("Set atten: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Set atten: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetMode { band, mode } => {
                                     if let Err(e) = radio.set_mode(band, mode).await {
-                                        let _ = tx.send(Message::RadioError(format!("Set mode: {e} (may require VFO mode)")));
+                                        let _send = tx.send(Message::RadioError(format!("Set mode: {e} (may require VFO mode)")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetLock(on) => {
                                     if let Err(e) = radio.set_lock(on).await {
-                                        let _ = tx.send(Message::RadioError(format!("Set lock: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Set lock: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetDualBand(on) => {
                                     if let Err(e) = radio.set_dual_band(on).await {
-                                        let _ = tx.send(Message::RadioError(format!("Set dual band: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Set dual band: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetBluetooth(on) => {
                                     if let Err(e) = radio.set_bluetooth(on).await {
-                                        let _ = tx.send(Message::RadioError(format!("Set bluetooth: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Set bluetooth: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetVox(on) => {
                                     if let Err(e) = radio.set_vox(on).await {
-                                        let _ = tx.send(Message::RadioError(format!("Set VOX: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Set VOX: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetVoxGain(level) => {
                                     if let Err(e) = radio.set_vox_gain(level).await {
-                                        let _ = tx.send(Message::RadioError(format!("Set VOX gain: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Set VOX gain: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetVoxDelay(delay) => {
                                     if let Err(e) = radio.set_vox_delay(delay).await {
-                                        let _ = tx.send(Message::RadioError(format!("Set VOX delay: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Set VOX delay: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetPower { band, level } => {
                                     if let Err(e) = radio.set_power_level(band, level).await {
-                                        let _ = tx.send(Message::RadioError(format!("Set power: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Set power: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetStepSize { band, step } => {
                                     if let Err(e) = radio.set_step_size(band, step).await {
-                                        let _ = tx.send(Message::RadioError(format!("Set step: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Set step: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetScanResumeCat(method) => {
                                     if let Err(e) = radio.set_scan_resume(method).await {
-                                        let _ = tx.send(Message::RadioError(format!("Scan resume: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Scan resume: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetTncBaud(rate) => {
                                     if let Err(e) = radio.set_tnc_baud(rate).await {
-                                        let _ = tx.send(Message::RadioError(format!("TNC baud: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("TNC baud: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetBeaconType(mode) => {
                                     if let Err(e) = radio.set_beacon_type(mode).await {
-                                        let _ = tx.send(Message::RadioError(format!("Beacon type: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Beacon type: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetGpsConfig(enabled, pc_output) => {
                                     if let Err(e) = radio.set_gps_config(enabled, pc_output).await {
-                                        let _ = tx.send(Message::RadioError(format!("GPS config: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("GPS config: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetFmRadio(enabled) => {
                                     if let Err(e) = radio.set_fm_radio(enabled).await {
-                                        let _ = tx.send(Message::RadioError(format!("FM radio: {e}")));
-                                    }
-                                }
-                                crate::event::RadioCommand::SetCallsignSlot(slot) => {
-                                    if let Err(e) = radio.set_active_callsign_slot(slot).await {
-                                        let _ = tx.send(Message::RadioError(format!("Callsign slot: {e}")));
-                                    }
-                                }
-                                crate::event::RadioCommand::SetDstarSlot(slot) => {
-                                    if let Err(e) = radio.set_dstar_slot(slot).await {
-                                        let _ = tx.send(Message::RadioError(format!("D-STAR slot: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("FM radio: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::McpWriteByte { offset, value } => {
@@ -465,42 +455,44 @@ pub(crate) async fn spawn_with_transport(
                                     // Enters MCP mode, modifies one byte, exits. USB/BT drops.
                                     let page = offset / 256;
                                     let byte_idx = (offset % 256) as usize;
-                                    let _ = tx.send(Message::RadioError(format!("Writing MCP 0x{offset:04X}...")));
+                                    let _send = tx.send(Message::RadioError(format!("Writing MCP 0x{offset:04X}...")));
                                     match radio.modify_memory_page(page, |data| {
-                                        data[byte_idx] = value;
+                                        if let Some(byte) = data.get_mut(byte_idx) {
+                                            *byte = value;
+                                        }
                                     }).await {
                                         Ok(()) => {
                                             // Update the in-memory MCP cache so the TUI
                                             // stays in sync without requiring a full re-read.
-                                            let _ = tx.send(Message::McpByteWritten { offset, value });
-                                            let _ = tx.send(Message::RadioError(format!("MCP 0x{offset:04X} = {value} — reconnecting...")));
+                                            let _send = tx.send(Message::McpByteWritten { offset, value });
+                                            let _send = tx.send(Message::RadioError(format!("MCP 0x{offset:04X} = {value} — reconnecting...")));
                                         }
                                         Err(e) => {
-                                            let _ = tx.send(Message::McpError(format!("MCP write 0x{offset:04X}: {e}")));
+                                            let _send = tx.send(Message::McpError(format!("MCP write 0x{offset:04X}: {e}")));
                                         }
                                     }
                                     // USB/BT drops after MCP exit
-                                    let _ = tx.send(Message::Disconnected);
+                                    let _send = tx.send(Message::Disconnected);
                                     break; // Go to reconnect loop
                                 }
                                 crate::event::RadioCommand::SetUrcall { callsign, suffix } => {
                                     if let Err(e) = radio.set_urcall(&callsign, &suffix).await {
-                                        let _ = tx.send(Message::RadioError(format!("Set URCALL: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Set URCALL: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::ConnectReflector { name, module } => {
                                     if let Err(e) = radio.connect_reflector(&name, module).await {
-                                        let _ = tx.send(Message::RadioError(format!("Connect reflector: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Connect reflector: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::DisconnectReflector => {
                                     if let Err(e) = radio.disconnect_reflector().await {
-                                        let _ = tx.send(Message::RadioError(format!("Disconnect reflector: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Disconnect reflector: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetCQ => {
                                     if let Err(e) = radio.set_cq().await {
-                                        let _ = tx.send(Message::RadioError(format!("Set CQ: {e}")));
+                                        let _send = tx.send(Message::RadioError(format!("Set CQ: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::EnterDStar { config } => {
@@ -508,7 +500,7 @@ pub(crate) async fn spawn_with_transport(
                                     continue 'outer;
                                 }
                                 crate::event::RadioCommand::ExitDStar => {
-                                    let _ = tx.send(Message::RadioError(
+                                    let _send = tx.send(Message::RadioError(
                                         "Not in D-STAR gateway mode".into()
                                     ));
                                 }
@@ -523,7 +515,7 @@ pub(crate) async fn spawn_with_transport(
                                 | crate::event::RadioCommand::SendAprsMessage { .. }
                                 | crate::event::RadioCommand::BeaconPosition { .. } => {
                                     // These are only valid in APRS mode; ignore in CAT mode.
-                                    let _ = tx.send(Message::RadioError(
+                                    let _send = tx.send(Message::RadioError(
                                         "Not in APRS mode".into()
                                     ));
                                 }
@@ -555,7 +547,7 @@ pub(crate) async fn spawn_with_transport(
             let mut attempts = 0u32;
             loop {
                 attempts += 1;
-                let _ = tx.send(Message::RadioError(format!(
+                let _send = tx.send(Message::RadioError(format!(
                     "Reconnect attempt {attempts}..."
                 )));
 
@@ -587,27 +579,27 @@ pub(crate) async fn spawn_with_transport(
                             Ok(_) => {
                                 if let Err(e) = new_radio.set_auto_info(true).await {
                                     tracing::error!("AI mode failed after reconnect: {e}");
-                                    let _ = tx.send(Message::RadioError(format!(
+                                    let _send = tx.send(Message::RadioError(format!(
                                         "AI mode failed: {e} — S-meter may not update"
                                     )));
                                 }
                                 notifications = new_radio.subscribe();
-                                s_meter_a = SMeterReading::new(0).unwrap();
-                                s_meter_b = SMeterReading::new(0).unwrap();
+                                s_meter_a = SMeterReading::ZERO;
+                                s_meter_b = SMeterReading::ZERO;
                                 busy_a = false;
                                 busy_b = false;
-                                let _ = tx.send(Message::Reconnected);
+                                let _send = tx.send(Message::Reconnected);
                                 radio_opt = Some(new_radio);
                                 continue 'outer;
                             }
                             Err(e) => {
-                                let _ = tx.send(Message::RadioError(format!(
+                                let _send = tx.send(Message::RadioError(format!(
                                     "Radio found but not responding: {e}"
                                 )));
                             }
                         },
                         Err(e) => {
-                            let _ = tx.send(Message::RadioError(format!(
+                            let _send = tx.send(Message::RadioError(format!(
                                 "Transport opened but handshake failed: {e}"
                             )));
                         }
@@ -704,13 +696,13 @@ async fn poll_once(
         radio,
         "VG",
         radio.get_vox_gain(),
-        kenwood_thd75::types::VoxGain::new(0).unwrap()
+        kenwood_thd75::types::VoxGain::ZERO
     );
     let vox_delay = global_read!(
         radio,
         "VD",
         radio.get_vox_delay(),
-        kenwood_thd75::types::VoxDelay::new(0).unwrap()
+        kenwood_thd75::types::VoxDelay::ZERO
     );
     let af_gain = global_read!(
         radio,
@@ -826,7 +818,7 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
     Ok(BandState {
         frequency: channel.rx_frequency,
         mode,
-        s_meter: SMeterReading::new(0).unwrap(), // Set by AI notification handler
+        s_meter: SMeterReading::ZERO, // Set by AI notification handler
         squelch,
         power_level,
         busy: false, // Set by AI notification handler
@@ -880,14 +872,14 @@ async fn enter_aprs_session(
         }
     };
 
-    let _ = tx.send(Message::AprsStarted);
+    let _send = tx.send(Message::AprsStarted);
 
     let exit_result = run_aprs_loop(&mut client, tx, cmd_rx).await;
 
     match client.stop().await {
         Ok(new_radio) => {
             if let Err(msg) = exit_result {
-                let _ = tx.send(Message::AprsError(msg));
+                let _send = tx.send(Message::AprsError(msg));
             }
             Ok(new_radio)
         }
@@ -930,14 +922,14 @@ async fn run_aprs_loop(
                     crate::event::RadioCommand::SendAprsMessage { addressee, text } => {
                         match client.send_message(&addressee, &text).await {
                             Ok(message_id) => {
-                                let _ = tx.send(Message::AprsMessageSent {
+                                let _send = tx.send(Message::AprsMessageSent {
                                     addressee,
                                     text,
                                     message_id,
                                 });
                             }
                             Err(e) => {
-                                let _ = tx.send(Message::AprsError(
+                                let _send = tx.send(Message::AprsError(
                                     format!("Send message failed: {e}")
                                 ));
                             }
@@ -945,14 +937,14 @@ async fn run_aprs_loop(
                     }
                     crate::event::RadioCommand::BeaconPosition { lat, lon, comment } => {
                         if let Err(e) = client.beacon_position(lat, lon, &comment).await {
-                            let _ = tx.send(Message::AprsError(
+                            let _send = tx.send(Message::AprsError(
                                 format!("Beacon failed: {e}")
                             ));
                         }
                     }
                     _ => {
                         // CAT commands are not valid in APRS mode.
-                        let _ = tx.send(Message::RadioError(
+                        let _send = tx.send(Message::RadioError(
                             "CAT commands unavailable in APRS mode".into()
                         ));
                     }
@@ -987,14 +979,14 @@ async fn enter_dstar_session(
         }
     };
 
-    let _ = tx.send(Message::DStarStarted);
+    let _send = tx.send(Message::DStarStarted);
 
     let exit_result = run_dstar_loop(&mut gateway, tx, cmd_rx).await;
 
     match gateway.stop().await {
         Ok(new_radio) => {
             if let Err(msg) = exit_result {
-                let _ = tx.send(Message::DStarError(msg));
+                let _send = tx.send(Message::DStarError(msg));
             }
             Ok(new_radio)
         }
@@ -1034,7 +1026,7 @@ async fn run_dstar_loop(
                     }
                     _ => {
                         // CAT commands are not valid in D-STAR gateway mode.
-                        let _ = tx.send(Message::RadioError(
+                        let _send = tx.send(Message::RadioError(
                             "CAT commands unavailable in D-STAR gateway mode".into()
                         ));
                     }

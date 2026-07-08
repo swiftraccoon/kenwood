@@ -1,14 +1,3 @@
-#![expect(
-    clippy::unwrap_used,
-    clippy::indexing_slicing,
-    reason = "Proptest `prop_assert!` / closure bodies cannot use `?` to unwrap `Result` \
-              or `Option`, so `.unwrap()` on known-valid constructor outputs and direct \
-              `buf[..n]` slicing on fixed-size decoded byte arrays are structurally \
-              required. `clippy::unwrap_used` fires on those unwraps; \
-              `clippy::indexing_slicing` fires on the slice expressions. Both are safe \
-              because the proptest strategies generate inputs that are guaranteed valid \
-              by construction, and any failure would correctly panic the test."
-)]
 //! Property tests for `DPlus` codec round-trips.
 //!
 //! Two flavours:
@@ -36,19 +25,29 @@ use dstar_gateway_core::codec::dplus::{
 use dstar_gateway_core::validator::NullSink;
 use dstar_gateway_core::{Callsign, DStarHeader, StreamId, Suffix, VoiceFrame};
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 
-prop_compose! {
-    fn any_callsign()(s in "[A-Z0-9]{1,8}") -> Callsign {
-        // Strategy regex guarantees valid callsign characters.
-        Callsign::try_from_str(&s).unwrap()
-    }
+/// Convert a library error into a proptest failure carrying its Debug text.
+fn to_test_err<E: std::fmt::Debug>(e: E) -> TestCaseError {
+    TestCaseError::fail(format!("{e:?}"))
 }
 
-prop_compose! {
-    fn any_stream_id()(n in 1u16..=u16::MAX) -> StreamId {
-        // Strategy range starts at 1, always non-zero.
-        StreamId::new(n).unwrap()
-    }
+/// The first `n` encoded bytes of `buf`, as a proptest-friendly `Result`.
+fn wire(buf: &[u8], n: usize) -> Result<&[u8], TestCaseError> {
+    buf.get(..n)
+        .ok_or_else(|| TestCaseError::fail("encoded length exceeds buffer"))
+}
+
+fn any_callsign() -> impl Strategy<Value = Callsign> {
+    // Strategy regex guarantees valid callsign characters.
+    "[A-Z0-9]{1,8}".prop_filter_map("valid callsign characters", |s| {
+        Callsign::try_from_str(&s).ok()
+    })
+}
+
+fn any_stream_id() -> impl Strategy<Value = StreamId> {
+    // Strategy range starts at 1, always non-zero.
+    (1u16..=u16::MAX).prop_filter_map("non-zero stream id", StreamId::new)
 }
 
 prop_compose! {
@@ -80,32 +79,32 @@ proptest! {
     #[test]
     fn link1_client_roundtrips(_ in 0u8..1) {
         let mut buf = [0u8; 16];
-        let n = encode_link1(&mut buf).unwrap();
-        let pkt = decode_client_to_server(&buf[..n], &mut NullSink).unwrap();
+        let n = encode_link1(&mut buf).map_err(to_test_err)?;
+        let pkt = decode_client_to_server(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         prop_assert!(matches!(pkt, ClientPacket::Link1));
     }
 
     #[test]
     fn unlink_client_roundtrips(_ in 0u8..1) {
         let mut buf = [0u8; 16];
-        let n = encode_unlink(&mut buf).unwrap();
-        let pkt = decode_client_to_server(&buf[..n], &mut NullSink).unwrap();
+        let n = encode_unlink(&mut buf).map_err(to_test_err)?;
+        let pkt = decode_client_to_server(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         prop_assert!(matches!(pkt, ClientPacket::Unlink));
     }
 
     #[test]
     fn poll_client_roundtrips(_ in 0u8..1) {
         let mut buf = [0u8; 16];
-        let n = encode_poll(&mut buf).unwrap();
-        let pkt = decode_client_to_server(&buf[..n], &mut NullSink).unwrap();
+        let n = encode_poll(&mut buf).map_err(to_test_err)?;
+        let pkt = decode_client_to_server(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         prop_assert!(matches!(pkt, ClientPacket::Poll));
     }
 
     #[test]
     fn poll_echo_server_roundtrips(_ in 0u8..1) {
         let mut buf = [0u8; 16];
-        let n = encode_poll(&mut buf).unwrap();
-        let pkt = decode_server_to_client(&buf[..n], &mut NullSink).unwrap();
+        let n = encode_poll(&mut buf).map_err(to_test_err)?;
+        let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         prop_assert!(matches!(pkt, ServerPacket::PollEcho));
     }
 
@@ -113,8 +112,8 @@ proptest! {
     #[test]
     fn link2_client_roundtrips(cs in any_callsign()) {
         let mut buf = [0u8; 32];
-        let n = encode_link2(&mut buf, &cs).unwrap();
-        let pkt = decode_client_to_server(&buf[..n], &mut NullSink).unwrap();
+        let n = encode_link2(&mut buf, &cs).map_err(to_test_err)?;
+        let pkt = decode_client_to_server(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ClientPacket::Link2 { callsign } => prop_assert_eq!(callsign, cs),
             _ => prop_assert!(false, "expected Link2"),
@@ -124,8 +123,8 @@ proptest! {
     #[test]
     fn link2_reply_accept_server_roundtrips(_ in 0u8..1) {
         let mut buf = [0u8; 16];
-        let n = encode_link2_reply(&mut buf, Link2Result::Accept).unwrap();
-        let pkt = decode_server_to_client(&buf[..n], &mut NullSink).unwrap();
+        let n = encode_link2_reply(&mut buf, Link2Result::Accept).map_err(to_test_err)?;
+        let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ServerPacket::Link2Reply { result } => {
                 prop_assert_eq!(result, Link2Result::Accept);
@@ -137,8 +136,8 @@ proptest! {
     #[test]
     fn link2_reply_busy_server_roundtrips(_ in 0u8..1) {
         let mut buf = [0u8; 16];
-        let n = encode_link2_reply(&mut buf, Link2Result::Busy).unwrap();
-        let pkt = decode_server_to_client(&buf[..n], &mut NullSink).unwrap();
+        let n = encode_link2_reply(&mut buf, Link2Result::Busy).map_err(to_test_err)?;
+        let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ServerPacket::Link2Reply { result } => {
                 prop_assert_eq!(result, Link2Result::Busy);
@@ -155,8 +154,8 @@ proptest! {
         frame in any_voice_frame(),
     ) {
         let mut buf = [0u8; 64];
-        let n = encode_voice_data(&mut buf, sid, seq, &frame).unwrap();
-        let pkt = decode_server_to_client(&buf[..n], &mut NullSink).unwrap();
+        let n = encode_voice_data(&mut buf, sid, seq, &frame).map_err(to_test_err)?;
+        let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ServerPacket::VoiceData { stream_id, seq: s, frame: f } => {
                 prop_assert_eq!(stream_id, sid);
@@ -171,8 +170,8 @@ proptest! {
     #[test]
     fn voice_eot_server_roundtrips(sid in any_stream_id(), seq in 0u8..21) {
         let mut buf = [0u8; 64];
-        let n = encode_voice_eot(&mut buf, sid, seq).unwrap();
-        let pkt = decode_server_to_client(&buf[..n], &mut NullSink).unwrap();
+        let n = encode_voice_eot(&mut buf, sid, seq).map_err(to_test_err)?;
+        let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ServerPacket::VoiceEot { stream_id, seq: s } => {
                 prop_assert_eq!(stream_id, sid);
@@ -187,8 +186,8 @@ proptest! {
     fn voice_header_server_roundtrips(sid in any_stream_id(), my_call in any_callsign()) {
         let header = ref030_header(my_call);
         let mut buf = [0u8; 64];
-        let n = encode_voice_header(&mut buf, sid, &header).unwrap();
-        let pkt = decode_server_to_client(&buf[..n], &mut NullSink).unwrap();
+        let n = encode_voice_header(&mut buf, sid, &header).map_err(to_test_err)?;
+        let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ServerPacket::VoiceHeader { stream_id, header: decoded } => {
                 prop_assert_eq!(stream_id, sid);

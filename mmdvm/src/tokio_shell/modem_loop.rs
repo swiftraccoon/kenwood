@@ -19,14 +19,6 @@
 //! 3. Loop exits on consumer drop, `Shutdown` command, or a fatal
 //!    transport error.
 
-// `ModemLoop` is `pub(crate)` because the handle in `handle.rs`
-// needs to reference it from a sibling submodule, but it must not be
-// part of the crate's public API.
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "ModemLoop is crate-internal infrastructure; pub(crate) documents the intent"
-)]
-
 use std::time::Duration;
 
 use mmdvm_core::{

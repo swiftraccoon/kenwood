@@ -23,17 +23,6 @@
 //! produces different numerical SAs because the 3-bin-power
 //! integration doesn't account for the Hamming spectral lobe the
 //! analysis window imparts on each harmonic.
-#![expect(
-    clippy::indexing_slicing,
-    reason = "V/UV detection: iterates per harmonic and per-bin over the fitted \
-              sinusoid response; indices come from the harmonic count L (<= 56 by \
-              IMBE spec) and the fixed WR_SP analysis window bounds. All array \
-              accesses are bounded by the analysis-stage invariants — the FFT bins, \
-              the fitted amplitudes, and the per-band window offsets are all \
-              algorithmically defined. `.get()?` on every access would overwhelm the \
-              reference-algorithm correspondence this file maintains with OP25 \
-              `v_uv_det.cc`."
-)]
 //!
 //! # State carried across frames
 //!
@@ -146,6 +135,15 @@ pub fn detect_vuv(fft_out: &[Complex<f32>], f0_bin: f32) -> VuvDecisions {
               capped at MAX_HARMONICS (56), so the many f32/usize casts in the windowed \
               sinusoid fit are all within safe magnitudes. Splitting into smaller helpers \
               would break the line-by-line mapping with the reference."
+)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "The per-harmonic scratch arrays are indexed by `k < num_harms` and \
+              `band_cnt < num_bands`, and both counts are clamped to the array sizes \
+              at derivation (`.min(MAX_HARMONICS)` / `.min(MAX_BANDS)` above the loop). \
+              An iterator rewrite is blocked by the band-commit step, which re-reads \
+              earlier `m_num[kk]`/`sc_coef[kk]` entries while the per-`k` slots would \
+              still be mutably borrowed by the zip."
 )]
 pub fn detect_vuv_and_sa(
     fft_out: &[Complex<f32>],

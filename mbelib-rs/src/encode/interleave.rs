@@ -16,15 +16,6 @@
 //! (<https://github.com/szechyjs/dsd>, ISC-licensed, copied under
 //! GPL-2.0-or-later via the mbelib relicensing pathway).
 
-#![expect(
-    clippy::indexing_slicing,
-    reason = "All indices are bounded by AMBE_FRAME_BITS=72 (enforced by the table \
-              declarations themselves — FORWARD and INVERSE are `[u8; 72]`). The bit \
-              permutation routines iterate over 0..72 and index into fixed-size tables; \
-              bounds are statically provable but clippy can't prove them from the local \
-              code shape."
-)]
-
 /// Number of bits in an AMBE frame (also the codeword array length).
 pub(crate) const AMBE_FRAME_BITS: usize = 72;
 
@@ -50,6 +41,12 @@ const FORWARD: [u8; AMBE_FRAME_BITS] = [
 /// `FORWARD` is not a bijection on `0..AMBE_FRAME_BITS` (the initial
 /// `u8::MAX` sentinel survives in any output slot that was never
 /// assigned, and the final loop catches it).
+#[expect(
+    clippy::indexing_slicing,
+    reason = "const fn evaluated only at compile time (the sole caller is the `INVERSE` \
+              const item): `slice::get` is not const-callable, and an out-of-bounds \
+              index here is a compile error, not a runtime panic"
+)]
 const fn build_inverse() -> [u8; AMBE_FRAME_BITS] {
     let mut inverse = [u8::MAX; AMBE_FRAME_BITS];
 
@@ -97,33 +94,37 @@ pub(crate) const INVERSE: [u8; AMBE_FRAME_BITS] = build_inverse();
 mod tests {
     use super::{AMBE_FRAME_BITS, FORWARD, INVERSE};
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     /// The inverse must undo the forward permutation.
     #[test]
-    fn inverse_round_trips_forward() {
+    fn inverse_round_trips_forward() -> TestResult {
         for (input_bit, &target_u8) in FORWARD.iter().enumerate() {
             let target = target_u8 as usize;
-            let expected = u8::try_from(input_bit).expect("input_bit < 72 fits in u8");
+            let expected = u8::try_from(input_bit)?;
             assert_eq!(
-                INVERSE[target], expected,
+                INVERSE.get(target),
+                Some(&expected),
                 "inverse mismatch at ambe_fr index {target} (input bit {input_bit})",
             );
         }
+        Ok(())
     }
 
     /// Every `ambe_fr` slot should map to a unique input bit in 0..72.
     #[test]
-    fn inverse_is_a_permutation() {
+    fn inverse_is_a_permutation() -> TestResult {
         let mut seen = [false; AMBE_FRAME_BITS];
         for &input_bit in &INVERSE {
             let i = input_bit as usize;
-            assert!(
-                i < AMBE_FRAME_BITS,
-                "inverse contains out-of-range value {i}",
-            );
-            assert!(!seen[i], "inverse maps two ambe_fr slots to input bit {i}",);
-            seen[i] = true;
+            let slot = seen
+                .get_mut(i)
+                .ok_or_else(|| format!("inverse contains out-of-range value {i}"))?;
+            assert!(!*slot, "inverse maps two ambe_fr slots to input bit {i}",);
+            *slot = true;
         }
         // Redundant with the loop above, but explicit: all 72 bits covered.
         assert!(seen.iter().all(|&b| b), "inverse missed some input bit");
+        Ok(())
     }
 }

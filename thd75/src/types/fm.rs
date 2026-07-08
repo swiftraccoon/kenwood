@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn fm_radio_mode_debug() {
-        let _ = format!("{:?}", FmRadioMode::Tuning);
-        let _ = format!("{:?}", FmRadioMode::Memory);
+        assert_eq!(format!("{:?}", FmRadioMode::Tuning), "Tuning");
+        assert_eq!(format!("{:?}", FmRadioMode::Memory), "Memory");
     }
 }

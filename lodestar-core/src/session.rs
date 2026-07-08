@@ -1588,21 +1588,12 @@ async fn connect_dplus(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::cast_possible_truncation,
-    clippy::drop_non_drop,
-    reason = "test fixtures use fixed-size buffers and known-valid IDs; \
-              panicking on violation is the intended failure signal. \
-              `drop(delta)` is the clippy-compliant way to silence \
-              unused_results on SlowDataDelta in this strict crate."
-)]
 mod slow_data_gps_tests {
     use super::*;
     use dstar_gateway_core::StreamId;
     use dstar_gateway_core::slowdata::scramble;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// Re-implement ircDDBGateway's `CSlowDataEncoder::setGPSData` + `getData`
     /// pair to produce the exact wire bytes (scrambled, in 3-byte frames)
@@ -1628,22 +1619,19 @@ mod slow_data_gps_tests {
         let data_size = 1 + bytes.len().saturating_sub(1) / BLOCK_SIZE + bytes.len();
         let full_size = FULL_BLOCK_SIZE * (1 + (data_size.saturating_sub(1)) / FULL_BLOCK_SIZE);
 
-        let mut buf = vec![b'f'; full_size];
-        let mut str_pos = 0usize;
-        let mut pos = 0usize;
-        while pos < full_size {
-            let data_len = (bytes.len() - str_pos).min(5);
-            buf[pos] = TYPE_GPS | (data_len as u8);
-            pos += 1;
-            for _ in 0..data_len {
-                if pos >= full_size {
-                    break;
-                }
-                buf[pos] = bytes[str_pos];
-                pos += 1;
-                str_pos += 1;
-            }
+        let mut buf: Vec<u8> = Vec::with_capacity(full_size);
+        for chunk in bytes.chunks(5) {
+            // `chunks(5)` yields 1..=5 bytes — always fits the low nibble.
+            buf.push(TYPE_GPS | u8::try_from(chunk.len()).unwrap_or(5));
+            buf.extend_from_slice(chunk);
         }
+        // Once the sentence is exhausted the reference encoder keeps
+        // emitting `(TYPE_GPS | 0)` type bytes with no payload, so the
+        // tail of the stream is a run of bare 0x30 bytes.
+        while buf.len() < full_size {
+            buf.push(TYPE_GPS);
+        }
+        buf.truncate(full_size);
 
         let mut frames: Vec<[u8; 3]> = Vec::new();
         for chunk in buf.chunks_exact(3) {
@@ -1658,12 +1646,12 @@ mod slow_data_gps_tests {
     /// `StreamSlowDataState.push` pipeline and return the extracted
     /// latest position, if any.
     fn decode_frames(frames: &[[u8; 3]]) -> Option<GpsPosition> {
-        let sid = StreamId::new(0x1234).unwrap();
+        let sid = StreamId::new(0x1234)?;
         let mut state = StreamSlowDataState::new(sid);
 
         let mut seq: u8 = 1;
         for &frame in frames {
-            drop(state.push(frame, seq));
+            let _delta = state.push(frame, seq);
             seq = seq.wrapping_add(1);
             if seq == 0 {
                 seq = 1;
@@ -1673,7 +1661,7 @@ mod slow_data_gps_tests {
     }
 
     #[test]
-    fn decodes_dprs_sentence_with_cr_terminator() {
+    fn decodes_dprs_sentence_with_cr_terminator() -> TestResult {
         let sentence = "$$CRC1234,W1AW    >APDPRS,DSTAR*:!4321.12N/07123.45W>Test\r";
         let frames = encode_dprs_to_scrambled_frames(sentence);
         assert!(
@@ -1682,7 +1670,7 @@ mod slow_data_gps_tests {
             frames.len()
         );
 
-        let pos = decode_frames(&frames).expect("decoder should recover position");
+        let pos = decode_frames(&frames).ok_or("decoder should recover position")?;
         assert_eq!(pos.callsign.trim(), "W1AW");
         let expected_lat = 43.0 + 21.12 / 60.0;
         let expected_lon = -(71.0 + 23.45 / 60.0);
@@ -1698,6 +1686,7 @@ mod slow_data_gps_tests {
             pos.longitude,
             expected_lon
         );
+        Ok(())
     }
 
     #[test]
@@ -1708,32 +1697,35 @@ mod slow_data_gps_tests {
     }
 
     #[test]
-    fn nmea_rmc_sentence_decodes() {
+    fn nmea_rmc_sentence_decodes() -> TestResult {
         let sentence = "$GPRMC,123456.00,A,4321.1200,N,07123.4500,W,0.0,0.0,010125,,*31\n";
         let frames = encode_dprs_to_scrambled_frames(sentence);
-        let pos = decode_frames(&frames).expect("decoder should recover GPRMC");
+        let pos = decode_frames(&frames).ok_or("decoder should recover GPRMC")?;
         let expected_lat = 43.0 + 21.12 / 60.0;
         assert!(
             (pos.latitude - expected_lat).abs() < 0.01,
             "lat {}",
             pos.latitude
         );
+        Ok(())
     }
 
     #[test]
-    fn test_scrambler_roundtrip_with_real_sentence() {
+    fn test_scrambler_roundtrip_with_real_sentence() -> TestResult {
         let sentence = "$$CRC0001,XXX\r";
         let frames = encode_dprs_to_scrambled_frames(sentence);
-        let plain0 = dstar_gateway_core::slowdata::descramble(frames[0]);
-        let plain1 = dstar_gateway_core::slowdata::descramble(frames[1]);
-        let mut block = [0u8; 6];
-        block[0..3].copy_from_slice(&plain0);
-        block[3..6].copy_from_slice(&plain1);
+        let plain0 =
+            dstar_gateway_core::slowdata::descramble(*frames.first().ok_or("missing frame 0")?);
+        let plain1 =
+            dstar_gateway_core::slowdata::descramble(*frames.get(1).ok_or("missing frame 1")?);
+        let block: Vec<u8> = plain0.iter().chain(plain1.iter()).copied().collect();
         assert_eq!(
-            block[0], 0x35,
+            block.first(),
+            Some(&0x35),
             "first block type byte should be 0x35 (GPS|5)"
         );
-        assert_eq!(&block[1..6], b"$$CRC");
+        assert_eq!(block.get(1..6), Some(b"$$CRC".as_slice()));
+        Ok(())
     }
 
     /// Exercise the block-phase alignment: if we "join mid-stream"
@@ -1741,11 +1733,12 @@ mod slow_data_gps_tests {
     /// shifted by 3 bytes — the type nibble will be whatever byte 4
     /// of the original block was, never 0x3X. No GPS should decode.
     #[test]
-    fn misaligned_stream_join_drops_gps() {
+    fn misaligned_stream_join_drops_gps() -> TestResult {
         let sentence = "$$CRC1234,W1AW    >APDPRS,DSTAR*:!4321.12N/07123.45W>\r";
         let frames = encode_dprs_to_scrambled_frames(sentence);
-        let shifted = &frames[1..];
+        let shifted = frames.get(1..).ok_or("need at least one frame")?;
         assert!(decode_frames(shifted).is_none());
+        Ok(())
     }
 }
 

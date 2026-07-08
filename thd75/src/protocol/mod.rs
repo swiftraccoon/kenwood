@@ -29,18 +29,11 @@ pub mod vfo;
 pub use codec::Codec;
 
 use crate::error::ProtocolError;
-#[expect(
-    unused_imports,
-    reason = "Broad re-export of every D75 type the protocol layer constructs. Some variants \
-              only appear behind `#[cfg(test)]` paths or in docstrings; the umbrella import \
-              keeps the `use` block consistent with the enum variants regardless of which \
-              features/targets are enabled."
-)]
 use crate::types::{
     AfGainLevel, Band, BeaconMode, CallsignSlot, ChannelMemory, DetectOutputMode, DstarSlot,
     DvGatewayMode, FilterMode, FilterWidthIndex, FineStep, GpsRadioMode, KeyLockType, Mode,
     PowerLevel, SMeterReading, ScanResumeMethod, SquelchLevel, StepSize, TncBaud, TncMode,
-    ToneCode, VfoMemoryMode, VoxDelay, VoxGain,
+    VfoMemoryMode, VoxDelay, VoxGain,
 };
 
 /// A CAT command to send to the radio.

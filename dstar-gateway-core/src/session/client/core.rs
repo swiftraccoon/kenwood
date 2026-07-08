@@ -1892,10 +1892,15 @@ mod tests {
     use crate::types::{StreamId, Suffix};
     use crate::voice::VoiceFrame;
 
-    #[expect(clippy::unwrap_used, reason = "const-validated: n is non-zero")]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test helper: every call site passes a non-zero literal, so the \
+                  unwrap cannot fire; a zero would panic only this test, at runtime"
+    )]
     const fn sid(n: u16) -> StreamId {
-        // Option::unwrap is const since 1.83 — panics at compile
-        // time on zero, never at runtime with a non-zero literal.
+        // Runtime call sites evaluate this at runtime — a zero
+        // argument would panic the test, and every call site passes
+        // a non-zero literal.
         StreamId::new(n).unwrap()
     }
 

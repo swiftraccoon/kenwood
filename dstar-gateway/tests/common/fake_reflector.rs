@@ -12,11 +12,6 @@
 //! The helper is single-session — it latches onto the first client
 //! that speaks to it and doesn't try to multiplex.
 
-#![expect(
-    unreachable_pub,
-    reason = "test helper module — pub items serve sibling test files"
-)]
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -25,7 +20,7 @@ use tokio::sync::Mutex;
 
 /// Loopback fake reflector used by the tokio-shell integration tests.
 #[derive(Debug)]
-pub struct FakeReflector {
+pub(crate) struct FakeReflector {
     socket: Arc<UdpSocket>,
     received: Arc<Mutex<Vec<Vec<u8>>>>,
     peer: Arc<Mutex<Option<SocketAddr>>>,
@@ -38,7 +33,7 @@ impl FakeReflector {
     /// the sender callsign and module) and echoes 9-byte poll packets.
     /// Voice packets (56-byte header, 27-byte data/EOT) are recorded
     /// but not forwarded.
-    pub async fn spawn_dextra() -> Result<Self, std::io::Error> {
+    pub(crate) async fn spawn_dextra() -> Result<Self, std::io::Error> {
         let (socket, received, peer) = Self::new_state().await?;
         let sock_clone = Arc::clone(&socket);
         let received_clone = Arc::clone(&received);
@@ -106,13 +101,13 @@ impl FakeReflector {
     /// - 28-byte LINK2 → 8-byte `OKRW` reply.
     /// - 3-byte poll `[0x03, 0x60, 0x00]` → echoed.
     /// - 5-byte `[..., 0x00]` UNLINK → echoed as `UNLINK_ACK`.
-    pub async fn spawn_dplus_accepting() -> Result<Self, std::io::Error> {
+    pub(crate) async fn spawn_dplus_accepting() -> Result<Self, std::io::Error> {
         Self::spawn_dplus(DPlusMode::Accept).await
     }
 
     /// Spawn a fake `DPlus` reflector that rejects the step-2 login
     /// with `BUSY` instead of `OKRW`.
-    pub async fn spawn_dplus_rejecting() -> Result<Self, std::io::Error> {
+    pub(crate) async fn spawn_dplus_rejecting() -> Result<Self, std::io::Error> {
         Self::spawn_dplus(DPlusMode::RejectWithBusy).await
     }
 
@@ -187,7 +182,7 @@ impl FakeReflector {
     ///   reply so the core's disconnect timer short-circuits rather
     ///   than waiting for the 2 s timeout.
     /// - 100-byte voice frames are recorded but not forwarded.
-    pub async fn spawn_dcs() -> Result<Self, std::io::Error> {
+    pub(crate) async fn spawn_dcs() -> Result<Self, std::io::Error> {
         let (socket, received, peer) = Self::new_state().await?;
         let sock_clone = Arc::clone(&socket);
         let received_clone = Arc::clone(&received);
@@ -273,17 +268,17 @@ impl FakeReflector {
     ///
     /// Returns the underlying I/O error if the socket address cannot be
     /// retrieved.
-    pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
+    pub(crate) fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
         self.socket.local_addr()
     }
 
     /// Snapshot of every datagram received so far.
-    pub async fn received_packets(&self) -> Vec<Vec<u8>> {
+    pub(crate) async fn received_packets(&self) -> Vec<Vec<u8>> {
         self.received.lock().await.clone()
     }
 
     /// Convenience wrapper: total number of received datagrams.
-    pub async fn received_count(&self) -> usize {
+    pub(crate) async fn received_count(&self) -> usize {
         self.received.lock().await.len()
     }
 
@@ -298,7 +293,7 @@ impl FakeReflector {
     /// Returns [`std::io::Error`] with kind [`std::io::ErrorKind::NotConnected`]
     /// if no client address has been observed yet, or any error from
     /// the underlying `send_to` call.
-    pub async fn send_to_peer(&self, bytes: &[u8]) -> std::io::Result<()> {
+    pub(crate) async fn send_to_peer(&self, bytes: &[u8]) -> std::io::Result<()> {
         let peer = {
             let guard = self.peer.lock().await;
             *guard

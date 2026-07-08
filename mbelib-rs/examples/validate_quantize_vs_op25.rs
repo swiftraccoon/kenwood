@@ -23,21 +23,12 @@
     clippy::print_stderr,
     clippy::cast_precision_loss,
     clippy::uninlined_format_args,
-    clippy::collapsible_if,
-    clippy::cast_lossless,
     clippy::too_many_lines,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    dead_code,
     missing_docs,
-    reason = "Stages 5-8 quantize A/B harness (OP25 trace -> Rust-port match rates). \
-              Prints diagnostics; DSP precision casts are unavoidable in the PRBA/HOC \
-              codebook search. `.expect()` is used on trace-parse results because this \
-              is validation scratchwork — a malformed fixture should abort the example \
-              with a specific message rather than propagating errors through a \
-              library-shaped API. `clippy::indexing_slicing` fires on direct indexing \
-              into the parsed-trace fixed-size arrays (`b[0..8]`, `prev_mp.log2_ml[0..56]`, \
-              etc.) — bounds are IMBE-spec constants enforced at trace parse time."
+    reason = "Stages 5-8 quantize A/B harness (OP25 trace -> Rust-port match rates): a \
+              diagnostic CLI that prints its comparison tables to stdout/stderr; the \
+              summary math casts frame counts to f64 for percentage display only. Docs \
+              are skipped since the tool is an internal validation harness."
 )]
 
 // Dev-dependencies pulled in by sibling tests/examples. Acknowledge them here so
@@ -53,7 +44,6 @@ use std::io::{BufRead, BufReader};
 /// One parsed frame from the OP25 reference trace.
 #[derive(Debug, Clone)]
 struct Op25Frame {
-    index: usize,
     ref_pitch_q88: u16,
     num_harms: usize,
     sa: Vec<i32>,
@@ -64,20 +54,18 @@ struct Op25Frame {
     prev_l: usize,
 }
 
-fn parse_trace(path: &str) -> Vec<Op25Frame> {
-    let file = std::fs::File::open(path).expect("open trace file");
+fn parse_trace(path: &str) -> Result<Vec<Op25Frame>, std::io::Error> {
+    let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut frames: Vec<Op25Frame> = Vec::new();
     let mut cur: Option<Op25Frame> = None;
     for line in reader.lines().map_while(Result::ok) {
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("FRAME ") {
+        if trimmed.strip_prefix("FRAME ").is_some() {
             if let Some(f) = cur.take() {
                 frames.push(f);
             }
-            let idx: usize = rest.trim().parse().unwrap_or(0);
             cur = Some(Op25Frame {
-                index: idx,
                 ref_pitch_q88: 0,
                 num_harms: 0,
                 sa: Vec::new(),
@@ -112,10 +100,8 @@ fn parse_trace(path: &str) -> Vec<Op25Frame> {
                     .take(9)
                     .filter_map(|s| s.parse().ok())
                     .collect();
-                for (i, v) in parts.iter().enumerate() {
-                    if i < 9 {
-                        f.b[i] = *v;
-                    }
+                for (slot, &v) in f.b.iter_mut().zip(parts.iter()) {
+                    *slot = v;
                 }
             } else if let Some(rest) = trimmed.strip_prefix("prev_L = ") {
                 let parts: Vec<&str> = rest.split_whitespace().collect();
@@ -125,8 +111,8 @@ fn parse_trace(path: &str) -> Vec<Op25Frame> {
                     .split_whitespace()
                     .filter_map(|s| s.parse().ok())
                     .collect();
-                for (i, v) in vals.iter().enumerate().take(57) {
-                    f.prev_log2_ml[i] = *v;
+                for (slot, &v) in f.prev_log2_ml.iter_mut().zip(vals.iter()) {
+                    *slot = v;
                 }
             }
         }
@@ -134,7 +120,7 @@ fn parse_trace(path: &str) -> Vec<Op25Frame> {
     if let Some(f) = cur {
         frames.push(f);
     }
-    frames
+    Ok(frames)
 }
 
 /// Build our [`PitchEstimate`] from OP25's `ref_pitch` (Q8.8 period).
@@ -175,7 +161,7 @@ fn vuv_from_op25(v_uv_dsn: &[bool], num_harms: usize, num_bands: usize) -> VuvDe
 /// to reverse the scaling and end up with the same value OP25 uses.
 fn amps_from_op25(sa: &[i32], num_harms: usize) -> SpectralAmplitudes {
     let mut magnitudes = [0.0_f32; MAX_HARMONICS];
-    for (i, &v) in sa.iter().enumerate().take(num_harms).take(MAX_HARMONICS) {
+    for (slot, &v) in magnitudes.iter_mut().zip(sa.iter().take(num_harms)) {
         // Pass OP25's sa verbatim as the "raw" magnitude. Our quantize
         // then multiplies by SA_SCALE=32768 then `log2` — but OP25 is
         // already at the int16 scale (log2 ready), so divide first so
@@ -186,7 +172,7 @@ fn amps_from_op25(sa: &[i32], num_harms: usize) -> SpectralAmplitudes {
                       exact within int16 range where real values land."
         )]
         let f = v as f32 / 32768.0;
-        magnitudes[i] = f;
+        *slot = f;
     }
     SpectralAmplitudes {
         magnitudes,
@@ -194,7 +180,7 @@ fn amps_from_op25(sa: &[i32], num_harms: usize) -> SpectralAmplitudes {
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let Some(path) = args.get(1) else {
         eprintln!(
@@ -203,23 +189,21 @@ fn main() {
         );
         std::process::exit(2);
     };
-    let frames = parse_trace(path);
+    let frames = parse_trace(path)?;
     eprintln!("parsed {} frames", frames.len());
 
-    let mut exact_b_match = 0;
-    let mut b0_match = 0;
-    let mut b_total = 0;
+    let mut exact_b_match = 0_usize;
+    let mut b0_match = 0_usize;
+    let mut b_total = 0_usize;
     let mut b_pos_matches = [0_usize; 9];
 
-    for i in 0..frames.len() {
-        let f = &frames[i];
-        if f.num_harms == 0 {
-            continue; // silence-ish frame in OP25 — skip
-        }
-        // Previous-frame state: for frame 0, zero prev. For frame N,
-        // use frame N-1's post-encode dump.
-        let prev = if i == 0 {
-            PrevFrameState {
+    // Previous-frame state: for frame 0, zero prev. For frame N, use
+    // frame N-1's post-encode dump — even when N-1 was a skipped
+    // silence-ish frame.
+    let mut prev_frame: Option<&Op25Frame> = None;
+    for (i, f) in frames.iter().enumerate() {
+        let prev = prev_frame.map_or_else(
+            || PrevFrameState {
                 log2_ml: [0.0_f32; 57],
                 l: 0,
                 // OP25 trace format predates the `prev_gamma` predictor
@@ -229,14 +213,17 @@ fn main() {
                 // delta) and that divergence is the whole reason this
                 // field now exists.
                 prev_gamma: 0.0,
-            }
-        } else {
-            PrevFrameState {
-                log2_ml: frames[i - 1].prev_log2_ml,
-                l: frames[i - 1].prev_l,
+            },
+            |pf| PrevFrameState {
+                log2_ml: pf.prev_log2_ml,
+                l: pf.prev_l,
                 prev_gamma: 0.0,
-            }
-        };
+            },
+        );
+        prev_frame = Some(f);
+        if f.num_harms == 0 {
+            continue; // silence-ish frame in OP25 — skip
+        }
         let pitch = pitch_from_op25(f.ref_pitch_q88, 0.5);
         let amps = amps_from_op25(&f.sa, f.num_harms);
         // OP25 picks num_bands based on the pitch-dependent band
@@ -248,7 +235,7 @@ fn main() {
         let outcome = quantize(pitch, vuv, &amps, &prev);
         // Extract our b[0..8] from the returned ambe_d.
         let a = &outcome.ambe_d;
-        let bit = |k: usize| i32::from(a[k]);
+        let bit = |k: usize| i32::from(a.get(k).copied().unwrap_or(0));
         let our_b0 = (bit(0) << 6)
             | (bit(1) << 5)
             | (bit(2) << 4)
@@ -291,23 +278,21 @@ fn main() {
         if ours == f.b {
             exact_b_match += 1;
         }
-        if ours[0] == f.b[0] {
+        if ours.first() == f.b.first() {
             b0_match += 1;
         }
-        for k in 0..9 {
-            if ours[k] == f.b[k] {
-                b_pos_matches[k] += 1;
+        for ((our_v, op25_v), count) in ours.iter().zip(f.b.iter()).zip(b_pos_matches.iter_mut()) {
+            if our_v == op25_v {
+                *count += 1;
             }
         }
-        if i < 20 || ours != f.b {
-            if i < 20 {
-                println!(
-                    "F{i:3}: OP25 b={:?}  OURS b={:?}  {}",
-                    f.b,
-                    ours,
-                    if ours == f.b { "MATCH" } else { "DIFF" }
-                );
-            }
+        if i < 20 {
+            println!(
+                "F{i:3}: OP25 b={:?}  OURS b={:?}  {}",
+                f.b,
+                ours,
+                if ours == f.b { "MATCH" } else { "DIFF" }
+            );
         }
     }
 
@@ -328,4 +313,5 @@ fn main() {
             100.0 * *count as f64 / b_total.max(1) as f64
         );
     }
+    Ok(())
 }

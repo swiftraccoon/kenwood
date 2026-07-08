@@ -267,12 +267,14 @@ mod whitener_tests {
         // First 4 bytes XOR FIRMWARE_WHITENING; subsequent bytes cycle.
         let zeros = [0_u8; FRAME_LEN];
         let whitened = apply_whitening(zeros);
-        for (i, &b) in whitened.iter().enumerate() {
+        for (i, (&b, &expected)) in whitened
+            .iter()
+            .zip(FIRMWARE_WHITENING.iter().cycle())
+            .enumerate()
+        {
             assert_eq!(
-                b,
-                FIRMWARE_WHITENING[i % FIRMWARE_WHITENING.len()],
-                "byte {i}: whitened {b:#x} != expected {:#x}",
-                FIRMWARE_WHITENING[i % FIRMWARE_WHITENING.len()],
+                b, expected,
+                "byte {i}: whitened {b:#x} != expected {expected:#x}",
             );
         }
     }
@@ -281,27 +283,26 @@ mod whitener_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        FRAME_LEN, PITCH_ANCHORS, STABLE_BIT_MASK, VOLATILE_BIT_MASK, hamming_distance,
-        mask_stable_bits,
+        PITCH_ANCHORS, STABLE_BIT_MASK, VOLATILE_BIT_MASK, hamming_distance, mask_stable_bits,
     };
 
     /// `STABLE_BIT_MASK` and `VOLATILE_BIT_MASK` must partition all 72 bits.
     #[test]
     fn masks_partition_all_72_bits() {
-        for i in 0..FRAME_LEN {
+        for (i, (&stable, &volatile)) in STABLE_BIT_MASK
+            .iter()
+            .zip(VOLATILE_BIT_MASK.iter())
+            .enumerate()
+        {
             assert_eq!(
-                STABLE_BIT_MASK[i] | VOLATILE_BIT_MASK[i],
+                stable | volatile,
                 0xFF,
-                "byte {i}: stable {:#x} | volatile {:#x} != 0xFF",
-                STABLE_BIT_MASK[i],
-                VOLATILE_BIT_MASK[i]
+                "byte {i}: stable {stable:#x} | volatile {volatile:#x} != 0xFF",
             );
             assert_eq!(
-                STABLE_BIT_MASK[i] & VOLATILE_BIT_MASK[i],
+                stable & volatile,
                 0,
-                "byte {i}: stable {:#x} & volatile {:#x} != 0 (overlap)",
-                STABLE_BIT_MASK[i],
-                VOLATILE_BIT_MASK[i]
+                "byte {i}: stable {stable:#x} & volatile {volatile:#x} != 0 (overlap)",
             );
         }
     }
@@ -325,9 +326,14 @@ mod tests {
     #[test]
     fn anchor_frames_are_already_masked() {
         for anchor in PITCH_ANCHORS {
-            for (i, &byte) in anchor.frame.iter().enumerate() {
+            for (i, (&byte, &volatile)) in anchor
+                .frame
+                .iter()
+                .zip(VOLATILE_BIT_MASK.iter())
+                .enumerate()
+            {
                 assert_eq!(
-                    byte & VOLATILE_BIT_MASK[i],
+                    byte & volatile,
                     0,
                     "anchor {} Hz, byte {i}: volatile bits not zeroed in {byte:#x}",
                     anchor.frequency_hz
@@ -361,7 +367,7 @@ mod tests {
     /// Exact distances were measured during the RE pass and codified here
     /// to catch drift if any anchor is mistyped.
     #[test]
-    fn cross_anchor_distances_match_measurements() {
+    fn cross_anchor_distances_match_measurements() -> Result<(), Box<dyn std::error::Error>> {
         // (lhs_hz, rhs_hz, expected_bits)
         let expected: &[(f32, f32, u32)] = &[
             (210.0, 440.0, 17),
@@ -375,16 +381,17 @@ mod tests {
             let lhs = PITCH_ANCHORS
                 .iter()
                 .find(|a| a.frequency_hz.to_bits() == lhs_hz.to_bits())
-                .expect("lhs anchor present");
+                .ok_or("lhs anchor present")?;
             let rhs = PITCH_ANCHORS
                 .iter()
                 .find(|a| a.frequency_hz.to_bits() == rhs_hz.to_bits())
-                .expect("rhs anchor present");
+                .ok_or("rhs anchor present")?;
             let got = hamming_distance(lhs.frame, rhs.frame);
             assert_eq!(
                 got, want,
                 "{lhs_hz} Hz vs {rhs_hz} Hz: got {got} bits, expected {want}"
             );
         }
+        Ok(())
     }
 }

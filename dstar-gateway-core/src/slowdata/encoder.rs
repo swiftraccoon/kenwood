@@ -83,14 +83,7 @@ mod tests {
         assert_eq!(out.len(), 8);
 
         let mut c = SlowDataTextCollector::new();
-        for (i, h) in out.iter().enumerate() {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "`i` comes from `.enumerate()` over an 8-element fixture \
-                          (`out.len() == 8` asserted above), so `i as u8` is always \
-                          lossless. `wrapping_add(1)` then produces frame indices 1..=8."
-            )]
-            let idx = (i as u8).wrapping_add(1);
+        for (idx, h) in (1u8..).zip(out.iter()) {
             c.push(*h, idx);
         }
         let msg = c.take_message().ok_or("complete")?;
@@ -102,15 +95,7 @@ mod tests {
     fn exactly_20_chars_roundtrip() -> TestResult {
         let out = encode_text_message("ABCDEFGHIJKLMNOPQRST");
         let mut c = SlowDataTextCollector::new();
-        for (i, h) in out.iter().enumerate() {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "`i` comes from `.enumerate()` over `encode_text_message`'s output \
-                          which is bounded to at most 8 halves (D-STAR slow-data carries \
-                          20 chars in 4 packets × 2 halves), so `i as u8` is always \
-                          lossless."
-            )]
-            let idx = (i as u8).wrapping_add(1);
+        for (idx, h) in (1u8..).zip(out.iter()) {
             c.push(*h, idx);
         }
         let msg = c.take_message().ok_or("complete")?;
@@ -122,15 +107,7 @@ mod tests {
     fn long_input_truncates_to_20() -> TestResult {
         let out = encode_text_message("1234567890ABCDEFGHIJKLMN");
         let mut c = SlowDataTextCollector::new();
-        for (i, h) in out.iter().enumerate() {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "`i` comes from `.enumerate()` over `encode_text_message`'s output \
-                          which is bounded to at most 8 halves (D-STAR slow-data carries \
-                          20 chars in 4 packets × 2 halves), so `i as u8` is always \
-                          lossless."
-            )]
-            let idx = (i as u8).wrapping_add(1);
+        for (idx, h) in (1u8..).zip(out.iter()) {
             c.push(*h, idx);
         }
         let msg = c.take_message().ok_or("complete")?;

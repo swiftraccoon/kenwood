@@ -106,8 +106,8 @@ impl ToneCode {
         clippy::indexing_slicing,
         reason = "`ToneCode::new` validates `self.0 <= MAX_INDEX == 50` and \
                   CTCSS_FREQUENCIES has 51 entries, so this const-fn index is always \
-                  in-bounds. Kept as indexed access (not `.get(...)`) because `const fn` \
-                  cannot unwrap Option yet and the invariant is type-enforced."
+                  in-bounds. Kept as indexed access because `slice::get` is not \
+                  const-callable, so a `const fn` has no non-indexing accessor."
     )]
     pub const fn frequency_hz(self) -> f64 {
         CTCSS_FREQUENCIES[self.0 as usize]
@@ -115,14 +115,8 @@ impl ToneCode {
 }
 
 impl std::fmt::Display for ToneCode {
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "Same invariant as `frequency_hz`: `self.0 <= MAX_INDEX == 50` by \
-                  construction via `ToneCode::new`, so `CTCSS_FREQUENCIES[self.0]` is \
-                  always in-bounds."
-    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({} Hz)", self.0, CTCSS_FREQUENCIES[self.0 as usize])
+        write!(f, "{} ({} Hz)", self.0, self.frequency_hz())
     }
 }
 
@@ -165,7 +159,8 @@ impl DcsCode {
         clippy::indexing_slicing,
         reason = "`DcsCode::new` validates `self.0 < COUNT == 104` and DCS_CODES has 104 \
                   entries, so this const-fn index is always in-bounds. Kept as indexed \
-                  access because `const fn` cannot unwrap Option yet."
+                  access because `slice::get` is not const-callable, so a `const fn` \
+                  has no non-indexing accessor."
     )]
     pub const fn code_value(self) -> u16 {
         DCS_CODES[self.0 as usize]
@@ -173,13 +168,8 @@ impl DcsCode {
 }
 
 impl std::fmt::Display for DcsCode {
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "Same invariant as `code_value`: `self.0 < COUNT == 104` by construction \
-                  via `DcsCode::new`, so `DCS_CODES[self.0]` is always in-bounds."
-    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "D{:03}", DCS_CODES[self.0 as usize])
+        write!(f, "D{:03}", self.code_value())
     }
 }
 

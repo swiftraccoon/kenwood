@@ -130,12 +130,6 @@ pub async fn fan_out_voice_at<P: Protocol>(
 
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::indexing_slicing,
-        reason = "Tests slice fixed-size fixture buffers where bounds are obvious by \
-                  construction; out-of-range access correctly fails the test."
-    )]
-
     use super::fan_out_voice;
     use crate::client_pool::{
         ClientHandle, ClientPool, DEFAULT_UNHEALTHY_THRESHOLD, UnhealthyOutcome,
@@ -224,7 +218,7 @@ mod tests {
         )
         .await??;
         assert_eq!(src_b, addr_a);
-        assert_eq!(&buf_b[..n_b], b"voicebits");
+        assert_eq!(buf_b.get(..n_b), Some(b"voicebits".as_slice()));
 
         let mut buf_c = [0u8; 64];
         let (n_c, src_c) = tokio::time::timeout(
@@ -233,7 +227,7 @@ mod tests {
         )
         .await??;
         assert_eq!(src_c, addr_a);
-        assert_eq!(&buf_c[..n_c], b"voicebits");
+        assert_eq!(buf_c.get(..n_c), Some(b"voicebits".as_slice()));
         Ok(())
     }
 
@@ -340,7 +334,7 @@ mod tests {
             sock_b.recv_from(&mut buf_b1),
         )
         .await??;
-        assert_eq!(&buf_b1[..n1], b"frame1");
+        assert_eq!(buf_b1.get(..n1), Some(b"frame1".as_slice()));
 
         // Second frame at the SAME instant: B's bucket is empty, so
         // we skip the send_to for B. Rate-limited is NOT unhealthy,
@@ -373,7 +367,11 @@ mod tests {
             sock_b.recv_from(&mut buf_b3),
         )
         .await??;
-        assert_eq!(&buf_b3[..n3], b"frame3", "refilled bucket delivers frame3");
+        assert_eq!(
+            buf_b3.get(..n3),
+            Some(b"frame3".as_slice()),
+            "refilled bucket delivers frame3"
+        );
         Ok(())
     }
 

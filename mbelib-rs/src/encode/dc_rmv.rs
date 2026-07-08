@@ -86,7 +86,7 @@ mod tests {
         dc_rmv(&input, &mut output, &mut mem);
         // Compare RMS: output should retain most of the input energy.
         let rms_in = rms(&input);
-        let rms_out = rms(&output[100..]); // skip transient
+        let rms_out = rms(output.split_at(100).1); // skip transient
         let ratio = rms_out / rms_in;
         assert!(
             ratio > 0.95,

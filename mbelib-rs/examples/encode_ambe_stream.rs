@@ -9,12 +9,8 @@
 #![cfg(feature = "encoder")]
 #![expect(
     clippy::print_stderr,
-    clippy::indexing_slicing,
-    reason = "CLI tool. `clippy::print_stderr` fires on stderr usage for CLI messages — \
-              standard pattern for a binary example, not a library. \
-              `clippy::indexing_slicing` fires on direct indexing into fixed-size frame \
-              buffers (9-byte AMBE, 160-sample PCM). The CLI reads exact-size frames \
-              with `read_exact` before indexing, so accesses are always in-bounds."
+    reason = "CLI tool: uses stderr for usage/error messages — standard pattern for a \
+              binary example, not a library."
 )]
 
 // Dev-dependencies pulled in by sibling tests/examples. Acknowledge them here so
@@ -26,14 +22,21 @@ use wide as _;
 use std::io::{Read, Write};
 
 fn main() -> std::io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 || args.len() > 4 {
-        eprintln!("usage: {} <in.s16> <out.ambe> [out.trace]", args[0]);
+    let mut args = std::env::args();
+    let prog = args
+        .next()
+        .unwrap_or_else(|| "encode_ambe_stream".to_owned());
+    let (Some(in_path), Some(out_path)) = (args.next(), args.next()) else {
+        eprintln!("usage: {prog} <in.s16> <out.ambe> [out.trace]");
+        std::process::exit(2);
+    };
+    let trace_path = args.next();
+    if args.next().is_some() {
+        eprintln!("usage: {prog} <in.s16> <out.ambe> [out.trace]");
         std::process::exit(2);
     }
-    let trace_path = args.get(3).cloned();
-    let mut input = std::fs::File::open(&args[1])?;
-    let mut output = std::fs::File::create(&args[2])?;
+    let mut input = std::fs::File::open(&in_path)?;
+    let mut output = std::fs::File::create(&out_path)?;
     let mut trace = match trace_path.as_deref() {
         Some("-") | None => None,
         Some(p) => Some(std::fs::File::create(p)?),
@@ -53,8 +56,10 @@ fn main() -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
         let mut pcm = [0_i16; 160];
-        for (i, slot) in pcm.iter_mut().enumerate() {
-            *slot = i16::from_le_bytes([pcm_bytes[i * 2], pcm_bytes[i * 2 + 1]]);
+        for (slot, chunk) in pcm.iter_mut().zip(pcm_bytes.chunks_exact(2)) {
+            if let [lo, hi] = *chunk {
+                *slot = i16::from_le_bytes([lo, hi]);
+            }
         }
         let ambe = enc.encode_frame_i16(&pcm);
         output.write_all(&ambe)?;

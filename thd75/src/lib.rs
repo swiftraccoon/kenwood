@@ -71,6 +71,15 @@ pub mod sdcard;
 pub mod transport;
 pub mod types;
 
+// Dev-dependencies used only by the integration tests in `tests/`.
+// Acknowledge them at the lib level so `unused_crate_dependencies`
+// stays silent for the lib-test compilation unit, which sees every
+// dev-dep but exercises none of these directly.
+#[cfg(test)]
+use proptest as _;
+#[cfg(test)]
+use serde_json as _;
+
 // Convenience re-exports for the most commonly used types.
 pub use error::Error;
 pub use radio::Radio;

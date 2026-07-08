@@ -21,15 +21,6 @@
 //! reference encoder actually emits, so matching it is the only way
 //! to achieve bit-exact `b0` against the OP25 traces.
 
-#![expect(
-    clippy::indexing_slicing,
-    reason = "Pitch quantization: indices into B0_LOOKUP (827 entries, statically sized) \
-              and AmbePlusLtable are bounded by the OP25 walk algorithm — the ±1 step \
-              over `b0_lookup[]` stays within [0, 826] by construction. Rewriting with \
-              `.get()?` would obscure the OP25 reference-implementation traceability \
-              that this module exists to preserve."
-)]
-
 /// OP25 `b0_lookup[]` table — 827 entries (`ambe_encoder.cc:41-146`).
 ///
 /// Indexed by `(ref_pitch >> 5) - 159` where `ref_pitch` is the
@@ -116,7 +107,7 @@ pub(crate) fn pitch_index(ref_pitch_q8_8: u32, target_l: usize, ltable: &[f32]) 
     // Compile-time const; B0_LOOKUP is a fixed-size array whose
     // length is 827 (see table definition). Asserting the literal
     // here instead of casting the const `B0_LOOKUP.len() as i32`
-    // avoids the usize→i32 cast lints without a per-site `#[allow]`.
+    // avoids the usize→i32 cast lints without a per-site `#[expect]`.
     const LOOKUP_LEN: i32 = 827;
     const LOOKUP_MAX: i32 = LOOKUP_LEN - 1;
     debug_assert_eq!(
@@ -143,8 +134,11 @@ pub(crate) fn pitch_index(ref_pitch_q8_8: u32, target_l: usize, ltable: &[f32]) 
     // fallback.
     #[expect(
         clippy::cast_sign_loss,
-        reason = "b0_i is clamped to [0, LOOKUP_MAX] on line 120, so the i32-to-usize cast \
-                  cannot lose a sign bit here."
+        clippy::indexing_slicing,
+        reason = "b0_i is clamped to [0, LOOKUP_MAX] on the previous line, so the \
+                  i32-to-usize cast cannot lose a sign bit and the index is within \
+                  B0_LOOKUP's 827 entries. A `.get()` fallback would add a dead \
+                  silent-wrong-b0 branch to a bit-exact codec path."
     )]
     let mut b0 = B0_LOOKUP[b0_i as usize];
     let current_l = |b0: u8| -> usize {
@@ -173,8 +167,10 @@ pub(crate) fn pitch_index(ref_pitch_q8_8: u32, target_l: usize, ltable: &[f32]) 
             b0_i = 0;
             #[expect(
                 clippy::cast_sign_loss,
+                clippy::indexing_slicing,
                 reason = "b0_i was just set to 0 on the previous line, so the i32-to-usize \
-                          cast is trivially safe."
+                          cast is trivially safe and index 0 is in-bounds for the \
+                          827-entry table."
             )]
             {
                 b0 = B0_LOOKUP[b0_i as usize];
@@ -185,8 +181,10 @@ pub(crate) fn pitch_index(ref_pitch_q8_8: u32, target_l: usize, ltable: &[f32]) 
             b0_i = LOOKUP_MAX;
             #[expect(
                 clippy::cast_sign_loss,
-                reason = "b0_i was just set to LOOKUP_MAX (826), a non-negative integer, so \
-                          the i32-to-usize cast is trivially safe."
+                clippy::indexing_slicing,
+                reason = "b0_i was just set to LOOKUP_MAX (826), a non-negative integer and \
+                          the last valid index of the 827-entry table, so both the cast \
+                          and the index are trivially safe."
             )]
             {
                 b0 = B0_LOOKUP[b0_i as usize];
@@ -195,8 +193,10 @@ pub(crate) fn pitch_index(ref_pitch_q8_8: u32, target_l: usize, ltable: &[f32]) 
         }
         #[expect(
             clippy::cast_sign_loss,
+            clippy::indexing_slicing,
             reason = "b0_i has been verified non-negative (the `< 0` branch above) and \
-                      below LOOKUP_LEN (the `>= LOOKUP_LEN` branch above); cast is safe."
+                      below LOOKUP_LEN (the `>= LOOKUP_LEN` branch above), so the cast \
+                      is safe and the index is within the 827-entry table."
         )]
         {
             b0 = B0_LOOKUP[b0_i as usize];
@@ -224,14 +224,17 @@ mod tests {
         // b0). A regression in the dump ordering would show up as a
         // monotonicity break.
         for w in B0_LOOKUP.windows(2) {
-            assert!(w[0] <= w[1], "non-monotonic entry: {w:?}");
+            let [prev, next] = w else {
+                continue;
+            };
+            assert!(prev <= next, "non-monotonic entry: {w:?}");
         }
     }
 
     #[test]
     fn table_covers_full_b0_range() {
-        assert_eq!(B0_LOOKUP[0], 0);
-        assert_eq!(B0_LOOKUP[B0_LOOKUP.len() - 1], 119);
+        assert_eq!(B0_LOOKUP.first(), Some(&0));
+        assert_eq!(B0_LOOKUP.last(), Some(&119));
     }
 
     /// On an input whose `(ref_pitch >> 5) − 159` points at a slot
@@ -244,41 +247,43 @@ mod tests {
             reason = "L_TABLE entries are whole positive integers in 9..=56 stored as f32; \
                       the f32-to-usize cast is exact within this range."
         )]
-        let v = L_TABLE[b0 as usize] as usize;
+        let v = L_TABLE.get(b0 as usize).copied().unwrap_or(0.0) as usize;
         v
     }
 
     /// where `L_TABLE[b0] == target_l`, the walk exits immediately
     /// and returns the lookup's value.
     #[test]
-    fn no_walk_needed_when_initial_b0_matches_target_l() {
+    fn no_walk_needed_when_initial_b0_matches_target_l() -> Result<(), Box<dyn std::error::Error>> {
         // Pick ref_pitch such that b0_lookup entry happens to match.
         // For ref_pitch = 0x1800 (period = 24.0 samples), b0_i = 0x1800>>5 - 159 = 192 - 159 = 33.
         // B0_LOOKUP[33] = 12. L_TABLE[12] = ? — whatever mbelib says.
         let ref_pitch_q8_8 = 0x1800_u32;
         let b0_i = (ref_pitch_q8_8 >> 5) as usize - 159;
-        let start_b0 = B0_LOOKUP[b0_i];
+        let start_b0 = *B0_LOOKUP.get(b0_i).ok_or("b0_i out of table range")?;
         let start_l = l_of(start_b0);
         let chosen = pitch_index(ref_pitch_q8_8, start_l, &L_TABLE);
         assert_eq!(
             chosen, start_b0,
             "walk should be a no-op when L already matches"
         );
+        Ok(())
     }
 
     /// If the target L exceeds the initial slot's L, the walk must
     /// increment (not decrement) — corresponds to a longer-period
     /// pitch needing more harmonics.
     #[test]
-    fn walk_increments_when_target_l_is_larger() {
+    fn walk_increments_when_target_l_is_larger() -> Result<(), Box<dyn std::error::Error>> {
         let ref_pitch_q8_8 = 0x1800_u32;
         let b0_i = (ref_pitch_q8_8 >> 5) as usize - 159;
-        let start_b0 = B0_LOOKUP[b0_i];
+        let start_b0 = *B0_LOOKUP.get(b0_i).ok_or("b0_i out of table range")?;
         let start_l = l_of(start_b0);
         let chosen = pitch_index(ref_pitch_q8_8, start_l + 1, &L_TABLE);
         assert!(
             chosen > start_b0,
             "walk-up should produce larger b0; start={start_b0}, chosen={chosen}"
         );
+        Ok(())
     }
 }

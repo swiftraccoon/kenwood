@@ -14,16 +14,6 @@
 //! reference data. See the file-header comment above for context.
 
 #![cfg(feature = "kenwood-tables")]
-#![expect(
-    clippy::indexing_slicing,
-    clippy::expect_used,
-    reason = "Provenance-integrity test file. Directly indexes into extracted Kenwood DSP \
-              tables (known exact-size const arrays imported above) to check specific \
-              signature values, and uses `.expect()` on optional fields that the extracted \
-              firmware data guarantees present. Any bounds violation or missing field \
-              would indicate the wrong firmware dump was copied in — the test correctly \
-              panics in that case."
-)]
 
 // Dev-dependencies pulled in by sibling tests. Acknowledge them here so
 // `unused_crate_dependencies` stays silent for this compilation unit.
@@ -79,8 +69,8 @@ fn hpf_345hz_is_prefix_of_bank_h_i_j() {
         ("J", &BIQUAD_BANK_J[..]),
     ] {
         assert_eq!(
-            &bank[..5],
-            &HPF_345HZ_COEFFS[..],
+            bank.get(..5),
+            Some(&HPF_345HZ_COEFFS[..]),
             "bank {bank_name} first 5 coefficients diverged from HPF_345HZ_COEFFS"
         );
     }
@@ -119,14 +109,14 @@ fn math_lut_contains_ln2_and_ln10() {
 }
 
 #[test]
-fn envelope_weights_peak_is_at_index_51() {
+fn envelope_weights_peak_is_at_index_51() -> Result<(), Box<dyn std::error::Error>> {
     // Shape per the extraction notes: 0.88 → 1.0 peak at index 51, decay to 0.83,
     // sharp drop at 100, zero tail. Assert the peak is exactly at 51.
     let (peak_idx, &peak_val) = ENVELOPE_WEIGHTS
         .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .expect("non-empty table");
+        .ok_or("non-empty table")?;
     assert_eq!(
         peak_idx, 51,
         "envelope peak drifted from index 51 to {peak_idx}"
@@ -140,6 +130,7 @@ fn envelope_weights_peak_is_at_index_51() {
         "envelope tail at index 102 should be zero, got {}",
         ENVELOPE_WEIGHTS[102]
     );
+    Ok(())
 }
 
 #[test]
@@ -175,8 +166,8 @@ fn inline_codebook_11804a90_opens_with_known_q15_values() {
     // catch any endian / sign extraction bug.
     let expected = [1_i16, -8192, 8192, -8192, 3434, 1, 392, 392];
     assert_eq!(
-        &FN_11804A90[..expected.len()],
-        &expected,
+        FN_11804A90.get(..expected.len()),
+        Some(expected.as_slice()),
         "FN_11804A90 prefix diverged from the extraction dump"
     );
 }
@@ -200,10 +191,11 @@ fn block_interleaver_known_positions() {
         (55, 2),           // row 2 starts with 2
     ];
     for (k, expected) in fixtures {
+        let got = BLOCK_INTERLEAVER.get(k).copied();
         assert_eq!(
-            BLOCK_INTERLEAVER[k], expected,
-            "interleaver[{k}] drifted: got {}, expected {expected}",
-            BLOCK_INTERLEAVER[k]
+            got,
+            Some(expected),
+            "interleaver[{k}] drifted: got {got:?}, expected {expected}",
         );
     }
 }

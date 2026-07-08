@@ -80,9 +80,14 @@ mod tests {
     /// Filter coefficients must be symmetric (linear phase).
     #[test]
     fn coefficients_are_symmetric() {
-        for i in 0..PE_LPF_ORD / 2 {
-            let left = LPF_COEF[i];
-            let right = LPF_COEF[PE_LPF_ORD - 1 - i];
+        // Pair tap `i` (forward) with tap `PE_LPF_ORD - 1 - i`
+        // (reverse iteration) across the first half of the filter.
+        for (i, (left, right)) in LPF_COEF
+            .iter()
+            .zip(LPF_COEF.iter().rev())
+            .take(PE_LPF_ORD / 2)
+            .enumerate()
+        {
             assert!(
                 (left - right).abs() < 1e-9,
                 "asymmetry at tap {i}: {left} vs {right}",
@@ -124,8 +129,7 @@ mod tests {
         // LPF_COEF[PE_LPF_ORD - 1], then drifts left through the
         // coefficients as it moves through the line. So output[k]
         // for k < PE_LPF_ORD equals LPF_COEF[PE_LPF_ORD - 1 - k].
-        for (k, &out) in output.iter().enumerate().take(PE_LPF_ORD) {
-            let expected = LPF_COEF[PE_LPF_ORD - 1 - k];
+        for (k, (&out, &expected)) in output.iter().zip(LPF_COEF.iter().rev()).enumerate() {
             assert!(
                 (out - expected).abs() < 1e-9,
                 "impulse mismatch at k={k}: {out} vs {expected}",

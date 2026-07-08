@@ -420,6 +420,8 @@ mod tests {
     use super::*;
     use crate::lint;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
     fn all_commands_have_help() {
         for cmd in ALL_COMMANDS {
@@ -431,15 +433,16 @@ mod tests {
     }
 
     #[test]
-    fn every_help_text_passes_lint() {
+    fn every_help_text_passes_lint() -> TestResult {
         for cmd in ALL_COMMANDS {
-            let text = for_command(cmd).expect("entry exists");
-            if let Err(violations) = lint::check_output(text) {
-                panic!(
-                    "help for {cmd:?} violates accessibility rules: {violations:?}\ntext:\n{text}"
-                );
-            }
+            let text = for_command(cmd).ok_or_else(|| format!("no help entry for {cmd:?}"))?;
+            let lint_result = lint::check_output(text);
+            assert!(
+                lint_result.is_ok(),
+                "help for {cmd:?} violates accessibility rules: {lint_result:?}\ntext:\n{text}"
+            );
         }
+        Ok(())
     }
 
     #[test]
@@ -448,16 +451,22 @@ mod tests {
     }
 
     #[test]
-    fn freq_help_includes_example() {
-        let text = for_command("freq").expect("freq has help");
+    fn freq_help_includes_example() -> TestResult {
+        let text = for_command("freq").ok_or("freq has help")?;
         assert!(text.contains("Example:"));
         assert!(text.contains("Syntax:"));
+        Ok(())
     }
 
     #[test]
     fn mode_help_texts_pass_lint() {
-        lint::check_output(CAT_MODE_HELP).expect("CAT_MODE_HELP lints clean");
-        lint::check_output(APRS_MODE_HELP).expect("APRS_MODE_HELP lints clean");
-        lint::check_output(DSTAR_MODE_HELP).expect("DSTAR_MODE_HELP lints clean");
+        for (name, text) in [
+            ("CAT_MODE_HELP", CAT_MODE_HELP),
+            ("APRS_MODE_HELP", APRS_MODE_HELP),
+            ("DSTAR_MODE_HELP", DSTAR_MODE_HELP),
+        ] {
+            let lint_result = lint::check_output(text);
+            assert!(lint_result.is_ok(), "{name} lints clean: {lint_result:?}");
+        }
     }
 }

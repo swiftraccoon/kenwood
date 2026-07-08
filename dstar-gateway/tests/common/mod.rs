@@ -5,4 +5,4 @@
     reason = "each integration test uses a subset of the helper surface"
 )]
 
-pub mod fake_reflector;
+pub(crate) mod fake_reflector;

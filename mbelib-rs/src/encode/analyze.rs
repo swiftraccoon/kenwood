@@ -18,16 +18,6 @@
 //! The pitch-estimation step (`pitch_est()`) itself runs in phase P3
 //! and consumes `pitch_est_buf`. Phase P4 consumes the FFT output.
 
-#![expect(
-    clippy::indexing_slicing,
-    reason = "DSP front-end: indices into pitch-history buffers (`pitch_ref_buf`, \
-              `pitch_est_buf`, `snd[..FRAME]`) are bounded by the buffer constants \
-              (`PITCH_EST_BUF_SIZE`, `FRAME`) defined in the IMBE spec and enforced by \
-              the caller. Rewriting with `.get()?` would add unwrap noise to every array \
-              access in the FFT-scatter path without catching any real bug — bounds are \
-              static and obvious by construction."
-)]
-
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
 
@@ -126,14 +116,17 @@ pub fn analyze_frame(
     // stages read — swapping the filter doesn't change the data
     // flow, only the frequency response of the input.
     let tail_start = PITCH_EST_BUF_SIZE - FRAME;
+    // The length assert at the top of this function guarantees the
+    // split below cannot panic.
+    let (frame, _) = snd.split_at(FRAME);
     let (prefix, tail) = bufs.pitch_ref_buf.split_at_mut(tail_start);
     let _ = prefix; // keeping older history intact
     #[cfg(not(feature = "kenwood-tables"))]
-    dc_rmv(&snd[..FRAME], tail, &mut bufs.dc_rmv_mem);
+    dc_rmv(frame, tail, &mut bufs.dc_rmv_mem);
     #[cfg(feature = "kenwood-tables")]
     crate::encode::kenwood::filter::biquad_df1_section(
         &crate::encode::kenwood::biquads::HPF_345HZ_COEFFS,
-        &snd[..FRAME],
+        frame,
         tail,
         &mut bufs.kenwood_hpf_mem,
     );
@@ -147,17 +140,7 @@ pub fn analyze_frame(
         .get(tail_start..)
         .map(<[f32]>::to_vec)
         .unwrap_or_default();
-    #[expect(
-        clippy::expect_used,
-        reason = "`tail_start = PITCH_EST_BUF_SIZE - FRAME` which is always < PITCH_EST_BUF_SIZE \
-                  (FRAME=160, PITCH_EST_BUF_SIZE is 256 in current layout), so the slice is \
-                  always valid. A `.unwrap_or_else(|| unreachable!())` would be equivalent but \
-                  less readable."
-    )]
-    let est_tail = bufs
-        .pitch_est_buf
-        .get_mut(tail_start..)
-        .expect("tail slice in range");
+    let (_, est_tail) = bufs.pitch_est_buf.split_at_mut(tail_start);
     pe_lpf(&dc_removed_tail, est_tail, &mut bufs.pe_lpf_mem);
 
     // Step 4: build a 256-sample real-input buffer with Yazev's

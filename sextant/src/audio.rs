@@ -328,30 +328,27 @@ impl AudioHandle {
     /// `session_tx` is used to push `StartTx` / `TxFrame` / `EndTx`
     /// commands at the session task; those are distinct from the
     /// `AudioCommand`s the GUI sends to the worker itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS error if the worker thread cannot be spawned
+    /// (resource exhaustion). The audio subsystem is mandatory, so the
+    /// caller (`main`) treats this as fatal.
     pub(crate) fn start(
         session_tx: tokio_mpsc::Sender<SessionCommand>,
-    ) -> (Self, std_mpsc::Receiver<AudioStatus>) {
+    ) -> Result<(Self, std_mpsc::Receiver<AudioStatus>), std::io::Error> {
         let (cmd_tx, cmd_rx) = std_mpsc::channel();
         let (status_tx, status_rx) = std_mpsc::channel();
-        #[expect(
-            clippy::expect_used,
-            reason = "Thread spawn can only fail from OS resource exhaustion (PTHREAD_CREATE \
-                      ENOMEM/EAGAIN), which is unrecoverable inside an egui constructor — \
-                      the audio subsystem is mandatory for the GUI's purpose. Panicking \
-                      with a named message here produces a clearer crash report than \
-                      propagating the error through the GUI init path."
-        )]
         let worker = std::thread::Builder::new()
             .name("sextant-audio".into())
-            .spawn(move || run_audio_worker(cmd_rx, session_tx, status_tx))
-            .expect("spawn audio thread");
-        (
+            .spawn(move || run_audio_worker(cmd_rx, session_tx, status_tx))?;
+        Ok((
             Self {
                 cmd_tx,
                 _worker: std::sync::Arc::new(worker),
             },
             status_rx,
-        )
+        ))
     }
 
     /// Send a command to the audio worker. Drops silently if the

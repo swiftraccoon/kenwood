@@ -137,6 +137,8 @@ impl fmt::Display for AfGainLevel {
 pub struct SMeterReading(u8);
 
 impl SMeterReading {
+    /// Zero reading (S0 — no signal).
+    pub const ZERO: Self = Self(0);
     /// Number of valid S-meter reading values (0-5).
     pub const COUNT: u8 = 6;
 
@@ -423,6 +425,8 @@ impl From<BatteryLevel> for u8 {
 pub struct VoxGain(u8);
 
 impl VoxGain {
+    /// Minimum VOX gain (level 0).
+    pub const ZERO: Self = Self(0);
     /// Maximum valid VOX gain value (inclusive).
     pub const MAX: u8 = 9;
 
@@ -488,6 +492,8 @@ impl fmt::Display for VoxGain {
 pub struct VoxDelay(u8);
 
 impl VoxDelay {
+    /// Zero delay (level 0).
+    pub const ZERO: Self = Self(0);
     /// Maximum valid VOX delay value (inclusive).
     pub const MAX: u8 = 30;
 

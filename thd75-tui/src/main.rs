@@ -58,24 +58,37 @@ enum RunOutcome {
     ConnectFailed(radio_task::ConnectFailure),
 }
 
+/// Set up file logging when `RUST_LOG` is present. A read-only cwd
+/// must not abort the TUI just because `RUST_LOG` was set — run
+/// without file logging and say so.
+fn init_logging() {
+    if std::env::var("RUST_LOG").is_ok() {
+        match std::fs::File::create("thd75-tui.log") {
+            Ok(log_file) => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                    .with_writer(log_file)
+                    .with_ansi(false)
+                    .init();
+            }
+            Err(err) => {
+                eprintln!("warning: cannot create thd75-tui.log ({err}); logging disabled");
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     type BtResult = Result<(String, kenwood_thd75::transport::EitherTransport), String>;
 
     let cli = Cli::parse();
 
-    if std::env::var("RUST_LOG").is_ok() {
-        let log_file = std::fs::File::create("thd75-tui.log").expect("failed to create log file");
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_writer(log_file)
-            .with_ansi(false)
-            .init();
-    }
+    init_logging();
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _cleanup = disable_raw_mode();
+        let _cleanup = execute!(io::stdout(), LeaveAlternateScreen);
         original_hook(panic_info);
     }));
 
@@ -105,10 +118,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mcp_speed = cli.mcp_speed.clone();
 
         let _thread = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
+            let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .expect("failed to build tokio runtime");
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    // Restore the terminal before reporting: the main
+                    // thread is blocked pumping the CFRunLoop and only
+                    // reacts to `done_tx`.
+                    let _cleanup = disable_raw_mode();
+                    let _cleanup = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+                    let _cleanup = terminal.show_cursor();
+                    let _send = done_tx.send(Err(format!("failed to build tokio runtime: {err}")));
+                    return;
+                }
+            };
 
             let result = rt.block_on(async {
                 run_app(&mut terminal, transport, mcp_speed, bt_req_tx, bt_resp_rx)
@@ -116,11 +141,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| e.to_string())
             });
 
-            let _ = disable_raw_mode();
-            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-            let _ = terminal.show_cursor();
+            let _cleanup = disable_raw_mode();
+            let _cleanup = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+            let _cleanup = terminal.show_cursor();
 
-            let _ = done_tx.send(result);
+            let _send = done_tx.send(result);
         });
 
         // Main thread: pump CFRunLoop for IOBluetooth callbacks until the
@@ -140,6 +165,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                           signatures are verified against the CoreFoundation headers in this \
                           machine's SDK."
             )]
+            // SAFETY: `CFRunLoopRunInMode` and `kCFRunLoopDefaultMode`
+            // are declared exactly as in the CoreFoundation headers of
+            // this machine's SDK (mode: CFRunLoopMode as *const void,
+            // seconds: CFTimeInterval as f64, returnAfterSourceHandled:
+            // Boolean as u8, returning SInt32). The call runs the main
+            // thread's own run loop for at most 10 ms and touches no
+            // Rust-managed memory.
             unsafe {
                 unsafe extern "C" {
                     fn CFRunLoopRunInMode(
@@ -159,7 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // BluetoothTransport::open() must happen on the main thread.
             if let Ok((port, baud)) = bt_req_rx.try_recv() {
                 let result = radio_task::discover_and_open_transport(port.as_deref(), baud);
-                let _ = bt_resp_tx.send(result);
+                let _send = bt_resp_tx.send(result);
             }
 
             if let Ok(result) = done_rx.try_recv() {
@@ -198,9 +230,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn guide_terminal_mode_exit(message: &str) {
     println!("\n{message}\n");
     print!("Set Menu 650 to Off on the radio, then press Enter to retry (Ctrl-C to quit)... ");
-    let _ = io::stdout().flush();
+    let _flush = io::stdout().flush();
     let mut line = String::new();
-    let _ = io::stdin().read_line(&mut line);
+    let _bytes = io::stdin().read_line(&mut line);
     println!("Reconnecting...");
     std::thread::sleep(Duration::from_secs(4));
 }

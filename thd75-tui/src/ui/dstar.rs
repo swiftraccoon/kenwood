@@ -1,12 +1,3 @@
-#![expect(
-    clippy::too_many_lines,
-    reason = "D-STAR pane render functions draw complete UI sections (session status, \
-              stream history, last-heard list) — Ratatui's immediate-mode API means each \
-              visible cell is an explicit construction call. Splitting per-section \
-              helpers would move the layout logic away from the constraints that bound \
-              it, making the view harder to read end-to-end."
-)]
-
 use std::time::Instant;
 
 use ratatui::Frame;
@@ -61,6 +52,12 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
 // CAT config view (gateway not active)
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Draws the complete D-STAR CAT-config section — Ratatui's immediate-mode \
+              API means each visible cell is an explicit construction call; splitting \
+              would move layout logic away from the constraints that bound it."
+)]
 fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     let block = Block::default()
         .title(" D-STAR Configuration ")
@@ -225,6 +222,13 @@ fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
 // Gateway mode view (DStarGateway active)
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Draws the complete D-STAR gateway view (session status, stream history, \
+              last-heard list) — Ratatui's immediate-mode API means each visible cell \
+              is an explicit construction call; splitting would move layout logic away \
+              from the constraints that bound it."
+)]
 fn render_gateway(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     // --- Left pane: last heard list ---
     let count = app.dstar_last_heard.len();
@@ -251,7 +255,13 @@ fn render_gateway(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area
         };
         let end = (start + visible_height).min(count);
 
-        for (i, entry) in app.dstar_last_heard[start..end].iter().enumerate() {
+        for (i, entry) in app
+            .dstar_last_heard
+            .get(start..end)
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+        {
             let idx = start + i;
             let is_selected = idx == app.dstar_last_heard_index;
 
