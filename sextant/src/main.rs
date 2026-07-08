@@ -24,6 +24,7 @@ mod heard;
 mod hosts;
 mod session;
 mod settings;
+mod theme;
 mod ui;
 
 use std::env;
@@ -38,6 +39,11 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // MUST be the first statement: the local UTC offset can only be
+    // read soundly while the process is single-threaded (Unix env
+    // rules) — logging and the tokio runtime both spawn threads.
+    let local_offset = time::UtcOffset::current_local_offset().ok();
+
     let _log_guard = init_logging();
 
     // Build a multi-thread tokio runtime so the session task and any
@@ -68,7 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Sextant — D-STAR Client")
-            .with_inner_size([960.0, 680.0]),
+            .with_inner_size([960.0, 680.0])
+            .with_min_inner_size([880.0, 560.0]),
         ..Default::default()
     };
 
@@ -83,6 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 audio,
                 audio_status_rx,
                 runtime,
+                local_offset,
             )))
         }),
     )

@@ -97,6 +97,31 @@ pub(crate) enum SessionCommand {
     AudioInitError(String),
 }
 
+/// Routing fields from an RX stream's D-STAR header, display-trimmed.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RxRoute {
+    /// Origin suffix (often the radio model, e.g. `D75`).
+    pub(crate) suffix: String,
+    /// Destination callsign (usually `CQCQCQ`).
+    pub(crate) to: String,
+    /// Access repeater (RPT1).
+    pub(crate) rpt1: String,
+    /// Gateway repeater (RPT2).
+    pub(crate) rpt2: String,
+}
+
+impl RxRoute {
+    /// Extract the display-trimmed routing fields from a header.
+    fn from_header(header: &DStarHeader) -> Self {
+        Self {
+            suffix: header.my_suffix.to_string().trim().to_owned(),
+            to: header.ur_call.to_string().trim().to_owned(),
+            rpt1: header.rpt1.to_string().trim().to_owned(),
+            rpt2: header.rpt2.to_string().trim().to_owned(),
+        }
+    }
+}
+
 /// Current lifecycle state of the session, summarised for the GUI.
 #[derive(Debug, Clone)]
 pub(crate) enum ConnStatus {
@@ -128,6 +153,8 @@ pub(crate) enum SessionEvent {
         stream_id: u16,
         /// Source callsign (if known).
         from: String,
+        /// Routing fields from the stream's D-STAR header.
+        route: RxRoute,
     },
     /// An incoming voice stream ended.
     VoiceEnd {
@@ -306,6 +333,7 @@ enum RuntimeEvent {
     VoiceStart {
         stream_id: StreamId,
         my_call: String,
+        route: RxRoute,
     },
     VoiceEnd {
         stream_id: StreamId,
@@ -352,6 +380,7 @@ impl RuntimeEvent {
             } => Self::VoiceStart {
                 stream_id,
                 my_call: header.my_call.to_string(),
+                route: RxRoute::from_header(&header),
             },
             Event::VoiceEnd { stream_id, reason } => Self::VoiceEnd { stream_id, reason },
             Event::VoiceFrame { seq, frame, .. } => Self::VoiceFrame { seq, frame },
@@ -525,7 +554,11 @@ fn apply_gap_policy(state: &mut EventState, seq: u8, decisions: &mut Vec<EventDe
 /// `EventState` counter and slow-data collector.
 fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<EventDecision> {
     match event {
-        RuntimeEvent::VoiceStart { stream_id, my_call } => {
+        RuntimeEvent::VoiceStart {
+            stream_id,
+            my_call,
+            route,
+        } => {
             state.rx_frame_count = 0;
             state.rx_stream_id = stream_id.get();
             state.expected_seq = None;
@@ -540,6 +573,7 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
                 EventDecision::EmitSessionEvent(SessionEvent::VoiceStart {
                     stream_id: stream_id.get(),
                     from: my_call,
+                    route,
                 }),
             ]
         }
@@ -1038,8 +1072,18 @@ where
                 connecting
                     .handle_input(Instant::now(), src, slice)
                     .map_err(|e| format!("handshake input: {e}"))?;
-                if connecting.state_kind() == ClientStateKind::Connected {
-                    return Ok(());
+                match connecting.state_kind() {
+                    ClientStateKind::Connected => return Ok(()),
+                    // A login NAK (DPlus BUSY) closes the session —
+                    // surface the refusal immediately instead of
+                    // idling into a misleading 5-second timeout.
+                    ClientStateKind::Closed => {
+                        return Err("reflector refused the link (BUSY) — \
+                             DPlus authorization for your callsign/IP may \
+                             still be propagating"
+                            .into());
+                    }
+                    _ => {}
                 }
             }
             Ok(Err(e)) => return Err(format!("recv handshake: {e}")),
@@ -1383,6 +1427,7 @@ mod tests {
             RuntimeEvent::VoiceStart {
                 stream_id: sid(0x1234),
                 my_call: "W1AW".into(),
+                route: super::RxRoute::default(),
             },
             &mut state,
         );
@@ -1509,6 +1554,7 @@ mod tests {
             RuntimeEvent::VoiceStart {
                 stream_id: sid(0x0001),
                 my_call: "W1AW".into(),
+                route: super::RxRoute::default(),
             },
             &mut state,
         );
@@ -1862,6 +1908,55 @@ mod tests {
             "expected RxStats second, got {second:?}"
         );
         assert_eq!(state.frames_lost, 0, "counters reset after VoiceEnd");
+        Ok(())
+    }
+
+    /// **Regression guard for the masked-rejection bug.** A `DPlus`
+    /// reflector that answers BUSY has refused the link — the
+    /// handshake must fail immediately with a "refused" error, not
+    /// idle out as a fake 5-second "handshake timeout" (which is what
+    /// a real dstargateway REF refusal looked like before the fix).
+    #[tokio::test]
+    async fn dplus_busy_rejection_fails_fast_with_refusal() -> TestResult {
+        use std::time::Instant;
+
+        use dstar_gateway_core::codec::dplus::HostList;
+        use dstar_gateway_core::session::client::{Configured, DPlus, Session};
+        use dstar_gateway_core::types::{Callsign, Module};
+
+        // Fake reflector: reply BUSY to every datagram, like a REF
+        // refusing an unauthorized IP.
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let peer = server.local_addr()?;
+        let _reflector = tokio::spawn(async move {
+            let mut buf = [0_u8; 64];
+            while let Ok((_n, src)) = server.recv_from(&mut buf).await {
+                let reply = [0x08, 0xC0, 0x04, 0x00, b'B', b'U', b'S', b'Y'];
+                if server.send_to(&reply, src).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let sock = super::bind_session_socket().await?;
+        let configured = Session::<DPlus, Configured>::builder()
+            .callsign(Callsign::try_from_str("W1AW")?)
+            .local_module(Module::C)
+            .reflector_module(Module::C)
+            .reflector_callsign(Callsign::try_from_str("REF030")?)
+            .peer(peer)
+            .build();
+        let authed = configured
+            .authenticate(HostList::new())
+            .map_err(|f| f.error.to_string())?;
+        let mut connecting = authed
+            .connect(Instant::now())
+            .map_err(|f| f.error.to_string())?;
+        let result = super::run_handshake(&mut connecting, &sock).await;
+        assert!(
+            matches!(result, Err(ref e) if e.contains("refused")),
+            "BUSY must surface as an immediate refusal, got {result:?}"
+        );
         Ok(())
     }
 }

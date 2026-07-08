@@ -113,9 +113,71 @@ impl TxPosition {
     }
 }
 
+/// Mean Earth radius in kilometres (IUGG).
+const EARTH_RADIUS_KM: f64 = 6_371.008_8;
+
+/// Great-circle distance in kilometres between two positions
+/// (haversine formula).
+pub(crate) fn haversine_km(from: (f64, f64), to: (f64, f64)) -> f64 {
+    let (lat1, lon1) = (from.0.to_radians(), from.1.to_radians());
+    let (lat2, lon2) = (to.0.to_radians(), to.1.to_radians());
+    let dlat = lat2 - lat1;
+    let dlon = lon2 - lon1;
+    let a =
+        (lat1.cos() * lat2.cos()).mul_add((dlon / 2.0).sin().powi(2), (dlat / 2.0).sin().powi(2));
+    2.0 * EARTH_RADIUS_KM * a.sqrt().asin()
+}
+
+/// Initial great-circle bearing in degrees (0° = north, clockwise)
+/// from `from` towards `to`.
+pub(crate) fn initial_bearing_deg(from: (f64, f64), to: (f64, f64)) -> f64 {
+    let (lat1, lon1) = (from.0.to_radians(), from.1.to_radians());
+    let (lat2, lon2) = (to.0.to_radians(), to.1.to_radians());
+    let dlon = lon2 - lon1;
+    let y = dlon.sin() * lat2.cos();
+    let x = lat1
+        .cos()
+        .mul_add(lat2.sin(), -(lat1.sin() * lat2.cos() * dlon.cos()));
+    (y.atan2(x).to_degrees() + 360.0) % 360.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// JFK → LHR, the canonical great-circle test pair
+    /// (≈5 555 km, initial bearing ≈51°).
+    #[test]
+    fn haversine_and_bearing_match_known_pair() {
+        let jfk = (40.6413, -73.7781);
+        let lhr = (51.4700, -0.4543);
+        let dist = haversine_km(jfk, lhr);
+        assert!(
+            (dist - 5_555.0).abs() < 30.0,
+            "JFK-LHR ≈ 5555 km, got {dist:.1}"
+        );
+        let bearing = initial_bearing_deg(jfk, lhr);
+        assert!(
+            (bearing - 51.0).abs() < 2.0,
+            "JFK→LHR initial bearing ≈ 51°, got {bearing:.1}"
+        );
+    }
+
+    #[test]
+    fn zero_distance_for_identical_points() {
+        let p = (41.7148, -72.7273);
+        assert!(haversine_km(p, p) < 1e-9);
+    }
+
+    #[test]
+    fn bearing_is_normalized_to_compass_range() {
+        // Due west should be 270°, not -90°.
+        let bearing = initial_bearing_deg((0.0, 0.0), (0.0, -10.0));
+        assert!(
+            (bearing - 270.0).abs() < 1e-6,
+            "due west = 270°, got {bearing}"
+        );
+    }
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

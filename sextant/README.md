@@ -26,6 +26,28 @@ listening; treat transmit as experimental.**
 - Windowed-sinc resampling between the hardware rate and the 8 kHz
   codec rate (anti-aliasing built in).
 
+## UI
+
+One window, two pages, toggled in the header:
+
+- **Operator** — the everyday face. A hero display shows who is
+  talking right now (callsign, slow-data text, GPS, elapsed time,
+  loss), with the heard list beside it and a transmit strip along the
+  bottom (TRANSMIT toggle, mic meter, slow-data message, GPS beacon).
+  Clicking the reflector name in the header opens the connect sheet:
+  a searchable directory with favorites and recents first, and a
+  collapsed manual host form for unlisted reflectors.
+- **Debug** — the engineering surface. Timestamped, filterable event
+  log with copy-to-clipboard, live stream statistics, TX test tools
+  (silence, WAV), and audio device controls.
+
+The gear opens settings: operator callsign, auto-reconnect, heard
+persistence, audio devices. Errors appear as a dismissable strip
+under the header on both pages. Color is used as signal only: amber
+means live RF, red means you are transmitting, green means the link
+is healthy. The dark instrument theme embeds the Inter and JetBrains
+Mono fonts (both SIL OFL — license texts in `assets/`).
+
 ## Usage
 
 ```text
@@ -70,14 +92,17 @@ cargo run -p sextant
 
 In the GUI:
 
-1. Set **Callsign** to your own (≤ 8 ASCII chars, uppercase).
-2. Leave **Reflector host / port / callsign** at the defaults
-   (`127.0.0.1:30001`, `POLARIS`).
-3. Click **Connect**.
-4. Click **PTT** to start transmitting (mic audio → AMBE →
-   reflector). Click again to stop (EOT is sent).
-5. Any other client on the same module hears your audio; anyone
-   transmitting on your module plays through your speakers.
+1. Open the gear (top right) and set **Callsign** to your own
+   (≤ 8 ASCII chars, uppercase).
+2. Click the reflector name in the header (or **Open directory** on
+   the not-linked screen) and pick **POLARIS** — it's bundled, no
+   fetch needed. Clicking a row connects immediately.
+3. Click **TRANSMIT** (or hold **Space**) to start transmitting
+   (mic audio → AMBE → reflector). Click again / release to stop
+   (EOT is sent).
+4. Any other client on the same module hears your audio; anyone
+   transmitting on your module plays through your speakers and
+   lights up the hero display.
 
 A second client is needed to hear yourself — `thd75-repl` can link
 to `POLARIS` identically, or run a second `sextant` instance.

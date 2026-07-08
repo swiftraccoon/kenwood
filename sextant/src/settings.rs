@@ -28,6 +28,36 @@ use tracing::{debug, warn};
 /// Maximum entries kept in the recent-connections list.
 pub(crate) const RECENTS_CAP: usize = 8;
 
+/// Which clock timestamps are displayed in (heard list, event log).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TimeMode {
+    /// The operator's local timezone (falls back to UTC when the
+    /// local offset couldn't be detected at startup).
+    #[default]
+    Local,
+    /// UTC — ham logging convention.
+    Utc,
+}
+
+impl TimeMode {
+    /// Stable settings-file token.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Utc => "utc",
+        }
+    }
+
+    /// Parse the settings-file token; unknown values fall back to
+    /// the default so a future token can't brick old builds.
+    fn from_str(s: &str) -> Self {
+        match s {
+            "utc" => Self::Utc,
+            _ => Self::Local,
+        }
+    }
+}
+
 /// One remembered reflector connection (a favorite or a recent).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SavedHost {
@@ -101,6 +131,20 @@ pub(crate) struct Settings {
     pub(crate) reconnect_on_drop: bool,
     /// Persist the heard-list across launches.
     pub(crate) persist_heard_list: bool,
+    /// Timestamp display mode (heard list + event log).
+    pub(crate) time_mode: TimeMode,
+    /// Slow-data text message to transmit (≤20 chars).
+    pub(crate) tx_message: String,
+    /// GPS beacon enabled.
+    pub(crate) tx_beacon_enabled: bool,
+    /// Beacon latitude (edit string, parsed at push time).
+    pub(crate) tx_lat: String,
+    /// Beacon longitude (edit string, parsed at push time).
+    pub(crate) tx_lon: String,
+    /// Beacon APRS symbol glyph.
+    pub(crate) tx_symbol: String,
+    /// Beacon free-text comment.
+    pub(crate) tx_comment: String,
     /// Audio input device name (empty = host default).
     pub(crate) input_device: String,
     /// Audio output device name (empty = host default).
@@ -125,6 +169,13 @@ impl Default for Settings {
             reflector_module: 'C',
             reconnect_on_drop: false,
             persist_heard_list: false,
+            time_mode: TimeMode::default(),
+            tx_message: String::new(),
+            tx_beacon_enabled: false,
+            tx_lat: String::new(),
+            tx_lon: String::new(),
+            tx_symbol: "/".into(),
+            tx_comment: String::new(),
             input_device: String::new(),
             output_device: String::new(),
             favorites: Vec::new(),
@@ -208,6 +259,13 @@ fn serialize(s: &Settings) -> String {
     );
     push_bool(&mut out, "reconnect_on_drop", s.reconnect_on_drop);
     push_bool(&mut out, "persist_heard_list", s.persist_heard_list);
+    push_string(&mut out, "time_mode", s.time_mode.as_str());
+    push_string(&mut out, "tx_message", &s.tx_message);
+    push_bool(&mut out, "tx_beacon_enabled", s.tx_beacon_enabled);
+    push_string(&mut out, "tx_lat", &s.tx_lat);
+    push_string(&mut out, "tx_lon", &s.tx_lon);
+    push_string(&mut out, "tx_symbol", &s.tx_symbol);
+    push_string(&mut out, "tx_comment", &s.tx_comment);
     push_string(&mut out, "input_device", &s.input_device);
     push_string(&mut out, "output_device", &s.output_device);
     for (i, f) in s.favorites.iter().enumerate() {
@@ -266,7 +324,7 @@ fn parse(raw: &str) -> Result<Settings, String> {
         }
         // Boolean keys carry a bare `true` / `false`, not a quoted
         // string — handle them before the quoted-string parse.
-        if key == "reconnect_on_drop" || key == "persist_heard_list" {
+        if key == "reconnect_on_drop" || key == "persist_heard_list" || key == "tx_beacon_enabled" {
             let flag = match value {
                 "true" => true,
                 "false" => false,
@@ -277,10 +335,10 @@ fn parse(raw: &str) -> Result<Settings, String> {
                     ));
                 }
             };
-            if key == "reconnect_on_drop" {
-                out.reconnect_on_drop = flag;
-            } else {
-                out.persist_heard_list = flag;
+            match key {
+                "reconnect_on_drop" => out.reconnect_on_drop = flag,
+                "persist_heard_list" => out.persist_heard_list = flag,
+                _ => out.tx_beacon_enabled = flag,
             }
             continue;
         }
@@ -302,6 +360,12 @@ fn parse(raw: &str) -> Result<Settings, String> {
                     out.reflector_module = ch;
                 }
             }
+            "time_mode" => out.time_mode = TimeMode::from_str(&value),
+            "tx_message" => out.tx_message = value,
+            "tx_lat" => out.tx_lat = value,
+            "tx_lon" => out.tx_lon = value,
+            "tx_symbol" => out.tx_symbol = value,
+            "tx_comment" => out.tx_comment = value,
             "input_device" => out.input_device = value,
             "output_device" => out.output_device = value,
             // Unknown keys are ignored — forward-compat for future
@@ -340,7 +404,7 @@ fn parse_quoted(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RECENTS_CAP, SavedHost, Settings, parse, push_recent, serialize};
+    use super::{RECENTS_CAP, SavedHost, Settings, TimeMode, parse, push_recent, serialize};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -368,6 +432,13 @@ mod tests {
             reflector_module: 'B',
             reconnect_on_drop: true,
             persist_heard_list: true,
+            time_mode: TimeMode::Utc,
+            tx_message: "73 de sextant".into(),
+            tx_beacon_enabled: true,
+            tx_lat: "41.7148".into(),
+            tx_lon: "-72.7273".into(),
+            tx_symbol: "-".into(),
+            tx_comment: "home QTH".into(),
             input_device: "Built-in Microphone".into(),
             output_device: "External Headphones".into(),
             favorites: vec![saved("REF001")],
@@ -387,6 +458,14 @@ mod tests {
             matches!(result, Err(ref e) if e.contains("line 2")),
             "parser must reject malformed lines and report line number, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn unknown_time_mode_falls_back_to_local() -> TestResult {
+        let raw = "time_mode = \"martian\"\n";
+        let parsed = parse(raw).map_err(|e| format!("parse: {e}"))?;
+        assert_eq!(parsed.time_mode, TimeMode::Local);
+        Ok(())
     }
 
     #[test]

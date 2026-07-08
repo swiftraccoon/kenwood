@@ -36,8 +36,8 @@ use crate::audio::{AudioCommand, AudioHandle, AudioStatus};
 use crate::geo::TxPosition;
 use crate::heard::HeardList;
 use crate::hosts::{DirectoryUpdate, ReflectorDirectory};
-use crate::session::{ConnStatus, ConnectConfig, SessionCommand, SessionEvent};
-use crate::settings::{self, SavedHost, Settings};
+use crate::session::{ConnStatus, ConnectConfig, RxRoute, SessionCommand, SessionEvent};
+use crate::settings::{self, SavedHost, Settings, TimeMode};
 use crate::ui;
 
 /// Maximum lines kept in the event-log buffer. Older lines drop off
@@ -73,10 +73,11 @@ pub(crate) struct App {
     pub(crate) log: Vec<LogLine>,
     pub(crate) last_error: Option<String>,
     pub(crate) active_tx: bool,
-    /// Most recent D-STAR slow-data text message (20 chars max,
-    /// trailing whitespace trimmed). Cleared on Disconnect; kept
-    /// across streams so a viewer can read the last thing they
-    /// missed even after the speaker stops talking.
+    /// Slow-data text message from the current / most recent RX
+    /// stream (20 chars max, trailing whitespace trimmed). Cleared
+    /// when a new stream starts (the hero attributes it to the
+    /// speaker on screen) and on Disconnect; per-station history
+    /// lives in the heard list.
     pub(crate) last_slow_data: Option<String>,
     /// Stations heard this session.
     pub(crate) heard: HeardList,
@@ -89,7 +90,29 @@ pub(crate) struct App {
     /// Callsign of the currently-active incoming stream, captured from
     /// `VoiceStart` so the slow-data / GPS that arrive mid-stream can
     /// be attributed to the right heard-station.
-    current_rx_callsign: Option<String>,
+    pub(crate) current_rx_callsign: Option<String>,
+    /// Routing fields from the current / most recent RX stream's
+    /// header. Replaced per stream; cleared on Disconnect.
+    pub(crate) rx_route: Option<RxRoute>,
+
+    // --- presentation state (which page / overlay is showing) ---
+    /// Which page the header toggle shows.
+    pub(crate) page: ui::Page,
+    /// Which overlay is open, if any.
+    pub(crate) overlay: ui::Overlay,
+    /// Debug-page log filter.
+    pub(crate) log_filter: LogFilter,
+    /// Set while an RX voice stream is active (drives the hero
+    /// elapsed timer); cleared on `VoiceEnd` / disconnect.
+    pub(crate) rx_active_since: Option<std::time::Instant>,
+    /// Set while transmitting (drives the ON AIR elapsed timer).
+    pub(crate) tx_active_since: Option<std::time::Instant>,
+    /// Timestamp display mode (heard list + event log).
+    pub(crate) time_mode: TimeMode,
+    /// The machine's UTC offset, detected once at startup while the
+    /// process was still single-threaded. `None` when undetectable —
+    /// [`TimeMode::Local`] then falls back to UTC.
+    pub(crate) local_offset: Option<time::UtcOffset>,
 
     /// Audio-worker status mirrored from the `AudioStatus` channel.
     pub(crate) audio_state: AudioState,
@@ -128,16 +151,41 @@ pub(crate) struct App {
 /// One line in the event log.
 #[derive(Debug, Clone)]
 pub(crate) struct LogLine {
+    /// UTC wall-clock stamp (`HH:MM:SS`) captured at append time.
+    pub(crate) stamp: String,
     pub(crate) level: LogLevel,
     pub(crate) text: String,
 }
 
 /// Severity of an event-log line, used to colour it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogLevel {
     Info,
     Event,
     Error,
+}
+
+/// Debug-page log filter — which levels the log view shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LogFilter {
+    /// Every line.
+    #[default]
+    All,
+    /// Protocol events and errors (drops routine info lines).
+    Events,
+    /// Errors only.
+    Errors,
+}
+
+impl LogFilter {
+    /// True when a line of `level` passes this filter.
+    pub(crate) const fn admits(self, level: LogLevel) -> bool {
+        match self {
+            Self::All => true,
+            Self::Events => matches!(level, LogLevel::Event | LogLevel::Error),
+            Self::Errors => matches!(level, LogLevel::Error),
+        }
+    }
 }
 
 /// Per-stream RX loss counters mirrored from the session task.
@@ -201,13 +249,15 @@ impl App {
     /// task via `cmd_tx` / `evt_rx` and the shared audio worker via
     /// `audio`.
     pub(crate) fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         cmd_tx: mpsc::Sender<SessionCommand>,
         evt_rx: mpsc::Receiver<SessionEvent>,
         audio: AudioHandle,
         audio_status_rx: std_mpsc::Receiver<AudioStatus>,
         runtime: Runtime,
+        local_offset: Option<time::UtcOffset>,
     ) -> Self {
+        crate::theme::apply(&cc.egui_ctx);
         let settings = Settings::load_or_default();
         let protocol = match settings.protocol.as_str() {
             "DPlus" => ProtocolKind::DPlus,
@@ -258,15 +308,21 @@ impl App {
             reflector_module: settings.reflector_module,
             reconnect_on_drop: settings.reconnect_on_drop,
             persist_heard_list: settings.persist_heard_list,
-            tx_slow_text: String::new(),
-            tx_gps: TxGpsForm::default(),
+            tx_slow_text: settings.tx_message,
+            tx_gps: TxGpsForm {
+                enabled: settings.tx_beacon_enabled,
+                lat: settings.tx_lat,
+                lon: settings.tx_lon,
+                symbol: settings.tx_symbol,
+                comment: settings.tx_comment,
+            },
             status: ConnStatus::Disconnected,
             log: Vec::new(),
             last_error: None,
             active_tx: false,
             last_slow_data: None,
             heard: if settings.persist_heard_list {
-                HeardList::load(std::time::Instant::now())
+                HeardList::load()
             } else {
                 HeardList::default()
             },
@@ -274,6 +330,14 @@ impl App {
             last_rx_stats: None,
             link_last_heard_secs: None,
             current_rx_callsign: None,
+            rx_route: None,
+            page: ui::Page::default(),
+            overlay: ui::Overlay::default(),
+            log_filter: LogFilter::default(),
+            rx_active_since: None,
+            tx_active_since: None,
+            time_mode: settings.time_mode,
+            local_offset,
             audio_state: AudioState::default(),
             input_device: settings.input_device,
             output_device: settings.output_device,
@@ -324,19 +388,19 @@ impl App {
                 DirectoryUpdate::AuthLoaded { hosts } => {
                     let count = hosts.len();
                     self.directory.merge_hosts(hosts);
-                    self.append_log(LogLine {
-                        level: LogLevel::Info,
-                        text: format!("merged {count} REF hosts from the dstargateway auth server"),
-                    });
+                    self.append_log_line(
+                        LogLevel::Info,
+                        format!("merged {count} REF hosts from the dstargateway auth server"),
+                    );
                 }
                 DirectoryUpdate::Failed(err) => {
                     self.directory.set_status(format!(
                         "reflector list: fetch failed ({err}) — using cache"
                     ));
-                    self.append_log(LogLine {
-                        level: LogLevel::Error,
-                        text: format!("reflector directory fetch failed: {err}"),
-                    });
+                    self.append_log_line(
+                        LogLevel::Error,
+                        format!("reflector directory fetch failed: {err}"),
+                    );
                 }
             }
         }
@@ -358,23 +422,35 @@ impl App {
         });
     }
 
-    fn append_log(&mut self, line: LogLine) {
+    /// The UTC offset timestamps are displayed in, per the operator's
+    /// [`TimeMode`] choice.
+    pub(crate) fn display_offset(&self) -> time::UtcOffset {
+        match self.time_mode {
+            TimeMode::Utc => time::UtcOffset::UTC,
+            TimeMode::Local => self.local_offset.unwrap_or(time::UtcOffset::UTC),
+        }
+    }
+
+    /// Append a stamped line to the event log, evicting the oldest
+    /// line past [`LOG_CAPACITY`].
+    fn append_log_line(&mut self, level: LogLevel, text: String) {
         if self.log.len() >= LOG_CAPACITY {
             // Evict the oldest entry. `swap_remove(0)` would be O(1)
             // but reorders — for a log display we want FIFO order.
             let _removed = self.log.remove(0);
         }
-        self.log.push(line);
+        self.log.push(LogLine {
+            stamp: ui::format::fmt_time_hms(time::OffsetDateTime::now_utc(), self.display_offset()),
+            level,
+            text,
+        });
     }
 
     /// Apply a connection-status change: log it, reset TX and stale
     /// RX state on disconnect, and push the operator's slow-data once
     /// the link comes up.
     fn handle_status(&mut self, s: ConnStatus) {
-        self.append_log(LogLine {
-            level: LogLevel::Info,
-            text: format!("status: {}", ui::fmt_status(&s)),
-        });
+        self.append_log_line(LogLevel::Info, format!("status: {}", ui::fmt_status(&s)));
         // When we disconnect, make sure the PTT toggle resets so the
         // GUI can't get stuck "transmitting" without an active session.
         if matches!(s, ConnStatus::Disconnected) {
@@ -387,6 +463,9 @@ impl App {
             self.last_rx_stats = None;
             self.link_last_heard_secs = None;
             self.current_rx_callsign = None;
+            self.rx_route = None;
+            self.rx_active_since = None;
+            self.tx_active_since = None;
         }
         self.status = s;
         // On reaching Connected, push the operator's slow-data so a
@@ -412,43 +491,52 @@ impl App {
         while let Ok(evt) = self.evt_rx.try_recv() {
             match evt {
                 SessionEvent::Status(s) => self.handle_status(s),
-                SessionEvent::Log(t) => self.append_log(LogLine {
-                    level: LogLevel::Info,
-                    text: t,
-                }),
-                SessionEvent::VoiceStart { stream_id, from } => {
+                SessionEvent::Log(t) => self.append_log_line(LogLevel::Info, t),
+                SessionEvent::VoiceStart {
+                    stream_id,
+                    from,
+                    route,
+                } => {
                     // Decoder reset is driven by the session task
                     // (direct to audio worker) — the GUI only shows
                     // the event in the log.
-                    self.append_log(LogLine {
-                        level: LogLevel::Event,
-                        text: format!("VoiceStart sid=0x{stream_id:04X} from={from}"),
-                    });
+                    self.append_log_line(
+                        LogLevel::Event,
+                        format!("VoiceStart sid=0x{stream_id:04X} from={from}"),
+                    );
                     let callsign = from.trim().to_owned();
                     self.heard
-                        .record_stream(&callsign, std::time::Instant::now());
+                        .record_stream(&callsign, time::OffsetDateTime::now_utc());
                     self.current_rx_callsign = Some(callsign);
+                    self.rx_route = Some(route);
+                    self.rx_active_since = Some(std::time::Instant::now());
+                    // The hero attributes slow-data / position to the
+                    // speaker on screen — a new stream must not
+                    // inherit the previous speaker's. Their copy
+                    // stays on their heard-list row.
+                    self.last_slow_data = None;
+                    self.last_gps = None;
                 }
                 SessionEvent::VoiceEnd {
                     stream_id,
                     frames,
                     reason,
-                } => self.append_log(LogLine {
-                    level: LogLevel::Event,
-                    text: format!("VoiceEnd sid=0x{stream_id:04X} frames={frames} reason={reason}"),
-                }),
+                } => {
+                    self.append_log_line(
+                        LogLevel::Event,
+                        format!("VoiceEnd sid=0x{stream_id:04X} frames={frames} reason={reason}"),
+                    );
+                    self.rx_active_since = None;
+                }
                 SessionEvent::Error(e) => {
                     self.last_error = Some(e.clone());
-                    self.append_log(LogLine {
-                        level: LogLevel::Error,
-                        text: e,
-                    });
+                    self.append_log_line(LogLevel::Error, e);
                 }
                 SessionEvent::SlowDataMessage { stream_id, text } => {
-                    self.append_log(LogLine {
-                        level: LogLevel::Event,
-                        text: format!("SlowData sid=0x{stream_id:04X}: {text:?}"),
-                    });
+                    self.append_log_line(
+                        LogLevel::Event,
+                        format!("SlowData sid=0x{stream_id:04X}: {text:?}"),
+                    );
                     if let Some(callsign) = self.current_rx_callsign.clone() {
                         self.heard.record_message(&callsign, text.clone());
                     }
@@ -459,10 +547,10 @@ impl App {
                     latitude,
                     longitude,
                 } => {
-                    self.append_log(LogLine {
-                        level: LogLevel::Event,
-                        text: format!("GPS sid=0x{stream_id:04X} {latitude:.4},{longitude:.4}"),
-                    });
+                    self.append_log_line(
+                        LogLevel::Event,
+                        format!("GPS sid=0x{stream_id:04X} {latitude:.4},{longitude:.4}"),
+                    );
                     if let Some(callsign) = self.current_rx_callsign.clone() {
                         self.heard.record_gps(&callsign, latitude, longitude);
                     }
@@ -498,10 +586,10 @@ impl App {
                         })
                         .collect();
                     self.directory.merge_hosts(merged);
-                    self.append_log(LogLine {
-                        level: LogLevel::Info,
-                        text: format!("merged {count} REF hosts from DPlus auth"),
-                    });
+                    self.append_log_line(
+                        LogLevel::Info,
+                        format!("merged {count} REF hosts from DPlus auth"),
+                    );
                 }
             }
         }
@@ -512,13 +600,22 @@ impl App {
             Ok(c) => c,
             Err(e) => {
                 self.last_error = Some(e.clone());
-                self.append_log(LogLine {
-                    level: LogLevel::Error,
-                    text: format!("invalid config: {e}"),
-                });
+                self.append_log_line(LogLevel::Error, format!("invalid config: {e}"));
                 return;
             }
         };
+        // Record the identity every attempt goes out as — a stale
+        // callsign silently poisons DPlus auth, so the log must make
+        // it visible per-attempt.
+        self.append_log_line(
+            LogLevel::Info,
+            format!(
+                "connecting as {} → {} module {}",
+                cfg.callsign,
+                self.reflector_callsign.trim().to_uppercase(),
+                self.reflector_module
+            ),
+        );
         let _unused = self.cmd_tx.try_send(SessionCommand::Connect(cfg));
     }
 
@@ -533,7 +630,7 @@ impl App {
         }
     }
 
-    fn snapshot_settings(&self) -> Settings {
+    pub(crate) fn snapshot_settings(&self) -> Settings {
         Settings {
             callsign: self.callsign.clone(),
             reflector_host: self.reflector_host.clone(),
@@ -544,6 +641,13 @@ impl App {
             reflector_module: self.reflector_module,
             reconnect_on_drop: self.reconnect_on_drop,
             persist_heard_list: self.persist_heard_list,
+            time_mode: self.time_mode,
+            tx_message: self.tx_slow_text.clone(),
+            tx_beacon_enabled: self.tx_gps.enabled,
+            tx_lat: self.tx_gps.lat.clone(),
+            tx_lon: self.tx_gps.lon.clone(),
+            tx_symbol: self.tx_gps.symbol.clone(),
+            tx_comment: self.tx_gps.comment.clone(),
             input_device: self.input_device.clone(),
             output_device: self.output_device.clone(),
             favorites: self.favorites.clone(),
@@ -597,17 +701,16 @@ impl App {
     pub(crate) fn toggle_ptt(&mut self) {
         if self.active_tx {
             self.active_tx = false;
+            self.tx_active_since = None;
             self.audio.send(AudioCommand::StopTx);
         } else if matches!(self.status, ConnStatus::Connected { .. }) {
             self.active_tx = true;
+            self.tx_active_since = Some(std::time::Instant::now());
             self.audio.send(AudioCommand::StartTx {
                 my_call: self.callsign.clone(),
             });
         } else {
-            self.append_log(LogLine {
-                level: LogLevel::Error,
-                text: "cannot TX: not connected".into(),
-            });
+            self.append_log_line(LogLevel::Error, "cannot TX: not connected".into());
         }
     }
 
@@ -629,12 +732,14 @@ impl App {
         });
         if pressed && connected && !self.active_tx {
             self.active_tx = true;
+            self.tx_active_since = Some(std::time::Instant::now());
             self.audio.send(AudioCommand::StartTx {
                 my_call: self.callsign.clone(),
             });
         }
         if released && self.active_tx {
             self.active_tx = false;
+            self.tx_active_since = None;
             self.audio.send(AudioCommand::StopTx);
         }
     }
@@ -706,7 +811,7 @@ impl App {
 
     /// Parse the manual GPS fields into a [`TxPosition`], or `None` if
     /// the latitude / longitude fields aren't valid in-range numbers.
-    fn parse_tx_gps(&self) -> Option<TxPosition> {
+    pub(crate) fn parse_tx_gps(&self) -> Option<TxPosition> {
         let latitude: f64 = self.tx_gps.lat.trim().parse().ok()?;
         let longitude: f64 = self.tx_gps.lon.trim().parse().ok()?;
         let symbol = self.tx_gps.symbol.chars().next().unwrap_or('/');
@@ -717,6 +822,28 @@ impl App {
             comment: self.tx_gps.comment.clone(),
         };
         pos.validated().cloned()
+    }
+
+    /// Operator page: interim composition re-homing the existing
+    /// panels until the deck components land.
+    fn show_operator_page(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("tx_strip")
+            .frame(
+                egui::Frame::none()
+                    .fill(crate::theme::BG_INSET)
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
+            )
+            .show(ctx, |ui| {
+                ui::operator::tx_strip::show(self, ui);
+            });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui::operator::show_deck(self, ui);
+        });
+    }
+
+    /// Debug page: event log + engineering tools.
+    fn show_debug_page(&mut self, ctx: &egui::Context) {
+        ui::debug::show(self, ctx);
     }
 
     fn build_connect_config(&self) -> Result<ConnectConfig, String> {
@@ -765,50 +892,63 @@ impl eframe::App for App {
         self.drain_directory();
         self.handle_ptt_keybinding(ctx);
 
-        // Persistent status + PTT — always on screen, never tab-gated.
-        egui::TopBottomPanel::top("status_bar").show(ctx, |ui| {
-            ui::top_bar(self, ui);
-        });
-        // Connection form on the left.
-        egui::SidePanel::left("connection_panel")
-            .resizable(true)
-            .default_width(300.0)
+        egui::TopBottomPanel::top("header")
+            .frame(
+                egui::Frame::none()
+                    .fill(crate::theme::BG_WINDOW)
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
+            )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Connection");
-                    ui::connection::show(self, ui);
-                    ui.separator();
-                    egui::CollapsingHeader::new("Audio")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui::audio_panel::show(self, ui);
-                        });
+                ui::header(self, ui);
+            });
+        if self.last_error.is_some() {
+            egui::TopBottomPanel::top("error_strip")
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| {
+                    ui::error_strip(self, ui);
                 });
-            });
-        // Event log along the bottom.
-        egui::TopBottomPanel::bottom("log_panel")
-            .resizable(true)
-            .default_height(220.0)
-            .show(ctx, |ui| {
-                ui::log::show(self, ui);
-            });
-        // Transmit + Receive fill the centre as two columns.
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.columns(2, |cols| {
-                // `columns(2, ..)` always yields exactly two `Ui`s, so
-                // the slice pattern always matches; the pattern (rather
-                // than `cols[0]`) keeps clear of `indexing_slicing`.
-                if let [transmit_col, receive_col] = cols {
-                    transmit_col.heading("Transmit");
-                    ui::transmit::show(self, transmit_col);
-                    receive_col.heading("Receive");
-                    ui::receive::show(self, receive_col);
-                }
-            });
-        });
+        }
+        match self.page {
+            ui::Page::Operator => self.show_operator_page(ctx),
+            ui::Page::Debug => self.show_debug_page(ctx),
+        }
+        // Overlays draw last so they sit above both pages.
+        ui::operator::connect_sheet::show(self, ctx);
+        ui::settings_popup::show(self, ctx);
 
         // Repaint frequently so log lines and voice events appear
         // within a few frames of arrival.
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogFilter, LogLevel};
+
+    #[test]
+    fn status_text_covers_every_variant() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        use crate::session::ConnStatus;
+        use crate::ui::fmt_status;
+        assert_eq!(fmt_status(&ConnStatus::Disconnected), "disconnected");
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+        assert!(
+            fmt_status(&ConnStatus::Connecting { peer }).contains("127.0.0.1"),
+            "connecting shows the peer"
+        );
+        assert_eq!(fmt_status(&ConnStatus::Disconnecting), "disconnecting…");
+    }
+
+    #[test]
+    fn log_filter_admits_matrix() {
+        assert!(LogFilter::All.admits(LogLevel::Info));
+        assert!(LogFilter::All.admits(LogLevel::Error));
+        assert!(!LogFilter::Events.admits(LogLevel::Info));
+        assert!(LogFilter::Events.admits(LogLevel::Event));
+        assert!(LogFilter::Events.admits(LogLevel::Error));
+        assert!(!LogFilter::Errors.admits(LogLevel::Event));
+        assert!(LogFilter::Errors.admits(LogLevel::Error));
     }
 }
