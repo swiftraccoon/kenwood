@@ -8,13 +8,14 @@
 //! Lifecycle:
 //! 1. Send `GetVersion` + `GetStatus` immediately to learn the
 //!    protocol version and initial FIFO depths.
-//! 2. Enter the main `tokio::select!`:
+//! 2. Enter the main `tokio::select!` (biased, in priority order):
 //!    - receive from [`Command`] channel (handle → loop)
-//!    - read inbound bytes from the transport
 //!    - 250 ms periodic `GetStatus` poll (matches `MMDVMHost`'s
 //!      `m_statusTimer(1000, 0, 250)` at `Modem.cpp:245`)
 //!    - 10 ms playout tick to drain the [`TxQueue`] into the wire
 //!      when modem reports slot space (`Modem.cpp:247`)
+//!    - read inbound bytes from the transport (last, so a saturated
+//!      RX stream cannot starve the ticks)
 //! 3. Loop exits on consumer drop, `Shutdown` command, or a fatal
 //!    transport error.
 
@@ -32,11 +33,11 @@ use mmdvm_core::{
     MMDVM_ACK, MMDVM_DEBUG_DUMP, MMDVM_DEBUG1, MMDVM_DEBUG2, MMDVM_DEBUG3, MMDVM_DEBUG4,
     MMDVM_DEBUG5, MMDVM_DSTAR_DATA, MMDVM_DSTAR_EOT, MMDVM_DSTAR_HEADER, MMDVM_DSTAR_LOST,
     MMDVM_GET_STATUS, MMDVM_GET_VERSION, MMDVM_NAK, MMDVM_SERIAL_DATA, MMDVM_SET_MODE,
-    MMDVM_TRANSPARENT, MmdvmFrame, ModemStatus, NakReason, VersionResponse, decode_frame,
-    encode_frame,
+    MMDVM_TRANSPARENT, MmdvmFrame, ModemMode, ModemStatus, NakReason, VersionResponse,
+    decode_frame, encode_frame,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::error::ShellError;
@@ -58,6 +59,25 @@ const PLAYOUT_INTERVAL: Duration = Duration::from_millis(10);
 /// frame length (255).
 const RX_READ_CHUNK: usize = 512;
 
+/// Deadline for a single transport write (frame bytes + flush).
+///
+/// A wedged write side (kernel TX buffer full under asserted flow
+/// control, hung USB endpoint) would otherwise freeze the entire
+/// loop inside a handler `.await` — no reads, no commands, no
+/// shutdown. 5 s is far beyond any healthy serial or Bluetooth SPP
+/// latency; on expiry the loop exits with [`Event::Fatal`].
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a graceful shutdown keeps trying to flush queued TX
+/// frames before force-exiting.
+///
+/// The queue holds at most 64 frames draining at one per 10 ms
+/// playout tick (~640 ms), plus status-poll latency to learn about
+/// freed FIFO space — 2 s covers the worst healthy case. A modem
+/// that grants no space within that window is treated as wedged;
+/// undelivered frames surface as [`Event::TxDropped`].
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Maximum retained RX buffer capacity — guards against a malformed
 /// stream endlessly appending without producing frames. If the buffer
 /// exceeds this size with no decode progress we drop the contents and
@@ -74,6 +94,17 @@ pub(crate) struct ModemLoop<T: Transport> {
     dstar_space: u8,
     protocol_version: u8,
     shutting_down: bool,
+    /// Deadline for the shutdown TX flush — set when the `Shutdown`
+    /// command arrives; the loop force-exits once it passes.
+    flush_deadline: Option<Instant>,
+    /// Reply channel of an in-flight `SetMode` awaiting the modem's
+    /// ACK/NAK. The firmware acknowledges every `SetMode`
+    /// (`MMDVM/SerialPort.cpp` `processMessage`), so the caller's
+    /// result reflects whether the mode change actually happened.
+    pending_set_mode: Option<oneshot::Sender<Result<(), ShellError>>>,
+    /// Events dropped since the event channel was last writable —
+    /// see [`ModemLoop::emit_event`].
+    dropped_events: u64,
 }
 
 impl<T: Transport> ModemLoop<T> {
@@ -94,6 +125,9 @@ impl<T: Transport> ModemLoop<T> {
             // that until the first `VersionResponse` corrects us.
             protocol_version: 2,
             shutting_down: false,
+            flush_deadline: None,
+            pending_set_mode: None,
+            dropped_events: 0,
         }
     }
 
@@ -104,16 +138,42 @@ impl<T: Transport> ModemLoop<T> {
     /// since a failed transport is not useful to recover.
     pub(crate) async fn run(mut self) -> Result<T, ShellError> {
         let result = self.run_inner().await;
+
+        // Every send_dstar_* call for these frames already reported
+        // success ("queued") — discarding them on exit must be
+        // observable or the far end hears a silently truncated
+        // transmission.
+        let undelivered = self.tx_queue.len();
+        if undelivered > 0 {
+            tracing::warn!(
+                target: "mmdvm::tokio_shell",
+                frames = undelivered,
+                "exiting with undelivered TX frames"
+            );
+            self.emit_event(Event::TxDropped {
+                frames: undelivered,
+            });
+        }
+
         match &result {
             Ok(()) => tracing::debug!(
                 target: "mmdvm::tokio_shell",
                 "modem loop exited cleanly"
             ),
-            Err(e) => tracing::warn!(
-                target: "mmdvm::tokio_shell",
-                error = %e,
-                "modem loop exited with error"
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    target: "mmdvm::tokio_shell",
+                    error = %e,
+                    "modem loop exited with error"
+                );
+                // Consumers watching next_event() cannot see the
+                // JoinHandle result — surface the cause as a
+                // terminal event so a dead link is distinguishable
+                // from a clean close.
+                self.emit_event(Event::Fatal {
+                    message: e.to_string(),
+                });
+            }
         }
         result.map(|()| self.transport)
     }
@@ -139,12 +199,27 @@ impl<T: Transport> ModemLoop<T> {
         playout_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            if self.shutting_down && self.tx_queue.is_empty() {
-                tracing::debug!(
-                    target: "mmdvm::tokio_shell",
-                    "shutdown complete; exiting loop"
-                );
-                return Ok(());
+            if self.shutting_down {
+                if self.tx_queue.is_empty() {
+                    tracing::debug!(
+                        target: "mmdvm::tokio_shell",
+                        "shutdown complete; exiting loop"
+                    );
+                    return Ok(());
+                }
+                if self
+                    .flush_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    // The modem never granted enough space to flush.
+                    // Force-exit rather than hang the shutdown() caller
+                    // forever; run() reports the loss as TxDropped.
+                    tracing::warn!(
+                        target: "mmdvm::tokio_shell",
+                        "shutdown flush deadline expired with frames still queued"
+                    );
+                    return Ok(());
+                }
             }
 
             tokio::select! {
@@ -163,6 +238,32 @@ impl<T: Transport> ModemLoop<T> {
                     tracing::trace!(target: "mmdvm::hang_hunt", "select: command handled");
                 }
 
+                // The tick branches sit ABOVE the transport read on
+                // purpose: with `biased` polling, a perpetually
+                // readable transport (misbehaving firmware streaming
+                // back-to-back bytes, or a garbage flood) would
+                // otherwise win every iteration and starve status
+                // polling and TX playout entirely. Ticks are ready at
+                // most once per interval, so RX still dominates in
+                // healthy operation — this mirrors the reference,
+                // where playout runs unconditionally on every
+                // `clock()` call regardless of RX pressure.
+                _ = status_tick.tick() => {
+                    tracing::trace!(target: "mmdvm::hang_hunt", "select: status_tick fired");
+                    // Keep polling during a shutdown flush: a status
+                    // response is the only way to learn that FIFO
+                    // space freed up, which is exactly what the flush
+                    // is waiting for.
+                    self.write_frame(&MmdvmFrame::new(MMDVM_GET_STATUS)).await?;
+                    tracing::trace!(target: "mmdvm::hang_hunt", "select: status_tick handled");
+                }
+
+                _ = playout_tick.tick() => {
+                    tracing::trace!(target: "mmdvm::hang_hunt", "select: playout_tick fired");
+                    self.drain_tx_queue().await?;
+                    tracing::trace!(target: "mmdvm::hang_hunt", "select: playout_tick handled");
+                }
+
                 read = self.transport.read(&mut read_chunk) => {
                     tracing::trace!(target: "mmdvm::hang_hunt", "select: transport.read fired");
                     match read {
@@ -171,14 +272,14 @@ impl<T: Transport> ModemLoop<T> {
                                 target: "mmdvm::tokio_shell",
                                 "transport EOF; exiting loop"
                             );
-                            emit_event(&self.event_tx, Event::TransportClosed).await;
+                            self.emit_event(Event::TransportClosed);
                             return Ok(());
                         }
                         Ok(n) => {
                             if let Some(slice) = read_chunk.get(..n) {
                                 self.rx_buffer.extend_from_slice(slice);
                             }
-                            self.drain_rx().await?;
+                            self.drain_rx();
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -190,20 +291,6 @@ impl<T: Transport> ModemLoop<T> {
                         }
                     }
                     tracing::trace!(target: "mmdvm::hang_hunt", "select: transport.read handled");
-                }
-
-                _ = status_tick.tick() => {
-                    tracing::trace!(target: "mmdvm::hang_hunt", "select: status_tick fired");
-                    if !self.shutting_down {
-                        self.write_frame(&MmdvmFrame::new(MMDVM_GET_STATUS)).await?;
-                    }
-                    tracing::trace!(target: "mmdvm::hang_hunt", "select: status_tick handled");
-                }
-
-                _ = playout_tick.tick() => {
-                    tracing::trace!(target: "mmdvm::hang_hunt", "select: playout_tick fired");
-                    self.drain_tx_queue().await?;
-                    tracing::trace!(target: "mmdvm::hang_hunt", "select: playout_tick handled");
                 }
             }
         }
@@ -222,20 +309,41 @@ impl<T: Transport> ModemLoop<T> {
             }
             Command::SetMode { mode, reply } => {
                 let frame = MmdvmFrame::with_payload(MMDVM_SET_MODE, vec![mode.as_byte()]);
-                let result = self.write_frame(&frame).await;
-                let _send_result = reply.send(result);
+                match self.write_frame(&frame).await {
+                    // Written — the caller's reply now waits for the
+                    // modem's ACK/NAK (resolved in dispatch_frame).
+                    Ok(()) => self.pending_set_mode = Some(reply),
+                    Err(e) => {
+                        let _send_result = reply.send(Err(e));
+                    }
+                }
             }
             Command::SendDStarHeader { bytes, reply } => {
-                self.tx_queue.push_dstar_header(bytes);
-                let _send_result = reply.send(Ok(()));
+                let result =
+                    self.tx_queue
+                        .push_dstar_header(bytes)
+                        .map_err(|_| ShellError::BufferFull {
+                            mode: ModemMode::DStar,
+                        });
+                let _send_result = reply.send(result);
             }
             Command::SendDStarData { bytes, reply } => {
-                self.tx_queue.push_dstar_data(bytes);
-                let _send_result = reply.send(Ok(()));
+                let result =
+                    self.tx_queue
+                        .push_dstar_data(bytes)
+                        .map_err(|_| ShellError::BufferFull {
+                            mode: ModemMode::DStar,
+                        });
+                let _send_result = reply.send(result);
             }
             Command::SendDStarEot { reply } => {
-                self.tx_queue.push_dstar_eot();
-                let _send_result = reply.send(Ok(()));
+                let result = self
+                    .tx_queue
+                    .push_dstar_eot()
+                    .map_err(|_| ShellError::BufferFull {
+                        mode: ModemMode::DStar,
+                    });
+                let _send_result = reply.send(result);
             }
             Command::SendRaw {
                 command,
@@ -248,6 +356,7 @@ impl<T: Transport> ModemLoop<T> {
             }
             Command::Shutdown { reply } => {
                 self.shutting_down = true;
+                self.flush_deadline = Some(Instant::now() + SHUTDOWN_FLUSH_TIMEOUT);
                 let _send_result = reply.send(());
             }
         }
@@ -256,15 +365,14 @@ impl<T: Transport> ModemLoop<T> {
 
     /// Walk the RX buffer, decoding every complete frame currently
     /// available.
-    async fn drain_rx(&mut self) -> Result<(), ShellError> {
+    fn drain_rx(&mut self) {
         loop {
             match decode_frame(&self.rx_buffer) {
                 Ok(Some((frame, consumed))) => {
                     // Drop the consumed prefix. `drain` returns an
-                    // iterator that clears the range when dropped —
-                    // we consume it immediately with `for _ in`.
+                    // iterator that clears the range when dropped.
                     drop(self.rx_buffer.drain(..consumed));
-                    self.dispatch_frame(frame).await?;
+                    self.dispatch_frame(frame);
                 }
                 Ok(None) => {
                     // Need more bytes.
@@ -276,98 +384,128 @@ impl<T: Transport> ModemLoop<T> {
                         );
                         self.rx_buffer.clear();
                     }
-                    return Ok(());
+                    return;
                 }
                 Err(e) => {
                     // Silent-death prevention: decode errors are
                     // dropped as diagnostics, not propagated —
-                    // propagating via `?` would kill the whole
-                    // session loop on a single malformed byte. We
-                    // also resync by consuming one byte so we don't
-                    // loop forever on the same junk.
+                    // propagating would kill the whole session loop
+                    // on a single malformed byte. Resync to the next
+                    // frame-start candidate so we don't loop forever
+                    // on the same junk.
                     tracing::debug!(
                         target: "mmdvm::tokio_shell",
                         error = %e,
                         "decoder rejected RX bytes; resyncing"
                     );
-                    if !self.rx_buffer.is_empty() {
-                        let _discarded = self.rx_buffer.remove(0);
-                    }
+                    self.resync_rx_buffer();
                 }
             }
         }
     }
 
+    /// Discard the malformed prefix of the RX buffer up to (but not
+    /// including) the next `0xE0` frame-start candidate after index
+    /// 0, or everything if none exists. Equivalent to the reference's
+    /// byte-at-a-time scan for `MMDVM_FRAME_START`, but linear
+    /// instead of quadratic on garbage bursts.
+    fn resync_rx_buffer(&mut self) {
+        let next_start = self
+            .rx_buffer
+            .iter()
+            .skip(1)
+            .position(|&b| b == mmdvm_core::MMDVM_FRAME_START);
+        match next_start {
+            Some(offset) => {
+                // `offset` is relative to index 1.
+                drop(self.rx_buffer.drain(..=offset));
+            }
+            None => self.rx_buffer.clear(),
+        }
+    }
+
     /// Dispatch a decoded frame to the appropriate event variant.
-    async fn dispatch_frame(&mut self, frame: MmdvmFrame) -> Result<(), ShellError> {
+    fn dispatch_frame(&mut self, frame: MmdvmFrame) {
         match frame.command {
-            MMDVM_GET_VERSION => self.handle_version(&frame.payload).await,
-            MMDVM_GET_STATUS => self.handle_status(&frame.payload).await,
+            MMDVM_GET_VERSION => self.handle_version(&frame.payload),
+            MMDVM_GET_STATUS => self.handle_status(&frame.payload),
             MMDVM_ACK => {
-                let cmd = frame.payload.first().copied().unwrap_or(0);
-                emit_event(&self.event_tx, Event::Ack { command: cmd }).await;
+                // The reference always sends the ACK'd command byte;
+                // defaulting a missing byte to 0 would misattribute
+                // the ACK to GetVersion (0x00).
+                if let Some(&cmd) = frame.payload.first() {
+                    if cmd == MMDVM_SET_MODE
+                        && let Some(reply) = self.pending_set_mode.take()
+                    {
+                        let _send_result = reply.send(Ok(()));
+                    }
+                    self.emit_event(Event::Ack { command: cmd });
+                } else {
+                    self.protocol_violation(MMDVM_ACK, "empty ACK payload");
+                }
             }
             MMDVM_NAK => {
-                let cmd = frame.payload.first().copied().unwrap_or(0);
-                let reason = NakReason::from_byte(frame.payload.get(1).copied().unwrap_or(0));
-                emit_event(
-                    &self.event_tx,
-                    Event::Nak {
+                if let Some(&cmd) = frame.payload.first() {
+                    let reason = NakReason::from_byte(frame.payload.get(1).copied().unwrap_or(0));
+                    if cmd == MMDVM_SET_MODE
+                        && let Some(reply) = self.pending_set_mode.take()
+                    {
+                        let _send_result = reply.send(Err(ShellError::Nak {
+                            command: cmd,
+                            reason,
+                        }));
+                    }
+                    self.emit_event(Event::Nak {
                         command: cmd,
                         reason,
-                    },
-                )
-                .await;
+                    });
+                } else {
+                    self.protocol_violation(MMDVM_NAK, "empty NAK payload");
+                }
             }
-            MMDVM_DSTAR_HEADER => emit_dstar_header(&self.event_tx, &frame.payload).await,
-            MMDVM_DSTAR_DATA => emit_dstar_data(&self.event_tx, &frame.payload).await,
+            MMDVM_DSTAR_HEADER => self.emit_dstar_header(&frame.payload),
+            MMDVM_DSTAR_DATA => self.emit_dstar_data(&frame.payload),
             MMDVM_DSTAR_LOST => {
-                emit_event(&self.event_tx, Event::DStarLost).await;
+                self.emit_event(Event::DStarLost);
             }
             MMDVM_DSTAR_EOT => {
-                emit_event(&self.event_tx, Event::DStarEot).await;
+                self.emit_event(Event::DStarEot);
             }
             MMDVM_DEBUG1 | MMDVM_DEBUG2 | MMDVM_DEBUG3 | MMDVM_DEBUG4 | MMDVM_DEBUG5
             | MMDVM_DEBUG_DUMP => {
-                emit_debug(&self.event_tx, frame.command, &frame.payload).await;
+                self.emit_debug(frame.command, &frame.payload);
             }
             MMDVM_SERIAL_DATA => {
-                emit_event(&self.event_tx, Event::SerialData(frame.payload)).await;
+                self.emit_event(Event::SerialData(frame.payload));
             }
             MMDVM_TRANSPARENT => {
-                emit_event(&self.event_tx, Event::TransparentData(frame.payload)).await;
+                self.emit_event(Event::TransparentData(frame.payload));
             }
             other => {
-                emit_event(
-                    &self.event_tx,
-                    Event::UnhandledResponse {
-                        command: other,
-                        payload: frame.payload,
-                    },
-                )
-                .await;
+                self.emit_event(Event::UnhandledResponse {
+                    command: other,
+                    payload: frame.payload,
+                });
             }
         }
-        Ok(())
     }
 
     /// Handle an `MMDVM_GET_VERSION` response payload.
-    async fn handle_version(&mut self, payload: &[u8]) {
+    fn handle_version(&mut self, payload: &[u8]) {
         match VersionResponse::parse(payload) {
             Ok(v) => {
                 self.protocol_version = v.protocol;
-                emit_event(&self.event_tx, Event::Version(v)).await;
+                self.emit_event(Event::Version(v));
             }
-            Err(e) => tracing::debug!(
-                target: "mmdvm::tokio_shell",
-                error = %e,
-                "malformed GetVersion response; swallowing"
-            ),
+            // A dropped version response means the assumed protocol
+            // version was never confirmed — if it's wrong, every
+            // status parse reads shifted offsets. Surface it.
+            Err(e) => self.protocol_violation(MMDVM_GET_VERSION, &e.to_string()),
         }
     }
 
     /// Handle an `MMDVM_GET_STATUS` response payload.
-    async fn handle_status(&mut self, payload: &[u8]) {
+    fn handle_status(&mut self, payload: &[u8]) {
         let parsed = if self.protocol_version >= 2 {
             ModemStatus::parse_v2(payload)
         } else {
@@ -376,22 +514,133 @@ impl<T: Transport> ModemLoop<T> {
         match parsed {
             Ok(s) => {
                 self.dstar_space = s.dstar_space;
-                emit_event(&self.event_tx, Event::Status(s)).await;
+                self.emit_event(Event::Status(s));
             }
-            Err(e) => tracing::debug!(
-                target: "mmdvm::tokio_shell",
-                error = %e,
-                "malformed GetStatus response; swallowing"
-            ),
+            // A status that never parses freezes dstar_space and
+            // stalls TX forever with every send reporting success —
+            // the consumer must be able to see that happening.
+            Err(e) => self.protocol_violation(MMDVM_GET_STATUS, &e.to_string()),
         }
     }
 
-    /// Drain as many queued D-STAR frames as the modem's reported
-    /// FIFO slot count can absorb. Each successful write decrements
-    /// the local `dstar_space` estimate; the real number is
-    /// recalibrated on every status response.
+    /// Emit [`Event::ProtocolViolation`] for a frame whose payload
+    /// doesn't match its command's wire layout, with a matching
+    /// `warn` log.
+    fn protocol_violation(&mut self, command: u8, detail: &str) {
+        tracing::warn!(
+            target: "mmdvm::tokio_shell",
+            command = format!("0x{command:02X}"),
+            detail,
+            "protocol violation in modem response"
+        );
+        self.emit_event(Event::ProtocolViolation {
+            command,
+            detail: detail.to_owned(),
+        });
+    }
+
+    /// Deliver an event to the consumer without ever blocking the
+    /// loop.
+    ///
+    /// The event channel is bounded; blocking on a full channel would
+    /// deadlock a single-task consumer that is awaiting a command
+    /// reply while the channel is full (the consumer waits on the
+    /// loop, the loop waits on the consumer). The reference instead
+    /// decouples modem I/O from its consumer with fixed-size ring
+    /// buffers that lose data when full — we mirror that: excess
+    /// events are dropped and counted.
+    fn emit_event(&mut self, event: Event) {
+        match self.event_tx.try_send(event) {
+            Ok(()) => {
+                if self.dropped_events > 0 {
+                    tracing::warn!(
+                        target: "mmdvm::tokio_shell",
+                        dropped = self.dropped_events,
+                        "event channel recovered; events were dropped while it was full"
+                    );
+                    self.dropped_events = 0;
+                }
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if self.dropped_events == 0 {
+                    tracing::warn!(
+                        target: "mmdvm::tokio_shell",
+                        "event channel full; dropping events until the consumer catches up"
+                    );
+                }
+                self.dropped_events += 1;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(
+                    target: "mmdvm::tokio_shell",
+                    "event consumer dropped; suppressing further events"
+                );
+            }
+        }
+    }
+
+    /// Parse a D-STAR header payload and emit the corresponding
+    /// event.
+    fn emit_dstar_header(&mut self, payload: &[u8]) {
+        if let Ok(bytes) = <[u8; 41]>::try_from(payload) {
+            self.emit_event(Event::DStarHeaderRx { bytes });
+        } else {
+            self.protocol_violation(
+                MMDVM_DSTAR_HEADER,
+                &format!(
+                    "D-STAR header payload is {} bytes, expected 41",
+                    payload.len()
+                ),
+            );
+        }
+    }
+
+    /// Parse a D-STAR voice data payload and emit the corresponding
+    /// event.
+    fn emit_dstar_data(&mut self, payload: &[u8]) {
+        if let Ok(bytes) = <[u8; 12]>::try_from(payload) {
+            self.emit_event(Event::DStarDataRx { bytes });
+        } else {
+            self.protocol_violation(
+                MMDVM_DSTAR_DATA,
+                &format!(
+                    "D-STAR data payload is {} bytes, expected 12",
+                    payload.len()
+                ),
+            );
+        }
+    }
+
+    /// Decode a debug payload and emit it as [`Event::Debug`].
+    ///
+    /// `command` selects the level: DEBUG1..DEBUG5 map to 1..5, and
+    /// `MMDVM_DEBUG_DUMP` uses level 0 as a sentinel for "this is a
+    /// raw hex dump rather than readable text".
+    fn emit_debug(&mut self, command: u8, payload: &[u8]) {
+        let level = match command {
+            MMDVM_DEBUG1 => 1,
+            MMDVM_DEBUG2 => 2,
+            MMDVM_DEBUG3 => 3,
+            MMDVM_DEBUG4 => 4,
+            MMDVM_DEBUG5 => 5,
+            _ => 0,
+        };
+        let text = String::from_utf8_lossy(payload)
+            .trim_end_matches('\0')
+            .trim_end()
+            .to_owned();
+        self.emit_event(Event::Debug { level, text });
+    }
+
+    /// Release at most ONE queued D-STAR frame per playout tick,
+    /// mirroring the reference's pacing (`MMDVMHost/Modem.cpp:1049-1084`
+    /// writes a single frame, then restarts the playout timer). The
+    /// successful write decrements the local `dstar_space` estimate;
+    /// the real number is recalibrated on every status response.
+    /// One-frame pacing bounds how far a stale status estimate can
+    /// overshoot the modem's real FIFO.
     async fn drain_tx_queue(&mut self) -> Result<(), ShellError> {
-        while let Some(frame) = self.tx_queue.pop_if_space_allows(self.dstar_space) {
+        if let Some(frame) = self.tx_queue.pop_if_space_allows(self.dstar_space) {
             let wire = MmdvmFrame::with_payload(frame.command, frame.payload);
             tracing::trace!(
                 target: "mmdvm::tokio_shell",
@@ -404,11 +653,12 @@ impl<T: Transport> ModemLoop<T> {
             self.write_frame(&wire).await?;
             self.dstar_space = self.dstar_space.saturating_sub(frame.slots_required);
         }
-        tracing::trace!(target: "mmdvm::hang_hunt", "drain_tx_queue: queue empty");
         Ok(())
     }
 
-    /// Encode `frame` and push the bytes to the transport.
+    /// Encode `frame` and push the bytes to the transport, bounded
+    /// by [`WRITE_TIMEOUT`] so a wedged write side cannot freeze the
+    /// loop indefinitely.
     async fn write_frame(&mut self, frame: &MmdvmFrame) -> Result<(), ShellError> {
         let bytes = encode_frame(frame)?;
         tracing::trace!(
@@ -417,86 +667,20 @@ impl<T: Transport> ModemLoop<T> {
             cmd = format!("0x{:02X}", frame.command),
             "write_frame: awaiting transport.write_all"
         );
-        self.transport.write_all(&bytes).await?;
-        tracing::trace!(target: "mmdvm::hang_hunt", "write_frame: write_all done, awaiting flush");
-        self.transport.flush().await?;
+        let write = async {
+            self.transport.write_all(&bytes).await?;
+            self.transport.flush().await
+        };
+        match tokio::time::timeout(WRITE_TIMEOUT, write).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(ShellError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("transport write timed out after {WRITE_TIMEOUT:?}"),
+                )));
+            }
+        }
         tracing::trace!(target: "mmdvm::hang_hunt", "write_frame: flushed");
         Ok(())
     }
-}
-
-/// Send an event, logging and swallowing failure if the consumer
-/// channel has been dropped. Kept as a free function so the
-/// auto-`Send` checker doesn't require `&ModemLoop<T>: Sync`.
-async fn emit_event(sender: &mpsc::Sender<Event>, event: Event) {
-    // Hang-hunt: if the REPL stops consuming mmdvm events, this
-    // send will eventually block on a full channel (cap 256) and
-    // the entire modem loop freezes. A matched "awaiting" / "sent"
-    // pair is healthy; "awaiting" with no "sent" for hundreds of
-    // ms points directly at event-channel backpressure.
-    let variant = std::mem::discriminant(&event);
-    tracing::trace!(
-        target: "mmdvm::hang_hunt",
-        remaining_cap = sender.capacity(),
-        ?variant,
-        "emit_event: awaiting event_tx.send"
-    );
-    if sender.send(event).await.is_err() {
-        tracing::debug!(
-            target: "mmdvm::tokio_shell",
-            "event consumer dropped; suppressing further events"
-        );
-    } else {
-        tracing::trace!(target: "mmdvm::hang_hunt", "emit_event: sent");
-    }
-}
-
-/// Parse a D-STAR header payload and emit the corresponding event.
-///
-/// Unexpected payload lengths are swallowed as a debug diagnostic to
-/// match the sans-io core's leniency rules.
-async fn emit_dstar_header(sender: &mpsc::Sender<Event>, payload: &[u8]) {
-    if let Ok(bytes) = <[u8; 41]>::try_from(payload) {
-        emit_event(sender, Event::DStarHeaderRx { bytes }).await;
-    } else {
-        tracing::debug!(
-            target: "mmdvm::tokio_shell",
-            len = payload.len(),
-            "D-STAR header with unexpected payload length; dropping"
-        );
-    }
-}
-
-/// Parse a D-STAR voice data payload and emit the corresponding event.
-async fn emit_dstar_data(sender: &mpsc::Sender<Event>, payload: &[u8]) {
-    if let Ok(bytes) = <[u8; 12]>::try_from(payload) {
-        emit_event(sender, Event::DStarDataRx { bytes }).await;
-    } else {
-        tracing::debug!(
-            target: "mmdvm::tokio_shell",
-            len = payload.len(),
-            "D-STAR data with unexpected payload length; dropping"
-        );
-    }
-}
-
-/// Decode a debug payload and emit it as [`Event::Debug`].
-///
-/// `command` selects the level: DEBUG1..DEBUG5 map to 1..5, and
-/// `MMDVM_DEBUG_DUMP` uses level 0 as a sentinel for "this is a raw
-/// hex dump rather than readable text".
-async fn emit_debug(sender: &mpsc::Sender<Event>, command: u8, payload: &[u8]) {
-    let level = match command {
-        MMDVM_DEBUG1 => 1,
-        MMDVM_DEBUG2 => 2,
-        MMDVM_DEBUG3 => 3,
-        MMDVM_DEBUG4 => 4,
-        MMDVM_DEBUG5 => 5,
-        _ => 0,
-    };
-    let text = String::from_utf8_lossy(payload)
-        .trim_end_matches('\0')
-        .trim_end()
-        .to_owned();
-    emit_event(sender, Event::Debug { level, text }).await;
 }

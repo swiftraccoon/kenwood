@@ -74,12 +74,9 @@ impl From<mmdvm_core::MmdvmError> for MmdvmFrameError {
             mmdvm_core::MmdvmError::InvalidLength { len } => Self::ShortLength {
                 got: u32::from(len),
             },
-            mmdvm_core::MmdvmError::FrameTooShort { len } => Self::ShortLength {
-                got: u32::try_from(len).unwrap_or(u32::MAX),
-            },
             mmdvm_core::MmdvmError::InvalidStartByte { got } => Self::BadStart { actual: got },
-            // Response-parsing errors (wrong status layout, version payload,
-            // unknown NAK reason) aren't reachable from `encode_frame` or
+            // Response-parsing errors (wrong status layout, version
+            // payload) aren't reachable from `encode_frame` or
             // `decode_frame`, but enum is `#[non_exhaustive]` so cover them.
             _ => Self::BadStart { actual: 0 },
         }

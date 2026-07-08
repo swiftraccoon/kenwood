@@ -2,8 +2,18 @@
 //!
 //! Each frame is `[0xE0, length, command, payload...]` where `length`
 //! is the total frame length (start + length + command + payload).
-//! Since the length field is a single byte, a frame can carry at most
+//! Since the length field is a single byte, this form carries at most
 //! `255 - 3 = 252` payload bytes.
+//!
+//! Frames longer than 255 bytes use the **extended form**
+//! `[0xE0, 0x00, length2, command, payload...]` where the total frame
+//! length is `length2 + 255` (up to 510 bytes). The firmware emits
+//! extended frames for FM audio data and debug dumps
+//! (`MMDVM/SerialPort.cpp` `writeFMData`/`writeDebugDump`); the host
+//! side decodes them in `MMDVMHost/Modem.cpp` `getResponse`
+//! (`SERIAL_STATE::LENGTH2`). [`decode_frame`] accepts both forms;
+//! [`encode_frame`] only emits the single-byte form because no
+//! host-to-modem command exceeds 255 bytes.
 
 use crate::command::MMDVM_FRAME_START;
 use crate::error::MmdvmError;
@@ -77,10 +87,15 @@ pub fn encode_frame(frame: &MmdvmFrame) -> Result<Vec<u8>, MmdvmError> {
 /// needed. Trailing bytes beyond `bytes_consumed` are left untouched
 /// for the caller to hand to the next `decode_frame` call.
 ///
+/// Both wire forms are accepted: the single-byte-length form and the
+/// extended form (`length == 0`, total length `data[2] + 255` — see
+/// the module docs).
+///
 /// # Errors
 ///
 /// - [`MmdvmError::InvalidStartByte`] if the first byte is not `0xE0`.
-/// - [`MmdvmError::InvalidLength`] if the length field is less than 3.
+/// - [`MmdvmError::InvalidLength`] if the length field is 1 or 2
+///   (a frame can never be shorter than start + length + command).
 pub fn decode_frame(data: &[u8]) -> Result<Option<(MmdvmFrame, usize)>, MmdvmError> {
     let Some(&first) = data.first() else {
         return Ok(None);
@@ -91,29 +106,45 @@ pub fn decode_frame(data: &[u8]) -> Result<Option<(MmdvmFrame, usize)>, MmdvmErr
     let Some(&length) = data.get(1) else {
         return Ok(None);
     };
-    if length < MIN_FRAME_LEN {
-        return Err(MmdvmError::InvalidLength { len: length });
-    }
-    let frame_len = usize::from(length);
+    // A zero length byte selects the extended form: the real total
+    // length is `data[2] + 255` and the command byte shifts to index
+    // 3 (`MMDVMHost/Modem.cpp` getResponse, SERIAL_STATE::LENGTH2).
+    let (frame_len, header_len) = if length == 0 {
+        let Some(&length2) = data.get(2) else {
+            return Ok(None);
+        };
+        (usize::from(length2) + 255, 4)
+    } else {
+        if length < MIN_FRAME_LEN {
+            return Err(MmdvmError::InvalidLength { len: length });
+        }
+        (usize::from(length), 3)
+    };
     if data.len() < frame_len {
         return Ok(None);
     }
-    let Some(&command) = data.get(2) else {
-        // Impossible because frame_len >= 3 and data.len() >= frame_len,
-        // but the lint-safe get() path is cheap.
+    let Some(&command) = data.get(header_len - 1) else {
+        // Impossible: frame_len >= header_len and data.len() >=
+        // frame_len, but the lint-safe get() path is cheap.
         return Ok(None);
     };
-    let payload = data
-        .get(3..frame_len)
-        .ok_or(MmdvmError::FrameTooShort { len: data.len() })?
-        .to_vec();
-    Ok(Some((MmdvmFrame { command, payload }, frame_len)))
+    let Some(payload) = data.get(header_len..frame_len) else {
+        // Equally impossible — same bounds as the command byte.
+        return Ok(None);
+    };
+    Ok(Some((
+        MmdvmFrame {
+            command,
+            payload: payload.to_vec(),
+        },
+        frame_len,
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::{MMDVM_DSTAR_DATA, MMDVM_GET_VERSION};
+    use crate::command::{MMDVM_DEBUG_DUMP, MMDVM_DSTAR_DATA, MMDVM_FM_DATA, MMDVM_GET_VERSION};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -197,5 +228,54 @@ mod tests {
         // Length says 5, only 3 bytes available.
         assert!(decode_frame(&[0xE0, 5, 0x00])?.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn decode_extended_frame() -> TestResult {
+        // Extended form: [0xE0, 0x00, len2, cmd, payload...] with
+        // total frame length = len2 + 255 (MMDVMHost SERIAL_STATE::LENGTH2).
+        let total = 255 + 3;
+        let mut wire = vec![0xE0, 0x00, 3, MMDVM_FM_DATA];
+        wire.resize(total, 0x55);
+        let (frame, consumed) = decode_frame(&wire)?.ok_or("expected full frame")?;
+        assert_eq!(consumed, total);
+        assert_eq!(frame.command, MMDVM_FM_DATA);
+        assert_eq!(frame.payload.len(), total - 4);
+        assert!(frame.payload.iter().all(|&b| b == 0x55));
+        Ok(())
+    }
+
+    #[test]
+    fn decode_extended_min_total_255() -> TestResult {
+        // len2 = 0 → total 255, payload 251 bytes.
+        let mut wire = vec![0xE0, 0x00, 0x00, MMDVM_DEBUG_DUMP];
+        wire.resize(255, 0xAA);
+        let (frame, consumed) = decode_frame(&wire)?.ok_or("expected full frame")?;
+        assert_eq!(consumed, 255);
+        assert_eq!(frame.command, MMDVM_DEBUG_DUMP);
+        assert_eq!(frame.payload.len(), 251);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_extended_incomplete_returns_none() -> TestResult {
+        // len2 byte not yet available.
+        assert!(decode_frame(&[0xE0, 0x00])?.is_none());
+        // Header present but body truncated (needs 258 bytes).
+        let mut partial = vec![0xE0, 0x00, 3, MMDVM_FM_DATA];
+        partial.resize(100, 0);
+        assert!(decode_frame(&partial)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn decode_invalid_length_one_and_two() {
+        for len in [1u8, 2] {
+            let err = decode_frame(&[0xE0, len, 0x00]);
+            assert!(
+                matches!(err, Err(MmdvmError::InvalidLength { len: l }) if l == len),
+                "expected InvalidLength({len}), got {err:?}"
+            );
+        }
     }
 }

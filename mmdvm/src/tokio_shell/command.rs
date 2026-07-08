@@ -35,14 +35,15 @@ pub(crate) enum Command {
     SetMode {
         /// Target mode.
         mode: ModemMode,
-        /// Reply channel — `Ok(())` once the frame is written.
+        /// Reply channel — resolved with the modem's ACK/NAK for the
+        /// mode change, not merely with the write result.
         reply: oneshot::Sender<Result<(), ShellError>>,
     },
     /// Enqueue a D-STAR header (41 bytes) in the loop's TX queue.
     ///
     /// Actual wire transmission is gated on the modem reporting
-    /// sufficient D-STAR FIFO space (>= 4 slots per `MMDVMHost`
-    /// convention).
+    /// strictly more than 4 free D-STAR FIFO slots, matching
+    /// `MMDVMHost/Modem.cpp:1053`.
     SendDStarHeader {
         /// The 41 header bytes.
         bytes: [u8; 41],

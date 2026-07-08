@@ -33,6 +33,10 @@ pub enum ShellError {
         /// The rejection reason the modem reported.
         reason: NakReason,
     },
+    /// The modem did not answer a correlated command (`set_mode`)
+    /// with an ACK or NAK within the response deadline.
+    #[error("modem did not acknowledge the command in time")]
+    ResponseTimeout,
 }
 
 #[cfg(test)]

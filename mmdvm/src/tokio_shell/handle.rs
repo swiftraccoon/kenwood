@@ -25,6 +25,13 @@ const COMMAND_CHANNEL_CAPACITY: usize = 32;
 /// status polls at 4 Hz with generous headroom.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// How long [`AsyncModem::set_mode`] waits for the modem's ACK/NAK
+/// before failing with [`ShellError::ResponseTimeout`].
+///
+/// The firmware acknowledges `SetMode` immediately on receipt; 2 s is
+/// generous even over Bluetooth SPP.
+const SET_MODE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Async handle to an MMDVM modem running in a spawned tokio task.
 ///
 /// The handle is generic over the transport type `T` so that
@@ -86,6 +93,11 @@ impl<T: Transport + 'static> AsyncModem<T> {
     /// Returns `None` once the task has exited and the event channel
     /// has been fully drained.
     ///
+    /// Consume events promptly: the modem loop never blocks on a slow
+    /// consumer — if the event channel fills up, further events are
+    /// dropped (and counted in a `warn` log) until the consumer
+    /// catches up, mirroring the reference's fixed-size ring buffers.
+    ///
     /// # Cancellation safety
     ///
     /// Cancel-safe — backed by `tokio::sync::mpsc::Receiver::recv`.
@@ -98,8 +110,16 @@ impl<T: Transport + 'static> AsyncModem<T> {
     /// The frame is placed in the loop's TX queue and drained only
     /// when the modem reports enough D-STAR FIFO space.
     ///
+    /// # Cancellation
+    ///
+    /// Not cancellation-atomic: if this future is dropped (e.g. by a
+    /// `timeout`) after the command was queued but before the reply
+    /// arrived, the frame may still be transmitted. This applies to
+    /// all `send_*` and `set_mode` calls on this handle.
+    ///
     /// # Errors
     ///
+    /// - [`ShellError::BufferFull`] if the TX queue is at capacity.
     /// - [`ShellError::SessionClosed`] if the loop has exited.
     pub async fn send_dstar_header(&mut self, bytes: [u8; 41]) -> Result<(), ShellError> {
         let (tx, rx) = oneshot::channel();
@@ -112,8 +132,12 @@ impl<T: Transport + 'static> AsyncModem<T> {
 
     /// Enqueue a D-STAR voice data frame for transmission.
     ///
+    /// See [`AsyncModem::send_dstar_header`] for cancellation
+    /// semantics.
+    ///
     /// # Errors
     ///
+    /// - [`ShellError::BufferFull`] if the TX queue is at capacity.
     /// - [`ShellError::SessionClosed`] if the loop has exited.
     pub async fn send_dstar_data(&mut self, bytes: [u8; 12]) -> Result<(), ShellError> {
         // Hang-hunt: two awaits here. Trace both sides so a repro
@@ -144,8 +168,12 @@ impl<T: Transport + 'static> AsyncModem<T> {
 
     /// Enqueue a D-STAR end-of-transmission marker.
     ///
+    /// See [`AsyncModem::send_dstar_header`] for cancellation
+    /// semantics.
+    ///
     /// # Errors
     ///
+    /// - [`ShellError::BufferFull`] if the TX queue is at capacity.
     /// - [`ShellError::SessionClosed`] if the loop has exited.
     pub async fn send_dstar_eot(&mut self) -> Result<(), ShellError> {
         let (tx, rx) = oneshot::channel();
@@ -158,8 +186,17 @@ impl<T: Transport + 'static> AsyncModem<T> {
 
     /// Set the modem's operating mode.
     ///
+    /// Resolves only after the modem acknowledges the mode change —
+    /// an `Ok(())` means the modem actually switched, not merely
+    /// that the request was written. (The corresponding
+    /// [`Event::Ack`]/[`Event::Nak`] is still emitted on the event
+    /// stream as well.)
+    ///
     /// # Errors
     ///
+    /// - [`ShellError::Nak`] if the modem rejected the mode change.
+    /// - [`ShellError::ResponseTimeout`] if the modem did not answer
+    ///   within 2 s.
     /// - [`ShellError::SessionClosed`] if the loop has exited.
     /// - [`ShellError::Io`] if writing to the transport fails.
     /// - [`ShellError::Core`] if the codec rejects the frame.
@@ -169,7 +206,10 @@ impl<T: Transport + 'static> AsyncModem<T> {
             .send(Command::SetMode { mode, reply: tx })
             .await
             .map_err(|_| ShellError::SessionClosed)?;
-        rx.await.map_err(|_| ShellError::SessionClosed)?
+        match tokio::time::timeout(SET_MODE_RESPONSE_TIMEOUT, rx).await {
+            Ok(reply) => reply.map_err(|_| ShellError::SessionClosed)?,
+            Err(_elapsed) => Err(ShellError::ResponseTimeout),
+        }
     }
 
     /// Trigger a `GetVersion` request. The response arrives as
@@ -228,37 +268,67 @@ impl<T: Transport + 'static> AsyncModem<T> {
         rx.await.map_err(|_| ShellError::SessionClosed)?
     }
 
-    /// Graceful shutdown — flushes the TX queue, exits the loop, and
-    /// returns the recovered transport.
+    /// Graceful shutdown — flushes the TX queue (bounded by an
+    /// internal ~2 s deadline), exits the loop, and returns the
+    /// recovered transport.
     ///
     /// Consumes the handle. After `shutdown` returns, the task has
     /// fully wound down and ownership of the transport is handed back
     /// to the caller so it can be reused (e.g. to switch back to CAT
-    /// mode on a serial port).
+    /// mode on a serial port). If the modem never grants FIFO space
+    /// for queued frames, the flush deadline expires, the remaining
+    /// frames are dropped (logged and reported as
+    /// [`Event::TxDropped`]), and shutdown still completes — it never
+    /// hangs on a wedged modem.
+    ///
+    /// Works even if the loop already exited on its own (EOF or
+    /// transport error): the transport recovered by the task is
+    /// handed back whenever the loop terminated cleanly.
     ///
     /// # Errors
     ///
-    /// - [`ShellError::SessionClosed`] if the loop had already exited
-    ///   before the shutdown command could be delivered, or the task
-    ///   panicked / was aborted before it could hand the transport back.
+    /// - [`ShellError::Io`] / [`ShellError::Core`] if the loop exited
+    ///   with that error (the transport is not recoverable).
+    /// - [`ShellError::SessionClosed`] if the task panicked or was
+    ///   aborted before it could hand the transport back.
     pub async fn shutdown(mut self) -> Result<T, ShellError> {
         let (tx, rx) = oneshot::channel();
-        self.command_tx
+        if self
+            .command_tx
             .send(Command::Shutdown { reply: tx })
             .await
-            .map_err(|_| ShellError::SessionClosed)?;
-        rx.await.map_err(|_| ShellError::SessionClosed)?;
+            .is_ok()
+        {
+            // Ignore a dropped reply — the loop may already be on
+            // its way out, which is fine; we only need it to
+            // terminate.
+            if rx.await.is_err() {
+                tracing::debug!(
+                    target: "mmdvm::tokio_shell",
+                    "loop exited before acknowledging shutdown"
+                );
+            }
+        }
 
         // Drain any remaining events so the loop can finish its
         // flush. Once the send half drops (when the loop exits), this
-        // loop terminates.
+        // terminates — also immediately if the loop was already gone.
         while self.event_rx.recv().await.is_some() {}
 
         // Reclaim the transport from the task.
         let handle = self.join_handle.take().ok_or(ShellError::SessionClosed)?;
         match handle.await {
             Ok(transport_result) => transport_result,
-            Err(_join_err) => Err(ShellError::SessionClosed),
+            Err(join_err) => {
+                // A panic in the loop would otherwise vanish into a
+                // generic "session closed".
+                tracing::warn!(
+                    target: "mmdvm::tokio_shell",
+                    error = %join_err,
+                    "modem task did not complete cleanly"
+                );
+                Err(ShellError::SessionClosed)
+            }
         }
     }
 }

@@ -12,8 +12,9 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
 fn parse_v1_all_flags_set() -> TestResult {
-    // proto=1, mode=DStar(1), state=0x7F (every flag set), dstar=0.
-    let payload = [1, 1, 0x7F, 0];
+    // proto=1, mode=DStar(1), state=0x7F (every flag set), dstar=0,
+    // dmr1/dmr2/ysf=0.
+    let payload = [1, 1, 0x7F, 0, 0, 0, 0];
     let s = ModemStatus::parse_v1(&payload)?;
     assert_eq!(s.mode, ModemMode::DStar);
     assert!(s.tx());
@@ -64,7 +65,7 @@ fn parse_v2_buffer_counts() -> TestResult {
 fn parse_v1_too_short_errors() {
     let err = ModemStatus::parse_v1(&[1, 1, 0]);
     assert!(
-        matches!(err, Err(MmdvmError::InvalidStatusLength { len: 3, min: 4 })),
+        matches!(err, Err(MmdvmError::InvalidStatusLength { len: 3, min: 7 })),
         "got {err:?}"
     );
 }
@@ -73,20 +74,24 @@ fn parse_v1_too_short_errors() {
 fn parse_v2_too_short_errors() {
     let err = ModemStatus::parse_v2(&[0u8; 8]);
     assert!(
-        matches!(err, Err(MmdvmError::InvalidStatusLength { len: 8, min: 9 })),
+        matches!(
+            err,
+            Err(MmdvmError::InvalidStatusLength { len: 8, min: 12 })
+        ),
         "got {err:?}"
     );
 }
 
 #[test]
-fn parse_v1_partial_buffer_fields_default_to_zero() -> TestResult {
-    // Only the mandatory 4 bytes — everything else must default to 0.
-    let payload = [1, 1, 0, 7];
+fn parse_v1_optional_tail_fields_default_to_zero() -> TestResult {
+    // Only the mandatory 7 bytes — p25/nxdn/pocsag (firmware-version
+    // dependent on v1) must default to 0.
+    let payload = [1, 1, 0, 7, 3, 4, 5];
     let s = ModemStatus::parse_v1(&payload)?;
     assert_eq!(s.dstar_space, 7);
-    assert_eq!(s.dmr_space1, 0);
-    assert_eq!(s.dmr_space2, 0);
-    assert_eq!(s.ysf_space, 0);
+    assert_eq!(s.dmr_space1, 3);
+    assert_eq!(s.dmr_space2, 4);
+    assert_eq!(s.ysf_space, 5);
     assert_eq!(s.p25_space, 0);
     assert_eq!(s.nxdn_space, 0);
     assert_eq!(s.pocsag_space, 0);
@@ -96,7 +101,7 @@ fn parse_v1_partial_buffer_fields_default_to_zero() -> TestResult {
 #[test]
 fn parse_v2_includes_fm_space() -> TestResult {
     // Explicitly test the new v2 FM-space field, which didn't exist in v1.
-    let mut payload = [0u8; 11];
+    let mut payload = [0u8; 12];
     payload[0] = 1; // mode=DStar (just for diversity)
     payload[10] = 0x42;
     let s = ModemStatus::parse_v2(&payload)?;
@@ -108,7 +113,7 @@ fn parse_v2_includes_fm_space() -> TestResult {
 fn parse_v2_tx_lockout_cd_flags() -> TestResult {
     // state byte bits: 0x01 TX, 0x10 lockout, 0x40 CD.
     let state = 0x01 | 0x10 | 0x40;
-    let payload = [1, state, 0, 0, 0, 0, 0, 0, 0];
+    let payload = [1, state, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let s = ModemStatus::parse_v2(&payload)?;
     assert!(s.tx());
     assert!(s.lockout());

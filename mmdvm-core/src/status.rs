@@ -32,17 +32,21 @@ const STATE_CD: u8 = 0x40;
 
 /// Minimum payload length for a protocol-v1 status response.
 ///
-/// v1 layout: proto(0), mode(1), state(2), dstarSpace(3). Earlier
-/// fields (dmr/ysf/etc.) beyond byte 3 are optional and default to 0.
-const MIN_V1_LEN: usize = 4;
+/// v1 layout: proto(0), mode(1), state(2), dstarSpace(3),
+/// dmrSpace1(4), dmrSpace2(5), ysfSpace(6) — all read unconditionally
+/// by the reference (`MMDVMHost/Modem.cpp` v1 status case). Only
+/// p25(7), nxdn(8) and pocsag(9) are firmware-version dependent
+/// there (guarded by length checks) and default to 0 here.
+const MIN_V1_LEN: usize = 7;
 
 /// Minimum payload length for a protocol-v2 status response.
 ///
 /// v2 layout: mode(0), state(1), reserved(2), dstarSpace(3),
 /// dmrSpace1(4), dmrSpace2(5), ysfSpace(6), p25Space(7),
-/// nxdnSpace(8). FM and POCSAG live at 10 and 11 respectively and are
-/// optional.
-const MIN_V2_LEN: usize = 9;
+/// nxdnSpace(8), reserved(9), fmSpace(10), pocsagSpace(11) — the
+/// reference reads every field through index 11 unconditionally, so
+/// a conforming v2 status payload is at least 12 bytes.
+const MIN_V2_LEN: usize = 12;
 
 /// The seven flag bits packed into the status byte.
 ///
@@ -204,10 +208,12 @@ impl ModemStatus {
         let mode = ModemMode::from_byte(payload.get(1).copied().unwrap_or(0));
         let flags = StatusFlags::from_bits(payload.get(2).copied().unwrap_or(0));
         let dstar_space = payload.get(3).copied().unwrap_or(0);
-        // Remaining fields are optional on v1.
         let dmr_space1 = payload.get(4).copied().unwrap_or(0);
         let dmr_space2 = payload.get(5).copied().unwrap_or(0);
         let ysf_space = payload.get(6).copied().unwrap_or(0);
+        // p25/nxdn/pocsag depend on the firmware version on v1 and
+        // default to 0 when absent (mirrors the reference's length
+        // guards).
         let p25_space = payload.get(7).copied().unwrap_or(0);
         let nxdn_space = payload.get(8).copied().unwrap_or(0);
         let pocsag_space = payload.get(9).copied().unwrap_or(0);
@@ -250,8 +256,9 @@ impl ModemStatus {
         let ysf_space = payload.get(6).copied().unwrap_or(0);
         let p25_space = payload.get(7).copied().unwrap_or(0);
         let nxdn_space = payload.get(8).copied().unwrap_or(0);
-        // payload[9] is reserved / older FM. FM_SPACE is at index 10
-        // per the reference implementation.
+        // payload[9] is reserved; fm(10) and pocsag(11) are inside
+        // the guaranteed minimum length, so the unwrap_or(0) is
+        // lint-safe fetch only, never a real default.
         let fm_space = payload.get(10).copied().unwrap_or(0);
         let pocsag_space = payload.get(11).copied().unwrap_or(0);
 
@@ -300,8 +307,9 @@ mod tests {
 
     #[test]
     fn v1_minimum_payload() -> TestResult {
-        // proto=1, mode=DStar, state=0 (all flags clear), dstar_space=10.
-        let payload = [1, 1, 0, 10];
+        // proto=1, mode=DStar, state=0 (all flags clear), dstar=10,
+        // dmr1/dmr2/ysf=0 — the 7-byte v1 minimum.
+        let payload = [1, 1, 0, 10, 0, 0, 0];
         let s = ModemStatus::parse_v1(&payload)?;
         assert_eq!(s.mode, ModemMode::DStar);
         assert!(!s.tx());
@@ -314,7 +322,7 @@ mod tests {
     fn v1_too_short_errors() {
         let err = ModemStatus::parse_v1(&[1, 1, 0]);
         assert!(
-            matches!(err, Err(MmdvmError::InvalidStatusLength { len: 3, min: 4 })),
+            matches!(err, Err(MmdvmError::InvalidStatusLength { len: 3, min: 7 })),
             "got {err:?}"
         );
     }
@@ -323,7 +331,10 @@ mod tests {
     fn v2_too_short_errors() {
         let err = ModemStatus::parse_v2(&[0, 0, 0, 0]);
         assert!(
-            matches!(err, Err(MmdvmError::InvalidStatusLength { len: 4, min: 9 })),
+            matches!(
+                err,
+                Err(MmdvmError::InvalidStatusLength { len: 4, min: 12 })
+            ),
             "got {err:?}"
         );
     }
@@ -338,6 +349,31 @@ mod tests {
         assert_eq!(s.pocsag_space, 9);
         assert_eq!(s.dstar_space, 2);
         Ok(())
+    }
+
+    #[test]
+    fn v1_shorter_than_seven_errors() {
+        // dmr1/dmr2/ysf are read unconditionally by the reference v1
+        // parser — a 6-byte payload must be rejected, not zero-filled.
+        let err = ModemStatus::parse_v1(&[1, 1, 0, 10, 8, 9]);
+        assert!(
+            matches!(err, Err(MmdvmError::InvalidStatusLength { len: 6, min: 7 })),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn v2_shorter_than_twelve_errors() {
+        // fm(10) and pocsag(11) are read unconditionally by the
+        // reference v2 parser — an 11-byte payload must be rejected.
+        let err = ModemStatus::parse_v2(&[1, 0, 0, 2, 3, 4, 5, 6, 7, 0, 8]);
+        assert!(
+            matches!(
+                err,
+                Err(MmdvmError::InvalidStatusLength { len: 11, min: 12 })
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]

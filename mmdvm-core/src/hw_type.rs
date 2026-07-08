@@ -104,13 +104,11 @@ mod tests {
 
     #[test]
     fn mmdvm_hs_dual_hat_before_mmdvm_hs_hat_alternative() {
-        // Both prefixes start with "MMDVM_HS_" — the dual-hat match
-        // must not be accidentally pre-empted by the single-hat check
-        // because the reference ordering tests them in that order.
-        // Here the single-hat prefix matches "MMDVM_HS_Hat" first in
-        // our implementation, but "MMDVM_HS_Dual_Hat" also has the
-        // "MMDVM_HS_Hat" prefix absent — in fact they differ, so both
-        // resolve uniquely.
+        // Both prefixes start with "MMDVM_HS_" but diverge at the
+        // next character ("Hat" vs "Dual_Hat"), so the single-hat
+        // check — which runs first, mirroring the reference order —
+        // can never shadow the dual-hat match. This test pins that
+        // both resolve to their own variant.
         assert_eq!(
             HwType::from_description("MMDVM_HS_Hat v2"),
             HwType::MmdvmHsHat

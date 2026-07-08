@@ -63,4 +63,31 @@ pub enum Event {
     },
     /// The transport closed gracefully (e.g. serial device unplug).
     TransportClosed,
+    /// The modem loop hit a fatal error and is about to exit. After
+    /// the event channel drains, [`super::AsyncModem::next_event`]
+    /// returns `None`. Distinguishes "the link died" from a clean
+    /// close.
+    Fatal {
+        /// Human-readable description of the error that killed the
+        /// loop.
+        message: String,
+    },
+    /// Queued TX frames were discarded because the loop exited before
+    /// the modem granted enough FIFO space to send them. Without
+    /// this, a transmission truncates silently even though every
+    /// `send_dstar_*` call reported success.
+    TxDropped {
+        /// Number of frames discarded.
+        frames: usize,
+    },
+    /// The modem sent a frame that violates the protocol layout for
+    /// its command byte (wrong payload length or unparseable
+    /// response). The frame was dropped; counting these lets a
+    /// consumer detect a degrading link.
+    ProtocolViolation {
+        /// The command byte of the offending frame.
+        command: u8,
+        /// What was wrong with it.
+        detail: String,
+    },
 }

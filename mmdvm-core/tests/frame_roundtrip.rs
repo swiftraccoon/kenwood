@@ -145,4 +145,37 @@ proptest! {
         prop_assert_eq!(consumed, wire.len());
         prop_assert_eq!(parsed, frame);
     }
+
+    /// Arbitrary bytes — the adversarial input a noisy serial or
+    /// Bluetooth link produces — must never panic the decoder; the
+    /// only outcomes are a frame, "need more", or a typed error.
+    #[test]
+    fn prop_decode_arbitrary_bytes_never_panics(
+        data in proptest::collection::vec(any::<u8>(), 0..600),
+    ) {
+        if let Ok(Some((_, consumed))) = decode_frame(&data) {
+            prop_assert!(consumed <= data.len());
+        }
+    }
+
+    /// Every strict prefix of a valid frame asks for more bytes
+    /// rather than erroring or mis-decoding — the property the
+    /// streaming reassembly path in the shell depends on.
+    #[test]
+    fn prop_partial_frames_request_more_bytes(
+        command in any::<u8>(),
+        payload in proptest::collection::vec(any::<u8>(), 0..=MAX_PAYLOAD_LEN),
+    ) {
+        let frame = MmdvmFrame::with_payload(command, payload);
+        let wire = encode_frame(&frame).map_err(|e| TestCaseError::fail(format!("encode: {e}")))?;
+        for k in 0..wire.len() {
+            let prefix = wire.get(..k)
+                .ok_or_else(|| TestCaseError::fail("prefix in bounds"))?;
+            let result = decode_frame(prefix);
+            prop_assert!(
+                matches!(result, Ok(None)),
+                "prefix of {} bytes must request more, got {:?}", k, result
+            );
+        }
+    }
 }

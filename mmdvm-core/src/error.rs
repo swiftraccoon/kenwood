@@ -10,19 +10,14 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum MmdvmError {
-    /// Frame is shorter than the minimum 3 bytes.
-    #[error("frame too short: {len} bytes (minimum 3)")]
-    FrameTooShort {
-        /// Number of bytes actually seen.
-        len: usize,
-    },
     /// The first byte is not `0xE0`.
     #[error("invalid start byte: 0x{got:02X} (expected 0xE0)")]
     InvalidStartByte {
         /// The byte found at position 0.
         got: u8,
     },
-    /// The length field is less than 3.
+    /// The length field is 1 or 2 — shorter than any frame can be,
+    /// and not the extended-form marker (0).
     #[error("invalid length field: {len} (minimum 3)")]
     InvalidLength {
         /// The raw length byte.
@@ -33,12 +28,6 @@ pub enum MmdvmError {
     PayloadTooLarge {
         /// Requested payload length in bytes.
         len: usize,
-    },
-    /// An unknown NAK reason code was received.
-    #[error("unknown NAK reason code: 0x{code:02X}")]
-    UnknownNakReason {
-        /// Raw reason byte.
-        code: u8,
     },
     /// Status response was too short to parse.
     #[error("status response too short: {len} bytes (need at least {min})")]
