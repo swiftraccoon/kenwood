@@ -157,33 +157,78 @@ fn r13_no_ad_hoc_bracket_timestamps() {
     }
 }
 
+/// Line spans (0-based, inclusive) of the named top-level functions,
+/// found by counting braces from each `fn <name>(` declaration line
+/// until the body's depth returns to zero.
+///
+/// Brace counting ignores braces inside string literals and comments;
+/// that is fine here because format strings keep their braces paired,
+/// so imbalance from literals cannot occur in this crate's source. A
+/// span that ends early would only make the check stricter (an
+/// `eprintln!` would fall outside it and fail loudly), never looser.
+fn function_spans(lines: &[&str], names: &[&str]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut line_no = 0;
+    while line_no < lines.len() {
+        let is_decl = names
+            .iter()
+            .any(|n| lines[line_no].contains(&format!("fn {n}(")));
+        if !is_decl {
+            line_no += 1;
+            continue;
+        }
+        let mut depth = 0i64;
+        let mut body_started = false;
+        let mut end = line_no;
+        for (j, line) in lines.iter().enumerate().skip(line_no) {
+            for c in line.chars() {
+                match c {
+                    '{' => {
+                        depth += 1;
+                        body_started = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if body_started && depth <= 0 {
+                end = j;
+                break;
+            }
+        }
+        spans.push((line_no, end));
+        line_no = end + 1;
+    }
+    spans
+}
+
 #[test]
 fn r14_no_eprintln_in_user_output_path() {
     // User-facing output goes to stdout via println!/aprintln!.
     // Diagnostics go to stderr via `tracing`. `eprintln!` is a
     // code smell — it bypasses tracing and bypasses stdout. The
-    // only exception is startup warnings before tracing is
-    // initialized (in `init_logging`).
+    // exceptions, checked by actual function span rather than "the
+    // declaration appears somewhere earlier in the file" (which
+    // exempted everything below `init_logging` in main.rs):
+    // - `init_logging` / `run_main`: startup warnings before the
+    //   tracing subscriber exists.
+    // - `main`: the fatal-error printer (renders errors via
+    //   `Display` on stderr with a real exit code).
     for file in src_files() {
         let text = fs::read_to_string(&file).expect("read file");
         let lines: Vec<&str> = text.lines().collect();
+        let allowed = function_spans(&lines, &["init_logging", "run_main", "main"]);
         for (line_no, line) in lines.iter().enumerate() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
             if line.contains("eprintln!") {
-                // Allow the `eprintln!` if any earlier line in the file
-                // declared `fn init_logging`. This is an approximation
-                // (we don't track the function's closing brace), but
-                // matches the intent: startup warnings before tracing
-                // is initialized live in that function.
-                let in_init_logging = lines[..=line_no]
+                let in_allowed = allowed
                     .iter()
-                    .rev()
-                    .any(|l| l.contains("fn init_logging"));
+                    .any(|&(start, end)| line_no >= start && line_no <= end);
                 assert!(
-                    in_init_logging,
-                    "R14 violation: {} line {}: eprintln! outside init_logging: {}",
+                    in_allowed,
+                    "R14 violation: {} line {}: eprintln! outside init_logging/run_main/main: {}",
                     file.display(),
                     line_no + 1,
                     line.trim()

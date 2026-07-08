@@ -39,6 +39,13 @@
 mod commands;
 mod transport;
 
+// proptest is a dev-dependency used by the library's unit tests; the bin
+// target's test build links dev-deps too. Acknowledge it so
+// `unused_crate_dependencies` stays silent for this compilation unit.
+#[cfg(test)]
+use proptest as _;
+
+use std::io::IsTerminal as _;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::Ordering;
 
@@ -190,8 +197,7 @@ struct Cli {
     ///
     /// One command per line. `#` at line start is a comment. Blank
     /// lines are skipped. `exit`/`quit` ends the script. Errors from
-    /// individual commands are printed but do not halt the script
-    /// unless `--script-strict` is also passed.
+    /// individual commands are printed and the script continues.
     #[arg(long)]
     script: Option<std::path::PathBuf>,
 
@@ -451,6 +457,12 @@ fn parse_utc_offset(s: &str) -> Result<i32, String> {
     if s.is_empty() {
         return Err("empty".to_string());
     }
+    // Reject non-ASCII up front: the slicing below is byte-indexed,
+    // and a multi-byte character straddling a slice boundary would
+    // panic instead of reaching the graceful invalid-offset error.
+    if !s.is_ascii() {
+        return Err("contains non-ASCII characters".to_string());
+    }
     let bytes = s.as_bytes();
     let (sign, rest) = match bytes[0] {
         b'+' => (1i32, &s[1..]),
@@ -540,7 +552,11 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.yes {
         thd75_repl::confirm::set_required(false);
     }
-    if cli.script.is_some() {
+    // Script mode also covers piped stdin: the transmit confirmation
+    // prompt cannot be answered when stdin is not a terminal —
+    // reading the answer would silently consume the next queued
+    // command line instead.
+    if cli.script.is_some() || !std::io::stdin().is_terminal() {
         thd75_repl::confirm::set_script_mode(true);
     }
 
@@ -778,6 +794,11 @@ struct DStarSession {
     /// frame. Capped at [`PAD_FRAMES_MAX`] so a fully dead reflector
     /// doesn't keep the modem fed with repeated audio indefinitely.
     pad_frames_emitted: u32,
+    /// Set after the radio-side MMDVM drain hits a fatal transport
+    /// error, so the failure is announced to the operator exactly
+    /// once instead of on every 100 ms poll cycle. Cleared only by
+    /// leaving D-STAR mode (the session is torn down).
+    radio_link_lost: bool,
 }
 
 /// Echo test state machine.
@@ -1103,7 +1124,15 @@ async fn run_repl(
                     if let Some(ref mut r) = s.reflector {
                         let _ = r.disconnect().await;
                     }
-                    s.gateway.stop().await.ok()
+                    let radio = s.gateway.stop().await.ok();
+                    // Mirror the guidance the interactive quit path
+                    // gives via `exit_dstar`: the radio stays in
+                    // Reflector Terminal Mode until the operator
+                    // changes Menu 650, and end-of-input gives us no
+                    // way to walk them through a reconnect.
+                    println!("The radio is still in Reflector Terminal Mode.");
+                    println!("Set Menu 650 (DV Gateway) to Off to restore normal operation.");
+                    radio
                 }
             };
             if let Some(r) = radio {
@@ -1194,7 +1223,11 @@ async fn run_repl(
             "last" | "repeat" => {
                 let count = if let Some(arg) = parts.get(1) {
                     if *arg == "all" {
-                        thd75_repl::HISTORY_CAPACITY_DEFAULT
+                        // Everything the buffer holds. `last_lines`
+                        // clamps to the stored line count, so this
+                        // respects whatever `--history-lines` set
+                        // rather than assuming the default capacity.
+                        usize::MAX
                     } else if let Ok(n) = arg.parse::<usize>() {
                         n
                     } else {
@@ -1265,6 +1298,13 @@ async fn run_repl(
                 );
                 continue;
             }
+            "check" => {
+                // Hardware-free accessibility self-check, also
+                // available as the `check` CLI subcommand. The exit
+                // code is meaningless mid-session, so discard it.
+                let _ = thd75_repl::check::run();
+                continue;
+            }
             _ => {}
         }
 
@@ -1326,9 +1366,6 @@ async fn run_repl(
                                         "entering D-STAR mode: {e}"
                                     ))
                                 );
-                                println!(
-                                    "Error: radio connection lost. Please close and reopen the program."
-                                );
                                 break;
                             }
                         }
@@ -1342,16 +1379,13 @@ async fn run_repl(
                 if cmd == "aprs" && parts.get(1).is_some_and(|s| *s == "stop") {
                     match client.stop().await {
                         Ok(radio) => {
-                            println!("APRS mode stopped. Returned to CAT mode.");
+                            aprintln!("APRS mode stopped. Returned to CAT mode.");
                             ReplState::Cat(radio)
                         }
                         Err(e) => {
                             println!(
                                 "{}",
                                 thd75_repl::output::error(format_args!("stopping APRS: {e}"))
-                            );
-                            println!(
-                                "Error: radio connection lost. Please close and reopen the program."
                             );
                             break;
                         }
@@ -1369,16 +1403,13 @@ async fn run_repl(
                     }
                     match exit_dstar(session.gateway, cli_port.as_deref(), cli_baud).await {
                         Ok(radio) => {
-                            println!("D-STAR mode stopped. Returned to normal radio control.");
+                            aprintln!("D-STAR mode stopped. Returned to normal radio control.");
                             ReplState::Cat(radio)
                         }
                         Err(e) => {
                             println!(
                                 "{}",
                                 thd75_repl::output::error(format_args!("exiting D-STAR mode: {e}"))
-                            );
-                            println!(
-                                "Error: radio connection lost. Please close and reopen the program."
                             );
                             break;
                         }
@@ -1398,7 +1429,11 @@ async fn run_repl(
         };
     }
 
-    Ok(())
+    // The loop only breaks (rather than returning) when the radio
+    // connection was lost mid-session. Surface that as a real error
+    // so scripts and automation see a non-zero exit code; `main`
+    // prints it with the `Error:` prefix via `Display`.
+    Err("radio connection lost. Please close and reopen the program.".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,11 +1508,26 @@ async fn enter_aprs(
     radio: Radio<EitherTransport>,
     args: &[&str],
 ) -> Result<AprsClient<EitherTransport>, (Radio<EitherTransport>, String)> {
-    let callsign = args[0];
-    let ssid: u8 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    // AX.25 callsigns are upper-case on the wire; normalize here so
+    // a lower-case `aprs start w1aw` behaves like the intended call.
+    let callsign = args[0].to_ascii_uppercase();
+    let ssid: u8 = match args.get(1) {
+        None => 0,
+        // Reject rather than silently beaconing as SSID 0 when the
+        // argument is not a valid SSID (e.g. `aprs start W1AW seven`).
+        Some(s) => match s.parse::<u8>() {
+            Ok(n) if n <= 15 => n,
+            _ => {
+                return Err((
+                    radio,
+                    format!("invalid SSID {s:?}. Use a number from 0 through 15."),
+                ));
+            }
+        },
+    };
     println!("Leaving normal radio control. Entering APRS mode as {callsign}-{ssid}.");
 
-    let config = AprsClientConfig::new(callsign, ssid);
+    let config = AprsClientConfig::new(&callsign, ssid);
     match AprsClient::start(radio, config).await {
         Ok(client) => {
             println!("{}", thd75_repl::output::aprs_mode_active());
@@ -1592,10 +1642,7 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
                         )
                     );
                 }
-                println!(
-                    "{}",
-                    thd75_repl::output::aprs_stations_summary(stations.len())
-                );
+                println!("{}", thd75_repl::output::stations_summary(stations.len()));
             }
         }
         "igate" => {
@@ -2018,29 +2065,40 @@ async fn enter_dstar(
     radio: Radio<EitherTransport>,
     args: &[&str],
 ) -> Result<DStarSession, (Option<Radio<EitherTransport>>, String)> {
-    let callsign = args[0];
+    // D-STAR callsigns are upper-case on the wire (headers and DPlus
+    // authentication); normalize so `dstar start w1aw` works as the
+    // operator intended.
+    let callsign = args[0].to_ascii_uppercase();
     // Optional reflector argument: e.g. "XRF030C" → name="XRF030", module='C'
     let reflector_arg = args.get(1).copied();
+
+    // Validate the callsign BEFORE touching the radio:
+    // `ensure_terminal_mode` may perform an MCP write that reboots
+    // the radio (and re-execs this process) — far too expensive a
+    // side effect to spend on input that was never usable. Failing
+    // here also hands the radio back so the REPL continues in CAT
+    // mode instead of ending the session.
+    let callsign_typed = match Callsign::try_from_str(&callsign) {
+        Ok(cs) => cs,
+        Err(e) => {
+            return Err((
+                Some(radio),
+                format!("Invalid station callsign {callsign}: {e}"),
+            ));
+        }
+    };
 
     let radio = ensure_terminal_mode(radio).await?;
 
     // Radio is now in MMDVM mode. Start the gateway.
     println!("Starting D-STAR gateway as {callsign}.");
 
-    let config = DStarGatewayConfig::new(callsign);
+    let config = DStarGatewayConfig::new(&callsign);
     let gateway = match DStarGateway::start_gateway_mode(radio, config).await {
         Ok(gw) => gw,
         Err(e) => return Err((None, format!("Gateway init failed: {e}"))),
     };
     println!("MMDVM modem initialized.");
-
-    // Validate the callsign once. Everything downstream uses the typed form.
-    let callsign_typed = match Callsign::try_from_str(callsign) {
-        Ok(cs) => cs,
-        Err(e) => {
-            return Err((None, format!("Invalid station callsign {callsign}: {e}")));
-        }
-    };
 
     // Connect to reflector if specified.
     let (reflector, link_arg) = if let Some(ref_str) = reflector_arg {
@@ -2067,7 +2125,7 @@ async fn enter_dstar(
 
     println!("D-STAR gateway active. Type dstar stop to exit.");
     println!("Commands: monitor, link, unlink, echo, text, heard, status, dstar stop");
-    let default_module = Module::try_from_char('C').expect("'C' is valid");
+    let default_module = Module::C;
     let (local_module, reflector_module) = link_arg
         .as_ref()
         .map_or((default_module, default_module), |arg| {
@@ -2105,6 +2163,7 @@ async fn enter_dstar(
         last_rx_voice_frame: None,
         last_relay_at: None,
         pad_frames_emitted: 0,
+        radio_link_lost: false,
     })
 }
 
@@ -2195,17 +2254,17 @@ fn parse_link_arg(s: &str) -> Result<LinkArg, String> {
 const HOST_FILES: &[(&str, &str, u16)] = &[
     (
         "DExtra_Hosts.txt",
-        "http://www.pistar.uk/downloads/DExtra_Hosts.txt",
+        "https://www.pistar.uk/downloads/DExtra_Hosts.txt",
         30001,
     ),
     (
         "DPlus_Hosts.txt",
-        "http://www.pistar.uk/downloads/DPlus_Hosts.txt",
+        "https://www.pistar.uk/downloads/DPlus_Hosts.txt",
         20001,
     ),
     (
         "DCS_Hosts.txt",
-        "http://www.pistar.uk/downloads/DCS_Hosts.txt",
+        "https://www.pistar.uk/downloads/DCS_Hosts.txt",
         30051,
     ),
 ];
@@ -2253,8 +2312,11 @@ async fn ensure_host_files() {
         }
         // Use a simple TCP GET since we don't have an HTTP client dep.
         // Shell out to curl which is available on macOS/Linux.
+        // `-f` makes curl exit non-zero on HTTP errors (404, 500);
+        // without it the error page body would be written to the
+        // hosts file and reported as a successful download.
         match tokio::process::Command::new("curl")
-            .args(["-sL", "-o"])
+            .args(["-fsSL", "-o"])
             .arg(&path)
             .arg(url)
             .output()
@@ -2264,6 +2326,11 @@ async fn ensure_host_files() {
                 println!("Downloaded {name}.");
             }
             Ok(output) => {
+                // `-o` may have created a partial or empty file
+                // before the failure; remove it so the presence
+                // check above retries the download next time
+                // instead of treating the stub as installed.
+                let _ = std::fs::remove_file(&path);
                 println!(
                     "Error: failed to download {name}: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
@@ -2653,7 +2720,7 @@ async fn connect_reflector(callsign: Callsign, link: &LinkArg) -> Result<Reflect
         _ => return Err(format!("Unsupported reflector protocol: {protocol:?}")),
     };
 
-    println!("Connected to {ref_name} module {}.", link.reflector_module);
+    aprintln!("Connected to {ref_name} module {}.", link.reflector_module);
     Ok(session)
 }
 
@@ -2686,6 +2753,11 @@ async fn exit_dstar(
     println!("Please set Menu 650 (DV Gateway) to Off on the radio.");
     println!("Press Enter when done.");
 
+    // Blocking stdin read. Note: once any monitor loop has awaited
+    // `tokio::signal::ctrl_c()`, tokio owns the process SIGINT
+    // handler for good — Ctrl-C no longer terminates the process, so
+    // Enter is the only way past this prompt. Don't advertise Ctrl-C
+    // here.
     let mut input = String::new();
     let _ = std::io::stdin().read_line(&mut input);
 
@@ -3007,8 +3079,24 @@ async fn dstar_poll_cycle(session: &mut DStarSession) {
         .gateway
         .set_event_timeout(std::time::Duration::from_millis(5));
     for _ in 0..MAX_EVENTS_PER_CYCLE {
-        let Ok(Some(event)) = session.gateway.next_event().await else {
-            break;
+        let event = match session.gateway.next_event().await {
+            Ok(Some(event)) => event,
+            // No MMDVM event within the timeout — queue is dry.
+            Ok(None) => break,
+            // `Err` is a fatal transport failure, never a timeout
+            // (see `DStarGateway::next_event`). Announce it once
+            // instead of silently treating a dead radio link like
+            // an empty queue while the monitor keeps running.
+            Err(e) => {
+                if !session.radio_link_lost {
+                    session.radio_link_lost = true;
+                    aprintln!(
+                        "{}",
+                        thd75_repl::output::error(format_args!("radio link failed: {e}"))
+                    );
+                }
+                break;
+            }
         };
         trace_dstar_event(&event);
         print_dstar_event(&event);
@@ -3088,7 +3176,7 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
             if let Some(ref mut client) = session.reflector {
                 match client.disconnect().await {
                     Ok(()) => {
-                        println!("Disconnected from reflector.");
+                        aprintln!("Disconnected from reflector.");
                         session.reflector = None;
                     }
                     Err(e) => println!(
@@ -3113,7 +3201,7 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
                         commands::fmt_elapsed(entry.timestamp.elapsed())
                     );
                 }
-                println!("{} stations heard.", list.len());
+                println!("{}", thd75_repl::output::stations_summary(list.len()));
             }
         }
         "status" => {
@@ -3169,12 +3257,11 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
                 println!("Outgoing text cleared.");
             } else {
                 let text = parts[1..].join(" ");
-                let truncated = if text.len() > 20 {
-                    println!("Text truncated to 20 characters.");
-                    text[..20].to_owned()
-                } else {
-                    text
-                };
+                let truncated = truncate_slow_data_text(&text);
+                if truncated.len() < text.len() {
+                    println!("Text truncated to fit 20 bytes.");
+                }
+                let truncated = truncated.to_owned();
                 session.tx_slow_data = encode_text_message(&truncated);
                 session.tx_slow_data_idx = 0;
                 println!(
@@ -3189,6 +3276,23 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
              Commands: monitor, link, unlink, echo, text, heard, status, dstar stop"
         ),
     }
+}
+
+/// Truncate `text` to at most 20 bytes for the D-STAR slow-data text
+/// field, backing off to the nearest character boundary so multi-byte
+/// input can never be split mid-character (byte-slicing a UTF-8
+/// string off a boundary panics). The wire format is 20 bytes, so
+/// the limit is measured in bytes, not characters.
+fn truncate_slow_data_text(text: &str) -> &str {
+    const MAX_BYTES: usize = 20;
+    if text.len() <= MAX_BYTES {
+        return text;
+    }
+    let mut end = MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Maximum echo recording length (60 seconds at 50 frames/sec).
@@ -3378,8 +3482,10 @@ async fn relay_radio_to_reflector(session: &mut DStarSession, event: &DStarEvent
 /// Drive the echo playback state machine.
 ///
 /// Called from the poll cycle. When in `Waiting` state and the delay
-/// has elapsed, plays back all buffered frames to the radio with
-/// proper 20ms pacing per AMBE frame.
+/// has elapsed, plays back all buffered frames to the radio, sleeping
+/// 15 ms per frame — the BT write latency supplies the remainder of
+/// the 20 ms AMBE frame interval, so the modem sees roughly its
+/// native 50 fps consumption rate.
 async fn echo_playback_tick(session: &mut DStarSession) {
     // Check if we're in Waiting and the delay has elapsed.
     let should_play = matches!(
@@ -3405,9 +3511,9 @@ async fn echo_playback_tick(session: &mut DStarSession) {
         flag3: header.flag3,
         rpt2: header.rpt2,
         rpt1: header.rpt1,
-        ur_call: Callsign::try_from_str("CQCQCQ").expect("static constant"),
+        ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
         my_call: session.callsign,
-        my_suffix: Suffix::try_from_str("ECHO").expect("static constant"),
+        my_suffix: Suffix::from_wire_bytes(*b"ECHO"),
     };
 
     // Send header to radio.
@@ -3539,8 +3645,7 @@ fn build_radio_header(
     }
     let rpt = Callsign::from_wire_bytes(rpt_buf);
 
-    let ur_call = Callsign::try_from_str("CQCQCQ")
-        .unwrap_or_else(|_| Callsign::from_wire_bytes(*b"CQCQCQ  "));
+    let ur_call = Callsign::from_wire_bytes(*b"CQCQCQ  ");
 
     DStarHeader {
         flag1: header.flag1 | DSTAR_REPEATER_MASK,
@@ -4086,5 +4191,47 @@ mod offset_tests {
     fn parses_zero_offset() {
         assert_eq!(parse_utc_offset("+00:00").unwrap(), 0);
         assert_eq!(parse_utc_offset("-00:00").unwrap(), 0);
+    }
+
+    #[test]
+    fn rejects_non_ascii_without_panicking() {
+        // A multi-byte character where the HHMM split lands mid-char
+        // used to panic on the byte slice; it must be a plain error.
+        assert!(parse_utc_offset("\u{e9}5").is_err());
+        assert!(parse_utc_offset("+\u{e9}\u{e9}").is_err());
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_slow_data_text;
+
+    #[test]
+    fn short_text_unchanged() {
+        assert_eq!(truncate_slow_data_text("hello"), "hello");
+    }
+
+    #[test]
+    fn exact_twenty_bytes_unchanged() {
+        let s = "12345678901234567890";
+        assert_eq!(truncate_slow_data_text(s), s);
+    }
+
+    #[test]
+    fn ascii_truncated_to_twenty_bytes() {
+        assert_eq!(
+            truncate_slow_data_text("123456789012345678901234"),
+            "12345678901234567890"
+        );
+    }
+
+    #[test]
+    fn multibyte_straddling_boundary_backs_off() {
+        // 19 ASCII bytes followed by a 2-byte character straddling
+        // byte 20: truncation must back off to byte 19, not panic.
+        let s = "1234567890123456789\u{e9}x";
+        let t = truncate_slow_data_text(s);
+        assert_eq!(t, "1234567890123456789");
+        assert!(t.len() <= 20, "truncated to {} bytes", t.len());
     }
 }

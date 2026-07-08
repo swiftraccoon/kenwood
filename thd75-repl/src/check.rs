@@ -38,7 +38,10 @@ const COVERAGE: &[(&str, Generator)] = &[
     ("output::vox", gen_vox),
     ("output::fm_radio", gen_fm_radio),
     ("output::channel_read", gen_channel_read),
+    ("output::channels_reading", gen_channels_reading),
     ("output::channels_summary", gen_channels_summary),
+    ("output::tx_offset", gen_tx_offset),
+    ("output::step_size", gen_step_size),
     ("output::gps_config", gen_gps_config),
     ("output::urcall_read", gen_urcall_read),
     ("output::urcall_set", gen_urcall_set),
@@ -47,7 +50,9 @@ const COVERAGE: &[(&str, Generator)] = &[
     ("output::warning", gen_warning),
     ("output::aprs_events", gen_aprs_events),
     ("output::dstar_events", gen_dstar_events),
+    ("output::startup", gen_startup),
     ("help_text::for_command", gen_help_text),
+    ("help_text::mode_help", gen_mode_help),
 ];
 
 fn gen_frequency() -> Vec<String> {
@@ -196,11 +201,32 @@ fn gen_channel_read() -> Vec<String> {
     ]
 }
 
+fn gen_channels_reading() -> Vec<String> {
+    vec![
+        output::channels_reading(0, 19),
+        output::channels_reading(100, 199),
+    ]
+}
+
 fn gen_channels_summary() -> Vec<String> {
     vec![
         output::channels_summary(0),
         output::channels_summary(1),
         output::channels_summary(42),
+    ]
+}
+
+fn gen_tx_offset() -> Vec<String> {
+    vec![
+        output::tx_offset(Band::A, 600_000),
+        output::tx_offset(Band::B, 5_000_000),
+    ]
+}
+
+fn gen_step_size() -> Vec<String> {
+    vec![
+        output::step_size_read(Band::A, "25 kilohertz"),
+        output::step_size_set(Band::B, "12.5 kilohertz"),
     ]
 }
 
@@ -257,7 +283,10 @@ fn gen_aprs_events() -> Vec<String> {
         output::aprs_mode_active().to_string(),
         output::aprs_is_connected().to_string(),
         output::aprs_is_incoming("W1AW>APRS:hello"),
-        output::aprs_stations_summary(5),
+        output::aprs_station_entry("W1AW", Some((35.3, -82.46)), 12, "2 minutes"),
+        output::aprs_station_entry("W1AW", None, 1, "15 seconds"),
+        output::stations_summary(1),
+        output::stations_summary(5),
     ]
 }
 
@@ -269,6 +298,7 @@ fn gen_dstar_events() -> Vec<String> {
         output::dstar_voice_lost().to_string(),
         output::dstar_text_message("hello"),
         output::dstar_gps(""),
+        output::dstar_gps("$GPGGA,123519,4807.038,N"),
         output::dstar_station_heard("W1AW"),
         output::dstar_command_cq().to_string(),
         output::dstar_command_echo().to_string(),
@@ -277,11 +307,40 @@ fn gen_dstar_events() -> Vec<String> {
         output::dstar_command_link("REF030", 'C'),
         output::dstar_command_callsign("W1AW"),
         output::dstar_modem_status(5, false),
+        output::dstar_modem_status(0, true),
         output::reflector_event_connected().to_string(),
+        output::reflector_event_rejected().to_string(),
+        output::reflector_event_disconnected().to_string(),
         output::reflector_event_voice_start("W1AW", "", "CQCQCQ"),
+        output::reflector_event_voice_start("W1AW", "P", "CQCQCQ"),
         output::reflector_event_voice_end(0, 0),
+        output::reflector_event_voice_end(1, 20),
         output::reflector_event_voice_end(42, 840),
     ]
+}
+
+fn gen_startup() -> Vec<String> {
+    vec![
+        output::startup_banner("0.1.0"),
+        output::connected_via("/dev/cu.usbmodem1234"),
+        output::startup_identified("TH-D75", "1.03"),
+        output::type_help_hint().to_string(),
+        output::goodbye().to_string(),
+    ]
+}
+
+fn gen_mode_help() -> Vec<String> {
+    let mut v = Vec::new();
+    for blob in [
+        help_text::CAT_MODE_HELP,
+        help_text::APRS_MODE_HELP,
+        help_text::DSTAR_MODE_HELP,
+    ] {
+        for line in blob.lines() {
+            v.push(line.to_string());
+        }
+    }
+    v
 }
 
 fn gen_help_text() -> Vec<String> {

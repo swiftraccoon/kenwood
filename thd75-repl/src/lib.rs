@@ -10,7 +10,10 @@
 //! Public modules here are part of the REPL's internal API, not a
 //! stable library API for external consumers.
 
-#![deny(unsafe_code)]
+// `unsafe_code = "forbid"` comes from this crate's `[lints.rust]` block in
+// Cargo.toml, which covers every target (lib, bin, integration tests). A
+// source-level attribute here would be a compile error: changing the level
+// of a forbidden lint — even to `deny` — is rejected by rustc.
 #![deny(missing_docs)]
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]

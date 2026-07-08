@@ -387,6 +387,7 @@ Example: status";
 const CHECK_HELP: &str = "check: Run the accessibility compliance self-check.
 Syntax: check
 Exercises every formatter, runs the lint, prints a report.
+Also available without connecting a radio: thd75-repl check
 Example: check";
 
 const VERBOSE_HELP: &str = "verbose: Toggle verbose monitor output.

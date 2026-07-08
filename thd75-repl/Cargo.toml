@@ -56,10 +56,15 @@ time = { version = "0.3", default-features = false, features = [
 rustyline = "18"
 dirs-next = "2"
 
+# KNOWN DIVERGENCE FROM WORKSPACE — a crate-local [lints.<group>] block fully
+# REPLACES the workspace block (no merge), so every difference is listed here:
+# - [lints.clippy]: unwrap_used / expect_used / panic are allowed crate-wide
+#   (interactive REPL shape — see the comment on those lines below), plus
+#   module_name_repetitions, multiple_crate_versions, redundant_pub_crate.
+# - [lints.rust]: restates the workspace block in full, including
+#   unsafe_code = "forbid" and unused_crate_dependencies = "deny".
 [lints.rust]
-# unsafe_code lives at the source level — `#![deny(unsafe_code)]` in `src/lib.rs:13`
-# and `#![deny(unsafe_code)]` in `src/main.rs`. Not declared here so the attribute-level
-# deny is the single source of truth.
+unsafe_code = "forbid"
 missing_docs = "deny"
 missing_debug_implementations = "deny"
 unreachable_pub = "deny"
@@ -72,6 +77,7 @@ unused_qualifications = "deny"
 non_ascii_idents = "deny"
 single_use_lifetimes = "deny"
 let_underscore_drop = "deny"
+unused_crate_dependencies = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

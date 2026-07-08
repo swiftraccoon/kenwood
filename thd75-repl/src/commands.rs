@@ -56,11 +56,16 @@ fn band_name(band: Band) -> &'static str {
 pub(crate) fn fmt_elapsed(elapsed: std::time::Duration) -> String {
     let secs = elapsed.as_secs();
     if secs < 60 {
-        format!("{secs} seconds")
+        format!("{secs} {}", if secs == 1 { "second" } else { "seconds" })
     } else if secs < 3600 {
-        format!("{} minutes", secs / 60)
+        let minutes = secs / 60;
+        format!(
+            "{minutes} {}",
+            if minutes == 1 { "minute" } else { "minutes" }
+        )
     } else {
-        format!("{} hours", secs / 3600)
+        let hours = secs / 3600;
+        format!("{hours} {}", if hours == 1 { "hour" } else { "hours" })
     }
 }
 
@@ -251,9 +256,8 @@ pub(crate) async fn step_down<T: Transport>(radio: &mut Radio<T>, args: &[&str])
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "Frequencies are entered in megahertz (e.g. 146.52), multiplied by 1_000_000 to yield \
-              at most ~1.3e9 — well within u32 range. The parsed f64 is always non-negative since \
-              the radio's supported bands are all positive frequencies, so the `as u32` truncation \
-              and sign-loss are both fine."
+              at most ~1.3e9 — well within u32 range. The parsed f64 is validated finite and \
+              positive above, so the `as u32` truncation and sign-loss are both fine."
 )]
 pub(crate) async fn tune<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     if args.len() < 2 {
@@ -269,6 +273,13 @@ pub(crate) async fn tune<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
         aprintln!("Error: invalid frequency: {freq_str}");
         return;
     };
+    // `parse::<f64>` accepts negative numbers, NaN, and infinity;
+    // an unguarded `as u32` would silently saturate those to 0 and
+    // tune the radio to 0 hertz instead of reporting the mistake.
+    if !mhz.is_finite() || mhz <= 0.0 {
+        aprintln!("Error: frequency must be a positive number in megahertz: {freq_str}");
+        return;
+    }
 
     let hz = (mhz * 1_000_000.0) as u32;
     let freq = kenwood_thd75::types::Frequency::new(hz);
@@ -312,10 +323,21 @@ pub(crate) async fn channel<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 /// Default range is 0 through 19.
 pub(crate) async fn channels<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     let start: u16 = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Saturate rather than overflow when the default range extends
+    // past u16::MAX (e.g. `channels 65530`).
     let end: u16 = args
         .get(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(start + 20);
+        .unwrap_or_else(|| start.saturating_add(20));
+    if end <= start {
+        aprintln!(
+            "{}",
+            thd75_repl::output::error(format_args!(
+                "end channel must be greater than start channel"
+            ))
+        );
+        return;
+    }
 
     aprintln!("{}", thd75_repl::output::channels_reading(start, end - 1));
     match radio.read_channels(start..end).await {

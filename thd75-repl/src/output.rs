@@ -27,8 +27,8 @@ pub fn band_name(band: Band) -> &'static str {
 /// Format a frequency in megahertz for natural speech output.
 ///
 /// Trailing zeros are stripped, but a trailing decimal with a single
-/// zero is kept so `146.5 megahertz` reads cleanly. Values below 1 Hz
-/// render as `0 megahertz`.
+/// zero is kept so `146.5 megahertz` reads cleanly. Zero renders as
+/// `0.0 megahertz`.
 #[must_use]
 pub fn freq_mhz(hz: u32) -> String {
     let mhz = f64::from(hz) / 1_000_000.0;
@@ -291,7 +291,8 @@ pub fn channels_summary(count: usize) -> String {
     if count == 0 {
         "No programmed channels in that range.".to_string()
     } else {
-        format!("{count} programmed channels found.")
+        let word = if count == 1 { "channel" } else { "channels" };
+        format!("{count} programmed {word} found.")
     }
 }
 
@@ -440,13 +441,22 @@ pub fn aprs_station_entry(
         Some((lat, lon)) => format!(" at {lat:.4}, {lon:.4}"),
         None => String::new(),
     };
-    format!("Station {callsign}{pos}, {packet_count} packets, heard {elapsed_display} ago.")
+    let packet_word = if packet_count == 1 {
+        "packet"
+    } else {
+        "packets"
+    };
+    format!("Station {callsign}{pos}, {packet_count} {packet_word}, heard {elapsed_display} ago.")
 }
 
-/// `{count} stations heard.`
+/// `{count} stations heard.` (singular `station` for a count of 1).
+///
+/// Shared by the APRS `stations` command and the D-STAR `heard`
+/// command — both close their station lists with this summary line.
 #[must_use]
-pub fn aprs_stations_summary(count: usize) -> String {
-    format!("{count} stations heard.")
+pub fn stations_summary(count: usize) -> String {
+    let word = if count == 1 { "station" } else { "stations" };
+    format!("{count} {word} heard.")
 }
 
 // ---------------------------------------------------------------------------
@@ -893,6 +903,9 @@ mod tests {
         let s = channels_summary(3);
         assert_eq!(s, "3 programmed channels found.");
         assert_lint(&s);
+        let s = channels_summary(1);
+        assert_eq!(s, "1 programmed channel found.");
+        assert_lint(&s);
     }
 
     #[test]
@@ -959,7 +972,8 @@ mod tests {
             aprs_is_incoming("W1AW-7>APRS:hello"),
             aprs_station_entry("W1AW", Some((35.3, -82.46)), 12, "2 minutes"),
             aprs_station_entry("W1AW", None, 1, "15 seconds"),
-            aprs_stations_summary(5),
+            stations_summary(5),
+            stations_summary(1),
         ];
         for s in &cases {
             assert_lint(s);
@@ -1010,7 +1024,13 @@ mod tests {
     #[test]
     fn aprs_station_entry_without_position() {
         let s = aprs_station_entry("W1AW", None, 1, "15 seconds");
-        assert_eq!(s, "Station W1AW, 1 packets, heard 15 seconds ago.");
+        assert_eq!(s, "Station W1AW, 1 packet, heard 15 seconds ago.");
+    }
+
+    #[test]
+    fn stations_summary_singular_and_plural() {
+        assert_eq!(stations_summary(1), "1 station heard.");
+        assert_eq!(stations_summary(5), "5 stations heard.");
     }
 
     #[test]

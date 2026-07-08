@@ -12,7 +12,7 @@ use kenwood_thd75::transport::{EitherTransport, SerialTransport};
 /// Priority order:
 /// 1. Explicit `--port` if provided
 /// 2. USB CDC-ACM auto-discovery
-/// 3. Native Bluetooth (macOS: `IOBluetooth` RFCOMM, with one retry)
+/// 3. Native Bluetooth (macOS: `IOBluetooth` RFCOMM)
 /// 4. Serial BT SPP ports (Linux/Windows only — skipped on macOS)
 pub(crate) fn discover_and_open(
     port: Option<&str>,
@@ -55,8 +55,9 @@ fn open_explicit(
 /// Open a Bluetooth connection using native `IOBluetooth` RFCOMM.
 ///
 /// `_baud` is ignored: the native macOS RFCOMM path negotiates its own
-/// line parameters. One retry is built in to cover a stale RFCOMM channel
-/// from a prior session that didn't call `disconnect()`.
+/// line parameters. A single attempt is made; a stale RFCOMM channel
+/// from a prior session that didn't call `disconnect()` surfaces as
+/// the error below with recovery guidance.
 #[cfg(target_os = "macos")]
 fn open_bluetooth(_baud: u32) -> Result<(String, EitherTransport), Box<dyn std::error::Error>> {
     let bt = kenwood_thd75::BluetoothTransport::open(None).map_err(|e| {
