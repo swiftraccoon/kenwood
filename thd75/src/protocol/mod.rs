@@ -1605,6 +1605,72 @@ pub enum Response {
     NotAvailable,
 }
 
+/// Band a band-indexed command addresses, `None` for global commands.
+///
+/// Used by the response-matching loop: with AI mode enabled the radio
+/// pushes `BY`/`FQ`/`MD`/`SQ` frames unsolicited — the same mnemonics
+/// as the reads — so an in-flight band-A query must not accept a
+/// band-B push as its answer.
+pub(crate) const fn command_band(cmd: &Command) -> Option<Band> {
+    match cmd {
+        Command::GetFrequency { band }
+        | Command::SetFrequency { band, .. }
+        | Command::GetFrequencyFull { band }
+        | Command::SetFrequencyFull { band, .. }
+        | Command::GetPowerLevel { band }
+        | Command::SetPowerLevel { band, .. }
+        | Command::GetVfoMemoryMode { band }
+        | Command::SetVfoMemoryMode { band, .. }
+        | Command::GetSquelch { band }
+        | Command::SetSquelch { band, .. }
+        | Command::GetSmeter { band }
+        | Command::SetSmeter { band, .. }
+        | Command::GetMode { band }
+        | Command::SetMode { band, .. }
+        | Command::GetBusy { band }
+        | Command::SetBusy { band, .. }
+        | Command::GetAttenuator { band }
+        | Command::SetAttenuator { band, .. }
+        | Command::GetStepSize { band }
+        | Command::SetStepSize { band, .. }
+        | Command::GetCurrentChannel { band }
+        | Command::RecallMemoryChannel { band, .. }
+        | Command::GetBandScope { band }
+        | Command::SetBandScope { band, .. }
+        | Command::SetFineStep { band, .. }
+        | Command::FrequencyUp { band }
+        | Command::FrequencyDown { band }
+        | Command::Transmit { band }
+        | Command::Receive { band }
+        | Command::SetBand { band } => Some(*band),
+        _ => None,
+    }
+}
+
+/// Band a band-indexed response pertains to, `None` for global ones.
+///
+/// Counterpart of [`command_band`] for the response side of the
+/// unsolicited-push disambiguation.
+pub(crate) const fn response_band(response: &Response) -> Option<Band> {
+    match response {
+        Response::Frequency { band, .. }
+        | Response::FrequencyFull { band, .. }
+        | Response::PowerLevel { band, .. }
+        | Response::VfoMemoryMode { band, .. }
+        | Response::Squelch { band, .. }
+        | Response::Smeter { band, .. }
+        | Response::Mode { band, .. }
+        | Response::Busy { band, .. }
+        | Response::Attenuator { band, .. }
+        | Response::StepSize { band, .. }
+        | Response::CurrentChannel { band, .. }
+        | Response::MemoryRecall { band, .. }
+        | Response::BandScope { band, .. }
+        | Response::BandResponse { band } => Some(*band),
+        _ => None,
+    }
+}
+
 /// Get the CAT mnemonic for a command (for logging).
 #[must_use]
 pub const fn command_name(cmd: &Command) -> &'static str {
@@ -1999,7 +2065,13 @@ pub fn parse(frame: &[u8]) -> Result<Response, ProtocolError> {
         return Err(ProtocolError::MalformedFrame(frame.to_vec()));
     }
 
-    let mnemonic = &frame_str[..2];
+    // Char-boundary-safe: a valid-UTF-8 frame starting with a
+    // multi-byte character has no 2-byte mnemonic — reject it rather
+    // than panicking on the slice.
+    let Some(mnemonic) = frame_str.get(..2) else {
+        tracing::warn!(frame = %frame_str, "frame mnemonic is not two ASCII bytes");
+        return Err(ProtocolError::MalformedFrame(frame.to_vec()));
+    };
     tracing::debug!(mnemonic = %mnemonic, "parsing response");
 
     // The rest of the frame after the mnemonic (may start with a space).
@@ -2057,6 +2129,23 @@ mod tests {
     fn parse_unknown_command() {
         let r = parse(b"ZZ 123");
         assert!(matches!(r, Err(ProtocolError::UnknownCommand(_))));
+    }
+
+    #[test]
+    fn parse_multibyte_utf8_frame_is_error_not_panic() {
+        // A valid-UTF-8 frame whose first character is multi-byte
+        // ("€" = 3 bytes) lands mid-character at byte index 2 — the
+        // mnemonic extraction must reject it, not panic.
+        let r = parse("€X 1".as_bytes());
+        assert!(r.is_err(), "non-ASCII mnemonic must be an error: {r:?}");
+    }
+
+    #[test]
+    fn parse_mr_multibyte_payload_is_error_not_panic() {
+        // The MR payload splitter indexes bytes 0 and 1..; a
+        // multi-byte first character must not panic it.
+        let r = parse("MR €,005".as_bytes());
+        assert!(r.is_err(), "non-ASCII MR payload must be an error: {r:?}");
     }
 
     #[test]

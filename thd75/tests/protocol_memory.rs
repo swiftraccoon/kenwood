@@ -45,9 +45,9 @@ fn parse_me_response_basic() -> TestResult {
     assert_eq!(data.rx_frequency, Frequency::new(145_000_000));
     assert_eq!(data.tx_offset, Frequency::new(600_000));
     assert_eq!(data.step_size, StepSize::Hz5000);
-    assert!(!data.tone_enable);
-    assert!(!data.reverse);
-    assert_eq!(data.flags_0a_raw, 0);
+    assert!(!data.tone_enable());
+    assert!(!data.reverse());
+    assert_eq!(data.flags_0a_raw(), 0);
     Ok(())
 }
 
@@ -85,11 +85,6 @@ fn me_write_serialize_full() -> TestResult {
         step_size: StepSize::Hz5000,
         mode_flags_raw: 0,
         shift: ShiftDirection::SIMPLEX,
-        reverse: false,
-        tone_enable: false,
-        ctcss_mode: CtcssMode::Off,
-        dcs_enable: false,
-        cross_tone_reverse: false,
         flags_0a_raw: 0,
         tone_code: ToneCode::new(8)?,
         ctcss_code: ToneCode::new(8)?,
@@ -118,11 +113,6 @@ fn me_write_parse_round_trip() -> TestResult {
         step_size: StepSize::Hz5000,
         mode_flags_raw: 0,
         shift: ShiftDirection::SIMPLEX,
-        reverse: false,
-        tone_enable: false,
-        ctcss_mode: CtcssMode::Off,
-        dcs_enable: false,
-        cross_tone_reverse: false,
         flags_0a_raw: 0,
         tone_code: ToneCode::new(8)?,
         ctcss_code: ToneCode::new(8)?,

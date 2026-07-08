@@ -54,12 +54,8 @@ fn arb_channel_memory() -> impl Strategy<Value = ChannelMemory> {
     (part_a, part_b).prop_filter_map(
         "channel memory construction failed",
         |((rx, tx, step, _ctcss_m, flags), (tc, cc, dc, ds, lo, urcall, dm))| {
-            // Derive individual fields from flags_0a_raw for consistency
-            let tone_enable = (flags >> 7) & 1 != 0;
-            let ctcss_enable = (flags >> 6) & 1 != 0;
-            let dcs_enable = (flags >> 5) & 1 != 0;
-            let cross_tone = (flags >> 4) & 1 != 0;
-            let reverse = (flags >> 3) & 1 != 0;
+            // The tone flags live in flags_0a_raw itself; only shift
+            // needs deriving (it is double-encoded on the wire).
             let shift_val = flags & 0x07;
             Some(ChannelMemory {
                 rx_frequency: Frequency::new(rx),
@@ -67,11 +63,6 @@ fn arb_channel_memory() -> impl Strategy<Value = ChannelMemory> {
                 step_size: StepSize::try_from(step).ok()?,
                 mode_flags_raw: 0,
                 shift: ShiftDirection::try_from(shift_val).ok()?,
-                reverse,
-                tone_enable,
-                ctcss_mode: CtcssMode::try_from(u8::from(ctcss_enable)).ok()?,
-                dcs_enable,
-                cross_tone_reverse: cross_tone,
                 flags_0a_raw: flags,
                 tone_code: ToneCode::new(tc).ok()?,
                 ctcss_code: ToneCode::new(cc).ok()?,
@@ -143,11 +134,6 @@ proptest! {
     fn byte_0a_packing(flags in 0u8..=255u8) {
         let ch = ChannelMemory {
             flags_0a_raw: flags,
-            // Derive individual fields for struct consistency
-            tone_enable: (flags >> 7) & 1 != 0,
-            dcs_enable: (flags >> 5) & 1 != 0,
-            cross_tone_reverse: (flags >> 4) & 1 != 0,
-            reverse: (flags >> 3) & 1 != 0,
             shift: ShiftDirection::try_from(flags & 0x07).map_err(to_test_err)?,
             ..ChannelMemory::default()
         };

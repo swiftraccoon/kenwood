@@ -33,14 +33,17 @@ impl<T: Transport> Radio<T> {
         // Write the updated frequency.
         self.set_frequency_full(band, &channel).await?;
 
-        // Verify.
+        // Verify. This readback is the only verification anywhere in
+        // the tune path — the radio clamps out-of-range FO writes
+        // silently, so a mismatch means the radio is NOT on the
+        // requested frequency and a subsequent transmit would key up
+        // on the wrong one.
         let readback = self.get_frequency(band).await?;
         if readback.rx_frequency != freq {
-            tracing::warn!(
-                expected = freq.as_hz(),
-                actual = readback.rx_frequency.as_hz(),
-                "frequency readback mismatch"
-            );
+            return Err(Error::FrequencyReadbackMismatch {
+                expected: freq.as_hz(),
+                actual: readback.rx_frequency.as_hz(),
+            });
         }
 
         Ok(())
@@ -60,10 +63,13 @@ impl<T: Transport> Radio<T> {
     pub async fn tune_channel(&mut self, band: Band, channel: u16) -> Result<(), Error> {
         tracing::info!(?band, channel, "tuning to memory channel");
 
-        // Verify the channel exists and is populated by trying to read it.
+        // Verify the channel exists and is populated by trying to read
+        // it. Recalling an empty channel would leave the radio in an
+        // unusable state; the documented contract is an error.
         let ch_data = self.read_channel(channel).await?;
         if ch_data.rx_frequency.as_hz() == 0 {
-            tracing::warn!(channel, "channel appears empty (frequency is 0 Hz)");
+            tracing::warn!(channel, "channel is empty (frequency is 0 Hz)");
+            return Err(Error::RadioError);
         }
 
         // Ensure memory mode.

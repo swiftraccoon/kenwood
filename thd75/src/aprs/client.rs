@@ -59,7 +59,7 @@
 //! }
 //!
 //! // Clean shutdown — exits KISS mode, returns Radio for other use
-//! let _radio = client.stop().await?;
+//! let _radio = client.stop().await.map_err(|(_client, e)| e)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -174,9 +174,21 @@ impl AprsClientConfig {
     }
 
     /// Build the [`Ax25Address`] for this station.
-    fn my_address(&self) -> Ax25Address {
-        Ax25Address::new(&self.callsign, self.ssid)
-            .unwrap_or_else(|_| unreachable!("config validated callsign + ssid at construction"))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] if the callsign or SSID is not a
+    /// valid AX.25 address — config fields are freely settable, so
+    /// validation happens at use ([`AprsClient::start`]), not at
+    /// construction.
+    fn my_address(&self) -> Result<Ax25Address, Error> {
+        Ax25Address::new(&self.callsign, self.ssid).map_err(|e| {
+            tracing::warn!(callsign = %self.callsign, ssid = self.ssid, error = %e, "invalid APRS station address");
+            Error::Validation(crate::error::ValidationError::AprsWireOutOfRange {
+                field: "APRS station address",
+                detail: "callsign must be 1-6 chars A-Z/0-9 and SSID 0-15",
+            })
+        })
     }
 
     /// Start building a configuration with the fluent builder.
@@ -441,6 +453,8 @@ pub enum AprsEvent {
 pub struct AprsClient<T: Transport> {
     session: KissSession<T>,
     config: AprsClientConfig,
+    /// The station's AX.25 address, validated once at [`Self::start`].
+    my_addr: Ax25Address,
     messenger: AprsMessenger,
     stations: StationList,
     beaconing: SmartBeaconing,
@@ -487,14 +501,22 @@ impl<T: Transport> AprsClient<T> {
         radio: Radio<T>,
         config: AprsClientConfig,
     ) -> Result<Self, (Radio<T>, Error)> {
+        // Validate the station address BEFORE touching the radio —
+        // config fields are freely settable, so this is the gate that
+        // keeps an invalid callsign/SSID from reaching the air (and
+        // it must be an error, never a panic).
+        let my_addr = match config.my_address() {
+            Ok(addr) => addr,
+            Err(e) => return Err((radio, e)),
+        };
+
         let mut session = match radio.enter_kiss(config.baud).await {
             Ok(s) => s,
             Err((radio, e)) => return Err((radio, e)),
         };
         session.set_receive_timeout(EVENT_POLL_TIMEOUT);
 
-        let my_addr = config.my_address();
-        let messenger = AprsMessenger::new(my_addr, config.digipeater_path.clone());
+        let messenger = AprsMessenger::new(my_addr.clone(), config.digipeater_path.clone());
         let stations = StationList::new(
             config.max_stations,
             Duration::from_secs(config.station_timeout_secs),
@@ -504,6 +526,7 @@ impl<T: Transport> AprsClient<T> {
         Ok(Self {
             session,
             config,
+            my_addr,
             messenger,
             stations,
             beaconing,
@@ -516,9 +539,35 @@ impl<T: Transport> AprsClient<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the KISS exit command fails.
-    pub async fn stop(self) -> Result<Radio<T>, Error> {
-        self.session.exit().await
+    /// Returns the client back together with the error if the KISS
+    /// exit command fails, so the transport survives for a retry.
+    pub async fn stop(self) -> Result<Radio<T>, (Box<Self>, Error)> {
+        let Self {
+            session,
+            config,
+            my_addr,
+            messenger,
+            stations,
+            beaconing,
+            pending_events,
+            last_rf_packet,
+        } = self;
+        match session.exit().await {
+            Ok(radio) => Ok(radio),
+            Err((session, e)) => Err((
+                Box::new(Self {
+                    session,
+                    config,
+                    my_addr,
+                    messenger,
+                    stations,
+                    beaconing,
+                    pending_events,
+                    last_rf_packet,
+                }),
+                e,
+            )),
+        }
     }
 
     /// Process pending I/O and return the next event.
@@ -598,8 +647,12 @@ impl<T: Transport> AprsClient<T> {
     /// `MessageExpired` events for any messages that exhausted their
     /// retry budget.
     async fn process_retries(&mut self, now: Instant) -> Result<(), Error> {
-        if let Some(frame) = self.messenger.next_frame_to_send(now) {
+        // Peek → transmit → commit: if this future is cancelled during
+        // the write, the attempt is not burned and the retry fires
+        // again next cycle instead of silently vanishing.
+        if let Some((id, frame)) = self.messenger.peek_frame_to_send(now) {
             self.session.send_wire(&frame).await?;
+            self.messenger.commit_send(&id, now);
         }
         for id in self.messenger.cleanup_expired(now) {
             self.pending_events.push_back(AprsEvent::MessageExpired(id));
@@ -628,7 +681,16 @@ impl<T: Transport> AprsClient<T> {
         if frame.command != KissCommand::Data {
             return Ok(None);
         }
-        Ok(parse_ax25(&frame.data).ok())
+        Ok(match parse_ax25(&frame.data) {
+            Ok(packet) => Some(packet),
+            Err(e) => {
+                // A KISS frame that fails AX.25 decode is real
+                // corruption on air — leave a trace so a degrading
+                // link is distinguishable from an idle channel.
+                tracing::debug!(error = ?e, len = frame.data.len(), "dropping undecodable AX.25 frame");
+                None
+            }
+        })
     }
 
     /// Phase 3: if the digipeater is configured and would relay this
@@ -711,13 +773,20 @@ impl<T: Transport> AprsClient<T> {
             .update(&packet.source.callsign, &aprs_data, &path, now);
 
         if let AprsData::Message(ref msg) = aprs_data {
-            if !self
+            // Check-then-mark, NOT check-and-mark: marking happens
+            // only after the message was fully processed, so a
+            // cancelled delivery (mid auto-ack send) does not eat the
+            // message and dedup away its RF retries.
+            if self
                 .messenger
-                .is_new_incoming(&packet.source.callsign, msg, now)
+                .is_duplicate_incoming(&packet.source.callsign, msg, now)
             {
                 return Ok(None);
             }
-            return self.handle_incoming_message(msg, &packet.source).await;
+            let event = self.handle_incoming_message(msg, &packet.source).await?;
+            self.messenger
+                .mark_incoming_seen(&packet.source.callsign, msg, now);
+            return Ok(event);
         }
 
         self.dispatch_event(packet, aprs_data)
@@ -813,9 +882,11 @@ impl<T: Transport> AprsClient<T> {
         let now = Instant::now();
         let message_id = self.messenger.send_message(addressee, text, now);
 
-        // Send the first frame immediately.
-        if let Some(frame) = self.messenger.next_frame_to_send(now) {
+        // Send the first frame immediately (peek → write → commit, so
+        // a cancelled write leaves the first attempt unburned).
+        if let Some((id, frame)) = self.messenger.peek_frame_to_send(now) {
             self.session.send_wire(&frame).await?;
+            self.messenger.commit_send(&id, now);
         }
 
         Ok(message_id)
@@ -866,7 +937,7 @@ impl<T: Transport> AprsClient<T> {
         comment: &str,
         now: Instant,
     ) -> Result<(), Error> {
-        let source = self.config.my_address();
+        let source = self.my_addr.clone();
         let wire = build_aprs_position_report(
             &source,
             lat,
@@ -919,7 +990,7 @@ impl<T: Transport> AprsClient<T> {
         comment: &str,
         now: Instant,
     ) -> Result<(), Error> {
-        let source = self.config.my_address();
+        let source = self.my_addr.clone();
         let wire = build_aprs_position_compressed(
             &source,
             lat,
@@ -940,7 +1011,7 @@ impl<T: Transport> AprsClient<T> {
     ///
     /// Returns an error if the transmission fails.
     pub async fn send_status(&mut self, text: &str) -> Result<(), Error> {
-        let source = self.config.my_address();
+        let source = self.my_addr.clone();
         let wire = build_aprs_status(&source, text, &self.config.digipeater_path);
         self.session.send_wire(&wire).await?;
         Ok(())
@@ -967,7 +1038,7 @@ impl<T: Transport> AprsClient<T> {
         lon: f64,
         comment: &str,
     ) -> Result<(), Error> {
-        let source = self.config.my_address();
+        let source = self.my_addr.clone();
         let wire = build_aprs_object(
             &source,
             name,
@@ -1058,7 +1129,7 @@ impl<T: Transport> AprsClient<T> {
         let mut path_parts: Vec<String> =
             packet.digipeaters.iter().map(ToString::to_string).collect();
         path_parts.push("qAR".to_owned());
-        path_parts.push(format!("{}", self.config.my_address()));
+        path_parts.push(format!("{}", self.my_addr));
         let path_str = path_parts.join(",");
         let data = String::from_utf8_lossy(&packet.info);
         format!(
@@ -1090,7 +1161,7 @@ impl<T: Transport> AprsClient<T> {
         // what distinguishes an Internet→RF gated packet from one that
         // was already on RF; receivers look for `,I` to skip re-gating
         // and to know who introduced the packet.
-        let igate_call = self.config.my_address();
+        let igate_call = self.my_addr.clone();
         let third_party_payload = format!("}}{header},{igate_call},I:{data}");
 
         // Outer AX.25 frame:
@@ -1134,7 +1205,7 @@ impl<T: Transport> AprsClient<T> {
     ///
     /// where
     /// - `MYCALL` is the `IGate`'s configured callsign + SSID
-    ///   (`self.config.my_address()`),
+    ///   (the station's validated address),
     /// - `APK005` is the TH-D75 tocall (matching this crate's beacon
     ///   destination), and
     /// - `RF_PATH` is the `IGate`'s configured digipeater path
@@ -1294,7 +1365,7 @@ impl<T: Transport> AprsClient<T> {
             && let Some((lat, lon)) = self.config.auto_query_position
         {
             tracing::info!(from = %from.callsign, "responding to ?APRSP query");
-            let source = self.config.my_address();
+            let source = self.my_addr.clone();
             let wire = build_query_response_position(
                 &source,
                 lat,
@@ -1370,7 +1441,36 @@ mod tests {
         // Queue the KISS exit frame expectation.
         client.session.transport.expect(&[FEND, 0xFF, FEND], &[]);
 
-        let _radio = client.stop().await?;
+        let _radio = client.stop().await.map_err(|(_, e)| e)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_with_invalid_callsign_errors_instead_of_panicking() -> TestResult {
+        // Config fields are freely settable, so validation must happen
+        // at use — an invalid callsign previously hit an `unreachable!`
+        // deep inside start().
+        let mock = MockTransport::new();
+        let radio = Radio::connect(mock).await?;
+        let config = AprsClientConfig::new("N0CALL/P", 7);
+        let result = AprsClient::start(radio, config).await;
+        assert!(
+            matches!(result, Err((_, Error::Validation(_)))),
+            "invalid callsign must be a validation error"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_with_invalid_ssid_errors_instead_of_panicking() -> TestResult {
+        let mock = MockTransport::new();
+        let radio = Radio::connect(mock).await?;
+        let config = AprsClientConfig::new("N0CALL", 99);
+        let result = AprsClient::start(radio, config).await;
+        assert!(
+            matches!(result, Err((_, Error::Validation(_)))),
+            "SSID above 15 must be a validation error"
+        );
         Ok(())
     }
 
@@ -1532,11 +1632,12 @@ mod tests {
     }
 
     #[test]
-    fn config_my_address() {
+    fn config_my_address() -> TestResult {
         let config = AprsClientConfig::new("KQ4NIT", 9);
-        let addr = config.my_address();
+        let addr = config.my_address()?;
         assert_eq!(addr.callsign, "KQ4NIT");
         assert_eq!(addr.ssid, 9);
+        Ok(())
     }
 
     #[test]

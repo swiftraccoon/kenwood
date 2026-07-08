@@ -60,8 +60,20 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the command fails or the response is unexpected.
+    /// Returns [`Error::Validation`] if `level` exceeds 99 (the type
+    /// is deliberately lenient because *reads* can return values above
+    /// 99, but the firmware's write range is 000-099). Returns an
+    /// error if the command fails or the response is unexpected.
     pub async fn set_af_gain(&mut self, band: Band, level: AfGainLevel) -> Result<(), Error> {
+        if level.as_u8() > 99 {
+            return Err(Error::Validation(
+                crate::error::ValidationError::SettingOutOfRange {
+                    name: "AF gain (write)",
+                    value: level.as_u8(),
+                    detail: "must be 0-99",
+                },
+            ));
+        }
         tracing::debug!(?band, ?level, "setting AF gain");
         let response = self.execute(Command::SetAfGain { band, level }).await?;
         match response {
@@ -171,6 +183,24 @@ impl<T: Transport> Radio<T> {
         callsign: &str,
         suffix: &str,
     ) -> Result<(), Error> {
+        // Validate through the typed callsign/suffix constructors so
+        // an over-length value never reaches the wire.
+        if crate::types::DstarCallsign::new(callsign).is_none() {
+            return Err(Error::Validation(
+                crate::error::ValidationError::CallsignTooLong {
+                    len: callsign.len(),
+                    max: 8,
+                },
+            ));
+        }
+        if crate::types::DstarSuffix::new(suffix).is_none() {
+            return Err(Error::Validation(
+                crate::error::ValidationError::CallsignTooLong {
+                    len: suffix.len(),
+                    max: 4,
+                },
+            ));
+        }
         tracing::info!(?slot, callsign, suffix, "setting D-STAR callsign");
         let response = self
             .execute(Command::SetDstarCallsign {

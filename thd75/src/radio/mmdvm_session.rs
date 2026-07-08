@@ -252,6 +252,11 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
             mode_b: self.state.mode_b,
             mcp_speed: self.state.mcp_speed,
             last_cmd_time: None,
+            // MMDVM binary traffic may have left residue on the line —
+            // drain before the first CAT command.
+            desynced: true,
+            mcp_active: false,
+            mcp_saved_timeout: None,
         })
     }
 }

@@ -104,12 +104,36 @@ mod inner {
     impl Transport for BluetoothTransport {
         async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
             tracing::debug!(bytes = data.len(), "BT write");
-            // SAFETY: `self.handle` was produced by `bt_rfcomm_open` (in `open()`) and
-            // is still live — `close()` is the only path that nulls it, and Rust's
-            // `&mut self` bound prevents `close()` from racing with us. The buffer
-            // `(data.as_ptr(), data.len())` is valid and in-bounds for reading during
-            // the call (the `&[u8]` borrow outlives the FFI call).
-            let ret = unsafe { bt_rfcomm_write(self.handle, data.as_ptr(), data.len()) };
+            // `writeSync:` blocks the calling OS thread until the peer
+            // acknowledges. BT runs on a current-thread runtime, so
+            // calling it inline would park the ONLY runtime thread —
+            // including tokio's timer, meaning command timeouts could
+            // never fire during exactly the stall they exist for. Run
+            // it on the blocking pool instead.
+            let handle_addr = self.handle as usize;
+            let owned = data.to_vec();
+            let ret = tokio::task::spawn_blocking(move || {
+                // SAFETY: `handle_addr` is the live handle from
+                // `bt_rfcomm_open` — `&mut self` is borrowed across
+                // this await, so `close()`/`Drop` cannot run
+                // concurrently through this transport; and even if
+                // this future is cancelled (detaching the blocking
+                // task) while `close()` then frees the handle, the C
+                // side serializes the entire write against close
+                // under its internal mutex. The buffer is owned by
+                // the closure for the full call.
+                unsafe {
+                    bt_rfcomm_write(
+                        handle_addr as *mut std::ffi::c_void,
+                        owned.as_ptr(),
+                        owned.len(),
+                    )
+                }
+            })
+            .await
+            .map_err(|e| {
+                TransportError::Write(io::Error::other(format!("BT write task failed: {e}")))
+            })?;
             if ret != 0 {
                 return Err(TransportError::Write(io::Error::other(
                     "RFCOMM write failed",

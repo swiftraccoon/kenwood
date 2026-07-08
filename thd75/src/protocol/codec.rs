@@ -60,12 +60,35 @@ impl Codec {
         }
     }
 
+    /// Discards all buffered bytes.
+    ///
+    /// Used to resynchronize after a command timeout: a partial frame
+    /// left in the buffer belongs to a response that will never be
+    /// completed and must not prefix the next command's response.
+    pub fn clear(&mut self) {
+        if !self.buffer.is_empty() {
+            tracing::debug!(
+                discarded = self.buffer.len(),
+                "codec: clearing stale buffered bytes"
+            );
+            self.buffer.clear();
+        }
+    }
+
     /// Extracts the next complete frame from the buffer, if available.
     ///
     /// Searches for a `\r` delimiter, extracts everything before it as a
     /// frame (without the trailing `\r`), and removes the consumed bytes
     /// from the buffer. Returns `None` if no complete frame is available.
+    ///
+    /// Leading `\n` bytes are skipped before framing: NMEA sentences on
+    /// the shared serial stream end `\r\n`, so after splitting on `\r`
+    /// the stray `\n` would otherwise corrupt the next frame's mnemonic.
     pub fn next_frame(&mut self) -> Option<Vec<u8>> {
+        let skip = self.buffer.iter().take_while(|&&b| b == b'\n').count();
+        if skip > 0 {
+            drop(self.buffer.drain(..skip));
+        }
         let pos = self.buffer.iter().position(|&b| b == b'\r')?;
         let frame = self.buffer.get(..pos)?.to_vec();
         drop(self.buffer.drain(..=pos));
@@ -132,6 +155,38 @@ mod tests {
         let frame = codec.next_frame().ok_or("next_frame returned None")?;
         assert!(frame.starts_with(b"FO"));
         Ok(())
+    }
+
+    #[test]
+    fn skips_newline_residue_between_frames() {
+        // NMEA sentences end "\r\n" while CAT frames end "\r". After
+        // splitting an NMEA sentence on '\r', the stray '\n' must not
+        // become the first byte of the next CAT frame (it would corrupt
+        // the mnemonic to "\nF" and fail an otherwise-valid response).
+        let mut codec = Codec::new();
+        codec.feed(b"$GPGGA,123519,4807.038,N*47\r\nFV 1.03.000\r");
+        assert_eq!(
+            codec.next_frame(),
+            Some(b"$GPGGA,123519,4807.038,N*47".to_vec())
+        );
+        assert_eq!(codec.next_frame(), Some(b"FV 1.03.000".to_vec()));
+    }
+
+    #[test]
+    fn skips_leading_newline_at_buffer_start() {
+        let mut codec = Codec::new();
+        codec.feed(b"\nID TH-D75\r");
+        assert_eq!(codec.next_frame(), Some(b"ID TH-D75".to_vec()));
+    }
+
+    #[test]
+    fn clear_discards_partial_frame() {
+        let mut codec = Codec::new();
+        codec.feed(b"FQ 0,01455");
+        codec.clear();
+        codec.feed(b"MD 0,0\r");
+        // The stale partial frame must not prefix the new one.
+        assert_eq!(codec.next_frame(), Some(b"MD 0,0".to_vec()));
     }
 
     #[test]

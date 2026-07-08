@@ -211,6 +211,42 @@ impl AprsMessenger {
         None
     }
 
+    /// Next retry-eligible frame WITHOUT recording a transmission
+    /// attempt. Returns `(message_id, wire_frame)`.
+    ///
+    /// Pair with [`Self::commit_send`] once the frame has actually
+    /// been written: an async caller can be cancelled between
+    /// obtaining a frame and transmitting it, and a burned attempt
+    /// for a frame that never went on air would silently exhaust the
+    /// retry budget.
+    #[must_use]
+    pub fn peek_frame_to_send(&self, now: Instant) -> Option<(String, Vec<u8>)> {
+        let max_retries = self.config.max_retries;
+        let retry_interval = self.config.retry_interval;
+        self.pending_messages
+            .iter()
+            .find(|msg| {
+                msg.attempts < max_retries
+                    && msg
+                        .last_sent
+                        .is_none_or(|last| now.duration_since(last) >= retry_interval)
+            })
+            .map(|msg| (msg.message_id.clone(), msg.wire_frame.clone()))
+    }
+
+    /// Record that the frame for `message_id` was transmitted at
+    /// `now` — the counterpart of [`Self::peek_frame_to_send`].
+    pub fn commit_send(&mut self, message_id: &str, now: Instant) {
+        if let Some(msg) = self
+            .pending_messages
+            .iter_mut()
+            .find(|m| m.message_id == message_id)
+        {
+            msg.attempts += 1;
+            msg.last_sent = Some(now);
+        }
+    }
+
     /// Like [`Self::send_message`] but returns `Err(MessageTooLong)` if
     /// the text exceeds the APRS 1.0.1 §14 limit of 67 bytes.
     ///
@@ -241,18 +277,45 @@ impl AprsMessenger {
     /// `now` is used to expire stale dedup entries and to record the
     /// arrival time of the current message.
     pub fn is_new_incoming(&mut self, source: &str, msg: &AprsMessage, now: Instant) -> bool {
+        if self.is_duplicate_incoming(source, msg, now) {
+            return false;
+        }
+        self.mark_incoming_seen(source, msg, now);
+        true
+    }
+
+    /// Non-mutating duplicate check: is this message already in the
+    /// dedup cache?
+    ///
+    /// Split from [`Self::mark_incoming_seen`] so an async caller can
+    /// check, fully process the message (through awaits that may be
+    /// cancelled), and mark it seen only once delivery is assured — a
+    /// message marked before delivery would be permanently lost if
+    /// the delivery future is cancelled, because every RF retry of it
+    /// then dedups away.
+    #[must_use]
+    pub fn is_duplicate_incoming(&self, source: &str, msg: &AprsMessage, now: Instant) -> bool {
+        let window = self.config.incoming_dedup_window;
+        let Some(ref id) = msg.message_id else {
+            return false;
+        };
+        let key = (source.to_owned(), id.clone());
+        self.incoming_seen
+            .get(&key)
+            .is_some_and(|t| now.duration_since(*t) < window)
+    }
+
+    /// Record an incoming message in the dedup cache — the counterpart
+    /// of [`Self::is_duplicate_incoming`]. Also expires stale entries.
+    pub fn mark_incoming_seen(&mut self, source: &str, msg: &AprsMessage, now: Instant) {
         let window = self.config.incoming_dedup_window;
         self.incoming_seen
             .retain(|_, t| now.duration_since(*t) < window);
-        let Some(ref id) = msg.message_id else {
-            return true;
-        };
-        let key = (source.to_owned(), id.clone());
-        if self.incoming_seen.contains_key(&key) {
-            return false;
+        if let Some(ref id) = msg.message_id {
+            let _prior = self
+                .incoming_seen
+                .insert((source.to_owned(), id.clone()), now);
         }
-        let _prior = self.incoming_seen.insert(key, now);
-        true
     }
 
     /// Process an incoming APRS message for acknowledgements of our own
@@ -398,6 +461,52 @@ mod tests {
         assert_eq!(msg.addressee, "W1AW");
         assert_eq!(msg.text, "Test");
         assert_eq!(msg.message_id, Some("1".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn peek_does_not_burn_a_retry_attempt() -> TestResult {
+        // An async caller may be cancelled between obtaining a frame
+        // and actually transmitting it — peeking must not record an
+        // attempt, only an explicit commit does.
+        let t0 = Instant::now();
+        let mut m = test_messenger();
+        let id = m.send_message("W1AW", "Test", t0);
+
+        let (peek_id, _wire) = m.peek_frame_to_send(t0).ok_or("expected a frame")?;
+        assert_eq!(peek_id, id);
+        // Peeked but never committed: the frame must still be
+        // available (the attempt was not burned).
+        let again = m.peek_frame_to_send(t0);
+        assert!(
+            again.is_some(),
+            "uncommitted peek must not consume the send"
+        );
+
+        // After a commit, the retry interval gates it.
+        m.commit_send(&id, t0);
+        assert!(m.peek_frame_to_send(t0).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_check_and_mark_are_separate() -> TestResult {
+        // An async caller must be able to CHECK for a duplicate,
+        // fully process the message (including awaits that may be
+        // cancelled), and only then MARK it seen — otherwise a
+        // cancelled delivery permanently eats the message and every
+        // RF retry of it.
+        let t0 = Instant::now();
+        let mut m = test_messenger();
+        let msg = parse_msg(b":N0CALL   :Hello{7")?;
+
+        assert!(!m.is_duplicate_incoming("W1AW", &msg, t0));
+        // Not yet marked: still not a duplicate (a cancelled delivery
+        // leaves it deliverable).
+        assert!(!m.is_duplicate_incoming("W1AW", &msg, t0));
+
+        m.mark_incoming_seen("W1AW", &msg, t0);
+        assert!(m.is_duplicate_incoming("W1AW", &msg, t0));
         Ok(())
     }
 

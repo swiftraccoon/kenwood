@@ -90,6 +90,35 @@ pub enum Error {
         /// The expected size in bytes.
         expected: usize,
     },
+
+    /// A frequency tune was written but the radio's readback shows a
+    /// different frequency — the radio silently clamped or rejected
+    /// the write (typically an out-of-band value or wrong mode).
+    #[error("frequency readback mismatch: wrote {expected} Hz, radio reports {actual} Hz")]
+    FrequencyReadbackMismatch {
+        /// The frequency that was written, in Hz.
+        expected: u32,
+        /// The frequency the radio reports, in Hz.
+        actual: u32,
+    },
+
+    /// An MCP page read returned data for a different page than the one
+    /// requested (a stale duplicate response from an earlier retry).
+    /// Accepting it would silently shift the rest of the dump.
+    #[error("MCP page mismatch: requested 0x{requested:04X}, radio answered 0x{answered:04X}")]
+    McpPageMismatch {
+        /// The page that was requested.
+        requested: u16,
+        /// The page the radio's response was for.
+        answered: u16,
+    },
+
+    /// An MCP programming session was interrupted (its future was
+    /// cancelled mid-transfer). The radio may still be in PROG MCP mode
+    /// where CAT commands do not work — call
+    /// `Radio::recover_from_interrupted_mcp` first.
+    #[error("MCP session interrupted; radio may be in programming mode — recover first")]
+    McpInterrupted,
 }
 
 /// Errors originating from the transport layer (serial port / Bluetooth).
@@ -204,8 +233,9 @@ pub enum ProtocolError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ValidationError {
-    /// The CTCSS tone code is outside the valid range 0-49.
-    #[error("tone code {0} out of range (must be 0-49)")]
+    /// The CTCSS tone code is outside the valid range 0-50
+    /// (0-49 = the 50 CTCSS tones, 50 = the 1750 Hz tone burst).
+    #[error("tone code {0} out of range (must be 0-50)")]
     ToneCodeOutOfRange(
         /// The invalid tone code.
         u8,
@@ -218,8 +248,8 @@ pub enum ValidationError {
         u8,
     ),
 
-    /// The operating mode is outside the valid range 0-7.
-    #[error("mode {0} out of range (must be 0-7: FM/DV/AM/LSB/USB/CW/NFM/DR)")]
+    /// The operating mode is outside the valid range 0-9.
+    #[error("mode {0} out of range (must be 0-9: FM/DV/AM/LSB/USB/CW/NFM/DR/WFM/CW-R)")]
     ModeOutOfRange(
         /// The invalid mode value.
         u8,
@@ -295,6 +325,15 @@ pub enum ValidationError {
         len: usize,
     },
 
+    /// A callsign or callsign suffix exceeds its maximum length.
+    #[error("callsign field too long ({len} chars, max {max})")]
+    CallsignTooLong {
+        /// The actual length.
+        len: usize,
+        /// The maximum allowed length.
+        max: usize,
+    },
+
     /// The frequency is outside the valid range for the band.
     #[error("frequency {0} Hz out of range for band")]
     FrequencyOutOfRange(
@@ -368,8 +407,22 @@ mod tests {
 
     #[test]
     fn validation_error_display() {
-        let err = ValidationError::ToneCodeOutOfRange(50);
-        assert_eq!(err.to_string(), "tone code 50 out of range (must be 0-49)");
+        // 50 (the 1750 Hz tone burst) is VALID — the message must
+        // state the real accepted range.
+        let err = ValidationError::ToneCodeOutOfRange(51);
+        assert_eq!(err.to_string(), "tone code 51 out of range (must be 0-50)");
+    }
+
+    #[test]
+    fn mode_error_message_covers_full_range() {
+        // Mode accepts 0-9 (including WFM=8 and CW-R=9); the message
+        // must not claim 0-7.
+        let err = ValidationError::ModeOutOfRange(10);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("0-9"),
+            "message must state the real range: {msg}"
+        );
     }
 
     #[test]

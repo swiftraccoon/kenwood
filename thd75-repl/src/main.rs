@@ -1382,7 +1382,7 @@ async fn run_repl(
                             aprintln!("APRS mode stopped. Returned to CAT mode.");
                             ReplState::Cat(radio)
                         }
-                        Err(e) => {
+                        Err((_client, e)) => {
                             println!(
                                 "{}",
                                 thd75_repl::output::error(format_args!("stopping APRS: {e}"))

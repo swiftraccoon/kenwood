@@ -46,11 +46,6 @@ async fn set_frequency_full() -> TestResult {
         step_size: StepSize::Hz5000,
         mode_flags_raw: 0,
         shift: ShiftDirection::DOWN,
-        reverse: false,
-        tone_enable: false,
-        ctcss_mode: CtcssMode::Off,
-        dcs_enable: false,
-        cross_tone_reverse: false,
         flags_0a_raw: 0x02, // shift- = 2
         tone_code: ToneCode::new(8)?,
         ctcss_code: ToneCode::new(8)?,

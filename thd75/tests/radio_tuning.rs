@@ -1,6 +1,7 @@
 //! Integration tests for high-level tuning methods: `tune_frequency`,
 //! `tune_channel`, and `quick_tune`.
 
+use kenwood_thd75::Error;
 use kenwood_thd75::protocol::programming;
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;
@@ -96,9 +97,52 @@ async fn tune_frequency_switches_from_memory_to_vfo() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn tune_frequency_readback_mismatch_is_error() -> TestResult {
+    // The radio clamps out-of-band FO writes silently; the readback
+    // is the only verification. A mismatch must be an error, not a
+    // warn-and-Ok — the operator would otherwise transmit on the
+    // wrong frequency believing the tune succeeded.
+    let mut mock = MockTransport::new();
+    mock.expect(b"VM 0\r", b"VM 0,0\r");
+    mock.expect(b"FO 0\r", FO_RESPONSE_145);
+    mock.expect(FO_WRITE_146520, FO_RESPONSE_146520);
+    // Readback shows the radio did NOT take the new frequency.
+    mock.expect(b"FQ 0\r", b"FQ 0,0145000000\r");
+
+    let mut radio = Radio::connect(mock).await?;
+    let result = radio
+        .tune_frequency(Band::A, Frequency::new(146_520_000))
+        .await;
+    assert!(
+        matches!(result, Err(Error::FrequencyReadbackMismatch { .. })),
+        "a readback mismatch must be an error: {result:?}"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // tune_channel
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tune_channel_empty_channel_is_error() -> TestResult {
+    // Documented contract: an empty channel (0 Hz) is an error. The
+    // radio must not be switched to Memory mode and no recall sent.
+    let mut mock = MockTransport::new();
+    mock.expect(
+        b"ME 021\r",
+        b"ME 021,0000000000,0000600000,5,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,,0,00,0\r",
+    );
+
+    let mut radio = Radio::connect(mock).await?;
+    let result = radio.tune_channel(Band::A, 21).await;
+    assert!(
+        matches!(result, Err(Error::RadioError)),
+        "an empty channel must be an error per the documented contract: {result:?}"
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn tune_channel_switches_to_memory_mode() -> TestResult {

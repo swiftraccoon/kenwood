@@ -121,7 +121,10 @@ impl<T: Transport> Radio<T> {
     where
         F: FnMut(u16, u16),
     {
-        let saved_timeout = self.timeout;
+        // Save the timeout in the struct, not a local, so an
+        // interrupted (cancelled) session can still restore it via
+        // `recover_from_interrupted_mcp`.
+        self.mcp_saved_timeout = Some(self.timeout);
         self.timeout = FULL_DUMP_TIMEOUT;
 
         self.enter_programming_mode().await?;
@@ -131,7 +134,9 @@ impl<T: Transport> Radio<T> {
             .await;
 
         let exit_result = self.exit_programming_mode().await;
-        self.timeout = saved_timeout;
+        if let Some(saved) = self.mcp_saved_timeout.take() {
+            self.timeout = saved;
+        }
 
         let image = result?;
         exit_result?;
@@ -179,7 +184,9 @@ impl<T: Transport> Radio<T> {
             });
         }
 
-        let saved_timeout = self.timeout;
+        // Struct-held so an interrupted session can restore it (see
+        // `recover_from_interrupted_mcp`).
+        self.mcp_saved_timeout = Some(self.timeout);
         self.timeout = FULL_DUMP_TIMEOUT;
 
         self.enter_programming_mode().await?;
@@ -199,7 +206,9 @@ impl<T: Transport> Radio<T> {
             .await;
 
         let exit_result = self.exit_programming_mode().await;
-        self.timeout = saved_timeout;
+        if let Some(saved) = self.mcp_saved_timeout.take() {
+            self.timeout = saved;
+        }
 
         result?;
         exit_result?;
@@ -538,15 +547,24 @@ impl<T: Transport> Radio<T> {
         let raw = result?;
         exit_result?;
 
-        // Parse 4-byte flag records, 1200 entries.
+        // Parse 4-byte flag records, 1200 entries. A record that fails
+        // to parse must error rather than be skipped: skipping shifts
+        // every subsequent index, silently associating flags with the
+        // wrong channels.
         let mut flags = Vec::with_capacity(programming::TOTAL_CHANNEL_ENTRIES);
         for i in 0..programming::TOTAL_CHANNEL_ENTRIES {
             let offset = i * programming::FLAG_RECORD_SIZE;
-            if let Some(record) = raw.get(offset..offset + programming::FLAG_RECORD_SIZE)
-                && let Some(flag) = programming::parse_channel_flag(record)
-            {
-                flags.push(flag);
-            }
+            let flag = raw
+                .get(offset..offset + programming::FLAG_RECORD_SIZE)
+                .and_then(programming::parse_channel_flag)
+                .ok_or_else(|| {
+                    Error::Protocol(ProtocolError::FieldParse {
+                        command: "MCP channel flags".to_owned(),
+                        field: format!("flag record {i}"),
+                        detail: "record missing or unparseable".to_owned(),
+                    })
+                })?;
+            flags.push(flag);
         }
 
         tracing::info!(count = flags.len(), "channel flags read");
@@ -589,14 +607,18 @@ impl<T: Transport> Radio<T> {
                 {
                     match FlashChannel::from_bytes(record) {
                         Ok(ch) => channels.push(ch),
+                        // A corrupt record is a real fault in the dump —
+                        // substituting a fabricated default would
+                        // misrepresent radio state to the caller.
                         Err(e) => {
-                            tracing::warn!(
-                                memgroup = memgroup_idx,
-                                slot,
-                                error = %e,
-                                "failed to parse flash channel record, using default"
-                            );
-                            channels.push(FlashChannel::default());
+                            return Err(Error::Protocol(ProtocolError::FieldParse {
+                                command: "MCP channel data".to_owned(),
+                                field: format!(
+                                    "channel {}",
+                                    memgroup_idx * programming::CHANNELS_PER_MEMGROUP + slot
+                                ),
+                                detail: e.to_string(),
+                            }));
                         }
                     }
                 }
@@ -720,6 +742,16 @@ impl<T: Transport> Radio<T> {
     async fn enter_programming_mode(&mut self) -> Result<(), Error> {
         tracing::info!("entering programming mode at 9600 baud");
 
+        // Queued AI pushes / NMEA sentences would land ahead of the
+        // radio's `0M\r` acknowledgement and blow the small entry
+        // window — drain them first.
+        self.drain_stale_input().await;
+
+        // Mark the session active BEFORE any wire traffic: if this
+        // future is cancelled from here on, the radio may be in (or
+        // entering) PROG MCP mode and CAT must refuse until recovery.
+        self.mcp_active = true;
+
         // Switch to 9600 baud for the entire programming session.
         self.transport
             .set_baud_rate(PROGRAMMING_BAUD)
@@ -737,7 +769,7 @@ impl<T: Transport> Radio<T> {
         let mut buf = [0u8; 64];
         let mut received = Vec::new();
 
-        let result = tokio::time::timeout(self.timeout, async {
+        let entry = match tokio::time::timeout(self.timeout, async {
             loop {
                 let n = self
                     .transport
@@ -769,8 +801,23 @@ impl<T: Transport> Radio<T> {
             }
         })
         .await
-        .map_err(|_| Error::Timeout(self.timeout))?;
-        result?;
+        {
+            Ok(inner) => inner,
+            Err(_elapsed) => Err(Error::Timeout(self.timeout)),
+        };
+        if let Err(e) = entry {
+            // The radio may have entered MCP mode even though its
+            // acknowledgement was never confirmed (noise ahead of it,
+            // or a lost byte). Exit best-effort so an unconfirmed
+            // entry cannot strand the radio in PROG MCP.
+            if let Err(exit_err) = self.exit_programming_mode().await {
+                tracing::debug!(
+                    error = %exit_err,
+                    "best-effort MCP exit after failed entry also failed"
+                );
+            }
+            return Err(e);
+        }
 
         // If Fast mode is requested, switch to 115200 baud for the data
         // transfer phase.
@@ -830,6 +877,13 @@ impl<T: Transport> Radio<T> {
     async fn exit_programming_mode(&mut self) -> Result<(), Error> {
         tracing::info!("exiting programming mode");
 
+        // The session is over as soon as the exit is attempted — even
+        // if the write fails, retrying CAT (which will error loudly)
+        // beats refusing forever. Binary residue may remain on the
+        // line, so the next CAT command drains first.
+        self.mcp_active = false;
+        self.desynced = true;
+
         self.transport
             .write(&[programming::EXIT])
             .await
@@ -857,6 +911,31 @@ impl<T: Transport> Radio<T> {
         Ok(())
     }
 
+    /// Recover after an MCP programming session's future was cancelled
+    /// mid-transfer (e.g. by a caller-side `tokio::time::timeout`).
+    ///
+    /// Best-effort: sends the MCP exit byte so the radio leaves PROG
+    /// MCP mode, restores the saved CAT timeout, and re-enables CAT
+    /// commands (which refuse with [`Error::McpInterrupted`] while an
+    /// interrupted session is pending). A no-op if no session was
+    /// interrupted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exit write fails — CAT is re-enabled
+    /// regardless, so a retry or reconnect can proceed.
+    pub async fn recover_from_interrupted_mcp(&mut self) -> Result<(), Error> {
+        if !self.mcp_active {
+            return Ok(());
+        }
+        tracing::warn!("recovering from interrupted MCP session");
+        let exit_result = self.exit_programming_mode().await;
+        if let Some(saved) = self.mcp_saved_timeout.take() {
+            self.timeout = saved;
+        }
+        exit_result
+    }
+
     // -----------------------------------------------------------------------
     // Internal: raw page I/O (caller must hold programming mode)
     // -----------------------------------------------------------------------
@@ -881,16 +960,9 @@ impl<T: Transport> Radio<T> {
 
         for i in 0..count {
             let page = start_page + i;
-            let data = match self.read_single_page(page).await {
-                Ok(d) => d,
-                Err(Error::Timeout(_)) => {
-                    tracing::warn!(page, "page read timed out, retrying once");
-                    // Brief pause before retry to let the serial bus settle.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    self.read_single_page(page).await?
-                }
-                Err(e) => return Err(e),
-            };
+            // `read_single_page` verifies the echoed page address and
+            // retries once (with a drain) on timeout or mismatch.
+            let data = self.read_single_page(page).await?;
             image.extend_from_slice(&data);
             on_progress(i + 1, count);
         }
@@ -948,7 +1020,56 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Read a single 256-byte page (caller must be in programming mode).
+    /// Read one page, verifying the radio's echoed page address, with
+    /// one drain-and-retry on timeout or address mismatch.
+    ///
+    /// A merely *delayed* (not lost) response would otherwise satisfy
+    /// a blind retry while its duplicate answers the NEXT page's read
+    /// — silently shifting the remainder of a 500 KB dump by one page.
     async fn read_single_page(&mut self, page: u16) -> Result<[u8; programming::PAGE_SIZE], Error> {
+        match self.read_single_page_attempt(page).await {
+            Ok(data) => Ok(data),
+            Err(e @ (Error::Timeout(_) | Error::McpPageMismatch { .. })) => {
+                tracing::warn!(page, error = %e, "page read failed; draining and retrying once");
+                // Let the serial bus settle, then discard any straggler
+                // bytes (the late response, a duplicate, a stray ACK)
+                // so the retry starts from a clean line.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                self.drain_mcp_input().await;
+                self.read_single_page_attempt(page).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Discard whatever the radio has already sent (binary MCP bytes:
+    /// late W responses, duplicate pages, stray ACKs) until the line
+    /// goes quiet. Used before an MCP retry so stale bytes cannot
+    /// misalign the next fixed-size response window.
+    async fn drain_mcp_input(&mut self) {
+        let mut buf = [0u8; 512];
+        let mut discarded = 0_usize;
+        while let Ok(Ok(n)) = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            self.transport.read(&mut buf),
+        )
+        .await
+        {
+            if n == 0 {
+                break;
+            }
+            discarded += n;
+        }
+        if discarded > 0 {
+            tracing::warn!(discarded, "drained stray MCP bytes before retry");
+        }
+    }
+
+    /// One un-retried page read exchange (R command → W response → ACK).
+    async fn read_single_page_attempt(
+        &mut self,
+        page: u16,
+    ) -> Result<[u8; programming::PAGE_SIZE], Error> {
         let cmd = programming::build_read_command(page);
 
         tracing::debug!(page, "reading page");
@@ -986,25 +1107,51 @@ impl<T: Transport> Radio<T> {
         result?;
 
         // Parse: W(1) + addr(4) + data(256).
-        let (_page_addr, data) =
+        let (answered_page, data) =
             programming::parse_write_response(&received).map_err(Error::Protocol)?;
+
+        // The echoed address is the only integrity check the MCP
+        // protocol offers — a mismatch means this is a stale duplicate
+        // of some other page, not our answer.
+        if answered_page != page {
+            return Err(Error::McpPageMismatch {
+                requested: page,
+                answered: answered_page,
+            });
+        }
 
         // Copy into a fixed-size array.
         let mut page_data = [0u8; programming::PAGE_SIZE];
         page_data.copy_from_slice(data);
 
-        // Send ACK, read ACK back.
+        // Send ACK, read the radio's ACK back.
         self.transport
             .write(&[programming::ACK])
             .await
             .map_err(Error::Transport)?;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let mut ack_buf = [0u8; 1];
-        let _ = tokio::time::timeout(
+        match tokio::time::timeout(
             std::time::Duration::from_millis(1000),
             self.transport.read(&mut ack_buf),
         )
-        .await;
+        .await
+        {
+            Ok(Ok(1)) if ack_buf.first() == Some(&programming::ACK) => {}
+            Ok(Ok(_)) => {
+                tracing::debug!(page, byte = ?ack_buf.first(), "unexpected byte in place of ACK");
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(page, error = %e, "error reading post-page ACK");
+            }
+            Err(_elapsed) => {
+                // The ACK may still arrive as a straggler and would
+                // misalign the next 261-byte response window — clear
+                // the line before the next exchange.
+                tracing::debug!(page, "post-page ACK timed out; draining stragglers");
+                self.drain_mcp_input().await;
+            }
+        }
 
         Ok(page_data)
     }
@@ -1126,9 +1273,12 @@ impl<T: Transport> Radio<T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::Error;
     use crate::protocol::programming;
+    use crate::protocol::{Command, Response};
     use crate::radio::Radio;
     use crate::transport::MockTransport;
+    use crate::types::Band;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;
@@ -1230,6 +1380,147 @@ mod tests {
         for name in names.get(4..16).ok_or("names[4..16] missing")? {
             assert!(name.is_empty(), "expected empty name, got {name:?}");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn page_read_rejects_mismatched_address_and_retries() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page: u16 = 0x0020;
+        let cmd = programming::build_read_command(page);
+        // The radio answers with a DIFFERENT page — a duplicate response
+        // from an earlier retried read. Accepting it would store the
+        // wrong page's bytes and shift the rest of a dump by one page.
+        mock.expect(&cmd, &build_w_response(0x0021, &[0x11u8; 256])?);
+        // The retry re-requests and gets the right page.
+        mock.expect(&cmd, &build_w_response(page, &[0x22u8; 256])?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        mock.expect(b"E", &[]);
+
+        let mut radio = Radio::connect(mock).await?;
+        let data = radio.read_page(page).await?;
+        assert_eq!(
+            *data.first().ok_or("data[0] missing")?,
+            0x22,
+            "mismatched page must be rejected, not stored"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistent_page_mismatch_errors_and_still_exits() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page: u16 = 0x0020;
+        let cmd = programming::build_read_command(page);
+        // Both the read and its retry answer with the wrong page.
+        mock.expect(&cmd, &build_w_response(0x0021, &[0x11u8; 256])?);
+        mock.expect(&cmd, &build_w_response(0x0021, &[0x11u8; 256])?);
+        // Exit must still be attempted even though the read failed.
+        mock.expect(b"E", &[]);
+
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.read_page(page).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::McpPageMismatch {
+                    requested: 0x0020,
+                    answered: 0x0021,
+                })
+            ),
+            "persistent mismatch must surface: {result:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_mcp_poisons_cat_until_recovered() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+        // The first page read never completes — the caller's timeout
+        // cancels the whole dump future mid-transfer.
+        let cmd = programming::build_read_command(0);
+        mock.expect_hang(&cmd);
+
+        let mut radio = Radio::connect(mock).await?;
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            radio.read_memory_image(),
+        )
+        .await;
+        assert!(cancelled.is_err(), "dump must be cancelled by the timeout");
+
+        // The radio may still be in PROG MCP — CAT must refuse rather
+        // than talk binary-mode garbage.
+        let refused = radio.execute(Command::GetMode { band: Band::A }).await;
+        assert!(
+            matches!(refused, Err(Error::McpInterrupted)),
+            "CAT after a cancelled MCP session must refuse: {refused:?}"
+        );
+
+        // Recovery sends the exit byte and restores normal operation.
+        radio.transport.expect(b"E", &[]);
+        radio.recover_from_interrupted_mcp().await?;
+
+        radio.transport.expect(b"MD 0\r", b"MD 0,0\r");
+        let response = radio.execute(Command::GetMode { band: Band::A }).await?;
+        assert!(matches!(response, Response::Mode { .. }));
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn entry_drains_stale_noise_before_handshake() -> TestResult {
+        let mut mock = MockTransport::new();
+        // Stale AI/NMEA noise queued on the line from before the MCP
+        // session — more than the entry parser's tolerance window.
+        mock.queue_read(b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9*47\r\n");
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page: u16 = 0x0020;
+        let cmd = programming::build_read_command(page);
+        mock.expect(&cmd, &build_w_response(page, &[0xAAu8; 256])?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        mock.expect(b"E", &[]);
+
+        let mut radio = Radio::connect(mock).await?;
+        let data = radio.read_page(page).await?;
+        assert_eq!(*data.first().ok_or("data[0] missing")?, 0xAA);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_all_channels_rejects_corrupt_record() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page_count = programming::CHANNEL_DATA_END - programming::CHANNEL_DATA_START + 1;
+        for offset in 0..page_count {
+            let page = programming::CHANNEL_DATA_START + offset;
+            let mut page_data = vec![0u8; 256];
+            if offset == 0 {
+                // Corrupt the first channel record: byte 0x0A bits 1:0
+                // = 3 is an invalid duplex value.
+                set_byte(&mut page_data, 0x0A, 0x03)?;
+            }
+            let cmd = programming::build_read_command(page);
+            mock.expect(&cmd, &build_w_response(page, &page_data)?);
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+        }
+        mock.expect(b"E", &[]);
+
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.read_all_channels().await;
+        assert!(
+            matches!(result, Err(Error::Protocol(_))),
+            "a corrupt channel record must error, not become a fabricated default: {result:?}"
+        );
         Ok(())
     }
 

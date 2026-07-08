@@ -7,12 +7,33 @@ use crate::error::TransportError;
 
 use super::Transport;
 
+/// A scripted outcome for a single [`MockTransport::read`] call.
+#[derive(Debug, Clone)]
+enum MockRead {
+    /// Deliver these bytes.
+    Data(Vec<u8>),
+    /// Sleep for the given milliseconds, then deliver these bytes —
+    /// models a response with real wire latency (needed when the
+    /// consumer correlates a response to a write it must make first).
+    Delayed(Vec<u8>, u64),
+    /// Return `Ok(0)` — transport EOF (device unplugged / port closed).
+    Eof,
+    /// Never resolve — a wedged link. Pair with a timeout in the test.
+    Hang,
+}
+
 /// Mock transport for testing. Programs expected command/response exchanges.
 #[derive(Debug)]
 pub struct MockTransport {
-    exchanges: VecDeque<(Vec<u8>, Vec<u8>)>,
-    pending_response: Option<Vec<u8>>,
+    exchanges: VecDeque<(Vec<u8>, Vec<MockRead>)>,
+    pending: VecDeque<MockRead>,
     accept_any_write: bool,
+    pend_when_empty: bool,
+    /// When the front `Delayed` entry started waiting — persists
+    /// across cancelled read futures so the delay makes progress even
+    /// if the consumer keeps cancelling reads (e.g. a biased select
+    /// with a busy write branch).
+    delay_started: Option<tokio::time::Instant>,
 }
 
 impl MockTransport {
@@ -21,18 +42,53 @@ impl MockTransport {
     pub const fn new() -> Self {
         Self {
             exchanges: VecDeque::new(),
-            pending_response: None,
+            pending: VecDeque::new(),
             accept_any_write: false,
+            pend_when_empty: false,
+            delay_started: None,
         }
     }
 
     /// Queue an expected command/response exchange.
     ///
     /// When `write()` is called with `command`, the corresponding `response`
-    /// will be returned by the next `read()`.
+    /// will be returned by the next `read()`. An empty `response` means
+    /// "expect the write, queue nothing" (use [`Self::expect_eof`] to
+    /// model a disconnect instead).
     pub fn expect(&mut self, command: &[u8], response: &[u8]) {
+        let reads = if response.is_empty() {
+            Vec::new()
+        } else {
+            vec![MockRead::Data(response.to_vec())]
+        };
+        self.exchanges.push_back((command.to_vec(), reads));
+    }
+
+    /// Queue an expected command followed by several read chunks,
+    /// delivered one per `read()` call.
+    ///
+    /// Models interleaved traffic: unsolicited frames (AI pushes, NMEA
+    /// sentences) arriving on the stream before the real response.
+    pub fn expect_reads(&mut self, command: &[u8], responses: &[&[u8]]) {
+        let reads = responses
+            .iter()
+            .map(|r| MockRead::Data(r.to_vec()))
+            .collect();
+        self.exchanges.push_back((command.to_vec(), reads));
+    }
+
+    /// Queue an expected command whose next `read()` reports EOF
+    /// (`Ok(0)`) — the device disappeared mid-command.
+    pub fn expect_eof(&mut self, command: &[u8]) {
         self.exchanges
-            .push_back((command.to_vec(), response.to_vec()));
+            .push_back((command.to_vec(), vec![MockRead::Eof]));
+    }
+
+    /// Queue an expected command whose `read()` never resolves — a
+    /// wedged link. The caller's timeout machinery must fire.
+    pub fn expect_hang(&mut self, command: &[u8]) {
+        self.exchanges
+            .push_back((command.to_vec(), vec![MockRead::Hang]));
     }
 
     /// Load expected exchanges from a fixture file.
@@ -55,7 +111,7 @@ impl MockTransport {
             } else if let Some(resp) = line.strip_prefix("< ") {
                 let bytes = resp.replace("\\r", "\r").into_bytes();
                 if let Some(cmd) = current_command.take() {
-                    mock.exchanges.push_back((cmd, bytes));
+                    mock.exchanges.push_back((cmd, vec![MockRead::Data(bytes)]));
                 }
             }
         }
@@ -63,13 +119,22 @@ impl MockTransport {
         Ok(mock)
     }
 
-    /// Queue data to be returned by the next `read()` without requiring
-    /// a preceding `write()`.
+    /// Queue data to be returned by a subsequent `read()` without
+    /// requiring a preceding `write()`.
     ///
-    /// This is useful for testing unsolicited incoming data (e.g., MMDVM
-    /// frames received from the radio without a prior command).
+    /// Useful for unsolicited incoming data (AI pushes, MMDVM frames,
+    /// stale late responses). Multiple calls queue multiple chunks,
+    /// delivered one per `read()` in call order.
     pub fn queue_read(&mut self, data: &[u8]) {
-        self.pending_response = Some(data.to_vec());
+        self.pending.push_back(MockRead::Data(data.to_vec()));
+    }
+
+    /// Queue data delivered by a subsequent `read()` only after the
+    /// given delay — models wire latency so the consumer can perform
+    /// the write this data responds to before it arrives.
+    pub fn queue_read_delayed(&mut self, data: &[u8], delay_ms: u64) {
+        self.pending
+            .push_back(MockRead::Delayed(data.to_vec(), delay_ms));
     }
 
     /// Accept any subsequent `write()` calls without validation.
@@ -78,6 +143,18 @@ impl MockTransport {
     /// exchanges and no response is queued.
     pub const fn expect_any_write(&mut self) {
         self.accept_any_write = true;
+    }
+
+    /// Make `read()` pend forever (like an idle serial port) instead
+    /// of failing with `WouldBlock` when no scripted read is queued.
+    ///
+    /// Required for consumers with an always-reading pump task (the
+    /// MMDVM adapter) that treats a read error as a dead transport.
+    /// The whole read script must be queued up front — use
+    /// [`Self::queue_read_delayed`] to sequence responses after the
+    /// writes they answer.
+    pub const fn pend_when_empty(&mut self) {
+        self.pend_when_empty = true;
     }
 
     /// Panic if any expected exchanges remain unconsumed.
@@ -130,31 +207,79 @@ impl Transport for MockTransport {
             )));
         }
 
-        tracing::debug!(bytes = response.len(), "mock: read response queued");
-        self.pending_response = Some(response);
+        tracing::debug!(reads = response.len(), "mock: read outcomes queued");
+        self.pending.extend(response);
         Ok(())
     }
 
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
-        let response = self.pending_response.take().ok_or_else(|| {
+        if self.pending.is_empty() && self.pend_when_empty {
+            // Nothing can enqueue more data once the consumer owns
+            // this transport — pend like an idle line until the test
+            // tears the task down.
+            tracing::debug!("mock: read pending forever (script exhausted)");
+            std::future::pending::<()>().await;
+        }
+        // Cancellation safety: consumers may drop this read future
+        // mid-await (e.g. a select! with a busy write branch). Sleep
+        // for a Delayed entry BEFORE popping it, and measure the
+        // delay from its first attempt so cancelled reads still make
+        // progress toward delivery.
+        if let Some(MockRead::Delayed(_, delay_ms)) = self.pending.front() {
+            let delay = std::time::Duration::from_millis(*delay_ms);
+            let started = *self
+                .delay_started
+                .get_or_insert_with(tokio::time::Instant::now);
+            let deadline = started + delay;
+            tokio::time::sleep_until(deadline).await;
+            self.delay_started = None;
+            if let Some(MockRead::Delayed(data, _)) = self.pending.pop_front() {
+                let len = data.len().min(buf.len());
+                if let (Some(dst), Some(src)) = (buf.get_mut(..len), data.get(..len)) {
+                    dst.copy_from_slice(src);
+                }
+                tracing::debug!(bytes = len, "mock: delayed read");
+                return Ok(len);
+            }
+            // Unreachable: front was Delayed and nothing else pops.
+            return Ok(0);
+        }
+
+        let outcome = self.pending.pop_front().ok_or_else(|| {
             TransportError::Read(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "no pending response — call write() first",
             ))
         })?;
 
-        let len = response.len().min(buf.len());
-        if let (Some(dst), Some(src)) = (buf.get_mut(..len), response.get(..len)) {
-            dst.copy_from_slice(src);
+        match outcome {
+            MockRead::Data(response) => {
+                let len = response.len().min(buf.len());
+                if let (Some(dst), Some(src)) = (buf.get_mut(..len), response.get(..len)) {
+                    dst.copy_from_slice(src);
+                }
+                tracing::debug!(bytes = len, "mock: read");
+                Ok(len)
+            }
+            MockRead::Delayed(..) => {
+                // Handled above via the peek path; unreachable here.
+                Ok(0)
+            }
+            MockRead::Eof => {
+                tracing::debug!("mock: read EOF");
+                Ok(0)
+            }
+            MockRead::Hang => {
+                tracing::debug!("mock: read hanging forever");
+                std::future::pending().await
+            }
         }
-        tracing::debug!(bytes = len, "mock: read");
-        Ok(len)
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
         tracing::debug!("mock: closing transport");
         self.exchanges.clear();
-        self.pending_response = None;
+        self.pending.clear();
         Ok(())
     }
 }

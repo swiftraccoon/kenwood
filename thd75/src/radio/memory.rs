@@ -14,6 +14,13 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn read_channel(&mut self, channel: u16) -> Result<ChannelMemory, Error> {
+        // The `ME {:03}` wire format silently grows to 4+ digits for
+        // out-of-range channels — validate before the wire.
+        if channel > 999 {
+            return Err(Error::Validation(
+                crate::error::ValidationError::ChannelOutOfRange { channel, max: 999 },
+            ));
+        }
         tracing::debug!(channel, "reading memory channel");
         let response = self.execute(Command::GetMemoryChannel { channel }).await?;
         match response {
@@ -67,6 +74,11 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn write_channel(&mut self, channel: u16, data: &ChannelMemory) -> Result<(), Error> {
+        if channel > 999 {
+            return Err(Error::Validation(
+                crate::error::ValidationError::ChannelOutOfRange { channel, max: 999 },
+            ));
+        }
         tracing::info!(channel, "writing memory channel");
         let response = self
             .execute(Command::SetMemoryChannel {

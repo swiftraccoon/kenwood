@@ -201,6 +201,16 @@ impl<'a> DstarAccess<'a> {
     ///
     /// Region boundary confirmed. Internal field layout from firmware RE
     /// offset is estimated, not hardware-verified.
+    ///
+    /// # Field provenance — placeholders, not parsed data
+    ///
+    /// Only the callsign and frequency fields are read from the image.
+    /// The following fields of the returned [`RepeaterEntry`] are
+    /// hardcoded placeholders whose flash offsets have not been
+    /// reverse-engineered yet: `duplex` (always `Minus`), `offset`
+    /// (always 0), `module` (always `B`), `latitude`/`longitude`
+    /// (always 0.0), and `position_accuracy` (always `Invalid`). Do
+    /// NOT program DR-mode operation from these fields.
     #[must_use]
     pub fn repeater_entry(&self, index: u16) -> Option<RepeaterEntry> {
         if index >= MAX_REPEATER_ENTRIES {

@@ -192,8 +192,15 @@ fn parse_mr(payload: &str) -> Result<Response, ProtocolError> {
             });
         }
 
-        let band_str = &payload[..1];
-        let ch_str = &payload[1..];
+        // Char-boundary-safe split: a (bogus) multi-byte first
+        // character must be a parse error, not a slice panic.
+        let Some((band_str, ch_str)) = payload.split_at_checked(1) else {
+            return Err(ProtocolError::FieldParse {
+                command: "MR".to_owned(),
+                field: "band".to_owned(),
+                detail: format!("non-ASCII MR payload: {payload:?}"),
+            });
+        };
 
         let band_val = band_str
             .parse::<u8>()

@@ -338,6 +338,9 @@ pub struct DStarGateway<T: Transport + Unpin + 'static> {
     /// keys (`tx() = true`) or stops transmitting (`tx() = false`).
     /// `None` until the first status response arrives.
     last_tx_active: Option<bool>,
+    /// Previous status health bits (overflow/lockout, TX and CD bits
+    /// masked out) for rising-edge warn logging.
+    last_health_bits: Option<u8>,
 }
 
 impl<T: Transport + Unpin + 'static> std::fmt::Debug for DStarGateway<T> {
@@ -360,21 +363,17 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
     /// # Errors
     ///
     /// On failure, returns the [`Radio`] alongside the error so the
-    /// caller can continue using CAT mode.
-    ///
-    /// # Panics
-    ///
-    /// Panics if MMDVM was entered and D-STAR init failed AND the
-    /// subsequent MMDVM exit also failed. This indicates unrecoverable
-    /// transport state; the caller's only option is to drop any
-    /// remaining handles and reconnect to the radio from scratch.
+    /// caller can continue using CAT mode. The `Radio` is `None` only
+    /// when D-STAR init failed AND the MMDVM rollback also failed
+    /// (e.g. the USB cable was pulled) — the transport is gone and
+    /// the caller must reconnect from scratch.
     pub async fn start(
         radio: Radio<T>,
         config: DStarGatewayConfig,
-    ) -> Result<Self, (Radio<T>, Error)> {
+    ) -> Result<Self, (Option<Radio<T>>, Error)> {
         let session = match radio.enter_mmdvm(config.baud).await {
             Ok(s) => s,
-            Err((radio, e)) => return Err((radio, e)),
+            Err((radio, e)) => return Err((Some(radio), e)),
         };
 
         match Self::build_from_session(session, config).await {
@@ -382,25 +381,20 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
             Err((restore, modem, init_err)) => {
                 // Init failed; roll back MMDVM mode to recover the Radio.
                 match restore.exit_and_rebuild(modem).await {
-                    Ok(radio) => Err((radio, init_err)),
+                    Ok(radio) => Err((Some(radio), init_err)),
                     Err(exit_err) => {
+                        // Both init AND rollback failed (one USB
+                        // unplug does it). No Radio can be returned —
+                        // the transport is gone — but a long-running
+                        // gateway app must get an error, not a
+                        // process abort.
                         tracing::error!(
                             init_err = %init_err,
                             exit_err = %exit_err,
                             "MMDVM exit failed after D-STAR init failure; \
                              radio state is unrecoverable"
                         );
-                        // We cannot return a valid Radio to the caller.
-                        // The contract of this function requires a Radio
-                        // in the error path; this is an unrecoverable
-                        // state, so we mark it with `unreachable!` to
-                        // satisfy the clippy `panic` lint while still
-                        // failing loudly.
-                        unreachable!(
-                            "MMDVM exit failed after D-STAR init failure; \
-                             transport is in an unrecoverable state: \
-                             init_err={init_err}, exit_err={exit_err}"
-                        );
+                        Err((None, double_fault_error(&init_err, &exit_err)))
                     }
                 }
             }
@@ -464,6 +458,7 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
             echo_active: false,
             event_timeout: EVENT_POLL_TIMEOUT,
             last_tx_active: None,
+            last_health_bits: None,
         })
     }
 
@@ -505,15 +500,15 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
         // time in the reflector-event branch of `dstar_poll_cycle`,
         // producing only ~one radio-drain pass per cycle; if that
         // pass swallows a single Status and then breaks, noise
-        // accumulates faster than it's consumed. The channel fills
-        // at cap 256 after ~128 s of voice, at which point
-        // `ModemLoop::emit_event` blocks forever on `event_tx.send`,
-        // wedging command processing and deadlocking the REPL on
-        // `send_dstar_data`'s oneshot reply.
+        // accumulates faster than it's consumed and the mmdvm event
+        // channel fills. The modem loop never blocks on a full
+        // channel — it drops events instead — so a lazy drain here
+        // costs real events (received voice frames included), not a
+        // deadlock.
         //
         // Fix: loop internally past noise within the caller's time
         // budget so `Ok(None)` means "timed out with no meaningful
-        // event" and nothing else.
+        // event" and nothing else, and the channel stays drained.
         let timeout = self.event_timeout;
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -521,11 +516,23 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            let Ok(Some(raw)) = tokio::time::timeout(remaining, self.modem.next_event()).await
-            else {
-                // Either a timeout (outer Err) or the task shut down cleanly
-                // (inner None) — surface no event.
-                return Ok(None);
+            let raw = match tokio::time::timeout(remaining, self.modem.next_event()).await {
+                Ok(Some(raw)) => raw,
+                Ok(None) => {
+                    // The modem task exited and its event channel is
+                    // fully drained. The terminal event (if any) was
+                    // already consumed — this closed channel is the
+                    // only remaining signal, and a dead modem must
+                    // never read as quiet airtime.
+                    return Err(Error::Transport(
+                        crate::error::TransportError::Disconnected(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "MMDVM modem loop exited",
+                        )),
+                    ));
+                }
+                // Idle poll timeout — genuinely no event this cycle.
+                Err(_elapsed) => return Ok(None),
             };
             if let Some(evt) = self.dispatch_event(raw).await? {
                 return Ok(Some(evt));
@@ -539,6 +546,11 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
 
     /// Dispatch a raw [`mmdvm::Event`] into a [`DStarEvent`].
     async fn dispatch_event(&mut self, raw: Event) -> Result<Option<DStarEvent>, Error> {
+        // Terminal events (transport gone, loop dying) become session
+        // errors — a dead modem must never read as quiet airtime.
+        if let Some(err) = terminal_event_error(&raw) {
+            return Err(err);
+        }
         match raw {
             Event::DStarHeaderRx { bytes } => {
                 let header = DStarHeader::decode(&bytes);
@@ -572,12 +584,31 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
                 self.rx_header = None;
                 Ok(Some(DStarEvent::VoiceLost))
             }
-            Event::TransportClosed => Err(Error::Transport(
-                crate::error::TransportError::Disconnected(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "MMDVM transport closed",
-                )),
-            )),
+            // Queued TX frames were discarded because the modem
+            // session is ending — the operator's last over was
+            // truncated on air even though every send reported
+            // success. The terminal event follows immediately;
+            // this is the audit trail for what it took with it.
+            Event::TxDropped { frames } => {
+                tracing::warn!(
+                    target: "kenwood_thd75::mmdvm::gateway",
+                    frames,
+                    "MMDVM session discarded queued TX frames; transmission truncated"
+                );
+                Ok(None)
+            }
+            // The radio sent a frame violating the MMDVM layout for
+            // its command byte. Non-fatal, but a rising count means a
+            // degrading link (or a firmware quirk worth capturing).
+            Event::ProtocolViolation { command, detail } => {
+                tracing::warn!(
+                    target: "kenwood_thd75::mmdvm::gateway",
+                    command = format!("0x{command:02X}"),
+                    detail = %detail,
+                    "MMDVM protocol violation from radio"
+                );
+                Ok(None)
+            }
             // Status events are 4 Hz noise — but the TX flag inside
             // them is the single most useful diagnostic for the
             // network → radio voice path: did the radio actually key
@@ -589,6 +620,24 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
             // exact moment the radio enters / leaves TX.
             Event::Status(status) => {
                 log_noise_event(&Event::Status(status));
+                // Health flags at warn on the RISING edge only — an
+                // operator running at info/warn must see a degrading
+                // modem before the audio breaks, without a 4 Hz flood.
+                let health_now = status.flags.bits() & !0x01 & !0x40;
+                let health_prev = self.last_health_bits.unwrap_or(0);
+                let rising = health_now & !health_prev;
+                if rising != 0 {
+                    tracing::warn!(
+                        adc_overflow = status.adc_overflow(),
+                        rx_overflow = status.rx_overflow(),
+                        tx_overflow = status.tx_overflow(),
+                        dac_overflow = status.dac_overflow(),
+                        lockout = status.lockout(),
+                        "MMDVM modem health flag raised"
+                    );
+                }
+                self.last_health_bits = Some(health_now);
+
                 let tx_now = status.tx();
                 let edge = self.last_tx_active != Some(tx_now);
                 self.last_tx_active = Some(tx_now);
@@ -612,16 +661,20 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
     /// Handle a received D-STAR EOT, emitting any queued text message
     /// and driving echo playback if the record phase was active.
     async fn on_eot(&mut self) -> Result<Option<DStarEvent>, Error> {
+        // Reset ALL reception state and queue the decoded text BEFORE
+        // any await: if the caller's future is cancelled mid-echo-
+        // playback, the gateway must not be left claiming an RX that
+        // already ended (and the text message must not be lost).
         let text_event = self.take_text_message();
         let was_echo = self.echo_active;
-        if was_echo {
-            self.echo_active = false;
-            self.play_echo().await?;
-        }
+        self.echo_active = false;
         self.rx_active = false;
         self.rx_header = None;
         if let Some(text) = text_event {
             self.pending_events.push_back(DStarEvent::TextMessage(text));
+        }
+        if was_echo {
+            self.play_echo().await?;
         }
         Ok(Some(DStarEvent::VoiceEnd))
     }
@@ -633,9 +686,11 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
         self.slow_data_frame_index = 0;
         self.rx_header = Some(header);
 
-        // Parse URCALL for special commands.
-        let ur_str = std::str::from_utf8(header.ur_call.as_bytes()).unwrap_or("");
-        let action = UrCallAction::parse(ur_str);
+        // Parse URCALL for special commands. Lossy decode: a corrupted
+        // header should show its garbled callsign (with replacement
+        // chars) rather than silently becoming an empty string.
+        let ur_str = String::from_utf8_lossy(header.ur_call.as_bytes());
+        let action = UrCallAction::parse(&ur_str);
         match &action {
             UrCallAction::Cq | UrCallAction::Callsign(_) => {}
             UrCallAction::Echo => {
@@ -878,6 +933,14 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
             if let Event::Status(status) = evt {
                 return Ok(status);
             }
+            // Not a status: run it through the normal pipeline so
+            // voice frames / EOT / terminal events that arrive while
+            // polling are queued for next_event() instead of being
+            // discarded (a discarded EOT would leave rx_active stuck
+            // and lose the slow-data text).
+            if let Some(dstar_event) = self.dispatch_event(evt).await? {
+                self.pending_events.push_back(dstar_event);
+            }
         }
     }
 
@@ -991,9 +1054,11 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
 /// Initialise the MMDVM modem for D-STAR: send `SetConfig` with
 /// D-STAR-only flags, then `SetMode(DStar)`.
 ///
-/// Consumes events until the corresponding ACK arrives for each
-/// command. `Version` and `Status` events delivered by the modem's
-/// startup handshake are accepted silently.
+/// `SetConfig` goes out as a raw write, so its ACK is awaited from
+/// the event stream; `set_mode` correlates the modem's ACK/NAK into
+/// its own return value, so its result is authoritative on its own.
+/// `Version` and `Status` events delivered by the modem's startup
+/// handshake are accepted silently.
 async fn init_dstar<T: Transport + Unpin + 'static>(
     modem: &mut AsyncModem<MmdvmTransportAdapter<T>>,
 ) -> Result<(), Error> {
@@ -1012,12 +1077,12 @@ async fn init_dstar<T: Transport + Unpin + 'static>(
         .map_err(shell_err_to_thd75_err)?;
     await_ack(modem, MMDVM_SET_CONFIG).await?;
 
-    // Send SetMode.
+    // Send SetMode — resolves with the modem's ACK/NAK directly, so
+    // a rejection or a silent modem surfaces here as an error.
     modem
         .set_mode(ModemMode::DStar)
         .await
         .map_err(shell_err_to_thd75_err)?;
-    await_ack(modem, mmdvm_core::MMDVM_SET_MODE).await?;
 
     Ok(())
 }
@@ -1045,6 +1110,9 @@ async fn await_ack<T: Transport + Unpin + 'static>(
                 )),
             ));
         };
+        if let Some(err) = terminal_event_error(&evt) {
+            return Err(err);
+        }
         match evt {
             Event::Ack { command } if command == expected_command => return Ok(()),
             Event::Nak { command, reason } if command == expected_command => {
@@ -1060,14 +1128,6 @@ async fn await_ack<T: Transport + Unpin + 'static>(
             }
             Event::Debug { level, text } => {
                 tracing::trace!(level, ?text, "MMDVM debug during init");
-            }
-            Event::TransportClosed => {
-                return Err(Error::Transport(
-                    crate::error::TransportError::Disconnected(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "MMDVM transport closed during init",
-                    )),
-                ));
             }
             // Any protocol frames during init are unexpected but non-fatal.
             Event::DStarHeaderRx { .. }
@@ -1086,6 +1146,42 @@ async fn await_ack<T: Transport + Unpin + 'static>(
                 tracing::debug!("unrecognised MMDVM event during init; ignoring");
             }
         }
+    }
+}
+
+/// Combine a D-STAR init failure with a failed MMDVM rollback into
+/// one reportable error carrying both causes — the double-fault path
+/// of [`DStarGateway::start`], where no `Radio` can be returned.
+fn double_fault_error(init_err: &Error, exit_err: &Error) -> Error {
+    Error::Transport(crate::error::TransportError::Disconnected(
+        std::io::Error::other(format!(
+            "radio unrecoverable: D-STAR init failed ({init_err}) and \
+             MMDVM exit failed ({exit_err}); reconnect from scratch"
+        )),
+    ))
+}
+
+/// Map a terminal [`mmdvm::Event`] — one that means the modem loop is
+/// exiting — to the error the gateway surfaces to its caller.
+///
+/// Returns `None` for every non-terminal event, including
+/// [`Event::TxDropped`]: the drop report always precedes the terminal
+/// event, so it is logged where it is dispatched and the session error
+/// comes from the event that follows.
+fn terminal_event_error(event: &Event) -> Option<Error> {
+    match event {
+        Event::TransportClosed => Some(Error::Transport(
+            crate::error::TransportError::Disconnected(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "MMDVM transport closed",
+            )),
+        )),
+        Event::Fatal { message } => Some(Error::Transport(
+            crate::error::TransportError::Disconnected(std::io::Error::other(format!(
+                "MMDVM modem loop failed: {message}"
+            ))),
+        )),
+        _ => None,
     }
 }
 
@@ -1113,6 +1209,12 @@ fn shell_err_to_thd75_err(err: mmdvm::ShellError) -> Error {
             Error::Protocol(crate::error::ProtocolError::UnexpectedResponse {
                 expected: format!("MMDVM ACK for 0x{command:02X}"),
                 actual: format!("NAK: {reason:?}").into_bytes(),
+            })
+        }
+        mmdvm::ShellError::ResponseTimeout => {
+            Error::Protocol(crate::error::ProtocolError::UnexpectedResponse {
+                expected: "MMDVM ACK/NAK".to_owned(),
+                actual: b"no response (timeout)".to_vec(),
             })
         }
         // `mmdvm::ShellError` is `#[non_exhaustive]`. Surface unknown
@@ -1199,16 +1301,14 @@ fn log_noise_event(event: &Event) {
 
 /// Trim trailing spaces from a `Callsign` and return an owned `String`.
 fn cs_trim(cs: dstar_gateway_core::Callsign) -> String {
-    std::str::from_utf8(cs.as_bytes())
-        .unwrap_or("")
-        .trim_end()
-        .to_owned()
+    // Lossy: corrupted bytes surface as replacement characters in the
+    // last-heard list — evidence of a bad header, not a blank entry.
+    String::from_utf8_lossy(cs.as_bytes()).trim_end().to_owned()
 }
 
 /// Trim trailing spaces from a `Suffix` and return an owned `String`.
 fn sfx_trim(sfx: dstar_gateway_core::Suffix) -> String {
-    std::str::from_utf8(sfx.as_bytes())
-        .unwrap_or("")
+    String::from_utf8_lossy(sfx.as_bytes())
         .trim_end()
         .to_owned()
 }
@@ -1220,6 +1320,8 @@ fn sfx_trim(sfx: dstar_gateway_core::Suffix) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::radio::Radio;
+    use crate::transport::MockTransport;
     use crate::types::TncBaud;
 
     fn test_config() -> DStarGatewayConfig {
@@ -1304,6 +1406,188 @@ mod tests {
         let event = DStarEvent::TextMessage("Hello D-STAR".to_owned());
         let debug = format!("{event:?}");
         assert!(debug.contains("Hello D-STAR"), "debug should mention text");
+    }
+
+    // -------------------------------------------------------------------
+    // Terminal-event mapping tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fatal_event_maps_to_transport_error() -> Result<(), Box<dyn std::error::Error>> {
+        let event = Event::Fatal {
+            message: "transport write timed out".to_owned(),
+        };
+        let err = terminal_event_error(&event).ok_or("Fatal must be terminal")?;
+        assert!(
+            matches!(err, Error::Transport(_)),
+            "expected a transport error, got {err:?}"
+        );
+        // The loop's failure message travels in the source chain
+        // (Error → TransportError::Disconnected → io::Error).
+        let mut source: Option<&dyn std::error::Error> = Some(&err);
+        let mut found = false;
+        while let Some(e) = source {
+            if e.to_string().contains("transport write timed out") {
+                found = true;
+                break;
+            }
+            source = e.source();
+        }
+        assert!(
+            found,
+            "error chain must carry the modem loop's failure message: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transport_closed_maps_to_disconnected() -> Result<(), Box<dyn std::error::Error>> {
+        let err = terminal_event_error(&Event::TransportClosed)
+            .ok_or("TransportClosed must be terminal")?;
+        assert!(
+            matches!(err, Error::Transport(_)),
+            "expected a transport error, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// Build a fully-started gateway over a scripted [`MockTransport`].
+    ///
+    /// The whole read script must be pre-queued (the gateway owns the
+    /// transport once started): the D-STAR init ACKs are delivered
+    /// with wire-latency delays so they arrive after the writes they
+    /// answer, and `extra_reads` are appended for the test body.
+    /// Must run inside a `tokio::task::LocalSet`.
+    async fn started_gateway(
+        extra_reads: &[(&[u8], u64)],
+    ) -> Result<DStarGateway<MockTransport>, BoxTestErr> {
+        let mut mock = MockTransport::new();
+        // All writes accepted without wire assertions — the read
+        // script below is the sequencing mechanism. (Responses are
+        // pre-queued rather than attached to expectations because the
+        // ACKs must be interleavable with the MMDVM pump's reads.)
+        mock.expect_any_write();
+        // The pump reads continuously — pend instead of erroring when
+        // the script runs dry.
+        mock.pend_when_empty();
+        // enter_mmdvm's TN 3,1 response (Bps9600 default for D-STAR).
+        mock.queue_read(b"TN 3,1\r");
+        // ACK for SetConfig (0x02), then for SetMode (0x03) — the
+        // SetMode ACK is delayed so it lands after set_mode's write
+        // (its reply is correlated, not scanned from the event log).
+        mock.queue_read_delayed(&[0xE0, 4, 0x70, 0x02], 20);
+        mock.queue_read_delayed(&[0xE0, 4, 0x70, 0x03], 150);
+        for (data, delay) in extra_reads {
+            mock.queue_read_delayed(data, *delay);
+        }
+
+        let radio = Radio::connect(mock).await?;
+        let config = DStarGatewayConfig::new("N0CALL");
+        DStarGateway::start(radio, config)
+            .await
+            .map_err(|(_, e)| -> BoxTestErr { format!("gateway start failed: {e}").into() })
+    }
+
+    type BoxTestErr = Box<dyn std::error::Error>;
+
+    #[tokio::test]
+    async fn dead_modem_is_error_not_quiet_airtime() -> Result<(), BoxTestErr> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                // The transport EOFs shortly after startup (an empty
+                // delayed read delivers Ok(0)): the modem loop exits.
+                // The FIRST next_event surfaces the terminal event as
+                // an error; every LATER call must also error — a dead
+                // modem must never read as an idle timeout forever.
+                let mut gateway = started_gateway(&[(&[], 300)]).await?;
+                gateway.set_event_timeout(Duration::from_millis(200));
+
+                let mut saw_error = false;
+                for _ in 0..20 {
+                    if gateway.next_event().await.is_err() {
+                        saw_error = true;
+                        break;
+                    }
+                }
+                assert!(saw_error, "modem death must surface as an error");
+
+                // And it must KEEP erroring — the channel is closed.
+                let after = gateway.next_event().await;
+                assert!(
+                    after.is_err(),
+                    "a dead modem must not read as quiet airtime: {after:?}"
+                );
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn poll_status_queues_voice_events_instead_of_discarding() -> Result<(), BoxTestErr> {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                // A D-STAR header arrives while poll_status is
+                // waiting for its status frame: the header must be
+                // queued for next_event(), not thrown away.
+                let header_frame = {
+                    let mut f = vec![0xE0u8, 44, 0x10];
+                    f.extend_from_slice(&[0x20u8; 41]);
+                    f
+                };
+                let status_frame: &[u8] = &[0xE0, 15, 0x01, 1, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0];
+                let mut gateway =
+                    started_gateway(&[(header_frame.as_slice(), 300), (status_frame, 350)]).await?;
+                gateway.set_event_timeout(Duration::from_millis(200));
+
+                // Wait past the queued reads, then poll.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let status = gateway.poll_status().await?;
+                assert_eq!(status.dstar_space, 10);
+
+                let event = gateway.next_event().await?;
+                assert!(
+                    matches!(event, Some(DStarEvent::VoiceStart(_))),
+                    "the header drained during poll_status must surface: {event:?}"
+                );
+                Ok(())
+            })
+            .await
+    }
+
+    #[test]
+    fn double_fault_error_carries_both_causes() {
+        // When D-STAR init fails AND the MMDVM rollback also fails,
+        // the process must not abort — the combined error carries
+        // both causes for the operator.
+        let init = Error::Timeout(Duration::from_secs(2));
+        let exit = Error::RadioError;
+        let err = double_fault_error(&init, &exit);
+        let mut chain_text = String::new();
+        let mut source: Option<&dyn std::error::Error> = Some(&err);
+        while let Some(e) = source {
+            chain_text.push_str(&e.to_string());
+            source = e.source();
+        }
+        assert!(
+            chain_text.contains("timed out") && chain_text.contains("error response"),
+            "both causes must be reported: {chain_text}"
+        );
+    }
+
+    #[test]
+    fn non_terminal_events_map_to_none() {
+        assert!(terminal_event_error(&Event::DStarEot).is_none());
+        assert!(
+            terminal_event_error(&Event::TxDropped { frames: 3 }).is_none(),
+            "TxDropped is reported, not terminal — the terminal event follows it"
+        );
+        assert!(
+            terminal_event_error(&Event::ProtocolViolation {
+                command: 0x01,
+                detail: String::new(),
+            })
+            .is_none()
+        );
     }
 
     // -------------------------------------------------------------------

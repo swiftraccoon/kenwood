@@ -50,7 +50,7 @@ jobs:
         working-directory: mbelib-rs
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: stargazer
-      - run: cargo test --lib
+      - run: cargo test
         working-directory: thd75
       - run: cargo test
         working-directory: thd75-tui

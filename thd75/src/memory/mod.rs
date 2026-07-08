@@ -213,10 +213,15 @@ impl MemoryImage {
     where
         F: FnOnce(&mut SettingsWriter<'_>),
     {
-        // Settings live at offsets 0x0000..0x2000 in the raw image
-        // (MCP addresses 0x1000..0x10FF map to image[0x1000..0x10FF])
-        const SETTINGS_START: usize = 0x1000;
-        const SETTINGS_END: usize = 0x1100;
+        // Settings-bearing bytes span 0x0000..0x2000 in the raw image:
+        // band state (power level 0x0359, attenuator 0x035C, dual band
+        // 0x0396), the main settings block (0x1000-0x10D0), and the
+        // string regions (0x11C0 power-on message, 0x1300 callsign).
+        // The diff window must cover ALL of them — a setter outside
+        // the window mutates the image but reports "nothing changed",
+        // and the caller silently skips the radio write-back.
+        const SETTINGS_START: usize = 0x0000;
+        const SETTINGS_END: usize = 0x2000;
 
         // Snapshot the settings region. If the image is shorter than
         // SETTINGS_END (shouldn't happen for a valid MCP image), there's nothing
@@ -449,6 +454,20 @@ mod tests {
             w.set_key_beep(true);
         });
         assert_eq!(result, Some((0x1071, 1)));
+        Ok(())
+    }
+
+    #[test]
+    fn modify_setting_sees_settings_below_0x1000() -> TestResult {
+        // dual_band lives at 0x0396 — outside the old diff window
+        // [0x1000, 0x1100), where the mutation happened but was
+        // reported as "nothing changed", silently skipping the radio
+        // write-back.
+        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE])?;
+        let result = image.modify_setting(|w| {
+            w.set_dual_band(true);
+        });
+        assert_eq!(result, Some((0x0396, 1)));
         Ok(())
     }
 

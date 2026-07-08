@@ -45,6 +45,9 @@ const BT_BAUD: u32 = 9600;
 #[derive(Debug)]
 pub struct SerialTransport {
     port: SerialStream,
+    /// Whether the underlying path is a Bluetooth SPP port (detected
+    /// at open time). BT ports must not be shut down explicitly.
+    is_bluetooth: bool,
 }
 
 impl SerialTransport {
@@ -98,7 +101,10 @@ impl SerialTransport {
             source: e.into(),
         })?;
         tracing::info!(path = %path, "serial port opened successfully");
-        Ok(Self { port })
+        Ok(Self {
+            port,
+            is_bluetooth: is_bt,
+        })
     }
 
     /// Discover TH-D75 radios connected via USB.
@@ -194,6 +200,15 @@ impl Transport for SerialTransport {
 
     async fn close(&mut self) -> Result<(), TransportError> {
         tracing::info!("closing serial transport");
+        // Bluetooth SPP ports must NOT be shut down — on macOS the
+        // stale RFCOMM channel outlives the shutdown and blocks the
+        // next open. Dropping the FD (when this transport is dropped)
+        // is the correct release for BT; only real serial devices get
+        // an explicit shutdown.
+        if self.is_bluetooth {
+            tracing::debug!("Bluetooth SPP port: skipping shutdown, dropping FD instead");
+            return Ok(());
+        }
         self.port
             .shutdown()
             .await

@@ -25,7 +25,7 @@
 //! kiss.send_frame(&frame).await?;
 //!
 //! // Exit KISS mode (returns the Radio).
-//! let radio = kiss.exit().await?;
+//! let radio = kiss.exit().await.map_err(|(_session, e)| e)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -227,7 +227,28 @@ impl<T: Transport> KissSession<T> {
             if let Some(chunk) = tmp.get(..n) {
                 self.read_buf.extend_from_slice(chunk);
             }
+            // Cap the buffer: an opening FEND followed by an endless
+            // unterminated payload (stuck TNC, wedged line) must not
+            // grow memory without bound. Keep the newest bytes — the
+            // oldest belong to a frame that never completed.
+            if self.read_buf.len() > Self::MAX_READ_BUF {
+                tracing::warn!(
+                    len = self.read_buf.len(),
+                    "KISS read buffer exceeded cap; truncating oldest bytes"
+                );
+                let excess = self.read_buf.len() - Self::MAX_READ_BUF;
+                drop(self.read_buf.drain(..excess));
+            }
         }
+    }
+
+    /// Maximum RX buffer size (64 KB), mirroring the CAT codec's cap.
+    const MAX_READ_BUF: usize = 64 * 1024;
+
+    /// Current RX buffer length (test instrumentation).
+    #[cfg(test)]
+    pub(crate) const fn read_buf_len(&self) -> usize {
+        self.read_buf.len()
     }
 
     /// Try to extract a complete KISS frame from the buffer.
@@ -236,33 +257,55 @@ impl<T: Transport> KissSession<T> {
     /// are removed from the buffer and decoded. Leading FENDs (inter-frame
     /// fill) are consumed.
     fn try_extract_frame(buf: &mut Vec<u8>) -> Option<KissFrame> {
-        // Skip leading duplicate FENDs (inter-frame fill).
-        while matches!(buf.first(), Some(&FEND)) && matches!(buf.get(1), Some(&FEND)) {
-            let _removed: u8 = buf.remove(0);
-        }
-
-        // Need at least FEND + type + FEND.
-        if buf.len() < 3 || buf.first() != Some(&FEND) {
-            return None;
-        }
-
-        // Find the closing FEND after the opening one.
-        let end_pos = buf.get(1..)?.iter().position(|&b| b == FEND)?;
-        let frame_end = end_pos + 2; // Include the closing FEND.
-
-        let frame_bytes: Vec<u8> = buf.drain(..frame_end).collect();
-        match decode_kiss_frame(&frame_bytes) {
-            Ok(frame) => {
-                tracing::debug!(
-                    command = ?frame.command,
-                    data_len = frame.data.len(),
-                    "KISS RX"
-                );
-                Some(frame)
+        loop {
+            // A frame can only start at a FEND. Discard inter-frame
+            // noise (stray CAT/NMEA bytes, line garbage) up to the
+            // first FEND — or everything, if no FEND exists — so one
+            // stray byte can never block extraction forever.
+            match buf.iter().position(|&b| b == FEND) {
+                Some(0) => {}
+                Some(start) => {
+                    tracing::warn!(discarded = start, "discarding pre-frame garbage bytes");
+                    drop(buf.drain(..start));
+                }
+                None => {
+                    if !buf.is_empty() {
+                        tracing::debug!(discarded = buf.len(), "discarding FEND-free noise bytes");
+                        buf.clear();
+                    }
+                    return None;
+                }
             }
-            Err(e) => {
-                tracing::warn!(?e, "discarding malformed KISS frame");
-                None
+
+            // Skip leading duplicate FENDs (inter-frame fill).
+            while matches!(buf.first(), Some(&FEND)) && matches!(buf.get(1), Some(&FEND)) {
+                let _removed: u8 = buf.remove(0);
+            }
+
+            // Need at least FEND + type + FEND.
+            if buf.len() < 3 || buf.first() != Some(&FEND) {
+                return None;
+            }
+
+            // Find the closing FEND after the opening one.
+            let end_pos = buf.get(1..)?.iter().position(|&b| b == FEND)?;
+            let frame_end = end_pos + 2; // Include the closing FEND.
+
+            let frame_bytes: Vec<u8> = buf.drain(..frame_end).collect();
+            match decode_kiss_frame(&frame_bytes) {
+                Ok(frame) => {
+                    tracing::debug!(
+                        command = ?frame.command,
+                        data_len = frame.data.len(),
+                        "KISS RX"
+                    );
+                    return Some(frame);
+                }
+                Err(e) => {
+                    // A malformed frame must not stall a valid frame
+                    // already buffered behind it — keep extracting.
+                    tracing::warn!(?e, "discarding malformed KISS frame");
+                }
             }
         }
     }
@@ -392,10 +435,14 @@ impl<T: Transport> KissSession<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] if the write fails.
-    pub async fn exit(mut self) -> Result<Radio<T>, Error> {
+    /// Returns the session back together with the error if the exit
+    /// write fails, so the transport survives for a retry — a full
+    /// reopen is expensive (and fragile over Bluetooth RFCOMM).
+    pub async fn exit(mut self) -> Result<Radio<T>, (Self, Error)> {
         tracing::info!("exiting KISS mode");
-        self.send_frame(&KissFrame::return_command()).await?;
+        if let Err(e) = self.send_frame(&KissFrame::return_command()).await {
+            return Err((self, e));
+        }
 
         // Small delay to let the TNC switch back to CAT mode.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -410,6 +457,11 @@ impl<T: Transport> KissSession<T> {
             mode_b: self.mode_b,
             mcp_speed: self.mcp_speed,
             last_cmd_time: None,
+            // Binary TNC traffic may have left residue on the line —
+            // drain before the first CAT command.
+            desynced: true,
+            mcp_active: false,
+            mcp_saved_timeout: None,
         })
     }
 }
@@ -600,7 +652,103 @@ mod tests {
         // CMD_RETURN frame: C0 FF C0
         session.transport.expect(&[FEND, 0xFF, FEND], &[]);
 
-        let _radio = session.exit().await?;
+        let _radio = session.exit().await.map_err(|(_, e)| e)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn try_extract_skips_leading_garbage() -> TestResult {
+        // Stray bytes before framing starts (a late AI push, line
+        // noise) must be discarded, not block extraction forever.
+        let mut buf = b"TN 2,0\r".to_vec();
+        buf.extend_from_slice(&[FEND, 0x00, 0xCC, FEND]);
+        let frame = KissSession::<MockTransport>::try_extract_frame(&mut buf)
+            .ok_or("frame behind leading garbage must extract")?;
+        assert_eq!(frame.data, vec![0xCC]);
+        assert!(buf.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn try_extract_all_garbage_clears_buffer() {
+        // No FEND anywhere: nothing can ever frame — the noise must
+        // not accumulate.
+        let mut buf = b"pure ascii noise with no fend".to_vec();
+        let frame = KissSession::<MockTransport>::try_extract_frame(&mut buf);
+        assert!(frame.is_none());
+        assert!(buf.is_empty(), "FEND-free noise must be discarded");
+    }
+
+    #[tokio::test]
+    async fn try_extract_recovers_past_malformed_frame() -> TestResult {
+        // A malformed frame (invalid escape) followed by a valid one:
+        // the valid frame must be returned by the SAME call, not
+        // stall until more bytes arrive.
+        let mut buf = vec![FEND, 0x00, kiss_tnc::FESC, 0x00, FEND];
+        buf.extend_from_slice(&[FEND, 0x00, 0xDD, FEND]);
+        let frame = KissSession::<MockTransport>::try_extract_frame(&mut buf)
+            .ok_or("valid frame behind a malformed one must extract")?;
+        assert_eq!(frame.data, vec![0xDD]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receive_resyncs_past_leading_garbage() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
+
+        let mut wire = b"stray CAT response\r".to_vec();
+        wire.extend_from_slice(&[FEND, 0x00, 0xEE, FEND]);
+        session.transport.queue_read(&wire);
+
+        let frame = session.receive_frame().await?;
+        assert_eq!(frame.data, vec![0xEE]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_buffer_is_capped() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let mut session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
+
+        // An opening FEND followed by an endless unterminated payload
+        // (a stuck TNC): the buffer must not grow without bound.
+        session.transport.queue_read(&[FEND]);
+        for _ in 0..80 {
+            session.transport.queue_read(&[0x55u8; 1024]);
+        }
+        let result = session.receive_frame().await;
+        assert!(result.is_err(), "no complete frame must yield an error");
+        assert!(
+            session.read_buf_len() <= 64 * 1024,
+            "read buffer exceeded cap: {}",
+            session.read_buf_len()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exit_failure_returns_session_intact() -> TestResult {
+        let radio = mock_radio_for_kiss(TncBaud::Bps1200).await?;
+        let session = radio
+            .enter_kiss(TncBaud::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
+
+        // No expected exchange for CMD_RETURN — the write fails. The
+        // session (and its transport) must come back for a retry
+        // instead of being destroyed.
+        let result = session.exit().await;
+        let Err((session, _err)) = result else {
+            return Err("exit with a failing write must return the session".into());
+        };
+        drop(session);
         Ok(())
     }
 

@@ -539,6 +539,13 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn recall_channel(&mut self, band: Band, channel: u16) -> Result<(), Error> {
+        // The `MR {},{:03}` wire format silently grows to 4+ digits
+        // for out-of-range channels — validate before the wire.
+        if channel > 999 {
+            return Err(Error::Validation(
+                crate::error::ValidationError::ChannelOutOfRange { channel, max: 999 },
+            ));
+        }
         tracing::info!(?band, channel, "recalling memory channel");
         let response = self
             .execute(Command::RecallMemoryChannel { band, channel })

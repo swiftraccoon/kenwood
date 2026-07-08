@@ -107,6 +107,19 @@ pub struct Radio<T: Transport> {
     /// ARFC-D75 enforces a minimum 5ms gap between commands to avoid
     /// overwhelming the radio's command buffer.
     last_cmd_time: Option<tokio::time::Instant>,
+    /// Set when a command timed out: the radio's response may still be
+    /// in flight and must be drained before the next command, or a
+    /// retry with the same mnemonic would consume the stale answer.
+    desynced: bool,
+    /// Set while an MCP programming session is active. If it is still
+    /// set outside a programming method, the session's future was
+    /// cancelled mid-transfer and the radio may be stuck in PROG MCP
+    /// mode — CAT refuses until
+    /// [`Radio::recover_from_interrupted_mcp`] runs.
+    pub(crate) mcp_active: bool,
+    /// The CAT timeout saved while an MCP session temporarily raises
+    /// it; restored on session end or interrupted-session recovery.
+    pub(crate) mcp_saved_timeout: Option<Duration>,
 }
 
 impl<T: Transport> std::fmt::Debug for Radio<T> {
@@ -150,6 +163,9 @@ impl<T: Transport> Radio<T> {
             mode_b: None,
             mcp_speed: programming::McpSpeed::default(),
             last_cmd_time: None,
+            desynced: false,
+            mcp_active: false,
+            mcp_saved_timeout: None,
         })
     }
 
@@ -169,23 +185,49 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the transport connection fails.
+    /// Returns an error if the transport connection fails or if any
+    /// preamble write fails — a write failure means the recovery
+    /// sequence never reached the radio, and reporting success would
+    /// leave the caller debugging mysterious first-command failures.
     pub async fn connect_safe(transport: T) -> Result<Self, Error> {
         tracing::info!("connecting with TNC exit preamble");
         let mut radio = Self::connect(transport).await?;
 
+        // The radio may legitimately not RESPOND to any of these (it
+        // was never in TNC mode), but the WRITES must succeed — a
+        // failed write means a broken port, not a quiet radio.
         // Send empty frames to wake up any stale connection.
-        let _ = radio.transport.write(b"\r").await;
-        let _ = radio.transport.write(b"\r").await;
+        radio
+            .transport
+            .write(b"\r")
+            .await
+            .map_err(Error::Transport)?;
+        radio
+            .transport
+            .write(b"\r")
+            .await
+            .map_err(Error::Transport)?;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // ETX (exit KISS mode if active).
-        let _ = radio.transport.write(&[0x03]).await;
+        radio
+            .transport
+            .write(&[0x03])
+            .await
+            .map_err(Error::Transport)?;
         // TC 1 exits KISS TNC mode.
-        let _ = radio.transport.write(b"\rTC 1\r").await;
+        radio
+            .transport
+            .write(b"\rTC 1\r")
+            .await
+            .map_err(Error::Transport)?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         // TN 0,0 exits MMDVM mode (returns to APRS/normal TNC).
-        let _ = radio.transport.write(b"TN 0,0\r").await;
+        radio
+            .transport
+            .write(b"TN 0,0\r")
+            .await
+            .map_err(Error::Transport)?;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Drain any buffered responses from the mode exit commands.
@@ -276,7 +318,13 @@ impl<T: Transport> Radio<T> {
         let timeout_dur = self.timeout;
         tracing::debug!(cmd = %cmd_name, "executing command");
 
-        // 0. Warn if the command is likely to fail in the current mode.
+        // 0. Refuse CAT while an interrupted MCP session may have left
+        //    the radio in PROG MCP mode (binary protocol, CAT dead).
+        if self.mcp_active {
+            return Err(Error::McpInterrupted);
+        }
+
+        // 0.5. Warn if the command is likely to fail in the current mode.
         if let Some(warning) = self.check_mode_compatibility(&cmd) {
             tracing::warn!(cmd = %cmd_name, warning, "command may fail in current mode");
         }
@@ -287,6 +335,15 @@ impl<T: Transport> Radio<T> {
             if elapsed < Duration::from_millis(5) {
                 tokio::time::sleep(Duration::from_millis(5).saturating_sub(elapsed)).await;
             }
+        }
+
+        // 1.5. After a timeout, the previous command's response may
+        //      still arrive late. Drain and reroute it BEFORE sending
+        //      a new command, or a retry with the same mnemonic would
+        //      consume the stale answer as its own.
+        if self.desynced {
+            self.drain_stale_input().await;
+            self.desynced = false;
         }
 
         // 2. Serialize command to wire format.
@@ -305,66 +362,7 @@ impl<T: Transport> Radio<T> {
         //    notifications may arrive interleaved with command responses.
         //    Match the frame's mnemonic to the command we sent; route
         //    mismatches to the notification broadcast channel.
-        let expected_mnemonic = command_name(&cmd);
-        let result = tokio::time::timeout(timeout_dur, async {
-            let mut buf = [0u8; 1024];
-            loop {
-                let n = self
-                    .transport
-                    .read(&mut buf)
-                    .await
-                    .map_err(Error::Transport)?;
-                if n == 0 {
-                    tracing::error!(cmd = %cmd_name, "transport disconnected during read");
-                    return Err(Error::Transport(
-                        crate::error::TransportError::Disconnected(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "connection closed",
-                        )),
-                    ));
-                }
-                if let Some(chunk) = buf.get(..n) {
-                    self.codec.feed(chunk);
-                }
-                while let Some(frame) = self.codec.next_frame() {
-                    // Frames are CR-terminated ASCII: "MNEMONIC PAYLOAD\r"
-                    // e.g. "FQ 0,0145520000\r", "BY 1,1\r", "?\r", "N\r".
-                    // Extract the 2-letter mnemonic before the space.
-                    let frame_str = String::from_utf8_lossy(&frame);
-                    let frame_mnemonic = frame_str
-                        .split_once(' ')
-                        .map_or_else(|| frame_str.trim(), |(m, _)| m);
-
-                    tracing::trace!(cmd = %cmd_name, frame = ?frame_str.trim(), "RX");
-
-                    // Error/not-available are always responses to the current command.
-                    if frame_mnemonic == "?" {
-                        return Err(Error::RadioError);
-                    }
-                    if frame_mnemonic == "N" {
-                        return Err(Error::NotAvailable);
-                    }
-
-                    let response = protocol::parse(&frame).map_err(Error::Protocol)?;
-
-                    // If this frame's mnemonic doesn't match what we sent,
-                    // it's an unsolicited AI notification — route it to
-                    // subscribers and keep waiting for our actual response.
-                    if frame_mnemonic != expected_mnemonic {
-                        tracing::debug!(
-                            expected = expected_mnemonic,
-                            got = frame_mnemonic,
-                            "unsolicited AI notification"
-                        );
-                        let _ = self.notifications.send(response);
-                        continue;
-                    }
-
-                    return Ok(response);
-                }
-            }
-        })
-        .await;
+        let result = tokio::time::timeout(timeout_dur, self.read_matched_response(&cmd)).await;
 
         match result {
             Ok(inner) => {
@@ -374,7 +372,144 @@ impl<T: Transport> Radio<T> {
             }
             Err(_elapsed) => {
                 tracing::error!(cmd = %cmd_name, timeout = ?timeout_dur, "command timed out");
+                // The response (whole or partial) may still arrive.
+                // Drop any partial frame now and drain the rest before
+                // the next command (see `desynced`).
+                self.codec.clear();
+                self.desynced = true;
                 Err(Error::Timeout(timeout_dur))
+            }
+        }
+    }
+
+    /// Read frames until one answers `cmd`.
+    ///
+    /// `?`/`N` are always taken as answers to the in-flight command.
+    /// Anything else that doesn't match the command's mnemonic (or
+    /// matches it but carries the wrong band — AI pushes reuse the
+    /// read mnemonics) is unsolicited: parse successes go to
+    /// subscribers, failures are dropped as diagnostics, and neither
+    /// is ever fatal to the in-flight command.
+    async fn read_matched_response(&mut self, cmd: &Command) -> Result<Response, Error> {
+        let cmd_name = command_name(cmd);
+        let expected_mnemonic = cmd_name;
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = self
+                .transport
+                .read(&mut buf)
+                .await
+                .map_err(Error::Transport)?;
+            if n == 0 {
+                tracing::error!(cmd = %cmd_name, "transport disconnected during read");
+                return Err(Error::Transport(
+                    crate::error::TransportError::Disconnected(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed",
+                    )),
+                ));
+            }
+            if let Some(chunk) = buf.get(..n) {
+                self.codec.feed(chunk);
+            }
+            while let Some(frame) = self.codec.next_frame() {
+                // Frames are CR-terminated ASCII: "MNEMONIC PAYLOAD\r"
+                // e.g. "FQ 0,0145520000\r", "BY 1,1\r", "?\r", "N\r".
+                // Extract the 2-letter mnemonic before the space.
+                let frame_str = String::from_utf8_lossy(&frame);
+                let frame_mnemonic = frame_str
+                    .split_once(' ')
+                    .map_or_else(|| frame_str.trim(), |(m, _)| m);
+
+                tracing::trace!(cmd = %cmd_name, frame = ?frame_str.trim(), "RX");
+
+                // Error/not-available are always responses to the current command.
+                if frame_mnemonic == "?" {
+                    return Err(Error::RadioError);
+                }
+                if frame_mnemonic == "N" {
+                    return Err(Error::NotAvailable);
+                }
+
+                if frame_mnemonic != expected_mnemonic {
+                    match protocol::parse(&frame) {
+                        Ok(unsolicited) => {
+                            tracing::debug!(
+                                expected = expected_mnemonic,
+                                got = frame_mnemonic,
+                                "unsolicited AI notification"
+                            );
+                            let _ = self.notifications.send(unsolicited);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                frame = ?frame_str.trim(),
+                                "discarding unparseable unsolicited frame"
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                // Our mnemonic — a parse failure here IS a real
+                // protocol error.
+                let response = protocol::parse(&frame).map_err(Error::Protocol)?;
+
+                // Same mnemonic, wrong band: a band-B push must not
+                // answer a band-A query.
+                if let (Some(cmd_band), Some(resp_band)) = (
+                    protocol::command_band(cmd),
+                    protocol::response_band(&response),
+                ) && cmd_band != resp_band
+                {
+                    tracing::debug!(
+                        expected_band = ?cmd_band,
+                        got_band = ?resp_band,
+                        "band-mismatched push routed as unsolicited"
+                    );
+                    let _ = self.notifications.send(response);
+                    continue;
+                }
+
+                return Ok(response);
+            }
+        }
+    }
+
+    /// Drain frames the radio sent while no command was in flight —
+    /// typically a late response arriving after its command already
+    /// timed out. Parseable frames are rerouted to the notification
+    /// channel; `?`/`N` and garbage are dropped, since they cannot be
+    /// attributed to any command.
+    async fn drain_stale_input(&mut self) {
+        let mut buf = [0u8; 1024];
+        loop {
+            match tokio::time::timeout(Duration::from_millis(2), self.transport.read(&mut buf))
+                .await
+            {
+                Ok(Ok(n)) if n > 0 => {
+                    if let Some(chunk) = buf.get(..n) {
+                        self.codec.feed(chunk);
+                    }
+                }
+                // Timeout, EOF, or read error: nothing more to drain.
+                // A broken transport surfaces on the next command.
+                _ => break,
+            }
+        }
+        while let Some(frame) = self.codec.next_frame() {
+            match protocol::parse(&frame) {
+                Ok(stale) => {
+                    tracing::warn!(
+                        frame = ?String::from_utf8_lossy(&frame).trim(),
+                        "rerouting stale response received after a timeout"
+                    );
+                    let _ = self.notifications.send(stale);
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "dropping stale unparseable frame");
+                }
             }
         }
     }
@@ -603,6 +738,180 @@ mod tests {
         assert!(
             matches!(result, Err(Error::NotAvailable)),
             "expected NotAvailable, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn channel_number_above_999_is_validation_error() -> TestResult {
+        // The `{channel:03}` wire format silently emits 4+ digits for
+        // channel > 999 (e.g. `MR 0,1500`) — a malformed command the
+        // radio answers with `?`. Validate before the wire.
+        let mock = MockTransport::new();
+        let mut radio = Radio::connect(mock).await?;
+        let recall = radio.recall_channel(Band::A, 1500).await;
+        assert!(
+            matches!(recall, Err(Error::Validation(_))),
+            "recall_channel(1500) must fail validation: {recall:?}"
+        );
+        let read = radio.read_channel(1500).await;
+        assert!(
+            matches!(read, Err(Error::Validation(_))),
+            "read_channel(1500) must fail validation: {read:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dstar_callsign_write_validates_length() -> TestResult {
+        // DC writes previously took raw strings — an over-length
+        // callsign flowed to the wire unchecked.
+        let mock = MockTransport::new();
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio
+            .set_dstar_callsign(crate::types::DstarSlot::new(1)?, "TOOLONGCALLSIGN", "")
+            .await;
+        assert!(
+            matches!(result, Err(Error::Validation(_))),
+            "an over-length D-STAR callsign must fail validation: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_safe_propagates_preamble_write_failure() {
+        // A mock with no expectations rejects every write: the
+        // TNC-exit recovery preamble never reaches the radio. That
+        // must not be reported as a successful safe-connect.
+        let result = Radio::connect_safe(MockTransport::new()).await;
+        assert!(result.is_err(), "a dead write path must fail connect_safe");
+    }
+
+    #[tokio::test]
+    async fn set_af_gain_rejects_write_out_of_range() -> TestResult {
+        // AG accepts 0-99 on write (reads can exceed 99, so the type
+        // is lenient) — the write path must validate.
+        let mock = MockTransport::new();
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio
+            .set_af_gain(Band::A, crate::types::AfGainLevel::new(150))
+            .await;
+        assert!(
+            matches!(result, Err(Error::Validation(_))),
+            "AG write above 99 must fail validation: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nmea_interleave_does_not_fail_command() -> TestResult {
+        // With GPS PC output enabled, NMEA sentences interleave with
+        // CAT responses on the same stream. They must be skipped, not
+        // kill the in-flight command.
+        let mut mock = MockTransport::new();
+        mock.expect_reads(
+            b"MD 0\r",
+            &[
+                b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n",
+                b"MD 0,0\r",
+            ],
+        );
+        let mut radio = Radio::connect(mock).await?;
+        let response = radio.execute(Command::GetMode { band: Band::A }).await?;
+        assert!(
+            matches!(response, Response::Mode { band: Band::A, .. }),
+            "NMEA interleave must not fail the command: {response:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_unsolicited_mnemonic_is_skipped() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect_reads(b"MD 0\r", &[b"ZZ 1\r", b"MD 0,0\r"]);
+        let mut radio = Radio::connect(mock).await?;
+        let response = radio.execute(Command::GetMode { band: Band::A }).await?;
+        assert!(
+            matches!(response, Response::Mode { band: Band::A, .. }),
+            "unknown unsolicited frame must be skipped: {response:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_response_after_timeout_not_consumed_by_retry() -> TestResult {
+        let mut mock = MockTransport::new();
+        // First attempt: the link hangs and the command times out.
+        mock.expect_hang(b"SQ 0\r");
+        let mut radio = Radio::connect(mock).await?;
+        let first = radio.execute(Command::GetSquelch { band: Band::A }).await;
+        assert!(
+            matches!(first, Err(Error::Timeout(_))),
+            "hung link must time out: {first:?}"
+        );
+
+        // The original response arrives late (stale), then the retry
+        // gets its own fresh response. The retry must return the
+        // FRESH value, not the stale one.
+        radio.transport.queue_read(b"SQ 0,2\r");
+        radio.transport.expect(b"SQ 0\r", b"SQ 0,5\r");
+        let second = radio.execute(Command::GetSquelch { band: Band::A }).await?;
+        let Response::Squelch { level, .. } = second else {
+            return Err(format!("expected Squelch, got {second:?}").into());
+        };
+        assert_eq!(
+            level.as_u8(),
+            5,
+            "retry must not consume the stale pre-timeout response"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_mid_command_returns_transport_error() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect_eof(b"MD 0\r");
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.execute(Command::GetMode { band: Band::A }).await;
+        assert!(
+            matches!(result, Err(Error::Transport(_))),
+            "EOF mid-command must surface as a transport error: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parse_failure_of_matching_response_is_protocol_error() -> TestResult {
+        let mut mock = MockTransport::new();
+        // Squelch level 9 is out of range (0-6) — OUR response failing
+        // to parse is a real protocol error, unlike unsolicited noise.
+        mock.expect(b"SQ 0\r", b"SQ 0,9\r");
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.execute(Command::GetSquelch { band: Band::A }).await;
+        assert!(
+            matches!(result, Err(Error::Protocol(_))),
+            "out-of-range matching response must be a protocol error: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn band_mismatched_response_routed_as_unsolicited() -> TestResult {
+        // AI pushes carry the same mnemonics as reads (MD/FQ/SQ/BY).
+        // A band-B push must not answer a band-A query.
+        let mut mock = MockTransport::new();
+        mock.expect_reads(b"MD 0\r", &[b"MD 1,1\r", b"MD 0,0\r"]);
+        let mut radio = Radio::connect(mock).await?;
+        let mut notifications = radio.subscribe();
+        let response = radio.execute(Command::GetMode { band: Band::A }).await?;
+        assert!(
+            matches!(response, Response::Mode { band: Band::A, .. }),
+            "band-B push must not answer a band-A query: {response:?}"
+        );
+        let pushed = notifications.try_recv();
+        assert!(
+            matches!(pushed, Ok(Response::Mode { band: Band::B, .. })),
+            "the band-B push must reach subscribers: {pushed:?}"
         );
         Ok(())
     }

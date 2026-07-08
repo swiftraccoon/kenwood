@@ -267,12 +267,12 @@ fn parse_fo_response_21_fields() -> TestResult {
     assert_eq!(channel.tx_offset, Frequency::new(600_000));
     assert_eq!(channel.step_size, StepSize::Hz5000);
     assert_eq!(channel.shift, ShiftDirection::DOWN);
-    assert!(!channel.reverse);
-    assert!(!channel.tone_enable);
-    assert_eq!(channel.ctcss_mode, CtcssMode::Off);
-    assert!(!channel.dcs_enable);
-    assert!(!channel.cross_tone_reverse);
-    assert_eq!(channel.flags_0a_raw, 0x02); // shift=2 in bits 2:0
+    assert!(!channel.reverse());
+    assert!(!channel.tone_enable());
+    assert_eq!(channel.ctcss_mode(), CtcssMode::Off);
+    assert!(!channel.dcs_enable());
+    assert!(!channel.cross_tone_reverse());
+    assert_eq!(channel.flags_0a_raw(), 0x02); // shift=2 in bits 2:0
     assert_eq!(channel.tone_code, ToneCode::new(8)?);
     assert_eq!(channel.ctcss_code, ToneCode::new(8)?);
     assert_eq!(channel.dcs_code, DcsCode::new(0)?);
@@ -294,10 +294,10 @@ fn parse_fo_response_with_name() -> TestResult {
     assert_eq!(band, Band::B);
     assert_eq!(channel.rx_frequency, Frequency::new(440_000_000));
     assert_eq!(channel.tx_offset, Frequency::new(5_000_000));
-    assert!(channel.tone_enable); // field[7]=1
-    assert!(!channel.reverse); // field[11]=0
+    assert!(channel.tone_enable()); // field[7]=1
+    assert!(!channel.reverse()); // field[11]=0
     // flags_0a_raw encodes: tone=1(b7), ctcss=1(b6), dcs=1(b5), shift=1(b0)
-    assert_eq!(channel.flags_0a_raw, 0xE1);
+    assert_eq!(channel.flags_0a_raw(), 0xE1);
     assert_eq!(channel.tone_code, ToneCode::new(14)?);
     assert_eq!(channel.ctcss_code, ToneCode::new(14)?);
     assert_eq!(channel.dcs_code, DcsCode::new(23)?);
@@ -338,11 +338,6 @@ fn serialize_fo_write() -> TestResult {
         step_size: StepSize::Hz5000,
         mode_flags_raw: 0,
         shift: ShiftDirection::DOWN,
-        reverse: false,
-        tone_enable: false,
-        ctcss_mode: CtcssMode::Off,
-        dcs_enable: false,
-        cross_tone_reverse: false,
         flags_0a_raw: 0x02, // shift- = bits 1:0 = 2
         tone_code: ToneCode::new(8)?,
         ctcss_code: ToneCode::new(8)?,
@@ -373,11 +368,6 @@ fn fo_write_parse_round_trip() -> TestResult {
         step_size: StepSize::Hz5000,
         mode_flags_raw: 0,
         shift: ShiftDirection::DOWN,
-        reverse: false,
-        tone_enable: false,
-        ctcss_mode: CtcssMode::Off,
-        dcs_enable: false,
-        cross_tone_reverse: false,
         flags_0a_raw: 0x02, // shift- = 2
         tone_code: ToneCode::new(8)?,
         ctcss_code: ToneCode::new(8)?,
@@ -402,7 +392,7 @@ fn fo_write_parse_round_trip() -> TestResult {
     };
     assert_eq!(band, Band::A);
     assert_eq!(parsed.rx_frequency, channel.rx_frequency);
-    assert_eq!(parsed.flags_0a_raw, channel.flags_0a_raw);
+    assert_eq!(parsed.flags_0a_raw(), channel.flags_0a_raw());
     assert_eq!(parsed.urcall, channel.urcall);
     Ok(())
 }
@@ -467,11 +457,6 @@ fn serialize_fq_write() -> TestResult {
         step_size: StepSize::Hz5000,
         mode_flags_raw: 0,
         shift: ShiftDirection::DOWN,
-        reverse: false,
-        tone_enable: false,
-        ctcss_mode: CtcssMode::Off,
-        dcs_enable: false,
-        cross_tone_reverse: false,
         flags_0a_raw: 0x02, // shift- = 2
         tone_code: ToneCode::new(8)?,
         ctcss_code: ToneCode::new(8)?,
@@ -520,7 +505,7 @@ fn parse_fo_vfo_mode_extended_shift() -> TestResult {
     assert_eq!(band, Band::A);
     assert_eq!(channel.rx_frequency, Frequency::new(145_190_000));
     // field[12]=2 → shift direction in flags_0a_raw bits 2:0
-    assert_eq!(channel.flags_0a_raw & 0x07, 2);
+    assert_eq!(channel.flags_0a_raw() & 0x07, 2);
     assert_eq!(channel.urcall, ChannelName::new("CQCQCQ")?);
     Ok(())
 }
@@ -546,11 +531,6 @@ fn fo_vfo_extended_shift_round_trip() -> TestResult {
         step_size: StepSize::Hz5000,
         mode_flags_raw: 0,
         shift: ShiftDirection::new(5)?,
-        reverse: false,
-        tone_enable: false,
-        ctcss_mode: CtcssMode::Off,
-        dcs_enable: false,
-        cross_tone_reverse: false,
         flags_0a_raw: 0x05, // shift=5 in bits 2:0
         tone_code: ToneCode::new(8)?,
         ctcss_code: ToneCode::new(8)?,

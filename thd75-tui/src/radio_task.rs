@@ -891,7 +891,7 @@ async fn enter_aprs_session(
             }
             Ok(new_radio)
         }
-        Err(e) => Err(EnterAprsError::KissExitFailed(format!(
+        Err((_client, e)) => Err(EnterAprsError::KissExitFailed(format!(
             "KISS exit failed: {e}"
         ))),
     }

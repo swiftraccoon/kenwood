@@ -71,8 +71,8 @@ fn parse_fq_short_defaults_non_frequency_fields() -> TestResult {
         return Err(format!("expected Frequency, got {r:?}").into());
     };
     assert_eq!(channel.tx_offset, Frequency::new(0));
-    assert!(!channel.tone_enable);
-    assert!(!channel.reverse);
+    assert!(!channel.tone_enable());
+    assert!(!channel.reverse());
     Ok(())
 }
 
@@ -138,7 +138,7 @@ fn parse_me_with_tone_settings() -> TestResult {
     assert_eq!(data.rx_frequency, Frequency::new(155_340_000));
     // field[8]=1 → CTCSS enable → maps to byte[10] bit 6
     // In our struct, ctcss is stored via flags_0a_raw bit 6
-    assert_eq!(data.flags_0a_raw & 0x40, 0x40);
+    assert_eq!(data.flags_0a_raw() & 0x40, 0x40);
     Ok(())
 }
 

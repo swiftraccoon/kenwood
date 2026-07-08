@@ -62,19 +62,20 @@ pub const FM_RADIO_CHANNEL_COUNT: u8 = 10;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FmRadioChannel {
     /// Channel number (0-9, displayed as FM0-FM9).
-    pub number: u8,
+    number: u8,
     /// Station frequency in Hz (76,000,000 - 108,000,000).
     /// The radio tunes in 50/100 kHz steps in the FM broadcast band.
-    pub frequency_hz: u32,
+    frequency_hz: u32,
     /// Station name (up to 8 characters).
-    pub name: String,
+    name: String,
 }
 
 impl FmRadioChannel {
     /// Create a new FM radio channel.
     ///
     /// Returns `None` if the channel number or frequency is out of range,
-    /// or if the name exceeds 8 characters.
+    /// or if the name exceeds 8 characters. Fields are private so this
+    /// validation cannot be bypassed after construction.
     #[must_use]
     pub fn new(number: u8, frequency_hz: u32, name: String) -> Option<Self> {
         if number >= FM_RADIO_CHANNEL_COUNT {
@@ -91,6 +92,24 @@ impl FmRadioChannel {
             frequency_hz,
             name,
         })
+    }
+
+    /// Channel number (0-9).
+    #[must_use]
+    pub const fn number(&self) -> u8 {
+        self.number
+    }
+
+    /// Station frequency in Hz.
+    #[must_use]
+    pub const fn frequency_hz(&self) -> u32 {
+        self.frequency_hz
+    }
+
+    /// Station name (may be empty).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Returns the frequency in MHz as a floating-point value.
@@ -142,10 +161,10 @@ mod tests {
     fn fm_channel_valid() -> Result<(), Box<dyn std::error::Error>> {
         let ch = FmRadioChannel::new(0, 89_100_000, "NPR".to_owned())
             .ok_or("valid FM channel rejected")?;
-        assert_eq!(ch.number, 0);
-        assert_eq!(ch.frequency_hz, 89_100_000);
+        assert_eq!(ch.number(), 0);
+        assert_eq!(ch.frequency_hz(), 89_100_000);
         assert!((ch.frequency_mhz() - 89.1).abs() < 0.001);
-        assert_eq!(ch.name, "NPR");
+        assert_eq!(ch.name(), "NPR");
         Ok(())
     }
 

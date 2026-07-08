@@ -9,7 +9,7 @@ use crate::types::channel::{ChannelMemory, ChannelName, CrossToneType, FlashDigi
 use crate::types::frequency::Frequency;
 use crate::types::mode::{PowerLevel, ShiftDirection, StepSize};
 use crate::types::radio_params::VfoMemoryMode;
-use crate::types::tone::{CtcssMode, DcsCode, ToneCode};
+use crate::types::tone::{DcsCode, ToneCode};
 
 use super::{Command, Response};
 
@@ -262,7 +262,9 @@ pub(crate) fn parse_channel_fields(
     //  [1]  TX offset / split TX freq        → byte[4..8]
     //  [2]  RX step size                     → byte[8] high nibble
     //  [3]  TX step size                     → byte[8] low nibble (always 0 on regular channels)
-    //  [4]  Mode (0=FM,1=DV,6=NFM,...)       → byte[9] upper nibble
+    //  [4]  Mode, CAT WIRE encoding          → byte[9] bits 6:4
+    //       (0=FM, 1=DV, 2=NFM, 3=AM — hardware-verified; NOT the
+    //       MD/flash table, where 2=AM and 6=NFM)
     //  [5]  Fine tuning (0/1)                → byte[9] bit 3 (always 0 on regular channels)
     //  [6]  Fine step size                   → byte[9] bits 2:0 (always 0 on regular channels)
     //  [7]  Tone encode enable (0/1)         → byte[10] bit 7
@@ -328,16 +330,6 @@ pub(crate) fn parse_channel_fields(
         | (u8::from(reverse) << 3)
         | (shift_val & 0x07);
 
-    // Reconstruct the CTCSS mode from the ctcss_enable flag. The wire protocol
-    // only distinguishes enable/disable here (the full On/EncodeOnly split lives
-    // in the TN command), so we map the flag directly without going through
-    // `try_from` on a raw byte.
-    let ctcss_mode = if ctcss_enable {
-        CtcssMode::On
-    } else {
-        CtcssMode::Off
-    };
-
     // field 13: tone frequency code (2 digits)
     let tone_val = parse_u8_field(f_tone_code, cmd, "tone_code")?;
     let tone_code = ToneCode::new(tone_val).map_err(|e| ProtocolError::FieldParse {
@@ -396,11 +388,6 @@ pub(crate) fn parse_channel_fields(
         step_size,
         mode_flags_raw,
         shift,
-        reverse,
-        tone_enable,
-        ctcss_mode,
-        dcs_enable,
-        cross_tone_reverse: cross_tone,
         flags_0a_raw,
         tone_code,
         ctcss_code,

@@ -690,8 +690,10 @@ impl UrCallAction {
     /// first 8 characters are used.
     #[must_use]
     pub fn parse(ur_call: &str) -> Self {
-        // Pad to 8 characters.
-        let padded = format!("{:<8}", &ur_call[..ur_call.len().min(8)]);
+        // Truncate char-safely (a multi-byte character straddling
+        // byte 8 must not panic the slice), then pad to 8.
+        let truncated: String = ur_call.chars().take(8).collect();
+        let padded = format!("{truncated:<8}");
         let bytes = padded.as_bytes();
 
         // Check for CQCQCQ.
@@ -824,6 +826,17 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn urcall_parse_multibyte_input_no_panic() {
+        // 7 ASCII bytes + a 3-byte character: byte index 8 falls
+        // mid-character. The 8-char truncation must be char-safe.
+        let action = UrCallAction::parse("1234567€");
+        assert!(
+            !format!("{action:?}").is_empty(),
+            "parse must classify, not panic"
+        );
+    }
 
     #[test]
     fn dstar_callsign_valid() -> TestResult {

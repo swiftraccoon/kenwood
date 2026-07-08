@@ -2653,4 +2653,174 @@ mod tests {
         assert_eq!(f.as_hz(), 222_100_000);
         Ok(())
     }
+
+    /// A setter invocation for the offset-audit table.
+    type ApplySetter = fn(&mut SettingsWriter<'_>);
+
+    /// Every settings setter, paired with the flash offset it must
+    /// write, transcribed INDEPENDENTLY from the RE offset map (hex
+    /// literals, not the `*_OFFSET` constants) — a transposed digit
+    /// in a constant would corrupt an unrelated radio setting on MCP
+    /// write-back, and the offset audit below is the test that
+    /// catches it.
+    static SETTER_OFFSET_TABLE: &[(&str, usize, ApplySetter)] = &[
+        ("set_backlight", 0x1069, |s| s.set_backlight(1)),
+        ("set_backlight_control", 0x1069, |s| {
+            s.set_backlight_control(1);
+        }),
+        ("set_backlight_timer", 0x106A, |s| s.set_backlight_timer(1)),
+        ("set_beep_volume", 0x1072, |s| s.set_beep_volume(1)),
+        ("set_auto_power_off", 0x10D0, |s| {
+            s.set_auto_power_off(AutoPowerOff::Min30);
+        }),
+        ("set_battery_saver", 0x10C0, |s| s.set_battery_saver(true)),
+        ("set_key_lock_type", 0x1061, |s| {
+            s.set_key_lock_type(KeyLockType::KeyAndPtt);
+        }),
+        ("set_language", 0x1006, |s| {
+            s.set_language(Language::Japanese);
+        }),
+        ("set_speed_distance_unit", 0x1077, |s| {
+            s.set_speed_distance_unit(SpeedDistanceUnit::KilometersPerHour);
+        }),
+        ("set_altitude_rain_unit", 0x1083, |s| {
+            s.set_altitude_rain_unit(AltitudeRainUnit::MetersMm);
+        }),
+        ("set_temperature_unit", 0x1084, |s| {
+            s.set_temperature_unit(TemperatureUnit::Celsius);
+        }),
+        ("set_vox_delay", 0x101D, |s| s.set_vox_delay(1)),
+        ("set_vox_tx_on_busy", 0x101E, |s| s.set_vox_tx_on_busy(true)),
+        ("set_squelch_a", 0x100D, |s| s.set_squelch_a(1)),
+        ("set_squelch_b", 0x100E, |s| s.set_squelch_b(1)),
+        ("set_fm_narrow", 0x100F, |s| s.set_fm_narrow(1)),
+        ("set_auto_filter", 0x100C, |s| s.set_auto_filter(1)),
+        ("set_scan_resume", 0x1007, |s| s.set_scan_resume(1)),
+        ("set_digital_scan_resume", 0x1008, |s| {
+            s.set_digital_scan_resume(1);
+        }),
+        ("set_timeout_timer", 0x1018, |s| s.set_timeout_timer(1)),
+        ("set_tx_inhibit", 0x1019, |s| s.set_tx_inhibit(true)),
+        ("set_beat_shift", 0x101A, |s| s.set_beat_shift(true)),
+        ("set_cw_break_in", 0x101F, |s| s.set_cw_break_in(true)),
+        ("set_cw_pitch", 0x1021, |s| s.set_cw_pitch(1)),
+        ("set_dtmf_speed", 0x1024, |s| s.set_dtmf_speed(1)),
+        ("set_mic_sensitivity", 0x1040, |s| s.set_mic_sensitivity(1)),
+        ("set_pf_key1", 0x1041, |s| s.set_pf_key1(1)),
+        ("set_pf_key2", 0x1042, |s| s.set_pf_key2(1)),
+        ("set_aprs_lock", 0x1097, |s| s.set_aprs_lock(true)),
+        ("set_dual_display_size", 0x1066, |s| {
+            s.set_dual_display_size(1);
+        }),
+        ("set_display_area", 0x1067, |s| s.set_display_area(1)),
+        ("set_info_line", 0x1068, |s| s.set_info_line(1)),
+        ("set_volume_lock", 0x1076, |s| s.set_volume_lock(true)),
+        ("set_bt_auto_connect", 0x1079, |s| {
+            s.set_bt_auto_connect(true);
+        }),
+        ("set_pc_output_mode", 0x1085, |s| s.set_pc_output_mode(1)),
+        ("set_aprs_usb_mode", 0x1086, |s| s.set_aprs_usb_mode(1)),
+        ("set_power_on_message_flag", 0x1087, |s| {
+            s.set_power_on_message_flag(true);
+        }),
+        ("set_dual_band_mcp", 0x1096, |s| s.set_dual_band_mcp(true)),
+        ("set_key_beep", 0x1071, |s| s.set_key_beep(true)),
+        ("set_vox_enabled", 0x101B, |s| s.set_vox_enabled(true)),
+        ("set_vox_gain", 0x101C, |s| s.set_vox_gain(1)),
+        ("set_lock", 0x1060, |s| s.set_lock(true)),
+        ("set_dual_band", 0x0396, |s| s.set_dual_band(true)),
+        ("set_attenuator_a", 0x035C, |s| s.set_attenuator_a(true)),
+        ("set_power_level_a", 0x0359, |s| {
+            s.set_power_level_a(PowerLevel::ExtraLow);
+        }),
+        ("set_bluetooth", 0x1078, |s| s.set_bluetooth(true)),
+        ("set_ssb_high_cut", 0x1011, |s| s.set_ssb_high_cut(1)),
+        ("set_cw_high_cut", 0x1012, |s| s.set_cw_high_cut(1)),
+        ("set_am_high_cut", 0x1013, |s| s.set_am_high_cut(1)),
+        ("set_scan_restart_time", 0x1009, |s| {
+            s.set_scan_restart_time(1);
+        }),
+        ("set_scan_restart_carrier", 0x100A, |s| {
+            s.set_scan_restart_carrier(1);
+        }),
+        ("set_cw_delay_time", 0x1020, |s| s.set_cw_delay_time(1)),
+        ("set_dtmf_pause_time", 0x1026, |s| s.set_dtmf_pause_time(1)),
+        ("set_dtmf_tx_hold", 0x1027, |s| s.set_dtmf_tx_hold(true)),
+        ("set_repeater_auto_offset", 0x1030, |s| {
+            s.set_repeater_auto_offset(true);
+        }),
+        ("set_repeater_call_key", 0x1031, |s| {
+            s.set_repeater_call_key(1);
+        }),
+        ("set_lock_key_a", 0x1062, |s| s.set_lock_key_a(true)),
+        ("set_lock_key_b", 0x1063, |s| s.set_lock_key_b(true)),
+        ("set_lock_key_c", 0x1064, |s| s.set_lock_key_c(true)),
+        ("set_lock_key_ptt", 0x1065, |s| s.set_lock_key_ptt(true)),
+        ("set_display_hold_time", 0x106B, |s| {
+            s.set_display_hold_time(1);
+        }),
+        ("set_display_method", 0x106C, |s| s.set_display_method(1)),
+        ("set_power_on_display", 0x106D, |s| {
+            s.set_power_on_display(1);
+        }),
+        ("set_emr_volume_level", 0x106E, |s| {
+            s.set_emr_volume_level(1);
+        }),
+        ("set_auto_mute_return_time", 0x106F, |s| {
+            s.set_auto_mute_return_time(1);
+        }),
+        ("set_announce", 0x1070, |s| s.set_announce(true)),
+        ("set_voice_language", 0x1073, |s| s.set_voice_language(1)),
+        ("set_voice_volume", 0x1074, |s| s.set_voice_volume(1)),
+        ("set_voice_speed", 0x1075, |s| s.set_voice_speed(1)),
+        ("set_usb_audio_output", 0x1094, |s| {
+            s.set_usb_audio_output(true);
+        }),
+        ("set_internet_link", 0x1095, |s| s.set_internet_link(true)),
+        ("set_gps_bt_interface", 0x1080, |s| {
+            s.set_gps_bt_interface(1);
+        }),
+        ("set_key_lock_type_raw", 0x1061, |s| {
+            s.set_key_lock_type_raw(1);
+        }),
+        ("set_auto_power_off_raw", 0x10D0, |s| {
+            s.set_auto_power_off_raw(1);
+        }),
+        ("set_speed_distance_unit_raw", 0x1077, |s| {
+            s.set_speed_distance_unit_raw(1);
+        }),
+        ("set_altitude_rain_unit_raw", 0x1083, |s| {
+            s.set_altitude_rain_unit_raw(1);
+        }),
+        ("set_temperature_unit_raw", 0x1084, |s| {
+            s.set_temperature_unit_raw(1);
+        }),
+    ];
+
+    /// Applies every entry of [`SETTER_OFFSET_TABLE`] to a fresh image
+    /// and asserts exactly one byte changed, at the documented offset
+    /// (no neighbor stomping, no wrong-offset writes).
+    #[test]
+    fn every_setter_writes_exactly_one_byte_at_its_documented_offset() -> TestResult {
+        for (name, offset, apply) in SETTER_OFFSET_TABLE {
+            let image = make_settings_image()?;
+            let mut mi = crate::memory::MemoryImage::from_raw(image)?;
+            let before = mi.as_raw().to_vec();
+            apply(&mut mi.settings_mut());
+            let after = mi.as_raw();
+            let diffs: Vec<usize> = before
+                .iter()
+                .zip(after.iter())
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                diffs,
+                vec![*offset],
+                "{name}: expected exactly one byte changed at 0x{offset:04X}, got {diffs:04X?}"
+            );
+        }
+        Ok(())
+    }
 }
