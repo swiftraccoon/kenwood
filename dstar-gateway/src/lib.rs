@@ -22,11 +22,11 @@
 //! # Feature flags
 //!
 //! - `blocking` — additionally compiles a blocking-shell variant
-//!   (no tokio dependency at runtime) under the `blocking_shell`
-//!   module. Useful for CLI scripts and test fixtures that don't
-//!   want a tokio runtime.
-//! - `hosts-fetcher` — pulls `reqwest` for downloading Pi-Star host
-//!   files under the `hosts_fetcher` module. Disabled by default so
+//!   under the `blocking_shell` module. Its caller-driven API uses
+//!   `std::net::UdpSocket` and does not require running a tokio runtime;
+//!   tokio remains an unconditional dependency of this async crate.
+//! - `hosts-fetcher` — pulls `reqwest` for fetching the XLX reflector
+//!   directory under the `hosts_fetcher` module. Disabled by default so
 //!   the crate stays dependency-light for consumers who don't need
 //!   HTTP.
 //!
@@ -45,8 +45,11 @@ pub mod blocking_shell;
 #[cfg(feature = "hosts-fetcher")]
 pub mod hosts_fetcher;
 
-// Re-export core types and session machinery so consumers don't
-// need a separate `dstar-gateway-core` dependency.
+// Re-export the core's leaf types so simple consumers need only this
+// crate. The typestate session machinery (`Session`, `Driver`, the
+// state and protocol markers) is deliberately NOT re-exported —
+// driving the sans-io core directly requires an explicit
+// `dstar-gateway-core` dependency.
 pub use dstar_gateway_core::{
     AMBE_SILENCE, BandLetter, Callsign, DSTAR_SYNC_BYTES, DStarHeader, Error, HostEntry, HostFile,
     Module, ProtocolKind, ReflectorCallsign, StreamId, Suffix, TypeError, VoiceFrame,

@@ -8,14 +8,15 @@ Terminal UI for the Kenwood TH-D75. Built on [`kenwood-thd75`](../thd75/), [rata
 
 - Real-time CAT display: frequency, mode, squelch, RSSI, battery level, power step, tones, shift direction, step size.
 - Memory channel browser: 1000 channels with name / frequency / mode / group columns; edit and write back via CAT or MCP.
-- APRS monitor panel: decoded position, message, status, weather, telemetry, Mic-E, object, item reports.
+- APRS monitor panel: decoded position (including Mic-E), message, and weather reports, plus digipeated packets, query responses, and a last-heard station list. Status, telemetry, object, and item packets are received but not yet decoded into their own display.
 - D-STAR gateway reflector monitor (via [`dstar-gateway-core`](../dstar-gateway-core/)): link status, heard stations, voice-transmission events.
 - MCP programming: full memory dump (~55 s at 9600 baud), channel read/write, settings patches. Cached at `~/Library/Caches/thd75-tui/mcp.bin` on macOS for offline correlation.
+- Reflector Terminal Mode: detects a radio booted into terminal mode and, with `--exit-terminal-mode`, guides an exit and reconnects instead of just reporting it.
 
 ## Running
 
 ```
-cargo run -p thd75-tui -- [--port /dev/cu.usbmodem*] [--baud 115200] [--mcp-speed safe|fast]
+cargo run -p thd75-tui -- [--port /dev/cu.usbmodem*] [--baud 115200] [--mcp-speed safe|fast] [--exit-terminal-mode]
 ```
 
 Default port auto-discovers USB (VID `0x2166` / PID `0x9023`) or the paired Bluetooth SPP channel (macOS IOBluetooth RFCOMM; Linux/Windows via the serial emulator).

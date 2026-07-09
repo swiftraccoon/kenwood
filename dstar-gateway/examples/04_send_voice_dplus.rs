@@ -1,5 +1,5 @@
 #![cfg(feature = "examples-network")]
-//! Send 3 seconds of silence to a `DPlus` (REF) reflector.
+//! Send 1.2 seconds of silence to a `DPlus` (REF) reflector.
 //!
 //! Demonstrates the full `DPlus` TX flow:
 //! 1. Run the TCP auth step via `AuthClient::authenticate` to
@@ -7,7 +7,7 @@
 //! 2. Build a `Session<DPlus, Configured>`, promote through
 //!    `Authenticated -> Connecting -> Connected` on the sans-io core.
 //! 3. Hand the `Connected` session off to `AsyncSession::spawn`.
-//! 4. Send a header, 60 voice frames of `AMBE_SILENCE` (3 s @ 20 fps),
+//! 4. Send a header, 60 voice frames of `AMBE_SILENCE` (1.2 s @ 50 fps),
 //!    and a final EOT. Disconnect gracefully.
 //!
 //! Gated behind the `examples-network` feature because it requires a
@@ -17,7 +17,8 @@
 //! build). Run with:
 //!
 //! ```text
-//! REFLECTOR_HOST=ref030.dstargateway.org:20001 \
+//! DSTAR_CALLSIGN=N0CALL REFLECTOR_HOST=ref030.dstargateway.org:20001 \
+//! REFLECTOR_CALLSIGN=REF030 \
 //!     cargo run -p dstar-gateway --example 04_send_voice_dplus \
 //!     --features examples-network
 //! ```
@@ -25,6 +26,9 @@
 //! **Transmits on real reflectors — set `ACTUALLY_TRANSMIT=1` to opt
 //! in.** Without the opt-in the example resolves the address, runs
 //! the handshake, and exits without keying any voice frames.
+
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
 
 use std::env;
 use std::sync::Arc;
@@ -46,16 +50,20 @@ use tokio::time::timeout;
 // dev-deps we don't reference directly so the strict
 // `unused_crate_dependencies` lint stays silent.
 use pcap_parser as _;
+use thiserror as _;
 use trybuild as _;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let callsign = Callsign::try_from_str("W1AW")?;
+    let callsign = Callsign::try_from_str(&env::var("DSTAR_CALLSIGN")?)?;
     let reflector_host =
         env::var("REFLECTOR_HOST").unwrap_or_else(|_| "ref030.example.com:20001".to_string());
-    let actually_transmit = env::var("ACTUALLY_TRANSMIT").is_ok();
+    let reflector_callsign = Callsign::try_from_str(
+        &env::var("REFLECTOR_CALLSIGN").unwrap_or_else(|_| "REF030".to_string()),
+    )?;
+    let actually_transmit = env::var("ACTUALLY_TRANSMIT").ok().as_deref() == Some("1");
 
     // 1. TCP auth — fetches the host list cached by the DPlus auth
     //    server. The returned `HostList` is required to promote the
@@ -118,18 +126,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|f| format!("promote: {}", f.error))?;
     let mut async_session = AsyncSession::spawn(connected, Arc::clone(&sock));
 
-    // 5. If the operator opted in, key the transmitter for 3 seconds.
+    // 5. If the operator opted in, key the transmitter for 1.2 seconds
+    //    (60 frames at 20 ms).
     if actually_transmit {
-        let header = DStarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
-            rpt2: Callsign::try_from_str("REF030 G")?,
-            rpt1: Callsign::try_from_str("REF030 C")?,
-            ur_call: Callsign::try_from_str("CQCQCQ")?,
-            my_call: callsign,
-            my_suffix: Suffix::EMPTY,
-        };
+        let header = DStarHeader::for_relay(
+            callsign,
+            Module::B,
+            reflector_callsign,
+            Module::C,
+            callsign,
+            Suffix::EMPTY,
+        );
         let sid = StreamId::new(0x1234).ok_or("non-zero stream id")?;
         async_session.send_header(header, sid).await?;
 
@@ -142,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("TX complete");
     } else {
         tracing::info!(
-            "connected but ACTUALLY_TRANSMIT not set; skipping voice send to avoid keying the air"
+            "connected but ACTUALLY_TRANSMIT is not 1; skipping voice send to avoid keying the air"
         );
     }
 

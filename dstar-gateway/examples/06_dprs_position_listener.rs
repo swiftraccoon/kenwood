@@ -15,10 +15,13 @@
 //! Gated behind the `examples-network` feature.
 //!
 //! ```text
-//! REFLECTOR_HOST=ref030.example.com:20001 \
+//! DSTAR_CALLSIGN=N0CALL REFLECTOR_HOST=ref030.example.com:20001 \
 //!     cargo run -p dstar-gateway --example 06_dprs_position_listener \
 //!     --features examples-network
 //! ```
+
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
 
 use std::collections::HashMap;
 use std::env;
@@ -39,13 +42,14 @@ use tokio::time::timeout;
 
 // Acknowledged workspace dev-deps.
 use pcap_parser as _;
+use thiserror as _;
 use trybuild as _;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let callsign = Callsign::try_from_str("W1AW")?;
+    let callsign = Callsign::try_from_str(&env::var("DSTAR_CALLSIGN")?)?;
     let reflector_host =
         env::var("REFLECTOR_HOST").unwrap_or_else(|_| "ref030.example.com:20001".to_string());
 
@@ -84,7 +88,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         };
         let (n, src) = recv?;
-        connecting.handle_input(Instant::now(), src, &buf[..n])?;
+        let slice = buf.get(..n).unwrap_or(&[]);
+        connecting.handle_input(Instant::now(), src, slice)?;
         if connecting.state_kind() == ClientStateKind::Connected {
             break;
         }

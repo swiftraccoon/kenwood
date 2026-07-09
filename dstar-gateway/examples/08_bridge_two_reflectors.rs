@@ -7,21 +7,25 @@
 //! event streams keeps the forwarding fair (one call from A does not
 //! starve the next call from B).
 //!
-//! This is the minimal form of the "bridge" pattern from the
-//! `dstar-gateway` specification section 7; a production bridge adds
-//! loop detection (don't forward traffic that originated on the
-//! other side), per-module policy, and transcoding for mixed
-//! protocols. For clarity, this example omits all of that — it
-//! just illustrates the two-session wiring.
+//! This is the minimal form of a reflector-to-reflector "bridge".
+//! It rewrites routing headers for each destination, but deliberately
+//! omits loop detection, per-module policy, and transcoding. Run it
+//! only against controlled endpoints where you have permission to
+//! forward traffic; do not point both sides at public reflectors.
 //!
 //! Gated behind the `examples-network` feature.
 //!
 //! ```text
-//! REFLECTOR_A=xrf030.example.com:30001 \
+//! DSTAR_CALLSIGN=N0CALL ACTUALLY_BRIDGE=1 \
+//! REFLECTOR_A=xrf030.example.com:30001 REFLECTOR_A_CALLSIGN=XRF030 \
 //! REFLECTOR_B=xrf040.example.com:30001 \
+//! REFLECTOR_B_CALLSIGN=XRF040 \
 //!     cargo run -p dstar-gateway --example 08_bridge_two_reflectors \
 //!     --features examples-network
 //! ```
+
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
 
 use std::env;
 use std::sync::Arc;
@@ -40,17 +44,33 @@ use tokio::time::timeout;
 
 // Acknowledged workspace dev-deps.
 use pcap_parser as _;
+use thiserror as _;
 use trybuild as _;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let callsign = Callsign::try_from_str("W1AW")?;
+    if env::var("ACTUALLY_BRIDGE").ok().as_deref() != Some("1") {
+        eprintln!(
+            "refusing to forward traffic: set ACTUALLY_BRIDGE=1 after reviewing the safety notes"
+        );
+        return Ok(());
+    }
+
+    let callsign = Callsign::try_from_str(&env::var("DSTAR_CALLSIGN")?)?;
     let reflector_a =
         env::var("REFLECTOR_A").unwrap_or_else(|_| "xrf030.example.com:30001".to_string());
     let reflector_b =
         env::var("REFLECTOR_B").unwrap_or_else(|_| "xrf040.example.com:30001".to_string());
+    let reflector_callsigns = (
+        Callsign::try_from_str(
+            &env::var("REFLECTOR_A_CALLSIGN").unwrap_or_else(|_| "XRF030".to_string()),
+        )?,
+        Callsign::try_from_str(
+            &env::var("REFLECTOR_B_CALLSIGN").unwrap_or_else(|_| "XRF040".to_string()),
+        )?,
+    );
 
     // Connect to both reflectors in parallel to minimize startup
     // latency. If either fails the example aborts — a production
@@ -62,6 +82,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let mut async_a = session_a;
     let mut async_b = session_b;
+    let route_to_a = RelayRoute {
+        operator: callsign,
+        local_module: Module::B,
+        reflector: reflector_callsigns.0,
+        reflector_module: Module::C,
+    };
+    let route_to_b = RelayRoute {
+        operator: callsign,
+        local_module: Module::B,
+        reflector: reflector_callsigns.1,
+        reflector_module: Module::C,
+    };
 
     tracing::info!("bridge up — forwarding both directions");
 
@@ -70,8 +102,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // through to the other side; on `VoiceEnd` we send an EOT. The
     // outbound stream id is preserved from the inbound id so a
     // reflector-side dedup by stream id still works.
-    let mut tx_header_a_to_b: Option<(StreamId, DStarHeader)> = None;
-    let mut tx_header_b_to_a: Option<(StreamId, DStarHeader)> = None;
+    let mut tx_stream_a_to_b: Option<StreamId> = None;
+    let mut tx_stream_b_to_a: Option<StreamId> = None;
 
     loop {
         tokio::select! {
@@ -83,7 +115,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 forward(
                     &event,
                     &mut async_b,
-                    &mut tx_header_a_to_b,
+                    &mut tx_stream_a_to_b,
+                    route_to_b,
                 )
                 .await?;
             }
@@ -95,7 +128,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 forward(
                     &event,
                     &mut async_a,
-                    &mut tx_header_b_to_a,
+                    &mut tx_stream_b_to_a,
+                    route_to_a,
                 )
                 .await?;
             }
@@ -104,45 +138,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Clean shutdown, ignoring errors because either side may
     // already be dead.
-    let _ = async_a.disconnect().await;
-    let _ = async_b.disconnect().await;
+    drop(async_a.disconnect().await);
+    drop(async_b.disconnect().await);
     Ok(())
 }
 
-/// Forward one event from the RX side to the TX side, tracking the
-/// current stream header so `send_voice` / `send_eot` can reference
-/// it if needed (DCS would; `DExtra` does not — but the pattern scales
-/// to any TX side).
+#[derive(Clone, Copy)]
+struct RelayRoute {
+    operator: Callsign,
+    local_module: Module,
+    reflector: Callsign,
+    reflector_module: Module,
+}
+
+/// Forward one event from the RX side to the TX side, rewriting the
+/// header for the destination reflector and tracking the active stream.
 async fn forward(
     event: &Event<DExtra>,
     tx: &mut AsyncSession<DExtra>,
-    tx_header: &mut Option<(StreamId, DStarHeader)>,
+    tx_stream: &mut Option<StreamId>,
+    route: RelayRoute,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event {
         Event::VoiceStart {
             stream_id, header, ..
         } => {
-            *tx_header = Some((*stream_id, *header));
-            tx.send_header(*header, *stream_id).await?;
+            let mut outbound_header = DStarHeader::for_relay(
+                route.operator,
+                route.local_module,
+                route.reflector,
+                route.reflector_module,
+                header.my_call,
+                header.my_suffix,
+            );
+            outbound_header.flag1 = header.flag1;
+            outbound_header.flag2 = header.flag2;
+            outbound_header.flag3 = header.flag3;
+            *tx_stream = Some(*stream_id);
+            tx.send_header(outbound_header, *stream_id).await?;
         }
         Event::VoiceFrame {
             stream_id,
             seq,
             frame,
         } => {
-            // Forward the frame verbatim. `VoiceFrame` is `Copy` so
-            // this is a bitwise move, no alloc.
-            let outgoing: VoiceFrame = *frame;
-            tx.send_voice(*stream_id, *seq, outgoing).await?;
+            if tx_stream.is_some_and(|active| active == *stream_id) {
+                // Forward the frame verbatim. `VoiceFrame` is `Copy` so
+                // this is a bitwise move, no alloc.
+                let outgoing: VoiceFrame = *frame;
+                tx.send_voice(*stream_id, *seq, outgoing).await?;
+            }
         }
         Event::VoiceEnd { stream_id, .. } => {
             // If we had a matching header cached, emit an EOT on the
             // TX side. Seq on EOT is advisory — MMDVMHost uses 0 in
             // the common case, which the core codec accepts.
-            if let Some((sid, _)) = tx_header.take()
-                && sid == *stream_id
-            {
+            if *tx_stream == Some(*stream_id) {
                 tx.send_eot(*stream_id, 0).await?;
+                *tx_stream = None;
             }
         }
         _ => {}
@@ -180,7 +233,8 @@ async fn connect(
     let (n, src) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
         .await
         .map_err(|_| "handshake timeout")??;
-    connecting.handle_input(Instant::now(), src, &buf[..n])?;
+    let slice = buf.get(..n).unwrap_or(&[]);
+    connecting.handle_input(Instant::now(), src, slice)?;
     if connecting.state_kind() != ClientStateKind::Connected {
         return Err("handshake did not complete".into());
     }

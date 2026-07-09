@@ -171,7 +171,7 @@ impl Default for Tier1Config {
 /// Tier 2: XLX live monitoring configuration.
 ///
 /// Controls how many XLX reflectors are monitored concurrently via the UDP
-/// JSON monitor protocol (port 10001) and when idle monitors are disconnected.
+/// JSON monitor protocol (port 10001). Idle-pool eviction is reserved.
 #[derive(Debug, Deserialize)]
 pub(crate) struct Tier2Config {
     /// Maximum number of concurrent UDP JSON monitor connections.
@@ -180,7 +180,8 @@ pub(crate) struct Tier2Config {
     #[serde(default = "default_max_concurrent_monitors")]
     pub(crate) max_concurrent_monitors: usize,
 
-    /// Seconds of inactivity before disconnecting a Tier 2 monitor.
+    /// Reserved seconds-of-inactivity setting for future pool eviction.
+    /// The current monitor uses its fixed receive deadline instead.
     ///
     /// Default: `600` (10 minutes)
     #[serde(default = "default_tier2_idle_disconnect_secs")]
@@ -206,30 +207,28 @@ impl Default for Tier2Config {
 
 /// Tier 3: deep D-STAR protocol connection configuration.
 ///
-/// Controls how many reflectors are simultaneously connected at the D-STAR
-/// protocol level for voice capture, and the callsign used for `DPlus`
-/// authentication.
+/// Reserved settings for the not-yet-wired Tier 3 session pool.
 #[derive(Debug, Deserialize)]
 pub(crate) struct Tier3Config {
-    /// Maximum number of concurrent D-STAR protocol connections.
+    /// Reserved maximum number of concurrent D-STAR protocol connections.
     ///
     /// Default: `20`
     #[serde(default = "default_max_concurrent_connections")]
     pub(crate) max_concurrent_connections: usize,
 
-    /// Seconds of silence before disconnecting a Tier 3 session.
+    /// Reserved seconds of silence before disconnecting a Tier 3 session.
     ///
     /// Default: `300` (5 minutes)
     #[serde(default = "default_tier3_idle_disconnect_secs")]
     pub(crate) idle_disconnect_secs: u64,
 
-    /// Whether Tier 2 activity automatically promotes reflectors to Tier 3.
+    /// Reserved flag for automatic Tier 2-to-Tier 3 promotion.
     ///
     /// Default: `true`
     #[serde(default = "default_auto_promote")]
     pub(crate) auto_promote: bool,
 
-    /// Callsign used for `DPlus` authentication with `auth.dstargateway.org`.
+    /// Reserved callsign for `DPlus` authentication with `auth.dstargateway.org`.
     ///
     /// Must be a valid amateur radio callsign registered with the `DPlus`
     /// gateway trust system.

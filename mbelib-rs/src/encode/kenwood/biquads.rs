@@ -2,8 +2,8 @@
 //!
 //! Each bank is a cascade of biquads in direct-form-I with
 //! coefficient layout `[b0, b1, b2, a1, a2]` (standard DSP
-//! convention; the runner in [`crate::encode::kenwood::filter`]
-//! subtracts `a1·y[n-1]` and `a2·y[n-2]` from the new output).
+//! convention; the runner in the crate-private `encode::kenwood::filter`
+//! module subtracts `a1·y[n-1]` and `a2·y[n-2]` from the new output).
 //!
 //! Banks H, I, and J share a common 5-tap preamble
 //! `[0.98168, -1.96336, 0.98168, -1.96302, 0.96370]` that acts as a

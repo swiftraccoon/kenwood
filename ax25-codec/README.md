@@ -7,10 +7,10 @@ AX.25 v2.2 frame encode/decode. `no_std` + `alloc`, sans-io.
 - `Ax25Packet` — source, destination, up to 8 digipeaters, control field, PID, info payload.
 - `parse_ax25(&[u8]) -> Result<Ax25Packet, Ax25Error>` and `build_ax25(&Ax25Packet) -> Vec<u8>`.
 - `Ax25Control` classification: Information / Supervisory{RR, RNR, REJ, SREJ} / Unnumbered{UI, SABM, DISC, DM, UA, FRMR, XID, TEST, ...}.
-- `Ax25Pid` enum with 15 canonical values (NoLayer3, NetRom, Ip, Arp, Appletalk, TexNet, LinkQuality, FlexNet, ...).
-- `CommandResponse` classification per AX.25 v2.2 §4.3.1.2.
+- `Ax25Pid` enum with 14 canonical values (NoLayer3, NetRom, Ip, Arp, Appletalk, TexNet, LinkQuality, FlexNet, ...).
+- `CommandResponse` classification per AX.25 v2.2 §6.1.2.
 - `ax25_fcs(&[u8]) -> u16` CRC-16-CCITT.
-- Validated address types: `Ax25Address`, `Callsign` (1–6 ASCII upper/digit), `Ssid` (0–15).
+- Validated address types: `Ax25Address`, `Callsign` (1–6 ASCII upper/digit), `Ssid` (0–15), and `RouteEntry` (a digipeater hop: address + H-bit).
 
 This is the AX.25 layer only. KISS framing is in [`kiss-tnc`](../kiss-tnc/); APRS info-field parsing is in [`aprs`](../aprs/).
 

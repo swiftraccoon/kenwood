@@ -1,8 +1,7 @@
 # dstar-gateway
 
-[![CI](https://github.com/swiftraccoon/dstar-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/swiftraccoon/dstar-gateway/actions/workflows/ci.yml)
-[![docs.rs](https://docs.rs/dstar-gateway/badge.svg)](https://docs.rs/dstar-gateway)
-[![Book](https://img.shields.io/badge/book-mdbook-blue)](https://swiftraccoon.github.io/dstar-gateway/)
+[![CI](https://img.shields.io/github/actions/workflow/status/swiftraccoon/kenwood/ubuntu.yml?label=CI)](https://github.com/swiftraccoon/kenwood/actions)
+[![Docs](https://img.shields.io/badge/docs-github.io-blue)](https://swiftraccoon.github.io/kenwood/dstar_gateway/)
 [![License: GPL-2.0-or-later](https://img.shields.io/badge/License-GPL%20v2%2B-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
 
 Async Rust D-STAR reflector gateway library. Implements the **DPlus**,
@@ -12,17 +11,18 @@ structured diagnostics**, and **symmetric client + server** scope.
 
 ## Status
 
-**Alpha. Pre-0.1.0, unpublished.** The rewrite is feature-complete
-on the client side (`DPlus` + `DExtra` + DCS) but has not been
+**Version 0.1.0 alpha, unpublished.** The rewrite is feature-complete
+on both the client side (`DPlus` + `DExtra` + DCS) and the reflector
+server, which supports all three protocols (`DExtra`, `DPlus`, and
+DCS) with every protocol enabled by default. It has not yet been
 stress-tested against real reflectors for an extended period.
-The reflector server currently ships `DExtra` only; `DPlus` and DCS
-server support, cross-protocol forwarding, per-client rate
-limiting, and the `StreamCache` header retransmit wiring are all
-open deferred work.
+Cross-protocol forwarding, per-client rate limiting, and the
+`StreamCache` header retransmit are all wired; cross-protocol
+forwarding is off by default.
 
 This crate lives in the [kenwood monorepo](https://github.com/swiftraccoon/kenwood)
 and is not yet published to crates.io. Consume it via a path or
-git dependency until the first numbered release lands. See
+git dependency until the first published release lands. See
 [CHANGELOG.md](CHANGELOG.md) for the work-in-progress feature
 list.
 
@@ -31,8 +31,8 @@ list.
 | Crate | What it does |
 |-------|--------------|
 | [`dstar-gateway-core`](../dstar-gateway-core) | Sans-io codec + typestate `Session<P, S>` state machines. No tokio, no I/O. |
-| [`dstar-gateway`](.) (this crate) | Tokio `AsyncSession<P>` shell, `DPlus` TCP `AuthClient`, optional Pi-Star host-file fetcher. |
-| [`dstar-gateway-server`](../dstar-gateway-server) | Multi-client `Reflector` server (`DExtra` only today; `DPlus`/DCS deferred). |
+| [`dstar-gateway`](.) (this crate) | Tokio `AsyncSession<P>` shell, `DPlus` TCP `AuthClient`, optional XLX reflector-directory fetcher. |
+| [`dstar-gateway-server`](../dstar-gateway-server) | Multi-client `Reflector` server. Supports `DExtra`, `DPlus`, and DCS, all enabled by default. |
 
 ## Quickstart
 
@@ -66,13 +66,19 @@ let session: Session<DExtra, Configured> = Session::<DExtra, Configured>::builde
 
 // 3. Drive the handshake manually on the test thread.
 let mut connecting = session.connect(Instant::now())?;
-let tx = connecting.poll_transmit(Instant::now()).expect("LINK");
+let tx = connecting
+    .poll_transmit(Instant::now())
+    .ok_or("LINK not ready")?;
 sock.send_to(tx.payload, tx.dst).await?;
 
 let mut buf = [0u8; 64];
 let (n, peer) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
     .await??;
-connecting.handle_input(Instant::now(), peer, &buf[..n])?;
+connecting.handle_input(
+    Instant::now(),
+    peer,
+    buf.get(..n).ok_or("receive length exceeded buffer")?,
+)?;
 assert_eq!(connecting.state_kind(), ClientStateKind::Connected);
 let connected = connecting.promote()?;
 
@@ -96,29 +102,30 @@ session.disconnect().await?;
 # Ok(()) }
 ```
 
-For `DPlus` you additionally call
-[`AuthClient::authenticate`](src/auth/client.rs) before building the
-`Session<DPlus, Configured>`; `DCS` uses the same shape as `DExtra`.
+For `DPlus`, fetch a host list with
+[`AuthClient::authenticate`](src/auth/client.rs), build the configured
+session, and call `Session::authenticate` before `connect`; `DCS` uses
+the same shape as `DExtra`.
 
 See the `dstar-gateway/examples/` directory for standalone runnable
 versions of each.
 
 ## Features
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| `DPlus` client (REF, TCP auth) | Stable | `AuthClient` + `Session<DPlus, _>` |
-| `DExtra` client (XRF, XLX) | Stable | `Session<DExtra, _>` |
-| `DCS` client | Stable | `Session<Dcs, _>` — header caching handled by core |
-| `DExtra` reflector server | Stable | `dstar-gateway-server::Reflector` |
-| `DPlus` reflector server | Deferred | Core typestate exists; shell not wired |
-| `DCS` reflector server | Deferred | Core typestate exists; shell not wired |
+| Feature | State | Notes |
+|---------|-------|-------|
+| `DPlus` client (REF, TCP auth) | Implemented | `AuthClient` + `Session<DPlus, _>` |
+| `DExtra` client (XRF, XLX) | Implemented | `Session<DExtra, _>` |
+| `DCS` client | Implemented | `Session<Dcs, _>` — header caching handled by core |
+| `DExtra` reflector server | Implemented | `dstar-gateway-server::Reflector`, on by default |
+| `DPlus` reflector server | Implemented | `handle_inbound_dplus` endpoint, on by default |
+| `DCS` reflector server | Implemented | `handle_inbound_dcs` endpoint, on by default |
 | `blocking` feature | Optional | CLI-friendly variant of `AsyncSession` |
-| `hosts-fetcher` feature | Optional | Pulls `reqwest`; downloads Pi-Star host files |
-| Slow-data sub-codec | Stable | Short messages embedded in voice frames |
-| DPRS position reports | Stable | Decodes `$$CRC`-prefixed slow-data strings |
-| Lenient parsing | Stable | Structured `Diagnostic` via `DiagnosticSink` trait |
-| Property tests + fuzz | Stable | 10 fuzz targets, 75M executions, 0 crashes |
+| `hosts-fetcher` feature | Optional | Pulls `reqwest`; fetches the XLX reflector directory over HTTP |
+| Slow-data sub-codec | Implemented | Short messages embedded in voice frames |
+| DPRS position reports | Implemented | Decodes `$$CRC`-prefixed slow-data strings |
+| Lenient parsing | Implemented | Structured `Diagnostic` via `DiagnosticSink` trait |
+| Property tests + fuzz | Testing | 10 fuzz targets plus property and loopback tests |
 
 ## Feature flags
 
@@ -127,15 +134,21 @@ versions of each.
 dstar-gateway = { path = "../dstar-gateway", features = ["hosts-fetcher"] }
 ```
 
-- `blocking` — compile a non-tokio blocking shell for CLI scripts and
-  test fixtures.
-- `hosts-fetcher` — pulls `reqwest`; downloads the Pi-Star
-  `DPlus_Hosts.txt`, `DExtra_Hosts.txt`, and `DCS_Hosts.txt` files.
+- `blocking` — compile a caller-driven synchronous shell backed by
+  `std::net::UdpSocket`. Callers do not run a Tokio runtime, although
+  Tokio remains an unconditional dependency of this async client crate.
+- `hosts-fetcher` — pulls `reqwest`; fetches the XLX reflector
+  directory from `http://xlxapi.rlx.lu/api.php?do=GetReflectorHostname`
+  via `HostsFetcher::fetch_xlx_directory`, returning protocol-tagged
+  host entries.
+- `examples-network` — compile examples that contact live network services.
+- `hardware-tests` — compile ignored live-reflector integration tests.
+  These last two flags are for examples/tests rather than downstream APIs.
 
 ## Documentation
 
-- [API reference on docs.rs](https://docs.rs/dstar-gateway)
-- [The dstar-gateway Book (mdBook)](https://swiftraccoon.github.io/dstar-gateway/)
+- [API reference](https://swiftraccoon.github.io/kenwood/dstar_gateway/)
+- [`book/`](book/) — mdBook source; currently covers the introduction and Getting Started. Build with `mdbook serve book`
 - [ARCHITECTURE.md](ARCHITECTURE.md) — 5000-foot design overview
 - [REFERENCES.md](REFERENCES.md) — line-numbered references into
   `ircDDBGateway` and `xlxd`

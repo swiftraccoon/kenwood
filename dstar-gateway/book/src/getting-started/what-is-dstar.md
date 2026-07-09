@@ -76,16 +76,17 @@ When a client "links" to a reflector, it sends a **LINK** packet
 to the reflector's well-known port. The reflector either
 acknowledges the link (ACK/OKRW) or rejects it (NAK/BUSY). Once
 linked, the client and reflector exchange **keepalive** packets
-at a protocol-specific cadence (1 second for DPlus, 1 second for
-DExtra, 1 second for DCS) and the client sends voice frames
+at a protocol-specific cadence (1 second for DPlus, 10 seconds for
+DExtra, 5 seconds for DCS) and the client sends voice frames
 whenever the local operator keys up.
 
 Disconnection happens by sending an **UNLINK** packet and
 optionally waiting for the reflector's ACK. Most real-world
 clients don't wait — they send UNLINK and drop the socket.
-`dstar-gateway` supports both patterns: `AsyncSession::disconnect`
-sends UNLINK and awaits the ACK, while `Drop` on the session
-just severs the connection.
+`AsyncSession::disconnect` queues UNLINK and returns when the session
+loop acknowledges the request. Callers that need the protocol outcome
+continue reading until `Event::Disconnected`; dropping the handle just
+severs the local connection.
 
 ## Voice, headers, and streams
 
@@ -95,8 +96,8 @@ A **voice transmission** in D-STAR has three parts:
    destination (usually `CQCQCQ`), and the routing info.
 2. A series of **voice frames**, each carrying 20 ms of AMBE-
    encoded audio plus a sync pattern and optional slow-data.
-   DPlus/DExtra frames are 29 bytes; DCS frames are 100 bytes
-   including an embedded copy of the header.
+   DExtra frames are 27 bytes, DPlus frames 29 bytes; DCS frames
+   are 100 bytes including an embedded copy of the header.
 3. An **end-of-transmission** marker, which is a voice frame
    with a special `End` byte set.
 

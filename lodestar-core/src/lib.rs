@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
 //! Lodestar core — Rust library powering the Lodestar native macOS and
-//! iOS/iPadOS D-STAR gateway app for the Kenwood TH-D75.
+//! iPadOS D-STAR gateway app for the Kenwood TH-D75.
 //!
 //! Surfaces to Swift via `UniFFI`:
 //!
@@ -24,6 +24,9 @@
 //!   [`session::ReflectorObserver`] callback trait Swift implements to
 //!   receive voice events, slow-data text updates, and parsed GPS
 //!   positions.
+//! - Logging bridge — [`init_tracing`] installs a `tracing` subscriber that
+//!   forwards each event to a Swift-implemented [`LogSink`] (tagged with
+//!   [`LogLevel`]) for the in-app Log Viewer and Apple's Unified Log.
 
 pub mod audio;
 pub mod cat;

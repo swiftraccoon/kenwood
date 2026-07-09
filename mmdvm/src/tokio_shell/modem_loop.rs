@@ -3,7 +3,8 @@
 // See LICENSE for full attribution.
 
 //! Tokio event loop driving a sans-io MMDVM codec over any
-//! [`AsyncRead`]+[`AsyncWrite`] transport.
+//! [`AsyncRead`](tokio::io::AsyncRead)+[`AsyncWrite`](tokio::io::AsyncWrite)
+//! transport.
 //!
 //! Lifecycle:
 //! 1. Send `GetVersion` + `GetStatus` immediately to learn the

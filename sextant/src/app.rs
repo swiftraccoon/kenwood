@@ -3,15 +3,21 @@
 
 //! egui front-end.
 //!
-//! Single-window layout:
+//! Two-page layout, switched by a toggle in the header (`ui::Page`):
 //!
-//! - Settings panel (left): callsign, reflector host:port, protocol,
-//!   local / remote module letters.
-//! - Connection bar: Connect / Disconnect button + status indicator.
-//! - Transmit section: big PTT toggle (click to start TX, click again
-//!   to stop and send EOT). Optional "TX silence (2 s)" button for
-//!   sanity-checking the protocol path without the mic.
-//! - Event log: append-only list of recent session events.
+//! - Operator page: the everyday face. A central "deck" carries the
+//!   hero (who's transmitting now), the heard list, and link
+//!   readouts, with a bottom transmit strip (`tx_strip`) holding the
+//!   PTT toggle, mic meter, and slow-data / GPS-beacon controls.
+//! - Debug page: the engineering surface — the append-only event log
+//!   plus stream-stats, TX, and audio tools.
+//!
+//! Overlays (`ui::Overlay`, at most one open at a time) draw above
+//! whichever page is showing: the connect sheet (searchable reflector
+//! directory + manual host form) and the gear settings popup —
+//! callsign, behaviour toggles, and audio devices, in
+//! `ui::settings_popup`. A dismissable error strip sits under the
+//! header on both pages.
 
 use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
@@ -140,7 +146,8 @@ pub(crate) struct App {
 /// One line in the event log.
 #[derive(Debug, Clone)]
 pub(crate) struct LogLine {
-    /// UTC wall-clock stamp (`HH:MM:SS`) captured at append time.
+    /// Wall-clock stamp (`HH:MM:SS`) captured at append time, rendered in
+    /// the operator's display timezone (see [`App::display_offset`]).
     pub(crate) stamp: String,
     pub(crate) level: LogLevel,
     pub(crate) text: String,

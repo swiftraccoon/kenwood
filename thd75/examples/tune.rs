@@ -55,20 +55,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Parse --freq or --channel (one required).
-    let freq_hz: Option<u64> = args
+    let freq_hz: Option<u32> = args
         .iter()
         .position(|a| a == "--freq")
         .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse().ok());
+        .map(|s| s.parse())
+        .transpose()?;
 
     let channel_num: Option<u16> = args
         .iter()
         .position(|a| a == "--channel")
         .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse().ok());
+        .map(|s| s.parse())
+        .transpose()?;
 
-    if freq_hz.is_none() && channel_num.is_none() {
-        eprintln!("Specify --freq <hz> or --channel <num>");
+    if freq_hz.is_some() == channel_num.is_some() {
+        eprintln!("Specify exactly one of --freq <hz> or --channel <num>");
         std::process::exit(1);
     }
 
@@ -87,14 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected to: {}", info.model);
 
     if let Some(hz) = freq_hz {
-        // Frequency::new takes u32; truncate for safety.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "CLI example: `hz` is parsed from the user's argv as u64 for flexibility, \
-                      but the D75 tunes below 1.3 GHz — well within u32. The cast cannot \
-                      truncate for any on-band value."
-        )]
-        let freq = Frequency::new(hz as u32);
+        let freq = Frequency::new(hz);
         println!("Tuning band {band} to {freq}...");
         radio.tune_frequency(band, freq).await?;
         println!("Done.");

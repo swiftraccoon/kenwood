@@ -5,19 +5,23 @@
 //! write every incoming datagram to `session.bin` for offline replay.
 //! The file format is intentionally minimal — each record is a big-
 //! endian 4-byte length followed by exactly that many bytes. The
-//! conformance harness already supports a compatible shape via
-//! `replay_pcap_file`, so the output can be fed back into the test
-//! corpus with only a small adapter.
+//! conformance harness consumes pcap rather than this format, so the
+//! output is not directly replayable: an adapter must wrap each record
+//! in link/IP/UDP and pcap framing first.
 //!
 //! The capture runs for 60 seconds and then disconnects cleanly.
 //!
 //! Gated behind the `examples-network` feature.
 //!
 //! ```text
-//! REFLECTOR_HOST=xrf030.example.com:30001 OUTPUT=/tmp/session.bin \
+//! DSTAR_CALLSIGN=N0CALL REFLECTOR_HOST=xrf030.example.com:30001 \
+//! OUTPUT=/tmp/session.bin \
 //!     cargo run -p dstar-gateway --example 10_record_session_to_file \
 //!     --features examples-network
 //! ```
+
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
 
 use std::env;
 use std::fs::File;
@@ -32,15 +36,19 @@ use dstar_gateway_core::types::{Callsign, Module};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
-// Acknowledged workspace dev-deps.
+// Acknowledged workspace dev-deps. This example taps the raw UDP
+// socket and drives the sans-io core directly, so the async shell
+// crate itself is acknowledged rather than used.
+use dstar_gateway as _;
 use pcap_parser as _;
+use thiserror as _;
 use trybuild as _;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let callsign = Callsign::try_from_str("W1AW")?;
+    let callsign = Callsign::try_from_str(&env::var("DSTAR_CALLSIGN")?)?;
     let reflector_host =
         env::var("REFLECTOR_HOST").unwrap_or_else(|_| "xrf030.example.com:30001".to_string());
     let output: PathBuf = env::var("OUTPUT")
@@ -82,8 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (n, src) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
         .await
         .map_err(|_| "handshake timeout")??;
-    write_record(&mut writer, &buf[..n])?;
-    connecting.handle_input(Instant::now(), src, &buf[..n])?;
+    let slice = buf.get(..n).unwrap_or(&[]);
+    write_record(&mut writer, slice)?;
+    connecting.handle_input(Instant::now(), src, slice)?;
     if connecting.state_kind() != ClientStateKind::Connected {
         eprintln!("handshake did not complete");
         return Ok(());
@@ -109,8 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let recv_fut = sock.recv_from(&mut buf);
         match timeout(Duration::from_millis(250), recv_fut).await {
             Ok(Ok((n, src))) => {
-                write_record(&mut writer, &buf[..n])?;
-                connected.handle_input(Instant::now(), src, &buf[..n])?;
+                let slice = buf.get(..n).unwrap_or(&[]);
+                write_record(&mut writer, slice)?;
+                connected.handle_input(Instant::now(), src, slice)?;
             }
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => {
@@ -144,9 +154,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Write one length-prefixed record: 4-byte BE length followed by
-/// `bytes`. Matches the format expected by the conformance replay
-/// harness (modulo a thin adapter that wraps each record in pcap
-/// framing if needed).
+/// `bytes`. Convert the records to link/IP/UDP packets inside a pcap
+/// container before passing them to the conformance replay harness.
 fn write_record<W: Write>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()> {
     let len = u32::try_from(bytes.len()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "record too large for u32")

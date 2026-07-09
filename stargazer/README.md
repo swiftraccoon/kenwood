@@ -1,9 +1,10 @@
 # stargazer
 
-D-STAR network observatory — Kubernetes-deployed service that discovers
-reflectors, monitors real-time activity, captures voice transmissions
-with metadata, decodes AMBE audio to MP3, and uploads to an existing
-SDRTrunk-compatible Rdio API server for transcription.
+Experimental D-STAR network observatory. The running service discovers
+reflectors, monitors XLX activity, stores operational data in Postgres,
+serves an HTTP API, and processes queued Rdio uploads. Voice-capture,
+AMBE-to-MP3, and stream-finalization components are implemented and tested,
+but the Tier 3 session orchestrator does not yet feed them live traffic.
 
 ## What this is
 
@@ -13,14 +14,15 @@ layer. XLX reflectors expose a UDP JSON push feed on port 10001;
 REF/DCS reflectors expose nothing. Operator dashboards scrape HTML
 per-reflector. There is no cross-network visibility layer.
 
-`stargazer` builds that layer. It runs as a headless service, polls
+`stargazer` is building that layer. It runs as a headless service, polls
 multiple public data sources for reflector discovery, maintains live
-XLX JSON monitor subscriptions to active reflectors, establishes deep
-D-STAR protocol connections for voice capture, decodes AMBE to MP3 via
-the sibling [`mbelib-rs`](../mbelib-rs/) crate, and uploads completed
-transmissions to a Rdio API server (the
+XLX JSON monitor subscriptions to active reflectors, and exposes the stored
+activity through Postgres and HTTP. Separate components decode AMBE to MP3
+via the sibling [`mbelib-rs`](../mbelib-rs/) crate and upload completed
+database rows to a Rdio API server (the
 [`sdrtrunk-rdio-api`](https://github.com/swiftraccoon/sdrtrunk-rdio-api)
-transcription pipeline) using the same wire format as SDRTrunk.
+transcription pipeline) using the same wire format as SDRTrunk. Live
+D-STAR sessions are not yet connected to that capture/upload path.
 
 ## Architecture: three-tier monitoring
 
@@ -50,16 +52,17 @@ real-time JSON events:
 ```
 
 Stargazer maintains up to `max_concurrent_monitors` (default 100) of
-these connections, driven by Tier 1 activity signals. No authentication,
-no client slot consumed on the reflector — it is a first-class public
-interface documented in the xlxd README.
+these connections, selected from recent Tier 1 activity. No D-STAR
+authentication or voice-protocol client slot is used; UDP port 10001 is
+listed as xlxd's JSON interface in the upstream README. A monitor that
+misses the implementation's 30-second receive deadline is dropped and may
+be selected again on a later refresh.
 
-### Tier 3 — Deep connect & voice capture (D-STAR protocol)
+### Tier 3 — Deep connect & voice capture (not yet orchestrated)
 
-For reflectors of interest, stargazer establishes a full D-STAR
-protocol connection (DPlus/DExtra/DCS) via the
-[`dstar-gateway`](../dstar-gateway/) crate's `AsyncSession<P>` and
-captures voice streams:
+The planned Tier 3 path establishes full D-STAR protocol connections
+(DPlus/DExtra/DCS) via the [`dstar-gateway`](../dstar-gateway/) crate's
+`AsyncSession<P>` and feeds voice events through:
 
 ```
 AsyncSession<P> → VoiceStart (header) → VoiceFrame × N → VoiceEnd
@@ -76,6 +79,10 @@ AsyncSession<P> → VoiceStart (header) → VoiceFrame × N → VoiceEnd
 Per-stream record: reflector, module, protocol, stream_id, callsign,
 suffix, ur_call, D-STAR text (20-char message), DPRS lat/lon (if
 present), started_at, ended_at, frame_count, encoded MP3 bytes.
+
+The decoder, capture manager, stream finalizer, schema, and upload worker
+exist. `tier3::run` currently logs its configuration and waits forever;
+it does not create `AsyncSession` instances or persist captures.
 
 ## Rdio API upload (SDRTrunk-compatible)
 
@@ -110,7 +117,7 @@ Lightweight operational endpoints — **not** the primary data consumer
 | `GET /api/reflectors/{callsign}/nodes` | Connected nodes per reflector |
 | `GET /api/activity` | Global recent activity |
 | `GET /api/streams` | Query captured streams (`?since=1h&reflector=REF030`) |
-| `GET /api/upload-queue` | Pending/failed uploads |
+| `GET /api/upload-queue` | Pending uploads (failed streams are terminal — see `/api/streams`) |
 | `POST /api/tier3/connect` | Manually promote reflector to Tier 3 (501 stub) |
 | `DELETE /api/tier3/{callsign}/{module}` | Disconnect Tier 3 session (501 stub) |
 
@@ -136,14 +143,14 @@ ircddb = 60           # ircDDB scrape interval (seconds)
 
 [tier2]
 max_concurrent_monitors = 100
-idle_disconnect_secs = 600
+idle_disconnect_secs = 600  # reserved; not yet applied by the pool
 activity_threshold_secs = 1800
 
 [tier3]
-max_concurrent_connections = 20
-idle_disconnect_secs = 300
-auto_promote = true
-dplus_callsign = "N0CALL"
+max_concurrent_connections = 20  # reserved until Tier 3 is wired
+idle_disconnect_secs = 300       # reserved until Tier 3 is wired
+auto_promote = true              # reserved until Tier 3 is wired
+dplus_callsign = "N0CALL"        # reserved until Tier 3 is wired
 
 [audio]
 format = "mp3"
@@ -160,9 +167,10 @@ Environment overrides: `STARGAZER_POSTGRES_URL`, `STARGAZER_RDIO_ENDPOINT`,
 ## Storage: Postgres as the durable spool
 
 Postgres serves double duty as both the discovery registry and the
-upload queue. Streams captured during a Rdio API outage are persisted
-with `upload_status = 'pending'` and drained when the API recovers.
-Pod restarts do not lose captures — no PersistentVolume is needed.
+upload queue. Once Tier 3 writes completed streams, rows left with
+`upload_status = 'pending'` during a Rdio API outage are drained when
+the API recovers. Durable rows survive pod restarts without a separate
+audio PersistentVolume.
 
 Four tables: `reflectors`, `activity_log`, `connected_nodes`,
 `streams`. Schema is embedded in the binary and applied idempotently
@@ -171,18 +179,20 @@ on startup.
 ## Legal & community notes
 
 - **License:** GPL-2.0-or-later
-- **Monitoring legality:** Amateur radio transmissions are "readily
-  accessible to the general public" under 18 USC 2511, so monitoring
-  and recording them is legal in the US. Callsigns are public records
-  (FCC ULS, QRZ.com, etc.). Every XLX reflector already publishes
-  last-heard callsigns on its web dashboard.
-- **Port 10001 is a documented public interface** in the xlxd README,
-  intended for external consumption. However, the xlxd JSON monitor
-  is single-client per reflector — stargazer claims the feed.
+- **Law and policy:** US federal law contains amateur-radio interception
+  exceptions in [18 USC 2511(g)](https://uscode.house.gov/view.xhtml?req=%28title%3A18+section%3A2511%29)
+  and [47 USC 605](https://uscode.house.gov/view.xhtml?edition=prelim&num=0&req=granuleid%3AUSC-prelim-title47-section605).
+  Those provisions are not a blanket conclusion about recording,
+  republication, transcription, privacy, or laws outside the US. Operators
+  are responsible for applicable law and reflector/service policies.
+- **Port 10001** is listed as the JSON interface in the
+  [xlxd README](https://github.com/LX3JL/xlxd#firewall-settings). Confirm
+  the reflector operator's policy and capacity before monitoring it.
 
 ## Status
 
-Alpha. The pipeline is implemented end-to-end with 66 tests. The Tier
-3 session-pool orchestrator is a stub pending follow-up work — the
-decode-and-upload path (including CaptureManager, decoder, Rdio API
-client) is complete and tested.
+Alpha. Tier 1 discovery, Tier 2 XLX monitoring, persistence, operational
+HTTP reads, and the upload worker are implemented. Tier 3 is not end to
+end: its capture manager, decoder, finalizer, and Rdio client are tested in
+isolation, but session-pool orchestration and the manual Tier 3 API remain
+stubs.

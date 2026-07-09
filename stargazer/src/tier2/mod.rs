@@ -4,17 +4,17 @@
 //! receiving real-time push notifications about connected nodes, heard stations,
 //! and on-air/off-air events.
 //!
-//! The monitor pool is activity-driven:
+//! The current monitor pool is eligibility-driven:
 //!
 //! - Reflectors detected as active by Tier 1 are connected (up to the
 //!   configured maximum).
-//! - Reflectors idle beyond the configured threshold are disconnected to free
-//!   slots.
 //! - Newly active reflectors are connected as Tier 1 detects them.
+//! - A monitor ends after its 30-second receive deadline and may be selected
+//!   again on a later refresh. Configured idle-pool eviction is not yet wired.
 //!
 //! Events are written to the `activity_log` and `connected_nodes` `PostgreSQL`
-//! tables, and on-air events can trigger Tier 3 auto-promotion for voice
-//! capture.
+//! tables. On-air events are the planned Tier 3 promotion trigger; today they
+//! are logged only.
 
 mod monitor;
 mod protocol;

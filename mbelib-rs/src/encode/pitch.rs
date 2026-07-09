@@ -15,12 +15,16 @@
 //     below 0.48 (Q4.12).
 //
 // Look-AHEAD pitch tracking + sub-multiples analysis
-// (pitch_est.cc:229–332) is deferred: they need a 2-frame lookahead
-// buffer (40 ms added latency), which is a caller-visible change and
-// is tracked as its own piece of work. When look-back's confidence
-// threshold isn't met, this module falls back to a single-frame
-// global minimum over the E(p) array — better than autocorrelation
-// + YIN on formant-rich speech, worse than full OP25.
+// (pitch_est.cc:229–332) is implemented in `estimate_with_lookahead`:
+// single-frame look-back + 2-frame look-ahead DP + sub-multiples,
+// selecting look-back vs look-ahead by cumulative-error score. It
+// needs a 2-frame lookahead buffer (40 ms added latency), so callers
+// buffer two frames of E(p) output before invoking it. The
+// zero-latency `estimate` entry point uses only look-back and, when
+// look-back's confidence threshold isn't met, falls back to a
+// single-frame global minimum over the E(p) array — better than
+// autocorrelation + YIN on formant-rich speech, worse than the full
+// look-ahead DP.
 //
 // Q-format constants are carried from OP25's `globals.h` verbatim so
 // threshold comparisons map directly across the port. The fixed-point
@@ -49,7 +53,8 @@
 //!    stays below `CNST_0_48_Q4_12`, commit that as the new pitch.
 //! 5. Otherwise fall back to the global minimum of `E` across all
 //!    203 candidates. (This is the single-frame approximation of
-//!    OP25's look-ahead DP; the full DP is a follow-on port.)
+//!    OP25's look-ahead DP; the full DP is available via
+//!    [`PitchTracker::estimate_with_lookahead`].)
 //!
 //! The AMBE codebooks quantize F0 via the `W0_TABLE` in
 //! [`crate::tables`]; [`PitchEstimate::period_samples`] is the
@@ -254,14 +259,17 @@ impl PitchTracker {
         let mut chosen_idx = if ceb <= CEB_THRESHOLD {
             pb
         } else {
-            // --- Fallback: global E(p) minimum (deferred DP stand-in) ---
+            // --- Fallback: global E(p) minimum (look-back-only path) ---
             //
-            // OP25 runs a 2-frame look-ahead DP here (pitch_est.cc:229).
-            // Without that lookahead, a single-frame global argmin is
-            // the best we can do without inventing data — it matches
-            // OP25 exactly whenever the true pitch already sits at the
-            // global minimum (stable voiced speech), and falls back
-            // gracefully to the best-scored candidate otherwise.
+            // OP25 runs a 2-frame look-ahead DP here (pitch_est.cc:229);
+            // this single-frame `estimate()` path forgoes that look-ahead
+            // DP, which [`Self::estimate_with_lookahead`] provides when
+            // callers can buffer future frames. Without the lookahead, a
+            // single-frame global argmin is the best we can do without
+            // inventing data — it matches OP25 exactly whenever the true
+            // pitch already sits at the global minimum (stable voiced
+            // speech), and falls back gracefully to the best-scored
+            // candidate otherwise.
             let mut best_idx = 0;
             let mut best_e = e_p.first().copied().unwrap_or(1.0);
             for (idx, &val) in e_p.iter().enumerate().skip(1) {
@@ -693,8 +701,9 @@ mod tests {
     /// trivially also periodic at 2P, 3P, ...), so this test only
     /// asserts "within 3 samples of the true period OR within 3
     /// samples of 2× the true period" — the remaining octave
-    /// ambiguity is exactly what the deferred 2-frame look-ahead DP
-    /// resolves.
+    /// ambiguity is exactly what the 2-frame look-ahead DP in
+    /// [`PitchTracker::estimate_with_lookahead`] resolves (this
+    /// look-back-only `estimate` path forgoes it).
     #[test]
     fn sine_at_150hz_lands_on_valid_octave() {
         let mut buf = [0.0_f32; PITCH_EST_BUF_SIZE];

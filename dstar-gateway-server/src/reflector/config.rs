@@ -3,8 +3,8 @@
 //! The configuration uses a typestate builder (mirroring
 //! `SessionBuilder` in `dstar-gateway-core`) so required fields
 //! (`callsign`, `modules`, `bind`) are enforced at compile time. All
-//! other fields have sensible defaults drawn from the rewrite
-//! design spec Section 8.
+//! other fields carry sensible defaults documented on each builder
+//! method.
 
 use std::collections::HashSet;
 use std::marker::PhantomData;

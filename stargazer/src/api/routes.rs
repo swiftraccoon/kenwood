@@ -536,7 +536,7 @@ pub(crate) async fn list_streams(
     Ok(Json(rows.into_iter().map(StreamView::from).collect()))
 }
 
-/// `GET /api/upload-queue` — pending and failed uploads.
+/// `GET /api/upload-queue` — pending uploads.
 ///
 /// Returns streams currently awaiting upload, ordered oldest-first (FIFO
 /// matches the upload processor's drain order). Failed streams are not

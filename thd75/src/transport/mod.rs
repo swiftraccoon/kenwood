@@ -24,15 +24,15 @@
 //! - USB Mass Storage: Menu No. 980 (Windows only for mass storage feature)
 //!
 //! Implementations:
-//! - [`SerialTransport`] — USB serial connections (and BT via `/dev/cu.*`)
+//! - [`SerialTransport`] — USB serial connections, plus serial RFCOMM on
+//!   Linux and Windows
 //! - [`BluetoothTransport`] — Native macOS `IOBluetooth` RFCOMM (macOS only)
 //! - [`MockTransport`] — Programmed exchanges for testing
 //!
-//! On macOS, prefer [`BluetoothTransport`] over [`SerialTransport`] for BT
-//! connections. The macOS serial port driver has a bug where closing and
-//! reopening `/dev/cu.TH-D75` kills the RFCOMM channel permanently.
-//! [`BluetoothTransport`] talks directly to the RFCOMM channel via
-//! `IOBluetooth` and can be closed and reopened without issues.
+//! On macOS, use [`BluetoothTransport`] for Bluetooth connections. Apple's
+//! Bluetooth serial driver drops data for this radio, and closing and
+//! reopening `/dev/cu.TH-D75` can also kill the RFCOMM channel permanently.
+//! [`BluetoothTransport`] bypasses that driver and talks directly to RFCOMM.
 
 #[cfg(any(target_os = "macos", doc))]
 pub mod bluetooth;

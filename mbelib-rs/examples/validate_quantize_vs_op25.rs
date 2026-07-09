@@ -3,8 +3,8 @@
 // Strict-validation harness for the encoder's `quantize` stage.
 //
 // Feeds OP25's reference `encode_ambe` intermediate values into our
-// Rust `quantize()` function and verifies the emitted `b[0..8]`
-// matches OP25's for every frame.  Any divergence pinpoints exactly
+// Rust `quantize()` function and reports how the emitted `b[0..8]`
+// compares with OP25's for every frame. Any divergence helps pinpoint
 // which codebook search / DCT / interpolation step in our pipeline
 // differs from the reference — without any confounding from stages
 // 1–4 (PCM → spectral analysis), which use different algorithms.

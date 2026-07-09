@@ -72,12 +72,16 @@
 //! - Computes `BigGamma` (global gain normalization) and final `log2_ml`
 //! - Exponentiates to get linear magnitudes ml, with an unvoiced scaling factor
 //!
-//! # Status Codes
+//! # Frame Status
 //!
-//! The function returns a status code matching the C reference:
-//! - `0` = valid voice frame, parameters fully populated
-//! - `2` = erasure frame (b0 in 120..=123), unrecoverable
-//! - `3` = tone signal detected (b0 in 126..=127)
+//! Where the C reference returns an integer status code, `decode_params`
+//! returns a `FrameStatus`:
+//! - `Voice` — valid speech frame, parameters fully populated
+//! - `Erasure` — erasure frame (b0 in 120..=123), unrecoverable
+//! - `Tone { index, volume }` — tone signal (b0 in 126..=127)
+//!
+//! Erasure and tone frames return early without modifying `cur`, leaving
+//! the caller to silence, reset, or synthesize.
 //!
 //! [`W0_TABLE`]: crate::tables::W0_TABLE
 //! [`L_TABLE`]: crate::tables::L_TABLE
@@ -86,6 +90,8 @@
 //! [`PRBA24_TABLE`]: crate::tables::PRBA24_TABLE
 //! [`PRBA58_TABLE`]: crate::tables::PRBA58_TABLE
 //! [`HOC_B5_TABLE`]: crate::tables::HOC_B5_TABLE
+//! [`HOC_B6_TABLE`]: crate::tables::HOC_B6_TABLE
+//! [`HOC_B7_TABLE`]: crate::tables::HOC_B7_TABLE
 //! [`HOC_B8_TABLE`]: crate::tables::HOC_B8_TABLE
 //! [`MbeParams`]: crate::params::MbeParams
 
@@ -460,7 +466,7 @@ fn lookup_ji(big_l: usize) -> [usize; IDCT_BLOCKS + 1] {
 
 /// Inverse DCT per block: Cik -> Tl (per-band spectral offsets).
 ///
-/// Each of 4 blocks produces Ji[i] values; concatenated they give Tl[1..L].
+/// Each of 4 blocks produces `Ji[i]` values; concatenated they give `Tl[1..L]`.
 ///
 /// For each fixed `(i, j)` the inner cosines are linear in `k`:
 /// `angle = step_j * (k - 1)` with `step_j = pi * (j - 0.5) / ji_val`.

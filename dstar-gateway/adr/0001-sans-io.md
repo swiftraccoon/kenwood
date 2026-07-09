@@ -45,10 +45,11 @@ in from the caller. Every codec function and every state-machine
 step is a pure function from `(current state, input bytes, now)`
 to `(new state, output bytes, events)`.
 
-The tokio shell lives in a separate crate `dstar-gateway` that
+The client tokio shell lives in a separate crate `dstar-gateway` that
 depends on `dstar-gateway-core`. The shell owns the `UdpSocket`,
 the `tokio::select!` driver loop, and the command/event channels.
-It is the only crate in the workspace that depends on tokio.
+Runtime-facing client and server crates may depend on tokio; the core
+does not.
 
 ## Consequences
 

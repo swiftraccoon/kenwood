@@ -8,7 +8,7 @@
 
 A D-STAR reflector client session goes through a well-defined set
 of states. For DExtra and DCS:
-`Configured → Connecting → Connected → Disconnecting → Disconnected`.
+`Configured → Connecting → Connected → Disconnecting → Closed`.
 For DPlus, there is an additional `Authenticated` state between
 `Configured` and `Connecting` because DPlus requires a TCP auth
 step before the UDP LINK can begin.

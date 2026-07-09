@@ -35,8 +35,10 @@ they share the same `dstar-gateway-core` crate for the wire format.
 
 - Client sessions use `Session<P, S>` with client state markers:
   `Configured`, `Authenticated`, `Connecting`, `Connected`, etc.
-- Server sessions use `ServerSessionCore<P>` with server state
-  markers: `Listening`, `Linked`, `Disconnecting`, etc.
+- Server sessions use the `ServerSession<P, S>` typestate (backed
+  by the non-generic `ServerSessionCore`) with server state markers:
+  `Unknown`, `Link1Received`, `Linked`, `Streaming`, `Unlinking`,
+  and `Closed`.
 - **Both** consume the same `codec::<protocol>::encode_*` /
   `parse_*` functions. An encoder bug fix lands once and benefits
   both sides.
@@ -57,29 +59,30 @@ drop `ClientPool`, `Reflector`, and fan-out code entirely).
   against each other in a single tokio test, using the real codec
   on both sides. This catches interop bugs that only surface when
   the encoder and decoder agree about a non-standard field.
-- **Single reference for cross-protocol forwarding.** A future
-  feature where a reflector bridges two protocols (e.g. DExtra
+- **Single reference for cross-protocol forwarding.** The implemented
+  optional forwarding path can bridge two protocols (e.g. DExtra
   module A to DCS module A) can use a `codec::dextra::parse` →
   `codec::dcs::encode` pipeline, all inside the same crate.
 
 ### Negative
 
-- **Dependency scope.** The `dstar-gateway-server` crate pulls in
-  the client's tokio shell as well. Consumers who only want the
-  server cannot avoid the client types. We mitigate this by
-  keeping the server crate focused on the `Reflector` and
-  `ClientPool` abstractions and by letting the shared codec types
-  be re-exported.
+- **Dependency scope.** Server consumers still pay for tokio and the
+  reflector shell, but not for the client shell: the server depends
+  directly on `dstar-gateway-core`. Consumers import shared core types
+  explicitly because the server crate does not re-export them.
 - **Larger test surface.** Every wire-format test now has to
   verify both the encoder and the decoder round-trip. We use
   property tests (`proptest::roundtrip!`) to make this cheap.
-- **API shape divergence.** Client sessions use `Session<P, S>`
-  but server sessions use `ServerSessionCore<P>` without the
-  typestate. The reason: a server typestate would need to
-  parameterize over every client attached to the reflector, which
-  is a dependent-type problem that Rust's type system does not
-  directly support. The server uses a runtime state enum instead,
-  with the safety loss scoped to the server crate.
+- **Parallel but distinct typestates.** Client sessions use
+  `Session<P, S>` and server sessions use `ServerSession<P, S>`,
+  backed by the non-generic `ServerSessionCore`. The two state sets
+  differ — the server side adds `Link1Received`, `Streaming`, and
+  `Unlinking` markers for the reflector's inbound handshake — so the
+  typestate machinery is written twice rather than shared. Methods
+  stay state-gated on both sides: `handle_voice_data` is only on
+  `ServerSession<P, Streaming>`, `handle_link2` on
+  `ServerSession<DPlus, Link1Received>`, and `handle_unlink` on
+  `ServerSession<P, Linked>`, each guarded by compile-fail tests.
 
 ## Alternatives considered
 
@@ -97,6 +100,6 @@ drop `ClientPool`, `Reflector`, and fan-out code entirely).
 ## References
 
 - `dstar-gateway-core/src/session/server/` — server-side
-  typestate + `ServerSessionCore<P>` state machine.
+  typestate + `ServerSessionCore` state machine.
 - `dstar-gateway-server/src/` — tokio shell, reflector top-level
   type, fan-out engine, cross-protocol transcode.

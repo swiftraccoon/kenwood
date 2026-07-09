@@ -7,7 +7,7 @@
 //!
 //! Port of OP25's `imbe_vocoder::v_uv_det`. For each harmonic in the
 //! `±f0/2` analysis window, fit a weighted sinusoid via the spectral
-//! response window [`WR_SP`](crate::encode::wr_sp::WR_SP), then decide
+//! response window [`WR_SP`], then decide
 //! voicing per band from the reconstruction-error-to-energy ratio
 //! `Dk = D_num / D_den`. Bands group 3 adjacent harmonics except the
 //! final band which takes the remainder.

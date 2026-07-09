@@ -38,35 +38,35 @@ report it.
 
 ## Decision
 
-The codec parses **leniently** by default but **emits structured
+The codec parses **leniently** by default but **records structured
 diagnostics** for every deviation. The two ideas are combined in
 the `DiagnosticSink` trait:
 
 ```rust
 pub trait DiagnosticSink {
-    fn emit(&mut self, diag: Diagnostic);
+    fn record(&mut self, diagnostic: Diagnostic);
 }
 ```
 
-Every codec function takes `&mut impl DiagnosticSink`. When the
+Every codec decoder takes `&mut dyn DiagnosticSink`. When the
 parser encounters a recoverable deviation (trailing byte, non-
-canonical magic byte, etc.) it calls `sink.emit(Diagnostic { ... })`
-with a stable, machine-readable code and then continues parsing.
+canonical magic byte, etc.) it calls `sink.record(diagnostic)` with
+a stable, machine-readable `Diagnostic` enum variant and then
+continues parsing. `record` returns `()`, so the parser cannot fail
+on a recoverable quirk.
 
-Consumers who want a strict parser wrap their sink in the provided
-`StrictnessFilter`:
+`Diagnostic` is a `#[non_exhaustive]` enum, so each deviation is a
+named variant rather than a free-form struct. The crate ships three
+sinks: `NullSink` drops every diagnostic silently (the default for
+tests and the high-performance path); `VecSink` collects them into
+a `Vec` for inspection; and `TracingSink` forwards each one as a
+structured `tracing` event.
 
-```rust
-let mut sink = StrictnessFilter::new(NullSink, Severity::Warning);
-// ...
-let result = codec::dplus::parse_header(&bytes, &mut sink);
-// result is Err if the parser emitted any diagnostic >= Warning.
-```
-
-The default sink `NullSink` drops every diagnostic silently, which
-is what the test suite and the high-performance path use. A
-production tracing integration wires a `TracingSink` that forwards
-diagnostics as structured `tracing` events.
+There is no shipped strict-mode wrapper. A consumer who wants strict
+rejection writes a `DiagnosticSink` whose `record` sets a flag (or
+short-circuits the caller's own logic) so any recorded diagnostic
+becomes a hard failure in their code. Strictness is a caller-side
+policy, not a codec return value.
 
 ## Consequences
 
@@ -76,13 +76,14 @@ diagnostics as structured `tracing` events.
   tests pass against all three canonical reflectors plus every
   variant we've encountered in the wild.
 - **Observability is free.** Wiring a `TracingSink` into the shell
-  turns every wire-format quirk into a structured log event with a
-  stable code. Consumers can filter on `dgstar_gateway::diag::dcs::extra_trailing_byte`
-  without parsing text.
-- **Strict mode is still available.** Tools that want strict
+  turns every wire-format quirk into a structured `tracing` event
+  carrying the named `Diagnostic` variant, so consumers can filter
+  on the diagnostic without parsing text.
+- **Strict validation is still achievable.** Tools that want strict
   validation (e.g. a conformance test runner, or a CI check that a
-  new reflector is spec-compliant) wrap their sink in
-  `StrictnessFilter` and get the error behavior they want.
+  new reflector is spec-compliant) supply their own `DiagnosticSink`
+  whose `record` treats any recorded diagnostic as a failure, and
+  get the error behavior they want.
 - **No version skew.** Adding a new lenient-parse case does not
   break existing consumers because the default sink ignores the
   new diagnostic. Callers who care set up their own filter.
@@ -99,8 +100,8 @@ diagnostics as structured `tracing` events.
   enum to preserve forward compatibility.
 - **"Is this a bug or a lenient parse?" is harder to answer.** A
   consumer seeing unexpected output has to check whether a
-  diagnostic was emitted. We mitigate this with `StrictnessFilter`
-  as the recommended debug setup.
+  diagnostic was recorded. We mitigate this by recommending a
+  `VecSink` (or a custom recording sink) as the debug setup.
 
 ## Alternatives considered
 
@@ -117,8 +118,8 @@ diagnostics as structured `tracing` events.
 ## References
 
 - `dstar-gateway-core/src/validator/` — `DiagnosticSink` trait
-  plus `NullSink`, `VecSink`, `TracingSink`, and
-  `StrictnessFilter` implementations.
+  plus the `NullSink`, `VecSink`, and `TracingSink`
+  implementations.
 - `dstar-gateway-core/src/codec/{dplus,dextra,dcs}/decode.rs`
   — every decoder takes `&mut dyn DiagnosticSink` so consumers
   opt into strictness per call site.

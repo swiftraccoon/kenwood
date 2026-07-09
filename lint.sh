@@ -95,6 +95,13 @@ if [ -n "$PKG" ] && [ "$PKG" != "mbelib-rs" ]; then
     MBELIB_MATRIX=0
 fi
 
+# The mdBook lives under dstar-gateway — only build it when that crate
+# is in scope.
+BOOK_BUILD=1
+if [ -n "$PKG" ] && [ "$PKG" != "dstar-gateway" ]; then
+    BOOK_BUILD=0
+fi
+
 # ---------- failure log preservation ----------
 FAIL_DIR=.lint-failures
 
@@ -209,6 +216,7 @@ run_inline() {
 if [ "$FIX" -eq 1 ]; then
     run cargo fmt --all
     run cargo clippy --fix --allow-dirty "${SCOPE[@]}" --all-targets
+    run cargo clippy --fix --allow-dirty "${SCOPE[@]}" --all-targets --all-features
     if [ "$MBELIB_MATRIX" -eq 1 ]; then
         run cargo clippy --fix --allow-dirty -p mbelib-rs --all-targets --features encoder
         run cargo clippy --fix --allow-dirty -p mbelib-rs --all-targets --features kenwood-tables
@@ -266,7 +274,7 @@ run_inline "unsafe audit (workspace-wide)" check_unsafe_audit
 check_required_tools() {
     local missing=()
     local tool
-    for tool in cargo-audit cargo-deny cargo-machete shellcheck taplo; do
+    for tool in cargo-audit cargo-deny cargo-machete shellcheck taplo mdbook; do
         if ! command -v "$tool" &>/dev/null; then
             missing+=("$tool")
         fi
@@ -278,6 +286,7 @@ check_required_tools() {
             case "$tool" in
                 shellcheck) echo "  brew install shellcheck   # or: apt install shellcheck" ;;
                 taplo)      echo "  cargo install taplo-cli --locked" ;;
+                mdbook)     echo "  cargo install mdbook --locked" ;;
                 *)          echo "  cargo install $tool" ;;
             esac
         done
@@ -295,10 +304,17 @@ run_inline "required tools present" check_required_tools
 # single `-p` package for the edit loop.
 run cargo clippy "${SCOPE[@]}" --all-targets -- -D warnings
 
-# Feature-specific clippy: the `encoder` and `kenwood-tables` gates on
-# mbelib-rs compile additional modules (encode/, encode/kenwood/)
-# that default clippy wouldn't see. Run once per non-default feature
-# set that the crate advertises.
+# Clippy again with every feature on. `--all-targets` does NOT reach a
+# target whose `required-features` are disabled — Cargo skips those
+# silently, with no warning. Without this pass the network-gated
+# dstar-gateway examples, the hardware-tests integration test, and the
+# thd75-repl `testing` module are never compiled by any gate, and rot
+# undetected.
+run cargo clippy "${SCOPE[@]}" --all-targets --all-features -- -D warnings
+
+# Feature-specific clippy: `--all-features` turns on `kenwood-tables`,
+# which implies `encoder` — so the encoder-only combination is still
+# unexercised above. Run each advertised feature set on its own.
 if [ "$MBELIB_MATRIX" -eq 1 ]; then
     run cargo clippy -p mbelib-rs --all-targets --features encoder -- -D warnings
     run cargo clippy -p mbelib-rs --all-targets --features kenwood-tables -- -D warnings
@@ -314,10 +330,35 @@ if [ "$MBELIB_MATRIX" -eq 1 ]; then
     run cargo test -p mbelib-rs --features kenwood-tables
 fi
 
-# Docs: scoped build with `-D warnings` so broken doc links (e.g.
-# a `[`priv_fn`]` link from a pub item) hard-fail instead of printing
-# a yellow warning.
-RUSTDOCFLAGS="-D warnings" run cargo doc "${SCOPE[@]}" --no-deps
+# Docs: scoped build with `-D warnings` so broken doc links hard-fail
+# instead of printing a yellow warning. `--document-private-items` is
+# load-bearing: rustdoc only resolves intra-doc links on items it
+# actually renders, so a `[`RENAMED_CONST`]` link sitting on a private
+# field is never checked without it.
+RUSTDOCFLAGS="-D warnings" run cargo doc "${SCOPE[@]}" --no-deps --document-private-items
+
+# Docs again with every feature on. Feature-gated modules carry doc
+# comments too, and the default-feature pass above never renders them
+# (mbelib-rs `encode::kenwood`, thd75-repl `mock_scenarios`), so their
+# intra-doc links go unchecked.
+RUSTDOCFLAGS="-D warnings" run cargo doc "${SCOPE[@]}" --no-deps --document-private-items --all-features
+
+# Docs a third time over binary targets. When a package ships both a
+# lib and a bin (thd75-repl), cargo's default target selection renders
+# only the lib, so every doc comment in `main.rs` goes unchecked. Use
+# `--bins` rather than `--lib --bins`: the latter hard-errors on
+# bin-only packages (sextant). Lib-only packages no-op with a warning.
+# This pass is lint-only — it collides output filenames in target/doc,
+# which is why docs.yml still publishes with plain `cargo doc`.
+RUSTDOCFLAGS="-D warnings" run cargo doc "${SCOPE[@]}" --no-deps --document-private-items --all-features --bins
+
+# The mdBook is committed but nothing else compiles it. With
+# `create-missing = false` in book.toml, this fails when SUMMARY.md
+# names a chapter that was never written, instead of quietly
+# generating an empty placeholder for it.
+if [ "$BOOK_BUILD" -eq 1 ]; then
+    run mdbook build dstar-gateway/book
+fi
 
 # Format: workspace-wide via `--all`. When `--fix` was passed we
 # already ran `cargo fmt --all` in apply mode above, so this is the

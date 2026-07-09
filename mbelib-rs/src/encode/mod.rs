@@ -3,9 +3,10 @@
 
 //! AMBE 3600×2400 D-STAR encoder (feature-gated).
 //!
-//! Scope: D-STAR only. This encoder produces 72-bit AMBE frames
-//! compatible with the AMBE chips inside real D-STAR radios (DVSI
-//! AMBE-2020 / AMBE-3000 / AMBE-3003). The algorithmic structure is a
+//! Scope: D-STAR only. This experimental encoder produces 72-bit AMBE
+//! frames intended for the AMBE chips inside real D-STAR radios (DVSI
+//! AMBE-2020 / AMBE-3000 / AMBE-3003), but reliable hardware
+//! interoperability is not yet validated. The algorithmic structure is a
 //! Rust port of Max H. Parke's (KA1RBI) `ambe_encoder.cc` from OP25,
 //! which chains Pavel Yazev's IMBE analyzer (OP25 `imbe_vocoder`, 2009,
 //! GPLv3) with AMBE-specific parameter requantization against the
@@ -17,10 +18,10 @@
 //! |------:|------|--------|
 //! | P1    | bit pack + interleave + C1 XOR ([`pack_frame`]) | done |
 //! | P2    | DC removal, LPF, window, FFT ([`analyze_frame`]) | done |
-//! | P3    | pitch estimation (sub-harmonic summation port of `pitch_est.cc`) | done (single-frame; multi-frame DP deferred) |
+//! | P3    | pitch estimation (sub-harmonic summation port of `pitch_est.cc`) | done (single-frame + 2-frame DP look-ahead) |
 //! | P4    | V/UV + spectral amplitudes + gain quantization ([`detect_vuv`], [`extract_spectral_amplitudes`], `quantize`) | done |
-//! | P5    | PRBA/HOC codebook search, FEC, `AmbeEncoder` wrapper | done (bit-exact vs OP25 on b3..b7) |
-//! | P6    | chip-interop tuning | partial (see [`encoder`]'s status block) |
+//! | P5    | PRBA/HOC codebook search, FEC, `AmbeEncoder` wrapper | wired; spectral-envelope validation remains |
+//! | P6    | chip-interop tuning | not validated (see [`encoder`]'s status block) |
 //!
 //! The top-level entry point is [`AmbeEncoder::encode_frame`]. The
 //! individual stage functions (`analyze_frame`, `PitchTracker`,

@@ -96,12 +96,12 @@ impl LogLevel {
 
 /// Subcommands that bypass the interactive REPL entirely.
 ///
-/// `check` runs the accessibility compliance self-check and exits.
+/// `check` runs the accessibility output self-check and exits.
 /// Any future non-interactive operations (status dump, send-one,
 /// etc.) belong as sibling variants here.
 #[derive(clap::Subcommand, Debug)]
 enum Subcommand {
-    /// Run the accessibility compliance self-check and print a report.
+    /// Run the accessibility output self-check and print a report.
     ///
     /// Exercises every user-facing formatter, runs the accessibility
     /// lint on each result, and prints a rule-by-rule report. Exits
@@ -594,8 +594,9 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     // instead.
     #[cfg(feature = "testing")]
     let (path, transport, rt) = if let Some(ref scenario) = cli.mock_radio {
-        let mock = thd75_repl::mock_scenarios::build(scenario)
-            .ok_or_else(|| format!("Unknown mock scenario: {scenario}. Known: simple, empty."))?;
+        let mock = thd75_repl::mock_scenarios::build(scenario).ok_or_else(|| {
+            format!("Unknown mock scenario: {scenario}. Known: simple, empty, mmdvm.")
+        })?;
         let rt = tokio::runtime::Runtime::new()?;
         (format!("mock:{scenario}"), EitherTransport::Mock(mock), rt)
     } else {
@@ -770,7 +771,7 @@ struct DStarSession {
     /// Wall-clock timestamp of the most recent relay to the radio
     /// (real or padded frame). Drives the pacing decision in
     /// [`emit_silence_pad_if_needed`] — if no frame has been sent
-    /// for longer than [`PAD_THRESHOLD`], the pad timer emits a
+    /// for longer than [`PAD_INITIAL_THRESHOLD`], the pad timer emits a
     /// copy of the last known frame to cover the gap.
     last_relay_at: Option<std::time::Instant>,
     /// Consecutive padding frames emitted since the last real voice
@@ -1007,6 +1008,13 @@ async fn run_repl(
     // Try connect_safe (sends TNC exit preamble to recover from stuck modes).
     let mut radio = Radio::connect_safe(transport).await?;
 
+    // Tracks whether the radio is in a DV Gateway / Reflector Terminal
+    // Mode where its CAT command parser is offline (it speaks MMDVM
+    // binary instead). Set by the startup link diagnosis below and
+    // consulted by the terminal-mode guard in the command loop; cleared
+    // when we return to verified CAT control.
+    let mut terminal_mode = false;
+
     // Try to identify. If it fails, the radio may be in MMDVM/TERM mode.
     let mut state = match radio.identify().await {
         Ok(info) => {
@@ -1036,9 +1044,19 @@ async fn run_repl(
                     ReplState::Cat(radio)
                 }
                 LinkDiagnosis::MmdvmMode => {
+                    // CAT is offline in this mode. Remember it so the
+                    // command loop's terminal-mode guard can intercept
+                    // CAT commands with actionable guidance instead of
+                    // letting each one block for the full timeout.
+                    terminal_mode = true;
                     println!("Radio is in D-STAR Reflector Terminal Mode.");
-                    println!("Type dstar start <callsign> [reflector] to begin, or quit to exit.");
-                    println!("Example: dstar start W1AW REF030C");
+                    println!("CAT commands like freq, mode, and status do not work in this mode.");
+                    println!("To use D-STAR now: dstar start <callsign> [reflector]");
+                    println!("  Example: dstar start W1AW REF030C");
+                    println!(
+                        "To restore normal radio control: set Menu No. 650 (DV Gateway) to Off,"
+                    );
+                    println!("  then restart, or relaunch with --exit-terminal-mode.");
                     ReplState::Cat(radio)
                 }
                 LinkDiagnosis::Unresponsive if std::env::var_os(RELAUNCH_GUARD_ENV).is_some() => {
@@ -1291,6 +1309,24 @@ async fn run_repl(
             _ => {}
         }
 
+        // Terminal-mode guard: the radio started in DV Gateway /
+        // Reflector Terminal Mode, so its CAT parser is offline and any
+        // radio command would block for the full command timeout with no
+        // explanation. Intercept CAT commands with actionable guidance,
+        // but let the `dstar`/`aprs` mode transitions through — starting
+        // D-STAR is how you actually use terminal mode. The flag is
+        // cleared when we return to verified CAT control (after
+        // `dstar stop`), so this stops firing once the radio is back.
+        if terminal_mode
+            && matches!(state, ReplState::Cat(_))
+            && !matches!(cmd.as_str(), "dstar" | "aprs")
+        {
+            println!("{}", LinkDiagnosis::MmdvmMode.guidance());
+            println!("Then restart this program, or relaunch with --exit-terminal-mode.");
+            println!("Or type dstar start <callsign> [reflector] to use D-STAR now.");
+            continue;
+        }
+
         // Mode-specific dispatch.
         state = match state {
             ReplState::Cat(mut radio) => {
@@ -1386,6 +1422,10 @@ async fn run_repl(
                     }
                     match exit_dstar(session.gateway, cli_port.as_deref(), cli_baud).await {
                         Ok(radio) => {
+                            // `exit_dstar` reconnected and verified CAT
+                            // control, so the terminal-mode guard no
+                            // longer applies.
+                            terminal_mode = false;
                             aprintln!("D-STAR mode stopped. Returned to normal radio control.");
                             ReplState::Cat(radio)
                         }
@@ -3792,7 +3832,7 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
                     // relay, and zero the pad counter. The 20 ms
                     // pad tick in `run_dstar_monitor` will repeat
                     // this frame only if the next real frame
-                    // doesn't arrive before `PAD_THRESHOLD` past
+                    // doesn't arrive before `PAD_INITIAL_THRESHOLD` past
                     // this moment.
                     session.last_rx_voice_frame = Some(**frame);
                     session.last_relay_at = Some(std::time::Instant::now());

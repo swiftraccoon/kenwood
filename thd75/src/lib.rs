@@ -1,4 +1,5 @@
 #![deny(unsafe_code)]
+#![doc = include_str!("../README.md")]
 //! Async Rust library for controlling the Kenwood TH-D75 transceiver via
 //! CAT (Computer Aided Transceiver) -- the serial command protocol Kenwood
 //! uses for remote radio control.
@@ -57,8 +58,15 @@
 //! - [`protocol`] — Pure-logic CAT command codec (serialize / parse).
 //! - [`transport`] — Async I/O trait and serial / mock implementations.
 //! - [`radio`] — High-level async API wrapping the protocol and transport layers.
-//! - [`aprs`] — KISS TNC framing, AX.25 packet parsing, and APRS position decoding.
-//! - [`mmdvm`] — MMDVM serial protocol codec, D-STAR header, and slow data decoder.
+//! - [`memory`] — Typed accessors over a TH-D75 memory image (from MCP or `.d75` files).
+//! - [`sdcard`] — Parsers for TH-D75 SD card files (`.d75` config, `.tsv` lists, `.nme` logs, and more).
+//! - [`aprs`] — TH-D75-specific APRS glue: [`AprsClient`] owning a [`Radio`] and
+//!   [`KissSession`], the MCP-config bridge, and digipeater-path helpers.
+//!   Generic KISS/AX.25/APRS decoding lives in the `kiss-tnc`, `ax25-codec`,
+//!   and `aprs` sibling crates.
+//! - [`mmdvm`] — D-STAR gateway client ([`DStarGateway`]) for Reflector Terminal
+//!   Mode, built on the `mmdvm-core` framing codec and `dstar-gateway-core`
+//!   protocol crates.
 //! - [`error`] — Error types for transport, protocol, and validation failures.
 
 pub mod aprs;

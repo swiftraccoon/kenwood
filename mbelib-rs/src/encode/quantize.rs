@@ -24,7 +24,7 @@
 //! - **`b3..b8` (spectral envelope):** block-DCT on the prediction
 //!   residual `T = lsa - 0.65·interp(prev_log2_ml)`; assemble R
 //!   pairs from block DC + first AC coefficients; inverse 8-pt DCT
-//!   → G[8]; PRBA24 / PRBA58 codebook search (b3, b4); per-block
+//!   → `G[8]`; PRBA24 / PRBA58 codebook search (b3, b4); per-block
 //!   HOC codebook search (b5..b8). `b8` uses stride-2 search —
 //!   only even indices are representable in the 3-bits-with-
 //!   forced-zero-LSB wire field (mbelib decoder convention).
@@ -35,11 +35,9 @@
 //! next frame — so the prediction residual the decoder adds back
 //! matches bit-for-bit what the encoder subtracted.
 //!
-//! Stage 5..8 is bit-exact against OP25's `ambe_encoder.cc` for
-//! b3/b4/b5/b6/b7 when given identical `imbe_param` inputs
-//! (validated by `examples/validate_quantize_vs_op25.rs`). The
-//! remaining mismatch on b0 / b1 / b2 / b8 is documented inline
-//! next to each codebook search.
+//! `examples/validate_quantize_vs_op25.rs` compares this stage with
+//! supplied OP25 traces field by field. Match rates vary with the trace;
+//! the PRBA/HOC spectral-envelope fields remain an active investigation.
 
 use crate::ecc::AMBE_DATA_BITS;
 use crate::encode::pitch::PitchEstimate;

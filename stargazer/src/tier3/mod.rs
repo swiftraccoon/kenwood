@@ -1,8 +1,8 @@
 //! Tier 3: deep D-STAR protocol connections and voice capture.
 //!
-//! Establishes full D-STAR protocol connections (`DPlus`, `DExtra`, DCS) to
-//! reflectors via the `dstar-gateway` crate's `AsyncSession` API. Captures
-//! voice streams including:
+//! The planned orchestrator establishes full D-STAR protocol connections
+//! (`DPlus`, `DExtra`, DCS) through `dstar-gateway::AsyncSession`. The
+//! implemented capture components model voice streams containing:
 //!
 //! - D-STAR header metadata (callsign, suffix, UR call, RPT fields)
 //! - AMBE voice frames decoded to PCM via `mbelib-rs`, then encoded to MP3
@@ -22,10 +22,9 @@
 //!             Postgres: streams table (metadata + audio_mp3)
 //! ```
 //!
-//! Connections are managed by a priority queue: user-pinned reflectors take
-//! precedence, followed by auto-promoted reflectors ranked by activity score.
-//! Idle sessions (no voice activity beyond the configured timeout) are
-//! disconnected to free slots for more active reflectors.
+//! The planned pool will prioritize user-pinned reflectors, then
+//! auto-promoted reflectors ranked by activity, and evict idle sessions.
+//! None of that connection-pool behavior is implemented in [`run`] yet.
 //!
 //! # Module layout
 //!

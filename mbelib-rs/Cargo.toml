@@ -39,9 +39,10 @@ kenwood-tables = ["encoder"]
 [dev-dependencies]
 proptest = "1"
 
-# Examples that depend on the encoder feature — lint.sh runs
-# clippy with `--all-targets` but without `--features encoder`, so
-# these are skipped unless explicitly enabled.
+# Examples that depend on the encoder feature. Cargo silently skips a
+# target whose `required-features` are off, so these are invisible to a
+# plain `--all-targets` run; lint.sh compiles them via its
+# `--all-features` pass and its per-feature mbelib-rs matrix.
 [[example]]
 name = "encode_ambe_stream"
 required-features = ["encoder"]

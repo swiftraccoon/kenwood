@@ -198,7 +198,7 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
 /// Spec-compliant transmitters routinely use the alt range to expand
 /// the encodable space for low speeds and back-quadrant courses;
 /// refusing to apply the subtraction silently drops these decodes
-/// (earlier code generations did exactly that — see CB-B-1/B-2).
+/// (earlier code generations did exactly that).
 ///
 /// After adjustment, the returned tuple has:
 ///
@@ -334,8 +334,7 @@ fn mice_decode_message(chars: [u8; 3]) -> Option<MiceMessage> {
 /// Per APRS 1.0.1 §10.1 Table 10. Returns `(bit_a, bit_b, bit_c)` where
 /// `true` means "standard-1" (uppercase P-Y in the destination char).
 ///
-/// Used by the Mic-E TX builder (`build_aprs_mice`) which lands in PR 3
-/// Task 5 together with the rest of the APRS builders.
+/// Used by the Mic-E TX builder [`crate::build_aprs_mice`].
 #[must_use]
 pub const fn mice_message_bits(msg: MiceMessage) -> (bool, bool, bool) {
     match msg {

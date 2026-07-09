@@ -7,6 +7,7 @@
 // JMBE-compatible algorithm ports adapted from arancormonk/mbelib-neo
 // (also GPL-2.0-or-later).
 
+#![doc = include_str!("../README.md")]
 //! Pure Rust AMBE 3600×2400 voice codec decoder for D-STAR digital radio.
 //!
 //! The AMBE (Advanced Multi-Band Excitation) 3600×2400 codec compresses
@@ -48,9 +49,12 @@
 //! 3. **Demodulation** — LFSR descrambling of C1 using C0 seed
 //! 4. **Parameter extraction** — 49 decoded bits → fundamental frequency,
 //!    harmonic count, voiced/unvoiced decisions, spectral magnitudes.
-//!    Frames with b0 in the erasure range (120..=123) or tone range
-//!    (126..=127) trigger the same repeat/conceal path as Golay-C0
-//!    failures, since D-STAR does not use codec-level tone signaling.
+//!    Disposition then splits three ways: valid tone frames (b0 in
+//!    126..=127) are synthesized directly by a dedicated tone oscillator;
+//!    erasure frames (b0 in 120..=123) and out-of-range tone descriptors
+//!    emit silence and fully re-initialize the decoder state; voice frames
+//!    whose FEC required more than 3 corrected bits reuse the previous
+//!    frame's parameters and increment the repeat counter.
 //! 5. **Spectral enhancement** — adaptive amplitude weighting for clarity
 //! 6. **Adaptive smoothing** — JMBE algorithms #111-116, gracefully
 //!    damps spurious magnitudes/voicing decisions on noisy frames
@@ -266,11 +270,10 @@ impl AmbeDecoder {
         // Frame disposition — ports mbelib's `mbe_processAmbe2400Dataf`
         // (`mbelib/ambe3600x2400.c:655-713`) exactly:
         //
-        // 1. Erasure (b0 in 120..=123) or tone (b0 in 126..=127, unused
-        //    by D-STAR): output silence and RE-INITIALIZE the decoder
-        //    state — the reference calls `mbe_initMbeParms` here, so
-        //    the next voice frame predicts from defaults, not from
-        //    whatever preceded the erasure.
+        // 1. Erasure (b0 in 120..=123), invalid single-tone index, or
+        //    unsupported dual tone: output silence and RE-INITIALIZE the
+        //    decoder state. Valid single-tone descriptors are synthesized
+        //    directly in the match below.
         // 2. More than 3 total FEC-corrected bits (`errs2 > 3`): the
         //    corrections nominally succeeded, but Golay mis-corrects
         //    silently at these error densities, so the decoded

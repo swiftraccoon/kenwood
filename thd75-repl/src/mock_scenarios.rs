@@ -3,7 +3,8 @@
 //! This module is gated behind the `testing` cargo feature; it is not
 //! compiled into release builds. Each scenario is a pre-scripted
 //! sequence of `(request_bytes, response_bytes)` pairs that drive a
-//! [`MockTransport`] through a known exchange.
+//! [`MockTransport`](kenwood_thd75::transport::MockTransport) through
+//! a known exchange.
 //!
 //! Used by the `--mock-radio <name>` CLI flag, which is also gated
 //! behind the same `testing` feature.
@@ -14,7 +15,8 @@
 //! let an integration test exit the REPL loop cleanly after reading
 //! the radio model. More elaborate scenarios (D-STAR, APRS) belong
 //! in dedicated test fixture files loaded via
-//! [`MockTransport::from_fixture`] rather than code-generated here.
+//! [`MockTransport::from_fixture`](kenwood_thd75::transport::MockTransport::from_fixture)
+//! rather than code-generated here.
 
 use kenwood_thd75::transport::MockTransport;
 
@@ -22,12 +24,15 @@ use kenwood_thd75::transport::MockTransport;
 ///
 /// Returns `None` if `name` does not match a known scenario. Known
 /// names: `"simple"` (minimal CAT identification flow), `"empty"`
-/// (empty mock that rejects every write).
+/// (empty mock that rejects every write), `"mmdvm"` (radio in DV
+/// Gateway / Reflector Terminal Mode: CAT identification fails and an
+/// MMDVM probe answers, so the REPL takes the terminal-mode path).
 #[must_use]
 pub fn build(name: &str) -> Option<MockTransport> {
     match name {
         "simple" => Some(simple_scenario()),
         "empty" => Some(MockTransport::new()),
+        "mmdvm" => Some(mmdvm_scenario()),
         _ => None,
     }
 }
@@ -62,6 +67,45 @@ fn simple_scenario() -> MockTransport {
     // without having to predict the exact wire output. Subsequent
     // reads will error (pending_response empty), which surfaces as
     // command-level errors that the script can absorb.
+    mock.expect_any_write();
+
+    mock
+}
+
+/// Radio in a DV Gateway / Reflector Terminal Mode: CAT identification
+/// fails (the radio speaks MMDVM binary, not CAT) but the MMDVM
+/// `GET_VERSION` probe answers, so `Radio::diagnose_link` classifies
+/// the link as [`kenwood_thd75::LinkDiagnosis::MmdvmMode`] and the REPL
+/// takes the terminal-mode startup path.
+///
+/// Used by the integration test that asserts the terminal-mode guard
+/// intercepts CAT commands with guidance instead of letting each one
+/// block for the full command timeout.
+fn mmdvm_scenario() -> MockTransport {
+    let mut mock = MockTransport::new();
+
+    // connect_safe preamble (same as the simple scenario) — each write
+    // is programmed against an empty response so the drain read at the
+    // end of connect_safe is satisfied cleanly.
+    mock.expect(b"\r", b"");
+    mock.expect(b"\r", b"");
+    mock.expect(&[0x03], b"");
+    mock.expect(b"\rTC 1\r", b"");
+    mock.expect(b"TN 0,0\r", b"");
+
+    // identify() sends `ID\r`. In a DV Gateway mode the CAT parser is
+    // offline, so the radio answers `?` (or nothing); `?` keeps the
+    // transport alive while making identify() return an error, which is
+    // what drives the REPL into the diagnose_link path.
+    mock.expect(b"ID\r", b"?\r");
+
+    // diagnose_link() sends the MMDVM GET_VERSION frame and an
+    // 0xE0-framed reply is positive proof of a DV Gateway mode.
+    mock.expect(b"\xE0\x03\x00", b"\xE0\x0F\x00\x01MMDVM");
+
+    // Absorb any trailing writes (the `quit` path calls disconnect()).
+    // No CAT command in this scenario reaches the radio: the
+    // terminal-mode guard intercepts them before dispatch.
     mock.expect_any_write();
 
     mock

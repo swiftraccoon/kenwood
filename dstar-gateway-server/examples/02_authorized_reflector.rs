@@ -2,8 +2,9 @@
 //!
 //! Demonstrates the shape of a production authorizer:
 //! - Loads a banlist from the `BANLIST_FILE` env var (one callsign
-//!   per line), falling back to a small hardcoded set when the file
-//!   is missing or unreadable.
+//!   per line). When the variable is absent, a small hardcoded demo
+//!   set is used; an unreadable configured file logs a warning and
+//!   produces an empty set.
 //! - Rejects any linking client whose callsign is on the list with
 //!   [`RejectReason::Banned`].
 //! - Accepts everyone else with [`AccessPolicy::ReadWrite`].

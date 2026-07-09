@@ -1,0 +1,5 @@
+# Radio starts in DV Gateway / Reflector Terminal Mode.
+# A CAT command must be intercepted by the terminal-mode guard with
+# guidance, not sent to the radio (which would block for the timeout).
+mode b
+quit

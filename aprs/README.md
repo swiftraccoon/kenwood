@@ -6,7 +6,7 @@ APRS (Automatic Packet Reporting System) protocol stack. std-only, sans-io.
 
 **Parsers.** Position (uncompressed + compressed), Mic-E (with speed/course from `dest` bytes + `info[4..7]`), weather (positionless and position-embedded, CSE/SPD + 13-field), status, telemetry, messages, items, objects, queries, third-party, grid square, raw GPS, user-defined.
 
-**Builders.** `build_aprs_item`, `build_aprs_message`, `build_aprs_mice`, `build_aprs_object`, `build_aprs_position_compressed`, `build_aprs_position_report`, `build_aprs_status`, `build_aprs_weather`, `build_query_response_position`, plus `_packet` variants returning `Ax25Packet`.
+**Builders.** Position reports (plain, compressed, and weather-bearing), Mic-E, weather, status, messages, items, timestamped objects, telemetry data/metadata, and query responses. Most `build_aprs_*` helpers return KISS-wrapped bytes; matching `_packet` variants return `Ax25Packet`, and checked message/item/object variants reject values that the convenience builders would truncate.
 
 **Stateful algorithms.**
 

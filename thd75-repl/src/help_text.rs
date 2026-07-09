@@ -129,7 +129,7 @@ vox: Voice-operated transmit on or off
 fm: FM broadcast radio on or off
 vfo: Full variable frequency oscillator state (or: vfo b)
 -- Changing settings --
-mode a fm: Set mode. Options: fm, nfm, am, dv, lsb, usb, cw
+mode a fm: Set mode. Options: fm, nfm, am, dv, lsb, usb, cw, dr, wfm
 squelch a 3: Set squelch level, 0 through 5
 power a high: Set power. Options: high, medium, low, extra-low
 att a on: Set attenuator on or off
@@ -384,7 +384,7 @@ Reads model, firmware, battery, clock, lock, both bands' settings.
 Takes 2 to 3 seconds because it issues many CAT commands.
 Example: status";
 
-const CHECK_HELP: &str = "check: Run the accessibility compliance self-check.
+const CHECK_HELP: &str = "check: Run the accessibility output self-check.
 Syntax: check
 Exercises every formatter, runs the lint, prints a report.
 Also available without connecting a radio: thd75-repl check

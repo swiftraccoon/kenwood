@@ -67,19 +67,24 @@
 /// `radio_send_dsp_command_9b` at ARM address 0xC005D928.
 pub const FRAME_LEN: usize = 9;
 
-/// TH-D75 firmware FEC whitening pattern (32-bit, cycled).
+/// Candidate whitening pattern (32-bit, cycled), applied as
+/// `out[i] = in[i] ^ WHITENING[i % 4]`.
 ///
 /// Source: DSP firmware function at virtual address 0x118123E0.
-/// Applied as `out[i] = in[i] ^ WHITENING[i % 4]` to the post-Golay
-/// AMBE bit stream. When dewhitened, a Kenwood-captured frame decodes
-/// through the standard DSD/mbelib ECC pipeline.
 ///
-/// Applying [`apply_whitening`] to a Rust encoder's output (or
-/// equivalently, dewhitening a Kenwood capture) is the simple wire-
-/// format adapter between mbelib's wire format and TH-D75's wire
-/// format. Verified across the 210/440/550/660 Hz captures — every
-/// dewhitened steady-state frame decodes to a sensible AMBE
-/// `(b0, b1, L)` tuple.
+/// # Superseded — do not apply to voice bytes
+///
+/// This was originally read as a firmware wire-format adapter between
+/// mbelib's AMBE bit order and the TH-D75's. That interpretation is
+/// wrong. The leading `0x70 0x4F 0x93` is the standard D-STAR slow-data
+/// scrambler sequence; it appeared to line up with voice bytes only
+/// because the captures under analysis had been sliced MSB-first. DVSI
+/// wire frames are LSB-first per byte, and once that is corrected a
+/// Kenwood capture decodes through the ordinary ECC pipeline with no
+/// dewhitening step at all.
+///
+/// [`apply_whitening`] is retained solely so the historical anchor
+/// analysis remains reproducible. It is not part of the encode path.
 pub const FIRMWARE_WHITENING: [u8; 4] = [0x70, 0x4F, 0x93, 0x40];
 
 /// Apply the TH-D75 firmware whitening XOR to a 9-byte frame.

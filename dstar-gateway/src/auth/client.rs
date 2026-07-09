@@ -259,8 +259,8 @@ impl AuthClient {
     ///
     /// The fix is to resolve the hostname ourselves with
     /// [`tokio::net::lookup_host`], then race each resolved address
-    /// sequentially with a short per-address timeout
-    /// ([`Self::per_address_timeout`]). The first address that
+    /// sequentially with a short (3 s) per-address timeout. The
+    /// first address that
     /// completes the TCP handshake wins; dead addresses are abandoned
     /// quickly so the next one gets a real chance. This is a
     /// minimal happy-eyeballs-style fallback without the

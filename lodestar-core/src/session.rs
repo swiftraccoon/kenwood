@@ -384,7 +384,8 @@ pub enum ReflectorError {
         /// Supplied length.
         got: u32,
     },
-    /// Voice frame must have 9 AMBE bytes + 3 slow-data bytes = 12 total.
+    /// TX was attempted on a session owned by the background task, from
+    /// outside that task.
     #[error("cannot send TX frames on a background-owned session outside its task")]
     SessionInBackground,
 }

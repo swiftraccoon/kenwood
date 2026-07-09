@@ -1,5 +1,5 @@
 //! Shell-level error type wrapping the sans-io core error + adding
-//! tokio-specific failure modes (channel closed, disconnect timeout).
+//! tokio-specific failure modes (channel closed).
 
 use dstar_gateway_core::error::Error as CoreError;
 
@@ -16,6 +16,14 @@ pub enum ShellError {
     SessionClosed,
 
     /// Disconnect did not complete within the timeout.
+    ///
+    /// Never returned by the current shell: [`AsyncSession::disconnect`]
+    /// takes no deadline and resolves as soon as the session loop
+    /// acknowledges the request. A disconnect that times out is reported
+    /// by the core as `Event::Disconnected(DisconnectReason::DisconnectTimeout)`
+    /// on the event stream instead.
+    ///
+    /// [`AsyncSession::disconnect`]: crate::tokio_shell::AsyncSession::disconnect
     #[error("disconnect timed out")]
     DisconnectTimeout,
 }

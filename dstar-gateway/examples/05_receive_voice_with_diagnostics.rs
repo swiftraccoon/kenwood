@@ -13,10 +13,14 @@
 //! the `REFLECTOR_HOST` / `REFLECTOR_MODULE` env vars.
 //!
 //! ```text
-//! REFLECTOR_HOST=xrf030.example.com:30001 REFLECTOR_MODULE=C \
+//! DSTAR_CALLSIGN=N0CALL REFLECTOR_HOST=xrf030.example.com:30001 \
+//! REFLECTOR_MODULE=C \
 //!     cargo run -p dstar-gateway --example 05_receive_voice_with_diagnostics \
 //!     --features examples-network
 //! ```
+
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
 
 use std::env;
 use std::sync::Arc;
@@ -31,13 +35,14 @@ use tokio::time::timeout;
 
 // Acknowledged workspace dev-deps.
 use pcap_parser as _;
+use thiserror as _;
 use trybuild as _;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let callsign = Callsign::try_from_str("W1AW")?;
+    let callsign = Callsign::try_from_str(&env::var("DSTAR_CALLSIGN")?)?;
     let reflector_host =
         env::var("REFLECTOR_HOST").unwrap_or_else(|_| "xrf030.example.com:30001".to_string());
     let reflector_module_char = env::var("REFLECTOR_MODULE")
@@ -76,7 +81,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (n, src) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
         .await?
         .map_err(|e| format!("recv ACK: {e}"))?;
-    connecting.handle_input(Instant::now(), src, &buf[..n])?;
+    let slice = buf.get(..n).unwrap_or(&[]);
+    connecting.handle_input(Instant::now(), src, slice)?;
 
     if connecting.state_kind() != ClientStateKind::Connected {
         eprintln!("handshake did not complete");

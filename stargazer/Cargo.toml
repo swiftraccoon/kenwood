@@ -3,7 +3,7 @@ name = "stargazer"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-description = "D-STAR network observatory — reflector monitoring and voice capture service"
+description = "Experimental D-STAR reflector discovery and XLX monitoring service"
 license = "GPL-2.0-or-later"
 publish = false
 

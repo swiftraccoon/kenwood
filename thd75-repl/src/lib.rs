@@ -17,10 +17,8 @@
 // `#![deny(clippy::pedantic)]` would re-arm whole groups at a higher
 // precedence than the manifest and silently clobber the manifest's
 // documented per-lint tuning.
-// Note: `unwrap_used`, `expect_used`, and `panic` are already allowed crate-wide via
-// `[lints.clippy]` in `Cargo.toml`. A previous `cfg_attr(test, expect(...))` block was
-// removed because the workspace policy bans that form (it gates suppression on the
-// build predicate, not on whether the annotated item is actually a test).
+// `unwrap_used`, `expect_used`, and `panic` are denied crate-wide by
+// `[lints.clippy]` in `Cargo.toml`.
 
 // Dev-dependencies / optional deps pulled in only by `src/main.rs` (the binary target).
 // Acknowledge at the lib level so `unused_crate_dependencies` stays silent for the lib
@@ -72,7 +70,7 @@ pub mod script;
 #[cfg(feature = "testing")]
 pub mod mock_scenarios;
 
-/// Accessibility compliance self-check for the `check` subcommand.
+/// Accessibility output self-check for the `check` subcommand.
 pub mod check;
 
 /// Transmit confirmation prompt and script-mode gating.

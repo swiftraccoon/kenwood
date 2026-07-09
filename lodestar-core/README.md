@@ -1,16 +1,18 @@
 # lodestar-core
 
-Rust core for [Lodestar](../lodestar) — the native macOS and iOS/iPadOS
+Rust core for [Lodestar](../lodestar) — the native macOS and iPadOS
 D-STAR gateway app for the Kenwood TH-D75.
 
-Wraps `dstar-gateway-core`, `dstar-gateway`, and `kenwood-thd75` and exposes
-them to Swift via [UniFFI](https://mozilla.github.io/uniffi-rs/). The Swift
+Wraps `dstar-gateway-core`, `dstar-gateway`, `mmdvm-core`, and `mbelib-rs` and
+exposes them to Swift via [UniFFI](https://mozilla.github.io/uniffi-rs/). The Swift
 bindings ship as `LodestarKit.xcframework`, produced by
 `scripts/build-xcframework.sh`.
 
 ## What's exposed
 
 - `version()` — crate semver.
+- Audio: `RxAudioPipeline` — AMBE-decodes reflector voice frames into 8 kHz
+  mono PCM for on-device monitoring.
 - CAT: `encode_cat`, `parse_cat_line` covering the `ID` identify command.
 - MCP: page read/write primitives for flipping menu 650 (DV Gateway) into
   Reflector Terminal Mode.
@@ -23,6 +25,13 @@ bindings ship as `LodestarKit.xcframework`, produced by
   into typed fields so Swift can synthesise a local "recently heard" entry
   for operator-originated transmissions (reflectors don't echo the sender
   back).
+- Reflector directory: `default_reflectors()` plus live-directory support —
+  `parse_hosts_text`, `parse_xlx_text`, `merge_directories`, `xlx_directory_url`,
+  and the `DirectoryEntry` / `DirectorySource` types for provenance-aware
+  merging of bundled, DPlus auth-server, and XLX-registry sources.
+- Logging bridge: `init_tracing()` installs a `tracing` subscriber that
+  forwards each event to a Swift-implemented `LogSink` (with `LogLevel`),
+  routing Rust diagnostics into the app's Log Viewer and Apple's Unified Log.
 
 ## License
 

@@ -22,7 +22,7 @@ pub enum AprsError {
     #[error("APRS message text exceeds 67 characters ({0} bytes)")]
     MessageTooLong(usize),
 
-    // --- Validation variants for wire newtypes (Task 3) ---
+    // --- Validation variants for wire newtypes ---
     /// Latitude is not finite or outside `-90.0..=90.0`.
     #[error("invalid latitude: {0}")]
     InvalidLatitude(&'static str),

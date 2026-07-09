@@ -54,7 +54,7 @@ pub struct FanOutReport {
 /// # Errors
 ///
 /// Reserved for future fatal conditions (e.g. cross-protocol
-/// re-encode errors). The current DExtra-only implementation never
+/// re-encode errors). The current same-protocol fan-out never
 /// returns `Err`.
 ///
 /// # Cancellation safety

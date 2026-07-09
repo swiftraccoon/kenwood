@@ -2,9 +2,9 @@
 //!
 //! This crate is **runtime-agnostic and I/O-free**. It contains the
 //! wire-format codecs, the typestate session machines, and the
-//! supporting types and errors. The async (tokio) and blocking shells
-//! live in the sibling [`dstar-gateway`] and [`dstar-gateway-server`]
-//! crates respectively.
+//! supporting types and errors. The tokio shell lives in the sibling
+//! [`dstar-gateway`] crate, and the multi-client reflector server in
+//! [`dstar-gateway-server`].
 //!
 //! See [`crate::types`] for validated primitives, [`crate::header`]
 //! for the D-STAR radio header, [`crate::voice`] for voice frame
@@ -12,8 +12,8 @@
 //! [`crate::error`] for the error hierarchy.
 //!
 //!
-//! [`dstar-gateway`]: https://github.com/swiftraccoon/dstar-gateway/tree/main/dstar-gateway
-//! [`dstar-gateway-server`]: https://github.com/swiftraccoon/dstar-gateway/tree/main/dstar-gateway-server
+//! [`dstar-gateway`]: https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway
+//! [`dstar-gateway-server`]: https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway-server
 
 pub mod codec;
 pub mod dprs;

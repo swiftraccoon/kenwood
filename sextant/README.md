@@ -8,6 +8,8 @@ no radio in the loop.
 **WIP — protocol details and audio quality still churn. Fine for
 listening; treat transmit as experimental.**
 
+![Sextant operator page: hero callsign readout, heard-station list, and transmit strip](operator.png)
+
 ## Features
 
 - Connect to DExtra / DPlus / DCS reflectors: searchable directory
@@ -41,6 +43,8 @@ One window, two pages, toggled in the header:
   log with copy-to-clipboard, live stream statistics, TX test tools
   (silence, WAV), and audio device controls.
 
+![Sextant debug page: filterable event log, stream statistics, and TX tools](debug.png)
+
 The gear opens settings: operator callsign, auto-reconnect, heard
 persistence, audio devices. Errors appear as a dismissable strip
 under the header on both pages. Color is used as signal only: amber
@@ -58,8 +62,9 @@ cargo run -p sextant
 
 Unbundled CLI binaries (like `cargo run`) don't get their own mic
 permission prompt — they inherit from the Terminal that launched
-them.  If mic capture goes silent and the logs show
-`50 consecutive silent TX frames`, macOS has denied access.
+them.  If mic capture goes silent, stop transmitting and look for the
+`TX mic-level summary:` line in the logs — a `MIC LIKELY DENIED`
+diagnosis on that line means macOS has denied access.
 
 **Fastest fix** — grant your terminal permission once:
 
@@ -125,8 +130,9 @@ App::update()               session::run()              audio::run_audio_worker(
 ```
 
 - Sessions are tokio tasks (the `dstar-gateway` shell). They talk
-  UDP to the reflector, decode incoming frames, and forward
-  `VoiceRx` to the GUI.
+  UDP to the reflector, decode the core's `VoiceStart` / `VoiceFrame` /
+  `VoiceEnd` events, and forward `SessionEvent`s to the GUI while
+  pushing `AudioCommand::Rx*` to the audio thread.
 - Audio I/O lives on its own `std::thread` because `cpal::Stream` is
   `!Send` on some platforms. The thread owns both streams, two
   ring buffers (mic → worker, worker → speakers), and the codec
@@ -138,4 +144,4 @@ App::update()               session::run()              audio::run_audio_worker(
 ## License
 
 GPL-2.0-or-later (base) / GPL-3.0-or-later (through `mbelib-rs`'s
-encoder feature). See `LICENSES/` at the workspace root.
+encoder feature). See `LICENSE` at the workspace root.

@@ -5,17 +5,21 @@
 //! wait on each failure (1 s, 2 s, 4 s, 8 s, ..., capped at 60 s).
 //! After a successful connect the session runs for 30 seconds, then
 //! disconnects cleanly and starts the cycle over. Intended to
-//! illustrate the idiomatic way to recover from a dropped session
-//! using the `Failed<S, E>` return type surfaced by the typestate
-//! transitions.
+//! illustrate one recovery strategy: flatten each transition error,
+//! discard that attempt, and rebuild a fresh session. Applications
+//! that need the original state can instead retain the `Failed<S, E>`
+//! value returned by typestate transitions.
 //!
 //! Gated behind the `examples-network` feature.
 //!
 //! ```text
-//! REFLECTOR_HOST=xrf030.example.com:30001 \
+//! DSTAR_CALLSIGN=N0CALL REFLECTOR_HOST=xrf030.example.com:30001 \
 //!     cargo run -p dstar-gateway --example 07_reconnect_with_backoff \
 //!     --features examples-network
 //! ```
+
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
 
 use std::env;
 use std::sync::Arc;
@@ -32,6 +36,7 @@ use tokio::time::timeout;
 
 // Acknowledged workspace dev-deps.
 use pcap_parser as _;
+use thiserror as _;
 use trybuild as _;
 
 /// Max session lifetime before this example voluntarily disconnects
@@ -49,7 +54,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let callsign = Callsign::try_from_str("W1AW")?;
+    let callsign = Callsign::try_from_str(&env::var("DSTAR_CALLSIGN")?)?;
     let reflector_host =
         env::var("REFLECTOR_HOST").unwrap_or_else(|_| "xrf030.example.com:30001".to_string());
 
@@ -76,8 +81,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Graceful disconnect — shell sends UNLINK and waits
-                // for the ACK. On error we fall through to backoff.
+                // Queue a graceful disconnect. The shell sends UNLINK;
+                // this call does not wait for the reflector's ACK.
                 if let Err(e) = async_session.disconnect().await {
                     tracing::warn!(?e, "disconnect failed");
                 }
@@ -127,7 +132,8 @@ async fn connect_once(
     let (n, src) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
         .await
         .map_err(|_| "handshake timeout")??;
-    connecting.handle_input(Instant::now(), src, &buf[..n])?;
+    let slice = buf.get(..n).unwrap_or(&[]);
+    connecting.handle_input(Instant::now(), src, slice)?;
 
     if connecting.state_kind() != ClientStateKind::Connected {
         return Err("handshake did not complete".into());

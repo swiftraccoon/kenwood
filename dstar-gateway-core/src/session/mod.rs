@@ -2,8 +2,7 @@
 //!
 //! The `Driver` trait is the contract every session implements.
 //! See [`driver`] for the trait definition. Per-protocol client
-//! sessions live in [`client`]. Server sessions live in [`server`]
-//! (currently DExtra-only).
+//! sessions live in [`client`]. Server sessions live in [`server`].
 
 pub mod client;
 pub mod driver;

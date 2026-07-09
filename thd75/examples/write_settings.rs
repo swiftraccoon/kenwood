@@ -1,8 +1,8 @@
 //! Write radio settings via CAT and MCP.
 //!
-//! Demonstrates both direct CAT write commands (for settings the
-//! firmware accepts) and MCP memory writes (for settings where CAT
-//! writes are rejected, such as beep and Bluetooth).
+//! Demonstrates a direct CAT setting write and an MCP channel-name
+//! memory write. The CAT portion restores the original squelch value;
+//! the MCP portion intentionally overwrites channel 0's display name.
 //!
 //! Usage:
 //! ```text
@@ -10,9 +10,9 @@
 //! cargo run --example write_settings -- /dev/cu.usbmodem1234
 //! ```
 //!
-//! **Warning:** The MCP write portion enters programming mode. The USB
-//! connection resets when done. The radio display shows "PROG MCP"
-//! during the transfer.
+//! **Warning:** The MCP portion permanently changes channel 0's display
+//! name to `EXAMPLE`; restore it manually after running this example.
+//! It enters programming mode, shows "PROG MCP", and resets USB when done.
 
 // Deps visible to every kenwood-thd75 example target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -89,12 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write a channel name via MCP (read-modify-write of one page).
     // This enters and exits programming mode.
-    println!("Writing channel 0 name to 'EXAMPLE' via MCP...");
+    println!("WARNING: overwriting channel 0 name with 'EXAMPLE' via MCP.");
     println!("(Radio will show 'PROG MCP' briefly)\n");
     radio.write_channel_name(0, "EXAMPLE").await?;
 
     println!("Channel name written.");
     println!("USB connection has been reset by the radio.");
+    println!("Restore channel 0's original name manually when finished.");
     println!("\nTo verify: reconnect and run `cargo run --example channel_dump -- --names`");
 
     Ok(())

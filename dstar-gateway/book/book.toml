@@ -4,7 +4,13 @@ authors = ["swiftraccoon"]
 language = "en"
 src = "src"
 
+# Fail the build when SUMMARY.md names a chapter that does not exist.
+# The default (true) silently generates an empty placeholder instead,
+# which is how a SUMMARY listing outgrew its written pages.
+[build]
+create-missing = false
+
 [output.html]
 default-theme = "ayu"
-git-repository-url = "https://github.com/swiftraccoon/dstar-gateway"
-edit-url-template = "https://github.com/swiftraccoon/dstar-gateway/edit/main/dstar-gateway/book/{path}"
+git-repository-url = "https://github.com/swiftraccoon/kenwood"
+edit-url-template = "https://github.com/swiftraccoon/kenwood/edit/main/dstar-gateway/book/{path}"

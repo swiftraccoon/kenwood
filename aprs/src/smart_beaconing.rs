@@ -34,7 +34,7 @@
 //! the prose claimed "eight parameters via Menu 540-547" while only
 //! seven menu rows existed, and the Turn Time row stated `30 s` while
 //! the algorithm's `Default` impl shipped `15 s` (which matches the
-//! `HamHUD` v2.1 reference and modern community defaults). See CB-G.
+//! `HamHUD` v2.1 reference and modern community defaults).
 //!
 //! # Time handling
 //!

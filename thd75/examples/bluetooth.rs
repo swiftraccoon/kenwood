@@ -1,17 +1,21 @@
 //! Connect and control the radio via Bluetooth SPP.
 //!
-//! Demonstrates Bluetooth serial port connection. The radio must be
-//! paired first via Menu 934 on the TH-D75.
+//! Uses native `IOBluetooth` RFCOMM on macOS and a serial RFCOMM port
+//! on Linux or Windows. The radio must be paired first via Menu 934.
 //!
 //! Usage:
 //! ```text
-//! cargo run --example bluetooth
-//! cargo run --example bluetooth -- /dev/cu.TH-D75
+//! # macOS: optionally pass a paired Bluetooth device name
+//! cargo run -p kenwood-thd75 --example bluetooth
+//! cargo run -p kenwood-thd75 --example bluetooth -- TH-D75
+//!
+//! # Linux/Windows: pass the RFCOMM serial port
+//! cargo run -p kenwood-thd75 --example bluetooth -- /dev/rfcomm0
+//! cargo run -p kenwood-thd75 --example bluetooth -- COM7
 //! ```
 //!
-//! On macOS the Bluetooth SPP port is typically `/dev/cu.TH-D75`.
-//! On Linux it is `/dev/rfcomm0` (after `rfcomm bind`).
-//! On Windows it is a COM port assigned during pairing.
+//! Do not use `/dev/cu.TH-D75` on macOS: Apple's Bluetooth serial
+//! driver drops data for this radio. The native transport bypasses it.
 
 // Deps visible to every kenwood-thd75 example target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -30,22 +34,54 @@ use tokio_serial as _;
 use tracing as _;
 
 use kenwood_thd75::Radio;
-use kenwood_thd75::transport::SerialTransport;
+use kenwood_thd75::transport::Transport;
 use kenwood_thd75::types::Band;
 
-/// Default Bluetooth SPP port on macOS after pairing.
-const DEFAULT_BT_PORT: &str = "/dev/cu.TH-D75";
+#[cfg(target_os = "linux")]
+const DEFAULT_BT_PORT: Option<&str> = Some("/dev/rfcomm0");
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const DEFAULT_BT_PORT: Option<&str> = None;
+
+#[cfg(target_os = "macos")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use kenwood_thd75::transport::BluetoothTransport;
+
+    let device_name = std::env::args().nth(1);
+    println!(
+        "Connecting via native Bluetooth RFCOMM to {}...",
+        device_name.as_deref().unwrap_or("TH-D75")
+    );
+    println!("(Radio must be paired via Menu 934 first.)\n");
+
+    let transport = BluetoothTransport::open(device_name.as_deref())?;
+    inspect_radio(transport).await
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use kenwood_thd75::transport::SerialTransport;
+
     let port = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| DEFAULT_BT_PORT.to_owned());
+        .or_else(|| DEFAULT_BT_PORT.map(str::to_owned))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "pass the Bluetooth serial port, for example COM7",
+            )
+        })?;
 
     println!("Connecting via Bluetooth SPP on {port}...");
     println!("(Radio must be paired via Menu 934 first.)\n");
 
     let transport = SerialTransport::open(&port, SerialTransport::DEFAULT_BAUD)?;
+    inspect_radio(transport).await
+}
+
+async fn inspect_radio<T: Transport>(transport: T) -> Result<(), Box<dyn std::error::Error>> {
     let mut radio = Radio::connect(transport).await?;
 
     // Identify.

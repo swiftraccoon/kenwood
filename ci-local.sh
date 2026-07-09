@@ -149,6 +149,10 @@ ci_pod() {
         # automatically without editing this script.
         step "check workspace"       cargo check --workspace --all-targets
         step "clippy workspace"      cargo clippy --workspace --all-targets -- -D warnings
+        # `--all-targets` skips any target whose `required-features` are
+        # off, silently. Without this pass the network-gated examples and
+        # the feature-gated integration tests are never compiled at all.
+        step "clippy all-features"   cargo clippy --workspace --all-targets --all-features -- -D warnings
         step "clippy +encoder"       cargo clippy -p mbelib-rs --all-targets --features encoder -- -D warnings
         step "clippy +kenwood"       cargo clippy -p mbelib-rs --all-targets --features kenwood-tables -- -D warnings
         # Some thd75 integration tests depend on gitignored spec
@@ -157,6 +161,9 @@ ci_pod() {
         step "test +encoder"         cargo test -p mbelib-rs --features encoder --lib
         step "test +kenwood"         cargo test -p mbelib-rs --features kenwood-tables --lib
         step "doc workspace"         env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+        # Feature-gated modules carry doc comments the default pass never
+        # renders, so their intra-doc links go unchecked without this.
+        step "doc all-features"      env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
         step "audit"                 cargo audit --file Cargo.lock
         step "deny"                  cargo deny check
         step "machete"               cargo machete .

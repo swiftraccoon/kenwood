@@ -2,8 +2,9 @@
 //! Blocking-shell CLI: no tokio runtime, just `std::net::UdpSocket`.
 //!
 //! Demonstrates the [`dstar_gateway::blocking_shell::BlockingSession`]
-//! entry point for consumers that don't want to drag in the tokio
-//! runtime. The main loop is a regular `fn main()` — no
+//! entry point for consumers that don't want to run a tokio runtime.
+//! Tokio remains a dependency of the parent async crate. The main
+//! loop is a regular `fn main()` — no
 //! `#[tokio::main]`, no `async fn`, no channels.
 //!
 //! The blocking shell is caller-driven: each call to
@@ -15,10 +16,13 @@
 //! Gated behind `examples-network` AND the `blocking` feature:
 //!
 //! ```text
-//! REFLECTOR_HOST=xrf030.example.com:30001 \
+//! DSTAR_CALLSIGN=N0CALL REFLECTOR_HOST=xrf030.example.com:30001 \
 //!     cargo run -p dstar-gateway --example 09_blocking_cli \
 //!     --features "examples-network blocking"
 //! ```
+
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
 
 use std::env;
 use std::net::UdpSocket;
@@ -31,14 +35,19 @@ use dstar_gateway_core::session::client::{
 };
 use dstar_gateway_core::types::{Callsign, Module};
 
-// Acknowledged workspace dev-deps.
+// Acknowledged workspace dev-deps. This example is deliberately
+// not running tokio, so the async runtime and `tracing` facade are
+// acknowledged rather than used.
 use pcap_parser as _;
+use thiserror as _;
+use tokio as _;
+use tracing as _;
 use trybuild as _;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let callsign = Callsign::try_from_str("W1AW")?;
+    let callsign = Callsign::try_from_str(&env::var("DSTAR_CALLSIGN")?)?;
     let reflector_host =
         env::var("REFLECTOR_HOST").unwrap_or_else(|_| "xrf030.example.com:30001".to_string());
 
@@ -72,7 +81,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Recv ACK.
     let mut buf = [0u8; 64];
     let (n, src) = sock.recv_from(&mut buf)?;
-    connecting.handle_input(Instant::now(), src, &buf[..n])?;
+    let slice = buf.get(..n).unwrap_or(&[]);
+    connecting.handle_input(Instant::now(), src, slice)?;
     if connecting.state_kind() != ClientStateKind::Connected {
         eprintln!("handshake did not complete");
         return Ok(());

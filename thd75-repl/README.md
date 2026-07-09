@@ -1,6 +1,6 @@
 # thd75-repl
 
-Accessible command-line REPL for the Kenwood TH-D75 transceiver. Designed for screen-reader compatibility and rigorously conformant to nine published accessibility standards.
+Accessible command-line REPL for the Kenwood TH-D75 transceiver. Its screen-reader-oriented output contract draws on nine published accessibility standards and guidance sources.
 
 ## Features
 
@@ -8,7 +8,7 @@ Accessible command-line REPL for the Kenwood TH-D75 transceiver. Designed for sc
 - D-STAR reflector gateway (DPlus/DExtra/DCS, REF/XRF/XLX/DCS reflectors)
 - APRS KISS mode (packet radio)
 - Auto-detect Reflector Terminal Mode on startup
-- Auto-download Pi-Star host files
+- Offer to download Pi-Star host files when connecting to a reflector without them
 - Plain text output, one line at a time
 - No box drawing, escape sequences, or cursor repositioning
 - Per-command help via `help <command>` and `help all`
@@ -16,13 +16,13 @@ Accessible command-line REPL for the Kenwood TH-D75 transceiver. Designed for sc
 - Re-announce previous output via `last`, `last N`, or `last all`
 - Transmit confirmation on every TX command (disable with `--yes`)
 - Verbose / quiet toggle for monitor modes (`verbose on|off`, `quiet`)
-- Accessibility compliance self-check via `thd75-repl check`
+- Accessibility output self-check via `thd75-repl check`
 - Script mode via `--script <file>` for batch operation
 - Local-time timestamps via `--local-time` and `--utc-offset=+HH:MM`
 
-## Accessibility compliance
+## Accessibility contract
 
-This REPL conforms to nine published accessibility standards:
+The output design draws requirements and guidance from:
 
 - WCAG 2.1 Level AA
 - Section 508 of the US Rehabilitation Act
@@ -34,9 +34,9 @@ This REPL conforms to nine published accessibility standards:
 - Handi-Ham Program recommendations
 - ARRL accessibility resources
 
-Conformance is enforced by 14 mechanically-checked rules (R1-R14) covering line length, ASCII purity, error prefixes, unit spelling, boolean rendering, label format, and more. Every user-facing string is unit-tested against the rule set.
+The locally enforceable contract consists of 14 mechanically checked rules (R1-R14) covering line length, ASCII purity, error prefixes, unit spelling, boolean rendering, label format, and more. Tests exercise representative output from each formatter against that rule set. Passing these checks is not an independent certification of complete conformance to every external source above.
 
-Run `thd75-repl check` to verify your build meets the spec. The subcommand exercises every formatter, runs the accessibility lint, and prints a rule-by-rule report. Exit 0 means every string passes every rule.
+Run `thd75-repl check` to verify the mechanically checked output contract. The subcommand exercises every formatter with representative inputs, runs the accessibility lint, and prints a rule-by-rule report. Exit 0 means the generated sample set passes all 14 local rules.
 
 ## Usage
 
@@ -112,11 +112,13 @@ thd75-repl --log-level=debug     # state transitions + decoded events
 thd75-repl --log-level=info      # high-level session flow only
 ```
 
-File location (rotated daily):
+File location (one fresh file per session, suffix is the UTC session
+start time at second granularity — nothing rotates, so old files
+accumulate until you delete them):
 
-- macOS: `~/Library/Logs/thd75-repl/thd75-repl.log.<date>`
-- Linux: `~/.local/state/thd75-repl/thd75-repl.log.<date>`
-- Windows: `%LOCALAPPDATA%\thd75-repl\logs\thd75-repl.log.<date>`
+- macOS: `~/Library/Logs/thd75-repl/thd75-repl.log.<YYYY-MM-DD-HHMMSS>`
+- Linux: `~/.local/state/thd75-repl/thd75-repl.log.<YYYY-MM-DD-HHMMSS>`
+- Windows: `%LOCALAPPDATA%\thd75-repl\logs\thd75-repl.log.<YYYY-MM-DD-HHMMSS>`
 
 For live stderr output (power users, no file), set `RUST_LOG`:
 

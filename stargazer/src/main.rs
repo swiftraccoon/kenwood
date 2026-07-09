@@ -1,9 +1,9 @@
 //! Stargazer: D-STAR network observatory.
 //!
-//! A headless Kubernetes-deployed service that discovers active D-STAR
-//! reflectors, monitors real-time activity, captures voice transmissions with
-//! metadata, decodes AMBE audio to MP3, and uploads completed streams to an
-//! `SDRTrunk`-compatible Rdio API server for transcription.
+//! A headless service that discovers active D-STAR reflectors, monitors XLX
+//! activity, stores it in `PostgreSQL`, exposes an HTTP API, and processes queued
+//! uploads to an `SDRTrunk`-compatible Rdio API server. Tier 3 voice-capture
+//! components exist, but live session orchestration is not yet wired.
 //!
 //! # Architecture
 //!
@@ -13,12 +13,12 @@
 //!   reflector registry.
 //! - **Tier 2** (Monitoring): connects to active XLX reflectors via UDP JSON
 //!   monitor protocol for real-time activity events.
-//! - **Tier 3** (Capture): establishes full D-STAR protocol connections to
-//!   capture and decode voice streams.
+//! - **Tier 3** (Capture, stub): the decoder and capture state exist, but the
+//!   session pool does not yet establish D-STAR connections.
 //!
 //! All tiers run as independent tokio tasks. A background upload processor
 //! sends completed streams to the Rdio API server. An HTTP API provides
-//! operational visibility and manual session control.
+//! operational visibility; manual Tier 3 controls currently return `501`.
 //!
 //! # Usage
 //!
@@ -50,7 +50,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-/// D-STAR network observatory — reflector monitoring and voice capture service.
+/// Experimental D-STAR reflector discovery and XLX monitoring service.
 #[derive(Debug, Parser)]
 #[command(name = "stargazer", version, about)]
 struct Cli {

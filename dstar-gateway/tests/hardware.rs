@@ -1,4 +1,4 @@
-//! Hardware-in-the-loop tests against real reflectors.
+//! Opt-in integration tests against live reflectors.
 //!
 //! Gated behind the `hardware-tests` feature flag. Requires a
 //! network-reachable D-STAR reflector for each protocol and
@@ -18,6 +18,9 @@
 //!   reflector (default: `XLX307`). The tests append `:30001`.
 //! - `DSTAR_TEST_REFLECTOR_DCS` — host name of a `DCS` reflector
 //!   (default: `DCS001`). The tests append `:30051`.
+//! - `DSTAR_TEST_REFLECTOR_CALLSIGN` — routing callsign used by the
+//!   voice TX header (default: `REF030`). Keep this separate from the
+//!   DNS hostname in `DSTAR_TEST_REFLECTOR_DPLUS`.
 //! - `DSTAR_TEST_CALLSIGN` — user callsign to authenticate with
 //!   (default: `TEST    `). Must be a valid amateur radio callsign when
 //!   running the TX test against a real reflector.
@@ -33,6 +36,9 @@
 //! required for any test that transmits. Remove none of these gates.
 
 #![cfg(feature = "hardware-tests")]
+
+#[cfg(feature = "hosts-fetcher")]
+use reqwest as _;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -100,22 +106,18 @@ async fn resolve_peer(host: &str, port: u16) -> Result<SocketAddr, Box<dyn std::
 /// prefix (e.g., `"REF030"`) and local callsign. Pattern matches the
 /// loopback tests in `loopback_dplus.rs`.
 fn build_header(
-    reflector_prefix: &str,
+    reflector_callsign: &str,
     reflector_module: char,
     my_call: Callsign,
 ) -> Result<DStarHeader, Box<dyn std::error::Error>> {
-    let rpt1 = format!("{reflector_prefix} {reflector_module}");
-    let rpt2 = format!("{reflector_prefix} G");
-    Ok(DStarHeader {
-        flag1: 0,
-        flag2: 0,
-        flag3: 0,
-        rpt2: Callsign::try_from_str(&rpt2)?,
-        rpt1: Callsign::try_from_str(&rpt1)?,
-        ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
+    Ok(DStarHeader::for_relay(
         my_call,
-        my_suffix: Suffix::EMPTY,
-    })
+        Module::B,
+        Callsign::try_from_str(reflector_callsign)?,
+        Module::try_from_char(reflector_module)?,
+        my_call,
+        Suffix::EMPTY,
+    ))
 }
 
 /// Drive a `Session<DExtra, _>` or `Session<Dcs, _>` through its
@@ -371,7 +373,9 @@ async fn dplus_voice_burst_to_real_reflector() -> Result<(), Box<dyn std::error:
     listen_for(&mut async_session, Duration::from_millis(500)).await;
 
     // Build a header + transmit three voice frames + EOT.
-    let header = build_header(reflector.as_str(), 'C', callsign)?;
+    let reflector_callsign =
+        std::env::var("DSTAR_TEST_REFLECTOR_CALLSIGN").unwrap_or_else(|_| "REF030".to_string());
+    let header = build_header(&reflector_callsign, 'C', callsign)?;
     let sid = StreamId::new(0x1234).ok_or("zero stream id")?;
     async_session.send_header(header, sid).await?;
 

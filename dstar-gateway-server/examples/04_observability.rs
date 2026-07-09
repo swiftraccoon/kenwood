@@ -1,4 +1,4 @@
-//! Production-grade structured logging for a reflector.
+//! Structured JSON logging for a reflector.
 //!
 //! Installs a `tracing-subscriber` with the JSON formatter so every
 //! log line is a parsable JSON object suitable for ingest by
@@ -19,10 +19,10 @@
 //! ```
 //!
 //! Notes:
-//! - The JSON format is stable across tracing-subscriber releases.
-//! - `tracing-subscriber` is a dev-dependency of this crate, so the
-//!   example links against it without pulling it into downstream
-//!   consumers.
+//! - `tracing-subscriber` is a regular dependency of this crate (the
+//!   `polaris` binary installs a subscriber). The `json` feature that
+//!   this example needs is added by the dev-dependency entry, so it is
+//!   available to examples and tests but not to downstream consumers.
 
 use std::collections::HashSet;
 use std::sync::Arc;

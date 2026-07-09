@@ -37,7 +37,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 default = []
 blocking = []
 hosts-fetcher = ["dep:reqwest"]
-# Opt-in hardware-in-the-loop integration tests. Requires a reachable
+# Opt-in live-reflector integration tests. Requires a reachable
 # reflector (see `tests/hardware.rs`). Off by default so normal
 # `cargo test` runs do not reach out to the network. Enable with
 # `cargo test --features hardware-tests --test hardware -- --test-threads=1`.
@@ -91,7 +91,7 @@ required-features = ["examples-network", "blocking"]
 name = "10_record_session_to_file"
 required-features = ["examples-network"]
 
-# Hardware-in-the-loop tests: Cargo skips the test target entirely
+# Live-reflector tests: Cargo skips the test target entirely
 # when the feature is off, so the unused_crate_dependencies lint
 # never fires on it and no #![cfg] gymnastics are needed inside
 # the file.

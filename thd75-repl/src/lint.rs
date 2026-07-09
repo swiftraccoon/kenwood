@@ -1,13 +1,14 @@
 //! Accessibility lint checker for REPL output.
 //!
-//! Implements fourteen hard rules (R1 through R14) that together
-//! establish conformance to nine published accessibility standards:
+//! Implements fourteen hard rules (R1 through R14) derived from concerns
+//! covered by nine published accessibility standards and guidance sources:
 //! WCAG 2.1 Level AA, Section 508 of the US Rehabilitation Act, the
 //! CHI 2021 CLI accessibility paper, EN 301 549 version 3.2.1,
 //! ISO 9241-171, ITU-T Recommendation F.790, BRLTTY compatibility,
 //! the Handi-Ham Program recommendations, and the ARRL accessibility
-//! resources. Each `Rule` variant carries its own doc comment
-//! describing the specific constraint.
+//! resources. These local checks do not independently certify complete
+//! conformance to each source. Each `Rule` variant carries its own doc
+//! comment describing the specific constraint.
 
 use std::fmt;
 

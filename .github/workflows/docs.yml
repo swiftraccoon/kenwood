@@ -41,14 +41,21 @@ jobs:
           <body>
             <p>Redirecting to <a href="kenwood_thd75/">kenwood-thd75 documentation</a>.</p>
             <p>Other crates in this workspace:
-              <a href="dstar_gateway/">dstar-gateway</a>,
-              <a href="dstar_gateway_core/">dstar-gateway-core</a>,
-              <a href="dstar_gateway_server/">dstar-gateway-server</a>,
               <a href="thd75_tui/">thd75-tui</a>,
               <a href="thd75_repl/">thd75-repl</a>,
+              <a href="kiss_tnc/">kiss-tnc</a>,
+              <a href="ax25_codec/">ax25-codec</a>,
+              <a href="aprs/">aprs</a>,
+              <a href="aprs_is/">aprs-is</a>,
+              <a href="dstar_gateway_core/">dstar-gateway-core</a>,
+              <a href="dstar_gateway/">dstar-gateway</a>,
+              <a href="dstar_gateway_server/">dstar-gateway-server</a>,
+              <a href="mmdvm_core/">mmdvm-core</a>,
+              <a href="mmdvm/">mmdvm</a>,
               <a href="mbelib_rs/">mbelib-rs</a>,
               <a href="sextant/">sextant</a>,
-              <a href="stargazer/">stargazer</a>.
+              <a href="stargazer/">stargazer</a>,
+              <a href="lodestar_core/">lodestar-core</a>.
             </p>
           </body>
           </html>

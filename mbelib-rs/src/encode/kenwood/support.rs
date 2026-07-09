@@ -56,7 +56,7 @@ pub const RISING_COSINE_CURVE: [f32; 9] = [
     9.9691915512e-01,
 ];
 
-/// [0,0,b1,b2,b3,a1,a2] applied twice
+/// Coefficient layout `[0, 0, b1, b2, b3, a1, a2]`, applied twice.
 /// Extracted from TH-D75 AMBE DSP firmware (E5210 AMBE DSHP1.00.01)
 /// at DSP VA 0x1183D2C4.
 pub const BIQUAD_PATTERN_TWICE: [f32; 13] = [

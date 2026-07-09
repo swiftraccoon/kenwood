@@ -49,16 +49,16 @@ expecting stability.
 | [`mmdvm/`](mmdvm/) | Tokio async shell for MMDVM modems | experimental |
 | [`mbelib-rs/`](mbelib-rs/) | AMBE 3600×2400 voice codec (decoder default; encoder behind `--features encoder`) | experimental |
 | [`sextant/`](sextant/) | GUI D-STAR reflector client — exercises the laptop-only encode/decode pipeline against a local `polaris` reflector | experimental |
-| [`stargazer/`](stargazer/) | D-STAR network observatory — reflector monitoring and voice capture with Postgres + HTTP API | experimental |
-| [`lodestar-core/`](lodestar-core/) | UniFFI Rust core for the Lodestar iOS/macOS app | experimental |
+| [`stargazer/`](stargazer/) | D-STAR observatory — discovery and XLX monitoring, with unwired voice-capture components | experimental |
+| [`lodestar-core/`](lodestar-core/) | UniFFI Rust core for the Lodestar macOS/iPadOS app | experimental |
 
 ## App
 
 | App | Platform | Source | Status |
 |-----|----------|--------|--------|
-| Lodestar | iOS, iPadOS, macOS | [`lodestar/`](lodestar/) (Xcode) + [`lodestar-core/`](lodestar-core/) (Rust via UniFFI) | experimental |
+| Lodestar | iPadOS, macOS | [`lodestar/`](lodestar/) (Xcode) + [`lodestar-core/`](lodestar-core/) (Rust via UniFFI) | experimental |
 
-Lodestar is a D-STAR gateway app that bridges a TH-D75 over Bluetooth RFCOMM to DPlus / DExtra / DCS reflectors. SwiftUI front-end, native macOS `IOBluetooth` transport, iOS private-framework `BluetoothManager` transport (sideload-only). Build via XcodeGen: `(cd lodestar && xcodegen generate && open Lodestar.xcodeproj)`.
+Lodestar is a SwiftUI D-STAR gateway app for DPlus / DExtra / DCS reflectors. The macOS build can bridge a TH-D75 over native `IOBluetooth` RFCOMM. The iPadOS build is currently reflector-only; its USB-C DriverKit transport is scaffolded but not yet functional. iPhone is not supported. Build via XcodeGen: `(cd lodestar && xcodegen generate && open Lodestar.xcodeproj)`.
 
 ## Building
 
@@ -66,10 +66,10 @@ Lodestar is a D-STAR gateway app that bridges a TH-D75 over Bluetooth RFCOMM to 
 cargo build --workspace
 cargo test --workspace
 ./lint.sh       # clippy --all-targets, cargo-audit, cargo-deny, cargo-machete, fmt
-./ci-local.sh   # cross-platform CI in macOS + Ubuntu + Fedora pods
+./ci-local.sh   # cross-platform CI: macOS locally, Ubuntu + Fedora in k8s pods
 ```
 
-Rust 1.94+, edition 2024. Workspace-level lints enforce `unsafe_code = "forbid"`, `missing_docs = "deny"`, and clippy `pedantic`/`nursery`/`cargo` across every crate.
+Rust 1.94+, edition 2024. Workspace-level lints enforce `unsafe_code = "forbid"`, `missing_docs = "deny"`, and clippy `pedantic`/`nursery`/`cargo`. A crate's `[lints]` table replaces the workspace one rather than merging, so four crates restate it: `thd75` and `thd75-tui` deny (rather than forbid) `unsafe_code` for the macOS `IOBluetooth` bindings, `lodestar-core` permits it for the generated UniFFI scaffolding, and `thd75-repl` restates the table only to diverge on other lints — it forbids `unsafe_code` and contains no FFI. Every `unsafe` block outside that allowlist is rejected by `./lint.sh`'s unsafe audit.
 
 ## License
 

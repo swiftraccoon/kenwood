@@ -1239,7 +1239,7 @@ pub fn build_aprs_mice_with_message_packet(
     // Earlier code generations only set the bit for ≥100°, which left
     // 0-9° longitudes encoded into the info-field byte range 28..37
     // — outside the spec-listed valid encodings. Spec-strict receivers
-    // would mis-decode. See CB-B-3.
+    // would mis-decode.
     let lon_offset = !(10.0..100.0).contains(&lon_abs);
     let dest_chars: [u8; 6] = [
         if msg_a { b'P' + d0 } else { b'0' + d0 },
@@ -2864,7 +2864,7 @@ mod tests {
 
     #[test]
     fn build_mice_lon_0_to_9_sets_offset_and_high_column() -> TestResult {
-        // Regression guard for CB-B-3 (APRS 1.0.1 §10 p.47): a longitude
+        // Regression guard (APRS 1.0.1 §10 p.47): a longitude
         // in 0..10° must (a) set the offset bit on destination char 4,
         // and (b) emit an info-field d-byte in the high column 118-127
         // (`v` through `DEL`). Pre-fix the builder emitted bytes 28-37

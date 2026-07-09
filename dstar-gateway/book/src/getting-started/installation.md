@@ -4,27 +4,40 @@ Add `dstar-gateway` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-dstar-gateway = "0.1"
+dstar-gateway = { git = "https://github.com/swiftraccoon/kenwood", branch = "main" }
+dstar-gateway-core = { git = "https://github.com/swiftraccoon/kenwood", branch = "main" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
 ```
 
+The crates are not published to crates.io. For reproducible builds,
+replace `branch = "main"` with `rev = "<commit SHA>"`; contributors
+working in this monorepo can use `path` dependencies instead.
+
 This gets you the default feature set: the tokio-backed
 `AsyncSession<P>`, the DPlus `AuthClient`, and all three codecs.
-`dstar-gateway-core` is pulled in transitively — you don't need
-to list it as a separate dependency.
+
+`dstar-gateway` re-exports the core's leaf types (`Callsign`,
+`Module`, `DStarHeader`, `VoiceFrame`, `Error`, …) from its crate
+root, so simple programs need only this one dependency. The typestate
+session machinery — `Session`, `Driver`, the `Configured` /
+`Connected` state markers, and the `DPlus` / `DExtra` / `Dcs`
+protocol markers — is **not** re-exported. If you drive the sans-io
+core directly, add `dstar-gateway-core` as an explicit dependency.
 
 ## Feature flags
 
 | Feature | Default? | What it enables |
 |---------|----------|-----------------|
-| `blocking` | off | Compiles a non-tokio blocking shell under `dstar_gateway::blocking_shell`. Useful for CLI scripts and test fixtures that don't want to spin up a tokio runtime. |
-| `hosts-fetcher` | off | Pulls `reqwest` and enables `dstar_gateway::hosts_fetcher::HostsFetcher`, which downloads the Pi-Star `DPlus_Hosts.txt` / `DExtra_Hosts.txt` / `DCS_Hosts.txt` files over HTTPS. |
+| `blocking` | off | Compiles a caller-driven synchronous shell under `dstar_gateway::blocking_shell`. It uses `std::net::UdpSocket` and does not run a tokio runtime, although tokio remains a dependency of the async crate. |
+| `hosts-fetcher` | off | Pulls `reqwest` and enables `dstar_gateway::hosts_fetcher::HostsFetcher`, which fetches the XLX reflector directory (http://xlxapi.rlx.lu) over HTTP via `HostsFetcher::fetch_xlx_directory`. |
+| `examples-network` | off | Compiles examples that contact live network services; intended for repository development. |
+| `hardware-tests` | off | Compiles ignored live-reflector integration tests; intended for repository development. |
 
 To enable both:
 
 ```toml
 [dependencies]
-dstar-gateway = { version = "0.1", features = ["blocking", "hosts-fetcher"] }
+dstar-gateway = { git = "https://github.com/swiftraccoon/kenwood", branch = "main", features = ["blocking", "hosts-fetcher"] }
 ```
 
 ## MSRV
@@ -40,15 +53,15 @@ instead of (or alongside) the client crate:
 
 ```toml
 [dependencies]
-dstar-gateway-server = "0.1"
+dstar-gateway-server = { git = "https://github.com/swiftraccoon/kenwood", branch = "main" }
+dstar-gateway-core = { git = "https://github.com/swiftraccoon/kenwood", branch = "main" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
 ```
 
-The server crate re-exports the common types from
-`dstar-gateway-core`, so you don't need to depend on either of
-the other two crates unless you specifically want the client
-`AsyncSession<P>` as well (e.g. to implement a cross-protocol
-bridge that is both a client and a server).
+The server crate does not re-export the core's common types, so add
+`dstar-gateway-core` explicitly for `Callsign`, `Module`, and related
+configuration types. Add the client crate only when you also need
+`AsyncSession<P>`.
 
 ## Verifying the install
 
@@ -83,10 +96,10 @@ that your `use` statements match the ones in the example.
 
 ## What the test suite looks like
 
-`dstar-gateway` ships with around **2,200 tests**, plus 10 fuzz
+`dstar-gateway` ships with a large test suite, plus fuzz
 targets and a loopback integration test harness for every
-protocol. The full test suite runs in under a minute on a modern
-laptop:
+protocol. Runtime depends on the machine and enabled feature matrices;
+the complete workspace lint runs several test/doc configurations:
 
 ```bash
 cargo test --workspace
@@ -97,9 +110,9 @@ in CI. You can run one locally with:
 
 ```bash
 cd dstar-gateway-core/fuzz
-cargo +nightly fuzz run parse_dplus_header -- -max_total_time=60
+cargo +nightly fuzz run header_decode -- -max_total_time=60
 ```
 
 Once you've verified everything builds, move on to
-[Hello, REF030 (DPlus)](hello-dplus.md) or one of the other two
+[Hello, local DPlus](hello-dplus.md) or one of the other two
 walkthroughs.

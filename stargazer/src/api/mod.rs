@@ -13,7 +13,7 @@
 //! |-------|--------|---------|
 //! | `/health` | GET | Kubernetes liveness/readiness probe |
 //! | `/metrics` | GET | Tier statistics: reflectors, streams, upload queue |
-//! | `/api/reflectors` | GET | List reflectors with status and activity scores |
+//! | `/api/reflectors` | GET | List reflectors with status, most recent first |
 //! | `/api/reflectors/{callsign}/activity` | GET | Recent activity for one reflector |
 //! | `/api/reflectors/{callsign}/nodes` | GET | Nodes currently linked to a reflector |
 //! | `/api/activity` | GET | Recent activity across all reflectors |

@@ -10,11 +10,13 @@ Decoder on by default; encoder behind the `encoder` Cargo feature.
 - **Encoder** (`--features encoder`): 160-sample PCM → 9-byte AMBE frames.
   All 9 parameter fields (pitch / V/UV / gain / PRBA × 2 / HOC × 4) are
   populated from real signal analysis, FEC-encoded, scrambled, and packed
-  to wire form. Chip-interop (DVSI hardware receiving our bytes) is
-  untested as of this writing — use `--features encoder` at your own risk.
+  to wire form. The encoder is experimental: reliable DVSI hardware
+  interoperability is not yet validated, and the ignored correlation test
+  tracks a known spectral-envelope defect.
 - **D-STAR only**: AMBE 3600×2400 is the mandatory voice codec for the
-  JARL D-STAR standard. Does **not** support AMBE+, AMBE+2, IMBE, tone
-  synthesis, or the AMBE+2 "half-rate" variant used by DMR / YSF / NXDN
+  JARL D-STAR standard. The decoder synthesizes valid single-tone frames,
+  but the encoder does not emit tone frames. Does **not** support AMBE+,
+  AMBE+2, IMBE, or the AMBE+2 "half-rate" variant used by DMR / YSF / NXDN
   (which remains covered by US Patent 8,359,197 until 2028-05-20).
 
 ## Usage
@@ -51,9 +53,13 @@ One decoder/encoder per voice stream (each carries inter-frame state).
    bits) are unprotected data.
 3. LFSR demodulation of C1 using corrected C0 as seed.
 4. Parameter extraction into 49-bit vector → `w0`, `L`, voiced/unvoiced
-   decisions, spectral magnitudes. Erasure (b0=120..=123) and tone
-   (b0=126..=127) frames fall through to error concealment (reuse
-   previous frame, increment repeat counter).
+   decisions, spectral magnitudes. Disposition then splits three ways:
+   valid tone frames (b0=126..=127) are synthesized directly by a
+   dedicated tone oscillator; erasure frames (b0=120..=123) and
+   out-of-range tone descriptors emit silence and fully re-initialize
+   the decoder state; voice frames whose FEC required more than 3
+   corrected bits reuse the previous frame's parameters and increment
+   the repeat counter.
 5. Spectral amplitude enhancement.
 6. JMBE adaptive smoothing (algorithms #111-116).
 7. Frame muting: if error rate exceeds 9.6% or repeat counter reaches
@@ -98,32 +104,58 @@ Symmetrical to decode, plus an analysis front-end:
 9. LFSR scramble of C1 seeded from C0 data bits.
 10. 72-bit interleave to transmission order, pack to 9 wire bytes.
 
-### Validation infrastructure
+### Stream tools and validation infrastructure
 
-Two `cargo run --release --example` harnesses validate against
-OP25's reference implementation with identical inputs:
+Decode concatenated 9-byte AMBE frames to signed 16-bit little-endian PCM,
+or encode 8 kHz mono PCM in the other direction:
+
+```bash
+cargo run -p mbelib-rs --example decode_ambe_stream -- input.ambe output.s16
+cargo run -p mbelib-rs --features encoder --example encode_ambe_stream -- input.s16 output.ambe
+```
+
+Four validation harnesses compare against OP25's reference
+implementation with identical inputs. Each is an `encoder`-feature
+example, run with:
+
+```bash
+cargo run -p mbelib-rs --release --features encoder --example <name> -- <args>
+```
 
 - `validate_quantize_vs_op25 <op25.trace>` — feeds OP25's exact
-  `imbe_param` (sa, v_uv_dsn, ref_pitch, prev state) into our
-  `quantize()` and checks `b[0..8]` byte-for-byte. As of the last
-  pass: **b3/b4/b5/b6/b7 (spectral) 100%**, b2 (gain) 99%, b1 (VUV)
-  88%, b0 (pitch) 60%, b8 (HOC_B8) 30% (OP25 off-spec in D-STAR
-  mode — our stride-2 is correct per mbelib).
+  `imbe_param` (sa, `v_uv_dsn`, `ref_pitch`, prev state) into our
+  `quantize()` and reports `b[0..8]` field differences. Match rates depend
+  on the supplied trace; no fixed percentage is treated as a current
+  guarantee.
 - `validate_analysis_vs_op25 <pcm> <op25.trace>` — runs our full
-  analysis pipeline on identical PCM and compares pitch/num_harms
-  against OP25's IMBE. ±5-sample pitch match ≈ 45% — the multi-
-  frame DP look-ahead from OP25 `pitch_est.cc:229-281` is the
-  remaining piece to close this gap.
+  analysis pipeline on identical PCM and compares `pitch`/`num_harms`
+  against OP25's IMBE. The 2-frame DP look-ahead from OP25
+  `pitch_est.cc:229-281` is implemented (`AmbeEncoder::new_with_lookahead`,
+  `PitchTracker::estimate_with_lookahead`), closing most of this gap
+  at the cost of ≈40 ms added latency.
+- `validate_bvec_vs_op25 <pcm> <op25.trace>` — per-field `b0..b8` diff
+  of our encoder against OP25's `ambe_encode_dump` trace, reverse-
+  deriving each field from our 49-bit `ambe_d` via the D-STAR bit
+  layout.
+- `validate_dp_vs_op25 <pcm> <op25.trace>` — A/B of single-frame
+  `PitchTracker::estimate` against the 2-frame DP
+  `estimate_with_lookahead`, reporting the pitch-match rate for each.
 
 Produce the `.trace` input with the `ambe_encode_dump` harness
 built against an OP25 checkout (CLI: `ambe_encode_dump <pcm>
 <out.ambe> <trace>`).
 
+The encoder currently clears structural round-trip and non-silence tests,
+but `sine_roundtrip_has_nonzero_correlation_with_input` remains ignored at
+roughly 0.04 correlation. The PRBA/HOC spectral-envelope fields (`b3` through
+`b8`) are the active investigation area. Treat these harnesses as diagnostic
+tools, not evidence of reliable DVSI hardware interoperability.
+
 Derived from Max H. Parke (KA1RBI)'s `ambe_encoder.cc` and Pavel
 Yazev's `imbe_vocoder` in [boatbod/op25](https://github.com/boatbod/op25)
 (GPL-3.0-or-later, 2009–2016). Our Rust formulation simplifies the
-ETSI fixed-point arithmetic to native f32 throughout; intelligibility
-should match but bit-exact DVSI chip output is not guaranteed.
+ETSI fixed-point arithmetic to native f32 throughout; bit-exact output and
+reliable DVSI chip interoperability are not guaranteed.
 
 ## Dependencies
 
@@ -150,8 +182,9 @@ GPL-2.0-or-later (decoder) / GPL-3.0-or-later (encoder, feature-gated).
   Enabling the `encoder` feature activates GPL-3.0-or-later provisions
   for the resulting binary.
 
-See [`LICENSE`](./LICENSE) for upstream copyright notices. Full license
-texts in [`LICENSES/`](./LICENSES/).
+See [`LICENSE`](https://github.com/swiftraccoon/kenwood/blob/main/mbelib-rs/LICENSE)
+for upstream copyright notices. Full license texts in
+[`LICENSES/`](https://github.com/swiftraccoon/kenwood/tree/main/mbelib-rs/LICENSES).
 
 ## Patents
 

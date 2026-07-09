@@ -85,6 +85,35 @@ fn cat_basics_script_lints_clean() -> TestResult {
 }
 
 #[test]
+fn terminal_mode_guard_intercepts_cat_commands() -> TestResult {
+    // The `mmdvm` scenario puts the radio in a DV Gateway mode where CAT
+    // identification fails but an MMDVM probe answers. The REPL must take
+    // the terminal-mode path and, when the script issues a CAT command
+    // (`mode b`), intercept it with Menu 650 guidance instead of letting
+    // it block for the full command timeout.
+    let (_ok, stdout, stderr) = run_with_script("terminal_mode.txt", "mmdvm")?;
+
+    assert!(
+        stdout.contains("Reflector Terminal Mode"),
+        "missing terminal-mode notice in stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("650"),
+        "CAT command should be met with Menu 650 guidance, not a timeout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("timed out"),
+        "CAT command timed out instead of being intercepted by the guard:\n{stdout}"
+    );
+    let lint_result = lint::check_output(&stdout);
+    assert!(
+        lint_result.is_ok(),
+        "terminal-mode stdout violates rules: {lint_result:#?}\nstdout:\n{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
 fn help_all_script_runs_without_crash() -> TestResult {
     // Empty scenario has no programmed exchanges, so the REPL will
     // fail identification and exit early. We only check that the

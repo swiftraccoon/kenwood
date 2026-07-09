@@ -44,6 +44,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
+    // NOTE: `.reflector_callsign()` is omitted below, so the DCS
+    // builder defaults the reflector callsign to `DCS001`. That is
+    // correct only for reflector DCS001 — set it explicitly to reach
+    // any other DCS reflector, since the callsign goes into the DCS
+    // LINK/UNLINK/POLL wire packets.
     let session: Session<Dcs, Configured> = Session::<Dcs, Configured>::builder()
         .callsign(Callsign::try_from_str("W1AW")?)
         .local_module(Module::try_from_char('B')?)

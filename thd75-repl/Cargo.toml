@@ -7,7 +7,7 @@ description = "Accessible command-line REPL for the Kenwood TH-D75 transceiver"
 license = "GPL-2.0-or-later"
 authors = ["swiftraccoon"]
 repository = "https://github.com/swiftraccoon/kenwood"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["ham-radio", "kenwood", "accessibility", "amateur-radio"]
 categories = ["command-line-utilities"]
 publish = false
@@ -43,12 +43,12 @@ tokio = { version = "1", features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-# `time` is already in the transitive tree via tracing-appender's
-# daily rotation logic. We use it directly here only to format the
-# current UTC date into the "log file path" startup message so
-# users can copy-paste the real filename for bug reports. Matching
-# tracing-appender's internal UTC-based rotation means the date we
-# print will always equal the rotation suffix at that moment.
+# `time` is already in the transitive tree via tracing-appender. We
+# use it directly here only to format the UTC session-start timestamp
+# that names the log file (second granularity), and to print that same
+# path in the startup message so users can copy-paste the real
+# filename for bug reports. No rotating appender is in play — each
+# invocation gets one fresh file via `File::create`.
 time = { version = "0.3", default-features = false, features = [
   "formatting",
   "macros",
@@ -56,11 +56,12 @@ time = { version = "0.3", default-features = false, features = [
 rustyline = "18"
 dirs-next = "2"
 
-# A crate-local [lints.<group>] block fully REPLACES the workspace block
-# (no merge). Both blocks below restate the workspace policy in full —
-# the only differences are the workspace-allowed lints restated
-# explicitly (module_name_repetitions, multiple_crate_versions,
-# redundant_pub_crate).
+# KNOWN DIVERGENCE FROM WORKSPACE: a crate-local [lints.<group>] block
+# fully REPLACES the workspace block (no merge). Both blocks below
+# restate the workspace policy in full — the only differences are the
+# workspace-allowed lints restated explicitly (module_name_repetitions,
+# multiple_crate_versions, redundant_pub_crate). This crate contains no
+# FFI and keeps `unsafe_code = "forbid"`.
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"

@@ -1,11 +1,11 @@
-//! Accessibility compliance self-check.
+//! Accessibility output self-check.
 //!
 //! The `check` subcommand runs without connecting to a radio. It
 //! exercises every `output::*` formatter with representative inputs,
 //! runs the accessibility lint on every result, and prints a report.
 //!
 //! A blind ham can run `thd75-repl check` and read the report via
-//! their screen reader to verify their build meets the spec.
+//! their screen reader to verify the mechanically checked output contract.
 
 use crate::{help_text, lint, output};
 use kenwood_thd75::types::{Band, BatteryLevel, PowerLevel};
@@ -355,25 +355,25 @@ fn gen_help_text() -> Vec<String> {
     v
 }
 
-/// Run the compliance check, print the report, return the exit code.
+/// Run the output check, print the report, return the exit code.
 ///
 /// Returns 0 if all rules pass, 1 if any violation is found. Prints
 /// the full report to stdout.
 #[must_use]
 pub fn run() -> i32 {
     println!(
-        "Accessibility compliance check, thd75-repl version {}.",
+        "Accessibility output check, thd75-repl version {}.",
         env!("CARGO_PKG_VERSION")
     );
-    println!("Standard: WCAG 2.1 Level AA.");
-    println!("Standard: Section 508 of the US Rehabilitation Act.");
-    println!("Standard: CHI 2021 CLI accessibility paper.");
-    println!("Standard: EN 301 549 version 3.2.1.");
-    println!("Standard: ISO 9241-171.");
-    println!("Standard: ITU-T Recommendation F.790.");
-    println!("Standard: BRLTTY compatibility.");
-    println!("Standard: Handi-Ham Program recommendations.");
-    println!("Standard: ARRL accessibility resources.");
+    println!("Reference: WCAG 2.1 Level AA.");
+    println!("Reference: Section 508 of the US Rehabilitation Act.");
+    println!("Reference: CHI 2021 CLI accessibility paper.");
+    println!("Reference: EN 301 549 version 3.2.1.");
+    println!("Reference: ISO 9241-171.");
+    println!("Reference: ITU-T Recommendation F.790.");
+    println!("Reference: BRLTTY compatibility.");
+    println!("Reference: Handi-Ham Program recommendations.");
+    println!("Reference: ARRL accessibility resources.");
     println!();
 
     // Collect per-rule counts and violations.

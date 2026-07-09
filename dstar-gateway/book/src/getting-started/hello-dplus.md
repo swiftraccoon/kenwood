@@ -1,8 +1,9 @@
-# Hello, REF030 (DPlus)
+# Hello, local DPlus
 
-This walkthrough connects to a DPlus reflector (REF030 module C),
-listens for 10 seconds of inbound traffic, and disconnects
-cleanly. DPlus is the most involved of the three protocols
+This walkthrough connects to a DPlus reflector on loopback,
+listens for 10 seconds of inbound traffic, and requests a clean
+disconnect. It does not contact REF030. DPlus is the most involved
+of the three protocols
 because it requires a TCP authentication step before the UDP
 session can start.
 
@@ -44,14 +45,19 @@ let authenticated: Session<DPlus, Authenticated> =
 let now = Instant::now();
 let mut connecting: Session<DPlus, Connecting> = authenticated.connect(now)?;
 for _ in 0..2 {
-    let tx = connecting.poll_transmit(Instant::now())
-        .expect("DPlus LINK ready");
+    let tx = connecting
+        .poll_transmit(Instant::now())
+        .ok_or("DPlus LINK not ready")?;
     sock.send_to(tx.payload, tx.dst).await?;
 
     let mut buf = [0u8; 64];
     let (n, peer) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
         .await??;
-    connecting.handle_input(Instant::now(), peer, &buf[..n])?;
+    connecting.handle_input(
+        Instant::now(),
+        peer,
+        buf.get(..n).ok_or("receive length exceeded buffer")?,
+    )?;
     if connecting.state_kind() == ClientStateKind::Connected {
         break;
     }
@@ -103,22 +109,25 @@ session.disconnect().await?;
    a dedicated task that owns the socket and the session; your
    code interacts with it via `next_event` and `send_*`.
 7. **Listen** for 10 seconds of inbound events. Each event is an
-   `Event<DPlus>` — `Connected`, `VoiceHeader`, `VoiceFrame`,
-   `VoiceEnd`, `Disconnected`, etc.
-8. **Disconnect gracefully.** `session.disconnect().await?`
-   sends UNLINK and awaits the reflector's ACK.
+   `Event<DPlus>` — `Connected`, `VoiceStart`, `VoiceFrame`,
+   `VoiceEnd`, `Disconnected`, `PollEcho`.
+8. **Request a graceful disconnect.** `session.disconnect().await?`
+   returns once the session loop has queued UNLINK. Continue reading
+   events if you need to observe `Event::Disconnected` and its reason.
 
 ## Running it
 
-You cannot run this example against a real reflector without
-being a licensed operator with permission to transmit. The code
-above binds to `0.0.0.0:0` and attempts to connect to
+The code above binds to `0.0.0.0:0` and attempts to connect to
 `127.0.0.1:20001`, which is a local loopback address — no RF
 energy leaves your machine. To connect to a real reflector, swap
 the peer address for a real REF reflector (e.g. look up REF030
 in the Pi-Star DPlus hosts file) and run the real auth step via
-`AuthClient`.
+`AuthClient`. Use your own valid callsign and follow the service's
+access rules. This listing receives events but sends no voice stream.
 
-See [Hello, DCS001](hello-dcs.md) and [Hello, XLX307
-(DExtra)](hello-dextra.md) for the simpler one-round-trip
-handshakes.
+DCS and DExtra use simpler one-round-trip handshakes with no TCP
+auth step. See the runnable
+[`02_connect_dcs`](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/examples/02_connect_dcs.rs)
+and
+[`03_connect_dextra`](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/examples/03_connect_dextra.rs)
+examples.

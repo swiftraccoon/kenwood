@@ -11,11 +11,12 @@
 //! - [`AprsIsConfig`] login configuration, [`aprs_is_passcode`] hash.
 //! - [`AprsIsFilter`] filter-command builder.
 //! - [`QConstruct`] Q-construct classification.
-//! - [`igate_format_for_is`] full `IGate` path rewriter implementing the
+//! - [`igate_format_for_is`] full `IGate` gating implementing the
 //!   q.aspx algorithm (refuses to gate on `NOGATE`/`RFONLY`/`TCPIP`/
-//!   `TCPXX`/loop, strips unused digipeaters and `*` markers, picks
-//!   `qAR`/`qAr` from the login state). For naïve append-only
-//!   construction see [`format_is_packet_with_qconstruct`].
+//!   `TCPXX`/loop, gates the heard path verbatim — preserving unused
+//!   digipeaters and `*` markers — and selects `qAR`/`qAO` from the
+//!   login state). For basic q-construct appending see
+//!   [`format_is_packet_with_qconstruct`].
 //! - [`parse_is_line`] TNC2 monitor-format parser.
 //! - [`format_is_packet`] outbound line formatter.
 //!

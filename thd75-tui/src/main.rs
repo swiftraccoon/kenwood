@@ -2,8 +2,8 @@
 //!
 //! Built on top of [`kenwood_thd75`]. Displays live VFO state, S-meter,
 //! squelch, and channel memories pulled from the radio over USB CDC or
-//! Bluetooth SPP. Edits to channel memory and radio settings round-trip
-//! back to the radio.
+//! Bluetooth SPP, plus APRS, D-STAR reflector, GPS, and FM-radio panels.
+//! Edits to channel memory and radio settings round-trip back to the radio.
 //!
 //! Run with `cargo run -p thd75-tui` for auto-discovery, or pass
 //! `--port /dev/cu.TH-D75` for a paired Bluetooth radio.
@@ -30,7 +30,7 @@ use ratatui::backend::CrosstermBackend;
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Cli {
-    /// Serial port path (default: auto-discover USB).
+    /// Serial port path (default: auto-discover USB, then Bluetooth).
     #[arg(short, long)]
     port: Option<String>,
 

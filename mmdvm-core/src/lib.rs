@@ -32,7 +32,7 @@
 //!
 //! ## What's out of scope
 //!
-//! - Serial / network I/O (see the `thd75` and `mmdvm-gateway` shell
+//! - Serial / network I/O (see the `thd75` and `mmdvm` shell
 //!   crates).
 //! - Per-protocol voice/data framing above the MMDVM wire layer
 //!   (e.g. AMBE, IMBE, NXDN, DMR BPTC). Those live in dedicated

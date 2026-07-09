@@ -5,11 +5,11 @@ Sans-io codec for the MMDVM ham-radio digital-voice modem protocol. Runtime-agno
 ## Scope
 
 - `MmdvmFrame` — the `[0xE0, len, cmd, payload]` wire-frame type and its codec.
-- `command` module — every MMDVM protocol byte constant (GET_STATUS, GET_VERSION, GET_CAPABILITIES, SET_CONFIG, SET_MODE, SEND_CWID, per-mode TX/RX commands, ACKs / NAKs, debug frames).
+- `command` module — every MMDVM protocol byte constant (GET_STATUS, GET_VERSION, SET_CONFIG, SET_MODE, SET_FREQ, SEND_CWID, per-mode TX/RX commands, ACKs / NAKs, debug frames).
 - `ModemMode` — operating-mode enum. D-STAR is the primary exercise target; DMR / YSF / P25 / NXDN / POCSAG / FM command bytes are present but less tested.
-- `Capabilities` — decoder for the `GET_CAPABILITIES` / `GET_VERSION` response frame.
-- `Config` — encoder for the `SET_CONFIG` frame (all ~40 fields: audio gains, RF power, per-mode enables, TX delay, etc.).
-- Per-mode frame types: D-STAR header / voice / voice-sync / EOT as typed variants; DMR / YSF / P25 / NXDN / POCSAG / FM as byte-level passthroughs.
+- `Capabilities` — a two-byte bitfield struct (`cap1` / `cap2`) exposing the capability bits embedded in the protocol-v2 `GET_VERSION` response (there is no standalone capabilities command or frame).
+- `ModemConfig` — a provisional 6-field `SET_CONFIG` parameter struct (invert flags, mode-enable flags, TX delay, mode, RX level, TX level). Stub only: it has no wire encoder yet, just an `idle()` constructor.
+- A single generic `MmdvmFrame` (command byte + raw payload) carries every mode — there are no per-mode typed variants. D-STAR / DMR / YSF / P25 / NXDN / POCSAG / FM are distinguished by the command-byte constant, not by the frame type.
 
 ## Reference implementation
 
@@ -23,7 +23,7 @@ No transport, no async, no session state. The tokio async shell is [`mmdvm`](../
 
 ## Status
 
-Pre-release. Public API is unstable. Frame types for non-D-STAR modes are present but under-exercised.
+Pre-release. Public API is unstable. Command bytes and `ModemMode` support for non-D-STAR protocols are present but under-exercised.
 
 ## Reference
 

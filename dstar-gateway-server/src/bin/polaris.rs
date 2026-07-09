@@ -19,7 +19,8 @@
 //! - `POLARIS_BIND` — bind address (default `0.0.0.0:30001`)
 //! - `POLARIS_CALLSIGN` — reflector callsign (default `POLARIS`)
 //! - `POLARIS_MODULES` — enabled module letters concatenated (default `ABCD`)
-//! - `RUST_LOG` — tracing filter (default `info`)
+//! - `RUST_LOG` — tracing filter (unset falls back to [`DEFAULT_FILTER`]:
+//!   `debug` for this crate and `dstar-gateway`, `info` for everything else)
 //!
 //! Enables only `DExtra`; `DPlus` and `Dcs` are disabled because a
 //! local test reflector is simpler to exercise over the lightweight

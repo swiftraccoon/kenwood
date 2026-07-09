@@ -9,12 +9,13 @@
 //! and receives [`SessionEvent`]s back, which it renders into the
 //! status indicator + event log.
 //!
-//! TX audio (iteration 2) will flow through a separate `mpsc<VoiceFrame>`
-//! owned by the session task: the audio worker pushes encoded frames
-//! into that channel while PTT is held, and this task calls
-//! `send_voice` until the channel empties + the operator releases PTT.
-//! For now the only TX available is `TxSilence { seconds }`, which
-//! transmits the AMBE silence pattern for diagnostic purposes.
+//! TX audio flows over the same [`SessionCommand`] channel. When the
+//! operator keys PTT the audio worker sends `StartTx`, then a
+//! `TxFrame(VoiceFrame)` per encoded frame while PTT is held, then
+//! `EndTx` on release; this task turns those into the header,
+//! `send_voice` calls, and EOT on the wire. `TxSilence { seconds }`
+//! remains as a diagnostic that transmits the AMBE silence pattern to
+//! prove the header + voice + EOT path without the mic.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -14,7 +14,7 @@
 //! `DExtra` is the "middle" of the three protocols: one round-trip
 //! (11-byte LINK out, 14-byte ACK in) and no TCP auth, but
 //! voice frames use the traditional DSVT-style 56-byte header +
-//! 29-byte voice data layout rather than DCS's single 100-byte
+//! 27-byte voice data layout rather than DCS's single 100-byte
 //! combined frame.
 
 #[cfg(feature = "hosts-fetcher")]

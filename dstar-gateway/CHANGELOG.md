@@ -8,11 +8,9 @@ and the project aims to adhere to [Semantic Versioning](https://semver.org/spec/
 once it reaches 1.0. Pre-1.0 releases may include breaking changes
 in any version bump.
 
-**Status: alpha.** Not yet published to crates.io. The entire
-dstar-gateway rewrite is tracked under `[Unreleased]` until the
-library has been stress-tested against real reflectors and the
-open deferred work (see [ARCHITECTURE.md](ARCHITECTURE.md)) is
-either closed or explicitly scoped out of 0.1.0.
+**Status: 0.1.0 alpha, not published to crates.io.** The rewrite is
+tracked under `[Unreleased]` until it has been stress-tested against
+real reflectors and is ready for a published release.
 
 ## [Unreleased]
 
@@ -37,9 +35,9 @@ either closed or explicitly scoped out of 0.1.0.
 - **Typestate client session**: sans-io `Session<P, S>` with
   compile-time-enforced state transitions
   (`Configured → Authenticated → Connecting → Connected →
-  Disconnecting → Disconnected`) and a `Failed<S, E>` recovery
+  Disconnecting → Closed`) and a `Failed<S, E>` recovery
   state. Includes a `Driver` trait that every state implements
-  for uniform `poll_transmit` / `handle_input` / `pop_event`
+  for uniform `poll_transmit` / `handle_input` / `poll_event`
   access.
 - **Sans-io Driver + timer wheel**: time is injected via
   `Instant` arguments, not read from the system clock. Enables
@@ -49,20 +47,20 @@ either closed or explicitly scoped out of 0.1.0.
   `SlowDataAssembler` finite state machine.
 - **DPRS position reports**: full DPRS `$$CRC` parser with the
   `calcCRC` algorithm from `ircDDBGateway`.
-- **Server typestate**: `ServerSessionCore<P>` + per-client
-  state machines mirroring the client side. Currently
-  DExtra-only at the endpoint-shell level; DPlus and DCS server
-  handshakes are implemented at the core layer and the
+- **Server typestate**: `ServerSessionCore` + per-client
+  state machines mirroring the client side. DPlus, DExtra, and
+  DCS server handshakes are implemented at the core layer and the
   `ProtocolEndpoint<P>` shell dispatches all three.
 - **State-gated typestate methods**: `handle_voice_data`
   restricted to `ServerSession<P, Streaming>`, `handle_link2`
   to `ServerSession<DPlus, Link1Received>`, `handle_unlink` to
   `ServerSession<P, Linked>`. Compile-fail tests enforce each.
-- **Lenient parsing + `DiagnosticSink`**: every codec function
-  emits structured `Diagnostic`s for recoverable wire-format
-  quirks instead of failing, with a `StrictnessFilter` wrapper
-  available for opt-in strict mode. Unknown-length datagrams in
-  the client session dispatcher are swallowed as diagnostics so
+- **Lenient parsing + `DiagnosticSink`**: every codec decoder
+  records structured `Diagnostic`s for recoverable wire-format
+  quirks instead of failing, via `DiagnosticSink::record`; strict
+  rejection is a pattern a caller implements in its own `record`
+  impl, not a shipped type. Unknown-length datagrams in the client
+  session dispatcher are swallowed as diagnostics so
   reflector-emitted quirks never kill an established session.
 - **Error hierarchy**: layered `Error` / `ProtocolError` /
   per-protocol error enums (`DPlusError`, `DExtraError`,
@@ -83,21 +81,22 @@ either closed or explicitly scoped out of 0.1.0.
   fallback across the multiple round-robin A records of
   `auth.dstargateway.org` with a short per-address timeout so
   dead addresses don't burn the overall connect budget.
-- **`blocking` feature**: non-tokio blocking shell variant for
-  CLI scripts and test fixtures.
-- **`hosts-fetcher` feature**: pulls `reqwest`; downloads the
-  Pi-Star `DPlus_Hosts.txt`, `DExtra_Hosts.txt`, and
-  `DCS_Hosts.txt` files over HTTPS.
+- **`blocking` feature**: caller-driven synchronous shell using
+  `std::net::UdpSocket`; callers do not need to run a tokio runtime.
+- **`hosts-fetcher` feature**: pulls `reqwest`; fetches the XLX
+  reflector directory from
+  `http://xlxapi.rlx.lu/api.php?do=GetReflectorHostname` over HTTP
+  via `HostsFetcher::fetch_xlx_directory`, returning
+  protocol-tagged host entries.
 - **Loopback integration tests**: full tokio shell +
   `FakeReflector` UDP harness exercising connect → voice → EOT
-  → disconnect round trips for all three protocols, plus a
-  `dplus_auth` TCP harness for the auth flow.
+  → disconnect round trips for all three protocols.
 - **Conformance pcap replay**: `tests/conformance.rs` uses
   `pcap-parser` to strip Ethernet/IPv4/UDP headers from
   captured traffic and feeds UDP payloads through every
   codec. The corpus itself lives outside the tree; the runner
   is shipped and no-ops on an empty corpus.
-- **Hardware-in-the-loop tests**: `tests/hardware.rs` contains
+- **Live-reflector integration tests**: `tests/hardware.rs` contains
   real connect/listen/disconnect bodies for all three protocols
   plus a voice-burst TX test, triple-gated behind the
   `hardware-tests` feature, `#[ignore]`, and an opt-in
@@ -111,12 +110,12 @@ either closed or explicitly scoped out of 0.1.0.
   endpoints, spawns one tokio task per enabled protocol, and
   manages shutdown via a `tokio::sync::watch` channel.
 - **`ProtocolEndpoint<P>` run loop**: binds a pre-configured
-  `UdpSocket` and drives `ServerSessionCore<P>` for every
+  `UdpSocket` and drives `ServerSessionCore` for every
   inbound peer. All three protocol handshakes
   (DPlus, DExtra, DCS) dispatch through dedicated
   per-protocol `handle_inbound_*` helpers.
-- **`ReflectorConfig` + typed builder**: bind address, enable
-  flags per protocol, max clients, keepalive cadence, TX
+- **`ReflectorConfig` + typed builder**: bind address, enabled-protocol
+  set with `enable` / `disable` helpers, max clients, keepalive cadence, TX
   rate-limit frames per second, cross-protocol forwarding
   flag. Missing/Provided marker typestate ensures required
   fields are supplied at compile time.
@@ -153,10 +152,8 @@ either closed or explicitly scoped out of 0.1.0.
 ### Test infrastructure
 
 #### Added
-- **Ten `cargo-fuzz` targets** covering every parser entry
-  point across DPlus, DExtra, DCS, slow-data, DPRS, and auth.
-  Baseline: ~1.1 billion executions across all targets, zero
-  crashes.
+- **Ten `cargo-fuzz` targets** covering parser entry points across
+  DPlus, DExtra, DCS, slow-data, DPRS, and auth.
 - **CI fuzz workflow**: a GitHub Action runs every fuzz target
   for a capped wall-clock budget per PR touching the core
   crate.

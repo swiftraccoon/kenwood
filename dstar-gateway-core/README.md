@@ -18,4 +18,4 @@ directly and drive it via the [`Driver`] trait.
 Alpha. See [the `dstar-gateway` README](../dstar-gateway/README.md)
 for the current project status and consumption instructions.
 
-[`Driver`]: https://docs.rs/dstar-gateway-core/*/dstar_gateway_core/session/trait.Driver.html
+[`Driver`]: https://swiftraccoon.github.io/kenwood/dstar_gateway_core/session/driver/trait.Driver.html

@@ -9,29 +9,15 @@
 //!
 //! # Status
 //!
-//! Functional end-to-end.  Every stage of OP25's `ambe_encoder.cc`
-//! is ported and wired together; the output bytes decode cleanly
-//! through our own decoder and through reference `mbelib`.
+//! Every stage of OP25's `ambe_encoder.cc` is ported and wired together,
+//! including the optional two-frame look-ahead pitch path. The output
+//! clears structural round-trip and non-silence tests, and the validation
+//! examples compare individual stages with supplied OP25 traces.
 //!
-//! Bit-exact vs OP25 on the stage-5..8 (quantize) path when fed
-//! identical `sa`/`v_uv_dsn`/`prev_mp` state — validated by
-//! `examples/validate_quantize_vs_op25.rs`:
-//! b3/b4/b5/b6/b7 = 100%, b2 (gain) = 99%, b1 (VUV) = 88%,
-//! b0 (pitch) = 60%.  b8 (`HOC_B8`) = 30% because OP25 searches the
-//! full 0..=15 codebook in D-STAR mode while the wire format only
-//! carries 3 bits with a forced-zero LSB; our stride-2 search
-//! follows mbelib's decoder convention (the DVSI implementation).
-//!
-//! Stages 1..4 (analysis: pitch / `num_harms` / V/UV / sa from FFT)
-//! still diverge from OP25 during pitch transitions. The pitch
-//! tracker ports OP25's exact E(p) detectability function plus
-//! look-back tracking (`pitch_est.cc:200–226`) and sub-multiples
-//! analysis (`pitch_est.cc:273–332`). The remaining gap — OP25's
-//! 2-frame look-ahead DP (`pitch_est.cc:229–270`) — is the main
-//! stage 1-4 improvement left. Audio remains intelligible on real
-//! speech despite the divergence because the spectral-envelope
-//! reconstruction (stages 5..8) emits the correct codebook entries
-//! for whatever pitch we pick.
+//! The encoder remains experimental. Match rates depend on the trace, the
+//! PRBA/HOC spectral-envelope path (`b3` through `b8`) is still under
+//! investigation, and the ignored sine-correlation test remains near 0.04.
+//! Reliable DVSI hardware interoperability is therefore not yet validated.
 //!
 //! # Pipeline
 //!

@@ -7,9 +7,10 @@
 //!
 //! # Scope
 //!
-//! - Frame header parsing: source, destination, up to 8 digipeaters.
+//! - Frame header parsing: source, destination, up to 8 digipeaters
+//!   (each a [`RouteEntry`] carrying the AX.25 H-bit).
 //! - [`Ax25Control`] decoding (Information / Supervisory / Unnumbered).
-//! - [`Ax25Pid`] PID byte decoding (15 canonical values).
+//! - [`Ax25Pid`] PID byte decoding (14 canonical values plus a catch-all).
 //! - FCS (frame check sequence) calculation via [`ax25_fcs`].
 //! - Command/Response classification per AX.25 v2.2 §6.1.2.
 //!

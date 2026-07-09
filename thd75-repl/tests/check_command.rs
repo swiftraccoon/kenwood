@@ -1,7 +1,7 @@
 //! Integration test for the `check` subcommand.
 //!
 //! Spawns the REPL binary with `check` as the subcommand argument
-//! and asserts that the compliance report is emitted cleanly. This
+//! and asserts that the output-check report is emitted cleanly. This
 //! test runs without the `testing` feature because `check` never
 //! opens a radio transport.
 
@@ -44,12 +44,12 @@ fn check_subcommand_exits_zero() -> TestResult {
 }
 
 #[test]
-fn check_subcommand_lists_nine_standards() -> TestResult {
+fn check_subcommand_lists_nine_references() -> TestResult {
     let output = Command::new(env!("CARGO_BIN_EXE_thd75-repl"))
         .arg("check")
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let count = stdout.matches("Standard:").count();
-    assert_eq!(count, 9, "expected 9 standard lines, got {count}");
+    let count = stdout.matches("Reference:").count();
+    assert_eq!(count, 9, "expected 9 reference lines, got {count}");
     Ok(())
 }
