@@ -164,7 +164,14 @@ impl StreamCapture {
     }
 
     fn push_frame(&mut self, seq: u8, frame: &VoiceFrame) {
-        if let Some(prev) = self.prev_seq {
+        // Gap accounting is only defined inside the valid seq
+        // alphabet (0..=20). The wire byte is untrusted — corrupted
+        // frames carry arbitrary values (observed live), and feeding
+        // one into the modular distance would underflow.
+        if let Some(prev) = self.prev_seq
+            && u16::from(seq) < SEQ_MODULUS
+            && u16::from(prev) < SEQ_MODULUS
+        {
             let distance = (u16::from(seq) + SEQ_MODULUS - u16::from(prev)) % SEQ_MODULUS;
             self.gaps += u64::from(distance.saturating_sub(1));
         }
@@ -400,6 +407,24 @@ mod tests {
         assert!(
             matches!(rec, Some(ref r) if r.gaps == 2 && r.expected_frames() == 5),
             "got {rec:?}"
+        );
+    }
+
+    /// Wire seq bytes are untrusted: a corrupted frame observed live
+    /// carried an out-of-alphabet value, and the modular gap math
+    /// underflowed. Wild values must be survivable and must not
+    /// corrupt the gap count.
+    #[test]
+    fn out_of_alphabet_seq_does_not_panic_or_count_gaps() {
+        let mut mgr = CaptureManager::new(origin());
+        mgr.on_voice_start(sid(1), header(), Vec::new(), t0());
+        for seq in [3u8, 200, 3, 0xFF, 4] {
+            mgr.on_voice_frame(sid(1), seq, &frame(seq), t0());
+        }
+        let rec = mgr.on_voice_end(sid(1), EndReason::Eot, t0());
+        assert!(
+            matches!(rec, Some(ref r) if r.frames.len() == 5 && r.gaps == 0),
+            "wild seq must be archived but never drive gap math: {rec:?}"
         );
     }
 

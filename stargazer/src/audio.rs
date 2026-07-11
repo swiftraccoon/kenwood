@@ -33,7 +33,14 @@ pub fn decode_stream(frames: &[FrameRecord]) -> DecodedAudio {
     let mut prev_seq: Option<u8> = None;
 
     for frame in frames {
-        if let Some(prev) = prev_seq {
+        // Concealment only makes sense inside the valid seq alphabet
+        // (0..=20); corrupted wire bytes carry arbitrary values and
+        // must not drive the modular distance (underflow observed
+        // live on a corrupted frame).
+        if let Some(prev) = prev_seq
+            && u16::from(frame.seq) < SEQ_MODULUS
+            && u16::from(prev) < SEQ_MODULUS
+        {
             let distance = (u16::from(frame.seq) + SEQ_MODULUS - u16::from(prev)) % SEQ_MODULUS;
             for _ in 1..distance {
                 pcm.extend_from_slice(&decoder.conceal_frame());
@@ -82,6 +89,15 @@ mod tests {
     fn duplicate_seq_decodes_without_concealment() {
         let out = decode_stream(&[rec(3), rec(3)]);
         assert_eq!(out.pcm.len(), 2 * 160);
+        assert_eq!(out.concealed_frames, 0);
+    }
+
+    #[test]
+    fn out_of_alphabet_seq_decodes_without_concealment() {
+        // Same corrupted-wire-byte scenario the capture core guards:
+        // decode must not underflow or conceal against wild seqs.
+        let out = decode_stream(&[rec(3), rec(200), rec(3), rec(255), rec(4)]);
+        assert_eq!(out.pcm.len(), 5 * 160);
         assert_eq!(out.concealed_frames, 0);
     }
 

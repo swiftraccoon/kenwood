@@ -342,13 +342,23 @@ enum SessionOutcome {
 
 /// Consume one connected session's events until it drops or
 /// shutdown is requested; open captures are always finalized.
+///
+/// Owns its state and runs as its own task so that a panic (e.g. a
+/// decode-path bug tripped by hostile wire input) is contained by
+/// the task boundary: the supervisor observes the `JoinError` and
+/// reconnects instead of silently losing the target forever.
 async fn pump_session(
-    session: &mut RuntimeSession,
-    mgr: &mut CaptureManager,
-    writer: &Arc<Writer>,
-    shutdown: &mut watch::Receiver<bool>,
-    label: &str,
+    mut session: RuntimeSession,
+    mut mgr: CaptureManager,
+    writer: Arc<Writer>,
+    mut shutdown: watch::Receiver<bool>,
+    label: String,
 ) -> SessionOutcome {
+    let session = &mut session;
+    let mgr = &mut mgr;
+    let writer = &writer;
+    let shutdown = &mut shutdown;
+    let label: &str = &label;
     loop {
         tokio::select! {
             ev = session.next_event() => match ev {
@@ -418,7 +428,7 @@ pub async fn run_supervisor(
             Err(e) => {
                 tracing::warn!(target = %label, error = %e, "connect failed");
             }
-            Ok((mut session, peer)) => {
+            Ok((session, peer)) => {
                 tracing::info!(target = %label, peer = %peer, "connected");
                 let connected_at = Instant::now();
                 let origin = StreamOrigin {
@@ -429,11 +439,32 @@ pub async fn run_supervisor(
                     port: target.port,
                     peer,
                 };
-                let mut mgr = CaptureManager::new(origin);
+                let mgr = CaptureManager::new(origin);
 
-                match pump_session(&mut session, &mut mgr, &writer, &mut shutdown, &label).await {
-                    SessionOutcome::ShutdownRequested => return,
-                    SessionOutcome::Dropped => {}
+                let pump = tokio::spawn(pump_session(
+                    session,
+                    mgr,
+                    Arc::clone(&writer),
+                    shutdown.clone(),
+                    label.clone(),
+                ));
+                match pump.await {
+                    Ok(SessionOutcome::ShutdownRequested) => return,
+                    Ok(SessionOutcome::Dropped) => {}
+                    Err(e) => {
+                        // A panic inside the session task must not end
+                        // this target's supervision — log it loudly,
+                        // accept the open captures as lost, reconnect.
+                        tracing::error!(
+                            target = %label,
+                            panicked = e.is_panic(),
+                            error = %e,
+                            "session task died — reconnecting"
+                        );
+                    }
+                }
+                if *shutdown.borrow_and_update() {
+                    return;
                 }
 
                 if connected_at.elapsed() >= STABLE_AFTER {
