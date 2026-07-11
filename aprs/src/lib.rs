@@ -27,6 +27,13 @@
 //! - APRS 1.0.1: <http://www.aprs.org/doc/APRS101.PDF>
 //! - APRS 1.2: <http://www.aprs.org/aprs12.html>
 
+// `proptest` is a dev-dependency used by `tests/adversarial_parse.rs`
+// (the never-panics net over the parse entry points). Each test target
+// is its own compilation unit that sees every dev-dep, so the lib test
+// target must acknowledge it or `unused_crate_dependencies` fires.
+#[cfg(test)]
+use proptest as _;
+
 mod build;
 mod digipeater;
 mod error;
@@ -88,9 +95,3 @@ pub use units::{
     AprsSymbol, Course, Fahrenheit, Latitude, Longitude, MessageId, Speed, SymbolTable, Tocall,
 };
 pub use weather::{AprsWeather, extract_position_weather, parse_aprs_weather_positionless};
-
-// `proptest` is a dev-dependency used only in the integration test
-// suites. Acknowledge it here to keep `-D unused-crate-dependencies`
-// happy when the lib test crate compiles with dev-deps in scope.
-#[cfg(test)]
-use proptest as _;

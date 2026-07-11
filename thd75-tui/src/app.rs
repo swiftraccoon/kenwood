@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use kenwood_thd75::memory::MemoryImage;
@@ -36,34 +36,72 @@ fn cache_dir() -> Option<PathBuf> {
     }
 }
 
-/// Save raw MCP image to disk cache.
+/// Save raw MCP image to the cache file at `path`.
 ///
 /// Logs errors but does not propagate — a failed cache write should not
 /// block radio operation. The user will see a warning in the log.
-pub(crate) fn save_cache(data: &[u8]) {
-    let path = cache_path();
+pub(crate) fn save_cache_to(path: &Path, data: &[u8]) {
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
         tracing::error!(path = %parent.display(), "failed to create cache dir: {e}");
         return;
     }
-    if let Err(e) = std::fs::write(&path, data) {
+    if let Err(e) = std::fs::write(path, data) {
         tracing::error!(path = %path.display(), "failed to write MCP cache: {e}");
     }
 }
 
-/// Load cached MCP image from disk. Returns (image, age).
-pub(crate) fn load_cache() -> Option<(MemoryImage, std::time::Duration)> {
-    let path = cache_path();
-    let data = std::fs::read(&path).ok()?;
-    let age = std::fs::metadata(&path)
+/// Load cached MCP image from `path`. Returns (image, age).
+pub(crate) fn load_cache(path: &Path) -> Option<(MemoryImage, std::time::Duration)> {
+    let data = std::fs::read(path).ok()?;
+    let age = std::fs::metadata(path)
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| SystemTime::now().duration_since(t).ok())
         .unwrap_or_default();
     let image = MemoryImage::from_raw(data).ok()?;
     Some((image, age))
+}
+
+/// Parse D-STAR reflector-connect input into `(name, module)`.
+///
+/// Accepts two forms:
+/// - Two-token: `"REF030 C"` — the module is the first character of the
+///   second token and must be an ASCII uppercase letter.
+/// - Single-token: `"REF030C"` — at least 4 characters, with an ASCII
+///   uppercase final character as the module letter and the rest as the
+///   reflector name. This mirrors the REPL's reflector parsing, so a bare
+///   name ending in a digit (`"REF030"`) is rejected instead of being
+///   misread as name `"REF03"` + module `'0'`.
+///
+/// The returned name is uppercased. Anything else — including empty input
+/// and a non-ASCII final character (which would make a byte-index slice
+/// panic on a char boundary) — returns `None`.
+fn parse_reflector_input(input: &str) -> Option<(String, char)> {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    match parts.as_slice() {
+        [name, module_token, ..] => {
+            let module = module_token.chars().next()?;
+            if !module.is_ascii_uppercase() {
+                return None;
+            }
+            Some((name.to_uppercase(), module))
+        }
+        [single] => {
+            if single.len() < 4 {
+                return None;
+            }
+            let module = single.chars().last()?;
+            if !module.is_ascii_uppercase() {
+                return None;
+            }
+            // `module` is ASCII (1 byte), so `len - 1` is a char boundary.
+            let name = single.get(..single.len() - 1)?;
+            Some((name.to_uppercase(), module))
+        }
+        [] => None,
+    }
 }
 
 /// Number of rows in the settings list (must match `SettingRow::ALL.len()`).
@@ -1012,6 +1050,11 @@ pub(crate) enum Message {
               right data model, even if it looks bool-heavy to clippy."
 )]
 pub(crate) struct App {
+    /// Where the MCP image is cached on disk. `None` disables caching
+    /// entirely — the reducer's MCP arms then keep everything in
+    /// memory, which is how tests drive them without touching the
+    /// user's real cache file.
+    pub cache_path: Option<PathBuf>,
     pub connected: bool,
     pub port_path: String,
     pub state: RadioState,
@@ -1104,7 +1147,17 @@ impl App {
 
     /// Create a new app instance, loading MCP cache from disk if available.
     pub(crate) fn new(port_path: String) -> Self {
-        let (mcp, status_message) = match load_cache() {
+        Self::with_cache_path(port_path, Some(cache_path().as_path()))
+    }
+
+    /// Create a new app instance, loading the MCP image from the given cache
+    /// file when one is provided.
+    ///
+    /// `None` skips the disk cache entirely, so construction has no
+    /// filesystem side effects — tests use this to avoid reading the real
+    /// per-user cache directory.
+    pub(crate) fn with_cache_path(port_path: String, cache: Option<&Path>) -> Self {
+        let (mcp, status_message) = match cache.and_then(load_cache) {
             Some((image, age)) => {
                 let mins = age.as_secs() / 60;
                 let msg = if mins < 60 {
@@ -1126,6 +1179,7 @@ impl App {
         };
 
         Self {
+            cache_path: cache.map(Path::to_path_buf),
             connected: false,
             port_path,
             state: RadioState::default(),
@@ -1241,7 +1295,9 @@ impl App {
                 true
             }
             Message::McpReadComplete(data) => {
-                save_cache(&data);
+                if let Some(ref path) = self.cache_path {
+                    save_cache_to(path, &data);
+                }
                 match MemoryImage::from_raw(data) {
                     Ok(image) => {
                         self.mcp = McpState::Loaded {
@@ -1270,7 +1326,9 @@ impl App {
                     if let Some(byte) = image.as_raw_mut().get_mut(offset as usize) {
                         *byte = value;
                     }
-                    save_cache(image.as_raw());
+                    if let Some(ref path) = self.cache_path {
+                        save_cache_to(path, image.as_raw());
+                    }
                 }
                 true
             }
@@ -1459,17 +1517,7 @@ impl App {
                     let input = buf.clone();
                     self.dstar_reflector_input = None;
                     // Parse "REF030 C" or "REF030C"
-                    let parts: Vec<&str> = input.split_whitespace().collect();
-                    let (name, module) = if let [name_part, module_part, ..] = parts.as_slice() {
-                        (
-                            (*name_part).to_string(),
-                            module_part.chars().next().unwrap_or('A'),
-                        )
-                    } else if input.len() > 1 {
-                        let module = input.chars().last().unwrap_or('A');
-                        let name = &input[..input.len() - 1];
-                        (name.trim().to_string(), module)
-                    } else {
+                    let Some((name, module)) = parse_reflector_input(&input) else {
                         self.status_message = Some("Invalid reflector (e.g. REF030 C)".into());
                         return true;
                     };
@@ -1486,7 +1534,10 @@ impl App {
                     let _ = buf.pop();
                 }
                 KeyCode::Char(c) => {
-                    if buf.len() < 12 {
+                    // Only characters that can appear in a reflector spec:
+                    // rejecting non-ASCII here keeps the buffer single-byte
+                    // per char, so parsing can never split a char boundary.
+                    if buf.len() < 12 && (c.is_ascii_alphanumeric() || c == ' ') {
                         buf.push(c.to_ascii_uppercase());
                     }
                 }
@@ -3363,5 +3414,339 @@ impl App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    use super::{App, McpState, Message, RadioState, parse_reflector_input};
+    use crate::event::RadioCommand;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    // ── Reducer: `update(Message) -> bool` ────────────────────────
+    //
+    // `App::update` is a pure state machine whose only effect channel
+    // is `cmd_tx` — an unbounded tokio channel that works without a
+    // runtime — so these need no async harness. Each test below pins a
+    // regression this file has actually shipped.
+
+    /// A failed MCP write must NOT wipe the loaded image.
+    ///
+    /// The cache exists so the operator can keep working (and retry the
+    /// write) after a transient MCP failure; resetting to `Idle` on
+    /// error threw away a 55-second full-memory read. The guard is one
+    /// `matches!` — trivially deleted by a future refactor, and nothing
+    /// pinned it until now.
+    #[test]
+    fn mcp_error_preserves_a_loaded_image() {
+        let mut app = App::with_cache_path(String::new(), None);
+        let raw = vec![0u8; 500_480];
+        assert!(app.update(Message::McpReadComplete(raw)));
+        assert!(
+            matches!(app.mcp, McpState::Loaded { .. }),
+            "precondition: the image is loaded"
+        );
+
+        assert!(app.update(Message::McpError("write failed".into())));
+        assert!(
+            matches!(app.mcp, McpState::Loaded { .. }),
+            "a failed MCP write must not destroy the cached image"
+        );
+
+        // With no image loaded, an error DOES return to Idle.
+        let mut fresh = App::with_cache_path(String::new(), None);
+        assert!(fresh.update(Message::McpError("read failed".into())));
+        assert!(
+            matches!(fresh.mcp, McpState::Idle),
+            "without a loaded image, an MCP error resets to Idle"
+        );
+    }
+
+    /// `McpByteWritten` patches the cached image in place, so the TUI
+    /// stays in sync without a full re-read after reconnect.
+    #[test]
+    fn mcp_byte_written_patches_the_cached_image() -> TestResult {
+        let mut app = App::with_cache_path(String::new(), None);
+        assert!(app.update(Message::McpReadComplete(vec![0u8; 500_480])));
+
+        assert!(app.update(Message::McpByteWritten {
+            offset: 0x1000,
+            value: 0x42,
+        }));
+
+        let McpState::Loaded { ref image, .. } = app.mcp else {
+            return Err("image must still be loaded".into());
+        };
+        assert_eq!(
+            image.as_raw().get(0x1000).copied(),
+            Some(0x42),
+            "the written byte must be patched into the cached image"
+        );
+        Ok(())
+    }
+
+    /// A poll that carries empty static fields must not erase what the
+    /// radio told us once at connect. Firmware version and radio type
+    /// are read a single time; the periodic poll leaves them blank, so
+    /// a naive `self.state = state` blanks the header on every tick.
+    #[test]
+    fn radio_update_preserves_connect_only_fields() {
+        let mut app = App::with_cache_path(String::new(), None);
+        let initial = RadioState {
+            firmware_version: "1.03".to_owned(),
+            radio_type: "TH-D75A".to_owned(),
+            dstar_urcall: "CQCQCQ".to_owned(),
+            ..RadioState::default()
+        };
+        assert!(app.update(Message::RadioUpdate(initial)));
+
+        // A routine poll: no firmware, no radio type, no D-STAR fields.
+        assert!(app.update(Message::RadioUpdate(RadioState::default())));
+
+        assert_eq!(
+            app.state.firmware_version, "1.03",
+            "firmware version must survive a poll that omits it"
+        );
+        assert_eq!(
+            app.state.radio_type, "TH-D75A",
+            "radio type must survive a poll that omits it"
+        );
+        assert_eq!(
+            app.state.dstar_urcall, "CQCQCQ",
+            "D-STAR URCALL must survive a poll that omits it"
+        );
+        assert!(app.connected, "a RadioUpdate marks the link connected");
+    }
+
+    /// A poll that DOES carry a value must overwrite the old one —
+    /// the preservation above must not become a write-once latch.
+    #[test]
+    fn radio_update_overwrites_fields_the_poll_provides() {
+        let mut app = App::with_cache_path(String::new(), None);
+        let initial = RadioState {
+            dstar_urcall: "CQCQCQ".to_owned(),
+            ..RadioState::default()
+        };
+        assert!(app.update(Message::RadioUpdate(initial)));
+
+        let updated = RadioState {
+            dstar_urcall: "W1AW".to_owned(),
+            ..RadioState::default()
+        };
+        assert!(app.update(Message::RadioUpdate(updated)));
+
+        assert_eq!(
+            app.state.dstar_urcall, "W1AW",
+            "a poll that carries a URCALL must replace the cached one"
+        );
+    }
+
+    /// `McpProgress` must not mistake a write for a read: while a write
+    /// is in flight, progress ticks stay `Writing` (the UI otherwise
+    /// reports "Reading page N/M" during a write).
+    #[test]
+    fn mcp_progress_does_not_downgrade_a_write_to_a_read() {
+        let mut app = App::with_cache_path(String::new(), None);
+        app.mcp = McpState::Writing {
+            page: 0,
+            total: 100,
+        };
+
+        assert!(app.update(Message::McpProgress {
+            page: 5,
+            total: 100,
+        }));
+        assert!(
+            matches!(app.mcp, McpState::Writing { page: 5, .. }),
+            "progress during a write must stay Writing, got {:?}",
+            app.mcp
+        );
+
+        // From Idle, progress means a read is underway.
+        let mut reader = App::with_cache_path(String::new(), None);
+        assert!(reader.update(Message::McpProgress {
+            page: 3,
+            total: 100,
+        }));
+        assert!(
+            matches!(reader.mcp, McpState::Reading { page: 3, .. }),
+            "progress with no write in flight is a read, got {:?}",
+            reader.mcp
+        );
+    }
+
+    /// Connection-state messages drive the `connected` flag both ways.
+    #[test]
+    fn disconnect_and_reconnect_toggle_the_connected_flag() {
+        let mut app = App::with_cache_path(String::new(), None);
+        assert!(app.update(Message::RadioUpdate(RadioState::default())));
+        assert!(app.connected);
+
+        assert!(app.update(Message::Disconnected));
+        assert!(!app.connected, "Disconnected clears the connected flag");
+
+        assert!(app.update(Message::Reconnected));
+        assert!(app.connected, "Reconnected sets it again");
+    }
+
+    #[test]
+    fn parse_single_token_splits_trailing_module() -> TestResult {
+        let (name, module) = parse_reflector_input("REF030C").ok_or("expected REF030C to parse")?;
+        assert_eq!(name, "REF030", "reflector name");
+        assert_eq!(module, 'C', "reflector module");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_two_token_form() -> TestResult {
+        let (name, module) =
+            parse_reflector_input("REF030 C").ok_or("expected `REF030 C` to parse")?;
+        assert_eq!(name, "REF030", "reflector name");
+        assert_eq!(module, 'C', "reflector module");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_uppercases_name() -> TestResult {
+        let (name, module) =
+            parse_reflector_input("xlx757 B").ok_or("expected `xlx757 B` to parse")?;
+        assert_eq!(name, "XLX757", "reflector name");
+        assert_eq!(module, 'B', "reflector module");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_rejects_single_token_trailing_digit() {
+        let parsed = parse_reflector_input("REF030");
+        assert!(
+            parsed.is_none(),
+            "trailing digit is not a module letter, got {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_lowercase_module() {
+        for input in ["REF030c", "REF030 c"] {
+            let parsed = parse_reflector_input(input);
+            assert!(
+                parsed.is_none(),
+                "lowercase module must be rejected for {input:?}, got {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_short_empty_and_non_ascii_without_panic() {
+        // "é" is 2 bytes: the pre-fix code byte-sliced `len - 1` and panicked
+        // mid-char. The parser must reject these instead (single-token inputs
+        // need >= 4 chars and an ASCII uppercase module letter).
+        for input in ["", " ", "AB", "ABC", "é", "REFé"] {
+            let parsed = parse_reflector_input(input);
+            assert!(
+                parsed.is_none(),
+                "expected {input:?} to be rejected, got {parsed:?}"
+            );
+        }
+    }
+
+    /// An `App` in D-STAR reflector-input mode with a command channel
+    /// attached, plus the receiving end for asserting on emitted commands.
+    fn reflector_app() -> (App, UnboundedReceiver<RadioCommand>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::with_cache_path(String::new(), None);
+        app.cmd_tx = Some(tx);
+        app.dstar_reflector_input = Some(String::new());
+        (app, rx)
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        let _render = app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    fn assert_connect(
+        rx: &mut UnboundedReceiver<RadioCommand>,
+        expected_name: &str,
+        expected_module: char,
+    ) -> TestResult {
+        let cmd = rx.try_recv()?;
+        match cmd {
+            RadioCommand::ConnectReflector { name, module } => {
+                assert_eq!(name, expected_name, "reflector name");
+                assert_eq!(module, expected_module, "reflector module");
+                Ok(())
+            }
+            other => Err(format!("expected ConnectReflector, got {other:?}").into()),
+        }
+    }
+
+    #[test]
+    fn reflector_input_non_ascii_is_rejected_without_panic() -> TestResult {
+        let (mut app, mut rx) = reflector_app();
+        type_str(&mut app, "REFé");
+        press(&mut app, KeyCode::Enter);
+        let recv = rx.try_recv();
+        assert!(
+            recv.is_err(),
+            "non-ASCII reflector input must not emit a command, got {recv:?}"
+        );
+        let status = app.status_message.ok_or("expected a status message")?;
+        assert!(
+            status.contains("Invalid reflector"),
+            "expected invalid-reflector status, got {status:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reflector_single_token_trailing_digit_is_rejected() -> TestResult {
+        let (mut app, mut rx) = reflector_app();
+        type_str(&mut app, "REF030");
+        press(&mut app, KeyCode::Enter);
+        let recv = rx.try_recv();
+        assert!(
+            recv.is_err(),
+            "input ending in a digit has no module letter and must not \
+             emit a command, got {recv:?}"
+        );
+        let status = app.status_message.ok_or("expected a status message")?;
+        assert!(
+            status.contains("Invalid reflector"),
+            "expected invalid-reflector status, got {status:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reflector_single_token_with_module_connects() -> TestResult {
+        let (mut app, mut rx) = reflector_app();
+        type_str(&mut app, "REF030C");
+        press(&mut app, KeyCode::Enter);
+        assert_connect(&mut rx, "REF030", 'C')
+    }
+
+    #[test]
+    fn reflector_two_token_form_connects() -> TestResult {
+        let (mut app, mut rx) = reflector_app();
+        type_str(&mut app, "REF030 C");
+        press(&mut app, KeyCode::Enter);
+        assert_connect(&mut rx, "REF030", 'C')
+    }
+
+    #[test]
+    fn reflector_lowercase_input_is_uppercased() -> TestResult {
+        let (mut app, mut rx) = reflector_app();
+        type_str(&mut app, "ref030c");
+        press(&mut app, KeyCode::Enter);
+        assert_connect(&mut rx, "REF030", 'C')
     }
 }

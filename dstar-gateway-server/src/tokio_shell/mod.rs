@@ -9,6 +9,6 @@ pub mod endpoint;
 pub mod fanout;
 pub mod transcode;
 
-pub use endpoint::{EndpointOutcome, ProtocolEndpoint, ShellError};
+pub use endpoint::{EndpointOutcome, EndpointSettings, ProtocolEndpoint, ShellError};
 pub use fanout::{FanOutReport, fan_out_voice, fan_out_voice_at};
 pub use transcode::{CrossProtocolEvent, TranscodeError, VoiceEvent, transcode_voice};

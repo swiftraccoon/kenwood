@@ -590,6 +590,71 @@ mod tests {
         assert_eq!(corrected_data, data, "corrected data should match original");
     }
 
+    /// Golay(23,12) is a perfect code: every error pattern of weight
+    /// ≤ 3 falls in a distinct coset, so the decoder must restore the
+    /// data bits of any codeword corrupted by up to three flips.
+    /// This decoder corrects data bits only (parity bits pass through
+    /// unmodified) and its error count reports corrected DATA bits,
+    /// so a parity-only flip pattern legitimately reports zero.
+    /// Sweeping every 1-, 2- and 3-bit pattern (2,047 masks) over a
+    /// spread of data words exercises every correctable syndrome — a
+    /// single corrupted `GOLAY_MATRIX` entry mis-corrects exactly one
+    /// syndrome, which the hand-picked cases above cannot see.
+    #[test]
+    fn golay_corrects_every_pattern_up_to_three_flips() {
+        let mut words: Vec<i32> = vec![0x000, 0xFFF, 0x001, 0x800, 0x555, 0xAAA];
+        words.extend((0_i32..10).map(|k| (k * 397 + 91) & 0xFFF));
+
+        for &data in &words {
+            let mut parity: i32 = 0;
+            for (i, &g) in tables::GOLAY_GENERATOR.iter().enumerate().take(12) {
+                if (data & (1 << (11 - i))) != 0 {
+                    parity ^= g;
+                }
+            }
+            let codeword: i32 = (data << 11) | parity;
+            let mut clean = [0u8; 23];
+            for (bi, slot) in clean.iter_mut().enumerate() {
+                *slot = bit_at(codeword, bi);
+            }
+
+            let check = |flips: &[usize]| {
+                let mut corrupted = clean;
+                for &f in flips {
+                    if let Some(bit) = corrupted.get_mut(f) {
+                        *bit ^= 1;
+                    }
+                }
+                let (out_bits, errs) = golay_decode(&corrupted);
+                let data_flips = flips.iter().filter(|&&f| f >= 11).count();
+                assert_eq!(
+                    usize::try_from(errs).unwrap_or(usize::MAX),
+                    data_flips,
+                    "word {data:#05x}: flips {flips:?} must report exactly the corrected data bits"
+                );
+                let mut corrected: i32 = 0;
+                for &bit in out_bits.iter().skip(11).rev() {
+                    corrected <<= 1;
+                    corrected |= i32::from(bit);
+                }
+                assert_eq!(
+                    corrected, data,
+                    "word {data:#05x}: flips {flips:?} must restore the data bits"
+                );
+            };
+
+            for a in 0..23 {
+                check(&[a]);
+                for b in (a + 1)..23 {
+                    check(&[a, b]);
+                    for c in (b + 1)..23 {
+                        check(&[a, b, c]);
+                    }
+                }
+            }
+        }
+    }
+
     /// Verifies that `ecc_c0` leaves a zero frame unchanged and reports
     /// zero errors.
     #[test]

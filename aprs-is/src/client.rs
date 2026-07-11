@@ -601,15 +601,58 @@ mod tests {
     use std::future::Future;
     use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    /// Read up to `buf.len()` bytes from `stream`. Returns the number of
-    /// bytes read, or panics via `assert!` in the test handler on I/O
-    /// error — the handler is spawned on a tokio task and must not
-    /// leak an `?` beyond the `async move` body.
+    /// Read up to `buf.len()` bytes from `stream`. Returns `Some(n)` for
+    /// a non-empty read, or `None` on EOF or I/O error. Handlers treat
+    /// `None` as "stop capturing" and return early; dropping their
+    /// `oneshot` sender then fails the test body's [`recv_captured`]
+    /// await instead of being lost in the detached server task.
     async fn read_some(stream: &mut TcpStream, buf: &mut [u8]) -> Option<usize> {
         stream.read(buf).await.ok().filter(|n| *n > 0)
+    }
+
+    /// Capture bytes from `stream` until `lines` newline bytes have been
+    /// seen, EOF is reached, or a read fails. Returns everything read.
+    ///
+    /// Framing on `\n` counts (rather than on `read` call boundaries)
+    /// makes the capture immune to TCP coalescing and fragmentation:
+    /// the client's login and packet writes may arrive merged into one
+    /// segment or split across several. Pass `usize::MAX` to capture
+    /// until the peer closes the connection.
+    async fn read_lines_capture(stream: &mut TcpStream, lines: usize) -> Vec<u8> {
+        let mut captured = Vec::new();
+        let mut seen = 0_usize;
+        let mut buf = [0_u8; 512];
+        while seen < lines {
+            let Some(n) = read_some(stream, &mut buf).await else {
+                break;
+            };
+            let chunk = buf.get(..n).unwrap_or(&[]);
+            for &byte in chunk {
+                if byte == b'\n' {
+                    seen += 1;
+                }
+            }
+            captured.extend_from_slice(chunk);
+        }
+        captured
+    }
+
+    /// Await the bytes a mock-server handler captured, bounding the wait
+    /// so a wedged handler fails the test instead of hanging it. A
+    /// handler that exited without sending (dropped sender) fails the
+    /// test immediately. Decodes the bytes as UTF-8 — everything these
+    /// tests put on the wire is ASCII.
+    async fn recv_captured(
+        rx: oneshot::Receiver<Vec<u8>>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let bytes = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| "mock server handler did not report captured bytes within 5s")??;
+        Ok(String::from_utf8(bytes)?)
     }
 
     /// Write all of `data` to `stream`; swallow any I/O error since the
@@ -620,10 +663,17 @@ mod tests {
         }
     }
 
-    /// Spawn a mock APRS-IS server that accepts one connection, reads
-    /// the login line, and runs the given handler.
+    /// Spawn a mock APRS-IS server that accepts one connection and runs
+    /// the given handler on it.
     ///
     /// Returns the bound `SocketAddr` so tests can connect to it.
+    ///
+    /// The handler runs on a detached tokio task, so a panic inside it
+    /// (e.g. a failed `assert!`) is swallowed by the runtime and can
+    /// never fail the test. Handlers must therefore not assert. Instead
+    /// they capture the bytes they read (see [`read_lines_capture`]) and
+    /// ship them to the test body over a `oneshot` channel, and the test
+    /// body asserts on the wire content after [`recv_captured`].
     async fn spawn_mock_server<F, Fut>(handler: F) -> Result<std::net::SocketAddr, std::io::Error>
     where
         F: FnOnce(TcpStream) -> Fut + Send + 'static,
@@ -653,24 +703,21 @@ mod tests {
 
     #[tokio::test]
     async fn connect_sends_login_string() -> TestResult {
-        let addr = spawn_mock_server(|mut stream| async move {
-            let mut buf = [0u8; 512];
-            let Some(n) = read_some(&mut stream, &mut buf).await else {
-                return;
-            };
-            let Ok(login) = std::str::from_utf8(buf.get(..n).unwrap_or(&[])) else {
-                return;
-            };
-            assert!(
-                login.starts_with("user N0CALL pass -1 vers test 0.1"),
-                "unexpected login: {login:?}"
-            );
-            assert!(login.ends_with("\r\n"), "missing CRLF: {login:?}");
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        let (tx, rx) = oneshot::channel::<Vec<u8>>();
+        let addr = spawn_mock_server(move |mut stream| async move {
+            let captured = read_lines_capture(&mut stream, 1).await;
+            drop(tx.send(captured));
         })
         .await?;
 
         let _client = AprsIsClient::connect(test_config(addr)).await?;
+
+        let login = recv_captured(rx).await?;
+        assert!(
+            login.starts_with("user N0CALL pass -1 vers test 0.1"),
+            "unexpected login: {login:?}"
+        );
+        assert!(login.ends_with("\r\n"), "missing CRLF: {login:?}");
         Ok(())
     }
 
@@ -840,25 +887,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_packet_formats_line() -> TestResult {
-        let addr = spawn_mock_server(|mut stream| async move {
-            let mut buf = [0u8; 1024];
-            let Some(n) = read_some(&mut stream, &mut buf).await else {
-                return;
-            };
-            let Ok(text) = std::str::from_utf8(buf.get(..n).unwrap_or(&[])) else {
-                return;
-            };
-            assert!(text.contains("user N0CALL"), "login missing: {text:?}");
-            let Some(n) = read_some(&mut stream, &mut buf).await else {
-                return;
-            };
-            let Ok(pkt) = std::str::from_utf8(buf.get(..n).unwrap_or(&[])) else {
-                return;
-            };
-            assert_eq!(
-                pkt, "N0CALL>APK005,WIDE1-1:!4903.50N/07201.75W-Test\r\n",
-                "unexpected packet: {pkt:?}"
-            );
+        let (tx, rx) = oneshot::channel::<Vec<u8>>();
+        let addr = spawn_mock_server(move |mut stream| async move {
+            // Login line + packet line.
+            let captured = read_lines_capture(&mut stream, 2).await;
+            drop(tx.send(captured));
         })
         .await?;
 
@@ -866,47 +899,75 @@ mod tests {
         client
             .send_packet("N0CALL", "APK005", &["WIDE1-1"], "!4903.50N/07201.75W-Test")
             .await?;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let wire = recv_captured(rx).await?;
+        let mut lines = wire.split_inclusive('\n');
+        let login = lines.next().ok_or("no login line captured")?;
+        assert!(login.contains("user N0CALL"), "login missing: {login:?}");
+        let pkt = lines.next().ok_or("no packet line captured")?;
+        assert_eq!(
+            pkt, "N0CALL>APK005,WIDE1-1:!4903.50N/07201.75W-Test\r\n",
+            "unexpected packet: {pkt:?}"
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn send_keepalive_sends_comment_line() -> TestResult {
-        let addr = spawn_mock_server(|mut stream| async move {
-            let mut buf = [0u8; 1024];
-            let _ = read_some(&mut stream, &mut buf).await;
-            let Some(n) = read_some(&mut stream, &mut buf).await else {
-                return;
-            };
-            let Ok(ka) = std::str::from_utf8(buf.get(..n).unwrap_or(&[])) else {
-                return;
-            };
-            assert!(
-                ka.starts_with("# aprs-is keepalive"),
-                "unexpected keepalive: {ka:?}"
-            );
-            assert!(ka.ends_with("\r\n"), "missing CRLF: {ka:?}");
+        let (tx, rx) = oneshot::channel::<Vec<u8>>();
+        let addr = spawn_mock_server(move |mut stream| async move {
+            // Login line + keepalive line.
+            let captured = read_lines_capture(&mut stream, 2).await;
+            drop(tx.send(captured));
         })
         .await?;
 
         let mut client = AprsIsClient::connect(test_config(addr)).await?;
         client.send_keepalive().await?;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let wire = recv_captured(rx).await?;
+        let mut lines = wire.split_inclusive('\n');
+        let login = lines.next().ok_or("no login line captured")?;
+        assert!(
+            login.starts_with("user N0CALL"),
+            "unexpected login: {login:?}"
+        );
+        let ka = lines.next().ok_or("no keepalive line captured")?;
+        assert!(
+            ka.starts_with("# aprs-is keepalive"),
+            "unexpected keepalive: {ka:?}"
+        );
+        assert!(ka.ends_with("\r\n"), "missing CRLF: {ka:?}");
         Ok(())
     }
 
     #[tokio::test]
     async fn maybe_send_keepalive_noop_when_recent() -> TestResult {
-        let addr = spawn_mock_server(|mut stream| async move {
-            let mut buf = [0u8; 1024];
-            let _ = read_some(&mut stream, &mut buf).await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        let (tx, rx) = oneshot::channel::<Vec<u8>>();
+        let addr = spawn_mock_server(move |mut stream| async move {
+            // Capture everything until the client closes the connection.
+            let captured = read_lines_capture(&mut stream, usize::MAX).await;
+            drop(tx.send(captured));
         })
         .await?;
 
         let mut client = AprsIsClient::connect(test_config(addr)).await?;
         // Called immediately after connect — last_write is fresh, no send.
         client.maybe_send_keepalive().await?;
+        // Close the socket so the capture ends at EOF, then prove the
+        // login line is the ONLY thing that went on the wire.
+        drop(client);
+
+        let wire = recv_captured(rx).await?;
+        assert!(
+            wire.starts_with("user N0CALL"),
+            "expected the login line on the wire, got {wire:?}"
+        );
+        assert_eq!(
+            wire.matches('\n').count(),
+            1,
+            "expected nothing after the login line, got {wire:?}"
+        );
         Ok(())
     }
 
@@ -923,19 +984,25 @@ mod tests {
             software_name: "test".to_owned(),
             software_version: "0.1".to_owned(),
         };
-        // Override the timeout for the test — we don't want to wait 10s.
-        // Instead, verify the error path exists by checking connect_with_retry
-        // returns an error with max_attempts=1.
+        // `connect` bounds the TCP handshake at CONNECT_TIMEOUT (10s), so
+        // a single attempt must resolve within that plus margin. If the
+        // outer timer fires, the client hung past its own deadline —
+        // exactly the regression this test guards — and the `?` fails
+        // the test.
         let result = tokio::time::timeout(
-            Duration::from_secs(15),
+            CONNECT_TIMEOUT + Duration::from_secs(5),
             AprsIsClient::connect_with_retry(config, Some(1)),
         )
-        .await;
-        // Either the overall test timeout fires, or the connect fails.
-        // Both are acceptable as long as we don't hang.
-        if let Ok(r) = result {
-            assert!(r.is_err(), "expected connect to fail, got Ok");
-        }
+        .await
+        .map_err(|_| "connect_with_retry hung past CONNECT_TIMEOUT + margin")?;
+        // Within the deadline the attempt must have failed: fast-reject
+        // networks yield Connect(unreachable) immediately, SYN-dropping
+        // networks yield Connect(TimedOut) at CONNECT_TIMEOUT. Either
+        // way, reaching a TEST-NET-2 address is a failure.
+        assert!(
+            result.is_err(),
+            "expected connect to TEST-NET-2 to fail, got Ok"
+        );
         Ok(())
     }
 
@@ -1033,14 +1100,12 @@ mod tests {
 
     #[tokio::test]
     async fn send_packet_rejects_crlf_injection_in_data() -> TestResult {
-        // The mock server records every byte it receives after the login
-        // line so we can prove no forged second line is written.
-        let addr = spawn_mock_server(|mut stream| async move {
-            let mut buf = [0u8; 1024];
-            // Drain the login line.
-            let _ = read_some(&mut stream, &mut buf).await;
-            // Give the client time to attempt (and reject) the send.
-            tokio::time::sleep(Duration::from_millis(80)).await;
+        // The mock server records every byte it receives so we can prove
+        // no forged second line is written.
+        let (tx, rx) = oneshot::channel::<Vec<u8>>();
+        let addr = spawn_mock_server(move |mut stream| async move {
+            let captured = read_lines_capture(&mut stream, usize::MAX).await;
+            drop(tx.send(captured));
         })
         .await?;
 
@@ -1053,6 +1118,25 @@ mod tests {
         assert!(
             matches!(result, Err(AprsIsError::EmbeddedNewline)),
             "expected EmbeddedNewline, got {result:?}"
+        );
+        // Close the socket so the capture ends at EOF, then prove the
+        // login line is the ONLY thing that went on the wire — the
+        // rejected send must not have written anything.
+        drop(client);
+
+        let wire = recv_captured(rx).await?;
+        assert!(
+            wire.starts_with("user N0CALL"),
+            "expected the login line on the wire, got {wire:?}"
+        );
+        assert_eq!(
+            wire.matches('\n').count(),
+            1,
+            "rejected send leaked bytes onto the wire: {wire:?}"
+        );
+        assert!(
+            !wire.contains("forged"),
+            "forged line reached the wire: {wire:?}"
         );
         Ok(())
     }
@@ -1080,19 +1164,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_packet_normal_still_sends() -> TestResult {
-        let addr = spawn_mock_server(|mut stream| async move {
-            let mut buf = [0u8; 1024];
-            let _ = read_some(&mut stream, &mut buf).await;
-            let Some(n) = read_some(&mut stream, &mut buf).await else {
-                return;
-            };
-            let Ok(pkt) = std::str::from_utf8(buf.get(..n).unwrap_or(&[])) else {
-                return;
-            };
-            assert_eq!(
-                pkt, "N0CALL>APK005:!4903.50N/07201.75W-Test\r\n",
-                "unexpected packet: {pkt:?}"
-            );
+        let (tx, rx) = oneshot::channel::<Vec<u8>>();
+        let addr = spawn_mock_server(move |mut stream| async move {
+            // Login line + packet line.
+            let captured = read_lines_capture(&mut stream, 2).await;
+            drop(tx.send(captured));
         })
         .await?;
 
@@ -1100,7 +1176,19 @@ mod tests {
         client
             .send_packet("N0CALL", "APK005", &[], "!4903.50N/07201.75W-Test")
             .await?;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let wire = recv_captured(rx).await?;
+        let mut lines = wire.split_inclusive('\n');
+        let login = lines.next().ok_or("no login line captured")?;
+        assert!(
+            login.starts_with("user N0CALL"),
+            "unexpected login: {login:?}"
+        );
+        let pkt = lines.next().ok_or("no packet line captured")?;
+        assert_eq!(
+            pkt, "N0CALL>APK005:!4903.50N/07201.75W-Test\r\n",
+            "unexpected packet: {pkt:?}"
+        );
         Ok(())
     }
 

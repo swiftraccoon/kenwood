@@ -16,7 +16,8 @@
 //!    supplies already-encoded codewords and this step restores them
 //!    to wire form).
 //! 2. **Packs** the 72 bits back into 9 bytes via the inverse interleave
-//!    table, MSB-first within each byte (bit 7 of byte 0 is input bit 0).
+//!    table, LSB-first within each byte (bit 0 of byte 0 is input bit 0
+//!    — the DVSI wire convention; see [`crate::unpack`]).
 //!
 //! The output is a valid 9-byte AMBE wire frame suitable for the
 //! DSVT voice-data slot in the D-STAR frame.
@@ -42,7 +43,7 @@ use crate::unpack::demodulate_c1;
 ///
 /// # Returns
 ///
-/// 9 packed bytes, MSB-first. `result[0]` bit 7 is the first bit that
+/// 9 packed bytes, LSB-first. `result[0]` bit 0 is the first bit that
 /// goes on the wire.
 ///
 /// # Round-trip invariant

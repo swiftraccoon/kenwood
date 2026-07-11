@@ -6,12 +6,34 @@
 //! other fields carry sensible defaults documented on each builder
 //! method.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use dstar_gateway_core::types::{Callsign, Module, ProtocolKind};
+
+/// Standard `DExtra` reflector UDP port (`xlxd/src/main.h`, `DEXTRA_PORT`).
+pub const STANDARD_DEXTRA_PORT: u16 = 30001;
+
+/// Standard `DPlus` reflector UDP port (`xlxd/src/main.h`, `DPLUS_PORT`).
+pub const STANDARD_DPLUS_PORT: u16 = 20001;
+
+/// Standard `DCS` reflector UDP port (`xlxd/src/main.h`, `DCS_PORT`).
+pub const STANDARD_DCS_PORT: u16 = 30051;
+
+/// The standard reflector UDP port for a protocol, if known.
+///
+/// Returns `None` for protocol kinds this crate has no standard
+/// port assignment for (`ProtocolKind` is `#[non_exhaustive]`).
+const fn standard_port(protocol: ProtocolKind) -> Option<u16> {
+    match protocol {
+        ProtocolKind::DExtra => Some(STANDARD_DEXTRA_PORT),
+        ProtocolKind::DPlus => Some(STANDARD_DPLUS_PORT),
+        ProtocolKind::Dcs => Some(STANDARD_DCS_PORT),
+        _ => None,
+    }
+}
 
 /// Marker indicating a required `ReflectorConfigBuilder` field has NOT been set.
 #[derive(Debug)]
@@ -44,10 +66,32 @@ pub struct ReflectorConfig {
     /// Modules this reflector exposes.
     pub modules: HashSet<Module>,
     /// UDP bind address.
+    ///
+    /// This is the *base* address: the address each endpoint
+    /// actually binds is resolved per protocol by
+    /// [`Self::bind_addr_for`], which honors per-protocol overrides
+    /// from [`ReflectorConfigBuilder::protocol_bind`] and falls back
+    /// to the standard reflector ports when several protocols would
+    /// otherwise contend for one fixed port.
     pub bind: SocketAddr,
+    /// Explicit per-protocol bind overrides.
+    ///
+    /// Populated by [`ReflectorConfigBuilder::protocol_bind`]; an
+    /// entry here wins over every other resolution rule in
+    /// [`Self::bind_addr_for`].
+    pub protocol_binds: HashMap<ProtocolKind, SocketAddr>,
     /// Maximum clients allowed per module.
+    ///
+    /// A LINK attempt that would push a module's membership past
+    /// this count is rejected with the protocol's reject reply
+    /// (`DExtra`/`DCS` NAK, `DPlus` BUSY) and a `ClientRejected`
+    /// event.
     pub max_clients_per_module: usize,
     /// Maximum clients allowed across all modules.
+    ///
+    /// A LINK attempt from a new address while the endpoint's pool
+    /// already holds this many clients is rejected with the
+    /// protocol's reject reply and a `ClientRejected` event.
     pub max_total_clients: usize,
     /// Which protocol endpoints are enabled.
     ///
@@ -56,10 +100,25 @@ pub struct ReflectorConfig {
     /// set before building.
     pub enabled_protocols: HashSet<ProtocolKind>,
     /// Interval between keepalive polls sent to each client.
+    ///
+    /// Each endpoint's maintenance sweep sends every linked client
+    /// one protocol-appropriate keepalive per elapsed interval
+    /// (`DExtra`: 9-byte reflector-callsign poll; `DPlus`: 3-byte
+    /// poll; `DCS`: 22-byte per-client keepalive — the forms xlxd
+    /// sends).
     pub keepalive_interval: Duration,
     /// Inactivity window after which a silent client is evicted.
+    ///
+    /// Measured against the last datagram received from the peer;
+    /// eviction removes the pool entry and emits a `ClientEvicted`
+    /// event.
     pub keepalive_inactivity_timeout: Duration,
-    /// Inactivity window after which a stalled voice stream is closed.
+    /// Inactivity window after which a stalled voice stream's cache
+    /// entry is dropped.
+    ///
+    /// Frees the module's one-stream header cache when a talker
+    /// disappears without sending an end-of-transmission frame, so
+    /// the next stream on the module can be tracked.
     pub voice_inactivity_timeout: Duration,
     /// Whether voice from one protocol should be forwarded to clients on another protocol.
     pub cross_protocol_forwarding: bool,
@@ -70,6 +129,10 @@ pub struct ReflectorConfig {
     /// client trying to saturate the reflector with a burst of
     /// 200+ fps gets rate-limited. Set higher if you expect large
     /// bursts of legitimate traffic.
+    ///
+    /// Applied to every new client's fan-out token bucket: refill
+    /// runs at this rate and the burst capacity is one second of
+    /// traffic at this rate.
     pub tx_rate_limit_frames_per_sec: f64,
 }
 
@@ -78,6 +141,40 @@ impl ReflectorConfig {
     #[must_use]
     pub fn is_enabled(&self, protocol: ProtocolKind) -> bool {
         self.enabled_protocols.contains(&protocol)
+    }
+
+    /// Resolve the UDP address the given protocol's endpoint binds.
+    ///
+    /// Resolution rules, in order:
+    ///
+    /// 1. An explicit per-protocol override set via
+    ///    [`ReflectorConfigBuilder::protocol_bind`] is used verbatim.
+    /// 2. If [`Self::bind`] has port `0`, every protocol gets
+    ///    `(bind.ip(), 0)` — each endpoint binds its own ephemeral
+    ///    port.
+    /// 3. If exactly ONE protocol is enabled, [`Self::bind`] is used
+    ///    verbatim — a single-protocol reflector serves on exactly
+    ///    the address it was configured with.
+    /// 4. Otherwise (several protocols contending for one fixed
+    ///    port), each protocol gets `(bind.ip(), standard port)`,
+    ///    where the standard D-STAR reflector ports are `DExtra` =
+    ///    30001, `DPlus` = 20001, `DCS` = 30051 (`xlxd/src/main.h`:
+    ///    `DEXTRA_PORT` / `DPLUS_PORT` / `DCS_PORT`). Without this
+    ///    rule the library-default config (all three protocols
+    ///    enabled) could never start on a fixed port — the second
+    ///    bind would fail with `AddrInUse`.
+    #[must_use]
+    pub fn bind_addr_for(&self, protocol: ProtocolKind) -> SocketAddr {
+        if let Some(addr) = self.protocol_binds.get(&protocol) {
+            return *addr;
+        }
+        if self.bind.port() == 0 {
+            return SocketAddr::new(self.bind.ip(), 0);
+        }
+        if self.enabled_protocols.len() == 1 {
+            return self.bind;
+        }
+        standard_port(protocol).map_or(self.bind, |port| SocketAddr::new(self.bind.ip(), port))
     }
 
     /// Start building a [`ReflectorConfig`].
@@ -130,6 +227,7 @@ pub struct ReflectorConfigBuilder<Cs, Ms, Bn> {
     callsign: Option<Callsign>,
     modules: Option<HashSet<Module>>,
     bind: Option<SocketAddr>,
+    protocol_binds: HashMap<ProtocolKind, SocketAddr>,
     max_clients_per_module: usize,
     max_total_clients: usize,
     enabled_protocols: HashSet<ProtocolKind>,
@@ -157,6 +255,7 @@ impl ReflectorConfigBuilder<Missing, Missing, Missing> {
             callsign: None,
             modules: None,
             bind: None,
+            protocol_binds: HashMap::new(),
             max_clients_per_module: 50,
             max_total_clients: 250,
             enabled_protocols: enabled,
@@ -180,6 +279,7 @@ impl<Cs, Ms, Bn> ReflectorConfigBuilder<Cs, Ms, Bn> {
             callsign: Some(callsign),
             modules: self.modules,
             bind: self.bind,
+            protocol_binds: self.protocol_binds,
             max_clients_per_module: self.max_clients_per_module,
             max_total_clients: self.max_total_clients,
             enabled_protocols: self.enabled_protocols,
@@ -201,6 +301,7 @@ impl<Cs, Ms, Bn> ReflectorConfigBuilder<Cs, Ms, Bn> {
             callsign: self.callsign,
             modules: Some(modules),
             bind: self.bind,
+            protocol_binds: self.protocol_binds,
             max_clients_per_module: self.max_clients_per_module,
             max_total_clients: self.max_total_clients,
             enabled_protocols: self.enabled_protocols,
@@ -216,12 +317,19 @@ impl<Cs, Ms, Bn> ReflectorConfigBuilder<Cs, Ms, Bn> {
     }
 
     /// Set the UDP bind address.
+    ///
+    /// This is the base address — the address each protocol endpoint
+    /// actually binds is resolved by
+    /// [`ReflectorConfig::bind_addr_for`]. Use
+    /// [`Self::protocol_bind`] to pin a specific protocol to a
+    /// specific address.
     #[must_use]
     pub fn bind(self, bind: SocketAddr) -> ReflectorConfigBuilder<Cs, Ms, Provided> {
         ReflectorConfigBuilder {
             callsign: self.callsign,
             modules: self.modules,
             bind: Some(bind),
+            protocol_binds: self.protocol_binds,
             max_clients_per_module: self.max_clients_per_module,
             max_total_clients: self.max_total_clients,
             enabled_protocols: self.enabled_protocols,
@@ -234,6 +342,19 @@ impl<Cs, Ms, Bn> ReflectorConfigBuilder<Cs, Ms, Bn> {
             _ms: PhantomData,
             _bn: PhantomData,
         }
+    }
+
+    /// Pin one protocol's endpoint to an explicit bind address.
+    ///
+    /// The override is used verbatim by
+    /// [`ReflectorConfig::bind_addr_for`] — it wins over the base
+    /// [`Self::bind`] address, the ephemeral-port rule, and the
+    /// standard-port fallback. Calling this again for the same
+    /// protocol replaces the previous override.
+    #[must_use]
+    pub fn protocol_bind(mut self, protocol: ProtocolKind, bind: SocketAddr) -> Self {
+        let _prev = self.protocol_binds.insert(protocol, bind);
+        self
     }
 
     /// Override the maximum clients per module (default `50`).
@@ -331,6 +452,7 @@ impl ReflectorConfigBuilder<Provided, Provided, Provided> {
             callsign,
             modules,
             bind,
+            protocol_binds: self.protocol_binds,
             max_clients_per_module: self.max_clients_per_module,
             max_total_clients: self.max_total_clients,
             enabled_protocols: self.enabled_protocols,
@@ -430,6 +552,88 @@ mod tests {
             .bind(BIND)
             .build()?;
         assert!(!config.cross_protocol_forwarding);
+        Ok(())
+    }
+
+    // ─── bind_addr_for resolution rules ───────────────────────────
+
+    #[test]
+    fn bind_addr_rule1_explicit_protocol_override_wins_verbatim() -> TestResult {
+        let dcs_override = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 40999);
+        let config = ReflectorConfig::builder()
+            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .module_set(module_set(&[Module::C]))
+            .bind(BIND)
+            .protocol_bind(ProtocolKind::Dcs, dcs_override)
+            .build()?;
+        assert_eq!(
+            config.bind_addr_for(ProtocolKind::Dcs),
+            dcs_override,
+            "explicit override is used verbatim"
+        );
+        // Protocols without an override still resolve through the
+        // remaining rules (all three enabled + fixed port → rule 4).
+        assert_eq!(
+            config.bind_addr_for(ProtocolKind::DExtra),
+            SocketAddr::new(BIND.ip(), super::STANDARD_DEXTRA_PORT)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bind_addr_rule2_ephemeral_base_port_stays_ephemeral() -> TestResult {
+        let ephemeral = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let config = ReflectorConfig::builder()
+            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .module_set(module_set(&[Module::C]))
+            .bind(ephemeral)
+            .build()?;
+        for protocol in [ProtocolKind::DExtra, ProtocolKind::DPlus, ProtocolKind::Dcs] {
+            assert_eq!(
+                config.bind_addr_for(protocol),
+                ephemeral,
+                "port 0 base keeps every protocol on an ephemeral port"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bind_addr_rule3_single_enabled_protocol_uses_bind_verbatim() -> TestResult {
+        let config = ReflectorConfig::builder()
+            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .module_set(module_set(&[Module::C]))
+            .bind(BIND)
+            .disable(ProtocolKind::DPlus)
+            .disable(ProtocolKind::Dcs)
+            .build()?;
+        assert_eq!(
+            config.bind_addr_for(ProtocolKind::DExtra),
+            BIND,
+            "a single-protocol reflector serves on exactly the configured address"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bind_addr_rule4_multi_protocol_fixed_port_uses_standard_ports() -> TestResult {
+        let config = ReflectorConfig::builder()
+            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .module_set(module_set(&[Module::C]))
+            .bind(BIND)
+            .build()?;
+        assert_eq!(
+            config.bind_addr_for(ProtocolKind::DExtra),
+            SocketAddr::new(BIND.ip(), 30001)
+        );
+        assert_eq!(
+            config.bind_addr_for(ProtocolKind::DPlus),
+            SocketAddr::new(BIND.ip(), 20001)
+        );
+        assert_eq!(
+            config.bind_addr_for(ProtocolKind::Dcs),
+            SocketAddr::new(BIND.ip(), 30051)
+        );
         Ok(())
     }
 }

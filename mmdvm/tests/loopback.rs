@@ -624,6 +624,49 @@ async fn set_mode_times_out_on_silent_modem() -> TestResult {
     Ok(())
 }
 
+/// An ACK correlated to a DIFFERENT command must not resolve a
+/// pending `set_mode`: a stray ACK (raw command, firmware quirk)
+/// would otherwise report success while the mode never changed. The
+/// wrong-command ACK is delivered, then the modem stays silent —
+/// `set_mode` must still end in `ResponseTimeout`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn set_mode_ignores_ack_for_a_different_command() -> TestResult {
+    let (client_side, mut modem_side) = duplex_pair();
+    let mut modem = AsyncModem::spawn(client_side);
+
+    tokio::time::advance(Duration::from_millis(5)).await;
+    let _init =
+        collect_frames_until(&mut modem_side, |_| None::<()>, Duration::from_millis(100)).await;
+
+    let (set_result, drive_result) = tokio::join!(
+        timeout(Duration::from_secs(30), modem.set_mode(ModemMode::DStar)),
+        async {
+            let hit = collect_frames_until(
+                &mut modem_side,
+                |f| (f.command == MMDVM_SET_MODE).then_some(()),
+                Duration::from_millis(500),
+            )
+            .await;
+            if hit.and_then(|(_, h)| h).is_none() {
+                return Err::<(), Box<dyn std::error::Error>>("SetMode frame never seen".into());
+            }
+            // ACK correlated to GET_STATUS, not SET_MODE.
+            modem_write(
+                &mut modem_side,
+                &MmdvmFrame::with_payload(MMDVM_ACK, vec![MMDVM_GET_STATUS]),
+            )
+            .await
+        }
+    );
+    drive_result?;
+    let inner = set_result.map_err(|_| "set_mode must not hang")?;
+    assert!(
+        matches!(inner, Err(ShellError::ResponseTimeout)),
+        "an ACK for another command must not resolve set_mode: {inner:?}"
+    );
+    Ok(())
+}
+
 /// Test transport whose read side fails immediately with an I/O
 /// error; writes are swallowed. Used to drive the loop's fatal-error
 /// exit path (a `DuplexStream` can only EOF, never error).

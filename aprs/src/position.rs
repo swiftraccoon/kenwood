@@ -60,7 +60,9 @@ pub struct AprsPosition {
 ///
 /// Returns `(degrees, ambiguity)` where `degrees` is the decimal-degree
 /// value (positive North) and `ambiguity` counts how many trailing
-/// digits were replaced with spaces per APRS 1.0.1 §8.1.6.
+/// digits were replaced with spaces per APRS 1.0.1 §8.1.6. Rejects
+/// out-of-range fields: minutes must be below 60 and the resulting
+/// magnitude at most 90°.
 fn parse_aprs_latitude(s: &[u8]) -> Result<(f64, PositionAmbiguity), AprsError> {
     let bytes_slice = s.get(..8).ok_or(AprsError::InvalidCoordinates)?;
     let bytes: [u8; 8] = bytes_slice
@@ -74,6 +76,13 @@ fn parse_aprs_latitude(s: &[u8]) -> Result<(f64, PositionAmbiguity), AprsError> 
     let min_str = text.get(2..7).ok_or(AprsError::InvalidCoordinates)?;
     let degrees: f64 = deg_str.parse().map_err(|_| AprsError::InvalidCoordinates)?;
     let minutes: f64 = min_str.parse().map_err(|_| AprsError::InvalidCoordinates)?;
+    // Range validation: minutes run 0..60 and latitude degrees at most
+    // 90. Without this, garbage like `9999.99N` parses to an
+    // impossible 100.67° that then flows into distance calculations
+    // and map consumers.
+    if minutes >= 60.0 || degrees > 90.0 {
+        return Err(AprsError::InvalidCoordinates);
+    }
     let hemisphere = *bytes.get(7).ok_or(AprsError::InvalidCoordinates)?;
 
     let mut lat = degrees + minutes / 60.0;
@@ -82,10 +91,18 @@ fn parse_aprs_latitude(s: &[u8]) -> Result<(f64, PositionAmbiguity), AprsError> 
     } else if hemisphere != b'N' {
         return Err(AprsError::InvalidCoordinates);
     }
+    // 90° with nonzero minutes slips past the per-field checks; the
+    // combined magnitude must not exceed the pole.
+    if lat.abs() > 90.0 {
+        return Err(AprsError::InvalidCoordinates);
+    }
     Ok((lat, ambiguity))
 }
 
 /// Parse APRS longitude from the standard `DDDMM.HH[E/W]` format.
+///
+/// Rejects out-of-range fields: minutes must be below 60 and the
+/// resulting magnitude at most 180°.
 fn parse_aprs_longitude(s: &[u8]) -> Result<(f64, PositionAmbiguity), AprsError> {
     let bytes_slice = s.get(..9).ok_or(AprsError::InvalidCoordinates)?;
     let bytes: [u8; 9] = bytes_slice
@@ -99,12 +116,22 @@ fn parse_aprs_longitude(s: &[u8]) -> Result<(f64, PositionAmbiguity), AprsError>
     let min_str = text.get(3..8).ok_or(AprsError::InvalidCoordinates)?;
     let degrees: f64 = deg_str.parse().map_err(|_| AprsError::InvalidCoordinates)?;
     let minutes: f64 = min_str.parse().map_err(|_| AprsError::InvalidCoordinates)?;
+    // Range validation: minutes run 0..60 and longitude degrees at
+    // most 180. Rejects impossible values like `36101.75W` (361°).
+    if minutes >= 60.0 || degrees > 180.0 {
+        return Err(AprsError::InvalidCoordinates);
+    }
     let hemisphere = *bytes.get(8).ok_or(AprsError::InvalidCoordinates)?;
 
     let mut lon = degrees + minutes / 60.0;
     if hemisphere == b'W' {
         lon = -lon;
     } else if hemisphere != b'E' {
+        return Err(AprsError::InvalidCoordinates);
+    }
+    // 180° with nonzero minutes slips past the per-field checks; the
+    // combined magnitude must not exceed the antimeridian.
+    if lon.abs() > 180.0 {
         return Err(AprsError::InvalidCoordinates);
     }
     Ok((lon, ambiguity))
@@ -478,6 +505,68 @@ mod tests {
         let info = b"=4903.50N/07201.75W-";
         let pos = parse_aprs_position(info)?;
         assert!((pos.latitude - 49.058_333).abs() < 0.001, "lat check");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_position_rejects_out_of_range_latitude() {
+        // Degrees 91 with minutes 60 — impossible latitude; pre-fix
+        // this parsed to 92°.
+        let r = parse_aprs_position(b"!9160.00N/07201.75W-");
+        assert!(
+            matches!(r, Err(AprsError::InvalidCoordinates)),
+            "9160.00N must be rejected: {r:?}",
+        );
+        // Minutes 99.99 — minutes must be < 60.
+        let r = parse_aprs_position(b"!4999.99N/07201.75W-");
+        assert!(
+            matches!(r, Err(AprsError::InvalidCoordinates)),
+            "latitude minutes 99.99 must be rejected: {r:?}",
+        );
+        // 90° plus nonzero minutes exceeds the pole (90.5°).
+        let r = parse_aprs_position(b"!9030.00N/07201.75W-");
+        assert!(
+            matches!(r, Err(AprsError::InvalidCoordinates)),
+            "9030.00N must be rejected: {r:?}",
+        );
+    }
+
+    #[test]
+    fn parse_position_rejects_out_of_range_longitude() {
+        // Degrees 361 — impossible longitude.
+        let r = parse_aprs_position(b"!4903.50N/36101.75W-");
+        assert!(
+            matches!(r, Err(AprsError::InvalidCoordinates)),
+            "36101.75W must be rejected: {r:?}",
+        );
+        // Minutes 90 — minutes must be < 60.
+        let r = parse_aprs_position(b"!4903.50N/07290.00W-");
+        assert!(
+            matches!(r, Err(AprsError::InvalidCoordinates)),
+            "longitude minutes 90 must be rejected: {r:?}",
+        );
+        // 180° plus nonzero minutes exceeds the antimeridian (180.5°).
+        let r = parse_aprs_position(b"!4903.50N/18030.00W-");
+        assert!(
+            matches!(r, Err(AprsError::InvalidCoordinates)),
+            "18030.00W must be rejected: {r:?}",
+        );
+    }
+
+    #[test]
+    fn parse_position_accepts_polar_and_antimeridian_boundary() -> TestResult {
+        // Exactly 90°00.00' / 180°00.00' — the boundary itself is valid.
+        let pos = parse_aprs_position(b"!9000.00N/18000.00E-")?;
+        assert!(
+            (pos.latitude - 90.0).abs() < f64::EPSILON,
+            "lat={}",
+            pos.latitude
+        );
+        assert!(
+            (pos.longitude - 180.0).abs() < f64::EPSILON,
+            "lon={}",
+            pos.longitude
+        );
         Ok(())
     }
 

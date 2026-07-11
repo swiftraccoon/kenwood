@@ -154,6 +154,70 @@ async fn header_needs_five_slots() -> TestResult {
     Ok(())
 }
 
+/// The local space ledger must deplete between status polls.
+///
+/// The modem reports FIFO space only in status replies; between polls
+/// the loop must debit its local `dstar_space` for every frame it
+/// drains (`MMDVMHost`'s `Modem.cpp` keeps the same local ledger).
+/// Without the debit, a burst queued between polls would all drain at
+/// the last-reported space and overrun the modem's TX FIFO. Every
+/// other test in this file refreshes status before its expectation,
+/// so this is the only test that fails if the debit disappears.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn local_space_depletes_between_status_polls() -> TestResult {
+    let (client_side, mut modem_side) = duplex_pair();
+    let mut modem = AsyncModem::spawn(client_side);
+
+    tokio::time::advance(Duration::from_millis(5)).await;
+    let _init = drain_frames(&mut modem_side, Duration::from_millis(100)).await;
+
+    // One status report: 3 slots. The fake modem then stays silent,
+    // so the loop has only its local ledger to go on.
+    modem_write(
+        &mut modem_side,
+        &MmdvmFrame::with_payload(MMDVM_GET_STATUS, status_v2(3)),
+    )
+    .await?;
+
+    // Queue three data frames. Data drains only while space exceeds
+    // one slot, so exactly two may go out (3 → 2 → 1, hold at 1).
+    modem.send_dstar_data([1u8; 12]).await?;
+    modem.send_dstar_data([2u8; 12]).await?;
+    modem.send_dstar_data([3u8; 12]).await?;
+
+    tokio::time::advance(Duration::from_millis(1000)).await;
+    let frames = drain_frames(&mut modem_side, Duration::from_millis(100)).await;
+    let data_count = frames
+        .iter()
+        .filter(|f| f.command == MMDVM_DSTAR_DATA)
+        .count();
+    assert_eq!(
+        data_count,
+        2,
+        "exactly two data frames may drain from 3 reported slots: {:?}",
+        frames.iter().map(|f| f.command).collect::<Vec<_>>()
+    );
+
+    // A fresh status report replenishes the ledger — the held frame
+    // drains on the next playout tick.
+    modem_write(
+        &mut modem_side,
+        &MmdvmFrame::with_payload(MMDVM_GET_STATUS, status_v2(3)),
+    )
+    .await?;
+    tokio::time::advance(Duration::from_millis(500)).await;
+    let frames = drain_frames(&mut modem_side, Duration::from_millis(100)).await;
+    let data_count = frames
+        .iter()
+        .filter(|f| f.command == MMDVM_DSTAR_DATA)
+        .count();
+    assert_eq!(
+        data_count, 1,
+        "the held frame drains after a fresh status report"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn data_needs_two_slots() -> TestResult {
     let (client_side, mut modem_side) = duplex_pair();

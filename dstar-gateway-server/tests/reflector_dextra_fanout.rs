@@ -27,7 +27,7 @@ use dstar_gateway_core::session::client::DExtra;
 use dstar_gateway_core::types::{Callsign, Module, ProtocolKind, StreamId, Suffix};
 use dstar_gateway_core::voice::VoiceFrame;
 use dstar_gateway_server::{
-    AllowAllAuthorizer, ProtocolEndpoint, Reflector, ReflectorConfig, ShellError,
+    AllowAllAuthorizer, EndpointSettings, ProtocolEndpoint, Reflector, ReflectorConfig, ShellError,
 };
 
 // Workspace dev-deps used by sibling test targets. Acknowledge them
@@ -92,11 +92,20 @@ async fn three_clients_fan_out_voice_without_echo() -> Result<(), Box<dyn std::e
     let endpoint_socket = Arc::new(endpoint_socket);
 
     // Spawn the DExtra endpoint on a dedicated tokio task driven by
-    // a watch channel shutdown signal.
-    let endpoint = Arc::new(ProtocolEndpoint::<DExtra>::new(
+    // a watch channel shutdown signal. The keepalive interval is
+    // pushed out to an hour so the run loop's maintenance timer
+    // cannot interleave keepalive datagrams with the exact packet
+    // sequence this test asserts on (keepalive emission has its own
+    // dedicated tests).
+    let endpoint = Arc::new(ProtocolEndpoint::<DExtra>::new_with_settings(
         ProtocolKind::DExtra,
         Module::C,
         Arc::new(AllowAllAuthorizer),
+        None,
+        EndpointSettings {
+            keepalive_interval: Duration::from_secs(3600),
+            ..EndpointSettings::default()
+        },
     ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let endpoint_task = {

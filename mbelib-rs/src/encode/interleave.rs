@@ -87,7 +87,7 @@ const fn build_inverse() -> [u8; AMBE_FRAME_BITS] {
 /// Inverse interleave: `INVERSE[ambe_fr_index] = input_bit`.
 ///
 /// Used by [`crate::encode::pack`] to read the 72 codeword bits back
-/// out in transmission order (MSB-first within the 9-byte frame).
+/// out in transmission order (LSB-first within the 9-byte frame).
 pub(crate) const INVERSE: [u8; AMBE_FRAME_BITS] = build_inverse();
 
 #[cfg(test)]

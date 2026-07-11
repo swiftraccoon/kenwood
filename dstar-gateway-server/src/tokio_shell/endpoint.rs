@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
@@ -21,11 +21,12 @@ use dstar_gateway_core::codec::dcs::{
     encode_connect_nak as encode_dcs_connect_nak,
 };
 use dstar_gateway_core::codec::dextra::{
-    ClientPacket, decode_client_to_server, encode_connect_nak,
+    ClientPacket, decode_client_to_server, encode_connect_nak, encode_poll as encode_dextra_poll,
 };
 use dstar_gateway_core::codec::dplus::{
     ClientPacket as DPlusClientPacket, Link2Result,
     decode_client_to_server as decode_dplus_client_to_server, encode_link2_reply,
+    encode_poll_echo as encode_dplus_poll_echo,
 };
 use dstar_gateway_core::error::Error as CoreError;
 use dstar_gateway_core::header::DStarHeader;
@@ -34,8 +35,10 @@ use dstar_gateway_core::session::server::ServerEvent;
 use dstar_gateway_core::types::{Callsign, Module, ProtocolKind, StreamId};
 use dstar_gateway_core::validator::NullSink;
 
-use crate::client_pool::{ClientHandle, ClientPool, UnhealthyOutcome};
-use crate::reflector::{AccessPolicy, ClientAuthorizer, LinkAttempt, StreamCache};
+use crate::client_pool::{ClientHandle, ClientPool, SweepEntry, UnhealthyOutcome};
+use crate::reflector::{
+    AccessPolicy, ClientAuthorizer, LinkAttempt, ReflectorConfig, RejectReason, StreamCache,
+};
 use crate::tokio_shell::fanout::fan_out_voice;
 use crate::tokio_shell::transcode::{
     CrossProtocolEvent, TranscodeError, VoiceEvent, transcode_voice,
@@ -129,6 +132,94 @@ pub enum ShellError {
     Io(#[from] std::io::Error),
 }
 
+/// Shell-level tunables for one [`ProtocolEndpoint`].
+///
+/// [`crate::reflector::Reflector`] derives these from its
+/// [`ReflectorConfig`] via [`From`]; the plain constructors
+/// ([`ProtocolEndpoint::new`] / [`ProtocolEndpoint::new_with_voice_bus`])
+/// fall back to [`EndpointSettings::default`], which mirrors the
+/// `ReflectorConfig` builder defaults.
+#[derive(Debug, Clone)]
+pub struct EndpointSettings {
+    /// Reflector callsign, used in server-initiated keepalives
+    /// (the `DExtra` and `DCS` keepalive wire forms carry it).
+    ///
+    /// Defaults to `NOCALL` — a placeholder that only becomes
+    /// visible on the wire if an endpoint is constructed without a
+    /// reflector identity, which production paths never do.
+    pub reflector_callsign: Callsign,
+    /// Per-client TX rate limit in voice frames per second.
+    ///
+    /// Applied to every new [`ClientHandle`]'s token bucket: refill
+    /// runs at this rate and the burst capacity is one second of
+    /// traffic at this rate (see [`crate::client_pool::TokenBucket::from_rate`]).
+    pub tx_rate_limit_frames_per_sec: f64,
+    /// Maximum clients across all modules.
+    ///
+    /// A LINK attempt from a NEW address when the pool already holds
+    /// this many entries is rejected with the protocol's reject
+    /// reply and a [`ServerEvent::ClientRejected`] event
+    /// ([`crate::reflector::RejectReason::Busy`]).
+    pub max_total_clients: usize,
+    /// Maximum clients per module.
+    ///
+    /// A LINK attempt that would make a module's membership exceed
+    /// this count is rejected with the protocol's reject reply
+    /// ([`crate::reflector::RejectReason::MaxClients`]).
+    pub max_clients_per_module: usize,
+    /// Interval between server-initiated keepalives.
+    ///
+    /// Each maintenance sweep (driven on this interval by
+    /// [`ProtocolEndpoint::run`]) that observes at least this much
+    /// time since the previous keepalive send emits one
+    /// protocol-appropriate keepalive per linked client.
+    pub keepalive_interval: Duration,
+    /// Idle window after which a silent client is evicted.
+    ///
+    /// The sweep evicts every pool entry whose `last_heard` is at
+    /// least this old (any inbound datagram from the peer refreshes
+    /// it).
+    pub keepalive_inactivity_timeout: Duration,
+    /// Idle window after which a stalled voice stream's cache entry
+    /// is dropped.
+    ///
+    /// The sweep removes stream-cache entries via
+    /// [`StreamCache::should_evict`], freeing the module's cache for
+    /// the next talker when a stream dies without an EOT.
+    pub voice_inactivity_timeout: Duration,
+}
+
+impl Default for EndpointSettings {
+    /// Mirrors the [`ReflectorConfig`] builder defaults (with the
+    /// `NOCALL` placeholder callsign — the config builder has no
+    /// callsign default).
+    fn default() -> Self {
+        Self {
+            reflector_callsign: Callsign::from_wire_bytes(*b"NOCALL  "),
+            tx_rate_limit_frames_per_sec: 60.0,
+            max_total_clients: 250,
+            max_clients_per_module: 50,
+            keepalive_interval: Duration::from_secs(1),
+            keepalive_inactivity_timeout: Duration::from_secs(30),
+            voice_inactivity_timeout: Duration::from_secs(2),
+        }
+    }
+}
+
+impl From<&ReflectorConfig> for EndpointSettings {
+    fn from(config: &ReflectorConfig) -> Self {
+        Self {
+            reflector_callsign: config.callsign,
+            tx_rate_limit_frames_per_sec: config.tx_rate_limit_frames_per_sec,
+            max_total_clients: config.max_total_clients,
+            max_clients_per_module: config.max_clients_per_module,
+            keepalive_interval: config.keepalive_interval,
+            keepalive_inactivity_timeout: config.keepalive_inactivity_timeout,
+            voice_inactivity_timeout: config.voice_inactivity_timeout,
+        }
+    }
+}
+
 /// A hint describing an inbound datagram's role in the fan-out path.
 ///
 /// Extracted from the [`EndpointOutcome::events`] list so the run loop
@@ -178,6 +269,13 @@ pub struct ProtocolEndpoint<P: Protocol> {
     /// endpoints can transcode and fan out the frame on their own
     /// wire format.
     voice_bus: Option<broadcast::Sender<CrossProtocolEvent>>,
+    /// Shell-level tunables (rate limit, client caps, keepalive and
+    /// inactivity windows) — see [`EndpointSettings`].
+    settings: EndpointSettings,
+    /// Instant of the most recent [`Self::handle_tick`] sweep that
+    /// sent keepalives; `None` until the first sweep (which always
+    /// sends).
+    last_keepalive_sent: Mutex<Option<Instant>>,
     _protocol: PhantomData<fn() -> P>,
 }
 
@@ -223,15 +321,38 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     /// the endpoint publishes inbound voice events to the bus so
     /// other protocols' endpoints can transcode and re-broadcast.
     ///
-    /// Used by [`crate::reflector::Reflector`] when its config has
-    /// `cross_protocol_forwarding = true`. Pass `None` to disable
-    /// cross-protocol participation on this endpoint.
+    /// Pass `None` to disable cross-protocol participation on this
+    /// endpoint. Uses [`EndpointSettings::default`] — see
+    /// [`Self::new_with_settings`] to tune the shell-level knobs.
     #[must_use]
     pub fn new_with_voice_bus(
         protocol: ProtocolKind,
         default_reflector_module: Module,
         authorizer: Arc<dyn ClientAuthorizer>,
         voice_bus: Option<broadcast::Sender<CrossProtocolEvent>>,
+    ) -> Self {
+        Self::new_with_settings(
+            protocol,
+            default_reflector_module,
+            authorizer,
+            voice_bus,
+            EndpointSettings::default(),
+        )
+    }
+
+    /// Construct a new endpoint with explicit [`EndpointSettings`].
+    ///
+    /// This is the constructor [`crate::reflector::Reflector`] uses —
+    /// it derives the settings from its [`ReflectorConfig`] so the
+    /// configured rate limit, client caps, keepalive interval, and
+    /// inactivity timeouts actually govern the endpoint's behavior.
+    #[must_use]
+    pub fn new_with_settings(
+        protocol: ProtocolKind,
+        default_reflector_module: Module,
+        authorizer: Arc<dyn ClientAuthorizer>,
+        voice_bus: Option<broadcast::Sender<CrossProtocolEvent>>,
+        settings: EndpointSettings,
     ) -> Self {
         Self {
             protocol,
@@ -241,6 +362,8 @@ impl<P: Protocol> ProtocolEndpoint<P> {
             authorizer,
             pending_events: Mutex::new(VecDeque::new()),
             voice_bus,
+            settings,
+            last_keepalive_sent: Mutex::new(None),
             _protocol: PhantomData,
         }
     }
@@ -261,11 +384,12 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     ///
     /// Dispatches to the protocol-specific handler based on
     /// [`Self::protocol_kind`]. Each handler pre-decodes the inbound
-    /// packet, consults the authorizer on LINK attempts, gates
-    /// voice-stream ingress on [`AccessPolicy`], drives the core via
-    /// the private `drive_core` helper, then updates the per-module
-    /// stream cache and drains pending background events into the
-    /// outcome.
+    /// packet, drops non-link traffic from unknown peers (session
+    /// state is only allocated for a valid LINK attempt), consults
+    /// the authorizer on LINK attempts, gates voice-stream ingress on
+    /// [`AccessPolicy`], drives the core via the private `drive_core`
+    /// helper, then updates the per-module stream cache and drains
+    /// pending background events into the outcome.
     ///
     /// # Errors
     ///
@@ -278,12 +402,12 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     ///
     /// This method is **not** cancel-safe. It takes multiple
     /// [`ClientPool`] locks in sequence (`contains` → `insert` →
-    /// `set_module` → `record_last_heard`) and cancellation between
-    /// any two awaits can leave the pool in a half-updated state where
-    /// a session has been created but not yet attached to its module
-    /// in the reverse index. The reflector's run loop is the only
-    /// expected caller and it never cancels this future except via
-    /// shutdown.
+    /// `set_module` / `remove` → `record_last_heard`) and cancellation
+    /// between any two awaits can leave the pool in a half-updated
+    /// state where a session has been created but not yet attached to
+    /// its module in the reverse index. The reflector's run loop is
+    /// the only expected caller and it never cancels this future
+    /// except via shutdown.
     pub async fn handle_inbound(
         &self,
         bytes: &[u8],
@@ -305,8 +429,9 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     ///
     /// Pre-decodes the `DExtra` wire packet, consults the authorizer on
     /// `Link`, gates voice-stream ingress on `AccessPolicy::ReadOnly`,
-    /// drives the core, mirrors `ClientLinked` module into the pool's
-    /// reverse index, and maintains the per-module stream cache.
+    /// drives the core, mirrors `ClientLinked` / `ClientUnlinked`
+    /// transitions into the pool (module reverse index update / entry
+    /// removal), and maintains the per-module stream cache.
     async fn handle_inbound_dextra(
         &self,
         bytes: &[u8],
@@ -318,6 +443,18 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         // `ServerSessionCore::handle_input`.
         let mut null_sink = NullSink;
         let pre_decoded = decode_client_to_server(bytes, &mut null_sink).ok();
+
+        // Unknown peers only earn session state via a valid LINK
+        // attempt. Garbage (or well-formed non-link traffic that the
+        // core would ignore from the `Unknown` state anyway) must not
+        // allocate a `ClientHandle` — otherwise every port-scan
+        // datagram grows the pool without bound.
+        if !self.clients.contains(&peer).await
+            && !matches!(pre_decoded, Some(ClientPacket::Link { .. }))
+        {
+            tracing::debug!(?peer, "dropping non-link datagram from unknown DExtra peer");
+            return Ok(EndpointOutcome::<P>::empty());
+        }
 
         // LINK → authorizer. Rejected attempts never materialize a
         // ClientHandle; they produce a NAK + `ClientRejected` event.
@@ -334,7 +471,27 @@ impl<P: Protocol> ProtocolEndpoint<P> {
                 module: reflector_module,
             };
             match self.authorizer.authorize(&attempt) {
-                Ok(access_policy) => Some(access_policy),
+                Ok(access_policy) => {
+                    // Capacity gate, adjacent to the authorizer
+                    // verdict: total-client and per-module caps from
+                    // the reflector config.
+                    if let Some(reject) = self.link_capacity_reject(peer, reflector_module).await {
+                        tracing::info!(
+                            ?peer,
+                            %callsign,
+                            %reflector_module,
+                            reason = ?reject,
+                            "client capacity limit rejected DExtra LINK attempt"
+                        );
+                        return Ok(Self::build_dextra_reject_outcome(
+                            peer,
+                            callsign,
+                            reflector_module,
+                            reject,
+                        ));
+                    }
+                    Some(access_policy)
+                }
                 Err(reject) => {
                     tracing::info!(
                         ?peer,
@@ -376,14 +533,21 @@ impl<P: Protocol> ProtocolEndpoint<P> {
 
         let mut outcome = self.drive_core(&peer, bytes, now).await?;
         self.clients.record_last_heard(&peer, now).await;
-        self.mirror_linked_module(&outcome, peer).await;
+        self.mirror_link_events(&outcome, peer).await;
 
+        // Snapshot the header that was live for this module BEFORE
+        // the stream-cache update: the EOT path removes the cache
+        // entry, and the cross-protocol StreamEnd publish still needs
+        // the header (DCS re-encoders embed it in every packet,
+        // including the end frame).
+        let pre_update_header = self.module_cached_header_of_peer(peer).await;
         if let Some(pkt) = pre_decoded.as_ref() {
             outcome.header_retransmit =
                 self.update_stream_cache_dextra(pkt, bytes, peer, now).await;
         }
 
-        self.publish_voice_events(&outcome, peer).await;
+        self.publish_voice_events(&outcome, peer, pre_update_header)
+            .await;
         self.drain_pending_events(&mut outcome).await;
         Ok(outcome)
     }
@@ -406,6 +570,26 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         let mut null_sink = NullSink;
         let pre_decoded = decode_dplus_client_to_server(bytes, &mut null_sink).ok();
 
+        // Unknown peers only earn session state via LINK1 — the
+        // opening packet of the `DPlus` handshake. Anything else from
+        // an unknown address (garbage, voice, or a LINK2 that the
+        // core would drop for lack of a preceding LINK1) must not
+        // allocate a `ClientHandle`.
+        if !self.clients.contains(&peer).await {
+            if !matches!(pre_decoded, Some(DPlusClientPacket::Link1)) {
+                tracing::debug!(?peer, "dropping non-link datagram from unknown DPlus peer");
+                return Ok(EndpointOutcome::<P>::empty());
+            }
+            // `DPlus` allocates its pool entry at LINK1 (the packet
+            // carries no callsign, so the authorizer can't run until
+            // LINK2) — enforce the total-client cap here, where the
+            // entry would be created.
+            if self.clients.len().await >= self.settings.max_total_clients {
+                tracing::info!(?peer, "client capacity limit rejected DPlus LINK1 attempt");
+                return Ok(Self::build_dplus_reject_outcome(peer, RejectReason::Busy));
+            }
+        }
+
         // LINK2 → authorizer. LINK1 passes through unconditionally
         // because it carries no callsign; the core's
         // `handle_dplus_input` walks the state machine from
@@ -419,7 +603,36 @@ impl<P: Protocol> ProtocolEndpoint<P> {
                     module: self.default_reflector_module,
                 };
                 match self.authorizer.authorize(&attempt) {
-                    Ok(access_policy) => Some(access_policy),
+                    Ok(access_policy) => {
+                        // Per-module capacity gate at the LINK2
+                        // verdict. The peer already holds a
+                        // transitional LINK1 handle (with no module
+                        // yet), so key on "not yet a module member"
+                        // rather than pool membership; on a cap hit
+                        // the transitional handle is discarded so
+                        // the address doesn't linger half-open.
+                        if self.clients.module_of(&peer).await.is_none()
+                            && self
+                                .clients
+                                .members_of_module(self.default_reflector_module)
+                                .await
+                                .len()
+                                >= self.settings.max_clients_per_module
+                        {
+                            tracing::info!(
+                                ?peer,
+                                %callsign,
+                                module = %self.default_reflector_module,
+                                "client capacity limit rejected DPlus LINK2 attempt"
+                            );
+                            drop(self.clients.remove(&peer).await);
+                            return Ok(Self::build_dplus_reject_outcome(
+                                peer,
+                                RejectReason::MaxClients,
+                            ));
+                        }
+                        Some(access_policy)
+                    }
                     Err(reject) => {
                         tracing::info!(
                             ?peer,
@@ -427,6 +640,12 @@ impl<P: Protocol> ProtocolEndpoint<P> {
                             reason = ?reject,
                             "authorizer rejected DPlus LINK2 attempt"
                         );
+                        // Discard the transitional LINK1 handle, same
+                        // as the cap-reject path below — a denied
+                        // client looping the handshake must not pin a
+                        // total-cap slot (LINK1 refreshes last_heard,
+                        // so the idle sweep would never reclaim it).
+                        drop(self.clients.remove(&peer).await);
                         return Ok(Self::build_dplus_reject_outcome(peer, reject));
                     }
                 }
@@ -453,13 +672,17 @@ impl<P: Protocol> ProtocolEndpoint<P> {
 
         let mut outcome = self.drive_core(&peer, bytes, now).await?;
         self.clients.record_last_heard(&peer, now).await;
-        self.mirror_linked_module(&outcome, peer).await;
+        self.mirror_link_events(&outcome, peer).await;
 
+        // Pre-update header snapshot — see the DExtra sibling for
+        // the EOT/StreamEnd rationale.
+        let pre_update_header = self.module_cached_header_of_peer(peer).await;
         if let Some(pkt) = pre_decoded.as_ref() {
             outcome.header_retransmit = self.update_stream_cache_dplus(pkt, bytes, peer, now).await;
         }
 
-        self.publish_voice_events(&outcome, peer).await;
+        self.publish_voice_events(&outcome, peer, pre_update_header)
+            .await;
         self.drain_pending_events(&mut outcome).await;
         Ok(outcome)
     }
@@ -481,6 +704,15 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         let mut null_sink = NullSink;
         let pre_decoded = decode_dcs_client_to_server(bytes, &mut null_sink).ok();
 
+        // Unknown peers only earn session state via a valid LINK
+        // attempt — see the DExtra sibling for the rationale.
+        if !self.clients.contains(&peer).await
+            && !matches!(pre_decoded, Some(DcsClientPacket::Link { .. }))
+        {
+            tracing::debug!(?peer, "dropping non-link datagram from unknown DCS peer");
+            return Ok(EndpointOutcome::<P>::empty());
+        }
+
         let link_access: Option<AccessPolicy> = if let Some(DcsClientPacket::Link {
             callsign,
             reflector_module,
@@ -494,7 +726,26 @@ impl<P: Protocol> ProtocolEndpoint<P> {
                 module: reflector_module,
             };
             match self.authorizer.authorize(&attempt) {
-                Ok(access_policy) => Some(access_policy),
+                Ok(access_policy) => {
+                    // Capacity gate, adjacent to the authorizer
+                    // verdict — see the DExtra sibling.
+                    if let Some(reject) = self.link_capacity_reject(peer, reflector_module).await {
+                        tracing::info!(
+                            ?peer,
+                            %callsign,
+                            %reflector_module,
+                            reason = ?reject,
+                            "client capacity limit rejected DCS LINK attempt"
+                        );
+                        return Ok(Self::build_dcs_reject_outcome(
+                            peer,
+                            callsign,
+                            reflector_module,
+                            reject,
+                        ));
+                    }
+                    Some(access_policy)
+                }
                 Err(reject) => {
                     tracing::info!(
                         ?peer,
@@ -534,13 +785,17 @@ impl<P: Protocol> ProtocolEndpoint<P> {
 
         let mut outcome = self.drive_core(&peer, bytes, now).await?;
         self.clients.record_last_heard(&peer, now).await;
-        self.mirror_linked_module(&outcome, peer).await;
+        self.mirror_link_events(&outcome, peer).await;
 
+        // Pre-update header snapshot — see the DExtra sibling for
+        // the EOT/StreamEnd rationale.
+        let pre_update_header = self.module_cached_header_of_peer(peer).await;
         if let Some(pkt) = pre_decoded.as_ref() {
             outcome.header_retransmit = self.update_stream_cache_dcs(pkt, bytes, peer, now).await;
         }
 
-        self.publish_voice_events(&outcome, peer).await;
+        self.publish_voice_events(&outcome, peer, pre_update_header)
+            .await;
         self.drain_pending_events(&mut outcome).await;
         Ok(outcome)
     }
@@ -551,7 +806,9 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     /// `link_access` is the authorizer decision from a fresh LINK
     /// pre-decode; if `None` (e.g. for non-LINK packets) the
     /// fallback is [`AccessPolicy::ReadWrite`]. The LINK path above
-    /// overwrites the fallback when it fires.
+    /// overwrites the fallback when it fires. New handles get a TX
+    /// token bucket sized from the configured
+    /// [`EndpointSettings::tx_rate_limit_frames_per_sec`].
     async fn ensure_handle(
         &self,
         peer: SocketAddr,
@@ -564,16 +821,61 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         let access = link_access.unwrap_or(AccessPolicy::ReadWrite);
         let reflector_module = self.default_reflector_module;
         let core = ServerSessionCore::new(self.protocol, peer, reflector_module);
-        let handle = ClientHandle::new(core, access, now);
+        let handle = ClientHandle::new_with_tx_rate(
+            core,
+            access,
+            now,
+            self.settings.tx_rate_limit_frames_per_sec,
+        );
         self.clients.insert(peer, handle).await;
     }
 
-    /// Mirror any `ClientLinked` module transitions into the pool's
-    /// reverse index so fan-out can enumerate module members in O(1).
-    async fn mirror_linked_module(&self, outcome: &EndpointOutcome<P>, peer: SocketAddr) {
+    /// Check the configured client-capacity limits for a peer's LINK
+    /// attempt against `module`.
+    ///
+    /// Returns `Some(RejectReason::Busy)` when admitting a NEW peer
+    /// would exceed [`EndpointSettings::max_total_clients`], and
+    /// `Some(RejectReason::MaxClients)` when the requested module is
+    /// already at [`EndpointSettings::max_clients_per_module`]. A
+    /// peer already linked to `module` passes unconditionally — an
+    /// idempotent re-link changes neither count.
+    async fn link_capacity_reject(&self, peer: SocketAddr, module: Module) -> Option<RejectReason> {
+        if self.clients.module_of(&peer).await == Some(module) {
+            return None;
+        }
+        if !self.clients.contains(&peer).await
+            && self.clients.len().await >= self.settings.max_total_clients
+        {
+            return Some(RejectReason::Busy);
+        }
+        if self.clients.members_of_module(module).await.len()
+            >= self.settings.max_clients_per_module
+        {
+            return Some(RejectReason::MaxClients);
+        }
+        None
+    }
+
+    /// Mirror link-lifecycle events into the pool.
+    ///
+    /// `ClientLinked` writes the module into the pool's reverse index
+    /// so fan-out can enumerate module members in O(1).
+    /// `ClientUnlinked` removes the peer's pool entry entirely
+    /// (forward map + reverse index): the core session is `Closed`
+    /// after an unlink and silently ignores any further LINK, so a
+    /// retained entry would leave the address unable to reconnect —
+    /// removal lets the next LINK from the same address build a
+    /// fresh session.
+    async fn mirror_link_events(&self, outcome: &EndpointOutcome<P>, peer: SocketAddr) {
         for ev in &outcome.events {
-            if let ServerEvent::ClientLinked { module, .. } = ev {
-                self.clients.set_module(&peer, *module).await;
+            match ev {
+                ServerEvent::ClientLinked { module, .. } => {
+                    self.clients.set_module(&peer, *module).await;
+                }
+                ServerEvent::ClientUnlinked { .. } => {
+                    drop(self.clients.remove(&peer).await);
+                }
+                _ => {}
             }
         }
     }
@@ -595,18 +897,52 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     /// endpoints can transcode and fan out to their own module
     /// members. No-op when the endpoint was constructed with a
     /// `None` voice bus.
-    async fn publish_voice_events(&self, outcome: &EndpointOutcome<P>, peer: SocketAddr) {
+    ///
+    /// The published `cached_header` prefers the module's current
+    /// stream-cache entry (so a header cached on this very tick
+    /// wins), falling back to `fallback_header` — the caller's
+    /// snapshot taken before the stream-cache update — when the
+    /// update cleared the entry. That keeps the header attached to
+    /// the `StreamEnd` publish on EOT ticks, which `DCS` targets
+    /// need to encode the 100-byte end frame.
+    ///
+    /// First-talker-wins extends to this publish path: while the
+    /// module tracks a live stream, events belonging to a DIFFERENT
+    /// stream are dropped — otherwise a second talker's audio would
+    /// go out under the tracked stream's cached header. The collider
+    /// recovers after the tracked stream ends (its next periodic
+    /// header retransmit re-establishes it as the tracked stream).
+    async fn publish_voice_events(
+        &self,
+        outcome: &EndpointOutcome<P>,
+        peer: SocketAddr,
+        fallback_header: Option<DStarHeader>,
+    ) {
         let Some(bus) = &self.voice_bus else {
             return;
         };
         let Some(module) = self.clients.module_of(&peer).await else {
             return;
         };
-        let cached_header = self.cached_header_for_module(module).await;
+        let (live_header, tracked_stream) = {
+            let cache = self.stream_cache.lock().await;
+            cache.get(&module).map_or((None, None), |entry| {
+                (Some(*entry.header()), Some(entry.stream_id()))
+            })
+        };
+        let cached_header = live_header.or(fallback_header);
         for ev in &outcome.events {
             let Some(voice_event) = voice_event_from_server_event(ev) else {
                 continue;
             };
+            let ev_stream = match &voice_event {
+                VoiceEvent::StreamStart { stream_id, .. }
+                | VoiceEvent::Frame { stream_id, .. }
+                | VoiceEvent::StreamEnd { stream_id, .. } => *stream_id,
+            };
+            if tracked_stream.is_some_and(|tracked| tracked != ev_stream) {
+                continue;
+            }
             // `broadcast::Sender::send` errors only when there are
             // no live receivers; that's fine for publish — we don't
             // want to fail the inbound path because nobody listens.
@@ -630,6 +966,16 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         cache.get(&module).map(|entry| *entry.header())
     }
 
+    /// Cached header for the module `peer` is linked to, if any.
+    ///
+    /// Convenience wrapper the inbound handlers use to snapshot the
+    /// live header before mutating the stream cache — see
+    /// [`Self::publish_voice_events`] for how the snapshot is used.
+    async fn module_cached_header_of_peer(&self, peer: SocketAddr) -> Option<DStarHeader> {
+        let module = self.clients.module_of(&peer).await?;
+        self.cached_header_for_module(module).await
+    }
+
     /// Evict a peer from the pool and enqueue a
     /// [`ServerEvent::ClientEvicted`] event onto the pending-event
     /// queue.
@@ -647,14 +993,165 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         });
     }
 
+    /// Periodic maintenance sweep: idle eviction, stale stream-cache
+    /// cleanup, and server-initiated keepalives.
+    ///
+    /// Driven by [`Self::run`] on a fixed interval with the wall
+    /// clock, and by tests directly with synthetic instants — like
+    /// [`Self::handle_inbound`], it never samples a clock itself.
+    /// Returns the keepalive datagrams to transmit (`(payload,
+    /// destination)` pairs); the caller owns the socket.
+    ///
+    /// One sweep performs, in order:
+    ///
+    /// 1. Evict every pool entry whose `last_heard` is at least
+    ///    [`EndpointSettings::keepalive_inactivity_timeout`] old.
+    ///    Each eviction queues a [`ServerEvent::ClientEvicted`] on
+    ///    the pending-event queue (surfaced on the next
+    ///    [`Self::handle_inbound`] outcome).
+    /// 2. Drop stream-cache entries idle for at least
+    ///    [`EndpointSettings::voice_inactivity_timeout`] (via
+    ///    [`StreamCache::should_evict`]), so a stream that died
+    ///    without an EOT frees its module's cache.
+    /// 3. If at least [`EndpointSettings::keepalive_interval`] has
+    ///    elapsed since the last keepalive send (the first sweep
+    ///    always sends), emit one protocol-appropriate keepalive per
+    ///    surviving *linked* client — see `encode_keepalive_for` for
+    ///    the wire forms.
+    pub(crate) async fn handle_tick(&self, now: Instant) -> Vec<(Vec<u8>, SocketAddr)> {
+        // 1. Idle-client eviction.
+        let entries = self.clients.sweep_snapshot().await;
+        for entry in &entries {
+            if now.saturating_duration_since(entry.last_heard)
+                >= self.settings.keepalive_inactivity_timeout
+            {
+                tracing::info!(
+                    peer = ?entry.peer,
+                    "evicting client after keepalive inactivity timeout"
+                );
+                self.evict_peer(entry.peer, "keepalive inactivity timeout")
+                    .await;
+            }
+        }
+
+        // 2. Stale voice-stream cleanup.
+        {
+            let mut cache = self.stream_cache.lock().await;
+            cache.retain(|module, entry| {
+                let stale = entry.should_evict(now, self.settings.voice_inactivity_timeout);
+                if stale {
+                    tracing::info!(
+                        %module,
+                        stream_id = ?entry.stream_id(),
+                        "evicting stalled voice stream from cache"
+                    );
+                }
+                !stale
+            });
+        }
+
+        // 3. Keepalives, one per linked client, when due.
+        let due = {
+            let mut last = self.last_keepalive_sent.lock().await;
+            let due = last.is_none_or(|sent| {
+                now.saturating_duration_since(sent) >= self.settings.keepalive_interval
+            });
+            if due {
+                *last = Some(now);
+            }
+            due
+        };
+        if !due {
+            return Vec::new();
+        }
+        let survivors = self.clients.sweep_snapshot().await;
+        survivors
+            .iter()
+            .filter_map(|entry| {
+                self.encode_keepalive_for(entry)
+                    .map(|payload| (payload, entry.peer))
+            })
+            .collect()
+    }
+
+    /// Encode the server-initiated keepalive for one pool entry.
+    ///
+    /// Only fully linked clients (module assigned) get keepalives —
+    /// mid-handshake entries return `None`. The wire forms follow
+    /// xlxd's per-protocol keepalive senders:
+    ///
+    /// - `DExtra`: the 9-byte reflector-callsign poll — 8-byte
+    ///   space-padded callsign plus a NUL (`xlxd/src/cdextraprotocol.cpp`
+    ///   `EncodeKeepAlivePacket` / `IsValidKeepAlivePacket`). Same
+    ///   wire shape the core's `encode_poll` produces, with the
+    ///   REFLECTOR's callsign rather than a client's.
+    /// - `DPlus`: the 3-byte `0x03 0x60 0x00` poll
+    ///   (`xlxd/src/cdplusprotocol.cpp` `EncodeKeepAlivePacket`) —
+    ///   byte-identical to the core's `encode_poll_echo`.
+    /// - `DCS`: the 22-byte per-client form
+    ///   (`xlxd/src/cdcsprotocol.cpp` `EncodeKeepAlivePacket(CBuffer*,
+    ///   CClient*)`): reflector callsign (7 bytes) + linked reflector
+    ///   module + `' '` + client callsign (7 bytes) + client module
+    ///   twice + `0x0A 0x00 0x20 0x20`. The core's 17-byte
+    ///   `encode_poll_reply` form is deliberately NOT reused here:
+    ///   ircDDBGateway's `CDCSHandler::process(CPollData&)` only
+    ///   refreshes an outgoing link's poll-inactivity timer for the
+    ///   22-byte form, so a 17-byte server keepalive would let real
+    ///   clients time out.
+    fn encode_keepalive_for(&self, entry: &SweepEntry) -> Option<Vec<u8>> {
+        let module = entry.module?;
+        match self.protocol {
+            ProtocolKind::DExtra => {
+                let mut buf = [0u8; 16];
+                let n = encode_dextra_poll(&mut buf, &self.settings.reflector_callsign).ok()?;
+                Some(buf.get(..n)?.to_vec())
+            }
+            ProtocolKind::DPlus => {
+                let mut buf = [0u8; 8];
+                let n = encode_dplus_poll_echo(&mut buf).ok()?;
+                Some(buf.get(..n)?.to_vec())
+            }
+            ProtocolKind::Dcs => {
+                let callsign = entry.client_callsign?;
+                let client_module = entry.client_module?;
+                let mut payload = Vec::with_capacity(22);
+                payload.extend_from_slice(
+                    self.settings
+                        .reflector_callsign
+                        .as_bytes()
+                        .as_slice()
+                        .get(..7)?,
+                );
+                payload.push(module.as_byte());
+                payload.push(b' ');
+                payload.extend_from_slice(callsign.as_bytes().as_slice().get(..7)?);
+                payload.push(client_module.as_byte());
+                payload.push(client_module.as_byte());
+                payload.extend_from_slice(&[0x0A, 0x00, 0x20, 0x20]);
+                Some(payload)
+            }
+            _ => None,
+        }
+    }
+
     /// Update the per-module `DExtra` stream cache for this packet.
     ///
-    /// Lifecycle:
-    /// - `VoiceHeader`: insert or replace the module's cache entry,
-    ///   store the raw 56-byte header.
-    /// - `VoiceData`: bump the seq counter; if `should_rebroadcast_header`
-    ///   fires return a clone of the cached bytes.
-    /// - `VoiceEot`: remove the module's cache entry.
+    /// The cache tracks ONE stream per module — the first active one
+    /// — guarded by stream id (the first-talker-wins semantics all
+    /// three protocol variants share), so a second simultaneous
+    /// talker cannot corrupt the entry:
+    /// - `VoiceHeader`: insert when the module has no entry (or
+    ///   refresh when the id matches the tracked stream); a header
+    ///   for a DIFFERENT stream is ignored while the tracked stream
+    ///   is live.
+    /// - `VoiceData`: only a frame of the tracked stream bumps the
+    ///   seq counter; if `should_rebroadcast_header` fires return a
+    ///   clone of the cached bytes. Frames of other streams are
+    ///   ignored.
+    /// - `VoiceEot`: only the tracked stream's EOT removes the entry.
+    ///
+    /// A tracked stream that dies without an EOT is reclaimed by the
+    /// voice-inactivity sweep in [`Self::handle_tick`].
     ///
     /// Returns `None` on all non-retransmit ticks.
     async fn update_stream_cache_dextra(
@@ -668,13 +1165,26 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         let mut cache_guard = self.stream_cache.lock().await;
         match pkt {
             ClientPacket::VoiceHeader { stream_id, header } => {
+                if cache_guard
+                    .get(&module)
+                    .is_some_and(|entry| entry.stream_id() != *stream_id)
+                {
+                    // A second talker's header must not hijack the
+                    // module entry mid-stream.
+                    return None;
+                }
                 let entry =
                     StreamCache::new_with_bytes(*stream_id, *header, bytes.to_vec(), peer, now);
                 let _prev = cache_guard.insert(module, entry);
                 None
             }
-            ClientPacket::VoiceData { .. } => {
+            ClientPacket::VoiceData { stream_id, .. } => {
                 let entry = cache_guard.get_mut(&module)?;
+                if entry.stream_id() != *stream_id {
+                    // A second talker's data must not advance the
+                    // tracked stream's retransmit cadence.
+                    return None;
+                }
                 entry.record_frame(now);
                 if entry.should_rebroadcast_header() {
                     Some(entry.header_bytes().to_vec())
@@ -682,8 +1192,13 @@ impl<P: Protocol> ProtocolEndpoint<P> {
                     None
                 }
             }
-            ClientPacket::VoiceEot { .. } => {
-                let _prev = cache_guard.remove(&module);
+            ClientPacket::VoiceEot { stream_id, .. } => {
+                if cache_guard
+                    .get(&module)
+                    .is_some_and(|entry| entry.stream_id() == *stream_id)
+                {
+                    let _prev = cache_guard.remove(&module);
+                }
                 None
             }
             _ => None,
@@ -692,9 +1207,9 @@ impl<P: Protocol> ProtocolEndpoint<P> {
 
     /// Update the per-module `DPlus` stream cache for this packet.
     ///
-    /// Same lifecycle as [`Self::update_stream_cache_dextra`], but
-    /// operates on the [`dstar_gateway_core::codec::dplus::ClientPacket`]
-    /// enum.
+    /// Same lifecycle and stream-id guards as
+    /// [`Self::update_stream_cache_dextra`], but operates on the
+    /// [`dstar_gateway_core::codec::dplus::ClientPacket`] enum.
     async fn update_stream_cache_dplus(
         &self,
         pkt: &DPlusClientPacket,
@@ -706,13 +1221,26 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         let mut cache_guard = self.stream_cache.lock().await;
         match pkt {
             DPlusClientPacket::VoiceHeader { stream_id, header } => {
+                if cache_guard
+                    .get(&module)
+                    .is_some_and(|entry| entry.stream_id() != *stream_id)
+                {
+                    // A second talker's header must not hijack the
+                    // module entry mid-stream.
+                    return None;
+                }
                 let entry =
                     StreamCache::new_with_bytes(*stream_id, *header, bytes.to_vec(), peer, now);
                 let _prev = cache_guard.insert(module, entry);
                 None
             }
-            DPlusClientPacket::VoiceData { .. } => {
+            DPlusClientPacket::VoiceData { stream_id, .. } => {
                 let entry = cache_guard.get_mut(&module)?;
+                if entry.stream_id() != *stream_id {
+                    // A second talker's data must not advance the
+                    // tracked stream's retransmit cadence.
+                    return None;
+                }
                 entry.record_frame(now);
                 if entry.should_rebroadcast_header() {
                     Some(entry.header_bytes().to_vec())
@@ -720,8 +1248,13 @@ impl<P: Protocol> ProtocolEndpoint<P> {
                     None
                 }
             }
-            DPlusClientPacket::VoiceEot { .. } => {
-                let _prev = cache_guard.remove(&module);
+            DPlusClientPacket::VoiceEot { stream_id, .. } => {
+                if cache_guard
+                    .get(&module)
+                    .is_some_and(|entry| entry.stream_id() == *stream_id)
+                {
+                    let _prev = cache_guard.remove(&module);
+                }
                 None
             }
             _ => None,
@@ -731,11 +1264,17 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     /// Update the per-module `DCS` stream cache for this packet.
     ///
     /// `DCS` is a single-packet-per-frame protocol: every `Voice`
-    /// packet carries the header + AMBE + optional end marker. The
-    /// first sighting of a new `stream_id` acts as the implicit
-    /// stream-start and is cached. Subsequent packets with the same
-    /// `stream_id` are data (and trigger the 21-frame retransmit
-    /// cadence). A packet with `is_end = true` clears the cache.
+    /// packet carries the header + AMBE + optional end marker. With
+    /// no live entry, the first sighting of a `stream_id` acts as the
+    /// implicit stream-start and is cached. Subsequent packets with
+    /// the same `stream_id` are data (and trigger the 21-frame
+    /// retransmit cadence); the same stream's `is_end = true` clears
+    /// the cache. While an entry is live, packets of a DIFFERENT
+    /// stream are ignored — first-talker-wins, the same guard as the
+    /// `DExtra`/`DPlus` variants — so a colliding talker can neither
+    /// hijack the entry nor clear it with a foreign `is_end`. A
+    /// tracked stream that dies without its own `is_end` is reclaimed
+    /// by the voice-inactivity sweep in [`Self::handle_tick`].
     async fn update_stream_cache_dcs(
         &self,
         pkt: &DcsClientPacket,
@@ -755,36 +1294,40 @@ impl<P: Protocol> ProtocolEndpoint<P> {
             return None;
         };
 
-        // First sighting of this stream id on this module: cache the
-        // header + raw bytes and emit no retransmit.
-        let existing_stream = cache_guard.get(&module).map(StreamCache::stream_id);
-        if existing_stream != Some(*stream_id) {
-            if *is_end {
-                // A one-packet stream that starts and ends in the
-                // same datagram — clear any stale entry and bail.
-                let _prev = cache_guard.remove(&module);
-                return None;
-            }
-            let entry = StreamCache::new_with_bytes(*stream_id, *header, bytes.to_vec(), peer, now);
-            let _prev = cache_guard.insert(module, entry);
-            return None;
-        }
-
-        // Same stream id — data frame. Bump the seq counter; if the
-        // packet is the end-of-stream marker, clear the cache after
-        // checking the retransmit cadence one last time.
-        let retransmit_payload = cache_guard.get_mut(&module).and_then(|entry| {
-            entry.record_frame(now);
-            if entry.should_rebroadcast_header() {
-                Some(entry.header_bytes().to_vec())
-            } else {
+        match cache_guard.get(&module).map(StreamCache::stream_id) {
+            // No live stream on this module: first sighting of a
+            // stream id is the implicit stream-start. A lone is_end
+            // packet has nothing to track.
+            None => {
+                if !*is_end {
+                    let entry =
+                        StreamCache::new_with_bytes(*stream_id, *header, bytes.to_vec(), peer, now);
+                    let _prev = cache_guard.insert(module, entry);
+                }
                 None
             }
-        });
-        if *is_end {
-            let _prev = cache_guard.remove(&module);
+            // A different stream is live: ignore the collider — its
+            // header must not hijack the entry, its data must not
+            // advance the cadence, and its is_end must not clear it.
+            Some(tracked) if tracked != *stream_id => None,
+            // Same stream id — data frame. Bump the seq counter; if
+            // the packet is the end-of-stream marker, clear the cache
+            // after checking the retransmit cadence one last time.
+            Some(_) => {
+                let retransmit_payload = cache_guard.get_mut(&module).and_then(|entry| {
+                    entry.record_frame(now);
+                    if entry.should_rebroadcast_header() {
+                        Some(entry.header_bytes().to_vec())
+                    } else {
+                        None
+                    }
+                });
+                if *is_end {
+                    let _prev = cache_guard.remove(&module);
+                }
+                retransmit_payload
+            }
         }
-        retransmit_payload
     }
 
     /// Return the voice stream id if this `DExtra` packet is a voice
@@ -901,7 +1444,7 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         peer: SocketAddr,
         callsign: Callsign,
         reflector_module: Module,
-        reject: crate::reflector::RejectReason,
+        reject: RejectReason,
     ) -> EndpointOutcome<P> {
         let mut outcome = EndpointOutcome::<P>::empty();
         let mut buf = [0u8; 16];
@@ -922,10 +1465,7 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     /// Emits an 8-byte `BUSY` reply (`Link2Result::Busy`) and a
     /// [`ServerEvent::ClientRejected`] event. The client pool is not
     /// touched — the peer never becomes a handle.
-    fn build_dplus_reject_outcome(
-        peer: SocketAddr,
-        reject: crate::reflector::RejectReason,
-    ) -> EndpointOutcome<P> {
+    fn build_dplus_reject_outcome(peer: SocketAddr, reject: RejectReason) -> EndpointOutcome<P> {
         let mut outcome = EndpointOutcome::<P>::empty();
         let mut buf = [0u8; 16];
         if let Ok(n) = encode_link2_reply(&mut buf, Link2Result::Busy)
@@ -949,7 +1489,7 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         peer: SocketAddr,
         callsign: Callsign,
         reflector_module: Module,
-        reject: crate::reflector::RejectReason,
+        reject: RejectReason,
     ) -> EndpointOutcome<P> {
         let mut outcome = EndpointOutcome::<P>::empty();
         let mut buf = [0u8; 32];
@@ -986,13 +1526,18 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         self.clients
             .with_handle_mut(peer, |handle| -> Result<(), ShellError> {
                 handle.session.handle_input(now, bytes)?;
-                // The core currently stamps outbox entries with a
-                // fresh `Instant::now()` rather than the injected
-                // `now`. Sampling the wall clock again here ensures
-                // `pop_ready` sees a time strictly after the enqueue
-                // instant so just-enqueued packets actually drain.
-                let drain_now = Instant::now();
-                while let Some(tx) = handle.session.pop_transmit(drain_now) {
+                // The core stamps outbox entries with the SAME
+                // injected `now` we just passed to `handle_input`
+                // (every `ServerSessionCore` enqueue uses
+                // `not_before: now`, and the outbox never samples a
+                // clock), so draining with the caller's `now` pops
+                // everything enqueued on this tick — `pop_ready`
+                // returns packets with `not_before <= now`. Never
+                // re-sample the wall clock here: a caller driving a
+                // synthetic clock (tests, replay tooling) would see
+                // its responses stranded until real time caught up
+                // with the injected instant.
+                while let Some(tx) = handle.session.pop_transmit(now) {
                     outcome.txs.push((tx.payload.to_vec(), tx.dst));
                 }
                 while let Some(ev) = handle.session.pop_event::<P>() {
@@ -1048,7 +1593,9 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     /// Each iteration reads one datagram, feeds it to
     /// [`Self::handle_inbound`], writes outbound responses back to
     /// their destination peer, and finally fans voice frames out to
-    /// every other peer on the same module.
+    /// every other peer on the same module. A maintenance timer also
+    /// drives the periodic sweep (idle eviction, stale-stream
+    /// cleanup, keepalives) on the configured keepalive interval.
     ///
     /// Returns when `shutdown` transitions to `true`, or when an
     /// unrecoverable I/O error occurs.
@@ -1078,6 +1625,23 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     ) -> Result<(), ShellError> {
         let mut buf = [0u8; 2048];
         let mut voice_rx = self.voice_bus.as_ref().map(broadcast::Sender::subscribe);
+        // Maintenance sweep timer. The period is the configured
+        // keepalive interval, clamped to 100 ms so a zero-duration
+        // config can neither panic `tokio::time::interval` nor spin
+        // the loop; `handle_tick` re-checks due-ness against the
+        // configured interval itself, so a faster timer only costs
+        // wakeups.
+        let tick_period = self
+            .settings
+            .keepalive_interval
+            .max(Duration::from_millis(100));
+        let mut maintenance = tokio::time::interval(tick_period);
+        maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `interval`'s first tick completes immediately — consume it
+        // here so the first maintenance sweep runs one full period
+        // after startup instead of racing the first inbound
+        // datagrams with a keepalive burst.
+        let _immediate_first_tick = maintenance.tick().await;
         loop {
             // Pattern: "maybe-subscribed optional branch" — when
             // `voice_rx` is None the voice arm must never resolve so
@@ -1097,6 +1661,22 @@ impl<P: Protocol> ProtocolEndpoint<P> {
                     // treat that as an implicit shutdown.
                     if change.is_err() || *shutdown.borrow() {
                         return Ok(());
+                    }
+                }
+                // The maintenance arm sits ABOVE the socket arm on
+                // purpose: with `biased`, arms are polled in order,
+                // and a sustained datagram flood keeps `recv_from`
+                // perpetually ready — placed after it, the sweep
+                // (idle eviction, keepalives) would starve under
+                // exactly the load it exists to defend against. The
+                // interval is ready at most once per period, so this
+                // ordering costs nothing when idle.
+                _ = maintenance.tick() => {
+                    let txs = self.handle_tick(Instant::now()).await;
+                    let mut evicted_peers: Vec<SocketAddr> = Vec::new();
+                    self.send_replies(&socket, &txs, &mut evicted_peers).await;
+                    for evicted in evicted_peers {
+                        self.evict_peer(evicted, "too many send failures").await;
                     }
                 }
                 result = socket.recv_from(&mut buf) => {
@@ -1330,20 +1910,22 @@ impl<P: Protocol> ProtocolEndpoint<P> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EndpointOutcome, ProtocolEndpoint};
+    use super::{EndpointOutcome, EndpointSettings, ProtocolEndpoint};
     use crate::reflector::{
         AllowAllAuthorizer, ClientAuthorizer, DenyAllAuthorizer, ReadOnlyAuthorizer,
     };
     use dstar_gateway_core::codec::dcs::{
         GatewayType as DcsGatewayType, encode_connect_link as encode_dcs_link,
-        encode_voice as encode_dcs_voice,
+        encode_connect_unlink as encode_dcs_unlink, encode_voice as encode_dcs_voice,
     };
     use dstar_gateway_core::codec::dextra::{
-        encode_connect_link, encode_voice_data, encode_voice_eot, encode_voice_header,
+        encode_connect_link, encode_poll, encode_unlink, encode_voice_data, encode_voice_eot,
+        encode_voice_header,
     };
     use dstar_gateway_core::codec::dplus::{
         encode_link1 as encode_dplus_link1, encode_link2 as encode_dplus_link2,
-        encode_voice_data as encode_dplus_voice_data, encode_voice_eot as encode_dplus_voice_eot,
+        encode_unlink as encode_dplus_unlink, encode_voice_data as encode_dplus_voice_data,
+        encode_voice_eot as encode_dplus_voice_eot,
         encode_voice_header as encode_dplus_voice_header,
     };
     use dstar_gateway_core::header::DStarHeader;
@@ -1353,7 +1935,7 @@ mod tests {
     use dstar_gateway_core::voice::VoiceFrame;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1413,6 +1995,319 @@ mod tests {
         assert_eq!(ep.clients().len().await, 1);
         let members = ep.clients().members_of_module(Module::C).await;
         assert_eq!(members, vec![peer()]);
+        Ok(())
+    }
+
+    // ─── synthetic-time contract ──────────────────────────────────
+    #[tokio::test]
+    async fn dextra_link_with_synthetic_future_now_still_drains_ack() -> TestResult {
+        // `handle_inbound` takes an injected `now`; the core stamps
+        // its outbox replies with that same instant, so the shell
+        // must drain the outbox with the caller's `now` — not a
+        // re-sampled wall clock. A caller driving a synthetic clock
+        // (tests, replay tooling) would otherwise see its responses
+        // stranded until the wall clock catches up.
+        let ep = ProtocolEndpoint::<DExtra>::new(ProtocolKind::DExtra, Module::C, allow_all());
+        let mut buf = [0u8; 16];
+        let n = encode_connect_link(
+            &mut buf,
+            &Callsign::from_wire_bytes(*b"W1AW    "),
+            Module::C,
+            Module::B,
+        )?;
+        let slice = buf.get(..n).ok_or("encode produced no bytes")?;
+
+        let future_now = Instant::now() + Duration::from_secs(3600);
+        let outcome: EndpointOutcome<DExtra> = ep.handle_inbound(slice, peer(), future_now).await?;
+
+        assert_eq!(
+            outcome.txs.len(),
+            1,
+            "LINK ACK must drain with the caller's injected now, not the wall clock"
+        );
+        Ok(())
+    }
+
+    // ─── unlink must release the pool entry ───────────────────────
+    #[tokio::test]
+    async fn dextra_unlink_releases_pool_entry_and_allows_relink() -> TestResult {
+        let ep = ProtocolEndpoint::<DExtra>::new(ProtocolKind::DExtra, Module::C, allow_all());
+        let mut link_buf = [0u8; 16];
+        let n = encode_connect_link(
+            &mut link_buf,
+            &Callsign::from_wire_bytes(*b"W1AW    "),
+            Module::C,
+            Module::B,
+        )?;
+        let link_slice = link_buf.get(..n).ok_or("link empty")?;
+
+        // LINK: ACK on the wire, pool + module reverse index populated.
+        let link_outcome = ep
+            .handle_inbound(link_slice, peer(), Instant::now())
+            .await?;
+        assert_eq!(link_outcome.txs.len(), 1, "LINK produces an ACK");
+        assert!(ep.clients().contains(&peer()).await, "peer in pool");
+        assert_eq!(
+            ep.clients().members_of_module(Module::C).await,
+            vec![peer()]
+        );
+
+        // UNLINK: ClientUnlinked surfaces AND the pool entry is gone.
+        let mut unlink_buf = [0u8; 16];
+        let n = encode_unlink(
+            &mut unlink_buf,
+            &Callsign::from_wire_bytes(*b"W1AW    "),
+            Module::B,
+        )?;
+        let unlink_slice = unlink_buf.get(..n).ok_or("unlink empty")?;
+        let unlink_outcome = ep
+            .handle_inbound(unlink_slice, peer(), Instant::now())
+            .await?;
+        assert!(
+            unlink_outcome
+                .events
+                .iter()
+                .any(|ev| matches!(ev, ServerEvent::ClientUnlinked { .. })),
+            "UNLINK emits ClientUnlinked"
+        );
+        assert!(
+            !ep.clients().contains(&peer()).await,
+            "unlinked peer must be removed from the pool"
+        );
+        assert!(
+            ep.clients().members_of_module(Module::C).await.is_empty(),
+            "unlinked peer must be removed from the module reverse index"
+        );
+
+        // Re-LINK from the same address: a fresh session must accept
+        // the LINK and ACK it (a leftover Closed session would
+        // silently ignore it).
+        let relink_outcome = ep
+            .handle_inbound(link_slice, peer(), Instant::now())
+            .await?;
+        assert_eq!(relink_outcome.txs.len(), 1, "re-LINK produces a fresh ACK");
+        let (payload, dst) = relink_outcome.txs.first().ok_or("no relink tx")?;
+        assert_eq!(*dst, peer());
+        assert_eq!(payload.len(), 14, "DExtra ACK is 14 bytes");
+        assert!(
+            relink_outcome
+                .events
+                .iter()
+                .any(|ev| matches!(ev, ServerEvent::ClientLinked { .. })),
+            "re-LINK emits ClientLinked"
+        );
+        assert!(ep.clients().contains(&peer()).await, "peer re-admitted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dplus_unlink_releases_pool_entry_and_allows_relink() -> TestResult {
+        let ep = ProtocolEndpoint::<DPlus>::new(ProtocolKind::DPlus, Module::C, allow_all());
+        let mut link1_buf = [0u8; 8];
+        let n1 = encode_dplus_link1(&mut link1_buf)?;
+        let link1_slice = link1_buf.get(..n1).ok_or("link1 empty")?;
+        let mut link2_buf = [0u8; 32];
+        let n2 = encode_dplus_link2(&mut link2_buf, &Callsign::from_wire_bytes(*b"W1AW    "))?;
+        let link2_slice = link2_buf.get(..n2).ok_or("link2 empty")?;
+
+        // Full LINK1 + LINK2 handshake.
+        drop(
+            ep.handle_inbound(link1_slice, peer(), Instant::now())
+                .await?,
+        );
+        let link_outcome = ep
+            .handle_inbound(link2_slice, peer(), Instant::now())
+            .await?;
+        assert_eq!(link_outcome.txs.len(), 1, "LINK2 produces the OKRW reply");
+        assert_eq!(
+            ep.clients().members_of_module(Module::C).await,
+            vec![peer()]
+        );
+
+        // UNLINK: ack + ClientUnlinked + pool entry gone.
+        let mut unlink_buf = [0u8; 16];
+        let n = encode_dplus_unlink(&mut unlink_buf)?;
+        let unlink_slice = unlink_buf.get(..n).ok_or("unlink empty")?;
+        let unlink_outcome = ep
+            .handle_inbound(unlink_slice, peer(), Instant::now())
+            .await?;
+        assert!(
+            unlink_outcome
+                .events
+                .iter()
+                .any(|ev| matches!(ev, ServerEvent::ClientUnlinked { .. })),
+            "UNLINK emits ClientUnlinked"
+        );
+        assert!(
+            !ep.clients().contains(&peer()).await,
+            "unlinked peer must be removed from the pool"
+        );
+        assert!(
+            ep.clients().members_of_module(Module::C).await.is_empty(),
+            "unlinked peer must be removed from the module reverse index"
+        );
+
+        // Re-link from the same address with a fresh handshake.
+        drop(
+            ep.handle_inbound(link1_slice, peer(), Instant::now())
+                .await?,
+        );
+        let relink_outcome = ep
+            .handle_inbound(link2_slice, peer(), Instant::now())
+            .await?;
+        assert_eq!(relink_outcome.txs.len(), 1, "re-LINK2 produces a reply");
+        let (payload, _dst) = relink_outcome.txs.first().ok_or("no relink tx")?;
+        assert!(
+            payload.windows(4).any(|w| w == b"OKRW"),
+            "re-LINK2 reply is a fresh OKRW accept, got {payload:?}"
+        );
+        assert!(
+            relink_outcome
+                .events
+                .iter()
+                .any(|ev| matches!(ev, ServerEvent::ClientLinked { .. })),
+            "re-LINK emits ClientLinked"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dcs_unlink_releases_pool_entry_and_allows_relink() -> TestResult {
+        let ep = ProtocolEndpoint::<Dcs>::new(ProtocolKind::Dcs, Module::C, allow_all());
+        let mut link_buf = vec![0u8; 600];
+        let link_n = encode_dcs_link(
+            &mut link_buf,
+            &Callsign::from_wire_bytes(*b"W1AW    "),
+            Module::B,
+            Module::C,
+            &dcs_reflector_cs(),
+            DcsGatewayType::Repeater,
+        )?;
+        let link_slice = link_buf.get(..link_n).ok_or("link empty")?;
+
+        let link_outcome = ep
+            .handle_inbound(link_slice, peer(), Instant::now())
+            .await?;
+        assert_eq!(link_outcome.txs.len(), 1, "LINK produces an ACK");
+        assert_eq!(
+            ep.clients().members_of_module(Module::C).await,
+            vec![peer()]
+        );
+
+        // UNLINK: ClientUnlinked + pool entry gone (the DCS core
+        // sends no unlink ack — only the event + state transition).
+        let mut unlink_buf = [0u8; 32];
+        let n = encode_dcs_unlink(
+            &mut unlink_buf,
+            &Callsign::from_wire_bytes(*b"W1AW    "),
+            Module::B,
+            &dcs_reflector_cs(),
+        )?;
+        let unlink_slice = unlink_buf.get(..n).ok_or("unlink empty")?;
+        let unlink_outcome = ep
+            .handle_inbound(unlink_slice, peer(), Instant::now())
+            .await?;
+        assert!(
+            unlink_outcome
+                .events
+                .iter()
+                .any(|ev| matches!(ev, ServerEvent::ClientUnlinked { .. })),
+            "UNLINK emits ClientUnlinked"
+        );
+        assert!(
+            !ep.clients().contains(&peer()).await,
+            "unlinked peer must be removed from the pool"
+        );
+        assert!(
+            ep.clients().members_of_module(Module::C).await.is_empty(),
+            "unlinked peer must be removed from the module reverse index"
+        );
+
+        // Re-LINK from the same address gets a fresh ACK.
+        let relink_outcome = ep
+            .handle_inbound(link_slice, peer(), Instant::now())
+            .await?;
+        assert_eq!(relink_outcome.txs.len(), 1, "re-LINK produces a fresh ACK");
+        let (payload, _dst) = relink_outcome.txs.first().ok_or("no relink tx")?;
+        assert_eq!(payload.len(), 14, "DCS ACK is 14 bytes");
+        assert!(
+            relink_outcome
+                .events
+                .iter()
+                .any(|ev| matches!(ev, ServerEvent::ClientLinked { .. })),
+            "re-LINK emits ClientLinked"
+        );
+        Ok(())
+    }
+
+    // ─── unknown peers must not allocate pool state ───────────────
+    #[tokio::test]
+    async fn garbage_datagrams_from_unknown_peers_allocate_no_handles() {
+        let dextra = ProtocolEndpoint::<DExtra>::new(ProtocolKind::DExtra, Module::C, allow_all());
+        let dplus = ProtocolEndpoint::<DPlus>::new(ProtocolKind::DPlus, Module::C, allow_all());
+        let dcs = ProtocolEndpoint::<Dcs>::new(ProtocolKind::Dcs, Module::C, allow_all());
+
+        for i in 0_u16..10 {
+            let garbage_peer =
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40100_u16.saturating_add(i));
+            // Arbitrary garbage of varying length. Malformed input may
+            // surface a decode error from `handle_inbound` — either
+            // way it must not allocate session state for the peer.
+            let garbage = vec![0xA5_u8; usize::from(i).saturating_add(3)];
+            drop(
+                dextra
+                    .handle_inbound(&garbage, garbage_peer, Instant::now())
+                    .await,
+            );
+            drop(
+                dplus
+                    .handle_inbound(&garbage, garbage_peer, Instant::now())
+                    .await,
+            );
+            drop(
+                dcs.handle_inbound(&garbage, garbage_peer, Instant::now())
+                    .await,
+            );
+        }
+
+        assert_eq!(
+            dextra.clients().len().await,
+            0,
+            "DExtra: garbage from unknown addrs must not allocate pool handles"
+        );
+        assert_eq!(
+            dplus.clients().len().await,
+            0,
+            "DPlus: garbage from unknown addrs must not allocate pool handles"
+        );
+        assert_eq!(
+            dcs.clients().len().await,
+            0,
+            "DCS: garbage from unknown addrs must not allocate pool handles"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_non_link_datagram_from_unknown_peer_allocates_no_handle() -> TestResult {
+        // A well-formed voice frame (or poll) from an address that
+        // never linked decodes fine but warrants no session state:
+        // the core would ignore it from the `Unknown` state anyway.
+        let ep = ProtocolEndpoint::<DExtra>::new(ProtocolKind::DExtra, Module::C, allow_all());
+        let stranger = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40200);
+
+        let frame = VoiceFrame::silence();
+        let mut data_buf = [0u8; 64];
+        let data_n = encode_voice_data(&mut data_buf, sid(), 0, &frame)?;
+        let data_slice = data_buf.get(..data_n).ok_or("empty")?;
+        let outcome = ep
+            .handle_inbound(data_slice, stranger, Instant::now())
+            .await?;
+        assert!(outcome.txs.is_empty(), "no reply to a stranger's voice");
+        assert_eq!(
+            ep.clients().len().await,
+            0,
+            "voice from an unknown peer must not allocate a pool handle"
+        );
         Ok(())
     }
 
@@ -1865,6 +2760,541 @@ mod tests {
         Ok(())
     }
 
+    // ─── stream-collision cache corruption ────────────────────────
+    const fn sid_of(n: u16) -> StreamId {
+        match StreamId::new(n) {
+            Some(s) => s,
+            None => unreachable!(),
+        }
+    }
+
+    fn drain_bus(
+        rx: &mut tokio::sync::broadcast::Receiver<super::CrossProtocolEvent>,
+    ) -> Vec<super::CrossProtocolEvent> {
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        events
+    }
+
+    /// Two talkers on one module: the cache must keep tracking the
+    /// FIRST active stream until that stream ends — the second
+    /// talker's header must not hijack the entry, its data must not
+    /// advance the first stream's retransmit cadence, and its EOT
+    /// must not clear the entry.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test walks two interleaved talkers through a full stream lifecycle; splitting it would obscure the linear narrative"
+    )]
+    #[tokio::test]
+    async fn dextra_stream_cache_tracks_first_talker_until_eot() -> TestResult {
+        use tokio::sync::broadcast;
+        let (tx, mut rx) = broadcast::channel::<super::CrossProtocolEvent>(256);
+        let ep = ProtocolEndpoint::<DExtra>::new_with_voice_bus(
+            ProtocolKind::DExtra,
+            Module::C,
+            allow_all(),
+            Some(tx),
+        );
+        let peer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40301);
+        let peer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40302);
+        let sid_a = sid_of(0x1111);
+        let sid_b = sid_of(0x2222);
+        let frame = VoiceFrame::silence();
+
+        // Both peers link to module C.
+        for (peer, callsign) in [
+            (peer_a, Callsign::from_wire_bytes(*b"W1AW    ")),
+            (peer_b, Callsign::from_wire_bytes(*b"K1ABC   ")),
+        ] {
+            let mut link_buf = [0u8; 16];
+            let n = encode_connect_link(&mut link_buf, &callsign, Module::C, Module::B)?;
+            drop(
+                ep.handle_inbound(link_buf.get(..n).ok_or("empty")?, peer, Instant::now())
+                    .await?,
+            );
+        }
+
+        // A starts a stream, then B tries to start a second one on
+        // the same module.
+        let mut hdr_a = [0u8; 64];
+        let n = encode_voice_header(&mut hdr_a, sid_a, &test_header("W1AW"))?;
+        drop(
+            ep.handle_inbound(hdr_a.get(..n).ok_or("empty")?, peer_a, Instant::now())
+                .await?,
+        );
+        let mut hdr_b = [0u8; 64];
+        let n = encode_voice_header(&mut hdr_b, sid_b, &test_header("K1ABC"))?;
+        drop(
+            ep.handle_inbound(hdr_b.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+        drop(drain_bus(&mut rx));
+
+        // A's first data frame publishes with A's header still cached
+        // — B's header must not have replaced the module entry.
+        let mut data_a = [0u8; 64];
+        let n = encode_voice_data(&mut data_a, sid_a, 0, &frame)?;
+        drop(
+            ep.handle_inbound(data_a.get(..n).ok_or("empty")?, peer_a, Instant::now())
+                .await?,
+        );
+        let events = drain_bus(&mut rx);
+        let frame_event = events
+            .iter()
+            .find(|ev| matches!(ev.event, super::VoiceEvent::Frame { .. }))
+            .ok_or("A's data frame not published")?;
+        assert_eq!(
+            frame_event.cached_header.map(|h| h.my_call),
+            Some(Callsign::from_wire_bytes(*b"W1AW    ")),
+            "cached header must still be A's after B's mid-stream header"
+        );
+
+        // B's data frames must not advance A's retransmit cadence.
+        for seq in 0_u8..25 {
+            let mut data_b = [0u8; 64];
+            let n = encode_voice_data(&mut data_b, sid_b, seq, &frame)?;
+            let outcome = ep
+                .handle_inbound(data_b.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?;
+            assert!(
+                outcome.header_retransmit.is_none(),
+                "B's frame {seq} must not fire the module's header retransmit"
+            );
+        }
+
+        // B's EOT must not clear A's cache entry.
+        let mut eot_b = [0u8; 64];
+        let n = encode_voice_eot(&mut eot_b, sid_b, 25)?;
+        drop(
+            ep.handle_inbound(eot_b.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+
+        // 19 more A frames (20 total) trip the cadence exactly once,
+        // and the retransmitted bytes are A's original header.
+        let mut retransmits = Vec::new();
+        for seq in 1_u8..20 {
+            let mut data = [0u8; 64];
+            let n = encode_voice_data(&mut data, sid_a, seq, &frame)?;
+            let outcome = ep
+                .handle_inbound(data.get(..n).ok_or("empty")?, peer_a, Instant::now())
+                .await?;
+            if let Some(bytes) = outcome.header_retransmit {
+                retransmits.push(bytes);
+            }
+        }
+        assert_eq!(
+            retransmits.len(),
+            1,
+            "exactly one retransmit after A's 20th data frame"
+        );
+        let retransmitted = retransmits.first().ok_or("no retransmit")?;
+        assert!(
+            retransmitted.windows(4).any(|w| w == b"W1AW"),
+            "retransmitted header must be A's (W1AW), not B's"
+        );
+
+        // Once A ends, B may take over the module cache.
+        let mut eot_a = [0u8; 64];
+        let n = encode_voice_eot(&mut eot_a, sid_a, 20)?;
+        drop(
+            ep.handle_inbound(eot_a.get(..n).ok_or("empty")?, peer_a, Instant::now())
+                .await?,
+        );
+        drop(drain_bus(&mut rx));
+        let sid_b2 = sid_of(0x3333);
+        let mut hdr_b2 = [0u8; 64];
+        let n = encode_voice_header(&mut hdr_b2, sid_b2, &test_header("K1ABC"))?;
+        drop(
+            ep.handle_inbound(hdr_b2.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+        let mut data_b2 = [0u8; 64];
+        let n = encode_voice_data(&mut data_b2, sid_b2, 0, &frame)?;
+        drop(
+            ep.handle_inbound(data_b2.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+        let events = drain_bus(&mut rx);
+        let frame_event = events
+            .iter()
+            .find(|ev| matches!(ev.event, super::VoiceEvent::Frame { .. }))
+            .ok_or("B's post-takeover frame not published")?;
+        assert_eq!(
+            frame_event.cached_header.map(|h| h.my_call),
+            Some(Callsign::from_wire_bytes(*b"K1ABC   ")),
+            "after A's EOT the cache follows B's new stream"
+        );
+        Ok(())
+    }
+
+    /// `DCS` sibling of
+    /// [`dextra_stream_cache_tracks_first_talker_until_eot`]. `DCS`
+    /// has no separate header/data/EOT packets — every 100-byte voice
+    /// packet embeds the header plus an `is_end` flag — so the guard
+    /// is asserted directly on the tracked cache entry: a colliding
+    /// stream must neither replace the live entry nor clear it with a
+    /// foreign `is_end`.
+    #[tokio::test]
+    async fn dcs_stream_cache_tracks_first_talker_until_eot() -> TestResult {
+        let ep = ProtocolEndpoint::<Dcs>::new(ProtocolKind::Dcs, Module::C, allow_all());
+        let peer_a = test_peer(40321);
+        let peer_b = test_peer(40322);
+        let sid_a = sid_of(0x1111);
+        let sid_b = sid_of(0x2222);
+        let frame = VoiceFrame::silence();
+
+        for (peer, callsign) in [
+            (peer_a, Callsign::from_wire_bytes(*b"W1AW    ")),
+            (peer_b, Callsign::from_wire_bytes(*b"K1ABC   ")),
+        ] {
+            let mut link_buf = vec![0u8; 600];
+            let n = encode_dcs_link(
+                &mut link_buf,
+                &callsign,
+                Module::B,
+                Module::C,
+                &dcs_reflector_cs(),
+                DcsGatewayType::Repeater,
+            )?;
+            drop(
+                ep.handle_inbound(link_buf.get(..n).ok_or("empty")?, peer, Instant::now())
+                    .await?,
+            );
+        }
+
+        // A's first packet tracks A's stream.
+        let mut voice_a = [0u8; 128];
+        let n = encode_dcs_voice(&mut voice_a, &test_header("W1AW"), sid_a, 0, &frame, false)?;
+        drop(
+            ep.handle_inbound(voice_a.get(..n).ok_or("empty")?, peer_a, Instant::now())
+                .await?,
+        );
+        assert_eq!(
+            ep.stream_cache
+                .lock()
+                .await
+                .get(&Module::C)
+                .map(super::StreamCache::stream_id),
+            Some(sid_a),
+            "A's first packet tracks A's stream"
+        );
+
+        // B's colliding packet must not replace the live entry.
+        let mut voice_b = [0u8; 128];
+        let n = encode_dcs_voice(&mut voice_b, &test_header("K1ABC"), sid_b, 0, &frame, false)?;
+        drop(
+            ep.handle_inbound(voice_b.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+        let tracked = {
+            let cache = ep.stream_cache.lock().await;
+            cache
+                .get(&Module::C)
+                .map(|entry| (entry.stream_id(), entry.header().my_call))
+        };
+        let (tracked_sid, tracked_my) = tracked.ok_or("module entry vanished")?;
+        assert_eq!(
+            tracked_sid, sid_a,
+            "B's colliding packet must not replace A's tracked stream"
+        );
+        assert_eq!(
+            tracked_my,
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            "cached header must remain A's"
+        );
+
+        // B's foreign is_end must not clear A's entry.
+        let mut eot_b = [0u8; 128];
+        let n = encode_dcs_voice(&mut eot_b, &test_header("K1ABC"), sid_b, 1, &frame, true)?;
+        drop(
+            ep.handle_inbound(eot_b.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+        assert_eq!(
+            ep.stream_cache
+                .lock()
+                .await
+                .get(&Module::C)
+                .map(super::StreamCache::stream_id),
+            Some(sid_a),
+            "a foreign is_end must not clear the tracked stream"
+        );
+
+        // Only the owning stream's is_end clears the entry.
+        let mut eot_a = [0u8; 128];
+        let n = encode_dcs_voice(&mut eot_a, &test_header("W1AW"), sid_a, 1, &frame, true)?;
+        drop(
+            ep.handle_inbound(eot_a.get(..n).ok_or("empty")?, peer_a, Instant::now())
+                .await?,
+        );
+        assert!(
+            ep.stream_cache.lock().await.get(&Module::C).is_none(),
+            "the owning stream's is_end clears the entry"
+        );
+        Ok(())
+    }
+
+    /// Extract the stream id shared by every [`super::VoiceEvent`] variant.
+    const fn stream_of(ev: &super::VoiceEvent) -> StreamId {
+        match ev {
+            super::VoiceEvent::StreamStart { stream_id, .. }
+            | super::VoiceEvent::Frame { stream_id, .. }
+            | super::VoiceEvent::StreamEnd { stream_id, .. } => *stream_id,
+        }
+    }
+
+    /// While a module tracks a live stream, a second talker's events
+    /// must not be published onto the cross-protocol bus at all —
+    /// otherwise `DCS`-side re-encoders emit B's audio framed under
+    /// A's cached header.
+    #[tokio::test]
+    async fn second_talker_events_are_not_published_while_stream_tracked() -> TestResult {
+        use tokio::sync::broadcast;
+        let (tx, mut rx) = broadcast::channel::<super::CrossProtocolEvent>(256);
+        let ep = ProtocolEndpoint::<DExtra>::new_with_voice_bus(
+            ProtocolKind::DExtra,
+            Module::C,
+            allow_all(),
+            Some(tx),
+        );
+        let peer_a = test_peer(40331);
+        let peer_b = test_peer(40332);
+        let sid_a = sid_of(0x1111);
+        let sid_b = sid_of(0x2222);
+        let frame = VoiceFrame::silence();
+
+        for (peer, callsign) in [
+            (peer_a, Callsign::from_wire_bytes(*b"W1AW    ")),
+            (peer_b, Callsign::from_wire_bytes(*b"K1ABC   ")),
+        ] {
+            let mut link_buf = [0u8; 16];
+            let n = encode_connect_link(&mut link_buf, &callsign, Module::C, Module::B)?;
+            drop(
+                ep.handle_inbound(link_buf.get(..n).ok_or("empty")?, peer, Instant::now())
+                    .await?,
+            );
+        }
+
+        // A starts a stream.
+        let mut hdr_a = [0u8; 64];
+        let n = encode_voice_header(&mut hdr_a, sid_a, &test_header("W1AW"))?;
+        drop(
+            ep.handle_inbound(hdr_a.get(..n).ok_or("empty")?, peer_a, Instant::now())
+                .await?,
+        );
+        drop(drain_bus(&mut rx));
+
+        // B talks over it: neither B's header nor B's data may reach
+        // the bus while A's stream is tracked.
+        let mut hdr_b = [0u8; 64];
+        let n = encode_voice_header(&mut hdr_b, sid_b, &test_header("K1ABC"))?;
+        drop(
+            ep.handle_inbound(hdr_b.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+        let mut data_b = [0u8; 64];
+        let n = encode_voice_data(&mut data_b, sid_b, 0, &frame)?;
+        drop(
+            ep.handle_inbound(data_b.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+        let events = drain_bus(&mut rx);
+        assert!(
+            events.iter().all(|ev| stream_of(&ev.event) != sid_b),
+            "second talker's events must not reach the bus while A's stream is tracked"
+        );
+
+        // A's own data still publishes.
+        let mut data_a = [0u8; 64];
+        let n = encode_voice_data(&mut data_a, sid_a, 0, &frame)?;
+        drop(
+            ep.handle_inbound(data_a.get(..n).ok_or("empty")?, peer_a, Instant::now())
+                .await?,
+        );
+        let events = drain_bus(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|ev| matches!(ev.event, super::VoiceEvent::Frame { .. })
+                    && stream_of(&ev.event) == sid_a),
+            "the tracked stream's own frames still publish"
+        );
+
+        // After A's EOT the module is free: B's next stream publishes
+        // under B's own header.
+        let mut eot_a = [0u8; 64];
+        let n = encode_voice_eot(&mut eot_a, sid_a, 1)?;
+        drop(
+            ep.handle_inbound(eot_a.get(..n).ok_or("empty")?, peer_a, Instant::now())
+                .await?,
+        );
+        drop(drain_bus(&mut rx));
+        let sid_b2 = sid_of(0x3333);
+        let mut hdr_b2 = [0u8; 64];
+        let n = encode_voice_header(&mut hdr_b2, sid_b2, &test_header("K1ABC"))?;
+        drop(
+            ep.handle_inbound(hdr_b2.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+        let mut data_b2 = [0u8; 64];
+        let n = encode_voice_data(&mut data_b2, sid_b2, 0, &frame)?;
+        drop(
+            ep.handle_inbound(data_b2.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+        let events = drain_bus(&mut rx);
+        let frame_event = events
+            .iter()
+            .find(|ev| {
+                matches!(ev.event, super::VoiceEvent::Frame { .. })
+                    && stream_of(&ev.event) == sid_b2
+            })
+            .ok_or("B's post-takeover frame not published")?;
+        assert_eq!(
+            frame_event.cached_header.map(|h| h.my_call),
+            Some(Callsign::from_wire_bytes(*b"K1ABC   ")),
+            "after A's EOT, B publishes under B's own header"
+        );
+        Ok(())
+    }
+
+    /// `DPlus` sibling of
+    /// [`dextra_stream_cache_tracks_first_talker_until_eot`] — the
+    /// cadence and retransmit-byte observables prove the module cache
+    /// follows the first active stream.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test walks two interleaved talkers through a full stream lifecycle; splitting it would obscure the linear narrative"
+    )]
+    #[tokio::test]
+    async fn dplus_stream_cache_tracks_first_talker_until_eot() -> TestResult {
+        let ep = ProtocolEndpoint::<DPlus>::new(ProtocolKind::DPlus, Module::C, allow_all());
+        let peer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40311);
+        let peer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40312);
+        let sid_a = sid_of(0x1111);
+        let sid_b = sid_of(0x2222);
+        let frame = VoiceFrame::silence();
+
+        // Full LINK1 + LINK2 for both peers.
+        for (peer, callsign) in [
+            (peer_a, Callsign::from_wire_bytes(*b"W1AW    ")),
+            (peer_b, Callsign::from_wire_bytes(*b"K1ABC   ")),
+        ] {
+            let mut link1_buf = [0u8; 8];
+            let n1 = encode_dplus_link1(&mut link1_buf)?;
+            drop(
+                ep.handle_inbound(link1_buf.get(..n1).ok_or("empty")?, peer, Instant::now())
+                    .await?,
+            );
+            let mut link2_buf = [0u8; 32];
+            let n2 = encode_dplus_link2(&mut link2_buf, &callsign)?;
+            drop(
+                ep.handle_inbound(link2_buf.get(..n2).ok_or("empty")?, peer, Instant::now())
+                    .await?,
+            );
+        }
+
+        // A starts a stream; B tries to hijack with its own header.
+        let mut hdr_a = [0u8; 64];
+        let n = encode_dplus_voice_header(&mut hdr_a, sid_a, &test_header("W1AW"))?;
+        drop(
+            ep.handle_inbound(hdr_a.get(..n).ok_or("empty")?, peer_a, Instant::now())
+                .await?,
+        );
+        let mut hdr_b = [0u8; 64];
+        let n = encode_dplus_voice_header(&mut hdr_b, sid_b, &test_header("K1ABC"))?;
+        drop(
+            ep.handle_inbound(hdr_b.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+
+        // B's data frames must not advance A's retransmit cadence.
+        for seq in 0_u8..25 {
+            let mut data_b = [0u8; 64];
+            let n = encode_dplus_voice_data(&mut data_b, sid_b, seq, &frame)?;
+            let outcome = ep
+                .handle_inbound(data_b.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?;
+            assert!(
+                outcome.header_retransmit.is_none(),
+                "B's frame {seq} must not fire the module's header retransmit"
+            );
+        }
+
+        // B's EOT must not clear A's entry.
+        let mut eot_b = [0u8; 64];
+        let n = encode_dplus_voice_eot(&mut eot_b, sid_b, 25)?;
+        drop(
+            ep.handle_inbound(eot_b.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+
+        // A's 20 data frames trip the cadence exactly once with A's
+        // header bytes.
+        let mut retransmits = Vec::new();
+        for seq in 0_u8..20 {
+            let mut data = [0u8; 64];
+            let n = encode_dplus_voice_data(&mut data, sid_a, seq, &frame)?;
+            let outcome = ep
+                .handle_inbound(data.get(..n).ok_or("empty")?, peer_a, Instant::now())
+                .await?;
+            if let Some(bytes) = outcome.header_retransmit {
+                retransmits.push(bytes);
+            }
+        }
+        assert_eq!(
+            retransmits.len(),
+            1,
+            "exactly one retransmit after A's 20th data frame"
+        );
+        let retransmitted = retransmits.first().ok_or("no retransmit")?;
+        assert!(
+            retransmitted.windows(4).any(|w| w == b"W1AW"),
+            "retransmitted header must be A's (W1AW), not B's"
+        );
+
+        // After A's EOT, B's fresh stream owns the cache: its own 20
+        // frames retransmit B's header.
+        let mut eot_a = [0u8; 64];
+        let n = encode_dplus_voice_eot(&mut eot_a, sid_a, 20)?;
+        drop(
+            ep.handle_inbound(eot_a.get(..n).ok_or("empty")?, peer_a, Instant::now())
+                .await?,
+        );
+        let sid_b2 = sid_of(0x3333);
+        let mut hdr_b2 = [0u8; 64];
+        let n = encode_dplus_voice_header(&mut hdr_b2, sid_b2, &test_header("K1ABC"))?;
+        drop(
+            ep.handle_inbound(hdr_b2.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?,
+        );
+        let mut takeover_retransmits = Vec::new();
+        for seq in 0_u8..20 {
+            let mut data = [0u8; 64];
+            let n = encode_dplus_voice_data(&mut data, sid_b2, seq, &frame)?;
+            let outcome = ep
+                .handle_inbound(data.get(..n).ok_or("empty")?, peer_b, Instant::now())
+                .await?;
+            if let Some(bytes) = outcome.header_retransmit {
+                takeover_retransmits.push(bytes);
+            }
+        }
+        assert_eq!(
+            takeover_retransmits.len(),
+            1,
+            "B's stream owns the cadence after A ended"
+        );
+        let retransmitted = takeover_retransmits.first().ok_or("no retransmit")?;
+        assert!(
+            retransmitted.windows(5).any(|w| w == b"K1ABC"),
+            "post-takeover retransmit carries B's header"
+        );
+        Ok(())
+    }
+
     // ─── Fix 4: ClientEvicted event path ──────────────────────────
     #[tokio::test]
     async fn dextra_endpoint_surfaces_evict_peer_event_next_tick() -> TestResult {
@@ -2072,6 +3502,688 @@ mod tests {
             state,
             ServerStateKind::Linked,
             "read-only voice must not push session into Streaming"
+        );
+        Ok(())
+    }
+
+    // ─── config knobs must have runtime effect ────────────────────
+
+    fn test_peer(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    async fn link_dextra(
+        ep: &ProtocolEndpoint<DExtra>,
+        peer: SocketAddr,
+        callsign: Callsign,
+        module: Module,
+        now: Instant,
+    ) -> Result<EndpointOutcome<DExtra>, Box<dyn std::error::Error>> {
+        let mut buf = [0u8; 16];
+        let n = encode_connect_link(&mut buf, &callsign, module, Module::B)?;
+        Ok(ep
+            .handle_inbound(buf.get(..n).ok_or("link empty")?, peer, now)
+            .await?)
+    }
+
+    async fn link_dcs(
+        ep: &ProtocolEndpoint<Dcs>,
+        peer: SocketAddr,
+        callsign: Callsign,
+        module: Module,
+        now: Instant,
+    ) -> Result<EndpointOutcome<Dcs>, Box<dyn std::error::Error>> {
+        let mut buf = vec![0u8; 600];
+        let n = encode_dcs_link(
+            &mut buf,
+            &callsign,
+            Module::B,
+            module,
+            &dcs_reflector_cs(),
+            DcsGatewayType::Repeater,
+        )?;
+        Ok(ep
+            .handle_inbound(buf.get(..n).ok_or("link empty")?, peer, now)
+            .await?)
+    }
+
+    #[tokio::test]
+    async fn configured_tx_rate_limit_reaches_client_handle() -> TestResult {
+        let settings = EndpointSettings {
+            tx_rate_limit_frames_per_sec: 2.0,
+            ..EndpointSettings::default()
+        };
+        let ep = ProtocolEndpoint::<DExtra>::new_with_settings(
+            ProtocolKind::DExtra,
+            Module::C,
+            allow_all(),
+            None,
+            settings,
+        );
+        let now = Instant::now();
+        drop(
+            link_dextra(
+                &ep,
+                peer(),
+                Callsign::from_wire_bytes(*b"W1AW    "),
+                Module::C,
+                now,
+            )
+            .await?,
+        );
+
+        // Burst capacity is one second at the configured rate: two
+        // tokens at the same instant, then the bucket runs dry.
+        assert!(ep.clients().try_consume_tx_token(&peer(), now).await);
+        assert!(ep.clients().try_consume_tx_token(&peer(), now).await);
+        assert!(
+            !ep.clients().try_consume_tx_token(&peer(), now).await,
+            "third frame at the same instant must be rate-limited"
+        );
+
+        // Refill runs at the configured rate.
+        let later = now + Duration::from_secs(1);
+        assert!(ep.clients().try_consume_tx_token(&peer(), later).await);
+        assert!(ep.clients().try_consume_tx_token(&peer(), later).await);
+        assert!(
+            !ep.clients().try_consume_tx_token(&peer(), later).await,
+            "refill is capped at the configured burst"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dextra_total_client_cap_rejects_next_link() -> TestResult {
+        let settings = EndpointSettings {
+            max_total_clients: 2,
+            ..EndpointSettings::default()
+        };
+        let ep = ProtocolEndpoint::<DExtra>::new_with_settings(
+            ProtocolKind::DExtra,
+            Module::C,
+            allow_all(),
+            None,
+            settings,
+        );
+        let cs = Callsign::from_wire_bytes(*b"W1AW    ");
+        for port in [41001, 41002] {
+            let outcome = link_dextra(&ep, test_peer(port), cs, Module::C, Instant::now()).await?;
+            assert_eq!(outcome.txs.len(), 1, "peer {port} links under the cap");
+        }
+        assert_eq!(ep.clients().len().await, 2);
+
+        let outcome = link_dextra(&ep, test_peer(41003), cs, Module::C, Instant::now()).await?;
+        let (payload, dst) = outcome.txs.first().ok_or("no reject tx")?;
+        assert_eq!(*dst, test_peer(41003));
+        assert_eq!(payload.len(), 14, "DExtra NAK is 14 bytes");
+        assert!(
+            payload.windows(3).any(|w| w == b"NAK"),
+            "cap hit must NAK, got {payload:?}"
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|ev| matches!(ev, ServerEvent::ClientRejected { .. })),
+            "cap hit emits ClientRejected"
+        );
+        assert_eq!(
+            ep.clients().len().await,
+            2,
+            "pool must not grow past the cap"
+        );
+        assert!(!ep.clients().contains(&test_peer(41003)).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dextra_per_module_cap_rejects_next_link() -> TestResult {
+        let settings = EndpointSettings {
+            max_clients_per_module: 1,
+            ..EndpointSettings::default()
+        };
+        let ep = ProtocolEndpoint::<DExtra>::new_with_settings(
+            ProtocolKind::DExtra,
+            Module::C,
+            allow_all(),
+            None,
+            settings,
+        );
+        let cs = Callsign::from_wire_bytes(*b"W1AW    ");
+        drop(link_dextra(&ep, test_peer(41011), cs, Module::C, Instant::now()).await?);
+        assert_eq!(ep.clients().members_of_module(Module::C).await.len(), 1);
+
+        // Second peer on the SAME module is rejected…
+        let outcome = link_dextra(&ep, test_peer(41012), cs, Module::C, Instant::now()).await?;
+        let (payload, _dst) = outcome.txs.first().ok_or("no reject tx")?;
+        assert!(
+            payload.windows(3).any(|w| w == b"NAK"),
+            "per-module cap hit must NAK"
+        );
+        assert!(
+            !ep.clients().contains(&test_peer(41012)).await,
+            "rejected peer must not enter the pool"
+        );
+
+        // …but a DIFFERENT module still has room.
+        let outcome = link_dextra(&ep, test_peer(41012), cs, Module::D, Instant::now()).await?;
+        let (payload, _dst) = outcome.txs.first().ok_or("no tx")?;
+        assert!(
+            payload.windows(3).any(|w| w == b"ACK"),
+            "the cap is per module, not global"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dplus_total_cap_rejects_link1_when_pool_full() -> TestResult {
+        let settings = EndpointSettings {
+            max_total_clients: 1,
+            ..EndpointSettings::default()
+        };
+        let ep = ProtocolEndpoint::<DPlus>::new_with_settings(
+            ProtocolKind::DPlus,
+            Module::C,
+            allow_all(),
+            None,
+            settings,
+        );
+        // First client completes the handshake.
+        let mut link1_buf = [0u8; 8];
+        let n1 = encode_dplus_link1(&mut link1_buf)?;
+        let link1_slice = link1_buf.get(..n1).ok_or("empty")?;
+        drop(
+            ep.handle_inbound(link1_slice, test_peer(41021), Instant::now())
+                .await?,
+        );
+        let mut link2_buf = [0u8; 32];
+        let n2 = encode_dplus_link2(&mut link2_buf, &Callsign::from_wire_bytes(*b"W1AW    "))?;
+        drop(
+            ep.handle_inbound(
+                link2_buf.get(..n2).ok_or("empty")?,
+                test_peer(41021),
+                Instant::now(),
+            )
+            .await?,
+        );
+        assert_eq!(ep.clients().len().await, 1);
+
+        // Second client's LINK1 hits the total cap: BUSY, no entry.
+        let outcome = ep
+            .handle_inbound(link1_slice, test_peer(41022), Instant::now())
+            .await?;
+        let (payload, _dst) = outcome.txs.first().ok_or("no reject tx")?;
+        assert!(
+            payload.windows(4).any(|w| w == b"BUSY"),
+            "total-cap hit at LINK1 must reply BUSY, got {payload:?}"
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|ev| matches!(ev, ServerEvent::ClientRejected { .. })),
+            "cap hit emits ClientRejected"
+        );
+        assert_eq!(ep.clients().len().await, 1, "no pool entry past the cap");
+        assert!(!ep.clients().contains(&test_peer(41022)).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dplus_per_module_cap_rejects_link2_and_discards_transitional_handle() -> TestResult {
+        let settings = EndpointSettings {
+            max_clients_per_module: 1,
+            ..EndpointSettings::default()
+        };
+        let ep = ProtocolEndpoint::<DPlus>::new_with_settings(
+            ProtocolKind::DPlus,
+            Module::C,
+            allow_all(),
+            None,
+            settings,
+        );
+        let mut link1_buf = [0u8; 8];
+        let n1 = encode_dplus_link1(&mut link1_buf)?;
+        let link1_slice = link1_buf.get(..n1).ok_or("empty")?;
+        let mut link2_buf = [0u8; 32];
+        let n2 = encode_dplus_link2(&mut link2_buf, &Callsign::from_wire_bytes(*b"W1AW    "))?;
+        let link2_slice = link2_buf.get(..n2).ok_or("empty")?;
+
+        // First client fills module C.
+        drop(
+            ep.handle_inbound(link1_slice, test_peer(41031), Instant::now())
+                .await?,
+        );
+        drop(
+            ep.handle_inbound(link2_slice, test_peer(41031), Instant::now())
+                .await?,
+        );
+        assert_eq!(ep.clients().members_of_module(Module::C).await.len(), 1);
+
+        // Second client passes LINK1 (total cap has room)…
+        drop(
+            ep.handle_inbound(link1_slice, test_peer(41032), Instant::now())
+                .await?,
+        );
+        assert_eq!(ep.clients().len().await, 2, "transitional LINK1 handle");
+        // …but its LINK2 hits the module cap: BUSY + the transitional
+        // handle is discarded so the address doesn't linger half-open.
+        let outcome = ep
+            .handle_inbound(link2_slice, test_peer(41032), Instant::now())
+            .await?;
+        let (payload, _dst) = outcome.txs.first().ok_or("no reject tx")?;
+        assert!(
+            payload.windows(4).any(|w| w == b"BUSY"),
+            "module-cap hit at LINK2 must reply BUSY, got {payload:?}"
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|ev| matches!(ev, ServerEvent::ClientRejected { .. })),
+            "cap hit emits ClientRejected"
+        );
+        assert!(
+            !ep.clients().contains(&test_peer(41032)).await,
+            "rejected peer must not keep a pool entry"
+        );
+        assert_eq!(ep.clients().len().await, 1);
+        Ok(())
+    }
+
+    /// An authorizer rejection at LINK2 must discard the transitional
+    /// LINK1 handle, exactly like the adjacent per-module-cap reject —
+    /// otherwise a denied client that loops the handshake pins a
+    /// `max_total_clients` slot forever (each LINK1 refreshes
+    /// `last_heard`, so the idle sweep never reclaims it).
+    #[tokio::test]
+    async fn dplus_authorizer_reject_discards_transitional_handle() -> TestResult {
+        let ep = ProtocolEndpoint::<DPlus>::new(
+            ProtocolKind::DPlus,
+            Module::C,
+            Arc::new(DenyAllAuthorizer),
+        );
+        let denied = test_peer(41041);
+        let mut link1_buf = [0u8; 8];
+        let n1 = encode_dplus_link1(&mut link1_buf)?;
+        drop(
+            ep.handle_inbound(link1_buf.get(..n1).ok_or("empty")?, denied, Instant::now())
+                .await?,
+        );
+        assert_eq!(ep.clients().len().await, 1, "transitional LINK1 handle");
+
+        let mut link2_buf = [0u8; 32];
+        let n2 = encode_dplus_link2(&mut link2_buf, &Callsign::from_wire_bytes(*b"W1AW    "))?;
+        let outcome = ep
+            .handle_inbound(link2_buf.get(..n2).ok_or("empty")?, denied, Instant::now())
+            .await?;
+        assert!(!outcome.txs.is_empty(), "authorizer reject still replies");
+        assert!(
+            !ep.clients().contains(&denied).await,
+            "denied peer must not keep a pool entry"
+        );
+        assert_eq!(
+            ep.clients().len().await,
+            0,
+            "authorizer reject discards the transitional handle"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dcs_total_client_cap_rejects_next_link() -> TestResult {
+        let settings = EndpointSettings {
+            max_total_clients: 1,
+            ..EndpointSettings::default()
+        };
+        let ep = ProtocolEndpoint::<Dcs>::new_with_settings(
+            ProtocolKind::Dcs,
+            Module::C,
+            allow_all(),
+            None,
+            settings,
+        );
+        let cs = Callsign::from_wire_bytes(*b"W1AW    ");
+        drop(link_dcs(&ep, test_peer(41041), cs, Module::C, Instant::now()).await?);
+        assert_eq!(ep.clients().len().await, 1);
+
+        let outcome = link_dcs(&ep, test_peer(41042), cs, Module::C, Instant::now()).await?;
+        let (payload, _dst) = outcome.txs.first().ok_or("no reject tx")?;
+        assert_eq!(payload.len(), 14, "DCS NAK is 14 bytes");
+        assert!(
+            payload.windows(3).any(|w| w == b"NAK"),
+            "cap hit must NAK, got {payload:?}"
+        );
+        assert_eq!(ep.clients().len().await, 1, "no pool entry past the cap");
+        assert!(!ep.clients().contains(&test_peer(41042)).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dcs_per_module_cap_rejects_next_link() -> TestResult {
+        let settings = EndpointSettings {
+            max_clients_per_module: 1,
+            ..EndpointSettings::default()
+        };
+        let ep = ProtocolEndpoint::<Dcs>::new_with_settings(
+            ProtocolKind::Dcs,
+            Module::C,
+            allow_all(),
+            None,
+            settings,
+        );
+        let cs = Callsign::from_wire_bytes(*b"W1AW    ");
+        drop(link_dcs(&ep, test_peer(41051), cs, Module::C, Instant::now()).await?);
+
+        let outcome = link_dcs(&ep, test_peer(41052), cs, Module::C, Instant::now()).await?;
+        let (payload, _dst) = outcome.txs.first().ok_or("no reject tx")?;
+        assert!(
+            payload.windows(3).any(|w| w == b"NAK"),
+            "per-module cap hit must NAK"
+        );
+        assert!(!ep.clients().contains(&test_peer(41052)).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_tick_evicts_idle_clients_and_keeps_active_ones() -> TestResult {
+        let settings = EndpointSettings {
+            keepalive_inactivity_timeout: Duration::from_secs(30),
+            ..EndpointSettings::default()
+        };
+        let ep = ProtocolEndpoint::<DExtra>::new_with_settings(
+            ProtocolKind::DExtra,
+            Module::C,
+            allow_all(),
+            None,
+            settings,
+        );
+        let base = Instant::now();
+        let peer_a = test_peer(41061);
+        let peer_b = test_peer(41062);
+        drop(
+            link_dextra(
+                &ep,
+                peer_a,
+                Callsign::from_wire_bytes(*b"W1AW    "),
+                Module::C,
+                base,
+            )
+            .await?,
+        );
+        drop(
+            link_dextra(
+                &ep,
+                peer_b,
+                Callsign::from_wire_bytes(*b"K1ABC   "),
+                Module::C,
+                base,
+            )
+            .await?,
+        );
+
+        // B polls 20 s in — refreshing its last_heard.
+        let mut poll_buf = [0u8; 16];
+        let n = encode_poll(&mut poll_buf, &Callsign::from_wire_bytes(*b"K1ABC   "))?;
+        drop(
+            ep.handle_inbound(
+                poll_buf.get(..n).ok_or("empty")?,
+                peer_b,
+                base + Duration::from_secs(20),
+            )
+            .await?,
+        );
+
+        // Sweep at 35 s: A has been silent past the timeout, B not.
+        drop(ep.handle_tick(base + Duration::from_secs(35)).await);
+        assert!(
+            !ep.clients().contains(&peer_a).await,
+            "silent peer must be evicted after the inactivity timeout"
+        );
+        assert!(
+            ep.clients().contains(&peer_b).await,
+            "recently active peer must survive the sweep"
+        );
+        assert!(
+            ep.clients().members_of_module(Module::C).await == vec![peer_b],
+            "module reverse index follows the eviction"
+        );
+
+        // The eviction surfaces as ClientEvicted on the next inbound.
+        let outcome = ep
+            .handle_inbound(
+                poll_buf.get(..n).ok_or("empty")?,
+                peer_b,
+                base + Duration::from_secs(36),
+            )
+            .await?;
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|ev| matches!(ev, ServerEvent::ClientEvicted { .. })),
+            "sweep eviction emits ClientEvicted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_tick_drops_stale_stream_cache_entry() -> TestResult {
+        let settings = EndpointSettings {
+            voice_inactivity_timeout: Duration::from_secs(2),
+            keepalive_inactivity_timeout: Duration::from_secs(3600),
+            ..EndpointSettings::default()
+        };
+        let ep = ProtocolEndpoint::<DExtra>::new_with_settings(
+            ProtocolKind::DExtra,
+            Module::C,
+            allow_all(),
+            None,
+            settings,
+        );
+        let base = Instant::now();
+        drop(
+            link_dextra(
+                &ep,
+                peer(),
+                Callsign::from_wire_bytes(*b"W1AW    "),
+                Module::C,
+                base,
+            )
+            .await?,
+        );
+
+        // Start a stream and feed 5 frames, then let it stall.
+        let mut hdr_buf = [0u8; 64];
+        let hdr_n = encode_voice_header(&mut hdr_buf, sid(), &test_header("W1AW"))?;
+        drop(
+            ep.handle_inbound(hdr_buf.get(..hdr_n).ok_or("empty")?, peer(), base)
+                .await?,
+        );
+        let frame = VoiceFrame::silence();
+        for seq in 0_u8..5 {
+            let mut data_buf = [0u8; 64];
+            let data_n = encode_voice_data(&mut data_buf, sid(), seq, &frame)?;
+            drop(
+                ep.handle_inbound(data_buf.get(..data_n).ok_or("empty")?, peer(), base)
+                    .await?,
+            );
+        }
+
+        // Sweep past the voice-inactivity timeout evicts the entry.
+        drop(ep.handle_tick(base + Duration::from_secs(3)).await);
+
+        // Without the cache entry, 20 further frames can never fire
+        // the header-retransmit cadence (the counter sat at 5, so a
+        // surviving entry WOULD have fired within these 20).
+        for seq in 5_u8..25 {
+            let mut data_buf = [0u8; 64];
+            let data_n = encode_voice_data(&mut data_buf, sid(), seq, &frame)?;
+            let outcome = ep
+                .handle_inbound(
+                    data_buf.get(..data_n).ok_or("empty")?,
+                    peer(),
+                    base + Duration::from_secs(3),
+                )
+                .await?;
+            assert!(
+                outcome.header_retransmit.is_none(),
+                "stale entry must be gone after the sweep (frame {seq})"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_tick_sends_one_keepalive_per_linked_peer_per_due_interval() -> TestResult {
+        let settings = EndpointSettings {
+            reflector_callsign: Callsign::from_wire_bytes(*b"REF030  "),
+            keepalive_interval: Duration::from_secs(10),
+            ..EndpointSettings::default()
+        };
+        let ep = ProtocolEndpoint::<DExtra>::new_with_settings(
+            ProtocolKind::DExtra,
+            Module::C,
+            allow_all(),
+            None,
+            settings,
+        );
+        let base = Instant::now();
+        let peer_a = test_peer(41071);
+        let peer_b = test_peer(41072);
+        drop(
+            link_dextra(
+                &ep,
+                peer_a,
+                Callsign::from_wire_bytes(*b"W1AW    "),
+                Module::C,
+                base,
+            )
+            .await?,
+        );
+        drop(
+            link_dextra(
+                &ep,
+                peer_b,
+                Callsign::from_wire_bytes(*b"K1ABC   "),
+                Module::C,
+                base,
+            )
+            .await?,
+        );
+
+        // First sweep is due: exactly one keepalive per linked peer,
+        // in the 9-byte reflector-callsign form.
+        let txs = ep.handle_tick(base).await;
+        assert_eq!(txs.len(), 2, "one keepalive per linked peer");
+        for expected_peer in [peer_a, peer_b] {
+            let matching: Vec<_> = txs
+                .iter()
+                .filter(|(_, dst)| *dst == expected_peer)
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "exactly one keepalive to {expected_peer}"
+            );
+            let (payload, _) = matching.first().ok_or("missing keepalive")?;
+            assert_eq!(payload.len(), 9, "DExtra keepalive is 9 bytes");
+            assert_eq!(payload.get(..8), Some(b"REF030  ".as_slice()));
+            assert_eq!(payload.get(8), Some(&0x00));
+        }
+
+        // Half an interval later: nothing due.
+        let txs = ep.handle_tick(base + Duration::from_secs(5)).await;
+        assert!(txs.is_empty(), "keepalive not due yet");
+
+        // A full interval after the first send: due again.
+        let txs = ep.handle_tick(base + Duration::from_secs(10)).await;
+        assert_eq!(txs.len(), 2, "one keepalive per peer per due tick");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_tick_dplus_keepalive_is_poll_echo_form() -> TestResult {
+        let ep = ProtocolEndpoint::<DPlus>::new_with_settings(
+            ProtocolKind::DPlus,
+            Module::C,
+            allow_all(),
+            None,
+            EndpointSettings::default(),
+        );
+        let base = Instant::now();
+        // Fully linked peer A.
+        let mut link1_buf = [0u8; 8];
+        let n1 = encode_dplus_link1(&mut link1_buf)?;
+        let link1_slice = link1_buf.get(..n1).ok_or("empty")?;
+        drop(
+            ep.handle_inbound(link1_slice, test_peer(41081), base)
+                .await?,
+        );
+        let mut link2_buf = [0u8; 32];
+        let n2 = encode_dplus_link2(&mut link2_buf, &Callsign::from_wire_bytes(*b"W1AW    "))?;
+        drop(
+            ep.handle_inbound(link2_buf.get(..n2).ok_or("empty")?, test_peer(41081), base)
+                .await?,
+        );
+        // Mid-handshake peer B (LINK1 only, no module yet) gets none.
+        drop(
+            ep.handle_inbound(link1_slice, test_peer(41082), base)
+                .await?,
+        );
+
+        let txs = ep.handle_tick(base).await;
+        assert_eq!(txs.len(), 1, "only fully linked peers get keepalives");
+        let (payload, dst) = txs.first().ok_or("no keepalive")?;
+        assert_eq!(*dst, test_peer(41081));
+        assert_eq!(
+            payload.as_slice(),
+            &[0x03, 0x60, 0x00],
+            "DPlus keepalive is the 3-byte poll form"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_tick_dcs_keepalive_is_xlxd_22_byte_form() -> TestResult {
+        let settings = EndpointSettings {
+            reflector_callsign: Callsign::from_wire_bytes(*b"REF030  "),
+            ..EndpointSettings::default()
+        };
+        let ep = ProtocolEndpoint::<Dcs>::new_with_settings(
+            ProtocolKind::Dcs,
+            Module::C,
+            allow_all(),
+            None,
+            settings,
+        );
+        let base = Instant::now();
+        // W1AW links its module B to reflector module C.
+        drop(
+            link_dcs(
+                &ep,
+                test_peer(41091),
+                Callsign::from_wire_bytes(*b"W1AW    "),
+                Module::C,
+                base,
+            )
+            .await?,
+        );
+
+        let txs = ep.handle_tick(base).await;
+        assert_eq!(txs.len(), 1);
+        let (payload, dst) = txs.first().ok_or("no keepalive")?;
+        assert_eq!(*dst, test_peer(41091));
+        assert_eq!(payload.len(), 22, "DCS keepalive is 22 bytes");
+        assert_eq!(payload.get(..7), Some(b"REF030 ".as_slice()));
+        assert_eq!(payload.get(7), Some(&b'C'), "linked reflector module");
+        assert_eq!(payload.get(8), Some(&b' '));
+        assert_eq!(payload.get(9..16), Some(b"W1AW   ".as_slice()));
+        assert_eq!(payload.get(16), Some(&b'B'), "client module");
+        assert_eq!(payload.get(17), Some(&b'B'), "client module repeated");
+        assert_eq!(
+            payload.get(18..22),
+            Some([0x0A, 0x00, 0x20, 0x20].as_slice())
         );
         Ok(())
     }

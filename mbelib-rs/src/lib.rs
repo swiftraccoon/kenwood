@@ -936,6 +936,87 @@ mod frame_fec_tests {
         );
     }
 
+    /// The repeat disposition trusts a frame at exactly three
+    /// corrected bits and repeats the previous parameters at four —
+    /// the `errs2 > 3` boundary mbelib uses (Golay mis-corrects
+    /// silently above three). Real reflector uplinks live around this
+    /// threshold, and decoding untrusted frames fresh is the past
+    /// regression that turned noisy-but-intelligible speech into
+    /// garble. Wire bit positions are located empirically so the test
+    /// is independent of the interleave table.
+    #[test]
+    fn repeat_threshold_trusts_three_corrections_and_repeats_at_four()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let flip = |frame: &mut [u8; 9], bit_index: u32| {
+            let byte = (bit_index / 8) as usize;
+            if let Some(b) = frame.get_mut(byte) {
+                *b ^= 1u8 << (bit_index % 8);
+            }
+        };
+
+        // Locate two C0-protected and two data-protected wire bits.
+        let mut c0_bits: Vec<u32> = Vec::new();
+        let mut data_bits: Vec<u32> = Vec::new();
+        for bit_index in 0..72u32 {
+            let mut frame = SILENCE;
+            flip(&mut frame, bit_index);
+            let fec = frame_fec(&frame);
+            if fec.c0_errors == 1 && fec.total_errors == 1 {
+                c0_bits.push(bit_index);
+            } else if fec.c0_errors == 0 && fec.total_errors == 1 {
+                data_bits.push(bit_index);
+            }
+        }
+        let &[c0_a, c0_b, ..] = c0_bits.as_slice() else {
+            return Err("need two C0-protected wire bits".into());
+        };
+        let &[d_a, d_b, ..] = data_bits.as_slice() else {
+            return Err("need two data-protected wire bits".into());
+        };
+
+        let mut extractor = AmbeParamExtractor::new();
+        let baseline = extractor.extract(&SILENCE);
+        assert!(!baseline.repeated, "clean frame is never repeated");
+
+        // Three corrections (2 in C0 + 1 in the data chain, each
+        // Golay block within its correction capacity): still trusted,
+        // and the corrected payload is byte-identical to SILENCE.
+        let mut frame3 = SILENCE;
+        flip(&mut frame3, c0_a);
+        flip(&mut frame3, c0_b);
+        flip(&mut frame3, d_a);
+        let p3 = extractor.extract(&frame3);
+        assert_eq!(p3.fec_errors, 3, "crafted frame must show 3 corrections");
+        assert!(
+            !p3.repeated,
+            "exactly three corrected bits is still a trusted frame"
+        );
+        assert_eq!(
+            p3.harmonics, baseline.harmonics,
+            "fully corrected frame decodes to the clean payload"
+        );
+
+        // Four corrections: one past the trust threshold — the frame
+        // must be discarded and the previous parameters repeated.
+        let mut frame4 = SILENCE;
+        flip(&mut frame4, c0_a);
+        flip(&mut frame4, c0_b);
+        flip(&mut frame4, d_a);
+        flip(&mut frame4, d_b);
+        let p4 = extractor.extract(&frame4);
+        assert_eq!(p4.fec_errors, 4, "crafted frame must show 4 corrections");
+        assert!(
+            p4.repeated,
+            "four corrected bits must repeat the previous parameters"
+        );
+        assert_eq!(p4.kind, FrameKind::Voice, "repeat keeps the voice kind");
+        assert_eq!(
+            p4.harmonics, p3.harmonics,
+            "repeated frame carries the previous frame's parameters"
+        );
+        Ok(())
+    }
+
     #[test]
     fn silence_frame_is_clean() {
         let fec = frame_fec(&SILENCE);

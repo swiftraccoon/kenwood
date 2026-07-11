@@ -240,11 +240,15 @@ async fn three_protocol_cross_protocol_forwarding() -> Result<(), Box<dyn std::e
     assert!(matches!(event_end.event, VoiceEvent::StreamEnd { .. }));
 
     // StreamEnd re-encodes into both target protocols. DCS needs
-    // the cached header (every DCS voice packet embeds one). The
-    // cache is cleared by `update_stream_cache_dextra` on EOT, so
-    // `cached_header` in the published event MAY be `None` — but
-    // the test is still useful for the DPlus path which doesn't
-    // need the header.
+    // the cached header (every DCS voice packet embeds one, including
+    // the is_end frame), so the published StreamEnd must still carry
+    // the header that was live for the stream — even though the
+    // endpoint's own stream-cache entry is cleared on the same EOT
+    // tick. Without it, DCS listeners never see the stream end.
+    assert!(
+        event_end.cached_header.is_some(),
+        "published StreamEnd must carry the stream's cached header"
+    );
     let dplus_eot_len = transcode_voice(
         ProtocolKind::DPlus,
         &event_end.event,
@@ -252,6 +256,13 @@ async fn three_protocol_cross_protocol_forwarding() -> Result<(), Box<dyn std::e
         &mut out,
     )?;
     assert_eq!(dplus_eot_len, 32, "DPlus voice eot is 32 bytes");
+    let dcs_eot_len = transcode_voice(
+        ProtocolKind::Dcs,
+        &event_end.event,
+        event_end.cached_header.as_ref(),
+        &mut out,
+    )?;
+    assert_eq!(dcs_eot_len, 100, "DCS is_end voice frame is 100 bytes");
 
     // No more events on the bus.
     assert!(rx.try_recv().is_err(), "no further events after StreamEnd");

@@ -14,6 +14,9 @@ pub use authorizer::{
     AccessPolicy, AllowAllAuthorizer, ClientAuthorizer, DenyAllAuthorizer, LinkAttempt,
     ReadOnlyAuthorizer, RejectReason,
 };
-pub use config::{ConfigError, ReflectorConfig, ReflectorConfigBuilder};
+pub use config::{
+    ConfigError, ReflectorConfig, ReflectorConfigBuilder, STANDARD_DCS_PORT, STANDARD_DEXTRA_PORT,
+    STANDARD_DPLUS_PORT,
+};
 pub use reflector::Reflector;
 pub use stream_cache::StreamCache;

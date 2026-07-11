@@ -12,6 +12,8 @@ pub const MAX_APRS_MESSAGE_TEXT_LEN: usize = 67;
 /// Format: `:ADDRESSEE:message text{ID` or, with the APRS 1.2 reply-ack
 /// extension, `:ADDRESSEE:message text{MM}AA` where `MM` is this
 /// message's ID and `AA` is an ack for a previously-received message.
+/// A bare `:ADDRESSEE:message text{MM}` (nothing after the `}`) is the
+/// reply-ack capability advertisement: id `MM`, no piggybacked ack.
 /// - Addressee is exactly 9 characters, space-padded.
 /// - Message text follows the second `:`.
 /// - Optional message ID after `{` (for ack/rej).
@@ -30,7 +32,8 @@ pub struct AprsMessage {
     /// Optional APRS 1.2 reply-ack: when the sender bundles an
     /// acknowledgement for a previously-received message into a new
     /// outgoing message. Format on wire is `{MM}AA` where `AA` is the
-    /// acknowledged msgno.
+    /// acknowledged msgno. A bare `{MM}` trailer (the reply-ack
+    /// capability advertisement) leaves this `None`.
     pub reply_ack: Option<String>,
 }
 
@@ -153,10 +156,12 @@ pub fn parse_aprs_message(info: &[u8]) -> Result<AprsMessage, AprsError> {
     let trimmed_body = body_str.trim_end_matches(['\r', '\n']);
 
     // Split on `{` for message ID and APRS 1.2 reply-ack extension.
-    // Three possible trailer forms to recognise (checked from richest):
+    // Four possible trailer forms to recognise (checked from richest):
     //   1. `text{MM}AA`  — reply-ack: MM is this msg's id, AA is ack
-    //   2. `text{MM`     — plain message id
-    //   3. `text`        — no trailer
+    //   2. `text{MM}`    — reply-ack capability advertisement: MM is
+    //                      this msg's id, no ack piggybacked
+    //   3. `text{MM`     — plain message id
+    //   4. `text`        — no trailer
     let (text, message_id, reply_ack) = parse_message_trailer(trimmed_body);
 
     Ok(AprsMessage {
@@ -167,10 +172,14 @@ pub fn parse_aprs_message(info: &[u8]) -> Result<AprsMessage, AprsError> {
     })
 }
 
-/// Parse the optional `{MM}AA` / `{MM` trailer of an APRS message body.
+/// Parse the optional `{MM}AA` / `{MM}` / `{MM` trailer of an APRS
+/// message body.
 ///
 /// Returns `(text, message_id, reply_ack)` where the latter two are
-/// `Some` only when the trailer has the exact well-formed shape.
+/// `Some` only when the trailer has the exact well-formed shape. Per
+/// the APRS 1.2 reply-ack addendum, `{MM}` with nothing after the
+/// brace is the reply-ack capability advertisement: the message id is
+/// `MM` and no ack is piggybacked.
 fn parse_message_trailer(body: &str) -> (String, Option<String>, Option<String>) {
     let Some(brace_idx) = body.rfind('{') else {
         return (body.to_owned(), None, None);
@@ -182,16 +191,20 @@ fn parse_message_trailer(body: &str) -> (String, Option<String>, Option<String>)
         return (body.to_owned(), None, None);
     };
 
-    // APRS 1.2 reply-ack: `MM}AA` where MM is 1-5 alnum and AA is 1-5 alnum.
+    // APRS 1.2 reply-ack: `MM}AA` where MM is 1-5 alnum and AA is
+    // either 1-5 alnum (piggybacked ack) or empty (capability
+    // advertisement). Any other AA shape is malformed and falls
+    // through to the plain-text case.
     if let Some(close_idx) = after_brace.find('}') {
         let mm = after_brace.get(..close_idx).unwrap_or("");
         let aa = after_brace.get(close_idx + 1..).unwrap_or("");
-        if (1..=5).contains(&mm.len())
-            && mm.bytes().all(|b| b.is_ascii_alphanumeric())
-            && (1..=5).contains(&aa.len())
-            && aa.bytes().all(|b| b.is_ascii_alphanumeric())
-        {
-            return (prefix.to_owned(), Some(mm.to_owned()), Some(aa.to_owned()));
+        if (1..=5).contains(&mm.len()) && mm.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            if aa.is_empty() {
+                return (prefix.to_owned(), Some(mm.to_owned()), None);
+            }
+            if (1..=5).contains(&aa.len()) && aa.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return (prefix.to_owned(), Some(mm.to_owned()), Some(aa.to_owned()));
+            }
         }
     }
 
@@ -256,12 +269,28 @@ mod tests {
 
     #[test]
     fn parse_message_does_not_misinterpret_brace_in_text() -> TestResult {
-        // Regression: "reply {soon}" should NOT produce message_id="soon}"
-        // because "soon}" is not 1-5 alphanumerics at end of string.
+        // Regression: a braced word that cannot be a message id
+        // ("sooner" is 6 chars, above the 1-5 alnum limit) must NOT be
+        // stripped from the text or produce a message id.
+        let info = b":N0CALL   :reply {sooner}";
+        let msg = parse_aprs_message(info)?;
+        assert_eq!(msg.text, "reply {sooner}");
+        assert_eq!(msg.message_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_message_trailing_braced_word_is_advertisement() -> TestResult {
+        // `{soon}` is on-wire indistinguishable from the APRS 1.2
+        // reply-ack capability advertisement (`{MM}` with a 1-5 alnum
+        // id and empty ack), so it parses as message id "soon".
+        // Earlier code generations treated it as plain text because
+        // the empty-ack advertisement form was not recognised.
         let info = b":N0CALL   :reply {soon}";
         let msg = parse_aprs_message(info)?;
-        assert_eq!(msg.text, "reply {soon}");
-        assert_eq!(msg.message_id, None);
+        assert_eq!(msg.text, "reply ");
+        assert_eq!(msg.message_id, Some("soon".to_owned()));
+        assert_eq!(msg.reply_ack, None);
         Ok(())
     }
 
@@ -290,6 +319,32 @@ mod tests {
         let msg = parse_aprs_message(info)?;
         assert_eq!(msg.text, "Hello");
         assert_eq!(msg.message_id, Some("3".to_owned()));
+        assert_eq!(msg.reply_ack, None);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_message_reply_ack_advertisement() -> TestResult {
+        // APRS 1.2 reply-ack addendum: `{MM}` with nothing after the
+        // brace advertises reply-ack capability — this message's id is
+        // MM and no ack is piggybacked.
+        let info = b":N0CALL   :hi{05}";
+        let msg = parse_aprs_message(info)?;
+        assert_eq!(msg.text, "hi");
+        assert_eq!(msg.message_id, Some("05".to_owned()));
+        assert_eq!(msg.reply_ack, None);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_message_reply_ack_invalid_trailing_junk_stays_text() -> TestResult {
+        // The post-`}` segment "xx!" is not 1-5 alphanumerics, so the
+        // trailer is malformed: the whole body stays plain text and no
+        // message id is extracted.
+        let info = b":N0CALL   :hi{05}xx!";
+        let msg = parse_aprs_message(info)?;
+        assert_eq!(msg.text, "hi{05}xx!");
+        assert_eq!(msg.message_id, None);
         assert_eq!(msg.reply_ack, None);
         Ok(())
     }

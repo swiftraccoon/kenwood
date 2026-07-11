@@ -122,9 +122,11 @@ pub enum BeaconState {
     Running {
         /// When the last beacon was transmitted.
         last_beacon_time: Instant,
-        /// Course in degrees at the last beacon, or `None` if the
-        /// caller used [`SmartBeaconing::beacon_sent`] without
-        /// supplying one.
+        /// Course in degrees at the last beacon, normalized to
+        /// `[0, 360)`, or `None` if the caller used
+        /// [`SmartBeaconing::beacon_sent`] without supplying one or
+        /// supplied a non-finite (no-heading-information) value to
+        /// [`SmartBeaconing::beacon_sent_with`].
         last_course: Option<f64>,
         /// Speed in km/h at the last beacon, or `None` if unknown.
         last_speed: Option<f64>,
@@ -165,6 +167,11 @@ impl SmartBeaconing {
 
     /// Check if a beacon should be sent now, given current speed and course.
     ///
+    /// Inputs are sanitized as in [`Self::beacon_reason`]: non-finite
+    /// speed is treated as `0.0` (stopped ⇒ slow rate), non-finite
+    /// course means "no heading information" (never fires a turn
+    /// beacon), and a finite out-of-range course wraps into `[0, 360)`.
+    ///
     /// `now` is the current wall-clock time, injected by the caller so
     /// this module remains sans-io.
     #[must_use]
@@ -176,6 +183,14 @@ impl SmartBeaconing {
     /// course. Returns `None` if no beacon should be sent yet, otherwise
     /// a [`BeaconReason`] identifying which condition tripped.
     ///
+    /// Mirroring the builder policy for non-finite lat/lon, inputs are
+    /// sanitized on entry: a non-finite speed (`NaN`, `±∞`) is treated
+    /// as `0.0` — stopped, so the slow rate applies and no zero-second
+    /// interval can arise — and a non-finite course means "no heading
+    /// information", so no turn beacon can fire. A finite out-of-range
+    /// course (e.g. `480.0`) is wrapped into `[0, 360)` before the
+    /// heading comparison.
+    ///
     /// `now` is the current wall-clock time, injected by the caller so
     /// this module remains sans-io.
     #[must_use]
@@ -185,6 +200,8 @@ impl SmartBeaconing {
         course_deg: f64,
         now: Instant,
     ) -> Option<BeaconReason> {
+        let speed_kmh = sanitize_speed(speed_kmh);
+        let course_deg = sanitize_course(course_deg);
         // First beacon: always send.
         let BeaconState::Running {
             last_beacon_time,
@@ -204,6 +221,7 @@ impl SmartBeaconing {
 
         if speed_kmh > self.config.low_speed_kmh
             && let Some(last_course) = last_course
+            && let Some(course_deg) = course_deg
         {
             let turn = heading_delta(last_course, course_deg);
             let threshold = self.current_turn_threshold(speed_kmh);
@@ -223,8 +241,13 @@ impl SmartBeaconing {
     /// ```text
     /// turn_threshold = turn_min + (turn_slope * 10) / speed_kmh
     /// ```
+    ///
+    /// A non-finite speed is treated as `0.0` (stopped), yielding an
+    /// infinite threshold — no turn beacon is possible without valid
+    /// speed data.
     #[must_use]
     pub fn current_turn_threshold(&self, speed_kmh: f64) -> f64 {
+        let speed_kmh = sanitize_speed(speed_kmh);
         if speed_kmh <= self.config.low_speed_kmh {
             return f64::INFINITY;
         }
@@ -254,12 +277,18 @@ impl SmartBeaconing {
 
     /// Mark that a beacon was just sent with the given speed and course.
     ///
+    /// The recorded values are sanitized like the [`Self::beacon_reason`]
+    /// inputs: a non-finite speed is stored as `0.0`, a non-finite
+    /// course is stored as `None` (no heading reference for later turn
+    /// detection), and a finite out-of-range course wraps into
+    /// `[0, 360)`.
+    ///
     /// `now` is the wall-clock time at which the beacon was sent.
     pub const fn beacon_sent_with(&mut self, speed_kmh: f64, course_deg: f64, now: Instant) {
         self.state = BeaconState::Running {
             last_beacon_time: now,
-            last_course: Some(course_deg),
-            last_speed: Some(speed_kmh),
+            last_course: sanitize_course(course_deg),
+            last_speed: Some(sanitize_speed(speed_kmh)),
         };
     }
 
@@ -281,6 +310,11 @@ impl SmartBeaconing {
     ///
     /// Linear interpolation between `slow_rate` at `low_speed` and
     /// `fast_rate` at `high_speed`.
+    ///
+    /// Callers must pass a finite speed; every public entry point runs
+    /// [`sanitize_speed`] first, so a non-finite value can never reach
+    /// the interpolation below (where it would produce a `NaN` that
+    /// saturates the `as u32` cast to a zero-second interval).
     fn compute_interval(&self, speed_kmh: f64) -> u32 {
         if speed_kmh <= self.config.low_speed_kmh {
             return self.config.slow_rate_secs;
@@ -298,10 +332,47 @@ impl SmartBeaconing {
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "interval is bounded by slow_rate_secs (u32) and fraction is in [0,1]"
+            reason = "speed is sanitized to a finite value at every public entry point and \
+                      the guards above pin it strictly between low_speed and high_speed, so \
+                      fraction is in [0,1] and the interpolated interval is bounded by \
+                      slow_rate_secs (u32)"
         )]
         let interval = fraction.mul_add(-rate_range, f64::from(self.config.slow_rate_secs)) as u32;
         interval
+    }
+}
+
+/// Substitute `0.0` for a non-finite speed (`NaN`, `±∞`).
+///
+/// Mirrors the builder policy of substituting `0.0` for non-finite
+/// lat/lon: corrupt GPS speed data means "treat as stopped", which
+/// selects the slow beacon rate and disables turn detection, instead
+/// of interpolating a `NaN` interval that saturates to zero seconds
+/// and beacons continuously.
+const fn sanitize_speed(speed_kmh: f64) -> f64 {
+    if speed_kmh.is_finite() {
+        speed_kmh
+    } else {
+        0.0
+    }
+}
+
+/// Normalize a course to `[0, 360)` degrees.
+///
+/// Returns `None` for non-finite input (`NaN`, `±∞`) — no heading
+/// information, so turn detection must not use it. A finite
+/// out-of-range value (e.g. `480.0`) wraps into range so
+/// [`heading_delta`] sees the true heading instead of computing a
+/// bogus (possibly negative) delta.
+const fn sanitize_course(course_deg: f64) -> Option<f64> {
+    if !course_deg.is_finite() {
+        return None;
+    }
+    let wrapped = course_deg % 360.0;
+    if wrapped < 0.0 {
+        Some(wrapped + 360.0)
+    } else {
+        Some(wrapped)
     }
 }
 
@@ -519,6 +590,89 @@ mod tests {
             sb.beacon_reason(0.0, 0.0, later),
             Some(BeaconReason::TimeExpired),
         );
+    }
+
+    #[test]
+    fn nan_speed_does_not_zero_the_interval() {
+        // A non-finite speed must be treated as 0.0 (stopped ⇒ slow
+        // rate), not interpolated into a NaN that saturates to a
+        // zero-second interval and fires TimeExpired on every call
+        // (a continuous-TX beacon storm on air).
+        let t0 = Instant::now();
+        let mut sb = SmartBeaconing::new(SmartBeaconingConfig::default());
+        assert!(sb.should_beacon(50.0, 0.0, t0));
+        sb.beacon_sent_with(50.0, 0.0, t0);
+
+        let t1 = t0 + Duration::from_secs(1);
+        let reason = sb.beacon_reason(f64::NAN, 0.0, t1);
+        assert_eq!(
+            reason, None,
+            "NaN speed one second after a beacon must not trigger anything",
+        );
+        assert!(!sb.should_beacon(f64::NAN, 0.0, t1));
+        assert!(!sb.should_beacon(f64::INFINITY, 0.0, t1));
+        assert!(!sb.should_beacon(f64::NEG_INFINITY, 0.0, t1));
+    }
+
+    #[test]
+    fn out_of_range_course_behaves_like_normalized_course() {
+        // 480° is the same heading as 120°; turn detection must see
+        // them identically instead of computing a negative delta.
+        let t0 = Instant::now();
+        let cfg = SmartBeaconingConfig {
+            turn_time_secs: 0,
+            ..SmartBeaconingConfig::default()
+        };
+        let mut sb_wrapped = SmartBeaconing::new(cfg.clone());
+        let mut sb_plain = SmartBeaconing::new(cfg);
+        sb_wrapped.beacon_sent_with(75.0, 0.0, t0);
+        sb_plain.beacon_sent_with(75.0, 0.0, t0);
+
+        let t1 = t0 + Duration::from_secs(1);
+        let wrapped = sb_wrapped.beacon_reason(75.0, 480.0, t1);
+        let plain = sb_plain.beacon_reason(75.0, 120.0, t1);
+        assert_eq!(wrapped, plain, "course 480° must behave like 120°");
+        assert_eq!(plain, Some(BeaconReason::Turn));
+    }
+
+    #[test]
+    fn nan_course_fires_no_turn_beacon() {
+        // Non-finite course means "no heading information" — it must
+        // never fire a turn beacon, whether it arrives as the current
+        // course or was recorded at the previous beacon.
+        let t0 = Instant::now();
+        let cfg = SmartBeaconingConfig {
+            turn_time_secs: 0,
+            ..SmartBeaconingConfig::default()
+        };
+        let t1 = t0 + Duration::from_secs(1);
+
+        let mut sb = SmartBeaconing::new(cfg.clone());
+        sb.beacon_sent_with(75.0, 0.0, t0);
+        assert_eq!(
+            sb.beacon_reason(75.0, f64::NAN, t1),
+            None,
+            "NaN current course must not fire a turn beacon",
+        );
+
+        let mut sb_stored = SmartBeaconing::new(cfg);
+        sb_stored.beacon_sent_with(75.0, f64::NAN, t0);
+        assert_eq!(
+            sb_stored.beacon_reason(75.0, 120.0, t1),
+            None,
+            "NaN stored course must not act as a heading reference",
+        );
+    }
+
+    #[test]
+    fn turn_threshold_non_finite_speed_is_infinite() {
+        // Non-finite speed sanitizes to 0.0 (stopped), so no turn
+        // beacon is possible — the threshold must be infinite, not NaN
+        // (NaN) or a finite value (+∞ input).
+        let sb = SmartBeaconing::new(SmartBeaconingConfig::default());
+        assert!(sb.current_turn_threshold(f64::NAN).is_infinite());
+        assert!(sb.current_turn_threshold(f64::INFINITY).is_infinite());
+        assert!(sb.current_turn_threshold(f64::NEG_INFINITY).is_infinite());
     }
 
     #[test]

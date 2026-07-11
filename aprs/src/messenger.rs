@@ -63,6 +63,11 @@ impl Default for MessengerConfig {
 struct PendingMessage {
     /// Sequence ID for ack matching.
     message_id: String,
+    /// Station this message was sent to. An acknowledgement is only
+    /// honoured when it arrives FROM this station — over open RF, a
+    /// message number alone is not proof of delivery, and matching on
+    /// it lets any third party cancel our retries.
+    addressee: String,
     /// Pre-built KISS wire frame for retransmission.
     wire_frame: Vec<u8>,
     /// Number of transmission attempts so far.
@@ -172,6 +177,7 @@ impl AprsMessenger {
         // origin.
         self.pending_messages.push(PendingMessage {
             message_id: message_id.clone(),
+            addressee: addressee.to_owned(),
             wire_frame,
             attempts: 0,
             last_sent: None,
@@ -342,19 +348,28 @@ impl AprsMessenger {
     /// Returns `false` for regular messages with no acknowledgement,
     /// including ones that merely start with the letters `ack`/`rej` but
     /// aren't valid control frames.
-    pub fn process_incoming(&mut self, msg: &AprsMessage) -> bool {
+    ///
+    /// `source` is the callsign of the station that transmitted the
+    /// frame. An acknowledgement is honoured ONLY when it arrives from
+    /// the station the pending message was addressed to: over open RF a
+    /// message number is not a secret, so matching on it alone would let
+    /// any third party silently cancel our delivery retries. Comparison
+    /// is ASCII-case-insensitive, matching APRS callsign conventions.
+    pub fn process_incoming(&mut self, source: &str, msg: &AprsMessage) -> bool {
         let before = self.pending_messages.len();
 
         // (1) Standalone ack/rej control frame: `ack<id>` / `rej<id>`.
         if let Some((_is_ack, id)) = classify_ack_rej(&msg.text) {
-            self.pending_messages.retain(|p| p.message_id != id);
+            self.pending_messages
+                .retain(|p| !(p.message_id == id && p.addressee.eq_ignore_ascii_case(source)));
         }
 
         // (2) APRS 1.1/1.2 reply-ack: the `{MM}AA` trailer's `AA` field
         // acknowledges our outbound message number. Compared verbatim,
         // matching the format the standalone-ack path uses.
         if let Some(ref acked) = msg.reply_ack {
-            self.pending_messages.retain(|p| &p.message_id != acked);
+            self.pending_messages
+                .retain(|p| !(&p.message_id == acked && p.addressee.eq_ignore_ascii_case(source)));
         }
 
         self.pending_messages.len() < before
@@ -535,7 +550,80 @@ mod tests {
             message_id: None,
             reply_ack: None,
         };
-        assert!(m.process_incoming(&ack));
+        assert!(m.process_incoming("W1AW", &ack));
+        assert_eq!(m.pending_count(), 0);
+    }
+
+    /// An ack only counts when it comes from the station the message
+    /// was addressed to. Matching on the message number alone lets ANY
+    /// station on the air cancel our delivery retries — over RF that is
+    /// a trivially spoofable denial of delivery (the retries stop and
+    /// the message later reports "expired" instead of being resent).
+    #[test]
+    fn process_incoming_ack_from_a_third_party_does_not_clear_pending() {
+        let t0 = Instant::now();
+        let mut m = test_messenger();
+        let id = m.send_message("W1AW", "Hello", t0);
+        assert_eq!(m.pending_count(), 1);
+
+        // K9XYZ was never the addressee — its ack must be ignored.
+        let spoofed = AprsMessage {
+            addressee: "N0CALL".to_owned(),
+            text: format!("ack{id}"),
+            message_id: None,
+            reply_ack: None,
+        };
+        assert!(
+            !m.process_incoming("K9XYZ", &spoofed),
+            "an ack from a station we never messaged must not clear the pending message"
+        );
+        assert_eq!(
+            m.pending_count(),
+            1,
+            "the message must still be pending after a spoofed ack"
+        );
+
+        // The real addressee still clears it.
+        let genuine = AprsMessage {
+            addressee: "N0CALL".to_owned(),
+            text: format!("ack{id}"),
+            message_id: None,
+            reply_ack: None,
+        };
+        assert!(
+            m.process_incoming("w1aw", &genuine),
+            "callsign match is case-insensitive"
+        );
+        assert_eq!(m.pending_count(), 0);
+    }
+
+    /// The reply-ack carrier gets the same source check — it is the
+    /// form modern clients actually send.
+    #[test]
+    fn process_incoming_reply_ack_from_a_third_party_does_not_clear_pending() {
+        let t0 = Instant::now();
+        let mut m = test_messenger();
+        let id = m.send_message("W1AW", "Hello", t0);
+
+        let spoofed = AprsMessage {
+            addressee: "N0CALL".to_owned(),
+            text: "hi".to_owned(),
+            message_id: Some("07".to_owned()),
+            reply_ack: Some(id.clone()),
+        };
+        assert!(
+            !m.process_incoming("K9XYZ", &spoofed),
+            "a reply-ack from a third party must not clear the pending message"
+        );
+        assert_eq!(m.pending_count(), 1);
+
+        let genuine = AprsMessage {
+            addressee: "N0CALL".to_owned(),
+            text: "hi".to_owned(),
+            message_id: Some("08".to_owned()),
+            reply_ack: Some(id),
+        };
+        assert!(m.process_incoming("W1AW", &genuine));
         assert_eq!(m.pending_count(), 0);
     }
 
@@ -551,7 +639,7 @@ mod tests {
             message_id: None,
             reply_ack: None,
         };
-        assert!(m.process_incoming(&rej));
+        assert!(m.process_incoming("W1AW", &rej));
         assert_eq!(m.pending_count(), 0);
     }
 
@@ -567,7 +655,7 @@ mod tests {
             message_id: Some("42".to_owned()),
             reply_ack: None,
         };
-        assert!(!m.process_incoming(&unrelated));
+        assert!(!m.process_incoming("W1AW", &unrelated));
         assert_eq!(m.pending_count(), 1);
     }
 
@@ -693,7 +781,7 @@ mod tests {
             message_id: None,
             reply_ack: None,
         };
-        assert!(!m.process_incoming(&false_ack));
+        assert!(!m.process_incoming("W1AW", &false_ack));
         assert_eq!(m.pending_count(), 1);
     }
 
@@ -716,7 +804,7 @@ mod tests {
             reply_ack: Some(id),
         };
         assert!(
-            m.process_incoming(&reply_ack),
+            m.process_incoming("W1AW", &reply_ack),
             "reply-ack should clear the matching pending message",
         );
         assert_eq!(m.pending_count(), 0);
@@ -740,7 +828,7 @@ mod tests {
             m.is_new_incoming("W1AW", &reply_ack, t0),
             "reply-ack message id 05 must be surfaced as a new incoming",
         );
-        assert!(m.process_incoming(&reply_ack));
+        assert!(m.process_incoming("W1AW", &reply_ack));
         assert_eq!(m.pending_count(), 0);
         // Same message arriving again is a duplicate by (source, msgno).
         assert!(!m.is_new_incoming("W1AW", &reply_ack, t0));
@@ -761,7 +849,7 @@ mod tests {
             reply_ack: Some("99".to_owned()),
         };
         assert!(
-            !m.process_incoming(&reply_ack),
+            !m.process_incoming("W1AW", &reply_ack),
             "reply-ack with no matching pending clears nothing",
         );
         assert_eq!(m.pending_count(), 1);

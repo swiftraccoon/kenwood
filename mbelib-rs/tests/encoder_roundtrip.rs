@@ -163,6 +163,7 @@ fn zero_input_encode_decode_is_comfort_noise_level() {
 /// can see WHY the decoder produces loud output. Not a pass/fail
 /// test — it's diagnostic only.
 #[test]
+#[ignore = "diagnostic dump, asserts nothing — run explicitly with --ignored --nocapture"]
 fn diagnostic_dump_zero_input_ambe() {
     let mut enc = AmbeEncoder::new();
     for frame_num in 0..12 {
@@ -174,6 +175,7 @@ fn diagnostic_dump_zero_input_ambe() {
 /// Dump the AMBE bytes emitted for sine input so we can compare
 /// against zero and see how different they are.
 #[test]
+#[ignore = "diagnostic dump, asserts nothing — run explicitly with --ignored --nocapture"]
 fn diagnostic_dump_sine_input_ambe() {
     let mut enc = AmbeEncoder::new();
     let mut t0 = 0_usize;
@@ -325,61 +327,49 @@ fn sine_roundtrip_has_nonzero_correlation_with_input() {
 ///
 /// Per-frame b-vec is dumped so encoder fixes can be bisected by
 /// comparing what `b3..b8` change from one revision to the next.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Linear voice-band roundtrip test: synth → 40 frames encode→decode → \
-              cross-correlate. Splitting helpers obscures the data flow; the test reads \
-              top-to-bottom like the existing 1 kHz sine_roundtrip test."
-)]
-#[test]
-fn voice_band_200hz_roundtrip_correlation() {
-    fn make_voice_chunk(t0_samples: usize) -> [f32; 160] {
-        let mut buf = [0.0_f32; 160];
-        // Lower amplitude (0.02 = -34 dBFS) keeps the encoder's gain
-        // calculation away from DG_TABLE saturation. At 0.1 amp the
-        // FFT magnitudes drove `gain ≈ 12` while DG_TABLE max is
-        // ~5.35, so b2 was pinning at 62/63 and the closed-loop
-        // reconstructed_gamma converged to 10.7 instead of 12 — a
-        // 1.3-bit scale offset that propagated through `interp_prev`
-        // and corrupted every subsequent frame's `T = lsa - 0.65*ip + Sum43`.
-        let amplitude = 0.02_f32;
-        // Pick a frequency that lands EXACTLY on W0_TABLE[46] (0.02497
-        // cycles/sample × 8000 = 199.79 Hz) so the encoder's pitch
-        // quantization can't introduce a sub-Hz frequency error that
-        // accumulates phase drift over the 800 ms test window. With a
-        // 200.0 Hz target the pitch tracker rounds to W0_TABLE[45] =
-        // 205.5 Hz, and the resulting +5.5 Hz error drifts ~4 cycles
-        // over 0.8 s, dominating the cross-correlation metric.
-        let f0_hz = 199.79_f32;
-        let sr = 8000.0_f32;
-        // Continuous voice envelope: 18 harmonics with 1/k formant
-        // decay (moderate vowel /a/-like). Continuous coverage from
-        // k=1 to k=18 avoids the artificial voiced/unvoiced cliff that
-        // a sparse 4-harmonic signal creates — that cliff makes Gm
-        // saturate the PRBA24 codebook because real voice doesn't
-        // have the abrupt magnitude drop our short stack produces.
-        let n_harmonics = 18_usize;
-        for (i, slot) in buf.iter_mut().enumerate() {
+/// Deterministic 199.79 Hz voice-band signal (18 harmonics, 1/k
+/// formant decay, -34 dBFS) shared by the correlation gate and the
+/// steady-state wire pin below.
+///
+/// The amplitude keeps the encoder's gain away from `DG_TABLE`
+/// saturation (0.1 amp drove `gain ≈ 12` past the table max ~5.35,
+/// pinning b2 at 62/63 and corrupting every subsequent frame's
+/// closed-loop gamma). The frequency lands EXACTLY on `W0_TABLE[46]`
+/// (0.02497 cycles/sample × 8000 = 199.79 Hz) so pitch quantization
+/// introduces no sub-Hz error that would accumulate phase drift over
+/// the correlation window; a 200.0 Hz target rounds to `W0_TABLE[45]`
+/// = 205.5 Hz and drifts ~4 cycles over 0.8 s. Continuous k=1..=18
+/// coverage avoids the voiced/unvoiced cliff a sparse harmonic stack
+/// creates (which saturates Gm through the PRBA24 codebook).
+fn make_voice_chunk(t0_samples: usize) -> [f32; 160] {
+    let mut buf = [0.0_f32; 160];
+    let amplitude = 0.02_f32;
+    let f0_hz = 199.79_f32;
+    let sr = 8000.0_f32;
+    let n_harmonics = 18_usize;
+    for (i, slot) in buf.iter_mut().enumerate() {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test sample-time generator: i+t0 well below f32 mantissa precision."
+        )]
+        let t = (t0_samples + i) as f32;
+        let mut s = 0.0_f32;
+        for k_idx in 0..n_harmonics {
             #[expect(
                 clippy::cast_precision_loss,
-                reason = "test sample-time generator: i+t0 well below f32 mantissa precision."
+                reason = "harmonic index 1..=18 fits exactly in f32."
             )]
-            let t = (t0_samples + i) as f32;
-            let mut s = 0.0_f32;
-            for k_idx in 0..n_harmonics {
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "harmonic index 1..=18 fits exactly in f32."
-                )]
-                let k = (k_idx + 1) as f32;
-                let amp = 1.0 / k; // 1/k decay = pink-spectrum-like envelope
-                s += amp * (t * 2.0 * std::f32::consts::PI * f0_hz * k / sr).sin();
-            }
-            *slot = amplitude * s;
+            let k = (k_idx + 1) as f32;
+            let amp = 1.0 / k; // 1/k decay = pink-spectrum-like envelope
+            s += amp * (t * 2.0 * std::f32::consts::PI * f0_hz * k / sr).sin();
         }
-        buf
+        *slot = amplitude * s;
     }
+    buf
+}
 
+#[test]
+fn voice_band_200hz_roundtrip_correlation() {
     let mut enc = AmbeEncoder::new();
     let mut dec = AmbeDecoder::new();
 
@@ -480,6 +470,43 @@ fn voice_band_200hz_roundtrip_correlation() {
     assert!(
         max_ncc > 0.0,
         "voice-band encode→decode produced zero or anti-correlated output: {max_ncc:.4}"
+    );
+}
+
+/// Self-golden pin of the encoder's steady-state wire output for the
+/// deterministic 199.79 Hz voice-band signal.
+///
+/// The correlation gates in this file are deliberately loose while
+/// the known encoder deficiencies stand, which leaves the encoder
+/// with no committed regression tripwire — a refactor can change
+/// every emitted frame and nothing fails. This pin freezes the
+/// decoded b-vectors of three steady-state frames (after warm-up) at
+/// their current values; an INTENTIONAL encoder change must update
+/// these constants consciously. The values describe the encoder as
+/// it is today (b0=45 ⇒ the 205.5 Hz pitch quantization, the
+/// known-broken spectral path included) — a drift alarm, not a
+/// correctness claim.
+#[test]
+fn steady_state_wire_output_for_voice_band_signal_is_pinned() {
+    let mut enc = AmbeEncoder::new();
+    let mut t0 = 0_usize;
+    let mut steady: Vec<([usize; 9], usize)> = Vec::new();
+    for f in 0..13 {
+        let ambe = enc.encode_frame(&make_voice_chunk(t0));
+        t0 += 160;
+        if f >= 10 {
+            let (b, _w0, big_l, _d) = mbelib_rs::decode_trace(&ambe);
+            steady.push((b, big_l));
+        }
+    }
+    let expected: Vec<([usize; 9], usize)> = vec![
+        ([45, 15, 27, 310, 90, 10, 7, 7, 10], 18),
+        ([45, 15, 27, 360, 82, 12, 7, 7, 10], 18),
+        ([45, 15, 27, 294, 77, 10, 7, 7, 10], 18),
+    ];
+    assert_eq!(
+        steady, expected,
+        "steady-state encoder wire output drifted from the pinned b-vectors"
     );
 }
 

@@ -3,8 +3,9 @@
 
 //! Error types for the AMBE 3600×2400 decoder.
 //!
-//! The AMBE codec uses Golay(23,12) and Hamming(15,11) forward error
-//! correction to protect the parameter bits. When the channel
+//! The AMBE 3600×2400 codec uses Golay(23,12) forward error
+//! correction on the C0 and C1 codewords to protect the most critical
+//! parameter bits (C2 and C3 carry data with no FEC). When the channel
 //! introduces more errors than the FEC can correct, the decoder
 //! detects this via syndrome analysis and reports it here.
 
@@ -23,9 +24,9 @@ use core::fmt;
 pub enum DecodeError {
     /// Too many bit errors for the FEC to correct.
     ///
-    /// The Golay and Hamming decoders detected more errors than their
-    /// correction capacity (3 bits for Golay, 1 bit for Hamming). The
-    /// decoded parameters are unreliable and should not be used for
+    /// The Golay decoders detected more errors than their correction
+    /// capacity (3 bits per Golay(23,12) codeword). The decoded
+    /// parameters are unreliable and should not be used for
     /// synthesis.
     ExcessiveErrors {
         /// Errors detected in the C0 codeword (Golay-protected).

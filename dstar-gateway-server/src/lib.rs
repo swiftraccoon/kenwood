@@ -13,16 +13,16 @@ pub mod tokio_shell;
 
 pub use client_pool::{
     ClientHandle, ClientPool, DEFAULT_TX_BUDGET_MAX_TOKENS, DEFAULT_TX_BUDGET_REFILL_PER_SEC,
-    DEFAULT_UNHEALTHY_THRESHOLD, TokenBucket, UnhealthyOutcome,
+    DEFAULT_UNHEALTHY_THRESHOLD, SweepEntry, TokenBucket, UnhealthyOutcome,
 };
 pub use reflector::{
     AccessPolicy, AllowAllAuthorizer, ClientAuthorizer, ConfigError, DenyAllAuthorizer,
     LinkAttempt, ReadOnlyAuthorizer, Reflector, ReflectorConfig, ReflectorConfigBuilder,
-    RejectReason, StreamCache,
+    RejectReason, STANDARD_DCS_PORT, STANDARD_DEXTRA_PORT, STANDARD_DPLUS_PORT, StreamCache,
 };
 pub use tokio_shell::{
-    CrossProtocolEvent, EndpointOutcome, FanOutReport, ProtocolEndpoint, ShellError, VoiceEvent,
-    fan_out_voice, fan_out_voice_at, transcode_voice,
+    CrossProtocolEvent, EndpointOutcome, EndpointSettings, FanOutReport, ProtocolEndpoint,
+    ShellError, VoiceEvent, fan_out_voice, fan_out_voice_at, transcode_voice,
 };
 
 // `proptest` is a dev-dependency used by future property tests.

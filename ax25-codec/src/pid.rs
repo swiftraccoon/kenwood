@@ -84,3 +84,24 @@ impl Ax25Pid {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Ax25Pid;
+
+    /// `from_byte` and `as_byte` are two hand-maintained 15-arm match
+    /// tables; the involution over the full byte space is the property
+    /// that keeps them in lockstep — one drifted arm (e.g. a swapped
+    /// pair of `0xCx` codes) fails here and nowhere else, because
+    /// packets keep the PID as a raw byte.
+    #[test]
+    fn pid_tables_are_involutive_over_every_byte() {
+        for b in 0..=255u8 {
+            assert_eq!(
+                Ax25Pid::from_byte(b).as_byte(),
+                b,
+                "PID {b:#04x} must survive decode→encode"
+            );
+        }
+    }
+}

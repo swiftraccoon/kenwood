@@ -13,7 +13,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 
 use dstar_gateway_core::session::client::Protocol;
-use dstar_gateway_core::types::Module;
+use dstar_gateway_core::types::{Callsign, Module};
 
 use crate::reflector::AccessPolicy;
 
@@ -46,6 +46,27 @@ pub enum UnhealthyOutcome {
         /// Running count of send failures after this increment.
         failure_count: u32,
     },
+}
+
+/// One pool entry as seen by the endpoint's periodic maintenance
+/// sweep.
+///
+/// Snapshot produced by [`ClientPool::sweep_snapshot`] — carries
+/// everything the sweep needs to decide idle eviction
+/// (`last_heard`) and to encode per-protocol server-initiated
+/// keepalives (module membership plus the linked client's identity).
+#[derive(Debug, Clone, Copy)]
+pub struct SweepEntry {
+    /// Peer address.
+    pub peer: SocketAddr,
+    /// Last time a datagram arrived from this peer.
+    pub last_heard: Instant,
+    /// Reflector module the peer is linked to, if the link completed.
+    pub module: Option<Module>,
+    /// Client callsign, populated once the LINK carried one.
+    pub client_callsign: Option<Callsign>,
+    /// Client's own module letter from its LINK packet, if any.
+    pub client_module: Option<Module>,
 }
 
 /// Concurrent pool of linked clients for one [`Protocol`].
@@ -301,6 +322,30 @@ impl<P: Protocol> ClientPool<P> {
         }
     }
 
+    /// Snapshot every entry for the endpoint's maintenance sweep.
+    ///
+    /// Returns one [`SweepEntry`] per pool entry, in unspecified
+    /// order. The snapshot is taken under a single lock acquisition
+    /// and owned by the caller, so the sweep can evict or transmit
+    /// without holding the pool lock.
+    ///
+    /// # Cancellation safety
+    ///
+    /// This method is cancel-safe. See [`Self::len`].
+    pub async fn sweep_snapshot(&self) -> Vec<SweepEntry> {
+        let clients = self.clients.lock().await;
+        clients
+            .iter()
+            .map(|(peer, handle)| SweepEntry {
+                peer: *peer,
+                last_heard: handle.last_heard,
+                module: handle.module,
+                client_callsign: handle.session.client_callsign(),
+                client_module: handle.session.client_module(),
+            })
+            .collect()
+    }
+
     /// Run a closure with exclusive access to a peer's handle.
     ///
     /// Holds the internal `Mutex` for the duration of the closure;
@@ -445,13 +490,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_last_heard_updates_timestamp() {
+    async fn record_last_heard_updates_timestamp() -> Result<(), Box<dyn std::error::Error>> {
         let pool = ClientPool::<DExtra>::new();
         pool.insert(peer(30001), fresh_handle(30001)).await;
         let later = Instant::now() + std::time::Duration::from_secs(5);
         pool.record_last_heard(&peer(30001), later).await;
-        // No crash + no state leak = pass. We can't read last_heard
-        // without exposing it, which is intentional.
+        // `last_heard` is load-bearing for the endpoint's
+        // keepalive-inactivity eviction sweep — assert the write
+        // actually landed.
+        let heard = pool
+            .with_handle_mut(&peer(30001), |handle| handle.last_heard)
+            .await
+            .ok_or("handle missing")?;
+        assert_eq!(
+            heard, later,
+            "last_heard must advance to the injected instant"
+        );
+        Ok(())
     }
 
     #[tokio::test]

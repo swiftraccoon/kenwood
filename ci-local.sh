@@ -155,18 +155,26 @@ ci_pod() {
         step "clippy all-features"   cargo clippy --workspace --all-targets --all-features -- -D warnings
         step "clippy +encoder"       cargo clippy -p mbelib-rs --all-targets --features encoder -- -D warnings
         step "clippy +kenwood"       cargo clippy -p mbelib-rs --all-targets --features kenwood-tables -- -D warnings
-        # Some thd75 integration tests depend on gitignored spec
-        # fixtures that are not shipped in CI, so stick to --lib here.
-        step "test workspace (lib)"  cargo test --workspace --lib
-        step "test +encoder"         cargo test -p mbelib-rs --features encoder --lib
-        step "test +kenwood"         cargo test -p mbelib-rs --features kenwood-tables --lib
+        # Full test targets are pod-safe: thd75'"'"'s spec-audit suite
+        # self-skips without THD75_KI4LAX_SPEC, and every suite bound
+        # to uncommitted fixtures is `#[ignore]`d. (`--lib` here used
+        # to hide every integration test from the Linux pods.)
+        step "test workspace"        cargo test --workspace
+        step "test +encoder"         cargo test -p mbelib-rs --features encoder
+        step "test +kenwood"         cargo test -p mbelib-rs --features kenwood-tables
         step "doc workspace"         env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
         # Feature-gated modules carry doc comments the default pass never
         # renders, so their intra-doc links go unchecked without this.
         step "doc all-features"      env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
         step "audit"                 cargo audit --file Cargo.lock
         step "deny"                  cargo deny check
-        step "machete"               cargo machete .
+        # `--skip-target-dir`: the trybuild compile-fail suites (now that
+        # the pods run full test targets) generate scratch crates under
+        # `target/` that list every dev-dependency and use almost none.
+        # Machete would otherwise walk into them — it only skips them via
+        # `.gitignore`, which it honours solely inside a git checkout, and
+        # the pod gets a tarball with no `.git`.
+        step "machete"               cargo machete --skip-target-dir .
     ' 2>&1
 
     # Per-pod delete intentionally removed: the EXIT/INT/TERM trap at

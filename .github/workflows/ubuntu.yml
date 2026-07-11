@@ -60,6 +60,14 @@ jobs:
         working-directory: thd75-repl
       - run: cargo test
         working-directory: mbelib-rs
+      - run: cargo test --features encoder
+        working-directory: mbelib-rs
+      - run: cargo test --features kenwood-tables
+        working-directory: mbelib-rs
+      - run: cargo test
+        working-directory: mmdvm-core
+      - run: cargo test
+        working-directory: mmdvm
       - run: cargo test --bins
         working-directory: stargazer
       - run: cargo doc --no-deps

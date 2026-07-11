@@ -1333,9 +1333,12 @@ impl<T: Transport> AprsClient<T> {
         }
 
         // Check if it is an ack/rej control frame for a pending message.
+        // The messenger only honours it when `from` is the station the
+        // message was addressed to — a message number is not a secret on
+        // the air, so any other station's ack is ignored.
         if let Some((is_ack, id)) = classify_ack_rej(&msg.text) {
             let id_owned = id.to_owned();
-            if self.messenger.process_incoming(msg) {
+            if self.messenger.process_incoming(&from.callsign, msg) {
                 return Ok(Some(if is_ack {
                     AprsEvent::MessageDelivered(id_owned)
                 } else {

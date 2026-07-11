@@ -10,10 +10,10 @@
 //! (unpack -> ECC -> demodulate -> decode -> enhance -> synthesize -> output).
 
 use mbelib_rs::AmbeDecoder;
+use proptest::prelude::{ProptestConfig, any, prop_assert, proptest};
 
 // Dev-dependencies pulled in by sibling test targets. Acknowledge them here so
 // `unused_crate_dependencies` stays silent for this compilation unit.
-use proptest as _;
 use realfft as _;
 use wide as _;
 
@@ -23,6 +23,62 @@ use wide as _;
 /// used as filler. Reference: `dstar-gateway-core/src/voice.rs`
 /// constant `AMBE_SILENCE`, sourced from `g4klx/MMDVMHost/DStarDefines.h:44`.
 const AMBE_SILENCE: [u8; 9] = [0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8];
+
+/// Steady-state tone frame from a 2026-07-05 TH-D75 wire capture
+/// (LSB-first byte order, zero FEC corrections): a 440 Hz mic tone
+/// encoded by the DVSI hardware as AMBE tone index 14 (437.5 Hz).
+const TONE_FRAME: [u8; 9] = [0xD2, 0x4B, 0x28, 0xB2, 0x57, 0x44, 0xE4, 0x08, 0x1C];
+
+/// Locks FEC-cleanliness and the decoded b-vectors of the two
+/// known-good committed frames.
+///
+/// Zero corrections on genuine wire frames is the exact property that
+/// proved the LSB-first unpack correct — the MSB-first regression
+/// produced a fixed lattice of phantom corrections on every frame.
+/// The b-vector pins localize any future bit-layer drift (unpack,
+/// deinterleave, Golay tables, demodulation) to a hard failure here
+/// instead of a subtle audio artifact. The pinned values were
+/// recorded from the decode of these frames at the time the pin was
+/// written; an intentional bit-layer change must update them
+/// consciously.
+#[test]
+fn known_good_frames_decode_fec_clean_with_pinned_b_vectors() {
+    let silence_fec = mbelib_rs::frame_fec(&AMBE_SILENCE);
+    assert_eq!(
+        silence_fec.total_errors, 0,
+        "AMBE_SILENCE must decode with zero FEC corrections"
+    );
+    assert_eq!(
+        silence_fec.kind,
+        mbelib_rs::FrameKind::Voice,
+        "AMBE_SILENCE is a comfort-noise voice frame"
+    );
+    let (b, _f0, harmonics, _d) = mbelib_rs::decode_trace(&AMBE_SILENCE);
+    assert_eq!(
+        b,
+        [124, 0, 4, 165, 41, 10, 7, 7, 10],
+        "AMBE_SILENCE b-vector drifted"
+    );
+    assert_eq!(harmonics, 56, "AMBE_SILENCE harmonic count drifted");
+
+    let tone_fec = mbelib_rs::frame_fec(&TONE_FRAME);
+    assert_eq!(
+        tone_fec.total_errors, 0,
+        "TONE_FRAME must decode with zero FEC corrections"
+    );
+    assert_eq!(
+        tone_fec.kind,
+        mbelib_rs::FrameKind::Tone,
+        "TONE_FRAME must classify as a tone frame"
+    );
+    let (b, _f0, harmonics, _d) = mbelib_rs::decode_trace(&TONE_FRAME);
+    assert_eq!(
+        b,
+        [126, 0, 11, 349, 0, 0, 0, 0, 0],
+        "TONE_FRAME b-vector drifted"
+    );
+    assert_eq!(harmonics, 0, "tone frames expose zero harmonic bands");
+}
 
 /// An all-zero AMBE frame should produce PCM samples that are all zero
 /// or very close to zero.
@@ -333,9 +389,6 @@ fn conceal_after_voice_is_bounded_repeat() {
 /// legitimate hardware traffic.
 #[test]
 fn dvsi_tone_frame_synthesizes_the_tone() {
-    // Steady-state frame from a 2026-07-05 TH-D75 wire capture
-    // (LSB-first byte order, zero FEC corrections).
-    const TONE_FRAME: [u8; 9] = [0xD2, 0x4B, 0x28, 0xB2, 0x57, 0x44, 0xE4, 0x08, 0x1C];
     let mut dec = AmbeDecoder::new();
     // Two consecutive frames — the sine must be phase-continuous
     // across the boundary (a discontinuity would distort the
@@ -360,6 +413,84 @@ fn dvsi_tone_frame_synthesizes_the_tone() {
         "expected ~35 zero crossings for a 437.5 Hz tone, got {crossings}"
     );
     assert!(peak > 3000, "tone should be audible, peak={peak}");
+}
+
+/// Tone frames reset the parameter track completely: after a tone,
+/// the next voice frame must extract exactly as a fresh instance
+/// would. Distinct pre-tone state is built from a frame whose
+/// unprotected payload bits differ from silence (located empirically:
+/// flipping them changes the decoded b-vector with zero FEC
+/// corrections), so a missing reset shows up as delta-gain carryover.
+#[test]
+fn tone_frame_fully_resets_the_parameter_track() -> Result<(), Box<dyn std::error::Error>> {
+    let clean_b = mbelib_rs::decode_trace(&AMBE_SILENCE).0;
+    let mut distinct = None;
+    for bit_index in 0..72u32 {
+        let mut frame = AMBE_SILENCE;
+        let byte = (bit_index / 8) as usize;
+        if let Some(b) = frame.get_mut(byte) {
+            *b ^= 1u8 << (bit_index % 8);
+        }
+        if mbelib_rs::frame_fec(&frame).total_errors == 0
+            && mbelib_rs::decode_trace(&frame).0 != clean_b
+        {
+            distinct = Some(frame);
+            break;
+        }
+    }
+    let distinct = distinct.ok_or("no unprotected payload bit found")?;
+
+    let mut seasoned = mbelib_rs::AmbeParamExtractor::new();
+    let _d1 = seasoned.extract(&distinct);
+    let _d2 = seasoned.extract(&distinct);
+    let tone = seasoned.extract(&TONE_FRAME);
+    assert_eq!(
+        tone.kind,
+        mbelib_rs::FrameKind::Tone,
+        "TONE_FRAME classifies as tone"
+    );
+    let after_reset = seasoned.extract(&AMBE_SILENCE);
+
+    let mut fresh = mbelib_rs::AmbeParamExtractor::new();
+    let fresh_first = fresh.extract(&AMBE_SILENCE);
+    assert_eq!(
+        after_reset, fresh_first,
+        "post-tone extraction must match a fresh instance (full state reset)"
+    );
+    Ok(())
+}
+
+/// Random frame sequences interleaved with concealment must keep the
+/// delta-coded gain/magnitude accumulators bounded — the classic MBE
+/// failure mode is state blowup over adversarial frame SEQUENCES,
+/// which the single-frame tests above cannot reach. Non-finite f32
+/// state surfaces directly in the extractor's parameter output.
+#[test]
+fn random_frame_sequences_keep_parameters_finite_and_synthesis_alive() {
+    proptest!(ProptestConfig::with_cases(64), |(
+        frames in proptest::collection::vec(proptest::array::uniform9(any::<u8>()), 1..20),
+        conceal_mask in proptest::collection::vec(any::<bool>(), 20),
+    )| {
+        let mut decoder = AmbeDecoder::new();
+        let mut extractor = mbelib_rs::AmbeParamExtractor::new();
+        for (frame, conceal) in frames.iter().zip(conceal_mask.iter()) {
+            let params = if *conceal {
+                let _pcm = decoder.conceal_frame();
+                extractor.conceal()
+            } else {
+                let _pcm = decoder.decode_frame(frame);
+                extractor.extract(frame)
+            };
+            prop_assert!(
+                params.f0_hz.is_finite(),
+                "f0 must stay finite over any frame sequence"
+            );
+            prop_assert!(
+                params.amplitudes.iter().all(|a| a.is_finite()),
+                "spectral amplitudes must stay finite over any frame sequence"
+            );
+        }
+    });
 }
 
 /// Sustained concealment crosses the repeat-count muting threshold

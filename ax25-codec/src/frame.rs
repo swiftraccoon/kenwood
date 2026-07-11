@@ -421,6 +421,84 @@ mod tests {
         assert_eq!(parse_ax25(&frame), Err(Ax25Error::TooManyDigipeaters));
     }
 
+    /// Absolute wire pin for the encoder, hand-derived from AX.25
+    /// v2.2 §3.12. Every other encode check in this crate round-trips
+    /// through our own parser, which MASKS the reserved SSID bits the
+    /// encoder writes (`(ssid_byte >> 1) & 0x0F`) — an encoder
+    /// emitting `0x00`-base SSID bytes would pass the entire suite
+    /// while producing frames other TNCs may reject. Layout per SSID
+    /// byte: C/H in bit 7, reserved `0b11` in bits 6-5, SSID in bits
+    /// 4-1, address-extension in bit 0 (last address only).
+    #[test]
+    fn build_matches_hand_derived_wire_bytes() -> TestResult {
+        let destination = Ax25Address::from_parts(
+            Callsign::new("APRS").map_err(|_| "dest callsign")?,
+            Ssid::new(0).map_err(|_| "dest ssid")?,
+        );
+        let source = Ax25Address::from_parts(
+            Callsign::new("N0CALL").map_err(|_| "src callsign")?,
+            Ssid::new(7).map_err(|_| "src ssid")?,
+        );
+        let digi = RouteEntry {
+            address: Ax25Address::from_parts(
+                Callsign::new("WIDE1").map_err(|_| "digi callsign")?,
+                Ssid::new(1).map_err(|_| "digi ssid")?,
+            ),
+            has_repeated: true,
+        };
+        let packet = Ax25Packet {
+            source,
+            destination,
+            digipeaters: vec![digi],
+            command_or_response: Some(CommandResponse::Command),
+            control: 0x03,
+            protocol: 0xF0,
+            info: b"hello".to_vec(),
+        };
+        let wire = build_ax25(&packet);
+        let expected: [u8; 28] = [
+            // "APRS  " shifted << 1; SSID byte 0xE0 = C-bit (command)
+            // | 0x60 reserved | ssid 0 | ext 0.
+            0x82, 0xA0, 0xA4, 0xA6, 0x40, 0x40, 0xE0,
+            // "N0CALL" shifted; SSID byte 0x6E = C-bit clear | 0x60
+            // | ssid 7 << 1 | ext 0.
+            0x9C, 0x60, 0x86, 0x82, 0x98, 0x98, 0x6E,
+            // "WIDE1 " shifted; SSID byte 0xE3 = H-bit (repeated)
+            // | 0x60 | ssid 1 << 1 | ext 1 (last address).
+            0xAE, 0x92, 0x88, 0x8A, 0x62, 0x40, 0xE3,
+            // UI control, no-layer-3 PID, payload verbatim.
+            0x03, 0xF0, b'h', b'e', b'l', b'l', b'o',
+        ];
+        assert_eq!(
+            wire.as_slice(),
+            expected.as_slice(),
+            "encoder wire bytes must match the §3.12 hand derivation"
+        );
+        Ok(())
+    }
+
+    /// Wire-level idempotence for canonical inputs:
+    /// `build(parse(bytes)) == bytes`. Decode tolerates lowercase
+    /// wire callsigns as NORMALIZATION (uppercasing on the way in),
+    /// so identity holds only for canonical frames — which is exactly
+    /// what this pins: the parser/encoder pair must not silently
+    /// rewrite any bit of an already-canonical frame.
+    #[test]
+    fn canonical_wire_bytes_survive_parse_then_build() -> TestResult {
+        let canonical: [u8; 28] = [
+            0x82, 0xA0, 0xA4, 0xA6, 0x40, 0x40, 0xE0, 0x9C, 0x60, 0x86, 0x82, 0x98, 0x98, 0x6E,
+            0xAE, 0x92, 0x88, 0x8A, 0x62, 0x40, 0xE3, 0x03, 0xF0, b'h', b'e', b'l', b'l', b'o',
+        ];
+        let packet = parse_ax25(&canonical).map_err(|_| "canonical frame must parse")?;
+        let rebuilt = build_ax25(&packet);
+        assert_eq!(
+            rebuilt.as_slice(),
+            canonical.as_slice(),
+            "parse→build must be the identity on canonical wire bytes"
+        );
+        Ok(())
+    }
+
     #[test]
     fn ax25_fcs_known_value() {
         assert_eq!(ax25_fcs(b"123456789"), 0x906E);

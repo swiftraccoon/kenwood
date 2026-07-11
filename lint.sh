@@ -368,9 +368,16 @@ run cargo fmt --all -- --check
 # `cargo-audit` / `cargo-deny` both honour the workspace `Cargo.lock`
 # at the repo root. `cargo-machete` spots unused `[dependencies]`
 # entries across every workspace crate when pointed at `.`.
+#
+# `--skip-target-dir` is required, not cosmetic: the trybuild compile-fail
+# suites generate scratch crates under `target/` whose manifests list every
+# dev-dependency and use almost none of them. Machete's directory walk only
+# skips them by way of `.gitignore`, which it honours ONLY inside a git
+# checkout — so without this flag the check passes here and fails anywhere
+# the tree is built without `.git` (the CI pods, which receive a tarball).
 run cargo audit --file Cargo.lock
 run cargo deny check
-run cargo machete .
+run cargo machete --skip-target-dir .
 
 # Static-analyze the lint gate scripts themselves. Both files contain
 # trap handlers, kubectl heredocs, and pipefail-sensitive pipelines;

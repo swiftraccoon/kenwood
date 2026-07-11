@@ -14,11 +14,15 @@
 //!
 //! These tests exist on two tiers:
 //!
-//! 1. **Capture-integrity tests** (always run with this feature):
-//!    parse the fixture .ambe files, verify each is a multiple of 9
-//!    bytes (no header), verify the steady-state lock at the four
-//!    pitch anchors holds at the documented quality, verify the
-//!    volatile/stable bit partition.
+//! 1. **Capture-integrity tests** (`#[ignore]`'d): parse the fixture
+//!    .ambe files, verify each is a multiple of 9 bytes (no header),
+//!    verify the steady-state lock at the four pitch anchors holds at
+//!    the documented quality, verify the volatile/stable bit
+//!    partition. Ignored because the existing captures predate the
+//!    wire bit-order fix (they were recorded through a since-fixed
+//!    MMDVM slicing bug, so the pinned baselines are stale) and the
+//!    .ambe fixtures are not committed. Recapture from hardware, then
+//!    run these with `--ignored` to re-verify.
 //!
 //! 2. **Encoder-vs-anchor tests** (`#[ignore]`'d until the encoder is
 //!    Kenwood-perfect): synthesize a sinusoidal PCM stream at the
@@ -109,6 +113,7 @@ fn dominant_in_second_half(frames: &[[u8; FRAME_LEN]]) -> Option<([u8; FRAME_LEN
 // ─── capture-integrity tests (always enabled with feature) ──────────
 
 #[test]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
 fn captures_have_no_header_and_divide_by_nine() -> TestResult {
     // Each capture is a raw AMBE byte stream — no header, frames
     // begin at byte 0. File sizes divide evenly by 9 (one frame).
@@ -137,6 +142,7 @@ fn captures_have_no_header_and_divide_by_nine() -> TestResult {
 }
 
 #[test]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
 fn empty_capture_for_too_short_keying() -> TestResult {
     // capture_6 was an intentional very-brief key-up; the encoder
     // didn't get to flush any frames. Documents the firmware behaviour.
@@ -150,6 +156,7 @@ fn empty_capture_for_too_short_keying() -> TestResult {
 }
 
 #[test]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
 fn frame_stride_is_nine_bytes() -> TestResult {
     // The 440 Hz capture is the strongest demonstration: 107/196
     // frames are byte-identical when sliced at stride 9.
@@ -171,6 +178,7 @@ fn frame_stride_is_nine_bytes() -> TestResult {
 }
 
 #[test]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
 fn pitch_anchors_match_capture_steady_state() -> TestResult {
     // For each anchor, the corresponding capture's 2nd-half-dominant
     // masked frame must match the codified anchor.frame, at no less
@@ -201,6 +209,7 @@ fn pitch_anchors_match_capture_steady_state() -> TestResult {
 }
 
 #[test]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
 fn unsupported_pitches_do_not_lock() -> TestResult {
     // 100 Hz and 320 Hz captures exist but didn't lock — phone-speaker
     // limitations, not codec behaviour. Document this explicitly so
@@ -218,6 +227,7 @@ fn unsupported_pitches_do_not_lock() -> TestResult {
 }
 
 #[test]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
 fn mic_covered_captures_show_no_silence_anchor() -> TestResult {
     // Both mic-covered captures still produce 100% unique frames in
     // the 2nd half. Documents that this radio has no quiescent silence
@@ -234,6 +244,7 @@ fn mic_covered_captures_show_no_silence_anchor() -> TestResult {
 }
 
 #[test]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
 fn volatile_bits_are_actually_volatile_in_440hz_capture() -> TestResult {
     // For each bit position in VOLATILE_BIT_MASK, at least 5% of 440
     // Hz frames must show that bit differing from the dominant — that's
@@ -269,6 +280,7 @@ fn volatile_bits_are_actually_volatile_in_440hz_capture() -> TestResult {
 }
 
 #[test]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
 fn stable_bits_are_actually_stable_in_440hz_capture() -> TestResult {
     // For each bit in STABLE_BIT_MASK, < 5% of 440 Hz frames may differ
     // from the dominant masked frame. Confirms our partition is correct.
@@ -997,7 +1009,7 @@ fn rust_encoder_distance_baseline() {
 // AMBE 49-data-bit codeword layout per OP25/mbelib `pack_frame`:
 //   pre-interleave bits  0..22 : Golay(23,12) #0 (data 0..11, parity 12..22)
 //   pre-interleave bits 23..46 : Golay(23,12) #1 (data 23..34, parity 35..46)
-//   pre-interleave bits 47..71 : Hamming(15,11) + unprotected b3-b8 spectral
+//   pre-interleave bits 47..71 : unprotected b3-b8 spectral (C2+C3, no FEC in this mode)
 const fn field_of(pre: u8) -> &'static str {
     match pre {
         0..=11 => "G0_data",

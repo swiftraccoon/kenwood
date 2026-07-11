@@ -24,7 +24,7 @@ use dstar_gateway_core::types::ProtocolKind;
 
 use crate::reflector::authorizer::ClientAuthorizer;
 use crate::reflector::config::ReflectorConfig;
-use crate::tokio_shell::endpoint::{ProtocolEndpoint, ShellError};
+use crate::tokio_shell::endpoint::{EndpointSettings, ProtocolEndpoint, ShellError};
 use crate::tokio_shell::transcode::CrossProtocolEvent;
 
 /// Capacity of the cross-protocol voice broadcast channel.
@@ -115,9 +115,9 @@ impl Reflector {
     /// Construct a reflector with a pre-bound `DExtra` socket.
     ///
     /// Used by integration tests that need to know the bound port
-    /// before the reflector starts serving. The caller is responsible
-    /// for binding the socket to the same address as
-    /// [`ReflectorConfig::bind`].
+    /// before the reflector starts serving. A pre-bound socket is
+    /// used as-is — it bypasses the per-protocol address resolution
+    /// in [`ReflectorConfig::bind_addr_for`] entirely.
     pub fn new_with_socket<A: ClientAuthorizer + 'static>(
         config: ReflectorConfig,
         authorizer: A,
@@ -130,7 +130,8 @@ impl Reflector {
     /// protocol.
     ///
     /// Any `None` socket is bound lazily inside [`Self::run`] against
-    /// the address in [`ReflectorConfig::bind`]. Pass `Some` only for
+    /// the protocol's resolved address
+    /// ([`ReflectorConfig::bind_addr_for`]). Pass `Some` only for
     /// the protocols whose port must be known before `run` is called
     /// (typically multi-protocol integration tests).
     pub fn new_with_sockets<A: ClientAuthorizer + 'static>(
@@ -174,32 +175,39 @@ impl Reflector {
         } else {
             None
         };
+        // Every endpoint inherits the reflector's configured
+        // shell-level knobs (rate limit, client caps, keepalive and
+        // inactivity windows).
+        let settings = EndpointSettings::from(&config);
         let dextra = if config.is_enabled(ProtocolKind::DExtra) {
-            Some(Arc::new(ProtocolEndpoint::<DExtra>::new_with_voice_bus(
+            Some(Arc::new(ProtocolEndpoint::<DExtra>::new_with_settings(
                 ProtocolKind::DExtra,
                 default_module,
                 Arc::clone(&authorizer_arc),
                 voice_bus.clone(),
+                settings.clone(),
             )))
         } else {
             None
         };
         let dplus = if config.is_enabled(ProtocolKind::DPlus) {
-            Some(Arc::new(ProtocolEndpoint::<DPlus>::new_with_voice_bus(
+            Some(Arc::new(ProtocolEndpoint::<DPlus>::new_with_settings(
                 ProtocolKind::DPlus,
                 default_module,
                 Arc::clone(&authorizer_arc),
                 voice_bus.clone(),
+                settings.clone(),
             )))
         } else {
             None
         };
         let dcs = if config.is_enabled(ProtocolKind::Dcs) {
-            Some(Arc::new(ProtocolEndpoint::<Dcs>::new_with_voice_bus(
+            Some(Arc::new(ProtocolEndpoint::<Dcs>::new_with_settings(
                 ProtocolKind::Dcs,
                 default_module,
                 Arc::clone(&authorizer_arc),
                 voice_bus.clone(),
+                settings,
             )))
         } else {
             None
@@ -269,10 +277,17 @@ impl Reflector {
     pub async fn run(&self) -> Result<(), ShellError> {
         let mut tasks: JoinSet<Result<(), ShellError>> = JoinSet::new();
 
+        // Each protocol binds its own resolved address (explicit
+        // override → ephemeral → verbatim single-protocol → standard
+        // port; see `ReflectorConfig::bind_addr_for`) so the
+        // library-default config with all three protocols enabled
+        // can start on a fixed base port without `AddrInUse`.
         if let Some(endpoint) = self.dextra.as_ref() {
             let socket = match self.dextra_socket.clone() {
                 Some(s) => s,
-                None => Arc::new(UdpSocket::bind(self.config.bind).await?),
+                None => Arc::new(
+                    UdpSocket::bind(self.config.bind_addr_for(ProtocolKind::DExtra)).await?,
+                ),
             };
             let shutdown = self.shutdown_rx.clone();
             let endpoint = Arc::clone(endpoint);
@@ -282,7 +297,9 @@ impl Reflector {
         if let Some(endpoint) = self.dplus.as_ref() {
             let socket = match self.dplus_socket.clone() {
                 Some(s) => s,
-                None => Arc::new(UdpSocket::bind(self.config.bind).await?),
+                None => {
+                    Arc::new(UdpSocket::bind(self.config.bind_addr_for(ProtocolKind::DPlus)).await?)
+                }
             };
             let shutdown = self.shutdown_rx.clone();
             let endpoint = Arc::clone(endpoint);
@@ -292,7 +309,9 @@ impl Reflector {
         if let Some(endpoint) = self.dcs.as_ref() {
             let socket = match self.dcs_socket.clone() {
                 Some(s) => s,
-                None => Arc::new(UdpSocket::bind(self.config.bind).await?),
+                None => {
+                    Arc::new(UdpSocket::bind(self.config.bind_addr_for(ProtocolKind::Dcs)).await?)
+                }
             };
             let shutdown = self.shutdown_rx.clone();
             let endpoint = Arc::clone(endpoint);
@@ -382,6 +401,49 @@ mod tests {
         assert!(
             bus.is_some(),
             "cross_protocol_forwarding = true => voice bus present"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_protocol_run_binds_per_protocol_never_the_shared_config_bind() -> TestResult {
+        // Regression trap for `run()` binding `config.bind` once per
+        // enabled protocol (the old behavior, which aborted with
+        // AddrInUse on any fixed port). The explicit per-protocol
+        // overrides resolve to three ephemeral ports, so correct code
+        // never touches the fixed `bind` port at all, while regressed
+        // code binds it three times and fails with AddrInUse
+        // regardless of that port's availability. This deliberately
+        // avoids binding the standard 30001/20001/30051 ports (rule 4
+        // is covered port-free by the `bind_addr_for` unit tests in
+        // config.rs) — squatting them live would collide with a
+        // running polaris or an overlapping test suite.
+        let ephemeral = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let cfg = ReflectorConfig::builder()
+            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .module_set(module_set(&[Module::C]))
+            .bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45123))
+            .protocol_bind(ProtocolKind::DExtra, ephemeral)
+            .protocol_bind(ProtocolKind::DPlus, ephemeral)
+            .protocol_bind(ProtocolKind::Dcs, ephemeral)
+            .build()?;
+        assert_eq!(
+            cfg.enabled_protocols.len(),
+            3,
+            "library default enables all three protocols"
+        );
+        let reflector = Arc::new(Reflector::new(cfg, AllowAllAuthorizer));
+        let r2 = Arc::clone(&reflector);
+        let run_task = tokio::spawn(async move { r2.run().await });
+        // Give all three endpoint tasks a moment to bind and start;
+        // a bind conflict surfaces as an early Err from `run`.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        reflector.shutdown();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), run_task).await??;
+        assert!(
+            result.is_ok(),
+            "all three endpoints must start; AddrInUse means run() reverted \
+             to binding config.bind once per protocol: {result:?}"
         );
         Ok(())
     }

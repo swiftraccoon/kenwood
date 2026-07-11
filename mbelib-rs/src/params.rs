@@ -132,7 +132,7 @@ pub(crate) struct MbeParams {
     ///
     /// Used to gate adaptive smoothing entry (>1.25%) and frame muting
     /// (>9.6% for AMBE, >8.75% for IMBE). Updated by the AMBE decoder's
-    /// Golay/Hamming syndrome counts.
+    /// Golay syndrome counts.
     pub(crate) error_rate: f32,
 
     /// Total bit errors detected by FEC across all four codewords.

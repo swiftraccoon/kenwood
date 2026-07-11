@@ -9,8 +9,8 @@
 //! **interleaved** across the four FEC codewords (C0, C1, C2, C3) so
 //! that burst errors (consecutive corrupted bits) are spread across
 //! multiple codewords rather than concentrating in one. This allows the
-//! per-codeword FEC (Golay, Hamming) to correct errors that would
-//! otherwise exceed its capacity on a single codeword.
+//! Golay FEC on C0 and C1 to correct errors that would otherwise
+//! exceed its capacity on a single codeword.
 //!
 //! After unpacking and C0 error correction, the C1 codeword must be
 //! **demodulated** by XOR-ing with a pseudo-random sequence (LFSR)
@@ -67,9 +67,9 @@ const C1_OFFSET: usize = 24;
 /// D-STAR bit interleave table: input bit index to flat `ambe_fr` index.
 ///
 /// Derived from the DSD `dW[72]` and `dX[72]` tables (`dstar_const.h`).
-/// For each input bit `i` (0..72, MSB-first from the 9-byte frame),
-/// `INTERLEAVE[i]` gives the flat `ambe_fr` index where that bit
-/// belongs.
+/// For each input bit `i` (0..72, LSB-first from the 9-byte frame —
+/// bit `i % 8` of byte `i / 8`), `INTERLEAVE[i]` gives the flat
+/// `ambe_fr` index where that bit belongs.
 ///
 /// The DSD tables use `ambe_fr[dW[i]][dX[i]]` with a `char[4][24]`
 /// layout. We convert to flat indices using the codeword offsets:

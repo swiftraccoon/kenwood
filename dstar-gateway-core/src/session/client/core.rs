@@ -1917,6 +1917,123 @@ mod tests {
         }
     }
 
+    // ── Junk datagrams must not kill a live session ───────────
+
+    /// REF030 emits a 10-byte packet after every voice EOT, and real
+    /// reflectors send assorted unrecognized traffic (status
+    /// heartbeats, legacy framing). A decode error on any of it must
+    /// be SWALLOWED: propagating it through `?` is what killed the
+    /// tokio shell's run loop in production. The fix lives in the
+    /// three `handle_*_input` arms, but nothing fed junk to a
+    /// CONNECTED session — so a refactor could restore the `?` and no
+    /// test would notice.
+    ///
+    /// The session must survive and stay functional: after the junk,
+    /// a real voice header still produces a `VoiceStart`.
+    ///
+    /// Note the codecs dispatch on datagram LENGTH, so a payload that
+    /// is junk to one protocol can be a valid packet in another (a
+    /// 3-byte datagram is a `DPlus` poll). Events the probes
+    /// legitimately produce are drained before the voice assertion —
+    /// what is under test is that the session survives and keeps
+    /// working, not that every probe is rejected.
+    #[test]
+    fn dextra_junk_datagram_does_not_kill_a_connected_session() -> TestResult {
+        let (mut core, t0) = connected_dextra()?;
+
+        // The REF030 shape (10 bytes) plus a couple of other
+        // unknown-length datagrams.
+        for junk in [&[0u8; 10][..], &[0xFF; 3][..], &[0x42; 37][..]] {
+            let result = core.handle_input(t0, ADDR_DEXTRA, junk);
+            assert!(
+                result.is_ok(),
+                "junk datagram must be swallowed, not propagated: {result:?}"
+            );
+            assert_eq!(
+                core.state_kind(),
+                ClientStateKind::Connected,
+                "junk datagram must not tear down the session"
+            );
+        }
+        while core.pop_event::<DExtra>().is_some() {}
+
+        // The session still processes real traffic.
+        let mut hdr = [0u8; 64];
+        let n = dextra_codec::encode_voice_header(&mut hdr, sid(0x1234), &test_header())?;
+        core.handle_input(t0, ADDR_DEXTRA, hdr.get(..n).ok_or("n > buf")?)?;
+        let event = core.pop_event::<DExtra>().ok_or("no event after junk")?;
+        assert!(
+            matches!(event, Event::VoiceStart { .. }),
+            "voice must still flow after junk datagrams: {event:?}"
+        );
+        Ok(())
+    }
+
+    /// `DPlus` sibling of
+    /// [`dextra_junk_datagram_does_not_kill_a_connected_session`].
+    #[test]
+    fn dplus_junk_datagram_does_not_kill_a_connected_session() -> TestResult {
+        let (mut core, t0) = connected_dplus()?;
+        for junk in [&[0u8; 10][..], &[0xFF; 3][..], &[0x42; 37][..]] {
+            let result = core.handle_input(t0, ADDR_DPLUS, junk);
+            assert!(
+                result.is_ok(),
+                "junk datagram must be swallowed, not propagated: {result:?}"
+            );
+            assert_eq!(
+                core.state_kind(),
+                ClientStateKind::Connected,
+                "junk datagram must not tear down the session"
+            );
+        }
+        while core.pop_event::<DPlus>().is_some() {}
+        let mut hdr = [0u8; 64];
+        let n = dplus_codec::encode_voice_header(&mut hdr, sid(0x1234), &test_header())?;
+        core.handle_input(t0, ADDR_DPLUS, hdr.get(..n).ok_or("n > buf")?)?;
+        let event = core.pop_event::<DPlus>().ok_or("no event after junk")?;
+        assert!(
+            matches!(event, Event::VoiceStart { .. }),
+            "voice must still flow after junk datagrams: {event:?}"
+        );
+        Ok(())
+    }
+
+    /// `DCS` sibling of
+    /// [`dextra_junk_datagram_does_not_kill_a_connected_session`].
+    #[test]
+    fn dcs_junk_datagram_does_not_kill_a_connected_session() -> TestResult {
+        let (mut core, t0) = connected_dcs()?;
+        for junk in [&[0u8; 10][..], &[0xFF; 3][..], &[0x42; 37][..]] {
+            let result = core.handle_input(t0, ADDR_DCS, junk);
+            assert!(
+                result.is_ok(),
+                "junk datagram must be swallowed, not propagated: {result:?}"
+            );
+            assert_eq!(
+                core.state_kind(),
+                ClientStateKind::Connected,
+                "junk datagram must not tear down the session"
+            );
+        }
+        while core.pop_event::<Dcs>().is_some() {}
+        let mut voice = [0u8; 128];
+        let n = dcs_codec::encode_voice(
+            &mut voice,
+            &test_header(),
+            sid(0x1234),
+            0,
+            &VoiceFrame::silence(),
+            false,
+        )?;
+        core.handle_input(t0, ADDR_DCS, voice.get(..n).ok_or("n > buf")?)?;
+        let event = core.pop_event::<Dcs>().ok_or("no event after junk")?;
+        assert!(
+            matches!(event, Event::VoiceStart { .. }),
+            "voice must still flow after junk datagrams: {event:?}"
+        );
+        Ok(())
+    }
+
     // ── Voice TX: header sizes ────────────────────────────────
 
     #[test]

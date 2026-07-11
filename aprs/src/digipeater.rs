@@ -194,8 +194,10 @@ impl DigipeaterConfig {
 pub enum DigiAction {
     /// Do not relay this packet (no alias matched).
     Drop,
-    /// The packet was not a UI frame (control != 0x03 or PID != 0xF0).
-    /// APRS uses only UI frames, so this is effectively a pass-through.
+    /// The packet was not a UI frame (the control byte does not
+    /// classify as Unnumbered Information — P/F bit permitted, so both
+    /// `0x03` and `0x13` are UI — or PID != 0xF0). APRS uses only UI
+    /// frames, so this is effectively a pass-through.
     NotUiFrame,
     /// Loop detected — our own callsign is already in the used path.
     LoopDetected,
@@ -217,7 +219,10 @@ impl DigipeaterConfig {
     /// Process an incoming AX.25 UI frame through digipeater logic.
     ///
     /// Performs, in order:
-    /// 1. UI frame sanity (`control=0x03`, `PID=0xF0`).
+    /// 1. UI frame sanity: the control byte must classify as
+    ///    Unnumbered Information via [`Ax25Packet::is_ui`] (which
+    ///    accepts the P/F bit, so `0x13` counts as UI alongside the
+    ///    plain `0x03`) and the PID must be `0xF0`.
     /// 2. Own-callsign loop detection — if our callsign appears anywhere
     ///    in the digipeater path with the H-bit set, the packet has already
     ///    been through us and we must drop it to prevent routing loops.
@@ -235,7 +240,10 @@ impl DigipeaterConfig {
     /// Returns [`DigiAction::Drop`] if any check fails or no alias matches.
     pub fn process(&mut self, packet: &Ax25Packet, now: Instant) -> DigiAction {
         // --- 1. UI frame check ---
-        if packet.control != 0x03 || packet.protocol != 0xF0 {
+        // Typed classification instead of a raw `!= 0x03` compare: UI
+        // frames may legally carry the P/F bit (control 0x13), and
+        // `is_ui()` masks it off before matching.
+        if !packet.is_ui() || packet.protocol != 0xF0 {
             return DigiAction::NotUiFrame;
         }
 
@@ -1038,6 +1046,43 @@ mod tests {
         let t0 = Instant::now();
 
         assert_eq!(config.process(&packet, t0), DigiAction::NotUiFrame);
+    }
+
+    #[test]
+    fn ui_frame_with_pf_bit_is_relayed() -> TestResult {
+        // AX.25 UI frames may carry the P/F bit: control 0x13 is UI
+        // exactly like 0x03 (`Ax25Control::from_byte` masks the P/F
+        // bit before classifying). Real RF traffic includes 0x13 UI
+        // frames; they must relay identically, not bounce as
+        // NotUiFrame.
+        let t0 = Instant::now();
+
+        let mut plain_config = make_config();
+        let plain = make_packet(vec![make_digi("WIDE1", 1)]);
+        let plain_action = plain_config.process(&plain, t0);
+
+        let mut pf_config = make_config();
+        let mut pf = make_packet(vec![make_digi("WIDE1", 1)]);
+        pf.control = 0x13; // UI with the P/F bit set.
+        let pf_action = pf_config.process(&pf, t0);
+
+        let DigiAction::Relay {
+            modified_packet: plain_relay,
+        } = plain_action
+        else {
+            return Err(format!("expected Relay for control 0x03, got {plain_action:?}").into());
+        };
+        let DigiAction::Relay {
+            modified_packet: pf_relay,
+        } = pf_action
+        else {
+            return Err(format!("expected Relay for control 0x13, got {pf_action:?}").into());
+        };
+        // Identical path modification; the frame keeps its own control
+        // byte on retransmission.
+        assert_eq!(pf_relay.digipeaters, plain_relay.digipeaters);
+        assert_eq!(pf_relay.control, 0x13);
+        Ok(())
     }
 
     #[test]

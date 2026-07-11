@@ -136,6 +136,148 @@ pub enum UnnumberedKind {
     Other(u8),
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{Ax25Control, SupervisoryKind, UnnumberedKind};
+
+    /// Golden decode table for every U-frame kind per AX.25 v2.2
+    /// §4.3.3, with the P/F bit both ways. The kind bytes live in a
+    /// hand-maintained match: a DISC/UA transposition (0x43 ↔ 0x63,
+    /// visually adjacent) would pass the packet round-trip suite —
+    /// `Ax25Packet` keeps the control byte raw and nothing else
+    /// inspects the typed decode.
+    #[test]
+    fn unnumbered_kind_table_matches_spec() {
+        let cases: [(u8, UnnumberedKind); 8] = [
+            (0x03, UnnumberedKind::UnnumberedInformation),
+            (0x2F, UnnumberedKind::SetAsyncBalancedMode),
+            (0x43, UnnumberedKind::Disconnect),
+            (0x0F, UnnumberedKind::DisconnectedMode),
+            (0x63, UnnumberedKind::UnnumberedAcknowledge),
+            (0x87, UnnumberedKind::FrameReject),
+            (0xAF, UnnumberedKind::ExchangeIdentification),
+            (0xE3, UnnumberedKind::Test),
+        ];
+        for (base, want) in cases {
+            for pf_bit in [0x00u8, 0x10] {
+                let byte = base | pf_bit;
+                assert_eq!(
+                    Ax25Control::from_byte(byte),
+                    Ax25Control::Unnumbered {
+                        kind: want,
+                        pf: pf_bit != 0,
+                    },
+                    "U-frame control byte {byte:#04x}"
+                );
+            }
+        }
+    }
+
+    /// Golden decode table for the four S-frame kinds per §4.3.2,
+    /// across representative N(R) values and both P/F states.
+    #[test]
+    fn supervisory_kind_table_matches_spec() {
+        let cases: [(u8, SupervisoryKind); 4] = [
+            (0x01, SupervisoryKind::ReceiveReady),
+            (0x05, SupervisoryKind::ReceiveNotReady),
+            (0x09, SupervisoryKind::Reject),
+            (0x0D, SupervisoryKind::SelectiveReject),
+        ];
+        for (base, want) in cases {
+            for nr in [0u8, 5, 7] {
+                for pf_bit in [0x00u8, 0x10] {
+                    let byte = base | (nr << 5) | pf_bit;
+                    assert_eq!(
+                        Ax25Control::from_byte(byte),
+                        Ax25Control::Supervisory {
+                            kind: want,
+                            nr,
+                            pf: pf_bit != 0,
+                        },
+                        "S-frame control byte {byte:#04x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// I-frame N(S)/N(R)/P-F extraction per §4.3.1: N(S) in bits 1-3,
+    /// P/F in bit 4, N(R) in bits 5-7.
+    #[test]
+    fn information_fields_extract_per_spec() {
+        let cases: [(u8, u8, bool); 4] = [
+            (0, 0, false), // byte 0x00
+            (3, 6, true),  // byte 0xD6
+            (7, 7, true),  // byte 0xFE
+            (1, 4, false), // byte 0x82
+        ];
+        for (ns, nr, pf) in cases {
+            let byte = (ns << 1) | (nr << 5) | if pf { 0x10 } else { 0x00 };
+            assert_eq!(
+                Ax25Control::from_byte(byte),
+                Ax25Control::Information { ns, nr, pf },
+                "I-frame control byte {byte:#04x}"
+            );
+        }
+    }
+
+    /// UI classification must mask the P/F bit: 0x13 is UI exactly
+    /// like 0x03 (real RF traffic carries both), while an I-frame
+    /// byte is never UI.
+    #[test]
+    fn is_ui_masks_the_pf_bit() {
+        assert!(Ax25Control::from_byte(0x03).is_ui(), "0x03 is plain UI");
+        assert!(Ax25Control::from_byte(0x13).is_ui(), "0x13 is UI with P/F");
+        assert!(
+            !Ax25Control::from_byte(0x00).is_ui(),
+            "0x00 is an I frame, not UI"
+        );
+        assert!(
+            !Ax25Control::from_byte(0x01).is_ui(),
+            "0x01 is an S frame, not UI"
+        );
+    }
+
+    /// SABME (0x6F) deliberately stays unclassified: modulo-128
+    /// extended mode is out of this crate's scope, so the byte must
+    /// fall through to `Other` rather than gain a variant by
+    /// accident.
+    #[test]
+    fn sabme_stays_unclassified_other() {
+        assert_eq!(
+            Ax25Control::from_byte(0x6F),
+            Ax25Control::Unnumbered {
+                kind: UnnumberedKind::Other(0x6F),
+                pf: false,
+            },
+            "SABME must remain Other while modulo-128 is out of scope"
+        );
+    }
+
+    /// Exhaustive family classification over the full byte space:
+    /// bit 0 = 0 → I, bits 1..0 = 01 → S, bits 1..0 = 11 → U.
+    #[test]
+    fn every_byte_classifies_into_the_spec_family() {
+        for b in 0..=255u8 {
+            let parsed = Ax25Control::from_byte(b);
+            match (b & 0x01, b & 0x03) {
+                (0, _) => assert!(
+                    matches!(parsed, Ax25Control::Information { .. }),
+                    "byte {b:#04x} must classify as I"
+                ),
+                (_, 0x01) => assert!(
+                    matches!(parsed, Ax25Control::Supervisory { .. }),
+                    "byte {b:#04x} must classify as S"
+                ),
+                _ => assert!(
+                    matches!(parsed, Ax25Control::Unnumbered { .. }),
+                    "byte {b:#04x} must classify as U"
+                ),
+            }
+        }
+    }
+}
+
 /// Command/Response classification of an AX.25 frame.
 ///
 /// Per AX.25 v2.2 §6.1.2, the C-bit on the destination SSID byte and

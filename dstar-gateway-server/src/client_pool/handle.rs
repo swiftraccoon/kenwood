@@ -97,6 +97,31 @@ impl TokenBucket {
         }
     }
 
+    /// Construct a bucket sized for a frames-per-second rate limit.
+    ///
+    /// The burst capacity is one second of traffic at `rate_per_sec`
+    /// (clamped to at least one token so any positive rate can send
+    /// at least one frame), matching the relationship between
+    /// [`DEFAULT_TX_BUDGET_MAX_TOKENS`] and
+    /// [`DEFAULT_TX_BUDGET_REFILL_PER_SEC`]. Used by the reflector
+    /// endpoint to apply
+    /// [`ReflectorConfig::tx_rate_limit_frames_per_sec`] to each new
+    /// client handle. A negative `rate_per_sec` is clamped to zero
+    /// refill (the bucket empties and stays empty) — it must never
+    /// drain below zero over elapsed time.
+    ///
+    /// [`ReflectorConfig::tx_rate_limit_frames_per_sec`]: crate::ReflectorConfig::tx_rate_limit_frames_per_sec
+    #[must_use]
+    pub const fn from_rate(rate_per_sec: f64, now: Instant) -> Self {
+        let max_tokens = rate_per_sec.max(1.0);
+        Self {
+            tokens: max_tokens,
+            max_tokens,
+            refill_rate_per_sec: rate_per_sec.max(0.0),
+            last_refill: now,
+        }
+    }
+
     /// Current (refill-approximated) token count, for tests/metrics.
     #[must_use]
     pub const fn tokens(&self) -> f64 {
@@ -161,6 +186,33 @@ impl<P: Protocol> ClientHandle<P> {
         )
     }
 
+    /// Construct a new handle whose TX budget is derived from a
+    /// frames-per-second rate limit.
+    ///
+    /// The bucket is built via [`TokenBucket::from_rate`] — refill
+    /// runs at `rate_per_sec` and the burst capacity is one second
+    /// of traffic at that rate. This is how the reflector endpoint
+    /// applies the configured
+    /// `ReflectorConfig::tx_rate_limit_frames_per_sec` to every new
+    /// client.
+    #[must_use]
+    pub fn new_with_tx_rate(
+        session: ServerSessionCore,
+        access: AccessPolicy,
+        now: Instant,
+        rate_per_sec: f64,
+    ) -> Self {
+        Self {
+            session,
+            module: None,
+            last_heard: now,
+            access,
+            send_failure_count: 0,
+            tx_budget: TokenBucket::from_rate(rate_per_sec, now),
+            _protocol: PhantomData,
+        }
+    }
+
     /// Construct a new handle with a caller-specified TX budget.
     ///
     /// Primarily used by tests that need to drive the rate limiter
@@ -197,6 +249,27 @@ mod tests {
         let bucket = TokenBucket::new(5, 1.0, now);
         assert!((bucket.tokens() - 5.0).abs() < 1e-9);
         assert!((bucket.max_tokens() - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn from_rate_negative_rate_does_not_drain() {
+        let t0 = Instant::now();
+        let mut bucket = TokenBucket::from_rate(-5.0, t0);
+        // Capacity is clamped, so the initial burst still allows one frame.
+        assert!(
+            bucket.try_consume(t0, 1),
+            "clamped bucket allows its initial burst"
+        );
+        // A negative configured rate must clamp to zero refill: the
+        // bucket empties and stays empty — it must not drain further
+        // negative as time elapses.
+        let later = t0 + Duration::from_secs(60);
+        assert!(!bucket.try_consume(later, 1), "no refill at zero rate");
+        assert!(
+            bucket.tokens() >= 0.0,
+            "a negative rate must not drain the bucket below zero: {}",
+            bucket.tokens()
+        );
     }
 
     #[test]

@@ -2,17 +2,21 @@
 //!
 //! Catches regressions in parser strictness. The real pcap corpus
 //! lives in an external git submodule (see
-//! `tests/conformance/corpus/README.md`). When the corpus directory is
-//! empty or missing, each replay test is a no-op — this lets the test
-//! suite stay green in CI without the corpus checked out.
+//! `tests/conformance/corpus/README.md`). The corpus is not
+//! committed, so the replay tests are `#[ignore]`d — check out the
+//! corpus and run them explicitly with `--ignored`.
 //!
 //! # Packet framing
 //!
 //! Each file in the corpus is a libpcap-format `.pcap` capture. The
 //! replay walks every packet, strips the link-layer / IP / UDP
 //! headers, and hands the UDP payload to the matching protocol's
-//! lenient decoder. The decoder is allowed to fail — malformed
-//! packets are expected — what matters is that it doesn't panic.
+//! lenient decoders. A capture holds packets in both directions, so
+//! each payload is tried against both decoders. Individual rejects
+//! are expected — reflectors emit unrecognized packet lengths as a
+//! matter of course — but every capture file must contain at least
+//! one payload the protocol accepts, and nothing may panic. Accept
+//! and reject counts are printed per file for manual inspection.
 //!
 //! Supported link layers:
 //!
@@ -46,9 +50,14 @@ use trybuild as _;
 const PCAP_BUFFER_BYTES: usize = 65_536;
 
 /// Walk every `.pcap` file under `dir` and hand each captured UDP
-/// payload to `decoder`. Missing directories are silently skipped so
-/// CI without the corpus stays green.
-fn replay_dir(dir: &Path, mut decoder: impl FnMut(&[u8], &mut VecSink)) {
+/// payload to `decoder`, which reports whether the payload was
+/// accepted by at least one direction's decoder. Asserts that every
+/// pcap file contains at least one accepted payload — a file where
+/// both decoders reject everything means parser strictness regressed
+/// (or the capture is mislabeled). Missing directories are skipped
+/// with a note so an `--ignored` run without the corpus reports what
+/// it skipped instead of failing.
+fn replay_dir(dir: &Path, mut decoder: impl FnMut(&[u8], &mut VecSink) -> bool) {
     if !dir.exists() {
         eprintln!(
             "conformance corpus not present at {}; skipping",
@@ -70,12 +79,29 @@ fn replay_dir(dir: &Path, mut decoder: impl FnMut(&[u8], &mut VecSink)) {
             continue;
         }
         let mut sink = VecSink::default();
-        let count = replay_pcap_file(&path, |bytes| decoder(bytes, &mut sink));
+        let mut accepted: usize = 0;
+        let mut rejected: usize = 0;
+        let count = replay_pcap_file(&path, |bytes| {
+            if decoder(bytes, &mut sink) {
+                accepted = accepted.saturating_add(1);
+            } else {
+                rejected = rejected.saturating_add(1);
+            }
+        });
         eprintln!(
-            "replayed {} packets from {} ({} diagnostics)",
+            "replayed {} packets from {} ({} accepted, {} rejected, {} diagnostics)",
             count,
             path.display(),
+            accepted,
+            rejected,
             sink.len()
+        );
+        assert!(
+            accepted > 0,
+            "no UDP payload in {} decoded in either direction ({count} payloads, \
+             {rejected} rejected) — parser strictness regressed or the capture is \
+             mislabeled",
+            path.display()
         );
     }
 }
@@ -176,35 +202,39 @@ fn strip_to_udp_payload(frame: &[u8]) -> Option<&[u8]> {
 }
 
 #[test]
+#[ignore = "requires the pcap corpus under tests/conformance/corpus/dplus (not committed); see tests/conformance/corpus/README.md"]
 fn replay_dplus_corpus() {
     replay_dir(
         Path::new("tests/conformance/corpus/dplus"),
         |bytes, sink| {
             // A captured pcap may contain packets in either direction,
-            // so try both decoders. Both are lenient — a wrong-direction
-            // packet returns `Err`, which we drop.
-            let _ = dplus::decode_server_to_client(bytes, sink);
-            let _ = dplus::decode_client_to_server(bytes, sink);
+            // so try both decoders. A payload counts as accepted when
+            // either direction parses it; rejects surface in the
+            // per-file counts asserted by `replay_dir`.
+            dplus::decode_server_to_client(bytes, sink).is_ok()
+                || dplus::decode_client_to_server(bytes, sink).is_ok()
         },
     );
 }
 
 #[test]
+#[ignore = "requires the pcap corpus under tests/conformance/corpus/dextra (not committed); see tests/conformance/corpus/README.md"]
 fn replay_dextra_corpus() {
     replay_dir(
         Path::new("tests/conformance/corpus/dextra"),
         |bytes, sink| {
-            let _ = dextra::decode_server_to_client(bytes, sink);
-            let _ = dextra::decode_client_to_server(bytes, sink);
+            dextra::decode_server_to_client(bytes, sink).is_ok()
+                || dextra::decode_client_to_server(bytes, sink).is_ok()
         },
     );
 }
 
 #[test]
+#[ignore = "requires the pcap corpus under tests/conformance/corpus/dcs (not committed); see tests/conformance/corpus/README.md"]
 fn replay_dcs_corpus() {
     replay_dir(Path::new("tests/conformance/corpus/dcs"), |bytes, sink| {
-        let _ = dcs::decode_server_to_client(bytes, sink);
-        let _ = dcs::decode_client_to_server(bytes, sink);
+        dcs::decode_server_to_client(bytes, sink).is_ok()
+            || dcs::decode_client_to_server(bytes, sink).is_ok()
     });
 }
 
