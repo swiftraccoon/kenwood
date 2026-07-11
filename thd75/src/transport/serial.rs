@@ -48,6 +48,22 @@ pub struct SerialTransport {
     /// Whether the underlying path is a Bluetooth SPP port (detected
     /// at open time). BT ports must not be shut down explicitly.
     is_bluetooth: bool,
+    /// The path this transport was opened at — the reopen fallback
+    /// when USB discovery finds nothing.
+    path: String,
+    /// The effective baud currently configured. Tracked so a reopen
+    /// mid-session (e.g. during MCP programming at 9600) comes back
+    /// at the speed the radio is actually speaking.
+    baud: u32,
+}
+
+/// Pick the path for a reopen attempt: the first VID/PID-discovered
+/// port wins (USB re-enumeration can rename the device node), falling
+/// back to the originally opened path.
+fn choose_reopen_path(discovered: &[tokio_serial::SerialPortInfo], stored: &str) -> String {
+    discovered
+        .first()
+        .map_or_else(|| stored.to_owned(), |p| p.port_name.clone())
 }
 
 impl SerialTransport {
@@ -104,6 +120,8 @@ impl SerialTransport {
         Ok(Self {
             port,
             is_bluetooth: is_bt,
+            path: path.to_owned(),
+            baud: actual_baud,
         })
     }
 
@@ -175,7 +193,9 @@ impl Transport for SerialTransport {
             .map_err(|e| TransportError::Open {
                 path: String::new(),
                 source: std::io::Error::other(e.to_string()),
-            })
+            })?;
+        self.baud = baud;
+        Ok(())
     }
 
     async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
@@ -215,6 +235,24 @@ impl Transport for SerialTransport {
             .map_err(TransportError::Disconnected)?;
         Ok(())
     }
+
+    async fn reopen(&mut self) -> Result<(), TransportError> {
+        tracing::info!(path = %self.path, baud = self.baud, "reopening serial transport");
+        // Best-effort close: a re-enumerated or unplugged port may
+        // already be gone, and BT SPP ports skip shutdown by design.
+        drop(self.close().await);
+        let path = if self.is_bluetooth {
+            // RFCOMM/SPP device nodes are stable across drops and are
+            // not USB devices — discovery by VID/PID cannot find them.
+            self.path.clone()
+        } else {
+            let discovered = Self::discover_usb().unwrap_or_default();
+            choose_reopen_path(&discovered, &self.path)
+        };
+        let fresh = Self::open(&path, self.baud)?;
+        *self = fresh;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -238,5 +276,29 @@ mod tests {
             "/dev/cu.Bluetooth-Incoming-Port"
         ));
         assert!(!SerialTransport::is_bluetooth_port("COM3"));
+    }
+
+    fn usb_info(name: &str) -> tokio_serial::SerialPortInfo {
+        tokio_serial::SerialPortInfo {
+            port_name: name.to_owned(),
+            port_type: tokio_serial::SerialPortType::Unknown,
+        }
+    }
+
+    #[test]
+    fn reopen_path_prefers_discovery() {
+        let found = vec![usb_info("/dev/cu.usbmodem999")];
+        assert_eq!(
+            choose_reopen_path(&found, "/dev/cu.usbmodem123"),
+            "/dev/cu.usbmodem999"
+        );
+    }
+
+    #[test]
+    fn reopen_path_falls_back_to_stored() {
+        assert_eq!(
+            choose_reopen_path(&[], "/dev/cu.usbmodem123"),
+            "/dev/cu.usbmodem123"
+        );
     }
 }

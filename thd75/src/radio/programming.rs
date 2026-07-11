@@ -54,6 +54,13 @@ const PROGRAMMING_BAUD: u32 = 9600;
 /// Baud rate for fast MCP transfers.
 const FAST_TRANSFER_BAUD: u32 = 115_200;
 
+/// Additional settle time before reconnecting after a programming-mode
+/// exit. The radio drops and re-enumerates USB when it leaves MCP mode;
+/// together with the 2-second mode-switch wait in
+/// `exit_programming_mode`, this totals the ~5 seconds the hardware
+/// needs before the port answers again.
+const MCP_EXIT_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// MCP transfer speed options.
 ///
 /// The default (`Safe`) keeps the entire programming session at 9600
@@ -345,6 +352,41 @@ impl<T: Transport> Radio<T> {
         Ok(())
     }
 
+    /// Write a single memory page without read-back verification.
+    ///
+    /// Identical to [`write_page`](Self::write_page) but skips the
+    /// verify step, halving the wire traffic. Prefer this only for
+    /// bulk flows that verify separately at the end; the verified
+    /// default catches flash writes the radio acknowledged but did
+    /// not land.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MemoryWriteProtected`] if the page is in the
+    /// factory calibration region.
+    /// Returns an error if entry, the page write, or exit fails.
+    /// Programming mode is always exited, even on error.
+    pub async fn write_page_unverified(
+        &mut self,
+        page: u16,
+        data: &[u8; programming::PAGE_SIZE],
+    ) -> Result<(), Error> {
+        if programming::is_factory_calibration_page(page) {
+            return Err(Error::MemoryWriteProtected { page });
+        }
+
+        self.enter_programming_mode().await?;
+
+        let result = self.write_single_page_unverified(page, data).await;
+
+        let exit_result = self.exit_programming_mode().await;
+
+        result?;
+        exit_result?;
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // High-level: read-modify-write
     // -----------------------------------------------------------------------
@@ -359,9 +401,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Connection lifetime
     ///
-    /// The USB connection does not survive the programming mode transition.
-    /// After this method returns, the `Radio` instance should be dropped
-    /// and a fresh connection established for subsequent CAT commands.
+    /// The connection drops during the programming-mode transition; the
+    /// exit path waits out the radio's reset and reconnects, so this
+    /// method returns with the radio answering CAT commands again.
     ///
     /// # Errors
     ///
@@ -395,6 +437,59 @@ impl<T: Transport> Radio<T> {
 
         // Always exit programming mode, even on error.
         let exit_result = self.exit_programming_mode().await;
+
+        result?;
+        exit_result?;
+
+        Ok(())
+    }
+
+    /// Read-modify-write one memory page, then exit programming mode
+    /// WITHOUT reconnecting.
+    ///
+    /// For writes whose purpose is to reboot the radio out of CAT mode
+    /// (e.g. enabling DV Gateway / Reflector Terminal Mode, where the
+    /// radio comes back speaking the MMDVM binary protocol): the normal
+    /// post-exit reconnect would race that reboot — over Bluetooth the
+    /// link can reopen in the pre-reboot window and then wedge
+    /// mid-command as the radio's stack dies. The write is still
+    /// verified by read-back inside the session; the connection is
+    /// deliberately left dead afterwards and the caller owns recovery
+    /// (typically by reconnecting from a fresh process once the radio
+    /// finishes rebooting).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MemoryWriteProtected`] if the page is in the
+    /// factory calibration region.
+    /// Returns an error if entry, the page read, the page write, or the
+    /// exit write fails. Programming mode is always exited, even on
+    /// error.
+    pub async fn modify_memory_page_detached<F>(
+        &mut self,
+        page: u16,
+        modify: F,
+    ) -> Result<(), Error>
+    where
+        F: FnOnce(&mut [u8; programming::PAGE_SIZE]),
+    {
+        if programming::is_factory_calibration_page(page) {
+            return Err(Error::MemoryWriteProtected { page });
+        }
+
+        self.enter_programming_mode().await?;
+
+        let result: Result<(), Error> = async {
+            let mut page_data = self.read_single_page(page).await?;
+            modify(&mut page_data);
+            self.write_single_page(page, &page_data).await?;
+            Ok(())
+        }
+        .await;
+
+        // Exit without the settle-and-reconnect: the radio is about to
+        // reboot into a non-CAT mode and the link is expected to die.
+        let exit_result = self.exit_programming_mode_detached().await;
 
         result?;
         exit_result?;
@@ -866,15 +961,44 @@ impl<T: Transport> Radio<T> {
         Ok(())
     }
 
-    /// Exit programming mode (`E` command).
+    /// Exit programming mode (`E` command) and reconnect.
     ///
-    /// Sends the exit byte. The radio resets its USB stack after exiting
-    /// MCP mode, so the connection should be considered dead after this.
+    /// Sends the exit byte, waits out the radio's reset, and brings the
+    /// link back so the caller gets a radio that answers CAT commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exit byte cannot be written or the
+    /// post-exit reconnect fails.
+    async fn exit_programming_mode(&mut self) -> Result<(), Error> {
+        self.exit_programming_mode_detached().await?;
+
+        // The radio resets its USB stack when leaving MCP mode.
+        // Combined with the mode-switch wait in the detached exit, this
+        // totals the ~5 seconds the hardware needs before the port
+        // answers again.
+        tokio::time::sleep(MCP_EXIT_SETTLE).await;
+
+        // Bring the link back so every MCP operation returns a radio
+        // that answers CAT commands — callers no longer wait out the
+        // USB re-enumeration and reconnect by hand.
+        self.reconnect().await?;
+
+        Ok(())
+    }
+
+    /// Exit programming mode (`E` command) WITHOUT reconnecting.
+    ///
+    /// For writes whose purpose is to reboot the radio out of CAT mode
+    /// (e.g. enabling a gateway / terminal mode): reconnecting here
+    /// would race the reboot — the link can come back up in the
+    /// pre-reboot window and then die mid-command. The connection is
+    /// deliberately left dead; the caller owns recovery.
     ///
     /// # Errors
     ///
     /// Returns an error if the exit byte cannot be written.
-    async fn exit_programming_mode(&mut self) -> Result<(), Error> {
+    async fn exit_programming_mode_detached(&mut self) -> Result<(), Error> {
         tracing::info!("exiting programming mode");
 
         // The session is over as soon as the exit is attempted — even
@@ -1157,7 +1281,35 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Write a single 256-byte page (caller must be in programming mode).
+    /// Write one page and verify it by read-back.
+    ///
+    /// The radio's ACK only confirms receipt of the frame, not that
+    /// the bytes landed in flash. Reading the page back catches a
+    /// failed write before any cached image is trusted.
     async fn write_single_page(
+        &mut self,
+        page: u16,
+        data: &[u8; programming::PAGE_SIZE],
+    ) -> Result<(), Error> {
+        self.write_single_page_unverified(page, data).await?;
+        let readback = self.read_single_page(page).await?;
+        if let Some((offset, (&expected, &actual))) = data
+            .iter()
+            .zip(readback.iter())
+            .enumerate()
+            .find(|(_, (e, a))| e != a)
+        {
+            return Err(Error::McpVerifyMismatch {
+                page,
+                offset,
+                expected,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    async fn write_single_page_unverified(
         &mut self,
         page: u16,
         data: &[u8; programming::PAGE_SIZE],
@@ -1338,7 +1490,7 @@ mod tests {
         Ok(data)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn read_channel_names_full_sequence() -> TestResult {
         // Mock the full programming mode sequence at 9600 baud throughout:
         // enter -> 63 page R/W/ACK loops -> exit.
@@ -1365,8 +1517,10 @@ mod tests {
         // Final ACK after last page.
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
-        // Exit programming mode.
+        // Exit programming mode, then the exit path reconnects.
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         let names = radio.read_channel_names().await?;
@@ -1383,7 +1537,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn page_read_rejects_mismatched_address_and_retries() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"\r0M PROGRAM\r", b"0M\r");
@@ -1398,6 +1552,8 @@ mod tests {
         mock.expect(&cmd, &build_w_response(page, &[0x22u8; 256])?);
         mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         let data = radio.read_page(page).await?;
@@ -1410,7 +1566,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn persistent_page_mismatch_errors_and_still_exits() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"\r0M PROGRAM\r", b"0M\r");
@@ -1420,8 +1576,11 @@ mod tests {
         // Both the read and its retry answer with the wrong page.
         mock.expect(&cmd, &build_w_response(0x0021, &[0x11u8; 256])?);
         mock.expect(&cmd, &build_w_response(0x0021, &[0x11u8; 256])?);
-        // Exit must still be attempted even though the read failed.
+        // Exit must still be attempted even though the read failed,
+        // and the exit path reconnects.
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         let result = radio.read_page(page).await;
@@ -1464,8 +1623,11 @@ mod tests {
             "CAT after a cancelled MCP session must refuse: {refused:?}"
         );
 
-        // Recovery sends the exit byte and restores normal operation.
+        // Recovery sends the exit byte, reconnects, and restores
+        // normal operation.
         radio.transport.expect(b"E", &[]);
+        radio.transport.expect_reopen(Ok(()));
+        radio.transport.expect(b"ID\r", b"ID TH-D75\r");
         radio.recover_from_interrupted_mcp().await?;
 
         radio.transport.expect(b"MD 0\r", b"MD 0,0\r");
@@ -1475,7 +1637,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn entry_drains_stale_noise_before_handshake() -> TestResult {
         let mut mock = MockTransport::new();
         // Stale AI/NMEA noise queued on the line from before the MCP
@@ -1488,6 +1650,8 @@ mod tests {
         mock.expect(&cmd, &build_w_response(page, &[0xAAu8; 256])?);
         mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         let data = radio.read_page(page).await?;
@@ -1495,7 +1659,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn read_all_channels_rejects_corrupt_record() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"\r0M PROGRAM\r", b"0M\r");
@@ -1514,6 +1678,8 @@ mod tests {
             mock.expect(&[programming::ACK], &[programming::ACK]);
         }
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         let result = radio.read_all_channels().await;
@@ -1524,7 +1690,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn read_single_page_round_trip() -> TestResult {
         let mut mock = MockTransport::new();
 
@@ -1541,8 +1707,10 @@ mod tests {
         // ACK exchange.
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
-        // Exit.
+        // Exit, then the exit path reconnects.
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         let result = radio.read_page(page).await?;
@@ -1551,7 +1719,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn write_single_page_round_trip() -> TestResult {
         let mut mock = MockTransport::new();
 
@@ -1564,11 +1732,116 @@ mod tests {
         let write_cmd = programming::build_write_command(page, &page_data);
         mock.expect(&write_cmd, &[programming::ACK]);
 
-        // Exit.
+        // Verify read-back returns what was written.
+        let read_cmd = programming::build_read_command(page);
+        mock.expect(&read_cmd, &build_w_response(page, &page_data)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // Exit, then the exit path reconnects.
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         radio.write_page(page, &page_data).await?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn modify_memory_page_detached_skips_reconnect() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        // Read-modify-write of one page (verified by read-back), as
+        // the terminal-mode enable flow performs it.
+        let page: u16 = 0x001C;
+        let original = vec![0u8; 256];
+        let mut modified = original.clone();
+        set_byte(&mut modified, 0xA0, 0x01)?;
+        let read_cmd = programming::build_read_command(page);
+        mock.expect(&read_cmd, &build_w_response(page, &original)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let modified_array = into_page_array(modified.clone())?;
+        let write_cmd = programming::build_write_command(page, &modified_array);
+        mock.expect(&write_cmd, &[programming::ACK]);
+        mock.expect(&read_cmd, &build_w_response(page, &modified)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // Exit byte only: NO reopen and NO identify are scripted, so
+        // any reconnect attempt would fail the strict mock. The link
+        // is deliberately left dead for the radio's reboot.
+        mock.expect(b"E", &[]);
+
+        let mut radio = Radio::connect(mock).await?;
+        radio
+            .modify_memory_page_detached(page, |data| {
+                if let Some(b) = data.get_mut(0xA0) {
+                    *b = 0x01;
+                }
+            })
+            .await?;
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_page_verify_mismatch_is_typed() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page: u16 = 0x0100;
+        let page_data = [0xCDu8; 256];
+        let write_cmd = programming::build_write_command(page, &page_data);
+        mock.expect(&write_cmd, &[programming::ACK]);
+
+        // Read-back returns one flipped byte at offset 7: the radio
+        // ACKed the write but the byte did not land.
+        let mut corrupted = page_data.to_vec();
+        set_byte(&mut corrupted, 7, 0x00)?;
+        let read_cmd = programming::build_read_command(page);
+        mock.expect(&read_cmd, &build_w_response(page, &corrupted)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // Exit (with reconnect) still runs even though verify failed.
+        mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.write_page(page, &page_data).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::McpVerifyMismatch {
+                    page: 0x0100,
+                    offset: 7,
+                    expected: 0xCD,
+                    actual: 0x00,
+                })
+            ),
+            "verify mismatch must surface with the differing byte: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_page_unverified_skips_readback() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page: u16 = 0x0100;
+        let page_data = [0xCDu8; 256];
+        let write_cmd = programming::build_write_command(page, &page_data);
+        mock.expect(&write_cmd, &[programming::ACK]);
+
+        // No read-back scripted: the unverified variant must not read.
+        mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        radio.write_page_unverified(page, &page_data).await?;
+        radio.transport.assert_complete();
         Ok(())
     }
 
@@ -1606,7 +1879,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn read_memory_pages_small_range() -> TestResult {
         let mut mock = MockTransport::new();
 
@@ -1627,8 +1900,10 @@ mod tests {
             mock.expect(&[programming::ACK], &[programming::ACK]);
         }
 
-        // Exit.
+        // Exit, then the exit path reconnects.
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         let data = radio.read_memory_pages(0x0040, 2).await?;
@@ -1666,7 +1941,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn read_channel_flags_sequence() -> TestResult {
         let mut mock = MockTransport::new();
 
@@ -1697,8 +1972,10 @@ mod tests {
             mock.expect(&[programming::ACK], &[programming::ACK]);
         }
 
-        // Exit.
+        // Exit, then the exit path reconnects.
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         let flags = radio.read_channel_flags().await?;
@@ -1725,7 +2002,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn progress_callback_invoked() -> TestResult {
         let mut mock = MockTransport::new();
 
@@ -1741,8 +2018,10 @@ mod tests {
             mock.expect(&[programming::ACK], &[programming::ACK]);
         }
 
-        // Exit.
+        // Exit, then the exit path reconnects.
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
 
@@ -1754,7 +2033,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn modify_memory_page_read_modify_write() -> TestResult {
         let mut mock = MockTransport::new();
 
@@ -1785,8 +2064,14 @@ mod tests {
         let write_cmd = programming::build_write_command(page, &expected_array);
         mock.expect(&write_cmd, &[programming::ACK]);
 
-        // Exit programming mode.
+        // Verify read-back returns the modified page.
+        mock.expect(&read_cmd, &build_w_response(page, &expected_array)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // Exit programming mode, then the exit path reconnects.
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         radio
@@ -1821,7 +2106,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn write_channel_name_round_trip() -> TestResult {
         let mut mock = MockTransport::new();
 
@@ -1852,8 +2137,14 @@ mod tests {
         let write_cmd = programming::build_write_command(page, &expected_array);
         mock.expect(&write_cmd, &[programming::ACK]);
 
-        // Exit programming mode.
+        // Verify read-back returns the modified page.
+        mock.expect(&read_cmd, &build_w_response(page, &expected_array)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // Exit programming mode, then the exit path reconnects.
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         radio.write_channel_name(5, "TestCh").await?;
@@ -1876,7 +2167,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn write_channel_name_truncates_long_name() -> TestResult {
         let mut mock = MockTransport::new();
 
@@ -1901,14 +2192,18 @@ mod tests {
         let expected_array = into_page_array(expected_data)?;
         let write_cmd = programming::build_write_command(page, &expected_array);
         mock.expect(&write_cmd, &[programming::ACK]);
+        mock.expect(&read_cmd, &build_w_response(page, &expected_array)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         radio.write_channel_name(0, long_name).await?;
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn read_all_channel_names_returns_1200() -> TestResult {
         let mut mock = MockTransport::new();
 
@@ -1936,8 +2231,10 @@ mod tests {
         // Final ACK after last page.
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
-        // Exit programming mode.
+        // Exit programming mode, then the exit path reconnects.
         mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
 
         let mut radio = Radio::connect(mock).await?;
         let names = radio.read_all_channel_names().await?;

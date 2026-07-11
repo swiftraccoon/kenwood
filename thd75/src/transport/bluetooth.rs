@@ -34,10 +34,24 @@ mod inner {
     /// Default device name for BT discovery.
     const DEFAULT_DEVICE_NAME: &str = "TH-D75";
 
+    /// How long the radio needs after a full channel release before a
+    /// fresh open succeeds. Reopening while the prior RFCOMM channel
+    /// still lingers kills the new connection.
+    const BT_REOPEN_SETTLE: std::time::Duration = std::time::Duration::from_millis(1500);
+
     /// Native macOS Bluetooth transport using `IOBluetooth` RFCOMM.
     pub struct BluetoothTransport {
         handle: *mut std::ffi::c_void,
         read_fd: i32,
+        /// The device name this transport was opened with (`None` used
+        /// the default); reopen reuses it.
+        device_name: Option<String>,
+        /// The thread `open` ran on. `IOBluetooth` (re)opens must
+        /// happen on the `CFRunLoop` thread, and this is our proxy for
+        /// it: reopen runs directly here, or dispatches via the broker.
+        opened_on: std::thread::ThreadId,
+        /// Optional main-thread broker enabling reopen from any thread.
+        broker: Option<crate::transport::BrokerHandle>,
     }
 
     // SAFETY: `BluetoothTransport` holds an opaque `*mut c_void` handle that is only
@@ -59,6 +73,9 @@ mod inner {
             f.debug_struct("BluetoothTransport")
                 .field("handle", &self.handle)
                 .field("read_fd", &self.read_fd)
+                .field("device_name", &self.device_name)
+                .field("opened_on", &self.opened_on)
+                .field("broker", &self.broker)
                 .finish()
         }
     }
@@ -97,7 +114,27 @@ mod inner {
             }
 
             tracing::info!(device = %name, "Bluetooth RFCOMM connected");
-            Ok(Self { handle, read_fd })
+            Ok(Self {
+                handle,
+                read_fd,
+                device_name: device_name.map(str::to_owned),
+                opened_on: std::thread::current().id(),
+                broker: None,
+            })
+        }
+
+        /// Attach a [`MainThreadBroker`] handle so
+        /// [`reopen`](Transport::reopen) can run from any thread.
+        ///
+        /// Without a broker, reopen only works on the thread that
+        /// performed the original open and fails elsewhere with
+        /// [`TransportError::WrongThread`].
+        ///
+        /// [`MainThreadBroker`]: crate::transport::MainThreadBroker
+        #[must_use]
+        pub fn with_broker(mut self, handle: crate::transport::BrokerHandle) -> Self {
+            self.broker = Some(handle);
+            self
         }
     }
 
@@ -195,6 +232,39 @@ mod inner {
                 self.handle = std::ptr::null_mut();
                 self.read_fd = -1;
             }
+            Ok(())
+        }
+
+        async fn reopen(&mut self) -> Result<(), TransportError> {
+            let name = self.device_name.clone();
+            let broker = self.broker.clone();
+            tracing::info!(device = ?name, "reopening Bluetooth RFCOMM");
+            // Fully release the old channel before any new open: a
+            // fresh connection made while the prior channel lingers is
+            // killed by its teardown.
+            self.close().await?;
+            if std::thread::current().id() == self.opened_on {
+                tokio::time::sleep(BT_REOPEN_SETTLE).await;
+                *self = Self::open(name.as_deref())?;
+                self.broker = broker;
+                return Ok(());
+            }
+            let Some(handle) = broker.clone() else {
+                return Err(TransportError::WrongThread);
+            };
+            // The open must run on the run-loop thread. The job builds
+            // a complete fresh transport there (`BluetoothTransport`
+            // is `Send`) and ships it back for installation.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            handle
+                .run(Box::new(move || {
+                    std::thread::sleep(BT_REOPEN_SETTLE);
+                    let fresh = Self::open(name.as_deref())?;
+                    tx.send(fresh).map_err(|_| TransportError::WrongThread)
+                }))
+                .await?;
+            *self = rx.await.map_err(|_| TransportError::WrongThread)?;
+            self.broker = broker;
             Ok(())
         }
     }

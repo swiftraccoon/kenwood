@@ -13,6 +13,7 @@ Async Rust library for full control of the Kenwood TH-D75 ham radio transceiver.
 - **APRS integration** — High-level `AprsClient` that owns `Radio<T>` + `KissSession` and threads `now: Instant` into the sans-io stack. Packet-radio protocol code (KISS framing, AX.25 codec, APRS parser/digipeater/SmartBeaconing/messaging/station-list, APRS-IS) lives in the sibling [`kiss-tnc`](https://github.com/swiftraccoon/kenwood/tree/main/kiss-tnc), [`ax25-codec`](https://github.com/swiftraccoon/kenwood/tree/main/ax25-codec), [`aprs`](https://github.com/swiftraccoon/kenwood/tree/main/aprs), [`aprs-is`](https://github.com/swiftraccoon/kenwood/tree/main/aprs-is) crates.
 - **MCP bridge** — `From<McpSmartBeaconingConfig> for aprs::SmartBeaconingConfig` (mph → km/h) in `thd75/src/aprs/mcp_bridge.rs`.
 - **Transport layer** — USB (CDC ACM) and Bluetooth SPP with auto-detection. Native `IOBluetooth` on macOS, serial RFCOMM on Linux/Windows.
+- **Session resilience** — `Radio::reconnect()` re-establishes a dropped USB or Bluetooth link on the same transport identity (surviving USB re-enumeration and MCP programming-mode exits), and an opt-in `RadioSupervisor` retries with capped exponential backoff while broadcasting typed link events. MCP writes verify by read-back before reporting success.
 - **Async** — Built on tokio. All radio operations are async.
 
 ## Quick start

@@ -57,4 +57,13 @@ impl Transport for EitherTransport {
             Self::Mock(m) => m.close().await,
         }
     }
+
+    async fn reopen(&mut self) -> Result<(), TransportError> {
+        match self {
+            Self::Serial(s) => s.reopen().await,
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(b) => b.reopen().await,
+            Self::Mock(m) => m.reopen().await,
+        }
+    }
 }

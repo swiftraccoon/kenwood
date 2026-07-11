@@ -321,11 +321,17 @@ fn mock_modify_page_sequence(
     mock.expect(&[programming::ACK], &[programming::ACK]);
     let write_cmd = programming::build_write_command(page, expected);
     mock.expect(&write_cmd, &[programming::ACK]);
+    // Verify read-back returns the modified page.
+    mock.expect(&read_cmd, &build_w_response(page, expected)?);
+    mock.expect(&[programming::ACK], &[programming::ACK]);
     mock.expect(b"E", &[]);
+    // The exit path reconnects: transport reopen + identify.
+    mock.expect_reopen(Ok(()));
+    mock.expect(b"ID\r", b"ID TH-D75\r");
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn modify_memory_page_applies_closure() -> TestResult {
     // Verify: enter MCP → read page → closure mutates data → write back → exit.
     let page: u16 = 0x0020;
@@ -348,7 +354,7 @@ async fn modify_memory_page_applies_closure() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn modify_memory_page_preserves_surrounding_bytes() -> TestResult {
     // A non-zero page pattern ensures only the target byte is changed.
     let page: u16 = 0x0010;

@@ -36,6 +36,7 @@
 
 #[cfg(any(target_os = "macos", doc))]
 pub mod bluetooth;
+pub mod broker;
 pub mod either;
 pub mod mmdvm_adapter;
 pub mod mock;
@@ -43,6 +44,7 @@ pub mod serial;
 
 #[cfg(any(target_os = "macos", doc))]
 pub use bluetooth::BluetoothTransport;
+pub use broker::{BrokerHandle, MainThreadBroker};
 pub use either::EitherTransport;
 pub use mmdvm_adapter::MmdvmTransportAdapter;
 pub use mock::MockTransport;
@@ -80,5 +82,23 @@ pub trait Transport: Send + Sync {
     /// Returns [`TransportError::Open`] if the baud rate cannot be applied.
     fn set_baud_rate(&mut self, _baud: u32) -> Result<(), TransportError> {
         Ok(())
+    }
+
+    /// Re-establish a dropped connection using the same identity
+    /// (device path / name / discovery parameters) this transport was
+    /// opened with.
+    ///
+    /// Implementations own their platform's full recovery sequence,
+    /// including any mandatory release/settle delays. The default
+    /// declines: transports that cannot recover their own connection
+    /// report [`TransportError::ReopenUnsupported`] and the caller
+    /// must build a fresh transport instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ReopenUnsupported`] if this transport
+    /// cannot reopen; implementation-specific errors otherwise.
+    fn reopen(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send {
+        async { Err(TransportError::ReopenUnsupported) }
     }
 }

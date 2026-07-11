@@ -67,6 +67,8 @@
 //! - [`mmdvm`] — D-STAR gateway client ([`DStarGateway`]) for Reflector Terminal
 //!   Mode, built on the `mmdvm-core` framing codec and `dstar-gateway-core`
 //!   protocol crates.
+//! - [`session`] — Link supervision: reconnect backoff policy and the opt-in
+//!   supervisor driving [`Radio::reconnect`](radio::Radio::reconnect).
 //! - [`error`] — Error types for transport, protocol, and validation failures.
 
 pub mod aprs;
@@ -76,6 +78,7 @@ pub mod mmdvm;
 pub mod protocol;
 pub mod radio;
 pub mod sdcard;
+pub mod session;
 pub mod transport;
 pub mod types;
 

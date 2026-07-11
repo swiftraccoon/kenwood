@@ -34,6 +34,9 @@ pub struct MockTransport {
     /// if the consumer keeps cancelling reads (e.g. a biased select
     /// with a busy write branch).
     delay_started: Option<tokio::time::Instant>,
+    /// Scripted outcomes for [`Transport::reopen`] calls, consumed
+    /// FIFO. An empty queue means reopen succeeds.
+    reopen_script: VecDeque<Result<(), TransportError>>,
 }
 
 impl MockTransport {
@@ -46,7 +49,16 @@ impl MockTransport {
             accept_any_write: false,
             pend_when_empty: false,
             delay_started: None,
+            reopen_script: VecDeque::new(),
         }
+    }
+
+    /// Queue the outcome of the next [`Transport::reopen`] call.
+    ///
+    /// Outcomes are consumed FIFO; when the queue is empty, `reopen`
+    /// succeeds. Lets tests model reopen-fails-then-succeeds flows.
+    pub fn expect_reopen(&mut self, outcome: Result<(), TransportError>) {
+        self.reopen_script.push_back(outcome);
     }
 
     /// Queue an expected command/response exchange.
@@ -278,9 +290,16 @@ impl Transport for MockTransport {
 
     async fn close(&mut self) -> Result<(), TransportError> {
         tracing::debug!("mock: closing transport");
-        self.exchanges.clear();
+        // In-flight response bytes die with the connection, but
+        // scripted future exchanges survive: they model traffic the
+        // test expects after a reopen (reconnect flows close first).
         self.pending.clear();
         Ok(())
+    }
+
+    async fn reopen(&mut self) -> Result<(), TransportError> {
+        tracing::debug!("mock: reopen");
+        self.reopen_script.pop_front().unwrap_or(Ok(()))
     }
 }
 
@@ -384,11 +403,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_clears_state() -> TestResult {
+    async fn close_drops_inflight_reads_but_keeps_script() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.expect(b"FV\r", b"FV 1.03\r");
+        // Consume the first write; its response is now in flight.
+        mock.write(b"ID\r").await?;
         mock.close().await?;
-        mock.assert_complete();
+        // The in-flight response died with the connection...
+        let mut buf = [0u8; 32];
+        let r = mock.read(&mut buf).await;
+        assert!(
+            matches!(r, Err(TransportError::Read(_))),
+            "in-flight read should be gone, got {r:?}"
+        );
+        // ...but the next scripted exchange survives for post-reopen use.
+        mock.write(b"FV\r").await?;
+        let n = mock.read(&mut buf).await?;
+        assert_eq!(read_prefix(&buf, n)?, b"FV 1.03\r");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_reopen_is_unsupported() {
+        struct Bare;
+        impl Transport for Bare {
+            async fn write(&mut self, _d: &[u8]) -> Result<(), TransportError> {
+                Ok(())
+            }
+            async fn read(&mut self, _b: &mut [u8]) -> Result<usize, TransportError> {
+                Ok(0)
+            }
+            async fn close(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+        let mut t = Bare;
+        let r = t.reopen().await;
+        assert!(
+            matches!(r, Err(TransportError::ReopenUnsupported)),
+            "expected ReopenUnsupported, got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_reopen_is_scriptable_fifo() {
+        let mut mock = MockTransport::new();
+        mock.expect_reopen(Err(TransportError::NotFound));
+        mock.expect_reopen(Ok(()));
+        let first = mock.reopen().await;
+        assert!(
+            matches!(first, Err(TransportError::NotFound)),
+            "got {first:?}"
+        );
+        let second = mock.reopen().await;
+        assert!(second.is_ok(), "got {second:?}");
+        // A drained script defaults to success.
+        let third = mock.reopen().await;
+        assert!(third.is_ok(), "got {third:?}");
     }
 }

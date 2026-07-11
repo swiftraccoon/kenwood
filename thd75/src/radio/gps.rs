@@ -114,7 +114,11 @@ impl<T: Transport> Radio<T> {
             })
             .await?;
         match response {
-            Response::GpsConfig { .. } => Ok(()),
+            Response::GpsConfig { .. } => {
+                // Remembered so `Radio::reconnect` re-asserts it.
+                self.gps_config = Some((gps_enabled, pc_output));
+                Ok(())
+            }
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "GpsConfig".into(),
                 actual: format!("{other:?}").into_bytes(),
@@ -157,7 +161,11 @@ impl<T: Transport> Radio<T> {
             })
             .await?;
         match response {
-            Response::GpsSentences { .. } => Ok(()),
+            Response::GpsSentences { .. } => {
+                // Remembered so `Radio::reconnect` re-asserts it.
+                self.gps_sentences = Some((gga, gll, gsa, gsv, rmc, vtg));
+                Ok(())
+            }
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "GpsSentences".into(),
                 actual: format!("{other:?}").into_bytes(),

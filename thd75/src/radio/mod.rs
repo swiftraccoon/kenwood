@@ -83,6 +83,20 @@ impl RadioMode {
     }
 }
 
+/// Whether the CAT link is currently believed healthy.
+///
+/// Flips to [`LinkState::Down`] when a command surfaces a transport
+/// error, and back to [`LinkState::Up`] after a successful
+/// [`Radio::reconnect`]. Observe transitions via
+/// [`Radio::link_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkState {
+    /// Commands are being answered.
+    Up,
+    /// A transport error was observed; call [`Radio::reconnect`].
+    Down,
+}
+
 /// High-level async API for controlling a Kenwood TH-D75.
 ///
 /// Generic over the transport layer — works with USB serial,
@@ -120,6 +134,18 @@ pub struct Radio<T: Transport> {
     /// The CAT timeout saved while an MCP session temporarily raises
     /// it; restored on session end or interrupted-session recovery.
     pub(crate) mcp_saved_timeout: Option<Duration>,
+    /// Publishes link-health transitions; see [`Radio::link_state`].
+    link_state_tx: tokio::sync::watch::Sender<LinkState>,
+    /// Whether auto-info was enabled by the caller; re-asserted by
+    /// [`Radio::reconnect`].
+    pub(crate) auto_info_enabled: bool,
+    /// Last successful GPS config `(gps_enabled, pc_output)`;
+    /// re-asserted by [`Radio::reconnect`].
+    pub(crate) gps_config: Option<(bool, bool)>,
+    /// Last successful GPS NMEA sentence flags
+    /// `(gga, gll, gsa, gsv, rmc, vtg)`; re-asserted by
+    /// [`Radio::reconnect`].
+    pub(crate) gps_sentences: Option<(bool, bool, bool, bool, bool, bool)>,
 }
 
 impl<T: Transport> std::fmt::Debug for Radio<T> {
@@ -154,6 +180,7 @@ impl<T: Transport> Radio<T> {
     pub async fn connect(transport: T) -> Result<Self, Error> {
         tracing::info!("connecting to radio");
         let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let (link_tx, _link_rx) = tokio::sync::watch::channel(LinkState::Up);
         Ok(Self {
             transport,
             codec: Codec::new(),
@@ -166,6 +193,10 @@ impl<T: Transport> Radio<T> {
             desynced: false,
             mcp_active: false,
             mcp_saved_timeout: None,
+            link_state_tx: link_tx,
+            auto_info_enabled: false,
+            gps_config: None,
+            gps_sentences: None,
         })
     }
 
@@ -351,12 +382,26 @@ impl<T: Transport> Radio<T> {
         // 2. Serialize command to wire format.
         let wire = protocol::serialize(&cmd);
 
-        // 3. Write to transport.
+        // 3. Write to transport, bounded by the command timeout: a
+        //    dying link can wedge inside a blocking platform write
+        //    (macOS IOBluetooth `writeSync:` against a rebooting radio
+        //    never returns), and an unbounded await here would hang
+        //    the whole command loop instead of surfacing a timeout.
         tracing::trace!(cmd = %cmd_name, wire = ?String::from_utf8_lossy(&wire).trim(), "TX");
-        self.transport
-            .write(&wire)
-            .await
-            .map_err(Error::Transport)?;
+        match tokio::time::timeout(timeout_dur, self.transport.write(&wire)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = self.link_state_tx.send_replace(LinkState::Down);
+                return Err(Error::Transport(e));
+            }
+            Err(_elapsed) => {
+                tracing::error!(cmd = %cmd_name, timeout = ?timeout_dur, "transport write timed out");
+                let _ = self.link_state_tx.send_replace(LinkState::Down);
+                self.codec.clear();
+                self.desynced = true;
+                return Err(Error::Timeout(timeout_dur));
+            }
+        }
         self.last_cmd_time = Some(tokio::time::Instant::now());
 
         // 4. Read response bytes (loop until codec has a complete frame),
@@ -368,6 +413,11 @@ impl<T: Transport> Radio<T> {
 
         match result {
             Ok(inner) => {
+                // A transport-level failure during the read means the
+                // link itself is gone, not just this command.
+                if matches!(&inner, Err(Error::Transport(_))) {
+                    let _ = self.link_state_tx.send_replace(LinkState::Down);
+                }
                 // 4. Track mode changes from successful VM responses.
                 self.track_mode_from_response(&cmd, &inner);
                 inner
@@ -633,6 +683,55 @@ impl<T: Transport> Radio<T> {
     pub async fn close_transport(&mut self) -> Result<(), Error> {
         tracing::info!("closing transport for reconnect");
         self.transport.close().await.map_err(Error::Transport)
+    }
+
+    /// Watch link-health transitions.
+    ///
+    /// The receiver observes [`LinkState::Down`] when a command
+    /// surfaces a transport error and [`LinkState::Up`] again after a
+    /// successful [`Radio::reconnect`].
+    #[must_use]
+    pub fn link_state(&self) -> tokio::sync::watch::Receiver<LinkState> {
+        self.link_state_tx.subscribe()
+    }
+
+    /// Re-establish a dropped link on the same transport identity.
+    ///
+    /// Closes what remains of the old connection, asks the transport to
+    /// [`reopen`](crate::transport::Transport::reopen), verifies the
+    /// radio answers by re-running [`identify`](Radio::identify), and
+    /// restores auto-information and GPS streaming state if they were
+    /// enabled. In-flight commands are never replayed: whatever failed
+    /// stays failed, and the caller decides what to re-issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Transport`] if the transport cannot reopen, or
+    /// any error from the identify and state-restore commands.
+    pub async fn reconnect(&mut self) -> Result<(), Error> {
+        tracing::info!("reconnecting radio link");
+        if let Err(e) = self.close_transport().await {
+            tracing::debug!(error = %e, "close before reopen failed (link already dead)");
+        }
+        self.transport.reopen().await.map_err(Error::Transport)?;
+        // Fresh link: drop any half-parsed frame and stale-response
+        // bookkeeping from the dead connection.
+        self.codec.clear();
+        self.desynced = false;
+        self.last_cmd_time = None;
+        let _identified = self.identify().await?;
+        if self.auto_info_enabled {
+            self.set_auto_info(true).await?;
+        }
+        if let Some((gps_enabled, pc_output)) = self.gps_config {
+            self.set_gps_config(gps_enabled, pc_output).await?;
+        }
+        if let Some((gga, gll, gsa, gsv, rmc, vtg)) = self.gps_sentences {
+            self.set_gps_sentences(gga, gll, gsa, gsv, rmc, vtg).await?;
+        }
+        let _ = self.link_state_tx.send_replace(LinkState::Up);
+        tracing::info!("radio link restored");
+        Ok(())
     }
 }
 

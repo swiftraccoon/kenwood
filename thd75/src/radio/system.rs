@@ -430,7 +430,11 @@ impl<T: Transport> Radio<T> {
         tracing::info!(enabled, "setting auto-info mode");
         let response = self.execute(Command::SetAutoInfo { enabled }).await?;
         match response {
-            Response::AutoInfo { .. } => Ok(()),
+            Response::AutoInfo { .. } => {
+                // Remembered so `Radio::reconnect` re-asserts it.
+                self.auto_info_enabled = enabled;
+                Ok(())
+            }
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "AutoInfo".into(),
                 actual: format!("{other:?}").into_bytes(),

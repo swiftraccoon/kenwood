@@ -177,6 +177,9 @@ fn transport_err_to_io(err: TransportError) -> io::Error {
         TransportError::Open { path, source } => {
             io::Error::new(source.kind(), format!("failed to open {path}: {source}"))
         }
+        e @ (TransportError::ReopenUnsupported | TransportError::WrongThread) => {
+            io::Error::new(io::ErrorKind::Unsupported, e.to_string())
+        }
     }
 }
 

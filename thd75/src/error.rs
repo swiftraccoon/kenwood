@@ -82,6 +82,26 @@ pub enum Error {
         got: u8,
     },
 
+    /// An MCP write's read-back verification found a differing byte.
+    ///
+    /// The radio acknowledged the write, but reading the page back
+    /// shows the byte did not land. The cached memory image is left
+    /// unpatched.
+    #[error(
+        "MCP verify mismatch on page 0x{page:04X} at offset 0x{offset:02X}: \
+         wrote 0x{expected:02X}, read back 0x{actual:02X}"
+    )]
+    McpVerifyMismatch {
+        /// The page address that was written.
+        page: u16,
+        /// The first differing byte offset within the page.
+        offset: usize,
+        /// The byte that was written.
+        expected: u8,
+        /// The byte the read-back returned.
+        actual: u8,
+    },
+
     /// The supplied memory image has an invalid size.
     #[error("invalid memory image size: {actual} bytes (expected {expected})")]
     InvalidImageSize {
@@ -161,6 +181,25 @@ pub enum TransportError {
         #[source]
         std::io::Error,
     ),
+
+    /// The transport cannot re-establish its own connection.
+    ///
+    /// Returned by the default [`Transport::reopen`] implementation.
+    /// Callers must build a fresh transport instead.
+    ///
+    /// [`Transport::reopen`]: crate::transport::Transport::reopen
+    #[error("this transport cannot reopen its connection")]
+    ReopenUnsupported,
+
+    /// Reopen was invoked from a thread the platform forbids.
+    ///
+    /// macOS `IOBluetooth` connections can only be (re)opened on the
+    /// thread that runs the `CFRunLoop` (the thread that performed the
+    /// original open). Attach a
+    /// [`BrokerHandle`](crate::transport::BrokerHandle) to the
+    /// transport, or call from that thread.
+    #[error("reopen must run on the thread that opened the transport")]
+    WrongThread,
 }
 
 /// Errors in the CAT protocol layer (framing, field parsing, etc.).

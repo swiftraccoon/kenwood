@@ -666,8 +666,10 @@ fn read_line_blocking(rl: &mut rustyline::DefaultEditor, prompt: &str) -> Option
 
 /// The three operating modes of the REPL.
 enum ReplState {
-    /// Normal CAT control — radio is directly accessible.
-    Cat(Radio<EitherTransport>),
+    /// Normal CAT control — radio is directly accessible. Boxed to
+    /// keep this variant's size near its siblings'
+    /// (`clippy::large_enum_variant`).
+    Cat(Box<Radio<EitherTransport>>),
     /// APRS/KISS mode — radio consumed by `AprsClient`.
     Aprs(Box<AprsClient<EitherTransport>>),
     /// D-STAR gateway/MMDVM mode — radio consumed by `DStarGateway`.
@@ -716,15 +718,16 @@ struct DStarSession {
     /// Slow data decoder for incoming reflector voice frames.
     /// Decodes text messages embedded in the slow data bytes.
     rx_slow_data: SlowDataTextCollector,
-    /// Last 20-byte slow-data text message printed for the current
-    /// stream, used to dedupe repeat emissions. D-STAR radios
-    /// continuously re-transmit the operator's text message across
-    /// the voice stream (so late joiners can see it), so the decoder
-    /// legitimately re-emits the same 20 bytes every ~320 ms for the
-    /// full duration of a burst. Print it the first time we see it
-    /// per stream, and again only if the operator actually changes
-    /// the text mid-transmission. Cleared on `VoiceStart` for a new
-    /// stream and on `VoiceEnd`.
+    /// Latch: the slow-data text message already announced for the
+    /// current stream. D-STAR radios re-transmit one fixed 20-char
+    /// message continuously across the whole voice stream (so late
+    /// joiners can see it) — the message cannot legitimately change
+    /// mid-transmission, so any differing re-assembly is RF bit
+    /// corruption (the slow-data channel has no error correction).
+    /// Announce the first complete assembly per stream and suppress
+    /// everything after it, matching the reference collector
+    /// behavior in `ircDDBGateway/Common/TextCollector.cpp`. Cleared
+    /// on `VoiceStart` for a new stream and on `VoiceEnd`.
     rx_last_slow_text: Option<[u8; 20]>,
     /// Outgoing slow data text message to embed in TX voice frames.
     /// Set via the `text` command. Cleared after one transmission.
@@ -1024,7 +1027,7 @@ async fn run_repl(
                 thd75_repl::output::startup_identified(&info.model.clone(), &fw)
             );
             println!("{}", thd75_repl::output::type_help_hint());
-            ReplState::Cat(radio)
+            ReplState::Cat(Box::new(radio))
         }
         Err(_) => {
             // CAT identification failed — probe the link to find out why.
@@ -1041,7 +1044,7 @@ async fn run_repl(
                     let fw = radio.get_firmware_version().await.unwrap_or_default();
                     println!("{}", thd75_repl::output::startup_identified(&model, &fw));
                     println!("{}", thd75_repl::output::type_help_hint());
-                    ReplState::Cat(radio)
+                    ReplState::Cat(Box::new(radio))
                 }
                 LinkDiagnosis::MmdvmMode => {
                     // CAT is offline in this mode. Remember it so the
@@ -1057,7 +1060,7 @@ async fn run_repl(
                         "To restore normal radio control: set Menu No. 650 (DV Gateway) to Off,"
                     );
                     println!("  then restart, or relaunch with --exit-terminal-mode.");
-                    ReplState::Cat(radio)
+                    ReplState::Cat(Box::new(radio))
                 }
                 LinkDiagnosis::Unresponsive if std::env::var_os(RELAUNCH_GUARD_ENV).is_some() => {
                     // This process is the relaunch that follows a
@@ -1067,7 +1070,7 @@ async fn run_repl(
                     // the REPL so the initial `dstar start` command can
                     // poll for engagement instead of dying here.
                     println!("Radio is still rebooting into Reflector Terminal Mode.");
-                    ReplState::Cat(radio)
+                    ReplState::Cat(Box::new(radio))
                 }
                 LinkDiagnosis::Unresponsive => {
                     return Err(LinkDiagnosis::Unresponsive.guidance().into());
@@ -1119,7 +1122,7 @@ async fn run_repl(
         let Some(line) = line else {
             // EOF or Ctrl-C: disconnect cleanly.
             let radio = match state {
-                ReplState::Cat(r) => Some(r),
+                ReplState::Cat(r) => Some(*r),
                 ReplState::Aprs(c) => c.stop().await.ok(),
                 ReplState::Dstar(mut s) => {
                     if let Some(ref mut r) = s.reflector {
@@ -1213,7 +1216,7 @@ async fn run_repl(
                             }
                         }
                     }
-                    ReplState::Cat(r) => Some(r),
+                    ReplState::Cat(r) => Some(*r),
                 };
                 if let Some(r) = radio {
                     drop(r.disconnect().await);
@@ -1339,7 +1342,7 @@ async fn run_repl(
                         println!("Example: aprs start W1AW 7");
                         ReplState::Cat(radio)
                     } else {
-                        match enter_aprs(radio, parts.get(2..).unwrap_or(&[])).await {
+                        match enter_aprs(*radio, parts.get(2..).unwrap_or(&[])).await {
                             Ok(client) => ReplState::Aprs(Box::new(client)),
                             Err((radio_back, e)) => {
                                 println!(
@@ -1348,7 +1351,7 @@ async fn run_repl(
                                         "entering APRS mode: {e}"
                                     ))
                                 );
-                                ReplState::Cat(radio_back)
+                                ReplState::Cat(Box::new(radio_back))
                             }
                         }
                     }
@@ -1360,7 +1363,7 @@ async fn run_repl(
                         println!("Example: dstar start W1AW XRF030C");
                         ReplState::Cat(radio)
                     } else {
-                        match enter_dstar(radio, parts.get(2..).unwrap_or(&[])).await {
+                        match enter_dstar(*radio, parts.get(2..).unwrap_or(&[])).await {
                             Ok(mut session) => {
                                 // If a reflector was connected, auto-enter monitor.
                                 if session.reflector.is_some() {
@@ -1376,7 +1379,7 @@ async fn run_repl(
                                         "entering D-STAR mode: {e}"
                                     ))
                                 );
-                                ReplState::Cat(radio_back)
+                                ReplState::Cat(Box::new(radio_back))
                             }
                             Err((None, e)) => {
                                 println!(
@@ -1399,7 +1402,7 @@ async fn run_repl(
                     match client.stop().await {
                         Ok(radio) => {
                             aprintln!("APRS mode stopped. Returned to CAT mode.");
-                            ReplState::Cat(radio)
+                            ReplState::Cat(Box::new(radio))
                         }
                         Err((_client, e)) => {
                             println!(
@@ -1427,7 +1430,7 @@ async fn run_repl(
                             // longer applies.
                             terminal_mode = false;
                             aprintln!("D-STAR mode stopped. Returned to normal radio control.");
-                            ReplState::Cat(radio)
+                            ReplState::Cat(Box::new(radio))
                         }
                         Err(e) => {
                             println!(
@@ -2063,8 +2066,12 @@ async fn ensure_terminal_mode(
     // reopened to a just-rebooted radio — but a fresh process
     // connects cleanly, so re-exec ourselves once the radio is back.
     println!("Enabling D-STAR Reflector Terminal Mode via memory write.");
+    // Detached: this write reboots the radio out of CAT mode, so the
+    // normal exit-path reconnect would race the reboot (over Bluetooth
+    // the reopened channel wedges as the radio's stack dies). The link
+    // is left dead on purpose; the re-exec below owns recovery.
     if let Err(e) = radio
-        .modify_memory_page(GATEWAY_MODE_PAGE, |data| {
+        .modify_memory_page_detached(GATEWAY_MODE_PAGE, |data| {
             data[GATEWAY_MODE_BYTE] = 1; // ReflectorTerminal
         })
         .await
@@ -3773,16 +3780,16 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             // treats seq==0 as a sync frame and re-aligns its half-block
             // phase automatically. No external skipping needed.
             session.rx_slow_data.push(frame.slow_data, *seq);
-            // D-STAR radios repeat the 20-char text message across
-            // the voice stream continuously (~320 ms per full cycle)
-            // so late joiners can see it. The decoder correctly
-            // re-assembles on each cycle, which would print the same
-            // line 5-10 times per burst. Dedupe against the last
-            // printed text for this stream so we only announce the
-            // message when it changes (either fresh stream or the
-            // operator changed text mid-transmission).
+            // D-STAR radios repeat one FIXED 20-char text message
+            // across the voice stream continuously so late joiners
+            // can see it; it cannot change mid-transmission. Announce
+            // only the first complete assembly per stream: later
+            // re-assemblies that differ are RF bit corruption (no
+            // error correction on the slow-data channel) and printing
+            // each variant spams the operator — a real problem for
+            // screen-reader users.
             if let Some(bytes) = session.rx_slow_data.take_message()
-                && session.rx_last_slow_text.as_ref() != Some(&bytes)
+                && session.rx_last_slow_text.is_none()
             {
                 print_slow_data_text_message(&bytes);
                 session.rx_last_slow_text = Some(bytes);
@@ -3847,14 +3854,13 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             }
         }
         RuntimeEvent::VoiceEnd { .. } => {
-            // Drain any message that became complete on the very last
+            // Drain a message that became complete on the very last
             // voice frame; any partial message mid-assembly is silently
-            // discarded by the reset below. Apply the same dedupe
-            // against `rx_last_slow_text` so we don't double-print
-            // the message on VoiceEnd if it already printed during
-            // VoiceFrame processing.
+            // discarded by the reset below. The same first-assembly
+            // latch applies: if a message already printed during this
+            // stream, anything different here is RF corruption.
             if let Some(bytes) = session.rx_slow_data.take_message()
-                && session.rx_last_slow_text.as_ref() != Some(&bytes)
+                && session.rx_last_slow_text.is_none()
             {
                 print_slow_data_text_message(&bytes);
             }

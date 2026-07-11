@@ -67,6 +67,10 @@ struct RadioState {
     mode_a: Option<super::RadioMode>,
     mode_b: Option<super::RadioMode>,
     mcp_speed: super::programming::McpSpeed,
+    link_state_tx: tokio::sync::watch::Sender<super::LinkState>,
+    auto_info_enabled: bool,
+    gps_config: Option<(bool, bool)>,
+    gps_sentences: Option<(bool, bool, bool, bool, bool, bool)>,
 }
 
 /// An MMDVM session that owns the radio transport via an
@@ -113,6 +117,10 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
                 mode_a: self.mode_a,
                 mode_b: self.mode_b,
                 mcp_speed: self.mcp_speed,
+                link_state_tx: self.link_state_tx,
+                auto_info_enabled: self.auto_info_enabled,
+                gps_config: self.gps_config,
+                gps_sentences: self.gps_sentences,
             },
         }
     }
@@ -257,6 +265,10 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
             desynced: true,
             mcp_active: false,
             mcp_saved_timeout: None,
+            link_state_tx: self.state.link_state_tx,
+            auto_info_enabled: self.state.auto_info_enabled,
+            gps_config: self.state.gps_config,
+            gps_sentences: self.state.gps_sentences,
         })
     }
 }

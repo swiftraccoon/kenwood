@@ -60,8 +60,14 @@ fn mock_modify_page_sequence(
     let write_cmd = programming::build_write_command(page, expected);
     mock.expect(&write_cmd, &[programming::ACK]);
 
-    // Exit programming mode.
+    // Verify read-back returns the modified page.
+    mock.expect(&read_cmd, &build_w_response(page, expected)?);
+    mock.expect(&[programming::ACK], &[programming::ACK]);
+
+    // Exit programming mode, then the exit path reconnects.
     mock.expect(b"E", &[]);
+    mock.expect_reopen(Ok(()));
+    mock.expect(b"ID\r", b"ID TH-D75\r");
     Ok(())
 }
 
@@ -180,7 +186,7 @@ fn patch_page(base: &[u8; 256], idx: usize, value: u8) -> Result<[u8; 256], BoxE
     Ok(out)
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn set_beep_via_mcp_enables() -> TestResult {
     // Offset 0x1071 => page 0x0010, byte index 0x71.
     let page: u16 = 0x0010;
@@ -197,7 +203,7 @@ async fn set_beep_via_mcp_enables() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn set_beep_via_mcp_disables() -> TestResult {
     let page: u16 = 0x0010;
     let byte_index: usize = 0x71;
@@ -213,7 +219,7 @@ async fn set_beep_via_mcp_disables() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn set_beep_volume_via_mcp() -> TestResult {
     // Offset 0x1072 => page 0x0010, byte index 0x72.
     let page: u16 = 0x0010;
@@ -230,7 +236,7 @@ async fn set_beep_volume_via_mcp() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn set_vox_via_mcp_enables() -> TestResult {
     // Offset 0x101B => page 0x0010, byte index 0x1B.
     let page: u16 = 0x0010;
@@ -247,7 +253,7 @@ async fn set_vox_via_mcp_enables() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn set_lock_via_mcp_enables() -> TestResult {
     // Offset 0x1060 => page 0x0010, byte index 0x60.
     let page: u16 = 0x0010;
@@ -264,7 +270,7 @@ async fn set_lock_via_mcp_enables() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn set_bluetooth_via_mcp_enables() -> TestResult {
     // Offset 0x1078 => page 0x0010, byte index 0x78.
     let page: u16 = 0x0010;
@@ -281,7 +287,7 @@ async fn set_bluetooth_via_mcp_enables() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn set_beep_via_mcp_preserves_other_bytes() -> TestResult {
     // The page should be read-modify-write: only the target byte changes,
     // all other bytes in the page are preserved.
@@ -343,7 +349,7 @@ async fn set_beep_volume_rejects_out_of_range() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn set_beep_volume_boundary_max() -> TestResult {
     // Volume 7 is the maximum valid value — should succeed and do an MCP write.
     // Offset 0x1072 => page 0x0010, byte index 0x72.
@@ -361,7 +367,7 @@ async fn set_beep_volume_boundary_max() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn set_beep_volume_boundary_min() -> TestResult {
     // Volume 0 is the minimum valid value — should succeed.
     let page: u16 = 0x0010;
