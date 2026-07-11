@@ -63,6 +63,36 @@ enum Cmd {
         #[arg(long, default_value_t = 24)]
         window_hours: u64,
     },
+    /// Fetch reflector-published recordings (reference-decoded MP3s,
+    /// sidecars, gap-fill packet logs) that pair with local
+    /// recordings, into per-date `published/` subdirectories.
+    Harvest {
+        /// Recordings directory (as written by the recorder).
+        #[arg(long, default_value = "recordings")]
+        recordings: PathBuf,
+        /// Date to harvest, YYYY-MM-DD (UTC). Defaults to today —
+        /// published retention is short, so harvest same-day.
+        #[arg(long, value_parser = parse_date)]
+        date: Option<chrono::NaiveDate>,
+        /// Restrict to one reflector-module directory (repeatable,
+        /// e.g. `--target REF030-C`). Default: every directory.
+        #[arg(long)]
+        target: Vec<String>,
+        /// Dashboard base URL override (testing / non-REF systems).
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Maximum downloads this run.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Match and report only — download and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// Parse a `--date` argument.
+fn parse_date(s: &str) -> Result<chrono::NaiveDate, String> {
+    s.parse().map_err(|e| format!("{e} (expected YYYY-MM-DD)"))
 }
 
 #[tokio::main]
@@ -78,6 +108,14 @@ async fn main() -> ExitCode {
             once,
         }) => survey(&out, interval, once).await,
         Some(Cmd::Report { out, window_hours }) => report(&out, window_hours),
+        Some(Cmd::Harvest {
+            recordings,
+            date,
+            target,
+            base_url,
+            limit,
+            dry_run,
+        }) => harvest(&recordings, date, &target, base_url, limit, dry_run).await,
     }
 }
 
@@ -204,6 +242,136 @@ async fn survey(out: &std::path::Path, interval: u64, once: bool) -> ExitCode {
             }
         }
     }
+}
+
+/// Harvest mode: fetch published recordings that pair with ours.
+async fn harvest(
+    recordings: &std::path::Path,
+    date: Option<chrono::NaiveDate>,
+    targets: &[String],
+    base_url: Option<String>,
+    limit: Option<usize>,
+    dry_run: bool,
+) -> ExitCode {
+    use stargazer::harvest::{HarvestOptions, Harvester, split_target};
+
+    let date = date.unwrap_or_else(|| chrono::Utc::now().date_naive());
+    let harvester = match Harvester::new(HarvestOptions {
+        base_url: base_url.clone(),
+        limit,
+        dry_run,
+        ..HarvestOptions::default()
+    }) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, "harvester init failed");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut names: Vec<String> = if targets.is_empty() {
+        // Auto-walk: harvest every <SYSTEM>-<MODULE> directory that
+        // has a reachable dashboard scheme; skip the rest quietly.
+        let entries = match std::fs::read_dir(recordings) {
+            Ok(rd) => rd,
+            Err(e) => {
+                tracing::error!(
+                    dir = %recordings.display(),
+                    error = %e,
+                    "cannot read recordings dir"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|name| match split_target(name) {
+                None => false,
+                Some((system, _)) => {
+                    let derivable = base_url.is_some()
+                        || stargazer::harvest::derived_base_url(&system).is_some();
+                    if !derivable {
+                        tracing::info!(
+                            target = %name,
+                            "skipped: no derivable dashboard URL (pass --target + --base-url)"
+                        );
+                    }
+                    derivable
+                }
+            })
+            .collect()
+    } else {
+        targets.to_vec()
+    };
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        tracing::warn!(
+            dir = %recordings.display(),
+            "no <SYSTEM>-<MODULE> directories to harvest"
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let mut hard_failures = 0usize;
+    for name in &names {
+        match harvester.harvest_dir(recordings, name, date).await {
+            Err(e) => {
+                hard_failures += 1;
+                tracing::error!(target = %name, error = %e, "harvest failed");
+            }
+            Ok(rec) => print_harvest_run(&rec),
+        }
+    }
+    if hard_failures > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// One human-readable coverage line per harvested target.
+fn print_harvest_run(rec: &stargazer::harvest::RunRecord) {
+    if let Some(err) = &rec.error {
+        println!("{} {}: listing unavailable — {err}", rec.target, rec.date);
+        return;
+    }
+    if rec.http_status == Some(404) {
+        println!("{} {}: nothing published", rec.target, rec.date);
+        return;
+    }
+    let pct = if rec.published_tx > 0 {
+        100 * rec.matched / rec.published_tx
+    } else {
+        0
+    };
+    let action = if rec.dry_run {
+        format!("dry run, would fetch {}", rec.planned)
+    } else {
+        format!(
+            "downloaded {} · failed {} · already had {}{}",
+            rec.downloaded,
+            rec.failed,
+            rec.skipped_existing,
+            if rec.truncated {
+                " · truncated by --limit"
+            } else {
+                ""
+            }
+        )
+    };
+    println!(
+        "{} {}: published {} · local {} · matched {} ({pct}%) · salvage {} · local-only {} — {action}",
+        rec.target,
+        rec.date,
+        rec.published_tx,
+        rec.local_recordings,
+        rec.matched,
+        rec.published_only,
+        rec.local_only,
+    );
 }
 
 /// Report mode: rank reflector modules from the archived events.

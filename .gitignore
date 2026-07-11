@@ -53,3 +53,5 @@ lodestar/DerivedData/
 /recordings/
 /survey/
 /stargazer.toml
+# ML working set derived from recordings (never committed)
+/dataset/

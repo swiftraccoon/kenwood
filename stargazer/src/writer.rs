@@ -331,7 +331,7 @@ fn container_bytes(frames: &[FrameRecord]) -> Vec<u8> {
 }
 
 /// Map a wire callsign to a filename-safe `[A-Z0-9-]+` token.
-fn sanitize_callsign(raw: &str) -> String {
+pub(crate) fn sanitize_callsign(raw: &str) -> String {
     let cleaned: String = raw
         .trim_end()
         .chars()
@@ -375,7 +375,7 @@ fn unique_stem(dir: &Path, rec: &CompletedRecording) -> Result<String, WriteErro
 
 /// Write bytes to `<path>.tmp`, optionally fsync, then rename over
 /// `path`. A crash leaves at most `.tmp` litter, never a torn file.
-fn write_atomic(path: &Path, bytes: &[u8], fsync: bool) -> Result<(), WriteError> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], fsync: bool) -> Result<(), WriteError> {
     let mut tmp_os = path.as_os_str().to_owned();
     tmp_os.push(".tmp");
     let tmp = PathBuf::from(tmp_os);
