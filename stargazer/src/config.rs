@@ -1,443 +1,323 @@
-//! Configuration for the stargazer service.
-//!
-//! Configuration is loaded from a TOML file and can be overridden by environment
-//! variables. The TOML file is divided into sections matching the service tiers:
-//!
-//! - `[postgres]` — Database connection pool settings.
-//! - `[rdio]` — Rdio API upload endpoint and retry policy.
-//! - `[tier1]` — Discovery sweep intervals for Pi-Star, XLX API, and ircDDB.
-//! - `[tier2]` — XLX UDP JSON monitor concurrency and idle thresholds.
-//! - `[tier3]` — Deep D-STAR protocol connections for voice capture.
-//! - `[audio]` — MP3 encoding parameters.
-//! - `[server]` — HTTP API bind address.
-//!
-//! Environment variable overrides follow the `STARGAZER_SECTION_FIELD` pattern:
-//!
-//! | Variable | Overrides |
-//! |----------|-----------|
-//! | `STARGAZER_POSTGRES_URL` | `postgres.url` |
-//! | `STARGAZER_RDIO_ENDPOINT` | `rdio.endpoint` |
-//! | `STARGAZER_RDIO_API_KEY` | `rdio.api_key` |
-//! | `STARGAZER_TIER3_DPLUS_CALLSIGN` | `tier3.dplus_callsign` |
-//! | `STARGAZER_SERVER_LISTEN` | `server.listen` |
+// SPDX-FileCopyrightText: 2026 Swift Raccoon
+// SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
+//! TOML configuration: global settings plus one `[[record]]` entry
+//! per reflector, expanded into per-module [`Target`]s at load time.
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use dstar_gateway_core::{Callsign, Module};
 use serde::Deserialize;
 
-/// Top-level configuration for the stargazer service.
-///
-/// Loaded from a TOML file via [`load`], with selective environment variable
-/// overrides applied afterwards.
-#[derive(Debug, Deserialize)]
-pub(crate) struct Config {
-    /// `PostgreSQL` connection pool configuration.
-    #[serde(default)]
-    pub(crate) postgres: PostgresConfig,
-
-    /// Rdio API upload endpoint configuration.
-    #[serde(default)]
-    pub(crate) rdio: RdioConfig,
-
-    /// Tier 1: discovery and sweep configuration.
-    #[serde(default)]
-    pub(crate) tier1: Tier1Config,
-
-    /// Tier 2: XLX live monitoring configuration.
-    #[serde(default)]
-    pub(crate) tier2: Tier2Config,
-
-    /// Tier 3: deep connect and voice recording configuration.
-    #[serde(default)]
-    pub(crate) tier3: Tier3Config,
-
-    /// Audio encoding configuration.
-    #[serde(default)]
-    pub(crate) audio: AudioConfig,
-
-    /// HTTP API server configuration.
-    #[serde(default)]
-    pub(crate) server: ServerConfig,
+/// Which D-STAR reflector protocol a target speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolChoice {
+    /// `DPlus` (REF reflectors, TCP auth then UDP).
+    Dplus,
+    /// `DExtra` (XRF and XLX reflectors).
+    Dextra,
+    /// DCS.
+    Dcs,
 }
 
-/// `PostgreSQL` connection pool settings.
-///
-/// The `url` field is the `libpq`-style connection string. The pool size
-/// controls how many connections sqlx keeps open concurrently.
-#[derive(Debug, Deserialize)]
-pub(crate) struct PostgresConfig {
-    /// `PostgreSQL` connection URL.
-    ///
-    /// Default: `"postgres://stargazer:pass@localhost/stargazer"`
-    #[serde(default = "default_postgres_url")]
-    pub(crate) url: String,
+impl ProtocolChoice {
+    /// Well-known UDP port for the protocol.
+    #[must_use]
+    pub const fn default_port(self) -> u16 {
+        match self {
+            Self::Dplus => 20001,
+            Self::Dextra => 30001,
+            Self::Dcs => 30051,
+        }
+    }
 
-    /// Maximum number of connections in the pool.
-    ///
-    /// Default: `10`
-    #[serde(default = "default_max_connections")]
-    pub(crate) max_connections: u32,
-}
-
-impl Default for PostgresConfig {
-    fn default() -> Self {
-        Self {
-            url: default_postgres_url(),
-            max_connections: default_max_connections(),
+    /// Lowercase protocol name as used in config and metadata.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Dplus => "dplus",
+            Self::Dextra => "dextra",
+            Self::Dcs => "dcs",
         }
     }
 }
 
-/// Rdio API upload configuration.
-///
-/// Stargazer uploads completed voice streams to an `SDRTrunk`-compatible Rdio
-/// API server using the `POST /api/call-upload` multipart protocol.
+/// One expanded record target: a single `(reflector, module)` pair.
+#[derive(Debug, Clone)]
+pub struct Target {
+    /// Reflector callsign as written in config, uppercased (e.g. `"REF030"`).
+    pub reflector: String,
+    /// Typed reflector callsign (used in session setup; DCS embeds it
+    /// in wire packets and validates it).
+    pub reflector_callsign: Callsign,
+    /// Protocol to connect with.
+    pub protocol: ProtocolChoice,
+    /// Host name or IP to connect to (resolved at connect time).
+    pub host: String,
+    /// UDP port.
+    pub port: u16,
+    /// Reflector module to link to.
+    pub module: Module,
+}
+
+/// Fully validated configuration.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Operator callsign used for reflector login and `DPlus` auth.
+    pub callsign: Callsign,
+    /// Base directory recordings are written under.
+    pub recordings_dir: PathBuf,
+    /// Whether to decode and write a WAV alongside the raw AMBE.
+    pub write_wav: bool,
+    /// Local module letter presented in rpt1 (A-E).
+    pub local_module: Module,
+    /// Expanded record targets, one per `(reflector, module)`.
+    pub targets: Vec<Target>,
+}
+
+/// Configuration loading and validation failures.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// The file could not be read.
+    #[error("read {path}: {source}")]
+    Io {
+        /// Path that failed to read.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The file is not valid TOML for our schema.
+    #[error("parse: {0}")]
+    Parse(#[from] toml::de::Error),
+    /// The file parsed but a value is invalid.
+    #[error("invalid config: {0}")]
+    Invalid(String),
+}
+
 #[derive(Debug, Deserialize)]
-pub(crate) struct RdioConfig {
-    /// Full URL of the Rdio API call-upload endpoint.
-    ///
-    /// Default: `"http://rdio-api:8080/api/call-upload"`
-    #[serde(default = "default_rdio_endpoint")]
-    pub(crate) endpoint: String,
-
-    /// API key sent with each upload as the `key` form field.
-    ///
-    /// Default: `"stargazer-key"`
-    #[serde(default = "default_rdio_api_key")]
-    pub(crate) api_key: String,
-
-    /// Seconds between upload retry attempts for failed streams.
-    ///
-    /// Default: `30`
-    #[serde(default = "default_retry_interval_secs")]
-    pub(crate) retry_interval_secs: u64,
-
-    /// Maximum number of upload attempts before marking a stream as failed.
-    ///
-    /// Default: `10`
-    #[serde(default = "default_max_retries")]
-    pub(crate) max_retries: u32,
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    callsign: String,
+    #[serde(default = "default_recordings_dir")]
+    recordings_dir: PathBuf,
+    #[serde(default = "default_true")]
+    write_wav: bool,
+    #[serde(default = "default_local_module")]
+    local_module: String,
+    #[serde(default, rename = "record")]
+    records: Vec<RawRecord>,
 }
 
-impl Default for RdioConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: default_rdio_endpoint(),
-            api_key: default_rdio_api_key(),
-            retry_interval_secs: default_retry_interval_secs(),
-            max_retries: default_max_retries(),
-        }
-    }
-}
-
-/// Tier 1: discovery sweep configuration.
-///
-/// Controls how often each external data source is polled to build the
-/// reflector registry.
 #[derive(Debug, Deserialize)]
-pub(crate) struct Tier1Config {
-    /// Poll interval for Pi-Star host files, in seconds.
-    ///
-    /// The Pi-Star host file changes rarely; daily polling is sufficient.
-    ///
-    /// Default: `86400` (24 hours)
-    #[serde(default = "default_pistar")]
-    pub(crate) pistar: u64,
-
-    /// Poll interval for XLX API reflector-list, in seconds.
-    ///
-    /// Default: `600` (10 minutes)
-    #[serde(default = "default_xlx_api")]
-    pub(crate) xlx_api: u64,
-
-    /// Poll interval for ircDDB last-heard page scrapes, in seconds.
-    ///
-    /// Default: `60` (1 minute)
-    #[serde(default = "default_ircddb")]
-    pub(crate) ircddb: u64,
+#[serde(deny_unknown_fields)]
+struct RawRecord {
+    reflector: String,
+    protocol: String,
+    host: String,
+    port: Option<u16>,
+    modules: Vec<String>,
 }
 
-impl Default for Tier1Config {
-    fn default() -> Self {
-        Self {
-            pistar: default_pistar(),
-            xlx_api: default_xlx_api(),
-            ircddb: default_ircddb(),
-        }
-    }
+fn default_recordings_dir() -> PathBuf {
+    PathBuf::from("recordings")
 }
 
-/// Tier 2: XLX live monitoring configuration.
-///
-/// Controls how many XLX reflectors are monitored concurrently via the UDP
-/// JSON monitor protocol (port 10001). Idle-pool eviction is reserved.
-#[derive(Debug, Deserialize)]
-pub(crate) struct Tier2Config {
-    /// Maximum number of concurrent UDP JSON monitor connections.
-    ///
-    /// Default: `100`
-    #[serde(default = "default_max_concurrent_monitors")]
-    pub(crate) max_concurrent_monitors: usize,
-
-    /// Reserved seconds-of-inactivity setting for future pool eviction.
-    /// The current monitor uses its fixed receive deadline instead.
-    ///
-    /// Default: `600` (10 minutes)
-    #[serde(default = "default_tier2_idle_disconnect_secs")]
-    pub(crate) idle_disconnect_secs: u64,
-
-    /// Seconds of recent activity required to consider a reflector "active"
-    /// and eligible for Tier 2 monitoring.
-    ///
-    /// Default: `1800` (30 minutes)
-    #[serde(default = "default_activity_threshold_secs")]
-    pub(crate) activity_threshold_secs: u64,
-}
-
-impl Default for Tier2Config {
-    fn default() -> Self {
-        Self {
-            max_concurrent_monitors: default_max_concurrent_monitors(),
-            idle_disconnect_secs: default_tier2_idle_disconnect_secs(),
-            activity_threshold_secs: default_activity_threshold_secs(),
-        }
-    }
-}
-
-/// Tier 3: deep D-STAR protocol connection configuration.
-///
-/// Reserved settings for the not-yet-wired Tier 3 session pool.
-#[derive(Debug, Deserialize)]
-pub(crate) struct Tier3Config {
-    /// Reserved maximum number of concurrent D-STAR protocol connections.
-    ///
-    /// Default: `20`
-    #[serde(default = "default_max_concurrent_connections")]
-    pub(crate) max_concurrent_connections: usize,
-
-    /// Reserved seconds of silence before disconnecting a Tier 3 session.
-    ///
-    /// Default: `300` (5 minutes)
-    #[serde(default = "default_tier3_idle_disconnect_secs")]
-    pub(crate) idle_disconnect_secs: u64,
-
-    /// Reserved flag for automatic Tier 2-to-Tier 3 promotion.
-    ///
-    /// Default: `true`
-    #[serde(default = "default_auto_promote")]
-    pub(crate) auto_promote: bool,
-
-    /// Reserved callsign for `DPlus` authentication with `auth.dstargateway.org`.
-    ///
-    /// Must be a valid amateur radio callsign registered with the `DPlus`
-    /// gateway trust system.
-    ///
-    /// Default: `"N0CALL"`
-    #[serde(default = "default_dplus_callsign")]
-    pub(crate) dplus_callsign: String,
-}
-
-impl Default for Tier3Config {
-    fn default() -> Self {
-        Self {
-            max_concurrent_connections: default_max_concurrent_connections(),
-            idle_disconnect_secs: default_tier3_idle_disconnect_secs(),
-            auto_promote: default_auto_promote(),
-            dplus_callsign: default_dplus_callsign(),
-        }
-    }
-}
-
-/// Audio encoding configuration.
-///
-/// Controls the output format and quality of decoded voice streams.
-#[derive(Debug, Deserialize)]
-pub(crate) struct AudioConfig {
-    /// Audio output format. Currently only `"mp3"` is supported.
-    ///
-    /// Default: `"mp3"`
-    #[serde(default = "default_audio_format")]
-    pub(crate) format: String,
-
-    /// MP3 constant bitrate in kbps.
-    ///
-    /// D-STAR voice is narrow-band (8 kHz sample rate); 64 kbps provides
-    /// good quality without excessive file size.
-    ///
-    /// Default: `64`
-    #[serde(default = "default_mp3_bitrate")]
-    pub(crate) mp3_bitrate: u32,
-}
-
-impl Default for AudioConfig {
-    fn default() -> Self {
-        Self {
-            format: default_audio_format(),
-            mp3_bitrate: default_mp3_bitrate(),
-        }
-    }
-}
-
-/// HTTP API server configuration.
-#[derive(Debug, Deserialize)]
-pub(crate) struct ServerConfig {
-    /// Socket address to bind the HTTP API server to.
-    ///
-    /// Parsed as a `SocketAddr` at load time, so an invalid value in the TOML
-    /// file is rejected immediately rather than at bind time.
-    ///
-    /// Default: `0.0.0.0:8080`
-    #[serde(default = "default_listen")]
-    pub(crate) listen: SocketAddr,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            listen: default_listen(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Default value functions for serde
-// ---------------------------------------------------------------------------
-
-fn default_postgres_url() -> String {
-    String::from("postgres://stargazer:pass@localhost/stargazer")
-}
-
-const fn default_max_connections() -> u32 {
-    10
-}
-
-fn default_rdio_endpoint() -> String {
-    String::from("http://rdio-api:8080/api/call-upload")
-}
-
-fn default_rdio_api_key() -> String {
-    String::from("stargazer-key")
-}
-
-const fn default_retry_interval_secs() -> u64 {
-    30
-}
-
-const fn default_max_retries() -> u32 {
-    10
-}
-
-const fn default_pistar() -> u64 {
-    86400
-}
-
-const fn default_xlx_api() -> u64 {
-    600
-}
-
-const fn default_ircddb() -> u64 {
-    60
-}
-
-const fn default_max_concurrent_monitors() -> usize {
-    100
-}
-
-const fn default_tier2_idle_disconnect_secs() -> u64 {
-    600
-}
-
-const fn default_activity_threshold_secs() -> u64 {
-    1800
-}
-
-const fn default_max_concurrent_connections() -> usize {
-    20
-}
-
-const fn default_tier3_idle_disconnect_secs() -> u64 {
-    300
-}
-
-const fn default_auto_promote() -> bool {
+const fn default_true() -> bool {
     true
 }
 
-fn default_dplus_callsign() -> String {
-    String::from("N0CALL")
+fn default_local_module() -> String {
+    "D".to_string()
 }
 
-fn default_audio_format() -> String {
-    String::from("mp3")
-}
-
-const fn default_mp3_bitrate() -> u32 {
-    64
-}
-
-const fn default_listen() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080)
-}
-
-/// Loads configuration from a TOML file, then applies environment variable
-/// overrides.
-///
-/// # Environment variable overrides
-///
-/// The following environment variables, when set, override the corresponding
-/// TOML fields:
-///
-/// - `STARGAZER_POSTGRES_URL` overrides `postgres.url`
-/// - `STARGAZER_RDIO_ENDPOINT` overrides `rdio.endpoint`
-/// - `STARGAZER_RDIO_API_KEY` overrides `rdio.api_key`
-/// - `STARGAZER_TIER3_DPLUS_CALLSIGN` overrides `tier3.dplus_callsign`
-/// - `STARGAZER_SERVER_LISTEN` overrides `server.listen`
+/// Parse and validate a configuration from TOML text.
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be read or contains invalid TOML, if
-/// `server.listen` (from the file or `STARGAZER_SERVER_LISTEN`) is not a valid
-/// socket address, or if `audio.format` / `audio.mp3_bitrate` is unsupported.
-pub(crate) fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
-    let contents = std::fs::read_to_string(path)?;
-    let mut config: Config = toml::from_str(&contents)?;
+/// Returns [`ConfigError::Parse`] on malformed TOML and
+/// [`ConfigError::Invalid`] on schema violations (bad callsign or
+/// module, unknown protocol, no targets, duplicate targets).
+pub fn parse(text: &str) -> Result<Config, ConfigError> {
+    let raw: RawConfig = toml::from_str(text)?;
 
-    // Apply environment variable overrides.
-    if let Ok(val) = std::env::var("STARGAZER_POSTGRES_URL") {
-        config.postgres.url = val;
-    }
-    if let Ok(val) = std::env::var("STARGAZER_RDIO_ENDPOINT") {
-        config.rdio.endpoint = val;
-    }
-    if let Ok(val) = std::env::var("STARGAZER_RDIO_API_KEY") {
-        config.rdio.api_key = val;
-    }
-    if let Ok(val) = std::env::var("STARGAZER_TIER3_DPLUS_CALLSIGN") {
-        config.tier3.dplus_callsign = val;
-    }
-    if let Ok(val) = std::env::var("STARGAZER_SERVER_LISTEN") {
-        config.server.listen = val.parse()?;
+    let callsign = Callsign::try_from_str(&raw.callsign)
+        .map_err(|e| ConfigError::Invalid(format!("callsign {:?}: {e}", raw.callsign)))?;
+
+    let local_module = parse_module(&raw.local_module)?;
+    if !matches!(local_module.as_char(), 'A'..='E') {
+        return Err(ConfigError::Invalid(format!(
+            "local_module must be A-E (xlxd-derived reflectors silently drop others), got {}",
+            local_module.as_char()
+        )));
     }
 
-    // Validate audio settings up front so a typo fails fast at startup rather
-    // than on the first captured stream (Tier 3 is the only consumer).
-    if config.audio.format != "mp3" {
-        return Err(format!(
-            "unsupported audio.format {:?}: only \"mp3\" is supported",
-            config.audio.format
-        )
-        .into());
+    let mut targets = Vec::new();
+    let mut seen: HashSet<(String, char)> = HashSet::new();
+    for rec in &raw.records {
+        let reflector = rec.reflector.trim().to_uppercase();
+        let reflector_callsign = Callsign::try_from_str(&reflector)
+            .map_err(|e| ConfigError::Invalid(format!("reflector {reflector:?}: {e}")))?;
+        let protocol = match rec.protocol.as_str() {
+            "dplus" => ProtocolChoice::Dplus,
+            "dextra" => ProtocolChoice::Dextra,
+            "dcs" => ProtocolChoice::Dcs,
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "protocol must be dplus|dextra|dcs, got {other:?}"
+                )));
+            }
+        };
+        if rec.modules.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "reflector {reflector}: modules list is empty"
+            )));
+        }
+        for m in &rec.modules {
+            let module = parse_module(m)?;
+            if !seen.insert((reflector.clone(), module.as_char())) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate target {reflector} module {}",
+                    module.as_char()
+                )));
+            }
+            targets.push(Target {
+                reflector: reflector.clone(),
+                reflector_callsign,
+                protocol,
+                host: rec.host.clone(),
+                port: rec.port.unwrap_or_else(|| protocol.default_port()),
+                module,
+            });
+        }
     }
-    if !crate::tier3::decoder::is_supported_bitrate(config.audio.mp3_bitrate) {
-        return Err(format!(
-            "unsupported audio.mp3_bitrate {}: must be a valid MP3 CBR bitrate \
-             (one of 8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128, 160, 192, \
-             224, 256, 320)",
-            config.audio.mp3_bitrate
-        )
-        .into());
+    if targets.is_empty() {
+        return Err(ConfigError::Invalid(
+            "no [[record]] targets configured".to_string(),
+        ));
     }
 
-    Ok(config)
+    Ok(Config {
+        callsign,
+        recordings_dir: raw.recordings_dir,
+        write_wav: raw.write_wav,
+        local_module,
+        targets,
+    })
+}
+
+/// Load and validate the configuration file at `path`.
+///
+/// # Errors
+///
+/// [`ConfigError::Io`] if the file cannot be read, otherwise as
+/// [`parse`].
+pub fn load(path: &Path) -> Result<Config, ConfigError> {
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    parse(&text)
+}
+
+fn parse_module(s: &str) -> Result<Module, ConfigError> {
+    let mut chars = s.trim().chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return Err(ConfigError::Invalid(format!(
+            "module must be a single letter A-Z, got {s:?}"
+        )));
+    };
+    Module::try_from_char(c.to_ascii_uppercase())
+        .map_err(|e| ConfigError::Invalid(format!("module {s:?}: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const GOOD: &str = r#"
+callsign = "W1AW"
+
+[[record]]
+reflector = "ref030"
+protocol = "dplus"
+host = "ref030.dstargateway.org"
+modules = ["C"]
+
+[[record]]
+reflector = "XLX039"
+protocol = "dextra"
+host = "xlx039.example.org"
+port = 30201
+modules = ["A", "B"]
+"#;
+
+    #[test]
+    fn parses_and_expands_targets() -> TestResult {
+        let cfg = parse(GOOD)?;
+        assert_eq!(cfg.targets.len(), 3);
+        assert_eq!(cfg.recordings_dir, PathBuf::from("recordings"));
+        assert!(cfg.write_wav);
+        assert_eq!(cfg.local_module, Module::D);
+        let t0 = cfg.targets.first().ok_or("no target 0")?;
+        assert_eq!(t0.reflector, "REF030", "reflector is uppercased");
+        assert_eq!(t0.port, 20001, "dplus default port");
+        assert_eq!(t0.module, Module::C);
+        let t2 = cfg.targets.get(2).ok_or("no target 2")?;
+        assert_eq!(t2.port, 30201, "explicit port wins");
+        assert_eq!(t2.module, Module::B);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unknown_protocol() {
+        let bad = GOOD.replace("dextra", "dmr");
+        let result = parse(&bad);
+        assert!(
+            matches!(result, Err(ConfigError::Invalid(ref m)) if m.contains("protocol")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_module() {
+        let bad = GOOD.replace("\"C\"", "\"CC\"");
+        let result = parse(&bad);
+        assert!(
+            matches!(result, Err(ConfigError::Invalid(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_local_module_outside_a_to_e() {
+        let bad = format!("local_module = \"G\"\n{GOOD}");
+        let result = parse(&bad);
+        assert!(
+            matches!(result, Err(ConfigError::Invalid(ref m)) if m.contains("local_module")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_target() {
+        let bad = GOOD.replace("[\"A\", \"B\"]", "[\"A\", \"A\"]");
+        let result = parse(&bad);
+        assert!(
+            matches!(result, Err(ConfigError::Invalid(ref m)) if m.contains("duplicate")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_config() {
+        let result = parse("callsign = \"W1AW\"\n");
+        assert!(
+            matches!(result, Err(ConfigError::Invalid(ref m)) if m.contains("no [[record]]")),
+            "got {result:?}"
+        );
+    }
 }

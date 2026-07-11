@@ -1,184 +1,253 @@
-//! Stargazer: D-STAR network observatory.
-//!
-//! A headless service that discovers active D-STAR reflectors, monitors XLX
-//! activity, stores it in `PostgreSQL`, exposes an HTTP API, and processes queued
-//! uploads to an `SDRTrunk`-compatible Rdio API server. Tier 3 voice-capture
-//! components exist, but live session orchestration is not yet wired.
-//!
-//! # Architecture
-//!
-//! Stargazer operates in three tiers:
-//!
-//! - **Tier 1** (Discovery): polls Pi-Star, XLX API, and ircDDB to build a
-//!   reflector registry.
-//! - **Tier 2** (Monitoring): connects to active XLX reflectors via UDP JSON
-//!   monitor protocol for real-time activity events.
-//! - **Tier 3** (Capture, stub): the decoder and capture state exist, but the
-//!   session pool does not yet establish D-STAR connections.
-//!
-//! All tiers run as independent tokio tasks. A background upload processor
-//! sends completed streams to the Rdio API server. An HTTP API provides
-//! operational visibility; manual Tier 3 controls currently return `501`.
-//!
-//! # Usage
-//!
-//! ```text
-//! stargazer --config stargazer.toml
-//! ```
+// SPDX-FileCopyrightText: 2026 Swift Raccoon
+// SPDX-License-Identifier: GPL-2.0-or-later
 
-// Dependencies used by submodules but not yet referenced from main.rs directly.
-// Each stub module will use these once implemented; the `use as _` suppresses
-// the unused_crate_dependencies lint per file (not a blanket allow).
+//! Stargazer CLI entry point.
+
+// The bin target is its own compilation unit and sees every crate
+// dependency; acknowledge the ones consumed only by the library so
+// `unused_crate_dependencies` stays silent here.
 use dstar_gateway as _;
 use dstar_gateway_core as _;
 use mbelib_rs as _;
-use mp3lame_encoder as _;
-use quick_xml as _;
 use reqwest as _;
-use scraper as _;
+use serde as _;
+use serde_json as _;
+#[cfg(test)]
+use tempfile as _;
 use thiserror as _;
-
-mod api;
-mod config;
-mod db;
-mod tier1;
-mod tier2;
-mod tier3;
-mod upload;
+use toml as _;
 
 use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
-/// Experimental D-STAR reflector discovery and XLX monitoring service.
+/// D-STAR reflector voice recorder and activity survey.
 #[derive(Debug, Parser)]
-#[command(name = "stargazer", version, about)]
-struct Cli {
-    /// Path to the TOML configuration file.
+#[command(version, about)]
+struct Args {
+    /// Path to the TOML configuration file (recording mode).
     #[arg(long, default_value = "stargazer.toml")]
     config: PathBuf,
+    /// Enable per-frame debug logging.
+    #[arg(long)]
+    verbose: bool,
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
 }
 
-fn main() {
-    let cli = Cli::parse();
+/// Subcommands beyond the default recording mode.
+#[derive(Debug, Subcommand)]
+enum Cmd {
+    /// Poll the DPLUSMON network feed and archive every observed
+    /// transmission (raw responses + deduplicated event log).
+    Survey {
+        /// Archive directory.
+        #[arg(long, default_value = "survey")]
+        out: PathBuf,
+        /// Poll interval in seconds (minimum 30).
+        #[arg(long, default_value_t = 60)]
+        interval: u64,
+        /// Poll exactly once and exit.
+        #[arg(long)]
+        once: bool,
+    },
+    /// Rank reflector modules by archived voice activity.
+    Report {
+        /// Archive directory (as used by `survey`).
+        #[arg(long, default_value = "survey")]
+        out: PathBuf,
+        /// Ranking window in hours.
+        #[arg(long, default_value_t = 24)]
+        window_hours: u64,
+    },
+}
 
-    // Initialize structured JSON logging with env-filter support.
-    // Use `RUST_LOG=stargazer=debug` to control verbosity.
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("stargazer=info")),
-        )
-        .init();
+#[tokio::main]
+async fn main() -> ExitCode {
+    let args = Args::parse();
+    init_tracing(args.verbose);
 
-    let config = match config::load(&cli.config) {
+    match args.cmd {
+        None => record(&args.config).await,
+        Some(Cmd::Survey {
+            out,
+            interval,
+            once,
+        }) => survey(&out, interval, once).await,
+        Some(Cmd::Report { out, window_hours }) => report(&out, window_hours),
+    }
+}
+
+/// Default mode: record configured reflector targets.
+async fn record(config_path: &std::path::Path) -> ExitCode {
+    let config = match stargazer::config::load(config_path) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(path = %cli.config.display(), error = %e, "failed to load config");
-            std::process::exit(1);
+            tracing::error!(path = %config_path.display(), error = %e, "config load failed");
+            return ExitCode::FAILURE;
         }
     };
-
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to build tokio runtime");
-            std::process::exit(1);
-        }
-    };
-
-    runtime.block_on(run(config));
-}
-
-/// Top-level async entry point.
-///
-/// Connects to Postgres, runs migrations, spawns all tier orchestrators and
-/// the upload processor, starts the HTTP API, then waits for either a
-/// shutdown signal (SIGTERM / ctrl-c) or any subsystem task to exit.
-///
-/// Each tier runs as an independent tokio task. A tier task is expected to
-/// run for the lifetime of the process; if one returns or panics, the entry
-/// point logs the fault and proceeds to shutdown so the orchestrator restarts
-/// the whole process instead of leaving a pod with a dead subsystem. On
-/// shutdown the remaining tasks are aborted (graceful drain will be refined
-/// later).
-async fn run(config: config::Config) {
+    if let Err(e) = std::fs::create_dir_all(&config.recordings_dir) {
+        tracing::error!(
+            dir = %config.recordings_dir.display(),
+            error = %e,
+            "cannot create recordings dir"
+        );
+        return ExitCode::FAILURE;
+    }
     tracing::info!(
-        postgres_url = %config.postgres.url,
-        tier1_pistar = config.tier1.pistar,
-        tier2_max_monitors = config.tier2.max_concurrent_monitors,
-        tier3_max_connections = config.tier3.max_concurrent_connections,
-        server_listen = %config.server.listen,
-        "stargazer starting"
+        targets = config.targets.len(),
+        recordings_dir = %config.recordings_dir.display(),
+        "stargazer recording"
     );
 
-    // Connect to Postgres and run schema migrations.
-    let pool = match db::connect(&config.postgres).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to connect to postgres");
-            return;
+    let writer = Arc::new(stargazer::writer::Writer::new(
+        config.recordings_dir.clone(),
+        config.write_wav,
+    ));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let mut supervisors = Vec::with_capacity(config.targets.len());
+    for target in config.targets.clone() {
+        supervisors.push(tokio::spawn(stargazer::session::run_supervisor(
+            target,
+            config.callsign,
+            config.local_module,
+            Arc::clone(&writer),
+            shutdown_rx.clone(),
+        )));
+    }
+
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => tracing::info!("shutdown requested"),
+        Err(e) => tracing::error!(error = %e, "ctrl-c handler failed — shutting down"),
+    }
+    let _unused = shutdown_tx.send(true);
+
+    let drain = async {
+        for sup in supervisors {
+            let _unused = sup.await;
         }
     };
-    if let Err(e) = db::migrate(&pool).await {
-        tracing::error!(error = %e, "failed to run migrations");
-        return;
+    if tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .is_err()
+    {
+        tracing::warn!("supervisors did not drain within 5s — exiting anyway");
     }
-    tracing::info!("database connected and migrated");
-
-    // Spawn each tier as an independent tokio task so that a failure
-    // in one does not take down the others.
-    let mut api_handle = tokio::spawn(api::serve(config.server.listen, pool.clone()));
-    let mut t1_handle = tokio::spawn(tier1::run(config.tier1, pool.clone()));
-    let mut t2_handle = tokio::spawn(tier2::run(config.tier2, pool.clone()));
-    let mut t3_handle = tokio::spawn(tier3::run(config.tier3, config.audio, pool.clone()));
-    let mut upload_handle = tokio::spawn(upload::run(config.rdio, pool.clone()));
-
-    tracing::info!("all tiers started");
-
-    // Wait for either a shutdown signal or any subsystem task to exit. A tier
-    // task is expected to run for the lifetime of the process; if one returns
-    // or panics, that is a fault — log it and fall through to shutdown so the
-    // orchestrator restarts the whole process instead of leaving a pod with a
-    // dead subsystem.
-    tokio::select! {
-        signal = tokio::signal::ctrl_c() => match signal {
-            Ok(()) => tracing::info!("received ctrl-c, shutting down"),
-            Err(e) => tracing::error!(error = %e, "failed to listen for ctrl-c"),
-        },
-        outcome = &mut api_handle => report_exit("api", outcome),
-        outcome = &mut t1_handle => report_exit("tier1", outcome),
-        outcome = &mut t2_handle => report_exit("tier2", outcome),
-        outcome = &mut t3_handle => report_exit("tier3", outcome),
-        outcome = &mut upload_handle => report_exit("upload", outcome),
-    }
-
-    // Abort whatever is still running. Graceful shutdown (flush pending
-    // writes, disconnect sessions, drain upload queue) will be added later.
-    api_handle.abort();
-    t1_handle.abort();
-    t2_handle.abort();
-    t3_handle.abort();
-    upload_handle.abort();
+    ExitCode::SUCCESS
 }
 
-/// Outcome of awaiting a spawned subsystem task: the inner `Result` is the
-/// task's own return value, the outer layer captures a panic or cancellation.
-type TaskOutcome =
-    Result<Result<(), Box<dyn std::error::Error + Send + Sync>>, tokio::task::JoinError>;
+/// Survey mode: poll the DPLUSMON feed gently and archive everything.
+async fn survey(out: &std::path::Path, interval: u64, once: bool) -> ExitCode {
+    let interval = interval.max(stargazer::survey::MIN_INTERVAL_SECS);
+    let mut surveyor = match stargazer::survey::Surveyor::new(out) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "survey init failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(
+        archive = %out.display(),
+        interval_s = interval,
+        seeded_events = surveyor.total_seen(),
+        "surveying DPLUS activity via DPLUSMON"
+    );
 
-/// Logs why a subsystem task exited.
-///
-/// Tier tasks are expected to run for the lifetime of the process, so every
-/// exit path here is a fault and is logged at `error` level.
-fn report_exit(name: &str, outcome: TaskOutcome) {
-    match outcome {
-        Ok(Ok(())) => tracing::error!(task = name, "subsystem task exited unexpectedly"),
-        Ok(Err(e)) => tracing::error!(task = name, error = %e, "subsystem task failed"),
-        Err(e) => tracing::error!(task = name, error = %e, "subsystem task panicked"),
+    let mut consecutive_errors: u32 = 0;
+    loop {
+        match surveyor.poll_once().await {
+            Err(e) => {
+                // Archive I/O failure — the archive is the point.
+                tracing::error!(error = %e, "survey archive failure");
+                return ExitCode::FAILURE;
+            }
+            Ok(rec) => {
+                if let Some(err) = &rec.error {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    tracing::warn!(error = %err, consecutive = consecutive_errors, "poll failed");
+                } else {
+                    consecutive_errors = 0;
+                    tracing::info!(
+                        rows = rec.rows,
+                        new = rec.new_events,
+                        total = surveyor.total_seen(),
+                        gap_risk = rec.gap_risk,
+                        "poll ok"
+                    );
+                    if rec.gap_risk {
+                        tracing::warn!(
+                            "feed window rolled over between polls — some rows may be missing"
+                        );
+                    }
+                }
+            }
+        }
+        if once {
+            return ExitCode::SUCCESS;
+        }
+        // Back off politely on repeated errors: up to 16× interval.
+        let factor = 1u64 << consecutive_errors.min(4);
+        let sleep = Duration::from_secs(interval.saturating_mul(factor));
+        tokio::select! {
+            () = tokio::time::sleep(sleep) => {}
+            result = tokio::signal::ctrl_c() => {
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "ctrl-c handler failed — exiting");
+                }
+                tracing::info!("survey stopped");
+                return ExitCode::SUCCESS;
+            }
+        }
     }
+}
+
+/// Report mode: rank reflector modules from the archived events.
+fn report(out: &std::path::Path, window_hours: u64) -> ExitCode {
+    let archive = stargazer::survey::Archive::new(out);
+    let events = match archive.load_events() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(error = %e, archive = %out.display(), "cannot read archive");
+            return ExitCode::FAILURE;
+        }
+    };
+    let hours = i64::try_from(window_hours).unwrap_or(i64::MAX);
+    let since = chrono::Utc::now() - chrono::TimeDelta::hours(hours);
+    let ranked = stargazer::survey::rank_activity(&events, since);
+
+    println!(
+        "DPLUS voice activity — last {window_hours}h ({} events archived)",
+        events.len()
+    );
+    // Manually aligned to the row format below.
+    println!("REFLECTOR  MODULE TRANSMISSIONS  STATIONS  LAST HEARD (UTC)");
+    for row in &ranked {
+        println!(
+            "{:<10} {:<6} {:>13} {:>9}  {}",
+            row.reflector,
+            row.module,
+            row.transmissions,
+            row.distinct_callsigns,
+            row.last_heard.format("%Y-%m-%d %H:%M:%S")
+        );
+    }
+    if ranked.is_empty() {
+        println!("(no reflector activity in window — is the survey running?)");
+    }
+    ExitCode::SUCCESS
+}
+
+fn init_tracing(verbose: bool) {
+    use tracing_subscriber::EnvFilter;
+    let default = if verbose { "debug" } else { "info" };
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }

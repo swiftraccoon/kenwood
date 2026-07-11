@@ -48,3 +48,8 @@ lodestar/build/
 lodestar/Lodestar.xcodeproj/
 lodestar/*.xcworkspace/
 lodestar/DerivedData/
+
+# stargazer operator data (recordings + survey archives + local config)
+/recordings/
+/survey/
+/stargazer.toml
