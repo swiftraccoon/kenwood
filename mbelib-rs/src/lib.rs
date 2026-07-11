@@ -160,6 +160,240 @@ pub fn decode_trace(ambe: &[u8; 9]) -> ([usize; 9], f32, usize, [u8; 49]) {
     (b, w0, big_l, ambe_d)
 }
 
+/// Classification of a decoded AMBE frame, derived from the b0 field.
+///
+/// Mirrors the decoder's internal frame disposition exactly: tone
+/// frames are `(b0 & 0x7E) == 0x7E` (b0 ∈ {126, 127}), erasure
+/// frames are `b0 ∈ 120..=123`, and everything else — including the
+/// b0 ∈ {124, 125} silence encodings — decodes as voice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameKind {
+    /// Speech-model frame (includes explicit silence encodings).
+    Voice,
+    /// Encoder-signalled unrecoverable frame.
+    Erasure,
+    /// Tone-signalling frame (DVSI encoders emit these for pure tones).
+    Tone,
+}
+
+/// Per-frame FEC summary for archival and quality metadata.
+///
+/// Produced by [`frame_fec`]. The counts depend only on the input
+/// wire bytes (no decoder state), so archived frames re-derive the
+/// same numbers forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameFec {
+    /// Golay(24,12) corrections applied to the C0 codeword.
+    pub c0_errors: u32,
+    /// Total corrected bits across all FEC-protected codewords
+    /// (the analog of mbelib's `errs2`).
+    pub total_errors: u32,
+    /// Frame classification decoded from b0.
+    pub kind: FrameKind,
+}
+
+/// Classify a decoded b0 value into a [`FrameKind`].
+pub(crate) const fn classify_b0(b0: usize) -> FrameKind {
+    if (b0 & 0x7E) == 0x7E {
+        FrameKind::Tone
+    } else if matches!(b0, 120..=123) {
+        FrameKind::Erasure
+    } else {
+        FrameKind::Voice
+    }
+}
+
+/// Compute the per-frame FEC error summary for one 9-byte AMBE frame.
+///
+/// Runs the same stateless unpack → ECC pipeline as [`decode_trace`]
+/// but returns the correction counts that both [`decode_trace`] and
+/// [`AmbeDecoder::decode_frame`] discard. Intended for recorders and
+/// dataset tooling that need a signal-quality index per frame.
+#[must_use]
+pub fn frame_fec(ambe: &[u8; 9]) -> FrameFec {
+    let mut ambe_fr = [0u8; AMBE_FRAME_BITS];
+    let mut ambe_d = [0u8; AMBE_DATA_BITS];
+    unpack::unpack_frame(ambe, &mut ambe_fr);
+    let c0_errors = ecc::ecc_c0(&mut ambe_fr);
+    unpack::demodulate_c1(&mut ambe_fr);
+    let data_errors = ecc::ecc_data(&ambe_fr, &mut ambe_d);
+
+    let bit = |i: usize| usize::from(*ambe_d.get(i).unwrap_or(&0));
+    let b0 = (bit(0) << 6)
+        | (bit(1) << 5)
+        | (bit(2) << 4)
+        | (bit(3) << 3)
+        | (bit(4) << 2)
+        | (bit(5) << 1)
+        | bit(48);
+
+    FrameFec {
+        c0_errors,
+        total_errors: c0_errors + data_errors,
+        kind: classify_b0(b0),
+    }
+}
+
+/// Number of harmonic bands exposed per frame by [`FrameParams`].
+///
+/// The AMBE 3600×2400 codec produces 9..=56 bands depending on the
+/// fundamental; slots past [`FrameParams::harmonics`] are padding.
+pub const PARAM_BANDS: usize = 56;
+
+/// Per-frame vocoder parameters, extracted without synthesis.
+///
+/// This is the harmonic speech model the codec transmits — the same
+/// parameter family (fundamental, per-band voicing, spectral
+/// amplitudes) that vocoder-parameter ASR consumes directly instead
+/// of reconstructed audio.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameParams {
+    /// Fundamental frequency in Hz (8 kHz sample-rate domain).
+    /// Zero for erasure/tone frames.
+    pub f0_hz: f32,
+    /// Harmonic band count L (9..=56 for voice frames, else 0).
+    pub harmonics: usize,
+    /// Frame classification (voice / erasure / tone).
+    pub kind: FrameKind,
+    /// Voiced decision per band; index `i` is band `i + 1`, valid
+    /// for `i < harmonics`, padding `false` beyond.
+    pub voiced: [bool; PARAM_BANDS],
+    /// Linear spectral magnitude per band, same indexing, padding 0.
+    pub amplitudes: [f32; PARAM_BANDS],
+    /// Total FEC-corrected bits in this frame.
+    pub fec_errors: u32,
+    /// True when the frame's parameters were repeated from the
+    /// previous frame (untrustworthy FEC or concealment), mirroring
+    /// the decoder's repeat disposition.
+    pub repeated: bool,
+}
+
+impl FrameParams {
+    const fn empty(kind: FrameKind, fec_errors: u32) -> Self {
+        Self {
+            f0_hz: 0.0,
+            harmonics: 0,
+            kind,
+            voiced: [false; PARAM_BANDS],
+            amplitudes: [0.0; PARAM_BANDS],
+            fec_errors,
+            repeated: false,
+        }
+    }
+}
+
+/// Stateful vocoder-parameter extractor: the decoder's parameter
+/// track without audio synthesis.
+///
+/// AMBE delta-codes gain and predicts magnitudes from the previous
+/// frame, so extraction is sequential — feed frames in stream order,
+/// one extractor per stream, exactly like [`AmbeDecoder`]. The
+/// disposition rules mirror the decoder: untrustworthy frames
+/// (more than 3 corrected bits) repeat the previous parameters,
+/// sustained repeats reset the model, and erasure/tone frames reset
+/// it immediately.
+#[derive(Debug, Clone)]
+pub struct AmbeParamExtractor {
+    cur: MbeParams,
+    prev: MbeParams,
+}
+
+impl Default for AmbeParamExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AmbeParamExtractor {
+    /// Creates an extractor with zeroed initial state.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            cur: MbeParams::new(),
+            prev: MbeParams::new(),
+        }
+    }
+
+    /// Extracts one frame's parameters from 9 AMBE wire bytes.
+    pub fn extract(&mut self, ambe: &[u8; 9]) -> FrameParams {
+        let mut ambe_fr = [0u8; AMBE_FRAME_BITS];
+        let mut ambe_d = [0u8; AMBE_DATA_BITS];
+        unpack::unpack_frame(ambe, &mut ambe_fr);
+        let c0_errors = ecc::ecc_c0(&mut ambe_fr);
+        unpack::demodulate_c1(&mut ambe_fr);
+        let other_errors = ecc::ecc_data(&ambe_fr, &mut ambe_d);
+        let errs2 = c0_errors + other_errors;
+
+        let status = decode::decode_params(&ambe_d, &mut self.cur, &self.prev);
+        match status {
+            decode::FrameStatus::Voice => {}
+            decode::FrameStatus::Tone { .. } => {
+                *self = Self::new();
+                return FrameParams::empty(FrameKind::Tone, errs2);
+            }
+            decode::FrameStatus::Erasure => {
+                *self = Self::new();
+                return FrameParams::empty(FrameKind::Erasure, errs2);
+            }
+        }
+
+        let repeated = if errs2 > adaptive::MAX_CORRECTED_BITS {
+            let prev_repeat = self.prev.repeat_count;
+            self.cur.copy_from(&self.prev);
+            self.cur.repeat_count = prev_repeat + 1;
+            true
+        } else {
+            self.cur.repeat_count = 0;
+            false
+        };
+        if self.cur.repeat_count > adaptive::MAX_FRAME_REPEATS {
+            *self = Self::new();
+            let mut out = FrameParams::empty(FrameKind::Voice, errs2);
+            out.repeated = true;
+            return out;
+        }
+
+        let out = self.snapshot(errs2, repeated);
+        self.prev.copy_from(&self.cur);
+        out
+    }
+
+    /// Emits parameters for a frame known to be missing (sequence
+    /// gap): the previous frame's parameters, marked `repeated`,
+    /// with the decoder's sustained-loss reset semantics.
+    pub fn conceal(&mut self) -> FrameParams {
+        let prev_repeat = self.prev.repeat_count;
+        self.cur.copy_from(&self.prev);
+        self.cur.repeat_count = prev_repeat + 1;
+        if self.cur.repeat_count > adaptive::MAX_FRAME_REPEATS {
+            *self = Self::new();
+            let mut out = FrameParams::empty(FrameKind::Voice, 0);
+            out.repeated = true;
+            return out;
+        }
+        let out = self.snapshot(0, true);
+        self.prev.copy_from(&self.cur);
+        out
+    }
+
+    fn snapshot(&self, fec_errors: u32, repeated: bool) -> FrameParams {
+        let mut out = FrameParams::empty(FrameKind::Voice, fec_errors);
+        out.repeated = repeated;
+        out.f0_hz = self.cur.w0 / std::f32::consts::TAU * 8000.0;
+        out.harmonics = self.cur.l.min(PARAM_BANDS);
+        for band in 1..=out.harmonics {
+            if let (Some(v), Some(a)) = (
+                out.voiced.get_mut(band - 1),
+                out.amplitudes.get_mut(band - 1),
+            ) {
+                *v = self.cur.vl.get(band).copied().unwrap_or(false);
+                *a = self.cur.ml.get(band).copied().unwrap_or(0.0);
+            }
+        }
+        out
+    }
+}
+
 #[cfg(feature = "encoder")]
 pub use encode::{
     AmbeEncoder, EncoderBuffers, FftPlan, MAX_BANDS, MAX_HARMONICS, PitchEstimate, PitchTracker,
@@ -567,5 +801,185 @@ mod tests {
         );
         assert_eq!(out[2], 0);
         assert_eq!(out[3], 0);
+    }
+}
+
+#[cfg(test)]
+mod param_extractor_tests {
+    use super::*;
+
+    const SILENCE: [u8; 9] = [0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8];
+
+    #[test]
+    fn silence_frame_yields_valid_voice_params() {
+        let mut ex = AmbeParamExtractor::new();
+        let p = ex.extract(&SILENCE);
+        assert_eq!(p.kind, FrameKind::Voice);
+        assert!(!p.repeated);
+        assert_eq!(p.fec_errors, 0);
+        assert!(
+            (9..=PARAM_BANDS).contains(&p.harmonics),
+            "harmonics {} out of codec range",
+            p.harmonics
+        );
+        assert!(
+            p.f0_hz > 0.0 && p.f0_hz < 500.0,
+            "f0 {} implausible",
+            p.f0_hz
+        );
+        // Padding beyond L stays inert.
+        for i in p.harmonics..PARAM_BANDS {
+            assert_eq!(p.voiced.get(i), Some(&false));
+            assert_eq!(p.amplitudes.get(i), Some(&0.0));
+        }
+    }
+
+    #[test]
+    fn extraction_is_deterministic_per_stream() {
+        let mut a = AmbeParamExtractor::new();
+        let mut b = AmbeParamExtractor::new();
+        for _ in 0..3 {
+            assert_eq!(a.extract(&SILENCE), b.extract(&SILENCE));
+        }
+    }
+
+    #[test]
+    fn conceal_repeats_previous_parameters() {
+        let mut ex = AmbeParamExtractor::new();
+        let voice = ex.extract(&SILENCE);
+        let gap = ex.conceal();
+        assert!(gap.repeated);
+        assert_eq!(gap.kind, FrameKind::Voice);
+        assert!((gap.f0_hz - voice.f0_hz).abs() < f32::EPSILON);
+        assert_eq!(gap.harmonics, voice.harmonics);
+    }
+
+    #[test]
+    fn sustained_concealment_resets_like_the_decoder() {
+        let mut ex = AmbeParamExtractor::new();
+        let _voice = ex.extract(&SILENCE);
+        // MAX_FRAME_REPEATS is 3: the 4th consecutive conceal resets.
+        for _ in 0..3 {
+            let p = ex.conceal();
+            assert!(p.repeated);
+            assert!(p.harmonics > 0, "repeats keep the model alive");
+        }
+        let reset = ex.conceal();
+        assert!(reset.repeated);
+        assert_eq!(reset.harmonics, 0, "sustained loss resets the model");
+    }
+
+    #[test]
+    fn kind_agrees_with_frame_fec() {
+        for frame in [[0u8; 9], SILENCE, [0xFF; 9], [0xA5; 9]] {
+            let mut ex = AmbeParamExtractor::new();
+            assert_eq!(
+                ex.extract(&frame).kind,
+                frame_fec(&frame).kind,
+                "{frame:02X?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod frame_fec_tests {
+    use super::*;
+
+    /// The D-STAR AMBE silence frame (same bytes as
+    /// `DSTAR_AMBE_NULL` in g4klx/MMDVMHost `DStarDefines.h`).
+    const SILENCE: [u8; 9] = [0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8];
+
+    /// An all-zero frame is NOT FEC-clean end to end: C0 is the valid
+    /// zero Golay codeword (0 corrections), but the C1 bits are then
+    /// LFSR-descrambled with the C0-seeded PRN, and that descrambled
+    /// pattern is not a codeword — the data-path Golay reports 2
+    /// corrections. Pinned here as a regression guard on the ECC
+    /// accounting; [`SILENCE`] is the true zero-error baseline.
+    #[test]
+    fn zero_frame_c0_is_clean_but_descrambled_c1_is_not() {
+        let fec = frame_fec(&[0u8; 9]);
+        assert_eq!(fec.c0_errors, 0, "all-zero C0 is the valid zero codeword");
+        assert_eq!(
+            fec.total_errors, 2,
+            "descrambled all-zero C1 needs corrections"
+        );
+        assert_eq!(fec.kind, FrameKind::Voice);
+    }
+
+    /// Flipping a single wire bit inside the FEC-protected region of
+    /// a clean frame registers exactly one correction. The protected
+    /// wire positions depend on the interleave table, so the test
+    /// locates one empirically instead of hardcoding an index.
+    #[test]
+    fn single_flipped_protected_bit_is_corrected() {
+        let mut found = false;
+        for bit_index in 0..72u32 {
+            let mut frame = SILENCE;
+            let byte = (bit_index / 8) as usize;
+            if let Some(b) = frame.get_mut(byte) {
+                *b ^= 1u8 << (bit_index % 8);
+            }
+            let fec = frame_fec(&frame);
+            if fec.c0_errors == 1 {
+                assert_eq!(
+                    fec.total_errors, 1,
+                    "a lone C0 bit error must be the only correction (bit {bit_index})"
+                );
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "no wire bit flip landed in C0 — interleave regression?"
+        );
+    }
+
+    #[test]
+    fn silence_frame_is_clean() {
+        let fec = frame_fec(&SILENCE);
+        assert_eq!(fec.total_errors, 0, "valid DVSI frame needs no corrections");
+        assert_eq!(
+            fec.kind,
+            FrameKind::Voice,
+            "silence b0 (124/125) is a voice-status frame"
+        );
+    }
+
+    /// `frame_fec`'s kind must agree with the classification rule
+    /// applied to the b0 that `decode_trace` extracts from the same
+    /// wire bytes — the two paths share the unpack→ECC pipeline.
+    #[test]
+    fn kind_agrees_with_decode_trace_b0() {
+        for frame in [[0u8; 9], SILENCE, [0xFF; 9], [0xA5; 9]] {
+            let (b, _, _, _) = decode_trace(&frame);
+            assert_eq!(
+                frame_fec(&frame).kind,
+                classify_b0(b[0]),
+                "frame {frame:02X?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_b0_ranges() {
+        assert_eq!(classify_b0(0), FrameKind::Voice);
+        assert_eq!(classify_b0(119), FrameKind::Voice);
+        for b0 in 120..=123 {
+            assert_eq!(classify_b0(b0), FrameKind::Erasure, "b0={b0}");
+        }
+        assert_eq!(
+            classify_b0(124),
+            FrameKind::Voice,
+            "silence is voice-status"
+        );
+        assert_eq!(
+            classify_b0(125),
+            FrameKind::Voice,
+            "silence is voice-status"
+        );
+        assert_eq!(classify_b0(126), FrameKind::Tone);
+        assert_eq!(classify_b0(127), FrameKind::Tone);
     }
 }
