@@ -18,6 +18,7 @@ tokio = { version = "1", features = [
   "sync",
   "time",
   "net",
+  "io-util",
 ] }
 reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",

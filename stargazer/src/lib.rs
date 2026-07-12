@@ -17,6 +17,7 @@ use tracing_subscriber as _;
 pub mod audio;
 pub mod capture;
 pub mod config;
+pub mod control;
 pub mod harvest;
 pub mod session;
 pub mod survey;

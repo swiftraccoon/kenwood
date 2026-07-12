@@ -87,7 +87,40 @@ enum Cmd {
         /// Match and report only — download and write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Operator callsign advertised in the User-Agent so server
+        /// owners can identify and contact who is fetching (default:
+        /// the callsign from --config when that file exists).
+        #[arg(long)]
+        operator: Option<String>,
     },
+    /// Control the running recorder: free or reclaim individual
+    /// reflector slots and apply config target changes, all without
+    /// restarting (and without touching the other links).
+    Ctl {
+        #[command(subcommand)]
+        action: CtlAction,
+    },
+}
+
+/// Actions for `stargazer ctl`.
+#[derive(Debug, Subcommand)]
+enum CtlAction {
+    /// Show every configured target's state.
+    Status,
+    /// Unlink one target and keep its slot free (persists across
+    /// recorder restarts until `enable`).
+    Disable {
+        /// Target key, e.g. `REF030-C`.
+        target: String,
+    },
+    /// Relink a disabled target.
+    Enable {
+        /// Target key, e.g. `REF030-C`.
+        target: String,
+    },
+    /// Re-read the config file and start/stop supervisors to match
+    /// its target list.
+    Reload,
 }
 
 /// Parse a `--date` argument.
@@ -115,8 +148,68 @@ async fn main() -> ExitCode {
             base_url,
             limit,
             dry_run,
-        }) => harvest(&recordings, date, &target, base_url, limit, dry_run).await,
+            operator,
+        }) => {
+            // Identify the responsible operator in the User-Agent —
+            // explicit flag first, recorder config as the fallback.
+            let operator = operator.or_else(|| {
+                stargazer::config::load(&args.config)
+                    .ok()
+                    .map(|c| c.callsign.as_str().trim_end().to_string())
+            });
+            let options = stargazer::harvest::HarvestOptions {
+                base_url,
+                limit,
+                dry_run,
+                operator,
+                ..stargazer::harvest::HarvestOptions::default()
+            };
+            harvest(&recordings, date, &target, options).await
+        }
+        Some(Cmd::Ctl { action }) => ctl(&args.config, action).await,
     }
+}
+
+/// Send one control command to the running recorder and print the
+/// response.
+async fn ctl(config_path: &std::path::Path, action: CtlAction) -> ExitCode {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let config = match stargazer::config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(path = %config_path.display(), error = %e, "config load failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let socket = config.recordings_dir.join(stargazer::control::SOCKET_FILE);
+    let line = match action {
+        CtlAction::Status => "status".to_string(),
+        CtlAction::Disable { target } => format!("disable {target}"),
+        CtlAction::Enable { target } => format!("enable {target}"),
+        CtlAction::Reload => "reload".to_string(),
+    };
+    let mut stream = match tokio::net::UnixStream::connect(&socket).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                socket = %socket.display(),
+                error = %e,
+                "cannot reach the recorder — is it running (with control support)?"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = stream.write_all(format!("{line}\n").as_bytes()).await {
+        tracing::error!(error = %e, "control request failed");
+        return ExitCode::FAILURE;
+    }
+    let mut response = String::new();
+    if let Err(e) = stream.read_to_string(&mut response).await {
+        tracing::error!(error = %e, "control response failed");
+        return ExitCode::FAILURE;
+    }
+    print!("{response}");
+    ExitCode::SUCCESS
 }
 
 /// Default mode: record configured reflector targets.
@@ -146,36 +239,67 @@ async fn record(config_path: &std::path::Path) -> ExitCode {
         config.recordings_dir.clone(),
         config.write_wav,
     ));
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-    let mut supervisors = Vec::with_capacity(config.targets.len());
-    for target in config.targets.clone() {
-        supervisors.push(tokio::spawn(stargazer::session::run_supervisor(
-            target,
-            config.callsign,
-            config.local_module,
-            Arc::clone(&writer),
-            shutdown_rx.clone(),
-        )));
+    let mut coordinator =
+        match stargazer::control::Coordinator::new(config, config_path.to_path_buf(), writer) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "coordinator init failed");
+                return ExitCode::FAILURE;
+            }
+        };
+    // Single-instance guard BEFORE any reflector is touched: two
+    // recorders share one callsign and would displace each other on
+    // every slot, so a second instance must die without connecting.
+    let socket_path = coordinator.socket_path();
+    if stargazer::control::recorder_already_running(&socket_path).await {
+        tracing::error!(
+            socket = %socket_path.display(),
+            "another recorder is already running — refusing to start a second"
+        );
+        return ExitCode::FAILURE;
     }
-
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => tracing::info!("shutdown requested"),
-        Err(e) => tracing::error!(error = %e, "ctrl-c handler failed — shutting down"),
-    }
-    let _unused = shutdown_tx.send(true);
-
-    let drain = async {
-        for sup in supervisors {
-            let _unused = sup.await;
+    let _unused = std::fs::remove_file(&socket_path); // stale socket after a crash
+    let listener = match tokio::net::UnixListener::bind(&socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(socket = %socket_path.display(), error = %e, "control socket bind failed");
+            return ExitCode::FAILURE;
         }
     };
-    if tokio::time::timeout(Duration::from_secs(5), drain)
+    coordinator.spawn_initial();
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(16);
+    let server = tokio::spawn(stargazer::control::serve_socket(listener, request_tx));
+    tracing::info!(socket = %socket_path.display(), "control socket ready (`stargazer ctl status`)");
+
+    loop {
+        tokio::select! {
+            sig = tokio::signal::ctrl_c() => {
+                match sig {
+                    Ok(()) => tracing::info!("shutdown requested"),
+                    Err(e) => tracing::error!(error = %e, "ctrl-c handler failed — shutting down"),
+                }
+                break;
+            }
+            () = terminate_signal() => {
+                tracing::info!("termination requested (service stop)");
+                break;
+            }
+            request = request_rx.recv() => {
+                let Some((command, reply)) = request else { break };
+                let response = coordinator.handle(command).await;
+                let _unused = reply.send(response);
+            }
+        }
+    }
+
+    server.abort();
+    if tokio::time::timeout(Duration::from_secs(8), coordinator.shutdown_all())
         .await
         .is_err()
     {
-        tracing::warn!("supervisors did not drain within 5s — exiting anyway");
+        tracing::warn!("supervisors did not drain within 8s — exiting anyway");
     }
+    let _unused = std::fs::remove_file(&socket_path);
     ExitCode::SUCCESS
 }
 
@@ -249,19 +373,13 @@ async fn harvest(
     recordings: &std::path::Path,
     date: Option<chrono::NaiveDate>,
     targets: &[String],
-    base_url: Option<String>,
-    limit: Option<usize>,
-    dry_run: bool,
+    options: stargazer::harvest::HarvestOptions,
 ) -> ExitCode {
-    use stargazer::harvest::{HarvestOptions, Harvester, split_target};
+    use stargazer::harvest::{Harvester, split_target};
 
     let date = date.unwrap_or_else(|| chrono::Utc::now().date_naive());
-    let harvester = match Harvester::new(HarvestOptions {
-        base_url: base_url.clone(),
-        limit,
-        dry_run,
-        ..HarvestOptions::default()
-    }) {
+    let has_base_override = options.base_url.is_some();
+    let harvester = match Harvester::new(options) {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %e, "harvester init failed");
@@ -290,7 +408,7 @@ async fn harvest(
             .filter(|name| match split_target(name) {
                 None => false,
                 Some((system, _)) => {
-                    let derivable = base_url.is_some()
+                    let derivable = has_base_override
                         || stargazer::harvest::derived_base_url(&system).is_some();
                     if !derivable {
                         tracing::info!(
@@ -408,6 +526,25 @@ fn report(out: &std::path::Path, window_hours: u64) -> ExitCode {
         println!("(no reflector activity in window — is the survey running?)");
     }
     ExitCode::SUCCESS
+}
+
+/// Resolves when SIGTERM arrives (how launchd stops a service);
+/// pends forever where SIGTERM does not exist or cannot be hooked.
+async fn terminate_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                let _unused = sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM handler failed — only ctrl-c will stop us");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    std::future::pending::<()>().await;
 }
 
 fn init_tracing(verbose: bool) {
