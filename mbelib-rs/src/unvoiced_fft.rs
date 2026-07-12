@@ -288,14 +288,18 @@ fn generate_noise_with_overlap(buffer: &mut [f32; FFT_SIZE], params: &mut MbePar
 /// `noise_buffer` is the pre-generated noise; passing it in (rather than
 /// generating internally) lets the caller share the noise samples with
 /// JMBE phase calculation (algorithm #140).
+///
+/// `unvoiced_gain` multiplies the excitation level; `1.0` is
+/// mbelib/JMBE parity.
 pub(crate) fn synthesize_unvoiced(
     output: &mut [f32; FRAME_LEN],
     cur: &mut MbeParams,
     prev: &MbeParams,
     noise_buffer: &[f32; FFT_SIZE],
+    unvoiced_gain: f32,
 ) {
     FFT_PLAN.with_borrow_mut(|plan| {
-        synthesize_unvoiced_with_plan(plan, output, cur, prev, noise_buffer);
+        synthesize_unvoiced_with_plan(plan, output, cur, prev, noise_buffer, unvoiced_gain);
     });
 }
 
@@ -320,6 +324,7 @@ fn compute_unvoiced_band_scalors(
     cur: &MbeParams,
     big_l: usize,
     w0: f32,
+    unvoiced_gain: f32,
 ) {
     let mult = BIN_FREQ_MULT * w0;
     for l in 1..=big_l.min(56) {
@@ -368,7 +373,7 @@ fn compute_unvoiced_band_scalors(
         )]
         let denom = bin_count as f32;
         let ml = cur.ml.get(l).copied().unwrap_or(0.0);
-        let scalor = UNVOICED_SCALE_COEFF * ml / (numerator / denom).sqrt();
+        let scalor = (UNVOICED_SCALE_COEFF * unvoiced_gain) * ml / (numerator / denom).sqrt();
 
         for slot in bin_scalor.get_mut(a_min..b_max).into_iter().flatten() {
             *slot = scalor;
@@ -382,6 +387,7 @@ fn synthesize_unvoiced_with_plan(
     cur: &mut MbeParams,
     prev: &MbeParams,
     noise_buffer: &[f32; FFT_SIZE],
+    unvoiced_gain: f32,
 ) {
     let big_l = cur.l;
     let w0 = cur.w0;
@@ -404,7 +410,14 @@ fn synthesize_unvoiced_with_plan(
     // For unvoiced bands, scale = UNVOICED_SCALE_COEFF * Ml / sqrt(rms²).
     // For voiced bands, scale = 0 (zero out those bins).
     let mut bin_scalor = [0.0_f32; FFT_BINS];
-    compute_unvoiced_band_scalors(&mut bin_scalor, &plan.fft_spec, cur, big_l, w0);
+    compute_unvoiced_band_scalors(
+        &mut bin_scalor,
+        &plan.fft_spec,
+        cur,
+        big_l,
+        w0,
+        unvoiced_gain,
+    );
 
     // Apply per-bin scaling (voiced bands' bins are still 0 → zeroed).
     for (bin, &scale) in plan.fft_spec.iter_mut().zip(bin_scalor.iter()) {
@@ -558,7 +571,7 @@ mod tests {
         let noise = make_noise_buffer(&mut cur);
         let mut output = [0.5_f32; FRAME_LEN];
         let baseline = output;
-        synthesize_unvoiced(&mut output, &mut cur, &prev, &noise);
+        synthesize_unvoiced(&mut output, &mut cur, &prev, &noise, 1.0);
 
         // Voiced bands → zeroed bins → IFFT produces ~zero → WOLA adds
         // ~zero to output. Output should be very close to baseline.

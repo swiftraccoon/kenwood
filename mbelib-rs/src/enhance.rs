@@ -23,6 +23,7 @@
 //! GPL-2.0-or-later). The recurrence formula itself is the standard
 //! angle-addition identity (cf. Numerical Recipes §5.5).
 
+use crate::SynthesisTuning;
 use crate::params::MbeParams;
 
 /// Enhances spectral magnitudes in the decoded parameters.
@@ -59,7 +60,10 @@ use crate::params::MbeParams;
 ///
 /// * `params` - Mutable reference to the decoded parameters. The `ml`
 ///   array is modified in-place.
-pub(crate) fn spectral_amp_enhance(params: &mut MbeParams) {
+/// * `tuning` - Synthesis tuning; [`SynthesisTuning::PARITY`] keeps
+///   the constants above ( `0.96`, `0.25`, clamp `[0.5, 1.2]` ) and is
+///   bit-exact with the historical hard-coded behavior.
+pub(crate) fn spectral_amp_enhance(params: &mut MbeParams, tuning: &SynthesisTuning) {
     let big_l = params.l;
     if big_l == 0 {
         return;
@@ -129,10 +133,11 @@ pub(crate) fn spectral_amp_enhance(params: &mut MbeParams) {
 
         // Spectral density ratio: numerator measures local density at
         // band l, denominator is the global spectral density estimate.
-        // The 0.96*pi factor is a perceptual tuning constant from the
-        // AMBE specification.
-        let numerator =
-            0.96 * std::f32::consts::PI * (2.0 * rm0 * rm1).mul_add(-cos_w0l, rm0_sq + rm1_sq);
+        // The alpha*pi factor is a perceptual tuning constant — 0.96
+        // in the AMBE specification and at parity.
+        let numerator = tuning.enhance_alpha
+            * std::f32::consts::PI
+            * (2.0 * rm0 * rm1).mul_add(-cos_w0l, rm0_sq + rm1_sq);
         let denominator = params.w0 * rm0 * (rm0_sq - rm1_sq);
 
         // Guard against division by zero when the spectrum is perfectly
@@ -141,20 +146,20 @@ pub(crate) fn spectral_amp_enhance(params: &mut MbeParams) {
             continue;
         }
 
-        let wl = ml.sqrt() * (numerator / denominator).powf(0.25);
+        let wl = ml.sqrt() * (numerator / denominator).powf(tuning.enhance_exponent);
 
         // Bands in the lowest eighth of the spectrum (8*l <= L) are
         // exempt from enhancement. These carry the fundamental frequency
         // structure and should not be modified.
         if 8 * l <= big_l {
             // Intentionally no modification for the lowest bands.
-        } else if wl > 1.2 {
+        } else if wl > tuning.enhance_clamp_hi {
             if let Some(slot) = params.ml.get_mut(l) {
-                *slot = 1.2 * ml;
+                *slot = tuning.enhance_clamp_hi * ml;
             }
-        } else if wl < 0.5 {
+        } else if wl < tuning.enhance_clamp_lo {
             if let Some(slot) = params.ml.get_mut(l) {
-                *slot = 0.5 * ml;
+                *slot = tuning.enhance_clamp_lo * ml;
             }
         } else if let Some(slot) = params.ml.get_mut(l) {
             *slot = wl * ml;
@@ -296,7 +301,7 @@ mod tests {
         params.l = 12;
         params.w0 = 0.04;
 
-        spectral_amp_enhance(&mut params);
+        spectral_amp_enhance(&mut params, &SynthesisTuning::PARITY);
 
         for l in 1..=params.l {
             let ml = params.ml.get(l).copied().unwrap_or(f32::NAN);
@@ -319,7 +324,7 @@ mod tests {
         }
 
         let original_energy = original_ml * original_ml;
-        spectral_amp_enhance(&mut params);
+        spectral_amp_enhance(&mut params, &SynthesisTuning::PARITY);
 
         let enhanced_ml = *params.ml.get(band).ok_or("ml out of bounds")?;
         let enhanced_energy = enhanced_ml * enhanced_ml;
@@ -365,7 +370,7 @@ mod tests {
             })
             .sum();
 
-        spectral_amp_enhance(&mut params);
+        spectral_amp_enhance(&mut params, &SynthesisTuning::PARITY);
 
         // Compute enhanced total energy.
         let enhanced_energy: f32 = (1..=params.l)
@@ -391,7 +396,7 @@ mod tests {
         params.l = 0;
         params.w0 = 0.04;
 
-        spectral_amp_enhance(&mut params);
+        spectral_amp_enhance(&mut params, &SynthesisTuning::PARITY);
 
         // Nothing should have changed.
         assert_eq!(params.l, 0);
@@ -419,7 +424,7 @@ mod tests {
             .map(|l| params.ml.get(l).copied().unwrap_or(0.0))
             .collect();
 
-        spectral_amp_enhance(&mut params);
+        spectral_amp_enhance(&mut params, &SynthesisTuning::PARITY);
 
         // After gamma normalization, the exact bounds are scaled, but
         // the relative ratios between bands should reflect the clamping.
@@ -460,8 +465,8 @@ mod tests {
         let mut p1 = make_params();
         let mut p2 = make_params();
 
-        spectral_amp_enhance(&mut p1);
-        spectral_amp_enhance(&mut p2);
+        spectral_amp_enhance(&mut p1, &SynthesisTuning::PARITY);
+        spectral_amp_enhance(&mut p2, &SynthesisTuning::PARITY);
 
         for l in 1..=p1.l {
             let ml1 = p1.ml.get(l).copied().unwrap_or(f32::NAN);
@@ -507,7 +512,7 @@ mod tests {
             })
             .sum();
 
-        spectral_amp_enhance(&mut params);
+        spectral_amp_enhance(&mut params, &SynthesisTuning::PARITY);
 
         let post_energy: f32 = (1..=params.l)
             .map(|l| {

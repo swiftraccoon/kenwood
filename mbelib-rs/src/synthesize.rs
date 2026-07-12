@@ -77,10 +77,13 @@ const INTERPOLATION_MAX_BAND: usize = 8;
 /// * `prev_enh` - Previous frame's enhanced parameters. Modified
 ///   in-place: `ml` and `vl` are extended when the current frame has
 ///   more bands; `psi_l` is wrapped to `[0, 2π)`.
+/// * `unvoiced_gain` - Multiplier on the unvoiced excitation level;
+///   `1.0` is mbelib/JMBE parity.
 pub(crate) fn synthesize_speech(
     pcm: &mut [f32; FRAME_SAMPLES],
     cur: &mut MbeParams,
     prev_enh: &mut MbeParams,
+    unvoiced_gain: f32,
 ) {
     *pcm = [0.0_f32; FRAME_SAMPLES];
 
@@ -153,7 +156,7 @@ pub(crate) fn synthesize_speech(
 
     // Algorithms #117-126: FFT-based unvoiced synthesis, single pass
     // for all unvoiced bands across the previous→current transition.
-    unvoiced_fft::synthesize_unvoiced(pcm, cur, prev_enh, &noise_buffer);
+    unvoiced_fft::synthesize_unvoiced(pcm, cur, prev_enh, &noise_buffer, unvoiced_gain);
 
     // Soft clipping to keep float output within the float→i16 range.
     for sample in pcm.iter_mut() {
@@ -410,7 +413,7 @@ mod tests {
         prev.w0 = 0.04;
         cur.noise_seed = 100.0; // skip cold-start
 
-        synthesize_speech(&mut pcm, &mut cur, &mut prev);
+        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
 
         for (n, sample) in pcm.iter().enumerate() {
             assert!(
@@ -435,12 +438,12 @@ mod tests {
         let mut pcm1 = [0.0_f32; FRAME_SAMPLES];
         let mut cur1 = make_params();
         let mut prev1 = make_params();
-        synthesize_speech(&mut pcm1, &mut cur1, &mut prev1);
+        synthesize_speech(&mut pcm1, &mut cur1, &mut prev1, 1.0);
 
         let mut pcm2 = [0.0_f32; FRAME_SAMPLES];
         let mut cur2 = make_params();
         let mut prev2 = make_params();
-        synthesize_speech(&mut pcm2, &mut cur2, &mut prev2);
+        synthesize_speech(&mut pcm2, &mut cur2, &mut prev2, 1.0);
 
         for n in 0..FRAME_SAMPLES {
             let s1 = pcm1.get(n).copied().unwrap_or(f32::NAN);
@@ -467,7 +470,7 @@ mod tests {
         prev.ml[1] = 1.0;
         prev.vl[1] = true;
 
-        synthesize_speech(&mut pcm, &mut cur, &mut prev);
+        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
 
         let energy: f32 = pcm.iter().map(|s| s * s).sum();
         assert!(energy > 0.1, "energy={energy}");
@@ -494,9 +497,9 @@ mod tests {
         fill_harmonics(&mut prev, 1.0, |_| false, None);
 
         // Run two frames so WOLA has previous-frame data to combine.
-        synthesize_speech(&mut pcm, &mut cur, &mut prev);
+        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
         prev.copy_from(&cur);
-        synthesize_speech(&mut pcm, &mut cur, &mut prev);
+        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
 
         let energy: f32 = pcm.iter().map(|s| s * s).sum();
         assert!(energy > 0.001, "unvoiced output energy: {energy}");
@@ -517,7 +520,7 @@ mod tests {
         prev.l = 5;
         prev.w0 = 0.04;
 
-        synthesize_speech(&mut pcm, &mut cur, &mut prev);
+        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
 
         let psi_after = cur.psi_l.get(1).copied().unwrap_or(0.0);
         assert!(psi_after != 0.0, "PSI should advance: got {psi_after}");
@@ -539,7 +542,7 @@ mod tests {
         prev.w0 = 0.04;
         fill_harmonics(&mut prev, 0.5, |_| true, None);
 
-        synthesize_speech(&mut pcm, &mut cur, &mut prev);
+        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
 
         for l in 11..=15 {
             let ml = prev.ml.get(l).copied().unwrap_or(f32::NAN);
@@ -565,7 +568,7 @@ mod tests {
         prev.w0 = 0.02;
         fill_harmonics(&mut prev, 1000.0, |_| true, Some(0.0));
 
-        synthesize_speech(&mut pcm, &mut cur, &mut prev);
+        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
 
         for (n, &s) in pcm.iter().enumerate() {
             assert!(

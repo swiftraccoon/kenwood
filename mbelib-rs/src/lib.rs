@@ -462,6 +462,52 @@ pub struct AmbeDecoder {
     /// Carried across consecutive tone frames so the sine is
     /// continuous at frame boundaries.
     tone_phase: f32,
+    /// Synthesis tuning; [`SynthesisTuning::PARITY`] by default.
+    tuning: SynthesisTuning,
+}
+
+/// Runtime tuning for the synthesis-side stages of the decoder.
+///
+/// Every field's default is the exact constant used by mbelib/JMBE, so
+/// [`SynthesisTuning::default()`] (== [`SynthesisTuning::PARITY`])
+/// reproduces the untuned decoder bit for bit. Non-default values move
+/// the synthesis away from mbelib parity toward configurations scored
+/// against reference-decoded audio of the same transmissions; they
+/// never change bitstream interpretation, FEC handling, or frame
+/// disposition — only how already-decoded parameters are rendered.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SynthesisTuning {
+    /// Spectral-enhancement sharpening factor (mbelib parity: `0.96`).
+    /// Larger values weight loud harmonics harder relative to the
+    /// spectral floor.
+    pub enhance_alpha: f32,
+    /// Spectral-enhancement weight exponent (mbelib parity: `0.25`).
+    /// Controls how aggressively the density ratio reshapes bands.
+    pub enhance_exponent: f32,
+    /// Lower clamp on the per-band enhancement weight (parity: `0.5`).
+    pub enhance_clamp_lo: f32,
+    /// Upper clamp on the per-band enhancement weight (parity: `1.2`).
+    pub enhance_clamp_hi: f32,
+    /// Multiplier on the unvoiced excitation level (parity: `1.0`).
+    pub unvoiced_gain: f32,
+}
+
+impl SynthesisTuning {
+    /// The exact mbelib/JMBE constants — decoding with this tuning is
+    /// bit-identical to [`AmbeDecoder::new`].
+    pub const PARITY: Self = Self {
+        enhance_alpha: 0.96,
+        enhance_exponent: 0.25,
+        enhance_clamp_lo: 0.5,
+        enhance_clamp_hi: 1.2,
+        unvoiced_gain: 1.0,
+    };
+}
+
+impl Default for SynthesisTuning {
+    fn default() -> Self {
+        Self::PARITY
+    }
 }
 
 impl AmbeDecoder {
@@ -472,12 +518,22 @@ impl AmbeDecoder {
     /// the behavior of hardware DVSI vocoders.
     #[must_use]
     pub const fn new() -> Self {
+        Self::with_tuning(SynthesisTuning::PARITY)
+    }
+
+    /// Creates a decoder with explicit synthesis tuning.
+    ///
+    /// [`SynthesisTuning::PARITY`] reproduces [`AmbeDecoder::new`]
+    /// exactly; other values reshape enhancement and excitation only.
+    #[must_use]
+    pub const fn with_tuning(tuning: SynthesisTuning) -> Self {
         Self {
             cur: MbeParams::new(),
             prev: MbeParams::new(),
             prev_enhanced: MbeParams::new(),
             comfort_noise_state: adaptive::COMFORT_NOISE_INIT_SEED,
             tone_phase: 0.0,
+            tuning,
         }
     }
 
@@ -666,7 +722,7 @@ impl AmbeDecoder {
             .sum::<f32>();
 
         // Spectral amplitude enhancement.
-        enhance::spectral_amp_enhance(&mut self.cur);
+        enhance::spectral_amp_enhance(&mut self.cur, &self.tuning);
 
         // Adaptive smoothing (JMBE algorithms #111-116).
         adaptive::apply_adaptive_smoothing(
@@ -684,7 +740,12 @@ impl AmbeDecoder {
         if muted {
             adaptive::synthesize_comfort_noise(&mut pcm_f, &mut self.comfort_noise_state);
         } else {
-            synthesize::synthesize_speech(&mut pcm_f, &mut self.cur, &mut self.prev_enhanced);
+            synthesize::synthesize_speech(
+                &mut pcm_f,
+                &mut self.cur,
+                &mut self.prev_enhanced,
+                self.tuning.unvoiced_gain,
+            );
         }
 
         // Save enhanced parameters as cross-fade source for next frame.
