@@ -93,6 +93,14 @@ enum Cmd {
         #[arg(long)]
         operator: Option<String>,
     },
+    /// Reconstruct recordings from published dvrec packet logs for
+    /// transmissions with no locally captured twin (salvage from
+    /// recorder-offline windows and unlinked reflectors).
+    ImportDvrec {
+        /// Recordings directory (as written by the recorder).
+        #[arg(long, default_value = "recordings")]
+        recordings: PathBuf,
+    },
     /// Control the running recorder: free or reclaim individual
     /// reflector slots and apply config target changes, all without
     /// restarting (and without touching the other links).
@@ -166,7 +174,33 @@ async fn main() -> ExitCode {
             };
             harvest(&recordings, date, &target, options).await
         }
+        Some(Cmd::ImportDvrec { recordings }) => import_dvrec(&recordings),
         Some(Cmd::Ctl { action }) => ctl(&args.config, action).await,
+    }
+}
+
+/// Import salvaged dvrec packet logs as recordings.
+fn import_dvrec(recordings: &std::path::Path) -> ExitCode {
+    let writer = stargazer::writer::Writer::new(recordings.to_path_buf(), true);
+    match stargazer::dvrec::import_tree(recordings, &writer) {
+        Err(e) => {
+            tracing::error!(error = %e, "dvrec import failed");
+            ExitCode::FAILURE
+        }
+        Ok(summary) => {
+            println!(
+                "imported {} · already captured {} · kerchunks {} · failed {}",
+                summary.imported,
+                summary.skipped_existing,
+                summary.skipped_voiceless,
+                summary.failed
+            );
+            if summary.failed > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
     }
 }
 
