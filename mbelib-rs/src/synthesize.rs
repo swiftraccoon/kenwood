@@ -77,13 +77,13 @@ const INTERPOLATION_MAX_BAND: usize = 8;
 /// * `prev_enh` - Previous frame's enhanced parameters. Modified
 ///   in-place: `ml` and `vl` are extended when the current frame has
 ///   more bands; `psi_l` is wrapped to `[0, 2π)`.
-/// * `unvoiced_gain` - Multiplier on the unvoiced excitation level;
-///   `1.0` is mbelib/JMBE parity.
+/// * `tuning` - Synthesis tuning; [`crate::SynthesisTuning::PARITY`]
+///   is mbelib/JMBE parity.
 pub(crate) fn synthesize_speech(
     pcm: &mut [f32; FRAME_SAMPLES],
     cur: &mut MbeParams,
     prev_enh: &mut MbeParams,
-    unvoiced_gain: f32,
+    tuning: &crate::SynthesisTuning,
 ) {
     *pcm = [0.0_f32; FRAME_SAMPLES];
 
@@ -107,7 +107,15 @@ pub(crate) fn synthesize_speech(
 
     // Update PSI (smooth phase) and PHI (jittered phase). Uses noise
     // buffer for jitter to match JMBE's algorithm #140.
-    update_phases(cur, prev_enh, cw0, pw0, num_uv, &noise_buffer);
+    update_phases(
+        cur,
+        prev_enh,
+        cw0,
+        pw0,
+        num_uv,
+        &noise_buffer,
+        tuning.phase_jitter,
+    );
 
     // Per-band voiced synthesis. Unvoiced contributions are skipped
     // here — they are handled by the single FFT call after this loop.
@@ -156,7 +164,7 @@ pub(crate) fn synthesize_speech(
 
     // Algorithms #117-126: FFT-based unvoiced synthesis, single pass
     // for all unvoiced bands across the previous→current transition.
-    unvoiced_fft::synthesize_unvoiced(pcm, cur, prev_enh, &noise_buffer, unvoiced_gain);
+    unvoiced_fft::synthesize_unvoiced(pcm, cur, prev_enh, &noise_buffer, tuning.unvoiced_gain);
 
     // Soft clipping to keep float output within the float→i16 range.
     for sample in pcm.iter_mut() {
@@ -210,6 +218,7 @@ fn update_phases(
     pw0: f32,
     num_uv: usize,
     noise_buffer: &[f32; unvoiced_fft::FFT_SIZE],
+    phase_jitter: f32,
 ) {
     let two_pi = std::f32::consts::TAU;
 
@@ -245,7 +254,7 @@ fn update_phases(
                 clippy::cast_precision_loss,
                 reason = "num_uv and cur.l are at most 56; no precision loss"
             )]
-            let scale = num_uv as f32 / cur.l as f32;
+            let scale = (num_uv as f32 / cur.l as f32) * phase_jitter;
             scale.mul_add(pl, psi)
         } else {
             psi
@@ -413,7 +422,12 @@ mod tests {
         prev.w0 = 0.04;
         cur.noise_seed = 100.0; // skip cold-start
 
-        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
+        synthesize_speech(
+            &mut pcm,
+            &mut cur,
+            &mut prev,
+            &crate::SynthesisTuning::PARITY,
+        );
 
         for (n, sample) in pcm.iter().enumerate() {
             assert!(
@@ -438,12 +452,22 @@ mod tests {
         let mut pcm1 = [0.0_f32; FRAME_SAMPLES];
         let mut cur1 = make_params();
         let mut prev1 = make_params();
-        synthesize_speech(&mut pcm1, &mut cur1, &mut prev1, 1.0);
+        synthesize_speech(
+            &mut pcm1,
+            &mut cur1,
+            &mut prev1,
+            &crate::SynthesisTuning::PARITY,
+        );
 
         let mut pcm2 = [0.0_f32; FRAME_SAMPLES];
         let mut cur2 = make_params();
         let mut prev2 = make_params();
-        synthesize_speech(&mut pcm2, &mut cur2, &mut prev2, 1.0);
+        synthesize_speech(
+            &mut pcm2,
+            &mut cur2,
+            &mut prev2,
+            &crate::SynthesisTuning::PARITY,
+        );
 
         for n in 0..FRAME_SAMPLES {
             let s1 = pcm1.get(n).copied().unwrap_or(f32::NAN);
@@ -470,7 +494,12 @@ mod tests {
         prev.ml[1] = 1.0;
         prev.vl[1] = true;
 
-        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
+        synthesize_speech(
+            &mut pcm,
+            &mut cur,
+            &mut prev,
+            &crate::SynthesisTuning::PARITY,
+        );
 
         let energy: f32 = pcm.iter().map(|s| s * s).sum();
         assert!(energy > 0.1, "energy={energy}");
@@ -497,9 +526,19 @@ mod tests {
         fill_harmonics(&mut prev, 1.0, |_| false, None);
 
         // Run two frames so WOLA has previous-frame data to combine.
-        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
+        synthesize_speech(
+            &mut pcm,
+            &mut cur,
+            &mut prev,
+            &crate::SynthesisTuning::PARITY,
+        );
         prev.copy_from(&cur);
-        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
+        synthesize_speech(
+            &mut pcm,
+            &mut cur,
+            &mut prev,
+            &crate::SynthesisTuning::PARITY,
+        );
 
         let energy: f32 = pcm.iter().map(|s| s * s).sum();
         assert!(energy > 0.001, "unvoiced output energy: {energy}");
@@ -520,7 +559,12 @@ mod tests {
         prev.l = 5;
         prev.w0 = 0.04;
 
-        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
+        synthesize_speech(
+            &mut pcm,
+            &mut cur,
+            &mut prev,
+            &crate::SynthesisTuning::PARITY,
+        );
 
         let psi_after = cur.psi_l.get(1).copied().unwrap_or(0.0);
         assert!(psi_after != 0.0, "PSI should advance: got {psi_after}");
@@ -542,7 +586,12 @@ mod tests {
         prev.w0 = 0.04;
         fill_harmonics(&mut prev, 0.5, |_| true, None);
 
-        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
+        synthesize_speech(
+            &mut pcm,
+            &mut cur,
+            &mut prev,
+            &crate::SynthesisTuning::PARITY,
+        );
 
         for l in 11..=15 {
             let ml = prev.ml.get(l).copied().unwrap_or(f32::NAN);
@@ -568,7 +617,12 @@ mod tests {
         prev.w0 = 0.02;
         fill_harmonics(&mut prev, 1000.0, |_| true, Some(0.0));
 
-        synthesize_speech(&mut pcm, &mut cur, &mut prev, 1.0);
+        synthesize_speech(
+            &mut pcm,
+            &mut cur,
+            &mut prev,
+            &crate::SynthesisTuning::PARITY,
+        );
 
         for (n, &s) in pcm.iter().enumerate() {
             assert!(

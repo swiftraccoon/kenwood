@@ -490,6 +490,10 @@ pub struct SynthesisTuning {
     pub enhance_clamp_hi: f32,
     /// Multiplier on the unvoiced excitation level (parity: `1.0`).
     pub unvoiced_gain: f32,
+    /// Multiplier on the voiced phase jitter (parity: `1.0`).
+    /// `0.0` accumulates fully deterministic harmonic phases —
+    /// cleaner, at the risk of a more mechanical timbre.
+    pub phase_jitter: f32,
 }
 
 impl SynthesisTuning {
@@ -501,6 +505,7 @@ impl SynthesisTuning {
         enhance_clamp_lo: 0.5,
         enhance_clamp_hi: 1.2,
         unvoiced_gain: 1.0,
+        phase_jitter: 1.0,
     };
 }
 
@@ -744,7 +749,7 @@ impl AmbeDecoder {
                 &mut pcm_f,
                 &mut self.cur,
                 &mut self.prev_enhanced,
-                self.tuning.unvoiced_gain,
+                &self.tuning,
             );
         }
 

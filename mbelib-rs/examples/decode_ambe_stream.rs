@@ -47,6 +47,7 @@ fn tuning_from_env() -> mbelib_rs::SynthesisTuning {
             "lo" => tuning.enhance_clamp_lo = value,
             "hi" => tuning.enhance_clamp_hi = value,
             "uv" => tuning.unvoiced_gain = value,
+            "jit" => tuning.phase_jitter = value,
             other => {
                 eprintln!("MBELIB_TUNING: unknown key {other:?}");
                 std::process::exit(2);
