@@ -2,6 +2,11 @@ name: Docs
 on:
   push:
     branches: [main]
+# Standard Pages pattern: one deploy at a time, never cancelled
+# mid-flight so a half-uploaded artifact is never published.
+concurrency:
+  group: pages
+  cancel-in-progress: false
 jobs:
   docs:
     runs-on: ubuntu-latest
@@ -9,6 +14,8 @@ jobs:
       contents: read
       pages: write
       id-token: write
+    env:
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.94.0
@@ -18,6 +25,10 @@ jobs:
       # the other workflows which build crates individually.
       - name: Install Linux audio headers (alsa for cpal/sextant)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # Cargo.lock is intentionally gitignored; resolve it first so
+      # rust-cache gets a stable, content-addressed key.
+      - run: cargo generate-lockfile
+      - uses: Swatinem/rust-cache@v2
       - name: cargo doc
         run: cargo doc --workspace --no-deps
         env:

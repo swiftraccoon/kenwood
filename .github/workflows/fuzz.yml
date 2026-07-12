@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
@@ -34,7 +38,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
-      - run: cargo install cargo-fuzz
+      # Prebuilt release binary; `cargo install cargo-fuzz` compiled
+      # the tool from source in every one of the ten matrix jobs.
+      - uses: taiki-e/install-action@cargo-fuzz
+      # The fuzz crate is its own workspace with its own lockfile and
+      # target dir; point rust-cache there. Nightly moves daily so the
+      # key rotates with it, but repeat pushes to the same PR reuse it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dstar-gateway-core/fuzz
       - name: Run fuzz target
         env:
           FUZZ_TARGET: ${{ matrix.target }}

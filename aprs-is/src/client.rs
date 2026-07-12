@@ -971,10 +971,16 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn connect_timeout() -> TestResult {
         // Connect to a non-routable IP to trigger timeout.
         // Using 198.51.100.1 (TEST-NET-2) which should not respond.
+        //
+        // `start_paused`: the connect deadline is a tokio timer wrapping
+        // the pending socket, so once the runtime parks with no I/O
+        // readiness the clock auto-advances to the deadline. The test
+        // exercises the same timeout path in virtual time instead of
+        // sleeping out the real 10-second CONNECT_TIMEOUT.
         let config = AprsIsConfig {
             callsign: "N0CALL".to_owned(),
             passcode: Passcode::ReceiveOnly,
@@ -985,10 +991,10 @@ mod tests {
             software_version: "0.1".to_owned(),
         };
         // `connect` bounds the TCP handshake at CONNECT_TIMEOUT (10s), so
-        // a single attempt must resolve within that plus margin. If the
-        // outer timer fires, the client hung past its own deadline —
-        // exactly the regression this test guards — and the `?` fails
-        // the test.
+        // a single attempt must resolve within that plus margin (both
+        // measured on the paused clock). If the outer timer fires, the
+        // client hung past its own deadline — exactly the regression this
+        // test guards — and the `?` fails the test.
         let result = tokio::time::timeout(
             CONNECT_TIMEOUT + Duration::from_secs(5),
             AprsIsClient::connect_with_retry(config, Some(1)),

@@ -6,6 +6,17 @@ on:
     branches: [main]
 permissions:
   contents: read
+# Superseded PR pushes cancel their stale runs; main pushes never
+# cancel so every landed commit keeps a complete CI record.
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  # Incremental artifacts are useless on throwaway runners and bloat
+  # the cache; line-tables-only keeps file:line in backtraces while
+  # skipping the full debuginfo that CI never loads in a debugger.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 jobs:
   ci:
     runs-on: windows-latest
@@ -14,26 +25,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.0
         with:
           components: clippy
-      - run: cargo check
-        working-directory: thd75
-      - run: cargo check
-        working-directory: thd75-tui
-      - run: cargo check
-        working-directory: dstar-gateway
-      - run: cargo check
-        working-directory: thd75-repl
-      - run: cargo check
-        working-directory: mbelib-rs
-      - run: cargo build
-        working-directory: thd75
-      - run: cargo build
-        working-directory: thd75-tui
-      - run: cargo build
-        working-directory: dstar-gateway
-      - run: cargo build
-        working-directory: thd75-repl
-      - run: cargo build
-        working-directory: mbelib-rs
+      # Cargo.lock is intentionally gitignored; resolve it first so
+      # rust-cache gets a stable, content-addressed key.
+      - run: cargo generate-lockfile
+      - uses: Swatinem/rust-cache@v2
+      # No `cargo check` / `cargo build` steps: clippy IS check plus
+      # lints (and `--all-targets` covers strictly more targets), and
+      # `cargo test` compiles and links the same lib/bin/example
+      # targets. Neither dropped step produced artifacts the later
+      # steps reuse — clippy's driver fingerprints differently from
+      # check, so those passes were pure duplicate work.
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: thd75
       - run: cargo clippy --all-targets -- -D warnings

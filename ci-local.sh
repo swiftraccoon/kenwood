@@ -50,10 +50,19 @@ cleanup_pods
 # --- Create tarball ---
 echo ""
 echo "========== Preparing k8s CI =========="
-tar czf /tmp/kenwood-ci.tar.gz \
-    --exclude='target' --exclude='.git' \
-    --exclude='ref' --exclude='ref_tools' \
-    --exclude='thd75_re' . 2>/dev/null
+# Source-only tarball: tracked files plus untracked-but-not-ignored
+# files (what a fresh checkout plus work-in-progress contains), plus
+# the workspace Cargo.lock — gitignored on purpose, but the pods must
+# build and audit the same resolved dependency set as this machine.
+# The previous `tar . --exclude=...` swept in every OTHER gitignored
+# local artifact too (recordings/, dataset/, survey/ — 1.3 GB) and
+# shipped all of it to both pods on every run; this list is ~4 MB.
+# Tests whose fixtures are gitignored self-skip or are #[ignore]d
+# (see the "pod-safe" note in the pod script below), so dropping
+# those fixtures loses no pod coverage.
+[ -f Cargo.lock ] || cargo generate-lockfile
+{ git ls-files --cached --others --exclude-standard -z; printf 'Cargo.lock\0'; } \
+    | tar czf /tmp/kenwood-ci.tar.gz --null -T -
 
 ci_pod() {
     local name=$1 image=$2 setup=$3
@@ -66,7 +75,16 @@ ci_pod() {
     # blocking `kubectl run`), leaving the script to press on against
     # stale or misconfigured pods. Let kubectl's error output through
     # so a failed setup is diagnosable from the first ci-local log.
-    kubectl run "ci-$name" --image="$image" --command -- sleep 600
+    #
+    # `--restart=Never` + `sleep infinity`, not `sleep 600`: kubectl
+    # run defaults to restartPolicy Always, so a finite sleep capped
+    # the container's lifetime — at t=600s the main process exited,
+    # kubelet restarted the container, and every `kubectl exec`
+    # session (including the gate mid-build) was killed. The endless
+    # exit/restart cycle is also what left prior runs' pods lingering
+    # in CrashLoop/Running states. With Never + infinity the container
+    # lives until the cleanup trap deletes the pod.
+    kubectl run "ci-$name" --image="$image" --restart=Never --command -- sleep infinity
     kubectl wait --for=condition=Ready "pod/ci-$name" --timeout=120s
 
     kubectl exec "ci-$name" -- mkdir -p /work/kenwood
@@ -138,16 +156,26 @@ ci_pod() {
         # on pods that already have it.
         rustup component add clippy >/dev/null
 
-        # Install required lint-gate tools. Fail hard if install
-        # fails; dont skip-if-missing.
-        cargo install cargo-audit --quiet
-        cargo install cargo-deny --quiet
-        cargo install cargo-machete --quiet
+        # Install required lint-gate tools as prebuilt release
+        # binaries via cargo-binstall. `cargo install` compiled all
+        # three from source on every fresh pod — several minutes each,
+        # the single largest cost of a pod run — to produce the same
+        # binaries. binstall falls back to a source build only when no
+        # release binary exists for the platform. Fail hard if install
+        # fails; dont skip-if-missing. (curl | bash matches how the
+        # fedora bootstrap already installs rustup below.)
+        curl -L --proto "=https" --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+        cargo binstall -y cargo-audit cargo-deny cargo-machete
 
         # Workspace-wide checks: each command walks every crate in
         # `[workspace] members`, so new crates are picked up
         # automatically without editing this script.
-        step "check workspace"       cargo check --workspace --all-targets
+        #
+        # No `cargo check` step: clippy IS check plus lints over the
+        # same `--all-targets` set, and clippy does not reuse check
+        # artifacts (its driver fingerprints differently), so a
+        # preceding check pass was a full duplicate typecheck of the
+        # workspace.
         step "clippy workspace"      cargo clippy --workspace --all-targets -- -D warnings
         # `--all-targets` skips any target whose `required-features` are
         # off, silently. Without this pass the network-gated examples and

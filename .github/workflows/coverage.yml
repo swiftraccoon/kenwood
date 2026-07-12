@@ -6,6 +6,11 @@ on:
     branches: [main]
 permissions:
   contents: read
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_INCREMENTAL: "0"
 jobs:
   coverage:
     runs-on: ubuntu-latest
@@ -21,6 +26,11 @@ jobs:
       # reason the Docs workflow installs this.
       - name: Install Linux audio headers (alsa for cpal/sextant)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # Cargo.lock is intentionally gitignored; resolve it first so
+      # rust-cache gets a stable, content-addressed key. The cache holds
+      # the instrumented dep builds, which dominate this job's runtime.
+      - run: cargo generate-lockfile
+      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       # One instrumented run of every test target in every workspace
       # crate (unit + integration). This is also the only CI job that

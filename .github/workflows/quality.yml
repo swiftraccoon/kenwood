@@ -6,6 +6,9 @@ on:
     branches: [main]
 permissions:
   contents: read
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   machete:
     name: Unused deps
@@ -29,5 +32,9 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.94.0
+      # semver-checks builds rustdoc JSON for both baseline and current;
+      # the cache carries the dep builds between PR pushes.
+      - run: cargo generate-lockfile
+      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-semver-checks
       - run: cargo semver-checks --manifest-path thd75/Cargo.toml
