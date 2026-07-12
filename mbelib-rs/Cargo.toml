@@ -35,6 +35,13 @@ encoder = []
 # code is imported; the feature reshapes NUMBERS only. Pulls in
 # `encoder` because every current swap site is encoder-only.
 kenwood-tables = ["encoder"]
+# Learned waveform enhancement: a small complex-STFT masking network
+# (weights trained against reflector-published reference decodes of
+# identical AMBE frames, embedded as a binary blob) that regenerates
+# fine structure the base synthesis cannot. Off by default: it is an
+# opt-in post-process, gated by blind operator listening before any
+# release, and adds ~260 KiB of embedded weights.
+wave-enhance = []
 
 [dev-dependencies]
 proptest = "1"
@@ -67,6 +74,10 @@ required-features = ["encoder"]
 # `required-features` means cargo skips compiling them entirely when the feature
 # is off, instead of compiling them to empty crates that then trip
 # `unused_crate_dependencies` for every dev-dep in the workspace.
+[[test]]
+name = "wave_parity"
+required-features = ["wave-enhance"]
+
 [[test]]
 name = "encoder_roundtrip"
 required-features = ["encoder"]

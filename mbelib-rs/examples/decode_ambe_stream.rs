@@ -78,6 +78,19 @@ fn main() -> std::io::Result<()> {
         Some(p) => Some(std::fs::File::create(p)?),
     };
     let mut dec = mbelib_rs::AmbeDecoder::with_tuning(tuning_from_env());
+    #[cfg(feature = "wave-enhance")]
+    let wave = match std::env::var("MBELIB_WAVE_ENHANCE").as_deref() {
+        Ok("1") => match mbelib_rs::enhance_wave::WaveEnhancer::new() {
+            Ok(e) => Some(e),
+            Err(e) => {
+                eprintln!("wave enhancer init failed: {e}");
+                std::process::exit(2);
+            }
+        },
+        _ => None,
+    };
+    #[cfg(feature = "wave-enhance")]
+    let mut all_pcm: Vec<i16> = Vec::new();
     let mut frame = [0u8; 9];
     let mut frame_idx = 0_usize;
     loop {
@@ -109,12 +122,33 @@ fn main() -> std::io::Result<()> {
             writeln!(t, "  w0 = {w0:.6}  L = {big_l}")?;
         }
         let pcm = dec.decode_frame(&frame);
-        let mut bytes = [0u8; 320];
-        for (chunk, &s) in bytes.chunks_exact_mut(2).zip(pcm.iter()) {
-            chunk.copy_from_slice(&s.to_le_bytes());
+        // Whole-clip enhancement buffers everything and writes once
+        // after EOF (the masking network is non-causal).
+        #[cfg(feature = "wave-enhance")]
+        let buffering = wave.is_some();
+        #[cfg(not(feature = "wave-enhance"))]
+        let buffering = false;
+        if buffering {
+            #[cfg(feature = "wave-enhance")]
+            all_pcm.extend_from_slice(&pcm);
+        } else {
+            let mut bytes = [0u8; 320];
+            for (chunk, &s) in bytes.chunks_exact_mut(2).zip(pcm.iter()) {
+                chunk.copy_from_slice(&s.to_le_bytes());
+            }
+            output.write_all(&bytes)?;
+        }
+        frame_idx += 1;
+    }
+    #[cfg(feature = "wave-enhance")]
+    if let Some(enhancer) = wave {
+        let enhanced = enhancer.process(&all_pcm);
+        let mut bytes = Vec::with_capacity(enhanced.len() * 2);
+        for s in enhanced {
+            bytes.extend_from_slice(&s.to_le_bytes());
         }
         output.write_all(&bytes)?;
-        frame_idx += 1;
+        eprintln!("wave-enhanced output");
     }
     eprintln!("decoded {frame_idx} frames");
     Ok(())
