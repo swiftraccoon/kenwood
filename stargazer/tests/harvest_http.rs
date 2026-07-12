@@ -73,10 +73,12 @@ fn routes() -> HashMap<String, (u16, Vec<u8>)> {
 }
 
 /// Minimal blocking HTTP/1.1 responder on a detached thread.
-fn spawn_server() -> Result<String, Box<dyn std::error::Error>> {
+fn spawn_server(
+    table: HashMap<String, (u16, Vec<u8>)>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
-    let table = Arc::new(routes());
+    let table = Arc::new(table);
     let _unused = std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut sock) = stream else { return };
@@ -142,12 +144,13 @@ fn harvester(base_url: &str, dry_run: bool) -> Result<Harvester, Box<dyn std::er
         limit: None,
         dry_run,
         fetch_gap: Duration::ZERO,
+        operator: None,
     })?)
 }
 
 #[tokio::test]
 async fn harvest_end_to_end_dry_run_real_run_and_idempotent_rerun() -> TestResult {
-    let base_url = spawn_server()?;
+    let base_url = spawn_server(routes())?;
     let recordings = tempfile::tempdir()?;
     let date_dir = recordings.path().join("REF030-C").join("2026-07-11");
     write_local_recording(&date_dir)?;
@@ -252,7 +255,7 @@ async fn harvest_end_to_end_dry_run_real_run_and_idempotent_rerun() -> TestResul
 
 #[tokio::test]
 async fn harvest_records_listing_absence_without_failing() -> TestResult {
-    let base_url = spawn_server()?;
+    let base_url = spawn_server(routes())?;
     let recordings = tempfile::tempdir()?;
     std::fs::create_dir_all(recordings.path().join("REF030-C"))?;
     // A date the server has nothing for → 404 listing, zero coverage.
@@ -277,7 +280,7 @@ async fn harvest_records_listing_absence_without_failing() -> TestResult {
 
 #[tokio::test]
 async fn harvest_respects_download_limit() -> TestResult {
-    let base_url = spawn_server()?;
+    let base_url = spawn_server(routes())?;
     let recordings = tempfile::tempdir()?;
     let date_dir = recordings.path().join("REF030-C").join("2026-07-11");
     write_local_recording(&date_dir)?;
@@ -288,11 +291,81 @@ async fn harvest_respects_download_limit() -> TestResult {
         limit: Some(2),
         dry_run: false,
         fetch_gap: Duration::ZERO,
+        operator: None,
     })?;
     let rec = harvester
         .harvest_dir(recordings.path(), "REF030-C", date)
         .await?;
     assert_eq!(rec.downloaded + rec.failed, 2, "{rec:?}");
     assert!(rec.truncated);
+    Ok(())
+}
+
+#[tokio::test]
+async fn robots_disallow_stops_the_run_before_the_listing() -> TestResult {
+    let mut table = routes();
+    let _unused = table.insert(
+        "/robots.txt".to_string(),
+        (200, b"User-agent: *\nDisallow: /streams/\n".to_vec()),
+    );
+    let base_url = spawn_server(table)?;
+    let recordings = tempfile::tempdir()?;
+    let date_dir = recordings.path().join("REF030-C").join("2026-07-11");
+    write_local_recording(&date_dir)?;
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 11).ok_or("date")?;
+
+    let rec = harvester(&base_url, false)?
+        .harvest_dir(recordings.path(), "REF030-C", date)
+        .await?;
+    assert!(
+        rec.error.as_deref().is_some_and(|e| e.contains("robots")),
+        "{rec:?}"
+    );
+    assert_eq!(rec.published_tx, 0, "listing never fetched");
+    assert_eq!(rec.planned, 0);
+    assert_eq!(rec.downloaded, 0);
+    assert!(
+        !date_dir.join("published").exists(),
+        "a robots-blocked run leaves no trace"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn consecutive_failures_trip_the_breaker() -> TestResult {
+    // Listing advertises four salvage transmissions whose files have
+    // all been purged server-side (every download 404s): the breaker
+    // must stop after three straight failures instead of marching on.
+    use std::fmt::Write as _;
+    let mut html = String::from("<html><body><table>");
+    for sid in ["aa01", "aa02", "aa03", "aa04"] {
+        let _unused = write!(
+            html,
+            "<tr><td><a href=\"REF030-C--20260711-190000.000--K0GNE--{sid}.mp3\">x</a></td></tr>"
+        );
+    }
+    html.push_str("</table></body></html>");
+    let mut table = HashMap::new();
+    let _unused = table.insert(DATE_PATH.to_string(), (200, html.into_bytes()));
+    let base_url = spawn_server(table)?;
+
+    let recordings = tempfile::tempdir()?;
+    std::fs::create_dir_all(recordings.path().join("REF030-C"))?;
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 11).ok_or("date")?;
+    let rec = harvester(&base_url, false)?
+        .harvest_dir(recordings.path(), "REF030-C", date)
+        .await?;
+    assert_eq!(rec.planned, 4);
+    assert_eq!(
+        rec.failed, 3,
+        "stopped at the breaker, not the plan: {rec:?}"
+    );
+    assert_eq!(rec.downloaded, 0);
+    assert!(
+        rec.error
+            .as_deref()
+            .is_some_and(|e| e.contains("consecutive")),
+        "{rec:?}"
+    );
     Ok(())
 }

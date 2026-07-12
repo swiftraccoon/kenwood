@@ -24,8 +24,14 @@
 //! record to `<date dir>/published/harvest.jsonl`.
 //!
 //! Published retention is short (days), so harvesting is a same-day
-//! affair. Downloads are sequential with a polite pause — this is a
-//! volunteer-run service, not a mirror target.
+//! affair. This is a volunteer-run service, not a mirror target, and
+//! the client is engineered to be indistinguishable from a courteous
+//! human visitor: robots.txt is honored before anything else is
+//! fetched, downloads run strictly sequentially over one connection
+//! with a multi-second pause, the User-Agent names the tool and the
+//! responsible operator, re-runs never re-download, and a few
+//! consecutive failures stop the run entirely rather than hammer a
+//! struggling or purging server.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
@@ -35,15 +41,72 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Identify ourselves honestly: tool, version, purpose.
-const USER_AGENT: &str = concat!(
-    "stargazer-harvest/",
-    env!("CARGO_PKG_VERSION"),
-    " (amateur radio research; pairing our own captures)"
-);
+/// Identify ourselves honestly: tool, version, purpose, and (when
+/// known) the responsible operator, so a server owner can reach a
+/// human instead of reaching for a block.
+fn build_user_agent(operator: Option<&str>) -> String {
+    let mut ua = concat!(
+        "stargazer-harvest/",
+        env!("CARGO_PKG_VERSION"),
+        " (amateur radio research; pairing our own reflector captures"
+    )
+    .to_string();
+    if let Some(op) = operator {
+        ua.push_str("; operator ");
+        ua.push_str(op);
+    }
+    ua.push(')');
+    ua
+}
 
-/// Pause between successive file downloads.
-pub const POLITE_GAP: Duration = Duration::from_secs(1);
+/// Decide whether a robots.txt body forbids us from `path` — checked
+/// for both the wildcard agent and our own product token. We honor it
+/// even though the files are operator-published links, because the
+/// politest interpretation always wins.
+fn robots_disallows(robots: &str, path: &str) -> bool {
+    let mut applies = false; // current group names us (or everyone)
+    let mut in_agent_run = false; // inside consecutive User-agent lines
+    for raw in robots.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match key.as_str() {
+            "user-agent" => {
+                if !in_agent_run {
+                    applies = false; // a new group begins
+                }
+                in_agent_run = true;
+                let agent = value.to_ascii_lowercase();
+                if agent == "*" || agent.starts_with("stargazer") {
+                    applies = true;
+                }
+            }
+            "disallow" if applies => {
+                in_agent_run = false;
+                if !value.is_empty() && path.starts_with(value) {
+                    return true;
+                }
+            }
+            _ => in_agent_run = false,
+        }
+    }
+    false
+}
+
+/// Pause between successive file downloads. Two seconds keeps a full
+/// day's harvest around one small request every other second — far
+/// below anything a rate limiter or intrusion sensor watches for.
+pub const POLITE_GAP: Duration = Duration::from_secs(2);
+
+/// Consecutive download failures after which a run stops touching the
+/// server (remaining files retry on a later run).
+const MAX_CONSECUTIVE_FAILURES: usize = 3;
 
 /// Widest publish-vs-capture start-time skew treated as the same
 /// transmission when `(callsign, stream id)` repeats within a day.
@@ -527,7 +590,8 @@ pub struct RunRecord {
     pub truncated: bool,
     /// True when this run only planned (nothing written).
     pub dry_run: bool,
-    /// Listing fetch/HTTP error, if the run could not plan.
+    /// Why the run could not complete: a listing fetch/HTTP failure,
+    /// a robots.txt disallow, or a consecutive-failure stop.
     pub error: Option<String>,
 }
 
@@ -574,6 +638,9 @@ pub struct HarvestOptions {
     pub dry_run: bool,
     /// Pause between downloads (default [`POLITE_GAP`]).
     pub fetch_gap: Duration,
+    /// Operator callsign advertised in the User-Agent so the server
+    /// owner can identify and contact who is fetching.
+    pub operator: Option<String>,
 }
 
 impl Default for HarvestOptions {
@@ -583,6 +650,7 @@ impl Default for HarvestOptions {
             limit: None,
             dry_run: false,
             fetch_gap: POLITE_GAP,
+            operator: None,
         }
     }
 }
@@ -611,6 +679,7 @@ impl Harvester {
             limit,
             dry_run,
             fetch_gap,
+            operator,
         } = options;
         let base_url = base_url
             .map(|raw| {
@@ -618,8 +687,8 @@ impl Harvester {
             })
             .transpose()?;
         let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(Duration::from_secs(60))
+            .user_agent(build_user_agent(operator.as_deref()))
+            .timeout(Duration::from_secs(30))
             .build()
             .map_err(HarvestError::Client)?;
         Ok(Self {
@@ -688,6 +757,23 @@ impl Harvester {
         record.local_recordings = local.recordings.len();
         record.local_skipped = local.skipped;
 
+        // The politest interpretation wins: ask robots.txt first, and
+        // if the streams tree is off-limits for us, walk away without
+        // touching the listing.
+        let mut robots_url = base.clone();
+        robots_url.set_path("/robots.txt");
+        let robots_blocked = match self.fetch(robots_url).await {
+            Ok((200, body)) => robots_disallows(&String::from_utf8_lossy(&body), listing.path()),
+            // Absent or unreadable robots: the operator-published
+            // links themselves govern.
+            _ => false,
+        };
+        if robots_blocked {
+            record.error =
+                Some("robots.txt disallows the streams tree for us — nothing fetched".to_string());
+            return Ok(record);
+        }
+
         match self.fetch(listing).await {
             Err(e) => record.error = Some(e.to_string()),
             Ok((status, body)) => {
@@ -738,8 +824,9 @@ impl Harvester {
     ) -> Result<(), HarvestError> {
         let take = self.limit.unwrap_or(usize::MAX);
         record.truncated = plan.items.len() > take;
-        for (idx, item) in plan.items.iter().take(take).enumerate() {
-            if idx > 0 && !self.fetch_gap.is_zero() {
+        let mut consecutive_failures = 0usize;
+        for item in plan.items.iter().take(take) {
+            if !self.fetch_gap.is_zero() {
                 tokio::time::sleep(self.fetch_gap).await;
             }
             let url = file_url(base, date, &item.file_name);
@@ -757,6 +844,7 @@ impl Harvester {
                 Err(e) => {
                     file_record.error = Some(e.to_string());
                     record.failed += 1;
+                    consecutive_failures += 1;
                 }
                 Ok((status, body)) => {
                     file_record.http_status = Some(status);
@@ -772,6 +860,7 @@ impl Harvester {
                         )?;
                         file_record.bytes = body.len();
                         record.downloaded += 1;
+                        consecutive_failures = 0;
                         tracing::debug!(
                             file = %item.file_name,
                             bytes = body.len(),
@@ -780,10 +869,21 @@ impl Harvester {
                     } else {
                         file_record.error = Some(format!("http status {status}"));
                         record.failed += 1;
+                        consecutive_failures += 1;
                     }
                 }
             }
             append_manifest(published_dir, &ManifestRecord::File(file_record))?;
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                // A struggling or purging server should not receive
+                // the rest of the plan — everything left retries on a
+                // later run.
+                record.error = Some(format!(
+                    "stopped after {MAX_CONSECUTIVE_FAILURES} consecutive download failures — \
+                     leaving the server alone; remaining files retry next run"
+                ));
+                break;
+            }
         }
         Ok(())
     }
@@ -1349,6 +1449,69 @@ mod tests {
             "space re-encoded on the way out"
         );
         Ok(())
+    }
+
+    #[test]
+    fn default_pacing_is_gentle() {
+        assert_eq!(
+            HarvestOptions::default().fetch_gap,
+            Duration::from_secs(2),
+            "default pace stays well under any rate-limit radar"
+        );
+    }
+
+    #[test]
+    fn user_agent_identifies_tool_and_operator() {
+        let anon = build_user_agent(None);
+        assert!(anon.starts_with("stargazer-harvest/"), "{anon}");
+        assert!(anon.contains("amateur radio research"), "{anon}");
+        assert!(!anon.contains("operator"), "{anon}");
+
+        let signed = build_user_agent(Some("KQ4NIT"));
+        assert!(signed.contains("operator KQ4NIT"), "{signed}");
+    }
+
+    #[test]
+    fn robots_rules_parse_and_match() {
+        // No robots, empty rules, or unrelated prefixes: allowed.
+        assert!(!robots_disallows("", "/streams/2026/07/11/"));
+        assert!(!robots_disallows(
+            "User-agent: *\nDisallow:",
+            "/streams/2026/07/11/"
+        ));
+        assert!(!robots_disallows(
+            "User-agent: *\nDisallow: /admin",
+            "/streams/2026/07/11/"
+        ));
+        // Rules scoped to other agents do not apply to us.
+        assert!(!robots_disallows(
+            "User-agent: googlebot\nDisallow: /",
+            "/streams/2026/07/11/"
+        ));
+        // Wildcard-agent prefixes match our path.
+        assert!(robots_disallows(
+            "User-agent: *\nDisallow: /streams/",
+            "/streams/2026/07/11/"
+        ));
+        assert!(robots_disallows(
+            "User-agent: *\nDisallow: /",
+            "/streams/2026/07/11/"
+        ));
+        // Rules addressed to our own product token bind hardest.
+        assert!(robots_disallows(
+            "User-agent: stargazer-harvest\nDisallow: /",
+            "/streams/2026/07/11/"
+        ));
+        // Case-insensitive keys, comments, and blank lines survive.
+        assert!(robots_disallows(
+            "# be nice\nUSER-AGENT: *   # everyone\n\ndisallow: /streams",
+            "/streams/2026/07/11/"
+        ));
+        // A later agent block does not leak rules into the first.
+        assert!(!robots_disallows(
+            "User-agent: *\nDisallow:\n\nUser-agent: badbot\nDisallow: /",
+            "/streams/2026/07/11/"
+        ));
     }
 
     #[test]
