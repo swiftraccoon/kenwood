@@ -105,7 +105,7 @@ fn parse_reflector_input(input: &str) -> Option<(String, char)> {
 }
 
 /// Number of rows in the settings list (must match `SettingRow::ALL.len()`).
-pub(crate) const SETTINGS_COUNT: usize = 92;
+pub(crate) const SETTINGS_COUNT: usize = 76;
 
 /// Settings row identifiers for the interactive settings list.
 ///
@@ -131,16 +131,12 @@ pub(crate) enum SettingRow {
     FilterWidthCw,
     /// Filter width AM (CAT: SH read-only).
     FilterWidthAm,
-    /// FM narrow (MCP only).
-    FmNarrow,
     /// SSB high-cut filter (MCP only).
     SsbHighCut,
-    /// CW high-cut filter (MCP only).
-    CwHighCut,
+    /// CW filter width (MCP only).
+    CwWidth,
     /// AM high-cut filter (MCP only).
     AmHighCut,
-    /// Auto filter (MCP only).
-    AutoFilter,
 
     // --- Scan ---
     /// Scan resume mode (MCP only).
@@ -153,11 +149,11 @@ pub(crate) enum SettingRow {
     ScanRestartCarrier,
 
     // --- TX ---
-    /// Timeout timer (MCP only).
+    /// Timeout timer, 0-10 indexing the 0.5-10.0 minute table (MCP only).
     TimeoutTimer,
     /// TX inhibit (MCP only).
     TxInhibit,
-    /// Beat shift (MCP only).
+    /// Beat shift type, Type 1-8 (MCP only).
     BeatShift,
 
     // --- VOX ---
@@ -171,10 +167,6 @@ pub(crate) enum SettingRow {
     VoxTxOnBusy,
 
     // --- CW ---
-    /// CW break-in (MCP only).
-    CwBreakIn,
-    /// CW delay time (MCP only).
-    CwDelayTime,
     /// CW pitch (MCP only).
     CwPitch,
 
@@ -203,53 +195,37 @@ pub(crate) enum SettingRow {
     // --- Lock ---
     /// Lock (CAT: LC).
     Lock,
-    /// Key lock type (MCP only).
-    KeyLockType,
-    /// Lock key A (MCP only).
-    LockKeyA,
-    /// Lock key B (MCP only).
-    LockKeyB,
-    /// Lock key C (MCP only).
-    LockKeyC,
-    /// Lock PTT (MCP only).
-    LockPtt,
-    /// APRS lock (MCP only).
-    AprsLock,
+    /// Key-lock configuration checkbox (MCP only).
+    KeyLock,
+    /// Frequency-lock configuration checkbox (MCP only).
+    FrequencyLock,
+    /// APRS lock: frequency checkbox (MCP only).
+    AprsLockFrequency,
+    /// APRS lock: PTT checkbox (MCP only).
+    AprsLockPtt,
+    /// APRS lock: APRS key checkbox (MCP only).
+    AprsLockKey,
 
     // --- Display ---
-    /// Dual display size (MCP only).
-    DualDisplaySize,
-    /// Display area (MCP only).
-    DisplayArea,
-    /// Info line (MCP only).
-    InfoLine,
     /// Backlight control (MCP only).
     BacklightControl,
-    /// Backlight timer (MCP only).
+    /// Backlight timer, 3-60 seconds (MCP only).
     BacklightTimer,
-    /// Display hold time (MCP only).
-    DisplayHoldTime,
-    /// Display method (MCP only).
-    DisplayMethod,
-    /// Power-on display (MCP only).
-    PowerOnDisplay,
     /// Dual band (CAT: DL).
     DualBand,
 
     // --- Audio ---
-    /// EMR volume level (MCP only).
+    /// EMR volume level, 1-50 (MCP only).
     EmrVolumeLevel,
-    /// Auto mute return time (MCP only).
+    /// Auto mute return time, 1-10 (MCP only).
     AutoMuteReturnTime,
-    /// Announce (MCP only).
+    /// Voice announce mode, Off/Manual/Auto1/Auto2 (MCP only).
     Announce,
     /// Key beep (MCP only).
     KeyBeep,
-    /// Beep volume 1-7 (MCP only).
+    /// Beep volume 0-7, 0 = VOL Link (MCP only).
     BeepVolume,
-    /// Voice language (MCP only).
-    VoiceLanguage,
-    /// Voice volume (MCP only).
+    /// Voice volume 0-7, 0 = VOL Link (MCP only).
     VoiceVolume,
     /// Voice speed (MCP only).
     VoiceSpeed,
@@ -271,27 +247,19 @@ pub(crate) enum SettingRow {
     BtAutoConnect,
 
     // --- Interface ---
-    /// GPS/BT interface (MCP only).
+    /// GPS PC-output interface (MCP only).
     GpsBtInterface,
-    /// PC output mode (MCP only).
-    PcOutputMode,
-    /// APRS USB mode (MCP only).
+    /// APRS PC-output interface (MCP only).
     AprsUsbMode,
-    /// USB audio output (MCP only).
-    UsbAudioOutput,
-    /// Internet link (MCP only).
-    InternetLink,
 
     // --- System ---
     /// Language (MCP only).
     Language,
-    /// Power-on message flag (MCP only).
-    PowerOnMessageFlag,
 
     // --- Battery ---
-    /// Battery saver (MCP only).
+    /// Battery saver interval, Off/0.2-5.0 s (MCP only).
     BatterySaver,
-    /// Auto power off (MCP only).
+    /// Auto power off, Off/15/30/60 min (MCP only).
     AutoPowerOff,
 
     // --- CAT-only Radio Controls ---
@@ -345,11 +313,9 @@ impl SettingRow {
         Self::FilterWidthSsb,
         Self::FilterWidthCw,
         Self::FilterWidthAm,
-        Self::FmNarrow,
         Self::SsbHighCut,
-        Self::CwHighCut,
+        Self::CwWidth,
         Self::AmHighCut,
-        Self::AutoFilter,
         // Scan
         Self::ScanResume,
         Self::DigitalScanResume,
@@ -365,8 +331,6 @@ impl SettingRow {
         Self::VoxDelay,
         Self::VoxTxOnBusy,
         // CW
-        Self::CwBreakIn,
-        Self::CwDelayTime,
         Self::CwPitch,
         // DTMF
         Self::DtmfSpeed,
@@ -381,21 +345,14 @@ impl SettingRow {
         Self::PfKey2,
         // Lock
         Self::Lock,
-        Self::KeyLockType,
-        Self::LockKeyA,
-        Self::LockKeyB,
-        Self::LockKeyC,
-        Self::LockPtt,
-        Self::AprsLock,
+        Self::KeyLock,
+        Self::FrequencyLock,
+        Self::AprsLockFrequency,
+        Self::AprsLockPtt,
+        Self::AprsLockKey,
         // Display
-        Self::DualDisplaySize,
-        Self::DisplayArea,
-        Self::InfoLine,
         Self::BacklightControl,
         Self::BacklightTimer,
-        Self::DisplayHoldTime,
-        Self::DisplayMethod,
-        Self::PowerOnDisplay,
         Self::DualBand,
         // Audio
         Self::EmrVolumeLevel,
@@ -403,7 +360,6 @@ impl SettingRow {
         Self::Announce,
         Self::KeyBeep,
         Self::BeepVolume,
-        Self::VoiceLanguage,
         Self::VoiceVolume,
         Self::VoiceSpeed,
         Self::VolumeLock,
@@ -416,13 +372,9 @@ impl SettingRow {
         Self::BtAutoConnect,
         // Interface
         Self::GpsBtInterface,
-        Self::PcOutputMode,
         Self::AprsUsbMode,
-        Self::UsbAudioOutput,
-        Self::InternetLink,
         // System
         Self::Language,
-        Self::PowerOnMessageFlag,
         // Battery
         Self::BatterySaver,
         Self::AutoPowerOff,
@@ -458,11 +410,9 @@ impl SettingRow {
             Self::FilterWidthSsb => "Filter Width SSB",
             Self::FilterWidthCw => "Filter Width CW",
             Self::FilterWidthAm => "Filter Width AM",
-            Self::FmNarrow => "FM Narrow",
             Self::SsbHighCut => "SSB High Cut",
-            Self::CwHighCut => "CW High Cut",
+            Self::CwWidth => "CW Width",
             Self::AmHighCut => "AM High Cut",
-            Self::AutoFilter => "Auto Filter",
             Self::ScanResume => "Scan Resume",
             Self::DigitalScanResume => "Digital Scan Resume",
             Self::ScanRestartTime => "Scan Restart Time",
@@ -474,8 +424,6 @@ impl SettingRow {
             Self::VoxGain => "VOX Gain",
             Self::VoxDelay => "VOX Delay",
             Self::VoxTxOnBusy => "VOX TX on Busy",
-            Self::CwBreakIn => "CW Break-In",
-            Self::CwDelayTime => "CW Delay Time",
             Self::CwPitch => "CW Pitch",
             Self::DtmfSpeed => "DTMF Speed",
             Self::DtmfPauseTime => "DTMF Pause Time",
@@ -486,27 +434,19 @@ impl SettingRow {
             Self::PfKey1 => "PF Key 1",
             Self::PfKey2 => "PF Key 2",
             Self::Lock => "Lock",
-            Self::KeyLockType => "Key Lock Type",
-            Self::LockKeyA => "Lock Key A",
-            Self::LockKeyB => "Lock Key B",
-            Self::LockKeyC => "Lock Key C",
-            Self::LockPtt => "Lock PTT",
-            Self::AprsLock => "APRS Lock",
-            Self::DualDisplaySize => "Dual Display Size",
-            Self::DisplayArea => "Display Area",
-            Self::InfoLine => "Info Line",
+            Self::KeyLock => "Key Lock",
+            Self::FrequencyLock => "Frequency Lock",
+            Self::AprsLockFrequency => "APRS Lock: Frequency",
+            Self::AprsLockPtt => "APRS Lock: PTT",
+            Self::AprsLockKey => "APRS Lock: APRS Key",
             Self::BacklightControl => "Backlight Control",
             Self::BacklightTimer => "Backlight Timer",
-            Self::DisplayHoldTime => "Display Hold Time",
-            Self::DisplayMethod => "Display Method",
-            Self::PowerOnDisplay => "Power-On Display",
             Self::DualBand => "Dual Band",
             Self::EmrVolumeLevel => "EMR Volume Level",
             Self::AutoMuteReturnTime => "Auto Mute Return",
             Self::Announce => "Announce",
             Self::KeyBeep => "Key Beep",
             Self::BeepVolume => "Beep Volume",
-            Self::VoiceLanguage => "Voice Language",
             Self::VoiceVolume => "Voice Volume",
             Self::VoiceSpeed => "Voice Speed",
             Self::VolumeLock => "Volume Lock",
@@ -516,12 +456,8 @@ impl SettingRow {
             Self::Bluetooth => "Bluetooth",
             Self::BtAutoConnect => "BT Auto Connect",
             Self::GpsBtInterface => "GPS/BT Interface",
-            Self::PcOutputMode => "PC Output Mode",
             Self::AprsUsbMode => "APRS USB Mode",
-            Self::UsbAudioOutput => "USB Audio Output",
-            Self::InternetLink => "Internet Link",
             Self::Language => "Language",
-            Self::PowerOnMessageFlag => "Power-On Msg Flag",
             Self::BatterySaver => "Battery Saver",
             Self::AutoPowerOff => "Auto Power Off",
             Self::PowerA => "Power A",
@@ -552,12 +488,12 @@ impl SettingRow {
             Self::ScanResume => Some("── Scan ──"),
             Self::TimeoutTimer => Some("── TX ──"),
             Self::VoxEnabled => Some("── VOX ──"),
-            Self::CwBreakIn => Some("── CW ──"),
+            Self::CwPitch => Some("── CW ──"),
             Self::DtmfSpeed => Some("── DTMF ──"),
             Self::RepeaterAutoOffset => Some("── Repeater ──"),
             Self::MicSensitivity => Some("── Auxiliary ──"),
             Self::Lock => Some("── Lock ──"),
-            Self::DualDisplaySize => Some("── Display ──"),
+            Self::BacklightControl => Some("── Display ──"),
             Self::EmrVolumeLevel => Some("── Audio ──"),
             Self::SpeedDistanceUnit => Some("── Units ──"),
             Self::Bluetooth => Some("── Bluetooth ──"),
@@ -578,19 +514,17 @@ impl SettingRow {
                 | Self::StepSizeA
                 | Self::StepSizeB
                 | Self::ScanResumeCat
-                | Self::FmNarrow
                 | Self::SsbHighCut
-                | Self::CwHighCut
+                | Self::CwWidth
                 | Self::AmHighCut
-                | Self::AutoFilter
                 | Self::ScanResume
                 | Self::DigitalScanResume
                 | Self::ScanRestartTime
                 | Self::ScanRestartCarrier
                 | Self::TimeoutTimer
+                | Self::BeatShift
                 | Self::VoxGain
                 | Self::VoxDelay
-                | Self::CwDelayTime
                 | Self::CwPitch
                 | Self::DtmfSpeed
                 | Self::DtmfPauseTime
@@ -598,27 +532,20 @@ impl SettingRow {
                 | Self::MicSensitivity
                 | Self::PfKey1
                 | Self::PfKey2
-                | Self::KeyLockType
-                | Self::DualDisplaySize
-                | Self::DisplayArea
-                | Self::InfoLine
                 | Self::BacklightControl
                 | Self::BacklightTimer
-                | Self::DisplayHoldTime
-                | Self::DisplayMethod
-                | Self::PowerOnDisplay
                 | Self::EmrVolumeLevel
                 | Self::AutoMuteReturnTime
+                | Self::Announce
                 | Self::BeepVolume
-                | Self::VoiceLanguage
                 | Self::VoiceVolume
                 | Self::VoiceSpeed
                 | Self::SpeedDistanceUnit
                 | Self::AltitudeRainUnit
                 | Self::TemperatureUnit
                 | Self::GpsBtInterface
-                | Self::PcOutputMode
                 | Self::AprsUsbMode
+                | Self::BatterySaver
                 | Self::AutoPowerOff
                 | Self::PowerA
                 | Self::PowerB
@@ -694,6 +621,30 @@ pub(crate) fn mcp_settings() -> Vec<SettingRow> {
 
 const fn on_off(b: bool) -> &'static str {
     if b { "On" } else { "Off" }
+}
+
+/// Step a PF-key assignment one position through the registry's gapped
+/// domain (0-30 excluding 5, 23, 25 and 26), in the direction of `delta`.
+///
+/// Saturates at the domain edges (0 and 30 are both valid), so the
+/// result is always accepted by the library's PF-key validators.
+fn next_pf_key(cur: u8, delta: i8) -> u8 {
+    let mut next = cur;
+    loop {
+        let stepped = if delta > 0 {
+            next.saturating_add(1).min(30)
+        } else {
+            next.saturating_sub(1)
+        };
+        if stepped == next {
+            // Saturated at a domain edge.
+            return stepped;
+        }
+        next = stepped;
+        if !matches!(next, 5 | 23 | 25 | 26) {
+            return next;
+        }
+    }
 }
 
 /// Which pane currently has input focus.
@@ -2249,11 +2200,9 @@ impl App {
 
         match row {
             SettingRow::TxInhibit => toggle_bool!(tx_inhibit, set_tx_inhibit, "TX Inhibit"),
-            SettingRow::BeatShift => toggle_bool!(beat_shift, set_beat_shift, "Beat Shift"),
             SettingRow::VoxTxOnBusy => {
                 toggle_bool!(vox_tx_on_busy, set_vox_tx_on_busy, "VOX TX Busy");
             }
-            SettingRow::CwBreakIn => toggle_bool!(cw_break_in, set_cw_break_in, "CW Break-In"),
             SettingRow::DtmfTxHold => {
                 toggle_bool!(dtmf_tx_hold, set_dtmf_tx_hold, "DTMF TX Hold");
             }
@@ -2264,32 +2213,27 @@ impl App {
                     "Rpt Auto Offset"
                 );
             }
-            SettingRow::LockKeyA => toggle_bool!(lock_key_a, set_lock_key_a, "Lock Key A"),
-            SettingRow::LockKeyB => toggle_bool!(lock_key_b, set_lock_key_b, "Lock Key B"),
-            SettingRow::LockKeyC => toggle_bool!(lock_key_c, set_lock_key_c, "Lock Key C"),
-            SettingRow::LockPtt => toggle_bool!(lock_key_ptt, set_lock_key_ptt, "Lock PTT"),
-            SettingRow::AprsLock => toggle_bool!(aprs_lock, set_aprs_lock, "APRS Lock"),
-            SettingRow::Announce => toggle_bool!(announce, set_announce, "Announce"),
+            SettingRow::KeyLock => toggle_bool!(key_lock, set_key_lock, "Key Lock"),
+            SettingRow::FrequencyLock => {
+                toggle_bool!(frequency_lock, set_frequency_lock, "Freq Lock");
+            }
+            SettingRow::AprsLockFrequency => {
+                toggle_bool!(
+                    aprs_lock_frequency,
+                    set_aprs_lock_frequency,
+                    "APRS Lock Freq"
+                );
+            }
+            SettingRow::AprsLockPtt => {
+                toggle_bool!(aprs_lock_ptt, set_aprs_lock_ptt, "APRS Lock PTT");
+            }
+            SettingRow::AprsLockKey => {
+                toggle_bool!(aprs_lock_key, set_aprs_lock_key, "APRS Lock Key");
+            }
             SettingRow::KeyBeep => toggle_bool!(key_beep, set_key_beep, "Key Beep"),
             SettingRow::VolumeLock => toggle_bool!(volume_lock, set_volume_lock, "Vol Lock"),
             SettingRow::BtAutoConnect => {
                 toggle_bool!(bt_auto_connect, set_bt_auto_connect, "BT Auto Connect");
-            }
-            SettingRow::UsbAudioOutput => {
-                toggle_bool!(usb_audio_output, set_usb_audio_output, "USB Audio Out");
-            }
-            SettingRow::InternetLink => {
-                toggle_bool!(internet_link, set_internet_link, "Internet Link");
-            }
-            SettingRow::PowerOnMessageFlag => {
-                toggle_bool!(
-                    power_on_message_flag,
-                    set_power_on_message_flag,
-                    "PowerOn Msg"
-                );
-            }
-            SettingRow::BatterySaver => {
-                toggle_bool!(battery_saver, set_battery_saver, "Battery Saver");
             }
             _ => {
                 self.status_message = Some(format!("{}: use +/- to adjust", row.label()));
@@ -2638,9 +2582,6 @@ impl App {
         }
 
         match row {
-            SettingRow::FmNarrow => {
-                adjust_numeric!(fm_narrow, set_fm_narrow, "FM Narrow", image, delta, tx);
-            }
             SettingRow::SsbHighCut => {
                 adjust_numeric!(
                     ssb_high_cut,
@@ -2651,31 +2592,14 @@ impl App {
                     tx
                 );
             }
-            SettingRow::CwHighCut => {
-                adjust_numeric!(
-                    cw_high_cut,
-                    set_cw_high_cut,
-                    "CW High Cut",
-                    image,
-                    delta,
-                    tx
-                );
+            SettingRow::CwWidth => {
+                adjust_numeric!(cw_width, set_cw_width, "CW Width", image, delta, tx);
             }
             SettingRow::AmHighCut => {
                 adjust_numeric!(
                     am_high_cut,
                     set_am_high_cut,
                     "AM High Cut",
-                    image,
-                    delta,
-                    tx
-                );
-            }
-            SettingRow::AutoFilter => {
-                adjust_numeric!(
-                    auto_filter,
-                    set_auto_filter,
-                    "Auto Filter",
                     image,
                     delta,
                     tx
@@ -2722,24 +2646,44 @@ impl App {
                 );
             }
             SettingRow::TimeoutTimer => {
-                adjust_numeric!(
-                    timeout_timer,
-                    set_timeout_timer,
-                    "Timeout Timer",
-                    image,
-                    delta,
-                    tx
-                );
+                // radio.TimeOutTimer: 0-10 indexes the minute table, NOT a minute count.
+                let new_val = if delta > 0 {
+                    image.settings().timeout_timer().saturating_add(1).min(10)
+                } else {
+                    image.settings().timeout_timer().saturating_sub(1)
+                };
+                if let Some((offset, value)) =
+                    image.modify_setting(|w| w.set_timeout_timer(new_val))
+                {
+                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message = Some(format!(
+                        "Timeout Timer → {} min — applying...",
+                        [
+                            "0.5", "1.0", "1.5", "2.0", "2.5", "3.0", "3.5", "4.0", "4.5", "5.0",
+                            "10.0",
+                        ]
+                        .get(new_val as usize)
+                        .unwrap_or(&"?")
+                    ));
+                }
             }
-            SettingRow::CwDelayTime => {
-                adjust_numeric!(
-                    cw_delay_time,
-                    set_cw_delay_time,
-                    "CW Delay",
-                    image,
-                    delta,
-                    tx
-                );
+            SettingRow::BeatShift => {
+                // radio.BeatShift: eight types (raw 0-7 = Type 1-8), not on/off.
+                let cur = u8::from(image.settings().beat_shift());
+                let new_raw = if delta > 0 {
+                    cur.saturating_add(1).min(7)
+                } else {
+                    cur.saturating_sub(1)
+                };
+                if let Ok(shift) = kenwood_thd75::types::BeatShift::try_from(new_raw)
+                    && let Some((offset, value)) = image.modify_setting(|w| w.set_beat_shift(shift))
+                {
+                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message = Some(format!(
+                        "Beat Shift → Type {} — applying...",
+                        new_raw.saturating_add(1)
+                    ));
+                }
             }
             SettingRow::CwPitch => {
                 adjust_numeric!(cw_pitch, set_cw_pitch, "CW Pitch", image, delta, tx);
@@ -2768,56 +2712,45 @@ impl App {
                 );
             }
             SettingRow::MicSensitivity => {
-                adjust_numeric!(
-                    mic_sensitivity,
-                    set_mic_sensitivity,
-                    "Mic Sens",
-                    image,
-                    delta,
-                    tx
-                );
-            }
-            SettingRow::PfKey1 => {
-                adjust_numeric!(pf_key1, set_pf_key1, "PF Key 1", image, delta, tx);
-            }
-            SettingRow::PfKey2 => {
-                adjust_numeric!(pf_key2, set_pf_key2, "PF Key 2", image, delta, tx);
-            }
-            SettingRow::KeyLockType => {
-                let new_val = image
-                    .settings()
-                    .key_lock_type_raw()
-                    .saturating_add_signed(delta)
-                    .min(2);
+                // radio.MicSensitivity is inverted versus intuition: 0=High, 2=Low.
+                let new_val = if delta > 0 {
+                    image.settings().mic_sensitivity().saturating_add(1).min(2)
+                } else {
+                    image.settings().mic_sensitivity().saturating_sub(1)
+                };
                 if let Some((offset, value)) =
-                    image.modify_setting(|w| w.set_key_lock_type_raw(new_val))
+                    image.modify_setting(|w| w.set_mic_sensitivity(new_val))
                 {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!("Lock Type → {new_val} — applying..."));
+                    self.status_message = Some(format!(
+                        "Mic Sens → {} — applying...",
+                        ["High", "Medium", "Low"]
+                            .get(new_val as usize)
+                            .unwrap_or(&"?")
+                    ));
                 }
             }
-            SettingRow::DualDisplaySize => {
-                adjust_numeric!(
-                    dual_display_size,
-                    set_dual_display_size,
-                    "Dual Display",
-                    image,
-                    delta,
-                    tx
-                );
+            SettingRow::PfKey1 => {
+                let new_val = next_pf_key(image.settings().pf_key1(), delta);
+                let mut write = Ok(());
+                let changed = image.modify_setting(|w| write = w.set_pf_key1(new_val));
+                if let Err(e) = write {
+                    self.status_message = Some(format!("PF Key 1: {e}"));
+                } else if let Some((offset, value)) = changed {
+                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message = Some(format!("PF Key 1 → {new_val} — applying..."));
+                }
             }
-            SettingRow::DisplayArea => {
-                adjust_numeric!(
-                    display_area,
-                    set_display_area,
-                    "Display Area",
-                    image,
-                    delta,
-                    tx
-                );
-            }
-            SettingRow::InfoLine => {
-                adjust_numeric!(info_line, set_info_line, "Info Line", image, delta, tx);
+            SettingRow::PfKey2 => {
+                let new_val = next_pf_key(image.settings().pf_key2(), delta);
+                let mut write = Ok(());
+                let changed = image.modify_setting(|w| write = w.set_pf_key2(new_val));
+                if let Err(e) = write {
+                    self.status_message = Some(format!("PF Key 2: {e}"));
+                } else if let Some((offset, value)) = changed {
+                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message = Some(format!("PF Key 2 → {new_val} — applying..."));
+                }
             }
             SettingRow::BacklightControl => {
                 adjust_numeric!(
@@ -2834,36 +2767,6 @@ impl App {
                     backlight_timer,
                     set_backlight_timer,
                     "Backlight Timer",
-                    image,
-                    delta,
-                    tx
-                );
-            }
-            SettingRow::DisplayHoldTime => {
-                adjust_numeric!(
-                    display_hold_time,
-                    set_display_hold_time,
-                    "Display Hold",
-                    image,
-                    delta,
-                    tx
-                );
-            }
-            SettingRow::DisplayMethod => {
-                adjust_numeric!(
-                    display_method,
-                    set_display_method,
-                    "Display Method",
-                    image,
-                    delta,
-                    tx
-                );
-            }
-            SettingRow::PowerOnDisplay => {
-                adjust_numeric!(
-                    power_on_display,
-                    set_power_on_display,
-                    "PowerOn Display",
                     image,
                     delta,
                     tx
@@ -2889,28 +2792,27 @@ impl App {
                     tx
                 );
             }
-            SettingRow::BeepVolume => {
-                let cur = image.settings().beep_volume();
+            SettingRow::Announce => {
+                // radio.VoiceAnnounce: 0=Off, 1=Manual, 2=Auto1, 3=Auto2 — a mode
+                // selector, not an on/off switch.
                 let new_val = if delta > 0 {
-                    cur.saturating_add(1).min(7)
+                    image.settings().announce().saturating_add(1).min(3)
                 } else {
-                    cur.saturating_sub(1).max(1)
+                    image.settings().announce().saturating_sub(1)
                 };
-                if let Some((offset, value)) = image.modify_setting(|w| w.set_beep_volume(new_val))
-                {
+                if let Some((offset, value)) = image.modify_setting(|w| w.set_announce(new_val)) {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!("Beep Vol → {new_val} — applying..."));
+                    self.status_message = Some(format!(
+                        "Announce → {} — applying...",
+                        ["Off", "Manual", "Auto1", "Auto2"]
+                            .get(new_val as usize)
+                            .unwrap_or(&"?")
+                    ));
                 }
             }
-            SettingRow::VoiceLanguage => {
-                adjust_numeric!(
-                    voice_language,
-                    set_voice_language,
-                    "Voice Lang",
-                    image,
-                    delta,
-                    tx
-                );
+            SettingRow::BeepVolume => {
+                // radio.BeepVolume: 0-7, where 0 is the legal "VOL Link" value.
+                adjust_numeric!(beep_volume, set_beep_volume, "Beep Vol", image, delta, tx);
             }
             SettingRow::VoiceVolume => {
                 adjust_numeric!(
@@ -3004,16 +2906,6 @@ impl App {
                     tx
                 );
             }
-            SettingRow::PcOutputMode => {
-                adjust_numeric!(
-                    pc_output_mode,
-                    set_pc_output_mode,
-                    "PC Output",
-                    image,
-                    delta,
-                    tx
-                );
-            }
             SettingRow::AprsUsbMode => {
                 adjust_numeric!(
                     aprs_usb_mode,
@@ -3024,13 +2916,37 @@ impl App {
                     tx
                 );
             }
+            SettingRow::BatterySaver => {
+                // radio.BatterySaver: 0=Off, 1-9 select the 0.2-5.0 s saver
+                // interval — a 10-value selector, not an on/off switch.
+                let new_val = if delta > 0 {
+                    image.settings().battery_saver().saturating_add(1).min(9)
+                } else {
+                    image.settings().battery_saver().saturating_sub(1)
+                };
+                if let Some((offset, value)) =
+                    image.modify_setting(|w| w.set_battery_saver(new_val))
+                {
+                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message = Some(format!(
+                        "Battery Saver → {} — applying...",
+                        [
+                            "Off", "0.2 s", "0.4 s", "0.6 s", "0.8 s", "1.0 s", "2.0 s", "3.0 s",
+                            "4.0 s", "5.0 s",
+                        ]
+                        .get(new_val as usize)
+                        .unwrap_or(&"?")
+                    ));
+                }
+            }
             SettingRow::AutoPowerOff => {
+                // radio.AutoPowerOff: 0=Off, 1=15 min, 2=30 min, 3=60 min.
                 let new_val = if delta > 0 {
                     image
                         .settings()
                         .auto_power_off_raw()
                         .saturating_add(1)
-                        .min(4)
+                        .min(3)
                 } else {
                     image.settings().auto_power_off_raw().saturating_sub(1)
                 };
@@ -3040,7 +2956,7 @@ impl App {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
                         "Auto PwrOff → {} — applying...",
-                        ["Off", "30m", "60m", "90m", "120m"]
+                        ["Off", "15 min", "30 min", "60 min"]
                             .get(new_val as usize)
                             .unwrap_or(&"?")
                     ));

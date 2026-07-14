@@ -416,7 +416,10 @@ impl<T: Transport> Radio<T> {
     /// page is in the factory calibration region. Returns an error if entry,
     /// any page read, a changed-page write or verification, or exit fails.
     /// Programming mode is always exited after a successful entry, even when
-    /// a read, write, or verification fails.
+    /// a read, write, or verification fails. A failed read cannot change the
+    /// radio, but if a write or its verification fails partway through the
+    /// batch, pages written earlier in the same session remain changed; the
+    /// error identifies only the failing page.
     pub async fn modify_memory_pages<F>(
         &mut self,
         pages: &[u16],
@@ -1957,6 +1960,74 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Transport(_))),
             "short page response should surface as a transport error: {result:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn apply_menu_patches_writes_and_verifies_every_changed_page() -> TestResult {
+        use crate::memory::{FieldValue, PatchPlanner, menu_field};
+
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        // radio.Beep (Bool at 0x1071, page 0x10) and gps.MyPositionSelect
+        // (Byte at 0x11C0, page 0x11) both change, so the plan spans two
+        // pages that must each be written and read-back verified within the
+        // same programming session.
+        let beep_page = 0x0010;
+        let select_page = 0x0011;
+        let beep_original = vec![0x00; programming::PAGE_SIZE];
+        let select_original = vec![0x00; programming::PAGE_SIZE];
+
+        let beep_read = programming::build_read_command(beep_page);
+        mock.expect(&beep_read, &build_w_response(beep_page, &beep_original)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let select_read = programming::build_read_command(select_page);
+        mock.expect(
+            &select_read,
+            &build_w_response(select_page, &select_original)?,
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        let mut beep_modified = beep_original.clone();
+        set_byte(&mut beep_modified, 0x71, 0x01)?;
+        let beep_modified_array = into_page_array(beep_modified.clone())?;
+        let beep_write = programming::build_write_command(beep_page, &beep_modified_array);
+        mock.expect(&beep_write, &[programming::ACK]);
+        mock.expect(&beep_read, &build_w_response(beep_page, &beep_modified)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        let mut select_modified = select_original.clone();
+        set_byte(&mut select_modified, 0xC0, 0x02)?;
+        let select_modified_array = into_page_array(select_modified.clone())?;
+        let select_write = programming::build_write_command(select_page, &select_modified_array);
+        mock.expect(&select_write, &[programming::ACK]);
+        mock.expect(
+            &select_read,
+            &build_w_response(select_page, &select_modified)?,
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        let mut planner = PatchPlanner::new();
+        let beep = menu_field("radio.Beep").ok_or("registry field radio.Beep missing")?;
+        beep.plan_value(&mut planner, FieldValue::Bool(true))?;
+        let select = menu_field("gps.MyPositionSelect")
+            .ok_or("registry field gps.MyPositionSelect missing")?;
+        select.plan_value(&mut planner, FieldValue::Unsigned(2))?;
+        let patches = planner.finish()?;
+
+        let changed = radio.apply_menu_patches(&patches).await?;
+        assert_eq!(
+            changed,
+            vec![beep_page, select_page],
+            "both changed pages must be written and verified in ascending order"
         );
         radio.transport.assert_complete();
         Ok(())

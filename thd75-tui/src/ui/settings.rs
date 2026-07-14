@@ -304,11 +304,9 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
                 .map_or_else(|| "N/A".into(), |w| format!("{w}")),
             Color::Yellow,
         ),
-        SettingRow::FmNarrow => mcp_num(app, |s| s.settings().fm_narrow()),
         SettingRow::SsbHighCut => mcp_num(app, |s| s.settings().ssb_high_cut()),
-        SettingRow::CwHighCut => mcp_num(app, |s| s.settings().cw_high_cut()),
+        SettingRow::CwWidth => mcp_num(app, |s| s.settings().cw_width()),
         SettingRow::AmHighCut => mcp_num(app, |s| s.settings().am_high_cut()),
-        SettingRow::AutoFilter => mcp_num(app, |s| s.settings().auto_filter()),
 
         // --- Scan ---
         SettingRow::ScanResume => mcp_num(app, |s| s.settings().scan_resume()),
@@ -317,9 +315,22 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::ScanRestartCarrier => mcp_num(app, |s| s.settings().scan_restart_carrier()),
 
         // --- TX ---
-        SettingRow::TimeoutTimer => mcp_num(app, |s| s.settings().timeout_timer()),
+        SettingRow::TimeoutTimer => mcp_str(app, |s| {
+            // 0-10 indexes the official minute table, NOT a minute count.
+            [
+                "0.5", "1.0", "1.5", "2.0", "2.5", "3.0", "3.5", "4.0", "4.5", "5.0", "10.0",
+            ]
+            .get(usize::from(s.settings().timeout_timer()))
+            .map_or_else(|| "?".into(), |minutes| format!("{minutes} min"))
+        }),
         SettingRow::TxInhibit => mcp_bool(app, |s| s.settings().tx_inhibit()),
-        SettingRow::BeatShift => mcp_bool(app, |s| s.settings().beat_shift()),
+        SettingRow::BeatShift => mcp_str(app, |s| {
+            // Raw 0-7 selects beat-shift Type 1-8.
+            format!(
+                "Type {}",
+                u8::from(s.settings().beat_shift()).saturating_add(1)
+            )
+        }),
 
         // --- VOX (gain/delay: live CAT; rest: MCP) ---
         SettingRow::VoxEnabled => bool_span(app.state.vox),
@@ -328,8 +339,6 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::VoxTxOnBusy => mcp_bool(app, |s| s.settings().vox_tx_on_busy()),
 
         // --- CW ---
-        SettingRow::CwBreakIn => mcp_bool(app, |s| s.settings().cw_break_in()),
-        SettingRow::CwDelayTime => mcp_num(app, |s| s.settings().cw_delay_time()),
         SettingRow::CwPitch => mcp_num(app, |s| s.settings().cw_pitch()),
 
         // --- DTMF ---
@@ -342,42 +351,45 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::RepeaterCallKey => mcp_num(app, |s| s.settings().repeater_call_key()),
 
         // --- Auxiliary ---
-        SettingRow::MicSensitivity => mcp_num(app, |s| s.settings().mic_sensitivity()),
+        SettingRow::MicSensitivity => mcp_str(app, |s| {
+            // radio.MicSensitivity is inverted versus intuition: 0=High, 2=Low.
+            // The getter clamps to 0-2.
+            match s.settings().mic_sensitivity() {
+                0 => "High".into(),
+                1 => "Medium".into(),
+                _ => "Low".into(),
+            }
+        }),
         SettingRow::PfKey1 => mcp_num(app, |s| s.settings().pf_key1()),
         SettingRow::PfKey2 => mcp_num(app, |s| s.settings().pf_key2()),
 
         // --- Lock (Lock: live CAT; rest: MCP) ---
         SettingRow::Lock => bool_span(app.state.lock),
-        SettingRow::KeyLockType => mcp_str(app, |s| match s.settings().key_lock_type_raw() {
-            0 => "Key Only".into(),
-            1 => "Key+PTT".into(),
-            2 => "Key+PTT+Dial".into(),
-            v => format!("{v}"),
-        }),
-        SettingRow::LockKeyA => mcp_bool(app, |s| s.settings().lock_key_a()),
-        SettingRow::LockKeyB => mcp_bool(app, |s| s.settings().lock_key_b()),
-        SettingRow::LockKeyC => mcp_bool(app, |s| s.settings().lock_key_c()),
-        SettingRow::LockPtt => mcp_bool(app, |s| s.settings().lock_key_ptt()),
-        SettingRow::AprsLock => mcp_bool(app, |s| s.settings().aprs_lock()),
+        SettingRow::KeyLock => mcp_bool(app, |s| s.settings().key_lock()),
+        SettingRow::FrequencyLock => mcp_bool(app, |s| s.settings().frequency_lock()),
+        SettingRow::AprsLockFrequency => mcp_bool(app, |s| s.settings().aprs_lock_frequency()),
+        SettingRow::AprsLockPtt => mcp_bool(app, |s| s.settings().aprs_lock_ptt()),
+        SettingRow::AprsLockKey => mcp_bool(app, |s| s.settings().aprs_lock_key()),
 
         // --- Display (DualBand: live CAT; rest: MCP) ---
-        SettingRow::DualDisplaySize => mcp_num(app, |s| s.settings().dual_display_size()),
-        SettingRow::DisplayArea => mcp_num(app, |s| s.settings().display_area()),
-        SettingRow::InfoLine => mcp_num(app, |s| s.settings().info_line()),
         SettingRow::BacklightControl => mcp_num(app, |s| s.settings().backlight_control()),
         SettingRow::BacklightTimer => mcp_num(app, |s| s.settings().backlight_timer()),
-        SettingRow::DisplayHoldTime => mcp_num(app, |s| s.settings().display_hold_time()),
-        SettingRow::DisplayMethod => mcp_num(app, |s| s.settings().display_method()),
-        SettingRow::PowerOnDisplay => mcp_num(app, |s| s.settings().power_on_display()),
         SettingRow::DualBand => bool_span(app.state.dual_band),
 
         // --- Audio ---
         SettingRow::EmrVolumeLevel => mcp_num(app, |s| s.settings().emr_volume_level()),
         SettingRow::AutoMuteReturnTime => mcp_num(app, |s| s.settings().auto_mute_return_time()),
-        SettingRow::Announce => mcp_bool(app, |s| s.settings().announce()),
+        SettingRow::Announce => mcp_str(app, |s| {
+            // radio.VoiceAnnounce mode selector; the getter clamps to 0-3.
+            match s.settings().announce() {
+                0 => "Off".into(),
+                1 => "Manual".into(),
+                2 => "Auto1".into(),
+                _ => "Auto2".into(),
+            }
+        }),
         SettingRow::KeyBeep => mcp_bool(app, |s| s.settings().key_beep()),
         SettingRow::BeepVolume => mcp_num(app, |s| s.settings().beep_volume()),
-        SettingRow::VoiceLanguage => mcp_num(app, |s| s.settings().voice_language()),
         SettingRow::VoiceVolume => mcp_num(app, |s| s.settings().voice_volume()),
         SettingRow::VoiceSpeed => mcp_num(app, |s| s.settings().voice_speed()),
         SettingRow::VolumeLock => mcp_bool(app, |s| s.settings().volume_lock()),
@@ -412,10 +424,7 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
 
         // --- Interface ---
         SettingRow::GpsBtInterface => mcp_num(app, |s| s.settings().gps_bt_interface()),
-        SettingRow::PcOutputMode => mcp_num(app, |s| s.settings().pc_output_mode()),
         SettingRow::AprsUsbMode => mcp_num(app, |s| s.settings().aprs_usb_mode()),
-        SettingRow::UsbAudioOutput => mcp_bool(app, |s| s.settings().usb_audio_output()),
-        SettingRow::InternetLink => mcp_bool(app, |s| s.settings().internet_link()),
 
         // --- System ---
         SettingRow::Language => mcp_str(app, |s| {
@@ -425,16 +434,22 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
                 Language::Japanese => "Japanese".into(),
             }
         }),
-        SettingRow::PowerOnMessageFlag => mcp_bool(app, |s| s.settings().power_on_message_flag()),
 
         // --- Battery ---
-        SettingRow::BatterySaver => mcp_bool(app, |s| s.settings().battery_saver()),
+        SettingRow::BatterySaver => mcp_str(app, |s| {
+            // radio.BatterySaver: 0=Off, 1-9 select the saver interval.
+            [
+                "Off", "0.2 s", "0.4 s", "0.6 s", "0.8 s", "1.0 s", "2.0 s", "3.0 s", "4.0 s",
+                "5.0 s",
+            ]
+            .get(usize::from(s.settings().battery_saver()))
+            .map_or_else(|| "?".into(), |interval| (*interval).into())
+        }),
         SettingRow::AutoPowerOff => mcp_str(app, |s| match s.settings().auto_power_off_raw() {
             0 => "Off".into(),
-            1 => "30 min".into(),
-            2 => "60 min".into(),
-            3 => "90 min".into(),
-            4 => "120 min".into(),
+            1 => "15 min".into(),
+            2 => "30 min".into(),
+            3 => "60 min".into(),
             v => format!("{v}"),
         }),
 

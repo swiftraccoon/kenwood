@@ -1,40 +1,59 @@
 //! Typed access to the system settings region of the memory image.
 //!
 //! The system settings occupy bytes `0x0000`-`0x1FFF` (32 pages, 8,192
-//! bytes). This region stores the radio's global configuration including
-//! VFO state, squelch levels, display settings, audio settings, and more.
+//! bytes). This region stores the radio's global configuration
+//! including band state, menu settings, and configuration strings.
 //!
-//! # Known offsets
+//! # Offset provenance
 //!
-//! | Region | Offset | Confidence |
-//! |--------|--------|------------|
-//! | Power-on message | `0x11C0` | D74 dev notes |
-//! | Model name | `0x11D0` | D74 dev notes |
-//! | Callsign data | `0x1300` | D74 dev notes |
-//! | Power level A | `0x0359` | Hardware verified |
-//! | Attenuator A | `0x035C` | Hardware verified |
-//! | Dual band | `0x0396` | Hardware verified |
-//! | VOX enable | `0x101B` | Hardware verified |
-//! | VOX gain | `0x101C` | Hardware verified |
-//! | Lock | `0x1060` | Hardware verified |
-//! | Key beep | `0x1071` | Hardware verified |
-//! | Bluetooth | `0x1078` | Hardware verified |
-//! | Squelch A | `0x100D` | Firmware analysis |
-//! | Squelch B | `0x100E` | Firmware analysis |
-//! | Language | `0x1006` | Firmware analysis |
-//! | Beep volume | `0x1072` | Firmware analysis |
-//! | Backlight control | `0x1069` | Firmware analysis |
-//! | Auto power off | `0x10D0` | Firmware analysis |
-//! | Battery saver | `0x10C0` | Firmware analysis |
-//! | Key lock type | `0x1061` | Firmware analysis |
-//! | VOX delay | `0x101D` | Firmware analysis |
+//! Every menu-setting offset in this module is taken from the MCP-D75
+//! field registry ([`MCP_D75_MENU_FIELDS`](super::MCP_D75_MENU_FIELDS),
+//! generated from Kenwood's official MCP-D75 serializers) and
+//! cross-checked against a memory dump read from a physical TH-D75
+//! (`tests/memory_golden.rs`). A unit test in this file pins each
+//! offset constant to its registry field so the two layers cannot
+//! drift apart.
+//!
+//! | Region | Offsets | Source |
+//! |--------|---------|--------|
+//! | Band state (power level, attenuator, dual band) | `0x0359`, `0x035C`, `0x0396` | Hardware verified (registry has no field below `0x1000`) |
+//! | Radio menu block | `0x1000`-`0x10DF` | MCP-D75 registry |
+//! | APRS lock bits | `0x120A` | MCP-D75 registry (`aprs.*`) |
+//! | DV EMR volume | `0x1A03` | MCP-D75 registry (`dv.*`) |
+//!
+//! Two registry cells are shared bit bytes: the key-lock configuration
+//! pair at `0x1084` and the APRS lock triple at `0x120A`. Their setters
+//! perform masked read-modify-write so unrelated bits survive.
 
+// Removed legacy accessors (offsets disproven against the MCP-D75
+// registry and the hardware dump):
+//
+// - `lock`/`set_lock` (0x1060): that byte is `radio.BacklightControl`.
+//   Key-lock STATE is runtime state — the CAT layer
+//   (`Radio::get_lock`/`Radio::set_lock`, LC/DL wire commands) is the
+//   verified path. The persistent key-lock *configuration* is the bit
+//   pair at 0x1084 (`key_lock`/`frequency_lock` below).
+// - VFO block (0x0020): the hardware dump holds no VFO data there
+//   (entry 0 all-0xFF, entries 1-5 zero). Candidate real VFO records
+//   were observed at 0x0400/0x0430/0x0460 (48-byte stride, second bank
+//   at 0x0600) but remain unverified — no accessor until they are.
+// - `model_name` (0x11D0): unmapped gap after `gps.MyPositionSelect`;
+//   the famous "TH-D75" string lives at 0x10D0 =
+//   `radio.BluetoothDeviceName` (reachable through the registry).
+// - `squelch_a`/`squelch_b` (0x100D/0x100E): squelch is runtime state
+//   (CAT `SQ`), never serialized by MCP-D75 — those bytes are the
+//   digital scan-resume and time-restart cells.
+// - `callsign_raw` (0x1300): that offset is
+//   `aprs.StatusTextList[4].StatusText`. D-STAR MY callsigns live in
+//   `dv.MyCallsignDvGatewayList` at 0x1CA8 (see `memory::dstar`).
+
+use crate::error::ValidationError;
 use crate::protocol::programming;
+use crate::types::PowerLevel;
 use crate::types::settings::{
-    AltitudeRainUnit, AutoPowerOff, DisplayUnits, KeyLockType, Language, SpeedDistanceUnit,
+    AltitudeRainUnit, AutoPowerOff, BeatShift, DisplayUnits, Language, SpeedDistanceUnit,
     TemperatureUnit,
 };
-use crate::types::{Frequency, MemoryMode, PowerLevel};
 
 // ---------------------------------------------------------------------------
 // System settings region (0x0000 - 0x1FFF)
@@ -48,26 +67,14 @@ const SETTINGS_SIZE: usize = (programming::SETTINGS_END as usize + 1
     - programming::SETTINGS_START as usize)
     * programming::PAGE_SIZE;
 
-/// Byte offset of the power-on message (16 bytes, null-terminated ASCII).
-const POWER_ON_MESSAGE_OFFSET: usize = 0x11C0;
-
-/// Size of the power-on message field.
-const POWER_ON_MESSAGE_SIZE: usize = 16;
-
-/// Byte offset of the internal model name (16 bytes, null-terminated ASCII).
-const MODEL_NAME_OFFSET: usize = 0x11D0;
-
-/// Size of the model name field.
-const MODEL_NAME_SIZE: usize = 16;
-
-/// Byte offset of callsign data.
-const CALLSIGN_OFFSET: usize = 0x1300;
-
 // ---------------------------------------------------------------------------
-// Hardware-verified settings offsets
+// Hardware-verified band-state offsets (outside registry scope)
 //
 // Each of these offsets was confirmed on a real TH-D75 by toggling the
-// setting individually and identifying the changed byte in the MCP image.
+// setting individually and identifying the changed byte in the MCP
+// image. The MCP-D75 registry has no field below 0x1000, so these do
+// not conflict with any serializer cell (a unit test below asserts
+// that).
 // ---------------------------------------------------------------------------
 
 /// Hardware-verified offset for Band A power level (1 byte, 0=Hi, 1=Mid, 2=Lo, 3=EL).
@@ -79,203 +86,170 @@ const ATTENUATOR_A_OFFSET: usize = 0x035C;
 /// Hardware-verified offset for dual-band display (1 byte, 0=single, 1=dual).
 const DUAL_BAND_OFFSET: usize = 0x0396;
 
-/// Hardware-verified offset for VOX enabled (1 byte, 0=off, 1=on).
-const VOX_ENABLED_OFFSET: usize = 0x101B;
-
-/// Hardware-verified offset for VOX gain (1 byte, range 0-9).
-const VOX_GAIN_OFFSET: usize = 0x101C;
-
-/// Hardware-verified offset for lock on/off (1 byte, 0=unlocked, 1=locked).
-const LOCK_OFFSET: usize = 0x1060;
-
-/// Hardware-verified offset for key beep on/off (1 byte, 0=off, 1=on).
-const KEY_BEEP_OFFSET: usize = 0x1071;
-
-/// Hardware-verified offset for Bluetooth on/off (1 byte, 0=off, 1=on).
-const BLUETOOTH_OFFSET: usize = 0x1078;
-
 // ---------------------------------------------------------------------------
-// Settings offsets from firmware analysis
+// Registry-mapped menu offsets (`radio.*` unless noted)
 // ---------------------------------------------------------------------------
 
-// --- RX Settings ---
-/// Band A squelch level (1 byte, range 0-6).
-const SQUELCH_A_OFFSET: usize = 0x100D;
-/// Band B squelch level (1 byte, range 0-6).
-const SQUELCH_B_OFFSET: usize = 0x100E;
-/// FM narrow setting (1 byte).
-const FM_NARROW_OFFSET: usize = 0x100F;
-/// SSB high cut filter (1 byte).
-const SSB_HIGH_CUT_OFFSET: usize = 0x1011;
-/// CW high cut filter (1 byte).
-const CW_HIGH_CUT_OFFSET: usize = 0x1012;
-/// AM high cut filter (1 byte).
-const AM_HIGH_CUT_OFFSET: usize = 0x1013;
-/// Auto filter setting (1 byte).
-const AUTO_FILTER_OFFSET: usize = 0x100C;
+// --- TX/RX ---
+/// `radio.BeatShift` (1 byte, 0-7 = Type 1-8).
+const BEAT_SHIFT_OFFSET: usize = 0x1000;
+/// `radio.TxInhibit` (1 byte, 0=off, 1=on).
+const TX_INHIBIT_OFFSET: usize = 0x1001;
+/// `radio.TimeOutTimer` (1 byte, 0-10 indexing 0.5-5.0 then 10.0 minutes).
+const TIMEOUT_TIMER_OFFSET: usize = 0x1003;
+/// `radio.MicSensitivity` (1 byte, 0=High, 1=Medium, 2=Low).
+const MIC_SENSITIVITY_OFFSET: usize = 0x1006;
+/// `radio.SsbHighCut` (1 byte, 0-4 = 2.2/2.4/2.6/2.8/3.0 kHz).
+const SSB_HIGH_CUT_OFFSET: usize = 0x1008;
+/// `radio.CwWidth` (1 byte, 0-4 = 0.3/0.5/1.0/1.5/2.0 kHz).
+const CW_WIDTH_OFFSET: usize = 0x1009;
+/// `radio.AmHighCut` (1 byte, 0-3 = 3.0/4.5/6.0/7.5 kHz).
+const AM_HIGH_CUT_OFFSET: usize = 0x100A;
 
 // --- Scan ---
-/// Scan resume setting (1 byte).
-const SCAN_RESUME_OFFSET: usize = 0x1007;
-/// Digital scan resume setting (1 byte).
-const DIGITAL_SCAN_RESUME_OFFSET: usize = 0x1008;
-/// Scan restart time (1 byte).
-const SCAN_RESTART_TIME_OFFSET: usize = 0x1009;
-/// Scan restart carrier setting (1 byte).
-const SCAN_RESTART_CARRIER_OFFSET: usize = 0x100A;
-
-// --- TX ---
-/// Timeout timer (1 byte).
-const TIMEOUT_TIMER_OFFSET: usize = 0x1018;
-/// TX inhibit setting (1 byte).
-const TX_INHIBIT_OFFSET: usize = 0x1019;
-/// Beat shift setting (1 byte).
-const BEAT_SHIFT_OFFSET: usize = 0x101A;
-
-// --- VOX (0x101B and 0x101C hardware-verified above) ---
-/// VOX delay (1 byte, in 100 ms units).
-const VOX_DELAY_OFFSET: usize = 0x101D;
-/// VOX TX on busy setting (1 byte, 0=off, 1=on).
-const VOX_TX_ON_BUSY_OFFSET: usize = 0x101E;
-
-// --- CW ---
-/// CW break-in setting (1 byte).
-const CW_BREAK_IN_OFFSET: usize = 0x101F;
-/// CW delay time (1 byte).
-const CW_DELAY_TIME_OFFSET: usize = 0x1020;
-/// CW pitch (1 byte).
-const CW_PITCH_OFFSET: usize = 0x1021;
-
-// --- DTMF ---
-/// DTMF speed (1 byte).
-const DTMF_SPEED_OFFSET: usize = 0x1024;
-/// DTMF pause time (1 byte).
-const DTMF_PAUSE_TIME_OFFSET: usize = 0x1026;
-/// DTMF TX hold setting (1 byte).
-const DTMF_TX_HOLD_OFFSET: usize = 0x1027;
+/// `radio.ScanResumeAnalog` (1 byte, 0=Time, 1=Carrier, 2=Seek).
+const SCAN_RESUME_OFFSET: usize = 0x100C;
+/// `radio.ScanResumeDigital` (1 byte, 0=Time, 1=Carrier, 2=Seek).
+const DIGITAL_SCAN_RESUME_OFFSET: usize = 0x100D;
+/// `radio.TimeRestart` (1 byte, 1-10 seconds).
+const SCAN_RESTART_TIME_OFFSET: usize = 0x100E;
+/// `radio.CarrierRestart` (1 byte, 1-10 seconds).
+const SCAN_RESTART_CARRIER_OFFSET: usize = 0x100F;
 
 // --- Repeater ---
-/// Repeater auto offset setting (1 byte).
-const REPEATER_AUTO_OFFSET_OFFSET: usize = 0x1030;
-/// Repeater call key setting (1 byte).
-const REPEATER_CALL_KEY_OFFSET: usize = 0x1031;
+/// `radio.AutoOffset` (1 byte, 0=off, 1=on).
+const REPEATER_AUTO_OFFSET_OFFSET: usize = 0x1018;
+/// `radio.CallKey` (1 byte, 0=CALL, 1=1750 Hz).
+const REPEATER_CALL_KEY_OFFSET: usize = 0x1019;
 
-// --- Auxiliary ---
-/// Microphone sensitivity (1 byte).
-const MIC_SENSITIVITY_OFFSET: usize = 0x1040;
-/// PF key 1 assignment (1 byte).
-const PF_KEY1_OFFSET: usize = 0x1041;
-/// PF key 2 assignment (1 byte).
-const PF_KEY2_OFFSET: usize = 0x1042;
+// --- VOX ---
+/// `radio.Vox` (1 byte, 0=off, 1=on).
+const VOX_ENABLED_OFFSET: usize = 0x101B;
+/// `radio.VoxGain` (1 byte, 0-9).
+const VOX_GAIN_OFFSET: usize = 0x101C;
+/// `radio.VoxDelay` (1 byte, 0-6 indexing 250/500/750/1000/1500/2000/3000 ms).
+const VOX_DELAY_OFFSET: usize = 0x101D;
+/// `radio.VoxTxOnBusy` (1 byte, 0=off, 1=on).
+const VOX_TX_ON_BUSY_OFFSET: usize = 0x101E;
 
-// --- Lock (0x1060 hardware-verified above) ---
-/// Key lock type (1 byte, enum index).
-const KEY_LOCK_TYPE_OFFSET: usize = 0x1061;
-/// Lock key A setting (1 byte).
-const LOCK_KEY_A_OFFSET: usize = 0x1062;
-/// Lock key B setting (1 byte).
-const LOCK_KEY_B_OFFSET: usize = 0x1063;
-/// Lock key C setting (1 byte).
-const LOCK_KEY_C_OFFSET: usize = 0x1064;
-/// Lock PTT key setting (1 byte).
-const LOCK_KEY_PTT_OFFSET: usize = 0x1065;
-/// APRS lock setting (1 byte).
-const APRS_LOCK_OFFSET: usize = 0x1097;
+// --- DTMF ---
+/// `radio.DtmfSpeed` (1 byte, 0-2 = 50/100/150 ms).
+const DTMF_SPEED_OFFSET: usize = 0x101F;
+/// `radio.DtmfPauseTime` (1 byte, 0-6 = 100/250/500/750/1000/1500/2000 ms).
+const DTMF_PAUSE_TIME_OFFSET: usize = 0x1020;
+/// `radio.DtmfTxHold` (1 byte, 0=off, 1=on).
+const DTMF_TX_HOLD_OFFSET: usize = 0x1021;
+
+// --- CW receive ---
+/// `radio.CwPitchFreq` (1 byte, 0-6).
+const CW_PITCH_OFFSET: usize = 0x1024;
+
+// --- Audio ---
+/// `radio.AutoMuteRetTime` (1 byte, 1-10).
+const AUTO_MUTE_RETURN_TIME_OFFSET: usize = 0x1041;
 
 // --- Display ---
-/// Dual display size (1 byte).
-const DUAL_DISPLAY_SIZE_OFFSET: usize = 0x1066;
-/// Display area (1 byte).
-const DISPLAY_AREA_OFFSET: usize = 0x1067;
-/// Info line setting (1 byte).
-const INFO_LINE_OFFSET: usize = 0x1068;
-/// Backlight control (1 byte).
-const BACKLIGHT_CONTROL_OFFSET: usize = 0x1069;
-/// Backlight timer (1 byte).
-const BACKLIGHT_TIMER_OFFSET: usize = 0x106A;
-/// Display hold time (1 byte).
-const DISPLAY_HOLD_TIME_OFFSET: usize = 0x106B;
-/// Display method (1 byte).
-const DISPLAY_METHOD_OFFSET: usize = 0x106C;
-/// Power-on display setting (1 byte).
-const POWER_ON_DISPLAY_OFFSET: usize = 0x106D;
+/// `radio.BacklightControl` (1 byte, 0=Manual, 1=On, 2=Auto, 3=Auto (DC-IN)).
+const BACKLIGHT_CONTROL_OFFSET: usize = 0x1060;
+/// `radio.BacklightTimer` (1 byte, 3-60 seconds).
+const BACKLIGHT_TIMER_OFFSET: usize = 0x1061;
 
-// --- Audio (0x1071 key beep hardware-verified above) ---
-/// EMR volume level (1 byte).
-const EMR_VOLUME_LEVEL_OFFSET: usize = 0x106E;
-/// Auto mute return time (1 byte).
-const AUTO_MUTE_RETURN_TIME_OFFSET: usize = 0x106F;
-/// Announce setting (1 byte).
-const ANNOUNCE_OFFSET: usize = 0x1070;
-/// Beep volume (1 byte, range 1-7).
+// --- Beep / voice guidance ---
+/// `radio.Beep` (1 byte, 0=off, 1=on).
+const KEY_BEEP_OFFSET: usize = 0x1071;
+/// `radio.BeepVolume` (1 byte, 0=VOL Link, 1-7=Level 1-7).
 const BEEP_VOLUME_OFFSET: usize = 0x1072;
-/// Voice language (1 byte).
-const VOICE_LANGUAGE_OFFSET: usize = 0x1073;
-/// Voice volume (1 byte).
+/// `radio.VoiceAnnounce` (1 byte, 0=Off, 1=Manual, 2=Auto1, 3=Auto2).
+const ANNOUNCE_OFFSET: usize = 0x1073;
+/// `radio.VoiceAnnounceVolume` (1 byte, 0=VOL Link, 1-7=Level 1-7).
 const VOICE_VOLUME_OFFSET: usize = 0x1074;
-/// Voice speed (1 byte).
-const VOICE_SPEED_OFFSET: usize = 0x1075;
-/// Volume lock (1 byte).
-const VOLUME_LOCK_OFFSET: usize = 0x1076;
+/// `radio.VoiceGuidanceSpeed` (1 byte, 0-3 = Speed 1-4).
+const VOICE_SPEED_OFFSET: usize = 0x1097;
 
-// --- Units ---
-/// Speed/distance unit (1 byte, enum index).
-const SPEED_DISTANCE_UNIT_OFFSET: usize = 0x1077;
-/// Altitude/rain unit (1 byte, enum index).
-const ALTITUDE_RAIN_UNIT_OFFSET: usize = 0x1083;
-/// Temperature unit (1 byte, enum index).
-const TEMPERATURE_UNIT_OFFSET: usize = 0x1084;
+// --- Battery / power ---
+/// `radio.BatterySaver` (1 byte, 0=Off, 1-9 select the saver interval 0.2-5.0 s).
+const BATTERY_SAVER_OFFSET: usize = 0x1076;
+/// `radio.AutoPowerOff` (1 byte, 0=Off, 1=15 min, 2=30 min, 3=60 min).
+const AUTO_POWER_OFF_OFFSET: usize = 0x1077;
 
-// --- Bluetooth (0x1078 hardware-verified above) ---
-/// Bluetooth auto-connect setting (1 byte).
+// --- Bluetooth ---
+/// `radio.BluetoothOnOff` (1 byte, 0=off, 1=on). Hardware verified.
+const BLUETOOTH_OFFSET: usize = 0x1078;
+/// `radio.BluetoothAutoConnect` (1 byte, 0=off, 1=on).
 const BT_AUTO_CONNECT_OFFSET: usize = 0x1079;
 
-// --- Interface ---
-/// GPS Bluetooth interface (1 byte).
-const GPS_BT_INTERFACE_OFFSET: usize = 0x1080;
-/// PC output mode (1 byte).
-const PC_OUTPUT_MODE_OFFSET: usize = 0x1085;
-/// APRS USB mode (1 byte).
-const APRS_USB_MODE_OFFSET: usize = 0x1086;
-/// USB audio output setting (1 byte).
-const USB_AUDIO_OUTPUT_OFFSET: usize = 0x1094;
-/// Internet link setting (1 byte).
-const INTERNET_LINK_OFFSET: usize = 0x1095;
+// --- PF keys ---
+/// `radio.Pf1PfKey` (1 byte, gapped domain 0-30; 5, 23, 25, 26 invalid).
+const PF_KEY1_OFFSET: usize = 0x107A;
+/// `radio.Pf2PfKey` (1 byte, gapped domain 0-30; 5, 23, 25, 26 invalid).
+const PF_KEY2_OFFSET: usize = 0x107B;
+
+// --- Locks ---
+/// Shared bit byte: `radio.KeyLockTypeKeyLock` (bit `0x01`) and
+/// `radio.KeyLockTypeFrequencyLock` (bit `0x02`).
+const KEY_LOCK_OFFSET: usize = 0x1084;
+/// Bit owned by `radio.KeyLockTypeKeyLock` within `0x1084`.
+const KEY_LOCK_KEY_MASK: u8 = 0x01;
+/// Bit owned by `radio.KeyLockTypeFrequencyLock` within `0x1084`.
+const KEY_LOCK_FREQUENCY_MASK: u8 = 0x02;
+/// `radio.VolumeLockOnOff` (1 byte, 0=off, 1=on).
+const VOLUME_LOCK_OFFSET: usize = 0x1087;
+/// Shared bit byte for the APRS key-lock checkbox set: `aprs.Frequency`
+/// (bit `0x01`), `aprs.Ptt` (bit `0x02`), `aprs.AprsKey` (bit `0x04`).
+const APRS_LOCK_OFFSET: usize = 0x120A;
+/// Bit owned by `aprs.Frequency` within `0x120A`.
+const APRS_LOCK_FREQUENCY_MASK: u8 = 0x01;
+/// Bit owned by `aprs.Ptt` within `0x120A`.
+const APRS_LOCK_PTT_MASK: u8 = 0x02;
+/// Bit owned by `aprs.AprsKey` within `0x120A`.
+const APRS_LOCK_KEY_MASK: u8 = 0x04;
+
+// --- Units ---
+/// `radio.SpeedDistance` (1 byte, 0=mi/h+mile, 1=km/h+km, 2=knots+nm).
+const SPEED_DISTANCE_UNIT_OFFSET: usize = 0x1088;
+/// `radio.AltitudeRain` (1 byte, 0=feet/inch, 1=m/mm).
+const ALTITUDE_RAIN_UNIT_OFFSET: usize = 0x1089;
+/// `radio.Temperature` (1 byte, 0=°F, 1=°C).
+const TEMPERATURE_UNIT_OFFSET: usize = 0x108A;
+
+// --- Interfaces ---
+/// `radio.PcOutputInterfaceGps` (1 byte, 0=USB, 1=Bluetooth).
+const GPS_BT_INTERFACE_OFFSET: usize = 0x108E;
+/// `radio.PcOutputInterfaceAprs` (1 byte, 0=USB, 1=Bluetooth).
+const APRS_USB_MODE_OFFSET: usize = 0x108F;
 
 // --- System ---
-/// Power-on message flag (1 byte).
-const POWER_ON_MESSAGE_FLAG_OFFSET: usize = 0x1087;
-/// Language setting (1 byte, 0=English, 1=Japanese).
-const LANGUAGE_OFFSET: usize = 0x1006;
+/// `radio.Language` (1 byte, 0=English, 1=Japanese).
+const LANGUAGE_OFFSET: usize = 0x1092;
 
-// --- Battery ---
-/// Battery saver (1 byte, 0=off, 1=on).
-const BATTERY_SAVER_OFFSET: usize = 0x10C0;
-/// Auto power off (1 byte, enum index).
-const AUTO_POWER_OFF_OFFSET: usize = 0x10D0;
+// --- DV (D-STAR) ---
+/// `dv.EmrVolumeLevelTxRx` (1 byte, 1-50).
+const EMR_VOLUME_LEVEL_OFFSET: usize = 0x1A03;
 
-// --- DualBand (also at 0x0396 in VFO region) ---
-/// Dual band MCP setting (1 byte).
-const DUAL_BAND_MCP_OFFSET: usize = 0x1096;
+// --- Strings ---
+/// `radio.PowerOnMessage` (16 bytes, NUL-padded).
+const POWER_ON_MESSAGE_OFFSET: usize = 0x10C0;
+/// Size of the power-on message field.
+const POWER_ON_MESSAGE_SIZE: usize = 16;
 
-// ---------------------------------------------------------------------------
-// VFO data block (confirmed via memory dump analysis)
-//
-// The VFO data block at 0x0020 contains 6 VFO entries, each 40 bytes
-// (same format as channel memory data). These represent the current
-// VFO state for each band. Confirmed by both the memory map document
-// and visual inspection of the memory dump (valid frequency data at
-// 0x0020).
-// ---------------------------------------------------------------------------
+/// True when `value` is a member of the gapped `radio.Pf1PfKey` /
+/// `radio.Pf2PfKey` domain (0-30 excluding 5, 23, 25, 26).
+const fn pf_key_valid(value: u8) -> bool {
+    value <= 30 && !matches!(value, 5 | 23 | 25 | 26)
+}
 
-/// Byte offset of the VFO data block (6 entries x 40 bytes).
-const VFO_DATA_OFFSET: usize = 0x0020;
-
-/// Number of VFO entries in the VFO data block.
-const VFO_ENTRY_COUNT: usize = 6;
-
-/// Size of each VFO entry in bytes (same as channel record).
-const VFO_ENTRY_SIZE: usize = programming::CHANNEL_RECORD_SIZE; // 40
+/// Validate a PF-key assignment against the registry's gapped domain.
+const fn validate_pf_key(name: &'static str, value: u8) -> Result<(), ValidationError> {
+    if pf_key_valid(value) {
+        Ok(())
+    } else {
+        Err(ValidationError::SettingOutOfRange {
+            name,
+            value,
+            detail: "must be 0-30, excluding 5, 23, 25, 26",
+        })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SettingsAccess (read-only)
@@ -284,9 +258,9 @@ const VFO_ENTRY_SIZE: usize = programming::CHANNEL_RECORD_SIZE; // 40
 /// Read-only access to the system settings region.
 ///
 /// Provides raw byte access and typed field accessors for the settings
-/// region at bytes `0x0000`-`0x1FFF`. Hardware-verified offsets are
-/// confirmed on a real TH-D75; remaining offsets are from firmware
-/// analysis and marked accordingly.
+/// region at bytes `0x0000`-`0x1FFF`. Menu-setting offsets come from
+/// the MCP-D75 field registry; the band-state trio below `0x1000` is
+/// hardware-verified (see the module docs for provenance).
 #[derive(Debug)]
 pub struct SettingsAccess<'a> {
     image: &'a [u8],
@@ -307,31 +281,14 @@ impl<'a> SettingsAccess<'a> {
         self.image.get(SETTINGS_OFFSET..end)
     }
 
-    /// Get the power-on message (up to 16 characters).
+    /// Get the power-on message (`radio.PowerOnMessage`, up to 16
+    /// characters).
     ///
-    /// Stored at MCP offset `0x11C0`. Returns the null-terminated ASCII
-    /// string.
+    /// MCP offset `0x10C0`. Returns the NUL-padded ASCII string with
+    /// padding removed.
     #[must_use]
     pub fn power_on_message(&self) -> String {
         extract_string(self.image, POWER_ON_MESSAGE_OFFSET, POWER_ON_MESSAGE_SIZE)
-    }
-
-    /// Get the internal model name (up to 16 characters).
-    ///
-    /// Stored at MCP offset `0x11D0`.
-    #[must_use]
-    pub fn model_name(&self) -> String {
-        extract_string(self.image, MODEL_NAME_OFFSET, MODEL_NAME_SIZE)
-    }
-
-    /// Get the raw callsign data at MCP offset `0x1300`.
-    ///
-    /// The exact structure of this region is not yet fully mapped.
-    /// Returns up to `len` bytes, or `None` if out of bounds.
-    #[must_use]
-    pub fn callsign_raw(&self, len: usize) -> Option<&[u8]> {
-        let end = CALLSIGN_OFFSET + len;
-        self.image.get(CALLSIGN_OFFSET..end)
     }
 
     /// Read an arbitrary byte range from the settings region.
@@ -345,20 +302,342 @@ impl<'a> SettingsAccess<'a> {
     }
 
     // -----------------------------------------------------------------------
-    // Typed settings accessors
+    // TX/RX
     // -----------------------------------------------------------------------
 
-    /// Read key beep setting (0=off, 1=on).
+    /// Read the beat-shift type (`radio.BeatShift`).
     ///
-    /// MCP offset `0x1071`.
+    /// MCP offset `0x1000`. Returns [`BeatShift::Type1`] if the byte is
+    /// out of range or unreadable.
+    #[must_use]
+    pub fn beat_shift(&self) -> BeatShift {
+        self.image
+            .get(BEAT_SHIFT_OFFSET)
+            .copied()
+            .and_then(|b| BeatShift::try_from(b).ok())
+            .unwrap_or(BeatShift::Type1)
+    }
+
+    /// Read TX inhibit (`radio.TxInhibit`; false if unreadable).
+    ///
+    /// MCP offset `0x1001`.
+    #[must_use]
+    pub fn tx_inhibit(&self) -> bool {
+        self.image.get(TX_INHIBIT_OFFSET).is_some_and(|&b| b != 0)
+    }
+
+    /// Read the TX timeout timer index (`radio.TimeOutTimer`, 0-10; 0
+    /// if unreadable).
+    ///
+    /// MCP offset `0x1003`. Indexes the table 0.5, 1.0, 1.5, 2.0, 2.5,
+    /// 3.0, 3.5, 4.0, 4.5, 5.0, 10.0 minutes — NOT a minute count.
+    #[must_use]
+    pub fn timeout_timer(&self) -> u8 {
+        self.image
+            .get(TIMEOUT_TIMER_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(10))
+    }
+
+    /// Read microphone sensitivity (`radio.MicSensitivity`, 0-2; 0 if
+    /// unreadable).
+    ///
+    /// MCP offset `0x1006`. The encoding is inverted versus intuition:
+    /// **0=High, 1=Medium, 2=Low**.
+    #[must_use]
+    pub fn mic_sensitivity(&self) -> u8 {
+        self.image
+            .get(MIC_SENSITIVITY_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(2))
+    }
+
+    /// Read the SSB high-cut filter (`radio.SsbHighCut`, 0-4 =
+    /// 2.2/2.4/2.6/2.8/3.0 kHz; 0 if unreadable).
+    ///
+    /// MCP offset `0x1008`.
+    #[must_use]
+    pub fn ssb_high_cut(&self) -> u8 {
+        self.image
+            .get(SSB_HIGH_CUT_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(4))
+    }
+
+    /// Read the CW filter width (`radio.CwWidth`, 0-4 =
+    /// 0.3/0.5/1.0/1.5/2.0 kHz; 0 if unreadable).
+    ///
+    /// MCP offset `0x1009`. The D75 menu calls this "CW Width" (it was
+    /// previously misnamed "CW high cut" here).
+    #[must_use]
+    pub fn cw_width(&self) -> u8 {
+        self.image
+            .get(CW_WIDTH_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(4))
+    }
+
+    /// Read the AM high-cut filter (`radio.AmHighCut`, 0-3 =
+    /// 3.0/4.5/6.0/7.5 kHz; 0 if unreadable).
+    ///
+    /// MCP offset `0x100A`.
+    #[must_use]
+    pub fn am_high_cut(&self) -> u8 {
+        self.image
+            .get(AM_HIGH_CUT_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(3))
+    }
+
+    // -----------------------------------------------------------------------
+    // Scan
+    // -----------------------------------------------------------------------
+
+    /// Read the analog scan-resume method (`radio.ScanResumeAnalog`,
+    /// 0=Time, 1=Carrier, 2=Seek; 0 if unreadable).
+    ///
+    /// MCP offset `0x100C`.
+    #[must_use]
+    pub fn scan_resume(&self) -> u8 {
+        self.image
+            .get(SCAN_RESUME_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(2))
+    }
+
+    /// Read the digital scan-resume method (`radio.ScanResumeDigital`,
+    /// 0=Time, 1=Carrier, 2=Seek; 0 if unreadable).
+    ///
+    /// MCP offset `0x100D`.
+    #[must_use]
+    pub fn digital_scan_resume(&self) -> u8 {
+        self.image
+            .get(DIGITAL_SCAN_RESUME_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(2))
+    }
+
+    /// Read the time-operated scan restart time (`radio.TimeRestart`,
+    /// 1-10 seconds; 0 if unreadable).
+    ///
+    /// MCP offset `0x100E`.
+    #[must_use]
+    pub fn scan_restart_time(&self) -> u8 {
+        self.image
+            .get(SCAN_RESTART_TIME_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(10))
+    }
+
+    /// Read the carrier-operated scan restart time
+    /// (`radio.CarrierRestart`, 1-10 seconds; 0 if unreadable).
+    ///
+    /// MCP offset `0x100F`.
+    #[must_use]
+    pub fn scan_restart_carrier(&self) -> u8 {
+        self.image
+            .get(SCAN_RESTART_CARRIER_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(10))
+    }
+
+    // -----------------------------------------------------------------------
+    // Repeater
+    // -----------------------------------------------------------------------
+
+    /// Read repeater auto offset (`radio.AutoOffset`; false if
+    /// unreadable).
+    ///
+    /// MCP offset `0x1018`.
+    #[must_use]
+    pub fn repeater_auto_offset(&self) -> bool {
+        self.image
+            .get(REPEATER_AUTO_OFFSET_OFFSET)
+            .is_some_and(|&b| b != 0)
+    }
+
+    /// Read the CALL key function (`radio.CallKey`, 0=CALL, 1=1750 Hz;
+    /// 0 if unreadable).
+    ///
+    /// MCP offset `0x1019`.
+    #[must_use]
+    pub fn repeater_call_key(&self) -> u8 {
+        self.image
+            .get(REPEATER_CALL_KEY_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(1))
+    }
+
+    // -----------------------------------------------------------------------
+    // VOX
+    // -----------------------------------------------------------------------
+
+    /// Read VOX enabled (`radio.Vox`; false if unreadable).
+    ///
+    /// MCP offset `0x101B`. Hardware verified.
+    #[must_use]
+    pub fn vox_enabled(&self) -> bool {
+        self.image.get(VOX_ENABLED_OFFSET).is_some_and(|&b| b != 0)
+    }
+
+    /// Read VOX gain (`radio.VoxGain`, 0-9; 0 if unreadable).
+    ///
+    /// MCP offset `0x101C`. Hardware verified.
+    #[must_use]
+    pub fn vox_gain(&self) -> u8 {
+        self.image
+            .get(VOX_GAIN_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(9))
+    }
+
+    /// Read the VOX delay index (`radio.VoxDelay`, 0-6; 0 if
+    /// unreadable).
+    ///
+    /// MCP offset `0x101D`. Indexes the table 250, 500, 750, 1000,
+    /// 1500, 2000, 3000 ms — NOT a 100 ms unit count.
+    #[must_use]
+    pub fn vox_delay(&self) -> u8 {
+        self.image
+            .get(VOX_DELAY_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(6))
+    }
+
+    /// Read VOX TX-on-busy (`radio.VoxTxOnBusy`; false if unreadable).
+    ///
+    /// MCP offset `0x101E`.
+    #[must_use]
+    pub fn vox_tx_on_busy(&self) -> bool {
+        self.image
+            .get(VOX_TX_ON_BUSY_OFFSET)
+            .is_some_and(|&b| b != 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // DTMF
+    // -----------------------------------------------------------------------
+
+    /// Read DTMF speed (`radio.DtmfSpeed`, 0-2 = 50/100/150 ms; 0 if
+    /// unreadable).
+    ///
+    /// MCP offset `0x101F`.
+    #[must_use]
+    pub fn dtmf_speed(&self) -> u8 {
+        self.image
+            .get(DTMF_SPEED_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(2))
+    }
+
+    /// Read DTMF pause time (`radio.DtmfPauseTime`, 0-6 =
+    /// 100/250/500/750/1000/1500/2000 ms; 0 if unreadable).
+    ///
+    /// MCP offset `0x1020`.
+    #[must_use]
+    pub fn dtmf_pause_time(&self) -> u8 {
+        self.image
+            .get(DTMF_PAUSE_TIME_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(6))
+    }
+
+    /// Read DTMF TX hold (`radio.DtmfTxHold`; false if unreadable).
+    ///
+    /// MCP offset `0x1021`.
+    #[must_use]
+    pub fn dtmf_tx_hold(&self) -> bool {
+        self.image.get(DTMF_TX_HOLD_OFFSET).is_some_and(|&b| b != 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // CW receive
+    // -----------------------------------------------------------------------
+
+    /// Read the CW pitch index (`radio.CwPitchFreq`, 0-6; 0 if
+    /// unreadable).
+    ///
+    /// MCP offset `0x1024`.
+    #[must_use]
+    pub fn cw_pitch(&self) -> u8 {
+        self.image
+            .get(CW_PITCH_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(6))
+    }
+
+    // -----------------------------------------------------------------------
+    // Audio
+    // -----------------------------------------------------------------------
+
+    /// Read the auto-mute return time (`radio.AutoMuteRetTime`, 1-10;
+    /// 0 if unreadable).
+    ///
+    /// MCP offset `0x1041`.
+    #[must_use]
+    pub fn auto_mute_return_time(&self) -> u8 {
+        self.image
+            .get(AUTO_MUTE_RETURN_TIME_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(10))
+    }
+
+    /// Read the EMR volume level (`dv.EmrVolumeLevelTxRx`, 1-50; 0 if
+    /// unreadable).
+    ///
+    /// MCP offset `0x1A03`.
+    #[must_use]
+    pub fn emr_volume_level(&self) -> u8 {
+        self.image
+            .get(EMR_VOLUME_LEVEL_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(50))
+    }
+
+    // -----------------------------------------------------------------------
+    // Display
+    // -----------------------------------------------------------------------
+
+    /// Read backlight control (`radio.BacklightControl`, 0=Manual,
+    /// 1=On, 2=Auto, 3=Auto (DC-IN); 0 if unreadable).
+    ///
+    /// MCP offset `0x1060`.
+    #[must_use]
+    pub fn backlight_control(&self) -> u8 {
+        self.image
+            .get(BACKLIGHT_CONTROL_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(3))
+    }
+
+    /// Read the backlight timer (`radio.BacklightTimer`, 3-60 seconds;
+    /// 0 if unreadable).
+    ///
+    /// MCP offset `0x1061`.
+    #[must_use]
+    pub fn backlight_timer(&self) -> u8 {
+        self.image
+            .get(BACKLIGHT_TIMER_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(60))
+    }
+
+    // -----------------------------------------------------------------------
+    // Beep / voice guidance
+    // -----------------------------------------------------------------------
+
+    /// Read key beep (`radio.Beep`; false if unreadable).
+    ///
+    /// MCP offset `0x1071`. Hardware verified.
     #[must_use]
     pub fn key_beep(&self) -> bool {
         self.image.get(KEY_BEEP_OFFSET).is_some_and(|&b| b != 0)
     }
 
-    /// Read beep volume (1-7, 0 if unreadable).
+    /// Read beep volume (`radio.BeepVolume`, 0-7; 0 if unreadable).
     ///
-    /// MCP offset `0x1072`.
+    /// MCP offset `0x1072`. **0 is a legal value meaning "VOL Link"**
+    /// (beep follows the main volume); 1-7 are fixed levels.
     #[must_use]
     pub fn beep_volume(&self) -> u8 {
         self.image
@@ -367,57 +646,206 @@ impl<'a> SettingsAccess<'a> {
             .map_or(0, |b| b.min(7))
     }
 
-    /// Read LCD backlight control setting (0 if unreadable).
+    /// Read the voice announce mode (`radio.VoiceAnnounce`, 0=Off,
+    /// 1=Manual, 2=Auto1, 3=Auto2; 0 if unreadable).
     ///
-    /// MCP offset `0x1069`.
+    /// MCP offset `0x1073`.
     #[must_use]
-    pub fn backlight(&self) -> u8 {
+    pub fn announce(&self) -> u8 {
         self.image
-            .get(BACKLIGHT_CONTROL_OFFSET)
+            .get(ANNOUNCE_OFFSET)
             .copied()
-            .unwrap_or(0)
+            .map_or(0, |b| b.min(3))
     }
 
-    /// Read auto power off setting.
+    /// Read the voice announce volume (`radio.VoiceAnnounceVolume`,
+    /// 0-7; 0 if unreadable).
     ///
-    /// MCP offset `0x10D0`.
+    /// MCP offset `0x1074`. **0 is a legal value meaning "VOL Link"**;
+    /// 1-7 are fixed levels.
     #[must_use]
-    pub fn auto_power_off(&self) -> AutoPowerOff {
-        match self.image.get(AUTO_POWER_OFF_OFFSET).copied().unwrap_or(0) {
-            1 => AutoPowerOff::Min30,
-            2 => AutoPowerOff::Min60,
-            3 => AutoPowerOff::Min90,
-            4 => AutoPowerOff::Min120,
-            _ => AutoPowerOff::Off,
-        }
+    pub fn voice_volume(&self) -> u8 {
+        self.image
+            .get(VOICE_VOLUME_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(7))
     }
 
-    /// Read battery saver setting.
+    /// Read the voice guidance speed (`radio.VoiceGuidanceSpeed`, 0-3 =
+    /// Speed 1-4; 0 if unreadable).
     ///
-    /// MCP offset `0x10C0`.
+    /// MCP offset `0x1097`.
     #[must_use]
-    pub fn battery_saver(&self) -> bool {
+    pub fn voice_speed(&self) -> u8 {
+        self.image
+            .get(VOICE_SPEED_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(3))
+    }
+
+    // -----------------------------------------------------------------------
+    // Battery / power
+    // -----------------------------------------------------------------------
+
+    /// Read the battery saver interval index (`radio.BatterySaver`,
+    /// 0=Off, 1-9 select 0.2-5.0 s; 0 if unreadable).
+    ///
+    /// MCP offset `0x1076`. This is a 10-value selector, not an on/off
+    /// switch.
+    #[must_use]
+    pub fn battery_saver(&self) -> u8 {
         self.image
             .get(BATTERY_SAVER_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(9))
+    }
+
+    /// Read auto power off (`radio.AutoPowerOff`).
+    ///
+    /// MCP offset `0x1077`. Returns [`AutoPowerOff::Off`] if the byte
+    /// is out of range or unreadable.
+    #[must_use]
+    pub fn auto_power_off(&self) -> AutoPowerOff {
+        self.image
+            .get(AUTO_POWER_OFF_OFFSET)
+            .copied()
+            .and_then(|b| AutoPowerOff::try_from(b).ok())
+            .unwrap_or(AutoPowerOff::Off)
+    }
+
+    // -----------------------------------------------------------------------
+    // Bluetooth
+    // -----------------------------------------------------------------------
+
+    /// Read Bluetooth on/off (`radio.BluetoothOnOff`; false if
+    /// unreadable).
+    ///
+    /// MCP offset `0x1078`. Hardware verified.
+    #[must_use]
+    pub fn bluetooth(&self) -> bool {
+        self.image.get(BLUETOOTH_OFFSET).is_some_and(|&b| b != 0)
+    }
+
+    /// Read Bluetooth auto-connect (`radio.BluetoothAutoConnect`;
+    /// false if unreadable).
+    ///
+    /// MCP offset `0x1079`.
+    #[must_use]
+    pub fn bt_auto_connect(&self) -> bool {
+        self.image
+            .get(BT_AUTO_CONNECT_OFFSET)
             .is_some_and(|&b| b != 0)
     }
 
-    /// Read key lock type.
+    // -----------------------------------------------------------------------
+    // PF keys
+    // -----------------------------------------------------------------------
+
+    /// Read the PF1 key assignment (`radio.Pf1PfKey`, gapped domain
+    /// 0-30; 0 if unreadable).
     ///
-    /// MCP offset `0x1061`.
+    /// MCP offset `0x107A`. Raw values 5, 23, 25 and 26 are not part
+    /// of the official domain.
     #[must_use]
-    pub fn key_lock_type(&self) -> KeyLockType {
-        match self.image.get(KEY_LOCK_TYPE_OFFSET).copied().unwrap_or(0) {
-            1 => KeyLockType::KeyAndPtt,
-            2 => KeyLockType::KeyPttAndDial,
-            _ => KeyLockType::KeyOnly,
-        }
+    pub fn pf_key1(&self) -> u8 {
+        self.image
+            .get(PF_KEY1_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(30))
     }
 
-    /// Read display unit settings.
+    /// Read the PF2 key assignment (`radio.Pf2PfKey`, gapped domain
+    /// 0-30; 0 if unreadable).
     ///
-    /// MCP offsets `0x1077` (speed/distance), `0x1083` (altitude/rain),
-    /// `0x1084` (temperature).
+    /// MCP offset `0x107B`. Raw values 5, 23, 25 and 26 are not part
+    /// of the official domain.
+    #[must_use]
+    pub fn pf_key2(&self) -> u8 {
+        self.image
+            .get(PF_KEY2_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(30))
+    }
+
+    // -----------------------------------------------------------------------
+    // Locks
+    // -----------------------------------------------------------------------
+
+    /// Read the key-lock configuration bit
+    /// (`radio.KeyLockTypeKeyLock`; false if unreadable).
+    ///
+    /// MCP offset `0x1084`, bit `0x01`. This is the "Key Lock"
+    /// checkbox of the lock-type menu, not the runtime lock state (the
+    /// latter is CAT `LC`/`DL`).
+    #[must_use]
+    pub fn key_lock(&self) -> bool {
+        self.image
+            .get(KEY_LOCK_OFFSET)
+            .is_some_and(|&b| b & KEY_LOCK_KEY_MASK != 0)
+    }
+
+    /// Read the frequency-lock configuration bit
+    /// (`radio.KeyLockTypeFrequencyLock`; false if unreadable).
+    ///
+    /// MCP offset `0x1084`, bit `0x02`.
+    #[must_use]
+    pub fn frequency_lock(&self) -> bool {
+        self.image
+            .get(KEY_LOCK_OFFSET)
+            .is_some_and(|&b| b & KEY_LOCK_FREQUENCY_MASK != 0)
+    }
+
+    /// Read volume lock (`radio.VolumeLockOnOff`; false if
+    /// unreadable).
+    ///
+    /// MCP offset `0x1087`.
+    #[must_use]
+    pub fn volume_lock(&self) -> bool {
+        self.image.get(VOLUME_LOCK_OFFSET).is_some_and(|&b| b != 0)
+    }
+
+    /// Read the APRS-lock frequency bit (`aprs.Frequency`; false if
+    /// unreadable).
+    ///
+    /// MCP offset `0x120A`, bit `0x01`. Part of the APRS key-lock
+    /// checkbox set.
+    #[must_use]
+    pub fn aprs_lock_frequency(&self) -> bool {
+        self.image
+            .get(APRS_LOCK_OFFSET)
+            .is_some_and(|&b| b & APRS_LOCK_FREQUENCY_MASK != 0)
+    }
+
+    /// Read the APRS-lock PTT bit (`aprs.Ptt`; false if unreadable).
+    ///
+    /// MCP offset `0x120A`, bit `0x02`.
+    #[must_use]
+    pub fn aprs_lock_ptt(&self) -> bool {
+        self.image
+            .get(APRS_LOCK_OFFSET)
+            .is_some_and(|&b| b & APRS_LOCK_PTT_MASK != 0)
+    }
+
+    /// Read the APRS-lock APRS-key bit (`aprs.AprsKey`; false if
+    /// unreadable).
+    ///
+    /// MCP offset `0x120A`, bit `0x04`.
+    #[must_use]
+    pub fn aprs_lock_key(&self) -> bool {
+        self.image
+            .get(APRS_LOCK_OFFSET)
+            .is_some_and(|&b| b & APRS_LOCK_KEY_MASK != 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Units / language
+    // -----------------------------------------------------------------------
+
+    /// Read display unit settings (`radio.SpeedDistance`,
+    /// `radio.AltitudeRain`, `radio.Temperature`).
+    ///
+    /// MCP offsets `0x1088` (speed/distance), `0x1089` (altitude/rain),
+    /// `0x108A` (temperature).
     #[must_use]
     pub fn display_units(&self) -> DisplayUnits {
         let speed_distance = match self
@@ -458,9 +886,10 @@ impl<'a> SettingsAccess<'a> {
         }
     }
 
-    /// Read language setting.
+    /// Read language (`radio.Language`).
     ///
-    /// MCP offset `0x1006`.
+    /// MCP offset `0x1092`. Returns [`Language::English`] if the byte
+    /// is out of range or unreadable.
     #[must_use]
     pub fn language(&self) -> Language {
         match self.image.get(LANGUAGE_OFFSET).copied().unwrap_or(0) {
@@ -469,529 +898,42 @@ impl<'a> SettingsAccess<'a> {
         }
     }
 
-    /// Read VOX enabled setting (0=off, 1=on).
-    ///
-    /// MCP offset `0x101B`.
-    #[must_use]
-    pub fn vox_enabled(&self) -> bool {
-        self.image.get(VOX_ENABLED_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read VOX gain (0-9, 0 if unreadable).
-    ///
-    /// MCP offset `0x101C`.
-    #[must_use]
-    pub fn vox_gain(&self) -> u8 {
-        self.image
-            .get(VOX_GAIN_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(9))
-    }
-
-    /// Read VOX delay (in 100 ms units, 0 if unreadable).
-    ///
-    /// MCP offset `0x101D`.
-    #[must_use]
-    pub fn vox_delay(&self) -> u8 {
-        self.image.get(VOX_DELAY_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read squelch level for Band A (0-6, 0 if unreadable).
-    ///
-    /// MCP offset `0x100D`.
-    #[must_use]
-    pub fn squelch_a(&self) -> u8 {
-        self.image
-            .get(SQUELCH_A_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(6))
-    }
-
-    /// Read squelch level for Band B (0-6, 0 if unreadable).
-    ///
-    /// MCP offset `0x100E`.
-    #[must_use]
-    pub fn squelch_b(&self) -> u8 {
-        self.image
-            .get(SQUELCH_B_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(6))
-    }
-
     // -----------------------------------------------------------------------
-    // Accessors for settings from firmware analysis
+    // Interfaces
     // -----------------------------------------------------------------------
 
-    /// Read FM narrow setting (0 if unreadable).
+    /// Read the GPS PC-output interface (`radio.PcOutputInterfaceGps`,
+    /// 0=USB, 1=Bluetooth; 0 if unreadable).
     ///
-    /// MCP offset `0x100F`.
-    #[must_use]
-    pub fn fm_narrow(&self) -> u8 {
-        self.image.get(FM_NARROW_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read SSB high-cut filter setting (0 if unreadable).
-    ///
-    /// MCP offset `0x1011`.
-    #[must_use]
-    pub fn ssb_high_cut(&self) -> u8 {
-        self.image.get(SSB_HIGH_CUT_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read CW high-cut filter setting (0 if unreadable).
-    ///
-    /// MCP offset `0x1012`.
-    #[must_use]
-    pub fn cw_high_cut(&self) -> u8 {
-        self.image.get(CW_HIGH_CUT_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read AM high-cut filter setting (0 if unreadable).
-    ///
-    /// MCP offset `0x1013`.
-    #[must_use]
-    pub fn am_high_cut(&self) -> u8 {
-        self.image.get(AM_HIGH_CUT_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read auto filter setting (0 if unreadable).
-    ///
-    /// MCP offset `0x100C`.
-    #[must_use]
-    pub fn auto_filter(&self) -> u8 {
-        self.image.get(AUTO_FILTER_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read scan resume setting (0 if unreadable).
-    ///
-    /// MCP offset `0x1007`.
-    #[must_use]
-    pub fn scan_resume(&self) -> u8 {
-        self.image.get(SCAN_RESUME_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read digital scan resume setting (0 if unreadable).
-    ///
-    /// MCP offset `0x1008`.
-    #[must_use]
-    pub fn digital_scan_resume(&self) -> u8 {
-        self.image
-            .get(DIGITAL_SCAN_RESUME_OFFSET)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Read scan restart time (0 if unreadable).
-    ///
-    /// MCP offset `0x1009`.
-    #[must_use]
-    pub fn scan_restart_time(&self) -> u8 {
-        self.image
-            .get(SCAN_RESTART_TIME_OFFSET)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Read scan restart carrier setting (0 if unreadable).
-    ///
-    /// MCP offset `0x100A`.
-    #[must_use]
-    pub fn scan_restart_carrier(&self) -> u8 {
-        self.image
-            .get(SCAN_RESTART_CARRIER_OFFSET)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Read timeout timer setting (0 if unreadable).
-    ///
-    /// MCP offset `0x1018`.
-    #[must_use]
-    pub fn timeout_timer(&self) -> u8 {
-        self.image.get(TIMEOUT_TIMER_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read TX inhibit setting (false if unreadable).
-    ///
-    /// MCP offset `0x1019`.
-    #[must_use]
-    pub fn tx_inhibit(&self) -> bool {
-        self.image.get(TX_INHIBIT_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read beat shift setting (false if unreadable).
-    ///
-    /// MCP offset `0x101A`.
-    #[must_use]
-    pub fn beat_shift(&self) -> bool {
-        self.image.get(BEAT_SHIFT_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read VOX TX-on-busy setting (false if unreadable).
-    ///
-    /// MCP offset `0x101E`.
-    #[must_use]
-    pub fn vox_tx_on_busy(&self) -> bool {
-        self.image
-            .get(VOX_TX_ON_BUSY_OFFSET)
-            .is_some_and(|&b| b != 0)
-    }
-
-    /// Read CW break-in setting (false if unreadable).
-    ///
-    /// MCP offset `0x101F`.
-    #[must_use]
-    pub fn cw_break_in(&self) -> bool {
-        self.image.get(CW_BREAK_IN_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read CW delay time (0 if unreadable).
-    ///
-    /// MCP offset `0x1020`.
-    #[must_use]
-    pub fn cw_delay_time(&self) -> u8 {
-        self.image.get(CW_DELAY_TIME_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read CW pitch (0 if unreadable).
-    ///
-    /// MCP offset `0x1021`.
-    #[must_use]
-    pub fn cw_pitch(&self) -> u8 {
-        self.image.get(CW_PITCH_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read DTMF speed (0 if unreadable).
-    ///
-    /// MCP offset `0x1024`.
-    #[must_use]
-    pub fn dtmf_speed(&self) -> u8 {
-        self.image.get(DTMF_SPEED_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read DTMF pause time (0 if unreadable).
-    ///
-    /// MCP offset `0x1026`.
-    #[must_use]
-    pub fn dtmf_pause_time(&self) -> u8 {
-        self.image.get(DTMF_PAUSE_TIME_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read DTMF TX hold setting (false if unreadable).
-    ///
-    /// MCP offset `0x1027`.
-    #[must_use]
-    pub fn dtmf_tx_hold(&self) -> bool {
-        self.image.get(DTMF_TX_HOLD_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read repeater auto offset setting (false if unreadable).
-    ///
-    /// MCP offset `0x1030`.
-    #[must_use]
-    pub fn repeater_auto_offset(&self) -> bool {
-        self.image
-            .get(REPEATER_AUTO_OFFSET_OFFSET)
-            .is_some_and(|&b| b != 0)
-    }
-
-    /// Read repeater call key setting (0 if unreadable).
-    ///
-    /// MCP offset `0x1031`.
-    #[must_use]
-    pub fn repeater_call_key(&self) -> u8 {
-        self.image
-            .get(REPEATER_CALL_KEY_OFFSET)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Read microphone sensitivity (0 if unreadable).
-    ///
-    /// MCP offset `0x1040`.
-    #[must_use]
-    pub fn mic_sensitivity(&self) -> u8 {
-        self.image.get(MIC_SENSITIVITY_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read PF key 1 assignment (0 if unreadable).
-    ///
-    /// MCP offset `0x1041`.
-    #[must_use]
-    pub fn pf_key1(&self) -> u8 {
-        self.image.get(PF_KEY1_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read PF key 2 assignment (0 if unreadable).
-    ///
-    /// MCP offset `0x1042`.
-    #[must_use]
-    pub fn pf_key2(&self) -> u8 {
-        self.image.get(PF_KEY2_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read lock key A setting (false if unreadable).
-    ///
-    /// MCP offset `0x1062`.
-    #[must_use]
-    pub fn lock_key_a(&self) -> bool {
-        self.image.get(LOCK_KEY_A_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read lock key B setting (false if unreadable).
-    ///
-    /// MCP offset `0x1063`.
-    #[must_use]
-    pub fn lock_key_b(&self) -> bool {
-        self.image.get(LOCK_KEY_B_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read lock key C setting (false if unreadable).
-    ///
-    /// MCP offset `0x1064`.
-    #[must_use]
-    pub fn lock_key_c(&self) -> bool {
-        self.image.get(LOCK_KEY_C_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read lock PTT key setting (false if unreadable).
-    ///
-    /// MCP offset `0x1065`.
-    #[must_use]
-    pub fn lock_key_ptt(&self) -> bool {
-        self.image.get(LOCK_KEY_PTT_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read APRS lock setting (false if unreadable).
-    ///
-    /// MCP offset `0x1097`.
-    #[must_use]
-    pub fn aprs_lock(&self) -> bool {
-        self.image.get(APRS_LOCK_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read dual display size (0 if unreadable).
-    ///
-    /// MCP offset `0x1066`.
-    #[must_use]
-    pub fn dual_display_size(&self) -> u8 {
-        self.image
-            .get(DUAL_DISPLAY_SIZE_OFFSET)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Read display area setting (0 if unreadable).
-    ///
-    /// MCP offset `0x1067`.
-    #[must_use]
-    pub fn display_area(&self) -> u8 {
-        self.image.get(DISPLAY_AREA_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read info line setting (0 if unreadable).
-    ///
-    /// MCP offset `0x1068`.
-    #[must_use]
-    pub fn info_line(&self) -> u8 {
-        self.image.get(INFO_LINE_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read backlight control setting (0 if unreadable).
-    ///
-    /// MCP offset `0x1069`.
-    #[must_use]
-    pub fn backlight_control(&self) -> u8 {
-        self.image
-            .get(BACKLIGHT_CONTROL_OFFSET)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Read backlight timer (0 if unreadable).
-    ///
-    /// MCP offset `0x106A`.
-    #[must_use]
-    pub fn backlight_timer(&self) -> u8 {
-        self.image.get(BACKLIGHT_TIMER_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read display hold time (0 if unreadable).
-    ///
-    /// MCP offset `0x106B`.
-    #[must_use]
-    pub fn display_hold_time(&self) -> u8 {
-        self.image
-            .get(DISPLAY_HOLD_TIME_OFFSET)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Read display method (0 if unreadable).
-    ///
-    /// MCP offset `0x106C`.
-    #[must_use]
-    pub fn display_method(&self) -> u8 {
-        self.image.get(DISPLAY_METHOD_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read power-on display setting (0 if unreadable).
-    ///
-    /// MCP offset `0x106D`.
-    #[must_use]
-    pub fn power_on_display(&self) -> u8 {
-        self.image
-            .get(POWER_ON_DISPLAY_OFFSET)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Read EMR volume level (0 if unreadable).
-    ///
-    /// MCP offset `0x106E`.
-    #[must_use]
-    pub fn emr_volume_level(&self) -> u8 {
-        self.image
-            .get(EMR_VOLUME_LEVEL_OFFSET)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Read auto mute return time (0 if unreadable).
-    ///
-    /// MCP offset `0x106F`.
-    #[must_use]
-    pub fn auto_mute_return_time(&self) -> u8 {
-        self.image
-            .get(AUTO_MUTE_RETURN_TIME_OFFSET)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Read announce setting (false if unreadable).
-    ///
-    /// MCP offset `0x1070`.
-    #[must_use]
-    pub fn announce(&self) -> bool {
-        self.image.get(ANNOUNCE_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read voice language setting (0 if unreadable).
-    ///
-    /// MCP offset `0x1073`.
-    #[must_use]
-    pub fn voice_language(&self) -> u8 {
-        self.image.get(VOICE_LANGUAGE_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read voice volume (0 if unreadable).
-    ///
-    /// MCP offset `0x1074`.
-    #[must_use]
-    pub fn voice_volume(&self) -> u8 {
-        self.image.get(VOICE_VOLUME_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read voice speed (0 if unreadable).
-    ///
-    /// MCP offset `0x1075`.
-    #[must_use]
-    pub fn voice_speed(&self) -> u8 {
-        self.image.get(VOICE_SPEED_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read volume lock setting (false if unreadable).
-    ///
-    /// MCP offset `0x1076`.
-    #[must_use]
-    pub fn volume_lock(&self) -> bool {
-        self.image.get(VOLUME_LOCK_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read Bluetooth auto-connect setting (false if unreadable).
-    ///
-    /// MCP offset `0x1079`.
-    #[must_use]
-    pub fn bt_auto_connect(&self) -> bool {
-        self.image
-            .get(BT_AUTO_CONNECT_OFFSET)
-            .is_some_and(|&b| b != 0)
-    }
-
-    /// Read GPS Bluetooth interface setting (0 if unreadable).
-    ///
-    /// MCP offset `0x1080`.
+    /// MCP offset `0x108E`.
     #[must_use]
     pub fn gps_bt_interface(&self) -> u8 {
         self.image
             .get(GPS_BT_INTERFACE_OFFSET)
             .copied()
-            .unwrap_or(0)
+            .map_or(0, |b| b.min(1))
     }
 
-    /// Read PC output mode (0 if unreadable).
+    /// Read the APRS PC-output interface
+    /// (`radio.PcOutputInterfaceAprs`, 0=USB, 1=Bluetooth; 0 if
+    /// unreadable).
     ///
-    /// MCP offset `0x1085`.
-    #[must_use]
-    pub fn pc_output_mode(&self) -> u8 {
-        self.image.get(PC_OUTPUT_MODE_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read APRS USB mode (0 if unreadable).
-    ///
-    /// MCP offset `0x1086`.
+    /// MCP offset `0x108F`.
     #[must_use]
     pub fn aprs_usb_mode(&self) -> u8 {
-        self.image.get(APRS_USB_MODE_OFFSET).copied().unwrap_or(0)
-    }
-
-    /// Read USB audio output setting (false if unreadable).
-    ///
-    /// MCP offset `0x1094`.
-    #[must_use]
-    pub fn usb_audio_output(&self) -> bool {
         self.image
-            .get(USB_AUDIO_OUTPUT_OFFSET)
-            .is_some_and(|&b| b != 0)
-    }
-
-    /// Read internet link setting (false if unreadable).
-    ///
-    /// MCP offset `0x1095`.
-    #[must_use]
-    pub fn internet_link(&self) -> bool {
-        self.image
-            .get(INTERNET_LINK_OFFSET)
-            .is_some_and(|&b| b != 0)
-    }
-
-    /// Read power-on message flag (false if unreadable).
-    ///
-    /// MCP offset `0x1087`.
-    #[must_use]
-    pub fn power_on_message_flag(&self) -> bool {
-        self.image
-            .get(POWER_ON_MESSAGE_FLAG_OFFSET)
-            .is_some_and(|&b| b != 0)
-    }
-
-    /// Read dual band MCP setting (false if unreadable).
-    ///
-    /// MCP offset `0x1096`.
-    #[must_use]
-    pub fn dual_band_mcp(&self) -> bool {
-        self.image
-            .get(DUAL_BAND_MCP_OFFSET)
-            .is_some_and(|&b| b != 0)
+            .get(APRS_USB_MODE_OFFSET)
+            .copied()
+            .map_or(0, |b| b.min(1))
     }
 
     // -----------------------------------------------------------------------
-    // Hardware-verified settings accessors
+    // Band state (hardware-verified, outside registry scope)
     // -----------------------------------------------------------------------
 
     /// Read Band A power level.
     ///
-    /// MCP offset `0x0359`.
+    /// MCP offset `0x0359`. Hardware verified.
     /// Returns `High` if the byte is out of range or unreadable.
     #[must_use]
     pub fn power_level_a(&self) -> PowerLevel {
@@ -1004,7 +946,7 @@ impl<'a> SettingsAccess<'a> {
 
     /// Read Band A attenuator setting (0=off, 1=on).
     ///
-    /// MCP offset `0x035C`.
+    /// MCP offset `0x035C`. Hardware verified.
     #[must_use]
     pub fn attenuator_a(&self) -> bool {
         self.image.get(ATTENUATOR_A_OFFSET).is_some_and(|&b| b != 0)
@@ -1012,190 +954,58 @@ impl<'a> SettingsAccess<'a> {
 
     /// Read dual-band display setting (0=single, 1=dual).
     ///
-    /// MCP offset `0x0396`.
+    /// MCP offset `0x0396`. Hardware verified.
     #[must_use]
     pub fn dual_band(&self) -> bool {
         self.image.get(DUAL_BAND_OFFSET).is_some_and(|&b| b != 0)
     }
 
-    /// Read lock setting (0=unlocked, 1=locked).
-    ///
-    /// MCP offset `0x1060`.
-    #[must_use]
-    pub fn lock(&self) -> bool {
-        self.image.get(LOCK_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    /// Read Bluetooth on/off setting (0=off, 1=on).
-    ///
-    /// MCP offset `0x1078`.
-    #[must_use]
-    pub fn bluetooth(&self) -> bool {
-        self.image.get(BLUETOOTH_OFFSET).is_some_and(|&b| b != 0)
-    }
-
     // -----------------------------------------------------------------------
-    // VFO data accessors (confirmed via memory dump analysis)
+    // Raw numeric accessors for enum-typed settings (for UI +/- cycling)
     // -----------------------------------------------------------------------
 
-    /// Read the raw 40-byte VFO entry for a given index (0-5).
+    /// Read auto power off as raw byte (0=Off, 1=15m, 2=30m, 3=60m).
     ///
-    /// The VFO data block at `0x0020` contains 6 entries in the same
-    /// 40-byte format as channel memory records. Returns `None` if the
-    /// index is out of range or the region extends past the image.
-    ///
-    /// # VFO index mapping (estimated)
-    ///
-    /// The exact band-to-index mapping needs confirmation via differential
-    /// dump, but typical Kenwood convention is:
-    ///
-    /// | Index | Band |
-    /// |-------|------|
-    /// | 0 | Band A VHF |
-    /// | 1 | Band A 220 MHz |
-    /// | 2 | Band A UHF |
-    /// | 3 | Band B VHF |
-    /// | 4 | Band B 220 MHz |
-    /// | 5 | Band B UHF |
-    #[must_use]
-    pub fn vfo_raw(&self, index: usize) -> Option<&[u8]> {
-        if index >= VFO_ENTRY_COUNT {
-            return None;
-        }
-        let offset = VFO_DATA_OFFSET + index * VFO_ENTRY_SIZE;
-        let end = offset + VFO_ENTRY_SIZE;
-        self.image.get(offset..end)
-    }
-
-    /// Read the RX frequency from a VFO entry (0-5).
-    ///
-    /// Returns the frequency in Hz as a [`Frequency`], or `None` if the
-    /// index is out of range or the VFO entry is empty (all `0xFF`).
-    ///
-    /// Located at `0x0020 + index * 40`. Confirmed via memory dump.
-    #[must_use]
-    pub fn vfo_frequency(&self, index: usize) -> Option<Frequency> {
-        let raw = self.vfo_raw(index)?;
-        // Check for empty entry (all 0xFF).
-        if raw.iter().all(|&b| b == 0xFF) {
-            return None;
-        }
-        // vfo_raw returns exactly VFO_ENTRY_SIZE bytes — destructure the freq prefix.
-        let &[b0, b1, b2, b3, ..] = raw else {
-            return None;
-        };
-        // Check for zeroed entry.
-        if b0 == 0 && b1 == 0 && b2 == 0 && b3 == 0 {
-            return None;
-        }
-        Some(Frequency::from_le_bytes([b0, b1, b2, b3]))
-    }
-
-    /// Read the operating mode from a VFO entry (0-5).
-    ///
-    /// Returns the flash-encoded mode, or `None` if the index is out of
-    /// range or the VFO entry is empty. The mode is in byte 0x09 bits
-    /// \[6:4\] of the 40-byte VFO record.
-    ///
-    /// Located at `0x0020 + index * 40 + 0x09`. Confirmed via memory dump.
-    #[must_use]
-    pub fn vfo_mode(&self, index: usize) -> Option<MemoryMode> {
-        let raw = self.vfo_raw(index)?;
-        if raw.iter().all(|&b| b == 0xFF) {
-            return None;
-        }
-        let mode_bits = (raw.get(0x09).copied()? >> 4) & 0x07;
-        MemoryMode::try_from(mode_bits).ok()
-    }
-
-    /// Read the TX offset or split frequency from a VFO entry (0-5).
-    ///
-    /// Returns the offset/split frequency in Hz, or `None` if the index
-    /// is out of range or the VFO entry is empty.
-    ///
-    /// Located at `0x0020 + index * 40 + 0x04`. Confirmed via memory dump.
-    #[must_use]
-    pub fn vfo_tx_offset(&self, index: usize) -> Option<Frequency> {
-        let raw = self.vfo_raw(index)?;
-        if raw.iter().all(|&b| b == 0xFF) {
-            return None;
-        }
-        let &[_, _, _, _, b4, b5, b6, b7, ..] = raw else {
-            return None;
-        };
-        Some(Frequency::from_le_bytes([b4, b5, b6, b7]))
-    }
-
-    /// Get the number of non-empty VFO entries (out of 6).
-    #[must_use]
-    pub fn vfo_count(&self) -> usize {
-        (0..VFO_ENTRY_COUNT)
-            .filter(|&i| self.vfo_frequency(i).is_some())
-            .count()
-    }
-
-    // -----------------------------------------------------------------------
-    // Raw numeric accessors for enum-typed settings (for TUI +/- cycling)
-    // -----------------------------------------------------------------------
-
-    /// Read key lock type as raw byte (0=KeyOnly, 1=KeyAndPtt, 2=KeyPttAndDial).
-    ///
-    /// MCP offset `0x1061`.
-    #[must_use]
-    pub fn key_lock_type_raw(&self) -> u8 {
-        self.image
-            .get(KEY_LOCK_TYPE_OFFSET)
-            .copied()
-            .unwrap_or(0)
-            .min(2)
-    }
-
-    /// Read auto power off as raw byte (0=Off, 1=30m, 2=60m, 3=90m, 4=120m).
-    ///
-    /// MCP offset `0x10D0`.
+    /// MCP offset `0x1077`.
     #[must_use]
     pub fn auto_power_off_raw(&self) -> u8 {
         self.image
             .get(AUTO_POWER_OFF_OFFSET)
             .copied()
-            .unwrap_or(0)
-            .min(4)
+            .map_or(0, |b| b.min(3))
     }
 
     /// Read speed/distance unit as raw byte (0=mph, 1=km/h, 2=knots).
     ///
-    /// MCP offset `0x1077`.
+    /// MCP offset `0x1088`.
     #[must_use]
     pub fn speed_distance_unit_raw(&self) -> u8 {
         self.image
             .get(SPEED_DISTANCE_UNIT_OFFSET)
             .copied()
-            .unwrap_or(0)
-            .min(2)
+            .map_or(0, |b| b.min(2))
     }
 
     /// Read altitude/rain unit as raw byte (0=ft/in, 1=m/mm).
     ///
-    /// MCP offset `0x1083`.
+    /// MCP offset `0x1089`.
     #[must_use]
     pub fn altitude_rain_unit_raw(&self) -> u8 {
         self.image
             .get(ALTITUDE_RAIN_UNIT_OFFSET)
             .copied()
-            .unwrap_or(0)
-            .min(1)
+            .map_or(0, |b| b.min(1))
     }
 
     /// Read temperature unit as raw byte (0=°F, 1=°C).
     ///
-    /// MCP offset `0x1084`.
+    /// MCP offset `0x108A`.
     #[must_use]
     pub fn temperature_unit_raw(&self) -> u8 {
         self.image
             .get(TEMPERATURE_UNIT_OFFSET)
             .copied()
-            .unwrap_or(0)
-            .min(1)
+            .map_or(0, |b| b.min(1))
     }
 }
 
@@ -1205,9 +1015,12 @@ impl<'a> SettingsAccess<'a> {
 
 /// Mutable access to the system settings region of the memory image.
 ///
-/// Provides write methods for settings with verified offsets. Only
-/// settings with hardware-verified offsets have write accessors to
-/// prevent corrupting the memory image with unconfirmed offsets.
+/// Every write method targets a registry-verified offset (or one of
+/// the three hardware-verified band-state cells) and clamps or
+/// validates the value against the registry domain, so a write can
+/// never place an out-of-domain byte in an official menu field.
+/// Setters for shared bit bytes (`0x1084`, `0x120A`) perform masked
+/// read-modify-write and never touch bits owned by other fields.
 #[derive(Debug)]
 pub struct SettingsWriter<'a> {
     image: &'a mut [u8],
@@ -1219,732 +1032,542 @@ impl<'a> SettingsWriter<'a> {
         Self { image }
     }
 
-    /// Set LCD backlight control setting.
-    ///
-    /// MCP offset `0x1069`.
-    pub fn set_backlight(&mut self, level: u8) {
-        if let Some(b) = self.image.get_mut(BACKLIGHT_CONTROL_OFFSET) {
-            *b = level;
-        }
-    }
-
-    /// Set backlight control (same as `set_backlight`, named for clarity).
-    ///
-    /// MCP offset `0x1069`.
-    pub fn set_backlight_control(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(BACKLIGHT_CONTROL_OFFSET) {
+    /// Write `value` to the byte at `offset`, if in bounds.
+    fn put(&mut self, offset: usize, value: u8) {
+        if let Some(b) = self.image.get_mut(offset) {
             *b = value;
         }
     }
 
-    /// Set backlight timer.
-    ///
-    /// MCP offset `0x106A`.
-    pub fn set_backlight_timer(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(BACKLIGHT_TIMER_OFFSET) {
-            *b = value;
+    /// Set or clear `mask` within the shared bit byte at `offset`,
+    /// preserving all other bits (masked read-modify-write).
+    fn put_bit(&mut self, offset: usize, mask: u8, enabled: bool) {
+        if let Some(b) = self.image.get_mut(offset) {
+            if enabled {
+                *b |= mask;
+            } else {
+                *b &= !mask;
+            }
         }
     }
 
-    /// Set beep volume (1-7).
+    // -----------------------------------------------------------------------
+    // TX/RX
+    // -----------------------------------------------------------------------
+
+    /// Set the beat-shift type (`radio.BeatShift`).
     ///
-    /// Values above 7 are clamped to 7.
-    ///
-    /// MCP offset `0x1072`.
-    pub fn set_beep_volume(&mut self, volume: u8) {
-        if let Some(b) = self.image.get_mut(BEEP_VOLUME_OFFSET) {
-            *b = volume.min(7);
-        }
+    /// MCP offset `0x1000`.
+    pub fn set_beat_shift(&mut self, value: BeatShift) {
+        self.put(BEAT_SHIFT_OFFSET, u8::from(value));
     }
 
-    /// Set auto power off.
+    /// Set TX inhibit on/off (`radio.TxInhibit`).
     ///
-    /// MCP offset `0x10D0`.
-    pub fn set_auto_power_off(&mut self, value: AutoPowerOff) {
-        if let Some(b) = self.image.get_mut(AUTO_POWER_OFF_OFFSET) {
-            *b = match value {
-                AutoPowerOff::Off => 0,
-                AutoPowerOff::Min30 => 1,
-                AutoPowerOff::Min60 => 2,
-                AutoPowerOff::Min90 => 3,
-                AutoPowerOff::Min120 => 4,
-            };
-        }
+    /// MCP offset `0x1001`.
+    pub fn set_tx_inhibit(&mut self, enabled: bool) {
+        self.put(TX_INHIBIT_OFFSET, u8::from(enabled));
     }
 
-    /// Set battery saver on/off.
+    /// Set the TX timeout timer index (`radio.TimeOutTimer`, clamped
+    /// to 0-10).
     ///
-    /// MCP offset `0x10C0`.
-    pub fn set_battery_saver(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(BATTERY_SAVER_OFFSET) {
-            *b = u8::from(enabled);
-        }
+    /// MCP offset `0x1003`. The value indexes the 0.5-10.0 minute
+    /// table (see [`SettingsAccess::timeout_timer`]).
+    pub fn set_timeout_timer(&mut self, value: u8) {
+        self.put(TIMEOUT_TIMER_OFFSET, value.min(10));
     }
 
-    /// Set key lock type.
-    ///
-    /// MCP offset `0x1061`.
-    pub fn set_key_lock_type(&mut self, value: KeyLockType) {
-        if let Some(b) = self.image.get_mut(KEY_LOCK_TYPE_OFFSET) {
-            *b = match value {
-                KeyLockType::KeyOnly => 0,
-                KeyLockType::KeyAndPtt => 1,
-                KeyLockType::KeyPttAndDial => 2,
-            };
-        }
-    }
-
-    /// Set language.
+    /// Set microphone sensitivity (`radio.MicSensitivity`, clamped to
+    /// 0-2; **0=High, 1=Medium, 2=Low**).
     ///
     /// MCP offset `0x1006`.
-    pub fn set_language(&mut self, value: Language) {
-        if let Some(b) = self.image.get_mut(LANGUAGE_OFFSET) {
-            *b = match value {
-                Language::English => 0,
-                Language::Japanese => 1,
-            };
-        }
+    pub fn set_mic_sensitivity(&mut self, value: u8) {
+        self.put(MIC_SENSITIVITY_OFFSET, value.min(2));
     }
 
-    /// Set speed/distance display unit.
+    /// Set the SSB high-cut filter (`radio.SsbHighCut`, clamped to
+    /// 0-4).
     ///
-    /// MCP offset `0x1077`.
-    pub fn set_speed_distance_unit(&mut self, value: SpeedDistanceUnit) {
-        if let Some(b) = self.image.get_mut(SPEED_DISTANCE_UNIT_OFFSET) {
-            *b = match value {
-                SpeedDistanceUnit::MilesPerHour => 0,
-                SpeedDistanceUnit::KilometersPerHour => 1,
-                SpeedDistanceUnit::Knots => 2,
-            };
-        }
+    /// MCP offset `0x1008`.
+    pub fn set_ssb_high_cut(&mut self, value: u8) {
+        self.put(SSB_HIGH_CUT_OFFSET, value.min(4));
     }
 
-    /// Set altitude/rain display unit.
+    /// Set the CW filter width (`radio.CwWidth`, clamped to 0-4).
     ///
-    /// MCP offset `0x1083`.
-    pub fn set_altitude_rain_unit(&mut self, value: AltitudeRainUnit) {
-        if let Some(b) = self.image.get_mut(ALTITUDE_RAIN_UNIT_OFFSET) {
-            *b = match value {
-                AltitudeRainUnit::FeetInch => 0,
-                AltitudeRainUnit::MetersMm => 1,
-            };
-        }
+    /// MCP offset `0x1009`.
+    pub fn set_cw_width(&mut self, value: u8) {
+        self.put(CW_WIDTH_OFFSET, value.min(4));
     }
 
-    /// Set temperature display unit.
+    /// Set the AM high-cut filter (`radio.AmHighCut`, clamped to 0-3).
     ///
-    /// MCP offset `0x1084`.
-    pub fn set_temperature_unit(&mut self, value: TemperatureUnit) {
-        if let Some(b) = self.image.get_mut(TEMPERATURE_UNIT_OFFSET) {
-            *b = match value {
-                TemperatureUnit::Fahrenheit => 0,
-                TemperatureUnit::Celsius => 1,
-            };
-        }
+    /// MCP offset `0x100A`.
+    pub fn set_am_high_cut(&mut self, value: u8) {
+        self.put(AM_HIGH_CUT_OFFSET, value.min(3));
     }
 
-    /// Set VOX delay (in 100 ms units, clamped to 30).
+    // -----------------------------------------------------------------------
+    // Scan
+    // -----------------------------------------------------------------------
+
+    /// Set the analog scan-resume method (`radio.ScanResumeAnalog`,
+    /// clamped to 0-2).
     ///
-    /// MCP offset `0x101D`.
+    /// MCP offset `0x100C`.
+    pub fn set_scan_resume(&mut self, value: u8) {
+        self.put(SCAN_RESUME_OFFSET, value.min(2));
+    }
+
+    /// Set the digital scan-resume method (`radio.ScanResumeDigital`,
+    /// clamped to 0-2).
+    ///
+    /// MCP offset `0x100D`.
+    pub fn set_digital_scan_resume(&mut self, value: u8) {
+        self.put(DIGITAL_SCAN_RESUME_OFFSET, value.min(2));
+    }
+
+    /// Set the time-operated scan restart time (`radio.TimeRestart`,
+    /// clamped to 1-10 seconds).
+    ///
+    /// MCP offset `0x100E`. 0 is not a legal value for this field.
+    pub fn set_scan_restart_time(&mut self, value: u8) {
+        self.put(SCAN_RESTART_TIME_OFFSET, value.clamp(1, 10));
+    }
+
+    /// Set the carrier-operated scan restart time
+    /// (`radio.CarrierRestart`, clamped to 1-10 seconds).
+    ///
+    /// MCP offset `0x100F`. 0 is not a legal value for this field.
+    pub fn set_scan_restart_carrier(&mut self, value: u8) {
+        self.put(SCAN_RESTART_CARRIER_OFFSET, value.clamp(1, 10));
+    }
+
+    // -----------------------------------------------------------------------
+    // Repeater
+    // -----------------------------------------------------------------------
+
+    /// Set repeater auto offset on/off (`radio.AutoOffset`).
+    ///
+    /// MCP offset `0x1018`.
+    pub fn set_repeater_auto_offset(&mut self, enabled: bool) {
+        self.put(REPEATER_AUTO_OFFSET_OFFSET, u8::from(enabled));
+    }
+
+    /// Set the CALL key function (`radio.CallKey`, clamped to 0-1;
+    /// 0=CALL, 1=1750 Hz).
+    ///
+    /// MCP offset `0x1019`.
+    pub fn set_repeater_call_key(&mut self, value: u8) {
+        self.put(REPEATER_CALL_KEY_OFFSET, value.min(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // VOX
+    // -----------------------------------------------------------------------
+
+    /// Set VOX enabled on/off (`radio.Vox`).
+    ///
+    /// MCP offset `0x101B`. Hardware verified.
+    pub fn set_vox_enabled(&mut self, enabled: bool) {
+        self.put(VOX_ENABLED_OFFSET, u8::from(enabled));
+    }
+
+    /// Set VOX gain level (`radio.VoxGain`, clamped to 0-9).
+    ///
+    /// MCP offset `0x101C`. Hardware verified.
+    pub fn set_vox_gain(&mut self, gain: u8) {
+        self.put(VOX_GAIN_OFFSET, gain.min(9));
+    }
+
+    /// Set the VOX delay index (`radio.VoxDelay`, clamped to 0-6).
+    ///
+    /// MCP offset `0x101D`. The value indexes the 250-3000 ms table
+    /// (see [`SettingsAccess::vox_delay`]) — it is NOT a 100 ms unit
+    /// count.
     pub fn set_vox_delay(&mut self, delay: u8) {
-        if let Some(b) = self.image.get_mut(VOX_DELAY_OFFSET) {
-            *b = delay.min(30);
-        }
+        self.put(VOX_DELAY_OFFSET, delay.min(6));
     }
 
-    /// Set VOX TX-on-busy on/off.
+    /// Set VOX TX-on-busy on/off (`radio.VoxTxOnBusy`).
     ///
     /// MCP offset `0x101E`.
     pub fn set_vox_tx_on_busy(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(VOX_TX_ON_BUSY_OFFSET) {
-            *b = u8::from(enabled);
-        }
+        self.put(VOX_TX_ON_BUSY_OFFSET, u8::from(enabled));
     }
 
-    /// Set squelch level for Band A (0-6).
-    ///
-    /// MCP offset `0x100D`.
-    pub fn set_squelch_a(&mut self, level: u8) {
-        if let Some(b) = self.image.get_mut(SQUELCH_A_OFFSET) {
-            *b = level.min(6);
-        }
-    }
+    // -----------------------------------------------------------------------
+    // DTMF
+    // -----------------------------------------------------------------------
 
-    /// Set squelch level for Band B (0-6).
-    ///
-    /// MCP offset `0x100E`.
-    pub fn set_squelch_b(&mut self, level: u8) {
-        if let Some(b) = self.image.get_mut(SQUELCH_B_OFFSET) {
-            *b = level.min(6);
-        }
-    }
-
-    /// Set FM narrow setting.
-    ///
-    /// MCP offset `0x100F`.
-    pub fn set_fm_narrow(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(FM_NARROW_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set auto filter setting.
-    ///
-    /// MCP offset `0x100C`.
-    pub fn set_auto_filter(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(AUTO_FILTER_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set scan resume setting.
-    ///
-    /// MCP offset `0x1007`.
-    pub fn set_scan_resume(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(SCAN_RESUME_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set digital scan resume setting.
-    ///
-    /// MCP offset `0x1008`.
-    pub fn set_digital_scan_resume(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(DIGITAL_SCAN_RESUME_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set timeout timer.
-    ///
-    /// MCP offset `0x1018`.
-    pub fn set_timeout_timer(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(TIMEOUT_TIMER_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set TX inhibit on/off.
-    ///
-    /// MCP offset `0x1019`.
-    pub fn set_tx_inhibit(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(TX_INHIBIT_OFFSET) {
-            *b = u8::from(enabled);
-        }
-    }
-
-    /// Set beat shift on/off.
-    ///
-    /// MCP offset `0x101A`.
-    pub fn set_beat_shift(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(BEAT_SHIFT_OFFSET) {
-            *b = u8::from(enabled);
-        }
-    }
-
-    /// Set CW break-in on/off.
+    /// Set DTMF speed (`radio.DtmfSpeed`, clamped to 0-2).
     ///
     /// MCP offset `0x101F`.
-    pub fn set_cw_break_in(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(CW_BREAK_IN_OFFSET) {
-            *b = u8::from(enabled);
-        }
+    pub fn set_dtmf_speed(&mut self, value: u8) {
+        self.put(DTMF_SPEED_OFFSET, value.min(2));
     }
 
-    /// Set CW pitch.
+    /// Set DTMF pause time (`radio.DtmfPauseTime`, clamped to 0-6).
+    ///
+    /// MCP offset `0x1020`.
+    pub fn set_dtmf_pause_time(&mut self, value: u8) {
+        self.put(DTMF_PAUSE_TIME_OFFSET, value.min(6));
+    }
+
+    /// Set DTMF TX hold on/off (`radio.DtmfTxHold`).
     ///
     /// MCP offset `0x1021`.
-    pub fn set_cw_pitch(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(CW_PITCH_OFFSET) {
-            *b = value;
-        }
+    pub fn set_dtmf_tx_hold(&mut self, enabled: bool) {
+        self.put(DTMF_TX_HOLD_OFFSET, u8::from(enabled));
     }
 
-    /// Set DTMF speed.
+    // -----------------------------------------------------------------------
+    // CW receive
+    // -----------------------------------------------------------------------
+
+    /// Set the CW pitch index (`radio.CwPitchFreq`, clamped to 0-6).
     ///
     /// MCP offset `0x1024`.
-    pub fn set_dtmf_speed(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(DTMF_SPEED_OFFSET) {
-            *b = value;
-        }
+    pub fn set_cw_pitch(&mut self, value: u8) {
+        self.put(CW_PITCH_OFFSET, value.min(6));
     }
 
-    /// Set mic sensitivity.
+    // -----------------------------------------------------------------------
+    // Audio
+    // -----------------------------------------------------------------------
+
+    /// Set the auto-mute return time (`radio.AutoMuteRetTime`, clamped
+    /// to 1-10).
     ///
-    /// MCP offset `0x1040`.
-    pub fn set_mic_sensitivity(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(MIC_SENSITIVITY_OFFSET) {
-            *b = value;
-        }
+    /// MCP offset `0x1041`. 0 is not a legal value for this field.
+    pub fn set_auto_mute_return_time(&mut self, value: u8) {
+        self.put(AUTO_MUTE_RETURN_TIME_OFFSET, value.clamp(1, 10));
     }
 
-    /// Set PF key 1 assignment.
+    /// Set the EMR volume level (`dv.EmrVolumeLevelTxRx`, clamped to
+    /// 1-50).
     ///
-    /// MCP offset `0x1041`.
-    pub fn set_pf_key1(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(PF_KEY1_OFFSET) {
-            *b = value;
-        }
+    /// MCP offset `0x1A03`. 0 is not a legal value for this field.
+    pub fn set_emr_volume_level(&mut self, value: u8) {
+        self.put(EMR_VOLUME_LEVEL_OFFSET, value.clamp(1, 50));
     }
 
-    /// Set PF key 2 assignment.
+    // -----------------------------------------------------------------------
+    // Display
+    // -----------------------------------------------------------------------
+
+    /// Set backlight control (`radio.BacklightControl`, clamped to
+    /// 0-3).
     ///
-    /// MCP offset `0x1042`.
-    pub fn set_pf_key2(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(PF_KEY2_OFFSET) {
-            *b = value;
-        }
+    /// MCP offset `0x1060`.
+    pub fn set_backlight_control(&mut self, value: u8) {
+        self.put(BACKLIGHT_CONTROL_OFFSET, value.min(3));
     }
 
-    /// Set APRS lock on/off.
+    /// Set the backlight timer (`radio.BacklightTimer`, clamped to
+    /// 3-60 seconds).
+    ///
+    /// MCP offset `0x1061`. Values below 3 are not legal for this
+    /// field.
+    pub fn set_backlight_timer(&mut self, value: u8) {
+        self.put(BACKLIGHT_TIMER_OFFSET, value.clamp(3, 60));
+    }
+
+    // -----------------------------------------------------------------------
+    // Beep / voice guidance
+    // -----------------------------------------------------------------------
+
+    /// Set key beep on/off (`radio.Beep`).
+    ///
+    /// MCP offset `0x1071`. Hardware verified.
+    pub fn set_key_beep(&mut self, enabled: bool) {
+        self.put(KEY_BEEP_OFFSET, u8::from(enabled));
+    }
+
+    /// Set beep volume (`radio.BeepVolume`, clamped to 0-7; 0 = VOL
+    /// Link).
+    ///
+    /// MCP offset `0x1072`.
+    pub fn set_beep_volume(&mut self, volume: u8) {
+        self.put(BEEP_VOLUME_OFFSET, volume.min(7));
+    }
+
+    /// Set the voice announce mode (`radio.VoiceAnnounce`, clamped to
+    /// 0-3; 0=Off, 1=Manual, 2=Auto1, 3=Auto2).
+    ///
+    /// MCP offset `0x1073`.
+    pub fn set_announce(&mut self, value: u8) {
+        self.put(ANNOUNCE_OFFSET, value.min(3));
+    }
+
+    /// Set the voice announce volume (`radio.VoiceAnnounceVolume`,
+    /// clamped to 0-7; 0 = VOL Link).
+    ///
+    /// MCP offset `0x1074`.
+    pub fn set_voice_volume(&mut self, value: u8) {
+        self.put(VOICE_VOLUME_OFFSET, value.min(7));
+    }
+
+    /// Set the voice guidance speed (`radio.VoiceGuidanceSpeed`,
+    /// clamped to 0-3).
     ///
     /// MCP offset `0x1097`.
-    pub fn set_aprs_lock(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(APRS_LOCK_OFFSET) {
-            *b = u8::from(enabled);
-        }
+    pub fn set_voice_speed(&mut self, value: u8) {
+        self.put(VOICE_SPEED_OFFSET, value.min(3));
     }
 
-    /// Set dual display size.
-    ///
-    /// MCP offset `0x1066`.
-    pub fn set_dual_display_size(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(DUAL_DISPLAY_SIZE_OFFSET) {
-            *b = value;
-        }
-    }
+    // -----------------------------------------------------------------------
+    // Battery / power
+    // -----------------------------------------------------------------------
 
-    /// Set display area.
-    ///
-    /// MCP offset `0x1067`.
-    pub fn set_display_area(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(DISPLAY_AREA_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set info line setting.
-    ///
-    /// MCP offset `0x1068`.
-    pub fn set_info_line(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(INFO_LINE_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set volume lock on/off.
+    /// Set the battery saver interval index (`radio.BatterySaver`,
+    /// clamped to 0-9; 0 = Off).
     ///
     /// MCP offset `0x1076`.
-    pub fn set_volume_lock(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(VOLUME_LOCK_OFFSET) {
-            *b = u8::from(enabled);
-        }
+    pub fn set_battery_saver(&mut self, value: u8) {
+        self.put(BATTERY_SAVER_OFFSET, value.min(9));
     }
 
-    /// Set Bluetooth auto-connect on/off.
+    /// Set auto power off (`radio.AutoPowerOff`).
+    ///
+    /// MCP offset `0x1077`.
+    pub fn set_auto_power_off(&mut self, value: AutoPowerOff) {
+        self.put(AUTO_POWER_OFF_OFFSET, u8::from(value));
+    }
+
+    // -----------------------------------------------------------------------
+    // Bluetooth
+    // -----------------------------------------------------------------------
+
+    /// Set Bluetooth on/off (`radio.BluetoothOnOff`).
+    ///
+    /// MCP offset `0x1078`. Hardware verified.
+    pub fn set_bluetooth(&mut self, enabled: bool) {
+        self.put(BLUETOOTH_OFFSET, u8::from(enabled));
+    }
+
+    /// Set Bluetooth auto-connect on/off
+    /// (`radio.BluetoothAutoConnect`).
     ///
     /// MCP offset `0x1079`.
     pub fn set_bt_auto_connect(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(BT_AUTO_CONNECT_OFFSET) {
-            *b = u8::from(enabled);
-        }
+        self.put(BT_AUTO_CONNECT_OFFSET, u8::from(enabled));
     }
 
-    /// Set PC output mode.
+    // -----------------------------------------------------------------------
+    // PF keys
+    // -----------------------------------------------------------------------
+
+    /// Set the PF1 key assignment (`radio.Pf1PfKey`).
     ///
-    /// MCP offset `0x1085`.
-    pub fn set_pc_output_mode(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(PC_OUTPUT_MODE_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set APRS USB mode.
+    /// MCP offset `0x107A`.
     ///
-    /// MCP offset `0x1086`.
-    pub fn set_aprs_usb_mode(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(APRS_USB_MODE_OFFSET) {
-            *b = value;
-        }
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] if `value` is
+    /// outside the gapped domain (0-30 excluding 5, 23, 25, 26) — a
+    /// plain clamp cannot express the gaps, and writing a gap value
+    /// would store an invalid menu selection.
+    pub fn set_pf_key1(&mut self, value: u8) -> Result<(), ValidationError> {
+        validate_pf_key("PF1 key", value)?;
+        self.put(PF_KEY1_OFFSET, value);
+        Ok(())
     }
 
-    /// Set power-on message flag on/off.
+    /// Set the PF2 key assignment (`radio.Pf2PfKey`).
+    ///
+    /// MCP offset `0x107B`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] if `value` is
+    /// outside the gapped domain (0-30 excluding 5, 23, 25, 26).
+    pub fn set_pf_key2(&mut self, value: u8) -> Result<(), ValidationError> {
+        validate_pf_key("PF2 key", value)?;
+        self.put(PF_KEY2_OFFSET, value);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Locks
+    // -----------------------------------------------------------------------
+
+    /// Set the key-lock configuration bit
+    /// (`radio.KeyLockTypeKeyLock`).
+    ///
+    /// MCP offset `0x1084`, bit `0x01`. Masked read-modify-write: the
+    /// frequency-lock bit and the six unowned bits of the byte are
+    /// preserved.
+    pub fn set_key_lock(&mut self, enabled: bool) {
+        self.put_bit(KEY_LOCK_OFFSET, KEY_LOCK_KEY_MASK, enabled);
+    }
+
+    /// Set the frequency-lock configuration bit
+    /// (`radio.KeyLockTypeFrequencyLock`).
+    ///
+    /// MCP offset `0x1084`, bit `0x02`. Masked read-modify-write.
+    pub fn set_frequency_lock(&mut self, enabled: bool) {
+        self.put_bit(KEY_LOCK_OFFSET, KEY_LOCK_FREQUENCY_MASK, enabled);
+    }
+
+    /// Set volume lock on/off (`radio.VolumeLockOnOff`).
     ///
     /// MCP offset `0x1087`.
-    pub fn set_power_on_message_flag(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(POWER_ON_MESSAGE_FLAG_OFFSET) {
-            *b = u8::from(enabled);
-        }
+    pub fn set_volume_lock(&mut self, enabled: bool) {
+        self.put(VOLUME_LOCK_OFFSET, u8::from(enabled));
     }
 
-    /// Set dual band MCP setting on/off.
+    /// Set the APRS-lock frequency bit (`aprs.Frequency`).
     ///
-    /// MCP offset `0x1096`.
-    pub fn set_dual_band_mcp(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(DUAL_BAND_MCP_OFFSET) {
-            *b = u8::from(enabled);
-        }
+    /// MCP offset `0x120A`, bit `0x01`. Masked read-modify-write: the
+    /// other APRS-lock bits and the five unowned bits are preserved.
+    pub fn set_aprs_lock_frequency(&mut self, enabled: bool) {
+        self.put_bit(APRS_LOCK_OFFSET, APRS_LOCK_FREQUENCY_MASK, enabled);
     }
 
-    /// Set key beep on/off.
+    /// Set the APRS-lock PTT bit (`aprs.Ptt`).
     ///
-    /// MCP offset `0x1071`.
-    pub fn set_key_beep(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(KEY_BEEP_OFFSET) {
-            *b = u8::from(enabled);
-        }
+    /// MCP offset `0x120A`, bit `0x02`. Masked read-modify-write.
+    pub fn set_aprs_lock_ptt(&mut self, enabled: bool) {
+        self.put_bit(APRS_LOCK_OFFSET, APRS_LOCK_PTT_MASK, enabled);
     }
 
-    /// Set VOX enabled on/off.
+    /// Set the APRS-lock APRS-key bit (`aprs.AprsKey`).
     ///
-    /// MCP offset `0x101B`.
-    pub fn set_vox_enabled(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(VOX_ENABLED_OFFSET) {
-            *b = u8::from(enabled);
-        }
+    /// MCP offset `0x120A`, bit `0x04`. Masked read-modify-write.
+    pub fn set_aprs_lock_key(&mut self, enabled: bool) {
+        self.put_bit(APRS_LOCK_OFFSET, APRS_LOCK_KEY_MASK, enabled);
     }
 
-    /// Set VOX gain level (0-9).
+    // -----------------------------------------------------------------------
+    // Units / language
+    // -----------------------------------------------------------------------
+
+    /// Set speed/distance display unit (`radio.SpeedDistance`).
     ///
-    /// Values above 9 are clamped to 9.
-    ///
-    /// MCP offset `0x101C`.
-    pub fn set_vox_gain(&mut self, gain: u8) {
-        if let Some(b) = self.image.get_mut(VOX_GAIN_OFFSET) {
-            *b = gain.min(9);
-        }
+    /// MCP offset `0x1088`.
+    pub fn set_speed_distance_unit(&mut self, value: SpeedDistanceUnit) {
+        let raw = match value {
+            SpeedDistanceUnit::MilesPerHour => 0,
+            SpeedDistanceUnit::KilometersPerHour => 1,
+            SpeedDistanceUnit::Knots => 2,
+        };
+        self.put(SPEED_DISTANCE_UNIT_OFFSET, raw);
     }
 
-    /// Set lock on/off.
+    /// Set altitude/rain display unit (`radio.AltitudeRain`).
     ///
-    /// MCP offset `0x1060`.
-    pub fn set_lock(&mut self, locked: bool) {
-        if let Some(b) = self.image.get_mut(LOCK_OFFSET) {
-            *b = u8::from(locked);
-        }
+    /// MCP offset `0x1089`.
+    pub fn set_altitude_rain_unit(&mut self, value: AltitudeRainUnit) {
+        let raw = match value {
+            AltitudeRainUnit::FeetInch => 0,
+            AltitudeRainUnit::MetersMm => 1,
+        };
+        self.put(ALTITUDE_RAIN_UNIT_OFFSET, raw);
     }
 
-    /// Set dual-band display on/off.
+    /// Set temperature display unit (`radio.Temperature`).
     ///
-    /// MCP offset `0x0396`.
-    pub fn set_dual_band(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(DUAL_BAND_OFFSET) {
-            *b = u8::from(enabled);
-        }
+    /// MCP offset `0x108A`.
+    pub fn set_temperature_unit(&mut self, value: TemperatureUnit) {
+        let raw = match value {
+            TemperatureUnit::Fahrenheit => 0,
+            TemperatureUnit::Celsius => 1,
+        };
+        self.put(TEMPERATURE_UNIT_OFFSET, raw);
+    }
+
+    /// Set language (`radio.Language`).
+    ///
+    /// MCP offset `0x1092`.
+    pub fn set_language(&mut self, value: Language) {
+        let raw = match value {
+            Language::English => 0,
+            Language::Japanese => 1,
+        };
+        self.put(LANGUAGE_OFFSET, raw);
+    }
+
+    // -----------------------------------------------------------------------
+    // Interfaces
+    // -----------------------------------------------------------------------
+
+    /// Set the GPS PC-output interface (`radio.PcOutputInterfaceGps`,
+    /// clamped to 0-1; 0=USB, 1=Bluetooth).
+    ///
+    /// MCP offset `0x108E`.
+    pub fn set_gps_bt_interface(&mut self, value: u8) {
+        self.put(GPS_BT_INTERFACE_OFFSET, value.min(1));
+    }
+
+    /// Set the APRS PC-output interface
+    /// (`radio.PcOutputInterfaceAprs`, clamped to 0-1; 0=USB,
+    /// 1=Bluetooth).
+    ///
+    /// MCP offset `0x108F`.
+    pub fn set_aprs_usb_mode(&mut self, value: u8) {
+        self.put(APRS_USB_MODE_OFFSET, value.min(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Band state (hardware-verified, outside registry scope)
+    // -----------------------------------------------------------------------
+
+    /// Set Band A power level.
+    ///
+    /// MCP offset `0x0359`. Hardware verified.
+    pub fn set_power_level_a(&mut self, level: PowerLevel) {
+        self.put(POWER_LEVEL_A_OFFSET, u8::from(level));
     }
 
     /// Set Band A attenuator on/off.
     ///
-    /// MCP offset `0x035C`.
+    /// MCP offset `0x035C`. Hardware verified.
     pub fn set_attenuator_a(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(ATTENUATOR_A_OFFSET) {
-            *b = u8::from(enabled);
-        }
+        self.put(ATTENUATOR_A_OFFSET, u8::from(enabled));
     }
 
-    /// Set Band A power level.
+    /// Set dual-band display on/off.
     ///
-    /// MCP offset `0x0359`.
-    pub fn set_power_level_a(&mut self, level: PowerLevel) {
-        if let Some(b) = self.image.get_mut(POWER_LEVEL_A_OFFSET) {
-            *b = u8::from(level);
-        }
-    }
-
-    /// Set Bluetooth on/off.
-    ///
-    /// MCP offset `0x1078`.
-    pub fn set_bluetooth(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(BLUETOOTH_OFFSET) {
-            *b = u8::from(enabled);
-        }
+    /// MCP offset `0x0396`. Hardware verified.
+    pub fn set_dual_band(&mut self, enabled: bool) {
+        self.put(DUAL_BAND_OFFSET, u8::from(enabled));
     }
 
     // -----------------------------------------------------------------------
-    // Additional writer methods for settings not yet covered above
+    // Raw numeric setters for enum-typed settings (for UI +/- cycling)
     // -----------------------------------------------------------------------
 
-    /// Set SSB high-cut filter setting.
-    ///
-    /// MCP offset `0x1011`.
-    pub fn set_ssb_high_cut(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(SSB_HIGH_CUT_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set CW high-cut filter setting.
-    ///
-    /// MCP offset `0x1012`.
-    pub fn set_cw_high_cut(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(CW_HIGH_CUT_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set AM high-cut filter setting.
-    ///
-    /// MCP offset `0x1013`.
-    pub fn set_am_high_cut(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(AM_HIGH_CUT_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set scan restart time.
-    ///
-    /// MCP offset `0x1009`.
-    pub fn set_scan_restart_time(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(SCAN_RESTART_TIME_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set scan restart carrier setting.
-    ///
-    /// MCP offset `0x100A`.
-    pub fn set_scan_restart_carrier(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(SCAN_RESTART_CARRIER_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set CW delay time.
-    ///
-    /// MCP offset `0x1020`.
-    pub fn set_cw_delay_time(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(CW_DELAY_TIME_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set DTMF pause time.
-    ///
-    /// MCP offset `0x1026`.
-    pub fn set_dtmf_pause_time(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(DTMF_PAUSE_TIME_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set DTMF TX hold on/off.
-    ///
-    /// MCP offset `0x1027`.
-    pub fn set_dtmf_tx_hold(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(DTMF_TX_HOLD_OFFSET) {
-            *b = u8::from(enabled);
-        }
-    }
-
-    /// Set repeater auto offset on/off.
-    ///
-    /// MCP offset `0x1030`.
-    pub fn set_repeater_auto_offset(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(REPEATER_AUTO_OFFSET_OFFSET) {
-            *b = u8::from(enabled);
-        }
-    }
-
-    /// Set repeater call key function.
-    ///
-    /// MCP offset `0x1031`.
-    pub fn set_repeater_call_key(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(REPEATER_CALL_KEY_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set lock key A on/off.
-    ///
-    /// MCP offset `0x1062`.
-    pub fn set_lock_key_a(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(LOCK_KEY_A_OFFSET) {
-            *b = u8::from(enabled);
-        }
-    }
-
-    /// Set lock key B on/off.
-    ///
-    /// MCP offset `0x1063`.
-    pub fn set_lock_key_b(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(LOCK_KEY_B_OFFSET) {
-            *b = u8::from(enabled);
-        }
-    }
-
-    /// Set lock key C on/off.
-    ///
-    /// MCP offset `0x1064`.
-    pub fn set_lock_key_c(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(LOCK_KEY_C_OFFSET) {
-            *b = u8::from(enabled);
-        }
-    }
-
-    /// Set lock PTT key on/off.
-    ///
-    /// MCP offset `0x1065`.
-    pub fn set_lock_key_ptt(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(LOCK_KEY_PTT_OFFSET) {
-            *b = u8::from(enabled);
-        }
-    }
-
-    /// Set display hold time.
-    ///
-    /// MCP offset `0x106B`.
-    pub fn set_display_hold_time(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(DISPLAY_HOLD_TIME_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set display method.
-    ///
-    /// MCP offset `0x106C`.
-    pub fn set_display_method(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(DISPLAY_METHOD_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set power-on display setting.
-    ///
-    /// MCP offset `0x106D`.
-    pub fn set_power_on_display(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(POWER_ON_DISPLAY_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set EMR volume level.
-    ///
-    /// MCP offset `0x106E`.
-    pub fn set_emr_volume_level(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(EMR_VOLUME_LEVEL_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set auto mute return time.
-    ///
-    /// MCP offset `0x106F`.
-    pub fn set_auto_mute_return_time(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(AUTO_MUTE_RETURN_TIME_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set announce on/off.
-    ///
-    /// MCP offset `0x1070`.
-    pub fn set_announce(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(ANNOUNCE_OFFSET) {
-            *b = u8::from(enabled);
-        }
-    }
-
-    /// Set voice language.
-    ///
-    /// MCP offset `0x1073`.
-    pub fn set_voice_language(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(VOICE_LANGUAGE_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set voice volume.
-    ///
-    /// MCP offset `0x1074`.
-    pub fn set_voice_volume(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(VOICE_VOLUME_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set voice speed.
-    ///
-    /// MCP offset `0x1075`.
-    pub fn set_voice_speed(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(VOICE_SPEED_OFFSET) {
-            *b = value;
-        }
-    }
-
-    /// Set USB audio output on/off.
-    ///
-    /// MCP offset `0x1094`.
-    pub fn set_usb_audio_output(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(USB_AUDIO_OUTPUT_OFFSET) {
-            *b = u8::from(enabled);
-        }
-    }
-
-    /// Set internet link on/off.
-    ///
-    /// MCP offset `0x1095`.
-    pub fn set_internet_link(&mut self, enabled: bool) {
-        if let Some(b) = self.image.get_mut(INTERNET_LINK_OFFSET) {
-            *b = u8::from(enabled);
-        }
-    }
-
-    /// Set GPS/BT interface setting.
-    ///
-    /// MCP offset `0x1080`.
-    pub fn set_gps_bt_interface(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(GPS_BT_INTERFACE_OFFSET) {
-            *b = value;
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Raw numeric setters for enum-typed settings (for TUI +/- cycling)
-    // -----------------------------------------------------------------------
-
-    /// Set key lock type as raw byte (0=KeyOnly, 1=KeyAndPtt, 2=KeyPttAndDial).
-    ///
-    /// MCP offset `0x1061`.
-    pub fn set_key_lock_type_raw(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(KEY_LOCK_TYPE_OFFSET) {
-            *b = value.min(2);
-        }
-    }
-
-    /// Set auto power off as raw byte (0=Off, 1=30m, 2=60m, 3=90m, 4=120m).
-    ///
-    /// MCP offset `0x10D0`.
-    pub fn set_auto_power_off_raw(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(AUTO_POWER_OFF_OFFSET) {
-            *b = value.min(4);
-        }
-    }
-
-    /// Set speed/distance unit as raw byte (0=mph, 1=km/h, 2=knots).
+    /// Set auto power off as raw byte (0=Off, 1=15m, 2=30m, 3=60m;
+    /// clamped to 0-3).
     ///
     /// MCP offset `0x1077`.
+    pub fn set_auto_power_off_raw(&mut self, value: u8) {
+        self.put(AUTO_POWER_OFF_OFFSET, value.min(3));
+    }
+
+    /// Set speed/distance unit as raw byte (0=mph, 1=km/h, 2=knots;
+    /// clamped to 0-2).
+    ///
+    /// MCP offset `0x1088`.
     pub fn set_speed_distance_unit_raw(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(SPEED_DISTANCE_UNIT_OFFSET) {
-            *b = value.min(2);
-        }
+        self.put(SPEED_DISTANCE_UNIT_OFFSET, value.min(2));
     }
 
-    /// Set altitude/rain unit as raw byte (0=ft/in, 1=m/mm).
+    /// Set altitude/rain unit as raw byte (0=ft/in, 1=m/mm; clamped to
+    /// 0-1).
     ///
-    /// MCP offset `0x1083`.
+    /// MCP offset `0x1089`.
     pub fn set_altitude_rain_unit_raw(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(ALTITUDE_RAIN_UNIT_OFFSET) {
-            *b = value.min(1);
-        }
+        self.put(ALTITUDE_RAIN_UNIT_OFFSET, value.min(1));
     }
 
-    /// Set temperature unit as raw byte (0=°F, 1=°C).
+    /// Set temperature unit as raw byte (0=°F, 1=°C; clamped to 0-1).
     ///
-    /// MCP offset `0x1084`.
+    /// MCP offset `0x108A`.
     pub fn set_temperature_unit_raw(&mut self, value: u8) {
-        if let Some(b) = self.image.get_mut(TEMPERATURE_UNIT_OFFSET) {
-            *b = value.min(1);
-        }
+        self.put(TEMPERATURE_UNIT_OFFSET, value.min(1));
     }
 }
 
@@ -1967,10 +1590,9 @@ fn extract_string(image: &[u8], offset: usize, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::menu_fields::{MCP_D75_MENU_FIELDS, menu_field};
+    use crate::memory::schema::FieldCodec;
     use crate::protocol::programming::TOTAL_SIZE;
-    use crate::types::settings::{
-        AltitudeRainUnit, AutoPowerOff, KeyLockType, Language, SpeedDistanceUnit, TemperatureUnit,
-    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -2007,24 +1629,6 @@ mod tests {
         Ok(())
     }
 
-    /// Fill `len` bytes in `image` starting at `offset` with `value`, returning an error if the range is out of bounds.
-    fn fill_range(
-        image: &mut [u8],
-        offset: usize,
-        len: usize,
-        value: u8,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let end = offset + len;
-        let img_len = image.len();
-        image
-            .get_mut(offset..end)
-            .ok_or_else(|| {
-                format!("fill_range: range {offset}..{end} out of bounds (len={img_len})")
-            })?
-            .fill(value);
-        Ok(())
-    }
-
     /// Read a single byte from `image` at `offset`, returning an error if out of range.
     /// Used by tests asserting raw bytes after writes.
     fn get_byte(image: &[u8], offset: usize) -> Result<u8, Box<dyn std::error::Error>> {
@@ -2044,7 +1648,6 @@ mod tests {
             POWER_ON_MESSAGE_OFFSET,
             b"Hello D75!\0\0\0\0\0\0",
         )?;
-        write_slice(&mut image, MODEL_NAME_OFFSET, b"TH-D75A\0\0\0\0\0\0\0\0\0")?;
         Ok(image)
     }
 
@@ -2054,15 +1657,6 @@ mod tests {
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         let settings = mi.settings();
         assert_eq!(settings.power_on_message(), "Hello D75!");
-        Ok(())
-    }
-
-    #[test]
-    fn settings_model_name() -> TestResult {
-        let image = make_settings_image()?;
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let settings = mi.settings();
-        assert_eq!(settings.model_name(), "TH-D75A");
         Ok(())
     }
 
@@ -2094,7 +1688,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Read accessor tests (verified offsets)
+    // Read accessor tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2129,19 +1723,11 @@ mod tests {
     }
 
     #[test]
-    fn settings_lock() -> TestResult {
+    fn settings_vox_delay_clamped_to_registry_domain() -> TestResult {
         let mut image = make_settings_image()?;
-        set_byte(&mut image, LOCK_OFFSET, 1)?;
+        set_byte(&mut image, VOX_DELAY_OFFSET, 0xFF)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(mi.settings().lock());
-        Ok(())
-    }
-
-    #[test]
-    fn settings_lock_off() -> TestResult {
-        let image = make_settings_image()?;
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.settings().lock());
+        assert_eq!(mi.settings().vox_delay(), 6);
         Ok(())
     }
 
@@ -2172,28 +1758,11 @@ mod tests {
     }
 
     #[test]
-    fn settings_attenuator_a_off() -> TestResult {
-        let image = make_settings_image()?;
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.settings().attenuator_a());
-        Ok(())
-    }
-
-    #[test]
     fn settings_power_level_a() -> TestResult {
         let mut image = make_settings_image()?;
         set_byte(&mut image, POWER_LEVEL_A_OFFSET, 2)?; // Lo
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.settings().power_level_a(), PowerLevel::Low);
-        Ok(())
-    }
-
-    #[test]
-    fn settings_power_level_a_default() -> TestResult {
-        let image = make_settings_image()?;
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        // 0x00 maps to High.
-        assert_eq!(mi.settings().power_level_a(), PowerLevel::High);
         Ok(())
     }
 
@@ -2210,29 +1779,20 @@ mod tests {
     fn settings_bluetooth() -> TestResult {
         let mut image = make_settings_image()?;
         set_byte(&mut image, BLUETOOTH_OFFSET, 1)?;
+        set_byte(&mut image, BT_AUTO_CONNECT_OFFSET, 1)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.settings().bluetooth());
+        assert!(mi.settings().bt_auto_connect());
         Ok(())
     }
 
     #[test]
-    fn settings_bluetooth_off() -> TestResult {
+    fn settings_beep_volume_zero_is_vol_link() -> TestResult {
+        // 0 is a legal stored value (VOL Link), not an error or a
+        // clamped minimum.
         let image = make_settings_image()?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.settings().bluetooth());
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Read accessor tests (firmware analysis offsets)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn settings_beep_volume() -> TestResult {
-        let mut image = make_settings_image()?;
-        set_byte(&mut image, BEEP_VOLUME_OFFSET, 5)?;
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().beep_volume(), 5);
+        assert_eq!(mi.settings().beep_volume(), 0);
         Ok(())
     }
 
@@ -2246,11 +1806,11 @@ mod tests {
     }
 
     #[test]
-    fn settings_backlight() -> TestResult {
+    fn settings_backlight_control() -> TestResult {
         let mut image = make_settings_image()?;
-        set_byte(&mut image, BACKLIGHT_CONTROL_OFFSET, 4)?;
+        set_byte(&mut image, BACKLIGHT_CONTROL_OFFSET, 2)?; // Auto
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().backlight(), 4);
+        assert_eq!(mi.settings().backlight_control(), 2);
         Ok(())
     }
 
@@ -2259,7 +1819,18 @@ mod tests {
         let mut image = make_settings_image()?;
         set_byte(&mut image, AUTO_POWER_OFF_OFFSET, 2)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().auto_power_off(), AutoPowerOff::Min60);
+        // Raw 2 is 30 minutes on the D75 (0=Off, 1=15, 2=30, 3=60).
+        assert_eq!(mi.settings().auto_power_off(), AutoPowerOff::Min30);
+        Ok(())
+    }
+
+    #[test]
+    fn settings_auto_power_off_raw_one_is_fifteen_minutes() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, AUTO_POWER_OFF_OFFSET, 1)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        assert_eq!(mi.settings().auto_power_off(), AutoPowerOff::Min15);
+        assert_eq!(mi.settings().auto_power_off_raw(), 1);
         Ok(())
     }
 
@@ -2273,20 +1844,52 @@ mod tests {
     }
 
     #[test]
-    fn settings_battery_saver() -> TestResult {
+    fn settings_battery_saver_is_an_interval_index() -> TestResult {
         let mut image = make_settings_image()?;
-        set_byte(&mut image, BATTERY_SAVER_OFFSET, 1)?;
+        set_byte(&mut image, BATTERY_SAVER_OFFSET, 9)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(mi.settings().battery_saver());
+        assert_eq!(mi.settings().battery_saver(), 9);
         Ok(())
     }
 
     #[test]
-    fn settings_key_lock_type() -> TestResult {
+    fn settings_beat_shift() -> TestResult {
         let mut image = make_settings_image()?;
-        set_byte(&mut image, KEY_LOCK_TYPE_OFFSET, 2)?;
+        set_byte(&mut image, BEAT_SHIFT_OFFSET, 7)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().key_lock_type(), KeyLockType::KeyPttAndDial);
+        assert_eq!(mi.settings().beat_shift(), BeatShift::Type8);
+        Ok(())
+    }
+
+    #[test]
+    fn settings_beat_shift_invalid_defaults_to_type1() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, BEAT_SHIFT_OFFSET, 0xFF)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        assert_eq!(mi.settings().beat_shift(), BeatShift::Type1);
+        Ok(())
+    }
+
+    #[test]
+    fn settings_key_lock_bits() -> TestResult {
+        let mut image = make_settings_image()?;
+        // Both configuration bits set, plus unowned upper bits that
+        // must not leak into either reader.
+        set_byte(&mut image, KEY_LOCK_OFFSET, 0xFC | 0x01)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        assert!(mi.settings().key_lock());
+        assert!(!mi.settings().frequency_lock());
+        Ok(())
+    }
+
+    #[test]
+    fn settings_aprs_lock_bits() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, APRS_LOCK_OFFSET, 0x05)?; // frequency + APRS key
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        assert!(mi.settings().aprs_lock_frequency());
+        assert!(!mi.settings().aprs_lock_ptt());
+        assert!(mi.settings().aprs_lock_key());
         Ok(())
     }
 
@@ -2313,27 +1916,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn settings_squelch() -> TestResult {
-        let mut image = make_settings_image()?;
-        set_byte(&mut image, SQUELCH_A_OFFSET, 3)?;
-        set_byte(&mut image, SQUELCH_B_OFFSET, 4)?;
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let settings = mi.settings();
-        assert_eq!(settings.squelch_a(), 3);
-        assert_eq!(settings.squelch_b(), 4);
-        Ok(())
-    }
-
-    #[test]
-    fn settings_squelch_clamped() -> TestResult {
-        let mut image = make_settings_image()?;
-        set_byte(&mut image, SQUELCH_A_OFFSET, 0xFF)?;
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().squelch_a(), 6);
-        Ok(())
-    }
-
     // -----------------------------------------------------------------------
     // Write accessor tests (SettingsWriter)
     // -----------------------------------------------------------------------
@@ -2351,27 +1933,6 @@ mod tests {
     }
 
     #[test]
-    fn write_vox_enabled() -> TestResult {
-        let image = make_settings_image()?;
-        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.settings().vox_enabled());
-        mi.settings_mut().set_vox_enabled(true);
-        assert!(mi.settings().vox_enabled());
-        mi.settings_mut().set_vox_enabled(false);
-        assert!(!mi.settings().vox_enabled());
-        Ok(())
-    }
-
-    #[test]
-    fn write_vox_gain() -> TestResult {
-        let image = make_settings_image()?;
-        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        mi.settings_mut().set_vox_gain(7);
-        assert_eq!(mi.settings().vox_gain(), 7);
-        Ok(())
-    }
-
-    #[test]
     fn write_vox_gain_clamped() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
@@ -2381,68 +1942,140 @@ mod tests {
     }
 
     #[test]
-    fn write_lock() -> TestResult {
+    fn write_vox_delay_clamped_to_registry_domain() -> TestResult {
+        // The legacy setter accepted up to 30 ("100 ms units" fiction);
+        // the registry domain is 0-6 (250-3000 ms table).
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.settings().lock());
-        mi.settings_mut().set_lock(true);
-        assert!(mi.settings().lock());
-        mi.settings_mut().set_lock(false);
-        assert!(!mi.settings().lock());
+        mi.settings_mut().set_vox_delay(30);
+        assert_eq!(get_byte(mi.as_raw(), VOX_DELAY_OFFSET)?, 6);
         Ok(())
     }
 
     #[test]
-    fn write_dual_band() -> TestResult {
+    fn write_backlight_timer_clamps_to_min_three() -> TestResult {
+        // radio.BacklightTimer has domain 3-60: values below 3 are not
+        // legal stored bytes.
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.settings().dual_band());
-        mi.settings_mut().set_dual_band(true);
-        assert!(mi.settings().dual_band());
-        mi.settings_mut().set_dual_band(false);
-        assert!(!mi.settings().dual_band());
+        mi.settings_mut().set_backlight_timer(0);
+        assert_eq!(get_byte(mi.as_raw(), BACKLIGHT_TIMER_OFFSET)?, 3);
+        mi.settings_mut().set_backlight_timer(0xFF);
+        assert_eq!(get_byte(mi.as_raw(), BACKLIGHT_TIMER_OFFSET)?, 60);
         Ok(())
     }
 
     #[test]
-    fn write_attenuator_a() -> TestResult {
+    fn write_scan_restart_times_clamp_to_min_one() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.settings().attenuator_a());
-        mi.settings_mut().set_attenuator_a(true);
-        assert!(mi.settings().attenuator_a());
-        mi.settings_mut().set_attenuator_a(false);
-        assert!(!mi.settings().attenuator_a());
+        mi.settings_mut().set_scan_restart_time(0);
+        mi.settings_mut().set_scan_restart_carrier(0);
+        assert_eq!(get_byte(mi.as_raw(), SCAN_RESTART_TIME_OFFSET)?, 1);
+        assert_eq!(get_byte(mi.as_raw(), SCAN_RESTART_CARRIER_OFFSET)?, 1);
         Ok(())
     }
 
     #[test]
-    fn write_power_level_a() -> TestResult {
+    fn write_emr_volume_level_clamps_to_domain() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        mi.settings_mut().set_power_level_a(PowerLevel::Low);
-        assert_eq!(mi.settings().power_level_a(), PowerLevel::Low);
-        mi.settings_mut().set_power_level_a(PowerLevel::ExtraLow);
-        assert_eq!(mi.settings().power_level_a(), PowerLevel::ExtraLow);
-        mi.settings_mut().set_power_level_a(PowerLevel::High);
-        assert_eq!(mi.settings().power_level_a(), PowerLevel::High);
+        mi.settings_mut().set_emr_volume_level(0);
+        assert_eq!(get_byte(mi.as_raw(), EMR_VOLUME_LEVEL_OFFSET)?, 1);
+        mi.settings_mut().set_emr_volume_level(0xFF);
+        assert_eq!(get_byte(mi.as_raw(), EMR_VOLUME_LEVEL_OFFSET)?, 50);
         Ok(())
     }
 
     #[test]
-    fn write_bluetooth() -> TestResult {
+    fn write_beat_shift() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.settings().bluetooth());
-        mi.settings_mut().set_bluetooth(true);
-        assert!(mi.settings().bluetooth());
-        mi.settings_mut().set_bluetooth(false);
-        assert!(!mi.settings().bluetooth());
+        mi.settings_mut().set_beat_shift(BeatShift::Type5);
+        assert_eq!(mi.settings().beat_shift(), BeatShift::Type5);
+        assert_eq!(get_byte(mi.as_raw(), BEAT_SHIFT_OFFSET)?, 4);
         Ok(())
     }
 
     #[test]
-    fn write_roundtrip_all_verified() -> TestResult {
+    fn write_auto_power_off_enum_encoding() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
+        mi.settings_mut().set_auto_power_off(AutoPowerOff::Min15);
+        assert_eq!(get_byte(mi.as_raw(), AUTO_POWER_OFF_OFFSET)?, 1);
+        mi.settings_mut().set_auto_power_off(AutoPowerOff::Min60);
+        assert_eq!(get_byte(mi.as_raw(), AUTO_POWER_OFF_OFFSET)?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn write_pf_keys_validate_the_gapped_domain() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
+        mi.settings_mut().set_pf_key1(30)?;
+        assert_eq!(mi.settings().pf_key1(), 30);
+        mi.settings_mut().set_pf_key2(11)?;
+        assert_eq!(mi.settings().pf_key2(), 11);
+
+        for invalid in [5u8, 23, 25, 26, 31, 0xFF] {
+            let result = mi.settings_mut().set_pf_key1(invalid);
+            assert!(
+                result.is_err(),
+                "PF1 raw {invalid} must be rejected: {result:?}"
+            );
+            let result = mi.settings_mut().set_pf_key2(invalid);
+            assert!(
+                result.is_err(),
+                "PF2 raw {invalid} must be rejected: {result:?}"
+            );
+        }
+        // Rejected writes must not have modified the stored bytes.
+        assert_eq!(mi.settings().pf_key1(), 30);
+        assert_eq!(mi.settings().pf_key2(), 11);
+        Ok(())
+    }
+
+    #[test]
+    fn key_lock_setters_preserve_unowned_bits() -> TestResult {
+        let mut image = make_settings_image()?;
+        // Seed the shared byte with all six unowned bits set.
+        set_byte(&mut image, KEY_LOCK_OFFSET, 0xFC)?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
+
+        mi.settings_mut().set_key_lock(true);
+        assert_eq!(get_byte(mi.as_raw(), KEY_LOCK_OFFSET)?, 0xFD);
+        mi.settings_mut().set_frequency_lock(true);
+        assert_eq!(get_byte(mi.as_raw(), KEY_LOCK_OFFSET)?, 0xFF);
+        mi.settings_mut().set_key_lock(false);
+        assert_eq!(get_byte(mi.as_raw(), KEY_LOCK_OFFSET)?, 0xFE);
+        mi.settings_mut().set_frequency_lock(false);
+        assert_eq!(get_byte(mi.as_raw(), KEY_LOCK_OFFSET)?, 0xFC);
+        Ok(())
+    }
+
+    #[test]
+    fn aprs_lock_setters_preserve_unowned_bits() -> TestResult {
+        let mut image = make_settings_image()?;
+        // Seed the shared byte with all five unowned bits set.
+        set_byte(&mut image, APRS_LOCK_OFFSET, 0xF8)?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
+
+        mi.settings_mut().set_aprs_lock_frequency(true);
+        assert_eq!(get_byte(mi.as_raw(), APRS_LOCK_OFFSET)?, 0xF9);
+        mi.settings_mut().set_aprs_lock_ptt(true);
+        assert_eq!(get_byte(mi.as_raw(), APRS_LOCK_OFFSET)?, 0xFB);
+        mi.settings_mut().set_aprs_lock_key(true);
+        assert_eq!(get_byte(mi.as_raw(), APRS_LOCK_OFFSET)?, 0xFF);
+        mi.settings_mut().set_aprs_lock_ptt(false);
+        assert_eq!(get_byte(mi.as_raw(), APRS_LOCK_OFFSET)?, 0xFD);
+        mi.settings_mut().set_aprs_lock_frequency(false);
+        mi.settings_mut().set_aprs_lock_key(false);
+        assert_eq!(get_byte(mi.as_raw(), APRS_LOCK_OFFSET)?, 0xF8);
+        Ok(())
+    }
+
+    #[test]
+    fn write_roundtrip_hardware_verified_cells() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
 
@@ -2450,7 +2083,6 @@ mod tests {
         mi.settings_mut().set_key_beep(true);
         mi.settings_mut().set_vox_enabled(true);
         mi.settings_mut().set_vox_gain(9);
-        mi.settings_mut().set_lock(true);
         mi.settings_mut().set_dual_band(true);
         mi.settings_mut().set_attenuator_a(true);
         mi.settings_mut().set_power_level_a(PowerLevel::ExtraLow);
@@ -2461,7 +2093,6 @@ mod tests {
         assert!(s.key_beep());
         assert!(s.vox_enabled());
         assert_eq!(s.vox_gain(), 9);
-        assert!(s.lock());
         assert!(s.dual_band());
         assert!(s.attenuator_a());
         assert_eq!(s.power_level_a(), PowerLevel::ExtraLow);
@@ -2472,7 +2103,6 @@ mod tests {
         assert_eq!(get_byte(raw, KEY_BEEP_OFFSET)?, 1);
         assert_eq!(get_byte(raw, VOX_ENABLED_OFFSET)?, 1);
         assert_eq!(get_byte(raw, VOX_GAIN_OFFSET)?, 9);
-        assert_eq!(get_byte(raw, LOCK_OFFSET)?, 1);
         assert_eq!(get_byte(raw, DUAL_BAND_OFFSET)?, 1);
         assert_eq!(get_byte(raw, ATTENUATOR_A_OFFSET)?, 1);
         assert_eq!(get_byte(raw, POWER_LEVEL_A_OFFSET)?, 3); // ExtraLow = 3
@@ -2481,328 +2111,157 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // VFO data accessor tests
+    // Setter offset audit
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn vfo_raw_accessible() -> TestResult {
-        let mut image = make_settings_image()?;
-        // Write a known pattern at VFO entry 0.
-        write_slice(&mut image, VFO_DATA_OFFSET, &[0xDE, 0xAD, 0xBE, 0xEF])?;
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let settings = mi.settings();
-        let raw = settings.vfo_raw(0).ok_or("vfo_raw(0) returned None")?;
-        assert_eq!(raw.len(), VFO_ENTRY_SIZE);
-        assert_eq!(
-            raw.get(..4).ok_or("vfo_raw too short")?,
-            &[0xDE, 0xAD, 0xBE, 0xEF]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn vfo_raw_out_of_range() -> TestResult {
-        let image = make_settings_image()?;
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(mi.settings().vfo_raw(6).is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn vfo_frequency_valid() -> TestResult {
-        let mut image = make_settings_image()?;
-        // VFO entry 0 at offset 0x0020: 146.520 MHz.
-        let freq: u32 = 146_520_000;
-        let offset = VFO_DATA_OFFSET;
-        write_slice(&mut image, offset, &freq.to_le_bytes())?;
-        // Make the entry non-zero past the frequency.
-        set_byte(&mut image, offset + 8, 0x50)?; // step/shift byte
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let f = mi
-            .settings()
-            .vfo_frequency(0)
-            .ok_or("vfo_frequency(0) returned None")?;
-        assert_eq!(f.as_hz(), 146_520_000);
-        Ok(())
-    }
-
-    #[test]
-    fn vfo_frequency_empty_entry() -> TestResult {
-        let mut image = make_settings_image()?;
-        // Fill VFO entry 0 with 0xFF (empty).
-        fill_range(&mut image, VFO_DATA_OFFSET, VFO_ENTRY_SIZE, 0xFF)?;
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(mi.settings().vfo_frequency(0).is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn vfo_frequency_zeroed_entry() -> TestResult {
-        let image = make_settings_image()?; // All zeros.
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        // Frequency bytes are all zero -> returns None.
-        assert!(mi.settings().vfo_frequency(0).is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn vfo_mode_fm() -> TestResult {
-        let mut image = make_settings_image()?;
-        let offset = VFO_DATA_OFFSET;
-        // Non-empty entry with some frequency data.
-        write_slice(&mut image, offset, &146_520_000_u32.to_le_bytes())?;
-        // Byte 0x09: mode bits [6:4] = 0 (FM).
-        set_byte(&mut image, offset + 0x09, 0x00)?;
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let mode = mi
-            .settings()
-            .vfo_mode(0)
-            .ok_or("vfo_mode(0) returned None")?;
-        assert_eq!(mode, MemoryMode::Fm);
-        Ok(())
-    }
-
-    #[test]
-    fn vfo_mode_am() -> TestResult {
-        let mut image = make_settings_image()?;
-        let offset = VFO_DATA_OFFSET;
-        write_slice(&mut image, offset, &7_100_000_u32.to_le_bytes())?;
-        // Byte 0x09: mode bits [6:4] = 2 (AM in flash encoding).
-        set_byte(&mut image, offset + 0x09, 0x20)?;
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let mode = mi
-            .settings()
-            .vfo_mode(0)
-            .ok_or("vfo_mode(0) returned None")?;
-        assert_eq!(mode, MemoryMode::Am);
-        Ok(())
-    }
-
-    #[test]
-    fn vfo_mode_lsb() -> TestResult {
-        let mut image = make_settings_image()?;
-        let offset = VFO_DATA_OFFSET;
-        write_slice(&mut image, offset, &7_100_000_u32.to_le_bytes())?;
-        // Byte 0x09: mode bits [6:4] = 3 (LSB in flash encoding).
-        set_byte(&mut image, offset + 0x09, 0x30)?;
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let mode = mi
-            .settings()
-            .vfo_mode(0)
-            .ok_or("vfo_mode(0) returned None")?;
-        assert_eq!(mode, MemoryMode::Lsb);
-        Ok(())
-    }
-
-    #[test]
-    fn vfo_tx_offset() -> TestResult {
-        let mut image = make_settings_image()?;
-        let offset = VFO_DATA_OFFSET;
-        write_slice(&mut image, offset, &146_520_000_u32.to_le_bytes())?;
-        write_slice(&mut image, offset + 4, &600_000_u32.to_le_bytes())?;
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let tx_off = mi
-            .settings()
-            .vfo_tx_offset(0)
-            .ok_or("vfo_tx_offset(0) returned None")?;
-        assert_eq!(tx_off.as_hz(), 600_000);
-        Ok(())
-    }
-
-    #[test]
-    fn vfo_count_none_populated() -> TestResult {
-        let image = make_settings_image()?; // All zeros.
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().vfo_count(), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn vfo_count_with_entries() -> TestResult {
-        let mut image = make_settings_image()?;
-        // Populate VFO entries 0 and 2.
-        write_slice(&mut image, VFO_DATA_OFFSET, &146_520_000_u32.to_le_bytes())?;
-        write_slice(
-            &mut image,
-            VFO_DATA_OFFSET + 2 * VFO_ENTRY_SIZE,
-            &446_000_000_u32.to_le_bytes(),
-        )?;
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().vfo_count(), 2);
-        Ok(())
-    }
-
-    #[test]
-    fn vfo_second_entry_frequency() -> TestResult {
-        let mut image = make_settings_image()?;
-        let offset = VFO_DATA_OFFSET + VFO_ENTRY_SIZE; // Entry 1.
-        write_slice(&mut image, offset, &222_100_000_u32.to_le_bytes())?;
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let f = mi
-            .settings()
-            .vfo_frequency(1)
-            .ok_or("vfo_frequency(1) returned None")?;
-        assert_eq!(f.as_hz(), 222_100_000);
-        Ok(())
-    }
 
     /// A setter invocation for the offset-audit table.
     type ApplySetter = fn(&mut SettingsWriter<'_>);
 
     /// Every settings setter, paired with the flash offset it must
-    /// write, transcribed INDEPENDENTLY from the RE offset map (hex
-    /// literals, not the `*_OFFSET` constants) — a transposed digit
-    /// in a constant would corrupt an unrelated radio setting on MCP
-    /// write-back, and the offset audit below is the test that
-    /// catches it.
-    static SETTER_OFFSET_TABLE: &[(&str, usize, ApplySetter)] = &[
-        ("set_backlight", 0x1069, |s| s.set_backlight(1)),
-        ("set_backlight_control", 0x1069, |s| {
-            s.set_backlight_control(1);
+    /// write, transcribed INDEPENDENTLY from the MCP-D75 registry map
+    /// (hex literals, not the `*_OFFSET` constants) — a transposed
+    /// digit in a constant would corrupt an unrelated radio setting on
+    /// MCP write-back, and the offset audit below is the test that
+    /// catches it. The third column carries the owned bit mask for
+    /// setters that share a byte with other registry fields.
+    static SETTER_OFFSET_TABLE: &[(&str, usize, Option<u8>, ApplySetter)] = &[
+        ("set_beat_shift", 0x1000, None, |s| {
+            s.set_beat_shift(BeatShift::Type2);
         }),
-        ("set_backlight_timer", 0x106A, |s| s.set_backlight_timer(1)),
-        ("set_beep_volume", 0x1072, |s| s.set_beep_volume(1)),
-        ("set_auto_power_off", 0x10D0, |s| {
-            s.set_auto_power_off(AutoPowerOff::Min30);
+        ("set_tx_inhibit", 0x1001, None, |s| s.set_tx_inhibit(true)),
+        ("set_timeout_timer", 0x1003, None, |s| {
+            s.set_timeout_timer(1);
         }),
-        ("set_battery_saver", 0x10C0, |s| s.set_battery_saver(true)),
-        ("set_key_lock_type", 0x1061, |s| {
-            s.set_key_lock_type(KeyLockType::KeyAndPtt);
+        ("set_mic_sensitivity", 0x1006, None, |s| {
+            s.set_mic_sensitivity(1);
         }),
-        ("set_language", 0x1006, |s| {
-            s.set_language(Language::Japanese);
-        }),
-        ("set_speed_distance_unit", 0x1077, |s| {
-            s.set_speed_distance_unit(SpeedDistanceUnit::KilometersPerHour);
-        }),
-        ("set_altitude_rain_unit", 0x1083, |s| {
-            s.set_altitude_rain_unit(AltitudeRainUnit::MetersMm);
-        }),
-        ("set_temperature_unit", 0x1084, |s| {
-            s.set_temperature_unit(TemperatureUnit::Celsius);
-        }),
-        ("set_vox_delay", 0x101D, |s| s.set_vox_delay(1)),
-        ("set_vox_tx_on_busy", 0x101E, |s| s.set_vox_tx_on_busy(true)),
-        ("set_squelch_a", 0x100D, |s| s.set_squelch_a(1)),
-        ("set_squelch_b", 0x100E, |s| s.set_squelch_b(1)),
-        ("set_fm_narrow", 0x100F, |s| s.set_fm_narrow(1)),
-        ("set_auto_filter", 0x100C, |s| s.set_auto_filter(1)),
-        ("set_scan_resume", 0x1007, |s| s.set_scan_resume(1)),
-        ("set_digital_scan_resume", 0x1008, |s| {
+        ("set_ssb_high_cut", 0x1008, None, |s| s.set_ssb_high_cut(1)),
+        ("set_cw_width", 0x1009, None, |s| s.set_cw_width(1)),
+        ("set_am_high_cut", 0x100A, None, |s| s.set_am_high_cut(1)),
+        ("set_scan_resume", 0x100C, None, |s| s.set_scan_resume(1)),
+        ("set_digital_scan_resume", 0x100D, None, |s| {
             s.set_digital_scan_resume(1);
         }),
-        ("set_timeout_timer", 0x1018, |s| s.set_timeout_timer(1)),
-        ("set_tx_inhibit", 0x1019, |s| s.set_tx_inhibit(true)),
-        ("set_beat_shift", 0x101A, |s| s.set_beat_shift(true)),
-        ("set_cw_break_in", 0x101F, |s| s.set_cw_break_in(true)),
-        ("set_cw_pitch", 0x1021, |s| s.set_cw_pitch(1)),
-        ("set_dtmf_speed", 0x1024, |s| s.set_dtmf_speed(1)),
-        ("set_mic_sensitivity", 0x1040, |s| s.set_mic_sensitivity(1)),
-        ("set_pf_key1", 0x1041, |s| s.set_pf_key1(1)),
-        ("set_pf_key2", 0x1042, |s| s.set_pf_key2(1)),
-        ("set_aprs_lock", 0x1097, |s| s.set_aprs_lock(true)),
-        ("set_dual_display_size", 0x1066, |s| {
-            s.set_dual_display_size(1);
-        }),
-        ("set_display_area", 0x1067, |s| s.set_display_area(1)),
-        ("set_info_line", 0x1068, |s| s.set_info_line(1)),
-        ("set_volume_lock", 0x1076, |s| s.set_volume_lock(true)),
-        ("set_bt_auto_connect", 0x1079, |s| {
-            s.set_bt_auto_connect(true);
-        }),
-        ("set_pc_output_mode", 0x1085, |s| s.set_pc_output_mode(1)),
-        ("set_aprs_usb_mode", 0x1086, |s| s.set_aprs_usb_mode(1)),
-        ("set_power_on_message_flag", 0x1087, |s| {
-            s.set_power_on_message_flag(true);
-        }),
-        ("set_dual_band_mcp", 0x1096, |s| s.set_dual_band_mcp(true)),
-        ("set_key_beep", 0x1071, |s| s.set_key_beep(true)),
-        ("set_vox_enabled", 0x101B, |s| s.set_vox_enabled(true)),
-        ("set_vox_gain", 0x101C, |s| s.set_vox_gain(1)),
-        ("set_lock", 0x1060, |s| s.set_lock(true)),
-        ("set_dual_band", 0x0396, |s| s.set_dual_band(true)),
-        ("set_attenuator_a", 0x035C, |s| s.set_attenuator_a(true)),
-        ("set_power_level_a", 0x0359, |s| {
-            s.set_power_level_a(PowerLevel::ExtraLow);
-        }),
-        ("set_bluetooth", 0x1078, |s| s.set_bluetooth(true)),
-        ("set_ssb_high_cut", 0x1011, |s| s.set_ssb_high_cut(1)),
-        ("set_cw_high_cut", 0x1012, |s| s.set_cw_high_cut(1)),
-        ("set_am_high_cut", 0x1013, |s| s.set_am_high_cut(1)),
-        ("set_scan_restart_time", 0x1009, |s| {
+        ("set_scan_restart_time", 0x100E, None, |s| {
             s.set_scan_restart_time(1);
         }),
-        ("set_scan_restart_carrier", 0x100A, |s| {
+        ("set_scan_restart_carrier", 0x100F, None, |s| {
             s.set_scan_restart_carrier(1);
         }),
-        ("set_cw_delay_time", 0x1020, |s| s.set_cw_delay_time(1)),
-        ("set_dtmf_pause_time", 0x1026, |s| s.set_dtmf_pause_time(1)),
-        ("set_dtmf_tx_hold", 0x1027, |s| s.set_dtmf_tx_hold(true)),
-        ("set_repeater_auto_offset", 0x1030, |s| {
+        ("set_repeater_auto_offset", 0x1018, None, |s| {
             s.set_repeater_auto_offset(true);
         }),
-        ("set_repeater_call_key", 0x1031, |s| {
+        ("set_repeater_call_key", 0x1019, None, |s| {
             s.set_repeater_call_key(1);
         }),
-        ("set_lock_key_a", 0x1062, |s| s.set_lock_key_a(true)),
-        ("set_lock_key_b", 0x1063, |s| s.set_lock_key_b(true)),
-        ("set_lock_key_c", 0x1064, |s| s.set_lock_key_c(true)),
-        ("set_lock_key_ptt", 0x1065, |s| s.set_lock_key_ptt(true)),
-        ("set_display_hold_time", 0x106B, |s| {
-            s.set_display_hold_time(1);
+        ("set_vox_enabled", 0x101B, None, |s| s.set_vox_enabled(true)),
+        ("set_vox_gain", 0x101C, None, |s| s.set_vox_gain(1)),
+        ("set_vox_delay", 0x101D, None, |s| s.set_vox_delay(1)),
+        ("set_vox_tx_on_busy", 0x101E, None, |s| {
+            s.set_vox_tx_on_busy(true);
         }),
-        ("set_display_method", 0x106C, |s| s.set_display_method(1)),
-        ("set_power_on_display", 0x106D, |s| {
-            s.set_power_on_display(1);
+        ("set_dtmf_speed", 0x101F, None, |s| s.set_dtmf_speed(1)),
+        ("set_dtmf_pause_time", 0x1020, None, |s| {
+            s.set_dtmf_pause_time(1);
         }),
-        ("set_emr_volume_level", 0x106E, |s| {
-            s.set_emr_volume_level(1);
+        ("set_dtmf_tx_hold", 0x1021, None, |s| {
+            s.set_dtmf_tx_hold(true);
         }),
-        ("set_auto_mute_return_time", 0x106F, |s| {
-            s.set_auto_mute_return_time(1);
+        ("set_cw_pitch", 0x1024, None, |s| s.set_cw_pitch(1)),
+        ("set_auto_mute_return_time", 0x1041, None, |s| {
+            s.set_auto_mute_return_time(2);
         }),
-        ("set_announce", 0x1070, |s| s.set_announce(true)),
-        ("set_voice_language", 0x1073, |s| s.set_voice_language(1)),
-        ("set_voice_volume", 0x1074, |s| s.set_voice_volume(1)),
-        ("set_voice_speed", 0x1075, |s| s.set_voice_speed(1)),
-        ("set_usb_audio_output", 0x1094, |s| {
-            s.set_usb_audio_output(true);
+        ("set_backlight_control", 0x1060, None, |s| {
+            s.set_backlight_control(1);
         }),
-        ("set_internet_link", 0x1095, |s| s.set_internet_link(true)),
-        ("set_gps_bt_interface", 0x1080, |s| {
-            s.set_gps_bt_interface(1);
+        ("set_backlight_timer", 0x1061, None, |s| {
+            s.set_backlight_timer(10);
         }),
-        ("set_key_lock_type_raw", 0x1061, |s| {
-            s.set_key_lock_type_raw(1);
+        ("set_key_beep", 0x1071, None, |s| s.set_key_beep(true)),
+        ("set_beep_volume", 0x1072, None, |s| s.set_beep_volume(1)),
+        ("set_announce", 0x1073, None, |s| s.set_announce(1)),
+        ("set_voice_volume", 0x1074, None, |s| s.set_voice_volume(1)),
+        ("set_battery_saver", 0x1076, None, |s| {
+            s.set_battery_saver(1);
         }),
-        ("set_auto_power_off_raw", 0x10D0, |s| {
+        ("set_auto_power_off", 0x1077, None, |s| {
+            s.set_auto_power_off(AutoPowerOff::Min15);
+        }),
+        ("set_auto_power_off_raw", 0x1077, None, |s| {
             s.set_auto_power_off_raw(1);
         }),
-        ("set_speed_distance_unit_raw", 0x1077, |s| {
+        ("set_bluetooth", 0x1078, None, |s| s.set_bluetooth(true)),
+        ("set_bt_auto_connect", 0x1079, None, |s| {
+            s.set_bt_auto_connect(true);
+        }),
+        ("set_pf_key1", 0x107A, None, |s| {
+            let _ = s.set_pf_key1(1);
+        }),
+        ("set_pf_key2", 0x107B, None, |s| {
+            let _ = s.set_pf_key2(1);
+        }),
+        ("set_key_lock", 0x1084, Some(0x01), |s| s.set_key_lock(true)),
+        ("set_frequency_lock", 0x1084, Some(0x02), |s| {
+            s.set_frequency_lock(true);
+        }),
+        ("set_volume_lock", 0x1087, None, |s| s.set_volume_lock(true)),
+        ("set_speed_distance_unit", 0x1088, None, |s| {
+            s.set_speed_distance_unit(SpeedDistanceUnit::KilometersPerHour);
+        }),
+        ("set_speed_distance_unit_raw", 0x1088, None, |s| {
             s.set_speed_distance_unit_raw(1);
         }),
-        ("set_altitude_rain_unit_raw", 0x1083, |s| {
+        ("set_altitude_rain_unit", 0x1089, None, |s| {
+            s.set_altitude_rain_unit(AltitudeRainUnit::MetersMm);
+        }),
+        ("set_altitude_rain_unit_raw", 0x1089, None, |s| {
             s.set_altitude_rain_unit_raw(1);
         }),
-        ("set_temperature_unit_raw", 0x1084, |s| {
+        ("set_temperature_unit", 0x108A, None, |s| {
+            s.set_temperature_unit(TemperatureUnit::Celsius);
+        }),
+        ("set_temperature_unit_raw", 0x108A, None, |s| {
             s.set_temperature_unit_raw(1);
         }),
+        ("set_gps_bt_interface", 0x108E, None, |s| {
+            s.set_gps_bt_interface(1);
+        }),
+        ("set_aprs_usb_mode", 0x108F, None, |s| {
+            s.set_aprs_usb_mode(1);
+        }),
+        ("set_language", 0x1092, None, |s| {
+            s.set_language(Language::Japanese);
+        }),
+        ("set_voice_speed", 0x1097, None, |s| s.set_voice_speed(1)),
+        ("set_aprs_lock_frequency", 0x120A, Some(0x01), |s| {
+            s.set_aprs_lock_frequency(true);
+        }),
+        ("set_aprs_lock_ptt", 0x120A, Some(0x02), |s| {
+            s.set_aprs_lock_ptt(true);
+        }),
+        ("set_aprs_lock_key", 0x120A, Some(0x04), |s| {
+            s.set_aprs_lock_key(true);
+        }),
+        ("set_emr_volume_level", 0x1A03, None, |s| {
+            s.set_emr_volume_level(2);
+        }),
+        ("set_power_level_a", 0x0359, None, |s| {
+            s.set_power_level_a(PowerLevel::ExtraLow);
+        }),
+        ("set_attenuator_a", 0x035C, None, |s| {
+            s.set_attenuator_a(true);
+        }),
+        ("set_dual_band", 0x0396, None, |s| s.set_dual_band(true)),
     ];
 
     /// Applies every entry of [`SETTER_OFFSET_TABLE`] to a fresh image
     /// and asserts exactly one byte changed, at the documented offset
-    /// (no neighbor stomping, no wrong-offset writes).
+    /// (no neighbor stomping, no wrong-offset writes). For masked bit
+    /// setters, additionally asserts the change stayed within the
+    /// owned bits.
     #[test]
     fn every_setter_writes_exactly_one_byte_at_its_documented_offset() -> TestResult {
-        for (name, offset, apply) in SETTER_OFFSET_TABLE {
+        for (name, offset, mask, apply) in SETTER_OFFSET_TABLE {
             let image = make_settings_image()?;
             let mut mi = crate::memory::MemoryImage::from_raw(image)?;
             let before = mi.as_raw().to_vec();
@@ -2820,6 +2279,384 @@ mod tests {
                 vec![*offset],
                 "{name}: expected exactly one byte changed at 0x{offset:04X}, got {diffs:04X?}"
             );
+            if let Some(mask) = mask {
+                let before_byte = get_byte(&before, *offset)?;
+                let after_byte = get_byte(after, *offset)?;
+                assert_eq!(
+                    before_byte & !mask,
+                    after_byte & !mask,
+                    "{name}: bits outside owned mask 0x{mask:02X} changed at 0x{offset:04X}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-layer registry consistency
+    // -----------------------------------------------------------------------
+
+    /// Registry codec shape expected for one settings-layer binding.
+    /// Byte domains are the clamp bounds the setters enforce, so a
+    /// registry regeneration that changes a domain fails this test
+    /// until the accessor is re-audited.
+    enum ExpectedCodec {
+        /// `FieldCodec::Bool` (one byte holding 0/1).
+        Bool,
+        /// `FieldCodec::Byte` with this inclusive domain.
+        Byte {
+            /// Smallest legal raw value (setter clamp floor).
+            min: u8,
+            /// Largest legal raw value (setter clamp ceiling).
+            max: u8,
+        },
+        /// `FieldCodec::BitBool` with exactly this owned mask.
+        BitBool {
+            /// The single bit the accessor reads and writes.
+            mask: u8,
+        },
+        /// `FieldCodec::FixedString` of this length.
+        FixedString {
+            /// Reserved byte count.
+            len: usize,
+        },
+    }
+
+    /// Every surviving offset constant, bound to the registry field it
+    /// must address. This is the drift guard: `menu_fields.rs` is
+    /// generated from the official MCP-D75 serializers, so if a
+    /// regeneration moves or re-domains a field, this test points at
+    /// the exact accessor that needs re-auditing.
+    static REGISTRY_BINDINGS: &[(usize, &str, ExpectedCodec)] = &[
+        (
+            BEAT_SHIFT_OFFSET,
+            "radio.BeatShift",
+            ExpectedCodec::Byte { min: 0, max: 7 },
+        ),
+        (TX_INHIBIT_OFFSET, "radio.TxInhibit", ExpectedCodec::Bool),
+        (
+            TIMEOUT_TIMER_OFFSET,
+            "radio.TimeOutTimer",
+            ExpectedCodec::Byte { min: 0, max: 10 },
+        ),
+        (
+            MIC_SENSITIVITY_OFFSET,
+            "radio.MicSensitivity",
+            ExpectedCodec::Byte { min: 0, max: 2 },
+        ),
+        (
+            SSB_HIGH_CUT_OFFSET,
+            "radio.SsbHighCut",
+            ExpectedCodec::Byte { min: 0, max: 4 },
+        ),
+        (
+            CW_WIDTH_OFFSET,
+            "radio.CwWidth",
+            ExpectedCodec::Byte { min: 0, max: 4 },
+        ),
+        (
+            AM_HIGH_CUT_OFFSET,
+            "radio.AmHighCut",
+            ExpectedCodec::Byte { min: 0, max: 3 },
+        ),
+        (
+            SCAN_RESUME_OFFSET,
+            "radio.ScanResumeAnalog",
+            ExpectedCodec::Byte { min: 0, max: 2 },
+        ),
+        (
+            DIGITAL_SCAN_RESUME_OFFSET,
+            "radio.ScanResumeDigital",
+            ExpectedCodec::Byte { min: 0, max: 2 },
+        ),
+        (
+            SCAN_RESTART_TIME_OFFSET,
+            "radio.TimeRestart",
+            ExpectedCodec::Byte { min: 1, max: 10 },
+        ),
+        (
+            SCAN_RESTART_CARRIER_OFFSET,
+            "radio.CarrierRestart",
+            ExpectedCodec::Byte { min: 1, max: 10 },
+        ),
+        (
+            REPEATER_AUTO_OFFSET_OFFSET,
+            "radio.AutoOffset",
+            ExpectedCodec::Bool,
+        ),
+        (
+            REPEATER_CALL_KEY_OFFSET,
+            "radio.CallKey",
+            ExpectedCodec::Byte { min: 0, max: 1 },
+        ),
+        (VOX_ENABLED_OFFSET, "radio.Vox", ExpectedCodec::Bool),
+        (
+            VOX_GAIN_OFFSET,
+            "radio.VoxGain",
+            ExpectedCodec::Byte { min: 0, max: 9 },
+        ),
+        (
+            VOX_DELAY_OFFSET,
+            "radio.VoxDelay",
+            ExpectedCodec::Byte { min: 0, max: 6 },
+        ),
+        (
+            VOX_TX_ON_BUSY_OFFSET,
+            "radio.VoxTxOnBusy",
+            ExpectedCodec::Byte { min: 0, max: 1 },
+        ),
+        (
+            DTMF_SPEED_OFFSET,
+            "radio.DtmfSpeed",
+            ExpectedCodec::Byte { min: 0, max: 2 },
+        ),
+        (
+            DTMF_PAUSE_TIME_OFFSET,
+            "radio.DtmfPauseTime",
+            ExpectedCodec::Byte { min: 0, max: 6 },
+        ),
+        (DTMF_TX_HOLD_OFFSET, "radio.DtmfTxHold", ExpectedCodec::Bool),
+        (
+            CW_PITCH_OFFSET,
+            "radio.CwPitchFreq",
+            ExpectedCodec::Byte { min: 0, max: 6 },
+        ),
+        (
+            AUTO_MUTE_RETURN_TIME_OFFSET,
+            "radio.AutoMuteRetTime",
+            ExpectedCodec::Byte { min: 1, max: 10 },
+        ),
+        (
+            BACKLIGHT_CONTROL_OFFSET,
+            "radio.BacklightControl",
+            ExpectedCodec::Byte { min: 0, max: 3 },
+        ),
+        (
+            BACKLIGHT_TIMER_OFFSET,
+            "radio.BacklightTimer",
+            ExpectedCodec::Byte { min: 3, max: 60 },
+        ),
+        (KEY_BEEP_OFFSET, "radio.Beep", ExpectedCodec::Bool),
+        (
+            BEEP_VOLUME_OFFSET,
+            "radio.BeepVolume",
+            ExpectedCodec::Byte { min: 0, max: 7 },
+        ),
+        (
+            ANNOUNCE_OFFSET,
+            "radio.VoiceAnnounce",
+            ExpectedCodec::Byte { min: 0, max: 3 },
+        ),
+        (
+            VOICE_VOLUME_OFFSET,
+            "radio.VoiceAnnounceVolume",
+            ExpectedCodec::Byte { min: 0, max: 7 },
+        ),
+        (
+            BATTERY_SAVER_OFFSET,
+            "radio.BatterySaver",
+            ExpectedCodec::Byte { min: 0, max: 9 },
+        ),
+        (
+            AUTO_POWER_OFF_OFFSET,
+            "radio.AutoPowerOff",
+            ExpectedCodec::Byte { min: 0, max: 3 },
+        ),
+        (
+            BLUETOOTH_OFFSET,
+            "radio.BluetoothOnOff",
+            ExpectedCodec::Bool,
+        ),
+        (
+            BT_AUTO_CONNECT_OFFSET,
+            "radio.BluetoothAutoConnect",
+            ExpectedCodec::Bool,
+        ),
+        (
+            PF_KEY1_OFFSET,
+            "radio.Pf1PfKey",
+            ExpectedCodec::Byte { min: 0, max: 30 },
+        ),
+        (
+            PF_KEY2_OFFSET,
+            "radio.Pf2PfKey",
+            ExpectedCodec::Byte { min: 0, max: 30 },
+        ),
+        (
+            KEY_LOCK_OFFSET,
+            "radio.KeyLockTypeKeyLock",
+            ExpectedCodec::BitBool { mask: 0x01 },
+        ),
+        (
+            KEY_LOCK_OFFSET,
+            "radio.KeyLockTypeFrequencyLock",
+            ExpectedCodec::BitBool { mask: 0x02 },
+        ),
+        (
+            VOLUME_LOCK_OFFSET,
+            "radio.VolumeLockOnOff",
+            ExpectedCodec::Bool,
+        ),
+        (
+            SPEED_DISTANCE_UNIT_OFFSET,
+            "radio.SpeedDistance",
+            ExpectedCodec::Byte { min: 0, max: 2 },
+        ),
+        (
+            ALTITUDE_RAIN_UNIT_OFFSET,
+            "radio.AltitudeRain",
+            ExpectedCodec::Byte { min: 0, max: 1 },
+        ),
+        (
+            TEMPERATURE_UNIT_OFFSET,
+            "radio.Temperature",
+            ExpectedCodec::Byte { min: 0, max: 1 },
+        ),
+        (
+            GPS_BT_INTERFACE_OFFSET,
+            "radio.PcOutputInterfaceGps",
+            ExpectedCodec::Byte { min: 0, max: 1 },
+        ),
+        (
+            APRS_USB_MODE_OFFSET,
+            "radio.PcOutputInterfaceAprs",
+            ExpectedCodec::Byte { min: 0, max: 1 },
+        ),
+        (
+            LANGUAGE_OFFSET,
+            "radio.Language",
+            ExpectedCodec::Byte { min: 0, max: 1 },
+        ),
+        (
+            VOICE_SPEED_OFFSET,
+            "radio.VoiceGuidanceSpeed",
+            ExpectedCodec::Byte { min: 0, max: 3 },
+        ),
+        (
+            POWER_ON_MESSAGE_OFFSET,
+            "radio.PowerOnMessage",
+            ExpectedCodec::FixedString {
+                len: POWER_ON_MESSAGE_SIZE,
+            },
+        ),
+        (
+            APRS_LOCK_OFFSET,
+            "aprs.Frequency",
+            ExpectedCodec::BitBool { mask: 0x01 },
+        ),
+        (
+            APRS_LOCK_OFFSET,
+            "aprs.Ptt",
+            ExpectedCodec::BitBool { mask: 0x02 },
+        ),
+        (
+            APRS_LOCK_OFFSET,
+            "aprs.AprsKey",
+            ExpectedCodec::BitBool { mask: 0x04 },
+        ),
+        (
+            EMR_VOLUME_LEVEL_OFFSET,
+            "dv.EmrVolumeLevelTxRx",
+            ExpectedCodec::Byte { min: 1, max: 50 },
+        ),
+    ];
+
+    #[test]
+    fn every_offset_constant_binds_the_intended_registry_field() -> TestResult {
+        for (offset, name, expected) in REGISTRY_BINDINGS {
+            let field =
+                menu_field(name).ok_or_else(|| format!("registry field {name} is missing"))?;
+            assert_eq!(
+                field.descriptor.offset, *offset,
+                "{name}: registry offset does not match the settings constant"
+            );
+            match (expected, field.descriptor.codec) {
+                (ExpectedCodec::Bool, FieldCodec::Bool) => {}
+                (
+                    ExpectedCodec::Byte { min, max },
+                    FieldCodec::Byte {
+                        min: reg_min,
+                        max: reg_max,
+                    },
+                ) => {
+                    assert_eq!(
+                        (*min, *max),
+                        (reg_min, reg_max),
+                        "{name}: accessor clamp bounds diverge from the registry domain"
+                    );
+                }
+                (ExpectedCodec::BitBool { mask }, FieldCodec::BitBool { mask: reg_mask }) => {
+                    assert_eq!(
+                        *mask, reg_mask,
+                        "{name}: accessor bit mask diverges from the registry mask"
+                    );
+                }
+                (
+                    ExpectedCodec::FixedString { len },
+                    FieldCodec::FixedString { len: reg_len, .. },
+                ) => {
+                    assert_eq!(
+                        *len, reg_len,
+                        "{name}: accessor string length diverges from the registry"
+                    );
+                }
+                (_, other) => {
+                    return Err(format!("{name}: unexpected registry codec {other:?}").into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Byte length occupied by a registry codec, for span checks.
+    fn codec_len(codec: FieldCodec) -> usize {
+        match codec {
+            FieldCodec::Byte { .. }
+            | FieldCodec::Bool
+            | FieldCodec::BitBool { .. }
+            | FieldCodec::BitField { .. } => 1,
+            FieldCodec::FixedString { len, .. } | FieldCodec::Bytes { len } => len,
+            FieldCodec::Unsigned { width, .. } | FieldCodec::Signed { width, .. } => {
+                usize::from(width)
+            }
+        }
+    }
+
+    /// The three hardware-verified band-state cells sit below 0x1000
+    /// where the MCP-D75 registry has no coverage. If a registry
+    /// regeneration ever claims those offsets, a human must re-audit
+    /// the accessors before trusting either layer.
+    #[test]
+    fn band_state_cells_stay_outside_the_registry() {
+        for offset in [POWER_LEVEL_A_OFFSET, ATTENUATOR_A_OFFSET, DUAL_BAND_OFFSET] {
+            for field in MCP_D75_MENU_FIELDS {
+                let start = field.descriptor.offset;
+                let len = codec_len(field.descriptor.codec);
+                assert!(
+                    offset < start || offset >= start + len,
+                    "hardware-verified band-state cell 0x{offset:04X} collides with registry \
+                     field {} — re-audit the accessor before trusting either layer",
+                    field.descriptor.name
+                );
+            }
+        }
+    }
+
+    /// The PF-key setters hand-code the registry's gapped domain; pin
+    /// the gap set to the generated option list so a registry change
+    /// cannot silently outdate the validator.
+    #[test]
+    fn pf_key_validation_matches_the_registry_options() -> TestResult {
+        for name in ["radio.Pf1PfKey", "radio.Pf2PfKey"] {
+            let field = menu_field(name).ok_or_else(|| format!("{name} is missing"))?;
+            for raw in 0..=30_u8 {
+                let in_registry = field.option(u64::from(raw)).is_some();
+                assert_eq!(
+                    pf_key_valid(raw),
+                    in_registry,
+                    "{name}: validator and registry disagree about raw value {raw}"
+                );
+            }
         }
         Ok(())
     }

@@ -1,4 +1,9 @@
 //! System-level radio methods: battery level, beep, lock, dual-band, frequency step, bluetooth, attenuator, auto-info.
+//!
+//! The `set_*_via_mcp` methods write registry-verified MCP cells for
+//! settings whose CAT write is rejected or stubbed (beep, beep volume,
+//! VOX, Bluetooth). The key lock has no MCP path — its state is
+//! runtime-only and is controlled via CAT (`set_lock`/`get_lock`).
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
@@ -115,8 +120,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// On the TH-D75, the LC wire value is inverted: `LC 0` means locked,
     /// `LC 1` means unlocked. This method inverts the response so that
-    /// `true` means locked (logical meaning). The MCP offset for the lock
-    /// setting is `0x1060`.
+    /// `true` means locked (logical meaning). CAT is the only supported
+    /// path for the lock state — it is runtime state with no verified MCP
+    /// cell (the once-claimed `0x1060` is `radio.BacklightControl` in the
+    /// MCP-D75 registry).
     ///
     /// # Errors
     ///
@@ -678,41 +685,11 @@ impl<T: Transport> Radio<T> {
         .await
     }
 
-    /// Set lock on/off via MCP memory write.
-    ///
-    /// Writes directly to the verified MCP offset (`0x1060`). This
-    /// provides an alternative to CAT for modes where CAT writes are
-    /// rejected.
-    ///
-    /// # Connection lifetime
-    ///
-    /// This enters MCP programming mode. The USB connection drops after
-    /// exit. The `Radio` instance should be dropped and a fresh connection
-    /// established for subsequent CAT commands.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if entering programming mode, reading the page,
-    /// writing the page, or exiting programming mode fails.
-    pub async fn set_lock_via_mcp(&mut self, locked: bool) -> Result<(), Error> {
-        const OFFSET: usize = 0x1060;
-        // 0x1060 / 256 = 0x10 = 16, fits in u16.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "OFFSET (0x1060) / 256 = 0x10 is the constant page index in the MCP memory \
-                      map. The division's compile-time result fits trivially in u16; truncation \
-                      can only occur if MCP_SIZE exceeds u16::MAX pages (~16 MB), far beyond the \
-                      D75's 512 KB image."
-        )]
-        const PAGE: u16 = (OFFSET / 256) as u16;
-        const BYTE_INDEX: usize = OFFSET % 256;
-
-        tracing::info!(locked, offset = OFFSET, "setting lock via MCP");
-        self.modify_memory_page(PAGE, |data| {
-            data[BYTE_INDEX] = u8::from(locked);
-        })
-        .await
-    }
+    // NOTE: there is deliberately no `set_lock_via_mcp`. The legacy MCP
+    // lock offset (0x1060) is `radio.BacklightControl` in the MCP-D75
+    // registry — writing it silently rewrote the backlight mode. The
+    // key-lock state is runtime state; `set_lock`/`get_lock` (CAT LC/DL)
+    // are the supported path.
 
     /// Set Bluetooth on/off via MCP memory write.
     ///

@@ -282,7 +282,7 @@ fn hex_dump_region() {
                 .or(Some(&s))
                 .and_then(|h| usize::from_str_radix(h, 16).ok())
         })
-        .unwrap_or(0x11C0); // default: power-on message
+        .unwrap_or(0x10C0); // default: power-on message (radio.PowerOnMessage)
     let len: usize = std::env::var("DUMP_LEN")
         .ok()
         .and_then(|s| s.parse().ok())

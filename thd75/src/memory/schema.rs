@@ -239,7 +239,8 @@ pub enum FieldValue<'a> {
 }
 
 impl FieldValue<'_> {
-    const fn kind_name(self) -> &'static str {
+    /// Short human-readable name for this value variant.
+    pub(crate) const fn kind_name(self) -> &'static str {
         match self {
             Self::Unsigned(_) => "unsigned",
             Self::Signed(_) => "signed",
@@ -353,11 +354,26 @@ pub enum SchemaError {
         /// Absolute byte offset.
         offset: usize,
     },
+    /// A patch targets the factory-calibration region, which must never be
+    /// overwritten.
+    WriteProtected {
+        /// Field name.
+        field: &'static str,
+        /// Protected MCP page.
+        page: u16,
+    },
     /// Integer width is zero or greater than eight bytes.
     InvalidIntegerWidth {
         /// Field name.
         field: &'static str,
         /// Invalid width.
+        width: u8,
+    },
+    /// An integer domain does not fit within the codec's encoded width.
+    DomainExceedsWidth {
+        /// Field name.
+        field: &'static str,
+        /// Encoded width in bytes.
         width: u8,
     },
     /// A bit-field mask and shift do not describe usable bits.
@@ -371,6 +387,10 @@ pub enum SchemaError {
     },
     /// Two requested fields assign different values to the same owned bit.
     PatchConflict {
+        /// Field whose requested bits conflict with an earlier assignment.
+        field: &'static str,
+        /// Field that first claimed bits at the conflicting byte.
+        existing: &'static str,
         /// Absolute byte offset containing the conflict.
         offset: usize,
         /// Conflicting bits.
@@ -432,16 +452,32 @@ impl fmt::Display for SchemaError {
                     "field {field} offset 0x{offset:X} exceeds MCP addressing"
                 )
             }
+            Self::WriteProtected { field, page } => write!(
+                f,
+                "field {field} touches write-protected factory calibration page 0x{page:04X}"
+            ),
             Self::InvalidIntegerWidth { field, width } => {
                 write!(f, "field {field} has invalid integer width {width}")
+            }
+            Self::DomainExceedsWidth { field, width } => {
+                write!(
+                    f,
+                    "field {field} integer domain does not fit in {width} byte(s)"
+                )
             }
             Self::InvalidBitField { field, mask, shift } => write!(
                 f,
                 "field {field} has invalid bit field mask 0x{mask:02X}, shift {shift}"
             ),
-            Self::PatchConflict { offset, mask } => write!(
+            Self::PatchConflict {
+                field,
+                existing,
+                offset,
+                mask,
+            } => write!(
                 f,
-                "conflicting patch at MCP offset 0x{offset:X}, mask 0x{mask:02X}"
+                "field {field} conflicts with bits planned by {existing} at MCP offset \
+                 0x{offset:X}, mask 0x{mask:02X}"
             ),
         }
     }
@@ -547,33 +583,54 @@ impl PatchSet {
 
     /// Apply every patch to a complete raw MCP image.
     ///
+    /// The whole set is validated against the image bounds before any byte
+    /// is modified, so a failed application never leaves the image partially
+    /// patched.
+    ///
     /// # Errors
     ///
     /// Returns [`SchemaError::OutOfBounds`] if the image does not contain a
-    /// touched byte.
+    /// touched byte; the image is unmodified in that case.
     pub fn apply_to_image(&self, image: &mut [u8]) -> Result<(), SchemaError> {
         for page_patch in &self.pages {
             let page_start = usize::from(page_patch.page) * programming::PAGE_SIZE;
             for patch in &page_patch.bytes {
                 let absolute = page_start + usize::from(patch.offset);
-                let image_len = image.len();
-                let byte = image.get_mut(absolute).ok_or(SchemaError::OutOfBounds {
-                    field: "patch set",
-                    offset: absolute,
-                    len: 1,
-                    image_len,
-                })?;
-                *byte = (*byte & !patch.mask) | (patch.value & patch.mask);
+                if absolute >= image.len() {
+                    return Err(SchemaError::OutOfBounds {
+                        field: "patch set",
+                        offset: absolute,
+                        len: 1,
+                        image_len: image.len(),
+                    });
+                }
+            }
+        }
+        for page_patch in &self.pages {
+            let page_start = usize::from(page_patch.page) * programming::PAGE_SIZE;
+            for patch in &page_patch.bytes {
+                let absolute = page_start + usize::from(patch.offset);
+                if let Some(byte) = image.get_mut(absolute) {
+                    *byte = (*byte & !patch.mask) | (patch.value & patch.mask);
+                }
             }
         }
         Ok(())
     }
 }
 
+/// One planned byte: claimed bits, their values, and the claiming field.
+#[derive(Debug)]
+struct ByteClaim {
+    mask: u8,
+    value: u8,
+    owner: &'static str,
+}
+
 /// Builds a [`PatchSet`] without requiring a cached memory image.
 #[derive(Debug, Default)]
 pub struct PatchPlanner {
-    bytes: BTreeMap<usize, (u8, u8)>,
+    bytes: BTreeMap<usize, ByteClaim>,
 }
 
 impl PatchPlanner {
@@ -585,15 +642,26 @@ impl PatchPlanner {
         }
     }
 
-    /// Add or replace a requested menu field value.
+    /// Add a requested menu field value.
     ///
     /// Non-overlapping bits at the same byte are coalesced.  Overlapping bits
-    /// may be repeated only when both assignments request the same value.
+    /// may be repeated only when both assignments request the same value;
+    /// assigning a different value to already-claimed bits is a
+    /// [`SchemaError::PatchConflict`].  A later assignment therefore never
+    /// silently replaces an earlier one.
+    ///
+    /// Only the descriptor's storage codec is validated here.  Finite enum
+    /// and UI-choice domains live in the generated [`MenuField`] metadata and
+    /// are enforced by [`MenuField::plan_value`].
     ///
     /// # Errors
     ///
-    /// Returns an error for a type mismatch, out-of-domain value, malformed
-    /// descriptor, oversized value, or conflicting overlapping patch.
+    /// Returns an error for a type mismatch, out-of-range value, oversized
+    /// text or byte input, malformed descriptor, or conflicting overlapping
+    /// patch.
+    ///
+    /// [`MenuField`]: super::MenuField
+    /// [`MenuField::plan_value`]: super::MenuField::plan_value
     pub fn set(
         &mut self,
         field: &FieldDescriptor,
@@ -601,34 +669,54 @@ impl PatchPlanner {
     ) -> Result<&mut Self, SchemaError> {
         let encoded = encode_field(field, value)?;
         for (absolute, mask, bits) in encoded {
-            self.merge_byte(absolute, mask, bits)?;
+            self.merge_byte(field.name, absolute, mask, bits)?;
         }
         Ok(self)
     }
 
     /// Finish and return patches grouped by ascending MCP page.
     ///
+    /// The complete plan is validated against the radio's address space
+    /// before any patch is produced, so a [`PatchSet`] can never address
+    /// bytes outside the real memory image or inside the factory-calibration
+    /// region.
+    ///
     /// # Errors
     ///
-    /// Returns [`SchemaError::OffsetTooLarge`] if a patch cannot be addressed
-    /// by a 16-bit MCP page number.
+    /// Returns [`SchemaError::OutOfBounds`] for a patch beyond the radio's
+    /// memory image, and [`SchemaError::WriteProtected`] for a patch inside
+    /// the factory-calibration region.
     pub fn finish(self) -> Result<PatchSet, SchemaError> {
         let mut pages: BTreeMap<u16, Vec<BytePatch>> = BTreeMap::new();
-        for (absolute, (mask, value)) in self.bytes {
+        for (absolute, claim) in self.bytes {
+            if absolute >= programming::TOTAL_SIZE {
+                return Err(SchemaError::OutOfBounds {
+                    field: claim.owner,
+                    offset: absolute,
+                    len: 1,
+                    image_len: programming::TOTAL_SIZE,
+                });
+            }
             let page_number = absolute / programming::PAGE_SIZE;
             let page = u16::try_from(page_number).map_err(|_| SchemaError::OffsetTooLarge {
-                field: "patch set",
+                field: claim.owner,
                 offset: absolute,
             })?;
+            if programming::is_factory_calibration_page(page) {
+                return Err(SchemaError::WriteProtected {
+                    field: claim.owner,
+                    page,
+                });
+            }
             let in_page = absolute % programming::PAGE_SIZE;
             let offset = u8::try_from(in_page).map_err(|_| SchemaError::OffsetTooLarge {
-                field: "patch set",
+                field: claim.owner,
                 offset: absolute,
             })?;
             pages.entry(page).or_default().push(BytePatch {
                 offset,
-                mask,
-                value,
+                mask: claim.mask,
+                value: claim.value,
             });
         }
         Ok(PatchSet {
@@ -639,19 +727,34 @@ impl PatchPlanner {
         })
     }
 
-    fn merge_byte(&mut self, offset: usize, mask: u8, value: u8) -> Result<(), SchemaError> {
-        if let Some((existing_mask, existing_value)) = self.bytes.get_mut(&offset) {
-            let overlap = *existing_mask & mask;
-            if ((*existing_value ^ value) & overlap) != 0 {
+    fn merge_byte(
+        &mut self,
+        owner: &'static str,
+        offset: usize,
+        mask: u8,
+        value: u8,
+    ) -> Result<(), SchemaError> {
+        if let Some(claim) = self.bytes.get_mut(&offset) {
+            let overlap = claim.mask & mask;
+            if ((claim.value ^ value) & overlap) != 0 {
                 return Err(SchemaError::PatchConflict {
+                    field: owner,
+                    existing: claim.owner,
                     offset,
                     mask: overlap,
                 });
             }
-            *existing_value = (*existing_value & !mask) | (value & mask);
-            *existing_mask |= mask;
+            claim.value = (claim.value & !mask) | (value & mask);
+            claim.mask |= mask;
         } else {
-            let _previous = self.bytes.insert(offset, (mask, value & mask));
+            let _previous = self.bytes.insert(
+                offset,
+                ByteClaim {
+                    mask,
+                    value: value & mask,
+                    owner,
+                },
+            );
         }
         Ok(())
     }
@@ -748,13 +851,14 @@ fn encode_field(
             },
             FieldValue::Unsigned(value),
         ) => {
+            let width_bytes = validate_width(field.name, width)?;
+            validate_unsigned_capacity(field.name, width, max)?;
             validate_unsigned(field.name, value, min, max)?;
-            let width = validate_width(field.name, width)?;
             let bytes = match endian {
                 Endian::Little => value.to_le_bytes(),
                 Endian::Big => value.to_be_bytes(),
             };
-            encode_integer_bytes(field, bytes, width, endian)
+            encode_integer_bytes(field, bytes, width_bytes, endian)
         }
         (
             FieldCodec::Signed {
@@ -765,13 +869,14 @@ fn encode_field(
             },
             FieldValue::Signed(value),
         ) => {
+            let width_bytes = validate_width(field.name, width)?;
+            validate_signed_capacity(field.name, width, min, max)?;
             validate_signed(field.name, value, min, max)?;
-            let width = validate_width(field.name, width)?;
             let bytes = match endian {
                 Endian::Little => value.to_le_bytes(),
                 Endian::Big => value.to_be_bytes(),
             };
-            encode_integer_bytes(field, bytes, width, endian)
+            encode_integer_bytes(field, bytes, width_bytes, endian)
         }
         (FieldCodec::Bytes { len }, FieldValue::Bytes(bytes)) => {
             if bytes.len() != len {
@@ -863,6 +968,35 @@ fn validate_width(field: &'static str, width: u8) -> Result<usize, SchemaError> 
         return Err(SchemaError::InvalidIntegerWidth { field, width });
     }
     Ok(usize::from(width))
+}
+
+/// Reject an unsigned domain wider than the encoded byte width, which would
+/// otherwise truncate silently.
+fn validate_unsigned_capacity(field: &'static str, width: u8, max: u64) -> Result<(), SchemaError> {
+    if width < 8 {
+        let capacity = (1_u64 << (8 * u32::from(width))) - 1;
+        if max > capacity {
+            return Err(SchemaError::DomainExceedsWidth { field, width });
+        }
+    }
+    Ok(())
+}
+
+/// Reject a signed domain wider than the encoded byte width, which would
+/// otherwise truncate silently.
+fn validate_signed_capacity(
+    field: &'static str,
+    width: u8,
+    min: i64,
+    max: i64,
+) -> Result<(), SchemaError> {
+    if width < 8 {
+        let half = 1_i64 << (8 * u32::from(width) - 1);
+        if min < -half || max > half - 1 {
+            return Err(SchemaError::DomainExceedsWidth { field, width });
+        }
+    }
+    Ok(())
 }
 
 const fn validate_bit_codec(
@@ -1040,10 +1174,18 @@ mod tests {
         );
         let mut conflict = PatchPlanner::new();
         let _planner = conflict.set(&ENABLE, FieldValue::Unsigned(1))?;
-        assert!(matches!(
-            conflict.set(&contradictory, FieldValue::Unsigned(0)),
-            Err(SchemaError::PatchConflict { .. })
-        ));
+        let result = conflict.set(&contradictory, FieldValue::Unsigned(0));
+        assert!(
+            matches!(
+                result,
+                Err(SchemaError::PatchConflict {
+                    field: "test.contradictory",
+                    existing: "test.enable",
+                    ..
+                })
+            ),
+            "conflict must name both fields: {result:?}"
+        );
         Ok(())
     }
 
@@ -1121,5 +1263,124 @@ mod tests {
             planner.set(&bytes, FieldValue::Bytes(&[1])),
             Err(SchemaError::ByteLength { .. })
         ));
+    }
+
+    #[test]
+    fn finish_rejects_offsets_beyond_the_radio_image() -> TestResult {
+        let field = FieldDescriptor::new(
+            "test.beyond",
+            programming::TOTAL_SIZE,
+            FieldCodec::Byte { min: 0, max: 255 },
+        );
+        let mut planner = PatchPlanner::new();
+        let _planner = planner.set(&field, FieldValue::Unsigned(1))?;
+        let result = planner.finish();
+        assert!(
+            matches!(
+                result,
+                Err(SchemaError::OutOfBounds {
+                    field: "test.beyond",
+                    ..
+                })
+            ),
+            "plan-time bounds check must name the field: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn finish_rejects_factory_calibration_pages() -> TestResult {
+        let field = FieldDescriptor::new(
+            "test.calibration",
+            0x7A100,
+            FieldCodec::Byte { min: 0, max: 255 },
+        );
+        let mut planner = PatchPlanner::new();
+        let _planner = planner.set(&field, FieldValue::Unsigned(1))?;
+        let result = planner.finish();
+        assert!(
+            matches!(
+                result,
+                Err(SchemaError::WriteProtected {
+                    field: "test.calibration",
+                    page: 0x7A1,
+                })
+            ),
+            "calibration pages must be rejected at plan time: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_to_image_never_partially_patches_on_error() -> TestResult {
+        let low = FieldDescriptor::new("test.low", 0x1000, FieldCodec::Byte { min: 0, max: 255 });
+        let high = FieldDescriptor::new("test.high", 0x1200, FieldCodec::Byte { min: 0, max: 255 });
+        let mut planner = PatchPlanner::new();
+        let _planner = planner
+            .set(&low, FieldValue::Unsigned(0xA5))?
+            .set(&high, FieldValue::Unsigned(0x5A))?;
+        let patches = planner.finish()?;
+
+        // The image ends between the two patched bytes, so the set as a
+        // whole is out of bounds and nothing may change.
+        let mut image = vec![0_u8; 0x1100];
+        let result = patches.apply_to_image(&mut image);
+        assert!(
+            matches!(result, Err(SchemaError::OutOfBounds { .. })),
+            "short image must be rejected: {result:?}"
+        );
+        assert_eq!(
+            image.get(0x1000),
+            Some(&0),
+            "no byte may change when any patch is out of bounds"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn integer_domains_must_fit_their_declared_width() {
+        let unsigned = FieldDescriptor::new(
+            "test.wide_unsigned",
+            0,
+            FieldCodec::Unsigned {
+                width: 1,
+                endian: Endian::Little,
+                min: 0,
+                max: 300,
+            },
+        );
+        let signed = FieldDescriptor::new(
+            "test.wide_signed",
+            0,
+            FieldCodec::Signed {
+                width: 2,
+                endian: Endian::Little,
+                min: -40_000,
+                max: 0,
+            },
+        );
+        let mut planner = PatchPlanner::new();
+        let unsigned_result = planner.set(&unsigned, FieldValue::Unsigned(260));
+        assert!(
+            matches!(
+                unsigned_result,
+                Err(SchemaError::DomainExceedsWidth {
+                    field: "test.wide_unsigned",
+                    width: 1,
+                })
+            ),
+            "an over-wide unsigned domain must not truncate: {unsigned_result:?}"
+        );
+        let signed_result = planner.set(&signed, FieldValue::Signed(-40_000));
+        assert!(
+            matches!(
+                signed_result,
+                Err(SchemaError::DomainExceedsWidth {
+                    field: "test.wide_signed",
+                    width: 2,
+                })
+            ),
+            "an over-wide signed domain must not truncate: {signed_result:?}"
+        );
     }
 }

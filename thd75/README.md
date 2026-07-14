@@ -86,9 +86,12 @@ cargo run -p kenwood-thd75 --example mcp_menu -- \
 ```
 
 Enum values accept the official English label, decompiled member name, decimal
-raw value, or `0x` value. Fixed strings accept text. Raw bitmap fields accept
-`hex:...` or `@FILE`. The command reads only pages referenced by the patch,
-writes only pages that actually change, and verifies each write by read-back.
+raw value, or `0x` value. Numbers resolve as `0x` hex first, then as the
+decimal raw value whenever the field accepts that raw, then as an option
+label — so a numeric label can never capture a valid decimal raw. Fixed
+strings accept text. Raw bitmap fields accept `hex:...` or `@FILE`. The
+command reads only pages referenced by the patch, writes only pages that
+actually change, and verifies each write by read-back.
 
 ## Supported connections
 

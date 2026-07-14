@@ -85,9 +85,9 @@ pub use scan::{ProgramScanEdge, ScanResumeMethod, ScanType, VisualRange, VisualS
 
 // Settings re-exports.
 pub use settings::{
-    AltitudeRainUnit, AudioSettings, AutoPowerOff, BackgroundColor, BacklightControl, DateFormat,
-    DisplayHoldTime, DisplayMethod, DisplaySettings, DisplayUnits, EqSetting, KeyLockType,
-    Language, LedControl, MeterType, MicSensitivity, PfKeyFunction, PowerOnMessage,
+    AltitudeRainUnit, AudioSettings, AutoPowerOff, BackgroundColor, BacklightControl, BeatShift,
+    DateFormat, DisplayHoldTime, DisplayMethod, DisplaySettings, DisplayUnits, EqSetting,
+    KeyLockType, Language, LedControl, MeterType, MicSensitivity, PfKeyFunction, PowerOnMessage,
     SpeedDistanceUnit, SystemSettings, TemperatureUnit, VoiceGuideSpeed,
 };
 

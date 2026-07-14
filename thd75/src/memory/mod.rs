@@ -189,12 +189,15 @@ impl MemoryImage {
     /// This is the offline counterpart to
     /// [`Radio::apply_menu_patches`](crate::radio::Radio::apply_menu_patches).
     /// Masked bit fields preserve unrelated bits already present in the
-    /// image.
+    /// image. Patch sets built by [`PatchPlanner`] are validated at plan
+    /// time, so they can never address bytes outside the radio's memory
+    /// image or inside the write-protected factory-calibration region, and
+    /// application is all-or-nothing.
     ///
     /// # Errors
     ///
     /// Returns [`SchemaError::OutOfBounds`] if a patch references bytes
-    /// outside this image.
+    /// outside this image; the image is unmodified in that case.
     pub fn apply_menu_patches(&mut self, patches: &PatchSet) -> Result<(), SchemaError> {
         patches.apply_to_image(&mut self.raw)
     }
@@ -241,11 +244,12 @@ impl MemoryImage {
     {
         // Settings-bearing bytes span 0x0000..0x2000 in the raw image:
         // band state (power level 0x0359, attenuator 0x035C, dual band
-        // 0x0396), the main settings block (0x1000-0x10D0), and the
-        // string regions (0x11C0 power-on message, 0x1300 callsign).
-        // The diff window must cover ALL of them — a setter outside
-        // the window mutates the image but reports "nothing changed",
-        // and the caller silently skips the radio write-back.
+        // 0x0396), the radio menu block (0x1000..0x10E0, including the
+        // power-on message string at 0x10C0), the APRS lock bits at
+        // 0x120A, and the DV EMR volume at 0x1A03. The diff window
+        // must cover ALL of them — a setter outside the window mutates
+        // the image but reports "nothing changed", and the caller
+        // silently skips the radio write-back.
         const SETTINGS_START: usize = 0x0000;
         const SETTINGS_END: usize = 0x2000;
 

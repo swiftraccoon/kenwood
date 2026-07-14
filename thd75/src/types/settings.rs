@@ -300,6 +300,32 @@ pub enum VoiceGuideSpeed {
     Fast,
 }
 
+/// Receiver beat-shift type (`radio.BeatShift`, raw 0-7).
+///
+/// The D75 offers eight beat-shift types (Type 1 through Type 8) that
+/// move internally generated spurious beats out of the receive
+/// passband. This is a type selector, not an on/off switch — the
+/// MCP-D75 serializer stores one byte with domain 0-7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BeatShift {
+    /// Beat shift type 1.
+    Type1,
+    /// Beat shift type 2.
+    Type2,
+    /// Beat shift type 3.
+    Type3,
+    /// Beat shift type 4.
+    Type4,
+    /// Beat shift type 5.
+    Type5,
+    /// Beat shift type 6.
+    Type6,
+    /// Beat shift type 7.
+    Type7,
+    /// Beat shift type 8.
+    Type8,
+}
+
 // ---------------------------------------------------------------------------
 // System settings
 // ---------------------------------------------------------------------------
@@ -425,20 +451,19 @@ impl Default for SystemSettings {
 /// APO does not operate during scanning.
 ///
 /// The User Manual menu table lists options: Off / 15 / 30 / 60 minutes
-/// (default: 30). The firmware MCP binary encoding may support additional
-/// values (90, 120 minutes) not shown in the manual.
+/// (default: 30), and the MCP-D75 serializer (`radio.AutoPowerOff`,
+/// raw 0-3) agrees exactly. Earlier revisions of this enum invented
+/// 90/120-minute variants that do not exist on the D75.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AutoPowerOff {
     /// Auto power off disabled.
     Off,
+    /// Power off after 15 minutes of inactivity.
+    Min15,
     /// Power off after 30 minutes of inactivity.
     Min30,
     /// Power off after 60 minutes of inactivity.
     Min60,
-    /// Power off after 90 minutes of inactivity.
-    Min90,
-    /// Power off after 120 minutes of inactivity.
-    Min120,
 }
 
 /// Key lock type -- which controls are affected by key lock (Menu No. 960).
@@ -732,22 +757,55 @@ impl TryFrom<u8> for VoiceGuideSpeed {
     }
 }
 
+impl TryFrom<u8> for BeatShift {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Type1),
+            1 => Ok(Self::Type2),
+            2 => Ok(Self::Type3),
+            3 => Ok(Self::Type4),
+            4 => Ok(Self::Type5),
+            5 => Ok(Self::Type6),
+            6 => Ok(Self::Type7),
+            7 => Ok(Self::Type8),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "beat shift",
+                value,
+                detail: "must be 0-7",
+            }),
+        }
+    }
+}
+
+impl From<BeatShift> for u8 {
+    fn from(bs: BeatShift) -> Self {
+        bs as Self
+    }
+}
+
 impl TryFrom<u8> for AutoPowerOff {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Off),
-            1 => Ok(Self::Min30),
-            2 => Ok(Self::Min60),
-            3 => Ok(Self::Min90),
-            4 => Ok(Self::Min120),
+            1 => Ok(Self::Min15),
+            2 => Ok(Self::Min30),
+            3 => Ok(Self::Min60),
             _ => Err(ValidationError::SettingOutOfRange {
                 name: "auto power off",
                 value,
-                detail: "must be 0-4",
+                detail: "must be 0-3",
             }),
         }
+    }
+}
+
+impl From<AutoPowerOff> for u8 {
+    fn from(apo: AutoPowerOff) -> Self {
+        apo as Self
     }
 }
 

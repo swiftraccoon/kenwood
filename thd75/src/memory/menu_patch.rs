@@ -7,19 +7,32 @@ impl MenuField {
     ///
     /// In addition to storage-codec validation, this rejects gap values for
     /// enum domains. Some official MCP-D75 enums are non-contiguous, so their
-    /// numeric minimum and maximum alone are not sufficient validation.
+    /// numeric minimum and maximum alone are not sufficient validation. A
+    /// field with a finite enum or UI-choice domain accepts only
+    /// [`FieldValue::Unsigned`]; every other value kind is rejected before
+    /// codec validation, so the domain gate cannot be bypassed by a
+    /// mismatched value variant.
     ///
     /// # Errors
     ///
     /// Returns [`SchemaError::DisallowedValue`] for a raw value absent from an
-    /// official enum or finite UI-choice domain. Other failures report codec
-    /// type, range, length, encoding, or overlapping-patch errors.
+    /// official enum or finite UI-choice domain, and
+    /// [`SchemaError::TypeMismatch`] for a non-unsigned value supplied to a
+    /// finite-domain field. Other failures report codec type, range, length,
+    /// encoding, or overlapping-patch errors.
     pub fn plan_value(
         &self,
         planner: &mut PatchPlanner,
         value: FieldValue<'_>,
     ) -> Result<(), SchemaError> {
-        if let FieldValue::Unsigned(raw) = value {
+        if !self.options.is_empty() || !self.allowed_values.is_empty() {
+            let FieldValue::Unsigned(raw) = value else {
+                return Err(SchemaError::TypeMismatch {
+                    field: self.descriptor.name,
+                    expected: "unsigned",
+                    actual: value.kind_name(),
+                });
+            };
             let missing_enum = !self.options.is_empty() && self.option(raw).is_none();
             let missing_choice =
                 !self.allowed_values.is_empty() && !self.allowed_values.contains(&raw);
@@ -65,6 +78,24 @@ mod tests {
         field.plan_value(&mut planner, FieldValue::Unsigned(2))?;
         let patches = planner.finish()?;
         assert_eq!(patches.pages().count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn finite_domain_fields_reject_non_unsigned_values() -> Result<(), &'static str> {
+        let field = gapped_field()?;
+        let mut planner = PatchPlanner::new();
+        let result = field.plan_value(&mut planner, FieldValue::Bool(true));
+        assert!(
+            matches!(
+                result,
+                Err(SchemaError::TypeMismatch {
+                    expected: "unsigned",
+                    ..
+                })
+            ),
+            "finite-domain fields must only accept unsigned raw values: {result:?}"
+        );
         Ok(())
     }
 

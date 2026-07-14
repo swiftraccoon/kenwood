@@ -8,10 +8,10 @@
 //! blind to the failure mode that actually matters here: the channel
 //! and settings decoders are hand-maintained BITFIELD MAPS (mode
 //! nibble in byte 0x09, tone/CTCSS/DCS/shift bits in byte 0x0A,
-//! region offsets 0x2000/0x4000/0x10000, the settings block at
-//! 0x1000..0x10D0). A symmetric mistake — writing and reading the
-//! same wrong bit — passes every round-trip test while corrupting the
-//! radio.
+//! region offsets 0x2000/0x4000/0x10000, the settings cells spanning
+//! 0x1000..0x1A10 plus the D-STAR MY-callsign list at 0x1CA8). A
+//! symmetric mistake — writing and reading the same wrong bit —
+//! passes every round-trip test while corrupting the radio.
 //!
 //! This file decodes a real 500,480-byte MCP dump read off a physical
 //! TH-D75 and asserts values known to be true of that radio. Nothing
@@ -155,24 +155,116 @@ fn channel_zero_matches_the_radio() -> TestResult {
 
 /// Known-true settings bytes, read off the physical radio.
 ///
-/// The settings block is a flat offset map — every accessor is a
-/// hand-written byte/bit index into `0x1000..0x10D0`. Decoding the
-/// real block pins those indices to hardware.
+/// The settings layer is a flat offset map — every accessor is a
+/// hand-written byte/bit index sourced from the MCP-D75 field
+/// registry. Decoding the real dump pins each index to hardware, so
+/// an accessor that reads the wrong cell (the historical failure mode
+/// of this layer) cannot return the value the radio actually holds.
 #[test]
 fn settings_block_matches_the_radio() -> TestResult {
-    use kenwood_thd75::types::{KeyLockType, SpeedDistanceUnit, TemperatureUnit};
+    use kenwood_thd75::types::{
+        AltitudeRainUnit, AutoPowerOff, BeatShift, Language, SpeedDistanceUnit, TemperatureUnit,
+    };
 
     let image = load_dump()?;
     let settings = image.settings();
 
+    // Beep / voice guidance.
     assert!(settings.key_beep(), "key beep was enabled on the radio");
-    assert_eq!(settings.backlight(), 9, "backlight level");
+    assert_eq!(settings.beep_volume(), 0, "beep volume is VOL Link (0)");
+    assert_eq!(settings.announce(), 0, "voice announce is Off");
     assert_eq!(
-        settings.key_lock_type(),
-        KeyLockType::KeyOnly,
-        "key lock type"
+        settings.voice_volume(),
+        0,
+        "voice announce volume is VOL Link (0)"
+    );
+    assert_eq!(settings.voice_speed(), 0, "voice guidance speed is Speed 1");
+
+    // Backlight.
+    assert_eq!(settings.backlight_control(), 1, "backlight control is On");
+    assert_eq!(settings.backlight_timer(), 13, "backlight timer is 13 s");
+
+    // Lock configuration (shared bit byte 0x1084 holds 0x03).
+    assert!(settings.key_lock(), "key-lock checkbox was ticked");
+    assert!(
+        settings.frequency_lock(),
+        "frequency-lock checkbox was ticked"
+    );
+    assert!(!settings.volume_lock(), "volume lock was off");
+    assert!(!settings.aprs_lock_frequency(), "APRS frequency lock off");
+    assert!(!settings.aprs_lock_ptt(), "APRS PTT lock off");
+    assert!(!settings.aprs_lock_key(), "APRS key lock off");
+
+    // TX.
+    assert!(!settings.tx_inhibit(), "TX inhibit was off");
+    assert_eq!(
+        settings.timeout_timer(),
+        10,
+        "TX timeout index 10 = 10.0 minutes"
+    );
+    assert_eq!(settings.beat_shift(), BeatShift::Type1, "beat shift Type 1");
+    assert_eq!(
+        settings.mic_sensitivity(),
+        1,
+        "mic sensitivity Medium (0=High on the D75)"
     );
 
+    // RX filters.
+    assert_eq!(settings.ssb_high_cut(), 1, "SSB high cut 2.4 kHz");
+    assert_eq!(settings.cw_width(), 2, "CW width 1.0 kHz");
+    assert_eq!(settings.am_high_cut(), 2, "AM high cut 6.0 kHz");
+    assert_eq!(settings.cw_pitch(), 4, "CW pitch index");
+
+    // Scan.
+    assert_eq!(settings.scan_resume(), 1, "analog scan resume Carrier");
+    assert_eq!(
+        settings.digital_scan_resume(),
+        2,
+        "digital scan resume Seek"
+    );
+    assert_eq!(settings.scan_restart_time(), 8, "time restart 8 s");
+    assert_eq!(settings.scan_restart_carrier(), 4, "carrier restart 4 s");
+
+    // VOX.
+    assert!(!settings.vox_enabled(), "VOX was off");
+    assert_eq!(settings.vox_gain(), 4, "VOX gain");
+    assert_eq!(settings.vox_delay(), 1, "VOX delay index 1 = 500 ms");
+    assert!(!settings.vox_tx_on_busy(), "VOX TX-on-busy was off");
+
+    // DTMF.
+    assert_eq!(settings.dtmf_speed(), 1, "DTMF speed 100 ms");
+    assert_eq!(settings.dtmf_pause_time(), 2, "DTMF pause 500 ms");
+    assert!(!settings.dtmf_tx_hold(), "DTMF TX hold was off");
+
+    // Repeater.
+    assert!(settings.repeater_auto_offset(), "auto offset was on");
+    assert_eq!(settings.repeater_call_key(), 0, "CALL key function CALL");
+
+    // PF keys.
+    assert_eq!(settings.pf_key1(), 10, "PF1 assigned to Balance");
+    assert_eq!(settings.pf_key2(), 11, "PF2 assigned to GPS");
+
+    // Audio routing.
+    assert_eq!(settings.emr_volume_level(), 25, "EMR volume level 25");
+    assert_eq!(settings.auto_mute_return_time(), 3, "auto mute return 3");
+
+    // Interfaces.
+    assert_eq!(settings.gps_bt_interface(), 1, "GPS PC output Bluetooth");
+    assert_eq!(settings.aprs_usb_mode(), 1, "APRS PC output Bluetooth");
+
+    // Bluetooth.
+    assert!(settings.bluetooth(), "Bluetooth was on");
+    assert!(settings.bt_auto_connect(), "BT auto-connect was on");
+
+    // Power.
+    assert_eq!(settings.battery_saver(), 0, "battery saver Off");
+    assert_eq!(
+        settings.auto_power_off(),
+        AutoPowerOff::Off,
+        "auto power off disabled"
+    );
+
+    // Units / language / message.
     let units = settings.display_units();
     assert_eq!(
         units.speed_distance,
@@ -180,9 +272,46 @@ fn settings_block_matches_the_radio() -> TestResult {
         "US units: speed in mph"
     );
     assert_eq!(
+        units.altitude_rain,
+        AltitudeRainUnit::FeetInch,
+        "US units: altitude in feet"
+    );
+    assert_eq!(
         units.temperature,
         TemperatureUnit::Fahrenheit,
         "US units: temperature in F"
+    );
+    assert_eq!(settings.language(), Language::English, "display language");
+    assert_eq!(
+        settings.power_on_message(),
+        "",
+        "no power-on message programmed"
+    );
+    Ok(())
+}
+
+/// Known-true D-STAR MY-callsign record, read off the physical radio.
+///
+/// The MY callsign lives in `dv.MyCallsignDvGatewayList` at 0x1CA8
+/// (8-byte space-padded callsign + 4-byte memo, stride 12). The
+/// source radio has its owner's callsign and a "D75A" memo in record
+/// 0, with the selector pointing at that record.
+#[test]
+fn dstar_my_callsign_matches_the_radio() -> TestResult {
+    let image = load_dump()?;
+    let dstar = image.dstar();
+
+    assert_eq!(dstar.my_callsign_select(), 0, "record 0 is active");
+    assert_eq!(dstar.my_callsign(), "KQ4NIT", "MY callsign");
+    assert_eq!(
+        dstar.my_callsign_memo(0).as_deref(),
+        Some("D75A"),
+        "record 0 memo"
+    );
+    assert_eq!(
+        dstar.my_callsign_entry(1).as_deref(),
+        Some(""),
+        "record 1 is unprogrammed"
     );
     Ok(())
 }

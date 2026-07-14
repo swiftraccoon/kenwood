@@ -1,14 +1,25 @@
 //! Typed access to the D-STAR configuration region of the memory image.
 //!
-//! The D-STAR configuration occupies two regions:
+//! The D-STAR configuration occupies three regions:
 //!
 //! - **System settings** at byte offset `0x03F0` (~16 bytes): active
 //!   D-STAR channel information.
+//! - **MY callsign list** (`dv.MyCallsignDvGatewayList`) at byte
+//!   offset `0x1CA8`: six 12-byte records, each an 8-byte space-padded
+//!   callsign plus a 4-byte NUL-padded memo, with the active-entry
+//!   selector (`dv.MyCallsignSelectDvGateway`) at `0x1CA1`.
 //! - **Repeater/callsign list** starting at page `0x02A1` (byte offset
 //!   `0x2A100`): up to 1,500 repeater entries (108 bytes each) plus
 //!   up to 120 callsign entries (8 bytes each).
 //!
 //! # Offset confidence
+//!
+//! The MY callsign list offsets come from the MCP-D75 field registry
+//! ([`MCP_D75_MENU_FIELDS`](super::MCP_D75_MENU_FIELDS)) and are
+//! confirmed by the hardware dump in `tests/memory_golden.rs`. An
+//! earlier revision read the MY callsign from `0x1300` ("D74
+//! development notes") — that offset is actually
+//! `aprs.StatusTextList[4].StatusText` and never held a callsign.
 //!
 //! The D-STAR channel info at `0x03F0` is from D74 development notes.
 //! The repeater list at page `0x02A1` is confirmed from D74 development
@@ -37,12 +48,28 @@ const REPEATER_RECORD_SIZE: usize = 108;
 /// Maximum number of repeater entries in the D75.
 const MAX_REPEATER_ENTRIES: u16 = 1500;
 
-/// Estimated byte offset of the MY callsign within the system settings.
+/// Byte offset of the active MY-callsign selector
+/// (`dv.MyCallsignSelectDvGateway`, 1 byte, 0-5).
+const DV_MY_CALLSIGN_SELECT_OFFSET: usize = 0x1CA1;
+
+/// Byte offset of the MY callsign list (`dv.MyCallsignDvGatewayList`).
 ///
-/// The MY callsign for D-STAR is stored within the callsign data area
-/// at MCP offset `0x1300`.  The first 8 bytes are the MY callsign,
-/// followed by 4 bytes for the suffix.
-const DSTAR_MY_CALLSIGN_OFFSET: usize = 0x1300;
+/// Six records of [`DV_MY_CALLSIGN_STRIDE`] bytes each: an 8-byte
+/// space-padded callsign (`MyCallsignDvGateway`) followed by a 4-byte
+/// NUL-padded memo (`MemoDvGateway`).
+const DV_MY_CALLSIGN_LIST_OFFSET: usize = 0x1CA8;
+
+/// Number of MY-callsign records in the list.
+const DV_MY_CALLSIGN_COUNT: usize = 6;
+
+/// Stride between MY-callsign records (callsign + memo).
+const DV_MY_CALLSIGN_STRIDE: usize = 12;
+
+/// Length of the callsign portion of a MY-callsign record.
+const DV_MY_CALLSIGN_LEN: usize = 8;
+
+/// Length of the memo portion of a MY-callsign record.
+const DV_MY_CALLSIGN_MEMO_LEN: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Repeater record field offsets (from firmware RE at 0xC001239C)
@@ -70,15 +97,17 @@ const RPT_FREQ_OFFSET: usize = 0x58;
 /// Read-only access to the D-STAR configuration region.
 ///
 /// Provides raw byte access and typed field accessors for D-STAR settings
-/// stored in the system settings area (channel info at `0x03F0`) and the
-/// repeater/callsign list starting at page `0x02A1`.
+/// stored in the system settings area (channel info at `0x03F0`), the MY
+/// callsign list at `0x1CA8`, and the repeater/callsign list starting at
+/// page `0x02A1`.
 ///
 /// # Known sub-regions
 ///
 /// | MCP Offset | Content |
 /// |-----------|---------|
 /// | `0x003F0` | D-STAR channel info (16 bytes) |
-/// | `0x01300` | MY callsign (8 bytes) + suffix (4 bytes) |
+/// | `0x01CA1` | Active MY-callsign selector (1 byte, 0-5) |
+/// | `0x01CA8` | MY callsign list (6 × 12-byte records: callsign + memo) |
 /// | `0x2A100` | Repeater list (108-byte records) |
 /// | varies | Callsign list (8-byte entries, up to 120) |
 #[derive(Debug)]
@@ -145,39 +174,74 @@ impl<'a> DstarAccess<'a> {
     // Typed D-STAR accessors
     // -----------------------------------------------------------------------
 
-    /// Read the D-STAR MY callsign (up to 8 characters, space-padded).
+    /// Read the index of the active MY-callsign record
+    /// (`dv.MyCallsignSelectDvGateway`, 0-5).
     ///
-    /// # Offset
-    ///
-    /// Located at `0x1300` (confirmed from D74 development notes as the
-    /// callsign data region). The first 8 bytes are the MY callsign.
-    ///
-    /// # Verification
-    ///
-    /// Field boundary is estimated, not hardware-verified
-    /// within the callsign data region.
+    /// MCP offset `0x1CA1`. Out-of-range bytes are clamped to 5;
+    /// unreadable images return 0.
     #[must_use]
-    pub fn my_callsign(&self) -> String {
-        let offset = DSTAR_MY_CALLSIGN_OFFSET;
-        let Some(slice) = self.image.get(offset..offset + DstarCallsign::WIRE_LEN) else {
-            return String::new();
-        };
-        // D-STAR callsigns are space-padded; also handle null bytes.
-        let s = std::str::from_utf8(slice).unwrap_or("");
-        s.trim_end_matches([' ', '\0']).to_owned()
+    pub fn my_callsign_select(&self) -> usize {
+        self.image
+            .get(DV_MY_CALLSIGN_SELECT_OFFSET)
+            .copied()
+            .map_or(0, |b| usize::from(b.min(5)))
     }
 
-    /// Read the D-STAR MY callsign as a typed [`DstarCallsign`].
+    /// Read one MY-callsign record's callsign
+    /// (`dv.MyCallsignDvGatewayList[index].MyCallsignDvGateway`).
     ///
-    /// Returns `None` if the callsign is empty or invalid.
+    /// Records live at `0x1CA8 + index * 12` (8 bytes, space-padded).
+    /// Returns `None` if `index` is 6 or more, or the record extends
+    /// past the image; an unprogrammed record reads as an empty
+    /// string.
+    #[must_use]
+    pub fn my_callsign_entry(&self, index: usize) -> Option<String> {
+        if index >= DV_MY_CALLSIGN_COUNT {
+            return None;
+        }
+        let offset = DV_MY_CALLSIGN_LIST_OFFSET + index * DV_MY_CALLSIGN_STRIDE;
+        let slice = self.image.get(offset..offset + DV_MY_CALLSIGN_LEN)?;
+        // Callsigns are space-padded; unprogrammed records are NULs.
+        let s = std::str::from_utf8(slice).unwrap_or("");
+        Some(s.trim_end_matches([' ', '\0']).to_owned())
+    }
+
+    /// Read one MY-callsign record's memo
+    /// (`dv.MyCallsignDvGatewayList[index].MemoDvGateway`).
     ///
-    /// # Offset
+    /// The memo is the 4-byte NUL-padded field after the callsign
+    /// (offset `0x1CA8 + index * 12 + 8`); the hardware dump shows
+    /// "D75A" here. Returns `None` if `index` is 6 or more, or the
+    /// record extends past the image.
+    #[must_use]
+    pub fn my_callsign_memo(&self, index: usize) -> Option<String> {
+        if index >= DV_MY_CALLSIGN_COUNT {
+            return None;
+        }
+        let offset =
+            DV_MY_CALLSIGN_LIST_OFFSET + index * DV_MY_CALLSIGN_STRIDE + DV_MY_CALLSIGN_LEN;
+        let slice = self.image.get(offset..offset + DV_MY_CALLSIGN_MEMO_LEN)?;
+        let s = std::str::from_utf8(slice).unwrap_or("");
+        Some(s.trim_end_matches([' ', '\0']).to_owned())
+    }
+
+    /// Read the active D-STAR MY callsign (up to 8 characters).
     ///
-    /// Located at `0x1300`.
+    /// Resolves the selector at `0x1CA1` and reads that record from
+    /// the MY callsign list at `0x1CA8` (`dv.MyCallsignDvGatewayList`,
+    /// registry-verified and confirmed against a hardware dump).
+    /// Returns an empty string if the record is unprogrammed or the
+    /// image is too short.
+    #[must_use]
+    pub fn my_callsign(&self) -> String {
+        self.my_callsign_entry(self.my_callsign_select())
+            .unwrap_or_default()
+    }
+
+    /// Read the active D-STAR MY callsign as a typed [`DstarCallsign`].
     ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
+    /// Returns `None` if the callsign is empty or invalid. See
+    /// [`my_callsign`](Self::my_callsign) for the offset provenance.
     #[must_use]
     pub fn my_callsign_typed(&self) -> Option<DstarCallsign> {
         let raw = self.my_callsign();
@@ -396,18 +460,52 @@ mod tests {
     #[test]
     fn dstar_my_callsign() -> TestResult {
         let mut image = make_dstar_image();
-        write_slice(&mut image, DSTAR_MY_CALLSIGN_OFFSET, b"N0CALL  ")?;
+        // Record 0 of dv.MyCallsignDvGatewayList (selector stays 0).
+        write_slice(&mut image, DV_MY_CALLSIGN_LIST_OFFSET, b"N0CALL  ")?;
 
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
+        assert_eq!(dstar.my_callsign_select(), 0);
         assert_eq!(dstar.my_callsign(), "N0CALL");
+        Ok(())
+    }
+
+    #[test]
+    fn dstar_my_callsign_follows_the_selector() -> TestResult {
+        let mut image = make_dstar_image();
+        // Record 0 and record 2 hold different callsigns; the selector
+        // points at record 2.
+        write_slice(&mut image, DV_MY_CALLSIGN_LIST_OFFSET, b"N0CALL  ")?;
+        write_slice(
+            &mut image,
+            DV_MY_CALLSIGN_LIST_OFFSET + 2 * DV_MY_CALLSIGN_STRIDE,
+            b"W1AW    ",
+        )?;
+        write_slice(&mut image, DV_MY_CALLSIGN_SELECT_OFFSET, &[2])?;
+
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        let dstar = mi.dstar();
+        assert_eq!(dstar.my_callsign_select(), 2);
+        assert_eq!(dstar.my_callsign(), "W1AW");
+        assert_eq!(dstar.my_callsign_entry(0).as_deref(), Some("N0CALL"));
+        Ok(())
+    }
+
+    #[test]
+    fn dstar_my_callsign_memo() -> TestResult {
+        let mut image = make_dstar_image();
+        write_slice(&mut image, DV_MY_CALLSIGN_LIST_OFFSET, b"N0CALL  D75A")?;
+
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        let dstar = mi.dstar();
+        assert_eq!(dstar.my_callsign_memo(0).as_deref(), Some("D75A"));
         Ok(())
     }
 
     #[test]
     fn dstar_my_callsign_typed() -> TestResult {
         let mut image = make_dstar_image();
-        write_slice(&mut image, DSTAR_MY_CALLSIGN_OFFSET, b"W1AW    ")?;
+        write_slice(&mut image, DV_MY_CALLSIGN_LIST_OFFSET, b"W1AW    ")?;
 
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
@@ -425,6 +523,16 @@ mod tests {
         let dstar = mi.dstar();
         assert_eq!(dstar.my_callsign(), "");
         assert!(dstar.my_callsign_typed().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn dstar_my_callsign_entry_out_of_range() -> TestResult {
+        let image = make_dstar_image();
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        let dstar = mi.dstar();
+        assert!(dstar.my_callsign_entry(DV_MY_CALLSIGN_COUNT).is_none());
+        assert!(dstar.my_callsign_memo(DV_MY_CALLSIGN_COUNT).is_none());
         Ok(())
     }
 

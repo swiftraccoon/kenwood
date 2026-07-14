@@ -423,8 +423,10 @@ pub enum Command {
     },
     /// Get lock/control settings (LC read).
     ///
-    /// Returns the primary lock state as a boolean. For reading all
-    /// lock fields, use MCP memory offsets 0x1060–0x1065.
+    /// Returns the primary lock state as a boolean. The lock state is
+    /// runtime state with no verified MCP cell — CAT is the only
+    /// supported path. (The persistent lock-type *configuration* bits
+    /// live at MCP `0x1084`.)
     GetLock,
     /// Set lock/control state — simple boolean form (LC write).
     ///
@@ -442,12 +444,17 @@ pub enum Command {
     /// Set all lock/control fields (LC 6-field write).
     ///
     /// Sends `LC a,b,c,d,e,f` where each field is a control flag:
-    /// - `a`: Key lock (0=off, 1=on) — MCP 0x1060
-    /// - `b`: Key lock type (0=key, 1=PTT, 2=key+PTT) — MCP 0x1061
-    /// - `c`: Lock key A (0=off, 1=on) — MCP 0x1062
-    /// - `d`: Lock key B (0=off, 1=on) — MCP 0x1063
-    /// - `e`: Lock key C (0=off, 1=on) — MCP 0x1064
-    /// - `f`: Lock PTT (0=off, 1=on) — MCP 0x1065
+    /// - `a`: Key lock (0=off, 1=on)
+    /// - `b`: Key lock type (0=key, 1=PTT, 2=key+PTT)
+    /// - `c`: Lock key A (0=off, 1=on)
+    /// - `d`: Lock key B (0=off, 1=on)
+    /// - `e`: Lock key C (0=off, 1=on)
+    /// - `f`: Lock PTT (0=off, 1=on)
+    ///
+    /// These are CAT wire fields only; none of them has a verified MCP
+    /// counterpart (an earlier claim of MCP `0x1060`-`0x1065` was
+    /// wrong — those bytes are backlight/display cells in the MCP-D75
+    /// registry).
     SetLockFull {
         /// Key lock enabled.
         locked: bool,

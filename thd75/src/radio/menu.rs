@@ -22,11 +22,18 @@ impl<T: Transport> Radio<T> {
     /// An empty patch set is a no-op and does not enter programming mode. The
     /// returned page numbers are the pages that were actually written.
     ///
+    /// Patch sets built by [`PatchPlanner`](crate::memory::PatchPlanner) are
+    /// validated at plan time and can never address the factory-calibration
+    /// region; the radio layer still independently re-checks every requested
+    /// page before any I/O.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::MemoryWriteProtected`] before I/O if the patch set
+    /// Returns [`Error::MemoryWriteProtected`] before I/O if the page set
     /// touches the factory-calibration region. Other errors report MCP entry,
-    /// page read, verified write, exit, or reconnect failures.
+    /// page read, verified write, exit, or reconnect failures. If a write or
+    /// its verification fails partway through the batch, pages written
+    /// earlier in the same session remain changed on the radio.
     pub async fn apply_menu_patches(&mut self, patches: &PatchSet) -> Result<Vec<u16>, Error> {
         let pages: Vec<u16> = patches.pages().collect();
         self.modify_memory_pages(&pages, |page, data| {

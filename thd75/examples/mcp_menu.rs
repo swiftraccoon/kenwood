@@ -50,7 +50,7 @@ fn invalid_input(message: impl Into<String>) -> BoxError {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  mcp_menu --list [filter]\n  mcp_menu [--write] [--port DEVICE] menu.Field=value [...]\n\nValues accept official English option labels, raw decimal/0x numbers, on/off booleans, text, or hex:.../@FILE for byte arrays."
+        "Usage:\n  mcp_menu --list [filter]\n  mcp_menu [--write] [--port DEVICE] menu.Field=value [...]\n\nValues accept official English option labels, raw decimal/0x numbers, on/off booleans, text, or hex:.../@FILE for byte arrays.\nNumbers resolve as 0x hex first, then as the decimal raw value whenever the field accepts that raw, then as an option label."
     );
 }
 
@@ -156,7 +156,35 @@ fn list_fields(filter: Option<&str>) {
     }
 }
 
+/// Whether `raw` is a value this field's finite domain (if any) accepts.
+fn raw_is_accepted(field: &MenuField, raw: u64) -> bool {
+    if !field.options.is_empty() {
+        return field.option(raw).is_some();
+    }
+    if !field.allowed_values.is_empty() {
+        return field.allowed_values.contains(&raw);
+    }
+    true
+}
+
+/// Resolve an unsigned value with a fixed precedence: `0x` hex first, then a
+/// decimal raw value whenever the field accepts that raw, then an official
+/// English label or decompiled member name.
+///
+/// Numeric input therefore always means the raw value when that raw is
+/// valid; a numeric label of a different option can never capture it. A
+/// number the field rejects as a raw still falls through to label matching,
+/// so labels such as `500` (milliseconds) keep working where `500` is not a
+/// valid raw.
 fn parse_unsigned(field: &MenuField, text: &str) -> Result<u64> {
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        return Ok(u64::from_str_radix(hex, 16)?);
+    }
+    if let Ok(raw) = text.parse::<u64>()
+        && raw_is_accepted(field, raw)
+    {
+        return Ok(raw);
+    }
     if let Some(option) = field.options.iter().find(|option| {
         option.member.eq_ignore_ascii_case(text)
             || option
@@ -164,9 +192,6 @@ fn parse_unsigned(field: &MenuField, text: &str) -> Result<u64> {
                 .is_some_and(|label| label.eq_ignore_ascii_case(text))
     }) {
         return Ok(option.raw);
-    }
-    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        return Ok(u64::from_str_radix(hex, 16)?);
     }
     Ok(text.parse()?)
 }

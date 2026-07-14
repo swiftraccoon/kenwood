@@ -9,7 +9,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use kenwood_thd75::memory::MCP_D75_MENU_FIELDS;
+use kenwood_thd75::memory::{
+    Endian, FieldCodec, MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_VERSION, MCP_D75_SOURCE_SHA256,
+    MenuField, StringEncoding,
+};
 use kenwood_thd75::protocol::programming::TOTAL_SIZE;
 use serde_json::Value;
 
@@ -167,6 +170,358 @@ fn codec_span(operation: &Value) -> TestResult<usize> {
     }
 }
 
+fn optional_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+fn required_u64(value: &Value, key: &str) -> TestResult<u64> {
+    required(value, key)?
+        .as_u64()
+        .ok_or_else(|| invalid_data(format!("JSON property `{key}` is not an unsigned integer")))
+}
+
+fn required_i64(value: &Value, key: &str) -> TestResult<i64> {
+    required(value, key)?
+        .as_i64()
+        .ok_or_else(|| invalid_data(format!("JSON property `{key}` is not a signed integer")))
+}
+
+fn required_u8(value: &Value, key: &str) -> TestResult<u8> {
+    u8::try_from(required_u64(value, key)?)
+        .map_err(|_| invalid_data(format!("JSON property `{key}` does not fit in u8")))
+}
+
+fn enum_catalog<'a>(menu: &'a Value, enum_type: &str) -> TestResult<&'a [Value]> {
+    for catalog in required_array(menu, "enum_types")? {
+        if required_str(catalog, "name")? == enum_type {
+            return required_array(catalog, "options");
+        }
+    }
+    Err(invalid_data(format!("missing enum catalog `{enum_type}`")))
+}
+
+/// Smallest and largest raw value of an enum catalog, mirroring the
+/// generator's bounds derivation.
+fn enum_bounds(menu: &Value, enum_type: &str) -> TestResult<(u64, u64)> {
+    let mut bounds: Option<(u64, u64)> = None;
+    for option in enum_catalog(menu, enum_type)? {
+        let value = required_u64(option, "value")?;
+        bounds = Some(match bounds {
+            Some((minimum, maximum)) => (minimum.min(value), maximum.max(value)),
+            None => (value, value),
+        });
+    }
+    bounds.ok_or_else(|| invalid_data(format!("enum catalog `{enum_type}` has no options")))
+}
+
+/// Unsigned bounds of a field's declared domain, mirroring the generator.
+fn unsigned_domain_bounds(field: &Value) -> TestResult<Option<(u64, u64)>> {
+    let Some(domain) = field.get("domain") else {
+        return Ok(None);
+    };
+    match required_str(domain, "kind")? {
+        "range" => Ok(Some((
+            required_u64(domain, "min")?,
+            required_u64(domain, "max")?,
+        ))),
+        "choices" => {
+            let mut bounds: Option<(u64, u64)> = None;
+            for value in required_array(domain, "allowed_values")? {
+                let raw = value
+                    .as_u64()
+                    .ok_or_else(|| invalid_data("choice value is not an unsigned integer"))?;
+                bounds = Some(match bounds {
+                    Some((minimum, maximum)) => (minimum.min(raw), maximum.max(raw)),
+                    None => (raw, raw),
+                });
+            }
+            Ok(Some(bounds.ok_or_else(|| {
+                invalid_data("choice domain has no allowed values")
+            })?))
+        }
+        unexpected => Err(invalid_data(format!(
+            "unsupported field domain kind `{unexpected}`"
+        ))),
+    }
+}
+
+/// Signed bounds of a field's declared domain.
+fn signed_domain_bounds(field: &Value) -> TestResult<Option<(i64, i64)>> {
+    let Some(domain) = field.get("domain") else {
+        return Ok(None);
+    };
+    match required_str(domain, "kind")? {
+        "range" => Ok(Some((
+            required_i64(domain, "min")?,
+            required_i64(domain, "max")?,
+        ))),
+        unexpected => Err(invalid_data(format!(
+            "unsupported signed field domain kind `{unexpected}`"
+        ))),
+    }
+}
+
+/// Enum bounds first, then the declared domain, then the storage default —
+/// the generator's resolution order for unsigned codec bounds.
+fn resolved_unsigned_bounds(
+    menu: &Value,
+    field: &Value,
+    enum_type: Option<&str>,
+    default: (u64, u64),
+) -> TestResult<(u64, u64)> {
+    if let Some(enum_type) = enum_type {
+        return enum_bounds(menu, enum_type);
+    }
+    Ok(unsigned_domain_bounds(field)?.unwrap_or(default))
+}
+
+fn bounds_as_u8(name: &str, bounds: (u64, u64)) -> TestResult<(u8, u8)> {
+    let minimum = u8::try_from(bounds.0)
+        .map_err(|_| invalid_data(format!("field `{name}` minimum does not fit in u8")))?;
+    let maximum = u8::try_from(bounds.1)
+        .map_err(|_| invalid_data(format!("field `{name}` maximum does not fit in u8")))?;
+    Ok((minimum, maximum))
+}
+
+/// Rebuild the `FieldCodec` the generator derives from one manifest field.
+fn codec_from_manifest(menu: &Value, name: &str, field: &Value) -> TestResult<FieldCodec> {
+    let field_codec = codec(field)?;
+    let enum_type = optional_str(field_codec, "enum_type");
+    Ok(match required_str(field_codec, "kind")? {
+        "byte" => {
+            let bounds = resolved_unsigned_bounds(menu, field, enum_type, (0, 255))?;
+            let (min, max) = bounds_as_u8(name, bounds)?;
+            FieldCodec::Byte { min, max }
+        }
+        "bool" => FieldCodec::Bool,
+        "bit_field" => {
+            let bit = required_u8(field_codec, "bit")?;
+            let width = required_u8(field_codec, "width")?;
+            let low_bits = (1_u16 << width) - 1;
+            let mask = u8::try_from(low_bits << bit)
+                .map_err(|_| invalid_data(format!("field `{name}` bit range exceeds one byte")))?;
+            if optional_str(field_codec, "value_type") == Some("bool") {
+                FieldCodec::BitBool { mask }
+            } else {
+                let capacity = u64::from(low_bits);
+                let bounds = resolved_unsigned_bounds(menu, field, enum_type, (0, capacity))?;
+                let (min, max) = bounds_as_u8(name, bounds)?;
+                FieldCodec::BitField {
+                    mask,
+                    shift: bit,
+                    min,
+                    max,
+                }
+            }
+        }
+        "fixed_string" => {
+            let encoding = match required_str(field_codec, "encoding")? {
+                "utf8" => StringEncoding::Utf8,
+                "memory_map" => StringEncoding::MemoryMap,
+                unexpected => {
+                    return Err(invalid_data(format!(
+                        "unsupported string encoding `{unexpected}`"
+                    )));
+                }
+            };
+            FieldCodec::FixedString {
+                len: required_usize(field_codec, "length")?,
+                encoding,
+                padding: required_u8(field_codec, "padding")?,
+            }
+        }
+        "unsigned_le" => {
+            let width = required_u8(field_codec, "width")?;
+            let default_max = if width >= 8 {
+                u64::MAX
+            } else {
+                (1_u64 << (8 * u32::from(width))) - 1
+            };
+            let (min, max) = unsigned_domain_bounds(field)?.unwrap_or((0, default_max));
+            FieldCodec::Unsigned {
+                width,
+                endian: Endian::Little,
+                min,
+                max,
+            }
+        }
+        "signed_le" => {
+            let width = required_u8(field_codec, "width")?;
+            let defaults = if width >= 8 {
+                (i64::MIN, i64::MAX)
+            } else {
+                let half = 1_i64 << (8 * u32::from(width) - 1);
+                (-half, half - 1)
+            };
+            let (min, max) = signed_domain_bounds(field)?.unwrap_or(defaults);
+            FieldCodec::Signed {
+                width,
+                endian: Endian::Little,
+                min,
+                max,
+            }
+        }
+        "raw_bytes" => FieldCodec::Bytes {
+            len: required_usize(field_codec, "length")?,
+        },
+        unexpected => {
+            return Err(invalid_data(format!(
+                "unsupported registry codec kind `{unexpected}`"
+            )));
+        }
+    })
+}
+
+fn assert_options_match(menu: &Value, enum_type: &str, field: &MenuField) -> TestResult {
+    let catalog = enum_catalog(menu, enum_type)?;
+    let name = field.descriptor.name;
+    assert_eq!(
+        field.options.len(),
+        catalog.len(),
+        "enum option count for `{name}`"
+    );
+    for (actual, expected) in field.options.iter().zip(catalog) {
+        assert_eq!(
+            actual.raw,
+            required_u64(expected, "value")?,
+            "option raw value for `{name}`"
+        );
+        assert_eq!(
+            actual.member,
+            required_str(expected, "member")?,
+            "option member for `{name}`"
+        );
+        assert_eq!(
+            actual.label,
+            optional_str(expected, "label"),
+            "option label for `{name}`"
+        );
+        assert_eq!(
+            actual.resource_key,
+            optional_str(expected, "resource_key"),
+            "option resource key for `{name}`"
+        );
+    }
+    Ok(())
+}
+
+fn assert_allowed_values_match(json_field: &Value, field: &MenuField) -> TestResult {
+    let name = field.descriptor.name;
+    let choices = match json_field.get("domain") {
+        Some(domain) if optional_str(domain, "kind") == Some("choices") => {
+            Some(required_array(domain, "allowed_values")?)
+        }
+        _ => None,
+    };
+    if let Some(values) = choices {
+        assert_eq!(
+            field.allowed_values.len(),
+            values.len(),
+            "allowed-value count for `{name}`"
+        );
+        for (actual, expected) in field.allowed_values.iter().zip(values) {
+            let expected = expected
+                .as_u64()
+                .ok_or_else(|| invalid_data("choice value is not an unsigned integer"))?;
+            assert_eq!(*actual, expected, "allowed value for `{name}`");
+        }
+    } else {
+        assert!(
+            field.allowed_values.is_empty(),
+            "field `{name}` must not carry allowed values"
+        );
+    }
+    Ok(())
+}
+
+/// Compare one generated registry entry against its manifest field on every
+/// dimension the write path consumes.
+fn assert_registry_field_matches(
+    menu: &Value,
+    json_field: &Value,
+    field: &MenuField,
+) -> TestResult {
+    let name = field.descriptor.name;
+    let menu_name = required_str(menu, "menu")?;
+    assert_eq!(field.menu, menu_name, "menu group for `{name}`");
+    assert_eq!(
+        field.descriptor.offset,
+        required_usize(json_field, "offset")?,
+        "offset for `{name}`"
+    );
+    assert_eq!(
+        field.enum_type,
+        optional_str(codec(json_field)?, "enum_type"),
+        "enum type for `{name}`"
+    );
+    assert_eq!(
+        field.descriptor.codec,
+        codec_from_manifest(menu, name, json_field)?,
+        "codec for `{name}`"
+    );
+    if let Some(enum_type) = field.enum_type {
+        assert_options_match(menu, enum_type, field)?;
+    } else {
+        assert!(
+            field.options.is_empty(),
+            "non-enum field `{name}` must have no options"
+        );
+    }
+    assert_allowed_values_match(json_field, field)?;
+    assert_transform_matches(json_field, field)?;
+    assert_eq!(
+        field.is_blob,
+        optional_str(json_field, "category") == Some("blob"),
+        "blob flag for `{name}`"
+    );
+    if !field.options.is_empty() || !field.allowed_values.is_empty() {
+        assert_eq!(
+            field.descriptor.codec.value_kind(),
+            "unsigned",
+            "finite-domain field `{name}` must use an unsigned storage codec so \
+             plan_value's domain gate applies"
+        );
+    }
+    Ok(())
+}
+
+fn assert_transform_matches(json_field: &Value, field: &MenuField) -> TestResult {
+    let name = field.descriptor.name;
+    match (json_field.get("storage_transform"), field.storage_transform) {
+        (Some(json), Some(actual)) => {
+            assert_eq!(
+                required_str(json, "kind")?,
+                "scaled_integer",
+                "storage transform kind for `{name}`"
+            );
+            assert_eq!(
+                actual.input_unit,
+                required_str(json, "input_unit")?,
+                "storage transform unit for `{name}`"
+            );
+            assert_eq!(
+                actual.numerator,
+                required_i64(json, "numerator")?,
+                "storage transform numerator for `{name}`"
+            );
+            assert_eq!(
+                actual.denominator,
+                required_i64(json, "denominator")?,
+                "storage transform denominator for `{name}`"
+            );
+        }
+        (None, None) => {}
+        (json, registry) => {
+            return Err(invalid_data(format!(
+                "storage transform presence differs for `{name}`: manifest {}, registry {}",
+                json.is_some(),
+                registry.is_some()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn assert_pinned_summary(schema: &Value) -> TestResult {
     let summary = required(schema, "summary")?;
     let expected = [
@@ -200,8 +555,14 @@ fn assert_pinned_summary(schema: &Value) -> TestResult {
 
     assert_eq!(
         required_usize(schema, "schema_version")?,
-        3,
+        usize::try_from(MCP_D75_SCHEMA_VERSION)?,
         "schema version"
+    );
+    let source = required(schema, "source")?;
+    assert_eq!(
+        required_str(source, "normalized_source_sha256")?,
+        MCP_D75_SOURCE_SHA256,
+        "manifest and generated registry must come from the same reviewed source"
     );
     for (property, expected_count, description) in expected {
         assert_eq!(
@@ -367,7 +728,7 @@ fn every_codec_range_fits_the_complete_mcp_image() -> TestResult {
 #[test]
 fn generated_registry_exactly_matches_safe_manifest_fields() -> TestResult {
     let schema = load_schema()?;
-    let mut expected = HashMap::<String, usize>::new();
+    let mut expected = HashMap::<String, (&Value, &Value)>::new();
     let mut expanded_count = 0usize;
     let mut blocked_expanded_count = 0usize;
 
@@ -380,9 +741,8 @@ fn generated_registry_exactly_matches_safe_manifest_fields() -> TestResult {
                 continue;
             }
             let name = format!("{menu_name}.{}", required_str(operation, "name")?);
-            let offset = required_usize(operation, "offset")?;
             assert!(
-                expected.insert(name.clone(), offset).is_none(),
+                expected.insert(name.clone(), (menu, operation)).is_none(),
                 "duplicate writable manifest field `{name}`"
             );
         }
@@ -408,7 +768,7 @@ fn generated_registry_exactly_matches_safe_manifest_fields() -> TestResult {
                     "expanded field `{name}` exceeds the MCP image"
                 );
                 assert!(
-                    expected.insert(name.clone(), offset).is_none(),
+                    expected.insert(name.clone(), (menu, field)).is_none(),
                     "duplicate writable expanded field `{name}`"
                 );
             }
@@ -428,12 +788,13 @@ fn generated_registry_exactly_matches_safe_manifest_fields() -> TestResult {
     );
 
     for field in MCP_D75_MENU_FIELDS {
-        assert_eq!(
-            expected.remove(field.descriptor.name),
-            Some(field.descriptor.offset),
-            "generated field {} must have the manifest offset",
-            field.descriptor.name
-        );
+        let name = field.descriptor.name;
+        let Some((menu, json_field)) = expected.remove(name) else {
+            return Err(invalid_data(format!(
+                "registry field `{name}` is not a writable manifest field"
+            )));
+        };
+        assert_registry_field_matches(menu, json_field, field)?;
     }
     assert!(
         expected.is_empty(),
@@ -750,6 +1111,27 @@ fn real_memory_dump_values_agree_with_official_schema_anchors() -> TestResult {
         dump.get(name_offset..name_end),
         Some(expected_name.as_slice()),
         "raw fixture Bluetooth device name at its official schema offset"
+    );
+
+    let gateway = find_expanded_field(
+        &schema,
+        "dv",
+        "MyCallsignDvGatewayList[0].MyCallsignDvGateway",
+    )?;
+    let gateway_codec = codec(gateway)?;
+    assert_eq!(
+        required_usize(gateway_codec, "padding")?,
+        32,
+        "MY gateway callsigns use space padding"
+    );
+    let gateway_offset = required_usize(gateway, "offset")?;
+    let gateway_end = gateway_offset
+        .checked_add(required_usize(gateway_codec, "length")?)
+        .ok_or_else(|| invalid_data("gateway callsign range overflow"))?;
+    assert_eq!(
+        dump.get(gateway_offset..gateway_end),
+        Some(b"KQ4NIT  ".as_slice()),
+        "stored MY gateway callsign is space-padded on hardware"
     );
     Ok(())
 }

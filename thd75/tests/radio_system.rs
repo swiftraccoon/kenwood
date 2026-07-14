@@ -253,22 +253,9 @@ async fn set_vox_via_mcp_enables() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(start_paused = true)]
-async fn set_lock_via_mcp_enables() -> TestResult {
-    // Offset 0x1060 => page 0x0010, byte index 0x60.
-    let page: u16 = 0x0010;
-    let byte_index: usize = 0x60;
-
-    let original = [0u8; 256];
-    let expected = patch_page(&original, byte_index, 1)?;
-
-    let mut mock = MockTransport::new();
-    mock_modify_page_sequence(&mut mock, page, &original, &expected)?;
-
-    let mut radio = Radio::connect(mock).await?;
-    radio.set_lock_via_mcp(true).await?;
-    Ok(())
-}
+// NOTE: `set_lock_via_mcp` no longer exists — MCP offset 0x1060 is
+// `radio.BacklightControl` in the MCP-D75 registry, and the lock state
+// is runtime-only (CAT LC/DL, covered by `lock_control` above).
 
 #[tokio::test(start_paused = true)]
 async fn set_bluetooth_via_mcp_enables() -> TestResult {
