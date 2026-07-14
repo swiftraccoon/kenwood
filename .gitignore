@@ -2,6 +2,7 @@
 /target
 */target
 Cargo.lock
+__pycache__/
 
 # Local
 *.log

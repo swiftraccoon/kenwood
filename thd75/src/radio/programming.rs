@@ -391,6 +391,93 @@ impl<T: Transport> Radio<T> {
     // High-level: read-modify-write
     // -----------------------------------------------------------------------
 
+    /// Read, modify, and selectively write a sparse set of memory pages in
+    /// one MCP programming session.
+    ///
+    /// `pages` may be unordered and may contain duplicates. Each distinct
+    /// page is read exactly once before `modify` is called for any page. The
+    /// callback then receives each page in ascending order and can apply byte,
+    /// string, or masked bit-field patches in place. Only pages whose contents
+    /// actually changed are written, and every write is verified by read-back.
+    /// The returned page numbers are the pages that were written.
+    ///
+    /// An empty page list is a no-op: programming mode is not entered and the
+    /// callback is not called.
+    ///
+    /// # Connection lifetime
+    ///
+    /// The connection drops during the programming-mode transition; the exit
+    /// path waits out the radio's reset and reconnects, so this method returns
+    /// with the radio answering CAT commands again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MemoryWriteProtected`] before any I/O if any requested
+    /// page is in the factory calibration region. Returns an error if entry,
+    /// any page read, a changed-page write or verification, or exit fails.
+    /// Programming mode is always exited after a successful entry, even when
+    /// a read, write, or verification fails.
+    pub async fn modify_memory_pages<F>(
+        &mut self,
+        pages: &[u16],
+        mut modify: F,
+    ) -> Result<Vec<u16>, Error>
+    where
+        F: FnMut(u16, &mut [u8; programming::PAGE_SIZE]),
+    {
+        let pages: std::collections::BTreeSet<u16> = pages.iter().copied().collect();
+
+        // Validate the complete request before entering MCP mode. This also
+        // prevents a mixed settings/calibration request from partially
+        // applying its safe pages before the protected page is discovered.
+        for &page in &pages {
+            if programming::is_factory_calibration_page(page) {
+                return Err(Error::MemoryWriteProtected { page });
+            }
+        }
+
+        if pages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.enter_programming_mode().await?;
+
+        let result: Result<Vec<u16>, Error> = async {
+            // Read every requested page before running the patch callback or
+            // writing anything. A failed read therefore cannot leave a
+            // partially patched set of pages on the radio.
+            let mut page_data = Vec::with_capacity(pages.len());
+            for page in pages {
+                let original = self.read_single_page(page).await?;
+                page_data.push((page, original, original));
+            }
+
+            for (page, _, modified) in &mut page_data {
+                modify(*page, modified);
+            }
+
+            let mut changed_pages = Vec::new();
+            for (page, original, modified) in &page_data {
+                if original != modified {
+                    self.write_single_page(*page, modified).await?;
+                    changed_pages.push(*page);
+                }
+            }
+
+            Ok(changed_pages)
+        }
+        .await;
+
+        // Always exit programming mode after a successful entry, including
+        // read and verified-write failure paths.
+        let exit_result = self.exit_programming_mode().await;
+
+        let changed_pages = result?;
+        exit_result?;
+
+        Ok(changed_pages)
+    }
+
     /// Read a memory page, apply in-place modifications, and write it back
     /// in a single MCP programming session.
     ///
@@ -1744,6 +1831,134 @@ mod tests {
 
         let mut radio = Radio::connect(mock).await?;
         radio.write_page(page, &page_data).await?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn modify_memory_pages_reads_all_and_writes_only_changed_pages() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let low_page = 0x0010;
+        let high_page = 0x0152;
+        let low_original = vec![0x11; programming::PAGE_SIZE];
+        let high_original = vec![0x22; programming::PAGE_SIZE];
+
+        // Input is deliberately unordered and duplicated. The implementation
+        // reads each unique page once, in ascending order, before any write.
+        let low_read = programming::build_read_command(low_page);
+        mock.expect(&low_read, &build_w_response(low_page, &low_original)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        let high_read = programming::build_read_command(high_page);
+        mock.expect(&high_read, &build_w_response(high_page, &high_original)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // Only the low page is changed. The high page therefore has no write
+        // exchange in the strict mock script.
+        let mut low_modified = low_original.clone();
+        set_byte(&mut low_modified, 0x34, 0xA5)?;
+        let low_modified_array = into_page_array(low_modified.clone())?;
+        let low_write = programming::build_write_command(low_page, &low_modified_array);
+        mock.expect(&low_write, &[programming::ACK]);
+        mock.expect(&low_read, &build_w_response(low_page, &low_modified)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        let mut visited = Vec::new();
+        let changed = radio
+            .modify_memory_pages(&[high_page, low_page, high_page], |page, data| {
+                visited.push(page);
+                if page == low_page
+                    && let Some(byte) = data.get_mut(0x34)
+                {
+                    *byte = 0xA5;
+                }
+            })
+            .await?;
+
+        assert_eq!(
+            visited,
+            vec![low_page, high_page],
+            "callback should visit each distinct page in ascending order"
+        );
+        assert_eq!(
+            changed,
+            vec![low_page],
+            "only the byte-different page should be written"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn modify_memory_pages_rejects_protected_page_before_io() -> TestResult {
+        let mock = MockTransport::new();
+        let mut radio = Radio::connect(mock).await?;
+        let mut callback_called = false;
+
+        let result = radio
+            .modify_memory_pages(&[0x0010, 0x07A1], |_, _| callback_called = true)
+            .await;
+
+        assert!(
+            matches!(result, Err(Error::MemoryWriteProtected { page: 0x07A1 })),
+            "request should be rejected with the protected page number"
+        );
+        assert!(
+            !callback_called,
+            "callback must not run for a protected request"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn modify_memory_pages_empty_request_is_noop() -> TestResult {
+        let mock = MockTransport::new();
+        let mut radio = Radio::connect(mock).await?;
+        let mut callback_called = false;
+
+        let changed = radio
+            .modify_memory_pages(&[], |_, _| callback_called = true)
+            .await?;
+
+        assert!(changed.is_empty(), "an empty request cannot write pages");
+        assert!(
+            !callback_called,
+            "an empty request must not invoke the callback"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn modify_memory_pages_exits_after_read_failure() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page = 0x0010;
+        let read = programming::build_read_command(page);
+        // A short response is followed by MockTransport's WouldBlock error,
+        // which fails the page read without triggering the timeout retry.
+        mock.expect(&read, b"W");
+
+        mock.expect(b"E", &[]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.modify_memory_pages(&[page], |_, _| {}).await;
+
+        assert!(
+            matches!(result, Err(Error::Transport(_))),
+            "short page response should surface as a transport error: {result:?}"
+        );
+        radio.transport.assert_complete();
         Ok(())
     }
 

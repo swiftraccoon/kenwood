@@ -22,6 +22,9 @@ pub mod aprs;
 pub mod channels;
 pub mod dstar;
 pub mod gps;
+pub mod menu_fields;
+mod menu_patch;
+pub mod schema;
 pub mod settings;
 
 use crate::sdcard::SdCardError;
@@ -99,6 +102,14 @@ pub use aprs::AprsAccess;
 pub use channels::{ChannelAccess, ChannelWriter};
 pub use dstar::DstarAccess;
 pub use gps::GpsAccess;
+pub use menu_fields::{
+    MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_VERSION, MCP_D75_SOURCE_SHA256, MenuField, MenuOption,
+    StorageTransform, menu_field,
+};
+pub use schema::{
+    BytePatch, DecodedFieldValue, Endian, FieldCodec, FieldDescriptor, FieldValue, PagePatch,
+    PatchPlanner, PatchSet, SchemaError, StringEncoding,
+};
 pub use settings::{SettingsAccess, SettingsWriter};
 
 // ---------------------------------------------------------------------------
@@ -171,6 +182,21 @@ impl MemoryImage {
     #[must_use]
     pub fn as_raw_mut(&mut self) -> &mut [u8] {
         &mut self.raw
+    }
+
+    /// Apply a schema-generated menu patch set to this complete image.
+    ///
+    /// This is the offline counterpart to
+    /// [`Radio::apply_menu_patches`](crate::radio::Radio::apply_menu_patches).
+    /// Masked bit fields preserve unrelated bits already present in the
+    /// image.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaError::OutOfBounds`] if a patch references bytes
+    /// outside this image.
+    pub fn apply_menu_patches(&mut self, patches: &PatchSet) -> Result<(), SchemaError> {
+        patches.apply_to_image(&mut self.raw)
     }
 
     /// Access channel data (read-only).

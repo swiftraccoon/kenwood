@@ -17,6 +17,7 @@ pub mod freq;
 pub mod gps;
 pub mod kiss_session;
 pub mod memory;
+pub mod menu;
 pub mod mmdvm_session;
 pub mod programming;
 pub mod scan;
