@@ -56,7 +56,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use crate::error::AprsIsError;
 use crate::events::{AprsIsEvent, AprsIsPacket};
 use crate::line::{format_is_packet, parse_is_line};
-use crate::login::{AprsIsConfig, build_login_string};
+use crate::login::{AprsIsConfig, Passcode, build_login_string};
 
 /// Extract the server hostname from a `# logresp ... verified, server X`
 /// comment line. Returns `None` if the `server` clause is absent.
@@ -457,6 +457,17 @@ impl AprsIsClient {
             // latter is a substring of the former.
             if line.contains("unverified") {
                 self.logged_in_emitted = true;
+                // "unverified" is the expected success response to a
+                // receive-only (wire passcode -1) login: the server
+                // keeps the connection open and serves the filtered
+                // feed, it just will not gate our packets to RF. Only
+                // a login that sent a real passcode treats
+                // "unverified" as a rejection (wrong passcode).
+                if self.config.passcode == Passcode::ReceiveOnly {
+                    let server = parse_logresp_server(line);
+                    tracing::info!(response = %line, ?server, "APRS-IS receive-only login accepted");
+                    return Ok(AprsIsEvent::LoggedIn { server });
+                }
                 tracing::warn!(response = %line, "APRS-IS login rejected");
                 return Ok(AprsIsEvent::LoginRejected {
                     reason: line.to_owned(),
@@ -845,11 +856,41 @@ mod tests {
         })
         .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        // A login that SENT a real passcode and got "unverified" back
+        // was genuinely rejected (wrong passcode).
+        let mut config = test_config(addr);
+        config.passcode = Passcode::for_callsign("N0CALL");
+        let mut client = AprsIsClient::connect(config).await?;
         let event = client.next_event().await?;
         assert!(
             matches!(event, AprsIsEvent::LoginRejected { ref reason } if reason.contains("unverified")),
             "expected LoginRejected, got {event:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_event_accepts_unverified_for_receive_only_login() -> TestResult {
+        let addr = spawn_mock_server(|mut stream| async move {
+            let mut buf = [0u8; 512];
+            let _ = read_some(&mut stream, &mut buf).await;
+            write_all_ignore(
+                &mut stream,
+                b"# logresp N0CALL-14 unverified, server T2TEST\r\n",
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        })
+        .await?;
+
+        // "unverified" is the EXPECTED success response to a
+        // receive-only (passcode -1) login: the server keeps serving
+        // the filtered feed, it just will not gate our packets to RF.
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        let event = client.next_event().await?;
+        assert!(
+            matches!(event, AprsIsEvent::LoggedIn { ref server } if server.as_deref() == Some("T2TEST")),
+            "expected LoggedIn for receive-only unverified, got {event:?}"
         );
         Ok(())
     }
