@@ -76,6 +76,9 @@ pub mod check;
 /// Transmit confirmation prompt and script-mode gating.
 pub mod confirm;
 
+/// Argument parsing for APRS-mode commands (pure, unit-testable).
+pub mod aprs_args;
+
 /// Global flag for timestamp output mode.
 ///
 /// When `true`, the [`aprintln!`] macro prepends a `[HH:MM:SS]`
