@@ -108,6 +108,15 @@ enum Cmd {
         #[command(subcommand)]
         action: CtlAction,
     },
+    /// Export a recording's vocoder-parameter features (170 f32 per
+    /// 20 ms frame, little-endian, gap-concealed) for codec-domain
+    /// ASR training.
+    Features {
+        /// Input `.ambe` frame container.
+        input: PathBuf,
+        /// Output raw f32 file.
+        out: PathBuf,
+    },
 }
 
 /// Actions for `stargazer ctl`.
@@ -149,6 +158,18 @@ async fn main() -> ExitCode {
             once,
         }) => survey(&out, interval, once).await,
         Some(Cmd::Report { out, window_hours }) => report(&out, window_hours),
+        Some(Cmd::Features { input, out }) => {
+            match stargazer::features::export_file(&input, &out) {
+                Ok(frames) => {
+                    tracing::info!(frames, out = %out.display(), "features exported");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "feature export failed");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some(Cmd::Harvest {
             recordings,
             date,
