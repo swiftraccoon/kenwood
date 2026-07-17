@@ -33,6 +33,7 @@ pub fn build(name: &str) -> Option<MockTransport> {
         "simple" => Some(simple_scenario()),
         "empty" => Some(MockTransport::new()),
         "mmdvm" => Some(mmdvm_scenario()),
+        "aprs" => Some(aprs_scenario()),
         _ => None,
     }
 }
@@ -67,6 +68,43 @@ fn simple_scenario() -> MockTransport {
     // without having to predict the exact wire output. Subsequent
     // reads will error (pending_response empty), which surfaces as
     // command-level errors that the script can absorb.
+    mock.expect_any_write();
+
+    mock
+}
+
+/// Radio that identifies normally, then accepts a KISS-mode entry so
+/// the APRS transmit commands can be driven end-to-end.
+///
+/// Extends the [`simple_scenario`] startup (connect preamble + `ID` +
+/// `FV`) with the `TN 2,0\r` KISS-entry echo that
+/// [`AprsClient::start`](kenwood_thd75::AprsClient) waits for at the
+/// default 1200 bps. After that, [`MockTransport::expect_any_write`]
+/// absorbs every KISS frame the transmit commands emit (they are
+/// write-only), so an integration test can exercise `position`,
+/// `compressed`, `mice`, `object`, `status`, and `motion` without
+/// predicting exact wire bytes — the per-format wire encodings are
+/// already pinned by the `kenwood-thd75` and `aprs` unit tests.
+fn aprs_scenario() -> MockTransport {
+    let mut mock = MockTransport::new();
+
+    // connect_safe preamble (identical to the simple scenario).
+    mock.expect(b"\r", b"");
+    mock.expect(b"\r", b"");
+    mock.expect(&[0x03], b"");
+    mock.expect(b"\rTC 1\r", b"");
+    mock.expect(b"TN 0,0\r", b"");
+
+    // Startup identification, so the REPL enters normal CAT mode.
+    mock.expect(b"ID\r", b"ID TH-D75\r");
+    mock.expect(b"FV\r", b"FV 1.03.00\r");
+
+    // `aprs start` enters KISS mode at 1200 bps (TncBaud::Bps1200 = 0),
+    // which sends `TN 2,0\r` and waits for the echo.
+    mock.expect(b"TN 2,0\r", b"TN 2,0\r");
+
+    // Every subsequent KISS transmit frame and the KISS-exit frame from
+    // `aprs stop` are write-only; absorb them without validation.
     mock.expect_any_write();
 
     mock

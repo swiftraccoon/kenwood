@@ -1595,13 +1595,19 @@ async fn enter_aprs(
             if parsed.digi {
                 println!("Digipeater enabled: WIDE1-1 fill-in.");
             }
-            println!(
-                "Commands: monitor, msg, position, compressed, mice, object, status, motion, beacon, stations, igate, aprs stop"
-            );
+            print_aprs_command_list();
             Ok(client)
         }
         Err((radio, e)) => Err((radio, format!("{e}"))),
     }
+}
+
+/// Print the APRS-mode command list, wrapped across two lines so each
+/// stays within the accessibility line-length limit (80 characters).
+/// Shared by the mode-entry banner and the unrecognized-command hint.
+fn print_aprs_command_list() {
+    println!("Commands: monitor, msg, position, compressed, mice, object,");
+    println!("  status, motion, beacon, stations, igate, aprs stop");
 }
 
 /// Dispatch a command in APRS mode.
@@ -1837,11 +1843,10 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
             let filter = parts.get(1..).unwrap_or(&[]).join(" ");
             run_igate(client, &filter).await;
         }
-        _ => println!(
-            "APRS command not recognized: {cmd}. \
-             Commands: monitor, msg, position, compressed, mice, object, status, motion, \
-             beacon, stations, igate, aprs stop"
-        ),
+        _ => {
+            println!("APRS command not recognized: {cmd}.");
+            print_aprs_command_list();
+        }
     }
 }
 

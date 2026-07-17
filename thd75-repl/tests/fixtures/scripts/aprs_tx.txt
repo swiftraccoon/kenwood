@@ -1,0 +1,11 @@
+# APRS transmit surface — drives every TX command through the REPL
+# against the `aprs` mock scenario. Requires --yes (script-mode TX gate).
+aprs start N0CALL 7
+position 35.30 -82.46 Portable
+compressed 35.30 -82.46 Portable
+mice 35.30 -82.46 25 90 Portable
+object TESTOBJ 35.31 -82.45 Field day
+status QRV testing
+motion 35.30 -82.46 80 90
+aprs stop
+quit

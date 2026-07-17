@@ -42,14 +42,27 @@ fn run_with_script(
     fixture: &str,
     scenario: &str,
 ) -> Result<(bool, String, String), Box<dyn std::error::Error>> {
+    run_with_script_args(fixture, scenario, &[])
+}
+
+/// Like [`run_with_script`] but appends extra CLI arguments — used by the
+/// APRS transmit test, which needs `--yes` to clear the script-mode
+/// transmit confirmation gate.
+fn run_with_script_args(
+    fixture: &str,
+    scenario: &str,
+    extra: &[&str],
+) -> Result<(bool, String, String), Box<dyn std::error::Error>> {
     let script = fixtures_dir().join(fixture);
+    let mut args = vec![
+        "--script".to_string(),
+        script.to_str().ok_or("fixture path is utf8")?.to_string(),
+        "--mock-radio".to_string(),
+        scenario.to_string(),
+    ];
+    args.extend(extra.iter().map(|s| (*s).to_string()));
     let output = Command::new(env!("CARGO_BIN_EXE_thd75-repl"))
-        .args([
-            "--script",
-            script.to_str().ok_or("fixture path is utf8")?,
-            "--mock-radio",
-            scenario,
-        ])
+        .args(&args)
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -109,6 +122,51 @@ fn terminal_mode_guard_intercepts_cat_commands() -> TestResult {
     assert!(
         lint_result.is_ok(),
         "terminal-mode stdout violates rules: {lint_result:#?}\nstdout:\n{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn aprs_transmit_surface_drives_every_command() -> TestResult {
+    // Drive the full APRS transmit surface through the REPL against the
+    // `aprs` mock scenario. `--yes` clears the script-mode transmit
+    // gate so each command actually keys the (mock) radio. This proves
+    // the dispatch glue — argument parsing wired to the right client
+    // method in the right order — end-to-end; the exact wire bytes per
+    // format are pinned separately by the library unit tests.
+    let (ok, stdout, stderr) = run_with_script_args("aprs_tx.txt", "aprs", &["--yes"])?;
+    assert!(
+        ok,
+        "expected clean exit; stdout={stdout:?} stderr={stderr:?}"
+    );
+
+    for expected in [
+        "Entering APRS mode as N0CALL-7",
+        "Position beacon sent: 35.3000, -82.4600 (Portable).",
+        "Compressed position beacon sent: 35.3000, -82.4600.",
+        // Argument-wiring proof: lat, lon, speed, and course must all
+        // land in the right slots — a swap would show here.
+        "Mic-E beacon sent: 35.3000, -82.4600, 25 knots, course 90.",
+        "Object TESTOBJ sent at 35.3100, -82.4500.",
+        "Status sent: QRV testing",
+        // Just "Motion updated." — whether SmartBeaconing also fires a
+        // beacon depends on the shared beacon timer, which the earlier
+        // position/compressed/mice sends have just reset, so no beacon
+        // is due here. The beacon-timing logic itself is covered by the
+        // library's SmartBeaconing tests.
+        "Motion updated.",
+        "APRS mode stopped. Returned to CAT mode.",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    let lint_result = lint::check_output(&stdout);
+    assert!(
+        lint_result.is_ok(),
+        "APRS transmit stdout violates accessibility rules: {lint_result:#?}\nstdout:\n{stdout}"
     );
     Ok(())
 }
