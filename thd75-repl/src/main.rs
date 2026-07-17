@@ -39,7 +39,7 @@ use dstar_gateway_core::slowdata::{SlowDataTextCollector, encode_text_message};
 use kenwood_thd75::LinkDiagnosis;
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::EitherTransport;
-use kenwood_thd75::{AprsClient, AprsClientConfig, AprsEvent};
+use kenwood_thd75::{AprsClient, AprsClientConfig, AprsEvent, Ax25Address, DigipeaterConfig};
 use kenwood_thd75::{DStarEvent, DStarGateway, DStarGatewayConfig};
 
 use dstar_gateway::auth::AuthClient;
@@ -1337,22 +1337,14 @@ async fn run_repl(
 
                 // Check for mode transitions.
                 if cmd == "aprs" && parts.get(1).is_some_and(|s| *s == "start") {
-                    if parts.get(2).is_none() {
-                        println!("Error: callsign required. Usage: aprs start <callsign> [ssid]");
-                        println!("Example: aprs start W1AW 7");
-                        ReplState::Cat(radio)
-                    } else {
-                        match enter_aprs(*radio, parts.get(2..).unwrap_or(&[])).await {
-                            Ok(client) => ReplState::Aprs(Box::new(client)),
-                            Err((radio_back, e)) => {
-                                println!(
-                                    "{}",
-                                    thd75_repl::output::error(format_args!(
-                                        "entering APRS mode: {e}"
-                                    ))
-                                );
-                                ReplState::Cat(Box::new(radio_back))
-                            }
+                    match enter_aprs(*radio, parts.get(2..).unwrap_or(&[])).await {
+                        Ok(client) => ReplState::Aprs(Box::new(client)),
+                        Err((radio_back, e)) => {
+                            println!(
+                                "{}",
+                                thd75_repl::output::error(format_args!("entering APRS mode: {e}"))
+                            );
+                            ReplState::Cat(Box::new(radio_back))
                         }
                     }
                 } else if cmd == "dstar" && parts.get(1).is_some_and(|s| *s == "start") {
@@ -1508,8 +1500,9 @@ async fn dispatch_cat(radio: &mut Radio<EitherTransport>, cmd: &str, parts: &[&s
             if parts.get(1).is_some_and(|s| *s == "start") {
                 // Handled by caller after dispatch.
             } else {
-                println!("Usage: aprs start <callsign>");
+                println!("Usage: aprs start <callsign> [ssid] [digi]");
                 println!("  Enters APRS KISS mode. Type aprs stop to exit.");
+                println!("  Add digi to enable the WIDE1-1 fill-in digipeater.");
             }
         }
         "dstar" => {
@@ -1535,33 +1528,41 @@ async fn enter_aprs(
     radio: Radio<EitherTransport>,
     args: &[&str],
 ) -> Result<AprsClient<EitherTransport>, (Radio<EitherTransport>, String)> {
-    // AX.25 callsigns are upper-case on the wire; normalize here so
-    // a lower-case `aprs start w1aw` behaves like the intended call.
-    let Some(raw_callsign) = args.first() else {
-        return Err((radio, "callsign required".to_string()));
+    let parsed = match thd75_repl::aprs_args::parse_start(args) {
+        Ok(p) => p,
+        Err(e) => return Err((radio, e)),
     };
-    let callsign = raw_callsign.to_ascii_uppercase();
-    let ssid: u8 = match args.get(1) {
-        None => 0,
-        // Reject rather than silently beaconing as SSID 0 when the
-        // argument is not a valid SSID (e.g. `aprs start W1AW seven`).
-        Some(s) => match s.parse::<u8>() {
-            Ok(n) if n <= 15 => n,
-            _ => {
-                return Err((
-                    radio,
-                    format!("invalid SSID {s:?}. Use a number from 0 through 15."),
-                ));
-            }
-        },
-    };
-    println!("Leaving normal radio control. Entering APRS mode as {callsign}-{ssid}.");
+    println!(
+        "Leaving normal radio control. Entering APRS mode as {}-{}.",
+        parsed.callsign, parsed.ssid
+    );
 
-    let config = AprsClientConfig::new(&callsign, ssid);
+    let config = if parsed.digi {
+        let addr = match Ax25Address::new(&parsed.callsign, parsed.ssid) {
+            Ok(a) => a,
+            Err(e) => return Err((radio, format!("invalid callsign for digipeater: {e}"))),
+        };
+        let digi_cfg = DigipeaterConfig::new(addr, vec!["WIDE1-1".to_string()], None, None);
+        match AprsClientConfig::builder(&parsed.callsign, parsed.ssid)
+            .digipeater(digi_cfg)
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => return Err((radio, format!("{e}"))),
+        }
+    } else {
+        AprsClientConfig::new(&parsed.callsign, parsed.ssid)
+    };
+
     match AprsClient::start(radio, config).await {
         Ok(client) => {
             println!("{}", thd75_repl::output::aprs_mode_active());
-            println!("Commands: monitor, msg, position, beacon, stations, igate, aprs stop");
+            if parsed.digi {
+                println!("Digipeater enabled: WIDE1-1 fill-in.");
+            }
+            println!(
+                "Commands: monitor, msg, position, compressed, mice, object, status, motion, beacon, stations, igate, aprs stop"
+            );
             Ok(client)
         }
         Err((radio, e)) => Err((radio, format!("{e}"))),
@@ -1620,23 +1621,17 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
             }
         }
         "position" | "pos" => {
-            if parts.len() < 3 {
-                println!("Usage: position <lat> <lon> [comment]");
-                println!("  Example: position 35.30 -82.46 Portable");
-                return;
-            }
-            let Some(Ok(lat)) = parts.get(1).map(|s| s.parse::<f64>()) else {
-                println!("Error: invalid latitude. Use decimal degrees (e.g. 35.30).");
-                return;
-            };
-            let Some(Ok(lon)) = parts.get(2).map(|s| s.parse::<f64>()) else {
-                println!("Error: invalid longitude. Use decimal degrees (e.g. -82.46).");
-                return;
+            let args = match thd75_repl::aprs_args::parse_position(parts.get(1..).unwrap_or(&[])) {
+                Ok(a) => a,
+                Err(e) => {
+                    println!("Error: {e}");
+                    return;
+                }
             };
             if !thd75_repl::confirm::tx_confirm() {
                 return;
             }
-            let comment = parts.get(3..).unwrap_or(&[]).join(" ");
+            let (lat, lon, comment) = (args.pos.lat, args.pos.lon, args.comment);
             match client.beacon_position(lat, lon, &comment).await {
                 Ok(()) => println!(
                     "Position beacon sent: {lat:.4}, {lon:.4}{}.",
@@ -1649,6 +1644,128 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
                 Err(e) => println!(
                     "{}",
                     thd75_repl::output::error(format_args!("sending position: {e}"))
+                ),
+            }
+        }
+        "compressed" => {
+            let args = match thd75_repl::aprs_args::parse_position(parts.get(1..).unwrap_or(&[])) {
+                Ok(a) => a,
+                Err(e) => {
+                    println!("Error: {e}");
+                    return;
+                }
+            };
+            if !thd75_repl::confirm::tx_confirm() {
+                return;
+            }
+            match client
+                .beacon_position_compressed(args.pos.lat, args.pos.lon, &args.comment)
+                .await
+            {
+                Ok(()) => println!(
+                    "Compressed position beacon sent: {:.4}, {:.4}.",
+                    args.pos.lat, args.pos.lon
+                ),
+                Err(e) => println!(
+                    "{}",
+                    thd75_repl::output::error(format_args!("sending compressed position: {e}"))
+                ),
+            }
+        }
+        "mice" => {
+            let args = match thd75_repl::aprs_args::parse_mice(parts.get(1..).unwrap_or(&[])) {
+                Ok(a) => a,
+                Err(e) => {
+                    println!("Error: {e}");
+                    return;
+                }
+            };
+            if !thd75_repl::confirm::tx_confirm() {
+                return;
+            }
+            match client
+                .beacon_position_mice(
+                    args.pos.lat,
+                    args.pos.lon,
+                    args.speed_knots,
+                    args.course_deg,
+                    &args.comment,
+                )
+                .await
+            {
+                Ok(()) => println!(
+                    "Mic-E beacon sent: {:.4}, {:.4}, {} knots, course {}.",
+                    args.pos.lat, args.pos.lon, args.speed_knots, args.course_deg
+                ),
+                Err(e) => println!(
+                    "{}",
+                    thd75_repl::output::error(format_args!("sending Mic-E beacon: {e}"))
+                ),
+            }
+        }
+        "object" => {
+            let args = match thd75_repl::aprs_args::parse_object(parts.get(1..).unwrap_or(&[])) {
+                Ok(a) => a,
+                Err(e) => {
+                    println!("Error: {e}");
+                    return;
+                }
+            };
+            if !thd75_repl::confirm::tx_confirm() {
+                return;
+            }
+            match client
+                .send_object(&args.name, true, args.pos.lat, args.pos.lon, &args.comment)
+                .await
+            {
+                Ok(()) => println!(
+                    "Object {} sent at {:.4}, {:.4}.",
+                    args.name, args.pos.lat, args.pos.lon
+                ),
+                Err(e) => println!(
+                    "{}",
+                    thd75_repl::output::error(format_args!("sending object: {e}"))
+                ),
+            }
+        }
+        "status" => {
+            if parts.len() < 2 {
+                println!("Usage: status <text>");
+                println!("  Example: status QRV on 144.390");
+                return;
+            }
+            if !thd75_repl::confirm::tx_confirm() {
+                return;
+            }
+            let text = parts.get(1..).unwrap_or(&[]).join(" ");
+            match client.send_status(&text).await {
+                Ok(()) => println!("Status sent: {text}"),
+                Err(e) => println!(
+                    "{}",
+                    thd75_repl::output::error(format_args!("sending status: {e}"))
+                ),
+            }
+        }
+        "motion" => {
+            let args = match thd75_repl::aprs_args::parse_motion(parts.get(1..).unwrap_or(&[])) {
+                Ok(a) => a,
+                Err(e) => {
+                    println!("Error: {e}");
+                    return;
+                }
+            };
+            if !thd75_repl::confirm::tx_confirm() {
+                return;
+            }
+            match client
+                .update_motion(args.speed_kmh, args.course_deg, args.pos.lat, args.pos.lon)
+                .await
+            {
+                Ok(true) => println!("Motion updated. SmartBeaconing transmitted a beacon."),
+                Ok(false) => println!("Motion updated. No beacon due yet."),
+                Err(e) => println!(
+                    "{}",
+                    thd75_repl::output::error(format_args!("updating motion: {e}"))
                 ),
             }
         }
@@ -1687,7 +1804,8 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
         }
         _ => println!(
             "APRS command not recognized: {cmd}. \
-             Commands: monitor, msg, position, beacon, stations, igate, aprs stop"
+             Commands: monitor, msg, position, compressed, mice, object, status, motion, \
+             beacon, stations, igate, aprs stop"
         ),
     }
 }

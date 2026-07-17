@@ -170,6 +170,11 @@ pub const APRS_MODE_HELP: &str = "You are in APRS packet radio mode.
 monitor: Continuously listen for APRS events (Ctrl-C to stop)
 msg W1AW Hello there: Send an APRS message to a station
 position 35.30 -82.46 Portable: Send a position beacon
+compressed 35.30 -82.46 Portable: Send a compressed position beacon
+mice 35.30 -82.46 25 90: Send a Mic-E beacon, speed in knots, course in degrees
+object CAMP 35.31 -82.45 Field day: Send an object report
+status QRV mobile: Send a status report with your own text
+motion 35.30 -82.46 55 180: SmartBeaconing update, speed in kilometers per hour
 beacon: Send a status beacon
 stations: List recently heard stations
 igate r/35.30/-82.46/100: Bridge RF to APRS-IS with a filter

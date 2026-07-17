@@ -224,7 +224,10 @@ pub struct StartArgs {
 /// number from 0 through 15, or extra arguments follow.
 pub fn parse_start(args: &[&str]) -> Result<StartArgs, String> {
     let Some(raw_callsign) = args.first() else {
-        return Err("callsign required".to_string());
+        return Err(
+            "callsign required. Usage: aprs start <callsign> then an optional SSID and the word digi. Example: aprs start W1AW 7."
+                .to_string(),
+        );
     };
     let callsign = raw_callsign.to_ascii_uppercase();
     let mut ssid: u8 = 0;
