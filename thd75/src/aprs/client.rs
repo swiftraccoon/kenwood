@@ -69,9 +69,9 @@ use std::time::{Duration, Instant};
 
 use aprs::{
     AprsData, AprsMessage, AprsMessenger, AprsPosition, AprsWeather, DigiAction, DigipeaterConfig,
-    SmartBeaconing, SmartBeaconingConfig, StationEntry, StationList, build_aprs_object,
-    build_aprs_position_compressed, build_aprs_position_report, build_aprs_status,
-    build_query_response_position, classify_ack_rej, parse_aprs_data_full,
+    SmartBeaconing, SmartBeaconingConfig, StationEntry, StationList, build_aprs_mice,
+    build_aprs_object, build_aprs_position_compressed, build_aprs_position_report,
+    build_aprs_status, build_query_response_position, classify_ack_rej, parse_aprs_data_full,
 };
 use ax25_codec::{Ax25Address, Ax25Packet, CommandResponse, RouteEntry, build_ax25, parse_ax25};
 use kiss_tnc::{KissCommand, KissFrame, encode_kiss_frame};
@@ -1002,6 +1002,46 @@ impl<T: Transport> AprsClient<T> {
         );
         self.session.send_wire(&wire).await?;
         self.beaconing.beacon_sent(now);
+        Ok(())
+    }
+
+    /// Beacon current position using Mic-E encoding — the most compact
+    /// APRS position format and the TH-D75's native one.
+    ///
+    /// Latitude is encoded in the AX.25 destination address; longitude,
+    /// speed, and course are packed into the info field per APRS 1.0.1
+    /// Chapter 10. Uses the configured symbol, the configured digipeater
+    /// path, and the "Off Duty" Mic-E message code.
+    ///
+    /// `speed_knots` covers the Mic-E wire range 0–799; `course_deg`
+    /// uses 0 for "unknown" per the spec. Updates the `SmartBeaconing`
+    /// "last beacon" timer like the other beacon methods.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transmission fails.
+    pub async fn beacon_position_mice(
+        &mut self,
+        lat: f64,
+        lon: f64,
+        speed_knots: u16,
+        course_deg: u16,
+        comment: &str,
+    ) -> Result<(), Error> {
+        let source = self.my_addr.clone();
+        let wire = build_aprs_mice(
+            &source,
+            lat,
+            lon,
+            speed_knots,
+            course_deg,
+            self.config.symbol_table,
+            self.config.symbol_code,
+            comment,
+            &self.config.digipeater_path,
+        );
+        self.session.send_wire(&wire).await?;
+        self.beaconing.beacon_sent(Instant::now());
         Ok(())
     }
 
@@ -2269,6 +2309,31 @@ mod tests {
         // Second call immediately after should NOT beacon.
         let beaconed = client.update_motion(50.0, 90.0, 35.25, -97.75).await?;
         assert!(!beaconed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn beacon_position_mice_sends_expected_wire_bytes() -> TestResult {
+        let radio = mock_radio(TncBaud::Bps1200).await?;
+        let config = test_config();
+        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+
+        let expected = build_aprs_mice(
+            &test_address(),
+            35.30,
+            -82.46,
+            25,
+            90,
+            '/',
+            '>',
+            "mice hw validation",
+            &default_digipeater_path(),
+        );
+        client.session.transport.expect(&expected, &[]);
+
+        client
+            .beacon_position_mice(35.30, -82.46, 25, 90, "mice hw validation")
+            .await?;
         Ok(())
     }
 }
