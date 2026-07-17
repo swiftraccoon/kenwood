@@ -223,6 +223,15 @@ struct Cli {
     #[arg(long)]
     exit_terminal_mode: bool,
 
+    /// Clear the DV Gateway (Menu 650) flag via a memory write, then
+    /// exit. Works over whichever port keeps CAT alive — when the
+    /// radio is in Reflector Terminal Mode bound to Bluetooth (Menu
+    /// 985), connect over USB so the programming handshake is routed.
+    /// The radio reboots into normal control; no menu keypresses are
+    /// needed on the radio.
+    #[arg(long)]
+    set_gateway_off: bool,
+
     /// Command to run on startup (e.g. "dstar start KQ4NIT REF030C").
     ///
     /// If provided, the command is executed immediately after connecting.
@@ -606,6 +615,14 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     let (path, transport, rt) = open_real_transport(cli.port.as_deref(), cli.baud)?;
 
     println!("{}", thd75_repl::output::connected_via(&path));
+
+    // `--set-gateway-off`: clear the DV Gateway flag and exit, without
+    // entering the interactive loop. Runs over whatever port answered
+    // (use USB when Bluetooth is busy in terminal mode).
+    if cli.set_gateway_off {
+        let local = tokio::task::LocalSet::new();
+        return local.block_on(&rt, run_set_gateway_off(transport));
+    }
 
     // Build initial command from trailing args, if any.
     let initial_command = if cli.command.is_empty() {
@@ -1033,8 +1050,26 @@ async fn run_repl(
             // CAT identification failed — probe the link to find out why.
             match radio.diagnose_link().await {
                 LinkDiagnosis::MmdvmMode if exit_terminal_mode => {
-                    // The operator asked for CAT, not D-STAR: guide them
-                    // out of Reflector Terminal Mode, then reconnect.
+                    // The operator asked for CAT, not D-STAR. Try the
+                    // automated exit first — the MCP programming
+                    // handshake may still be routed by the firmware
+                    // even while the gateway app owns the port. Fall
+                    // back to guiding the operator through the menu
+                    // change only if the radio refuses the handshake.
+                    match automated_terminal_exit(&mut radio).await {
+                        Ok(()) => {
+                            drop(radio.disconnect().await);
+                            println!(
+                                "DV Gateway flag cleared. Radio is rebooting into normal \
+                                 control mode. Relaunching..."
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            return Err(relaunch_self().into());
+                        }
+                        Err(e) => {
+                            println!("Automated exit not possible on this link: {e}");
+                        }
+                    }
                     radio = guide_exit_terminal_mode(radio, cli_port.as_deref(), cli_baud).await?;
                     let model = radio
                         .identify()
@@ -2053,6 +2088,69 @@ async fn guide_exit_terminal_mode(
         }
         println!("The radio is still in Reflector Terminal Mode. Try again.");
     }
+}
+
+/// Clear the DV Gateway flag over the connected port, then return.
+///
+/// Connects a [`Radio`], writes the gateway-mode byte to `Off`, and
+/// reports the outcome. Used by `--set-gateway-off` to leave Reflector
+/// Terminal Mode with no radio keypresses: run it over USB while the
+/// radio's terminal mode is bound to Bluetooth (Menu 985), where the
+/// programming handshake is still routed. The radio reboots into
+/// normal control after the write, so the link is expected to drop.
+///
+/// # Errors
+///
+/// Returns an error string if the connection or the memory write
+/// fails — notably a handshake timeout, which means this port is the
+/// one dedicated to the gateway; try the other interface.
+async fn run_set_gateway_off(transport: EitherTransport) -> Result<(), Box<dyn std::error::Error>> {
+    let mut radio = Radio::connect_safe(transport).await?;
+    println!("Clearing the DV Gateway flag (Menu 650) via memory write.");
+    match automated_terminal_exit(&mut radio).await {
+        Ok(()) => {
+            drop(radio.disconnect().await);
+            println!(
+                "DV Gateway flag cleared. The radio reboots into normal control mode. \
+                 Reconnect for CAT or APRS once it finishes."
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "could not clear the DV Gateway flag: {e}\n\
+             If the radio is in Reflector Terminal Mode over this port, connect \
+             through the OTHER interface (USB when Menu 985 is Bluetooth) and retry."
+        )
+        .into()),
+    }
+}
+
+/// Attempt to leave Reflector Terminal Mode without operator keypresses.
+///
+/// The DV Gateway flag lives in radio flash and the CAT parser is gone
+/// in this mode, but the MCP programming handshake (`0M PROGRAM`) may
+/// still be routed by the firmware even while the gateway app owns the
+/// port. Try it: on success the flag is cleared (verified by read-back
+/// inside the session) and the radio reboots into normal control — the
+/// caller must then relaunch a fresh process, because an in-process
+/// Bluetooth reconnect to a just-rebooted radio wedges (see
+/// [`relaunch_self`]). On handshake timeout the radio is unchanged and
+/// the caller falls back to the guided operator exit.
+///
+/// # Errors
+///
+/// Returns an error if programming-mode entry, the page read, the page
+/// write, or the exit write fails. Entry timing out because the
+/// gateway app swallowed the handshake is the expected failure shape.
+async fn automated_terminal_exit(
+    radio: &mut Radio<EitherTransport>,
+) -> Result<(), kenwood_thd75::Error> {
+    println!("Attempting automated exit: clearing the DV Gateway flag via memory write.");
+    radio
+        .modify_memory_page_detached(GATEWAY_MODE_PAGE, |data| {
+            data[GATEWAY_MODE_BYTE] = 0; // Off
+        })
+        .await
 }
 
 /// MCP offset for DV Gateway mode setting (0=Off, 1=Reflector Terminal, 2=Access Point).
