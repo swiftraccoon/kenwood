@@ -6,15 +6,6 @@
 
 [advisories]
 ignore = [
-    # RUSTSEC-2025-0057: fxhash is unmaintained.
-    #
-    # Pulled in transitively by `selectors` → `scraper` (our HTML parser
-    # for ircDDB scraping in stargazer). Tiny (~50 LOC) hash-function
-    # crate, no known vulnerability, no safe upgrade path. Upstream
-    # recommendation (rustc-hash) requires a scraper upstream change.
-    # Recheck when scraper ships a version that migrates away.
-    "RUSTSEC-2025-0057",
-
     # RUSTSEC-2023-0071: Marvin Attack timing side-channel in rsa 0.9.x.
     #
     # Pulled in by sqlx-mysql, which itself comes from sqlx-macros-core
@@ -56,13 +47,12 @@ ignore = [
     # (quadratic duplicate-attribute check; unbounded namespace
     # allocation in NsReader).
     #
-    # stargazer's direct quick-xml is on 0.41 (fixed). The remaining
-    # vulnerable copy (0.39.x) is pinned by `wayland-scanner`, a
-    # Linux-only BUILD-TIME proc-macro (winit → smithay → eframe →
-    # sextant) that parses the local, trusted Wayland protocol XML
-    # shipped inside the crate itself. No attacker-controlled XML can
-    # reach it and no runtime code ships. Recheck when winit/smithay
-    # bump wayland-scanner to a quick-xml 0.41 release.
+    # The only quick-xml copy in the tree (0.39.x) is pinned by
+    # `wayland-scanner`, a Linux-only BUILD-TIME proc-macro (winit →
+    # smithay → eframe → sextant) that parses the local, trusted Wayland
+    # protocol XML shipped inside the crate itself. No attacker-controlled
+    # XML can reach it and no runtime code ships. Recheck when
+    # winit/smithay bump wayland-scanner to a quick-xml 0.41 release.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]

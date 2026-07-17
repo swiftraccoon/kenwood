@@ -16,23 +16,6 @@ targets = [
 [advisories]
 version = 2
 ignore = [
-    # RUSTSEC-2025-0057: fxhash is unmaintained.
-    #
-    # fxhash is a tiny (~50 LOC) hash-function crate pulled in transitively
-    # by `selectors` → `scraper` (our HTML parser for ircDDB scraping in
-    # stargazer). It provides FxHasher, a fast non-cryptographic hash used
-    # for internal hashmaps in HTML selector matching.
-    #
-    # "Unmaintained" here is a maintenance concern, not a security concern:
-    # there is no known vulnerability and no safe upgrade path. The upstream
-    # recommendation is rustc-hash, which scraper has not yet migrated to.
-    #
-    # Dependency path:
-    #   fxhash ← selectors ← scraper ← stargazer
-    #
-    # Recheck when `scraper` ships a version that migrates to rustc-hash.
-    { id = "RUSTSEC-2025-0057", reason = "fxhash is an unmaintained tiny hash-function crate pulled transitively by scraper/selectors; no known vulnerability, no safe upgrade; upstream recommendation (rustc-hash) requires a scraper upstream change" },
-
     # RUSTSEC-2026-0192: ttf-parser is unmaintained.
     #
     # ttf-parser is a TrueType/OpenType font parser pulled in transitively
@@ -52,12 +35,12 @@ ignore = [
 
     # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml < 0.41 DoS.
     #
-    # stargazer's direct quick-xml is on 0.41 (fixed). The remaining
-    # vulnerable copy is pinned by wayland-scanner, a Linux-only
-    # BUILD-TIME proc-macro (winit → smithay → eframe → sextant) that
-    # parses only the local, trusted Wayland protocol XML shipped in
-    # the crate — no attacker-controlled XML can reach it and no
-    # runtime code ships. Recheck when winit/smithay bump
+    # The only quick-xml copy in the tree (0.39.x) is pinned by
+    # wayland-scanner, a Linux-only BUILD-TIME proc-macro (winit →
+    # smithay → eframe → sextant) that parses only the local, trusted
+    # Wayland protocol XML shipped in the crate — no attacker-controlled
+    # XML can reach it and no runtime code ships. Recheck when
+    # winit/smithay bump
     # wayland-scanner onto quick-xml 0.41.
     { id = "RUSTSEC-2026-0194", reason = "vulnerable quick-xml copy is only reachable from wayland-scanner, a Linux build-time proc-macro parsing trusted local protocol XML; no runtime exposure" },
     { id = "RUSTSEC-2026-0195", reason = "vulnerable quick-xml copy is only reachable from wayland-scanner, a Linux build-time proc-macro parsing trusted local protocol XML; no runtime exposure" },
@@ -67,11 +50,6 @@ ignore = [
 version = 2
 allow = [
     "GPL-2.0-or-later",
-    "GPL-3.0",
-    # LGPL-3.0 is required by mp3lame-encoder and mp3lame-sys (bindings to
-    # libmp3lame, LGPL-2.1+). LGPL allows linking from GPL-compatible code,
-    # which matches stargazer's GPL-2.0-or-later licensing.
-    "LGPL-3.0",
     "MIT",
     "Apache-2.0",
     "BSD-2-Clause",
@@ -129,11 +107,6 @@ skip = [
     # Dropable when serialport upgrades; tokio-serial pins serialport 4.x.
     { crate = "nix@0.26" },
 
-    # mio-serial 5.x uses nix 0.29 for serial port event registration.
-    # Separate from serialport's nix 0.26 because mio-serial upgraded
-    # first. Dropable when mio-serial and serialport align on one nix.
-    { crate = "nix@0.29" },
-
     # ─────────────────────────────────────────────────────────────────────
     # thd75-repl directory detection (dirs-next → dirs-sys-next → redox_users)
     # ─────────────────────────────────────────────────────────────────────
@@ -147,68 +120,13 @@ skip = [
     { crate = "thiserror-impl@1" },
 
     # ─────────────────────────────────────────────────────────────────────
-    # stargazer HTML parser (scraper → selectors + html5ever → phf_generator)
-    # ─────────────────────────────────────────────────────────────────────
-
-    # selectors 0.26 (used by scraper for CSS selector matching) uses
-    # derive_more 0.99. mp3lame-sys and other newer deps use derive_more
-    # 2.x. Dropable when scraper updates to the 2.x major. Low risk — the
-    # 0.99 branch is security-patched.
-    { crate = "derive_more@0.99" },
-
-    # ─────────────────────────────────────────────────────────────────────
-    # stargazer Postgres driver (sqlx → sqlx-core + sqlx-postgres)
-    # ─────────────────────────────────────────────────────────────────────
-
-    # hashlink 0.10 (used by sqlx-core for linked hash maps) uses
-    # hashbrown 0.15. Our other deps use hashbrown 0.17 (or 0.16 via
-    # kasuari, see below). Dropable when sqlx updates its hashlink
-    # dependency.
-    { crate = "hashbrown@0.15" },
-
-    # hashbrown 0.15 (via sqlx-core → hashlink) uses foldhash 0.1.
-    # Newer hashbrown uses foldhash 0.2. Dropable when sqlx's hashbrown
-    # updates (tracks hashbrown@0.15 above exactly).
-    { crate = "foldhash@0.1" },
-
-    # sqlx-core bundles webpki-roots 0.26 for TLS cert validation when
-    # connecting to Postgres over TLS. reqwest's rustls-tls pulls in
-    # webpki-roots 1.0. Dropable when sqlx upgrades to webpki-roots 1.x.
-    { crate = "webpki-roots@0.26" },
-
-    # etcetera 0.8 (used by sqlx-postgres for locating config dirs on
-    # Windows) uses windows-sys 0.48. Serialport pulls windows-sys 0.52
-    # (see below) and newer deps use 0.60+. Dropable when etcetera
-    # updates.
-    { crate = "windows-sys@0.48" },
-
-    # ─────────────────────────────────────────────────────────────────────
     # thd75-tui layout engine (ratatui → kasuari)
     # ─────────────────────────────────────────────────────────────────────
 
     # kasuari 0.4 (ratatui's Cassowary constraint solver) uses hashbrown
-    # 0.16, separate from sqlx's 0.15 and the workspace default 0.17.
-    # Dropable when ratatui/kasuari updates.
+    # 0.16, separate from the workspace default 0.17. Dropable when
+    # ratatui/kasuari updates.
     { crate = "hashbrown@0.16" },
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Windows platform shim family 0.48 (sqlx-postgres → etcetera)
-    # ─────────────────────────────────────────────────────────────────────
-    #
-    # etcetera 0.8 (config-directory locator used by sqlx-postgres on
-    # Windows) depends on windows-sys 0.48, which transitively requires
-    # the full windows-targets 0.48 family (one shim per target triple).
-    # Newer crates in the tree use 0.52 or 0.53. Entire 0.48 family
-    # dropable when etcetera upgrades its windows-sys pin.
-
-    { crate = "windows-targets@0.48" },
-    { crate = "windows_aarch64_gnullvm@0.48" },
-    { crate = "windows_aarch64_msvc@0.48" },
-    { crate = "windows_i686_gnu@0.48" },
-    { crate = "windows_i686_msvc@0.48" },
-    { crate = "windows_x86_64_gnu@0.48" },
-    { crate = "windows_x86_64_gnullvm@0.48" },
-    { crate = "windows_x86_64_msvc@0.48" },
 
     # ─────────────────────────────────────────────────────────────────────
     # Windows platform shim family 0.52 (serialport + ring on Windows)
@@ -217,17 +135,14 @@ skip = [
     # serialport 4.x uses windows-sys 0.52 for Windows serial APIs.
     # ring (rustls crypto) also pulls windows-sys 0.52 on Windows.
     # Newer crates use windows-sys 0.60+ which use the unified
-    # `windows-link` crate instead of per-target shims. Entire 0.52
-    # family dropable when serialport/ring upgrade.
+    # `windows-link` crate instead of per-target shims. Only the shims
+    # reachable for the evaluated Windows target (x86_64-pc-windows-msvc;
+    # see [graph].targets above) appear as duplicates. Dropable when
+    # serialport/ring upgrade.
 
     { crate = "windows-sys@0.52" },
     { crate = "windows-targets@0.52" },
-    { crate = "windows_aarch64_gnullvm@0.52" },
-    { crate = "windows_aarch64_msvc@0.52" },
-    { crate = "windows_i686_gnu@0.52" },
-    { crate = "windows_i686_msvc@0.52" },
     { crate = "windows_x86_64_gnu@0.52" },
-    { crate = "windows_x86_64_gnullvm@0.52" },
     { crate = "windows_x86_64_msvc@0.52" },
 
     # ─────────────────────────────────────────────────────────────────────
@@ -259,8 +174,7 @@ skip = [
     { crate = "objc2-app-kit@0.2.2" },
     { crate = "objc2-foundation@0.2.2" },
 
-    # rand_core 0.6 chain (stargazer scraper path via fxhash-adjacent
-    # crates) uses getrandom 0.2; newer deps use 0.3.
+    # rand_core 0.6 chain uses getrandom 0.2; newer deps use 0.3.
     { crate = "getrandom@0.2.17" },
 
     # UniFFI 0.31 (lodestar-core Rust↔Swift FFI) pulls getrandom 0.4;
@@ -286,12 +200,6 @@ skip = [
     # pulled by winit. Drop when mio-serial updates.
     { crate = "rustix@0.38.44" },
     { crate = "linux-raw-sys@0.4.15" },
-
-    # quick-xml 0.39.x from wayland-scanner (Linux build-time
-    # proc-macro); stargazer's direct dep is on 0.41 (DoS fixes).
-    # Skip the whole 0.39 minor so a fresh CI lockfile resolving a
-    # different 0.39 patch (Cargo.lock is gitignored) stays covered.
-    { crate = "quick-xml@0.39" },
 
     # shlex two-major duplicate, both BUILD-TIME only: bindgen pulls
     # shlex 1.x, cc pulls shlex 2.x. No runtime code. Skip the older
