@@ -193,9 +193,13 @@ pub fn parse_dvrec(text: &str) -> Result<ParsedDvrec, DvrecError> {
             "vd" => match frame_from_payload(&log.payload, log.seq) {
                 None => skipped_lines += 1,
                 Some(frame) => {
+                    // Shared gap accounting: guards the untrusted seq
+                    // byte (the 0x40 EOT flag can ride it) and treats a
+                    // duplicate as zero gaps. The prior local
+                    // `(seq - prev - 1).rem_euclid(21)` form yielded 20
+                    // for a repeat and ran unguarded on wild bytes.
                     if let Some(prev) = prev_seq {
-                        let step = (i16::from(log.seq) - i16::from(prev) - 1).rem_euclid(21);
-                        gaps += u64::try_from(step).unwrap_or(0);
+                        gaps += crate::capture::seq_gap(prev, log.seq);
                     }
                     prev_seq = Some(log.seq);
                     frames.push(frame);
@@ -442,6 +446,38 @@ mod tests {
             "2026-07-11T17:54:07.594+00:00"
         );
         assert_eq!(parsed.ended_at.to_rfc3339(), "2026-07-11T17:54:09+00:00");
+        Ok(())
+    }
+
+    #[test]
+    fn gap_accounting_matches_capture_core_on_dup_and_wild_seq() -> TestResult {
+        // A duplicate seq (01, 01) and an out-of-alphabet seq (2A = 42,
+        // e.g. a corrupted byte) must both contribute ZERO gaps — the
+        // divergent local formula previously reported 20 for a repeat
+        // and ran unguarded on wild bytes. Seqs here: 0,1,1,42,2 — the
+        // only genuine discontinuity (1 -> 2 across the noise) is none,
+        // since 2 follows 1 in the alphabet once the wild value is
+        // ignored... but the wild value resets prev, so 42 -> 2 is also
+        // guarded to 0. Net: 0 gaps.
+        let dup_fixture = "\
+#DVREC 20260711-175407.594 dplus
+20260711-175407.594>c2g:20:0002:01:58e6:80:hdr:000000:REF030 C:MM3TWA D:CQCQCQ  :MM3TWA  /AMBE:000b
+20260711-175407.890>c2g:20:0002:01:58e6:00:vd :ac6b06c1f0c029975c:552d16#256285 |%b.|
+20260711-175407.910>c2g:20:0002:01:58e6:01:vd :2f210e626b3e6f0790:4d4d33#3d3d33 |M M3|
+20260711-175407.930>c2g:20:0002:01:58e6:01:vd :2f210e626b3e6f0790:4d4d33#3d3d33 |M M3|
+20260711-175407.940>c2g:20:0002:01:58e6:2a:vd :7ac6883a2f11dba642:aaaaaa#dadada |...|
+20260711-175407.960>c2g:20:0002:01:58e6:02:vd :7ac6883a2f11dba642:aaaaaa#dadada |...|
+20260711-175409.000>c2g:20:0002:01:58e6:44:vde:9e8d3288261a3f61e8:555555#251ac6 |%..|
+";
+        let parsed = parse_dvrec(dup_fixture)?;
+        assert_eq!(
+            parsed.frames.iter().map(|f| f.seq).collect::<Vec<_>>(),
+            [0, 1, 1, 0x2A, 2]
+        );
+        assert_eq!(
+            parsed.gaps, 0,
+            "duplicate and out-of-alphabet seqs must not inflate gaps"
+        );
         Ok(())
     }
 

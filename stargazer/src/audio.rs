@@ -12,9 +12,6 @@ use mbelib_rs::AmbeDecoder;
 
 use crate::capture::FrameRecord;
 
-/// D-STAR voice seq values cycle 0..=20.
-const SEQ_MODULUS: u16 = 21;
-
 /// Result of decoding one stream's frames.
 #[derive(Debug, Clone)]
 pub struct DecodedAudio {
@@ -33,16 +30,12 @@ pub fn decode_stream(frames: &[FrameRecord]) -> DecodedAudio {
     let mut prev_seq: Option<u8> = None;
 
     for frame in frames {
-        // Concealment only makes sense inside the valid seq alphabet
-        // (0..=20); corrupted wire bytes carry arbitrary values and
-        // must not drive the modular distance (underflow observed
-        // live on a corrupted frame).
-        if let Some(prev) = prev_seq
-            && u16::from(frame.seq) < SEQ_MODULUS
-            && u16::from(prev) < SEQ_MODULUS
-        {
-            let distance = (u16::from(frame.seq) + SEQ_MODULUS - u16::from(prev)) % SEQ_MODULUS;
-            for _ in 1..distance {
+        // One concealment frame per missing seq. `seq_gap` guards the
+        // untrusted wire byte and returns 0 for duplicates / out-of-
+        // alphabet values, so nothing is concealed against a corrupted
+        // frame (underflow observed live before the guard existed).
+        if let Some(prev) = prev_seq {
+            for _ in 0..crate::capture::seq_gap(prev, frame.seq) {
                 pcm.extend_from_slice(&decoder.conceal_frame());
                 concealed_frames += 1;
             }

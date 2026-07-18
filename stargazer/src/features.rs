@@ -15,9 +15,6 @@ use std::path::Path;
 
 use mbelib_rs::{AmbeParamExtractor, FrameParams, PARAM_BANDS};
 
-/// D-STAR voice seq values cycle 0..=20.
-const SEQ_MODULUS: u16 = 21;
-
 /// Features per frame: f0, L, then three `PARAM_BANDS`-wide planes
 /// (spectral amplitude, voiced flag, validity mask).
 pub const FEATURE_DIM: usize = 2 + PARAM_BANDS * 3;
@@ -120,12 +117,11 @@ pub fn extract_features(records: &[ContainerRecord]) -> Vec<[f32; FEATURE_DIM]> 
     let mut rows = Vec::with_capacity(records.len());
     let mut prev_seq: Option<u8> = None;
     for rec in records {
-        if let Some(prev) = prev_seq
-            && u16::from(rec.seq) < SEQ_MODULUS
-            && u16::from(prev) < SEQ_MODULUS
-        {
-            let distance = (u16::from(rec.seq) + SEQ_MODULUS - u16::from(prev)) % SEQ_MODULUS;
-            for _ in 1..distance {
+        // One concealment row per missing seq; the shared helper
+        // guards the untrusted seq byte (0 for duplicates / out-of-
+        // alphabet) so the 20 ms grid never desyncs on a corrupt frame.
+        if let Some(prev) = prev_seq {
+            for _ in 0..crate::capture::seq_gap(prev, rec.seq) {
                 rows.push(feature_row(&extractor.conceal()));
             }
         }

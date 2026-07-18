@@ -37,6 +37,12 @@ pub const DISABLED_FILE: &str = ".disabled-targets";
 /// it as slow (the task keeps draining in the background).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// Consecutive `accept()` failures on the control socket after which
+/// the server stops (a genuinely unusable listener, not a transient
+/// per-connection error). Transient errors below this bound are
+/// logged and retried so a control-plane hiccup never stops recording.
+const MAX_ACCEPT_FAILURES: usize = 8;
+
 /// One parsed control command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -379,9 +385,31 @@ pub async fn serve_socket(
     requests: mpsc::Sender<CommandRequest>,
 ) {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    // A transient accept error (ECONNABORTED from a client that aborts
+    // between connect and accept, or EMFILE/ENFILE under fd pressure)
+    // is NOT the listener closing — treating it as terminal would drop
+    // the request sender and tear down every reflector recording (main
+    // breaks its loop on a closed channel). The control plane must
+    // never take the data plane down with it, so we log and keep
+    // serving; only a sustained run of failures (a genuinely broken
+    // listener) gives up.
+    let mut consecutive_failures: usize = 0;
     loop {
-        let Ok((stream, _addr)) = listener.accept().await else {
-            return; // listener closed — recorder shutting down
+        let stream = match listener.accept().await {
+            Ok((stream, _addr)) => {
+                consecutive_failures = 0;
+                stream
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_ACCEPT_FAILURES {
+                    tracing::error!(error = %e, "control socket accept failed repeatedly — giving up");
+                    return;
+                }
+                tracing::warn!(error = %e, "control socket accept failed — continuing");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
         };
         let requests = requests.clone();
         let _unused: tokio::task::JoinHandle<()> = tokio::spawn(async move {

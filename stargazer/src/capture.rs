@@ -17,7 +17,25 @@ use dstar_gateway_core::slowdata::{SlowDataAssembler, SlowDataBlock, SlowDataTex
 use dstar_gateway_core::{DStarHeader, Module, StreamId, VoiceFrame};
 
 /// D-STAR voice seq values cycle 0..=20 (one 21-frame superframe).
-const SEQ_MODULUS: u16 = 21;
+pub(crate) const SEQ_MODULUS: u16 = 21;
+
+/// Frames missing between consecutive received seq values.
+///
+/// The single source of truth for D-STAR gap accounting, shared by
+/// the capture core, the audio decoder, the feature extractor, and
+/// the dvrec importer so they can never diverge. Both the wire seq
+/// and the previous seq are untrusted bytes — a corrupted frame (or
+/// the 0x40 EOT flag riding the seq byte) can be out of the 0..=20
+/// alphabet, and such a value must contribute no gaps rather than
+/// underflow the modular distance. A duplicate seq is zero gaps.
+#[must_use]
+pub(crate) fn seq_gap(prev: u8, seq: u8) -> u64 {
+    if u16::from(seq) >= SEQ_MODULUS || u16::from(prev) >= SEQ_MODULUS {
+        return 0;
+    }
+    let distance = (u16::from(seq) + SEQ_MODULUS - u16::from(prev)) % SEQ_MODULUS;
+    u64::from(distance.saturating_sub(1))
+}
 
 /// One received voice frame, archived exactly as it arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,16 +182,8 @@ impl StreamCapture {
     }
 
     fn push_frame(&mut self, seq: u8, frame: &VoiceFrame) {
-        // Gap accounting is only defined inside the valid seq
-        // alphabet (0..=20). The wire byte is untrusted — corrupted
-        // frames carry arbitrary values (observed live), and feeding
-        // one into the modular distance would underflow.
-        if let Some(prev) = self.prev_seq
-            && u16::from(seq) < SEQ_MODULUS
-            && u16::from(prev) < SEQ_MODULUS
-        {
-            let distance = (u16::from(seq) + SEQ_MODULUS - u16::from(prev)) % SEQ_MODULUS;
-            self.gaps += u64::from(distance.saturating_sub(1));
+        if let Some(prev) = self.prev_seq {
+            self.gaps += seq_gap(prev, seq);
         }
         self.prev_seq = Some(seq);
         self.frames.push(FrameRecord {
@@ -373,6 +383,17 @@ mod tests {
 
     fn t0() -> DateTime<Utc> {
         DateTime::<Utc>::UNIX_EPOCH
+    }
+
+    #[test]
+    fn seq_gap_helper_covers_wrap_dup_and_wild() {
+        assert_eq!(seq_gap(0, 1), 0, "adjacent = no gap");
+        assert_eq!(seq_gap(1, 3), 1, "one missing");
+        assert_eq!(seq_gap(19, 1), 2, "wrap: 20 and 0 missing between 19 and 1");
+        assert_eq!(seq_gap(5, 5), 0, "duplicate = no gap (was 20 in dvrec)");
+        assert_eq!(seq_gap(5, 200), 0, "out-of-alphabet seq guarded");
+        assert_eq!(seq_gap(200, 5), 0, "out-of-alphabet prev guarded");
+        assert_eq!(seq_gap(20, 0), 0, "20 -> 0 is adjacent across the wrap");
     }
 
     #[test]

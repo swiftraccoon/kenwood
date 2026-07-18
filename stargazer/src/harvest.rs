@@ -228,6 +228,24 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// True when `name` is a single safe path component: no directory
+/// separators, no parent-dir traversal, not absolute, non-empty.
+///
+/// A directory listing is untrusted input (the reflector server may be
+/// hostile or compromised) and the name is later joined onto the
+/// download directory and written, so a name carrying `/`, `\`, `..`,
+/// or a leading separator must never reach the filesystem — otherwise
+/// the HTTP body is written outside the download tree (an absolute
+/// component makes `Path::join` drop the base entirely).
+fn is_safe_basename(name: &str) -> bool {
+    use std::path::Component;
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    ) && !name.contains('\\')
+}
+
 /// Parse one published filename into its transmission identity and
 /// extension. Returns `None` for names that do not match the
 /// `SYS-M--YYYYMMDD-HHMMSS.mmm--MYCALL--ssss.ext` shape.
@@ -288,8 +306,17 @@ pub fn parse_listing(html: &str) -> Vec<PublishedTx> {
         let href = rest.get(..end).unwrap_or("");
         // Published files are bare basenames; directory navigation
         // links (parent, sort columns) carry '/' or '?' and drop out.
+        // The raw-href filter is NOT sufficient on its own: the value
+        // we keep is percent-DECODED, so an href like `%2Ftmp%2Fx` has
+        // no literal '/' yet decodes to an absolute path. Re-validate
+        // the decoded name as a single safe path component before
+        // trusting it as a basename downstream (it is later joined to
+        // the download dir and written).
         if !href.contains('/') && !href.contains('?') {
-            let _unused = names.insert(percent_decode(href));
+            let decoded = percent_decode(href);
+            if is_safe_basename(&decoded) {
+                let _unused = names.insert(decoded);
+            }
         }
         rest = rest.get(end..).unwrap_or("");
     }
@@ -1078,6 +1105,39 @@ mod tests {
             stems.last().is_some_and(|s| s.contains("182309")),
             "{stems:?}"
         );
+    }
+
+    #[test]
+    fn listing_rejects_percent_encoded_path_traversal() {
+        // A hostile listing whose href has no LITERAL '/' but decodes
+        // to an absolute path or a parent-dir escape. The raw-href
+        // filter alone would let these through; the decoded-name guard
+        // must drop them so nothing is ever written outside the tree.
+        let hostile = concat!(
+            "<a href=\"%2Ftmp%2Fpwned-C--20260711-175407.594--W1AW--e658.mp3\">x</a>",
+            "<a href=\"%2E%2E%2F%2E%2E%2Fescape-C--20260711-175407.594--W1AW--e658.mp3\">y</a>",
+            // A legitimate basename must still survive.
+            "<a href=\"REF030-C--20260711-175407.594--W1AW--e658.mp3\">ok</a>",
+        );
+        let stems: Vec<String> = parse_listing(hostile).into_iter().map(|t| t.stem).collect();
+        assert_eq!(stems.len(), 1, "only the safe basename survives: {stems:?}");
+        assert!(
+            stems.first().is_some_and(|s| s.starts_with("REF030-C")),
+            "{stems:?}"
+        );
+    }
+
+    #[test]
+    fn is_safe_basename_guards_separators_and_traversal() {
+        assert!(is_safe_basename(
+            "REF030-C--20260711-175407.594--W1AW--e658.mp3"
+        ));
+        assert!(!is_safe_basename("/tmp/evil.txt"));
+        assert!(!is_safe_basename("../escape.txt"));
+        assert!(!is_safe_basename("a/b.txt"));
+        assert!(!is_safe_basename("a\\b.txt"));
+        assert!(!is_safe_basename(".."));
+        assert!(!is_safe_basename(""));
     }
 
     #[test]
