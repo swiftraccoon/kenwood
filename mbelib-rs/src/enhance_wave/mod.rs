@@ -3,21 +3,23 @@
 
 //! Learned waveform enhancement (complex-STFT masking).
 //!
-//! Blind listening established that the audible distance between
-//! this decoder and reference hardware-grade decodes of identical
-//! AMBE frames lives in waveform fine structure — magnitude-only
-//! post-processing is imperceptible. This module runs a small
-//! convolutional network that predicts a bounded complex mask
-//! (magnitude *and* phase corrections around identity) over the
-//! decoder output's STFT, ports of the training-side model with
-//! embedded weights. Offline/whole-clip processing; the network is
-//! non-causal over a ±few-frame horizon.
+//! Blind listening located the audible distance between this decoder
+//! and reference hardware-grade decodes of identical AMBE frames in
+//! waveform fine structure, and the shipped model here is the first
+//! checkpoint to clear the operator listening bar (unanimous
+//! preference across a speaker-diverse blind review): a small
+//! grouped-convolution network with a bidirectional recurrent core,
+//! fine-tuned adversarially against reference decodes, predicting a
+//! bounded complex mask (magnitude *and* phase corrections around
+//! identity) over the decoder output's STFT. Offline/whole-clip
+//! processing; the recurrence reads the entire clip.
 //!
 //! The forward pass reproduces the training framework's semantics —
 //! centered reflect-padded STFT (256/64, Hann), exact-erf GELU,
-//! zero-padded 3×3 convolutions (one layer time-dilated), and
-//! window-envelope-normalized inverse STFT — and is pinned against a
-//! recorded reference vector produced by the training checkpoint.
+//! grouped and strided convolutions, a bidirectional GRU, nearest-
+//! neighbor frequency upsampling, and window-normalized inverse STFT
+//! — and is pinned against a recorded reference vector produced by
+//! the training checkpoint.
 
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
@@ -28,28 +30,61 @@ const N_FFT: usize = 256;
 const HOP: usize = 64;
 /// One-sided spectrum bins.
 const BINS: usize = N_FFT / 2 + 1;
-/// Conv channel width.
-const CH: usize = 48;
+/// Convolution channel width.
+const CH: usize = 56;
+/// Grouped-conv group count.
+const GROUPS: usize = 4;
+/// Downsampled channel count feeding the recurrence.
+const DCH: usize = 16;
+/// Downsampled frequency bins feeding the recurrence.
+const DFR: usize = 32;
+/// Recurrent input width (`DCH * DFR`).
+const GRU_IN: usize = DCH * DFR;
+/// Recurrent hidden width per direction.
+const GRU_H: usize = 128;
 
 /// Embedded network weights, exported from the training checkpoint
 /// (layer order and shapes in `model.layout.txt`).
 static MODEL_BIN: &[u8] = include_bytes!("model.bin");
 
-/// One zero-padded 3×3 convolution layer's parameters.
+/// One 2-D convolution's parameters and geometry.
 #[derive(Debug)]
 struct Conv {
-    weight: Vec<f32>, // [out][in][3][3] C-contiguous
+    weight: Vec<f32>, // [out][in/groups][kh][kw] C-contiguous
     bias: Vec<f32>,
-    out_ch: usize,
-    in_ch: usize,
-    /// Time-axis dilation (1 or 2); padding matches for same-size output.
-    dilation_t: usize,
+    out_c: usize,
+    in_c: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+    groups: usize,
 }
 
-/// The five-layer masking network.
+/// One GRU direction's parameters (gate order: reset, update, new).
+#[derive(Debug)]
+struct GruDir {
+    w_ih: Vec<f32>, // [3*GRU_H][GRU_IN]
+    w_hh: Vec<f32>, // [3*GRU_H][GRU_H]
+    b_ih: Vec<f32>,
+    b_hh: Vec<f32>,
+}
+
+/// The full masking network.
 #[derive(Debug)]
 pub struct WaveEnhancer {
-    layers: Vec<Conv>,
+    inp: Conv,
+    freq1: Conv,
+    freq2: Conv,
+    down: Conv,
+    gru_f: GruDir,
+    gru_r: GruDir,
+    up_w: Vec<f32>, // [GRU_IN][2*GRU_H]
+    up_b: Vec<f32>,
+    mix: Conv,
+    out: Conv,
     window: [f32; N_FFT],
 }
 
@@ -100,6 +135,181 @@ fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + erf)
 }
 
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Dense `y = W·x + b` for row-major `W` of `rows × cols`.
+fn matvec(w: &[f32], b: &[f32], x: &[f32], rows: usize, cols: usize, y: &mut [f32]) {
+    for r in 0..rows {
+        let mut acc = b.get(r).copied().unwrap_or(0.0);
+        let row = w.get(r * cols..(r + 1) * cols).unwrap_or(&[]);
+        for (wv, xv) in row.iter().zip(x.iter()) {
+            acc = wv.mul_add(*xv, acc);
+        }
+        if let Some(slot) = y.get_mut(r) {
+            *slot = acc;
+        }
+    }
+}
+
+/// Grouped, strided, zero-padded 2-D convolution over channel-major
+/// `(channels, height, width)` planes.
+fn conv2d(input: &[f32], h: usize, w: usize, layer: &Conv) -> (Vec<f32>, usize, usize) {
+    let h_out = (h + 2 * layer.ph - layer.kh) / layer.sh + 1;
+    let w_out = (w + 2 * layer.pw - layer.kw) / layer.sw + 1;
+    let in_per_g = layer.in_c / layer.groups;
+    let out_per_g = layer.out_c / layer.groups;
+    let mut output = vec![0.0_f32; layer.out_c * h_out * w_out];
+    for oc in 0..layer.out_c {
+        let g = oc / out_per_g;
+        let bias = layer.bias.get(oc).copied().unwrap_or(0.0);
+        for oy in 0..h_out {
+            for ox in 0..w_out {
+                let mut acc = bias;
+                for icg in 0..in_per_g {
+                    let ic = g * in_per_g + icg;
+                    let plane = ic * h * w;
+                    let wbase = (oc * in_per_g + icg) * layer.kh * layer.kw;
+                    for ky in 0..layer.kh {
+                        let iy = oy * layer.sh + ky;
+                        if iy < layer.ph {
+                            continue;
+                        }
+                        let iy = iy - layer.ph;
+                        if iy >= h {
+                            continue;
+                        }
+                        for kx in 0..layer.kw {
+                            let ix = ox * layer.sw + kx;
+                            if ix < layer.pw {
+                                continue;
+                            }
+                            let ix = ix - layer.pw;
+                            if ix >= w {
+                                continue;
+                            }
+                            let wv = layer
+                                .weight
+                                .get(wbase + ky * layer.kw + kx)
+                                .copied()
+                                .unwrap_or(0.0);
+                            acc = input
+                                .get(plane + iy * w + ix)
+                                .copied()
+                                .unwrap_or(0.0)
+                                .mul_add(wv, acc);
+                        }
+                    }
+                }
+                if let Some(slot) = output.get_mut(oc * h_out * w_out + oy * w_out + ox) {
+                    *slot = acc;
+                }
+            }
+        }
+    }
+    (output, h_out, w_out)
+}
+
+/// One GRU direction over the whole sequence; writes each step's
+/// hidden state into `out` at stride `2 * GRU_H` starting at `phase`.
+fn gru_pass(
+    dir: &GruDir,
+    seq: &[f32],
+    frames: usize,
+    reverse: bool,
+    out: &mut [f32],
+    phase: usize,
+) {
+    let mut hidden = vec![0.0_f32; GRU_H];
+    let mut gates_in = vec![0.0_f32; 3 * GRU_H];
+    let mut gates_hid = vec![0.0_f32; 3 * GRU_H];
+    for step in 0..frames {
+        let tick = if reverse { frames - 1 - step } else { step };
+        let x_step = seq.get(tick * GRU_IN..(tick + 1) * GRU_IN).unwrap_or(&[]);
+        matvec(
+            &dir.w_ih,
+            &dir.b_ih,
+            x_step,
+            3 * GRU_H,
+            GRU_IN,
+            &mut gates_in,
+        );
+        matvec(
+            &dir.w_hh,
+            &dir.b_hh,
+            &hidden,
+            3 * GRU_H,
+            GRU_H,
+            &mut gates_hid,
+        );
+        for j in 0..GRU_H {
+            let reset = sigmoid(
+                gates_in.get(j).copied().unwrap_or(0.0) + gates_hid.get(j).copied().unwrap_or(0.0),
+            );
+            let update = sigmoid(
+                gates_in.get(GRU_H + j).copied().unwrap_or(0.0)
+                    + gates_hid.get(GRU_H + j).copied().unwrap_or(0.0),
+            );
+            let candidate = (gates_in.get(2 * GRU_H + j).copied().unwrap_or(0.0)
+                + reset * gates_hid.get(2 * GRU_H + j).copied().unwrap_or(0.0))
+            .tanh();
+            let prev = hidden.get(j).copied().unwrap_or(0.0);
+            let next = (1.0 - update).mul_add(candidate, update * prev);
+            if let Some(slot) = hidden.get_mut(j) {
+                *slot = next;
+            }
+            if let Some(slot) = out.get_mut(tick * 2 * GRU_H + phase + j) {
+                *slot = next;
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "geometry constructor mirroring the framework layer signature; \
+              called five times with literal shapes from the exporter layout"
+)]
+fn read_conv(
+    blob: &[u8],
+    offset: &mut usize,
+    out_c: usize,
+    in_c: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+    groups: usize,
+) -> Option<Conv> {
+    let weight = read_f32s(blob, offset, out_c * (in_c / groups) * kh * kw)?;
+    let bias = read_f32s(blob, offset, out_c)?;
+    Some(Conv {
+        weight,
+        bias,
+        out_c,
+        in_c,
+        kh,
+        kw,
+        sh,
+        sw,
+        ph,
+        pw,
+        groups,
+    })
+}
+
+fn read_gru_dir(blob: &[u8], offset: &mut usize) -> Option<GruDir> {
+    Some(GruDir {
+        w_ih: read_f32s(blob, offset, 3 * GRU_H * GRU_IN)?,
+        w_hh: read_f32s(blob, offset, 3 * GRU_H * GRU_H)?,
+        b_ih: read_f32s(blob, offset, 3 * GRU_H)?,
+        b_hh: read_f32s(blob, offset, 3 * GRU_H)?,
+    })
+}
+
 impl WaveEnhancer {
     /// Parse the embedded weights.
     ///
@@ -108,32 +318,21 @@ impl WaveEnhancer {
     /// [`WaveEnhanceError::BadBlob`] when the embedded blob size does
     /// not match the compiled-in layer layout.
     pub fn new() -> Result<Self, WaveEnhanceError> {
-        // (out, in, dilation_t) per layer, mirroring the exporter.
-        let shapes = [
-            (CH, 3, 1),
-            (CH, CH, 1),
-            (CH, CH, 1),
-            (CH, CH, 2),
-            (2, CH, 1),
-        ];
-        let expected: usize = shapes.iter().map(|&(o, i, _)| o * i * 9 + o).sum::<usize>() * 4;
-        if MODEL_BIN.len() != expected {
-            return Err(WaveEnhanceError::BadBlob(MODEL_BIN.len()));
-        }
+        let err = || WaveEnhanceError::BadBlob(MODEL_BIN.len());
         let mut offset = 0usize;
-        let mut layers = Vec::with_capacity(shapes.len());
-        for &(out_ch, in_ch, dilation_t) in &shapes {
-            let weight = read_f32s(MODEL_BIN, &mut offset, out_ch * in_ch * 9)
-                .ok_or(WaveEnhanceError::BadBlob(MODEL_BIN.len()))?;
-            let bias = read_f32s(MODEL_BIN, &mut offset, out_ch)
-                .ok_or(WaveEnhanceError::BadBlob(MODEL_BIN.len()))?;
-            layers.push(Conv {
-                weight,
-                bias,
-                out_ch,
-                in_ch,
-                dilation_t,
-            });
+        let o = &mut offset;
+        let inp = read_conv(MODEL_BIN, o, CH, 4, 5, 1, 1, 1, 2, 0, 1).ok_or_else(err)?;
+        let freq1 = read_conv(MODEL_BIN, o, CH, CH, 5, 3, 1, 1, 2, 1, GROUPS).ok_or_else(err)?;
+        let freq2 = read_conv(MODEL_BIN, o, CH, CH, 5, 3, 1, 1, 2, 1, GROUPS).ok_or_else(err)?;
+        let down = read_conv(MODEL_BIN, o, DCH, CH, 4, 1, 4, 1, 0, 0, 1).ok_or_else(err)?;
+        let gru_f = read_gru_dir(MODEL_BIN, o).ok_or_else(err)?;
+        let gru_r = read_gru_dir(MODEL_BIN, o).ok_or_else(err)?;
+        let up_w = read_f32s(MODEL_BIN, o, GRU_IN * 2 * GRU_H).ok_or_else(err)?;
+        let up_b = read_f32s(MODEL_BIN, o, GRU_IN).ok_or_else(err)?;
+        let mix = read_conv(MODEL_BIN, o, CH, CH + DCH, 1, 1, 1, 1, 0, 0, 1).ok_or_else(err)?;
+        let out = read_conv(MODEL_BIN, o, 2, CH, 3, 3, 1, 1, 1, 1, 1).ok_or_else(err)?;
+        if offset != MODEL_BIN.len() {
+            return Err(err());
         }
         let mut window = [0.0_f32; N_FFT];
         for (n, slot) in window.iter_mut().enumerate() {
@@ -141,7 +340,19 @@ impl WaveEnhancer {
             let phase = std::f32::consts::TAU * n as f32 / N_FFT as f32;
             *slot = 0.5_f32.mul_add(-phase.cos(), 0.5);
         }
-        Ok(Self { layers, window })
+        Ok(Self {
+            inp,
+            freq1,
+            freq2,
+            down,
+            gru_f,
+            gru_r,
+            up_w,
+            up_b,
+            mix,
+            out,
+            window,
+        })
     }
 
     /// Enhance one whole clip of decoder output PCM.
@@ -171,22 +382,37 @@ impl WaveEnhancer {
     /// Float-domain processing (unit-scale samples). The parity test
     /// drives this directly against the training checkpoint's output.
     #[must_use]
-    pub fn process_f32(&self, x: &[f32]) -> Vec<f32> {
-        // Centered STFT: reflect-pad n_fft/2 on both ends.
-        let pad = N_FFT / 2;
-        let mut padded = Vec::with_capacity(x.len() + 2 * pad);
-        for i in (1..=pad).rev() {
-            padded.push(x.get(i).copied().unwrap_or(0.0));
-        }
-        padded.extend_from_slice(x);
-        for i in 1..=pad {
-            padded.push(x.get(x.len().wrapping_sub(1 + i)).copied().unwrap_or(0.0));
-        }
+    pub fn process_f32(&self, samples: &[f32]) -> Vec<f32> {
+        let padded = Self::reflect_pad(samples);
         let frames = (padded.len() - N_FFT) / HOP + 1;
+        let spec = self.stft(&padded, frames);
+        let mask = self.network_mask(&Self::features(&spec, frames), frames);
+        self.istft(&spec, &mask, frames, padded.len(), samples.len())
+    }
 
+    /// Centered-STFT preparation: reflect-pad `N_FFT / 2` on both ends.
+    fn reflect_pad(samples: &[f32]) -> Vec<f32> {
+        let pad = N_FFT / 2;
+        let mut padded = Vec::with_capacity(samples.len() + 2 * pad);
+        for i in (1..=pad).rev() {
+            padded.push(samples.get(i).copied().unwrap_or(0.0));
+        }
+        padded.extend_from_slice(samples);
+        for i in 1..=pad {
+            padded.push(
+                samples
+                    .get(samples.len().wrapping_sub(1 + i))
+                    .copied()
+                    .unwrap_or(0.0),
+            );
+        }
+        padded
+    }
+
+    /// Windowed forward STFT: `frames × BINS` complex, frame-major.
+    fn stft(&self, padded: &[f32], frames: usize) -> Vec<Complex<f32>> {
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(N_FFT);
-        let ifft = planner.plan_fft_inverse(N_FFT);
         let mut spec = vec![Complex::new(0.0_f32, 0.0); frames * BINS];
         let mut buf = fft.make_input_vec();
         let mut freq = fft.make_output_vec();
@@ -201,9 +427,14 @@ impl WaveEnhancer {
                 dst.copy_from_slice(&freq);
             }
         }
+        spec
+    }
 
-        // Features: [logmag, cos, sin] × BINS × frames.
-        let mut feat = vec![0.0_f32; 3 * BINS * frames];
+    /// Network input: [logmag, cos, sin, t] channel-major planes of
+    /// (`BINS` × frames). Inference is data prediction from t = 0, so
+    /// the time-conditioning plane is identically zero.
+    fn features(spec: &[Complex<f32>], frames: usize) -> Vec<f32> {
+        let mut feat = vec![0.0_f32; 4 * BINS * frames];
         for f in 0..frames {
             for b in 0..BINS {
                 let c = spec.get(f * BINS + b).copied().unwrap_or_default();
@@ -220,23 +451,116 @@ impl WaveEnhancer {
                 }
             }
         }
+        feat
+    }
 
-        // Conv stack (channels-major planes of BINS×frames).
-        let mut cur = feat;
-        for (li, layer) in self.layers.iter().enumerate() {
-            let mut next = vec![0.0_f32; layer.out_ch * BINS * frames];
-            conv3x3(&cur, &mut next, layer, BINS, frames);
-            if li + 1 < self.layers.len() {
-                for v in &mut next {
-                    *v = gelu(*v);
-                }
-            }
-            cur = next;
+    /// The network body — convolutional trunk, bidirectional
+    /// recurrence, nearest-neighbor frequency upsample, and the mask
+    /// head. Returns the two raw mask planes (`BINS` × frames each).
+    fn network_mask(&self, feat: &[f32], frames: usize) -> Vec<f32> {
+        // Convolutional trunk with residual grouped stages:
+        //   trunk = gelu(inp(feat))
+        //   trunk = gelu(freq1(trunk)) + trunk
+        //   trunk = gelu(freq2(trunk)) + trunk
+        //   down  = gelu(down(trunk))
+        let (mut trunk, _, _) = conv2d(feat, BINS, frames, &self.inp);
+        for v in &mut trunk {
+            *v = gelu(*v);
+        }
+        let (mut f1, _, _) = conv2d(&trunk, BINS, frames, &self.freq1);
+        for (a, b) in f1.iter_mut().zip(trunk.iter()) {
+            *a = gelu(*a) + b;
+        }
+        let (mut f2, _, _) = conv2d(&f1, BINS, frames, &self.freq2);
+        for (a, b) in f2.iter_mut().zip(f1.iter()) {
+            *a = gelu(*a) + b;
+        }
+        let (mut down_out, _dh, _dw) = conv2d(&f2, BINS, frames, &self.down);
+        for v in &mut down_out {
+            *v = gelu(*v);
         }
 
-        // Apply mask: (1 + tanh(m0)) + i·tanh(m1); inverse STFT.
-        let mut out_padded = vec![0.0_f32; padded.len()];
-        let mut norm = vec![0.0_f32; padded.len()];
+        // Sequence for the recurrence: per time step, features in
+        // [channel][freq] order.
+        let mut seq = vec![0.0_f32; frames * GRU_IN];
+        for c in 0..DCH {
+            for fr in 0..DFR {
+                for t in 0..frames {
+                    let v = down_out
+                        .get(c * DFR * frames + fr * frames + t)
+                        .copied()
+                        .unwrap_or(0.0);
+                    if let Some(slot) = seq.get_mut(t * GRU_IN + c * DFR + fr) {
+                        *slot = v;
+                    }
+                }
+            }
+        }
+        let mut gru_out = vec![0.0_f32; frames * 2 * GRU_H];
+        gru_pass(&self.gru_f, &seq, frames, false, &mut gru_out, 0);
+        gru_pass(&self.gru_r, &seq, frames, true, &mut gru_out, GRU_H);
+
+        // Per-step linear projection back to (DCH × DFR) planes.
+        let mut g_planes = vec![0.0_f32; DCH * DFR * frames];
+        let mut proj = vec![0.0_f32; GRU_IN];
+        for t in 0..frames {
+            let gseq = gru_out
+                .get(t * 2 * GRU_H..(t + 1) * 2 * GRU_H)
+                .unwrap_or(&[]);
+            matvec(&self.up_w, &self.up_b, gseq, GRU_IN, 2 * GRU_H, &mut proj);
+            for c in 0..DCH {
+                for fr in 0..DFR {
+                    let v = proj.get(c * DFR + fr).copied().unwrap_or(0.0);
+                    if let Some(slot) = g_planes.get_mut(c * DFR * frames + fr * frames + t) {
+                        *slot = v;
+                    }
+                }
+            }
+        }
+
+        // Concat [trunk(CH) ; nearest-upsampled recurrence(DCH)] over
+        // BINS × frames, then 1×1 mix and the mask head.
+        let mut cat = vec![0.0_f32; (CH + DCH) * BINS * frames];
+        if let Some(dst) = cat.get_mut(..CH * BINS * frames) {
+            dst.copy_from_slice(&f2);
+        }
+        for c in 0..DCH {
+            for b in 0..BINS {
+                let src_fr = b * DFR / BINS; // torch nearest: floor(i·in/out)
+                for t in 0..frames {
+                    let v = g_planes
+                        .get(c * DFR * frames + src_fr * frames + t)
+                        .copied()
+                        .unwrap_or(0.0);
+                    if let Some(slot) = cat.get_mut((CH + c) * BINS * frames + b * frames + t) {
+                        *slot = v;
+                    }
+                }
+            }
+        }
+        let (mut mixed, _, _) = conv2d(&cat, BINS, frames, &self.mix);
+        for v in &mut mixed {
+            *v = gelu(*v);
+        }
+        let (mask_planes, _, _) = conv2d(&mixed, BINS, frames, &self.out);
+        mask_planes
+    }
+
+    /// Bounded complex mask application — `(1 + tanh(m0)) + i·tanh(m1)`
+    /// — and window-normalized overlap-add inverse STFT, cropped back
+    /// to the unpadded input length.
+    fn istft(
+        &self,
+        spec: &[Complex<f32>],
+        mask_planes: &[f32],
+        frames: usize,
+        padded_len: usize,
+        out_len: usize,
+    ) -> Vec<f32> {
+        let mut planner = RealFftPlanner::<f32>::new();
+        let ifft = planner.plan_fft_inverse(N_FFT);
+        let mut out_padded = vec![0.0_f32; padded_len];
+        let mut norm = vec![0.0_f32; padded_len];
         let mut time = ifft.make_output_vec();
         let mut freq_in = ifft.make_input_vec();
         let mut iscratch = ifft.make_scratch_vec();
@@ -245,8 +569,8 @@ impl WaveEnhancer {
         for f in 0..frames {
             for b in 0..BINS {
                 let idx = b * frames + f;
-                let m0 = cur.get(idx).copied().unwrap_or(0.0);
-                let m1 = cur.get(BINS * frames + idx).copied().unwrap_or(0.0);
+                let m0 = mask_planes.get(idx).copied().unwrap_or(0.0);
+                let m1 = mask_planes.get(BINS * frames + idx).copied().unwrap_or(0.0);
                 let mask = Complex::new(1.0 + m0.tanh(), m1.tanh());
                 let c = spec.get(f * BINS + b).copied().unwrap_or_default();
                 if let Some(slot) = freq_in.get_mut(b) {
@@ -264,59 +588,13 @@ impl WaveEnhancer {
                 }
             }
         }
-        (0..x.len())
+        let pad = N_FFT / 2;
+        (0..out_len)
             .map(|i| {
                 let num = out_padded.get(pad + i).copied().unwrap_or(0.0);
                 let den = norm.get(pad + i).copied().unwrap_or(1.0).max(1e-8);
                 num / den
             })
             .collect()
-    }
-}
-
-/// Zero-padded 3×3 convolution over (freq, time) planes, with a
-/// time-axis dilation of 1 or 2 (padding matches the dilation so the
-/// output keeps the input size).
-fn conv3x3(input: &[f32], output: &mut [f32], layer: &Conv, height: usize, width: usize) {
-    let dt = layer.dilation_t;
-    for oc in 0..layer.out_ch {
-        let bias = layer.bias.get(oc).copied().unwrap_or(0.0);
-        for b in 0..height {
-            for f in 0..width {
-                let mut acc = bias;
-                for ic in 0..layer.in_ch {
-                    let plane = ic * height * width;
-                    let wbase = (oc * layer.in_ch + ic) * 9;
-                    for (kb, brow) in [-1_isize, 0, 1].into_iter().enumerate() {
-                        #[expect(clippy::cast_possible_wrap, reason = "height ≤ 129, fits isize")]
-                        let bb = b as isize + brow;
-                        if bb < 0 || bb >= height.cast_signed() {
-                            continue;
-                        }
-                        for (kf, frow) in [-1_isize, 0, 1].into_iter().enumerate() {
-                            #[expect(clippy::cast_possible_wrap, reason = "frame count fits isize")]
-                            let ff = f as isize + frow * dt as isize;
-                            if ff < 0 || ff >= width.cast_signed() {
-                                continue;
-                            }
-                            #[expect(
-                                clippy::cast_sign_loss,
-                                reason = "bounds-checked non-negative above"
-                            )]
-                            let src = plane + bb as usize * width + ff as usize;
-                            let w = layer
-                                .weight
-                                .get(wbase + kb * 3 + kf)
-                                .copied()
-                                .unwrap_or(0.0);
-                            acc = input.get(src).copied().unwrap_or(0.0).mul_add(w, acc);
-                        }
-                    }
-                }
-                if let Some(slot) = output.get_mut(oc * height * width + b * width + f) {
-                    *slot = acc;
-                }
-            }
-        }
     }
 }

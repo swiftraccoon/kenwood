@@ -13,6 +13,14 @@ Decoder on by default; encoder behind the `encoder` Cargo feature.
   to wire form. The encoder is experimental: reliable DVSI hardware
   interoperability is not yet validated, and the ignored correlation test
   tracks a known spectral-envelope defect.
+- **Waveform enhancement** (`--features wave-enhance`): a learned
+  post-processor for decoder output — a small complex-STFT masking
+  network with a bidirectional recurrent core, adversarially fine-tuned
+  against reference hardware-grade decodes of identical AMBE frames —
+  that regenerates waveform fine structure the base synthesis cannot.
+  Opt-in and offline: it processes whole clips (the recurrence reads the
+  entire clip), embeds ≈2.5 MiB of trained weights, and ships only after
+  blind operator listening prefers it.
 - **D-STAR only**: AMBE 3600×2400 is the mandatory voice codec for the
   JARL D-STAR standard. The decoder synthesizes valid single-tone frames,
   but the encoder does not emit tone frames. Does **not** support AMBE+,
@@ -45,6 +53,22 @@ let ambe: [u8; 9] = encoder.encode_frame_i16(&pcm_i16);
 ```
 
 One decoder/encoder per voice stream (each carries inter-frame state).
+
+### Waveform enhancement (feature-gated)
+
+```rust,ignore
+use mbelib_rs::enhance_wave::WaveEnhancer;
+
+let enhancer = WaveEnhancer::new()?;
+let decoded: Vec<i16> = todo!("whole clip of decoder output, 8 kHz mono");
+let enhanced: Vec<i16> = enhancer.process(&decoded);
+```
+
+Enhance after decoding a complete transmission, not per frame: the
+network reads the whole clip. Output length equals input length, and
+clips shorter than a few STFT frames pass through unchanged. One
+`WaveEnhancer` can be reused across clips (it is stateless between
+calls).
 
 ## Pipeline
 
@@ -159,8 +183,9 @@ reliable DVSI chip interoperability are not guaranteed.
 
 ## Dependencies
 
-- `realfft` — 256-point real FFT for unvoiced synthesis (decoder) and
-  spectral analysis (encoder).
+- `realfft` — 256-point real FFT for unvoiced synthesis (decoder),
+  spectral analysis (encoder), and the enhancement STFT
+  (`wave-enhance`).
 - `wide` — `f32x4`/`i32x4` SIMD for float→i16 conversion.
 
 Both are pure Rust (MIT/Apache-2.0), so no C, no FFI, no `unsafe`.

@@ -36,11 +36,12 @@ encoder = []
 # `encoder` because every current swap site is encoder-only.
 kenwood-tables = ["encoder"]
 # Learned waveform enhancement: a small complex-STFT masking network
-# (weights trained against reflector-published reference decodes of
-# identical AMBE frames, embedded as a binary blob) that regenerates
+# with a bidirectional recurrent core (weights trained against
+# reflector-published reference decodes of identical AMBE frames and
+# adversarially fine-tuned, embedded as a binary blob) that regenerates
 # fine structure the base synthesis cannot. Off by default: it is an
-# opt-in post-process, gated by blind operator listening before any
-# release, and adds ~260 KiB of embedded weights.
+# opt-in whole-clip post-process, gated by blind operator listening
+# before any release, and adds ~2.5 MiB of embedded weights.
 wave-enhance = []
 
 [dev-dependencies]
