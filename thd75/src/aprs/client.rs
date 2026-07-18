@@ -1172,6 +1172,14 @@ impl<T: Transport> AprsClient<T> {
         path_parts.push(format!("{}", self.my_addr));
         let path_str = path_parts.join(",");
         let data = String::from_utf8_lossy(&packet.info);
+        // RF info fields legitimately end with CR/LF (status packets
+        // carry a trailing CR by spec; many TNC beacons append one).
+        // Those bytes are the AX.25 payload's own framing junk, not
+        // content — carried into the IS line verbatim they read as an
+        // embedded newline ahead of our CRLF terminator, and the
+        // uplink's injection guard rightly refuses the line. Trim
+        // them; interior CR/LF still gets rejected downstream.
+        let data = data.trim_end_matches(['\r', '\n']);
         format!(
             "{}>{},{path_str}:{data}\r\n",
             packet.source, packet.destination,
@@ -1737,6 +1745,31 @@ mod tests {
         assert!(is_line.starts_with("W1AW>APK005,WIDE1-1,qAR,N0CALL-7:"));
         assert!(is_line.ends_with("\r\n"));
         assert!(is_line.contains("!4903.50N/07201.75W-"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn format_for_is_trims_trailing_cr_from_info() -> TestResult {
+        // APRS status packets end with a CR by spec, and many TNC
+        // beacons carry trailing CR/LF; verbatim framing produced
+        // "...\r\r\n", which the APRS-IS uplink guard correctly
+        // rejects as an embedded newline. On-air 2026-07-18: KQ4KDX's
+        // packet was refused with EmbeddedNewline for exactly this.
+        let radio = mock_radio(TncBaud::Bps1200).await?;
+        let config = test_config();
+        let client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+
+        let packet = make_test_packet("W1AW", "APK005", &["WIDE1-1"], b">QRV mobile\r");
+        let is_line = client.format_for_is(&packet);
+
+        assert_eq!(is_line, "W1AW>APK005,WIDE1-1,qAR,N0CALL-7:>QRV mobile\r\n");
+        let body = is_line
+            .strip_suffix("\r\n")
+            .ok_or("line must end with CRLF")?;
+        assert!(
+            !body.contains('\r') && !body.contains('\n'),
+            "body must not contain embedded CR/LF: {body:?}"
+        );
         Ok(())
     }
 
