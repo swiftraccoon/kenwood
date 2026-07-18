@@ -210,7 +210,14 @@ impl<T: Transport> Radio<T> {
     /// 1. Two empty frames
     /// 2. 300ms delay
     /// 3. ETX byte (0x03)
-    /// 4. `\rTC 1\r` (TNC exit command)
+    /// 4. KISS Return frame (`C0 FF C0`) — the exit the KISS protocol
+    ///    itself defines. A radio left in KISS mode (e.g. by a crashed
+    ///    APRS session) ignores every ASCII byte below, so this frame
+    ///    is the only thing that can bring it back; to a radio in CAT
+    ///    mode the three bytes are line noise flushed by the next
+    ///    leading `\r`.
+    /// 5. `\rTC 1\r` (TNC exit command)
+    /// 6. `TN 0,0\r` (returns from MMDVM/packet modes)
     ///
     /// After the preamble, the radio should be in normal CAT mode regardless
     /// of its previous state.
@@ -241,13 +248,23 @@ impl<T: Transport> Radio<T> {
             .map_err(Error::Transport)?;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // ETX (exit KISS mode if active).
+        // ETX (part of the ARFC-D75 wake sequence).
         radio
             .transport
             .write(&[0x03])
             .await
             .map_err(Error::Transport)?;
-        // TC 1 exits KISS TNC mode.
+        // KISS Return frame — the actual KISS-mode exit. A radio stuck
+        // in KISS mode discards all the ASCII bytes in this preamble as
+        // inter-frame garbage; this FEND-framed command is the only
+        // recovery path. Same bytes `AprsClient::stop` sends.
+        radio
+            .transport
+            .write(&[0xC0, 0xFF, 0xC0])
+            .await
+            .map_err(Error::Transport)?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // TC 1 exits the built-in packet TNC mode.
         radio
             .transport
             .write(b"\rTC 1\r")

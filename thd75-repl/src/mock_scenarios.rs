@@ -41,11 +41,12 @@ pub fn build(name: &str) -> Option<MockTransport> {
 /// Minimal scenario covering `Radio::connect_safe` plus one `identify`
 /// round-trip and one `get_firmware_version` round-trip.
 ///
-/// `connect_safe` sends a five-byte preamble (`\r`, `\r`, `ETX`,
-/// `\rTC 1\r`, `TN 0,0\r`) followed by a drained read; each of those
-/// writes is programmed against an empty response so the mock's
-/// exchange queue drains cleanly. The subsequent CAT reads match the
-/// `ID\r` and `FV\r` commands issued by the REPL startup.
+/// `connect_safe` sends a six-write preamble (`\r`, `\r`, `ETX`, the
+/// KISS Return frame `C0 FF C0`, `\rTC 1\r`, `TN 0,0\r`) followed by a
+/// drained read; each of those writes is programmed against an empty
+/// response so the mock's exchange queue drains cleanly. The subsequent
+/// CAT reads match the `ID\r` and `FV\r` commands issued by the REPL
+/// startup.
 fn simple_scenario() -> MockTransport {
     let mut mock = MockTransport::new();
 
@@ -55,6 +56,7 @@ fn simple_scenario() -> MockTransport {
     mock.expect(b"\r", b"");
     mock.expect(b"\r", b"");
     mock.expect(&[0x03], b"");
+    mock.expect(&[0xC0, 0xFF, 0xC0], b"");
     mock.expect(b"\rTC 1\r", b"");
     mock.expect(b"TN 0,0\r", b"");
 
@@ -92,6 +94,7 @@ fn aprs_scenario() -> MockTransport {
     mock.expect(b"\r", b"");
     mock.expect(b"\r", b"");
     mock.expect(&[0x03], b"");
+    mock.expect(&[0xC0, 0xFF, 0xC0], b"");
     mock.expect(b"\rTC 1\r", b"");
     mock.expect(b"TN 0,0\r", b"");
 
@@ -128,6 +131,7 @@ fn mmdvm_scenario() -> MockTransport {
     mock.expect(b"\r", b"");
     mock.expect(b"\r", b"");
     mock.expect(&[0x03], b"");
+    mock.expect(&[0xC0, 0xFF, 0xC0], b"");
     mock.expect(b"\rTC 1\r", b"");
     mock.expect(b"TN 0,0\r", b"");
 

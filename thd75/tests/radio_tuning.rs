@@ -292,6 +292,27 @@ async fn connect_safe_sends_tnc_exit_preamble() -> TestResult {
 }
 
 #[tokio::test]
+async fn connect_safe_preamble_includes_kiss_exit_frame() -> TestResult {
+    // A radio left in KISS mode (crashed APRS session) ignores every
+    // ASCII CAT byte — the only exit the KISS protocol defines is the
+    // FEND-framed Return command (C0 FF C0), the same bytes
+    // AprsClient::stop() sends. The preamble must include it ahead of
+    // the ASCII TNC exits, or a stuck-KISS radio stays unreachable
+    // even though the transport connects. Hardware-observed 2026-07-18.
+    let mut mock = MockTransport::new();
+    mock.expect(b"\r", b"");
+    mock.expect(b"\r", b"");
+    mock.expect(&[0x03], b"");
+    mock.expect(&[0xC0, 0xFF, 0xC0], b"");
+    mock.expect(b"\rTC 1\r", b"");
+    mock.expect(b"TN 0,0\r", b"");
+
+    let radio = Radio::connect_safe(mock).await?;
+    drop(radio);
+    Ok(())
+}
+
+#[tokio::test]
 async fn connect_safe_returns_functional_radio() -> TestResult {
     // After the preamble, connect_safe returns a usable Radio.
     // Verify by checking that subscribe() works (it requires a valid Radio).
