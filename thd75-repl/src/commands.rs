@@ -122,6 +122,93 @@ pub(crate) async fn frequency<T: Transport>(radio: &mut Radio<T>, args: &[&str])
     }
 }
 
+/// Read or set the TNC protocol mode. Args: `[aprs|kiss] [1200|9600]`.
+///
+/// With no arguments, reads the current mode and speed. Setting KISS
+/// here only changes the mode flag — use `aprs start` for a managed
+/// KISS session. APRS mode hands packet operation to the radio's own
+/// firmware.
+pub(crate) async fn tnc_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
+    let Some(&mode_arg) = args.first() else {
+        match radio.get_tnc_mode().await {
+            Ok((mode, baud)) => aprintln!("{}", thd75_repl::output::tnc_mode_read(mode, baud)),
+            Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
+        }
+        return;
+    };
+    let mode = match mode_arg.to_lowercase().as_str() {
+        "off" => kenwood_thd75::types::TncMode::Off,
+        "aprs" => kenwood_thd75::types::TncMode::Aprs,
+        "kiss" => kenwood_thd75::types::TncMode::Kiss,
+        other => {
+            aprintln!(
+                "{}",
+                thd75_repl::output::error(format_args!("unknown TNC mode: {other}"))
+            );
+            aprintln!("Valid modes: off, aprs, kiss");
+            return;
+        }
+    };
+    let baud = match args.get(1) {
+        None | Some(&"1200") => kenwood_thd75::types::TncBaud::Bps1200,
+        Some(&"9600") => kenwood_thd75::types::TncBaud::Bps9600,
+        Some(other) => {
+            aprintln!(
+                "{}",
+                thd75_repl::output::error(format_args!("unknown speed {other}. Use 1200 or 9600."))
+            );
+            return;
+        }
+    };
+    match radio.set_tnc_mode(mode, baud).await {
+        Ok(()) => aprintln!("{}", thd75_repl::output::tnc_mode_set(mode, baud)),
+        Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
+    }
+}
+
+/// Read or set the firmware beacon type. Args: `[off|manual|ptt|auto|smart]`.
+///
+/// Auto, smart, and PTT make the radio transmit BY ITSELF while its
+/// TNC is in APRS mode, so those settings go through the transmit
+/// confirmation gate.
+pub(crate) async fn beacon_type<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
+    let Some(&arg) = args.first() else {
+        match radio.get_beacon_type().await {
+            Ok(mode) => aprintln!("{}", thd75_repl::output::beacon_type_read(mode)),
+            Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
+        }
+        return;
+    };
+    let mode = match arg.to_lowercase().as_str() {
+        "off" => kenwood_thd75::types::BeaconMode::Off,
+        "manual" => kenwood_thd75::types::BeaconMode::Manual,
+        "ptt" => kenwood_thd75::types::BeaconMode::Ptt,
+        "auto" => kenwood_thd75::types::BeaconMode::Auto,
+        "smart" | "smartbeaconing" => kenwood_thd75::types::BeaconMode::SmartBeaconing,
+        other => {
+            aprintln!(
+                "{}",
+                thd75_repl::output::error(format_args!("unknown beacon type: {other}"))
+            );
+            aprintln!("Valid types: off, manual, ptt, auto, smart");
+            return;
+        }
+    };
+    let transmits = matches!(
+        mode,
+        kenwood_thd75::types::BeaconMode::Ptt
+            | kenwood_thd75::types::BeaconMode::Auto
+            | kenwood_thd75::types::BeaconMode::SmartBeaconing
+    );
+    if transmits && !thd75_repl::confirm::tx_confirm() {
+        return;
+    }
+    match radio.set_beacon_type(mode).await {
+        Ok(()) => aprintln!("{}", thd75_repl::output::beacon_type_set(mode)),
+        Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
+    }
+}
+
 /// Read or set the squelch level. Args: `[a|b] [level]`.
 /// With one arg, reads. With two, sets (level 0-5).
 pub(crate) async fn squelch<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {

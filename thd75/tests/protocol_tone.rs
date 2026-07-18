@@ -41,11 +41,13 @@ fn serialize_tn_read() {
 
 #[test]
 fn parse_tn_response() -> TestResult {
+    // TN 0 is TNC OFF — hardware-verified 2026-07-18 (display shows no
+    // packet-mode indicator). An earlier generation mapped 0 to APRS.
     let r = protocol::parse(b"TN 0,0")?;
     let Response::TncMode { mode, setting } = r else {
         return Err(format!("expected TncMode, got {r:?}").into());
     };
-    assert_eq!(mode, TncMode::Aprs);
+    assert_eq!(mode, TncMode::Off);
     assert_eq!(setting, TncBaud::Bps1200);
     Ok(())
 }
@@ -62,16 +64,14 @@ fn parse_tn_kiss_mode() -> TestResult {
 }
 
 #[test]
-fn parse_tn_navitra() -> TestResult {
-    // Setting 1 = 9600 bps — but TncBaud only has 0 and 1,
-    // and value 2 would be out of range. Navitra mode with 9600 setting
-    // is not documented; if the radio sends TN 1,2 it would be a parse error.
-    // Use valid values only.
+fn parse_tn_aprs_9600() -> TestResult {
+    // TN 1 is the firmware APRS mode ("APRS 12"/"APRS 96" on the
+    // display); setting 1 = 9600 bps.
     let r = protocol::parse(b"TN 1,1")?;
     let Response::TncMode { mode, setting } = r else {
         return Err(format!("expected TncMode, got {r:?}").into());
     };
-    assert_eq!(mode, TncMode::Navitra);
+    assert_eq!(mode, TncMode::Aprs);
     assert_eq!(setting, TncBaud::Bps9600);
     Ok(())
 }

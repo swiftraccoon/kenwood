@@ -8,7 +8,7 @@
 //! their screen reader to verify the mechanically checked output contract.
 
 use crate::{help_text, lint, output};
-use kenwood_thd75::types::{Band, BatteryLevel, PowerLevel};
+use kenwood_thd75::types::{Band, BatteryLevel, BeaconMode, PowerLevel, TncBaud, TncMode};
 
 /// One entry in the coverage table: a human-readable source name and
 /// a generator that produces the representative outputs for that
@@ -24,6 +24,8 @@ const COVERAGE: &[(&str, Generator)] = &[
     ("output::mode_set", gen_mode_set),
     ("output::power_read", gen_power_read),
     ("output::power_set", gen_power_set),
+    ("output::tnc_mode", gen_tnc_mode),
+    ("output::beacon_type", gen_beacon_type),
     ("output::squelch_read", gen_squelch_read),
     ("output::squelch_set", gen_squelch_set),
     ("output::smeter", gen_smeter),
@@ -104,6 +106,32 @@ fn gen_power_read() -> Vec<String> {
     .iter()
     .map(|p| output::power_read(Band::A, *p))
     .collect()
+}
+
+fn gen_tnc_mode() -> Vec<String> {
+    let mut v = Vec::new();
+    for mode in [TncMode::Off, TncMode::Aprs, TncMode::Kiss] {
+        for baud in [TncBaud::Bps1200, TncBaud::Bps9600] {
+            v.push(output::tnc_mode_read(mode, baud));
+            v.push(output::tnc_mode_set(mode, baud));
+        }
+    }
+    v
+}
+
+fn gen_beacon_type() -> Vec<String> {
+    let mut v = Vec::new();
+    for mode in [
+        BeaconMode::Off,
+        BeaconMode::Manual,
+        BeaconMode::Ptt,
+        BeaconMode::Auto,
+        BeaconMode::SmartBeaconing,
+    ] {
+        v.push(output::beacon_type_read(mode));
+        v.push(output::beacon_type_set(mode));
+    }
+    v
 }
 
 fn gen_power_set() -> Vec<String> {

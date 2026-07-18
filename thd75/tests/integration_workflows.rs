@@ -104,7 +104,7 @@ async fn audio_settings_workflow() -> TestResult {
     let mut radio = Radio::connect(mock).await?;
     assert_eq!(radio.get_af_gain().await?, AfGainLevel::new(20));
     let (tnc_mode, tnc_setting) = radio.get_tnc_mode().await?;
-    assert_eq!(tnc_mode, TncMode::Aprs);
+    assert_eq!(tnc_mode, TncMode::Off);
     assert_eq!(tnc_setting, TncBaud::Bps1200);
     assert!(!radio.get_vox().await?);
     Ok(())

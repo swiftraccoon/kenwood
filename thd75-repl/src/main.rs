@@ -1508,6 +1508,8 @@ async fn dispatch_cat(radio: &mut Radio<EitherTransport>, cmd: &str, parts: &[&s
         "mode" => commands::set_mode(radio, args).await,
         "squelch" | "sq" => commands::squelch(radio, args).await,
         "power" | "pwr" => commands::set_power(radio, args).await,
+        "tnc" => commands::tnc_mode(radio, args).await,
+        "beacontype" => commands::beacon_type(radio, args).await,
         "battery" | "bat" => commands::battery(radio).await,
         "lock" => commands::lock(radio, args).await,
         "dualband" | "dual" => commands::dual_band(radio, args).await,

@@ -271,7 +271,8 @@ impl<T: Transport> Radio<T> {
             .await
             .map_err(Error::Transport)?;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        // TN 0,0 exits MMDVM mode (returns to APRS/normal TNC).
+        // TN 0,0 turns the built-in TNC off entirely (exits APRS, KISS,
+        // and MMDVM packet modes; plain CAT operation remains).
         radio
             .transport
             .write(b"TN 0,0\r")

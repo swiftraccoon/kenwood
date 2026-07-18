@@ -925,12 +925,20 @@ impl From<DvGatewayMode> for u8 {
 /// §4.5 (Reflector Terminal/MMDVM), firmware string table (NAVITRA).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TncMode {
-    /// APRS mode — standard packet operation (index 0).
-    Aprs = 0,
-    /// NAVITRA mode — Japanese APRS variant (index 1).
-    Navitra = 1,
+    /// TNC off — no packet mode active, plain CAT operation (index 0).
+    ///
+    /// Hardware-verified 2026-07-18: after `TN 0,0` the radio's display
+    /// shows no packet-mode indicator (neither "APRS 12" nor "KISS 12").
+    /// An earlier code generation labeled index 0 as APRS, which made
+    /// every recovery preamble read back as "APRS mode" while the TNC
+    /// was actually off.
+    Off = 0,
+    /// APRS mode — packet operation run by the radio firmware (index 1).
+    /// The display shows "APRS 12" (or "APRS 96" at 9600 bps).
+    Aprs = 1,
     /// KISS mode — PC-based packet via KISS protocol (index 2).
-    /// Enter with `TN 2,0` (Band A) or `TN 2,1` (Band B).
+    /// Enter with `TN 2,0` (1200 bps) or `TN 2,1` (9600 bps); the
+    /// display shows "KISS 12" / "KISS 96".
     /// See Operating Tips §2.7, User Manual Chapter 15.
     /// The built-in TNC has 4 KB TX and RX buffers and supports only
     /// KISS mode (no Command mode or Converse mode).
@@ -949,8 +957,8 @@ impl TncMode {
 impl fmt::Display for TncMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Off => f.write_str("off"),
             Self::Aprs => f.write_str("APRS"),
-            Self::Navitra => f.write_str("NAVITRA"),
             Self::Kiss => f.write_str("KISS"),
             Self::Mmdvm => f.write_str("MMDVM"),
         }
@@ -962,8 +970,8 @@ impl TryFrom<u8> for TncMode {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::Aprs),
-            1 => Ok(Self::Navitra),
+            0 => Ok(Self::Off),
+            1 => Ok(Self::Aprs),
             2 => Ok(Self::Kiss),
             3 => Ok(Self::Mmdvm),
             _ => Err(ValidationError::SettingOutOfRange {

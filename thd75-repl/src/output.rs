@@ -15,7 +15,7 @@
 //! - Lines under 80 characters (no wrapping in standard terminals)
 //! - ASCII printable only (no box-drawing or symbols)
 
-use kenwood_thd75::types::{Band, BatteryLevel, PowerLevel};
+use kenwood_thd75::types::{Band, BatteryLevel, BeaconMode, PowerLevel, TncBaud, TncMode};
 
 /// Human-readable band name. Matches the pre-extraction helper which
 /// returned "A" for `Band::A` and "B" for every other variant.
@@ -107,6 +107,39 @@ pub fn warning(e: impl std::fmt::Display) -> String {
 #[must_use]
 pub fn mode_set(band: Band, mode_display: &str) -> String {
     format!("Band {} mode set to {mode_display}", band_name(band))
+}
+
+/// Spell out a TNC data speed without abbreviations.
+#[must_use]
+pub const fn tnc_baud_display(baud: TncBaud) -> &'static str {
+    match baud {
+        TncBaud::Bps1200 => "1200 bits per second",
+        TncBaud::Bps9600 => "9600 bits per second",
+    }
+}
+
+/// Format a TNC mode readout.
+#[must_use]
+pub fn tnc_mode_read(mode: TncMode, baud: TncBaud) -> String {
+    format!("TNC mode: {mode} at {}", tnc_baud_display(baud))
+}
+
+/// Format a TNC mode change confirmation.
+#[must_use]
+pub fn tnc_mode_set(mode: TncMode, baud: TncBaud) -> String {
+    format!("TNC mode set to {mode} at {}", tnc_baud_display(baud))
+}
+
+/// Format a firmware beacon type readout.
+#[must_use]
+pub fn beacon_type_read(mode: BeaconMode) -> String {
+    format!("Firmware beacon type: {mode}")
+}
+
+/// Format a firmware beacon type change confirmation.
+#[must_use]
+pub fn beacon_type_set(mode: BeaconMode) -> String {
+    format!("Firmware beacon type set to {mode}")
 }
 
 /// Human-readable power level name with watts in full.

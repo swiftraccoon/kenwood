@@ -23,6 +23,8 @@ pub const ALL_COMMANDS: &[&str] = &[
     "mode",
     "squelch",
     "power",
+    "tnc",
+    "beacontype",
     "att",
     "meter",
     "lock",
@@ -67,6 +69,8 @@ pub fn for_command(cmd: &str) -> Option<&'static str> {
         "mode" => Some(MODE_HELP),
         "squelch" | "sq" => Some(SQUELCH_HELP),
         "power" | "pwr" => Some(POWER_HELP),
+        "tnc" => Some(TNC_HELP),
+        "beacontype" => Some(BEACONTYPE_HELP),
         "att" | "attenuator" => Some(ATT_HELP),
         "meter" | "smeter" => Some(METER_HELP),
         "lock" => Some(LOCK_HELP),
@@ -236,6 +240,19 @@ Syntax: squelch [a or b] [0 through 5]
 Example: squelch
 Example: squelch a 3
 Related commands: meter";
+
+const TNC_HELP: &str = "tnc: Read or set the built-in TNC protocol mode.
+Usage: tnc reads the current mode and speed.
+tnc off: Turn the TNC off (no packet mode, plain radio control).
+tnc aprs: Hand packet operation to the radio firmware (APRS mode).
+tnc kiss: Set KISS mode. Prefer aprs start for a managed session.
+An optional second word sets the speed, 1200 or 9600.";
+
+const BEACONTYPE_HELP: &str = "beacontype: Read or set the firmware beacon type.
+Usage: beacontype reads the current setting.
+beacontype off, manual, ptt, auto, or smart sets it.
+Auto, smart, and ptt make the radio transmit by itself while the
+TNC is in APRS mode, so those settings ask for transmit confirmation.";
 
 const POWER_HELP: &str = "power: Read or set the transmit power on a band.
 Syntax: power [a or b] [level]
