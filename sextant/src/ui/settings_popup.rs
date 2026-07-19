@@ -8,7 +8,7 @@
 use eframe::egui;
 
 use crate::app::App;
-use crate::settings::TimeMode;
+use crate::settings::{RxAudioMode, TimeMode};
 use crate::theme;
 use crate::ui::Overlay;
 use crate::ui::debug::tools::device_combo;
@@ -36,19 +36,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 save |= resp.lost_focus();
             });
             ui.separator();
-            ui.label(theme::section_label("behaviour"));
-            save |= ui
-                .checkbox(
-                    &mut app.reconnect_on_drop,
-                    "Reconnect automatically if dropped",
-                )
-                .changed();
-            save |= ui
-                .checkbox(
-                    &mut app.persist_heard_list,
-                    "Remember heard stations across launches",
-                )
-                .changed();
+            save |= behaviour_section(app, ui);
             ui.separator();
             ui.label(theme::section_label("clock"));
             ui.horizontal(|ui| {
@@ -111,4 +99,34 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         app.overlay = Overlay::None;
     }
+}
+
+/// Behaviour toggles: reconnect, heard-list persistence, RX
+/// enhancement. Returns `true` when any setting changed.
+fn behaviour_section(app: &mut App, ui: &mut egui::Ui) -> bool {
+    let mut save = false;
+    ui.label(theme::section_label("behaviour"));
+    save |= ui
+        .checkbox(
+            &mut app.reconnect_on_drop,
+            "Reconnect automatically if dropped",
+        )
+        .changed();
+    save |= ui
+        .checkbox(
+            &mut app.persist_heard_list,
+            "Remember heard stations across launches",
+        )
+        .changed();
+    let mut enhance_rx = app.rx_audio.is_enhanced();
+    if ui.checkbox(&mut enhance_rx, "Enhance RX audio").changed() {
+        app.rx_audio = if enhance_rx {
+            RxAudioMode::Enhanced
+        } else {
+            RxAudioMode::Raw
+        };
+        app.apply_rx_audio_mode();
+        save = true;
+    }
+    save
 }

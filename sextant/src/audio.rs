@@ -10,8 +10,11 @@
 //! each direction, and processes audio in its main loop:
 //!
 //! - RX: pull incoming [`VoiceFrame`]s from the command channel,
-//!   decode to 160-sample PCM, sinc-resample to HW rate, push to
-//!   the speaker ringbuffer which the cpal output callback drains.
+//!   decode to 160-sample PCM, route through the two-tail
+//!   raw/enhanced selector ([`RxTailRouter`] — the operator's
+//!   "Enhance RX audio" toggle picks which tail feeds playback),
+//!   sinc-resample to HW rate, push to the speaker ringbuffer which
+//!   the cpal output callback drains.
 //! - TX: while PTT is active, drain 20 ms of HW-rate mic samples,
 //!   sinc-resample to 8 kHz, feed through [`AmbeEncoder`], wrap the
 //!   resulting 9-byte AMBE in a [`VoiceFrame`], and push into the
@@ -22,6 +25,7 @@
 //! is needed. The input / output devices and the recording /
 //! playback paths are all driven from here.
 
+use std::collections::VecDeque;
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -32,6 +36,7 @@ use dstar_gateway_core::dprs::{DprsReport, Latitude, Longitude, encode_dprs};
 use dstar_gateway_core::slowdata::{encode_text_message, scramble};
 use dstar_gateway_core::types::Callsign;
 use dstar_gateway_core::voice::{DSTAR_NULL_SLOW_DATA_BYTES, DSTAR_SYNC_BYTES, VoiceFrame};
+use mbelib_rs::enhance_live::{LiveWaveEnhancer, LiveWaveStream};
 use mbelib_rs::{AmbeDecoder, AmbeEncoder};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
@@ -53,6 +58,16 @@ const AMBE_FRAME_SAMPLES: usize = 160;
 /// the speaker ring buffer (~60 ms). The headroom rides through the
 /// stream, absorbing network jitter that would otherwise underrun.
 const RX_PRIME_FRAMES: usize = 3;
+
+/// Effective priming depth when the enhanced source is selected at
+/// stream start. The live enhancer releases nothing until it has
+/// seen 512 input samples (≈3.2 frames), so that fill already rides
+/// inside the [`LiveWaveStream`] as jitter headroom; adding one
+/// primed frame on top puts the first speaker push on the same
+/// clock as raw mode (3.2 internal + 1 prime ≈ raw's
+/// [`RX_PRIME_FRAMES`] + the first post-prime frame). Raw mode keeps
+/// [`RX_PRIME_FRAMES`] untouched.
+const RX_PRIME_FRAMES_ENHANCED: usize = 1;
 
 /// Samples of raised-cosine ramp at 8 kHz (10 ms) applied to each
 /// stream's first frame (fade-in) and final frame (fade-out).
@@ -98,6 +113,13 @@ pub(crate) enum AudioCommand {
     /// out and flush the held-back tail frame, then reset playback
     /// state for the next stream.
     RxEnd,
+    /// Toggle the learned RX enhancement. `true` routes decoded RX
+    /// audio through the causal live waveform enhancer; `false`
+    /// plays the raw decoder output. Mid-stream flips splice at a
+    /// 160-sample frame boundary with a crossfade. When the enhancer
+    /// model failed to parse at worker start the toggle warns and
+    /// audio stays raw.
+    SetRxEnhance(bool),
     /// Set the operator's slow-data text and/or GPS beacon. Either
     /// field may be `None`. Takes effect on the next TX frame.
     SetSlowData {
@@ -230,6 +252,325 @@ impl RxPlayback {
         apply_fade(&mut last, FadeDirection::Out);
         self.emitted = self.emitted.saturating_add(1);
         Some(last)
+    }
+}
+
+/// Splice `frame` onto the other source's timeline: blend the first
+/// [`RX_FADE_SAMPLES`] samples from the previous source's aligned
+/// candidate `prev` into `frame`, with the raised-cosine ramp
+/// [`apply_fade`] uses. Sample 0 is entirely `prev` (continuous with
+/// the last frame the previous source served); samples past the ramp
+/// are entirely `frame` (full blend-in). Both frames cover the same
+/// output-timeline positions — the router's tails are aligned — so
+/// this is a source blend, not a time blend.
+fn crossfade_frame(frame: &mut [i16; AMBE_FRAME_SAMPLES], prev: &[i16; AMBE_FRAME_SAMPLES]) {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "RX_FADE_SAMPLES is 80 — exact in f32"
+    )]
+    let ramp_len = RX_FADE_SAMPLES as f32;
+    for i in 0..RX_FADE_SAMPLES {
+        #[expect(clippy::cast_precision_loss, reason = "i < 80 — exact in f32")]
+        let rising = 0.5 * (1.0 - (std::f32::consts::PI * i as f32 / ramp_len).cos());
+        let (Some(slot), Some(&p)) = (frame.get_mut(i), prev.get(i)) else {
+            continue;
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "convex blend of two i16 samples stays inside i16 range"
+        )]
+        {
+            *slot = f32::from(p).mul_add(1.0 - rising, f32::from(*slot) * rising) as i16;
+        }
+    }
+}
+
+/// Decoder-domain `i16` → unit-scale `f32`, the live enhancer's
+/// input domain (matching its own conversion).
+fn rx_sample_to_f32(s: i16) -> f32 {
+    f32::from(s) / 32_768.0
+}
+
+/// Unit-scale `f32` → decoder-domain `i16`, matching the live
+/// enhancer's own output conversion (clamped, so full-scale output
+/// never wraps).
+fn rx_sample_to_i16(v: f32) -> i16 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "clamped to i16 range before the cast"
+    )]
+    let s = (v * 32_768.0).clamp(-32_767.0, 32_767.0) as i16;
+    s
+}
+
+/// Streaming enhancement engine the RX router feeds — abstracted
+/// from [`LiveWaveStream`] so the router's alignment logic is
+/// unit-testable without the embedded model weights.
+trait EnhanceStream {
+    /// Feed unit-scale samples; returns every enhanced sample that
+    /// has become final, in order.
+    fn push_samples(&mut self, samples: &[f32]) -> Vec<f32>;
+    /// End of stream: drain the residual lookahead so total output
+    /// length equals total input length.
+    fn finish(&mut self) -> Vec<f32>;
+}
+
+impl EnhanceStream for LiveWaveStream {
+    fn push_samples(&mut self, samples: &[f32]) -> Vec<f32> {
+        self.push_samples_f32(samples)
+    }
+
+    fn finish(&mut self) -> Vec<f32> {
+        self.finish_f32()
+    }
+}
+
+/// Which tail of the RX router served a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RxSource {
+    /// The raw decoder-output tail.
+    Raw,
+    /// The live-enhanced tail.
+    Enhanced,
+}
+
+/// Pop exactly one 160-sample frame off the front of `tail`, or pop
+/// nothing and return `None` when fewer samples are buffered.
+fn take_frame(tail: &mut VecDeque<i16>) -> Option<[i16; AMBE_FRAME_SAMPLES]> {
+    if tail.len() < AMBE_FRAME_SAMPLES {
+        return None;
+    }
+    let mut frame = [0_i16; AMBE_FRAME_SAMPLES];
+    for slot in &mut frame {
+        *slot = tail.pop_front()?;
+    }
+    Some(frame)
+}
+
+/// Aligned two-tail RX router: raw decoder output and its
+/// live-enhanced counterpart, kept on the same output timeline.
+///
+/// Every decoded (or concealed) frame is appended to the raw tail
+/// and — while a live stream is installed — pushed through the
+/// enhancer, whose ready samples land in the enhanced tail. Both
+/// tails start at the same origin and are consumed in lockstep:
+/// serving one 160-sample frame from the selected tail discards the
+/// matching 160 positions from the other, so flipping the selection
+/// never repeats or skips audio. The enhanced tail runs shorter than
+/// the raw tail by the enhancer's lookahead (< 56 ms plus a one-time
+/// 512-sample release floor); that in-flight fill is jitter headroom
+/// the playout path accounts for via [`RX_PRIME_FRAMES_ENHANCED`].
+///
+/// The first frame served after a source flip is crossfaded with the
+/// other tail's aligned candidate ([`crossfade_frame`]) so mid-over
+/// toggles splice cleanly at a frame boundary.
+///
+/// Generic over [`EnhanceStream`] so tests can inject deterministic
+/// enhanced samples; production installs a [`LiveWaveStream`].
+struct RxTailRouter<S> {
+    /// Unconsumed raw decoder output; its front is the consume point.
+    raw: VecDeque<i16>,
+    /// Unconsumed enhanced output, same origin as `raw`.
+    enhanced: VecDeque<i16>,
+    /// Enhanced-timeline positions consumed ahead of production
+    /// (grace frames served from raw while a freshly installed
+    /// stream was still short of the consume point). Newly produced
+    /// enhanced samples repay this debt — discarded, having already
+    /// played as raw — before landing in the tail.
+    enhanced_debt: usize,
+    /// Live enhancement session, `Some` while enhancement is active
+    /// on the current stream.
+    stream: Option<S>,
+    /// Serve from the enhanced tail when it can supply a full frame.
+    /// Stays `true` after [`Self::finish_stream`] so the flushed
+    /// enhanced tail — not raw — drains through end-of-stream.
+    enhance_selected: bool,
+    /// Source of the most recently served frame; a change triggers
+    /// the crossfade splice.
+    last_source: Option<RxSource>,
+    /// Crossfade partner captured when the enhanced source was
+    /// dropped mid-stream (toggle off): the enhanced candidate for
+    /// the next raw frame's positions.
+    xfade_prev: Option<[i16; AMBE_FRAME_SAMPLES]>,
+    /// One raw frame may be served in place of a not-yet-ready
+    /// enhanced frame right after a mid-stream toggle-on; cleared
+    /// once spent so the router then holds (the playout reserve
+    /// keeps the speaker fed) instead of drifting the timelines
+    /// permanently apart.
+    grace_available: bool,
+    /// True once any frame has been served this stream — arms the
+    /// mid-stream grace on toggle-on. A stream-start selection needs
+    /// no grace: the priming compensation covers the enhancer fill.
+    served_any: bool,
+}
+
+impl<S: EnhanceStream> RxTailRouter<S> {
+    /// An idle router (no stream in progress, raw passthrough).
+    const fn new() -> Self {
+        Self {
+            raw: VecDeque::new(),
+            enhanced: VecDeque::new(),
+            enhanced_debt: 0,
+            stream: None,
+            enhance_selected: false,
+            last_source: None,
+            xfade_prev: None,
+            grace_available: false,
+            served_any: false,
+        }
+    }
+
+    /// Reset for a new RX stream. `stream` is `Some` when enhancement
+    /// is selected from stream start (and the model parsed).
+    fn start_stream(&mut self, stream: Option<S>) {
+        self.raw.clear();
+        self.enhanced.clear();
+        self.enhanced_debt = 0;
+        self.enhance_selected = stream.is_some();
+        self.stream = stream;
+        self.last_source = None;
+        self.xfade_prev = None;
+        self.grace_available = false;
+        self.served_any = false;
+    }
+
+    /// One decoded (or concealed) frame arrives: append it to the
+    /// raw tail and, while enhancement is active, feed its f32 form
+    /// through the live stream, landing the returned ready samples
+    /// in the enhanced tail.
+    fn push_frame(&mut self, pcm: &[i16; AMBE_FRAME_SAMPLES]) {
+        self.raw.extend(pcm.iter().copied());
+        if let Some(stream) = self.stream.as_mut() {
+            let mut f32_frame = [0.0_f32; AMBE_FRAME_SAMPLES];
+            for (slot, &s) in f32_frame.iter_mut().zip(pcm.iter()) {
+                *slot = rx_sample_to_f32(s);
+            }
+            let ready = stream.push_samples(&f32_frame);
+            self.append_enhanced(&ready);
+        }
+    }
+
+    /// Land freshly produced enhanced samples: repay the grace debt
+    /// first (those positions already played as raw), then append.
+    fn append_enhanced(&mut self, samples: &[f32]) {
+        for &s in samples {
+            if self.enhanced_debt > 0 {
+                self.enhanced_debt -= 1;
+            } else {
+                self.enhanced.push_back(rx_sample_to_i16(s));
+            }
+        }
+    }
+
+    /// Toggle ON mid-stream (or while idle): install a fresh stream,
+    /// primed with the entire unconsumed raw backlog so the enhanced
+    /// tail's origin matches the raw tail's current front. With a
+    /// backlog at least the enhancer's lookahead deep, the enhanced
+    /// tail reaches the consume point immediately; with a shallow
+    /// one (the raw path drains its tail every arrival), the switch
+    /// completes after the one-frame grace plus a short hold that
+    /// the playout reserve covers.
+    fn enhance_on(&mut self, mut stream: S) {
+        self.enhanced.clear();
+        self.enhanced_debt = 0;
+        self.xfade_prev = None;
+        let backlog: Vec<f32> = self.raw.iter().map(|&s| rx_sample_to_f32(s)).collect();
+        let ready = stream.push_samples(&backlog);
+        self.stream = Some(stream);
+        self.enhance_selected = true;
+        self.append_enhanced(&ready);
+        self.grace_available = self.served_any;
+    }
+
+    /// Toggle OFF mid-stream: switch the selection back to the
+    /// (always populated) raw tail and drop the stream. When the
+    /// enhanced source was actually being served, its in-flight
+    /// lookahead is flushed first so the next raw frame has an
+    /// aligned enhanced candidate to crossfade from.
+    fn enhance_off(&mut self) {
+        let stream = self.stream.take();
+        if self.last_source == Some(RxSource::Enhanced)
+            && let Some(mut stream) = stream
+        {
+            let tail = stream.finish();
+            self.append_enhanced(&tail);
+            self.xfade_prev = take_frame(&mut self.enhanced);
+        }
+        self.enhance_selected = false;
+        self.enhanced.clear();
+        self.enhanced_debt = 0;
+        self.grace_available = false;
+    }
+
+    /// End of the RX stream: flush the live stream's residual
+    /// lookahead into the enhanced tail so both tails cover every
+    /// input sample (total output length equals total input length),
+    /// ready to drain fully.
+    fn finish_stream(&mut self) {
+        if let Some(mut stream) = self.stream.take() {
+            let tail = stream.finish();
+            self.append_enhanced(&tail);
+        }
+    }
+
+    /// Serve the next 160-sample frame from the selected tail,
+    /// consuming the matching positions from the other tail, or
+    /// `None` when the selected source cannot supply a full frame
+    /// yet. The first frame after a source flip is crossfaded with
+    /// the other tail's aligned candidate.
+    fn next_frame(&mut self) -> Option<[i16; AMBE_FRAME_SAMPLES]> {
+        let source = self.pick_source()?;
+        let (mut frame, partner) = match source {
+            RxSource::Enhanced => {
+                let frame = take_frame(&mut self.enhanced)?;
+                // The raw tail always covers at least the enhanced
+                // tail's positions (the stream cannot out-produce
+                // its input), so this both discards the consumed
+                // positions and captures the aligned raw candidate.
+                (frame, take_frame(&mut self.raw))
+            }
+            RxSource::Raw => {
+                let frame = take_frame(&mut self.raw)?;
+                if self.stream.is_some() {
+                    // Consume the enhanced timeline in lockstep: pop
+                    // what exists, book the shortfall as debt to be
+                    // repaid (discarded) once the stream produces it.
+                    let have = self.enhanced.len().min(AMBE_FRAME_SAMPLES);
+                    for _ in 0..have {
+                        let _popped = self.enhanced.pop_front();
+                    }
+                    self.enhanced_debt += AMBE_FRAME_SAMPLES - have;
+                }
+                (frame, self.xfade_prev.take())
+            }
+        };
+        if self.last_source.is_some_and(|last| last != source)
+            && let Some(prev) = partner.as_ref()
+        {
+            crossfade_frame(&mut frame, prev);
+        }
+        self.last_source = Some(source);
+        self.served_any = true;
+        Some(frame)
+    }
+
+    /// Decide which tail serves the next frame, or `None` to hold.
+    fn pick_source(&mut self) -> Option<RxSource> {
+        if self.enhance_selected {
+            if self.enhanced.len() >= AMBE_FRAME_SAMPLES {
+                return Some(RxSource::Enhanced);
+            }
+            // A freshly toggled-on stream still short of the consume
+            // point: serve one raw frame rather than stall the
+            // holdback, then hold until the stream catches up — the
+            // playout reserve keeps the speaker fed meanwhile.
+            if self.grace_available && self.raw.len() >= AMBE_FRAME_SAMPLES {
+                self.grace_available = false;
+                return Some(RxSource::Raw);
+            }
+            return None;
+        }
+        (self.raw.len() >= AMBE_FRAME_SAMPLES).then_some(RxSource::Raw)
     }
 }
 
@@ -389,6 +730,21 @@ fn run_audio_worker(
         }
     };
 
+    // Parse the live RX-enhancement model once — cheap, and the
+    // enhancer is stateless between streams (each stream gets its own
+    // `LiveWaveStream`). Failure is non-fatal: the toggle warns and
+    // RX audio stays raw.
+    let rx_enhancer = match LiveWaveEnhancer::new() {
+        Ok(e) => Some(e),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "live RX enhancer unavailable — \"Enhance RX audio\" will keep audio raw"
+            );
+            None
+        }
+    };
+
     let mut worker = AudioWorker {
         audio,
         // 40 ms-lookahead pitch tracker matches OP25's reference
@@ -417,8 +773,12 @@ fn run_audio_worker(
         recorder: None,
         tx_file: None,
         rx_playback: RxPlayback::default(),
+        rx_router: RxTailRouter::new(),
+        rx_enhancer,
+        rx_enhance_enabled: false,
         rx_prime: Vec::with_capacity(65_536),
         rx_prime_frames: 0,
+        rx_prime_target: RX_PRIME_FRAMES,
         rx_primed: false,
     };
     // Enumerate devices once at startup so the GUI's pickers populate
@@ -480,10 +840,23 @@ struct AudioWorker {
     tx_file: Option<std::vec::IntoIter<f32>>,
     /// RX one-frame holdback + fade bookkeeping.
     rx_playback: RxPlayback,
+    /// Two-tail raw/enhanced RX router feeding the holdback.
+    rx_router: RxTailRouter<LiveWaveStream>,
+    /// Parsed live-enhancement model, built once at worker start.
+    /// `None` when the embedded weights failed to parse — the
+    /// enhancement toggle then warns and audio stays raw.
+    rx_enhancer: Option<LiveWaveEnhancer>,
+    /// Operator's "Enhance RX audio" toggle, mirrored from the GUI.
+    rx_enhance_enabled: bool,
     /// Resampled PCM accumulated during stream-start priming.
     rx_prime: Vec<f32>,
     /// Frames accumulated into `rx_prime` so far this stream.
     rx_prime_frames: usize,
+    /// Effective priming depth for the current stream:
+    /// [`RX_PRIME_FRAMES_ENHANCED`] when the enhanced source was
+    /// selected at stream start, [`RX_PRIME_FRAMES`] otherwise (raw
+    /// timing is untouched).
+    rx_prime_target: usize,
     /// True once priming has flushed — frames then push straight
     /// through to the speaker.
     rx_primed: bool,
@@ -627,8 +1000,25 @@ impl AudioWorker {
                 self.rx_prime.clear();
                 self.rx_prime_frames = 0;
                 self.rx_primed = false;
+                let stream = if self.rx_enhance_enabled {
+                    self.rx_enhancer.as_ref().map(LiveWaveEnhancer::stream)
+                } else {
+                    None
+                };
+                // Enhanced-from-start streams carry ~3.2 frames of
+                // jitter headroom inside the enhancer (its 512-sample
+                // release floor), so the downstream prime shrinks to
+                // keep both modes' first speaker push on the same
+                // clock.
+                self.rx_prime_target = if stream.is_some() {
+                    RX_PRIME_FRAMES_ENHANCED
+                } else {
+                    RX_PRIME_FRAMES
+                };
+                self.rx_router.start_stream(stream);
             }
             AudioCommand::RxEnd => self.finish_rx_stream(),
+            AudioCommand::SetRxEnhance(enable) => self.set_rx_enhance(enable),
             AudioCommand::RxFrame(frame) => {
                 tracing::trace!(
                     ambe = format_args!("{:02x?}", frame.ambe),
@@ -645,17 +1035,61 @@ impl AudioWorker {
         }
     }
 
-    /// Route one decoded (or concealed) 8 kHz frame into the
-    /// holdback; emit whichever frame the holdback releases.
+    /// Flip the RX-enhancement toggle, reconfiguring the router
+    /// mid-stream when one is in flight. A repeat of the current
+    /// state is a no-op.
+    fn set_rx_enhance(&mut self, enable: bool) {
+        if enable == self.rx_enhance_enabled {
+            return;
+        }
+        self.rx_enhance_enabled = enable;
+        if enable {
+            let Some(enhancer) = self.rx_enhancer.as_ref() else {
+                warn!(
+                    "RX enhancement unavailable (model failed to parse at startup) — \
+                     audio stays raw"
+                );
+                return;
+            };
+            self.rx_router.enhance_on(enhancer.stream());
+        } else {
+            self.rx_router.enhance_off();
+        }
+        tracing::info!(enabled = enable, "RX enhancement toggled");
+        // A toggle-off releases the raw backlog that had been riding
+        // inside the enhancer's lookahead — serve it immediately so
+        // the speaker reserve refills without waiting for the next
+        // arrival.
+        self.drain_rx_router();
+    }
+
+    /// Route one decoded (or concealed) 8 kHz frame through the
+    /// two-tail router, then serve whatever the selected tail has
+    /// ready into the holdback → emit path.
     fn handle_rx_pcm(&mut self, pcm_i16: &[i16; AMBE_FRAME_SAMPLES]) {
-        if let Some(due) = self.rx_playback.push(*pcm_i16) {
-            self.emit_rx_frame(&due);
+        self.rx_router.push_frame(pcm_i16);
+        self.drain_rx_router();
+    }
+
+    /// Serve every frame the router has ready through the existing
+    /// holdback → emit path (fades, recorder tee, resampler, and
+    /// priming all unchanged).
+    fn drain_rx_router(&mut self) {
+        while let Some(frame) = self.rx_router.next_frame() {
+            if let Some(due) = self.rx_playback.push(frame) {
+                self.emit_rx_frame(&due);
+            }
         }
     }
 
-    /// Stream end: flush the faded tail and any un-flushed priming
-    /// buffer (streams shorter than the priming depth), then reset.
+    /// Stream end: flush the enhancer's residual lookahead and drain
+    /// both router tails fully — total played samples are identical
+    /// in raw and enhanced modes — then flush the faded holdback
+    /// tail and any un-flushed priming buffer (streams shorter than
+    /// the priming depth), then reset.
     fn finish_rx_stream(&mut self) {
+        self.rx_router.finish_stream();
+        self.drain_rx_router();
         if let Some(last) = self.rx_playback.finish() {
             self.emit_rx_frame(&last);
         }
@@ -663,6 +1097,11 @@ impl AudioWorker {
         self.rx_playback.reset();
         self.rx_prime_frames = 0;
         self.rx_primed = false;
+        // Frames arriving before the next RxStart fall back to raw
+        // passthrough (the pre-enhancement behavior for orphan
+        // frames); RxStart re-installs a stream if the toggle is on.
+        self.rx_router.start_stream(None);
+        self.rx_prime_target = RX_PRIME_FRAMES;
     }
 
     /// Emit one frame down the RX output path: recorder tee, level
@@ -698,9 +1137,12 @@ impl AudioWorker {
         } else {
             // Accumulate the stream's first frames so playback opens
             // with jitter headroom instead of racing the network.
+            // The depth is per stream: shallower when the enhanced
+            // source was selected at stream start, because the
+            // enhancer's release floor already holds ~3.2 frames.
             self.rx_prime.extend_from_slice(&self.resampled_out);
             self.rx_prime_frames = self.rx_prime_frames.saturating_add(1);
-            if self.rx_prime_frames >= RX_PRIME_FRAMES {
+            if self.rx_prime_frames >= self.rx_prime_target {
                 self.flush_rx_prime();
             }
         }
@@ -1633,5 +2075,346 @@ mod tests {
         assert!(tail.abs() <= 1, "tail must be faded to ~0, got {tail}");
         assert!(rx.finish().is_none(), "nothing left after finish");
         Ok(())
+    }
+
+    // --- two-tail RX router -------------------------------------
+
+    use super::{AMBE_FRAME_SAMPLES, RX_FADE_SAMPLES, RxTailRouter, crossfade_frame};
+
+    /// Deterministic stand-in for the live enhancer: releases
+    /// nothing until `floor` input samples have arrived, then emits
+    /// the input negated, lagging `lag` samples behind the newest
+    /// input; `finish` drains the remainder. Negation marks a sample
+    /// as having passed through "enhancement" so tests can tell the
+    /// tails apart while keeping perfect timeline alignment.
+    struct FakeStream {
+        /// Samples that must arrive before anything is released.
+        floor: usize,
+        /// Samples the output lags behind the input.
+        lag: usize,
+        /// Every input sample seen so far.
+        seen: Vec<f32>,
+        /// Samples already released.
+        emitted: usize,
+    }
+
+    impl FakeStream {
+        const fn new(floor: usize, lag: usize) -> Self {
+            Self {
+                floor,
+                lag,
+                seen: Vec::new(),
+                emitted: 0,
+            }
+        }
+
+        /// Release (negated) samples `emitted..through`.
+        fn release(&mut self, through: usize) -> Vec<f32> {
+            let out = self
+                .seen
+                .get(self.emitted..through)
+                .map(|s| s.iter().map(|&v| -v).collect())
+                .unwrap_or_default();
+            self.emitted = self.emitted.max(through);
+            out
+        }
+    }
+
+    impl super::EnhanceStream for FakeStream {
+        fn push_samples(&mut self, samples: &[f32]) -> Vec<f32> {
+            self.seen.extend_from_slice(samples);
+            if self.seen.len() < self.floor {
+                return Vec::new();
+            }
+            let through = self.seen.len().saturating_sub(self.lag);
+            self.release(through)
+        }
+
+        fn finish(&mut self) -> Vec<f32> {
+            let through = self.seen.len();
+            self.release(through)
+        }
+    }
+
+    /// A 160-sample frame with every sample set to `v`.
+    const fn frame_of(v: i16) -> [i16; AMBE_FRAME_SAMPLES] {
+        [v; AMBE_FRAME_SAMPLES]
+    }
+
+    /// The crossfade splice opens entirely on the previous source
+    /// (boundary continuity) and lands entirely on the new source
+    /// past the ramp (full blend-in), monotone in between.
+    #[test]
+    fn crossfade_starts_on_prev_and_fully_blends_in() -> TestResult {
+        let mut frame = frame_of(-1000);
+        let prev = frame_of(1000);
+        crossfade_frame(&mut frame, &prev);
+        assert_eq!(
+            frame.first().copied(),
+            Some(1000),
+            "sample 0 is entirely the previous source"
+        );
+        let past_ramp = frame.get(RX_FADE_SAMPLES..).ok_or("ramp within frame")?;
+        assert!(
+            past_ramp.iter().all(|&s| s == -1000),
+            "samples past the ramp are entirely the new source"
+        );
+        let mid = frame
+            .get(RX_FADE_SAMPLES / 2)
+            .copied()
+            .ok_or("mid sample")?;
+        assert!(
+            mid.abs() <= 1,
+            "ramp midpoint is an even ±1000 blend, got {mid}"
+        );
+        let ramp = frame.get(..RX_FADE_SAMPLES).ok_or("ramp slice")?;
+        assert!(
+            ramp.windows(2).all(|w| w.first() >= w.last()),
+            "ramp moves monotonically from the previous source to the new one"
+        );
+        Ok(())
+    }
+
+    /// With no stream installed the router is a straight passthrough:
+    /// every arrival is served immediately and unchanged.
+    #[test]
+    fn router_raw_mode_passes_frames_through_unchanged() -> TestResult {
+        let mut router: RxTailRouter<FakeStream> = RxTailRouter::new();
+        router.start_stream(None);
+        for v in [1000_i16, 2000, 3000] {
+            router.push_frame(&frame_of(v));
+            let served = router.next_frame().ok_or("raw frame ready on arrival")?;
+            assert!(
+                served.iter().all(|&s| s == v),
+                "raw passthrough must not alter samples"
+            );
+            assert!(router.next_frame().is_none(), "tail drains to empty");
+        }
+        assert!(router.raw.is_empty(), "raw tail empty after each drain");
+        Ok(())
+    }
+
+    /// Enhanced-from-start: the router holds while the stream sits
+    /// below its release floor (that fill is the priming
+    /// compensation's headroom), then serves the enhanced form of
+    /// frame 1 — un-blended, since a stream's first served frame is
+    /// no source flip — with the raw tail consumed in lockstep.
+    #[test]
+    fn router_enhanced_from_start_holds_then_serves_aligned_enhanced() -> TestResult {
+        let mut router = RxTailRouter::new();
+        router.start_stream(Some(FakeStream::new(512, 447)));
+        for (i, v) in [1000_i16, 2000, 3000].into_iter().enumerate() {
+            router.push_frame(&frame_of(v));
+            assert!(
+                router.next_frame().is_none(),
+                "arrival {i}: enhancer below its release floor — router holds"
+            );
+        }
+        router.push_frame(&frame_of(4000));
+        let first = router
+            .next_frame()
+            .ok_or("floor met — enhanced frame ready")?;
+        assert!(
+            first.iter().all(|&s| s == -1000),
+            "served frame is enhanced frame 1, with no crossfade applied"
+        );
+        assert_eq!(
+            router.raw.len(),
+            3 * AMBE_FRAME_SAMPLES,
+            "raw consumed in lockstep; three frames ride as enhancer fill"
+        );
+        assert!(
+            router.next_frame().is_none(),
+            "next frame's samples are still inside the lookahead"
+        );
+        Ok(())
+    }
+
+    /// Mid-stream toggle-on with a backlog at least the lookahead
+    /// deep: priming the fresh stream with the entire unconsumed raw
+    /// tail brings the enhanced tail to the consume point
+    /// immediately, and the first enhanced frame is crossfaded from
+    /// the aligned raw candidate.
+    #[test]
+    fn router_toggle_on_with_backlog_primes_and_crossfades_immediately() -> TestResult {
+        let mut router: RxTailRouter<FakeStream> = RxTailRouter::new();
+        router.start_stream(None);
+        for v in [1000_i16, 2000] {
+            router.push_frame(&frame_of(v));
+            let served = router.next_frame().ok_or("raw serve")?;
+            assert!(served.iter().all(|&s| s == v));
+        }
+        // Queue four frames without draining — the backlog a toggle
+        // can inherit when arrivals outpace consumption.
+        for v in [3000_i16, 4000, 5000, 6000] {
+            router.push_frame(&frame_of(v));
+        }
+        router.enhance_on(FakeStream::new(512, 447));
+        let spliced = router.next_frame().ok_or("enhanced ready immediately")?;
+        assert_eq!(
+            spliced.first().copied(),
+            Some(3000),
+            "splice opens fully on the previous (raw) source"
+        );
+        let past_ramp = spliced.get(RX_FADE_SAMPLES..).ok_or("ramp within frame")?;
+        assert!(
+            past_ramp.iter().all(|&s| s == -3000),
+            "past the ramp the frame is fully enhanced frame 3 — aligned, no skip"
+        );
+        assert_eq!(
+            router.raw.len(),
+            3 * AMBE_FRAME_SAMPLES,
+            "raw consumed in lockstep with the enhanced serve"
+        );
+        Ok(())
+    }
+
+    /// Mid-stream toggle-on with an empty backlog (raw steady state
+    /// drains its tail every arrival): one grace frame is served
+    /// from raw, the router then holds while the stream's output
+    /// repays the grace debt, and the switch completes at the next
+    /// unplayed position — crossfaded, no repeat, no skip.
+    #[test]
+    fn router_toggle_on_empty_backlog_serves_one_grace_frame_then_holds() -> TestResult {
+        let mut router: RxTailRouter<FakeStream> = RxTailRouter::new();
+        router.start_stream(None);
+        for v in [1000_i16, 2000] {
+            router.push_frame(&frame_of(v));
+            let _served = router.next_frame().ok_or("raw serve")?;
+        }
+        router.enhance_on(FakeStream::new(320, 200));
+        assert!(
+            router.next_frame().is_none(),
+            "no backlog — nothing to serve"
+        );
+        router.push_frame(&frame_of(3000));
+        let grace = router.next_frame().ok_or("grace frame")?;
+        assert!(
+            grace.iter().all(|&s| s == 3000),
+            "grace frame is raw and unblended (raw → raw is not a source flip)"
+        );
+        assert!(
+            router.next_frame().is_none(),
+            "grace spent — router holds while the stream catches up"
+        );
+        router.push_frame(&frame_of(4000));
+        assert!(
+            router.next_frame().is_none(),
+            "stream output repays the grace debt first — still holding"
+        );
+        router.push_frame(&frame_of(5000));
+        assert!(
+            router.next_frame().is_none(),
+            "enhanced tail still short of one frame"
+        );
+        router.push_frame(&frame_of(6000));
+        let spliced = router.next_frame().ok_or("catch-up frame")?;
+        assert_eq!(
+            spliced.first().copied(),
+            Some(4000),
+            "splice opens on the raw candidate for frame 4"
+        );
+        let past_ramp = spliced.get(RX_FADE_SAMPLES..).ok_or("ramp within frame")?;
+        assert!(
+            past_ramp.iter().all(|&s| s == -4000),
+            "catch-up frame is enhanced frame 4 — position continuity after grace"
+        );
+        Ok(())
+    }
+
+    /// Toggle OFF mid-stream: the raw tail takes over at the next
+    /// unplayed position; the first raw frame is crossfaded from the
+    /// enhanced candidate harvested out of the dropped stream's
+    /// in-flight lookahead, and later frames are pure raw.
+    #[test]
+    fn router_toggle_off_crossfades_back_to_raw_without_skips() -> TestResult {
+        let mut router = RxTailRouter::new();
+        router.start_stream(Some(FakeStream::new(320, 200)));
+        for v in [1000_i16, 2000] {
+            router.push_frame(&frame_of(v));
+            assert!(router.next_frame().is_none(), "stream filling");
+        }
+        router.push_frame(&frame_of(3000));
+        let first = router.next_frame().ok_or("enhanced frame 1")?;
+        assert!(first.iter().all(|&s| s == -1000), "serving enhanced");
+        router.enhance_off();
+        let spliced = router.next_frame().ok_or("raw resumes immediately")?;
+        assert_eq!(
+            spliced.first().copied(),
+            Some(-2000),
+            "splice opens on the previous (enhanced) source's frame 2"
+        );
+        let past_ramp = spliced.get(RX_FADE_SAMPLES..).ok_or("ramp within frame")?;
+        assert!(
+            past_ramp.iter().all(|&s| s == 2000),
+            "past the ramp the frame is fully raw frame 2 — no skip"
+        );
+        let next = router.next_frame().ok_or("raw frame 3")?;
+        assert!(
+            next.iter().all(|&s| s == 3000),
+            "subsequent frames are pure raw (no further blending)"
+        );
+        Ok(())
+    }
+
+    /// The equal-total-length invariant across `RxEnd`: raw mode,
+    /// enhanced-from-start, and a mid-stream toggle all play exactly
+    /// the samples that arrived — no more, no less.
+    #[test]
+    fn router_rx_end_totals_match_across_modes() {
+        fn drain(router: &mut RxTailRouter<FakeStream>) -> usize {
+            let mut total = 0_usize;
+            while let Some(frame) = router.next_frame() {
+                total += frame.len();
+            }
+            total
+        }
+
+        let n_frames = 5_i16;
+        let expected = 5 * AMBE_FRAME_SAMPLES;
+
+        let mut raw_router: RxTailRouter<FakeStream> = RxTailRouter::new();
+        raw_router.start_stream(None);
+        let mut raw_total = 0_usize;
+        for v in 0..n_frames {
+            raw_router.push_frame(&frame_of(v * 1000));
+            raw_total += drain(&mut raw_router);
+        }
+        raw_router.finish_stream();
+        raw_total += drain(&mut raw_router);
+        assert_eq!(raw_total, expected, "raw mode plays every arrived sample");
+
+        let mut enh_router = RxTailRouter::new();
+        enh_router.start_stream(Some(FakeStream::new(512, 447)));
+        let mut enh_total = 0_usize;
+        for v in 0..n_frames {
+            enh_router.push_frame(&frame_of(v * 1000));
+            enh_total += drain(&mut enh_router);
+        }
+        enh_router.finish_stream();
+        enh_total += drain(&mut enh_router);
+        assert_eq!(
+            enh_total, expected,
+            "enhanced mode flushes the lookahead at RxEnd — totals match raw"
+        );
+
+        let mut mixed: RxTailRouter<FakeStream> = RxTailRouter::new();
+        mixed.start_stream(None);
+        let mut mixed_total = 0_usize;
+        for v in 0..2_i16 {
+            mixed.push_frame(&frame_of(v * 1000));
+            mixed_total += drain(&mut mixed);
+        }
+        mixed.enhance_on(FakeStream::new(320, 200));
+        for v in 2..n_frames {
+            mixed.push_frame(&frame_of(v * 1000));
+            mixed_total += drain(&mut mixed);
+        }
+        mixed.finish_stream();
+        mixed_total += drain(&mut mixed);
+        assert_eq!(
+            mixed_total, expected,
+            "a mid-stream toggle (grace path) preserves the total"
+        );
     }
 }

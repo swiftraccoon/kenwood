@@ -22,8 +22,10 @@ dstar-gateway = { path = "../dstar-gateway", features = ["hosts-fetcher"] }
 dstar-gateway-core = { path = "../dstar-gateway-core" }
 # Voice codec — enable encoder feature for TX path. This pulls the
 # GPL-3.0-or-later provisions in via mbelib-rs's encoder module, which
-# is why this crate is dual-licensed GPL-2+/GPL-3+.
-mbelib-rs = { path = "../mbelib-rs", features = ["encoder"] }
+# is why this crate is dual-licensed GPL-2+/GPL-3+. wave-enhance adds
+# the causal live waveform enhancer behind the "Enhance RX audio"
+# operator toggle (off by default at runtime).
+mbelib-rs = { path = "../mbelib-rs", features = ["encoder", "wave-enhance"] }
 
 # Async runtime.
 tokio = { version = "1", features = [

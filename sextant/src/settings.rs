@@ -58,6 +58,44 @@ impl TimeMode {
     }
 }
 
+/// Whether decoded RX audio plays raw or through the learned live
+/// waveform enhancer ("Enhance RX audio" in the settings popup).
+///
+/// An enum rather than a bare bool so [`Settings`] / `App` stay under
+/// the `struct_excessive_bools` ceiling, mirroring [`TimeMode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RxAudioMode {
+    /// Raw decoder output (the default).
+    #[default]
+    Raw,
+    /// Decoder output routed through the causal live enhancer.
+    Enhanced,
+}
+
+impl RxAudioMode {
+    /// Stable settings-file token.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Enhanced => "enhanced",
+        }
+    }
+
+    /// Parse the settings-file token; unknown values fall back to
+    /// the default so a future token can't brick old builds.
+    fn from_str(s: &str) -> Self {
+        match s {
+            "enhanced" => Self::Enhanced,
+            _ => Self::Raw,
+        }
+    }
+
+    /// True when the enhancer is selected.
+    pub(crate) const fn is_enhanced(self) -> bool {
+        matches!(self, Self::Enhanced)
+    }
+}
+
 /// One remembered reflector connection (a favorite or a recent).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SavedHost {
@@ -133,6 +171,8 @@ pub(crate) struct Settings {
     pub(crate) persist_heard_list: bool,
     /// Timestamp display mode (heard list + event log).
     pub(crate) time_mode: TimeMode,
+    /// RX playback mode (raw decoder output vs live enhancement).
+    pub(crate) rx_audio: RxAudioMode,
     /// Slow-data text message to transmit (≤20 chars).
     pub(crate) tx_message: String,
     /// GPS beacon enabled.
@@ -170,6 +210,7 @@ impl Default for Settings {
             reconnect_on_drop: false,
             persist_heard_list: false,
             time_mode: TimeMode::default(),
+            rx_audio: RxAudioMode::default(),
             tx_message: String::new(),
             tx_beacon_enabled: false,
             tx_lat: String::new(),
@@ -260,6 +301,7 @@ fn serialize(s: &Settings) -> String {
     push_bool(&mut out, "reconnect_on_drop", s.reconnect_on_drop);
     push_bool(&mut out, "persist_heard_list", s.persist_heard_list);
     push_string(&mut out, "time_mode", s.time_mode.as_str());
+    push_string(&mut out, "rx_audio", s.rx_audio.as_str());
     push_string(&mut out, "tx_message", &s.tx_message);
     push_bool(&mut out, "tx_beacon_enabled", s.tx_beacon_enabled);
     push_string(&mut out, "tx_lat", &s.tx_lat);
@@ -361,6 +403,7 @@ fn parse(raw: &str) -> Result<Settings, String> {
                 }
             }
             "time_mode" => out.time_mode = TimeMode::from_str(&value),
+            "rx_audio" => out.rx_audio = RxAudioMode::from_str(&value),
             "tx_message" => out.tx_message = value,
             "tx_lat" => out.tx_lat = value,
             "tx_lon" => out.tx_lon = value,
@@ -404,7 +447,9 @@ fn parse_quoted(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RECENTS_CAP, SavedHost, Settings, TimeMode, parse, push_recent, serialize};
+    use super::{
+        RECENTS_CAP, RxAudioMode, SavedHost, Settings, TimeMode, parse, push_recent, serialize,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -433,6 +478,7 @@ mod tests {
             reconnect_on_drop: true,
             persist_heard_list: true,
             time_mode: TimeMode::Utc,
+            rx_audio: RxAudioMode::Enhanced,
             tx_message: "73 de sextant".into(),
             tx_beacon_enabled: true,
             tx_lat: "41.7148".into(),
@@ -465,6 +511,14 @@ mod tests {
         let raw = "time_mode = \"martian\"\n";
         let parsed = parse(raw).map_err(|e| format!("parse: {e}"))?;
         assert_eq!(parsed.time_mode, TimeMode::Local);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_rx_audio_mode_falls_back_to_raw() -> TestResult {
+        let raw = "rx_audio = \"psychoacoustic\"\n";
+        let parsed = parse(raw).map_err(|e| format!("parse: {e}"))?;
+        assert_eq!(parsed.rx_audio, RxAudioMode::Raw);
         Ok(())
     }
 

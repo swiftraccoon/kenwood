@@ -32,7 +32,7 @@ use crate::geo::TxPosition;
 use crate::heard::HeardList;
 use crate::hosts::{DirectoryUpdate, ReflectorDirectory};
 use crate::session::{ConnStatus, ConnectConfig, RxRoute, SessionCommand, SessionEvent};
-use crate::settings::{self, SavedHost, Settings, TimeMode};
+use crate::settings::{self, RxAudioMode, SavedHost, Settings, TimeMode};
 use crate::ui;
 
 /// Maximum lines kept in the event-log buffer. Older lines drop off
@@ -56,6 +56,9 @@ pub(crate) struct App {
     pub(crate) reconnect_on_drop: bool,
     /// Persist the heard-list across launches.
     pub(crate) persist_heard_list: bool,
+    /// RX playback mode (raw decoder output vs live enhancement),
+    /// mirrored to the audio worker via `SetRxEnhance`.
+    pub(crate) rx_audio: RxAudioMode,
 
     // --- transmit slow-data inputs (operator-entered) ---
     /// Slow-data text message the operator wants to transmit.
@@ -272,6 +275,12 @@ impl App {
                     .then(|| settings.output_device.clone()),
             });
         }
+        // Deliver the persisted RX-enhancement mode — the audio worker
+        // boots with enhancement off, so only a saved "enhanced" needs
+        // sending.
+        if settings.rx_audio.is_enhanced() {
+            audio.send(AudioCommand::SetRxEnhance(true));
+        }
         // Load the reflector directory from cache, then kick off a
         // background refresh so the picker is populated immediately
         // and updated when the network call returns.
@@ -304,6 +313,7 @@ impl App {
             reflector_module: settings.reflector_module,
             reconnect_on_drop: settings.reconnect_on_drop,
             persist_heard_list: settings.persist_heard_list,
+            rx_audio: settings.rx_audio,
             tx_slow_text: settings.tx_message,
             tx_gps: TxGpsForm {
                 enabled: settings.tx_beacon_enabled,
@@ -638,6 +648,7 @@ impl App {
             reconnect_on_drop: self.reconnect_on_drop,
             persist_heard_list: self.persist_heard_list,
             time_mode: self.time_mode,
+            rx_audio: self.rx_audio,
             tx_message: self.tx_slow_text.clone(),
             tx_beacon_enabled: self.tx_gps.enabled,
             tx_lat: self.tx_gps.lat.clone(),
@@ -759,6 +770,13 @@ impl App {
     /// Ask the audio worker to re-enumerate available devices.
     pub(crate) fn refresh_devices(&self) {
         self.audio.send(AudioCommand::EnumerateDevices);
+    }
+
+    /// Push the RX playback mode (raw vs live-enhanced) to the audio
+    /// worker. Called when the operator flips the settings checkbox.
+    pub(crate) fn apply_rx_audio_mode(&self) {
+        self.audio
+            .send(AudioCommand::SetRxEnhance(self.rx_audio.is_enhanced()));
     }
 
     /// Start recording received audio to a WAV file.
