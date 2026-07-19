@@ -35,13 +35,16 @@ encoder = []
 # code is imported; the feature reshapes NUMBERS only. Pulls in
 # `encoder` because every current swap site is encoder-only.
 kenwood-tables = ["encoder"]
-# Learned waveform enhancement: a small complex-STFT masking network
-# with a bidirectional recurrent core (weights trained against
-# reflector-published reference decodes of identical AMBE frames and
-# adversarially fine-tuned, embedded as a binary blob) that regenerates
-# fine structure the base synthesis cannot. Off by default: it is an
-# opt-in whole-clip post-process, gated by blind operator listening
-# before any release, and adds ~2.5 MiB of embedded weights.
+# Learned waveform enhancement: small complex-STFT masking networks
+# (weights trained against reflector-published reference decodes of
+# identical AMBE frames and adversarially fine-tuned, embedded as
+# binary blobs) that regenerate fine structure the base synthesis
+# cannot. Two variants compile in: `enhance_wave`, the offline
+# whole-clip model with a bidirectional recurrent core, and
+# `enhance_live`, its causal counterpart with a forward-only
+# recurrence plus a streaming API for frame-at-a-time use. Off by
+# default: opt-in post-processing, gated by blind operator listening
+# before any release, and adds ~5.5 MiB of embedded weights.
 wave-enhance = []
 
 [dev-dependencies]
@@ -77,6 +80,10 @@ required-features = ["encoder"]
 # `unused_crate_dependencies` for every dev-dep in the workspace.
 [[test]]
 name = "wave_parity"
+required-features = ["wave-enhance"]
+
+[[test]]
+name = "wave_live_parity"
 required-features = ["wave-enhance"]
 
 [[test]]

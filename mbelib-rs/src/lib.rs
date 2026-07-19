@@ -79,6 +79,8 @@ mod ecc;
 mod encode;
 mod enhance;
 #[cfg(feature = "wave-enhance")]
+pub mod enhance_live;
+#[cfg(feature = "wave-enhance")]
 pub mod enhance_wave;
 mod error;
 mod math;

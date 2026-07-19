@@ -13,14 +13,18 @@ Decoder on by default; encoder behind the `encoder` Cargo feature.
   to wire form. The encoder is experimental: reliable DVSI hardware
   interoperability is not yet validated, and the ignored correlation test
   tracks a known spectral-envelope defect.
-- **Waveform enhancement** (`--features wave-enhance`): a learned
-  post-processor for decoder output — a small complex-STFT masking
-  network with a bidirectional recurrent core, adversarially fine-tuned
-  against reference hardware-grade decodes of identical AMBE frames —
-  that regenerates waveform fine structure the base synthesis cannot.
-  Opt-in and offline: it processes whole clips (the recurrence reads the
-  entire clip), embeds ≈2.5 MiB of trained weights, and ships only after
-  blind operator listening prefers it.
+- **Waveform enhancement** (`--features wave-enhance`): learned
+  post-processors for decoder output — small complex-STFT masking
+  networks adversarially fine-tuned against reference hardware-grade
+  decodes of identical AMBE frames — that regenerate waveform fine
+  structure the base synthesis cannot. Two variants compile in:
+  `enhance_wave`, the offline whole-clip model (bidirectional
+  recurrence — best quality, requires the complete clip), and
+  `enhance_live`, its causal counterpart with a forward-only
+  recurrence and a streaming frame-at-a-time API whose total
+  algorithmic lookahead (< 56 ms) fits inside a typical network
+  playout buffer. Opt-in, ≈5.5 MiB of embedded weights, and each
+  variant ships only after blind operator listening prefers it.
 - **D-STAR only**: AMBE 3600×2400 is the mandatory voice codec for the
   JARL D-STAR standard. The decoder synthesizes valid single-tone frames,
   but the encoder does not emit tone frames. Does **not** support AMBE+,
@@ -69,6 +73,25 @@ network reads the whole clip. Output length equals input length, and
 clips shorter than a few STFT frames pass through unchanged. One
 `WaveEnhancer` can be reused across clips (it is stateless between
 calls).
+
+For live playback, the causal variant streams frame by frame:
+
+```rust,ignore
+use mbelib_rs::enhance_live::LiveWaveEnhancer;
+
+let enhancer = LiveWaveEnhancer::new()?;
+let mut stream = enhancer.stream();
+// For each decoded 20 ms frame as it arrives:
+let ready: Vec<i16> = stream.push_frame(&decoded_frame);
+// At end of transmission (flushes the tail; resets for reuse):
+let tail: Vec<i16> = stream.finish();
+```
+
+`push_frame` returns every sample that has become final; output lags
+input by the model's fixed lookahead (under 56 ms), and after
+`finish` the total output length equals the total input length. The
+streaming path computes bit-for-bit the same enhancement as the
+batch `process` call on the same audio.
 
 ## Pipeline
 
