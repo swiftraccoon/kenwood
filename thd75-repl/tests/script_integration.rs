@@ -91,6 +91,14 @@ fn cat_basics_script_lints_clean() -> TestResult {
         "missing radio model line in stdout:\n{stdout}"
     );
     assert!(
+        stdout.contains("Operation band: A"),
+        "missing band read line in stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("USB audio output: AF"),
+        "missing USB output read line in stdout:\n{stdout}"
+    );
+    assert!(
         stdout.contains("Goodbye."),
         "missing goodbye line:\n{stdout}"
     );

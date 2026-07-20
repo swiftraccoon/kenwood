@@ -1533,6 +1533,8 @@ async fn dispatch_cat(radio: &mut Radio<EitherTransport>, cmd: &str, parts: &[&s
         "reflector" | "ref" => commands::reflector(radio, args).await,
         "unreflector" | "unref" | "unlink" => commands::unreflector(radio).await,
         "status" => commands::status(radio).await,
+        "band" => commands::band(radio, args).await,
+        "ifout" | "usbout" => commands::ifout(radio, args).await,
         "aprs" => {
             if parts.get(1).is_some_and(|s| *s == "start") {
                 // Handled by caller after dispatch.

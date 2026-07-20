@@ -29,6 +29,8 @@ pub const ALL_COMMANDS: &[&str] = &[
     "meter",
     "lock",
     "dualband",
+    "band",
+    "ifout",
     "bt",
     "vox",
     "fm",
@@ -75,6 +77,8 @@ pub fn for_command(cmd: &str) -> Option<&'static str> {
         "meter" | "smeter" => Some(METER_HELP),
         "lock" => Some(LOCK_HELP),
         "dualband" | "dual" => Some(DUALBAND_HELP),
+        "band" => Some(BAND_HELP),
+        "ifout" | "usbout" => Some(IFOUT_HELP),
         "bt" | "bluetooth" => Some(BT_HELP),
         "vox" => Some(VOX_HELP),
         "fm" => Some(FM_HELP),
@@ -139,6 +143,8 @@ power a high: Set power. Options: high, medium, low, extra-low
 att a on: Set attenuator on or off
 lock on: Set key lock on or off
 dualband on: Set dual band on or off
+band b: Switch the operation band (a or b)
+ifout if: Stream band B IF to a computer (af restores audio)
 bt on: Set Bluetooth on or off
 vox on: Set voice-operated transmit on or off
 vox gain 5: Set voice-operated transmit gain, 0 through 9
@@ -279,6 +285,27 @@ Syntax: lock [on or off]
 Example: lock
 Example: lock on
 Related commands: status";
+
+const BAND_HELP: &str = "band: Read or set the operation band.
+Syntax: band [a or b]
+The operation band is the band the radio's controls act on.
+Switching bands changes what the radio is receiving.
+Example: band
+Example: band b
+Related commands: dualband, freq";
+
+const IFOUT_HELP: &str = "ifout: Read or set the USB audio output source.
+Syntax: ifout [af or if or detect]
+af: Received audio, the normal setting.
+if: Band B IF signal, 12 kilohertz centered, to a computer.
+detect: Band B detection signal to a computer.
+IF and Detect require Single Band mode on Band B.
+They also sound from the radio speaker and hide band A.
+Set af again when finished.
+Alias: usbout
+Example: ifout
+Example: ifout if
+Related commands: band, dualband";
 
 const DUALBAND_HELP: &str = "dualband: Read or set the dual-band display mode.
 Syntax: dualband [on or off]

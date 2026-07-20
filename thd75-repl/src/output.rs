@@ -15,7 +15,9 @@
 //! - Lines under 80 characters (no wrapping in standard terminals)
 //! - ASCII printable only (no box-drawing or symbols)
 
-use kenwood_thd75::types::{Band, BatteryLevel, BeaconMode, PowerLevel, TncBaud, TncMode};
+use kenwood_thd75::types::{
+    Band, BatteryLevel, BeaconMode, DetectOutputMode, PowerLevel, TncBaud, TncMode,
+};
 
 /// Human-readable band name. Matches the pre-extraction helper which
 /// returned "A" for `Band::A` and "B" for every other variant.
@@ -367,6 +369,30 @@ pub fn reflector_connected(name: &str, module: char) -> String {
 #[must_use]
 pub const fn reflector_disconnected() -> &'static str {
     "Disconnected from reflector"
+}
+
+/// `Operation band: {A|B}`.
+#[must_use]
+pub fn operation_band_read(band: Band) -> String {
+    format!("Operation band: {}", band_name(band))
+}
+
+/// `Operation band set to {A|B}`.
+#[must_use]
+pub fn operation_band_set(band: Band) -> String {
+    format!("Operation band set to {}", band_name(band))
+}
+
+/// `USB audio output: {AF|IF|Detect}` (CAT IO, radio Menu 102).
+#[must_use]
+pub fn usb_output_read(mode: DetectOutputMode) -> String {
+    format!("USB audio output: {mode}")
+}
+
+/// `USB audio output set to {AF|IF|Detect}`.
+#[must_use]
+pub fn usb_output_set(mode: DetectOutputMode) -> String {
+    format!("USB audio output set to {mode}")
 }
 
 // ---------------------------------------------------------------------------
@@ -984,6 +1010,37 @@ mod tests {
         assert_lint(cq_set());
         assert_lint(&reflector_connected("REF030", 'C'));
         assert_lint(reflector_disconnected());
+    }
+
+    #[test]
+    fn operation_band_formats() {
+        assert_eq!(operation_band_read(Band::A), "Operation band: A");
+        assert_eq!(operation_band_set(Band::B), "Operation band set to B");
+        assert_lint(&operation_band_read(Band::A));
+        assert_lint(&operation_band_set(Band::B));
+    }
+
+    #[test]
+    fn usb_output_formats() {
+        use kenwood_thd75::types::DetectOutputMode;
+        assert_eq!(
+            usb_output_read(DetectOutputMode::Af),
+            "USB audio output: AF"
+        );
+        assert_eq!(
+            usb_output_read(DetectOutputMode::If),
+            "USB audio output: IF"
+        );
+        assert_eq!(
+            usb_output_read(DetectOutputMode::Detect),
+            "USB audio output: Detect"
+        );
+        assert_eq!(
+            usb_output_set(DetectOutputMode::If),
+            "USB audio output set to IF"
+        );
+        assert_lint(&usb_output_read(DetectOutputMode::Af));
+        assert_lint(&usb_output_set(DetectOutputMode::Detect));
     }
 
     #[test]

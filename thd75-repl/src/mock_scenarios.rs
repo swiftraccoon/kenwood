@@ -65,6 +65,10 @@ fn simple_scenario() -> MockTransport {
     mock.expect(b"ID\r", b"ID TH-D75\r");
     mock.expect(b"FV\r", b"FV 1.03.00\r");
 
+    // Scripted command round-trips (cat_basics.txt), in script order.
+    mock.expect(b"BC\r", b"BC 0\r");
+    mock.expect(b"IO\r", b"IO 0\r");
+
     // From here on, accept any further writes without validation so
     // the integration test can run additional commands (`id`, `quit`)
     // without having to predict the exact wire output. Subsequent

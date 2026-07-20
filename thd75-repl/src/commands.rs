@@ -36,7 +36,7 @@
 
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::Transport;
-use kenwood_thd75::types::{Band, Mode};
+use kenwood_thd75::types::{Band, DetectOutputMode, Mode};
 use thd75_repl::aprintln;
 
 /// Parse a band argument ("a" or "b"), defaulting to A.
@@ -841,6 +841,82 @@ pub(crate) async fn unreflector<T: Transport>(radio: &mut Radio<T>) {
     match radio.disconnect_reflector().await {
         Ok(()) => aprintln!("{}", thd75_repl::output::reflector_disconnected()),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Operation band
+// ---------------------------------------------------------------------------
+
+/// Read or set the operation band. Args: `[a|b]`.
+///
+/// The operation band is the band the radio's own controls act on
+/// (BC command). With no argument, reads. Parsing is strict: a setter
+/// must not guess, so anything other than `a` or `b` prints an error
+/// instead of defaulting like the read-path `parse_band` does.
+pub(crate) async fn band<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
+    let Some(arg) = args.first() else {
+        match radio.get_band().await {
+            Ok(b) => aprintln!("{}", thd75_repl::output::operation_band_read(b)),
+            Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
+        }
+        return;
+    };
+    let target = match arg.to_lowercase().as_str() {
+        "a" => Band::A,
+        "b" => Band::B,
+        other => {
+            aprintln!(
+                "{}",
+                thd75_repl::output::error(format_args!("unknown band {other:?}. Use a or b."))
+            );
+            return;
+        }
+    };
+    match radio.set_band(target).await {
+        Ok(()) => aprintln!("{}", thd75_repl::output::operation_band_set(target)),
+        Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
+    }
+}
+
+/// Read or set the USB audio output source (IO command, radio Menu 102).
+/// Args: `[af|if|detect]`.
+///
+/// `if` and `detect` stream the Band B IF or detection signal to a
+/// connected computer instead of received audio. The radio accepts
+/// them only in Single Band mode on Band B; on refusal a hint with
+/// the required steps is printed after the error.
+pub(crate) async fn ifout<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
+    let Some(arg) = args.first() else {
+        match radio.get_io_port().await {
+            Ok(mode) => aprintln!("{}", thd75_repl::output::usb_output_read(mode)),
+            Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
+        }
+        return;
+    };
+    let target = match arg.to_lowercase().as_str() {
+        "af" => DetectOutputMode::Af,
+        "if" => DetectOutputMode::If,
+        "detect" => DetectOutputMode::Detect,
+        other => {
+            aprintln!(
+                "{}",
+                thd75_repl::output::error(format_args!(
+                    "unknown output {other:?}. Use af, if, or detect."
+                ))
+            );
+            return;
+        }
+    };
+    match radio.set_io_port(target).await {
+        Ok(()) => aprintln!("{}", thd75_repl::output::usb_output_set(target)),
+        Err(e) => {
+            aprintln!("{}", thd75_repl::output::error(e));
+            if !matches!(target, DetectOutputMode::Af) {
+                aprintln!("IF and Detect require Single Band mode on Band B.");
+                aprintln!("Type band b, then dualband off, and try again.");
+            }
+        }
     }
 }
 

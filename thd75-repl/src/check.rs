@@ -8,7 +8,9 @@
 //! their screen reader to verify the mechanically checked output contract.
 
 use crate::{help_text, lint, output};
-use kenwood_thd75::types::{Band, BatteryLevel, BeaconMode, PowerLevel, TncBaud, TncMode};
+use kenwood_thd75::types::{
+    Band, BatteryLevel, BeaconMode, DetectOutputMode, PowerLevel, TncBaud, TncMode,
+};
 
 /// One entry in the coverage table: a human-readable source name and
 /// a generator that produces the representative outputs for that
@@ -48,6 +50,8 @@ const COVERAGE: &[(&str, Generator)] = &[
     ("output::urcall_read", gen_urcall_read),
     ("output::urcall_set", gen_urcall_set),
     ("output::reflector_connected", gen_reflector_connected),
+    ("output::operation_band", gen_operation_band),
+    ("output::usb_output", gen_usb_output),
     ("output::error", gen_error),
     ("output::warning", gen_warning),
     ("output::aprs_events", gen_aprs_events),
@@ -282,6 +286,26 @@ fn gen_reflector_connected() -> Vec<String> {
     vec![
         output::reflector_connected("REF030", 'C'),
         output::reflector_disconnected().to_string(),
+    ]
+}
+
+fn gen_operation_band() -> Vec<String> {
+    vec![
+        output::operation_band_read(Band::A),
+        output::operation_band_read(Band::B),
+        output::operation_band_set(Band::A),
+        output::operation_band_set(Band::B),
+    ]
+}
+
+fn gen_usb_output() -> Vec<String> {
+    vec![
+        output::usb_output_read(DetectOutputMode::Af),
+        output::usb_output_read(DetectOutputMode::If),
+        output::usb_output_read(DetectOutputMode::Detect),
+        output::usb_output_set(DetectOutputMode::Af),
+        output::usb_output_set(DetectOutputMode::If),
+        output::usb_output_set(DetectOutputMode::Detect),
     ]
 }
 
