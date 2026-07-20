@@ -6,6 +6,7 @@ members = [
   "dstar-gateway",
   "dstar-gateway-core",
   "dstar-gateway-server",
+  "if-dsp",
   "aprs",
   "aprs-is",
   "ax25-codec",
