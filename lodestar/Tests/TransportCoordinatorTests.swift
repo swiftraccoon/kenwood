@@ -118,6 +118,60 @@ final class TransportCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.state, .disconnected)
     }
 
+    func testBackgroundDisconnectsAndForegroundReconnects() async throws {
+        let coordinator = TransportCoordinator()
+        let first = MockRadioTransport()
+        let second = MockRadioTransport()
+        var handedOut = 0
+        coordinator.transportFactory = { _ in
+            handedOut += 1
+            return handedOut == 1 ? first : second
+        }
+        coordinator.select(.mockTHD75)
+        await first.script(response: [0xE0, 0x04, 0x00, 0x01], for: [0xE0, 0x03, 0x00])
+        await second.script(response: [0xE0, 0x04, 0x00, 0x01], for: [0xE0, 0x03, 0x00])
+        await coordinator.connect()
+        guard case .connected = coordinator.state else {
+            return XCTFail("precondition: connect failed, state \(coordinator.state)")
+        }
+
+        await coordinator.handleScenePhaseBackground()
+        XCTAssertEqual(coordinator.state, .disconnected,
+                       "backgrounding must tear down the radio connection")
+        XCTAssertNil(coordinator.relayTransport)
+
+        await coordinator.handleScenePhaseActive()
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(handedOut, 2, "foreground must reconnect after a background teardown")
+        let secondState = await second.state
+        XCTAssertEqual(secondState, .connected)
+        XCTAssertNotNil(coordinator.relayTransport)
+    }
+
+    func testForegroundWithoutPriorConnectionDoesNotConnect() async throws {
+        let coordinator = TransportCoordinator()
+        var handedOut = 0
+        coordinator.transportFactory = { _ in
+            handedOut += 1
+            return MockRadioTransport()
+        }
+        await coordinator.handleScenePhaseActive()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(handedOut, 0, "no prior connection → no spurious connect")
+        XCTAssertEqual(coordinator.state, .disconnected)
+    }
+
+    func testBackgroundWhileDisconnectedIsANoOp() async throws {
+        let coordinator = TransportCoordinator()
+        coordinator.transportFactory = { _ in MockRadioTransport() }
+        await coordinator.handleScenePhaseBackground()
+        XCTAssertEqual(coordinator.state, .disconnected)
+        // A later foreground must not "restore" a connection that never was.
+        await coordinator.handleScenePhaseActive()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertNil(coordinator.relayTransport)
+    }
+
     /// Mock whose open() always throws, for failure-path tests.
     private struct FailingTransport: RadioTransport {
         let device: BluetoothDevice = .mockTHD75

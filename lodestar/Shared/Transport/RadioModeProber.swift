@@ -72,7 +72,25 @@ public struct RadioModeProber {
             // asleep, or is in CAT mode and simply ignored our probe.
             // We classify this as CAT because MMDVM firmware always
             // responds to GetVersion.
-            log.info("radio-mode probe: no response → classifying as .cat")
+            //
+            // Flush the radio's CAT line parser before returning: the
+            // probe bytes carry no CR, so they linger in the radio's
+            // line buffer and corrupt the NEXT CAT command ("ID\r"
+            // right after a probe answers "?\r" — hardware-verified
+            // 2026-07-19). A bare CR terminates the junk line; the
+            // radio's "?\r" reply to it is drained and discarded here
+            // so it can't poison the next reader either.
+            log.info("radio-mode probe: no response → classifying as .cat (flushing line buffer)")
+            try? await transport.write([0x0D])
+            let flushDeadline = ContinuousClock.now.advanced(by: .milliseconds(300))
+            while ContinuousClock.now < flushDeadline {
+                // `try?` flattens the timeout's nil and an error into
+                // one nil — either way there's nothing left to flush.
+                guard let chunk = try? await readChunkWithTimeout(
+                    transport: transport, maxBytes: 64, deadline: flushDeadline
+                ), !chunk.isEmpty else { break }
+                log.info("radio-mode probe: flushed \(Self.hex(chunk))")
+            }
             return .cat
         case 0xE0:
             // Drain whatever's left of the frame (~50 bytes) so it

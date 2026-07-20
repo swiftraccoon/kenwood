@@ -2,12 +2,13 @@
  * SPDX-FileCopyrightText: 2026 Swift Raccoon
  * SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
  *
- * IOUserClient subclass — exposes the LodestarUSBSerialDriver byte
- * stream to the iPad app via external method calls.
- *
- * App uses `IOServiceOpen` to instantiate this user client, then
- * `IOConnectCallStructMethod(connection, selector, ...)` for each
- * read/write.
+ * IOUserClient for LodestarUSBSerialDriver. Selectors (keep in sync
+ * with `USBSerialSelector` in Shared/Transport/USBSerialLink.swift):
+ *   0 write (struct in ≤4096) — kIOReturnNoResources = backpressure
+ *   1 read  (struct out ≤4096) — 0 bytes = empty, never blocks
+ *   2 armDoorbell (async completion) — one-shot data-available doorbell
+ *   3 status (4 scalars out)
+ *   4 copyLog (struct out ≤4096) — diagnostic event ring, oldest first
  */
 
 #ifndef LodestarUserClient_h
@@ -28,9 +29,28 @@ public:
     virtual kern_return_t Start(IOService *provider) override;
     virtual kern_return_t Stop(IOService *provider) override;
 
-    // ExternalMethod IPC dispatch is deferred — the iig-generated args
-    // struct shape needs hardware-iteration to verify. For the
-    // scaffolding pass the inherited IOUserClient default is fine.
+    virtual kern_return_t ExternalMethod(uint64_t selector,
+                                         IOUserClientMethodArguments *arguments,
+                                         const IOUserClientMethodDispatch *dispatch,
+                                         OSObject *target,
+                                         void *reference) override;
+
+    /// Complete an armed doorbell action. Called by the driver (on the
+    /// driver queue) — kIOReturnSuccess = data available,
+    /// kIOReturnAborted = teardown/re-arm.
+    void FireDoorbell(OSAction *action, IOReturn status) LOCALONLY;
+
+    // Static dispatch-table handlers.
+    static kern_return_t HandleWrite(OSObject *target, void *reference,
+                                     IOUserClientMethodArguments *arguments) LOCALONLY;
+    static kern_return_t HandleRead(OSObject *target, void *reference,
+                                    IOUserClientMethodArguments *arguments) LOCALONLY;
+    static kern_return_t HandleArmDoorbell(OSObject *target, void *reference,
+                                           IOUserClientMethodArguments *arguments) LOCALONLY;
+    static kern_return_t HandleStatus(OSObject *target, void *reference,
+                                      IOUserClientMethodArguments *arguments) LOCALONLY;
+    static kern_return_t HandleCopyLog(OSObject *target, void *reference,
+                                       IOUserClientMethodArguments *arguments) LOCALONLY;
 };
 
 #endif /* LodestarUserClient_h */

@@ -41,7 +41,12 @@ public actor McpSession {
                 log.error("MCP enter: timeout; received so far: \(Self.hex(buffer))")
                 throw McpOrchestratorError.enterTimeout(receivedSoFar: buffer)
             }
-            let chunk = try await transport.read(maxBytes: 64)
+            // Race the read against the deadline: transport reads BLOCK
+            // until data arrives, so a silent radio would otherwise park
+            // this loop forever and the deadline above never re-fires.
+            guard let chunk = try await readRacingDeadline(maxBytes: 64, deadline: deadline) else {
+                continue // timed out — top of loop throws enterTimeout
+            }
             if chunk.isEmpty {
                 try await Task.sleep(nanoseconds: 50_000_000)
                 continue
@@ -133,6 +138,68 @@ public actor McpSession {
         try await exitProgramming()
     }
 
+    /// Read every radio setting the USB reflector relay depends on, fix
+    /// any that are wrong, and report what was found and changed — one
+    /// programming pass, fully automated, no menu keypresses.
+    ///
+    /// Two settings gate USB relay (both hardware-verified):
+    /// - **Menu 650 / `0x1CA0`** must be `1` (Reflector Terminal Mode).
+    /// - **Menu 985 / `0x1093`** (DV Gateway Interface) must be `USB`.
+    ///   If it points at Bluetooth, the gateway's MMDVM framing goes out
+    ///   the BT port and the USB port stays in plain CAT — the exact
+    ///   "CAT works but MMDVM silent" symptom.
+    ///
+    /// The radio reboots on programming-mode exit iff anything changed
+    /// (`report.rebooted`); the caller must then reconnect and poll for
+    /// MMDVM (terminal mode engages ~50 s after the reboot).
+    public func prepareForUsbRelay() async throws -> UsbRelaySetupReport {
+        try await enterProgramming()
+
+        // Gateway mode (page 0x1C, byte 0xA0) and interface (page 0x10,
+        // byte 0x93) live on different pages — read each.
+        let gwPage = pageOf(offset: UniFFI_GatewayModeOffset)
+        let gwByte = byteOf(offset: UniFFI_GatewayModeOffset)
+        let gwData = try await readPage(gwPage)
+        let gwBefore = [UInt8](gwData)[Int(gwByte)]
+
+        let ifPage = pageOf(offset: UniFFI_DvGatewayInterfaceOffset)
+        let ifByte = byteOf(offset: UniFFI_DvGatewayInterfaceOffset)
+        let ifData = try await readPage(ifPage)
+        let ifBefore = [UInt8](ifData)[Int(ifByte)]
+
+        log.info("MCP relay setup: gatewayMode=\(gwBefore) interface=\(ifBefore) (target: mode=1 interface=\(UniFFI_DvGatewayInterfaceUsb))")
+
+        var wroteGateway = false
+        if gwBefore != UniFFI_GatewayModeReflectorTerminal {
+            let patched = try patchPageByte(
+                pageData: gwData, offset: gwByte,
+                value: UniFFI_GatewayModeReflectorTerminal
+            )
+            try await writePage(gwPage, data: patched)
+            wroteGateway = true
+        }
+
+        var wroteInterface = false
+        if ifBefore != UniFFI_DvGatewayInterfaceUsb {
+            let patched = try patchPageByte(
+                pageData: ifData, offset: ifByte,
+                value: UniFFI_DvGatewayInterfaceUsb
+            )
+            try await writePage(ifPage, data: patched)
+            wroteInterface = true
+        }
+
+        try await exitProgramming()
+
+        return UsbRelaySetupReport(
+            gatewayModeBefore: gwBefore,
+            interfaceBefore: ifBefore,
+            usbInterfaceValue: UniFFI_DvGatewayInterfaceUsb,
+            wroteGatewayMode: wroteGateway,
+            wroteInterface: wroteInterface
+        )
+    }
+
     // MARK: - Private helpers
 
     private func readExact(count: Int, timeoutSeconds: Double) async throws -> Data {
@@ -148,7 +215,9 @@ public actor McpSession {
                 throw McpOrchestratorError.readTimeout(expected: count, got: buffer.count)
             }
             let remaining = count - buffer.count
-            let chunk = try await transport.read(maxBytes: remaining)
+            guard let chunk = try await readRacingDeadline(maxBytes: remaining, deadline: deadline) else {
+                continue // timed out — top of loop throws readTimeout
+            }
             if chunk.isEmpty {
                 try await Task.sleep(nanoseconds: 50_000_000)
                 continue
@@ -156,6 +225,26 @@ public actor McpSession {
             buffer.append(contentsOf: chunk)
         }
         return buffer
+    }
+
+    /// Race a blocking transport read against an absolute deadline;
+    /// nil means the deadline fired first. (Cancellation of the losing
+    /// read is safe: transports resume a cancelled read with `[]`
+    /// without disturbing other readers.)
+    private func readRacingDeadline(
+        maxBytes: Int, deadline: ContinuousClock.Instant
+    ) async throws -> [UInt8]? {
+        try await withThrowingTaskGroup(of: [UInt8]?.self) { group in
+            group.addTask { [transport] in
+                try await transport.read(maxBytes: maxBytes)
+            }
+            group.addTask {
+                try? await Task.sleep(until: deadline, clock: .continuous)
+                return nil
+            }
+            defer { group.cancelAll() }
+            return try await group.next() ?? nil
+        }
     }
 
     private func contains(_ haystack: [UInt8], _ needle: [UInt8]) -> Bool {
@@ -178,6 +267,55 @@ public actor McpSession {
 /// constants to Swift; round-tripping through a function would be
 /// overkill for a single `u16`.
 private let UniFFI_GatewayModeOffset: UInt16 = 0x1CA0
+
+/// Gateway-mode value for Reflector Terminal Mode (Menu 650 = 1).
+private let UniFFI_GatewayModeReflectorTerminal: UInt8 = 1
+
+/// MCP offset of the DV Gateway Interface setting (Menu 985), from the
+/// MCP-D75 registry field `radio.DvGatewayInterface`. Selects which
+/// physical port carries the gateway/MMDVM stream: USB or Bluetooth.
+/// When this points at Bluetooth, the USB CDC port stays in CAT and the
+/// `E0 03 00` MMDVM probe gets no reply — the whole "terminal mode is
+/// on but the app can't see it over USB" failure.
+private let UniFFI_DvGatewayInterfaceOffset: UInt16 = 0x1093
+
+/// Interface value for USB. The Kenwood menu lists "[USB] or
+/// [Bluetooth]" (USB first) and the MCP enum maps the first option to
+/// 0; `prepareForUsbRelay` reports the read-back so this is verifiable
+/// against hardware, and the write is reversible if it ever proves
+/// inverted on a firmware revision.
+private let UniFFI_DvGatewayInterfaceUsb: UInt8 = 0
+
+/// Outcome of `McpSession.prepareForUsbRelay`: what the radio's relay
+/// settings were, and what got changed. `rebooted` is true iff a flash
+/// write happened (the radio reboots on programming-mode exit only when
+/// something changed).
+public struct UsbRelaySetupReport: Sendable, Equatable {
+    /// Menu 650 value read before any change (1 = already terminal mode).
+    public let gatewayModeBefore: UInt8
+    /// Menu 985 value read before any change.
+    public let interfaceBefore: UInt8
+    /// The value written to mean USB (for read-back verification).
+    public let usbInterfaceValue: UInt8
+    /// Whether Menu 650 was flipped to Reflector Terminal Mode.
+    public let wroteGatewayMode: Bool
+    /// Whether Menu 985 was switched to USB.
+    public let wroteInterface: Bool
+
+    /// The radio reboots on exit only if a flash write occurred.
+    public var rebooted: Bool { wroteGatewayMode || wroteInterface }
+
+    /// One-line human summary for the diagnostics card.
+    public var summary: String {
+        var parts: [String] = []
+        parts.append("Menu 650 (terminal mode): was \(gatewayModeBefore)"
+            + (wroteGatewayMode ? " → 1" : " (already on)"))
+        let ifName = { (v: UInt8) in v == usbInterfaceValue ? "USB" : "Bluetooth" }
+        parts.append("Menu 985 (interface): was \(ifName(interfaceBefore))"
+            + (wroteInterface ? " → USB" : " (already USB)"))
+        return parts.joined(separator: "\n")
+    }
+}
 
 /// Errors from `McpSession`.
 public enum McpOrchestratorError: Error, Equatable, Sendable {

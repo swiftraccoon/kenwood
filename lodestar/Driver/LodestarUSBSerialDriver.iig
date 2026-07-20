@@ -2,13 +2,9 @@
  * SPDX-FileCopyrightText: 2026 Swift Raccoon
  * SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
  *
- * IOKit Interface Generator declaration for the LodestarUSBSerialDriver
- * dext class. The `iig` tool processes this file at build time to emit
- * the C++ header with IPC trampolines.
- *
- * Architecture: a USB-CDC bulk-endpoint pump that exposes its byte
- * stream to the host app via a custom IOUserClient. Matched to the
- * TH-D75 by VID 0x2166 PID 0x9023 on the CDC ACM control interface.
+ * DriverKit dext for the TH-D75's CDC Data interface
+ * (bInterfaceNumber 1): bulk IN/OUT byte pump exposed to the app via
+ * LodestarUserClient (doorbell + drain protocol).
  */
 
 #ifndef LodestarUSBSerialDriver_h
@@ -19,6 +15,8 @@
 #include <DriverKit/IOUserClient.iig>
 #include <USBDriverKit/IOUSBHostInterface.iig>
 #include <USBDriverKit/IOUSBHostPipe.iig>
+
+class LodestarUserClient;
 
 class LodestarUSBSerialDriver: public IOService
 {
@@ -31,21 +29,44 @@ public:
 
     virtual kern_return_t NewUserClient(uint32_t type, IOUserClient **userClient) override;
 
-    /// Write `data` (length `length`) to the radio. Internal — called
-    /// by the user client. `LOCALONLY` keeps it out of the IPC table.
-    kern_return_t WriteToRadio(const uint8_t *data, size_t length) LOCALONLY;
+    /// Bulk-IN completion. Re-armed from within until kIOReturnAborted.
+    virtual void BulkInComplete(OSAction *action,
+                                IOReturn status,
+                                uint32_t actualByteCount,
+                                uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
 
-    /// Read up to `maxBytes` from the most recent USB IN-pipe completion.
-    /// Returns `kIOReturnNoData` if no bytes are available.
-    kern_return_t ReadFromRadio(uint8_t *out, size_t maxBytes, size_t *actualBytes) LOCALONLY;
+    /// Bulk-OUT completion. Sends the next queued chunk, if any.
+    virtual void BulkOutComplete(OSAction *action,
+                                 IOReturn status,
+                                 uint32_t actualByteCount,
+                                 uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
 
-    /// Background scheduler for async USB reads. Free-run loop kept fed
-    /// in `bulkInRead` completion callback. Declared virtual so iig
-    /// generates the trampoline + CreateActionbulkInRead helper.
-    virtual void bulkInRead(OSAction *action,
-                            IOReturn status,
-                            uint32_t actualByteCount,
-                            uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
+    // ---- Cross-object entry points (called from LodestarUserClient's
+    // dispatch queue; each serializes onto the driver queue). ----
+
+    /// Queue bytes for bulk OUT. kIOReturnNoResources = queue full.
+    kern_return_t EnqueueWrite(const uint8_t *data, size_t length) LOCALONLY;
+
+    /// Copy out up to `capacity` buffered RX bytes. Never blocks;
+    /// *actual == 0 means empty.
+    kern_return_t CopyBufferedBytes(uint8_t *out, size_t capacity, size_t *actual) LOCALONLY;
+
+    /// Arm the one-shot doorbell. Replaces any armed doorbell (the old
+    /// action is completed kIOReturnAborted). Fires immediately when
+    /// the RX ring is already non-empty.
+    void RegisterDoorbell(LodestarUserClient *client, OSAction *action) LOCALONLY;
+
+    /// Detach a dying user client: abort its doorbell, forget it.
+    void UnregisterUserClient(LodestarUserClient *client) LOCALONLY;
+
+    /// out[4] = { rxBuffered, rxOverflowBytes, linkUp, doorbellArmed }.
+    void CopyStatus(uint64_t out[4]) LOCALONLY;
+
+    /// Copy the diagnostic event ring (LodestarLogEntry structs, oldest
+    /// first) into `out`. The ring makes dext internals readable from
+    /// the app with no Console access — every lifecycle and I/O event
+    /// leaves a breadcrumb here.
+    void CopyLogEntries(uint8_t *out, size_t capacity, size_t *actual) LOCALONLY;
 };
 
 #endif /* LodestarUSBSerialDriver_h */

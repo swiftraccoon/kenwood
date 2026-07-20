@@ -77,7 +77,7 @@ public actor IOBluetoothTransport: RadioTransport {
         }
         #else
         throw RadioTransportError.notAvailableOnPlatform(
-            reason: "Direct radio access on iPad needs USB-C (DriverKit) — not yet implemented. Use the macOS build, or stay reflector-only on iPad."
+            reason: "Bluetooth Classic SPP is macOS-only. On iPad, use the USB-C transport (USBSerialTransport) — the coordinator selects it automatically."
         )
         #endif
     }

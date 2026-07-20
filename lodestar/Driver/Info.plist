@@ -30,38 +30,75 @@
 			<key>CFBundleIdentifier</key>
 			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 
-			<!-- The kernel-side stub class. IOUserService is the
-			     standard IOClass for user-space DriverKit drivers. -->
+			<!-- Kernel-side stub class for user-space DriverKit drivers. -->
 			<key>IOClass</key>
 			<string>IOUserService</string>
 
-			<!-- The user-space DriverKit class that actually runs.
-			     Must match the C++ class name in the .iig. -->
+			<!-- The user-space class that runs. Must match the .iig. -->
 			<key>IOUserClass</key>
 			<string>LodestarUSBSerialDriver</string>
 
-			<!-- The user-server name; pairs the dext executable to its
-			     IOService instance. By convention the bundle ID. -->
 			<key>IOUserServerName</key>
 			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 
-			<key>IOMatchCategory</key>
-			<string>com.apple.developer.driverkit.transport.usb</string>
-
-			<!-- Match the CDC ACM control interface on the TH-D75.
-			     bInterfaceClass=0x02 (CDC Communications),
-			     bInterfaceSubClass=0x02 (Abstract Control Model).
-			     Verified TH-D75 IDs: VID 0x2166 PID 0x9023. -->
+			<!-- Match the CDC *Data* interface (bInterfaceNumber 1) of
+			     the TH-D75 — that's where the bulk IN/OUT endpoints
+			     live; the class 02/02 control interface has only an
+			     interrupt endpoint (topology hardware-verified via
+			     ioreg 2026-07-19). The key combo
+			     idVendor+idProduct+bConfigurationValue+bInterfaceNumber
+			     is a valid USB Common Class match at probe score 90000,
+			     outranking any class-based system driver. Interfaces
+			     2-3 (USB audio) stay with the system's audio stack.
+			     VID 0x2166 = 8550, PID 0x9023 = 36899. -->
 			<key>IOProviderClass</key>
 			<string>IOUSBHostInterface</string>
 			<key>idVendor</key>
 			<integer>8550</integer>
 			<key>idProduct</key>
 			<integer>36899</integer>
-			<key>bInterfaceClass</key>
-			<integer>2</integer>
-			<key>bInterfaceSubClass</key>
-			<integer>2</integer>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>1</integer>
+
+			<!-- Instantiated by NewUserClient's Create() call, which
+			     names this key. -->
+			<key>LodestarUserClientProperties</key>
+			<dict>
+				<key>IOClass</key>
+				<string>IOUserUserClient</string>
+				<key>IOUserClass</key>
+				<string>LodestarUserClient</string>
+			</dict>
+		</dict>
+
+		<!-- Companion personality: claim the CDC ACM *control*
+		     interface (bInterfaceNumber 0) and service its interrupt
+		     endpoint, mirroring a standard host ACM stack (macOS runs
+		     AppleUSBACM here). Hardware evidence 2026-07-19: with the
+		     control interface unclaimed the radio ACKs bulk-OUT CAT
+		     bytes but never transmits on bulk IN. -->
+		<key>LodestarTHD75Comm</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>IOClass</key>
+			<string>IOUserService</string>
+			<key>IOUserClass</key>
+			<string>LodestarUSBCommDriver</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<key>idVendor</key>
+			<integer>8550</integer>
+			<key>idProduct</key>
+			<integer>36899</integer>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>0</integer>
 		</dict>
 	</dict>
 </dict>

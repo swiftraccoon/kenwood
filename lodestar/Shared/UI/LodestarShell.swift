@@ -50,12 +50,25 @@ struct LodestarShell: View {
             // auto-connect gets rejected.
             if phase == .background || phase == .inactive {
                 Task { @MainActor in
+                    #if os(iOS)
+                    // USB user-client connections don't survive app
+                    // suspension — tear down first so the dext isn't
+                    // left holding a doorbell for a frozen process.
+                    await transport.handleScenePhaseBackground()
+                    #endif
                     await session.shutdown()
                 }
             } else if phase == .active {
                 // Returning from background: restart the watchers +
                 // re-run auto-connect (shutdown cleared everything).
                 session.activate()
+                #if os(iOS)
+                Task { @MainActor in
+                    // Rescan (radio may have been plugged in while
+                    // suspended) and restore the pre-background link.
+                    await transport.handleScenePhaseActive()
+                }
+                #endif
             }
         }
     }

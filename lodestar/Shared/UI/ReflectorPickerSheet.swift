@@ -75,8 +75,15 @@ struct ReflectorPickerSheet: View {
                         #endif
                 } icon: {
                     Image(systemName: "person.fill")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(coordinator.callsign.isEmpty ? .orange : .secondary)
                 }
+            }
+            if coordinator.callsign.isEmpty {
+                Label("Enter your callsign to unlock the reflector list — every reflector needs it to connect.",
+                      systemImage: "arrow.up")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             HStack(spacing: 12) {
                 HStack(spacing: 4) {

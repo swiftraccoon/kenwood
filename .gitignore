@@ -57,3 +57,4 @@ lodestar/DerivedData/
 /stargazer.toml
 # ML working set derived from recordings (never committed)
 /dataset/
+/lodestar/project-local.yml

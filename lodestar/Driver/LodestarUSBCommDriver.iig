@@ -1,0 +1,39 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Swift Raccoon
+ * SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
+ *
+ * Companion driver for the TH-D75's CDC ACM *control* interface
+ * (bInterfaceNumber 0, class 02/02/01). Claims the interface and
+ * services its interrupt-IN endpoint the way a standard host ACM stack
+ * does. Exists because the radio ACKs bulk-OUT CAT bytes yet never
+ * transmits on bulk IN while the control interface is unclaimed —
+ * mirroring macOS (AppleUSBACM on interface 0 + AppleUSBACMData on
+ * interface 1) is the remaining host-behavior difference.
+ */
+
+#ifndef LodestarUSBCommDriver_h
+#define LodestarUSBCommDriver_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+#include <USBDriverKit/IOUSBHostInterface.iig>
+#include <USBDriverKit/IOUSBHostPipe.iig>
+
+class LodestarUSBCommDriver: public IOService
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+
+    /// Interrupt-IN completion (SERIAL_STATE notifications etc.).
+    /// Logged and re-armed until kIOReturnAborted.
+    virtual void InterruptComplete(OSAction *action,
+                                   IOReturn status,
+                                   uint32_t actualByteCount,
+                                   uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
+};
+
+#endif /* LodestarUSBCommDriver_h */
