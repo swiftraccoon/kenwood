@@ -120,6 +120,16 @@ skip = [
     { crate = "thiserror-impl@1" },
 
     # ─────────────────────────────────────────────────────────────────────
+    # proc-macro ecosystem syn 2 → syn 3 migration
+    # ─────────────────────────────────────────────────────────────────────
+
+    # serde_derive 1.0.229 moved to syn 3 while thiserror-impl (both major
+    # lines) and most other proc-macro crates in the tree still use syn 2.
+    # The ecosystem split resolves upstream; dropable once every proc-macro
+    # dependency has migrated and the tree converges on one syn major.
+    { crate = "syn@2" },
+
+    # ─────────────────────────────────────────────────────────────────────
     # thd75-tui layout engine (ratatui → kasuari)
     # ─────────────────────────────────────────────────────────────────────
 

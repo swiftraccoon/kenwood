@@ -68,6 +68,8 @@ jobs:
       - run: cargo test --features kenwood-tables
         working-directory: mbelib-rs
       - run: cargo test
+        working-directory: mcp-d75-extract
+      - run: cargo test
         working-directory: mmdvm-core
       - run: cargo test
         working-directory: mmdvm

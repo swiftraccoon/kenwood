@@ -1,0 +1,24 @@
+[package]
+name = "mcp-d75-extract"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "MCP-D75 menu-schema extractor: turns ILSpy-decompiled serializer writes into a JSON manifest and the generated Rust menu-field registry"
+license = "GPL-2.0-or-later"
+authors = ["swiftraccoon"]
+repository = "https://github.com/swiftraccoon/kenwood"
+keywords = ["kenwood", "thd75", "mcp-d75", "ham-radio", "amateur-radio"]
+categories = ["parser-implementations", "command-line-utilities"]
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+fancy-regex = "0.14"
+regex = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+
+[lints]
+workspace = true

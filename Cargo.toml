@@ -13,6 +13,7 @@ members = [
   "ax25-codec",
   "kiss-tnc",
   "mbelib-rs",
+  "mcp-d75-extract",
   "mmdvm",
   "mmdvm-core",
   "sextant",

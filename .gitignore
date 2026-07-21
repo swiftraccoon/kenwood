@@ -4,6 +4,10 @@
 Cargo.lock
 __pycache__/
 
+# Local dev tooling scratch (ML pipeline, ops scripts) — never tracked.
+# The MCP-D75 menu-schema extractor lives in the mcp-d75-extract crate.
+tools/
+
 # Local
 *.log
 .DS_Store
