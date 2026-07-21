@@ -243,6 +243,9 @@ public final class ReflectorCoordinator: ReflectorObserver {
             // on the next launch. Captured unconditionally; the user's
             // `autoConnectReflector` toggle controls whether we act on it.
             rememberedReflectorName = reflector.name
+            // A live link starts the audio render pipeline even before
+            // any voice arrives — background execution rides on it.
+            audioPlayer.beginKeepAlive()
         } catch {
             let msg = error.displayMessage
             state = .failed(msg)
@@ -334,6 +337,9 @@ public final class ReflectorCoordinator: ReflectorObserver {
         connectedReflector = nil
         currentStream = nil
         state = .disconnected
+        // User chose to unlink — release the audio keep-alive so the
+        // app can suspend normally in the background.
+        audioPlayer.endKeepAlive()
     }
 
     public func clearHeardHistory() {
@@ -399,6 +405,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
         switch event {
         case .connected:
             state = .connected
+            audioPlayer.beginKeepAlive()
 
         case .disconnected(let reason):
             state = .disconnected
@@ -406,6 +413,11 @@ public final class ReflectorCoordinator: ReflectorObserver {
             userInitiatedDisconnect = false
             let reasonText = reason.displayText
             lastError = "reflector disconnected: \(reasonText)"
+            // No endKeepAlive here for unexpected drops: the audio
+            // pipeline must keep the process alive through the
+            // reconnect backoff so a backgrounded app can relink.
+            // The backoff task releases it if all attempts fail;
+            // user-initiated disconnects released it already.
             // Flush decoder state; the tail PCM is discarded because the
             // link is gone and there's nothing left to play through.
             _ = rxPipeline.endStream()
@@ -478,6 +490,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
             state = .disconnected
             session = nil
             connectedReflector = nil
+            audioPlayer.endKeepAlive()
         }
     }
 
@@ -631,6 +644,11 @@ public final class ReflectorCoordinator: ReflectorObserver {
                     return
                 }
             }
+            // Backoff exhausted — release the audio keep-alive so the
+            // app can suspend instead of rendering silence forever for
+            // a link that isn't coming back.
+            guard let self, !Task.isCancelled else { return }
+            self.audioPlayer.endKeepAlive()
         }
     }
 

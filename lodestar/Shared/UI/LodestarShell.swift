@@ -43,24 +43,33 @@ struct LodestarShell: View {
             #endif
         }
         .onChange(of: scenePhase) { _, phase in
-            // Graceful shutdown on background / inactive so the
-            // reflector receives our unlink packet before the process
-            // is suspended / terminated. Without this, reflectors
-            // hold the stale session for 30–60 s and the next launch's
-            // auto-connect gets rejected.
-            if phase == .background || phase == .inactive {
-                Task { @MainActor in
-                    #if os(iOS)
-                    // USB user-client connections don't survive app
-                    // suspension — tear down first so the dext isn't
-                    // left holding a doorbell for a frozen process.
-                    await transport.handleScenePhaseBackground()
-                    #endif
-                    await session.shutdown()
+            switch phase {
+            case .background:
+                // A linked app stays alive in the background: the
+                // running audio pipeline (UIBackgroundModes: audio)
+                // holds the process open — and with it the reflector
+                // UDP session and the USB user client, so the relay
+                // keeps relaying with the screen off. Only an idle
+                // app (no reflector link) shuts down and suspends
+                // normally; without the graceful unlink, reflectors
+                // hold the stale session for 30–60 s and the next
+                // launch's auto-connect gets rejected.
+                if reflector.state != .connected {
+                    Task { @MainActor in
+                        #if os(iOS)
+                        // USB user-client connections don't survive
+                        // app suspension — tear down first so the
+                        // dext isn't left holding a doorbell for a
+                        // frozen process.
+                        await transport.handleScenePhaseBackground()
+                        #endif
+                        await session.shutdown()
+                    }
                 }
-            } else if phase == .active {
-                // Returning from background: restart the watchers +
-                // re-run auto-connect (shutdown cleared everything).
+            case .active:
+                // Both calls self-guard: activate() is idempotent,
+                // and the transport only reconnects if backgrounding
+                // actually tore a live link down.
                 session.activate()
                 #if os(iOS)
                 Task { @MainActor in
@@ -69,6 +78,11 @@ struct LodestarShell: View {
                     await transport.handleScenePhaseActive()
                 }
                 #endif
+            default:
+                // .inactive is transient — Notification Center pulls,
+                // incoming-call UI, the app switcher. Tearing down
+                // here killed live sessions on trivial interruptions.
+                break
             }
         }
     }
