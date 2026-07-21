@@ -1,0 +1,35 @@
+[package]
+name = "thd75-listen"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Accessible SSB/CW/AM demodulator for the Kenwood TH-D75 IF-over-USB-audio stream"
+license = "GPL-2.0-or-later"
+authors = ["swiftraccoon"]
+repository = "https://github.com/swiftraccoon/kenwood"
+keywords = ["ham-radio", "sdr", "ssb", "accessibility", "amateur-radio"]
+categories = ["command-line-utilities", "multimedia::audio"]
+publish = false
+
+[lib]
+name = "thd75_listen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "thd75-listen"
+path = "src/main.rs"
+
+[dependencies]
+kenwood-thd75 = { path = "../thd75" }
+if-dsp = { path = "../if-dsp" }
+# Matches sextant's cpal pin — two cpal majors cannot coexist (the
+# alsa-sys `links = "alsa"` value must be unique in the graph).
+cpal = "0.15"
+tokio = { version = "1", features = ["rt", "time"] }
+rustyline = "18"
+
+[dev-dependencies]
+thd75-repl = { path = "../thd75-repl" }
+
+[lints]
+workspace = true
