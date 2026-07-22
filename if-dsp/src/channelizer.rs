@@ -49,7 +49,7 @@ pub struct ChannelizerConfig {
     pub mode: DemodMode,
     /// Audio passband width override in hertz (`None` = mode default).
     pub filter_hz: Option<f32>,
-    /// AGC parameters (`None` disables AGC — used by amplitude-precise
+    /// AGC parameters (`None` disables AGC, used by amplitude-precise
     /// tests; keep it on for listening).
     pub agc: Option<AgcConfig>,
 }

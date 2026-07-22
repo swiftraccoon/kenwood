@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn callsign_from_wire_bytes_stores_non_ascii_verbatim() {
-        // Mirrors ircDDBGateway's raw memcpy behaviour — a remote
+        // Mirrors ircDDBGateway's raw memcpy behaviour: a remote
         // radio transmitting non-printable bytes in a callsign field
         // produces a Callsign with those bytes preserved, not a
         // silent drop.

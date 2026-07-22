@@ -1,5 +1,5 @@
 //! Calling `AsyncSession::spawn` with a `Session<P, Configured>` must
-//! be a compile error — the tokio shell only accepts a session that
+//! be a compile error: the tokio shell only accepts a session that
 //! has already been driven through the handshake and promoted to
 //! `Connected`.
 //!

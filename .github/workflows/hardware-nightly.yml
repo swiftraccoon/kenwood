@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 # Minimum required permissions: the job only needs to checkout source and
-# run cargo test — no writes to any GitHub resource.
+# run cargo test; no writes to any GitHub resource.
 permissions:
   contents: read
 

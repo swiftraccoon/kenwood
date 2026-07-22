@@ -10,7 +10,7 @@ use crate::Complex32;
 /// Amplitude of the `freq_hz` component of `samples` (Goertzel).
 ///
 /// Returns the amplitude a pure tone at `freq_hz` would need to
-/// produce the observed correlation — for a clean unit tone the result
+/// produce the observed correlation; for a clean unit tone the result
 /// is ~1.0.
 #[expect(
     clippy::cast_precision_loss,

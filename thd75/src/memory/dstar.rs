@@ -18,7 +18,7 @@
 //! ([`MCP_D75_MENU_FIELDS`](super::MCP_D75_MENU_FIELDS)) and are
 //! confirmed by the hardware dump in `tests/memory_golden.rs`. An
 //! earlier revision read the MY callsign from `0x1300` ("D74
-//! development notes") — that offset is actually
+//! development notes"); that offset is actually
 //! `aprs.StatusTextList[4].StatusText` and never held a callsign.
 //!
 //! The D-STAR channel info at `0x03F0` is from D74 development notes.
@@ -266,7 +266,7 @@ impl<'a> DstarAccess<'a> {
     /// Region boundary confirmed. Internal field layout from firmware RE
     /// offset is estimated, not hardware-verified.
     ///
-    /// # Field provenance — placeholders, not parsed data
+    /// # Field provenance: placeholders, not parsed data
     ///
     /// Only the callsign and frequency fields are read from the image.
     /// The following fields of the returned [`RepeaterEntry`] are

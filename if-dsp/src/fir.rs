@@ -175,7 +175,7 @@ mod tests {
     use super::*;
 
     /// Evaluate the frequency response magnitude of real taps at `f`
-    /// (analytic DTFT — deterministic, no filtering needed).
+    /// (analytic DTFT: deterministic, no filtering needed).
     fn response_real(taps: &[f32], f_hz: f64, rate: f64) -> f64 {
         let omega = std::f64::consts::TAU * f_hz / rate;
         let (mut re, mut im) = (0.0_f64, 0.0_f64);

@@ -58,7 +58,7 @@
 //!     }
 //! }
 //!
-//! // Clean shutdown — exits KISS mode, returns Radio for other use
+//! // Clean shutdown: exits KISS mode, returns Radio for other use
 //! let _radio = client.stop().await.map_err(|(_client, e)| e)?;
 //! # Ok(())
 //! # }
@@ -178,7 +178,7 @@ impl AprsClientConfig {
     /// # Errors
     ///
     /// Returns [`Error::Validation`] if the callsign or SSID is not a
-    /// valid AX.25 address — config fields are freely settable, so
+    /// valid AX.25 address; config fields are freely settable, so
     /// validation happens at use ([`AprsClient::start`]), not at
     /// construction.
     fn my_address(&self) -> Result<Ax25Address, Error> {
@@ -501,7 +501,7 @@ impl<T: Transport> AprsClient<T> {
         radio: Radio<T>,
         config: AprsClientConfig,
     ) -> Result<Self, (Radio<T>, Error)> {
-        // Validate the station address BEFORE touching the radio —
+        // Validate the station address BEFORE touching the radio:
         // config fields are freely settable, so this is the gate that
         // keeps an invalid callsign/SSID from reaching the air (and
         // it must be an error, never a panic).
@@ -685,7 +685,7 @@ impl<T: Transport> AprsClient<T> {
             Ok(packet) => Some(packet),
             Err(e) => {
                 // A KISS frame that fails AX.25 decode is real
-                // corruption on air — leave a trace so a degrading
+                // corruption on air; leave a trace so a degrading
                 // link is distinguishable from an idle channel.
                 tracing::debug!(error = ?e, len = frame.data.len(), "dropping undecodable AX.25 frame");
                 None
@@ -717,7 +717,7 @@ impl<T: Transport> AprsClient<T> {
     /// has elapsed.
     ///
     /// When the digipeater runs with a non-zero viscous delay, a relay is
-    /// not sent immediately — [`DigipeaterConfig::process`] returns
+    /// not sent immediately: [`DigipeaterConfig::process`] returns
     /// [`DigiAction::Drop`] and stashes the modified frame internally. The
     /// frame is only released once the delay elapses (and no other station
     /// digipeated it first), via
@@ -749,9 +749,9 @@ impl<T: Transport> AprsClient<T> {
     ///
     /// Returns `Some` only when the cycle that produced the current event
     /// also received a frame off the air. An `IGate` uses this to forward
-    /// **every** heard packet to APRS-IS — including ones that surfaced as
+    /// **every** heard packet to APRS-IS, including ones that surfaced as
     /// typed events (`PositionReceived`, `StationHeard`, …) rather than
-    /// [`AprsEvent::RawPacket`] — by pairing it with
+    /// [`AprsEvent::RawPacket`], by pairing it with
     /// [`Self::format_for_is`].
     pub const fn take_last_rf_packet(&mut self) -> Option<Ax25Packet> {
         self.last_rf_packet.take()
@@ -807,7 +807,7 @@ impl<T: Transport> AprsClient<T> {
 
                 // Observation-order contract (matches every other arm in
                 // this match): `StationHeard` is the *primary* event when
-                // the station list has an entry — it carries the "we just
+                // the station list has an entry: it carries the "we just
                 // heard from this station" signal that callers use for UI
                 // refresh and IGate timing. Any data-bearing sub-event
                 // (weather, position) is queued for the *next* call to
@@ -815,7 +815,7 @@ impl<T: Transport> AprsClient<T> {
                 // arrival order: heard-then-data.
                 //
                 // Earlier code generations returned `WeatherReceived`
-                // first and queued `StationHeard` — that violated the
+                // first and queued `StationHeard`; that violated the
                 // sibling-arm convention and would *lose* the StationHeard
                 // event entirely if the caller stopped polling between
                 // the two.
@@ -1005,7 +1005,7 @@ impl<T: Transport> AprsClient<T> {
         Ok(())
     }
 
-    /// Beacon current position using Mic-E encoding — the most compact
+    /// Beacon current position using Mic-E encoding, the most compact
     /// APRS position format and the TH-D75's native one.
     ///
     /// Latitude is encoded in the AX.25 destination address; longitude,
@@ -1175,7 +1175,7 @@ impl<T: Transport> AprsClient<T> {
         // RF info fields legitimately end with CR/LF (status packets
         // carry a trailing CR by spec; many TNC beacons append one).
         // Those bytes are the AX.25 payload's own framing junk, not
-        // content — carried into the IS line verbatim they read as an
+        // content; carried into the IS line verbatim they read as an
         // embedded newline ahead of our CRLF terminator, and the
         // uplink's injection guard rightly refuses the line. Trim
         // them; interior CR/LF still gets rejected downstream.
@@ -1298,7 +1298,7 @@ impl<T: Transport> AprsClient<T> {
     ///
     /// All callsign comparisons here are case-sensitive against the
     /// uppercase form because `ax25_codec::Callsign::new` already
-    /// enforces uppercase ASCII alphanumeric at validation time — every
+    /// enforces uppercase ASCII alphanumeric at validation time; every
     /// `Callsign` in a parsed `Ax25Packet` is therefore already in
     /// canonical case, and a runtime `.to_uppercase()` would allocate
     /// without semantic effect.
@@ -1375,14 +1375,14 @@ impl<T: Transport> AprsClient<T> {
 
         // Check if this message is addressed to us.
         if msg.addressee.to_uppercase() != my_call {
-            // Not for us — treat as a station heard event.
+            // Not for us; treat as a station heard event.
             let entry = self.stations.get(&from.callsign).cloned();
             return Ok(entry.map(AprsEvent::StationHeard));
         }
 
         // Check if it is an ack/rej control frame for a pending message.
         // The messenger only honours it when `from` is the station the
-        // message was addressed to — a message number is not a secret on
+        // message was addressed to; a message number is not a secret on
         // the air, so any other station's ack is ignored.
         if let Some((is_ack, id)) = classify_ack_rej(&msg.text) {
             let id_owned = id.to_owned();
@@ -1393,11 +1393,11 @@ impl<T: Transport> AprsClient<T> {
                     AprsEvent::MessageRejected(id_owned)
                 }));
             }
-            // Control frame for an unknown message — ignore.
+            // Control frame for an unknown message; ignore.
             return Ok(None);
         }
 
-        // Regular message addressed to us — auto-ack if configured.
+        // Regular message addressed to us; auto-ack if configured.
         if self.config.auto_ack
             && let Some(ref id) = msg.message_id
         {
@@ -1409,7 +1409,7 @@ impl<T: Transport> AprsClient<T> {
         //
         // When enabled and a position is cached, respond with a position
         // beacon. The beacon goes to CQCQCQ (all stations), not just the
-        // querying station — this is per APRS spec, which treats the
+        // querying station; this is per APRS spec, which treats the
         // query as a request for a fresh beacon from the queried station.
         if self.config.auto_query_response
             && msg.text.trim() == "?APRSP"
@@ -1499,7 +1499,7 @@ mod tests {
     #[tokio::test]
     async fn start_with_invalid_callsign_errors_instead_of_panicking() -> TestResult {
         // Config fields are freely settable, so validation must happen
-        // at use — an invalid callsign previously hit an `unreachable!`
+        // at use; an invalid callsign previously hit an `unreachable!`
         // deep inside start().
         let mock = MockTransport::new();
         let radio = Radio::connect(mock).await?;
@@ -1939,7 +1939,7 @@ mod tests {
         // `[TCPIP-0]`), and the inner third-party payload must end with
         // `,MYCALL,I:` per APRS 1.0.1 §17 + IGating.aspx. Verified
         // structurally by inspecting the built packet's fields rather
-        // than the encoded KISS bytes — fewer brittle assertions, same
+        // than the encoded KISS bytes: fewer brittle assertions, same
         // protocol coverage.
         let radio = mock_radio(TncBaud::Bps1200).await?;
         let config = test_config();
@@ -1959,7 +1959,7 @@ mod tests {
         let is_line = "W1AW>APK005,qAC,SRV::KQ4NIT   :Hello{123";
         let packet = client
             .build_gate_from_is_packet(is_line)
-            .ok_or("gate packet not built — expected Some")?;
+            .ok_or("gate packet not built: expected Some")?;
 
         // Outer source is the IGate's callsign + SSID.
         assert_eq!(packet.source.callsign.as_str(), "N0CALL");
@@ -1982,7 +1982,7 @@ mod tests {
             );
         }
         // Inner third-party payload starts with `}`, ends with
-        // `,MYCALL,I:data`. Decoding via lossy is safe — the payload is
+        // `,MYCALL,I:data`. Decoding via lossy is safe: the payload is
         // ASCII by construction here.
         let info_str = String::from_utf8_lossy(&packet.info);
         assert!(
@@ -2080,8 +2080,8 @@ mod tests {
         client.session.transport.queue_read(&wire);
 
         // Observation-order contract (see `dispatch_event` for the
-        // rationale): a position-with-weather packet emits two events
-        // — `StationHeard` first ("we saw this station"), then
+        // rationale): a position-with-weather packet emits two events:
+        // `StationHeard` first ("we saw this station"), then
         // `WeatherReceived` ("here is the payload"). Earlier code
         // generations emitted these in the opposite order; the
         // current order matches every other arm of `dispatch_event`

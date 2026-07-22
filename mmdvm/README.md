@@ -4,8 +4,8 @@ Tokio async shell for the MMDVM digital-voice modem protocol. Wraps [`mmdvm-core
 
 ## Scope
 
-- `AsyncModem::spawn` — spawns a background task that owns a `Transport`, drives `mmdvm-core` frame I/O, and returns an `AsyncModem` handle for commands and events.
-- `transport` module — `Transport` trait, blanket-implemented for any async duplex byte stream (`AsyncRead + AsyncWrite + Send + Unpin`); concrete serial/SPP types are supplied by the caller.
+- `AsyncModem::spawn` spawns a background task that owns a `Transport`, drives `mmdvm-core` frame I/O, and returns an `AsyncModem` handle for commands and events.
+- The `transport` module holds the `Transport` trait, blanket-implemented for any async duplex byte stream (`AsyncRead + AsyncWrite + Send + Unpin`); concrete serial/SPP types are supplied by the caller.
 - Periodic 250 ms `GetStatus` polling that corrects local buffer-space estimates from modem reports. Matches the reference MMDVMHost main loop.
 - Per-mode TX queues drained only when the modem reports FIFO-slot availability. D-STAR queue wired today; DMR / YSF / P25 / NXDN / POCSAG / FM present in core but not driven from this shell yet.
 

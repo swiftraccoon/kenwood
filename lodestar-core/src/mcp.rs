@@ -8,7 +8,7 @@
 //!
 //! Pure-logic byte encoders/decoders for the TH-D75's binary MCP
 //! programming protocol. The orchestration (timing, transport, ACK
-//! exchange, reconnect after exit) happens on the Swift side — this
+//! exchange, reconnect after exit) happens on the Swift side; this
 //! module only produces and parses bytes.
 //!
 //! # Protocol summary
@@ -159,7 +159,7 @@ pub fn build_read_page_cmd(page: u16) -> Vec<u8> {
 /// - [`McpError::WrongPageSize`] if `data.len() != PAGE_SIZE`.
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "UniFFI FFI boundary — `sequence<u8>` in UDL maps to owned `Vec<u8>`."
+    reason = "UniFFI FFI boundary: `sequence<u8>` in UDL maps to owned `Vec<u8>`."
 )]
 #[uniffi::export]
 pub fn build_write_page_cmd(page: u16, data: Vec<u8>) -> Result<Vec<u8>, McpError> {
@@ -200,7 +200,7 @@ pub struct McpPage {
 /// - [`McpError::BadMarker`] if the first byte isn't `'W'`.
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "UniFFI FFI boundary — `sequence<u8>` in UDL maps to owned `Vec<u8>`."
+    reason = "UniFFI FFI boundary: `sequence<u8>` in UDL maps to owned `Vec<u8>`."
 )]
 #[uniffi::export]
 pub fn parse_w_frame(bytes: Vec<u8>) -> Result<McpPage, McpError> {

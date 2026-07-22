@@ -21,7 +21,7 @@
 //! The D75 has two frequency-related command pairs:
 //!
 //! - **FQ** (read-only): returns the current frequency and step size for a band. Writes are
-//!   rejected by the firmware — use FO for frequency changes.
+//!   rejected by the firmware; use FO for frequency changes.
 //! - **FO** (read/write): returns or sets the full channel configuration for a band, including
 //!   frequency, offset, tone mode, CTCSS/DCS codes, shift direction, and more. This is the
 //!   primary command for tuning the radio via CAT.
@@ -154,7 +154,7 @@ impl<T: Transport> Radio<T> {
     /// modes on Band A will return `?`. FM, NFM, DV, and DR modes are available on both bands.
     ///
     /// See the [`Mode`] type for valid values. Note that the MD command uses a different
-    /// encoding than FO/ME commands — the [`Mode`] type handles this mapping internally.
+    /// encoding than FO/ME commands; the [`Mode`] type handles this mapping internally.
     ///
     /// # Errors
     ///
@@ -252,7 +252,7 @@ impl<T: Transport> Radio<T> {
     /// Get the S-meter reading for the given band (SM read).
     ///
     /// Returns an instantaneous signal strength measurement as a raw value 0-5. This is a
-    /// read-only, point-in-time snapshot — the value changes continuously as signal conditions
+    /// read-only, point-in-time snapshot; the value changes continuously as signal conditions
     /// vary.
     ///
     /// # Value mapping
@@ -270,7 +270,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Polling warning
     ///
-    /// Do not poll SM continuously — the firmware returns spurious spikes on Band B. Instead,
+    /// Do not poll SM continuously: the firmware returns spurious spikes on Band B. Instead,
     /// use AI mode ([`set_auto_info`](Self::set_auto_info)) with the BY (busy) signal as a
     /// gate: read SM once when squelch opens, and treat it as zero when squelch is closed.
     ///
@@ -295,7 +295,7 @@ impl<T: Transport> Radio<T> {
 
     /// Get the busy state for the given band (BY read).
     ///
-    /// "Busy" means the squelch is open — a signal strong enough to exceed the current squelch
+    /// "Busy" means the squelch is open: a signal strong enough to exceed the current squelch
     /// threshold is present on the channel. Returns `true` when the squelch is open (signal
     /// present), `false` when closed (no signal or signal below threshold).
     ///
@@ -540,7 +540,7 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn recall_channel(&mut self, band: Band, channel: u16) -> Result<(), Error> {
         // The `MR {},{:03}` wire format silently grows to 4+ digits
-        // for out-of-range channels — validate before the wire.
+        // for out-of-range channels, so validate before the wire.
         if channel > 999 {
             return Err(Error::Validation(
                 crate::error::ValidationError::ChannelOutOfRange { channel, max: 999 },
@@ -562,7 +562,7 @@ impl<T: Transport> Radio<T> {
     /// Step the frequency up by one increment on the given band (UP action).
     ///
     /// This is an ACTION command that changes the radio's active frequency.
-    /// There is no undo — the previous frequency is not preserved.
+    /// There is no undo; the previous frequency is not preserved.
     ///
     /// # Errors
     ///
@@ -599,7 +599,7 @@ impl<T: Transport> Radio<T> {
     /// Set the FM broadcast radio on/off state (FR write).
     ///
     /// This controls the **broadcast FM receiver** (76-108 MHz), not amateur FM mode. This is
-    /// the same as the "FM Radio" menu item on the radio — it tunes to commercial broadcast
+    /// the same as the "FM Radio" menu item on the radio: it tunes to commercial broadcast
     /// stations.
     ///
     /// # Side effects
@@ -627,7 +627,7 @@ impl<T: Transport> Radio<T> {
     /// Get the fine step setting (FS bare read).
     ///
     /// Firmware-verified: FS = Fine Step. Bare `FS\r` returns a single value (0-3).
-    /// No band parameter — the radio returns a global fine step setting.
+    /// No band parameter: the radio returns a global fine step setting.
     ///
     /// # Errors
     ///
@@ -650,7 +650,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Firmware bug (v1.03)
     ///
-    /// FS write is broken on firmware 1.03 — the radio returns `N`
+    /// FS write is broken on firmware 1.03: the radio returns `N`
     /// (not available) for all write attempts.
     ///
     /// # Errors

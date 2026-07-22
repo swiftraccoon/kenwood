@@ -3,8 +3,8 @@
 // Per-field `b0..b8` diff of our encoder vs OP25's `ambe_encode_dump`
 // trace. Reverse-derives each b_N from our `ambe_d[0..49]` using the
 // D-STAR bit layout documented in `src/encode/quantize.rs` (mbelib
-// AmbePlus convention). Matches what OP25's `ambe_encode_dump` does
-// — it also reverse-derives b[0..8] from its own 72-bit interleaved
+// AmbePlus convention). Matches what OP25's `ambe_encode_dump` does:
+// it also reverse-derives b[0..8] from its own 72-bit interleaved
 // output via `decode_dstar`, rather than exposing the quantizer's
 // internal values directly.
 //
@@ -309,8 +309,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .zip(first_mismatch_by_field.iter())
         .enumerate()
     {
-        let first =
-            first_mismatch.map_or_else(|| "—".to_string(), |f| format!("first diverge at F{f}"));
+        let first = first_mismatch.map_or_else(
+            || "no divergence".to_string(),
+            |f| format!("first diverge at F{f}"),
+        );
         println!(
             "  b{i}: {:3}/{} ({:5.1}%)  [{}]",
             count,

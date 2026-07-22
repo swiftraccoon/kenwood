@@ -10,7 +10,7 @@
 //! nibble in byte 0x09, tone/CTCSS/DCS/shift bits in byte 0x0A,
 //! region offsets 0x2000/0x4000/0x10000, the settings cells spanning
 //! 0x1000..0x1A10 plus the D-STAR MY-callsign list at 0x1CA8). A
-//! symmetric mistake — writing and reading the same wrong bit —
+//! symmetric mistake (writing and reading the same wrong bit)
 //! passes every round-trip test while corrupting the radio.
 //!
 //! This file decodes a real 500,480-byte MCP dump read off a physical
@@ -61,7 +61,7 @@ fn load_dump() -> Result<MemoryImage, Box<dyn std::error::Error>> {
 ///
 /// The counts also pin the regular/special split: `count()` covers
 /// only the regular bank (0..=999), while the flag region spans all
-/// 1,200 entries — the extra used slots on this radio are its special
+/// 1,200 entries; the extra used slots on this radio are its special
 /// channels (call/scan-edge/weather). A regression that moved the
 /// regular-bank boundary would change one count without the other.
 #[test]
@@ -105,7 +105,7 @@ fn real_dump_parses_and_every_used_channel_decodes() -> TestResult {
 /// Known-true channel contents, read off the physical radio.
 ///
 /// These are public-safety memories programmed into the source
-/// handheld — frequency, name, mode, step and shift all come from the
+/// handheld: frequency, name, mode, step and shift all come from the
 /// hardware, not from our encoder. A wrong mode nibble, a shifted
 /// frequency word, or an off-by-one in the 32-byte record stride
 /// fails here.
@@ -155,7 +155,7 @@ fn channel_zero_matches_the_radio() -> TestResult {
 
 /// Known-true settings bytes, read off the physical radio.
 ///
-/// The settings layer is a flat offset map — every accessor is a
+/// The settings layer is a flat offset map: every accessor is a
 /// hand-written byte/bit index sourced from the MCP-D75 field
 /// registry. Decoding the real dump pins each index to hardware, so
 /// an accessor that reads the wrong cell (the historical failure mode

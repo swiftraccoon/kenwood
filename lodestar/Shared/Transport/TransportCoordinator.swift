@@ -25,13 +25,13 @@ public final class TransportCoordinator {
     public private(set) var isProbingMode: Bool = false
 
     /// Why the last mode probe failed (nil after a successful probe).
-    /// Surfaced by the diagnostics card — a probe failure must never
+    /// Surfaced by the diagnostics card: a probe failure must never
     /// hide behind a bare "Mode unknown".
     public private(set) var lastProbeErrorText: String?
 
     /// Result of the last automated USB-relay setup (which radio
     /// settings were found and changed). Displayed so the operator sees
-    /// exactly what the app read and did — no menu spelunking.
+    /// exactly what the app read and did, with no menu spelunking.
     public private(set) var lastRelaySetup: UsbRelaySetupReport?
 
     /// When `true`, `tryAutoConnect()` will reconnect on launch to the
@@ -54,7 +54,7 @@ public final class TransportCoordinator {
         didSet { UserDefaults.standard.set(rememberedRadioName, forKey: Self.rememberedNameKey) }
     }
 
-    /// Handle to the underlying transport — exposed only so
+    /// Handle to the underlying transport, exposed only so
     /// `RelayCoordinator` can run an `MmdvmReader`/`MmdvmWriter`
     /// alongside the coordinator's own calls. All I/O still serialises
     /// through the transport actor.
@@ -136,7 +136,7 @@ public final class TransportCoordinator {
         do {
             try await t.open()
             // Remember this radio so `tryAutoConnect()` can find it on
-            // the next launch. Captured unconditionally — the user's
+            // the next launch. Captured unconditionally; the user's
             // `autoConnectRadio` toggle controls whether we act on it.
             rememberedRadioAddress = device.address
             rememberedRadioName = device.name
@@ -153,8 +153,8 @@ public final class TransportCoordinator {
 
     /// Auto-reconnect to the remembered radio on launch, if enabled and
     /// the remembered device is still paired. Idempotent and silent when
-    /// conditions aren't met — safe to call unconditionally from app
-    /// startup.
+    /// conditions aren't met, so it is safe to call unconditionally from
+    /// app startup.
     public func tryAutoConnect() async {
         guard autoConnectRadio, transport == nil else { return }
         guard let address = rememberedRadioAddress else { return }
@@ -191,7 +191,7 @@ public final class TransportCoordinator {
     /// IOKit notifications, and pending mach messages may be dropped),
     /// so the recommended pattern is: disconnect before suspending,
     /// rescan + reopen on wake. Called from the scenePhase observer on
-    /// iOS only — macOS Bluetooth connections survive fine.
+    /// iOS only; macOS Bluetooth connections survive fine.
     public func handleScenePhaseBackground() async {
         resumeRadioOnForeground = transport != nil
         guard transport != nil else { return }
@@ -214,7 +214,7 @@ public final class TransportCoordinator {
     }
 
     /// Re-run the MMDVM GetVersion probe against the current transport.
-    /// Safe to call any time a transport exists — don't gate on
+    /// Safe to call any time a transport exists. Don't gate on
     /// `state == .connected` because that's set asynchronously by the
     /// state-observer task, which races with the probe kicked off from
     /// `connect()` and causes the first-launch probe to silently bail.
@@ -311,14 +311,14 @@ public final class TransportCoordinator {
             return
         }
         // Prove the CAT path FIRST. `0M PROGRAM` sent at a radio that
-        // isn't answering leaves it half-entered in programming mode —
+        // isn't answering leaves it half-entered in programming mode,
         // mute to everything until a power cycle (hardware-verified
         // 2026-07-19, and it poisons all subsequent debugging).
         await sendIdentify()
         guard lastResponseText.hasPrefix("Identify:") else {
             mcpStatus = .failed(
                 "Radio is not answering CAT (last response: \(lastResponseText)). "
-                + "Not entering programming mode — that would wedge the radio. "
+                + "Not entering programming mode, because that would wedge the radio. "
                 + "Power-cycle the radio, reconnect, and retry once Send ID works.")
             return
         }
@@ -364,7 +364,7 @@ public final class TransportCoordinator {
             log.info("MCP: enable Reflector Terminal Mode succeeded")
             // The radio reboots itself on programming-mode exit (its
             // protocol, same as over Bluetooth). Reconnect automatically
-            // as it re-enumerates — no manual reconnect step.
+            // as it re-enumerates, with no manual reconnect step.
             scheduleRadioReconnect()
         } catch {
             log.error("MCP: enable Reflector Terminal Mode failed: \(error)")
@@ -392,12 +392,12 @@ public final class TransportCoordinator {
         }
         isBusy = true
 
-        // 1. Cheap readiness check — if MMDVM already answers over USB,
+        // 1. Cheap readiness check: if MMDVM already answers over USB,
         // the radio is set up correctly and no reboot is needed.
         mcpStatus = .running("Checking whether the radio is already relay-ready…")
         await probeRadioMode()
         if radioMode == .mmdvm {
-            lastResponseText = "Radio is already in Terminal Mode over USB — ready to relay."
+            lastResponseText = "Radio is already in Terminal Mode over USB, ready to relay."
             mcpStatus = .idle
             isBusy = false
             return
@@ -407,8 +407,8 @@ public final class TransportCoordinator {
         await sendIdentify()
         guard lastResponseText.hasPrefix("Identify:") else {
             mcpStatus = .failed(
-                "Radio isn't answering CAT (\(lastResponseText)). Can't reprogram — "
-                + "power-cycle the radio, reconnect, and try again.")
+                "Radio isn't answering CAT (\(lastResponseText)). Can't reprogram. "
+                + "Power-cycle the radio, reconnect, and try again.")
             isBusy = false
             return
         }
@@ -429,7 +429,7 @@ public final class TransportCoordinator {
 
         // 4. Reconnect + poll for terminal mode to come up.
         if report.rebooted {
-            mcpStatus = .running("Applied changes — radio is rebooting.\n\(report.summary)")
+            mcpStatus = .running("Applied changes; radio is rebooting.\n\(report.summary)")
         } else {
             mcpStatus = .running("Settings were already correct; waiting for MMDVM…")
         }
@@ -470,7 +470,7 @@ public final class TransportCoordinator {
                         try await fresh.open()
                         transport = fresh
                     } catch {
-                        // Radio not back yet — wait and retry.
+                        // Radio not back yet; wait and retry.
                         try? await Task.sleep(nanoseconds: 3_000_000_000)
                         continue
                     }
@@ -481,7 +481,7 @@ public final class TransportCoordinator {
             }
 
             if let t = transport {
-                mcpStatus = .running("Connected — waiting for Terminal Mode (MMDVM)…")
+                mcpStatus = .running("Connected; waiting for Terminal Mode (MMDVM)…")
                 let prober = RadioModeProber(transport: t)
                 if let mode = try? await prober.probe(), mode == .mmdvm {
                     radioMode = .mmdvm
@@ -490,11 +490,11 @@ public final class TransportCoordinator {
                     observeState(of: t)   // hand back to normal drop-handling
                     rememberedRadioAddress = device.address
                     rememberedRadioName = device.name
-                    lastResponseText = "Radio is in Terminal Mode over USB — ready to relay."
+                    lastResponseText = "Radio is in Terminal Mode over USB, ready to relay."
                     mcpStatus = .idle
                     return
                 }
-                // Still CAT (radio mid-boot) — the transport may also
+                // Still CAT (radio mid-boot); the transport may also
                 // drop as the radio reboots; detect and re-acquire.
                 if await t.state == .disconnected {
                     await t.close()

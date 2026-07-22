@@ -21,7 +21,7 @@ pub(crate) const AMBE_FRAME_BITS: usize = 72;
 
 /// Forward interleave: `FORWARD[input_bit] = ambe_fr_index`.
 ///
-/// Identical to `crate::unpack::INTERLEAVE` — duplicated here as
+/// Identical to `crate::unpack::INTERLEAVE`, duplicated here as
 /// `pub(crate)` so [`build_inverse`] can consume it at compile time
 /// without exposing `unpack::INTERLEAVE` as a module-public item.
 #[rustfmt::skip]
@@ -57,7 +57,7 @@ const fn build_inverse() -> [u8; AMBE_FRAME_BITS] {
         // slot would silently lose data at encode time.
         assert!(
             inverse[target] == u8::MAX,
-            "FORWARD interleave has a collision — two input bits map to the same ambe_fr slot",
+            "FORWARD interleave has a collision: two input bits map to the same ambe_fr slot",
         );
         // Input-bit indices are 0..72 so the u8 narrowing is exact.
         #[expect(
@@ -76,7 +76,7 @@ const fn build_inverse() -> [u8; AMBE_FRAME_BITS] {
     while check < AMBE_FRAME_BITS {
         assert!(
             inverse[check] != u8::MAX,
-            "FORWARD interleave has a gap — some ambe_fr slot has no source input bit",
+            "FORWARD interleave has a gap: some ambe_fr slot has no source input bit",
         );
         check += 1;
     }

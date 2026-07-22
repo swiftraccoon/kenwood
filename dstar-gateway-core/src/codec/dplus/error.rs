@@ -52,7 +52,7 @@ pub enum DPlusError {
         have: usize,
     },
 
-    /// Auth chunk flag byte `[1]` failed validation — `(b1 & 0xC0) != 0xC0`.
+    /// Auth chunk flag byte `[1]` failed validation: `(b1 & 0xC0) != 0xC0`.
     #[error("DPlus auth chunk has invalid flag byte 0x{byte:02X} at offset {offset}")]
     AuthChunkFlagsInvalid {
         /// Byte offset of the chunk header.
@@ -81,7 +81,7 @@ pub enum DPlusError {
 
     /// Reserved for callsign parsing errors on received packets.
     ///
-    /// Currently unused — the lenient RX path uses
+    /// Currently unused: the lenient RX path uses
     /// `Callsign::from_wire_bytes` which stores bytes verbatim and
     /// cannot fail. This variant exists so that if a future strict
     /// mode rejects non-printable wire callsigns at the codec
@@ -96,7 +96,7 @@ pub enum DPlusError {
     /// An encoder was called with an undersized output buffer.
     ///
     /// This is a programming error inside
-    /// [`crate::session::client::SessionCore`] — it should never
+    /// [`crate::session::client::SessionCore`]; it should never
     /// fire in production because the core sizes its own scratch
     /// buffers. Propagated as a variant rather than swallowed so
     /// callers can still surface the fault.

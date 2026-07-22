@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Connect sheet — the overlay for choosing / connecting to a
+//! Connect sheet: the overlay for choosing / connecting to a
 //! reflector. Favorites first, then recents, then the searchable
 //! directory; the raw host form lives under a collapsed "Manual…".
 
@@ -12,7 +12,7 @@ use crate::hosts::ReflectorHost;
 use crate::theme;
 use crate::ui::{Overlay, module_picker};
 
-/// Cap on directory rows rendered — narrow with search instead.
+/// Cap on directory rows rendered; narrow with search instead.
 const MAX_ROWS: usize = 200;
 
 /// Render the sheet when open. Esc or the close button dismisses it.
@@ -187,7 +187,7 @@ fn directory_rows(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-/// Collapsed manual entry — the raw host form for unlisted
+/// Collapsed manual entry: the raw host form for unlisted
 /// reflectors, plus its own Connect button.
 fn manual_section(app: &mut App, ui: &mut egui::Ui) {
     let _header = egui::CollapsingHeader::new("Manual…")

@@ -15,7 +15,7 @@ use crate::error::AprsError;
 pub struct AprsTelemetry {
     /// Telemetry sequence number (0-999 or "MIC").
     pub sequence: String,
-    /// Analog values — exactly 5 channels per APRS 1.0.1 §13.1.
+    /// Analog values: exactly 5 channels per APRS 1.0.1 §13.1.
     /// Channels omitted from the wire frame are `None`.
     pub analog: [Option<u16>; 5],
     /// Digital value (8 bits).
@@ -27,7 +27,7 @@ pub struct AprsTelemetry {
 /// Per APRS 1.0.1 §13.1 a telemetry frame has exactly 5 analog channels
 /// and 1 digital channel. We tolerate fewer analog channels (missing
 /// channels become `None`) but reject frames with more fields than the
-/// spec allows — those are almost certainly malformed.
+/// spec allows; those are almost certainly malformed.
 ///
 /// # Errors
 ///
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn parse_telemetry_invalid_digital_field_is_error() {
-        // Digital field must be exactly 8 binary digits — non-binary
+        // Digital field must be exactly 8 binary digits; non-binary
         // characters must fail parsing, not silently return 0.
         let info = b"T#123,1,2,3,4,5,XXXXXXXX";
         assert!(

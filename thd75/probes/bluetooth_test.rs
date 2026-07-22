@@ -1,4 +1,4 @@
-//! Bluetooth SPP transport test — verifies CAT commands work over BT.
+//! Bluetooth SPP transport test: verifies CAT commands work over BT.
 //!
 //! Requires TH-D75 paired via Bluetooth (Menu 934).
 //! Run: cargo test --test bluetooth_test -- --ignored --nocapture --test-threads=1

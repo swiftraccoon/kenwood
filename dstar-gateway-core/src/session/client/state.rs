@@ -27,7 +27,7 @@ pub struct Connected;
 #[derive(Debug, Clone, Copy)]
 pub struct Disconnecting;
 
-/// Terminal — must be rebuilt to use again.
+/// Terminal state; must be rebuilt to use again.
 #[derive(Debug, Clone, Copy)]
 pub struct Closed;
 

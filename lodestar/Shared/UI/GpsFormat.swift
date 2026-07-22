@@ -7,7 +7,7 @@ import Foundation
 /// expanded rows, and the now-playing card share a single rendering.
 enum GpsFormat {
     /// Short coordinate string: e.g. `36.1699°N 115.1398°W`. Four
-    /// fractional digits is ~11 m precision — plenty for APRS-grade
+    /// fractional digits is ~11 m precision: plenty for APRS-grade
     /// GPS without overstating accuracy.
     static func coordinate(_ pos: GpsPosition) -> String {
         let lat = formatAxis(pos.latitude, positive: "N", negative: "S")

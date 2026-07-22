@@ -12,25 +12,25 @@
 //!
 //! # Environment variables
 //!
-//! - `DSTAR_TEST_REFLECTOR_DPLUS` — host name of a `DPlus` (REF)
+//! - `DSTAR_TEST_REFLECTOR_DPLUS`: host name of a `DPlus` (REF)
 //!   reflector (default: `REF030`). The tests append `:20001`.
-//! - `DSTAR_TEST_REFLECTOR_DEXTRA` — host name of a `DExtra` (XRF/XLX)
+//! - `DSTAR_TEST_REFLECTOR_DEXTRA`: host name of a `DExtra` (XRF/XLX)
 //!   reflector (default: `XLX307`). The tests append `:30001`.
-//! - `DSTAR_TEST_REFLECTOR_DCS` — host name of a `DCS` reflector
+//! - `DSTAR_TEST_REFLECTOR_DCS`: host name of a `DCS` reflector
 //!   (default: `DCS001`). The tests append `:30051`.
-//! - `DSTAR_TEST_REFLECTOR_CALLSIGN` — routing callsign used by the
+//! - `DSTAR_TEST_REFLECTOR_CALLSIGN`: routing callsign used by the
 //!   voice TX header (default: `REF030`). Keep this separate from the
 //!   DNS hostname in `DSTAR_TEST_REFLECTOR_DPLUS`.
-//! - `DSTAR_TEST_CALLSIGN` — user callsign to authenticate with
+//! - `DSTAR_TEST_CALLSIGN`: user callsign to authenticate with
 //!   (default: `TEST    `). Must be a valid amateur radio callsign when
 //!   running the TX test against a real reflector.
-//! - `DSTAR_TEST_TX_OK` — must be set to `1` to enable the voice-burst
+//! - `DSTAR_TEST_TX_OK`: must be set to `1` to enable the voice-burst
 //!   TX test. Unset by default so accidentally running `--ignored`
 //!   against a live reflector does not key the air.
 //!
 //! # Triple gate
 //!
-//! The tests are triple-gated — `#[cfg(feature = "hardware-tests")]`
+//! The tests are triple-gated: `#[cfg(feature = "hardware-tests")]`
 //! excludes them from default compilation, `#[ignore]` excludes them
 //! from the default test pass, and `DSTAR_TEST_TX_OK=1` is further
 //! required for any test that transmits. Remove none of these gates.
@@ -189,7 +189,7 @@ async fn drive_dplus_handshake(
 
 /// Drain any inbound events for `duration`, discarding them. This is
 /// the "listen while the reflector transmits at us" phase of each
-/// test — we don't assert on frame contents, only that the session
+/// test; we don't assert on frame contents, only that the session
 /// machinery does not crash.
 async fn listen_for<P>(session: &mut AsyncSession<P>, duration: Duration)
 where

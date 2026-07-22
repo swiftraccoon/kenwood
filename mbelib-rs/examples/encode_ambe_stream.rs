@@ -9,8 +9,8 @@
 #![cfg(feature = "encoder")]
 #![expect(
     clippy::print_stderr,
-    reason = "CLI tool: uses stderr for usage/error messages — standard pattern for a \
-              binary example, not a library."
+    reason = "CLI tool: uses stderr for usage/error messages (standard pattern for a \
+              binary example, not a library)."
 )]
 
 // Dev-dependencies pulled in by sibling tests/examples. Acknowledge them here so

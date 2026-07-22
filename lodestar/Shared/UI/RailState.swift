@@ -4,8 +4,8 @@
 import Foundation
 
 /// Pure derivation of what the wide-layout rail shows and with what
-/// emphasis. Every product opinion about pane precedence lives here —
-/// error > setup-needed > now-transmitting > quiet — so the rules are
+/// emphasis. Every product opinion about pane precedence lives here
+/// (error > setup-needed > now-transmitting > quiet), so the rules are
 /// table-testable without SwiftUI.
 ///
 /// The narrow layout ignores `chain` (it always renders the expanded
@@ -39,7 +39,7 @@ struct RailState: Equatable {
         var relay: RelayCoordinator.RelayState
         var streamActive: Bool
         var hasHeardHistory: Bool
-        /// Strip tapped open by the user. Only ever *adds* expansion —
+        /// Strip tapped open by the user. Only ever *adds* expansion;
         /// forced expansion (error/setup) wins when this is false.
         var manualChainExpanded: Bool
     }

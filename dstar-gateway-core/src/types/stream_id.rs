@@ -1,6 +1,6 @@
 //! D-STAR voice stream identifier (non-zero u16).
 //!
-//! Stream ID 0 is reserved by the D-STAR protocol — it is the
+//! Stream ID 0 is reserved by the D-STAR protocol as the
 //! sentinel for "no active stream". Wrapping `NonZeroU16` makes the
 //! invalid value unrepresentable.
 
@@ -10,7 +10,7 @@ use std::num::NonZeroU16;
 ///
 /// # Invariants
 ///
-/// The wrapped `NonZeroU16` makes the zero case unrepresentable —
+/// The wrapped `NonZeroU16` makes the zero case unrepresentable;
 /// any code path holding a `StreamId` is statically guaranteed not
 /// to be carrying a malformed stream id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

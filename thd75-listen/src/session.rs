@@ -1,7 +1,7 @@
 //! Radio state discipline for the listener.
 //!
 //! Everything the listener touches is saved before, and restored
-//! after — the save/configure/restore pattern hardware-verified by
+//! after: the save/configure/restore pattern hardware-verified by
 //! the IF-tap work, formalized.
 
 use kenwood_thd75::Radio;
@@ -31,7 +31,7 @@ pub struct RestoreReport {
 ///
 /// # Errors
 ///
-/// Propagates the first failed read — without a complete snapshot the
+/// Propagates the first failed read; without a complete snapshot the
 /// caller must not reconfigure the radio.
 pub async fn save_state<T: Transport>(
     radio: &mut Radio<T>,
@@ -97,8 +97,8 @@ pub async fn configure_for_listening<T: Transport>(radio: &mut Radio<T>) -> Resu
 /// Best-effort restore of every saved setting, frequency last.
 ///
 /// Frequency goes last because it is the only multi-command
-/// operation. IF output, dual-band, and the operation band — the
-/// settings that can strand the radio — are verified by readback;
+/// operation. IF output, dual-band, and the operation band (the
+/// settings that can strand the radio) are verified by readback;
 /// the rest rely on their command echoes.
 pub async fn restore<T: Transport>(radio: &mut Radio<T>, saved: SavedState) -> RestoreReport {
     let mut report = RestoreReport::default();

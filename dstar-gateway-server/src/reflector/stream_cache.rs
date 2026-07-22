@@ -1,4 +1,4 @@
-//! `StreamCache` — tracks one active voice stream per module.
+//! `StreamCache`: tracks one active voice stream per module.
 //!
 //! Voice headers must be periodically rebroadcast so clients who
 //! joined mid-stream (or missed the initial header) can still decode
@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(cache.from(), peer());
         assert_eq!(cache.started_at(), now);
         assert_eq!(cache.last_activity(), now);
-        // header() returns a borrowed reference — compare field-by-field
+        // header() returns a borrowed reference; compare field-by-field
         let h = cache.header();
         assert_eq!(h.my_call, header().my_call);
     }
@@ -224,7 +224,7 @@ mod tests {
         let start = Instant::now();
         let mut cache = StreamCache::new(sid(), header(), peer(), start);
         let timeout = Duration::from_secs(2);
-        // Fresh cache — not yet evicted at start.
+        // Fresh cache: not yet evicted at start.
         assert!(!cache.should_evict(start, timeout));
         // Record a frame at start + 500ms.
         let t1 = start + Duration::from_millis(500);

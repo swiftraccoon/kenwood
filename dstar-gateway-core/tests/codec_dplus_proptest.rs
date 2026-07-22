@@ -1,10 +1,10 @@
 //! Property tests for `DPlus` codec round-trips.
 //!
 //! Two flavours:
-//! 1. Round-trip properties — encode a valid input, decode it, assert
+//! 1. Round-trip properties: encode a valid input, decode it, assert
 //!    the decoded value matches the original. Exercises every encoder
 //!    against its matching decoder.
-//! 2. Never-panic properties — throw random bytes at the decoders and
+//! 2. Never-panic properties: throw random bytes at the decoders and
 //!    `parse_auth_response` to prove they cannot panic on any input.
 //!
 //! Together these give ~27,000 generated cases per full run.

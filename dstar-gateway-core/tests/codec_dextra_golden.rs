@@ -4,7 +4,7 @@
 //! against a known input. The .bin.txt sibling files document the
 //! per-byte meaning.
 
-// Integration tests are separate compilation units — each one must
+// Integration tests are separate compilation units, so each one must
 // silence `unused_crate_dependencies` for workspace crates it doesn't
 // `src/lib.rs`.
 use proptest as _;

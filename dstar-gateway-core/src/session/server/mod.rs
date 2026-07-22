@@ -13,7 +13,7 @@
 //! [`ServerSessionCore::handle_input`].
 //!
 //! [`ForwardableFrame`] is a helper type describing an encoded voice
-//! frame ready for fan-out to N other connected clients — the
+//! frame ready for fan-out to N other connected clients; the
 //! fan-out engine uses it to avoid re-encoding the same bytes
 //! per destination.
 

@@ -55,7 +55,7 @@ impl MainThreadBroker {
     pub fn pump(&mut self) -> usize {
         let mut ran = 0;
         while let Ok((job, reply)) = self.rx.try_recv() {
-            // A dropped awaiter is fine — the job still ran.
+            // A dropped awaiter is fine; the job still ran.
             drop(reply.send(job()));
             ran += 1;
         }

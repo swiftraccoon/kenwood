@@ -10,7 +10,7 @@ use kenwood_thd75::protocol::Codec;
 use kenwood_thd75::transport::{SerialTransport, Transport};
 use std::io::Write as IoWrite;
 
-// Commands that are known writes/actions — SKIP these even if found
+// Commands that are known writes/actions: SKIP these even if found
 const DANGEROUS: &[&str] = &[
     "SR", // Reset
     "TX", // Transmit
@@ -19,7 +19,7 @@ const DANGEROUS: &[&str] = &[
     "DW", // Freq down (down button)
     "BE", // Beacon send (transmits!)
     "0M", // Programming mode
-    "BC", // With bare send could change band — actually BC bare is a read. Keep it.
+    "BC", // With bare send could change band. Actually BC bare is a read; keep it.
 ];
 
 async fn raw_cmd(transport: &mut SerialTransport, cmd: &str) -> Option<String> {
@@ -93,7 +93,7 @@ async fn scan_all_mnemonics() {
                 }
                 None => {
                     println!("  [{scanned:4}/{total}] {mnemonic} -> TIMEOUT/DISCONNECT");
-                    // Connection may be dead — try to continue
+                    // Connection may be dead; try to continue
                 }
             }
 

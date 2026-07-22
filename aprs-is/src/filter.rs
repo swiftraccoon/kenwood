@@ -22,7 +22,7 @@
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AprsIsFilter {
-    /// Range filter `r/lat/lon/distance_km` — packets from stations
+    /// Range filter `r/lat/lon/distance_km`: packets from stations
     /// within the given radius of the centre coordinate.
     Range {
         /// Centre latitude in degrees (positive = North).
@@ -32,7 +32,7 @@ pub enum AprsIsFilter {
         /// Radius in kilometres.
         distance_km: f64,
     },
-    /// Area / bounding-box filter `a/latN/lonW/latS/lonE` — packets
+    /// Area / bounding-box filter `a/latN/lonW/latS/lonE`: packets
     /// inside the rectangular area defined by NW and SE corner coords.
     Area {
         /// North-edge latitude.
@@ -44,20 +44,20 @@ pub enum AprsIsFilter {
         /// East-edge longitude.
         lon2: f64,
     },
-    /// Prefix filter `p/aa/bb/cc/…` — packets whose source callsign
+    /// Prefix filter `p/aa/bb/cc/…`: packets whose source callsign
     /// begins with any of the listed prefixes (case-insensitive).
     Prefix(Vec<String>),
-    /// Budlist filter `b/call1/call2/…` — packets from exactly these
+    /// Budlist filter `b/call1/call2/…`: packets from exactly these
     /// stations.
     Budlist(Vec<String>),
-    /// Object filter `o/obj1/obj2/…` — object reports with these
+    /// Object filter `o/obj1/obj2/…`: object reports with these
     /// names (substring match per the spec).
     Object(Vec<String>),
-    /// Strict-object filter `os/obj1/obj2/…` — like [`Self::Object`]
+    /// Strict-object filter `os/obj1/obj2/…`: like [`Self::Object`]
     /// but enforces 9-char object names and must be the last clause
     /// on the filter line per javAPRSFilter.html.
     StrictObject(Vec<String>),
-    /// Type filter `t/poimqstunw` — single-string of frame-type
+    /// Type filter `t/poimqstunw`: single-string of frame-type
     /// characters selecting which packet types to include.
     ///
     /// The spec set is exactly `p o i m q s t u n w` per the
@@ -76,7 +76,7 @@ pub enum AprsIsFilter {
     /// The string is passed through verbatim, so only these characters
     /// match server-side; any other letter selects nothing.
     Type(String),
-    /// Station-centric type filter `t/poimqstuw/call/km` — like
+    /// Station-centric type filter `t/poimqstuw/call/km`: like
     /// [`Self::Type`] but restricted to stations within `distance_km`
     /// of `callsign`.
     TypeAround {
@@ -87,7 +87,7 @@ pub enum AprsIsFilter {
         /// Radius in km.
         distance_km: f64,
     },
-    /// Symbol filter `s/pri/alt/over` — primary-table symbols,
+    /// Symbol filter `s/pri/alt/over`: primary-table symbols,
     /// alternate-table symbols, and overlay characters (each field
     /// is a string of single-char symbol codes; empty fields are
     /// allowed).
@@ -99,27 +99,27 @@ pub enum AprsIsFilter {
         /// Overlay characters.
         overlay: String,
     },
-    /// Digipeater filter `d/digi1/digi2/…` — packets digipeated by
+    /// Digipeater filter `d/digi1/digi2/…`: packets digipeated by
     /// any of the listed stations.
     Digi(Vec<String>),
-    /// Entry-station filter `e/call1/call2/…` — packets whose APRS-IS
+    /// Entry-station filter `e/call1/call2/…`: packets whose APRS-IS
     /// q-construct names any of the listed entry servers/IGates.
     Entry(Vec<String>),
-    /// Q-construct filter `q/con/…` — packets whose q-construct
+    /// Q-construct filter `q/con/…`: packets whose q-construct
     /// matches the listed letters. Each entry is the third character
     /// of a `qA?` construct (e.g. `R` selects `qAR`).
     QConstruct(String),
-    /// My-range filter `m/km` — packets within `distance_km` of the
+    /// My-range filter `m/km`: packets within `distance_km` of the
     /// client's *own* location (the server uses the position from the
     /// client's most recent position report).
     MyRange {
         /// Radius in km.
         distance_km: f64,
     },
-    /// Group-message filter `g/name1/name2/…` — bulletins addressed
+    /// Group-message filter `g/name1/name2/…`: bulletins addressed
     /// to any of the listed groups.
     Group(Vec<String>),
-    /// Friend filter `f/call/dist` — packets from stations within
+    /// Friend filter `f/call/dist`: packets from stations within
     /// `distance_km` of the listed friend callsign's last position.
     Friend {
         /// Station to centre on.
@@ -127,11 +127,11 @@ pub enum AprsIsFilter {
         /// Distance in km.
         distance_km: f64,
     },
-    /// Unproto / destination filter `u/proto1/proto2/…` — packets
+    /// Unproto / destination filter `u/proto1/proto2/…`: packets
     /// whose AX.25 destination address matches any of the listed
     /// tocalls (e.g. `APRS`, `APK005`).
     Unproto(Vec<String>),
-    /// Negated clause `-<clause>` — packets matching the inner clause
+    /// Negated clause `-<clause>`: packets matching the inner clause
     /// are **excluded** from delivery, even if another clause would
     /// have included them.
     Negated(Box<Self>),

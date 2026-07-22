@@ -261,7 +261,7 @@ fn signed_domain_bounds(field: &Value) -> TestResult<Option<(i64, i64)>> {
     }
 }
 
-/// Enum bounds first, then the declared domain, then the storage default —
+/// Enum bounds first, then the declared domain, then the storage default:
 /// the generator's resolution order for unsigned codec bounds.
 fn resolved_unsigned_bounds(
     menu: &Value,

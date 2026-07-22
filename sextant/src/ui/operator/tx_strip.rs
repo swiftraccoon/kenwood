@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! TX strip — TRANSMIT toggle, mic meter, slow-data message, GPS
+//! TX strip: TRANSMIT toggle, mic meter, slow-data message, GPS
 //! beacon. The always-visible bottom edge of the operator page.
 
 use eframe::egui;

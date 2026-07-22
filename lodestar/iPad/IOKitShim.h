@@ -3,7 +3,7 @@
 //
 // Bridging header for the iPad target. The iOS SDK ships the IOKit
 // user-client C API (public since iOS 16 for DriverKit apps) but no
-// Swift module map, so `import IOKit` fails — the bridging header is
+// Swift module map, so `import IOKit` fails; the bridging header is
 // the supported route to those declarations.
 
 #ifndef IOKitShim_h

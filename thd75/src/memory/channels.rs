@@ -360,7 +360,7 @@ impl<'a> ChannelWriter<'a> {
         )?;
 
         let mut buf = [0u8; NAME_ENTRY_SIZE];
-        // Zip is bounded by the shorter of buf (NAME_ENTRY_SIZE) and src — no indexing.
+        // Zip is bounded by the shorter of buf (NAME_ENTRY_SIZE) and src; no indexing.
         buf.iter_mut()
             .zip(name.as_bytes().iter())
             .for_each(|(b, &s)| *b = s);

@@ -50,8 +50,8 @@ abstractions that compose:
 
 ### 2.1 The codec (`codec/`)
 
-The codec module contains three submodules — `dplus`, `dextra`, and
-`dcs` — each of which exports pure functions: encoders like
+The codec module contains three submodules (`dplus`, `dextra`, and
+`dcs`), each of which exports pure functions: encoders like
 `encode_voice_header`, `encode_voice_data`, and `encode_voice_eot`,
 decoders like `decode_server_to_client` and
 `decode_client_to_server`, plus DPlus's `parse_auth_response`.
@@ -103,17 +103,17 @@ correctness risk lives.
 Errors are layered, not flattened. Each crate owns its error types,
 and higher layers wrap lower-layer errors with context:
 
-- `dstar-gateway-core::Error` — codec, validator, and state-machine
+- `dstar-gateway-core::Error`: codec, validator, and state-machine
   errors. No variant ever holds a tokio type or an `io::Error`.
-- `dstar-gateway::ShellError` — wraps the core error (`Core`) and
+- `dstar-gateway::ShellError`: wraps the core error (`Core`) and
   channel/task closure (`SessionClosed`). The legacy
   `DisconnectTimeout` variant is retained but not returned by the
   current shell; timeout outcomes arrive as disconnect events.
-- `dstar-gateway::AuthError` — TCP-auth-specific cases: `Io` (tagged
+- `dstar-gateway::AuthError` covers the TCP-auth-specific cases: `Io` (tagged
   with the connect/write/read operation), `Timeout` (tagged with the
   phase), and `Parse`, which wraps a `DPlusError` from the auth
   response parser.
-- `dstar-gateway-server::ShellError` — wraps the core error (`Core`)
+- `dstar-gateway-server::ShellError`: wraps the core error (`Core`)
   plus `Protocol(String)` (framing and unexpected-variant failures, which
   also carry the endpoint-task-aborted case) and `Io`.
 
@@ -127,7 +127,7 @@ Every codec decoder takes a `&mut dyn DiagnosticSink`. When the
 codec encounters a field that is malformed but recoverable (e.g. a
 trailing byte after a well-formed packet, a reserved bit set, a
 UTF-8 suffix that isn't canonical) it calls `sink.record(diagnostic)`
-— where `Diagnostic` is an enum variant — rather than returning an
+(where `Diagnostic` is an enum variant) rather than returning an
 error. `DiagnosticSink::record` returns `()`, so a decoder never
 fails on a recoverable quirk.
 
@@ -149,9 +149,9 @@ See ADR 0004.
 ## 6. The tokio shell model
 
 `dstar-gateway::tokio_shell::AsyncSession<P>` is the user-facing
-handle. Internally it owns three channels — a command channel, an
+handle. Internally it owns three channels: a command channel, an
 event channel, and a peer-activity `watch` channel (`activity_rx`)
-that surfaces link-health timing — and spawns a `SessionLoop` task
+that surfaces link-health timing. It also spawns a `SessionLoop` task
 that owns the `UdpSocket` and the `Session<P, Connected>`.
 
 The driver loop is a `select!` that reads from the socket, advances
@@ -168,7 +168,7 @@ session; call it to obtain a host list, attach that list with
 
 `dstar-gateway-server::Reflector` owns a `ProtocolEndpoint<P>` per
 enabled protocol. An endpoint owns:
-- a `ClientPool<P>` — a hash map from peer `SocketAddr` to
+- a `ClientPool<P>`: a hash map from peer `SocketAddr` to
   `ServerSessionCore` wrapped in a `ClientHandle<P>`, with a
   reverse index from `Module` to `HashSet<SocketAddr>`
 - a `UdpSocket`
@@ -197,19 +197,19 @@ dstar-gateway maintains an 8-tier test pyramid:
    test.
 2. **Property tests** (`proptest`) for encoder/decoder pairs:
    generate random input, round-trip, and assert the documented invariant.
-3. **Golden fixtures** — raw bytes captured from ircDDBGateway and
+3. **Golden fixtures**: raw bytes captured from ircDDBGateway and
    xlxd, committed to the tree, parsed by every codec test.
-4. **Loopback integration tests** — full tokio shell +
+4. **Loopback integration tests**: full tokio shell +
    `FakeReflector` over a real loopback UDP socket. One per
    protocol covers connect / voice / disconnect round-trips.
-5. **Compile-fail tests** (`trybuild`) — snapshots of rustc errors
+5. **Compile-fail tests** (`trybuild`): snapshots of rustc errors
    that verify the typestate actually prevents invalid transitions.
-6. **Fuzz targets** — ten `cargo-fuzz` harnesses covering parser
+6. **Fuzz targets**: ten `cargo-fuzz` harnesses covering parser
    entry points and exercised by the fuzz workflow.
-7. **Conformance pcap replay** — a `pcap-parser` harness that
+7. **Conformance pcap replay**: a `pcap-parser` harness that
    feeds captured UDP traffic through every codec. The corpus
    itself is external; the runner is in-tree.
-8. **Live-reflector integration** — ignored tests that connect to
+8. **Live-reflector integration**: ignored tests that connect to
    real reflectors, plus an explicitly opted-in short voice burst. Gated
    behind the `hardware-tests` feature + `#[ignore]` + an opt-in
    `DSTAR_TEST_TX_OK` env var so nobody accidentally keys the air.
@@ -219,12 +219,12 @@ compile-fail cases. Full runtime varies by host and feature matrix.
 
 ## Further reading
 
-- [`REFERENCES.md`](REFERENCES.md) — every reference we made to
+- [`REFERENCES.md`](REFERENCES.md): every reference we made to
   ircDDBGateway or xlxd, pinned to a commit hash.
-- [`adr/`](adr/) — architectural decision records. Read
+- [`adr/`](adr/): architectural decision records. Read
   `0001-sans-io.md` and `0002-typestate.md` first if you want to
   understand *why* the core is shaped the way it is.
-- [`book/`](book/) — mdBook source for a longer narrative version of
+- [`book/`](book/): mdBook source for a longer narrative version of
   the above. It currently covers the introduction and Getting Started;
   the remaining chapters are unwritten. Build it locally with
   `mdbook serve book`.

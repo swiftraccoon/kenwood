@@ -11,7 +11,7 @@ and a metadata JSON (callsigns, timing, signal quality, GPS).
 Create `stargazer.toml`:
 
 ```toml
-callsign = "N0CALL"            # your callsign — reflector login + DPlus auth
+callsign = "N0CALL"            # your callsign: reflector login + DPlus auth
 recordings_dir = "recordings"  # created if missing
 write_wav = true               # decoded WAV alongside the raw AMBE
 local_module = "D"             # module letter presented in rpt1 (A-E)
@@ -50,7 +50,7 @@ exponential backoff. `--verbose` enables per-frame debug logging.
 | `local_module` | `"D"` | Local module letter in rpt1 (A–E; other letters are silently dropped by xlxd-derived reflectors) |
 | `[[record]].reflector` | *required* | Reflector callsign, e.g. `"REF030"` (also the wire callsign for DCS) |
 | `[[record]].protocol` | *required* | `dplus`, `dextra`, or `dcs` |
-| `[[record]].host` | *required* | Host name or IP — always explicit, there is no discovery |
+| `[[record]].host` | *required* | Host name or IP; always explicit, there is no discovery |
 | `[[record]].port` | per protocol | `dplus` 20001, `dextra` 30001, `dcs` 30051 |
 | `[[record]].modules` | *required* | Module letters (A–Z); each gets its own session |
 
@@ -81,7 +81,7 @@ never a torn recording.
 
 ## File formats
 
-### `.ambe` — raw frame container
+### `.ambe`: raw frame container
 
 Everything the reflector sent for the stream, exactly as it arrived.
 All integers little-endian.
@@ -101,7 +101,7 @@ Records (13 bytes each, arrival order):
 This file is the canonical archive: the decoded WAV, per-frame FEC
 error counts, codec parameters for vocoder-domain ASR, and any future
 (better) decode are all deterministic re-derivations from it. It costs
-about 650 bytes per second of speech — roughly 2.3 MB per hour of
+about 650 bytes per second of speech, roughly 2.3 MB per hour of
 continuous talk.
 
 ### `.wav`
@@ -110,7 +110,7 @@ continuous talk.
 gaps) are filled with the decoder's concealment output so the audio
 timeline matches the transmission's codec time.
 
-### `.json` — metadata (schema `stargazer-recording/1`)
+### `.json`: metadata (schema `stargazer-recording/1`)
 
 ```json
 {
@@ -164,7 +164,7 @@ Field notes:
   first-class recordings with honest metadata, not discarded.
 - `header` is `null` when no voice header was ever received.
 - `frames.gaps` counts frames missing from the sequence; `fec` sums
-  Golay/ECC corrections across the stream — both are quality indexes
+  Golay/ECC corrections across the stream; both are quality indexes
   whose ground truth remains the `.ambe` file.
 - `slow_data.text` is the radio's 20-character TX message; when the
   message is not clean printable ASCII (Japanese radios commonly send
@@ -184,9 +184,9 @@ cargo run -p stargazer -- report             # rank reflector modules, last 24 h
 cargo run -p stargazer -- report --window-hours 6
 ```
 
-The survey polls the [NJ6N DPLUSMON](https://nj6n.com/dplusmon/) feed —
-a volunteer-run monitor that republishes every transmission on the
-DPLUS network — rather than probing reflectors directly: no client
+The survey polls the [NJ6N DPLUSMON](https://nj6n.com/dplusmon/) feed
+(a volunteer-run monitor that republishes every transmission on the
+DPLUS network) rather than probing reflectors directly: no client
 slots are consumed and no reflector sees a single extra packet. Please
 be a good guest of that service too: the default 60-second interval is
 gentler than one open browser tab of its own web UI (which polls every
@@ -196,9 +196,9 @@ and the tool identifies itself in its User-Agent.
 The feed is a rolling ~30-row window, so history evaporates unless
 kept. The survey archives everything it observes under `survey/dplusmon/`:
 
-- `raw/<date>/<timestamp>.html` — every response, verbatim, before parsing
-- `activity.jsonl` — append-only deduplicated transmission events
-- `polls.jsonl` — per-poll provenance (row counts, window span, and a
+- `raw/<date>/<timestamp>.html`: every response, verbatim, before parsing
+- `activity.jsonl`: append-only deduplicated transmission events
+- `polls.jsonl`: per-poll provenance (row counts, window span, and a
   `gap_risk` flag when the window may have rolled over between polls)
 
 `report` reads the accumulated archive and ranks reflector modules by
@@ -209,7 +209,7 @@ survey runs, the more meaningful the ranking.
 
 Decoded audio is a one-way door: MP3/WAV destroys the codec
 parameters. The raw 9-byte frames preserve everything the RF channel
-delivered — they can be re-decoded forever with improving decoders,
+delivered: they can be re-decoded forever with improving decoders,
 and they are exactly the input that vocoder-parameter speech
 recognition consumes (models that read AMBE/IMBE codec parameters
 directly instead of reconstructed audio). The WAV exists for humans;

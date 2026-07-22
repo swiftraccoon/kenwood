@@ -17,7 +17,7 @@ pub const DEFAULT_PORT: u16 = 20001;
 /// (`m_pollTimer(1000U, 1U)` = 1 second).
 /// Reference: `xlxd/src/main.h:94` (`DPLUS_KEEPALIVE_PERIOD = 1`).
 ///
-/// **The legacy `dstar-gateway` crate ships 5s — that is the bug
+/// **The legacy `dstar-gateway` crate ships 5s; that is the bug
 /// the audit found.** This rewrite uses 1s to match both references.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -28,13 +28,13 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// reflector links).
 pub const KEEPALIVE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `DPlus` voice inactivity timeout — synthesize `VoiceEnd` after this.
+/// `DPlus` voice inactivity timeout: synthesize `VoiceEnd` after this.
 ///
 /// Reference: `ircDDBGateway/Common/DStarDefines.h:122`
 /// (`NETWORK_TIMEOUT = 2U`).
 pub const VOICE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// `DPlus` disconnect ACK timeout — give up waiting for unlink reply.
+/// `DPlus` disconnect ACK timeout: give up waiting for unlink reply.
 pub const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Number of times the initial connect packet is retransmitted.
@@ -77,13 +77,13 @@ pub const UNLINK_BYTES: [u8; 5] = [0x05, 0x00, 0x18, 0x00, 0x00];
 /// (`EncodeKeepAlivePacket`).
 pub const POLL_BYTES: [u8; 3] = [0x03, 0x60, 0x00];
 
-/// LINK1 ACK echo — server replies with the same bytes as LINK1.
+/// LINK1 ACK echo: server replies with the same bytes as LINK1.
 pub const LINK1_ACK_BYTES: [u8; 5] = LINK1_BYTES;
 
-/// UNLINK ACK echo — server replies with the same bytes as UNLINK.
+/// UNLINK ACK echo: server replies with the same bytes as UNLINK.
 pub const UNLINK_ACK_BYTES: [u8; 5] = UNLINK_BYTES;
 
-/// Poll echo — server replies with the same bytes as POLL.
+/// Poll echo: server replies with the same bytes as POLL.
 pub const POLL_ECHO_BYTES: [u8; 3] = POLL_BYTES;
 
 /// LINK2 reply tag for accept (4 bytes at offsets `[4..8]` of an

@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use dstar_gateway_server::ReflectorConfig;
 
 fn main() {
-    // Missing callsign — only 2 of 3 required fields set.
+    // Missing callsign: only 2 of 3 required fields set.
     let builder = ReflectorConfig::builder()
         .module_set(HashSet::new())
         .bind("0.0.0.0:0".parse().unwrap());

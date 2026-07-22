@@ -38,7 +38,7 @@ struct NowTransmittingPane: View {
                 // Slow-data fields are always rendered so the card's
                 // footprint is stable across the transmit / idle /
                 // text-arrives-first / position-arrives-first sequence.
-                // An empty value renders as a tertiary `—`, matching
+                // An empty value renders as a tertiary "None", matching
                 // the callsign rows above.
                 slowDataRow(
                     icon: "text.bubble",
@@ -118,7 +118,7 @@ struct NowTransmittingPane: View {
                 Button {
                     poppedStation = StationRef(stream: s)
                 } label: {
-                    Text(value.isEmpty ? "—" : value)
+                    Text(value.isEmpty ? "None" : value)
                         .font(.body.monospaced())
                         .underline(pattern: .dot)
                         .contentShape(.rect)
@@ -126,7 +126,7 @@ struct NowTransmittingPane: View {
                 .buttonStyle(.plain)
                 .accessibilityHint("Shows station details and actions")
             } else {
-                Text(value.isEmpty ? "—" : value)
+                Text(value.isEmpty ? "None" : value)
                     .font(.body.monospaced())
                     .foregroundStyle(value.isEmpty ? .tertiary : .primary)
             }
@@ -153,7 +153,7 @@ struct NowTransmittingPane: View {
             } else {
                 Color.clear.frame(width: 30)
             }
-            Text(isEmpty ? "—" : value)
+            Text(isEmpty ? "None" : value)
                 .font(monospaced ? .callout.monospaced() : .callout)
                 .foregroundStyle(isEmpty ? .tertiary : .primary)
                 .textSelection(.enabled)

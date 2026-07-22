@@ -33,47 +33,47 @@ pub(crate) enum RadioCommand {
         /// The frequency in Hz.
         freq: u32,
     },
-    /// Set the squelch level for the given band (SQ write — verified working).
+    /// Set the squelch level for the given band (SQ write: verified working).
     SetSquelch {
         band: kenwood_thd75::types::Band,
         level: kenwood_thd75::types::SquelchLevel,
     },
-    /// Toggle the attenuator for the given band (RA write — verified working).
+    /// Toggle the attenuator for the given band (RA write: verified working).
     SetAttenuator {
         band: kenwood_thd75::types::Band,
         enabled: bool,
     },
-    /// Set the operating mode for the given band (MD write — may return N in some modes).
+    /// Set the operating mode for the given band (MD write: may return N in some modes).
     SetMode {
         band: kenwood_thd75::types::Band,
         mode: kenwood_thd75::types::Mode,
     },
-    /// Toggle lock on/off (LC write — verified working, value inverted on D75).
+    /// Toggle lock on/off (LC write: verified working, value inverted on D75).
     SetLock(bool),
-    /// Toggle dual band on/off (DL write — verified working, value inverted on D75).
+    /// Toggle dual band on/off (DL write: verified working, value inverted on D75).
     SetDualBand(bool),
-    /// Toggle bluetooth on/off (BT write — verified working).
+    /// Toggle bluetooth on/off (BT write: verified working).
     SetBluetooth(bool),
-    /// Toggle VOX on/off (VX write — verified working).
+    /// Toggle VOX on/off (VX write: verified working).
     SetVox(bool),
-    /// Set VOX gain (VG write — verified working).
+    /// Set VOX gain (VG write: verified working).
     SetVoxGain(kenwood_thd75::types::VoxGain),
-    /// Set VOX delay (VD write — verified working).
+    /// Set VOX delay (VD write: verified working).
     SetVoxDelay(kenwood_thd75::types::VoxDelay),
-    /// Set TNC baud rate (AS write — verified working).
+    /// Set TNC baud rate (AS write: verified working).
     SetTncBaud(kenwood_thd75::types::TncBaud),
-    /// Set beacon type (PT write — verified working).
+    /// Set beacon type (PT write: verified working).
     SetBeaconType(kenwood_thd75::types::BeaconMode),
-    /// Set GPS config (GP write — verified working).
+    /// Set GPS config (GP write: verified working).
     SetGpsConfig(bool, bool),
-    /// Set FM radio on/off (FR write — verified working).
+    /// Set FM radio on/off (FR write: verified working).
     SetFmRadio(bool),
-    /// Set the step size for the given band (SF write — verified working).
+    /// Set the step size for the given band (SF write: verified working).
     SetStepSize {
         band: kenwood_thd75::types::Band,
         step: kenwood_thd75::types::StepSize,
     },
-    /// Set the scan resume method (SR write — write-only on D75).
+    /// Set the scan resume method (SR write: write-only on D75).
     SetScanResumeCat(kenwood_thd75::types::ScanResumeMethod),
     /// Write a single byte to MCP memory via `modify_memory_page`.
     /// Enters MCP mode, modifies one byte, exits. USB drops and reconnects.
@@ -157,7 +157,7 @@ impl EventHandler {
         // Spawn a dedicated thread for blocking crossterm event polling.
         // This avoids blocking a tokio worker thread. A poll/read error
         // (terminal detached, tty closed) means keyboard input is gone
-        // for good — request an app quit rather than dying silently in
+        // for good: request an app quit rather than dying silently in
         // this background thread.
         let input_tx = tx.clone();
         let _handle = std::thread::spawn(move || {

@@ -14,9 +14,9 @@ use crate::error::KissError;
 /// port or a command the encoder cannot represent on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KissFrame {
-    /// TNC port — the high nibble of the type byte. `0` for the TH-D75.
+    /// TNC port: the high nibble of the type byte. `0` for the TH-D75.
     pub port: KissPort,
-    /// KISS command — the low nibble of the type byte, or the
+    /// KISS command: the low nibble of the type byte, or the
     /// whole-byte [`KissCommand::Return`].
     pub command: KissCommand,
     /// Frame payload (e.g. an AX.25 frame for [`KissCommand::Data`]).
@@ -37,7 +37,7 @@ impl KissFrame {
         }
     }
 
-    /// Build a KISS `Return` frame — the exit-KISS-mode command (`0xFF`).
+    /// Build a KISS `Return` frame, the exit-KISS-mode command (`0xFF`).
     #[must_use]
     pub const fn return_command() -> Self {
         Self {

@@ -12,13 +12,13 @@ use crate::error::ShellError;
 pub(crate) enum Command {
     /// Send a `GetVersion` request.
     GetVersion {
-        /// Reply channel — `Ok(())` once the request is framed and
+        /// Reply channel: `Ok(())` once the request is framed and
         /// written to the transport.
         reply: oneshot::Sender<Result<(), ShellError>>,
     },
     /// Send a `GetStatus` request.
     GetStatus {
-        /// Reply channel — `Ok(())` once the request is framed and
+        /// Reply channel: `Ok(())` once the request is framed and
         /// written to the transport.
         reply: oneshot::Sender<Result<(), ShellError>>,
     },
@@ -26,7 +26,7 @@ pub(crate) enum Command {
     SetMode {
         /// Target mode.
         mode: ModemMode,
-        /// Reply channel — resolved with the modem's ACK/NAK for the
+        /// Reply channel, resolved with the modem's ACK/NAK for the
         /// mode change, not merely with the write result.
         reply: oneshot::Sender<Result<(), ShellError>>,
     },
@@ -38,7 +38,7 @@ pub(crate) enum Command {
     SendDStarHeader {
         /// The 41 header bytes.
         bytes: [u8; 41],
-        /// Reply channel — `Ok(())` once the frame has been queued.
+        /// Reply channel: `Ok(())` once the frame has been queued.
         reply: oneshot::Sender<Result<(), ShellError>>,
     },
     /// Enqueue a D-STAR voice data frame (12 bytes).
@@ -53,7 +53,7 @@ pub(crate) enum Command {
         /// Reply channel.
         reply: oneshot::Sender<Result<(), ShellError>>,
     },
-    /// Send a raw frame — escape hatch for modes we haven't modelled
+    /// Send a raw frame: escape hatch for modes we haven't modelled
     /// yet.
     SendRaw {
         /// The command byte.
@@ -65,7 +65,7 @@ pub(crate) enum Command {
     },
     /// Trigger graceful shutdown of the loop.
     Shutdown {
-        /// Reply channel — fires when the loop acknowledges the
+        /// Reply channel, fired when the loop acknowledges the
         /// shutdown request.
         reply: oneshot::Sender<()>,
     },

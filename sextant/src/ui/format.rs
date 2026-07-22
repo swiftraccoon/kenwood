@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Display formatting helpers — relative times and elapsed timers.
+//! Display formatting helpers: relative times and elapsed timers.
 
 /// Compact relative-time for heard-list rows: "now" under 5 s,
 /// `M:SS` under an hour, `Hh MMm` beyond.
@@ -40,7 +40,7 @@ pub(crate) fn fmt_time_hms(ts: time::OffsetDateTime, offset: time::UtcOffset) ->
 }
 
 /// QRZ.com database URL for a callsign. Strips the SSID/suffix part
-/// (anything from the first space or `/`) — QRZ indexes base calls.
+/// (anything from the first space or `/`) because QRZ indexes base calls.
 pub(crate) fn qrz_url(callsign: &str) -> String {
     let base: String = callsign
         .trim()

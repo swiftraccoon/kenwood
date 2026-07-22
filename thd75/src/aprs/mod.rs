@@ -1,10 +1,10 @@
 //! TH-D75-specific APRS integration.
 //!
 //! Generic packet-radio protocols live in their own workspace crates:
-//! - [`kiss_tnc`] — KISS TNC wire framing.
-//! - [`ax25_codec`] — AX.25 frame codec.
-//! - [`aprs`] — APRS parser, digipeater, `SmartBeaconing`, messaging, station list.
-//! - [`aprs_is`] — APRS-IS TCP client.
+//! - [`kiss_tnc`]: KISS TNC wire framing.
+//! - [`ax25_codec`]: AX.25 frame codec.
+//! - [`aprs`]: APRS parser, digipeater, `SmartBeaconing`, messaging, station list.
+//! - [`aprs_is`]: APRS-IS TCP client.
 //!
 //! This module contains only the D75-specific glue: [`client::AprsClient`]
 //! owning a [`Radio`](crate::Radio) and [`KissSession`](crate::KissSession);

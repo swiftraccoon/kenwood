@@ -23,8 +23,8 @@ use crate::error::ProtocolError;
 /// Command to enter MCP programming mode (ASCII).
 ///
 /// The leading carriage return terminates any stale, unterminated
-/// command sitting in the radio's CAT line buffer — for example an
-/// MMDVM-detection probe (`E0 03 00`) sent just before — so it cannot
+/// command sitting in the radio's CAT line buffer, for example an
+/// MMDVM-detection probe (`E0 03 00`) sent just before, so it cannot
 /// be prepended to `0M PROGRAM` and corrupt the handshake. This mirrors
 /// the `\r`-prefixed preamble `Radio::connect_safe` uses; the radio
 /// treats the empty leading line as a no-op.
@@ -541,7 +541,7 @@ mod tests {
             clippy::assertions_on_constants,
             reason = "Regression guard: if any region offset constant is edited to overlap with \
                       a neighbour, these asserts must fail. Clippy warns because the constants \
-                      are known at compile time; that's exactly the point — we want a test \
+                      are known at compile time; that's exactly the point: we want a test \
                       failure if someone silently breaks the memory map."
         )]
         {

@@ -6,7 +6,7 @@
 //! DPLUSMON (`nj6n.com/dplusmon`) republishes every transmission on
 //! the DPLUS (REF reflector) network as a rolling ~30-row last-heard
 //! table. Polling that one volunteer-run endpoint is the gentlest way
-//! to measure per-reflector voice activity — no reflector is probed,
+//! to measure per-reflector voice activity: no reflector is probed,
 //! no client slot consumed. The feed is a sliding window, so history
 //! evaporates unless archived: every fetch is stored verbatim, parsed
 //! events append to a deduplicated JSONL log, and every poll writes a
@@ -30,7 +30,7 @@ const USER_AGENT: &str = concat!(
     " (amateur radio activity research)"
 );
 
-/// Minimum allowed poll interval — the feed's own web UI polls every
+/// Minimum allowed poll interval. The feed's own web UI polls every
 /// 15 s per viewer; we never go below twice that.
 pub const MIN_INTERVAL_SECS: u64 = 30;
 
@@ -92,7 +92,7 @@ pub struct PollRecord {
     pub window_newest: Option<DateTime<Utc>>,
     /// True when the window may have overflowed since the previous
     /// poll (no overlap: every row is newer than the previous poll's
-    /// newest row) — rows may have been missed.
+    /// newest row); rows may have been missed.
     pub gap_risk: bool,
     /// Fetch/parse error, if the poll failed.
     pub error: Option<String>,
@@ -387,7 +387,7 @@ impl Surveyor {
     /// # Errors
     ///
     /// Archive I/O errors are fatal (the archive is the point).
-    /// Fetch errors are NOT returned as `Err` — they are recorded in
+    /// Fetch errors are NOT returned as `Err`; they are recorded in
     /// the poll log and reflected in the returned record, so the
     /// caller can back off without losing provenance.
     pub async fn poll_once(&mut self) -> Result<PollRecord, SurveyError> {

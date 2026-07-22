@@ -144,7 +144,7 @@ async fn mock_reopen_reachable_through_trait() -> TestResult {
     Ok(())
 }
 
-/// A transport whose write never resolves — models a platform write
+/// A transport whose write never resolves, modelling a platform write
 /// wedged against a dying link (macOS `IOBluetooth` `writeSync:` on a
 /// rebooting radio never returns).
 #[derive(Debug)]
@@ -189,7 +189,7 @@ fn build_w_response(page: u16, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::erro
 
 /// Leaving MCP programming mode drops the USB link; the exit path now
 /// waits out the settle period, reopens the transport, and
-/// re-identifies — so CAT works immediately after any MCP operation.
+/// re-identifies, so CAT works immediately after any MCP operation.
 #[tokio::test(start_paused = true)]
 async fn mcp_exit_reconnects_and_cat_works() -> TestResult {
     use kenwood_thd75::protocol::programming;

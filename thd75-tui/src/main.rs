@@ -59,7 +59,7 @@ enum RunOutcome {
 }
 
 /// Set up file logging when `RUST_LOG` is present. A read-only cwd
-/// must not abort the TUI just because `RUST_LOG` was set — run
+/// must not abort the TUI just because `RUST_LOG` was set: run
 /// without file logging and say so.
 fn init_logging() {
     if std::env::var("RUST_LOG").is_ok() {
@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 unsafe_code,
                 reason = "macOS IOBluetooth RFCOMM delivers packet callbacks on the main \
                           thread's CFRunLoop, so a non-Cocoa binary must pump that run loop \
-                          itself — otherwise incoming BT frames never arrive. The Rust \
+                          itself; otherwise incoming BT frames never arrive. The Rust \
                           ecosystem has no safe wrapper for CFRunLoopRunInMode; this is \
                           Apple's only documented API for pumping the run loop from a \
                           non-Cocoa binary. `seconds=0.01` keeps the main thread responsive \

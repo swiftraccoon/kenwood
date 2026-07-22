@@ -47,7 +47,7 @@ tracing-appender = "0.2"
 # use it directly here only to format the UTC session-start timestamp
 # that names the log file (second granularity), and to print that same
 # path in the startup message so users can copy-paste the real
-# filename for bug reports. No rotating appender is in play — each
+# filename for bug reports. No rotating appender is in play; each
 # invocation gets one fresh file via `File::create`.
 time = { version = "0.3", default-features = false, features = [
   "formatting",
@@ -58,7 +58,7 @@ dirs-next = "2"
 
 # KNOWN DIVERGENCE FROM WORKSPACE: a crate-local [lints.<group>] block
 # fully REPLACES the workspace block (no merge). Both blocks below
-# restate the workspace policy in full — the only differences are the
+# restate the workspace policy in full; the only differences are the
 # workspace-allowed lints restated explicitly (module_name_repetitions,
 # multiple_crate_versions, redundant_pub_crate). This crate contains no
 # FFI and keeps `unsafe_code = "forbid"`.
@@ -89,10 +89,10 @@ undocumented_unsafe_blocks = "deny"
 missing_assert_message = "deny"
 missing_const_for_fn = "deny"
 indexing_slicing = "deny"
-# `#[allow]` ban — see root workspace.lints.clippy for rationale.
+# `#[allow]` ban: see root workspace.lints.clippy for rationale.
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
-# Forward-protection lints — mirror the workspace block exactly.
+# Forward-protection lints: mirror the workspace block exactly.
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"

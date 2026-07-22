@@ -1,6 +1,6 @@
 name: Lodestar
 # Optional machine-local overrides (signing team for device deploys).
-# The file is gitignored; absence is fine — CI builds stay ad-hoc.
+# The file is gitignored; absence is fine: CI builds stay ad-hoc.
 include:
   - path: project-local.yml
     optional: true
@@ -52,7 +52,7 @@ targets:
     dependencies:
       - framework: LodestarKit.xcframework
         embed: false
-      # IOKit user-client C API (IOServiceOpen / IOConnectCall*) —
+      # IOKit user-client C API (IOServiceOpen / IOConnectCall*),
       # public on iOS 16+ for DriverKit host apps.
       - sdk: IOKit.framework
       # Embed the dext at <App>.app/SystemExtensions/<dext>.dext.
@@ -98,7 +98,7 @@ targets:
         PRODUCT_MODULE_NAME: Lodestar
         PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.lodestar.ipad
         # IOKit's user-client C API is public on iOS 16+ but the SDK has
-        # no Swift module for it — bridge the headers in.
+        # no Swift module for it; bridge the headers in.
         SWIFT_OBJC_BRIDGING_HEADER: iPad/IOKitShim.h
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_ENTITLEMENTS: iPad/Lodestar.entitlements
@@ -111,7 +111,7 @@ targets:
   LodestarDriver:
     type: driver-extension
     # DriverKit dexts compile against the `driverkit` SDK, NOT
-    # `iphoneos` — they're a separate toolchain even though they run
+    # `iphoneos`: they're a separate toolchain even though they run
     # on iPadOS. xcodegen's `platform:` field maps to SUPPORTED_PLATFORMS
     # so we override below.
     platform: iOS
@@ -128,13 +128,13 @@ targets:
         TARGETED_DEVICE_FAMILY: "2"
         PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.lodestar.ipad.driver
         # The dext's hand-written Info.plist holds the IOKitPersonalities
-        # dict matching TH-D75 — too nested to express in project.yml's
+        # dict matching TH-D75, too nested to express in project.yml's
         # `info.properties`, so reference it directly.
         INFOPLIST_FILE: Driver/Info.plist
         CODE_SIGN_ENTITLEMENTS: Driver/Driver.entitlements
         # DriverKit dexts use the `driverkit` SDK (Xcode 26.5 ships
         # `DriverKit25.5.sdk`). The same SDK builds for both macOS and
-        # iPadOS targets — iPadOS-vs-macOS distinction is at runtime
+        # iPadOS targets; the iPadOS-vs-macOS distinction is at runtime
         # via the deployment target rather than a separate sub-SDK.
         SDKROOT: driverkit
         SUPPORTED_PLATFORMS: driverkit
@@ -155,7 +155,7 @@ targets:
     dependencies:
       - framework: LodestarKit.xcframework
         embed: false
-      # Real macOS framework — works on native macOS target (unlike Catalyst).
+      # Real macOS framework; works on native macOS target (unlike Catalyst).
       - sdk: IOBluetooth.framework
     info:
       path: macOS/Info.plist

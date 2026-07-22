@@ -34,7 +34,7 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
       # rustdoc does not generate a root index.html when called with
-      # --workspace — each crate gets its own subdirectory. Without this
+      # --workspace; each crate gets its own subdirectory. Without this
       # redirect, https://<org>.github.io/kenwood/ returns 404 while
       # /kenwood_thd75/ etc. serve correctly. The content below is 100%
       # static (no GitHub event input interpolation) so no injection risk.

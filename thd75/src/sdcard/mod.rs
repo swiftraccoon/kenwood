@@ -47,7 +47,7 @@
 //!
 //! # Encoding
 //!
-//! All parsers accept `&[u8]` input — the caller decides how to read the
+//! All parsers accept `&[u8]` input; the caller decides how to read the
 //! file (e.g., `std::fs::read`, memory-mapped, etc.).
 //!
 //! The repeater list and callsign list use UTF-16LE encoding with a BOM.
@@ -234,7 +234,7 @@ impl std::error::Error for SdCardError {}
 
 /// Read a little-endian `u16` from a byte slice at the given offset.
 ///
-/// Returns `0` if the slice is too short — callers are expected to have
+/// Returns `0` if the slice is too short; callers are expected to have
 /// validated the buffer length against their wire-format constants.
 pub(crate) fn read_u16_le(data: &[u8], offset: usize) -> u16 {
     data.get(offset..offset + 2)
@@ -244,7 +244,7 @@ pub(crate) fn read_u16_le(data: &[u8], offset: usize) -> u16 {
 
 /// Read a little-endian `u32` from a byte slice at the given offset.
 ///
-/// Returns `0` if the slice is too short — callers are expected to have
+/// Returns `0` if the slice is too short; callers are expected to have
 /// validated the buffer length against their wire-format constants.
 pub(crate) fn read_u32_le(data: &[u8], offset: usize) -> u32 {
     data.get(offset..offset + 4)

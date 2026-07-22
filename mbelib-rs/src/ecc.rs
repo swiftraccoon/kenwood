@@ -4,7 +4,7 @@
 
 //! Error correction coding for AMBE 3600×2400 voice frames.
 //!
-//! AMBE 3600×2400 uses **Golay(23,12)** — a 3-error-correcting code —
+//! AMBE 3600×2400 uses **Golay(23,12)**, a 3-error-correcting code,
 //! on the C0 and C1 codewords. C0 carries the fundamental frequency
 //! index (the most perceptually critical parameter), so it receives
 //! the strongest protection. C1 carries the PRBA spectral coefficients.
@@ -213,7 +213,7 @@ fn golay_decode(in_bits: &[u8; 23]) -> ([u8; 23], u32) {
 /// AMBE frame.
 ///
 /// C0 carries the fundamental frequency index (b0), which is the most
-/// perceptually critical parameter — even a 1-bit error can shift the
+/// perceptually critical parameter; even a 1-bit error can shift the
 /// decoded pitch drastically. The 24-bit C0 consists of 1 overall
 /// parity bit at index 0, followed by 23 Golay-encoded bits at
 /// indices 1..24. This function corrects the 23 Golay bits in place.
@@ -261,11 +261,11 @@ pub(crate) fn ecc_c0(ambe_fr: &mut [u8; AMBE_FRAME_BITS]) -> u32 {
 ///
 /// This function performs three operations:
 ///
-/// 1. **C0 data extraction** — copies the 12 data bits from the
+/// 1. **C0 data extraction**: copies the 12 data bits from the
 ///    already-corrected C0 codeword (bits 12..23, MSB first).
-/// 2. **C1 Golay correction** — applies Golay(23,12) ECC to C1 and
+/// 2. **C1 Golay correction**: applies Golay(23,12) ECC to C1 and
 ///    extracts the 12 corrected data bits (MSB first).
-/// 3. **C2/C3 passthrough** — copies C2 (11 bits) and C3 (14 bits)
+/// 3. **C2/C3 passthrough**: copies C2 (11 bits) and C3 (14 bits)
 ///    verbatim, as the reference implementation does not apply any
 ///    FEC to these shorter codewords.
 ///
@@ -456,7 +456,7 @@ pub(crate) fn ecc_encode(ambe_d: &[u8; AMBE_DATA_BITS], ambe_fr: &mut [u8; AMBE_
         i += 1;
     }
     // Outer parity: XOR of all 23 Golay bits. mbelib decode ignores
-    // this bit, but real DVSI chips may check it — we compute it
+    // this bit, but real DVSI chips may check it; we compute it
     // correctly to be safe.
     let mut outer: u8 = 0;
     for &b in &c0_codeword {
@@ -597,7 +597,7 @@ mod tests {
     /// unmodified) and its error count reports corrected DATA bits,
     /// so a parity-only flip pattern legitimately reports zero.
     /// Sweeping every 1-, 2- and 3-bit pattern (2,047 masks) over a
-    /// spread of data words exercises every correctable syndrome — a
+    /// spread of data words exercises every correctable syndrome; a
     /// single corrupted `GOLAY_MATRIX` entry mis-corrects exactly one
     /// syndrome, which the hand-picked cases above cannot see.
     #[test]

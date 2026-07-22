@@ -6,7 +6,7 @@
 //! `.rs` source. The test suite fails if any file compiles
 //! successfully (the typestate has regressed).
 
-// Integration tests are separate compilation units — each one must
+// Integration tests are separate compilation units, so each one must
 // silence `unused_crate_dependencies` for workspace crates it doesn't
 // directly use. Only `trybuild` is actually referenced from the
 // runner, but the compile-fail test files under `tests/compile_fail/`

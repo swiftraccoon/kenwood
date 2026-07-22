@@ -1,6 +1,6 @@
 //! Compile-smoke for the `ModemConfig` stub.
 //!
-//! The full `SetConfig` wire encoder isn't implemented yet — this
+//! The full `SetConfig` wire encoder isn't implemented yet; this
 //! test exists only to ensure the public API surface compiles and
 //! that the struct fields can be freely mutated.
 
@@ -40,6 +40,6 @@ fn fields_are_writable() {
 fn copy_trait_works() {
     let c = ModemConfig::idle();
     let d = c;
-    // Both should still be usable — Copy semantics.
+    // Both should still be usable: Copy semantics.
     assert_eq!(c.mode, d.mode);
 }

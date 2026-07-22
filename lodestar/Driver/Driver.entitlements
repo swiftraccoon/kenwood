@@ -7,7 +7,7 @@
 	<true/>
 
 	<!-- USB transport entitlement. The development wildcard is a DICT
-	     with idVendor = "*" (String) — matching the shape the DriverKit
+	     with idVendor = "*" (String), matching the shape the DriverKit
 	     team provisioning profile grants. A bare <string>*</string> in
 	     the array does NOT match the profile and installd rejects the
 	     dext with 0xe8008015 "valid provisioning profile not found"

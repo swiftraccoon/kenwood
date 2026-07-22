@@ -6,7 +6,7 @@ use crate::position::{AprsPosition, parse_compressed_body, parse_uncompressed_bo
 
 /// An APRS object report (data type `;`).
 ///
-/// Objects represent entities that may not have their own radio —
+/// Objects represent entities that may not have their own radio:
 /// hurricanes, marathon runners, event locations. They include a
 /// name (9 chars), a live/killed flag, a timestamp, and a position.
 ///
@@ -35,7 +35,7 @@ pub struct AprsObject {
 
 /// An APRS item report (data type `)` ).
 ///
-/// Items are similar to objects but simpler — no timestamp. They
+/// Items are similar to objects but simpler (no timestamp). They
 /// represent static entities like event locations or landmarks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AprsItem {
@@ -61,7 +61,7 @@ pub enum AprsQuery {
     Message,
     /// Direction finding query (`?APRSD`).
     DirectionFinding,
-    /// Weather query (`?WX`) — request latest weather fields.
+    /// Weather query (`?WX`): request latest weather fields.
     Weather,
     /// Telemetry query (`?APRST` or `?APRST?`).
     Telemetry,
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn parse_item_short_name_rejected() {
-        // "AB" is only 2 characters — APRS101 requires 3-9.
+        // "AB" is only 2 characters; APRS101 requires 3-9.
         let info = b")AB!4903.50N/07201.75W-";
         assert!(
             matches!(parse_aprs_item(info), Err(AprsError::InvalidFormat)),

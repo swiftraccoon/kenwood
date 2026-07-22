@@ -8,8 +8,8 @@ use kenwood_thd75::types::*;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
-// weakening the lint. (`::aprs` — the `types::*` glob shadows the
-// bare crate name.)
+// weakening the lint. (`::aprs` is spelled that way because the
+// `types::*` glob shadows the bare crate name.)
 use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
@@ -35,7 +35,7 @@ fn strip_cr(bytes: &[u8]) -> Result<&[u8], Box<dyn std::error::Error>> {
 }
 
 // ============================================================================
-// ID — Radio model identification
+// ID: Radio model identification
 // ============================================================================
 
 #[test]
@@ -55,7 +55,7 @@ fn parse_id_response() -> TestResult {
 }
 
 // ============================================================================
-// FV — Firmware version
+// FV: Firmware version
 // ============================================================================
 
 #[test]
@@ -75,7 +75,7 @@ fn parse_fv_response() -> TestResult {
 }
 
 // ============================================================================
-// PS — Power status
+// PS: Power status
 // ============================================================================
 
 #[test]
@@ -105,7 +105,7 @@ fn parse_ps_off() -> TestResult {
 }
 
 // ============================================================================
-// BE — Beep on/off (moved to control tests, but keep basic test here)
+// BE: Beep on/off (moved to control tests, but keep basic test here)
 // ============================================================================
 
 #[test]
@@ -125,7 +125,7 @@ fn parse_be_response() -> TestResult {
 }
 
 // ============================================================================
-// PC — Power level
+// PC: Power level
 // ============================================================================
 
 #[test]
@@ -155,7 +155,7 @@ fn parse_pc_response() -> TestResult {
 }
 
 // ============================================================================
-// BC — Band read/set
+// BC: Band read/set
 // ============================================================================
 
 #[test]
@@ -171,7 +171,7 @@ fn serialize_bc_set() {
 }
 
 // ============================================================================
-// VM — VFO/Memory mode
+// VM: VFO/Memory mode
 // ============================================================================
 
 #[test]
@@ -211,7 +211,7 @@ fn serialize_vm_wx_mode() {
 }
 
 // ============================================================================
-// FR — FM radio on/off
+// FR: FM radio on/off
 // ============================================================================
 
 #[test]
@@ -241,7 +241,7 @@ fn parse_fr_response_on() -> TestResult {
 }
 
 // ============================================================================
-// FQ — Quick frequency
+// FQ: Quick frequency
 // ============================================================================
 
 #[test]
@@ -257,7 +257,7 @@ fn serialize_fq_read_band_b() {
 }
 
 // ============================================================================
-// FO — Full frequency and settings (21 comma-separated fields)
+// FO: Full frequency and settings (21 comma-separated fields)
 // ============================================================================
 
 #[test]
@@ -508,7 +508,7 @@ fn parse_fq_response_21_fields() -> TestResult {
 }
 
 // ============================================================================
-// FO — VFO mode extended values (shift=8, etc.)
+// FO: VFO mode extended values (shift=8, etc.)
 // ============================================================================
 
 #[test]
@@ -618,7 +618,7 @@ fn fo_vfo_tune_frequency_simulation() -> TestResult {
 }
 
 // ============================================================================
-// FQ — Short (2-field) response
+// FQ: Short (2-field) response
 // ============================================================================
 
 #[test]
@@ -635,7 +635,7 @@ fn parse_fq_short_response() -> TestResult {
 }
 
 // ============================================================================
-// VM — Parse response
+// VM: Parse response
 // ============================================================================
 
 #[test]
@@ -683,7 +683,7 @@ fn parse_vm_response_wx() -> TestResult {
 }
 
 // ============================================================================
-// BC — Parse response
+// BC: Parse response
 // ============================================================================
 
 #[test]

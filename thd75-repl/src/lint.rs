@@ -248,7 +248,7 @@ fn check_r12_units(line: &str, violations: &mut Vec<Violation>) {
                 clippy::indexing_slicing,
                 reason = "The `if offset == 0` guard above ensures `offset - 1` is \
                           non-negative when this branch runs, and `offset` came from \
-                          `find(unit)` on `bytes`, so `offset < bytes.len()` — the index \
+                          `find(unit)` on `bytes`, so `offset < bytes.len()`; the index \
                           is always in-bounds. Using `bytes.get(offset - 1)` and \
                           unwrapping would add noise without catching a real bug."
             )]
@@ -406,7 +406,7 @@ mod tests {
         // A blank line in the middle of the output should be visible
         // to check_line (which currently accepts it because the stub
         // always returns Ok, but once rule logic lands this test
-        // becomes meaningful — e.g. R1 must still run on the blank
+        // becomes meaningful; e.g. R1 must still run on the blank
         // line to confirm it has no control characters).
         //
         // This test locks in the fix for the bug where
@@ -421,7 +421,7 @@ mod tests {
         // Double trailing newline means there IS an intentional blank
         // as the final line. It should be checked, not silently dropped.
         // With `split('\n')` on `"a\n\n"` after stripping one `\n`, we
-        // get ["a", ""] — two lines, both processed.
+        // get ["a", ""]: two lines, both processed.
         let result = check_output("a\n\n");
         assert!(result.is_ok());
     }

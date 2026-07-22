@@ -70,7 +70,7 @@ enum Cmd {
         /// Recordings directory (as written by the recorder).
         #[arg(long, default_value = "recordings")]
         recordings: PathBuf,
-        /// Date to harvest, YYYY-MM-DD (UTC). Defaults to today —
+        /// Date to harvest, YYYY-MM-DD (UTC). Defaults to today;
         /// published retention is short, so harvest same-day.
         #[arg(long, value_parser = parse_date)]
         date: Option<chrono::NaiveDate>,
@@ -84,7 +84,7 @@ enum Cmd {
         /// Maximum downloads this run.
         #[arg(long)]
         limit: Option<usize>,
-        /// Match and report only — download and write nothing.
+        /// Match and report only; download and write nothing.
         #[arg(long)]
         dry_run: bool,
         /// Operator callsign advertised in the User-Agent so server
@@ -179,7 +179,7 @@ async fn main() -> ExitCode {
             dry_run,
             operator,
         }) => {
-            // Identify the responsible operator in the User-Agent —
+            // Identify the responsible operator in the User-Agent:
             // explicit flag first, recorder config as the fallback.
             let operator = operator.or_else(|| {
                 stargazer::config::load(&args.config)
@@ -249,7 +249,7 @@ async fn ctl(config_path: &std::path::Path, action: CtlAction) -> ExitCode {
             tracing::error!(
                 socket = %socket.display(),
                 error = %e,
-                "cannot reach the recorder — is it running (with control support)?"
+                "cannot reach the recorder; is it running (with control support)?"
             );
             return ExitCode::FAILURE;
         }
@@ -309,7 +309,7 @@ async fn record(config_path: &std::path::Path) -> ExitCode {
     if stargazer::control::recorder_already_running(&socket_path).await {
         tracing::error!(
             socket = %socket_path.display(),
-            "another recorder is already running — refusing to start a second"
+            "another recorder is already running; refusing to start a second"
         );
         return ExitCode::FAILURE;
     }
@@ -331,7 +331,7 @@ async fn record(config_path: &std::path::Path) -> ExitCode {
             sig = tokio::signal::ctrl_c() => {
                 match sig {
                     Ok(()) => tracing::info!("shutdown requested"),
-                    Err(e) => tracing::error!(error = %e, "ctrl-c handler failed — shutting down"),
+                    Err(e) => tracing::error!(error = %e, "ctrl-c handler failed, shutting down"),
                 }
                 break;
             }
@@ -352,7 +352,7 @@ async fn record(config_path: &std::path::Path) -> ExitCode {
         .await
         .is_err()
     {
-        tracing::warn!("supervisors did not drain within 8s — exiting anyway");
+        tracing::warn!("supervisors did not drain within 8s, exiting anyway");
     }
     let _unused = std::fs::remove_file(&socket_path);
     ExitCode::SUCCESS
@@ -379,7 +379,7 @@ async fn survey(out: &std::path::Path, interval: u64, once: bool) -> ExitCode {
     loop {
         match surveyor.poll_once().await {
             Err(e) => {
-                // Archive I/O failure — the archive is the point.
+                // Archive I/O failure: the archive is the point.
                 tracing::error!(error = %e, "survey archive failure");
                 return ExitCode::FAILURE;
             }
@@ -398,7 +398,7 @@ async fn survey(out: &std::path::Path, interval: u64, once: bool) -> ExitCode {
                     );
                     if rec.gap_risk {
                         tracing::warn!(
-                            "feed window rolled over between polls — some rows may be missing"
+                            "feed window rolled over between polls; some rows may be missing"
                         );
                     }
                 }
@@ -414,7 +414,7 @@ async fn survey(out: &std::path::Path, interval: u64, once: bool) -> ExitCode {
             () = tokio::time::sleep(sleep) => {}
             result = tokio::signal::ctrl_c() => {
                 if let Err(e) = result {
-                    tracing::error!(error = %e, "ctrl-c handler failed — exiting");
+                    tracing::error!(error = %e, "ctrl-c handler failed, exiting");
                 }
                 tracing::info!("survey stopped");
                 return ExitCode::SUCCESS;
@@ -508,7 +508,7 @@ async fn harvest(
 /// One human-readable coverage line per harvested target.
 fn print_harvest_run(rec: &stargazer::harvest::RunRecord) {
     if let Some(err) = &rec.error {
-        println!("{} {}: listing unavailable — {err}", rec.target, rec.date);
+        println!("{} {}: listing unavailable: {err}", rec.target, rec.date);
         return;
     }
     if rec.http_status == Some(404) {
@@ -536,7 +536,7 @@ fn print_harvest_run(rec: &stargazer::harvest::RunRecord) {
         )
     };
     println!(
-        "{} {}: published {} · local {} · matched {} ({pct}%) · salvage {} · local-only {} — {action}",
+        "{} {}: published {} · local {} · matched {} ({pct}%) · salvage {} · local-only {}; {action}",
         rec.target,
         rec.date,
         rec.published_tx,
@@ -562,7 +562,7 @@ fn report(out: &std::path::Path, window_hours: u64) -> ExitCode {
     let ranked = stargazer::survey::rank_activity(&events, since);
 
     println!(
-        "DPLUS voice activity — last {window_hours}h ({} events archived)",
+        "DPLUS voice activity: last {window_hours}h ({} events archived)",
         events.len()
     );
     // Manually aligned to the row format below.
@@ -578,7 +578,7 @@ fn report(out: &std::path::Path, window_hours: u64) -> ExitCode {
         );
     }
     if ranked.is_empty() {
-        println!("(no reflector activity in window — is the survey running?)");
+        println!("(no reflector activity in window; is the survey running?)");
     }
     ExitCode::SUCCESS
 }
@@ -593,7 +593,7 @@ async fn terminate_signal() {
                 let _unused = sig.recv().await;
             }
             Err(e) => {
-                tracing::warn!(error = %e, "SIGTERM handler failed — only ctrl-c will stop us");
+                tracing::warn!(error = %e, "SIGTERM handler failed; only ctrl-c will stop us");
                 std::future::pending::<()>().await;
             }
         }

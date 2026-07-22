@@ -3,7 +3,7 @@
 
 import SwiftUI
 
-/// macOS `Settings` scene — the window shown for `App → Settings…` /
+/// macOS `Settings` scene: the window shown for `App → Settings…` /
 /// ⌘,. Tabbed per Apple HIG: General, Connections, Diagnostics.
 ///
 /// All controls write to the coordinators via `@Bindable`; coordinators

@@ -1,7 +1,7 @@
 //! Same as `builder_missing_callsign` but with `local_module` missing.
 //!
 //! Proves the `Missing`/`Provided` typestate catches each required
-//! builder field independently — not just the first one.
+//! builder field independently, not just the first one.
 
 use dstar_gateway_core::session::client::{DExtra, Session};
 use dstar_gateway_core::types::{Callsign, Module};

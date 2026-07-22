@@ -37,7 +37,7 @@ fn to_test_err<E: std::fmt::Debug>(e: E) -> TestCaseError {
 // ============================================================================
 
 fn arb_band() -> impl Strategy<Value = Band> {
-    // Only A/B for protocol tests. Try_from will not fail — the range 0..2 is
+    // Only A/B for protocol tests. Try_from will not fail: the range 0..2 is
     // within Band::COUNT. Converting the panic to an `Option::filter` keeps
     // proptest from panicking if someone widens the range and hits an invalid
     // value; `.prop_filter_map` would hide the bug but this unwrap is documented
@@ -55,7 +55,7 @@ fn arb_channel_memory() -> impl Strategy<Value = ChannelMemory> {
         any::<u32>(),            // tx_offset
         (0u8..StepSize::COUNT),  // step_size
         (0u8..CtcssMode::COUNT), // ctcss_mode
-        (0u8..=255u8),           // flags_0a_raw (all 8 bits — serializer uses this)
+        (0u8..=255u8),           // flags_0a_raw (all 8 bits; serializer uses this)
     );
     let part_b = (
         (0u8..ToneCode::MAX_INDEX),        // tone_code
@@ -135,7 +135,7 @@ proptest! {
         prop_assert_eq!(b08 & 0x0F, shift);
     }
 
-    // 4. Byte 0x09 packing (currently zeroed — mode/fine not individually modeled)
+    // 4. Byte 0x09 packing (currently zeroed; mode/fine not individually modeled)
     #[test]
     fn byte_09_packing(_rev in any::<bool>(), _tone in any::<bool>(), _ctcss in 0u8..CtcssMode::COUNT) {
         let ch = ChannelMemory::default();
@@ -144,7 +144,7 @@ proptest! {
         prop_assert_eq!(b09, 0);
     }
 
-    // 5. Byte 0x0A packing — flags_0a_raw is stored directly (hardware-verified)
+    // 5. Byte 0x0A packing: flags_0a_raw is stored directly (hardware-verified)
     #[test]
     fn byte_0a_packing(flags in 0u8..=255u8) {
         let ch = ChannelMemory {
@@ -202,7 +202,7 @@ proptest! {
         prop_assert_eq!(dc.index(), idx);
     }
 
-    // 11. AG (AF gain) — no round-trip: write is band-indexed "AG band,level"
+    // 11. AG (AF gain) has no round-trip: write is band-indexed "AG band,level"
     //     but read returns bare "AG level" (no band). Asymmetric by design.
 
     // 12. SQ (squelch) wire round-trip
@@ -268,7 +268,7 @@ proptest! {
         prop_assert_eq!(decoded, frame);
     }
 
-    // TN (TNC mode) is a bare read command — no write variant, so no round-trip.
+    // TN (TNC mode) is a bare read command with no write variant, so no round-trip.
     // CTCSS tone is configured through the FO (full channel) command.
 
     // 15. ME wire round-trip: serialize SetMemoryChannel, parse as MemoryChannel

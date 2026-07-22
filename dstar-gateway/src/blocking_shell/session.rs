@@ -3,7 +3,7 @@
 //! The blocking shell is a one-for-one mirror of
 //! [`crate::tokio_shell`] but driven by a plain `std::net::UdpSocket`
 //! with read timeouts instead of tokio channels. The caller controls
-//! the loop via [`BlockingSession::run_until_event`] — no spawned
+//! the loop via [`BlockingSession::run_until_event`]: no spawned
 //! thread, no background task, no tokio runtime.
 
 use std::net::UdpSocket;
@@ -31,7 +31,7 @@ const MIN_WAIT: Duration = Duration::from_millis(1);
 /// Synchronous wrapper over a `Session<P, Connected>` + `UdpSocket`.
 ///
 /// Drives the sans-io driver loop one step at a time via
-/// [`Self::run_until_event`]. The caller controls the iteration —
+/// [`Self::run_until_event`]. The caller controls the iteration:
 /// no spawned task, no channel plumbing.
 ///
 /// # Example
@@ -69,7 +69,7 @@ impl<P: Protocol> BlockingSession<P> {
 
     /// Drive the driver loop until an event is available or the
     /// short idle window elapses. Returns `None` if no event
-    /// arrived within the window — the caller should then call
+    /// arrived within the window; the caller should then call
     /// again to continue driving the loop.
     ///
     /// The driver loop performs four steps per call:
@@ -77,7 +77,7 @@ impl<P: Protocol> BlockingSession<P> {
     /// 1. Drain outbound datagrams via `session.poll_transmit`.
     /// 2. Compute the next wake deadline via `session.poll_timeout`
     ///    and arm `UdpSocket::set_read_timeout` accordingly.
-    /// 3. Attempt a `recv_from` — on success feed the bytes into
+    /// 3. Attempt a `recv_from`: on success feed the bytes into
     ///    `session.handle_input`, on timeout feed `session.handle_timeout`.
     /// 4. Drain one event via `session.poll_event`.
     ///
@@ -125,7 +125,7 @@ impl<P: Protocol> BlockingSession<P> {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                // Timeout — let the session know time has advanced.
+                // Timeout: let the session know time has advanced.
                 self.session.handle_timeout(Instant::now());
             }
             Err(e) => {
@@ -149,7 +149,7 @@ mod tests {
     // The blocking shell is gated by the `Session<P, Connected>`
     // typestate, so the type system already proves most invariants
     // at compile time. Behavioral tests would need a synchronous
-    // `FakeReflector` — the loopback suites under `tests/` cover the
+    // `FakeReflector`; the loopback suites under `tests/` cover the
     // async path and the core codecs are separately tested inside
     // `dstar-gateway-core`.
     //
@@ -169,11 +169,11 @@ mod tests {
         // Proves `BlockingSession::new` is callable with the expected
         // argument types. The actual guarantees come from
         // `Session<P, Connected>` being a typestate-gated, well-formed
-        // type — if the typestate ever regresses, this test stops
+        // type; if the typestate ever regresses, this test stops
         // compiling.
         let ctor: fn(Session<DExtra, Connected>, UdpSocket) -> BlockingSession<DExtra> =
             BlockingSession::<DExtra>::new;
-        // Binding prevents the call from being dropped silently — the
+        // Binding prevents the call from being dropped silently; the
         // `unused_results = "deny"` lint still sees the `fn` item as
         // used because we assigned it into a typed slot.
         let _: fn(Session<DExtra, Connected>, UdpSocket) -> BlockingSession<DExtra> = ctor;

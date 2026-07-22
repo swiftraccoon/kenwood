@@ -5,7 +5,7 @@
 //! originator's module. This file implements that "encode once, send
 //! N times" loop.
 //!
-//! This function handles **same-protocol** fan-out only — it
+//! This function handles **same-protocol** fan-out only: it
 //! re-sends the raw inbound bytes verbatim to every peer on the
 //! same module. Cross-protocol forwarding (re-encoding bytes
 //! from one protocol into another via [`super::transcode::transcode_voice`])
@@ -48,8 +48,8 @@ pub struct FanOutReport {
 /// [`crate::client_pool::DEFAULT_UNHEALTHY_THRESHOLD`] are recorded
 /// in the returned [`FanOutReport::evicted`] list and the caller is
 /// responsible for removing them from the pool. The function only
-/// returns `Err` if a truly fatal condition occurs — currently none,
-/// so the `Result` is reserved for future fatal conditions.
+/// returns `Err` if a truly fatal condition occurs; there are
+/// currently none, so the `Result` is reserved for future ones.
 ///
 /// # Errors
 ///
@@ -100,7 +100,7 @@ pub async fn fan_out_voice_at<P: Protocol>(
     for peer in members.iter().copied().filter(|p| *p != from) {
         // Fix 5: consult the per-client TX token bucket BEFORE the
         // kernel send. On empty-bucket, drop the frame for THIS
-        // peer — rate-limited is not the same as broken, so we do
+        // peer: rate-limited is not the same as broken, so we do
         // NOT mark_unhealthy here. Other peers on the same module
         // still receive the frame.
         if !clients.try_consume_tx_token(&peer, now).await {
@@ -162,7 +162,7 @@ mod tests {
         pool.insert(addr, fresh_handle(addr)).await;
         pool.set_module(&addr, Module::C).await;
 
-        // No other members — fan_out_voice returns Ok and sends no
+        // No other members, so fan_out_voice returns Ok and sends no
         // datagrams. We test the Ok-path here; the "no send" side is
         // implicit because there's nobody to receive.
         let result = fan_out_voice(
@@ -182,7 +182,7 @@ mod tests {
     async fn fan_out_to_two_peers_delivers_bytes() -> TestResult {
         // Bind three loopback sockets: A is the "reflector" (the
         // originator), B and C are receivers. fan_out_voice uses A's
-        // socket as the send-side — B and C receive via their own
+        // socket as the send-side; B and C receive via their own
         // bound sockets which we use only to observe.
         let pool = ClientPool::<DExtra>::new();
         let (sock_a, addr_a) = bound_socket().await?;
@@ -240,7 +240,7 @@ mod tests {
         // so send_to to B fails repeatedly.
         //
         // Note: UDP send_to on Linux/macOS loopback will *succeed*
-        // against any port — there's no connection and the kernel
+        // against any port: there's no connection and the kernel
         // just drops the datagram on the floor. To reliably fail a
         // send we pre-mark the peer unhealthy 4 times and let the
         // 5th tick (via a normal successful send+mark cycle) flip
@@ -263,7 +263,7 @@ mod tests {
         }
 
         // Now directly call mark_unhealthy once more to trip the
-        // threshold — this is exactly what fan_out_voice does on the
+        // threshold. This is exactly what fan_out_voice does on the
         // Nth send failure. Confirm the outcome reports ShouldEvict.
         let outcome = pool.mark_unhealthy(&addr_b).await;
         assert!(matches!(outcome, UnhealthyOutcome::ShouldEvict { .. }));
@@ -299,7 +299,7 @@ mod tests {
         // Peer B has a 1-token bucket with 1 token/sec refill. The
         // first frame goes through; the second (same instant) is
         // dropped for B. Other peers on the same module would still
-        // receive the frame — here we only have one other peer to
+        // receive the frame; here we only have one other peer to
         // keep the test focused on the rate-limit mechanism.
         let pool = ClientPool::<DExtra>::new();
         let (sock_a, addr_a) = bound_socket().await?;
@@ -356,7 +356,7 @@ mod tests {
             "rate-limited peer must not receive the second frame"
         );
 
-        // Advance the clock by 1 second — bucket refills by 1 token.
+        // Advance the clock by 1 second; the bucket refills by 1 token.
         let later = now + std::time::Duration::from_secs(1);
         let _report3 =
             super::fan_out_voice_at(sock_a.as_ref(), &pool, addr_a, Module::C, b"frame3", later)

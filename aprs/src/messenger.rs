@@ -64,7 +64,7 @@ struct PendingMessage {
     /// Sequence ID for ack matching.
     message_id: String,
     /// Station this message was sent to. An acknowledgement is only
-    /// honoured when it arrives FROM this station — over open RF, a
+    /// honoured when it arrives FROM this station: over open RF, a
     /// message number alone is not proof of delivery, and matching on
     /// it lets any third party cancel our retries.
     addressee: String,
@@ -74,8 +74,8 @@ struct PendingMessage {
     attempts: u8,
     /// Timestamp of the most recent transmission, or `None` if the
     /// message has never been sent yet (in which case it is immediately
-    /// eligible). Representing "never sent" explicitly — rather than by
-    /// backdating `last_sent` into the past — keeps first-send eligibility
+    /// eligible). Representing "never sent" explicitly, rather than by
+    /// backdating `last_sent` into the past, keeps first-send eligibility
     /// independent of the monotonic clock's origin (on Linux
     /// `CLOCK_MONOTONIC` is boot-relative, so subtracting the retry
     /// interval from an early `Instant` would saturate and spuriously
@@ -241,7 +241,7 @@ impl AprsMessenger {
     }
 
     /// Record that the frame for `message_id` was transmitted at
-    /// `now` — the counterpart of [`Self::peek_frame_to_send`].
+    /// `now`. The counterpart of [`Self::peek_frame_to_send`].
     pub fn commit_send(&mut self, message_id: &str, now: Instant) {
         if let Some(msg) = self
             .pending_messages
@@ -295,7 +295,7 @@ impl AprsMessenger {
     ///
     /// Split from [`Self::mark_incoming_seen`] so an async caller can
     /// check, fully process the message (through awaits that may be
-    /// cancelled), and mark it seen only once delivery is assured — a
+    /// cancelled), and mark it seen only once delivery is assured. A
     /// message marked before delivery would be permanently lost if
     /// the delivery future is cancelled, because every RF retry of it
     /// then dedups away.
@@ -311,7 +311,7 @@ impl AprsMessenger {
             .is_some_and(|t| now.duration_since(*t) < window)
     }
 
-    /// Record an incoming message in the dedup cache — the counterpart
+    /// Record an incoming message in the dedup cache. The counterpart
     /// of [`Self::is_duplicate_incoming`]. Also expires stale entries.
     pub fn mark_incoming_seen(&mut self, source: &str, msg: &AprsMessage, now: Instant) {
         let window = self.config.incoming_dedup_window;
@@ -397,8 +397,8 @@ impl AprsMessenger {
     /// attempts) and return their message IDs so callers can notify upstream.
     ///
     /// Takes `now: Instant` for API consistency with the other time-aware
-    /// methods even though no clock-dependent logic is currently used here
-    /// — the decision is based on attempt count, not elapsed time.
+    /// methods even though no clock-dependent logic is currently used here:
+    /// the decision is based on attempt count, not elapsed time.
     pub fn cleanup_expired(&mut self, _now: Instant) -> Vec<String> {
         let mut expired = Vec::new();
         let max_retries = self.config.max_retries;
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn peek_does_not_burn_a_retry_attempt() -> TestResult {
         // An async caller may be cancelled between obtaining a frame
-        // and actually transmitting it — peeking must not record an
+        // and actually transmitting it, so peeking must not record an
         // attempt, only an explicit commit does.
         let t0 = Instant::now();
         let mut m = test_messenger();
@@ -508,7 +508,7 @@ mod tests {
     fn duplicate_check_and_mark_are_separate() -> TestResult {
         // An async caller must be able to CHECK for a duplicate,
         // fully process the message (including awaits that may be
-        // cancelled), and only then MARK it seen — otherwise a
+        // cancelled), and only then MARK it seen; otherwise a
         // cancelled delivery permanently eats the message and every
         // RF retry of it.
         let t0 = Instant::now();
@@ -556,7 +556,7 @@ mod tests {
 
     /// An ack only counts when it comes from the station the message
     /// was addressed to. Matching on the message number alone lets ANY
-    /// station on the air cancel our delivery retries — over RF that is
+    /// station on the air cancel our delivery retries; over RF that is
     /// a trivially spoofable denial of delivery (the retries stop and
     /// the message later reports "expired" instead of being resent).
     #[test]
@@ -566,7 +566,7 @@ mod tests {
         let id = m.send_message("W1AW", "Hello", t0);
         assert_eq!(m.pending_count(), 1);
 
-        // K9XYZ was never the addressee — its ack must be ignored.
+        // K9XYZ was never the addressee, so its ack must be ignored.
         let spoofed = AprsMessage {
             addressee: "N0CALL".to_owned(),
             text: format!("ack{id}"),
@@ -597,8 +597,8 @@ mod tests {
         assert_eq!(m.pending_count(), 0);
     }
 
-    /// The reply-ack carrier gets the same source check — it is the
-    /// form modern clients actually send.
+    /// The reply-ack carrier gets the same source check, since it is
+    /// the form modern clients actually send.
     #[test]
     fn process_incoming_reply_ack_from_a_third_party_does_not_clear_pending() {
         let t0 = Instant::now();
@@ -763,7 +763,7 @@ mod tests {
             reply_ack: None,
         };
         assert!(m.is_new_incoming("W1AW", &msg, t0));
-        // Jump past the dedup window — the entry should be expired.
+        // Jump past the dedup window; the entry should be expired.
         let later = t0 + INCOMING_DEDUP_WINDOW + Duration::from_secs(1);
         assert!(m.is_new_incoming("W1AW", &msg, later));
     }
@@ -794,7 +794,7 @@ mod tests {
         assert_eq!(id, "1");
         assert_eq!(m.pending_count(), 1);
 
-        // Incoming ":N0CALL   :hi{05}1" — a *new* inbound message id "05"
+        // Incoming ":N0CALL   :hi{05}1", a *new* inbound message id "05"
         // whose reply-ack "1" acknowledges our pending "1". Mirrors what
         // parse_aprs_message yields for that wire form.
         let reply_ack = AprsMessage {
@@ -817,7 +817,7 @@ mod tests {
         let id = m.send_message("W1AW", "ping", t0);
 
         // A reply-ack message acks our outbound AND is a fresh inbound
-        // message in its own right — is_new_incoming must still surface it.
+        // message in its own right, so is_new_incoming must still surface it.
         let reply_ack = AprsMessage {
             addressee: "N0CALL".to_owned(),
             text: "hi".to_owned(),

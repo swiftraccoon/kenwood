@@ -1,4 +1,4 @@
-# 0001 — Sans-IO core crate
+# 0001: Sans-IO core crate
 
 - **Status**: accepted
 - **Date**: 2026-04-10
@@ -19,7 +19,7 @@ coupling made three categories of work painful:
 2. **Determinism.** The codec and the state machine both read the
    system clock for keepalive and timeout logic. Property tests had
    to either mock the clock at great expense or skip timer branches
-   entirely — in practice, the timer branches stayed under-tested.
+   entirely; in practice, the timer branches stayed under-tested.
 3. **Portability.** Embedding the crate in a WebAssembly module or
    a no-tokio async runtime was impossible because the codec
    reached for tokio types in its signatures.
@@ -32,8 +32,8 @@ core to a specific async runtime.
 
 We explicitly asked whether sans-io was worth the extra boilerplate
 of the two-crate split. The answer was
-yes, primarily because the alternative — a small tokio integration
-test that pretends to be a unit test — is a well-known anti-pattern
+yes, primarily because the alternative (a small tokio integration
+test that pretends to be a unit test) is a well-known anti-pattern
 and we wanted to exit this state definitively rather than incrementally.
 
 ## Decision

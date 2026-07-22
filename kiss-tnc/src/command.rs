@@ -57,21 +57,21 @@ pub const CMD_RETURN: u8 = 0xFF;
 /// tracked separately via [`KissPort`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KissCommand {
-    /// `0x00` — data frame (payload is an AX.25 frame).
+    /// `0x00`: data frame (payload is an AX.25 frame).
     Data,
-    /// `0x01` — TX delay in 10 ms units.
+    /// `0x01`: TX delay in 10 ms units.
     TxDelay,
-    /// `0x02` — CSMA persistence (0-255).
+    /// `0x02`: CSMA persistence (0-255).
     Persistence,
-    /// `0x03` — CSMA slot time in 10 ms units (0-250).
+    /// `0x03`: CSMA slot time in 10 ms units (0-250).
     SlotTime,
-    /// `0x04` — TX tail time in 10 ms units (0-255).
+    /// `0x04`: TX tail time in 10 ms units (0-255).
     TxTail,
-    /// `0x05` — full duplex (0 = half, nonzero = full).
+    /// `0x05`: full duplex (0 = half, nonzero = full).
     FullDuplex,
-    /// `0x06` — `SetHardware`, a TNC-defined hardware parameter.
+    /// `0x06`: `SetHardware`, a TNC-defined hardware parameter.
     SetHardware,
-    /// `0xFF` — full-byte return command (exit KISS mode).
+    /// `0xFF`: full-byte return command (exit KISS mode).
     Return,
 }
 
@@ -132,7 +132,7 @@ impl KissPort {
     /// The TH-D75 always uses port 0.
     pub const TH_D75: Self = Self(0);
 
-    /// The maximum valid port — the type byte's port nibble holds 4 bits.
+    /// The maximum valid port; the type byte's port nibble holds 4 bits.
     pub const MAX: Self = Self(15);
 
     /// Create a port from a raw `u8`, validating the `0..=15` range.
@@ -147,7 +147,7 @@ impl KissPort {
         }
     }
 
-    /// Extract the port from a KISS type byte — its high nibble.
+    /// Extract the port from a KISS type byte (its high nibble).
     ///
     /// Always succeeds: a 4-bit nibble is intrinsically within `0..=15`.
     #[must_use]

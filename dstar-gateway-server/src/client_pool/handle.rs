@@ -1,4 +1,4 @@
-//! `ClientHandle` — one linked client as tracked by the reflector.
+//! `ClientHandle`: one linked client as tracked by the reflector.
 //!
 //! The pool stores protocol-erased [`ServerSessionCore`] instances
 //! keyed by `SocketAddr`. A phantom `P: Protocol` marker threads the
@@ -107,7 +107,7 @@ impl TokenBucket {
     /// endpoint to apply
     /// [`ReflectorConfig::tx_rate_limit_frames_per_sec`] to each new
     /// client handle. A negative `rate_per_sec` is clamped to zero
-    /// refill (the bucket empties and stays empty) — it must never
+    /// refill (the bucket empties and stays empty); it must never
     /// drain below zero over elapsed time.
     ///
     /// [`ReflectorConfig::tx_rate_limit_frames_per_sec`]: crate::ReflectorConfig::tx_rate_limit_frames_per_sec
@@ -165,7 +165,7 @@ pub struct ClientHandle<P: Protocol> {
     /// fan-out consumes one token; when the bucket is empty, the
     /// frame is dropped for THIS peer (the other peers on the same
     /// module still receive it). Rate-limited is NOT the same as
-    /// broken — the peer is not marked unhealthy.
+    /// broken: the peer is not marked unhealthy.
     pub tx_budget: TokenBucket,
     _protocol: PhantomData<fn() -> P>,
 }
@@ -189,7 +189,7 @@ impl<P: Protocol> ClientHandle<P> {
     /// Construct a new handle whose TX budget is derived from a
     /// frames-per-second rate limit.
     ///
-    /// The bucket is built via [`TokenBucket::from_rate`] — refill
+    /// The bucket is built via [`TokenBucket::from_rate`]: refill
     /// runs at `rate_per_sec` and the burst capacity is one second
     /// of traffic at that rate. This is how the reflector endpoint
     /// applies the configured
@@ -261,7 +261,7 @@ mod tests {
             "clamped bucket allows its initial burst"
         );
         // A negative configured rate must clamp to zero refill: the
-        // bucket empties and stays empty — it must not drain further
+        // bucket empties and stays empty; it must not drain further
         // negative as time elapses.
         let later = t0 + Duration::from_secs(60);
         assert!(!bucket.try_consume(later, 1), "no refill at zero rate");

@@ -1,4 +1,4 @@
-# 0004 — Lenient parsing with opt-in strict validator
+# 0004: Lenient parsing with opt-in strict validator
 
 - **Status**: accepted
 - **Date**: 2026-04-10
@@ -117,12 +117,12 @@ policy, not a codec return value.
 
 ## References
 
-- `dstar-gateway-core/src/validator/` — `DiagnosticSink` trait
+- `dstar-gateway-core/src/validator/`: `DiagnosticSink` trait
   plus the `NullSink`, `VecSink`, and `TracingSink`
   implementations.
-- `dstar-gateway-core/src/codec/{dplus,dextra,dcs}/decode.rs`
-  — every decoder takes `&mut dyn DiagnosticSink` so consumers
+- `dstar-gateway-core/src/codec/{dplus,dextra,dcs}/decode.rs`:
+  every decoder takes `&mut dyn DiagnosticSink` so consumers
   opt into strictness per call site.
-- `dstar-gateway-core/src/session/client/core.rs` — lenient
+- `dstar-gateway-core/src/session/client/core.rs`: lenient
   client-input path that swallows unknown-length datagrams so
   reflector-emitted traffic never kills an established session.

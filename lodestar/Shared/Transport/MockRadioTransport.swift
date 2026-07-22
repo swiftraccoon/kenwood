@@ -10,7 +10,7 @@ import Foundation
 /// inspect captured writes with `writtenBytes()`, and simulate a
 /// Bluetooth drop with `simulateUnexpectedClose()`.
 ///
-/// Unscripted writes are captured but produce no reply (no echo) — the
+/// Unscripted writes are captured but produce no reply (no echo). The
 /// one built-in convenience is that `ID\r` still answers `ID TH-D75A\r`
 /// so the CAT identify round-trip works without scripting.
 public actor MockRadioTransport: RadioTransport {

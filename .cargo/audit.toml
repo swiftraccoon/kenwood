@@ -13,7 +13,7 @@ ignore = [
     # at compile time regardless of which runtime features are enabled).
     # Our stargazer crate enables only the postgres backend. The
     # vulnerable RSA decryption code path is never executed at runtime
-    # because we never talk to a MySQL server — it is only present in
+    # because we never talk to a MySQL server; it is only present in
     # the proc-macro compilation stage.
     # Recheck when rsa 0.10+ (timing-safe) is adopted by sqlx, or when
     # sqlx splits its proc-macro crate per backend.

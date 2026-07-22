@@ -191,7 +191,7 @@ pub fn last_lines(n: usize) -> Vec<String> {
 ///
 /// Every printed line is also appended to the rolling history buffer
 /// so the `last` REPL command can replay recent output. Plain
-/// `println!` calls bypass this recording — use `aprintln!` whenever
+/// `println!` calls bypass this recording; use `aprintln!` whenever
 /// a line is user-facing and should be replayable.
 #[macro_export]
 macro_rules! aprintln {

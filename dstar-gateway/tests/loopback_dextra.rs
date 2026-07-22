@@ -49,7 +49,7 @@ async fn dextra_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std:
         .build();
 
     // 4. Drive the connect handshake manually via the `Driver` trait.
-    //    `AsyncSession::spawn` requires a `Session<P, Connected>` — the
+    //    `AsyncSession::spawn` requires a `Session<P, Connected>`, and the
     //    typestate won't let us hand it a Configured session. The
     //    handshake runs on the test thread so the loop never sees a
     //    "not yet connected" state.
@@ -99,7 +99,7 @@ async fn dextra_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std:
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 8. Verify shape of the received packets:
-    //    - at least 1 LINK (11 bytes) — the one we sent manually
+    //    - at least 1 LINK (11 bytes): the one we sent manually
     //    - exactly 1 voice header (56 bytes)
     //    - exactly 6 × 27-byte voice packets (5 data + 1 EOT)
     let received = fake.received_packets().await;
@@ -126,7 +126,7 @@ async fn dextra_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std:
     async_session.disconnect().await?;
 
     // 10. Drain any final events before the session task exits. We
-    //     don't assert on a specific disconnect reason — the DExtra
+    //     don't assert on a specific disconnect reason: the DExtra
     //     reflector harness doesn't echo the UNLINK, so the reason
     //     surfaces as `DisconnectTimeout` once the 2 s deadline
     //     fires. Dropping the handle terminates the loop well
@@ -166,7 +166,7 @@ async fn dextra_async_session_observes_connected_event() -> Result<(), Box<dyn s
     let mut async_session = AsyncSession::spawn(connected, Arc::clone(&client_sock));
 
     // The `Connected` event was pushed by `finalize_connected` during
-    // handshake — the loop's first iteration drains it to the consumer.
+    // handshake; the loop's first iteration drains it to the consumer.
     let evt = timeout(Duration::from_secs(1), async_session.next_event())
         .await?
         .ok_or("event channel closed")?;

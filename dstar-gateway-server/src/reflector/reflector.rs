@@ -33,7 +33,7 @@ use crate::tokio_shell::transcode::CrossProtocolEvent;
 /// 12 seconds of traffic per protocol source. If a receiver lags
 /// further than that, `broadcast::Receiver::recv` returns
 /// `Err(RecvError::Lagged)` and the subscriber catches up by
-/// skipping to the newest frame — which for voice is the right
+/// skipping to the newest frame, which for voice is the right
 /// behavior (dropping old frames beats stale-audio artifacts).
 const CROSS_PROTOCOL_BUS_CAPACITY: usize = 256;
 
@@ -55,7 +55,7 @@ pub struct Reflector {
     dplus_socket: Option<Arc<UdpSocket>>,
     /// Pre-bound `DCS` socket.
     dcs_socket: Option<Arc<UdpSocket>>,
-    /// Cross-protocol voice bus — `Some` iff
+    /// Cross-protocol voice bus: `Some` iff
     /// `config.cross_protocol_forwarding` is `true`. Populated in
     /// the constructor so every endpoint subscribes at spawn time.
     voice_bus: Option<broadcast::Sender<CrossProtocolEvent>>,
@@ -82,7 +82,7 @@ impl Reflector {
     /// Construct a reflector that will bind its own UDP sockets on
     /// [`Self::run`].
     ///
-    /// This is the default constructor for production use — pass the
+    /// This is the default constructor for production use: pass the
     /// parsed [`ReflectorConfig`] and an authorizer, then call
     /// [`Self::run`] to start serving.
     ///
@@ -116,7 +116,7 @@ impl Reflector {
     ///
     /// Used by integration tests that need to know the bound port
     /// before the reflector starts serving. A pre-bound socket is
-    /// used as-is — it bypasses the per-protocol address resolution
+    /// used as-is: it bypasses the per-protocol address resolution
     /// in [`ReflectorConfig::bind_addr_for`] entirely.
     pub fn new_with_socket<A: ClientAuthorizer + 'static>(
         config: ReflectorConfig,
@@ -155,7 +155,7 @@ impl Reflector {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let authorizer_arc: Arc<dyn ClientAuthorizer> = Arc::new(authorizer);
         // Pick a deterministic default module from the configured
-        // set — the endpoint uses this as the seed `reflector_module`
+        // set; the endpoint uses this as the seed `reflector_module`
         // for every new `ServerSessionCore`. DExtra/DCS sessions
         // overwrite it from the LINK packet on the wire; DPlus
         // sessions keep the default because the LINK2 packet doesn't
@@ -248,7 +248,7 @@ impl Reflector {
     /// The `run` future resolves cleanly once every spawned endpoint
     /// task observes the shutdown flag and returns.
     pub fn shutdown(&self) {
-        // Ignore send errors — the only failure mode is "no
+        // Ignore send errors: the only failure mode is "no
         // receivers", which already means we're shutting down.
         let _ = self.shutdown_tx.send(true);
     }
@@ -267,7 +267,7 @@ impl Reflector {
     /// # Cancellation safety
     ///
     /// This method is cancel-safe in the sense that dropping the
-    /// future aborts the internal [`tokio::task::JoinSet`] cleanly —
+    /// future aborts the internal [`tokio::task::JoinSet`] cleanly:
     /// every spawned endpoint task is aborted and the sockets are
     /// released. For a graceful shutdown call [`Self::shutdown`] first
     /// and then `await` the `run()` future to completion; for an
@@ -416,7 +416,7 @@ mod tests {
         // regardless of that port's availability. This deliberately
         // avoids binding the standard 30001/20001/30051 ports (rule 4
         // is covered port-free by the `bind_addr_for` unit tests in
-        // config.rs) — squatting them live would collide with a
+        // config.rs); squatting them live would collide with a
         // running polaris or an overlapping test suite.
         let ephemeral = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let cfg = ReflectorConfig::builder()

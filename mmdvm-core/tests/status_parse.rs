@@ -2,7 +2,7 @@
 
 use mmdvm_core::{MmdvmError, ModemMode, ModemStatus};
 
-// Dev-dep acknowledgement — not used in this file, but the test
+// Dev-dep acknowledgement: not used in this file, but the test
 // crate sees every dev-dep.
 use proptest as _;
 use thiserror as _;
@@ -84,7 +84,7 @@ fn parse_v2_too_short_errors() {
 
 #[test]
 fn parse_v1_optional_tail_fields_default_to_zero() -> TestResult {
-    // Only the mandatory 7 bytes — p25/nxdn/pocsag (firmware-version
+    // Only the mandatory 7 bytes, so p25/nxdn/pocsag (firmware-version
     // dependent on v1) must default to 0.
     let payload = [1, 1, 0, 7, 3, 4, 5];
     let s = ModemStatus::parse_v1(&payload)?;

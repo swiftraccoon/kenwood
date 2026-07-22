@@ -137,7 +137,7 @@ impl fmt::Display for AfGainLevel {
 pub struct SMeterReading(u8);
 
 impl SMeterReading {
-    /// Zero reading (S0 — no signal).
+    /// Zero reading (S0, no signal).
     pub const ZERO: Self = Self(0);
     /// Number of valid S-meter reading values (0-5).
     pub const COUNT: u8 = 6;
@@ -224,13 +224,13 @@ impl fmt::Display for SMeterReading {
 ///   A1-A10 at 161.650-163.275 MHz).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VfoMemoryMode {
-    /// VFO mode — frequency entered directly (index 0).
+    /// VFO mode: frequency entered directly (index 0).
     Vfo = 0,
-    /// Memory channel mode — recalls stored channels (index 1).
+    /// Memory channel mode: recalls stored channels (index 1).
     Memory = 1,
-    /// Call channel mode — quick-access channel (index 2).
+    /// Call channel mode: quick-access channel (index 2).
     Call = 2,
-    /// Weather channel mode — NOAA weather frequencies (index 3).
+    /// Weather channel mode: NOAA weather frequencies (index 3).
     Weather = 3,
 }
 
@@ -353,15 +353,15 @@ impl From<FilterMode> for u8 {
 /// only, approximately 3.5 hours).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BatteryLevel {
-    /// Empty — red battery indicator (index 0).
+    /// Empty: red battery indicator (index 0).
     Empty = 0,
-    /// One-third — yellow battery indicator (index 1).
+    /// One-third: yellow battery indicator (index 1).
     OneThird = 1,
-    /// Two-thirds — green battery indicator (index 2).
+    /// Two-thirds: green battery indicator (index 2).
     TwoThirds = 2,
-    /// Full — green battery indicator (index 3).
+    /// Full: green battery indicator (index 3).
     Full = 3,
-    /// Charging — USB power connected (index 4).
+    /// Charging: USB power connected (index 4).
     Charging = 4,
 }
 
@@ -610,13 +610,13 @@ impl From<TncBaud> for u8 {
 pub enum BeaconMode {
     /// Beaconing off (index 0).
     Off = 0,
-    /// Manual beacon — press button to transmit (index 1).
+    /// Manual beacon: press button to transmit (index 1).
     Manual = 1,
-    /// PTT beacon — transmit position on each PTT keyup (index 2).
+    /// PTT beacon: transmit position on each PTT keyup (index 2).
     Ptt = 2,
-    /// Auto beacon — transmit at configured interval (index 3).
+    /// Auto beacon: transmit at configured interval (index 3).
     Auto = 3,
-    /// `SmartBeaconing` — adaptive interval based on speed/heading (index 4).
+    /// `SmartBeaconing`: adaptive interval based on speed/heading (index 4).
     SmartBeaconing = 4,
 }
 
@@ -804,11 +804,11 @@ impl fmt::Display for CallsignSlot {
 /// Source: User Manual Chapter 12 "AF/IF/DETECT OUTPUT MODE".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DetectOutputMode {
-    /// AF output — received audio sound (index 0).
+    /// AF output: received audio sound (index 0).
     Af = 0,
-    /// IF output — received IF signal of Band B to PC (index 1).
+    /// IF output: received IF signal of Band B to PC (index 1).
     If = 1,
-    /// Detect output — decoded signal of Band B to PC (index 2).
+    /// Detect output: decoded signal of Band B to PC (index 2).
     Detect = 2,
 }
 
@@ -869,7 +869,7 @@ pub enum DvGatewayMode {
     ReflectorTerminal = 1,
     /// Access Point mode (index 2). Discovered via ARFC-D75 decompilation
     /// which shows 3 gateway modes (0/1/2). Needs hardware verification
-    /// to confirm exact behavior — may be "Auto" or "Access Point" mode
+    /// to confirm exact behavior; it may be "Auto" or "Access Point" mode
     /// for D-STAR hotspot operation.
     AccessPoint = 2,
 }
@@ -925,7 +925,7 @@ impl From<DvGatewayMode> for u8 {
 /// §4.5 (Reflector Terminal/MMDVM), firmware string table (NAVITRA).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TncMode {
-    /// TNC off — no packet mode active, plain CAT operation (index 0).
+    /// TNC off: no packet mode active, plain CAT operation (index 0).
     ///
     /// Hardware-verified 2026-07-18: after `TN 0,0` the radio's display
     /// shows no packet-mode indicator (neither "APRS 12" nor "KISS 12").
@@ -933,17 +933,17 @@ pub enum TncMode {
     /// every recovery preamble read back as "APRS mode" while the TNC
     /// was actually off.
     Off = 0,
-    /// APRS mode — packet operation run by the radio firmware (index 1).
+    /// APRS mode: packet operation run by the radio firmware (index 1).
     /// The display shows "APRS 12" (or "APRS 96" at 9600 bps).
     Aprs = 1,
-    /// KISS mode — PC-based packet via KISS protocol (index 2).
+    /// KISS mode: PC-based packet via KISS protocol (index 2).
     /// Enter with `TN 2,0` (1200 bps) or `TN 2,1` (9600 bps); the
     /// display shows "KISS 12" / "KISS 96".
     /// See Operating Tips §2.7, User Manual Chapter 15.
     /// The built-in TNC has 4 KB TX and RX buffers and supports only
     /// KISS mode (no Command mode or Converse mode).
     Kiss = 2,
-    /// MMDVM/Reflector Terminal mode — D-STAR reflector access (index 3).
+    /// MMDVM/Reflector Terminal mode: D-STAR reflector access (index 3).
     /// Uses MMDVM serial commands via USB or Bluetooth.
     /// See Operating Tips §4.5.
     Mmdvm = 3,
@@ -1114,7 +1114,7 @@ impl fmt::Display for FilterWidthIndex {
 pub enum GpsRadioMode {
     /// Normal transceiver mode (index 0).
     Normal = 0,
-    /// GPS receiver mode (index 1) — **reboots the radio**.
+    /// GPS receiver mode (index 1). **Reboots the radio.**
     GpsReceiver = 1,
 }
 
@@ -1184,7 +1184,7 @@ mod tests {
 
     #[test]
     fn af_gain_valid() {
-        // AfGainLevel accepts full u8 range — radio reads can exceed 99
+        // AfGainLevel accepts full u8 range; radio reads can exceed 99
         assert_eq!(AfGainLevel::new(0).as_u8(), 0);
         assert_eq!(AfGainLevel::new(99).as_u8(), 99);
         assert_eq!(AfGainLevel::new(113).as_u8(), 113);

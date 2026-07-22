@@ -7,7 +7,7 @@
 //! `(reflector, module)` pair connects listen-only and writes each
 //! received transmission to disk as three files: a raw AMBE frame
 //! container (ground truth), a decoded 8 kHz WAV, and a metadata
-//! JSON (written last — a recording exists iff its JSON exists).
+//! JSON (written last, so a recording exists iff its JSON exists).
 
 // Binary-only dependencies (used by `main.rs`); acknowledged here so
 // `unused_crate_dependencies` stays quiet on the lib target.

@@ -8,7 +8,7 @@
 //! 256-point FFT pass that processes all unvoiced bands of a frame
 //! simultaneously, followed by a Weighted Overlap-Add (WOLA) combine
 //! with the previous frame's output. The audio quality is noticeably
-//! cleaner — less "buzzy" — and the per-frame compute is substantially
+//! cleaner (less "buzzy") and the per-frame compute is substantially
 //! lower (one FFT + one IFFT vs L × 160 × `UV_QUALITY` oscillator
 //! evaluations).
 //!

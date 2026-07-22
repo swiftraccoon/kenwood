@@ -73,7 +73,7 @@ fn patch_page(base: &[u8; 256], idx: usize, value: u8) -> Result<[u8; 256], BoxE
 
 #[tokio::test]
 async fn tune_frequency_when_already_vfo() -> TestResult {
-    // Radio is already in VFO mode — no VM write needed.
+    // Radio is already in VFO mode, so no VM write is needed.
     let mut mock = MockTransport::new();
     // ensure_mode: query VM -> already VFO
     mock.expect(b"VM 0\r", b"VM 0,0\r");
@@ -93,7 +93,7 @@ async fn tune_frequency_when_already_vfo() -> TestResult {
 
 #[tokio::test]
 async fn tune_frequency_switches_from_memory_to_vfo() -> TestResult {
-    // Radio starts in Memory mode — must switch to VFO first.
+    // Radio starts in Memory mode, so it must switch to VFO first.
     let mut mock = MockTransport::new();
     // ensure_mode: query VM -> Memory (1), needs to switch
     mock.expect(b"VM 0\r", b"VM 0,1\r");
@@ -117,7 +117,7 @@ async fn tune_frequency_switches_from_memory_to_vfo() -> TestResult {
 async fn tune_frequency_readback_mismatch_is_error() -> TestResult {
     // The radio clamps out-of-band FO writes silently; the readback
     // is the only verification. A mismatch must be an error, not a
-    // warn-and-Ok — the operator would otherwise transmit on the
+    // warn-and-Ok; the operator would otherwise transmit on the
     // wrong frequency believing the tune succeeded.
     let mut mock = MockTransport::new();
     mock.expect(b"VM 0\r", b"VM 0,0\r");
@@ -162,7 +162,7 @@ async fn tune_channel_empty_channel_is_error() -> TestResult {
 
 #[tokio::test]
 async fn tune_channel_switches_to_memory_mode() -> TestResult {
-    // Radio starts in VFO mode — tune_channel must switch to Memory.
+    // Radio starts in VFO mode, so tune_channel must switch to Memory.
     let mut mock = MockTransport::new();
     // read_channel: verify channel is populated
     mock.expect(
@@ -182,7 +182,7 @@ async fn tune_channel_switches_to_memory_mode() -> TestResult {
 
 #[tokio::test]
 async fn tune_channel_already_in_memory_mode() -> TestResult {
-    // Radio already in Memory mode — no VM write needed.
+    // Radio already in Memory mode, so no VM write is needed.
     let mut mock = MockTransport::new();
     // read_channel: verify channel is populated
     mock.expect(
@@ -201,13 +201,13 @@ async fn tune_channel_already_in_memory_mode() -> TestResult {
 
 #[tokio::test]
 async fn tune_channel_band_b() -> TestResult {
-    // Tune Band B to a channel — confirms band index is passed correctly.
+    // Tune Band B to a channel: confirms band index is passed correctly.
     let mut mock = MockTransport::new();
     mock.expect(
         b"ME 042\r",
         b"ME 042,0440000000,0005000000,5,2,0,0,0,0,0,0,0,0,0,0,08,08,000,0,,0,00,0\r",
     );
-    // Band B VM query — already in Memory mode
+    // Band B VM query: already in Memory mode
     mock.expect(b"VM 1\r", b"VM 1,1\r");
     mock.expect(b"MR 1,042\r", b"MR 1,042\r");
 
@@ -252,7 +252,7 @@ async fn quick_tune_nfm_with_step_12500() -> TestResult {
     // tune_frequency sub-sequence (145 -> 145, same frequency, just verifying)
     mock.expect(b"VM 0\r", b"VM 0,0\r");
     mock.expect(b"FO 0\r", FO_RESPONSE_145);
-    // FO write — frequency 145.000 MHz (same as readback, so write identical)
+    // FO write: frequency 145.000 MHz (same as readback, so write identical)
     mock.expect(
         b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
         FO_RESPONSE_145,
@@ -271,13 +271,13 @@ async fn quick_tune_nfm_with_step_12500() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// connect_safe — TNC exit preamble
+// connect_safe: TNC exit preamble
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn connect_safe_sends_tnc_exit_preamble() -> TestResult {
     // connect_safe writes 4 raw payloads (CR, CR, ETX, "\rTC 1\r") and then
-    // does a best-effort drain read — all ignored on error.  We use
+    // does a best-effort drain read, all ignored on error.  We use
     // expect_any_write so the mock accepts all writes without validation
     // (the preamble bytes are not CAT command/response pairs).
     let mut mock = MockTransport::new();
@@ -286,7 +286,7 @@ async fn connect_safe_sends_tnc_exit_preamble() -> TestResult {
     // Should not panic or return an error.
     let radio = Radio::connect_safe(mock).await?;
 
-    // Verify we got a usable Radio back — the mock has no exchanges left.
+    // Verify we got a usable Radio back; the mock has no exchanges left.
     drop(radio);
     Ok(())
 }
@@ -294,7 +294,7 @@ async fn connect_safe_sends_tnc_exit_preamble() -> TestResult {
 #[tokio::test]
 async fn connect_safe_preamble_includes_kiss_exit_frame() -> TestResult {
     // A radio left in KISS mode (crashed APRS session) ignores every
-    // ASCII CAT byte — the only exit the KISS protocol defines is the
+    // ASCII CAT byte; the only exit the KISS protocol defines is the
     // FEND-framed Return command (C0 FF C0), the same bytes
     // AprsClient::stop() sends. The preamble must include it ahead of
     // the ASCII TNC exits, or a stuck-KISS radio stays unreachable
@@ -327,7 +327,7 @@ async fn connect_safe_returns_functional_radio() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// modify_memory_page — integration test
+// modify_memory_page: integration test
 // ---------------------------------------------------------------------------
 
 fn mock_modify_page_sequence(
@@ -400,7 +400,7 @@ async fn modify_memory_page_preserves_surrounding_bytes() -> TestResult {
 
 #[tokio::test]
 async fn modify_memory_page_rejects_factory_cal_page() -> TestResult {
-    // Pages 0x07A1 and 0x07A2 are factory calibration — must be rejected
+    // Pages 0x07A1 and 0x07A2 are factory calibration and must be rejected
     // before entering MCP mode (no mock exchanges needed).
     let mock = MockTransport::new();
     let mut radio = Radio::connect(mock).await?;

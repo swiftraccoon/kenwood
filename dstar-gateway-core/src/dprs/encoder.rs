@@ -11,7 +11,7 @@ use super::parser::DprsReport;
 ///
 /// The output `String` is cleared first, then written in place. The
 /// CRC is computed over the sentence body (everything after the
-/// comma following `$$CRC<hex>`) using [`super::compute_crc`] —
+/// comma following `$$CRC<hex>`) using [`super::compute_crc`]:
 /// CRC-CCITT with reflected polynomial `0x8408`, initial value
 /// `0xFFFF`, final `~accumulator`, matching the ircDDBGateway
 /// reference.
@@ -34,7 +34,7 @@ pub fn encode_dprs(report: &DprsReport, out: &mut String) -> Result<(), DprsErro
     // CRC prefixed.
     let mut body = String::new();
 
-    // Callsign (space-padded to 8 bytes) — read straight from the
+    // Callsign (space-padded to 8 bytes), read straight from the
     // wire bytes so we don't depend on `Callsign::as_str()`'s
     // trimming behaviour.
     let cs_bytes = report.callsign.as_bytes();
@@ -50,7 +50,7 @@ pub fn encode_dprs(report: &DprsReport, out: &mut String) -> Result<(), DprsErro
     let lat_abs = lat.abs();
     let lat_int = lat_abs.trunc();
     let lat_min = (lat_abs - lat_int) * 60.0;
-    // Width 2, leading zeros, precision 0 — prints e.g. "35" for
+    // Width 2, leading zeros, precision 0: prints e.g. "35" for
     // 35.0. `lat_int` has already been truncated, so `{:.0}` does
     // not round away from the integer-degree value.
     write!(body, "{lat_int:02.0}{lat_min:05.2}{lat_hemi}")

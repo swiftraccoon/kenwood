@@ -17,7 +17,7 @@
 //! layout so that the OP25 V/UV detector's indexing math translates
 //! 1:1 into f32 offsets.
 
-/// Spectral window peak is at index 160 (0-based) — the harmonic
+/// Spectral window peak is at index 160 (0-based): the harmonic
 /// center. Offsets into this table correspond to FFT-bin-fractional
 /// offsets from the harmonic center, scaled by 64 samples per bin.
 pub(crate) const WR_SP_CENTER: usize = 160;

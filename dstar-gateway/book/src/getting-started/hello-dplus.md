@@ -89,7 +89,7 @@ session.disconnect().await?;
 1. **Bind** a local UDP socket. Port 0 lets the OS pick; the
    reflector will send replies to whatever ephemeral port you
    got.
-2. **Build** a `Session<DPlus, Configured>` — that's a session
+2. **Build** a `Session<DPlus, Configured>`: that's a session
    whose type parameters are `DPlus` (protocol) and `Configured`
    (state). Configured is the starting state; calling `.connect()`
    on it produces a `Session<DPlus, Connecting>`.
@@ -109,7 +109,7 @@ session.disconnect().await?;
    a dedicated task that owns the socket and the session; your
    code interacts with it via `next_event` and `send_*`.
 7. **Listen** for 10 seconds of inbound events. Each event is an
-   `Event<DPlus>` — `Connected`, `VoiceStart`, `VoiceFrame`,
+   `Event<DPlus>`: `Connected`, `VoiceStart`, `VoiceFrame`,
    `VoiceEnd`, `Disconnected`, `PollEcho`.
 8. **Request a graceful disconnect.** `session.disconnect().await?`
    returns once the session loop has queued UNLINK. Continue reading
@@ -118,7 +118,7 @@ session.disconnect().await?;
 ## Running it
 
 The code above binds to `0.0.0.0:0` and attempts to connect to
-`127.0.0.1:20001`, which is a local loopback address — no RF
+`127.0.0.1:20001`, which is a local loopback address; no RF
 energy leaves your machine. To connect to a real reflector, swap
 the peer address for a real REF reflector (e.g. look up REF030
 in the Pi-Star DPlus hosts file) and run the real auth step via

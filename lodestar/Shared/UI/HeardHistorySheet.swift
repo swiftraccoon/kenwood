@@ -5,7 +5,7 @@ import SwiftUI
 
 /// Full-history sheet for the reflector's "Recently heard" log.
 ///
-/// Keeps the main dashboard bounded — Apple's own apps use the same
+/// Keeps the main dashboard bounded; Apple's own apps use the same
 /// "summary inline, full list behind a tap" pattern (Photos' Recently
 /// Viewed, Music's Recently Played, Health's daily summaries).
 struct HeardHistorySheet: View {

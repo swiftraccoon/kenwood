@@ -23,7 +23,7 @@
 //!     --features examples-network
 //! ```
 //!
-//! **Transmits on real reflectors — set `ACTUALLY_TRANSMIT=1` to opt
+//! **Transmits on real reflectors, so set `ACTUALLY_TRANSMIT=1` to opt
 //! in.** Without the opt-in the example resolves the address, runs
 //! the handshake, and exits without keying any voice frames.
 
@@ -46,7 +46,7 @@ use dstar_gateway_core::voice::VoiceFrame;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
-// Examples are a separate compilation unit — acknowledge workspace
+// Examples are a separate compilation unit, so acknowledge workspace
 // dev-deps we don't reference directly so the strict
 // `unused_crate_dependencies` lint stays silent.
 use pcap_parser as _;
@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let actually_transmit = env::var("ACTUALLY_TRANSMIT").ok().as_deref() == Some("1");
 
-    // 1. TCP auth — fetches the host list cached by the DPlus auth
+    // 1. TCP auth: fetches the host list cached by the DPlus auth
     //    server. The returned `HostList` is required to promote the
     //    core's typestate past `Configured`.
     let auth_client = AuthClient::new();
@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect(Instant::now())
         .map_err(|f| format!("connect: {}", f.error))?;
 
-    // 4. Drive the handshake to `Connected` — poll_transmit / recv /
+    // 4. Drive the handshake to `Connected`: poll_transmit / recv /
     //    handle_input, matching the pattern in `loopback_dplus.rs`.
     for _ in 0..4_u8 {
         if let Some(tx) = connecting.poll_transmit(Instant::now()) {

@@ -3,7 +3,7 @@
 
 import SwiftUI
 
-/// Visual treatment for each D-STAR protocol — consistent color + SF
+/// Visual treatment for each D-STAR protocol: consistent color + SF
 /// Symbol + short label across every view that displays reflectors.
 extension ReflectorProtocol {
     var accentColor: Color {
@@ -23,7 +23,7 @@ extension ReflectorProtocol {
         }
     }
 
-    /// One-line description of the protocol family — used as a caption.
+    /// One-line description of the protocol family, used as a caption.
     var shortTagline: String {
         switch self {
         case .dPlus:

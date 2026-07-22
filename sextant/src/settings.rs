@@ -17,7 +17,7 @@
 //! parser only handles `key = "value"` lines so it's a strict subset
 //! of TOML.
 //!
-//! Save/load failures are logged at `warn` and ignored — the user
+//! Save/load failures are logged at `warn` and ignored; the user
 //! still gets defaults if the file is missing or malformed, and a
 //! corrupt file is overwritten on the next save.
 
@@ -35,7 +35,7 @@ pub(crate) enum TimeMode {
     /// local offset couldn't be detected at startup).
     #[default]
     Local,
-    /// UTC — ham logging convention.
+    /// UTC, the ham logging convention.
     Utc,
 }
 
@@ -119,7 +119,7 @@ pub(crate) fn push_recent(recents: &mut Vec<SavedHost>, entry: SavedHost) {
     recents.truncate(RECENTS_CAP);
 }
 
-/// `callsign|host|port|protocol|module` — `|` never appears in
+/// `callsign|host|port|protocol|module`; `|` never appears in
 /// callsigns, hostnames, ports, or protocol names.
 fn encode_saved(s: &SavedHost) -> String {
     format!(
@@ -159,7 +159,7 @@ pub(crate) struct Settings {
     pub(crate) reflector_port: String,
     /// Reflector callsign (e.g. `REF030`).
     pub(crate) reflector_callsign: String,
-    /// Protocol family — stored as the `Debug` repr (`DExtra`, `DPlus`, `Dcs`).
+    /// Protocol family, stored as the `Debug` repr (`DExtra`, `DPlus`, `Dcs`).
     pub(crate) protocol: String,
     /// Local module letter.
     pub(crate) local_module: char,
@@ -243,7 +243,7 @@ impl Settings {
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
-                debug!(path = %path.display(), error = %e, "no settings file — using defaults");
+                debug!(path = %path.display(), error = %e, "no settings file, using defaults");
                 return Self::default();
             }
         };
@@ -253,13 +253,13 @@ impl Settings {
                 s
             }
             Err(e) => {
-                warn!(path = %path.display(), error = %e, "settings file malformed — using defaults");
+                warn!(path = %path.display(), error = %e, "settings file malformed, using defaults");
                 Self::default()
             }
         }
     }
 
-    /// Persist to disk. Logs and swallows errors — settings persistence
+    /// Persist to disk. Logs and swallows errors: settings persistence
     /// must never block app shutdown or interaction.
     pub(crate) fn save(&self) {
         let Some(path) = Self::path() else {
@@ -286,7 +286,7 @@ impl Settings {
 /// practice, but the escape keeps adversarial inputs safe.
 fn serialize(s: &Settings) -> String {
     let mut out = String::with_capacity(256);
-    out.push_str("# sextant GUI settings — auto-saved on disconnect / app exit.\n");
+    out.push_str("# sextant GUI settings, auto-saved on disconnect / app exit.\n");
     push_string(&mut out, "callsign", &s.callsign);
     push_string(&mut out, "reflector_host", &s.reflector_host);
     push_string(&mut out, "reflector_port", &s.reflector_port);
@@ -358,14 +358,14 @@ fn parse(raw: &str) -> Result<Settings, String> {
             match decode_saved(&value) {
                 Some(entry) if key.starts_with("favorite.") => out.favorites.push(entry),
                 Some(entry) => out.recents.push(entry),
-                // Malformed entries are skipped, not fatal — one bad
+                // Malformed entries are skipped, not fatal: one bad
                 // line must not cost the user their whole settings.
                 None => warn!(key, "skipping malformed saved-host entry"),
             }
             continue;
         }
         // Boolean keys carry a bare `true` / `false`, not a quoted
-        // string — handle them before the quoted-string parse.
+        // string, so handle them before the quoted-string parse.
         if key == "reconnect_on_drop" || key == "persist_heard_list" || key == "tx_beacon_enabled" {
             let flag = match value {
                 "true" => true,
@@ -411,7 +411,7 @@ fn parse(raw: &str) -> Result<Settings, String> {
             "tx_comment" => out.tx_comment = value,
             "input_device" => out.input_device = value,
             "output_device" => out.output_device = value,
-            // Unknown keys are ignored — forward-compat for future
+            // Unknown keys are ignored: forward-compat for future
             // settings without breaking older sextant installs.
             _ => {}
         }
@@ -435,7 +435,7 @@ fn parse_quoted(value: &str) -> Option<String> {
             match chars.next()? {
                 '"' => out.push('"'),
                 '\\' => out.push('\\'),
-                // Unknown escape sequence — bail.
+                // Unknown escape sequence: bail.
                 _ => return None,
             }
         } else {
@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn embedded_quotes_roundtrip() -> TestResult {
-        // Adversarial input — a callsign containing a quote (won't
+        // Adversarial input: a callsign containing a quote (won't
         // happen in practice but the escape must still survive a round
         // trip).
         let original = Settings {

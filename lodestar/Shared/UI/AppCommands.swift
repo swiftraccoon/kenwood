@@ -5,12 +5,12 @@ import SwiftUI
 
 /// App-level keyboard shortcuts, exposed as `.commands { AppCommands(...) }`
 /// on the main window group. Follows the standard macOS menu layout:
-/// File, Radio, Reflector, View — with destructive actions at the bottom
+/// File, Radio, Reflector, View, with destructive actions at the bottom
 /// of each menu and confirmed with ⌘⇧-destructive pattern where needed.
 ///
 /// Uses `NotificationCenter` to signal the `SessionScreen` instead of
 /// direct method calls, because `Commands` builders can't hold `@State`
-/// or call actor methods directly — they live outside the view tree.
+/// or call actor methods directly; they live outside the view tree.
 struct AppCommands: Commands {
     let transport: TransportCoordinator
     let reflector: ReflectorCoordinator
@@ -26,7 +26,7 @@ struct AppCommands: Commands {
             }
         }
 
-        // Replace the default "New Item" entry with a Radio group — no
+        // Replace the default "New Item" entry with a Radio group; no
         // document-new concept applies to this app.
         CommandGroup(replacing: .newItem) {
             Button("Connect Radio…") {
@@ -77,7 +77,7 @@ struct AppCommands: Commands {
             .disabled(reflector.recentlyHeard.isEmpty)
         }
 
-        // Replace default Help so we can link to the repo — still
+        // Replace default Help so we can link to the repo, still
         // in the standard trailing position on macOS.
         CommandGroup(replacing: .help) {
             Link(destination: URL(string: "https://github.com/swiftraccoon/kenwood")!) {
@@ -108,7 +108,7 @@ import AppKit
 
 /// Render the standard NSApplication about panel with our credits.
 /// Matches the exact presentation style used by every Apple-shipped
-/// app — bundle icon, app name, short version, copyright, and a
+/// app: bundle icon, app name, short version, copyright, and a
 /// "Credits" roll that opens as a secondary sheet.
 @MainActor
 private func showAboutPanel() {

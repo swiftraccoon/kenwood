@@ -15,7 +15,7 @@
 //! processing never allocates: output `Vec`s are caller-owned and
 //! reused (each `process` clears its output before filling it), and
 //! internal scratch buffers grow once to their working size.
-//! Reconfiguration (mode or filter changes) may allocate — that is the
+//! Reconfiguration (mode or filter changes) may allocate; that is the
 //! documented exception.
 //!
 //! # Amplitude convention

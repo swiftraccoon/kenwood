@@ -1,4 +1,4 @@
-# 0002 — Full typestate for the client session
+# 0002: Full typestate for the client session
 
 - **Status**: accepted
 - **Date**: 2026-04-10
@@ -48,7 +48,7 @@ Each state is a distinct zero-sized type that implements the
 `ClientState` sealed trait. Methods are defined only on the
 specific `Session<P, State>` impls where they are legal.
 
-`send_voice` is defined only on `impl<P> Session<P, Connected>` —
+`send_voice` is defined only on `impl<P> Session<P, Connected>`,
 so calling it on a `Session<DExtra, Configured>` is a compile-time
 type error, not a runtime check.
 
@@ -66,7 +66,7 @@ error before deciding whether to retry or give up.
   uncompilable even as the library evolves.
 - The `ClientState` sealed trait prevents downstream crates from
   adding their own states. This is important because the state set
-  is a closed universe — there are no extension points for
+  is a closed universe: there are no extension points for
   custom states, and opening the set would invalidate the
   compile-fail guarantees.
 - IDE autocomplete becomes a documentation tool: only the methods
@@ -99,7 +99,7 @@ error before deciding whether to retry or give up.
 - **Builder pattern with state type-tag only in the builder, and
   a single `Session` type at steady state**. Considered and
   rejected because it moves the safety guarantee from the type
-  system to the programmer — after the builder hands off, the
+  system to the programmer: after the builder hands off, the
   runtime check returns.
 - **`enum Session { Configured(...), Connected(...), ... }`**.
   Considered, but the caller ends up writing a match at every
@@ -107,7 +107,7 @@ error before deciding whether to retry or give up.
 
 ## References
 
-- `dstar-gateway-core/src/session/client/session.rs` — the
+- `dstar-gateway-core/src/session/client/session.rs`: the
   concrete `Session<P, S>` typestate wrapper and every
   state-gated method.
 - `dstar-gateway-core/tests/compile_fail/` for the living

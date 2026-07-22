@@ -6,7 +6,7 @@
 //!
 //! Port of the signal-conditioning and FFT section of
 //! `imbe_vocoder::encode()` in OP25. Accepts one 160-sample PCM frame
-//! (16 kHz-equivalent energy — i.e. i16 inputs normalized to `[-1,
+//! (16 kHz-equivalent energy, i.e. i16 inputs normalized to `[-1,
 //! 1)`) and produces:
 //!
 //! 1. updated pitch-history buffers (DC-removed in `pitch_ref_buf`,
@@ -29,7 +29,7 @@ use crate::encode::window::WR_HALF;
 
 /// Per-stream FFT planning cache.
 ///
-/// Plans are thread-bound in `realfft` — we keep one plan per
+/// Plans are thread-bound in `realfft`; we keep one plan per
 /// encoder instance rather than re-planning every frame. Each call
 /// to [`analyze_frame`] borrows the planner through a `&mut`.
 pub struct FftPlan {
@@ -40,7 +40,7 @@ pub struct FftPlan {
 }
 
 impl std::fmt::Debug for FftPlan {
-    // `RealFftPlanner` does not implement `Debug` (upstream choice —
+    // `RealFftPlanner` does not implement `Debug` (upstream choice:
     // the FFTW-style plans hold runtime codegen state). We print the
     // cached scratch size instead so debug output remains useful.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -105,7 +105,7 @@ pub fn analyze_frame(
     // room for the new samples at the tail.
     bufs.shift_pitch_history();
 
-    // Step 2: input conditioning — remove DC (plus, when Kenwood
+    // Step 2: input conditioning. Remove DC (plus, when Kenwood
     // tables are enabled, everything below ≈345 Hz) and write the
     // result into `pitch_ref_buf`'s tail. The default path uses
     // OP25's 13 Hz first-order HPF; the `kenwood-tables` path uses
@@ -113,7 +113,7 @@ pub fn analyze_frame(
     // at DC, corner ≈345 Hz) which rejects rumble entirely before
     // pitch analysis sees it. Either way, the tail slice of
     // `pitch_ref_buf` is what downstream pitch refinement + FFT
-    // stages read — swapping the filter doesn't change the data
+    // stages read; swapping the filter doesn't change the data
     // flow, only the frequency response of the input.
     let tail_start = PITCH_EST_BUF_SIZE - FRAME;
     // The length assert at the top of this function guarantees the
@@ -144,7 +144,7 @@ pub fn analyze_frame(
     pe_lpf(&dc_removed_tail, est_tail, &mut bufs.pe_lpf_mem);
 
     // Step 4: build a 256-sample real-input buffer with Yazev's
-    // scatter layout — windowed signal at indices [146..256] and
+    // scatter layout: windowed signal at indices [146..256] and
     // [0, 1..111], zeros at [111..146]. This places the center of the
     // 221-sample analysis window at index 0 of the FFT input (time
     // domain) so the spectrum comes out with zero group delay for the

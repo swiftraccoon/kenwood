@@ -35,7 +35,7 @@ async fn raw_cmd(transport: &mut SerialTransport, cmd: &str) -> Option<String> {
 }
 
 /// Investigation 1: TN tone settings.
-/// TN returns ? — maybe it needs a specific format.
+/// TN returns ?; maybe it needs a specific format.
 /// The D74 docs say TN returns TNC mode, not tone.
 /// Try: bare TN, TN 0, TN 1
 /// Also check: what mode are the bands in? If DV mode, tone may not apply.
@@ -118,7 +118,7 @@ async fn investigate_cs() {
 
 /// Investigation 3: Channel names.
 /// ME field 19 is URCALL (always CQCQCQ). The display name isn't there.
-/// Let's look at the ME response more carefully — dump ALL 23 fields
+/// Let's look at the ME response more carefully: dump ALL 23 fields
 /// for a channel we know has a name ("ForestCityPD" on ch 018).
 /// Also check if there are fields beyond 22 that we truncated.
 #[tokio::test]
@@ -145,7 +145,7 @@ async fn investigate_channel_names() {
         }
     }
 
-    // Compare with a VFO read — FO has the name field too
+    // Compare with a VFO read; FO has the name field too
     println!("\n  FO 0 for comparison:");
     if let Some(resp) = raw_cmd(&mut transport, "FO 0").await {
         let fields: Vec<&str> = resp.split(',').collect();
@@ -160,28 +160,28 @@ async fn investigate_channel_names() {
         }
     }
 
-    // Try MN command — some Kenwood radios have MN for memory name
+    // Try MN command; some Kenwood radios have MN for memory name
     println!("\n  Trying MN (memory name) command:");
     let resp = raw_cmd(&mut transport, "MN 018").await;
     println!("    MN 018: {:?}", resp);
     let resp = raw_cmd(&mut transport, "MN").await;
     println!("    MN (bare): {:?}", resp);
 
-    // Try MNA — another possible memory name command
+    // Try MNA, another possible memory name command
     println!("\n  Trying MNA (memory name alt) command:");
     let resp = raw_cmd(&mut transport, "MNA 018").await;
     println!("    MNA 018: {:?}", resp);
 
-    // Try NB — name block?
+    // Try NB (name block?)
     println!("\n  Trying NB:");
     let resp = raw_cmd(&mut transport, "NB").await;
     println!("    NB: {:?}", resp);
 
-    // Try NA — name?
+    // Try NA (name?)
     let resp = raw_cmd(&mut transport, "NA").await;
     println!("    NA: {:?}", resp);
 
-    // Try CN — channel name?
+    // Try CN (channel name?)
     let resp = raw_cmd(&mut transport, "CN 018").await;
     println!("    CN 018: {:?}", resp);
 
@@ -231,7 +231,7 @@ async fn investigate_us() {
 /// AG returns 091 (3-digit). Is there a per-band version?
 /// Try AG 0 and AG 1 to see if they're reads or writes on D75.
 /// CAUTION: AG with a number MAY set gain. Only try if we can verify.
-/// Actually — our deep probe already sent AG bare and got 091.
+/// Actually, our deep probe already sent AG bare and got 091.
 /// Let's NOT send AG with parameters (risk of muting speaker).
 /// Just document what we know.
 #[tokio::test]
@@ -246,7 +246,7 @@ async fn investigate_ag() {
     let resp = raw_cmd(&mut transport, "AG").await;
     println!("  AG (bare): {:?}", resp);
     println!("  NOTE: AG with number parameter is a WRITE (sets gain level).");
-    println!("  NOT sending AG 0 or AG 1 — would change radio volume.");
+    println!("  NOT sending AG 0 or AG 1; it would change radio volume.");
 
     let _ = transport.close().await;
 }
@@ -254,7 +254,7 @@ async fn investigate_ag() {
 /// Investigation 6: BE (beacon) behavior.
 /// On our radio it returned N. Is it truly beacon or beep?
 /// Check if the radio is in a mode where beep status could be queried.
-/// DO NOT send BE — it may transmit a beacon.
+/// DO NOT send BE; it may transmit a beacon.
 #[tokio::test]
 #[ignore]
 async fn investigate_be() {
@@ -265,7 +265,7 @@ async fn investigate_be() {
     println!("\n=== INVESTIGATE BE ===");
     println!("  BE is classified as BEACON SEND (transmit action) on D74.");
     println!("  On our D75, it returned N (not available).");
-    println!("  NOT sending BE — risk of unintended transmission.");
+    println!("  NOT sending BE: risk of unintended transmission.");
     println!("  There is no known safe way to query beep setting via CAT.");
 
     let _ = transport.close().await;

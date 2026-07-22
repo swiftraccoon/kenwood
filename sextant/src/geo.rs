@@ -36,7 +36,7 @@ impl GpsPosition {
 
 /// Try to decode a GPS sentence (DPRS or NMEA) into a position.
 ///
-/// Returns `None` for anything that does not parse — callers treat a
+/// Returns `None` for anything that does not parse; callers treat a
 /// `None` as "no position yet", never an error (lenient receive).
 pub(crate) fn parse_gps_sentence(sentence: &str) -> Option<GpsPosition> {
     let trimmed = sentence.trim();

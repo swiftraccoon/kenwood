@@ -37,7 +37,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// reply over a oneshot. Dropping the handle severs the connection
 /// from the consumer side; the spawned task exits on its next loop.
 ///
-/// **Drop is not graceful** — for graceful shutdown call
+/// **Drop is not graceful.** For graceful shutdown call
 /// [`AsyncSession::disconnect`]. Drop just severs the connection from
 /// the consumer's side; the reflector eventually times the link out
 /// via inactivity.

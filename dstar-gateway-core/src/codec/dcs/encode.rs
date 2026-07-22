@@ -28,7 +28,7 @@ use super::packet::GatewayType;
 /// - `[18]`: space padding (from `memset(data + 11, ' ', 8)`)
 /// - `[19..519]`: 500-byte HTML banner identifying the gateway type,
 ///   zero-padded. The receiving reflector logs this banner but does
-///   not parse it — any short ASCII payload that fits in 500 bytes
+///   not parse it; any short ASCII payload that fits in 500 bytes
 ///   is valid.
 ///
 /// # Errors
@@ -71,7 +71,7 @@ pub fn encode_connect_link(
     //   memset(data + 11, ' ', 8)
     //   for i in 0..min(reflector.Len(), 7)
     //       data[i + 11] = reflector.GetChar(i)
-    // so byte [18] stays as a space from the memset — we write
+    // so byte [18] stays as a space from the memset; we write
     // only the first 7 chars.
     if let Some(region) = out.get_mut(11..19) {
         region.fill(b' ');
@@ -101,7 +101,7 @@ pub fn encode_connect_link(
 /// - `[0..7]`: first 7 chars of the client callsign
 /// - `[7]`: space padding
 /// - `[8]`: client module letter (8th char of the repeater)
-/// - `[9]`: `0x20` (space — the unlink marker)
+/// - `[9]`: `0x20` (space, the unlink marker)
 /// - `[10]`: `0x00`
 /// - `[11..18]`: first 7 chars of the reflector callsign
 /// - `[18]`: space padding
@@ -127,7 +127,7 @@ pub fn encode_connect_unlink(
         });
     }
     write_connect_prefix(out, *callsign, client_module.as_byte(), b' ');
-    // Reflector callsign at [11..19] — first 7 chars + space pad
+    // Reflector callsign at [11..19]: first 7 chars + space pad
     // matching the reference `memset + loop i<7`.
     if let Some(region) = out.get_mut(11..19) {
         region.fill(b' ');
@@ -218,7 +218,7 @@ pub fn encode_poll_request(
 
 /// Encode a 17-byte poll (keepalive) reply.
 ///
-/// Identical to [`encode_poll_request`] — the server side of the poll
+/// Identical to [`encode_poll_request`]: the server side of the poll
 /// is byte-for-byte symmetric in this codec (matching xlxd's 17-byte
 /// keepalive shape).
 ///
@@ -252,7 +252,7 @@ pub fn encode_poll_reply(
 /// - `[46..55]`: 9 AMBE bytes
 /// - `[55..58]`: slow data (or `0x55 0x55 0x55` if `is_end`)
 /// - `[58..61]`: 3-byte repeater sequence counter (always zero in this
-///   codec — clients that care can layer counters on top)
+///   codec; clients that care can layer counters on top)
 /// - `[61]`: `0x01`
 /// - `[62]`: `0x00`
 /// - `[63]`: `0x21`
@@ -328,7 +328,7 @@ pub fn encode_voice(
         *b = sid[1];
     }
     // Seq byte at [45]. The reference does NOT OR 0x40 for EOT in
-    // DCS — the EOT marker is in bytes [55..58] instead. xlxd DOES
+    // DCS; the EOT marker is in bytes [55..58] instead. xlxd DOES
     // OR 0x40 (see cdcsprotocol.cpp:558), and the reference decoder
     // checks for it (AMBEData.cpp shows the same). We mirror xlxd and
     // set the bit when is_end is true, matching the protocol the
@@ -349,7 +349,7 @@ pub fn encode_voice(
     } else if let Some(dst) = out.get_mut(55..58) {
         dst.copy_from_slice(&frame.slow_data);
     }
-    // [58..61] rpt seq counter — zero for now.
+    // [58..61] rpt seq counter, zero for now.
     // [61] = 0x01, [62] = 0x00, [63] = 0x21 per AMBEData.cpp:420-423.
     if let Some(b) = out.get_mut(61) {
         *b = 0x01;
@@ -422,7 +422,7 @@ fn write_connect_prefix(out: &mut [u8], callsign: Callsign, byte8: u8, byte9: u8
 /// (`getDCSData CT_ACK`/`CT_NAK`):
 /// - `[0..7]` first 7 chars of the echoed callsign
 /// - `[7]` space padding (from `memset`)
-/// - `[8]` 8th char of the echoed callsign — the repeater/client
+/// - `[8]` 8th char of the echoed callsign, i.e. the repeater/client
 ///   module letter (`m_repeater.GetChar(7)`)
 /// - `[9]` reflector module letter
 /// - `[10..13]` `tag` (`b"ACK"` or `b"NAK"`)
@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn encode_connect_ack_writes_14_bytes() -> TestResult {
         let mut buf = [0u8; 32];
-        // Test callsign "DCS001 C" so the 8th char is 'C' — the
+        // Test callsign "DCS001 C" so the 8th char is 'C', the
         // client/repeater module letter echoed at byte [8].
         let n = encode_connect_ack(&mut buf, &cs(*b"DCS001 C"), Module::B)?;
         assert_eq!(n, 14);

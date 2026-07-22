@@ -1,4 +1,4 @@
-//! Connection diagnostics — explaining *why* a link is not carrying CAT.
+//! Connection diagnostics: explaining *why* a link is not carrying CAT.
 //!
 //! When a freshly-opened transport accepts bytes but the radio never
 //! answers a CAT command, the link is physically fine yet logically
@@ -40,7 +40,7 @@ pub enum LinkDiagnosis {
     /// DV Gateway mode is switched off on the radio.
     MmdvmMode,
     /// The radio answered neither CAT nor an MMDVM probe. The transport
-    /// opened, but nothing the library recognises replied — typically a
+    /// opened, but nothing the library recognises replied: typically a
     /// cabling or power problem, the wrong serial device, another
     /// program holding the port, or KISS routing pointed elsewhere.
     Unresponsive,
@@ -136,7 +136,7 @@ mod tests {
     #[tokio::test]
     async fn diagnose_link_reports_unresponsive_on_empty_reply() -> TestResult {
         let mut mock = MockTransport::new();
-        // No bytes back at all — nothing recognisable answered.
+        // No bytes back at all, so nothing recognisable answered.
         mock.expect(b"\xE0\x03\x00", b"");
         let mut radio = Radio::connect(mock).await?;
         assert_eq!(radio.diagnose_link().await, LinkDiagnosis::Unresponsive);

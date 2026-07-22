@@ -34,7 +34,7 @@ impl<T: Transport> Radio<T> {
         self.set_frequency_full(band, &channel).await?;
 
         // Verify. This readback is the only verification anywhere in
-        // the tune path — the radio clamps out-of-range FO writes
+        // the tune path: the radio clamps out-of-range FO writes
         // silently, so a mismatch means the radio is NOT on the
         // requested frequency and a subsequent transmit would key up
         // on the wrong one.

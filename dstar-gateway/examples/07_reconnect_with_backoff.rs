@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         () = tokio::time::sleep_until(deadline) => break,
                         ev = async_session.next_event() => {
                             let Some(event) = ev else {
-                                tracing::warn!("event stream closed — will reconnect");
+                                tracing::warn!("event stream closed, will reconnect");
                                 break;
                             };
                             tracing::debug!(?event, "event");

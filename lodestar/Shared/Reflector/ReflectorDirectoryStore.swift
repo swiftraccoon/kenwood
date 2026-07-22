@@ -11,7 +11,7 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "dire
 /// cached results of previous fetches, and on-demand refreshes from
 /// the XLX registry + DPlus auth server. Merging and provenance
 /// precedence live in Rust (`mergeDirectories`); this store handles
-/// the platform pieces — HTTP, cache file, observability.
+/// the platform pieces: HTTP, cache file, observability.
 @Observable
 @MainActor
 public final class ReflectorDirectoryStore {
@@ -118,7 +118,7 @@ public final class ReflectorDirectoryStore {
 
     private func saveCache() {
         guard let cacheUrl else { return }
-        // Persist only non-bundled rows — bundled entries reload from
+        // Persist only non-bundled rows; bundled entries reload from
         // the binary and must not shadow a future bundled-list update.
         let rows = entries
             .filter { $0.source != .bundled }

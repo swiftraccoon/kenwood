@@ -2,7 +2,7 @@
 //!
 //! The `set_*_via_mcp` methods write registry-verified MCP cells for
 //! settings whose CAT write is rejected or stubbed (beep, beep volume,
-//! VOX, Bluetooth). The key lock has no MCP path — its state is
+//! VOX, Bluetooth). The key lock has no MCP path; its state is
 //! runtime-only and is controlled via CAT (`set_lock`/`get_lock`).
 
 use crate::error::{Error, ProtocolError};
@@ -121,7 +121,7 @@ impl<T: Transport> Radio<T> {
     /// On the TH-D75, the LC wire value is inverted: `LC 0` means locked,
     /// `LC 1` means unlocked. This method inverts the response so that
     /// `true` means locked (logical meaning). CAT is the only supported
-    /// path for the lock state — it is runtime state with no verified MCP
+    /// path for the lock state; it is runtime state with no verified MCP
     /// cell (the once-claimed `0x1060` is `radio.BacklightControl` in the
     /// MCP-D75 registry).
     ///
@@ -171,7 +171,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// - `locked`: master lock enable (`true` = locked, `false` = unlocked). Inverted
     ///   before sending on the wire (D75: `0` = locked, `1` = unlocked).
-    /// - `lock_type`: what to lock — key only, key+PTT, or key+PTT+dial.
+    /// - `lock_type`: what to lock: key only, key+PTT, or key+PTT+dial.
     /// - `lock_a`: lock Band A controls (`true` = locked).
     /// - `lock_b`: lock Band B controls (`true` = locked).
     /// - `lock_c`: lock Band C controls (`true` = locked).
@@ -290,7 +290,7 @@ impl<T: Transport> Radio<T> {
     /// The frequency moves by the band's current step size (see
     /// [`get_step_size`](super::Radio::get_step_size) /
     /// [`set_step_size`](super::Radio::set_step_size)). The step size varies by
-    /// band and mode — for example, 25 kHz for FM, 1 kHz for SSB.
+    /// band and mode: for example, 25 kHz for FM, 1 kHz for SSB.
     ///
     /// # Wire format
     ///
@@ -423,7 +423,7 @@ impl<T: Transport> Radio<T> {
     /// responses (matching the sent command's mnemonic) to the caller and unsolicited frames
     /// to the broadcast channel.
     ///
-    /// This command is write-only — there is no `AI` read form. To check the current state,
+    /// This command is write-only; there is no `AI` read form. To check the current state,
     /// you must track it in your application after calling this method.
     ///
     /// # Wire format
@@ -564,13 +564,13 @@ impl<T: Transport> Radio<T> {
     //
     // Each method enters MCP programming mode, reads the containing page,
     // modifies the target byte, writes the page back, and exits. The USB
-    // connection does not survive the MCP transition — after calling any of
+    // connection does not survive the MCP transition: after calling any of
     // these methods, drop the Radio and reconnect.
     // -----------------------------------------------------------------------
 
     /// Set key beep on/off via MCP memory write.
     ///
-    /// The CAT `BE` command is a firmware stub on the TH-D75 — it always
+    /// The CAT `BE` command is a firmware stub on the TH-D75; it always
     /// returns `?` for writes. This method writes directly to the verified
     /// MCP offset (`0x1071`) instead.
     ///
@@ -606,7 +606,7 @@ impl<T: Transport> Radio<T> {
 
     /// Set beep volume level via MCP memory write.
     ///
-    /// The CAT `BE` command only supports on/off — volume level must be
+    /// The CAT `BE` command only supports on/off; volume level must be
     /// set via MCP. Writes directly to verified MCP offset (`0x1072`).
     /// Volume range is 0–7 (per Menu 915 in the Operating Tips §5.6.1).
     ///
@@ -687,7 +687,7 @@ impl<T: Transport> Radio<T> {
 
     // NOTE: there is deliberately no `set_lock_via_mcp`. The legacy MCP
     // lock offset (0x1060) is `radio.BacklightControl` in the MCP-D75
-    // registry — writing it silently rewrote the backlight mode. The
+    // registry, and writing it silently rewrote the backlight mode. The
     // key-lock state is runtime state; `set_lock`/`get_lock` (CAT LC/DL)
     // are the supported path.
 

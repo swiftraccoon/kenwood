@@ -3,7 +3,7 @@
 //! Catches regressions in parser strictness. The real pcap corpus
 //! lives in an external git submodule (see
 //! `tests/conformance/corpus/README.md`). The corpus is not
-//! committed, so the replay tests are `#[ignore]`d — check out the
+//! committed, so the replay tests are `#[ignore]`d: check out the
 //! corpus and run them explicitly with `--ignored`.
 //!
 //! # Packet framing
@@ -13,16 +13,16 @@
 //! headers, and hands the UDP payload to the matching protocol's
 //! lenient decoders. A capture holds packets in both directions, so
 //! each payload is tried against both decoders. Individual rejects
-//! are expected — reflectors emit unrecognized packet lengths as a
-//! matter of course — but every capture file must contain at least
+//! are expected (reflectors emit unrecognized packet lengths as a
+//! matter of course), but every capture file must contain at least
 //! one payload the protocol accepts, and nothing may panic. Accept
 //! and reject counts are printed per file for manual inspection.
 //!
 //! Supported link layers:
 //!
-//! - Ethernet II (EN10MB) — IPv4 payload starts at offset 14
-//! - BSD loopback (NULL) — IPv4 payload starts at offset 4
-//! - Raw IPv4 — payload starts at offset 0
+//! - Ethernet II (EN10MB): IPv4 payload starts at offset 14
+//! - BSD loopback (NULL): IPv4 payload starts at offset 4
+//! - Raw IPv4: payload starts at offset 0
 //!
 //! IPv6 is not supported (reflector captures are IPv4 in practice).
 
@@ -52,7 +52,7 @@ const PCAP_BUFFER_BYTES: usize = 65_536;
 /// Walk every `.pcap` file under `dir` and hand each captured UDP
 /// payload to `decoder`, which reports whether the payload was
 /// accepted by at least one direction's decoder. Asserts that every
-/// pcap file contains at least one accepted payload — a file where
+/// pcap file contains at least one accepted payload: a file where
 /// both decoders reject everything means parser strictness regressed
 /// (or the capture is mislabeled). Missing directories are skipped
 /// with a note so an `--ignored` run without the corpus reports what
@@ -99,7 +99,7 @@ fn replay_dir(dir: &Path, mut decoder: impl FnMut(&[u8], &mut VecSink) -> bool) 
         assert!(
             accepted > 0,
             "no UDP payload in {} decoded in either direction ({count} payloads, \
-             {rejected} rejected) — parser strictness regressed or the capture is \
+             {rejected} rejected); parser strictness regressed or the capture is \
              mislabeled",
             path.display()
         );

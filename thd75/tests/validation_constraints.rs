@@ -10,8 +10,8 @@ use kenwood_thd75::types::*;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
-// weakening the lint. (`::aprs` — the `types::*` glob shadows the
-// bare crate name.)
+// weakening the lint. (`::aprs` is needed because the `types::*` glob
+// shadows the bare crate name.)
 use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
@@ -38,12 +38,12 @@ fn entry<T: Copy>(table: &[T], idx: usize, name: &str) -> Result<T, BoxErr> {
 }
 
 // ============================================================================
-// 1. Boundary tests — exact boundary for each validated type (12 tests)
+// 1. Boundary tests: exact boundary for each validated type (12 tests)
 // ============================================================================
 
 #[test]
 fn tone_code_boundary() {
-    // Independent spec assertion — KI4LAX TABLE A (50 CTCSS) + ARFC RE (code 50 = 1750Hz)
+    // Independent spec assertion: KI4LAX TABLE A (50 CTCSS) + ARFC RE (code 50 = 1750Hz)
     assert_eq!(ToneCode::MAX_INDEX, 50, "spec: KI4LAX TABLE A + ARFC RE");
     assert!(
         ToneCode::new(ToneCode::MAX_INDEX - 1).is_ok(),
@@ -720,7 +720,7 @@ fn all_validation_error_variants_display() {
 }
 
 // ============================================================================
-// 6. Round-trip tests — channel/tone types
+// 6. Round-trip tests: channel/tone types
 // ============================================================================
 
 /// Verify `TryFrom<u8>` -> `From<T>` -> `u8` round-trip for a range.
@@ -779,7 +779,7 @@ fn channel_enum_types_round_trip() -> TestResult {
 }
 
 // ============================================================================
-// 7. Round-trip tests — radio parameter types
+// 7. Round-trip tests: radio parameter types
 // ============================================================================
 
 #[test]

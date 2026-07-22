@@ -19,7 +19,7 @@ use crate::error::AprsError;
 /// zero-padding the degree field to `deg_width` columns.
 ///
 /// Per APRS 1.0.1 §6 p.23-24, the minutes field is **whole minutes
-/// `00..=59` plus hundredths `00..=99`** — never `60.00`. A naive
+/// `00..=59` plus hundredths `00..=99`**, never `60.00`. A naive
 /// `format!("{minutes:05.2}")` on a value like `59.9999` rounds the
 /// printed minutes up to `60.00` with no carry into the degree field,
 /// emitting a malformed coordinate that decodes a full degree off (or
@@ -37,7 +37,7 @@ pub(crate) fn format_ddmm_hundredths(value_abs: f64, deg_width: usize) -> String
     // Total hundredths-of-a-minute across the whole value, rounded to
     // the nearest integer. For a clamped latitude (<=90) this is at
     // most 90 * 60 * 100 = 540_000; for longitude (<=180) at most
-    // 1_080_000 — both far inside u32.
+    // 1_080_000. Both are far inside u32.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -199,9 +199,9 @@ impl Longitude {
 /// A ground-speed measurement with explicit units.
 ///
 /// APRS uses multiple unit conventions depending on context:
-/// - **Knots** — Mic-E and course/speed extension on wire
-/// - **`Km/h`** — `SmartBeaconing` parameters
-/// - **Mph** — US weather station display convention
+/// - **Knots**: Mic-E and course/speed extension on wire
+/// - **`Km/h`**: `SmartBeaconing` parameters
+/// - **Mph**: US weather station display convention
 ///
 /// This enum keeps each unit distinct and provides lossless conversions
 /// so callers never accidentally mix them.
@@ -237,14 +237,14 @@ impl Speed {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "APRS speeds are physical quantities the caller is responsible for keeping \
-                  sane — u16 covers 0..65535 knots which exceeds every terrestrial APRS use \
+                  sane: u16 covers 0..65535 knots which exceeds every terrestrial APRS use \
                   case (satellites up to ~14,000 knots, aircraft to ~2000 knots). \
                   `cast_possible_truncation` fires on `.round() as u16` because clippy can't \
                   prove the f64 is bounded; `cast_sign_loss` fires because the `Kmh` and \
                   `Mph` variants internally store non-negative floats but the types don't \
                   enforce it. A fix-the-code version of this method would use \
                   `.round().clamp(0.0, f64::from(u16::MAX)) as u16` to make the saturation \
-                  explicit — left as `#[expect]` pending that refactor."
+                  explicit; left as `#[expect]` pending that refactor."
     )]
     pub fn as_knots(self) -> u16 {
         match self {
@@ -344,9 +344,9 @@ impl fmt::Display for MessageId {
 ///
 /// Per APRS 1.0.1 §5.1, the first character of a position report's symbol
 /// pair selects the table:
-/// - `/` — Primary table (most common symbols)
-/// - `\` — Alternate table
-/// - `0-9` or `A-Z` — Overlay character (displays on top of the alternate
+/// - `/`: Primary table (most common symbols)
+/// - `\`: Alternate table
+/// - `0-9` or `A-Z`: Overlay character (displays on top of the alternate
 ///   table's symbol) used for groups and regional indicators
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolTable {
@@ -460,7 +460,7 @@ impl Fahrenheit {
 // Tocall
 // ---------------------------------------------------------------------------
 
-/// An APRS "tocall" — the destination callsign used to identify the
+/// An APRS "tocall": the destination callsign used to identify the
 /// originating software or device.
 ///
 /// APRS tocalls follow the form `APxxxx` where the `xxxx` is registered
@@ -486,7 +486,7 @@ impl Tocall {
     ///
     /// Returns [`AprsError::InvalidTocall`] on invalid input.
     pub fn new(s: &str) -> Result<Self, AprsError> {
-        // Reuse Callsign's validation rules — tocalls are structurally
+        // Reuse Callsign's validation rules; tocalls are structurally
         // identical to callsigns, they're just a different namespace.
         // `Callsign::new` lives in ax25-codec and returns `Ax25Error`;
         // map to this crate's `AprsError` at the boundary.
@@ -814,7 +814,7 @@ mod tests {
 
     #[test]
     fn ddmm_longitude_carry_boundary_97_999983() -> TestResult {
-        // 97.999983° used to print "09760.00" — must carry to 98° 00.00'.
+        // 97.999983° used to print "09760.00"; it must carry to 98° 00.00'.
         let core = format_ddmm_hundredths(97.999_983, 3);
         let (deg, min, hun) = split_ddmm(&core, 3)?;
         assert!(min < 60, "minutes must stay < 60, got {min} in {core}");

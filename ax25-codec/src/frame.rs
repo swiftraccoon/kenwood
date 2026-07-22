@@ -23,7 +23,7 @@ pub const MAX_DIGIPEATERS: usize = 8;
 /// `0x1021`, initial value `0xFFFF`, reflected, `xorout = 0xFFFF`) over
 /// a byte slice.
 ///
-/// KISS frames do not carry the FCS — the TNC computes and strips it —
+/// KISS frames do not carry the FCS (the TNC computes and strips it),
 /// but this function is provided for callers working with raw AX.25
 /// over a transport that does expect the FCS (e.g. a software modem,
 /// SDR, or packet capture tool). The byte order on the wire is
@@ -104,7 +104,7 @@ impl Ax25Packet {
 
 /// Decode a single AX.25 address slot from a 7-byte slice. Returns the
 /// validated [`Ax25Address`] plus the raw wire bit 7 (interpretation
-/// depends on slot — caller decides).
+/// depends on slot; caller decides).
 ///
 /// Rejects callsign bytes outside ASCII A-Z / 0-9 (after the AX.25
 /// `<< 1` shift is undone) and rejects embedded spaces (only trailing
@@ -119,7 +119,7 @@ fn decode_address(bytes: [u8; 7]) -> Result<(Ax25Address, bool), Ax25Error> {
             continue;
         }
         if in_pad {
-            // Non-space byte after padding starts — malformed per §3.12.2.
+            // Non-space byte after padding starts: malformed per §3.12.2.
             return Err(Ax25Error::InvalidCallsignByte(ch));
         }
         if !ch.is_ascii_alphanumeric() {
@@ -136,10 +136,10 @@ fn decode_address(bytes: [u8; 7]) -> Result<(Ax25Address, bool), Ax25Error> {
 }
 
 /// Encode a single AX.25 address slot into 7 bytes. `bit7` is written
-/// to wire bit 7 (interpretation depends on slot — caller decides).
+/// to wire bit 7 (interpretation depends on slot; caller decides).
 /// `is_last` sets the address-extension bit on the final address.
 fn encode_address(addr: &Ax25Address, bit7: bool, is_last: bool) -> [u8; 7] {
-    let mut bytes = [0x40u8; 7]; // space << 1 = 0x40 — right-pads to 6 chars
+    let mut bytes = [0x40u8; 7]; // space << 1 = 0x40, right-pads to 6 chars
     for (slot, &ch) in bytes
         .iter_mut()
         .take(6)
@@ -424,7 +424,7 @@ mod tests {
     /// Absolute wire pin for the encoder, hand-derived from AX.25
     /// v2.2 §3.12. Every other encode check in this crate round-trips
     /// through our own parser, which MASKS the reserved SSID bits the
-    /// encoder writes (`(ssid_byte >> 1) & 0x0F`) — an encoder
+    /// encoder writes (`(ssid_byte >> 1) & 0x0F`), so an encoder
     /// emitting `0x00`-base SSID bytes would pass the entire suite
     /// while producing frames other TNCs may reject. Layout per SSID
     /// byte: C/H in bit 7, reserved `0b11` in bits 6-5, SSID in bits
@@ -480,7 +480,7 @@ mod tests {
     /// Wire-level idempotence for canonical inputs:
     /// `build(parse(bytes)) == bytes`. Decode tolerates lowercase
     /// wire callsigns as NORMALIZATION (uppercasing on the way in),
-    /// so identity holds only for canonical frames — which is exactly
+    /// so identity holds only for canonical frames, which is exactly
     /// what this pins: the parser/encoder pair must not silently
     /// rewrite any bit of an already-canonical frame.
     #[test]
@@ -644,7 +644,7 @@ mod tests {
 
     #[test]
     fn endpoint_address_display_omits_asterisk() -> TestResult {
-        // Endpoints have no H-bit semantic — never render `*`.
+        // Endpoints have no H-bit semantic, so never render `*`.
         let addr = Ax25Address::new("APRS", 0)?;
         assert_eq!(alloc::format!("{addr}"), "APRS");
         let addr = Ax25Address::new("N0CALL", 7)?;

@@ -1,4 +1,4 @@
-TH-D75 Deep Probe — CONFIRMED SAFE READS ONLY
+TH-D75 Deep Probe: CONFIRMED SAFE READS ONLY
 Date: 2026-03-25
 Port: /dev/cu.usbmodem101
 Sources: D75-CAT-Control, LA3QMA TH-D74 docs, Hamlib

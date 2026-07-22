@@ -2,7 +2,7 @@
 //!
 //! The TH-D75 has a built-in GPS receiver that provides position data for APRS beaconing,
 //! waypoint navigation, and time synchronization. The GPS integrates directly with the APRS
-//! TNC — when APRS beaconing is enabled and the GPS has a fix, position reports are
+//! TNC: when APRS beaconing is enabled and the GPS has a fix, position reports are
 //! automatically included in transmitted beacons.
 //!
 //! The `pc_output` flag in the GPS configuration controls whether raw NMEA sentences are
@@ -13,7 +13,7 @@
 //!
 //! - **GP**: GPS enable and PC output configuration
 //! - **GS**: NMEA sentence selection (which sentence types to output)
-//! - **GM**: GPS/Radio mode (bare read only — `GM 1` reboots the radio into GPS-only mode)
+//! - **GM**: GPS/Radio mode (bare read only; `GM 1` reboots the radio into GPS-only mode)
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
@@ -47,7 +47,7 @@ impl<T: Transport> Radio<T> {
 
     /// Get GPS NMEA sentence enable flags (GS read).
     ///
-    /// Returns `(gga, gll, gsa, gsv, rmc, vtg)` — six booleans indicating which NMEA 0183
+    /// Returns `(gga, gll, gsa, gsv, rmc, vtg)`: six booleans indicating which NMEA 0183
     /// sentence types are enabled for output when `pc_output` is active.
     ///
     /// # Sentence types
@@ -93,7 +93,7 @@ impl<T: Transport> Radio<T> {
     /// - `gps_enabled`: turns the GPS receiver on or off. When off, no position fix is
     ///   available for APRS beaconing or display.
     /// - `pc_output`: when `true`, the radio outputs raw NMEA sentences over the serial
-    ///   connection (USB or Bluetooth SPP). **This competes with CAT command I/O** — NMEA
+    ///   connection (USB or Bluetooth SPP). **This competes with CAT command I/O**: NMEA
     ///   data will be interleaved with CAT responses on the same serial channel, which can
     ///   confuse the protocol parser. Only enable this if you are prepared to handle mixed
     ///   NMEA/CAT traffic, or if you are using the serial port exclusively for GPS data.
@@ -136,7 +136,7 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if the command fails or the response is unexpected.
     #[expect(
         clippy::fn_params_excessive_bools,
-        reason = "CAT `GS band,gga,gll,gsa,gsv,rmc,vtg` is a 6-boolean fixed-format command — the \
+        reason = "CAT `GS band,gga,gll,gsa,gsv,rmc,vtg` is a 6-boolean fixed-format command; the \
                   API mirrors the wire layout 1:1. Grouping into a struct would add indirection \
                   without improving clarity since each bool names one NMEA sentence type."
     )]

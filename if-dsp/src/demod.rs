@@ -103,7 +103,7 @@ mod tests {
     use super::*;
     use crate::spectrum_test_support::tone_amplitude;
 
-    /// Complex tone at `freq_hz` (may be negative), amplitude 0.5 —
+    /// Complex tone at `freq_hz` (may be negative), amplitude 0.5:
     /// what a unit-amplitude IF tone looks like after the real mix.
     fn half_tone(freq_hz: f64, rate: f64, len: usize) -> Vec<Complex32> {
         (0..len)

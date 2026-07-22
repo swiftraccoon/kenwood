@@ -43,25 +43,25 @@ impl AprsMessage {
     ///
     /// The classification ladder, in spec-mandated precedence order:
     ///
-    /// 1. **`AckRej`** — text begins with `ack`/`rej` + 1-5 alnum
+    /// 1. **`AckRej`**: text begins with `ack`/`rej` + 1-5 alnum
     ///    (control frames use a regular station addressee but the text
     ///    shape disambiguates).
-    /// 2. **`NwsBulletin`** — addressee starts with `NWS-`, `SKY-`,
+    /// 2. **`NwsBulletin`**: addressee starts with `NWS-`, `SKY-`,
     ///    `CWA-`, or `BOM-` per APRS 1.0.1 §14 p.74.
-    /// 3. **`Bulletin { number }`** — addressee is exactly `BLN<digit>`
+    /// 3. **`Bulletin { number }`**: addressee is exactly `BLN<digit>`
     ///    (general bulletin) per APRS 1.0.1 §14 p.73.
-    /// 4. **`Announcement { letter }`** — addressee is exactly
+    /// 4. **`Announcement { letter }`**: addressee is exactly
     ///    `BLN<uppercase letter>` per APRS 1.0.1 §14 p.73.
-    /// 5. **`GroupBulletin { group }`** — addressee is `BLN` + 1-5
+    /// 5. **`GroupBulletin { group }`**: addressee is `BLN` + 1-5
     ///    alnum chars not matched by (3) or (4), per APRS 1.0.1 §14
     ///    p.74 (the spec's canonical form is `BLN<digit><group>` but
     ///    in-the-wild traffic uses many variations, so we accept any
     ///    multi-char tail).
-    /// 6. **`Direct`** — anything else.
+    /// 6. **`Direct`**: anything else.
     #[must_use]
     pub fn kind(&self) -> MessageKind {
         let addr = self.addressee.trim();
-        // Check ack/rej on text first — control frames use a regular
+        // Check ack/rej on text first: control frames use a regular
         // addressee.
         if classify_ack_rej(&self.text).is_some() {
             return MessageKind::AckRej;
@@ -157,11 +157,11 @@ pub fn parse_aprs_message(info: &[u8]) -> Result<AprsMessage, AprsError> {
 
     // Split on `{` for message ID and APRS 1.2 reply-ack extension.
     // Four possible trailer forms to recognise (checked from richest):
-    //   1. `text{MM}AA`  — reply-ack: MM is this msg's id, AA is ack
-    //   2. `text{MM}`    — reply-ack capability advertisement: MM is
+    //   1. `text{MM}AA`  is reply-ack: MM is this msg's id, AA is ack
+    //   2. `text{MM}`    is a reply-ack capability advertisement: MM is
     //                      this msg's id, no ack piggybacked
-    //   3. `text{MM`     — plain message id
-    //   4. `text`        — no trailer
+    //   3. `text{MM`     is a plain message id
+    //   4. `text`        has no trailer
     let (text, message_id, reply_ack) = parse_message_trailer(trimmed_body);
 
     Ok(AprsMessage {
@@ -215,7 +215,7 @@ fn parse_message_trailer(body: &str) -> (String, Option<String>, Option<String>)
         return (prefix.to_owned(), Some(after_brace.to_owned()), None);
     }
 
-    // Neither pattern matched — treat whole body as plain text.
+    // Neither pattern matched; treat whole body as plain text.
     (body.to_owned(), None, None)
 }
 
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn parse_message_reply_ack_advertisement() -> TestResult {
         // APRS 1.2 reply-ack addendum: `{MM}` with nothing after the
-        // brace advertises reply-ack capability — this message's id is
+        // brace advertises reply-ack capability: this message's id is
         // MM and no ack is piggybacked.
         let info = b":N0CALL   :hi{05}";
         let msg = parse_aprs_message(info)?;
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn message_kind_group_bulletin_requires_multichar_tail() {
         // A single-character tail is *not* a
-        // group bulletin — it's either a Bulletin (digit) or
+        // group bulletin; it's either a Bulletin (digit) or
         // Announcement (letter). Group bulletins use 2-5 char tails.
         let msg = AprsMessage {
             addressee: "BLNWX".to_owned(),

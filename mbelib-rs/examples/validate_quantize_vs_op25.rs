@@ -6,7 +6,7 @@
 // Rust `quantize()` function and reports how the emitted `b[0..8]`
 // compares with OP25's for every frame. Any divergence helps pinpoint
 // which codebook search / DCT / interpolation step in our pipeline
-// differs from the reference — without any confounding from stages
+// differs from the reference, without any confounding from stages
 // 1–4 (PCM → spectral analysis), which use different algorithms.
 //
 // Usage:
@@ -163,7 +163,7 @@ fn amps_from_op25(sa: &[i32], num_harms: usize) -> SpectralAmplitudes {
     let mut magnitudes = [0.0_f32; MAX_HARMONICS];
     for (slot, &v) in magnitudes.iter_mut().zip(sa.iter().take(num_harms)) {
         // Pass OP25's sa verbatim as the "raw" magnitude. Our quantize
-        // then multiplies by SA_SCALE=32768 then `log2` — but OP25 is
+        // then multiplies by SA_SCALE=32768 then `log2`, but OP25 is
         // already at the int16 scale (log2 ready), so divide first so
         // the round-trip through `sa * SA_SCALE` lands at OP25's value.
         #[expect(
@@ -198,7 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut b_pos_matches = [0_usize; 9];
 
     // Previous-frame state: for frame 0, zero prev. For frame N, use
-    // frame N-1's post-encode dump — even when N-1 was a skipped
+    // frame N-1's post-encode dump, even when N-1 was a skipped
     // silence-ish frame.
     let mut prev_frame: Option<&Op25Frame> = None;
     for (i, f) in frames.iter().enumerate() {
@@ -222,7 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         prev_frame = Some(f);
         if f.num_harms == 0 {
-            continue; // silence-ish frame in OP25 — skip
+            continue; // silence-ish frame in OP25; skip
         }
         let pitch = pitch_from_op25(f.ref_pitch_q88, 0.5);
         let amps = amps_from_op25(&f.sa, f.num_harms);

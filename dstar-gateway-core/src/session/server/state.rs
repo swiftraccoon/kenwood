@@ -6,7 +6,7 @@
 //! break the typestate's exhaustiveness proof.
 //!
 //! [`ServerStateKind`] is the runtime discriminator that mirrors the
-//! compile-time markers — used in error variants, diagnostics, and
+//! compile-time markers, used in error variants, diagnostics, and
 //! any path where the `S` phantom has been erased.
 
 /// Sealed marker for server-side session states.
@@ -22,7 +22,7 @@ pub struct Unknown;
 
 /// `DPlus`-specific: LINK1 seen and acknowledged, waiting for LINK2.
 ///
-/// This state only applies to `DPlus` sessions — `DExtra` and `DCS`
+/// This state only applies to `DPlus` sessions; `DExtra` and `DCS`
 /// link in a single packet and move directly from [`Unknown`] to
 /// [`Linked`]. The public runtime discriminator
 /// [`ServerStateKind`] collapses `Link1Received` into
@@ -44,7 +44,7 @@ pub struct Streaming;
 #[derive(Debug, Clone, Copy)]
 pub struct Unlinking;
 
-/// Terminal — client disconnected.
+/// Terminal state: the client disconnected.
 #[derive(Debug, Clone, Copy)]
 pub struct Closed;
 

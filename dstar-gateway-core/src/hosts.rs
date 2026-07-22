@@ -27,7 +27,7 @@ pub struct HostEntry {
 
 /// Collection of host file entries keyed by reflector name.
 ///
-/// Lookups are case-insensitive — the query is upper-cased before
+/// Lookups are case-insensitive: the query is upper-cased before
 /// the `HashMap` lookup. Parsed insertion likewise upper-cases the
 /// name. Duplicate names use last-wins semantics.
 #[derive(Debug, Clone, Default)]
@@ -124,7 +124,7 @@ const XLX_DCS_PORT: u16 = 30051;
 /// This is the `xlxapi.rlx.lu/api.php?do=GetReflectorHostname` format:
 /// one `name<whitespace>address` entry per line, grouped under `#`
 /// comment headers. The same reflector appears once per protocol
-/// prefix (`REF`, `XRF`, `DCS`), all pointing at one address — those
+/// prefix (`REF`, `XRF`, `DCS`), all pointing at one address; those
 /// prefixes are protocols, not separate networks.
 ///
 /// Protocol family and UDP port are derived from the name prefix.

@@ -9,7 +9,7 @@
 //! - All three clients received the 14-byte LINK ACK exactly once.
 //!
 //! The test bypasses the top-level `Reflector::run` to keep the
-//! wiring minimal — the real multi-protocol orchestration is a
+//! wiring minimal; the real multi-protocol orchestration is a
 //! thin wrapper over the same endpoint code path. A separate
 //! smoke test covers `Reflector::new_with_socket` + shutdown.
 
@@ -86,7 +86,7 @@ async fn drain_one(sock: &UdpSocket, buf: &mut [u8], label: &str) -> Result<usiz
 
 #[tokio::test]
 async fn three_clients_fan_out_voice_without_echo() -> Result<(), Box<dyn std::error::Error>> {
-    // Endpoint socket — simulates the reflector binding :30001.
+    // Endpoint socket, simulating the reflector binding :30001.
     let endpoint_socket = UdpSocket::bind("127.0.0.1:0").await?;
     let endpoint_addr = endpoint_socket.local_addr()?;
     let endpoint_socket = Arc::new(endpoint_socket);
@@ -191,7 +191,7 @@ async fn three_clients_fan_out_voice_without_echo() -> Result<(), Box<dyn std::e
         assert_eq!(n4, 27, "{label}: EOT size");
     }
 
-    // Client A must not have received any fan-out — it's the sender.
+    // Client A must not have received any fan-out; it's the sender.
     // We consider "no datagram in 100 ms" sufficient proof of no echo.
     let mut scratch = [0u8; 128];
     let no_echo =

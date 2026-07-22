@@ -22,10 +22,10 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// (`m_pollInactivityTimer(1000U, 60U)` = 60 seconds).
 pub const KEEPALIVE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// `DExtra` voice inactivity timeout — synthesize `VoiceEnd` after this.
+/// `DExtra` voice inactivity timeout: synthesize `VoiceEnd` after this.
 pub const VOICE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// `DExtra` disconnect ACK timeout — give up waiting for unlink reply.
+/// `DExtra` disconnect ACK timeout: give up waiting for unlink reply.
 pub const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Number of times the connect packet is retransmitted.
@@ -36,7 +36,7 @@ pub const HEADER_RETX: u8 = 5;
 
 /// DSVT magic at offsets `[0..4]` of every `DExtra` voice packet.
 ///
-/// **Note**: unlike `DPlus`, `DExtra` has NO 2-byte length prefix —
+/// **Note**: unlike `DPlus`, `DExtra` has NO 2-byte length prefix.
 /// DSVT magic is at offset 0, not offset 2.
 pub const DSVT_MAGIC: [u8; 4] = *b"DSVT";
 
@@ -72,7 +72,7 @@ pub const VOICE_EOT_LEN: usize = 27;
 /// followed by `0x00` at byte `[13]`.
 ///
 /// Reference: `ircDDBGateway/Common/ConnectData.cpp:302-308`
-/// (`data[LONG_CALLSIGN_LENGTH + 2U] = 'A';` — i.e. `data[10]`).
+/// (`data[LONG_CALLSIGN_LENGTH + 2U] = 'A';`, i.e. `data[10]`).
 pub const CONNECT_ACK_TAG: [u8; 3] = *b"ACK";
 
 /// NAK tag at offsets `[10..13]` of a 14-byte connect reply,

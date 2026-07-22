@@ -10,7 +10,7 @@
 //!
 //! [`MemoryImage`] owns the raw byte buffer and hands out lightweight
 //! accessor structs ([`ChannelAccess`], [`SettingsAccess`], etc.) that
-//! borrow into it. No data is copied on access — parsing happens
+//! borrow into it. No data is copied on access; parsing happens
 //! on-demand when you call methods on the accessors.
 //!
 //! Mutation works the same way: call a mutable accessor, modify a
@@ -134,7 +134,7 @@ pub use settings::{SettingsAccess, SettingsWriter};
 /// let channels = image.channels();
 /// if channels.is_used(0) {
 ///     if let Some(entry) = channels.get(0) {
-///         println!("Ch 0: {} — {} Hz", entry.name, entry.flash.rx_frequency.as_hz());
+///         println!("Ch 0: {} ({} Hz)", entry.name, entry.flash.rx_frequency.as_hz());
 ///     }
 /// }
 ///
@@ -247,7 +247,7 @@ impl MemoryImage {
         // 0x0396), the radio menu block (0x1000..0x10E0, including the
         // power-on message string at 0x10C0), the APRS lock bits at
         // 0x120A, and the DV EMR volume at 0x1A03. The diff window
-        // must cover ALL of them — a setter outside the window mutates
+        // must cover ALL of them: a setter outside the window mutates
         // the image but reports "nothing changed", and the caller
         // silently skips the radio write-back.
         const SETTINGS_START: usize = 0x0000;
@@ -376,7 +376,7 @@ impl MemoryImage {
     /// # Errors
     ///
     /// Returns a [`SdCardError`] if the built-in model string is rejected
-    /// (unreachable under normal operation — `"Data For TH-D75A"` is in the
+    /// (unreachable under normal operation: `"Data For TH-D75A"` is in the
     /// crate's `KNOWN_MODELS` constant, so this method is effectively
     /// infallible unless that constant changes).
     pub fn to_d75_bytes(&self) -> Result<Vec<u8>, SdCardError> {
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn modify_setting_sees_settings_below_0x1000() -> TestResult {
-        // dual_band lives at 0x0396 — outside the old diff window
+        // dual_band lives at 0x0396, outside the old diff window
         // [0x1000, 0x1100), where the mutation happened but was
         // reported as "nothing changed", silently skipping the radio
         // write-back.

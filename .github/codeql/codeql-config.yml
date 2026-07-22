@@ -2,7 +2,7 @@
 #
 # The lodestar/ directory holds the native iOS / macOS Swift app
 # that talks to lodestar-core over UniFFI. Its Xcode project is
-# generated on demand via XcodeGen from project.yml — we don't
+# generated on demand via XcodeGen from project.yml; we don't
 # commit the .xcodeproj, .xcworkspace, or DerivedData/ directories,
 # so CodeQL's Swift autobuild step fails with
 # "autobuild detected neither an Xcode project or workspace, nor a

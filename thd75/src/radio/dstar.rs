@@ -7,10 +7,10 @@
 //! # Command relationships
 //!
 //! - **DS**: selects the active D-STAR callsign slot (which stored callsign configuration to use)
-//! - **CS**: selects the active callsign slot number (0-10) — similar to DS but for the CS
+//! - **CS**: selects the active callsign slot number (0-10), similar to DS but for the CS
 //!   slot register. The actual callsign text is read via DC.
 //! - **DC**: reads D-STAR callsign data for a given slot (1-6). This command lives in
-//!   [`audio.rs`](super) because it was discovered during audio subsystem probing — the DC
+//!   [`audio.rs`](super) because it was discovered during audio subsystem probing; the DC
 //!   mnemonic is overloaded on the D75 compared to the D74.
 //! - **GW**: D-STAR gateway setting for repeater linking
 
@@ -159,9 +159,9 @@ impl<T: Transport> Radio<T> {
     /// In D-STAR, the URCALL field determines the routing behaviour of your
     /// transmission (per User Manual Chapter 16):
     ///
-    /// - `"CQCQCQ  "` — general CQ call (local or via gateway)
-    /// - A specific callsign — callsign routing through the D-STAR network
-    /// - A reflector command — link/unlink/info/echo operations
+    /// - `"CQCQCQ  "`: general CQ call (local or via gateway)
+    /// - A specific callsign: callsign routing through the D-STAR network
+    /// - A reflector command: link/unlink/info/echo operations
     ///
     /// Returns `(callsign, suffix)` where both are as stored on the radio
     /// (8-char callsign, up to 4-char suffix).
@@ -177,10 +177,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// The URCALL field controls D-STAR routing behaviour. Common values:
     ///
-    /// - CQ call: `set_urcall("CQCQCQ", "")` — general call
-    /// - Callsign routing: `set_urcall("KQ4NIT", "")` — route to a station
-    /// - Reflector link: `set_urcall("REF030", "CL")` — connect module C, link
-    /// - Reflector unlink: `set_urcall("       U", "")` — 7 spaces + U
+    /// - CQ call: `set_urcall("CQCQCQ", "")` for a general call
+    /// - Callsign routing: `set_urcall("KQ4NIT", "")` to route to a station
+    /// - Reflector link: `set_urcall("REF030", "CL")` to connect module C, link
+    /// - Reflector unlink: `set_urcall("       U", "")`, 7 spaces + U
     ///
     /// The callsign is space-padded to 8 characters and the suffix to 4
     /// characters before writing to the radio.
@@ -302,7 +302,7 @@ impl<T: Transport> Radio<T> {
 
     /// Disconnect from the current D-STAR reflector.
     ///
-    /// Sets URCALL to the unlink command (`"       U"` — 7 spaces followed
+    /// Sets URCALL to the unlink command (`"       U"`, 7 spaces followed
     /// by 'U') with a blank suffix. The operator must then key up to
     /// trigger the unlink.
     ///

@@ -10,17 +10,17 @@ use crate::header::DStarHeader;
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlowDataBlockKind {
-    /// `0x3X` — GPS NMEA passthrough.
+    /// `0x3X`: GPS NMEA passthrough.
     Gps,
-    /// `0x4X` — 20-character status text.
+    /// `0x4X`: 20-character status text.
     Text,
-    /// `0x5X` — header retransmission.
+    /// `0x5X`: header retransmission.
     HeaderRetx,
-    /// `0x8X` — fast data variant 1.
+    /// `0x8X`: fast data variant 1.
     FastData1,
-    /// `0x9X` — fast data variant 2.
+    /// `0x9X`: fast data variant 2.
     FastData2,
-    /// `0xCX` — squelch / control.
+    /// `0xCX`: squelch / control.
     Squelch,
     /// Any other high nibble.
     Unknown {
@@ -64,14 +64,14 @@ pub enum SlowDataBlock {
     Text(SlowDataText),
     /// Retransmitted header.
     HeaderRetx(DStarHeader),
-    /// Fast data block 1 — opaque payload.
+    /// Fast data block 1, with an opaque payload.
     FastData(Vec<u8>),
     /// Squelch / control marker.
     Squelch {
         /// Squelch code byte.
         code: u8,
     },
-    /// Unknown block type — payload preserved verbatim.
+    /// Unknown block type, with the payload preserved verbatim.
     Unknown {
         /// The type byte that didn't match a known kind.
         type_byte: u8,

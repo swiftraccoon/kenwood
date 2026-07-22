@@ -9,14 +9,14 @@
 //!   hero (who's transmitting now), the heard list, and link
 //!   readouts, with a bottom transmit strip (`tx_strip`) holding the
 //!   PTT toggle, mic meter, and slow-data / GPS-beacon controls.
-//! - Debug page: the engineering surface — the append-only event log
+//! - Debug page: the engineering surface, the append-only event log
 //!   plus stream-stats, TX, and audio tools.
 //!
 //! Overlays (`ui::Overlay`, at most one open at a time) draw above
 //! whichever page is showing: the connect sheet (searchable reflector
-//! directory + manual host form) and the gear settings popup —
-//! callsign, behaviour toggles, and audio devices, in
-//! `ui::settings_popup`. A dismissable error strip sits under the
+//! directory + manual host form) and the gear settings popup
+//! (callsign, behaviour toggles, and audio devices, in
+//! `ui::settings_popup`). A dismissable error strip sits under the
 //! header on both pages.
 
 use std::net::SocketAddr;
@@ -108,7 +108,7 @@ pub(crate) struct App {
     /// Timestamp display mode (heard list + event log).
     pub(crate) time_mode: TimeMode,
     /// The machine's UTC offset, detected once at startup while the
-    /// process was still single-threaded. `None` when undetectable —
+    /// process was still single-threaded. `None` when undetectable;
     /// [`TimeMode::Local`] then falls back to UTC.
     pub(crate) local_offset: Option<time::UtcOffset>,
 
@@ -164,7 +164,7 @@ pub(crate) enum LogLevel {
     Error,
 }
 
-/// Debug-page log filter — which levels the log view shows.
+/// Debug-page log filter: which levels the log view shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum LogFilter {
     /// Every line.
@@ -199,7 +199,7 @@ pub(crate) struct RxStreamStats {
 }
 
 /// Audio-worker status mirrored into the GUI from the `AudioStatus`
-/// channel — device lists, live levels, and recording state.
+/// channel: device lists, live levels, and recording state.
 #[derive(Debug, Default)]
 pub(crate) struct AudioState {
     /// Enumerated input device names.
@@ -261,12 +261,12 @@ impl App {
         let protocol = match settings.protocol.as_str() {
             "DPlus" => ProtocolKind::DPlus,
             "Dcs" | "DCS" => ProtocolKind::Dcs,
-            // DExtra is the historical default — also the fallback for
+            // DExtra is the historical default, and the fallback for
             // unknown / future protocol strings so a forward-compat
             // settings file can't brick the GUI.
             _ => ProtocolKind::DExtra,
         };
-        // Apply a persisted device choice on launch — the audio worker
+        // Apply a persisted device choice on launch: the audio worker
         // starts on host defaults, so re-select only if a name is set.
         if !settings.input_device.is_empty() || !settings.output_device.is_empty() {
             audio.send(AudioCommand::SelectDevices {
@@ -275,7 +275,7 @@ impl App {
                     .then(|| settings.output_device.clone()),
             });
         }
-        // Deliver the persisted RX-enhancement mode — the audio worker
+        // Deliver the persisted RX-enhancement mode: the audio worker
         // boots with enhancement off, so only a saved "enhanced" needs
         // sending.
         if settings.rx_audio.is_enhanced() {
@@ -293,7 +293,7 @@ impl App {
             });
         }
         {
-            // Authoritative REF list from the DPlus auth server — the
+            // Authoritative REF list from the DPlus auth server, the
             // same startup exchange every DPlus dongle performs. Must
             // outrank the XLX registry's REF-alias entries, which
             // point at unrelated XLX reflectors.
@@ -400,9 +400,8 @@ impl App {
                     );
                 }
                 DirectoryUpdate::Failed(err) => {
-                    self.directory.set_status(format!(
-                        "reflector list: fetch failed ({err}) — using cache"
-                    ));
+                    self.directory
+                        .set_status(format!("reflector list: fetch failed ({err}); using cache"));
                     self.append_log_line(
                         LogLevel::Error,
                         format!("reflector directory fetch failed: {err}"),
@@ -442,7 +441,7 @@ impl App {
     fn append_log_line(&mut self, level: LogLevel, text: String) {
         if self.log.len() >= LOG_CAPACITY {
             // Evict the oldest entry. `swap_remove(0)` would be O(1)
-            // but reorders — for a log display we want FIFO order.
+            // but reorders; for a log display we want FIFO order.
             let _removed = self.log.remove(0);
         }
         self.log.push(LogLine {
@@ -462,7 +461,7 @@ impl App {
         if matches!(s, ConnStatus::Disconnected) {
             self.active_tx = false;
             self.audio.send(AudioCommand::StopTx);
-            // Clear stale RX state from the prior session —
+            // Clear stale RX state from the prior session;
             // a new session will populate fresh values.
             self.last_slow_data = None;
             self.last_gps = None;
@@ -478,7 +477,7 @@ impl App {
         // beacon configured before connecting takes effect immediately.
         if matches!(self.status, ConnStatus::Connected { .. }) {
             self.push_slow_data();
-            // Remember the connection and persist — a successful
+            // Remember the connection and persist: a successful
             // connect is a natural checkpoint, and saving here means
             // recents survive a crash.
             let entry = SavedHost {
@@ -504,7 +503,7 @@ impl App {
                     route,
                 } => {
                     // Decoder reset is driven by the session task
-                    // (direct to audio worker) — the GUI only shows
+                    // (direct to audio worker); the GUI only shows
                     // the event in the log.
                     self.append_log_line(
                         LogLevel::Event,
@@ -517,7 +516,7 @@ impl App {
                     self.rx_route = Some(route);
                     self.rx_active_since = Some(std::time::Instant::now());
                     // The hero attributes slow-data / position to the
-                    // speaker on screen — a new stream must not
+                    // speaker on screen; a new stream must not
                     // inherit the previous speaker's. Their copy
                     // stays on their heard-list row.
                     self.last_slow_data = None;
@@ -567,7 +566,7 @@ impl App {
                     lost,
                     late,
                 } => {
-                    // No log line — this fires up to once per second;
+                    // No log line: this fires up to once per second;
                     // VoiceEnd already logs the final frame count.
                     self.last_rx_stats = Some(RxStreamStats {
                         received,
@@ -576,7 +575,7 @@ impl App {
                     });
                 }
                 SessionEvent::LinkHealth { last_heard_secs } => {
-                    // 1 Hz sample — display-only, never logged.
+                    // 1 Hz sample: display-only, never logged.
                     self.link_last_heard_secs = Some(last_heard_secs);
                 }
                 SessionEvent::ReflectorHosts(hosts) => {
@@ -610,7 +609,7 @@ impl App {
                 return;
             }
         };
-        // Record the identity every attempt goes out as — a stale
+        // Record the identity every attempt goes out as: a stale
         // callsign silently poisons DPlus auth, so the log must make
         // it visible per-attempt.
         self.append_log_line(
@@ -628,7 +627,7 @@ impl App {
     pub(crate) fn try_disconnect(&self) {
         let _unused = self.cmd_tx.try_send(SessionCommand::Disconnect);
         // Persist current form state when the user voluntarily
-        // disconnects — this is the natural checkpoint where they're
+        // disconnects; this is the natural checkpoint where they're
         // most likely to have settled on the values they want next time.
         self.snapshot_settings().save();
         if self.persist_heard_list {
@@ -891,7 +890,7 @@ impl App {
 }
 
 impl eframe::App for App {
-    /// Persist form state when the window closes — covers the common
+    /// Persist form state when the window closes, covering the common
     /// case of quitting without an explicit disconnect.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.snapshot_settings().save();

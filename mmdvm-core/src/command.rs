@@ -4,7 +4,7 @@
 
 //! MMDVM command byte constants.
 //!
-//! Every protocol byte used in the MMDVM wire format — command IDs,
+//! Every protocol byte used in the MMDVM wire format: command IDs,
 //! response IDs, mode bytes, and capability bitfield masks.
 //!
 //! Mirrors the `MMDVM_*` constants at the top of
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn capability_bits() {
-        // CAP1 is a bitfield — each bit must be distinct.
+        // CAP1 is a bitfield: each bit must be distinct.
         let cap1 = CAP1_DSTAR | CAP1_DMR | CAP1_YSF | CAP1_P25 | CAP1_NXDN | CAP1_FM;
         assert_eq!(cap1, 0x5F);
         assert_eq!(CAP2_POCSAG, 0x01);

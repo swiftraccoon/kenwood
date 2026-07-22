@@ -1,16 +1,16 @@
-//! Deep probe — map the full read-only data surface of the TH-D75.
+//! Deep probe: map the full read-only data surface of the TH-D75.
 //!
 //! STRICTLY READ-ONLY. Every command sent here has been verified against
 //! D74 development notes and Hamlib source.
 //!
 //! ## Commands EXCLUDED (will change radio state):
-//! - SR (RESET — factory resets radio)
-//! - 0M (enters programming mode — radio stops responding)
-//! - TX (keys transmitter — transmits on air)
+//! - SR (RESET: factory resets radio)
+//! - 0M (enters programming mode; radio stops responding)
+//! - TX (keys transmitter; transmits on air)
 //! - RX (forces receive mode)
 //! - UP (steps frequency up)
-//! - DW (steps frequency DOWN — NOT dual watch!)
-//! - BE (sends APRS beacon — transmits on air!)
+//! - DW (steps frequency DOWN, NOT dual watch!)
+//! - BE (sends APRS beacon; transmits on air!)
 //! - BC with parameter (changes active band)
 //! - MR with 2 params (switches active channel)
 //! - VM with 2 params (changes VFO/Memory mode)
@@ -19,9 +19,9 @@
 //! - Any command with write parameters
 //!
 //! ## Safe read patterns used:
-//! - Bare mnemonic: `XX\r` — for commands with no index
-//! - Band-indexed: `XX 0\r` / `XX 1\r` — for per-band queries
-//! - Channel-indexed: `ME ccc\r` — reads memory channel data
+//! - Bare mnemonic: `XX\r`, for commands with no index
+//! - Band-indexed: `XX 0\r` / `XX 1\r`, for per-band queries
+//! - Channel-indexed: `ME ccc\r`, which reads memory channel data
 //! - Slot-indexed: `DC 1\r`-`DC 6\r`, `CS 0\r`-`CS 10\r`
 //!
 //! Run: cargo test --test deep_probe -- --ignored --nocapture --test-threads=1
@@ -111,7 +111,7 @@ async fn deep_probe_all_reads() {
     let mut output: Vec<String> = Vec::new();
     let mut alive = true;
 
-    output.push("TH-D75 Deep Probe — CONFIRMED SAFE READS ONLY".into());
+    output.push("TH-D75 Deep Probe: CONFIRMED SAFE READS ONLY".into());
     output.push("Date: 2026-03-25".into());
     output.push(format!("Port: {}", ports[0].port_name));
     output.push("Sources: D74 development notes, Hamlib".into());
@@ -141,7 +141,7 @@ async fn deep_probe_all_reads() {
     }
 
     // ================================================================
-    // FREQUENCY — per band (confirmed: FO band, FQ band)
+    // FREQUENCY: per band (confirmed: FO band, FQ band)
     // ================================================================
     if alive {
         output.push("\n===== FREQUENCY (per band) =====".into());
@@ -152,7 +152,7 @@ async fn deep_probe_all_reads() {
     }
 
     // ================================================================
-    // VFO SETTINGS — per band
+    // VFO SETTINGS: per band
     // Confirmed safe: SQ band, SM band, MD band, PC band, RA band
     // Confirmed safe bare: AG, FS, FT
     // SH uses mode index not band: SH 0, SH 1, SH 2
@@ -196,7 +196,7 @@ async fn deep_probe_all_reads() {
     }
 
     // ================================================================
-    // CONTROL — bare reads
+    // CONTROL: bare reads
     // ================================================================
     if alive {
         output.push("\n===== CONTROL SETTINGS =====".into());
@@ -222,7 +222,7 @@ async fn deep_probe_all_reads() {
     }
 
     // ================================================================
-    // TONE — per band for TN, bare for RT
+    // TONE: per band for TN, bare for RT
     // ================================================================
     if alive {
         output.push("\n===== TONE SETTINGS =====".into());
@@ -233,7 +233,7 @@ async fn deep_probe_all_reads() {
     }
 
     // ================================================================
-    // D-STAR — bare DS, indexed DC 1-6, indexed CS 0-10
+    // D-STAR: bare DS, indexed DC 1-6, indexed CS 0-10
     // ================================================================
     if alive {
         output.push("\n===== D-STAR =====".into());
@@ -251,7 +251,7 @@ async fn deep_probe_all_reads() {
             }
         }
         // CS bare: active callsign slot number
-        // NOTE: CS N (indexed) is a WRITE that selects the slot — do NOT send
+        // NOTE: CS N (indexed) is a WRITE that selects the slot; do NOT send
         if alive {
             alive = bare_read(&mut transport, "CS", &mut output).await;
         }
@@ -261,7 +261,7 @@ async fn deep_probe_all_reads() {
     }
 
     // ================================================================
-    // GPS — bare reads only (GM bare is safe, GM with params is NOT)
+    // GPS: bare reads only (GM bare is safe, GM with params is NOT)
     // ================================================================
     if alive {
         output.push("\n===== GPS =====".into());
@@ -283,7 +283,7 @@ async fn deep_probe_all_reads() {
     }
 
     // ================================================================
-    // APRS — bare reads for AS, PT, MS
+    // APRS: bare reads for AS, PT, MS
     // AE is serial number (bare read, already captured above)
     // ================================================================
     if alive {
@@ -298,7 +298,7 @@ async fn deep_probe_all_reads() {
     }
 
     // ================================================================
-    // USER SETTINGS — bare read
+    // USER SETTINGS: bare read
     // ================================================================
     if alive {
         output.push("\n===== USER SETTINGS =====".into());
@@ -306,7 +306,7 @@ async fn deep_probe_all_reads() {
     }
 
     // ================================================================
-    // SCAN — SF per band, BS per band
+    // SCAN: SF per band, BS per band
     // ================================================================
     if alive {
         output.push("\n===== SCAN =====".into());
@@ -374,7 +374,7 @@ async fn deep_probe_all_reads() {
     }
 
     println!("\n{}", "=".repeat(72));
-    println!("  TH-D75 DEEP PROBE — CONFIRMED SAFE READS ONLY");
+    println!("  TH-D75 DEEP PROBE: CONFIRMED SAFE READS ONLY");
     println!("{}\n", "=".repeat(72));
     for line in &output {
         println!("{line}");

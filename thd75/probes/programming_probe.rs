@@ -74,7 +74,7 @@ async fn probe_programming_mode() {
     hex_dump(&resp, "Entry response");
 
     if resp.is_empty() {
-        println!("  NO RESPONSE — radio may not support 0M PROGRAM");
+        println!("  NO RESPONSE; radio may not support 0M PROGRAM");
         // Try to exit anyway
         let _ = transport.write(b"E").await;
         let _ = transport.close().await;
@@ -97,7 +97,7 @@ async fn probe_programming_mode() {
     hex_dump(&read_cmd, "Read command sent");
     let _ = transport.write(&read_cmd).await;
 
-    // Use longer timeout — radio may take a while to respond
+    // Use longer timeout; radio may take a while to respond
     // Poll in a loop
     println!("  Waiting for response (up to 10s, polling every 100ms)...");
     let resp = read_all_available(&mut transport, 10000).await;

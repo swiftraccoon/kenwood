@@ -1,7 +1,7 @@
 # Introduction
 
 `dstar-gateway` is an async Rust library for speaking the three
-D-STAR reflector protocols — **DPlus** (REF reflectors, port
+D-STAR reflector protocols: **DPlus** (REF reflectors, port
 20001), **DExtra** (XRF/XLX reflectors, port 30001), and **DCS**
 (DCS reflectors, port 30051). It provides a typed client API, a
 multi-client reflector server, and a runtime-agnostic sans-io core
@@ -26,7 +26,7 @@ are the places to go.
 
 `dstar-gateway` ships as three crates:
 
-- **`dstar-gateway-core`** — the sans-io core. Contains the wire
+- **`dstar-gateway-core`**: the sans-io core. Contains the wire
   format codecs for all three protocols, the typestate
   `Session<P, S>` state machines, the slow-data sub-codec, the
   DPRS parser, and the server session implementation. Has no
@@ -34,7 +34,7 @@ are the places to go.
   dependency on an async runtime. You drive it by calling pure
   functions that take byte slices and return byte slices plus
   events.
-- **`dstar-gateway`** — the tokio shell. Wraps `dstar-gateway-core`
+- **`dstar-gateway`**: the tokio shell. Wraps `dstar-gateway-core`
   in a `tokio::net::UdpSocket`-backed driver loop, spawns it as a
   task, and exposes an `AsyncSession<P>` handle with the familiar
   `send_header` / `send_voice` / `send_eot` / `disconnect` /
@@ -43,11 +43,11 @@ are the places to go.
   shell for CLI scripts), and the optional `hosts-fetcher`
   feature (pulls `reqwest` and fetches the XLX reflector
   directory over HTTP).
-- **`dstar-gateway-server`** — the reflector server. Provides the
+- **`dstar-gateway-server`**: the reflector server. Provides the
   `Reflector` type, the `ClientPool<P>`, the `fan_out_voice`
   function, the `ClientAuthorizer` trait, and an optional
   cross-protocol forwarding bus. Both the client and server sides
-  support all three protocols — `DExtra`, `DPlus`, and `DCS`. The
+  support all three protocols: `DExtra`, `DPlus`, and `DCS`. The
   server enables all three by default, spawning one
   `ProtocolEndpoint<P>` task per enabled protocol.
 
@@ -64,14 +64,14 @@ Three ideas drive every design decision in the library:
    port. (See [ADR 0001](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/adr/0001-sans-io.md).)
 2. **Typestate the happy path.** Invalid state transitions are
    compile errors, not runtime checks. You cannot call
-   `send_voice` on a `Session<DExtra, Configured>` — the type
+   `send_voice` on a `Session<DExtra, Configured>`: the type
    system rejects the call before the test suite runs. (See
    [ADR 0002](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/adr/0002-typestate.md).)
 3. **Lenient bytes, strict diagnostics.** The codec parses every
    real-world reflector's quirks without failing, but every
    non-canonical byte becomes a structured diagnostic through the
    `DiagnosticSink` trait. Strict rejection is a caller-side
-   policy: there is no shipped strict-mode wrapper type — a
+   policy: there is no shipped strict-mode wrapper type, so a
    consumer who wants it supplies a `DiagnosticSink` whose
    `record` flags (or short-circuits on) any diagnostic. (See
    [ADR 0004](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/adr/0004-lenient-validator.md).)
@@ -88,7 +88,7 @@ Three ideas drive every design decision in the library:
 > [`examples/`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway/examples).
 
 - **I want to exercise a client against a local reflector.** Jump to
-  [Hello, local DPlus](getting-started/hello-dplus.md) — the one
+  [Hello, local DPlus](getting-started/hello-dplus.md), the one
   walkthrough with a complete, working code listing.
 - **I want to understand the typestate API.** Read §2.2 of
   [ARCHITECTURE.md](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/ARCHITECTURE.md)

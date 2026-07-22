@@ -69,7 +69,7 @@ impl ModemMode {
     /// Parse a wire byte into a mode.
     ///
     /// Unknown bytes are mapped to [`ModemMode::Idle`] to keep the
-    /// sans-io core lenient — callers that need strict validation
+    /// sans-io core lenient; callers that need strict validation
     /// should compare the raw byte against the `MODE_*` constants
     /// themselves.
     #[must_use]

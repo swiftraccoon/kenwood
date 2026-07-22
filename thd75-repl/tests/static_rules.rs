@@ -1,6 +1,6 @@
 //! Static accessibility rule checks (R10, R11, R13, R14).
 //!
-//! These rules are structural — they cannot be verified from
+//! These rules are structural: they cannot be verified from
 //! captured output alone. Instead this test scans the REPL's source
 //! files for forbidden patterns. Runs as part of `cargo test`.
 
@@ -48,7 +48,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), std::io::E
 fn r10_no_print_without_newline() -> TestResult {
     // Skip `print!` entirely in user output. `print!` is only
     // allowed for the interactive prompt, which uses
-    // rustyline::readline() directly — not `print!`.
+    // rustyline::readline() directly, not `print!`.
     for file in src_files()? {
         let text = fs::read_to_string(&file)?;
         for (line_no, line) in text.lines().enumerate() {
@@ -200,7 +200,7 @@ fn function_spans(lines: &[&str], names: &[&str]) -> Vec<(usize, usize)> {
 fn r14_no_eprintln_in_user_output_path() -> TestResult {
     // User-facing output goes to stdout via println!/aprintln!.
     // Diagnostics go to stderr via `tracing`. `eprintln!` is a
-    // code smell — it bypasses tracing and bypasses stdout. The
+    // code smell: it bypasses tracing and bypasses stdout. The
     // exceptions, checked by actual function span rather than "the
     // declaration appears somewhere earlier in the file" (which
     // exempted everything below `init_logging` in main.rs):

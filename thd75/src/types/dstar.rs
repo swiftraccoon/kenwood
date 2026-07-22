@@ -57,10 +57,10 @@ use crate::error::ValidationError;
 /// and data options. Derived from the capability gap analysis features 40-62.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "Mirrors the radio's D-STAR menu tree 1:1 — each bool maps to a discrete on/off menu \
-              item (EMR, auto-reply, data squelch, etc.) that the user can toggle independently. \
-              Consolidating into a bitflags enum would lose the field-by-field self-documenting \
-              layout that matches the user manual's menu structure."
+    reason = "Mirrors the radio's D-STAR menu tree 1:1, so each bool maps to a discrete on/off \
+              menu item (EMR, auto-reply, data squelch, etc.) that the user can toggle \
+              independently. Consolidating into a bitflags enum would lose the field-by-field \
+              self-documenting layout that matches the user manual's menu structure."
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DstarConfig {
@@ -184,7 +184,7 @@ impl DstarCallsign {
     #[must_use]
     pub fn to_wire_bytes(&self) -> [u8; 8] {
         let mut buf = [b' '; 8];
-        // Zip bounds the iteration by the shorter of the two — buf has exactly 8
+        // Zip bounds the iteration by the shorter of the two: buf has exactly 8
         // bytes so at most 8 source bytes are written; no indexing needed.
         buf.iter_mut()
             .zip(self.0.as_bytes().iter())
@@ -655,19 +655,19 @@ pub enum ReflectorCommand {
 ///
 /// # Special URCALL patterns (per DPlus/DCS/DExtra conventions)
 ///
-/// - `"CQCQCQ  "` — Broadcast CQ (no routing)
-/// - `"       E"` — Echo test (7 spaces + `E`)
-/// - `"       U"` — Unlink from reflector (7 spaces + `U`)
-/// - `"       I"` — Request info (7 spaces + `I`)
-/// - `"REF001 A"` — Link to reflector REF001, module A
+/// - `"CQCQCQ  "`: Broadcast CQ (no routing)
+/// - `"       E"`: Echo test (7 spaces + `E`)
+/// - `"       U"`: Unlink from reflector (7 spaces + `U`)
+/// - `"       I"`: Request info (7 spaces + `I`)
+/// - `"REF001 A"`: Link to reflector REF001, module A
 ///   (up to 7 chars reflector name + module letter)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UrCallAction {
-    /// Broadcast CQ — no special routing.
+    /// Broadcast CQ: no special routing.
     Cq,
-    /// Echo test — record and play back the transmission.
+    /// Echo test: record and play back the transmission.
     Echo,
-    /// Unlink — disconnect from the current reflector.
+    /// Unlink: disconnect from the current reflector.
     Unlink,
     /// Request information from the gateway.
     Info,

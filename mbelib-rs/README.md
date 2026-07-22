@@ -14,12 +14,12 @@ Decoder on by default; encoder behind the `encoder` Cargo feature.
   interoperability is not yet validated, and the ignored correlation test
   tracks a known spectral-envelope defect.
 - **Waveform enhancement** (`--features wave-enhance`): learned
-  post-processors for decoder output — small complex-STFT masking
+  post-processors for decoder output (small complex-STFT masking
   networks adversarially fine-tuned against reference hardware-grade
-  decodes of identical AMBE frames — that regenerate waveform fine
+  decodes of identical AMBE frames) that regenerate waveform fine
   structure the base synthesis cannot. Two variants compile in:
   `enhance_wave`, the offline whole-clip model (bidirectional
-  recurrence — best quality, requires the complete clip), and
+  recurrence: best quality, requires the complete clip), and
   `enhance_live`, its causal counterpart with a forward-only
   recurrence and a streaming frame-at-a-time API whose total
   algorithmic lookahead (< 56 ms) fits inside a typical network
@@ -145,7 +145,7 @@ Symmetrical to decode, plus an analysis front-end:
 7. Closed-loop `prev_log2_ml` reconstruction: after emitting the
    49-bit parameter vector we run `decode_params()` internally to
    capture what the on-air decoder will reconstruct, and carry THAT
-   state into the next frame's prediction residual computation —
+   state into the next frame's prediction residual computation,
    so encoder and decoder track identical magnitude history.
 8. Golay(23,12) encode on C0 and C1 + outer parity.
 9. LFSR scramble of C1 seeded from C0 data bits.
@@ -169,22 +169,22 @@ example, run with:
 cargo run -p mbelib-rs --release --features encoder --example <name> -- <args>
 ```
 
-- `validate_quantize_vs_op25 <op25.trace>` — feeds OP25's exact
+- `validate_quantize_vs_op25 <op25.trace>`: feeds OP25's exact
   `imbe_param` (sa, `v_uv_dsn`, `ref_pitch`, prev state) into our
   `quantize()` and reports `b[0..8]` field differences. Match rates depend
   on the supplied trace; no fixed percentage is treated as a current
   guarantee.
-- `validate_analysis_vs_op25 <pcm> <op25.trace>` — runs our full
+- `validate_analysis_vs_op25 <pcm> <op25.trace>`: runs our full
   analysis pipeline on identical PCM and compares `pitch`/`num_harms`
   against OP25's IMBE. The 2-frame DP look-ahead from OP25
   `pitch_est.cc:229-281` is implemented (`AmbeEncoder::new_with_lookahead`,
   `PitchTracker::estimate_with_lookahead`), closing most of this gap
   at the cost of ≈40 ms added latency.
-- `validate_bvec_vs_op25 <pcm> <op25.trace>` — per-field `b0..b8` diff
+- `validate_bvec_vs_op25 <pcm> <op25.trace>`: per-field `b0..b8` diff
   of our encoder against OP25's `ambe_encode_dump` trace, reverse-
   deriving each field from our 49-bit `ambe_d` via the D-STAR bit
   layout.
-- `validate_dp_vs_op25 <pcm> <op25.trace>` — A/B of single-frame
+- `validate_dp_vs_op25 <pcm> <op25.trace>`: A/B of single-frame
   `PitchTracker::estimate` against the 2-frame DP
   `estimate_with_lookahead`, reporting the pitch-match rate for each.
 
@@ -206,10 +206,10 @@ reliable DVSI chip interoperability are not guaranteed.
 
 ## Dependencies
 
-- `realfft` — 256-point real FFT for unvoiced synthesis (decoder),
+- `realfft`: 256-point real FFT for unvoiced synthesis (decoder),
   spectral analysis (encoder), and the enhancement STFT
   (`wave-enhance`).
-- `wide` — `f32x4`/`i32x4` SIMD for float→i16 conversion.
+- `wide`: `f32x4`/`i32x4` SIMD for float→i16 conversion.
 
 Both are pure Rust (MIT/Apache-2.0), so no C, no FFI, no `unsafe`.
 

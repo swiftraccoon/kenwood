@@ -216,7 +216,7 @@ async fn verify_cat_writes() {
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetMode"),
     }
 
-    // Frequency Down (DW — sends step-down then reads back frequency)
+    // Frequency Down (DW sends step-down then reads back frequency)
     match radio.frequency_down(Band::A).await {
         Ok(ch) => println!("  {:<25} OK (freq={})", "FrequencyDown", ch.rx_frequency),
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "FrequencyDown"),

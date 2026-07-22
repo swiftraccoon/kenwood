@@ -71,8 +71,8 @@ static pthread_t g_pump_thread;
 static _Atomic int g_pump_running = 0;
 static _Atomic int g_open_count = 0;
 static pthread_mutex_t g_bt_mutex = PTHREAD_MUTEX_INITIALIZER;
-// Ingress bytes dropped because the (non-blocking) pipe was full —
-// the Rust side stopped draining. Surfaces in traces; the CAT layer's
+// Ingress bytes dropped because the (non-blocking) pipe was full,
+// i.e. the Rust side stopped draining. Surfaces in traces; the CAT layer's
 // timeout machinery handles the resulting gap.
 static _Atomic unsigned long g_ingress_dropped = 0;
 
@@ -81,7 +81,7 @@ static _Atomic unsigned long g_ingress_dropped = 0;
     // All _ctx access is serialized with bt_rfcomm_close under
     // g_bt_mutex: close() nulls _ctx under the mutex BEFORE freeing
     // the context, so a callback either sees a valid context (and
-    // blocks close until it's done) or NULL — never freed memory.
+    // blocks close until it's done) or NULL, never freed memory.
     pthread_mutex_lock(&g_bt_mutex);
     if (_ctx && e == kIOReturnSuccess) _ctx->state = 1;
     pthread_mutex_unlock(&g_bt_mutex);
@@ -102,7 +102,7 @@ static _Atomic unsigned long g_ingress_dropped = 0;
             unsigned long total = (g_ingress_dropped += dropped);
             fprintf(stderr,
                     "[bt] WARNING: ingress pipe full; dropped %zu bytes "
-                    "(total %lu) — consumer not draining\n",
+                    "(total %lu); consumer not draining\n",
                     dropped, total);
         }
         bt_trace("rfcommChannelData exit wrote=%zd", w);
@@ -129,13 +129,13 @@ static void *pump_main_runloop(void *arg) {
 }
 
 void bt_pump_runloop(void) {
-    // Must pump the MAIN thread's run loop — IOBluetooth delivers
+    // Must pump the MAIN thread's run loop: IOBluetooth delivers
     // RFCOMM callbacks there regardless of which thread calls this.
     if ([NSThread isMainThread]) {
         // Bounded pump: 1 ms cap. Should always return promptly.
         // If a long "enter" with no matching "exit" shows up in a
         // hang's tail, the freeze is inside a CFRunLoop callback
-        // (most likely rfcommChannelData: — see its own trace).
+        // (most likely rfcommChannelData:, which has its own trace).
         bt_trace("bt_pump_runloop enter main");
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, false);
         bt_trace("bt_pump_runloop exit main");
@@ -148,7 +148,7 @@ void bt_pump_runloop(void) {
     }
 }
 
-// Internal open — must be called from a thread with an active CFRunLoop.
+// Internal open: must be called from a thread with an active CFRunLoop.
 static void *do_rfcomm_open(const char *device_name, uint8_t rfcomm_channel) {
     @autoreleasepool {
         NSString *name = [NSString stringWithUTF8String:device_name];
@@ -169,7 +169,7 @@ static void *do_rfcomm_open(const char *device_name, uint8_t rfcomm_channel) {
         ctx->pipe_write = fds[1];
         fcntl(ctx->pipe_read, F_SETFL, fcntl(ctx->pipe_read, F_GETFL) | O_NONBLOCK);
         // Non-blocking WRITE end too: the delegate callback writes on
-        // the main thread while holding g_bt_mutex — a blocking write
+        // the main thread while holding g_bt_mutex, and a blocking write
         // into a full pipe would wedge the main thread (and deadlock
         // against close, which needs the same mutex). Overflow drops
         // are counted in g_ingress_dropped instead.
@@ -229,7 +229,7 @@ void *bt_rfcomm_open(const char *device_name, uint8_t rfcomm_channel) {
         // Only one RFCOMM handle may exist per process: a second
         // open would call closeConnection on the live device (the
         // radio shows connected), tearing the baseband out from
-        // under the first handle's channel — the documented SIGTRAP.
+        // under the first handle's channel: the documented SIGTRAP.
         // Refuse instead; the caller must close the first handle
         // fully before reconnecting.
         pthread_mutex_unlock(&g_bt_mutex);
@@ -263,7 +263,7 @@ int bt_rfcomm_write(void *handle, const uint8_t *data, size_t len) {
     if (!ctx || len > UINT16_MAX) return -1;
     // writeSync: blocks until the peer acknowledges the RFCOMM frame
     // (or the channel errors out). The Rust side calls this from the
-    // blocking pool, and its future may be dropped mid-write — so the
+    // blocking pool, and its future may be dropped mid-write, so the
     // whole context access (including writeSync) runs under
     // g_bt_mutex: bt_rfcomm_close cannot free the context while a
     // write is in flight. A wedged write therefore delays close (and
@@ -301,7 +301,7 @@ void bt_rfcomm_close(void *handle) {
         // is done, so this write waits for it; any callback arriving
         // afterwards observes NULL. Merely niling without the mutex
         // races a callback that has passed its NULL check but not yet
-        // used the context — the use-after-free this fixes.
+        // used the context: the use-after-free this fixes.
         pthread_mutex_lock(&g_bt_mutex);
         ctx->delegate.ctx = NULL;
         ctx->state = -1;

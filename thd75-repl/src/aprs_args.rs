@@ -1,6 +1,6 @@
 //! Argument parsing for APRS-mode commands.
 //!
-//! Pure functions — no I/O, no radio access — so every grammar rule is
+//! Pure functions (no I/O, no radio access), so every grammar rule is
 //! unit-testable without hardware. Error strings are printed verbatim
 //! by the dispatcher and therefore follow the accessibility phrasing
 //! rules: complete sentences, units spelled out, concrete examples.

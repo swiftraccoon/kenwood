@@ -1,4 +1,4 @@
-//! DPRS CRC — CRC-CCITT over the DPRS payload bytes.
+//! DPRS CRC: CRC-CCITT over the DPRS payload bytes.
 //!
 //! Reference: `ircDDBGateway/Common/APRSCollector.cpp:371-394`
 //! (`CAPRSCollector::calcCRC`). The algorithm is:
@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn dprs_body_matches_header_crc() {
-        // A representative DPRS payload — everything after the
+        // A representative DPRS payload: everything after the
         // `$$CRC<4hex>,` prefix up to but not including the final
         // line terminator. The exact input doesn't matter; the point
         // is that the CRC algorithm matches the header CRC.
@@ -76,14 +76,14 @@ mod tests {
         // (init 0xFFFF, reflected poly 0x8408, final ~acc) and
         // cross-checking with [`crc_ccitt`]. The body is the
         // contents that would follow `$$CRC<4hex>,` in a live
-        // sentence — no line terminator, no prefix.
+        // sentence: no line terminator, no prefix.
         let body: &[u8] = b"W1AW    *>APDPRS,DSTAR*:!4041.27N/07229.28W>Test";
         let observed = compute_crc(body);
         // Delegate sanity: this must equal `crc_ccitt(body)`.
         assert_eq!(observed, crc_ccitt(body));
         // Locked-in vector to prevent silent regression to a
         // placeholder-zero implementation. This is the value the
-        // reference algorithm produces — any future edit that
+        // reference algorithm produces; any future edit that
         // changes it needs a documented reason.
         assert_eq!(observed, 0xB8D9);
     }
@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn different_inputs_produce_different_crcs() {
         // Two inputs differing by one byte must produce different
-        // CRCs — this would fail under the placeholder implementation
+        // CRCs; this would fail under the placeholder implementation
         // that returned 0 regardless of input.
         let a = compute_crc(b"HELLO");
         let b = compute_crc(b"HELLP");

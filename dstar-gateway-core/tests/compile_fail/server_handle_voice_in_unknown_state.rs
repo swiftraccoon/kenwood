@@ -1,5 +1,5 @@
 //! Calling `handle_voice_data` on a `ServerSession<_, Unknown>` must
-//! be a compile error — voice frames are only valid in the
+//! be a compile error: voice frames are only valid in the
 //! `Streaming` state.
 //!
 //! `handle_voice_data` is only implemented on
@@ -15,7 +15,7 @@ fn main() {
     let session: ServerSession<DExtra, Unknown> = todo!();
 
     // ERROR: no method named `handle_voice_data` found for
-    // `ServerSession<DExtra, Unknown>` — `handle_voice_data` is only
+    // `ServerSession<DExtra, Unknown>`; `handle_voice_data` is only
     // implemented on `ServerSession<P, Streaming>`.
     let _ = session.handle_voice_data(Instant::now(), &[0u8; 0]);
 }

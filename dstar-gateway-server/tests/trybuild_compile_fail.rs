@@ -6,7 +6,7 @@
 //! source. The test suite fails if any file compiles successfully
 //! (a typestate has regressed).
 //!
-//! This runner only covers the server crate's own public API —
+//! This runner only covers the server crate's own public API,
 //! specifically `ReflectorConfig`'s typed-builder required-field
 //! enforcement. Server-side session typestate compile-fail tests
 //! (state-gated `handle_voice_data` / `handle_link2` /
@@ -16,7 +16,7 @@
 
 // Integration tests are separate compilation units. Acknowledge
 // workspace deps that this runner does not reference directly so the
-// strict `unused_crate_dependencies` lint stays quiet — only
+// strict `unused_crate_dependencies` lint stays quiet: only
 // `trybuild` is actually touched below, everything else is needed
 // by the compile_fail targets that trybuild compiles separately.
 use dstar_gateway_core as _;

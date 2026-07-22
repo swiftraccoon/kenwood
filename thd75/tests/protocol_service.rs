@@ -23,7 +23,7 @@ use tracing as _;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 // ============================================================================
-// 0G — Enter / Exit service mode
+// 0G: Enter / Exit service mode
 // ============================================================================
 
 #[test]
@@ -59,7 +59,7 @@ fn parse_enter_service_mode_with_payload() -> TestResult {
 }
 
 // ============================================================================
-// 2V — Service version read
+// 2V: Service version read
 // ============================================================================
 
 #[test]
@@ -82,7 +82,7 @@ fn parse_service_version_response() -> TestResult {
 }
 
 // ============================================================================
-// 0S — Calibration data read
+// 0S: Calibration data read
 // ============================================================================
 
 #[test]

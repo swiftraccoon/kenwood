@@ -9,10 +9,10 @@ import IOBluetooth
 /// macOS transport using `IOBluetooth` RFCOMM (Serial Port Profile).
 ///
 /// On iPadOS this type still compiles but every operation throws
-/// `RadioTransportError.notAvailableOnPlatform` — iPad direct-radio
+/// `RadioTransportError.notAvailableOnPlatform`: iPad direct-radio
 /// support requires the (yet-to-land) USB-CDC DriverKit transport.
 ///
-/// `IOBluetoothDevice` is a macOS-only framework — Mac Catalyst cannot
+/// `IOBluetoothDevice` is a macOS-only framework, and Mac Catalyst cannot
 /// reach it (classes are marked unavailable on Catalyst). Lodestar ships
 /// a separate native macOS target rather than a Catalyst build for
 /// exactly this reason.
@@ -77,7 +77,7 @@ public actor IOBluetoothTransport: RadioTransport {
         }
         #else
         throw RadioTransportError.notAvailableOnPlatform(
-            reason: "Bluetooth Classic SPP is macOS-only. On iPad, use the USB-C transport (USBSerialTransport) — the coordinator selects it automatically."
+            reason: "Bluetooth Classic SPP is macOS-only. On iPad, use the USB-C transport (USBSerialTransport); the coordinator selects it automatically."
         )
         #endif
     }

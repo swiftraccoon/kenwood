@@ -12,7 +12,7 @@ use kenwood_thd75::types::*;
 /// Helper: connect to the first discovered TH-D75.
 async fn connect() -> Radio<SerialTransport> {
     let ports = SerialTransport::discover_usb().expect("USB discovery failed");
-    assert!(!ports.is_empty(), "No TH-D75 found — connect radio via USB");
+    assert!(!ports.is_empty(), "No TH-D75 found; connect radio via USB");
     let transport = SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD)
         .expect("Failed to open serial port");
     Radio::connect(transport).await.expect("Failed to connect")
@@ -41,37 +41,37 @@ async fn hw_core_commands() {
     let mut radio = connect().await;
     println!("\n=== CORE COMMANDS ===");
 
-    // ID — Radio identification
+    // ID: Radio identification
     let _ = probe(&mut radio, Command::GetRadioId).await;
 
-    // FV — Firmware version
+    // FV: Firmware version
     let _ = probe(&mut radio, Command::GetFirmwareVersion).await;
 
-    // PS — Power status
+    // PS: Power status
     let _ = probe(&mut radio, Command::GetPowerStatus).await;
 
-    // BE — Send beacon (DANGEROUS: transmits — skipped in normal testing)
+    // BE: Send beacon (DANGEROUS: transmits; skipped in normal testing)
     // let _ = probe(&mut radio, Command::SendBeacon).await;
 
-    // FQ — Quick frequency read (Band A)
+    // FQ: Quick frequency read (Band A)
     let _ = probe(&mut radio, Command::GetFrequency { band: Band::A }).await;
 
-    // FQ — Quick frequency read (Band B)
+    // FQ: Quick frequency read (Band B)
     let _ = probe(&mut radio, Command::GetFrequency { band: Band::B }).await;
 
-    // FO — Full frequency + settings (Band A)
+    // FO: Full frequency + settings (Band A)
     let _ = probe(&mut radio, Command::GetFrequencyFull { band: Band::A }).await;
 
-    // FO — Full frequency + settings (Band B)
+    // FO: Full frequency + settings (Band B)
     let _ = probe(&mut radio, Command::GetFrequencyFull { band: Band::B }).await;
 
-    // PC — Power level (Band A)
+    // PC: Power level (Band A)
     let _ = probe(&mut radio, Command::GetPowerLevel { band: Band::A }).await;
 
-    // PC — Power level (Band B)
+    // PC: Power level (Band B)
     let _ = probe(&mut radio, Command::GetPowerLevel { band: Band::B }).await;
 
-    // FR — Frequency range
+    // FR: Frequency range
     let _ = probe(&mut radio, Command::GetFmRadio).await;
 
     let _ = radio.disconnect().await;
@@ -87,33 +87,33 @@ async fn hw_vfo_commands() {
     let mut radio = connect().await;
     println!("\n=== VFO COMMANDS ===");
 
-    // AG — AF Gain (bare read)
+    // AG: AF Gain (bare read)
     let _ = probe(&mut radio, Command::GetAfGain).await;
 
-    // SQ — Squelch
+    // SQ: Squelch
     let _ = probe(&mut radio, Command::GetSquelch { band: Band::A }).await;
     let _ = probe(&mut radio, Command::GetSquelch { band: Band::B }).await;
 
-    // SM — S-meter
+    // SM: S-meter
     let _ = probe(&mut radio, Command::GetSmeter { band: Band::A }).await;
     let _ = probe(&mut radio, Command::GetSmeter { band: Band::B }).await;
 
-    // MD — Mode
+    // MD: Mode
     let _ = probe(&mut radio, Command::GetMode { band: Band::A }).await;
     let _ = probe(&mut radio, Command::GetMode { band: Band::B }).await;
 
-    // FS — Fine step (bare read)
+    // FS: Fine step (bare read)
     let _ = probe(&mut radio, Command::GetFineStep).await;
 
-    // FT — Function type (bare read, no band)
+    // FT: Function type (bare read, no band)
     let _ = probe(&mut radio, Command::GetFunctionType).await;
 
-    // SH — Filter width (by mode index)
+    // SH: Filter width (by mode index)
     let _ = probe(&mut radio, Command::GetFilterWidth { mode_index: 0 }).await;
     let _ = probe(&mut radio, Command::GetFilterWidth { mode_index: 1 }).await;
     let _ = probe(&mut radio, Command::GetFilterWidth { mode_index: 2 }).await;
 
-    // RA — Attenuator
+    // RA: Attenuator
     let _ = probe(&mut radio, Command::GetAttenuator { band: Band::A }).await;
     let _ = probe(&mut radio, Command::GetAttenuator { band: Band::B }).await;
 
@@ -130,31 +130,31 @@ async fn hw_control_commands() {
     let mut radio = connect().await;
     println!("\n=== CONTROL COMMANDS ===");
 
-    // BY — Busy status
+    // BY: Busy status
     let _ = probe(&mut radio, Command::GetBusy { band: Band::A }).await;
     let _ = probe(&mut radio, Command::GetBusy { band: Band::B }).await;
 
-    // DL — Dual band display
+    // DL: Dual band display
     let _ = probe(&mut radio, Command::GetDualBand).await;
 
-    // DW — Frequency Down (action, not probed — would change frequency)
+    // DW: Frequency Down (action, not probed; it would change frequency)
 
-    // LC — Lock control
+    // LC: Lock control
     let _ = probe(&mut radio, Command::GetLock).await;
 
-    // BL — Battery Level
+    // BL: Battery Level
     let _ = probe(&mut radio, Command::GetBatteryLevel).await;
 
-    // VX — VOX
+    // VX: VOX
     let _ = probe(&mut radio, Command::GetVox).await;
 
-    // VG — VOX gain
+    // VG: VOX gain
     let _ = probe(&mut radio, Command::GetVoxGain).await;
 
-    // VD — VOX delay
+    // VD: VOX delay
     let _ = probe(&mut radio, Command::GetVoxDelay).await;
 
-    // IO — I/O port
+    // IO: I/O port
     let _ = probe(&mut radio, Command::GetIoPort).await;
 
     let _ = radio.disconnect().await;
@@ -170,14 +170,14 @@ async fn hw_tnc_dstar_clock_commands() {
     let mut radio = connect().await;
     println!("\n=== TNC / D-STAR / CLOCK COMMANDS ===");
 
-    // TN — TNC mode (bare read)
+    // TN: TNC mode (bare read)
     let _ = probe(&mut radio, Command::GetTncMode).await;
 
-    // DC — D-STAR callsign slots 1-6
+    // DC: D-STAR callsign slots 1-6
     let _ = probe(&mut radio, Command::GetDstarCallsign { slot: 1 }).await;
     let _ = probe(&mut radio, Command::GetDstarCallsign { slot: 2 }).await;
 
-    // RT — Real-time clock (bare read)
+    // RT: Real-time clock (bare read)
     let _ = probe(&mut radio, Command::GetRealTimeClock).await;
 
     let _ = radio.disconnect().await;
@@ -193,13 +193,13 @@ async fn hw_memory_commands() {
     let mut radio = connect().await;
     println!("\n=== MEMORY COMMANDS ===");
 
-    // ME — Read memory channel 0
+    // ME: Read memory channel 0
     let _ = probe(&mut radio, Command::GetMemoryChannel { channel: 0 }).await;
 
-    // ME — Read memory channel 1
+    // ME: Read memory channel 1
     let _ = probe(&mut radio, Command::GetMemoryChannel { channel: 1 }).await;
 
-    // MR — Recall memory channel 0 on band A
+    // MR: Recall memory channel 0 on band A
     let _ = probe(
         &mut radio,
         Command::RecallMemoryChannel {
@@ -209,7 +209,7 @@ async fn hw_memory_commands() {
     )
     .await;
 
-    // MR — Recall memory channel 1 on band A
+    // MR: Recall memory channel 1 on band A
     let _ = probe(
         &mut radio,
         Command::RecallMemoryChannel {
@@ -219,7 +219,7 @@ async fn hw_memory_commands() {
     )
     .await;
 
-    // 0M — Enter programming mode (DANGEROUS — skipped in normal testing)
+    // 0M: Enter programming mode (DANGEROUS; skipped in normal testing)
     // let _ = probe(&mut radio, Command::EnterProgrammingMode).await;
 
     let _ = radio.disconnect().await;

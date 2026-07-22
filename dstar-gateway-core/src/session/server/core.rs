@@ -2,7 +2,7 @@
 //!
 //! [`ServerSessionCore`] is the runtime-erased state machine that
 //! drives a single server-side client session. It handles one client
-//! at a time — the server's fan-out engine in `dstar-gateway-server`
+//! at a time; the server's fan-out engine in `dstar-gateway-server`
 //! spawns a `ServerSessionCore` per inbound peer and routes datagrams
 //! through [`ServerSessionCore::handle_input`].
 //!
@@ -11,7 +11,7 @@
 //! protocol-specific handshakes are implemented as private helpers
 //! (`handle_dextra_input`, `handle_dplus_input`, `handle_dcs_input`).
 //!
-//! The server core does NOT authenticate clients — that's the
+//! The server core does NOT authenticate clients; that's the
 //! `dstar-gateway-server` shell's `ClientAuthorizer` job. The core
 //! only manages wire decoding + state transitions + event emission.
 
@@ -66,7 +66,7 @@ enum InternalState {
 impl InternalState {
     const fn kind(self) -> ServerStateKind {
         match self {
-            // Link1Received is a DPlus-private transitional state —
+            // Link1Received is a DPlus-private transitional state;
             // the public view sees "not linked yet", same as Unknown.
             Self::Unknown | Self::Link1Received => ServerStateKind::Unknown,
             Self::Linked => ServerStateKind::Linked,
@@ -81,7 +81,7 @@ impl InternalState {
 ///
 /// [`ServerSessionCore::pop_event`] is generic over `P: Protocol` and
 /// converts each `RawServerEvent` into a [`ServerEvent<P>`] at drain
-/// time — the queue itself is protocol-erased.
+/// time; the queue itself is protocol-erased.
 #[derive(Debug, Clone)]
 enum RawServerEvent {
     Linked {
@@ -123,7 +123,7 @@ pub struct ServerSessionCore {
     peer: SocketAddr,
     /// Default reflector module for this session.
     ///
-    /// `DPlus` LINK2 does not carry a module letter on the wire —
+    /// `DPlus` LINK2 does not carry a module letter on the wire;
     /// the reflector's own identity is what implicitly selects it.
     /// This field carries the module the reflector endpoint is
     /// bound to so `DPlus` sessions have something to put in their
@@ -140,7 +140,7 @@ pub struct ServerSessionCore {
     ///
     /// DCS voice packets carry the D-STAR header embedded in every
     /// 100-byte frame, so the server can't distinguish "start of
-    /// stream" by packet type alone — it must track whether the
+    /// stream" by packet type alone; it must track whether the
     /// incoming `stream_id` is the same as the last frame's or a
     /// fresh one. On a fresh id we emit `StreamStarted` first, then
     /// the `StreamFrame`. On the same id we emit only `StreamFrame`.
@@ -180,7 +180,7 @@ impl ServerSessionCore {
     /// protocol, peer, and reflector module.
     ///
     /// `reflector_module` is the module this reflector endpoint is
-    /// bound to — used as the default for `DPlus` `ClientLinked`
+    /// bound to, used as the default for `DPlus` `ClientLinked`
     /// events and overwritten on LINK for `DExtra`/`DCS` which carry
     /// their own module in the wire packet.
     #[must_use]
@@ -325,7 +325,7 @@ impl ServerSessionCore {
         self.state = InternalState::Unlinking;
         self.events
             .push_back(RawServerEvent::Unlinked { peer: self.peer });
-        // Transition straight to Closed — we don't wait for our ACK
+        // Transition straight to Closed; we don't wait for our ACK
         // to be sent. The fan-out engine will drop this session
         // reference on the next tick.
         self.state = InternalState::Closed;
@@ -418,13 +418,13 @@ impl ServerSessionCore {
                 self.state = InternalState::Link1Received;
             }
             InternalState::Link1Received | InternalState::Linked => {
-                // Real clients retransmit LINK1 — just re-enqueue the
+                // Real clients retransmit LINK1, so just re-enqueue the
                 // ACK idempotently. If we're already Linked the client
                 // is badly lagged; echoing LINK1 is still the safest
                 // response.
             }
             InternalState::Streaming | InternalState::Unlinking | InternalState::Closed => {
-                // Ignore — can't drop back to LINK1 handshake.
+                // Ignore: can't drop back to LINK1 handshake.
                 return Ok(());
             }
         }
@@ -467,7 +467,7 @@ impl ServerSessionCore {
                 Ok(())
             }
             InternalState::Unknown | InternalState::Unlinking | InternalState::Closed => {
-                // LINK2 without LINK1 — drop silently. The real client
+                // LINK2 without LINK1: drop silently. The real client
                 // will retransmit LINK1 on its own retry timer. Safest
                 // path: do nothing.
                 Ok(())
@@ -628,7 +628,7 @@ impl ServerSessionCore {
         let n = dcs_codec::encode_connect_ack(&mut buf, &callsign, reflector_module)
             .map_err(|e| Error::Protocol(ProtocolError::Dcs(e.into())))?;
         let payload = buf.get(..n).unwrap_or(&[]).to_vec();
-        // DCS ACK is enqueued without a rate-limit delay — the caller
+        // DCS ACK is enqueued without a rate-limit delay; the caller
         // drives `now` through `pop_transmit`.
         self.outbox.enqueue(OutboundPacket {
             dst: self.peer,
@@ -682,7 +682,7 @@ impl ServerSessionCore {
         if !matches!(self.state, InternalState::Linked | InternalState::Streaming) {
             return;
         }
-        // DCS embeds the header in every voice packet — detect
+        // DCS embeds the header in every voice packet, so detect
         // stream-start by observing a new stream id.
         let is_new_stream = self.last_stream_id != Some(stream_id);
         if is_new_stream {
@@ -725,7 +725,7 @@ impl ServerSessionCore {
     /// Drain the next event, typed with the correct protocol marker.
     ///
     /// The `P` type parameter re-attaches the protocol phantom at
-    /// drain time — the event queue itself is protocol-erased.
+    /// drain time; the event queue itself is protocol-erased.
     pub fn pop_event<P: Protocol>(&mut self) -> Option<ServerEvent<P>> {
         let raw = self.events.pop_front()?;
         Some(match raw {

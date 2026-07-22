@@ -23,7 +23,7 @@ struct StationAnnotationModel: Equatable, Identifiable {
 /// The station map. `.canvas` fills the wide layout edge-to-edge under
 /// the toolbar; `.card` is the narrow layout's fixed-height tile. The
 /// camera auto-fits pins; when the live station reports GPS the camera
-/// pans (span preserved — never a destructive zoom) to include it.
+/// pans (span preserved, never a destructive zoom) to include it.
 struct StationMapPane: View {
     enum Style {
         case canvas
@@ -125,8 +125,8 @@ struct StationMapPane: View {
         }
     }
 
-    /// Callsign set driving camera refits. Keyed on callsigns — not
-    /// annotation IDs — so a repeat transmission or position refresh
+    /// Callsign set driving camera refits. Keyed on callsigns, not
+    /// annotation IDs, so a repeat transmission or position refresh
     /// from a known station never yanks a camera the operator has
     /// panned; only a genuinely new station reframes the view.
     private var callsignKey: String {
@@ -158,7 +158,7 @@ struct StationMapPane: View {
         .onChange(of: liveStream?.latestPosition) { _, newPosition in
             guard let pos = newPosition else { return }
             // Pan to the transmitting station, preserving the span the
-            // operator chose — pan, never destructive zoom.
+            // operator chose: pan, never destructive zoom.
             let span = lastSpan ?? MKCoordinateSpan(latitudeDelta: 8, longitudeDelta: 8)
             withAnimation(.easeInOut(duration: 0.6)) {
                 camera = .region(MKCoordinateRegion(
@@ -173,7 +173,7 @@ struct StationMapPane: View {
                     Rectangle().fill(.black.opacity(0.45))
                     Text(annotations.isEmpty
                          ? "Stations you hear will appear here."
-                         : "Not linked — showing last heard positions.")
+                         : "Not linked. Showing last heard positions.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .padding(10)

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Reflector directory — the searchable list of reflectors offered in
+//! Reflector directory: the searchable list of reflectors offered in
 //! the connection panel.
 //!
 //! Sources, in merge-precedence order: the bundled POLARIS test
@@ -20,14 +20,14 @@ use dstar_gateway_core::types::ProtocolKind;
 /// The `REFnnn` namespace is ambiguous: the dstargateway auth server
 /// lists the legacy US-network REF reflectors, while the XLX
 /// self-registration registry lists `REFnnn` as the DPlus-protocol
-/// alias of XLX reflector `nnn` — a different server entirely. The
+/// alias of XLX reflector `nnn`, a different server entirely. The
 /// auth server is authoritative for `REF` names, so its entries must
 /// win the dedup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostSource {
     /// Compiled-in (the POLARIS test reflector).
     Bundled,
-    /// The `DPlus` auth server's host list — authoritative for `REF`.
+    /// The `DPlus` auth server's host list, authoritative for `REF`.
     DPlusAuth,
     /// XLX self-registration registry. A `REFnnn` from here is an
     /// XLX in `DPlus`-compat mode, not a dstargateway REF.
@@ -60,7 +60,7 @@ pub(crate) struct ReflectorHost {
     pub(crate) source: HostSource,
 }
 
-/// The bundled host list — just the local POLARIS test reflector,
+/// The bundled host list: just the local POLARIS test reflector,
 /// which is in no public registry and so must ship with the app.
 pub(crate) fn bundled() -> Vec<ReflectorHost> {
     vec![ReflectorHost {
@@ -76,7 +76,7 @@ pub(crate) fn bundled() -> Vec<ReflectorHost> {
 /// the directory channel.
 #[derive(Debug)]
 pub(crate) enum DirectoryUpdate {
-    /// An XLX-registry fetch succeeded — the parsed hosts and a
+    /// An XLX-registry fetch succeeded, carrying the parsed hosts and a
     /// display timestamp.
     Loaded {
         /// Reflectors parsed from the registry.
@@ -84,13 +84,13 @@ pub(crate) enum DirectoryUpdate {
         /// ISO-date display string for the fetch time.
         when: String,
     },
-    /// A `DPlus` auth-server fetch succeeded — the authoritative REF
+    /// A `DPlus` auth-server fetch succeeded, carrying the authoritative REF
     /// host list, merged at higher precedence than the XLX registry.
     AuthLoaded {
         /// REF reflectors from the auth server.
         hosts: Vec<ReflectorHost>,
     },
-    /// A fetch failed — the error text for the status line.
+    /// A fetch failed; carries the error text for the status line.
     Failed(String),
 }
 
@@ -130,7 +130,7 @@ pub(crate) async fn fetch_directory() -> DirectoryUpdate {
 /// server (the same TCP exchange every `DPlus` dongle performs at
 /// startup). Runs on the tokio runtime; the caller forwards the
 /// returned [`DirectoryUpdate`] to the GUI. Failures are reported
-/// but harmless — the directory keeps its other sources.
+/// but harmless: the directory keeps its other sources.
 pub(crate) async fn fetch_auth_directory(callsign: String) -> DirectoryUpdate {
     let callsign = match dstar_gateway_core::types::Callsign::try_from_str(callsign.trim()) {
         Ok(c) => c,
@@ -164,7 +164,7 @@ pub(crate) struct ReflectorDirectory {
     fetched: Vec<ReflectorHost>,
     /// Reflectors merged from the `DPlus` auth host list.
     merged: Vec<ReflectorHost>,
-    /// Combined, deduplicated view — rebuilt whenever `fetched` or
+    /// Combined, deduplicated view, rebuilt whenever `fetched` or
     /// `merged` changes, so a per-frame `search` is a cheap filter.
     hosts: Vec<ReflectorHost>,
     /// Human-readable provenance line for the connection panel.
@@ -172,7 +172,7 @@ pub(crate) struct ReflectorDirectory {
 }
 
 impl ReflectorDirectory {
-    /// A directory with no fetched/merged entries — just the bundled
+    /// A directory with no fetched/merged entries: just the bundled
     /// POLARIS reflector.
     pub(crate) fn bundled_only() -> Self {
         Self {
@@ -202,7 +202,7 @@ impl ReflectorDirectory {
     }
 
     /// Rebuild the combined view: bundled, then auth-merged, then
-    /// XLX-fetched, deduplicated by `(callsign, protocol)` — the
+    /// XLX-fetched, deduplicated by `(callsign, protocol)`, where the
     /// earliest wins. Auth entries outrank the XLX registry because
     /// XLX self-registrations reuse `REFnnn` names that collide with
     /// the genuine dstargateway reflectors of the same name.
@@ -255,7 +255,7 @@ impl ReflectorDirectory {
     }
 
     /// Write the fetched entries to the on-disk cache. Errors are
-    /// logged at `warn` and swallowed — caching must never block the UI.
+    /// logged at `warn` and swallowed: caching must never block the UI.
     pub(crate) fn save_cache(&self, when: &str) {
         let Some(path) = cache_path() else {
             return;
@@ -273,7 +273,7 @@ impl ReflectorDirectory {
 }
 
 /// Remove later duplicates sharing an `(uppercased callsign, protocol)`
-/// key — the first occurrence wins.
+/// key; the first occurrence wins.
 fn dedup_hosts(hosts: &mut Vec<ReflectorHost>) {
     let mut seen = std::collections::HashSet::new();
     hosts.retain(|h| seen.insert((h.callsign.to_ascii_uppercase(), format!("{:?}", h.protocol))));

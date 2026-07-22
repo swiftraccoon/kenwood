@@ -58,7 +58,7 @@ impl Protocol for Dcs {
 ///
 /// Used as a trait bound on `Session<P, Configured>::connect` so
 /// the no-auth path only exists for protocols that don't need it.
-/// `DPlus` does NOT impl this — it requires `authenticate` first.
+/// `DPlus` does NOT impl this, since it requires `authenticate` first.
 pub trait NoAuthRequired: Protocol {}
 impl NoAuthRequired for DExtra {}
 impl NoAuthRequired for Dcs {}
@@ -70,7 +70,7 @@ mod tests {
     // `Protocol::KIND` / `DEFAULT_PORT` / `NEEDS_AUTH` are associated
     // consts, so `assert_eq!` against another literal is a
     // compile-time check clippy flags as "will be optimised out".
-    // Pull the values into local bindings first — this is a runtime
+    // Pull the values into local bindings first; this is a runtime
     // read from the function's perspective, even though the optimiser
     // folds it.
     fn needs_auth_of<P: Protocol>() -> bool {

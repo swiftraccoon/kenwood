@@ -1,7 +1,7 @@
 # Explicit target list: without this, cargo-deny uses the host platform
 # only and silently filters out deps gated for other targets. CI runs on
 # Linux x86_64 and sees redox-specific crates (parking_lot_core →
-# redox_syscall) that macOS developers don't — leading to local "bans
+# redox_syscall) that macOS developers don't, leading to local "bans
 # ok" but CI "bans FAILED". These triples cover every platform we ship
 # to (macOS ARM, macOS x86, Linux x86, Linux ARM, Windows).
 [graph]
@@ -24,7 +24,7 @@ ignore = [
     # "oxidize"/fontations project).
     #
     # "Unmaintained" here is a maintenance concern, not a security concern:
-    # there is no known vulnerability and no safe upgrade path — no egui
+    # there is no known vulnerability and no safe upgrade path; no egui
     # release has migrated off ttf-parser yet.
     #
     # Dependency path:
@@ -38,7 +38,7 @@ ignore = [
     # The only quick-xml copy in the tree (0.39.x) is pinned by
     # wayland-scanner, a Linux-only BUILD-TIME proc-macro (winit →
     # smithay → eframe → sextant) that parses only the local, trusted
-    # Wayland protocol XML shipped in the crate — no attacker-controlled
+    # Wayland protocol XML shipped in the crate; no attacker-controlled
     # XML can reach it and no runtime code ships. Recheck when
     # winit/smithay bump
     # wayland-scanner onto quick-xml 0.41.
@@ -59,18 +59,18 @@ allow = [
     "Unicode-3.0",
     "BSL-1.0",
     "Zlib",
-    # Community Data License Agreement — Permissive 2.0. Used by
+    # Community Data License Agreement Permissive 2.0. Used by
     # webpki-roots (Mozilla's web PKI root cert list, pulled in via
     # reqwest's rustls feature). Permissive data license similar to CC0.
     "CDLA-Permissive-2.0",
-    # SIL Open Font License 1.1 — used by epaint_default_fonts
+    # SIL Open Font License 1.1: used by epaint_default_fonts
     # (Ubuntu font family shipped with egui for sextant). Permissive
     # font licence that allows redistribution + derivative works.
     "OFL-1.1",
 ]
 confidence-threshold = 0.8
 
-# Per-crate license exceptions — used where a crate carries a
+# Per-crate license exceptions: used where a crate carries a
 # non-SPDX license reference (`LicenseRef-*`) that cargo-deny can't
 # match against the `allow` list.
 [[licenses.exceptions]]
@@ -86,7 +86,7 @@ name = "epaint_default_fonts"
 [bans]
 multiple-versions = "deny"
 # Path dependencies in this workspace don't carry a `version = "..."`
-# constraint — the dstar-gateway-* crates live in the kenwood monorepo
+# constraint; the dstar-gateway-* crates live in the kenwood monorepo
 # and are consumed by sibling crates via path only (we are not
 # publishing to crates.io). cargo-deny's `wildcards = "deny"` would
 # otherwise flag every path dep as a wildcard. `allow-wildcard-paths`
@@ -160,7 +160,7 @@ skip = [
     # ─────────────────────────────────────────────────────────────────────
     #
     # sextant (GUI test app for sextant↔sextant D-STAR traffic) pulls
-    # in egui, cpal, and winit — three large GUI/audio stacks whose
+    # in egui, cpal, and winit: three large GUI/audio stacks whose
     # own dep graphs sit at different maturity levels. The pairs
     # below are the "old" side of each duplicate; each will resolve
     # on its own cadence as egui/cpal/winit upgrade their transitive

@@ -167,7 +167,7 @@ impl MbeParams {
     /// Creates a zeroed parameter set representing silence.
     ///
     /// All frequencies, magnitudes, and phases are zero. This is the
-    /// starting state for a new voice stream — the first frame's delta
+    /// starting state for a new voice stream; the first frame's delta
     /// decoding will use these zeros as the prediction reference.
     pub(crate) const fn new() -> Self {
         Self {

@@ -3,7 +3,7 @@
 //! This module handles serialization and parsing of the TH-D75's serial
 //! command protocol. Commands are ASCII text terminated by carriage return
 //! (`\r`), with parameters separated by commas. The protocol layer has no
-//! async or I/O dependencies — it operates purely on byte slices.
+//! async or I/O dependencies; it operates purely on byte slices.
 //!
 //! All 55 CAT commands (53 from the firmware dispatch table, plus 2 extra
 //! mnemonics TY and 0E) are represented as variants of [`Command`] (outgoing) and [`Response`]
@@ -207,7 +207,7 @@ pub enum Command {
     /// Set AF gain level (AG write).
     ///
     /// Per KI4LAX CAT reference: `AG AAA` (AAA: 000-099, 3-digit zero-padded).
-    /// Sends bare `AG level\r` (no band parameter — firmware rejects band-indexed writes).
+    /// Sends bare `AG level\r` (no band parameter; firmware rejects band-indexed writes).
     ///
     /// **Important: the `band` field is ignored by the firmware.** The AG
     /// command on the TH-D75 is a global (non-band-specific) control.
@@ -218,7 +218,7 @@ pub enum Command {
     /// [`Command::SetMode`]) so that callers can use a uniform
     /// band+value pattern. The serializer discards it.
     SetAfGain {
-        /// Target band. **Ignored by firmware** — AF gain is a global
+        /// Target band. **Ignored by firmware**: AF gain is a global
         /// control on the TH-D75. This field exists for API symmetry
         /// with other band-indexed commands; the serializer discards it
         /// and sends a bare `AG level\r`.
@@ -288,7 +288,7 @@ pub enum Command {
     ///
     /// # Firmware bug (v1.03)
     ///
-    /// FS write is broken on firmware 1.03 — the radio returns `N`
+    /// FS write is broken on firmware 1.03; the radio returns `N`
     /// (not available) for all write attempts.
     SetFineStep {
         /// Target band.
@@ -424,11 +424,11 @@ pub enum Command {
     /// Get lock/control settings (LC read).
     ///
     /// Returns the primary lock state as a boolean. The lock state is
-    /// runtime state with no verified MCP cell — CAT is the only
+    /// runtime state with no verified MCP cell; CAT is the only
     /// supported path. (The persistent lock-type *configuration* bits
     /// live at MCP `0x1084`.)
     GetLock,
-    /// Set lock/control state — simple boolean form (LC write).
+    /// Set lock/control state, simple boolean form (LC write).
     ///
     /// Sends `LC 0` or `LC 1`. The `locked` field uses **wire semantics**:
     /// on the D75 the wire value is inverted (`true` on the wire means
@@ -438,7 +438,7 @@ pub enum Command {
     /// For full lock configuration, use
     /// [`SetLockFull`](Command::SetLockFull).
     SetLock {
-        /// Whether key lock is engaged (wire semantics — inverted on D75).
+        /// Whether key lock is engaged (wire semantics, inverted on D75).
         locked: bool,
     },
     /// Set all lock/control fields (LC 6-field write).
@@ -453,7 +453,7 @@ pub enum Command {
     ///
     /// These are CAT wire fields only; none of them has a verified MCP
     /// counterpart (an earlier claim of MCP `0x1060`-`0x1065` was
-    /// wrong — those bytes are backlight/display cells in the MCP-D75
+    /// wrong; those bytes are backlight/display cells in the MCP-D75
     /// registry).
     SetLockFull {
         /// Key lock enabled.
@@ -561,7 +561,7 @@ pub enum Command {
         /// Channel memory data.
         data: ChannelMemory,
     },
-    /// Recall memory channel — switches the radio's active channel (MR write).
+    /// Recall memory channel: switches the radio's active channel (MR write).
     ///
     /// # Mode requirement
     /// Radio must be in Memory mode on the target band.
@@ -811,7 +811,7 @@ pub enum Command {
     /// Note: The firmware's SD handler primarily checks for `SD PROGRAM`
     /// to enter MCP programming mode. The bare `SD` read response (`SD 0/1`)
     /// appears to indicate programming interface readiness, not SD card
-    /// presence. Do NOT send `SD PROGRAM` — it enters programming mode
+    /// presence. Do NOT send `SD PROGRAM`: it enters programming mode
     /// and the radio stops responding to normal CAT commands.
     GetSdCard,
 
@@ -828,7 +828,7 @@ pub enum Command {
     // === Extra (TY, 0E) ===
     /// Get radio type/region code (TY read).
     ///
-    /// Not in the firmware's 53-command dispatch table — likely processed
+    /// Not in the firmware's 53-command dispatch table, likely processed
     /// by a separate code path. Returns a region string and variant number
     /// (e.g., `TY K,2` for US region, variant 2).
     GetRadioType,
@@ -838,7 +838,7 @@ pub enum Command {
     /// appears to be MCP-related. Its full behavior is unknown.
     GetMcpStatus,
 
-    // === Service Mode (factory calibration/test — requires `0G KENWOOD` first) ===
+    // === Service Mode (factory calibration/test; requires `0G KENWOOD` first) ===
     /// Enter factory service mode (0G write).
     ///
     /// Wire format: `0G KENWOOD\r`. The radio validates the "KENWOOD"
@@ -1032,7 +1032,7 @@ pub enum Command {
     ///
     /// Wire format: `0Y band\r` (5 bytes total). Band is 0 or 1.
     /// Band 0 calls `radio_caller_06ef1c()`, band 1 calls
-    /// `ipc_caller_06eef6()` — different code paths for the two
+    /// `ipc_caller_06eef6()`: different code paths for the two
     /// receiver chains.
     ///
     /// Requires service mode (`0G KENWOOD` first).
@@ -1100,7 +1100,7 @@ pub enum Command {
     ///
     /// Wire format: `1C XXX\r` (7 bytes = 2 mnemonic + 1 space + 3-digit
     /// hex value + 1 CR). Value must be less than 0x100 (256). Not present
-    /// in the D74 firmware — likely related to the 220 MHz band (D75A)
+    /// in the D74 firmware; likely related to the 220 MHz band (D75A)
     /// or enhanced DSP.
     ///
     /// Requires service mode (`0G KENWOOD` first).
@@ -1114,7 +1114,7 @@ pub enum Command {
     ///
     /// Wire format: `1U\r` (read, 3 bytes) or `1U data\r` (write, dynamic
     /// length determined by reading a hardware register). The firmware
-    /// calls `os_disable_interrupts()` in the error path — this is a
+    /// calls `os_disable_interrupts()` in the error path; this is a
     /// low-level hardware configuration command.
     ///
     /// Requires service mode (`0G KENWOOD` first).
@@ -1275,7 +1275,7 @@ pub enum Response {
     /// and `Radio::get_lock()` handle the inversion so callers see
     /// logical lock state.
     Lock {
-        /// Whether key lock is engaged (wire semantics — inverted on D75).
+        /// Whether key lock is engaged (wire semantics, inverted on D75).
         locked: bool,
     },
     /// AF/IF/Detect output mode response (IO).
@@ -1526,7 +1526,7 @@ pub enum Response {
     },
     /// MCP status response (0E).
     ///
-    /// Placeholder — always returns `N` (not available) in normal mode.
+    /// Placeholder: always returns `N` (not available) in normal mode.
     McpStatus {
         /// Raw status value.
         value: String,
@@ -1601,15 +1601,15 @@ pub enum Response {
     Ok,
     /// Error response (`?\r`).
     Error,
-    /// Not available response (`N\r`) — command not supported in current mode.
+    /// Not available response (`N\r`): command not supported in current mode.
     NotAvailable,
 }
 
 /// Band a band-indexed command addresses, `None` for global commands.
 ///
 /// Used by the response-matching loop: with AI mode enabled the radio
-/// pushes `BY`/`FQ`/`MD`/`SQ` frames unsolicited — the same mnemonics
-/// as the reads — so an in-flight band-A query must not accept a
+/// pushes `BY`/`FQ`/`MD`/`SQ` frames unsolicited (the same mnemonics
+/// as the reads), so an in-flight band-A query must not accept a
 /// band-B push as its answer.
 pub(crate) const fn command_band(cmd: &Command) -> Option<Band> {
     match cmd {
@@ -1760,7 +1760,7 @@ pub const fn command_name(cmd: &Command) -> &'static str {
 #[must_use]
 #[expect(
     clippy::too_many_lines,
-    reason = "Dispatch table over every CAT Command variant — one match arm per command is the \
+    reason = "Dispatch table over every CAT Command variant: one match arm per command is the \
               clearest mapping of the Command enum to its wire format. Splitting by submodule \
               would hide the complete command inventory; fall-through helpers already exist \
               (core::serialize_core_write, memory::serialize_memory_write, etc.)."
@@ -2066,7 +2066,7 @@ pub fn parse(frame: &[u8]) -> Result<Response, ProtocolError> {
     }
 
     // Char-boundary-safe: a valid-UTF-8 frame starting with a
-    // multi-byte character has no 2-byte mnemonic — reject it rather
+    // multi-byte character has no 2-byte mnemonic; reject it rather
     // than panicking on the slice.
     let Some(mnemonic) = frame_str.get(..2) else {
         tracing::warn!(frame = %frame_str, "frame mnemonic is not two ASCII bytes");
@@ -2134,7 +2134,7 @@ mod tests {
     #[test]
     fn parse_multibyte_utf8_frame_is_error_not_panic() {
         // A valid-UTF-8 frame whose first character is multi-byte
-        // ("€" = 3 bytes) lands mid-character at byte index 2 — the
+        // ("€" = 3 bytes) lands mid-character at byte index 2; the
         // mnemonic extraction must reject it, not panic.
         let r = parse("€X 1".as_bytes());
         assert!(r.is_err(), "non-ASCII mnemonic must be an error: {r:?}");
@@ -2284,7 +2284,7 @@ mod tests {
             if let Err(ProtocolError::UnknownCommand(_)) = result {
                 return Err(format!("Mnemonic '{mnemonic}' not recognized by parser").into());
             }
-            // Other errors (FieldParse, etc.) are OK — the test only checks recognition
+            // Other errors (FieldParse, etc.) are OK; the test only checks recognition
         }
         Ok(())
     }

@@ -3,7 +3,7 @@
 //
 // Hardware-in-the-loop verification anchors for the Kenwood-exact
 // encoder. Each constant in this module was derived from radio-captured
-// AMBE bytes — TH-D75 in D-STAR TX mode, AMBE_CAPTURE env var directing
+// AMBE bytes: TH-D75 in D-STAR TX mode, AMBE_CAPTURE env var directing
 // the firmware's encoded output to a file. The bit-level structure was
 // reverse-engineered by feeding the radio known sinusoidal tones via
 // the mic and observing which bits are stable (the actual voice
@@ -20,12 +20,12 @@
 //!
 //! Decoding a Kenwood 210 Hz raw dominant frame through
 //! [`crate::decode_trace`] produces `b0=126` (the AMBE erasure code),
-//! `L=0` — NOT a sensible 210 Hz pitch index. The same `decode_trace`
+//! `L=0`, NOT a sensible 210 Hz pitch index. The same `decode_trace`
 //! recovers `b0=86, L=34` correctly when fed our own encoder's output.
 //! Conclusion: **TH-D75 does not use the DSD/mbelib wire format**.
 //!
 //! Bit-mask comparison via [`STABLE_BIT_MASK`] is therefore a NECESSARY
-//! but not SUFFICIENT criterion — bit-identical wire bytes guarantee
+//! but not SUFFICIENT criterion: bit-identical wire bytes guarantee
 //! identical decoded fields only if both encoders use the same
 //! bit-permutation. Until the Kenwood interleaver (firmware
 //! `ambe_bit_interleaver` at 0x11815550) is ported, the masked
@@ -42,13 +42,13 @@
 //!
 //! ## Frame structure (validated against 6 distinct tone captures)
 //!
-//! - **9 bytes per voice frame, no header** — confirmed via stride-9
+//! - **9 bytes per voice frame, no header**, confirmed via stride-9
 //!   repetition in steady-state captures (99/99 frames byte-identical
 //!   in the 440 Hz 2nd half). This matches the firmware's
 //!   `radio_send_dsp_command_9b` IPC name identified during the
 //!   static RE pass. Captures begin at byte 0; nothing precedes the
 //!   first frame.
-//! - **14 of 72 bits volatile per frame** — 8 slow-data positions at
+//! - **14 of 72 bits volatile per frame**: 8 slow-data positions at
 //!   ~31% volatility + 6 FEC parity positions at ~11-18% volatility.
 //!   The Rust encoder is responsible for the 58 stable bits; slow-data
 //!   bits are protocol-layer state injected outside the codec.
@@ -72,7 +72,7 @@ pub const FRAME_LEN: usize = 9;
 ///
 /// Source: DSP firmware function at virtual address 0x118123E0.
 ///
-/// # Superseded — do not apply to voice bytes
+/// # Superseded: do not apply to voice bytes
 ///
 /// This was originally read as a firmware wire-format adapter between
 /// mbelib's AMBE bit order and the TH-D75's. That interpretation is
@@ -89,7 +89,7 @@ pub const FIRMWARE_WHITENING: [u8; 4] = [0x70, 0x4F, 0x93, 0x40];
 
 /// Apply the TH-D75 firmware whitening XOR to a 9-byte frame.
 ///
-/// Self-inverse — calling twice returns the original. Use to convert
+/// Self-inverse: calling twice returns the original. Use to convert
 /// between mbelib wire format and TH-D75 wire format in either
 /// direction.
 #[must_use]
@@ -111,7 +111,7 @@ pub fn apply_whitening(frame: [u8; FRAME_LEN]) -> [u8; FRAME_LEN] {
 ///
 /// The bits in this mask carry slow-data injection (~31% volatility)
 /// or Golay-parity-of-slow-data (~11-18% volatility). They are NOT
-/// produced by the AMBE codec — they are protocol-layer overhead
+/// produced by the AMBE codec; they are protocol-layer overhead
 /// stamped on top of the codec output.
 ///
 /// To verify the AMBE codec's bit-exact output, AND-mask the encoder's
@@ -185,7 +185,7 @@ pub struct PitchAnchor {
 /// before the first match).
 ///
 /// All four tones lock cleanly (>=0.95 of 2nd-half frames identical).
-/// 100 Hz and 320 Hz captures exist but did not lock — likely due to
+/// 100 Hz and 320 Hz captures exist but did not lock, likely due to
 /// reproduction quality limits of the phone-speaker source used during
 /// recording, not codec behaviour. Excluded here.
 pub const PITCH_ANCHORS: &[PitchAnchor] = &[
@@ -194,28 +194,28 @@ pub const PITCH_ANCHORS: &[PitchAnchor] = &[
         frame: [0x41, 0x11, 0x04, 0xC3, 0x80, 0x12, 0x01, 0x33, 0x04],
         raw_dominant_frame: [0x49, 0x91, 0x04, 0xCB, 0x80, 0x32, 0x09, 0xB3, 0x04],
         lock_quality: 0.97,
-        in_op25_pitch_range: true, // period 38 samples — solidly inside 21..122
+        in_op25_pitch_range: true, // period 38 samples: solidly inside 21..122
     },
     PitchAnchor {
         frequency_hz: 440.0,
         frame: [0x43, 0x50, 0x04, 0x41, 0x68, 0x02, 0x07, 0x12, 0x18],
         raw_dominant_frame: [0x43, 0x52, 0x04, 0x4D, 0x6B, 0xA2, 0x2F, 0x12, 0x18],
         lock_quality: 1.00,
-        in_op25_pitch_range: false, // period 18 samples — below 21 minimum
+        in_op25_pitch_range: false, // period 18 samples: below 21 minimum
     },
     PitchAnchor {
         frequency_hz: 550.0,
         frame: [0x45, 0x30, 0x14, 0x43, 0xE0, 0x18, 0xC7, 0x70, 0x10],
         raw_dominant_frame: [0x4D, 0x32, 0x34, 0x4B, 0xE3, 0x18, 0xC7, 0x70, 0x10],
         lock_quality: 1.00,
-        in_op25_pitch_range: false, // period 14.5 samples — below 21 minimum
+        in_op25_pitch_range: false, // period 14.5 samples: below 21 minimum
     },
     PitchAnchor {
         frequency_hz: 660.0,
         frame: [0x45, 0x30, 0x1C, 0xC1, 0xE0, 0x02, 0x47, 0x61, 0x0C],
         raw_dominant_frame: [0x4D, 0x32, 0x3C, 0xC5, 0xE2, 0xA2, 0x6F, 0x61, 0x0C],
         lock_quality: 1.00,
-        in_op25_pitch_range: false, // period 12 samples — below 21 minimum
+        in_op25_pitch_range: false, // period 12 samples: below 21 minimum
     },
 ];
 
@@ -237,7 +237,7 @@ pub fn mask_stable_bits(frame: [u8; FRAME_LEN]) -> [u8; FRAME_LEN] {
 ///
 /// Returns `None` if no anchor exists for that frequency (only the
 /// frequencies in [`PITCH_ANCHORS`] are valid). Uses an exact `f32`
-/// equality match — pass the same value as the anchor's
+/// equality match: pass the same value as the anchor's
 /// `frequency_hz`.
 #[must_use]
 pub fn anchor_for(frequency_hz: f32) -> Option<&'static PitchAnchor> {
@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(n, 58, "expected 58 stable bits, got {n}");
     }
 
-    /// Each anchor frame must already have the volatile bits zeroed —
+    /// Each anchor frame must already have the volatile bits zeroed;
     /// they are stored pre-masked so direct comparison works.
     #[test]
     fn anchor_frames_are_already_masked() {

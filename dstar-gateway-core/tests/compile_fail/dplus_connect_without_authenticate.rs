@@ -1,5 +1,5 @@
 //! Calling `connect` on `Session<DPlus, Configured>` must be a compile
-//! error — DPlus requires `.authenticate()` first.
+//! error; DPlus requires `.authenticate()` first.
 //!
 //! The `connect()` method is only implemented on
 //! `Session<P, Configured> where P: NoAuthRequired`. `DPlus` does

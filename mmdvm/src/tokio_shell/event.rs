@@ -10,7 +10,7 @@ pub enum Event {
     /// Modem firmware version + capabilities (one-shot, typically at
     /// init).
     Version(VersionResponse),
-    /// Modem status update — periodic (from internal 250 ms poll) OR
+    /// Modem status update: periodic (from internal 250 ms poll) OR
     /// unsolicited (from the modem itself after TX transitions etc.).
     Status(ModemStatus),
     /// Positive acknowledgement for a sent command.
@@ -53,8 +53,8 @@ pub enum Event {
     /// Transparent data from the modem.
     TransparentData(Vec<u8>),
     /// The modem sent a mode we don't fully model yet
-    /// (DMR/YSF/P25/NXDN/POCSAG/FM), but the raw frame was accepted —
-    /// payload preserved verbatim.
+    /// (DMR/YSF/P25/NXDN/POCSAG/FM), but the raw frame was accepted
+    /// with the payload preserved verbatim.
     UnhandledResponse {
         /// The command byte.
         command: u8,

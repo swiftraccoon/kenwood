@@ -12,7 +12,7 @@ crate under GPL-2.0-or-later, with the original ISC copyright notices
 retained for attribution as ISC requires.
 
 This is the same relicensing pathway that arancormonk used in mbelib-neo
-(https://github.com/arancormonk/mbelib-neo) — taking the ISC mbelib code
+(https://github.com/arancormonk/mbelib-neo): taking the ISC mbelib code
 and redistributing the combined work under GPL-2.0-or-later.
 
 ================================================================
@@ -62,7 +62,7 @@ Affected file:
                    ported from include/dstar_const.h)
 
 Note on DSD's dual licensing: the upstream DSD repository is dual-licensed.
-The files dstar_header.{c,h}, descramble.h, and fcs.h are GPLv2-only —
+The files dstar_header.{c,h}, descramble.h, and fcs.h are GPLv2-only;
 none of those files are used here. All code reused from DSD originates
 from ISC-licensed files (specifically include/dstar_const.h).
 

@@ -67,7 +67,7 @@ impl StationList {
     ///
     /// Creates a new entry if the station has not been seen before, or
     /// updates the existing entry with fresh data. The `now` parameter
-    /// stamps the entry's `last_heard` field — callers in the tokio
+    /// stamps the entry's `last_heard` field; callers in the tokio
     /// shell read the wall clock once per iteration and thread it down.
     pub fn update(&mut self, source: &str, data: &AprsData, path: &[String], now: Instant) {
         let entry = self
@@ -85,7 +85,7 @@ impl StationList {
 
         entry.last_heard = now;
         entry.packet_count = entry.packet_count.saturating_add(1);
-        // Only reallocate the path when it actually changed — a station's
+        // Only reallocate the path when it actually changed: a station's
         // digipeater path is usually identical packet-to-packet, so the
         // per-update `to_vec()` was a pure waste otherwise.
         if entry.last_path != path {
@@ -95,7 +95,7 @@ impl StationList {
         match data {
             AprsData::Position(pos) => {
                 // A weather-station position (symbol `_`) carries embedded
-                // wx data too — record both.
+                // wx data too, so record both.
                 if let Some(ref wx) = pos.weather {
                     entry.last_weather = Some(wx.clone());
                 }
@@ -119,7 +119,7 @@ impl StationList {
             | AprsData::RawWeather { .. } => {
                 // These frame types don't update the station's own
                 // position or status. RawWeather is the legacy
-                // Peet Bros `#`/`*` format — we tolerate it on the
+                // Peet Bros `#`/`*` format; we tolerate it on the
                 // wire but don't attempt to decode the proprietary
                 // ASCII-hex payload; if a downstream caller wants
                 // weather data from it, they can re-parse the payload
@@ -302,12 +302,12 @@ mod tests {
         let entry = sl.get("N0CALL").ok_or("expected N0CALL entry")?;
         assert_eq!(entry.last_path, path_a);
 
-        // Same path again — value must remain correct (skip-clone path).
+        // Same path again: value must remain correct (skip-clone path).
         sl.update("N0CALL", &pos, &path_a, t0);
         let entry = sl.get("N0CALL").ok_or("expected N0CALL entry")?;
         assert_eq!(entry.last_path, path_a);
 
-        // Changed path — value must update.
+        // Changed path: value must update.
         let path_b = vec!["WIDE2-2".to_owned()];
         sl.update("N0CALL", &pos, &path_b, t0);
         let entry = sl.get("N0CALL").ok_or("expected N0CALL entry")?;

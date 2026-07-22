@@ -37,7 +37,7 @@ use tracing::debug;
 
 use crate::reflector::{Reflector, ReflectorProtocol};
 
-/// Handshake timeout — how long we wait for the reflector to ACK the LINK
+/// Handshake timeout: how long we wait for the reflector to ACK the LINK
 /// before giving up.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -81,7 +81,7 @@ impl ReflectorSession {
     /// - `rpt2[7]`    = reflector module letter.
     /// - `ur_call`    = `"CQCQCQ"` (hotspot-to-reflector convention).
     ///
-    /// `my_call` / `my_suffix` / flags pass through unchanged — they
+    /// `my_call` / `my_suffix` / flags pass through unchanged; they
     /// identify the operator and their tail (`/D75`, `/M`, etc.).
     fn build_reflector_header(&self, radio: &DStarHeader) -> DStarHeader {
         let mut rpt1_buf = [b' '; 8];
@@ -193,7 +193,7 @@ pub fn decode_radio_header(bytes: Vec<u8>) -> Option<DecodedRadioHeader> {
 ///
 /// All coordinates are decimal degrees; negative values are south/west.
 /// `callsign`, `symbol`, and `comment` are populated when the DPRS
-/// sentence decodes cleanly — `symbol` is a single APRS symbol char
+/// sentence decodes cleanly; `symbol` is a single APRS symbol char
 /// rendered as a one-character string for FFI simplicity.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct GpsPosition {
@@ -209,7 +209,7 @@ pub struct GpsPosition {
     pub comment: Option<String>,
 }
 
-/// Why the reflector link ended — typed so Swift can pattern-match
+/// Why the reflector link ended, typed so Swift can pattern-match
 /// instead of string-matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum DisconnectCause {
@@ -248,7 +248,7 @@ pub enum ReflectorEvent {
         /// Typed disconnect reason.
         reason: DisconnectCause,
     },
-    /// `DPlus` keepalive bounce — useful as a "still alive" signal.
+    /// `DPlus` keepalive bounce, useful as a "still alive" signal.
     PollEcho,
     /// A remote station started transmitting.
     VoiceStart {
@@ -280,7 +280,7 @@ pub enum ReflectorEvent {
         voice_bytes: Vec<u8>,
     },
     /// Slow-data metadata for the current stream updated. Fires any
-    /// time the assembled text or parsed GPS position changes — the
+    /// time the assembled text or parsed GPS position changes; the
     /// UI uses it to show live "now transmitting" details before the
     /// stream ends.
     SlowDataUpdate {
@@ -308,9 +308,9 @@ pub enum ReflectorEvent {
         /// Final parsed DPRS position seen on the stream, if any.
         position: Option<GpsPosition>,
     },
-    /// The background task ended — session is finished, no further events.
+    /// The background task ended: session is finished, no further events.
     Ended,
-    /// An event variant this build doesn't recognise — surfaced for
+    /// An event variant this build doesn't recognise, surfaced for
     /// diagnostics instead of being conflated with session teardown.
     Unknown {
         /// Debug rendering of the unrecognised event.
@@ -325,7 +325,7 @@ pub enum ReflectorEvent {
 /// `Arc<dyn ReflectorObserver>` and releases it when the session ends.
 #[uniffi::export(with_foreign)]
 pub trait ReflectorObserver: Send + Sync + std::fmt::Debug {
-    /// Called once per reflector event. Must not block for long — the
+    /// Called once per reflector event. Must not block for long: the
     /// session task awaits completion before pumping the next event.
     fn on_event(&self, event: ReflectorEvent);
 }
@@ -458,7 +458,7 @@ impl ReflectorSession {
         // with rpt1/rpt2 both set to the literal `"DIRECT  "` (the
         // radio doesn't know the gateway's callsign). xlxd and
         // ircDDBGateway read rpt1[7]/rpt2[7] as the module letter and
-        // silently drop any packet where it isn't a valid module —
+        // silently drop any packet where it isn't a valid module;
         // `"DIRECT  "` has 'T' at byte 7, so the reflector eats the
         // stream without a NAK or log line. We rewrite rpt1/rpt2 /
         // ur_call to the hotspot-to-reflector convention here.
@@ -601,7 +601,7 @@ impl ReflectorSession {
             let mut guard = self.backend.lock().await;
             guard.take().ok_or(ReflectorError::AlreadyDisconnected)?
         };
-        // Best-effort shutdown signal — if the receiver already dropped,
+        // Best-effort shutdown signal: if the receiver already dropped,
         // the task is exiting on its own and we just await its result.
         let _ = backend.shutdown.send(());
         match backend.join.await {
@@ -621,7 +621,7 @@ impl ReflectorSession {
 /// # Errors
 ///
 /// Returns [`ReflectorError`] variants describing whichever step of
-/// the connect flow failed — invalid input, DNS, socket bind, session
+/// the connect flow failed: invalid input, DNS, socket bind, session
 /// builder rejection, reflector handshake failure, or timeout.
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn connect_reflector(
@@ -723,13 +723,13 @@ pub async fn fetch_dplus_directory(callsign: String) -> Result<Vec<Reflector>, R
 
 /// TX-side slow-data text tracker. Assembles the outgoing radio's
 /// Kenwood 4-block text (the 20-char "TX message") so it can be
-/// reported back to Swift when the stream ends — used for local
+/// reported back to Swift when the stream ends; used for local
 /// recently-heard entries.
 ///
 /// Outbound `slow_data` bytes are SCRAMBLED (wire format) because the
 /// radio emits them that way in MMDVM `DStarData` frames. The Kenwood
 /// D-STAR sync frame carries `[0x55, 0x55, 0x55]` plain, which lines
-/// up with the collector's `frame_index == 0` resync trigger — we
+/// up with the collector's `frame_index == 0` resync trigger, so we
 /// detect sync frames by matching the wire bytes directly rather
 /// than relying on our ad-hoc outbound seq counter (which is monotonic
 /// and doesn't wrap on superframe boundaries).
@@ -773,10 +773,10 @@ impl TxTextState {
 /// bytes, transmitted as two consecutive 3-byte halves. The high
 /// nibble of the type byte identifies the kind:
 ///
-/// - `0x4X` — text block (Kenwood 4-block protocol, handled by
+/// - `0x4X`: text block (Kenwood 4-block protocol, handled by
 ///   [`SlowDataTextCollector`] which uses the low nibble as a block
 ///   index 0..=3 and composes a 20-char message across 4 blocks).
-/// - `0x3X` — GPS block: 5 payload bytes are appended to a running
+/// - `0x3X`: GPS block whose 5 payload bytes are appended to a running
 ///   sentence buffer which is scanned for DPRS (`$$CRC...\r`) and
 ///   NMEA (`$GPRMC...\n`, `$GPGGA...\n`) sentences.
 ///
@@ -875,7 +875,7 @@ impl StreamSlowDataState {
         self.text_collector.push(slow_data, seq);
 
         // Assemble the 6-byte block locally so we can inspect its
-        // type byte and route GPS payloads — even when the text
+        // type byte and route GPS payloads, even when the text
         // collector decides the block isn't for it.
         let plain = descramble(slow_data);
         match self.block_phase {
@@ -934,7 +934,7 @@ impl StreamSlowDataState {
                 delta.position_changed = ingest_gps_chunk(self, &chunk);
             }
             _ => {
-                // Header retx, fast data, squelch, unknown — ignore.
+                // Header retx, fast data, squelch, unknown: ignore.
             }
         }
         delta
@@ -1060,7 +1060,7 @@ fn handle_event<P>(
             frame,
             ..
         } => {
-            // Emit the raw voice event first — the relay layer consumes
+            // Emit the raw voice event first: the relay layer consumes
             // it for radio↔reflector pass-through without waiting on the
             // slow-data decoders.
             observer.on_event(translate_event(event));
@@ -1110,7 +1110,7 @@ const GPS_SENTENCE_PATTERNS: [(&str, char); 3] =
 /// - `$GPGGA` (NMEA), terminated by `\n` (0x0A).
 ///
 /// The prefix may appear anywhere in the running buffer (not just
-/// byte 0) — GPS payload chunks span many blocks, and the first few
+/// byte 0), because GPS payload chunks span many blocks and the first few
 /// blocks can contain leading padding or the tail of a prior sentence.
 /// Any bytes preceding a recognised prefix are dropped as noise once
 /// the sentence lands.
@@ -1231,7 +1231,7 @@ fn nmea_coord_to_degrees(raw: &str, hemisphere: &str, deg_width: usize) -> Optio
 }
 
 /// Parse a `$GPRMC` sentence. Only lat/lon are extracted; the rest of
-/// the NMEA fields (speed, heading, date) are ignored — the UI only
+/// the NMEA fields (speed, heading, date) are ignored, since the UI only
 /// shows position.
 fn parse_nmea_rmc(sentence: &str) -> Option<GpsPosition> {
     // $GPRMC,hhmmss.ss,A,DDMM.MMMM,N,DDDMM.MMMM,W,speed,course,ddmmyy,...
@@ -1331,7 +1331,7 @@ where
             stream_id: stream_id.get(),
             reason: map_voice_end_reason(*reason),
             // `handle_event` always produces the authoritative VoiceEnd
-            // with the assembled text + GPS — this fallback only fires
+            // with the assembled text + GPS; this fallback only fires
             // for callers that bypass the state machine.
             text: None,
             position: None,
@@ -1523,8 +1523,8 @@ async fn connect_dcs(
 
 /// Build, authenticate, and drive a full `DPlus` (REF) connect handshake.
 ///
-/// If auth fails we still attempt the UDP handshake — matches the
-/// repl's best-effort behaviour — but if the handshake ALSO fails,
+/// If auth fails we still attempt the UDP handshake (matching the
+/// repl's best-effort behaviour), but if the handshake ALSO fails,
 /// we prefix the error with the auth failure so users hunting the
 /// real cause don't have to guess.
 async fn connect_dplus(
@@ -1570,8 +1570,8 @@ async fn connect_dplus(
         Err(e) => {
             if let Some(auth_warning) = auth_warning {
                 // Auth failed AND LINK1 was rejected. The common cause is
-                // an unregistered callsign — tell the user so they don't
-                // have to guess.
+                // an unregistered callsign, so say so instead of
+                // making the user guess.
                 Err(ReflectorError::AuthFailed(format!(
                     "{e}. DPlus auth also failed: {auth_warning}. \
                      Register your callsign at dstargateway.org, or try an XRF/DCS reflector \
@@ -1585,7 +1585,7 @@ async fn connect_dplus(
 }
 
 // ---------------------------------------------------------------------------
-// Tests — end-to-end slow-data GPS decoder
+// Tests: end-to-end slow-data GPS decoder
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1622,7 +1622,7 @@ mod slow_data_gps_tests {
 
         let mut buf: Vec<u8> = Vec::with_capacity(full_size);
         for chunk in bytes.chunks(5) {
-            // `chunks(5)` yields 1..=5 bytes — always fits the low nibble.
+            // `chunks(5)` yields 1..=5 bytes, always fitting the low nibble.
             buf.push(TYPE_GPS | u8::try_from(chunk.len()).unwrap_or(5));
             buf.extend_from_slice(chunk);
         }
@@ -1731,7 +1731,7 @@ mod slow_data_gps_tests {
 
     /// Exercise the block-phase alignment: if we "join mid-stream"
     /// by skipping the first frame, every downstream block read is
-    /// shifted by 3 bytes — the type nibble will be whatever byte 4
+    /// shifted by 3 bytes: the type nibble will be whatever byte 4
     /// of the original block was, never 0x3X. No GPS should decode.
     #[test]
     fn misaligned_stream_join_drops_gps() -> TestResult {

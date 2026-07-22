@@ -6,7 +6,7 @@
 /// `\r\n` stripped) and a **lossy UTF-8 view** (`line`) for parsing and
 /// display. The lossy view is built via [`String::from_utf8_lossy`],
 /// which replaces invalid UTF-8 sequences with the U+FFFD replacement
-/// character — this prevents a single non-UTF-8 byte (common in Mic-E
+/// character. This prevents a single non-UTF-8 byte (common in Mic-E
 /// payloads, raw weather data, and Latin-1 comments) from killing the
 /// TCP connection, while keeping the raw bytes available for callers
 /// that need exact wire fidelity (e.g. `IGate` forwarding, packet
@@ -20,7 +20,7 @@
 pub struct AprsIsPacket {
     /// Wire-truth bytes for the packet line, **without** the trailing
     /// `\r` / `\n`. Callers that need to forward the packet across an
-    /// `IGate` or write it to a capture file should use this field —
+    /// `IGate` or write it to a capture file should use this field:
     /// `line` may carry replacement characters in place of any non-UTF-8
     /// byte and is not byte-identical to what the server sent.
     pub raw: Vec<u8>,

@@ -36,7 +36,7 @@
 //! macOS: `IOBluetooth`'s RFCOMM channel callbacks are dispatched to the
 //! `CFRunLoop` of the thread that opened the channel (typically the
 //! main thread, before the tokio runtime starts). Pumping that runloop
-//! from a worker thread is a no-op — the callbacks never deliver data
+//! from a worker thread is a no-op: the callbacks never deliver data
 //! into the pipe that `BluetoothTransport::read` waits on. By keeping
 //! the pump on the same thread, every `bt_pump_runloop()` call drains
 //! pending callbacks where they actually live.
@@ -110,7 +110,7 @@ impl<T: Transport + 'static> MmdvmTransportAdapter<T> {
     ///
     /// Spawns the pump task on the current [`tokio::task::LocalSet`]
     /// via [`tokio::task::spawn_local`]. **Panics** if no `LocalSet`
-    /// is active — see the [module-level docs](self) for why this is
+    /// is active; see the [module-level docs](self) for why this is
     /// required (macOS Bluetooth thread-affinity).
     #[must_use]
     pub fn new(inner: T) -> Self {
@@ -131,7 +131,7 @@ impl<T: Transport + 'static> MmdvmTransportAdapter<T> {
     /// Closes the write channel, which signals the pump task to drop
     /// the transport cleanly. Then awaits the pump's [`JoinHandle`]
     /// to recover the inner `T`. Call this after
-    /// [`mmdvm::AsyncModem::shutdown`] has returned — by then the
+    /// [`mmdvm::AsyncModem::shutdown`] has returned: by then the
     /// modem loop has released the adapter and the pump's write
     /// channel will close as soon as the adapter is dropped... but
     /// we own the adapter here, so closing happens via explicit drop
@@ -215,7 +215,7 @@ async fn pump_task<T: Transport>(
                 tracing::trace!(
                     target: "mmdvm::hang_hunt",
                     len = data.len(),
-                    "pump: write branch — calling transport.write"
+                    "pump: write branch, calling transport.write"
                 );
                 if let Err(e) = transport.write(&data).await {
                     tracing::warn!(
@@ -261,7 +261,7 @@ async fn pump_task<T: Transport>(
                             target: "mmdvm::hang_hunt",
                             len = bytes.len(),
                             cap_remaining = read_tx.capacity(),
-                            "pump: read branch — awaiting read_tx.send"
+                            "pump: read branch, awaiting read_tx.send"
                         );
                         if read_tx.send(Ok(bytes)).await.is_err() {
                             tracing::debug!(
@@ -340,7 +340,7 @@ impl<T: Transport + Unpin + 'static> AsyncWrite for MmdvmTransportAdapter<T> {
                 // A sustained hang-hunt trace here (many "Full" in
                 // a row with no matching pump write progress) means
                 // the pump task is wedged in FFI. The log is
-                // rate-limited by the spin itself — every retry
+                // rate-limited by the spin itself: every retry
                 // emits one line, so "hundreds of Full in a millisecond"
                 // is the signal, not the volume.
                 tracing::trace!(
@@ -360,7 +360,7 @@ impl<T: Transport + Unpin + 'static> AsyncWrite for MmdvmTransportAdapter<T> {
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // [`crate::Transport::write`] flushes synchronously and the
-        // pump task writes eagerly — once `poll_write` accepts a
+        // pump task writes eagerly: once `poll_write` accepts a
         // buffer, the pump will drain it on its next loop turn and
         // call [`Transport::write`] which itself flushes. No explicit
         // flush is needed here.

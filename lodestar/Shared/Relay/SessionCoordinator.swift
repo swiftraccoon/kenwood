@@ -13,7 +13,7 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "sess
 /// the radio is in MMDVM mode AND a reflector session is live, and
 /// auto-stops it when either precondition drops.
 ///
-/// Users never toggle relay — they just connect a radio and pick a
+/// Users never toggle relay: they just connect a radio and pick a
 /// reflector, and audio flows.
 @Observable
 @MainActor
@@ -22,7 +22,7 @@ public final class SessionCoordinator {
     public let reflector: ReflectorCoordinator
     public let relay: RelayCoordinator
 
-    /// `true` between `activate()` and `deactivate()` — gates the
+    /// `true` between `activate()` and `deactivate()`; gates the
     /// observation re-arm loop below.
     private var preconditionsActive = false
 
@@ -38,13 +38,13 @@ public final class SessionCoordinator {
     /// Start watching for precondition changes. Idempotent.
     ///
     /// Also kicks off per-coordinator auto-connect attempts. Both are
-    /// guarded internally — `tryAutoConnect()` no-ops when its toggle
+    /// guarded internally: `tryAutoConnect()` no-ops when its toggle
     /// is off, when a session is already live, or when the remembered
     /// identifier isn't available on the device.
     public func activate() {
         guard !preconditionsActive else { return }
         preconditionsActive = true
-        // Kick off auto-connect in the background — it guards on its
+        // Kick off auto-connect in the background; it guards on its
         // own preconditions, so this is safe to call unconditionally
         // every time the view reappears.
         let transport = self.transport
@@ -84,7 +84,7 @@ public final class SessionCoordinator {
     }
 
     /// `true` iff the radio is in MMDVM mode and the reflector session
-    /// is live — regardless of the relay's own state. Used purely as
+    /// is live, regardless of the relay's own state. Used purely as
     /// the "should this be running?" input to reconcile.
     public var wantsRelay: Bool {
         transport.radioMode == .mmdvm && reflector.state == .connected
@@ -146,7 +146,7 @@ public final class SessionCoordinator {
     }
 
     /// Compare preconditions (`wantsRelay`) against the relay's
-    /// current state and start/stop as needed. Idempotent — safe to
+    /// current state and start/stop as needed. Idempotent; safe to
     /// call on every tick.
     private func reconcileRelay() async {
         let want = wantsRelay

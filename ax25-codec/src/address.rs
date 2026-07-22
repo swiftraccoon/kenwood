@@ -94,7 +94,7 @@ impl Callsign {
         self.0.len()
     }
 
-    /// Always `false` — a valid [`Callsign`] is never empty. Provided for
+    /// Always `false`; a valid [`Callsign`] is never empty. Provided for
     /// slice-convention parity with `len`.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
@@ -184,12 +184,12 @@ impl PartialEq<Callsign> for String {
 ///
 /// SSIDs distinguish multiple stations running under the same callsign.
 /// Conventional meanings on APRS:
-/// - `0` — home station (fixed)
-/// - `1` — generic digipeater
-/// - `5` — other networks (Dstar, iGate)
-/// - `7` — handheld radio
-/// - `9` — mobile (car)
-/// - `15` — generic / other
+/// - `0`: home station (fixed)
+/// - `1`: generic digipeater
+/// - `5`: other networks (Dstar, iGate)
+/// - `7`: handheld radio
+/// - `9`: mobile (car)
+/// - `15`: generic / other
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[doc(alias = "SSID")]
 #[doc(alias = "callsign-ssid")]
@@ -256,7 +256,7 @@ impl PartialOrd<u8> for Ssid {
 /// Digipeater slots use [`RouteEntry`], which wraps an `Ax25Address` with
 /// a `has_repeated` flag for the AX.25 v2.2 §3.12.1 H-bit. The single
 /// physical wire bit at SSID-byte bit 7 is reconstructed at encode/decode
-/// time from frame-level context — it is *not* a field on this struct.
+/// time from frame-level context; it is *not* a field on this struct.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Ax25Address {
     /// Station callsign (1-6 uppercase ASCII alphanumerics).

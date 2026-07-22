@@ -32,7 +32,7 @@ pub struct SpectralAmplitudes {
 /// energy for harmonics that fall between bin centres (fractional
 /// `f0_bin` from pitch periods that aren't integer factors of the
 /// FFT size). Without this, harmonics at bin offset ±0.5 drop ~3 dB
-/// below their true amplitude — measurable on real voice captures
+/// below their true amplitude, measurable on real voice captures
 /// against the DVSI chip's own extraction, where the missing energy
 /// produced flat Gm vectors that the PRBA codebook search always
 /// resolved to near-origin entries (flat envelope → no formants).
@@ -102,7 +102,7 @@ mod tests {
                 clippy::cast_sign_loss,
                 clippy::cast_precision_loss,
                 reason = "test bin painter: k in [1, 3], f0_bin = 6.4, so bin is bounded \
-                          and non-negative — all casts are exact."
+                          and non-negative; all casts are exact."
             )]
             let bin = (f0_bin * k as f32).round() as usize;
             if let Some(c) = fft_out.get_mut(bin) {

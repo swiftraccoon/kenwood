@@ -81,7 +81,7 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 /// Default connect timeout for the initial TCP handshake + login.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Maximum APRS-IS line length on the wire, in bytes — **including**
+/// Maximum APRS-IS line length on the wire, in bytes, **including**
 /// the trailing `\r\n`.
 ///
 /// Per <http://www.aprs-is.net/Connecting.aspx>: "No line may exceed
@@ -115,7 +115,7 @@ const KEEPALIVE_COMMENT: &str = "# aprs-is keepalive";
 ///
 /// On success returns `Ok(n)` where `n` is the number of bytes appended
 /// to `buf` (including the terminating `\n`, if any). `Ok(0)` signals
-/// clean EOF. `buf` is **not** cleared — the caller clears it.
+/// clean EOF. `buf` is **not** cleared; the caller clears it.
 ///
 /// Unlike [`AsyncBufReadExt::read_until`], this caps the amount of data
 /// buffered for a single line: if `max` bytes accumulate without a `\n`,
@@ -212,13 +212,13 @@ fn line_body_has_embedded_newline(line: &str) -> bool {
 /// Owns a single TCP connection to an APRS-IS server, handles the login
 /// handshake, and exposes line-at-a-time read/write methods.
 ///
-/// Not `Clone` and not `Send`-across-the-await — typical usage is to own
+/// Not `Clone` and not `Send`-across-the-await; typical usage is to own
 /// it from a single task.
 ///
 /// # TLS support
 ///
 /// This client speaks plaintext TCP only. APRS-IS T2 servers also
-/// support TLS on port 24580 — to use it, build the connection
+/// support TLS on port 24580. To use it, build the connection
 /// yourself with your preferred TLS library (e.g. `tokio-rustls` or
 /// `tokio-native-tls`) and use the line-level helpers at the crate
 /// root ([`crate::build_login_string`], [`crate::format_is_packet`],
@@ -380,7 +380,7 @@ impl AprsIsClient {
     /// Read the next event from the server.
     ///
     /// Returns when a complete line arrives or the connection closes.
-    /// This is a blocking read — wrap in a `tokio::select!` with a
+    /// This is a blocking read; wrap in a `tokio::select!` with a
     /// keepalive timer if you need concurrency.
     ///
     /// # Encoding policy
@@ -433,7 +433,7 @@ impl AprsIsClient {
             unreachable!("raw_len is bounded by line_buf.len() by construction")
         });
 
-        // Lossy decode — every non-UTF-8 byte becomes U+FFFD. Used for
+        // Lossy decode: every non-UTF-8 byte becomes U+FFFD. Used for
         // line-level parsing (TNC2 monitor format) and the human-
         // readable view; the raw bytes are kept separately for the
         // packet event so wire-truth is recoverable downstream.
@@ -506,8 +506,8 @@ impl AprsIsClient {
     /// Send a raw line to the server (must already be CRLF-terminated).
     ///
     /// Use this for custom formatting or to forward packets from RF.
-    /// This is the single send choke point: every outbound line — packet
-    /// formatting, keepalives, and direct raw forwarding — funnels
+    /// This is the single send choke point: every outbound line (packet
+    /// formatting, keepalives, and direct raw forwarding) funnels
     /// through here, so the CR/LF-injection guard below covers all of
     /// them regardless of who built the string.
     ///
@@ -655,7 +655,7 @@ mod tests {
     /// Await the bytes a mock-server handler captured, bounding the wait
     /// so a wedged handler fails the test instead of hanging it. A
     /// handler that exited without sending (dropped sender) fails the
-    /// test immediately. Decodes the bytes as UTF-8 — everything these
+    /// test immediately. Decodes the bytes as UTF-8; everything these
     /// tests put on the wire is ASCII.
     async fn recv_captured(
         rx: oneshot::Receiver<Vec<u8>>,
@@ -993,7 +993,7 @@ mod tests {
         .await?;
 
         let mut client = AprsIsClient::connect(test_config(addr)).await?;
-        // Called immediately after connect — last_write is fresh, no send.
+        // Called immediately after connect: last_write is fresh, no send.
         client.maybe_send_keepalive().await?;
         // Close the socket so the capture ends at EOF, then prove the
         // login line is the ONLY thing that went on the wire.
@@ -1034,8 +1034,8 @@ mod tests {
         // `connect` bounds the TCP handshake at CONNECT_TIMEOUT (10s), so
         // a single attempt must resolve within that plus margin (both
         // measured on the paused clock). If the outer timer fires, the
-        // client hung past its own deadline — exactly the regression this
-        // test guards — and the `?` fails the test.
+        // client hung past its own deadline (exactly the regression this
+        // test guards) and the `?` fails the test.
         let result = tokio::time::timeout(
             CONNECT_TIMEOUT + Duration::from_secs(5),
             AprsIsClient::connect_with_retry(config, Some(1)),
@@ -1167,7 +1167,7 @@ mod tests {
             "expected EmbeddedNewline, got {result:?}"
         );
         // Close the socket so the capture ends at EOF, then prove the
-        // login line is the ONLY thing that went on the wire — the
+        // login line is the ONLY thing that went on the wire; the
         // rejected send must not have written anything.
         drop(client);
 

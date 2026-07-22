@@ -24,10 +24,10 @@
 //! - USB Mass Storage: Menu No. 980 (Windows only for mass storage feature)
 //!
 //! Implementations:
-//! - [`SerialTransport`] — USB serial connections, plus serial RFCOMM on
+//! - [`SerialTransport`]: USB serial connections, plus serial RFCOMM on
 //!   Linux and Windows
-//! - [`BluetoothTransport`] — Native macOS `IOBluetooth` RFCOMM (macOS only)
-//! - [`MockTransport`] — Programmed exchanges for testing
+//! - [`BluetoothTransport`]: Native macOS `IOBluetooth` RFCOMM (macOS only)
+//! - [`MockTransport`]: Programmed exchanges for testing
 //!
 //! On macOS, use [`BluetoothTransport`] for Bluetooth connections. Apple's
 //! Bluetooth serial driver drops data for this radio, and closing and

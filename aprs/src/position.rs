@@ -246,7 +246,7 @@ pub fn parse_uncompressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
     let (longitude, lon_ambig) = parse_aprs_longitude(lon_slice)?;
     let symbol_code = *body.get(18).ok_or(AprsError::InvalidFormat)? as char;
     // A position's ambiguity is the maximum of the two component
-    // ambiguities — whichever field was masked more aggressively wins.
+    // ambiguities: whichever field was masked more aggressively wins.
     let ambiguity = std::cmp::max_by_key(lat_ambig, lon_ambig, |a| match a {
         PositionAmbiguity::None => 0,
         PositionAmbiguity::OneDigit => 1,
@@ -510,14 +510,14 @@ mod tests {
 
     #[test]
     fn parse_position_rejects_out_of_range_latitude() {
-        // Degrees 91 with minutes 60 — impossible latitude; pre-fix
+        // Degrees 91 with minutes 60 is an impossible latitude; pre-fix
         // this parsed to 92°.
         let r = parse_aprs_position(b"!9160.00N/07201.75W-");
         assert!(
             matches!(r, Err(AprsError::InvalidCoordinates)),
             "9160.00N must be rejected: {r:?}",
         );
-        // Minutes 99.99 — minutes must be < 60.
+        // Minutes 99.99: minutes must be < 60.
         let r = parse_aprs_position(b"!4999.99N/07201.75W-");
         assert!(
             matches!(r, Err(AprsError::InvalidCoordinates)),
@@ -533,13 +533,13 @@ mod tests {
 
     #[test]
     fn parse_position_rejects_out_of_range_longitude() {
-        // Degrees 361 — impossible longitude.
+        // Degrees 361 is an impossible longitude.
         let r = parse_aprs_position(b"!4903.50N/36101.75W-");
         assert!(
             matches!(r, Err(AprsError::InvalidCoordinates)),
             "36101.75W must be rejected: {r:?}",
         );
-        // Minutes 90 — minutes must be < 60.
+        // Minutes 90: minutes must be < 60.
         let r = parse_aprs_position(b"!4903.50N/07290.00W-");
         assert!(
             matches!(r, Err(AprsError::InvalidCoordinates)),
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn parse_position_accepts_polar_and_antimeridian_boundary() -> TestResult {
-        // Exactly 90°00.00' / 180°00.00' — the boundary itself is valid.
+        // Exactly 90°00.00' / 180°00.00': the boundary itself is valid.
         let pos = parse_aprs_position(b"!9000.00N/18000.00E-")?;
         assert!(
             (pos.latitude - 90.0).abs() < f64::EPSILON,
@@ -657,7 +657,7 @@ mod tests {
     #[test]
     fn base91_decode_rejects_pipe_byte() {
         // ASCII '|' (124) is one past the legal base-91 range and would
-        // encode digit 91 (one past the max 90) — it must be rejected, not
+        // encode digit 91 (one past the max 90), so it must be rejected, not
         // decoded to 68_574_961.
         assert!(
             decode_base91_4(b"||||").is_err(),

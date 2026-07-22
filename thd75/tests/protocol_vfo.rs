@@ -6,8 +6,8 @@ use kenwood_thd75::types::*;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
-// weakening the lint. (`::aprs` — the `types::*` glob shadows the
-// bare crate name.)
+// weakening the lint. (`::aprs` is spelled that way because the
+// `types::*` glob shadows the bare crate name.)
 use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
@@ -25,7 +25,7 @@ use tracing as _;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 // ============================================================================
-// AG -- AF Gain (bare read, bare write — 3-digit zero-padded per KI4LAX)
+// AG -- AF Gain (bare read, bare write, 3-digit zero-padded per KI4LAX)
 // ============================================================================
 
 #[test]
@@ -47,7 +47,7 @@ fn serialize_ag_write() {
 
 #[test]
 fn serialize_ag_write_band_b() {
-    // Band is ignored — AG is global. 3-digit zero-padded.
+    // Band is ignored; AG is global. 3-digit zero-padded.
     assert_eq!(
         protocol::serialize(&Command::SetAfGain {
             band: Band::B,
@@ -137,7 +137,7 @@ fn parse_sq_no_padding() -> TestResult {
 
 #[test]
 fn parse_sq_out_of_range_rejected() {
-    // Squelch 9 exceeds valid range 0-6 — strict validation rejects it
+    // Squelch 9 exceeds valid range 0-6, so strict validation rejects it
     assert!(protocol::parse(b"SQ 1,09").is_err());
 }
 
@@ -177,7 +177,7 @@ fn parse_sm_zero() -> TestResult {
 
 #[test]
 fn parse_sm_out_of_range_rejected() {
-    // S-meter 20 exceeds valid range 0-5 — strict validation rejects it
+    // S-meter 20 exceeds valid range 0-5, so strict validation rejects it
     assert!(protocol::parse(b"SM 0,0020").is_err());
 }
 
@@ -217,7 +217,7 @@ fn parse_md_fm() -> TestResult {
 
 #[test]
 fn parse_md_lsb() -> TestResult {
-    // MD mode 3 = LSB on D75 (not AM — AM is mode 2)
+    // MD mode 3 = LSB on D75 (not AM; AM is mode 2)
     let r = protocol::parse(b"MD 1,3")?;
     let Response::Mode { band, mode } = r else {
         return Err(format!("expected Mode, got {r:?}").into());

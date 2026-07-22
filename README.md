@@ -16,7 +16,7 @@ Rust workspace for Kenwood amateur-radio transceivers: core TH-D75 library, TUI,
 
 > **Hardware risk.** This code talks to real radios over CAT, MCP, KISS, and MMDVM. Incorrect memory writes can corrupt radio configuration. Do not use this on a radio you are not prepared to factory-reset or send in for service. No warranty; see [LICENSE](LICENSE).
 
-> **API instability.** Every crate in this workspace is pre-1.0 and pre-release. Public APIs change without notice — often within a single commit. Nothing here is published to crates.io. Pin to a specific git SHA if you need a stable build. `Cargo.lock` is gitignored.
+> **API instability.** Every crate in this workspace is pre-1.0 and pre-release. Public APIs change without notice, often within a single commit. Nothing here is published to crates.io. Pin to a specific git SHA if you need a stable build. `Cargo.lock` is gitignored.
 
 
 ## Radios
@@ -38,6 +38,9 @@ expecting stability.
 | [`thd75/`](thd75/) | TH-D75 library: CAT, MCP programming, SD-card parsing, transports, high-level `AprsClient` | experimental |
 | [`thd75-tui/`](thd75-tui/) | Terminal UI for the TH-D75 | experimental |
 | [`thd75-repl/`](thd75-repl/) | Screen-reader-friendly REPL (CAT, APRS, D-STAR gateway) | experimental |
+| [`thd75-listen/`](thd75-listen/) | Accessible SSB/CW/AM demodulator for the TH-D75's IF-over-USB-audio stream | experimental |
+| [`if-dsp/`](if-dsp/) | Sans-io DSP for a 12 kHz low-IF stream: channelizer, USB/LSB/CW/AM demodulation, AGC | experimental |
+| [`mcp-d75-extract/`](mcp-d75-extract/) | Generates the TH-D75 menu manifest and Rust field registry from the official programming software | experimental |
 | [`kiss-tnc/`](kiss-tnc/) | KISS TNC wire framing (`no_std` + `alloc`, sans-io) | experimental |
 | [`ax25-codec/`](ax25-codec/) | AX.25 v2.2 frame codec (`no_std` + `alloc`, sans-io) | experimental |
 | [`aprs/`](aprs/) | APRS parser, digipeater, SmartBeaconing, messaging, station list (std, sans-io) | experimental |
@@ -48,8 +51,8 @@ expecting stability.
 | [`mmdvm-core/`](mmdvm-core/) | Sans-io MMDVM modem protocol codec | experimental |
 | [`mmdvm/`](mmdvm/) | Tokio async shell for MMDVM modems | experimental |
 | [`mbelib-rs/`](mbelib-rs/) | AMBE 3600×2400 voice codec (decoder default; encoder behind `--features encoder`) | experimental |
-| [`sextant/`](sextant/) | GUI D-STAR reflector client — exercises the laptop-only encode/decode pipeline against a local `polaris` reflector | experimental |
-| [`stargazer/`](stargazer/) | D-STAR observatory — discovery and XLX monitoring, with unwired voice-capture components | experimental |
+| [`sextant/`](sextant/) | GUI D-STAR reflector client; exercises the laptop-only encode/decode pipeline against a local `polaris` reflector | experimental |
+| [`stargazer/`](stargazer/) | D-STAR observatory: discovery and XLX monitoring, with unwired voice-capture components | experimental |
 | [`lodestar-core/`](lodestar-core/) | UniFFI Rust core for the Lodestar macOS/iPadOS app | experimental |
 
 ## App
@@ -58,18 +61,18 @@ expecting stability.
 |-----|----------|--------|--------|
 | Lodestar | iPadOS, macOS | [`lodestar/`](lodestar/) (Xcode) + [`lodestar-core/`](lodestar-core/) (Rust via UniFFI) | experimental |
 
-Lodestar is a SwiftUI D-STAR gateway app for DPlus / DExtra / DCS reflectors. The macOS build can bridge a TH-D75 over native `IOBluetooth` RFCOMM. The iPadOS build is currently reflector-only; its USB-C DriverKit transport is scaffolded but not yet functional. iPhone is not supported. Build via XcodeGen: `(cd lodestar && xcodegen generate && open Lodestar.xcodeproj)`.
+Lodestar is a SwiftUI D-STAR gateway app for DPlus / DExtra / DCS reflectors. The macOS build bridges a TH-D75 over native `IOBluetooth` RFCOMM; the iPadOS build drives the radio directly over USB-C through an embedded DriverKit extension on M-series iPads, and keeps relaying while backgrounded. Both also work reflector-only with no radio (TX/RX over IP). iPhone is not supported. Build via XcodeGen: `(cd lodestar && xcodegen generate && open Lodestar.xcodeproj)`.
 
 ## Building
 
 ```
 cargo build --workspace
 cargo test --workspace
-./lint.sh       # clippy --all-targets, cargo-audit, cargo-deny, cargo-machete, fmt
+./lint.sh       # unsafe audit, clippy --all-targets, nextest + doctests, docs, fmt, audit, deny, machete, shellcheck, taplo, mdbook
 ./ci-local.sh   # cross-platform CI: macOS locally, Ubuntu + Fedora in k8s pods
 ```
 
-Rust 1.94+, edition 2024. Workspace-level lints enforce `unsafe_code = "forbid"`, `missing_docs = "deny"`, and clippy `pedantic`/`nursery`/`cargo`. A crate's `[lints]` table replaces the workspace one rather than merging, so four crates restate it: `thd75` and `thd75-tui` deny (rather than forbid) `unsafe_code` for the macOS `IOBluetooth` bindings, `lodestar-core` permits it for the generated UniFFI scaffolding, and `thd75-repl` restates the table only to diverge on other lints — it forbids `unsafe_code` and contains no FFI. Every `unsafe` block outside that allowlist is rejected by `./lint.sh`'s unsafe audit.
+Rust 1.94+, edition 2024. Workspace-level lints enforce `unsafe_code = "forbid"`, `missing_docs = "deny"`, and clippy `pedantic`/`nursery`/`cargo`. A crate's `[lints]` table replaces the workspace one rather than merging, so four crates restate it: `thd75` and `thd75-tui` deny (rather than forbid) `unsafe_code` for the macOS `IOBluetooth` bindings, `lodestar-core` permits it for the generated UniFFI scaffolding, and `thd75-repl` restates the table only to diverge on other lints; it forbids `unsafe_code` and contains no FFI. Every `unsafe` block outside that allowlist is rejected by `./lint.sh`'s unsafe audit.
 
 ## License
 
@@ -77,8 +80,8 @@ GPL-2.0-or-later.
 
 Derived works and attribution:
 
-- [`mmdvm/`](mmdvm/) and [`mmdvm-core/`](mmdvm-core/) — portions derived from [MMDVMHost](https://github.com/g4klx/MMDVMHost) by Jonathan Naylor G4KLX (2015–2026, GPL-2.0-or-later).
-- [`dstar-gateway-core/`](dstar-gateway-core/) reflector codec constants and session-transition timing — derived from [ircDDBGateway](https://github.com/g4klx/ircDDBGateway) by Jonathan Naylor G4KLX (GPL-2.0-or-later) and [xlxd](https://github.com/LX3JL/xlxd) by LX3JL and contributors (GPL-2.0-or-later).
-- [`mbelib-rs/`](mbelib-rs/) — Rust port of [mbelib](https://github.com/szechyjs/mbelib) and [DSD](https://github.com/szechyjs/dsd) by szechyjs (originally ISC-licensed; redistributed here under GPL-2.0-or-later per ISC's relicensing allowance). Relicensing pathway follows [mbelib-neo](https://github.com/arancormonk/mbelib-neo) by arancormonk.
-- [`aprs/`](aprs/) SmartBeaconing implementation — algorithm by Tony Arnerich KD7TA and Steve Bragg KA9MVA (HamHUD).
+- [`mmdvm/`](mmdvm/) and [`mmdvm-core/`](mmdvm-core/): portions derived from [MMDVMHost](https://github.com/g4klx/MMDVMHost) by Jonathan Naylor G4KLX (2015–2026, GPL-2.0-or-later).
+- [`dstar-gateway-core/`](dstar-gateway-core/) reflector codec constants and session-transition timing are derived from [ircDDBGateway](https://github.com/g4klx/ircDDBGateway) by Jonathan Naylor G4KLX (GPL-2.0-or-later) and [xlxd](https://github.com/LX3JL/xlxd) by LX3JL and contributors (GPL-2.0-or-later).
+- [`mbelib-rs/`](mbelib-rs/): Rust port of [mbelib](https://github.com/szechyjs/mbelib) and [DSD](https://github.com/szechyjs/dsd) by szechyjs (originally ISC-licensed; redistributed here under GPL-2.0-or-later per ISC's relicensing allowance). Relicensing pathway follows [mbelib-neo](https://github.com/arancormonk/mbelib-neo) by arancormonk.
+- [`aprs/`](aprs/) SmartBeaconing implementation: algorithm by Tony Arnerich KD7TA and Steve Bragg KA9MVA (HamHUD).
 - KISS protocol specification (Chepponis / Karn, 1987) and AX.25 v2.2 (TAPR, 1998) are referenced as public specifications, not derivations.

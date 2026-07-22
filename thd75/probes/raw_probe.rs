@@ -1,4 +1,4 @@
-//! Raw byte probe — captures exact wire responses for debugging.
+//! Raw byte probe: captures exact wire responses for debugging.
 //! Run: cargo test --test raw_probe -- --ignored --nocapture --test-threads=1
 
 use kenwood_thd75::protocol::Codec;

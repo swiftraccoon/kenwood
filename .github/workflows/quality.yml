@@ -25,7 +25,7 @@ jobs:
   semver:
     name: Semver check
     runs-on: ubuntu-latest
-    # Only run on PRs — needs a baseline to compare against
+    # Only run on PRs: needs a baseline to compare against
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4

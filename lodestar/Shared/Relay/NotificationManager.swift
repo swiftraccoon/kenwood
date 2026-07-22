@@ -14,7 +14,7 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "noti
 /// Per Apple HIG: notifications should be infrequent, actionable,
 /// and mirror something the user could already see in the window
 /// they're not looking at. We do **not** notify on every heard
-/// station — that would become spam for any active reflector.
+/// station: that would become spam for any active reflector.
 @MainActor
 public final class NotificationManager {
     public static let shared = NotificationManager()
@@ -26,7 +26,7 @@ public final class NotificationManager {
     private init() {}
 
     /// Request notification authorization if we haven't already.
-    /// Safe to call repeatedly — the system coalesces and the
+    /// Safe to call repeatedly: the system coalesces and the
     /// `askedThisSession` flag short-circuits further prompts.
     public func requestAuthorizationIfNeeded() {
         guard !askedThisSession else { return }
@@ -99,7 +99,7 @@ public final class NotificationManager {
             content.sound = sound
         }
 
-        // Stable id per notification kind — re-posting replaces the
+        // Stable id per notification kind; re-posting replaces the
         // prior alert in Notification Center instead of stacking.
         let request = UNNotificationRequest(
             identifier: id,

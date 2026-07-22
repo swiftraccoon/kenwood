@@ -16,7 +16,7 @@
 
 #define Log(fmt, ...) os_log(OS_LOG_DEFAULT, "[Lodestar uc] " fmt, ##__VA_ARGS__)
 
-// Selector values — the other half of the contract in
+// Selector values: the other half of the contract in
 // Shared/Transport/USBSerialLink.swift (USBSerialSelector).
 enum LodestarSelector : uint64_t {
     kSelectorWrite = 0,

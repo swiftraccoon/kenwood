@@ -3,14 +3,14 @@
 
 #if os(iOS)
 
-// IOKit's C API arrives via the target bridging header (iPad/IOKitShim.h)
-// — the iOS SDK has the headers but no `import IOKit` Swift module.
+// IOKit's C API arrives via the target bridging header (iPad/IOKitShim.h):
+// the iOS SDK has the headers but no `import IOKit` Swift module.
 import Foundation
 import OSLog
 
 private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "usb-link")
 
-/// `kIOReturnNoResources` — the header defines it via the
+/// `kIOReturnNoResources`: the header defines it via the
 /// `iokit_common_err()` function-like macro, which Swift cannot import
 /// through a bridging header. Same numeric value the dext returns for a
 /// full write queue.
@@ -46,7 +46,7 @@ private func doorbellCallback(
 /// Thread-safety: all mutable state behind `lock`; the notification
 /// port delivers callbacks on a private serial dispatch queue.
 public final class IOKitUSBSerialLink: USBSerialLink, @unchecked Sendable {
-    /// The dext's IOUserClass — what the registered service is named.
+    /// The dext's IOUserClass, which is what the registered service is named.
     static let serviceName = "LodestarUSBSerialDriver"
 
     private let lock = NSLock()
@@ -64,8 +64,8 @@ public final class IOKitUSBSerialLink: USBSerialLink, @unchecked Sendable {
         Self.registered(Self.serviceName)
     }
 
-    /// Whether the companion control-interface driver is running —
-    /// diagnostics only (it has no user client).
+    /// Whether the companion control-interface driver is running.
+    /// Diagnostics only (it has no user client).
     public func commServicePresent() -> Bool? {
         Self.registered("LodestarUSBCommDriver")
     }
@@ -116,7 +116,7 @@ public final class IOKitUSBSerialLink: USBSerialLink, @unchecked Sendable {
         // Barrier: any doorbell callout already dispatched has now run
         // (and consumed its refcon); after the destroy above no new one
         // can be scheduled. Whatever is still recorded as armed will
-        // never fire — reclaim its retain.
+        // never fire, so reclaim its retain.
         queue.sync {}
         lock.lock()
         let leftover = armedRefcon
@@ -178,7 +178,7 @@ public final class IOKitUSBSerialLink: USBSerialLink, @unchecked Sendable {
         box.owner = self
         let refcon = Unmanaged.passRetained(box).toOpaque()
         // io_async_ref64_t layout per OSMessageNotification.h:
-        // slot 0 = kIOAsyncReservedIndex (kernel-owned — the wake port
+        // slot 0 = kIOAsyncReservedIndex (kernel-owned; the wake port
         // lands here), slot 1 = kIOAsyncCalloutFuncIndex (callback fn
         // ptr), slot 2 = kIOAsyncCalloutRefconIndex; the ref count is
         // kIOAsyncCalloutCount = 3. Putting the callback in slot 0 is

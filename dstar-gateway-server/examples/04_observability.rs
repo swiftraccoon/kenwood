@@ -3,7 +3,7 @@
 //! Installs a `tracing-subscriber` with the JSON formatter so every
 //! log line is a parsable JSON object suitable for ingest by
 //! Loki / Datadog / Elasticsearch / etc. The reflector then runs
-//! with [`AllowAllAuthorizer`] — in a real deployment this would be
+//! with [`AllowAllAuthorizer`]; in a real deployment this would be
 //! a policy-aware authorizer similar to `02_authorized_reflector.rs`.
 //!
 //! Demonstrates the two separate knobs you generally want in a

@@ -48,7 +48,7 @@ pub fn set_script_mode(on: bool) {
 /// Prompt the user to confirm a transmit action.
 ///
 /// Returns `true` when the caller may proceed:
-/// - [`CONFIRM_TX`] is false — confirmation globally disabled.
+/// - [`CONFIRM_TX`] is false: confirmation globally disabled.
 /// - The user typed `y` or `yes` (case-insensitive).
 ///
 /// Returns `false` when the caller must abort:
@@ -58,7 +58,7 @@ pub fn set_script_mode(on: bool) {
 ///
 /// In the abort path the function prints an explanatory line via
 /// plain `println!` (so the message is *not* suppressed by the
-/// history buffer or the quiet flag — confirmation is always loud).
+/// history buffer or the quiet flag; confirmation is always loud).
 pub fn tx_confirm() -> bool {
     if !is_required() {
         return true;
@@ -69,7 +69,7 @@ pub fn tx_confirm() -> bool {
     }
     println!("Confirm transmit? Type yes or y to proceed, anything else to cancel.");
     // Flush stdout so the prompt is visible before the blocking read.
-    // A flush failure is fine — the prompt was already sent via
+    // A flush failure is fine; the prompt was already sent via
     // `println!` so there is nothing left buffered.
     drop(std::io::stdout().flush());
 

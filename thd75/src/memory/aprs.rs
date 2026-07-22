@@ -10,13 +10,13 @@
 //! ⚠ **Field-level offsets inside the APRS data region are not
 //! hardware-verified on a TH-D75.** This module exposes only the region-
 //! boundary readers (`status_header`, `data_region`, `position_data_*`)
-//! and a generic `read_bytes` accessor. Field-level typed accessors —
-//! `my_callsign`, `beacon_interval`, `packet_path` — were previously
+//! and a generic `read_bytes` accessor. Field-level typed accessors
+//! (`my_callsign`, `beacon_interval`, `packet_path`) were previously
 //! present but **have been removed**: their offsets were ported from
 //! TH-D74 development notes during the April 2026 extraction, and
 //! D74 confirmations are not confirmations on D75. Returning typed
 //! values from unverified
-//! offsets violates the validation contract — the type system promised
+//! offsets violates the validation contract: the type system promised
 //! "this is the callsign" while in practice the bytes might come from
 //! a completely unrelated field.
 //!
@@ -32,7 +32,7 @@
 //!    radio, set the field via the menu, re-capture, then diff the byte
 //!    at the candidate offset and confirm it tracks the change.
 //!
-//! Only when both pass should a typed accessor land — with the source
+//! Only when both pass should a typed accessor land, with the source
 //! comment recording the firmware function address and the hardware
 //! capture date that verified it.
 //!
@@ -89,7 +89,7 @@ pub const APRS_POSITION_DATA_SIZE: usize = 0x4B00;
 /// Provides **region-boundary** byte access for the APRS settings
 /// region at pages `0x0151`+. The page-level layout (status header,
 /// data region, position data region) is verified; sub-page field
-/// offsets are not — see the module-level "Verification status" section
+/// offsets are not; see the module-level "Verification status" section
 /// for what was removed and why, and for the criteria a typed accessor
 /// must meet before it can be reintroduced.
 ///
@@ -149,7 +149,7 @@ impl<'a> AprsAccess<'a> {
     }
 
     // -----------------------------------------------------------------------
-    // Typed sub-page field accessors — REMOVED pending verification.
+    // Typed sub-page field accessors: REMOVED pending verification.
     //
     // `my_callsign`, `my_callsign_typed`, `beacon_interval`,
     // `packet_path_index`, and `packet_path` previously lived here.
@@ -297,7 +297,7 @@ mod tests {
     }
 
     // Tests for typed sub-page accessors (my_callsign, beacon_interval,
-    // packet_path) were removed alongside the accessors themselves —
+    // packet_path) were removed alongside the accessors themselves;
     // they exercised synthetic round-trips at unverified offsets, which
     // is exactly the failure mode the deletion was meant to prevent
     // (a green test passing on a wrong offset is worse than no test

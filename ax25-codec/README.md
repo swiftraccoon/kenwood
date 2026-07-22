@@ -4,7 +4,7 @@ AX.25 v2.2 frame encode/decode. `no_std` + `alloc`, sans-io.
 
 ## Scope
 
-- `Ax25Packet` — source, destination, up to 8 digipeaters, control field, PID, info payload.
+- `Ax25Packet`: source, destination, up to 8 digipeaters, control field, PID, info payload.
 - `parse_ax25(&[u8]) -> Result<Ax25Packet, Ax25Error>` and `build_ax25(&Ax25Packet) -> Vec<u8>`.
 - `Ax25Control` classification: Information / Supervisory{RR, RNR, REJ, SREJ} / Unnumbered{UI, SABM, DISC, DM, UA, FRMR, XID, TEST, ...}.
 - `Ax25Pid` enum with 14 canonical values (NoLayer3, NetRom, Ip, Arp, Appletalk, TexNet, LinkQuality, FlexNet, ...).

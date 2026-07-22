@@ -18,21 +18,21 @@ use crate::error::ValidationError;
 ///
 /// # Menu numbers (per Operating Tips §5.2, User Manual Chapter 12)
 ///
-/// - Menu No. 900: Backlight control — `Auto` (keys/encoder turn on,
-///   timer turns off; also lights on APRS interrupt or scan pause),
+/// - Menu No. 900: Backlight control, one of `Auto` (keys/encoder turn
+///   on, timer turns off; also lights on APRS interrupt or scan pause),
 ///   `Auto (DC-IN)` (same as Auto on battery, always-on on DC),
 ///   `Manual` (only `[Power]` toggles), `On` (always on).
-/// - Menu No. 901: Backlight timer — 3 to 60 seconds, default 10.
-/// - Menu No. 902: LCD brightness — High / Medium / Low.
-/// - Menu No. 903: Power-on message — up to 16 characters, default
+/// - Menu No. 901: Backlight timer, 3 to 60 seconds, default 10.
+/// - Menu No. 902: LCD brightness (High / Medium / Low).
+/// - Menu No. 903: Power-on message, up to 16 characters, default
 ///   "HELLO !!". Displayed for approximately 2 seconds at power-on.
 ///   MCP-D75 software can also set a custom bitmap graphic.
-/// - Menu No. 904: Single Band Display — Off / GPS(Altitude) /
-///   GPS(GS) / Date / Demodulation Mode.
-/// - Menu No. 905: Meter Type — Type 1 / Type 2 / Type 3 (S/RF meter
-///   design variants).
-/// - Menu No. 906: Background Color — Black / White.
-/// - Menu No. 907: Info Backlight — Off / LCD / LCD+Key. Controls
+/// - Menu No. 904: Single Band Display (Off / GPS(Altitude) /
+///   GPS(GS) / Date / Demodulation Mode).
+/// - Menu No. 905: Meter Type (Type 1 / Type 2 / Type 3, the S/RF
+///   meter design variants).
+/// - Menu No. 906: Background Color (Black / White).
+/// - Menu No. 907: Info Backlight (Off / LCD / LCD+Key). Controls
 ///   whether the backlight turns on for APRS or D-STAR interrupt
 ///   display and scan pause/stop events.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,7 +304,7 @@ pub enum VoiceGuideSpeed {
 ///
 /// The D75 offers eight beat-shift types (Type 1 through Type 8) that
 /// move internally generated spurious beats out of the receive
-/// passband. This is a type selector, not an on/off switch — the
+/// passband. This is a type selector, not an on/off switch: the
 /// MCP-D75 serializer stores one byte with domain 0-7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BeatShift {
@@ -362,7 +362,7 @@ pub enum BeatShift {
 /// of inactivity.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "Maps 1:1 to the D75 System menu tree — each bool is a discrete on/off menu item \
+    reason = "Maps 1:1 to the D75 System menu tree; each bool is a discrete on/off menu item \
               (battery saver, key lock, PC output NMEA, GPS on). Collapsing to bitflags would \
               lose the per-field User Manual Menu-number documentation."
 )]

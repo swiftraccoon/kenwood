@@ -1,4 +1,4 @@
-//! `AnySession<P>` — storage-friendly enum wrapping a session in any state.
+//! `AnySession<P>`: storage-friendly enum wrapping a session in any state.
 
 use super::protocol::{DPlus, Protocol};
 use super::session::Session;
@@ -19,17 +19,17 @@ use super::state::{
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum AnySession<P: Protocol> {
-    /// [`Configured`] state — session built but no I/O has happened.
+    /// [`Configured`] state: session built but no I/O has happened.
     Configured(Session<P, Configured>),
-    /// [`Authenticated`] state — `DPlus` only, TCP auth completed.
+    /// [`Authenticated`] state: `DPlus` only, TCP auth completed.
     Authenticated(Session<DPlus, Authenticated>),
-    /// [`Connecting`] state — LINK packet sent, waiting for ACK.
+    /// [`Connecting`] state: LINK packet sent, waiting for ACK.
     Connecting(Session<P, Connecting>),
-    /// [`Connected`] state — operational.
+    /// [`Connected`] state: operational.
     Connected(Session<P, Connected>),
-    /// [`Disconnecting`] state — UNLINK sent, waiting for ACK.
+    /// [`Disconnecting`] state: UNLINK sent, waiting for ACK.
     Disconnecting(Session<P, Disconnecting>),
-    /// [`Closed`] state — terminal.
+    /// [`Closed`] state: terminal.
     Closed(Session<P, Closed>),
 }
 

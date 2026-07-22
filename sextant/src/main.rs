@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Sextant — desktop D-STAR reflector client.
+//! Sextant: desktop D-STAR reflector client.
 //!
 //! Cross-platform egui app that lets the user connect to a D-STAR
 //! reflector (`DExtra` / `DPlus` / `DCS`), receive voice from other clients
-//! through the default speaker, and transmit via the default mic —
+//! through the default speaker, and transmit via the default mic,
 //! all with no radio in the loop. The primary use case is exercising
 //! the local POLARIS test reflector end-to-end during development.
 //!
@@ -41,7 +41,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MUST be the first statement: the local UTC offset can only be
     // read soundly while the process is single-threaded (Unix env
-    // rules) — logging and the tokio runtime both spawn threads.
+    // rules); logging and the tokio runtime both spawn threads.
     let local_offset = time::UtcOffset::current_local_offset().ok();
 
     let _log_guard = init_logging();
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Sextant — D-STAR Client")
+            .with_title("Sextant: D-STAR Client")
             .with_inner_size([960.0, 680.0])
             .with_min_inner_size([880.0, 560.0]),
         ..Default::default()

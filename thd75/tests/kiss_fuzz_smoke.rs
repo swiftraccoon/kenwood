@@ -1,6 +1,6 @@
 //! Smoke fuzzing for the AX.25 / APRS parsers.
 //!
-//! Not a real `cargo-fuzz` harness — that requires nightly. Instead,
+//! Not a real `cargo-fuzz` harness, which requires nightly. Instead,
 //! we feed the parsers a large number of pseudo-random byte sequences
 //! and assert that none of them panic. The seed is fixed so the test
 //! is reproducible.
@@ -32,7 +32,7 @@ use tokio as _;
 use tokio_serial as _;
 use tracing as _;
 
-/// Tiny xorshift32 RNG — deterministic, no `rand` dependency.
+/// Tiny xorshift32 RNG: deterministic, no `rand` dependency.
 struct Xor32(u32);
 
 impl Xor32 {

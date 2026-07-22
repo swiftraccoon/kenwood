@@ -10,7 +10,7 @@
 //! decode. The resulting `ambe_d` must match the input exactly.
 //!
 //! If this test fails, the encoder→decoder round-trip cannot work
-//! regardless of any algorithmic correctness — the bit-twiddling
+//! regardless of any algorithmic correctness: the bit-twiddling
 //! layer itself is asymmetric.
 
 #![cfg(feature = "encoder")]
@@ -65,7 +65,7 @@ fn encoder_pack_inverts_decoder_unpack_via_pitch_roundtrip() {
         assert!(
             any_nonzero,
             "decoder produced all-zero PCM from wire bytes our encoder \
-             emitted — bit pack/unpack asymmetry suspected"
+             emitted; bit pack/unpack asymmetry suspected"
         );
         t0 += 160;
     }
@@ -128,7 +128,7 @@ fn encoder_pack_inverts_decoder_unpack_via_pitch_roundtrip() {
     assert!(
         mag_at_target > 0.005,
         "decoded signal has only {mag_at_target:.6} energy at the input's \
-         1 kHz fundamental — encoder-decoder pipeline isn't preserving \
+         1 kHz fundamental; the encoder-decoder pipeline isn't preserving \
          the frequency content."
     );
 }

@@ -49,7 +49,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "  Note: FR is write-only on D75 — status is tracked",
+            "  Note: FR is write-only on D75; status is tracked",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(

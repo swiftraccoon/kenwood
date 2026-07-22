@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Debug page — the engineering surface: event log and tools.
+//! Debug page, the engineering surface: event log and tools.
 
 pub(crate) mod log;
 pub(crate) mod tools;

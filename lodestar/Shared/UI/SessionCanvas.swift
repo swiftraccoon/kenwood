@@ -3,12 +3,12 @@
 
 import SwiftUI
 
-/// Adaptive session layout. Wide (≥ 700 pt of actual available width —
+/// Adaptive session layout. Wide (≥ 700 pt of actual available width,
 /// never device idiom): the station map is the full-bleed content
 /// layer with a 380 pt rail of material cards whose composition comes
 /// from `RailState.derive`. Narrow: the classic single scrolling
 /// column with the map demoted to a fixed-height card. Reflow is
-/// non-destructive in both directions — all state lives above the
+/// non-destructive in both directions; all state lives above the
 /// branch, so resizing only re-composes.
 struct SessionCanvas: View {
     static let wideBreakpoint: CGFloat = 700
@@ -50,7 +50,7 @@ struct SessionCanvas: View {
         // makes (narrow → wide replaces the subtree), so SwiftUI's
         // layout-loop protection suppresses the update and the initial
         // branch renders forever. The outer observer below only feeds
-        // the toolbar's diagnostics toggle — a consumer that cannot
+        // the toolbar's diagnostics toggle, a consumer that cannot
         // affect this view's own layout, so it cannot loop.
         GeometryReader { proxy in
             Group {
@@ -124,7 +124,7 @@ struct SessionCanvas: View {
                     Button {
                         reflector.monitorAudioEnabled = true
                     } label: {
-                        Label("Monitor muted — unmute", systemImage: "speaker.slash")
+                        Label("Monitor muted, tap to unmute", systemImage: "speaker.slash")
                             .font(.caption)
                     }
                     .buttonStyle(.borderless)
@@ -171,13 +171,13 @@ struct SessionCanvas: View {
                     // nobody's transmitting.
                     NowTransmittingPane(stream: reflector.currentStream, size: .regular)
                     if !reflector.monitorAudioEnabled {
-                        // Tappable so the muted state is never a dead end —
-                        // the menu toggle exists too, but this is the spot
+                        // Tappable so the muted state is never a dead end.
+                        // The menu toggle exists too, but this is the spot
                         // the operator is already looking at.
                         Button {
                             reflector.monitorAudioEnabled = true
                         } label: {
-                            Label("Monitor muted — unmute", systemImage: "speaker.slash")
+                            Label("Monitor muted, tap to unmute", systemImage: "speaker.slash")
                                 .font(.caption)
                         }
                         .buttonStyle(.borderless)

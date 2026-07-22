@@ -41,8 +41,8 @@ impl HwType {
     /// Guess the hardware type from a `GetVersion` description string.
     ///
     /// The description is matched against the same set of prefixes that
-    /// `MMDVMHost/Modem.cpp:1997-2020` uses. Unknown descriptions
-    /// — including the TH-D75's internal modem — return
+    /// `MMDVMHost/Modem.cpp:1997-2020` uses. Unknown descriptions,
+    /// including the TH-D75's internal modem, return
     /// [`HwType::Unknown`].
     #[must_use]
     pub fn from_description(desc: &str) -> Self {
@@ -106,7 +106,7 @@ mod tests {
     fn mmdvm_hs_dual_hat_before_mmdvm_hs_hat_alternative() {
         // Both prefixes start with "MMDVM_HS_" but diverge at the
         // next character ("Hat" vs "Dual_Hat"), so the single-hat
-        // check — which runs first, mirroring the reference order —
+        // check (which runs first, mirroring the reference order)
         // can never shadow the dual-hat match. This test pins that
         // both resolve to their own variant.
         assert_eq!(

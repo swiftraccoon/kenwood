@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-/// Named timer identifier — a `&'static str` keeps the wheel
+/// Named timer identifier; a `&'static str` keeps the wheel
 /// allocation-free for fixed sets of timers (keepalive,
 /// inactivity, connect-deadline, voice-inactivity, etc.).
 pub(crate) type TimerId = &'static str;

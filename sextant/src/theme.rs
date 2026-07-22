@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Instrument design system — colour tokens, typography, and the app
+//! Instrument design system: colour tokens, typography, and the app
 //! `Style`.
 //!
 //! Palette discipline: [`LIVE`] amber marks live RF activity only,
@@ -31,15 +31,15 @@ pub(crate) const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xE8, 0xE8, 0xEA);
 pub(crate) const TEXT_SECONDARY: Color32 = Color32::from_rgb(0x9A, 0x9B, 0xA3);
 /// Hints and timestamps.
 pub(crate) const TEXT_TERTIARY: Color32 = Color32::from_rgb(0x63, 0x66, 0x6E);
-/// Live-RF amber — active RX callsign, page-toggle accent, favorites.
+/// Live-RF amber: active RX callsign, page-toggle accent, favorites.
 pub(crate) const LIVE: Color32 = Color32::from_rgb(0xFF, 0xB3, 0x40);
-/// Healthy-link green — status dot, mic/RX meters.
+/// Healthy-link green: status dot, mic/RX meters.
 pub(crate) const OK: Color32 = Color32::from_rgb(0x34, 0xC7, 0x59);
-/// On-air red — active TRANSMIT fill and hero tint only.
+/// On-air red: active TRANSMIT fill and hero tint only.
 pub(crate) const TX: Color32 = Color32::from_rgb(0xFF, 0x45, 0x3A);
-/// Error red — log errors and the error strip.
+/// Error red: log errors and the error strip.
 pub(crate) const ERR: Color32 = Color32::from_rgb(0xFF, 0x5F, 0x57);
-/// Event blue — log event lines.
+/// Event blue: log event lines.
 pub(crate) const INFO: Color32 = Color32::from_rgb(0x64, 0xA7, 0xFF);
 
 /// Medium-weight proportional family (section headings, buttons).
@@ -202,7 +202,7 @@ fn style() -> egui::Style {
         TextStyle::Monospace,
         FontId::new(12.0, FontFamily::Monospace),
     );
-    // Named style for the hero callsign — the loudest element in the
+    // Named style for the hero callsign, the loudest element in the
     // app; the theme owns its size so panels can't drift.
     let _prev = style.text_styles.insert(
         TextStyle::Name("hero".into()),

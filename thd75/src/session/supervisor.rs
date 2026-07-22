@@ -93,7 +93,7 @@ impl<T: Transport> RadioSupervisor<T> {
         self.events_tx.subscribe()
     }
 
-    /// The supervised radio — the one and only command path.
+    /// The supervised radio: the one and only command path.
     pub const fn radio(&mut self) -> &mut Radio<T> {
         &mut self.radio
     }
@@ -148,7 +148,7 @@ impl<T: Transport> RadioSupervisor<T> {
     }
 
     fn emit(&self, event: LinkEvent) {
-        // No subscribers is fine — events are advisory.
+        // No subscribers is fine; events are advisory.
         let _ = self.events_tx.send(event);
     }
 }

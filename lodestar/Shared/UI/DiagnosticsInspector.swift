@@ -11,8 +11,8 @@ import AppKit
 /// Radio-link diagnostics. `.card` is the classic inline dashboard
 /// card (narrow layout); `.panel` is the wide layout's toolbar-toggled
 /// floating inspector over the map. Content and actions are identical:
-/// probe/identify plus a one-tap transport + dext-event-ring dump —
-/// no Console.app required. Diagnostics actions stay available even
+/// probe/identify plus a one-tap transport + dext-event-ring dump,
+/// with no Console.app required. Diagnostics actions stay available even
 /// when `isBusy` gates the transport-writing buttons; a stuck busy
 /// flow is exactly when they're needed most.
 struct DiagnosticsInspector: View {
@@ -61,9 +61,9 @@ struct DiagnosticsInspector: View {
             }
             HStack(spacing: 12) {
                 // Only the transport-writing actions respect
-                // isBusy. Diagnostics stay available ALWAYS —
-                // a stuck busy flow is exactly when they're
-                // needed most.
+                // isBusy. Diagnostics stay available ALWAYS,
+                // because a stuck busy flow is exactly when
+                // they're needed most.
                 Group {
                     Button("Send ID") {
                         Task { await transport.sendIdentify() }

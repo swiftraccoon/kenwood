@@ -18,14 +18,14 @@ public final class ReflectorAudioPlayer {
 
     /// While `true`, playback is inaudible (used when the radio relay
     /// owns the audio path, or the user muted the monitor). The render
-    /// pipeline keeps running either way — a stopped engine would make
+    /// pipeline keeps running either way: a stopped engine would make
     /// the app suspension-eligible in the background, taking the
     /// reflector link and USB relay down with it.
     public var isSuspended = false {
         didSet { engine.mainMixerNode.outputVolume = isSuspended ? 0 : 1 }
     }
 
-    /// 8 kHz mono Float32 — valid parameters, so construction cannot
+    /// 8 kHz mono Float32: valid parameters, so construction cannot
     /// fail; checked once at startup.
     private let format = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
@@ -62,10 +62,10 @@ public final class ReflectorAudioPlayer {
 
     /// Route changes (headphones in/out) and media-services resets stop
     /// the engine out from under us. Drop the latch so the next enqueue
-    /// rebuilds the graph and restarts — re-attaching an already
+    /// rebuilds the graph and restarts; re-attaching an already
     /// attached node and re-connecting are documented no-ops/replacements.
     private func handleEngineConfigurationChange() {
-        log.info("Audio engine configuration changed — will restart on next enqueue")
+        log.info("Audio engine configuration changed; will restart on next enqueue")
         player.stop()
         engine.stop()
         started = false
@@ -73,8 +73,8 @@ public final class ReflectorAudioPlayer {
 
     /// Spin up the audio session + engine before any PCM arrives.
     /// While the engine renders (silence when idle or muted), iOS's
-    /// audio background mode keeps the process — and with it the
-    /// reflector session and the USB user client — alive when
+    /// audio background mode keeps the process (and with it the
+    /// reflector session and the USB user client) alive when
     /// backgrounded. Idempotent.
     public func beginKeepAlive() {
         guard let format else { return }
@@ -100,7 +100,7 @@ public final class ReflectorAudioPlayer {
     }
 
     /// Schedule one batch of PCM samples for playback. Scheduling
-    /// continues while suspended — the mixer is at zero volume, and
+    /// continues while suspended: the mixer is at zero volume, and
     /// keeping the render pipeline fed preserves background
     /// execution. No-op when empty or if the engine fails to start.
     public func enqueue(_ pcm: [Int16]) {
@@ -133,7 +133,7 @@ public final class ReflectorAudioPlayer {
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
         try engine.start()
-        // Re-apply after every engine (re)build — the didSet on
+        // Re-apply after every engine (re)build: the didSet on
         // isSuspended may have fired against a stopped graph.
         engine.mainMixerNode.outputVolume = isSuspended ? 0 : 1
         player.play()

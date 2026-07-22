@@ -3,7 +3,7 @@
 use dstar_gateway_core::hosts::{HostEntry, parse_xlx_directory};
 use dstar_gateway_core::types::ProtocolKind;
 
-/// XLX self-registration registry — the live, auto-generated reflector
+/// XLX self-registration registry: the live, auto-generated reflector
 /// directory. Emits `REF` / `XRF` / `DCS` entries for every reflector.
 const XLX_DIRECTORY_URL: &str = "http://xlxapi.rlx.lu/api.php?do=GetReflectorHostname";
 
@@ -34,7 +34,7 @@ impl HostsFetcher {
     /// Fetch and parse the XLX reflector directory.
     ///
     /// Returns one `(protocol, entry)` pair per reflector per protocol
-    /// prefix — the same reflector appears as `REF`, `XRF`, and `DCS`.
+    /// prefix: the same reflector appears as `REF`, `XRF`, and `DCS`.
     ///
     /// # Errors
     ///
@@ -68,7 +68,7 @@ mod tests {
     #[test]
     fn fetcher_new_builds_default_client() {
         // No network calls in unit tests. Round-trip through Clone
-        // proves the derive holds — the inner reqwest::Client is Clone.
+        // proves the derive holds: the inner reqwest::Client is Clone.
         let fetcher = HostsFetcher::new();
         let cloned = fetcher.clone();
         assert_eq!(format!("{fetcher:?}"), format!("{cloned:?}"));

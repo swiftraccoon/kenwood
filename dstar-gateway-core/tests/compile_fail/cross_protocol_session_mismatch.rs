@@ -1,6 +1,6 @@
 //! A function expecting `Session<Dcs, _>` cannot accept `Session<DPlus, _>`.
-//! This proves the phantom protocol type discriminates at compile time
-//! — even though both sessions wrap the same `SessionCore`, the
+//! This proves the phantom protocol type discriminates at compile time:
+//! even though both sessions wrap the same `SessionCore`, the
 //! phantom marker is part of the type identity.
 
 use dstar_gateway_core::session::client::{Configured, DPlus, Dcs, Session};

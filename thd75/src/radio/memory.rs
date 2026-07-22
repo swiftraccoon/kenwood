@@ -15,7 +15,7 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn read_channel(&mut self, channel: u16) -> Result<ChannelMemory, Error> {
         // The `ME {:03}` wire format silently grows to 4+ digits for
-        // out-of-range channels — validate before the wire.
+        // out-of-range channels, so validate before the wire.
         if channel > 999 {
             return Err(Error::Validation(
                 crate::error::ValidationError::ChannelOutOfRange { channel, max: 999 },
@@ -60,7 +60,7 @@ impl<T: Transport> Radio<T> {
                     }
                 }
                 Err(Error::NotAvailable) => {
-                    // Channel is empty/not programmed — skip.
+                    // Channel is empty/not programmed, so skip it.
                 }
                 Err(e) => return Err(e),
             }

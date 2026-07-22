@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Settings popup — operator identity and behaviour toggles, anchored
+//! Settings popup: operator identity and behaviour toggles, anchored
 //! under the header gear. Audio devices are duplicated here from the
 //! debug page deliberately: device choice is an operator concern too.
 
@@ -41,7 +41,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             ui.label(theme::section_label("clock"));
             ui.horizontal(|ui| {
                 let local_label = app.local_offset.map_or_else(
-                    || "Local (undetected — uses UTC)".to_owned(),
+                    || "Local (undetected, uses UTC)".to_owned(),
                     |off| {
                         format!(
                             "Local (UTC{:+03}:{:02})",

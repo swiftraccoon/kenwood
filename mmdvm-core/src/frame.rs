@@ -88,7 +88,7 @@ pub fn encode_frame(frame: &MmdvmFrame) -> Result<Vec<u8>, MmdvmError> {
 /// for the caller to hand to the next `decode_frame` call.
 ///
 /// Both wire forms are accepted: the single-byte-length form and the
-/// extended form (`length == 0`, total length `data[2] + 255` — see
+/// extended form (`length == 0`, total length `data[2] + 255`; see
 /// the module docs).
 ///
 /// # Errors
@@ -129,7 +129,7 @@ pub fn decode_frame(data: &[u8]) -> Result<Option<(MmdvmFrame, usize)>, MmdvmErr
         return Ok(None);
     };
     let Some(payload) = data.get(header_len..frame_len) else {
-        // Equally impossible — same bounds as the command byte.
+        // Equally impossible: same bounds as the command byte.
         return Ok(None);
     };
     Ok(Some((

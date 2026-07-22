@@ -107,7 +107,7 @@ pub fn parse_qso_log(data: &[u8]) -> Result<Vec<QsoEntry>, SdCardError> {
         let cols: Vec<&str> = line.split('\t').collect();
         let actual = cols.len();
         // Slice-pattern destructure: requires >= EXPECTED_COLUMNS elements, tail `..`
-        // allows (and ignores) extras. Binds each column to a named local — no indexing.
+        // allows (and ignores) extras. Binds each column to a named local, no indexing.
         let &[
             tx_rx,
             date,

@@ -7,7 +7,7 @@
 //! The MMDVM firmware rejects a command with `[0xE0, len, 0x7F, cmd,
 //! reason]`. The reason codes below are approximated from
 //! `MMDVMHost/Modem.cpp:970-971` and the historical MMDVM
-//! specification — unknown codes are preserved in [`NakReason::Unknown`]
+//! specification; unknown codes are preserved in [`NakReason::Unknown`]
 //! rather than turning into a hard error, so callers can log and
 //! continue.
 
@@ -25,7 +25,7 @@ pub enum NakReason {
     DataIncorrect,
     /// The TX buffer is full.
     BufferFull,
-    /// Unknown NAK reason byte — the raw code is preserved.
+    /// Unknown NAK reason byte; the raw code is preserved.
     Unknown {
         /// Raw byte as received from the modem.
         code: u8,
@@ -33,7 +33,7 @@ pub enum NakReason {
 }
 
 impl NakReason {
-    /// Parse a raw reason byte. Never fails — unknown codes are
+    /// Parse a raw reason byte. Never fails: unknown codes are
     /// captured as [`NakReason::Unknown`].
     #[must_use]
     pub const fn from_byte(b: u8) -> Self {

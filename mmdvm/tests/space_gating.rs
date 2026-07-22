@@ -90,7 +90,7 @@ async fn zero_space_means_no_header_drained() -> TestResult {
     // Drain the initial handshake.
     let _init = drain_frames(&mut modem_side, Duration::from_millis(100)).await;
 
-    // Report zero space — the loop must not emit our header.
+    // Report zero space: the loop must not emit our header.
     modem_write(
         &mut modem_side,
         &MmdvmFrame::with_payload(MMDVM_GET_STATUS, status_v2(0)),
@@ -119,7 +119,7 @@ async fn header_needs_five_slots() -> TestResult {
     tokio::time::advance(Duration::from_millis(5)).await;
     let _init = drain_frames(&mut modem_side, Duration::from_millis(100)).await;
 
-    // Report exactly 4 — the reference requires MORE than the header's
+    // Report exactly 4: the reference requires MORE than the header's
     // 4-slot cost (Modem.cpp:1053 `m_dstarSpace > 4U`), so nothing
     // may drain yet.
     modem_write(
@@ -137,7 +137,7 @@ async fn header_needs_five_slots() -> TestResult {
         frames.iter().map(|f| f.command).collect::<Vec<_>>()
     );
 
-    // Now bump space to 5 — header should drain on the next playout
+    // Now bump space to 5; the header should drain on the next playout
     // tick.
     modem_write(
         &mut modem_side,
@@ -198,7 +198,7 @@ async fn local_space_depletes_between_status_polls() -> TestResult {
         frames.iter().map(|f| f.command).collect::<Vec<_>>()
     );
 
-    // A fresh status report replenishes the ledger — the held frame
+    // A fresh status report replenishes the ledger, so the held frame
     // drains on the next playout tick.
     modem_write(
         &mut modem_side,
@@ -226,7 +226,7 @@ async fn data_needs_two_slots() -> TestResult {
     tokio::time::advance(Duration::from_millis(5)).await;
     let _init = drain_frames(&mut modem_side, Duration::from_millis(100)).await;
 
-    // 1 slot — below the strict `> 1` data gate (Modem.cpp:1054).
+    // 1 slot: below the strict `> 1` data gate (Modem.cpp:1054).
     modem_write(
         &mut modem_side,
         &MmdvmFrame::with_payload(MMDVM_GET_STATUS, status_v2(1)),
@@ -350,7 +350,7 @@ async fn queue_cap_returns_buffer_full() -> TestResult {
     tokio::time::advance(Duration::from_millis(5)).await;
     let _init = drain_frames(&mut modem_side, Duration::from_millis(100)).await;
 
-    // Space stays 0 — nothing drains, so the queue fills.
+    // Space stays 0, so nothing drains and the queue fills.
     for i in 0..64 {
         modem
             .send_dstar_data([0u8; 12])
@@ -374,7 +374,7 @@ async fn queue_blocked_then_replenished_drains_in_order() -> TestResult {
     let _init = drain_frames(&mut modem_side, Duration::from_millis(100)).await;
 
     // 2 free slots: enough for data (needs >1) but the HEAD of the
-    // queue is a header (needs >4), so nothing may drain — FIFO
+    // queue is a header (needs >4), so nothing may drain: FIFO
     // order must not be bypassed.
     modem_write(
         &mut modem_side,
@@ -395,7 +395,7 @@ async fn queue_blocked_then_replenished_drains_in_order() -> TestResult {
         "a blocked head must hold the whole queue: {blocked:?}"
     );
 
-    // Fresh status grants plenty of space mid-transmission — the
+    // Fresh status grants plenty of space mid-transmission, so the
     // queue must now release in FIFO order across playout ticks.
     modem_write(
         &mut modem_side,
@@ -427,7 +427,7 @@ async fn shutdown_with_stuck_queue_returns_within_flush_deadline() -> TestResult
     tokio::time::advance(Duration::from_millis(5)).await;
     let _init = drain_frames(&mut modem_side, Duration::from_millis(100)).await;
 
-    // No space ever granted — the frame can never drain. A shutdown
+    // No space ever granted, so the frame can never drain. A shutdown
     // must still complete once the flush deadline expires instead of
     // hanging forever (the modem may be unplugged or wedged).
     modem.send_dstar_data([7u8; 12]).await?;
@@ -451,7 +451,7 @@ async fn shutdown_flush_drains_when_modem_grants_space() -> TestResult {
     // Queue a frame the modem has no space for yet.
     modem.send_dstar_data([9u8; 12]).await?;
 
-    // Start the shutdown concurrently — the loop enters its flush
+    // Start the shutdown concurrently; the loop enters its flush
     // phase with the frame still queued.
     let shutdown_task = tokio::spawn(modem.shutdown());
     tokio::time::advance(Duration::from_millis(50)).await;
@@ -491,7 +491,7 @@ async fn shutdown_flush_drains_when_modem_grants_space() -> TestResult {
         "status polling must continue during the shutdown flush: {polls:?}"
     );
 
-    // Grant space — the queued frame must now drain and shutdown
+    // Grant space: the queued frame must now drain and shutdown
     // must complete well before the flush deadline.
     modem_write(
         &mut modem_side,

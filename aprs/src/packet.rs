@@ -85,7 +85,7 @@ impl<E: fmt::Display> fmt::Display for ParseContext<E> {
 /// | 4     | `49  .  N`            | 1 degree            |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PositionAmbiguity {
-    /// No ambiguity — full DDMM.HH precision.
+    /// No ambiguity: full DDMM.HH precision.
     None,
     /// Last digit of hundredths-of-a-minute masked (0.1' precision).
     OneDigit,
@@ -303,7 +303,7 @@ impl AprsTimestamp {
 ///
 /// | Code | Direction                  | Degrees |
 /// |------|----------------------------|---------|
-/// | `0`  | Omni-directional           | —       |
+/// | `0`  | Omni-directional           | n/a     |
 /// | `1`  | North-East                 | 45      |
 /// | `2`  | East                       | 90      |
 /// | `3`  | South-East                 | 135     |
@@ -312,7 +312,7 @@ impl AprsTimestamp {
 /// | `6`  | West                       | 270     |
 /// | `7`  | North-West                 | 315     |
 /// | `8`  | North                      | 360     |
-/// | `9`  | Undefined (treat as omni)  | —       |
+/// | `9`  | Undefined (treat as omni)  | n/a     |
 ///
 /// The 45° step is the canonical interpretation in every published
 /// reference implementation (`aprx`, `Xastir`, `aprs.fi`). The bug fixed
@@ -568,7 +568,7 @@ const fn phg_decode_height(byte: u8) -> Option<u32> {
 ///   [`PhgDirectivity::from_code`].
 ///
 /// Returns `None` if `PHG` is absent or any field fails its validation
-/// rule. Note the height field's relaxed acceptance — earlier code
+/// rule. Note the height field's relaxed acceptance: earlier code
 /// generations rejected `':'` (10 240 ft, common in balloon trackers),
 /// which produced silent loss of PHG data on receive.
 fn parse_phg(comment: &str) -> Option<Phg> {
@@ -667,14 +667,14 @@ fn parse_dao(comment: &str) -> Option<(f64, f64)> {
 pub enum MessageKind {
     /// Direct station-to-station message.
     Direct,
-    /// Numeric general bulletin (addressee `BLN0`-`BLN9` — exactly the
-    /// `BLN` prefix followed by a single ASCII digit).
+    /// Numeric general bulletin (addressee `BLN0`-`BLN9`, i.e. exactly
+    /// the `BLN` prefix followed by a single ASCII digit).
     Bulletin {
         /// Bulletin number (0-9).
         number: u8,
     },
     /// Group bulletin (addressee `BLN<digit><group>` per APRS 1.0.1
-    /// §14 p.74 — `BLN` prefix, then a single digit ID, then a 1-5
+    /// §14 p.74: `BLN` prefix, then a single digit ID, then a 1-5
     /// character group name, e.g. `BLN4WX___` for weather group
     /// bulletin number 4). The current parser accepts the looser
     /// "BLN + 1-5 alnum starting with anything except a single digit
@@ -684,7 +684,7 @@ pub enum MessageKind {
         /// Group identifier (1-5 alphanumeric characters).
         group: String,
     },
-    /// Announcement (addressee `BLNA`-`BLNZ` — exactly the `BLN`
+    /// Announcement (addressee `BLNA`-`BLNZ`, i.e. exactly the `BLN`
     /// prefix followed by a single uppercase ASCII letter). Per APRS
     /// 1.0.1 §14 p.73, announcements are transmitted less frequently
     /// than general bulletins and are intended for less time-sensitive
@@ -715,15 +715,15 @@ pub enum MessageKind {
 /// keyword prefix.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TelemetryDefinition {
-    /// `PARM.P1,P2,P3,P4,P5,B1,B2,B3,B4,B5,B6,B7,B8` — human-readable
+    /// `PARM.P1,P2,P3,P4,P5,B1,B2,B3,B4,B5,B6,B7,B8`: human-readable
     /// names for 5 analog + 8 digital channels.
     Parameters(TelemetryParameters),
-    /// `UNIT.U1,U2,U3,U4,U5,B1,B2,B3,B4,B5,B6,B7,B8` — unit labels.
+    /// `UNIT.U1,U2,U3,U4,U5,B1,B2,B3,B4,B5,B6,B7,B8`: unit labels.
     Units(TelemetryParameters),
-    /// `EQNS.a1,b1,c1,a2,b2,c2,...` — calibration coefficients for the
+    /// `EQNS.a1,b1,c1,a2,b2,c2,...`: calibration coefficients for the
     /// 5 analog channels (`y = a*x² + b*x + c`, 15 values total).
     Equations([Option<(f64, f64, f64)>; 5]),
-    /// `BITS.b1b2b3b4b5b6b7b8,project_title` — active-bit mask plus
+    /// `BITS.b1b2b3b4b5b6b7b8,project_title`: active-bit mask plus
     /// project title.
     Bits {
         /// 8-character binary string specifying which digital bits are
@@ -806,7 +806,7 @@ fn parse_telemetry_labels(s: &str) -> TelemetryParameters {
 /// Parse an `EQNS.` coefficient list into 5 `(a, b, c)` tuples.
 ///
 /// The wire format is 15 comma-separated decimal values per APRS 1.0.1
-/// §13 p.70 — three coefficients (a, b, c) for each of five analog
+/// §13 p.70: three coefficients (a, b, c) for each of five analog
 /// telemetry channels. The equation is `y = a·v² + b·v + c` where `v`
 /// is the raw channel value.
 ///
@@ -815,11 +815,11 @@ fn parse_telemetry_labels(s: &str) -> TelemetryParameters {
 /// field is empty, contains non-numeric text, or is missing entirely),
 /// that slot remains `None`. Earlier code generations substituted
 /// `0.0` for parse failures, which produced all-zero coefficients on
-/// malformed input — silently coercing a parsing bug into a "valid"
+/// malformed input, silently coercing a parsing bug into a "valid"
 /// equation `y = 0·v² + 0·v + 0 = 0`.
 fn parse_telemetry_equations(s: &str) -> [Option<(f64, f64, f64)>; 5] {
     // Parse each comma-separated field into `Option<f64>`; we deliberately
-    // do NOT fall through to 0.0 on parse failure — a missing/bad value
+    // do NOT fall through to 0.0 on parse failure; a missing/bad value
     // disables the whole slot.
     let values: Vec<Option<f64>> = s.split(',').map(|v| v.trim().parse::<f64>().ok()).collect();
     let mut out: [Option<(f64, f64, f64)>; 5] = [None, None, None, None, None];
@@ -865,7 +865,7 @@ pub enum AprsData {
     Telemetry(AprsTelemetry),
     /// Query (position, status, message, or direction finding).
     Query(AprsQuery),
-    /// Third-party traffic — a packet originating elsewhere and
+    /// Third-party traffic: a packet originating elsewhere and
     /// forwarded by an intermediate station (APRS 1.0.1 §17). The
     /// `header` carries the original `source>dest,path` and the
     /// `payload` the original info field.
@@ -917,8 +917,8 @@ pub enum AprsData {
     /// (data types `#` Peet Bros U-II, `*` Peet Bros U-II under a
     /// different ID per APRS 1.0.1 §12 p.62 Table).
     ///
-    /// Addendum 1.1 deprecates these formats ("not recommended on RF
-    /// — please use the Complete Weather Report format instead") but
+    /// Addendum 1.1 deprecates these formats ("not recommended on RF;
+    /// please use the Complete Weather Report format instead") but
     /// receivers must tolerate them. The library does not attempt to
     /// parse the proprietary ASCII-hex payload; downstream code can
     /// either decode it via a dedicated Peet Bros parser or log it
@@ -952,7 +952,7 @@ pub struct AprsPacket {
 /// the destination address.
 ///
 /// **Prefer [`crate::mic_e::parse_aprs_data_full`] when the AX.25
-/// destination address is available** — it handles all data types
+/// destination address is available**, since it handles all data types
 /// including Mic-E.
 ///
 /// # Supported data types
@@ -1008,7 +1008,7 @@ pub fn parse_aprs_data(info: &[u8]) -> Result<AprsData, AprsError> {
             info.get(1..).unwrap_or(&[]).to_vec(),
         )),
         // Raw weather formats from legacy commercial stations
-        // (APRS 1.0.1 §12 p.62 Table — `#` Peet Bros U-II, `*` Peet
+        // (APRS 1.0.1 §12 p.62 Table: `#` Peet Bros U-II, `*` Peet
         // Bros U-II again under a different ID, second `$` Ultimeter
         // 2000). Addendum 1.1 line 156-157 deprecates these
         // ("not recommended on RF") but says receivers MUST tolerate
@@ -1019,7 +1019,7 @@ pub fn parse_aprs_data(info: &[u8]) -> Result<AprsData, AprsError> {
             data_type: first,
             payload: info.get(1..).unwrap_or(&[]).to_vec(),
         }),
-        // Mic-E (` ' 0x1C 0x1D) needs destination address — use parse_mice_position().
+        // Mic-E (` ' 0x1C 0x1D) needs destination address: use parse_mice_position().
         b'`' | b'\'' | 0x1C | 0x1D => Err(AprsError::MicERequiresDestination),
         // All other types are unrecognized.
         _ => Err(AprsError::InvalidFormat),
@@ -1071,7 +1071,7 @@ fn parse_aprs_grid(info: &[u8]) -> Result<AprsData, AprsError> {
     let bytes = body.as_bytes();
     // First two: letters A-R. Next two: digits 0-9. Last two (optional):
     // letters a-x. Every byte of whatever length we accept must be
-    // validated — an odd length leaves a trailing byte unchecked, so only
+    // validated: an odd length leaves a trailing byte unchecked, so only
     // the even Maidenhead pair-lengths {4, 6} are valid here. (The spec
     // also defines an 8-char extended-square locator, but this `[` data
     // type dispatcher only emits 4-/6-char grids, so 8 is rejected too.)
@@ -1402,7 +1402,7 @@ mod tests {
 
     #[test]
     fn dispatch_raw_weather_peet_bros_star() -> TestResult {
-        // Second Peet Bros identifier (`*`) — same tolerance rule.
+        // Second Peet Bros identifier (`*`), same tolerance rule.
         let info = b"*0123 4567";
         let result = parse_aprs_data(info)?;
         assert!(
@@ -1594,7 +1594,7 @@ mod tests {
 
     #[test]
     fn phg_height_balloon_range() -> TestResult {
-        // `';'` (h=11) → 20 480 ft AGL — high-altitude balloon territory.
+        // `';'` (h=11) → 20 480 ft AGL, high-altitude balloon territory.
         let ext = parse_aprs_extensions("PHG3;30");
         let phg = ext.phg.ok_or("phg missing")?;
         assert_eq!(phg.height_feet, 20_480);
@@ -1759,7 +1759,7 @@ mod tests {
 
     #[test]
     fn parse_extensions_dao_human_readable() -> TestResult {
-        // !W5! — W is uppercase, so digits 5 and 5.
+        // !W5!: W is uppercase, so digits 5 and 5.
         let ext = parse_aprs_extensions("text !5W5! more");
         let (lat, lon) = ext.dao.ok_or("dao missing")?;
         let expected = 5.0 / 600.0;
@@ -1770,7 +1770,7 @@ mod tests {
 
     #[test]
     fn parse_extensions_dao_base91() -> TestResult {
-        // !w"! — w is lowercase, " is char 34, so base-91 value = 34-33 = 1
+        // !w"!: w is lowercase, " is char 34, so base-91 value = 34-33 = 1
         let ext = parse_aprs_extensions("!\"w\"!");
         let (lat, lon) = ext.dao.ok_or("dao missing")?;
         let expected = 1.0 / (91.0 * 60.0);
@@ -1842,7 +1842,7 @@ mod tests {
         // Regression guard: a non-numeric field must
         // disable the affected slot rather than substituting 0.0
         // (which would silently produce a valid-looking equation).
-        // Here channel 1 has a bad `b` coefficient ('hello') — the
+        // Here channel 1 has a bad `b` coefficient ('hello'), so the
         // entire slot must be None.
         let def = TelemetryDefinition::from_text("EQNS.0,0.1,0,0,hello,0,0,1,0,0,2,0,0,3,0")
             .ok_or("missing")?;

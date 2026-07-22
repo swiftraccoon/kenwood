@@ -33,7 +33,7 @@ const TONE_FRAME: [u8; 9] = [0xD2, 0x4B, 0x28, 0xB2, 0x57, 0x44, 0xE4, 0x08, 0x1
 /// known-good committed frames.
 ///
 /// Zero corrections on genuine wire frames is the exact property that
-/// proved the LSB-first unpack correct — the MSB-first regression
+/// proved the LSB-first unpack correct: the MSB-first regression
 /// produced a fixed lattice of phantom corrections on every frame.
 /// The b-vector pins localize any future bit-layer drift (unpack,
 /// deinterleave, Golay tables, demodulation) to a hard failure here
@@ -348,7 +348,7 @@ fn frame_peak(pcm: &[i16]) -> i32 {
 }
 
 /// Concealment on a fresh decoder repeats the initial silence
-/// parameters — the output must be near-silent, not garbage.
+/// parameters, so the output must be near-silent, not garbage.
 #[test]
 fn conceal_on_fresh_decoder_is_near_silence() {
     let mut dec = AmbeDecoder::new();
@@ -361,7 +361,7 @@ fn conceal_on_fresh_decoder_is_near_silence() {
 }
 
 /// Concealment after decoded audio repeats the previous frame's
-/// parameters — output stays in the same amplitude regime as the
+/// parameters, so output stays in the same amplitude regime as the
 /// stream it patches, with no energy blow-up.
 #[test]
 fn conceal_after_voice_is_bounded_repeat() {
@@ -383,14 +383,14 @@ fn conceal_after_voice_is_bounded_repeat() {
 /// tone, not silence.
 ///
 /// DVSI hardware encoders emit AMBE tone frames (b0 = 126/127) for
-/// any pure-tone input — a 440 Hz test tone into a TH-D75 mic
+/// any pure-tone input: a 440 Hz test tone into a TH-D75 mic
 /// produced this frame (tone index 14 = 437.5 Hz) on nearly every
 /// frame of the capture. A decoder that mutes tone frames fails
 /// legitimate hardware traffic.
 #[test]
 fn dvsi_tone_frame_synthesizes_the_tone() {
     let mut dec = AmbeDecoder::new();
-    // Two consecutive frames — the sine must be phase-continuous
+    // Two consecutive frames: the sine must be phase-continuous
     // across the boundary (a discontinuity would distort the
     // zero-crossing count).
     let mut pcm = Vec::new();
@@ -461,7 +461,7 @@ fn tone_frame_fully_resets_the_parameter_track() -> Result<(), Box<dyn std::erro
 }
 
 /// Random frame sequences interleaved with concealment must keep the
-/// delta-coded gain/magnitude accumulators bounded — the classic MBE
+/// delta-coded gain/magnitude accumulators bounded. The classic MBE
 /// failure mode is state blowup over adversarial frame SEQUENCES,
 /// which the single-frame tests above cannot reach. Non-finite f32
 /// state surfaces directly in the extractor's parameter output.
@@ -494,7 +494,7 @@ fn random_frame_sequences_keep_parameters_finite_and_synthesis_alive() {
 }
 
 /// Sustained concealment crosses the repeat-count muting threshold
-/// and degrades to bounded comfort noise — it must never accumulate
+/// and degrades to bounded comfort noise; it must never accumulate
 /// energy across consecutive concealed frames.
 #[test]
 fn sustained_conceal_stays_bounded() {

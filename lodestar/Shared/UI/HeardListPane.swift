@@ -7,7 +7,7 @@ import SwiftUI
 /// rail's remaining height and the "Show all" sheet retires; on narrow
 /// (`limit == n`) it renders the classic inline preview. Tapping a row
 /// selects the station (syncing the map pin highlight) and opens the
-/// station popover — the touch-first path to QRZ/copy/maps actions.
+/// station popover, the touch-first path to QRZ/copy/maps actions.
 struct HeardListPane: View {
     let reflector: ReflectorCoordinator
     let limit: Int?
@@ -83,7 +83,7 @@ struct HeardListPane: View {
     }
 }
 
-/// One heard-history row. Rendering only — tap handling, selection,
+/// One heard-history row. Rendering only: tap handling, selection,
 /// and menus live in `HeardListPane.rowButton`.
 struct HeardRow: View {
     let entry: ReflectorCoordinator.HeardEntry

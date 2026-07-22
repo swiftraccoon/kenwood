@@ -9,9 +9,9 @@
 //! speech model parameters carried by [`MbeParams`].
 //!
 //! Ported from `mbe_decodeAmbe2400Parms()` in mbelib's `ambe3600x2400.c`
-//! (<https://github.com/szechyjs/mbelib>), ISC license — the D-STAR variant
+//! (<https://github.com/szechyjs/mbelib>), ISC license: the D-STAR variant
 //! of the AMBE codec family.  **This is not compatible with the AMBE+2 /
-//! 2450-bit layout used by DMR / YSF / NXDN** — those are different codecs
+//! 2450-bit layout used by DMR / YSF / NXDN**: those are different codecs
 //! with different bit positions, different codebooks, and different gain
 //! quantization, and mbelib-rs no longer claims support for them.
 //!
@@ -47,8 +47,8 @@
 //! 5. **b4 (7 bits)** -- high-band PRBA from bits
 //!    `[17, 18, 19, 20, 21, 46, 47]`. Gm\[5..8\] via [`PRBA58_TABLE`].
 //!
-//! 6. **b5 (4 bits)** -- first-block HOC from bits `[22, 23, 25, 26]` —
-//!    note bit 24 is **skipped**; it is the only `ambe_d` bit that carries
+//! 6. **b5 (4 bits)** -- first-block HOC from bits `[22, 23, 25, 26]`.
+//!    Note bit 24 is **skipped**; it is the only `ambe_d` bit that carries
 //!    no parameter data in the D-STAR layout. Indexes [`HOC_B5_TABLE`].
 //!
 //! 7. **b6 (4 bits)** -- second-block HOC from bits `[27, 28, 29, 30]`.
@@ -59,7 +59,7 @@
 //!
 //! 9. **b8 (3 bits, stored shifted)** -- fourth-block HOC from bits
 //!    `[35, 36, 37]` assembled as `(a35 << 3) | (a36 << 2) | (a37 << 1)`.
-//!    The low bit is always zero — per the AMBE+ patent the LSB of `HOCb8`
+//!    The low bit is always zero: per the AMBE+ patent the LSB of `HOCb8`
 //!    is forced to 0 when unused. Indexes [`HOC_B8_TABLE`] on even values.
 //!
 //! After extracting these sub-fields, the decoder:
@@ -76,9 +76,9 @@
 //!
 //! Where the C reference returns an integer status code, `decode_params`
 //! returns a `FrameStatus`:
-//! - `Voice` — valid speech frame, parameters fully populated
-//! - `Erasure` — erasure frame (b0 in 120..=123), unrecoverable
-//! - `Tone { index, volume }` — tone signal (b0 in 126..=127)
+//! - `Voice`: valid speech frame, parameters fully populated
+//! - `Erasure`: erasure frame (b0 in 120..=123), unrecoverable
+//! - `Tone { index, volume }`: tone signal (b0 in 126..=127)
 //!
 //! Erasure and tone frames return early without modifying `cur`, leaving
 //! the caller to silence, reset, or synthesize.
@@ -104,7 +104,7 @@ use crate::tables;
 ///
 /// Only [`FrameStatus::Voice`] produces synthesizable speech-model
 /// parameters. [`FrameStatus::Tone`] carries the decoded tone
-/// descriptor for the caller to synthesize directly — DVSI hardware
+/// descriptor for the caller to synthesize directly; DVSI hardware
 /// encoders emit tone frames whenever the input is a pure tone (a
 /// TH-D75 fed a 440 Hz test tone encodes `index = 14`, 437.5 Hz, on
 /// nearly every frame), so a decoder that mutes them fails real
@@ -176,7 +176,7 @@ pub(crate) fn decode_params(
 
     // Tone detection: mbelib 2400 treats `(b0 & 0x7E) == 0x7E` (i.e.
     // b0 ∈ {126, 127}) as a tone frame. Decode the tone descriptor so
-    // the caller can synthesize it — DVSI encoders emit these for any
+    // the caller can synthesize it; DVSI encoders emit these for any
     // pure-tone input.
     if (b0 & 0x7E) == 0x7E {
         return decode_tone(ambe_d);
@@ -318,7 +318,7 @@ fn decode_spectral_offsets(ambe_d: &[u8; AMBE_DATA_BITS], big_l: usize) -> [f32;
     // -- b5-b8: HOC coefficients (D-STAR 2400 layout) --
     // Reference: `mbelib/ambe3600x2400.c:414-439`.
     //
-    // b5 is 4 bits at `[22, 23, 25, 26]` — bit 24 is deliberately
+    // b5 is 4 bits at `[22, 23, 25, 26]`; bit 24 is deliberately
     // skipped (the only unused ambe_d position in D-STAR).
     let b5: usize =
         (bit(ambe_d, 22) << 3) | (bit(ambe_d, 23) << 2) | (bit(ambe_d, 25) << 1) | bit(ambe_d, 26);
@@ -326,7 +326,7 @@ fn decode_spectral_offsets(ambe_d: &[u8; AMBE_DATA_BITS], big_l: usize) -> [f32;
         (bit(ambe_d, 27) << 3) | (bit(ambe_d, 28) << 2) | (bit(ambe_d, 29) << 1) | bit(ambe_d, 30);
     let b7: usize =
         (bit(ambe_d, 31) << 3) | (bit(ambe_d, 32) << 2) | (bit(ambe_d, 33) << 1) | bit(ambe_d, 34);
-    // b8 has only 3 source bits — the LSB is forced to 0 per the
+    // b8 has only 3 source bits; the LSB is forced to 0 per the
     // AMBE+ patent (mbelib 2400 line 437-440 comment). The resulting
     // value is always even and indexes HOC_B8_TABLE at even indices.
     let b8: usize = (bit(ambe_d, 35) << 3) | (bit(ambe_d, 36) << 2) | (bit(ambe_d, 37) << 1);
@@ -338,7 +338,7 @@ fn decode_spectral_offsets(ambe_d: &[u8; AMBE_DATA_BITS], big_l: usize) -> [f32;
     // 9 codebook indices the decoder pulled out of `ambe_d` plus the
     // partially-reconstructed `cik[2]` (block 2 mean + first AC, before
     // HOC fill). Used to compare against `MBELIB_DUMP_QUANTIZE=1`'s
-    // emitter output frame-by-frame — caught the FEC double-modulation
+    // emitter output frame-by-frame; this caught the FEC double-modulation
     // bug (April 2026) by showing decoder b3 = 304 where the encoder
     // had written b3 = 368 for the same input.
     if std::env::var_os("MBELIB_DUMP_DECODE").is_some() {
@@ -678,7 +678,7 @@ fn decode_tone(ambe_d: &[u8; AMBE_DATA_BITS]) -> FrameStatus {
 
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "index and volume are assembled from 8 single-bit values each — always < 256"
+        reason = "index and volume are assembled from 8 single-bit values each, always < 256"
     )]
     FrameStatus::Tone {
         index: index as u8,
@@ -757,7 +757,7 @@ mod tests {
 
     /// b1 V/UV mapping: D-STAR `VUV_TABLE`[0] is all-zeros, so every
     /// band should be UNVOICED with b1=0. (This is the opposite of the
-    /// old 2450 table which placed voiced in slot 0 — the D-STAR
+    /// old 2450 table which placed voiced in slot 0: the D-STAR
     /// VUV codebook puts the all-unvoiced pattern at index 0 and the
     /// all-voiced pattern at index 15.)
     #[test]

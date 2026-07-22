@@ -203,7 +203,7 @@ proptest! {
         let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
         let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
         let parsed: AprsPosition = parse_aprs_position(&parsed_packet.info).map_err(to_test_err)?;
-        // Compressed is less precise than uncompressed — allow more slop.
+        // Compressed is less precise than uncompressed, so allow more slop.
         prop_assert!((parsed.latitude - lat).abs() < 0.1);
         prop_assert!((parsed.longitude - lon).abs() < 0.1);
     }
@@ -354,7 +354,7 @@ proptest! {
 
 /// Regression: a status whose text carries leading whitespace must
 /// round-trip with that space intact. `parse_aprs_status` strips only
-/// trailing whitespace (the `\r` terminator and right padding) —
+/// trailing whitespace (the `\r` terminator and right padding);
 /// leading whitespace is content, as the parser's own grid+comment
 /// handling relies on. The `status_roundtrip` proptest previously
 /// compared against `text.trim()`, which also stripped the leading

@@ -5,7 +5,7 @@
 //! [`SessionBuilder`] with the corresponding marker type flipped from
 //! [`Missing`] to [`Provided`]. The [`SessionBuilder::build`] method
 //! is only implemented on
-//! `SessionBuilder<P, Provided, Provided, Provided, Provided>` — a
+//! `SessionBuilder<P, Provided, Provided, Provided, Provided>`; a
 //! missing field turns `.build()` into a compile error.
 
 use std::marker::PhantomData;
@@ -30,13 +30,13 @@ pub struct Provided;
 ///
 /// Parameters:
 ///
-/// - `P` — protocol marker ([`super::DPlus`], [`super::DExtra`],
+/// - `P`: protocol marker ([`super::DPlus`], [`super::DExtra`],
 ///   [`super::Dcs`])
-/// - `Cs` — [`Missing`] or [`Provided`], tracks whether the callsign
+/// - `Cs`: [`Missing`] or [`Provided`], tracks whether the callsign
 ///   has been set
-/// - `Lm` — tracks local module
-/// - `Rm` — tracks reflector module
-/// - `Pe` — tracks peer address
+/// - `Lm`: tracks local module
+/// - `Rm`: tracks reflector module
+/// - `Pe`: tracks peer address
 ///
 /// All four `Missing`/`Provided` type parameters start as
 /// [`Missing`] and must be flipped to [`Provided`] before
@@ -48,7 +48,7 @@ pub struct SessionBuilder<P: Protocol, Cs, Lm, Rm, Pe> {
     local_module: Option<Module>,
     reflector_module: Option<Module>,
     peer: Option<SocketAddr>,
-    /// Optional reflector callsign — only required for `DCS`
+    /// Optional reflector callsign, only required for `DCS`
     /// sessions targeting a non-`DCS001` reflector. `None` means
     /// `SessionCore` falls back to its `DCS001  ` default (and
     /// logs a warning if the protocol is `DCS`).
@@ -136,12 +136,12 @@ impl<P: Protocol, Cs, Lm, Rm, Pe> SessionBuilder<P, Cs, Lm, Rm, Pe> {
     /// callsign in every LINK / UNLINK / POLL packet, and a real
     /// `DCS030` reflector will silently drop traffic whose embedded
     /// reflector callsign reads `DCS001  `. For `DPlus` and
-    /// `DExtra` this is metadata only — the protocols do not carry
+    /// `DExtra` this is metadata only: the protocols do not carry
     /// the reflector callsign on the wire, so the setter is
     /// harmless when unused.
     ///
     /// Unlike the four required fields, this setter does not flip
-    /// a typestate marker — sessions that do not need a reflector
+    /// a typestate marker; sessions that do not need a reflector
     /// callsign keep building with four setters, and DCS sessions
     /// that forget it get a runtime warning at construction time
     /// plus a `DCS001  ` fallback. Upgrading this to a compile-time
@@ -157,7 +157,7 @@ impl<P: Protocol, Cs, Lm, Rm, Pe> SessionBuilder<P, Cs, Lm, Rm, Pe> {
 impl<P: Protocol> SessionBuilder<P, Provided, Provided, Provided, Provided> {
     /// Build the [`Session<P, Configured>`].
     ///
-    /// Only callable when all four required fields have been set —
+    /// Only callable when all four required fields have been set;
     /// any [`Missing`] marker turns this into a compile error.
     ///
     /// The [`Provided`] type parameters are the typestate proof that

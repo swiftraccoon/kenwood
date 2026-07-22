@@ -7,7 +7,7 @@
 // Values transcribed from `mbelib/ambe3600x2400_const.h` (szechyjs'
 // mbelib, originally ISC-licensed, relicensed to GPL-2.0-or-later via
 // mbelib-neo per its LICENSE/NOTICE). The C file stores them under the
-// `AmbePlus` prefix — this file strips that prefix and renames each
+// `AmbePlus` prefix; this file strips that prefix and renames each
 // table to SCREAMING_SNAKE_CASE Rust convention:
 //
 //   AmbePlusLtable -> L_TABLE   (126 entries, 7-bit b0 index)
@@ -26,7 +26,7 @@
 
 // Codec tables are verbatim copies of the mbelib reference values.
 // Clippy's style lints ("long literal lacking separators", "float has
-// excessive precision") flag thousands of entries here — silencing
+// excessive precision") flag thousands of entries here. Silencing
 // them at module scope both keeps the upstream values byte-for-byte
 // identical to the C source and avoids a review burden every time
 // upstream changes. NOT the place to start applying style fixups.

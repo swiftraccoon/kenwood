@@ -21,14 +21,14 @@ default = []
 # AMBE 3600×2400 D-STAR encoder. Off by default because decode-only
 # consumers are the common case. When enabled, ports Max H. Parke's
 # OP25 `ambe_encoder.cc` + Pavel Yazev's `imbe_vocoder` analysis path.
-# Scope is deliberately D-STAR only — the AMBE+2 "half-rate vocoder"
+# Scope is deliberately D-STAR only: the AMBE+2 "half-rate vocoder"
 # variant (DMR / YSF / NXDN) is NOT implemented and is covered by
 # US Patent 8,359,197 B2 (DVSI, active until 2028-05-20). See LICENSE
 # for full jurisdictional notes.
 encoder = []
 # Reference data lifted from the TH-D75 AMBE DSP firmware image
 # (lawfully owned hardware, DMCA §1201(f) interoperability exception).
-# Enabling this compiles the `encode::kenwood` module — a catalogue of
+# Enabling this compiles the `encode::kenwood` module, a catalogue of
 # `pub const` tables (filter coefficients, postfilter weights, math
 # constants) that the encoder pipeline can swap in at specific A/B
 # test points against radio-captured AMBE frames. No Kenwood algorithm

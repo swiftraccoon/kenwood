@@ -10,21 +10,21 @@
 /// CAT commands that Lodestar can send over the transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatCommand {
-    /// Radio identity query — `ID\r`.
+    /// Radio identity query: `ID\r`.
     Identify,
 }
 
 /// Parsed CAT response received from the radio.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatResponse {
-    /// Identity response — model string after the `ID ` prefix.
+    /// Identity response: model string after the `ID ` prefix.
     Identify {
         /// Radio model reported by the `ID` response, e.g. `TH-D75A`.
         model: String,
     },
-    /// Radio returned `?` — unknown command.
+    /// Radio returned `?`, meaning unknown command.
     Unknown,
-    /// Radio returned `N` — command not available in current mode.
+    /// Radio returned `N`, meaning command not available in current mode.
     NotAvailableInMode,
     /// Raw wire bytes that didn't match any known shape.
     Raw {
@@ -49,7 +49,7 @@ pub fn encode_cat(command: CatCommand) -> Vec<u8> {
 #[must_use]
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "UniFFI FFI boundary — `sequence<u8>` in UDL maps to owned `Vec<u8>`; a `&[u8]` signature wouldn't cross the FFI."
+    reason = "UniFFI FFI boundary: `sequence<u8>` in UDL maps to owned `Vec<u8>`; a `&[u8]` signature wouldn't cross the FFI."
 )]
 pub fn parse_cat_line(line: Vec<u8>) -> CatResponse {
     let text = String::from_utf8_lossy(&line).trim().to_owned();

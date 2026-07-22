@@ -54,14 +54,14 @@ const KISS_RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// | Command | Code | Range | Default |
 /// |---------|------|-------|---------|
-/// | Data Frame | `0x00` | AX.25 payload | — |
+/// | Data Frame | `0x00` | AX.25 payload | n/a |
 /// | TX Delay | `0x01` | 0-120 (10 ms units) | Menu 508 |
 /// | Persistence | `0x02` | 0-255 | 128 |
 /// | Slot Time | `0x03` | 0-250 (10 ms units) | 10 |
 /// | TX Tail | `0x04` | 0-255 | 3 |
 /// | Full Duplex | `0x05` | 0=half, nonzero=full | 0 |
 /// | Set Hardware | `0x06` | 0/0x23=1200, 0x05/0x26=9600 | Menu 505 |
-/// | Return | `0xFF` | — | — |
+/// | Return | `0xFF` | n/a | n/a |
 pub struct KissSession<T: Transport> {
     /// The underlying transport (serial or Bluetooth).
     pub(crate) transport: T,
@@ -241,7 +241,7 @@ impl<T: Transport> KissSession<T> {
             }
             // Cap the buffer: an opening FEND followed by an endless
             // unterminated payload (stuck TNC, wedged line) must not
-            // grow memory without bound. Keep the newest bytes — the
+            // grow memory without bound. Keep the newest bytes; the
             // oldest belong to a frame that never completed.
             if self.read_buf.len() > Self::MAX_READ_BUF {
                 tracing::warn!(
@@ -272,7 +272,7 @@ impl<T: Transport> KissSession<T> {
         loop {
             // A frame can only start at a FEND. Discard inter-frame
             // noise (stray CAT/NMEA bytes, line garbage) up to the
-            // first FEND — or everything, if no FEND exists — so one
+            // first FEND (or everything, if no FEND exists), so one
             // stray byte can never block extraction forever.
             match buf.iter().position(|&b| b == FEND) {
                 Some(0) => {}
@@ -315,7 +315,7 @@ impl<T: Transport> KissSession<T> {
                 }
                 Err(e) => {
                     // A malformed frame must not stall a valid frame
-                    // already buffered behind it — keep extracting.
+                    // already buffered behind it, so keep extracting.
                     tracing::warn!(?e, "discarding malformed KISS frame");
                 }
             }
@@ -448,7 +448,7 @@ impl<T: Transport> KissSession<T> {
     /// # Errors
     ///
     /// Returns the session back together with the error if the exit
-    /// write fails, so the transport survives for a retry — a full
+    /// write fails, so the transport survives for a retry: a full
     /// reopen is expensive (and fragile over Bluetooth RFCOMM).
     pub async fn exit(mut self) -> Result<Radio<T>, (Self, Error)> {
         tracing::info!("exiting KISS mode");
@@ -469,7 +469,7 @@ impl<T: Transport> KissSession<T> {
             mode_b: self.mode_b,
             mcp_speed: self.mcp_speed,
             last_cmd_time: None,
-            // Binary TNC traffic may have left residue on the line —
+            // Binary TNC traffic may have left residue on the line, so
             // drain before the first CAT command.
             desynced: true,
             mcp_active: false,
@@ -687,7 +687,7 @@ mod tests {
 
     #[tokio::test]
     async fn try_extract_all_garbage_clears_buffer() {
-        // No FEND anywhere: nothing can ever frame — the noise must
+        // No FEND anywhere: nothing can ever frame, and the noise must
         // not accumulate.
         let mut buf = b"pure ascii noise with no fend".to_vec();
         let frame = KissSession::<MockTransport>::try_extract_frame(&mut buf);
@@ -757,7 +757,7 @@ mod tests {
             .await
             .map_err(|(_, e)| e)?;
 
-        // No expected exchange for CMD_RETURN — the write fails. The
+        // No expected exchange for CMD_RETURN, so the write fails. The
         // session (and its transport) must come back for a retry
         // instead of being destroyed.
         let result = session.exit().await;

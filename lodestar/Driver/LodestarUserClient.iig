@@ -4,11 +4,11 @@
  *
  * IOUserClient for LodestarUSBSerialDriver. Selectors (keep in sync
  * with `USBSerialSelector` in Shared/Transport/USBSerialLink.swift):
- *   0 write (struct in ≤4096) — kIOReturnNoResources = backpressure
- *   1 read  (struct out ≤4096) — 0 bytes = empty, never blocks
- *   2 armDoorbell (async completion) — one-shot data-available doorbell
+ *   0 write (struct in ≤4096): kIOReturnNoResources = backpressure
+ *   1 read  (struct out ≤4096): 0 bytes = empty, never blocks
+ *   2 armDoorbell (async completion): one-shot data-available doorbell
  *   3 status (4 scalars out)
- *   4 copyLog (struct out ≤4096) — diagnostic event ring, oldest first
+ *   4 copyLog (struct out ≤4096): diagnostic event ring, oldest first
  */
 
 #ifndef LodestarUserClient_h
@@ -36,7 +36,7 @@ public:
                                          void *reference) override;
 
     /// Complete an armed doorbell action. Called by the driver (on the
-    /// driver queue) — kIOReturnSuccess = data available,
+    /// driver queue): kIOReturnSuccess = data available,
     /// kIOReturnAborted = teardown/re-arm.
     void FireDoorbell(OSAction *action, IOReturn status) LOCALONLY;
 

@@ -2,7 +2,7 @@
 //!
 //! [`ServerEvent`] is the consumer-visible enum surfaced by the
 //! server-side session machine. The `P: Protocol` parameter is a
-//! phantom discriminator — every variant carries the same data
+//! phantom discriminator: every variant carries the same data
 //! regardless of protocol, mirroring the client-side `Event<P>`
 //! design.
 
@@ -41,7 +41,7 @@ pub enum ClientRejectedReason {
     MaxClients,
     /// Custom rejection.
     Custom {
-        /// Numeric code (NOT a protocol code — internal).
+        /// Numeric code (NOT a protocol code; internal only).
         code: u8,
         /// Human-readable message.
         message: String,
@@ -50,7 +50,7 @@ pub enum ClientRejectedReason {
 
 /// One event surfaced by the server-side session machine.
 ///
-/// The `P: Protocol` parameter is a phantom — every variant carries
+/// The `P: Protocol` parameter is a phantom: every variant carries
 /// the same data regardless of protocol. The phantom is for
 /// compile-time discrimination only, confined to a hidden
 /// [`ServerEvent::__Phantom`] variant that cannot be constructed
@@ -101,7 +101,7 @@ pub enum ServerEvent<P: Protocol> {
     },
     /// A link attempt was refused by the shell authorizer.
     ///
-    /// Emitted before any handle is created — the rejected client is
+    /// Emitted before any handle is created; the rejected client is
     /// *not* present in the pool. The reflector additionally enqueues
     /// a protocol-appropriate NAK to the peer.
     ClientRejected {
@@ -115,7 +115,7 @@ pub enum ServerEvent<P: Protocol> {
     /// Emitted when a client whose [`AccessPolicy`] is `ReadOnly`
     /// sends a voice header / data / EOT packet. The reflector drops
     /// the frame silently on the wire so the originator isn't told
-    /// the difference — this event lets consumers observe the drop
+    /// the difference; this event lets consumers observe the drop
     /// for metrics and audit purposes without exposing it on-air.
     ///
     /// [`AccessPolicy`]: https://docs.rs/dstar-gateway-server/latest/dstar_gateway_server/enum.AccessPolicy.html
@@ -128,7 +128,7 @@ pub enum ServerEvent<P: Protocol> {
     /// A client was evicted by the reflector.
     ///
     /// Emitted when the shell removes a client for reasons unrelated
-    /// to a protocol-level UNLINK — e.g. the send-failure threshold
+    /// to a protocol-level UNLINK, e.g. the send-failure threshold
     /// was exceeded or a health check fired. The peer entry has
     /// already been removed from the pool by the time this event is
     /// observed.
@@ -147,7 +147,7 @@ pub enum ServerEvent<P: Protocol> {
     /// every public variant.
     #[doc(hidden)]
     __Phantom {
-        /// Uninhabited — prevents construction of this variant.
+        /// Uninhabited, which prevents construction of this variant.
         #[doc(hidden)]
         never: Infallible,
         /// Phantom marker for `P`.

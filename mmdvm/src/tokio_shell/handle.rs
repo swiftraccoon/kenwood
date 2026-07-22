@@ -94,13 +94,13 @@ impl<T: Transport + 'static> AsyncModem<T> {
     /// has been fully drained.
     ///
     /// Consume events promptly: the modem loop never blocks on a slow
-    /// consumer — if the event channel fills up, further events are
+    /// consumer. If the event channel fills up, further events are
     /// dropped (and counted in a `warn` log) until the consumer
     /// catches up, mirroring the reference's fixed-size ring buffers.
     ///
     /// # Cancellation safety
     ///
-    /// Cancel-safe — backed by `tokio::sync::mpsc::Receiver::recv`.
+    /// Cancel-safe: backed by `tokio::sync::mpsc::Receiver::recv`.
     pub async fn next_event(&mut self) -> Option<Event> {
         self.event_rx.recv().await
     }
@@ -186,7 +186,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
 
     /// Set the modem's operating mode.
     ///
-    /// Resolves only after the modem acknowledges the mode change —
+    /// Resolves only after the modem acknowledges the mode change:
     /// an `Ok(())` means the modem actually switched, not merely
     /// that the request was written. (The corresponding
     /// [`Event::Ack`]/[`Event::Nak`] is still emitted on the event
@@ -246,7 +246,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
         rx.await.map_err(|_| ShellError::SessionClosed)?
     }
 
-    /// Send a raw frame — escape hatch for protocols we don't model
+    /// Send a raw frame: an escape hatch for protocols we don't model
     /// yet.
     ///
     /// # Errors
@@ -268,7 +268,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
         rx.await.map_err(|_| ShellError::SessionClosed)?
     }
 
-    /// Graceful shutdown — flushes the TX queue (bounded by an
+    /// Graceful shutdown: flushes the TX queue (bounded by an
     /// internal ~2 s deadline), exits the loop, and returns the
     /// recovered transport.
     ///
@@ -278,7 +278,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
     /// mode on a serial port). If the modem never grants FIFO space
     /// for queued frames, the flush deadline expires, the remaining
     /// frames are dropped (logged and reported as
-    /// [`Event::TxDropped`]), and shutdown still completes — it never
+    /// [`Event::TxDropped`]), and shutdown still completes; it never
     /// hangs on a wedged modem.
     ///
     /// Works even if the loop already exited on its own (EOF or
@@ -299,7 +299,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
             .await
             .is_ok()
         {
-            // Ignore a dropped reply — the loop may already be on
+            // Ignore a dropped reply: the loop may already be on
             // its way out, which is fine; we only need it to
             // terminate.
             if rx.await.is_err() {
@@ -312,7 +312,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
 
         // Drain any remaining events so the loop can finish its
         // flush. Once the send half drops (when the loop exits), this
-        // terminates — also immediately if the loop was already gone.
+        // terminates, also immediately if the loop was already gone.
         while self.event_rx.recv().await.is_some() {}
 
         // Reclaim the transport from the task.
@@ -337,7 +337,7 @@ impl<T: Transport + 'static> Drop for AsyncModem<T> {
     fn drop(&mut self) {
         // Dropping command_tx closes the channel, which signals the
         // modem task to exit on its next loop iteration. The spawned
-        // task's JoinHandle is detached — if the caller never invoked
+        // task's JoinHandle is detached: if the caller never invoked
         // `shutdown`, we do not await the task (awaiting in Drop would
         // require blocking). The tokio runtime detaches the task and
         // its transport will be dropped when the task finishes.

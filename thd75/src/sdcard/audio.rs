@@ -11,7 +11,7 @@
 //!
 //! # Location
 //!
-//! `/KENWOOD/TH-D75/AUDIO_REC/*.wav` — maximum 255 files per directory.
+//! `/KENWOOD/TH-D75/AUDIO_REC/*.wav`, maximum 255 files per directory.
 //!
 //! # Details
 //!
@@ -38,7 +38,7 @@ const MIN_WAV_SIZE: usize = 44;
 
 /// Metadata extracted from a TH-D75 audio recording WAV file.
 ///
-/// Contains only the header information — PCM sample data is not
+/// Contains only the header information; PCM sample data is not
 /// loaded or decoded.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioRecording {

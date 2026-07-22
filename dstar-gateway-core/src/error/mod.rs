@@ -31,7 +31,7 @@ use crate::types::TypeError;
 pub enum Error {
     /// Underlying I/O failure on a socket or TCP stream.
     ///
-    /// Only emitted by the shell crates — `dstar-gateway-core` itself
+    /// Only emitted by the shell crates; `dstar-gateway-core` itself
     /// has no I/O. Carried here for the shell crates' convenience.
     #[error("I/O error during {operation:?}: {source}")]
     Io {

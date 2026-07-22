@@ -8,7 +8,7 @@ import AppKit
 
 /// Read-only window showing recent Unified Log entries for the app's
 /// subsystems. Opened from `View → Show Log` (⌘⇧L). Uses Apple's
-/// public `OSLogStore` API — works on any dev-signed or notarized
+/// public `OSLogStore` API, which works on any dev-signed or notarized
 /// macOS build without special entitlements.
 public struct LogViewerWindow: View {
     @State private var entries: [LogRow] = []
@@ -47,8 +47,8 @@ public struct LogViewerWindow: View {
         }
         .frame(minWidth: 640, minHeight: 420)
         .task {
-            // `.task` runs at first-appear but on a detached priority
-            // — `.onAppear { Task { ... } }` previously scheduled the
+            // `.task` runs at first-appear but on a detached priority.
+            // `.onAppear { Task { ... } }` previously scheduled the
             // async work on MainActor which blocked the window from
             // painting until the OSLogStore scan returned.
             await reload()
@@ -116,7 +116,7 @@ public struct LogViewerWindow: View {
             // One single monospaced text block inside a ScrollView.
             // `.textSelection(.enabled)` + a single `Text` lets the
             // user drag-select across rows, copy multi-line spans,
-            // and ⌘A select-all — behaviour you expect from any log
+            // and ⌘A select-all: behaviour you expect from any log
             // viewer, which per-row `Text` + `.textSelection` does not
             // give you.
             ScrollView {
@@ -159,7 +159,7 @@ public struct LogViewerWindow: View {
         defer { isLoading = false }
 
         // `OSLogStore.getEntries` is synchronous and can take several
-        // seconds to scan the shared-cache store — run it OFF the
+        // seconds to scan the shared-cache store, so run it OFF the
         // MainActor so the window paints its chrome immediately and
         // the ProgressView spinner is actually visible.
         let filter = selectedSubsystem

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Debug tools column — stream stats, TX test tools, audio devices.
+//! Debug tools column: stream stats, TX test tools, audio devices.
 
 use eframe::egui;
 

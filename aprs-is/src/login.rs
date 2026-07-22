@@ -22,7 +22,7 @@ use crate::error::AprsIsError;
 pub enum Passcode {
     /// A verified 15-bit passcode computed from the station callsign.
     Verified(u16),
-    /// Receive-only connection — the server will accept incoming packets
+    /// Receive-only connection: the server will accept incoming packets
     /// from us but will not forward any packets we transmit to RF.
     ReceiveOnly,
 }
@@ -159,8 +159,8 @@ pub fn aprs_is_passcode(callsign: &str) -> i32 {
 /// login/callsign is "alphanumeric ASCII characters only" with at most a
 /// single hyphen-SSID. The login line is space-delimited, so any
 /// embedded whitespace (space, tab, …) or `CRLF`/control character in
-/// these fields would either shift the keyword parsing or — for a raw
-/// `\n` — inject a second handshake line. We reject the whole class of
+/// these fields would either shift the keyword parsing or, for a raw
+/// `\n`, inject a second handshake line. We reject the whole class of
 /// ASCII whitespace and control characters here rather than enumerating
 /// the exact callsign grammar, which is stricter than necessary but
 /// never rejects a valid value.

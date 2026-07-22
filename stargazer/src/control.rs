@@ -5,7 +5,7 @@
 //!
 //! One callsign gets one session per reflector, so testing a client
 //! (sextant) against a busy reflector used to mean restarting the
-//! whole recorder with an edited config — dropping and relinking
+//! whole recorder with an edited config, dropping and relinking
 //! every target. This module gives the running recorder a local
 //! control socket instead: `stargazer ctl disable REF030-C` unlinks
 //! exactly one target (politely, finalizing open captures), `enable`
@@ -203,7 +203,7 @@ impl Coordinator {
     pub fn new(config: Config, config_path: PathBuf, writer: Arc<Writer>) -> std::io::Result<Self> {
         let disabled = load_disabled(&config.recordings_dir.join(DISABLED_FILE))?;
         for key in &disabled {
-            tracing::warn!(target = %key, "target is disabled (persisted) — not linking");
+            tracing::warn!(target = %key, "target is disabled (persisted), not linking");
         }
         Ok(Self {
             config,
@@ -277,7 +277,7 @@ impl Coordinator {
         let _unused = running.shutdown.send(true);
         match tokio::time::timeout(DRAIN_TIMEOUT, running.join).await {
             Ok(_) => "unlinked",
-            Err(_) => "unlink is taking long — draining in background",
+            Err(_) => "unlink is taking long; draining in background",
         }
     }
 
@@ -317,21 +317,21 @@ impl Coordinator {
             }
             Command::Disable(key) => {
                 if !self.configured_keys().contains(&key) && !self.running.contains_key(&key) {
-                    return format!("unknown target {key} — see `status`");
+                    return format!("unknown target {key}; see `status`");
                 }
                 let outcome = self.stop_target(&key).await;
                 let _unused = self.disabled.insert(key.clone());
                 let warn = self.persist_disabled();
-                format!("{key} disabled — {outcome}; slot is free until `enable`{warn}")
+                format!("{key} disabled: {outcome}; slot is free until `enable`{warn}")
             }
             Command::Enable(key) => {
                 if !self.configured_keys().contains(&key) {
-                    return format!("unknown target {key} — see `status`");
+                    return format!("unknown target {key}; see `status`");
                 }
                 let _unused = self.disabled.remove(&key);
                 let warn = self.persist_disabled();
                 self.spawn_target(&key);
-                format!("{key} enabled — relinking{warn}")
+                format!("{key} enabled, relinking{warn}")
             }
             Command::Reload => match crate::config::load(&self.config_path) {
                 Err(e) => format!("config reload failed (targets unchanged): {e}"),
@@ -387,7 +387,7 @@ pub async fn serve_socket(
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
     // A transient accept error (ECONNABORTED from a client that aborts
     // between connect and accept, or EMFILE/ENFILE under fd pressure)
-    // is NOT the listener closing — treating it as terminal would drop
+    // is NOT the listener closing; treating it as terminal would drop
     // the request sender and tear down every reflector recording (main
     // breaks its loop on a closed channel). The control plane must
     // never take the data plane down with it, so we log and keep
@@ -403,10 +403,10 @@ pub async fn serve_socket(
             Err(e) => {
                 consecutive_failures += 1;
                 if consecutive_failures >= MAX_ACCEPT_FAILURES {
-                    tracing::error!(error = %e, "control socket accept failed repeatedly — giving up");
+                    tracing::error!(error = %e, "control socket accept failed repeatedly, giving up");
                     return;
                 }
-                tracing::warn!(error = %e, "control socket accept failed — continuing");
+                tracing::warn!(error = %e, "control socket accept failed, continuing");
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -607,7 +607,7 @@ mod tests {
         responder.abort();
 
         // The socket file lingers after the listener dies (nothing
-        // unlinks it) — connect is refused, so: not running.
+        // unlinks it), but connect is refused, so: not running.
         assert!(
             !recorder_already_running(&sock).await,
             "stale socket file must not read as a live recorder"

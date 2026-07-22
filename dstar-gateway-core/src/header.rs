@@ -100,7 +100,7 @@ impl DStarHeader {
     /// forced to zero BEFORE CRC computation. Matches
     /// `ircDDBGateway/Common/HeaderData.cpp:665-667` (`getDPlusData`).
     ///
-    /// DCS voice packets carry real flag bytes — use [`Self::encode`]
+    /// DCS voice packets carry real flag bytes; use [`Self::encode`]
     /// for those.
     #[must_use]
     pub fn encode_for_dsvt(&self) -> [u8; ENCODED_LEN] {
@@ -129,8 +129,8 @@ impl DStarHeader {
     /// - `flag1`/`flag2`/`flag3` = 0
     ///
     /// Both `rpt1[7]` and `rpt2[7]` are real module letters. xlxd's
-    /// `IsValidModule` rejects `'G'` and silently drops the packet —
-    /// no NAK, no log line, no retry — so any header with `rpt1[7]`
+    /// `IsValidModule` rejects `'G'` and silently drops the packet
+    /// (no NAK, no log line, no retry), so any header with `rpt1[7]`
     /// outside `b'A'..=b'Z'` will be invisible to other clients.
     /// The `Module` type's invariant (`b'A'..=b'Z'`) is what makes
     /// this safe to express infallibly.
@@ -208,7 +208,7 @@ impl DStarHeader {
 
 /// Build an `rpt1`/`rpt2` field: 7-byte callsign + 1-byte module
 /// letter at index 7. The `Module` type's `b'A'..=b'Z'` invariant is
-/// what guarantees byte 7 is a valid module letter — no runtime check
+/// what guarantees byte 7 is a valid module letter, so no runtime check
 /// needed.
 fn rpt_field(callsign: Callsign, module: Module) -> Callsign {
     let cs = callsign.as_bytes();
@@ -271,7 +271,7 @@ mod tests {
     fn decode_accepts_bad_crc() {
         // Per ircDDBGateway/Common/DPlusProtocolHandler.cpp:172
         // ("DPlus checksums are unreliable") the receive path skips
-        // CRC checks. We mirror that — decode is infallible.
+        // CRC checks. We mirror that: decode is infallible.
         let header = test_header();
         let mut encoded = header.encode();
         if let Some(byte) = encoded.get_mut(40) {
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn decode_accepts_non_ascii_callsign_verbatim() {
         // Real-world reflector traffic includes non-printable bytes
-        // in callsign fields. Lenient receive — bytes preserved.
+        // in callsign fields. Lenient receive: bytes preserved.
         let header = test_header();
         let mut encoded = header.encode();
         if let Some(byte) = encoded.get_mut(27) {
@@ -430,7 +430,7 @@ mod tests {
     #[test]
     fn for_relay_truncates_callsign_to_7_bytes_for_rpt() {
         // Even with a fully-populated 8-byte callsign, only the first
-        // 7 bytes feed rpt1 — byte 7 is reserved for the module letter.
+        // 7 bytes feed rpt1; byte 7 is reserved for the module letter.
         // (Real callsigns are ≤6 chars so this only matters for
         // adversarial inputs, but the invariant must hold.)
         let header = DStarHeader::for_relay(

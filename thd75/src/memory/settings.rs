@@ -29,19 +29,19 @@
 // registry and the hardware dump):
 //
 // - `lock`/`set_lock` (0x1060): that byte is `radio.BacklightControl`.
-//   Key-lock STATE is runtime state — the CAT layer
+//   Key-lock STATE is runtime state; the CAT layer
 //   (`Radio::get_lock`/`Radio::set_lock`, LC/DL wire commands) is the
 //   verified path. The persistent key-lock *configuration* is the bit
 //   pair at 0x1084 (`key_lock`/`frequency_lock` below).
 // - VFO block (0x0020): the hardware dump holds no VFO data there
 //   (entry 0 all-0xFF, entries 1-5 zero). Candidate real VFO records
 //   were observed at 0x0400/0x0430/0x0460 (48-byte stride, second bank
-//   at 0x0600) but remain unverified — no accessor until they are.
+//   at 0x0600) but remain unverified; no accessor until they are.
 // - `model_name` (0x11D0): unmapped gap after `gps.MyPositionSelect`;
 //   the famous "TH-D75" string lives at 0x10D0 =
 //   `radio.BluetoothDeviceName` (reachable through the registry).
 // - `squelch_a`/`squelch_b` (0x100D/0x100E): squelch is runtime state
-//   (CAT `SQ`), never serialized by MCP-D75 — those bytes are the
+//   (CAT `SQ`), never serialized by MCP-D75; those bytes are the
 //   digital scan-resume and time-restart cells.
 // - `callsign_raw` (0x1300): that offset is
 //   `aprs.StatusTextList[4].StatusText`. D-STAR MY callsigns live in
@@ -330,7 +330,7 @@ impl<'a> SettingsAccess<'a> {
     /// if unreadable).
     ///
     /// MCP offset `0x1003`. Indexes the table 0.5, 1.0, 1.5, 2.0, 2.5,
-    /// 3.0, 3.5, 4.0, 4.5, 5.0, 10.0 minutes — NOT a minute count.
+    /// 3.0, 3.5, 4.0, 4.5, 5.0, 10.0 minutes, NOT a minute count.
     #[must_use]
     pub fn timeout_timer(&self) -> u8 {
         self.image
@@ -495,7 +495,7 @@ impl<'a> SettingsAccess<'a> {
     /// unreadable).
     ///
     /// MCP offset `0x101D`. Indexes the table 250, 500, 750, 1000,
-    /// 1500, 2000, 3000 ms — NOT a 100 ms unit count.
+    /// 1500, 2000, 3000 ms, NOT a 100 ms unit count.
     #[must_use]
     pub fn vox_delay(&self) -> u8 {
         self.image
@@ -1184,7 +1184,7 @@ impl<'a> SettingsWriter<'a> {
     /// Set the VOX delay index (`radio.VoxDelay`, clamped to 0-6).
     ///
     /// MCP offset `0x101D`. The value indexes the 250-3000 ms table
-    /// (see [`SettingsAccess::vox_delay`]) — it is NOT a 100 ms unit
+    /// (see [`SettingsAccess::vox_delay`]); it is NOT a 100 ms unit
     /// count.
     pub fn set_vox_delay(&mut self, delay: u8) {
         self.put(VOX_DELAY_OFFSET, delay.min(6));
@@ -1366,7 +1366,7 @@ impl<'a> SettingsWriter<'a> {
     /// # Errors
     ///
     /// Returns [`ValidationError::SettingOutOfRange`] if `value` is
-    /// outside the gapped domain (0-30 excluding 5, 23, 25, 26) — a
+    /// outside the gapped domain (0-30 excluding 5, 23, 25, 26); a
     /// plain clamp cannot express the gaps, and writing a gap value
     /// would store an invalid menu selection.
     pub fn set_pf_key1(&mut self, value: u8) -> Result<(), ValidationError> {
@@ -2119,7 +2119,7 @@ mod tests {
 
     /// Every settings setter, paired with the flash offset it must
     /// write, transcribed INDEPENDENTLY from the MCP-D75 registry map
-    /// (hex literals, not the `*_OFFSET` constants) — a transposed
+    /// (hex literals, not the `*_OFFSET` constants): a transposed
     /// digit in a constant would corrupt an unrelated radio setting on
     /// MCP write-back, and the offset audit below is the test that
     /// catches it. The third column carries the owned bit mask for
@@ -2635,7 +2635,7 @@ mod tests {
                 assert!(
                     offset < start || offset >= start + len,
                     "hardware-verified band-state cell 0x{offset:04X} collides with registry \
-                     field {} — re-audit the accessor before trusting either layer",
+                     field {}; re-audit the accessor before trusting either layer",
                     field.descriptor.name
                 );
             }

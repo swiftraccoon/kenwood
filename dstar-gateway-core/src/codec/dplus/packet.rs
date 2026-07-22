@@ -2,7 +2,7 @@
 //!
 //! `ClientPacket` represents every packet a `DPlus` client sends to a
 //! reflector. `ServerPacket` represents every packet a reflector
-//! sends to a client. The codec is symmetric — both directions are
+//! sends to a client. The codec is symmetric; both directions are
 //! first-class.
 
 use crate::header::DStarHeader;
@@ -32,7 +32,7 @@ pub enum ClientPacket {
     VoiceHeader {
         /// D-STAR stream id.
         stream_id: StreamId,
-        /// Decoded D-STAR header (lenient — bytes preserved verbatim).
+        /// Decoded D-STAR header (lenient; bytes preserved verbatim).
         header: DStarHeader,
     },
 
@@ -111,9 +111,9 @@ pub enum ServerPacket {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Link2Result {
-    /// Server returned `b"OKRW"` — login accepted.
+    /// Server returned `b"OKRW"`: login accepted.
     Accept,
-    /// Server returned `b"BUSY"` — login refused.
+    /// Server returned `b"BUSY"`: login refused.
     Busy,
     /// Server returned a 4-byte tag that doesn't match any known reply.
     Unknown {

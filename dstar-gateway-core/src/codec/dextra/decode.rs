@@ -1,6 +1,6 @@
 //! `DExtra` packet decoders.
 //!
-//! Both directions — `decode_client_to_server` parses packets a
+//! Both directions: `decode_client_to_server` parses packets a
 //! client would send, `decode_server_to_client` parses packets a
 //! reflector would send.
 //!
@@ -34,7 +34,7 @@ use super::packet::{ClientPacket, ServerPacket};
 ///
 /// # See also
 ///
-/// `ircDDBGateway/Common/DExtraProtocolHandler.cpp` — the reference
+/// `ircDDBGateway/Common/DExtraProtocolHandler.cpp`, the reference
 /// parser this decoder mirrors. `xlxd/src/cdextraprotocol.cpp` is
 /// a mirror reference.
 pub fn decode_client_to_server(
@@ -63,7 +63,7 @@ pub fn decode_client_to_server(
 ///
 /// # See also
 ///
-/// `ircDDBGateway/Common/DExtraProtocolHandler.cpp` — the reference
+/// `ircDDBGateway/Common/DExtraProtocolHandler.cpp`, the reference
 /// parser for the server-side `DExtra` wire format.
 pub fn decode_server_to_client(
     bytes: &[u8],
@@ -90,8 +90,8 @@ pub fn decode_server_to_client(
 /// representation.
 ///
 /// On the connect-packet wire format, byte `[7]` is the pad slot
-/// (space from `memset`) and byte `[8]` — outside the 8-byte
-/// window — holds the module letter per
+/// (space from `memset`) and byte `[8]` (outside the 8-byte
+/// window) holds the module letter per
 /// `ircDDBGateway/Common/ConnectData.cpp:278-300` (`getDExtraData`).
 /// Our API exposes the module as a separate `Module` field on
 /// [`ClientPacket::Link`]/[`ServerPacket::ConnectAck`], so this
@@ -152,7 +152,7 @@ fn decode_server_connect_reply(bytes: &[u8]) -> Result<ServerPacket, DExtraError
             offset: 9,
             byte: module_byte,
         })?;
-    // Tag is at [10..13], NUL at [13] — per
+    // Tag is at [10..13], NUL at [13], per
     // `ircDDBGateway/Common/ConnectData.cpp:302-316`.
     let mut tag = [0u8; 3];
     if let Some(src) = bytes.get(10..13) {
@@ -596,7 +596,7 @@ mod tests {
         // Valid callsign, invalid (lowercase) client module byte.
         let mut bytes = [b' '; 11];
         bytes[..4].copy_from_slice(b"W1AW");
-        bytes[8] = b'b'; // lowercase — invalid
+        bytes[8] = b'b'; // lowercase, invalid
         bytes[9] = b'C';
         bytes[10] = 0x00;
         let Err(err) = decode_client_to_server(&bytes, &mut NullSink) else {
@@ -617,7 +617,7 @@ mod tests {
         let mut bytes = [b' '; 11];
         bytes[..4].copy_from_slice(b"W1AW");
         bytes[8] = b'B';
-        bytes[9] = b'1'; // digit — invalid
+        bytes[9] = b'1'; // digit, invalid
         bytes[10] = 0x00;
         let Err(err) = decode_client_to_server(&bytes, &mut NullSink) else {
             return Err("expected error for invalid reflector module byte".into());

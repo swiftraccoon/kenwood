@@ -13,7 +13,7 @@
 //!   header and can be copied directly after protocol-specific
 //!   framing.
 //! - `DCS` voice frames include the D-STAR header embedded in every
-//!   packet — when transcoding `DCS` → `DPlus`/`DExtra`, the
+//!   packet; when transcoding `DCS` → `DPlus`/`DExtra`, the
 //!   endpoint emits a synthetic header frame on the first `DCS`
 //!   packet of a stream and data frames for subsequent packets.
 //! - `DPlus`/`DExtra` → `DCS` requires building a 100-byte DCS
@@ -113,7 +113,7 @@ pub enum TranscodeError {
 /// the header). For `DPlus` and `DExtra`, `cached_header` is only
 /// consulted on the header frame itself (and on `StreamEnd` where
 /// the downstream protocol still needs the header for its own
-/// framing on some encoders — currently unused, but kept for
+/// framing on some encoders, currently unused but kept for
 /// symmetry).
 ///
 /// Returns the number of bytes written into `out`.
@@ -193,14 +193,14 @@ fn transcode_dcs(
     cached_header: Option<&DStarHeader>,
     out: &mut [u8],
 ) -> Result<usize, TranscodeError> {
-    // DCS is special — every voice packet embeds the header, so
+    // DCS is special: every voice packet embeds the header, so
     // `cached_header` is required for every `VoiceEvent` variant.
     let header = cached_header.ok_or(TranscodeError::MissingCachedHeader)?;
     match event {
         VoiceEvent::StreamStart { stream_id, .. } => {
             // Build a "first frame" packet. We use silence payload
             // because the header packet itself on `DCS` doesn't
-            // carry an AMBE frame — the stream starts with a
+            // carry an AMBE frame; the stream starts with a
             // regular voice frame. The caller that converts a
             // `StreamStart` into a DCS packet should really follow
             // it with a real frame; this branch exists so the
@@ -218,7 +218,7 @@ fn transcode_dcs(
             Ok(n)
         }
         VoiceEvent::StreamEnd { stream_id, seq } => {
-            // DCS EOT is signaled in the slow_data bytes — the
+            // DCS EOT is signaled in the slow_data bytes; the
             // encoder handles that when `is_end = true`. We pass a
             // silence frame because the EOT packet's AMBE payload
             // is conventionally silence.

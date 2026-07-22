@@ -42,7 +42,7 @@
 			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 
 			<!-- Match the CDC *Data* interface (bInterfaceNumber 1) of
-			     the TH-D75 — that's where the bulk IN/OUT endpoints
+			     the TH-D75: that's where the bulk IN/OUT endpoints
 			     live; the class 02/02 control interface has only an
 			     interrupt endpoint (topology hardware-verified via
 			     ioreg 2026-07-19). The key combo

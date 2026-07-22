@@ -31,7 +31,7 @@ final class RelayCoordinatorTests: XCTestCase {
         relay.simulateRunningForTests()
         // Let the reader spin up and park its `transport.read` BEFORE the
         // close, so the close resumes that parked read with an empty
-        // chunk (EOF) — the signal that ends the reader stream. A read
+        // chunk (EOF), the signal that ends the reader stream. A read
         // that parks *after* close would block forever, so this settle
         // is load-bearing (mirrors MockTransportTests' park-then-close).
         try await Task.sleep(nanoseconds: 150_000_000)

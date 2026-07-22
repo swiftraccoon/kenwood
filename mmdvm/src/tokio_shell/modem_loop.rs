@@ -56,7 +56,7 @@ const RX_READ_CHUNK: usize = 512;
 ///
 /// A wedged write side (kernel TX buffer full under asserted flow
 /// control, hung USB endpoint) would otherwise freeze the entire
-/// loop inside a handler `.await` — no reads, no commands, no
+/// loop inside a handler `.await`: no reads, no commands, no
 /// shutdown. 5 s is far beyond any healthy serial or Bluetooth SPP
 /// latency; on expiry the loop exits with [`Event::Fatal`].
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -66,12 +66,12 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The queue holds at most 64 frames draining at one per 10 ms
 /// playout tick (~640 ms), plus status-poll latency to learn about
-/// freed FIFO space — 2 s covers the worst healthy case. A modem
+/// freed FIFO space; 2 s covers the worst healthy case. A modem
 /// that grants no space within that window is treated as wedged;
 /// undelivered frames surface as [`Event::TxDropped`].
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum retained RX buffer capacity — guards against a malformed
+/// Maximum retained RX buffer capacity, guarding against a malformed
 /// stream endlessly appending without producing frames. If the buffer
 /// exceeds this size with no decode progress we drop the contents and
 /// resync.
@@ -87,7 +87,7 @@ pub(crate) struct ModemLoop<T: Transport> {
     dstar_space: u8,
     protocol_version: u8,
     shutting_down: bool,
-    /// Deadline for the shutdown TX flush — set when the `Shutdown`
+    /// Deadline for the shutdown TX flush, set when the `Shutdown`
     /// command arrives; the loop force-exits once it passes.
     flush_deadline: Option<Instant>,
     /// Reply channel of an in-flight `SetMode` awaiting the modem's
@@ -95,8 +95,8 @@ pub(crate) struct ModemLoop<T: Transport> {
     /// (`MMDVM/SerialPort.cpp` `processMessage`), so the caller's
     /// result reflects whether the mode change actually happened.
     pending_set_mode: Option<oneshot::Sender<Result<(), ShellError>>>,
-    /// Events dropped since the event channel was last writable —
-    /// see [`ModemLoop::emit_event`].
+    /// Events dropped since the event channel was last writable.
+    /// See [`ModemLoop::emit_event`].
     dropped_events: u64,
 }
 
@@ -114,7 +114,7 @@ impl<T: Transport> ModemLoop<T> {
             event_tx,
             tx_queue: TxQueue::new(),
             dstar_space: 0,
-            // TH-D75 and newer MMDVMHost firmwares speak v2 — assume
+            // TH-D75 and newer MMDVMHost firmwares speak v2, so assume
             // that until the first `VersionResponse` corrects us.
             protocol_version: 2,
             shutting_down: false,
@@ -133,7 +133,7 @@ impl<T: Transport> ModemLoop<T> {
         let result = self.run_inner().await;
 
         // Every send_dstar_* call for these frames already reported
-        // success ("queued") — discarding them on exit must be
+        // success ("queued"), so discarding them on exit must be
         // observable or the far end hears a silently truncated
         // transmission.
         let undelivered = self.tx_queue.len();
@@ -160,7 +160,7 @@ impl<T: Transport> ModemLoop<T> {
                     "modem loop exited with error"
                 );
                 // Consumers watching next_event() cannot see the
-                // JoinHandle result — surface the cause as a
+                // JoinHandle result, so surface the cause as a
                 // terminal event so a dead link is distinguishable
                 // from a clean close.
                 self.emit_event(Event::Fatal {
@@ -172,7 +172,7 @@ impl<T: Transport> ModemLoop<T> {
     }
 
     async fn run_inner(&mut self) -> Result<(), ShellError> {
-        // Initial handshake — send GetVersion, then GetStatus, so the
+        // Initial handshake: send GetVersion, then GetStatus, so the
         // consumer's first couple of events describe the hardware
         // and its current state.
         self.write_frame(&MmdvmFrame::new(MMDVM_GET_VERSION))
@@ -185,7 +185,7 @@ impl<T: Transport> ModemLoop<T> {
         let playout_tick_start = Instant::now() + PLAYOUT_INTERVAL;
         let mut status_tick = tokio::time::interval_at(status_tick_start, STATUS_POLL_INTERVAL);
         let mut playout_tick = tokio::time::interval_at(playout_tick_start, PLAYOUT_INTERVAL);
-        // Prefer "skip if we fall behind" over burst-catchup — if the
+        // Prefer "skip if we fall behind" over burst-catchup: if the
         // runtime is slow we don't want a flood of back-to-back status
         // polls.
         status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -238,7 +238,7 @@ impl<T: Transport> ModemLoop<T> {
                 // otherwise win every iteration and starve status
                 // polling and TX playout entirely. Ticks are ready at
                 // most once per interval, so RX still dominates in
-                // healthy operation — this mirrors the reference,
+                // healthy operation. This mirrors the reference,
                 // where playout runs unconditionally on every
                 // `clock()` call regardless of RX pressure.
                 _ = status_tick.tick() => {
@@ -303,7 +303,7 @@ impl<T: Transport> ModemLoop<T> {
             Command::SetMode { mode, reply } => {
                 let frame = MmdvmFrame::with_payload(MMDVM_SET_MODE, vec![mode.as_byte()]);
                 match self.write_frame(&frame).await {
-                    // Written — the caller's reply now waits for the
+                    // Written: the caller's reply now waits for the
                     // modem's ACK/NAK (resolved in dispatch_frame).
                     Ok(()) => self.pending_set_mode = Some(reply),
                     Err(e) => {
@@ -381,7 +381,7 @@ impl<T: Transport> ModemLoop<T> {
                 }
                 Err(e) => {
                     // Silent-death prevention: decode errors are
-                    // dropped as diagnostics, not propagated —
+                    // dropped as diagnostics, not propagated;
                     // propagating would kill the whole session loop
                     // on a single malformed byte. Resync to the next
                     // frame-start candidate so we don't loop forever
@@ -491,7 +491,7 @@ impl<T: Transport> ModemLoop<T> {
                 self.emit_event(Event::Version(v));
             }
             // A dropped version response means the assumed protocol
-            // version was never confirmed — if it's wrong, every
+            // version was never confirmed; if it's wrong, every
             // status parse reads shifted offsets. Surface it.
             Err(e) => self.protocol_violation(MMDVM_GET_VERSION, &e.to_string()),
         }
@@ -510,7 +510,7 @@ impl<T: Transport> ModemLoop<T> {
                 self.emit_event(Event::Status(s));
             }
             // A status that never parses freezes dstar_space and
-            // stalls TX forever with every send reporting success —
+            // stalls TX forever with every send reporting success, so
             // the consumer must be able to see that happening.
             Err(e) => self.protocol_violation(MMDVM_GET_STATUS, &e.to_string()),
         }
@@ -540,7 +540,7 @@ impl<T: Transport> ModemLoop<T> {
     /// reply while the channel is full (the consumer waits on the
     /// loop, the loop waits on the consumer). The reference instead
     /// decouples modem I/O from its consumer with fixed-size ring
-    /// buffers that lose data when full — we mirror that: excess
+    /// buffers that lose data when full. We mirror that: excess
     /// events are dropped and counted.
     fn emit_event(&mut self, event: Event) {
         match self.event_tx.try_send(event) {

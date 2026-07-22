@@ -1,4 +1,4 @@
-//! `ForwardableFrame` — encoded voice frame ready for fan-out.
+//! `ForwardableFrame`: encoded voice frame ready for fan-out.
 //!
 //! The fan-out engine in `dstar-gateway-server` uses this type to
 //! describe a voice frame in "ready to re-send" form. The idea is

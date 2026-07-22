@@ -147,34 +147,34 @@ pub struct ChannelMemory {
     pub tx_offset: Frequency,
     /// Frequency step size (byte 0x08 high nibble).
     pub step_size: StepSize,
-    /// Raw byte 0x09 — mode and fine tuning configuration, as packed
+    /// Raw byte 0x09: mode and fine tuning configuration, as packed
     /// from the CAT wire fields.
     ///
     /// Bit layout (what [`crate::protocol`]'s FO/ME parser packs from
     /// wire fields \[3\]-\[6\]):
     /// - bit 7: reserved
     /// - bits 6:4: operating mode in the **CAT wire encoding**
-    ///   (0=FM, 1=DV, 2=NFM, 3=AM — hardware-verified; NOT the
+    ///   (0=FM, 1=DV, 2=NFM, 3=AM; hardware-verified, NOT the
     ///   MD/flash encoding, where 2=AM and 6=NFM)
     /// - bit 3: fine tuning enable
     /// - bits 2:0: fine step size
     ///
     /// Do not interpret these bits with `Mode`/`MemoryMode` (both use
-    /// the MD/flash encoding) — same byte positions, different value
+    /// the MD/flash encoding); same byte positions, different value
     /// tables. `FlashChannel`'s byte 0x09 uses the flash layout.
     pub mode_flags_raw: u8,
     /// Shift direction (byte 0x08 low nibble in binary format).
     ///
     /// Authoritative for byte 0x08; `flags_0a_raw` bits 2:0 carry a
-    /// 3-bit copy on the wire — use [`Self::set_shift`] to keep both
+    /// 3-bit copy on the wire, so use [`Self::set_shift`] to keep both
     /// in sync. (This field can hold extended values like 8 that FO
     /// returns in VFO mode, which don't fit in the 3-bit copy.)
     pub shift: ShiftDirection,
-    /// Raw byte 0x0A — the single source of truth for the tone flags;
+    /// Raw byte 0x0A: the single source of truth for the tone flags;
     /// read it through the accessors ([`Self::tone_enable`],
     /// [`Self::ctcss_mode`], [`Self::dcs_enable`],
     /// [`Self::cross_tone_reverse`], [`Self::reverse`]) and prefer the
-    /// corresponding setters (and [`Self::set_shift`]) for writes —
+    /// corresponding setters (and [`Self::set_shift`]) for writes:
     /// they keep the 3-bit shift copy in bits 2:0 consistent with the
     /// `shift` field.
     ///
@@ -217,13 +217,13 @@ impl ChannelMemory {
     /// Size of the packed binary representation in bytes.
     pub const BYTE_SIZE: usize = 40;
 
-    /// Tone (encode) enabled — `flags_0a_raw` bit 7.
+    /// Tone (encode) enabled (`flags_0a_raw` bit 7).
     #[must_use]
     pub const fn tone_enable(&self) -> bool {
         self.flags_0a_raw & 0x80 != 0
     }
 
-    /// CTCSS mode — `flags_0a_raw` bit 6. The wire only carries
+    /// CTCSS mode (`flags_0a_raw` bit 6). The wire only carries
     /// enable/disable here; the full On/EncodeOnly split lives in the
     /// TN command.
     #[must_use]
@@ -235,19 +235,19 @@ impl ChannelMemory {
         }
     }
 
-    /// DCS enabled — `flags_0a_raw` bit 5.
+    /// DCS enabled (`flags_0a_raw` bit 5).
     #[must_use]
     pub const fn dcs_enable(&self) -> bool {
         self.flags_0a_raw & 0x20 != 0
     }
 
-    /// Cross-tone enabled — `flags_0a_raw` bit 4.
+    /// Cross-tone enabled (`flags_0a_raw` bit 4).
     #[must_use]
     pub const fn cross_tone_reverse(&self) -> bool {
         self.flags_0a_raw & 0x10 != 0
     }
 
-    /// Reverse mode — `flags_0a_raw` bit 3.
+    /// Reverse mode (`flags_0a_raw` bit 3).
     #[must_use]
     pub const fn reverse(&self) -> bool {
         self.flags_0a_raw & 0x08 != 0
@@ -259,27 +259,27 @@ impl ChannelMemory {
         self.flags_0a_raw
     }
 
-    /// Set tone (encode) enable — `flags_0a_raw` bit 7.
+    /// Set tone (encode) enable (`flags_0a_raw` bit 7).
     pub const fn set_tone_enable(&mut self, on: bool) {
         self.set_flag_bit(0x80, on);
     }
 
-    /// Set CTCSS enable — `flags_0a_raw` bit 6.
+    /// Set CTCSS enable (`flags_0a_raw` bit 6).
     pub const fn set_ctcss_enable(&mut self, on: bool) {
         self.set_flag_bit(0x40, on);
     }
 
-    /// Set DCS enable — `flags_0a_raw` bit 5.
+    /// Set DCS enable (`flags_0a_raw` bit 5).
     pub const fn set_dcs_enable(&mut self, on: bool) {
         self.set_flag_bit(0x20, on);
     }
 
-    /// Set cross-tone enable — `flags_0a_raw` bit 4.
+    /// Set cross-tone enable (`flags_0a_raw` bit 4).
     pub const fn set_cross_tone_reverse(&mut self, on: bool) {
         self.set_flag_bit(0x10, on);
     }
 
-    /// Set reverse mode — `flags_0a_raw` bit 3.
+    /// Set reverse mode (`flags_0a_raw` bit 3).
     pub const fn set_reverse(&mut self, on: bool) {
         self.set_flag_bit(0x08, on);
     }
@@ -316,7 +316,7 @@ impl ChannelMemory {
         // byte 0x09: mode + fine tuning flags (preserved as raw byte)
         buf[0x09] = self.mode_flags_raw;
 
-        // byte 0x0A: flags_0a_raw (all 8 bits — hardware-verified mapping):
+        // byte 0x0A: flags_0a_raw (all 8 bits, hardware-verified mapping):
         //   bit 7 = tone encode, bit 6 = CTCSS, bit 5 = DCS, bit 4 = cross-tone,
         //   bit 3 = reverse, bits 2:0 = shift direction
         buf[0x0A] = self.flags_0a_raw;
@@ -351,8 +351,8 @@ impl ChannelMemory {
     /// Returns [`ProtocolError::FieldParse`] if any field contains an
     /// invalid value, or if the slice is too short.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        // Capture the raw length first — `first_chunk` only yields the prefix,
-        // but the error message should reflect the original input size.
+        // Capture the raw length first, because `first_chunk` only yields the
+        // prefix and the error message should reflect the original input size.
         let total_len = bytes.len();
         let bytes: &[u8; Self::BYTE_SIZE] =
             bytes
@@ -388,7 +388,7 @@ impl ChannelMemory {
         let mode_flags_raw = bytes[0x09];
 
         // byte 0x0A: all 8 bits (hardware-verified mapping), stored
-        // raw — the flag accessors derive their values on demand.
+        // raw; the flag accessors derive their values on demand.
         let flags_0a_raw = bytes[0x0A];
 
         let tone_code = ToneCode::new(bytes[0x0B]).map_err(|e| ProtocolError::FieldParse {
@@ -668,7 +668,7 @@ impl fmt::Display for FineStep {
 /// complete byte map, correlated against MCP memory dumps from hardware.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "Mirrors the MCP flash channel record 1:1 — each bool is a discrete bit in the 40-byte \
+    reason = "Mirrors the MCP flash channel record 1:1; each bool is a discrete bit in the 40-byte \
               binary layout (tone_enabled, ctcss_enabled, dtcs_enabled, cross_tone, reverse, \
               narrow, fine_mode, byte09_bit7, split_tune). A bitflags enum would lose the \
               byte-for-byte offset documentation that makes this struct useful."
@@ -751,13 +751,13 @@ impl FlashChannel {
         clippy::similar_names,
         clippy::too_many_lines,
         reason = "`rx_frequency`/`tx_offset` plus `tone_code`/`ctcss_code`/`dtcs_code` are the \
-                  canonical RE notes names — renaming would desync from firmware documentation. \
+                  canonical RE notes names; renaming would desync from firmware documentation. \
                   The method decodes every bit of a 40-byte flash record inline so the bit \
                   layout is visible in one place; splitting would fragment that."
     )]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        // Capture the raw length first — `first_chunk` only yields the prefix,
-        // but the error message should reflect the original input size.
+        // Capture the raw length first, because `first_chunk` only yields the
+        // prefix and the error message should reflect the original input size.
         let total_len = bytes.len();
         let bytes: &[u8; Self::BYTE_SIZE] =
             bytes
@@ -1040,7 +1040,7 @@ mod tests {
     #[test]
     fn flag_accessors_derive_from_raw_byte() -> TestResult {
         // Single representation: the flag accessors read (and the
-        // setters write) `flags_0a_raw` — there is no separate bool
+        // setters write) `flags_0a_raw`; there is no separate bool
         // state to fall out of sync with the wire byte.
         let mut ch = ChannelMemory::default();
         ch.set_tone_enable(true);
@@ -1060,7 +1060,7 @@ mod tests {
     #[test]
     fn set_shift_keeps_raw_bits_in_sync() -> TestResult {
         // Shift is double-encoded on the wire (byte 0x08 low nibble
-        // AND byte 0x0A bits 2:0) — the setter must keep both in
+        // AND byte 0x0A bits 2:0), so the setter must keep both in
         // sync so the two serializers can never disagree.
         let mut ch = ChannelMemory::default();
         ch.set_shift(ShiftDirection::DOWN);
@@ -1218,7 +1218,7 @@ mod tests {
 
     #[test]
     fn channel_memory_byte09_packing() -> TestResult {
-        // Tone flags live in byte 0x0A — setting them must leave the
+        // Tone flags live in byte 0x0A, so setting them must leave the
         // mode/fine-tuning byte 0x09 untouched.
         let mut ch = ChannelMemory::default();
         ch.set_reverse(true);

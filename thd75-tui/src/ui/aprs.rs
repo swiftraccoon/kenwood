@@ -54,7 +54,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
 
 #[expect(
     clippy::too_many_lines,
-    reason = "Draws the complete APRS station list with columns and selection state — \
+    reason = "Draws the complete APRS station list with columns and selection state. \
               Ratatui's immediate-mode API means each visible cell is an explicit \
               construction call; splitting would move layout logic away from the \
               constraints that bound it."
@@ -269,7 +269,7 @@ fn render_live(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: R
 
 #[expect(
     clippy::too_many_lines,
-    reason = "Draws the complete APRS MCP-config section row-by-row — Ratatui's \
+    reason = "Draws the complete APRS MCP-config section row-by-row. Ratatui's \
               immediate-mode API means each visible cell is an explicit construction \
               call; splitting would move layout logic away from the constraints that \
               bound it."
@@ -327,7 +327,7 @@ fn render_mcp_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
         Line::from(""),
         kv_line(
             "My callsign",
-            "<offset unverified — use CAT MY for live value>".to_owned(),
+            "<offset unverified; use CAT MY for live value>".to_owned(),
             Color::DarkGray,
         ),
         kv_line(

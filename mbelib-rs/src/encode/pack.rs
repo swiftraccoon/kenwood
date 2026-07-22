@@ -1,23 +1,23 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! AMBE frame packing — the exact inverse of [`crate::unpack`].
+//! AMBE frame packing: the exact inverse of [`crate::unpack`].
 //!
 //! Given a 72-bit codeword array `ambe_fr` (C0 at 0..24, C1 at 24..47,
-//! C2 at 47..58, C3 at 58..72 — the same layout the decoder consumes
+//! C2 at 47..58, C3 at 58..72; the same layout the decoder consumes
 //! after error correction and C1 demodulation), this module:
 //!
 //! 1. **Modulates C1** by XOR-ing its bits with an LFSR sequence
 //!    seeded from the C0 data bits. The XOR operation is self-inverse,
-//!    so we call [`crate::unpack::demodulate_c1`] directly — "modulate"
+//!    so we call [`crate::unpack::demodulate_c1`] directly: "modulate"
 //!    and "demodulate" are the same byte-level op; only the pipeline
 //!    direction differs. Applied after the caller has already encoded
 //!    FEC into C0 and C1 (or, for P1 round-trip testing, the caller
 //!    supplies already-encoded codewords and this step restores them
 //!    to wire form).
 //! 2. **Packs** the 72 bits back into 9 bytes via the inverse interleave
-//!    table, LSB-first within each byte (bit 0 of byte 0 is input bit 0
-//!    — the DVSI wire convention; see [`crate::unpack`]).
+//!    table, LSB-first within each byte (bit 0 of byte 0 is input bit 0,
+//!    the DVSI wire convention; see [`crate::unpack`]).
 //!
 //! The output is a valid 9-byte AMBE wire frame suitable for the
 //! DSVT voice-data slot in the D-STAR frame.
@@ -67,7 +67,7 @@ pub fn pack_frame(ambe_fr: &[u8; AMBE_FRAME_BITS]) -> [u8; 9] {
     let mut working = *ambe_fr;
     demodulate_c1(&mut working);
 
-    // Step 2: pack 72 codeword bits back into 9 bytes, LSB-first —
+    // Step 2: pack 72 codeword bits back into 9 bytes, LSB-first:
     // the DVSI wire convention (first transmitted bit is bit 0 of
     // byte 0; see `unpack_frame` for the verification history).
     // Iterate over every `ambe_fr` position paired with its

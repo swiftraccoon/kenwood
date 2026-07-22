@@ -5,7 +5,7 @@ pub mod authorizer;
 pub mod config;
 #[expect(
     clippy::module_inception,
-    reason = "reflector::Reflector is the canonical naming — module_inception is too aggressive here"
+    reason = "reflector::Reflector is the canonical naming; module_inception is too aggressive here"
 )]
 pub mod reflector;
 pub mod stream_cache;

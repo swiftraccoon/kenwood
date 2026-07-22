@@ -2,7 +2,7 @@
 //!
 //! [`Event`] is the consumer-visible enum surfaced by the typestate
 //! session. Each variant carries the same data regardless of
-//! protocol — the `P: Protocol` parameter is carried through a
+//! protocol: the `P: Protocol` parameter is carried through a
 //! hidden phantom variant so the type is generic without bloating
 //! the other variants with a `PhantomData` field each.
 
@@ -19,7 +19,7 @@ use super::protocol::Protocol;
 
 /// One event surfaced by the client session machine.
 ///
-/// The `P: Protocol` parameter is a phantom — every variant carries
+/// The `P: Protocol` parameter is a phantom; every variant carries
 /// the same data regardless of protocol. The phantom is for
 /// compile-time discrimination only, confined to a hidden
 /// [`Event::__Phantom`] variant that cannot be constructed (its
@@ -84,7 +84,7 @@ pub enum Event<P: Protocol> {
     /// every public variant.
     #[doc(hidden)]
     __Phantom {
-        /// Uninhabited — prevents construction of this variant.
+        /// Uninhabited, which prevents construction of this variant.
         never: Infallible,
         /// Phantom marker for `P`.
         _protocol: PhantomData<P>,
@@ -99,9 +99,9 @@ pub enum DisconnectReason {
     Rejected,
     /// Reflector acknowledged the unlink.
     UnlinkAcked,
-    /// Local timeout — keepalive inactivity.
+    /// Local timeout from keepalive inactivity.
     KeepaliveInactivity,
-    /// Local timeout — disconnect ACK never arrived.
+    /// Local timeout: the disconnect ACK never arrived.
     DisconnectTimeout,
 }
 
@@ -111,8 +111,8 @@ pub enum DisconnectReason {
 pub enum VoiceEndReason {
     /// Real EOT packet received.
     Eot,
-    /// No voice frames for the protocol's inactivity window —
-    /// synthesized end.
+    /// No voice frames for the protocol's inactivity window, so the
+    /// end was synthesized.
     Inactivity,
 }
 

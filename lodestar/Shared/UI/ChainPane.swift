@@ -5,7 +5,7 @@ import SwiftUI
 
 /// The Radio → Reflector → Relay chain. Two presentations:
 /// `.expanded` is the full card (stage rows, connect buttons, inline
-/// errors — the classic dashboard card unchanged); `.strip` is a
+/// errors: the classic dashboard card unchanged); `.strip` is a
 /// one-line summary for the wide rail once everything is healthy.
 struct ChainPane: View {
     let session: SessionCoordinator
@@ -101,7 +101,7 @@ struct ChainPane: View {
                         .font(.headline)
                     radioModeSubtitle
                 }
-                // Prominent action on its own full-width line — a
+                // Prominent action on its own full-width line, because a
                 // trailing placement gets crushed against the status
                 // text at rail width (380 pt).
                 if showsRadioConnectButton {

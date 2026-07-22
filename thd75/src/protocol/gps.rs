@@ -51,7 +51,7 @@ fn parse_gp(payload: &str) -> Result<Response, ProtocolError> {
             field: "all".to_owned(),
             detail: format!("expected 2 fields (gps_enabled,pc_output), got {payload:?}"),
         })?;
-    // Reject any extra comma — matches the old `split(',').len() != 2` check.
+    // Reject any extra comma, matching the old `split(',').len() != 2` check.
     if pc_str.contains(',') {
         return Err(ProtocolError::FieldParse {
             command: "GP".to_owned(),

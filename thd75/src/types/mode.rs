@@ -22,7 +22,7 @@ use crate::error::ValidationError;
 /// - **Band A** supports only **FM** and **DV**. Band A is the amateur
 ///   TX/RX band (144/220/430 MHz). Its receiver chain (VCO/PLL IC800,
 ///   IF IC IC900) is a double super heterodyne with 1st IF at 57.15 MHz
-///   and 2nd IF at 450 kHz — it has no third IF stage, so AM/SSB/CW
+///   and 2nd IF at 450 kHz. It has no third IF stage, so AM/SSB/CW
 ///   demodulation is not possible in hardware (service manual §2.1.3).
 /// - **Band B** supports all modes: FM, DV, AM, LSB, USB, CW, NFM, DR,
 ///   WFM, and CW-R. Band B's receiver chain (VCO/PLL IC700, IF IC
@@ -66,28 +66,28 @@ pub enum Mode {
     Fm = 0,
     /// D-STAR digital voice (index 1). Available on both Band A and Band B.
     Dv = 1,
-    /// AM modulation (index 2). Band B only — Band A lacks the 3rd IF
+    /// AM modulation (index 2). Band B only: Band A lacks the 3rd IF
     /// stage (10.8 kHz via IC1001) required for AM envelope detection.
     Am = 2,
-    /// Lower sideband (index 3). Band B only — requires the 3rd IF at
+    /// Lower sideband (index 3). Band B only: requires the 3rd IF at
     /// 10.8 kHz (via 3rd mixer IC1001 and 460.8 kHz local oscillation).
     Lsb = 3,
-    /// Upper sideband (index 4). Band B only — requires the 3rd IF at
+    /// Upper sideband (index 4). Band B only: requires the 3rd IF at
     /// 10.8 kHz (via 3rd mixer IC1001 and 460.8 kHz local oscillation).
     Usb = 4,
-    /// CW / Morse code (index 5). Band B only — requires the 3rd IF at
+    /// CW / Morse code (index 5). Band B only: requires the 3rd IF at
     /// 10.8 kHz (via 3rd mixer IC1001 and 460.8 kHz local oscillation).
     Cw = 5,
-    /// Narrow FM modulation (index 6). Band B only — Band A supports
+    /// Narrow FM modulation (index 6). Band B only: Band A supports
     /// only standard FM deviation.
     Nfm = 6,
-    /// D-STAR repeater mode (index 7). Band A only — DR requires the
+    /// D-STAR repeater mode (index 7). Band A only: DR requires the
     /// CTRL/PTT band for gateway access and callsign routing.
     Dr = 7,
-    /// Wide FM (index 8). Band B only — FM broadcast reception mode
+    /// Wide FM (index 8). Band B only: FM broadcast reception mode
     /// for the 76-108 MHz range. Confirmed by ARFC-D75 decompilation.
     Wfm = 8,
-    /// CW Reverse (index 9). Band B only — uses LSB detection for CW
+    /// CW Reverse (index 9). Band B only: uses LSB detection for CW
     /// reception instead of the default USB. Confirmed by ARFC-D75
     /// decompilation.
     CwReverse = 9,
@@ -161,13 +161,13 @@ impl From<Mode> for u8 {
 /// Power level cannot be changed while transmitting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PowerLevel {
-    /// High power — 5 W (index 0).
+    /// High power, 5 W (index 0).
     High = 0,
-    /// Medium power — 2 W (index 1).
+    /// Medium power, 2 W (index 1).
     Medium = 1,
-    /// Low power — 0.5 W (index 2).
+    /// Low power, 0.5 W (index 2).
     Low = 2,
-    /// Extra-low power — 50 mW (index 3). D75-specific; not present on the TH-D74.
+    /// Extra-low power, 50 mW (index 3). D75-specific; not present on the TH-D74.
     ExtraLow = 3,
 }
 
@@ -418,13 +418,13 @@ impl From<StepSize> for u8 {
 /// Discovered via ARFC-D75 decompilation. The ARFC application multiplies
 /// the base step size by this factor before sending `UP`/`DW` commands,
 /// enabling faster tuning in large frequency ranges. This is a
-/// client-side feature — the radio itself has no coarse step command.
+/// client-side feature; the radio itself has no coarse step command.
 ///
 /// For example, with a 25.0 kHz base step and a `X10` multiplier, each
 /// `UP`/`DW` press tunes 250.0 kHz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CoarseStepMultiplier {
-    /// 1x — no multiplication, same as normal step (index 0).
+    /// 1x, no multiplication, same as normal step (index 0).
     X1 = 0,
     /// 2x multiplication (index 1).
     X2 = 1,

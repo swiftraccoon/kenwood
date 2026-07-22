@@ -269,7 +269,7 @@ async fn map_vox_delay() {
     .await;
 }
 
-// BL is battery level (read-only) per KI4LAX — no MCP offset mapping needed.
+// BL is battery level (read-only) per KI4LAX, so no MCP offset mapping is needed.
 
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
@@ -282,7 +282,7 @@ async fn map_bluetooth() {
     .await;
 }
 
-// DW is frequency down (action command) per KI4LAX — no MCP offset mapping needed.
+// DW is frequency down (action command) per KI4LAX, so no MCP offset mapping is needed.
 
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
@@ -342,7 +342,7 @@ async fn map_all_settings() {
     println!("\n=== AUTOMATED OFFSET MAPPER (single-dump per setting) ===\n");
 
     let tests = vec![
-        // BL is battery level (read-only) per KI4LAX — excluded.
+        // BL is battery level (read-only) per KI4LAX; excluded.
         SettingTest {
             name: "vox_enable",
             set_cmd: Command::SetVox { enabled: true },
@@ -408,7 +408,7 @@ async fn map_all_settings() {
             set_cmd: Command::SetBluetooth { enabled: false },
             restore_cmd: Command::SetBluetooth { enabled: true },
         },
-        // DW is frequency down (action command) per KI4LAX — excluded.
+        // DW is frequency down (action command) per KI4LAX; excluded.
         SettingTest {
             name: "auto_info",
             set_cmd: Command::SetAutoInfo { enabled: true },

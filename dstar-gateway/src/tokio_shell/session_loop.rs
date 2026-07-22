@@ -24,7 +24,7 @@ use super::{Command, ShellError};
 /// Dropping the handle closes the `command_rx` channel, which causes
 /// the loop to exit on its next iteration.
 ///
-/// The loop is specialized to `Session<P, Connected>` — command
+/// The loop is specialized to `Session<P, Connected>`: command
 /// dispatch only makes sense on a session that can actually send
 /// voice traffic. The shell's spawn path builds the session through
 /// the typestate transitions on the main thread, then hands the
@@ -68,7 +68,7 @@ impl<P: Protocol> SessionLoop<P> {
                 // we kept transmitting POLLs through the silent window
                 // (rules out our side as the cause). The first byte
                 // is the protocol-specific opcode (`0x03` = DPlus
-                // POLL, `0x10`/`0x11` = voice frames, etc.) — enough
+                // POLL, `0x10`/`0x11` = voice frames, etc.), enough
                 // to spot keepalive vs voice without being verbose.
                 let first_byte = tx.payload.first().copied().unwrap_or(0);
                 tracing::trace!(
@@ -137,7 +137,7 @@ impl<P: Protocol> SessionLoop<P> {
                     };
                     // Refresh the peer-activity watch for link-health
                     // consumers. Send only fails when every receiver
-                    // is gone — harmless here.
+                    // is gone, which is harmless here.
                     let _unused = self.activity_tx.send(Instant::now());
                     let slice = rx_buf.get(..n).unwrap_or(&[]);
                     if let Err(e) = self.session.handle_input(Instant::now(), peer, slice) {
@@ -180,7 +180,7 @@ impl<P: Protocol> SessionLoop<P> {
                     .session
                     .send_header(now, &header, stream_id)
                     .map_err(ShellError::Core);
-                // If the receiver was dropped the reply is lost — the
+                // If the receiver was dropped the reply is lost; the
                 // caller has already given up, so there's nothing to
                 // do about it here.
                 drop(reply.send(result));
@@ -212,7 +212,7 @@ impl<P: Protocol> SessionLoop<P> {
                 // `disconnect_in_place` advances the internal state
                 // machine to `Disconnecting` without consuming the
                 // typestate handle. We intentionally swallow any
-                // encoder failure here — the caller only waits for
+                // encoder failure here: the caller only waits for
                 // the signal that the request was observed; they
                 // then drain events until `Event::Disconnected`
                 // arrives (or the channel closes).

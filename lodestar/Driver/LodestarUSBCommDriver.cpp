@@ -67,7 +67,7 @@ kern_return_t IMPL(LodestarUSBCommDriver, Start)
     }
 
     // Find the interrupt-IN (notification) endpoint. Its absence is
-    // not fatal — merely claiming the interface may be what matters.
+    // not fatal; merely claiming the interface may be what matters.
     uint8_t notifyEp = 0;
     const IOUSBConfigurationDescriptor *config =
         ivars->interface->CopyConfigurationDescriptor();

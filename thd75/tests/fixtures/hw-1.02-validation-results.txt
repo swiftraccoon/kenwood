@@ -1,4 +1,4 @@
-TH-D75 Hardware Validation Results — Firmware 1.02
+TH-D75 Hardware Validation Results (Firmware 1.02)
 Captured: 2026-03-25
 Radio: KQ4NIT-7
 Port: /dev/cu.usbmodem101
@@ -110,10 +110,10 @@ US  ERR  | sent: US     | error: radio returned ?
 SUMMARY
 ================================================================================
 Working:          36 commands
-Parse errors:      5 (BE, FQ, DW, ME, DC — fixable parser issues)
-Radio rejects:     5 (TN, MR, SR, SF, US — returned ?)
-Hung:              1 (0M — no response, needs timeout)
-Buffer issue:      1 (DC band B — residual data)
+Parse errors:      5 (BE, FQ, DW, ME, DC: fixable parser issues)
+Radio rejects:     5 (TN, MR, SR, SF, US: returned ?)
+Hung:              1 (0M: no response, needs timeout)
+Buffer issue:      1 (DC band B: residual data)
 
 Total:            48 command invocations across 53 command types
-                  (UP, TX, RX not tested — write-only/action commands)
+                  (UP, TX, RX not tested: write-only/action commands)

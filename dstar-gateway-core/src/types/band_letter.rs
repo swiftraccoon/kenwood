@@ -1,6 +1,6 @@
 //! D-STAR band letter (A, B, C, or D).
 //!
-//! Distinct from [`super::module::Module`] (A-Z) — band letters are
+//! Distinct from [`super::module::Module`] (A-Z): band letters are
 //! the radio's hardware bands (typically two on a TH-D75: A=upper,
 //! B=lower, plus C and D for tri/quad-band radios). Module letters
 //! identify reflector modules and may be any A-Z.

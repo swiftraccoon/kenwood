@@ -32,8 +32,8 @@ pub trait ClientAuthorizer: Send + Sync + 'static {
 
 /// One link attempt observed by the reflector.
 ///
-/// Carries the structured inputs an authorizer typically needs —
-/// protocol, callsign, peer address, and requested module — without
+/// Carries the structured inputs an authorizer typically needs
+/// (protocol, callsign, peer address, and requested module) without
 /// leaking any wire-level details.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -57,7 +57,7 @@ pub struct LinkAttempt {
 pub enum AccessPolicy {
     /// Full RX + TX.
     ReadWrite,
-    /// Listen-only — client receives streams but transmissions are dropped.
+    /// Listen-only: client receives streams but transmissions are dropped.
     ReadOnly,
 }
 
@@ -82,7 +82,7 @@ pub enum RejectReason {
     MaxClients,
     /// Custom rejection.
     Custom {
-        /// Numeric code (NOT a protocol code — internal).
+        /// Numeric code (internal, NOT a protocol code).
         code: u8,
         /// Human-readable message.
         message: String,
@@ -121,7 +121,7 @@ impl ClientAuthorizer for AllowAllAuthorizer {
 
 /// Authorizer that rejects every link with [`RejectReason::Banned`].
 ///
-/// Intended for tests and negative-path bring-up — verifies the
+/// Intended for tests and negative-path bring-up. Verifies the
 /// shell honors an authorizer rejection (no handle created, NAK on
 /// the wire, [`ClientRejected`] event emitted).
 ///
@@ -141,7 +141,7 @@ impl ClientAuthorizer for DenyAllAuthorizer {
 ///
 /// Intended for tests that need to exercise the read-only voice
 /// drop path on the shell. Production deployments should NOT use
-/// this — it provides no capacity check, no banlist, and no per-peer
+/// this: it provides no capacity check, no banlist, and no per-peer
 /// policy.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReadOnlyAuthorizer;

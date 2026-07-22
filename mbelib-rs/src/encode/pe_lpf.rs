@@ -6,7 +6,7 @@
 //!
 //! Port of `imbe_vocoder::pe_lpf()` from OP25. The coefficients are
 //! from the reference implementation and are symmetric around the
-//! center tap, giving the filter linear phase — required so pitch
+//! center tap, giving the filter linear phase, required so pitch
 //! estimation sees undistorted waveform periodicity.
 //!
 //! The original uses ETSI Q1.15 fixed-point (`mac` into a Q1.31
@@ -96,7 +96,7 @@ mod tests {
     }
 
     /// A DC input (1.0) eventually saturates to the sum of all
-    /// coefficients — which is ~0.75 for this filter.
+    /// coefficients, which is ~0.75 for this filter.
     #[test]
     fn dc_gain_matches_coefficient_sum() {
         let input = [1.0_f32; 200];

@@ -5,12 +5,12 @@
 //!
 //! - Clients whose callsign starts with `D` are presumed to be
 //!   dongle/hotspot users and are accepted with
-//!   [`AccessPolicy::ReadOnly`] — they can receive every voice
+//!   [`AccessPolicy::ReadOnly`]; they can receive every voice
 //!   stream on the module, but their own transmissions are dropped
 //!   at the fan-out layer.
 //! - Everyone else gets [`AccessPolicy::ReadWrite`].
 //!
-//! The dongle rule is deliberately simplistic — a real deployment
+//! The dongle rule is deliberately simplistic: a real deployment
 //! would key on peer IP, registered station type, or an explicit
 //! opt-in database rather than a callsign prefix. The example's
 //! point is to show the `AccessPolicy::ReadOnly` wiring end-to-end.

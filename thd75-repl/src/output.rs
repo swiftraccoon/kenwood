@@ -10,7 +10,7 @@
 //! fixed-width terminals:
 //!
 //! - Label-colon-value format (screen readers parse "Label: value" well)
-//! - Natural-language units (megahertz, watts, hertz — not symbols)
+//! - Natural-language units (megahertz, watts, hertz, not symbols)
 //! - Booleans as words (on/off, not true/false or checkmarks)
 //! - Lines under 80 characters (no wrapping in standard terminals)
 //! - ASCII printable only (no box-drawing or symbols)
@@ -511,7 +511,7 @@ pub fn aprs_station_entry(
 /// `{count} stations heard.` (singular `station` for a count of 1).
 ///
 /// Shared by the APRS `stations` command and the D-STAR `heard`
-/// command — both close their station lists with this summary line.
+/// command; both close their station lists with this summary line.
 #[must_use]
 pub fn stations_summary(count: usize) -> String {
     let word = if count == 1 { "station" } else { "stations" };
@@ -649,7 +649,7 @@ pub fn reflector_event_voice_start(my_call: &str, my_suffix: &str, ur_call: &str
 
 /// `Reflector: voice transmission ended, {frames} frames in {seconds} seconds.`
 ///
-/// When `frames == 0` (no voice frames tracked — e.g. a `VoiceEnd`
+/// When `frames == 0` (no voice frames tracked, e.g. a `VoiceEnd`
 /// arrived without a preceding `VoiceStart`), falls back to the bare
 /// `Reflector: voice transmission ended.` sentence so the message
 /// never contains a misleading zero count.

@@ -4,7 +4,7 @@
 //! Adversarial-input properties for the APRS parse entry points.
 //!
 //! Every byte this crate parses arrives from the open airwaves or a
-//! public APRS-IS feed — hostile and malformed input is the norm, not
+//! public APRS-IS feed; hostile and malformed input is the norm, not
 //! an edge case. `parse_aprs_data_full` is the single dispatcher that
 //! fans arbitrary bytes into ~15 sub-parsers (position, Mic-E,
 //! compressed, weather, telemetry, message, object, item, status...),
@@ -70,7 +70,7 @@ proptest! {
     }
 
     /// Position payloads made of digits, separators and hemisphere
-    /// letters — the shape that reaches the float-parsing and
+    /// letters: the shape that reaches the float-parsing and
     /// range-validation code rather than bouncing off the format
     /// check.
     #[test]

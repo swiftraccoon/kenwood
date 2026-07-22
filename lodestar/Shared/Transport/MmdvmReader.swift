@@ -12,7 +12,7 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "mmdv
 ///
 /// Used in MMDVM mode (after flipping Menu 650) when the BT channel
 /// carries `[0xE0, len, cmd, payload...]` framing instead of CAT
-/// ASCII. The reader is deliberately transport-agnostic — give it any
+/// ASCII. The reader is deliberately transport-agnostic: give it any
 /// `RadioTransport` and it pulls bytes through `transport.read(...)`.
 public actor MmdvmReader {
     public let transport: RadioTransport
@@ -71,7 +71,7 @@ public actor MmdvmReader {
                 do {
                     let result = try decodeMmdvmBytes(bytes: Data(buffer))
                     guard let frame = result.frame else {
-                        // Partial frame — wait for more bytes.
+                        // Partial frame: wait for more bytes.
                         break
                     }
                     continuation.yield(frame)
@@ -97,7 +97,7 @@ public actor MmdvmReader {
     }
 }
 
-/// Thin helper for sending MMDVM frames. Non-streaming — one
+/// Thin helper for sending MMDVM frames. Non-streaming: one
 /// `send` per frame. The writer borrows the transport and doesn't
 /// own it, so the same transport can be shared with `MmdvmReader`.
 public struct MmdvmWriter {

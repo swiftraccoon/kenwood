@@ -57,7 +57,7 @@ pub fn encode_poll(out: &mut [u8]) -> Result<usize, EncodeError> {
     write_fixed(out, &POLL_BYTES)
 }
 
-/// Encode the server's LINK1 ACK echo (5 bytes — same shape as LINK1).
+/// Encode the server's LINK1 ACK echo (5 bytes, same shape as LINK1).
 ///
 /// # Errors
 ///
@@ -70,7 +70,7 @@ pub fn encode_link1_ack(out: &mut [u8]) -> Result<usize, EncodeError> {
     write_fixed(out, &LINK1_ACK_BYTES)
 }
 
-/// Encode the server's UNLINK ACK echo (5 bytes — same shape as UNLINK).
+/// Encode the server's UNLINK ACK echo (5 bytes, same shape as UNLINK).
 ///
 /// # Errors
 ///
@@ -91,7 +91,7 @@ pub fn encode_unlink_ack(out: &mut [u8]) -> Result<usize, EncodeError> {
 ///
 /// # See also
 ///
-/// `xlxd/src/cdplusprotocol.cpp` — the reference encoder reuses the
+/// `xlxd/src/cdplusprotocol.cpp`: the reference encoder reuses the
 /// client poll bytes verbatim.
 pub fn encode_poll_echo(out: &mut [u8]) -> Result<usize, EncodeError> {
     write_fixed(out, &POLL_ECHO_BYTES)
@@ -145,7 +145,7 @@ pub fn encode_link2(out: &mut [u8], callsign: &Callsign) -> Result<usize, Encode
         dst.copy_from_slice(&LINK2_HEADER);
     }
     // Callsign at offset 4. The Callsign type guarantees 8 bytes
-    // already space-padded — we want the trimmed length followed by
+    // already space-padded; we want the trimmed length followed by
     // zeros up to offset 20, matching the reference encoder.
     let bytes = callsign.as_bytes();
     let trimmed_len = bytes.iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);

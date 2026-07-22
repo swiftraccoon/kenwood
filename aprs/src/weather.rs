@@ -12,7 +12,7 @@ use crate::error::AprsError;
 /// standalone positionless weather report (data type `_`). The TH-D75
 /// displays weather station data in the station list.
 ///
-/// All fields are optional — weather stations may report any subset.
+/// All fields are optional; weather stations may report any subset.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AprsWeather {
     /// Wind direction in degrees (0-360).
@@ -59,7 +59,7 @@ pub fn extract_position_weather(symbol_code: char, comment: &str) -> Option<Aprs
     // as dots or spaces when the station has no wind sensor (spec example
     // `_10090556c...s...g...t...P012Jim`). A `.`/space placeholder in the
     // `DDD/SSS` extension means "no data" for that field, NOT a malformed
-    // report — the remaining weather fields (gust/temp/humidity/pressure)
+    // report: the remaining weather fields (gust/temp/humidity/pressure)
     // must still be parsed. `parse_weather_value` maps an all-dots/spaces
     // run to `None`; any other non-digit content is genuinely invalid and
     // aborts the whole parse (a position-with-`_`-symbol comment whose
@@ -131,7 +131,7 @@ fn parse_weather_fields(data: &[u8]) -> AprsWeather {
             b'c' | b's' | b'g' | b't' | b'r' | b'p' | b'P' | b'L' | b'l' => 3,
             b'h' => 2,
             b'b' => 5,
-            // Unknown byte — assume start of comment / type suffix.
+            // Unknown byte: assume start of comment / type suffix.
             _ => break,
         };
         let Some(val_bytes) = data.get(i + 1..i + 1 + width) else {
@@ -193,7 +193,7 @@ enum WindField {
     /// All ASCII digits, parsed and range-checked to a `u16` degree/mph
     /// value.
     Value(u16),
-    /// All dots or spaces — the spec "no data" sentinel (APRS 1.0.1 §12.2
+    /// All dots or spaces: the spec "no data" sentinel (APRS 1.0.1 §12.2
     /// p.64). The field is unknown but the surrounding report is valid and
     /// the remaining weather fields must still be parsed.
     Unknown,
@@ -213,7 +213,7 @@ impl WindField {
 /// Classify a fixed-width `DDD` / `SSS` extension field.
 ///
 /// Returns `None` (so the caller aborts via `?`) when the bytes are
-/// neither all digits nor all dots/spaces — such a prefix is not a
+/// neither all digits nor all dots/spaces; such a prefix is not a
 /// `DDD/SSS` extension and the comment is not a weather report. A digit
 /// run that parses but overflows `u16` (an impossible 4+ digit value in a
 /// 3-byte field, but defended anyway) also yields `None`.
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn parse_weather_fields_in_order_with_gaps() {
-        // Temperature only — other fields omitted entirely.
+        // Temperature only; other fields omitted entirely.
         let wx = parse_weather_fields(b"t072");
         assert_eq!(wx.temperature, Some(72));
         assert_eq!(wx.wind_direction, None);

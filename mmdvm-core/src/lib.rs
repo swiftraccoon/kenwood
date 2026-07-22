@@ -19,16 +19,16 @@
 //!
 //! ## What's in scope
 //!
-//! - [`frame::MmdvmFrame`] — the `[0xE0, len, cmd, payload]` wire
+//! - [`frame::MmdvmFrame`]: the `[0xE0, len, cmd, payload]` wire
 //!   frame and its codec.
-//! - [`command`] — every MMDVM protocol byte constant.
-//! - [`ModemMode`] — the modem's operating-mode enum.
-//! - [`ModemStatus`] — parsing of the status response for protocol v1
+//! - [`command`]: every MMDVM protocol byte constant.
+//! - [`ModemMode`]: the modem's operating-mode enum.
+//! - [`ModemStatus`]: parsing of the status response for protocol v1
 //!   and v2.
-//! - [`VersionResponse`] / [`Capabilities`] / [`HwType`] — parsing of
+//! - [`VersionResponse`] / [`Capabilities`] / [`HwType`]: parsing of
 //!   the `GetVersion` handshake.
-//! - [`NakReason`] — typed NAK reason codes.
-//! - [`MmdvmError`] — the unified codec error type.
+//! - [`NakReason`]: typed NAK reason codes.
+//! - [`MmdvmError`]: the unified codec error type.
 //!
 //! ## What's out of scope
 //!
@@ -37,7 +37,7 @@
 //! - Per-protocol voice/data framing above the MMDVM wire layer
 //!   (e.g. AMBE, IMBE, NXDN, DMR BPTC). Those live in dedicated
 //!   sans-io crates.
-//! - The full `SetConfig` encoder (stub only — see [`ModemConfig`]).
+//! - The full `SetConfig` encoder (stub only; see [`ModemConfig`]).
 
 pub mod capabilities;
 pub mod command;

@@ -118,18 +118,18 @@ pub struct AmbeEncoder {
     /// state is re-zeroed each time (via
     /// [`Self::reset_prev_state_after_silence`]).
     ///
-    /// `None` means look-ahead is disabled entirely — the default
+    /// `None` means look-ahead is disabled entirely: the default
     /// zero-latency [`Self::new`] sets this to `None`, while
     /// [`Self::new_with_lookahead`] sets it to `Some(Vec::new())`.
     pending: Option<Vec<FrameSlot>>,
-    /// Hysteretic V/UV state — previous frame's per-band decisions
+    /// Hysteretic V/UV state: previous frame's per-band decisions
     /// plus the slow-update frame-energy ceiling `th_max`. Carried
     /// across frames so the V/UV threshold reflects the signal's
     /// recent history (OP25 `v_uv_det.cc:152`).
     vuv_state: VuvState,
 }
 
-/// Silence shortcut threshold — when the pitch tracker reports
+/// Silence shortcut threshold: when the pitch tracker reports
 /// essentially-no-signal (confidence below this), emit the canonical
 /// D-STAR silence pattern directly (`MMDVMHost` / DVSI convention)
 /// rather than trying to quantize zeros. Reference:
@@ -152,7 +152,7 @@ impl AmbeEncoder {
     /// common octave ambiguities; pure-sine synthetic tests can
     /// lose the 2P-vs-P disambiguation on settled tones. For the
     /// full OP25 pitch pipeline (2-frame look-ahead DP), see
-    /// [`Self::new_with_lookahead`] — it costs 40 ms of latency and
+    /// [`Self::new_with_lookahead`]; it costs 40 ms of latency and
     /// an extra 2-frame warmup but matches OP25's pitch decisions
     /// on pure sines as well as voice.
     #[must_use]
@@ -193,7 +193,7 @@ impl AmbeEncoder {
 
     /// After emitting `AMBE_SILENCE`, overwrite the encoder's
     /// `prev_log2_ml` / `prev_l` with what the decoder will have
-    /// after parsing that silence frame — otherwise the next voice
+    /// after parsing that silence frame; otherwise the next voice
     /// frame's prediction residual
     /// `T[i] = lsa[i] - 0.65 * interp(prev_log2_ml)[i]` is computed
     /// against a `prev` state the decoder doesn't share.
@@ -235,8 +235,8 @@ impl AmbeEncoder {
     /// # Panics
     ///
     /// Never panics under normal use. The look-ahead pipeline's
-    /// internal invariant — `self.pending` is `Some` iff the encoder
-    /// was built with [`Self::new_with_lookahead`] — is enforced at
+    /// internal invariant (`self.pending` is `Some` iff the encoder
+    /// was built with [`Self::new_with_lookahead`]) is enforced at
     /// construction and never mutated afterwards; the unreachable
     /// `expect` is kept as a defensive check rather than removed
     /// entirely.
@@ -264,7 +264,7 @@ impl AmbeEncoder {
         };
         if pending.len() < 2 {
             pending.push(slot);
-            // Pipeline not full yet — emit silence and keep the
+            // Pipeline not full yet: emit silence and keep the
             // decoder's `prev_log2_ml` state consistent with what
             // it sees on the wire.
             self.reset_prev_state_after_silence();
@@ -347,7 +347,7 @@ impl AmbeEncoder {
         // expects already-demodulated `ambe_fr` and re-modulates as
         // part of the packing). An explicit `demodulate_c1` call
         // *before* `pack_frame` cancels with the one inside, leaving
-        // the wire bytes in unmodulated form — which the decoder's
+        // the wire bytes in unmodulated form, which the decoder's
         // single `demodulate_c1` then incorrectly XORs back into the
         // modulated state. Net effect: 7 of 49 `ambe_d` bits flip
         // through the round-trip (b3 was reading 304 instead of 368
@@ -486,7 +486,7 @@ mod tests {
     /// NOT silent. This proves the spectral quantization path
     /// (PRBA/HOC) carries meaningful signal energy end-to-end.
     ///
-    /// Audio quality (vs. DVSI chip output) is not asserted — that
+    /// Audio quality (vs. DVSI chip output) is not asserted; that
     /// requires real hardware-in-the-loop testing.
     #[test]
     fn encode_decode_produces_non_silent_output() {

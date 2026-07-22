@@ -19,9 +19,9 @@ This gets you the default feature set: the tokio-backed
 `dstar-gateway` re-exports the core's leaf types (`Callsign`,
 `Module`, `DStarHeader`, `VoiceFrame`, `Error`, …) from its crate
 root, so simple programs need only this one dependency. The typestate
-session machinery — `Session`, `Driver`, the `Configured` /
+session machinery (`Session`, `Driver`, the `Configured` /
 `Connected` state markers, and the `DPlus` / `DExtra` / `Dcs`
-protocol markers — is **not** re-exported. If you drive the sans-io
+protocol markers) is **not** re-exported. If you drive the sans-io
 core directly, add `dstar-gateway-core` as an explicit dependency.
 
 ## Feature flags
@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .peer("127.0.0.1:30001".parse()?)
         .build();
 
-    // We don't actually connect — this just verifies the types resolve.
+    // We don't actually connect; this just verifies the types resolve.
     let _ = session;
     // AsyncSession is needed to satisfy the `use` above.
     let _: Option<AsyncSession<DExtra>> = None;

@@ -30,7 +30,7 @@ use dstar_gateway_core::types::{Callsign, Module};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
-// Examples are a separate compilation unit — acknowledge workspace
+// Examples are a separate compilation unit, so acknowledge workspace
 // dev-deps we don't reference directly so the strict
 // `unused_crate_dependencies` lint stays silent.
 use pcap_parser as _;
@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut buf = [0u8; 64];
     let Ok(recv) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf)).await else {
-        eprintln!("timeout waiting for reflector reply — is 127.0.0.1:30001 listening?");
+        eprintln!("timeout waiting for reflector reply; is 127.0.0.1:30001 listening?");
         return Ok(());
     };
     let (n, peer) = recv?;

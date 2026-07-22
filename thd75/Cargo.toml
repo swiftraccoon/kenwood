@@ -45,7 +45,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
 # blocks (cargo replaces, never merges, the workspace set). Divergences:
 # - `unsafe_code` is NOT declared here: the workspace `forbid` cannot be
 #   weakened at crate level, and this crate needs one unsafe module for
-#   the IOBluetooth FFI. The guard lives at the source level instead —
+#   the IOBluetooth FFI. The guard lives at the source level instead:
 #   `#![deny(unsafe_code)]` in lib.rs with a scoped `expect` in
 #   transport/bluetooth.rs.
 # - Everything else mirrors the workspace policy; see the inline notes.
@@ -71,12 +71,12 @@ pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
 restriction = { level = "allow", priority = -1 }
-# Ban `#[allow]` — every suppression must be `#[expect(..., reason = "...")]`.
+# Ban `#[allow]`: every suppression must be `#[expect(..., reason = "...")]`.
 # Mirrors the root `[workspace.lints.clippy]` ban; restated here because this crate's
 # `[lints]` block replaces the workspace one entirely (cargo does not merge).
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
-# Restriction-lint denies mirror the workspace — no divergence.
+# Restriction-lint denies mirror the workspace; no divergence.
 undocumented_unsafe_blocks = "deny"
 missing_assert_message = "deny"
 missing_const_for_fn = "deny"
@@ -84,7 +84,7 @@ panic = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
-# Forward-protection lints — mirror the workspace block exactly.
+# Forward-protection lints: mirror the workspace block exactly.
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"

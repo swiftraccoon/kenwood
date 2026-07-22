@@ -1,9 +1,9 @@
 //! Tokio async shell driving the sans-io [`mmdvm_core`] codec.
 //!
 //! Entry points:
-//! - [`AsyncModem`] — user-facing handle over a spawned modem task;
+//! - [`AsyncModem`]: user-facing handle over a spawned modem task;
 //!   use [`AsyncModem::spawn`] to wire up the internal loop
-//! - [`Event`] — inbound events the modem loop emits to consumers
+//! - [`Event`]: inbound events the modem loop emits to consumers
 //!
 //! Internal types (`Command`, `ModemLoop`, `TxQueue`) are
 //! crate-private.

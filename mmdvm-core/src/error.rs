@@ -16,7 +16,7 @@ pub enum MmdvmError {
         /// The byte found at position 0.
         got: u8,
     },
-    /// The length field is 1 or 2 — shorter than any frame can be,
+    /// The length field is 1 or 2: shorter than any frame can be,
     /// and not the extended-form marker (0).
     #[error("invalid length field: {len} (minimum 3)")]
     InvalidLength {

@@ -23,7 +23,7 @@ pub struct DprsReport {
 /// Parse a DPRS sentence into a [`DprsReport`].
 ///
 /// The sentence must start with `$$CRC<4hex>,`. The CRC field is
-/// parsed but not validated here — callers that want to verify it
+/// parsed but not validated here; callers that want to verify it
 /// should compute [`super::compute_crc`] over the body bytes after
 /// the comma and compare against the 4-hex value between `$$CRC`
 /// and `,`.
@@ -38,7 +38,7 @@ pub struct DprsReport {
 ///
 /// # See also
 ///
-/// `ircDDBGateway/Common/APRSCollector.cpp:371-394` — the reference
+/// `ircDDBGateway/Common/APRSCollector.cpp:371-394`, the reference
 /// parser this decoder mirrors. CRC-CCITT uses reflected polynomial
 /// `0x8408`, initial value `0xFFFF`, final `~accumulator`.
 pub fn parse_dprs(sentence: &str) -> Result<DprsReport, DprsError> {

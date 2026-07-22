@@ -2,7 +2,7 @@
 //!
 //! `ClientPacket` represents every packet a `DCS` client sends to a
 //! reflector. `ServerPacket` represents every packet a reflector sends
-//! to a client. The codec is symmetric — both directions are
+//! to a client. The codec is symmetric; both directions are
 //! first-class.
 
 use crate::header::DStarHeader;

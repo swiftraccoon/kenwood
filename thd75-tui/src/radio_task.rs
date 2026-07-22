@@ -11,7 +11,7 @@ use crate::app::{BandState, Message, RadioState};
 
 /// Poll interval for reading radio state.
 /// ~10 commands per cycle (FQ, SQ, MD, PC, RA, FS per band + globals).
-/// SM and BY are NOT polled — they use AI push notifications instead.
+/// SM and BY are NOT polled; they use AI push notifications instead.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Reconnect poll interval after disconnect.
@@ -39,7 +39,7 @@ impl ConnectFailure {
         }
     }
 
-    /// A failure backed by a `LinkDiagnosis` probe — the message is
+    /// A failure backed by a `LinkDiagnosis` probe; the message is
     /// built from the diagnosis's operator guidance.
     pub(crate) fn diagnosed(diagnosis: LinkDiagnosis) -> Self {
         Self {
@@ -54,7 +54,7 @@ impl ConnectFailure {
 
 /// Open a transport on the calling thread (must be main for BT).
 ///
-/// This is synchronous — call from main before starting tokio.
+/// This is synchronous: call from main before starting tokio.
 /// On macOS, Bluetooth RFCOMM callbacks require the main thread's
 /// `CFRunLoop`, so transport discovery must happen before the tokio
 /// runtime is spawned on a dedicated thread.
@@ -96,14 +96,14 @@ pub(crate) fn discover_and_open_transport(
     clippy::too_many_lines,
     reason = "`bt_req_tx` and `bt_resp_rx` (and internally `bt_req_rx`/`bt_resp_tx`) form \
               the canonical request/response channel pair for the main-thread IOBluetooth \
-              reconnect path. The names are structurally parallel by design — renaming \
+              reconnect path. The names are structurally parallel by design; renaming \
               would obscure which channel is the request side and which is the response \
               side. The channel pair exists because IOBluetooth RFCOMM reconnect must run \
               on the process main thread (Cocoa run loop); the radio task lives on a \
               tokio worker and dispatches reconnect requests across this channel pair. \
               `too_many_lines` fires because the function owns the entire radio task loop \
               (command polling + event handling + BT reconnect dance) in a single \
-              `tokio::select!` over MPSC receivers — splitting would require channel \
+              `tokio::select!` over MPSC receivers; splitting would require channel \
               plumbing for no reader benefit."
 )]
 pub(crate) async fn spawn_with_transport(
@@ -126,7 +126,7 @@ pub(crate) async fn spawn_with_transport(
         radio.set_mcp_speed(kenwood_thd75::McpSpeed::Fast);
     }
 
-    // Verify identity. A failure here — most often a timeout — means the
+    // Verify identity. A failure here (most often a timeout) means the
     // radio is not answering CAT control: it is in Reflector Terminal
     // Mode, or otherwise unresponsive. Probe the link so the operator
     // gets actionable guidance instead of a bare "command timed out".
@@ -135,7 +135,7 @@ pub(crate) async fn spawn_with_transport(
         return Err(ConnectFailure::diagnosed(diagnosis));
     }
 
-    // Enable AI (Auto Information) mode — radio pushes BY/FQ/MD notifications
+    // Enable AI (Auto Information) mode: the radio pushes BY/FQ/MD notifications
     // instead of requiring polling. This is critical for reliable S-meter:
     // AI-pushed BY notifications go through the radio's internal squelch
     // debouncing, while polled BY reads raw hardware state with spurious spikes.
@@ -164,7 +164,7 @@ pub(crate) async fn spawn_with_transport(
     let path_clone = path.clone();
 
     let _task = tokio::spawn(async move {
-        // AI notification state — these fields are updated by push notifications
+        // AI notification state: these fields are updated by push notifications
         // from the radio (AI mode) rather than polling. This reduces USB traffic,
         // provides instant updates, and avoids firmware quirks (e.g., spurious
         // SM/BY spikes on Band B when polled directly).
@@ -210,7 +210,7 @@ pub(crate) async fn spawn_with_transport(
                         let _send = tx.send(Message::AprsError(msg));
                         let _send = tx.send(Message::AprsStopped);
                         let _send = tx.send(Message::Disconnected);
-                        // radio_opt is None — fall through to reconnect.
+                        // radio_opt is None; fall through to reconnect.
                     }
                 }
             }
@@ -238,7 +238,7 @@ pub(crate) async fn spawn_with_transport(
                         let _send = tx.send(Message::DStarError(msg));
                         let _send = tx.send(Message::DStarStopped);
                         let _send = tx.send(Message::Disconnected);
-                        // radio_opt is None — fall through to reconnect.
+                        // radio_opt is None; fall through to reconnect.
                     }
                 }
             }
@@ -260,7 +260,7 @@ pub(crate) async fn spawn_with_transport(
                                     break; // Go to reconnect
                                 }
                                 Err(PollError::Protocol(e)) => {
-                                    // Parse errors are non-fatal — skip this poll cycle
+                                    // Parse errors are non-fatal; skip this poll cycle
                                     let _send = tx.send(Message::RadioError(e));
                                 }
                             }
@@ -271,7 +271,7 @@ pub(crate) async fn spawn_with_transport(
                             // faster than polling and avoids firmware quirks.
                             use kenwood_thd75::protocol::Response;
                             // Other AI notifications (FQ, MD, SQ, VM, etc.) are
-                            // handled implicitly — the next poll cycle will read
+                            // handled implicitly: the next poll cycle will read
                             // the updated values. AI mode ensures we don't miss
                             // rapid changes between poll cycles.
                             if let Response::Busy { band, busy } = notification {
@@ -345,7 +345,7 @@ pub(crate) async fn spawn_with_transport(
                                     if let Err(e) = radio.tune_channel(band, channel).await {
                                         let _send = tx.send(Message::RadioError(format!("Tune failed: {e}")));
                                     }
-                                    // Don't break — stay in poll loop, radio is still connected
+                                    // Don't break: stay in poll loop, radio is still connected
                                 }
                                 crate::event::RadioCommand::FreqUp(band) => {
                                     if let Err(e) = radio.frequency_up(band).await {
@@ -465,7 +465,7 @@ pub(crate) async fn spawn_with_transport(
                                             // Update the in-memory MCP cache so the TUI
                                             // stays in sync without requiring a full re-read.
                                             let _send = tx.send(Message::McpByteWritten { offset, value });
-                                            let _send = tx.send(Message::RadioError(format!("MCP 0x{offset:04X} = {value} — reconnecting...")));
+                                            let _send = tx.send(Message::RadioError(format!("MCP 0x{offset:04X} = {value}; reconnecting...")));
                                         }
                                         Err(e) => {
                                             let _send = tx.send(Message::McpError(format!("MCP write 0x{offset:04X}: {e}")));
@@ -580,7 +580,7 @@ pub(crate) async fn spawn_with_transport(
                                 if let Err(e) = new_radio.set_auto_info(true).await {
                                     tracing::error!("AI mode failed after reconnect: {e}");
                                     let _send = tx.send(Message::RadioError(format!(
-                                        "AI mode failed: {e} — S-meter may not update"
+                                        "AI mode failed: {e}; S-meter may not update"
                                     )));
                                 }
                                 notifications = new_radio.subscribe();
@@ -617,7 +617,7 @@ pub(crate) async fn spawn_with_transport(
 
 /// Distinguishes transport errors (connection lost) from protocol errors
 /// (parse failures). Transport errors break out of the poll loop to the
-/// reconnect path. Protocol errors are non-fatal — the current poll cycle
+/// reconnect path. Protocol errors are non-fatal: the current poll cycle
 /// is skipped but the connection stays alive.
 enum PollError {
     Transport(String),
@@ -651,13 +651,13 @@ macro_rules! global_read {
 
 #[expect(
     clippy::cognitive_complexity,
-    reason = "`poll_once` issues every CAT read the TUI displays — band A/B state, battery, \
-              GPS, filter widths, VOX, beacon, AI-gated meter — in a single dump per \
+    reason = "`poll_once` issues every CAT read the TUI displays (band A/B state, battery, \
+              GPS, filter widths, VOX, beacon, AI-gated meter) in a single dump per \
               refresh cycle. Each individual read is simple; the combined function looks \
               complex to clippy because it orchestrates ~20 serial CAT round-trips. \
               Splitting by subsystem would force multiple concurrent `Radio<T>` borrows \
               (which is impossible) or a second layer of channel plumbing for no reader \
-              benefit — the whole point is `poll_once` owns the radio for one atomic pass."
+              benefit; the whole point is `poll_once` owns the radio for one atomic pass."
 )]
 async fn poll_once(
     radio: &mut Radio<EitherTransport>,
@@ -685,7 +685,7 @@ async fn poll_once(
         radio.get_battery_level(),
         kenwood_thd75::types::BatteryLevel::Empty
     );
-    // BE (beep) is a firmware stub on D75 — always returns N.
+    // BE (beep) is a firmware stub on D75: always returns N.
     // Beep state is read from MCP image instead. Skip polling.
     let beep = false;
     let lock = global_read!(radio, "LC", radio.get_lock(), false);
@@ -719,9 +719,9 @@ async fn poll_once(
         radio.get_beacon_type(),
         kenwood_thd75::types::BeaconMode::Off
     );
-    // FS read (no band parameter) — returns N in some modes
+    // FS read (no band parameter): returns N in some modes
     let fine_step = radio.get_fine_step().await.ok();
-    // SH read per mode — returns N in some modes
+    // SH read per mode: returns N in some modes
     let filter_width_ssb = radio
         .get_filter_width(kenwood_thd75::types::FilterMode::Ssb)
         .await
@@ -734,7 +734,7 @@ async fn poll_once(
         .get_filter_width(kenwood_thd75::types::FilterMode::Am)
         .await
         .ok();
-    // D-STAR reads — non-fatal, default to empty/None on error
+    // D-STAR reads: non-fatal, default to empty/None on error
     let dstar_urcall = radio.get_urcall().await.unwrap_or_default();
     let dstar_rpt1 = radio.get_rpt1().await.unwrap_or_default();
     let dstar_rpt2 = radio.get_rpt2().await.unwrap_or_default();
@@ -764,8 +764,8 @@ async fn poll_once(
         filter_width_ssb,
         filter_width_cw,
         filter_width_am,
-        scan_resume_cat: None, // Write-only on D75 — not readable
-        // D-STAR state — non-fatal reads (protocol errors use defaults)
+        scan_resume_cat: None, // Write-only on D75, not readable
+        // D-STAR state: non-fatal reads (protocol errors use defaults)
         dstar_urcall: dstar_urcall.0,
         dstar_urcall_suffix: dstar_urcall.1,
         dstar_rpt1: dstar_rpt1.0,
@@ -792,7 +792,7 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
         .await
         .map_err(|e| classify_error(&format!("FQ {band:?}"), &e))?;
 
-    // SM and BY are NOT polled — they are driven by AI-pushed BY notifications.
+    // SM and BY are NOT polled; they are driven by AI-pushed BY notifications.
     // Polling SM/BY causes spurious readings on Band B due to firmware behavior.
     // The AI push path goes through the radio's internal squelch debouncing.
 
@@ -812,7 +812,7 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
         .map_err(|e| classify_error(&format!("PC {band:?}"), &e))?;
 
     let attenuator = radio.get_attenuator(band).await.unwrap_or(false);
-    // SF returns N (not available) in some modes — gracefully default
+    // SF returns N (not available) in some modes; gracefully default
     let step_size = radio.get_step_size(band).await.ok().map(|(_, s)| s);
 
     Ok(BandState {
@@ -835,7 +835,7 @@ async fn freq_down(
     band: Band,
 ) -> Result<(), kenwood_thd75::Error> {
     let ch = radio.get_frequency(band).await?;
-    // SF may return N (not available) in some modes — default to 5 kHz
+    // SF may return N (not available) in some modes; default to 5 kHz
     let step = radio
         .get_step_size(band)
         .await
@@ -847,7 +847,7 @@ async fn freq_down(
         .await
 }
 
-/// Error type for the APRS session helper — the radio is lost, reconnect required.
+/// Error type for the APRS session helper: the radio is lost, reconnect required.
 enum EnterAprsError {
     /// KISS exit failed or the session ended with a transport error.
     KissExitFailed(String),
@@ -907,7 +907,7 @@ async fn run_aprs_loop(
                         }
                     }
                     Ok(None) | Err(kenwood_thd75::Error::Timeout(_)) => {
-                        // Timeout — no activity, loop again.
+                        // Timeout: no activity, loop again.
                     }
                     Err(e) => {
                         return Err(format!("APRS transport error: {e}"));
@@ -954,7 +954,7 @@ async fn run_aprs_loop(
     }
 }
 
-/// Error type for the D-STAR gateway session — the radio is lost, reconnect required.
+/// Error type for the D-STAR gateway session: the radio is lost, reconnect required.
 enum EnterDStarError {
     /// MMDVM exit failed or the session ended with a transport error.
     MmdvmExitFailed(String),
@@ -1012,7 +1012,7 @@ async fn run_dstar_loop(
                         }
                     }
                     Ok(None) | Err(kenwood_thd75::Error::Timeout(_)) => {
-                        // Timeout — no activity, loop again.
+                        // Timeout: no activity, loop again.
                     }
                     Err(e) => {
                         return Err(format!("D-STAR transport error: {e}"));
@@ -1072,7 +1072,7 @@ fn discover_and_open(port: Option<&str>, baud: u32) -> Result<(String, EitherTra
         return Ok((path, EitherTransport::Serial(transport)));
     }
 
-    // No USB — try Bluetooth.
+    // No USB, so try Bluetooth.
     // macOS: use native IOBluetooth RFCOMM (the serial driver drops bytes).
     // Linux/Windows: discover BT SPP serial ports (rfcomm*, COM with "bluetooth").
     #[cfg(target_os = "macos")]

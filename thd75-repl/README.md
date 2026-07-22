@@ -46,21 +46,21 @@ thd75-repl [--port /dev/cu.usbmodem1234] [--baud 115200]
 
 ### Session-wide flags
 
-- `--timestamps` / `-t` — prepend `[HH:MM:SS]` to every output line (UTC by default)
-- `--local-time` — use local time in timestamps (detected from `date +%z` on Unix)
-- `--utc-offset=+HH:MM` — override the timezone offset manually
-- `--history-lines=N` — set the `last` command history buffer size (default 30)
-- `--yes` — skip transmit confirmation prompts for this session (use with caution)
+- `--timestamps` / `-t`: prepend `[HH:MM:SS]` to every output line (UTC by default)
+- `--local-time`: use local time in timestamps (detected from `date +%z` on Unix)
+- `--utc-offset=+HH:MM`: override the timezone offset manually
+- `--history-lines=N`: set the `last` command history buffer size (default 30)
+- `--yes`: skip transmit confirmation prompts for this session (use with caution)
 
 ### Interactive commands
 
 At the `d75>` prompt, the most useful commands are:
 
-- `status` — dump the full radio state in one block
-- `last` / `last 5` / `last all` — re-announce previous output
-- `help` / `help <cmd>` / `help all` — help, per-command or all commands
-- `verbose on` / `quiet` — toggle monitor verbosity
-- `confirm on` / `confirm off` — toggle transmit confirmation
+- `status`: dump the full radio state in one block
+- `last` / `last 5` / `last all`: re-announce previous output
+- `help` / `help <cmd>` / `help all`: help, per-command or all commands
+- `verbose on` / `quiet`: toggle monitor verbosity
+- `confirm on` / `confirm off`: toggle transmit confirmation
 
 Standard commands cover frequency, mode, power, squelch, attenuator, VOX, dual band, Bluetooth, lock, FM radio, memory channels, GPS, URCALL, and reflector linking.
 
@@ -99,7 +99,7 @@ dstar> dstar stop
 
 ## Logging
 
-By default no log file is created and no tracing output is written —
+By default no log file is created and no tracing output is written;
 the terminal only shows normal REPL output. File logging is opt-in
 because trace-level capture during D-STAR voice flow generates large
 files fast (~1 MB/s per active reflector link).
@@ -107,13 +107,13 @@ files fast (~1 MB/s per active reflector link).
 To enable a log file, pass `--log-level` or `--trace`:
 
 ```
-thd75-repl --trace               # trace level — captures every packet
+thd75-repl --trace               # trace level: captures every packet
 thd75-repl --log-level=debug     # state transitions + decoded events
 thd75-repl --log-level=info      # high-level session flow only
 ```
 
 File location (one fresh file per session, suffix is the UTC session
-start time at second granularity — nothing rotates, so old files
+start time at second granularity; nothing rotates, so old files
 accumulate until you delete them):
 
 - macOS: `~/Library/Logs/thd75-repl/thd75-repl.log.<YYYY-MM-DD-HHMMSS>`
@@ -127,7 +127,7 @@ RUST_LOG=dstar_gateway=debug thd75-repl
 RUST_LOG=dstar_gateway=trace,kenwood_thd75::slow_data=debug thd75-repl
 ```
 
-`RUST_LOG` and `--log-level` are independent — you can combine them
+`RUST_LOG` and `--log-level` are independent: you can combine them
 (live stderr stream + persistent file) or use either alone.
 
 ## Requirements

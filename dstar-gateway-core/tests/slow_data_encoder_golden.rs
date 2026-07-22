@@ -13,7 +13,7 @@
 //!      c. half1 = block[0..3] XOR [0x70, 0x4F, 0x93].
 //!      d. half2 = block[3..6] XOR [0x70, 0x4F, 0x93].
 
-// Integration tests are separate compilation units — each one must
+// Integration tests are separate compilation units, so each one must
 // silence `unused_crate_dependencies` for workspace crates it doesn't
 // directly reference beyond `src/lib.rs`.
 use proptest as _;

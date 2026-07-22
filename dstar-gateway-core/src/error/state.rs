@@ -31,7 +31,7 @@ pub enum StateError {
     },
 
     /// A method was called on a [`SessionCore`] while it was in the
-    /// wrong [`ClientStateKind`] — e.g. `enqueue_connect` outside of
+    /// wrong [`ClientStateKind`], e.g. `enqueue_connect` outside of
     /// `Configured`/`Authenticated`, or `attach_host_list` on a
     /// non-`DPlus` session.
     ///

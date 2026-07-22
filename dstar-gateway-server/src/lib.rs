@@ -1,7 +1,7 @@
 //! Multi-client D-STAR reflector server.
 //!
-//! Supports all three reflector protocols — `DExtra`, `DPlus`, and
-//! `DCS` — behind a common [`Reflector`] front-end. Each enabled
+//! Supports all three reflector protocols (`DExtra`, `DPlus`, and
+//! `DCS`) behind a common [`Reflector`] front-end. Each enabled
 //! endpoint runs on its own tokio task and (when
 //! `cross_protocol_forwarding = true` in the config) publishes to a
 //! shared broadcast bus so voice frames received on one protocol

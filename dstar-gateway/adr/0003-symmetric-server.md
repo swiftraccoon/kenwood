@@ -1,4 +1,4 @@
-# 0003 — Symmetric client and server sharing the codec
+# 0003: Symmetric client and server sharing the codec
 
 - **Status**: accepted
 - **Date**: 2026-04-10
@@ -9,11 +9,11 @@
 Historically, D-STAR reflector software has been split along the
 client/server divide:
 
-- `ircDDBGateway` (the canonical implementation) is a **client** —
+- `ircDDBGateway` (the canonical implementation) is a **client**:
   it runs on the operator's machine, talks to a radio over the
   MMDVM protocol, and to a reflector over UDP. It has no code for
   accepting inbound UDP connections from other clients.
-- `xlxd` (the canonical reflector implementation) is a **server** —
+- `xlxd` (the canonical reflector implementation) is a **server**:
   it binds UDP ports and fans traffic between multiple connected
   clients. It has no code for talking to a radio.
 
@@ -76,8 +76,8 @@ drop `ClientPool`, `Reflector`, and fan-out code entirely).
 - **Parallel but distinct typestates.** Client sessions use
   `Session<P, S>` and server sessions use `ServerSession<P, S>`,
   backed by the non-generic `ServerSessionCore`. The two state sets
-  differ — the server side adds `Link1Received`, `Streaming`, and
-  `Unlinking` markers for the reflector's inbound handshake — so the
+  differ (the server side adds `Link1Received`, `Streaming`, and
+  `Unlinking` markers for the reflector's inbound handshake), so the
   typestate machinery is written twice rather than shared. Methods
   stay state-gated on both sides: `handle_voice_data` is only on
   `ServerSession<P, Streaming>`, `handle_link2` on
@@ -95,11 +95,11 @@ drop `ClientPool`, `Reflector`, and fan-out code entirely).
   duplication-of-constants outcome we wanted to avoid.
 - **Server as a cargo workspace sub-crate of the client**. This
   is what we actually did, but "symmetric" vs "sub-crate" is a
-  framing difference — both share the codec.
+  framing difference; both share the codec.
 
 ## References
 
-- `dstar-gateway-core/src/session/server/` — server-side
+- `dstar-gateway-core/src/session/server/`: server-side
   typestate + `ServerSessionCore` state machine.
-- `dstar-gateway-server/src/` — tokio shell, reflector top-level
+- `dstar-gateway-server/src/`: tokio shell, reflector top-level
   type, fan-out engine, cross-protocol transcode.

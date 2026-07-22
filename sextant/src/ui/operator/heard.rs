@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Heard list — two-line rows, newest first, active speaker pinned
+//! Heard list: two-line rows, newest first, active speaker pinned
 //! with an amber "now" dot. Clicking a row copies the callsign.
 
 use eframe::egui;
@@ -57,14 +57,14 @@ fn row(
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Wall-clock stamp in the operator's chosen display
-                // offset — matches the event log's timezone. "—" for
-                // legacy entries without one.
+                // offset, matching the event log's timezone. Legacy
+                // entries without one read as "unknown".
                 let when = if is_live {
                     "● now".to_owned()
                 } else {
                     station
                         .last_heard
-                        .map_or_else(|| "—".to_owned(), |ts| fmt_datetime(ts, offset))
+                        .map_or_else(|| "unknown".to_owned(), |ts| fmt_datetime(ts, offset))
                 };
                 let when_color = if is_live {
                     theme::LIVE

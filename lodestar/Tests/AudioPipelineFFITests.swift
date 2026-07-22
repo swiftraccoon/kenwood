@@ -9,7 +9,7 @@ final class AudioPipelineFFITests: XCTestCase {
         let p = RxAudioPipeline()
         p.startStream()
         // 12 arbitrary bytes decode to SOMETHING (worst case comfort
-        // noise) — the contract under test is holdback + counters.
+        // noise); the contract under test is holdback + counters.
         let frame = Data(repeating: 0, count: 12)
         XCTAssertTrue(p.pushVoice(seq: 0, voiceBytes: frame).isEmpty)
         XCTAssertEqual(p.pushVoice(seq: 1, voiceBytes: frame).count, 160)

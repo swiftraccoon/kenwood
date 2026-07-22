@@ -26,7 +26,7 @@ async fn main() {
         .peer("127.0.0.1:30001".parse().unwrap())
         .build();
 
-    // Transition to `Connecting` — the LINK packet is now in the
+    // Transition to `Connecting`; the LINK packet is now in the
     // outbox but the handshake hasn't completed.
     let connecting = session.connect(Instant::now()).unwrap();
 

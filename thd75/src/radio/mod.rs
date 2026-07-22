@@ -50,9 +50,9 @@ pub struct RadioInfo {
 /// 0 = VFO, 1 = Memory, 2 = Call, 3 = WX.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RadioMode {
-    /// VFO (Variable Frequency Oscillator) mode — direct frequency entry.
+    /// VFO (Variable Frequency Oscillator) mode: direct frequency entry.
     Vfo,
-    /// Memory mode — operating on a stored channel.
+    /// Memory mode: operating on a stored channel.
     Memory,
     /// Call channel mode.
     Call,
@@ -100,7 +100,7 @@ pub enum LinkState {
 
 /// High-level async API for controlling a Kenwood TH-D75.
 ///
-/// Generic over the transport layer — works with USB serial,
+/// Generic over the transport layer: works with USB serial,
 /// Bluetooth SPP, or mock transport for testing.
 ///
 /// The `Radio` struct tracks the VFO/Memory mode of each band when VM
@@ -129,7 +129,7 @@ pub struct Radio<T: Transport> {
     /// Set while an MCP programming session is active. If it is still
     /// set outside a programming method, the session's future was
     /// cancelled mid-transfer and the radio may be stuck in PROG MCP
-    /// mode — CAT refuses until
+    /// mode, where CAT refuses until
     /// [`Radio::recover_from_interrupted_mcp`] runs.
     pub(crate) mcp_active: bool,
     /// The CAT timeout saved while an MCP session temporarily raises
@@ -210,7 +210,7 @@ impl<T: Transport> Radio<T> {
     /// 1. Two empty frames
     /// 2. 300ms delay
     /// 3. ETX byte (0x03)
-    /// 4. KISS Return frame (`C0 FF C0`) — the exit the KISS protocol
+    /// 4. KISS Return frame (`C0 FF C0`), the exit the KISS protocol
     ///    itself defines. A radio left in KISS mode (e.g. by a crashed
     ///    APRS session) ignores every ASCII byte below, so this frame
     ///    is the only thing that can bring it back; to a radio in CAT
@@ -225,7 +225,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the transport connection fails or if any
-    /// preamble write fails — a write failure means the recovery
+    /// preamble write fails: a write failure means the recovery
     /// sequence never reached the radio, and reporting success would
     /// leave the caller debugging mysterious first-command failures.
     pub async fn connect_safe(transport: T) -> Result<Self, Error> {
@@ -233,7 +233,7 @@ impl<T: Transport> Radio<T> {
         let mut radio = Self::connect(transport).await?;
 
         // The radio may legitimately not RESPOND to any of these (it
-        // was never in TNC mode), but the WRITES must succeed — a
+        // was never in TNC mode), but the WRITES must succeed: a
         // failed write means a broken port, not a quiet radio.
         // Send empty frames to wake up any stale connection.
         radio
@@ -254,7 +254,7 @@ impl<T: Transport> Radio<T> {
             .write(&[0x03])
             .await
             .map_err(Error::Transport)?;
-        // KISS Return frame — the actual KISS-mode exit. A radio stuck
+        // KISS Return frame: the actual KISS-mode exit. A radio stuck
         // in KISS mode discards all the ASCII bytes in this preamble as
         // inter-frame garbage; this FEND-framed command is the only
         // recovery path. Same bytes `AprsClient::stop` sends.
@@ -457,7 +457,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// `?`/`N` are always taken as answers to the in-flight command.
     /// Anything else that doesn't match the command's mnemonic (or
-    /// matches it but carries the wrong band — AI pushes reuse the
+    /// matches it but carries the wrong band, since AI pushes reuse the
     /// read mnemonics) is unsolicited: parse successes go to
     /// subscribers, failures are dropped as diagnostics, and neither
     /// is ever fatal to the in-flight command.
@@ -523,7 +523,7 @@ impl<T: Transport> Radio<T> {
                     continue;
                 }
 
-                // Our mnemonic — a parse failure here IS a real
+                // Our mnemonic: a parse failure here IS a real
                 // protocol error.
                 let response = protocol::parse(&frame).map_err(Error::Protocol)?;
 
@@ -548,7 +548,7 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Drain frames the radio sent while no command was in flight —
+    /// Drain frames the radio sent while no command was in flight,
     /// typically a late response arriving after its command already
     /// timed out. Parseable frames are rerouted to the notification
     /// channel; `?`/`N` and garbage are dropped, since they cannot be
@@ -693,7 +693,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// This is used before reconnecting to ensure Bluetooth RFCOMM
     /// resources are fully released before a new connection is opened.
-    /// The `Radio` is left in a non-functional state — only reassignment
+    /// The `Radio` is left in a non-functional state: only reassignment
     /// or drop should follow.
     ///
     /// # Errors
@@ -865,7 +865,7 @@ mod tests {
     #[tokio::test]
     async fn channel_number_above_999_is_validation_error() -> TestResult {
         // The `{channel:03}` wire format silently emits 4+ digits for
-        // channel > 999 (e.g. `MR 0,1500`) — a malformed command the
+        // channel > 999 (e.g. `MR 0,1500`), a malformed command the
         // radio answers with `?`. Validate before the wire.
         let mock = MockTransport::new();
         let mut radio = Radio::connect(mock).await?;
@@ -884,7 +884,7 @@ mod tests {
 
     #[tokio::test]
     async fn dstar_callsign_write_validates_length() -> TestResult {
-        // DC writes previously took raw strings — an over-length
+        // DC writes previously took raw strings, so an over-length
         // callsign flowed to the wire unchecked.
         let mock = MockTransport::new();
         let mut radio = Radio::connect(mock).await?;
@@ -910,7 +910,7 @@ mod tests {
     #[tokio::test]
     async fn set_af_gain_rejects_write_out_of_range() -> TestResult {
         // AG accepts 0-99 on write (reads can exceed 99, so the type
-        // is lenient) — the write path must validate.
+        // is lenient), so the write path must validate.
         let mock = MockTransport::new();
         let mut radio = Radio::connect(mock).await?;
         let result = radio
@@ -1003,7 +1003,7 @@ mod tests {
     #[tokio::test]
     async fn parse_failure_of_matching_response_is_protocol_error() -> TestResult {
         let mut mock = MockTransport::new();
-        // Squelch level 9 is out of range (0-6) — OUR response failing
+        // Squelch level 9 is out of range (0-6). OUR response failing
         // to parse is a real protocol error, unlike unsolicited noise.
         mock.expect(b"SQ 0\r", b"SQ 0,9\r");
         let mut radio = Radio::connect(mock).await?;

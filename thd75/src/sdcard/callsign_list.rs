@@ -52,7 +52,7 @@ pub fn parse_callsign_list(data: &[u8]) -> Result<Vec<CallsignEntry>, SdCardErro
             })?
             .to_owned();
 
-        // Skip the D-STAR broadcast CQ address — it is always implicit.
+        // Skip the D-STAR broadcast CQ address; it is always implicit.
         if callsign.trim() == "CQCQCQ" {
             continue;
         }

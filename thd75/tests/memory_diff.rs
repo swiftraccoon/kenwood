@@ -9,8 +9,8 @@
 //! 4. Run this diff to find the changed bytes
 //! 5. Document the offset in `src/memory/settings.rs`
 //!
-//! Both entry points are `#[ignore]`d — they are diagnostic tools,
-//! not tests. Run explicitly:
+//! Both entry points are `#[ignore]`d because they are diagnostic
+//! tools, not tests. Run explicitly:
 //! ```text
 //! cargo test --test memory_diff -- --ignored --nocapture
 //! ```
@@ -73,7 +73,7 @@ const fn region_for_offset(offset: usize) -> &'static str {
 /// The output groups changes by memory region and shows both the hex
 /// and ASCII values (when printable) to aid manual analysis.
 #[test]
-#[ignore = "diagnostic tool, not a test — run explicitly with --ignored"]
+#[ignore = "diagnostic tool, not a test; run explicitly with --ignored"]
 #[expect(
     clippy::too_many_lines,
     reason = "Developer-only diagnostic harness that correlates two memory dumps region by \
@@ -271,7 +271,7 @@ const fn displayable_char(b: u8) -> char {
 /// Usage: set `DUMP_PATH`, `DUMP_OFFSET`, and `DUMP_LEN` environment
 /// variables, or just edit the constants below for quick inspection.
 #[test]
-#[ignore = "diagnostic tool, not a test — run explicitly with --ignored"]
+#[ignore = "diagnostic tool, not a test; run explicitly with --ignored"]
 fn hex_dump_region() {
     let path =
         std::env::var("DUMP_PATH").unwrap_or_else(|_| "tests/fixtures/memory_dump.bin".to_string());

@@ -3,7 +3,7 @@ name = "stargazer"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
-description = "D-STAR reflector voice recorder — archives raw AMBE frames, decoded WAV, and metadata per transmission"
+description = "D-STAR reflector voice recorder: archives raw AMBE frames, decoded WAV, and metadata per transmission"
 license = "GPL-2.0-or-later"
 publish = false
 

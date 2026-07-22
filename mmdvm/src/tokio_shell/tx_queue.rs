@@ -24,7 +24,7 @@ pub(crate) const DSTAR_EOT_SLOTS: u8 = 1;
 /// `push_*` refuses with [`TxQueueFull`].
 ///
 /// Mirrors `MMDVMHost`'s fixed-size host-side ring
-/// (`CRingBuffer m_txDStarData`, ~60 serialized data frames) — a
+/// (`CRingBuffer m_txDStarData`, ~60 serialized data frames). A
 /// bounded queue gives callers backpressure instead of unbounded
 /// memory growth when the modem stops granting FIFO space.
 pub(crate) const MAX_TX_QUEUE_FRAMES: usize = 64;
@@ -132,7 +132,7 @@ impl TxQueue {
     ///
     /// The strict `>` mirrors the reference
     /// (`MMDVMHost/Modem.cpp:1053-1055`: header needs `> 4`, data and
-    /// EOT need `> 1`) — one slot of margin absorbs estimation drift
+    /// EOT need `> 1`); one slot of margin absorbs estimation drift
     /// between 250 ms status polls and prevents modem TX-FIFO
     /// overflow.
     pub(crate) fn pop_if_space_allows(&mut self, dstar_space: u8) -> Option<QueuedFrame> {

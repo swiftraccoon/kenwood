@@ -15,7 +15,7 @@
 //!
 //! `App::update` composes the dashboard from these per-panel `show`
 //! functions. Each panel is pure presentation: it reads `App` state
-//! and calls `App` action methods — no async, no I/O.
+//! and calls `App` action methods: no async, no I/O.
 
 use eframe::egui;
 
@@ -38,7 +38,7 @@ pub(crate) enum Page {
 }
 
 /// Which overlay is showing, if any. At most one overlay is open at
-/// a time — opening another replaces it.
+/// a time; opening another replaces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Overlay {
     /// No overlay.
@@ -112,7 +112,7 @@ pub(crate) fn header(app: &mut App, ui: &mut egui::Ui) {
                 .color(crate::theme::TEXT_SECONDARY),
         );
         // Third on-air indicator (with the hero and the TX strip
-        // button) — a PTT state change must be visible everywhere.
+        // button): a PTT state change must be visible everywhere.
         if app.active_tx {
             ui.label(
                 egui::RichText::new("● ON AIR")
@@ -139,7 +139,7 @@ pub(crate) fn header(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-/// The operator's own callsign, always visible in the header — a
+/// The operator's own callsign, always visible in the header. A
 /// stale value here silently poisons `DPlus` auth, so it must never
 /// hide behind the gear alone. Click opens settings.
 fn mycall_indicator(app: &mut App, ui: &mut egui::Ui) {
@@ -157,7 +157,7 @@ fn mycall_indicator(app: &mut App, ui: &mut egui::Ui) {
     .fill(egui::Color32::TRANSPARENT);
     if ui
         .add(btn)
-        .on_hover_text("Operator callsign — click to edit")
+        .on_hover_text("Operator callsign, click to edit")
         .clicked()
     {
         app.overlay = Overlay::Settings;
@@ -189,7 +189,7 @@ fn page_toggle(app: &mut App, ui: &mut egui::Ui, page: Page, label: &str) {
     }
 }
 
-/// Slim dismissable error banner under the header — shown on BOTH
+/// Slim dismissable error banner under the header, shown on BOTH
 /// pages so an error can't hide behind the page toggle.
 pub(crate) fn error_strip(app: &mut App, ui: &mut egui::Ui) {
     let Some(err) = app.last_error.clone() else {
@@ -229,7 +229,7 @@ pub(crate) fn fmt_status(s: &ConnStatus) -> String {
         ConnStatus::Disconnected => "disconnected".into(),
         ConnStatus::Connecting { peer } => format!("connecting to {peer}"),
         ConnStatus::Connected { reflector, module } => {
-            format!("connected — {reflector} / {module}")
+            format!("connected: {reflector} / {module}")
         }
         ConnStatus::Disconnecting => "disconnecting…".into(),
     }

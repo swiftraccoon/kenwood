@@ -108,7 +108,7 @@ pub struct DigipeaterConfig {
     /// How long a recently-seen packet is remembered in the dedup cache.
     /// Defaults to [`DEFAULT_DEDUP_TTL`] (30 s).
     pub dedup_ttl: Duration,
-    /// Viscous delay — how long to hold a relay candidate before
+    /// Viscous delay: how long to hold a relay candidate before
     /// actually transmitting it. `0` disables the feature (default).
     ///
     /// Viscous digis defer relay for a short window so that nearby
@@ -195,13 +195,13 @@ pub enum DigiAction {
     /// Do not relay this packet (no alias matched).
     Drop,
     /// The packet was not a UI frame (the control byte does not
-    /// classify as Unnumbered Information — P/F bit permitted, so both
-    /// `0x03` and `0x13` are UI — or PID != 0xF0). APRS uses only UI
+    /// classify as Unnumbered Information (P/F bit permitted, so both
+    /// `0x03` and `0x13` are UI) or PID != 0xF0). APRS uses only UI
     /// frames, so this is effectively a pass-through.
     NotUiFrame,
-    /// Loop detected — our own callsign is already in the used path.
+    /// Loop detected: our own callsign is already in the used path.
     LoopDetected,
-    /// Duplicate packet — we already relayed this one within the TTL
+    /// Duplicate packet: we already relayed this one within the TTL
     /// window.
     Duplicate,
     /// Relay with modified digipeater path.
@@ -223,10 +223,10 @@ impl DigipeaterConfig {
     ///    Unnumbered Information via [`Ax25Packet::is_ui`] (which
     ///    accepts the P/F bit, so `0x13` counts as UI alongside the
     ///    plain `0x03`) and the PID must be `0xF0`.
-    /// 2. Own-callsign loop detection — if our callsign appears anywhere
+    /// 2. Own-callsign loop detection: if our callsign appears anywhere
     ///    in the digipeater path with the H-bit set, the packet has already
     ///    been through us and we must drop it to prevent routing loops.
-    /// 3. Dedup cache lookup — if we've relayed a packet with the same
+    /// 3. Dedup cache lookup: if we've relayed a packet with the same
     ///    source/destination/info hash within [`Self::dedup_ttl`], drop.
     /// 4. First-unused entry alias matching (`UIdigipeat`, `UIflood`,
     ///    `UItrace`).
@@ -257,7 +257,7 @@ impl DigipeaterConfig {
         // stays correct regardless of when the cache is next swept; the sweep
         // below is throttled to at most once per `dedup_ttl` purely to bound
         // memory. An entry counts as a duplicate only while younger than the
-        // TTL — a stale entry that has not yet been reclaimed is ignored.
+        // TTL; a stale entry that has not yet been reclaimed is ignored.
         self.prune_dedup(now);
         let packet_hash = hash_packet_identity(packet);
         if self
@@ -327,7 +327,7 @@ impl DigipeaterConfig {
         } = action
         {
             if self.viscous_delay > Duration::from_secs(0) {
-                // Defer the relay — hold it in the viscous queue. The
+                // Defer the relay: hold it in the viscous queue. The
                 // dedup cache is only populated once we actually
                 // transmit (in `drain_ready_viscous`).
                 let _prev = self
@@ -344,7 +344,7 @@ impl DigipeaterConfig {
     /// Remove dedup entries older than [`Self::dedup_ttl`], at most once per
     /// TTL window.
     ///
-    /// This is a memory-reclamation pass only — duplicate detection in
+    /// This is a memory-reclamation pass only; duplicate detection in
     /// [`Self::process`] is timestamp-aware and does not depend on expired
     /// entries having already been swept. Throttling the full `retain` sweep
     /// to one pass per [`Self::dedup_ttl`] keeps `process` amortized O(1) in
@@ -525,7 +525,7 @@ const fn is_used_digi(entry: &RouteEntry) -> bool {
 /// callsign field, and `N` is the *remaining* hop count carried in the SSID.
 /// Because the trailing `n` digit is part of the AX.25 callsign field, an
 /// on-wire `WIDE2-2` entry decodes (see `ax25_codec::parse_ax25`) to
-/// `callsign == "WIDE2"`, `ssid == 2` — **not** `callsign == "WIDE"`.
+/// `callsign == "WIDE2"`, `ssid == 2`, **not** `callsign == "WIDE"`.
 ///
 /// This returns `true` when `callsign` is either:
 /// - the New-N form `<base>` followed by exactly one decimal digit `1..=7`
@@ -569,7 +569,7 @@ fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a st
 /// (e.g. `"WIDE1-1"`, `"RELAY"`) without allocating.
 ///
 /// `UIdigipeat` aliases are matched as complete `CALL` or `CALL-SSID` tokens
-/// (no New-N digit synthesis — the alias is taken verbatim). The comparison
+/// (no New-N digit synthesis; the alias is taken verbatim). The comparison
 /// is ASCII-case-insensitive and mirrors the `Ax25Address` `Display` form
 /// (`CALL` when the SSID is zero, otherwise `CALL-SSID`) so it stays
 /// behaviourally identical to the previous `format!`-based check.
@@ -810,7 +810,7 @@ mod tests {
         // `WIDE7-1` (callsign "WIDE7", ssid 1) is a final traceable hop:
         // decrement to ssid 0 and mark used. (We avoid `WIDE1-1` here, which
         // the default config also lists as a verbatim UIdigipeat alias and
-        // would match with higher precedence — see the dedicated precedence
+        // would match with higher precedence; see the dedicated precedence
         // test.) Use a config whose only alias family is the "WIDE" trace
         // base so this exclusively exercises the New-N UItrace last hop.
         let mut config = DigipeaterConfig::new(
@@ -1192,7 +1192,7 @@ mod tests {
         // BUG 3 regression: the prune sweep is now amortized (throttled to
         // once per TTL), so duplicate detection must rely on the stored
         // timestamp, not on the sweep having run. A packet is a duplicate
-        // for the full TTL window and admitted once past it — even though no
+        // for the full TTL window and admitted once past it, even though no
         // sweep necessarily ran in between.
         let mut config = make_config();
         config.dedup_ttl = Duration::from_secs(30);
@@ -1267,7 +1267,7 @@ mod tests {
             DigiAction::Relay { .. }
         ));
         // With zero TTL the previous entry is pruned, so the same packet
-        // can be relayed again — pass the same instant to force the
+        // can be relayed again; pass the same instant to force the
         // pruning branch (`now.duration_since(t) < 0s` is false).
         assert!(matches!(
             config.process(&packet, t0),
@@ -1315,7 +1315,7 @@ mod tests {
     #[test]
     fn own_callsign_with_h_bit_set_is_loop_detected() {
         let mut config = make_config(); // our callsign is MYDIGI
-        // Packet already shows us as a used digi — must not be re-relayed.
+        // Packet already shows us as a used digi; must not be re-relayed.
         let packet = make_packet(vec![make_digi("MYDIGI*", 0), make_digi("WIDE2", 1)]);
         let t0 = Instant::now();
         assert_eq!(config.process(&packet, t0), DigiAction::LoopDetected);

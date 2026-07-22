@@ -5,7 +5,7 @@
 // Algorithmic reference: Pavel Yazev's `imbe_vocoder/pitch_est.cc`
 // (OP25, 2009, GPLv3). This port implements:
 //
-//   * `e_p()` — the detectability function that returns one value of
+//   * `e_p()`: the detectability function that returns one value of
 //     E(p) per candidate pitch period. A fully periodic signal at
 //     period `p` scores E(p) ≈ 0; non-periodic / aperiodic candidates
 //     score E(p) closer to 1.
@@ -22,13 +22,13 @@
 // buffer two frames of E(p) output before invoking it. The
 // zero-latency `estimate` entry point uses only look-back and, when
 // look-back's confidence threshold isn't met, falls back to a
-// single-frame global minimum over the E(p) array — better than
+// single-frame global minimum over the E(p) array: better than
 // autocorrelation + YIN on formant-rich speech, worse than the full
 // look-ahead DP.
 //
 // Q-format constants are carried from OP25's `globals.h` verbatim so
 // threshold comparisons map directly across the port. The fixed-point
-// math itself is f32 here — the overflow guards OP25 needs in Q15
+// math itself is f32 here; the overflow guards OP25 needs in Q15
 // arithmetic are implicit in f32's much larger dynamic range.
 
 //! Pitch (F0) estimation from the pitch-estimation history buffer.
@@ -37,7 +37,7 @@
 //! produces a fractional pitch period in samples and the corresponding
 //! F0 in Hz, plus a confidence score.
 //!
-//! # Algorithm — OP25 `pitch_est` port
+//! # Algorithm: OP25 `pitch_est` port
 //!
 //! For each frame, [`PitchTracker::estimate`]:
 //!
@@ -46,7 +46,7 @@
 //!    half-integer lags interpolated between them (259 values, one
 //!    per OP25 `corr[]` slot).
 //! 3. Evaluates `E(p)` over 203 candidate periods from 21 to 122
-//!    samples in 0.5-sample steps — the IMBE-native pitch grid.
+//!    samples in 0.5-sample steps, the IMBE-native pitch grid.
 //! 4. Look-back pitch search: within the allowed window
 //!    [`MIN_MAX_TBL`] indexed by `prev_pitch_idx`, find the period minimizing
 //!    `E`. If the 3-frame cumulative error (current + prev + prev-prev)
@@ -63,7 +63,7 @@
 use crate::encode::state::PITCH_EST_BUF_SIZE;
 use crate::encode::window::WI;
 
-/// OP25 `min_max_tbl[203]` — per-pitch allowed search window.
+/// OP25 `min_max_tbl[203]`: per-pitch allowed search window.
 ///
 /// Indexed by the previous frame's pitch index `prev_pitch_idx` in
 /// `0..203`. Each entry packs `(min_index, max_index)` as
@@ -106,15 +106,15 @@ const MIN_MAX_TBL: [u16; 203] = [
 const CEB_THRESHOLD: f32 = 0.48;
 
 /// Number of E(p) candidates. Corresponds to pitch periods 21.0, 21.5,
-/// 22.0, ..., 121.5, 122.0 — the OP25 index space.
+/// 22.0, ..., 121.5, 122.0, the OP25 index space.
 pub(crate) const PITCH_CANDIDATES: usize = 203;
 
 /// Default pitch index used on a fresh tracker.
 ///
 /// OP25 initializes `prev_pitch = 158` (Q15.1 format = 2 × period +
 /// 42). In our 0-based index space that's `158 − 42 = 116`, which
-/// corresponds to a period of `21 + 116 × 0.5 = 79` samples (≈100 Hz)
-/// — a reasonable baseline for unvoiced speech onset.
+/// corresponds to a period of `21 + 116 × 0.5 = 79` samples (≈100 Hz),
+/// a reasonable baseline for unvoiced speech onset.
 const PITCH_DEFAULT_IDX: usize = 116;
 
 /// Convert an OP25 pitch index (0..203) to the corresponding period
@@ -155,7 +155,7 @@ fn period_to_idx(period: f32) -> usize {
 /// Result of a pitch-estimation pass on one 20 ms frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PitchEstimate {
-    /// Pitch period in samples at 8 kHz. Fractional — either an
+    /// Pitch period in samples at 8 kHz. Fractional: either an
     /// integer or integer + 0.5 on the IMBE pitch grid.
     pub period_samples: f32,
     /// Fundamental frequency in Hz (8000 / `period_samples`).
@@ -168,7 +168,7 @@ pub struct PitchEstimate {
 }
 
 /// Per-stream pitch-tracker state, matching OP25's `pitch_est` member
-/// variables. All fields are prefixed `prev` by design — they're the
+/// variables. All fields are prefixed `prev` by design: they're the
 /// rolling history the look-back / cumulative-error tests consume.
 #[derive(Debug, Clone, Copy)]
 #[expect(
@@ -221,7 +221,7 @@ impl PitchTracker {
     pub fn estimate(&mut self, pitch_est_buf: &[f32; PITCH_EST_BUF_SIZE]) -> PitchEstimate {
         let e_p = compute_e_p(pitch_est_buf);
         if e_p.iter().all(|&v| v >= 1.0 - f32::EPSILON) {
-            // Silent buffer — hold previous state, return zero-confidence.
+            // Silent buffer: hold previous state, return zero-confidence.
             let period = idx_to_period(self.prev_pitch_idx);
             return PitchEstimate {
                 period_samples: period,
@@ -266,7 +266,7 @@ impl PitchTracker {
             // DP, which [`Self::estimate_with_lookahead`] provides when
             // callers can buffer future frames. Without the lookahead, a
             // single-frame global argmin is the best we can do without
-            // inventing data — it matches OP25 exactly whenever the true
+            // inventing data; it matches OP25 exactly whenever the true
             // pitch already sits at the global minimum (stable voiced
             // speech), and falls back gracefully to the best-scored
             // candidate otherwise.
@@ -286,13 +286,13 @@ impl PitchTracker {
         // For harmonic-rich signals, E(p) has near-zero minima at the
         // true period AND at integer multiples of it (the signal is
         // trivially also periodic at 2P, 3P, ...). Look-back alone
-        // can't break this tie — if the tracker converges on 2·P_true
+        // can't break this tie: if the tracker converges on 2·P_true
         // it keeps scoring E ≈ 0 there and never considers P_true.
         //
         // OP25 works around this by testing P_est/2, /3, /4, /5 after
         // the DP and switching to the smallest sub-multiple whose E
         // is comparable to or smaller than the current best. We do
-        // the same using the single-frame E(p) array — less precise
+        // the same using the single-frame E(p) array: less precise
         // than OP25's look-ahead-augmented cef but enough to fix the
         // 2P lock-in on voice-like signals.
         //
@@ -328,13 +328,13 @@ impl PitchTracker {
                 let cef = e_p.get(sub_idx).copied().unwrap_or(1.0);
 
                 let accept = if cef <= 0.05 {
-                    // Tier 3 — always accept small-enough sub-multiple.
+                    // Tier 3: always accept small-enough sub-multiple.
                     true
                 } else if cef <= 0.4 && cef <= 3.5 * cef_est {
-                    // Tier 2 — accept if within 3.5× of current best.
+                    // Tier 2: accept if within 3.5× of current best.
                     true
                 } else if cef <= 0.85 && cef <= 1.7 * cef_est {
-                    // Tier 1 — accept if within 1.7× of current best.
+                    // Tier 1: accept if within 1.7× of current best.
                     true
                 } else {
                     false
@@ -397,8 +397,8 @@ impl PitchTracker {
     /// [`compute_e_p`] output before invoking this method; the
     /// encoder's 40 ms effective latency is the cost.
     ///
-    /// State is advanced exactly as in the single-frame path
-    /// — `prev_pitch_idx`, `prev_e_p`, and their `prev_prev`
+    /// State is advanced exactly as in the single-frame path:
+    /// `prev_pitch_idx`, `prev_e_p`, and their `prev_prev`
     /// shadows roll forward.
     #[must_use]
     #[expect(
@@ -592,7 +592,7 @@ pub fn compute_e_p(pitch_est_buf: &[f32; PITCH_EST_BUF_SIZE]) -> [f32; PITCH_CAN
         }
     }
 
-    // L_sum = Σ(s² · w) — single-windowed energy (OP25's L_sum via
+    // L_sum = Σ(s² · w), the single-windowed energy (OP25's L_sum via
     // `L_mpy_ls(L_mult(s, s), wi)`).
     let l_sum: f32 = pitch_est_buf
         .iter()
@@ -600,12 +600,12 @@ pub fn compute_e_p(pitch_est_buf: &[f32; PITCH_EST_BUF_SIZE]) -> [f32; PITCH_CAN
         .map(|(&x, &w)| x * x * w)
         .sum();
     if l_sum < 1e-12 {
-        // Silent buffer — return "all bad" so track_single_frame
+        // Silent buffer: return "all bad" so track_single_frame
         // / estimate_with_lookahead fall into their silent branches.
         return [1.0; PITCH_CANDIDATES];
     }
 
-    // L_e0 = Σ((s·w)²) — doubly-windowed self-energy. Scaled by
+    // L_e0 = Σ((s·w)²), the doubly-windowed self-energy. Scaled by
     // 1/128 to match OP25's `L_shr(L_e0, 7)` compensation.
     let l_e0_raw: f32 = windowed.iter().map(|&x| x * x).sum();
     let l_e0 = l_e0_raw / 128.0;
@@ -700,7 +700,7 @@ mod tests {
     /// Pure tones have octave-symmetric E(p) minima (the signal is
     /// trivially also periodic at 2P, 3P, ...), so this test only
     /// asserts "within 3 samples of the true period OR within 3
-    /// samples of 2× the true period" — the remaining octave
+    /// samples of 2× the true period"; the remaining octave
     /// ambiguity is exactly what the 2-frame look-ahead DP in
     /// [`PitchTracker::estimate_with_lookahead`] resolves (this
     /// look-back-only `estimate` path forgoes it).
@@ -733,7 +733,7 @@ mod tests {
         );
     }
 
-    /// Pure sine at 200 Hz (period 40) — the look-ahead DP breaks
+    /// Pure sine at 200 Hz (period 40), where the look-ahead DP breaks
     /// the octave ambiguity that stuck the single-frame tracker on
     /// `2·P` or `P`. Feeds the same `E(p)` array for all three
     /// look-ahead slots to simulate a long steady-state sine.
@@ -761,7 +761,7 @@ mod tests {
         let est = tracker.estimate_with_lookahead(&e_p, &e_p, &e_p);
         // Valid octaves for 200 Hz at 8 kHz: 40, 80, 120. Sub-multiples
         // analysis in the DP should prefer the smallest acceptable
-        // period — 40 — since E(40) ≈ E(80) ≈ E(120) on pure sines.
+        // period (40), since E(40) ≈ E(80) ≈ E(120) on pure sines.
         let valid = [40.0_f32, 80.0, 120.0];
         let matched = valid.iter().any(|&m| (est.period_samples - m).abs() < 3.0);
         assert!(
@@ -775,7 +775,7 @@ mod tests {
     /// The DP prefers a period that scores low across ALL three
     /// frames. If frames 0 and 1 favour `P`, but frame 2 favours `2P`,
     /// cef at `P` stays low (sum of good scores) while cef at `2P` is
-    /// pulled up by frame 0/1's bad score — the DP picks P.
+    /// pulled up by frame 0/1's bad score, so the DP picks P.
     #[test]
     fn lookahead_dp_picks_pitch_stable_across_frames() {
         use super::{PITCH_CANDIDATES, compute_e_p};
@@ -795,7 +795,7 @@ mod tests {
         let e_p = compute_e_p(&buf);
 
         let est = tracker.estimate_with_lookahead(&e_p, &e_p, &e_p);
-        // Confidence should be high — 3 frames agree perfectly.
+        // Confidence should be high: 3 frames agree perfectly.
         assert!(
             est.confidence > 0.9,
             "expected high confidence on 3 matching frames, got {:.3}",
@@ -842,7 +842,7 @@ mod tests {
         let expected = 53.3_f32;
         assert!(
             (est.period_samples - expected).abs() < 3.0,
-            "period {:.2} off from 53.3 (err {:.2}) — harmonic signal \
+            "period {:.2} off from 53.3 (err {:.2}); harmonic signal \
              should break the octave tie; f0={:.1}, conf={:.3}",
             est.period_samples,
             (est.period_samples - expected).abs(),

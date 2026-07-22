@@ -10,7 +10,7 @@ use crate::header::{DStarHeader, ENCODED_LEN};
 use super::block::{SlowDataBlock, SlowDataBlockKind, SlowDataText};
 use super::scrambler::descramble;
 
-/// Maximum scratch size — slow data blocks are at most ~20 bytes,
+/// Maximum scratch size. Slow data blocks are at most ~20 bytes,
 /// and we need headroom so that a 3-byte append on a nearly-full
 /// scratch buffer can be guarded cleanly.
 const SCRATCH_SIZE: usize = 48;
@@ -75,7 +75,7 @@ impl SlowDataAssembler {
             self.type_byte = Some(t);
             // Low nibble = number of *additional* payload bytes
             // beyond the type byte itself. Reference:
-            // `ircDDBGateway/Common/SlowDataEncoder.cpp` — the
+            // `ircDDBGateway/Common/SlowDataEncoder.cpp`, where the
             // encoder packs the byte count into the low nibble.
             self.expected_len = Some(usize::from(t & 0x0F));
         }
@@ -180,9 +180,9 @@ mod tests {
     fn text_block_assembles_across_two_frames() -> TestResult {
         // Text block: byte 0 = 0x45 (text, length 5), payload = "HELLO"
         let mut asm = SlowDataAssembler::new();
-        // Frame 1: [0x45, 'H', 'E'] — type byte + 2 payload bytes
+        // Frame 1: [0x45, 'H', 'E'] = type byte + 2 payload bytes
         assert!(push_descrambled(&mut asm, [0x45, b'H', b'E']).is_none());
-        // Frame 2: ['L', 'L', 'O'] — remaining 3 payload bytes
+        // Frame 2: ['L', 'L', 'O'] = remaining 3 payload bytes
         let block = push_descrambled(&mut asm, [b'L', b'L', b'O'])
             .ok_or("expected block after second frame")?;
         assert!(
@@ -199,7 +199,7 @@ mod tests {
         assert!(push_descrambled(&mut asm, [0x34, b'T', b'E']).is_none());
         let block = push_descrambled(&mut asm, [b'S', b'T', 0x00])
             .ok_or("expected block after second frame")?;
-        // GPS doesn't trim — includes the exact 4 payload bytes.
+        // GPS doesn't trim: it includes the exact 4 payload bytes.
         assert!(
             matches!(&block, SlowDataBlock::Gps(text) if text == "TEST"),
             "expected Gps(\"TEST\"), got {block:?}"

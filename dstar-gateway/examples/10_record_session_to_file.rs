@@ -3,7 +3,7 @@
 //!
 //! Connects to a `DExtra` reflector, then taps the raw UDP socket to
 //! write every incoming datagram to `session.bin` for offline replay.
-//! The file format is intentionally minimal — each record is a big-
+//! The file format is intentionally minimal: each record is a big-
 //! endian 4-byte length followed by exactly that many bytes. The
 //! conformance harness consumes pcap rather than this format, so the
 //! output is not directly replayable: an adapter must wrap each record
@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = sock.send_to(tx.payload, tx.dst).await?;
     }
 
-    // Recv ACK. We write the ACK to the capture too — the file
+    // Recv ACK. We write the ACK to the capture too, since the file
     // records EVERY inbound datagram, including the handshake reply.
     let mut buf = [0u8; 2048];
     let (n, src) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // After the handshake we bypass the tokio shell entirely — it
+    // After the handshake we bypass the tokio shell entirely: it
     // owns the socket so we can't tap it. The tap is a pure
     // recv/drive loop that forwards bytes into the sans-io core
     // directly. This is the simplest way to tee inbound traffic.
@@ -124,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => {
-                // Timeout — let the session advance its internal
+                // Timeout: let the session advance its internal
                 // timers. No bytes to record this iteration.
                 connected.handle_timeout(Instant::now());
             }
@@ -140,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("recording complete");
 
     // Best-effort disconnect on the sans-io session. We don't
-    // unwrap the result — the recording is the point of this
+    // unwrap the result, because the recording is the point of this
     // example, so even a failing disconnect should not drop the
     // captured file on the floor.
     if let Err(e) = connected.disconnect_in_place(Instant::now()) {

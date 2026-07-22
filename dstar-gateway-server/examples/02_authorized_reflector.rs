@@ -9,7 +9,7 @@
 //!   [`RejectReason::Banned`].
 //! - Accepts everyone else with [`AccessPolicy::ReadWrite`].
 //!
-//! The example compiles hermetically — the only I/O at runtime is
+//! The example compiles hermetically; the only I/O at runtime is
 //! the reflector's own UDP bind, which happens inside `run()` and is
 //! not triggered by `cargo build --example`.
 //!
@@ -38,7 +38,7 @@ use trybuild as _;
 /// A simple banlist authorizer.
 ///
 /// Stores banned callsigns in a [`HashSet`] so lookups are O(1).
-/// Construction is infallible — an I/O failure while reading the
+/// Construction is infallible: an I/O failure while reading the
 /// banlist file falls back to an empty set and logs a warning, so
 /// the reflector still comes up.
 #[derive(Debug, Default, Clone)]
@@ -56,7 +56,7 @@ impl BanlistAuthorizer {
         let contents = match fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("could not read banlist at {path}: {e} — using empty list");
+                eprintln!("could not read banlist at {path}: {e}; using empty list");
                 return Self::default();
             }
         };

@@ -35,7 +35,7 @@ tests, cargo test --doc for doctests), docs, fmt, cargo-audit,
 cargo-deny, cargo-machete. Steps that never touch the cargo
 build lock (fmt check, audit, deny, machete, shellcheck, taplo,
 mdbook) run in the background alongside the cargo chain and
-report after it — their output is buffered, not streamed.
+report after it; their output is buffered, not streamed.
 
 Options:
   -q, --quiet    Suppress output from passing checks. Each step
@@ -52,7 +52,7 @@ Options:
                  target is mbelib-rs. Cheap workspace-wide steps
                  (unsafe audit, fmt, audit/deny/machete, shellcheck,
                  taplo) always run. A scoped pass does NOT lint the
-                 crates that depend on the target — run the full
+                 crates that depend on the target; run the full
                  gate before committing.
 
   --fix          Auto-apply mechanical fixes BEFORE running the
@@ -93,13 +93,13 @@ else
 fi
 
 # The mbelib-rs feature matrix only adds signal when mbelib-rs is in
-# scope — skip it when the gate is narrowed to some other crate.
+# scope; skip it when the gate is narrowed to some other crate.
 MBELIB_MATRIX=1
 if [ -n "$PKG" ] && [ "$PKG" != "mbelib-rs" ]; then
     MBELIB_MATRIX=0
 fi
 
-# The mdBook lives under dstar-gateway — only build it when that crate
+# The mdBook lives under dstar-gateway; only build it when that crate
 # is in scope.
 BOOK_BUILD=1
 if [ -n "$PKG" ] && [ "$PKG" != "dstar-gateway" ]; then
@@ -125,7 +125,7 @@ save_failure_log() {
     local name
     name=$(sanitise "$desc")
     mkdir -p "$FAIL_DIR"
-    # mv rather than cp — the temp is ours, moving is atomic and
+    # mv rather than cp: the temp is ours, moving is atomic and
     # avoids a second disk write.
     mv "$src" "$FAIL_DIR/${name}.log"
     printf '  (output saved to %s/%s.log)\n' "$FAIL_DIR" "$name"
@@ -233,19 +233,19 @@ fi
 # for every `[lints] workspace = true` crate, but the override crates
 # (thd75, thd75-tui, lodestar-core) weaken or omit that lint, and
 # thd75's source-level `#![deny(unsafe_code)]` guards only its lib
-# target — probes/examples/tests are separate compilation units. This
+# target; probes/examples/tests are separate compilation units. This
 # audit closes those gaps by scanning the tree directly:
 #
-# 1. `unsafe_code` suppression markers — `allow(unsafe_code)` or
+# 1. `unsafe_code` suppression markers: `allow(unsafe_code)` or
 #    `expect(unsafe_code)` in any form, including the multi-line
 #    attribute style where `unsafe_code,` sits on its own line.
 # 2. The `unsafe` keyword itself (blocks, fns, extern, attributes).
 #    Comment-only lines are excluded; a mention inside a string still
-#    trips the audit — a loud false positive beats a silent miss.
+#    trips the audit; a loud false positive beats a silent miss.
 #
 # Allowlist (each entry is a deliberate design decision):
-#   thd75/src/transport/bluetooth.rs — IOBluetooth RFCOMM FFI
-#   thd75-tui/src/main.rs            — CFRunLoop pump for IOBluetooth
+#   thd75/src/transport/bluetooth.rs: IOBluetooth RFCOMM FFI
+#   thd75-tui/src/main.rs:           CFRunLoop pump for IOBluetooth
 check_unsafe_audit() {
     local allowlist='thd75/src/transport/bluetooth\.rs|thd75-tui/src/main\.rs'
     local suppressions keyword
@@ -271,6 +271,46 @@ check_unsafe_audit() {
 }
 
 run_inline "unsafe audit (workspace-wide)" check_unsafe_audit
+
+# ---------- em-dash ban ----------
+# House style: no em dashes (U+2014) in committed prose, meaning doc
+# comments, code comments, READMEs, markdown, shell/TOML/YAML comments,
+# and user-facing string literals. Punctuation is chosen per sentence
+# (semicolon between independent clauses, colon before elaboration,
+# comma pair or parentheses for an aside, or a reword), so a mechanical
+# hyphen swap is never the fix. En dash ranges and box-drawing
+# separators are unaffected: only U+2014 is banned.
+#
+# The pattern is assembled from its UTF-8 bytes rather than written
+# literally, so this file does not trip its own check.
+#
+# TRACKED files only: in-flight untracked scratch must not redden the
+# gate. Outside a git checkout (the CI pods receive a tarball) the list
+# is empty and the step passes vacuously.
+#
+# Exempt, because their bytes are a contract rather than prose:
+#   thd75/data/mcp_d75_menu_schema.json  generated menu manifest
+#   thd75/src/memory/menu_fields.rs      generated field registry
+#   mcp-d75-extract/tests/fixtures/      pinned decompilation fixtures
+check_em_dashes() {
+    local exempt='^thd75/data/mcp_d75_menu_schema\.json$|^thd75/src/memory/menu_fields\.rs$|^mcp-d75-extract/tests/fixtures/'
+    local em files hits
+    em=$(printf '\342\200\224')
+    files=$(git ls-files 2>/dev/null | grep -vE "$exempt" || true)
+    [ -n "$files" ] || return 0
+    hits=$(printf '%s\n' "$files" | tr '\n' '\0' | \
+        xargs -0 grep -HnIF -- "$em" 2>/dev/null || true)
+    if [ -n "$hits" ]; then
+        echo "ERROR: em dash (U+2014) in committed prose."
+        echo "Use a semicolon between independent clauses, a colon before an"
+        echo "elaboration, commas or parentheses for an aside, or reword."
+        echo "$hits"
+        return 1
+    fi
+    return 0
+}
+
+run_inline "em-dash ban (tracked files)" check_em_dashes
 
 # ---------- required external tools ----------
 # A missing tool is a hard failure; partial gating is worse than no
@@ -308,7 +348,7 @@ run_inline "required tools present" check_required_tools
 # taplo and mdbook don't invoke cargo at all), so they run concurrently
 # with the cargo chain below instead of serially after it. Their output
 # is captured per step and reported by join_static_group after the
-# cargo chain finishes — buffered, never interleaved with cargo output.
+# cargo chain finishes: buffered, never interleaved with cargo output.
 #
 # Each step writes four files into $BG_DIR keyed by index: .desc, .log,
 # .status, .time. The parent reads those at join time; passing state
@@ -357,7 +397,7 @@ static_group() {
     # compile-fail suites generate scratch crates under `target/` whose
     # manifests list every dev-dependency and use almost none of them.
     # Machete's directory walk only skips them by way of `.gitignore`,
-    # which it honours ONLY inside a git checkout — so without this flag
+    # which it honours ONLY inside a git checkout, so without this flag
     # the check passes here and fails anywhere the tree is built without
     # `.git` (the CI pods, which receive a tarball). It also keeps the
     # walk clear of the cargo chain writing target/ concurrently.
@@ -415,7 +455,7 @@ join_static_group() {
 run cargo clippy "${SCOPE[@]}" --all-targets -- -D warnings
 
 # Clippy again with every feature on. `--all-targets` does NOT reach a
-# target whose `required-features` are disabled — Cargo skips those
+# target whose `required-features` are disabled; Cargo skips those
 # silently, with no warning. Without this pass the network-gated
 # dstar-gateway examples, the hardware-tests integration test, and the
 # thd75-repl `testing` module are never compiled by any gate, and rot
@@ -423,7 +463,7 @@ run cargo clippy "${SCOPE[@]}" --all-targets -- -D warnings
 run cargo clippy "${SCOPE[@]}" --all-targets --all-features -- -D warnings
 
 # Feature-specific clippy: `--all-features` turns on `kenwood-tables`,
-# which implies `encoder` — so the encoder-only combination is still
+# which implies `encoder`, so the encoder-only combination is still
 # unexercised above. Run each advertised feature set on its own.
 if [ "$MBELIB_MATRIX" -eq 1 ]; then
     run cargo clippy -p mbelib-rs --all-targets --features encoder -- -D warnings
@@ -445,7 +485,7 @@ if [ "$MBELIB_MATRIX" -eq 1 ]; then
 fi
 
 # Doctests. Cargo cannot cache these: every run recompiles each
-# crate's merged doctest binary, serially, crate by crate — this is
+# crate's merged doctest binary, serially, crate by crate; this is
 # the warm gate's floor (~75s workspace-wide) and the reason the
 # executable tests moved to nextest rather than everything.
 #
@@ -461,7 +501,7 @@ doc_tests_scoped() {
     fi
     if printf '%s' "$out" | grep -q 'no library targets found'; then
         printf '%s\n' "$out"
-        echo "(bin-only package: no lib target, so no doctests — skipped)"
+        echo "(bin-only package: no lib target, so doctests are skipped)"
         return 0
     fi
     printf '%s\n' "$out"

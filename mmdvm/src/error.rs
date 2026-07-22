@@ -7,7 +7,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ShellError {
-    /// The session task has exited — consumer handle received a
+    /// The session task has exited; the consumer handle received a
     /// closed channel.
     #[error("MMDVM session task has exited")]
     SessionClosed,

@@ -4,7 +4,7 @@
 //! Demonstrates the [`dstar_gateway::blocking_shell::BlockingSession`]
 //! entry point for consumers that don't want to run a tokio runtime.
 //! Tokio remains a dependency of the parent async crate. The main
-//! loop is a regular `fn main()` — no
+//! loop is a regular `fn main()`: no
 //! `#[tokio::main]`, no `async fn`, no channels.
 //!
 //! The blocking shell is caller-driven: each call to
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("resolve failed")?;
     let sock = UdpSocket::bind("0.0.0.0:0")?;
     sock.set_read_timeout(Some(Duration::from_secs(2)))?;
-    sock.connect(peer)?; // optional — lets send() drop the address
+    sock.connect(peer)?; // optional: lets send() drop the address
 
     // 2. Typestate handshake, synchronously.
     let session: Session<DExtra, Configured> = Session::<DExtra, Configured>::builder()
@@ -99,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Print events for 30 seconds, one step at a time. A real
     //    CLI would install a SIGINT handler here and break out of
-    //    the loop when it fires. No-event steps are a quiet path —
+    //    the loop when it fires. No-event steps are a quiet path:
     //    the shell's internal 100 ms idle wait already throttles
     //    CPU, so we simply loop back to the next call.
     let deadline = Instant::now() + Duration::from_secs(30);

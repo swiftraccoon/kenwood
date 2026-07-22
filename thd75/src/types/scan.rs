@@ -25,7 +25,7 @@
 
 use super::Frequency;
 
-/// Scan resume method — controls how the radio resumes scanning after
+/// Scan resume method: controls how the radio resumes scanning after
 /// stopping on an active signal.
 ///
 /// Configured via Menu No. 130 (analog) or Menu No. 131 (digital DV/DR)
@@ -91,7 +91,7 @@ impl TryFrom<u8> for ScanResumeMethod {
     }
 }
 
-/// Scan type — the different scanning modes available on the TH-D75.
+/// Scan type: the different scanning modes available on the TH-D75.
 ///
 /// The active scan type depends on the current radio mode (VFO vs Memory)
 /// and the key sequence used to start the scan.
@@ -156,7 +156,7 @@ pub enum VisualRange {
     Wide,
 }
 
-/// Program scan edges — lower and upper frequency limits for program scan.
+/// Program scan edges: lower and upper frequency limits for program scan.
 ///
 /// These correspond to the Programmable VFO settings (Menu No. 100),
 /// which define the lower and upper tunable frequency boundaries.

@@ -8,7 +8,7 @@
 //!   - PF-key assignment block: MCP 0x107A..=0x107E (front PF1/2, mic PF1/2/3)
 //!   - "Screen Capture" function byte: 0x1F
 //!
-//! This is an *off-menu* assignment — the radio's Menu 940 never offers
+//! This is an *off-menu* assignment: the radio's Menu 940 never offers
 //! Screen Capture for a front-panel key. The probe exists to test whether
 //! the firmware dispatch honours it regardless.
 //!

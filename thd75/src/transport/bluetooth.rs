@@ -92,8 +92,8 @@ mod inner {
 
             let c_name = std::ffi::CString::new(name).map_err(|_| TransportError::NotFound)?;
             // SAFETY: `bt_rfcomm_open` takes a NUL-terminated C string pointer (which
-            // `CString::as_ptr` guarantees for the `CString`'s lifetime — valid through
-            // this call) and a channel number. Returns a handle or NULL. We check for
+            // `CString::as_ptr` guarantees for the `CString`'s lifetime, so it is valid
+            // through this call) and a channel number. Returns a handle or NULL. We check for
             // NULL immediately below.
             let handle = unsafe { bt_rfcomm_open(c_name.as_ptr(), SPP_CHANNEL) };
             if handle.is_null() {
@@ -101,13 +101,13 @@ mod inner {
             }
 
             // SAFETY: `handle` is non-null (checked above) and was produced by the
-            // paired `bt_rfcomm_open` above — guaranteed to be a valid handle for the
+            // paired `bt_rfcomm_open` above, so it is a valid handle for the
             // lifetime until we call `bt_rfcomm_close`. `bt_rfcomm_read_fd` returns
             // -1 on failure; we check immediately.
             let read_fd = unsafe { bt_rfcomm_read_fd(handle) };
             if read_fd < 0 {
                 // SAFETY: `handle` is non-null (checked above) and was produced by
-                // `bt_rfcomm_open` in this same function — the pairing invariant is
+                // `bt_rfcomm_open` in this same function; the pairing invariant is
                 // trivially preserved because we have not yet escaped this function.
                 unsafe { bt_rfcomm_close(handle) };
                 return Err(TransportError::NotFound);
@@ -143,7 +143,7 @@ mod inner {
             tracing::debug!(bytes = data.len(), "BT write");
             // `writeSync:` blocks the calling OS thread until the peer
             // acknowledges. BT runs on a current-thread runtime, so
-            // calling it inline would park the ONLY runtime thread —
+            // calling it inline would park the ONLY runtime thread,
             // including tokio's timer, meaning command timeouts could
             // never fire during exactly the stall they exist for. Run
             // it on the blocking pool instead.
@@ -151,7 +151,7 @@ mod inner {
             let owned = data.to_vec();
             let ret = tokio::task::spawn_blocking(move || {
                 // SAFETY: `handle_addr` is the live handle from
-                // `bt_rfcomm_open` — `&mut self` is borrowed across
+                // `bt_rfcomm_open`. `&mut self` is borrowed across
                 // this await, so `close()`/`Drop` cannot run
                 // concurrently through this transport; and even if
                 // this future is cancelled (detaching the blocking
@@ -185,7 +185,7 @@ mod inner {
 
         async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
             loop {
-                // SAFETY: Parameterless CFRunLoop tick — see the corresponding block in
+                // SAFETY: Parameterless CFRunLoop tick; see the corresponding block in
                 // `write()` above. Pumped inside the loop so IOBluetooth callbacks
                 // deliver bytes into the pipe before we attempt to read from it.
                 unsafe { bt_pump_runloop() };
@@ -201,7 +201,7 @@ mod inner {
                     #[expect(
                         clippy::cast_sign_loss,
                         reason = "`libc::read` returns `ssize_t` where the positive branch \
-                                  (`r > 0`) is guaranteed to fit in usize by the POSIX spec — \
+                                  (`r > 0`) is guaranteed to fit in usize by the POSIX spec; \
                                   it cannot exceed the caller's buffer length. Guarded by the \
                                   preceding `if r > 0` branch."
                     )]
@@ -291,7 +291,7 @@ mod inner {
         unsafe extern "C" {
             fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
         }
-        // SAFETY: Forwarded from the function's own safety contract — the caller
+        // SAFETY: Forwarded from the function's own safety contract; the caller
         // guaranteed `fd` is valid and `(buf, len)` is a writable buffer of `len`
         // bytes.
         unsafe { read(fd, buf, len) }

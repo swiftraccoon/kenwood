@@ -4,18 +4,18 @@ APRS-IS (APRS Internet Service) TCP client. Tokio shell, depends on [`aprs`](../
 
 ## Scope
 
-- `AprsIsClient` — connect (with retry), login, 120 s keepalive, next-event loop, send-packet, shutdown.
-- `AprsIsConfig` — callsign, passcode, server, port, optional filter, software-name and -version strings. (Connect timeout and keepalive interval are module constants `CONNECT_TIMEOUT` / `KEEPALIVE_INTERVAL`, not config fields.)
-- `aprs_is_passcode(callsign: &str) -> i32` — the standard two-byte-XOR hash.
-- `build_login_string(&AprsIsConfig) -> Result<String, AprsIsError>` — `user <call> pass <code> vers <sw> <ver> [filter <spec>]` (errors on login fields with whitespace/control characters, or a filter containing `CR`/`LF`).
-- `AprsIsFilter` — a `#[non_exhaustive]` enum covering the APRS-IS filter clause types (range, area, prefix, budlist, object, strict-object, type, type-around, symbol, digi, entry, q-construct, my-range, group, friend, unproto, negation, and raw). `as_wire()` renders one clause; `join()` concatenates a slice into a filter string; `negated()` / `raw()` construct the negation and passthrough variants.
-- `QConstruct` — qAC / qAX / qAU / qAo / qAO / qAS / qAr / qAR / qAZ / qAI classification, `format_is_packet_with_qconstruct` for basic q-construct appending, and `igate_format_for_is` for the full q.aspx IGate path-rewriting algorithm.
-- `AprsIsLine` + `parse_is_line` — TNC2 monitor-format parser.
-- `format_is_packet` — outbound line formatter.
+- `AprsIsClient`: connect (with retry), login, 120 s keepalive, next-event loop, send-packet, shutdown.
+- `AprsIsConfig`: callsign, passcode, server, port, optional filter, software-name and -version strings. (Connect timeout and keepalive interval are module constants `CONNECT_TIMEOUT` / `KEEPALIVE_INTERVAL`, not config fields.)
+- `aprs_is_passcode(callsign: &str) -> i32`: the standard two-byte-XOR hash.
+- `build_login_string(&AprsIsConfig) -> Result<String, AprsIsError>`: `user <call> pass <code> vers <sw> <ver> [filter <spec>]` (errors on login fields with whitespace/control characters, or a filter containing `CR`/`LF`).
+- `AprsIsFilter`: a `#[non_exhaustive]` enum covering the APRS-IS filter clause types (range, area, prefix, budlist, object, strict-object, type, type-around, symbol, digi, entry, q-construct, my-range, group, friend, unproto, negation, and raw). `as_wire()` renders one clause; `join()` concatenates a slice into a filter string; `negated()` / `raw()` construct the negation and passthrough variants.
+- `QConstruct`: qAC / qAX / qAU / qAo / qAO / qAS / qAr / qAR / qAZ / qAI classification, `format_is_packet_with_qconstruct` for basic q-construct appending, and `igate_format_for_is` for the full q.aspx IGate path-rewriting algorithm.
+- `AprsIsLine` + `parse_is_line`: TNC2 monitor-format parser.
+- `format_is_packet`: outbound line formatter.
 
 ## Scope boundaries
 
-APRS parsing is in [`aprs`](../aprs/). This crate is the network adapter only — it does not decode APRS info fields itself; callers hand `AprsIsLine::parse`'d output to the `aprs` parser.
+APRS parsing is in [`aprs`](../aprs/). This crate is the network adapter only; it does not decode APRS info fields itself, and callers hand `AprsIsLine::parse`'d output to the `aprs` parser.
 
 ## Status
 

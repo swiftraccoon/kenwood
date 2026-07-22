@@ -11,7 +11,7 @@
 //!
 //! - **One self-contained line per datum.** Screen readers navigate
 //!   line-by-line; each line must make sense without context from
-//!   adjacent lines. No indented sub-items — repeat the label.
+//!   adjacent lines. No indented sub-items; repeat the label.
 //! - **Label-colon-value format.** Every response starts with a label
 //!   (e.g. "Band A frequency: 146.52 megahertz"). WCAG 1.3.1.
 //! - **Natural language units.** Say "megahertz" not "MHz", "on"/"off"
@@ -125,7 +125,7 @@ pub(crate) async fn frequency<T: Transport>(radio: &mut Radio<T>, args: &[&str])
 /// Read or set the TNC protocol mode. Args: `[aprs|kiss] [1200|9600]`.
 ///
 /// With no arguments, reads the current mode and speed. Setting KISS
-/// here only changes the mode flag — use `aprs start` for a managed
+/// here only changes the mode flag; use `aprs start` for a managed
 /// KISS session. APRS mode hands packet operation to the radio's own
 /// firmware.
 pub(crate) async fn tnc_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
@@ -341,7 +341,7 @@ pub(crate) async fn step_down<T: Transport>(radio: &mut Radio<T>, args: &[&str])
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "Frequencies are entered in megahertz (e.g. 146.52), multiplied by 1_000_000 to yield \
-              at most ~1.3e9 — well within u32 range. The parsed f64 is validated finite and \
+              at most ~1.3e9, well within u32 range. The parsed f64 is validated finite and \
               positive above, so the `as u32` truncation and sign-loss are both fine."
 )]
 pub(crate) async fn tune<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
@@ -931,7 +931,7 @@ pub(crate) async fn ifout<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 /// start of a session: model, firmware, battery, clock, key lock,
 /// dual-band, bluetooth, VOX, and for each band the frequency, mode,
 /// transmit power, squelch, attenuator, and signal meter. Each read
-/// is independent — a failing call prints a `"not available"` line
+/// is independent: a failing call prints a `"not available"` line
 /// and the dump continues with the next field instead of aborting.
 ///
 /// S-meter polls are defensive: the D75 firmware occasionally

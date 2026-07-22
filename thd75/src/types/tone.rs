@@ -31,7 +31,7 @@ use crate::error::ValidationError;
 /// 196.6, 199.5) and high-frequency tones (210.7-254.1 Hz).
 ///
 /// Index 50 (1750.0 Hz) is the European repeater access tone burst,
-/// confirmed by ARFC-D75 decompilation. It is NOT a CTCSS tone — it is
+/// confirmed by ARFC-D75 decompilation. It is NOT a CTCSS tone; it is
 /// a short audio-frequency burst used to open European repeaters.
 ///
 /// This table corresponds to **KI4LAX TABLE A** in the CAT command
@@ -66,7 +66,7 @@ pub const DCS_CODES: [u16; 104] = [
 ///
 /// Wraps a `u8` index in the range 0..=50. Indices 0-49 are standard
 /// CTCSS sub-audible tones. Index 50 is the 1750 Hz tone burst used for
-/// European repeater access — it is NOT a CTCSS tone but a short
+/// European repeater access; it is NOT a CTCSS tone but a short
 /// audio-frequency burst. Confirmed by ARFC-D75 decompilation.
 ///
 /// Use [`ToneCode::frequency_hz`] to look up the corresponding frequency.
@@ -77,7 +77,7 @@ impl ToneCode {
     /// Maximum valid tone code index (inclusive).
     pub const MAX_INDEX: u8 = 50;
 
-    /// 100.0 Hz CTCSS tone (index 12 in the TH-D75 codebook) — the APRS
+    /// 100.0 Hz CTCSS tone (index 12 in the TH-D75 codebook), the APRS
     /// voice-alert default per TH-D75 Operating Tips §5.13.
     pub const TONE_100HZ: Self = Self(12);
 

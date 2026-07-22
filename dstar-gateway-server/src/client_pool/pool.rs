@@ -2,7 +2,7 @@
 //!
 //! Keyed by `SocketAddr` (the only stable identifier for a UDP
 //! client). Wrapped in [`tokio::sync::Mutex`] so multiple tokio tasks
-//! can update concurrently — this is intentionally simple for Batch
+//! can update concurrently. This is intentionally simple for Batch
 //! 2; we can swap to a sharded map if contention is observed.
 
 use std::collections::{HashMap, HashSet};
@@ -28,7 +28,7 @@ pub const DEFAULT_UNHEALTHY_THRESHOLD: u32 = 5;
 /// Outcome of a [`ClientPool::mark_unhealthy`] call.
 ///
 /// Tells the caller whether the peer is still within its failure
-/// budget or has crossed the eviction threshold — in which case the
+/// budget or has crossed the eviction threshold, in which case the
 /// fan-out engine should remove the peer and emit a
 /// [`ServerEvent::ClientEvicted`] event.
 ///
@@ -51,7 +51,7 @@ pub enum UnhealthyOutcome {
 /// One pool entry as seen by the endpoint's periodic maintenance
 /// sweep.
 ///
-/// Snapshot produced by [`ClientPool::sweep_snapshot`] — carries
+/// Snapshot produced by [`ClientPool::sweep_snapshot`]. It carries
 /// everything the sweep needs to decide idle eviction
 /// (`last_heard`) and to encode per-protocol server-initiated
 /// keepalives (module membership plus the linked client's identity).
@@ -129,7 +129,7 @@ impl<P: Protocol> ClientPool<P> {
     /// # Cancellation safety
     ///
     /// This method is **not** cancel-safe for the same reason as
-    /// [`Self::insert`] — it touches the forward and reverse maps in
+    /// [`Self::insert`]: it touches the forward and reverse maps in
     /// sequence and cancellation between the two awaits leaves a
     /// stale module-index entry.
     pub async fn remove(&self, peer: &SocketAddr) -> Option<ClientHandle<P>> {
@@ -225,7 +225,7 @@ impl<P: Protocol> ClientPool<P> {
     /// whether the peer should now be evicted.
     ///
     /// Returns [`UnhealthyOutcome::StillHealthy`] with `failure_count`
-    /// `0` if the peer is not present — callers should treat that as
+    /// `0` if the peer is not present; callers should treat that as
     /// "no increment happened" rather than "counter reset".
     ///
     /// The eviction threshold is [`DEFAULT_UNHEALTHY_THRESHOLD`]. Once
@@ -302,7 +302,7 @@ impl<P: Protocol> ClientPool<P> {
     /// Returns `true` on success (the fan-out engine may send this
     /// frame to the peer); returns `false` if the bucket is empty
     /// (the frame must be dropped for this peer). Returns `false`
-    /// if the peer is not in the pool — no handle means no budget.
+    /// if the peer is not in the pool: no handle means no budget.
     ///
     /// The `now` argument is the caller's injected wall-clock
     /// instant and is used to drive the token bucket's refill
@@ -496,7 +496,7 @@ mod tests {
         let later = Instant::now() + std::time::Duration::from_secs(5);
         pool.record_last_heard(&peer(30001), later).await;
         // `last_heard` is load-bearing for the endpoint's
-        // keepalive-inactivity eviction sweep — assert the write
+        // keepalive-inactivity eviction sweep; assert the write
         // actually landed.
         let heard = pool
             .with_handle_mut(&peer(30001), |handle| handle.last_heard)

@@ -13,8 +13,8 @@
 //! - [`QConstruct`] Q-construct classification.
 //! - [`igate_format_for_is`] full `IGate` gating implementing the
 //!   q.aspx algorithm (refuses to gate on `NOGATE`/`RFONLY`/`TCPIP`/
-//!   `TCPXX`/loop, gates the heard path verbatim — preserving unused
-//!   digipeaters and `*` markers — and selects `qAR`/`qAO` from the
+//!   `TCPXX`/loop, gates the heard path verbatim (preserving unused
+//!   digipeaters and `*` markers), and selects `qAR`/`qAO` from the
 //!   login state). For basic q-construct appending see
 //!   [`format_is_packet_with_qconstruct`].
 //! - [`parse_is_line`] TNC2 monitor-format parser.

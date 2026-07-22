@@ -3,25 +3,25 @@
 //! This module defines a three-level error hierarchy that mirrors the
 //! library's architecture:
 //!
-//! 1. **[`enum@Error`]** — The top-level enum returned by all public API
+//! 1. **[`enum@Error`]**: the top-level enum returned by all public API
 //!    methods. It wraps the three lower-level categories below, plus
 //!    radio-specific conditions like [`Error::RadioError`] (`?` response),
 //!    [`Error::NotAvailable`] (`N` response), [`Error::Timeout`], and
 //!    MCP memory-related errors.
 //!
-//! 2. **[`TransportError`]** — Failures in the serial/Bluetooth I/O
+//! 2. **[`TransportError`]**: failures in the serial/Bluetooth I/O
 //!    layer. These occur when opening, reading from, or writing to the
 //!    serial port. A `TransportError` generally means the physical link
 //!    is broken or was never established. Wrapped by
 //!    [`Error::Transport`].
 //!
-//! 3. **[`ProtocolError`]** — Failures in CAT command framing and
+//! 3. **[`ProtocolError`]**: failures in CAT command framing and
 //!    parsing. These occur when the radio sends a response that cannot
 //!    be decoded: wrong field count, unparseable field value, unknown
 //!    command prefix, or a malformed frame (e.g., missing `\r`
 //!    terminator). Wrapped by [`Error::Protocol`].
 //!
-//! 4. **[`ValidationError`]** — Failures when a caller-supplied value
+//! 4. **[`ValidationError`]**: failures when a caller-supplied value
 //!    is outside the valid range for its type (e.g., band index > 13,
 //!    tone code > 49, power level > 3). These are raised **before** any
 //!    I/O occurs, during construction of typed wrappers. Wrapped by
@@ -54,7 +54,7 @@ pub enum Error {
     #[error("radio returned error response")]
     RadioError,
 
-    /// The radio returned "not available" (`N\r`) — command not supported in current mode.
+    /// The radio returned "not available" (`N\r`): command not supported in current mode.
     #[error("command not available in current radio mode")]
     NotAvailable,
 
@@ -112,7 +112,7 @@ pub enum Error {
     },
 
     /// A frequency tune was written but the radio's readback shows a
-    /// different frequency — the radio silently clamped or rejected
+    /// different frequency, meaning the radio silently clamped or rejected
     /// the write (typically an out-of-band value or wrong mode).
     #[error("frequency readback mismatch: wrote {expected} Hz, radio reports {actual} Hz")]
     FrequencyReadbackMismatch {
@@ -135,9 +135,9 @@ pub enum Error {
 
     /// An MCP programming session was interrupted (its future was
     /// cancelled mid-transfer). The radio may still be in PROG MCP mode
-    /// where CAT commands do not work — call
+    /// where CAT commands do not work, so call
     /// `Radio::recover_from_interrupted_mcp` first.
-    #[error("MCP session interrupted; radio may be in programming mode — recover first")]
+    #[error("MCP session interrupted; radio may be in programming mode. Recover first")]
     McpInterrupted,
 }
 
@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn validation_error_display() {
-        // 50 (the 1750 Hz tone burst) is VALID — the message must
+        // 50 (the 1750 Hz tone burst) is VALID, so the message must
         // state the real accepted range.
         let err = ValidationError::ToneCodeOutOfRange(51);
         assert_eq!(err.to_string(), "tone code 51 out of range (must be 0-50)");

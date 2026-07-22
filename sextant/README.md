@@ -1,11 +1,11 @@
 # sextant
 
 Desktop GUI client for D-STAR reflectors (`DExtra` / `DPlus` / `DCS`).
-Companion to the POLARIS test reflector — exercises the full
+Companion to the POLARIS test reflector, exercising the full
 laptop-only `dstar-gateway` + `mbelib-rs` encode/decode pipeline with
 no radio in the loop.
 
-**WIP — protocol details and audio quality still churn. Fine for
+**WIP: protocol details and audio quality still churn. Fine for
 listening; treat transmit as experimental.**
 
 ![Sextant operator page: hero callsign readout, heard-station list, and transmit strip](operator.png)
@@ -32,14 +32,14 @@ listening; treat transmit as experimental.**
 
 One window, two pages, toggled in the header:
 
-- **Operator** — the everyday face. A hero display shows who is
+- **Operator**: the everyday face. A hero display shows who is
   talking right now (callsign, slow-data text, GPS, elapsed time,
   loss), with the heard list beside it and a transmit strip along the
   bottom (TRANSMIT toggle, mic meter, slow-data message, GPS beacon).
   Clicking the reflector name in the header opens the connect sheet:
   a searchable directory with favorites and recents first, and a
   collapsed manual host form for unlisted reflectors.
-- **Debug** — the engineering surface. Timestamped, filterable event
+- **Debug**: the engineering surface. Timestamped, filterable event
   log with copy-to-clipboard, live stream statistics, TX test tools
   (silence, WAV), and audio device controls.
 
@@ -50,7 +50,7 @@ persistence, audio devices. Errors appear as a dismissable strip
 under the header on both pages. Color is used as signal only: amber
 means live RF, red means you are transmitting, green means the link
 is healthy. The dark instrument theme embeds the Inter and JetBrains
-Mono fonts (both SIL OFL — license texts in `assets/`).
+Mono fonts (both SIL OFL; license texts in `assets/`).
 
 ## Usage
 
@@ -61,18 +61,18 @@ cargo run -p sextant
 ### macOS: microphone permission
 
 Unbundled CLI binaries (like `cargo run`) don't get their own mic
-permission prompt — they inherit from the Terminal that launched
+permission prompt; they inherit from the Terminal that launched
 them.  If mic capture goes silent, stop transmitting and look for the
-`TX mic-level summary:` line in the logs — a `MIC LIKELY DENIED`
+`TX mic-level summary:` line in the logs; a `MIC LIKELY DENIED`
 diagnosis on that line means macOS has denied access.
 
-**Fastest fix** — grant your terminal permission once:
+**Fastest fix** is to grant your terminal permission once:
 
 1. System Settings > Privacy & Security > Microphone
 2. Enable the toggle for Terminal / iTerm / whichever shell you use
 3. Restart the terminal, rerun `cargo run -p sextant`
 
-**Cleaner fix** — run sextant as a proper `.app` bundle with its own
+**Cleaner fix** is to run sextant as a proper `.app` bundle with its own
 Info.plist declaring `NSMicrophoneUsageDescription`:
 
 ```text
@@ -85,13 +85,13 @@ Terminal).  You can revoke/grant later under Privacy & Security.
 
 ### End-to-end test against POLARIS
 
-Two terminals — server then client:
+Two terminals, server then client:
 
 ```text
-# Terminal 1 — start the local reflector
+# Terminal 1: start the local reflector
 cargo run -p dstar-gateway-server --bin polaris
 
-# Terminal 2 — launch the GUI
+# Terminal 2: launch the GUI
 cargo run -p sextant
 ```
 
@@ -100,7 +100,7 @@ In the GUI:
 1. Open the gear (top right) and set **Callsign** to your own
    (≤ 8 ASCII chars, uppercase).
 2. Click the reflector name in the header (or **Open directory** on
-   the not-linked screen) and pick **POLARIS** — it's bundled, no
+   the not-linked screen) and pick **POLARIS**; it's bundled, no
    fetch needed. Clicking a row connects immediately.
 3. Click **TRANSMIT** (or hold **Space**) to start transmitting
    (mic audio → AMBE → reflector). Click again / release to stop
@@ -109,7 +109,7 @@ In the GUI:
    transmitting on your module plays through your speakers and
    lights up the hero display.
 
-A second client is needed to hear yourself — `thd75-repl` can link
+A second client is needed to hear yourself: `thd75-repl` can link
 to `POLARIS` identically, or run a second `sextant` instance.
 
 ## Architecture

@@ -67,7 +67,7 @@ const C1_OFFSET: usize = 24;
 /// D-STAR bit interleave table: input bit index to flat `ambe_fr` index.
 ///
 /// Derived from the DSD `dW[72]` and `dX[72]` tables (`dstar_const.h`).
-/// For each input bit `i` (0..72, LSB-first from the 9-byte frame —
+/// For each input bit `i` (0..72, LSB-first from the 9-byte frame:
 /// bit `i % 8` of byte `i / 8`), `INTERLEAVE[i]` gives the flat
 /// `ambe_fr` index where that bit belongs.
 ///
@@ -668,7 +668,7 @@ mod tests {
         unpack_frame(&ambe, &mut ambe_fr);
 
         // Verify each input bit. LSB-first: input bit i is bit (i % 8)
-        // of its byte, and 0xAA has odd bit positions set — so
+        // of its byte, and 0xAA has odd bit positions set, so
         // odd-indexed input bits are 1, even-indexed are 0.
         for input_bit in 0..72_usize {
             let is_set = (input_bit % 2) == 1;

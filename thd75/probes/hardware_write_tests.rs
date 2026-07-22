@@ -12,7 +12,7 @@
 //!
 //! Run: cargo test --test hardware_write_tests -- --ignored --nocapture --test-threads=1
 //!
-//! REVIEW BEFORE RUNNING — these modify real radio settings (temporarily).
+//! REVIEW BEFORE RUNNING: these modify real radio settings (temporarily).
 
 use kenwood_thd75::protocol::Command;
 use kenwood_thd75::radio::Radio;
@@ -28,7 +28,7 @@ async fn connect() -> Radio<SerialTransport> {
 }
 
 // ============================================================
-// SAFE WRITE TESTS — cosmetic / non-destructive settings
+// SAFE WRITE TESTS: cosmetic / non-destructive settings
 // ============================================================
 
 /// Test: AF gain (volume) can be written and read back.
@@ -48,7 +48,7 @@ async fn write_af_gain() {
     println!("  Writing AF gain: {new_value}");
     radio.set_af_gain(Band::A, new_value).await.unwrap();
 
-    // Read back — must be the new value
+    // Read back; must be the new value
     let readback = radio.get_af_gain().await.unwrap();
     println!("  Readback AF gain: {readback}");
     assert_eq!(readback, new_value, "AF gain write did not take effect");
@@ -217,7 +217,7 @@ async fn write_dual_band() {
 }
 
 // ============================================================
-// RADIO PARAMETER WRITES — mode, power, step, tone
+// RADIO PARAMETER WRITES: mode, power, step, tone
 // ============================================================
 
 /// Test: Operating mode can be changed (FM <-> NFM).
@@ -336,11 +336,11 @@ async fn write_auto_info() {
 }
 
 // ============================================================
-// FO WRITE — full channel data round-trip
+// FO WRITE: full channel data round-trip
 // ============================================================
 
 /// Test: Write full channel data via FO, read back, verify all fields.
-/// This is the ultimate write test — FO carries all 21 fields.
+/// This is the ultimate write test: FO carries all 21 fields.
 /// Safe: we read current state, modify only the step size (cosmetic),
 /// write it back, verify, then restore.
 #[tokio::test]
@@ -358,7 +358,7 @@ async fn write_fo_full_channel() {
         original.urcall.as_str()
     );
 
-    // Create modified copy — change step size (harmless)
+    // Create modified copy: change step size (harmless)
     let mut modified = original.clone();
     modified.step_size = match original.step_size {
         StepSize::Hz5000 => StepSize::Hz12500,
@@ -403,7 +403,7 @@ async fn write_fo_full_channel() {
 }
 
 // ============================================================
-// MEMORY WRITE — channel memory round-trip
+// MEMORY WRITE: channel memory round-trip
 // ============================================================
 
 /// Test: Write a memory channel via ME, read back, verify.
@@ -468,7 +468,7 @@ async fn write_memory_channel() {
 // INVESTIGATE REJECTED COMMANDS
 // ============================================================
 
-/// Test TN (TNC mode) — bare read.
+/// Test TN (TNC mode) as a bare read.
 ///
 /// Hardware-verified: bare `TN\r` returns TNC mode data.
 #[tokio::test]
@@ -487,7 +487,7 @@ async fn investigate_tn_tnc_mode() {
     let _ = radio.disconnect().await;
 }
 
-/// Investigate SF — band-indexed scan range.
+/// Investigate SF, the band-indexed scan range.
 #[tokio::test]
 #[ignore]
 async fn investigate_scan_commands() {
@@ -505,7 +505,7 @@ async fn investigate_scan_commands() {
     let _ = radio.disconnect().await;
 }
 
-/// Investigate MR — memory recall takes band,channel format.
+/// Investigate MR: memory recall takes band,channel format.
 /// MR is an action command that switches the active channel.
 #[tokio::test]
 #[ignore]
@@ -526,13 +526,13 @@ async fn investigate_mr_command() {
         Err(e) => println!("  MR 000 fails: {e}"),
     }
 
-    // The RE shows MR handler at 0xC002E694 — might take band,channel format
+    // The RE shows MR handler at 0xC002E694; it might take band,channel format
     // rather than just channel number.
 
     let _ = radio.disconnect().await;
 }
 
-/// Investigate US (user settings) — does it need a sub-parameter?
+/// Investigate US (user settings): does it need a sub-parameter?
 /// Theory: US may be a prefix command that needs a sub-command number.
 #[tokio::test]
 #[ignore]

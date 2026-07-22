@@ -202,7 +202,7 @@ impl<T: Transport> Radio<T> {
         let writable_pages = programming::TOTAL_PAGES - programming::FACTORY_CAL_PAGES;
         let writable_bytes = writable_pages as usize * programming::PAGE_SIZE;
         // Length is validated at the top of this function (image.len() == TOTAL_SIZE),
-        // and TOTAL_SIZE > writable_bytes — so `.get()` always yields `Some`, but we
+        // and TOTAL_SIZE > writable_bytes, so `.get()` always yields `Some`, but we
         // propagate via `?` anyway to avoid any possibility of a panic.
         let writable_slice = image.get(..writable_bytes).ok_or(Error::InvalidImageSize {
             actual: image.len(),
@@ -540,7 +540,7 @@ impl<T: Transport> Radio<T> {
     /// For writes whose purpose is to reboot the radio out of CAT mode
     /// (e.g. enabling DV Gateway / Reflector Terminal Mode, where the
     /// radio comes back speaking the MMDVM binary protocol): the normal
-    /// post-exit reconnect would race that reboot — over Bluetooth the
+    /// post-exit reconnect would race that reboot. Over Bluetooth the
     /// link can reopen in the pre-reboot window and then wedge
     /// mid-command as the radio's stack dies. The write is still
     /// verified by read-back inside the session; the connection is
@@ -792,7 +792,7 @@ impl<T: Transport> Radio<T> {
                 {
                     match FlashChannel::from_bytes(record) {
                         Ok(ch) => channels.push(ch),
-                        // A corrupt record is a real fault in the dump —
+                        // A corrupt record is a real fault in the dump;
                         // substituting a fabricated default would
                         // misrepresent radio state to the caller.
                         Err(e) => {
@@ -929,7 +929,7 @@ impl<T: Transport> Radio<T> {
 
         // Queued AI pushes / NMEA sentences would land ahead of the
         // radio's `0M\r` acknowledgement and blow the small entry
-        // window — drain them first.
+        // window, so drain them first.
         self.drain_stale_input().await;
 
         // Mark the session active BEFORE any wire traffic: if this
@@ -1011,7 +1011,7 @@ impl<T: Transport> Radio<T> {
             self.transport
                 .set_baud_rate(FAST_TRANSFER_BAUD)
                 .map_err(Error::Transport)?;
-            // Read sync byte — verifies the radio switched baud rates.
+            // Read sync byte: verifies the radio switched baud rates.
             // If this times out, the radio is likely still at 9600 and all
             // subsequent reads will produce garbage.
             let mut sync = [0u8; 1];
@@ -1028,7 +1028,7 @@ impl<T: Transport> Radio<T> {
                     );
                 }
                 Ok(Ok(_)) => {
-                    tracing::error!("fast mode sync read returned 0 bytes — baud mismatch likely");
+                    tracing::error!("fast mode sync read returned 0 bytes; baud mismatch likely");
                     return Err(Error::Protocol(ProtocolError::MalformedFrame(
                         b"fast mode sync byte not received".to_vec(),
                     )));
@@ -1039,7 +1039,7 @@ impl<T: Transport> Radio<T> {
                 }
                 Err(_) => {
                     tracing::error!(
-                        "fast mode sync byte timed out — radio may not have switched baud"
+                        "fast mode sync byte timed out; radio may not have switched baud"
                     );
                     return Err(Error::Timeout(std::time::Duration::from_secs(2)));
                 }
@@ -1070,7 +1070,7 @@ impl<T: Transport> Radio<T> {
         tokio::time::sleep(MCP_EXIT_SETTLE).await;
 
         // Bring the link back so every MCP operation returns a radio
-        // that answers CAT commands — callers no longer wait out the
+        // that answers CAT commands; callers no longer wait out the
         // USB re-enumeration and reconnect by hand.
         self.reconnect().await?;
 
@@ -1081,7 +1081,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// For writes whose purpose is to reboot the radio out of CAT mode
     /// (e.g. enabling a gateway / terminal mode): reconnecting here
-    /// would race the reboot — the link can come back up in the
+    /// would race the reboot; the link can come back up in the
     /// pre-reboot window and then die mid-command. The connection is
     /// deliberately left dead; the caller owns recovery.
     ///
@@ -1091,7 +1091,7 @@ impl<T: Transport> Radio<T> {
     async fn exit_programming_mode_detached(&mut self) -> Result<(), Error> {
         tracing::info!("exiting programming mode");
 
-        // The session is over as soon as the exit is attempted — even
+        // The session is over as soon as the exit is attempted. Even
         // if the write fails, retrying CAT (which will error loudly)
         // beats refusing forever. Binary residue may remain on the
         // line, so the next CAT command drains first.
@@ -1136,7 +1136,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the exit write fails — CAT is re-enabled
+    /// Returns an error if the exit write fails; CAT is re-enabled
     /// regardless, so a retry or reconnect can proceed.
     pub async fn recover_from_interrupted_mcp(&mut self) -> Result<(), Error> {
         if !self.mcp_active {
@@ -1216,7 +1216,7 @@ impl<T: Transport> Radio<T> {
         })?;
 
         // `chunks_exact` guarantees each chunk is exactly `PAGE_SIZE` bytes, so the
-        // conversion to `&[u8; PAGE_SIZE]` is effectively infallible — `map_err`
+        // conversion to `&[u8; PAGE_SIZE]` is effectively infallible; `map_err`
         // converts the impossible error into an `InvalidImageSize` for type
         // purposes rather than using `.expect()`.
         for (i, chunk) in (0u16..page_count_u16).zip(data.chunks_exact(programming::PAGE_SIZE)) {
@@ -1238,8 +1238,8 @@ impl<T: Transport> Radio<T> {
     /// one drain-and-retry on timeout or address mismatch.
     ///
     /// A merely *delayed* (not lost) response would otherwise satisfy
-    /// a blind retry while its duplicate answers the NEXT page's read
-    /// — silently shifting the remainder of a 500 KB dump by one page.
+    /// a blind retry while its duplicate answers the NEXT page's read,
+    /// silently shifting the remainder of a 500 KB dump by one page.
     async fn read_single_page(&mut self, page: u16) -> Result<[u8; programming::PAGE_SIZE], Error> {
         match self.read_single_page_attempt(page).await {
             Ok(data) => Ok(data),
@@ -1325,7 +1325,7 @@ impl<T: Transport> Radio<T> {
             programming::parse_write_response(&received).map_err(Error::Protocol)?;
 
         // The echoed address is the only integrity check the MCP
-        // protocol offers — a mismatch means this is a stale duplicate
+        // protocol offers: a mismatch means this is a stale duplicate
         // of some other page, not our answer.
         if answered_page != page {
             return Err(Error::McpPageMismatch {
@@ -1360,7 +1360,7 @@ impl<T: Transport> Radio<T> {
             }
             Err(_elapsed) => {
                 // The ACK may still arrive as a straggler and would
-                // misalign the next 261-byte response window — clear
+                // misalign the next 261-byte response window, so clear
                 // the line before the next exchange.
                 tracing::debug!(page, "post-page ACK timed out; draining stragglers");
                 self.drain_mcp_input().await;
@@ -1634,7 +1634,7 @@ mod tests {
 
         let page: u16 = 0x0020;
         let cmd = programming::build_read_command(page);
-        // The radio answers with a DIFFERENT page — a duplicate response
+        // The radio answers with a DIFFERENT page: a duplicate response
         // from an earlier retried read. Accepting it would store the
         // wrong page's bytes and shift the rest of a dump by one page.
         mock.expect(&cmd, &build_w_response(0x0021, &[0x11u8; 256])?);
@@ -1692,7 +1692,7 @@ mod tests {
     async fn interrupted_mcp_poisons_cat_until_recovered() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"\r0M PROGRAM\r", b"0M\r");
-        // The first page read never completes — the caller's timeout
+        // The first page read never completes, so the caller's timeout
         // cancels the whole dump future mid-transfer.
         let cmd = programming::build_read_command(0);
         mock.expect_hang(&cmd);
@@ -1705,7 +1705,7 @@ mod tests {
         .await;
         assert!(cancelled.is_err(), "dump must be cancelled by the timeout");
 
-        // The radio may still be in PROG MCP — CAT must refuse rather
+        // The radio may still be in PROG MCP, so CAT must refuse rather
         // than talk binary-mode garbage.
         let refused = radio.execute(Command::GetMode { band: Band::A }).await;
         assert!(
@@ -1731,7 +1731,7 @@ mod tests {
     async fn entry_drains_stale_noise_before_handshake() -> TestResult {
         let mut mock = MockTransport::new();
         // Stale AI/NMEA noise queued on the line from before the MCP
-        // session — more than the entry parser's tolerance window.
+        // session: more than the entry parser's tolerance window.
         mock.queue_read(b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9*47\r\n");
         mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 

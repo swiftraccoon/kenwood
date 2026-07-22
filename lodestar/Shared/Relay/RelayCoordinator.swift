@@ -9,7 +9,7 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "rela
 
 /// MMDVM command byte constants from `mmdvm-core::command`. Copied
 /// here because UniFFI doesn't ship plain Rust `const` values to
-/// Swift — they're protocol constants, not crate-version-sensitive.
+/// Swift; they're protocol constants, not crate-version-sensitive.
 private enum MmdvmCmd {
     static let dstarHeader: UInt8 = 0x10
     static let dstarData: UInt8 = 0x11
@@ -123,7 +123,7 @@ public final class RelayCoordinator {
         await startReader(on: transport)
 
         state = .running
-        // The radio speaker now owns the audio path — silence the
+        // The radio speaker now owns the audio path; silence the
         // on-device monitor so reflector voice doesn't play twice.
         reflectorCoordinator.suppressMonitorForRelay = true
         log.info("Relay: running")
@@ -144,7 +144,7 @@ public final class RelayCoordinator {
         readerTask = Task { [weak self] in
             for await frame in frames {
                 guard let session else {
-                    log.warning("Relay: no active reflector session — stopping reader")
+                    log.warning("Relay: no active reflector session; stopping reader")
                     break
                 }
                 await self?.handleRadioFrame(frame, session: session, transport: transport)
@@ -178,7 +178,7 @@ public final class RelayCoordinator {
                 outboundStreamId = streamId
                 outboundSeq = 0
                 // Decode the radio's header so we can synthesise a
-                // recently-heard entry for our own TX on EOT — the
+                // recently-heard entry for our own TX on EOT; the
                 // reflector won't echo it back.
                 if let decoded = decodeRadioHeader(bytes: frame.payload) {
                     localTx = LocalTxTracker(
@@ -228,10 +228,10 @@ public final class RelayCoordinator {
                 log.info("Relay: radio → reflector EOT")
             default:
                 // Any other MMDVM command (status, version, etc.) is
-                // informational at the relay layer — skip.
+                // informational at the relay layer; skip.
                 break
             }
-            // Frames are flowing again — clear any stale relay error.
+            // Frames are flowing again; clear any stale relay error.
             lastError = nil
         } catch {
             log.error("Relay: radio → reflector failed: \(error)")
@@ -275,7 +275,7 @@ public final class RelayCoordinator {
         relayEventPump?.cancel()
         relayEventPump = nil
         reflectorCoordinator.relayHook = nil
-        // Relay no longer owns the audio path — let the on-device
+        // Relay no longer owns the audio path; let the on-device
         // monitor resume (subject to the user's monitor toggle).
         reflectorCoordinator.suppressMonitorForRelay = false
         readerTask?.cancel()

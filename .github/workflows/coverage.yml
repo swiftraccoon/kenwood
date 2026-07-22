@@ -35,7 +35,7 @@ jobs:
       # One instrumented run of every test target in every workspace
       # crate (unit + integration). This is also the only CI job that
       # executes the full workspace test suite on Linux, so a test
-      # failure here must fail the job — no `|| true`.
+      # failure here must fail the job: no `|| true`.
       - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
         with:

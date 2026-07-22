@@ -15,7 +15,7 @@ pub enum SlowDataError {
         got: usize,
     },
 
-    /// Buffer for the assembler ran out of room — should not happen
+    /// Buffer for the assembler ran out of room; should not happen
     /// in well-formed input.
     #[error("slow data assembler internal buffer overflow")]
     BufferOverflow,

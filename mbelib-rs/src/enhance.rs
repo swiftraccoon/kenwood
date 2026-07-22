@@ -133,7 +133,7 @@ pub(crate) fn spectral_amp_enhance(params: &mut MbeParams, tuning: &SynthesisTun
 
         // Spectral density ratio: numerator measures local density at
         // band l, denominator is the global spectral density estimate.
-        // The alpha*pi factor is a perceptual tuning constant — 0.96
+        // The alpha*pi factor is a perceptual tuning constant: 0.96
         // in the AMBE specification and at parity.
         let numerator = tuning.enhance_alpha
             * std::f32::consts::PI
@@ -195,7 +195,7 @@ pub(crate) fn spectral_amp_enhance(params: &mut MbeParams, tuning: &SynthesisTun
 ///
 /// Source: `ENVELOPE_WEIGHTS[103]` at DSP VA `0x80049044`. The table
 /// is a bell curve peaking at index 51 with the value `1.0` and
-/// rolling off symmetrically — values around 0.85–0.88 at the
+/// rolling off symmetrically: values around 0.85–0.88 at the
 /// endpoints, plateau near 0.97 across the mid-band where speech
 /// formants live (1.5–2.5 kHz). Multiplying decoder per-harmonic
 /// magnitudes by this curve reshapes the synthesized spectrum to
@@ -204,7 +204,7 @@ pub(crate) fn spectral_amp_enhance(params: &mut MbeParams, tuning: &SynthesisTun
 /// generic mbelib decode.
 ///
 /// The 103 entries span DC up to Nyquist (4000 Hz at the 8 kHz
-/// sample rate the AMBE codec works at) — each index covers
+/// sample rate the AMBE codec works at); each index covers
 /// `4000 / 103 ≈ 38.8 Hz`. Harmonic `l` lands at frequency
 /// `f_l = w0 · 8000 · l / (2π)` Hz; the index is
 /// `round(f_l / (4000 / 103))`. We clamp to `[0, 102]` for
@@ -486,7 +486,7 @@ mod tests {
     /// near index 51, ≈0.83 at endpoints).
     ///
     /// This test asserts:
-    /// 1. Energy preservation — `Σ ml²` after postfilter ≈ before.
+    /// 1. Energy preservation: `Σ ml²` after postfilter ≈ before.
     /// 2. Mid-band magnitudes (where weight ≈ 1) are emphasized over
     ///    end-band magnitudes (weight ≈ 0.83).
     #[cfg(feature = "kenwood-tables")]

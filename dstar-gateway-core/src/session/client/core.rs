@@ -2,7 +2,7 @@
 //!
 //! [`SessionCore`] is the runtime-erased state machine that drives a
 //! single D-STAR reflector client session. It is wrapped by the
-//! typestate [`Session<P, S>`][session] — the typestate sits on top
+//! typestate [`Session<P, S>`][session]: the typestate sits on top
 //! of this struct and forwards every method. Keeping the state machine
 //! monomorphization-free avoids duplicating the machine body for each
 //! protocol.
@@ -89,7 +89,7 @@ enum RawEvent {
         /// Peer that sent the echo.
         peer: SocketAddr,
     },
-    /// Voice stream started — header arrived from the reflector.
+    /// Voice stream started: header arrived from the reflector.
     VoiceStart {
         /// D-STAR stream id.
         stream_id: StreamId,
@@ -118,7 +118,7 @@ enum RawEvent {
 ///
 /// Holds all mutable state for one reflector session. The typestate
 /// `Session<P, S>` wrapper forwards most calls straight through; the
-/// core does not itself enforce state transitions at compile time —
+/// core does not itself enforce state transitions at compile time;
 /// that discipline is the wrapper's job.
 pub struct SessionCore {
     /// Which protocol this session speaks.
@@ -131,14 +131,14 @@ pub struct SessionCore {
     reflector_module: Module,
     /// Reflector's own callsign (e.g. `REF030`, `XLX307`, `DCS030`).
     ///
-    /// Required by the DCS wire format — the 519-byte LINK packet,
+    /// Required by the DCS wire format: the 519-byte LINK packet,
     /// the 19-byte UNLINK packet, and the 17-byte POLL packet all
     /// embed the target reflector's callsign at specific offsets.
     /// If the DCS client sends the wrong reflector callsign the
     /// target reflector will drop the packet with no response.
     ///
     /// `None` means the caller did not supply one. For `DPlus` and
-    /// `DExtra` this is harmless — neither protocol embeds the
+    /// `DExtra` this is harmless: neither protocol embeds the
     /// reflector callsign on the wire. For `DCS` the session falls
     /// back to a `DCS001  ` default and emits a warning at construction
     /// time so the operator can see why connections to
@@ -170,7 +170,7 @@ pub struct SessionCore {
     /// frame, so [`Self::enqueue_send_voice`] / [`Self::enqueue_send_eot`]
     /// must be able to retrieve the header that started the stream.
     /// `DPlus` and `DExtra` do not embed the header in voice frames,
-    /// so the cache is not consulted on those protocols — it is still
+    /// so the cache is not consulted on those protocols; it is still
     /// populated for symmetry and future header retransmit support.
     cached_tx_header: Option<DStarHeader>,
     /// Stream id of the currently-active incoming voice stream, or
@@ -184,7 +184,7 @@ pub struct SessionCore {
     ///
     /// Without tracking the "active stream" here, every retransmitted
     /// header would surface as a fresh [`RawEvent::VoiceStart`] to the
-    /// consumer — which resets any decoder state kept per stream and
+    /// consumer, which resets any decoder state kept per stream and
     /// sounds like the first few frames of the stream repeating over
     /// and over (because those are the only frames the decoder ever
     /// converges on before being reset again).
@@ -204,7 +204,7 @@ pub struct SessionCore {
     /// interleaves frames from two simultaneous talkers). A header
     /// for a different `stream_id` that arrives while the active
     /// stream is still producing frames indicates the latter, and
-    /// must not swap `active_rx_stream` — doing so tears down and
+    /// must not swap `active_rx_stream`: doing so tears down and
     /// re-keys the radio modem 2-4 times per second and produces
     /// audible chopping between talkers. Observed live at REF030 C
     /// when two gateways forwarded the same QSO to the reflector,
@@ -213,7 +213,7 @@ pub struct SessionCore {
     ///
     /// Cleared on `VoiceEnd` and on session reset. Updated on every
     /// voice frame / header push for the active stream (and only
-    /// the active stream — concurrent streams must not keep the
+    /// the active stream, because concurrent streams must not keep the
     /// liveness timer alive).
     last_voice_activity_at: Option<Instant>,
     /// Diagnostic sink for lenient parser warnings.
@@ -259,13 +259,13 @@ impl SessionCore {
     /// late-joining clients can decode. Without the
     /// [`Self::active_rx_stream`] check, every retransmit would
     /// surface as a fresh `VoiceStart`, which typically resets the
-    /// consumer's per-stream AMBE decoder state — the user hears the
+    /// consumer's per-stream AMBE decoder state, so the user hears the
     /// first few frames of the stream looping indefinitely.
     ///
     /// If `stream_id` differs from the current active stream, an
     /// [`RawEvent::VoiceEnd`] with
     /// [`VoiceEndReason::Inactivity`] is synthesized for the old
-    /// stream before the new `VoiceStart` — covers the case where a
+    /// stream before the new `VoiceStart`. That covers the case where a
     /// new talker takes the module mid-flight without an EOT from
     /// the previous one.
     fn emit_voice_start_if_new(&mut self, now: Instant, stream_id: StreamId, header: DStarHeader) {
@@ -306,7 +306,7 @@ impl SessionCore {
                     target: "dstar_gateway_core::session::client",
                     old_sid = format_args!("{:#06X}", old_sid.get()),
                     new_sid = format_args!("{:#06X}", stream_id.get()),
-                    "mid-stream sid change — synthesizing VoiceEnd for old + VoiceStart for new"
+                    "mid-stream sid change: synthesizing VoiceEnd for old + VoiceStart for new"
                 );
                 self.events.push_back(RawEvent::VoiceEnd {
                     stream_id: old_sid,
@@ -322,7 +322,7 @@ impl SessionCore {
                 tracing::debug!(
                     target: "dstar_gateway_core::session::client",
                     stream_id = format_args!("{:#06X}", stream_id.get()),
-                    "new voice stream — emitting VoiceStart"
+                    "new voice stream: emitting VoiceStart"
                 );
                 self.active_rx_stream = Some(stream_id);
                 self.events
@@ -337,7 +337,7 @@ impl SessionCore {
     ///
     /// EOTs for non-active streams (e.g. a concurrent stream whose
     /// `VoiceStart` was suppressed by [`Self::emit_voice_start_if_new`])
-    /// are silently ignored — the consumer never saw a matching
+    /// are silently ignored, because the consumer never saw a matching
     /// `VoiceStart`, so emitting `VoiceEnd` for that stream would
     /// be a dangling close.
     fn emit_voice_end(&mut self, stream_id: StreamId, reason: VoiceEndReason) {
@@ -394,7 +394,7 @@ impl SessionCore {
     /// callsign.
     ///
     /// Required for `DCS` sessions that target a non-`DCS001`
-    /// reflector — the DCS codec embeds the reflector callsign in
+    /// reflector: the DCS codec embeds the reflector callsign in
     /// every LINK/UNLINK/POLL packet, and the default fallback is
     /// `DCS001  `. Optional for `DPlus` and `DExtra`, which do not
     /// carry the reflector callsign on the wire.
@@ -417,7 +417,7 @@ impl SessionCore {
                 target: "dstar_gateway_core::session",
                 %callsign,
                 %peer,
-                "DCS session constructed without reflector_callsign — \
+                "DCS session constructed without reflector_callsign, \
                  falling back to \"DCS001  \" default. Connections to \
                  any other DCS reflector will fail silently because the \
                  target reflector reads the callsign field from the \
@@ -514,7 +514,7 @@ impl SessionCore {
     ///
     /// Returns [`StateError::WrongState`] if the session is not a
     /// `DPlus` session or is not in [`ClientStateKind::Configured`].
-    /// The typestate wrapper prevents both cases at compile time —
+    /// The typestate wrapper prevents both cases at compile time;
     /// this runtime check is the residual safety net for direct
     /// `SessionCore` users (tests + the protocol-erased fallback path).
     pub fn attach_host_list(&mut self, list: dplus::HostList) -> Result<(), Error> {
@@ -538,7 +538,7 @@ impl SessionCore {
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] if a codec encoder reports a
-    /// buffer-too-small (should never happen — the scratch
+    /// buffer-too-small (should never happen, since the scratch
     /// buffers in this core are oversized for every known packet).
     pub fn enqueue_connect(&mut self, now: Instant) -> Result<(), Error> {
         let packet = match self.kind {
@@ -659,8 +659,8 @@ impl SessionCore {
     /// calls can use it (required by DCS, which embeds the full
     /// header in every voice frame).
     ///
-    /// For DCS, the protocol does NOT have a separate header packet
-    /// — the first frame (seq=0) carries the embedded header. This
+    /// For DCS, the protocol does NOT have a separate header packet:
+    /// the first frame (seq=0) carries the embedded header. This
     /// method emits a synthetic silence frame at seq=0 to start the
     /// stream and matches the legacy
     /// [`crate`]-internal behavior.
@@ -697,7 +697,7 @@ impl SessionCore {
                 .map_err(dextra::DExtraError::from)
                 .map_err(ProtocolError::DExtra)?,
             ProtocolKind::Dcs => {
-                // DCS has no separate header packet — the first frame
+                // DCS has no separate header packet: the first frame
                 // (seq=0) carries the embedded header. Emit a silence
                 // frame at seq=0 to start the stream.
                 let silence = VoiceFrame::silence();
@@ -717,7 +717,7 @@ impl SessionCore {
     /// Enqueue a voice data frame for transmission.
     ///
     /// On DCS, the cached header from [`Self::enqueue_send_header`]
-    /// is required — DCS embeds the full header in every voice frame.
+    /// is required: DCS embeds the full header in every voice frame.
     /// On `DPlus` and `DExtra`, the cache is consulted but not
     /// strictly required for voice data.
     ///
@@ -775,7 +775,7 @@ impl SessionCore {
     /// Enqueue a voice EOT packet for transmission.
     ///
     /// On DCS, the cached header from [`Self::enqueue_send_header`]
-    /// is required — DCS embeds the full header in every voice frame
+    /// is required: DCS embeds the full header in every voice frame
     /// (including the EOT). On `DPlus` and `DExtra`, the cache is not
     /// consulted.
     ///
@@ -889,7 +889,7 @@ impl SessionCore {
         match pkt {
             dplus::ServerPacket::Link1Ack => {
                 if self.state == ClientStateKind::Connecting {
-                    // First half of the two-step DPlus handshake —
+                    // First half of the two-step DPlus handshake:
                     // reply with LINK2 immediately.
                     let mut buf = [0u8; 32];
                     let n = dplus::encode_link2(&mut buf, &self.callsign)
@@ -1048,7 +1048,7 @@ impl SessionCore {
                 frame,
             } => {
                 self.arm_keepalive_inactivity(now);
-                // See the DPlus branch above — emit only for the
+                // See the DPlus branch above: emit only for the
                 // active stream so concurrent talkers' frames don't
                 // mix into the modem FIFO.
                 if self.active_rx_stream == Some(stream_id) {
@@ -1139,7 +1139,7 @@ impl SessionCore {
                     // frame. Treat `seq == 0` (or a fresh stream id)
                     // as the stream-start trigger via
                     // [`Self::emit_voice_start_if_new`], but ALWAYS
-                    // surface the frame as `VoiceFrame` too — the
+                    // surface the frame as `VoiceFrame` too, because the
                     // `seq == 0` frame carries real voice data plus
                     // the superframe sync pattern in slow-data, so
                     // dropping it (as the pre-fix code did) left
@@ -1148,7 +1148,7 @@ impl SessionCore {
                     // Frames for a concurrent stream whose header
                     // was suppressed by
                     // [`Self::emit_voice_start_if_new`] are dropped
-                    // here — see the DPlus branch for rationale.
+                    // here; see the DPlus branch for rationale.
                     self.emit_voice_start_if_new(now, stream_id, header);
                     if self.active_rx_stream == Some(stream_id) {
                         self.events.push_back(RawEvent::VoiceFrame {
@@ -1221,7 +1221,7 @@ impl SessionCore {
                 tracing::debug!(
                     target: "dstar_gateway_core::session::client",
                     stream_id = format_args!("{:#06X}", stream_id.get()),
-                    "voice inactivity expired — synthesizing VoiceEnd(Inactivity)"
+                    "voice inactivity expired: synthesizing VoiceEnd(Inactivity)"
                 );
                 self.emit_voice_end(stream_id, VoiceEndReason::Inactivity);
             } else {
@@ -1267,7 +1267,7 @@ impl SessionCore {
     /// Pop the next consumer-visible event.
     ///
     /// The `P` type parameter re-attaches the protocol phantom at
-    /// drain time — the event queue itself is protocol-erased.
+    /// drain time; the event queue itself is protocol-erased.
     pub fn pop_event<P: Protocol>(&mut self) -> Option<Event<P>> {
         let raw = self.events.pop_front()?;
         Some(match raw {
@@ -1315,7 +1315,7 @@ impl SessionCore {
 
     /// Enqueue the protocol-appropriate keepalive poll packet.
     ///
-    /// Encoder failures are swallowed — the scratch buffers in this
+    /// Encoder failures are swallowed: the scratch buffers in this
     /// method are always big enough for the smallest packet in each
     /// protocol, so the error path is unreachable in practice. A
     /// failure would simply mean no poll is sent this tick and the
@@ -1898,7 +1898,7 @@ mod tests {
                   unwrap cannot fire; a zero would panic only this test, at runtime"
     )]
     const fn sid(n: u16) -> StreamId {
-        // Runtime call sites evaluate this at runtime — a zero
+        // Runtime call sites evaluate this at runtime, so a zero
         // argument would panic the test, and every call site passes
         // a non-zero literal.
         StreamId::new(n).unwrap()
@@ -1925,7 +1925,7 @@ mod tests {
     /// be SWALLOWED: propagating it through `?` is what killed the
     /// tokio shell's run loop in production. The fix lives in the
     /// three `handle_*_input` arms, but nothing fed junk to a
-    /// CONNECTED session — so a refactor could restore the `?` and no
+    /// CONNECTED session, so a refactor could restore the `?` and no
     /// test would notice.
     ///
     /// The session must survive and stay functional: after the junk,
@@ -1934,8 +1934,8 @@ mod tests {
     /// Note the codecs dispatch on datagram LENGTH, so a payload that
     /// is junk to one protocol can be a valid packet in another (a
     /// 3-byte datagram is a `DPlus` poll). Events the probes
-    /// legitimately produce are drained before the voice assertion —
-    /// what is under test is that the session survives and keeps
+    /// legitimately produce are drained before the voice assertion.
+    /// What is under test is that the session survives and keeps
     /// working, not that every probe is rejected.
     #[test]
     fn dextra_junk_datagram_does_not_kill_a_connected_session() -> TestResult {
@@ -2247,7 +2247,7 @@ mod tests {
         // VoiceEnd(Inactivity) for the old stream before emitting
         // VoiceStart for the new one. This is only done once the
         // old stream has been silent for `STREAM_TAKEOVER_THRESHOLD`
-        // — see `emit_voice_start_if_new`. The previous test sent
+        // (see `emit_voice_start_if_new`). The previous test sent
         // both headers at the same `now`, which under the new
         // guard (suppress if active stream still live) would be
         // treated as a concurrent stream and suppressed, so we
@@ -2297,7 +2297,7 @@ mod tests {
         // Drain the two events we expect for stream A.
         drop(core.pop_event::<DExtra>().ok_or("no VoiceStart")?);
         drop(core.pop_event::<DExtra>().ok_or("no VoiceFrame")?);
-        // B's header arrives only 50 ms after A's last activity —
+        // B's header arrives only 50 ms after A's last activity,
         // well inside STREAM_TAKEOVER_THRESHOLD (500 ms). Must be
         // suppressed silently.
         let n = dextra_codec::encode_voice_header(&mut buf, sid(0xBBBB), &test_header())?;
@@ -2342,8 +2342,8 @@ mod tests {
         let (mut core, _) = connected_dextra()?;
         let now = Instant::now();
         let mut buf = [0u8; 64];
-        // Voice frames are gated on `active_rx_stream` matching —
-        // see `handle_dextra_input`'s VoiceData branch — so
+        // Voice frames are gated on `active_rx_stream` matching
+        // (see `handle_dextra_input`'s VoiceData branch), so
         // establish the stream with a VoiceHeader first.
         let n = dextra_codec::encode_voice_header(&mut buf, sid(0x1234), &test_header())?;
         core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
@@ -2377,8 +2377,8 @@ mod tests {
     }
 
     /// Regression scenario: replay the exact wire sequence a running
-    /// reflector sends — one header every superframe interleaved
-    /// with 21 voice-data frames — and verify that exactly ONE
+    /// reflector sends (one header every superframe interleaved
+    /// with 21 voice-data frames) and verify that exactly ONE
     /// `VoiceStart` is emitted for the whole stream, followed by all
     /// the `VoiceFrame`s in order, then `VoiceEnd` on the EOT packet.
     #[test]
@@ -2604,7 +2604,7 @@ mod tests {
         // Establish the stream first so the EOT's stream_id matches
         // `active_rx_stream`. Without the VoiceHeader, `emit_voice_end`
         // ignores the EOT as a dangling close of a stream the
-        // consumer never saw start — see the mid-stream sid-change
+        // consumer never saw start; see the mid-stream sid-change
         // guard in `emit_voice_start_if_new`.
         let n = dplus_codec::encode_voice_header(&mut buf, sid(0x4567), &test_header())?;
         core.handle_input(now, ADDR_DPLUS, buf.get(..n).ok_or("n > buf")?)?;
@@ -2679,7 +2679,7 @@ mod tests {
         let (mut core, _) = connected_dcs()?;
         let now = Instant::now();
         let mut buf = [0u8; 128];
-        // Establish the stream with a non-end voice packet first —
+        // Establish the stream with a non-end voice packet first.
         // DCS embeds the header in every frame, so this is also the
         // VoiceStart trigger. `emit_voice_end` now ignores EOTs
         // for non-active streams. Using `non_silence_frame()` so

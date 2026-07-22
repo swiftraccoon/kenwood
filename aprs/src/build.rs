@@ -64,7 +64,7 @@ fn ax25_to_kiss_wire(packet: &Ax25Packet) -> Vec<u8> {
 /// like `"950000.00N"`. The `DDMM.hh` core is produced by the shared
 /// [`crate::units::format_ddmm_hundredths`] helper, which carries
 /// minute/degree overflow so the minutes field is whole minutes
-/// `00..=59` plus hundredths `00..=99` per APRS 1.0.1 §6 p.23 — never
+/// `00..=59` plus hundredths `00..=99` per APRS 1.0.1 §6 p.23, never
 /// the malformed `60.00` that a fixed-precision `format!` of
 /// `59.9999` minutes would emit.
 fn format_aprs_latitude(lat: f64) -> String {
@@ -84,7 +84,7 @@ fn format_aprs_latitude(lat: f64) -> String {
 /// core is produced by the shared
 /// [`crate::units::format_ddmm_hundredths`] helper, which carries
 /// minute/degree overflow so the minutes field is whole minutes
-/// `00..=59` plus hundredths `00..=99` per APRS 1.0.1 §6 p.24 — never
+/// `00..=59` plus hundredths `00..=99` per APRS 1.0.1 §6 p.24, never
 /// the malformed `60.00`.
 fn format_aprs_longitude(lon: f64) -> String {
     let lon = if lon.is_finite() {
@@ -193,7 +193,7 @@ pub fn build_aprs_position_report_packet(
 ///
 /// The addressee is padded to exactly 9 characters per the APRS spec.
 /// Message text that exceeds [`MAX_APRS_MESSAGE_TEXT_LEN`] (67 bytes) is
-/// **truncated** — use [`build_aprs_message_checked`] if you want a
+/// **truncated**; use [`build_aprs_message_checked`] if you want a
 /// hard error on overlong input.
 ///
 /// Returns wire-ready bytes (FEND-delimited KISS frame).
@@ -288,7 +288,7 @@ pub fn build_aprs_message_checked(
 /// The object name is padded to exactly 9 characters per the APRS spec.
 ///
 /// This convenience builder emits a **placeholder zero DHM-zulu
-/// timestamp** (`000000z`, day 0) — it is sans-io and cannot read the
+/// timestamp** (`000000z`, day 0); it is sans-io and cannot read the
 /// clock. Day 0 is outside the spec-valid `01..=31` range and is
 /// rejected by [`AprsTimestamp::parse`]. Callers that need a real
 /// timestamp must use [`build_aprs_object_with_timestamp`], which takes
@@ -388,7 +388,7 @@ pub fn build_aprs_object_with_timestamp(
 /// **silently truncated** to the first 9 bytes (the wire frame then
 /// identifies a *different* object than the caller intended). Prefer
 /// [`build_aprs_object_with_timestamp_checked`] / its `_packet`
-/// variant when caller input is uncontrolled — they return
+/// variant when caller input is uncontrolled; they return
 /// [`AprsError::InvalidObjectName`] for malformed input instead.
 #[must_use]
 #[expect(
@@ -430,7 +430,7 @@ pub fn build_aprs_object_with_timestamp_packet(
 /// 1..=9 bytes of printable ASCII (0x20..=0x7E).
 ///
 /// Empty names are rejected (the spec implicitly requires at least one
-/// non-space character — a 9-space name would render as a blank
+/// non-space character: a 9-space name would render as a blank
 /// identifier). Names over 9 bytes are rejected to prevent the silent
 /// truncation that the unchecked builder performs.
 fn validate_object_name(name: &str) -> Result<(), AprsError> {
@@ -585,7 +585,7 @@ pub fn build_aprs_item(
 ///
 /// The `name` must be 3-9 bytes of printable ASCII excluding `!` and
 /// `_` per APRS 1.0.1 §11 p.59. This unchecked entry point performs
-/// **no validation** — passing a name shorter than 3 chars, longer
+/// **no validation**: passing a name shorter than 3 chars, longer
 /// than 9 chars, or containing `!`/`_` will produce a malformed item
 /// that no spec-compliant parser will accept. Prefer
 /// [`build_aprs_item_checked`] / its `_packet` variant when caller
@@ -622,7 +622,7 @@ pub fn build_aprs_item_packet(
 ///
 /// - 3..=9 bytes long, and
 /// - every byte is printable ASCII (0x20..=0x7E), and
-/// - no byte is `!` (0x21) or `_` (0x5F) — these would terminate the
+/// - no byte is `!` (0x21) or `_` (0x5F); these would terminate the
 ///   name field on the wire and produce a malformed item.
 fn validate_item_name(name: &str) -> Result<(), AprsError> {
     if name.len() < 3 {
@@ -724,8 +724,8 @@ pub fn build_aprs_item_checked_packet(
 // APRS weather builders
 // ---------------------------------------------------------------------------
 
-/// Append the shared 7-field weather tail — gust, temperature, rain
-/// (1 h / 24 h / since-midnight), humidity, barometric pressure — to an
+/// Append the shared 7-field weather tail (gust, temperature, rain
+/// 1 h / 24 h / since-midnight, humidity, barometric pressure) to an
 /// info field, clamping every value to its APRS 1.0.1 §12 p.64 field
 /// width before formatting.
 ///
@@ -1237,8 +1237,8 @@ pub fn build_aprs_mice_with_message_packet(
     //                            1.1 correction).
     //
     // Earlier code generations only set the bit for ≥100°, which left
-    // 0-9° longitudes encoded into the info-field byte range 28..37
-    // — outside the spec-listed valid encodings. Spec-strict receivers
+    // 0-9° longitudes encoded into the info-field byte range 28..37,
+    // outside the spec-listed valid encodings. Spec-strict receivers
     // would mis-decode.
     let lon_offset = !(10.0..100.0).contains(&lon_abs);
     let dest_chars: [u8; 6] = [
@@ -1302,7 +1302,7 @@ pub fn build_aprs_mice_with_message_packet(
     )]
     let lon_min_int = lon_min_f as u8;
     // Hundredths of a minute. Rounding `0.999... * 100.0` can yield 100,
-    // which when added to the wire offset of 28 would produce byte 128 —
+    // which when added to the wire offset of 28 would produce byte 128,
     // outside the spec-mandated Mic-E receivable range of 28..=127
     // (APRS 1.0.1 §10.3.3). Clamp to 0..=99 to keep the wire byte legal;
     // the latitude-side computation at `lat_hundredths` uses the same
@@ -1332,7 +1332,7 @@ pub fn build_aprs_mice_with_message_packet(
     // speed >= 800 subtract 800" / "if course >= 400 subtract 400", so
     // these are the maximum representable values. Without the clamp an
     // out-of-range speed (e.g. 2280 kt → SP = 228, byte 228 + 28 = 256)
-    // overflows the `+ 28` wire offset — a debug panic under
+    // overflows the `+ 28` wire offset: a debug panic under
     // overflow-checks and an undecodable byte > 127 in release. This
     // mirrors the longitude-hundredths `.min(99)` clamp above.
     let speed_knots = speed_knots.min(799);
@@ -1367,7 +1367,7 @@ pub fn build_aprs_mice_with_message_packet(
     // every byte is in the AX.25 v2.2 §3.12.2 callsign-character set
     // (uppercase ASCII alphanumeric). `Callsign::new` therefore cannot
     // fail; the `unreachable!` guards the invariant explicitly rather
-    // than silently substituting a wrong destination — which would
+    // than silently substituting a wrong destination, which would
     // corrupt the Mic-E latitude carried in the address slot.
     let dest_callsign_typed = Callsign::new(dest_callsign).unwrap_or_else(|err| {
         unreachable!("Mic-E destination digits violated their construction invariant: {err}")
@@ -1392,12 +1392,12 @@ const APRS_TELEMETRY_MAX_SEQUENCE: u16 = 999;
 const APRS_TELEMETRY_MAX_ANALOG: u16 = 999;
 
 /// Maximum analog-channel label length per APRS 1.0.1 §13 p.69 (field
-/// widths A1=7, A2=7, A3=6, A4=6, A5=5 — the longest is 7). The
+/// widths A1=7, A2=7, A3=6, A4=6, A5=5; the longest is 7). The
 /// builder uses 7 as the conservative cap for all analog labels.
 const APRS_TELEMETRY_MAX_ANALOG_LABEL: usize = 7;
 
 /// Maximum digital-channel label length per APRS 1.0.1 §13 p.69 (B1=6,
-/// B2=5, B3=4, B4=4, B5=4, B6=3, B7=3, B8=3 — the longest is 6).
+/// B2=5, B3=4, B4=4, B5=4, B6=3, B7=3, B8=3; the longest is 6).
 const APRS_TELEMETRY_MAX_DIGITAL_LABEL: usize = 6;
 
 /// Build a KISS-encoded APRS telemetry frame.
@@ -1611,7 +1611,7 @@ pub fn build_aprs_telemetry_eqns_packet(
 /// Build a KISS-encoded APRS telemetry **bit-sense + project-name**
 /// definition message (`:DEST    :BITS.11111111,Project name`).
 ///
-/// `bit_sense` is the 8-bit polarity word — each bit indicates whether
+/// `bit_sense` is the 8-bit polarity word: each bit indicates whether
 /// the corresponding digital channel is normally `1` (set bit) or `0`
 /// (clear bit). `project` is a free-form ≤23-byte title per §13 p.70.
 #[must_use]
@@ -2000,7 +2000,7 @@ mod tests {
         let packet = parse_ax25(&kiss.data)?;
         // The info field should have the addressee padded to 9 chars.
         let info_str = String::from_utf8_lossy(&packet.info);
-        // Format: :ADDRESSEE:text — addressee is bytes 1..10.
+        // Format: :ADDRESSEE:text, where addressee is bytes 1..10.
         let addressee_field = info_str.get(1..10).ok_or("addressee field missing")?;
         assert_eq!(addressee_field, "AB       ");
         Ok(())
@@ -2229,7 +2229,7 @@ mod tests {
             "pressure must clamp to 5-digit 99999: {info}",
         );
 
-        // Every field must still round-trip — nothing dropped.
+        // Every field must still round-trip; nothing dropped.
         let parsed = parse_aprs_weather_positionless(&packet.info)?;
         assert_eq!(parsed.wind_direction, Some(180));
         assert_eq!(parsed.wind_speed, Some(10));
@@ -2419,7 +2419,7 @@ mod tests {
         // Regression guard: out-of-range coordinates must clamp
         // rather than wrap. Pre-fix, a latitude of 200° would compute
         // 380_926 × (90 - 200) = -41_901_860 which `as u32` reinterprets
-        // to ~4.25 billion — silently producing a "valid" but absurd
+        // to ~4.25 billion, silently producing a "valid" but absurd
         // wire encoding. Post-fix the input clamps to 90.0 first.
         let source = test_source();
         let wire = build_aprs_position_compressed(
@@ -2656,7 +2656,7 @@ mod tests {
 
     #[test]
     fn build_mice_roundtrip_oklahoma() -> TestResult {
-        // 35.258 N, 97.755 W — matches the existing parse_mice test case.
+        // 35.258 N, 97.755 W; matches the existing parse_mice test case.
         let source = test_source();
         let wire = build_aprs_mice(
             &source,
@@ -2868,7 +2868,7 @@ mod tests {
         // in 0..10° must (a) set the offset bit on destination char 4,
         // and (b) emit an info-field d-byte in the high column 118-127
         // (`v` through `DEL`). Pre-fix the builder emitted bytes 28-37
-        // and left the offset bit clear — outside the spec table.
+        // and left the offset bit clear, outside the spec table.
         let source = test_source();
         // London-area longitude 0.1°W: lon_abs = 0.1, lon_deg_raw = 0,
         // expected d = 0 + 90 = 90, expected info[1] = 90 + 28 = 118 (`v`).

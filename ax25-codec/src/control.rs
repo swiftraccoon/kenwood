@@ -4,9 +4,9 @@
 ///
 /// Per AX.25 v2.2 §4.2, the control byte identifies one of three frame
 /// families:
-/// - **Information (I)** — numbered data transfer frames
-/// - **Supervisory (S)** — flow-control frames (RR, RNR, REJ, SREJ)
-/// - **Unnumbered (U)** — link-setup, disconnection, and **UI** frames
+/// - **Information (I)**: numbered data transfer frames
+/// - **Supervisory (S)**: flow-control frames (RR, RNR, REJ, SREJ)
+/// - **Unnumbered (U)**: link-setup, disconnection, and **UI** frames
 ///   used by APRS
 ///
 /// The APRS protocol uses the `UI` subtype with control byte `0x03`.
@@ -116,7 +116,7 @@ pub enum SupervisoryKind {
 /// Unnumbered (U) frame sub-kinds (AX.25 v2.2 §4.3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnnumberedKind {
-    /// Unnumbered Information (UI) — used by APRS.
+    /// Unnumbered Information (UI), used by APRS.
     UnnumberedInformation,
     /// Set Asynchronous Balanced Mode (SABM).
     SetAsyncBalancedMode,
@@ -143,9 +143,9 @@ mod tests {
     /// Golden decode table for every U-frame kind per AX.25 v2.2
     /// §4.3.3, with the P/F bit both ways. The kind bytes live in a
     /// hand-maintained match: a DISC/UA transposition (0x43 ↔ 0x63,
-    /// visually adjacent) would pass the packet round-trip suite —
-    /// `Ax25Packet` keeps the control byte raw and nothing else
-    /// inspects the typed decode.
+    /// visually adjacent) would pass the packet round-trip suite,
+    /// because `Ax25Packet` keeps the control byte raw and nothing
+    /// else inspects the typed decode.
     #[test]
     fn unnumbered_kind_table_matches_spec() {
         let cases: [(u8, UnnumberedKind); 8] = [

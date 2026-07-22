@@ -145,7 +145,7 @@ enum StationActionRunner {
     }
 }
 
-/// Context-menu items for a station — shared by heard rows, the NOW TX
+/// Context-menu items for a station, shared by heard rows, the NOW TX
 /// card, and map pins. The popover is the discoverable path; this is
 /// the right-click / long-press fast path over the same action set.
 struct StationActionMenuItems: View {

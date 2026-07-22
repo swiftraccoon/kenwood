@@ -8,7 +8,7 @@
 // `imbe_param` values dumped by an `ambe_encode_dump` harness built
 // against OP25.
 //
-// This isolates Stages 1–4 from Stages 5–8 — stage-5+ divergences
+// This isolates Stages 1–4 from Stages 5–8; stage-5+ divergences
 // are covered by `validate_quantize_vs_op25`. Together, the two
 // harnesses cover the entire encoder path against the reference.
 //

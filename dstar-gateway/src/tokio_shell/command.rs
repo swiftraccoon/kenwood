@@ -17,7 +17,7 @@ pub enum Command {
         header: Box<DStarHeader>,
         /// Stream id for the voice burst.
         stream_id: StreamId,
-        /// Reply channel — `Ok(())` on success, or the shell error.
+        /// Reply channel: `Ok(())` on success, or the shell error.
         reply: tokio::sync::oneshot::Sender<Result<(), ShellError>>,
     },
 
@@ -45,7 +45,7 @@ pub enum Command {
 
     /// Initiate a graceful disconnect and wait for UNLINK ACK or timeout.
     Disconnect {
-        /// Reply channel — fires when disconnect is complete.
+        /// Reply channel: fires when disconnect is complete.
         reply: tokio::sync::oneshot::Sender<()>,
     },
 }

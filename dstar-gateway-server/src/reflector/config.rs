@@ -1,4 +1,4 @@
-//! `ReflectorConfig` — multi-client reflector configuration.
+//! `ReflectorConfig`: multi-client reflector configuration.
 //!
 //! The configuration uses a typestate builder (mirroring
 //! `SessionBuilder` in `dstar-gateway-core`) so required fields
@@ -54,7 +54,7 @@ pub enum ConfigError {
 
 /// Complete configuration for a multi-client reflector.
 ///
-/// Construct via [`Self::builder`] — the typestate builder enforces
+/// Construct via [`Self::builder`]; the typestate builder enforces
 /// that `callsign`, `modules`, and `bind` are set before `build` is
 /// callable. All other fields carry defaults documented on
 /// [`ReflectorConfigBuilder`].
@@ -104,8 +104,8 @@ pub struct ReflectorConfig {
     /// Each endpoint's maintenance sweep sends every linked client
     /// one protocol-appropriate keepalive per elapsed interval
     /// (`DExtra`: 9-byte reflector-callsign poll; `DPlus`: 3-byte
-    /// poll; `DCS`: 22-byte per-client keepalive — the forms xlxd
-    /// sends).
+    /// poll; `DCS`: 22-byte per-client keepalive, matching the forms
+    /// xlxd sends).
     pub keepalive_interval: Duration,
     /// Inactivity window after which a silent client is evicted.
     ///
@@ -150,10 +150,10 @@ impl ReflectorConfig {
     /// 1. An explicit per-protocol override set via
     ///    [`ReflectorConfigBuilder::protocol_bind`] is used verbatim.
     /// 2. If [`Self::bind`] has port `0`, every protocol gets
-    ///    `(bind.ip(), 0)` — each endpoint binds its own ephemeral
+    ///    `(bind.ip(), 0)`: each endpoint binds its own ephemeral
     ///    port.
     /// 3. If exactly ONE protocol is enabled, [`Self::bind`] is used
-    ///    verbatim — a single-protocol reflector serves on exactly
+    ///    verbatim: a single-protocol reflector serves on exactly
     ///    the address it was configured with.
     /// 4. Otherwise (several protocols contending for one fixed
     ///    port), each protocol gets `(bind.ip(), standard port)`,
@@ -161,7 +161,7 @@ impl ReflectorConfig {
     ///    30001, `DPlus` = 20001, `DCS` = 30051 (`xlxd/src/main.h`:
     ///    `DEXTRA_PORT` / `DPLUS_PORT` / `DCS_PORT`). Without this
     ///    rule the library-default config (all three protocols
-    ///    enabled) could never start on a fixed port — the second
+    ///    enabled) could never start on a fixed port: the second
     ///    bind would fail with `AddrInUse`.
     #[must_use]
     pub fn bind_addr_for(&self, protocol: ProtocolKind) -> SocketAddr {
@@ -182,7 +182,7 @@ impl ReflectorConfig {
     /// The returned builder is a typestate: [`ReflectorConfigBuilder::build`]
     /// only compiles when `.callsign()`, `.module_set()`, and
     /// `.bind()` have all been called. Skipping any of the three is
-    /// a compile error — the type parameters flip from [`Missing`]
+    /// a compile error: the type parameters flip from [`Missing`]
     /// to [`Provided`] as each setter is invoked.
     ///
     /// # Example
@@ -215,12 +215,12 @@ impl ReflectorConfig {
 ///
 /// Parameters:
 ///
-/// - `Cs` — `Missing` or `Provided`, tracks whether the callsign has been set.
-/// - `Ms` — tracks whether the module set has been provided.
-/// - `Bn` — tracks whether the bind address has been set.
+/// - `Cs`: `Missing` or `Provided`, tracks whether the callsign has been set.
+/// - `Ms`: tracks whether the module set has been provided.
+/// - `Bn`: tracks whether the bind address has been set.
 ///
 /// [`Self::build`] is only implemented when all three markers are
-/// [`Provided`] — forgetting any required field turns `.build()` into
+/// [`Provided`]; forgetting any required field turns `.build()` into
 /// a compile error.
 #[derive(Debug)]
 pub struct ReflectorConfigBuilder<Cs, Ms, Bn> {
@@ -294,7 +294,7 @@ impl<Cs, Ms, Bn> ReflectorConfigBuilder<Cs, Ms, Bn> {
         }
     }
 
-    /// Set the module set (`HashSet<Module>` — pass one or more module letters).
+    /// Set the module set (`HashSet<Module>`; pass one or more module letters).
     #[must_use]
     pub fn module_set(self, modules: HashSet<Module>) -> ReflectorConfigBuilder<Cs, Provided, Bn> {
         ReflectorConfigBuilder {
@@ -318,7 +318,7 @@ impl<Cs, Ms, Bn> ReflectorConfigBuilder<Cs, Ms, Bn> {
 
     /// Set the UDP bind address.
     ///
-    /// This is the base address — the address each protocol endpoint
+    /// This is the base address; the address each protocol endpoint
     /// actually binds is resolved by
     /// [`ReflectorConfig::bind_addr_for`]. Use
     /// [`Self::protocol_bind`] to pin a specific protocol to a
@@ -347,7 +347,7 @@ impl<Cs, Ms, Bn> ReflectorConfigBuilder<Cs, Ms, Bn> {
     /// Pin one protocol's endpoint to an explicit bind address.
     ///
     /// The override is used verbatim by
-    /// [`ReflectorConfig::bind_addr_for`] — it wins over the base
+    /// [`ReflectorConfig::bind_addr_for`]: it wins over the base
     /// [`Self::bind`] address, the ephemeral-port rule, and the
     /// standard-port fallback. Calling this again for the same
     /// protocol replaces the previous override.

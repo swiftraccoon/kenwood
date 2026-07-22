@@ -5,7 +5,7 @@
 //! completed per-transmission recordings.
 //!
 //! Sans-io discipline: nothing here reads the clock or touches the
-//! filesystem — the session shell passes `now` into every event
+//! filesystem; the session shell passes `now` into every event
 //! method, and the writer consumes the completed values.
 
 use std::collections::HashMap;
@@ -24,7 +24,7 @@ pub(crate) const SEQ_MODULUS: u16 = 21;
 /// The single source of truth for D-STAR gap accounting, shared by
 /// the capture core, the audio decoder, the feature extractor, and
 /// the dvrec importer so they can never diverge. Both the wire seq
-/// and the previous seq are untrusted bytes — a corrupted frame (or
+/// and the previous seq are untrusted bytes: a corrupted frame (or
 /// the 0x40 EOT flag riding the seq byte) can be out of the 0..=20
 /// alphabet, and such a value must contribute no gaps rather than
 /// underflow the modular distance. A duplicate seq is zero gaps.
@@ -124,7 +124,7 @@ pub struct CompletedRecording {
     /// Missing frames inferred from seq discontinuities.
     pub gaps: u64,
     /// 20-character D-STAR TX message, trailing spaces trimmed
-    /// (lossy UTF-8 view — Japanese radios commonly send JIS X 0201
+    /// (lossy UTF-8 view, since Japanese radios commonly send JIS X 0201
     /// half-width katakana, which is not UTF-8).
     pub text: Option<String>,
     /// The TX message's raw 20 wire bytes, kept losslessly.
@@ -192,7 +192,7 @@ impl StreamCapture {
             slow_data: frame.slow_data,
         });
 
-        // Text: the collector wants every frame index — index 0 is
+        // Text: the collector wants every frame index, and index 0 is
         // its documented reset signal for superframe sync.
         self.text_collector.push(frame.slow_data, seq);
         if self.text.is_none()
@@ -205,7 +205,7 @@ impl StreamCapture {
             }
         }
 
-        // GPS/DPRS: sync-frame bytes are not slow data — feeding them
+        // GPS/DPRS: sync-frame bytes are not slow data, so feeding them
         // would corrupt an in-progress block.
         if seq != 0
             && let Some(SlowDataBlock::Gps(sentence)) = self.assembler.push(frame.slow_data)
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn dprs_sentence_parses_into_report_with_frame_index() {
         // The parser accepts any 4-hex CRC field (it is parsed, not
-        // validated) — same synthesized sentence the dprs module's
+        // validated); same synthesized sentence the dprs module's
         // own tests use.
         let sentence = "$$CRC0000,W1AW    *>APDPRS,DSTAR*:!3530.00N/08233.00W#/Asheville test";
         let mut capture = StreamCapture::new(t0());

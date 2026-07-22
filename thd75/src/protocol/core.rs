@@ -214,7 +214,7 @@ fn parse_bc(payload: &str) -> Result<Response, ProtocolError> {
     clippy::similar_names,
     reason = "Parser for the 20-field FO/ME CAT channel record. The single-function layout \
               mirrors the wire format 1:1 so the bit/field correspondence is visible in one \
-              place — splitting it would fragment the protocol decoding across helpers and \
+              place; splitting it would fragment the protocol decoding across helpers and \
               obscure the mapping between wire field index and channel struct field. \
               `tone_code`/`ctcss_code`/`dtcs_code` share prefixes because they are the \
               canonical firmware RE names."
@@ -263,7 +263,7 @@ pub(crate) fn parse_channel_fields(
     //  [2]  RX step size                     → byte[8] high nibble
     //  [3]  TX step size                     → byte[8] low nibble (always 0 on regular channels)
     //  [4]  Mode, CAT WIRE encoding          → byte[9] bits 6:4
-    //       (0=FM, 1=DV, 2=NFM, 3=AM — hardware-verified; NOT the
+    //       (0=FM, 1=DV, 2=NFM, 3=AM, hardware-verified; NOT the
     //       MD/flash table, where 2=AM and 6=NFM)
     //  [5]  Fine tuning (0/1)                → byte[9] bit 3 (always 0 on regular channels)
     //  [6]  Fine step size                   → byte[9] bits 2:0 (always 0 on regular channels)
@@ -313,8 +313,8 @@ pub(crate) fn parse_channel_fields(
     let dcs_enable = parse_u8_field(f_dcs_en, cmd, "dcs_enable")? != 0;
     let cross_tone = parse_u8_field(f_cross_tone, cmd, "cross_tone")? != 0;
     let reverse = parse_u8_field(f_reverse, cmd, "reverse")? != 0;
-    // field[12]: shift direction — combines split + direction in one value
-    // (0=simplex, 1=shift+, 2=shift-, 4=split — byte[10] bits 2:0)
+    // field[12]: shift direction, combining split + direction in one value
+    // (0=simplex, 1=shift+, 2=shift-, 4=split; byte[10] bits 2:0)
     let shift_val = parse_u8_field(f_shift, cmd, "shift")?;
     let shift = ShiftDirection::try_from(shift_val).map_err(|e| ProtocolError::FieldParse {
         command: cmd.to_owned(),
@@ -444,7 +444,7 @@ fn parse_fo_fq(payload: &str, cmd: &str) -> Result<Response, ProtocolError> {
         detail: e.to_string(),
     })?;
 
-    // Remaining 20 fields are channel data — parse_channel_fields validates the count.
+    // Remaining 20 fields are channel data; parse_channel_fields validates the count.
     let channel_fields: Vec<&str> = rest.split(',').collect();
     let channel = parse_channel_fields(&channel_fields, cmd)?;
 

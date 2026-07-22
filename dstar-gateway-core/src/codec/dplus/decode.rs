@@ -1,6 +1,6 @@
 //! `DPlus` packet decoders.
 //!
-//! Both directions — `decode_client_to_server` parses packets a
+//! Both directions: `decode_client_to_server` parses packets a
 //! client would send, `decode_server_to_client` parses packets a
 //! reflector would send.
 //!
@@ -28,7 +28,7 @@ use super::packet::{ClientPacket, Link2Result, ServerPacket};
 ///
 /// # See also
 ///
-/// `ircDDBGateway/Common/DPlusProtocolHandler.cpp` — the reference
+/// `ircDDBGateway/Common/DPlusProtocolHandler.cpp`, the reference
 /// parser this decoder mirrors (length-dispatch then DSVT-magic
 /// branch). `xlxd/src/cdplusprotocol.cpp` is a mirror reference.
 pub fn decode_server_to_client(
@@ -72,7 +72,7 @@ pub fn decode_server_to_client(
                 {
                     dst.copy_from_slice(src);
                 }
-                // Treat trailing zeros as padding — replace them with spaces so
+                // Treat trailing zeros as padding: replace them with spaces so
                 // `Callsign::from_wire_bytes` stores a clean wire representation.
                 for b in &mut cs {
                     if *b == 0 {
@@ -96,12 +96,12 @@ pub fn decode_server_to_client(
 /// # Errors
 ///
 /// Same as [`decode_server_to_client`], but produces [`ClientPacket`]
-/// variants. The 8-byte length is NOT accepted here — clients do not
+/// variants. The 8-byte length is NOT accepted here; clients do not
 /// send 8-byte LINK2 replies.
 ///
 /// # See also
 ///
-/// `ircDDBGateway/Common/DPlusProtocolHandler.cpp` — mirror parser
+/// `ircDDBGateway/Common/DPlusProtocolHandler.cpp`, the mirror parser
 /// on the server side.
 pub fn decode_client_to_server(
     bytes: &[u8],
@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn link2_reply_unknown_records_diagnostic() -> TestResult {
-        // 8-byte reply with a tag that's neither OKRW nor BUSY — should still
+        // 8-byte reply with a tag that's neither OKRW nor BUSY should still
         // parse as Link2Reply { Unknown } and fire Diagnostic::UnknownLink2Reply.
         let bytes = [0x08, 0xC0, 0x04, 0x00, b'F', b'A', b'I', b'L'];
         let mut sink = crate::validator::VecSink::default();

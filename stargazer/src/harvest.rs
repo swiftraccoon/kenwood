@@ -59,7 +59,7 @@ fn build_user_agent(operator: Option<&str>) -> String {
     ua
 }
 
-/// Decide whether a robots.txt body forbids us from `path` — checked
+/// Decide whether a robots.txt body forbids us from `path`, checked
 /// for both the wildcard agent and our own product token. We honor it
 /// even though the files are operator-published links, because the
 /// politest interpretation always wins.
@@ -100,7 +100,7 @@ fn robots_disallows(robots: &str, path: &str) -> bool {
 }
 
 /// Pause between successive file downloads. Two seconds keeps a full
-/// day's harvest around one small request every other second — far
+/// day's harvest around one small request every other second, far
 /// below anything a rate limiter or intrusion sensor watches for.
 pub const POLITE_GAP: Duration = Duration::from_secs(2);
 
@@ -115,7 +115,7 @@ const MATCH_TOLERANCE_SECS: i64 = 120;
 /// File extensions the daemon publishes per transmission.
 const PUBLISHED_EXTENSIONS: [&str; 3] = ["dvrec", "mp3", "txt"];
 
-/// One published transmission — the listing entries sharing a stem.
+/// One published transmission: the listing entries sharing a stem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedTx {
     /// Filename stem exactly as published (no extension).
@@ -168,7 +168,7 @@ pub enum FetchReason {
     PairedSidecar,
     /// Packet log to repair a gapped local capture.
     GapFillDvrec,
-    /// Transmission we missed entirely — take everything published.
+    /// Transmission we missed entirely: take everything published.
     Salvage,
 }
 
@@ -234,7 +234,7 @@ fn percent_decode(s: &str) -> String {
 /// A directory listing is untrusted input (the reflector server may be
 /// hostile or compromised) and the name is later joined onto the
 /// download directory and written, so a name carrying `/`, `\`, `..`,
-/// or a leading separator must never reach the filesystem — otherwise
+/// or a leading separator must never reach the filesystem; otherwise
 /// the HTTP body is written outside the download tree (an absolute
 /// component makes `Path::join` drop the base entirely).
 fn is_safe_basename(name: &str) -> bool {
@@ -346,7 +346,7 @@ pub fn parse_listing(html: &str) -> Vec<PublishedTx> {
 pub fn load_local_recordings(date_dir: &Path) -> std::io::Result<LoadedLocal> {
     let mut out = LoadedLocal::default();
     if !date_dir.exists() {
-        // No local captures for this date — everything published is
+        // No local captures for this date, so everything published is
         // a salvage candidate.
         return Ok(out);
     }
@@ -568,7 +568,7 @@ pub enum HarvestError {
     /// HTTP client construction failed.
     #[error("http client: {0}")]
     Client(#[source] reqwest::Error),
-    /// Local filesystem failure (the archive is the point — fatal).
+    /// Local filesystem failure (the archive is the point, so fatal).
     #[error("archive io: {0}")]
     Io(#[from] std::io::Error),
     /// Manifest serialization failed (unexpected).
@@ -579,7 +579,7 @@ pub enum HarvestError {
     Write(#[from] crate::writer::WriteError),
 }
 
-/// One run's coverage summary — printed to the operator and appended
+/// One run's coverage summary, printed to the operator and appended
 /// to the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
@@ -622,7 +622,7 @@ pub struct RunRecord {
     pub error: Option<String>,
 }
 
-/// One attempted download — appended to the manifest.
+/// One attempted download, appended to the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRecord {
     /// When the download ran.
@@ -661,7 +661,7 @@ pub struct HarvestOptions {
     pub base_url: Option<String>,
     /// Cap on downloads per run.
     pub limit: Option<usize>,
-    /// Plan and report only — write nothing, download nothing.
+    /// Plan and report only: write nothing, download nothing.
     pub dry_run: bool,
     /// Pause between downloads (default [`POLITE_GAP`]).
     pub fetch_gap: Duration,
@@ -797,7 +797,7 @@ impl Harvester {
         };
         if robots_blocked {
             record.error =
-                Some("robots.txt disallows the streams tree for us — nothing fetched".to_string());
+                Some("robots.txt disallows the streams tree for us; nothing fetched".to_string());
             return Ok(record);
         }
 
@@ -806,7 +806,7 @@ impl Harvester {
             Ok((status, body)) => {
                 record.http_status = Some(status);
                 match status {
-                    // Nothing published for this date — normal.
+                    // Nothing published for this date, which is normal.
                     404 => {}
                     200 => {
                         let published = parse_listing(&String::from_utf8_lossy(&body));
@@ -828,7 +828,7 @@ impl Harvester {
             }
         }
 
-        // Append the run summary — but never create directory litter
+        // Append the run summary, but never create directory litter
         // for a date with nothing to do and nothing done before.
         if !self.dry_run
             && (record.planned > 0 || record.skipped_existing > 0 || published_dir.exists())
@@ -903,11 +903,11 @@ impl Harvester {
             append_manifest(published_dir, &ManifestRecord::File(file_record))?;
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                 // A struggling or purging server should not receive
-                // the rest of the plan — everything left retries on a
+                // the rest of the plan; everything left retries on a
                 // later run.
                 record.error = Some(format!(
-                    "stopped after {MAX_CONSECUTIVE_FAILURES} consecutive download failures — \
-                     leaving the server alone; remaining files retry next run"
+                    "stopped after {MAX_CONSECUTIVE_FAILURES} consecutive download failures. \
+                     Leaving the server alone; remaining files retry next run"
                 ));
                 break;
             }
@@ -1096,7 +1096,7 @@ mod tests {
             .collect();
         // Chronological, not lexical: the 12:00 module-A row precedes
         // the 17:54 row even though "REF030-A" sorts first lexically
-        // only by accident — assert explicit chronology instead.
+        // only by accident; assert explicit chronology instead.
         assert!(
             stems.first().is_some_and(|s| s.contains("120000")),
             "{stems:?}"

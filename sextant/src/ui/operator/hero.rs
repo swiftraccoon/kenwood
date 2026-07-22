@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Hero display — the deck's main instrument. One of four states:
+//! Hero display: the deck's main instrument. One of four states:
 //! not-linked invitation, dimmed listening, amber receiving, red
 //! on-air.
 
@@ -17,7 +17,7 @@ use crate::ui::format::elapsed_mmss;
 /// (if you key up over a stream, YOUR state is what matters).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeroState {
-    /// No session — invite the operator to pick a reflector.
+    /// No session: invite the operator to pick a reflector.
     NotLinked,
     /// Linked and idle.
     Listening,
@@ -55,7 +55,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-/// The 44 px monospace callsign — the loudest element in the app.
+/// The 44 px monospace callsign, the loudest element in the app.
 fn big_callsign(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     ui.label(
         egui::RichText::new(text)
@@ -122,7 +122,7 @@ fn listening(app: &App, ui: &mut egui::Ui) {
 /// with distance/bearing, elapsed, loss stats, live audio level.
 fn receiving(app: &App, ui: &mut egui::Ui) {
     ui.label(theme::section_label("now receiving"));
-    let callsign = app.current_rx_callsign.as_deref().unwrap_or("——");
+    let callsign = app.current_rx_callsign.as_deref().unwrap_or("unknown");
     let resp = ui
         .add(
             egui::Label::new(
@@ -166,7 +166,7 @@ fn receiving(app: &App, ui: &mut egui::Ui) {
             .color(theme::TEXT_TERTIARY),
         );
     }
-    // Live decoded-audio level — confidence the stream is audible.
+    // Live decoded-audio level: confidence the stream is audible.
     ui.add_space(4.0);
     ui.scope(|ui| {
         ui.set_max_width(200.0);

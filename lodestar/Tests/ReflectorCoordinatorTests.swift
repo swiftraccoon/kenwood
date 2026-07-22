@@ -8,7 +8,7 @@ import XCTest
 final class ReflectorCoordinatorTests: XCTestCase {
     /// The coordinator persists through `UserDefaults.standard`, so
     /// tests that touch persisted settings snapshot and restore the
-    /// affected keys — otherwise running the suite would silently
+    /// affected keys; otherwise running the suite would silently
     /// rewrite the developer's own app settings (e.g. mute monitor
     /// audio on the next launch).
     private let touchedKeys = [
@@ -44,7 +44,7 @@ final class ReflectorCoordinatorTests: XCTestCase {
 
     func testEventsApplyInArrivalOrder() async throws {
         // setUp cleared the persisted keys, so `recentlyHeard` starts
-        // empty regardless of prior app runs — hermetic like CI.
+        // empty regardless of prior app runs: hermetic like CI.
         let coordinator = ReflectorCoordinator()
         // Silence on-device playback: the voiceFrame events below carry
         // 12 zero bytes that would otherwise reach the audio pipeline.

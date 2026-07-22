@@ -9,8 +9,8 @@
 //! D-STAR routing header. A capture from our own client session of
 //! the same stream is byte-identical (verified against a live
 //! transmission frame for frame), so a transmission we never
-//! captured — recorder offline, target disabled, or a reflector we
-//! do not link — can be reconstructed from its published dvrec into
+//! captured (recorder offline, target disabled, or a reflector we
+//! do not link) can be reconstructed from its published dvrec into
 //! the same `.ambe`/`.wav`/`.json` recording layout the live
 //! recorder writes, and from there paired with its published
 //! reference MP3 like any other recording.
@@ -38,7 +38,7 @@ use crate::writer::Writer;
 /// Failures parsing a dvrec file.
 #[derive(Debug, thiserror::Error)]
 pub enum DvrecError {
-    /// No header line — the D-STAR routing fields are unknown.
+    /// No header line, so the D-STAR routing fields are unknown.
     #[error("no hdr line in dvrec")]
     MissingHeader,
     /// No voice frames.
@@ -239,7 +239,7 @@ pub struct ImportSummary {
     /// Transmissions that already had a local recording.
     pub skipped_existing: usize,
     /// Voiceless logs (kerchunks: header + end marker, zero voice
-    /// frames) — a normal on-air shape, nothing to reconstruct.
+    /// frames): a normal on-air shape, nothing to reconstruct.
     pub skipped_voiceless: usize,
     /// Dvrec files that could not be parsed or written.
     pub failed: usize,
@@ -254,7 +254,7 @@ const MATCH_TOLERANCE_SECS: i64 = 120;
 /// Walks `<recordings>/<SYS>-<M>/<date>/published/*.dvrec` and
 /// reconstructs a recording per unmatched transmission (twins are
 /// matched on stream id within a start-time window). Existing
-/// captures — including gapped ones — are never overwritten.
+/// captures, including gapped ones, are never overwritten.
 ///
 /// # Errors
 ///
@@ -318,10 +318,10 @@ fn import_one(
         Ok(p) => p,
         Err(DvrecError::NoFrames) => {
             // Kerchunk: a header and end marker with no voice at all.
-            // Normal on-air behavior, not a failure — and it must not
+            // Normal on-air behavior, not a failure, and it must not
             // fail the import step (the nightly pipeline aborts on a
             // failing exit before ever reaching alignment).
-            tracing::debug!(path = %path.display(), "voiceless dvrec (kerchunk) — skipped");
+            tracing::debug!(path = %path.display(), "voiceless dvrec (kerchunk); skipped");
             summary.skipped_voiceless += 1;
             return;
         }
@@ -392,7 +392,7 @@ mod tests {
     /// line, and vde end-marker shape are verified against live
     /// captures (a census over 97 published dvrecs parsed every line:
     /// only hdr/vd/vde records exist). The vde payload is always the
-    /// AMBE silence constant with its seq carrying an 0x40 end flag —
+    /// AMBE silence constant with its seq carrying an 0x40 end flag,
     /// correctly not a voice frame. Later vd lines here carry real
     /// AMBE payloads with abridged slow-data, and one seq gap is
     /// contrived at 02.
@@ -452,9 +452,9 @@ mod tests {
     #[test]
     fn gap_accounting_matches_capture_core_on_dup_and_wild_seq() -> TestResult {
         // A duplicate seq (01, 01) and an out-of-alphabet seq (2A = 42,
-        // e.g. a corrupted byte) must both contribute ZERO gaps — the
+        // e.g. a corrupted byte) must both contribute ZERO gaps: the
         // divergent local formula previously reported 20 for a repeat
-        // and ran unguarded on wild bytes. Seqs here: 0,1,1,42,2 — the
+        // and ran unguarded on wild bytes. Seqs here: 0,1,1,42,2. The
         // only genuine discontinuity (1 -> 2 across the noise) is none,
         // since 2 follows 1 in the alphabet once the wild value is
         // ignored... but the wild value resets prev, so 42 -> 2 is also
@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(summary.imported, 0, "{summary:?}");
         assert_eq!(summary.skipped_existing, 1);
 
-        // A voiceless kerchunk log is a skip, never a failure — a
+        // A voiceless kerchunk log is a skip, never a failure: a
         // failing import exit would abort the nightly pipeline
         // before alignment.
         std::fs::write(

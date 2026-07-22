@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: 2026 Swift Raccoon
  * SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
  *
- * LodestarUSBSerialDriver — byte pump between the iPad app and the
+ * LodestarUSBSerialDriver: byte pump between the iPad app and the
  * TH-D75's CDC Data interface (bulk IN/OUT on bInterfaceNumber 1).
  *
  * Concurrency: everything mutable lives behind the driver's default
@@ -41,7 +41,7 @@ constexpr uint32_t kOutBufferSize = 4096;
 // CDC PSTN class requests to the communications interface (wIndex 0).
 // Kenwood documents the line-coding VALUE as ignored, but every real
 // host OS sends SET_LINE_CODING on port open and the radio's CDC stack
-// may not bring up its TX path until it has seen one — send both, in
+// may not bring up its TX path until it has seen one; send both, in
 // the standard host order (line coding, then DTR|RTS). Hardware
 // evidence 2026-07-19: with only SET_CONTROL_LINE_STATE the radio ACKs
 // our bulk-OUT bytes yet never answers CAT.
@@ -53,7 +53,7 @@ constexpr uint16_t kCdcDtrRts = 0x0003;
 constexpr uint8_t kLineCoding115200_8N1[7] = {0x00, 0xC2, 0x01, 0x00, 0x00, 0x00, 0x08};
 
 // Diagnostic event ring. Entry layout and event codes are mirrored by
-// `USBDextLogEntry` in Shared/Transport/USBSerialLink.swift — keep in
+// `USBDextLogEntry` in Shared/Transport/USBSerialLink.swift; keep in
 // sync. 96 × 32 B = 3072 B, fits one 4096 B read.
 struct LodestarLogEntry {
     uint32_t seq;
@@ -141,7 +141,7 @@ static size_t RxCount(const LodestarUSBSerialDriver_IVars *iv)
 
 /// Mark the link dead and wake the app. Must run on the driver queue.
 /// The armed doorbell is the app's ONLY signal (it never polls Status
-/// while a read is parked) — every path that kills the pump must fire
+/// while a read is parked); every path that kills the pump must fire
 /// it, or a receive-only session hangs forever with no error anywhere.
 static void LinkFailed(LodestarUSBSerialDriver_IVars *iv, const char *why,
                        uint64_t reason)
@@ -158,7 +158,7 @@ static void LinkFailed(LodestarUSBSerialDriver_IVars *iv, const char *why,
 }
 
 /// Submit the TX FIFO head if idle. Must run on the driver queue.
-/// Bytes leave the FIFO only AFTER AsyncIO accepts the transfer — a
+/// Bytes leave the FIFO only AFTER AsyncIO accepts the transfer: a
 /// dequeue-before-submit ordering silently loses already-accepted
 /// bytes when the submit fails.
 static void SendNextTx(LodestarUSBSerialDriver_IVars *iv)
@@ -300,7 +300,7 @@ kern_return_t IMPL(LodestarUSBSerialDriver, Start)
     // memory: documented as mapped in the driver's address space with
     // GetAddressRange valid. (The interface's CreateIOBuffer variant is
     // controller-optimized but its dext-side dereferenceability proved
-    // doubtful on iPadOS 27 — the first `memcpy(outAddr, …)` killed the
+    // doubtful on iPadOS 27: the first `memcpy(outAddr, …)` killed the
     // process with MIG_SERVER_DIED. Bounced DMA is irrelevant at our
     // ~1 KB/s.) Addresses are additionally guarded: a zero address
     // fails Start instead of crashing on first use. ---
@@ -412,7 +412,7 @@ void IMPL(LodestarUSBSerialDriver, BulkInComplete)
         Log("BulkInComplete: status 0x%x (streak %u)", status, ivars->inErrorStreak);
         LogEvent(ivars, kEvBulkInError, status, actualByteCount, ivars->inErrorStreak);
         if (ivars->inErrorStreak > 3) {
-            // Give up — and WAKE THE APP: the armed doorbell is its only
+            // Give up, and WAKE THE APP: the armed doorbell is its only
             // signal, and a parked read makes no user-client calls.
             LinkFailed(ivars, "bulk-IN error streak", 2);
             return;

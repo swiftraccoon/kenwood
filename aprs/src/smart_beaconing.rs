@@ -30,7 +30,7 @@
 //! | 545  | Turn Thresh  | 28°      | `turn_min_deg`    |
 //! | 546  | Turn Time    | 15 s     | `turn_time_secs`  |
 //!
-//! Earlier code generations carried documentation drift in this table —
+//! Earlier code generations carried documentation drift in this table:
 //! the prose claimed "eight parameters via Menu 540-547" while only
 //! seven menu rows existed, and the Turn Time row stated `30 s` while
 //! the algorithm's `Default` impl shipped `15 s` (which matches the
@@ -93,11 +93,11 @@ impl Default for SmartBeaconingConfig {
 /// Reason a `SmartBeacon` was triggered at a given moment.
 ///
 /// Returned by [`SmartBeaconing::beacon_reason`]. Useful for logging or
-/// UI display — `SmartBeaconing` has three distinct trigger conditions,
+/// UI display: `SmartBeaconing` has three distinct trigger conditions,
 /// and users often want to know which one fired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BeaconReason {
-    /// First beacon of the session — nothing sent yet.
+    /// First beacon of the session, with nothing sent yet.
     First,
     /// Time-based interval elapsed since the previous beacon.
     TimeExpired,
@@ -114,7 +114,7 @@ pub enum BeaconReason {
 /// the reference data they need.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BeaconState {
-    /// No beacon has been sent yet — first call to `should_beacon` /
+    /// No beacon has been sent yet; the first call to `should_beacon` /
     /// `beacon_reason` will return `Some(BeaconReason::First)`.
     Uninitialized,
     /// At least one beacon has been sent. Carries the timestamp and
@@ -185,8 +185,8 @@ impl SmartBeaconing {
     ///
     /// Mirroring the builder policy for non-finite lat/lon, inputs are
     /// sanitized on entry: a non-finite speed (`NaN`, `±∞`) is treated
-    /// as `0.0` — stopped, so the slow rate applies and no zero-second
-    /// interval can arise — and a non-finite course means "no heading
+    /// as `0.0` (stopped, so the slow rate applies and no zero-second
+    /// interval can arise), and a non-finite course means "no heading
     /// information", so no turn beacon can fire. A finite out-of-range
     /// course (e.g. `480.0`) is wrapped into `[0, 360)` before the
     /// heading comparison.
@@ -243,7 +243,7 @@ impl SmartBeaconing {
     /// ```
     ///
     /// A non-finite speed is treated as `0.0` (stopped), yielding an
-    /// infinite threshold — no turn beacon is possible without valid
+    /// infinite threshold: no turn beacon is possible without valid
     /// speed data.
     #[must_use]
     pub fn current_turn_threshold(&self, speed_kmh: f64) -> f64 {
@@ -359,8 +359,8 @@ const fn sanitize_speed(speed_kmh: f64) -> f64 {
 
 /// Normalize a course to `[0, 360)` degrees.
 ///
-/// Returns `None` for non-finite input (`NaN`, `±∞`) — no heading
-/// information, so turn detection must not use it. A finite
+/// Returns `None` for non-finite input (`NaN`, `±∞`), which means no
+/// heading information, so turn detection must not use it. A finite
 /// out-of-range value (e.g. `480.0`) wraps into range so
 /// [`heading_delta`] sees the true heading instead of computing a
 /// bogus (possibly negative) delta.
@@ -540,7 +540,7 @@ mod tests {
         assert!(sb.should_beacon(3.0, 0.0, t0));
         sb.beacon_sent_with(3.0, 0.0, t0);
 
-        // Large heading change but at low speed — should NOT trigger.
+        // Large heading change but at low speed: should NOT trigger.
         assert!(!sb.should_beacon(3.0, 90.0, t0));
     }
 
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn nan_course_fires_no_turn_beacon() {
-        // Non-finite course means "no heading information" — it must
+        // Non-finite course means "no heading information", so it must
         // never fire a turn beacon, whether it arrives as the current
         // course or was recorded at the previous beacon.
         let t0 = Instant::now();
@@ -667,7 +667,7 @@ mod tests {
     #[test]
     fn turn_threshold_non_finite_speed_is_infinite() {
         // Non-finite speed sanitizes to 0.0 (stopped), so no turn
-        // beacon is possible — the threshold must be infinite, not NaN
+        // beacon is possible: the threshold must be infinite, not NaN
         // (NaN) or a finite value (+∞ input).
         let sb = SmartBeaconing::new(SmartBeaconingConfig::default());
         assert!(sb.current_turn_threshold(f64::NAN).is_infinite());
@@ -679,12 +679,12 @@ mod tests {
     fn turn_time_gates_turn_beacon() {
         let t0 = Instant::now();
         let mut sb = SmartBeaconing::new(SmartBeaconingConfig::default());
-        // Default turn_time_secs is 15 — less than 15 secs and the turn
+        // Default turn_time_secs is 15; less than 15 secs and the turn
         // beacon is suppressed even when the angle threshold is met.
         assert!(sb.should_beacon(75.0, 0.0, t0));
         sb.beacon_sent_with(75.0, 0.0, t0);
 
-        // 5 seconds after the beacon, a 45-degree turn should NOT fire —
+        // 5 seconds after the beacon, a 45-degree turn should NOT fire:
         // the turn_time_secs gate is still closed.
         let t5 = t0 + Duration::from_secs(5);
         assert_eq!(sb.beacon_reason(75.0, 45.0, t5), None);

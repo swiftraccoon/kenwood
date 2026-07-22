@@ -26,7 +26,7 @@
 //! ```
 //! use mbelib_rs::AmbeDecoder;
 //!
-//! // Create one decoder per voice stream — it carries inter-frame state
+//! // Create one decoder per voice stream; it carries inter-frame state
 //! // needed for delta decoding and phase-continuous synthesis.
 //! let mut decoder = AmbeDecoder::new();
 //!
@@ -42,12 +42,12 @@
 //!
 //! Each frame passes through these stages:
 //!
-//! 1. **Bit unpacking** — 72-bit frame → 4 FEC codeword bitplanes
-//! 2. **Error correction** — Golay(23,12) on C0 and C1 (3-error
+//! 1. **Bit unpacking**: 72-bit frame → 4 FEC codeword bitplanes
+//! 2. **Error correction**: Golay(23,12) on C0 and C1 (3-error
 //!    correction). AMBE 3600×2400 does not apply Hamming to C3; those
 //!    14 bits are copied verbatim into the parameter vector.
-//! 3. **Demodulation** — LFSR descrambling of C1 using C0 seed
-//! 4. **Parameter extraction** — 49 decoded bits → fundamental frequency,
+//! 3. **Demodulation**: LFSR descrambling of C1 using C0 seed
+//! 4. **Parameter extraction**: 49 decoded bits → fundamental frequency,
 //!    harmonic count, voiced/unvoiced decisions, spectral magnitudes.
 //!    Disposition then splits three ways: valid tone frames (b0 in
 //!    126..=127) are synthesized directly by a dedicated tone oscillator;
@@ -55,15 +55,15 @@
 //!    emit silence and fully re-initialize the decoder state; voice frames
 //!    whose FEC required more than 3 corrected bits reuse the previous
 //!    frame's parameters and increment the repeat counter.
-//! 5. **Spectral enhancement** — adaptive amplitude weighting for clarity
-//! 6. **Adaptive smoothing** — JMBE algorithms #111-116, gracefully
+//! 5. **Spectral enhancement**: adaptive amplitude weighting for clarity
+//! 6. **Adaptive smoothing**: JMBE algorithms #111-116, gracefully
 //!    damps spurious magnitudes/voicing decisions on noisy frames
-//! 7. **Frame muting check** — comfort noise on excessive errors or
+//! 7. **Frame muting check**: comfort noise on excessive errors or
 //!    sustained repeat frames (JMBE-compatible)
-//! 8. **Synthesis** — voiced bands per-band cosine oscillators (with
+//! 8. **Synthesis**: voiced bands per-band cosine oscillators (with
 //!    JMBE phase/amplitude interpolation for low harmonics) plus a
 //!    single FFT-based unvoiced pass (JMBE algorithms #117-126)
-//! 9. **Output conversion** — float PCM → i16 with SIMD-vectorized
+//! 9. **Output conversion**: float PCM → i16 with SIMD-vectorized
 //!    gain and clamping
 
 // Dev-dependency `proptest` is used only inside the `encoder` feature module
@@ -106,8 +106,8 @@ pub use error::DecodeError;
 /// bits differ) vs "parameter extraction disagrees" (`ambe_d` bits
 /// match but `b[]` differs).
 ///
-/// This is deliberately stateless — each call constructs fresh
-/// `MbeParams` — so the output depends only on the input bytes and
+/// This is deliberately stateless (each call constructs fresh
+/// `MbeParams`), so the output depends only on the input bytes and
 /// can be compared frame-for-frame against another implementation.
 #[must_use]
 pub fn decode_trace(ambe: &[u8; 9]) -> ([usize; 9], f32, usize, [u8; 49]) {
@@ -168,8 +168,8 @@ pub fn decode_trace(ambe: &[u8; 9]) -> ([usize; 9], f32, usize, [u8; 49]) {
 ///
 /// Mirrors the decoder's internal frame disposition exactly: tone
 /// frames are `(b0 & 0x7E) == 0x7E` (b0 ∈ {126, 127}), erasure
-/// frames are `b0 ∈ 120..=123`, and everything else — including the
-/// b0 ∈ {124, 125} silence encodings — decodes as voice.
+/// frames are `b0 ∈ 120..=123`, and everything else, including the
+/// b0 ∈ {124, 125} silence encodings, decodes as voice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
     /// Speech-model frame (includes explicit silence encodings).
@@ -246,7 +246,7 @@ pub const PARAM_BANDS: usize = 56;
 
 /// Per-frame vocoder parameters, extracted without synthesis.
 ///
-/// This is the harmonic speech model the codec transmits — the same
+/// This is the harmonic speech model the codec transmits: the same
 /// parameter family (fundamental, per-band voicing, spectral
 /// amplitudes) that vocoder-parameter ASR consumes directly instead
 /// of reconstructed audio.
@@ -290,7 +290,7 @@ impl FrameParams {
 /// track without audio synthesis.
 ///
 /// AMBE delta-codes gain and predicts magnitudes from the previous
-/// frame, so extraction is sequential — feed frames in stream order,
+/// frame, so extraction is sequential: feed frames in stream order,
 /// one extractor per stream, exactly like [`AmbeDecoder`]. The
 /// disposition rules mirror the decoder: untrustworthy frames
 /// (more than 3 corrected bits) repeat the previous parameters,
@@ -408,7 +408,7 @@ pub use encode::{
 /// Kenwood-specific constants for A/B testing the encoder, gated
 /// behind the `kenwood-tables` feature.
 ///
-/// The encoder pipeline does NOT consume these by default — the
+/// The encoder pipeline does NOT consume these by default; the
 /// module is a catalogue, not a swap. Swap points are introduced
 /// deliberately, one at a time, with each change measurable against
 /// hardware-in-the-loop captures.
@@ -437,10 +437,10 @@ const FRAME_BITS: f32 = 72.0;
 /// spectral magnitudes are delta-coded against the previous frame.
 /// This decoder maintains three parameter snapshots to support that:
 ///
-/// - **`cur`** — parameters decoded from the current frame
-/// - **`prev`** — previous frame's parameters (before enhancement),
+/// - **`cur`**: parameters decoded from the current frame
+/// - **`prev`**: previous frame's parameters (before enhancement),
 ///   used as the prediction reference for delta decoding
-/// - **`prev_enhanced`** — previous frame's parameters (after spectral
+/// - **`prev_enhanced`**: previous frame's parameters (after spectral
 ///   enhancement), used as the cross-fade source during synthesis
 ///
 /// # Invariants
@@ -478,7 +478,8 @@ pub struct AmbeDecoder {
 /// the synthesis away from mbelib parity toward configurations scored
 /// against reference-decoded audio of the same transmissions; they
 /// never change bitstream interpretation, FEC handling, or frame
-/// disposition — only how already-decoded parameters are rendered.
+/// disposition; they change only how already-decoded parameters are
+/// rendered.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SynthesisTuning {
     /// Spectral-enhancement sharpening factor (mbelib parity: `0.96`).
@@ -495,13 +496,13 @@ pub struct SynthesisTuning {
     /// Multiplier on the unvoiced excitation level (parity: `1.0`).
     pub unvoiced_gain: f32,
     /// Multiplier on the voiced phase jitter (parity: `1.0`).
-    /// `0.0` accumulates fully deterministic harmonic phases —
+    /// `0.0` accumulates fully deterministic harmonic phases:
     /// cleaner, at the risk of a more mechanical timbre.
     pub phase_jitter: f32,
 }
 
 impl SynthesisTuning {
-    /// The exact mbelib/JMBE constants — decoding with this tuning is
+    /// The exact mbelib/JMBE constants. Decoding with this tuning is
     /// bit-identical to [`AmbeDecoder::new`].
     pub const PARITY: Self = Self {
         enhance_alpha: 0.96,
@@ -566,7 +567,7 @@ impl AmbeDecoder {
         unpack::demodulate_c1(&mut ambe_fr);
         let other_errors = ecc::ecc_data(&ambe_fr, &mut ambe_d);
 
-        // Frame disposition — ports mbelib's `mbe_processAmbe2400Dataf`
+        // Frame disposition, porting mbelib's `mbe_processAmbe2400Dataf`
         // (`mbelib/ambe3600x2400.c:655-713`) exactly:
         //
         // 1. Erasure (b0 in 120..=123), invalid single-tone index, or
@@ -580,7 +581,7 @@ impl AmbeDecoder {
         //    RAW parameters (`mbe_useLastMbeParms` copies `prev_mp`,
         //    not the enhanced snapshot) and increment the repeat
         //    counter. Real-world reflector uplinks sit in this zone
-        //    for a large fraction of frames — decoding them fresh is
+        //    for a large fraction of frames; decoding them fresh is
         //    what turned noisy-but-intelligible speech into garble.
         // 3. More than 3 consecutive repeats: mute (comfort noise
         //    downstream) and re-initialize, per the reference's
@@ -593,7 +594,7 @@ impl AmbeDecoder {
                 // Single tone at index × 31.25 Hz. No open reference
                 // implements tone synthesis (mbelib decodes the
                 // descriptor for diagnostics and outputs silence), but
-                // real DVSI decoders render the tone — and hardware
+                // real DVSI decoders render the tone, and hardware
                 // encoders emit tone frames for any pure-tone input,
                 // so muting them fails legitimate captures. The
                 // amplitude mapping (`volume × 32`) is empirical:
@@ -663,7 +664,7 @@ impl AmbeDecoder {
         // Same repeat semantics as an untrustworthy wire frame: copy
         // the previous frame's RAW parameters (the reference's
         // `mbe_useLastMbeParms` copies `prev_mp`, not the enhanced
-        // snapshot — repeats must not re-enhance already-enhanced
+        // snapshot; repeats must not re-enhance already-enhanced
         // spectra) and increment the repeat counter.
         let prev_repeat = self.prev.repeat_count;
         self.cur.copy_from(&self.prev);
@@ -963,7 +964,7 @@ mod frame_fec_tests {
     /// An all-zero frame is NOT FEC-clean end to end: C0 is the valid
     /// zero Golay codeword (0 corrections), but the C1 bits are then
     /// LFSR-descrambled with the C0-seeded PRN, and that descrambled
-    /// pattern is not a codeword — the data-path Golay reports 2
+    /// pattern is not a codeword; the data-path Golay reports 2
     /// corrections. Pinned here as a regression guard on the ECC
     /// accounting; [`SILENCE`] is the true zero-error baseline.
     #[test]
@@ -1002,13 +1003,13 @@ mod frame_fec_tests {
         }
         assert!(
             found,
-            "no wire bit flip landed in C0 — interleave regression?"
+            "no wire bit flip landed in C0 (interleave regression?)"
         );
     }
 
     /// The repeat disposition trusts a frame at exactly three
-    /// corrected bits and repeats the previous parameters at four —
-    /// the `errs2 > 3` boundary mbelib uses (Golay mis-corrects
+    /// corrected bits and repeats the previous parameters at four,
+    /// which is the `errs2 > 3` boundary mbelib uses (Golay mis-corrects
     /// silently above three). Real reflector uplinks live around this
     /// threshold, and decoding untrusted frames fresh is the past
     /// regression that turned noisy-but-intelligible speech into
@@ -1066,7 +1067,7 @@ mod frame_fec_tests {
             "fully corrected frame decodes to the clean payload"
         );
 
-        // Four corrections: one past the trust threshold — the frame
+        // Four corrections, one past the trust threshold: the frame
         // must be discarded and the previous parameters repeated.
         let mut frame4 = SILENCE;
         flip(&mut frame4, c0_a);
@@ -1100,7 +1101,7 @@ mod frame_fec_tests {
 
     /// `frame_fec`'s kind must agree with the classification rule
     /// applied to the b0 that `decode_trace` extracts from the same
-    /// wire bytes — the two paths share the unpack→ECC pipeline.
+    /// wire bytes; the two paths share the unpack→ECC pipeline.
     #[test]
     fn kind_agrees_with_decode_trace_b0() {
         for frame in [[0u8; 9], SILENCE, [0xFF; 9], [0xA5; 9]] {

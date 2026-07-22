@@ -10,7 +10,7 @@ const SAMPLE_RATE: u32 = 8000;
 ///
 /// Standard 44-byte RIFF/WAVE header (PCM format tag 1, mono,
 /// 8 kHz, 16-bit little-endian) followed by the raw samples. Sizes
-/// saturate at `u32::MAX` — unreachable in practice, since stream
+/// saturate at `u32::MAX`, which is unreachable in practice: stream
 /// length is bounded by the session inactivity timeout.
 #[must_use]
 pub fn wav_bytes(pcm: &[i16]) -> Vec<u8> {

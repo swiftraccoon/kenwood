@@ -54,7 +54,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
 
 #[expect(
     clippy::too_many_lines,
-    reason = "Draws the complete D-STAR CAT-config section — Ratatui's immediate-mode \
+    reason = "Draws the complete D-STAR CAT-config section. Ratatui's immediate-mode \
               API means each visible cell is an explicit construction call; splitting \
               would move layout logic away from the constraints that bound it."
 )]
@@ -225,7 +225,7 @@ fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
 #[expect(
     clippy::too_many_lines,
     reason = "Draws the complete D-STAR gateway view (session status, stream history, \
-              last-heard list) — Ratatui's immediate-mode API means each visible cell \
+              last-heard list). Ratatui's immediate-mode API means each visible cell \
               is an explicit construction call; splitting would move layout logic away \
               from the constraints that bound it."
 )]

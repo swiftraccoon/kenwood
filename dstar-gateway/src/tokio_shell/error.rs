@@ -11,7 +11,7 @@ pub enum ShellError {
     #[error(transparent)]
     Core(#[from] CoreError),
 
-    /// The session task has stopped — handle is no longer valid.
+    /// The session task has stopped; the handle is no longer valid.
     #[error("session task closed")]
     SessionClosed,
 

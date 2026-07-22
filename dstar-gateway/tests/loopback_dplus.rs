@@ -76,7 +76,7 @@ async fn dplus_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std::
 
     // 3. Build a `Session<DPlus, Configured>`, authenticate it with
     //    an empty `HostList` (the core attaches the list as the proof
-    //    of a completed TCP auth step — we bypass the real auth
+    //    of a completed TCP auth step; we bypass the real auth
     //    entirely in this test), then call `.connect()` to enqueue
     //    the LINK1 packet.
     let session: Session<DPlus, Configured> = Session::<DPlus, Configured>::builder()

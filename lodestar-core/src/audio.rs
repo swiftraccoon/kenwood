@@ -14,7 +14,7 @@ use mbelib_rs::AmbeDecoder;
 
 /// Samples per 20 ms AMBE frame at 8 kHz.
 pub(crate) const FRAME_SAMPLES: usize = 160;
-/// D-STAR superframe length — wire seq wraps mod this value.
+/// D-STAR superframe length; wire seq wraps mod this value.
 const SUPERFRAME_LEN: u8 = 21;
 /// Longest gap concealed frame-by-frame (10 frames = 200 ms). Beyond
 /// this, repeating one voice posture sounds worse than a clean
@@ -150,7 +150,7 @@ impl RxAudioPipeline {
             return Vec::new();
         }
         // Wire seq is 0..21 on a well-formed stream, but the value
-        // arrives off the network — normalize so a hostile or corrupt
+        // arrives off the network; normalize so a hostile or corrupt
         // frame can't overflow the mod-21 ring arithmetic below.
         let seq = seq % SUPERFRAME_LEN;
         let mut out = Vec::new();

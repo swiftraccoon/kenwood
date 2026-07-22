@@ -78,14 +78,14 @@ fn peak_i16(pcm: &[i16]) -> f32 {
 
 /// A sustained sine wave, piped through encoder and then decoder,
 /// must produce non-silent output from the dec. Threshold is
-/// deliberately generous — we're asserting "some signal survives",
+/// deliberately generous: we're asserting "some signal survives",
 /// not bit-exactness.
 #[test]
 fn sine_1khz_encode_decode_produces_audio() {
     let mut enc = AmbeEncoder::new();
     let mut dec = AmbeDecoder::new();
 
-    // Warm up the encoder's internal state across a few frames —
+    // Warm up the encoder's internal state across a few frames:
     // pitch tracker, spectral history etc. need time to converge.
     // Same pattern we use in the encoder's pitch.rs tests.
     let mut t0 = 0_usize;
@@ -117,7 +117,7 @@ fn sine_1khz_encode_decode_produces_audio() {
         peak > 0.01,
         "encoder→decoder round-trip produced silent output for a sustained sine wave input. \
          peak={peak:.4} rms={rms:.4}. This means the encoder is emitting AMBE bytes that even \
-         our own decoder interprets as silence — a codec internal-consistency bug."
+         our own decoder interprets as silence, a codec internal-consistency bug."
     );
 }
 
@@ -125,14 +125,14 @@ fn sine_1khz_encode_decode_produces_audio() {
 /// not pure silence.
 ///
 /// D-STAR / mbelib silence frames (b0 = 124/125) are decoded with
-/// w0 = 2π/32, L = 14, all bands unvoiced — which produces a
+/// w0 = 2π/32, L = 14, all bands unvoiced, which produces a
 /// low-level random-phase unvoiced synthesis (comfort noise) rather
 /// than exact zero. This matches DVSI chip behavior: on-wire AMBE
 /// silence is not digital-zero audio; it carries a low-level
 /// pseudo-noise floor so listeners don't perceive the audio channel
 /// as dropped.
 ///
-/// The realistic bound here is "below speech level" — roughly
+/// The realistic bound here is "below speech level": roughly
 /// -10 dBFS peak = 0.3 linear. Anything above that indicates a
 /// broken gain path (which is the 0.22-peak symptom we caught
 /// during the 2400 migration).
@@ -153,7 +153,7 @@ fn zero_input_encode_decode_is_comfort_noise_level() {
     let rms = rms_i16(&decoded);
     assert!(
         peak < 0.3,
-        "zero input produced loud output (peak={peak:.4} rms={rms:.4}) — \
+        "zero input produced loud output (peak={peak:.4} rms={rms:.4}); \
          the decoder is synthesizing a real signal for what should be silence. \
          Expected behaviour: comfort noise floor well below speech level."
     );
@@ -161,9 +161,9 @@ fn zero_input_encode_decode_is_comfort_noise_level() {
 
 /// Dump the AMBE bytes emitted for zero input across N frames so we
 /// can see WHY the decoder produces loud output. Not a pass/fail
-/// test — it's diagnostic only.
+/// test; it's diagnostic only.
 #[test]
-#[ignore = "diagnostic dump, asserts nothing — run explicitly with --ignored --nocapture"]
+#[ignore = "diagnostic dump, asserts nothing; run explicitly with --ignored --nocapture"]
 fn diagnostic_dump_zero_input_ambe() {
     let mut enc = AmbeEncoder::new();
     for frame_num in 0..12 {
@@ -175,7 +175,7 @@ fn diagnostic_dump_zero_input_ambe() {
 /// Dump the AMBE bytes emitted for sine input so we can compare
 /// against zero and see how different they are.
 #[test]
-#[ignore = "diagnostic dump, asserts nothing — run explicitly with --ignored --nocapture"]
+#[ignore = "diagnostic dump, asserts nothing; run explicitly with --ignored --nocapture"]
 fn diagnostic_dump_sine_input_ambe() {
     let mut enc = AmbeEncoder::new();
     let mut t0 = 0_usize;
@@ -216,7 +216,7 @@ fn diagnostic_dump_sine_input_ambe() {
 /// number as the spectral path lands further fixes is the way to
 /// drive the encoder toward recognizable voice.
 #[test]
-#[ignore = "tracks spectral-envelope encoder bug — correlation ~0.04 on sines"]
+#[ignore = "tracks spectral-envelope encoder bug: correlation ~0.04 on sines"]
 fn sine_roundtrip_has_nonzero_correlation_with_input() {
     let mut enc = AmbeEncoder::new();
     let mut dec = AmbeDecoder::new();
@@ -310,13 +310,13 @@ fn sine_roundtrip_has_nonzero_correlation_with_input() {
         max_ncc >= 0.10,
         "round-trip cross-correlation with input is essentially zero: \
          {max_ncc:.4}. The decoder reconstructs a waveform uncorrelated \
-         with the input — spectral-envelope encoder bug (b3/b4/b5-b8). \
+         with the input: spectral-envelope encoder bug (b3/b4/b5-b8). \
          Fix the spectral path; loosen this threshold only as a \
          regression tightening, not a regression loosening."
     );
 }
 
-/// Voice-band roundtrip — 200 Hz fundamental with 4 decaying harmonics
+/// Voice-band roundtrip: 200 Hz fundamental with 4 decaying harmonics
 /// (a synthetic "voice" signal sitting squarely inside the AMBE codec's
 /// design range). 1 kHz is OUT-OF-RANGE for AMBE 3600x2400 (which
 /// targets human speech, F0 ≈ 80–400 Hz), so the existing 1 kHz
@@ -478,13 +478,13 @@ fn voice_band_200hz_roundtrip_correlation() {
 ///
 /// The correlation gates in this file are deliberately loose while
 /// the known encoder deficiencies stand, which leaves the encoder
-/// with no committed regression tripwire — a refactor can change
+/// with no committed regression tripwire: a refactor can change
 /// every emitted frame and nothing fails. This pin freezes the
 /// decoded b-vectors of three steady-state frames (after warm-up) at
 /// their current values; an INTENTIONAL encoder change must update
 /// these constants consciously. The values describe the encoder as
 /// it is today (b0=45 ⇒ the 205.5 Hz pitch quantization, the
-/// known-broken spectral path included) — a drift alarm, not a
+/// known-broken spectral path included). It is a drift alarm, not a
 /// correctness claim.
 #[test]
 fn steady_state_wire_output_for_voice_band_signal_is_pinned() {
@@ -527,7 +527,7 @@ fn sine_input_differs_from_zero_input_encoding() {
     let ambe_zero = enc_zero.encode_frame(&[0.0_f32; 160]);
     assert_ne!(
         ambe_sine, ambe_zero,
-        "encoder emitted identical AMBE bytes for sine and zero input — \
-         sine={ambe_sine:02x?} zero={ambe_zero:02x?} — V/UV or gain path is collapsing all inputs."
+        "encoder emitted identical AMBE bytes for sine and zero input: \
+         sine={ambe_sine:02x?} zero={ambe_zero:02x?}. V/UV or gain path is collapsing all inputs."
     );
 }

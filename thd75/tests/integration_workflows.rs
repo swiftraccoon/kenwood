@@ -7,8 +7,8 @@ use std::path::Path;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
-// weakening the lint. (`::aprs` — the `types::*` glob shadows the
-// bare crate name.)
+// weakening the lint. (`::aprs` is spelled that way because the
+// `types::*` glob shadows the bare crate name.)
 use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;

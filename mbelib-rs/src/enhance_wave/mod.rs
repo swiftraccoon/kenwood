@@ -14,11 +14,11 @@
 //! identity) over the decoder output's STFT. Offline/whole-clip
 //! processing; the recurrence reads the entire clip.
 //!
-//! The forward pass reproduces the training framework's semantics —
+//! The forward pass reproduces the training framework's semantics:
 //! centered reflect-padded STFT (256/64, Hann), exact-erf GELU,
 //! grouped and strided convolutions, a bidirectional GRU, nearest-
-//! neighbor frequency upsampling, and window-normalized inverse STFT
-//! — and is pinned against a recorded reference vector produced by
+//! neighbor frequency upsampling, and window-normalized inverse STFT.
+//! It is pinned against a recorded reference vector produced by
 //! the training checkpoint.
 
 use realfft::RealFftPlanner;
@@ -454,7 +454,7 @@ impl WaveEnhancer {
         feat
     }
 
-    /// The network body — convolutional trunk, bidirectional
+    /// The network body: convolutional trunk, bidirectional
     /// recurrence, nearest-neighbor frequency upsample, and the mask
     /// head. Returns the two raw mask planes (`BINS` × frames each).
     fn network_mask(&self, feat: &[f32], frames: usize) -> Vec<f32> {
@@ -546,9 +546,9 @@ impl WaveEnhancer {
         mask_planes
     }
 
-    /// Bounded complex mask application — `(1 + tanh(m0)) + i·tanh(m1)`
-    /// — and window-normalized overlap-add inverse STFT, cropped back
-    /// to the unpadded input length.
+    /// Bounded complex mask application, `(1 + tanh(m0)) + i·tanh(m1)`,
+    /// followed by window-normalized overlap-add inverse STFT, cropped
+    /// back to the unpadded input length.
     fn istft(
         &self,
         spec: &[Complex<f32>],

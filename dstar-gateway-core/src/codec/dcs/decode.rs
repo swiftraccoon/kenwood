@@ -1,6 +1,6 @@
 //! `DCS` packet decoders.
 //!
-//! Both directions — `decode_client_to_server` parses packets a
+//! Both directions: `decode_client_to_server` parses packets a
 //! client would send, `decode_server_to_client` parses packets a
 //! reflector would send.
 //!
@@ -35,7 +35,7 @@ use super::packet::{ClientPacket, GatewayType, ServerPacket};
 ///
 /// # See also
 ///
-/// `ircDDBGateway/Common/DCSProtocolHandler.cpp` — the reference
+/// `ircDDBGateway/Common/DCSProtocolHandler.cpp`, the reference
 /// parser this decoder mirrors. `xlxd/src/cdcsprotocol.cpp` is
 /// a mirror reference.
 pub fn decode_client_to_server(
@@ -63,7 +63,7 @@ pub fn decode_client_to_server(
 ///
 /// # See also
 ///
-/// `ircDDBGateway/Common/DCSProtocolHandler.cpp` — the reference
+/// `ircDDBGateway/Common/DCSProtocolHandler.cpp`, the reference
 /// parser for the server side of the `DCS` wire format.
 pub fn decode_server_to_client(
     bytes: &[u8],
@@ -82,7 +82,7 @@ pub fn decode_server_to_client(
 /// for embedded zero bytes (so the wire representation stays clean
 /// through `Callsign::from_wire_bytes`).
 ///
-/// This reader is used for every DCS callsign slot — poll,
+/// This reader is used for every DCS callsign slot: poll,
 /// reflector-callsign at `[11..19]`, and the connect-packet
 /// prefix at `[0..8]`. The wire format has byte `[7]` as the
 /// `memset` pad slot and byte `[8]` outside the 8-byte window
@@ -125,7 +125,7 @@ fn decode_client_link(bytes: &[u8]) -> Result<ClientPacket, DcsError> {
             byte: reflector_byte,
         })?;
     let reflector_callsign = extract_callsign(bytes.get(11..19).unwrap_or(&[]));
-    // We don't parse the HTML payload — default to Repeater.
+    // We don't parse the HTML payload, so default to Repeater.
     Ok(ClientPacket::Link {
         callsign,
         client_module,
@@ -304,7 +304,7 @@ fn parse_voice(
 ///
 /// DCS stores the header fields starting at offset 4 with a layout
 /// that differs from [`DStarHeader::encode`]'s default 41-byte
-/// encoding — the flag bytes are at offsets 4/5/6 and the suffix is
+/// encoding: the flag bytes are at offsets 4/5/6 and the suffix is
 /// at offsets 39..43 (no CRC). Build the struct manually from the
 /// field positions.
 fn decode_dcs_header_from_voice(bytes: &[u8]) -> DStarHeader {
@@ -633,7 +633,7 @@ mod tests {
             &cs(*b"DCS001  "),
             GatewayType::Repeater,
         )?;
-        buf[8] = b'b'; // lowercase — invalid
+        buf[8] = b'b'; // lowercase, invalid
         let Err(err) = decode_client_to_server(&buf[..LINK_LEN], &mut NullSink) else {
             return Err("expected error for invalid module byte".into());
         };
@@ -658,7 +658,7 @@ mod tests {
             &cs(*b"DCS001  "),
             GatewayType::Repeater,
         )?;
-        buf[9] = b'1'; // digit — invalid
+        buf[9] = b'1'; // digit, invalid
         let Err(err) = decode_client_to_server(&buf[..LINK_LEN], &mut NullSink) else {
             return Err("expected error for invalid reflector module byte".into());
         };

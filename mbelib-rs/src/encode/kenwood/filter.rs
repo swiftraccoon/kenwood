@@ -53,7 +53,7 @@ impl Biquad2State {
 }
 
 /// Run one biquad section over an input block, writing to the output
-/// block in place. `coeffs` is `[b0, b1, b2, a1, a2]` — the last two
+/// block in place. `coeffs` is `[b0, b1, b2, a1, a2]`; the last two
 /// are the feedback coefficients and are SUBTRACTED from the new
 /// output per the standard DF-I convention. `state` carries the
 /// four-tap delay line across calls.
@@ -146,8 +146,8 @@ mod tests {
     }
 
     /// The filter's pole pair sits very close to its double zero at
-    /// DC, so the notch is narrow. At 100 Hz — well above the
-    /// effective cutoff — the signal passes through nearly intact.
+    /// DC, so the notch is narrow. At 100 Hz, well above the
+    /// effective cutoff, the signal passes through nearly intact.
     /// Documents Kenwood's actual design (DC trap, not sub-corner
     /// attenuator).
     #[test]

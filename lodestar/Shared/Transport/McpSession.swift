@@ -45,7 +45,7 @@ public actor McpSession {
             // until data arrives, so a silent radio would otherwise park
             // this loop forever and the deadline above never re-fires.
             guard let chunk = try await readRacingDeadline(maxBytes: 64, deadline: deadline) else {
-                continue // timed out — top of loop throws enterTimeout
+                continue // timed out; top of loop throws enterTimeout
             }
             if chunk.isEmpty {
                 try await Task.sleep(nanoseconds: 50_000_000)
@@ -72,7 +72,7 @@ public actor McpSession {
         let parsed = try parseWFrame(bytes: frame)
 
         // Send our ACK. The radio echoes one back but thd75 treats the
-        // echo as best-effort — a missing echo doesn't fail the read.
+        // echo as best-effort: a missing echo doesn't fail the read.
         try await transport.write([0x06])
         try await Task.sleep(nanoseconds: 10_000_000)
         _ = try? await readExact(count: 1, timeoutSeconds: 1)
@@ -102,7 +102,7 @@ public actor McpSession {
     public func exitProgramming() async throws {
         log.info("MCP exit")
         try await transport.write(Array(buildExitCmd()))
-        // No read — transport will close.
+        // No read; transport will close.
     }
 
     // MARK: - High-level orchestration
@@ -139,14 +139,14 @@ public actor McpSession {
     }
 
     /// Read every radio setting the USB reflector relay depends on, fix
-    /// any that are wrong, and report what was found and changed — one
+    /// any that are wrong, and report what was found and changed, in one
     /// programming pass, fully automated, no menu keypresses.
     ///
     /// Two settings gate USB relay (both hardware-verified):
     /// - **Menu 650 / `0x1CA0`** must be `1` (Reflector Terminal Mode).
     /// - **Menu 985 / `0x1093`** (DV Gateway Interface) must be `USB`.
     ///   If it points at Bluetooth, the gateway's MMDVM framing goes out
-    ///   the BT port and the USB port stays in plain CAT — the exact
+    ///   the BT port and the USB port stays in plain CAT: the exact
     ///   "CAT works but MMDVM silent" symptom.
     ///
     /// The radio reboots on programming-mode exit iff anything changed
@@ -156,7 +156,7 @@ public actor McpSession {
         try await enterProgramming()
 
         // Gateway mode (page 0x1C, byte 0xA0) and interface (page 0x10,
-        // byte 0x93) live on different pages — read each.
+        // byte 0x93) live on different pages, so read each.
         let gwPage = pageOf(offset: UniFFI_GatewayModeOffset)
         let gwByte = byteOf(offset: UniFFI_GatewayModeOffset)
         let gwData = try await readPage(gwPage)
@@ -216,7 +216,7 @@ public actor McpSession {
             }
             let remaining = count - buffer.count
             guard let chunk = try await readRacingDeadline(maxBytes: remaining, deadline: deadline) else {
-                continue // timed out — top of loop throws readTimeout
+                continue // timed out; top of loop throws readTimeout
             }
             if chunk.isEmpty {
                 try await Task.sleep(nanoseconds: 50_000_000)
@@ -275,7 +275,7 @@ private let UniFFI_GatewayModeReflectorTerminal: UInt8 = 1
 /// MCP-D75 registry field `radio.DvGatewayInterface`. Selects which
 /// physical port carries the gateway/MMDVM stream: USB or Bluetooth.
 /// When this points at Bluetooth, the USB CDC port stays in CAT and the
-/// `E0 03 00` MMDVM probe gets no reply — the whole "terminal mode is
+/// `E0 03 00` MMDVM probe gets no reply: the whole "terminal mode is
 /// on but the app can't see it over USB" failure.
 private let UniFFI_DvGatewayInterfaceOffset: UInt16 = 0x1093
 

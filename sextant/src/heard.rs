@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Heard-station list — per-callsign history of received traffic.
+//! Heard-station list: per-callsign history of received traffic.
 //!
 //! Timestamps are UTC wall clock (not `Instant`) so they survive
 //! restarts and render as real dates. The persisted file carries the
@@ -175,7 +175,7 @@ impl HeardList {
         Self::deserialize(&raw)
     }
 
-    /// Persist the current station list. Logs and swallows IO errors —
+    /// Persist the current station list. Logs and swallows IO errors;
     /// heard-list persistence must never block shutdown.
     pub(crate) fn save(&self) {
         let Some(path) = Self::path() else {

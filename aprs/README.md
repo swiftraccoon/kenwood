@@ -10,10 +10,10 @@ APRS (Automatic Packet Reporting System) protocol stack. std-only, sans-io.
 
 **Stateful algorithms.**
 
-- `DigipeaterConfig` — path handling, 30 s dup cache keyed on `(source, dest, info)` hash, own-callsign loop detection, optional viscous delay queue.
-- `SmartBeaconing` — HamHUD (Tony Arnerich KD7TA / Steve Bragg KA9MVA) formula with low/high speeds, turn slope, turn minimum, turn time.
-- `AprsMessenger` — ack/rej classification via strict `^(ack|rej)[A-Za-z0-9]{1,5}$`, per-message retry backoff, incoming dedup window.
-- `StationList` — heard-station database with expiry and bounded capacity.
+- `DigipeaterConfig`: path handling, 30 s dup cache keyed on `(source, dest, info)` hash, own-callsign loop detection, optional viscous delay queue.
+- `SmartBeaconing`: HamHUD (Tony Arnerich KD7TA / Steve Bragg KA9MVA) formula with low/high speeds, turn slope, turn minimum, turn time.
+- `AprsMessenger`: ack/rej classification via strict `^(ack|rej)[A-Za-z0-9]{1,5}$`, per-message retry backoff, incoming dedup window.
+- `StationList`: heard-station database with expiry and bounded capacity.
 
 **Validated newtypes.** `Latitude`, `Longitude`, `Speed`, `Course`, `MessageId`, `SymbolTable`, `AprsSymbol`, `Fahrenheit`, `Tocall`.
 
@@ -29,7 +29,7 @@ Every stateful method accepts `now: Instant` as a parameter. The crate never cal
 
 ## Status
 
-Extracted from `kenwood-thd75` April 2026. Pre-release. Public API is unstable — `StationList::update` currently takes `&str` / `&[String]` pending planned tightening to `&Callsign` / `&[Ax25Address]`. Error-variant names may change. The `aprs` → `kiss-tnc` dependency (for `ax25_to_kiss_wire`) may be removed in a future reorganization that pushes KISS wrapping back up to the consumer.
+Extracted from `kenwood-thd75` April 2026. Pre-release. Public API is unstable: `StationList::update` currently takes `&str` / `&[String]` pending planned tightening to `&Callsign` / `&[Ax25Address]`. Error-variant names may change. The `aprs` → `kiss-tnc` dependency (for `ax25_to_kiss_wire`) may be removed in a future reorganization that pushes KISS wrapping back up to the consumer.
 
 ## References
 

@@ -1,4 +1,4 @@
-//! Client pool — concurrent `SocketAddr` → `ClientHandle` map.
+//! Client pool: concurrent `SocketAddr` → `ClientHandle` map.
 
 pub mod handle;
 pub mod pool;

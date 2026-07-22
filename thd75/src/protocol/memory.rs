@@ -91,7 +91,7 @@ fn parse_me(payload: &str) -> Result<Response, ProtocolError> {
     let fields: Vec<&str> = payload.split(',').collect();
     let actual = fields.len();
 
-    // ME wire: `channel,f1..=f13,me14,f15..=f21,me22` — 23 fields exactly.
+    // ME wire: `channel,f1..=f13,me14,f15..=f21,me22` (23 fields exactly).
     let &[ch_str, ref body @ ..] = fields.as_slice() else {
         return Err(ProtocolError::FieldCount {
             command: "ME".to_owned(),

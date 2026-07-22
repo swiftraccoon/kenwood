@@ -18,7 +18,7 @@ use mbelib_rs::AmbeEncoder;
 
 /// Canonical D-STAR silence bytes. If the encoder is short-circuiting
 /// real voice input to this pattern every frame, the decoder will
-/// produce comfort noise with gamma-smoothed volume envelope —
+/// produce comfort noise with gamma-smoothed volume envelope:
 /// exactly the "volume tracks, content is noise" symptom.
 const AMBE_SILENCE: [u8; 9] = [0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8];
 
@@ -55,7 +55,7 @@ fn make_voiced_chunk(t0_samples: usize) -> [f32; 160] {
 /// silence byte pattern. If it does, the pitch tracker is reporting
 /// confidence below `SILENCE_CONFIDENCE` and the encoder's silence
 /// short-circuit is converting real speech to the DVSI null-audio
-/// pattern — a catastrophic failure that produces exactly the
+/// pattern, a catastrophic failure that produces exactly the
 /// "noise with volume envelope, no content" symptom.
 #[test]
 fn voiced_input_must_not_encode_to_silence() {
@@ -80,12 +80,12 @@ fn voiced_input_must_not_encode_to_silence() {
     assert!(
         silence_count < sample_count / 2,
         "encoder emitted AMBE_SILENCE for {silence_count}/{sample_count} post-warmup \
-         voice frames — pitch tracker confidence is falling below SILENCE_CONFIDENCE \
+         voice frames: pitch tracker confidence is falling below SILENCE_CONFIDENCE \
          even for a clean 150 Hz harmonic signal"
     );
 }
 
-/// Pure sine at 150 Hz — decoder's f0 must match. If decoded
+/// Pure sine at 150 Hz; the decoder's f0 must match. If decoded
 /// spectrum has more energy at 300 Hz than 150 Hz, the pitch-index
 /// path is writing the wrong b0 (doubled or halved).
 #[test]
@@ -155,7 +155,7 @@ fn pure_sine_pitch_preserved_through_codec() {
 
 /// End-to-end: voice-in → encode → decode → check spectral content.
 ///
-/// Not just RMS — check that the decoded signal has the ENERGY
+/// Not just RMS: check that the decoded signal has the ENERGY
 /// concentrated at the expected fundamental + a couple of harmonics.
 /// If the decoder is synthesizing filtered noise (unvoiced everywhere)
 /// instead of a proper harmonic spectrum, this will show as
@@ -166,7 +166,7 @@ fn voiced_input_produces_harmonic_output() {
     let mut dec = mbelib_rs::AmbeDecoder::new();
 
     let mut t0 = 0_usize;
-    // Long warmup — pitch tracker and encoder prev state need time.
+    // Long warmup: pitch tracker and encoder prev state need time.
     for _ in 0..20 {
         let chunk = make_voiced_chunk(t0);
         t0 += 160;
@@ -212,8 +212,8 @@ fn voiced_input_produces_harmonic_output() {
 
     // The encoder quantizes pitch through OP25's b0_lookup table
     // (`src/encode/pitch_quant.rs`), so the decoded signal's
-    // harmonics don't land exactly at the source's 150/300/450 Hz
-    // — they shift to the nearest b0 / W0_TABLE entry. Scan a
+    // harmonics don't land exactly at the source's 150/300/450 Hz;
+    // they shift to the nearest b0 / W0_TABLE entry. Scan a
     // window around each expected harmonic to find the actual
     // harmonic peak, then compare against background.
     // Probe in 13 integer steps of 5 Hz from hz-30 to hz+30, avoiding
@@ -242,7 +242,7 @@ fn voiced_input_produces_harmonic_output() {
     // band. Tight margins (e.g. > 3×) were workable before the OP25
     // b0_lookup port but over-constrain the relationship between
     // the source's exact harmonic frequencies and the quantized
-    // output's harmonic grid — both encoder and decoder now walk
+    // output's harmonic grid; both encoder and decoder now walk
     // through W0_TABLE[b0] for reconstruction, so harmonics shift
     // by up to a few percent. The essential invariant ("not pure
     // noise") still holds.

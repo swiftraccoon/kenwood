@@ -33,7 +33,7 @@ final class StationMapModelTests: XCTestCase {
         XCTAssertTrue(anns.isEmpty)
     }
 
-    // One pin per callsign — the most recent position wins.
+    // One pin per callsign: the most recent position wins.
     // recentlyHeard is newest-first, so the FIRST match per call is kept.
     func testDuplicateCallsignKeepsNewestPosition() {
         let newer = entry(mycall: "W7YAA", endedAt: Date(timeIntervalSince1970: 200), lat: 44.0, lon: -116.0)

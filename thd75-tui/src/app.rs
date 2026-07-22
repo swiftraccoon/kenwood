@@ -38,7 +38,7 @@ fn cache_dir() -> Option<PathBuf> {
 
 /// Save raw MCP image to the cache file at `path`.
 ///
-/// Logs errors but does not propagate — a failed cache write should not
+/// Logs errors but does not propagate; a failed cache write should not
 /// block radio operation. The user will see a warning in the log.
 pub(crate) fn save_cache_to(path: &Path, data: &[u8]) {
     if let Some(parent) = path.parent()
@@ -67,17 +67,17 @@ pub(crate) fn load_cache(path: &Path) -> Option<(MemoryImage, std::time::Duratio
 /// Parse D-STAR reflector-connect input into `(name, module)`.
 ///
 /// Accepts two forms:
-/// - Two-token: `"REF030 C"` — the module is the first character of the
-///   second token and must be an ASCII uppercase letter.
-/// - Single-token: `"REF030C"` — at least 4 characters, with an ASCII
+/// - Two-token: `"REF030 C"`, where the module is the first character of
+///   the second token and must be an ASCII uppercase letter.
+/// - Single-token: `"REF030C"`, at least 4 characters, with an ASCII
 ///   uppercase final character as the module letter and the rest as the
 ///   reflector name. This mirrors the REPL's reflector parsing, so a bare
 ///   name ending in a digit (`"REF030"`) is rejected instead of being
 ///   misread as name `"REF03"` + module `'0'`.
 ///
-/// The returned name is uppercased. Anything else — including empty input
+/// The returned name is uppercased. Anything else, including empty input
 /// and a non-ASCII final character (which would make a byte-index slice
-/// panic on a char boundary) — returns `None`.
+/// panic on a char boundary), returns `None`.
 fn parse_reflector_input(input: &str) -> Option<(String, char)> {
     let parts: Vec<&str> = input.split_whitespace().collect();
     match parts.as_slice() {
@@ -680,9 +680,9 @@ impl Pane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MainView {
     Channels,
-    /// CAT settings — instant, no disconnect.
+    /// CAT settings: instant, no disconnect.
     SettingsCat,
-    /// MCP settings — ~3s per change, brief disconnect.
+    /// MCP settings: ~3s per change, brief disconnect.
     SettingsMcp,
     Aprs,
     DStar,
@@ -734,9 +734,9 @@ impl ChannelEditField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InputMode {
     Normal,
-    /// Searching channels — buffer holds the search string.
+    /// Searching channels: buffer holds the search string.
     Search(String),
-    /// Entering a frequency — buffer holds digits typed so far.
+    /// Entering a frequency: buffer holds digits typed so far.
     FreqInput(String),
 }
 
@@ -775,8 +775,8 @@ impl Default for BandState {
 #[derive(Debug, Clone)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "RadioState aggregates the TH-D75's independent CAT toggle settings — beep, \
-              lock, dual_band, bluetooth, vox, gps_enabled, gps_pc_output — each mapping \
+    reason = "RadioState aggregates the TH-D75's independent CAT toggle settings (beep, \
+              lock, dual_band, bluetooth, vox, gps_enabled, gps_pc_output), each mapping \
               1:1 to a distinct CAT command name (BP, LK, DW, BT, VX, GP, GP). Collapsing \
               these into a `HashSet<RadioFlag>` (the refactor clippy wants) would break \
               the 1:1 CAT-command-to-field mapping that makes the poll_once / apply_state \
@@ -872,18 +872,18 @@ impl Default for RadioState {
 /// Whether the D-STAR gateway is active in the radio task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DStarMode {
-    /// Not in gateway mode — show CAT config view on the D-STAR panel.
+    /// Not in gateway mode: show CAT config view on the D-STAR panel.
     Inactive,
-    /// Gateway mode active — `DStarGateway` is running in the radio task.
+    /// Gateway mode active: `DStarGateway` is running in the radio task.
     Active,
 }
 
 /// Whether the APRS client is active in the radio task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AprsMode {
-    /// Not in APRS mode — show MCP config view on the APRS panel.
+    /// Not in APRS mode: show MCP config view on the APRS panel.
     Inactive,
-    /// APRS mode active — `AprsClient` is running in the radio task.
+    /// APRS mode active: `AprsClient` is running in the radio task.
     Active,
 }
 
@@ -957,7 +957,7 @@ pub(crate) enum Message {
     },
     McpReadComplete(Vec<u8>),
     McpWriteComplete,
-    /// A single MCP byte was written successfully — update the in-memory
+    /// A single MCP byte was written successfully; update the in-memory
     /// cache without requiring a full re-read.
     McpByteWritten {
         offset: u16,
@@ -992,8 +992,8 @@ pub(crate) enum Message {
 /// Central application state.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "App aggregates the TUI's global mode flags — connected, should_quit, \
-              quit_pending, show_help — plus several view-specific toggles. Each flag \
+    reason = "App aggregates the TUI's global mode flags (connected, should_quit, \
+              quit_pending, show_help) plus several view-specific toggles. Each flag \
               drives a distinct Ratatui branch in the event/render loop and mutates at a \
               distinct site; collapsing into a `HashSet<AppFlag>` would force every \
               dispatch to go through a hash lookup for no reader benefit, and the flags \
@@ -1002,7 +1002,7 @@ pub(crate) enum Message {
 )]
 pub(crate) struct App {
     /// Where the MCP image is cached on disk. `None` disables caching
-    /// entirely — the reducer's MCP arms then keep everything in
+    /// entirely; the reducer's MCP arms then keep everything in
     /// memory, which is how tests drive them without touching the
     /// user's real cache file.
     pub cache_path: Option<PathBuf>,
@@ -1105,7 +1105,7 @@ impl App {
     /// file when one is provided.
     ///
     /// `None` skips the disk cache entirely, so construction has no
-    /// filesystem side effects — tests use this to avoid reading the real
+    /// filesystem side effects; tests use this to avoid reading the real
     /// per-user cache directory.
     pub(crate) fn with_cache_path(port_path: String, cache: Option<&Path>) -> Self {
         let (mcp, status_message) = match cache.and_then(load_cache) {
@@ -1171,7 +1171,7 @@ impl App {
     /// Process a message and update state. Returns true if a render is needed.
     #[expect(
         clippy::too_many_lines,
-        reason = "`update` is the TUI's single message-dispatch entry point — it matches \
+        reason = "`update` is the TUI's single message-dispatch entry point: it matches \
                   over every `Message` variant (radio state updates, status text, D-STAR \
                   events, APRS events, TX responses, etc.) and translates each into the \
                   corresponding `App` state change. Splitting per variant would create a \
@@ -1229,7 +1229,7 @@ impl App {
             }
             Message::Disconnected => {
                 self.connected = false;
-                self.status_message = Some("Disconnected — reconnecting...".into());
+                self.status_message = Some("Disconnected, reconnecting...".into());
                 true
             }
             Message::Reconnected => {
@@ -1255,7 +1255,7 @@ impl App {
                             image,
                             modified: false,
                         };
-                        self.status_message = Some("MCP read complete — cached to disk".into());
+                        self.status_message = Some("MCP read complete, cached to disk".into());
                     }
                     Err(e) => {
                         self.mcp = McpState::Idle;
@@ -1266,7 +1266,7 @@ impl App {
             }
             Message::McpWriteComplete => {
                 self.mcp = McpState::Reconnecting;
-                self.status_message = Some("MCP write complete — reconnecting...".into());
+                self.status_message = Some("MCP write complete, reconnecting...".into());
                 true
             }
             Message::McpByteWritten { offset, value } => {
@@ -1299,7 +1299,7 @@ impl App {
             }
             Message::AprsStopped => {
                 self.aprs_mode = AprsMode::Inactive;
-                self.status_message = Some("APRS mode stopped — CAT polling resumed".into());
+                self.status_message = Some("APRS mode stopped, CAT polling resumed".into());
                 true
             }
             Message::AprsEvent(event) => {
@@ -1333,7 +1333,7 @@ impl App {
                 self.dstar_rx_active = false;
                 self.dstar_rx_header = None;
                 self.status_message =
-                    Some("D-STAR gateway mode stopped — CAT polling resumed".into());
+                    Some("D-STAR gateway mode stopped, CAT polling resumed".into());
                 true
             }
             Message::DStarEvent(event) => {
@@ -1350,7 +1350,7 @@ impl App {
     #[expect(
         clippy::cognitive_complexity,
         clippy::too_many_lines,
-        reason = "`handle_key` is the TUI's single keyboard dispatch entry point — it \
+        reason = "`handle_key` is the TUI's single keyboard dispatch entry point: it \
                   branches on (`InputMode`, `MainView`, key) to route every keystroke in \
                   the app. Splitting per mode would either (a) duplicate the Ctrl-C \
                   global-quit handling at every site or (b) add a second-level dispatch \
@@ -1998,7 +1998,7 @@ impl App {
                     && self.aprs_mode == AprsMode::Active =>
             {
                 if let Some(ref tx) = self.cmd_tx {
-                    // Use 0,0 as placeholder — real GPS position would come from the radio.
+                    // Use 0,0 as placeholder; real GPS position would come from the radio.
                     let _send = tx.send(crate::event::RadioCommand::BeaconPosition {
                         lat: 0.0,
                         lon: 0.0,
@@ -2084,7 +2084,7 @@ impl App {
     /// Toggle a boolean setting or show hint for numeric ones.
     #[expect(
         clippy::too_many_lines,
-        reason = "`toggle_setting` is paired with `adjust_setting` — together they are \
+        reason = "`toggle_setting` is paired with `adjust_setting`; together they are \
                   the TUI's dispatch into the settings-mutation path. It matches over \
                   every settings row and issues the corresponding RadioCommand. Splitting \
                   would duplicate the row-resolution logic; keeping it linear matches the \
@@ -2160,7 +2160,7 @@ impl App {
                 }
                 SettingRow::GpsPcOutput => {
                     self.status_message =
-                        Some("GPS PC Output: use SetGpsSentences — not yet wired".into());
+                        Some("GPS PC Output: SetGpsSentences not yet wired".into());
                     return;
                 }
                 SettingRow::AutoInfo => {
@@ -2177,7 +2177,7 @@ impl App {
             return;
         }
 
-        // MCP-backed boolean settings — write directly to radio via single-page MCP
+        // MCP-backed boolean settings: write directly to radio via single-page MCP
         let Some(tx) = self.cmd_tx.clone() else {
             return;
         };
@@ -2193,7 +2193,7 @@ impl App {
                 if let Some((offset, value)) = image.modify_setting(|w| w.$setter(new_val)) {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message =
-                        Some(format!("{} → {} — applying...", $label, on_off(new_val)));
+                        Some(format!("{} → {}, applying...", $label, on_off(new_val)));
                 }
             }};
         }
@@ -2509,16 +2509,15 @@ impl App {
                     return;
                 }
                 SettingRow::ActiveBand => {
-                    self.status_message =
-                        Some("Active Band: use BC command — not yet wired".into());
+                    self.status_message = Some("Active Band: BC command not yet wired".into());
                     return;
                 }
                 SettingRow::VfoMemModeA => {
-                    self.status_message = Some("VFO/Mem A: use VM command — not yet wired".into());
+                    self.status_message = Some("VFO/Mem A: VM command not yet wired".into());
                     return;
                 }
                 SettingRow::VfoMemModeB => {
-                    self.status_message = Some("VFO/Mem B: use VM command — not yet wired".into());
+                    self.status_message = Some("VFO/Mem B: VM command not yet wired".into());
                     return;
                 }
                 SettingRow::TncBaud => {
@@ -2546,19 +2545,18 @@ impl App {
                 }
                 SettingRow::CallsignSlot => {
                     self.status_message =
-                        Some("Callsign Slot: not yet polled — cannot adjust".into());
+                        Some("Callsign Slot: not yet polled, cannot adjust".into());
                     return;
                 }
                 SettingRow::DstarSlot => {
-                    self.status_message =
-                        Some("D-STAR Slot: not yet polled — cannot adjust".into());
+                    self.status_message = Some("D-STAR Slot: not yet polled, cannot adjust".into());
                     return;
                 }
                 _ => {}
             }
         }
 
-        // MCP-backed numeric settings — write directly via single-page MCP
+        // MCP-backed numeric settings: write directly via single-page MCP
         let Some(tx) = self.cmd_tx.clone() else {
             return;
         };
@@ -2574,9 +2572,9 @@ impl App {
             ($getter:ident, $setter:ident, $label:expr, $image:expr, $delta:expr, $tx:expr) => {{
                 let new_val = $image.settings().$getter().saturating_add_signed($delta);
                 if let Some((offset, value)) = $image.modify_setting(|w| w.$setter(new_val)) {
-                    let _send = $tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message =
-                        Some(format!("{} → {} — applying...", $label, new_val));
+                    let _send =
+                        $tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
+                    self.status_message = Some(format!("{} → {}, applying...", $label, new_val));
                 }
             }};
         }
@@ -2657,7 +2655,7 @@ impl App {
                 {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
-                        "Timeout Timer → {} min — applying...",
+                        "Timeout Timer → {} min, applying...",
                         [
                             "0.5", "1.0", "1.5", "2.0", "2.5", "3.0", "3.5", "4.0", "4.5", "5.0",
                             "10.0",
@@ -2680,7 +2678,7 @@ impl App {
                 {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
-                        "Beat Shift → Type {} — applying...",
+                        "Beat Shift → Type {}, applying...",
                         new_raw.saturating_add(1)
                     ));
                 }
@@ -2723,7 +2721,7 @@ impl App {
                 {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
-                        "Mic Sens → {} — applying...",
+                        "Mic Sens → {}, applying...",
                         ["High", "Medium", "Low"]
                             .get(new_val as usize)
                             .unwrap_or(&"?")
@@ -2738,7 +2736,7 @@ impl App {
                     self.status_message = Some(format!("PF Key 1: {e}"));
                 } else if let Some((offset, value)) = changed {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!("PF Key 1 → {new_val} — applying..."));
+                    self.status_message = Some(format!("PF Key 1 → {new_val}, applying..."));
                 }
             }
             SettingRow::PfKey2 => {
@@ -2749,7 +2747,7 @@ impl App {
                     self.status_message = Some(format!("PF Key 2: {e}"));
                 } else if let Some((offset, value)) = changed {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!("PF Key 2 → {new_val} — applying..."));
+                    self.status_message = Some(format!("PF Key 2 → {new_val}, applying..."));
                 }
             }
             SettingRow::BacklightControl => {
@@ -2793,8 +2791,8 @@ impl App {
                 );
             }
             SettingRow::Announce => {
-                // radio.VoiceAnnounce: 0=Off, 1=Manual, 2=Auto1, 3=Auto2 — a mode
-                // selector, not an on/off switch.
+                // radio.VoiceAnnounce: 0=Off, 1=Manual, 2=Auto1, 3=Auto2. This is a
+                // mode selector, not an on/off switch.
                 let new_val = if delta > 0 {
                     image.settings().announce().saturating_add(1).min(3)
                 } else {
@@ -2803,7 +2801,7 @@ impl App {
                 if let Some((offset, value)) = image.modify_setting(|w| w.set_announce(new_val)) {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
-                        "Announce → {} — applying...",
+                        "Announce → {}, applying...",
                         ["Off", "Manual", "Auto1", "Auto2"]
                             .get(new_val as usize)
                             .unwrap_or(&"?")
@@ -2849,7 +2847,7 @@ impl App {
                 {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
-                        "Speed Unit → {} — applying...",
+                        "Speed Unit → {}, applying...",
                         ["mph", "km/h", "knots"]
                             .get(new_val as usize)
                             .unwrap_or(&"?")
@@ -2871,7 +2869,7 @@ impl App {
                 {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
-                        "Alt Unit → {} — applying...",
+                        "Alt Unit → {}, applying...",
                         if new_val == 0 { "ft/in" } else { "m/mm" }
                     ));
                 }
@@ -2891,7 +2889,7 @@ impl App {
                 {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
-                        "Temp Unit → {} — applying...",
+                        "Temp Unit → {}, applying...",
                         if new_val == 0 { "°F" } else { "°C" }
                     ));
                 }
@@ -2918,7 +2916,7 @@ impl App {
             }
             SettingRow::BatterySaver => {
                 // radio.BatterySaver: 0=Off, 1-9 select the 0.2-5.0 s saver
-                // interval — a 10-value selector, not an on/off switch.
+                // interval. This is a 10-value selector, not an on/off switch.
                 let new_val = if delta > 0 {
                     image.settings().battery_saver().saturating_add(1).min(9)
                 } else {
@@ -2929,7 +2927,7 @@ impl App {
                 {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
-                        "Battery Saver → {} — applying...",
+                        "Battery Saver → {}, applying...",
                         [
                             "Off", "0.2 s", "0.4 s", "0.6 s", "0.8 s", "1.0 s", "2.0 s", "3.0 s",
                             "4.0 s", "5.0 s",
@@ -2955,7 +2953,7 @@ impl App {
                 {
                     let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
                     self.status_message = Some(format!(
-                        "Auto PwrOff → {} — applying...",
+                        "Auto PwrOff → {}, applying...",
                         ["Off", "15 min", "30 min", "60 min"]
                             .get(new_val as usize)
                             .unwrap_or(&"?")
@@ -3102,7 +3100,7 @@ impl App {
                 self.dstar_text_message = None;
             }
             DStarEvent::VoiceData(_frame) => {
-                // Voice data — no UI action needed.
+                // Voice data: no UI action needed.
             }
             DStarEvent::VoiceEnd => {
                 self.dstar_rx_active = false;
@@ -3131,7 +3129,7 @@ impl App {
                 self.status_message = Some(format!("D-STAR: URCALL command detected: {action:?}"));
             }
             DStarEvent::StatusUpdate(_status) => {
-                // Modem status — no UI action needed.
+                // Modem status: no UI action needed.
             }
         }
     }
@@ -3252,7 +3250,7 @@ impl App {
             ChannelEditField::Name => {
                 // Channel name editing requires MCP write (no CAT command for name-only).
                 self.status_message = Some(format!(
-                    "Ch {ch_num}: name editing requires MCP write — use MCP panel (m)"
+                    "Ch {ch_num}: name editing requires MCP write; use MCP panel (m)"
                 ));
             }
             ChannelEditField::Mode => {
@@ -3292,7 +3290,7 @@ impl App {
                 // either a full ME write (which changes the live channel) or MCP
                 // for permanent memory storage. Full ME write support is planned.
                 self.status_message = Some(format!(
-                    "Ch {ch_num}: {} editing not yet implemented — requires ME write",
+                    "Ch {ch_num}: {} editing not yet implemented; requires ME write",
                     field.label()
                 ));
             }
@@ -3346,8 +3344,8 @@ mod tests {
     // ── Reducer: `update(Message) -> bool` ────────────────────────
     //
     // `App::update` is a pure state machine whose only effect channel
-    // is `cmd_tx` — an unbounded tokio channel that works without a
-    // runtime — so these need no async harness. Each test below pins a
+    // is `cmd_tx`, an unbounded tokio channel that works without a
+    // runtime, so these need no async harness. Each test below pins a
     // regression this file has actually shipped.
 
     /// A failed MCP write must NOT wipe the loaded image.
@@ -3355,7 +3353,7 @@ mod tests {
     /// The cache exists so the operator can keep working (and retry the
     /// write) after a transient MCP failure; resetting to `Idle` on
     /// error threw away a 55-second full-memory read. The guard is one
-    /// `matches!` — trivially deleted by a future refactor, and nothing
+    /// `matches!`, trivially deleted by a future refactor, and nothing
     /// pinned it until now.
     #[test]
     fn mcp_error_preserves_a_loaded_image() {
@@ -3438,7 +3436,7 @@ mod tests {
         assert!(app.connected, "a RadioUpdate marks the link connected");
     }
 
-    /// A poll that DOES carry a value must overwrite the old one —
+    /// A poll that DOES carry a value must overwrite the old one:
     /// the preservation above must not become a write-once latch.
     #[test]
     fn radio_update_overwrites_fields_the_poll_provides() {

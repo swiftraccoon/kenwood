@@ -5,7 +5,7 @@
 //! data-type dispatch, Mic-E decoder, position parser, and weather
 //! parser against known-good inputs.
 //!
-//! Capture sources are intentionally anonymized — callsigns are
+//! Capture sources are intentionally anonymized: callsigns are
 //! replaced with well-known testing callsigns (`N0CALL`, `W1AW`) and
 //! positions with synthetic values.
 
@@ -86,8 +86,8 @@ fn real_capture_uncompressed_position() -> TestResult {
 fn real_capture_mice_emergency() -> TestResult {
     // Mic-E with emergency message bits (all digits, no custom chars).
     // Destination chars 0-2 = "354" → bits 000 → Emergency.
-    // Destination chars 3-5 = "N0E" — wait, that's not valid, let me
-    // use digit-only chars. Lat 35.4°N requires digits 3,5,4,... etc.
+    // Destination chars 3-5 = "N0E" is not valid, so use digit-only
+    // chars instead. Lat 35.4°N requires digits 3,5,4,... etc.
     // Use "354UPP" where U=N indicator, P=+100 offset, P=W.
     //
     // Actually the simplest: construct via the builder and verify parse.

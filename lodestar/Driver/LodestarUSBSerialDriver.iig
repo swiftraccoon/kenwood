@@ -64,7 +64,7 @@ public:
 
     /// Copy the diagnostic event ring (LodestarLogEntry structs, oldest
     /// first) into `out`. The ring makes dext internals readable from
-    /// the app with no Console access — every lifecycle and I/O event
+    /// the app with no Console access; every lifecycle and I/O event
     /// leaves a breadcrumb here.
     void CopyLogEntries(uint8_t *out, size_t capacity, size_t *actual) LOCALONLY;
 };

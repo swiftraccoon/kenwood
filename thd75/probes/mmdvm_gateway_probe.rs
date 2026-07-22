@@ -15,11 +15,11 @@
     missing_docs,
     reason = "Hardware probe binary. `too_many_lines` fires because `main()` is a linear \
               script that opens the BT transport, sends MMDVM GET_VERSION, reads the \
-              response, and reports — the single-flow shape is the point. \
+              response, and reports; the single-flow shape is the point. \
               `clippy::doc_markdown` fires on inline references to `/dev/cu.*` device \
               paths and `Menu 983` style capitalized markers in the doc comments. \
               `missing_docs` is relaxed because probes are one-shot hardware diagnostic \
-              binaries, not library API — the top-of-file module doc comment describes \
+              binaries, not library API; the top-of-file module doc comment describes \
               how to run the probe, which is the documentation that matters here."
 )]
 

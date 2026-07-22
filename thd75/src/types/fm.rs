@@ -145,10 +145,10 @@ impl fmt::Display for FmRadioChannel {
 /// signal ends before the FM radio audio resumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FmRadioMode {
-    /// Direct frequency tuning — tune to any frequency in the
+    /// Direct frequency tuning: tune to any frequency in the
     /// 76-108 MHz FM broadcast band using the dial or up/down keys.
     Tuning,
-    /// Memory channel mode — recall one of the 10 FM memory
+    /// Memory channel mode: recall one of the 10 FM memory
     /// channels (FM0-FM9).
     Memory,
 }

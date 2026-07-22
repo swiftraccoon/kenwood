@@ -20,8 +20,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.0
       - run: cargo generate-lockfile
       # Prebuilt release binary (~2s). `cargo install cargo-audit` was
-      # compiling the tool from source on every run — 149s of a ~180s
-      # job — to produce the same binary.
+      # compiling the tool from source on every run (149s of a ~180s
+      # job) to produce the same binary.
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit --file Cargo.lock
 

@@ -12,13 +12,13 @@ use super::Transport;
 enum MockRead {
     /// Deliver these bytes.
     Data(Vec<u8>),
-    /// Sleep for the given milliseconds, then deliver these bytes —
-    /// models a response with real wire latency (needed when the
+    /// Sleep for the given milliseconds, then deliver these bytes.
+    /// Models a response with real wire latency (needed when the
     /// consumer correlates a response to a write it must make first).
     Delayed(Vec<u8>, u64),
-    /// Return `Ok(0)` — transport EOF (device unplugged / port closed).
+    /// Return `Ok(0)`: transport EOF (device unplugged / port closed).
     Eof,
-    /// Never resolve — a wedged link. Pair with a timeout in the test.
+    /// Never resolve: a wedged link. Pair with a timeout in the test.
     Hang,
 }
 
@@ -29,7 +29,7 @@ pub struct MockTransport {
     pending: VecDeque<MockRead>,
     accept_any_write: bool,
     pend_when_empty: bool,
-    /// When the front `Delayed` entry started waiting — persists
+    /// When the front `Delayed` entry started waiting. Persists
     /// across cancelled read futures so the delay makes progress even
     /// if the consumer keeps cancelling reads (e.g. a biased select
     /// with a busy write branch).
@@ -90,13 +90,13 @@ impl MockTransport {
     }
 
     /// Queue an expected command whose next `read()` reports EOF
-    /// (`Ok(0)`) — the device disappeared mid-command.
+    /// (`Ok(0)`), i.e. the device disappeared mid-command.
     pub fn expect_eof(&mut self, command: &[u8]) {
         self.exchanges
             .push_back((command.to_vec(), vec![MockRead::Eof]));
     }
 
-    /// Queue an expected command whose `read()` never resolves — a
+    /// Queue an expected command whose `read()` never resolves, i.e. a
     /// wedged link. The caller's timeout machinery must fire.
     pub fn expect_hang(&mut self, command: &[u8]) {
         self.exchanges
@@ -142,7 +142,7 @@ impl MockTransport {
     }
 
     /// Queue data delivered by a subsequent `read()` only after the
-    /// given delay — models wire latency so the consumer can perform
+    /// given delay. Models wire latency so the consumer can perform
     /// the write this data responds to before it arrives.
     pub fn queue_read_delayed(&mut self, data: &[u8], delay_ms: u64) {
         self.pending
@@ -162,7 +162,7 @@ impl MockTransport {
     ///
     /// Required for consumers with an always-reading pump task (the
     /// MMDVM adapter) that treats a read error as a dead transport.
-    /// The whole read script must be queued up front — use
+    /// The whole read script must be queued up front, so use
     /// [`Self::queue_read_delayed`] to sequence responses after the
     /// writes they answer.
     pub const fn pend_when_empty(&mut self) {
@@ -227,7 +227,7 @@ impl Transport for MockTransport {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
         if self.pending.is_empty() && self.pend_when_empty {
             // Nothing can enqueue more data once the consumer owns
-            // this transport — pend like an idle line until the test
+            // this transport, so pend like an idle line until the test
             // tears the task down.
             tracing::debug!("mock: read pending forever (script exhausted)");
             std::future::pending::<()>().await;
@@ -260,7 +260,7 @@ impl Transport for MockTransport {
         let outcome = self.pending.pop_front().ok_or_else(|| {
             TransportError::Read(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                "no pending response — call write() first",
+                "no pending response; call write() first",
             ))
         })?;
 

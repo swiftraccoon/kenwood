@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2009 Pavel Yazev (OP25 imbe_vocoder/tbls.cc — `wr[]`)
+// SPDX-FileCopyrightText: 2009 Pavel Yazev (OP25 imbe_vocoder/tbls.cc, `wr[]`)
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
@@ -8,7 +8,7 @@
 //! (2·110 + 1 center) symmetric window against a 256-point FFT. The
 //! window half-curve lives in [`WR_HALF`]; the full window is built
 //! at runtime by the encoder front-end by mirroring it around the
-//! center sample — see [`crate::encode::analyze`].
+//! center sample; see [`crate::encode::analyze`].
 //!
 //! Values copied verbatim from Yazev's `imbe_vocoder/tbls.cc`. They're
 //! the Q1.15 fixed-point ints divided by 32768 to recover the
@@ -20,7 +20,7 @@ use crate::encode::state::WR_HALF_LEN;
 ///
 /// Length is [`WR_HALF_LEN`] = 111 but the front-end uses only
 /// `WR_HALF[0..110]` (the peak at index 110 is unused because the
-/// center sample is handled unwindowed — gain 1.0 by construction).
+/// center sample is handled unwindowed: gain 1.0 by construction).
 #[rustfmt::skip]
 pub(crate) const WR_HALF: [f32; WR_HALF_LEN] = [
     487.0 / 32768.0,   570.0 / 32768.0,   658.0 / 32768.0,   753.0 / 32768.0,
@@ -51,16 +51,16 @@ pub(crate) const WR_HALF: [f32; WR_HALF_LEN] = [
   32033.0 / 32768.0, 32172.0 / 32768.0, 32296.0 / 32768.0, 32406.0 / 32768.0,
   32502.0 / 32768.0, 32583.0 / 32768.0, 32649.0 / 32768.0, 32701.0 / 32768.0,
   32738.0 / 32768.0, 32760.0 / 32768.0,
-  //  ^ index 110 (peak) — unused by front-end; present for spec fidelity.
+  //  ^ index 110 (peak): unused by front-end; present for spec fidelity.
   32760.0 / 32768.0,
 ];
 
 /// Pitch-estimation window (full symmetric 301-sample tapered curve).
 ///
 /// Verbatim from Yazev's `imbe_vocoder/tbls.cc` `wi[301]`. Peak at
-/// index 150 (17779 / 32768 ≈ 0.5425 — note this window does NOT
+/// index 150 (17779 / 32768 ≈ 0.5425). Note this window does NOT
 /// reach unity; it's squared-and-tapered to concentrate energy around
-/// the center sample for robust pitch autocorrelation).
+/// the center sample for robust pitch autocorrelation.
 #[rustfmt::skip]
 pub(crate) const WI: [f32; 301] = [
     15.0 / 32768.0, 18.0 / 32768.0, 21.0 / 32768.0, 25.0 / 32768.0, 29.0 / 32768.0, 34.0 / 32768.0,

@@ -167,7 +167,7 @@ impl TryFrom<u8> for GpsOperatingMode {
 /// navigation data.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "Mirrors the `GS band,gga,gll,gsa,gsv,rmc,vtg` CAT command 1:1 — each bool is one \
+    reason = "Mirrors the `GS band,gga,gll,gsa,gsv,rmc,vtg` CAT command 1:1; each bool is one \
               NMEA 0183 sentence-type enable bit per the TH-D75 CAT reference. Keeping the \
               fields independent matches the protocol layout the type serialises to."
 )]

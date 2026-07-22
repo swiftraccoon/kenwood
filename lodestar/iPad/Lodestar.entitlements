@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<!-- iPadOS app-side DriverKit entitlement: allows this app to open
-	     user clients to drivers (Boolean — replaces the macOS-only
+	     user clients to drivers (Boolean; replaces the macOS-only
 	     userclient-access array). Same-team dexts need nothing more. -->
 	<key>com.apple.developer.driverkit.communicates-with-drivers</key>
 	<true/>

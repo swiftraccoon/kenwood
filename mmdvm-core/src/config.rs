@@ -14,12 +14,12 @@
 //! This module exposes the configuration type so downstream crates can
 //! construct it, but does **not** yet implement wire encoding.
 //
-// TODO: full SetConfig encoding — multi-mode config is complex, will
+// TODO: full SetConfig encoding. Multi-mode config is complex, will
 // be done when needed.
 
 use crate::mode::ModemMode;
 
-/// Modem configuration parameters (provisional — encoding not yet
+/// Modem configuration parameters (provisional; encoding not yet
 /// implemented, see module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModemConfig {

@@ -1,6 +1,6 @@
 //! Hardware probe: Bluetooth RFCOMM reopen after a real link drop.
 //!
-//! NOT a cargo target (nothing in `probes/` compiles) — move to
+//! NOT a cargo target (nothing in `probes/` compiles); move to
 //! `examples/` or register it before running. IOBluetooth needs the
 //! real main thread, which is why this is a standalone `fn main`
 //! program rather than a `#[test]`.

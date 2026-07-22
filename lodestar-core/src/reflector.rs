@@ -18,9 +18,9 @@ use dstar_gateway_core::types::ProtocolKind as CoreProtocolKind;
 /// Which D-STAR reflector protocol a given host speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReflectorProtocol {
-    /// `DPlus` — REF-style reflectors (originated by Icom, widely deployed).
+    /// `DPlus`: REF-style reflectors (originated by Icom, widely deployed).
     DPlus,
-    /// `DExtra` — XRF-style reflectors.
+    /// `DExtra`: XRF-style reflectors.
     DExtra,
     /// DCS-style reflectors.
     Dcs,
@@ -50,7 +50,7 @@ impl From<ReflectorProtocol> for CoreProtocolKind {
 /// A single reflector the user can link to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Reflector {
-    /// Uppercase reflector callsign prefix — e.g. `REF030`, `XRF030`, `DCS001`.
+    /// Uppercase reflector callsign prefix, e.g. `REF030`, `XRF030`, `DCS001`.
     pub name: String,
     /// DNS hostname or IPv4 literal for the reflector.
     pub host: String,
@@ -63,7 +63,7 @@ pub struct Reflector {
 }
 
 /// Bundled hosts files from `ircDDBGateway/Data/`. Small enough
-/// (1309 lines total) to embed in the binary — saves a network fetch
+/// (1309 lines total) to embed in the binary, which saves a network fetch
 /// on first launch and means the list always works offline.
 const DPLUS_HOSTS: &str = include_str!("../data/DPlus_Hosts.txt");
 const DEXTRA_HOSTS: &str = include_str!("../data/DExtra_Hosts.txt");
@@ -72,7 +72,7 @@ const DCS_HOSTS: &str = include_str!("../data/DCS_Hosts.txt");
 /// Reorder hosts-file lines so that, for any reflector listed both by
 /// IP literal and by hostname, the hostname row comes LAST. `HostFile`
 /// collapses duplicate names with last-row-wins semantics during
-/// parse, so this ordering is what makes the hostname survive — a
+/// parse, so this ordering is what makes the hostname survive: a
 /// hostname outlives the reflector changing address, unlike a pinned
 /// IP. (The bundled files really do mix orders: `XRF000` lists its
 /// hostname last, `DCS006` lists its IP last.)
@@ -152,8 +152,8 @@ pub fn default_reflectors() -> Vec<Reflector> {
 
 /// Where a directory entry came from.
 ///
-/// Merge precedence: `DPlusAuth` beats `Bundled` beats `XlxRegistry` —
-/// the auth server is the authoritative REF directory, and XLX's
+/// Merge precedence: `DPlusAuth` beats `Bundled` beats `XlxRegistry`.
+/// The auth server is the authoritative REF directory, and XLX's
 /// `REFnnn` names are aliases of XLX reflectors rather than the
 /// dstargateway.org REFs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -175,7 +175,7 @@ pub struct DirectoryEntry {
     pub source: DirectorySource,
 }
 
-/// Merge priority for a source — lower wins. `DPlusAuth` (0) beats
+/// Merge priority for a source; lower wins. `DPlusAuth` (0) beats
 /// `Bundled` (1) beats `XlxRegistry` (2).
 const fn source_priority(source: DirectorySource) -> u8 {
     match source {
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn merge_precedence_holds_regardless_of_input_order() -> Result<(), Box<dyn std::error::Error>>
     {
-        // The XLX row arrives FIRST here — auth must still win.
+        // The XLX row arrives FIRST here; auth must still win.
         let merged = merge_directories(vec![
             entry(
                 "REF030",

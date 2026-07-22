@@ -141,7 +141,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
     private let eventContinuation: AsyncStream<ReflectorEvent>.Continuation
     private var eventPump: Task<Void, Never>?
 
-    /// `true` when the user just tapped "Disconnect reflector" — so
+    /// `true` when the user just tapped "Disconnect reflector", so
     /// the subsequent `.disconnected` event is expected and the
     /// auto-reconnect scheduler should NOT fire. Cleared once the
     /// event is applied.
@@ -200,7 +200,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
 
     deinit {
         // The pump task holds the stream strongly, so dropping the
-        // continuation alone never terminates it — finish explicitly
+        // continuation alone never terminates it; finish explicitly
         // or the parked pump task leaks per coordinator instance.
         eventContinuation.finish()
     }
@@ -215,7 +215,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
         }
 
         // If already connected (or mid-connect) to something, tear that
-        // session down first. This is the "switch reflector" path — the
+        // session down first. This is the "switch reflector" path, the
         // picker sheet's only call site. Without this, picking a new
         // reflector while connected silently no-ops.
         if session != nil {
@@ -244,7 +244,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
             // `autoConnectReflector` toggle controls whether we act on it.
             rememberedReflectorName = reflector.name
             // A live link starts the audio render pipeline even before
-            // any voice arrives — background execution rides on it.
+            // any voice arrives; background execution rides on it.
             audioPlayer.beginKeepAlive()
         } catch {
             let msg = error.displayMessage
@@ -258,7 +258,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
     /// and the remembered name is present in the bundled directory.
     /// Idempotent and silent when conditions aren't met.
     ///
-    /// Retries with backoff on rejection — if the app was recently
+    /// Retries with backoff on rejection: if the app was recently
     /// terminated without a graceful `disconnect()`, reflectors hold
     /// the previous UDP session in memory for 30–60 s until keepalive
     /// timeout and reject fresh LINK attempts during that window.
@@ -289,7 +289,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
             // Between retries, re-check: user might have manually
             // connected, toggled the setting off, or disconnected.
             // We retry when the previous attempt ended in `.failed`
-            // or we're still at `.disconnected` — but NOT while a
+            // or we're still at `.disconnected`, but NOT while a
             // `.connecting` / `.connected` session is in flight or live.
             guard autoConnectReflector, session == nil else { return }
             switch state {
@@ -308,7 +308,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
             if case .connected = state {
                 if attempt > 0 {
                     // Clear whatever transient error the earlier
-                    // attempt surfaced — the retry succeeded.
+                    // attempt surfaced: the retry succeeded.
                     lastError = nil
                 }
                 return
@@ -337,7 +337,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
         connectedReflector = nil
         currentStream = nil
         state = .disconnected
-        // User chose to unlink — release the audio keep-alive so the
+        // User chose to unlink; release the audio keep-alive so the
         // app can suspend normally in the background.
         audioPlayer.endKeepAlive()
     }
@@ -618,12 +618,12 @@ public final class ReflectorCoordinator: ReflectorObserver {
 
     /// Schedule a best-effort reconnect after the reflector drops us
     /// unexpectedly (network blip, reflector restart, keepalive
-    /// timeout). Backoff: 5s / 15s / 45s — mirrors the pattern
+    /// timeout). Backoff: 5s / 15s / 45s, mirroring the pattern
     /// `tryAutoConnect` uses for launch-time stale-session recovery.
     ///
     /// Only fires when the previous link was a user-picked reflector
     /// (so we know where to reconnect to). Cancels any prior pending
-    /// reconnect task before scheduling — prevents stacked retries
+    /// reconnect task before scheduling, preventing stacked retries
     /// during a rapid flap.
     private func scheduleUnexpectedReconnect() {
         guard let reflector = connectedReflector else { return }
@@ -644,7 +644,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
                     return
                 }
             }
-            // Backoff exhausted — release the audio keep-alive so the
+            // Backoff exhausted; release the audio keep-alive so the
             // app can suspend instead of rendering silence forever for
             // a link that isn't coming back.
             guard let self, !Task.isCancelled else { return }

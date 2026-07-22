@@ -18,21 +18,21 @@ use crate::weather::extract_position_weather;
 /// in the comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MiceMessage {
-    /// M0 — "Off Duty" (111 standard, 000 custom).
+    /// M0: "Off Duty" (111 standard, 000 custom).
     OffDuty,
-    /// M1 — "En Route" (110, 001).
+    /// M1: "En Route" (110, 001).
     EnRoute,
-    /// M2 — "In Service" (101, 010).
+    /// M2: "In Service" (101, 010).
     InService,
-    /// M3 — "Returning" (100, 011).
+    /// M3: "Returning" (100, 011).
     Returning,
-    /// M4 — "Committed" (011, 100).
+    /// M4: "Committed" (011, 100).
     Committed,
-    /// M5 — "Special" (010, 101).
+    /// M5: "Special" (010, 101).
     Special,
-    /// M6 — "Priority" (001, 110).
+    /// M6: "Priority" (001, 110).
     Priority,
-    /// Emergency — (000, 111) always means emergency.
+    /// Emergency: (000, 111) always means emergency.
     Emergency,
 }
 
@@ -88,15 +88,15 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
             *slot = digit;
         }
 
-        // Char 3: N/S flag — P-Z = North, otherwise (0-9, L) = South.
+        // Char 3: N/S flag. P-Z = North, otherwise (0-9, L) = South.
         if i == 3 {
             north = north_offset_west;
         }
-        // Char 4: longitude offset — P-Z = +100 degrees, otherwise +0.
+        // Char 4: longitude offset. P-Z = +100 degrees, otherwise +0.
         if i == 4 && north_offset_west {
             lon_offset = 100;
         }
-        // Char 5: W/E flag — P-Z = West (negate longitude), otherwise East.
+        // Char 5: W/E flag. P-Z = West (negate longitude), otherwise East.
     }
 
     let d0 = f64::from(*lat_digits.first().ok_or(AprsError::InvalidCoordinates)?);
@@ -206,7 +206,7 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
 ///   outside the spec's representable range (impossible from a
 ///   spec-conformant transmitter).
 /// - `course` is `Some(1..=360)` degrees, or `None` if the value is
-///   `0` (the spec's "unknown / not relevant" sentinel — §10 p.49).
+///   `0` (the spec's "unknown / not relevant" sentinel, §10 p.49).
 ///
 /// The byte-range guard (each of SP/DC/SE must be ≥ 28 per §10 p.47)
 /// is enforced; a byte < 28 yields `(None, None)` rather than wrapping
@@ -243,7 +243,7 @@ fn decode_mice_speed_course(header: &[u8]) -> (Option<u16>, Option<u16>) {
 /// Returns `(digit, north_west_offset)`. The boolean is the bytes-4-6
 /// indicator from the APRS 1.0.1 §10 destination table (document p.44):
 /// it is `true` only for the standard-set characters that decode N/S =
-/// North, Long Offset = +100, and W/E = West — namely `P`-`Z`. Digits
+/// North, Long Offset = +100, and W/E = West, namely `P`-`Z`. Digits
 /// `0`-`9` and the ambiguity space `L` decode South / +0 / East, so the
 /// flag is `false` for them. The custom-message range `A`-`K` is never
 /// used in bytes 4-6 (the spec's "ASCII characters A-K are not used in
@@ -280,9 +280,9 @@ const fn mice_dest_is_custom(ch: u8) -> bool {
 /// contributes one bit (A, B, or C) to a 3-bit message code via three
 /// categories:
 ///
-/// - `Std0` — character is `0`-`9` or `L`, contributes bit `0`
-/// - `Std1` — character is `P`-`Y` or `Z`, contributes bit `1`
-/// - `Custom` — character is `A`-`K`, marks the entire message as custom
+/// - `Std0`: character is `0`-`9` or `L`, contributes bit `0`
+/// - `Std1`: character is `P`-`Y` or `Z`, contributes bit `1`
+/// - `Custom`: character is `A`-`K`, marks the entire message as custom
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MiceMsgClass {
     Std0,
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn parse_mice_basic() -> TestResult {
-        // Destination "SUQU5P" → digits 3,5,1,5,5,0 — Off Duty
+        // Destination "SUQU5P" → digits 3,5,1,5,5,0 (Off Duty)
         let dest = "SUQU5P";
         let info: &[u8] = &[
             0x60, // Mic-E current data type
@@ -452,8 +452,8 @@ mod tests {
     #[test]
     fn mice_dest_char_l_is_standard_not_custom() -> TestResult {
         // APRS 1.0.1 §10 destination table (document p.44): 'L' is the
-        // standard-set ambiguity/space code — N/S = South, Long Offset =
-        // +0, W/E = East — NOT a North/+100/West (custom) indicator.
+        // standard-set ambiguity/space code: N/S = South, Long Offset =
+        // +0, W/E = East. It is NOT a North/+100/West (custom) indicator.
         assert!(!mice_dest_is_custom(b'L'), "L must decode East/South/+0");
         assert_eq!(mice_dest_digit(b'L')?, (0, false), "L: space digit, Std");
         // Spot-check the rest of the table's bytes-4-6 classification.
@@ -469,7 +469,7 @@ mod tests {
     fn parse_mice_l_decodes_east_hemisphere() -> TestResult {
         // Same frame as `parse_mice_basic` but destination char 5 is 'L'
         // instead of 'P'. Per document p.44, 'L' = East, so the longitude
-        // must come out positive (East) — the magnitude matches the West
+        // must come out positive (East); the magnitude matches the West
         // 'P' case from `parse_mice_basic` (~ -97.755) with flipped sign.
         let dest = "SUQU5L";
         let info: &[u8] = &[0x60, 125, 73, 58, 40, 40, 40, b'>', b'/'];
@@ -661,7 +661,7 @@ mod tests {
         // a fake decode. Post-fix the parser surfaces these as
         // `None` for the affected field.
         let dest = "SUQU5P";
-        // Byte 4 = 27 (SP+28 with SP < 0 — impossible, must reject).
+        // Byte 4 = 27 (SP+28 with SP < 0: impossible, must reject).
         let info: &[u8] = &[0x60, 125, 73, 58, 27, 40, 40, b'>', b'/'];
         let pos = parse_mice_position(dest, info)?;
         assert_eq!(pos.speed_knots, None);

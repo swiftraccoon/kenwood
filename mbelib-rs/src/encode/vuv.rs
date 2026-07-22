@@ -69,7 +69,7 @@ pub struct VuvState {
 }
 
 impl VuvState {
-    /// Fresh state — no hysteresis, `th_max` starts at 0.
+    /// Fresh state: no hysteresis, `th_max` starts at 0.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -122,7 +122,7 @@ pub fn detect_vuv(fft_out: &[Complex<f32>], f0_bin: f32) -> VuvDecisions {
 ///
 /// `e_p` is the current-frame pitch-error metric (output of the
 /// pitch tracker); passing a large value (`> 0.55`) disables voicing
-/// in all but the first band — the pitch quality is too low to trust
+/// in all but the first band: the pitch quality is too low to trust
 /// the harmonic model.
 #[must_use]
 #[expect(
@@ -165,7 +165,7 @@ pub fn detect_vuv_and_sa(
     //
     // The inner truncation matters: a pure
     // `floor((period/2 + 0.5) * 0.9254)` (our previous formula) is
-    // off-by-one on many mid-range pitches — e.g. `period = 54.75`
+    // off-by-one on many mid-range pitches: e.g. `period = 54.75`
     // gives `(27.375 + 0.5) * 0.9254 = 25.8 → 25`, while OP25's
     // pathway gives `floor(27.375 + 0.25) * 0.9254 = 27 * 0.9254 =
     // 24.98 → 24`. That 1-harmonic disagreement shifts
@@ -419,7 +419,7 @@ fn wr_sp_sample(bin: usize, harmonic_center: f32) -> f32 {
 /// **OP25-exact port (April 2026):** the prior pure-`sqrt(num/den)` form
 /// produced sa values 800× smaller than OP25's int16-scale sa[]. The
 /// downstream `compute_lsa` then needed `SA_SCALE = 32768` to inflate
-/// log2(sa) into OP25's working range — but that pre-multiplication
+/// log2(sa) into OP25's working range, but that pre-multiplication
 /// inflates strong AND weak harmonics non-uniformly relative to
 /// OP25's M_den-dependent scaling. Direct frame-by-frame diff against
 /// OP25's `imbe_param->sa[]` (via the standalone `op25_dump` harness)
@@ -444,7 +444,7 @@ fn voiced_sa_calc(m_num: f32, sc: f32) -> f32 {
     512.0 * (2.0 * num_over_den).sqrt()
 }
 
-/// Unvoiced spectral amplitude — float port of OP25's
+/// Unvoiced spectral amplitude: float port of OP25's
 /// `unvoiced_sa_calc(num, bin_count)` =
 /// `(Word16)(2 * 0.1454 * sqrt(2 * 256 * num / den))` =
 /// `0.2908 * sqrt(512 * num / den)`.
@@ -477,7 +477,7 @@ mod tests {
     }
 
     /// A spectrum shaped like the analysis window's sinusoidal
-    /// response — `wr_sp` centered at each `k · f0_bin` — should be
+    /// response (`wr_sp` centered at each `k · f0_bin`) should be
     /// classified as voiced. Single-bin-impulse inputs don't work
     /// for the integrated detector: its sinusoidal fit expects the
     /// tapered `wr_sp` spectral lobe the real encoder's analysis
@@ -504,7 +504,7 @@ mod tests {
                 )]
                 let offset_bins = (wr_idx as f32 - WR_SP_CENTER as f32) / 64.0;
                 // `bin` is bounded: center ∈ [6.4, 64], offset_bins
-                // ∈ [−2.5, 2.5], so `bin ∈ [3, 67]` — well within
+                // ∈ [−2.5, 2.5], so `bin ∈ [3, 67]`, well within
                 // usize and within the 129-bin FFT.
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -563,7 +563,7 @@ mod tests {
     /// on the next frame.
     #[test]
     fn hysteresis_biases_voicing_decision() {
-        // Build a spectrum that's a borderline voicing case — the
+        // Build a spectrum that's a borderline voicing case: the
         // same ratio produces different decisions depending on
         // `state.prev_voiced`.
         let mut fft_out = vec![Complex::new(0.0, 0.0); 129];

@@ -118,7 +118,7 @@ pub(crate) fn synthesize_speech(
     );
 
     // Per-band voiced synthesis. Unvoiced contributions are skipped
-    // here — they are handled by the single FFT call after this loop.
+    // here; they are handled by the single FFT call after this loop.
     for l in 1..=maxl {
         #[expect(
             clippy::cast_precision_loss,

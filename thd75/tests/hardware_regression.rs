@@ -9,8 +9,8 @@ use kenwood_thd75::types::*;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
-// weakening the lint. (`::aprs` — the `types::*` glob shadows the
-// bare crate name.)
+// weakening the lint. (`::aprs` is spelled that way because the
+// `types::*` glob shadows the bare crate name.)
 use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
@@ -27,7 +27,7 @@ use tracing as _;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 // ============================================================================
-// Bug 2: N response — not available in current mode
+// Bug 2: N response, not available in current mode
 // ============================================================================
 
 #[test]
@@ -184,7 +184,7 @@ fn parse_dw_band_b_returns_frequency_down() -> TestResult {
 }
 
 // ============================================================================
-// Bug 1: Timeout on execute() — configurable timeout
+// Bug 1: Timeout on execute(), configurable timeout
 // ============================================================================
 
 #[tokio::test]

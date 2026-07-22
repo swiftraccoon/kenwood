@@ -21,8 +21,8 @@ use kenwood_thd75::types::*;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
-// weakening the lint. (`::aprs` — the `types::*` glob shadows the
-// bare crate name.)
+// weakening the lint. (`::aprs` is needed because the `types::*` glob
+// shadows the bare crate name.)
 use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
@@ -199,7 +199,7 @@ fn document_commands_beyond_spec() -> TestResult {
         .collect();
 
     // These are commands we implement from firmware RE that KI4LAX
-    // didn't document. This list must be kept up to date — any NEW
+    // didn't document. This list must be kept up to date: any NEW
     // undocumented command added should be reviewed.
     let expected_extra = vec![
         "PS", // Power status
@@ -223,7 +223,7 @@ fn document_commands_beyond_spec() -> TestResult {
     for m in &extra {
         assert!(
             expected_extra.contains(m),
-            "New undocumented command {m} — add to expected_extra or document in spec"
+            "New undocumented command {m}: add to expected_extra or document in spec"
         );
     }
     Ok(())
@@ -297,10 +297,10 @@ fn step_size_table_matches_spec() -> TestResult {
         );
     }
 
-    // Index 12 (0xC) should be invalid — spec defines 0-B only
+    // Index 12 (0xC) should be invalid: spec defines 0-B only
     assert!(
         StepSize::try_from(12).is_err(),
-        "Step size 12 should be invalid — spec only defines 0-B"
+        "Step size 12 should be invalid: spec only defines 0-B"
     );
     Ok(())
 }
@@ -375,7 +375,7 @@ fn bl_values_include_spec_range() -> TestResult {
     let response = protocol::parse(b"BL 4")?;
     assert!(
         matches!(response, Response::BatteryLevel { level } if level == BatteryLevel::Charging),
-        "BL 4 (charging) should parse — hardware extension beyond spec"
+        "BL 4 (charging) should parse: hardware extension beyond spec"
     );
     Ok(())
 }
@@ -510,7 +510,7 @@ fn me_has_23_fields_per_spec() -> TestResult {
 }
 
 // ============================================================================
-// SF/FS mnemonic assignment — firmware-verified
+// SF/FS mnemonic assignment (firmware-verified)
 // ============================================================================
 
 #[test]

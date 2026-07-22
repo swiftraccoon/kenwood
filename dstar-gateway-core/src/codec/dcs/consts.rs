@@ -22,13 +22,13 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// (`m_pollInactivityTimer(1000U, 60U)` = 60 seconds).
 pub const KEEPALIVE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// `DCS` voice inactivity timeout — synthesize `VoiceEnd` after this.
+/// `DCS` voice inactivity timeout: synthesize `VoiceEnd` after this.
 pub const VOICE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Disconnect ACK timeout — give up waiting for unlink reply.
+/// Disconnect ACK timeout: give up waiting for unlink reply.
 pub const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// LINK packet length (519 bytes — includes 500-byte HTML template).
+/// LINK packet length (519 bytes, including the 500-byte HTML template).
 ///
 /// Reference: `ircDDBGateway/Common/ConnectData.cpp:364` (return 519U).
 pub const LINK_LEN: usize = 519;
@@ -47,7 +47,7 @@ pub const CONNECT_REPLY_LEN: usize = 14;
 ///
 /// Reference: `ircDDBGateway/Common/PollData.cpp:186` (return 17U).
 /// The 22-byte `DIR_INCOMING` variant from the reference is not used
-/// here — both directions are symmetric 17-byte packets, which matches
+/// here; both directions are symmetric 17-byte packets, which matches
 /// xlxd's `IsValidKeepAlivePacket` accept list
 /// (`xlxd/src/cdcsprotocol.cpp:411`).
 pub const POLL_LEN: usize = 17;
@@ -85,7 +85,7 @@ pub const VOICE_EOT_MARKER: [u8; 3] = [0x55, 0x55, 0x55];
 ///
 /// Reference: `ircDDBGateway/Common/ConnectData.cpp:344-358` shows the
 /// reference populating a template via `wxString::Printf(HTML, ...)`.
-/// We emit a static short banner instead of the full template — the
+/// We emit a static short banner instead of the full template: the
 /// receiving reflector logs the HTML but does not parse it, so any
 /// short identification string that fits in 500 bytes satisfies the
 /// protocol. This mirrors `xlxd`, which accepts LINK packets regardless

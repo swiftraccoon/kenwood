@@ -1,6 +1,6 @@
 # thd75-tui
 
-![thd75-tui](../thd75_tui.png)
+![thd75-tui](thd75_tui.png)
 
 Terminal UI for the Kenwood TH-D75. Built on [`kenwood-thd75`](../thd75/), [ratatui](https://ratatui.rs/), and [crossterm](https://github.com/crossterm-rs/crossterm).
 

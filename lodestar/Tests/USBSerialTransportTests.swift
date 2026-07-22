@@ -15,7 +15,7 @@ final class MockUSBSerialLink: USBSerialLink, @unchecked Sendable {
     var present = true
     /// Number of writes that answer `.backpressure` before succeeding.
     var backpressureCount = 0
-    /// When true, `armDoorbell` throws — simulates a user-client call
+    /// When true, `armDoorbell` throws, simulating a user-client call
     /// failing right after a successful `open()`.
     var failArmDoorbell = false
     private(set) var writes: [[UInt8]] = []
@@ -214,7 +214,7 @@ final class USBSerialTransportTests: XCTestCase {
         let cancelledResult = try await cancelled.value
         XCTAssertEqual(cancelledResult, [], "cancelled read resumes empty")
 
-        // The OTHER parked read must still be alive and receive data —
+        // The OTHER parked read must still be alive and receive data:
         // cancellation must not broadcast the link-closed sentinel.
         link.radioSends([0x42])
         let got = try await survivor

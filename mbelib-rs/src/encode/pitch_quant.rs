@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Pitch-index (`b0`) quantization — OP25-compatible port.
+//! Pitch-index (`b0`) quantization: OP25-compatible port.
 //!
 //! OP25's `ambe_encoder.cc:158-192` picks `b[0]` by first mapping
 //! `ref_pitch` (Q8.8) through a 827-entry lookup table, then
@@ -21,7 +21,7 @@
 //! reference encoder actually emits, so matching it is the only way
 //! to achieve bit-exact `b0` against the OP25 traces.
 
-/// OP25 `b0_lookup[]` table — 827 entries (`ambe_encoder.cc:41-146`).
+/// OP25 `b0_lookup[]` table: 827 entries (`ambe_encoder.cc:41-146`).
 ///
 /// Indexed by `(ref_pitch >> 5) - 159` where `ref_pitch` is the
 /// pitch period in Q8.8 format. Each entry is a 7-bit `b0` index in
@@ -86,10 +86,10 @@ pub(crate) const B0_LOOKUP: [u8; 827] = [
 /// lookup + ±1 walk policy.
 ///
 /// `ref_pitch_q8_8` is the pitch period in Q8.8 format (samples × 256).
-/// `target_l` is the desired `AmbePlusLtable[b0]` value — usually
+/// `target_l` is the desired `AmbePlusLtable[b0]` value, usually
 /// `num_harms` from the V/UV + SA stage.
 /// `ltable` is the L-table we look up against. For D-STAR / AMBE+
-/// this is `AmbePlusLtable` (126 entries — codes 120–127 are
+/// this is `AmbePlusLtable` (126 entries; codes 120–127 are
 /// reserved for silence / tone / erasure and are not visited by the
 /// walk). Only `ltable[0..120]` matters here.
 ///
@@ -113,13 +113,13 @@ pub(crate) fn pitch_index(ref_pitch_q8_8: u32, target_l: usize, ltable: &[f32]) 
     debug_assert_eq!(
         B0_LOOKUP.len(),
         LOOKUP_LEN as usize,
-        "B0_LOOKUP length must equal LOOKUP_LEN=827 per OP25 ambe_encoder.cc:41-146 — the \
+        "B0_LOOKUP length must equal LOOKUP_LEN=827 per OP25 ambe_encoder.cc:41-146; the \
          walk algorithm's bounds rely on this invariant"
     );
     #[expect(
         clippy::cast_possible_wrap,
         reason = "Initial b0_lookup index: ref_pitch_q8_8 is Q8.8 with period < 256, so the \
-                  value is < 2^16; `>> 5` yields <= 2047, which fits safely in i32 — the \
+                  value is < 2^16; `>> 5` yields <= 2047, which fits safely in i32, so the \
                   u32->i32 cast cannot wrap at these magnitudes."
     )]
     let initial = (ref_pitch_q8_8 >> 5) as i32 - 159;
@@ -128,7 +128,7 @@ pub(crate) fn pitch_index(ref_pitch_q8_8: u32, target_l: usize, ltable: &[f32]) 
     // Walk until AmbePlusLtable[b0] matches target_l, or we bump
     // into a boundary. OP25 treats boundary hits as silent aborts
     // (it returns without emitting a frame); we return whatever the
-    // clamped b0 is — the caller has already validated the pitch
+    // clamped b0 is; the caller has already validated the pitch
     // range, so boundary hits here indicate a pitch the codec can't
     // represent, and returning the closest b0 is the least-bad
     // fallback.
@@ -257,7 +257,7 @@ mod tests {
     fn no_walk_needed_when_initial_b0_matches_target_l() -> Result<(), Box<dyn std::error::Error>> {
         // Pick ref_pitch such that b0_lookup entry happens to match.
         // For ref_pitch = 0x1800 (period = 24.0 samples), b0_i = 0x1800>>5 - 159 = 192 - 159 = 33.
-        // B0_LOOKUP[33] = 12. L_TABLE[12] = ? — whatever mbelib says.
+        // B0_LOOKUP[33] = 12. L_TABLE[12] is whatever mbelib says.
         let ref_pitch_q8_8 = 0x1800_u32;
         let b0_i = (ref_pitch_q8_8 >> 5) as usize - 159;
         let start_b0 = *B0_LOOKUP.get(b0_i).ok_or("b0_i out of table range")?;
@@ -271,7 +271,7 @@ mod tests {
     }
 
     /// If the target L exceeds the initial slot's L, the walk must
-    /// increment (not decrement) — corresponds to a longer-period
+    /// increment (not decrement); this corresponds to a longer-period
     /// pitch needing more harmonics.
     #[test]
     fn walk_increments_when_target_l_is_larger() -> Result<(), Box<dyn std::error::Error>> {

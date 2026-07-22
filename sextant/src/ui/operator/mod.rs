@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Operator page — the clean everyday face of the app.
+//! Operator page: the clean everyday face of the app.
 
 pub(crate) mod connect_sheet;
 pub(crate) mod heard;
@@ -15,7 +15,7 @@ use crate::app::App;
 /// The operator deck: hero display (left, 55 %) beside the heard
 /// list, separated by a hairline.
 ///
-/// Both columns are explicitly allocated at the full panel height —
+/// Both columns are explicitly allocated at the full panel height.
 /// `ui.horizontal` starts as a single interact-row and centers
 /// children vertically as it grows, which starved the heard list's
 /// scroll area of its real height (only a few rows were reachable

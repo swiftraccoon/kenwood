@@ -4,7 +4,7 @@
 #
 # Pass-through policy: any tool or command the pod needs must be
 # installed; a missing tool is a hard failure. The earlier
-# "optional — skip if missing" pattern hid real regressions because
+# "optional, skip if missing" pattern hid real regressions because
 # the Docs workflow's alsa dependency could silently fall through.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -13,7 +13,7 @@ cd "$(dirname "$0")"
 # `ci_pod "<name>"` calls below so the cleanup trap can find them.
 CI_POD_NAMES=(ci-ubuntu ci-fedora)
 
-# Delete any pods this script owns. Safe to call multiple times —
+# Delete any pods this script owns. Safe to call multiple times:
 # `--ignore-not-found` treats "already gone" as success. Synchronous
 # (no trailing `&`) so we actually wait for the API to accept the
 # delete before the script exits.
@@ -26,7 +26,7 @@ cleanup_pods() {
 
 # EXIT covers normal finish AND `set -e` errors mid-run.
 # INT / TERM cover Ctrl-C and external kills (harness timeouts,
-# foreground SIGTERM, etc.) — without these the previous script
+# foreground SIGTERM, etc.); without these the previous script
 # version leaked pods whenever anything upstream killed it.
 trap cleanup_pods EXIT INT TERM
 
@@ -52,10 +52,10 @@ echo ""
 echo "========== Preparing k8s CI =========="
 # Source-only tarball: tracked files plus untracked-but-not-ignored
 # files (what a fresh checkout plus work-in-progress contains), plus
-# the workspace Cargo.lock — gitignored on purpose, but the pods must
-# build and audit the same resolved dependency set as this machine.
+# the workspace Cargo.lock (gitignored on purpose, but the pods must
+# build and audit the same resolved dependency set as this machine).
 # The previous `tar . --exclude=...` swept in every OTHER gitignored
-# local artifact too (recordings/, dataset/, survey/ — 1.3 GB) and
+# local artifact too (recordings/, dataset/, survey/; 1.3 GB) and
 # shipped all of it to both pods on every run; this list is ~4 MB.
 # Tests whose fixtures are gitignored self-skip or are #[ignore]d
 # (see the "pod-safe" note in the pod script below), so dropping
@@ -78,7 +78,7 @@ ci_pod() {
     #
     # `--restart=Never` + `sleep infinity`, not `sleep 600`: kubectl
     # run defaults to restartPolicy Always, so a finite sleep capped
-    # the container's lifetime — at t=600s the main process exited,
+    # the container's lifetime: at t=600s the main process exited,
     # kubelet restarted the container, and every `kubectl exec`
     # session (including the gate mid-build) was killed. The endless
     # exit/restart cycle is also what left prior runs' pods lingering
@@ -100,7 +100,7 @@ ci_pod() {
     # aborts and propagates a non-zero exit up through `kubectl exec`,
     # which flips our outer `failed=1`. Previously every command piped
     # through `| tail -1`, which hid cargo's exit code behind tail's
-    # (always 0), so pod failures went unreported — the Docs workflow
+    # (always 0), so pod failures went unreported: the Docs workflow
     # broke on libasound2-dev missing for sextant/cpal without
     # ci-local flagging it, because the pod's `cargo doc --workspace`
     # silently failed.
@@ -110,7 +110,7 @@ ci_pod() {
     # so context is visible without `tail -1` hiding cargo errors.
     # Run checks. `kubectl exec` returns the exit code of the remote
     # command, so letting the exit code propagate up makes this the
-    # last command in the function — and the subshell spawned by
+    # last command in the function, and the subshell spawned by
     # `ci_pod &` inherits that exit status. The parent's `wait` then
     # surfaces the failure via its own exit code, which drives
     # `failed=1` back in the main shell. An earlier version wrapped
@@ -130,15 +130,15 @@ ci_pod() {
 
         # Pod-level system deps. Neither base image ships these out
         # of the box:
-        #   libasound2-dev / alsa-lib-devel — sextant (cpal) needs
+        #   libasound2-dev / alsa-lib-devel: sextant (cpal) needs
         #     ALSA headers. Missing ALSA is exactly the silent
         #     regression the Docs workflow hit previously.
-        #   git — cargo-deny clones the RustSec advisory database
+        #   git: cargo-deny clones the RustSec advisory database
         #     via `git clone`, and neither `rust:1.94` nor
         #     `fedora:latest` preinstalls a git binary. Without
         #     this, `cargo deny check` fails with
         #     "failed to spawn git: No such file or directory".
-        # No `sudo` — both base images run as root and neither
+        # No `sudo`: both base images run as root and neither
         # ships sudo; adding it would break with "command not
         # found".
         if command -v apt-get >/dev/null 2>&1; then
@@ -150,7 +150,7 @@ ci_pod() {
 
         # Ensure clippy is present. Neither `rust:1.94` nor the
         # `rustup --profile minimal` install on fedora ships clippy
-        # by default — a previous run surfaced the mistake only at
+        # by default; a previous run surfaced the mistake only at
         # the `cargo clippy` step, far too late. rustup component
         # add is idempotent, so running it unconditionally is cheap
         # on pods that already have it.
@@ -158,8 +158,8 @@ ci_pod() {
 
         # Install required lint-gate tools as prebuilt release
         # binaries via cargo-binstall. `cargo install` compiled all
-        # three from source on every fresh pod — several minutes each,
-        # the single largest cost of a pod run — to produce the same
+        # three from source on every fresh pod (several minutes each,
+        # the single largest cost of a pod run) to produce the same
         # binaries. binstall falls back to a source build only when no
         # release binary exists for the platform. Fail hard if install
         # fails; dont skip-if-missing. (curl | bash matches how the
@@ -199,7 +199,7 @@ ci_pod() {
         # `--skip-target-dir`: the trybuild compile-fail suites (now that
         # the pods run full test targets) generate scratch crates under
         # `target/` that list every dev-dependency and use almost none.
-        # Machete would otherwise walk into them — it only skips them via
+        # Machete would otherwise walk into them: it only skips them via
         # `.gitignore`, which it honours solely inside a git checkout, and
         # the pod gets a tarball with no `.git`.
         step "machete"               cargo machete --skip-target-dir .
@@ -208,7 +208,7 @@ ci_pod() {
     # Per-pod delete intentionally removed: the EXIT/INT/TERM trap at
     # the top of this script calls `cleanup_pods` which deletes every
     # pod name in `CI_POD_NAMES`. A backgrounded `kubectl delete` at
-    # this point (the previous design) would fire-and-forget — the
+    # this point (the previous design) would fire-and-forget: the
     # script was free to exit before the API server processed the
     # request, leaving the pods running for the 22-hour+ lifetimes
     # we observed in practice.
@@ -222,7 +222,7 @@ ci_pod "fedora" "fedora:latest" "
     # Fedora base image ships neither a compiler nor rustup. Install
     # gcc first (rustc's linker needs it), then rustup-init with an
     # explicit minimal profile. Clippy is added by the inner lint
-    # script via 'rustup component add clippy' — kept there as a
+    # script via 'rustup component add clippy', kept there as a
     # single source of truth that handles both pods. Dropped the
     # ' | tail -1' mask that used to hide install failures (see
     # the 'pass-through policy' comment at the top of this file).

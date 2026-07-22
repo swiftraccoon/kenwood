@@ -140,7 +140,7 @@ fn erase<P: Protocol>(ev: Event<P>) -> LinkEvent {
                 _ => EndReason::Inactivity,
             },
         },
-        // Connected / PollEcho / future variants — nothing to record.
+        // Connected / PollEcho / future variants: nothing to record.
         _ => LinkEvent::Other,
     }
 }
@@ -250,7 +250,7 @@ async fn connect(
             {
                 Ok(h) => h,
                 Err(e) => {
-                    tracing::warn!(error = ?e, "DPlus auth failed — continuing unauthenticated");
+                    tracing::warn!(error = ?e, "DPlus auth failed, continuing unauthenticated");
                     HostList::new()
                 }
             };
@@ -334,9 +334,9 @@ async fn write_recording(writer: &Arc<Writer>, rec: CompletedRecording) {
 
 /// Why [`pump_session`] returned.
 enum SessionOutcome {
-    /// Session ended (disconnect or loop death) — reconnect.
+    /// Session ended (disconnect or loop death): reconnect.
     Dropped,
-    /// Shutdown was requested — supervisor should return.
+    /// Shutdown was requested: supervisor should return.
     ShutdownRequested,
 }
 
@@ -453,13 +453,13 @@ pub async fn run_supervisor(
                     Ok(SessionOutcome::Dropped) => {}
                     Err(e) => {
                         // A panic inside the session task must not end
-                        // this target's supervision — log it loudly,
+                        // this target's supervision: log it loudly,
                         // accept the open captures as lost, reconnect.
                         tracing::error!(
                             target = %label,
                             panicked = e.is_panic(),
                             error = %e,
-                            "session task died — reconnecting"
+                            "session task died, reconnecting"
                         );
                     }
                 }

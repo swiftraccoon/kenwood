@@ -23,7 +23,7 @@ use tracing as _;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 // ============================================================================
-// ME — Memory channel read/write
+// ME: Memory channel read/write
 // ============================================================================
 
 #[test]
@@ -159,7 +159,7 @@ fn me_write_parse_round_trip() -> TestResult {
 }
 
 // ============================================================================
-// MR — Memory recall (action command, echoes band,channel)
+// MR: Memory recall (action command, echoes band,channel)
 // ============================================================================
 
 #[test]
@@ -207,7 +207,7 @@ fn parse_mr_echo_band_b() -> TestResult {
 }
 
 // ============================================================================
-// MR — Read current channel (MR band read, no comma in response)
+// MR: Read current channel (MR band read, no comma in response)
 // ============================================================================
 
 #[test]
@@ -261,7 +261,7 @@ fn parse_mr_read_response_channel_0() -> TestResult {
 }
 
 // ============================================================================
-// 0M — Enter programming mode (action command)
+// 0M: Enter programming mode (action command)
 // ============================================================================
 
 #[test]

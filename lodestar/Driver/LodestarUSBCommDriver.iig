@@ -6,7 +6,7 @@
  * (bInterfaceNumber 0, class 02/02/01). Claims the interface and
  * services its interrupt-IN endpoint the way a standard host ACM stack
  * does. Exists because the radio ACKs bulk-OUT CAT bytes yet never
- * transmits on bulk IN while the control interface is unclaimed —
+ * transmits on bulk IN while the control interface is unclaimed;
  * mirroring macOS (AppleUSBACM on interface 0 + AppleUSBACMData on
  * interface 1) is the remaining host-behavior difference.
  */

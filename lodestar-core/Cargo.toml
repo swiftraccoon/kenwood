@@ -3,7 +3,7 @@ name = "lodestar-core"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Rust core for Lodestar — native macOS + iPadOS D-STAR gateway app for the Kenwood TH-D75."
+description = "Rust core for Lodestar, the native macOS + iPadOS D-STAR gateway app for the Kenwood TH-D75."
 license = "GPL-2.0-or-later OR GPL-3.0-or-later"
 authors = ["swiftraccoon"]
 repository = "https://github.com/swiftraccoon/kenwood"
@@ -68,12 +68,12 @@ unused_results = "deny"
 elided_lifetimes_in_paths = "deny"
 trivial_casts = "deny"
 trivial_numeric_casts = "deny"
-# `unused_qualifications = "deny"` is intentionally omitted — UniFFI's
+# `unused_qualifications = "deny"` is intentionally omitted: UniFFI's
 # generated scaffolding emits fully qualified paths like
 # `std::vec::Vec<u8>` that trip this lint, and the scaffolding is
 # spliced into lib.rs by `include_scaffolding!`, so the lint cannot be
 # scoped out of the generated code. NOTE: no clippy lint backstops this
-# for hand-written code — redundant qualification here is caught only
+# for hand-written code; redundant qualification here is caught only
 # in review.
 non_ascii_idents = "deny"
 single_use_lifetimes = "deny"
@@ -93,12 +93,12 @@ panic = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
-# Ban `#[allow]` — every suppression must be `#[expect(..., reason = "...")]`.
+# Ban `#[allow]`: every suppression must be `#[expect(..., reason = "...")]`.
 # Mirrors the root `[workspace.lints.clippy]` ban; restated here because this crate's
 # `[lints]` block replaces the workspace one entirely (cargo does not merge).
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
-# Forward-protection lints — mirror the workspace block exactly.
+# Forward-protection lints; these mirror the workspace block exactly.
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
@@ -109,7 +109,7 @@ module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
 # UniFFI's generated scaffolding declares top-level FFI functions
 # (`extern "C" fn ...`) that clippy flags as candidates for `const`.
-# They can't be const — they're the `#[unsafe(no_mangle)]` FFI surface.
+# They can't be const; they're the `#[unsafe(no_mangle)]` FFI surface.
 # Allowing here rather than per-file because the scaffolding is emitted
 # directly into `lib.rs` by `include_scaffolding!` and cannot be scoped.
 missing_const_for_fn = "allow"

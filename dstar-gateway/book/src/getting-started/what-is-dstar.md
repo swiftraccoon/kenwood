@@ -65,7 +65,7 @@ Reflector naming follows a convention:
   DCS002). Port 30051.
 
 From the gateway's perspective, DExtra and XLX are the same wire
-format — XLX just has more features. DPlus is different enough to
+format; XLX just has more features. DPlus is different enough to
 need a separate codec but shares the voice-frame structure. DCS
 is different again and has a notably larger (100-byte) voice
 frame.
@@ -82,7 +82,7 @@ whenever the local operator keys up.
 
 Disconnection happens by sending an **UNLINK** packet and
 optionally waiting for the reflector's ACK. Most real-world
-clients don't wait — they send UNLINK and drop the socket.
+clients don't wait: they send UNLINK and drop the socket.
 `AsyncSession::disconnect` queues UNLINK and returns when the session
 loop acknowledges the request. Callers that need the protocol outcome
 continue reading until `Event::Disconnected`; dropping the handle just

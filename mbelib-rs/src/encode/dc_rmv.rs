@@ -13,7 +13,7 @@
 //! ```
 //!
 //! With α = 0.99, the −3 dB corner sits at about 13 Hz, well below the
-//! 250–500 Hz lower edge of human speech — so audible content passes
+//! 250–500 Hz lower edge of human speech, so audible content passes
 //! unattenuated and the integrator quickly eliminates any DC bias or
 //! very-low-frequency microphone artifacts.
 
@@ -25,7 +25,7 @@ const ALPHA: f32 = 0.990_05;
 ///
 /// `sigin` is the block of new samples (length `len`). Output is
 /// written to `sigout` (same length). `mem` carries the integrator
-/// state across calls — zero at stream start, updated on return.
+/// state across calls: zero at stream start, updated on return.
 ///
 /// Panics if `sigin.len()` and `sigout.len()` are both less than the
 /// advertised frame size (we iterate over `min(sigin.len(), sigout.len())`).

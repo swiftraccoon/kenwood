@@ -3,7 +3,7 @@
 //
 // Reference data extracted from a lawfully-owned TH-D75 radio's
 // firmware under DMCA §1201(f) (interoperability). Every symbol in
-// this module is a numerical constant — no compiled Kenwood code or
+// this module is a numerical constant; no compiled Kenwood code or
 // algorithm logic is imported. The clean-room JMBE/mbelib-derived
 // algorithms in the rest of this crate are the code; these constants
 // are referenced only at the specific A/B-test swap points gated by
@@ -52,8 +52,8 @@
 //!
 //! # Provenance
 //!
-//! The full extraction audit — DSP section map, pointer-target
-//! analysis, biquad bank labeling, inline-codebook disassembly — is
+//! The full extraction audit (DSP section map, pointer-target
+//! analysis, biquad bank labeling, inline-codebook disassembly) is
 //! kept in a separate working tree outside this repo. The tables
 //! here are the committed output; the raw firmware dump and
 //! Python-based extraction scripts that produced them are not

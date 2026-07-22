@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn protocol_v1_canonical_caps() {
-        // MMDVMHost/Modem.cpp:2027 — v1 always advertises this set.
+        // MMDVMHost/Modem.cpp:2027: v1 always advertises this set.
         let c = Capabilities::new(
             CAP1_DSTAR | CAP1_DMR | CAP1_YSF | CAP1_P25 | CAP1_NXDN,
             CAP2_POCSAG,

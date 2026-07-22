@@ -1,7 +1,7 @@
 //! Runtime protocol discriminator.
 //!
 //! Compile-time protocol distinction lives in the typestate marker
-//! types `DPlus`, `DExtra`, `Dcs`. This enum is the runtime mirror —
+//! types `DPlus`, `DExtra`, `Dcs`. This enum is the runtime mirror,
 //! used in error variants, diagnostics, log fields, and anywhere a
 //! `Protocol` type parameter has been erased.
 
@@ -34,7 +34,7 @@ impl ProtocolKind {
 
     /// Whether this protocol requires TCP authentication before UDP linking.
     ///
-    /// Only `DPlus` requires this — see
+    /// Only `DPlus` requires this; see
     /// `ircDDBGateway/Common/DPlusAuthenticator.cpp:62-200`.
     #[must_use]
     pub const fn needs_auth(self) -> bool {

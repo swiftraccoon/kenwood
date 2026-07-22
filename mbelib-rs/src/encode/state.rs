@@ -8,7 +8,7 @@
 
 //! Encoder state buffers and canonical frame dimensions.
 //!
-//! The IMBE/AMBE encoder carries per-stream state across frames —
+//! The IMBE/AMBE encoder carries per-stream state across frames:
 //! primarily the 301-sample pitch-estimation history (one past frame
 //! plus current) and the 21-tap LPF memory. This module owns those
 //! buffers plus the canonical size constants every downstream module
@@ -34,7 +34,7 @@ pub(crate) const FFT_LENGTH: usize = 256;
 /// Pitch-refinement half-window length (samples).
 ///
 /// Indices 146..256 read the window ascending, and 1..111 read it
-/// descending — total 220-sample overlap that sits centered on the
+/// descending, for a total 220-sample overlap that sits centered on the
 /// current 160-sample frame inside the 256-point FFT.
 pub(crate) const WR_HALF_LEN: usize = 111;
 
@@ -56,10 +56,10 @@ pub struct EncoderBuffers {
     pub(crate) pitch_ref_buf: [f32; PITCH_EST_BUF_SIZE],
     /// Pitch-estimation LPF delay line (one sample per tap).
     pub(crate) pe_lpf_mem: [f32; PE_LPF_ORD],
-    /// OP25 `dc_rmv` single-pole HPF integrator — default path.
+    /// OP25 `dc_rmv` single-pole HPF integrator (default path).
     #[cfg(not(feature = "kenwood-tables"))]
     pub(crate) dc_rmv_mem: f32,
-    /// Kenwood 345 Hz biquad HPF delay line — replaces `dc_rmv_mem`
+    /// Kenwood 345 Hz biquad HPF delay line; replaces `dc_rmv_mem`
     /// as the active input-conditioning state when the
     /// `kenwood-tables` feature is enabled.
     #[cfg(feature = "kenwood-tables")]
@@ -113,7 +113,7 @@ mod tests {
     use super::{EncoderBuffers, FRAME, PE_LPF_ORD, PITCH_EST_BUF_SIZE};
 
     /// Bit-exact zero comparison on f32 is legitimate for freshly
-    /// zero-initialized buffers — the values went through no
+    /// zero-initialized buffers: the values went through no
     /// arithmetic that could introduce rounding.
     fn is_zero(x: f32) -> bool {
         x.to_bits() == 0 || x.to_bits() == (1u32 << 31)
@@ -133,7 +133,7 @@ mod tests {
     /// position `p - FRAME`. Verifies the buffer slides correctly.
     /// Note that `2 * FRAME > PITCH_EST_BUF_SIZE` so we can't verify
     /// "the last frame lands in the second-to-last frame position"
-    /// directly — instead we check the sliding identity.
+    /// directly; instead we check the sliding identity.
     #[test]
     fn shift_moves_content_by_frame() {
         let mut b = EncoderBuffers::new();

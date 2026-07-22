@@ -5,7 +5,7 @@ import Foundation
 
 /// External-method selectors of the LodestarDriver user client.
 /// MUST match the `LodestarSelector` enum in
-/// `Driver/LodestarUserClient.cpp` — the dext side is the other half of
+/// `Driver/LodestarUserClient.cpp`; the dext side is the other half of
 /// this contract.
 public enum USBSerialSelector: UInt32 {
     /// structureInput 1..4096 bytes → bulk OUT queue.
@@ -35,7 +35,7 @@ public struct USBDextStatus: Sendable {
 
 /// One diagnostic event from the dext's ring (selector 4). Mirrors
 /// `LodestarLogEntry` + `LodestarEvent` in
-/// `Driver/LodestarUSBSerialDriver.cpp` — keep in sync.
+/// `Driver/LodestarUSBSerialDriver.cpp`; keep in sync.
 public struct USBDextLogEntry: Sendable {
     public let seq: UInt32
     public let event: UInt32
@@ -118,7 +118,7 @@ public enum USBLinkError: Error, Equatable {
     case openFailed(kern: Int32)
     /// Operation attempted before `open()` / after `close()`.
     case notOpen
-    /// Dext write queue full (`kIOReturnNoResources`) — retryable.
+    /// Dext write queue full (`kIOReturnNoResources`), retryable.
     case backpressure
     /// Any other failed user-client call.
     case callFailed(kern: Int32)
@@ -131,7 +131,7 @@ public enum USBLinkError: Error, Equatable {
 /// scriptable mock. All methods are synchronous and non-blocking: the
 /// doorbell + drain protocol lives in `USBSerialTransport`, not here.
 public protocol USBSerialLink: Sendable {
-    /// `true` when the dext's IOService is registered — radio plugged
+    /// `true` when the dext's IOService is registered: radio plugged
     /// in AND the driver enabled in Settings → General → Drivers.
     func servicePresent() -> Bool
 

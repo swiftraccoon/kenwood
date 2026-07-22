@@ -5,7 +5,7 @@ import XCTest
 @testable import Lodestar
 
 final class RailStateTests: XCTestCase {
-    /// Baseline healthy inputs — reflector linked, radio relaying,
+    /// Baseline healthy inputs: reflector linked, radio relaying,
     /// nobody transmitting. Individual tests perturb one dimension.
     private func healthy() -> RailState.Inputs {
         RailState.Inputs(
@@ -41,7 +41,7 @@ final class RailStateTests: XCTestCase {
         XCTAssertTrue(s.showsHeardList)
     }
 
-    // Spec §4 row: first run — nothing connected → expanded chain only.
+    // Spec §4 row: first run, nothing connected → expanded chain only.
     func testNothingConnectedExpandsChain() {
         let i = RailState.Inputs(
             transport: .disconnected,

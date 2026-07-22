@@ -1,4 +1,4 @@
-//! Build script — compiles the macOS `IOBluetooth` RFCOMM wrapper.
+//! Build script: compiles the macOS `IOBluetooth` RFCOMM wrapper.
 
 // `cc` is only exercised on macOS (see the `cfg` block below). On every other
 // target the build script is a no-op, so the `cc` build-dependency would trip
@@ -13,7 +13,7 @@ fn main() {
         println!("cargo:rerun-if-changed=src/transport/bluetooth_mac.m");
 
         // The `ar -D` (deterministic) flag from cc crate causes cosmetic warnings
-        // on macOS Xcode ar. These are harmless — the archive is still created correctly.
+        // on macOS Xcode ar. These are harmless; the archive is still created correctly.
         // Suppressed by redirecting ar stderr in the cc crate is not possible, so we
         // accept the warnings. They do not affect the build.
         cc::Build::new()

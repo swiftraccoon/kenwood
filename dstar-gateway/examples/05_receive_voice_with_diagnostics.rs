@@ -107,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Listen for 30 seconds of traffic. `Event::VoiceStart` is the
-    // interesting one — it carries the decoded header AND the
+    // interesting one: it carries the decoded header AND the
     // `Vec<Diagnostic>` accumulated while parsing it. Anything that
     // doesn't bind to a stream (keepalive echoes, disconnect)
     // still surfaces as the normal event stream.

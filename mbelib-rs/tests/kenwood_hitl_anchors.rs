@@ -78,8 +78,8 @@ fn load_capture(name: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Parse a capture file into 9-byte frames. Captures are raw AMBE byte
-/// streams with no header — frames begin at byte 0. Returns `None` if
-/// the file is empty (happens with very-short keying — e.g. `capture_6`
+/// streams with no header; frames begin at byte 0. Returns `None` if
+/// the file is empty (happens with very-short keying, e.g. `capture_6`
 /// which the encoder never flushed).
 fn parse_frames(raw: &[u8]) -> Option<Vec<[u8; FRAME_LEN]>> {
     if raw.is_empty() {
@@ -113,9 +113,9 @@ fn dominant_in_second_half(frames: &[[u8; FRAME_LEN]]) -> Option<([u8; FRAME_LEN
 // ─── capture-integrity tests (always enabled with feature) ──────────
 
 #[test]
-#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed; recapture from hardware before re-enabling"]
 fn captures_have_no_header_and_divide_by_nine() -> TestResult {
-    // Each capture is a raw AMBE byte stream — no header, frames
+    // Each capture is a raw AMBE byte stream with no header; frames
     // begin at byte 0. File sizes divide evenly by 9 (one frame).
     let names = [
         "capture_0_voice.ambe",
@@ -142,7 +142,7 @@ fn captures_have_no_header_and_divide_by_nine() -> TestResult {
 }
 
 #[test]
-#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed; recapture from hardware before re-enabling"]
 fn empty_capture_for_too_short_keying() -> TestResult {
     // capture_6 was an intentional very-brief key-up; the encoder
     // didn't get to flush any frames. Documents the firmware behaviour.
@@ -156,7 +156,7 @@ fn empty_capture_for_too_short_keying() -> TestResult {
 }
 
 #[test]
-#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed; recapture from hardware before re-enabling"]
 fn frame_stride_is_nine_bytes() -> TestResult {
     // The 440 Hz capture is the strongest demonstration: 107/196
     // frames are byte-identical when sliced at stride 9.
@@ -178,7 +178,7 @@ fn frame_stride_is_nine_bytes() -> TestResult {
 }
 
 #[test]
-#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed; recapture from hardware before re-enabling"]
 fn pitch_anchors_match_capture_steady_state() -> TestResult {
     // For each anchor, the corresponding capture's 2nd-half-dominant
     // masked frame must match the codified anchor.frame, at no less
@@ -209,10 +209,10 @@ fn pitch_anchors_match_capture_steady_state() -> TestResult {
 }
 
 #[test]
-#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed; recapture from hardware before re-enabling"]
 fn unsupported_pitches_do_not_lock() -> TestResult {
-    // 100 Hz and 320 Hz captures exist but didn't lock — phone-speaker
-    // limitations, not codec behaviour. Document this explicitly so
+    // 100 Hz and 320 Hz captures exist but didn't lock, a phone-speaker
+    // limitation rather than codec behaviour. Document this explicitly so
     // future sessions don't try to derive anchors from these files.
     for file in ["capture_5_100Hz_tone.ambe", "capture_3_320Hz_tone.ambe"] {
         let frames = parse_frames(&load_capture(file)?).ok_or("capture parses")?;
@@ -220,18 +220,18 @@ fn unsupported_pitches_do_not_lock() -> TestResult {
         let quality = count as f32 / total as f32;
         assert!(
             quality < 0.5,
-            "{file}: unexpected lock at quality {quality:.2} — anchor may be derivable"
+            "{file}: unexpected lock at quality {quality:.2}; anchor may be derivable"
         );
     }
     Ok(())
 }
 
 #[test]
-#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed; recapture from hardware before re-enabling"]
 fn mic_covered_captures_show_no_silence_anchor() -> TestResult {
     // Both mic-covered captures still produce 100% unique frames in
     // the 2nd half. Documents that this radio has no quiescent silence
-    // pattern — mic noise always drives V/UV decisions.
+    // pattern: mic noise always drives V/UV decisions.
     for file in ["capture_9_mic_covered.ambe", "capture_10_mic_covered.ambe"] {
         let frames = parse_frames(&load_capture(file)?).ok_or("capture parses")?;
         let (_, count, _total) = dominant_in_second_half(&frames).ok_or("non-empty 2nd half")?;
@@ -244,10 +244,10 @@ fn mic_covered_captures_show_no_silence_anchor() -> TestResult {
 }
 
 #[test]
-#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed; recapture from hardware before re-enabling"]
 fn volatile_bits_are_actually_volatile_in_440hz_capture() -> TestResult {
     // For each bit position in VOLATILE_BIT_MASK, at least 5% of 440
-    // Hz frames must show that bit differing from the dominant — that's
+    // Hz frames must show that bit differing from the dominant; that's
     // why we classified it as volatile. Catches mask drift.
     let frames =
         parse_frames(&load_capture("capture_2_440Hz_tone.ambe")?).ok_or("440 Hz capture parses")?;
@@ -280,7 +280,7 @@ fn volatile_bits_are_actually_volatile_in_440hz_capture() -> TestResult {
 }
 
 #[test]
-#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed — recapture from hardware before re-enabling"]
+#[ignore = "capture fixtures predate the wire bit-order fix (recorded through a since-fixed MMDVM slicing bug; baselines stale) and are not committed; recapture from hardware before re-enabling"]
 fn stable_bits_are_actually_stable_in_440hz_capture() -> TestResult {
     // For each bit in STABLE_BIT_MASK, < 5% of 440 Hz frames may differ
     // from the dominant masked frame. Confirms our partition is correct.
@@ -317,7 +317,7 @@ fn stable_bits_are_actually_stable_in_440hz_capture() -> TestResult {
 ///
 /// 8 kHz sample rate, 16-bit signed. Length is `n_frames * 160`
 /// because AMBE/D-STAR uses 20 ms (160-sample) frames at 8 kHz.
-/// No additive noise — with `D_STAR_GAIN_ADJUST = 0.0`, pure sine
+/// No additive noise: with `D_STAR_GAIN_ADJUST = 0.0`, pure sine
 /// produces `b2 = 49` for 210 Hz, within 1 step of Kenwood's `b2 = 48`.
 /// Adding a noise floor pushes b2 higher and away from the anchor.
 fn synthesize_tone_pcm(frequency_hz: f32, n_frames: usize, amplitude: i16) -> Vec<i16> {
@@ -364,7 +364,7 @@ fn synthesize_tone_with_noise(
 /// Run the Rust encoder on PCM and return the emitted 9-byte AMBE
 /// frames. Slices the input into 160-sample (20 ms) frames matching the
 /// AMBE frame rate at 8 kHz. Trailing samples (less than one full
-/// frame) are dropped — synthesized inputs in this test are sized to
+/// frame) are dropped; synthesized inputs in this test are sized to
 /// be exact multiples of 160.
 fn encode_to_ambe_frames(pcm: &[i16]) -> Vec<[u8; FRAME_LEN]> {
     use mbelib_rs::AmbeEncoder;
@@ -376,16 +376,16 @@ fn encode_to_ambe_frames(pcm: &[i16]) -> Vec<[u8; FRAME_LEN]> {
         .collect()
 }
 
-/// The "Kenwood-exact" milestone — V path: synthesized 210 Hz tone
-/// must produce a bit-exact-after-mask AMBE frame matching the
-/// 210 Hz anchor. Only 210 Hz is currently a reachable target — the
+/// The "Kenwood-exact" milestone for the V path: a synthesized 210 Hz
+/// tone must produce a bit-exact-after-mask AMBE frame matching the
+/// 210 Hz anchor. Only 210 Hz is currently a reachable target: the
 /// 440/550/660 Hz inputs have pitch periods below the OP25 pitch
 /// tracker's 21-sample minimum (`PitchAnchor::in_op25_pitch_range`
 /// flags this); the encoder octave-folds those inputs, producing a
 /// different b0 than Kenwood. Widening `PITCH_CANDIDATES` to cover
 /// the full IMBE-spec range is a separate larger refactor.
 ///
-/// Currently `#[ignore]`'d — the encoder pipeline is at 27 wrong bits
+/// Currently `#[ignore]`'d: the encoder pipeline is at 27 wrong bits
 /// out of 58 stable for 210 Hz (47% wrong). This test gates the
 /// V-path milestone.
 #[test]
@@ -398,7 +398,7 @@ fn rust_encoder_matches_pitch_anchors() -> TestResult {
 }
 
 /// Aspirational test for full IMBE pitch range support. Currently
-/// stays `#[ignore]`'d well past the V-path milestone — gates the
+/// stays `#[ignore]`'d well past the V-path milestone; it gates the
 /// full-range encoder rewrite.
 #[test]
 #[ignore = "blocked on widening PITCH_CANDIDATES to full IMBE range (~50-625 Hz)"]
@@ -693,7 +693,7 @@ fn probe_b2_with_varied_inputs() {
             #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_possible_wrap,
-                reason = "PRNG output to i16 PCM. The truncation is intentional — the \
+                reason = "PRNG output to i16 PCM. The truncation is intentional: the \
                           xorshift32 produces a full 32-bit value and we want the low 16 \
                           as the PCM sample. Wrap is safe; sign loss is the desired noise \
                           characteristic."
@@ -1059,7 +1059,7 @@ fn attribute_wrong_bits(
 /// #1 data/parity, unprotected b3-b8 spectral magnitudes).
 ///
 /// Lets us answer "is the issue in pitch/voicing/gain encoding, or in
-/// spectral magnitudes?" — and watch each category's error count drop
+/// spectral magnitudes?", and watch each category's error count drop
 /// independently as fixes land.
 ///
 /// Run with `cargo test ... -- --ignored --nocapture
@@ -1069,7 +1069,7 @@ fn attribute_wrong_bits(
 fn rust_encoder_field_breakdown() -> TestResult {
     // DSD INVERSE table: INVERSE[ambe_fr_index] = pre-interleave input bit.
     // Built once at startup from the FORWARD table that lives in the
-    // private encode::interleave module — duplicated literally here so
+    // private encode::interleave module, duplicated literally here so
     // this diagnostic stays decoupled from the encoder's internals.
     const FORWARD: [u8; 72] = [
         10, 22, 69, 56, 34, 46, 11, 23, 32, 44, 9, 21, 68, 55, 33, 45, 66, 53, 31, 43, 8, 20, 67,

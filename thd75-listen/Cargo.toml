@@ -22,7 +22,7 @@ path = "src/main.rs"
 [dependencies]
 kenwood-thd75 = { path = "../thd75" }
 if-dsp = { path = "../if-dsp" }
-# Matches sextant's cpal pin — two cpal majors cannot coexist (the
+# Matches sextant's cpal pin: two cpal majors cannot coexist (the
 # alsa-sys `links = "alsa"` value must be unique in the graph).
 cpal = "0.15"
 tokio = { version = "1", features = ["rt", "time"] }

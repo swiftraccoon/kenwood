@@ -242,7 +242,7 @@ async fn three_protocol_cross_protocol_forwarding() -> Result<(), Box<dyn std::e
     // StreamEnd re-encodes into both target protocols. DCS needs
     // the cached header (every DCS voice packet embeds one, including
     // the is_end frame), so the published StreamEnd must still carry
-    // the header that was live for the stream — even though the
+    // the header that was live for the stream, even though the
     // endpoint's own stream-cache entry is cleared on the same EOT
     // tick. Without it, DCS listeners never see the stream end.
     assert!(

@@ -6,7 +6,7 @@
 //!
 //! The status command `0x01` returns a varying payload depending on
 //! the firmware protocol version. Parsing is split into
-//! [`ModemStatus::parse_v1`] and [`ModemStatus::parse_v2`] — the
+//! [`ModemStatus::parse_v1`] and [`ModemStatus::parse_v2`]; the
 //! caller is expected to know which version the modem speaks
 //! (established via the `GetVersion` handshake).
 //!
@@ -33,7 +33,7 @@ const STATE_CD: u8 = 0x40;
 /// Minimum payload length for a protocol-v1 status response.
 ///
 /// v1 layout: proto(0), mode(1), state(2), dstarSpace(3),
-/// dmrSpace1(4), dmrSpace2(5), ysfSpace(6) — all read unconditionally
+/// dmrSpace1(4), dmrSpace2(5), ysfSpace(6), all read unconditionally
 /// by the reference (`MMDVMHost/Modem.cpp` v1 status case). Only
 /// p25(7), nxdn(8) and pocsag(9) are firmware-version dependent
 /// there (guarded by length checks) and default to 0 here.
@@ -43,7 +43,7 @@ const MIN_V1_LEN: usize = 7;
 ///
 /// v2 layout: mode(0), state(1), reserved(2), dstarSpace(3),
 /// dmrSpace1(4), dmrSpace2(5), ysfSpace(6), p25Space(7),
-/// nxdnSpace(8), reserved(9), fmSpace(10), pocsagSpace(11) — the
+/// nxdnSpace(8), reserved(9), fmSpace(10), pocsagSpace(11); the
 /// reference reads every field through index 11 unconditionally, so
 /// a conforming v2 status payload is at least 12 bytes.
 const MIN_V2_LEN: usize = 12;
@@ -282,7 +282,7 @@ impl ModemStatus {
 /// Emit a `tracing::warn!` event for each overflow flag that's set,
 /// mirroring the `LogError` calls in
 /// `MMDVMHost/Modem.cpp:826-837,883-894`. Keeping the logging in
-/// the sans-io core is fine because `tracing` is a passive facade —
+/// the sans-io core is fine because `tracing` is a passive facade:
 /// no subscriber means no I/O.
 fn log_overflow_warnings(status: ModemStatus) {
     if status.adc_overflow() {
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn v1_minimum_payload() -> TestResult {
         // proto=1, mode=DStar, state=0 (all flags clear), dstar=10,
-        // dmr1/dmr2/ysf=0 — the 7-byte v1 minimum.
+        // dmr1/dmr2/ysf=0: the 7-byte v1 minimum.
         let payload = [1, 1, 0, 10, 0, 0, 0];
         let s = ModemStatus::parse_v1(&payload)?;
         assert_eq!(s.mode, ModemMode::DStar);
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn v1_shorter_than_seven_errors() {
         // dmr1/dmr2/ysf are read unconditionally by the reference v1
-        // parser — a 6-byte payload must be rejected, not zero-filled.
+        // parser; a 6-byte payload must be rejected, not zero-filled.
         let err = ModemStatus::parse_v1(&[1, 1, 0, 10, 8, 9]);
         assert!(
             matches!(err, Err(MmdvmError::InvalidStatusLength { len: 6, min: 7 })),
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn v2_shorter_than_twelve_errors() {
         // fm(10) and pocsag(11) are read unconditionally by the
-        // reference v2 parser — an 11-byte payload must be rejected.
+        // reference v2 parser; an 11-byte payload must be rejected.
         let err = ModemStatus::parse_v2(&[1, 0, 0, 2, 3, 4, 5, 6, 7, 0, 8]);
         assert!(
             matches!(
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn flags_reserved_bit_masked_off() {
-        // Bit 7 (0x80) is reserved — from_bits must clear it.
+        // Bit 7 (0x80) is reserved: from_bits must clear it.
         let f = StatusFlags::from_bits(0xFF);
         assert_eq!(f.bits(), 0x7F);
     }

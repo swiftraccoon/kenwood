@@ -15,7 +15,7 @@ struct LodestarApp: App {
     /// `Settings` scenes share the same state as the main window.
     ///
     /// Eagerly constructed so every scene has a consistent state
-    /// from the first frame — no placeholder swapping.
+    /// from the first frame, with no placeholder swapping.
     @State private var transport: TransportCoordinator
     @State private var reflector: ReflectorCoordinator
     @State private var session: SessionCoordinator
@@ -24,10 +24,10 @@ struct LodestarApp: App {
     init() {
         // Install the Rust → os_log bridge BEFORE any FFI call so
         // the first tokio runtime spin-up + reflector connect events
-        // are captured. Idempotent — tracing's global dispatcher
+        // are captured. Idempotent: tracing's global dispatcher
         // accepts the first installer and ignores later ones.
         // (This is why every store is constructed HERE, not as a
-        // stored-property default — defaults evaluate before init
+        // stored-property default: defaults evaluate before init
         // bodies, and the directory store calls FFI on construction.)
         installRustLogBridge()
 

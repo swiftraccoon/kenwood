@@ -40,7 +40,7 @@ pub enum DprsError {
         reason: &'static str,
     },
 
-    /// CRC mismatch — computed vs on-wire disagree.
+    /// CRC mismatch: computed vs on-wire disagree.
     #[error("DPRS $$CRC mismatch: computed 0x{computed:04X}, on-wire 0x{on_wire:04X}")]
     CrcMismatch {
         /// Computed CRC.

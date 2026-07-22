@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! POLARIS — local D-STAR test reflector.
+//! POLARIS: local D-STAR test reflector.
 //!
 //! Named after the navigational star that sits fixed while everything
 //! else rotates around it: a single bind-point other clients can orient
@@ -16,10 +16,10 @@
 //!
 //! Environment overrides:
 //!
-//! - `POLARIS_BIND` — bind address (default `0.0.0.0:30001`)
-//! - `POLARIS_CALLSIGN` — reflector callsign (default `POLARIS`)
-//! - `POLARIS_MODULES` — enabled module letters concatenated (default `ABCD`)
-//! - `RUST_LOG` — tracing filter (unset falls back to [`DEFAULT_FILTER`]:
+//! - `POLARIS_BIND`: bind address (default `0.0.0.0:30001`)
+//! - `POLARIS_CALLSIGN`: reflector callsign (default `POLARIS`)
+//! - `POLARIS_MODULES`: enabled module letters concatenated (default `ABCD`)
+//! - `RUST_LOG`: tracing filter (unset falls back to [`DEFAULT_FILTER`]:
 //!   `debug` for this crate and `dstar-gateway`, `info` for everything else)
 //!
 //! Enables only `DExtra`; `DPlus` and `Dcs` are disabled because a

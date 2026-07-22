@@ -32,7 +32,7 @@ All paths below are relative to the root of the upstream
 
 | File | Lines | What we use | Consumed in |
 |------|-------|-------------|------------|
-| `Common/DPlusProtocolHandler.cpp` | — | Inbound packet length-table dispatch (the 13 / 15 / 17 / 29 / 32 / 56 / 58 byte table); this is the foundation of `dstar-gateway-core::codec::dplus::decode` | `dstar-gateway-core/src/codec/dplus/decode.rs` |
+| `Common/DPlusProtocolHandler.cpp` | (all) | Inbound packet length-table dispatch (the 13 / 15 / 17 / 29 / 32 / 56 / 58 byte table); this is the foundation of `dstar-gateway-core::codec::dplus::decode` | `dstar-gateway-core/src/codec/dplus/decode.rs` |
 | `Common/DPlusProtocolHandler.cpp` | 64-68 | NAK packet layout | `dstar-gateway-core/src/codec/dplus/consts.rs:45-48` |
 | `Common/DPlusHandler.cpp` | 57 | `DPLUS_POLL_INTERVAL = 1` second | `dstar-gateway-core/src/codec/dplus/consts.rs:16-17` |
 | `Common/DPlusHandler.cpp` | 58 | `DPLUS_INACTIVITY_TIMEOUT = 30` seconds | `dstar-gateway-core/src/codec/dplus/consts.rs:26` |
@@ -48,7 +48,7 @@ All paths below are relative to the root of the upstream
 | `Common/HeaderData.cpp` | 590-635 | DExtra voice header (56 bytes) | `dstar-gateway-core/src/codec/dextra/encode.rs:139` |
 | `Common/HeaderData.cpp` | 619-623 | Raw `memcpy` callsign copy (RX lenient parsing) | `dstar-gateway-core/src/types/callsign.rs:10-12, 67-71, 153-156` |
 | `Common/HeaderData.cpp` | 637-684 | `getDPlusData` (full DPlus voice header serialization) | `dstar-gateway-core/src/header.rs:27-30, 101-105, 116-122`, `dstar-gateway-core/src/codec/dplus/encode.rs:169-247` |
-| `Common/CCITTChecksum.cpp` | — | CRC-CCITT reference | `dstar-gateway-core/src/header.rs:28` |
+| `Common/CCITTChecksum.cpp` | (all) | CRC-CCITT reference | `dstar-gateway-core/src/header.rs:28` |
 | `Common/AMBEData.cpp` | 317-345 | DExtra voice data + EOT frames | `dstar-gateway-core/src/codec/dextra/encode.rs:211-280` |
 | `Common/AMBEData.cpp` | 347-388 | DPlus voice data frame | `dstar-gateway-core/src/codec/dplus/encode.rs:249` |
 | `Common/AMBEData.cpp` | 380-388 | DPlus EOT marker inside voice frame | `dstar-gateway-core/src/codec/dplus/encode.rs:291` |
@@ -58,16 +58,16 @@ All paths below are relative to the root of the upstream
 | `Common/DStarDefines.h` | 111-113 | Slow-data scrambler constants | `dstar-gateway-core/src/slowdata/mod.rs:16`, `dstar-gateway-core/src/slowdata/scrambler.rs:3` |
 | `Common/DStarDefines.h` | 115-117 | Reflector port assignments (DPlus=20001, DEXTRA=30001, DCS=30051) | `dstar-gateway-core/src/codec/dplus/consts.rs:10`, `dstar-gateway-core/src/codec/dextra/consts.rs:10`, `dstar-gateway-core/src/codec/dcs/consts.rs:10`, `dstar-gateway-core/src/types/protocol_kind.rs:25` |
 | `Common/DStarDefines.h` | 122 | Magic bytes table | `dstar-gateway-core/src/codec/dplus/consts.rs:33` |
-| `Common/DStarDefines.h` | — | `Module` letter space ("A"–"Z") | `dstar-gateway-core/src/types/module.rs:8` |
+| `Common/DStarDefines.h` | (all) | `Module` letter space ("A"–"Z") | `dstar-gateway-core/src/types/module.rs:8` |
 | `Common/DPRSHandler.cpp` | 120-260 | DPRS position decoder | `dstar-gateway-core/src/dprs/mod.rs:7` |
-| `Common/DPRSHandler.cpp` | — | `calcCRC` function for DPRS checksum | `dstar-gateway-core/src/dprs/crc.rs:5` |
-| `Common/SlowDataEncoder.cpp` | — | Slow-data assembler reference | `dstar-gateway-core/src/slowdata/assembler.rs:78`, `dstar-gateway-core/src/slowdata/mod.rs:15` |
+| `Common/DPRSHandler.cpp` | (all) | `calcCRC` function for DPRS checksum | `dstar-gateway-core/src/dprs/crc.rs:5` |
+| `Common/SlowDataEncoder.cpp` | (all) | Slow-data assembler reference | `dstar-gateway-core/src/slowdata/assembler.rs:78`, `dstar-gateway-core/src/slowdata/mod.rs:15` |
 
 #### DExtra (XRF/XLX port 30001)
 
 | File | Lines | What we use | Consumed in |
 |------|-------|-------------|------------|
-| `Common/DExtraProtocolHandler.cpp` | — | Inbound packet length-table dispatch | `dstar-gateway-core/src/codec/dextra/decode.rs` (mirror reference) |
+| `Common/DExtraProtocolHandler.cpp` | (all) | Inbound packet length-table dispatch | `dstar-gateway-core/src/codec/dextra/decode.rs` (mirror reference) |
 | `Common/DExtraHandler.cpp` | 51 | `DEXTRA_POLL_INTERVAL` | `dstar-gateway-core/src/codec/dextra/consts.rs:15-17` |
 | `Common/DExtraHandler.cpp` | 52 | `DEXTRA_INACTIVITY_TIMEOUT` | `dstar-gateway-core/src/codec/dextra/consts.rs:21-23` |
 | `Common/ConnectData.cpp` | 278-321 | DExtra LINK / UNLINK / ACK / NAK layouts | `dstar-gateway-core/src/codec/dextra/mod.rs:7-11`, `dstar-gateway-core/src/codec/dextra/encode.rs:18-100` |
@@ -100,7 +100,7 @@ All paths below are relative to the root of the upstream
 
 ### LX3JL/xlxd
 
-Used as the "mirror" reference — we cross-check every ircDDBGateway
+Used as the "mirror" reference: we cross-check every ircDDBGateway
 finding against xlxd to catch places where the two agree (confirming
 it's on the wire) and places where they diverge (where we have to
 pick the more widely deployed behavior).
@@ -114,10 +114,10 @@ pick the more widely deployed behavior).
 | `src/cdplusprotocol.cpp` | 529-533 | DPlus header retransmit cadence | `dstar-gateway-core/src/codec/dplus/consts.rs:76` |
 | `src/cdplusprotocol.cpp` | 535-544 | DPlus keepalive body | `dstar-gateway-core/src/codec/dplus/consts.rs:94`, `dstar-gateway-core/src/codec/dplus/encode.rs:139` |
 | `src/cdplusprotocol.cpp` | 541-545 | DPlus NAK keepalive response | `dstar-gateway-core/src/codec/dplus/consts.rs:101` |
-| `src/cdextraprotocol.cpp` | — | DExtra wire format mirror | `dstar-gateway-core/src/codec/dextra/mod.rs:11` |
-| `src/cdcsprotocol.cpp` | — | DCS wire format mirror | `dstar-gateway-core/src/codec/dcs/mod.rs:19` |
+| `src/cdextraprotocol.cpp` | (all) | DExtra wire format mirror | `dstar-gateway-core/src/codec/dextra/mod.rs:11` |
+| `src/cdcsprotocol.cpp` | (all) | DCS wire format mirror | `dstar-gateway-core/src/codec/dcs/mod.rs:19` |
 | `src/cdcsprotocol.cpp` | 411 | DCS keepalive accept list | `dstar-gateway-core/src/codec/dcs/consts.rs:51-52` |
-| `src/cdcsprotocol.cpp` | — | DCS trailer byte variant | `dstar-gateway-core/src/validator/diagnostic.rs:96` |
+| `src/cdcsprotocol.cpp` | (all) | DCS trailer byte variant | `dstar-gateway-core/src/validator/diagnostic.rs:96` |
 
 ## How to update this file
 

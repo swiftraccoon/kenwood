@@ -28,7 +28,7 @@ pub(crate) fn render_cat(app: &App, frame: &mut Frame<'_>, list_area: Rect, deta
         detail_area,
         &rows,
         app.settings_cat_index,
-        " Settings (CAT — instant) [Enter: toggle, +/-: adjust] ",
+        " Settings (CAT, instant) [Enter: toggle, +/-: adjust] ",
     );
 }
 
@@ -42,7 +42,7 @@ pub(crate) fn render_mcp(app: &App, frame: &mut Frame<'_>, list_area: Rect, deta
         detail_area,
         &rows,
         app.settings_mcp_index,
-        " Settings (MCP — ~3s per change) [Enter: toggle, +/-: adjust] ",
+        " Settings (MCP, ~3s per change) [Enter: toggle, +/-: adjust] ",
     );
 }
 

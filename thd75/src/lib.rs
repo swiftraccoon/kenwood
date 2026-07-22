@@ -54,22 +54,22 @@
 //!
 //! # Modules
 //!
-//! - [`types`] — Validated newtypes for frequencies, tones, modes, and channels.
-//! - [`protocol`] — Pure-logic CAT command codec (serialize / parse).
-//! - [`transport`] — Async I/O trait and serial / mock implementations.
-//! - [`radio`] — High-level async API wrapping the protocol and transport layers.
-//! - [`memory`] — Typed accessors over a TH-D75 memory image (from MCP or `.d75` files).
-//! - [`sdcard`] — Parsers for TH-D75 SD card files (`.d75` config, `.tsv` lists, `.nme` logs, and more).
-//! - [`aprs`] — TH-D75-specific APRS glue: [`AprsClient`] owning a [`Radio`] and
-//!   [`KissSession`], the MCP-config bridge, and digipeater-path helpers.
+//! - [`types`]: validated newtypes for frequencies, tones, modes, and channels.
+//! - [`protocol`]: pure-logic CAT command codec (serialize / parse).
+//! - [`transport`]: async I/O trait and serial / mock implementations.
+//! - [`radio`]: high-level async API wrapping the protocol and transport layers.
+//! - [`memory`]: typed accessors over a TH-D75 memory image (from MCP or `.d75` files).
+//! - [`sdcard`]: parsers for TH-D75 SD card files (`.d75` config, `.tsv` lists, `.nme` logs, and more).
+//! - [`aprs`]: TH-D75-specific APRS glue, namely [`AprsClient`] owning a [`Radio`]
+//!   and [`KissSession`], the MCP-config bridge, and digipeater-path helpers.
 //!   Generic KISS/AX.25/APRS decoding lives in the `kiss-tnc`, `ax25-codec`,
 //!   and `aprs` sibling crates.
-//! - [`mmdvm`] — D-STAR gateway client ([`DStarGateway`]) for Reflector Terminal
+//! - [`mmdvm`]: D-STAR gateway client ([`DStarGateway`]) for Reflector Terminal
 //!   Mode, built on the `mmdvm-core` framing codec and `dstar-gateway-core`
 //!   protocol crates.
-//! - [`session`] — Link supervision: reconnect backoff policy and the opt-in
-//!   supervisor driving [`Radio::reconnect`](radio::Radio::reconnect).
-//! - [`error`] — Error types for transport, protocol, and validation failures.
+//! - [`session`]: link supervision, covering the reconnect backoff policy and the
+//!   opt-in supervisor driving [`Radio::reconnect`](radio::Radio::reconnect).
+//! - [`error`]: error types for transport, protocol, and validation failures.
 
 pub mod aprs;
 pub mod error;

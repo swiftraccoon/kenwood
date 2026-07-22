@@ -7,7 +7,7 @@
 //!
 //! Banks H, I, and J share a common 5-tap preamble
 //! `[0.98168, -1.96336, 0.98168, -1.96302, 0.96370]` that acts as a
-//! DC blocker — exposed as [`HPF_345HZ_COEFFS`] for direct
+//! DC blocker, exposed as [`HPF_345HZ_COEFFS`] for direct
 //! substitution into single-biquad contexts.
 
 /// DC-blocker biquad used as the pre-pitch-analysis input filter
@@ -18,13 +18,13 @@
 /// HPF form `b0 = (1 + cos(ω₀))/2 = 0.98168` ⇒ `ω₀ ≈ 0.2712 rad` ⇒
 /// `f₀ ≈ 345 Hz` describes the filter's characteristic frequency;
 /// the actual frequency response is a narrow notch at DC with unity
-/// gain everywhere above ≈20 Hz — Kenwood tuned the pole pair (at
+/// gain everywhere above ≈20 Hz: Kenwood tuned the pole pair (at
 /// `z = 0.982 ± 0.019i`, `r ≈ 0.9817`) very close to the double
 /// zero at `z = 1`, so the HPF shape collapses into a DC trap.
 ///
 /// In the encoder pipeline this displaces OP25's first-order
 /// `dc_rmv` integrator (corner ≈13 Hz) with a stiffer 2nd-order
-/// zero-at-DC structure — measurable as a cleaner pitch-analysis
+/// zero-at-DC structure, measurable as a cleaner pitch-analysis
 /// buffer on signals with low-frequency microphone artefacts.
 pub const HPF_345HZ_COEFFS: [f32; 5] = [
     9.8168003559e-01,

@@ -79,7 +79,7 @@ struct ReflectorPickerSheet: View {
                 }
             }
             if coordinator.callsign.isEmpty {
-                Label("Enter your callsign to unlock the reflector list — every reflector needs it to connect.",
+                Label("Enter your callsign to unlock the reflector list. Every reflector needs it to connect.",
                       systemImage: "arrow.up")
                     .font(.caption)
                     .foregroundStyle(.orange)

@@ -2,7 +2,7 @@
 //! end to end, restoring every touched setting afterwards.
 //!
 //! The radio's USB interface carries a capture-only audio function whose
-//! device name is "ADC stream IN" (mono 48 kHz) — not "TH-D75". With
+//! device name is "ADC stream IN" (mono 48 kHz), not "TH-D75". With
 //! `IO 1` the radio streams the Band B receiver's 12 kHz-centered IF
 //! (about 15 kHz passband, per Kenwood's TH-D75 Operating Tips section
 //! 5.10.5) on that device instead of received audio; `IO 2` streams the

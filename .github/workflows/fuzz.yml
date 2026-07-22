@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 # Minimum required permissions: fuzz jobs only checkout source and run
-# cargo-fuzz — no writes to any GitHub resource.
+# cargo-fuzz; no writes to any GitHub resource.
 permissions:
   contents: read
 

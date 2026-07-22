@@ -10,7 +10,7 @@
 //! # Fields
 //!
 //! - **`b0` (pitch, 7 bits):** L-constrained search against
-//!   [`crate::tables::W0_TABLE`] — pick the index whose
+//!   [`crate::tables::W0_TABLE`]: pick the index whose
 //!   [`crate::tables::L_TABLE`] entry equals `amps.num_harmonics`
 //!   and whose W0 value is closest to the target f0. Falls back
 //!   to nearest-W0 only when no b0 matches the target L (rare,
@@ -25,14 +25,14 @@
 //!   residual `T = lsa - 0.65·interp(prev_log2_ml)`; assemble R
 //!   pairs from block DC + first AC coefficients; inverse 8-pt DCT
 //!   → `G[8]`; PRBA24 / PRBA58 codebook search (b3, b4); per-block
-//!   HOC codebook search (b5..b8). `b8` uses stride-2 search —
+//!   HOC codebook search (b5..b8). `b8` uses stride-2 search:
 //!   only even indices are representable in the 3-bits-with-
 //!   forced-zero-LSB wire field (mbelib decoder convention).
 //!
 //! After emitting the 49-bit vector, the encoder runs a closed-loop
 //! [`crate::decode::decode_params`] on its own output and carries
 //! the reconstructed `log2_ml` forward as `prev_log2_ml` for the
-//! next frame — so the prediction residual the decoder adds back
+//! next frame, so the prediction residual the decoder adds back
 //! matches bit-for-bit what the encoder subtracted.
 //!
 //! `examples/validate_quantize_vs_op25.rs` compares this stage with
@@ -54,7 +54,7 @@ const MAX_HOC_TERMS: usize = 6;
 
 /// Quantize analysis outputs into a 49-bit `ambe_d` vector.
 ///
-/// Uses the D-STAR AMBE 3600x2400 bit layout — every position below
+/// Uses the D-STAR AMBE 3600x2400 bit layout: every position below
 /// is the exact mirror of what `crate::decode::decode_params` reads,
 /// which in turn matches `mbe_decodeAmbe2400Parms` in
 /// `mbelib/ambe3600x2400.c`.
@@ -133,8 +133,8 @@ pub struct QuantizeOutcome {
 /// Enables env-gated diagnostic `eprintln!`s that emit each
 /// intermediate-stage value inside `quantize()`. Set
 /// `MBELIB_DUMP_QUANTIZE=1` at runtime to log one frame's full
-/// pipeline — lsa, gain, T residuals, block DCT coefficients, R
-/// pairs, 8-pt DCT G vector, and PRBA/HOC target vectors — to
+/// pipeline (lsa, gain, T residuals, block DCT coefficients, R
+/// pairs, 8-pt DCT G vector, and PRBA/HOC target vectors) to
 /// stderr, line-prefixed so the output can be diffed frame-by-frame
 /// against the matching dump from OP25's `ambe_encode_dump`.
 ///
@@ -288,7 +288,7 @@ pub fn quantize(
     }
     let mut t_residuals = compute_spectral_residuals(&lsa, amps.num_harmonics, prev);
     // Mean-center T before block-DCT so the spectral codebooks
-    // (PRBA24/58) operate on a residual whose overall mean is zero —
+    // (PRBA24/58) operate on a residual whose overall mean is zero,
     // mirroring the BigGamma subtraction the decoder applies on the
     // way back. The decoder's `big_gamma = cur.gamma - 0.5*log2(L) - sum42`
     // includes a `-sum42` term that compensates the encoder's mean
@@ -349,7 +349,7 @@ pub fn quantize(
     write_bit(&mut out, 46, (b4 >> 1) & 1);
     write_bit(&mut out, 47, b4 & 1);
 
-    // b5 (4 bits) — note the gap at position 24 (unused in D-STAR).
+    // b5 (4 bits). Note the gap at position 24 (unused in D-STAR).
     write_bit(&mut out, 22, (b5 >> 3) & 1);
     write_bit(&mut out, 23, (b5 >> 2) & 1);
     write_bit(&mut out, 25, (b5 >> 1) & 1);
@@ -382,21 +382,21 @@ pub fn quantize(
     // its own `log2_ml` by running PRBA/HOC codebook dequantization
     // plus inverse-DCT plus prediction using ITS previous frame's
     // state. Our encoder's `prev_log2_ml` must match the decoder's
-    // result exactly — otherwise the prediction residual
+    // result exactly; otherwise the prediction residual
     // `T = lsa − 0.65·interp(prev_log2_ml)` that we subtract at
     // encode time differs from the value the decoder adds back at
     // decode time, and the reconstructed magnitudes drift frame-
     // by-frame. Empirically (April 2026 OP25 diff): the drift
     // showed up as uniform lsa-valued prev on our side (≈11.4 across
     // all bins) vs OP25's varied decoder-shape (0.0 at boundary,
-    // rising to 9–10 at vowel harmonics, decaying after) — the
+    // rising to 9–10 at vowel harmonics, decaying after). That
     // difference produced unintelligible spectral envelopes despite
     // matching b0/b2 values.
     //
     // The reference implementation (OP25 `ambe_encoder.cc:486`)
     // handles this by running mbelib's `mbe_dequantizeAmbe2400Parms`
     // on its own emitted `b[]`. We mirror that here via our own
-    // `decode::decode_params` — same inputs, same outputs, so the
+    // `decode::decode_params`: same inputs, same outputs, so the
     // encoder's `prev_log2_ml` is bit-exactly what the decoder will
     // have on the next frame.
     let mut cur_reconstructed = crate::params::MbeParams::new();
@@ -434,7 +434,7 @@ fn compute_lsa(b0: u8, vuv: &VuvDecisions, amps: &SpectralAmplitudes) -> [f32; 5
     // OP25 `ambe_encoder.cc:234` does `log_l_w0 = 0.5 * log2(num_harms *
     // make_f0(b[0]) * 2π) + 2.289`, where `make_f0(b)` is the same
     // `W0_TABLE` lookup our decoder uses. Feeding raw pitch.f0_hz here
-    // produces a systematic ~0.026 lsa bias — small but enough to push
+    // produces a systematic ~0.026 lsa bias, small but enough to push
     // the DC component of each block's DCT across a codebook boundary
     // occasionally, explaining the residual 30-45% b3/b4 disagreement
     // we saw before this change.
@@ -477,12 +477,12 @@ fn compute_lsa(b0: u8, vuv: &VuvDecisions, amps: &SpectralAmplitudes) -> [f32; 5
 /// log-magnitude at the position this frame's harmonic `i+1` projects
 /// onto.
 ///
-/// `Sum43 = (0.65 / L) * sum_l interp_prev[l]` — the **DC bias correction**
+/// `Sum43 = (0.65 / L) * sum_l interp_prev[l]`: the **DC bias correction**
 /// from `mbe_decodeAmbe2450Parms` (eq. 43 in the AMBE spec). The decoder
 /// reconstructs `log2Ml[l] = T[l] + 0.65 * interp_prev[l] - Sum43 + BigGamma`,
 /// so the encoder MUST add `Sum43` to keep `T[l]` consistent with the
 /// decoder's reconstruction. Without this term, every PRBA24 / PRBA58
-/// codebook lookup gets an offset block-mean and selects the wrong entry —
+/// codebook lookup gets an offset block-mean and selects the wrong entry:
 /// the documented spectral-envelope encoder bug at
 /// `tests/encoder_roundtrip.rs::sine_roundtrip_has_nonzero_correlation_with_input`.
 ///
@@ -567,7 +567,7 @@ fn compute_spectral_residuals(lsa: &[f32; 57], n: usize, prev: &PrevFrameState) 
 ///   OP25's Q8.8 `ref_pitch` format.
 fn quantize_pitch(pitch: PitchEstimate, target_l: usize) -> u8 {
     if pitch.confidence < 0.05 {
-        // Near-silence — emit the silence code that mbelib 2400
+        // Near-silence: emit the silence code that mbelib 2400
         // treats specially (w0 = 2π/32, L = 14, all bands unvoiced).
         return 124;
     }
@@ -576,7 +576,7 @@ fn quantize_pitch(pitch: PitchEstimate, target_l: usize) -> u8 {
     // OP25 expects `ref_pitch` in the range 19.875..123.125 samples
     // (`ambe_encoder.cc:163`). Values outside clamp into the table's
     // valid index range inside `pitch_index`, which is the
-    // least-bad fallback — the caller should have silenced the
+    // least-bad fallback; the caller should have silenced the
     // frame if the pitch were that far out.
     #[expect(
         clippy::cast_possible_truncation,
@@ -608,7 +608,7 @@ fn quantize_pitch(pitch: PitchEstimate, target_l: usize) -> u8 {
 ///
 /// where `jl = floor(l * 16 * f0)` picks which of the 8 row slots
 /// applies to harmonic `l`. Strong (high-energy) harmonics dominate
-/// the decision — a bright voiced harmonic drags the best-match row
+/// the decision: a bright voiced harmonic drags the best-match row
 /// toward one that covers its band, even if weaker harmonics in
 /// other bands would individually prefer the opposite voicing.
 ///
@@ -695,7 +695,7 @@ fn write_bit(dst: &mut [u8; AMBE_DATA_BITS], idx: usize, value: u8) {
 /// 4. Return the index `i` minimizing `|diff_gain - DG_TABLE[i]|`.
 ///
 /// The first entry `DG_TABLE[0] = 0.0` is the "completely silent"
-/// value — encoders emit it when the harmonic magnitudes are
+/// value: encoders emit it when the harmonic magnitudes are
 /// effectively zero. The table is monotonically non-decreasing all
 /// the way to `5.352783` at index 63.
 /// Scale factor applied to harmonic magnitudes before `log2()`.
@@ -704,21 +704,21 @@ fn write_bit(dst: &mut [u8; AMBE_DATA_BITS], idx: usize, value: u8) {
 /// `unvoiced_sa_calc` in [`crate::encode::vuv`] now bake in OP25's
 /// `2 * 256 * sqrt(2 * num / den)` and `0.2908 * sqrt(512 * num / den)`
 /// formulas, producing `sa[]` values directly in OP25's int16 sa scale
-/// (peaks ~17000 for voiced fundamentals on a 0.5-amp sine — matches
+/// (peaks ~17000 for voiced fundamentals on a 0.5-amp sine; matches
 /// OP25's `imbe_param->sa[]` within ~10% on the same input).
 ///
 /// OP25 reads those int16 sa values straight into `log2()` with no
 /// further scaling (`ambe_encoder.cc:241-248`). Mirroring that, our
-/// `SA_SCALE` is **1.0** — `compute_lsa` and `compute_gain_from_amps`
+/// `SA_SCALE` is **1.0**: `compute_lsa` and `compute_gain_from_amps`
 /// take `sa.max(1.0).log2()` directly.
 ///
 /// **Why this changed.** A prior revision had `SA_SCALE = 32768.0`
-/// from when `voiced_sa_calc` returned a *bare* `sqrt(num/den)` —
+/// from when `voiced_sa_calc` returned a *bare* `sqrt(num/den)`,
 /// 800× smaller than OP25's int16 scale. The 32768 multiplier
 /// retroactively pushed `log2(sa)` into the right working range.
 /// After the OP25-exact `voiced_sa_calc` port, leaving the multiplier
 /// in place double-scaled, adding +15 to every `log2(sa)` and pushing
-/// `gain` from OP25's typical ~11 to ~19+ — well past the
+/// `gain` from OP25's typical ~11 to ~19+, well past the
 /// `gain_adjust = 7.5` window where `DG_TABLE` (max 5.35) has entries.
 /// Resulting b2 saturated at 62/63 and the decoder's smoothed
 /// `gamma = DG_TABLE[b2] + 0.5*prev_gamma` blew up to ~10.7,
@@ -729,7 +729,7 @@ const SA_SCALE: f32 = 1.0;
 ///
 /// OP25's `ambe_encoder.cc:256` does `diff_gain -= gain_adjust;` where
 /// the D-STAR per-protocol value is **7.5** (see
-/// `op25/op25/gr-op25_repeater/apps/tx/dv_tx.py:49-53` —
+/// `op25/op25/gr-op25_repeater/apps/tx/dv_tx.py:49-53`:
 /// `gain_adjust = {'dmr': 3.0, 'dstar': 7.5, 'ysf': 4.0}`).
 ///
 /// **Calibration history.** April 2026: temporarily lowered to 3.0
@@ -737,11 +737,11 @@ const SA_SCALE: f32 = 1.0;
 /// below the input. **Reverted to 7.5** when real-voice testing
 /// showed 3.0 caused continuous hard-clip at the synthesis ceiling
 /// (peak = `SOFT_CLIP_FLOAT × 7 = 31129`), generating square-wave
-/// distortion in production — exactly the "garble noise" symptom.
+/// distortion in production, exactly the "garble noise" symptom.
 ///
 /// **May 2026 attempt at 0.0:** synthetic sweep against TH-D75 anchors
 /// suggested 0.0 minimized Hamming distance and took the sine
-/// roundtrip correlation from 0.04 to 0.20 — but real-voice
+/// roundtrip correlation from 0.04 to 0.20, but real-voice
 /// sextant-to-sextant testing confirmed garbled output, exactly the
 /// hard-clip symptom described above. Reverted to 7.5.
 ///
@@ -754,7 +754,7 @@ const SA_SCALE: f32 = 1.0;
 /// 2-5.5 → `lsa` mean lands in the OP25-target range, and 7.5 is
 /// the right offset.
 ///
-/// Treat changes here with extreme suspicion — verify against real
+/// Treat changes here with extreme suspicion: verify against real
 /// microphone audio before adjusting, never tune purely against
 /// synthetic test signals or the Kenwood capture anchors. The synth
 /// correlation test does NOT validate real-voice fidelity; sextant↔
@@ -769,14 +769,14 @@ const D_STAR_GAIN_ADJUST: f32 = 7.5;
 ///   `b2 = arg min_i |diff_gain - DG_TABLE[i]|`
 ///
 /// (The AMBE+2 path used by DMR/YSF additionally subtracts
-/// `0.5 * prev_mp->gamma` for predictive coding — D-STAR does NOT.
+/// `0.5 * prev_mp->gamma` for predictive coding; D-STAR does NOT.
 /// I tried adding that subtraction in an earlier round; it's wrong
 /// against OP25's reference and got reverted in favor of the
 /// `gain_adjust` calibration above.)
 ///
 /// Returns `(b2, reconstructed_gamma)` so the caller can keep
 /// `prev_gamma` consistent with the decoder's
-/// `gamma_cur = DG_TABLE[b2] + 0.5 * gamma_prev` smoothing — useful
+/// `gamma_cur = DG_TABLE[b2] + 0.5 * gamma_prev` smoothing, useful
 /// for any future predictor that does want delta coding (or for
 /// diagnostic dumps that compare reconstructed gamma against the
 /// mbelib golden trace).
@@ -814,7 +814,7 @@ fn quantize_gain(
     (best_idx, reconstructed_gamma)
 }
 
-/// Mean log-spectral-amplitude across all harmonics — `gain` in the
+/// Mean log-spectral-amplitude across all harmonics, i.e. `gain` in the
 /// OP25 sense. Shared between `quantize_gain` and `compute_lsa` to
 /// keep the scale factor / voicing-offset math in one place.
 fn compute_gain_from_amps(
@@ -887,7 +887,7 @@ struct QuantizedSpectrum {
     clippy::too_many_lines,
     reason = "Linear top-to-bottom pipeline covering LMPRBL block partition, per-block DCT, \
               PRBA codebook lookup, and HOC codebook lookup. Splitting further obscures the \
-              data flow — OP25's `ambe_encoder.cc::encode_envelope()` is structured the same \
+              data flow; OP25's `ambe_encoder.cc::encode_envelope()` is structured the same \
               way."
 )]
 fn quantize_spectrum(t_residuals: &[f32; 57], n: usize) -> QuantizedSpectrum {
@@ -948,7 +948,7 @@ fn quantize_spectrum(t_residuals: &[f32; 57], n: usize) -> QuantizedSpectrum {
             // reverses that by dividing all bins equally by N; the
             // decoder's factor-of-2 for AC bins restores the original
             // amplitude. Both the DC and AC branches here use the
-            // same 1/N scale — the decoder handles the asymmetry.
+            // same 1/N scale; the decoder handles the asymmetry.
             if let Some(block) = cik.get_mut(blk)
                 && let Some(slot) = block.get_mut(k)
             {
@@ -995,7 +995,7 @@ fn quantize_spectrum(t_residuals: &[f32; 57], n: usize) -> QuantizedSpectrum {
     //
     // Only `min(Ji - 2, 4)` HOC dimensions per block are real data:
     // positions 1-2 (DC, first-AC) went to PRBA, leaving Ji-2 AC
-    // coefficients available for HOC — capped at 4 because each HOC
+    // coefficients available for HOC, capped at 4 because each HOC
     // codebook row is only 4-D.  Blocks with Ji ≤ 2 have no HOC
     // information at all and use codebook index 0 (per OP25
     // `ambe_encoder.cc:393-394`).
@@ -1006,7 +1006,7 @@ fn quantize_spectrum(t_residuals: &[f32; 57], n: usize) -> QuantizedSpectrum {
     // are zero. The full-4D nearest-neighbor search then found the
     // codebook row whose LAST three coordinates were closest to
     // zero rather than the row whose FIRST coordinate matched the
-    // real target — a completely different HOC vector. That's the
+    // real target, a completely different HOC vector. That's the
     // "envelope warped; 2f0 louder than f0" symptom in end-to-end
     // decoded audio: block-wise envelope terms reconstructed with
     // the wrong HOC signs/magnitudes.
@@ -1052,12 +1052,12 @@ fn quantize_spectrum(t_residuals: &[f32; 57], n: usize) -> QuantizedSpectrum {
     //
     // Consequence: if we'd done the stride=1 full-row search, an
     // odd-indexed best pick (say row k+1) would pack-collapse to
-    // even row k on our wire — and row k may have HIGHER SSE than
+    // even row k on our wire, and row k may have HIGHER SSE than
     // row k+2 would. Stride=2 evaluates `{k, k+2}` directly and
     // picks whichever has lower SSE. That's strictly ≤ what
     // stride=1 achieves under mbelib wire packing. Empirically
     // (chirp fixture), stride=1 and stride=2 produce identical
-    // wire bytes AND identical validator b8 match rate (22%) — the
+    // wire bytes AND identical validator b8 match rate (22%); the
     // remaining gap is structural wire-format difference with
     // OP25's D-STAR path, not search policy.
     let b8 = if hoc_dims(4) == 0 {
@@ -1106,7 +1106,7 @@ fn lookup_ji(big_l: usize) -> [usize; IDCT_BLOCKS + 1] {
 /// odd index would silently remap to the adjacent even entry at the
 /// decoder, producing the wrong block-4 HOC ~50% of the time.
 ///
-/// The other HOC tables (`B5`/`B6`/`B7`) are 16 rows × 4 bits — the
+/// The other HOC tables (`B5`/`B6`/`B7`) are 16 rows × 4 bits; the
 /// full index range is addressable, so they use `stride == 1`.
 #[expect(
     clippy::cast_possible_truncation,
@@ -1132,12 +1132,12 @@ fn nearest_hoc(table: &[[f32; 4]], target: &[f32; 4], dims: usize, stride: usize
     best_idx
 }
 
-/// Inverse 8-point DCT — the exact undo of `decode::forward_dct_8`.
+/// Inverse 8-point DCT: the exact undo of `decode::forward_dct_8`.
 ///
 /// The decoder's forward DCT is:
 /// `Ri[i] = Σ am·Gm[m]·cos(π·(m−1)·(i−0.5)/8)` with am=1 for m=1, 2 for m≥2.
 ///
-/// Its inverse — derived via basis orthogonality — divides by `N=8`
+/// Its inverse, derived via basis orthogonality, divides by `N=8`
 /// for **both DC and AC** terms:
 ///
 /// ```text
@@ -1159,7 +1159,7 @@ fn nearest_hoc(table: &[[f32; 4]], target: &[f32; 4], dims: usize, stride: usize
 /// for AC, which double-counted the `am=2` factor: encoder-side
 /// `Gm[m>1]` came out 2× too large, the decoder's `forward_dct_8`
 /// doubled it again, and the reconstructed `Ri` AC terms arrived at
-/// the synthesis with a 4× boost — audibly a "loud but not-voice"
+/// the synthesis with a 4× boost: audibly a "loud but not-voice"
 /// spectrum envelope.
 #[expect(
     clippy::cast_precision_loss,
@@ -1239,7 +1239,7 @@ mod tests {
             f0_hz: 200.0,
             confidence: 0.9,
         };
-        // 200 Hz at L=30 — plausible voiced mid-range parameters.
+        // 200 Hz at L=30: plausible voiced mid-range parameters.
         let idx = quantize_pitch(est, 30);
         // 200 Hz / 8000 = 0.025 cycles/sample, which lives somewhere
         // in the middle of the W0_TABLE (indices ~60..70).
@@ -1362,12 +1362,12 @@ mod tests {
     ///
     /// The decoder's `forward_dct_8` uses `am = 1 for m=1, 2 for m≥2`
     /// weights. The encoder's inverse must divide by `N = 8` for
-    /// both DC and AC components — the `am=2` factor on the decoder
+    /// both DC and AC components: the `am=2` factor on the decoder
     /// side exactly cancels the `N/2` cosine-norm factor, leaving
     /// the same `1/N` scale as DC. A prior revision divided AC by
     /// `N/2` which produced a 2× AC-gain, and the decoder's forward
     /// DCT doubled it again to give a 4× AC boost on reconstructed
-    /// `Ri` — heard as "intelligibly-loud but spectrally-wrong
+    /// `Ri`, heard as "intelligibly-loud but spectrally-wrong
     /// voice envelope" in sextant↔sextant tests.
     #[test]
     fn inverse_dct_8_recovers_gm() {
@@ -1410,7 +1410,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Regression tests — each pins a specific bug we fixed during the
+    // Regression tests: each pins a specific bug we fixed during the
     // stage-by-stage OP25 validation pass. A failure on any of these
     // indicates a regression in the quantize pipeline.
     // -------------------------------------------------------------------
@@ -1422,7 +1422,7 @@ mod tests {
     /// **2026-04 finding:** for some frames the read-back differs
     /// from the written value (e.g. encoded b3=368 reads back as 304).
     /// This indicates an asymmetry in `pack_frame` / `unpack_frame` /
-    /// `demodulate_c1` / ECC chain — encoder and decoder are not
+    /// `demodulate_c1` / ECC chain; encoder and decoder are not
     /// inverses for arbitrary `ambe_d` bit patterns.
     #[test]
     fn encoder_b3_round_trips_via_decode_trace() {
@@ -1476,7 +1476,7 @@ mod tests {
         // Encode through ECC and pack. Match the production encoder
         // pipeline exactly: `ecc_encode` produces `ambe_fr` in
         // demodulated form, then `pack_frame` modulates internally.
-        // No explicit `demodulate_c1` call here — see the comment
+        // No explicit `demodulate_c1` call here; see the comment
         // in `encoder::quantize_from_fft`.
         let mut ambe_fr_enc = [0u8; AMBE_FRAME_BITS];
         ecc_encode(&outcome.ambe_d, &mut ambe_fr_enc);
@@ -1562,15 +1562,15 @@ mod tests {
     }
 
     /// Fix #1 (`SA_SCALE = 1`): `quantize()` now consumes `sa` values
-    /// in OP25's int16 domain — `vuv::voiced_sa_calc` /
+    /// in OP25's int16 domain: `vuv::voiced_sa_calc` /
     /// `unvoiced_sa_calc` upstream produce values in `[1, 30000+]`
     /// directly. Multiplying by 32768 again (the old `SA_SCALE`)
     /// added 15 to every `log2(sa)`, pushed `gain` to ~19, and pinned
-    /// `b2` at the `DG_TABLE` max (62/63) — saturating synthesis to a
+    /// `b2` at the `DG_TABLE` max (62/63), saturating synthesis to a
     /// square-wave ceiling.
     ///
     /// This test feeds a typical voiced-frame OP25-scale `sa` envelope
-    /// — strong fundamental ~12 000, decaying harmonics — and asserts
+    /// (strong fundamental ~12 000, decaying harmonics) and asserts
     /// that `b2` lands somewhere in the middle of `DG_TABLE` (≈10–55).
     /// Regression scenarios:
     /// - Old `SA_SCALE = 32768`: `gain` ≈ 19 → `b2 = 62` (saturated).
@@ -1588,7 +1588,7 @@ mod tests {
             num_bands: 10,
         };
         let mut magnitudes = [0.0_f32; MAX_HARMONICS];
-        // OP25-scale sa values — what `voiced_sa_calc` produces for a
+        // OP25-scale sa values: what `voiced_sa_calc` produces for a
         // typical voiced frame (peak ~12 000 at fundamental, decaying
         // through subsequent harmonics; matches the dump magnitudes
         // we cross-checked against OP25's `imbe_param->sa[]` on a
@@ -1642,12 +1642,12 @@ mod tests {
         // around 11 → `diff_gain` around 3.5, which lands in the
         // mid-upper range of `DG_TABLE` (entries ~30-50 sit in
         // `[2.66, 4.85]`). The exact match depends on the per-input
-        // numbers, so we just assert `b2` is in a "real frame" range
-        // — non-zero, non-saturated.
+        // numbers, so we just assert `b2` is in a "real frame" range:
+        // non-zero, non-saturated.
         assert!(
             (5..=63).contains(&b2),
             "b2 for a voiced OP25-scale sa envelope should sit in the \
-             real-frame range, got {b2} — likely a SA scale regression \
+             real-frame range, got {b2}; likely a SA scale regression \
              (sa values doubly-scaled or sub-int16-scale)"
         );
     }
@@ -1761,7 +1761,7 @@ mod tests {
 
         // b1 (VUV index) is 4 bits at positions [38, 39, 40, 41]. For
         // all 10 bands voiced with the band-expansion bug absent, the
-        // V/UV codebook search should pick row 15 (all-voiced) — the
+        // V/UV codebook search should pick row 15 (all-voiced), the
         // minimum-energy pattern when every band matches. With the
         // bug (voiced[i] read per-harmonic), harmonics 10..=29 report
         // unvoiced, pulling the search toward a mid-voiced row.
@@ -1771,7 +1771,7 @@ mod tests {
         assert_eq!(
             b1, 15,
             "b1 should pick the all-voiced row (15) when every band is \
-             voiced; got {b1} — likely per-harmonic band-expansion \
+             voiced; got {b1}, likely a per-harmonic band-expansion \
              regression"
         );
     }
@@ -1791,7 +1791,7 @@ mod tests {
             confidence: 0.9,
         };
         // For a mid-range target_l, the chosen b0 must satisfy
-        // L_TABLE[b0] == target_l — this is the whole point of the
+        // L_TABLE[b0] == target_l; this is the whole point of the
         // L-constrained search.
         for target_l in [18_usize, 24, 30, 40] {
             let b0 = quantize_pitch(est, target_l);
@@ -1804,8 +1804,8 @@ mod tests {
             let got_l = L_TABLE.get(b0 as usize).copied().unwrap_or(0.0) as usize;
             assert_eq!(
                 got_l, target_l,
-                "L_TABLE[b0={b0}]={got_l} does not match target_l={target_l} \
-                 — nearest-W0 fallback fired when a matching entry exists"
+                "L_TABLE[b0={b0}]={got_l} does not match target_l={target_l}: \
+                 nearest-W0 fallback fired when a matching entry exists"
             );
         }
     }

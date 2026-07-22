@@ -1,8 +1,8 @@
 #![cfg(feature = "examples-network")]
 //! Bridge voice traffic between two `DExtra` reflectors (A <-> B).
 //!
-//! Spawns two `AsyncSession<DExtra>` connections — one to "reflector
-//! A" and one to "reflector B" — and forwards every inbound voice
+//! Spawns two `AsyncSession<DExtra>` connections, one to "reflector
+//! A" and one to "reflector B", and forwards every inbound voice
 //! event from A to B and vice versa. A `tokio::select!` over both
 //! event streams keeps the forwarding fair (one call from A does not
 //! starve the next call from B).
@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Connect to both reflectors in parallel to minimize startup
-    // latency. If either fails the example aborts — a production
+    // latency. If either fails the example aborts; a production
     // bridge would retry the failed side while keeping the other
     // side open.
     let (session_a, session_b) = tokio::try_join!(
@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reflector_module: Module::C,
     };
 
-    tracing::info!("bridge up — forwarding both directions");
+    tracing::info!("bridge up, forwarding both directions");
 
     // Forwarding loop. On every `VoiceStart` we record the header
     // for that stream; on subsequent `VoiceFrame`s we push the frame
@@ -191,7 +191,7 @@ async fn forward(
         }
         Event::VoiceEnd { stream_id, .. } => {
             // If we had a matching header cached, emit an EOT on the
-            // TX side. Seq on EOT is advisory — MMDVMHost uses 0 in
+            // TX side. Seq on EOT is advisory: MMDVMHost uses 0 in
             // the common case, which the core codec accepts.
             if *tx_stream == Some(*stream_id) {
                 tx.send_eot(*stream_id, 0).await?;

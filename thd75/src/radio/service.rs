@@ -3,13 +3,13 @@
 //! # Safety
 //!
 //! These commands are intended for factory use only. Incorrect use can:
-//! - **Corrupt factory calibration** (0R, 1A-1W) — may require professional recalibration
-//! - **Brick the radio** (1F) — raw flash write can overwrite boot code
-//! - **Change the serial number** (1I) — may void warranty
+//! - **Corrupt factory calibration** (0R, 1A-1W), which may require professional recalibration
+//! - **Brick the radio** (1F), because a raw flash write can overwrite boot code
+//! - **Change the serial number** (1I), which may void the warranty
 //!
 //! Service mode is entered by sending `0G KENWOOD` and exited with bare `0G`.
 //! While in service mode, the standard CAT command table is replaced with the
-//! service mode table — normal commands will not work until service mode is exited.
+//! service mode table; normal commands will not work until service mode is exited.
 //!
 //! All 20 service mode commands were discovered via Ghidra decompilation of the
 //! TH-D75 V1.03 firmware. The service mode table is at address 0xC006F288 with
@@ -102,7 +102,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn write_calibration_data(&mut self, data: &str) -> Result<(), Error> {
-        tracing::warn!("writing factory calibration data (0R) — CRITICAL OPERATION");
+        tracing::warn!("writing factory calibration data (0R): CRITICAL OPERATION");
         let response = self
             .execute(Command::WriteCalibrationData {
                 data: data.to_owned(),
@@ -296,7 +296,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn service_write_id(&mut self, id: &str, code: &str) -> Result<(), Error> {
-        tracing::warn!(id, code, "writing factory ID (1I) — HIGH RISK OPERATION");
+        tracing::warn!(id, code, "writing factory ID (1I): HIGH RISK OPERATION");
         let response = self
             .execute(Command::ServiceWriteId {
                 id: id.to_owned(),
@@ -357,7 +357,7 @@ impl<T: Transport> Radio<T> {
         tracing::warn!(
             address,
             data_len = data.len(),
-            "writing raw flash memory (1F) — CRITICAL OPERATION"
+            "writing raw flash memory (1F): CRITICAL OPERATION"
         );
         let response = self
             .execute(Command::ServiceFlashWrite {

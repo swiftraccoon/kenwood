@@ -90,10 +90,10 @@ async fn dcs_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std::er
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Inspect the received packets. DCS shapes:
-    //   519 — LINK
-    //    14 — ACK (echoed from the reflector, not sent by client)
-    //   100 — every voice frame (header + 5 data + EOT = 7 total).
-    //    19 — UNLINK
+    //   519: LINK
+    //    14: ACK (echoed from the reflector, not sent by client)
+    //   100: every voice frame (header + 5 data + EOT = 7 total).
+    //    19: UNLINK
     let received = fake.received_packets().await;
     let link_count = received.iter().filter(|p| p.len() == 519).count();
     let voice_count = received.iter().filter(|p| p.len() == 100).count();

@@ -76,7 +76,7 @@ struct FecDoc {
 #[derive(Debug, Serialize)]
 struct SlowDataDoc {
     text: Option<String>,
-    /// Raw 20 message bytes as hex — present only when the message
+    /// Raw 20 message bytes as hex, present only when the message
     /// is not clean printable ASCII (e.g. JIS X 0201 half-width
     /// katakana from Japanese radios), where `text` is lossy.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -133,7 +133,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// Build the metadata document for a completed recording.
 ///
 /// FEC statistics are computed here from the archived frames via
-/// [`mbelib_rs::frame_fec`] — a convenience index; the authoritative
+/// [`mbelib_rs::frame_fec`] as a convenience index; the authoritative
 /// numbers are always re-derivable from the `.ambe` container.
 #[must_use]
 pub fn build_doc(rec: &CompletedRecording, audio: &AudioOutcome) -> RecordingDoc {
@@ -266,7 +266,7 @@ impl Writer {
         Self { base, write_wav }
     }
 
-    /// Write one recording: `.ambe` (ground truth — failure aborts),
+    /// Write one recording: `.ambe` (ground truth, failure aborts),
     /// then `.wav` (failure is recorded in the JSON, not fatal),
     /// then `.json` (the commit marker, fsynced). Returns the JSON path.
     ///
@@ -444,7 +444,7 @@ mod tests {
     }
 
     /// JSON-pointer accessor that fails the test on a missing path
-    /// (workspace lints ban `Value` bracket indexing — it may panic).
+    /// (workspace lints ban `Value` bracket indexing, which may panic).
     fn at<'a>(
         doc: &'a serde_json::Value,
         path: &str,
@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(*at(&doc, "/slow_data/text")?, "Asheville NC");
         // All-zero frames pass C0 as the zero codeword but the
         // descrambled C1 needs 2 corrections each (see mbelib-rs
-        // frame_fec tests) — the fixture's two frames pin 4 bits.
+        // frame_fec tests), so the fixture's two frames pin 4 bits.
         assert_eq!(*at(&doc, "/fec/corrected_bits")?, 4);
         assert_eq!(*at(&doc, "/fec/frames_with_errors")?, 2);
         assert_eq!(*at(&doc, "/fec/erasure_frames")?, 0);

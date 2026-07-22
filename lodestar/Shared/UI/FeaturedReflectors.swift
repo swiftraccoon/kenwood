@@ -3,7 +3,7 @@
 
 import Foundation
 
-/// Curated starter set — the ~15 reflectors most newcomers actually
+/// Curated starter set: the ~15 reflectors most newcomers actually
 /// use. Surfaced in the picker sheet by default; the full ~200 list
 /// is a "Show all" click away.
 ///
@@ -13,19 +13,19 @@ import Foundation
 ///   user with nothing that works.
 /// - XRF/DCS first because they don't require callsign registration.
 enum FeaturedReflectors {
-    /// Names only — resolved against the full list at display time so
+    /// Names only, resolved against the full list at display time so
     /// host/port drift in the bundled Pi-Star files flows through.
     static let names: [String] = [
-        // --- DExtra (XRF) — no auth, easy wins -------------
+        // --- DExtra (XRF): no auth, easy wins --------------
         "XRF757", // North America multi-mode hub
         "XRF030", // Austrian, bridged to REF030
         "XRF012", // UK
         "XRF310", // Italy
-        // --- DCS — no auth ---------------------------------
+        // --- DCS: no auth ----------------------------------
         "DCS001", // Flagship EU DCS
         "DCS003", // EU DCS
         "DCS006", // EU DCS
-        // --- DPlus (REF) — requires registration -----------
+        // --- DPlus (REF): requires registration ------------
         "REF001", // USA global
         "REF030", // USA east
         "REF038", // Germany
@@ -39,7 +39,7 @@ enum FeaturedReflectors {
     /// debug builds (and a unit test) instead of silently vanishing
     /// from the Featured section.
     static func resolve(from all: [Reflector]) -> [Reflector] {
-        // `all` can now include network-fetched rows — tolerate a
+        // `all` can now include network-fetched rows, so tolerate a
         // duplicate name rather than trapping on it.
         let byName = Dictionary(all.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
         return names.compactMap { name in

@@ -22,7 +22,7 @@ pub const DEFAULT_MAX_FRAME_LEN: usize = 1024;
 /// [`Self::next_frame`].
 ///
 /// To bound memory against a stuck or noisy peer, the decoder discards
-/// any frame — or run of bytes with no usable delimiter — longer than
+/// any frame (or run of bytes with no usable delimiter) longer than
 /// its configured maximum (see [`Self::with_max_frame_len`]) and reports
 /// [`KissError::FrameTooLong`].
 #[derive(Debug)]
@@ -53,7 +53,7 @@ impl KissDecoder {
     /// Create a new empty decoder with an explicit maximum frame length.
     ///
     /// `max_frame_len` bounds a complete frame *including* its two FEND
-    /// delimiters. Frames — or runs of bytes with no usable delimiter —
+    /// delimiters. Frames (or runs of bytes with no usable delimiter)
     /// longer than this are discarded and reported as
     /// [`KissError::FrameTooLong`], which caps the decoder's memory use
     /// against a peer that never closes a frame. Values below `3` reject
@@ -80,8 +80,8 @@ impl KissDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`KissError::FrameTooLong`] when a frame — or a run of
-    /// bytes with no usable delimiter — exceeds the configured maximum
+    /// Returns [`KissError::FrameTooLong`] when a frame (or a run of
+    /// bytes with no usable delimiter) exceeds the configured maximum
     /// length; the offending bytes are discarded and decoding resyncs at
     /// the next FEND. Returns other [`KissError`] variants on invalid
     /// escape sequences or otherwise malformed frames.
@@ -107,7 +107,7 @@ impl KissDecoder {
             let tail = self.buffer.get(1..).unwrap_or(&[][..]);
             let Some(end) = tail.iter().position(|&b| b == FEND) else {
                 // Frame still open. If it has already outgrown the cap it
-                // can never close validly — discard it and resync.
+                // can never close validly: discard it and resync.
                 if self.buffer.len() > self.max_frame_len {
                     self.buffer.clear();
                     self.in_frame = false;

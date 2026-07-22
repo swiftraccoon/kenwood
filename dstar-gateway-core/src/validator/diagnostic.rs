@@ -35,7 +35,7 @@ pub enum Diagnostic {
     },
 
     /// Header carries non-zero flag bytes (the DSVT-embedded form
-    /// is supposed to zero them — see `HeaderData.cpp:665-667`).
+    /// is supposed to zero them; see `HeaderData.cpp:665-667`).
     HeaderFlagsNonZero {
         /// Originating protocol.
         protocol: ProtocolKind,
@@ -160,7 +160,7 @@ pub enum CallsignField {
 pub enum AuthHostSkipReason {
     /// Record's active flag (high bit of byte 25) was clear.
     Inactive,
-    /// Callsign field starts with `XRF` — the reference filters these
+    /// Callsign field starts with `XRF`; the reference filters these
     /// out before caching.
     XrfPrefix,
     /// IP field is empty after trimming.

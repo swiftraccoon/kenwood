@@ -41,7 +41,7 @@ fn serialize_tn_read() {
 
 #[test]
 fn parse_tn_response() -> TestResult {
-    // TN 0 is TNC OFF — hardware-verified 2026-07-18 (display shows no
+    // TN 0 is TNC OFF, hardware-verified 2026-07-18 (display shows no
     // packet-mode indicator). An earlier generation mapped 0 to APRS.
     let r = protocol::parse(b"TN 0,0")?;
     let Response::TncMode { mode, setting } = r else {

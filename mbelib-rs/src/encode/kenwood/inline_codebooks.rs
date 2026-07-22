@@ -1,4 +1,4 @@
-//! Kenwood TH-D75 AMBE DSP — inline Q-format codebooks.
+//! Kenwood TH-D75 AMBE DSP: inline Q-format codebooks.
 //!
 //! Each `FN_XXXXXXXX` const is the sequence of MVK immediates loaded
 //! by the DSP function at the corresponding VA. These are quantizer

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Async session task — owns the `AsyncSession<P>` handles and
+//! Async session task: owns the `AsyncSession<P>` handles and
 //! brokers commands from / events to the GUI.
 //!
 //! The GUI never touches `dstar-gateway` types directly. It sends
@@ -40,7 +40,7 @@ use tokio::time::timeout;
 /// Pair an active runtime session with the configuration it was
 /// established with. The cfg fields (operator callsign, modules,
 /// reflector callsign) are needed to build correctly-routed `rpt1` /
-/// `rpt2` headers at TX time — see [`DStarHeader::for_relay`] for the
+/// `rpt2` headers at TX time; see [`DStarHeader::for_relay`] for the
 /// `rpt[7]` module-byte invariant that strict reflectors enforce.
 struct ActiveSession {
     runtime: RuntimeSession,
@@ -76,11 +76,11 @@ pub(crate) enum SessionCommand {
     /// Gracefully tear down the current session.
     Disconnect,
     /// Send N seconds of AMBE silence for pipeline sanity checks.
-    /// Useful before wiring real mic capture — proves header + voice
+    /// Useful before wiring real mic capture; proves header + voice
     /// + EOT reach the reflector.
     TxSilence { seconds: f32 },
-    /// Begin a TX stream — audio worker sends this when the operator
-    /// keys PTT. The session task generates a fresh stream-id, sends
+    /// Begin a TX stream. The audio worker sends this when the
+    /// operator keys PTT. The session task generates a fresh stream-id, sends
     /// the header, and starts accepting `TxFrame`s.
     StartTx {
         /// Callsign to embed in the D-STAR header `my_call`.
@@ -89,7 +89,7 @@ pub(crate) enum SessionCommand {
     /// One encoded voice frame from the audio worker. Ignored if no
     /// TX stream is active.
     TxFrame(VoiceFrame),
-    /// End the active TX stream — emits EOT and clears state.
+    /// End the active TX stream: emits EOT and clears state.
     EndTx,
     /// The audio worker hit a fatal init error (no devices, format
     /// unsupported, etc.). Forwarded to the GUI as
@@ -130,7 +130,7 @@ pub(crate) enum ConnStatus {
     Disconnected,
     /// Handshake in progress.
     Connecting { peer: SocketAddr },
-    /// Connected — showing the remote reflector + module.
+    /// Connected, showing the remote reflector + module.
     Connected {
         /// Reflector callsign (display-form).
         reflector: String,
@@ -166,7 +166,7 @@ pub(crate) enum SessionEvent {
         /// Reason reported by the core state machine.
         reason: String,
     },
-    /// Hard error — session task is returning to Disconnected.
+    /// Hard error: the session task is returning to Disconnected.
     Error(String),
     /// A complete 20-character D-STAR slow-data text message has been
     /// assembled from incoming voice frames.
@@ -207,7 +207,7 @@ pub(crate) enum SessionEvent {
 }
 
 /// Protocol-generic wrapper over `AsyncSession<P>`. Borrowed verbatim
-/// from the pattern in `thd75-repl/src/main.rs` — same runtime-state
+/// from the pattern in `thd75-repl/src/main.rs`; same runtime-state
 /// dispatch so the event-pump code can be protocol-agnostic.
 enum RuntimeSession {
     DPlus(AsyncSession<DPlus>),
@@ -225,7 +225,7 @@ impl RuntimeSession {
     }
 
     /// Watch receiver for the instant of the last datagram from the
-    /// reflector — see [`AsyncSession::activity`].
+    /// reflector; see [`AsyncSession::activity`].
     fn activity(&self) -> tokio::sync::watch::Receiver<Instant> {
         match self {
             Self::DPlus(s) => s.activity(),
@@ -277,7 +277,7 @@ impl RuntimeSession {
 /// `seq` is the NEXT wire seq to use, always in `0..21`.  D-STAR
 /// encodes seq in the low 6 bits of a wire byte with bit 6 (`0x40`)
 /// reserved as the EOT flag.  Any value `>= 0x40` would set that bit
-/// mid-stream and the reflector would treat it as EOT — silently
+/// mid-stream and the reflector would treat it as EOT, silently
 /// ending the stream.  Wrapping at the superframe length (21) is
 /// both spec-correct and keeps us well clear of the EOT bit.
 #[derive(Debug)]
@@ -286,7 +286,7 @@ struct TxStream {
     seq: u8,
 }
 
-/// D-STAR superframe length — seq wraps mod this value.
+/// D-STAR superframe length: seq wraps mod this value.
 const SUPERFRAME_LEN: u8 = 21;
 
 /// Longest sequence gap concealed frame-by-frame (10 frames =
@@ -297,7 +297,7 @@ const MAX_CONCEAL: u8 = 10;
 /// Frames within this distance BEHIND the expected sequence are
 /// treated as late/reordered duplicates and dropped. The wire
 /// counter is mod-21, so "slightly behind" and "far ahead" are the
-/// same number — this window is how the two are told apart.
+/// same number, and this window is how the two are told apart.
 const REORDER_WINDOW: u8 = 3;
 
 /// Where an arriving frame's sequence lands relative to expectation.
@@ -305,11 +305,11 @@ const REORDER_WINDOW: u8 = 3;
 enum GapClass {
     /// Exactly the expected sequence.
     InOrder,
-    /// This many frames were lost — conceal them, then play the frame.
+    /// This many frames were lost: conceal them, then play the frame.
     Conceal(u8),
-    /// Too many frames lost to conceal — resync and play the frame.
+    /// Too many frames lost to conceal: resync and play the frame.
     Dropout(u8),
-    /// Behind the expected sequence — drop the frame, never
+    /// Behind the expected sequence: drop the frame, never
     /// double-play.
     Late,
 }
@@ -347,7 +347,7 @@ enum RuntimeEvent {
         seq: u8,
         frame: VoiceFrame,
     },
-    /// Reflector-side disconnect — keepalive timeout, link rejection,
+    /// Reflector-side disconnect: keepalive timeout, link rejection,
     /// or an unlink ACK after our own disconnect. Surfaced explicitly
     /// (not folded into `Other`) so the run loop can clear `session`
     /// and tell the GUI the link is dead, instead of leaving a stale
@@ -355,11 +355,11 @@ enum RuntimeEvent {
     Disconnected { reason: String },
     /// Keepalive echo from the reflector. Liveness is already
     /// surfaced through the activity watch (the status line's
-    /// "heard Ns ago"), so these stay out of the event log — at
+    /// "heard Ns ago"), so these stay out of the event log; at
     /// poll cadence they'd drown every operator-relevant line.
     Keepalive,
-    /// Anything else — logged as a debug line, not surfaced to the GUI
-    /// explicitly.
+    /// Anything else, logged as a debug line and not surfaced to the
+    /// GUI explicitly.
     Other(String),
 }
 
@@ -410,7 +410,7 @@ struct GpsSlowData {
 }
 
 impl GpsSlowData {
-    /// Drop all partial state — call on stream boundaries.
+    /// Drop all partial state; call on stream boundaries.
     fn reset(&mut self) {
         self.block = [0u8; 6];
         self.have_first_half = false;
@@ -420,7 +420,7 @@ impl GpsSlowData {
     /// Feed one voice frame's slow-data fragment at superframe `seq`.
     /// Returns a [`GpsPosition`] when a sentence completes.
     fn push(&mut self, fragment: [u8; 3], seq: u8) -> Option<GpsPosition> {
-        // seq 0 is the superframe sync frame — no slow data, resync.
+        // seq 0 is the superframe sync frame: no slow data, resync.
         if seq == 0 {
             self.have_first_half = false;
             return None;
@@ -436,7 +436,7 @@ impl GpsSlowData {
         None
     }
 
-    /// A complete 6-byte block assembled — route GPS payloads.
+    /// A complete 6-byte block assembled: route GPS payloads.
     fn commit_block(&mut self) -> Option<GpsPosition> {
         // High nibble 0x30 == GPS NMEA passthrough.
         if self.block[0] & 0xF0 != 0x30 {
@@ -497,13 +497,13 @@ enum EventDecision {
     AudioRxStart,
     /// Hand a decoded voice frame to the audio worker.
     AudioRxFrame(VoiceFrame),
-    /// A frame was lost upstream — tell the audio worker to
+    /// A frame was lost upstream: tell the audio worker to
     /// synthesize one concealment frame.
     AudioRxLost,
-    /// The RX stream ended — tell the audio worker to fade out and
+    /// The RX stream ended: tell the audio worker to fade out and
     /// flush its held-back tail frame.
     AudioRxEnd,
-    /// Clear the active session — the reflector booted us or the
+    /// Clear the active session, because the reflector booted us or the
     /// underlying transport died. The run loop sets `session = None`.
     ClearSession,
 }
@@ -522,7 +522,7 @@ impl PartialEq for EventDecision {
 /// dropouts, and update the loss/late counters.
 ///
 /// Returns `false` when the frame is a late duplicate that the
-/// caller must drop (the stream already played past its slot —
+/// caller must drop (the stream already played past its slot, so
 /// playing it now would double-play 20 ms of audio).
 fn apply_gap_policy(state: &mut EventState, seq: u8, decisions: &mut Vec<EventDecision>) -> bool {
     match state
@@ -541,8 +541,8 @@ fn apply_gap_policy(state: &mut EventState, seq: u8, decisions: &mut Vec<EventDe
         }
         Some(GapClass::Dropout(n)) => {
             // Too long to conceal without smearing one voice
-            // posture across the hole — count it and resync.
-            tracing::debug!(lost = n, seq, "RX dropout — resyncing without concealment");
+            // posture across the hole: count it and resync.
+            tracing::debug!(lost = n, seq, "RX dropout; resyncing without concealment");
             state.frames_lost = state.frames_lost.saturating_add(u32::from(n));
         }
         Some(GapClass::InOrder) | None => {}
@@ -581,13 +581,13 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
         RuntimeEvent::VoiceFrame { seq, frame } => {
             let mut decisions = Vec::new();
             if !apply_gap_policy(state, seq, &mut decisions) {
-                // Late duplicate — dropped whole, including its
+                // Late duplicate, dropped whole, including its
                 // slow-data fragment (its superframe slot has passed).
                 return decisions;
             }
             state.expected_seq = Some((seq + 1) % SUPERFRAME_LEN);
             state.rx_frame_count = state.rx_frame_count.saturating_add(1);
-            // `slow_data` is `[u8; 3]` (`Copy`) — read it out before
+            // `slow_data` is `[u8; 3]` (`Copy`), so read it out before
             // `frame` is moved into the `AudioRxFrame` decision so both
             // the text collector and the GPS assembler can be fed.
             let slow = frame.slow_data;
@@ -622,7 +622,7 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
             state.expected_seq = None;
             state.frames_lost = 0;
             state.frames_late = 0;
-            // EOT — drop any partial slow-data half-blocks; the next
+            // EOT: drop any partial slow-data half-blocks; the next
             // stream restarts assembly cleanly.
             state.slow_data.reset();
             state.gps.reset();
@@ -667,7 +667,7 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
 /// Top-level session task entry point. Runs until `cmd_rx` closes.
 #[expect(
     clippy::too_many_lines,
-    reason = "main event loop — splitting the per-command arms into separate helpers would obscure the select! structure"
+    reason = "main event loop; splitting the per-command arms into separate helpers would obscure the select! structure"
 )]
 pub(crate) async fn run(
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
@@ -682,9 +682,9 @@ pub(crate) async fn run(
     // Counts frames on the currently-transmitting OUTGOING stream;
     // reset between streams.
     let mut tx_frame_count: u32 = 0;
-    // Active outgoing TX stream — `Some` between `StartTx` and `EndTx`.
+    // Active outgoing TX stream: `Some` between `StartTx` and `EndTx`.
     let mut tx_stream: Option<TxStream> = None;
-    // Last config used to connect — replayed for auto-reconnect after
+    // Last config used to connect, replayed for auto-reconnect after
     // a reflector-driven drop. Cleared by an explicit `Disconnect`.
     let mut last_cfg: Option<ConnectConfig> = None;
     // Pending reconnect: (when to fire, attempt index). `None` when no
@@ -702,7 +702,7 @@ pub(crate) async fn run(
                 match cmd {
                     SessionCommand::Connect(cfg) => {
                         if session.is_some() {
-                            let _unused = evt_tx.send(SessionEvent::Log("already connected — ignoring Connect".into())).await;
+                            let _unused = evt_tx.send(SessionEvent::Log("already connected; ignoring Connect".into())).await;
                             continue;
                         }
                         let _unused = evt_tx.send(SessionEvent::Status(ConnStatus::Connecting { peer: cfg.peer })).await;
@@ -724,7 +724,7 @@ pub(crate) async fn run(
                                         Some("DPlus auth: ok".to_owned())
                                     }
                                     AuthOutcome::FellBack => Some(
-                                        "DPlus auth: failed — connected with empty host list"
+                                        "DPlus auth: failed; connected with empty host list"
                                             .to_owned(),
                                     ),
                                 };
@@ -767,10 +767,10 @@ pub(crate) async fn run(
                             continue;
                         };
                         if tx_stream.is_some() {
-                            // Refuse silence test mid-PTT — interleaving two
+                            // Refuse silence test mid-PTT: interleaving two
                             // stream-ids on one wire confuses the reflector.
                             let _unused = evt_tx.send(SessionEvent::Log(
-                                "TxSilence: PTT active — ignoring".into(),
+                                "TxSilence: PTT active; ignoring".into(),
                             )).await;
                             continue;
                         }
@@ -784,7 +784,7 @@ pub(crate) async fn run(
                             continue;
                         };
                         if tx_stream.is_some() {
-                            let _unused = evt_tx.send(SessionEvent::Log("StartTx: already transmitting — ignoring".into())).await;
+                            let _unused = evt_tx.send(SessionEvent::Log("StartTx: already transmitting; ignoring".into())).await;
                             continue;
                         }
                         // Audio-worker-supplied `my_call` is a diagnostic
@@ -837,10 +837,10 @@ pub(crate) async fn run(
                         ts.seq = (ts.seq + 1) % SUPERFRAME_LEN;
                     }
                     SessionCommand::AudioInitError(msg) => {
-                        // Surface once per init failure — the audio worker
+                        // Surface once per init failure; the audio worker
                         // only reports this when it can't open devices.
                         let _unused = evt_tx.send(SessionEvent::Error(format!(
-                            "audio init failed: {msg} — TX/RX disabled until restart"
+                            "audio init failed: {msg}; TX/RX disabled until restart"
                         ))).await;
                     }
                     SessionCommand::EndTx => {
@@ -850,7 +850,7 @@ pub(crate) async fn run(
                                 sid = format_args!("{:#06X}", ts.sid.get()),
                                 eot_seq = seq,
                                 frames = tx_frame_count,
-                                "TX ending — sending EOT"
+                                "TX ending; sending EOT"
                             );
                             if let Err(e) = active.runtime.send_eot(ts.sid, seq).await {
                                 let _unused = evt_tx.send(SessionEvent::Error(format!("EndTx: {e}"))).await;
@@ -921,7 +921,7 @@ pub(crate) async fn run(
                             last_heard_secs: age.as_secs_f32(),
                         })
                         .await;
-                    // Live per-stream counters while a stream is up —
+                    // Live per-stream counters while a stream is up;
                     // the final values still arrive via VoiceEnd.
                     if rx_state.expected_seq.is_some() {
                         let _unused = evt_tx
@@ -1004,7 +1004,7 @@ async fn next_event_opt(session: Option<&mut ActiveSession>) -> Option<RuntimeEv
 /// Outcome of the optional `DPlus` authentication step.
 #[derive(Debug, Clone, Copy)]
 enum AuthOutcome {
-    /// Not a `DPlus` session — no auth attempted.
+    /// Not a `DPlus` session, so no auth attempted.
     NotApplicable,
     /// Auth succeeded against the `DPlus` auth server.
     Authenticated,
@@ -1075,11 +1075,11 @@ where
                     .map_err(|e| format!("handshake input: {e}"))?;
                 match connecting.state_kind() {
                     ClientStateKind::Connected => return Ok(()),
-                    // A login NAK (DPlus BUSY) closes the session —
+                    // A login NAK (DPlus BUSY) closes the session, so
                     // surface the refusal immediately instead of
                     // idling into a misleading 5-second timeout.
                     ClientStateKind::Closed => {
-                        return Err("reflector refused the link (BUSY) — \
+                        return Err("reflector refused the link (BUSY); \
                              DPlus authorization for your callsign/IP may \
                              still be propagating"
                             .into());
@@ -1137,7 +1137,7 @@ async fn connect_dplus(
     {
         Ok(h) => (h, AuthOutcome::Authenticated),
         Err(e) => {
-            tracing::debug!(?e, "DPlus auth failed — falling back to empty host list");
+            tracing::debug!(?e, "DPlus auth failed; falling back to empty host list");
             (
                 dstar_gateway_core::codec::dplus::HostList::new(),
                 AuthOutcome::FellBack,
@@ -1190,7 +1190,7 @@ async fn connect_dcs(cfg: &ConnectConfig) -> Result<AsyncSession<Dcs>, String> {
 /// validated module letters strict reflectors (xlxd-derived) demand.
 async fn start_tx(active: &mut ActiveSession) -> Result<TxStream, String> {
     let Some(sid) = StreamId::new(rand_stream_id()) else {
-        return Err("stream id zero — retry".into());
+        return Err("stream id zero; retry".into());
     };
     let header = DStarHeader::for_relay(
         active.cfg.callsign,
@@ -1207,7 +1207,7 @@ async fn start_tx(active: &mut ActiveSession) -> Result<TxStream, String> {
         rpt1_module = %active.cfg.local_module,
         rpt2 = %active.cfg.reflector_callsign,
         rpt2_module = %active.cfg.reflector_module,
-        "TX starting — sending header"
+        "TX starting; sending header"
     );
     active
         .runtime
@@ -1217,7 +1217,7 @@ async fn start_tx(active: &mut ActiveSession) -> Result<TxStream, String> {
     Ok(TxStream { sid, seq: 0 })
 }
 
-/// TX pipeline sanity check — send `seconds` worth of AMBE silence.
+/// TX pipeline sanity check: send `seconds` worth of AMBE silence.
 /// Proves header + voice + EOT reach the reflector without needing
 /// mic capture or the AMBE encoder. Uses the operator's configured
 /// callsign and the same [`DStarHeader::for_relay`] convention as
@@ -1228,7 +1228,7 @@ async fn tx_silence(
     seconds: f32,
     evt_tx: &mpsc::Sender<SessionEvent>,
 ) -> Result<(), String> {
-    // D-STAR voice frame rate is 50 fps (20 ms). Clamp sane bounds —
+    // D-STAR voice frame rate is 50 fps (20 ms). Clamp sane bounds:
     // 0.2 s minimum (10 frames, enough for a header + EOT pair with a
     // brief gap), 10 s maximum to keep an accidental infinite loop
     // from holding the mic open on a shared reflector.
@@ -1243,7 +1243,7 @@ async fn tx_silence(
     let total_frames = frames_f as u32;
 
     let Some(sid) = StreamId::new(rand_stream_id()) else {
-        return Err("stream id zero — retry".into());
+        return Err("stream id zero; retry".into());
     };
 
     let header = DStarHeader::for_relay(
@@ -1274,7 +1274,7 @@ async fn tx_silence(
     // D-STAR encodes seq in the low 6 bits of the wire byte with bit 6
     // reserved as the EOT flag.  Wrapping mod 256 (as a prior revision
     // did) sets bit 6 at `i == 64`, which the reflector parses as an
-    // EOT and silently closes the stream — 1.28 s into the helper's
+    // EOT and silently closes the stream, 1.28 s into the helper's
     // supposedly-10-s run.  Wrap mod SUPERFRAME_LEN (21) to match the
     // real-mic TxFrame handler above and stay clear of bit 6.
     for i in 0..total_frames {
@@ -1289,7 +1289,7 @@ async fn tx_silence(
             .send_voice(sid, seq, frame)
             .await
             .map_err(|e| e.to_string())?;
-        // Natural 20 ms pacing — avoids flooding the reflector. Real
+        // Natural 20 ms pacing that avoids flooding the reflector. Real
         // mic capture will inherently pace itself at 50 fps.
         tokio::time::sleep_until(tokio::time::Instant::from_std(
             start + Duration::from_millis(20 * u64::from(i + 1)),
@@ -1316,7 +1316,7 @@ async fn tx_silence(
     Ok(())
 }
 
-/// Simple PRNG for stream IDs — doesn't need to be cryptographic. A
+/// Simple PRNG for stream IDs; it doesn't need to be cryptographic. A
 /// time-seeded `u16` is plenty to avoid accidental overlap with the
 /// previous stream while PTT bounces.
 fn rand_stream_id() -> u16 {
@@ -1327,7 +1327,7 @@ fn rand_stream_id() -> u16 {
     // Map to 1..=0xFFFF to avoid the zero that `StreamId::new` rejects.
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "Intentional truncation of u32 nanos to u16 — we want the low 16 bits \
+        reason = "Intentional truncation of u32 nanos to u16: we want the low 16 bits \
                   as a seed for StreamId. OR with 0x1 then .max(1) guarantees non-zero."
     )]
     let v = (nanos as u16) | 0x1;
@@ -1348,7 +1348,7 @@ mod tests {
 
     /// Compile-time-checked [`StreamId`] constructor for test fixtures.
     /// `Option::unwrap` is const since 1.83, so a zero literal becomes
-    /// a compile error — the workspace convention of infallible
+    /// a compile error, matching the workspace convention of infallible
     /// test-fixture construction.
     const fn sid(n: u16) -> StreamId {
         match StreamId::new(n) {
@@ -1523,7 +1523,7 @@ mod tests {
     fn voice_start_resets_slow_data_collector() -> TestResult {
         use dstar_gateway_core::slowdata::scramble;
         let mut state = EventState::default();
-        // Push half a message, then start a new stream — the collector
+        // Push half a message, then start a new stream; the collector
         // must drop the partial state.
         for (seq, half) in (1u8..).zip([[0x40_u8, b'X', b'X'], [b'X', b'X', b'X']].iter()) {
             let _unused = decide_runtime_event(
@@ -1635,7 +1635,7 @@ mod tests {
         Ok(())
     }
 
-    /// Keepalive echoes arrive at poll cadence — they must stay out
+    /// Keepalive echoes arrive at poll cadence; they must stay out
     /// of the event log entirely (liveness is shown by the status
     /// line's last-heard age instead).
     #[test]
@@ -1781,7 +1781,7 @@ mod tests {
     }
 
     /// A frame arriving behind the expected sequence was already
-    /// concealed past — playing it now would double-play 20 ms.
+    /// concealed past, so playing it now would double-play 20 ms.
     #[test]
     fn late_frame_is_dropped_not_double_played() {
         let mut state = EventState::default();
@@ -1827,7 +1827,7 @@ mod tests {
             },
             &mut state,
         );
-        // seq 1..=14 lost — beyond MAX_CONCEAL.
+        // seq 1..=14 lost: beyond MAX_CONCEAL.
         let decisions = decide_runtime_event(
             RuntimeEvent::VoiceFrame {
                 seq: 15,
@@ -1895,7 +1895,7 @@ mod tests {
     }
 
     /// **Regression guard for the masked-rejection bug.** A `DPlus`
-    /// reflector that answers BUSY has refused the link — the
+    /// reflector that answers BUSY has refused the link, so the
     /// handshake must fail immediately with a "refused" error, not
     /// idle out as a fake 5-second "handshake timeout" (which is what
     /// a real dstargateway REF refusal looked like before the fix).

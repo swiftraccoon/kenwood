@@ -8,12 +8,12 @@
 //! against mbelib's for identical AMBE input, and by the synthesis
 //! tuning sweep, which sets the `MBELIB_TUNING` environment variable
 //! to a comma-separated `key=value` list (keys: `alpha`, `exp`, `lo`,
-//! `hi`, `uv` — anything omitted stays at mbelib parity).
+//! `hi`, `uv`; anything omitted stays at mbelib parity).
 
 #![expect(
     clippy::print_stderr,
-    reason = "CLI tool: uses stderr for usage/error messages — standard pattern for a \
-              binary example, not a library."
+    reason = "CLI tool: uses stderr for usage/error messages (standard pattern for a \
+              binary example, not a library)."
 )]
 
 // Dev-dependencies pulled in by sibling test/example targets. Acknowledge them

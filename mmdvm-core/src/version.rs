@@ -15,7 +15,7 @@ use crate::error::MmdvmError;
 
 /// Index (within the payload) where the description starts for
 /// protocol v1 responses. The payload layout is:
-/// `[protocol][description bytes...]` — protocol at 0, description
+/// `[protocol][description bytes...]`: protocol at 0, description
 /// at 1.
 const V1_DESCRIPTION_OFFSET: usize = 1;
 
@@ -65,7 +65,7 @@ impl VersionResponse {
                 capabilities: Some(Capabilities::new(cap1, cap2)),
             });
         }
-        // Protocol v1 (or older / unknown) — description starts
+        // Protocol v1 (or older / unknown): description starts
         // right after the protocol byte; no capability bits
         // are present on the wire.
         let description = decode_description(payload, V1_DESCRIPTION_OFFSET);

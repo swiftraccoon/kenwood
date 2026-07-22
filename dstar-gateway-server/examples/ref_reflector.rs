@@ -15,7 +15,7 @@ use std::sync::Arc;
 use dstar_gateway_core::types::{Callsign, Module, ProtocolKind};
 use dstar_gateway_server::{AllowAllAuthorizer, Reflector, ReflectorConfig};
 
-// Examples are a separate compilation unit — acknowledge workspace
+// Examples are a separate compilation unit. Acknowledge workspace
 // dev-deps we don't reference directly so the strict
 // `unused_crate_dependencies` lint stays silent.
 use proptest as _;

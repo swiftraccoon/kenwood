@@ -4,10 +4,10 @@
 //! Learned waveform enhancement, causal/streaming variant
 //! (complex-STFT masking with a forward-only recurrence).
 //!
-//! Same architecture family as [`crate::enhance_wave`] — a small
+//! Same architecture family as [`crate::enhance_wave`]: a small
 //! grouped-convolution network predicting a bounded complex mask
 //! (magnitude *and* phase corrections around identity) over the
-//! decoder output's STFT — but the bidirectional recurrent core is
+//! decoder output's STFT. The bidirectional recurrent core, however, is
 //! replaced by a single *forward* GRU, so the recurrence never reads
 //! future spectral columns. The only remaining lookahead is the
 //! convolutions' short time context, which makes frame-in/frame-out
@@ -15,12 +15,12 @@
 //!
 //! Entry points:
 //!
-//! - [`LiveWaveEnhancer`] — whole-clip batch processing with the same
+//! - [`LiveWaveEnhancer`]: whole-clip batch processing with the same
 //!   semantics as the offline enhancer (centered reflect-padded STFT,
 //!   256/64, Hann; exact-erf GELU; the training framework's GRU gate
 //!   order; window-normalized inverse STFT), pinned against a
 //!   recorded reference vector produced by the training checkpoint.
-//! - [`LiveWaveStream`] — incremental processing that reproduces the
+//! - [`LiveWaveStream`]: incremental processing that reproduces the
 //!   batch output while emitting each sample as soon as it is final.
 //!
 //! # Latency budget
@@ -28,21 +28,21 @@
 //! A streamed output sample is final at most 447 input samples (just
 //! under 56 ms at 8 kHz) after the matching input sample arrives:
 //!
-//! - **128 samples (16 ms)** — centered-STFT offset: each analysis
+//! - **128 samples (16 ms)**, the centered-STFT offset: each analysis
 //!   window extends half a window past its column center. (The left
 //!   half-window is covered by mirroring the first 128 samples as
 //!   reflect padding, so stream start pays no extra delay.)
-//! - **192 samples (24 ms)** — convolutional lookahead: the two
+//! - **192 samples (24 ms)**, the convolutional lookahead: the two
 //!   grouped frequency stages and the mask head each see one STFT
 //!   column (64 samples) ahead, three hops end to end.
-//! - **127 samples (just under 16 ms)** — overlap-add completion: a
+//! - **127 samples (just under 16 ms)**, overlap-add completion: a
 //!   sample is emitted only after the last analysis window
 //!   overlapping it has been masked, inverse-transformed, and
 //!   accumulated together with its squared-window normalization.
 //!
 //! Additionally, nothing is released until the stream has seen 512
-//! input samples (64 ms) — the batch API's short-clip passthrough
-//! threshold — which delays only the first release, not steady-state
+//! input samples (64 ms), the batch API's short-clip passthrough
+//! threshold, which delays only the first release, not steady-state
 //! pacing. The stream is designed to sit inside a receiver playout
 //! buffer that already holds at least that much audio, where the
 //! enhancement adds no end-to-end delay of its own;
@@ -79,7 +79,7 @@ const PAD: usize = N_FFT / 2;
 /// Network time lookahead in STFT columns: `freq1`, `freq2`, and the
 /// mask head each see one column ahead.
 const LOOKAHEAD_COLS: usize = 3;
-/// Input samples a stream must see before releasing output — the
+/// Input samples a stream must see before releasing output: the
 /// batch API's short-clip passthrough threshold.
 const RELEASE_MIN: usize = N_FFT * 2;
 /// Inverse-FFT normalization.
@@ -115,7 +115,7 @@ struct GruDir {
     b_hh: Vec<f32>,
 }
 
-/// The full masking network — weights and analysis window — shared by
+/// The full masking network (weights and analysis window), shared by
 /// the batch and streaming paths.
 #[derive(Debug)]
 struct Model {
@@ -523,7 +523,7 @@ impl Model {
         feat
     }
 
-    /// The network body — convolutional trunk, forward recurrence,
+    /// The network body: convolutional trunk, forward recurrence,
     /// nearest-neighbor frequency upsample, and the mask head.
     /// Returns the two raw mask planes (`BINS` × frames each).
     fn network_mask(&self, feat: &[f32], frames: usize) -> Vec<f32> {
@@ -612,8 +612,8 @@ impl Model {
         mask_planes
     }
 
-    /// Bounded complex mask application — `(1 + tanh(m0)) + i·tanh(m1)`
-    /// — and window-normalized overlap-add inverse STFT, cropped back
+    /// Bounded complex mask application, `(1 + tanh(m0)) + i·tanh(m1)`,
+    /// plus window-normalized overlap-add inverse STFT, cropped back
     /// to the unpadded input length.
     fn istft(
         &self,
@@ -663,7 +663,7 @@ impl Model {
     }
 }
 
-/// The live (causal) masking network — batch entry point and factory
+/// The live (causal) masking network: batch entry point and factory
 /// for streaming sessions.
 ///
 /// Holds the parsed weights behind an [`Arc`] so
@@ -718,9 +718,9 @@ impl LiveWaveEnhancer {
 
 /// Incremental (streaming) live-enhancement session.
 ///
-/// Feed decoder output as it is produced — 20 ms frames via
+/// Feed decoder output as it is produced (20 ms frames via
 /// [`push_frame`](Self::push_frame) or arbitrary-length unit-scale
-/// float slices via [`push_samples_f32`](Self::push_samples_f32) —
+/// float slices via [`push_samples_f32`](Self::push_samples_f32)),
 /// and receive every output sample that has become final. The
 /// concatenation of all per-push outputs plus the matching
 /// [`finish`](Self::finish) / [`finish_f32`](Self::finish_f32) call
@@ -782,8 +782,8 @@ pub struct LiveWaveStream {
     pure_i16: bool,
 }
 
-/// Ring-buffer column lookup: `None` when `idx` exceeds `last` — the
-/// batch convolutions' zero time padding at the sequence edges.
+/// Ring-buffer column lookup: `None` when `idx` exceeds `last`, which
+/// is the batch convolutions' zero time padding at the sequence edges.
 fn ring3(cols: &[Vec<f32>; 3], idx: usize, last: usize) -> Option<&[f32]> {
     if idx > last {
         return None;
@@ -910,9 +910,9 @@ impl LiveWaveStream {
     }
 
     /// Float-domain [`finish`](Self::finish): always runs the
-    /// enhancement pipeline — like
+    /// enhancement pipeline, like
     /// [`LiveWaveEnhancer::process_f32`], which has no short-clip
-    /// passthrough — then flushes and resets the session.
+    /// passthrough, then flushes and resets the session.
     #[must_use]
     pub fn finish_f32(&mut self) -> Vec<f32> {
         let len = self.received;
@@ -1230,8 +1230,8 @@ impl LiveWaveStream {
         self.emit_ready(start + HOP - 1);
     }
 
-    /// Move every final sample — padded position at most `through`,
-    /// i.e. all of whose overlapping windows have been accumulated —
+    /// Move every final sample (padded position at most `through`,
+    /// i.e. all of whose overlapping windows have been accumulated)
     /// into the pending output, dividing by the accumulated
     /// squared-window norm exactly as the batch path does.
     fn emit_ready(&mut self, through: usize) {

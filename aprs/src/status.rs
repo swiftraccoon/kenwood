@@ -64,7 +64,7 @@ pub const MAX_APRS_STATUS_TEXT_LEN: usize = 62;
 /// [`AprsStatus`]. The dispatch order is:
 ///
 /// 1. If the body starts with a 7-byte DHM-Zulu timestamp
-///    (`DDHHMMz` — the only timestamp form a status report may carry,
+///    (`DDHHMMz`, the only timestamp form a status report may carry,
 ///    APRS 1.0.1 §16 p.80), strip the prefix and surface it in the
 ///    `timestamp` field. A 7-byte HMS or DHM-local prefix is *not* a
 ///    valid status timestamp and is left as status text.
@@ -120,7 +120,7 @@ pub fn parse_aprs_status(info: &[u8]) -> Result<AprsStatus, AprsError> {
         {
             let grid = grid_candidate.to_owned();
             // The symbol-table is implicit `/` (primary) per APRS 1.0.1
-            // p.81 example "IO91SX/G" — the `/` here is the table marker
+            // p.81 example "IO91SX/G": the `/` here is the table marker
             // and `G` is the code.
             let symbol_table = '/';
             let symbol_code = sym_byte as char;
@@ -390,7 +390,7 @@ mod tests {
     fn validate_grid_locator_accepts_mixed_case() {
         // Real-world traffic mixes cases; accept both for both halves
         // of the locator. Sub-square stays bounded at A..X (case-folded
-        // to a..x) — Y and Z are spec-disallowed in either case.
+        // to a..x); Y and Z are spec-disallowed in either case.
         assert!(is_valid_grid_locator("aa00"), "lowercase field");
         assert!(is_valid_grid_locator("AA00XX"), "uppercase sub-square at X");
         assert!(is_valid_grid_locator("Aa00bX"), "mixed case");

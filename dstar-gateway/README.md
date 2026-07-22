@@ -116,7 +116,7 @@ versions of each.
 |---------|-------|-------|
 | `DPlus` client (REF, TCP auth) | Implemented | `AuthClient` + `Session<DPlus, _>` |
 | `DExtra` client (XRF, XLX) | Implemented | `Session<DExtra, _>` |
-| `DCS` client | Implemented | `Session<Dcs, _>` — header caching handled by core |
+| `DCS` client | Implemented | `Session<Dcs, _>`; header caching handled by core |
 | `DExtra` reflector server | Implemented | `dstar-gateway-server::Reflector`, on by default |
 | `DPlus` reflector server | Implemented | `handle_inbound_dplus` endpoint, on by default |
 | `DCS` reflector server | Implemented | `handle_inbound_dcs` endpoint, on by default |
@@ -134,26 +134,26 @@ versions of each.
 dstar-gateway = { path = "../dstar-gateway", features = ["hosts-fetcher"] }
 ```
 
-- `blocking` — compile a caller-driven synchronous shell backed by
+- `blocking`: compile a caller-driven synchronous shell backed by
   `std::net::UdpSocket`. Callers do not run a Tokio runtime, although
   Tokio remains an unconditional dependency of this async client crate.
-- `hosts-fetcher` — pulls `reqwest`; fetches the XLX reflector
+- `hosts-fetcher`: pulls `reqwest`; fetches the XLX reflector
   directory from `http://xlxapi.rlx.lu/api.php?do=GetReflectorHostname`
   via `HostsFetcher::fetch_xlx_directory`, returning protocol-tagged
   host entries.
-- `examples-network` — compile examples that contact live network services.
-- `hardware-tests` — compile ignored live-reflector integration tests.
+- `examples-network`: compile examples that contact live network services.
+- `hardware-tests`: compile ignored live-reflector integration tests.
   These last two flags are for examples/tests rather than downstream APIs.
 
 ## Documentation
 
 - [API reference](https://swiftraccoon.github.io/kenwood/dstar_gateway/)
-- [`book/`](book/) — mdBook source; currently covers the introduction and Getting Started. Build with `mdbook serve book`
-- [ARCHITECTURE.md](ARCHITECTURE.md) — 5000-foot design overview
-- [REFERENCES.md](REFERENCES.md) — line-numbered references into
+- [`book/`](book/): mdBook source; currently covers the introduction and Getting Started. Build with `mdbook serve book`
+- [ARCHITECTURE.md](ARCHITECTURE.md): 5000-foot design overview
+- [REFERENCES.md](REFERENCES.md): line-numbered references into
   `ircDDBGateway` and `xlxd`
-- [CHANGELOG.md](CHANGELOG.md) — per-release notes
-- `adr/` — architectural decision records
+- [CHANGELOG.md](CHANGELOG.md): per-release notes
+- `adr/`: architectural decision records
 
 ## License
 

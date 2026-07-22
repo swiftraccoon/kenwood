@@ -8,8 +8,8 @@
 //! `[f0, L, sa[56], v_uv[56], mask[56]]`, one row per 20 ms frame.
 //! Sequence gaps are filled with the extractor's concealment
 //! parameters so the row grid stays uniform, and out-of-alphabet
-//! seq bytes (corrupted frames) never drive the gap math — the same
-//! guards the capture core applies.
+//! seq bytes (corrupted frames) never drive the gap math, matching
+//! the guards the capture core applies.
 
 use std::path::Path;
 
@@ -161,7 +161,7 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    /// The D-STAR AMBE silence frame — a valid DVSI voice frame.
+    /// The D-STAR AMBE silence frame, a valid DVSI voice frame.
     const SILENCE: [u8; 9] = [0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8];
 
     fn recording(frames: Vec<FrameRecord>) -> Option<CompletedRecording> {

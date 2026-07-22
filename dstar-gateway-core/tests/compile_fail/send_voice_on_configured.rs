@@ -1,5 +1,5 @@
 //! Calling `send_voice` on a `Session<_, Configured>` must be a
-//! compile error — voice TX is only available in the `Connected`
+//! compile error; voice TX is only available in the `Connected`
 //! state.
 //!
 //! `send_voice` is only implemented on `Session<P, Connected>`. The
@@ -21,7 +21,7 @@ fn main() {
         .build();
 
     // ERROR: no method named `send_voice` found for
-    // `Session<DExtra, Configured>` — `send_voice` is only
+    // `Session<DExtra, Configured>`; `send_voice` is only
     // implemented on `Session<P, Connected>`.
     let frame = VoiceFrame::silence();
     let _ = session.send_voice(

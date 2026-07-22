@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum KissError {
-    /// Fewer than two bytes — too short to hold even the start and end
+    /// Fewer than two bytes: too short to hold even the start and end
     /// FEND delimiters.
     #[error("KISS frame too short")]
     FrameTooShort,
@@ -36,7 +36,7 @@ pub enum KissError {
     /// it should have been stuffed as `FESC TFEND`.
     #[error("unexpected FEND inside KISS frame body")]
     UnexpectedFrameDelimiter,
-    /// A frame — or a run of bytes with no usable delimiter — exceeded
+    /// A frame (or a run of bytes with no usable delimiter) exceeded
     /// the streaming decoder's configured maximum length and was
     /// discarded to bound memory use.
     #[error("KISS frame exceeds maximum length")]

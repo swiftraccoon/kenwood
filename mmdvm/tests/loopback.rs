@@ -69,7 +69,7 @@ where
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    // Bad frame — resync one byte.
+                    // Bad frame: resync one byte.
                     if buf.is_empty() {
                         break;
                     }
@@ -93,7 +93,7 @@ async fn spawn_issues_initial_version_and_status_probes() -> TestResult {
     let (client_side, mut modem_side) = duplex_pair();
     let _modem = AsyncModem::spawn(client_side);
 
-    // Advance time so interval_at/interval clocks wake up — otherwise
+    // Advance time so interval_at/interval clocks wake up; otherwise
     // the paused clock means nothing elapses. The initial probes are
     // emitted before any timer fires, but we still need to yield.
     tokio::time::advance(Duration::from_millis(10)).await;
@@ -184,12 +184,12 @@ async fn send_dstar_header_writes_after_space_reported() -> TestResult {
         "expected GetVersion"
     );
 
-    // Enqueue a header BEFORE sending any status reply — the loop has
+    // Enqueue a header BEFORE sending any status reply: the loop has
     // no space info yet (dstar_space = 0), so the header must sit in
     // the queue.
     modem.send_dstar_header([0u8; 41]).await?;
 
-    // Advance playout tick a few times — loop should NOT write the
+    // Advance playout tick a few times; the loop should NOT write the
     // header yet because space is 0.
     for _ in 0..5 {
         tokio::time::advance(Duration::from_millis(11)).await;
@@ -293,7 +293,7 @@ async fn frame_fragmented_byte_at_a_time_reassembles() -> TestResult {
         collect_frames_until(&mut modem_side, |_| None::<()>, Duration::from_millis(100)).await;
 
     // Serial and Bluetooth SPP transports routinely deliver a frame
-    // in arbitrary fragments — feed a D-STAR data frame one byte at
+    // in arbitrary fragments; feed a D-STAR data frame one byte at
     // a time.
     let wire = encode_frame(&MmdvmFrame::with_payload(
         mmdvm_core::MMDVM_DSTAR_DATA,
@@ -378,7 +378,7 @@ async fn v1_handshake_selects_v1_status_offsets() -> TestResult {
     .await?;
 
     // v1 status layout: [unused, mode(1), state(2), dstar(3),
-    // dmr1(4), dmr2(5), ysf(6)] — mode DStar, CD set, dstar=12.
+    // dmr1(4), dmr2(5), ysf(6)]; mode DStar, CD set, dstar=12.
     // Misparsed as v2 this would read mode=Idle from payload[0] and
     // reject the 7-byte payload as too short.
     modem_write(
@@ -503,8 +503,8 @@ async fn extended_length_frame_decodes_through_the_loop() -> TestResult {
     // Extended frame as the firmware sends for FM audio >252 B:
     // [0xE0, 0x00, len2, cmd, payload...], total = len2 + 255.
     // len2=45 → total 300 → 296 payload bytes. FM data is not a
-    // modeled mode, so it must surface as UnhandledResponse intact —
-    // NOT get shredded by the resync path.
+    // modeled mode, so it must surface as UnhandledResponse intact,
+    // NOT shredded by the resync path.
     let total = 255 + 45;
     let mut wire = vec![0xE0, 0x00, 45, mmdvm_core::MMDVM_FM_DATA];
     wire.resize(total, 0x5A);
@@ -627,7 +627,7 @@ async fn set_mode_times_out_on_silent_modem() -> TestResult {
 /// An ACK correlated to a DIFFERENT command must not resolve a
 /// pending `set_mode`: a stray ACK (raw command, firmware quirk)
 /// would otherwise report success while the mode never changed. The
-/// wrong-command ACK is delivered, then the modem stays silent —
+/// wrong-command ACK is delivered, then the modem stays silent;
 /// `set_mode` must still end in `ResponseTimeout`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn set_mode_ignores_ack_for_a_different_command() -> TestResult {
@@ -751,8 +751,8 @@ impl tokio::io::AsyncWrite for WedgedWriteTransport {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn wedged_transport_write_times_out_with_fatal_event() -> TestResult {
     // The very first handshake write wedges. Without a write
-    // deadline the loop freezes forever — no reads, no commands, no
-    // shutdown — and the consumer waits on next_event() for eternity.
+    // deadline the loop freezes forever (no reads, no commands, no
+    // shutdown) and the consumer waits on next_event() for eternity.
     let mut modem = AsyncModem::spawn(WedgedWriteTransport);
 
     let mut fatal_message = None;
@@ -806,7 +806,7 @@ async fn queued_frames_dropped_on_eof_surface_tx_dropped() -> TestResult {
     modem.send_dstar_data([1u8; 12]).await?;
     modem.send_dstar_data([2u8; 12]).await?;
 
-    // EOF the transport — the loop exits with the queue non-empty.
+    // EOF the transport: the loop exits with the queue non-empty.
     drop(modem_side);
 
     let mut dropped = None;
@@ -889,7 +889,7 @@ async fn full_event_channel_does_not_block_loop() -> TestResult {
         collect_frames_until(&mut modem_side, |_| None::<()>, Duration::from_millis(100)).await;
 
     // Flood the loop with 300 inbound EOT frames without consuming a
-    // single event — more than the event channel can hold. A loop
+    // single event, more than the event channel can hold. A loop
     // that blocks on event delivery wedges here and can never process
     // another command (the deadlock: consumer waits on the loop, the
     // loop waits on the consumer).
@@ -928,7 +928,7 @@ async fn malformed_bytes_are_swallowed() -> TestResult {
     )
     .await;
 
-    // Write garbage bytes — invalid start byte, invalid length, etc.
+    // Write garbage bytes: invalid start byte, invalid length, etc.
     modem_side
         .write_all(&[0x13, 0x37, 0xDE, 0xAD, 0xBE, 0xEF])
         .await?;

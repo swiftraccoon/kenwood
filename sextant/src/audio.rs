@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Audio I/O — mic capture / speaker playback / AMBE codec plumbing.
+//! Audio I/O: mic capture / speaker playback / AMBE codec plumbing.
 //!
 //! Runs on a dedicated `std::thread` so the tokio runtime never owns
 //! a `cpal::Stream` (streams are `!Send` on some platforms). The
@@ -11,7 +11,7 @@
 //!
 //! - RX: pull incoming [`VoiceFrame`]s from the command channel,
 //!   decode to 160-sample PCM, route through the two-tail
-//!   raw/enhanced selector ([`RxTailRouter`] — the operator's
+//!   raw/enhanced selector ([`RxTailRouter`]; the operator's
 //!   "Enhance RX audio" toggle picks which tail feeds playback),
 //!   sinc-resample to HW rate, push to the speaker ringbuffer which
 //!   the cpal output callback drains.
@@ -21,7 +21,7 @@
 //!   session command channel via [`SessionCommand::TxFrame`].
 //!
 //! Sample-rate conversion uses `rubato`'s windowed-sinc resampler,
-//! which bandlimits as it resamples — no separate anti-alias filter
+//! which bandlimits as it resamples; no separate anti-alias filter
 //! is needed. The input / output devices and the recording /
 //! playback paths are all driven from here.
 
@@ -77,7 +77,7 @@ const RX_FADE_SAMPLES: usize = 80;
 /// and RX frames to the audio worker thread.
 ///
 /// Cloneable so the session task can route RX voice frames directly
-/// to the worker — bypassing the egui redraw cadence, which would
+/// to the worker, bypassing the egui redraw cadence, which would
 /// otherwise add ~50 ms of jitter to every frame and cause the 50 fps
 /// audio to arrive in bursts that underflow the speaker ring buffer.
 #[derive(Debug, Clone)]
@@ -89,7 +89,7 @@ pub(crate) struct AudioHandle {
 /// Commands emitted by the GUI and consumed by the audio worker.
 #[derive(Debug)]
 pub(crate) enum AudioCommand {
-    /// Begin mic capture — worker also wires a `StartTx` through the
+    /// Begin mic capture; the worker also wires a `StartTx` through the
     /// session command channel so the session task emits the header
     /// before the first voice frame arrives.
     StartTx {
@@ -99,17 +99,17 @@ pub(crate) enum AudioCommand {
     /// Stop mic capture and tell the session task to emit EOT.
     StopTx,
     /// A new RX voice stream is starting. The audio worker resets the
-    /// [`AmbeDecoder`] — one decoder per voice stream — so stale
+    /// [`AmbeDecoder`] (one decoder per voice stream) so stale
     /// synthesiser state from the prior stream doesn't leak into the
     /// first frames of the new one.
     RxStart,
-    /// One voice frame arrived from the reflector — decode + play.
+    /// One voice frame arrived from the reflector: decode + play.
     RxFrame(VoiceFrame),
-    /// A voice frame was lost upstream (UDP sequence gap) —
+    /// A voice frame was lost upstream (UDP sequence gap);
     /// synthesize one concealment frame so the hole plays as a
     /// parameter-repeat instead of a 20 ms silence gap.
     RxLost,
-    /// The RX stream ended (EOT, inactivity, or link loss) — fade
+    /// The RX stream ended (EOT, inactivity, or link loss): fade
     /// out and flush the held-back tail frame, then reset playback
     /// state for the next stream.
     RxEnd,
@@ -189,11 +189,11 @@ enum FadeDirection {
 fn apply_fade(pcm: &mut [i16; AMBE_FRAME_SAMPLES], direction: FadeDirection) {
     #[expect(
         clippy::cast_precision_loss,
-        reason = "RX_FADE_SAMPLES is 80 — exact in f32"
+        reason = "RX_FADE_SAMPLES is 80, exact in f32"
     )]
     let ramp_len = RX_FADE_SAMPLES as f32;
     for i in 0..RX_FADE_SAMPLES {
-        #[expect(clippy::cast_precision_loss, reason = "i < 80 — exact in f32")]
+        #[expect(clippy::cast_precision_loss, reason = "i < 80, exact in f32")]
         let rising = 0.5 * (1.0 - (std::f32::consts::PI * i as f32 / ramp_len).cos());
         let (idx, gain) = match direction {
             FadeDirection::In => (i, rising),
@@ -216,7 +216,7 @@ fn apply_fade(pcm: &mut [i16; AMBE_FRAME_SAMPLES], direction: FadeDirection) {
 /// The most recent decoded frame waits here and is released only
 /// when its successor arrives, so end-of-stream can fade the final
 /// frame's tail before it reaches the speaker. Costs one frame
-/// (20 ms) of RX latency — inaudible for reflector listening.
+/// (20 ms) of RX latency, inaudible for reflector listening.
 #[derive(Debug, Default)]
 struct RxPlayback {
     /// Held-back most recent frame (8 kHz, pre-resample).
@@ -227,7 +227,7 @@ struct RxPlayback {
 
 impl RxPlayback {
     /// Reset for a new stream, discarding any unflushed holdback
-    /// (the previous stream ended without EOT — its tail is stale).
+    /// (the previous stream ended without EOT; its tail is stale).
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -261,16 +261,16 @@ impl RxPlayback {
 /// [`apply_fade`] uses. Sample 0 is entirely `prev` (continuous with
 /// the last frame the previous source served); samples past the ramp
 /// are entirely `frame` (full blend-in). Both frames cover the same
-/// output-timeline positions — the router's tails are aligned — so
+/// output-timeline positions (the router's tails are aligned), so
 /// this is a source blend, not a time blend.
 fn crossfade_frame(frame: &mut [i16; AMBE_FRAME_SAMPLES], prev: &[i16; AMBE_FRAME_SAMPLES]) {
     #[expect(
         clippy::cast_precision_loss,
-        reason = "RX_FADE_SAMPLES is 80 — exact in f32"
+        reason = "RX_FADE_SAMPLES is 80, exact in f32"
     )]
     let ramp_len = RX_FADE_SAMPLES as f32;
     for i in 0..RX_FADE_SAMPLES {
-        #[expect(clippy::cast_precision_loss, reason = "i < 80 — exact in f32")]
+        #[expect(clippy::cast_precision_loss, reason = "i < 80, exact in f32")]
         let rising = 0.5 * (1.0 - (std::f32::consts::PI * i as f32 / ramp_len).cos());
         let (Some(slot), Some(&p)) = (frame.get_mut(i), prev.get(i)) else {
             continue;
@@ -303,7 +303,7 @@ fn rx_sample_to_i16(v: f32) -> i16 {
     s
 }
 
-/// Streaming enhancement engine the RX router feeds — abstracted
+/// Streaming enhancement engine the RX router feeds, abstracted
 /// from [`LiveWaveStream`] so the router's alignment logic is
 /// unit-testable without the embedded model weights.
 trait EnhanceStream {
@@ -351,7 +351,7 @@ fn take_frame(tail: &mut VecDeque<i16>) -> Option<[i16; AMBE_FRAME_SAMPLES]> {
 /// live-enhanced counterpart, kept on the same output timeline.
 ///
 /// Every decoded (or concealed) frame is appended to the raw tail
-/// and — while a live stream is installed — pushed through the
+/// and, while a live stream is installed, pushed through the
 /// enhancer, whose ready samples land in the enhanced tail. Both
 /// tails start at the same origin and are consumed in lockstep:
 /// serving one 160-sample frame from the selected tail discards the
@@ -375,15 +375,15 @@ struct RxTailRouter<S> {
     /// Enhanced-timeline positions consumed ahead of production
     /// (grace frames served from raw while a freshly installed
     /// stream was still short of the consume point). Newly produced
-    /// enhanced samples repay this debt — discarded, having already
-    /// played as raw — before landing in the tail.
+    /// enhanced samples repay this debt (discarded, having already
+    /// played as raw) before landing in the tail.
     enhanced_debt: usize,
     /// Live enhancement session, `Some` while enhancement is active
     /// on the current stream.
     stream: Option<S>,
     /// Serve from the enhanced tail when it can supply a full frame.
     /// Stays `true` after [`Self::finish_stream`] so the flushed
-    /// enhanced tail — not raw — drains through end-of-stream.
+    /// enhanced tail, not raw, drains through end-of-stream.
     enhance_selected: bool,
     /// Source of the most recently served frame; a change triggers
     /// the crossfade splice.
@@ -398,7 +398,7 @@ struct RxTailRouter<S> {
     /// keeps the speaker fed) instead of drifting the timelines
     /// permanently apart.
     grace_available: bool,
-    /// True once any frame has been served this stream — arms the
+    /// True once any frame has been served this stream; arms the
     /// mid-stream grace on toggle-on. A stream-start selection needs
     /// no grace: the priming compensation covers the enhancer fill.
     served_any: bool,
@@ -562,7 +562,7 @@ impl<S: EnhanceStream> RxTailRouter<S> {
             }
             // A freshly toggled-on stream still short of the consume
             // point: serve one raw frame rather than stall the
-            // holdback, then hold until the stream catches up — the
+            // holdback, then hold until the stream catches up; the
             // playout reserve keeps the speaker fed meanwhile.
             if self.grace_available && self.raw.len() >= AMBE_FRAME_SAMPLES {
                 self.grace_available = false;
@@ -579,7 +579,7 @@ impl<S: EnhanceStream> RxTailRouter<S> {
 /// Holds the scrambled 3-byte fragments for the operator's current
 /// text message and/or GPS beacon. `pump_tx` pulls one fragment per
 /// non-sync superframe slot, cycling so the message + position repeat
-/// for the duration of the transmission — the cadence a receiving
+/// for the duration of the transmission, the cadence a receiving
 /// station expects.
 #[derive(Debug, Default)]
 struct TxSlowData {
@@ -618,7 +618,7 @@ impl TxSlowData {
 /// Fragment a DPRS sentence for `pos` into scrambled `0x3X` slow-data
 /// blocks (Kenwood layout: type byte + 5 payload bytes per 6-byte
 /// block, two 3-byte halves). Returns an empty vec if the position or
-/// callsign can't be encoded — lenient, never panics.
+/// callsign can't be encoded: lenient, never panics.
 fn encode_gps_fragments(pos: &TxPosition, my_call: &str) -> Vec<[u8; 3]> {
     let Ok(callsign) = Callsign::try_from_str(my_call) else {
         return Vec::new();
@@ -644,7 +644,7 @@ fn encode_gps_fragments(pos: &TxPosition, my_call: &str) -> Vec<[u8; 3]> {
     if encode_dprs(&report, &mut sentence).is_err() {
         return Vec::new();
     }
-    // DPRS sentences terminate with CR — the RX assembler scans for it.
+    // DPRS sentences terminate with CR; the RX assembler scans for it.
     sentence.push('\r');
 
     let mut out = Vec::new();
@@ -704,7 +704,7 @@ fn run_audio_worker(
     session_tx: tokio_mpsc::Sender<SessionCommand>,
     status_tx: std_mpsc::Sender<AudioStatus>,
 ) {
-    // Init failure is no longer fatal — the worker keeps running with
+    // Init failure is no longer fatal: the worker keeps running with
     // no device so the operator can pick a working one from the audio
     // panel. The error is still surfaced to the GUI.
     let audio = match AudioIo::init() {
@@ -719,10 +719,10 @@ fn run_audio_worker(
             Some(a)
         }
         Err(e) => {
-            error!(error = %e, "audio init failed — TX/RX disabled until a device is selected");
+            error!(error = %e, "audio init failed; TX/RX disabled until a device is selected");
             // Surface to the GUI via the session task so the user sees
             // a real error banner. `try_send` because the session task
-            // may not yet be polling — the bounded channel queues it.
+            // may not yet be polling; the bounded channel queues it.
             if let Err(send_err) = session_tx.try_send(SessionCommand::AudioInitError(e)) {
                 error!(error = %send_err, "could not surface audio init error to GUI");
             }
@@ -730,7 +730,7 @@ fn run_audio_worker(
         }
     };
 
-    // Parse the live RX-enhancement model once — cheap, and the
+    // Parse the live RX-enhancement model once: cheap, and the
     // enhancer is stateless between streams (each stream gets its own
     // `LiveWaveStream`). Failure is non-fatal: the toggle warns and
     // RX audio stays raw.
@@ -739,7 +739,7 @@ fn run_audio_worker(
         Err(e) => {
             warn!(
                 error = %e,
-                "live RX enhancer unavailable — \"Enhance RX audio\" will keep audio raw"
+                "live RX enhancer unavailable; \"Enhance RX audio\" will keep audio raw"
             );
             None
         }
@@ -843,7 +843,7 @@ struct AudioWorker {
     /// Two-tail raw/enhanced RX router feeding the holdback.
     rx_router: RxTailRouter<LiveWaveStream>,
     /// Parsed live-enhancement model, built once at worker start.
-    /// `None` when the embedded weights failed to parse — the
+    /// `None` when the embedded weights failed to parse; the
     /// enhancement toggle then warns and audio stays raw.
     rx_enhancer: Option<LiveWaveEnhancer>,
     /// Operator's "Enhance RX audio" toggle, mirrored from the GUI.
@@ -857,7 +857,7 @@ struct AudioWorker {
     /// selected at stream start, [`RX_PRIME_FRAMES`] otherwise (raw
     /// timing is untouched).
     rx_prime_target: usize,
-    /// True once priming has flushed — frames then push straight
+    /// True once priming has flushed; frames then push straight
     /// through to the speaker.
     rx_primed: bool,
 }
@@ -963,7 +963,7 @@ impl AudioWorker {
                 // boundary; without sync at the right cadence the radio
                 // gets the header but never enters audio decode.
                 self.tx_superframe_idx = 0;
-                // Match the constructor in `start_audio_worker` —
+                // Match the constructor in `start_audio_worker`:
                 // lookahead encoder for OP25-parity voice quality.
                 self.encoder = AmbeEncoder::new_with_lookahead();
                 // Remember the callsign for the DPRS slow-data sentence.
@@ -973,7 +973,7 @@ impl AudioWorker {
                 }) {
                     warn!(error = %e, "session StartTx enqueue failed");
                 }
-                tracing::info!(my_call, "TX path enabled — mic capture active");
+                tracing::info!(my_call, "TX path enabled; mic capture active");
             }
             AudioCommand::SetSlowData { text, gps } => {
                 self.tx_slow_data
@@ -994,7 +994,7 @@ impl AudioWorker {
             AudioCommand::TransmitFile { path } => self.transmit_file(&path),
             AudioCommand::StopTx => self.stop_tx_capture(),
             AudioCommand::RxStart => {
-                tracing::info!("RX stream starting — decoder + playback reset");
+                tracing::info!("RX stream starting; decoder + playback reset");
                 self.decoder = AmbeDecoder::new();
                 self.rx_playback.reset();
                 self.rx_prime.clear();
@@ -1046,7 +1046,7 @@ impl AudioWorker {
         if enable {
             let Some(enhancer) = self.rx_enhancer.as_ref() else {
                 warn!(
-                    "RX enhancement unavailable (model failed to parse at startup) — \
+                    "RX enhancement unavailable (model failed to parse at startup); \
                      audio stays raw"
                 );
                 return;
@@ -1057,7 +1057,7 @@ impl AudioWorker {
         }
         tracing::info!(enabled = enable, "RX enhancement toggled");
         // A toggle-off releases the raw backlog that had been riding
-        // inside the enhancer's lookahead — serve it immediately so
+        // inside the enhancer's lookahead; serve it immediately so
         // the speaker reserve refills without waiting for the next
         // arrival.
         self.drain_rx_router();
@@ -1083,8 +1083,8 @@ impl AudioWorker {
     }
 
     /// Stream end: flush the enhancer's residual lookahead and drain
-    /// both router tails fully — total played samples are identical
-    /// in raw and enhanced modes — then flush the faded holdback
+    /// both router tails fully (total played samples are identical
+    /// in raw and enhanced modes), then flush the faded holdback
     /// tail and any un-flushed priming buffer (streams shorter than
     /// the priming depth), then reset.
     fn finish_rx_stream(&mut self) {
@@ -1108,7 +1108,7 @@ impl AudioWorker {
     /// meter, resample, then prime-or-push to the speaker.
     fn emit_rx_frame(&mut self, pcm_i16: &[i16; AMBE_FRAME_SAMPLES]) {
         // While recording, tee the decoded 8 kHz PCM straight
-        // to the WAV (the codec's native rate — no resampling).
+        // to the WAV (the codec's native rate, no resampling).
         if let Some(writer) = self.recorder.as_mut() {
             for &s in pcm_i16 {
                 let _unused = writer.write_sample(s);
@@ -1163,7 +1163,7 @@ impl AudioWorker {
     /// Rebuild audio I/O on the named devices, surfacing any failure
     /// to the GUI. Tears the old streams down first.
     fn select_devices(&mut self, input: Option<&str>, output: Option<&str>) {
-        // Some hosts allow only one stream per device — drop the old
+        // Some hosts allow only one stream per device; drop the old
         // `AudioIo` before opening the new one.
         self.audio = None;
         match AudioIo::init_with(input, output) {
@@ -1218,19 +1218,19 @@ impl AudioWorker {
             f64::from(stats.silent_frames) / f64::from(stats.frames)
         };
         let diagnosis = if stats.peak_max < 0.001 {
-            "MIC LIKELY DENIED — peak never exceeded -60 dBFS; \
+            "MIC LIKELY DENIED: peak never exceeded -60 dBFS; \
              cpal is receiving zeros. macOS permission not granted. \
              Run via `open target/Sextant.app` (rebuild the bundle first)."
         } else if stats.peak_max < 0.02 {
-            "MIC VERY QUIET — peak never exceeded -34 dBFS. Either \
+            "MIC VERY QUIET: peak never exceeded -34 dBFS. Either \
              the mic is muted, the input device is wrong, or the \
              gain is set very low. The AMBE encoder will treat \
              this as silence."
         } else if silence_ratio > 0.7 {
-            "MIC MOSTLY SILENT — <30% of frames had usable audio. \
+            "MIC MOSTLY SILENT: <30% of frames had usable audio. \
              Speak louder/closer to the mic."
         } else {
-            "MIC OK — producing signal above the floor-noise threshold."
+            "MIC OK: producing signal above the floor-noise threshold."
         };
         tracing::info!(
             frames = stats.frames,
@@ -1243,7 +1243,7 @@ impl AudioWorker {
         if let Err(e) = self.session_tx.try_send(SessionCommand::EndTx) {
             warn!(error = %e, "session EndTx enqueue failed");
         }
-        tracing::info!("TX path disabled — mic capture stopped");
+        tracing::info!("TX path disabled; mic capture stopped");
     }
 
     /// Play a WAV file to the speakers locally (not transmitted).
@@ -1266,7 +1266,7 @@ impl AudioWorker {
     /// Refused while a live-mic TX is already active.
     fn transmit_file(&mut self, path: &std::path::Path) {
         if self.tx_active {
-            warn!("transmit-from-file ignored — already transmitting");
+            warn!("transmit-from-file ignored: already transmitting");
             return;
         }
         let samples = match load_wav_resampled(path, AMBE_SAMPLE_RATE) {
@@ -1298,7 +1298,7 @@ impl AudioWorker {
             .as_mut()
             .map_or_else(Vec::new, |f| f.by_ref().take(AMBE_FRAME_SAMPLES).collect());
         if chunk.is_empty() {
-            // File exhausted — end the outgoing stream.
+            // File exhausted; end the outgoing stream.
             self.tx_file = None;
             self.tx_active = false;
             if let Err(e) = self.session_tx.try_send(SessionCommand::EndTx) {
@@ -1318,7 +1318,7 @@ impl AudioWorker {
         if !audio.pop_mic(hw_per_frame, &mut self.mic_scratch) {
             return None;
         }
-        // Raw HW-rate mic peak — feeds the mic-health verdict.
+        // Raw HW-rate mic peak, feeding the mic-health verdict.
         let mic_peak = self
             .mic_scratch
             .iter()
@@ -1383,7 +1383,7 @@ impl AudioWorker {
 }
 
 /// Owns the cpal streams and ringbufs. One input (mic) + one output
-/// (speaker). Mono samples on both ends — stereo HW is folded to
+/// (speaker). Mono samples on both ends; stereo HW is folded to
 /// mono in the callbacks.
 struct AudioIo {
     _input_stream: cpal::Stream,
@@ -1421,7 +1421,7 @@ fn resample_buffer(samples: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
 
 /// Read a WAV file as mono `f32` resampled to `target_rate`.
 ///
-/// 16-bit PCM only — samples that don't decode as `i16` are dropped
+/// 16-bit PCM only; samples that don't decode as `i16` are dropped
 /// (a non-16-bit file therefore plays as silence rather than an
 /// error). Multi-channel input is folded to mono.
 fn load_wav_resampled(path: &std::path::Path, target_rate: u32) -> Result<Vec<f32>, String> {
@@ -1526,7 +1526,7 @@ impl AudioIo {
         let input_rate = input_cfg.sample_rate().0;
         let output_rate = output_cfg.sample_rate().0;
 
-        // ~1 s of buffer at HW rate — plenty of headroom for GC /
+        // ~1 s of buffer at HW rate: plenty of headroom for GC /
         // scheduler hiccups without burning memory.
         let mic_cap = input_rate as usize;
         let speaker_cap = output_rate as usize;
@@ -1591,7 +1591,7 @@ impl AudioIo {
     fn push_speaker(&mut self, samples: &[f32]) {
         for &s in samples {
             if self.speaker_tx.try_push(s).is_err() {
-                // Speaker ringbuf full — drop the rest. Implies
+                // Speaker ringbuf full: drop the rest. Implies
                 // output is back-pressuring (shouldn't happen with
                 // 1s of buffer unless the speaker stream stalled).
                 return;
@@ -1604,7 +1604,7 @@ impl AudioIo {
 ///
 /// `SincFixedIn` consumes a fixed input chunk and bandlimits with its
 /// own windowed-sinc filter, so it both resamples and anti-aliases in
-/// one step — replacing the previous hand-rolled linear-interpolation
+/// one step, replacing the previous hand-rolled linear-interpolation
 /// and FIR cascade. Both sextant directions resample fixed-size
 /// frames (160 samples at 8 kHz on RX, one HW-rate frame on TX),
 /// which is exactly the fixed-input contract `SincFixedIn` wants.
@@ -1747,7 +1747,7 @@ fn build_output_stream(
                         #[expect(
                             clippy::cast_possible_truncation,
                             reason = "s is clamped to -1.0..=1.0 then multiplied by \
-                                      32767.0, yielding -32767.0..=32767.0 — all \
+                                      32767.0, yielding -32767.0..=32767.0, all \
                                       representable in i16 with no truncation."
                         )]
                         let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
@@ -1770,7 +1770,7 @@ fn build_output_stream(
                             clippy::cast_possible_truncation,
                             clippy::cast_sign_loss,
                             reason = "s is clamped to -1.0..=1.0, so (s + 1.0) is \
-                                      0.0..=2.0, times 32767.5 is 0.0..=65535.0 — \
+                                      0.0..=2.0, times 32767.5 is 0.0..=65535.0, \
                                       non-negative and fits in u16 with no truncation."
                         )]
                         let v = ((s.clamp(-1.0, 1.0) + 1.0) * 32767.5) as u16;
@@ -1824,7 +1824,7 @@ mod tests {
     /// resampled 48 kHz → 8 kHz must not produce 1500 Hz content
     /// (6500 folds to 8000 − 6500 = 1500 without an anti-alias
     /// filter). rubato's windowed-sinc kernel bandlimits before
-    /// downsampling — this guards the property the old hand-rolled
+    /// downsampling. This guards the property the old hand-rolled
     /// FIR provided; losing it brings sextant↔sextant "garble noise"
     /// back.
     #[test]
@@ -1868,7 +1868,7 @@ mod tests {
         let alias_mag = re.hypot(im) / n_down;
         assert!(
             alias_mag < 0.05,
-            "1500 Hz alias amplitude {alias_mag:.4} exceeds 0.05 — the \
+            "1500 Hz alias amplitude {alias_mag:.4} exceeds 0.05: the \
              resampler is leaking high-frequency content into the speech \
              band (sextant↔sextant garble noise)."
         );
@@ -1877,7 +1877,7 @@ mod tests {
 
     /// Full sextant↔sextant simulation: generate a voice-like signal,
     /// resample 48 → 8 kHz (TX), AMBE-encode, AMBE-decode, resample
-    /// 8 → 48 kHz (RX), and verify the output is audible — not the
+    /// 8 → 48 kHz (RX), and verify the output is audible, not the
     /// "garble noise" / "no voice" symptom. If this passes, the codec
     /// and resampler pipeline is internally consistent; any remaining
     /// sextant↔sextant failure is in cpal I/O, the network, or
@@ -1947,7 +1947,7 @@ mod tests {
             hw_output.extend(rx_rs.process(&norm));
         }
 
-        // 4. Skip warmup — encoder, decoder, and both resamplers take
+        // 4. Skip warmup: encoder, decoder, and both resamplers take
         //    a few frames to converge.
         let warmup = 8 * frame_hw;
         let body = hw_output.get(warmup..).unwrap_or(&[]);
@@ -1964,11 +1964,11 @@ mod tests {
         let peak = body.iter().map(|&v| v.abs()).fold(0.0_f32, f32::max);
         assert!(
             rms > 0.02,
-            "decoded RMS {rms:.4} below 0.02 — pipeline producing near-silent output."
+            "decoded RMS {rms:.4} below 0.02: pipeline producing near-silent output."
         );
         assert!(
             peak > 0.05,
-            "decoded peak {peak:.4} below 0.05 — pipeline producing near-silent output."
+            "decoded peak {peak:.4} below 0.05: pipeline producing near-silent output."
         );
         Ok(())
     }
@@ -1980,7 +1980,7 @@ mod tests {
         let mut sched = super::TxSlowData::default();
         sched.set(Some("CQ TEST"), None, "W1AW");
         // `encode_text_message` yields exactly 8 fragments for non-empty
-        // text — pull them and feed the RX collector at seq 1..=8.
+        // text; pull them and feed the RX collector at seq 1..=8.
         let mut collector = SlowDataTextCollector::new();
         for seq in 1u8..=8 {
             let Some(frag) = sched.next_fragment() else {
@@ -2197,8 +2197,8 @@ mod tests {
     /// Enhanced-from-start: the router holds while the stream sits
     /// below its release floor (that fill is the priming
     /// compensation's headroom), then serves the enhanced form of
-    /// frame 1 — un-blended, since a stream's first served frame is
-    /// no source flip — with the raw tail consumed in lockstep.
+    /// frame 1 (un-blended, since a stream's first served frame is
+    /// no source flip), with the raw tail consumed in lockstep.
     #[test]
     fn router_enhanced_from_start_holds_then_serves_aligned_enhanced() -> TestResult {
         let mut router = RxTailRouter::new();
@@ -2207,13 +2207,13 @@ mod tests {
             router.push_frame(&frame_of(v));
             assert!(
                 router.next_frame().is_none(),
-                "arrival {i}: enhancer below its release floor — router holds"
+                "arrival {i}: enhancer below its release floor; router holds"
             );
         }
         router.push_frame(&frame_of(4000));
         let first = router
             .next_frame()
-            .ok_or("floor met — enhanced frame ready")?;
+            .ok_or("floor met, enhanced frame ready")?;
         assert!(
             first.iter().all(|&s| s == -1000),
             "served frame is enhanced frame 1, with no crossfade applied"
@@ -2244,7 +2244,7 @@ mod tests {
             let served = router.next_frame().ok_or("raw serve")?;
             assert!(served.iter().all(|&s| s == v));
         }
-        // Queue four frames without draining — the backlog a toggle
+        // Queue four frames without draining: the backlog a toggle
         // can inherit when arrivals outpace consumption.
         for v in [3000_i16, 4000, 5000, 6000] {
             router.push_frame(&frame_of(v));
@@ -2259,7 +2259,7 @@ mod tests {
         let past_ramp = spliced.get(RX_FADE_SAMPLES..).ok_or("ramp within frame")?;
         assert!(
             past_ramp.iter().all(|&s| s == -3000),
-            "past the ramp the frame is fully enhanced frame 3 — aligned, no skip"
+            "past the ramp the frame is fully enhanced frame 3: aligned, no skip"
         );
         assert_eq!(
             router.raw.len(),
@@ -2273,7 +2273,7 @@ mod tests {
     /// drains its tail every arrival): one grace frame is served
     /// from raw, the router then holds while the stream's output
     /// repays the grace debt, and the switch completes at the next
-    /// unplayed position — crossfaded, no repeat, no skip.
+    /// unplayed position: crossfaded, no repeat, no skip.
     #[test]
     fn router_toggle_on_empty_backlog_serves_one_grace_frame_then_holds() -> TestResult {
         let mut router: RxTailRouter<FakeStream> = RxTailRouter::new();
@@ -2285,7 +2285,7 @@ mod tests {
         router.enhance_on(FakeStream::new(320, 200));
         assert!(
             router.next_frame().is_none(),
-            "no backlog — nothing to serve"
+            "no backlog, nothing to serve"
         );
         router.push_frame(&frame_of(3000));
         let grace = router.next_frame().ok_or("grace frame")?;
@@ -2295,12 +2295,12 @@ mod tests {
         );
         assert!(
             router.next_frame().is_none(),
-            "grace spent — router holds while the stream catches up"
+            "grace spent; router holds while the stream catches up"
         );
         router.push_frame(&frame_of(4000));
         assert!(
             router.next_frame().is_none(),
-            "stream output repays the grace debt first — still holding"
+            "stream output repays the grace debt first, still holding"
         );
         router.push_frame(&frame_of(5000));
         assert!(
@@ -2317,7 +2317,7 @@ mod tests {
         let past_ramp = spliced.get(RX_FADE_SAMPLES..).ok_or("ramp within frame")?;
         assert!(
             past_ramp.iter().all(|&s| s == -4000),
-            "catch-up frame is enhanced frame 4 — position continuity after grace"
+            "catch-up frame is enhanced frame 4: position continuity after grace"
         );
         Ok(())
     }
@@ -2347,7 +2347,7 @@ mod tests {
         let past_ramp = spliced.get(RX_FADE_SAMPLES..).ok_or("ramp within frame")?;
         assert!(
             past_ramp.iter().all(|&s| s == 2000),
-            "past the ramp the frame is fully raw frame 2 — no skip"
+            "past the ramp the frame is fully raw frame 2, no skip"
         );
         let next = router.next_frame().ok_or("raw frame 3")?;
         assert!(
@@ -2359,7 +2359,7 @@ mod tests {
 
     /// The equal-total-length invariant across `RxEnd`: raw mode,
     /// enhanced-from-start, and a mid-stream toggle all play exactly
-    /// the samples that arrived — no more, no less.
+    /// the samples that arrived: no more, no less.
     #[test]
     fn router_rx_end_totals_match_across_modes() {
         fn drain(router: &mut RxTailRouter<FakeStream>) -> usize {
@@ -2395,7 +2395,7 @@ mod tests {
         enh_total += drain(&mut enh_router);
         assert_eq!(
             enh_total, expected,
-            "enhanced mode flushes the lookahead at RxEnd — totals match raw"
+            "enhanced mode flushes the lookahead at RxEnd; totals match raw"
         );
 
         let mut mixed: RxTailRouter<FakeStream> = RxTailRouter::new();

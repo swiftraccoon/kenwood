@@ -49,7 +49,7 @@ async fn probe_bluetooth_commands() {
     let resp = raw_cmd(&mut transport, "BT").await;
     println!("  BT (bare): {:?}", resp);
 
-    // Try BT with sub-indices (read only — single digit should be read)
+    // Try BT with sub-indices (read only; a single digit should be a read)
     println!("\nBT sub-indices (reads):");
     for i in 0..=5u8 {
         let cmd = format!("BT {i}");
@@ -79,7 +79,7 @@ async fn probe_bluetooth_commands() {
         }
     }
 
-    // Check the RE data — the BT handler at 0xC002ED7C might reveal pairing mode
+    // Check the RE data: the BT handler at 0xC002ED7C might reveal pairing mode
     // The D74 docs show BT as on/off only. Pairing mode might be a menu-only function.
     // Let's also check if there's a separate pairing command
 

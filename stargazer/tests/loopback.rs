@@ -83,7 +83,7 @@ async fn fake_reflector() -> Result<(SocketAddr, tokio::task::JoinHandle<()>), s
                     let _unused = sock.send_to(pkt, src).await;
                 }
             }
-            // Ignore polls/unlinks — the test shuts the client down.
+            // Ignore polls/unlinks; the test shuts the client down.
         }
     });
     Ok((addr, handle))

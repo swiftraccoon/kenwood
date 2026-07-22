@@ -2,12 +2,12 @@
 //!
 //! Wraps [`SessionCore`] with compile-time state tracking via the
 //! `S: ClientState` phantom. Methods are gated by `impl` blocks on
-//! specific `Session<P, S>` shapes — calling `send_voice` on a
+//! specific `Session<P, S>` shapes: calling `send_voice` on a
 //! `Session<P, Configured>` is a compile error, not a runtime error.
 //!
 //! The `Session<P, S>` is a thin wrapper over [`SessionCore`] (the
 //! protocol-erased state machine). The phantom types add zero
-//! runtime cost — the entire typestate machinery compiles away.
+//! runtime cost; the entire typestate machinery compiles away.
 
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -35,13 +35,13 @@ use super::state::{
 /// `P` is the protocol marker ([`DPlus`], [`super::DExtra`],
 /// [`super::Dcs`]). `S` is the connection state marker
 /// ([`Configured`], [`Connecting`], etc.). Methods are gated by
-/// `impl` blocks on specific `Session<P, S>` shapes — calling
+/// `impl` blocks on specific `Session<P, S>` shapes: calling
 /// `send_voice` on a `Session<P, Configured>` is a compile error, not
 /// a runtime error.
 ///
 /// The `Session<P, S>` is a thin wrapper over [`SessionCore`] (the
 /// protocol-erased state machine). The phantom types add zero
-/// runtime cost — the entire typestate machinery compiles away.
+/// runtime cost; the entire typestate machinery compiles away.
 #[derive(Debug)]
 pub struct Session<P: Protocol, S: ClientState> {
     pub(crate) inner: SessionCore,
@@ -82,7 +82,7 @@ impl<P: Protocol, S: ClientState> Session<P, S> {
     }
 }
 
-// ─── Universal `Driver` impl — the typestate wraps the same state
+// ─── Universal `Driver` impl: the typestate wraps the same state
 //     machine regardless of which `(P, S)` it's in. ────────────
 
 impl<P: Protocol, S: ClientState> Driver for Session<P, S> {
@@ -150,7 +150,7 @@ impl<P: Protocol + NoAuthRequired> Session<P, Configured> {
 impl Session<DPlus, Configured> {
     /// Mark the session as authenticated using a previously-fetched host list.
     ///
-    /// The actual TCP auth happens in the shell crate — the
+    /// The actual TCP auth happens in the shell crate; the
     /// sans-io core takes the resulting [`HostList`] here as input.
     ///
     /// # Errors
@@ -242,7 +242,7 @@ impl<P: Protocol> Session<P, Connecting> {
     /// already in [`ClientStateKind::Connected`]; any other state
     /// returns a [`Failed`] with a [`StateError::WrongState`] error.
     /// If the session was rejected mid-handshake the caller should
-    /// inspect the failed session's [`Session::state_kind`] — it may
+    /// inspect the failed session's [`Session::state_kind`]; it may
     /// already be in [`ClientStateKind::Closed`].
     ///
     /// # Errors
@@ -341,7 +341,7 @@ impl<P: Protocol> Session<P, Connected> {
     /// it (DCS embeds the full header in every voice frame, so the
     /// cache is mandatory there).
     ///
-    /// This method takes `&mut self`, NOT `self` — voice TX does not
+    /// This method takes `&mut self`, NOT `self`, because voice TX does not
     /// change the typestate. The session stays in [`Connected`] until
     /// `disconnect` or a timeout closes it.
     ///
@@ -380,7 +380,7 @@ impl<P: Protocol> Session<P, Connected> {
     /// Send a voice EOT packet, ending the outbound stream.
     ///
     /// This method takes `&mut self`, NOT `self`. The session stays
-    /// in [`Connected`] after EOT — the caller may begin a new stream
+    /// in [`Connected`] after EOT; the caller may begin a new stream
     /// by calling [`Self::send_header`] again.
     ///
     /// # Errors

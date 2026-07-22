@@ -6,7 +6,7 @@ import SwiftUI
 /// Top-level app destinations. Currently just the session view;
 /// Map (future) and other routes would join here.
 ///
-/// About is **not** a route — it lives in the macOS app menu via
+/// About is **not** a route: it lives in the macOS app menu via
 /// `CommandGroup(replacing: .appInfo)` per Apple HIG.
 enum AppRoute: String, CaseIterable, Hashable, Identifiable {
     case session
@@ -47,7 +47,7 @@ struct LodestarShell: View {
             case .background:
                 // A linked app stays alive in the background: the
                 // running audio pipeline (UIBackgroundModes: audio)
-                // holds the process open — and with it the reflector
+                // holds the process open, and with it the reflector
                 // UDP session and the USB user client, so the relay
                 // keeps relaying with the screen off. Only an idle
                 // app (no reflector link) shuts down and suspends
@@ -58,7 +58,7 @@ struct LodestarShell: View {
                     Task { @MainActor in
                         #if os(iOS)
                         // USB user-client connections don't survive
-                        // app suspension — tear down first so the
+                        // app suspension, so tear down first and the
                         // dext isn't left holding a doorbell for a
                         // frozen process.
                         await transport.handleScenePhaseBackground()
@@ -79,7 +79,7 @@ struct LodestarShell: View {
                 }
                 #endif
             default:
-                // .inactive is transient — Notification Center pulls,
+                // .inactive is transient: Notification Center pulls,
                 // incoming-call UI, the app switcher. Tearing down
                 // here killed live sessions on trivial interruptions.
                 break
@@ -89,7 +89,7 @@ struct LodestarShell: View {
 
     #if os(macOS)
     private var macShell: some View {
-        // Single destination — skip the NavigationSplitView.
+        // Single destination, so skip the NavigationSplitView.
         // If future routes land, reintroduce a sidebar here.
         NavigationStack {
             SessionScreen(session: session)

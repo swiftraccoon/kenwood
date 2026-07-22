@@ -17,9 +17,9 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "usb-
 /// ```
 ///
 /// The dext matches the radio's CDC **Data** interface (bInterfaceNumber
-/// 1, class 0x0A — where the bulk endpoints live; the class 02/02
+/// 1, class 0x0A, where the bulk endpoints live; the class 02/02
 /// control interface has only an interrupt endpoint). Wire bytes above
-/// this transport — CAT, MMDVM frames, MCP — are identical to the macOS
+/// this transport (CAT, MMDVM frames, MCP) are identical to the macOS
 /// Bluetooth path; `MmdvmReader`, `RadioModeProber`, `McpSession`, and
 /// `RelayCoordinator` reuse unchanged.
 ///
@@ -28,7 +28,7 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "usb-
 /// One async user-client completion stays armed as a one-shot doorbell.
 /// The dext fires it on its RX buffer's empty→non-empty edge (or
 /// immediately if armed while non-empty). On each ring this actor
-/// re-arms FIRST, then drains `link.drain` until empty — the re-arm-first
+/// re-arms FIRST, then drains `link.drain` until empty; the re-arm-first
 /// order plus the immediate-fire-when-non-empty rule closes every race.
 ///
 /// ## Platform notes
@@ -48,7 +48,7 @@ public actor USBSerialTransport: RadioTransport {
     private var buffer: [UInt8] = []
     /// Parked readers, FIFO. Each keeps its own `maxBytes` (the
     /// delivery cap) and an ID so cancellation can target exactly one
-    /// continuation — resuming *all* parked reads on one reader's
+    /// continuation: resuming *all* parked reads on one reader's
     /// cancellation would send the `[]` link-closed sentinel to
     /// unrelated readers.
     private var readContinuations:
@@ -88,8 +88,8 @@ public actor USBSerialTransport: RadioTransport {
             try drainAll()
             updateState(.connected)
         } catch {
-            // link.open() may have succeeded before a later step threw —
-            // release the user-client connection instead of leaking it.
+            // link.open() may have succeeded before a later step threw,
+            // so release the user-client connection instead of leaking it.
             link.close()
             let reason = Self.describe(error)
             updateState(.failed(message: reason))
@@ -123,8 +123,8 @@ public actor USBSerialTransport: RadioTransport {
                 let reason = Self.describe(error)
                 log.error("write failed: \(reason)")
                 // A hard user-client failure means the link is dead
-                // (dext crashed, radio unplugged, connection severed) —
-                // reflect that instead of lingering in a zombie
+                // (dext crashed, radio unplugged, connection severed),
+                // so reflect that instead of lingering in a zombie
                 // "connected" state with parked reads that never wake.
                 handleLinkDrop()
                 throw RadioTransportError.writeFailed(reason: reason)
@@ -196,7 +196,7 @@ public actor USBSerialTransport: RadioTransport {
         }
     }
 
-    /// Cancellation resumes exactly the cancelled reader — never its
+    /// Cancellation resumes exactly the cancelled reader, never its
     /// siblings (the `[]` sentinel would read as "link closed" to them).
     private func cancelParkedRead(id: UInt64) {
         guard let idx = readContinuations.firstIndex(where: { $0.id == id }) else { return }
@@ -242,7 +242,7 @@ public actor USBSerialTransport: RadioTransport {
     }
 
     /// One-paste debugging: transport internals + dext counters + the
-    /// dext's own event ring. Best-effort — every line that can't be
+    /// dext's own event ring. Best-effort: every line that can't be
     /// fetched says why instead of vanishing.
     public func diagnosticsReport() -> String {
         var lines: [String] = []
@@ -272,7 +272,7 @@ public actor USBSerialTransport: RadioTransport {
 }
 
 public extension BluetoothDevice {
-    /// Synthetic descriptor for the USB path — one cable, one radio, no
+    /// Synthetic descriptor for the USB path: one cable, one radio, no
     /// picker needed. IDs mirror the TH-D75 USB VID/PID.
     static let usbSynthetic = BluetoothDevice(
         id: "usb:2166:9023",

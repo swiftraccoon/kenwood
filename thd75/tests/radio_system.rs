@@ -175,8 +175,8 @@ async fn set_lock_full() -> TestResult {
 // ---------------------------------------------------------------------------
 
 /// Return a 256-byte page with `page[idx] = value`, cloning `base`.
-/// Returns an error if `idx` is out of range (256-byte array — can't happen in practice,
-/// but the Result preserves the no-panic policy).
+/// Returns an error if `idx` is out of range (256-byte array, so it can't happen
+/// in practice, but the Result preserves the no-panic policy).
 fn patch_page(base: &[u8; 256], idx: usize, value: u8) -> Result<[u8; 256], BoxErr> {
     let mut out = *base;
     let slot: &mut u8 = out.get_mut(idx).ok_or_else(|| -> BoxErr {
@@ -253,7 +253,7 @@ async fn set_vox_via_mcp_enables() -> TestResult {
     Ok(())
 }
 
-// NOTE: `set_lock_via_mcp` no longer exists — MCP offset 0x1060 is
+// NOTE: `set_lock_via_mcp` no longer exists. MCP offset 0x1060 is
 // `radio.BacklightControl` in the MCP-D75 registry, and the lock state
 // is runtime-only (CAT LC/DL, covered by `lock_control` above).
 
@@ -294,7 +294,7 @@ async fn set_beep_via_mcp_preserves_other_bytes() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// frequency_down — steps down and reads back frequency
+// frequency_down: steps down and reads back frequency
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -320,12 +320,12 @@ async fn frequency_down_blind() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// set_beep_volume_via_mcp — out-of-range rejection and boundary success
+// set_beep_volume_via_mcp: out-of-range rejection and boundary success
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn set_beep_volume_rejects_out_of_range() -> TestResult {
-    // Volume 8 is out of range (0-7) — should fail before sending anything.
+    // Volume 8 is out of range (0-7), so it should fail before sending anything.
     let mock = MockTransport::new();
     let mut radio = Radio::connect(mock).await?;
     let result = radio.set_beep_volume_via_mcp(8).await;
@@ -338,7 +338,7 @@ async fn set_beep_volume_rejects_out_of_range() -> TestResult {
 
 #[tokio::test(start_paused = true)]
 async fn set_beep_volume_boundary_max() -> TestResult {
-    // Volume 7 is the maximum valid value — should succeed and do an MCP write.
+    // Volume 7 is the maximum valid value, so it should succeed and do an MCP write.
     // Offset 0x1072 => page 0x0010, byte index 0x72.
     let page: u16 = 0x0010;
     let byte_index: usize = 0x72;
@@ -356,7 +356,7 @@ async fn set_beep_volume_boundary_max() -> TestResult {
 
 #[tokio::test(start_paused = true)]
 async fn set_beep_volume_boundary_min() -> TestResult {
-    // Volume 0 is the minimum valid value — should succeed.
+    // Volume 0 is the minimum valid value, so it should succeed.
     let page: u16 = 0x0010;
     let byte_index: usize = 0x72;
 
@@ -372,7 +372,7 @@ async fn set_beep_volume_boundary_min() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// read_channels — skip-N integration test
+// read_channels: skip-N integration test
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

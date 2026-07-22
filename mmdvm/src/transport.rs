@@ -1,7 +1,7 @@
 //! Transport abstraction for the MMDVM async shell.
 //!
 //! Consumers provide any type that implements both [`AsyncRead`] and
-//! [`AsyncWrite`] — the shell takes ownership and drives it from the
+//! [`AsyncWrite`]. The shell takes ownership and drives it from the
 //! internal modem loop. Typical concrete types:
 //!
 //! - `tokio::io::DuplexStream` for unit tests

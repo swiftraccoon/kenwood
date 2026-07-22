@@ -55,7 +55,7 @@ impl<P: Protocol, S: ServerState> ServerSession<P, S> {
 //
 // Each of the following `impl` blocks bounds one state marker. A
 // call site in the wrong state will fail to compile with an
-// `E0599: no method found` error — the compile-fail trybuild tests
+// `E0599: no method found` error; the compile-fail trybuild tests
 // prove the gates are tight.
 //
 // The bodies here are intentionally thin wrappers over the
@@ -66,7 +66,7 @@ impl<P: Protocol, S: ServerState> ServerSession<P, S> {
 impl<P: Protocol> ServerSession<P, Streaming> {
     /// Process a voice data packet on a streaming client.
     ///
-    /// Only available when `S = Streaming` — calling this in any
+    /// Only available when `S = Streaming`; calling this in any
     /// other state is a compile error.
     ///
     /// # Errors
@@ -87,7 +87,7 @@ impl ServerSession<DPlus, Link1Received> {
     /// Process a `DPlus` LINK2 packet after a LINK1 has been
     /// received.
     ///
-    /// Only available on `ServerSession<DPlus, Link1Received>` —
+    /// Only available on `ServerSession<DPlus, Link1Received>`;
     /// calling this before LINK1 (in the [`super::Unknown`] state)
     /// is a compile error.
     ///
@@ -112,7 +112,7 @@ impl ServerSession<DPlus, Link1Received> {
 impl<P: Protocol> ServerSession<P, Linked> {
     /// Process an UNLINK packet on a linked client.
     ///
-    /// Only available on `ServerSession<P, Linked>` — calling this
+    /// Only available on `ServerSession<P, Linked>`; calling this
     /// after the session has already reached [`Closed`] is a
     /// compile error.
     ///

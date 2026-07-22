@@ -9,7 +9,7 @@
 //! datagram in a single `Vec<Vec<u8>>` so tests can assert on the
 //! exact wire shape produced by the new tokio shell's `SessionLoop`.
 //!
-//! The helper is single-session — it latches onto the first client
+//! The helper is single-session: it latches onto the first client
 //! that speaks to it and doesn't try to multiplex.
 
 use std::net::SocketAddr;
@@ -49,7 +49,7 @@ impl FakeReflector {
                 *peer_clone.lock().await = Some(src);
 
                 match n {
-                    // LINK (11 bytes) — reply with a 14-byte ACK.
+                    // LINK (11 bytes): reply with a 14-byte ACK.
                     // `write_connect_reply` in the core codec writes:
                     //   [0..7]  first 7 chars of callsign
                     //   [7]     memset pad slot (space)
@@ -76,7 +76,7 @@ impl FakeReflector {
                         }
                         drop(sock_clone.send_to(&ack, src).await);
                     }
-                    // 9-byte poll — echo back.
+                    // 9-byte poll: echo back.
                     9 => {
                         if let Some(slice) = buf.get(..9) {
                             drop(sock_clone.send_to(slice, src).await);
@@ -146,7 +146,7 @@ impl FakeReflector {
                         }
                     }
                     28 => {
-                        // LINK2 login — reply OKRW or BUSY.
+                        // LINK2 login: reply OKRW or BUSY.
                         let reply: [u8; 8] = match mode {
                             DPlusMode::Accept => [0x08, 0xC0, 0x04, 0x00, b'O', b'K', b'R', b'W'],
                             DPlusMode::RejectWithBusy => {

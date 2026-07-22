@@ -33,7 +33,7 @@ jobs:
       # lints (and `--all-targets` covers strictly more targets), and
       # `cargo test` compiles and links the same lib/bin/example
       # targets. Neither dropped step produced artifacts the later
-      # steps reuse — clippy's driver fingerprints differently from
+      # steps reuse; clippy's driver fingerprints differently from
       # check, so those passes were pure duplicate work.
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: thd75

@@ -1,10 +1,10 @@
 //! Property tests for `DExtra` codec round-trips.
 //!
 //! Two flavours:
-//! 1. Round-trip properties — encode a valid input, decode it, assert
+//! 1. Round-trip properties: encode a valid input, decode it, assert
 //!    the decoded value matches the original. Exercises every encoder
 //!    against its matching decoder.
-//! 2. Never-panic properties — throw random bytes at the decoders to
+//! 2. Never-panic properties: throw random bytes at the decoders to
 //!    prove they cannot panic on any input.
 
 // Integration tests are separate compilation units and re-evaluate
@@ -43,7 +43,7 @@ fn any_callsign() -> impl Strategy<Value = Callsign> {
     })
 }
 
-/// Connect-packet callsigns — restricted to 1..=7 chars so byte 7
+/// Connect-packet callsigns, restricted to 1..=7 chars so byte 7
 /// is always a space. The connect-packet wire format places the
 /// module letter at byte [8], and the decoder reads bytes [0..8]
 /// as the callsign, so an 8-char callsign would put a non-space

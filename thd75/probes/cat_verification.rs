@@ -73,7 +73,7 @@ async fn verify_all_cat_commands() {
     let mut results: Vec<(String, String, String)> = Vec::new();
 
     println!("\n========================================================================");
-    println!("  CAT COMMAND VERIFICATION — every command tested against live radio");
+    println!("  CAT COMMAND VERIFICATION: every command tested against live radio");
     println!("========================================================================\n");
     println!(
         "  {:<8} {:<25} {:<12} {}",

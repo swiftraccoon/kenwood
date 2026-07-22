@@ -51,7 +51,7 @@ impl<T: Transport> Radio<T> {
     ///   (`AG 0\r`) returns `?`.
     /// - **Write** (`AG NNN\r`): bare 3-digit zero-padded value (e.g., `AG 015\r`). Despite
     ///   the `band` parameter in this method's signature, the wire format is bare (no band
-    ///   index) — the value applies globally.
+    ///   index) and the value applies globally.
     ///
     /// # Valid range
     ///
@@ -248,7 +248,7 @@ impl<T: Transport> Radio<T> {
     /// after a configurable delay when audio stops.
     ///
     /// VOX must be enabled before [`get_vox_gain`](Self::get_vox_gain) or
-    /// [`get_vox_delay`](Self::get_vox_delay) will succeed — those commands return `N`
+    /// [`get_vox_delay`](Self::get_vox_delay) will succeed; those commands return `N`
     /// (not available) when VOX is disabled.
     ///
     /// # Errors

@@ -13,8 +13,8 @@
 //!
 //! No Kenwood executable and no verbatim decompiler output is committed.
 //! The test fixtures and inline test sources reproduce structural facts from
-//! the reviewed decompilation — obfuscated identifiers, offsets, and layout
-//! formulas — so the parser's expected shape stays pinned. To decompile and
+//! the reviewed decompilation (obfuscated identifiers, offsets, and layout
+//! formulas) so the parser's expected shape stays pinned. To decompile and
 //! extract in one step, install ilspycmd 10.1 (the reviewed output used
 //! 10.1.0.8386), then:
 //!

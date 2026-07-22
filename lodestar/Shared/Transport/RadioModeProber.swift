@@ -14,7 +14,7 @@ public enum RadioMode: Equatable, Sendable {
     case cat
     /// Radio responds with MMDVM binary framing (first byte `0xE0`).
     /// Menu 650 is `Reflector Terminal` (or `Access Point`). The BT
-    /// channel is no longer a CAT channel — it carries MMDVM frames.
+    /// channel is no longer a CAT channel; it carries MMDVM frames.
     case mmdvm
     /// The probe got a response we can't classify.
     case unrecognized(firstByte: UInt8)
@@ -56,7 +56,7 @@ public struct RadioModeProber {
             guard let chunk else { break } // timed out
             if chunk.isEmpty { break }     // transport closed
             buffer.append(contentsOf: chunk)
-            // As soon as we have the first byte, we can classify — but
+            // As soon as we have the first byte, we can classify, but
             // keep draining briefly to absorb the rest of the frame so
             // the next caller's read starts on a clean byte boundary.
             if buffer.count >= 1 {
@@ -76,7 +76,7 @@ public struct RadioModeProber {
             // Flush the radio's CAT line parser before returning: the
             // probe bytes carry no CR, so they linger in the radio's
             // line buffer and corrupt the NEXT CAT command ("ID\r"
-            // right after a probe answers "?\r" — hardware-verified
+            // right after a probe answers "?\r"; hardware-verified
             // 2026-07-19). A bare CR terminates the junk line; the
             // radio's "?\r" reply to it is drained and discarded here
             // so it can't poison the next reader either.
@@ -85,7 +85,7 @@ public struct RadioModeProber {
             let flushDeadline = ContinuousClock.now.advanced(by: .milliseconds(300))
             while ContinuousClock.now < flushDeadline {
                 // `try?` flattens the timeout's nil and an error into
-                // one nil — either way there's nothing left to flush.
+                // one nil; either way there's nothing left to flush.
                 guard let chunk = try? await readChunkWithTimeout(
                     transport: transport, maxBytes: 64, deadline: flushDeadline
                 ), !chunk.isEmpty else { break }
@@ -103,7 +103,7 @@ public struct RadioModeProber {
     }
 
     /// Having seen `0xE0` as the first byte, keep reading until we've
-    /// absorbed the whole MMDVM frame. Best-effort — if we time out or
+    /// absorbed the whole MMDVM frame. Best-effort: if we time out or
     /// the frame is malformed, we move on; the next read will handle
     /// any leftover garbage.
     private func drainFrame(

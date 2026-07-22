@@ -1,4 +1,4 @@
-//! `AuthClient` — `DPlus` TCP auth.
+//! `AuthClient`: `DPlus` TCP auth.
 //!
 //! Performs the mandatory TCP authentication step against
 //! `auth.dstargateway.org:20001` and returns the [`HostList`] cached
@@ -142,7 +142,7 @@ impl AuthClient {
     ///
     /// # See also
     ///
-    /// `ircDDBGateway/Common/DPlusAuthenticator.cpp:111-143` — the
+    /// `ircDDBGateway/Common/DPlusAuthenticator.cpp:111-143`, the
     /// reference 56-byte packet layout this client mirrors.
     pub async fn authenticate(&self, callsign: Callsign) -> Result<HostList, AuthError> {
         let endpoint_display = self.endpoint.map_or_else(
@@ -254,7 +254,7 @@ impl AuthClient {
     /// the macOS TCP stack's per-address retry budget (~75 s of SYN
     /// retransmit before giving up and moving to the next address)
     /// blows through our 10 s budget before any live address is
-    /// reached — the auth flow then times out deterministically on
+    /// reached; the auth flow then times out deterministically on
     /// every run that happens to draw a dead address first.
     ///
     /// The fix is to resolve the hostname ourselves with
@@ -334,7 +334,7 @@ impl AuthClient {
             }
         }
 
-        // Every resolved address failed — fall through to the outer
+        // Every resolved address failed: fall through to the outer
         // Timeout variant if appropriate, otherwise an Io error with
         // the last underlying cause.
         Err(last_err.map_or(
@@ -444,7 +444,7 @@ pub enum AuthError {
         operation: IoOperation,
     },
 
-    /// Phase timed out — the configured [`AuthClient::with_connect_timeout`]
+    /// Phase timed out: the configured [`AuthClient::with_connect_timeout`]
     /// or [`AuthClient::with_read_timeout`] elapsed before the
     /// operation completed.
     #[error("DPlus auth timed out after {elapsed:?} during {phase:?}")]

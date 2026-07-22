@@ -19,7 +19,7 @@ use super::consts::{
 /// (`getDExtraData CT_LINK1`):
 /// - `[0..7]`: first 7 chars of the callsign (from `data[0..7]`)
 /// - `[7]`: space padding (from `memset(data, ' ', 8)`)
-/// - `[8]`: 8th char of the callsign slot — the client module
+/// - `[8]`: 8th char of the callsign slot, i.e. the client module
 ///   letter per the ircDDBGateway convention
 /// - `[9]`: reflector module letter
 /// - `[10]`: `0x00`
@@ -161,7 +161,7 @@ pub fn encode_poll_echo(out: &mut [u8], callsign: &Callsign) -> Result<usize, En
 ///
 /// Layout per `ircDDBGateway/Common/HeaderData.cpp:590-635`
 /// (`getDExtraData`):
-/// - `[0..4]`: `b"DSVT"` (NOT preceded by a length prefix — unlike `DPlus`)
+/// - `[0..4]`: `b"DSVT"` (NOT preceded by a length prefix, unlike `DPlus`)
 /// - `[4]`: `0x10` (header indicator)
 /// - `[5..8]`: `0x00` (reserved)
 /// - `[8]`: `0x20` (config)
@@ -292,7 +292,7 @@ pub fn encode_voice_data(
 ///
 /// # See also
 ///
-/// `ircDDBGateway/Common/AMBEData.cpp:317-345` — the
+/// `ircDDBGateway/Common/AMBEData.cpp:317-345`: the
 /// `getDExtraData` encoder produces the same 27-byte layout regardless
 /// of `isEnd()`; the caller is expected to set `m_outSeq |= 0x40` and
 /// fill `m_data` with silence + sync bytes before invoking it.
@@ -394,7 +394,7 @@ fn write_connect_common(
         region.fill(b' ');
     }
     // out[0..7] = first 7 chars of the callsign. Loop `i < 7` in
-    // the reference, so we intentionally stop at 7 — never touch
+    // the reference, so we intentionally stop at 7 and never touch
     // out[7].
     let cs = callsign.as_bytes();
     if let Some(dst) = out.get_mut(..7)
@@ -425,7 +425,7 @@ fn write_connect_common(
 /// (`getDExtraData CT_ACK`/`CT_NAK`):
 /// - `[0..7]` first 7 chars of the echoed callsign
 /// - `[7]` space padding (from `memset`)
-/// - `[8]` 8th char of the echoed callsign — the client's module
+/// - `[8]` 8th char of the echoed callsign, i.e. the client's module
 ///   from the original LINK request (`m_repeater.GetChar(7)`)
 /// - `[9]` reflector module letter (`m_reflector.GetChar(7)`)
 /// - `[10..13]` `tag` (`b"ACK"` or `b"NAK"`)
@@ -443,7 +443,7 @@ fn write_connect_reply(
         });
     }
     // Mirror `memset(data, ' ', 8)` + the rest of the trailing
-    // positions. Filling with spaces ensures out[7] is a space —
+    // positions. Filling with spaces ensures out[7] is a space,
     // and any bytes we don't explicitly overwrite stay as spaces
     // rather than leaking arbitrary prior contents.
     if let Some(region) = out.get_mut(..CONNECT_REPLY_LEN) {
@@ -516,7 +516,7 @@ mod tests {
         let n = encode_connect_link(&mut buf, &cs(*b"W1AW    "), Module::C, Module::B)?;
         assert_eq!(n, 11);
         // First 7 chars of the callsign at [0..7]. "W1AW" pads to
-        // "W1AW   " — 4 chars + 3 spaces.
+        // "W1AW   " (4 chars + 3 spaces).
         assert_eq!(&buf[..7], b"W1AW   ", "callsign chars 0..7");
         // Position 7 stays as the space padding (from memset).
         assert_eq!(buf[7], b' ', "pad slot before module letter");
@@ -568,7 +568,7 @@ mod tests {
     fn encode_connect_ack_writes_14_bytes() -> TestResult {
         let mut buf = [0u8; 16];
         // Test case: callsign "XRF030 C" so the 8th char of the
-        // callsign is 'C' — the client/repeater module letter we
+        // callsign is 'C', the client/repeater module letter we
         // want echoed at byte [8]. The reflector module is 'B'.
         let n = encode_connect_ack(&mut buf, &cs(*b"XRF030 C"), Module::B)?;
         assert_eq!(n, 14);

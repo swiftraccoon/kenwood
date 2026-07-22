@@ -1,4 +1,4 @@
-//! `Failed<S, E>` — typestate-friendly error wrapper.
+//! `Failed<S, E>`: typestate-friendly error wrapper.
 
 /// A failed state transition.
 ///

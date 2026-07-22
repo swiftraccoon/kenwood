@@ -17,7 +17,7 @@ use core::fmt;
 /// reliable audio output. The decoder handles them internally by
 /// repeating the previous frame's parameters (up to 3 times) and
 /// then muting to silence. Callers generally do not need to inspect
-/// these — [`AmbeDecoder::decode_frame`](crate::AmbeDecoder::decode_frame)
+/// these: [`AmbeDecoder::decode_frame`](crate::AmbeDecoder::decode_frame)
 /// always returns a valid PCM buffer, using silence as the fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

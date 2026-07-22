@@ -11,7 +11,7 @@
 //! The session holds an [`mmdvm::AsyncModem`] that owns the transport via a
 //! [`MmdvmTransportAdapter`]. All MMDVM framing, periodic status polling,
 //! TX-queue slot gating, and RX frame dispatch happen inside the
-//! `AsyncModem`'s spawned task — the session itself is just a thin
+//! `AsyncModem`'s spawned task; the session itself is just a thin
 //! lifecycle wrapper that also caches the [`Radio`]'s CAT-mode state for
 //! restoration on exit.
 //!
@@ -214,7 +214,7 @@ impl<T: Transport + Unpin + 'static> MmdvmSession<T> {
 /// MMDVM operation. Keeps the `Radio`'s CAT-mode codec, notifications,
 /// timeouts, and VFO/memory cache alive so they can be restored on exit.
 ///
-/// This type is crate-internal — it only escapes [`MmdvmSession::into_parts`]
+/// This type is crate-internal; it only escapes [`MmdvmSession::into_parts`]
 /// so [`crate::mmdvm::DStarGateway`] can reconstruct the `Radio` after
 /// `AsyncModem::shutdown`.
 pub(crate) struct MmdvmRadioRestore<T: Transport + Unpin + 'static> {
@@ -260,8 +260,8 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
             mode_b: self.state.mode_b,
             mcp_speed: self.state.mcp_speed,
             last_cmd_time: None,
-            // MMDVM binary traffic may have left residue on the line —
-            // drain before the first CAT command.
+            // MMDVM binary traffic may have left residue on the line,
+            // so drain before the first CAT command.
             desynced: true,
             mcp_active: false,
             mcp_saved_timeout: None,

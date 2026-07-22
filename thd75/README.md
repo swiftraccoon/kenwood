@@ -7,15 +7,15 @@ Async Rust library for full control of the Kenwood TH-D75 ham radio transceiver.
 
 ## Features
 
-- **CAT protocol** — All 55 commands with strict type safety. Every parameter uses validated types that reject invalid values at construction time.
-- **MCP programming** — Binary memory read/write via `0M PROGRAM` mode. Read and modify all 1,200 MCP channel entries (1,000 standard channels plus special channels), settings, and calibration data.
-- **Generated MCP-D75 menu schema** — Menu offsets, bit masks, value domains, and English option labels are extracted from the official MCP-D75 serializers. Batch patches read only the touched pages, preserve shared bits, enter programming mode once, and verify every changed page.
-- **SD card parsing** — Read `.d75` configs, `.nme` GPS logs, `.tsv` repeater/callsign/QSO lists, `.wav` audio recordings, and `.bmp` screen captures.
-- **APRS integration** — High-level `AprsClient` that owns `Radio<T>` + `KissSession` and threads `now: Instant` into the sans-io stack. Packet-radio protocol code (KISS framing, AX.25 codec, APRS parser/digipeater/SmartBeaconing/messaging/station-list, APRS-IS) lives in the sibling [`kiss-tnc`](https://github.com/swiftraccoon/kenwood/tree/main/kiss-tnc), [`ax25-codec`](https://github.com/swiftraccoon/kenwood/tree/main/ax25-codec), [`aprs`](https://github.com/swiftraccoon/kenwood/tree/main/aprs), [`aprs-is`](https://github.com/swiftraccoon/kenwood/tree/main/aprs-is) crates.
-- **MCP bridge** — `From<McpSmartBeaconingConfig> for aprs::SmartBeaconingConfig` (mph → km/h) in `thd75/src/aprs/mcp_bridge.rs`.
-- **Transport layer** — USB (CDC ACM) and Bluetooth SPP with auto-detection. Native `IOBluetooth` on macOS, serial RFCOMM on Linux/Windows.
-- **Session resilience** — `Radio::reconnect()` re-establishes a dropped USB or Bluetooth link on the same transport identity (surviving USB re-enumeration and MCP programming-mode exits), and an opt-in `RadioSupervisor` retries with capped exponential backoff while broadcasting typed link events. MCP writes verify by read-back before reporting success.
-- **Async** — Built on tokio. All radio operations are async.
+- **CAT protocol**: All 55 commands with strict type safety. Every parameter uses validated types that reject invalid values at construction time.
+- **MCP programming**: Binary memory read/write via `0M PROGRAM` mode. Read and modify all 1,200 MCP channel entries (1,000 standard channels plus special channels), settings, and calibration data.
+- **Generated MCP-D75 menu schema**: Menu offsets, bit masks, value domains, and English option labels are extracted from the official MCP-D75 serializers. Batch patches read only the touched pages, preserve shared bits, enter programming mode once, and verify every changed page.
+- **SD card parsing**: Read `.d75` configs, `.nme` GPS logs, `.tsv` repeater/callsign/QSO lists, `.wav` audio recordings, and `.bmp` screen captures.
+- **APRS integration**: High-level `AprsClient` that owns `Radio<T>` + `KissSession` and threads `now: Instant` into the sans-io stack. Packet-radio protocol code (KISS framing, AX.25 codec, APRS parser/digipeater/SmartBeaconing/messaging/station-list, APRS-IS) lives in the sibling [`kiss-tnc`](https://github.com/swiftraccoon/kenwood/tree/main/kiss-tnc), [`ax25-codec`](https://github.com/swiftraccoon/kenwood/tree/main/ax25-codec), [`aprs`](https://github.com/swiftraccoon/kenwood/tree/main/aprs), [`aprs-is`](https://github.com/swiftraccoon/kenwood/tree/main/aprs-is) crates.
+- **MCP bridge**: `From<McpSmartBeaconingConfig> for aprs::SmartBeaconingConfig` (mph → km/h) in `thd75/src/aprs/mcp_bridge.rs`.
+- **Transport layer**: USB (CDC ACM) and Bluetooth SPP with auto-detection. Native `IOBluetooth` on macOS, serial RFCOMM on Linux/Windows.
+- **Session resilience**: `Radio::reconnect()` re-establishes a dropped USB or Bluetooth link on the same transport identity (surviving USB re-enumeration and MCP programming-mode exits), and an opt-in `RadioSupervisor` retries with capped exponential backoff while broadcasting typed link events. MCP writes verify by read-back before reporting success.
+- **Async**: Built on tokio. All radio operations are async.
 
 ## Quick start
 
@@ -88,7 +88,7 @@ cargo run -p kenwood-thd75 --example mcp_menu -- \
 Enum values accept the official English label, decompiled member name, decimal
 raw value, or `0x` value. Numbers resolve as `0x` hex first, then as the
 decimal raw value whenever the field accepts that raw, then as an option
-label — so a numeric label can never capture a valid decimal raw. Fixed
+label, so a numeric label can never capture a valid decimal raw. Fixed
 strings accept text. Raw bitmap fields accept `hex:...` or `@FILE`. The
 command reads only pages referenced by the patch, writes only pages that
 actually change, and verifies each write by read-back.

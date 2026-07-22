@@ -1,6 +1,6 @@
 //! End-to-end loopback test: `DPlus` 2-step login rejected with `BUSY`.
 //!
-//! The `FakeReflector` spawns in rejecting mode — it answers the
+//! The `FakeReflector` spawns in rejecting mode: it answers the
 //! 28-byte LINK2 with `[0x08, 0xC0, 0x04, 0x00, 'B', 'U', 'S', 'Y']`
 //! instead of `OKRW`. The sans-io core should flip to `Closed` with
 //! `DisconnectReason::Rejected` **without** the shell ever having to
@@ -74,7 +74,7 @@ async fn dplus_rejecting_reflector_closes_session() -> Result<(), Box<dyn std::e
         "DPlus should be Closed after BUSY"
     );
 
-    // `promote` should fail now — there's no `Session<DPlus, Connected>`
+    // `promote` should fail now; there's no `Session<DPlus, Connected>`
     // to spawn because the session never reached that state.
     let Err(failed) = connecting.promote() else {
         return Err("promote should have failed when Closed".into());
@@ -85,7 +85,7 @@ async fn dplus_rejecting_reflector_closes_session() -> Result<(), Box<dyn std::e
         "the failed handle carries the Closed session back to the caller"
     );
 
-    // Drain any pending events off the unspawned session — there
+    // Drain any pending events off the unspawned session; there
     // should be a `Disconnected { reason: Rejected }` waiting.
     let mut drained = failed.session;
     let event = drained.poll_event().ok_or("rejected event not emitted")?;

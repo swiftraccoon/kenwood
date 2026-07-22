@@ -1,30 +1,30 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
-//! Lodestar core — Rust library powering the Lodestar native macOS and
+//! Lodestar core: Rust library powering the Lodestar native macOS and
 //! iPadOS D-STAR gateway app for the Kenwood TH-D75.
 //!
 //! Surfaces to Swift via `UniFFI`:
 //!
-//! - `version()` — crate semver.
-//! - [`audio`] — `RxAudioPipeline`: AMBE-decodes reflector voice frames
+//! - `version()`: crate semver.
+//! - [`audio`]: `RxAudioPipeline`, which AMBE-decodes reflector voice frames
 //!   into 8 kHz PCM with loss concealment, reorder rejection, and
 //!   click-free stream edges for on-device monitoring.
-//! - [`cat`] — minimal CAT codec covering the `ID` identify command.
-//! - [`mcp`] — programming-protocol primitives for flipping menu 650
+//! - [`cat`]: minimal CAT codec covering the `ID` identify command.
+//! - [`mcp`]: programming-protocol primitives for flipping menu 650
 //!   (DV Gateway) into Reflector Terminal Mode.
-//! - [`mmdvm`] — MMDVM frame codec and the `GetVersion` probe used for
+//! - [`mmdvm`]: MMDVM frame codec and the `GetVersion` probe used for
 //!   radio-mode detection.
-//! - [`reflector`] — `DPlus` / `DExtra` / `DCS` reflector list loaded
+//! - [`reflector`]: `DPlus` / `DExtra` / `DCS` reflector list loaded
 //!   from bundled `ircDDBGateway` host files, plus live-directory
 //!   support: Pi-Star hosts-text and XLX-registry parsers and a
 //!   provenance-aware merge over bundled, auth-server, and XLX sources.
-//! - [`session`] — async `connect_reflector` + [`session::ReflectorSession`]
+//! - [`session`]: async `connect_reflector` + [`session::ReflectorSession`]
 //!   driving the full radio-to-reflector voice loop, plus the
 //!   [`session::ReflectorObserver`] callback trait Swift implements to
 //!   receive voice events, slow-data text updates, and parsed GPS
 //!   positions.
-//! - Logging bridge — [`init_tracing`] installs a `tracing` subscriber that
+//! - Logging bridge: [`init_tracing`] installs a `tracing` subscriber that
 //!   forwards each event to a Swift-implemented [`LogSink`] (tagged with
 //!   [`LogLevel`]) for the in-app Log Viewer and Apple's Unified Log.
 
@@ -63,18 +63,18 @@ pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
 
-/// Level label passed to a [`LogSink`] — mirrors `tracing::Level`.
+/// Level label passed to a [`LogSink`]; mirrors `tracing::Level`.
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
 pub enum LogLevel {
-    /// `tracing::Level::TRACE` — finest-grained diagnostic.
+    /// `tracing::Level::TRACE`: finest-grained diagnostic.
     Trace,
-    /// `tracing::Level::DEBUG` — development diagnostic.
+    /// `tracing::Level::DEBUG`: development diagnostic.
     Debug,
-    /// `tracing::Level::INFO` — normal operational event.
+    /// `tracing::Level::INFO`: normal operational event.
     Info,
-    /// `tracing::Level::WARN` — unexpected but recoverable event.
+    /// `tracing::Level::WARN`: unexpected but recoverable event.
     Warn,
-    /// `tracing::Level::ERROR` — unrecoverable error.
+    /// `tracing::Level::ERROR`: unrecoverable error.
     Error,
 }
 
@@ -115,7 +115,7 @@ pub fn init_tracing(sink: std::sync::Arc<dyn LogSink>) {
 /// Internal `tracing_subscriber::Layer` impl used by [`init_tracing`].
 ///
 /// Exposed as `pub` only because `tracing_subscriber`'s `.with(...)`
-/// builder chain requires the layer type to be nameable — callers
+/// builder chain requires the layer type to be nameable; callers
 /// don't construct this directly.
 pub mod tracing_layer {
     use super::{LogLevel, LogSink};
@@ -174,7 +174,7 @@ pub mod tracing_layer {
             _id: &tracing::span::Id,
             _ctx: Context<'_, S>,
         ) {
-            // Intentionally ignore span lifecycle — only flat events
+            // Intentionally ignore span lifecycle: only flat events
             // make it to the sink, which is what our UI needs.
             drop(Span::none());
         }

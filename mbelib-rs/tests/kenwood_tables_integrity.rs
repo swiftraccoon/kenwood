@@ -3,7 +3,7 @@
 //
 // Provenance-anchored integrity tests for the extracted Kenwood AMBE
 // DSP constants. These don't validate the encoder's *behaviour* with
-// the tables — that requires hardware-in-the-loop captures from the
+// the tables; that requires hardware-in-the-loop captures from the
 // radio. They only check that the specific numerical signatures the
 // extraction calls out survived the copy into
 // `mbelib-rs/src/encode/kenwood/` intact. If any of these break, the
@@ -42,7 +42,7 @@ fn hpf_coefficients_match_bristow_johnson_form() {
     // Derive the characteristic frequency f₀ from the filter's
     // numerator using the Bristow-Johnson HPF shape
     // `b0 = (1 + cos(ω₀))/2`. The resulting f₀ ≈ 345 Hz is the
-    // filter's "design frequency" in the BJ parameterisation — NOT
+    // filter's "design frequency" in the BJ parameterisation, NOT
     // its frequency response's cutoff (Kenwood tuned the poles very
     // close to the zeros, so the actual response is a narrow notch
     // at DC; see [`HPF_345HZ_COEFFS`]'s doc comment for the full
@@ -161,7 +161,7 @@ fn inline_codebook_11804a90_opens_with_known_q15_values() {
     // FN_11804A90 starts with the Q15 sentinel pattern
     // [1, -8192, 8192, -8192, 3434, 1, 392, 392, ...] per the
     // inline_codebooks_per_function.txt dump. The -8192/+8192 bookends
-    // are Q15 representations of -0.25/+0.25 — a common initial
+    // are Q15 representations of -0.25/+0.25, a common initial
     // state for a codebook search. Verify the first 8 entries to
     // catch any endian / sign extraction bug.
     let expected = [1_i16, -8192, 8192, -8192, 3434, 1, 392, 392];

@@ -2,7 +2,7 @@
 //!
 //! The Q-construct is a single ASCII token, beginning with `qA`, that
 //! every packet carries in its APRS-IS path. It records *how* the
-//! packet entered the network — directly from RF via a verified `IGate`,
+//! packet entered the network: directly from RF via a verified `IGate`,
 //! from a server peer, from a client app, and so on. APRS-IS servers
 //! propagate the construct unchanged; the originating station (`IGate`
 //! or client) inserts it.
@@ -10,11 +10,11 @@
 //! This module exposes:
 //!
 //! - The [`QConstruct`] enum (all nine spec values).
-//! - [`format_is_packet_with_qconstruct`] — a *naive* line builder
+//! - [`format_is_packet_with_qconstruct`]: a *naive* line builder
 //!   that simply appends `,qXX,GATE` to a path. Suitable when the
 //!   caller has already computed the correct construct and gate
 //!   callsign; not a full `IGate`.
-//! - [`igate_format_for_is`] — a *strict*, append-only `IGate` path
+//! - [`igate_format_for_is`]: a *strict*, append-only `IGate` path
 //!   rewriter that implements the <http://www.aprs-is.net/q.aspx> and
 //!   <http://www.aprs-is.net/IGating.aspx> algorithm: refuses to gate
 //!   when the sender opted out, then gates the heard path **verbatim**
@@ -45,27 +45,27 @@ use crate::login::Passcode;
 /// originate packets add one based on the packet's source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QConstruct {
-    /// `qAC` — client-owned, server verified the login.
+    /// `qAC`: client-owned, server verified the login.
     QAC,
-    /// `qAX` — client-owned, server did *not* verify the login.
+    /// `qAX`: client-owned, server did *not* verify the login.
     QAX,
-    /// `qAU` — client-owned, received via UDP submit.
+    /// `qAU`: client-owned, received via UDP submit.
     QAU,
-    /// `qAo` — server-owned, received from a different server.
+    /// `qAo`: server-owned, received from a different server.
     QAo,
-    /// `qAO` — server-owned, originated on RF (`IGATE`).
+    /// `qAO`: server-owned, originated on RF (`IGATE`).
     QAO,
-    /// `qAS` — server-owned, received from a peer.
+    /// `qAS`: server-owned, received from a peer.
     QAS,
-    /// `qAr` — gated from RF with no callsign substitution.
+    /// `qAr`: gated from RF with no callsign substitution.
     QAr,
-    /// `qAR` — gated from RF by a verified login.
+    /// `qAR`: gated from RF by a verified login.
     QAR,
-    /// `qAZ` — server-client command packet. The packet is generated
+    /// `qAZ`: server-client command packet. The packet is generated
     /// by the server, client, or `IGate` and must not be propagated
     /// further.
     QAZ,
-    /// `qAI` — trace packet. Each server adds login identification
+    /// `qAI`: trace packet. Each server adds login identification
     /// (this construct + originating server callsign) so the packet's
     /// network path can be reconstructed. Defined in the q.aspx
     /// Client Generated table.
@@ -95,7 +95,7 @@ impl QConstruct {
     /// well-known forms. Returns `None` otherwise.
     ///
     /// The leading `*` (has-been-repeated) marker, if present, is
-    /// trimmed before matching — a path element like `qAR*` decodes to
+    /// trimmed before matching: a path element like `qAR*` decodes to
     /// `Some(QAR)`. Per q.aspx the construct should never carry that
     /// marker on the wire, but tolerant parsing keeps the rewriter
     /// robust against malformed upstream input.
@@ -180,7 +180,7 @@ pub fn format_is_packet_with_qconstruct(
 #[non_exhaustive]
 pub enum IGateError {
     /// The source callsign is `TCPIP` or `TCPXX`, indicating the packet
-    /// originated from APRS-IS — gating would create a loop.
+    /// originated from APRS-IS; gating would create a loop.
     SourceIsInternet,
     /// The path contains a `NOGATE` element: the originator opted out
     /// of gating.
@@ -191,7 +191,7 @@ pub enum IGateError {
     /// The path already contains `TCPIP` or `TCPXX`: the packet has
     /// already been gated and gating again would create a loop.
     PathAlreadyGated,
-    /// The `IGate`'s own callsign appears in the path — the packet has
+    /// The `IGate`'s own callsign appears in the path: the packet has
     /// already visited this station and re-gating would loop.
     LoopDetected,
     /// The packet's info field begins with `}` (third-party header),
@@ -222,16 +222,16 @@ impl std::error::Error for IGateError {}
 /// The choice depends solely on the `IGate`'s login state:
 ///
 /// - A verified login (real callsign + valid passcode) uses
-///   [`QConstruct::QAR`] — q.aspx: "qAR - Gated packet from RF. Packet
+///   [`QConstruct::QAR`], per q.aspx: "qAR - Gated packet from RF. Packet
 ///   is placed on APRS-IS by an `IGate` from RF."
-/// - A receive-only login uses [`QConstruct::QAO`] (capital letter O) —
-///   q.aspx: "qAO - (letter O) Gated packet from RF without messaging…
+/// - A receive-only login uses [`QConstruct::QAO`] (capital letter O),
+///   per q.aspx: "qAO - (letter O) Gated packet from RF without messaging…
 ///   Receive-only `IGates` will use this exclusively for all packets
 ///   gated to APRS-IS."
 ///
 /// Note: `qAr` (lowercase r) and `qAo` (lowercase o) are *server-side*
 /// constructs for packets that arrived **indirectly** via the legacy
-/// `,I` path from a remote `IGate` (q.aspx "Server Generated" table) —
+/// `,I` path from a remote `IGate` (q.aspx "Server Generated" table);
 /// they are never inserted by the `IGate` that heard the packet on RF,
 /// so they are not selectable here. The other constructs (`qAS`,
 /// `qAC`, `qAX`, `qAU`, `qAZ`, `qAI`) are likewise not applicable to an
@@ -266,7 +266,7 @@ const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
 ///    has-been-repeated marker**. IGating.aspx is explicit: "No
 ///    modification of the TNC2 format line should be made except to add
 ///    ,qAR,IGATECALL to the end of the path." q.aspx's RF-gating
-///    example confirms the marker survives — `AE5PL>APRS,WIDE1*` gates
+///    example confirms the marker survives: `AE5PL>APRS,WIDE1*` gates
 ///    to `AE5PL>APRS,WIDE1*,qAR,AE5PL-10`. Unused hops are **not**
 ///    dropped and `*` is **not** stripped; doing either would mislead
 ///    receivers about the propagation history and violate the
@@ -370,7 +370,7 @@ pub fn igate_format_for_is(
     // `*` is *not* stripped. A real RF AX.25 frame never carries a
     // q-construct on the wire (q-constructs only exist on APRS-IS), and
     // `RouteEntry` callsigns are validated uppercase alphanumerics, so
-    // `qAR`/`qAr`/… can never appear as a heard hop — no q-construct
+    // `qAR`/`qAr`/… can never appear as a heard hop, so no q-construct
     // filtering is needed here.
     let qconstruct = qconstruct_for_igate(passcode);
     let mut path_parts: Vec<String> = Vec::with_capacity(rf_path.len() + 2);
@@ -381,7 +381,7 @@ pub fn igate_format_for_is(
     path_parts.push(igate.to_string());
 
     // Build the final line. The info field may contain non-UTF-8
-    // bytes (Mic-E, raw weather) — preserve them via lossy decode for
+    // bytes (Mic-E, raw weather); preserve them via lossy decode for
     // the IS line; callers that need byte-exact fidelity should use
     // [`format_is_packet`] directly with a pre-decoded `&str`.
     let path_refs: Vec<&str> = path_parts.iter().map(String::as_str).collect();
@@ -590,8 +590,8 @@ mod tests {
 
     #[test]
     fn igate_format_preserves_heard_path_verbatim() -> TestResult {
-        // IGating.aspx: append-only. The full heard path — including a
-        // *later* unrepeated hop — is preserved verbatim, with the
+        // IGating.aspx: append-only. The full heard path, including a
+        // *later* unrepeated hop, is preserved verbatim, with the
         // has-been-repeated `*` on the hops that carry it. Only
         // `,qAR,N0CALL-7` is appended.
         let src = addr("W1AW", 0);
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn igate_format_preserves_unused_digipeaters() -> TestResult {
         // Append-only gating keeps every heard hop, even ones whose
-        // H-bit is clear — the older "drop unused slots" behavior
+        // H-bit is clear; the older "drop unused slots" behavior
         // violated IGating.aspx and is gone.
         let src = addr("W1AW", 0);
         let dst = addr("APK005", 0);

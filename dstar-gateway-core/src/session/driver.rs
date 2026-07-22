@@ -25,7 +25,7 @@ impl<'a> Transmit<'a> {
 ///
 /// The shell calls these methods in a loop. The core never calls
 /// back into the shell. **Time is injected via the `now: Instant`
-/// parameter on every call** — implementors of this trait must NOT
+/// parameter on every call**, and implementors of this trait must NOT
 /// consult `Instant::now()` themselves.
 pub trait Driver {
     /// Consumer-visible event type.
@@ -58,7 +58,7 @@ pub trait Driver {
 
     /// Earliest instant at which the core needs to be re-entered.
     ///
-    /// `None` means "no pending timer — only wake me on input".
+    /// `None` means "no pending timer, only wake me on input".
     fn poll_timeout(&self) -> Option<Instant>;
 }
 

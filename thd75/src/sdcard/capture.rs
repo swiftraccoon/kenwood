@@ -62,7 +62,7 @@ pub struct ScreenCapture {
 
 /// Read a little-endian `i32` from a byte slice at the given offset.
 ///
-/// Returns `0` if the slice is too short — the caller is expected to have
+/// Returns `0` if the slice is too short; the caller is expected to have
 /// validated the buffer length before calling.
 fn read_i32_le(data: &[u8], offset: usize) -> i32 {
     data.get(offset..offset + 4)

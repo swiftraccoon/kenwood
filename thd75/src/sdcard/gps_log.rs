@@ -7,7 +7,7 @@
 //!
 //! # Location
 //!
-//! `/KENWOOD/TH-D75/GPS_LOG/*.nme` — maximum 255 files per directory.
+//! `/KENWOOD/TH-D75/GPS_LOG/*.nme`, maximum 255 files per directory.
 //!
 //! # GPS Receiver mode (per Operating Tips §5.14.2)
 //!
@@ -86,9 +86,9 @@ pub struct GgaFix {
 /// A parsed NMEA sentence.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NmeaSentence {
-    /// `$GPRMC` — Recommended Minimum (time, position, speed, course, date).
+    /// `$GPRMC`: Recommended Minimum (time, position, speed, course, date).
     Rmc(RmcFix),
-    /// `$GPGGA` — Fix data (time, position, quality, satellites, altitude).
+    /// `$GPGGA`: Fix data (time, position, quality, satellites, altitude).
     Gga(GgaFix),
 }
 
@@ -198,7 +198,7 @@ pub fn parse(data: &[u8]) -> Result<GpsLog, SdCardError> {
                 }
             }
             _ => {
-                // Unrecognised sentence type — skip silently
+                // Unrecognised sentence type: skip silently
             }
         }
     }
@@ -437,8 +437,8 @@ $GPRMC,,V,,,,,,,,,,N*53\n\
 $GPGGA,,,,,,0,,,,,,,,*66\n";
 
         let log = parse(data)?;
-        // Void RMC has no coordinates — should be skipped by parser
-        // GGA with quality=0 has no coordinates — should be skipped
+        // Void RMC has no coordinates, so the parser should skip it.
+        // GGA with quality=0 has no coordinates, so it is skipped too.
         assert_eq!(log.errors, 0, "checksums should be valid");
         // Void sentences have empty coordinate fields → parse_coordinate returns None
         // so they won't produce Rmc/Gga entries

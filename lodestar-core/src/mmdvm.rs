@@ -116,7 +116,7 @@ pub struct MmdvmDecodeResult {
     /// The decoded frame, if one was complete at the start of the buffer.
     pub frame: Option<MmdvmFrame>,
     /// Number of bytes consumed. `0` means the buffer holds a partial
-    /// frame — caller should keep accumulating and try again.
+    /// frame; the caller should keep accumulating and try again.
     pub bytes_consumed: u32,
 }
 
@@ -142,7 +142,7 @@ pub fn build_mmdvm_frame(command: u8, payload: Vec<u8>) -> Result<Vec<u8>, Mmdvm
 ///
 /// Returns the decoded frame plus the number of bytes consumed.
 /// If the buffer holds a partial frame, `frame` is `None` and
-/// `bytes_consumed` is `0` — caller should keep buffering.
+/// `bytes_consumed` is `0`; the caller should keep buffering.
 ///
 /// # Errors
 ///
@@ -150,7 +150,7 @@ pub fn build_mmdvm_frame(command: u8, payload: Vec<u8>) -> Result<Vec<u8>, Mmdvm
 /// - [`MmdvmFrameError::ShortLength`] if the length byte is below 3.
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "UniFFI FFI boundary — `sequence<u8>` in UDL maps to owned `Vec<u8>`."
+    reason = "UniFFI FFI boundary: `sequence<u8>` in UDL maps to owned `Vec<u8>`."
 )]
 #[uniffi::export]
 pub fn decode_mmdvm_bytes(bytes: Vec<u8>) -> Result<MmdvmDecodeResult, MmdvmFrameError> {
@@ -175,7 +175,7 @@ pub fn decode_mmdvm_bytes(bytes: Vec<u8>) -> Result<MmdvmDecodeResult, MmdvmFram
 #[must_use]
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "UniFFI FFI boundary — takes owned `Vec<u8>` so Swift can hand it in directly."
+    reason = "UniFFI FFI boundary: takes owned `Vec<u8>` so Swift can hand it in directly."
 )]
 #[uniffi::export]
 pub fn looks_like_mmdvm_response(bytes: Vec<u8>) -> bool {

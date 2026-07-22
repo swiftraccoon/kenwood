@@ -146,8 +146,8 @@ proptest! {
         prop_assert_eq!(parsed, frame);
     }
 
-    /// Arbitrary bytes — the adversarial input a noisy serial or
-    /// Bluetooth link produces — must never panic the decoder; the
+    /// Arbitrary bytes (the adversarial input a noisy serial or
+    /// Bluetooth link produces) must never panic the decoder; the
     /// only outcomes are a frame, "need more", or a typed error.
     #[test]
     fn prop_decode_arbitrary_bytes_never_panics(
@@ -159,7 +159,7 @@ proptest! {
     }
 
     /// Every strict prefix of a valid frame asks for more bytes
-    /// rather than erroring or mis-decoding — the property the
+    /// rather than erroring or mis-decoding: the property the
     /// streaming reassembly path in the shell depends on.
     #[test]
     fn prop_partial_frames_request_more_bytes(
