@@ -11,8 +11,9 @@ import Foundation
 /// Bluetooth drop with `simulateUnexpectedClose()`.
 ///
 /// Unscripted writes are captured but produce no reply (no echo). The
-/// one built-in convenience is that `ID\r` still answers `ID TH-D75A\r`
-/// so the CAT identify round-trip works without scripting.
+/// built-in conveniences are that `ID\r` answers `ID TH-D75\r` and
+/// `FV\r` answers `FV 1.03\r`, so exact MCP target qualification works
+/// without scripting.
 public actor MockRadioTransport: RadioTransport {
     public let device: BluetoothDevice
     private var _state: RadioTransportState = .disconnected
@@ -20,12 +21,19 @@ public actor MockRadioTransport: RadioTransport {
     public nonisolated let stateStream: AsyncStream<RadioTransportState>
 
     private var pendingReads: [[UInt8]] = []
-    private var readContinuations: [CheckedContinuation<[UInt8], Error>] = []
-    private var scripted: [[UInt8]: [UInt8]] = [:]
+    private var readContinuations:
+        [(id: UInt64, maxBytes: Int, continuation: CheckedContinuation<[UInt8], Error>)] = []
+    private var nextReadID: UInt64 = 0
+    private var scripted: [[UInt8]: [[UInt8]]] = [:]
     private var writes: [[UInt8]] = []
+    private let closeDelayNanoseconds: UInt64
 
-    public init(device: BluetoothDevice = .mockTHD75) {
+    public init(
+        device: BluetoothDevice = .mockTHD75,
+        closeDelayNanoseconds: UInt64 = 0
+    ) {
         self.device = device
+        self.closeDelayNanoseconds = closeDelayNanoseconds
         var cont: AsyncStream<RadioTransportState>.Continuation!
         self.stateStream = AsyncStream { c in cont = c }
         self.stateContinuation = cont
@@ -36,7 +44,12 @@ public actor MockRadioTransport: RadioTransport {
     /// Register an exact-match canned response. Script `[]` to mean
     /// "radio stays silent for this request".
     public func script(response: [UInt8], for request: [UInt8]) {
-        scripted[request] = response
+        scripted[request] = [response]
+    }
+
+    /// Register a response sequence for repeated identical writes.
+    public func scriptSequence(responses: [[UInt8]], for request: [UInt8]) {
+        scripted[request] = responses
     }
 
     /// Inject unsolicited bytes, as if the radio sent them.
@@ -52,7 +65,9 @@ public actor MockRadioTransport: RadioTransport {
     /// stream stays open (the transport object is still alive).
     public func simulateUnexpectedClose() {
         updateState(.disconnected)
-        for c in readContinuations { c.resume(returning: []) }
+        for reader in readContinuations {
+            reader.continuation.resume(returning: [])
+        }
         readContinuations.removeAll()
     }
 
@@ -63,8 +78,13 @@ public actor MockRadioTransport: RadioTransport {
     }
 
     public func close() async {
+        if closeDelayNanoseconds > 0 {
+            try? await Task.sleep(nanoseconds: closeDelayNanoseconds)
+        }
         updateState(.disconnected)
-        for c in readContinuations { c.resume(returning: []) }
+        for reader in readContinuations {
+            reader.continuation.resume(returning: [])
+        }
         readContinuations.removeAll()
         stateContinuation.finish()
     }
@@ -74,13 +94,21 @@ public actor MockRadioTransport: RadioTransport {
             throw RadioTransportError.notConnected
         }
         writes.append(bytes)
-        if let response = scripted[bytes] {
+        if var responses = scripted[bytes], !responses.isEmpty {
+            let response = responses.removeFirst()
+            if responses.isEmpty {
+                scripted.removeValue(forKey: bytes)
+            } else {
+                scripted[bytes] = responses
+            }
             if !response.isEmpty { enqueueRead(response) }
             return
         }
-        // Built-in convenience: CAT identify still answers.
+        // Built-in conveniences: exact target qualification answers.
         if bytes == Array("ID\r".utf8) {
-            enqueueRead(Array("ID TH-D75A\r".utf8))
+            enqueueRead(Array("ID TH-D75\r".utf8))
+        } else if bytes == Array("FV\r".utf8) {
+            enqueueRead(Array("FV 1.03\r".utf8))
         }
     }
 
@@ -93,26 +121,37 @@ public actor MockRadioTransport: RadioTransport {
             }
             return slice
         }
+        let id = nextReadID
+        nextReadID += 1
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { c in
-                readContinuations.append(c)
+                readContinuations.append(
+                    (id: id, maxBytes: maxBytes, continuation: c)
+                )
             }
         } onCancel: {
-            Task { await self.resumeParkedReadsEmpty() }
+            Task { await self.cancelParkedRead(id: id) }
         }
     }
 
-    /// Cancellation support: resume every parked read with an empty
-    /// chunk, the same signal a closed transport produces.
-    private func resumeParkedReadsEmpty() {
-        for c in readContinuations { c.resume(returning: []) }
-        readContinuations.removeAll()
+    private func cancelParkedRead(id: UInt64) {
+        guard let index = readContinuations.firstIndex(
+            where: { $0.id == id }
+        ) else {
+            return
+        }
+        let reader = readContinuations.remove(at: index)
+        reader.continuation.resume(returning: [])
     }
 
     private func enqueueRead(_ bytes: [UInt8]) {
-        if let c = readContinuations.first {
-            readContinuations.removeFirst()
-            c.resume(returning: bytes)
+        if !readContinuations.isEmpty {
+            let reader = readContinuations.removeFirst()
+            let slice = Array(bytes.prefix(reader.maxBytes))
+            if slice.count < bytes.count {
+                pendingReads.insert(Array(bytes.dropFirst(slice.count)), at: 0)
+            }
+            reader.continuation.resume(returning: slice)
             return
         }
         pendingReads.append(bytes)

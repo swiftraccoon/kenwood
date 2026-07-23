@@ -10,11 +10,13 @@ namespace lodestar {
 
 enum CatCommand {
     "Identify",
+    "FirmwareVersion",
 };
 
 [Enum]
 interface CatResponse {
     Identify(string model);
+    FirmwareVersion(string version);
     Unknown();
     NotAvailableInMode();
     Raw(string line);

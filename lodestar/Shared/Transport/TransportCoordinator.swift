@@ -29,11 +29,6 @@ public final class TransportCoordinator {
     /// hide behind a bare "Mode unknown".
     public private(set) var lastProbeErrorText: String?
 
-    /// Result of the last automated USB-relay setup (which radio
-    /// settings were found and changed). Displayed so the operator sees
-    /// exactly what the app read and did, with no menu spelunking.
-    public private(set) var lastRelaySetup: UsbRelaySetupReport?
-
     /// When `true`, `tryAutoConnect()` will reconnect on launch to the
     /// last-used radio (by Bluetooth address). Persisted.
     public var autoConnectRadio: Bool {
@@ -76,11 +71,29 @@ public final class TransportCoordinator {
 
     private var transport: RadioTransport?
     private var stateObserver: Task<Void, Never>?
+    /// Synchronous fence for state observers. Task cancellation is
+    /// cooperative, so a cancelled observer may still have buffered stream
+    /// elements ready to consume unless every element also proves it belongs
+    /// to the current observation generation.
+    private var stateObservationGeneration: UInt64 = 0
     private var radioReconnectTask: Task<Void, Never>?
+    private var mcpOperationInFlight = false
+    /// Synchronous MainActor lease for every coordinator-owned transport
+    /// transaction. Acquiring this before the first await prevents a parked
+    /// read or opening transport from overlapping MCP or another coordinator
+    /// operation.
+    private var coordinatorIOInFlight = false
+    /// Generation fence for transport opens. Background teardown advances
+    /// this while an uncancellable open is suspended so that attempt can
+    /// close itself without restoring or clobbering coordinator state.
+    private var transportGeneration: UInt64 = 0
 
     /// True when `handleScenePhaseBackground()` tore down a live
     /// connection that `handleScenePhaseActive()` should restore.
     private var resumeRadioOnForeground = false
+    /// Foreground arrived before an old coordinator transaction released
+    /// its lease. `endCoordinatorIO()` schedules the deferred reconnect.
+    private var foregroundReconnectPending = false
 
     private static let autoConnectKey = "lodestar.autoConnectRadio"
     private static let rememberedAddressKey = "lodestar.rememberedRadioAddress"
@@ -116,16 +129,34 @@ public final class TransportCoordinator {
     /// User-driven connect. Cancels any pending post-drop reconnect (the
     /// user's explicit action takes precedence) then performs the open.
     public func connect() async {
+        guard !mcpOperationInFlight else {
+            log.warning("Connect ignored while MCP owns the radio transport")
+            return
+        }
         radioReconnectTask?.cancel()
         radioReconnectTask = nil
-        await performConnect()
+        guard beginCoordinatorIO(operation: "connect") else { return }
+        defer { endCoordinatorIO() }
+        await performConnectOwned()
     }
 
     /// The actual open/observe/probe sequence, shared by the public
     /// `connect()` and the reconnect task. Kept free of the reconnect
     /// cancel so the reconnect task can call it without cancelling itself.
     private func performConnect() async {
+        guard beginCoordinatorIO(operation: "reconnect") else { return }
+        defer { endCoordinatorIO() }
+        await performConnectOwned()
+    }
+
+    private func performConnectOwned() async {
         guard let device = selectedDevice else { return }
+        guard transport == nil else {
+            log.warning("Connect ignored because a transport already exists")
+            return
+        }
+        transportGeneration &+= 1
+        let attemptGeneration = transportGeneration
         isBusy = true
         defer { isBusy = false }
         radioMode = .unknown
@@ -135,6 +166,21 @@ public final class TransportCoordinator {
         observeState(of: t)
         do {
             try await t.open()
+            guard attemptGeneration == transportGeneration else {
+                log.info("Discarding transport opened after background teardown")
+                await t.close()
+                return
+            }
+            guard case .connected = await t.state else {
+                throw RadioTransportError.openFailed(
+                    reason: "transport closed before connection setup completed"
+                )
+            }
+            // `open()` has a connected-state postcondition, but the observer
+            // task may not have consumed its buffered `.connected` event yet.
+            // Publish the postcondition synchronously before `connect()` can
+            // return; a later buffered `.connecting` event is ignored below.
+            state = .connected
             // Remember this radio so `tryAutoConnect()` can find it on
             // the next launch. Captured unconditionally; the user's
             // `autoConnectRadio` toggle controls whether we act on it.
@@ -142,12 +188,23 @@ public final class TransportCoordinator {
             rememberedRadioName = device.name
             // Once open, fire off a mode probe so the UI can show the
             // right affordances (MCP button only if still in CAT mode).
-            await probeRadioMode()
+            try Task.checkCancellation()
+            await probeRadioModeOwned()
+            try Task.checkCancellation()
+            guard attemptGeneration == transportGeneration else {
+                log.info("Discarding transport probed after background teardown")
+                await t.close()
+                return
+            }
         } catch {
-            state = .failed(message: error.displayMessage)
-            stateObserver?.cancel()
-            stateObserver = nil
-            transport = nil
+            if attemptGeneration == transportGeneration {
+                state = .failed(message: error.displayMessage)
+                stopObservingState()
+                transport = nil
+            } else {
+                log.info("Ignoring stale connect failure after background teardown")
+            }
+            await t.close()
         }
     }
 
@@ -156,6 +213,7 @@ public final class TransportCoordinator {
     /// conditions aren't met, so it is safe to call unconditionally from
     /// app startup.
     public func tryAutoConnect() async {
+        guard !mcpOperationInFlight else { return }
         guard autoConnectRadio, transport == nil else { return }
         guard let address = rememberedRadioAddress else { return }
         refreshPairedDevices()
@@ -172,10 +230,15 @@ public final class TransportCoordinator {
     }
 
     public func disconnect() async {
+        guard !mcpOperationInFlight else {
+            log.warning("Disconnect ignored while MCP cleanup owns the radio transport")
+            return
+        }
+        guard beginCoordinatorIO(operation: "disconnect") else { return }
+        defer { endCoordinatorIO() }
         radioReconnectTask?.cancel()
         radioReconnectTask = nil
-        stateObserver?.cancel()
-        stateObserver = nil
+        stopObservingState()
         // Detach BEFORE the await: `close()` is a cross-actor suspension
         // point, and a concurrent connect() interleaving there would have
         // its fresh transport clobbered by a post-await `transport = nil`.
@@ -193,9 +256,14 @@ public final class TransportCoordinator {
     /// rescan + reopen on wake. Called from the scenePhase observer on
     /// iOS only; macOS Bluetooth connections survive fine.
     public func handleScenePhaseBackground() async {
+        if mcpOperationInFlight {
+            log.warning("Background transport teardown deferred during MCP cleanup")
+            return
+        }
+        foregroundReconnectPending = false
         resumeRadioOnForeground = transport != nil
         guard transport != nil else { return }
-        await disconnect()
+        await detachTransportForBackground()
     }
 
     /// Foreground restore: refresh the device list (also the mitigation
@@ -203,14 +271,14 @@ public final class TransportCoordinator {
     /// notifications never fire) and reconnect if backgrounding tore a
     /// live connection down.
     public func handleScenePhaseActive() async {
+        guard !mcpOperationInFlight else { return }
         refreshPairedDevices()
         guard resumeRadioOnForeground else { return }
-        resumeRadioOnForeground = false
-        if selectedDevice == nil, let first = availableDevices.first {
-            select(first)
+        guard !coordinatorIOInFlight else {
+            foregroundReconnectPending = true
+            return
         }
-        guard selectedDevice != nil else { return }
-        await connect()
+        await reconnectAfterBackground()
     }
 
     /// Re-run the MMDVM GetVersion probe against the current transport.
@@ -219,6 +287,16 @@ public final class TransportCoordinator {
     /// state-observer task, which races with the probe kicked off from
     /// `connect()` and causes the first-launch probe to silently bail.
     public func probeRadioMode() async {
+        guard !mcpOperationInFlight else {
+            log.warning("Mode probe ignored while MCP owns the radio transport")
+            return
+        }
+        guard beginCoordinatorIO(operation: "mode probe") else { return }
+        defer { endCoordinatorIO() }
+        await probeRadioModeOwned()
+    }
+
+    private func probeRadioModeOwned() async {
         guard let t = transport else { return }
         isProbingMode = true
         defer { isProbingMode = false }
@@ -257,6 +335,12 @@ public final class TransportCoordinator {
     }
 
     public func sendIdentify() async {
+        guard !mcpOperationInFlight else {
+            log.warning("CAT identify ignored while MCP owns the radio transport")
+            return
+        }
+        guard beginCoordinatorIO(operation: "CAT identify") else { return }
+        defer { endCoordinatorIO() }
         guard let t = transport else { return }
         isBusy = true
         defer { isBusy = false }
@@ -306,39 +390,56 @@ public final class TransportCoordinator {
     /// the exit byte and reboots; the coordinator transitions to
     /// `.disconnected` and the user must re-pair / reconnect.
     public func enableReflectorTerminalMode() async {
+        guard !mcpOperationInFlight else {
+            log.warning("Ignoring overlapping MCP setup request")
+            return
+        }
+        #if os(iOS)
+        mcpStatus = .failed(
+            "Radio programming is disabled on iPad because app suspension can "
+                + "interrupt MCP cleanup. No radio setting was changed."
+        )
+        return
+        #else
         guard let t = transport, case .connected = state else {
             mcpStatus = .failed("Not connected to the radio.")
             return
         }
-        // Prove the CAT path FIRST. `0M PROGRAM` sent at a radio that
-        // isn't answering leaves it half-entered in programming mode,
-        // mute to everything until a power cycle (hardware-verified
-        // 2026-07-19, and it poisons all subsequent debugging).
-        await sendIdentify()
-        guard lastResponseText.hasPrefix("Identify:") else {
+        guard !coordinatorIOInFlight else {
             mcpStatus = .failed(
-                "Radio is not answering CAT (last response: \(lastResponseText)). "
-                + "Not entering programming mode, because that would wedge the radio. "
-                + "Power-cycle the radio, reconnect, and retry once Send ID works.")
+                "Another radio operation is still in progress; wait for it to finish "
+                    + "before entering programming mode."
+            )
             return
         }
+        // MainActor makes both ownership transitions atomic with respect to
+        // every public coordinator operation and reconnect attempt.
+        mcpOperationInFlight = true
+        coordinatorIOInFlight = true
         isBusy = true
+        defer {
+            mcpOperationInFlight = false
+            coordinatorIOInFlight = false
+            isBusy = false
+        }
         mcpStatus = .running("Entering programming mode…")
         log.info("MCP: enable Reflector Terminal Mode starting")
 
         let session = McpSession(transport: t)
+        guard await proveCatModeForMcp() else { return }
+        quarantineTransportForMcp()
         do {
-            // Surface progress as the coordinator works through the steps.
-            mcpStatus = .running("Entering programming mode…")
+            // `enterProgramming` performs exact typed ID/FV target
+            // qualification immediately before its entry wire write.
+            mcpStatus = .running("Qualifying TH-D75 firmware 1.03…")
             try await session.enterProgramming()
             mcpStatus = .running("Reading page 0x1C…")
-            // `enableReflectorTerminalMode` performs read → patch → write → exit.
-            // We already called `enterProgramming` above, so run the rest
-            // piecewise for better progress reporting.
             let page = pageOf(offset: 0x1CA0)
             let byte = byteOf(offset: 0x1CA0)
             let currentData = try await session.readPage(page)
-            let patched = try patchPageByte(pageData: currentData, offset: byte, value: 1)
+            let patched = try patchPageByte(
+                pageData: currentData, offset: byte, value: 1
+            )
             if currentData == patched {
                 log.info("MCP: radio already in Reflector Terminal Mode; skipping write")
                 mcpStatus = .running("Already enabled; exiting programming mode…")
@@ -349,18 +450,8 @@ public final class TransportCoordinator {
             }
             try await session.exitProgramming()
 
-            // Radio will drop the connection; force our local state to
-            // match. Detach before the await (same reentrancy rule as
-            // `disconnect()`).
-            stateObserver?.cancel()
-            stateObserver = nil
-            let t = transport
-            transport = nil
-            state = .disconnected
-            radioMode = .unknown
-            await t?.close()
+            await detachAfterMcpAttempt(t)
             mcpStatus = .succeededRebooting
-            isBusy = false
             log.info("MCP: enable Reflector Terminal Mode succeeded")
             // The radio reboots itself on programming-mode exit (its
             // protocol, same as over Bluetooth). Reconnect automatically
@@ -368,151 +459,148 @@ public final class TransportCoordinator {
             scheduleRadioReconnect()
         } catch {
             log.error("MCP: enable Reflector Terminal Mode failed: \(error)")
+            let mustDetach = await session.requiresTransportDetach()
+            let exitProved = await session.exitWasProved()
+            if mustDetach {
+                await detachAfterMcpAttempt(t)
+                if exitProved {
+                    scheduleRadioReconnect()
+                }
+            } else {
+                await restoreObservationAfterSafeQualificationFailure(t)
+            }
             mcpStatus = .failed(error.displayMessage)
-            isBusy = false
         }
+        #endif
     }
 
     public func acknowledgeMcpStatus() {
         mcpStatus = .idle
     }
 
-    /// One-tap, fully automated path to a USB-relay-ready radio.
-    ///
-    /// The app reads and fixes BOTH settings the relay depends on
-    /// (Menu 650 Reflector Terminal Mode and Menu 985 DV Gateway
-    /// Interface = USB), reboots the radio only if something changed,
-    /// then reconnects and POLLS for MMDVM (terminal mode engages
-    /// ~50 s after the reboot, so a single probe would always miss it).
-    /// No radio keypresses, no manual reconnect.
-    public func setUpUsbRelay() async {
-        guard let t = transport, case .connected = state else {
-            mcpStatus = .failed("Connect the radio first.")
-            return
-        }
-        isBusy = true
-
-        // 1. Cheap readiness check: if MMDVM already answers over USB,
-        // the radio is set up correctly and no reboot is needed.
-        mcpStatus = .running("Checking whether the radio is already relay-ready…")
-        await probeRadioMode()
-        if radioMode == .mmdvm {
-            lastResponseText = "Radio is already in Terminal Mode over USB, ready to relay."
-            mcpStatus = .idle
-            isBusy = false
-            return
-        }
-
-        // 2. Reprogramming needs a live CAT parser.
-        await sendIdentify()
-        guard lastResponseText.hasPrefix("Identify:") else {
-            mcpStatus = .failed(
-                "Radio isn't answering CAT (\(lastResponseText)). Can't reprogram. "
-                + "Power-cycle the radio, reconnect, and try again.")
-            isBusy = false
-            return
-        }
-
-        // 3. Read + fix the relay settings in one programming pass.
-        mcpStatus = .running("Reading and updating radio settings…")
-        let session = McpSession(transport: t)
-        let report: UsbRelaySetupReport
-        do {
-            report = try await session.prepareForUsbRelay()
-        } catch {
-            mcpStatus = .failed("Couldn't program the radio: \(error.displayMessage)")
-            isBusy = false
-            return
-        }
-        lastRelaySetup = report
-        log.info("USB relay setup: \(report.summary)")
-
-        // 4. Reconnect + poll for terminal mode to come up.
-        if report.rebooted {
-            mcpStatus = .running("Applied changes; radio is rebooting.\n\(report.summary)")
-        } else {
-            mcpStatus = .running("Settings were already correct; waiting for MMDVM…")
-        }
-        await reconnectAndPollForMmdvm()
-        isBusy = false
-    }
-
-    /// After a settings-change reboot, reconnect to the radio and poll
-    /// the MMDVM probe until terminal mode answers (or a 2-minute
-    /// ceiling). Manages the transport directly so the standard
-    /// unexpected-drop reconnect logic doesn't race this.
-    private func reconnectAndPollForMmdvm() async {
+    /// Remove every coordinator reference to a transport that may have
+    /// entered MCP or begun its reset. Detach before awaiting close so
+    /// the observable state can never claim this link is still usable.
+    private func detachAfterMcpAttempt(_ attemptedTransport: RadioTransport) async {
         radioReconnectTask?.cancel()
         radioReconnectTask = nil
-        stateObserver?.cancel()
-        stateObserver = nil
-        await transport?.close()
+        stopObservingState()
         transport = nil
         state = .disconnected
         radioMode = .unknown
+        await attemptedTransport.close()
+    }
 
-        guard let device = selectedDevice else {
-            mcpStatus = .failed("No radio selected to reconnect to.")
+    /// Give one McpSession exclusive logical ownership before its first
+    /// await. This hides the transport from RelayCoordinator and every
+    /// other public coordinator I/O path while the wire mode is unknown.
+    private func quarantineTransportForMcp() {
+        radioReconnectTask?.cancel()
+        radioReconnectTask = nil
+        stopObservingState()
+        transport = nil
+        state = .disconnected
+        radioMode = .unknown
+    }
+
+    /// Require a positive CAT-mode classification before MCP takes the
+    /// transport. A live MMDVM classification means a relay may already
+    /// own captured reader/writer handles, so no CAT or MCP byte is sent.
+    private func proveCatModeForMcp() async -> Bool {
+        if radioMode == .cat {
+            return true
+        }
+        if radioMode == .mmdvm {
+            lastResponseText = "Radio is already in Terminal Mode."
+            mcpStatus = .idle
+            return false
+        }
+
+        mcpStatus = .running("Confirming CAT mode…")
+        await probeRadioModeOwned()
+        switch radioMode {
+        case .cat:
+            return true
+        case .mmdvm:
+            lastResponseText = "Radio is already in Terminal Mode."
+            mcpStatus = .idle
+            return false
+        case .unknown, .unrecognized:
+            mcpStatus = .failed(
+                "Radio mode could not be proved as CAT; refusing to enter programming mode."
+            )
+            return false
+        }
+    }
+
+    /// Qualification failures happen before any MCP entry byte and leave
+    /// a live CAT transport safe to keep. Restore observation only if the
+    /// transport itself still agrees that it is connected.
+    private func restoreObservationAfterSafeQualificationFailure(
+        _ attemptedTransport: RadioTransport
+    ) async {
+        if await attemptedTransport.state == .connected {
+            transport = attemptedTransport
+            state = .connected
+            observeState(of: attemptedTransport)
+        } else {
+            await detachAfterMcpAttempt(attemptedTransport)
+        }
+    }
+
+    /// Background teardown is intentionally allowed to interrupt an ordinary
+    /// coordinator transaction. Detach synchronously, invalidate any suspended
+    /// open, then close so parked reads are resumed without exposing the link.
+    private func detachTransportForBackground() async {
+        radioReconnectTask?.cancel()
+        radioReconnectTask = nil
+        stopObservingState()
+        transportGeneration &+= 1
+        let detached = transport
+        transport = nil
+        state = .disconnected
+        radioMode = .unknown
+        await detached?.close()
+    }
+
+    private func reconnectAfterBackground() async {
+        guard resumeRadioOnForeground else { return }
+        guard !coordinatorIOInFlight, !mcpOperationInFlight else {
+            foregroundReconnectPending = true
             return
         }
-
-        // Let the radio actually drop and begin rebooting.
-        try? await Task.sleep(nanoseconds: 3_000_000_000)
-        let deadline = ContinuousClock.now.advanced(by: .seconds(120))
-
-        while ContinuousClock.now < deadline {
-            if transport == nil {
-                refreshPairedDevices()
-                if availableDevices.contains(where: { $0.address == device.address }) {
-                    mcpStatus = .running("Reconnecting to the radio…")
-                    let fresh = transportFactory(device)
-                    do {
-                        try await fresh.open()
-                        transport = fresh
-                    } catch {
-                        // Radio not back yet; wait and retry.
-                        try? await Task.sleep(nanoseconds: 3_000_000_000)
-                        continue
-                    }
-                } else {
-                    try? await Task.sleep(nanoseconds: 3_000_000_000)
-                    continue
-                }
-            }
-
-            if let t = transport {
-                mcpStatus = .running("Connected; waiting for Terminal Mode (MMDVM)…")
-                let prober = RadioModeProber(transport: t)
-                if let mode = try? await prober.probe(), mode == .mmdvm {
-                    radioMode = .mmdvm
-                    lastProbeErrorText = nil
-                    state = .connected
-                    observeState(of: t)   // hand back to normal drop-handling
-                    rememberedRadioAddress = device.address
-                    rememberedRadioName = device.name
-                    lastResponseText = "Radio is in Terminal Mode over USB, ready to relay."
-                    mcpStatus = .idle
-                    return
-                }
-                // Still CAT (radio mid-boot); the transport may also
-                // drop as the radio reboots; detect and re-acquire.
-                if await t.state == .disconnected {
-                    await t.close()
-                    transport = nil
-                }
-            }
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+        foregroundReconnectPending = false
+        resumeRadioOnForeground = false
+        if selectedDevice == nil, let first = availableDevices.first {
+            select(first)
         }
+        guard selectedDevice != nil else { return }
+        await connect()
+    }
 
-        // Timed out. Leave whatever transport we have connected for CAT.
-        if let t = transport {
-            state = .connected
-            observeState(of: t)
+    /// Acquire the coordinator's transport transaction lease synchronously,
+    /// before the caller reaches its first suspension point.
+    private func beginCoordinatorIO(operation: String) -> Bool {
+        guard !mcpOperationInFlight else {
+            log.warning("\(operation, privacy: .public) ignored while MCP owns the transport")
+            return false
         }
-        mcpStatus = .failed(
-            "The radio didn't come up in Terminal Mode within 2 minutes. "
-            + "If its screen shows TERM, tap Set up USB relay again; otherwise "
-            + "it may still be booting.")
+        guard !coordinatorIOInFlight else {
+            log.warning(
+                "\(operation, privacy: .public) ignored while another radio operation is in progress"
+            )
+            return false
+        }
+        coordinatorIOInFlight = true
+        return true
+    }
+
+    private func endCoordinatorIO() {
+        coordinatorIOInFlight = false
+        guard foregroundReconnectPending, resumeRadioOnForeground else { return }
+        Task { @MainActor [weak self] in
+            await self?.reconnectAfterBackground()
+        }
     }
 
     /// Race `transport.read` against an absolute deadline. Returns `nil` if
@@ -540,14 +628,26 @@ public final class TransportCoordinator {
     }
 
     private func observeState(of transport: RadioTransport) {
-        stateObserver?.cancel()
+        stopObservingState()
+        let observationGeneration = stateObservationGeneration
         let stream = transport.stateStream
         stateObserver = Task { @MainActor [weak self] in
             for await s in stream {
-                guard let self else { return }
+                guard let self,
+                      !Task.isCancelled,
+                      self.stateObservationGeneration == observationGeneration else { return }
                 self.applyTransportState(s)
             }
         }
+    }
+
+    /// Invalidate the observer synchronously before detaching or closing its
+    /// transport. The generation change is the correctness fence; cancellation
+    /// only lets the old task retire promptly.
+    private func stopObservingState() {
+        stateObservationGeneration &+= 1
+        stateObserver?.cancel()
+        stateObserver = nil
     }
 
     /// Apply a state yielded by the transport's own stream. A
@@ -556,19 +656,29 @@ public final class TransportCoordinator {
     /// closing the transport.
     private func applyTransportState(_ s: RadioTransportState) {
         let previous = state
-        state = s
         switch s {
         case .failed:
+            state = s
             radioMode = .unknown
         case .disconnected:
+            state = s
             guard case .connected = previous else { return }
             log.warning("Transport dropped unexpectedly")
             radioMode = .unknown
             transport = nil
+            stopObservingState()
             NotificationManager.shared.radioDisconnected()
             scheduleRadioReconnect()
-        case .connecting, .connected:
-            break
+        case .connecting:
+            // `performConnectOwned()` publishes `.connected` from the
+            // transport's post-open snapshot. A buffered pre-open event must
+            // never regress that current state after `connect()` returns.
+            guard case .connected = previous else {
+                state = s
+                return
+            }
+        case .connected:
+            state = s
         }
     }
 
@@ -596,6 +706,8 @@ public final class TransportCoordinator {
         switch resp {
         case .identify(let model):
             return "Identify: \(model)"
+        case .firmwareVersion(let version):
+            return "Firmware: \(version)"
         case .unknown:
             return "? (unknown command)"
         case .notAvailableInMode:

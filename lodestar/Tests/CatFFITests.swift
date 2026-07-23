@@ -10,12 +10,26 @@ final class CatFFITests: XCTestCase {
         XCTAssertEqual(bytes, Array("ID\r".utf8))
     }
 
+    func testEncodeFirmwareVersionIsFvCr() {
+        let bytes = encodeCat(command: .firmwareVersion)
+        XCTAssertEqual(bytes, Array("FV\r".utf8))
+    }
+
     func testParseIdentifyResponse() {
         let resp = parseCatLine(line: Array("ID TH-D75A".utf8))
         if case .identify(let model) = resp {
             XCTAssertEqual(model, "TH-D75A")
         } else {
             XCTFail("expected .identify, got \(resp)")
+        }
+    }
+
+    func testParseFirmwareVersionResponse() {
+        let resp = parseCatLine(line: Array("FV 1.03".utf8))
+        if case .firmwareVersion(let version) = resp {
+            XCTAssertEqual(version, "1.03")
+        } else {
+            XCTFail("expected .firmwareVersion, got \(resp)")
         }
     }
 
@@ -60,7 +74,7 @@ final class CatFFITests: XCTestCase {
         let response = parseCatLine(line: line)
 
         if case .identify(let model) = response {
-            XCTAssertEqual(model, "TH-D75A")
+            XCTAssertEqual(model, "TH-D75")
         } else {
             XCTFail("expected .identify, got \(response)")
         }

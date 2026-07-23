@@ -3,15 +3,18 @@
 
 //! Minimal CAT command codec exposed to Swift.
 //!
-//! Covers the `ID` identify command and a generic `ID`-response
-//! parser. Broader CAT coverage lives in `kenwood-thd75`'s protocol
-//! module and can be surfaced here on demand.
+//! Covers the `ID` identify and `FV` firmware-version commands used to
+//! qualify a radio before firmware-specific MCP access. Broader CAT
+//! coverage lives in `kenwood-thd75`'s protocol module and can be
+//! surfaced here on demand.
 
 /// CAT commands that Lodestar can send over the transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatCommand {
     /// Radio identity query: `ID\r`.
     Identify,
+    /// Firmware-version query: `FV\r`.
+    FirmwareVersion,
 }
 
 /// Parsed CAT response received from the radio.
@@ -21,6 +24,11 @@ pub enum CatResponse {
     Identify {
         /// Radio model reported by the `ID` response, e.g. `TH-D75A`.
         model: String,
+    },
+    /// Firmware-version response: version string after the `FV ` prefix.
+    FirmwareVersion {
+        /// Radio firmware version, e.g. `1.03`.
+        version: String,
     },
     /// Radio returned `?`, meaning unknown command.
     Unknown,
@@ -38,6 +46,7 @@ pub enum CatResponse {
 pub fn encode_cat(command: CatCommand) -> Vec<u8> {
     match command {
         CatCommand::Identify => b"ID\r".to_vec(),
+        CatCommand::FirmwareVersion => b"FV\r".to_vec(),
     }
 }
 
@@ -65,6 +74,11 @@ pub fn parse_cat_line(line: Vec<u8>) -> CatResponse {
             model: rest.trim().to_owned(),
         };
     }
+    if let Some(rest) = text.strip_prefix("FV ") {
+        return CatResponse::FirmwareVersion {
+            version: rest.trim().to_owned(),
+        };
+    }
     CatResponse::Raw { line: text }
 }
 
@@ -78,12 +92,28 @@ mod tests {
     }
 
     #[test]
+    fn encode_firmware_version_is_fv_cr() {
+        assert_eq!(encode_cat(CatCommand::FirmwareVersion), b"FV\r");
+    }
+
+    #[test]
     fn parse_identity_response() {
         let r = parse_cat_line(b"ID TH-D75A".to_vec());
         assert_eq!(
             r,
             CatResponse::Identify {
                 model: "TH-D75A".to_owned(),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_firmware_version_response() {
+        let r = parse_cat_line(b"FV 1.03".to_vec());
+        assert_eq!(
+            r,
+            CatResponse::FirmwareVersion {
+                version: "1.03".to_owned(),
             },
         );
     }

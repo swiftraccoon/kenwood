@@ -13,14 +13,15 @@
 //!
 //! # Protocol summary
 //!
-//! - **Entry:** send `0M PROGRAM\r` at 9600 baud. Radio replies `0M\r`.
+//! - **Entry:** send `\r0M PROGRAM\r` at 9600 baud. The leading carriage
+//!   return terminates stale CAT bytes; the radio replies `0M\r`.
 //! - **Read:** `R` + 2-byte BE page + `0x00 0x00` (5 bytes).
 //!   Radio replies with a full `W` write frame (261 bytes) plus a
 //!   trailing `ACK` (`0x06`).
 //! - **Write:** `W` + 2-byte BE page + `0x00 0x00` + 256 data bytes
 //!   (261 bytes total). Radio replies with a single `ACK` byte.
-//! - **Exit:** single byte `E`. The radio drops the USB/BT connection
-//!   after this; the caller must reconnect.
+//! - **Exit:** single byte `E`. The radio replies with a single `ACK`
+//!   byte, then drops the USB/BT connection; the caller must reconnect.
 //!
 //! # Reflector Terminal Mode
 //!
@@ -32,15 +33,18 @@
 use thiserror::Error;
 
 /// Command to enter programming mode. Send at 9600 baud.
-pub const ENTER_PROGRAMMING_CMD: &[u8] = b"0M PROGRAM\r";
+///
+/// The leading carriage return terminates any stale, unterminated CAT
+/// bytes before the firmware sees `0M PROGRAM`.
+pub const ENTER_PROGRAMMING_CMD: &[u8] = b"\r0M PROGRAM\r";
 
 /// Expected radio reply to [`ENTER_PROGRAMMING_CMD`].
 pub const ENTER_RESPONSE: &[u8] = b"0M\r";
 
-/// Single-byte acknowledgement the radio sends after each page read/write.
+/// Single-byte acknowledgement used by the page and exit handshakes.
 pub const ACK: u8 = 0x06;
 
-/// Single-byte command to exit programming mode. Radio drops the connection.
+/// Single-byte command to exit programming mode. Radio replies with [`ACK`].
 pub const EXIT_CMD: u8 = b'E';
 
 /// Bytes per MCP page.
@@ -102,6 +106,12 @@ pub enum McpError {
         /// The byte that was there instead of `'W'`.
         actual: u8,
     },
+    /// Response addressed a nonzero byte offset within the page.
+    #[error("expected page-aligned W response, got offset {actual}")]
+    NonZeroOffset {
+        /// The big-endian offset encoded in header bytes 3-4.
+        actual: u16,
+    },
     /// Offset into a page was out of range.
     #[error("byte offset {offset} out of range (page is {size} bytes)")]
     OffsetOutOfRange {
@@ -127,7 +137,7 @@ pub fn byte_of(offset: u16) -> u8 {
     (offset & 0xFF) as u8
 }
 
-/// Build the 11-byte `0M PROGRAM\r` command.
+/// Build the 12-byte `\r0M PROGRAM\r` command.
 #[must_use]
 #[uniffi::export]
 pub fn build_enter_cmd() -> Vec<u8> {
@@ -219,6 +229,12 @@ pub fn parse_w_frame(bytes: Vec<u8>) -> Result<McpPage, McpError> {
     let hi = bytes.get(1).copied().unwrap_or(0);
     let lo = bytes.get(2).copied().unwrap_or(0);
     let page = u16::from_be_bytes([hi, lo]);
+    let offset_hi = bytes.get(3).copied().unwrap_or(0);
+    let offset_lo = bytes.get(4).copied().unwrap_or(0);
+    let offset = u16::from_be_bytes([offset_hi, offset_lo]);
+    if offset != 0 {
+        return Err(McpError::NonZeroOffset { actual: offset });
+    }
     let data = bytes
         .get(5..5 + PAGE_SIZE)
         .ok_or_else(|| McpError::ResponseTooShort {
@@ -267,6 +283,7 @@ mod tests {
     #[test]
     fn enter_cmd_is_fixed_string() {
         assert_eq!(build_enter_cmd(), ENTER_PROGRAMMING_CMD);
+        assert_eq!(build_enter_cmd(), b"\r0M PROGRAM\r");
     }
 
     #[test]
@@ -363,6 +380,15 @@ mod tests {
             matches!(result, Err(McpError::ResponseTooShort { .. })),
             "got {result:?}"
         );
+    }
+
+    #[test]
+    fn parse_w_frame_rejects_nonzero_offset() -> TestResult {
+        let mut bytes = build_write_page_cmd(0x1C, vec![0; PAGE_SIZE])?;
+        *bytes.get_mut(4).ok_or("offset byte missing")? = 1;
+        let result = parse_w_frame(bytes);
+        assert_eq!(result, Err(McpError::NonZeroOffset { actual: 1 }));
+        Ok(())
     }
 
     #[test]

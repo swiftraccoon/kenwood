@@ -81,35 +81,27 @@ struct SessionScreen: View {
 
 }
 
-/// "Set up radio for USB relay" card. Only surfaced when the radio is
-/// connected in CAT (or unrecognized) mode. If MMDVM already answers
-/// we skip it entirely.
+/// Firmware-qualified Menu 650 setup card. Menu 985 is deliberately not
+/// written: its raw USB/Bluetooth value mapping is not independently proved.
 struct McpCard: View {
     let transport: TransportCoordinator
 
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
-                Label("Set up radio for USB relay", systemImage: "gearshape.2")
+                Label("Enable Reflector Terminal Mode", systemImage: "gearshape.2")
                     .font(.headline)
-                Text("Reads and fixes both radio settings the relay needs, Reflector Terminal Mode (Menu 650) and the DV Gateway Interface (Menu 985 → USB), then reconnects and waits for the radio to come up. The radio reboots only if something changed; no menu keypresses, no manual reconnect.")
+                Text("Verifies the exact TH-D75 model and firmware, then changes Menu 650 only. Lodestar does not write Menu 985 because its raw USB/Bluetooth mapping is not yet independently verified.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
 
                 Button {
-                    Task { await transport.setUpUsbRelay() }
+                    Task { await transport.enableReflectorTerminalMode() }
                 } label: {
-                    Label("Set up radio for USB relay", systemImage: "arrow.up.right.circle.fill")
+                    Label("Enable Terminal Mode", systemImage: "arrow.up.right.circle.fill")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(transport.isBusy)
-
-                if let setup = transport.lastRelaySetup {
-                    Text(setup.summary)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                }
 
                 mcpStatus
             }
@@ -132,7 +124,8 @@ struct McpCard: View {
                     .foregroundStyle(.green)
                     .font(.callout)
                 Text("Radio is rebooting; the app reconnects automatically. On the "
-                     + "radio, make sure Menu 985 (DV Gateway Interface) is USB and "
+                     + "radio, make sure Menu 985 (DV Gateway Interface) matches this "
+                     + "connection (USB on iPad, Bluetooth on Mac) and "
                      + "Menu 650 is Terminal Mode. Mode should then read MMDVM.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -269,5 +262,3 @@ private struct DevicePickerSheet: View {
         .disabled(coordinator.isBusy)
     }
 }
-
-

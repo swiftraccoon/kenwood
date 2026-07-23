@@ -29,4 +29,20 @@ final class LodestarCoreFFITests: XCTestCase {
         let v = Lodestar.version()
         XCTAssertTrue(v.hasPrefix("0."), "expected 0.x.y core version, got \(v)")
     }
+
+    func testParseWFrameRejectsNonzeroOffsetAcrossSwiftBridge() throws {
+        var frame = try buildWritePageCmd(
+            page: 0x001C,
+            data: Data(repeating: 0xA5, count: 256)
+        )
+        frame[3] = 0x00
+        frame[4] = 0x01
+
+        XCTAssertThrowsError(try parseWFrame(bytes: frame)) { error in
+            guard let mcpError = error as? McpError else {
+                return XCTFail("expected McpError, got \(error)")
+            }
+            XCTAssertEqual(mcpError, .NonZeroOffset(actual: 1))
+        }
+    }
 }

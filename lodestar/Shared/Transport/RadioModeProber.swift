@@ -97,6 +97,9 @@ public struct RadioModeProber {
             // doesn't poison the next read.
             _ = try? await drainFrame(startBuffer: buffer, deadline: deadline)
             return .mmdvm
+        case .some(let byte)
+            where byte == UInt8(ascii: "?") || byte == UInt8(ascii: "N"):
+            return .cat
         case .some(let b):
             return .unrecognized(firstByte: b)
         }

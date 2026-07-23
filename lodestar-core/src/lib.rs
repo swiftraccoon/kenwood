@@ -10,7 +10,8 @@
 //! - [`audio`]: `RxAudioPipeline`, which AMBE-decodes reflector voice frames
 //!   into 8 kHz PCM with loss concealment, reorder rejection, and
 //!   click-free stream edges for on-device monitoring.
-//! - [`cat`]: minimal CAT codec covering the `ID` identify command.
+//! - [`cat`]: minimal CAT codec covering the `ID` identify and `FV`
+//!   firmware-version commands.
 //! - [`mcp`]: programming-protocol primitives for flipping menu 650
 //!   (DV Gateway) into Reflector Terminal Mode.
 //! - [`mmdvm`]: MMDVM frame codec and the `GetVersion` probe used for

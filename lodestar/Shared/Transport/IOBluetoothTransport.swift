@@ -25,7 +25,9 @@ public actor IOBluetoothTransport: RadioTransport {
     #if os(macOS)
     private var rfcomm: RFCOMMBridge?
     private var pendingReads: [[UInt8]] = []
-    private var readContinuations: [CheckedContinuation<[UInt8], Error>] = []
+    private var readContinuations:
+        [(id: UInt64, maxBytes: Int, continuation: CheckedContinuation<[UInt8], Error>)] = []
+    private var nextReadID: UInt64 = 0
     #endif
 
     public init(device: BluetoothDevice) {
@@ -88,8 +90,8 @@ public actor IOBluetoothTransport: RadioTransport {
             await bridge.close()
         }
         rfcomm = nil
-        for c in readContinuations {
-            c.resume(returning: [])
+        for reader in readContinuations {
+            reader.continuation.resume(returning: [])
         }
         readContinuations.removeAll()
         pendingReads.removeAll()
@@ -120,8 +122,16 @@ public actor IOBluetoothTransport: RadioTransport {
             return slice
         }
         if case .disconnected = _state { return [] }
-        return try await withCheckedThrowingContinuation { c in
-            readContinuations.append(c)
+        let id = nextReadID
+        nextReadID += 1
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { c in
+                readContinuations.append(
+                    (id: id, maxBytes: maxBytes, continuation: c)
+                )
+            }
+        } onCancel: {
+            Task { await self.cancelParkedRead(id: id) }
         }
         #else
         throw RadioTransportError.notAvailableOnPlatform(reason: "No IOBluetooth on iPad.")
@@ -130,19 +140,33 @@ public actor IOBluetoothTransport: RadioTransport {
 
     #if os(macOS)
     private func deliverRead(_ bytes: [UInt8]) {
-        if let c = readContinuations.first {
-            readContinuations.removeFirst()
-            c.resume(returning: bytes)
+        if !readContinuations.isEmpty {
+            let reader = readContinuations.removeFirst()
+            let slice = Array(bytes.prefix(reader.maxBytes))
+            if slice.count < bytes.count {
+                pendingReads.insert(Array(bytes.dropFirst(slice.count)), at: 0)
+            }
+            reader.continuation.resume(returning: slice)
             return
         }
         pendingReads.append(bytes)
     }
 
+    private func cancelParkedRead(id: UInt64) {
+        guard let index = readContinuations.firstIndex(
+            where: { $0.id == id }
+        ) else {
+            return
+        }
+        let reader = readContinuations.remove(at: index)
+        reader.continuation.resume(returning: [])
+    }
+
     private func handleUnexpectedClose() {
         rfcomm = nil
         updateState(.disconnected)
-        for c in readContinuations {
-            c.resume(returning: [])
+        for reader in readContinuations {
+            reader.continuation.resume(returning: [])
         }
         readContinuations.removeAll()
     }
@@ -175,9 +199,21 @@ private extension RadioTransportError {
 /// main thread, so the bridge lives on `@MainActor`.
 @MainActor
 final class RFCOMMBridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
+    private final class PendingWrite {
+        let bytes: [UInt8]
+        let continuation: CheckedContinuation<Void, Error>
+
+        init(bytes: [UInt8], continuation: CheckedContinuation<Void, Error>) {
+            self.bytes = bytes
+            self.continuation = continuation
+        }
+    }
+
     private let address: String
     private var channel: IOBluetoothRFCOMMChannel?
     private var openContinuation: CheckedContinuation<Void, Error>?
+    private var pendingWrites: [UInt64: PendingWrite] = [:]
+    private var nextWriteID: UInt64 = 1
     private var onData: (@Sendable ([UInt8]) -> Void)?
     private var onClose: (@Sendable () -> Void)?
 
@@ -278,22 +314,102 @@ final class RFCOMMBridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
             _ = ch.close()
         }
         channel = nil
+        failAllPendingWrites(with: RadioTransportError.notConnected)
     }
 
-    func write(_ bytes: [UInt8]) throws {
+    func write(_ bytes: [UInt8]) async throws {
         guard let ch = channel else {
             throw RadioTransportError.notConnected
         }
-        try bytes.withUnsafeBufferPointer { ptr -> Void in
-            guard let base = ptr.baseAddress else { return }
-            // IOBluetooth needs a mutable pointer; the call copies so the cast is safe.
-            let mutablePtr = UnsafeMutableRawPointer(mutating: UnsafeRawPointer(base))
-            let result = ch.writeSync(mutablePtr, length: UInt16(bytes.count))
-            if result != kIOReturnSuccess {
-                throw RadioTransportError.writeFailed(
-                    reason: "writeSync failed: \(String(format: "0x%08x", result))"
+        guard !bytes.isEmpty else { return }
+
+        // writeAsync rejects buffers larger than the negotiated RFCOMM
+        // MTU. Chunk serially and await each completion so byte order is
+        // preserved and no synchronous Bluetooth call can block MainActor.
+        let mtu = max(1, Int(ch.getMTU()))
+        var offset = 0
+        while offset < bytes.count {
+            try Task.checkCancellation()
+            let end = min(offset + mtu, bytes.count)
+            try await writeChunk(Array(bytes[offset..<end]), on: ch)
+            offset = end
+        }
+    }
+
+    private func writeChunk(
+        _ bytes: [UInt8],
+        on channel: IOBluetoothRFCOMMChannel
+    ) async throws {
+        let id = nextWriteID
+        nextWriteID &+= 1
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let pending = PendingWrite(
+                    bytes: bytes,
+                    continuation: continuation
                 )
+                pendingWrites[id] = pending
+                let refcon = UnsafeMutableRawPointer(
+                    bitPattern: UInt(id)
+                )
+                let result = pending.bytes.withUnsafeBufferPointer { buffer in
+                    guard let baseAddress = buffer.baseAddress else {
+                        return kIOReturnBadArgument
+                    }
+                    return channel.writeAsync(
+                        UnsafeMutableRawPointer(
+                            mutating: UnsafeRawPointer(baseAddress)
+                        ),
+                        length: UInt16(buffer.count),
+                        refcon: refcon
+                    )
+                }
+                if result != kIOReturnSuccess,
+                   let failed = pendingWrites.removeValue(forKey: id) {
+                    failed.continuation.resume(
+                        throwing: RadioTransportError.writeFailed(
+                            reason: "writeAsync failed: "
+                                + String(format: "0x%08x", result)
+                        )
+                    )
+                }
             }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancelPendingWrite(id: id)
+            }
+        }
+    }
+
+    private func cancelPendingWrite(id: UInt64) {
+        guard let pending = pendingWrites.removeValue(forKey: id) else {
+            return
+        }
+        pending.continuation.resume(throwing: CancellationError())
+    }
+
+    private func completePendingWrite(id: UInt64, status: IOReturn) {
+        guard let pending = pendingWrites.removeValue(forKey: id) else {
+            return
+        }
+        if status == kIOReturnSuccess {
+            pending.continuation.resume(returning: ())
+        } else {
+            pending.continuation.resume(
+                throwing: RadioTransportError.writeFailed(
+                    reason: "RFCOMM write completion failed: "
+                        + String(format: "0x%08x", status)
+                )
+            )
+        }
+    }
+
+    private func failAllPendingWrites(with error: Error) {
+        let pending = pendingWrites.values
+        pendingWrites.removeAll()
+        for write in pending {
+            write.continuation.resume(throwing: error)
         }
     }
 
@@ -331,12 +447,25 @@ final class RFCOMMBridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
         }
     }
 
+    nonisolated func rfcommChannelWriteComplete(
+        _ rfcommChannel: IOBluetoothRFCOMMChannel!,
+        refcon: UnsafeMutableRawPointer!,
+        status error: IOReturn
+    ) {
+        guard let refcon else { return }
+        let id = UInt(bitPattern: refcon)
+        Task { @MainActor [weak self] in
+            self?.completePendingWrite(id: UInt64(id), status: error)
+        }
+    }
+
     nonisolated func rfcommChannelClosed(
         _ rfcommChannel: IOBluetoothRFCOMMChannel!
     ) {
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.channel = nil
+            self.failAllPendingWrites(with: RadioTransportError.notConnected)
             self.onClose?()
         }
     }

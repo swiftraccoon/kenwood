@@ -14,95 +14,231 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "mcp"
 /// exchange. All protocol bytes are produced/parsed by the Rust side
 /// (`lodestar-core::mcp`); this type only sequences them.
 ///
-/// **Important:** Exiting programming mode causes the TH-D75 to drop
-/// the BT/USB connection and reboot. Callers must close the transport
-/// after `exitProgramming()` and reconnect from scratch.
+/// **Important:** Every firmware-offset flow first proves the exact
+/// supported target (`ID TH-D75`, `FV 1.03`). Once entry wire traffic
+/// starts, this actor owns cleanup: every exit attempt is one-shot, the
+/// transport is closed, and the session becomes terminal.
 public actor McpSession {
     public let transport: RadioTransport
 
+    private enum Phase: String, Sendable {
+        case inactive
+        case qualifying
+        case entering
+        case active
+        case exitSent
+        case terminal
+    }
+
+    private static let supportedModel = "TH-D75"
+    private static let supportedFirmwareWireValues: Set<String> = [
+        "1.03",
+        "1.03.000",
+    ]
+
+    private var phase: Phase = .inactive
+    private var operationInFlight = false
+    private var exclusiveFlowInProgress = false
+    private var exitAcknowledged = false
+    private var mcpDesynchronized = false
+    private let pageReadTimeoutSeconds: Double
+
     public init(transport: RadioTransport) {
         self.transport = transport
+        self.pageReadTimeoutSeconds = 5
+    }
+
+    init(transport: RadioTransport, pageReadTimeoutSeconds: Double) {
+        self.transport = transport
+        self.pageReadTimeoutSeconds = pageReadTimeoutSeconds
     }
 
     // MARK: - Primitive steps
 
-    /// Send `0M PROGRAM\r` and wait for `0M\r` confirmation.
+    /// Prove `TH-D75` firmware `1.03`, then send `0M PROGRAM\r`.
+    ///
+    /// The `FV` response is the last completed transaction before the
+    /// MCP entry write. The phase becomes `entering` before that write so
+    /// an ambiguous write/cancellation can never be mistaken for safe CAT.
     public func enterProgramming() async throws {
-        log.info("MCP enter: sending 0M PROGRAM")
-        try await transport.write(Array(buildEnterCmd()))
-        try await Task.sleep(nanoseconds: 10_000_000)
-
-        let expected = Array("0M\r".utf8)
-        var buffer: [UInt8] = []
-        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-
-        while !contains(buffer, expected) {
-            if ContinuousClock.now >= deadline {
-                log.error("MCP enter: timeout; received so far: \(Self.hex(buffer))")
-                throw McpOrchestratorError.enterTimeout(receivedSoFar: buffer)
-            }
-            // Race the read against the deadline: transport reads BLOCK
-            // until data arrives, so a silent radio would otherwise park
-            // this loop forever and the deadline above never re-fires.
-            guard let chunk = try await readRacingDeadline(maxBytes: 64, deadline: deadline) else {
-                continue // timed out; top of loop throws enterTimeout
-            }
-            if chunk.isEmpty {
-                try await Task.sleep(nanoseconds: 50_000_000)
-                continue
-            }
-            buffer.append(contentsOf: chunk)
-            // thd75 caps the scan at 20 bytes; we match.
-            if buffer.count > 20 {
-                log.error("MCP enter: unexpected reply: \(Self.hex(buffer))")
-                throw McpOrchestratorError.enterUnexpectedReply(received: buffer)
-            }
-        }
-        log.info("MCP enter: confirmed")
+        try requireNoExclusiveFlow(operation: "enter programming mode")
+        try await enterProgrammingOwned()
     }
 
-    /// Read one 256-byte page. Returns the page's raw contents.
+    private func enterProgrammingOwned() async throws {
+        try requireCleanupCapablePlatform()
+        try requirePhase(.inactive, operation: "enter programming mode")
+        phase = .qualifying
+        do {
+            try await qualifyFirmwareOffsetTarget()
+        } catch {
+            // No MCP entry wire byte has been sent. Restore the only
+            // reusable state before surfacing the qualification failure.
+            phase = .inactive
+            throw error
+        }
+
+        phase = .entering
+        operationInFlight = true
+        do {
+            log.info("MCP enter: sending 0M PROGRAM to qualified TH-D75 firmware 1.03")
+            try await writeWithDeadline(
+                Array(buildEnterCmd()),
+                operation: "MCP entry",
+                timeoutNanoseconds: 5_000_000_000
+            )
+            try await Task.sleep(nanoseconds: 10_000_000)
+
+            let expected = Array("0M\r".utf8)
+            var buffer: [UInt8] = []
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+
+            while !contains(buffer, expected) {
+                if ContinuousClock.now >= deadline {
+                    log.error("MCP enter: timeout; received so far: \(Self.hex(buffer))")
+                    throw McpOrchestratorError.enterTimeout(receivedSoFar: buffer)
+                }
+                guard let chunk = try await readRacingDeadline(
+                    maxBytes: 64, deadline: deadline
+                ) else {
+                    continue
+                }
+                if chunk.isEmpty {
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                    continue
+                }
+                buffer.append(contentsOf: chunk)
+                if buffer.count > 20 {
+                    log.error("MCP enter: unexpected reply: \(Self.hex(buffer))")
+                    throw McpOrchestratorError.enterUnexpectedReply(received: buffer)
+                }
+            }
+            operationInFlight = false
+            phase = .active
+            log.info("MCP enter: confirmed")
+        } catch {
+            mcpDesynchronized = true
+            operationInFlight = false
+            throw await terminateAfterOperationFailure(error)
+        }
+    }
+
+    /// Read one 256-byte page and require its echoed address to match.
     public func readPage(_ page: UInt16) async throws -> Data {
-        log.info("MCP read page 0x\(String(page, radix: 16, uppercase: true))")
-
-        try await transport.write(Array(buildReadPageCmd(page: page)))
-        try await Task.sleep(nanoseconds: 10_000_000)
-
-        let frame = try await readExact(count: 261, timeoutSeconds: 5)
-        let parsed = try parseWFrame(bytes: frame)
-
-        // Send our ACK. The radio echoes one back but thd75 treats the
-        // echo as best-effort: a missing echo doesn't fail the read.
-        try await transport.write([0x06])
-        try await Task.sleep(nanoseconds: 10_000_000)
-        _ = try? await readExact(count: 1, timeoutSeconds: 1)
-
-        log.info("MCP read page 0x\(String(page, radix: 16, uppercase: true)) complete")
-        return parsed.data
+        try requireNoExclusiveFlow(operation: "read MCP page")
+        return try await readPageOwned(page)
     }
 
-    /// Write one 256-byte page. Throws if the radio doesn't ACK with 0x06.
-    public func writePage(_ page: UInt16, data: Data) async throws {
-        log.info("MCP write page 0x\(String(page, radix: 16, uppercase: true))")
-
-        let cmd = try buildWritePageCmd(page: page, data: data)
-        try await transport.write(Array(cmd))
-        try await Task.sleep(nanoseconds: 10_000_000)
-
-        let ack = try await readExact(count: 1, timeoutSeconds: 5)
-        guard let b = ack.first, b == 0x06 else {
-            let got = ack.first ?? 0
-            log.error("MCP write: bad ACK 0x\(String(got, radix: 16))")
-            throw McpOrchestratorError.badWriteAck(actual: got)
+    private func readPageOwned(_ page: UInt16) async throws -> Data {
+        try beginActiveOperation("read MCP page")
+        do {
+            let data = try await readPageWithRetry(page)
+            operationInFlight = false
+            return data
+        } catch {
+            let terminalError = await terminateAfterOperationFailure(error)
+            operationInFlight = false
+            throw terminalError
         }
-        log.info("MCP write page 0x\(String(page, radix: 16, uppercase: true)) ACKed")
     }
 
-    /// Send the `E` byte. The radio drops the connection immediately after.
+    /// Write one page, require ACK, then verify all 256 bytes by read-back.
+    public func writePage(_ page: UInt16, data: Data) async throws {
+        try requireNoExclusiveFlow(operation: "write MCP page")
+        try await writePageOwned(page, data: data)
+    }
+
+    private func writePageOwned(_ page: UInt16, data: Data) async throws {
+        try beginActiveOperation("write MCP page")
+        var writeWireStarted = false
+        do {
+            log.info("MCP write page 0x\(String(page, radix: 16, uppercase: true))")
+
+            let cmd = try buildWritePageCmd(page: page, data: data)
+            writeWireStarted = true
+            try await writeWithDeadline(
+                Array(cmd),
+                operation: "MCP page write",
+                timeoutNanoseconds: 5_000_000_000
+            )
+            try await Task.sleep(nanoseconds: 10_000_000)
+
+            let ack = try await readExact(count: 1, timeoutSeconds: 5)
+            guard let actual = ack.first, actual == 0x06 else {
+                let got = ack.first ?? 0
+                log.error("MCP write: bad ACK 0x\(String(got, radix: 16))")
+                throw McpOrchestratorError.badWriteAck(actual: got)
+            }
+
+            let verified = try await readPageWithRetry(page)
+            let expectedBytes = [UInt8](data)
+            let actualBytes = [UInt8](verified)
+            if let mismatch = zip(expectedBytes, actualBytes).enumerated().first(
+                where: { $0.element.0 != $0.element.1 }
+            ) {
+                throw McpOrchestratorError.writeVerificationMismatch(
+                    page: page,
+                    offset: mismatch.offset,
+                    expected: mismatch.element.0,
+                    actual: mismatch.element.1
+                )
+            }
+            guard expectedBytes.count == actualBytes.count else {
+                throw McpOrchestratorError.writeVerificationLengthMismatch(
+                    page: page,
+                    expected: expectedBytes.count,
+                    actual: actualBytes.count
+                )
+            }
+            log.info("MCP write page 0x\(String(page, radix: 16, uppercase: true)) verified")
+            operationInFlight = false
+        } catch {
+            if writeWireStarted && !Self.isKnownAlignedFailure(error) {
+                mcpDesynchronized = true
+            }
+            let terminalError = await terminateAfterOperationFailure(error)
+            operationInFlight = false
+            throw terminalError
+        }
+    }
+
+    /// Send exactly one `E`, require `0x06`, close, and terminalize.
     public func exitProgramming() async throws {
-        log.info("MCP exit")
-        try await transport.write(Array(buildExitCmd()))
-        // No read; transport will close.
+        try requireNoExclusiveFlow(operation: "exit programming mode")
+        try await exitProgrammingOwned()
+    }
+
+    private func exitProgrammingOwned() async throws {
+        try beginActiveOperation("exit programming mode")
+        defer { operationInFlight = false }
+        do {
+            try await sendExitOnce()
+        } catch let error as McpOrchestratorError {
+            await transport.close()
+            throw error
+        } catch {
+            await transport.close()
+            throw McpOrchestratorError.exitNotProved(detail: error.displayMessage)
+        }
+        await transport.close()
+    }
+
+    /// Whether a coordinator must detach its reference to this transport.
+    ///
+    /// False only when target qualification failed before MCP entry wire
+    /// traffic. Once entry was attempted, this remains true forever.
+    public func requiresTransportDetach() -> Bool {
+        switch phase {
+        case .inactive, .qualifying:
+            return false
+        case .entering, .active, .exitSent, .terminal:
+            return true
+        }
+    }
+
+    /// True only when the radio returned the exact ACK for this session's E.
+    public func exitWasProved() -> Bool {
+        exitAcknowledged
     }
 
     // MARK: - High-level orchestration
@@ -114,93 +250,331 @@ public actor McpSession {
     /// returns (successfully or not), the caller **must** close the
     /// transport; the radio will reboot into the new mode.
     public func enableReflectorTerminalMode() async throws {
-        try await enterProgramming()
+        try beginExclusiveFlow(operation: "enable Reflector Terminal Mode")
+        defer { exclusiveFlowInProgress = false }
+        do {
+            try await enterProgrammingOwned()
 
-        let offset = UniFFI_GatewayModeOffset
-        let page = pageOf(offset: offset)
-        let byte = byteOf(offset: offset)
+            let offset = UniFFI_GatewayModeOffset
+            let page = pageOf(offset: offset)
+            let byte = byteOf(offset: offset)
 
-        let current = try await readPage(page)
-        let patched = try patchPageByte(
-            pageData: current,
-            offset: byte,
-            value: 1 // GATEWAY_MODE_REFLECTOR_TERMINAL
-        )
-
-        // Idempotence: if the radio is already in Reflector Terminal
-        // Mode, skip the write. Saves a flash cycle.
-        if current == patched {
-            log.info("MCP: radio already in Reflector Terminal Mode, skipping write")
-        } else {
-            try await writePage(page, data: patched)
-        }
-
-        try await exitProgramming()
-    }
-
-    /// Read every radio setting the USB reflector relay depends on, fix
-    /// any that are wrong, and report what was found and changed, in one
-    /// programming pass, fully automated, no menu keypresses.
-    ///
-    /// Two settings gate USB relay (both hardware-verified):
-    /// - **Menu 650 / `0x1CA0`** must be `1` (Reflector Terminal Mode).
-    /// - **Menu 985 / `0x1093`** (DV Gateway Interface) must be `USB`.
-    ///   If it points at Bluetooth, the gateway's MMDVM framing goes out
-    ///   the BT port and the USB port stays in plain CAT: the exact
-    ///   "CAT works but MMDVM silent" symptom.
-    ///
-    /// The radio reboots on programming-mode exit iff anything changed
-    /// (`report.rebooted`); the caller must then reconnect and poll for
-    /// MMDVM (terminal mode engages ~50 s after the reboot).
-    public func prepareForUsbRelay() async throws -> UsbRelaySetupReport {
-        try await enterProgramming()
-
-        // Gateway mode (page 0x1C, byte 0xA0) and interface (page 0x10,
-        // byte 0x93) live on different pages, so read each.
-        let gwPage = pageOf(offset: UniFFI_GatewayModeOffset)
-        let gwByte = byteOf(offset: UniFFI_GatewayModeOffset)
-        let gwData = try await readPage(gwPage)
-        let gwBefore = [UInt8](gwData)[Int(gwByte)]
-
-        let ifPage = pageOf(offset: UniFFI_DvGatewayInterfaceOffset)
-        let ifByte = byteOf(offset: UniFFI_DvGatewayInterfaceOffset)
-        let ifData = try await readPage(ifPage)
-        let ifBefore = [UInt8](ifData)[Int(ifByte)]
-
-        log.info("MCP relay setup: gatewayMode=\(gwBefore) interface=\(ifBefore) (target: mode=1 interface=\(UniFFI_DvGatewayInterfaceUsb))")
-
-        var wroteGateway = false
-        if gwBefore != UniFFI_GatewayModeReflectorTerminal {
+            let current = try await readPageOwned(page)
             let patched = try patchPageByte(
-                pageData: gwData, offset: gwByte,
-                value: UniFFI_GatewayModeReflectorTerminal
+                pageData: current,
+                offset: byte,
+                value: 1 // GATEWAY_MODE_REFLECTOR_TERMINAL
             )
-            try await writePage(gwPage, data: patched)
-            wroteGateway = true
+
+            // Idempotence: if the radio is already in Reflector Terminal
+            // Mode, skip the write. Saves a flash cycle.
+            if current == patched {
+                log.info("MCP: radio already in Reflector Terminal Mode, skipping write")
+            } else {
+                try await writePageOwned(page, data: patched)
+            }
+
+            try await exitProgrammingOwned()
+        } catch {
+            throw await finishHighLevelFailure(error)
         }
-
-        var wroteInterface = false
-        if ifBefore != UniFFI_DvGatewayInterfaceUsb {
-            let patched = try patchPageByte(
-                pageData: ifData, offset: ifByte,
-                value: UniFFI_DvGatewayInterfaceUsb
-            )
-            try await writePage(ifPage, data: patched)
-            wroteInterface = true
-        }
-
-        try await exitProgramming()
-
-        return UsbRelaySetupReport(
-            gatewayModeBefore: gwBefore,
-            interfaceBefore: ifBefore,
-            usbInterfaceValue: UniFFI_DvGatewayInterfaceUsb,
-            wroteGatewayMode: wroteGateway,
-            wroteInterface: wroteInterface
-        )
     }
 
     // MARK: - Private helpers
+
+    private func requireCleanupCapablePlatform() throws {
+        #if os(iOS)
+        // iOS can suspend the process without enough bounded execution time
+        // to prove the one-shot MCP exit handshake. Refuse before any CAT or
+        // programming-mode byte, even if this actor is used without the UI
+        // coordinator's platform gate.
+        throw McpOrchestratorError.platformCleanupNotGuaranteed
+        #endif
+    }
+
+    private func qualifyFirmwareOffsetTarget() async throws {
+        let identity = try await transactCat(.identify)
+        guard case .identify(let model) = identity else {
+            throw McpOrchestratorError.unexpectedCatResponse(
+                command: "ID", actual: String(describing: identity)
+            )
+        }
+        guard model == Self.supportedModel else {
+            throw McpOrchestratorError.unsupportedModel(actual: model)
+        }
+
+        let firmware = try await transactCat(.firmwareVersion)
+        guard case .firmwareVersion(let version) = firmware else {
+            throw McpOrchestratorError.unexpectedCatResponse(
+                command: "FV", actual: String(describing: firmware)
+            )
+        }
+        guard Self.supportedFirmwareWireValues.contains(version) else {
+            throw McpOrchestratorError.unsupportedFirmware(actual: version)
+        }
+
+        log.info("MCP target qualified: TH-D75 firmware 1.03")
+    }
+
+    private func transactCat(_ command: CatCommand) async throws -> CatResponse {
+        try await writeWithDeadline(
+            encodeCat(command: command),
+            operation: "CAT \(String(describing: command))",
+            timeoutNanoseconds: 2_000_000_000
+        )
+
+        var buffer: [UInt8] = []
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !buffer.contains(0x0D) {
+            if ContinuousClock.now >= deadline {
+                throw McpOrchestratorError.catResponseTimeout(
+                    command: String(describing: command),
+                    receivedSoFar: buffer
+                )
+            }
+            guard let chunk = try await readRacingDeadline(
+                maxBytes: 256, deadline: deadline
+            ) else {
+                continue
+            }
+            if chunk.isEmpty {
+                throw McpOrchestratorError.catTransportClosed(
+                    command: String(describing: command)
+                )
+            }
+            buffer.append(contentsOf: chunk)
+            if buffer.count > 512 {
+                throw McpOrchestratorError.catResponseTooLong(
+                    command: String(describing: command),
+                    received: buffer
+                )
+            }
+        }
+
+        let end = buffer.firstIndex(of: 0x0D) ?? buffer.endIndex
+        return parseCatLine(line: Array(buffer[..<end]))
+    }
+
+    private func readPageWithRetry(_ page: UInt16) async throws -> Data {
+        do {
+            return try await readPageAttempt(page)
+        } catch {
+            guard Self.isRetryablePageRead(error) else {
+                // Any other failure after R may leave a partial frame or
+                // delayed ACK. It is not safe to retry or trust a later
+                // 0x06 as proof of E.
+                mcpDesynchronized = true
+                throw error
+            }
+            log.warning(
+                "MCP read page 0x\(String(page, radix: 16, uppercase: true)) returned a fully ACKed stale page; retrying once: \(error.displayMessage)"
+            )
+            do {
+                return try await readPageAttempt(page)
+            } catch {
+                if !Self.isRetryablePageRead(error) {
+                    mcpDesynchronized = true
+                }
+                throw error
+            }
+        }
+    }
+
+    private func readPageAttempt(_ page: UInt16) async throws -> Data {
+        log.info("MCP read page 0x\(String(page, radix: 16, uppercase: true))")
+
+        try await writeWithDeadline(
+            Array(buildReadPageCmd(page: page)),
+            operation: "MCP page read request",
+            timeoutNanoseconds: 5_000_000_000
+        )
+        try await Task.sleep(nanoseconds: 10_000_000)
+
+        let frame = try await readExact(
+            count: 261, timeoutSeconds: pageReadTimeoutSeconds
+        )
+        let parsed = try parseWFrame(bytes: frame)
+
+        // A complete W frame always requires the host ACK before the
+        // radio emits its trailing ACK. Finish that exchange even when
+        // the echoed page is stale; only a fully realigned exchange may
+        // be retried.
+        try await writeWithDeadline(
+            [0x06],
+            operation: "MCP page read ACK",
+            timeoutNanoseconds: 1_000_000_000
+        )
+        try await Task.sleep(nanoseconds: 10_000_000)
+        do {
+            let ack = try await readExact(count: 1, timeoutSeconds: 1)
+            guard let actual = ack.first, actual == 0x06 else {
+                let got = ack.first ?? 0
+                mcpDesynchronized = true
+                throw McpOrchestratorError.badPageReadAck(
+                    page: parsed.page, actual: got
+                )
+            }
+        } catch {
+            mcpDesynchronized = true
+            if let error = error as? McpOrchestratorError,
+               case .badPageReadAck = error {
+                throw error
+            }
+            throw McpOrchestratorError.pageReadAckNotProved(
+                page: parsed.page, detail: error.displayMessage
+            )
+        }
+
+        guard parsed.page == page else {
+            throw McpOrchestratorError.pageEchoMismatch(
+                requested: page, actual: parsed.page
+            )
+        }
+
+        log.info("MCP read page 0x\(String(page, radix: 16, uppercase: true)) complete")
+        return parsed.data
+    }
+
+    private func sendExitOnce() async throws {
+        guard phase == .active || phase == .entering else {
+            throw McpOrchestratorError.invalidPhase(
+                operation: "send MCP exit",
+                expected: "active or entering",
+                actual: phase.rawValue
+            )
+        }
+
+        // This transition happens before the awaited write. From here
+        // onward an ambiguous transport result must never trigger a
+        // second E.
+        phase = .exitSent
+        defer { phase = .terminal }
+
+        do {
+            log.info("MCP exit")
+            try await writeWithDeadline(
+                Array(buildExitCmd()),
+                operation: "MCP exit",
+                timeoutNanoseconds: 1_000_000_000
+            )
+
+            let ack = try await readExact(count: 1, timeoutSeconds: 1)
+            guard let actual = ack.first, actual == 0x06 else {
+                let got = ack.first ?? 0
+                log.error("MCP exit: bad ACK 0x\(String(got, radix: 16))")
+                throw McpOrchestratorError.badExitAck(actual: got)
+            }
+            if mcpDesynchronized {
+                throw McpOrchestratorError.exitNotProved(
+                    detail: "a prior page exchange was desynchronized, so this ACK may be stale"
+                )
+            }
+            exitAcknowledged = true
+            log.info("MCP exit ACKed")
+        } catch let error as McpOrchestratorError {
+            switch error {
+            case .badExitAck, .exitNotProved:
+                throw error
+            default:
+                throw McpOrchestratorError.exitNotProved(detail: error.displayMessage)
+            }
+        } catch {
+            throw McpOrchestratorError.exitNotProved(detail: error.displayMessage)
+        }
+    }
+
+    private func terminateAfterOperationFailure(_ operation: Error) async -> Error {
+        guard phase != .inactive else { return operation }
+
+        var cleanupError: Error?
+        if phase == .active || phase == .entering {
+            do {
+                try await sendExitOnce()
+            } catch {
+                cleanupError = error
+            }
+        } else if phase == .exitSent {
+            cleanupError = McpOrchestratorError.exitNotProved(
+                detail: "the one-shot exit write was already started"
+            )
+            phase = .terminal
+        }
+
+        await transport.close()
+
+        if let cleanupError {
+            return McpOrchestratorError.operationAndCleanupFailed(
+                operation: operation.displayMessage,
+                cleanup: cleanupError.displayMessage
+            )
+        }
+        return operation
+    }
+
+    private func finishHighLevelFailure(_ error: Error) async -> Error {
+        if phase == .entering || phase == .active || phase == .exitSent {
+            return await terminateAfterOperationFailure(error)
+        }
+        if phase == .terminal {
+            await transport.close()
+        }
+        return error
+    }
+
+    private func requirePhase(_ expected: Phase, operation: String) throws {
+        guard phase == expected else {
+            throw McpOrchestratorError.invalidPhase(
+                operation: operation,
+                expected: expected.rawValue,
+                actual: phase.rawValue
+            )
+        }
+    }
+
+    private func beginActiveOperation(_ operation: String) throws {
+        try requirePhase(.active, operation: operation)
+        guard !operationInFlight else {
+            throw McpOrchestratorError.operationInProgress(operation: operation)
+        }
+        operationInFlight = true
+    }
+
+    private func requireNoExclusiveFlow(operation: String) throws {
+        guard !exclusiveFlowInProgress else {
+            throw McpOrchestratorError.operationInProgress(operation: operation)
+        }
+    }
+
+    private func beginExclusiveFlow(operation: String) throws {
+        try requireNoExclusiveFlow(operation: operation)
+        try requirePhase(.inactive, operation: operation)
+        guard !operationInFlight else {
+            throw McpOrchestratorError.operationInProgress(operation: operation)
+        }
+        exclusiveFlowInProgress = true
+    }
+
+    private static func isRetryablePageRead(_ error: Error) -> Bool {
+        guard let error = error as? McpOrchestratorError else { return false }
+        switch error {
+        case .pageEchoMismatch:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func isKnownAlignedFailure(_ error: Error) -> Bool {
+        guard let error = error as? McpOrchestratorError else { return false }
+        switch error {
+        case .pageEchoMismatch,
+             .writeVerificationMismatch,
+             .writeVerificationLengthMismatch:
+            return true
+        default:
+            return false
+        }
+    }
 
     private func readExact(count: Int, timeoutSeconds: Double) async throws -> Data {
         var buffer = Data()
@@ -225,6 +599,25 @@ public actor McpSession {
             buffer.append(contentsOf: chunk)
         }
         return buffer
+    }
+
+    private func writeWithDeadline(
+        _ bytes: [UInt8],
+        operation: String,
+        timeoutNanoseconds: UInt64
+    ) async throws {
+        let transport = self.transport
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await transport.write(bytes)
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                throw McpOrchestratorError.writeTimeout(operation: operation)
+            }
+            defer { group.cancelAll() }
+            _ = try await group.next()
+        }
     }
 
     /// Race a blocking transport read against an absolute deadline;
@@ -271,60 +664,123 @@ private let UniFFI_GatewayModeOffset: UInt16 = 0x1CA0
 /// Gateway-mode value for Reflector Terminal Mode (Menu 650 = 1).
 private let UniFFI_GatewayModeReflectorTerminal: UInt8 = 1
 
-/// MCP offset of the DV Gateway Interface setting (Menu 985), from the
-/// MCP-D75 registry field `radio.DvGatewayInterface`. Selects which
-/// physical port carries the gateway/MMDVM stream: USB or Bluetooth.
-/// When this points at Bluetooth, the USB CDC port stays in CAT and the
-/// `E0 03 00` MMDVM probe gets no reply: the whole "terminal mode is
-/// on but the app can't see it over USB" failure.
-private let UniFFI_DvGatewayInterfaceOffset: UInt16 = 0x1093
-
-/// Interface value for USB. The Kenwood menu lists "[USB] or
-/// [Bluetooth]" (USB first) and the MCP enum maps the first option to
-/// 0; `prepareForUsbRelay` reports the read-back so this is verifiable
-/// against hardware, and the write is reversible if it ever proves
-/// inverted on a firmware revision.
-private let UniFFI_DvGatewayInterfaceUsb: UInt8 = 0
-
-/// Outcome of `McpSession.prepareForUsbRelay`: what the radio's relay
-/// settings were, and what got changed. `rebooted` is true iff a flash
-/// write happened (the radio reboots on programming-mode exit only when
-/// something changed).
-public struct UsbRelaySetupReport: Sendable, Equatable {
-    /// Menu 650 value read before any change (1 = already terminal mode).
-    public let gatewayModeBefore: UInt8
-    /// Menu 985 value read before any change.
-    public let interfaceBefore: UInt8
-    /// The value written to mean USB (for read-back verification).
-    public let usbInterfaceValue: UInt8
-    /// Whether Menu 650 was flipped to Reflector Terminal Mode.
-    public let wroteGatewayMode: Bool
-    /// Whether Menu 985 was switched to USB.
-    public let wroteInterface: Bool
-
-    /// The radio reboots on exit only if a flash write occurred.
-    public var rebooted: Bool { wroteGatewayMode || wroteInterface }
-
-    /// One-line human summary for the diagnostics card.
-    public var summary: String {
-        var parts: [String] = []
-        parts.append("Menu 650 (terminal mode): was \(gatewayModeBefore)"
-            + (wroteGatewayMode ? " → 1" : " (already on)"))
-        let ifName = { (v: UInt8) in v == usbInterfaceValue ? "USB" : "Bluetooth" }
-        parts.append("Menu 985 (interface): was \(ifName(interfaceBefore))"
-            + (wroteInterface ? " → USB" : " (already USB)"))
-        return parts.joined(separator: "\n")
-    }
-}
-
 /// Errors from `McpSession`.
 public enum McpOrchestratorError: Error, Equatable, Sendable {
+    /// The platform cannot guarantee time for a bounded one-shot MCP cleanup.
+    case platformCleanupNotGuaranteed
+    /// An MCP step was invoked before entry or after the terminal exit attempt.
+    case invalidPhase(operation: String, expected: String, actual: String)
+    /// Another primitive already owns the session's transport exchange.
+    case operationInProgress(operation: String)
+    /// CAT did not return a complete line before qualification timed out.
+    case catResponseTimeout(command: String, receivedSoFar: [UInt8])
+    /// CAT transport closed while qualifying the radio.
+    case catTransportClosed(command: String)
+    /// CAT returned an unbounded line while qualifying the radio.
+    case catResponseTooLong(command: String, received: [UInt8])
+    /// A transport write did not complete within its MCP safety deadline.
+    case writeTimeout(operation: String)
+    /// A CAT response did not match the command used for qualification.
+    case unexpectedCatResponse(command: String, actual: String)
+    /// Firmware-offset MCP access is limited to the exact TH-D75 model.
+    case unsupportedModel(actual: String)
+    /// Firmware-offset MCP access is limited to firmware 1.03.
+    case unsupportedFirmware(actual: String)
     /// Did not receive `0M\r` from the radio within the timeout.
     case enterTimeout(receivedSoFar: [UInt8])
     /// Received something other than `0M\r` during entry.
     case enterUnexpectedReply(received: [UInt8])
     /// Expected `count` bytes, only got `got` before the timeout.
     case readTimeout(expected: Int, got: Int)
+    /// A page response echoed a different address than the request.
+    case pageEchoMismatch(requested: UInt16, actual: UInt16)
+    /// The radio's trailing ACK after a page read was the wrong byte.
+    case badPageReadAck(page: UInt16, actual: UInt8)
+    /// The radio's trailing ACK after a page read could not be proved.
+    case pageReadAckNotProved(page: UInt16, detail: String)
     /// Radio replied with a non-0x06 byte after a page write.
     case badWriteAck(actual: UInt8)
+    /// Page read-back differed from the 256 bytes sent.
+    case writeVerificationMismatch(
+        page: UInt16, offset: Int, expected: UInt8, actual: UInt8
+    )
+    /// Page read-back had an unexpected length.
+    case writeVerificationLengthMismatch(page: UInt16, expected: Int, actual: Int)
+    /// Radio replied with a non-0x06 byte after the programming-mode exit.
+    case badExitAck(actual: UInt8)
+    /// The one-shot MCP exit could not be proved.
+    case exitNotProved(detail: String)
+    /// An operation failed and its one-shot MCP cleanup also could not be proved.
+    case operationAndCleanupFailed(operation: String, cleanup: String)
+}
+
+extension McpOrchestratorError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .platformCleanupNotGuaranteed:
+            return "Radio programming is disabled on this platform because app suspension "
+                + "can interrupt MCP cleanup. No radio setting was changed."
+        case .invalidPhase(let operation, let expected, let actual):
+            return "Cannot \(operation): MCP session is \(actual), expected \(expected)."
+        case .operationInProgress(let operation):
+            return "Cannot \(operation): another MCP transport exchange is already in progress."
+        case .catResponseTimeout(let command, let received):
+            return "CAT \(command) timed out during MCP target qualification "
+                + "(\(received.count) byte(s) received)."
+        case .catTransportClosed(let command):
+            return "Radio transport closed while waiting for CAT \(command)."
+        case .catResponseTooLong(let command, let received):
+            return "CAT \(command) returned an invalid \(received.count)-byte line."
+        case .writeTimeout(let operation):
+            return "\(operation) write did not complete before its safety deadline."
+        case .unexpectedCatResponse(let command, let actual):
+            return "CAT \(command) returned \(actual); refusing firmware-offset MCP access."
+        case .unsupportedModel(let actual):
+            return "Refusing firmware-offset MCP access to model \(actual); "
+                + "the validated target is exactly TH-D75."
+        case .unsupportedFirmware(let actual):
+            return "Refusing firmware-offset MCP access to firmware \(actual); "
+                + "the validated TH-D75 firmware 1.03 wire forms are "
+                + "1.03 and 1.03.000."
+        case .enterTimeout(let received):
+            return "MCP entry timed out after receiving \(received.count) byte(s)."
+        case .enterUnexpectedReply(let received):
+            return "MCP entry returned an unexpected \(received.count)-byte reply."
+        case .readTimeout(let expected, let got):
+            return "MCP read timed out: expected \(expected) byte(s), got \(got)."
+        case .pageEchoMismatch(let requested, let actual):
+            return "MCP page response was stale: requested 0x"
+                + String(requested, radix: 16, uppercase: true)
+                + ", received 0x" + String(actual, radix: 16, uppercase: true) + "."
+        case .badPageReadAck(let page, let actual):
+            return "MCP page 0x" + String(page, radix: 16, uppercase: true)
+                + " read handshake returned 0x" + String(format: "%02X", actual)
+                + " instead of ACK."
+        case .pageReadAckNotProved(let page, let detail):
+            return "MCP page 0x" + String(page, radix: 16, uppercase: true)
+                + " read handshake was not completed (\(detail))."
+        case .badWriteAck(let actual):
+            return "Radio rejected the MCP page write with ACK byte 0x"
+                + String(format: "%02X", actual) + "."
+        case .writeVerificationMismatch(let page, let offset, let expected, let actual):
+            return "MCP write verification failed on page 0x"
+                + String(page, radix: 16, uppercase: true)
+                + " at byte \(offset): wrote 0x" + String(format: "%02X", expected)
+                + ", read 0x" + String(format: "%02X", actual) + "."
+        case .writeVerificationLengthMismatch(let page, let expected, let actual):
+            return "MCP write verification on page 0x"
+                + String(page, radix: 16, uppercase: true)
+                + " returned \(actual) bytes; expected \(expected)."
+        case .badExitAck(let actual):
+            return "MCP exit returned 0x" + String(format: "%02X", actual)
+                + " instead of ACK. Exit is not proved; close the link and power-cycle "
+                + "the radio before retrying."
+        case .exitNotProved(let detail):
+            return "MCP exit is not proved (\(detail)). The link was closed; power-cycle "
+                + "the radio before retrying."
+        case .operationAndCleanupFailed(let operation, let cleanup):
+            return "MCP operation failed: \(operation) Cleanup also failed: \(cleanup) "
+                + "The link was closed; power-cycle the radio before retrying."
+        }
+    }
 }
