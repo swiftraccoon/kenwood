@@ -629,7 +629,11 @@ const fn on_off(b: bool) -> &'static str {
 /// Saturates at the domain edges (0 and 30 are both valid), so the
 /// result is always accepted by the library's PF-key validators.
 fn next_pf_key(cur: u8, delta: i8) -> u8 {
-    let mut next = cur;
+    // Reads preserve the exact flash byte, including off-menu probe values
+    // such as 31 and erased/uninitialized 0xFF. Clamp those to the highest
+    // writable registry value before stepping so the TUI can always recover
+    // the setting instead of repeatedly proposing an invalid byte.
+    let mut next = cur.min(30);
     loop {
         let stepped = if delta > 0 {
             next.saturating_add(1).min(30)
@@ -3336,10 +3340,18 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    use super::{App, McpState, Message, RadioState, parse_reflector_input};
+    use super::{App, McpState, Message, RadioState, next_pf_key, parse_reflector_input};
     use crate::event::RadioCommand;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn pf_key_step_recovers_from_exact_off_menu_bytes() {
+        for raw in [31, 0xFF] {
+            assert_eq!(next_pf_key(raw, 1), 30);
+            assert_eq!(next_pf_key(raw, -1), 29);
+        }
+    }
 
     // ── Reducer: `update(Message) -> bool` ────────────────────────
     //
