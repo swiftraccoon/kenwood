@@ -7708,7 +7708,7 @@ pub static MCP_D75_MENU_FIELDS: &[MenuField] = &[
             "aprs.QsyLimit",
             0x1364,
             FieldCodec::Byte {
-                min: 1,
+                min: 0,
                 max: 250,
             }
         ),
@@ -7724,7 +7724,7 @@ pub static MCP_D75_MENU_FIELDS: &[MenuField] = &[
             "aprs.FilterPositionLimit",
             0x1365,
             FieldCodec::Byte {
-                min: 1,
+                min: 0,
                 max: 250,
             }
         ),

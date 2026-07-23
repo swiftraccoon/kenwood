@@ -7279,10 +7279,10 @@
           },
           "domain": {
             "kind": "range",
-            "min": 1,
+            "min": 0,
             "max": 250,
             "step": 1,
-            "provenance": "ui_numeric_scaled"
+            "provenance": "ui_numeric_scaled_with_off"
           }
         },
         {
@@ -7298,10 +7298,10 @@
           },
           "domain": {
             "kind": "range",
-            "min": 1,
+            "min": 0,
             "max": 250,
             "step": 1,
-            "provenance": "ui_numeric_scaled"
+            "provenance": "ui_numeric_scaled_with_off"
           }
         },
         {

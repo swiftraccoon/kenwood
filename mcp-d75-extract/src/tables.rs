@@ -303,10 +303,15 @@ pub(crate) static DIRECT_FIELD_DOMAINS: LazyLock<HashMap<String, Value>> = LazyL
         ("gps.MyPositionSelect", range_domain(0, 5, "ui_choices")),
         ("gps.Interval", range_domain(2, 1800, "ui_numeric")),
         ("gps.Distance", range_domain(1, 999, "ui_numeric_scaled")),
-        ("aprs.QsyLimit", range_domain(1, 250, "ui_numeric_scaled")),
+        // Both distance controls expose raw zero as the official "Off"
+        // display value; raw 1..=250 represents 10..=2500 distance units.
+        (
+            "aprs.QsyLimit",
+            range_domain(0, 250, "ui_numeric_scaled_with_off"),
+        ),
         (
             "aprs.FilterPositionLimit",
-            range_domain(1, 250, "ui_numeric_scaled"),
+            range_domain(0, 250, "ui_numeric_scaled_with_off"),
         ),
         ("aprs.LowSpeedSpeed", range_domain(2, 30, "ui_numeric")),
         ("aprs.HiSpeedSpeed", range_domain(2, 90, "ui_numeric")),

@@ -10,8 +10,8 @@
 use std::collections::{HashMap, HashSet};
 
 use kenwood_thd75::memory::{
-    Endian, FieldCodec, MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_VERSION, MCP_D75_SOURCE_SHA256,
-    MenuField, StringEncoding,
+    Endian, FieldCodec, FieldValue, MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_VERSION,
+    MCP_D75_SOURCE_SHA256, MenuField, PatchPlanner, SchemaError, StringEncoding, menu_field,
 };
 use kenwood_thd75::protocol::programming::TOTAL_SIZE;
 use serde_json::Value;
@@ -689,6 +689,55 @@ fn repeated_records_are_expanded_with_checked_offsets_and_domains() -> TestResul
         gps_blob.get("writable").and_then(Value::as_bool),
         Some(false)
     );
+    Ok(())
+}
+
+#[test]
+fn aprs_distance_limits_include_off_and_reject_reserved_high_values() -> TestResult {
+    let schema = load_schema()?;
+    for short_name in ["QsyLimit", "FilterPositionLimit"] {
+        let qualified = format!("aprs.{short_name}");
+        let json_field = find_field(&schema, "aprs", short_name)?;
+        let domain = required(json_field, "domain")?;
+        assert_eq!(required_usize(domain, "min")?, 0, "{qualified} minimum");
+        assert_eq!(required_usize(domain, "max")?, 250, "{qualified} maximum");
+        assert_eq!(
+            required_str(domain, "provenance")?,
+            "ui_numeric_scaled_with_off",
+            "{qualified} must retain the official raw-zero Off semantics"
+        );
+
+        let field = menu_field(&qualified)
+            .ok_or_else(|| invalid_data(format!("missing registry field `{qualified}`")))?;
+        assert_eq!(
+            field.descriptor.codec,
+            FieldCodec::Byte { min: 0, max: 250 },
+            "{qualified} generated codec"
+        );
+        for raw in [0, 1, 250] {
+            let mut planner = PatchPlanner::new();
+            field.plan_value(&mut planner, FieldValue::Unsigned(raw))?;
+            assert_eq!(
+                planner.finish()?.pages().count(),
+                1,
+                "{qualified} raw {raw} should produce one page patch"
+            );
+        }
+
+        let mut planner = PatchPlanner::new();
+        assert!(
+            matches!(
+                field.plan_value(&mut planner, FieldValue::Unsigned(251)),
+                Err(SchemaError::UnsignedOutOfRange {
+                    value: 251,
+                    min: 0,
+                    max: 250,
+                    ..
+                })
+            ),
+            "{qualified} raw 251 must remain outside the write domain"
+        );
+    }
     Ok(())
 }
 
