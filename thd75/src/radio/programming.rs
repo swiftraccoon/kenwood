@@ -25,9 +25,10 @@
 //! # Connection Lifetime
 //!
 //! The USB connection does not survive the programming mode transition.
-//! The radio's USB stack resets when exiting MCP mode. After calling
-//! any method in this module, the `Radio` instance should be dropped
-//! and a fresh connection established for subsequent CAT commands.
+//! The radio's USB stack resets when exiting MCP mode. Normal high-level
+//! operations wait for re-enumeration, reopen the selected device, and prove
+//! CAT identity before returning. Methods explicitly documented as detached
+//! intentionally skip that reconnect because the caller owns recovery.
 //!
 //! # Safety
 //!
@@ -42,7 +43,7 @@ use crate::protocol::programming::{self, ChannelFlag};
 use crate::transport::Transport;
 use crate::types::FlashChannel;
 
-use super::Radio;
+use super::{McpPhase, Radio};
 
 /// Baud rate for the programming mode handshake.
 ///
@@ -60,6 +61,17 @@ const FAST_TRANSFER_BAUD: u32 = 115_200;
 /// `exit_programming_mode`, this totals the ~5 seconds the hardware
 /// needs before the port answers again.
 const MCP_EXIT_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Maximum time to wait for the radio's one-byte acknowledgement of the
+/// raw MCP exit command.
+///
+/// Kenwood's official client uses a synchronous one-byte read with a
+/// one-second timeout and accepts only ACK (`0x06`).
+const MCP_EXIT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Maximum time for either half of the ACK exchange that completes an
+/// MCP page read.
+const MCP_PAGE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// MCP transfer speed options.
 ///
@@ -95,6 +107,54 @@ pub enum McpSpeed {
 const FULL_DUMP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl<T: Transport> Radio<T> {
+    /// Combine an MCP operation with the cleanup that followed it.
+    ///
+    /// When CAT restoration was not proved, cleanup takes safety precedence
+    /// and both errors are retained. A cleanup anomaly after an independently
+    /// successful CAT reconnect remains visible, but does not mislabel the
+    /// radio as stranded in MCP mode.
+    fn finish_mcp_operation<R>(
+        &self,
+        operation: Result<R, Error>,
+        cleanup: Result<(), Error>,
+    ) -> Result<R, Error> {
+        let cleanup = cleanup.map_err(|cleanup_error| {
+            if self.mcp_phase != McpPhase::Inactive
+                && !Self::contains_unproved_cleanup(&cleanup_error)
+            {
+                Error::McpCleanupNotProved {
+                    cleanup: Box::new(cleanup_error),
+                }
+            } else {
+                cleanup_error
+            }
+        });
+
+        match (operation, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(operation_error), Ok(())) => Err(operation_error),
+            (Err(operation_error), Err(cleanup_error)) => {
+                Err(Error::McpOperationAndCleanupFailed {
+                    operation: Box::new(operation_error),
+                    cleanup: Box::new(cleanup_error),
+                })
+            }
+            (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        }
+    }
+
+    /// Whether an error already carries terminal guidance for an unproved
+    /// CAT restoration, directly or on the cleanup side of a combined error.
+    fn contains_unproved_cleanup(error: &Error) -> bool {
+        match error {
+            Error::McpCleanupNotProved { .. } => true,
+            Error::McpOperationAndCleanupFailed { cleanup, .. } => {
+                Self::contains_unproved_cleanup(cleanup)
+            }
+            _ => false,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // High-level: full memory image
     // -----------------------------------------------------------------------
@@ -128,27 +188,21 @@ impl<T: Transport> Radio<T> {
     where
         F: FnMut(u16, u16),
     {
-        // Save the timeout in the struct, not a local, so an
-        // interrupted (cancelled) session can still restore it via
-        // `recover_from_interrupted_mcp`.
-        self.mcp_saved_timeout = Some(self.timeout);
-        self.timeout = FULL_DUMP_TIMEOUT;
+        self.begin_full_image_operation()?;
 
-        self.enter_programming_mode().await?;
+        if let Err(error) = self.enter_programming_mode().await {
+            self.restore_mcp_timeout();
+            return Err(error);
+        }
 
         let result = self
             .read_pages_raw(0, programming::TOTAL_PAGES, &mut on_progress)
             .await;
 
         let exit_result = self.exit_programming_mode().await;
-        if let Some(saved) = self.mcp_saved_timeout.take() {
-            self.timeout = saved;
-        }
+        self.restore_mcp_timeout();
 
-        let image = result?;
-        exit_result?;
-
-        Ok(image)
+        self.finish_mcp_operation(result, exit_result)
     }
 
     /// Write a complete memory image back to the radio.
@@ -191,12 +245,14 @@ impl<T: Transport> Radio<T> {
             });
         }
 
+        self.begin_full_image_operation()?;
+
         // Struct-held so an interrupted session can restore it (see
         // `recover_from_interrupted_mcp`).
-        self.mcp_saved_timeout = Some(self.timeout);
-        self.timeout = FULL_DUMP_TIMEOUT;
-
-        self.enter_programming_mode().await?;
+        if let Err(error) = self.enter_programming_mode().await {
+            self.restore_mcp_timeout();
+            return Err(error);
+        }
 
         // Write all pages except factory calibration (last 2).
         let writable_pages = programming::TOTAL_PAGES - programming::FACTORY_CAL_PAGES;
@@ -213,13 +269,59 @@ impl<T: Transport> Radio<T> {
             .await;
 
         let exit_result = self.exit_programming_mode().await;
+        self.restore_mcp_timeout();
+
+        self.finish_mcp_operation(result, exit_result)
+    }
+
+    /// Validate that no unresolved MCP session exists, then raise the
+    /// timeout for a full-image transfer without losing an earlier saved
+    /// value left by a cancelled pre-entry future.
+    fn begin_full_image_operation(&mut self) -> Result<(), Error> {
+        if self.mcp_phase != McpPhase::Inactive {
+            return Err(Error::McpInterrupted);
+        }
+        if self.mcp_saved_timeout.is_none() {
+            self.mcp_saved_timeout = Some(self.timeout);
+        }
+        self.timeout = FULL_DUMP_TIMEOUT;
+        Ok(())
+    }
+
+    /// Restore the CAT timeout saved by a full-image operation.
+    const fn restore_mcp_timeout(&mut self) {
         if let Some(saved) = self.mcp_saved_timeout.take() {
             self.timeout = saved;
         }
+    }
 
-        result?;
-        exit_result?;
+    /// Validate a complete contiguous page range before any MCP I/O.
+    ///
+    /// A zero-length range is a no-op. For a non-empty range, both the
+    /// first and last page must lie inside the physical image, and the
+    /// last-page calculation must not overflow `u16`.
+    fn validate_mcp_page_range(start_page: u16, count: u16) -> Result<(), Error> {
+        if count == 0 {
+            return Ok(());
+        }
+        if start_page >= programming::TOTAL_PAGES {
+            return Err(Error::McpPageOutOfRange {
+                page: start_page,
+                total_pages: programming::TOTAL_PAGES,
+            });
+        }
 
+        let last_page = count
+            .checked_sub(1)
+            .and_then(|offset| start_page.checked_add(offset));
+        if !matches!(last_page, Some(page) if page < programming::TOTAL_PAGES) {
+            return Err(Error::McpPageOutOfRange {
+                // `start_page` is valid, so this is the first page beyond
+                // the physical image regardless of how far the request runs.
+                page: programming::TOTAL_PAGES,
+                total_pages: programming::TOTAL_PAGES,
+            });
+        }
         Ok(())
     }
 
@@ -230,58 +332,169 @@ impl<T: Transport> Radio<T> {
     /// Read a range of pages from radio memory.
     ///
     /// Enters programming mode, reads `count` pages starting at
-    /// `start_page`, and exits. Returns the raw bytes.
+    /// `start_page`, and exits. Returns the raw bytes. A zero-page request
+    /// is a no-op and does not enter programming mode.
     ///
     /// # Errors
     ///
-    /// Returns an error if entry, any page read, or exit fails.
+    /// Returns [`Error::McpPageOutOfRange`] before any I/O if the complete
+    /// requested range is not inside the radio's memory image. Returns an
+    /// error if entry, any page read, or exit fails.
     /// Programming mode is always exited, even on error.
     pub async fn read_memory_pages(
         &mut self,
         start_page: u16,
         count: u16,
     ) -> Result<Vec<u8>, Error> {
+        Self::validate_mcp_page_range(start_page, count)?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
         self.enter_programming_mode().await?;
 
         let result = self.read_pages_raw(start_page, count, &mut |_, _| {}).await;
 
         let exit_result = self.exit_programming_mode().await;
 
-        let data = result?;
-        exit_result?;
+        self.finish_mcp_operation(result, exit_result)
+    }
 
-        Ok(data)
+    /// Read a sparse set of memory pages in one programming session.
+    ///
+    /// `pages` may be unordered and contain duplicates. Each distinct page is
+    /// read exactly once, in ascending page-number order. The returned vector
+    /// contains `(page_number, page_data)` pairs in that same order.
+    ///
+    /// An empty page list is a no-op and does not enter programming mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::McpPageOutOfRange`] before any I/O if any requested
+    /// page is outside the radio's memory image. Returns an error if entry,
+    /// any page read, or exit fails. Programming mode is always exited after a
+    /// successful entry, even when a page read fails.
+    pub async fn read_sparse_memory_pages(
+        &mut self,
+        pages: &[u16],
+    ) -> Result<Vec<(u16, [u8; programming::PAGE_SIZE])>, Error> {
+        self.read_sparse_memory_pages_with_progress(pages, |_, _| {})
+            .await
+    }
+
+    /// Read a sparse set of memory pages with a progress callback.
+    ///
+    /// The callback receives `(pages_read, total_unique_pages)` after each
+    /// successful page read. Pages are validated before any I/O, then sorted
+    /// and deduplicated before the single programming session begins.
+    ///
+    /// An empty page list is a no-op and does not invoke the callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::McpPageOutOfRange`] before any I/O if any requested
+    /// page is outside the radio's memory image. Returns an error if entry,
+    /// any page read, or exit fails. Programming mode is always exited after a
+    /// successful entry, even when a page read fails.
+    pub async fn read_sparse_memory_pages_with_progress<F>(
+        &mut self,
+        pages: &[u16],
+        mut on_progress: F,
+    ) -> Result<Vec<(u16, [u8; programming::PAGE_SIZE])>, Error>
+    where
+        F: FnMut(u16, u16),
+    {
+        // Validate the complete request before entering MCP mode. Read-only
+        // access to the final factory-calibration pages is permitted; only
+        // page numbers beyond the physical image are invalid.
+        for &page in pages {
+            if page >= programming::TOTAL_PAGES {
+                return Err(Error::McpPageOutOfRange {
+                    page,
+                    total_pages: programming::TOTAL_PAGES,
+                });
+            }
+        }
+
+        let mut pages = pages.to_vec();
+        pages.sort_unstable();
+        pages.dedup();
+
+        if pages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Every distinct page is less than TOTAL_PAGES, so the number of
+        // distinct pages is also at most TOTAL_PAGES and fits in u16.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "The validated and deduplicated page list can contain at most TOTAL_PAGES \
+                      (1955) entries, which fits in u16."
+        )]
+        let total = pages.len() as u16;
+
+        self.enter_programming_mode().await?;
+
+        let result: Result<Vec<(u16, [u8; programming::PAGE_SIZE])>, Error> = async {
+            let mut page_data = Vec::with_capacity(pages.len());
+            for (completed, page) in (1u16..=total).zip(pages) {
+                let data = self.read_single_page(page).await?;
+                page_data.push((page, data));
+                on_progress(completed, total);
+            }
+            Ok(page_data)
+        }
+        .await;
+
+        // Always exit programming mode after a successful entry, including a
+        // page-read failure.
+        let exit_result = self.exit_programming_mode().await;
+
+        self.finish_mcp_operation(result, exit_result)
     }
 
     /// Write a range of pages to radio memory.
     ///
     /// Enters programming mode, writes pages starting at `start_page`
     /// with the provided data, and exits. The data length must be a
-    /// multiple of 256 (one or more full pages).
+    /// multiple of 256. Empty data is a no-op and does not enter
+    /// programming mode.
     ///
     /// # Errors
     ///
     /// Returns [`Error::MemoryWriteProtected`] if any target page falls
     /// within the factory calibration region.
+    /// Returns [`Error::InvalidImageSize`] before any I/O if `data` is not
+    /// page-aligned, and [`Error::McpPageOutOfRange`] if the complete target
+    /// range is not inside the radio's memory image.
     /// Returns an error if entry, any page write, or exit fails.
     /// Programming mode is always exited, even on error.
     pub async fn write_memory_pages(&mut self, start_page: u16, data: &[u8]) -> Result<(), Error> {
-        let page_count = data.len() / programming::PAGE_SIZE;
-        // Validate no factory calibration pages are in range.
-        for i in 0..page_count {
-            // page_count is bounded by data.len() / 256, which fits in u16
-            // because the maximum image is 500,480 bytes (1955 pages).
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "Page loop index. The D75 MCP image is 500,480 bytes = 1955 pages, so \
-                          `i < page_count <= TOTAL_PAGES = 1955`, which fits comfortably in u16 \
-                          (max 65535). Cannot truncate."
-            )]
-            let offset = i as u16;
-            let page = start_page + offset;
-            if programming::is_factory_calibration_page(page) {
-                return Err(Error::MemoryWriteProtected { page });
+        if data.is_empty() {
+            return Ok(());
+        }
+        if !data.len().is_multiple_of(programming::PAGE_SIZE) {
+            return Err(Error::InvalidImageSize {
+                actual: data.len(),
+                expected: data.len().next_multiple_of(programming::PAGE_SIZE),
+            });
+        }
+        let page_count = u16::try_from(data.len() / programming::PAGE_SIZE).map_err(|_| {
+            Error::InvalidImageSize {
+                actual: data.len(),
+                expected: programming::PAGE_SIZE * usize::from(u16::MAX),
             }
+        })?;
+        Self::validate_mcp_page_range(start_page, page_count)?;
+
+        // The complete range is now known to be in bounds, so checked
+        // arithmetic above guarantees this last-page calculation.
+        let last_page = start_page + (page_count - 1);
+        if last_page > programming::MAX_WRITABLE_PAGE {
+            let first_protected = start_page.max(programming::MAX_WRITABLE_PAGE + 1);
+            return Err(Error::MemoryWriteProtected {
+                page: first_protected,
+            });
         }
 
         self.enter_programming_mode().await?;
@@ -290,10 +503,7 @@ impl<T: Transport> Radio<T> {
 
         let exit_result = self.exit_programming_mode().await;
 
-        result?;
-        exit_result?;
-
-        Ok(())
+        self.finish_mcp_operation(result, exit_result)
     }
 
     // -----------------------------------------------------------------------
@@ -306,19 +516,19 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if entry, the page read, or exit fails.
+    /// Returns [`Error::McpPageOutOfRange`] before any I/O if `page` is
+    /// outside the radio's memory image. Returns an error if entry, the page
+    /// read, or exit fails.
     /// Programming mode is always exited, even on error.
     pub async fn read_page(&mut self, page: u16) -> Result<[u8; programming::PAGE_SIZE], Error> {
+        Self::validate_mcp_page_range(page, 1)?;
         self.enter_programming_mode().await?;
 
         let result = self.read_single_page(page).await;
 
         let exit_result = self.exit_programming_mode().await;
 
-        let data = result?;
-        exit_result?;
-
-        Ok(data)
+        self.finish_mcp_operation(result, exit_result)
     }
 
     /// Write a single memory page (256 bytes).
@@ -329,6 +539,8 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns [`Error::MemoryWriteProtected`] if the page is in the
     /// factory calibration region.
+    /// Returns [`Error::McpPageOutOfRange`] if `page` is outside the radio's
+    /// memory image.
     /// Returns an error if entry, the page write, or exit fails.
     /// Programming mode is always exited, even on error.
     pub async fn write_page(
@@ -336,6 +548,7 @@ impl<T: Transport> Radio<T> {
         page: u16,
         data: &[u8; programming::PAGE_SIZE],
     ) -> Result<(), Error> {
+        Self::validate_mcp_page_range(page, 1)?;
         if programming::is_factory_calibration_page(page) {
             return Err(Error::MemoryWriteProtected { page });
         }
@@ -346,10 +559,7 @@ impl<T: Transport> Radio<T> {
 
         let exit_result = self.exit_programming_mode().await;
 
-        result?;
-        exit_result?;
-
-        Ok(())
+        self.finish_mcp_operation(result, exit_result)
     }
 
     /// Write a single memory page without read-back verification.
@@ -364,6 +574,8 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns [`Error::MemoryWriteProtected`] if the page is in the
     /// factory calibration region.
+    /// Returns [`Error::McpPageOutOfRange`] if `page` is outside the radio's
+    /// memory image.
     /// Returns an error if entry, the page write, or exit fails.
     /// Programming mode is always exited, even on error.
     pub async fn write_page_unverified(
@@ -371,6 +583,7 @@ impl<T: Transport> Radio<T> {
         page: u16,
         data: &[u8; programming::PAGE_SIZE],
     ) -> Result<(), Error> {
+        Self::validate_mcp_page_range(page, 1)?;
         if programming::is_factory_calibration_page(page) {
             return Err(Error::MemoryWriteProtected { page });
         }
@@ -381,10 +594,7 @@ impl<T: Transport> Radio<T> {
 
         let exit_result = self.exit_programming_mode().await;
 
-        result?;
-        exit_result?;
-
-        Ok(())
+        self.finish_mcp_operation(result, exit_result)
     }
 
     // -----------------------------------------------------------------------
@@ -475,10 +685,7 @@ impl<T: Transport> Radio<T> {
         // read and verified-write failure paths.
         let exit_result = self.exit_programming_mode().await;
 
-        let changed_pages = result?;
-        exit_result?;
-
-        Ok(changed_pages)
+        self.finish_mcp_operation(result, exit_result)
     }
 
     /// Read a memory page, apply in-place modifications, and write it back
@@ -528,10 +735,7 @@ impl<T: Transport> Radio<T> {
         // Always exit programming mode, even on error.
         let exit_result = self.exit_programming_mode().await;
 
-        result?;
-        exit_result?;
-
-        Ok(())
+        self.finish_mcp_operation(result, exit_result)
     }
 
     /// Read-modify-write one memory page, then exit programming mode
@@ -553,8 +757,12 @@ impl<T: Transport> Radio<T> {
     /// Returns [`Error::MemoryWriteProtected`] if the page is in the
     /// factory calibration region.
     /// Returns an error if entry, the page read, the page write, or the
-    /// exit write fails. Programming mode is always exited, even on
-    /// error.
+    /// exit acknowledgement fails. Exit is always attempted after a
+    /// successful entry. A successful page operation uses the detached exit
+    /// expected by the caller. Any page-operation error instead uses the
+    /// normal reconnect-and-identify exit path, because stale page bytes or
+    /// ACKs must not be mistaken for proof of a detached exit. An unproved
+    /// exit leaves CAT poisoned for explicit recovery.
     pub async fn modify_memory_page_detached<F>(
         &mut self,
         page: u16,
@@ -577,14 +785,19 @@ impl<T: Transport> Radio<T> {
         }
         .await;
 
-        // Exit without the settle-and-reconnect: the radio is about to
-        // reboot into a non-CAT mode and the link is expected to die.
-        let exit_result = self.exit_programming_mode_detached().await;
+        let exit_result = if result.is_ok() {
+            // The entire read/write/readback exchange is aligned and the
+            // caller expects this setting to reboot into a non-CAT mode.
+            self.exit_programming_mode_detached().await
+        } else {
+            // A partial W frame or delayed page/write ACK could otherwise
+            // be consumed as the detached E acknowledgement. Require an
+            // independent reconnect and CAT identity proof after any
+            // operation failure.
+            self.exit_programming_mode().await
+        };
 
-        result?;
-        exit_result?;
-
-        Ok(())
+        self.finish_mcp_operation(result, exit_result)
     }
 
     // -----------------------------------------------------------------------
@@ -614,11 +827,7 @@ impl<T: Transport> Radio<T> {
         // Always attempt to exit, even if reading failed.
         let exit_result = self.exit_programming_mode().await;
 
-        // Propagate the read error first, then the exit error.
-        let names = result?;
-        exit_result?;
-
-        Ok(names)
+        self.finish_mcp_operation(result, exit_result)
     }
 
     /// Read all 1,200 channel display names from the radio, including
@@ -630,9 +839,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Connection lifetime
     ///
-    /// This enters MCP programming mode. The USB connection drops after
-    /// exit. The `Radio` instance should be dropped and a fresh connection
-    /// established for subsequent CAT commands.
+    /// This enters MCP programming mode. Exit resets the USB connection; the
+    /// method waits for re-enumeration, reopens it, and proves CAT identity
+    /// before returning.
     ///
     /// # Errors
     ///
@@ -646,10 +855,7 @@ impl<T: Transport> Radio<T> {
 
         let exit_result = self.exit_programming_mode().await;
 
-        let names = result?;
-        exit_result?;
-
-        Ok(names)
+        self.finish_mcp_operation(result, exit_result)
     }
 
     /// Write a single channel display name via MCP programming mode.
@@ -661,9 +867,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Connection lifetime
     ///
-    /// This enters MCP programming mode. The USB connection drops after
-    /// exit. The `Radio` instance should be dropped and a fresh connection
-    /// established for subsequent CAT commands.
+    /// This enters MCP programming mode. Exit resets the USB connection; the
+    /// method waits for re-enumeration, reopens it, and proves CAT identity
+    /// before returning.
     ///
     /// # Errors
     ///
@@ -729,8 +935,7 @@ impl<T: Transport> Radio<T> {
 
         let exit_result = self.exit_programming_mode().await;
 
-        let raw = result?;
-        exit_result?;
+        let raw = self.finish_mcp_operation(result, exit_result)?;
 
         // Parse 4-byte flag records, 1200 entries. A record that fails
         // to parse must error rather than be skipped: skipping shifts
@@ -777,8 +982,7 @@ impl<T: Transport> Radio<T> {
 
         let exit_result = self.exit_programming_mode().await;
 
-        let raw = result?;
-        exit_result?;
+        let raw = self.finish_mcp_operation(result, exit_result)?;
 
         // Parse memgroups: each 256-byte page is one memgroup containing
         // 6 channel records of 40 bytes + 16 bytes padding.
@@ -925,6 +1129,20 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if the entry command fails or the radio does
     /// not respond with the expected `0M\r` acknowledgement.
     async fn enter_programming_mode(&mut self) -> Result<(), Error> {
+        // A previous cancelled session must be recovered before any
+        // further serial traffic. In particular, starting a fresh entry
+        // must not erase the fact that its exit byte may already have
+        // been sent.
+        if self.mcp_phase != McpPhase::Inactive {
+            return Err(Error::McpInterrupted);
+        }
+        if let Some(exit_error) = self.mcp_pending_exit_error.take() {
+            // A previous exit anomaly can remain after CAT was proved if
+            // its caller cancelled during optional state restoration.
+            // Surface it before associating it with a new MCP session.
+            return Err(exit_error);
+        }
+
         tracing::info!("entering programming mode at 9600 baud");
 
         // Queued AI pushes / NMEA sentences would land ahead of the
@@ -932,123 +1150,129 @@ impl<T: Transport> Radio<T> {
         // window, so drain them first.
         self.drain_stale_input().await;
 
-        // Mark the session active BEFORE any wire traffic: if this
-        // future is cancelled from here on, the radio may be in (or
-        // entering) PROG MCP mode and CAT must refuse until recovery.
-        self.mcp_active = true;
-
-        // Switch to 9600 baud for the entire programming session.
+        // Switching the host baud is synchronous and cannot have put the
+        // radio in MCP mode if it fails.
         self.transport
             .set_baud_rate(PROGRAMMING_BAUD)
             .map_err(Error::Transport)?;
 
-        self.transport
-            .write(programming::ENTER_PROGRAMMING)
-            .await
-            .map_err(Error::Transport)?;
+        // Mark the session active BEFORE any wire traffic: if this
+        // future is cancelled from here on, the radio may be in (or
+        // entering) PROG MCP mode and CAT must refuse until recovery.
+        self.mcp_phase = McpPhase::Active;
 
-        // 10ms delay after write.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        // Read response -- expect "0M\r" (3 bytes).
-        let mut buf = [0u8; 64];
-        let mut received = Vec::new();
-
-        let entry = match tokio::time::timeout(self.timeout, async {
-            loop {
-                let n = self
-                    .transport
-                    .read(&mut buf)
-                    .await
-                    .map_err(Error::Transport)?;
-                if n == 0 {
-                    return Err(Error::Transport(TransportError::Disconnected(
-                        std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "connection closed during programming mode entry",
-                        ),
-                    )));
-                }
-                if let Some(chunk) = buf.get(..n) {
-                    received.extend_from_slice(chunk);
-                }
-                // Look for "0M\r" anywhere in the received data.
-                if received.windows(3).any(|w| w == b"0M\r") {
-                    return Ok(());
-                }
-                if received.len() > 20 {
-                    // Too much data without finding "0M\r".
-                    return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                        expected: "0M\\r".to_string(),
-                        actual: received.clone(),
-                    }));
-                }
-            }
-        })
-        .await
-        {
-            Ok(inner) => inner,
-            Err(_elapsed) => Err(Error::Timeout(self.timeout)),
-        };
-        if let Err(e) = entry {
-            // The radio may have entered MCP mode even though its
-            // acknowledgement was never confirmed (noise ahead of it,
-            // or a lost byte). Exit best-effort so an unconfirmed
-            // entry cannot strand the radio in PROG MCP.
-            if let Err(exit_err) = self.exit_programming_mode().await {
-                tracing::debug!(
-                    error = %exit_err,
-                    "best-effort MCP exit after failed entry also failed"
-                );
-            }
-            return Err(e);
-        }
-
-        // If Fast mode is requested, switch to 115200 baud for the data
-        // transfer phase.
-        if self.mcp_speed == McpSpeed::Fast {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let entry: Result<(), Error> = async {
             self.transport
-                .set_baud_rate(FAST_TRANSFER_BAUD)
+                .write(programming::ENTER_PROGRAMMING)
+                .await
                 .map_err(Error::Transport)?;
-            // Read sync byte: verifies the radio switched baud rates.
-            // If this times out, the radio is likely still at 9600 and all
-            // subsequent reads will produce garbage.
-            let mut sync = [0u8; 1];
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                self.transport.read(&mut sync),
-            )
+
+            // 10ms delay after write.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+            // Read response -- expect "0M\r" (3 bytes).
+            let mut buf = [0u8; 64];
+            let mut received = Vec::new();
+
+            match tokio::time::timeout(self.timeout, async {
+                loop {
+                    let n = self
+                        .transport
+                        .read(&mut buf)
+                        .await
+                        .map_err(Error::Transport)?;
+                    if n == 0 {
+                        return Err(Error::Transport(TransportError::Disconnected(
+                            std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "connection closed during programming mode entry",
+                            ),
+                        )));
+                    }
+                    if let Some(chunk) = buf.get(..n) {
+                        received.extend_from_slice(chunk);
+                    }
+                    // Look for "0M\r" anywhere in the received data.
+                    if received.windows(3).any(|w| w == b"0M\r") {
+                        return Ok(());
+                    }
+                    if received.len() > 20 {
+                        // Too much data without finding "0M\r".
+                        return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                            expected: "0M\\r".to_string(),
+                            actual: received.clone(),
+                        }));
+                    }
+                }
+            })
             .await
             {
-                Ok(Ok(n)) if n > 0 => {
-                    tracing::info!(
-                        sync_byte = sync[0],
-                        "programming mode entered, switched to {FAST_TRANSFER_BAUD} baud (fast)"
-                    );
-                }
-                Ok(Ok(_)) => {
-                    tracing::error!("fast mode sync read returned 0 bytes; baud mismatch likely");
-                    return Err(Error::Protocol(ProtocolError::MalformedFrame(
-                        b"fast mode sync byte not received".to_vec(),
-                    )));
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("fast mode sync read failed: {e}");
-                    return Err(Error::Transport(e));
-                }
-                Err(_) => {
-                    tracing::error!(
-                        "fast mode sync byte timed out; radio may not have switched baud"
-                    );
-                    return Err(Error::Timeout(std::time::Duration::from_secs(2)));
-                }
-            }
-        } else {
-            tracing::info!("programming mode entered, staying at {PROGRAMMING_BAUD} baud");
-        }
+                Ok(inner) => inner,
+                Err(_elapsed) => Err(Error::Timeout(self.timeout)),
+            }?;
 
-        Ok(())
+            // If Fast mode is requested, switch to 115200 baud for the data
+            // transfer phase.
+            if self.mcp_speed == McpSpeed::Fast {
+                self.enter_fast_programming_transfer().await?;
+            } else {
+                tracing::info!("programming mode entered, staying at {PROGRAMMING_BAUD} baud");
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match entry {
+            Ok(()) => Ok(()),
+            Err(entry_error) => {
+                // Any error after the raw entry write began is ambiguous:
+                // the radio may have accepted MCP even when the write or
+                // acknowledgement failed. Preserve a failed cleanup proof
+                // alongside the entry error instead of hiding it.
+                let cleanup = self.exit_programming_mode().await;
+                self.finish_mcp_operation::<()>(Err(entry_error), cleanup)
+            }
+        }
+    }
+
+    /// Switch an acknowledged MCP session to the optional fast transfer baud.
+    async fn enter_fast_programming_transfer(&mut self) -> Result<(), Error> {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        self.transport
+            .set_baud_rate(FAST_TRANSFER_BAUD)
+            .map_err(Error::Transport)?;
+
+        // The sync byte proves that the radio also switched baud rates.
+        let mut sync = [0u8; 1];
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.transport.read(&mut sync),
+        )
+        .await
+        {
+            Ok(Ok(n)) if n > 0 => {
+                tracing::info!(
+                    sync_byte = sync[0],
+                    "programming mode entered, switched to {FAST_TRANSFER_BAUD} baud (fast)"
+                );
+                Ok(())
+            }
+            Ok(Ok(_)) => {
+                tracing::error!("fast mode sync read returned 0 bytes; baud mismatch likely");
+                Err(Error::Protocol(ProtocolError::MalformedFrame(
+                    b"fast mode sync byte not received".to_vec(),
+                )))
+            }
+            Ok(Err(error)) => {
+                tracing::error!("fast mode sync read failed: {error}");
+                Err(Error::Transport(error))
+            }
+            Err(_) => {
+                tracing::error!("fast mode sync byte timed out; radio may not have switched baud");
+                Err(Error::Timeout(std::time::Duration::from_secs(2)))
+            }
+        }
     }
 
     /// Exit programming mode (`E` command) and reconnect.
@@ -1058,23 +1282,24 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the exit byte cannot be written or the
-    /// post-exit reconnect fails.
+    /// Returns an error if the exit byte cannot be written, the radio
+    /// does not acknowledge it, or the post-exit reconnect fails. Even
+    /// when the acknowledgement is missing or wrong, the reset settle
+    /// and CAT reconnect proof are still attempted. A successful CAT
+    /// proof clears the programming-session poison but does not hide the
+    /// original acknowledgement error.
     async fn exit_programming_mode(&mut self) -> Result<(), Error> {
-        self.exit_programming_mode_detached().await?;
-
-        // The radio resets its USB stack when leaving MCP mode.
-        // Combined with the mode-switch wait in the detached exit, this
-        // totals the ~5 seconds the hardware needs before the port
-        // answers again.
-        tokio::time::sleep(MCP_EXIT_SETTLE).await;
-
-        // Bring the link back so every MCP operation returns a radio
-        // that answers CAT commands; callers no longer wait out the
-        // USB re-enumeration and reconnect by hand.
-        self.reconnect().await?;
-
-        Ok(())
+        if let Err(error) = self.send_programming_exit().await {
+            // Store this before the next await. If reset settling or
+            // reconnect is cancelled, recovery can still surface the
+            // original exit anomaly.
+            if self.mcp_pending_exit_error.is_none() {
+                self.mcp_pending_exit_error = Some(error);
+            }
+        }
+        let reconnect_result = self.settle_and_reconnect_after_programming_exit().await;
+        let exit_result = self.take_pending_mcp_exit_result();
+        self.finish_mcp_operation(exit_result, reconnect_result)
     }
 
     /// Exit programming mode (`E` command) WITHOUT reconnecting.
@@ -1087,22 +1312,92 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the exit byte cannot be written.
+    /// Returns an error if the exit byte cannot be written or the radio
+    /// does not answer with exactly one ACK byte. An unconfirmed exit
+    /// leaves the session poisoned; the caller must recover it. The exit
+    /// byte is never resent.
     async fn exit_programming_mode_detached(&mut self) -> Result<(), Error> {
         tracing::info!("exiting programming mode");
 
-        // The session is over as soon as the exit is attempted. Even
-        // if the write fails, retrying CAT (which will error loudly)
-        // beats refusing forever. Binary residue may remain on the
-        // line, so the next CAT command drains first.
-        self.mcp_active = false;
+        self.send_programming_exit().await?;
+        self.settle_after_programming_exit().await;
+
+        // Detached mode deliberately does not prove CAT because the
+        // caller expects the link to disappear. The exact ACK is its
+        // terminal proof that MCP accepted the one exit byte.
+        self.mcp_phase = McpPhase::Inactive;
+        Ok(())
+    }
+
+    /// Send exactly one raw MCP exit byte and require its one-byte ACK.
+    ///
+    /// The phase flag is set before awaiting the write, because a cancelled
+    /// or failed write may still have delivered the byte. It is cleared only
+    /// after CAT reconnect is proved (or a detached exit receives its ACK).
+    /// Any write, read, EOF, timeout, or wrong-byte error leaves the session
+    /// poisoned and `desynced` so normal CAT cannot proceed.
+    async fn send_programming_exit(&mut self) -> Result<(), Error> {
+        if self.mcp_phase == McpPhase::ExitSent {
+            return Err(Error::McpExitAlreadySent);
+        }
+
+        // Set this before polling the transport write. From this point on,
+        // recovery must conservatively assume that E reached the radio.
+        self.mcp_phase = McpPhase::ExitSent;
         self.desynced = true;
+        tokio::time::timeout(
+            MCP_EXIT_ACK_TIMEOUT,
+            self.transport.write(&[programming::EXIT]),
+        )
+        .await
+        .map_err(|_| Error::Timeout(MCP_EXIT_ACK_TIMEOUT))?
+        .map_err(Error::Transport)?;
 
-        self.transport
-            .write(&[programming::EXIT])
+        let mut ack = [0u8; 1];
+        let read_result = tokio::time::timeout(MCP_EXIT_ACK_TIMEOUT, self.transport.read(&mut ack))
             .await
-            .map_err(Error::Transport)?;
+            .map_err(|_| Error::Timeout(MCP_EXIT_ACK_TIMEOUT))?;
 
+        let count = read_result.map_err(Error::Transport)?;
+        if count == 0 {
+            return Err(Error::Transport(TransportError::Disconnected(
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed waiting for MCP exit ACK",
+                ),
+            )));
+        }
+        if ack[0] != programming::ACK {
+            return Err(Error::McpExitNotAcknowledged { got: ack[0] });
+        }
+
+        Ok(())
+    }
+
+    /// Take a retained MCP exit anomaly, or report a successful exit.
+    fn take_pending_mcp_exit_result(&mut self) -> Result<(), Error> {
+        self.mcp_pending_exit_error.take().map_or(Ok(()), Err)
+    }
+
+    /// Wait out the radio's MCP reset and prove the reopened link speaks CAT.
+    async fn settle_and_reconnect_after_programming_exit(&mut self) -> Result<(), Error> {
+        // Even an unconfirmed exit may have reached the radio. Wait out
+        // the reset and try to prove CAT operation instead of abandoning
+        // cleanup solely because the ACK was lost.
+        self.settle_after_programming_exit().await;
+
+        // The radio resets its USB stack when leaving MCP mode.
+        // Combined with the mode-switch wait above, this totals the
+        // ~5 seconds the hardware needs before the port answers again.
+        tokio::time::sleep(MCP_EXIT_SETTLE).await;
+
+        // Bring the link back so every ordinary MCP operation returns a
+        // radio that answers CAT commands.
+        self.reconnect_after_mcp_exit().await
+    }
+
+    /// Wait for the accepted exit to take effect and restore the host baud.
+    async fn settle_after_programming_exit(&mut self) {
         // Give the radio time to leave MCP mode and resume CAT.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -1121,33 +1416,99 @@ impl<T: Transport> Radio<T> {
             // CAT commands work at 9600 baud (CDC ACM ignores line coding).
             tracing::info!("programming mode exited, staying at 9600 baud");
         }
+    }
 
-        Ok(())
+    /// Reconnect after an exit without permanently clearing the MCP poison
+    /// until CAT identity has been proved.
+    ///
+    /// `Radio::reconnect` must issue CAT commands, so this guard
+    /// temporarily permits them. If the future is cancelled or reconnect
+    /// fails, `Drop` restores the poisoned state.
+    async fn reconnect_after_mcp_exit(&mut self) -> Result<(), Error> {
+        struct ReconnectGuard<'a, T: Transport> {
+            radio: &'a mut Radio<T>,
+            recovery_phase: McpPhase,
+            cat_proved: bool,
+            restore_finished: bool,
+        }
+
+        impl<T: Transport> Drop for ReconnectGuard<'_, T> {
+            fn drop(&mut self) {
+                if !self.cat_proved {
+                    self.radio.mcp_phase = self.recovery_phase;
+                    self.radio.desynced = true;
+                } else if !self.restore_finished {
+                    // CAT identity was proved, so MCP must stay clear. An
+                    // optional restore command may nevertheless have been
+                    // cancelled with a late response still in flight.
+                    self.radio.desynced = true;
+                }
+            }
+        }
+
+        // The guard exclusively borrows the radio, so no other CAT
+        // operation can observe this temporary permission. Cancellation
+        // drops the guard and restores the poison.
+        let recovery_phase = self.mcp_phase;
+        self.mcp_phase = McpPhase::Inactive;
+        let mut guard = ReconnectGuard {
+            radio: self,
+            recovery_phase,
+            cat_proved: false,
+            restore_finished: false,
+        };
+        guard.radio.reopen_and_identify().await?;
+
+        // This assignment is synchronous immediately after `identify`
+        // succeeds. Cancellation or failure while restoring optional
+        // cached state must not re-poison an independently proved CAT link.
+        guard.cat_proved = true;
+        let result = guard.radio.restore_state_after_reconnect().await;
+        guard.restore_finished = true;
+        result
     }
 
     /// Recover after an MCP programming session's future was cancelled
     /// mid-transfer (e.g. by a caller-side `tokio::time::timeout`).
     ///
-    /// Best-effort: sends the MCP exit byte so the radio leaves PROG
-    /// MCP mode, restores the saved CAT timeout, and re-enables CAT
-    /// commands (which refuse with [`Error::McpInterrupted`] while an
-    /// interrupted session is pending). A no-op if no session was
-    /// interrupted.
+    /// Sends the MCP exit byte at most once, restores the saved CAT timeout,
+    /// and reconnects to prove normal CAT operation. If an earlier future
+    /// was cancelled after the exit phase began, recovery only settles and
+    /// reconnects; it never retransmits `E`. CAT commands refuse with
+    /// [`Error::McpInterrupted`] until CAT reconnect/identity is proved. A
+    /// no-op if no session was interrupted and no retained exit anomaly
+    /// remains to be reported.
     ///
     /// # Errors
     ///
-    /// Returns an error if the exit write fails; CAT is re-enabled
-    /// regardless, so a retry or reconnect can proceed.
+    /// Returns the original exit-ACK anomaly even if reconnect/ID
+    /// independently proves CAT recovery. If CAT recovery is not proved,
+    /// the MCP poison remains set and the error instructs the caller to
+    /// fully power-cycle the radio.
     pub async fn recover_from_interrupted_mcp(&mut self) -> Result<(), Error> {
-        if !self.mcp_active {
-            return Ok(());
+        if self.mcp_phase == McpPhase::Inactive {
+            // A full-image future can be cancelled while draining stale
+            // input, before any MCP wire traffic makes the phase active.
+            // Its struct-held timeout still needs explicit restoration.
+            self.restore_mcp_timeout();
+            // CAT may instead already have been proved after a failed MCP
+            // exit, with cancellation landing during cached-state restore.
+            // Preserve and surface that exit anomaly without re-poisoning.
+            return self.take_pending_mcp_exit_result();
         }
         tracing::warn!("recovering from interrupted MCP session");
-        let exit_result = self.exit_programming_mode().await;
-        if let Some(saved) = self.mcp_saved_timeout.take() {
-            self.timeout = saved;
-        }
-        exit_result
+        let recovery_result = if self.mcp_phase == McpPhase::ExitSent {
+            tracing::warn!(
+                "MCP exit was already attempted; recovering without retransmitting the exit byte"
+            );
+            let reconnect_result = self.settle_and_reconnect_after_programming_exit().await;
+            let exit_result = self.take_pending_mcp_exit_result();
+            self.finish_mcp_operation(exit_result, reconnect_result)
+        } else {
+            self.exit_programming_mode().await
+        };
+        self.restore_mcp_timeout();
+        recovery_result
     }
 
     // -----------------------------------------------------------------------
@@ -1158,9 +1519,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns a `Vec<u8>` containing `count * 256` bytes.
     ///
-    /// If a page read times out, it is retried once before failing. This
-    /// improves reliability during long memory dumps where occasional
-    /// serial hiccups can occur.
+    /// A complete response for the wrong page is acknowledged and retried
+    /// once. Partial, timed-out, or otherwise ambiguous responses are never
+    /// retried because the radio's ACK state cannot then be proved.
     async fn read_pages_raw<F>(
         &mut self,
         start_page: u16,
@@ -1175,7 +1536,8 @@ impl<T: Transport> Radio<T> {
         for i in 0..count {
             let page = start_page + i;
             // `read_single_page` verifies the echoed page address and
-            // retries once (with a drain) on timeout or mismatch.
+            // retries once only after fully completing the ACK handshake
+            // for a wrong-page response.
             let data = self.read_single_page(page).await?;
             image.extend_from_slice(&data);
             on_progress(i + 1, count);
@@ -1234,48 +1596,24 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Read a single 256-byte page (caller must be in programming mode).
-    /// Read one page, verifying the radio's echoed page address, with
-    /// one drain-and-retry on timeout or address mismatch.
+    /// Read one page, verifying the radio's echoed page address, with at
+    /// most one retry after a fully acknowledged address mismatch.
     ///
-    /// A merely *delayed* (not lost) response would otherwise satisfy
-    /// a blind retry while its duplicate answers the NEXT page's read,
-    /// silently shifting the remainder of a 500 KB dump by one page.
+    /// A partial or timed-out response is ambiguous: the radio may still be
+    /// sending the `W` frame or waiting for its host ACK. Retrying in that
+    /// state could misframe the next command, so those errors go directly to
+    /// programming-mode cleanup.
     async fn read_single_page(&mut self, page: u16) -> Result<[u8; programming::PAGE_SIZE], Error> {
         match self.read_single_page_attempt(page).await {
             Ok(data) => Ok(data),
-            Err(e @ (Error::Timeout(_) | Error::McpPageMismatch { .. })) => {
-                tracing::warn!(page, error = %e, "page read failed; draining and retrying once");
-                // Let the serial bus settle, then discard any straggler
-                // bytes (the late response, a duplicate, a stray ACK)
-                // so the retry starts from a clean line.
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                self.drain_mcp_input().await;
+            Err(e @ Error::McpPageMismatch { .. }) => {
+                // `read_single_page_attempt` returns a mismatch only after
+                // ACKing the complete W frame and consuming the radio's ACK,
+                // so exactly one retry is safe.
+                tracing::warn!(page, error = %e, "acknowledged wrong-page response; retrying once");
                 self.read_single_page_attempt(page).await
             }
             Err(e) => Err(e),
-        }
-    }
-
-    /// Discard whatever the radio has already sent (binary MCP bytes:
-    /// late W responses, duplicate pages, stray ACKs) until the line
-    /// goes quiet. Used before an MCP retry so stale bytes cannot
-    /// misalign the next fixed-size response window.
-    async fn drain_mcp_input(&mut self) {
-        let mut buf = [0u8; 512];
-        let mut discarded = 0_usize;
-        while let Ok(Ok(n)) = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            self.transport.read(&mut buf),
-        )
-        .await
-        {
-            if n == 0 {
-                break;
-            }
-            discarded += n;
-        }
-        if discarded > 0 {
-            tracing::warn!(discarded, "drained stray MCP bytes before retry");
         }
     }
 
@@ -1324,9 +1662,17 @@ impl<T: Transport> Radio<T> {
         let (answered_page, data) =
             programming::parse_write_response(&received).map_err(Error::Protocol)?;
 
-        // The echoed address is the only integrity check the MCP
-        // protocol offers: a mismatch means this is a stale duplicate
-        // of some other page, not our answer.
+        // Copy into a fixed-size array.
+        let mut page_data = [0u8; programming::PAGE_SIZE];
+        page_data.copy_from_slice(data);
+
+        // Every fully parsed W frame must complete its ACK handshake before
+        // any retry, next page, or exit command is safe.
+        self.acknowledge_page_read(answered_page).await?;
+
+        // The echoed address is the only integrity check the MCP protocol
+        // offers. This error is deliberately emitted only after the complete
+        // wrong-page frame has been acknowledged, making one retry safe.
         if answered_page != page {
             return Err(Error::McpPageMismatch {
                 requested: page,
@@ -1334,40 +1680,41 @@ impl<T: Transport> Radio<T> {
             });
         }
 
-        // Copy into a fixed-size array.
-        let mut page_data = [0u8; programming::PAGE_SIZE];
-        page_data.copy_from_slice(data);
+        Ok(page_data)
+    }
 
-        // Send ACK, read the radio's ACK back.
-        self.transport
-            .write(&[programming::ACK])
-            .await
-            .map_err(Error::Transport)?;
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let mut ack_buf = [0u8; 1];
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(1000),
-            self.transport.read(&mut ack_buf),
+    /// Complete the host-ACK/radio-ACK handshake for one parsed `W` frame.
+    async fn acknowledge_page_read(&mut self, answered_page: u16) -> Result<(), Error> {
+        tokio::time::timeout(
+            MCP_PAGE_ACK_TIMEOUT,
+            self.transport.write(&[programming::ACK]),
         )
         .await
-        {
-            Ok(Ok(1)) if ack_buf.first() == Some(&programming::ACK) => {}
-            Ok(Ok(_)) => {
-                tracing::debug!(page, byte = ?ack_buf.first(), "unexpected byte in place of ACK");
-            }
-            Ok(Err(e)) => {
-                tracing::debug!(page, error = %e, "error reading post-page ACK");
-            }
-            Err(_elapsed) => {
-                // The ACK may still arrive as a straggler and would
-                // misalign the next 261-byte response window, so clear
-                // the line before the next exchange.
-                tracing::debug!(page, "post-page ACK timed out; draining stragglers");
-                self.drain_mcp_input().await;
-            }
+        .map_err(|_| Error::Timeout(MCP_PAGE_ACK_TIMEOUT))?
+        .map_err(Error::Transport)?;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let mut ack_buf = [0u8; 1];
+        let count = tokio::time::timeout(MCP_PAGE_ACK_TIMEOUT, self.transport.read(&mut ack_buf))
+            .await
+            .map_err(|_| Error::Timeout(MCP_PAGE_ACK_TIMEOUT))?
+            .map_err(Error::Transport)?;
+        if count == 0 {
+            return Err(Error::Transport(TransportError::Disconnected(
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed waiting for MCP page-read ACK",
+                ),
+            )));
+        }
+        if ack_buf[0] != programming::ACK {
+            return Err(Error::McpPageReadNotAcknowledged {
+                page: answered_page,
+                got: ack_buf[0],
+            });
         }
 
-        Ok(page_data)
+        Ok(())
     }
 
     /// Write a single 256-byte page (caller must be in programming mode).
@@ -1515,15 +1862,32 @@ impl<T: Transport> Radio<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::error::Error;
+    use crate::error::{Error, ProtocolError, TransportError};
     use crate::protocol::programming;
     use crate::protocol::{Command, Response};
-    use crate::radio::Radio;
-    use crate::transport::MockTransport;
+    use crate::radio::{McpPhase, Radio};
+    use crate::transport::{MockTransport, Transport};
     use crate::types::Band;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;
+
+    #[derive(Debug)]
+    struct HangingWriteTransport;
+
+    impl Transport for HangingWriteTransport {
+        async fn write(&mut self, _data: &[u8]) -> Result<(), TransportError> {
+            std::future::pending().await
+        }
+
+        async fn read(&mut self, _buf: &mut [u8]) -> Result<usize, TransportError> {
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
 
     /// Set a single byte at `offset` in a mutable slice, returning an error if out of range.
     fn set_byte(image: &mut [u8], offset: usize, value: u8) -> Result<(), BoxErr> {
@@ -1608,7 +1972,7 @@ mod tests {
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
         // Exit programming mode, then the exit path reconnects.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -1638,10 +2002,13 @@ mod tests {
         // from an earlier retried read. Accepting it would store the
         // wrong page's bytes and shift the rest of a dump by one page.
         mock.expect(&cmd, &build_w_response(0x0021, &[0x11u8; 256])?);
+        // A complete wrong-page W still requires the normal ACK exchange
+        // before the retry command is safe.
+        mock.expect(&[programming::ACK], &[programming::ACK]);
         // The retry re-requests and gets the right page.
         mock.expect(&cmd, &build_w_response(page, &[0x22u8; 256])?);
         mock.expect(&[programming::ACK], &[programming::ACK]);
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -1665,10 +2032,12 @@ mod tests {
         let cmd = programming::build_read_command(page);
         // Both the read and its retry answer with the wrong page.
         mock.expect(&cmd, &build_w_response(0x0021, &[0x11u8; 256])?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(&cmd, &build_w_response(0x0021, &[0x11u8; 256])?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
         // Exit must still be attempted even though the read failed,
         // and the exit path reconnects.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -1683,6 +2052,73 @@ mod tests {
                 })
             ),
             "persistent mismatch must surface: {result:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_page_timeout_is_not_retried_before_cleanup() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page: u16 = 0x0020;
+        let cmd = programming::build_read_command(page);
+        let full_response = build_w_response(page, &[0x11u8; programming::PAGE_SIZE])?;
+        let partial = full_response
+            .get(..32)
+            .ok_or("test W response unexpectedly shorter than 32 bytes")?;
+        mock.expect_partial_then_hang(&cmd, partial);
+
+        // No retry and no host ACK are scripted. The ambiguous response
+        // must fail directly into the normal MCP exit path.
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        let page_timeout = std::time::Duration::from_millis(50);
+        radio.set_timeout(page_timeout);
+        let result = radio.read_page(page).await;
+        assert!(
+            matches!(result, Err(Error::Timeout(timeout)) if timeout == page_timeout),
+            "partial frame must time out without retrying: {result:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wrong_page_is_not_retried_without_completed_ack_handshake() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let requested_page: u16 = 0x0020;
+        let answered_page: u16 = 0x0021;
+        let cmd = programming::build_read_command(requested_page);
+        mock.expect(
+            &cmd,
+            &build_w_response(answered_page, &[0x11u8; programming::PAGE_SIZE])?,
+        );
+        mock.expect(&[programming::ACK], &[0x15]);
+
+        // A bad trailing ACK makes the exchange unsafe to retry. Cleanup is
+        // the only remaining scripted operation.
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.read_page(requested_page).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::McpPageReadNotAcknowledged {
+                    page: 0x0021,
+                    got: 0x15,
+                })
+            ),
+            "wrong-page retry must require the radio's trailing ACK: {result:?}"
         );
         radio.transport.assert_complete();
         Ok(())
@@ -1715,7 +2151,7 @@ mod tests {
 
         // Recovery sends the exit byte, reconnects, and restores
         // normal operation.
-        radio.transport.expect(b"E", &[]);
+        radio.transport.expect(b"E", &[programming::ACK]);
         radio.transport.expect_reopen(Ok(()));
         radio.transport.expect(b"ID\r", b"ID TH-D75\r");
         radio.recover_from_interrupted_mcp().await?;
@@ -1723,6 +2159,447 @@ mod tests {
         radio.transport.expect(b"MD 0\r", b"MD 0,0\r");
         let response = radio.execute(Command::GetMode { band: Band::A }).await?;
         assert!(matches!(response, Response::Mode { .. }));
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_pre_entry_full_dump_recovery_restores_original_timeout() -> TestResult {
+        let mut mock = MockTransport::new();
+        // Keep the pre-entry stale-input drain pending long enough for
+        // the caller to cancel before any MCP wire traffic is sent.
+        mock.queue_read_delayed(b"stale\r", 100);
+
+        let mut radio = Radio::connect(mock).await?;
+        let original_timeout = std::time::Duration::from_secs(7);
+        radio.set_timeout(original_timeout);
+
+        let first_cancel = tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            radio.read_memory_image(),
+        )
+        .await;
+        assert!(first_cancel.is_err(), "full dump was not cancelled");
+        assert_eq!(
+            radio.mcp_phase,
+            McpPhase::Inactive,
+            "pre-entry cancellation must not claim MCP wire traffic occurred"
+        );
+        assert_eq!(radio.timeout, super::FULL_DUMP_TIMEOUT);
+        assert_eq!(radio.mcp_saved_timeout, Some(original_timeout));
+
+        // A second pre-entry attempt must retain the first saved timeout
+        // rather than replacing it with FULL_DUMP_TIMEOUT.
+        let second_cancel = tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            radio.read_memory_image(),
+        )
+        .await;
+        assert!(second_cancel.is_err(), "second full dump was not cancelled");
+        assert_eq!(radio.mcp_saved_timeout, Some(original_timeout));
+
+        // Recovery is meaningful even though the phase never became active:
+        // it restores host-side state without touching the wire.
+        radio.recover_from_interrupted_mcp().await?;
+        assert_eq!(radio.timeout, original_timeout);
+        assert_eq!(radio.mcp_saved_timeout, None);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poisoned_full_image_methods_do_not_mutate_saved_timeout() -> TestResult {
+        let original_timeout = std::time::Duration::from_secs(7);
+
+        let mut read_radio = Radio::connect(MockTransport::new()).await?;
+        read_radio.timeout = super::FULL_DUMP_TIMEOUT;
+        read_radio.mcp_saved_timeout = Some(original_timeout);
+        read_radio.mcp_phase = McpPhase::Active;
+        let read_result = read_radio.read_memory_image().await;
+        assert!(
+            matches!(read_result, Err(Error::McpInterrupted)),
+            "poisoned full read must refuse before mutation: {read_result:?}"
+        );
+        assert_eq!(read_radio.timeout, super::FULL_DUMP_TIMEOUT);
+        assert_eq!(read_radio.mcp_saved_timeout, Some(original_timeout));
+
+        let mut write_radio = Radio::connect(MockTransport::new()).await?;
+        write_radio.timeout = super::FULL_DUMP_TIMEOUT;
+        write_radio.mcp_saved_timeout = Some(original_timeout);
+        write_radio.mcp_phase = McpPhase::ExitSent;
+        let image = vec![0; programming::TOTAL_SIZE];
+        let write_result = write_radio.write_memory_image(&image).await;
+        assert!(
+            matches!(write_result, Err(Error::McpInterrupted)),
+            "poisoned full write must refuse before mutation: {write_result:?}"
+        );
+        assert_eq!(write_radio.timeout, super::FULL_DUMP_TIMEOUT);
+        assert_eq!(write_radio.mcp_saved_timeout, Some(original_timeout));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wrong_exit_ack_still_reconnects_but_surfaces_typed_error() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"E", &[0x15]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.expect(b"MD 0\r", b"MD 0,0\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        radio.mcp_phase = McpPhase::Active;
+
+        let result = radio.exit_programming_mode().await;
+        assert!(
+            matches!(result, Err(Error::McpExitNotAcknowledged { got: 0x15 })),
+            "wrong exit byte must remain visible after successful CAT proof: {result:?}"
+        );
+        assert!(
+            radio.mcp_phase == McpPhase::Inactive,
+            "successful reconnect and ID must clear MCP poison"
+        );
+        assert!(
+            !radio.desynced,
+            "successful reconnect and ID must clear binary desynchronization"
+        );
+
+        let response = radio.execute(Command::GetMode { band: Band::A }).await?;
+        assert!(matches!(response, Response::Mode { .. }));
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_state_restore_failure_after_identify_does_not_repoison_mcp() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.expect(b"AI 1\r", b"?\r");
+        mock.expect(b"MD 0\r", b"MD 0,0\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        radio.mcp_phase = McpPhase::Active;
+        radio.auto_info_enabled = true;
+
+        let result = radio.exit_programming_mode().await;
+        assert!(
+            matches!(result, Err(Error::RadioError)),
+            "cached-state restore failure must remain an ordinary error: {result:?}"
+        );
+        assert_eq!(
+            radio.mcp_phase,
+            McpPhase::Inactive,
+            "successful identify must clear MCP poison before cached-state restoration"
+        );
+
+        let response = radio.execute(Command::GetMode { band: Band::A }).await?;
+        assert!(matches!(response, Response::Mode { .. }));
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_cached_state_restore_after_identify_does_not_repoison_mcp() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.expect_hang(b"AI 1\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        radio.mcp_phase = McpPhase::ExitSent;
+        radio.auto_info_enabled = true;
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            radio.reconnect_after_mcp_exit(),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "cached-state restoration was not cancelled"
+        );
+        assert_eq!(
+            radio.mcp_phase,
+            McpPhase::Inactive,
+            "cancellation after successful identify must not restore MCP poison"
+        );
+        assert!(
+            radio.desynced,
+            "cancelled cached-state command must drain possible late input before the next CAT command"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exit_write_is_bounded_and_retains_exit_sent_phase() -> TestResult {
+        let mut radio = Radio::connect(HangingWriteTransport).await?;
+        radio.mcp_phase = McpPhase::Active;
+
+        let result = radio.send_programming_exit().await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::Timeout(timeout)) if timeout == super::MCP_EXIT_ACK_TIMEOUT
+            ),
+            "wedged raw exit write must time out explicitly: {result:?}"
+        );
+        assert_eq!(
+            radio.mcp_phase,
+            McpPhase::ExitSent,
+            "write timeout must retain the no-second-E recovery phase"
+        );
+        assert!(
+            radio.desynced,
+            "write timeout must retain unknown wire state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_settle_preserves_exit_anomaly_for_recovery() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"E", &[0x15]);
+
+        let mut radio = Radio::connect(mock).await?;
+        radio.mcp_phase = McpPhase::Active;
+
+        // The wrong ACK is obtained immediately; cancellation then lands
+        // during the reset-settle delay that follows it.
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            radio.exit_programming_mode(),
+        )
+        .await;
+        assert!(cancelled.is_err(), "exit settle was not cancelled");
+        assert_eq!(radio.mcp_phase, McpPhase::ExitSent);
+        assert!(
+            matches!(
+                &radio.mcp_pending_exit_error,
+                Some(Error::McpExitNotAcknowledged { got: 0x15 })
+            ),
+            "exit anomaly was not retained across cancellation"
+        );
+
+        // Recovery must not send E again, and must still report the
+        // original ACK anomaly after independently proving CAT.
+        radio.transport.expect_reopen(Ok(()));
+        radio.transport.expect(b"ID\r", b"ID TH-D75\r");
+        let recovery = radio.recover_from_interrupted_mcp().await;
+        assert!(
+            matches!(recovery, Err(Error::McpExitNotAcknowledged { got: 0x15 })),
+            "recovery lost the retained exit anomaly: {recovery:?}"
+        );
+        assert_eq!(radio.mcp_phase, McpPhase::Inactive);
+        assert!(radio.mcp_pending_exit_error.is_none());
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn detached_exit_without_ack_remains_poisoned() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect_hang(b"E");
+
+        let mut radio = Radio::connect(mock).await?;
+        radio.mcp_phase = McpPhase::Active;
+
+        let result = radio.exit_programming_mode_detached().await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::Timeout(timeout)) if timeout == super::MCP_EXIT_ACK_TIMEOUT
+            ),
+            "missing detached-exit ACK must time out explicitly: {result:?}"
+        );
+        assert!(
+            radio.mcp_phase != McpPhase::Inactive,
+            "an unconfirmed detached exit must keep CAT poisoned"
+        );
+        assert!(
+            radio.desynced,
+            "an unconfirmed detached exit must retain unknown wire state"
+        );
+
+        let refused = radio.execute(Command::GetMode { band: Band::A }).await;
+        assert!(
+            matches!(refused, Err(Error::McpInterrupted)),
+            "CAT must remain blocked after an unconfirmed detached exit: {refused:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_exit_recovery_never_sends_a_second_exit_byte() -> TestResult {
+        let mut mock = MockTransport::new();
+        // The write succeeds, but waiting for its ACK never completes.
+        // Cancellation therefore lands after E may have reached the radio.
+        mock.expect_hang(b"E");
+
+        let mut radio = Radio::connect(mock).await?;
+        radio.mcp_phase = McpPhase::Active;
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            radio.exit_programming_mode(),
+        )
+        .await;
+        assert!(cancelled.is_err(), "exit future was not cancelled");
+        assert!(
+            radio.mcp_phase == McpPhase::ExitSent,
+            "cancellation after the E write must retain the exit-sent phase"
+        );
+
+        // There is deliberately no second E exchange in the strict mock.
+        // Recovery may only wait out reset and prove CAT by reopening.
+        radio.transport.expect_reopen(Ok(()));
+        radio.transport.expect(b"ID\r", b"ID TH-D75\r");
+        radio.recover_from_interrupted_mcp().await?;
+
+        assert!(
+            radio.mcp_phase == McpPhase::Inactive,
+            "CAT proof must clear both MCP phase flags"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sparse_read_reports_operation_and_unproved_reconnect_failures() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page = 0x0010;
+        let read = programming::build_read_command(page);
+        // The short frame is followed by MockTransport's WouldBlock error,
+        // producing a transfer failure without a timeout retry.
+        mock.expect(&read, b"W");
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Err(TransportError::ReopenUnsupported));
+
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.read_sparse_memory_pages(&[page]).await;
+
+        match result {
+            Err(Error::McpOperationAndCleanupFailed { operation, cleanup }) => {
+                assert!(
+                    matches!(&*operation, Error::Transport(_)),
+                    "the original page-read failure was not retained: {operation:?}"
+                );
+                assert!(
+                    matches!(&*cleanup, Error::McpCleanupNotProved { .. }),
+                    "the unproved reconnect failure was not prioritized: {cleanup:?}"
+                );
+            }
+            other => {
+                return Err(
+                    format!("expected combined operation/cleanup failure, got {other:?}").into(),
+                );
+            }
+        }
+        assert!(
+            radio.mcp_phase == McpPhase::ExitSent,
+            "failed CAT proof must leave MCP recovery state poisoned"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operation_and_exit_ack_failures_are_both_retained_after_cat_proof() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page = 0x0010;
+        let read = programming::build_read_command(page);
+        mock.expect(&read, b"W");
+        mock.expect(b"E", &[0x15]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.read_sparse_memory_pages(&[page]).await;
+        match result {
+            Err(Error::McpOperationAndCleanupFailed { operation, cleanup }) => {
+                assert!(
+                    matches!(&*operation, Error::Transport(_)),
+                    "original page-read failure was not retained: {operation:?}"
+                );
+                assert!(
+                    matches!(&*cleanup, Error::McpExitNotAcknowledged { got: 0x15 }),
+                    "exit-ACK anomaly was not retained: {cleanup:?}"
+                );
+            }
+            other => {
+                return Err(format!("expected both MCP failures, got {other:?}").into());
+            }
+        }
+        assert_eq!(
+            radio.mcp_phase,
+            McpPhase::Inactive,
+            "successful CAT proof must still clear MCP poison"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_entry_retains_failed_exit_and_reconnect_cleanup() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"not-an-mcp-entry-acknowledgement");
+        mock.expect(b"E", &[0x15]);
+        mock.expect_reopen(Err(TransportError::ReopenUnsupported));
+
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.read_page(0).await;
+
+        match result {
+            Err(Error::McpOperationAndCleanupFailed { operation, cleanup }) => {
+                assert!(
+                    matches!(&*operation, Error::Protocol(_)),
+                    "the failed entry was not retained: {operation:?}"
+                );
+                match *cleanup {
+                    Error::McpOperationAndCleanupFailed {
+                        operation: exit,
+                        cleanup: reconnect,
+                    } => {
+                        assert!(
+                            matches!(&*exit, Error::McpExitNotAcknowledged { got: 0x15 }),
+                            "the failed exit acknowledgement was not retained: {exit:?}"
+                        );
+                        match *reconnect {
+                            Error::McpCleanupNotProved { cleanup: source } => {
+                                assert!(
+                                    matches!(&*source, Error::Transport(_)),
+                                    "the reconnect proof failure was not retained: {source:?}"
+                                );
+                            }
+                            other => {
+                                return Err(format!(
+                                    "unproved reconnect lacked power-cycle guidance: {other:?}"
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(
+                            format!("expected failed exit plus reconnect, got {other:?}").into(),
+                        );
+                    }
+                }
+            }
+            other => {
+                return Err(format!("expected failed entry plus cleanup, got {other:?}").into());
+            }
+        }
+        assert!(
+            radio.mcp_phase == McpPhase::ExitSent,
+            "failed entry cleanup must keep CAT blocked"
+        );
         radio.transport.assert_complete();
         Ok(())
     }
@@ -1739,7 +2616,7 @@ mod tests {
         let cmd = programming::build_read_command(page);
         mock.expect(&cmd, &build_w_response(page, &[0xAAu8; 256])?);
         mock.expect(&[programming::ACK], &[programming::ACK]);
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -1767,7 +2644,7 @@ mod tests {
             mock.expect(&cmd, &build_w_response(page, &page_data)?);
             mock.expect(&[programming::ACK], &[programming::ACK]);
         }
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -1798,7 +2675,7 @@ mod tests {
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
         // Exit, then the exit path reconnects.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -1806,6 +2683,123 @@ mod tests {
         let result = radio.read_page(page).await?;
         assert_eq!(*result.first().ok_or("result[0] missing")?, 0x00);
         assert_eq!(*result.get(1).ok_or("result[1] missing")?, 0xAB);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sparse_page_read_sorts_deduplicates_and_reports_progress() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let low_page = 0x0010;
+        let high_page = programming::TOTAL_PAGES - 1;
+        let low_data = [0x11; programming::PAGE_SIZE];
+        let high_data = [0x22; programming::PAGE_SIZE];
+
+        // Input is deliberately unordered and duplicated. The strict mock
+        // permits exactly one read and ACK exchange per distinct page, in
+        // ascending order. The final factory-calibration page is readable.
+        let low_read = programming::build_read_command(low_page);
+        mock.expect(&low_read, &build_w_response(low_page, &low_data)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        let high_read = programming::build_read_command(high_page);
+        mock.expect(&high_read, &build_w_response(high_page, &high_data)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        let mut progress = Vec::new();
+        let pages = radio
+            .read_sparse_memory_pages_with_progress(
+                &[high_page, low_page, high_page],
+                |completed, total| progress.push((completed, total)),
+            )
+            .await?;
+
+        assert_eq!(pages, vec![(low_page, low_data), (high_page, high_data)]);
+        assert_eq!(progress, vec![(1, 2), (2, 2)]);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_page_read_rejects_out_of_range_page_before_io() -> TestResult {
+        let mock = MockTransport::new();
+        let mut radio = Radio::connect(mock).await?;
+        let mut callback_called = false;
+
+        let result = radio
+            .read_sparse_memory_pages_with_progress(
+                &[programming::TOTAL_PAGES - 1, programming::TOTAL_PAGES, 0],
+                |_, _| callback_called = true,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::McpPageOutOfRange {
+                    page,
+                    total_pages
+                }) if page == programming::TOTAL_PAGES
+                    && total_pages == programming::TOTAL_PAGES
+            ),
+            "out-of-range request should return the invalid page: {result:?}"
+        );
+        assert!(
+            !callback_called,
+            "validation failure must not invoke the callback"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_page_read_empty_request_is_noop() -> TestResult {
+        let mock = MockTransport::new();
+        let mut radio = Radio::connect(mock).await?;
+        let mut callback_called = false;
+
+        let pages = radio
+            .read_sparse_memory_pages_with_progress(&[], |_, _| callback_called = true)
+            .await?;
+
+        assert!(pages.is_empty());
+        assert!(
+            !callback_called,
+            "empty request must not invoke the callback"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sparse_page_read_exits_after_read_failure() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page = 0x0010;
+        let read = programming::build_read_command(page);
+        // A short response is followed by MockTransport's WouldBlock error,
+        // which fails the page read without triggering the timeout retry.
+        mock.expect(&read, b"W");
+
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.read_sparse_memory_pages(&[page]).await;
+
+        assert!(
+            matches!(result, Err(Error::Transport(_))),
+            "short page response should surface as a transport error: {result:?}"
+        );
+        radio.transport.assert_complete();
         Ok(())
     }
 
@@ -1828,7 +2822,7 @@ mod tests {
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
         // Exit, then the exit path reconnects.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -1867,7 +2861,7 @@ mod tests {
         mock.expect(&low_read, &build_w_response(low_page, &low_modified)?);
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -1950,7 +2944,7 @@ mod tests {
         // which fails the page read without triggering the timeout retry.
         mock.expect(&read, b"W");
 
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -1970,6 +2964,10 @@ mod tests {
         use crate::memory::{FieldValue, PatchPlanner, menu_field};
 
         let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        // Hardware captures contain both `1.03` and `1.03.000`; this
+        // exercises the extended exact identity through the live gate.
+        mock.expect(b"FV\r", b"FV 1.03.000\r");
         mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
         // radio.Beep (Bool at 0x1071, page 0x10) and gps.MyPositionSelect
@@ -2010,7 +3008,7 @@ mod tests {
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -2028,6 +3026,48 @@ mod tests {
             changed,
             vec![beep_page, select_page],
             "both changed pages must be written and verified in ascending order"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_menu_patches_rejects_unqualified_firmware_before_mcp_io() -> TestResult {
+        use crate::memory::{FieldValue, PatchPlanner, menu_field};
+
+        let mut planner = PatchPlanner::new();
+        let beep = menu_field("radio.Beep").ok_or("registry field radio.Beep missing")?;
+        beep.plan_value(&mut planner, FieldValue::Bool(true))?;
+        let patches = planner.finish()?;
+
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.expect(b"FV\r", b"FV 1.04\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.apply_menu_patches(&patches).await;
+        let message = match &result {
+            Err(error) => error.to_string(),
+            Ok(changed) => {
+                return Err(format!("unqualified firmware wrote pages: {changed:?}").into());
+            }
+        };
+        assert!(
+            message.contains("1.03.000") && message.contains("1.04"),
+            "qualification error must list accepted and actual CAT identities: {message}"
+        );
+        assert!(
+            matches!(
+                result,
+                Err(Error::UnsupportedMcpSchemaTarget {
+                    expected_model: "TH-D75",
+                    expected_firmware: "1.03",
+                    ref actual_model,
+                    ref actual_firmware,
+                    ..
+                }) if actual_model == "TH-D75" && actual_firmware == "1.04"
+            ),
+            "unqualified firmware must fail before MCP I/O: {result:?}"
         );
         radio.transport.assert_complete();
         Ok(())
@@ -2056,7 +3096,7 @@ mod tests {
         // Exit byte only: NO reopen and NO identify are scripted, so
         // any reconnect attempt would fail the strict mock. The link
         // is deliberately left dead for the radio's reboot.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
 
         let mut radio = Radio::connect(mock).await?;
         radio
@@ -2066,6 +3106,107 @@ mod tests {
                 }
             })
             .await?;
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn detached_modify_rejects_nonzero_w_offset_before_patch_or_ack() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page: u16 = 0x001C;
+        let read_cmd = programming::build_read_command(page);
+        let mut response = build_w_response(page, &[0x5A; programming::PAGE_SIZE])?;
+        set_byte(&mut response, 3, 0x00)?;
+        set_byte(&mut response, 4, 0x01)?;
+        mock.expect(&read_cmd, &response);
+
+        // The invalid W frame must not receive a host ACK or reach the patch
+        // callback. The operation-error path requires normal CAT proof.
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        let mut callback_called = false;
+        let result = radio
+            .modify_memory_page_detached(page, |_| callback_called = true)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::Protocol(ProtocolError::WriteResponseNonzeroOffset {
+                    got: 1
+                }))
+            ),
+            "nonzero W offset was not rejected: {result:?}"
+        );
+        assert!(
+            !callback_called,
+            "invalid offset payload reached the patch callback"
+        );
+        assert_eq!(
+            radio.mcp_phase,
+            McpPhase::Inactive,
+            "CAT identity proof should clear MCP after rejecting the frame"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn detached_operation_failure_does_not_trust_stale_ack_as_exit_proof() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page: u16 = 0x001C;
+        let read_cmd = programming::build_read_command(page);
+        let full_response = build_w_response(page, &[0x5A; programming::PAGE_SIZE])?;
+        let partial = full_response
+            .get(..32)
+            .ok_or("test W response unexpectedly shorter than 32 bytes")?;
+        // The partial W times out. A delayed ACK then sits ahead of the
+        // actual E response and can falsely satisfy a detached exit that
+        // relies on one byte alone.
+        mock.expect_partial_then_hang_with_late(&read_cmd, partial, &[programming::ACK]);
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Err(TransportError::ReopenUnsupported));
+
+        let mut radio = Radio::connect(mock).await?;
+        let page_timeout = std::time::Duration::from_millis(50);
+        radio.set_timeout(page_timeout);
+        let result = radio
+            .modify_memory_page_detached(page, |data| {
+                if let Some(byte) = data.get_mut(0xA0) {
+                    *byte = 1;
+                }
+            })
+            .await;
+
+        match result {
+            Err(Error::McpOperationAndCleanupFailed { operation, cleanup }) => {
+                assert!(
+                    matches!(&*operation, Error::Timeout(timeout) if *timeout == page_timeout),
+                    "partial page failure was not retained: {operation:?}"
+                );
+                assert!(
+                    matches!(&*cleanup, Error::McpCleanupNotProved { .. }),
+                    "stale ACK incorrectly proved the detached exit: {cleanup:?}"
+                );
+            }
+            other => {
+                return Err(format!(
+                    "expected page failure plus unproved CAT cleanup, got {other:?}"
+                )
+                .into());
+            }
+        }
+        assert_eq!(
+            radio.mcp_phase,
+            McpPhase::ExitSent,
+            "failed CAT identity proof must keep detached cleanup poisoned"
+        );
         radio.transport.assert_complete();
         Ok(())
     }
@@ -2089,7 +3230,7 @@ mod tests {
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
         // Exit (with reconnect) still runs even though verify failed.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -2121,7 +3262,7 @@ mod tests {
         mock.expect(&write_cmd, &[programming::ACK]);
 
         // No read-back scripted: the unverified variant must not read.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -2187,7 +3328,7 @@ mod tests {
         }
 
         // Exit, then the exit path reconnects.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -2209,6 +3350,97 @@ mod tests {
                 .all(|&b| b == 0x01),
             "second page should be all 0x01"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contiguous_reads_validate_complete_range_before_io() -> TestResult {
+        let mock = MockTransport::new();
+        let mut radio = Radio::connect(mock).await?;
+
+        let empty = radio.read_memory_pages(u16::MAX, 0).await?;
+        assert!(empty.is_empty(), "zero-page read must be a no-op");
+
+        let crossing = radio
+            .read_memory_pages(programming::TOTAL_PAGES - 1, 2)
+            .await;
+        assert!(
+            matches!(
+                crossing,
+                Err(Error::McpPageOutOfRange {
+                    page,
+                    total_pages,
+                }) if page == programming::TOTAL_PAGES
+                    && total_pages == programming::TOTAL_PAGES
+            ),
+            "range crossing the image end must fail before I/O: {crossing:?}"
+        );
+
+        let overflowing = radio.read_memory_pages(1, u16::MAX).await;
+        assert!(
+            matches!(
+                overflowing,
+                Err(Error::McpPageOutOfRange {
+                    page,
+                    total_pages,
+                }) if page == programming::TOTAL_PAGES
+                    && total_pages == programming::TOTAL_PAGES
+            ),
+            "overflowing range must fail before I/O: {overflowing:?}"
+        );
+
+        let single = radio.read_page(u16::MAX).await;
+        assert!(
+            matches!(
+                single,
+                Err(Error::McpPageOutOfRange {
+                    page: u16::MAX,
+                    total_pages,
+                }) if total_pages == programming::TOTAL_PAGES
+            ),
+            "out-of-range single page must fail before I/O: {single:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contiguous_writes_validate_shape_and_range_before_io() -> TestResult {
+        let mock = MockTransport::new();
+        let mut radio = Radio::connect(mock).await?;
+
+        radio.write_memory_pages(u16::MAX, &[]).await?;
+
+        let unaligned = vec![0; programming::PAGE_SIZE + 1];
+        let alignment_result = radio.write_memory_pages(0, &unaligned).await;
+        assert!(
+            matches!(
+                alignment_result,
+                Err(Error::InvalidImageSize {
+                    actual,
+                    expected,
+                }) if actual == programming::PAGE_SIZE + 1
+                    && expected == programming::PAGE_SIZE * 2
+            ),
+            "unaligned data must fail before MCP entry: {alignment_result:?}"
+        );
+
+        let crossing = vec![0; programming::PAGE_SIZE * 2];
+        let range_result = radio
+            .write_memory_pages(programming::TOTAL_PAGES - 1, &crossing)
+            .await;
+        assert!(
+            matches!(
+                range_result,
+                Err(Error::McpPageOutOfRange {
+                    page,
+                    total_pages,
+                }) if page == programming::TOTAL_PAGES
+                    && total_pages == programming::TOTAL_PAGES
+            ),
+            "write crossing the image end must fail before MCP entry: {range_result:?}"
+        );
+        radio.transport.assert_complete();
         Ok(())
     }
 
@@ -2259,7 +3491,7 @@ mod tests {
         }
 
         // Exit, then the exit path reconnects.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -2305,7 +3537,7 @@ mod tests {
         }
 
         // Exit, then the exit path reconnects.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -2355,7 +3587,7 @@ mod tests {
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
         // Exit programming mode, then the exit path reconnects.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -2428,7 +3660,7 @@ mod tests {
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
         // Exit programming mode, then the exit path reconnects.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -2480,7 +3712,7 @@ mod tests {
         mock.expect(&write_cmd, &[programming::ACK]);
         mock.expect(&read_cmd, &build_w_response(page, &expected_array)?);
         mock.expect(&[programming::ACK], &[programming::ACK]);
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
@@ -2518,7 +3750,7 @@ mod tests {
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
         // Exit programming mode, then the exit path reconnects.
-        mock.expect(b"E", &[]);
+        mock.expect(b"E", &[programming::ACK]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
 

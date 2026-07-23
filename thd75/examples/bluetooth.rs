@@ -44,7 +44,7 @@ const DEFAULT_BT_PORT: Option<&str> = Some("/dev/rfcomm0");
 const DEFAULT_BT_PORT: Option<&str> = None;
 
 #[cfg(target_os = "macos")]
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use kenwood_thd75::transport::BluetoothTransport;
 
@@ -91,6 +91,19 @@ async fn inspect_radio<T: Transport>(transport: T) -> Result<(), Box<dyn std::er
     let fw = radio.get_firmware_version().await?;
     println!("Firmware: {fw}");
 
+    let (tnc_mode, tnc_baud) = radio.get_tnc_mode().await?;
+    println!("TNC mode: {tnc_mode} ({tnc_baud})");
+
+    let gateway = radio.get_gateway().await?;
+    println!("DV Gateway: {gateway}");
+
+    let (gps_enabled, gps_pc_output) = radio.get_gps_config().await?;
+    println!(
+        "GPS: {} (PC output {})",
+        if gps_enabled { "ON" } else { "OFF" },
+        if gps_pc_output { "ON" } else { "OFF" }
+    );
+
     // Read state from both bands.
     for band in [Band::A, Band::B] {
         let freq = radio.get_frequency(band).await?;
@@ -103,9 +116,8 @@ async fn inspect_radio<T: Transport>(transport: T) -> Result<(), Box<dyn std::er
     let bt_on = radio.get_bluetooth().await?;
     println!("\nBluetooth: {}", if bt_on { "ON" } else { "OFF" });
 
-    // Note: MCP programming mode is NOT available over Bluetooth.
-    // Only CAT commands work over BT SPP.
-    println!("\nNote: MCP programming requires USB. CAT commands work over BT.");
+    println!("\nNote: this example stays in normal CAT mode.");
+    println!("MCP reads are explicit programming operations, not passive inspection.");
 
     radio.disconnect().await?;
     println!("Disconnected.");

@@ -345,7 +345,7 @@ fn mock_modify_page_sequence(
     // Verify read-back returns the modified page.
     mock.expect(&read_cmd, &build_w_response(page, expected)?);
     mock.expect(&[programming::ACK], &[programming::ACK]);
-    mock.expect(b"E", &[]);
+    mock.expect(b"E", &[programming::ACK]);
     // The exit path reconnects: transport reopen + identify.
     mock.expect_reopen(Ok(()));
     mock.expect(b"ID\r", b"ID TH-D75\r");

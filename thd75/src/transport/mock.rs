@@ -103,6 +103,38 @@ impl MockTransport {
             .push_back((command.to_vec(), vec![MockRead::Hang]));
     }
 
+    /// Queue an expected command whose response begins with `partial` and
+    /// then never completes.
+    ///
+    /// Models a truncated frame on a live but wedged transport.
+    pub fn expect_partial_then_hang(&mut self, command: &[u8], partial: &[u8]) {
+        self.exchanges.push_back((
+            command.to_vec(),
+            vec![MockRead::Data(partial.to_vec()), MockRead::Hang],
+        ));
+    }
+
+    /// Queue an expected command whose response begins, wedges, and then
+    /// leaves `late` bytes queued after the blocked read is cancelled.
+    ///
+    /// Models a truncated exchange whose delayed tail can be mistaken for a
+    /// later command's response.
+    pub fn expect_partial_then_hang_with_late(
+        &mut self,
+        command: &[u8],
+        partial: &[u8],
+        late: &[u8],
+    ) {
+        self.exchanges.push_back((
+            command.to_vec(),
+            vec![
+                MockRead::Data(partial.to_vec()),
+                MockRead::Hang,
+                MockRead::Data(late.to_vec()),
+            ],
+        ));
+    }
+
     /// Load expected exchanges from a fixture file.
     ///
     /// The file format uses `> ` prefixed lines for commands and `< ` prefixed

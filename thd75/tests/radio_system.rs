@@ -65,7 +65,7 @@ fn mock_modify_page_sequence(
     mock.expect(&[programming::ACK], &[programming::ACK]);
 
     // Exit programming mode, then the exit path reconnects.
-    mock.expect(b"E", &[]);
+    mock.expect(b"E", &[programming::ACK]);
     mock.expect_reopen(Ok(()));
     mock.expect(b"ID\r", b"ID TH-D75\r");
     Ok(())

@@ -201,7 +201,7 @@ async fn mcp_exit_reconnects_and_cat_works() -> TestResult {
     let cmd = programming::build_read_command(page);
     mock.expect(&cmd, &build_w_response(page, &[0x5Au8; 256])?);
     mock.expect(&[programming::ACK], &[programming::ACK]);
-    mock.expect(b"E", &[]);
+    mock.expect(b"E", &[programming::ACK]);
     // The exit path reconnects: reopen + identify...
     mock.expect_reopen(Ok(()));
     mock.expect(b"ID\r", b"ID TH-D75\r");

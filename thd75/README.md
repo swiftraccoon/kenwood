@@ -8,8 +8,11 @@ Async Rust library for full control of the Kenwood TH-D75 ham radio transceiver.
 ## Features
 
 - **CAT protocol**: All 55 commands with strict type safety. Every parameter uses validated types that reject invalid values at construction time.
-- **MCP programming**: Binary memory read/write via `0M PROGRAM` mode. Read and modify all 1,200 MCP channel entries (1,000 standard channels plus special channels), settings, and calibration data.
-- **Generated MCP-D75 menu schema**: Menu offsets, bit masks, value domains, and English option labels are extracted from the official MCP-D75 serializers. Batch patches read only the touched pages, preserve shared bits, enter programming mode once, and verify every changed page.
+- **MCP programming**: Binary memory access via `0M PROGRAM` mode. Read all
+  1,200 MCP channel entries (1,000 standard channels plus special channels),
+  settings, and calibration pages; modify user configuration while the final
+  two factory-calibration pages remain write-protected.
+- **Generated MCP-D75 menu schema**: 400 user-configuration fields, with offsets, bit masks, value domains, and English option labels extracted from the official MCP-D75 serializers. The `mcp_menu --read` example takes a sparse, structurally read-only snapshot; batch patches read only the touched pages, preserve shared bits, enter programming mode once, and verify every changed page. Runtime CAT state, channel records, and factory calibration remain separate interfaces.
 - **SD card parsing**: Read `.d75` configs, `.nme` GPS logs, `.tsv` repeater/callsign/QSO lists, `.wav` audio recordings, and `.bmp` screen captures.
 - **APRS integration**: High-level `AprsClient` that owns `Radio<T>` + `KissSession` and threads `now: Instant` into the sans-io stack. Packet-radio protocol code (KISS framing, AX.25 codec, APRS parser/digipeater/SmartBeaconing/messaging/station-list, APRS-IS) lives in the sibling [`kiss-tnc`](https://github.com/swiftraccoon/kenwood/tree/main/kiss-tnc), [`ax25-codec`](https://github.com/swiftraccoon/kenwood/tree/main/ax25-codec), [`aprs`](https://github.com/swiftraccoon/kenwood/tree/main/aprs), [`aprs-is`](https://github.com/swiftraccoon/kenwood/tree/main/aprs-is) crates.
 - **MCP bridge**: `From<McpSmartBeaconingConfig> for aprs::SmartBeaconingConfig` (mph → km/h) in `thd75/src/aprs/mcp_bridge.rs`.
@@ -56,7 +59,7 @@ Runnable examples live in [`examples/`](https://github.com/swiftraccoon/kenwood/
 | `channel_dump` | Read memory channels 0-999 via CAT, optionally reading display names via MCP. |
 | `config_backup` | Read the entire 500 KB radio memory via MCP and save it to a binary file. |
 | `write_settings` | Temporarily change and restore squelch via CAT, then overwrite channel 0's display name via MCP. |
-| `mcp_menu` | List, validate, and batch-write generated MCP-D75 menu fields using sparse verified page patches. Dry-run by default. |
+| `mcp_menu` | List, read, validate, and batch-write generated MCP-D75 menu fields using sparse page access. Writes are dry-run by default. |
 | `bluetooth` | Connect over native macOS Bluetooth or a Linux/Windows serial RFCOMM port (pair via Menu 934 first). |
 | `bt_native` | Exercise the native `IOBluetooth` RFCOMM transport (macOS). |
 | `pf_screen_capture` | Assign the front-panel PF1 key to Screen Capture via an MCP memory write. |
@@ -69,6 +72,20 @@ List fields or filter them by name:
 ```text
 cargo run -p kenwood-thd75 --example mcp_menu -- --list beep
 ```
+
+Take a structurally read-only sparse snapshot, optionally filtered by field
+name:
+
+```text
+cargo run -p kenwood-thd75 --example mcp_menu -- \
+  --read interface --port /dev/cu.usbmodem1234
+```
+
+Snapshot values can contain private callsigns, saved coordinates, messages,
+and Bluetooth device names. Keep the output local or send it only to a trusted
+destination. Catchable termination signals trigger MCP recovery; an
+uncatchable process kill or host power loss can still require power-cycling
+the radio.
 
 Build and validate a patch plan without touching the radio:
 

@@ -1,6 +1,10 @@
-//! Integration tests for service mode protocol commands:
-//! 0G enter/exit, 2V version read, 0S calibration data read.
+//! Quarantine tests for unverified factory-service mnemonics.
+//!
+//! These operations are intentionally excluded from the shared CAT codec.
+//! No public API may emit them until the selector-3 entry and exit sequence,
+//! transport framing, and read/write semantics are independently live-verified.
 
+use kenwood_thd75::error::ProtocolError;
 use kenwood_thd75::protocol::{self, Command, Response};
 
 // Deps visible to every kenwood-thd75 test target but unused here.
@@ -22,81 +26,36 @@ use tracing as _;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-// ============================================================================
-// 0G: Enter / Exit service mode
-// ============================================================================
-
 #[test]
-fn serialize_enter_service_mode() {
-    let bytes = protocol::serialize(&Command::EnterServiceMode);
-    assert_eq!(bytes, b"0G KENWOOD\r");
-}
+fn normal_0e_mcp_status_remains_supported() -> TestResult {
+    assert_eq!(protocol::serialize(&Command::GetMcpStatus), b"0E\r");
 
-#[test]
-fn serialize_exit_service_mode() {
-    let bytes = protocol::serialize(&Command::ExitServiceMode);
-    assert_eq!(bytes, b"0G\r");
-}
-
-#[test]
-fn parse_enter_service_mode_response() -> TestResult {
-    let r = protocol::parse(b"0G")?;
-    let Response::ServiceMode { data } = r else {
-        return Err(format!("expected ServiceMode, got {r:?}").into());
+    let response = protocol::parse(b"0E")?;
+    let Response::McpStatus { value } = response else {
+        return Err(format!("expected McpStatus, got {response:?}").into());
     };
-    assert_eq!(data, "");
+    assert_eq!(value, "");
     Ok(())
 }
 
 #[test]
-fn parse_enter_service_mode_with_payload() -> TestResult {
-    let r = protocol::parse(b"0G OK")?;
-    let Response::ServiceMode { data } = r else {
-        return Err(format!("expected ServiceMode, got {r:?}").into());
-    };
-    assert_eq!(data, "OK");
-    Ok(())
-}
+fn factory_service_responses_are_quarantined() {
+    let frames: &[(&[u8], &str)] = &[
+        (b"0G", "0G"),
+        (b"9R 000000,AF", "9R"),
+        (b"9E 000000,AA", "9E"),
+        (b"2V A1B2", "2V"),
+    ];
 
-// ============================================================================
-// 2V: Service version read
-// ============================================================================
-
-#[test]
-fn serialize_service_get_version() {
-    let bytes = protocol::serialize(&Command::ServiceGetVersion {
-        param1: "00".to_owned(),
-        param2: "000".to_owned(),
-    });
-    assert_eq!(bytes, b"2V 00,000\r");
-}
-
-#[test]
-fn parse_service_version_response() -> TestResult {
-    let r = protocol::parse(b"2V EX-5210")?;
-    let Response::ServiceVersion { data } = r else {
-        return Err(format!("expected ServiceVersion, got {r:?}").into());
-    };
-    assert_eq!(data, "EX-5210");
-    Ok(())
-}
-
-// ============================================================================
-// 0S: Calibration data read
-// ============================================================================
-
-#[test]
-fn serialize_read_calibration_data() {
-    let bytes = protocol::serialize(&Command::ReadCalibrationData);
-    assert_eq!(bytes, b"0S\r");
-}
-
-#[test]
-fn parse_calibration_data_response() -> TestResult {
-    let r = protocol::parse(b"0S AABBCCDD")?;
-    let Response::ServiceCalibrationData { data } = r else {
-        return Err(format!("expected ServiceCalibrationData, got {r:?}").into());
-    };
-    assert_eq!(data, "AABBCCDD");
-    Ok(())
+    for &(frame, expected_mnemonic) in frames {
+        let result = protocol::parse(frame);
+        assert!(
+            matches!(
+                result,
+                Err(ProtocolError::UnknownCommand(ref command))
+                    if command == expected_mnemonic
+            ),
+            "{expected_mnemonic} unexpectedly remained in the shared CAT codec: {result:?}"
+        );
+    }
 }

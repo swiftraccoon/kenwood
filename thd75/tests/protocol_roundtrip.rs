@@ -286,21 +286,6 @@ proptest! {
         prop_assert_eq!(parsed, channel);
     }
 
-    // 17. GW (DV Gateway mode) wire round-trip
-    #[test]
-    fn gw_round_trip(gw_val in 0u8..DvGatewayMode::COUNT) {
-        let value = DvGatewayMode::try_from(gw_val).map_err(to_test_err)?;
-        let cmd = Command::SetGateway { value };
-        let wire = protocol::serialize(&cmd);
-        let frame = wire.split_last().map(|(_, rest)| rest).ok_or_else(|| to_test_err("empty wire"))?;
-        let r = protocol::parse(frame).map_err(to_test_err)?;
-        let Response::Gateway { value: v } = r else {
-            prop_assert!(false, "wrong: {r:?}");
-            return Ok(());
-        };
-        prop_assert_eq!(v, value);
-    }
-
     // 18. SH (filter width) wire round-trip
     #[test]
     fn sh_round_trip(mode in 0u8..FilterMode::COUNT, width in 0u8..5) {

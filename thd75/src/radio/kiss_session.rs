@@ -472,8 +472,9 @@ impl<T: Transport> KissSession<T> {
             // Binary TNC traffic may have left residue on the line, so
             // drain before the first CAT command.
             desynced: true,
-            mcp_active: false,
+            mcp_phase: super::McpPhase::Inactive,
             mcp_saved_timeout: None,
+            mcp_pending_exit_error: None,
             link_state_tx: self.link_state_tx,
             auto_info_enabled: self.auto_info_enabled,
             gps_config: self.gps_config,

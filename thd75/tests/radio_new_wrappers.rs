@@ -3,8 +3,8 @@
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;
 use kenwood_thd75::types::{
-    Band, BeaconMode, DetectOutputMode, DstarSlot, DvGatewayMode, FilterMode, FineStep, StepSize,
-    TncBaud, VfoMemoryMode,
+    Band, BeaconMode, DetectOutputMode, DstarSlot, FilterMode, FineStep, StepSize, TncBaud,
+    VfoMemoryMode,
 };
 
 // Deps visible to every kenwood-thd75 test target but unused here.
@@ -376,17 +376,6 @@ async fn set_dstar_slot() -> TestResult {
     Ok(())
 }
 
-// ---- GW: set_gateway ----
-
-#[tokio::test]
-async fn set_gateway() -> TestResult {
-    let mut mock = MockTransport::new();
-    mock.expect(b"GW 1\r", b"GW 1\r");
-    let mut radio = Radio::connect(mock).await?;
-    radio.set_gateway(DvGatewayMode::ReflectorTerminal).await?;
-    Ok(())
-}
-
 // ---- Serialization tests for new command variants ----
 
 #[test]
@@ -479,17 +468,6 @@ fn serialize_set_dstar_slot() -> TestResult {
         b"DS 5\r"
     );
     Ok(())
-}
-
-#[test]
-fn serialize_set_gateway() {
-    use kenwood_thd75::protocol::{Command, serialize};
-    assert_eq!(
-        serialize(&Command::SetGateway {
-            value: DvGatewayMode::ReflectorTerminal
-        }),
-        b"GW 1\r"
-    );
 }
 
 #[test]

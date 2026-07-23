@@ -112,6 +112,37 @@ pub use schema::{
 };
 pub use settings::{SettingsAccess, SettingsWriter};
 
+/// Radio model whose live MCP layout is represented by the generated schema.
+pub const MCP_D75_SCHEMA_MODEL: &str = "TH-D75";
+
+/// Firmware version whose live MCP layout is represented by the schema.
+pub const MCP_D75_SCHEMA_FIRMWARE: &str = "1.03";
+
+/// Exact CAT `FV` identities emitted for the supported vendor firmware.
+///
+/// Both forms are present in committed TH-D75 hardware captures. They name
+/// the same Kenwood 1.03 release; no prefix or numeric-version matching is
+/// permitted for live schema access.
+pub const MCP_D75_SCHEMA_FIRMWARE_IDENTITIES: &[&str] = &["1.03", "1.03.000"];
+
+/// Canonicalize an exact supported CAT firmware identity.
+///
+/// Returns [`MCP_D75_SCHEMA_FIRMWARE`] for either exact identity in
+/// [`MCP_D75_SCHEMA_FIRMWARE_IDENTITIES`]. All other strings are rejected,
+/// including later build suffixes such as `1.03.001`.
+#[must_use]
+pub fn canonicalize_mcp_d75_schema_firmware(firmware: &str) -> Option<&'static str> {
+    MCP_D75_SCHEMA_FIRMWARE_IDENTITIES
+        .contains(&firmware)
+        .then_some(MCP_D75_SCHEMA_FIRMWARE)
+}
+
+/// Whether a live CAT identity exactly matches the MCP-D75 schema target.
+#[must_use]
+pub fn is_supported_mcp_d75_schema_target(model: &str, firmware: &str) -> bool {
+    model == MCP_D75_SCHEMA_MODEL && canonicalize_mcp_d75_schema_firmware(firmware).is_some()
+}
+
 // ---------------------------------------------------------------------------
 // MemoryImage
 // ---------------------------------------------------------------------------
@@ -419,6 +450,33 @@ mod tests {
     use crate::protocol::programming;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn schema_firmware_identity_canonicalization_is_exact() {
+        for supported in MCP_D75_SCHEMA_FIRMWARE_IDENTITIES {
+            assert_eq!(
+                canonicalize_mcp_d75_schema_firmware(supported),
+                Some(MCP_D75_SCHEMA_FIRMWARE),
+                "supported CAT identity was not canonicalized: {supported:?}"
+            );
+            assert!(
+                is_supported_mcp_d75_schema_target(MCP_D75_SCHEMA_MODEL, supported),
+                "supported schema target was rejected: {supported:?}"
+            );
+        }
+
+        for rejected in ["1.03.001", "1.04", "1.03.0", " 1.03", "1.03 "] {
+            assert_eq!(
+                canonicalize_mcp_d75_schema_firmware(rejected),
+                None,
+                "unsupported CAT identity was accepted: {rejected:?}"
+            );
+        }
+        assert!(
+            !is_supported_mcp_d75_schema_target("TH-D74", "1.03"),
+            "wrong model was accepted"
+        );
+    }
 
     #[test]
     fn to_d75_bytes_round_trip() -> TestResult {

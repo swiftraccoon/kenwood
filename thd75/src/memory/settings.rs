@@ -179,9 +179,9 @@ const BLUETOOTH_OFFSET: usize = 0x1078;
 const BT_AUTO_CONNECT_OFFSET: usize = 0x1079;
 
 // --- PF keys ---
-/// `radio.Pf1PfKey` (1 byte, gapped domain 0-30; 5, 23, 25, 26 invalid).
+/// `radio.Pf1PfKey` (1 byte; official writable domain 0-30 with gaps).
 const PF_KEY1_OFFSET: usize = 0x107A;
-/// `radio.Pf2PfKey` (1 byte, gapped domain 0-30; 5, 23, 25, 26 invalid).
+/// `radio.Pf2PfKey` (1 byte; official writable domain 0-30 with gaps).
 const PF_KEY2_OFFSET: usize = 0x107B;
 
 // --- Locks ---
@@ -741,30 +741,26 @@ impl<'a> SettingsAccess<'a> {
     // PF keys
     // -----------------------------------------------------------------------
 
-    /// Read the PF1 key assignment (`radio.Pf1PfKey`, gapped domain
-    /// 0-30; 0 if unreadable).
+    /// Read the exact stored PF1 key assignment byte
+    /// (`radio.Pf1PfKey`; 0 if unreadable).
     ///
-    /// MCP offset `0x107A`. Raw values 5, 23, 25 and 26 are not part
-    /// of the official domain.
+    /// MCP offset `0x107A`. The official writable domain is 0-30 with
+    /// gaps, but hardware probes may leave a known off-menu function code
+    /// such as 31 (Screen Capture). Reads preserve such values exactly;
+    /// [`SettingsWriter::set_pf_key1`] still enforces the official domain.
     #[must_use]
     pub fn pf_key1(&self) -> u8 {
-        self.image
-            .get(PF_KEY1_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(30))
+        self.image.get(PF_KEY1_OFFSET).copied().unwrap_or_default()
     }
 
-    /// Read the PF2 key assignment (`radio.Pf2PfKey`, gapped domain
-    /// 0-30; 0 if unreadable).
+    /// Read the exact stored PF2 key assignment byte
+    /// (`radio.Pf2PfKey`; 0 if unreadable).
     ///
-    /// MCP offset `0x107B`. Raw values 5, 23, 25 and 26 are not part
-    /// of the official domain.
+    /// MCP offset `0x107B`. Reads preserve values outside the official
+    /// writable domain so diagnostics cannot silently misreport them.
     #[must_use]
     pub fn pf_key2(&self) -> u8 {
-        self.image
-            .get(PF_KEY2_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(30))
+        self.image.get(PF_KEY2_OFFSET).copied().unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------
@@ -2032,6 +2028,18 @@ mod tests {
         // Rejected writes must not have modified the stored bytes.
         assert_eq!(mi.settings().pf_key1(), 30);
         assert_eq!(mi.settings().pf_key2(), 11);
+        Ok(())
+    }
+
+    #[test]
+    fn read_pf_keys_preserves_noncanonical_raw_values() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, PF_KEY1_OFFSET, 31)?;
+        set_byte(&mut image, PF_KEY2_OFFSET, 0xFF)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+
+        assert_eq!(mi.settings().pf_key1(), 31);
+        assert_eq!(mi.settings().pf_key2(), 0xFF);
         Ok(())
     }
 

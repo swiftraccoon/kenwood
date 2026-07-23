@@ -6,7 +6,10 @@
 //! session without downloading or uploading a complete memory image.
 
 use crate::error::Error;
-use crate::memory::PatchSet;
+use crate::memory::{
+    MCP_D75_SCHEMA_FIRMWARE, MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, MCP_D75_SCHEMA_MODEL, PatchSet,
+    is_supported_mcp_d75_schema_target,
+};
 use crate::transport::Transport;
 
 use super::Radio;
@@ -29,6 +32,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
+    /// Returns [`Error::UnsupportedMcpSchemaTarget`] before entering MCP if
+    /// the connected radio does not report the exact model and one of the
+    /// CAT firmware identities qualified for the generated offsets.
     /// Returns [`Error::MemoryWriteProtected`] before I/O if the page set
     /// touches the factory-calibration region. Other errors report MCP entry,
     /// page read, verified write, exit, or reconnect failures. If a write or
@@ -36,6 +42,22 @@ impl<T: Transport> Radio<T> {
     /// earlier in the same session remain changed on the radio.
     pub async fn apply_menu_patches(&mut self, patches: &PatchSet) -> Result<Vec<u16>, Error> {
         let pages: Vec<u16> = patches.pages().collect();
+        if pages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let identity = self.identify().await?;
+        let firmware = self.get_firmware_version().await?;
+        if !is_supported_mcp_d75_schema_target(&identity.model, &firmware) {
+            return Err(Error::UnsupportedMcpSchemaTarget {
+                expected_model: MCP_D75_SCHEMA_MODEL,
+                expected_firmware: MCP_D75_SCHEMA_FIRMWARE,
+                accepted_firmware_identities: MCP_D75_SCHEMA_FIRMWARE_IDENTITIES,
+                actual_model: identity.model,
+                actual_firmware: firmware,
+            });
+        }
+
         self.modify_memory_pages(&pages, |page, data| {
             if let Some(page_patch) = patches.page(page) {
                 page_patch.apply_to_page(data);

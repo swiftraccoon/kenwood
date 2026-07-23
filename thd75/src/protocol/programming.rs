@@ -9,7 +9,7 @@
 //! - Entry: `0M PROGRAM\r` -> `0M\r`
 //! - Read: `R` + 2-byte page + `0x00 0x00` -> `W` + 4-byte address + 256-byte data (261 bytes)
 //! - ACK: `0x06`
-//! - Exit: `E`
+//! - Exit: `E` -> `0x06`, followed by the radio's USB reset
 //!
 //! # Safety
 //!
@@ -33,7 +33,7 @@ pub const ENTER_PROGRAMMING: &[u8] = b"\r0M PROGRAM\r";
 /// Expected response when entering programming mode (ASCII).
 pub const ENTER_RESPONSE: &[u8] = b"0M\r";
 
-/// ACK byte sent after receiving a data block.
+/// ACK byte exchanged after page transfers and returned for an accepted exit.
 pub const ACK: u8 = 0x06;
 
 /// Exit byte to leave programming mode.
@@ -210,10 +210,12 @@ pub const fn is_factory_calibration_page(page: u16) -> bool {
 ///   than [`W_RESPONSE_SIZE`].
 /// - [`ProtocolError::WriteResponseBadMarker`] if the first byte is not
 ///   `'W'`.
+/// - [`ProtocolError::WriteResponseNonzeroOffset`] if address bytes 3-4
+///   contain an offset other than zero.
 pub fn parse_write_response(buf: &[u8]) -> Result<(u16, &[u8]), ProtocolError> {
     // W response layout: `W` marker + 4-byte address + PAGE_SIZE bytes.
     let actual = buf.len();
-    let &[marker, page_hi, page_lo, _off_hi, _off_lo, ..] = buf else {
+    let &[marker, page_hi, page_lo, off_hi, off_lo, ..] = buf else {
         return Err(ProtocolError::WriteResponseTooShort {
             actual,
             expected: W_RESPONSE_SIZE,
@@ -221,6 +223,10 @@ pub fn parse_write_response(buf: &[u8]) -> Result<(u16, &[u8]), ProtocolError> {
     };
     if marker != b'W' {
         return Err(ProtocolError::WriteResponseBadMarker { got: marker });
+    }
+    let offset = u16::from_be_bytes([off_hi, off_lo]);
+    if offset != 0 {
+        return Err(ProtocolError::WriteResponseNonzeroOffset { got: offset });
     }
     let page = u16::from_be_bytes([page_hi, page_lo]);
     let data = buf
@@ -405,6 +411,20 @@ mod tests {
                 Err(ProtocolError::WriteResponseBadMarker { got: b'X' })
             ),
             "expected WriteResponseBadMarker, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_write_response_rejects_nonzero_offset() {
+        let mut resp = vec![b'W', 0x01, 0x00, 0x01, 0x23];
+        resp.extend_from_slice(&[0x41; 256]);
+        let result = parse_write_response(&resp);
+        assert!(
+            matches!(
+                result,
+                Err(ProtocolError::WriteResponseNonzeroOffset { got: 0x0123 })
+            ),
+            "expected WriteResponseNonzeroOffset, got {result:?}"
         );
     }
 

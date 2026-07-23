@@ -133,23 +133,6 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set the gateway value (GW write).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_gateway(&mut self, value: DvGatewayMode) -> Result<(), Error> {
-        tracing::info!(?value, "setting D-STAR gateway mode");
-        let response = self.execute(Command::SetGateway { value }).await?;
-        match response {
-            Response::Gateway { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "Gateway".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
     // -----------------------------------------------------------------------
     // High-level callsign read/write helpers
     // -----------------------------------------------------------------------

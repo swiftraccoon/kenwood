@@ -133,6 +133,94 @@ pub enum Error {
         answered: u16,
     },
 
+    /// The radio did not complete the ACK handshake for an MCP page read.
+    #[error(
+        "read of page 0x{page:04X} not acknowledged by radio \
+         (expected ACK 0x06, got 0x{got:02X})"
+    )]
+    McpPageReadNotAcknowledged {
+        /// The page contained in the complete `W` response.
+        page: u16,
+        /// The byte received instead of ACK.
+        got: u8,
+    },
+
+    /// A requested MCP page lies outside the radio's memory image.
+    #[error("MCP page 0x{page:04X} out of range (page count: {total_pages})")]
+    McpPageOutOfRange {
+        /// The invalid page number.
+        page: u16,
+        /// The number of pages in the radio's memory image.
+        total_pages: u16,
+    },
+
+    /// A schema-generated patch was aimed at an unqualified live target.
+    #[error(
+        "MCP-D75 schema patches support only {expected_model} vendor firmware \
+         {expected_firmware} (accepted exact CAT FV identities: \
+         {accepted_firmware_identities:?}); connected target is model {actual_model} \
+         firmware {actual_firmware}"
+    )]
+    UnsupportedMcpSchemaTarget {
+        /// Model required by the generated schema.
+        expected_model: &'static str,
+        /// Canonical vendor firmware release required by the schema.
+        expected_firmware: &'static str,
+        /// Exact CAT `FV` strings accepted for that vendor release.
+        accepted_firmware_identities: &'static [&'static str],
+        /// Model reported by the connected radio.
+        actual_model: String,
+        /// Firmware reported by the connected radio.
+        actual_firmware: String,
+    },
+
+    /// The radio answered an MCP exit command with a byte other than ACK.
+    ///
+    /// The exit was not confirmed, so the programming session remains in
+    /// an unknown state until CAT operation is independently proved or the
+    /// radio is recovered.
+    #[error("MCP exit not acknowledged (expected ACK 0x06, got 0x{got:02X})")]
+    McpExitNotAcknowledged {
+        /// The byte received instead of ACK.
+        got: u8,
+    },
+
+    /// MCP cleanup failed and normal CAT operation was not proved.
+    ///
+    /// The radio may still be in programming mode, or its USB reset may not
+    /// have completed. Retrying MCP or sending CAT commands is unsafe until
+    /// the radio has been fully power-cycled.
+    #[error(
+        "MCP cleanup failed: {cleanup}; normal CAT restoration was not proved; \
+         fully power-cycle the radio before retrying"
+    )]
+    McpCleanupNotProved {
+        /// The cleanup or reconnect failure.
+        #[source]
+        cleanup: Box<Self>,
+    },
+
+    /// Both an MCP operation and its cleanup failed.
+    ///
+    /// Both errors are retained for diagnosis. When `cleanup` contains
+    /// [`Error::McpCleanupNotProved`], the radio's current mode is unknown
+    /// and that nested error carries the required power-cycle guidance.
+    #[error("MCP operation failed: {operation}; cleanup also failed: {cleanup}")]
+    McpOperationAndCleanupFailed {
+        /// The original transfer, entry, or write failure.
+        operation: Box<Self>,
+        /// The subsequent cleanup or reconnect failure.
+        #[source]
+        cleanup: Box<Self>,
+    },
+
+    /// An MCP exit byte may already have reached the radio.
+    ///
+    /// Sending `E` twice has undefined framing semantics, so recovery must
+    /// settle and prove CAT operation without retransmitting the exit byte.
+    #[error("MCP exit was already attempted; refusing to send a second exit byte")]
+    McpExitAlreadySent,
+
     /// An MCP programming session was interrupted (its future was
     /// cancelled mid-transfer). The radio may still be in PROG MCP mode
     /// where CAT commands do not work, so call
@@ -265,6 +353,13 @@ pub enum ProtocolError {
     WriteResponseBadMarker {
         /// The byte received in place of the `W` marker.
         got: u8,
+    },
+
+    /// An MCP `W` response carried a nonzero byte offset.
+    #[error("expected zero W response offset, got 0x{got:04X}")]
+    WriteResponseNonzeroOffset {
+        /// The unexpected big-endian offset from address bytes 3-4.
+        got: u16,
     },
 }
 

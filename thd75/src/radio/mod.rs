@@ -21,7 +21,6 @@ pub mod menu;
 pub mod mmdvm_session;
 pub mod programming;
 pub mod scan;
-pub mod service;
 pub mod system;
 pub mod tuning;
 
@@ -98,6 +97,18 @@ pub enum LinkState {
     Down,
 }
 
+/// Host-side safety phase for an MCP programming session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum McpPhase {
+    /// No unresolved MCP session; normal CAT traffic is permitted.
+    #[default]
+    Inactive,
+    /// MCP entry or binary transfer may be active; an exit has not begun.
+    Active,
+    /// The raw exit byte may have reached the radio and must not be resent.
+    ExitSent,
+}
+
 /// High-level async API for controlling a Kenwood TH-D75.
 ///
 /// Generic over the transport layer: works with USB serial,
@@ -126,15 +137,16 @@ pub struct Radio<T: Transport> {
     /// in flight and must be drained before the next command, or a
     /// retry with the same mnemonic would consume the stale answer.
     desynced: bool,
-    /// Set while an MCP programming session is active. If it is still
-    /// set outside a programming method, the session's future was
-    /// cancelled mid-transfer and the radio may be stuck in PROG MCP
-    /// mode, where CAT refuses until
-    /// [`Radio::recover_from_interrupted_mcp`] runs.
-    pub(crate) mcp_active: bool,
+    /// MCP safety phase. Any phase other than `Inactive` blocks CAT; the
+    /// `ExitSent` phase additionally prevents recovery from sending a second
+    /// raw exit byte after cancellation.
+    pub(crate) mcp_phase: McpPhase,
     /// The CAT timeout saved while an MCP session temporarily raises
     /// it; restored on session end or interrupted-session recovery.
     pub(crate) mcp_saved_timeout: Option<Duration>,
+    /// An MCP exit error retained across cancellation while reset settling
+    /// or CAT reconnection is still in progress.
+    pub(crate) mcp_pending_exit_error: Option<Error>,
     /// Publishes link-health transitions; see [`Radio::link_state`].
     link_state_tx: tokio::sync::watch::Sender<LinkState>,
     /// Whether auto-info was enabled by the caller; re-asserted by
@@ -192,8 +204,9 @@ impl<T: Transport> Radio<T> {
             mcp_speed: programming::McpSpeed::default(),
             last_cmd_time: None,
             desynced: false,
-            mcp_active: false,
+            mcp_phase: McpPhase::Inactive,
             mcp_saved_timeout: None,
+            mcp_pending_exit_error: None,
             link_state_tx: link_tx,
             auto_info_enabled: false,
             gps_config: None,
@@ -372,7 +385,7 @@ impl<T: Transport> Radio<T> {
 
         // 0. Refuse CAT while an interrupted MCP session may have left
         //    the radio in PROG MCP mode (binary protocol, CAT dead).
-        if self.mcp_active {
+        if self.mcp_phase != McpPhase::Inactive {
             return Err(Error::McpInterrupted);
         }
 
@@ -728,6 +741,16 @@ impl<T: Transport> Radio<T> {
     /// Returns [`Error::Transport`] if the transport cannot reopen, or
     /// any error from the identify and state-restore commands.
     pub async fn reconnect(&mut self) -> Result<(), Error> {
+        self.reopen_and_identify().await?;
+        self.restore_state_after_reconnect().await
+    }
+
+    /// Reopen the transport and prove that the new link answers CAT.
+    ///
+    /// Kept separate from cached-state restoration so MCP recovery can
+    /// clear its programming-mode poison at the exact point identity is
+    /// proved, before any optional AI/GPS state is re-applied.
+    async fn reopen_and_identify(&mut self) -> Result<(), Error> {
         tracing::info!("reconnecting radio link");
         if let Err(e) = self.close_transport().await {
             tracing::debug!(error = %e, "close before reopen failed (link already dead)");
@@ -739,6 +762,15 @@ impl<T: Transport> Radio<T> {
         self.desynced = false;
         self.last_cmd_time = None;
         let _identified = self.identify().await?;
+        Ok(())
+    }
+
+    /// Restore caller-selected streaming state after CAT identity is proved.
+    ///
+    /// General [`Radio::reconnect`] semantics remain all-or-nothing: the
+    /// link is announced as up only after every requested state restore
+    /// succeeds.
+    async fn restore_state_after_reconnect(&mut self) -> Result<(), Error> {
         if self.auto_info_enabled {
             self.set_auto_info(true).await?;
         }
