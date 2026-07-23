@@ -49,6 +49,8 @@ jobs:
         working-directory: dstar-gateway
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: thd75-repl
+      - run: cargo clippy --all-targets --features testing -- -D warnings
+        working-directory: thd75-repl
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: mbelib-rs
       - run: cargo clippy --all-targets -- -D warnings
@@ -60,6 +62,8 @@ jobs:
       - run: cargo test
         working-directory: dstar-gateway
       - run: cargo test
+        working-directory: thd75-repl
+      - run: cargo test --features testing
         working-directory: thd75-repl
       - run: cargo test
         working-directory: mbelib-rs

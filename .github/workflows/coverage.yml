@@ -36,7 +36,15 @@ jobs:
       # crate (unit + integration). This is also the only CI job that
       # executes the full workspace test suite on Linux, so a test
       # failure here must fail the job: no `|| true`.
-      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      #
+      # `--features testing` enables thd75-repl's `script_integration`
+      # suite (behind `required-features`), which is otherwise invisible
+      # to coverage. Only `testing` is named, so it does not turn on
+      # `dstar-gateway/hardware-tests` (whose test opens live reflectors)
+      # or the network example features. `--workspace --features testing`
+      # resolves because a single member defines the feature; cargo
+      # enables it only there.
+      - run: cargo llvm-cov --workspace --features testing --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
         with:
           files: lcov.info

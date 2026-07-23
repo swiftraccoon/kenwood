@@ -476,9 +476,21 @@ fi
 # for executable tests (lib/bin/integration, no custom harnesses in
 # this workspace); doctests are NOT run by nextest and get their own
 # pass below. Example and bench targets are compile-covered by the
-# clippy `--all-targets` passes above. Default + feature matrix
-# mirrors the clippy matrix so feature-gated tests are exercised.
+# clippy `--all-targets` passes above.
+#
+# The default pass runs no features, so any test target behind
+# `required-features` is skipped and must be run explicitly here. This
+# is NOT `--all-features` (as the clippy pass is): enabling every
+# feature would turn on `dstar-gateway/hardware-tests`, whose test
+# opens live reflectors, and `examples-network`. Each test-gating
+# feature is run on its own crate instead. thd75-repl's `testing`
+# feature gates the `script_integration` suite; mbelib-rs's matrix follows
+# the same per-crate rule as its clippy matrix (kenwood-tables implies encoder,
+# so the encoder-only combination needs its own run).
 run cargo nextest run "${SCOPE[@]}"
+if [ -z "$PKG" ] || [ "$PKG" = "thd75-repl" ]; then
+    run cargo nextest run -p thd75-repl --features testing
+fi
 if [ "$MBELIB_MATRIX" -eq 1 ]; then
     run cargo nextest run -p mbelib-rs --features encoder
     run cargo nextest run -p mbelib-rs --features kenwood-tables
