@@ -11,7 +11,7 @@
 //!
 //! ## Coverage
 //!
-//! The current scenarios are intentionally minimal — just enough to
+//! The normal REPL scenarios are intentionally minimal: just enough to
 //! let an integration test exit the REPL loop cleanly after reading
 //! the radio model. More elaborate scenarios (D-STAR, APRS) belong
 //! in dedicated test fixture files loaded via
@@ -89,7 +89,7 @@ fn simple_scenario() -> MockTransport {
 /// absorbs every KISS frame the transmit commands emit (they are
 /// write-only), so an integration test can exercise `position`,
 /// `compressed`, `mice`, `object`, `status`, and `motion` without
-/// predicting exact wire bytes — the per-format wire encodings are
+/// predicting exact wire bytes; the per-format wire encodings are
 /// already pinned by the `kenwood-thd75` and `aprs` unit tests.
 fn aprs_scenario() -> MockTransport {
     let mut mock = MockTransport::new();
@@ -129,7 +129,7 @@ fn aprs_scenario() -> MockTransport {
 fn mmdvm_scenario() -> MockTransport {
     let mut mock = MockTransport::new();
 
-    // connect_safe preamble (same as the simple scenario) — each write
+    // connect_safe preamble (same as the simple scenario): each write
     // is programmed against an empty response so the drain read at the
     // end of connect_safe is satisfied cleanly.
     mock.expect(b"\r", b"");

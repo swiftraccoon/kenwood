@@ -1,7 +1,7 @@
 //! Transport discovery and connection.
 //!
 //! Auto-discovers the TH-D75 via USB or Bluetooth. On macOS, always
-//! uses native `IOBluetooth` RFCOMM for Bluetooth — the macOS serial
+//! uses native `IOBluetooth` RFCOMM for Bluetooth, because the macOS serial
 //! driver (`/dev/cu.TH-D75`) drops bytes and is documented as broken.
 //! On Linux/Windows, serial BT SPP ports are used normally.
 
@@ -13,7 +13,7 @@ use kenwood_thd75::transport::{EitherTransport, SerialTransport};
 /// 1. Explicit `--port` if provided
 /// 2. USB CDC-ACM auto-discovery
 /// 3. Native Bluetooth (macOS: `IOBluetooth` RFCOMM)
-/// 4. Serial BT SPP ports (Linux/Windows only — skipped on macOS)
+/// 4. Serial BT SPP ports (Linux/Windows only; skipped on macOS)
 pub(crate) fn discover_and_open(
     port: Option<&str>,
     baud: u32,
@@ -72,7 +72,7 @@ fn open_bluetooth(_baud: u32) -> Result<(String, EitherTransport), Box<dyn std::
 
 /// Open a Bluetooth connection via serial BT SPP port discovery.
 ///
-/// On Linux/Windows there is no native `IOBluetooth` equivalent — we
+/// On Linux/Windows there is no native `IOBluetooth` equivalent, so we
 /// enumerate serial ports that look like Bluetooth TH-D75 pairings and
 /// open the first one at the requested baud rate.
 #[cfg(not(target_os = "macos"))]

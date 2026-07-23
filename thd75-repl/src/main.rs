@@ -28,6 +28,7 @@ mod transport;
 #[cfg(test)]
 use proptest as _;
 
+use std::future::Future;
 use std::io::IsTerminal as _;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::Ordering;
@@ -38,6 +39,10 @@ use clap::Parser;
 use dstar_gateway_core::slowdata::{SlowDataTextCollector, encode_text_message};
 use kenwood_thd75::LinkDiagnosis;
 use kenwood_thd75::Radio;
+use kenwood_thd75::memory::{
+    MCP_D75_SCHEMA_FIRMWARE, MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, MCP_D75_SCHEMA_MODEL,
+    is_supported_mcp_d75_schema_target,
+};
 use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::{AprsClient, AprsClientConfig, AprsEvent, Ax25Address, DigipeaterConfig};
 use kenwood_thd75::{DStarEvent, DStarGateway, DStarGatewayConfig};
@@ -59,7 +64,7 @@ use dstar_gateway_core::{Callsign, Module, StreamId, Suffix};
 ///
 /// The default is [`Self::Off`]: no file is created and no tracing
 /// output is written. File logging is enabled only when the user
-/// explicitly passes `--log-level` or `--trace` — this prevents the
+/// explicitly passes `--log-level` or `--trace`; this prevents the
 /// rotating log file from accumulating hundreds of megabytes on
 /// every normal session (D-STAR voice at trace level is ~1 MB/s).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -161,7 +166,7 @@ struct Cli {
     /// - Linux: `~/.local/state/thd75-repl/thd75-repl.log.<YYYY-MM-DD-HHMMSS>`
     /// - Windows: `%LOCALAPPDATA%\thd75-repl\logs\thd75-repl.log.<YYYY-MM-DD-HHMMSS>`
     ///
-    /// Every `thd75-repl` invocation creates its own log file — old
+    /// Every `thd75-repl` invocation creates its own log file; old
     /// files accumulate until you clean them up manually. **File
     /// logging is opt-in** because trace-level capture during D-STAR
     /// voice flow generates large files fast (~1 MB/s of trace output
@@ -211,7 +216,7 @@ struct Cli {
     ///
     /// By default every transmit command (`cq`, `beacon`, `position`,
     /// `msg`, `echo`, `link`) prompts before keying the radio. Pass
-    /// `--yes` to disable the prompt globally — required when running
+    /// `--yes` to disable the prompt globally; required when running
     /// a script in automation and also useful for interactive sessions
     /// where the operator does not want to be asked every time.
     #[arg(long)]
@@ -224,7 +229,7 @@ struct Cli {
     exit_terminal_mode: bool,
 
     /// Clear the DV Gateway (Menu 650) flag via a memory write, then
-    /// exit. Works over whichever port keeps CAT alive — when the
+    /// exit. Works over whichever port keeps CAT alive: when the
     /// radio is in Reflector Terminal Mode bound to Bluetooth (Menu
     /// 985), connect over USB so the programming handshake is routed.
     /// The radio reboots into normal control; no menu keypresses are
@@ -242,7 +247,7 @@ struct Cli {
 
 /// Determine the on-disk directory where per-session log files
 /// should be written. Returns `None` if no suitable directory can
-/// be derived from the environment (extremely rare — only if
+/// be derived from the environment (extremely rare: only if
 /// `home_dir()` is unset on Unix or `data_local_dir()` is unset on
 /// Windows).
 ///
@@ -288,7 +293,7 @@ fn log_directory() -> Option<std::path::PathBuf> {
 /// Guard returned by [`init_logging`] that must be kept alive for the
 /// whole process lifetime. Dropping it terminates the background
 /// flush thread for the non-blocking file sink, which would cause
-/// late log lines to be silently discarded — so `main` stores it in
+/// late log lines to be silently discarded, so `main` stores it in
 /// a local variable whose scope spans the entire runtime.
 struct LoggingGuard {
     /// Keeps the non-blocking file sink's flush thread alive until
@@ -313,7 +318,7 @@ struct LoggingGuard {
 /// For power users who want live log output on stderr, `RUST_LOG` is
 /// still honoured. Setting e.g. `RUST_LOG=dstar_gateway=debug` routes
 /// matching events to stderr at the requested level. `RUST_LOG` does
-/// NOT enable the file sink on its own — file logging is file-flag
+/// NOT enable the file sink on its own: file logging is file-flag
 /// controlled, stderr logging is env-var controlled, and the two are
 /// independent.
 fn init_logging(cli: &Cli) -> LoggingGuard {
@@ -421,7 +426,7 @@ fn init_logging(cli: &Cli) -> LoggingGuard {
 /// serial path registers a `tokio::io::AsyncFd`, and `tokio-serial`
 /// PANICS (rather than erroring) when no reactor exists. Discovering
 /// before creating the runtime therefore crashes whenever Bluetooth
-/// is unavailable and a serial port is present — an error-driven
+/// is unavailable and a serial port is present; an error-driven
 /// fallback branch never gets the chance to run.
 /// Factored out of `main` so the mock + real transport branches stay
 /// symmetric: both return the same `(path, transport, runtime)` shape.
@@ -545,7 +550,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
         thd75_repl::confirm::set_required(false);
     }
     // Script mode also covers piped stdin: the transmit confirmation
-    // prompt cannot be answered when stdin is not a terminal —
+    // prompt cannot be answered when stdin is not a terminal;
     // reading the answer would silently consume the next queued
     // command line instead.
     if cli.script.is_some() || !std::io::stdin().is_terminal() {
@@ -577,7 +582,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Configure logging before anything else so the file captures
     // the full startup sequence. The guard returned here must live
-    // until the program exits — dropping it would terminate the
+    // until the program exits; dropping it would terminate the
     // background flush thread and silently drop late log lines.
     let _logging_guard = init_logging(&cli);
 
@@ -591,7 +596,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     // IOBluetooth RFCOMM uses CoreFoundation callbacks on the main thread.
     // A tokio runtime's reactor can interfere with CFRunLoop dispatch,
     // causing BT connections to fail. The TUI avoids this by opening
-    // transport before the runtime — we do the same.
+    // transport before the runtime; we do the same.
     //
     // If BT isn't available (USB connected, or Linux/Windows), serial
     // transport needs a tokio reactor (mio), so we create the runtime
@@ -604,7 +609,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "testing")]
     let (path, transport, rt) = if let Some(ref scenario) = cli.mock_radio {
         let mock = thd75_repl::mock_scenarios::build(scenario).ok_or_else(|| {
-            format!("Unknown mock scenario: {scenario}. Known: simple, empty, mmdvm.")
+            format!("Unknown mock scenario: {scenario}. Known: simple, empty, mmdvm, aprs.")
         })?;
         let rt = tokio::runtime::Runtime::new()?;
         (format!("mock:{scenario}"), EitherTransport::Mock(mock), rt)
@@ -683,13 +688,13 @@ fn read_line_blocking(rl: &mut rustyline::DefaultEditor, prompt: &str) -> Option
 
 /// The three operating modes of the REPL.
 enum ReplState {
-    /// Normal CAT control — radio is directly accessible. Boxed to
+    /// Normal CAT control: radio is directly accessible. Boxed to
     /// keep this variant's size near its siblings'
     /// (`clippy::large_enum_variant`).
     Cat(Box<Radio<EitherTransport>>),
-    /// APRS/KISS mode — radio consumed by `AprsClient`.
+    /// APRS/KISS mode: radio consumed by `AprsClient`.
     Aprs(Box<AprsClient<EitherTransport>>),
-    /// D-STAR gateway/MMDVM mode — radio consumed by `DStarGateway`.
+    /// D-STAR gateway/MMDVM mode: radio consumed by `DStarGateway`.
     Dstar(Box<DStarSession>),
 }
 
@@ -723,7 +728,7 @@ struct DStarSession {
     ///
     /// Both end in the same A-E module letter (NEVER a literal `G`)
     /// because xlxd's `cdplusprotocol.cpp:209` rejects inbound
-    /// packets whose `rpt1` module byte is not a valid module — see
+    /// packets whose `rpt1` module byte is not a valid module; see
     /// [`build_reflector_header`] for details.
     reflector_callsign: Callsign,
     /// Current RX stream ID from reflector (`None` = no active stream).
@@ -738,7 +743,7 @@ struct DStarSession {
     /// Latch: the slow-data text message already announced for the
     /// current stream. D-STAR radios re-transmit one fixed 20-char
     /// message continuously across the whole voice stream (so late
-    /// joiners can see it) — the message cannot legitimately change
+    /// joiners can see it); the message cannot legitimately change
     /// mid-transmission, so any differing re-assembly is RF bit
     /// corruption (the slow-data channel has no error correction).
     /// Announce the first complete assembly per stream and suppress
@@ -769,7 +774,7 @@ struct DStarSession {
     /// startup), every 9-byte AMBE frame the radio's DVSI chip
     /// produces during a TX session is appended to the file. The
     /// result is a byte-for-byte record of what the real hardware
-    /// encoder emits for a specific known input — used as a golden
+    /// encoder emits for a specific known input, used as a golden
     /// vector against which the Rust encoder's output can be
     /// compared.
     ///
@@ -790,7 +795,7 @@ struct DStarSession {
     last_rx_voice_frame: Option<VoiceFrame>,
     /// Wall-clock timestamp of the most recent relay to the radio
     /// (real or padded frame). Drives the pacing decision in
-    /// [`emit_silence_pad_if_needed`] — if no frame has been sent
+    /// [`emit_silence_pad_if_needed`]: if no frame has been sent
     /// for longer than [`PAD_INITIAL_THRESHOLD`], the pad timer emits a
     /// copy of the last known frame to cover the gap.
     last_relay_at: Option<std::time::Instant>,
@@ -866,7 +871,7 @@ enum ReflectorSession {
 
 /// Runtime-unified event mirror of [`Event<P>`].
 ///
-/// The inner event data is identical across the three protocols —
+/// The inner event data is identical across the three protocols;
 /// this enum exists only to erase the `P: Protocol` parameter for the
 /// runtime event-handling functions (`relay_reflector_to_radio`,
 /// `trace_reflector_event`, `print_reflector_event`) that don't care
@@ -1005,7 +1010,7 @@ impl ReflectorSession {
               dispatches to the active mode, handles mode transitions, and unwinds on quit. \
               Extracting the three dispatch arms would require threading every mode's session \
               type through helpers and would not meaningfully reduce the function's inherent \
-              complexity — the branching is the algorithm. The argument list carries the CLI \
+              complexity: the branching is the algorithm. The argument list carries the CLI \
               flags the state machine needs; bundling them into a struct would only move the \
               same fields behind one more indirection."
 )]
@@ -1047,29 +1052,19 @@ async fn run_repl(
             ReplState::Cat(Box::new(radio))
         }
         Err(_) => {
-            // CAT identification failed — probe the link to find out why.
+            // CAT identification failed; probe the link to find out why.
             match radio.diagnose_link().await {
                 LinkDiagnosis::MmdvmMode if exit_terminal_mode => {
-                    // The operator asked for CAT, not D-STAR. Try the
-                    // automated exit first — the MCP programming
-                    // handshake may still be routed by the firmware
-                    // even while the gateway app owns the port. Fall
-                    // back to guiding the operator through the menu
-                    // change only if the radio refuses the handshake.
-                    match automated_terminal_exit(&mut radio).await {
-                        Ok(()) => {
-                            drop(radio.disconnect().await);
-                            println!(
-                                "DV Gateway flag cleared. Radio is rebooting into normal \
-                                 control mode. Relaunching..."
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                            return Err(relaunch_self().into());
-                        }
-                        Err(e) => {
-                            println!("Automated exit not possible on this link: {e}");
-                        }
-                    }
+                    // CAT is offline on this link, so neither model nor
+                    // firmware can be qualified before an offset-based MCP
+                    // write. Keep this path read-only and guide the operator.
+                    // Fully automated exit remains available through
+                    // `--set-gateway-off` on the other, CAT-capable interface,
+                    // where ID/FV are proved before touching flash.
+                    println!(
+                        "This gateway link cannot prove the radio model and firmware required \
+                         for a safe automated memory write."
+                    );
                     radio = guide_exit_terminal_mode(radio, cli_port.as_deref(), cli_baud).await?;
                     let model = radio
                         .identify()
@@ -1351,7 +1346,7 @@ async fn run_repl(
         // Reflector Terminal Mode, so its CAT parser is offline and any
         // radio command would block for the full command timeout with no
         // explanation. Intercept CAT commands with actionable guidance,
-        // but let the `dstar`/`aprs` mode transitions through — starting
+        // but let the `dstar`/`aprs` mode transitions through; starting
         // D-STAR is how you actually use terminal mode. The flag is
         // cleared when we return to verified CAT control (after
         // `dstar stop`), so this stops firing once the radio is back.
@@ -1906,7 +1901,7 @@ async fn run_igate(client: &mut AprsClient<EitherTransport>, filter: &str) {
                         // non-UTF-8 bytes appear as U+FFFD). For REPL
                         // display and the existing gate_from_is helper
                         // (which takes &str) the lossy form is the
-                        // right input — both are display- and parse-
+                        // right input: both are display- and parse-
                         // oriented operations. Callers needing byte-
                         // exact wire fidelity (capture file, full
                         // third-party rewrap) would use `pkt.raw`.
@@ -2111,11 +2106,33 @@ async fn guide_exit_terminal_mode(
 /// # Errors
 ///
 /// Returns an error string if the connection or the memory write
-/// fails — notably a handshake timeout, which means this port is the
-/// one dedicated to the gateway; try the other interface.
+/// fails. The notable case is a handshake timeout, which means this
+/// port is the one dedicated to the gateway; try the other interface.
 async fn run_set_gateway_off(transport: EitherTransport) -> Result<(), Box<dyn std::error::Error>> {
-    let mut radio = Radio::connect_safe(transport).await?;
-    println!("Clearing the DV Gateway flag (Menu 650) via memory write.");
+    // This path is selected specifically because CAT is already alive
+    // on the gateway's unused interface. Do not use `connect_safe`
+    // here: its recovery preamble writes TN 0,0 and would change the
+    // very state we need to inspect before the MCP write.
+    let mut radio = Radio::connect(transport).await?;
+    let identity = radio.identify().await?;
+    if identity.model != MCP_D75_SCHEMA_MODEL {
+        return Err(format!(
+            "refusing the Menu 650 write: expected {MCP_D75_SCHEMA_MODEL}, got {:?}",
+            identity.model
+        )
+        .into());
+    }
+    let firmware = radio.get_firmware_version().await?;
+    validate_gateway_mcp_target(&identity.model, &firmware)?;
+    let gateway = radio.get_gateway().await?;
+    println!("Verified TH-D75 firmware {firmware}; Menu 650 is {gateway}.");
+    if gateway == kenwood_thd75::types::DvGatewayMode::Off {
+        radio.disconnect().await?;
+        println!("DV Gateway is already off; no memory write or reboot was needed.");
+        return Ok(());
+    }
+
+    println!("Clearing Menu 650 via its firmware-verified MCP byte.");
     match automated_terminal_exit(&mut radio).await {
         Ok(()) => {
             drop(radio.disconnect().await);
@@ -2140,7 +2157,7 @@ async fn run_set_gateway_off(transport: EitherTransport) -> Result<(), Box<dyn s
 /// in this mode, but the MCP programming handshake (`0M PROGRAM`) may
 /// still be routed by the firmware even while the gateway app owns the
 /// port. Try it: on success the flag is cleared (verified by read-back
-/// inside the session) and the radio reboots into normal control — the
+/// inside the session) and the radio reboots into normal control; the
 /// caller must then relaunch a fresh process, because an in-process
 /// Bluetooth reconnect to a just-rebooted radio wedges (see
 /// [`relaunch_self`]). On handshake timeout the radio is unchanged and
@@ -2151,15 +2168,112 @@ async fn run_set_gateway_off(transport: EitherTransport) -> Result<(), Box<dyn s
 /// Returns an error if programming-mode entry, the page read, the page
 /// write, or the exit write fails. Entry timing out because the
 /// gateway app swallowed the handshake is the expected failure shape.
-async fn automated_terminal_exit(
-    radio: &mut Radio<EitherTransport>,
-) -> Result<(), kenwood_thd75::Error> {
+async fn automated_terminal_exit(radio: &mut Radio<EitherTransport>) -> Result<(), String> {
     println!("Attempting automated exit: clearing the DV Gateway flag via memory write.");
-    radio
-        .modify_memory_page_detached(GATEWAY_MODE_PAGE, |data| {
-            data[GATEWAY_MODE_BYTE] = 0; // Off
-        })
-        .await
+    write_gateway_mode_with_interrupt_recovery(radio, 0).await
+}
+
+/// Apply the Menu 650 byte while treating catchable process termination as
+/// an interrupted MCP transaction that must be explicitly recovered.
+async fn write_gateway_mode_with_interrupt_recovery(
+    radio: &mut Radio<EitherTransport>,
+    value: u8,
+) -> Result<(), String> {
+    write_gateway_mode_with_interrupt(radio, value, mcp_termination_signal()).await
+}
+
+async fn write_gateway_mode_with_interrupt<I>(
+    radio: &mut Radio<EitherTransport>,
+    value: u8,
+    interrupt: I,
+) -> Result<(), String>
+where
+    I: Future<Output = std::io::Result<()>>,
+{
+    let interrupt_result = {
+        let write = radio.modify_memory_page_detached(GATEWAY_MODE_PAGE, |data| {
+            data[GATEWAY_MODE_BYTE] = value;
+        });
+        tokio::pin!(write);
+        tokio::pin!(interrupt);
+        tokio::select! {
+            biased;
+            result = &mut write => return result.map_err(|error| format!("MCP write failed: {error}")),
+            signal = &mut interrupt => signal,
+        }
+    };
+
+    let interruption = interrupt_result.map_or_else(
+        |error| {
+            format!(
+                "MCP termination listener failed ({error}); the Menu 650 write was cancelled; \
+                 the setting may already have changed"
+            )
+        },
+        |()| "Menu 650 write interrupted; the setting may already have changed".to_owned(),
+    );
+    Err(recover_interrupted_gateway_write(radio, interruption).await)
+}
+
+async fn recover_interrupted_gateway_write(
+    radio: &mut Radio<EitherTransport>,
+    interruption: String,
+) -> String {
+    match radio.recover_from_interrupted_mcp().await {
+        Ok(()) => {
+            format!("{interruption}; MCP exit and normal CAT recovery completed")
+        }
+        Err(recovery_error) => match radio.identify().await {
+            Ok(info) if info.model == MCP_D75_SCHEMA_MODEL => format!(
+                "{interruption}; normal CAT is restored, but MCP exit reported: {recovery_error}"
+            ),
+            Ok(info) => format!(
+                "{interruption}; recovery reconnected to unexpected model `{}` after: \
+                 {recovery_error}",
+                info.model
+            ),
+            Err(probe_error) => format!(
+                "{interruption}; MCP exit and normal CAT recovery were not proved: \
+                 {recovery_error}; CAT probe also failed: {probe_error}; do not retry the \
+                 memory write blindly; fully power-cycle the radio and inspect Menu 650"
+            ),
+        },
+    }
+}
+
+#[cfg(unix)]
+async fn mcp_termination_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+        _ = hangup.recv() => Ok(()),
+    }
+}
+
+#[cfg(windows)]
+async fn mcp_termination_signal() -> std::io::Result<()> {
+    use tokio::signal::windows;
+
+    let mut ctrl_break = windows::ctrl_break()?;
+    let mut ctrl_close = windows::ctrl_close()?;
+    let mut ctrl_logoff = windows::ctrl_logoff()?;
+    let mut ctrl_shutdown = windows::ctrl_shutdown()?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = ctrl_break.recv() => Ok(()),
+        _ = ctrl_close.recv() => Ok(()),
+        _ = ctrl_logoff.recv() => Ok(()),
+        _ = ctrl_shutdown.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn mcp_termination_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 /// MCP offset for DV Gateway mode setting (0=Off, 1=Reflector Terminal, 2=Access Point).
@@ -2172,19 +2286,35 @@ const GATEWAY_MODE_PAGE: u16 = GATEWAY_MODE_MCP_OFFSET / 256;
 /// Byte index within the page.
 const GATEWAY_MODE_BYTE: usize = (GATEWAY_MODE_MCP_OFFSET % 256) as usize;
 
+fn validate_gateway_mcp_target(model: &str, firmware: &str) -> Result<(), String> {
+    if is_supported_mcp_d75_schema_target(model, firmware) {
+        return Ok(());
+    }
+    if model != MCP_D75_SCHEMA_MODEL {
+        return Err(format!(
+            "refusing the Menu 650 write: expected {MCP_D75_SCHEMA_MODEL}, got {model:?}"
+        ));
+    }
+    Err(format!(
+        "refusing the Menu 650 write: MCP offset 0x1CA0 is qualified only for vendor firmware \
+         {MCP_D75_SCHEMA_FIRMWARE}; accepted exact CAT FV identities are \
+         {MCP_D75_SCHEMA_FIRMWARE_IDENTITIES:?}, got {firmware:?}"
+    ))
+}
+
 /// Re-execute this process with the same command-line arguments.
 ///
 /// Used after enabling Reflector Terminal Mode: the radio reboots, and a
 /// fresh process connects cleanly where an in-process Bluetooth reconnect
 /// does not (macOS `IOBluetooth` keeps per-process RFCOMM state that
 /// wedges when the channel is reopened to a just-rebooted radio). `exec`
-/// replaces the current process image — same PID, same controlling
-/// terminal, fresh framework state — so on success this never returns.
+/// replaces the current process image (same PID, same controlling
+/// terminal, fresh framework state), so on success this never returns.
 /// The returned string is the failure message if the new image could not
 /// be started. Same pattern `rustup` uses in its shims.
 ///
 /// The [`RELAUNCH_GUARD_ENV`] marker tells the relaunched image it exists
-/// BECAUSE terminal mode was just enabled — if the mode probe still fails
+/// BECAUSE terminal mode was just enabled: if the mode probe still fails
 /// there, it must not rewrite the flag and reboot-loop.
 #[cfg(unix)]
 fn relaunch_self() -> String {
@@ -2228,26 +2358,26 @@ fn relaunch_self() -> String {
 /// Its presence means "this process is the relaunch that follows an
 /// MCP terminal-mode enable". If the gateway-mode probe STILL fails in
 /// such a process, writing the flag again would reboot the radio in an
-/// endless loop — the failure needs an operator, not a retry.
+/// endless loop; the failure needs an operator, not a retry.
 const RELAUNCH_GUARD_ENV: &str = "THD75_REPL_RELAUNCH_GUARD";
 
 /// Ensure the radio is in Reflector Terminal Mode, returning it once
 /// its link speaks MMDVM.
 ///
 /// If the MMDVM probe already answers, the radio is returned as-is.
-/// Otherwise Reflector Terminal Mode is enabled via an MCP write —
-/// which reboots the radio — and the process re-execs itself so a
+/// Otherwise Reflector Terminal Mode is enabled via an MCP write
+/// (which reboots the radio), and the process re-execs itself so a
 /// fresh image connects cleanly to the rebooted radio (this path
 /// never returns on success). A relaunched image whose probe STILL
 /// fails refuses to write again: rewriting would reboot the radio in
 /// an endless loop, and the usual cause is the radio's DV Gateway
-/// interface (Menu 985) bound to the other port — the radio shows
+/// interface (Menu 985) bound to the other port: the radio shows
 /// TERM and answers CAT here, while MMDVM flows on the port we are
 /// not connected to.
 async fn ensure_terminal_mode(
     mut radio: Radio<EitherTransport>,
 ) -> Result<Radio<EitherTransport>, (Option<Radio<EitherTransport>>, String)> {
-    // Send MMDVM GET_VERSION — if we get an E0 response, skip MCP write.
+    // Send MMDVM GET_VERSION; if we get an E0 response, skip MCP write.
     println!("Checking if radio is already in D-STAR gateway mode.");
     if radio.diagnose_link().await == LinkDiagnosis::MmdvmMode {
         println!("Radio is already in Reflector Terminal Mode.");
@@ -2260,7 +2390,7 @@ async fn ensure_terminal_mode(
         // of seconds) before the gateway app takes over the port.
         // Observed on USB: CAT alive at +10 s, dead at +49 s, MMDVM
         // answering shortly after. Poll instead of judging on one
-        // probe — a single early probe misreads "still booting" as
+        // probe: a single early probe misreads "still booting" as
         // "not in terminal mode".
         println!("Waiting for Reflector Terminal Mode to engage (up to 90 seconds).");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
@@ -2279,33 +2409,68 @@ async fn ensure_terminal_mode(
              If the radio's screen shows TERM, check Menu 985 (DV Gateway \
              PC Input/Output): it must be set to the interface you are \
              connected through (USB or Bluetooth).\n\
-             Not retrying the memory write — another attempt would only \
-             reboot the radio again."
+             Not retrying the memory write, because another attempt would \
+             only reboot the radio again."
                 .into(),
         ));
     }
 
+    // The offset below is qualified only for the stock TH-D75 1.03
+    // firmware. Unlike the CAT-off exit path, CAT is available here, so
+    // prove both values before entering MCP or touching flash.
+    let identity = match radio.identify().await {
+        Ok(identity) => identity,
+        Err(error) => {
+            return Err((
+                Some(radio),
+                format!("refusing terminal-mode memory write: could not identify radio: {error}"),
+            ));
+        }
+    };
+    if identity.model != MCP_D75_SCHEMA_MODEL {
+        return Err((
+            Some(radio),
+            format!(
+                "refusing the Menu 650 write: expected {MCP_D75_SCHEMA_MODEL}, got {:?}",
+                identity.model
+            ),
+        ));
+    }
+    let firmware = match radio.get_firmware_version().await {
+        Ok(firmware) => firmware,
+        Err(error) => {
+            return Err((
+                Some(radio),
+                format!(
+                    "refusing terminal-mode memory write: could not read firmware version: {error}"
+                ),
+            ));
+        }
+    };
+    if let Err(error) = validate_gateway_mcp_target(&identity.model, &firmware) {
+        return Err((Some(radio), error));
+    }
+
     // Enabling Reflector Terminal Mode via an MCP write reboots the
     // radio, dropping the connection. Reconnecting in-process is
-    // unreliable — IOBluetooth wedges its run loop on a channel
-    // reopened to a just-rebooted radio — but a fresh process
+    // unreliable (IOBluetooth wedges its run loop on a channel
+    // reopened to a just-rebooted radio), but a fresh process
     // connects cleanly, so re-exec ourselves once the radio is back.
-    println!("Enabling D-STAR Reflector Terminal Mode via memory write.");
+    println!(
+        "Verified {} firmware {firmware}; enabling D-STAR Reflector Terminal Mode via memory \
+         write.",
+        identity.model
+    );
     // Detached: this write reboots the radio out of CAT mode, so the
     // normal exit-path reconnect would race the reboot (over Bluetooth
     // the reopened channel wedges as the radio's stack dies). The link
     // is left dead on purpose; the re-exec below owns recovery.
-    if let Err(e) = radio
-        .modify_memory_page_detached(GATEWAY_MODE_PAGE, |data| {
-            data[GATEWAY_MODE_BYTE] = 1; // ReflectorTerminal
-        })
-        .await
-    {
-        return Err((Some(radio), format!("MCP write failed: {e}")));
+    if let Err(error) = write_gateway_mode_with_interrupt_recovery(&mut radio, 1).await {
+        return Err((Some(radio), error));
     }
 
     // Release the now-dead transport, wait out the ~5 s reboot, then
-    // relaunch — the fresh process picks up the radio in gateway mode.
+    // relaunch; the fresh process picks up the radio in gateway mode.
     drop(radio.disconnect().await);
     println!("Radio is rebooting into Reflector Terminal Mode. Relaunching...");
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -2334,7 +2499,7 @@ async fn enter_dstar(
 
     // Validate the callsign BEFORE touching the radio:
     // `ensure_terminal_mode` may perform an MCP write that reboots
-    // the radio (and re-execs this process) — far too expensive a
+    // the radio (and re-execs this process), far too expensive a
     // side effect to spend on input that was never usable. Failing
     // here also hands the radio back so the REPL continues in CAT
     // mode instead of ending the session.
@@ -2395,7 +2560,7 @@ async fn enter_dstar(
     // radio-to-reflector relay path to build the outbound rpt2 field
     // per ircDDBGateway convention (see build_reflector_header). If
     // no reflector was specified on the command line, we fall back
-    // to the station callsign as a placeholder — the relay path only
+    // to the station callsign as a placeholder; the relay path only
     // cares once link has actually connected.
     let reflector_callsign = link_arg.as_ref().map_or(callsign_typed, |arg| {
         Callsign::try_from_str(&arg.reflector_name).unwrap_or(callsign_typed)
@@ -2472,9 +2637,9 @@ fn parse_reflector_arg(s: &str) -> Option<(String, char)> {
 /// Parsed form of the `link` command argument.
 ///
 /// Supports two forms:
-/// - `XRF030C` — link to `XRF030` module `C`, with our local module
+/// - `XRF030C`: link to `XRF030` module `C`, with our local module
 ///   matching the reflector module (`C`).
-/// - `B:XRF030C` — link to `XRF030` module `C`, but present our local
+/// - `B:XRF030C`: link to `XRF030` module `C`, but present our local
 ///   module as `B` for cross-module routing.
 struct LinkArg {
     reflector_name: String,
@@ -2666,7 +2831,7 @@ async fn bind_reflector_socket() -> Result<std::sync::Arc<tokio::net::UdpSocket>
 /// elapses. Returns the promoted `Session<P, Connected>` on success.
 ///
 /// Shared between [`connect_dextra`], [`connect_dplus`], and
-/// [`connect_dcs`] — the handshake packet count differs across
+/// [`connect_dcs`]; the handshake packet count differs across
 /// protocols but the polling loop is identical (drain outbound,
 /// recv with short timeout, feed `handle_input`, repeat).
 async fn drive_handshake_to_connected<P>(
@@ -2717,7 +2882,7 @@ where
             }
             Ok(Err(e)) => return Err(format!("handshake recv failed: {e}")),
             Err(_) => {
-                // No datagram within the polling window — let the core
+                // No datagram within the polling window, so let the core
                 // fire any timers (keepalives, retransmits).
                 session.handle_timeout(std::time::Instant::now());
             }
@@ -2863,7 +3028,7 @@ async fn connect_dcs(
 /// remembered link parameters.
 ///
 /// Triggered automatically when a `Disconnected(KeepaliveInactivity)`
-/// event arrives — those mean we lost contact with the reflector for
+/// event arrives; those mean we lost contact with the reflector for
 /// 30 s but neither side intentionally closed the link, so a fresh
 /// `LINK1` handshake usually restores service. On success
 /// `session.reflector` is replaced with the newly-spawned client; on
@@ -2993,7 +3158,7 @@ async fn exit_dstar(
     cli_port: Option<&str>,
     cli_baud: u32,
 ) -> Result<Radio<EitherTransport>, String> {
-    // Stop the gateway — this sends TN 0,0 which won't actually exit
+    // Stop the gateway. This sends TN 0,0 which won't actually exit
     // Reflector Terminal Mode (that's a firmware setting, not a TNC
     // mode). But it cleanly ends our MMDVM session.
     println!("Stopping D-STAR gateway.");
@@ -3008,20 +3173,20 @@ async fn exit_dstar(
     // The radio is still in Reflector Terminal Mode. We cannot
     // MCP-write it back to Off because MCP requires CAT mode, but
     // the radio speaks MMDVM binary in TERM mode. This is the same
-    // limitation d75link has — the user must change Menu 650 manually.
+    // limitation d75link has: the user must change Menu 650 manually.
     println!("D-STAR gateway stopped.");
     println!("Please set Menu 650 (DV Gateway) to Off on the radio.");
     println!("Press Enter when done.");
 
     // Blocking stdin read. Note: once any monitor loop has awaited
     // `tokio::signal::ctrl_c()`, tokio owns the process SIGINT
-    // handler for good — Ctrl-C no longer terminates the process, so
+    // handler for good; Ctrl-C no longer terminates the process, so
     // Enter is the only way past this prompt. Don't advertise Ctrl-C
     // here.
     let mut input = String::new();
     drop(std::io::stdin().read_line(&mut input));
 
-    // Reconnect — should be in CAT mode now if user changed Menu 650.
+    // Reconnect: should be in CAT mode now if user changed Menu 650.
     println!("Reconnecting.");
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
@@ -3070,7 +3235,7 @@ async fn run_dstar_monitor(session: &mut DStarSession) {
     }
 }
 
-/// D-STAR voice frame interval — 50 fps, one frame per 20 ms.
+/// D-STAR voice frame interval: 50 fps, one frame per 20 ms.
 ///
 /// Matches the rate the modem's internal AMBE decoder consumes
 /// frames at. Used as:
@@ -3090,8 +3255,8 @@ const PAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 /// per the `dstar_space_before` telemetry (mean 120/125 slots
 /// free, i.e. 5-7 slots used = 100-140 ms). Any gap shorter than
 /// the buffer depth gets absorbed natively by the modem without
-/// an audible cut, so padding short gaps is pure over-production
-/// — every synthetic frame becomes permanent latency the modem
+/// an audible cut, so padding short gaps is pure over-production:
+/// every synthetic frame becomes permanent latency the modem
 /// plays out at 50 fps. A prior 30 ms threshold fired on routine
 /// 20-50 ms inter-frame jitter and accumulated 6+ seconds of
 /// audio delay over a 57 s stream.
@@ -3122,7 +3287,7 @@ const PAD_FRAMES_MAX: u32 = 30;
 /// the last received voice frame through the same unpaced relay
 /// path the real frames take, then updates the relay timestamp so
 /// the next tick re-evaluates against the moment of padding (not
-/// the moment of the last real frame) — this keeps us emitting at
+/// the moment of the last real frame). This keeps us emitting at
 /// a steady 20 ms cadence until either a real frame arrives or the
 /// cap hits.
 async fn emit_silence_pad_if_needed(session: &mut DStarSession) {
@@ -3145,7 +3310,7 @@ async fn emit_silence_pad_if_needed(session: &mut DStarSession) {
     // so the FIFO stays stable rather than draining. Re-checking
     // `last_relay_at.elapsed()` against `PAD_INTERVAL` on every
     // subsequent pad gives an effective 20 ms cadence that matches
-    // the modem's consumption exactly — no over-production, no
+    // the modem's consumption exactly: no over-production, no
     // under-production.
     let threshold = if session.pad_frames_emitted == 0 {
         PAD_INITIAL_THRESHOLD
@@ -3158,7 +3323,7 @@ async fn emit_silence_pad_if_needed(session: &mut DStarSession) {
 
     let pad_no = session.pad_frames_emitted;
     if pad_no == 0 {
-        // First pad of this gap — log at debug so operators can
+        // First pad of this gap: log at debug so operators can
         // correlate audible smoothing events with reflector
         // silence in the trace log without drowning the stream
         // in per-pad-frame noise.
@@ -3172,7 +3337,7 @@ async fn emit_silence_pad_if_needed(session: &mut DStarSession) {
         tracing::debug!(
             target: "thd75_repl::reflector",
             elapsed_ms,
-            "reflector silence — emitting silence pad to keep modem fed"
+            "reflector silence: emitting silence pad to keep modem fed"
         );
     }
     tracing::trace!(
@@ -3219,8 +3384,8 @@ const MAX_EVENTS_PER_CYCLE: usize = 24;
 /// radio immediately after it is pulled from the socket, instead of
 /// the previous drain-into-Vec-then-process-Vec pattern. The old
 /// two-phase version blocked the relay for the duration of the drain
-/// phase — typically 30-80 ms waiting for `poll()` to return `None`
-/// at the end of a superframe — during which the 20 already-drained
+/// phase (typically 30-80 ms waiting for `poll()` to return `None`
+/// at the end of a superframe), during which the 20 already-drained
 /// voice frames sat in the Vec instead of going to the radio. The
 /// MMDVM modem's small voice buffer underran during those gaps,
 /// dropping the receive popup. Observed live on REF030 C with 85 ms
@@ -3231,18 +3396,18 @@ const MAX_EVENTS_PER_CYCLE: usize = 24;
 /// 20 ms cadence with no >20 ms gaps inside a stream.
 async fn dstar_poll_cycle(session: &mut DStarSession) {
     // Matches the legacy `ReflectorClient::poll` 100 ms inner recv
-    // timeout — gives the reflector session task a short window to
+    // timeout, which gives the reflector session task a short window to
     // deliver a frame before we yield control back to the outer
     // `select!` for radio polling and ctrl_c.
     const EVENT_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
-    // Local pad_tick — lives for the duration of this cycle only.
+    // Local pad_tick: lives for the duration of this cycle only.
     // The previous design put the tick on the outer `run_dstar_monitor`
     // select!, which caused tokio to cancel `dstar_poll_cycle` every
     // time the tick won the race. Cancelling in the middle of
     // `relay_reflector_to_radio.await` dropped 48 of 2634 in-flight
     // relays in a 60 s trace and repeatedly short-circuited the radio
-    // drain below — the same mmdvm event-channel backpressure that
+    // drain below, the same mmdvm event-channel backpressure that
     // produced the original deadlock. Making the tick a branch of
     // this cycle's inner select! keeps cancellation scoped to a
     // single iteration and the radio drain is reached reliably.
@@ -3295,7 +3460,7 @@ async fn dstar_poll_cycle(session: &mut DStarSession) {
 
             // Auto-reconnect on keepalive inactivity. The other disconnect
             // reasons (`Rejected`, `UnlinkAcked`, `DisconnectTimeout`)
-            // reflect deliberate or terminal closures — never retry those
+            // reflect deliberate or terminal closures; never retry those
             // automatically.
             if matches!(
                 event,
@@ -3309,14 +3474,14 @@ async fn dstar_poll_cycle(session: &mut DStarSession) {
             emit_silence_pad_if_needed(session).await;
         } else {
             // client.next_event timed out with no event and no pad
-            // tick this iteration — nothing useful is happening, so
+            // tick this iteration. Nothing useful is happening, so
             // exit and let the outer loop re-enter (which also gives
             // ctrl_c a chance to fire).
             break;
         }
     }
 
-    // Poll radio — drain MMDVM events until the queue empties.
+    // Poll radio: drain MMDVM events until the queue empties.
     //
     // The radio emits voice-data events at the D-STAR frame rate
     // (~50 fps) while keyed.  A prior revision handled at most ONE
@@ -3330,7 +3495,7 @@ async fn dstar_poll_cycle(session: &mut DStarSession) {
     // select loop on reflector input or Ctrl-C.
     //
     // Drop the per-event timeout to 5 ms for the drain so "nothing
-    // pending" exits fast — the first call reuses the modem's
+    // pending" exits fast: the first call reuses the modem's
     // already-buffered events with zero wait, subsequent calls
     // wait briefly in case a 20 ms-paced frame arrives mid-drain,
     // and the loop exits as soon as the queue runs dry.
@@ -3341,7 +3506,7 @@ async fn dstar_poll_cycle(session: &mut DStarSession) {
     for _ in 0..MAX_EVENTS_PER_CYCLE {
         let event = match session.gateway.next_event().await {
             Ok(Some(event)) => event,
-            // No MMDVM event within the timeout — queue is dry.
+            // No MMDVM event within the timeout: queue is dry.
             Ok(None) => break,
             // `Err` is a fatal transport failure, never a timeout
             // (see `DStarGateway::next_event`). Announce it once
@@ -3422,8 +3587,8 @@ async fn dispatch_dstar(session: &mut DStarSession, cmd: &str, parts: &[&str]) {
                 Ok(client) => {
                     session.local_module = link.local_module;
                     session.reflector_module = link.reflector_module;
-                    // Update the stored reflector callsign too — the
-                    // relay path uses it to build the outbound rpt2
+                    // Update the stored reflector callsign too, since
+                    // the relay path uses it to build the outbound rpt2
                     // field (see build_reflector_header).
                     if let Ok(cs) = Callsign::try_from_str(&link.reflector_name) {
                         session.reflector_callsign = cs;
@@ -3594,7 +3759,7 @@ const ECHO_REPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(5
 ///
 /// The TH-D75 in Reflector Terminal Mode emits its TX header with
 /// `rpt1` / `rpt2` both set to the literal string `"DIRECT  "` as
-/// placeholders — the radio knows it's talking to a local gateway
+/// placeholders: the radio knows it's talking to a local gateway
 /// but doesn't know the gateway's callsign. This function is the
 /// gateway half of that contract: we rewrite those placeholders into
 /// the canonical relay header via [`DStarHeader::for_relay`], then
@@ -3615,7 +3780,7 @@ fn build_reflector_header(
         header.my_call,
         header.my_suffix,
     );
-    // Preserve the radio's flag bytes — the helper zeroes them by
+    // Preserve the radio's flag bytes. The helper zeroes them by
     // default, which is correct for sextant's TX-from-scratch path
     // but loses any repeater flags the radio sets in this relay path.
     hdr.flag1 = header.flag1;
@@ -3664,10 +3829,10 @@ async fn relay_radio_to_reflector(session: &mut DStarSession, event: &DStarEvent
                 return;
             }
             DStarEvent::VoiceStart(_) => {
-                // New stream started before VoiceEnd — the previous
+                // New stream started before VoiceEnd, so the previous
                 // stream's end was lost. Finish what we have.
                 finish_echo_recording(session);
-                // Don't return — let this VoiceStart fall through to
+                // Don't return; let this VoiceStart fall through to
                 // normal processing below.
             }
             _ => {}
@@ -3752,7 +3917,7 @@ async fn relay_radio_to_reflector(session: &mut DStarSession, event: &DStarEvent
 ///
 /// Called from the poll cycle. When in `Waiting` state and the delay
 /// has elapsed, plays back all buffered frames to the radio, sleeping
-/// 15 ms per frame — the BT write latency supplies the remainder of
+/// 15 ms per frame; the BT write latency supplies the remainder of
 /// the 20 ms AMBE frame interval, so the modem sees roughly its
 /// native 50 fps consumption rate.
 async fn echo_playback_tick(session: &mut DStarSession) {
@@ -3862,7 +4027,7 @@ async fn run_echo_monitor(session: &mut DStarSession) {
 
 /// Generate a random non-zero stream ID.
 ///
-/// Uses system time entropy (not cryptographic — just needs to be
+/// Uses system time entropy (not cryptographic, just needs to be
 /// per-stream unique). The low bit is forced to 1 so the result is
 /// always non-zero, making the `StreamId::new` unwrap trivial.
 fn rand_stream_id() -> StreamId {
@@ -3885,14 +4050,14 @@ fn rand_stream_id() -> StreamId {
 /// a reflector voice frame.
 ///
 /// Convention matches `MMDVMHost`'s `m_remoteGateway` network-to-RF
-/// path in `MMDVMHost/DStarControl.cpp:749-754` — `thd75-repl` is a
-/// remote gateway in front of the modem:
+/// path in `MMDVMHost/DStarControl.cpp:749-754`, since `thd75-repl`
+/// is a remote gateway in front of the modem:
 /// - `flag1` |= `0x40` (`DSTAR_REPEATER_MASK`) per
 ///   `MMDVMHost/DStarDefines.h:62`.
 /// - `rpt1` = local station callsign (7 bytes) + local module letter.
 /// - `rpt2` = same as `rpt1` (callsign + module). `MMDVMHost` uses
 ///   `rpt2 = m_callsign` (NOT `m_gateway`) in remote-gateway mode.
-/// - `ur_call` = `"CQCQCQ  "` — the standard "calling all stations"
+/// - `ur_call` = `"CQCQCQ  "`, the standard "calling all stations"
 ///   destination for relayed voice.
 /// - `my_call` / `my_suffix` = passed through from the original sender.
 fn build_radio_header(
@@ -3968,7 +4133,7 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             // Diagnostic: log the exact header fields going to the
             // radio's MMDVM modem at TRACE so the session log confirms
             // the relay path is firing AND records what the radio's TX
-            // header validator is being asked to accept — without
+            // header validator is being asked to accept, without
             // cluttering the operator's REPL output.
             tracing::trace!(
                 target: "thd75_repl::reflector",
@@ -4011,7 +4176,7 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             // only the first complete assembly per stream: later
             // re-assemblies that differ are RF bit corruption (no
             // error correction on the slow-data channel) and printing
-            // each variant spams the operator — a real problem for
+            // each variant spams the operator, a real problem for
             // screen-reader users.
             if let Some(bytes) = session.rx_slow_data.take_message()
                 && session.rx_last_slow_text.is_none()
@@ -4020,7 +4185,7 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
                 session.rx_last_slow_text = Some(bytes);
             }
 
-            // Use send_voice_unpaced — no host-side pacing. The
+            // Use send_voice_unpaced: no host-side pacing. The
             // correct pattern per `MMDVMHost/Modem.cpp:1049` is
             // to query the modem's `dstarSpace` status field and
             // only write when the modem reports buffer room,
@@ -4032,7 +4197,7 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             //
             // Host-side 20 ms pacing is wrong because DPlus
             // delivers 21 voice packets per ~440 ms superframe
-            // (~47.7 fps — there's an extra header packet slot
+            // (~47.7 fps, since there's an extra header packet slot
             // each superframe) while the modem's internal AMBE
             // decoder consumes at exactly 50 fps. A ~2 ms/frame
             // shortfall drains the modem's 10-slot buffer after
@@ -4101,13 +4266,13 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
             // so any further pad ticks should no-op. Without this
             // reset, the first ~2 s after EOT would keep padding
             // the modem with the final voice frame of the prior
-            // stream — the pad timer only checks `rx_stream_id`.
+            // stream, since the pad timer only checks `rx_stream_id`.
             session.last_rx_voice_frame = None;
             session.last_relay_at = None;
             session.pad_frames_emitted = 0;
             // Diagnostic: pairs with the `relay → radio: header` trace
             // emitted on `VoiceStart` so the session log confirms the
-            // EOT closes the stream — and that the relay is calling
+            // EOT closes the stream, and that the relay is calling
             // `send_eot` (not silently failing earlier in the path).
             tracing::trace!(target: "thd75_repl::reflector", "relay → radio: EOT");
             if let Err(e) = gw.send_eot().await {
@@ -4132,7 +4297,7 @@ async fn relay_reflector_to_radio(session: &mut DStarSession, event: &RuntimeEve
 fn print_slow_data_text_message(bytes: &[u8; 20]) {
     // Diagnostic: log the full 20-byte message in hex alongside the
     // lossy-UTF-8 rendering. This closes the loop with the per-frame
-    // and per-block traces — together they let you reverse-engineer
+    // and per-block traces; together they let you reverse-engineer
     // what an operator's non-standard slow-data scheme actually
     // contains.
     tracing::trace!(
@@ -4235,8 +4400,8 @@ fn trace_reflector_event(event: &RuntimeEvent) {
 ///
 /// `VoiceEnd` reads the per-stream frame counter and start timestamp
 /// off [`DStarSession`] to include them in the closing line. Must be
-/// called before [`relay_reflector_to_radio`] for `VoiceEnd` events —
-/// the relay resets those counters so the accessible "ended" line
+/// called before [`relay_reflector_to_radio`] for `VoiceEnd` events,
+/// because the relay resets those counters so the accessible "ended" line
 /// would otherwise see zeros.
 fn print_reflector_event(event: &RuntimeEvent, session: &DStarSession) {
     match event {
@@ -4367,7 +4532,7 @@ fn print_dstar_event(event: &DStarEvent) {
             );
         }
         DStarEvent::VoiceData(_) => {
-            // Don't announce every 20ms frame — too noisy for screen readers.
+            // Don't announce every 20ms frame: too noisy for screen readers.
         }
         DStarEvent::VoiceEnd => {
             aprintln!("{}", thd75_repl::output::dstar_voice_end());
@@ -4403,7 +4568,7 @@ fn print_dstar_event(event: &DStarEvent) {
         }
         DStarEvent::StatusUpdate(status) => {
             // Modem buffer / TX state is an audio-pipeline diagnostic, not a
-            // user-facing monitor event — route it to the trace log only.
+            // user-facing monitor event, so route it to the trace log only.
             tracing::debug!(
                 "{}",
                 thd75_repl::output::dstar_modem_status(status.dstar_space, status.tx())
@@ -4510,5 +4675,233 @@ mod truncate_tests {
         let t = truncate_slow_data_text(s);
         assert_eq!(t, "1234567890123456789");
         assert!(t.len() <= 20, "truncated to {} bytes", t.len());
+    }
+}
+
+#[cfg(test)]
+mod gateway_off_tests {
+    use super::{
+        GATEWAY_MODE_BYTE, GATEWAY_MODE_PAGE, ensure_terminal_mode, run_set_gateway_off,
+        validate_gateway_mcp_target, write_gateway_mode_with_interrupt,
+    };
+    use kenwood_thd75::Radio;
+    use kenwood_thd75::error::TransportError;
+    use kenwood_thd75::memory::MCP_D75_SCHEMA_FIRMWARE_IDENTITIES;
+    use kenwood_thd75::protocol::programming;
+    use kenwood_thd75::transport::{EitherTransport, MockTransport};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn page_response(page: u16, data: &[u8; programming::PAGE_SIZE]) -> Vec<u8> {
+        let [page_hi, page_lo] = page.to_be_bytes();
+        let mut response = Vec::with_capacity(programming::W_RESPONSE_SIZE);
+        response.extend_from_slice(&[b'W', page_hi, page_lo, 0, 0]);
+        response.extend_from_slice(data);
+        response
+    }
+
+    #[test]
+    fn gateway_target_uses_exact_central_firmware_identities() -> TestResult {
+        for firmware in MCP_D75_SCHEMA_FIRMWARE_IDENTITIES {
+            validate_gateway_mcp_target("TH-D75", firmware)?;
+        }
+        for firmware in ["1.03.001", "1.04", "1.03.0"] {
+            let error = validate_gateway_mcp_target("TH-D75", firmware)
+                .err()
+                .ok_or("unsupported gateway firmware unexpectedly accepted")?;
+            assert!(
+                error.contains("1.03") && error.contains("1.03.000") && error.contains(firmware),
+                "gateway refusal lost accepted or actual identity: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_wrong_model_before_firmware_query() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\x0D", b"ID TH-D74\x0D");
+
+        let result = run_set_gateway_off(EitherTransport::Mock(mock)).await;
+        let error = match result {
+            Ok(()) => return Err("wrong-model gateway write unexpectedly succeeded".into()),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("expected TH-D75") && message.contains("TH-D74"),
+            "wrong-model refusal lost its safety context: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_wrong_firmware_before_gateway_query() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
+        mock.expect(b"FV\x0D", b"FV 1.04\x0D");
+
+        let result = run_set_gateway_off(EitherTransport::Mock(mock)).await;
+        let error = match result {
+            Ok(()) => return Err("wrong-firmware gateway write unexpectedly succeeded".into()),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("vendor firmware 1.03")
+                && message.contains("1.03.000")
+                && message.contains("1.04"),
+            "wrong-firmware refusal lost its safety context: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_mode_enable_refuses_wrong_model_before_mcp_entry() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\xE0\x03\x00", b"?\x0D");
+        mock.expect(b"ID\x0D", b"ID TH-D74\x0D");
+
+        let radio = Radio::connect(EitherTransport::Mock(mock)).await?;
+        let error = match ensure_terminal_mode(radio).await {
+            Ok(_) => return Err("wrong-model terminal-mode write unexpectedly succeeded".into()),
+            Err((_, error)) => error,
+        };
+        assert!(
+            error.contains("expected TH-D75") && error.contains("TH-D74"),
+            "wrong-model terminal-mode refusal lost its safety context: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_mode_enable_refuses_wrong_firmware_before_mcp_entry() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\xE0\x03\x00", b"?\x0D");
+        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
+        mock.expect(b"FV\x0D", b"FV 1.04\x0D");
+
+        let radio = Radio::connect(EitherTransport::Mock(mock)).await?;
+        let error = match ensure_terminal_mode(radio).await {
+            Ok(_) => {
+                return Err("wrong-firmware terminal-mode write unexpectedly succeeded".into());
+            }
+            Err((_, error)) => error,
+        };
+        assert!(
+            error.contains("vendor firmware 1.03")
+                && error.contains("1.03.000")
+                && error.contains("1.04"),
+            "wrong-firmware terminal-mode refusal lost its safety context: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_off_disconnects_without_memory_write() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
+        mock.expect(b"FV\x0D", b"FV 1.03\x0D");
+        mock.expect(b"GW\x0D", b"GW 0\x0D");
+
+        run_set_gateway_off(EitherTransport::Mock(mock)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_gateway_is_cleared_with_verified_memory_write() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
+        mock.expect(b"FV\x0D", b"FV 1.03.000\x0D");
+        mock.expect(b"GW\x0D", b"GW 1\x0D");
+        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+
+        let mut original = [0x5A; programming::PAGE_SIZE];
+        original[GATEWAY_MODE_BYTE] = 1;
+        let read_command = programming::build_read_command(GATEWAY_MODE_PAGE);
+        let original_response = page_response(GATEWAY_MODE_PAGE, &original);
+        mock.expect(&read_command, &original_response);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        let mut modified = original;
+        modified[GATEWAY_MODE_BYTE] = 0;
+        let write_command = programming::build_write_command(GATEWAY_MODE_PAGE, &modified);
+        mock.expect(&write_command, &[programming::ACK]);
+        let modified_response = page_response(GATEWAY_MODE_PAGE, &modified);
+        mock.expect(&read_command, &modified_response);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        mock.expect(&[programming::EXIT], &[programming::ACK]);
+
+        run_set_gateway_off(EitherTransport::Mock(mock)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupted_gateway_write_recovers_after_page_may_have_changed() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+
+        let mut original = [0x5A; programming::PAGE_SIZE];
+        original[GATEWAY_MODE_BYTE] = 1;
+        let read_command = programming::build_read_command(GATEWAY_MODE_PAGE);
+        mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &original));
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // Let the write ACK complete, then hang its verification read so
+        // termination lands after the Menu 650 byte may have changed.
+        let mut modified = original;
+        modified[GATEWAY_MODE_BYTE] = 0;
+        let write_command = programming::build_write_command(GATEWAY_MODE_PAGE, &modified);
+        mock.expect(&write_command, &[programming::ACK]);
+        mock.expect_hang(&read_command);
+
+        mock.expect(&[programming::EXIT], &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
+
+        let mut radio = Radio::connect(EitherTransport::Mock(mock)).await?;
+        let interrupt = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok::<(), std::io::Error>(())
+        };
+        let error = match write_gateway_mode_with_interrupt(&mut radio, 0, interrupt).await {
+            Ok(()) => return Err("interrupted gateway write unexpectedly succeeded".into()),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("setting may already have changed")
+                && error.contains("normal CAT recovery completed"),
+            "interruption guidance lost partial-write or recovery state: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupted_gateway_write_with_unproved_exit_requires_power_cycle() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+
+        let read_command = programming::build_read_command(GATEWAY_MODE_PAGE);
+        mock.expect_hang(&read_command);
+        mock.expect(&[programming::EXIT], &[programming::ACK]);
+        mock.expect_reopen(Err(TransportError::ReopenUnsupported));
+
+        let mut radio = Radio::connect(EitherTransport::Mock(mock)).await?;
+        let interrupt = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok::<(), std::io::Error>(())
+        };
+        let error = match write_gateway_mode_with_interrupt(&mut radio, 1, interrupt).await {
+            Ok(()) => return Err("interrupted gateway write unexpectedly succeeded".into()),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("setting may already have changed")
+                && error.contains("were not proved")
+                && error.contains("do not retry")
+                && error.contains("fully power-cycle"),
+            "unproved-exit guidance was incomplete: {error}"
+        );
+        Ok(())
     }
 }
