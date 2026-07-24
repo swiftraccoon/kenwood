@@ -30,8 +30,9 @@ dstar-gateway-core = { path = "../dstar-gateway-core" }
 dstar-gateway = { path = "../dstar-gateway" }
 # Sans-io MMDVM wire-frame codec (`[0xE0, len, cmd, payload...]`).
 mmdvm-core = { path = "../mmdvm-core" }
-# AMBE 3600x2400 decode for on-device reflector audio monitoring.
-mbelib-rs = { path = "../mbelib-rs" }
+# AMBE 3600x2400 decode plus the causal live waveform enhancer for
+# always-enhanced on-device reflector audio monitoring.
+mbelib-rs = { path = "../mbelib-rs", features = ["wave-enhance"] }
 # Runtime: reused across FFI calls that drive reflector I/O.
 tokio = { version = "1", features = [
   "net",

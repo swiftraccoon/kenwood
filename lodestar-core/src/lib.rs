@@ -8,8 +8,8 @@
 //!
 //! - `version()`: crate semver.
 //! - [`audio`]: `RxAudioPipeline`, which AMBE-decodes reflector voice frames
-//!   into 8 kHz PCM with loss concealment, reorder rejection, and
-//!   click-free stream edges for on-device monitoring.
+//!   into live-enhanced 8 kHz PCM with loss concealment, reorder
+//!   rejection, and click-free stream edges for on-device monitoring.
 //! - [`cat`]: minimal CAT codec covering the `ID` identify and `FV`
 //!   firmware-version commands.
 //! - [`mcp`]: programming-protocol primitives for flipping menu 650

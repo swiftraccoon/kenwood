@@ -8,8 +8,8 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "audi
 
 /// Plays the 8 kHz mono PCM produced by `RxAudioPipeline` through the
 /// system output. `AVAudioEngine` handles the sample-rate conversion
-/// from 8 kHz to the hardware rate; buffers are scheduled as they
-/// arrive (one per 20 ms voice frame, more after concealment).
+/// from 8 kHz to the hardware rate; enhanced PCM buffers are scheduled
+/// as soon as the causal model finalizes them.
 @MainActor
 public final class ReflectorAudioPlayer {
     private let engine = AVAudioEngine()

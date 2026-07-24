@@ -5,16 +5,29 @@ import XCTest
 @testable import Lodestar
 
 final class AudioPipelineFFITests: XCTestCase {
-    func testHoldbackAndStats() throws {
+    func testAlwaysEnhancedStreamingAndStats() throws {
         let p = RxAudioPipeline()
         p.startStream()
-        // 12 arbitrary bytes decode to SOMETHING (worst case comfort
-        // noise); the contract under test is holdback + counters.
-        let frame = Data(repeating: 0, count: 12)
-        XCTAssertTrue(p.pushVoice(seq: 0, voiceBytes: frame).isEmpty)
-        XCTAssertEqual(p.pushVoice(seq: 1, voiceBytes: frame).count, 160)
+        let frame = Data([
+            0xD2, 0x4B, 0x28, 0xB2, 0x57, 0x44, 0xE4, 0x08, 0x1C,
+            0, 0, 0
+        ])
+        var pcm: [Int16] = []
+        for seq in UInt8(0)..<5 {
+            let ready = p.pushVoice(seq: seq, voiceBytes: frame)
+            if seq < 3 {
+                XCTAssertTrue(
+                    ready.isEmpty,
+                    "causal enhancement should retain its initial lookahead"
+                )
+            }
+            XCTAssertEqual(ready.count % 160, 0)
+            pcm.append(contentsOf: ready)
+        }
         let end = p.endStream()
-        XCTAssertEqual(end.tailPcm.count, 160)
-        XCTAssertEqual(end.stats.received, 2)
+        pcm.append(contentsOf: end.tailPcm)
+        XCTAssertEqual(pcm.count, 5 * 160)
+        XCTAssertEqual(end.stats.received, 5)
+        XCTAssertEqual(end.stats.lost, 0)
     }
 }
