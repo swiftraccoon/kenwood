@@ -29,11 +29,17 @@
 //!   forwards each event to a Swift-implemented [`LogSink`] (tagged with
 //!   [`LogLevel`]) for the in-app Log Viewer and Apple's Unified Log.
 
+#[forbid(unsafe_code)]
 pub mod audio;
+#[forbid(unsafe_code)]
 pub mod cat;
+#[forbid(unsafe_code)]
 pub mod mcp;
+#[forbid(unsafe_code)]
 pub mod mmdvm;
+#[forbid(unsafe_code)]
 pub mod reflector;
+#[forbid(unsafe_code)]
 pub mod session;
 
 pub use audio::{RxAudioPipeline, RxStreamEnd, RxStreamStats};

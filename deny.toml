@@ -6,67 +6,70 @@
 # to (macOS ARM, macOS x86, Linux x86, Linux ARM, Windows).
 [graph]
 targets = [
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
-    "x86_64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
 ]
 
 [advisories]
 version = 2
 ignore = [
-    # RUSTSEC-2026-0192: ttf-parser is unmaintained.
-    #
-    # ttf-parser is a TrueType/OpenType font parser pulled in transitively
-    # by egui's default text stack for the sextant GUI. The author has
-    # declared the crate unmaintained and recommends skrifa (Google Fonts
-    # "oxidize"/fontations project).
-    #
-    # "Unmaintained" here is a maintenance concern, not a security concern:
-    # there is no known vulnerability and no safe upgrade path; no egui
-    # release has migrated off ttf-parser yet.
-    #
-    # Dependency path:
-    #   ttf-parser ← owned_ttf_parser ← ab_glyph ← epaint ← egui ← eframe ← sextant
-    #
-    # Recheck when egui/ab_glyph migrate to skrifa.
-    { id = "RUSTSEC-2026-0192", reason = "ttf-parser is an unmaintained font parser pulled transitively by egui/eframe for the sextant GUI; no known vulnerability, no safe upgrade; the fix requires egui migrating to skrifa upstream" },
+  # RUSTSEC-2026-0192: ttf-parser is unmaintained.
+  #
+  # ttf-parser is a TrueType/OpenType font parser pulled in transitively
+  # by egui's default text stack for the sextant GUI. The author has
+  # declared the crate unmaintained and recommends skrifa (Google Fonts
+  # "oxidize"/fontations project).
+  #
+  # "Unmaintained" here is a maintenance concern, not a security concern:
+  # there is no known vulnerability and no safe upgrade path; no egui
+  # release has migrated off ttf-parser yet.
+  #
+  # Dependency path:
+  #   ttf-parser ← owned_ttf_parser ← ab_glyph ← epaint ← egui ← eframe ← sextant
+  #
+  # Recheck when egui/ab_glyph migrate to skrifa.
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser is an unmaintained font parser pulled transitively by egui/eframe for the sextant GUI; no known vulnerability, no safe upgrade; the fix requires egui migrating to skrifa upstream" },
 
-    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml < 0.41 DoS.
-    #
-    # The only quick-xml copy in the tree (0.39.x) is pinned by
-    # wayland-scanner, a Linux-only BUILD-TIME proc-macro (winit →
-    # smithay → eframe → sextant) that parses only the local, trusted
-    # Wayland protocol XML shipped in the crate; no attacker-controlled
-    # XML can reach it and no runtime code ships. Recheck when
-    # winit/smithay bump
-    # wayland-scanner onto quick-xml 0.41.
-    { id = "RUSTSEC-2026-0194", reason = "vulnerable quick-xml copy is only reachable from wayland-scanner, a Linux build-time proc-macro parsing trusted local protocol XML; no runtime exposure" },
-    { id = "RUSTSEC-2026-0195", reason = "vulnerable quick-xml copy is only reachable from wayland-scanner, a Linux build-time proc-macro parsing trusted local protocol XML; no runtime exposure" },
+  # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml < 0.41 DoS.
+  #
+  # The only quick-xml copy in the tree (0.39.x) is pinned by
+  # wayland-scanner, a Linux-only BUILD-TIME proc-macro (winit →
+  # smithay → eframe → sextant) that parses only the local, trusted
+  # Wayland protocol XML shipped in the crate; no attacker-controlled
+  # XML can reach it and no runtime code ships. Recheck when
+  # winit/smithay bump
+  # wayland-scanner onto quick-xml 0.41.
+  { id = "RUSTSEC-2026-0194", reason = "vulnerable quick-xml copy is only reachable from wayland-scanner, a Linux build-time proc-macro parsing trusted local protocol XML; no runtime exposure" },
+  { id = "RUSTSEC-2026-0195", reason = "vulnerable quick-xml copy is only reachable from wayland-scanner, a Linux build-time proc-macro parsing trusted local protocol XML; no runtime exposure" },
 ]
 
 [licenses]
 version = 2
 allow = [
-    "GPL-2.0-or-later",
-    "MIT",
-    "Apache-2.0",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
-    "MPL-2.0",
-    "Unicode-3.0",
-    "BSL-1.0",
-    "Zlib",
-    # Community Data License Agreement Permissive 2.0. Used by
-    # webpki-roots (Mozilla's web PKI root cert list, pulled in via
-    # reqwest's rustls feature). Permissive data license similar to CC0.
-    "CDLA-Permissive-2.0",
-    # SIL Open Font License 1.1: used by epaint_default_fonts
-    # (Ubuntu font family shipped with egui for sextant). Permissive
-    # font licence that allows redistribution + derivative works.
-    "OFL-1.1",
+  "GPL-2.0-or-later",
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  # University of Illinois/NCSA Open Source License: the permissive license
+  # carried by libfuzzer-sys's bundled LLVM libFuzzer runtime.
+  "NCSA",
+  "ISC",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "BSL-1.0",
+  "Zlib",
+  # Community Data License Agreement Permissive 2.0. Used by
+  # webpki-roots (Mozilla's web PKI root cert list, pulled in via
+  # reqwest's rustls feature). Permissive data license similar to CC0.
+  "CDLA-Permissive-2.0",
+  # SIL Open Font License 1.1: used by epaint_default_fonts
+  # (Ubuntu font family shipped with egui for sextant). Permissive
+  # font licence that allows redistribution + derivative works.
+  "OFL-1.1",
 ]
 confidence-threshold = 0.8
 
@@ -94,136 +97,136 @@ multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
 skip = [
-    # ─────────────────────────────────────────────────────────────────────
-    # thd75 serial stack (serialport → mio-serial → tokio-serial)
-    # ─────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────
+  # thd75 serial stack (serialport → mio-serial → tokio-serial)
+  # ─────────────────────────────────────────────────────────────────────
 
-    # serialport 4.x directly uses nix 0.26 (which itself uses bitflags 1).
-    # Newer nix (0.28+) migrated to bitflags 2. Other crates in the tree
-    # use bitflags 2. Can be dropped once serialport updates its nix pin.
-    { crate = "bitflags@1" },
+  # serialport 4.x directly uses nix 0.26 (which itself uses bitflags 1).
+  # Newer nix (0.28+) migrated to bitflags 2. Other crates in the tree
+  # use bitflags 2. Can be dropped once serialport updates its nix pin.
+  { crate = "bitflags@1" },
 
-    # serialport 4.x uses nix 0.26 for Unix-specific serial port IOCTLs.
-    # Dropable when serialport upgrades; tokio-serial pins serialport 4.x.
-    { crate = "nix@0.26" },
+  # serialport 4.x uses nix 0.26 for Unix-specific serial port IOCTLs.
+  # Dropable when serialport upgrades; tokio-serial pins serialport 4.x.
+  { crate = "nix@0.26" },
 
-    # ─────────────────────────────────────────────────────────────────────
-    # thd75-repl directory detection (dirs-next → dirs-sys-next → redox_users)
-    # ─────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────
+  # thd75-repl directory detection (dirs-next → dirs-sys-next → redox_users)
+  # ─────────────────────────────────────────────────────────────────────
 
-    # redox_users 0.4 (used on Redox OS detection in dirs-next) still pins
-    # thiserror 1.x. Our workspace crates all use thiserror 2.x. Dropable
-    # when redox_users updates, or when dirs-next is replaced.
-    { crate = "thiserror@1" },
+  # redox_users 0.4 (used on Redox OS detection in dirs-next) still pins
+  # thiserror 1.x. Our workspace crates all use thiserror 2.x. Dropable
+  # when redox_users updates, or when dirs-next is replaced.
+  { crate = "thiserror@1" },
 
-    # Proc-macro companion to thiserror 1.x. Tracks thiserror@1 exactly.
-    { crate = "thiserror-impl@1" },
+  # Proc-macro companion to thiserror 1.x. Tracks thiserror@1 exactly.
+  { crate = "thiserror-impl@1" },
 
-    # ─────────────────────────────────────────────────────────────────────
-    # proc-macro ecosystem syn 2 → syn 3 migration
-    # ─────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────
+  # proc-macro ecosystem syn 2 → syn 3 migration
+  # ─────────────────────────────────────────────────────────────────────
 
-    # serde_derive 1.0.229 moved to syn 3 while thiserror-impl (both major
-    # lines) and most other proc-macro crates in the tree still use syn 2.
-    # The ecosystem split resolves upstream; dropable once every proc-macro
-    # dependency has migrated and the tree converges on one syn major.
-    { crate = "syn@2" },
+  # serde_derive 1.0.229 moved to syn 3 while thiserror-impl (both major
+  # lines) and most other proc-macro crates in the tree still use syn 2.
+  # The ecosystem split resolves upstream; dropable once every proc-macro
+  # dependency has migrated and the tree converges on one syn major.
+  { crate = "syn@2" },
 
-    # ─────────────────────────────────────────────────────────────────────
-    # thd75-tui layout engine (ratatui → kasuari)
-    # ─────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────
+  # thd75-tui layout engine (ratatui → kasuari)
+  # ─────────────────────────────────────────────────────────────────────
 
-    # kasuari 0.4 (ratatui's Cassowary constraint solver) uses hashbrown
-    # 0.16, separate from the workspace default 0.17. Dropable when
-    # ratatui/kasuari updates.
-    { crate = "hashbrown@0.16" },
+  # kasuari 0.4 (ratatui's Cassowary constraint solver) uses hashbrown
+  # 0.16, separate from the workspace default 0.17. Dropable when
+  # ratatui/kasuari updates.
+  { crate = "hashbrown@0.16" },
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Windows platform shim family 0.52 (serialport + ring on Windows)
-    # ─────────────────────────────────────────────────────────────────────
-    #
-    # serialport 4.x uses windows-sys 0.52 for Windows serial APIs.
-    # ring (rustls crypto) also pulls windows-sys 0.52 on Windows.
-    # Newer crates use windows-sys 0.60+ which use the unified
-    # `windows-link` crate instead of per-target shims. Only the shims
-    # reachable for the evaluated Windows target (x86_64-pc-windows-msvc;
-    # see [graph].targets above) appear as duplicates. Dropable when
-    # serialport/ring upgrade.
+  # ─────────────────────────────────────────────────────────────────────
+  # Windows platform shim family 0.52 (serialport + ring on Windows)
+  # ─────────────────────────────────────────────────────────────────────
+  #
+  # serialport 4.x uses windows-sys 0.52 for Windows serial APIs.
+  # ring (rustls crypto) also pulls windows-sys 0.52 on Windows.
+  # Newer crates use windows-sys 0.60+ which use the unified
+  # `windows-link` crate instead of per-target shims. Only the shims
+  # reachable for the evaluated Windows target (x86_64-pc-windows-msvc;
+  # see [graph].targets above) appear as duplicates. Dropable when
+  # serialport/ring upgrade.
 
-    { crate = "windows-sys@0.52" },
-    { crate = "windows-targets@0.52" },
-    { crate = "windows_x86_64_gnu@0.52" },
-    { crate = "windows_x86_64_msvc@0.52" },
+  { crate = "windows-sys@0.52" },
+  { crate = "windows-targets@0.52" },
+  { crate = "windows_x86_64_gnu@0.52" },
+  { crate = "windows_x86_64_msvc@0.52" },
 
-    # ─────────────────────────────────────────────────────────────────────
-    # sextant egui + cpal + winit transitive graph
-    # ─────────────────────────────────────────────────────────────────────
-    #
-    # sextant (GUI test app for sextant↔sextant D-STAR traffic) pulls
-    # in egui, cpal, and winit: three large GUI/audio stacks whose
-    # own dep graphs sit at different maturity levels. The pairs
-    # below are the "old" side of each duplicate; each will resolve
-    # on its own cadence as egui/cpal/winit upgrade their transitive
-    # graphs. None are security-sensitive: all have the security
-    # advisories checked separately by `cargo-audit`.
+  # ─────────────────────────────────────────────────────────────────────
+  # sextant egui + cpal + winit transitive graph
+  # ─────────────────────────────────────────────────────────────────────
+  #
+  # sextant (GUI test app for sextant↔sextant D-STAR traffic) pulls
+  # in egui, cpal, and winit: three large GUI/audio stacks whose
+  # own dep graphs sit at different maturity levels. The pairs
+  # below are the "old" side of each duplicate; each will resolve
+  # on its own cadence as egui/cpal/winit upgrade their transitive
+  # graphs. None are security-sensitive: all have the security
+  # advisories checked separately by `cargo-audit`.
 
-    # winit 0.30 uses calloop 0.13 on wayland/X11; smithay-client-
-    # toolkit 0.19 (wayland toolkit) uses calloop 0.14 through a
-    # different path. Drop when winit bumps.
-    { crate = "calloop@0.13.0" },
-    { crate = "calloop-wayland-source@0.3.0" },
-    { crate = "smithay-client-toolkit@0.19.2" },
+  # winit 0.30 uses calloop 0.13 on wayland/X11; smithay-client-
+  # toolkit 0.19 (wayland toolkit) uses calloop 0.14 through a
+  # different path. Drop when winit bumps.
+  { crate = "calloop@0.13.0" },
+  { crate = "calloop-wayland-source@0.3.0" },
+  { crate = "smithay-client-toolkit@0.19.2" },
 
-    # cpal on macOS uses core-foundation 0.9; winit 0.30 uses 0.10.
-    # Drop when cpal updates to objc2-based path.
-    { crate = "core-foundation@0.9.4" },
+  # cpal on macOS uses core-foundation 0.9; winit 0.30 uses 0.10.
+  # Drop when cpal updates to objc2-based path.
+  { crate = "core-foundation@0.9.4" },
 
-    # cpal on macOS uses objc2 0.5; winit 0.30 uses 0.6. Drop when
-    # cpal bumps its objc2 pin.
-    { crate = "objc2@0.5.2" },
-    { crate = "objc2-app-kit@0.2.2" },
-    { crate = "objc2-foundation@0.2.2" },
+  # cpal on macOS uses objc2 0.5; winit 0.30 uses 0.6. Drop when
+  # cpal bumps its objc2 pin.
+  { crate = "objc2@0.5.2" },
+  { crate = "objc2-app-kit@0.2.2" },
+  { crate = "objc2-foundation@0.2.2" },
 
-    # rand_core 0.6 chain uses getrandom 0.2; newer deps use 0.3.
-    { crate = "getrandom@0.2.17" },
+  # rand_core 0.6 chain uses getrandom 0.2; newer deps use 0.3.
+  { crate = "getrandom@0.2.17" },
 
-    # UniFFI 0.31 (lodestar-core Rust↔Swift FFI) pulls getrandom 0.4;
-    # older workspace crates still use 0.3. Drop when those upgrade.
-    { crate = "getrandom@0.3.4" },
+  # UniFFI 0.31 (lodestar-core Rust↔Swift FFI) pulls getrandom 0.4;
+  # older workspace crates still use 0.3. Drop when those upgrade.
+  { crate = "getrandom@0.3.4" },
 
-    # toml 0.8 chain (stargazer direct + the toml_edit / toml_datetime
-    # / winnow that 0.8 pulls); UniFFI 0.31's uniffi_bindgen / trybuild
-    # pull the toml 0.9 / 1.1 chain which brings serde_spanned 1.x,
-    # toml_datetime 0.7, winnow 1.0. Drop whichever entries resolve
-    # when stargazer bumps toml or uniffi converges on one toml
-    # major.
-    { crate = "serde_spanned@0.6.9" },
-    { crate = "toml@0.8.23" },
-    { crate = "toml_datetime@0.6.11" },
-    { crate = "winnow@0.7.15" },
+  # toml 0.8 chain (stargazer direct + the toml_edit / toml_datetime
+  # / winnow that 0.8 pulls); UniFFI 0.31's uniffi_bindgen / trybuild
+  # pull the toml 0.9 / 1.1 chain which brings serde_spanned 1.x,
+  # toml_datetime 0.7, winnow 1.0. Drop whichever entries resolve
+  # when stargazer bumps toml or uniffi converges on one toml
+  # major.
+  { crate = "serde_spanned@0.6.9" },
+  { crate = "toml@0.8.23" },
+  { crate = "toml_datetime@0.6.11" },
+  { crate = "winnow@0.7.15" },
 
-    # scraper 0.22 uses itertools 0.13; multiple newer deps (including
-    # egui_extras) use 0.14. Drop when scraper updates.
-    { crate = "itertools@0.13.0" },
+  # scraper 0.22 uses itertools 0.13; multiple newer deps (including
+  # egui_extras) use 0.14. Drop when scraper updates.
+  { crate = "itertools@0.13.0" },
 
-    # rustix 0.38 chain from tokio-uring / mio-serial; rustix 1.x is
-    # pulled by winit. Drop when mio-serial updates.
-    { crate = "rustix@0.38.44" },
-    { crate = "linux-raw-sys@0.4.15" },
+  # rustix 0.38 chain from tokio-uring / mio-serial; rustix 1.x is
+  # pulled by winit. Drop when mio-serial updates.
+  { crate = "rustix@0.38.44" },
+  { crate = "linux-raw-sys@0.4.15" },
 
-    # shlex two-major duplicate, both BUILD-TIME only: bindgen pulls
-    # shlex 1.x, cc pulls shlex 2.x. No runtime code. Skip the older
-    # 1.x side; dropable when bindgen upgrades to shlex 2. Skip the
-    # whole major so patch bumps in a fresh lockfile stay covered.
-    { crate = "shlex@1" },
+  # shlex two-major duplicate, both BUILD-TIME only: bindgen pulls
+  # shlex 1.x, cc pulls shlex 2.x. No runtime code. Skip the older
+  # 1.x side; dropable when bindgen upgrades to shlex 2. Skip the
+  # whole major so patch bumps in a fresh lockfile stay covered.
+  { crate = "shlex@1" },
 
-    # windows-sys family 0.59 / 0.60 coexist with 0.61 from newer deps.
-    # 0.59 from accesskit/winit, 0.60 from other winit-adjacent crates.
-    { crate = "windows-sys@0.59.0" },
-    { crate = "windows-sys@0.60.2" },
-    # windows-core 0.54 from older winit path; 0.62 from newer.
-    { crate = "windows-core@0.54.0" },
-    { crate = "windows-result@0.1.2" },
+  # windows-sys family 0.59 / 0.60 coexist with 0.61 from newer deps.
+  # 0.59 from accesskit/winit, 0.60 from other winit-adjacent crates.
+  { crate = "windows-sys@0.59.0" },
+  { crate = "windows-sys@0.60.2" },
+  # windows-core 0.54 from older winit path; 0.62 from newer.
+  { crate = "windows-core@0.54.0" },
+  { crate = "windows-result@0.1.2" },
 ]
 
 [sources]
