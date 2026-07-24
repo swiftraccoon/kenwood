@@ -12,7 +12,7 @@
 [![Security](https://img.shields.io/github/actions/workflow/status/swiftraccoon/kenwood/security.yml?label=Security&logo=githubactions)](https://github.com/swiftraccoon/kenwood/actions/workflows/security.yml)
 [![codecov](https://codecov.io/gh/swiftraccoon/kenwood/graph/badge.svg?token=TVW1UKPRMW)](https://codecov.io/gh/swiftraccoon/kenwood)
 
-Rust workspace for Kenwood amateur-radio transceivers: core TH-D75 library, TUI, accessible REPL, plus generic packet-radio, D-STAR reflector, and MMDVM protocol stacks usable independently of any specific radio.
+Rust workspace for Kenwood amateur-radio transceivers: core TH-D75 library, TUI, accessible REPL, plus generic packet-radio, D-STAR reflector, DMR network, and MMDVM protocol stacks usable independently of any specific radio.
 
 > **Hardware risk.** This code talks to real radios over CAT, MCP, KISS, and MMDVM. Incorrect memory writes can corrupt radio configuration. Do not use this on a radio you are not prepared to factory-reset or send in for service. No warranty; see [LICENSE](LICENSE).
 
@@ -48,6 +48,9 @@ expecting stability.
 | [`dstar-gateway-core/`](dstar-gateway-core/) | DPlus / DExtra / DCS reflector codecs + typestate client and server sessions (no I/O) | experimental |
 | [`dstar-gateway/`](dstar-gateway/) | Tokio async shell over `dstar-gateway-core` with auth and host-file fetcher | experimental |
 | [`dstar-gateway-server/`](dstar-gateway-server/) | Multi-client D-STAR reflector server with cross-protocol forwarding; ships a `polaris` binary as a standalone local DExtra test reflector | experimental |
+| [`dmr-rewind-core/`](dmr-rewind-core/) | Sans-io codec and authentication primitives for BrandMeister Open DMR Terminal | experimental |
+| [`dmr-rewind/`](dmr-rewind/) | Receive-only Tokio client for self-service BrandMeister Open DMR Terminal subscriptions | experimental |
+| [`pulsar/`](pulsar/) | Software-only DMR recorder: archives BrandMeister AMBE+2 bursts and per-call metadata | experimental |
 | [`mmdvm-core/`](mmdvm-core/) | Sans-io MMDVM modem protocol codec | experimental |
 | [`mmdvm/`](mmdvm/) | Tokio async shell for MMDVM modems | experimental |
 | [`mbelib-rs/`](mbelib-rs/) | AMBE 3600×2400 voice codec (decoder default; encoder behind `--features encoder`) | experimental |
@@ -82,6 +85,7 @@ Derived works and attribution:
 
 - [`mmdvm/`](mmdvm/) and [`mmdvm-core/`](mmdvm-core/): portions derived from [MMDVMHost](https://github.com/g4klx/MMDVMHost) by Jonathan Naylor G4KLX (2015–2026, GPL-2.0-or-later).
 - [`dstar-gateway-core/`](dstar-gateway-core/) reflector codec constants and session-transition timing are derived from [ircDDBGateway](https://github.com/g4klx/ircDDBGateway) by Jonathan Naylor G4KLX (GPL-2.0-or-later) and [xlxd](https://github.com/LX3JL/xlxd) by LX3JL and contributors (GPL-2.0-or-later).
+- [`dmr-rewind-core/`](dmr-rewind-core/) independently implements the public BrandMeister REWIND wire format, cross-checked against BrandMeister's [go-brandmeister](https://github.com/BrandMeister/go-brandmeister), [DigestPlay](https://github.com/BrandMeister/DigestPlay), and [callrec](https://github.com/BrandMeister/callrec) interoperability references.
 - [`mbelib-rs/`](mbelib-rs/): Rust port of [mbelib](https://github.com/szechyjs/mbelib) and [DSD](https://github.com/szechyjs/dsd) by szechyjs (originally ISC-licensed; redistributed here under GPL-2.0-or-later per ISC's relicensing allowance). Relicensing pathway follows [mbelib-neo](https://github.com/arancormonk/mbelib-neo) by arancormonk.
 - [`aprs/`](aprs/) SmartBeaconing implementation: algorithm by Tony Arnerich KD7TA and Steve Bragg KA9MVA (HamHUD).
 - KISS protocol specification (Chepponis / Karn, 1987) and AX.25 v2.2 (TAPR, 1998) are referenced as public specifications, not derivations.

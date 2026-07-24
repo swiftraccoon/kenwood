@@ -21,6 +21,9 @@ jobs:
       - run: cargo machete thd75-tui/
       - run: cargo machete mbelib-rs/
       - run: cargo machete stargazer/
+      - run: cargo machete dmr-rewind-core/
+      - run: cargo machete dmr-rewind/
+      - run: cargo machete pulsar/
 
   semver:
     name: Semver check

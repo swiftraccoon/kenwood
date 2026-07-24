@@ -43,6 +43,11 @@ thd75_re/
 # but NOT the mdbook build output
 dstar-gateway/book/book/
 
+# DMR REWIND protocol and recorder documentation
+!dmr-rewind-core/README.md
+!dmr-rewind/README.md
+!pulsar/README.md
+
 ref/
 ref_tools/
 refs/
@@ -59,6 +64,9 @@ lodestar/DerivedData/
 /recordings/
 /survey/
 /stargazer.toml
+# pulsar operator data (DMR recordings + local credentials config)
+/dmr-recordings/
+/pulsar.toml
 # ML working set derived from recordings (never committed)
 /dataset/
 /lodestar/project-local.yml

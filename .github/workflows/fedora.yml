@@ -55,6 +55,12 @@ jobs:
         working-directory: mbelib-rs
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: stargazer
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: dmr-rewind-core
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: dmr-rewind
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: pulsar
       - run: cargo test
         working-directory: thd75
       - run: cargo test
@@ -79,3 +85,9 @@ jobs:
         working-directory: mmdvm
       - run: cargo test --bins
         working-directory: stargazer
+      - run: cargo test
+        working-directory: dmr-rewind-core
+      - run: cargo test
+        working-directory: dmr-rewind
+      - run: cargo test
+        working-directory: pulsar

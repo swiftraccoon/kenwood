@@ -1,0 +1,16 @@
+# Pulsar connects directly to BrandMeister as a software Open DMR Terminal.
+# Replace this placeholder with your own seven-digit RadioID allocation.
+recordings_dir = "dmr-recordings"
+max_capture_records_per_call = 20000
+call_hang_secs = 3
+server_timeout_secs = 15
+
+[[master]]
+name = "bm-us-chicago"
+host = "3104.master.brandmeister.network"
+port = 54006
+dmr_id = 3101234
+password_env = "PULSAR_BM_PASSWORD"
+bind = "0.0.0.0:0"
+talkgroups = [91, 3100]
+private_ids = []

@@ -1,0 +1,24 @@
+[package]
+name = "dmr-rewind"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Receive-only Tokio client for BrandMeister's REWIND Open DMR Terminal"
+license = "GPL-2.0-or-later"
+publish = false
+
+[dependencies]
+dmr-rewind-core = { path = "../dmr-rewind-core" }
+thiserror = "2"
+tokio = { version = "1", features = ["net", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = [
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "time",
+] }
+
+[lints]
+workspace = true
