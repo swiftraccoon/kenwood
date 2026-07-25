@@ -37,6 +37,21 @@ pub const PROBE_OFFSET: DdrOffset = match DdrOffset::new(0x17_D1BC) {
     Err(_) => unreachable!(),
 };
 
+/// The complete 54-byte BMP file header at [`PROBE_OFFSET`].
+///
+/// Every field is explicable, which is what makes it a good qualification
+/// target: `BM` magic, file size `0x1FA76` (54 header plus 129,600 pixel
+/// bytes), reserved zeros, pixel offset 54, DIB size 40, width 240, height 180,
+/// one plane, 24 bits per pixel, `BI_RGB`, image size `0x1FA40`, zero pixels
+/// per metre, zero palette entries. The same geometry is validated by
+/// [`crate::sdcard::capture`].
+pub const PROBE_EXPECTED_HEADER: [u8; 54] = [
+    0x42, 0x4D, 0x76, 0xFA, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x28, 0x00,
+    0x00, 0x00, 0xF0, 0x00, 0x00, 0x00, 0xB4, 0x00, 0x00, 0x00, 0x01, 0x00, 0x18, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x40, 0xFA, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 /// The bytes expected at [`PROBE_OFFSET`].
 ///
 /// A BMP file header for a 240 by 180 24-bit image: the `BM` magic, file size
@@ -103,6 +118,99 @@ impl<T: Transport> Radio<T> {
             out.extend_from_slice(&bytes);
         }
         Ok(out)
+    }
+
+    /// Runs the full post-flash qualification for the memory reader.
+    ///
+    /// This is what should be executed first on a freshly modified radio. It
+    /// escalates the read size, then performs the one check whose polarity is
+    /// inverted and therefore easy to get wrong by hand: a request that
+    /// overruns the radio's accepted window **must be refused**, and a refusal
+    /// is the passing outcome.
+    ///
+    /// The escalation exists because the failure modes differ by size. A
+    /// one-byte read proves the command is reachable at all. Sixteen and
+    /// fifty-four bytes prove the base address is right, since a wrong base
+    /// would return real but unrelated memory. Two hundred and fifty-six
+    /// proves the length field's `0x00` means 256 rather than zero.
+    ///
+    /// A widened bound that never rejects anything is indistinguishable from a
+    /// correct one by reading alone, which is why the last two steps are not
+    /// optional. Together they bracket the boundary: the highest aligned
+    /// request that must succeed, and the one just past it that must not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] if any read returns unexpected bytes, or if
+    /// the deliberately out-of-range request is **accepted**, which means the
+    /// bound was not applied. Also returns whatever [`Radio::read_memory`]
+    /// produces for a genuine transport or protocol failure.
+    pub async fn qualify_mem_read(&mut self) -> Result<(), Error> {
+        // Step 1: reachable at all.
+        let one = self.read_memory(PROBE_OFFSET, ReadLen::new(1)?).await?;
+        Self::expect_prefix(&one, 1)?;
+        tracing::info!("qualify: 1-byte read matches");
+
+        // Steps 2 and 3: the base address is correct.
+        let sixteen = self.read_memory(PROBE_OFFSET, ReadLen::new(16)?).await?;
+        Self::expect_prefix(&sixteen, 16)?;
+        tracing::info!("qualify: 16-byte read matches");
+
+        let header = self.read_memory(PROBE_OFFSET, ReadLen::new(54)?).await?;
+        Self::expect_prefix(&header, 54)?;
+        tracing::info!("qualify: full 54-byte BMP header matches");
+
+        // Step 4: `0x00` on the wire means 256, not zero.
+        let full = self.read_memory(DdrOffset::ZERO, ReadLen::MAX).await?;
+        if full.len() != 256 {
+            return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "256 bytes for a maximum-length read".to_owned(),
+                actual: format!("{} bytes", full.len()).into_bytes(),
+            }));
+        }
+        tracing::info!("qualify: maximum-length read returned 256 bytes");
+
+        // Step 5: the highest request that must still succeed.
+        let top = DdrOffset::new(0x00FF_FF00)?;
+        let last_ok = self.read_memory(top, ReadLen::MAX).await?;
+        if last_ok.len() != 256 {
+            return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "256 bytes at the top of the window".to_owned(),
+                actual: format!("{} bytes", last_ok.len()).into_bytes(),
+            }));
+        }
+        tracing::info!("qualify: read ending exactly at the bound succeeded");
+
+        // Step 6: inverted polarity. This request overruns the window by one
+        // byte and must be refused. Success here means the bound is not being
+        // applied, which is a failed qualification however healthy the earlier
+        // reads looked.
+        if let Ok(bytes) = self.read_memory(DdrOffset::MAX, ReadLen::MAX).await {
+            return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "a refusal for a read that overruns the accepted window".to_owned(),
+                actual: format!(
+                    "the radio accepted it and returned {} bytes, so the bound is \
+                     not being enforced",
+                    bytes.len()
+                )
+                .into_bytes(),
+            }));
+        }
+        tracing::info!("qualify: out-of-range read was refused, as required");
+        Ok(())
+    }
+
+    /// Compares `actual` against the first `len` bytes of the known header.
+    fn expect_prefix(actual: &[u8], len: usize) -> Result<(), Error> {
+        let expected = PROBE_EXPECTED_HEADER.get(..len).unwrap_or(&[]);
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: format!("{expected:02X?} at {PROBE_OFFSET}"),
+                actual: actual.to_vec(),
+            }))
+        }
     }
 
     /// Captures the given windows as a single snapshot.
@@ -188,7 +296,7 @@ impl<T: Transport> Radio<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PROBE_EXPECTED, PROBE_OFFSET};
+    use super::{PROBE_EXPECTED, PROBE_EXPECTED_HEADER, PROBE_OFFSET};
     use crate::protocol::Command;
     use crate::radio::Radio;
     use crate::transport::MockTransport;
@@ -328,6 +436,63 @@ mod tests {
             .await?;
 
         assert!(changes.is_empty(), "expected no changes, got {changes:?}");
+        Ok(())
+    }
+
+    /// Queues the five reads a passing qualification performs, leaving the
+    /// sixth (the out-of-range probe) for the caller to define.
+    fn queue_passing_qualification(mock: &mut MockTransport) {
+        let header = &PROBE_EXPECTED_HEADER;
+        mock.expect(b"GM 17D1BC,01\r", &reply(0x17_D1BC, &header[..1]));
+        mock.expect(b"GM 17D1BC,10\r", &reply(0x17_D1BC, &header[..16]));
+        mock.expect(b"GM 17D1BC,36\r", &reply(0x17_D1BC, &header[..54]));
+        mock.expect(b"GM 000000,00\r", &reply(0, &[0u8; 256]));
+        mock.expect(b"GM FFFF00,00\r", &reply(0xFF_FF00, &[0u8; 256]));
+    }
+
+    #[tokio::test]
+    async fn qualification_passes_when_the_bound_is_enforced() -> TestResult {
+        let mut mock = MockTransport::new();
+        queue_passing_qualification(&mut mock);
+        // The radio refuses the overrunning request, which is the pass.
+        mock.expect(b"GM FFFFFF,00\r", b"?\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        radio.qualify_mem_read().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn qualification_fails_when_an_out_of_range_read_is_accepted() -> TestResult {
+        let mut mock = MockTransport::new();
+        queue_passing_qualification(&mut mock);
+        // The radio answers a request it should have refused. Every earlier
+        // step passed, so this is the only signal that the bound is wrong.
+        mock.expect(b"GM FFFFFF,00\r", &reply(0xFF_FFFF, &[0u8; 256]));
+
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.qualify_mem_read().await;
+        assert!(
+            result.is_err(),
+            "an accepted out-of-range read must fail qualification, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn qualification_fails_on_a_wrong_base_address() -> TestResult {
+        // A wrong base returns real memory that is simply not the header. The
+        // one-byte step is too weak to catch it; the 16-byte step is not.
+        let mut mock = MockTransport::new();
+        mock.expect(b"GM 17D1BC,01\r", &reply(0x17_D1BC, &[0x42]));
+        mock.expect(b"GM 17D1BC,10\r", &reply(0x17_D1BC, &[0x42; 16]));
+
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio.qualify_mem_read().await;
+        assert!(
+            result.is_err(),
+            "a wrong base must fail qualification, got {result:?}"
+        );
         Ok(())
     }
 

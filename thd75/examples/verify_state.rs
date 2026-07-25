@@ -10,6 +10,7 @@
 //!
 //! ```text
 //! probe    <port>                     confirm the radio supports memory reads
+//! qualify  <port>                     full post-flash qualification
 //! dump     <port> <offset> <len>      read and hexdump a region
 //! discover <port> <offset> <len>      snapshot, wait, snapshot, report changes
 //! scan     <port> <offset> <len>      same, coalesced into runs, for large ranges
@@ -25,7 +26,14 @@
 //! which is how the framebuffer is meant to be located: read a wide window,
 //! change what is on screen, and look for a run of the right size.
 //!
+//! `qualify` is what to run first on a freshly modified radio, before trusting
+//! any read. It is the encoded form of the post-flash checklist, and it exists
+//! in code rather than in prose because one of its steps passes on failure: a
+//! read past the accepted window must be refused, and a human working from a
+//! checklist can easily record that backwards.
+//!
 //! ```text
+//! cargo run -p kenwood-thd75 --example verify_state -- qualify /dev/cu.usbmodemXXXX
 //! cargo run -p kenwood-thd75 --example verify_state -- probe /dev/cu.usbmodemXXXX
 //! cargo run -p kenwood-thd75 --example verify_state -- dump /dev/cu.usbmodemXXXX 17D1BC 40
 //! ```
@@ -66,6 +74,7 @@ fn usage() -> String {
     concat!(
         "usage:\n",
         "  verify_state probe    <port>\n",
+        "  verify_state qualify  <port>\n",
         "  verify_state dump     <port> <offset-hex> <len-dec>\n",
         "  verify_state discover <port> <offset-hex> <len-dec>\n",
         "  verify_state scan     <port> <offset-hex> <len-dec>\n",
@@ -143,6 +152,23 @@ async fn run() -> Result<(), Failure> {
     println!("  OK: the radio answered the known constant byte for byte.\n");
 
     if mode == "probe" {
+        return Ok(());
+    }
+
+    if mode == "qualify" {
+        // Run this first on a freshly modified radio. It escalates the read
+        // size and then checks the one condition whose polarity is inverted:
+        // a request past the accepted window must be REFUSED.
+        println!("Running full qualification (escalating reads, then bounds) ...");
+        radio.qualify_mem_read().await?;
+        println!(
+            "  PASS: reads matched at 1, 16 and 54 bytes; a maximum-length read \
+             returned 256 bytes; a read ending exactly at the bound succeeded; \
+             and a read past the bound was refused.\n\
+             \n\
+             The last two together are what prove the widened bound is real. \
+             Reads alone cannot distinguish a correct bound from an absent one."
+        );
         return Ok(());
     }
 
