@@ -234,6 +234,55 @@ impl<T: Transport> Radio<T> {
         Ok(StateSnapshot::from_windows(captured))
     }
 
+    /// Samples a wide range sparsely, for locating large structures.
+    ///
+    /// Reads `sample_len` bytes at every `stride` bytes across `total`, and
+    /// returns them as one snapshot whose windows are the sample points. Two
+    /// such snapshots diff exactly like dense ones.
+    ///
+    /// This exists because dense scanning does not scale to the whole window.
+    /// Reading 16 MiB densely is 65,536 requests; sampling 16 bytes every 4 KiB
+    /// is 4,096, a factor of sixteen fewer, and it still finds anything large.
+    /// A full-screen redraw dirties tens of consecutive kilobytes, so it cannot
+    /// hide between sample points. Something small can, which is the trade:
+    /// use this to narrow, then scan the candidate densely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] if `stride` is zero or a sample would
+    /// cross the addressable bound, plus any error [`Radio::read_memory`]
+    /// produces.
+    pub async fn sample_range(
+        &mut self,
+        start: DdrOffset,
+        total: u32,
+        stride: u32,
+        sample_len: ReadLen,
+    ) -> Result<StateSnapshot, Error> {
+        if stride == 0 {
+            return Err(Error::Validation(
+                crate::error::ValidationError::MemoryParamOutOfRange {
+                    name: "sample stride",
+                    value: 0,
+                    detail: "must be at least 1 byte",
+                },
+            ));
+        }
+        let mut windows = Vec::new();
+        let mut cursor = start.as_u32();
+        let end = u64::from(start.as_u32()) + u64::from(total);
+        while u64::from(cursor) < end {
+            let offset = DdrOffset::new(cursor)?;
+            let bytes = self.read_memory(offset, sample_len).await?;
+            windows.push((offset, bytes));
+            match cursor.checked_add(stride) {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        Ok(StateSnapshot::from_windows(windows))
+    }
+
     /// Discovers where a setting lives in memory by changing it and observing
     /// what moved.
     ///
@@ -492,6 +541,40 @@ mod tests {
         assert!(
             result.is_err(),
             "a wrong base must fail qualification, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sample_range_walks_by_stride() -> TestResult {
+        let mut mock = MockTransport::new();
+        // 0x300 bytes sampled 2 at a time every 0x100 gives three points.
+        mock.expect(b"GM 000000,02\r", &reply(0, &[1, 2]));
+        mock.expect(b"GM 000100,02\r", &reply(0x100, &[3, 4]));
+        mock.expect(b"GM 000200,02\r", &reply(0x200, &[5, 6]));
+
+        let mut radio = Radio::connect(mock).await?;
+        let snapshot = radio
+            .sample_range(DdrOffset::ZERO, 0x300, 0x100, ReadLen::new(2)?)
+            .await?;
+
+        assert_eq!(snapshot.windows().len(), 3);
+        let third = snapshot.windows().get(2).ok_or("missing sample")?;
+        assert_eq!(third.0.as_u32(), 0x200);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sample_range_rejects_a_zero_stride() -> TestResult {
+        // A zero stride would loop forever issuing the same request.
+        let mock = MockTransport::new();
+        let mut radio = Radio::connect(mock).await?;
+        let result = radio
+            .sample_range(DdrOffset::ZERO, 0x100, 0, ReadLen::new(2)?)
+            .await;
+        assert!(
+            result.is_err(),
+            "zero stride must be refused, got {result:?}"
         );
         Ok(())
     }

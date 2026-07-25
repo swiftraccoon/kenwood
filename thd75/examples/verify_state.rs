@@ -14,7 +14,14 @@
 //! dump     <port> <offset> <len>      read and hexdump a region
 //! discover <port> <offset> <len>      snapshot, wait, snapshot, report changes
 //! scan     <port> <offset> <len>      same, coalesced into runs, for large ranges
+//! hunt     <port> <offset> <len>      coarse sampling pass, to narrow a wide window
 //! ```
+//!
+//! `hunt` exists because dense scanning does not scale: 16 MiB is 65,536
+//! requests per snapshot, and a diff needs two. It samples 16 bytes every
+//! 4 KiB instead, a factor of sixteen fewer requests, which still cannot miss
+//! anything framebuffer-sized because such a structure dirties tens of
+//! consecutive kilobytes. Use it to narrow, then `scan` the candidate densely.
 //!
 //! `discover` is the workhorse: start it, change one setting on the radio or
 //! from another tool, press Enter, and it names the addresses that moved. That
@@ -58,7 +65,7 @@ use std::io::{BufRead, Write};
 
 use kenwood_thd75::error::TransportError;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::DdrOffset;
+use kenwood_thd75::types::{DdrOffset, ReadLen};
 use kenwood_thd75::verify::{ByteChange, RuntimeOffsetMap};
 use kenwood_thd75::{Error, Radio};
 
@@ -78,6 +85,7 @@ fn usage() -> String {
         "  verify_state dump     <port> <offset-hex> <len-dec>\n",
         "  verify_state discover <port> <offset-hex> <len-dec>\n",
         "  verify_state scan     <port> <offset-hex> <len-dec>\n",
+        "  verify_state hunt     <port> <offset-hex> <len-dec>\n",
     )
     .to_owned()
 }
@@ -121,6 +129,35 @@ fn wait_for_operator(prompt: &str) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Number of sample points a coarse pass will take.
+const fn total_points(len: u32, stride: u32) -> u32 {
+    len.div_ceil(stride)
+}
+
+/// Groups changed *sample points* into runs of consecutive points.
+///
+/// Distinct from [`coalesce`], which merges byte-adjacent changes. In a coarse
+/// pass the changed bytes sit `stride` apart, so byte adjacency never holds and
+/// merging has to happen at sample-point granularity instead. Returns each run
+/// as a start offset and a count of points.
+fn coalesce_samples(changes: &[ByteChange], stride: u32) -> Vec<(u32, u32)> {
+    let mut points: Vec<u32> = changes
+        .iter()
+        .map(|c| (c.offset.as_u32() / stride) * stride)
+        .collect();
+    points.sort_unstable();
+    points.dedup();
+
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for point in points {
+        match runs.last_mut() {
+            Some(last) if point == last.0 + last.1 * stride => last.1 += 1,
+            _ => runs.push((point, 1)),
+        }
+    }
+    runs
 }
 
 /// Groups changed bytes into contiguous runs so a large redraw reads as one
@@ -179,66 +216,134 @@ async fn run() -> Result<(), Failure> {
     let len: u32 = len_arg.parse()?;
 
     match mode {
-        "dump" => {
-            let bytes = radio.read_memory_range(offset, len).await?;
-            println!("{len} bytes at {offset}:");
-            hexdump(raw_offset, &bytes);
-        }
-        "discover" | "scan" => {
-            let windows = [(offset, len)];
-            println!("Capturing {len} bytes at {offset} ...");
-            let changes = radio
-                .discover_field(&windows, async |_| {
-                    wait_for_operator(
-                        "Change ONE setting now (radio keypad or another tool), \
-                         then press Enter: ",
-                    )
-                    .map_err(|e| Error::Transport(TransportError::Read(e)))
-                })
-                .await?;
+        "dump" => mode_dump(&mut radio, offset, raw_offset, len).await,
+        "discover" | "scan" => mode_discover(&mut radio, offset, len, mode == "scan").await,
+        "hunt" => mode_hunt(&mut radio, offset, len).await,
+        other => Err(format!("unknown mode {other:?}\n\n{}", usage()).into()),
+    }
+}
 
-            if changes.is_empty() {
-                println!(
-                    "\nNo bytes changed. That is a result, not a failure: either the \
-                     setting lives outside this window, or the change never reached \
-                     the running radio. Widen the window, or verify the change took \
-                     effect on the display."
-                );
-                return Ok(());
-            }
+/// Reads a region and hexdumps it.
+async fn mode_dump(
+    radio: &mut Radio<SerialTransport>,
+    offset: DdrOffset,
+    raw_offset: u32,
+    len: u32,
+) -> Result<(), Failure> {
+    let bytes = radio.read_memory_range(offset, len).await?;
+    println!("{len} bytes at {offset}:");
+    hexdump(raw_offset, &bytes);
+    Ok(())
+}
 
-            if mode == "scan" {
-                let runs = coalesce(&changes);
-                println!("\n{} changed bytes in {} runs:", changes.len(), runs.len());
-                for (start, length) in &runs {
-                    println!("  {start:06X}  {length} bytes");
-                }
-                println!(
-                    "\nA run of roughly 129,600 bytes is the screen-capture image size \
-                     for a 240 by 180 24-bit frame, which is what a framebuffer would \
-                     look like."
-                );
-            } else {
-                println!("\n{} changed bytes:", changes.len());
-                for change in &changes {
-                    println!(
-                        "  {}  {:02X} -> {:02X}",
-                        change.offset, change.before, change.after
-                    );
-                }
+/// Snapshots a window, waits for the operator to change something, snapshots
+/// again, and reports what moved.
+async fn mode_discover(
+    radio: &mut Radio<SerialTransport>,
+    offset: DdrOffset,
+    len: u32,
+    coalesced: bool,
+) -> Result<(), Failure> {
+    let windows = [(offset, len)];
+    println!("Capturing {len} bytes at {offset} ...");
+    let changes = radio
+        .discover_field(&windows, async |_| {
+            wait_for_operator(
+                "Change ONE setting now (radio keypad or another tool), then press Enter: ",
+            )
+            .map_err(|e| Error::Transport(TransportError::Read(e)))
+        })
+        .await?;
 
-                let mut map = RuntimeOffsetMap::default();
-                let offsets: Vec<DdrOffset> = changes.iter().map(|c| c.offset).collect();
-                map.record("discovered", &offsets);
-                println!(
-                    "\nRecord this in a runtime offset map as:\n{}",
-                    map.to_text()
-                );
-            }
-        }
-        other => return Err(format!("unknown mode {other:?}\n\n{}", usage()).into()),
+    if changes.is_empty() {
+        println!(
+            "\nNo bytes changed. That is a result, not a failure: either the \
+             setting lives outside this window, or the change never reached the \
+             running radio. Widen the window, or verify the change took effect \
+             on the display."
+        );
+        return Ok(());
     }
 
+    if coalesced {
+        let runs = coalesce(&changes);
+        println!("\n{} changed bytes in {} runs:", changes.len(), runs.len());
+        for (start, length) in &runs {
+            println!("  {start:06X}  {length} bytes");
+        }
+        println!(
+            "\nA run of roughly 129,600 bytes is the screen-capture image size for \
+             a 240 by 180 24-bit frame, which is what a framebuffer would look like."
+        );
+    } else {
+        println!("\n{} changed bytes:", changes.len());
+        for change in &changes {
+            println!(
+                "  {}  {:02X} -> {:02X}",
+                change.offset, change.before, change.after
+            );
+        }
+        let mut map = RuntimeOffsetMap::default();
+        let offsets: Vec<DdrOffset> = changes.iter().map(|c| c.offset).collect();
+        map.record("discovered", &offsets);
+        println!(
+            "\nRecord this in a runtime offset map as:\n{}",
+            map.to_text()
+        );
+    }
+    Ok(())
+}
+
+/// Coarse-to-fine search for a large structure such as a framebuffer.
+///
+/// Dense scanning does not scale to the whole window: 16 MiB is 65,536 requests
+/// per snapshot and a diff needs two. Sampling 16 bytes every 4 KiB is 4,096,
+/// and anything framebuffer-sized dirties tens of consecutive kilobytes, so it
+/// cannot hide between sample points. Something small can, which is the trade.
+async fn mode_hunt(
+    radio: &mut Radio<SerialTransport>,
+    offset: DdrOffset,
+    len: u32,
+) -> Result<(), Failure> {
+    const STRIDE: u32 = 4096;
+
+    let sample = ReadLen::new(16)?;
+    let points = total_points(len, STRIDE);
+    println!(
+        "Coarse pass: {points} samples of 16 bytes every {STRIDE} bytes across \
+         {len} bytes from {offset}."
+    );
+
+    let before = radio.sample_range(offset, len, STRIDE, sample).await?;
+    wait_for_operator(
+        "Now change the DISPLAY substantially (switch menus, change band), then press Enter: ",
+    )?;
+    let after = radio.sample_range(offset, len, STRIDE, sample).await?;
+
+    let changes = before.diff(&after)?;
+    if changes.is_empty() {
+        println!(
+            "\nNothing changed at any sample point. Either the display did not \
+             change, or whatever changed is smaller than the sampling can see. \
+             Re-run over a narrower range, or scan it densely."
+        );
+        return Ok(());
+    }
+
+    let runs = coalesce_samples(&changes, STRIDE);
+    println!(
+        "\n{} bytes moved across {} runs of samples:",
+        changes.len(),
+        runs.len()
+    );
+    for (start, count) in &runs {
+        println!("  {start:06X}  spans about {} bytes", count * STRIDE);
+    }
+    println!(
+        "\nA run spanning roughly 129,600 bytes is the size of a 240 by 180 24-bit \
+         frame. Scan the most promising run densely to confirm:\n  \
+         verify_state scan <port> <run-start-hex> <run-length-dec>"
+    );
     Ok(())
 }
 
