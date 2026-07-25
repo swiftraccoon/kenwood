@@ -20,6 +20,7 @@ use crate::protocol::memread::plan_read;
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
 use crate::types::{DdrOffset, ReadLen};
+use crate::verify::{ByteChange, StateSnapshot};
 
 use super::Radio;
 
@@ -104,6 +105,59 @@ impl<T: Transport> Radio<T> {
         Ok(out)
     }
 
+    /// Captures the given windows as a single snapshot.
+    ///
+    /// Each window is an offset and a byte count. Windows are read in the
+    /// order given, and the resulting snapshot records them in that order, so
+    /// two snapshots taken with the same window list are directly comparable.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error [`Radio::read_memory_range`] produces.
+    pub async fn capture_snapshot(
+        &mut self,
+        windows: &[(DdrOffset, u32)],
+    ) -> Result<StateSnapshot, Error> {
+        let mut captured = Vec::with_capacity(windows.len());
+        for &(offset, len) in windows {
+            let bytes = self.read_memory_range(offset, len).await?;
+            captured.push((offset, bytes));
+        }
+        Ok(StateSnapshot::from_windows(captured))
+    }
+
+    /// Discovers where a setting lives in memory by changing it and observing
+    /// what moved.
+    ///
+    /// Captures `windows`, runs `mutate`, captures them again, and reports the
+    /// bytes that differ. This is the empirical alternative to reverse
+    /// engineering each field's location: change a setting through whatever
+    /// path already works, and the diff names the address.
+    ///
+    /// The mutation runs between the two captures and receives the same radio,
+    /// so it can use any command, including one that leaves and re-enters
+    /// programming mode.
+    ///
+    /// A change that reports no differing bytes is a real result worth acting
+    /// on. It means the setting is not inside the windows given, or that the
+    /// write did not take effect on the running radio, and distinguishing
+    /// those two is the point of the exercise.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error the captures or `mutate` produce, and
+    /// [`Error::Verify`] if the two captures somehow disagree on layout.
+    pub async fn discover_field(
+        &mut self,
+        windows: &[(DdrOffset, u32)],
+        mutate: impl AsyncFnOnce(&mut Self) -> Result<(), Error>,
+    ) -> Result<Vec<ByteChange>, Error> {
+        let before = self.capture_snapshot(windows).await?;
+        mutate(self).await?;
+        let after = self.capture_snapshot(windows).await?;
+        Ok(before.diff(&after)?)
+    }
+
     /// Confirms the radio supports memory reads and answers correctly.
     ///
     /// Reads a known-constant location and compares byte for byte. A match
@@ -135,9 +189,10 @@ impl<T: Transport> Radio<T> {
 #[cfg(test)]
 mod tests {
     use super::{PROBE_EXPECTED, PROBE_OFFSET};
+    use crate::protocol::Command;
     use crate::radio::Radio;
     use crate::transport::MockTransport;
-    use crate::types::{DdrOffset, ReadLen};
+    use crate::types::{AfGainLevel, Band, DdrOffset, ReadLen};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -215,6 +270,84 @@ mod tests {
         let bytes = radio.read_memory_range(DdrOffset::ZERO, 300).await?;
         assert_eq!(bytes.len(), 300);
         assert_eq!(bytes.get(299).copied(), Some(0xAA));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discover_field_reports_the_byte_that_moved() -> TestResult {
+        let mut mock = MockTransport::new();
+        // Snapshot, mutate, snapshot. The mutation here is a plain CAT command
+        // whose own reply is consumed before the second capture.
+        mock.expect(b"GM 001000,04\r", &reply(0x1000, &[0x11, 0x22, 0x33, 0x44]));
+        mock.expect(b"AG 015\r", b"AG 015\r");
+        mock.expect(b"GM 001000,04\r", &reply(0x1000, &[0x11, 0x22, 0x99, 0x44]));
+
+        let mut radio = Radio::connect(mock).await?;
+        let windows = [(DdrOffset::new(0x1000)?, 4)];
+        let changes = radio
+            .discover_field(&windows, async |r| {
+                let _response = r
+                    .execute(Command::SetAfGain {
+                        band: Band::A,
+                        level: AfGainLevel::new(15),
+                    })
+                    .await?;
+                Ok(())
+            })
+            .await?;
+
+        assert_eq!(changes.len(), 1);
+        let change = changes.first().ok_or("missing change")?;
+        assert_eq!(change.offset.as_u32(), 0x1002);
+        assert_eq!(change.before, 0x33);
+        assert_eq!(change.after, 0x99);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discover_field_reports_nothing_when_the_window_is_wrong() -> TestResult {
+        // A silent result is a real finding: either the setting is elsewhere,
+        // or the write never reached the running radio.
+        let mut mock = MockTransport::new();
+        mock.expect(b"GM 002000,02\r", &reply(0x2000, &[0xAA, 0xBB]));
+        mock.expect(b"AG 015\r", b"AG 015\r");
+        mock.expect(b"GM 002000,02\r", &reply(0x2000, &[0xAA, 0xBB]));
+
+        let mut radio = Radio::connect(mock).await?;
+        let windows = [(DdrOffset::new(0x2000)?, 2)];
+        let changes = radio
+            .discover_field(&windows, async |r| {
+                let _response = r
+                    .execute(Command::SetAfGain {
+                        band: Band::A,
+                        level: AfGainLevel::new(15),
+                    })
+                    .await?;
+                Ok(())
+            })
+            .await?;
+
+        assert!(changes.is_empty(), "expected no changes, got {changes:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capture_snapshot_records_windows_in_order() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"GM 000010,02\r", &reply(0x10, &[1, 2]));
+        mock.expect(b"GM 000020,02\r", &reply(0x20, &[3, 4]));
+
+        let mut radio = Radio::connect(mock).await?;
+        let windows = [(DdrOffset::new(0x10)?, 2), (DdrOffset::new(0x20)?, 2)];
+        let snapshot = radio.capture_snapshot(&windows).await?;
+
+        assert_eq!(snapshot.windows().len(), 2);
+        let first = snapshot.windows().first().ok_or("missing window")?;
+        let second = snapshot.windows().get(1).ok_or("missing window")?;
+        assert_eq!(first.0.as_u32(), 0x10);
+        assert_eq!(first.1, vec![1, 2]);
+        assert_eq!(second.0.as_u32(), 0x20);
+        assert_eq!(second.1, vec![3, 4]);
         Ok(())
     }
 

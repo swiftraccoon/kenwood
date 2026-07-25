@@ -50,6 +50,10 @@ pub enum Error {
     #[error(transparent)]
     Validation(#[from] ValidationError),
 
+    /// Comparing two state snapshots failed.
+    #[error(transparent)]
+    Verify(#[from] crate::verify::VerifyError),
+
     /// The radio returned an error response (`?\r`).
     #[error("radio returned error response")]
     RadioError,
