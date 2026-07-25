@@ -1155,8 +1155,185 @@ impl fmt::Display for GpsRadioMode {
 }
 
 // ---------------------------------------------------------------------------
+// Memory-read parameters (DdrOffset, ReadLen)
+// ---------------------------------------------------------------------------
+
+/// One past the highest byte address a memory-read request may touch.
+///
+/// The radio rejects a request unless `offset + length - 1` is strictly less
+/// than this value. It is the addressable window implied by the six
+/// hexadecimal offset digits of the request grammar.
+pub const MEM_READ_BOUND: u32 = 0x0100_0000;
+
+/// An offset into the radio's readable memory window.
+///
+/// This is an offset, not an absolute address. The base is fixed in the radio
+/// and is never transmitted, so callers must not assume any particular base.
+///
+/// Valid range is `0x000000..=0xFFFFFF`, the span expressible in the six
+/// hexadecimal digits of the request grammar.
+///
+/// Memory reads require firmware modified by the `thd75-fw` project. An
+/// unmodified radio does not support them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DdrOffset(u32);
+
+impl DdrOffset {
+    /// The lowest valid offset.
+    pub const ZERO: Self = Self(0);
+    /// The highest valid offset.
+    pub const MAX: Self = Self(0x00FF_FFFF);
+
+    /// Creates a new `DdrOffset` from a raw value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::MemoryParamOutOfRange`] if
+    /// `value > 0xFFFFFF`.
+    pub const fn new(value: u32) -> Result<Self, ValidationError> {
+        if value > 0x00FF_FFFF {
+            Err(ValidationError::MemoryParamOutOfRange {
+                name: "DDR offset",
+                value,
+                detail: "must be 0-0xFFFFFF",
+            })
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the raw offset.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for DdrOffset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:06X}", self.0)
+    }
+}
+
+/// The number of bytes to read in one memory-read request.
+///
+/// Valid range is `1..=256`. The radio encodes 256 as the wire value `0x00`,
+/// which is why [`ReadLen::as_wire`] is separate from [`ReadLen::as_u16`].
+///
+/// The wire byte is what gets stored, so the logical count is produced by
+/// widening rather than narrowing. That keeps the single unavoidable narrowing
+/// in [`ReadLen::new`], where masking makes it provably lossless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReadLen(u8);
+
+impl ReadLen {
+    /// The largest read a single request can return.
+    pub const MAX: Self = Self(0);
+
+    /// Creates a new `ReadLen` from a raw byte count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::MemoryParamOutOfRange`] if `value` is 0 or
+    /// greater than 256.
+    pub const fn new(value: u16) -> Result<Self, ValidationError> {
+        if value == 0 || value > 256 {
+            return Err(ValidationError::MemoryParamOutOfRange {
+                name: "read length",
+                value: value as u32,
+                detail: "must be 1-256",
+            });
+        }
+        // `value` is 1..=256 here. Masking to 8 bits maps 1..=255 to
+        // themselves and maps 256 to 0, which is exactly the radio's wire
+        // encoding, so this narrowing is total and lossless by construction.
+        // Clippy proves this too: an `expect(cast_possible_truncation)` here
+        // is reported as an unfulfilled expectation, so no suppression is used.
+        Ok(Self((value & 0xFF) as u8))
+    }
+
+    /// Returns the byte count, with the wire value `0x00` widened back to 256.
+    ///
+    /// Not a `const fn`: `u16::from` is not const, and using `as` here would
+    /// trip `clippy::cast_lossless` for no benefit, since no caller needs this
+    /// in a const context.
+    #[must_use]
+    pub fn as_u16(self) -> u16 {
+        if self.0 == 0 { 256 } else { u16::from(self.0) }
+    }
+
+    /// Returns the wire encoding, in which 256 is `0x00`.
+    #[must_use]
+    pub const fn as_wire(self) -> u8 {
+        self.0
+    }
+}
+
+impl fmt::Display for ReadLen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:02X}", self.as_wire())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod memread_param_tests {
+    use super::{DdrOffset, MEM_READ_BOUND, ReadLen};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn offset_accepts_zero_and_max() -> TestResult {
+        assert_eq!(DdrOffset::new(0)?.as_u32(), 0);
+        assert_eq!(DdrOffset::new(0x00FF_FFFF)?.as_u32(), 0x00FF_FFFF);
+        assert_eq!(DdrOffset::MAX.as_u32(), 0x00FF_FFFF);
+        assert_eq!(DdrOffset::ZERO.as_u32(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn offset_rejects_above_24_bits() {
+        let result = DdrOffset::new(0x0100_0000);
+        assert!(
+            result.is_err(),
+            "0x1000000 must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn offset_displays_as_six_hex_digits() -> TestResult {
+        assert_eq!(format!("{}", DdrOffset::new(0x17_D1BC)?), "17D1BC");
+        assert_eq!(format!("{}", DdrOffset::ZERO), "000000");
+        Ok(())
+    }
+
+    #[test]
+    fn read_len_wire_encoding() -> TestResult {
+        assert_eq!(ReadLen::new(1)?.as_wire(), 1);
+        assert_eq!(ReadLen::new(255)?.as_wire(), 255);
+        // 256 is encoded on the wire as 0x00.
+        assert_eq!(ReadLen::new(256)?.as_wire(), 0);
+        assert_eq!(ReadLen::new(256)?.as_u16(), 256);
+        assert_eq!(ReadLen::MAX.as_u16(), 256);
+        Ok(())
+    }
+
+    #[test]
+    fn read_len_rejects_zero_and_over_256() {
+        let zero = ReadLen::new(0);
+        assert!(zero.is_err(), "zero length must be rejected, got {zero:?}");
+        let over = ReadLen::new(257);
+        assert!(over.is_err(), "257 must be rejected, got {over:?}");
+    }
+
+    #[test]
+    fn bound_is_one_past_max_offset() {
+        assert_eq!(MEM_READ_BOUND, DdrOffset::MAX.as_u32() + 1);
+    }
+}
 
 #[cfg(test)]
 mod tests {

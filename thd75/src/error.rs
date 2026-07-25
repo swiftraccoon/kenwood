@@ -519,6 +519,20 @@ pub enum ValidationError {
         detail: &'static str,
     },
 
+    /// A memory-read request parameter is outside the range the radio accepts.
+    ///
+    /// Used by `DdrOffset` and `ReadLen`, whose valid ranges are wider than the
+    /// `u8` that [`ValidationError::SettingOutOfRange`] carries.
+    #[error("{name} value {value:#X} out of range ({detail})")]
+    MemoryParamOutOfRange {
+        /// The parameter name, e.g. "DDR offset", "read length".
+        name: &'static str,
+        /// The invalid raw value.
+        value: u32,
+        /// Human-readable valid range description, e.g. "must be 0-0xFFFFFF".
+        detail: &'static str,
+    },
+
     /// A runtime APRS wire-format value failed validation.
     ///
     /// Used by the `aprs` and `ax25-codec` crates for typed primitives

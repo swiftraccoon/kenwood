@@ -81,6 +81,7 @@ pub mod sdcard;
 pub mod session;
 pub mod transport;
 pub mod types;
+pub mod verify;
 
 // Dev-dependencies used only by the integration tests in `tests/`.
 // Acknowledge them at the lib level so `unused_crate_dependencies`

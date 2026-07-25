@@ -19,6 +19,7 @@ pub mod core;
 pub mod dstar;
 pub mod gps;
 pub mod memory;
+pub mod memread;
 pub mod programming;
 pub mod scan;
 pub mod sd;
@@ -30,10 +31,10 @@ pub use codec::Codec;
 
 use crate::error::ProtocolError;
 use crate::types::{
-    AfGainLevel, Band, BeaconMode, CallsignSlot, ChannelMemory, DetectOutputMode, DstarSlot,
-    DvGatewayMode, FilterMode, FilterWidthIndex, FineStep, GpsRadioMode, KeyLockType, Mode,
-    PowerLevel, SMeterReading, ScanResumeMethod, SquelchLevel, StepSize, TncBaud, TncMode,
-    VfoMemoryMode, VoxDelay, VoxGain,
+    AfGainLevel, Band, BeaconMode, CallsignSlot, ChannelMemory, DdrOffset, DetectOutputMode,
+    DstarSlot, DvGatewayMode, FilterMode, FilterWidthIndex, FineStep, GpsRadioMode, KeyLockType,
+    Mode, PowerLevel, ReadLen, SMeterReading, ScanResumeMethod, SquelchLevel, StepSize, TncBaud,
+    TncMode, VfoMemoryMode, VoxDelay, VoxGain,
 };
 
 /// A CAT command to send to the radio.
@@ -810,6 +811,22 @@ pub enum Command {
     /// and the radio stops responding to normal CAT commands.
     GetSdCard,
 
+    // === Memory read (requires modified firmware) ===
+    /// Read `len` bytes at `offset` from the radio's readable memory window.
+    ///
+    /// # Firmware requirement
+    ///
+    /// Requires firmware modified by the `thd75-fw` project. It reuses the `GM`
+    /// mnemonic, which on stock firmware selects the GPS operating mode, so a
+    /// stock radio refuses this request and [`Command::GetGpsMode`] stops
+    /// working on a modified one. See [`memread`] for the wire format.
+    ReadMemory {
+        /// Offset into the readable window. Not an absolute address.
+        offset: DdrOffset,
+        /// Number of bytes to read, 1 to 256.
+        len: ReadLen,
+    },
+
     // === User (US) ===
     /// Get user settings (US read).
     ///
@@ -1211,6 +1228,19 @@ pub enum Response {
         present: bool,
     },
 
+    // === Memory read (requires modified firmware) ===
+    /// Bytes read from the radio's readable memory window.
+    ///
+    /// The radio echoes the requested offset in its reply, and this is that
+    /// echoed value rather than anything the host supplied, so comparing it
+    /// against the request detects a stale or mis-routed answer.
+    MemoryData {
+        /// Offset echoed back by the radio.
+        offset: DdrOffset,
+        /// The decoded bytes.
+        bytes: Vec<u8>,
+    },
+
     // === User ===
     /// User settings response (US).
     ///
@@ -1372,6 +1402,7 @@ pub const fn command_name(cmd: &Command) -> &'static str {
         Command::GetGpsSentences | Command::SetGpsSentences { .. } => "GS",
         Command::GetBluetooth | Command::SetBluetooth { .. } => "BT",
         Command::GetSdCard => "SD",
+        Command::ReadMemory { .. } => memread::MEM_READ_MNEMONIC,
         Command::GetUserSettings => "US",
         Command::GetRadioType => "TY",
         Command::GetMcpStatus => "0E",
@@ -1611,6 +1642,9 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         // SD
         Command::GetSdCard => "SD".to_owned(),
 
+        // Memory read (requires modified firmware)
+        Command::ReadMemory { offset, len } => memread::serialize_read(*offset, *len),
+
         // User
         Command::GetUserSettings => "US".to_owned(),
 
@@ -1682,6 +1716,10 @@ pub fn parse(frame: &[u8]) -> Result<Response, ProtocolError> {
         .or_else(|| scan::parse_scan(mnemonic, payload))
         .or_else(|| aprs::parse_aprs(mnemonic, payload))
         .or_else(|| dstar::parse_dstar(mnemonic, payload))
+        // Memory read must precede the GPS parser: both answer to `GM`, and
+        // the GPS parser always returns `Some`, so it would short-circuit the
+        // chain. This parser declines on shape, letting GPS replies through.
+        .or_else(|| memread::parse_memread(mnemonic, payload))
         .or_else(|| gps::parse_gps(mnemonic, payload))
         .or_else(|| bluetooth::parse_bluetooth(mnemonic, payload))
         .or_else(|| sd::parse_sd(mnemonic, payload))
