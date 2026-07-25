@@ -330,7 +330,26 @@ impl<T: Transport> Radio<T> {
     /// firmware, plus any error [`Radio::read_memory`] produces.
     pub async fn probe_mem_read(&mut self) -> Result<(), Error> {
         let len = ReadLen::new(16)?;
-        let bytes = self.read_memory(PROBE_OFFSET, len).await?;
+        let bytes = match self.read_memory(PROBE_OFFSET, len).await {
+            Ok(bytes) => bytes,
+            // Hardware-observed on stock V1.03: the radio answers `?`, which
+            // surfaces as `RadioError`. That is the expected outcome on
+            // unmodified firmware, and on its own it reads as an opaque
+            // failure, so say what it means.
+            Err(Error::RadioError | Error::NotAvailable) => {
+                return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                    expected: format!(
+                        "memory-read data at {PROBE_OFFSET}, but the radio refused \
+                         the command. Unmodified firmware does exactly this, \
+                         because the mnemonic carries an unrelated function there. \
+                         This radio cannot serve memory reads until the \
+                         memory-read patch is flashed"
+                    ),
+                    actual: b"?".to_vec(),
+                }));
+            }
+            Err(other) => return Err(other),
+        };
         if bytes.as_slice() == PROBE_EXPECTED.as_slice() {
             tracing::debug!("memory-read capability probe passed");
             Ok(())
@@ -396,6 +415,27 @@ mod tests {
         );
         let mut radio = Radio::connect(mock).await?;
         radio.probe_mem_read().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn probe_explains_a_refusal_from_stock_firmware() -> TestResult {
+        // Hardware-observed: stock V1.03 answers `?` because its GM write path
+        // is gated on an exact 5-byte request and a 13-byte one falls through
+        // to the error responder.
+        let mut mock = MockTransport::new();
+        mock.expect(b"GM 17D1BC,10\r", b"?\r");
+        let mut radio = Radio::connect(mock).await?;
+
+        let result = radio.probe_mem_read().await;
+        let message = match result {
+            Err(e) => format!("{e}"),
+            Ok(()) => return Err("probe must fail against stock firmware".into()),
+        };
+        assert!(
+            message.contains("refused"),
+            "the refusal should explain itself, got: {message}"
+        );
         Ok(())
     }
 

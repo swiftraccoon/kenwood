@@ -348,6 +348,12 @@ async fn mode_hunt(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Failure> {
-    run().await
+async fn main() {
+    // Print the Display form rather than returning Err from main, which would
+    // print the Debug form. The most common failure here is a refusal from
+    // unmodified firmware, and that message is written to be read.
+    if let Err(e) = run().await {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
 }
