@@ -2,17 +2,21 @@
 //!
 //! The backup is intentionally restricted to the supported USB radio and
 //! firmware used by this bench. Before entering programming mode it reads the
-//! raw CAT identity and checks five CAT-readable safety settings. Those reads
-//! do not establish the rest of the physical-radio checklist, so the operator
-//! must separately attest the UI and peripheral conditions before the port is
-//! opened. The operator must then confirm the exact port and output path at a
-//! terminal.
+//! raw CAT identity and checks five CAT-readable safety settings. By default,
+//! the operator must separately attest the UI and peripheral conditions before
+//! the port is opened. `--machine-checked-read-only` explicitly records that
+//! this manual attestation was skipped and proceeds only when the limited CAT
+//! subset is safe for a read-only MCP operation. In either mode, the operator
+//! must confirm the exact port and output path at a terminal.
 //!
 //! ```text
 //! cargo run -p kenwood-thd75 --example config_backup -- \
 //!   --port /dev/cu.usbmodem101 \
 //!   --output /absolute/private/directory/thd75-backup.bin
 //! ```
+//!
+//! Add `--machine-checked-read-only` to skip the manual UI checklist without
+//! claiming those unobservable conditions were verified.
 //!
 //! The existing output parent must be a canonical, owner-private 0700
 //! directory, and the final output name must not exist. A new empty
@@ -155,6 +159,7 @@ const CAT_SAFETY_COMMANDS: &[&[u8]] = &[b"AI\r", b"TN\r", b"PT\r", b"VX\r", b"IO
 struct Config {
     port: String,
     output: PathBuf,
+    machine_checked_read_only: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -164,7 +169,7 @@ struct RawIdentity {
     radio_type: Vec<u8>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CatSafetySubset {
     auto_info: Vec<u8>,
     tnc: Vec<u8>,
@@ -423,11 +428,28 @@ impl Drop for StagedOutput {
 }
 
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The fail-closed backup sequence stays linear so each close, recovery, postflight, \
+              and publication gate remains visibly ordered"
+)]
 async fn main() -> BackupResult<()> {
     let config = parse_args()?;
     validate_usb_port(&config.port)?;
     let staged_output = OutputTarget::prepare(&config.output)?.stage()?;
-    confirm_ui_checked(&config.port)?;
+    if config.machine_checked_read_only {
+        println!(
+            "Manual UI state was not attested. Continuing only with exact identity and the \
+             machine-readable CAT safety subset."
+        );
+        println!(
+            "Machine-only policy requires packet/TNC Off and a documented beacon method; it does \
+             not claim the beacon method is Manual."
+        );
+        println!("{CAT_SAFETY_SCOPE}");
+    } else {
+        confirm_ui_checked(&config.port)?;
+    }
 
     let mut transport = SerialTransport::open(&config.port, CAT_BAUD)?;
     let mut codec = Codec::new();
@@ -442,8 +464,8 @@ async fn main() -> BackupResult<()> {
         }
     };
 
-    if let Err(error) =
-        validate_expected_identity(&identity).and_then(|()| validate_cat_safety_subset(&cat_safety))
+    if let Err(error) = validate_expected_identity(&identity)
+        .and_then(|()| validate_cat_safety_subset(&cat_safety, config.machine_checked_read_only))
     {
         return Err(with_close_result(
             error,
@@ -458,14 +480,43 @@ async fn main() -> BackupResult<()> {
         ));
     }
 
+    let confirmation_preflight = run_preflight(&mut transport, &mut codec).await;
+    let (confirmed_identity, confirmed_cat_safety) = match confirmation_preflight {
+        Ok(preflight) => preflight,
+        Err(error) => {
+            return Err(with_close_result(
+                error,
+                close_transport(&mut transport).await,
+            ));
+        }
+    };
+    if let Err(error) = validate_expected_identity(&confirmed_identity).and_then(|()| {
+        validate_cat_safety_subset(&confirmed_cat_safety, config.machine_checked_read_only)
+    }) {
+        return Err(with_close_result(
+            error,
+            close_transport(&mut transport).await,
+        ));
+    }
+    if confirmed_identity != identity || confirmed_cat_safety != cat_safety {
+        return Err(with_close_result(
+            invalid_input(
+                "raw identity or CAT safety state changed during confirmation; no MCP command was \
+                 sent",
+            ),
+            close_transport(&mut transport).await,
+        ));
+    }
+
     let mut radio = Radio::connect(transport).await?;
     radio.set_mcp_speed(McpSpeed::Safe);
+    let mut termination = TerminationListener::install()?;
 
     println!(
         "Reading all {} bytes at 9600 baud...",
         programming::TOTAL_SIZE
     );
-    let image_result = read_image_with_interrupt_recovery(&mut radio).await;
+    let image_result = read_image_with_interrupt_recovery(&mut radio, &mut termination).await;
     let image = match image_result {
         Ok(image) => image,
         Err(error) => {
@@ -493,37 +544,51 @@ async fn main() -> BackupResult<()> {
         return Err(with_close_result(error, close_radio(&mut radio).await));
     }
 
-    disconnect_radio(radio).await?;
-
-    validate_usb_port(&config.port)?;
-    let mut post_transport = SerialTransport::open(&config.port, CAT_BAUD)?;
-    let mut post_codec = Codec::new();
-    let post_result = read_raw_identity(&mut post_transport, &mut post_codec).await;
-    let post_close = close_transport(&mut post_transport).await;
-    let post_identity = match post_result {
-        Ok(identity) => {
-            post_close?;
-            identity
+    let postflight: BackupResult<PublishedOutput> = tokio::select! {
+        biased;
+        signal = termination.recv() => {
+            signal?;
+            Err(invalid_input(
+                "termination signal received after MCP cleanup; backup was not published",
+            ))
         }
-        Err(error) => return Err(with_close_result(error, post_close)),
+        result = async {
+            disconnect_radio(radio).await?;
+
+            validate_usb_port(&config.port)?;
+            let mut post_transport = SerialTransport::open(&config.port, CAT_BAUD)?;
+            let mut post_codec = Codec::new();
+            let post_result = run_preflight(&mut post_transport, &mut post_codec).await;
+            let post_close = close_transport(&mut post_transport).await;
+            let (post_identity, post_cat_safety) = match post_result {
+                Ok(preflight) => {
+                    post_close?;
+                    preflight
+                }
+                Err(error) => return Err(with_close_result(error, post_close)),
+            };
+
+            validate_expected_identity(&post_identity)?;
+            validate_cat_safety_subset(&post_cat_safety, config.machine_checked_read_only)?;
+            if post_identity != identity || post_cat_safety != cat_safety {
+                return Err(invalid_input(
+                    "post-operation raw identity or CAT safety bytes differ from preflight; backup \
+                     bytes were not written",
+                ));
+            }
+
+            staged_output.publish(&image)
+        } => result,
     };
 
-    validate_expected_identity(&post_identity)?;
-    if post_identity != identity {
-        return Err(invalid_input(
-            "post-operation raw ID/FV/TY bytes differ from the preflight identity; backup bytes \
-             were not written",
-        ));
-    }
-
-    let published = staged_output.publish(&image)?;
+    let published = postflight?;
     println!(
         "Saved an exact {}-byte MCP image to {} (SHA-256 {}).",
         image.len(),
         published.path.display(),
         published.sha256
     );
-    println!("Independent post-operation CAT identity matched the preflight.");
+    println!("Independent post-operation identity and CAT safety bytes matched the preflight.");
     Ok(())
 }
 
@@ -537,15 +602,26 @@ where
 {
     let mut port = None;
     let mut output = None;
+    let mut machine_checked_read_only = false;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
-        let value = args
-            .next()
-            .ok_or_else(|| invalid_input(format!("missing value for {flag}")))?;
         match flag.as_str() {
-            "--port" if port.is_none() => port = Some(value),
-            "--output" if output.is_none() => output = Some(PathBuf::from(value)),
-            "--port" | "--output" => {
+            "--machine-checked-read-only" if !machine_checked_read_only => {
+                machine_checked_read_only = true;
+            }
+            "--port" if port.is_none() => {
+                port = Some(
+                    args.next()
+                        .ok_or_else(|| invalid_input(format!("missing value for {flag}")))?,
+                );
+            }
+            "--output" if output.is_none() => {
+                output =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        invalid_input(format!("missing value for {flag}"))
+                    })?));
+            }
+            "--machine-checked-read-only" | "--port" | "--output" => {
                 return Err(invalid_input(format!("duplicate argument: {flag}")));
             }
             _ => return Err(invalid_input(format!("unknown argument: {flag}"))),
@@ -554,11 +630,16 @@ where
 
     let port = port.ok_or_else(|| invalid_input(usage()))?;
     let output = output.ok_or_else(|| invalid_input(usage()))?;
-    Ok(Config { port, output })
+    Ok(Config {
+        port,
+        output,
+        machine_checked_read_only,
+    })
 }
 
 const fn usage() -> &'static str {
-    "usage: config_backup --port /dev/cu.usbmodemNNN --output /absolute/private/backup.bin"
+    "usage: config_backup --port /dev/cu.usbmodemNNN --output /absolute/private/backup.bin \
+     [--machine-checked-read-only]"
 }
 
 fn validate_usb_port(port: &str) -> BackupResult<()> {
@@ -1122,11 +1203,23 @@ fn validate_expected_identity(identity: &RawIdentity) -> BackupResult<()> {
     }
 }
 
-fn validate_cat_safety_subset(cat_safety: &CatSafetySubset) -> BackupResult<()> {
+fn validate_cat_safety_subset(
+    cat_safety: &CatSafetySubset,
+    machine_checked_read_only: bool,
+) -> BackupResult<()> {
     let tnc_off = cat_safety.tnc == b"TN 0,0" || cat_safety.tnc == b"TN 0,1";
+    let beacon_method_known = matches!(
+        cat_safety.beacon.as_slice(),
+        b"PT 0" | b"PT 1" | b"PT 2" | b"PT 3"
+    );
+    let beacon_safe = if machine_checked_read_only {
+        beacon_method_known
+    } else {
+        cat_safety.beacon == b"PT 0"
+    };
     if cat_safety.auto_info == b"AI 0"
         && tnc_off
-        && cat_safety.beacon == b"PT 0"
+        && beacon_safe
         && cat_safety.vox == b"VX 0"
         && cat_safety.io_port == b"IO 0"
     {
@@ -1146,8 +1239,8 @@ fn validate_cat_safety_subset(cat_safety: &CatSafetySubset) -> BackupResult<()> 
 
 async fn read_image_with_interrupt_recovery<T: Transport>(
     radio: &mut Radio<T>,
+    termination: &mut TerminationListener,
 ) -> BackupResult<Vec<u8>> {
-    let mut termination = TerminationListener::install()?;
     let interrupt_result = {
         let read = radio.read_memory_image_with_progress(|page, total| {
             if page % 100 == 0 || page == total.saturating_sub(1) {
@@ -1369,10 +1462,41 @@ mod tests {
             Config {
                 port: "/dev/cu.usbmodem101".to_owned(),
                 output: PathBuf::from("/private/backup.bin"),
+                machine_checked_read_only: false,
             }
         );
         assert!(parse_args_from(Vec::<String>::new()).is_err());
         assert!(parse_args_from(["--port", "/dev/cu.usbmodem101"].map(str::to_owned)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn machine_checked_read_only_mode_is_explicit_and_order_independent() -> TestResult {
+        let parsed = parse_args_from(
+            [
+                "--machine-checked-read-only",
+                "--output",
+                "/private/backup.bin",
+                "--port",
+                "/dev/cu.usbmodem101",
+            ]
+            .map(str::to_owned),
+        )?;
+        assert!(parsed.machine_checked_read_only);
+        assert!(
+            parse_args_from(
+                [
+                    "--machine-checked-read-only",
+                    "--machine-checked-read-only",
+                    "--port",
+                    "/dev/cu.usbmodem101",
+                    "--output",
+                    "/private/backup.bin",
+                ]
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -1406,13 +1530,20 @@ mod tests {
             vox: b"VX 0".to_vec(),
             io_port: b"IO 0".to_vec(),
         };
-        assert!(validate_cat_safety_subset(&cat_safety).is_ok());
+        assert!(validate_cat_safety_subset(&cat_safety, false).is_ok());
+
+        let automatic_beacon_with_tnc_off = CatSafetySubset {
+            beacon: b"PT 2".to_vec(),
+            ..cat_safety.clone()
+        };
+        assert!(validate_cat_safety_subset(&automatic_beacon_with_tnc_off, true).is_ok());
+        assert!(validate_cat_safety_subset(&automatic_beacon_with_tnc_off, false).is_err());
 
         let rejected_cat_safety = CatSafetySubset {
-            beacon: b"PT 2".to_vec(),
+            tnc: b"TN 2,0".to_vec(),
             ..cat_safety
         };
-        assert!(validate_cat_safety_subset(&rejected_cat_safety).is_err());
+        assert!(validate_cat_safety_subset(&rejected_cat_safety, true).is_err());
     }
 
     #[test]

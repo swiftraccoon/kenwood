@@ -75,6 +75,15 @@ impl Codec {
         }
     }
 
+    /// Reports whether no partial or complete frame is buffered.
+    ///
+    /// Strict exchanges use this to refuse an attestation when bytes from an
+    /// earlier command could be mistaken for the response being proved.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
     /// Extracts the next complete frame from the buffer, if available.
     ///
     /// Searches for a `\r` delimiter, extracts everything before it as a

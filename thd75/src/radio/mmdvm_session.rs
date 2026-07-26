@@ -67,6 +67,7 @@ struct RadioState {
     mode_a: Option<super::RadioMode>,
     mode_b: Option<super::RadioMode>,
     mcp_speed: super::programming::McpSpeed,
+    gm_poisoned: bool,
     link_state_tx: tokio::sync::watch::Sender<super::LinkState>,
     auto_info_enabled: bool,
     gps_config: Option<(bool, bool)>,
@@ -103,12 +104,29 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
     /// enabling DV Gateway / Reflector Terminal Mode via MCP write to
     /// offset `0x1CA0`). The transport is assumed to already speak
     /// MMDVM binary framing.
-    #[must_use]
-    pub fn into_mmdvm_session(self) -> MmdvmSession<T> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the original radio and [`Error::MemoryReadStreamPoisoned`] if
+    /// an incomplete GM exchange requires a reconnect, or
+    /// [`Error::McpInterrupted`] if an MCP session is not fully recovered.
+    #[expect(
+        clippy::result_large_err,
+        reason = "The ownership-preserving error matches enter_mmdvm: callers need the original \
+                  Radio to reconnect or recover MCP without losing the selected transport"
+    )]
+    pub fn into_mmdvm_session(self) -> Result<MmdvmSession<T>, (Self, Error)> {
+        if let Err(error) = self.require_unpoisoned_gm_stream() {
+            return Err((self, error));
+        }
+        if self.mcp_phase != super::McpPhase::Inactive {
+            return Err((self, Error::McpInterrupted));
+        }
+
         tracing::info!("wrapping transport as MMDVM session (radio already in gateway mode)");
         let adapter = MmdvmTransportAdapter::new(self.transport);
         let modem = AsyncModem::spawn(adapter);
-        MmdvmSession {
+        Ok(MmdvmSession {
             modem,
             radio_state: RadioState {
                 codec: self.codec,
@@ -117,12 +135,13 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
                 mode_a: self.mode_a,
                 mode_b: self.mode_b,
                 mcp_speed: self.mcp_speed,
+                gm_poisoned: self.gm_poisoned,
                 link_state_tx: self.link_state_tx,
                 auto_info_enabled: self.auto_info_enabled,
                 gps_config: self.gps_config,
                 gps_sentences: self.gps_sentences,
             },
-        }
+        })
     }
 
     /// Enter MMDVM mode, consuming this [`Radio`] and returning an [`MmdvmSession`].
@@ -160,7 +179,7 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
             }
         }
 
-        Ok(self.into_mmdvm_session())
+        self.into_mmdvm_session()
     }
 }
 
@@ -263,6 +282,7 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
             // MMDVM binary traffic may have left residue on the line,
             // so drain before the first CAT command.
             desynced: true,
+            gm_poisoned: self.state.gm_poisoned,
             mcp_phase: super::McpPhase::Inactive,
             mcp_saved_timeout: None,
             mcp_pending_exit_error: None,
@@ -354,5 +374,31 @@ mod tests {
                 Ok(())
             })
             .await
+    }
+
+    #[tokio::test]
+    async fn direct_mmdvm_conversion_rejects_a_poisoned_gm_stream() -> TestResult {
+        let mut radio = Radio::connect(MockTransport::new()).await?;
+        radio.gm_poisoned = true;
+
+        let Err((radio, error)) = radio.into_mmdvm_session() else {
+            return Err("poisoned radio unexpectedly entered MMDVM mode".into());
+        };
+        assert!(matches!(error, Error::MemoryReadStreamPoisoned));
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_mmdvm_conversion_rejects_active_mcp() -> TestResult {
+        let mut radio = Radio::connect(MockTransport::new()).await?;
+        radio.mcp_phase = super::super::McpPhase::Active;
+
+        let Err((radio, error)) = radio.into_mmdvm_session() else {
+            return Err("MCP-active radio unexpectedly entered MMDVM mode".into());
+        };
+        assert!(matches!(error, Error::McpInterrupted));
+        radio.transport.assert_complete();
+        Ok(())
     }
 }

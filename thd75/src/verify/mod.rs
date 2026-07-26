@@ -16,13 +16,13 @@
 use std::collections::BTreeMap;
 
 use crate::error::ValidationError;
-use crate::types::DdrOffset;
+use crate::types::MemoryReadOffset;
 
 /// A single byte that differed between two snapshots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteChange {
     /// Offset of the byte that changed.
-    pub offset: DdrOffset,
+    pub offset: MemoryReadOffset,
     /// Value in the earlier snapshot.
     pub before: u8,
     /// Value in the later snapshot.
@@ -57,19 +57,19 @@ pub enum VerifyError {
 /// Byte windows captured from the radio at one point in time.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StateSnapshot {
-    windows: Vec<(DdrOffset, Vec<u8>)>,
+    windows: Vec<(MemoryReadOffset, Vec<u8>)>,
 }
 
 impl StateSnapshot {
     /// Builds a snapshot from windows a caller already read.
     #[must_use]
-    pub const fn from_windows(windows: Vec<(DdrOffset, Vec<u8>)>) -> Self {
+    pub const fn from_windows(windows: Vec<(MemoryReadOffset, Vec<u8>)>) -> Self {
         Self { windows }
     }
 
     /// Returns the captured windows.
     #[must_use]
-    pub fn windows(&self) -> &[(DdrOffset, Vec<u8>)] {
+    pub fn windows(&self) -> &[(MemoryReadOffset, Vec<u8>)] {
         &self.windows
     }
 
@@ -123,7 +123,7 @@ impl StateSnapshot {
                     }
                 })?;
                 changes.push(ByteChange {
-                    offset: DdrOffset::new(raw)?,
+                    offset: MemoryReadOffset::new(raw)?,
                     before: *before,
                     after: *after,
                 });
@@ -141,13 +141,13 @@ impl StateSnapshot {
 /// only and this crate keeps its runtime dependencies minimal.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeOffsetMap {
-    entries: BTreeMap<String, Vec<DdrOffset>>,
+    entries: BTreeMap<String, Vec<MemoryReadOffset>>,
 }
 
 impl RuntimeOffsetMap {
     /// Records the offsets a field was observed to occupy, replacing any
     /// previous record for that field.
-    pub fn record(&mut self, field: &str, offsets: &[DdrOffset]) {
+    pub fn record(&mut self, field: &str, offsets: &[MemoryReadOffset]) {
         // Replacing an existing record is intentional and the displaced value
         // is not needed. Bound explicitly because `unused_results` is denied.
         let _previous = self.entries.insert(field.to_owned(), offsets.to_vec());
@@ -155,7 +155,7 @@ impl RuntimeOffsetMap {
 
     /// Returns the offsets recorded for a field, if any.
     #[must_use]
-    pub fn get(&self, field: &str) -> Option<&[DdrOffset]> {
+    pub fn get(&self, field: &str) -> Option<&[MemoryReadOffset]> {
         self.entries.get(field).map(Vec::as_slice)
     }
 
@@ -217,7 +217,7 @@ impl RuntimeOffsetMap {
                         detail: format!("offset {token:?}: {e}"),
                     }
                 })?;
-                offsets.push(DdrOffset::new(raw)?);
+                offsets.push(MemoryReadOffset::new(raw)?);
             }
             map.record(field, &offsets);
         }
@@ -228,14 +228,14 @@ impl RuntimeOffsetMap {
 #[cfg(test)]
 mod tests {
     use super::{RuntimeOffsetMap, StateSnapshot};
-    use crate::types::DdrOffset;
+    use crate::types::MemoryReadOffset;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;
 
     fn snap(offset: u32, bytes: &[u8]) -> Result<StateSnapshot, BoxErr> {
         Ok(StateSnapshot::from_windows(vec![(
-            DdrOffset::new(offset)?,
+            MemoryReadOffset::new(offset)?,
             bytes.to_vec(),
         )]))
     }
@@ -299,8 +299,8 @@ mod tests {
     #[test]
     fn diff_rejects_differing_window_count() -> TestResult {
         let before = StateSnapshot::from_windows(vec![
-            (DdrOffset::new(0x10)?, vec![0]),
-            (DdrOffset::new(0x20)?, vec![0]),
+            (MemoryReadOffset::new(0x10)?, vec![0]),
+            (MemoryReadOffset::new(0x20)?, vec![0]),
         ]);
         let after = snap(0x10, &[0])?;
         let result = before.diff(&after);
@@ -314,10 +314,13 @@ mod tests {
     #[test]
     fn offset_map_round_trips_through_text() -> TestResult {
         let mut map = RuntimeOffsetMap::default();
-        map.record("radio.BacklightControl", &[DdrOffset::new(0x12_3456)?]);
+        map.record(
+            "radio.BacklightControl",
+            &[MemoryReadOffset::new(0x12_3456)?],
+        );
         map.record(
             "radio.UsbFunction",
-            &[DdrOffset::new(0x10)?, DdrOffset::new(0x20)?],
+            &[MemoryReadOffset::new(0x10)?, MemoryReadOffset::new(0x20)?],
         );
 
         let text = map.to_text();

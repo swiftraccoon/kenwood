@@ -1155,20 +1155,58 @@ impl fmt::Display for GpsRadioMode {
 }
 
 // ---------------------------------------------------------------------------
-// Memory-read parameters (DdrOffset, ReadLen)
+// Memory-read parameters (MemoryReadTarget, MemoryReadOffset, ReadLen)
 // ---------------------------------------------------------------------------
 
-/// One past the highest byte address a memory-read request may touch.
+/// One past the highest offset expressible by the GM memory-read wire grammar.
 ///
 /// The radio rejects a request unless `offset + length - 1` is strictly less
 /// than this value. It is the addressable window implied by the six
 /// hexadecimal offset digits of the request grammar.
-pub const MEM_READ_BOUND: u32 = 0x0100_0000;
+pub const MEMORY_READ_WIRE_BOUND: u32 = 0x0100_0000;
+
+/// Qualified patched-firmware backend for the repurposed GM memory-read command.
+///
+/// The two V1.03 patches use the same wire grammar but add the transmitted
+/// offset to different CPU-visible bases. Selecting a target is therefore part
+/// of capability attestation, not an interpretation callers may change after a
+/// read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemoryReadTarget {
+    /// `normal-gm-ddr-read`: offsets address DDR at `0xC0000000`.
+    DdrV103,
+    /// `normal-gm-nor-read`: offsets address NOR at `0x60000000`.
+    ///
+    /// Only the low 2 MiB were hardware-qualified. The patched handler's wider
+    /// grammar does not authorize reads beyond that proven window.
+    LowNorV103,
+}
+
+impl MemoryReadTarget {
+    /// One past the last offset this exact target is qualified to read.
+    #[must_use]
+    pub const fn bound(self) -> u32 {
+        match self {
+            Self::DdrV103 => MEMORY_READ_WIRE_BOUND,
+            Self::LowNorV103 => 0x0020_0000,
+        }
+    }
+
+    /// Short stable name for logs and errors.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DdrV103 => "DDR V1.03",
+            Self::LowNorV103 => "low NOR V1.03",
+        }
+    }
+}
 
 /// An offset into the radio's readable memory window.
 ///
 /// This is an offset, not an absolute address. The base is fixed in the radio
-/// and is never transmitted, so callers must not assume any particular base.
+/// and is never transmitted. [`MemoryReadTarget`] qualification determines
+/// which base the installed firmware uses.
 ///
 /// Valid range is `0x000000..=0xFFFFFF`, the span expressible in the six
 /// hexadecimal digits of the request grammar.
@@ -1176,15 +1214,15 @@ pub const MEM_READ_BOUND: u32 = 0x0100_0000;
 /// Memory reads require firmware modified by the `thd75-fw` project. An
 /// unmodified radio does not support them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DdrOffset(u32);
+pub struct MemoryReadOffset(u32);
 
-impl DdrOffset {
+impl MemoryReadOffset {
     /// The lowest valid offset.
     pub const ZERO: Self = Self(0);
     /// The highest valid offset.
     pub const MAX: Self = Self(0x00FF_FFFF);
 
-    /// Creates a new `DdrOffset` from a raw value.
+    /// Creates a new `MemoryReadOffset` from a raw value.
     ///
     /// # Errors
     ///
@@ -1193,7 +1231,7 @@ impl DdrOffset {
     pub const fn new(value: u32) -> Result<Self, ValidationError> {
         if value > 0x00FF_FFFF {
             Err(ValidationError::MemoryParamOutOfRange {
-                name: "DDR offset",
+                name: "memory-read offset",
                 value,
                 detail: "must be 0-0xFFFFFF",
             })
@@ -1209,11 +1247,23 @@ impl DdrOffset {
     }
 }
 
-impl fmt::Display for DdrOffset {
+impl fmt::Display for MemoryReadOffset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:06X}", self.0)
     }
 }
+
+/// Backward-compatible name for [`MemoryReadOffset`].
+///
+/// New code should use the target-neutral name because the GM patch can expose
+/// either DDR or low NOR.
+pub type DdrOffset = MemoryReadOffset;
+
+/// Backward-compatible name for [`MEMORY_READ_WIRE_BOUND`].
+///
+/// This is only the wire grammar's ceiling. Use [`MemoryReadTarget::bound`] for
+/// a qualified live target; low-NOR V1.03 is deliberately limited to 2 MiB.
+pub const MEM_READ_BOUND: u32 = MEMORY_READ_WIRE_BOUND;
 
 /// The number of bytes to read in one memory-read request.
 ///
@@ -1281,22 +1331,22 @@ impl fmt::Display for ReadLen {
 
 #[cfg(test)]
 mod memread_param_tests {
-    use super::{DdrOffset, MEM_READ_BOUND, ReadLen};
+    use super::{MEMORY_READ_WIRE_BOUND, MemoryReadOffset, MemoryReadTarget, ReadLen};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
     fn offset_accepts_zero_and_max() -> TestResult {
-        assert_eq!(DdrOffset::new(0)?.as_u32(), 0);
-        assert_eq!(DdrOffset::new(0x00FF_FFFF)?.as_u32(), 0x00FF_FFFF);
-        assert_eq!(DdrOffset::MAX.as_u32(), 0x00FF_FFFF);
-        assert_eq!(DdrOffset::ZERO.as_u32(), 0);
+        assert_eq!(MemoryReadOffset::new(0)?.as_u32(), 0);
+        assert_eq!(MemoryReadOffset::new(0x00FF_FFFF)?.as_u32(), 0x00FF_FFFF);
+        assert_eq!(MemoryReadOffset::MAX.as_u32(), 0x00FF_FFFF);
+        assert_eq!(MemoryReadOffset::ZERO.as_u32(), 0);
         Ok(())
     }
 
     #[test]
     fn offset_rejects_above_24_bits() {
-        let result = DdrOffset::new(0x0100_0000);
+        let result = MemoryReadOffset::new(0x0100_0000);
         assert!(
             result.is_err(),
             "0x1000000 must be rejected, got {result:?}"
@@ -1305,8 +1355,8 @@ mod memread_param_tests {
 
     #[test]
     fn offset_displays_as_six_hex_digits() -> TestResult {
-        assert_eq!(format!("{}", DdrOffset::new(0x17_D1BC)?), "17D1BC");
-        assert_eq!(format!("{}", DdrOffset::ZERO), "000000");
+        assert_eq!(format!("{}", MemoryReadOffset::new(0x17_D1BC)?), "17D1BC");
+        assert_eq!(format!("{}", MemoryReadOffset::ZERO), "000000");
         Ok(())
     }
 
@@ -1331,7 +1381,13 @@ mod memread_param_tests {
 
     #[test]
     fn bound_is_one_past_max_offset() {
-        assert_eq!(MEM_READ_BOUND, DdrOffset::MAX.as_u32() + 1);
+        assert_eq!(MEMORY_READ_WIRE_BOUND, MemoryReadOffset::MAX.as_u32() + 1);
+    }
+
+    #[test]
+    fn memory_read_targets_have_distinct_qualified_bounds() {
+        assert_eq!(MemoryReadTarget::DdrV103.bound(), MEMORY_READ_WIRE_BOUND);
+        assert_eq!(MemoryReadTarget::LowNorV103.bound(), 0x0020_0000);
     }
 }
 

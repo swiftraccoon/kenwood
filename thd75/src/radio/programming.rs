@@ -1129,6 +1129,11 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if the entry command fails or the radio does
     /// not respond with the expected `0M\r` acknowledgement.
     async fn enter_programming_mode(&mut self) -> Result<(), Error> {
+        // An incomplete strict GM exchange may still have response bytes in
+        // flight. Reject before draining input, changing baud, mutating MCP
+        // state, or sending the programming-mode entry command.
+        self.require_unpoisoned_gm_stream()?;
+
         // A previous cancelled session must be recovered before any
         // further serial traffic. In particular, starting a fresh entry
         // must not erase the fact that its exit byte may already have
@@ -1942,6 +1947,22 @@ mod tests {
             write_slice(&mut data, start, bytes)?;
         }
         Ok(data)
+    }
+
+    #[tokio::test]
+    async fn mcp_entry_rejects_a_poisoned_gm_stream_before_io() -> TestResult {
+        let mut radio = Radio::connect(MockTransport::new()).await?;
+        radio.gm_poisoned = true;
+
+        let result = radio.read_memory_pages(0, 1).await;
+        assert!(matches!(result, Err(Error::MemoryReadStreamPoisoned)));
+        assert_eq!(
+            radio.mcp_phase,
+            McpPhase::Inactive,
+            "rejected MCP entry must not mutate programming state"
+        );
+        radio.transport.assert_complete();
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

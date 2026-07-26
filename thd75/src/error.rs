@@ -231,6 +231,38 @@ pub enum Error {
     /// `Radio::recover_from_interrupted_mcp` first.
     #[error("MCP session interrupted; radio may be in programming mode. Recover first")]
     McpInterrupted,
+
+    /// A GM memory read was requested before the installed patched target was
+    /// attested on this connection.
+    #[error(
+        "GM memory reads require a live MemoryReader; call \
+         Radio::qualify_mem_read_for with the expected patched target first"
+    )]
+    MemoryReadNotQualified,
+
+    /// A strict GM exchange failed or was cancelled after it may have put bytes
+    /// in flight. Only reopening the transport can exclude a delayed tail.
+    #[error(
+        "the GM memory-read stream is poisoned by an incomplete strict exchange; \
+         reconnect before sending any more commands"
+    )]
+    MemoryReadStreamPoisoned,
+
+    /// A GM read would leave the window qualified for the installed patch.
+    #[error(
+        "GM read 0x{offset:06X}+{length} exceeds the qualified {target} window \
+         with exclusive bound 0x{bound:06X}"
+    )]
+    MemoryReadOutOfRange {
+        /// Stable target name, such as `low NOR V1.03`.
+        target: &'static str,
+        /// Requested offset.
+        offset: u32,
+        /// Requested byte count.
+        length: u16,
+        /// One past the last qualified byte.
+        bound: u32,
+    },
 }
 
 /// Errors originating from the transport layer (serial port / Bluetooth).
@@ -525,11 +557,11 @@ pub enum ValidationError {
 
     /// A memory-read request parameter is outside the range the radio accepts.
     ///
-    /// Used by `DdrOffset` and `ReadLen`, whose valid ranges are wider than the
-    /// `u8` that [`ValidationError::SettingOutOfRange`] carries.
+    /// Used by `MemoryReadOffset` and `ReadLen`, whose valid ranges are wider
+    /// than the `u8` that [`ValidationError::SettingOutOfRange`] carries.
     #[error("{name} value {value:#X} out of range ({detail})")]
     MemoryParamOutOfRange {
-        /// The parameter name, e.g. "DDR offset", "read length".
+        /// The parameter name, e.g. "memory-read offset", "read length".
         name: &'static str,
         /// The invalid raw value.
         value: u32,

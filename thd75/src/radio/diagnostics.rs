@@ -34,6 +34,10 @@ const MMDVM_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// only after a CAT command has already failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkDiagnosis {
+    /// A strict GM memory-read exchange was interrupted or failed with bytes
+    /// potentially still in flight. No diagnostic probe was sent because only
+    /// a transport reconnect can establish a clean stream.
+    ReconnectRequired,
     /// The radio answered an MMDVM probe: it is in a DV Gateway mode
     /// (Reflector Terminal or Access Point) and speaks the MMDVM data
     /// protocol over this link, so CAT control is unavailable until
@@ -54,6 +58,12 @@ impl LinkDiagnosis {
     #[must_use]
     pub const fn guidance(self) -> &'static str {
         match self {
+            Self::ReconnectRequired => {
+                "\
+An incomplete GM memory-read exchange left the command stream untrusted.\n\
+\n\
+Reconnect the transport before sending any more commands."
+            }
             Self::MmdvmMode => {
                 "\
 The radio is in Reflector Terminal / DV Gateway Mode: it is speaking\n\
@@ -85,10 +95,15 @@ impl<T: Transport> Radio<T> {
     /// has already failed. It sends an MMDVM `GET_VERSION` frame and
     /// classifies the reply.
     ///
-    /// This never returns an error: a probe that cannot be written, or
-    /// that draws no reply, is itself diagnostic and yields
+    /// This never returns an error. A poisoned GM stream yields
+    /// [`LinkDiagnosis::ReconnectRequired`] without sending a probe. A probe
+    /// that cannot be written, or that draws no reply, yields
     /// [`LinkDiagnosis::Unresponsive`].
     pub async fn diagnose_link(&mut self) -> LinkDiagnosis {
+        if self.require_unpoisoned_gm_stream().is_err() {
+            tracing::warn!("refusing link probe on a poisoned GM stream");
+            return LinkDiagnosis::ReconnectRequired;
+        }
         tracing::info!("probing silent link for MMDVM mode");
         if self.transport.write(&MMDVM_GET_VERSION).await.is_err() {
             return LinkDiagnosis::Unresponsive;
@@ -140,6 +155,26 @@ mod tests {
         mock.expect(b"\xE0\x03\x00", b"");
         let mut radio = Radio::connect(mock).await?;
         assert_eq!(radio.diagnose_link().await, LinkDiagnosis::Unresponsive);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn diagnose_link_refuses_to_probe_a_poisoned_gm_stream() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(&MMDVM_GET_VERSION, b"\xE0\x0F\x00\x01MMDVM");
+        let mut radio = Radio::connect(mock).await?;
+        radio.gm_poisoned = true;
+
+        assert_eq!(
+            radio.diagnose_link().await,
+            LinkDiagnosis::ReconnectRequired
+        );
+
+        // The expected probe must still be queued, proving the poisoned call
+        // performed no transport I/O.
+        radio.gm_poisoned = false;
+        assert_eq!(radio.diagnose_link().await, LinkDiagnosis::MmdvmMode);
+        radio.transport.assert_complete();
         Ok(())
     }
 

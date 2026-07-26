@@ -1054,6 +1054,9 @@ async fn run_repl(
         Err(_) => {
             // CAT identification failed; probe the link to find out why.
             match radio.diagnose_link().await {
+                LinkDiagnosis::ReconnectRequired => {
+                    return Err(LinkDiagnosis::ReconnectRequired.guidance().into());
+                }
                 LinkDiagnosis::MmdvmMode if exit_terminal_mode => {
                     // CAT is offline on this link, so neither model nor
                     // firmware can be qualified before an offset-based MCP

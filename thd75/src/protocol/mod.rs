@@ -31,10 +31,10 @@ pub use codec::Codec;
 
 use crate::error::ProtocolError;
 use crate::types::{
-    AfGainLevel, Band, BeaconMode, CallsignSlot, ChannelMemory, DdrOffset, DetectOutputMode,
-    DstarSlot, DvGatewayMode, FilterMode, FilterWidthIndex, FineStep, GpsRadioMode, KeyLockType,
-    Mode, PowerLevel, ReadLen, SMeterReading, ScanResumeMethod, SquelchLevel, StepSize, TncBaud,
-    TncMode, VfoMemoryMode, VoxDelay, VoxGain,
+    AfGainLevel, Band, BeaconMode, CallsignSlot, ChannelMemory, DetectOutputMode, DstarSlot,
+    DvGatewayMode, FilterMode, FilterWidthIndex, FineStep, GpsRadioMode, KeyLockType,
+    MemoryReadOffset, Mode, PowerLevel, ReadLen, SMeterReading, ScanResumeMethod, SquelchLevel,
+    StepSize, TncBaud, TncMode, VfoMemoryMode, VoxDelay, VoxGain,
 };
 
 /// A CAT command to send to the radio.
@@ -822,7 +822,7 @@ pub enum Command {
     /// working on a modified one. See [`memread`] for the wire format.
     ReadMemory {
         /// Offset into the readable window. Not an absolute address.
-        offset: DdrOffset,
+        offset: MemoryReadOffset,
         /// Number of bytes to read, 1 to 256.
         len: ReadLen,
     },
@@ -1236,7 +1236,7 @@ pub enum Response {
     /// against the request detects a stale or mis-routed answer.
     MemoryData {
         /// Offset echoed back by the radio.
-        offset: DdrOffset,
+        offset: MemoryReadOffset,
         /// The decoded bytes.
         bytes: Vec<u8>,
     },

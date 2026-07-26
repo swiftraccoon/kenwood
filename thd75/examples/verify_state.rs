@@ -9,12 +9,12 @@
 //! # Modes
 //!
 //! ```text
-//! probe    <port>                     confirm the radio supports memory reads
-//! qualify  <port>                     full post-flash qualification
-//! dump     <port> <offset> <len>      read and hexdump a region
-//! discover <port> <offset> <len>      snapshot, wait, snapshot, report changes
-//! scan     <port> <offset> <len>      same, coalesced into runs, for large ranges
-//! hunt     <port> <offset> <len>      coarse sampling pass, to narrow a wide window
+//! probe    <target> <port>                     attest the patched target
+//! qualify  <target> <port>                     attest the patched target
+//! dump     <target> <port> <offset> <len>      read and hexdump a region
+//! discover ddr      <port> <offset> <len>      snapshot, wait, snapshot, report changes
+//! scan     ddr      <port> <offset> <len>      same, coalesced into runs
+//! hunt     ddr      <port> <offset> <len>      coarse sampling pass
 //! ```
 //!
 //! `hunt` exists because dense scanning does not scale: 16 MiB is 65,536
@@ -40,9 +40,9 @@
 //! checklist can easily record that backwards.
 //!
 //! ```text
-//! cargo run -p kenwood-thd75 --example verify_state -- qualify /dev/cu.usbmodemXXXX
-//! cargo run -p kenwood-thd75 --example verify_state -- probe /dev/cu.usbmodemXXXX
-//! cargo run -p kenwood-thd75 --example verify_state -- dump /dev/cu.usbmodemXXXX 17D1BC 40
+//! cargo run -p kenwood-thd75 --example verify_state -- qualify low-nor /dev/cu.usbmodemXXXX
+//! cargo run -p kenwood-thd75 --example verify_state -- qualify ddr /dev/cu.usbmodemXXXX
+//! cargo run -p kenwood-thd75 --example verify_state -- dump low-nor /dev/cu.usbmodemXXXX 0 40
 //! ```
 
 // Dependencies visible to every kenwood-thd75 example target but unused here.
@@ -62,12 +62,13 @@ use tokio_serial as _;
 use tracing as _;
 
 use std::io::{BufRead, Write};
+use std::path::Path;
 
-use kenwood_thd75::error::TransportError;
+use kenwood_thd75::Radio;
+use kenwood_thd75::radio::memory_read::MemoryReader;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::{DdrOffset, ReadLen};
+use kenwood_thd75::types::{MemoryReadOffset, MemoryReadTarget, ReadLen};
 use kenwood_thd75::verify::{ByteChange, RuntimeOffsetMap};
-use kenwood_thd75::{Error, Radio};
 
 type Failure = Box<dyn std::error::Error>;
 
@@ -77,15 +78,41 @@ const CAT_BAUD: u32 = 115_200;
 /// Bytes shown per hexdump line.
 const DUMP_WIDTH: usize = 16;
 
+#[derive(Debug, Clone, Copy)]
+enum Operation {
+    Qualify,
+    Dump {
+        offset: MemoryReadOffset,
+        raw_offset: u32,
+        len: u32,
+    },
+    Discover {
+        offset: MemoryReadOffset,
+        len: u32,
+        coalesced: bool,
+    },
+    Hunt {
+        offset: MemoryReadOffset,
+        len: u32,
+    },
+}
+
+#[derive(Debug)]
+struct Invocation {
+    target: MemoryReadTarget,
+    port: String,
+    operation: Operation,
+}
+
 fn usage() -> String {
     concat!(
         "usage:\n",
-        "  verify_state probe    <port>\n",
-        "  verify_state qualify  <port>\n",
-        "  verify_state dump     <port> <offset-hex> <len-dec>\n",
-        "  verify_state discover <port> <offset-hex> <len-dec>\n",
-        "  verify_state scan     <port> <offset-hex> <len-dec>\n",
-        "  verify_state hunt     <port> <offset-hex> <len-dec>\n",
+        "  verify_state probe    <ddr|low-nor> <port>\n",
+        "  verify_state qualify  <ddr|low-nor> <port>\n",
+        "  verify_state dump     <ddr|low-nor> <port> <offset-hex> <len-dec>\n",
+        "  verify_state discover ddr           <port> <offset-hex> <len-dec>\n",
+        "  verify_state scan     ddr           <port> <offset-hex> <len-dec>\n",
+        "  verify_state hunt     ddr           <port> <offset-hex> <len-dec>\n",
     )
     .to_owned()
 }
@@ -174,63 +201,116 @@ fn coalesce(changes: &[ByteChange]) -> Vec<(u32, u32)> {
     runs
 }
 
+fn parse_invocation(args: &[String]) -> Result<Invocation, Failure> {
+    let mode = args.first().ok_or_else(usage)?.as_str();
+    let target = match args.get(1).ok_or_else(usage)?.as_str() {
+        "ddr" => MemoryReadTarget::DdrV103,
+        "low-nor" => MemoryReadTarget::LowNorV103,
+        other => return Err(format!("unknown target {other:?}\n\n{}", usage()).into()),
+    };
+    let port = args.get(2).ok_or_else(usage)?.clone();
+    if target == MemoryReadTarget::LowNorV103 && matches!(mode, "discover" | "scan" | "hunt") {
+        return Err("discover, scan, and hunt describe mutable DDR; use target ddr".into());
+    }
+
+    let operation = match mode {
+        "probe" | "qualify" if args.len() == 3 => Operation::Qualify,
+        "dump" | "discover" | "scan" | "hunt" if args.len() == 5 => {
+            let raw_offset = u32::from_str_radix(args.get(3).ok_or_else(usage)?, 16)?;
+            let offset = MemoryReadOffset::new(raw_offset)?;
+            let len: u32 = args.get(4).ok_or_else(usage)?.parse()?;
+            let _chunks =
+                kenwood_thd75::protocol::memread::plan_read_for_target(target, offset, len)?;
+            match mode {
+                "dump" => Operation::Dump {
+                    offset,
+                    raw_offset,
+                    len,
+                },
+                "discover" => Operation::Discover {
+                    offset,
+                    len,
+                    coalesced: false,
+                },
+                "scan" => Operation::Discover {
+                    offset,
+                    len,
+                    coalesced: true,
+                },
+                "hunt" => Operation::Hunt { offset, len },
+                _ => return Err(usage().into()),
+            }
+        }
+        "probe" | "qualify" | "dump" | "discover" | "scan" | "hunt" => {
+            return Err(usage().into());
+        }
+        other => return Err(format!("unknown mode {other:?}\n\n{}", usage()).into()),
+    };
+
+    Ok(Invocation {
+        target,
+        port,
+        operation,
+    })
+}
+
+fn validate_usb_port(port: &str) -> Result<(), Failure> {
+    if !Path::new(port).is_absolute() || SerialTransport::is_bluetooth_port(port) {
+        return Err("the GM verifier requires an absolute USB CDC path, not Bluetooth".into());
+    }
+    let matches = SerialTransport::discover_usb()?
+        .into_iter()
+        .filter(|candidate| candidate.port_name == port)
+        .count();
+    if matches == 1 {
+        Ok(())
+    } else {
+        Err(
+            format!("the exact port must enumerate once as TH-D75 USB VID:PID 2166:9023: {port}")
+                .into(),
+        )
+    }
+}
+
 async fn run() -> Result<(), Failure> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mode = args.first().ok_or_else(usage)?.as_str();
-    let port = args.get(1).ok_or_else(usage)?;
+    let invocation = parse_invocation(&args)?;
+    validate_usb_port(&invocation.port)?;
 
-    let transport = SerialTransport::open(port, CAT_BAUD)?;
+    let transport = SerialTransport::open(&invocation.port, CAT_BAUD)?;
     let mut radio = Radio::connect(transport).await?;
 
-    // Every mode probes first. A read that is trusted without this is a read
-    // that might be answering with something else entirely.
-    println!("Probing memory-read capability ...");
-    radio.probe_mem_read().await?;
-    println!("  OK: the radio answered the known constant byte for byte.\n");
+    println!(
+        "Attesting {} memory-read target ...",
+        invocation.target.as_str()
+    );
+    let mut reader = radio.qualify_mem_read_for(invocation.target).await?;
+    println!("  PASS: exact V1.03 identity, patch, data, and bounds checks.\n");
 
-    if mode == "probe" {
-        return Ok(());
-    }
-
-    if mode == "qualify" {
-        // Run this first on a freshly modified radio. It escalates the read
-        // size and then checks the one condition whose polarity is inverted:
-        // a request past the accepted window must be REFUSED.
-        println!("Running full qualification (escalating reads, then bounds) ...");
-        radio.qualify_mem_read().await?;
-        println!(
-            "  PASS: reads matched at 1, 16 and 54 bytes; a maximum-length read \
-             returned 256 bytes; a read ending exactly at the bound succeeded; \
-             and a read past the bound was refused.\n\
-             \n\
-             The last two together are what prove the widened bound is real. \
-             Reads alone cannot distinguish a correct bound from an absent one."
-        );
-        return Ok(());
-    }
-
-    let offset_arg = args.get(2).ok_or_else(usage)?;
-    let len_arg = args.get(3).ok_or_else(usage)?;
-    let raw_offset = u32::from_str_radix(offset_arg, 16)?;
-    let offset = DdrOffset::new(raw_offset)?;
-    let len: u32 = len_arg.parse()?;
-
-    match mode {
-        "dump" => mode_dump(&mut radio, offset, raw_offset, len).await,
-        "discover" | "scan" => mode_discover(&mut radio, offset, len, mode == "scan").await,
-        "hunt" => mode_hunt(&mut radio, offset, len).await,
-        other => Err(format!("unknown mode {other:?}\n\n{}", usage()).into()),
+    match invocation.operation {
+        Operation::Qualify => Ok(()),
+        Operation::Dump {
+            offset,
+            raw_offset,
+            len,
+        } => mode_dump(&mut reader, offset, raw_offset, len).await,
+        Operation::Discover {
+            offset,
+            len,
+            coalesced,
+        } => mode_discover(&mut reader, offset, len, coalesced).await,
+        Operation::Hunt { offset, len } => mode_hunt(&mut reader, offset, len).await,
     }
 }
 
 /// Reads a region and hexdumps it.
 async fn mode_dump(
-    radio: &mut Radio<SerialTransport>,
-    offset: DdrOffset,
+    reader: &mut MemoryReader<'_, SerialTransport>,
+    offset: MemoryReadOffset,
     raw_offset: u32,
     len: u32,
 ) -> Result<(), Failure> {
-    let bytes = radio.read_memory_range(offset, len).await?;
+    let bytes = reader.read_memory_range(offset, len).await?;
     println!("{len} bytes at {offset}:");
     hexdump(raw_offset, &bytes);
     Ok(())
@@ -239,21 +319,17 @@ async fn mode_dump(
 /// Snapshots a window, waits for the operator to change something, snapshots
 /// again, and reports what moved.
 async fn mode_discover(
-    radio: &mut Radio<SerialTransport>,
-    offset: DdrOffset,
+    reader: &mut MemoryReader<'_, SerialTransport>,
+    offset: MemoryReadOffset,
     len: u32,
     coalesced: bool,
 ) -> Result<(), Failure> {
     let windows = [(offset, len)];
     println!("Capturing {len} bytes at {offset} ...");
-    let changes = radio
-        .discover_field(&windows, async |_| {
-            wait_for_operator(
-                "Change ONE setting now (radio keypad or another tool), then press Enter: ",
-            )
-            .map_err(|e| Error::Transport(TransportError::Read(e)))
-        })
-        .await?;
+    let before = reader.capture_snapshot(&windows).await?;
+    wait_for_operator("Change ONE setting on the radio, then press Enter: ")?;
+    let after = reader.capture_snapshot(&windows).await?;
+    let changes = before.diff(&after)?;
 
     if changes.is_empty() {
         println!(
@@ -284,7 +360,7 @@ async fn mode_discover(
             );
         }
         let mut map = RuntimeOffsetMap::default();
-        let offsets: Vec<DdrOffset> = changes.iter().map(|c| c.offset).collect();
+        let offsets: Vec<MemoryReadOffset> = changes.iter().map(|c| c.offset).collect();
         map.record("discovered", &offsets);
         println!(
             "\nRecord this in a runtime offset map as:\n{}",
@@ -301,8 +377,8 @@ async fn mode_discover(
 /// and anything framebuffer-sized dirties tens of consecutive kilobytes, so it
 /// cannot hide between sample points. Something small can, which is the trade.
 async fn mode_hunt(
-    radio: &mut Radio<SerialTransport>,
-    offset: DdrOffset,
+    reader: &mut MemoryReader<'_, SerialTransport>,
+    offset: MemoryReadOffset,
     len: u32,
 ) -> Result<(), Failure> {
     const STRIDE: u32 = 4096;
@@ -314,11 +390,11 @@ async fn mode_hunt(
          {len} bytes from {offset}."
     );
 
-    let before = radio.sample_range(offset, len, STRIDE, sample).await?;
+    let before = reader.sample_range(offset, len, STRIDE, sample).await?;
     wait_for_operator(
         "Now change the DISPLAY substantially (switch menus, change band), then press Enter: ",
     )?;
-    let after = radio.sample_range(offset, len, STRIDE, sample).await?;
+    let after = reader.sample_range(offset, len, STRIDE, sample).await?;
 
     let changes = before.diff(&after)?;
     if changes.is_empty() {
@@ -342,9 +418,59 @@ async fn mode_hunt(
     println!(
         "\nA run spanning roughly 129,600 bytes is the size of a 240 by 180 24-bit \
          frame. Scan the most promising run densely to confirm:\n  \
-         verify_state scan <port> <run-start-hex> <run-length-dec>"
+         verify_state scan ddr <port> <run-start-hex> <run-length-dec>"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MemoryReadTarget, Operation, parse_invocation};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn complete_invocation_is_parsed_before_hardware_access() -> TestResult {
+        let qualify = parse_invocation(&arguments(&["qualify", "low-nor", "/dev/cu.usbmodem101"]))?;
+        assert_eq!(qualify.target, MemoryReadTarget::LowNorV103);
+        assert!(matches!(qualify.operation, Operation::Qualify));
+
+        let dump = parse_invocation(&arguments(&[
+            "dump",
+            "low-nor",
+            "/dev/cu.usbmodem101",
+            "1FFFFF",
+            "1",
+        ]))?;
+        assert!(matches!(
+            dump.operation,
+            Operation::Dump {
+                raw_offset: 0x1F_FFFF,
+                len: 1,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_operation_fails_during_parse() {
+        for invalid in [
+            arguments(&["unknown", "low-nor", "/dev/cu.usbmodem101"]),
+            arguments(&["dump", "low-nor", "/dev/cu.usbmodem101"]),
+            arguments(&["discover", "low-nor", "/dev/cu.usbmodem101", "0", "16"]),
+            arguments(&["dump", "low-nor", "/dev/cu.usbmodem101", "200000", "1"]),
+        ] {
+            assert!(
+                parse_invocation(&invalid).is_err(),
+                "invalid invocation reached the hardware phase: {invalid:?}"
+            );
+        }
+    }
 }
 
 #[tokio::main]

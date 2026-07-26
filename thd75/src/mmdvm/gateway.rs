@@ -341,7 +341,9 @@ impl<T: Transport + Unpin + 'static> DStarGateway<T> {
         radio: Radio<T>,
         config: DStarGatewayConfig,
     ) -> Result<Self, Error> {
-        let session = radio.into_mmdvm_session();
+        let session = radio
+            .into_mmdvm_session()
+            .map_err(|(_radio, error)| error)?;
         Self::build_from_session(session, config)
             .await
             .map_err(|(_restore, _modem, err)| err)

@@ -138,6 +138,11 @@ pub struct Radio<T: Transport> {
     /// in flight and must be drained before the next command, or a
     /// retry with the same mnemonic would consume the stale answer.
     desynced: bool,
+    /// A strict GM exchange failed or was cancelled with bytes potentially in
+    /// flight. Unlike an ordinary timeout, this cannot be cleared by a short
+    /// stale-input drain; only a fresh transport or a completed strict
+    /// exchange can make the stream trustworthy again.
+    pub(crate) gm_poisoned: bool,
     /// MCP safety phase. Any phase other than `Inactive` blocks CAT; the
     /// `ExitSent` phase additionally prevents recovery from sending a second
     /// raw exit byte after cancellation.
@@ -175,6 +180,7 @@ impl<T: Transport> std::fmt::Debug for Radio<T> {
             .field("mode_b", &self.mode_b)
             .field("mcp_speed", &self.mcp_speed)
             .field("last_cmd_time", &self.last_cmd_time)
+            .field("gm_poisoned", &self.gm_poisoned)
             .finish_non_exhaustive()
     }
 }
@@ -205,6 +211,7 @@ impl<T: Transport> Radio<T> {
             mcp_speed: programming::McpSpeed::default(),
             last_cmd_time: None,
             desynced: false,
+            gm_poisoned: false,
             mcp_phase: McpPhase::Inactive,
             mcp_saved_timeout: None,
             mcp_pending_exit_error: None,
@@ -388,6 +395,15 @@ impl<T: Transport> Radio<T> {
         //    the radio in PROG MCP mode (binary protocol, CAT dead).
         if self.mcp_phase != McpPhase::Inactive {
             return Err(Error::McpInterrupted);
+        }
+
+        self.require_unpoisoned_gm_stream()?;
+
+        // The repurposed GM command is available only through the borrowed
+        // reader returned by `qualify_mem_read_for`. A raw command has no proof
+        // token and must never reach the wire.
+        if matches!(cmd, Command::ReadMemory { .. }) {
+            return Err(Error::MemoryReadNotQualified);
         }
 
         // 0.5. Warn if the command is likely to fail in the current mode.
@@ -687,8 +703,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] if the write fails.
+    /// Returns [`Error::MemoryReadStreamPoisoned`] after an incomplete strict
+    /// GM exchange, or [`Error::Transport`] if the write fails.
     pub async fn transport_write(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.require_unpoisoned_gm_stream()?;
         self.transport.write(data).await.map_err(Error::Transport)
     }
 
@@ -698,9 +716,21 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] if the read fails.
+    /// Returns [`Error::MemoryReadStreamPoisoned`] after an incomplete strict
+    /// GM exchange, or [`Error::Transport`] if the read fails.
     pub async fn transport_read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        self.require_unpoisoned_gm_stream()?;
         self.transport.read(buf).await.map_err(Error::Transport)
+    }
+
+    /// Refuse every non-reconnect I/O path after an incomplete strict GM
+    /// exchange.
+    pub(crate) const fn require_unpoisoned_gm_stream(&self) -> Result<(), Error> {
+        if self.gm_poisoned {
+            Err(Error::MemoryReadStreamPoisoned)
+        } else {
+            Ok(())
+        }
     }
 
     /// Close the underlying transport without consuming the `Radio`.
@@ -753,6 +783,16 @@ impl<T: Transport> Radio<T> {
     /// proved, before any optional AI/GPS state is re-applied.
     async fn reopen_and_identify(&mut self) -> Result<(), Error> {
         tracing::info!("reconnecting radio link");
+        if self.mcp_phase != McpPhase::Inactive {
+            return Err(Error::McpInterrupted);
+        }
+        // Keep the public stream poisoned across every await. The private
+        // identity command below is the only operation allowed to bypass this
+        // gate. Cancellation therefore cannot expose an in-flight ID reply to
+        // a later public command.
+        self.gm_poisoned = true;
+        self.desynced = true;
+        let _ = self.link_state_tx.send_replace(LinkState::Down);
         if let Err(e) = self.close_transport().await {
             tracing::debug!(error = %e, "close before reopen failed (link already dead)");
         }
@@ -762,7 +802,12 @@ impl<T: Transport> Radio<T> {
         self.codec.clear();
         self.desynced = false;
         self.last_cmd_time = None;
-        let _identified = self.identify().await?;
+
+        self.prove_reopened_thd75_identity().await?;
+
+        // No await may appear between proof and clearing the poison.
+        self.desynced = false;
+        self.gm_poisoned = false;
         Ok(())
     }
 
@@ -1030,6 +1075,105 @@ mod tests {
             matches!(result, Err(Error::Transport(_))),
             "EOF mid-command must surface as a transport error: {result:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_reconnect_identity_keeps_gm_stream_poisoned() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect_reopen(Ok(()));
+        mock.expect_hang(b"ID\r");
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        let mut radio = Radio::connect(mock).await?;
+        radio.gm_poisoned = true;
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(1), radio.reconnect()).await;
+        assert!(cancelled.is_err(), "outer cancellation should win");
+        assert!(
+            radio.gm_poisoned,
+            "cancelled reconnect proof must preserve the hard poison"
+        );
+        assert!(matches!(
+            radio.identify().await,
+            Err(Error::MemoryReadStreamPoisoned)
+        ));
+        assert!(matches!(
+            radio.transport_write(b"ID\r").await,
+            Err(Error::MemoryReadStreamPoisoned)
+        ));
+
+        radio.reconnect().await?;
+        assert!(
+            !radio.gm_poisoned,
+            "a fresh transport plus exact identity must clear the poison"
+        );
+        assert_eq!(radio.identify().await?.model, "TH-D75");
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_rejects_the_wrong_radio_and_keeps_gm_poisoned() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID OTHER\r");
+        let mut radio = Radio::connect(mock).await?;
+
+        let result = radio.reconnect().await;
+        assert!(matches!(result, Err(Error::Protocol(_))));
+        assert!(
+            radio.gm_poisoned,
+            "wrong reconnect identity must retain the hard poison"
+        );
+        assert!(matches!(
+            radio.identify().await,
+            Err(Error::MemoryReadStreamPoisoned)
+        ));
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_rejects_trailing_identity_bytes_and_keeps_gm_poisoned() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\rFV 1.03\r");
+        let mut radio = Radio::connect(mock).await?;
+
+        let result = radio.reconnect().await;
+        assert!(matches!(result, Err(Error::Protocol(_))));
+        assert!(
+            radio.gm_poisoned,
+            "a non-isolated identity frame must retain the hard poison"
+        );
+        assert!(matches!(
+            radio.identify().await,
+            Err(Error::MemoryReadStreamPoisoned)
+        ));
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_refuses_unresolved_mcp_before_transport_io() -> TestResult {
+        for phase in [McpPhase::Active, McpPhase::ExitSent] {
+            let mut radio = Radio::connect(MockTransport::new()).await?;
+            radio.mcp_phase = phase;
+
+            let result = radio.reconnect().await;
+            assert!(
+                matches!(result, Err(Error::McpInterrupted)),
+                "phase {phase:?} should reject reconnect: {result:?}"
+            );
+            assert_eq!(radio.mcp_phase, phase);
+            assert!(
+                !radio.gm_poisoned,
+                "preflight rejection must not mutate the GM poison"
+            );
+            radio.transport.assert_complete();
+        }
         Ok(())
     }
 
