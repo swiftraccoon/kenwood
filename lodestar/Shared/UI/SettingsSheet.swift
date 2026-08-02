@@ -52,9 +52,11 @@ struct SettingsSheet: View {
                 }
                 Section {
                     Button {
-                        Task { await directory.refresh(callsign: reflector.callsign) }
+                        Task {
+                            await directory.refreshDPlusDirectory(callsign: reflector.callsign)
+                        }
                     } label: {
-                        Label("Refresh reflector directory", systemImage: "arrow.clockwise")
+                        Label("Refresh DPlus directory", systemImage: "arrow.clockwise")
                     }
                     .disabled(directory.isRefreshing)
                 } header: {

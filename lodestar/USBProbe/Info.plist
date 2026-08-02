@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Lodestar</string>
+	<string>USB Probe</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -20,15 +20,19 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<key>LSApplicationCategoryType</key>
-	<string>public.app-category.utilities</string>
-	<key>LSMinimumSystemVersion</key>
-	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Lodestar uses Bluetooth to connect to your Kenwood TH-D75 transceiver and exchange CAT commands.</string>
-	<key>NSBluetoothPeripheralUsageDescription</key>
-	<string>Lodestar uses Bluetooth to connect to your Kenwood TH-D75 transceiver and exchange CAT commands.</string>
-	<key>NSPrincipalClass</key>
-	<string>NSApplication</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>USB Probe reads audio-input capabilities (including USB audio devices such as the Kenwood TH-D75) to report what iOS exposes.</string>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
 </dict>
 </plist>

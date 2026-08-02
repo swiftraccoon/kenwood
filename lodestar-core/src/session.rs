@@ -20,7 +20,7 @@ use std::sync::Arc;
 use dstar_gateway::auth::AuthClient;
 use dstar_gateway::tokio_shell::AsyncSession;
 use dstar_gateway_core::codec::dplus::HostList;
-use dstar_gateway_core::header::{DStarHeader, ENCODED_LEN as HEADER_ENCODED_LEN};
+use dstar_gateway_core::header::{DstarHeader, ENCODED_LEN as HEADER_ENCODED_LEN};
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{
     ClientStateKind, Connected, Connecting, DExtra, DPlus, Dcs, DisconnectReason, Event, Session,
@@ -83,7 +83,7 @@ impl ReflectorSession {
     ///
     /// `my_call` / `my_suffix` / flags pass through unchanged; they
     /// identify the operator and their tail (`/D75`, `/M`, etc.).
-    fn build_reflector_header(&self, radio: &DStarHeader) -> DStarHeader {
+    fn build_reflector_header(&self, radio: &DstarHeader) -> DstarHeader {
         let mut rpt1_buf = [b' '; 8];
         let cs_bytes = self.station_callsign.as_bytes();
         rpt1_buf[..7].copy_from_slice(&cs_bytes[..7]);
@@ -100,7 +100,7 @@ impl ReflectorSession {
         // string, but const construction needs a wire-byte literal.
         let ur_call = Callsign::from_wire_bytes(*b"CQCQCQ  ");
 
-        DStarHeader {
+        DstarHeader {
             flag1: radio.flag1,
             flag2: radio.flag2,
             flag3: radio.flag3,
@@ -124,7 +124,7 @@ struct Backend {
 #[derive(Debug)]
 enum TxCommand {
     Header {
-        header: Box<DStarHeader>,
+        header: Box<DstarHeader>,
         stream_id: StreamId,
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -179,7 +179,7 @@ pub fn decode_radio_header(bytes: Vec<u8>) -> Option<DecodedRadioHeader> {
     }
     let mut arr = [0u8; HEADER_ENCODED_LEN];
     arr.copy_from_slice(&bytes);
-    let h = DStarHeader::decode(&arr);
+    let h = DstarHeader::decode(&arr);
     Some(DecodedRadioHeader {
         mycall: h.my_call.as_str().trim().to_owned(),
         suffix: h.my_suffix.as_str().trim().to_owned(),
@@ -265,7 +265,7 @@ pub enum ReflectorEvent {
         /// Gateway repeater callsign (RPT2).
         rpt2: String,
         /// Raw 41-byte on-wire D-STAR header. Ready to wrap as an
-        /// MMDVM `DStarHeader` frame (command 0x10) and send to the radio.
+        /// MMDVM D-STAR header frame (command 0x10) and send to the radio.
         header_bytes: Vec<u8>,
     },
     /// A voice frame arrived mid-stream.
@@ -275,7 +275,7 @@ pub enum ReflectorEvent {
         /// Sequence number within the stream.
         seq: u8,
         /// Raw 12-byte voice frame (9 bytes AMBE + 3 bytes slow-data).
-        /// Ready to wrap as an MMDVM `DStarData` frame (command 0x11)
+        /// Ready to wrap as an MMDVM D-STAR data frame (command 0x11)
         /// and send to the radio.
         voice_bytes: Vec<u8>,
     },
@@ -452,7 +452,7 @@ impl ReflectorSession {
         let sid = StreamId::new(stream_id).ok_or(ReflectorError::ZeroStreamId)?;
         let mut arr = [0u8; HEADER_ENCODED_LEN];
         arr.copy_from_slice(&header_bytes);
-        let radio_header = DStarHeader::decode(&arr);
+        let radio_header = DstarHeader::decode(&arr);
 
         // The TH-D75 in Reflector Terminal Mode emits its TX header
         // with rpt1/rpt2 both set to the literal `"DIRECT  "` (the
@@ -727,7 +727,7 @@ pub async fn fetch_dplus_directory(callsign: String) -> Result<Vec<Reflector>, R
 /// recently-heard entries.
 ///
 /// Outbound `slow_data` bytes are SCRAMBLED (wire format) because the
-/// radio emits them that way in MMDVM `DStarData` frames. The Kenwood
+/// radio emits them that way in MMDVM D-STAR data frames. The Kenwood
 /// D-STAR sync frame carries `[0x55, 0x55, 0x55]` plain, which lines
 /// up with the collector's `frame_index == 0` resync trigger, so we
 /// detect sync frames by matching the wire bytes directly rather

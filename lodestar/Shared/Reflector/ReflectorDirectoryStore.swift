@@ -7,11 +7,10 @@ import OSLog
 
 private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "directory")
 
-/// Owns the merged reflector directory: bundled hosts files, the
-/// cached results of previous fetches, and on-demand refreshes from
-/// the XLX registry + DPlus auth server. Merging and provenance
-/// precedence live in Rust (`mergeDirectories`); this store handles
-/// the platform pieces: HTTP, cache file, observability.
+/// Owns the merged reflector directory: bundled hosts files plus the
+/// cached results of on-demand DPlus auth-server refreshes. Merging and
+/// provenance precedence live in Rust (`mergeDirectories`); this store
+/// handles the platform pieces: cache file and observability.
 @Observable
 @MainActor
 public final class ReflectorDirectoryStore {
@@ -23,6 +22,7 @@ public final class ReflectorDirectoryStore {
     public var reflectors: [Reflector] { entries.map(\.reflector) }
 
     private let cacheUrl: URL?
+    private let bundledEntries: [DirectoryEntry]
 
     /// Cached row: mirrors `DirectoryEntry` with Codable types.
     private struct CachedEntry: Codable {
@@ -46,14 +46,21 @@ public final class ReflectorDirectoryStore {
         let bundled = defaultReflectors().map {
             DirectoryEntry(reflector: $0, source: .bundled)
         }
+        self.bundledEntries = bundled
         var merged = bundled
         var status = "\(bundled.count) reflectors · bundled list"
         if let cacheUrl,
            let data = try? Data(contentsOf: cacheUrl),
            let cache = try? JSONDecoder().decode(CacheFile.self, from: data) {
-            let cached = cache.entries.compactMap(Self.entry(from:))
-            merged = mergeDirectories(entries: bundled + cached)
-            status = "\(merged.count) reflectors · last fetched \(cache.fetchedAt.formatted(date: .abbreviated, time: .shortened))"
+            // Only DPlus-auth rows are accepted. Older releases wrote XLX
+            // registry rows to this same cache; ignoring every other source
+            // prevents those plaintext-derived addresses from influencing a
+            // connection after upgrade.
+            let cached = cache.entries.compactMap(Self.dPlusEntry(from:))
+            if !cached.isEmpty {
+                merged = mergeDirectories(entries: bundled + cached)
+                status = "\(merged.count) reflectors · last DPlus update \(cache.fetchedAt.formatted(date: .abbreviated, time: .shortened))"
+            }
         }
         self.entries = merged
         self.statusLine = status
@@ -71,57 +78,46 @@ public final class ReflectorDirectoryStore {
         return dir.appendingPathComponent("reflectors.json")
     }
 
-    /// Fetch the XLX registry (always) and the DPlus auth list (when a
-    /// callsign is available), then re-merge and cache.
-    public func refresh(callsign: String?) async {
+    /// Fetch the DPlus auth list, then re-merge and cache its REF rows.
+    public func refreshDPlusDirectory(callsign: String?) async {
         guard !isRefreshing else { return }
+        guard let callsign, !callsign.isEmpty else {
+            statusLine = "\(entries.count) reflectors · enter a callsign to refresh DPlus"
+            return
+        }
         isRefreshing = true
         defer { isRefreshing = false }
-        var problems: [String] = []
-
-        if let url = URL(string: xlxDirectoryUrl()) {
-            do {
-                let (data, _) = try await URLSession.shared.data(from: url)
-                let text = String(decoding: data, as: UTF8.self)
-                integrate(fetched: parseXlxText(text: text), source: .xlxRegistry)
-            } catch {
-                problems.append("XLX fetch failed")
-                log.error("XLX directory fetch failed: \(error)")
-            }
+        do {
+            let refs = try await fetchDplusDirectory(callsign: callsign)
+            integrateDPlus(fetched: refs)
+            statusLine = "\(entries.count) reflectors · DPlus updated \(Date.now.formatted(date: .abbreviated, time: .shortened))"
+        } catch {
+            statusLine = "\(entries.count) reflectors · DPlus auth list failed"
+            log.error("DPlus directory fetch failed: \(error)")
         }
-
-        if let callsign, !callsign.isEmpty {
-            do {
-                let refs = try await fetchDplusDirectory(callsign: callsign)
-                integrate(fetched: refs, source: .dPlusAuth)
-            } catch {
-                problems.append("DPlus auth list failed")
-                log.error("DPlus directory fetch failed: \(error)")
-            }
-        }
-
-        var status = "\(entries.count) reflectors · updated \(Date.now.formatted(date: .abbreviated, time: .shortened))"
-        if !problems.isEmpty {
-            status += " · \(problems.joined(separator: ", "))"
-        }
-        statusLine = status
     }
 
-    /// Merge freshly fetched rows into the directory and persist.
+    /// Replace the prior DPlus-auth snapshot with freshly fetched rows and
+    /// persist. Rows absent from a later response must not linger.
     /// Internal so tests can drive it without network.
-    func integrate(fetched: [Reflector], source: DirectorySource) {
-        guard !fetched.isEmpty else { return }
-        let tagged = fetched.map { DirectoryEntry(reflector: $0, source: source) }
-        entries = mergeDirectories(entries: entries + tagged)
+    func integrateDPlus(fetched: [Reflector]) {
+        let tagged = fetched
+            .filter { $0.protocol == .dPlus }
+            .map { DirectoryEntry(reflector: $0, source: .dPlusAuth) }
+        // Always merge against the complete bundled snapshot. A previous
+        // auth row may have shadowed its bundled counterpart in `entries`;
+        // filtering the merged view would lose that fallback when a later
+        // auth response omits the row.
+        entries = mergeDirectories(entries: bundledEntries + tagged)
         saveCache()
     }
 
     private func saveCache() {
         guard let cacheUrl else { return }
-        // Persist only non-bundled rows; bundled entries reload from
-        // the binary and must not shadow a future bundled-list update.
+        // Persist only DPlus-auth rows. Bundled entries reload from the
+        // binary, and legacy XLX-derived rows must never be written again.
         let rows = entries
-            .filter { $0.source != .bundled }
+            .filter { $0.source == .dPlusAuth }
             .map(Self.cached(from:))
         let file = CacheFile(fetchedAt: .now, entries: rows)
         guard let data = try? JSONEncoder().encode(file) else { return }
@@ -138,19 +134,19 @@ public final class ReflectorDirectoryStore {
             host: entry.reflector.host,
             port: entry.reflector.port,
             protocolName: protocolName(entry.reflector.protocol),
-            sourceName: sourceName(entry.source)
+            sourceName: "auth"
         )
     }
 
-    private static func entry(from cached: CachedEntry) -> DirectoryEntry? {
-        guard let proto = protocolValue(cached.protocolName),
-              let source = sourceValue(cached.sourceName) else { return nil }
+    private static func dPlusEntry(from cached: CachedEntry) -> DirectoryEntry? {
+        guard cached.sourceName == "auth",
+              cached.protocolName == "dplus" else { return nil }
         return DirectoryEntry(
             reflector: Reflector(
                 name: cached.name, host: cached.host, port: cached.port,
-                protocol: proto, description: ""
+                protocol: .dPlus, description: ""
             ),
-            source: source
+            source: .dPlusAuth
         )
     }
 
@@ -159,32 +155,6 @@ public final class ReflectorDirectoryStore {
         case .dPlus: return "dplus"
         case .dExtra: return "dextra"
         case .dcs: return "dcs"
-        }
-    }
-
-    private static func protocolValue(_ s: String) -> ReflectorProtocol? {
-        switch s {
-        case "dplus": return .dPlus
-        case "dextra": return .dExtra
-        case "dcs": return .dcs
-        default: return nil
-        }
-    }
-
-    private static func sourceName(_ s: DirectorySource) -> String {
-        switch s {
-        case .bundled: return "bundled"
-        case .dPlusAuth: return "auth"
-        case .xlxRegistry: return "xlx"
-        }
-    }
-
-    private static func sourceValue(_ s: String) -> DirectorySource? {
-        switch s {
-        case "bundled": return .bundled
-        case "auth": return .dPlusAuth
-        case "xlx": return .xlxRegistry
-        default: return nil
         }
     }
 }

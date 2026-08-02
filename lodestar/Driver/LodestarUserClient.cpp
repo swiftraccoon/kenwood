@@ -34,7 +34,7 @@ struct LodestarUserClient_IVars
     LodestarUSBSerialDriver *provider = nullptr;
 };
 
-// Checked dispatch table (positional order = selector order 0..3):
+// Checked dispatch table (positional order = selector order 0..4):
 // mismatched shapes fail kIOReturnBadArgument before the handler runs.
 static const IOUserClientMethodDispatch sDispatch[kSelectorCount] = {
     // kSelectorWrite: variable-size struct in, nothing out.

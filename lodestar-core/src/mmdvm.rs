@@ -8,8 +8,8 @@
 //! wire format is `[0xE0, len, cmd, payload...]`. This module exposes
 //! the minimum FFI surface Lodestar needs to:
 //!
-//! - Build MMDVM frames (e.g. `GetVersion` for mode probing,
-//!   `DStarHeader`/`DStarData`/`DStarEot` for voice relay).
+//! - Build MMDVM frames (for example, `GetVersion` for mode probing and
+//!   D-STAR header, data, and end-of-transmission frames for voice relay).
 //! - Decode arbitrary MMDVM bytes coming off the radio.
 //! - Detect whether the radio is currently in MMDVM mode by looking
 //!   at the first byte of a response: `0xE0` means MMDVM, anything

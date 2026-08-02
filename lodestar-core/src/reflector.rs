@@ -12,7 +12,7 @@
 use std::sync::OnceLock;
 
 use dstar_gateway_core::codec::{dcs, dextra, dplus};
-use dstar_gateway_core::hosts::{HostFile, parse_xlx_directory};
+use dstar_gateway_core::hosts::HostFile;
 use dstar_gateway_core::types::ProtocolKind as CoreProtocolKind;
 
 /// Which D-STAR reflector protocol a given host speaks.
@@ -152,18 +152,14 @@ pub fn default_reflectors() -> Vec<Reflector> {
 
 /// Where a directory entry came from.
 ///
-/// Merge precedence: `DPlusAuth` beats `Bundled` beats `XlxRegistry`.
-/// The auth server is the authoritative REF directory, and XLX's
-/// `REFnnn` names are aliases of XLX reflectors rather than the
-/// dstargateway.org REFs.
+/// Merge precedence: `DPlusAuth` beats `Bundled`. The auth server is the
+/// authoritative live REF directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum DirectorySource {
     /// Compiled-in Pi-Star hosts files.
     Bundled,
     /// Live `DPlus` auth-server host list.
     DPlusAuth,
-    /// XLX self-registration registry.
-    XlxRegistry,
 }
 
 /// A reflector tagged with the source it came from.
@@ -176,12 +172,11 @@ pub struct DirectoryEntry {
 }
 
 /// Merge priority for a source; lower wins. `DPlusAuth` (0) beats
-/// `Bundled` (1) beats `XlxRegistry` (2).
+/// `Bundled` (1).
 const fn source_priority(source: DirectorySource) -> u8 {
     match source {
         DirectorySource::DPlusAuth => 0,
         DirectorySource::Bundled => 1,
-        DirectorySource::XlxRegistry => 2,
     }
 }
 
@@ -212,36 +207,6 @@ pub fn parse_hosts_text(protocol: ReflectorProtocol, text: String) -> Vec<Reflec
         .collect()
 }
 
-/// Parse the XLX registry response (`xlx_directory_url()` body) into
-/// tagged reflector rows.
-#[uniffi::export]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "UniFFI FFI boundary requires owned String"
-)]
-#[must_use]
-pub fn parse_xlx_text(text: String) -> Vec<Reflector> {
-    parse_xlx_directory(&text)
-        .into_iter()
-        .map(|(kind, e)| Reflector {
-            name: e.name,
-            host: e.address,
-            port: e.port,
-            protocol: kind.into(),
-            description: String::new(),
-        })
-        .collect()
-}
-
-/// URL of the XLX self-registration registry (fetched by the app
-/// layer with the platform HTTP stack, then parsed via
-/// [`parse_xlx_text`]).
-#[uniffi::export]
-#[must_use]
-pub fn xlx_directory_url() -> String {
-    "http://xlxapi.rlx.lu/api.php?do=GetReflectorHostname".to_owned()
-}
-
 /// Stable ordering for same-name entries across protocols, so the
 /// merged list renders identically run to run.
 const fn protocol_rank(protocol: ReflectorProtocol) -> u8 {
@@ -253,8 +218,7 @@ const fn protocol_rank(protocol: ReflectorProtocol) -> u8 {
 }
 
 /// Merge tagged entries: one row per `(name, protocol)`, source
-/// priority `DPlusAuth` > `Bundled` > `XlxRegistry`, sorted by name
-/// then protocol.
+/// priority `DPlusAuth` > `Bundled`, sorted by name then protocol.
 #[uniffi::export]
 #[must_use]
 pub fn merge_directories(entries: Vec<DirectoryEntry>) -> Vec<DirectoryEntry> {
@@ -305,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_prefers_auth_over_bundled_over_xlx() -> Result<(), Box<dyn std::error::Error>> {
+    fn merge_prefers_auth_over_bundled() -> Result<(), Box<dyn std::error::Error>> {
         let merged = merge_directories(vec![
             entry(
                 "REF030",
@@ -318,12 +282,6 @@ mod tests {
                 "auth.example",
                 ReflectorProtocol::DPlus,
                 DirectorySource::DPlusAuth,
-            ),
-            entry(
-                "REF030",
-                "xlx.example",
-                ReflectorProtocol::DPlus,
-                DirectorySource::XlxRegistry,
             ),
         ]);
         assert_eq!(merged.len(), 1);
@@ -358,13 +316,13 @@ mod tests {
     #[test]
     fn merge_precedence_holds_regardless_of_input_order() -> Result<(), Box<dyn std::error::Error>>
     {
-        // The XLX row arrives FIRST here; auth must still win.
+        // The bundled row arrives first here; auth must still win.
         let merged = merge_directories(vec![
             entry(
                 "REF030",
-                "xlx.example",
+                "bundled.example",
                 ReflectorProtocol::DPlus,
-                DirectorySource::XlxRegistry,
+                DirectorySource::Bundled,
             ),
             entry(
                 "REF030",
@@ -377,7 +335,7 @@ mod tests {
         let only = merged.first().ok_or("empty merge")?;
         assert_eq!(
             only.reflector.host, "auth.example",
-            "auth must win even when it arrives after the XLX row"
+            "auth must win even when it arrives after the bundled row"
         );
         Ok(())
     }

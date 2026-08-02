@@ -42,15 +42,22 @@ public actor McpSession {
     private var exitAcknowledged = false
     private var mcpDesynchronized = false
     private let pageReadTimeoutSeconds: Double
+    private let catTimeoutSeconds: Double
 
     public init(transport: RadioTransport) {
         self.transport = transport
         self.pageReadTimeoutSeconds = 5
+        self.catTimeoutSeconds = 2
     }
 
-    init(transport: RadioTransport, pageReadTimeoutSeconds: Double) {
+    init(
+        transport: RadioTransport,
+        pageReadTimeoutSeconds: Double,
+        catTimeoutSeconds: Double = 2
+    ) {
         self.transport = transport
         self.pageReadTimeoutSeconds = pageReadTimeoutSeconds
+        self.catTimeoutSeconds = catTimeoutSeconds
     }
 
     // MARK: - Primitive steps
@@ -72,9 +79,17 @@ public actor McpSession {
         do {
             try await qualifyFirmwareOffsetTarget()
         } catch {
-            // No MCP entry wire byte has been sent. Restore the only
-            // reusable state before surfacing the qualification failure.
-            phase = .inactive
+            if isCompletedQualificationRejection(error) {
+                // The radio returned complete typed CAT lines and no MCP byte
+                // was sent, so this specific refusal is safe to retry.
+                phase = .inactive
+            } else {
+                // A timeout, cancellation, transport failure, or malformed
+                // framing leaves the outcome of CAT I/O unproved. Close the
+                // byte stream and make this McpSession permanently terminal.
+                phase = .terminal
+                await transport.close()
+            }
             throw error
         }
 
@@ -225,13 +240,14 @@ public actor McpSession {
 
     /// Whether a coordinator must detach its reference to this transport.
     ///
-    /// False only when target qualification failed before MCP entry wire
-    /// traffic. Once entry was attempted, this remains true forever.
+    /// False only before qualification starts, or after the radio returned a
+    /// complete typed rejection. Ambiguous CAT I/O is terminal and requires
+    /// the coordinator to detach this transport just like attempted MCP entry.
     public func requiresTransportDetach() -> Bool {
         switch phase {
-        case .inactive, .qualifying:
+        case .inactive:
             return false
-        case .entering, .active, .exitSent, .terminal:
+        case .qualifying, .entering, .active, .exitSent, .terminal:
             return true
         }
     }
@@ -320,11 +336,13 @@ public actor McpSession {
         try await writeWithDeadline(
             encodeCat(command: command),
             operation: "CAT \(String(describing: command))",
-            timeoutNanoseconds: 2_000_000_000
+            timeoutNanoseconds: UInt64(catTimeoutSeconds * 1_000_000_000)
         )
 
         var buffer: [UInt8] = []
-        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        let deadline = ContinuousClock.now.advanced(
+            by: .seconds(catTimeoutSeconds)
+        )
         while !buffer.contains(0x0D) {
             if ContinuousClock.now >= deadline {
                 throw McpOrchestratorError.catResponseTimeout(
@@ -353,6 +371,16 @@ public actor McpSession {
 
         let end = buffer.firstIndex(of: 0x0D) ?? buffer.endIndex
         return parseCatLine(line: Array(buffer[..<end]))
+    }
+
+    private func isCompletedQualificationRejection(_ error: Error) -> Bool {
+        guard let error = error as? McpOrchestratorError else { return false }
+        switch error {
+        case .unexpectedCatResponse, .unsupportedModel, .unsupportedFirmware:
+            return true
+        default:
+            return false
+        }
     }
 
     private func readPageWithRetry(_ page: UInt16) async throws -> Data {

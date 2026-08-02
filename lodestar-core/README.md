@@ -26,9 +26,9 @@ bindings ship as `LodestarKit.xcframework`, produced by
   for operator-originated transmissions (reflectors don't echo the sender
   back).
 - Reflector directory: `default_reflectors()` plus live-directory support via
-  `parse_hosts_text`, `parse_xlx_text`, `merge_directories`, `xlx_directory_url`,
-  and the `DirectoryEntry` / `DirectorySource` types for provenance-aware
-  merging of bundled, DPlus auth-server, and XLX-registry sources.
+  `parse_hosts_text`, `merge_directories`, and the `DirectoryEntry` /
+  `DirectorySource` types for provenance-aware merging of bundled and DPlus
+  auth-server sources.
 - Logging bridge: `init_tracing()` installs a `tracing` subscriber that
   forwards each event to a Swift-implemented `LogSink` (with `LogLevel`),
   routing Rust diagnostics into the app's Log Viewer and Apple's Unified Log.

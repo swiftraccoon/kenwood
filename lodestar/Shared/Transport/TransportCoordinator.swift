@@ -651,24 +651,22 @@ public final class TransportCoordinator {
     }
 
     /// Apply a state yielded by the transport's own stream. A
-    /// `.connected → .disconnected` transition seen HERE is always
-    /// unexpected: user-initiated paths cancel the observer before
-    /// closing the transport.
+    /// `.connected → terminal` transition seen HERE is always unexpected:
+    /// user-initiated paths cancel the observer before closing the transport.
     private func applyTransportState(_ s: RadioTransportState) {
         let previous = state
         switch s {
-        case .failed:
+        case .failed(let message):
             state = s
             radioMode = .unknown
+            guard case .connected = previous else { return }
+            handleUnexpectedTransportEnd(
+                reason: "Transport failed unexpectedly: \(message)"
+            )
         case .disconnected:
             state = s
             guard case .connected = previous else { return }
-            log.warning("Transport dropped unexpectedly")
-            radioMode = .unknown
-            transport = nil
-            stopObservingState()
-            NotificationManager.shared.radioDisconnected()
-            scheduleRadioReconnect()
+            handleUnexpectedTransportEnd(reason: "Transport dropped unexpectedly")
         case .connecting:
             // `performConnectOwned()` publishes `.connected` from the
             // transport's post-open snapshot. A buffered pre-open event must
@@ -680,6 +678,19 @@ public final class TransportCoordinator {
         case .connected:
             state = s
         }
+    }
+
+    /// Detach a terminal transport before exposing reconnect affordances. In
+    /// particular, the Bluetooth helper reports EOF/write ambiguity as
+    /// `.failed`; retaining that poisoned object makes both manual and
+    /// automatic reconnect bail out because they require `transport == nil`.
+    private func handleUnexpectedTransportEnd(reason: String) {
+        log.warning("\(reason)")
+        radioMode = .unknown
+        transport = nil
+        stopObservingState()
+        NotificationManager.shared.radioDisconnected()
+        scheduleRadioReconnect()
     }
 
     /// Best-effort reconnect after an unexpected drop. Mirrors the

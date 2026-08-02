@@ -5,6 +5,74 @@ import XCTest
 @testable import Lodestar
 
 final class MockTransportTests: XCTestCase {
+    #if DEBUG && os(macOS)
+    func testBluetoothHelperReadyEchoAndRawPipe() throws {
+        let payload = Array("ID\r".utf8)
+        XCTAssertEqual(
+            try IOBluetoothTransport.helperEchoProbe(payload),
+            payload
+        )
+    }
+
+    func testBluetoothHelperDynamicLivenessDescriptorCannotAliasPipes() throws {
+        let payload = Array("ID\r".utf8)
+        XCTAssertEqual(
+            try IOBluetoothTransport.helperHighDescriptorProbe(payload),
+            payload
+        )
+    }
+
+    func testBluetoothHelperRejectsConcurrentChildAndReleasesAfterReap() throws {
+        try IOBluetoothTransport.helperReapProbe()
+    }
+
+    func testBluetoothCancelledReadPreservesFollowingBytes() async throws {
+        let transport = IOBluetoothTransport.helperTestTransport()
+        try await transport.open()
+        let cancelledRead = Task {
+            try await transport.read(maxBytes: 64)
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        cancelledRead.cancel()
+        let cancelledResult = try await cancelledRead.value
+        XCTAssertEqual(cancelledResult, [])
+
+        let payload = Array("FV\r".utf8)
+        try await transport.write(payload)
+        let preserved = try await transport.read(maxBytes: 64)
+        XCTAssertEqual(preserved, payload)
+        await transport.close()
+    }
+
+    func testBluetoothCancelledBackpressuredWritePoisonsHelper() async throws {
+        let transport = IOBluetoothTransport.helperTestTransport(wedged: true)
+        try await transport.open()
+        let write = Task {
+            try await transport.write([UInt8](repeating: 0x41, count: 1_048_576))
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        write.cancel()
+        do {
+            try await write.value
+            XCTFail("cancelled partial helper write must fail")
+        } catch {
+            // Expected: cancellation destroys the uncertain byte stream.
+        }
+
+        let state = await transport.state
+        guard case .failed = state else {
+            return XCTFail("cancelled write must poison the transport")
+        }
+        do {
+            try await transport.write([0x42])
+            XCTFail("a poisoned helper must not be reusable")
+        } catch let error as RadioTransportError {
+            XCTAssertEqual(error, .notConnected)
+        }
+        await transport.close()
+    }
+    #endif
+
     func testScriptedResponseAndWriteCapture() async throws {
         let mock = MockRadioTransport()
         try await mock.open()
@@ -125,6 +193,46 @@ final class McpSessionTests: XCTestCase {
         XCTAssertFalse(mustDetach, "no MCP entry byte was sent")
         let state = await mock.state
         XCTAssertEqual(state, .connected)
+    }
+
+    func testQualificationTimeoutClosesAndTerminalizesSession() async throws {
+        let mock = MockRadioTransport()
+        try await mock.open()
+        await mock.script(response: [], for: Array("ID\r".utf8))
+        let session = McpSession(
+            transport: mock,
+            pageReadTimeoutSeconds: 5,
+            catTimeoutSeconds: 0.03
+        )
+
+        do {
+            try await session.enterProgramming()
+            XCTFail("an unproved CAT exchange must fail")
+        } catch let error as McpOrchestratorError {
+            guard case .catResponseTimeout(let command, _) = error else {
+                return XCTFail("expected CAT timeout, got \(error)")
+            }
+            XCTAssertEqual(command, "identify")
+        }
+
+        let requiresDetach = await session.requiresTransportDetach()
+        let transportState = await mock.state
+        XCTAssertTrue(requiresDetach)
+        XCTAssertEqual(transportState, .disconnected)
+        do {
+            try await session.enterProgramming()
+            XCTFail("an ambiguous qualification must make the session terminal")
+        } catch let error as McpOrchestratorError {
+            guard case .invalidPhase(_, _, let actual) = error else {
+                return XCTFail("expected terminal phase, got \(error)")
+            }
+            XCTAssertEqual(actual, "terminal")
+        }
+        let written = await mock.writtenBytes()
+        XCTAssertEqual(
+            written.filter { $0 == Array("ID\r".utf8) }.count,
+            1
+        )
     }
 
     func testEntryAcceptsExactFullFirmwareWireForm() async throws {

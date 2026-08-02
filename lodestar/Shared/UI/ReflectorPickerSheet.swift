@@ -37,17 +37,20 @@ struct ReflectorPickerSheet: View {
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Button {
-                        Task { await directory.refresh(callsign: coordinator.callsign) }
+                        Task {
+                            await directory.refreshDPlusDirectory(callsign: coordinator.callsign)
+                        }
                     } label: {
                         if directory.isRefreshing {
                             Label("Refreshing…", systemImage: "arrow.clockwise")
                         } else {
-                            Label("Refresh directory", systemImage: "arrow.clockwise")
+                            Label("Refresh DPlus directory", systemImage: "arrow.clockwise")
                         }
                     }
                     .disabled(directory.isRefreshing)
                     .accessibilityLabel(
-                        directory.isRefreshing ? "Refreshing directory" : "Refresh directory"
+                        directory.isRefreshing
+                            ? "Refreshing DPlus directory" : "Refresh DPlus directory"
                     )
                 }
             }

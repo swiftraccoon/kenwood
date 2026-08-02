@@ -73,6 +73,79 @@ final class TransportCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.state, .connected)
     }
 
+    func testUnexpectedFailureDetachesPoisonedTransportAndAllowsManualReconnect() async throws {
+        let coordinator = TransportCoordinator()
+        let first = MockRadioTransport()
+        let second = MockRadioTransport()
+        var handedOut = 0
+        coordinator.transportFactory = { _ in
+            handedOut += 1
+            return handedOut == 1 ? first : second
+        }
+        // Keep automatic recovery inert so this test exercises the Connect
+        // affordance shown by the failed state.
+        coordinator.reconnectDelaysNs = []
+        coordinator.select(.mockTHD75)
+        await first.script(
+            response: [0xE0, 0x04, 0x00, 0x01],
+            for: Array(mmdvmGetVersionProbe())
+        )
+        await second.script(
+            response: [0xE0, 0x04, 0x00, 0x01],
+            for: Array(mmdvmGetVersionProbe())
+        )
+        await coordinator.connect()
+
+        await first.simulateUnexpectedFailure()
+        for _ in 0..<100 where coordinator.relayTransport != nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        guard case .failed(let message) = coordinator.state else {
+            return XCTFail("helper failure must remain visible, got \(coordinator.state)")
+        }
+        XCTAssertEqual(message, "Bluetooth helper exited")
+        XCTAssertNil(
+            coordinator.relayTransport,
+            "the poisoned transport must be detached before Connect is shown"
+        )
+
+        await coordinator.connect()
+
+        XCTAssertEqual(handedOut, 2)
+        XCTAssertEqual(coordinator.state, .connected)
+        XCTAssertNotNil(coordinator.relayTransport)
+    }
+
+    func testUnexpectedFailureSchedulesReconnect() async throws {
+        let coordinator = TransportCoordinator()
+        let first = MockRadioTransport()
+        let second = MockRadioTransport()
+        var handedOut = 0
+        coordinator.transportFactory = { _ in
+            handedOut += 1
+            return handedOut == 1 ? first : second
+        }
+        coordinator.reconnectDelaysNs = [50_000_000]
+        coordinator.select(.mockTHD75)
+        await first.script(
+            response: [0xE0, 0x04, 0x00, 0x01],
+            for: Array(mmdvmGetVersionProbe())
+        )
+        await second.script(
+            response: [0xE0, 0x04, 0x00, 0x01],
+            for: Array(mmdvmGetVersionProbe())
+        )
+        await coordinator.connect()
+
+        await first.simulateUnexpectedFailure()
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        XCTAssertEqual(handedOut, 2, "terminal failure must trigger a fresh transport")
+        XCTAssertEqual(coordinator.state, .connected)
+        XCTAssertNotNil(coordinator.relayTransport)
+    }
+
     func testUserDisconnectDoesNotTripUnexpectedPath() async throws {
         let coordinator = TransportCoordinator()
         let mock = MockRadioTransport()

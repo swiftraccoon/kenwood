@@ -73,12 +73,6 @@ targets:
         # the reflector UDP session and the USB user client.
         UIBackgroundModes:
           - audio
-        # The XLX reflector registry is http-only; exception scoped to
-        # that single host.
-        NSAppTransportSecurity:
-          NSExceptionDomains:
-            xlxapi.rlx.lu:
-              NSExceptionAllowsInsecureHTTPLoads: true
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: true
@@ -165,12 +159,6 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
         LSApplicationCategoryType: public.app-category.utilities
-        # The XLX reflector registry is http-only; exception scoped to
-        # that single host.
-        NSAppTransportSecurity:
-          NSExceptionDomains:
-            xlxapi.rlx.lu:
-              NSExceptionAllowsInsecureHTTPLoads: true
         NSBluetoothAlwaysUsageDescription: "Lodestar uses Bluetooth to connect to your Kenwood TH-D75 transceiver and exchange CAT commands."
         NSBluetoothPeripheralUsageDescription: "Lodestar uses Bluetooth to connect to your Kenwood TH-D75 transceiver and exchange CAT commands."
         NSPrincipalClass: NSApplication
@@ -192,6 +180,46 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.lodestar.mac.tests
 
+  # Diagnostic probe, iPhone-only: reports what iOS exposes for a
+  # directly-connected TH-D75 over USB-C (audio inputs, route, session
+  # format, MFi accessories). Read-only inspection; no radio control;
+  # the "iPhone is out of scope" platform decision (CAT/serial/BT) stands.
+  USBProbe:
+    type: application
+    platform: iOS
+    sources:
+      - path: USBProbe
+        excludes:
+          - Info.plist
+    dependencies:
+      # Public IOKit user-client C API (IOServiceGetMatchingServices /
+      # IOServiceOpen), used by the control-path probe to attempt raw USB
+      # from the sandbox and record how iOS denies it.
+      - sdk: IOKit.framework
+      # The two public frameworks that can carry bidirectional bytes over
+      # USB with no MFi: USB MIDI (SysEx) and USB PTP pass-through.
+      - sdk: CoreMIDI.framework
+      - sdk: ImageCaptureCore.framework
+    info:
+      path: USBProbe/Info.plist
+      properties:
+        CFBundleDisplayName: USB Probe
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        NSMicrophoneUsageDescription: "USB Probe reads audio-input capabilities (including USB audio devices such as the Kenwood TH-D75) to report what iOS exposes."
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities: [arm64]
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "1"
+        PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.lodestar.usbprobe
+        SWIFT_OBJC_BRIDGING_HEADER: USBProbe/USBProbeBridging.h
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        SUPPORTS_MACCATALYST: NO
+
 schemes:
   LodestarMac:
     build:
@@ -207,5 +235,11 @@ schemes:
     build:
       targets:
         LodestarIPad: all
+    run:
+      config: Debug
+  USBProbe:
+    build:
+      targets:
+        USBProbe: all
     run:
       config: Debug

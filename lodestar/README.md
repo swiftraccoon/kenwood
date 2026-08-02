@@ -4,7 +4,10 @@ D-STAR gateway app for the Kenwood TH-D75. Runs on iPad (iPadOS 26+)
 and Mac (native macOS 26+).
 
 - **macOS** connects to the radio over Bluetooth Classic SPP via
-  `IOBluetooth`.
+  `IOBluetooth`. The app re-executes its signed binary as a disposable
+  helper: only that child owns IOBluetooth/RFCOMM, and the parent can kill and
+  reap it if a framework write stalls. Cancelled or uncertain writes require
+  an explicit fresh connection; cancelling a read preserves buffered bytes.
 - **iPad** connects to the radio directly over USB-C: an embedded
   DriverKit extension drives the TH-D75's CDC serial interface on
   M-series iPads. Enable the driver once in **Settings → General →

@@ -3,19 +3,21 @@
 
 import Foundation
 #if os(macOS)
-import IOBluetooth
+import Darwin
 #endif
 
-/// macOS transport using `IOBluetooth` RFCOMM (Serial Port Profile).
+/// macOS Bluetooth Classic SPP transport.
 ///
-/// On iPadOS this type still compiles but every operation throws
-/// `RadioTransportError.notAvailableOnPlatform`: iPad direct-radio
-/// support requires the (yet-to-land) USB-CDC DriverKit transport.
+/// The app process never constructs an `IOBluetooth` object. It re-executes
+/// its own signed binary with a private environment handshake; an Objective-C
+/// constructor takes over before SwiftUI starts and owns RFCOMM plus its main
+/// run loop in that disposable helper process. Parent/child stdin and stdout
+/// are the raw radio byte stream.
 ///
-/// `IOBluetoothDevice` is a macOS-only framework, and Mac Catalyst cannot
-/// reach it (classes are marked unavailable on Catalyst). Lodestar ships
-/// a separate native macOS target rather than a Catalyst build for
-/// exactly this reason.
+/// This process boundary is required because every IOBluetooth write API can
+/// ultimately block inside the framework without a cancellation primitive.
+/// A cancelled or timed-out parent write kills and reaps the helper, so an
+/// uncertain partial command can never leave a reusable transport behind.
 public actor IOBluetoothTransport: RadioTransport {
     public let device: BluetoothDevice
     private var _state: RadioTransportState = .disconnected
@@ -23,451 +25,946 @@ public actor IOBluetoothTransport: RadioTransport {
     public nonisolated let stateStream: AsyncStream<RadioTransportState>
 
     #if os(macOS)
-    private var rfcomm: RFCOMMBridge?
-    private var pendingReads: [[UInt8]] = []
-    private var readContinuations:
-        [(id: UInt64, maxBytes: Int, continuation: CheckedContinuation<[UInt8], Error>)] = []
-    private var nextReadID: UInt64 = 0
+    private let configuredHelperMode: BluetoothHelperMode
+    private var helper: BluetoothHelperProcess?
+    private var helperGeneration: UInt64 = 0
+    private var openInProgress = false
+    private var activeWriteGeneration: UInt64?
+    private var poisoned = false
+    private var pendingBytes: [UInt8] = []
+    private var waitingReads: [WaitingRead] = []
+    private var reservedReadID: UInt64?
+    private var nextReadID: UInt64 = 1
     #endif
 
     public init(device: BluetoothDevice) {
         self.device = device
-        var cont: AsyncStream<RadioTransportState>.Continuation!
-        self.stateStream = AsyncStream { c in cont = c }
-        self.stateContinuation = cont
+        #if os(macOS)
+        self.configuredHelperMode = .radio
+        #endif
+        var continuation: AsyncStream<RadioTransportState>.Continuation!
+        self.stateStream = AsyncStream { continuation = $0 }
+        self.stateContinuation = continuation
     }
 
     public var state: RadioTransportState { _state }
 
-    /// Enumerate paired Bluetooth devices. On iPad returns an empty list.
+    /// Enumerate paired devices in a bounded, short-lived helper process.
+    /// Even discovery therefore keeps IOBluetooth objects out of the app.
     public nonisolated static func pairedDevices() -> [BluetoothDevice] {
         #if os(macOS)
-        guard let devices = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else {
-            return []
-        }
-        return devices.compactMap { dev -> BluetoothDevice? in
-            guard let address = dev.addressString else { return nil }
-            let name = dev.name ?? address
-            return BluetoothDevice(id: address, name: name, address: address)
-        }
+        return BluetoothHelperProcess.pairedDevices()
         #else
         return []
         #endif
     }
 
+    #if DEBUG && os(macOS)
+    private init(testHelperMode: BluetoothHelperMode) {
+        self.device = .mockTHD75
+        self.configuredHelperMode = testHelperMode
+        var continuation: AsyncStream<RadioTransportState>.Continuation!
+        self.stateStream = AsyncStream { continuation = $0 }
+        self.stateContinuation = continuation
+    }
+
+    nonisolated static func helperTestTransport(
+        wedged: Bool = false
+    ) -> IOBluetoothTransport {
+        IOBluetoothTransport(
+            testHelperMode: wedged ? .hangTest : .echoTest
+        )
+    }
+
+    /// No-radio integration probe for the exact self-reexec/READY/raw-pipe
+    /// path used in production.
+    nonisolated static func helperEchoProbe(_ payload: [UInt8]) throws -> [UInt8] {
+        try BluetoothHelperProcess.echoProbe(payload)
+    }
+
+    /// Exercises spawn with every pipe endpoint above the old fixed-FD range;
+    /// the dynamically reserved liveness destination must not alias any pipe.
+    nonisolated static func helperHighDescriptorProbe(
+        _ payload: [UInt8]
+    ) throws -> [UInt8] {
+        var descriptors: [Int32] = []
+        defer { for descriptor in descriptors { Darwin.close(descriptor) } }
+        while (descriptors.last ?? -1) < 220 {
+            let descriptor = Darwin.open("/dev/null", O_RDONLY)
+            guard descriptor >= 0 else {
+                throw RadioTransportError.openFailed(
+                    reason: "Could not reserve high descriptors for helper test"
+                )
+            }
+            descriptors.append(descriptor)
+        }
+        return try BluetoothHelperProcess.echoProbe(payload)
+    }
+
+    /// No-radio integration probe for one-helper exclusion and post-reap
+    /// slot release, including a child intentionally wedged after READY.
+    nonisolated static func helperReapProbe() throws {
+        try BluetoothHelperProcess.reapProbe()
+    }
+    #endif
+
     public func open() async throws {
         #if os(macOS)
+        guard !openInProgress, helper == nil else {
+            throw RadioTransportError.openFailed(
+                reason: "A Bluetooth helper is already opening or connected"
+            )
+        }
+        switch _state {
+        case .connecting, .connected:
+            throw RadioTransportError.openFailed(
+                reason: "Bluetooth transport is already opening or connected"
+            )
+        case .disconnected, .failed:
+            break
+        }
+
+        openInProgress = true
+        helperGeneration &+= 1
+        let generation = helperGeneration
         updateState(.connecting)
-        let bridge = await RFCOMMBridge(address: device.address)
-        rfcomm = bridge
-        await bridge.setHandlers(
-            onData: { [weak self] bytes in
-                Task { await self?.deliverRead(bytes) }
-            },
-            onClose: { [weak self] in
-                Task { await self?.handleUnexpectedClose() }
-            }
-        )
+
         do {
-            try await bridge.open()
+            var process = try BluetoothHelperProcess.spawn(
+                device: device.address,
+                mode: configuredHelperMode
+            )
+            process.generation = generation
+            helper = process
+            try await awaitReady(generation: generation)
+            try Task.checkCancellation()
+            guard var current = helper, current.generation == generation else {
+                throw RadioTransportError.notConnected
+            }
+
+            let outputFD = current.outputFD
+            current.outputFD = -1
+            current.reader = BluetoothHelperPipeReader(
+                descriptor: outputFD,
+                generation: generation,
+                owner: self
+            )
+            process = current
+            helper = process
+            openInProgress = false
+            poisoned = false
             updateState(.connected)
         } catch {
-            rfcomm = nil
-            let reason = (error as? RadioTransportError)?.displayMessage ?? "\(error)"
-            updateState(.failed(message: reason))
+            await terminateHelper(
+                generation: generation,
+                graceful: false,
+                markPoisoned: true
+            )
+            if generation == helperGeneration {
+                openInProgress = false
+                let reason = (error as? RadioTransportError)?.displayMessage
+                    ?? error.localizedDescription
+                updateState(.failed(message: reason))
+            }
             throw error
         }
         #else
         throw RadioTransportError.notAvailableOnPlatform(
-            reason: "Bluetooth Classic SPP is macOS-only. On iPad, use the USB-C transport (USBSerialTransport); the coordinator selects it automatically."
+            reason: "Bluetooth Classic SPP is macOS-only. On iPad, use the USB-C transport."
         )
         #endif
     }
 
     public func close() async {
         #if os(macOS)
-        if let bridge = rfcomm {
-            await bridge.close()
+        helperGeneration &+= 1
+        let closeRequestGeneration = helperGeneration
+        let closingGeneration = helper?.generation
+        openInProgress = false
+        activeWriteGeneration = nil
+        if let closingGeneration {
+            await terminateHelper(
+                generation: closingGeneration,
+                graceful: true,
+                markPoisoned: false
+            )
         }
-        rfcomm = nil
-        for reader in readContinuations {
-            reader.continuation.resume(returning: [])
-        }
-        readContinuations.removeAll()
-        pendingReads.removeAll()
+        guard helperGeneration == closeRequestGeneration else { return }
+        poisoned = false
+        finishReadsForClose()
+        pendingBytes.removeAll(keepingCapacity: false)
         #endif
         updateState(.disconnected)
-        stateContinuation.finish()
     }
 
     public func write(_ bytes: [UInt8]) async throws {
         #if os(macOS)
-        guard case .connected = _state, let bridge = rfcomm else {
+        guard !bytes.isEmpty else { return }
+        guard case .connected = _state,
+              !poisoned,
+              let active = helper else {
             throw RadioTransportError.notConnected
         }
-        try await bridge.write(bytes)
+        let generation = active.generation
+        guard activeWriteGeneration == nil else {
+            throw RadioTransportError.writeFailed(
+                reason: "Another Bluetooth write is already in progress"
+            )
+        }
+        activeWriteGeneration = generation
+        defer {
+            if activeWriteGeneration == generation {
+                activeWriteGeneration = nil
+            }
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+
+        do {
+            for chunk in bytes.chunked(maximumCount: 512) {
+                while true {
+                    try Task.checkCancellation()
+                    guard let current = helper,
+                          current.generation == generation,
+                          current.inputFD >= 0,
+                          !poisoned else {
+                        throw RadioTransportError.notConnected
+                    }
+                    let count = chunk.withUnsafeBytes { rawBuffer -> Int in
+                        guard let baseAddress = rawBuffer.baseAddress else {
+                            return 0
+                        }
+                        return Darwin.write(
+                            current.inputFD, baseAddress, rawBuffer.count
+                        )
+                    }
+                    if count == chunk.count {
+                        try Task.checkCancellation()
+                        break
+                    }
+                    if count >= 0 {
+                        throw RadioTransportError.writeFailed(
+                            reason: "Partial helper-pipe write \(count)/\(chunk.count)"
+                        )
+                    }
+                    let writeErrno = errno
+                    if writeErrno == EINTR { continue }
+                    if writeErrno == EAGAIN || writeErrno == EWOULDBLOCK {
+                        guard ContinuousClock.now < deadline else {
+                            throw RadioTransportError.writeFailed(
+                                reason: "Bluetooth helper write remained backpressured for 5s"
+                            )
+                        }
+                        try await Task.sleep(for: .milliseconds(5))
+                        continue
+                    }
+                    throw RadioTransportError.writeFailed(
+                        reason: String(cString: strerror(writeErrno))
+                    )
+                }
+            }
+        } catch {
+            // A cancellation/error can occur after only a prefix reached the
+            // helper. The only honest recovery is to destroy that byte stream.
+            await terminateHelper(
+                generation: generation,
+                graceful: false,
+                markPoisoned: true
+            )
+            if generation == helperGeneration {
+                updateState(.failed(message:
+                    "Bluetooth write outcome is unknown; reconnect required"
+                ))
+            }
+            throw error
+        }
         #else
-        throw RadioTransportError.notAvailableOnPlatform(reason: "No IOBluetooth on iPad.")
+        throw RadioTransportError.notAvailableOnPlatform(
+            reason: "No IOBluetooth transport on iPad."
+        )
         #endif
     }
 
     public func read(maxBytes: Int) async throws -> [UInt8] {
         #if os(macOS)
-        if !pendingReads.isEmpty {
-            let chunk = pendingReads.removeFirst()
-            let slice = Array(chunk.prefix(maxBytes))
-            if slice.count < chunk.count {
-                pendingReads.insert(Array(chunk.dropFirst(slice.count)), at: 0)
-            }
-            return slice
+        guard maxBytes > 0 else { return [] }
+        if Task.isCancelled { return [] }
+
+        if reservedReadID == nil,
+           waitingReads.isEmpty,
+           !pendingBytes.isEmpty {
+            return takePendingBytes(maximum: maxBytes)
         }
-        if case .disconnected = _state { return [] }
+        guard case .connected = _state, helper != nil, !poisoned else {
+            return []
+        }
+
         let id = nextReadID
-        nextReadID += 1
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { c in
-                readContinuations.append(
-                    (id: id, maxBytes: maxBytes, continuation: c)
-                )
+        nextReadID &+= 1
+        let gate = ReadCancellationGate()
+        let signaled = await withTaskCancellationHandler {
+            await withCheckedContinuation {
+                (continuation: CheckedContinuation<Bool, Never>) in
+                if gate.isCancelled {
+                    continuation.resume(returning: false)
+                    return
+                }
+                waitingReads.append(WaitingRead(
+                    id: id,
+                    maximum: maxBytes,
+                    gate: gate,
+                    continuation: continuation
+                ))
+                wakeNextReaderIfPossible()
             }
         } onCancel: {
-            Task { await self.cancelParkedRead(id: id) }
+            _ = gate.cancel()
+            Task { await self.cancelRead(id: id) }
         }
+
+        guard signaled, !Task.isCancelled else {
+            cancelRead(id: id)
+            return []
+        }
+        guard reservedReadID == id else { return [] }
+        reservedReadID = nil
+        let result = takePendingBytes(maximum: maxBytes)
+        wakeNextReaderIfPossible()
+        return result
         #else
-        throw RadioTransportError.notAvailableOnPlatform(reason: "No IOBluetooth on iPad.")
+        throw RadioTransportError.notAvailableOnPlatform(
+            reason: "No IOBluetooth transport on iPad."
+        )
         #endif
     }
 
     #if os(macOS)
-    private func deliverRead(_ bytes: [UInt8]) {
-        if !readContinuations.isEmpty {
-            let reader = readContinuations.removeFirst()
-            let slice = Array(bytes.prefix(reader.maxBytes))
-            if slice.count < bytes.count {
-                pendingReads.insert(Array(bytes.dropFirst(slice.count)), at: 0)
+    fileprivate func receiveHelperEvent(
+        generation: UInt64,
+        bytes: [UInt8],
+        reachedEOF: Bool
+    ) async {
+        guard let current = helper, current.generation == generation else {
+            return
+        }
+        if !bytes.isEmpty {
+            pendingBytes.append(contentsOf: bytes)
+            wakeNextReaderIfPossible()
+        }
+        if reachedEOF {
+            if activeWriteGeneration == generation {
+                activeWriteGeneration = nil
             }
-            reader.continuation.resume(returning: slice)
-            return
+            await terminateHelper(
+                generation: generation,
+                graceful: false,
+                markPoisoned: true
+            )
+            guard generation == helperGeneration else { return }
+            finishReadsForClose()
+            updateState(.failed(message: "Bluetooth helper exited"))
         }
-        pendingReads.append(bytes)
     }
 
-    private func cancelParkedRead(id: UInt64) {
-        guard let index = readContinuations.firstIndex(
-            where: { $0.id == id }
-        ) else {
-            return
+    private func awaitReady(generation: UInt64) async throws {
+        var ready = [UInt8](repeating: 0, count: bluetoothHelperReadyMagic.count)
+        var offset = 0
+        let deadline = ContinuousClock.now.advanced(by: .seconds(22))
+
+        while offset < ready.count {
+            try Task.checkCancellation()
+            guard let current = helper,
+                  current.generation == generation,
+                  current.outputFD >= 0 else {
+                throw RadioTransportError.notConnected
+            }
+            let count = ready.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+                return Darwin.read(
+                    current.outputFD,
+                    baseAddress.advanced(by: offset),
+                    rawBuffer.count - offset
+                )
+            }
+            if count > 0 {
+                offset += count
+                continue
+            }
+            if count == 0 {
+                throw RadioTransportError.openFailed(
+                    reason: "Bluetooth helper exited before READY"
+                )
+            }
+            let readErrno = errno
+            if readErrno == EINTR { continue }
+            if readErrno == EAGAIN || readErrno == EWOULDBLOCK {
+                guard ContinuousClock.now < deadline else {
+                    throw RadioTransportError.openFailed(
+                        reason: "Bluetooth helper did not become ready within 22s"
+                    )
+                }
+                try await Task.sleep(for: .milliseconds(5))
+                continue
+            }
+            throw RadioTransportError.openFailed(
+                reason: String(cString: strerror(readErrno))
+            )
         }
-        let reader = readContinuations.remove(at: index)
-        reader.continuation.resume(returning: [])
+        guard ready == bluetoothHelperReadyMagic else {
+            throw RadioTransportError.openFailed(
+                reason: "Bluetooth helper emitted an invalid READY frame"
+            )
+        }
     }
 
-    private func handleUnexpectedClose() {
-        rfcomm = nil
-        updateState(.disconnected)
-        for reader in readContinuations {
-            reader.continuation.resume(returning: [])
+    private func terminateHelper(
+        generation: UInt64,
+        graceful: Bool,
+        markPoisoned: Bool
+    ) async {
+        guard var current = helper, current.generation == generation else {
+            if markPoisoned, generation == helperGeneration {
+                poisoned = true
+            }
+            return
         }
-        readContinuations.removeAll()
+        helper = nil
+        current.reader?.stop()
+        current.reader = nil
+        if current.outputFD >= 0 {
+            Darwin.close(current.outputFD)
+            current.outputFD = -1
+        }
+        if current.inputFD >= 0 {
+            Darwin.close(current.inputFD)
+            current.inputFD = -1
+        }
+        let pid = current.pid
+        let livenessFD = current.livenessFD
+        let holdsSlot = current.holdsSlot
+        current.livenessFD = -1
+        if markPoisoned { poisoned = true }
+
+        _ = await Task.detached(priority: .utility) {
+            lodestar_bt_helper_terminate(
+                pid,
+                livenessFD,
+                graceful ? 1 : 0,
+                holdsSlot ? 1 : 0
+            )
+        }.value
+    }
+
+    private func takePendingBytes(maximum: Int) -> [UInt8] {
+        let count = min(maximum, pendingBytes.count)
+        let result = Array(pendingBytes.prefix(count))
+        pendingBytes.removeFirst(count)
+        return result
+    }
+
+    private func wakeNextReaderIfPossible() {
+        guard reservedReadID == nil, !pendingBytes.isEmpty else { return }
+        while !waitingReads.isEmpty {
+            let waiter = waitingReads.removeFirst()
+            if waiter.gate.signal() {
+                reservedReadID = waiter.id
+                waiter.continuation.resume(returning: true)
+                return
+            }
+            waiter.continuation.resume(returning: false)
+        }
+    }
+
+    private func cancelRead(id: UInt64) {
+        if reservedReadID == id {
+            reservedReadID = nil
+            wakeNextReaderIfPossible()
+            return
+        }
+        guard let index = waitingReads.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let waiter = waitingReads.remove(at: index)
+        _ = waiter.gate.cancel()
+        waiter.continuation.resume(returning: false)
+    }
+
+    private func finishReadsForClose() {
+        reservedReadID = nil
+        for waiter in waitingReads {
+            _ = waiter.gate.cancel()
+            waiter.continuation.resume(returning: false)
+        }
+        waitingReads.removeAll()
     }
     #endif
 
-    private func updateState(_ new: RadioTransportState) {
-        _state = new
-        stateContinuation.yield(new)
+    private func updateState(_ newState: RadioTransportState) {
+        _state = newState
+        stateContinuation.yield(newState)
     }
 }
 
 private extension RadioTransportError {
     var displayMessage: String {
         switch self {
-        case .notAvailableOnPlatform(let r): return r
+        case .notAvailableOnPlatform(let reason): return reason
         case .notConnected: return "Not connected"
-        case .openFailed(let r): return r
-        case .writeFailed(let r): return r
-        case .readFailed(let r): return r
-        case .deviceNotFound(let a): return "Device not found: \(a)"
+        case .openFailed(let reason): return reason
+        case .writeFailed(let reason): return reason
+        case .readFailed(let reason): return reason
+        case .deviceNotFound(let address): return "Device not found: \(address)"
         }
     }
 }
 
 #if os(macOS)
 
-/// Main-actor-isolated wrapper around an `IOBluetoothRFCOMMChannel` so the
-/// `IOBluetoothTransport` actor can hand off I/O without crossing thread
-/// isolation boundaries. `IOBluetooth` runs its delegate callbacks on the
-/// main thread, so the bridge lives on `@MainActor`.
-@MainActor
-final class RFCOMMBridge: NSObject, IOBluetoothRFCOMMChannelDelegate {
-    private final class PendingWrite {
-        let bytes: [UInt8]
-        let continuation: CheckedContinuation<Void, Error>
+@_silgen_name("lodestar_bt_helper_spawn")
+private func lodestar_bt_helper_spawn(
+    _ executable: UnsafePointer<CChar>,
+    _ device: UnsafePointer<CChar>,
+    _ mode: Int32,
+    _ pid: UnsafeMutablePointer<Int32>,
+    _ input: UnsafeMutablePointer<Int32>,
+    _ output: UnsafeMutablePointer<Int32>,
+    _ liveness: UnsafeMutablePointer<Int32>,
+    _ holdsSlot: UnsafeMutablePointer<Int32>
+) -> Int32
 
-        init(bytes: [UInt8], continuation: CheckedContinuation<Void, Error>) {
-            self.bytes = bytes
-            self.continuation = continuation
+@_silgen_name("lodestar_bt_helper_terminate")
+private func lodestar_bt_helper_terminate(
+    _ pid: Int32,
+    _ liveness: Int32,
+    _ graceful: Int32,
+    _ holdsSlot: Int32
+) -> Int32
+
+private let bluetoothHelperReadyMagic = Array("THD75BT-READY-v1".utf8)
+
+private enum BluetoothHelperMode: Int32 {
+    case radio = 0
+    case pairedDevices = 1
+    case echoTest = 2
+    case hangTest = 3
+}
+
+private struct BluetoothHelperProcess {
+    var pid: Int32
+    var inputFD: Int32
+    var outputFD: Int32
+    var livenessFD: Int32
+    var holdsSlot: Bool
+    var generation: UInt64 = 0
+    var reader: BluetoothHelperPipeReader?
+
+    static func spawn(
+        device: String,
+        mode: BluetoothHelperMode
+    ) throws -> BluetoothHelperProcess {
+        guard let executable = Bundle.main.executableURL?.path else {
+            throw RadioTransportError.openFailed(
+                reason: "Cannot locate the signed Lodestar executable"
+            )
         }
-    }
-
-    private let address: String
-    private var channel: IOBluetoothRFCOMMChannel?
-    private var openContinuation: CheckedContinuation<Void, Error>?
-    private var pendingWrites: [UInt64: PendingWrite] = [:]
-    private var nextWriteID: UInt64 = 1
-    private var onData: (@Sendable ([UInt8]) -> Void)?
-    private var onClose: (@Sendable () -> Void)?
-
-    init(address: String) {
-        self.address = address
-    }
-
-    func setHandlers(
-        onData: @escaping @Sendable ([UInt8]) -> Void,
-        onClose: @escaping @Sendable () -> Void
-    ) {
-        self.onData = onData
-        self.onClose = onClose
-    }
-
-    func open() async throws {
-        guard let dev = IOBluetoothDevice(addressString: address) else {
-            throw RadioTransportError.deviceNotFound(address: address)
-        }
-
-        // Mirror thd75's bluetooth_mac.m: if the device already holds an
-        // active baseband connection (e.g. a stale one from the broken
-        // serial-port driver or a prior Lodestar session that didn't tear
-        // down cleanly), close it and wait for it to actually drop before
-        // we try to open anything new. Up to 3 seconds in 50ms slices.
-        if dev.isConnected() {
-            _ = dev.closeConnection()
-            for _ in 0..<60 {
-                if !dev.isConnected() { break }
-                try? await Task.sleep(nanoseconds: 50_000_000)
+        var pid: Int32 = -1
+        var input: Int32 = -1
+        var output: Int32 = -1
+        var liveness: Int32 = -1
+        var holdsSlot: Int32 = 0
+        let result = executable.withCString { executableCString in
+            device.withCString { deviceCString in
+                lodestar_bt_helper_spawn(
+                    executableCString,
+                    deviceCString,
+                    mode.rawValue,
+                    &pid,
+                    &input,
+                    &output,
+                    &liveness,
+                    &holdsSlot
+                )
             }
         }
-
-        // SDP query triggers a fresh baseband connection.
-        let queryResult = dev.performSDPQuery(nil)
-        if queryResult != kIOReturnSuccess {
-            throw RadioTransportError.openFailed(
-                reason: "SDP query failed: \(String(format: "0x%08x", queryResult))"
-            )
+        guard result == 0 else {
+            let spawnErrno = errno
+            let reason = spawnErrno == EBUSY
+                ? "Another Bluetooth helper is still alive"
+                : String(cString: strerror(spawnErrno))
+            throw RadioTransportError.openFailed(reason: reason)
         }
-
-        // Wait up to 5 seconds for the baseband to actually come up.
-        for _ in 0..<100 {
-            if dev.isConnected() { break }
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-        if !dev.isConnected() {
-            throw RadioTransportError.openFailed(
-                reason: "Baseband did not connect within 5s"
-            )
-        }
-
-        // Now look up the SPP service record.
-        let sppUUID = IOBluetoothSDPUUID(
-            uuid16: BluetoothSDPUUID16(kBluetoothSDPUUID16ServiceClassSerialPort.rawValue)
+        return BluetoothHelperProcess(
+            pid: pid,
+            inputFD: input,
+            outputFD: output,
+            livenessFD: liveness,
+            holdsSlot: holdsSlot != 0
         )
-        guard let serviceRecord = dev.getServiceRecord(for: sppUUID) else {
-            throw RadioTransportError.openFailed(
-                reason: "No SPP service record on \(address)"
-            )
+    }
+
+    static func pairedDevices() -> [BluetoothDevice] {
+        guard var process = try? spawn(device: "-", mode: .pairedDevices) else {
+            return []
+        }
+        var bytes: [UInt8] = []
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        var complete = false
+
+        while ContinuousClock.now < deadline && !complete {
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            let count = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+                return Darwin.read(
+                    process.outputFD, baseAddress, rawBuffer.count
+                )
+            }
+            if count > 0 {
+                bytes.append(contentsOf: buffer.prefix(count))
+                complete = pairedPayload(bytes) != nil
+                continue
+            }
+            if count == 0 { break }
+            let readErrno = errno
+            if readErrno == EINTR { continue }
+            if readErrno == EAGAIN || readErrno == EWOULDBLOCK {
+                usleep(1_000)
+                continue
+            }
+            break
         }
 
-        var rfcommID: BluetoothRFCOMMChannelID = 0
-        let getResult = serviceRecord.getRFCOMMChannelID(&rfcommID)
-        if getResult != kIOReturnSuccess || rfcommID == 0 {
-            throw RadioTransportError.openFailed(
-                reason: "No RFCOMM channel ID in SDP record"
-            )
-        }
-
-        var ch: IOBluetoothRFCOMMChannel?
-        let openResult = dev.openRFCOMMChannelAsync(
-            &ch, withChannelID: rfcommID, delegate: self
+        Darwin.close(process.inputFD)
+        Darwin.close(process.outputFD)
+        process.inputFD = -1
+        process.outputFD = -1
+        _ = lodestar_bt_helper_terminate(
+            process.pid,
+            process.livenessFD,
+            complete ? 1 : 0,
+            process.holdsSlot ? 1 : 0
         )
-        if openResult != kIOReturnSuccess {
-            throw RadioTransportError.openFailed(
-                reason: "openRFCOMMChannelAsync failed: \(String(format: "0x%08x", openResult))"
+        process.livenessFD = -1
+        return pairedPayload(bytes) ?? []
+    }
+
+    #if DEBUG
+    static func echoProbe(_ payload: [UInt8]) throws -> [UInt8] {
+        guard payload.count <= 512 else {
+            throw RadioTransportError.writeFailed(
+                reason: "Echo test payload exceeds one atomic pipe frame"
             )
         }
-        self.channel = ch
+        var process = try spawn(device: "-", mode: .echoTest)
+        defer { terminateSynchronously(&process, graceful: false) }
+        try readReadySynchronously(from: process.outputFD)
+        try writeSynchronously(payload, to: process.inputFD)
+        return try readSynchronously(
+            count: payload.count,
+            from: process.outputFD,
+            timeout: .seconds(1)
+        )
+    }
 
-        // Wait for the delegate to confirm open.
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            openContinuation = c
+    static func reapProbe() throws {
+        var wedged = try spawn(device: "-", mode: .hangTest)
+        do {
+            var forbidden = try spawn(device: "-", mode: .hangTest)
+            terminateSynchronously(&forbidden, graceful: false)
+            terminateSynchronously(&wedged, graceful: false)
+            throw RadioTransportError.openFailed(
+                reason: "A concurrent helper unexpectedly acquired the slot"
+            )
+        } catch let error as RadioTransportError {
+            guard case .openFailed(let reason) = error,
+                  reason == "Another Bluetooth helper is still alive" else {
+                terminateSynchronously(&wedged, graceful: false)
+                throw error
+            }
+        }
+        terminateSynchronously(&wedged, graceful: false)
+
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while true {
+            do {
+                var replacement = try spawn(device: "-", mode: .hangTest)
+                terminateSynchronously(&replacement, graceful: false)
+                return
+            } catch let error as RadioTransportError {
+                guard case .openFailed(let reason) = error,
+                      reason == "Another Bluetooth helper is still alive",
+                      ContinuousClock.now < deadline else {
+                    throw error
+                }
+                usleep(1_000)
+            }
         }
     }
 
-    func close() {
-        // Mirror thd75's bluetooth_mac.m: nil the delegate FIRST so late
-        // IOBluetooth callbacks on the main run loop can't call into this
-        // bridge after we've torn it down. Then close the channel, then
-        // close the baseband too so the next open() starts from a clean
-        // state (the TH-D75 is sensitive to half-released channels).
-        onData = nil
-        onClose = nil
-        if let ch = channel {
-            ch.setDelegate(nil)
-            _ = ch.close()
+    private static func terminateSynchronously(
+        _ process: inout BluetoothHelperProcess,
+        graceful: Bool
+    ) {
+        if process.inputFD >= 0 {
+            Darwin.close(process.inputFD)
+            process.inputFD = -1
         }
-        channel = nil
-        failAllPendingWrites(with: RadioTransportError.notConnected)
+        if process.outputFD >= 0 {
+            Darwin.close(process.outputFD)
+            process.outputFD = -1
+        }
+        _ = lodestar_bt_helper_terminate(
+            process.pid,
+            process.livenessFD,
+            graceful ? 1 : 0,
+            process.holdsSlot ? 1 : 0
+        )
+        process.livenessFD = -1
     }
 
-    func write(_ bytes: [UInt8]) async throws {
-        guard let ch = channel else {
-            throw RadioTransportError.notConnected
+    private static func readReadySynchronously(from descriptor: Int32) throws {
+        let actual = try readSynchronously(
+            count: bluetoothHelperReadyMagic.count,
+            from: descriptor,
+            timeout: .seconds(1)
+        )
+        guard actual == bluetoothHelperReadyMagic else {
+            throw RadioTransportError.openFailed(
+                reason: "Test helper emitted an invalid READY frame"
+            )
         }
-        guard !bytes.isEmpty else { return }
+    }
 
-        // writeAsync rejects buffers larger than the negotiated RFCOMM
-        // MTU. Chunk serially and await each completion so byte order is
-        // preserved and no synchronous Bluetooth call can block MainActor.
-        let mtu = max(1, Int(ch.getMTU()))
+    private static func writeSynchronously(
+        _ bytes: [UInt8],
+        to descriptor: Int32
+    ) throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while true {
+            let count = bytes.withUnsafeBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+                return Darwin.write(descriptor, baseAddress, rawBuffer.count)
+            }
+            if count == bytes.count { return }
+            if count >= 0 {
+                throw RadioTransportError.writeFailed(
+                    reason: "Test helper pipe accepted a partial frame"
+                )
+            }
+            let writeErrno = errno
+            if writeErrno == EINTR { continue }
+            if (writeErrno == EAGAIN || writeErrno == EWOULDBLOCK),
+               ContinuousClock.now < deadline {
+                usleep(1_000)
+                continue
+            }
+            throw RadioTransportError.writeFailed(
+                reason: String(cString: strerror(writeErrno))
+            )
+        }
+    }
+
+    private static func readSynchronously(
+        count: Int,
+        from descriptor: Int32,
+        timeout: Duration
+    ) throws -> [UInt8] {
+        var result: [UInt8] = []
+        result.reserveCapacity(count)
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while result.count < count {
+            var buffer = [UInt8](
+                repeating: 0,
+                count: count - result.count
+            )
+            let readCount = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+                return Darwin.read(descriptor, baseAddress, rawBuffer.count)
+            }
+            if readCount > 0 {
+                result.append(contentsOf: buffer.prefix(readCount))
+                continue
+            }
+            if readCount == 0 {
+                throw RadioTransportError.readFailed(
+                    reason: "Test helper exited before its complete frame"
+                )
+            }
+            let readErrno = errno
+            if readErrno == EINTR { continue }
+            if (readErrno == EAGAIN || readErrno == EWOULDBLOCK),
+               ContinuousClock.now < deadline {
+                usleep(1_000)
+                continue
+            }
+            throw RadioTransportError.readFailed(
+                reason: readErrno == EAGAIN || readErrno == EWOULDBLOCK
+                    ? "Test helper read timed out"
+                    : String(cString: strerror(readErrno))
+            )
+        }
+        return result
+    }
+    #endif
+
+    private static func pairedPayload(_ bytes: [UInt8]) -> [BluetoothDevice]? {
+        guard bytes.count >= bluetoothHelperReadyMagic.count,
+              Array(bytes.prefix(bluetoothHelperReadyMagic.count))
+                == bluetoothHelperReadyMagic else {
+            return nil
+        }
+        var cursor = bluetoothHelperReadyMagic.count
+        var devices: [BluetoothDevice] = []
+        while true {
+            guard bytes.count - cursor >= 4 else { return nil }
+            let addressLength = Int(bytes[cursor]) << 8
+                | Int(bytes[cursor + 1])
+            let nameLength = Int(bytes[cursor + 2]) << 8
+                | Int(bytes[cursor + 3])
+            cursor += 4
+            if addressLength == 0 && nameLength == 0 { return devices }
+            guard addressLength > 0,
+                  bytes.count - cursor >= addressLength + nameLength else {
+                return nil
+            }
+            let addressBytes = bytes[cursor..<(cursor + addressLength)]
+            cursor += addressLength
+            let nameBytes = bytes[cursor..<(cursor + nameLength)]
+            cursor += nameLength
+            guard let address = String(bytes: addressBytes, encoding: .utf8),
+                  let name = String(bytes: nameBytes, encoding: .utf8) else {
+                continue
+            }
+            devices.append(BluetoothDevice(
+                id: address,
+                name: name.isEmpty ? address : name,
+                address: address
+            ))
+        }
+    }
+}
+
+private struct WaitingRead {
+    let id: UInt64
+    let maximum: Int
+    let gate: ReadCancellationGate
+    let continuation: CheckedContinuation<Bool, Never>
+}
+
+private final class ReadCancellationGate: @unchecked Sendable {
+    private enum State { case waiting, cancelled, signaled }
+    private let lock = NSLock()
+    private var state: State = .waiting
+
+    var isCancelled: Bool {
+        lock.withLock { state == .cancelled }
+    }
+
+    @discardableResult
+    func cancel() -> Bool {
+        lock.withLock {
+            guard state == .waiting else { return false }
+            state = .cancelled
+            return true
+        }
+    }
+
+    func signal() -> Bool {
+        lock.withLock {
+            guard state == .waiting else { return false }
+            state = .signaled
+            return true
+        }
+    }
+}
+
+private final class BluetoothHelperPipeReader: @unchecked Sendable {
+    private let descriptor: Int32
+    private let generation: UInt64
+    private weak var owner: IOBluetoothTransport?
+    private let source: DispatchSourceRead
+    private let lock = NSLock()
+    private var stopped = false
+
+    init(
+        descriptor: Int32,
+        generation: UInt64,
+        owner: IOBluetoothTransport
+    ) {
+        self.descriptor = descriptor
+        self.generation = generation
+        self.owner = owner
+        self.source = DispatchSource.makeReadSource(
+            fileDescriptor: descriptor,
+            queue: DispatchQueue(label: "org.swiftraccoon.lodestar.bt-helper-read")
+        )
+        source.setEventHandler { [weak self] in self?.drain() }
+        source.setCancelHandler { Darwin.close(descriptor) }
+        source.activate()
+    }
+
+    func stop() {
+        let shouldCancel = lock.withLock {
+            guard !stopped else { return false }
+            stopped = true
+            return true
+        }
+        if shouldCancel { source.cancel() }
+    }
+
+    private func drain() {
+        var received: [UInt8] = []
+        var reachedEOF = false
+        while true {
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            let count = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+                return Darwin.read(descriptor, baseAddress, rawBuffer.count)
+            }
+            if count > 0 {
+                received.append(contentsOf: buffer.prefix(count))
+                continue
+            }
+            if count == 0 {
+                reachedEOF = true
+                break
+            }
+            let readErrno = errno
+            if readErrno == EINTR { continue }
+            if readErrno == EAGAIN || readErrno == EWOULDBLOCK { break }
+            reachedEOF = true
+            break
+        }
+
+        if !received.isEmpty || reachedEOF {
+            let eventGeneration = generation
+            let eventBytes = received
+            let eventReachedEOF = reachedEOF
+            Task { @Sendable [weak owner] in
+                guard let owner else { return }
+                await owner.receiveHelperEvent(
+                    generation: eventGeneration,
+                    bytes: eventBytes,
+                    reachedEOF: eventReachedEOF
+                )
+            }
+        }
+        if reachedEOF { stop() }
+    }
+
+    deinit { stop() }
+}
+
+private extension Array where Element == UInt8 {
+    func chunked(maximumCount: Int) -> [[UInt8]] {
+        precondition(maximumCount > 0)
+        var result: [[UInt8]] = []
+        result.reserveCapacity((count + maximumCount - 1) / maximumCount)
         var offset = 0
-        while offset < bytes.count {
-            try Task.checkCancellation()
-            let end = min(offset + mtu, bytes.count)
-            try await writeChunk(Array(bytes[offset..<end]), on: ch)
+        while offset < count {
+            let end = Swift.min(offset + maximumCount, count)
+            result.append(Array(self[offset..<end]))
             offset = end
         }
-    }
-
-    private func writeChunk(
-        _ bytes: [UInt8],
-        on channel: IOBluetoothRFCOMMChannel
-    ) async throws {
-        let id = nextWriteID
-        nextWriteID &+= 1
-
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                let pending = PendingWrite(
-                    bytes: bytes,
-                    continuation: continuation
-                )
-                pendingWrites[id] = pending
-                let refcon = UnsafeMutableRawPointer(
-                    bitPattern: UInt(id)
-                )
-                let result = pending.bytes.withUnsafeBufferPointer { buffer in
-                    guard let baseAddress = buffer.baseAddress else {
-                        return kIOReturnBadArgument
-                    }
-                    return channel.writeAsync(
-                        UnsafeMutableRawPointer(
-                            mutating: UnsafeRawPointer(baseAddress)
-                        ),
-                        length: UInt16(buffer.count),
-                        refcon: refcon
-                    )
-                }
-                if result != kIOReturnSuccess,
-                   let failed = pendingWrites.removeValue(forKey: id) {
-                    failed.continuation.resume(
-                        throwing: RadioTransportError.writeFailed(
-                            reason: "writeAsync failed: "
-                                + String(format: "0x%08x", result)
-                        )
-                    )
-                }
-            }
-        } onCancel: {
-            Task { @MainActor [weak self] in
-                self?.cancelPendingWrite(id: id)
-            }
-        }
-    }
-
-    private func cancelPendingWrite(id: UInt64) {
-        guard let pending = pendingWrites.removeValue(forKey: id) else {
-            return
-        }
-        pending.continuation.resume(throwing: CancellationError())
-    }
-
-    private func completePendingWrite(id: UInt64, status: IOReturn) {
-        guard let pending = pendingWrites.removeValue(forKey: id) else {
-            return
-        }
-        if status == kIOReturnSuccess {
-            pending.continuation.resume(returning: ())
-        } else {
-            pending.continuation.resume(
-                throwing: RadioTransportError.writeFailed(
-                    reason: "RFCOMM write completion failed: "
-                        + String(format: "0x%08x", status)
-                )
-            )
-        }
-    }
-
-    private func failAllPendingWrites(with error: Error) {
-        let pending = pendingWrites.values
-        pendingWrites.removeAll()
-        for write in pending {
-            write.continuation.resume(throwing: error)
-        }
-    }
-
-    // MARK: - IOBluetoothRFCOMMChannelDelegate
-
-    nonisolated func rfcommChannelOpenComplete(
-        _ rfcommChannel: IOBluetoothRFCOMMChannel!,
-        status error: IOReturn
-    ) {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            if error == kIOReturnSuccess {
-                self.openContinuation?.resume(returning: ())
-            } else {
-                self.openContinuation?.resume(throwing: RadioTransportError.openFailed(
-                    reason: "delegate open failed: \(String(format: "0x%08x", error))"
-                ))
-            }
-            self.openContinuation = nil
-        }
-    }
-
-    nonisolated func rfcommChannelData(
-        _ rfcommChannel: IOBluetoothRFCOMMChannel!,
-        data dataPointer: UnsafeMutableRawPointer!,
-        length dataLength: Int
-    ) {
-        let buf = UnsafeBufferPointer<UInt8>(
-            start: dataPointer.assumingMemoryBound(to: UInt8.self),
-            count: dataLength
-        )
-        let bytes = Array(buf)
-        Task { @MainActor [weak self] in
-            self?.onData?(bytes)
-        }
-    }
-
-    nonisolated func rfcommChannelWriteComplete(
-        _ rfcommChannel: IOBluetoothRFCOMMChannel!,
-        refcon: UnsafeMutableRawPointer!,
-        status error: IOReturn
-    ) {
-        guard let refcon else { return }
-        let id = UInt(bitPattern: refcon)
-        Task { @MainActor [weak self] in
-            self?.completePendingWrite(id: UInt64(id), status: error)
-        }
-    }
-
-    nonisolated func rfcommChannelClosed(
-        _ rfcommChannel: IOBluetoothRFCOMMChannel!
-    ) {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.channel = nil
-            self.failAllPendingWrites(with: RadioTransportError.notConnected)
-            self.onClose?()
-        }
+        return result
     }
 }
 

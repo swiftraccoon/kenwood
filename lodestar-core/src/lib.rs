@@ -17,9 +17,9 @@
 //! - [`mmdvm`]: MMDVM frame codec and the `GetVersion` probe used for
 //!   radio-mode detection.
 //! - [`reflector`]: `DPlus` / `DExtra` / `DCS` reflector list loaded
-//!   from bundled `ircDDBGateway` host files, plus live-directory
-//!   support: Pi-Star hosts-text and XLX-registry parsers and a
-//!   provenance-aware merge over bundled, auth-server, and XLX sources.
+//!   from bundled `ircDDBGateway` host files, plus Pi-Star hosts-text
+//!   parsing and a provenance-aware merge over bundled and `DPlus`
+//!   auth-server sources.
 //! - [`session`]: async `connect_reflector` + [`session::ReflectorSession`]
 //!   driving the full radio-to-reflector voice loop, plus the
 //!   [`session::ReflectorObserver`] callback trait Swift implements to
@@ -49,7 +49,7 @@ pub use mmdvm::{
 };
 pub use reflector::{
     DirectoryEntry, DirectorySource, Reflector, ReflectorProtocol, default_reflectors,
-    merge_directories, parse_hosts_text, parse_xlx_text, xlx_directory_url,
+    merge_directories, parse_hosts_text,
 };
 pub use session::{
     DisconnectCause, ReflectorError, ReflectorSession, VoiceEndCause, connect_reflector,

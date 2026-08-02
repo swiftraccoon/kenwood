@@ -8,7 +8,8 @@ import Foundation
 /// Scriptable: register exact-match request→response pairs with
 /// `script(response:for:)`, inject unsolicited bytes with `push(_:)`,
 /// inspect captured writes with `writtenBytes()`, and simulate a
-/// Bluetooth drop with `simulateUnexpectedClose()`.
+/// Bluetooth drop with `simulateUnexpectedClose()` or a terminal helper
+/// failure with `simulateUnexpectedFailure(message:)`.
 ///
 /// Unscripted writes are captured but produce no reply (no echo). The
 /// built-in conveniences are that `ID\r` answers `ID TH-D75\r` and
@@ -65,6 +66,17 @@ public actor MockRadioTransport: RadioTransport {
     /// stream stays open (the transport object is still alive).
     public func simulateUnexpectedClose() {
         updateState(.disconnected)
+        for reader in readContinuations {
+            reader.continuation.resume(returning: [])
+        }
+        readContinuations.removeAll()
+    }
+
+    /// Fail the link the way the disposable Bluetooth helper does when it
+    /// exits or a write outcome becomes ambiguous. Pending reads resume empty,
+    /// but the state stream remains alive so coordinator recovery is exercised.
+    public func simulateUnexpectedFailure(message: String = "Bluetooth helper exited") {
+        updateState(.failed(message: message))
         for reader in readContinuations {
             reader.continuation.resume(returning: [])
         }
