@@ -591,16 +591,10 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
         thd75_repl::output::startup_banner(env!("CARGO_PKG_VERSION"))
     );
 
-    // Try to open transport BEFORE creating the tokio runtime.
-    //
-    // IOBluetooth RFCOMM uses CoreFoundation callbacks on the main thread.
-    // A tokio runtime's reactor can interfere with CFRunLoop dispatch,
-    // causing BT connections to fail. The TUI avoids this by opening
-    // transport before the runtime; we do the same.
-    //
-    // If BT isn't available (USB connected, or Linux/Windows), serial
-    // transport needs a tokio reactor (mio), so we create the runtime
-    // and retry via the serial path.
+    // Create the Tokio runtime before transport discovery because the serial
+    // path registers a mio descriptor while it opens. Native macOS Bluetooth
+    // is isolated in a helper process whose main thread owns IOBluetooth and
+    // its CFRunLoop, so the host runtime has no thread-affinity requirement.
     //
     // When compiled with the `testing` feature and `--mock-radio
     // <scenario>` is passed, short-circuit the real transport
@@ -646,11 +640,9 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     let in_script_mode = cli.script.is_some();
     let script_strict = cli.script_strict;
 
-    // Run the async REPL inside a LocalSet so the MMDVM transport
-    // adapter can pump its inner thd75 transport via `spawn_local`.
-    // That keeps the BluetoothTransport's CFRunLoop pumping on the
-    // main OS thread, which is the only thread where IOBluetooth's
-    // RFCOMM data callbacks fire.
+    // Run the async REPL inside a LocalSet because the MMDVM transport
+    // adapter uses `spawn_local`. Bluetooth's CFRunLoop lives entirely in
+    // the private transport helper and does not depend on this LocalSet.
     let local = tokio::task::LocalSet::new();
     local.block_on(
         &rt,
@@ -2161,10 +2153,9 @@ async fn run_set_gateway_off(transport: EitherTransport) -> Result<(), Box<dyn s
 /// still be routed by the firmware even while the gateway app owns the
 /// port. Try it: on success the flag is cleared (verified by read-back
 /// inside the session) and the radio reboots into normal control; the
-/// caller must then relaunch a fresh process, because an in-process
-/// Bluetooth reconnect to a just-rebooted radio wedges (see
-/// [`relaunch_self`]). On handshake timeout the radio is unchanged and
-/// the caller falls back to the guided operator exit.
+/// current link drops with the reboot. Once boot completes, the caller
+/// may open a new transport normally. On handshake timeout the radio is
+/// unchanged and the caller falls back to the guided operator exit.
 ///
 /// # Errors
 ///
@@ -2307,12 +2298,10 @@ fn validate_gateway_mcp_target(model: &str, firmware: &str) -> Result<(), String
 
 /// Re-execute this process with the same command-line arguments.
 ///
-/// Used after enabling Reflector Terminal Mode: the radio reboots, and a
-/// fresh process connects cleanly where an in-process Bluetooth reconnect
-/// does not (macOS `IOBluetooth` keeps per-process RFCOMM state that
-/// wedges when the channel is reopened to a just-rebooted radio). `exec`
-/// replaces the current process image (same PID, same controlling
-/// terminal, fresh framework state), so on success this never returns.
+/// Used after enabling Reflector Terminal Mode: the radio reboots and changes
+/// the protocol spoken on the selected interface. `exec` replaces the current
+/// process image (same PID and controlling terminal) so ordinary startup owns
+/// the post-reboot transport and mode probe; on success this never returns.
 /// The returned string is the failure message if the new image could not
 /// be started. Same pattern `rustup` uses in its shims.
 ///
@@ -2454,20 +2443,17 @@ async fn ensure_terminal_mode(
         return Err((Some(radio), error));
     }
 
-    // Enabling Reflector Terminal Mode via an MCP write reboots the
-    // radio, dropping the connection. Reconnecting in-process is
-    // unreliable (IOBluetooth wedges its run loop on a channel
-    // reopened to a just-rebooted radio), but a fresh process
-    // connects cleanly, so re-exec ourselves once the radio is back.
+    // Enabling Reflector Terminal Mode via an MCP write reboots the radio,
+    // drops this connection, and eventually changes the interface protocol.
+    // Re-exec once it is back so normal startup owns the new mode probe.
     println!(
         "Verified {} firmware {firmware}; enabling D-STAR Reflector Terminal Mode via memory \
          write.",
         identity.model
     );
-    // Detached: this write reboots the radio out of CAT mode, so the
-    // normal exit-path reconnect would race the reboot (over Bluetooth
-    // the reopened channel wedges as the radio's stack dies). The link
-    // is left dead on purpose; the re-exec below owns recovery.
+    // Detached: this write reboots the radio out of CAT mode, so the normal
+    // exit-path CAT reconnect would race a deliberate protocol transition.
+    // The link is left dead on purpose; the re-exec below owns recovery.
     if let Err(error) = write_gateway_mode_with_interrupt_recovery(&mut radio, 1).await {
         return Err((Some(radio), error));
     }

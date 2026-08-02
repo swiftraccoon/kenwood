@@ -55,16 +55,16 @@ fn open_explicit(
 /// Open a Bluetooth connection using native `IOBluetooth` RFCOMM.
 ///
 /// `_baud` is ignored: the native macOS RFCOMM path negotiates its own
-/// line parameters. A single attempt is made; a stale RFCOMM channel
-/// from a prior session that didn't call `disconnect()` surfaces as
-/// the error below with recovery guidance.
+/// line parameters. A single attempt is made. The transport never tears down
+/// an already-connected Bluetooth baseband as a cleanup strategy; an SPP
+/// channel owned by another process simply makes this open fail.
 #[cfg(target_os = "macos")]
 fn open_bluetooth(_baud: u32) -> Result<(String, EitherTransport), Box<dyn std::error::Error>> {
     let bt = kenwood_thd75::BluetoothTransport::open(None).map_err(|e| {
         format!(
             "Error: Bluetooth connection failed: {e}. \
-             If the previous session did not exit cleanly, \
-             wait a few seconds or run: sudo pkill bluetoothd"
+             Confirm that the radio is paired, Bluetooth is enabled, and no \
+             other application currently owns its SPP channel."
         )
     })?;
     Ok(("bluetooth:TH-D75".into(), EitherTransport::Bluetooth(bt)))
