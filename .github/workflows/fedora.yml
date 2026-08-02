@@ -27,7 +27,11 @@ jobs:
       # zstd: the cache action compresses with zstd when the binary is
       # present (falling back to much slower gzip when it is not), and
       # fedora:latest does not preinstall it.
-      - run: dnf install -y gcc zstd
+      # git-core: the configuration-backup privacy checks fail closed
+      # through git, which the base image also omits.
+      # perl-Digest-SHA: the hardware-audit manifest hashes its evidence
+      # with shasum; Fedora packages that executable separately.
+      - run: dnf install -y gcc git-core perl-Digest-SHA zstd
       - uses: dtolnay/rust-toolchain@1.94.0
         with:
           components: clippy

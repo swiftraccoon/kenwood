@@ -16,6 +16,10 @@ tools/
 .worktrees/
 .lint-failures/
 .aprs-validation-logs/
+/thd75-ui-control/evidence/
+/thd75-ui-control/capture-baseline.json
+/thd75-ui-control/radio-qualification.json
+/thd75-ui-firmware/out/
 
 # Private
 docs/

@@ -138,6 +138,8 @@ ci_pod() {
         #     `fedora:latest` preinstalls a git binary. Without
         #     this, `cargo deny check` fails with
         #     "failed to spawn git: No such file or directory".
+        #   perl-Digest-SHA: Fedora packages `shasum` separately; the
+        #     hardware-audit example uses it to hash captured evidence.
         # No `sudo`: both base images run as root and neither
         # ships sudo; adding it would break with "command not
         # found".
@@ -145,7 +147,7 @@ ci_pod() {
             apt-get update >/dev/null
             apt-get install -y libasound2-dev git >/dev/null
         elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y alsa-lib-devel git >/dev/null
+            dnf install -y alsa-lib-devel git perl-Digest-SHA >/dev/null
         fi
 
         # Ensure clippy is present. Neither `rust:1.94` nor the
