@@ -1,0 +1,16 @@
+# Copy this file to project-local.yml and replace the team ID before running
+# `xcodegen generate` for a physical iPad build. Both targets must use the
+# same paid Apple Developer team so the app can open the DriverKit user client.
+targets:
+  AzimuthIPad:
+    settings:
+      base:
+        DEVELOPMENT_TEAM: YOUR_TEAM_ID
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "Apple Development"
+  AzimuthDriver:
+    settings:
+      base:
+        DEVELOPMENT_TEAM: YOUR_TEAM_ID
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "Apple Development"

@@ -1,0 +1,2 @@
+/* Azimuth intentionally has no ordinary preferences here. iPadOS adds the
+   Drivers row for the embedded DriverKit extension. */

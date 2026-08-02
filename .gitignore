@@ -20,6 +20,8 @@ tools/
 /thd75-ui-control/capture-baseline.json
 /thd75-ui-control/radio-qualification.json
 /thd75-ui-firmware/out/
+/automation-evidence/
+/captures/
 
 # Private
 docs/
@@ -32,6 +34,8 @@ thd75_re/
 *.ambe
 
 !README.md
+!azimuth/README.md
+!azimuth-core/README.md
 
 # dstar-gateway: public docs and ADRs are committed
 !dstar-gateway/README.md
@@ -74,3 +78,14 @@ lodestar/DerivedData/
 # ML working set derived from recordings (never committed)
 /dataset/
 /lodestar/project-local.yml
+
+# Azimuth build artifacts (xcframework, generated Swift, Xcode project)
+azimuth/AzimuthCore.xcframework/
+azimuth/Generated/
+azimuth/Azimuth.xcodeproj/
+azimuth/project-local.yml
+azimuth/build/
+azimuth/DerivedData/
+azimuth/.build/
+azimuth/.derived-*/
+azimuth/*.xcworkspace/

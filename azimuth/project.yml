@@ -1,0 +1,166 @@
+name: Azimuth
+
+include:
+  - path: project-local.yml
+    optional: true
+
+options:
+  bundleIdPrefix: org.swiftraccoon.azimuth
+  deploymentTarget:
+    iOS: "26.0"
+    macOS: "26.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5"
+    SWIFT_STRICT_CONCURRENCY: complete
+    DEVELOPMENT_TEAM: ""
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "11"
+    GENERATE_INFOPLIST_FILE: NO
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGNING_ALLOWED: YES
+    CODE_SIGNING_REQUIRED: YES
+
+targets:
+  AzimuthIPad:
+    type: application
+    platform: iOS
+    sources:
+      - path: Shared
+      - path: iPad
+        excludes:
+          - Info.plist
+          - Azimuth.entitlements
+          - Settings.bundle
+      - path: iPad/Settings.bundle
+        buildPhase: resources
+      - path: Generated
+        optional: true
+    dependencies:
+      - framework: AzimuthCore.xcframework
+        embed: false
+      - sdk: FoundationModels.framework
+      - sdk: Speech.framework
+      - sdk: AVFAudio.framework
+      - sdk: IOKit.framework
+      - target: AzimuthDriver
+        embed: true
+        codeSign: true
+    info:
+      path: iPad/Info.plist
+      properties:
+        CFBundleDisplayName: Azimuth
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        NSMicrophoneUsageDescription: Azimuth uses audio input while you dictate an Assistant request or monitor the radio's USB IF output.
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities: [arm64, driverkit]
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "2"
+        PRODUCT_MODULE_NAME: Azimuth
+        PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.azimuth.ipad
+        SWIFT_OBJC_BRIDGING_HEADER: Shared/Transport/AzimuthIOKitShim.h
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: iPad/Azimuth.entitlements
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        SUPPORTS_MACCATALYST: NO
+
+  AzimuthDriver:
+    type: driver-extension
+    platform: iOS
+    sources:
+      - path: Driver
+        excludes:
+          - Driver.entitlements
+    dependencies:
+      - sdk: DriverKit.framework
+      - sdk: USBDriverKit.framework
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "2"
+        PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.azimuth.ipad.driver
+        INFOPLIST_FILE: Driver/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Driver/Driver.entitlements
+        SDKROOT: driverkit
+        SUPPORTED_PLATFORMS: driverkit
+        CLANG_CXX_LANGUAGE_STANDARD: gnu++17
+        CLANG_CXX_LIBRARY: libc++
+        DRIVERKIT_DEPLOYMENT_TARGET: "23.0"
+
+  AzimuthMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: Shared
+      - path: macOS
+        excludes:
+          - Info.plist
+          - Azimuth.entitlements
+      - path: Generated
+        optional: true
+    dependencies:
+      - framework: AzimuthCore.xcframework
+        embed: false
+      - sdk: FoundationModels.framework
+      # The Rust static archive includes the kenwood-thd75 macOS transport
+      # and screen modules, whose native Objective-C shims reference these
+      # system frameworks even though Azimuth itself uses USB-C.
+      - sdk: IOBluetooth.framework
+      - sdk: Vision.framework
+    info:
+      path: macOS/Info.plist
+      properties:
+        CFBundleDisplayName: Azimuth
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        LSApplicationCategoryType: public.app-category.utilities
+        NSPrincipalClass: NSApplication
+    settings:
+      base:
+        PRODUCT_MODULE_NAME: Azimuth
+        PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.azimuth.mac
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: macOS/Azimuth.entitlements
+
+  AzimuthTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: AzimuthMac
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.azimuth.mac.tests
+
+schemes:
+  AzimuthMac:
+    build:
+      targets:
+        AzimuthMac: all
+        AzimuthTests: [test]
+    test:
+      targets:
+        - AzimuthTests
+    run:
+      config: Debug
+  AzimuthIPad:
+    build:
+      targets:
+        AzimuthIPad: all
+    run:
+      config: Debug

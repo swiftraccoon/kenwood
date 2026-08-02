@@ -1,0 +1,33 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Swift Raccoon
+ * SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
+ *
+ * Companion driver for the TH-D75 CDC ACM control interface (interface 0).
+ * Claiming it and servicing interrupt-IN mirrors a normal host ACM stack and
+ * is required for the radio to return bytes on the data interface.
+ */
+
+#ifndef AzimuthUSBCommDriver_h
+#define AzimuthUSBCommDriver_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+#include <USBDriverKit/IOUSBHostInterface.iig>
+#include <USBDriverKit/IOUSBHostPipe.iig>
+
+class AzimuthUSBCommDriver: public IOService
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+
+    virtual void InterruptComplete(OSAction *action,
+                                   IOReturn status,
+                                   uint32_t actualByteCount,
+                                   uint64_t completionTimestamp)
+        TYPE(IOUSBHostPipe::CompleteAsyncIO);
+};
+
+#endif /* AzimuthUSBCommDriver_h */

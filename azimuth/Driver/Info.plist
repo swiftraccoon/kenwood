@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Azimuth TH-D75 Driver</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>DEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>OSBundleUsageDescription</key>
+	<string>Azimuth uses this driver to communicate with your Kenwood TH-D75 over USB-C.</string>
+
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>AzimuthTHD75Data</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>IOClass</key>
+			<string>IOUserService</string>
+			<key>IOUserClass</key>
+			<string>AzimuthUSBSerialDriver</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<!-- TH-D75 VID 0x2166 / PID 0x9023, configuration 1,
+			     CDC Data interface 1 (bulk IN/OUT). -->
+			<key>idVendor</key>
+			<integer>8550</integer>
+			<key>idProduct</key>
+			<integer>36899</integer>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>1</integer>
+
+			<key>AzimuthUserClientProperties</key>
+			<dict>
+				<key>IOClass</key>
+				<string>IOUserUserClient</string>
+				<key>IOUserClass</key>
+				<string>AzimuthUserClient</string>
+			</dict>
+		</dict>
+
+		<key>AzimuthTHD75Control</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>IOClass</key>
+			<string>IOUserService</string>
+			<key>IOUserClass</key>
+			<string>AzimuthUSBCommDriver</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<key>idVendor</key>
+			<integer>8550</integer>
+			<key>idProduct</key>
+			<integer>36899</integer>
+			<key>bConfigurationValue</key>
+			<integer>1</integer>
+			<key>bInterfaceNumber</key>
+			<integer>0</integer>
+		</dict>
+	</dict>
+</dict>
+</plist>
