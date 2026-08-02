@@ -231,7 +231,7 @@ fi
 
 # Two-layer source-tree check. Cargo enforces `unsafe_code = "forbid"`
 # for every `[lints] workspace = true` crate, but the override crates
-# (thd75, thd75-tui, lodestar-core) weaken or omit that lint, and
+# (thd75, thd75-tui, lodestar-core, azimuth-core) weaken or omit that lint, and
 # thd75's source-level `#![deny(unsafe_code)]` guards only its lib
 # target; probes/examples/tests are separate compilation units. This
 # audit closes those gaps by scanning the tree directly:
@@ -244,10 +244,10 @@ fi
 #    trips the audit; a loud false positive beats a silent miss.
 #
 # Allowlist (each entry is a deliberate design decision):
-#   thd75/src/transport/bluetooth.rs: IOBluetooth RFCOMM FFI
-#   thd75-tui/src/main.rs:           CFRunLoop pump for IOBluetooth
+#   thd75/src/transport/bluetooth.rs: process-isolated IOBluetooth support FFI
+#   thd75/src/screen/vision.rs:       synchronous macOS Vision OCR bridge FFI
 check_unsafe_audit() {
-    local allowlist='thd75/src/transport/bluetooth\.rs|thd75-tui/src/main\.rs'
+    local allowlist='thd75/src/transport/bluetooth\.rs|thd75/src/screen/vision\.rs'
     local suppressions keyword
     suppressions=$(grep -rnE \
         '(allow|expect)[[:space:]]*\([[:space:]]*unsafe_code|^[[:space:]]*unsafe_code[[:space:]]*,?[[:space:]]*$' \

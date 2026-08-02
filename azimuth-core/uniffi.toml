@@ -1,0 +1,4 @@
+[bindings.swift]
+module_name = "AzimuthCore"
+ffi_module_name = "AzimuthCoreFFI"
+generate_module_map = true

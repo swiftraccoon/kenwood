@@ -1,0 +1,89 @@
+[package]
+name = "azimuth-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Rust control core for the Azimuth TH-D75 iPadOS and macOS app"
+license = "GPL-2.0-or-later"
+authors = ["swiftraccoon"]
+repository = "https://github.com/swiftraccoon/kenwood"
+readme = "README.md"
+keywords = ["amateur-radio", "ios", "kenwood", "th-d75", "uniffi"]
+categories = ["api-bindings", "hardware-support"]
+publish = false
+
+[lib]
+name = "azimuth_core"
+crate-type = ["lib", "staticlib"]
+
+[[bin]]
+name = "azimuth-uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen-cli"]
+
+[features]
+default = []
+bindgen-cli = ["uniffi/cli"]
+
+[dependencies]
+aprs = { path = "../aprs" }
+async-trait = "0.1"
+ax25-codec = { path = "../ax25-codec" }
+if-dsp = { path = "../if-dsp" }
+kenwood-thd75 = { path = "../thd75" }
+kiss-tnc = { path = "../kiss-tnc" }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+uniffi = { version = "0.31", features = ["tokio"] }
+
+# UniFFI emits the unsafe C ABI entry points required by a static Swift
+# framework. This crate therefore restates workspace lint policy without the
+# workspace-level `unsafe_code = "forbid"` rule. Hand-written source contains
+# no unsafe blocks.
+[lints.rust]
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+unused_results = "deny"
+elided_lifetimes_in_paths = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+non_ascii_idents = "deny"
+single_use_lifetimes = "deny"
+let_underscore_drop = "deny"
+unused_crate_dependencies = "deny"
+unused_import_braces = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+restriction = { level = "allow", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+missing_assert_message = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+format_push_string = "deny"
+infinite_loop = "deny"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+redundant_pub_crate = "allow"
+# Generated UniFFI entry points cannot be `const` functions.
+missing_const_for_fn = "allow"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+missing_crate_level_docs = "deny"
+invalid_codeblock_attributes = "deny"
+bare_urls = "deny"
+unescaped_backticks = "deny"

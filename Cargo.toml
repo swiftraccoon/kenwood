@@ -22,6 +22,7 @@ members = [
   "sextant",
   "stargazer",
   "lodestar-core",
+  "azimuth-core",
 ]
 resolver = "3"
 
