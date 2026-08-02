@@ -58,6 +58,8 @@
 //! - [`protocol`]: pure-logic CAT command codec (serialize / parse).
 //! - [`transport`]: async I/O trait and serial / mock implementations.
 //! - [`radio`]: high-level async API wrapping the protocol and transport layers.
+//! - [`screen`]: exact RGB565 LCD frames, stock-compatible BMP rendering, CRC-32,
+//!   and macOS Vision OCR with strict unique-text assertions.
 //! - [`memory`]: typed accessors over a TH-D75 memory image (from MCP or `.d75` files).
 //! - [`sdcard`]: parsers for TH-D75 SD card files (`.d75` config, `.tsv` lists, `.nme` logs, and more).
 //! - [`aprs`]: TH-D75-specific APRS glue, namely [`AprsClient`] owning a [`Radio`]
@@ -77,6 +79,7 @@ pub mod memory;
 pub mod mmdvm;
 pub mod protocol;
 pub mod radio;
+pub mod screen;
 pub mod sdcard;
 pub mod session;
 pub mod transport;

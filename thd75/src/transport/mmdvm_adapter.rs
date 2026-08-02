@@ -28,23 +28,13 @@
 //! awaits the pump task's [`JoinHandle`], and recovers the inner `T`
 //! that the pump returned on clean exit.
 //!
-//! # Thread-affinity (macOS Bluetooth)
+//! # Local task ownership
 //!
-//! The pump task is spawned with [`tokio::task::spawn_local`] so it
-//! runs on the same OS thread as the calling [`tokio::task::LocalSet`].
-//! This is **required** for [`crate::transport::BluetoothTransport`] on
-//! macOS: `IOBluetooth`'s RFCOMM channel callbacks are dispatched to the
-//! `CFRunLoop` of the thread that opened the channel (typically the
-//! main thread, before the tokio runtime starts). Pumping that runloop
-//! from a worker thread is a no-op: the callbacks never deliver data
-//! into the pipe that `BluetoothTransport::read` waits on. By keeping
-//! the pump on the same thread, every `bt_pump_runloop()` call drains
-//! pending callbacks where they actually live.
-//!
-//! Callers must therefore construct this adapter from inside a
-//! [`tokio::task::LocalSet`]. For the REPL/TUI, the top-level
-//! `run_repl` future is launched via `LocalSet::block_on`, satisfying
-//! this requirement transparently.
+//! The pump uses [`tokio::task::spawn_local`], so callers must construct this
+//! adapter inside a [`tokio::task::LocalSet`]. This is an adapter ownership
+//! choice, not an `IOBluetooth` thread-affinity requirement: native macOS
+//! Bluetooth owns its framework objects and `CFRunLoop` in a private helper
+//! process.
 
 use std::io;
 use std::pin::Pin;
@@ -110,8 +100,7 @@ impl<T: Transport + 'static> MmdvmTransportAdapter<T> {
     ///
     /// Spawns the pump task on the current [`tokio::task::LocalSet`]
     /// via [`tokio::task::spawn_local`]. **Panics** if no `LocalSet`
-    /// is active; see the [module-level docs](self) for why this is
-    /// required (macOS Bluetooth thread-affinity).
+    /// is active; see the [module-level docs](self).
     #[must_use]
     pub fn new(inner: T) -> Self {
         let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(WRITE_CHANNEL_CAPACITY);

@@ -14,8 +14,9 @@
 //! # Details
 //!
 //! This parser validates the BMP and DIB headers, verifies the
-//! dimensions and bit depth match the TH-D75 display, and extracts
-//! the raw BGR pixel data. BMP files store rows bottom-up by default.
+//! dimensions and bit depth match the TH-D75 display, and canonicalizes
+//! the pixels to top-down RGB order. Native captures use a positive
+//! height (bottom-up rows); valid negative-height BMPs decode identically.
 
 use super::{SdCardError, read_u16_le, read_u32_le};
 
@@ -27,6 +28,12 @@ const EXPECTED_HEIGHT: u32 = 180;
 
 /// Expected bits per pixel.
 const EXPECTED_BPP: u16 = 24;
+
+/// Expected number of color planes.
+const EXPECTED_PLANES: u16 = 1;
+
+/// Bytes per canonical RGB pixel.
+const RGB_BYTES_PER_PIXEL: usize = 3;
 
 /// BMP file header size (14 bytes).
 const BMP_HEADER_SIZE: usize = 14;
@@ -42,8 +49,7 @@ const BI_RGB: u32 = 0;
 
 /// A parsed TH-D75 screen capture.
 ///
-/// Contains the validated image metadata and raw BGR pixel data
-/// as stored in the BMP file (bottom-up row order).
+/// Contains validated image metadata and canonical RGB pixel data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenCapture {
     /// Image width in pixels. Expected: 240 for TH-D75.
@@ -52,11 +58,10 @@ pub struct ScreenCapture {
     pub height: u32,
     /// Bits per pixel. Expected: 24 for TH-D75.
     pub bits_per_pixel: u16,
-    /// Raw BGR pixel data in bottom-up row order.
+    /// RGB pixel data in top-down row order.
     ///
-    /// Each pixel is 3 bytes: blue, green, red. Rows are stored
-    /// from the bottom of the image to the top, as is standard
-    /// for BMP files. Row padding (to 4-byte alignment) is stripped.
+    /// Each pixel is three bytes: red, green, blue. Row zero is the top
+    /// display row. BMP row padding is stripped.
     pub pixels: Vec<u8>,
 }
 
@@ -72,21 +77,68 @@ fn read_i32_le(data: &[u8], offset: usize) -> i32 {
 
 /// Parse a BMP screen capture file from raw bytes.
 ///
-/// Validates the BMP file header, DIB header, dimensions, and bit
-/// depth. Extracts the raw BGR pixel data with row padding removed.
+/// Validates the BMP file header, DIB header, declared sizes, pixel offset,
+/// dimensions, planes, bit depth, and compression. Pixels are returned as
+/// tightly packed, top-down RGB regardless of the source BMP's signed height.
 ///
 /// # Errors
 ///
 /// Returns [`SdCardError::FileTooSmall`] if the data is shorter than
 /// the minimum BMP header size (54 bytes).
 ///
-/// Returns [`SdCardError::InvalidBmpHeader`] if the BM magic bytes,
-/// DIB header size, or compression type is invalid.
+/// Returns [`SdCardError::InvalidBmpHeader`] if any structural field is
+/// inconsistent, including declared sizes or a pixel offset inside the headers.
 ///
 /// Returns [`SdCardError::UnexpectedImageFormat`] if the width,
 /// height, or bit depth does not match the expected TH-D75 screen
 /// dimensions (240x180, 24-bit).
 pub fn parse(data: &[u8]) -> Result<ScreenCapture, SdCardError> {
+    let file_header = parse_file_header(data)?;
+    let dib_header = parse_dib_header(data)?;
+    let layout = validate_pixel_layout(data, file_header, dib_header)?;
+    let pixels = decode_pixels(data, file_header, dib_header, layout)?;
+
+    Ok(ScreenCapture {
+        width: dib_header.width,
+        height: dib_header.height,
+        bits_per_pixel: dib_header.bits_per_pixel,
+        pixels,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FileHeader {
+    declared_file_size: usize,
+    pixel_offset: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DibHeader {
+    width: u32,
+    height: u32,
+    raw_height: i32,
+    bits_per_pixel: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PixelLayout {
+    height: usize,
+    bytes_per_row: usize,
+    row_stride: usize,
+    canonical_size: usize,
+}
+
+fn invalid_bmp(detail: impl Into<String>) -> SdCardError {
+    SdCardError::InvalidBmpHeader {
+        detail: detail.into(),
+    }
+}
+
+fn usize_header_field(value: u32, field: &str) -> Result<usize, SdCardError> {
+    usize::try_from(value).map_err(|_| invalid_bmp(format!("{field} does not fit this platform")))
+}
+
+fn parse_file_header(data: &[u8]) -> Result<FileHeader, SdCardError> {
     if data.len() < MIN_BMP_SIZE {
         return Err(SdCardError::FileTooSmall {
             expected: MIN_BMP_SIZE,
@@ -96,51 +148,92 @@ pub fn parse(data: &[u8]) -> Result<ScreenCapture, SdCardError> {
 
     // Validate BM magic bytes.
     if data.get(..2) != Some(b"BM") {
-        return Err(SdCardError::InvalidBmpHeader {
-            detail: "missing BM magic bytes".to_owned(),
-        });
+        return Err(invalid_bmp("missing BM magic bytes"));
     }
 
-    // Pixel data offset from file header.
-    let pixel_offset = read_u32_le(data, 10) as usize;
+    let declared_file_size = usize_header_field(read_u32_le(data, 2), "declared file size")?;
+    if declared_file_size != data.len() {
+        return Err(invalid_bmp(format!(
+            "declared file size {declared_file_size} does not match actual size {}",
+            data.len()
+        )));
+    }
+    let reserved_1 = read_u16_le(data, 6);
+    let reserved_2 = read_u16_le(data, 8);
+    if reserved_1 != 0 || reserved_2 != 0 {
+        return Err(invalid_bmp(format!(
+            "reserved file-header fields must be zero (got {reserved_1}, {reserved_2})"
+        )));
+    }
 
-    // DIB header size (at offset 14).
+    let pixel_offset = usize_header_field(read_u32_le(data, 10), "pixel offset")?;
+
     let dib_size = read_u32_le(data, 14);
     if dib_size < MIN_DIB_HEADER_SIZE {
-        return Err(SdCardError::InvalidBmpHeader {
-            detail: format!("DIB header size {dib_size} too small (minimum {MIN_DIB_HEADER_SIZE})"),
+        return Err(invalid_bmp(format!(
+            "DIB header size {dib_size} too small (minimum {MIN_DIB_HEADER_SIZE})"
+        )));
+    }
+    let dib_size = usize_header_field(dib_size, "DIB header size")?;
+    let dib_end = BMP_HEADER_SIZE
+        .checked_add(dib_size)
+        .ok_or_else(|| invalid_bmp("DIB header end overflows address space"))?;
+    if data.len() < dib_end {
+        return Err(SdCardError::FileTooSmall {
+            expected: dib_end,
+            actual: data.len(),
         });
     }
+    if pixel_offset < dib_end {
+        return Err(invalid_bmp(format!(
+            "pixel offset {pixel_offset} points inside headers ending at {dib_end}"
+        )));
+    }
 
-    // Image dimensions. Height can be negative (top-down), but TH-D75
-    // uses standard bottom-up, so we read as signed and take absolute value.
+    Ok(FileHeader {
+        declared_file_size,
+        pixel_offset,
+    })
+}
+
+fn parse_dib_header(data: &[u8]) -> Result<DibHeader, SdCardError> {
+    // A positive height stores BMP rows bottom-up; a negative height stores
+    // them top-down. The returned pixels are top-down in both cases.
     let raw_width = read_i32_le(data, 18);
     let raw_height = read_i32_le(data, 22);
 
     let Ok(width) = u32::try_from(raw_width) else {
-        return Err(SdCardError::InvalidBmpHeader {
-            detail: format!("invalid width {raw_width}"),
-        });
+        return Err(invalid_bmp(format!("invalid width {raw_width}")));
     };
     if width == 0 {
-        return Err(SdCardError::InvalidBmpHeader {
-            detail: "width is zero".to_owned(),
-        });
+        return Err(invalid_bmp("width is zero"));
     }
 
+    if raw_height == 0 {
+        return Err(invalid_bmp("height is zero"));
+    }
+    if raw_height == i32::MIN {
+        return Err(invalid_bmp(
+            "height cannot be represented as an absolute value",
+        ));
+    }
     let height = raw_height.unsigned_abs();
 
-    let bits_per_pixel = read_u16_le(data, 28);
-
-    // Compression (offset 30).
-    let compression = read_u32_le(data, 30);
-    if compression != BI_RGB {
-        return Err(SdCardError::InvalidBmpHeader {
-            detail: format!("unsupported compression type {compression} (expected 0 for BI_RGB)"),
-        });
+    let planes = read_u16_le(data, 26);
+    if planes != EXPECTED_PLANES {
+        return Err(invalid_bmp(format!(
+            "invalid color plane count {planes} (expected {EXPECTED_PLANES})"
+        )));
     }
 
-    // Validate TH-D75 expected format.
+    let bits_per_pixel = read_u16_le(data, 28);
+    let compression = read_u32_le(data, 30);
+    if compression != BI_RGB {
+        return Err(invalid_bmp(format!(
+            "unsupported compression type {compression} (expected 0 for BI_RGB)"
+        )));
+    }
+
     if width != EXPECTED_WIDTH || height != EXPECTED_HEIGHT || bits_per_pixel != EXPECTED_BPP {
         return Err(SdCardError::UnexpectedImageFormat {
             width,
@@ -149,58 +242,121 @@ pub fn parse(data: &[u8]) -> Result<ScreenCapture, SdCardError> {
         });
     }
 
-    // Calculate row stride with padding to 4-byte boundary.
-    let bytes_per_row = u32::from(bits_per_pixel) / 8 * width;
-    let row_stride = (bytes_per_row + 3) & !3;
+    Ok(DibHeader {
+        width,
+        height,
+        raw_height,
+        bits_per_pixel,
+    })
+}
 
-    let pixel_data_size = row_stride as usize * height as usize;
-    let required_size = pixel_offset + pixel_data_size;
+fn validate_pixel_layout(
+    data: &[u8],
+    file_header: FileHeader,
+    dib_header: DibHeader,
+) -> Result<PixelLayout, SdCardError> {
+    let width = usize_header_field(dib_header.width, "width")?;
+    let height = usize_header_field(dib_header.height, "height")?;
 
-    if data.len() < required_size {
+    // Calculate the BMP row stride, including padding to a four-byte boundary.
+    let bytes_per_row = width
+        .checked_mul(RGB_BYTES_PER_PIXEL)
+        .ok_or_else(|| invalid_bmp("unpacked row size overflows address space"))?;
+    let row_stride = bytes_per_row
+        .checked_add(3)
+        .map(|size| size & !3)
+        .ok_or_else(|| invalid_bmp("padded row size overflows address space"))?;
+    let pixel_data_size = row_stride
+        .checked_mul(height)
+        .ok_or_else(|| invalid_bmp("pixel data size overflows address space"))?;
+
+    let declared_image_size = usize_header_field(read_u32_le(data, 34), "declared image size")?;
+    if declared_image_size != pixel_data_size {
+        return Err(invalid_bmp(format!(
+            "declared image size {declared_image_size} does not match computed size \
+             {pixel_data_size}"
+        )));
+    }
+
+    let pixel_end = file_header
+        .pixel_offset
+        .checked_add(pixel_data_size)
+        .ok_or_else(|| invalid_bmp("pixel data end overflows address space"))?;
+    if data.len() < pixel_end {
         return Err(SdCardError::FileTooSmall {
-            expected: required_size,
+            expected: pixel_end,
             actual: data.len(),
         });
     }
+    if pixel_end != file_header.declared_file_size {
+        return Err(invalid_bmp(format!(
+            "pixel data ends at {pixel_end}, but declared file size is {}",
+            file_header.declared_file_size
+        )));
+    }
 
-    // Extract pixel data, stripping row padding if present.
-    let pixels = if row_stride == bytes_per_row {
-        data.get(pixel_offset..pixel_offset + pixel_data_size)
-            .ok_or(SdCardError::FileTooSmall {
-                expected: pixel_offset + pixel_data_size,
-                actual: data.len(),
-            })?
-            .to_vec()
-    } else {
-        let mut pixels = Vec::with_capacity(bytes_per_row as usize * height as usize);
-        for row in 0..height as usize {
-            let row_start = pixel_offset + row * row_stride as usize;
-            let row_end = row_start + bytes_per_row as usize;
-            let row_slice = data
-                .get(row_start..row_end)
-                .ok_or(SdCardError::FileTooSmall {
-                    expected: row_end,
-                    actual: data.len(),
-                })?;
-            pixels.extend_from_slice(row_slice);
-        }
-        pixels
-    };
+    let canonical_size = bytes_per_row
+        .checked_mul(height)
+        .ok_or_else(|| invalid_bmp("canonical pixel data size overflows address space"))?;
 
-    Ok(ScreenCapture {
-        width,
+    Ok(PixelLayout {
         height,
-        bits_per_pixel,
-        pixels,
+        bytes_per_row,
+        row_stride,
+        canonical_size,
     })
+}
+
+fn decode_pixels(
+    data: &[u8],
+    file_header: FileHeader,
+    dib_header: DibHeader,
+    layout: PixelLayout,
+) -> Result<Vec<u8>, SdCardError> {
+    let mut pixels = Vec::with_capacity(layout.canonical_size);
+    for output_row in 0..layout.height {
+        let source_row = if dib_header.raw_height.is_positive() {
+            layout.height - 1 - output_row
+        } else {
+            output_row
+        };
+        let row_offset = source_row
+            .checked_mul(layout.row_stride)
+            .ok_or_else(|| invalid_bmp("source row offset overflows address space"))?;
+        let row_start = file_header
+            .pixel_offset
+            .checked_add(row_offset)
+            .ok_or_else(|| invalid_bmp("source row start overflows address space"))?;
+        let row_end = row_start
+            .checked_add(layout.bytes_per_row)
+            .ok_or_else(|| invalid_bmp("source row end overflows address space"))?;
+        let row = data
+            .get(row_start..row_end)
+            .ok_or(SdCardError::FileTooSmall {
+                expected: row_end,
+                actual: data.len(),
+            })?;
+        for bgr in row.chunks_exact(RGB_BYTES_PER_PIXEL) {
+            let &[blue, green, red] = bgr else {
+                return Err(invalid_bmp(
+                    "pixel row is not a whole number of 24-bit pixels",
+                ));
+            };
+            pixels.extend_from_slice(&[red, green, blue]);
+        }
+    }
+
+    Ok(pixels)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a minimal valid BMP file with the given parameters.
-    fn build_bmp(width: u32, height: u32, bpp: u16) -> Vec<u8> {
+    /// Build a structurally complete BMP whose logical pixels are independent
+    /// of the source row orientation.
+    fn build_bmp(width: u32, signed_height: i32, bpp: u16) -> Vec<u8> {
+        let height = signed_height.unsigned_abs();
         let bytes_per_row = u32::from(bpp) / 8 * width;
         let row_stride = (bytes_per_row + 3) & !3;
         let pixel_data_size = row_stride * height;
@@ -224,12 +380,7 @@ mod tests {
                       positive values (<= 2^31-1), so the cast from u32 never wraps."
         )]
         buf.extend_from_slice(&(width as i32).to_le_bytes());
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "BMP DIB height is i32 (negative indicates top-down rows) per Microsoft's \
-                      BITMAPINFOHEADER spec. Test-only values stay well below i32::MAX."
-        )]
-        buf.extend_from_slice(&(height as i32).to_le_bytes());
+        buf.extend_from_slice(&signed_height.to_le_bytes());
         buf.extend_from_slice(&1u16.to_le_bytes()); // planes
         buf.extend_from_slice(&bpp.to_le_bytes());
         buf.extend_from_slice(&BI_RGB.to_le_bytes()); // compression
@@ -239,30 +390,17 @@ mod tests {
         buf.extend_from_slice(&0u32.to_le_bytes()); // colors used
         buf.extend_from_slice(&0u32.to_le_bytes()); // important colors
 
-        // Pixel data (fill with a recognisable pattern).
-        for row in 0..height {
+        // BMP storage rows are bottom-up for positive heights and top-down for
+        // negative heights. Encode the same logical image in either form.
+        for storage_row in 0..height {
+            let logical_row = if signed_height.is_positive() {
+                height - 1 - storage_row
+            } else {
+                storage_row
+            };
             for col in 0..width {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "Synthesises a recognisable test pixel pattern. `x % 256` is \
-                              provably in 0..=255, so the u32-to-u8 cast cannot truncate."
-                )]
-                let b = ((row + col) % 256) as u8;
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "Synthesises a recognisable test pixel pattern. `x % 256` is \
-                              provably in 0..=255, so the u32-to-u8 cast cannot truncate."
-                )]
-                let g = ((row * 2 + col) % 256) as u8;
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "Synthesises a recognisable test pixel pattern. `x % 256` is \
-                              provably in 0..=255, so the u32-to-u8 cast cannot truncate."
-                )]
-                let r = ((row + col * 2) % 256) as u8;
-                buf.push(b);
-                buf.push(g);
-                buf.push(r);
+                let [red, green, blue] = expected_rgb(logical_row, col);
+                buf.extend_from_slice(&[blue, green, red]);
             }
             // Padding bytes to reach row_stride.
             let padding = row_stride - bytes_per_row;
@@ -270,6 +408,18 @@ mod tests {
         }
 
         buf
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Each component is explicitly reduced modulo 256 before conversion to u8."
+    )]
+    fn expected_rgb(row: u32, column: u32) -> [u8; RGB_BYTES_PER_PIXEL] {
+        [
+            (row % 256) as u8,
+            (column % 256) as u8,
+            ((row + column) % 256) as u8,
+        ]
     }
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -287,12 +437,33 @@ mod tests {
         Ok(())
     }
 
-    /// Return `bytes[idx]` or an error if out of range.
-    fn byte_at(bytes: &[u8], idx: usize) -> Result<u8, BoxErr> {
-        bytes
-            .get(idx)
-            .copied()
-            .ok_or_else(|| format!("byte_at: idx {idx} out of range (len={})", bytes.len()).into())
+    fn pixel_at(pixels: &[u8], row: usize, column: usize) -> Result<[u8; 3], BoxErr> {
+        let offset = (row * EXPECTED_WIDTH as usize + column) * RGB_BYTES_PER_PIXEL;
+        let end = offset + RGB_BYTES_PER_PIXEL;
+        let pixel = pixels.get(offset..end).ok_or_else(|| {
+            format!(
+                "pixel_at: range {offset}..{end} out of bounds (len={})",
+                pixels.len()
+            )
+        })?;
+        <[u8; 3]>::try_from(pixel).map_err(|_| {
+            format!(
+                "pixel_at: expected exactly three bytes, got {}",
+                pixel.len()
+            )
+            .into()
+        })
+    }
+
+    fn assert_invalid_bmp(data: &[u8]) -> TestResult {
+        let err = parse(data)
+            .err()
+            .ok_or("expected InvalidBmpHeader but got Ok")?;
+        assert!(
+            matches!(err, SdCardError::InvalidBmpHeader { .. }),
+            "expected InvalidBmpHeader, got {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -303,25 +474,23 @@ mod tests {
         assert_eq!(cap.width, 240);
         assert_eq!(cap.height, 180);
         assert_eq!(cap.bits_per_pixel, 24);
-        // 240 * 180 * 3 = 129600 bytes of pixel data (no padding needed: 240*3=720, divisible by 4)
+        // 240 * 180 * 3 = 129600 canonical RGB bytes.
         assert_eq!(cap.pixels.len(), 240 * 180 * 3);
         Ok(())
     }
 
     #[test]
-    fn pixel_data_correct() -> TestResult {
-        let bmp = build_bmp(240, 180, 24);
-        let cap = parse(&bmp)?;
+    fn signed_height_forms_have_identical_top_down_rgb() -> TestResult {
+        let bottom_up = parse(&build_bmp(240, 180, 24))?;
+        let top_down = parse(&build_bmp(240, -180, 24))?;
 
-        // Verify first pixel (row 0, col 0): b=0, g=0, r=0
-        assert_eq!(byte_at(&cap.pixels, 0)?, 0); // blue
-        assert_eq!(byte_at(&cap.pixels, 1)?, 0); // green
-        assert_eq!(byte_at(&cap.pixels, 2)?, 0); // red
-
-        // Verify second pixel (row 0, col 1): b=1, g=1, r=2
-        assert_eq!(byte_at(&cap.pixels, 3)?, 1);
-        assert_eq!(byte_at(&cap.pixels, 4)?, 1);
-        assert_eq!(byte_at(&cap.pixels, 5)?, 2);
+        assert_eq!(bottom_up, top_down);
+        assert_eq!(pixel_at(&bottom_up.pixels, 0, 0)?, expected_rgb(0, 0));
+        assert_eq!(pixel_at(&bottom_up.pixels, 5, 7)?, expected_rgb(5, 7));
+        assert_eq!(
+            pixel_at(&bottom_up.pixels, 179, 239)?,
+            expected_rgb(179, 239)
+        );
         Ok(())
     }
 
@@ -352,14 +521,7 @@ mod tests {
     fn wrong_magic_bytes() -> TestResult {
         let mut bmp = build_bmp(240, 180, 24);
         write_slice(&mut bmp, 0, b"XX")?;
-        let err = parse(&bmp)
-            .err()
-            .ok_or("expected InvalidBmpHeader but got Ok")?;
-        assert!(
-            matches!(err, SdCardError::InvalidBmpHeader { .. }),
-            "expected InvalidBmpHeader, got {err:?}"
-        );
-        Ok(())
+        assert_invalid_bmp(&bmp)
     }
 
     #[test]
@@ -377,7 +539,8 @@ mod tests {
 
     #[test]
     fn wrong_bit_depth_rejected() -> TestResult {
-        let bmp = build_bmp(240, 180, 32);
+        let mut bmp = build_bmp(240, 180, 24);
+        write_slice(&mut bmp, 28, &32u16.to_le_bytes())?;
         let err = parse(&bmp)
             .err()
             .ok_or("expected UnexpectedImageFormat but got Ok")?;
@@ -389,17 +552,72 @@ mod tests {
     }
 
     #[test]
+    fn undersized_dib_header_rejected() -> TestResult {
+        let mut bmp = build_bmp(240, 180, 24);
+        write_slice(&mut bmp, 14, &39u32.to_le_bytes())?;
+        assert_invalid_bmp(&bmp)
+    }
+
+    #[test]
     fn compressed_bmp_rejected() -> TestResult {
         let mut bmp = build_bmp(240, 180, 24);
         // Set compression to 1 (BI_RLE8) at offset 30.
         write_slice(&mut bmp, 30, &1u32.to_le_bytes())?;
-        let err = parse(&bmp)
-            .err()
-            .ok_or("expected InvalidBmpHeader but got Ok")?;
-        assert!(
-            matches!(err, SdCardError::InvalidBmpHeader { .. }),
-            "expected InvalidBmpHeader, got {err:?}"
-        );
+        assert_invalid_bmp(&bmp)
+    }
+
+    #[test]
+    fn non_unit_color_plane_count_rejected() -> TestResult {
+        let mut bmp = build_bmp(240, 180, 24);
+        write_slice(&mut bmp, 26, &2u16.to_le_bytes())?;
+        assert_invalid_bmp(&bmp)
+    }
+
+    #[test]
+    fn declared_file_size_mismatch_rejected() -> TestResult {
+        let mut bmp = build_bmp(240, 180, 24);
+        let incorrect_size = u32::try_from(bmp.len())? - 1;
+        write_slice(&mut bmp, 2, &incorrect_size.to_le_bytes())?;
+        assert_invalid_bmp(&bmp)
+    }
+
+    #[test]
+    fn nonzero_reserved_header_fields_rejected() -> TestResult {
+        let mut bmp = build_bmp(240, 180, 24);
+        write_slice(&mut bmp, 6, &1u16.to_le_bytes())?;
+        assert_invalid_bmp(&bmp)
+    }
+
+    #[test]
+    fn declared_image_size_mismatch_rejected() -> TestResult {
+        let mut bmp = build_bmp(240, 180, 24);
+        write_slice(&mut bmp, 34, &(129_600_u32 - 1).to_le_bytes())?;
+        assert_invalid_bmp(&bmp)
+    }
+
+    #[test]
+    fn pixel_offset_inside_headers_rejected() -> TestResult {
+        let mut bmp = build_bmp(240, 180, 24);
+        write_slice(&mut bmp, 10, &53u32.to_le_bytes())?;
+        assert_invalid_bmp(&bmp)
+    }
+
+    #[test]
+    fn bytes_after_declared_pixel_array_rejected() -> TestResult {
+        let mut bmp = build_bmp(240, 180, 24);
+        bmp.push(0);
+        let enlarged_size = u32::try_from(bmp.len())?;
+        write_slice(&mut bmp, 2, &enlarged_size.to_le_bytes())?;
+        assert_invalid_bmp(&bmp)
+    }
+
+    #[test]
+    fn zero_and_unrepresentable_heights_rejected() -> TestResult {
+        for height in [0, i32::MIN] {
+            let mut bmp = build_bmp(240, 180, 24);
+            write_slice(&mut bmp, 22, &height.to_le_bytes())?;
+            assert_invalid_bmp(&bmp)?;
+        }
         Ok(())
     }
 
@@ -408,6 +626,7 @@ mod tests {
         let mut bmp = build_bmp(240, 180, 24);
         // Truncate to just the header.
         bmp.truncate(60);
+        write_slice(&mut bmp, 2, &60u32.to_le_bytes())?;
         let err = parse(&bmp)
             .err()
             .ok_or("expected FileTooSmall but got Ok")?;

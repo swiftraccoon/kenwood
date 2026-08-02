@@ -26,15 +26,15 @@
 //! Implementations:
 //! - [`SerialTransport`]: USB serial connections, plus serial RFCOMM on
 //!   Linux and Windows
-//! - [`BluetoothTransport`]: Native macOS `IOBluetooth` RFCOMM (macOS only)
+//! - `BluetoothTransport`: Native macOS `IOBluetooth` RFCOMM (macOS only)
 //! - [`MockTransport`]: Programmed exchanges for testing
 //!
-//! On macOS, use [`BluetoothTransport`] for Bluetooth connections. Apple's
-//! Bluetooth serial driver drops data for this radio, and closing and
-//! reopening `/dev/cu.TH-D75` can also kill the RFCOMM channel permanently.
-//! [`BluetoothTransport`] bypasses that driver and talks directly to RFCOMM.
+//! On macOS, use `BluetoothTransport` for Bluetooth connections. Apple's
+//! Bluetooth serial driver drops data for this radio; `BluetoothTransport`
+//! bypasses that device node and talks directly to RFCOMM in an isolated
+//! helper process.
 
-#[cfg(any(target_os = "macos", doc))]
+#[cfg(any(target_os = "macos", all(doc, unix)))]
 pub mod bluetooth;
 pub mod broker;
 pub mod either;
@@ -42,7 +42,7 @@ pub mod mmdvm_adapter;
 pub mod mock;
 pub mod serial;
 
-#[cfg(any(target_os = "macos", doc))]
+#[cfg(any(target_os = "macos", all(doc, unix)))]
 pub use bluetooth::BluetoothTransport;
 pub use broker::{BrokerHandle, MainThreadBroker};
 pub use either::EitherTransport;

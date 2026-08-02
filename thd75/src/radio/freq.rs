@@ -765,38 +765,6 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set the firmware version string (FV write) -- factory programming command.
-    ///
-    /// # Safety
-    ///
-    /// **DANGEROUS FACTORY COMMAND.** This is intended for factory programming
-    /// only. Writing an incorrect firmware version string may brick the radio,
-    /// cause firmware validation failures, or void your warranty. **Do not use
-    /// unless you fully understand the consequences.**
-    ///
-    /// # Wire format
-    ///
-    /// `FV version\r`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_firmware_version(&mut self, version: &str) -> Result<(), Error> {
-        tracing::warn!(version, "setting firmware version (FACTORY COMMAND)");
-        let response = self
-            .execute(Command::SetFirmwareVersion {
-                version: version.to_owned(),
-            })
-            .await?;
-        match response {
-            Response::FirmwareVersion { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "FirmwareVersion".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
     /// Set the radio model identification string (ID write) -- factory programming command.
     ///
     /// # Safety

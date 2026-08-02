@@ -22,10 +22,16 @@ const MAX_GM_FRAME_LEN: usize = 523;
 
 #[derive(Debug, Clone, Copy)]
 struct PatchAttestation {
-    offset: u32,
+    firmware_offset: u32,
     expected: &'static [u8],
 }
 
+/// Main-firmware offset in the CPU-visible low-NOR window.
+///
+/// DDR maps the running main image at offset zero, while low NOR starts with
+/// the 2 MiB bootloader/FLDM window and maps the main image after it.
+const LOW_NOR_FIRMWARE_OFFSET: u32 = 0x20_0000;
+const BASE_ATTESTATION_FIRMWARE_OFFSET: u32 = 0x06_F8A0;
 const DISPATCH_ATTESTATION: &[u8] = &[0x01, 0xEC, 0x02, 0xC0, 0x47, 0x4D, 0x00, 0x00];
 const ADAPTER_ATTESTATION: &[u8] = &[
     0x10, 0xB5, 0x14, 0x00, 0x40, 0xF0, 0x0F, 0xFE, 0x02, 0x20, 0x20, 0x70, 0x10, 0xBD,
@@ -39,15 +45,15 @@ const LOW_NOR_BASE_ATTESTATION: &[u8] = &[
 ];
 const COMMON_PATCH_ATTESTATIONS: &[PatchAttestation] = &[
     PatchAttestation {
-        offset: 0x22_E2C8,
+        firmware_offset: 0x02_E2C8,
         expected: DISPATCH_ATTESTATION,
     },
     PatchAttestation {
-        offset: 0x22_EC00,
+        firmware_offset: 0x02_EC00,
         expected: ADAPTER_ATTESTATION,
     },
     PatchAttestation {
-        offset: 0x26_F85C,
+        firmware_offset: 0x06_F85C,
         expected: BOUND_ATTESTATION,
     },
 ];
@@ -375,18 +381,21 @@ impl<T: Transport> Radio<T> {
             MemoryReadTarget::DdrV103 => DDR_BASE_ATTESTATION,
             MemoryReadTarget::LowNorV103 => LOW_NOR_BASE_ATTESTATION,
         };
+        let base_offset = Self::patch_attestation_offset(target, BASE_ATTESTATION_FIRMWARE_OFFSET);
 
         // This is deliberately the first GM request.
         let discriminator = target_base.get(..1).ok_or_else(|| {
             Self::strict_protocol_error("a target base attestation byte", target_base.to_vec())
         })?;
-        self.attest_exact_read(target, 0x26_F8A0, discriminator)
+        self.attest_exact_read(target, base_offset, discriminator)
             .await?;
         for item in COMMON_PATCH_ATTESTATIONS {
-            self.attest_exact_read(target, item.offset, item.expected)
+            let offset = Self::patch_attestation_offset(target, item.firmware_offset);
+            self.attest_exact_read(target, offset, item.expected)
                 .await?;
         }
-        self.attest_exact_read(target, 0x26_F8A0, target_base).await
+        self.attest_exact_read(target, base_offset, target_base)
+            .await
     }
 
     async fn attest_ddr_v103(&mut self) -> Result<(), Error> {
@@ -515,11 +524,13 @@ impl<T: Transport> Radio<T> {
 
     fn attestation_read_allowed(target: MemoryReadTarget, raw_offset: u32, len: ReadLen) -> bool {
         let length = len.as_u16();
-        let common = matches!(
-            (raw_offset, length),
-            (0x26_F8A0, 1 | 16) | (0x22_E2C8, 8) | (0x22_EC00, 14) | (0x26_F85C, 4)
-        );
-        common
+        let base_offset = Self::patch_attestation_offset(target, BASE_ATTESTATION_FIRMWARE_OFFSET);
+        let patch = (raw_offset == base_offset && matches!(length, 1 | 16))
+            || COMMON_PATCH_ATTESTATIONS.iter().any(|item| {
+                raw_offset == Self::patch_attestation_offset(target, item.firmware_offset)
+                    && usize::from(length) == item.expected.len()
+            });
+        patch
             || match target {
                 MemoryReadTarget::DdrV103 => matches!(
                     (raw_offset, length),
@@ -532,12 +543,25 @@ impl<T: Transport> Radio<T> {
             }
     }
 
-    async fn strict_checkpoint(&mut self) -> Result<(), Error> {
+    /// Resolve one flat main-firmware offset in the selected reader's address
+    /// space.
+    ///
+    /// The DDR reader starts at the running image (`0xC0000000 + offset`).
+    /// The low-NOR reader starts at NOR zero and therefore reaches the same
+    /// instruction after the 2 MiB bootloader/FLDM prefix.
+    const fn patch_attestation_offset(target: MemoryReadTarget, firmware_offset: u32) -> u32 {
+        match target {
+            MemoryReadTarget::DdrV103 => firmware_offset,
+            MemoryReadTarget::LowNorV103 => LOW_NOR_FIRMWARE_OFFSET + firmware_offset,
+        }
+    }
+
+    pub(super) async fn strict_checkpoint(&mut self) -> Result<(), Error> {
         self.strict_expect(b"ID\r", EXPECTED_MODEL_FRAME).await?;
         self.require_strict_quiet().await
     }
 
-    async fn strict_gm_read(
+    pub(super) async fn strict_gm_read(
         &mut self,
         offset: MemoryReadOffset,
         len: ReadLen,
@@ -550,7 +574,11 @@ impl<T: Transport> Radio<T> {
         parse_strict_read_reply(&frame, offset, len).map_err(Error::Protocol)
     }
 
-    async fn strict_expect(&mut self, request: &[u8], expected: &[u8]) -> Result<(), Error> {
+    pub(super) async fn strict_expect(
+        &mut self,
+        request: &[u8],
+        expected: &[u8],
+    ) -> Result<(), Error> {
         let actual = self.strict_cat_exchange(request, expected.len()).await?;
         if actual == expected {
             Ok(())
@@ -562,7 +590,7 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    async fn strict_cat_exchange(
+    pub(super) async fn strict_cat_exchange(
         &mut self,
         request: &[u8],
         max_frame_len: usize,
@@ -656,7 +684,7 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    async fn require_strict_quiet(&mut self) -> Result<(), Error> {
+    pub(super) async fn require_strict_quiet(&mut self) -> Result<(), Error> {
         if !self.codec.is_empty() {
             return Err(Self::strict_protocol_error(
                 "an empty CAT codec during quiet check",
@@ -704,7 +732,7 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    fn strict_protocol_error(expected: &str, actual: Vec<u8>) -> Error {
+    pub(super) fn strict_protocol_error(expected: &str, actual: Vec<u8>) -> Error {
         Error::Protocol(ProtocolError::UnexpectedResponse {
             expected: expected.to_owned(),
             actual,
@@ -715,9 +743,9 @@ impl<T: Transport> Radio<T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ADAPTER_ATTESTATION, BOUND_ATTESTATION, DDR_BASE_ATTESTATION, DDR_PROBE_OFFSET,
-        DISPATCH_ATTESTATION, LOW_NOR_BASE_ATTESTATION, MemoryReader, PROBE_EXPECTED,
-        PROBE_EXPECTED_HEADER,
+        ADAPTER_ATTESTATION, BASE_ATTESTATION_FIRMWARE_OFFSET, BOUND_ATTESTATION,
+        DDR_BASE_ATTESTATION, DDR_PROBE_OFFSET, DISPATCH_ATTESTATION, LOW_NOR_BASE_ATTESTATION,
+        MemoryReader, PROBE_EXPECTED, PROBE_EXPECTED_HEADER,
     };
     use crate::error::Error;
     use crate::protocol::Command;
@@ -744,18 +772,35 @@ mod tests {
         mock.expect(b"ID\r", b"ID TH-D75\r");
     }
 
-    fn queue_patch_attestation(mock: &mut MockTransport, discriminator: u8, target_base: &[u8]) {
-        queue_checked_read(mock, 0x26_F8A0, &[discriminator]);
-        queue_checked_read(mock, 0x22_E2C8, DISPATCH_ATTESTATION);
-        queue_checked_read(mock, 0x22_EC00, ADAPTER_ATTESTATION);
-        queue_checked_read(mock, 0x26_F85C, BOUND_ATTESTATION);
-        queue_checked_read(mock, 0x26_F8A0, target_base);
+    fn queue_patch_attestation(
+        mock: &mut MockTransport,
+        target: MemoryReadTarget,
+        discriminator: u8,
+        target_base: &[u8],
+    ) {
+        let base = Radio::<MockTransport>::patch_attestation_offset(
+            target,
+            BASE_ATTESTATION_FIRMWARE_OFFSET,
+        );
+        let dispatch = Radio::<MockTransport>::patch_attestation_offset(target, 0x02_E2C8);
+        let adapter = Radio::<MockTransport>::patch_attestation_offset(target, 0x02_EC00);
+        let bound = Radio::<MockTransport>::patch_attestation_offset(target, 0x06_F85C);
+        queue_checked_read(mock, base, &[discriminator]);
+        queue_checked_read(mock, dispatch, DISPATCH_ATTESTATION);
+        queue_checked_read(mock, adapter, ADAPTER_ATTESTATION);
+        queue_checked_read(mock, bound, BOUND_ATTESTATION);
+        queue_checked_read(mock, base, target_base);
     }
 
     fn queue_low_nor_attestation(mock: &mut MockTransport) {
         mock.pend_when_empty();
         queue_identity(mock);
-        queue_patch_attestation(mock, 0x60, LOW_NOR_BASE_ATTESTATION);
+        queue_patch_attestation(
+            mock,
+            MemoryReadTarget::LowNorV103,
+            0x60,
+            LOW_NOR_BASE_ATTESTATION,
+        );
         let page: Vec<u8> = (0_u8..=255).collect();
         let one: Vec<u8> = page.iter().copied().take(1).collect();
         let sixteen: Vec<u8> = page.iter().copied().take(16).collect();
@@ -773,7 +818,7 @@ mod tests {
     fn queue_ddr_attestation(mock: &mut MockTransport) {
         mock.pend_when_empty();
         queue_identity(mock);
-        queue_patch_attestation(mock, 0xC0, DDR_BASE_ATTESTATION);
+        queue_patch_attestation(mock, MemoryReadTarget::DdrV103, 0xC0, DDR_BASE_ATTESTATION);
         queue_checked_read(mock, DDR_PROBE_OFFSET.as_u32(), &[0x42]);
         queue_checked_read(mock, DDR_PROBE_OFFSET.as_u32(), &PROBE_EXPECTED);
         queue_checked_read(mock, DDR_PROBE_OFFSET.as_u32(), &PROBE_EXPECTED_HEADER);
@@ -816,7 +861,50 @@ mod tests {
             0x1F_FFFF,
             ReadLen::new(1)?,
         ));
+        assert!(Radio::<MockTransport>::attestation_read_allowed(
+            MemoryReadTarget::DdrV103,
+            0x06_F8A0,
+            ReadLen::new(16)?,
+        ));
+        assert!(!Radio::<MockTransport>::attestation_read_allowed(
+            MemoryReadTarget::DdrV103,
+            0x26_F8A0,
+            ReadLen::new(16)?,
+        ));
+        assert!(!Radio::<MockTransport>::attestation_read_allowed(
+            MemoryReadTarget::LowNorV103,
+            0x06_F8A0,
+            ReadLen::new(16)?,
+        ));
         Ok(())
+    }
+
+    #[test]
+    fn patch_attestation_offsets_are_backend_relative() {
+        let cases = [
+            (0x02_E2C8, 0x02_E2C8, 0x22_E2C8),
+            (0x02_EC00, 0x02_EC00, 0x22_EC00),
+            (0x06_F85C, 0x06_F85C, 0x26_F85C),
+            (BASE_ATTESTATION_FIRMWARE_OFFSET, 0x06_F8A0, 0x26_F8A0),
+        ];
+        for (firmware_offset, expected_ddr, expected_low_nor) in cases {
+            assert_eq!(
+                Radio::<MockTransport>::patch_attestation_offset(
+                    MemoryReadTarget::DdrV103,
+                    firmware_offset,
+                ),
+                expected_ddr,
+                "DDR must address the running main image directly"
+            );
+            assert_eq!(
+                Radio::<MockTransport>::patch_attestation_offset(
+                    MemoryReadTarget::LowNorV103,
+                    firmware_offset,
+                ),
+                expected_low_nor,
+                "low NOR must retain the 2 MiB bootloader/FLDM prefix"
+            );
+        }
     }
 
     #[tokio::test]
@@ -834,7 +922,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn low_nor_qualification_and_bounded_read_pass() -> TestResult {
+    async fn low_nor_qualification_uses_flash_relative_patch_offsets() -> TestResult {
         let mut mock = MockTransport::new();
         queue_low_nor_attestation(&mut mock);
         mock.expect(b"GM 000010,04\r", &reply(0x10, &[0xDE, 0xAD, 0xBE, 0xEF]));
@@ -851,7 +939,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn ddr_qualification_requires_exact_crossing_refusal() -> TestResult {
+    async fn ddr_qualification_uses_runtime_relative_patch_offsets() -> TestResult {
         let mut mock = MockTransport::new();
         queue_ddr_attestation(&mut mock);
         let mut radio = Radio::connect(mock).await?;
@@ -867,7 +955,7 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.pend_when_empty();
         queue_identity(&mut mock);
-        queue_checked_read(&mut mock, 0x26_F8A0, &[0x60]);
+        queue_checked_read(&mut mock, 0x06_F8A0, &[0x60]);
         let mut radio = Radio::connect(mock).await?;
         let result = radio.qualify_mem_read_for(MemoryReadTarget::DdrV103).await;
         assert!(result.is_err(), "wrong base discriminator must fail");

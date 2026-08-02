@@ -10,6 +10,7 @@
 
 pub mod aprs;
 pub mod audio;
+pub mod automation;
 pub mod diagnostics;
 pub mod dstar;
 #[path = "freq.rs"]

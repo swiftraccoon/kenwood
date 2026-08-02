@@ -387,11 +387,9 @@ impl Transport for SerialTransport {
         let Some(mut port) = self.port.take() else {
             return Ok(());
         };
-        // Bluetooth SPP ports must NOT be shut down: on macOS the
-        // stale RFCOMM channel outlives the shutdown and blocks the
-        // next open. Dropping the FD (when this transport is dropped)
-        // is the correct release for BT; only real serial devices get
-        // an explicit shutdown.
+        // A serial Bluetooth SPP endpoint has no meaningful UART shutdown
+        // operation. Releasing its descriptor is the complete ownership
+        // handoff; only physical serial devices get an explicit shutdown.
         if self.is_bluetooth {
             tracing::debug!("Bluetooth SPP port: skipping shutdown, dropping FD instead");
             return Ok(());

@@ -448,8 +448,8 @@ impl<T: Transport> KissSession<T> {
     /// # Errors
     ///
     /// Returns the session back together with the error if the exit
-    /// write fails, so the transport survives for a retry: a full
-    /// reopen is expensive (and fragile over Bluetooth RFCOMM).
+    /// write fails, so the already-owned transport survives for an exact
+    /// retry without an unnecessary reconnect.
     pub async fn exit(mut self) -> Result<Radio<T>, (Self, Error)> {
         tracing::info!("exiting KISS mode");
         if let Err(e) = self.send_frame(&KissFrame::return_command()).await {

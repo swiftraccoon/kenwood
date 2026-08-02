@@ -9,19 +9,26 @@
 //! the pages spanning the selected fields, exits MCP, restores CAT, and only
 //! then renders the snapshot.
 //!
-//! Read-only MCP still displays `PROG MCP` and resets/re-enumerates the USB
-//! connection on exit. Catchable termination signals run MCP recovery; an
-//! uncatchable process kill or host power loss can still require a physical
-//! radio power cycle. Snapshot output may contain callsigns, saved coordinates,
-//! messages, and Bluetooth device names; treat it as private configuration.
+//! Read-only MCP still displays `PROG MCP` and closes/reopens its transport on
+//! exit (USB resets and re-enumerates). Catchable termination signals run MCP
+//! recovery; an uncatchable process kill or host power loss can still require a
+//! physical radio power cycle. Snapshot output may contain callsigns, saved
+//! coordinates, messages, and Bluetooth device names; treat it as private
+//! configuration.
 //!
 //! ```text
 //! cargo run -p kenwood-thd75 --example mcp_menu -- --list beep
 //! cargo run -p kenwood-thd75 --example mcp_menu -- --read interface
+//! cargo run -p kenwood-thd75 --example mcp_menu -- --read --json --bluetooth TH-D75
 //! cargo run -p kenwood-thd75 --example mcp_menu -- radio.Beep=on radio.BluetoothOnOff=off
 //! cargo run -p kenwood-thd75 --example mcp_menu -- --write --port /dev/cu.usbmodem1234 \
 //!     radio.Beep=on radio.BluetoothOnOff=off
 //! ```
+//!
+//! `--json` is valid only with `--read`. It keeps stdout machine-readable and
+//! reports connection/status messages on stderr. Every selected field record
+//! includes its schema ID, absolute offset, exact raw bytes, and decoded value;
+//! byte-array values are emitted in full as hexadecimal.
 
 // Deps visible to every `kenwood-thd75` example target but unused here.
 use aprs as _;
@@ -32,7 +39,7 @@ use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
 use proptest as _;
-use serde_json as _;
+use serde_json::{Value, json};
 use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
@@ -50,14 +57,33 @@ use kenwood_thd75::memory::{
     menu_field,
 };
 use kenwood_thd75::protocol::programming;
-use kenwood_thd75::transport::{SerialTransport, Transport};
+#[cfg(target_os = "macos")]
+use kenwood_thd75::transport::BluetoothTransport;
+use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
 
 type BoxError = Box<dyn std::error::Error>;
 type Result<T = ()> = std::result::Result<T, BoxError>;
 
+const DEFAULT_USB_PORT: &str = "/dev/cu.usbmodem1234";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Endpoint {
+    Usb(String),
+    Bluetooth(String),
+}
+
+impl Endpoint {
+    fn description(&self) -> String {
+        match self {
+            Self::Usb(port) => port.clone(),
+            Self::Bluetooth(device_name) => format!("Bluetooth device {device_name:?}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Arguments {
-    port: String,
+    endpoint: Endpoint,
     operation: Operation,
 }
 
@@ -65,6 +91,7 @@ struct Arguments {
 enum Operation {
     Read {
         filter: Option<String>,
+        json: bool,
     },
     Patch {
         write: bool,
@@ -90,14 +117,16 @@ fn validate_schema_target(model: &str, firmware: &str) -> Result {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  mcp_menu --list [filter]\n  mcp_menu --read [filter] [--port DEVICE]\n  mcp_menu [--write] [--port DEVICE] menu.Field=value [...]\n\nValues accept official English option labels, raw decimal/0x numbers, on/off booleans, text, or hex:.../@FILE for byte arrays.\nNumbers resolve as 0x hex first, then as the decimal raw value whenever the field accepts that raw, then as an option label."
+        "Usage:\n  mcp_menu --list [filter]\n  mcp_menu --read [filter] [--json] [--port DEVICE | --bluetooth NAME]\n  mcp_menu [--write] [--port DEVICE | --bluetooth NAME] menu.Field=value [...]\n\nIf neither endpoint is supplied, --port {DEFAULT_USB_PORT} is used. --json is read-only and reserves stdout for one deterministic JSON document.\nValues accept official English option labels, raw decimal/0x numbers, on/off booleans, text, or hex:.../@FILE for byte arrays.\nNumbers resolve as 0x hex first, then as the decimal raw value whenever the field accepts that raw, then as an option label."
     );
 }
 
 fn parse_arguments(args: Vec<String>) -> Result<Arguments> {
     let mut write = false;
     let mut read = false;
-    let mut port = "/dev/cu.usbmodem1234".to_owned();
+    let mut json = false;
+    let mut port = None;
+    let mut bluetooth = None;
     let mut positional = Vec::new();
     let mut args = args.into_iter();
 
@@ -105,10 +134,18 @@ fn parse_arguments(args: Vec<String>) -> Result<Arguments> {
         match argument.as_str() {
             "--write" => write = true,
             "--read" => read = true,
+            "--json" => json = true,
             "--port" => {
-                port = args
-                    .next()
-                    .ok_or_else(|| invalid_input("--port requires a device path"))?;
+                port = Some(
+                    args.next()
+                        .ok_or_else(|| invalid_input("--port requires a device path"))?,
+                );
+            }
+            "--bluetooth" => {
+                bluetooth = Some(
+                    args.next()
+                        .ok_or_else(|| invalid_input("--bluetooth requires a device name"))?,
+                );
             }
             "--help" | "-h" => {
                 print_usage();
@@ -121,6 +158,17 @@ fn parse_arguments(args: Vec<String>) -> Result<Arguments> {
         }
     }
 
+    let endpoint = match (port, bluetooth) {
+        (Some(port), None) => Endpoint::Usb(port),
+        (None, Some(device_name)) => Endpoint::Bluetooth(device_name),
+        (None, None) => Endpoint::Usb(DEFAULT_USB_PORT.to_owned()),
+        (Some(_), Some(_)) => {
+            return Err(invalid_input(
+                "--port and --bluetooth are mutually exclusive",
+            ));
+        }
+    };
+
     let operation = if read {
         if write {
             return Err(invalid_input("--read and --write cannot be combined"));
@@ -130,8 +178,12 @@ fn parse_arguments(args: Vec<String>) -> Result<Arguments> {
         }
         Operation::Read {
             filter: positional.pop(),
+            json,
         }
     } else {
+        if json {
+            return Err(invalid_input("--json is valid only with --read"));
+        }
         if positional.is_empty() {
             return Err(invalid_input(
                 "at least one menu.Field=value assignment is required",
@@ -143,7 +195,10 @@ fn parse_arguments(args: Vec<String>) -> Result<Arguments> {
         }
     };
 
-    Ok(Arguments { port, operation })
+    Ok(Arguments {
+        endpoint,
+        operation,
+    })
 }
 
 fn print_field(field: &MenuField) {
@@ -439,6 +494,132 @@ fn render_snapshot(fields: &[&MenuField], pages: usize, image: &[u8]) {
     for field in fields {
         println!("{}", render_field(field, image));
     }
+}
+
+fn decoded_json(field: &MenuField, image: &[u8]) -> Value {
+    let raw_bytes = match raw_field_bytes(field, image) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return json!({
+                "kind": "decode_error",
+                "message": error.to_string(),
+            });
+        }
+    };
+    let value = match field.descriptor.read(image) {
+        Ok(value) => value,
+        Err(error) => {
+            return json!({
+                "kind": "decode_error",
+                "message": error.to_string(),
+            });
+        }
+    };
+
+    match (field.descriptor.codec, value) {
+        (FieldCodec::Bool, DecodedFieldValue::Bool(value)) => json!({
+            "canonical_raw": raw_bytes.first().is_some_and(|raw| *raw <= 1),
+            "kind": "boolean",
+            "value": value,
+        }),
+        (FieldCodec::BitBool { .. }, DecodedFieldValue::Bool(value)) => json!({
+            "kind": "boolean",
+            "value": value,
+        }),
+        (
+            FieldCodec::Byte { min, max } | FieldCodec::BitField { min, max, .. },
+            DecodedFieldValue::Unsigned(raw),
+        ) => unsigned_json(field, raw, u64::from(min), u64::from(max)),
+        (FieldCodec::Unsigned { min, max, .. }, DecodedFieldValue::Unsigned(raw)) => {
+            unsigned_json(field, raw, min, max)
+        }
+        (FieldCodec::Signed { min, max, .. }, DecodedFieldValue::Signed(value)) => json!({
+            "accepted_for_write": (min..=max).contains(&value),
+            "kind": "signed",
+            "value": value,
+        }),
+        (FieldCodec::FixedString { .. }, DecodedFieldValue::Text(value)) => json!({
+            "kind": "text",
+            "value": value,
+        }),
+        (FieldCodec::Bytes { .. }, DecodedFieldValue::Bytes(value)) => json!({
+            "hex": hex_bytes(&value),
+            "kind": "bytes",
+            "length": value.len(),
+        }),
+        (codec, value) => json!({
+            "kind": "decode_error",
+            "message": format!(
+                "decoder mismatch: codec={} value={value:?}",
+                codec.value_kind()
+            ),
+        }),
+    }
+}
+
+fn unsigned_json(field: &MenuField, raw: u64, min: u64, max: u64) -> Value {
+    let mut value = json!({
+        "accepted_for_write": (min..=max).contains(&raw) && raw_is_accepted(field, raw),
+        "kind": "unsigned",
+        "rendered": render_unsigned(field, raw, min, max),
+        "value": raw,
+    });
+    if let Some(option) = field.option(raw)
+        && let Some(object) = value.as_object_mut()
+    {
+        drop(object.insert(
+            "option".to_owned(),
+            json!({
+                "label": option.label,
+                "member": option.member,
+                "resource_key": option.resource_key,
+            }),
+        ));
+    }
+    value
+}
+
+fn json_field(field: &MenuField, image: &[u8]) -> Value {
+    let raw_hex = raw_field_bytes(field, image)
+        .map(hex_bytes)
+        .map_or(Value::Null, Value::String);
+    json!({
+        "decoded": decoded_json(field, image),
+        "id": field.descriptor.name,
+        "offset": field.descriptor.offset,
+        "offset_hex": format!("0x{:05X}", field.descriptor.offset),
+        "raw_hex": raw_hex,
+    })
+}
+
+fn json_snapshot(
+    fields: &[&MenuField],
+    pages: usize,
+    image: &[u8],
+    model: &str,
+    firmware: &str,
+) -> Value {
+    let mut ordered_fields = fields.to_vec();
+    ordered_fields.sort_unstable_by_key(|field| field.descriptor.name);
+    let records = ordered_fields
+        .into_iter()
+        .map(|field| json_field(field, image))
+        .collect::<Vec<_>>();
+    json!({
+        "fields": records,
+        "radio": {
+            "firmware": firmware,
+            "model": model,
+        },
+        "schema": {
+            "source_sha256": MCP_D75_SOURCE_SHA256,
+            "version": MCP_D75_SCHEMA_VERSION,
+        },
+        "snapshot": {
+            "field_count": fields.len(),
+            "page_count": pages,
+        },
+    })
 }
 
 async fn read_sparse_with_interrupt_recovery<T: Transport>(
@@ -737,7 +918,31 @@ fn print_patch_summary(patches: &PatchSet) {
     }
 }
 
-#[tokio::main]
+fn open_transport(endpoint: &Endpoint) -> Result<EitherTransport> {
+    match endpoint {
+        Endpoint::Usb(port) => Ok(EitherTransport::Serial(SerialTransport::open(
+            port,
+            SerialTransport::DEFAULT_BAUD,
+        )?)),
+        Endpoint::Bluetooth(device_name) => open_bluetooth_transport(device_name),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_bluetooth_transport(device_name: &str) -> Result<EitherTransport> {
+    Ok(EitherTransport::Bluetooth(BluetoothTransport::open(Some(
+        device_name,
+    ))?))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_bluetooth_transport(_device_name: &str) -> Result<EitherTransport> {
+    Err(invalid_input(
+        "--bluetooth uses native RFCOMM and is supported only on macOS",
+    ))
+}
+
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     if raw_args
@@ -749,21 +954,30 @@ async fn main() -> Result {
     }
 
     let arguments = parse_arguments(raw_args).inspect_err(|_| print_usage())?;
-    match arguments.operation {
-        Operation::Read { filter } => {
+    let Arguments {
+        endpoint,
+        operation,
+    } = arguments;
+    match operation {
+        Operation::Read { filter, json } => {
             let fields = select_fields(filter.as_deref())?;
             let pages = required_pages(&fields)?;
 
-            println!(
-                "Privacy: snapshot output can contain callsigns, coordinates, messages, and \
-                 Bluetooth names; send it only to a trusted destination."
-            );
-            println!(
+            let privacy = "Privacy: snapshot output can contain callsigns, coordinates, messages, \
+                           and Bluetooth names; send it only to a trusted destination.";
+            let connecting = format!(
                 "Connecting to {} for a read-only {}-page MCP snapshot...",
-                arguments.port,
+                endpoint.description(),
                 pages.len()
             );
-            let transport = SerialTransport::open(&arguments.port, SerialTransport::DEFAULT_BAUD)?;
+            if json {
+                eprintln!("{privacy}");
+                eprintln!("{connecting}");
+            } else {
+                println!("{privacy}");
+                println!("{connecting}");
+            }
+            let transport = open_transport(&endpoint)?;
             let mut radio = Radio::connect(transport).await?;
             let info = radio.identify().await?;
             let firmware = radio.get_firmware_version().await?;
@@ -775,8 +989,13 @@ async fn main() -> Result {
             let page_data = read_sparse_with_interrupt_recovery(&mut radio, &pages).await?;
             radio.disconnect().await?;
             let image = assemble_sparse_image(&page_data)?;
-            println!("Radio: {} firmware {firmware}", info.model);
-            render_snapshot(&fields, pages.len(), &image);
+            if json {
+                let snapshot = json_snapshot(&fields, pages.len(), &image, &info.model, &firmware);
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            } else {
+                println!("Radio: {} firmware {firmware}", info.model);
+                render_snapshot(&fields, pages.len(), &image);
+            }
             Ok(())
         }
         Operation::Patch { write, assignments } => {
@@ -793,8 +1012,8 @@ async fn main() -> Result {
                 return Ok(());
             }
 
-            println!("Connecting to {}...", arguments.port);
-            let transport = SerialTransport::open(&arguments.port, SerialTransport::DEFAULT_BAUD)?;
+            println!("Connecting to {}...", endpoint.description());
+            let transport = open_transport(&endpoint)?;
             let mut radio = Radio::connect(transport).await?;
             let info = radio.identify().await?;
             let firmware = radio.get_firmware_version().await?;
@@ -814,9 +1033,10 @@ async fn main() -> Result {
 #[cfg(test)]
 mod tests {
     use super::{
-        MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, Operation, Result, add_assignment,
-        apply_patches_with_interrupt, field_len, parse_arguments, read_sparse_with_interrupt,
-        render_field, required_pages, select_fields, validate_schema_target,
+        DEFAULT_USB_PORT, Endpoint, MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, Operation, Result,
+        add_assignment, apply_patches_with_interrupt, field_len, json_snapshot, parse_arguments,
+        read_sparse_with_interrupt, render_field, required_pages, select_fields,
+        validate_schema_target,
     };
     use kenwood_thd75::Radio;
     use kenwood_thd75::memory::{
@@ -886,12 +1106,13 @@ mod tests {
             "--port".to_owned(),
             "/dev/test".to_owned(),
         ])?;
-        assert_eq!(arguments.port, "/dev/test");
+        assert_eq!(arguments.endpoint, Endpoint::Usb("/dev/test".to_owned()));
         assert!(
             matches!(
                 arguments.operation,
                 Operation::Read {
-                    filter: Some(ref filter)
+                    filter: Some(ref filter),
+                    json: false,
                 } if filter == "interface"
             ),
             "read filter was not preserved: {:?}",
@@ -900,6 +1121,47 @@ mod tests {
 
         let conflict = parse_arguments(vec!["--read".to_owned(), "--write".to_owned()]);
         assert!(conflict.is_err(), "read/write conflict unexpectedly parsed");
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_and_json_arguments_are_unambiguous() -> Result {
+        let defaults = parse_arguments(vec!["--read".to_owned()])?;
+        assert_eq!(
+            defaults.endpoint,
+            Endpoint::Usb(DEFAULT_USB_PORT.to_owned()),
+            "the historical implicit USB endpoint changed"
+        );
+
+        let bluetooth = parse_arguments(vec![
+            "--read".to_owned(),
+            "--json".to_owned(),
+            "--bluetooth".to_owned(),
+            "TH-D75".to_owned(),
+            "beep".to_owned(),
+        ])?;
+        assert_eq!(bluetooth.endpoint, Endpoint::Bluetooth("TH-D75".to_owned()));
+        assert!(matches!(
+            bluetooth.operation,
+            Operation::Read {
+                filter: Some(ref filter),
+                json: true,
+            } if filter == "beep"
+        ));
+
+        let endpoint_conflict = parse_arguments(vec![
+            "--read".to_owned(),
+            "--port".to_owned(),
+            "/dev/test".to_owned(),
+            "--bluetooth".to_owned(),
+            "TH-D75".to_owned(),
+        ])
+        .expect_err("USB and Bluetooth endpoints unexpectedly parsed together");
+        assert!(endpoint_conflict.to_string().contains("mutually exclusive"));
+
+        let write_json = parse_arguments(vec!["--json".to_owned(), "radio.Beep=on".to_owned()])
+            .expect_err("machine output unexpectedly accepted on the patch path");
+        assert!(write_json.to_string().contains("only with --read"));
         Ok(())
     }
 
@@ -1074,6 +1336,74 @@ mod tests {
             !rendered.contains("01020304"),
             "blob contents leaked into output: {rendered}"
         );
+    }
+
+    #[test]
+    fn json_snapshot_is_complete_exact_and_deterministically_ordered() -> Result {
+        let enumeration = synthetic_field(
+            "test.a_enum",
+            0,
+            FieldCodec::Byte { min: 0, max: 7 },
+            ENUM_OPTIONS,
+            false,
+        );
+        let boolean = synthetic_field("test.b_bool", 1, FieldCodec::Bool, NO_OPTIONS, false);
+        let invalid_text = synthetic_field(
+            "test.c_text",
+            2,
+            FieldCodec::FixedString {
+                len: 2,
+                encoding: StringEncoding::MemoryMap,
+                padding: 0,
+            },
+            NO_OPTIONS,
+            false,
+        );
+        let blob = synthetic_field(
+            "test.d_blob",
+            4,
+            FieldCodec::Bytes { len: 2 },
+            NO_OPTIONS,
+            true,
+        );
+        let image = [0, 2, 0xFF, 0, 0xAB, 0xCD];
+        let forward = [&enumeration, &boolean, &invalid_text, &blob];
+        let reverse = [&blob, &invalid_text, &boolean, &enumeration];
+
+        let snapshot = json_snapshot(&reverse, 3, &image, "TH-D75", "1.03");
+        assert_eq!(
+            serde_json::to_string(&snapshot)?,
+            serde_json::to_string(&json_snapshot(&forward, 3, &image, "TH-D75", "1.03"))?,
+            "caller order changed machine output"
+        );
+        assert_eq!(snapshot["snapshot"]["field_count"], 4);
+        assert_eq!(snapshot["snapshot"]["page_count"], 3);
+        assert_eq!(snapshot["radio"]["model"], "TH-D75");
+
+        let fields = snapshot["fields"]
+            .as_array()
+            .ok_or_else(|| super::invalid_input("JSON fields are not an array"))?;
+        assert_eq!(fields.len(), 4, "a requested field was omitted");
+        assert_eq!(fields[0]["id"], "test.a_enum");
+        assert_eq!(fields[0]["offset"], 0);
+        assert_eq!(fields[0]["raw_hex"], "00");
+        assert_eq!(fields[0]["decoded"]["value"], 0);
+        assert_eq!(fields[0]["decoded"]["option"]["label"], "Zero");
+
+        assert_eq!(fields[1]["id"], "test.b_bool");
+        assert_eq!(fields[1]["decoded"]["value"], true);
+        assert_eq!(fields[1]["decoded"]["canonical_raw"], false);
+
+        assert_eq!(fields[2]["id"], "test.c_text");
+        assert_eq!(fields[2]["raw_hex"], "FF00");
+        assert_eq!(fields[2]["decoded"]["kind"], "decode_error");
+
+        assert_eq!(fields[3]["id"], "test.d_blob");
+        assert_eq!(fields[3]["offset_hex"], "0x00004");
+        assert_eq!(fields[3]["decoded"]["kind"], "bytes");
+        assert_eq!(fields[3]["decoded"]["hex"], "ABCD");
+        assert_eq!(fields[3]["decoded"]["length"], 2);
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

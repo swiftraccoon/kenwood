@@ -11,6 +11,29 @@
 //!   --capture-root /private/path/thd75-audit
 //! ```
 //!
+//! On macOS, the same fixed read-only allowlist can use the native RFCOMM
+//! transport and can machine-check its on-wire preflight without reading stdin:
+//!
+//! ```text
+//! cargo run -p kenwood-thd75 --example hardware_audit -- \
+//!   baseline --bluetooth TH-D75 --machine-checked-read-only \
+//!   --capture-root /private/path/thd75-audit
+//! ```
+//!
+//! Exact V1.03.AZM automation-firmware baseline (machine-checked only):
+//!
+//! ```text
+//! cargo run -p kenwood-thd75 --example hardware_audit -- \
+//!   baseline --automation --bluetooth TH-D75 \
+//!   --machine-checked-read-only --capture-root /private/path/thd75-audit
+//! ```
+//!
+//! This profile first proves the complete V1.03.AZM image and ABI through
+//! `Radio::qualify_automation`, reopens the same transport identity, and
+//! uses that fresh connection for the fixed CAT audit. The CAT allowlist is
+//! the stock 61-frame baseline minus only bare `GM` and bare `GW`, whose
+//! handlers V1.03.AZM deliberately repurposes.
+//!
 //! The compiled containment implementation is deliberately disabled for bench
 //! execution until a private MCP pre-image can exist before its first write.
 
@@ -37,9 +60,14 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use kenwood_thd75::error::TransportError;
 use kenwood_thd75::protocol::Codec;
-use kenwood_thd75::transport::{SerialTransport, Transport};
-use serde_json::{Value, json};
+use kenwood_thd75::radio::automation::AutomationAbi;
+#[cfg(target_os = "macos")]
+use kenwood_thd75::transport::BluetoothTransport;
+use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
+use kenwood_thd75::{Error as RadioError, Radio};
+use serde_json::{Map, Value, json};
 
 type AuditError = Box<dyn Error + Send + Sync>;
 type AuditResult<T> = Result<T, AuditError>;
@@ -81,11 +109,104 @@ impl Mode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaselineProfile {
+    StockDefault,
+    Automation,
+}
+
+impl BaselineProfile {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::StockDefault => "stock-default",
+            Self::Automation => "automation",
+        }
+    }
+
+    fn includes_rest_spec(self, spec: &CommandSpec) -> bool {
+        self == Self::StockDefault || (spec.wire != b"GM\r" && spec.wire != b"GW\r")
+    }
+
+    fn case_count(self) -> usize {
+        IDENTITY_READS.len() + BASELINE_PREFLIGHT.len() + baseline_rest_specs(self).count()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Endpoint {
+    Usb(String),
+    Bluetooth(String),
+}
+
+fn insert_evidence(record: &mut Map<String, Value>, key: &str, value: Value) {
+    drop(record.insert(key.to_owned(), value));
+}
+
+impl Endpoint {
+    const fn transport_name(&self) -> &'static str {
+        match self {
+            Self::Usb(_) => "usb-cdc",
+            Self::Bluetooth(_) => "bluetooth-rfcomm",
+        }
+    }
+
+    fn value(&self) -> &str {
+        match self {
+            Self::Usb(port) | Self::Bluetooth(port) => port,
+        }
+    }
+
+    fn add_evidence_fields(&self, record: &mut Map<String, Value>, privacy: EvidencePrivacy) {
+        insert_evidence(record, "transport", json!(self.transport_name()));
+        let endpoint = privacy.endpoint_value(self.value());
+        insert_evidence(record, "endpoint", endpoint.clone());
+        if let Self::Usb(_) = self {
+            insert_evidence(record, "port", endpoint);
+            insert_evidence(record, "baud", json!(CAT_BAUD));
+            insert_evidence(record, "usb_vid", json!("2166"));
+            insert_evidence(record, "usb_pid", json!("9023"));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EvidencePrivacy {
+    Private,
+    Sanitized,
+}
+
+impl EvidencePrivacy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Sanitized => "sanitized",
+        }
+    }
+
+    fn endpoint_value(self, endpoint: &str) -> Value {
+        match self {
+            Self::Private => json!(endpoint),
+            Self::Sanitized => json!({
+                "$redacted": "endpoint",
+                "byte_len": endpoint.len(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Config {
     mode: Mode,
-    port: String,
+    profile: BaselineProfile,
+    endpoint: Endpoint,
     capture_root: PathBuf,
+    machine_checked_read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutomationAttestation {
+    abi: AutomationAbi,
+    transport_reopened_before_raw_audit: bool,
 }
 
 #[derive(Debug)]
@@ -329,6 +450,12 @@ const BASELINE_REST: &[CommandSpec] = &[
     CommandSpec::public("A1-P0-GW-READ", b"GW\r"),
 ];
 
+fn baseline_rest_specs(profile: BaselineProfile) -> impl Iterator<Item = &'static CommandSpec> {
+    BASELINE_REST
+        .iter()
+        .filter(move |spec| profile.includes_rest_spec(spec))
+}
+
 const SAFETY_READS: &[CommandSpec] = &[
     CommandSpec::public("A1-P0-AI-READ", b"AI\r"),
     CommandSpec::public("A1-P0-TN-READ", b"TN\r"),
@@ -370,7 +497,7 @@ const CONTAINMENT_TARGETS: &[ContainmentTarget] = &[
     },
 ];
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> AuditResult<()> {
     let config = parse_args()?;
     if config.mode == Mode::MakeSafe {
@@ -379,7 +506,7 @@ async fn main() -> AuditResult<()> {
              through the radio UI and run the read-only baseline",
         ));
     }
-    validate_usb_port(&config.port)?;
+    validate_endpoint(&config.endpoint)?;
 
     let mut captures = create_capture_files(&config.capture_root)?;
     write_headers(
@@ -388,47 +515,32 @@ async fn main() -> AuditResult<()> {
         &config,
         &captures.capture_id,
     )?;
-    confirm_ui_checked(&config.port)?;
-    write_operator_attestation(
+    if !config.machine_checked_read_only {
+        confirm_ui_checked(&config.endpoint)?;
+    }
+    write_preflight_observation(
         &mut captures.private,
         &mut captures.sanitized,
         &captures.capture_id,
-        &config.port,
+        &config.endpoint,
+        config.profile,
+        config.machine_checked_read_only,
     )?;
     if config.mode == Mode::MakeSafe {
-        confirm_make_safe(&config.port)?;
+        confirm_make_safe(&config.endpoint)?;
     }
 
-    let mut transport = SerialTransport::open(&config.port, CAT_BAUD)?;
-    let mut codec = Codec::new();
-    let result = match config.mode {
-        Mode::Baseline => {
-            run_baseline(
-                &mut transport,
-                &mut codec,
-                &mut captures.private,
-                &mut captures.sanitized,
-            )
-            .await
-        }
-        Mode::MakeSafe => {
-            run_make_safe(
-                &mut transport,
-                &mut codec,
-                &mut captures.private,
-                &mut captures.sanitized,
-                &captures.session_dir,
-            )
-            .await
-        }
-    };
-    let close_result: AuditResult<()> = tokio::time::timeout(CLOSE_TIMEOUT, transport.close())
-        .await
-        .map_or_else(
-            |_| Err(invalid_input("transport close timed out")),
-            |inner| inner.map_err(Into::into),
-        );
-    let session_status = if result.is_ok() && close_result.is_ok() {
+    let mut automation_attestation = None;
+    let result = run_selected_profile(
+        &config,
+        &mut captures.private,
+        &mut captures.sanitized,
+        &captures.capture_id,
+        &captures.session_dir,
+        &mut automation_attestation,
+    )
+    .await;
+    let session_status = if result.is_ok() {
         "complete"
     } else {
         "aborted"
@@ -442,14 +554,18 @@ async fn main() -> AuditResult<()> {
     durable_flush(&mut captures.private)?;
     durable_flush(&mut captures.sanitized)?;
     end_result?;
-    write_capture_manifest(&captures, session_status)?;
+    write_capture_manifest(
+        &captures,
+        session_status,
+        &config,
+        automation_attestation.as_ref(),
+    )?;
     eprintln!(
         "Audit capture records and manifest written with status {session_status}. Capture ID: {}",
         captures.capture_id
     );
 
     result?;
-    close_result?;
     println!(
         "Audit capture complete; transport closed. Capture ID: {}",
         captures.capture_id
@@ -458,7 +574,15 @@ async fn main() -> AuditResult<()> {
 }
 
 fn parse_args() -> AuditResult<Config> {
-    let mut args = std::env::args().skip(1).peekable();
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from<I, S>(args: I) -> AuditResult<Config>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into).peekable();
     let mode = match args.peek().map(String::as_str) {
         Some("baseline") => {
             drop(args.next());
@@ -473,32 +597,88 @@ fn parse_args() -> AuditResult<Config> {
     };
 
     let mut port = None;
+    let mut bluetooth = None;
     let mut capture_root = None;
+    let mut machine_checked_read_only = false;
+    let mut automation = false;
     while let Some(flag) = args.next() {
-        let value = args
-            .next()
-            .ok_or_else(|| invalid_input(format!("missing value for {flag}")))?;
         match flag.as_str() {
-            "--port" if port.is_none() => port = Some(value),
-            "--capture-root" if capture_root.is_none() => {
-                capture_root = Some(PathBuf::from(value));
+            "--port" if port.is_none() => port = Some(required_value(&mut args, &flag)?),
+            "--bluetooth" if bluetooth.is_none() => {
+                bluetooth = Some(required_value(&mut args, &flag)?);
             }
-            "--port" | "--capture-root" => {
+            "--capture-root" if capture_root.is_none() => {
+                capture_root = Some(PathBuf::from(required_value(&mut args, &flag)?));
+            }
+            "--machine-checked-read-only" if !machine_checked_read_only => {
+                machine_checked_read_only = true;
+            }
+            "--automation" if !automation => automation = true,
+            "--port"
+            | "--bluetooth"
+            | "--capture-root"
+            | "--machine-checked-read-only"
+            | "--automation" => {
                 return Err(invalid_input(format!("duplicate argument: {flag}")));
             }
             _ => return Err(invalid_input(format!("unknown argument: {flag}"))),
         }
     }
 
+    let endpoint = match (port, bluetooth) {
+        (Some(port), None) => Endpoint::Usb(port),
+        (None, Some(device_name)) => Endpoint::Bluetooth(device_name),
+        _ => {
+            return Err(invalid_input(
+                "exactly one of --port PATH or --bluetooth NAME is required",
+            ));
+        }
+    };
+    if machine_checked_read_only && mode != Mode::Baseline {
+        return Err(invalid_input(
+            "--machine-checked-read-only is valid only for the read-only baseline",
+        ));
+    }
+    if automation && mode != Mode::Baseline {
+        return Err(invalid_input(
+            "--automation is valid only for the read-only baseline",
+        ));
+    }
+    if automation && !machine_checked_read_only {
+        return Err(invalid_input(
+            "--automation requires --machine-checked-read-only",
+        ));
+    }
+
     Ok(Config {
         mode,
-        port: port.ok_or_else(|| invalid_input("--port is required"))?,
+        profile: if automation {
+            BaselineProfile::Automation
+        } else {
+            BaselineProfile::StockDefault
+        },
+        endpoint,
         capture_root: capture_root.ok_or_else(|| invalid_input("--capture-root is required"))?,
+        machine_checked_read_only,
     })
 }
 
+fn required_value<I>(args: &mut std::iter::Peekable<I>, flag: &str) -> AuditResult<String>
+where
+    I: Iterator<Item = String>,
+{
+    let value = args
+        .next()
+        .ok_or_else(|| invalid_input(format!("missing value for {flag}")))?;
+    if value.is_empty() || value.starts_with("--") {
+        return Err(invalid_input(format!("missing value for {flag}")));
+    }
+    Ok(value)
+}
+
 const fn usage() -> &'static str {
-    "usage: hardware_audit [baseline|make-safe] --port PATH --capture-root DIR"
+    "usage: hardware_audit [baseline|make-safe] (--port PATH | --bluetooth NAME) \
+     --capture-root DIR [--machine-checked-read-only] [--automation]"
 }
 
 fn invalid_input(message: impl Into<String>) -> AuditError {
@@ -656,10 +836,28 @@ fn validate_capture_root_privacy(root: &Path) -> AuditResult<()> {
     }
 }
 
+fn validate_endpoint(endpoint: &Endpoint) -> AuditResult<()> {
+    match endpoint {
+        Endpoint::Usb(port) => validate_usb_port(port),
+        Endpoint::Bluetooth(_) => {
+            #[cfg(target_os = "macos")]
+            {
+                Ok(())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(invalid_input(
+                    "--bluetooth uses native RFCOMM and is supported only on macOS",
+                ))
+            }
+        }
+    }
+}
+
 fn validate_usb_port(port: &str) -> AuditResult<()> {
     if SerialTransport::is_bluetooth_port(port) {
         return Err(invalid_input(
-            "hardware audit requires the USB CDC endpoint, not Bluetooth",
+            "--port requires the USB CDC endpoint; use --bluetooth NAME for native RFCOMM",
         ));
     }
     let matches = SerialTransport::discover_usb()?
@@ -675,6 +873,202 @@ fn validate_usb_port(port: &str) -> AuditResult<()> {
     }
 }
 
+fn open_transport(endpoint: &Endpoint) -> AuditResult<EitherTransport> {
+    match endpoint {
+        Endpoint::Usb(port) => Ok(EitherTransport::Serial(SerialTransport::open(
+            port, CAT_BAUD,
+        )?)),
+        Endpoint::Bluetooth(device_name) => open_bluetooth_transport(device_name),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_bluetooth_transport(device_name: &str) -> AuditResult<EitherTransport> {
+    Ok(EitherTransport::Bluetooth(BluetoothTransport::open(Some(
+        device_name,
+    ))?))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_bluetooth_transport(_device_name: &str) -> AuditResult<EitherTransport> {
+    Err(invalid_input(
+        "--bluetooth uses native RFCOMM and is supported only on macOS",
+    ))
+}
+
+async fn close_transport<T: Transport>(transport: &mut T) -> AuditResult<()> {
+    tokio::time::timeout(CLOSE_TIMEOUT, transport.close())
+        .await
+        .map_or_else(
+            |_| Err(invalid_input("transport close timed out")),
+            |inner| inner.map_err(Into::into),
+        )
+}
+
+struct RadioRawTransport<'a, T: Transport>(&'a mut Radio<T>);
+
+fn map_radio_write_error(error: RadioError) -> TransportError {
+    match error {
+        RadioError::Transport(error) => error,
+        error => TransportError::Write(io::Error::other(error)),
+    }
+}
+
+fn map_radio_read_error(error: RadioError) -> TransportError {
+    match error {
+        RadioError::Transport(error) => error,
+        error => TransportError::Read(io::Error::other(error)),
+    }
+}
+
+fn map_radio_connection_error(error: RadioError) -> TransportError {
+    match error {
+        RadioError::Transport(error) => error,
+        error => TransportError::Disconnected(io::Error::other(error)),
+    }
+}
+
+impl<T: Transport> Transport for RadioRawTransport<'_, T> {
+    async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
+        self.0
+            .transport_write(data)
+            .await
+            .map_err(map_radio_write_error)
+    }
+
+    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
+        self.0
+            .transport_read(buffer)
+            .await
+            .map_err(map_radio_read_error)
+    }
+
+    async fn close(&mut self) -> Result<(), TransportError> {
+        self.0
+            .close_transport()
+            .await
+            .map_err(map_radio_connection_error)
+    }
+
+    async fn reopen(&mut self) -> Result<(), TransportError> {
+        self.0.reconnect().await.map_err(map_radio_connection_error)
+    }
+}
+
+async fn qualify_automation_on_endpoint(
+    endpoint: &Endpoint,
+) -> AuditResult<(Radio<EitherTransport>, AutomationAbi)> {
+    let transport = open_transport(endpoint)?;
+    let mut radio = Radio::connect(transport).await?;
+    let qualification = radio
+        .qualify_automation()
+        .await
+        .map(|session| session.abi());
+    match qualification {
+        Ok(abi) => Ok((radio, abi)),
+        Err(error) => {
+            drop(tokio::time::timeout(CLOSE_TIMEOUT, radio.disconnect()).await);
+            Err(error.into())
+        }
+    }
+}
+
+async fn run_configured_audit<T: Transport>(
+    config: &Config,
+    transport: &mut T,
+    private: &mut BufWriter<File>,
+    sanitized: &mut BufWriter<File>,
+    session_dir: &Path,
+) -> AuditResult<()> {
+    let mut codec = Codec::new();
+    match config.mode {
+        Mode::Baseline => {
+            run_baseline(transport, &mut codec, private, sanitized, config.profile).await
+        }
+        Mode::MakeSafe => {
+            run_make_safe(transport, &mut codec, private, sanitized, session_dir).await
+        }
+    }
+}
+
+async fn run_selected_profile(
+    config: &Config,
+    private: &mut BufWriter<File>,
+    sanitized: &mut BufWriter<File>,
+    capture_id: &str,
+    session_dir: &Path,
+    automation_attestation: &mut Option<AutomationAttestation>,
+) -> AuditResult<()> {
+    if config.profile == BaselineProfile::Automation {
+        println!("Exact-attesting V1.03.AZM before the raw CAT audit...");
+        let (mut radio, abi) = match qualify_automation_on_endpoint(&config.endpoint).await {
+            Ok(qualified) => qualified,
+            Err(error) => {
+                write_automation_attestation(
+                    private,
+                    sanitized,
+                    capture_id,
+                    &config.endpoint,
+                    None,
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
+        };
+        let mut evidence = AutomationAttestation {
+            abi,
+            transport_reopened_before_raw_audit: false,
+        };
+        *automation_attestation = Some(evidence);
+        if let Err(error) = radio.reconnect().await {
+            let error = AuditError::from(error);
+            let evidence_result = write_automation_attestation(
+                private,
+                sanitized,
+                capture_id,
+                &config.endpoint,
+                Some(&evidence),
+                Some(&error.to_string()),
+            );
+            drop(tokio::time::timeout(CLOSE_TIMEOUT, radio.disconnect()).await);
+            evidence_result?;
+            return Err(error);
+        }
+        evidence.transport_reopened_before_raw_audit = true;
+        *automation_attestation = Some(evidence);
+        if let Err(error) = write_automation_attestation(
+            private,
+            sanitized,
+            capture_id,
+            &config.endpoint,
+            Some(&evidence),
+            None,
+        ) {
+            drop(tokio::time::timeout(CLOSE_TIMEOUT, radio.disconnect()).await);
+            return Err(error);
+        }
+        let result = {
+            let mut transport = RadioRawTransport(&mut radio);
+            run_configured_audit(config, &mut transport, private, sanitized, session_dir).await
+        };
+        let close = tokio::time::timeout(CLOSE_TIMEOUT, radio.disconnect())
+            .await
+            .map_or_else(
+                |_| Err(invalid_input("transport close timed out")),
+                |inner| inner.map_err(Into::into),
+            );
+        result?;
+        return close;
+    }
+
+    let mut transport = open_transport(&config.endpoint)?;
+    let result =
+        run_configured_audit(config, &mut transport, private, sanitized, session_dir).await;
+    let close = close_transport(&mut transport).await;
+    result?;
+    close
+}
+
 fn write_headers(
     private: &mut BufWriter<File>,
     sanitized: &mut BufWriter<File>,
@@ -684,50 +1078,60 @@ fn write_headers(
     let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     write_json_line(
         private,
-        &json!({
-            "type": "session_start",
-            "schema_version": 1,
-            "privacy": "private",
-            "capture_id": capture_id,
-            "mode": config.mode.as_str(),
-            "started_unix_ms": started,
-            "transport": "usb-cdc",
-            "port": config.port,
-            "baud": CAT_BAUD,
-            "usb_vid": "2166",
-            "usb_pid": "9023",
-            "expected_model": "TH-D75",
-            "expected_firmware": "1.03",
-            "expected_region": "K",
-            "expected_variant": "2",
-        }),
+        &session_start_record(config, capture_id, started, EvidencePrivacy::Private),
     )?;
     write_json_line(
         sanitized,
-        &json!({
-            "type": "session_start",
-            "schema_version": 1,
-            "privacy": "sanitized",
-            "capture_id": capture_id,
-            "mode": config.mode.as_str(),
-            "started_unix_ms": started,
-            "transport": "usb-cdc",
-            "port": {
-                "$redacted": "endpoint",
-                "byte_len": config.port.len(),
-            },
-            "baud": CAT_BAUD,
-            "usb_vid": "2166",
-            "usb_pid": "9023",
-            "expected_model": "TH-D75",
-            "expected_firmware": "1.03",
-            "expected_region": "K",
-            "expected_variant": "2",
-        }),
+        &session_start_record(config, capture_id, started, EvidencePrivacy::Sanitized),
     )?;
     durable_flush(private)?;
     durable_flush(sanitized)?;
     Ok(())
+}
+
+fn session_start_record(
+    config: &Config,
+    capture_id: &str,
+    started: u128,
+    privacy: EvidencePrivacy,
+) -> Value {
+    let preflight_evidence_basis = if config.machine_checked_read_only {
+        "machine-checked-read-only"
+    } else {
+        "operator-ui-attestation"
+    };
+    with_endpoint_evidence(
+        json!({
+            "type": "session_start",
+            "schema_version": 1,
+            "privacy": privacy.as_str(),
+            "capture_id": capture_id,
+            "mode": config.mode.as_str(),
+            "profile": config.profile.as_str(),
+            "fixed_cat_case_count": config.profile.case_count(),
+            "automation_attestation_required": config.profile == BaselineProfile::Automation,
+            "started_unix_ms": started,
+            "preflight_evidence_basis": preflight_evidence_basis,
+            "machine_checked_read_only": config.machine_checked_read_only,
+            "expected_model": "TH-D75",
+            "expected_firmware": "1.03",
+            "expected_region": "K",
+            "expected_variant": "2",
+        }),
+        &config.endpoint,
+        privacy,
+    )
+}
+
+fn with_endpoint_evidence(
+    mut record: Value,
+    endpoint: &Endpoint,
+    privacy: EvidencePrivacy,
+) -> Value {
+    if let Value::Object(fields) = &mut record {
+        endpoint.add_evidence_fields(fields, privacy);
+    }
+    record
 }
 
 fn durable_flush(writer: &mut BufWriter<File>) -> AuditResult<()> {
@@ -736,7 +1140,12 @@ fn durable_flush(writer: &mut BufWriter<File>) -> AuditResult<()> {
     Ok(())
 }
 
-fn write_capture_manifest(captures: &CaptureFiles, session_status: &str) -> AuditResult<()> {
+fn write_capture_manifest(
+    captures: &CaptureFiles,
+    session_status: &str,
+    config: &Config,
+    automation_attestation: Option<&AutomationAttestation>,
+) -> AuditResult<()> {
     let private_path = captures.session_dir.join("private.jsonl");
     let sanitized_path = captures.session_dir.join("sanitized.jsonl");
     let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/hardware_audit.rs");
@@ -748,6 +1157,7 @@ fn write_capture_manifest(captures: &CaptureFiles, session_status: &str) -> Audi
         "capture_id": captures.capture_id,
         "created_unix_ms": timestamp,
         "session_status": session_status,
+        "profile": config.profile.as_str(),
         "identity_target": {
             "model": "TH-D75",
             "firmware": "1.03",
@@ -761,11 +1171,11 @@ fn write_capture_manifest(captures: &CaptureFiles, session_status: &str) -> Audi
         },
         "allowlist": {
             "risk": "R0",
-            "case_count": IDENTITY_READS.len()
-                + BASELINE_PREFLIGHT.len()
-                + BASELINE_REST.len(),
+            "profile": config.profile.as_str(),
+            "case_count": config.profile.case_count(),
             "arbitrary_command_mode": false,
         },
+        "automation_attestation": automation_attestation_manifest(config.profile, automation_attestation),
         "static_re_target": {
             "firmware_image_sha256": STATIC_RE_IMAGE_SHA256,
             "basis": "pinned-offline-image-not-an-observed-radio-hash",
@@ -796,6 +1206,49 @@ fn write_capture_manifest(captures: &CaptureFiles, session_status: &str) -> Audi
     serde_json::to_writer_pretty(&mut file, &manifest)?;
     file.write_all(b"\n")?;
     durable_flush(&mut file)
+}
+
+fn automation_attestation_manifest(
+    profile: BaselineProfile,
+    attestation: Option<&AutomationAttestation>,
+) -> Value {
+    if profile == BaselineProfile::StockDefault {
+        return json!({
+            "required": false,
+            "status": "not-applicable",
+            "qualifier": "Radio::qualify_automation",
+        });
+    }
+    attestation.map_or_else(
+        || {
+            json!({
+                "required": true,
+                "status": "not-proved",
+                "qualifier": "Radio::qualify_automation",
+                "automation_qualified": false,
+                "transport_reopened_before_raw_audit": false,
+            })
+        },
+        |evidence| {
+            json!({
+                "required": true,
+                "status": if evidence.transport_reopened_before_raw_audit {
+                    "passed"
+                } else {
+                    "qualified-reopen-not-proved"
+                },
+                "qualifier": "Radio::qualify_automation",
+                "automation_qualified": true,
+                "transport_reopened_before_raw_audit": evidence.transport_reopened_before_raw_audit,
+                "abi": {
+                    "version": evidence.abi.version,
+                    "features": evidence.abi.features,
+                    "max_key": evidence.abi.max_key,
+                    "max_phase": evidence.abi.max_phase,
+                },
+            })
+        },
+    )
 }
 
 fn sha256_file(path: &Path) -> AuditResult<String> {
@@ -874,50 +1327,185 @@ fn write_session_end(
     durable_flush(sanitized)
 }
 
-fn write_operator_attestation(
+fn write_preflight_observation(
     private: &mut BufWriter<File>,
     sanitized: &mut BufWriter<File>,
     capture_id: &str,
-    port: &str,
+    endpoint: &Endpoint,
+    profile: BaselineProfile,
+    machine_checked: bool,
 ) -> AuditResult<()> {
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     write_json_line(
         private,
-        &json!({
-            "type": "observation",
-            "schema_version": 1,
-            "privacy": "private",
-            "capture_id": capture_id,
-            "timestamp_unix_ms": timestamp,
-            "action_code": "preflight-ui-checklist",
-            "result_code": "operator-attested",
-            "evidence_basis": "operator-attestation",
-            "assertions": OPERATOR_ASSERTIONS,
-            "port": port,
-            "radio_state_verified": false,
-        }),
+        &preflight_observation_record(
+            capture_id,
+            endpoint,
+            profile,
+            timestamp,
+            EvidencePrivacy::Private,
+            machine_checked,
+        ),
     )?;
     write_json_line(
         sanitized,
-        &json!({
-            "type": "observation",
-            "schema_version": 1,
-            "privacy": "sanitized",
-            "capture_id": capture_id,
-            "timestamp_unix_ms": timestamp,
-            "action_code": "preflight-ui-checklist",
-            "result_code": "operator-attested",
-            "evidence_basis": "operator-attestation",
-            "assertions": OPERATOR_ASSERTIONS,
-            "port": {
-                "$redacted": "endpoint",
-                "byte_len": port.len(),
-            },
-            "radio_state_verified": false,
-        }),
+        &preflight_observation_record(
+            capture_id,
+            endpoint,
+            profile,
+            timestamp,
+            EvidencePrivacy::Sanitized,
+            machine_checked,
+        ),
     )?;
     durable_flush(private)?;
     durable_flush(sanitized)
+}
+
+fn preflight_observation_record(
+    capture_id: &str,
+    endpoint: &Endpoint,
+    profile: BaselineProfile,
+    timestamp: u128,
+    privacy: EvidencePrivacy,
+    machine_checked: bool,
+) -> Value {
+    let (action_code, result_code, evidence_basis, assertions) = if machine_checked {
+        let mut assertions = vec![
+            "exact identity must pass before non-identity reads",
+            "CAT containment must pass before the remaining read allowlist",
+            "the runner exposes no arbitrary-command mode",
+        ];
+        if profile == BaselineProfile::Automation {
+            assertions.extend([
+                "Radio::qualify_automation must exact-attest V1.03.AZM before raw probing",
+                "the qualified transport must close and a fresh transport must open before the 59-case CAT audit",
+            ]);
+        }
+        (
+            "preflight-read-only-policy",
+            "machine-check-required",
+            "machine-checked-read-only",
+            json!(assertions),
+        )
+    } else {
+        (
+            "preflight-ui-checklist",
+            "operator-attested",
+            "operator-attestation",
+            json!(OPERATOR_ASSERTIONS),
+        )
+    };
+    with_endpoint_evidence(
+        json!({
+            "type": "observation",
+            "schema_version": 1,
+            "privacy": privacy.as_str(),
+            "capture_id": capture_id,
+            "timestamp_unix_ms": timestamp,
+            "profile": profile.as_str(),
+            "fixed_cat_case_count": profile.case_count(),
+            "action_code": action_code,
+            "result_code": result_code,
+            "evidence_basis": evidence_basis,
+            "assertions": assertions,
+            "manual_ui_attestation_bypassed": machine_checked,
+            "radio_state_verified": false,
+        }),
+        endpoint,
+        privacy,
+    )
+}
+
+fn write_automation_attestation(
+    private: &mut BufWriter<File>,
+    sanitized: &mut BufWriter<File>,
+    capture_id: &str,
+    endpoint: &Endpoint,
+    attestation: Option<&AutomationAttestation>,
+    error: Option<&str>,
+) -> AuditResult<()> {
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    write_json_line(
+        private,
+        &automation_attestation_record(
+            capture_id,
+            endpoint,
+            timestamp,
+            EvidencePrivacy::Private,
+            attestation,
+            error,
+        ),
+    )?;
+    write_json_line(
+        sanitized,
+        &automation_attestation_record(
+            capture_id,
+            endpoint,
+            timestamp,
+            EvidencePrivacy::Sanitized,
+            attestation,
+            error,
+        ),
+    )?;
+    durable_flush(private)?;
+    durable_flush(sanitized)
+}
+
+fn automation_attestation_record(
+    capture_id: &str,
+    endpoint: &Endpoint,
+    timestamp: u128,
+    privacy: EvidencePrivacy,
+    attestation: Option<&AutomationAttestation>,
+    error: Option<&str>,
+) -> Value {
+    let automation_qualified = attestation.is_some();
+    let transport_reopened =
+        attestation.is_some_and(|evidence| evidence.transport_reopened_before_raw_audit);
+    let passed = automation_qualified && transport_reopened && error.is_none();
+    let result_code = if passed {
+        "exact-automation-qualified-transport-reopened"
+    } else if automation_qualified {
+        "exact-automation-qualified-transport-reopen-failed"
+    } else {
+        "exact-automation-not-proved"
+    };
+    let abi = attestation.map_or(Value::Null, |evidence| {
+        json!({
+            "version": evidence.abi.version,
+            "features": evidence.abi.features,
+            "max_key": evidence.abi.max_key,
+            "max_phase": evidence.abi.max_phase,
+        })
+    });
+    let error_detail = error.map_or(Value::Null, |detail| match privacy {
+        EvidencePrivacy::Private => json!(detail),
+        EvidencePrivacy::Sanitized => json!({
+            "$redacted": "automation-attestation-error",
+            "byte_len": detail.len(),
+        }),
+    });
+    with_endpoint_evidence(
+        json!({
+            "type": "observation",
+            "schema_version": 1,
+            "privacy": privacy.as_str(),
+            "capture_id": capture_id,
+            "timestamp_unix_ms": timestamp,
+            "profile": BaselineProfile::Automation.as_str(),
+            "fixed_cat_case_count": BaselineProfile::Automation.case_count(),
+            "action_code": "qualify-automation",
+            "result_code": result_code,
+            "evidence_basis": "Radio::qualify_automation",
+            "automation_qualified": automation_qualified,
+            "transport_reopened_before_raw_audit": transport_reopened,
+            "abi": abi,
+            "error_detail": error_detail,
+        }),
+        endpoint,
+        privacy,
+    )
 }
 
 async fn run_baseline<T: Transport>(
@@ -925,6 +1513,7 @@ async fn run_baseline<T: Transport>(
     codec: &mut Codec,
     private: &mut BufWriter<File>,
     sanitized: &mut BufWriter<File>,
+    profile: BaselineProfile,
 ) -> AuditResult<()> {
     println!("Running raw read-only preflight...");
     let identity = run_specs(transport, codec, private, sanitized, 0, IDENTITY_READS).await?;
@@ -963,7 +1552,7 @@ async fn run_baseline<T: Transport>(
         private,
         sanitized,
         IDENTITY_READS.len() + BASELINE_PREFLIGHT.len(),
-        BASELINE_REST,
+        baseline_rest_specs(profile),
     )
     .await?;
     println!(
@@ -1284,16 +1873,20 @@ async fn run_specs<T: Transport>(
     Ok(observed)
 }
 
-async fn run_specs_collect_all<T: Transport>(
+async fn run_specs_collect_all<'a, T, I>(
     transport: &mut T,
     codec: &mut Codec,
     private: &mut BufWriter<File>,
     sanitized: &mut BufWriter<File>,
     sequence_base: usize,
-    specs: &[CommandSpec],
-) -> AuditResult<CaseSummary> {
+    specs: I,
+) -> AuditResult<CaseSummary>
+where
+    T: Transport,
+    I: IntoIterator<Item = &'a CommandSpec>,
+{
     let mut summary = CaseSummary::default();
-    for (offset, spec) in specs.iter().enumerate() {
+    for (offset, spec) in specs.into_iter().enumerate() {
         let command = command_text(spec.wire)?;
         let sequence = sequence_base + offset;
         write_attempt(private, sanitized, sequence, spec)?;
@@ -2266,7 +2859,7 @@ fn response_for<'a>(observed: &'a [(String, Vec<u8>)], command: &str) -> AuditRe
         .ok_or_else(|| invalid_input(format!("missing response for {command}")))
 }
 
-fn confirm_ui_checked(port: &str) -> AuditResult<()> {
+fn confirm_ui_checked(endpoint: &Endpoint) -> AuditResult<()> {
     use std::io::IsTerminal;
 
     if !io::stdin().is_terminal() {
@@ -2274,8 +2867,8 @@ fn confirm_ui_checked(port: &str) -> AuditResult<()> {
             "the radio UI checklist attestation requires an interactive terminal",
         ));
     }
-    let required = format!("RADIO UI CHECKED {port}");
-    println!("Before the port is opened, attest that all of these are currently true:");
+    let required = format!("RADIO UI CHECKED {}", endpoint.value());
+    println!("Before the endpoint is opened, attest that all of these are currently true:");
     for assertion in OPERATOR_ASSERTIONS {
         println!("  - {assertion}");
     }
@@ -2305,7 +2898,7 @@ fn read_confirmation_line() -> AuditResult<String> {
         .ok_or_else(|| invalid_input("confirmation must end with Enter"))
 }
 
-fn confirm_make_safe(port: &str) -> AuditResult<()> {
+fn confirm_make_safe(endpoint: &Endpoint) -> AuditResult<()> {
     use std::io::IsTerminal;
 
     if !io::stdin().is_terminal() {
@@ -2313,7 +2906,7 @@ fn confirm_make_safe(port: &str) -> AuditResult<()> {
             "make-safe confirmation requires an interactive terminal",
         ));
     }
-    let required = format!("MAKE SAFE {port}");
+    let required = format!("MAKE SAFE {}", endpoint.value());
     println!("This will leave TNC Off, PT Manual, VOX Off, IO AF, and AI Off.");
     println!("Type exactly: {required}");
     io::stdout().flush()?;
@@ -2335,6 +2928,178 @@ mod tests {
     use kenwood_thd75::transport::MockTransport;
 
     type TestResult = AuditResult<()>;
+
+    fn test_config(args: &[&str]) -> AuditResult<Config> {
+        parse_args_from(args.iter().copied())
+    }
+
+    #[test]
+    fn cli_requires_exactly_one_endpoint() {
+        let missing = test_config(&["baseline", "--capture-root", "/tmp/audit"])
+            .expect_err("an endpoint is required");
+        assert!(missing.to_string().contains("exactly one"));
+
+        let both = test_config(&[
+            "baseline",
+            "--port",
+            "/dev/cu.usbmodem101",
+            "--bluetooth",
+            "TH-D75",
+            "--capture-root",
+            "/tmp/audit",
+        ])
+        .expect_err("USB and Bluetooth are mutually exclusive");
+        assert!(both.to_string().contains("exactly one"));
+    }
+
+    #[test]
+    fn cli_preserves_interactive_usb_baseline() -> TestResult {
+        let config = test_config(&[
+            "baseline",
+            "--port",
+            "/dev/cu.usbmodem101",
+            "--capture-root",
+            "/tmp/audit",
+        ])?;
+        assert_eq!(
+            config.endpoint,
+            Endpoint::Usb("/dev/cu.usbmodem101".to_owned())
+        );
+        assert_eq!(config.mode, Mode::Baseline);
+        assert_eq!(config.profile, BaselineProfile::StockDefault);
+        assert!(!config.machine_checked_read_only);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_accepts_noninteractive_bluetooth_baseline() -> TestResult {
+        let config = test_config(&[
+            "--bluetooth",
+            "TH-D75",
+            "--machine-checked-read-only",
+            "--capture-root",
+            "/tmp/audit",
+        ])?;
+        assert_eq!(config.endpoint, Endpoint::Bluetooth("TH-D75".to_owned()));
+        assert_eq!(config.mode, Mode::Baseline);
+        assert_eq!(config.profile, BaselineProfile::StockDefault);
+        assert!(config.machine_checked_read_only);
+        Ok(())
+    }
+
+    #[test]
+    fn automation_profile_requires_explicit_machine_checked_baseline() -> TestResult {
+        let config = test_config(&[
+            "baseline",
+            "--automation",
+            "--bluetooth",
+            "TH-D75",
+            "--machine-checked-read-only",
+            "--capture-root",
+            "/tmp/audit",
+        ])?;
+        assert_eq!(config.profile, BaselineProfile::Automation);
+        assert_eq!(config.mode, Mode::Baseline);
+        assert!(config.machine_checked_read_only);
+        assert_eq!(config.profile.case_count(), 59);
+
+        let interactive = test_config(&[
+            "baseline",
+            "--automation",
+            "--bluetooth",
+            "TH-D75",
+            "--capture-root",
+            "/tmp/audit",
+        ])
+        .expect_err("V1.03.AZM unexpectedly accepted an operator-only preflight");
+        assert!(
+            interactive
+                .to_string()
+                .contains("requires --machine-checked-read-only")
+        );
+
+        let write_capable = test_config(&[
+            "make-safe",
+            "--automation",
+            "--bluetooth",
+            "TH-D75",
+            "--capture-root",
+            "/tmp/audit",
+        ])
+        .expect_err("V1.03.AZM unexpectedly enabled a write-capable mode");
+        assert!(write_capable.to_string().contains("read-only baseline"));
+        Ok(())
+    }
+
+    #[test]
+    fn machine_checked_mode_cannot_enable_make_safe() {
+        let error = test_config(&[
+            "make-safe",
+            "--bluetooth",
+            "TH-D75",
+            "--machine-checked-read-only",
+            "--capture-root",
+            "/tmp/audit",
+        ])
+        .expect_err("machine checking is read-only");
+        assert!(
+            error
+                .to_string()
+                .contains("only for the read-only baseline")
+        );
+    }
+
+    #[test]
+    fn evidence_names_transport_and_redacts_endpoint() -> TestResult {
+        let config = test_config(&[
+            "baseline",
+            "--bluetooth",
+            "TH-D75",
+            "--machine-checked-read-only",
+            "--capture-root",
+            "/tmp/audit",
+        ])?;
+        let private = session_start_record(&config, "capture", 123, EvidencePrivacy::Private);
+        let sanitized = session_start_record(&config, "capture", 123, EvidencePrivacy::Sanitized);
+
+        assert_eq!(
+            private.get("transport").and_then(Value::as_str),
+            Some("bluetooth-rfcomm")
+        );
+        assert_eq!(
+            private.get("endpoint").and_then(Value::as_str),
+            Some("TH-D75")
+        );
+        assert_eq!(
+            private
+                .get("preflight_evidence_basis")
+                .and_then(Value::as_str),
+            Some("machine-checked-read-only")
+        );
+        assert_eq!(
+            private.get("profile").and_then(Value::as_str),
+            Some("stock-default")
+        );
+        assert_eq!(
+            private.get("fixed_cat_case_count").and_then(Value::as_u64),
+            Some(61)
+        );
+        assert_eq!(
+            sanitized
+                .get("endpoint")
+                .and_then(|value| value.get("$redacted"))
+                .and_then(Value::as_str),
+            Some("endpoint")
+        );
+        assert_eq!(
+            sanitized
+                .get("endpoint")
+                .and_then(|value| value.get("byte_len"))
+                .and_then(Value::as_u64),
+            Some(6)
+        );
+        Ok(())
+    }
 
     #[test]
     fn every_allowlisted_frame_is_cr_terminated() -> TestResult {
@@ -2384,6 +3149,114 @@ mod tests {
                 .ok_or_else(|| invalid_input("allowlisted frame has no mnemonic"))?;
             assert!(!prohibited.contains(&mnemonic));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn automation_fixed_cat_profile_excludes_only_bare_gm_and_gw() -> TestResult {
+        let stock: Vec<&CommandSpec> = IDENTITY_READS
+            .iter()
+            .chain(BASELINE_PREFLIGHT)
+            .chain(baseline_rest_specs(BaselineProfile::StockDefault))
+            .collect();
+        let automation: Vec<&CommandSpec> = IDENTITY_READS
+            .iter()
+            .chain(BASELINE_PREFLIGHT)
+            .chain(baseline_rest_specs(BaselineProfile::Automation))
+            .collect();
+        assert_eq!(stock.len(), 61);
+        assert_eq!(automation.len(), 59);
+        assert_eq!(BaselineProfile::StockDefault.case_count(), stock.len());
+        assert_eq!(BaselineProfile::Automation.case_count(), automation.len());
+
+        let automation_wires: BTreeSet<&[u8]> = automation.iter().map(|spec| spec.wire).collect();
+        let removed: Vec<&[u8]> = stock
+            .iter()
+            .map(|spec| spec.wire)
+            .filter(|wire| !automation_wires.contains(wire))
+            .collect();
+        assert_eq!(removed, vec![b"GM\r".as_slice(), b"GW\r".as_slice()]);
+        assert!(!automation_wires.contains(b"GM\r".as_slice()));
+        assert!(!automation_wires.contains(b"GW\r".as_slice()));
+        assert!(automation.iter().all(|spec| !spec.state_change));
+        Ok(())
+    }
+
+    #[test]
+    fn automation_evidence_records_profile_attestation_reopen_and_case_count() -> TestResult {
+        let config = test_config(&[
+            "baseline",
+            "--automation",
+            "--bluetooth",
+            "TH-D75",
+            "--machine-checked-read-only",
+            "--capture-root",
+            "/tmp/audit",
+        ])?;
+        let start = session_start_record(&config, "capture", 123, EvidencePrivacy::Private);
+        assert_eq!(
+            start.get("profile").and_then(Value::as_str),
+            Some("automation")
+        );
+        assert_eq!(
+            start.get("fixed_cat_case_count").and_then(Value::as_u64),
+            Some(59)
+        );
+
+        let attestation = AutomationAttestation {
+            abi: AutomationAbi {
+                version: 1,
+                features: 0x1F,
+                max_key: 0x18,
+                max_phase: 2,
+            },
+            transport_reopened_before_raw_audit: true,
+        };
+        let record = automation_attestation_record(
+            "capture",
+            &config.endpoint,
+            124,
+            EvidencePrivacy::Private,
+            Some(&attestation),
+            None,
+        );
+        assert_eq!(
+            record.get("result_code").and_then(Value::as_str),
+            Some("exact-automation-qualified-transport-reopened")
+        );
+        assert_eq!(
+            record.get("automation_qualified").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            record
+                .get("transport_reopened_before_raw_audit")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            record.get("fixed_cat_case_count").and_then(Value::as_u64),
+            Some(59)
+        );
+        assert_eq!(
+            record
+                .get("abi")
+                .and_then(|abi| abi.get("features"))
+                .and_then(Value::as_u64),
+            Some(0x1F)
+        );
+
+        let manifest = automation_attestation_manifest(config.profile, Some(&attestation));
+        assert_eq!(
+            manifest.get("status").and_then(Value::as_str),
+            Some("passed")
+        );
+        assert_eq!(
+            manifest
+                .get("transport_reopened_before_raw_audit")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         Ok(())
     }
 
@@ -2612,7 +3485,15 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        write_capture_manifest(&captures, "aborted")?;
+        let config = test_config(&[
+            "baseline",
+            "--port",
+            "/dev/cu.usbmodem101",
+            "--capture-root",
+            root.to_str()
+                .ok_or_else(|| invalid_input("temporary capture root is not UTF-8"))?,
+        ])?;
+        write_capture_manifest(&captures, "aborted", &config, None)?;
         let manifest_mode = std::fs::metadata(captures.session_dir.join("manifest.json"))?
             .permissions()
             .mode()
@@ -2628,6 +3509,24 @@ mod tests {
         assert_eq!(
             manifest.get("session_status").and_then(Value::as_str),
             Some("aborted")
+        );
+        assert_eq!(
+            manifest.get("profile").and_then(Value::as_str),
+            Some("stock-default")
+        );
+        assert_eq!(
+            manifest
+                .get("allowlist")
+                .and_then(|allowlist| allowlist.get("case_count"))
+                .and_then(Value::as_u64),
+            Some(61)
+        );
+        assert_eq!(
+            manifest
+                .get("automation_attestation")
+                .and_then(|attestation| attestation.get("status"))
+                .and_then(Value::as_str),
+            Some("not-applicable")
         );
         assert_eq!(
             manifest

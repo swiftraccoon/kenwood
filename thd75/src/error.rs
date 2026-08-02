@@ -240,6 +240,15 @@ pub enum Error {
     )]
     MemoryReadNotQualified,
 
+    /// An automation operation was attempted without a live qualified
+    /// [`AutomationSession`](crate::radio::automation::AutomationSession), or
+    /// after that session was poisoned by an incomplete operation.
+    #[error(
+        "radio automation requires a live qualified AutomationSession; \
+         reconnect and call Radio::qualify_automation"
+    )]
+    AutomationNotQualified,
+
     /// A strict GM exchange failed or was cancelled after it may have put bytes
     /// in flight. Only reopening the transport can exclude a delayed tail.
     #[error(
@@ -262,6 +271,16 @@ pub enum Error {
         length: u16,
         /// One past the last qualified byte.
         bound: u32,
+    },
+
+    /// Every bounded automation snapshot attempt observed a valid unstable frame.
+    ///
+    /// This is a clean semantic result rather than a malformed strict-GM
+    /// exchange; the qualified automation session remains usable.
+    #[error("radio screen remained unstable across {attempts} bounded capture attempts")]
+    AutomationScreenUnstable {
+        /// Number of host snapshot commands attempted.
+        attempts: u8,
     },
 }
 
@@ -315,13 +334,11 @@ pub enum TransportError {
     #[error("this transport cannot reopen its connection")]
     ReopenUnsupported,
 
-    /// Reopen was invoked from a thread the platform forbids.
+    /// A thread-affine third-party transport refused this reopen call.
     ///
-    /// macOS `IOBluetooth` connections can only be (re)opened on the
-    /// thread that runs the `CFRunLoop` (the thread that performed the
-    /// original open). Attach a
-    /// [`BrokerHandle`](crate::transport::BrokerHandle) to the
-    /// transport, or call from that thread.
+    /// The built-in macOS Bluetooth transport is process-isolated and does
+    /// not have this restriction. This variant remains available to custom
+    /// transports whose platform API requires its original opening thread.
     #[error("reopen must run on the thread that opened the transport")]
     WrongThread,
 }

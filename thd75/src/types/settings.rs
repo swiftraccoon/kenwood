@@ -72,7 +72,7 @@ impl Default for DisplaySettings {
             single_band_display: false,
             meter_type: MeterType::Bar,
             display_method: DisplayMethod::Dual,
-            led_control: LedControl::On,
+            led_control: LedControl::new(true, false),
             info_backlight: true,
             display_hold_time: DisplayHoldTime::Sec3,
         }
@@ -163,17 +163,43 @@ pub enum DisplayMethod {
     Single,
 }
 
-/// LED indicator control.
+/// Independent LED indicator controls (Menu No. 181).
 ///
-/// Per Operating Tips §5.2: Menu No. 181 controls the RX LED and
-/// FM Radio LED independently. When enabled, the LED lights on
-/// signal reception and during FM broadcast radio playback.
+/// MCP byte `0x1028` stores the RX LED in bit `0x01` and the FM Radio
+/// LED in bit `0x02`. They are separate checkboxes on firmware V1.03;
+/// neither bit implies the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LedControl {
-    /// LED indicators enabled.
-    On,
-    /// LED indicators disabled.
-    Off,
+pub struct LedControl {
+    /// Light the receive LED while a signal is being received.
+    pub receive: bool,
+    /// Light the LED while the FM broadcast radio is playing.
+    pub fm_radio: bool,
+}
+
+impl Default for LedControl {
+    fn default() -> Self {
+        Self::new(true, false)
+    }
+}
+
+impl LedControl {
+    /// Both LED indicators disabled.
+    pub const ALL_OFF: Self = Self {
+        receive: false,
+        fm_radio: false,
+    };
+
+    /// Both LED indicators enabled.
+    pub const ALL_ON: Self = Self {
+        receive: true,
+        fm_radio: true,
+    };
+
+    /// Creates independent RX and FM Radio LED controls.
+    #[must_use]
+    pub const fn new(receive: bool, fm_radio: bool) -> Self {
+        Self { receive, fm_radio }
+    }
 }
 
 /// Display hold time for transient information.
@@ -220,12 +246,10 @@ pub struct AudioSettings {
     pub beep: bool,
     /// Beep volume level (1-7).
     pub beep_volume: u8,
-    /// TX audio equalizer preset (for FM/NFM mode).
-    pub tx_equalizer_fm: EqSetting,
-    /// TX audio equalizer preset (for DV mode).
-    pub tx_equalizer_dv: EqSetting,
-    /// RX audio equalizer preset.
-    pub rx_equalizer: EqSetting,
+    /// TX equalizer enables and four independently adjustable bands.
+    pub tx_equalizer: TxEqualizer,
+    /// RX equalizer enable and five independently adjustable bands.
+    pub rx_equalizer: RxEqualizer,
     /// Microphone sensitivity level.
     pub mic_sensitivity: MicSensitivity,
     /// Voice guidance on/off.
@@ -248,9 +272,8 @@ impl Default for AudioSettings {
         Self {
             beep: true,
             beep_volume: 4,
-            tx_equalizer_fm: EqSetting::Off,
-            tx_equalizer_dv: EqSetting::Off,
-            rx_equalizer: EqSetting::Off,
+            tx_equalizer: TxEqualizer::default(),
+            rx_equalizer: RxEqualizer::default(),
             mic_sensitivity: MicSensitivity::Medium,
             voice_guidance: false,
             voice_guidance_volume: 4,
@@ -262,17 +285,213 @@ impl Default for AudioSettings {
     }
 }
 
-/// Audio equalizer setting (TX or RX).
+/// One TH-D75 TX equalizer band level, from -9 through +3 dB.
+///
+/// MCP stores these levels as `0..=12`, with raw zero representing
+/// -9 dB and raw nine representing 0 dB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EqSetting {
-    /// Equalizer disabled (flat response).
-    Off,
-    /// High-boost preset.
-    HighBoost,
-    /// Low-boost preset.
-    LowBoost,
-    /// Full-boost preset.
-    FullBoost,
+pub struct TxEqLevel(i8);
+
+impl TxEqLevel {
+    /// Minimum TX equalizer level in dB.
+    pub const MIN_DB: i8 = -9;
+    /// Maximum TX equalizer level in dB.
+    pub const MAX_DB: i8 = 3;
+    /// Flat (0 dB) TX equalizer level.
+    pub const FLAT: Self = Self(0);
+
+    /// Creates a TX equalizer level if `db` is in `-9..=3`.
+    #[must_use]
+    pub const fn new(db: i8) -> Option<Self> {
+        if db >= Self::MIN_DB && db <= Self::MAX_DB {
+            Some(Self(db))
+        } else {
+            None
+        }
+    }
+
+    /// Decodes the MCP representation (`0..=12`).
+    #[must_use]
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        if raw <= 12 {
+            Some(Self(raw.cast_signed() - 9))
+        } else {
+            None
+        }
+    }
+
+    /// Returns this level in dB.
+    #[must_use]
+    pub const fn as_db(self) -> i8 {
+        self.0
+    }
+
+    /// Returns the MCP representation (`0..=12`).
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        (self.0 + 9).cast_unsigned()
+    }
+}
+
+impl Default for TxEqLevel {
+    fn default() -> Self {
+        Self::FLAT
+    }
+}
+
+impl TryFrom<u8> for TxEqLevel {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::from_raw(value).ok_or(ValidationError::SettingOutOfRange {
+            name: "TX EQ level",
+            value,
+            detail: "must be raw 0-12 (-9 through +3 dB)",
+        })
+    }
+}
+
+impl From<TxEqLevel> for u8 {
+    fn from(value: TxEqLevel) -> Self {
+        value.as_raw()
+    }
+}
+
+/// One TH-D75 RX equalizer band level, from -9 through +9 dB.
+///
+/// MCP stores these levels as `0..=18`, with raw zero representing
+/// -9 dB and raw nine representing 0 dB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RxEqLevel(i8);
+
+impl RxEqLevel {
+    /// Minimum RX equalizer level in dB.
+    pub const MIN_DB: i8 = -9;
+    /// Maximum RX equalizer level in dB.
+    pub const MAX_DB: i8 = 9;
+    /// Flat (0 dB) RX equalizer level.
+    pub const FLAT: Self = Self(0);
+
+    /// Creates an RX equalizer level if `db` is in `-9..=9`.
+    #[must_use]
+    pub const fn new(db: i8) -> Option<Self> {
+        if db >= Self::MIN_DB && db <= Self::MAX_DB {
+            Some(Self(db))
+        } else {
+            None
+        }
+    }
+
+    /// Decodes the MCP representation (`0..=18`).
+    #[must_use]
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        if raw <= 18 {
+            Some(Self(raw.cast_signed() - 9))
+        } else {
+            None
+        }
+    }
+
+    /// Returns this level in dB.
+    #[must_use]
+    pub const fn as_db(self) -> i8 {
+        self.0
+    }
+
+    /// Returns the MCP representation (`0..=18`).
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        (self.0 + 9).cast_unsigned()
+    }
+}
+
+impl Default for RxEqLevel {
+    fn default() -> Self {
+        Self::FLAT
+    }
+}
+
+impl TryFrom<u8> for RxEqLevel {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::from_raw(value).ok_or(ValidationError::SettingOutOfRange {
+            name: "RX EQ level",
+            value,
+            detail: "must be raw 0-18 (-9 through +9 dB)",
+        })
+    }
+}
+
+impl From<RxEqLevel> for u8 {
+    fn from(value: RxEqLevel) -> Self {
+        value.as_raw()
+    }
+}
+
+/// TX equalizer state (Menus No. 911 and 912).
+///
+/// FM/NFM and DV have independent enable bits but share the same four
+/// band levels. Each field maps directly to one MCP-D75 setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TxEqualizer {
+    /// Enable TX EQ for FM and NFM modulation.
+    pub fm_nfm_enabled: bool,
+    /// Enable TX EQ for DV modulation.
+    pub dv_enabled: bool,
+    /// 0.4 kHz band level.
+    pub level_400_hz: TxEqLevel,
+    /// 0.8 kHz band level.
+    pub level_800_hz: TxEqLevel,
+    /// 1.6 kHz band level.
+    pub level_1_6_khz: TxEqLevel,
+    /// 3.2 kHz band level.
+    pub level_3_2_khz: TxEqLevel,
+}
+
+impl Default for TxEqualizer {
+    fn default() -> Self {
+        Self {
+            fm_nfm_enabled: false,
+            dv_enabled: false,
+            level_400_hz: TxEqLevel::FLAT,
+            level_800_hz: TxEqLevel::FLAT,
+            level_1_6_khz: TxEqLevel::FLAT,
+            level_3_2_khz: TxEqLevel::FLAT,
+        }
+    }
+}
+
+/// RX equalizer state (Menus No. 911 and 913).
+///
+/// RX EQ has one enable bit and five independently adjustable bands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RxEqualizer {
+    /// Enable the RX equalizer.
+    pub enabled: bool,
+    /// 0.4 kHz band level.
+    pub level_400_hz: RxEqLevel,
+    /// 0.8 kHz band level.
+    pub level_800_hz: RxEqLevel,
+    /// 1.6 kHz band level.
+    pub level_1_6_khz: RxEqLevel,
+    /// 3.2 kHz band level.
+    pub level_3_2_khz: RxEqLevel,
+    /// 6.4 kHz band level.
+    pub level_6_4_khz: RxEqLevel,
+}
+
+impl Default for RxEqualizer {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            level_400_hz: RxEqLevel::FLAT,
+            level_800_hz: RxEqLevel::FLAT,
+            level_1_6_khz: RxEqLevel::FLAT,
+            level_3_2_khz: RxEqLevel::FLAT,
+            level_6_4_khz: RxEqLevel::FLAT,
+        }
+    }
 }
 
 /// Microphone sensitivity level (Menu No. 112).
@@ -675,15 +894,24 @@ impl TryFrom<u8> for LedControl {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::On),
-            1 => Ok(Self::Off),
-            _ => Err(ValidationError::SettingOutOfRange {
+        if value & !0x03 == 0 {
+            Ok(Self {
+                receive: value & 0x01 != 0,
+                fm_radio: value & 0x02 != 0,
+            })
+        } else {
+            Err(ValidationError::SettingOutOfRange {
                 name: "LED control",
                 value,
-                detail: "must be 0-1",
-            }),
+                detail: "must contain only RX (0x01) and FM Radio (0x02) bits",
+            })
         }
+    }
+}
+
+impl From<LedControl> for u8 {
+    fn from(value: LedControl) -> Self {
+        Self::from(value.receive) | (Self::from(value.fm_radio) << 1)
     }
 }
 
@@ -698,24 +926,6 @@ impl TryFrom<u8> for DisplayHoldTime {
             3 => Ok(Self::Continuous),
             _ => Err(ValidationError::SettingOutOfRange {
                 name: "display hold time",
-                value,
-                detail: "must be 0-3",
-            }),
-        }
-    }
-}
-
-impl TryFrom<u8> for EqSetting {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Off),
-            1 => Ok(Self::HighBoost),
-            2 => Ok(Self::LowBoost),
-            3 => Ok(Self::FullBoost),
-            _ => Err(ValidationError::SettingOutOfRange {
-                name: "EQ setting",
                 value,
                 detail: "must be 0-3",
             }),
@@ -883,6 +1093,8 @@ mod tests {
         let ds = DisplaySettings::default();
         assert_eq!(ds.backlight_control, BacklightControl::Auto);
         assert_eq!(ds.background_color, BackgroundColor::Blue);
+        assert_eq!(ds.led_control, LedControl::new(true, false));
+        assert_eq!(ds.led_control, LedControl::default());
     }
 
     #[test]
@@ -891,6 +1103,50 @@ mod tests {
         assert!(a.beep);
         assert_eq!(a.beep_volume, 4);
         assert_eq!(a.mic_sensitivity, MicSensitivity::Medium);
+        assert_eq!(a.tx_equalizer, TxEqualizer::default());
+        assert_eq!(a.rx_equalizer, RxEqualizer::default());
+    }
+
+    #[test]
+    fn led_control_preserves_independent_bits() -> Result<(), ValidationError> {
+        for raw in 0..=3 {
+            let controls = LedControl::try_from(raw)?;
+            assert_eq!(u8::from(controls), raw);
+        }
+        assert_eq!(LedControl::try_from(1)?, LedControl::new(true, false));
+        assert_eq!(LedControl::try_from(2)?, LedControl::new(false, true));
+        assert!(LedControl::try_from(4).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tx_eq_level_validates_and_round_trips_raw() -> Result<(), Box<dyn std::error::Error>> {
+        for db in TxEqLevel::MIN_DB..=TxEqLevel::MAX_DB {
+            let level = TxEqLevel::new(db).ok_or("in-range TX EQ level rejected")?;
+            assert_eq!(TxEqLevel::from_raw(level.as_raw()), Some(level));
+            assert_eq!(TxEqLevel::try_from(u8::from(level))?, level);
+            assert_eq!(level.as_db(), db);
+        }
+        assert!(TxEqLevel::new(-10).is_none());
+        assert!(TxEqLevel::new(4).is_none());
+        assert!(TxEqLevel::from_raw(13).is_none());
+        assert!(TxEqLevel::try_from(13).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rx_eq_level_validates_and_round_trips_raw() -> Result<(), Box<dyn std::error::Error>> {
+        for db in RxEqLevel::MIN_DB..=RxEqLevel::MAX_DB {
+            let level = RxEqLevel::new(db).ok_or("in-range RX EQ level rejected")?;
+            assert_eq!(RxEqLevel::from_raw(level.as_raw()), Some(level));
+            assert_eq!(RxEqLevel::try_from(u8::from(level))?, level);
+            assert_eq!(level.as_db(), db);
+        }
+        assert!(RxEqLevel::new(-10).is_none());
+        assert!(RxEqLevel::new(10).is_none());
+        assert!(RxEqLevel::from_raw(19).is_none());
+        assert!(RxEqLevel::try_from(19).is_err());
+        Ok(())
     }
 
     #[test]

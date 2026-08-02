@@ -89,20 +89,6 @@ pub enum Command {
     },
     /// Get firmware version (FV).
     GetFirmwareVersion,
-    /// Set firmware version (FV write) -- factory programming command.
-    ///
-    /// Wire format: `FV version\r`.
-    ///
-    /// # Safety
-    ///
-    /// **DANGEROUS FACTORY COMMAND.** This is intended for factory programming
-    /// only. Writing an incorrect firmware version string may brick the radio,
-    /// cause firmware validation failures, or void your warranty. **Do not use
-    /// unless you fully understand the consequences.**
-    SetFirmwareVersion {
-        /// Firmware version string to write.
-        version: String,
-    },
     /// Get power on/off status (PS read).
     GetPowerStatus,
     /// Get radio model ID (ID).
@@ -1352,7 +1338,7 @@ pub const fn command_name(cmd: &Command) -> &'static str {
     match cmd {
         Command::GetFrequency { .. } | Command::SetFrequency { .. } => "FQ",
         Command::GetFrequencyFull { .. } | Command::SetFrequencyFull { .. } => "FO",
-        Command::GetFirmwareVersion | Command::SetFirmwareVersion { .. } => "FV",
+        Command::GetFirmwareVersion => "FV",
         Command::GetPowerStatus => "PS",
         Command::GetRadioId | Command::SetRadioId { .. } => "ID",
         Command::GetBeep | Command::SetBeep { .. } => "BE",
@@ -1458,7 +1444,6 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
             unreachable!("SetFrequencyFull handled by core::serialize_core_write")
         }
         Command::GetFirmwareVersion => "FV".to_owned(),
-        Command::SetFirmwareVersion { version } => format!("FV {version}"),
         Command::GetPowerStatus => "PS".to_owned(),
         Command::GetRadioId => "ID".to_owned(),
         Command::SetRadioId { model } => format!("ID {model}"),
@@ -1864,14 +1849,6 @@ mod tests {
             value: 1,
         });
         assert_eq!(bytes, b"BS 1,1\r");
-    }
-
-    #[test]
-    fn serialize_set_firmware_version() {
-        let bytes = serialize(&Command::SetFirmwareVersion {
-            version: "1.03".to_owned(),
-        });
-        assert_eq!(bytes, b"FV 1.03\r");
     }
 
     #[test]

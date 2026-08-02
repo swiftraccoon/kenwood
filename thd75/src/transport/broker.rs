@@ -1,12 +1,10 @@
-//! Main-thread job broker for transports with thread-affine platform
-//! APIs.
+//! Main-thread job broker for thread-affine platform APIs.
 //!
-//! macOS `IOBluetooth` can only (re)open an RFCOMM channel on the
-//! thread that runs the `CFRunLoop`. The application constructs a
-//! [`MainThreadBroker`] on that thread and calls
-//! [`MainThreadBroker::pump`] from its existing loop tick; any thread
-//! holding a [`BrokerHandle`] can then submit a synchronous job and
-//! await its result.
+//! A caller constructs [`MainThreadBroker`] on the required thread and calls
+//! [`MainThreadBroker::pump`] from that thread's loop; any thread holding a
+//! [`BrokerHandle`] can submit a synchronous job and await its result. Native
+//! macOS Bluetooth no longer uses this broker because all `IOBluetooth` and
+//! `CFRunLoop` work lives in its private helper process.
 
 use std::sync::mpsc;
 
@@ -34,8 +32,7 @@ pub struct BrokerHandle {
 }
 
 impl MainThreadBroker {
-    /// Create a broker. Call this on the thread that must run the
-    /// jobs (the `CFRunLoop` thread for `IOBluetooth`).
+    /// Create a broker on the thread that must run submitted jobs.
     #[must_use]
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();

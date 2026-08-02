@@ -118,16 +118,15 @@ pub const MCP_D75_SCHEMA_MODEL: &str = "TH-D75";
 /// Firmware version whose live MCP layout is represented by the schema.
 pub const MCP_D75_SCHEMA_FIRMWARE: &str = "1.03";
 
-/// Exact CAT `FV` identities emitted for the supported vendor firmware.
+/// Exact CAT `FV` identities whose MCP layout matches the generated schema.
 ///
-/// Both forms are present in committed TH-D75 hardware captures. They name
-/// the same Kenwood 1.03 release; no prefix or numeric-version matching is
-/// permitted for live schema access.
-pub const MCP_D75_SCHEMA_FIRMWARE_IDENTITIES: &[&str] = &["1.03", "1.03.000"];
+/// The vendor identities and V1.03.AZM automation identity share the same MCP
+/// layout. No prefix or numeric-version matching is permitted for live access.
+pub const MCP_D75_SCHEMA_FIRMWARE_IDENTITIES: &[&str] = &["1.03", "1.03.000", "1.03.AZM"];
 
 /// Canonicalize an exact supported CAT firmware identity.
 ///
-/// Returns [`MCP_D75_SCHEMA_FIRMWARE`] for either exact identity in
+/// Returns [`MCP_D75_SCHEMA_FIRMWARE`] for any exact identity in
 /// [`MCP_D75_SCHEMA_FIRMWARE_IDENTITIES`]. All other strings are rejected,
 /// including later build suffixes such as `1.03.001`.
 #[must_use]
@@ -453,6 +452,7 @@ mod tests {
 
     #[test]
     fn schema_firmware_identity_canonicalization_is_exact() {
+        assert!(MCP_D75_SCHEMA_FIRMWARE_IDENTITIES.contains(&"1.03.AZM"));
         for supported in MCP_D75_SCHEMA_FIRMWARE_IDENTITIES {
             assert_eq!(
                 canonicalize_mcp_d75_schema_firmware(supported),

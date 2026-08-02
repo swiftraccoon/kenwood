@@ -52,13 +52,16 @@ pub use tone::{
 
 // APRS subsystem re-exports.
 pub use aprs::{
-    AprsBand, AprsCallsign, AprsConfig, AprsDataSpeed, AprsIcon, AprsMessage, AprsNetwork,
-    AprsStation, AutoReplyConfig, AutoReplyDelay, AutoReplyType, BeaconControl, BeaconMethod,
-    DcdSense, DigipeatAlias, DigipeatConfig, DisplayArea, FilterPhrase, FloodAlias, GroupCode,
-    InterruptTime, McpSmartBeaconingConfig, NavitraConfig, NavitraGroupMode, NavitraMessage,
-    NotificationConfig, PacketFilter, PacketFilterType, PacketPath, PositionAmbiguity,
-    PositionComment, QsyConfig, ReplyMessage, StatusText, TraceAlias, TxDelay, VoiceAlertConfig,
-    WaypointConfig, WaypointFormat,
+    AltnetAddress, AprsBand, AprsCallsign, AprsConfig, AprsDataSpeed, AprsIcon, AprsLock,
+    AprsMessage, AprsNetwork, AprsNetworkType, AprsStation, AutoReplyConfig, AutoReplyDelay,
+    AutoReplyType, BeaconControl, BeaconInterval, BeaconMethod, DcdSense, DigipeatAlias,
+    DigipeatConfig, DisplayArea, FloodAlias, GroupCode, InterruptTime, McpFastRateSeconds,
+    McpHighSpeed, McpLowSpeed, McpSlowRateMinutes, McpSmartBeaconingConfig, McpTurnAngleDegrees,
+    McpTurnSlope, McpTurnTimeSeconds, NavitraConfig, NavitraGroupMode, NavitraMessage,
+    NotificationConfig, PacketFilter, PacketFilterDistance, PacketFilterFlags,
+    PacketFilterPositionLimit, PacketPath, PositionAmbiguity, PositionComment, QsyConfig,
+    ReplyMessage, StatusText, TraceAlias, TxDelay, UserPhrase, VoiceAlertConfig, WaypointConfig,
+    WaypointFormat,
 };
 
 // D-STAR subsystem re-exports.
@@ -87,9 +90,10 @@ pub use scan::{ProgramScanEdge, ScanResumeMethod, ScanType, VisualRange, VisualS
 // Settings re-exports.
 pub use settings::{
     AltitudeRainUnit, AudioSettings, AutoPowerOff, BackgroundColor, BacklightControl, BeatShift,
-    DateFormat, DisplayHoldTime, DisplayMethod, DisplaySettings, DisplayUnits, EqSetting,
-    KeyLockType, Language, LedControl, MeterType, MicSensitivity, PfKeyFunction, PowerOnMessage,
-    SpeedDistanceUnit, SystemSettings, TemperatureUnit, VoiceGuideSpeed,
+    DateFormat, DisplayHoldTime, DisplayMethod, DisplaySettings, DisplayUnits, KeyLockType,
+    Language, LedControl, MeterType, MicSensitivity, PfKeyFunction, PowerOnMessage, RxEqLevel,
+    RxEqualizer, SpeedDistanceUnit, SystemSettings, TemperatureUnit, TxEqLevel, TxEqualizer,
+    VoiceGuideSpeed,
 };
 
 // CW (Morse code) re-exports.

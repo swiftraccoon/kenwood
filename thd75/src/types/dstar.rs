@@ -100,7 +100,7 @@ pub struct DstarConfig {
     pub break_call: bool,
     /// Voice announcement of received callsigns.
     pub callsign_announce: bool,
-    /// EMR (Emergency) volume level (0-9, 0 = off).
+    /// EMR (Emergency) volume level (Menu No. 615, Level 1-Level 50).
     pub emr_volume: EmrVolume,
     /// Gateway mode for DV operation.
     pub gateway_mode: GatewayMode,
@@ -473,25 +473,30 @@ pub enum GatewayMode {
     Manual,
 }
 
-/// EMR (Emergency) volume level (0-9).
+/// EMR (Emergency) volume level (Menu No. 615, Level 1-Level 50).
 ///
 /// When EMR mode is activated by the remote station, the radio increases
-/// volume to the configured EMR level. 0 disables EMR volume override.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// volume to the configured EMR level. Stock TH-D75 V1.03 accepts levels
+/// 1 through 50 and defaults to Level 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EmrVolume(u8);
 
 impl EmrVolume {
+    /// Minimum EMR volume level.
+    pub const MIN: u8 = 1;
     /// Maximum EMR volume level.
-    pub const MAX: u8 = 9;
+    pub const MAX: u8 = 50;
+    /// Stock TH-D75 V1.03 default EMR volume level.
+    pub const DEFAULT: u8 = 1;
 
     /// Creates a new EMR volume level.
     ///
     /// # Errors
     ///
-    /// Returns `None` if the value exceeds 9.
+    /// Returns `None` unless `level` is in the inclusive range 1-50.
     #[must_use]
     pub const fn new(level: u8) -> Option<Self> {
-        if level <= Self::MAX {
+        if level >= Self::MIN && level <= Self::MAX {
             Some(Self(level))
         } else {
             None
@@ -502,6 +507,12 @@ impl EmrVolume {
     #[must_use]
     pub const fn level(self) -> u8 {
         self.0
+    }
+}
+
+impl Default for EmrVolume {
+    fn default() -> Self {
+        Self(Self::DEFAULT)
     }
 }
 
@@ -900,14 +911,30 @@ mod tests {
 
     #[test]
     fn emr_volume_valid_range() {
-        for i in 0u8..=9 {
+        for i in EmrVolume::MIN..=EmrVolume::MAX {
             assert!(EmrVolume::new(i).is_some());
         }
+        assert_eq!(
+            EmrVolume::new(EmrVolume::MIN).map(EmrVolume::level),
+            Some(1)
+        );
+        assert_eq!(
+            EmrVolume::new(EmrVolume::MAX).map(EmrVolume::level),
+            Some(50)
+        );
     }
 
     #[test]
-    fn emr_volume_invalid() {
-        assert!(EmrVolume::new(10).is_none());
+    fn emr_volume_rejects_values_outside_stock_domain() {
+        assert!(EmrVolume::new(0).is_none());
+        assert!(EmrVolume::new(51).is_none());
+        assert!(EmrVolume::new(u8::MAX).is_none());
+    }
+
+    #[test]
+    fn emr_volume_defaults_to_stock_level_one() {
+        assert_eq!(EmrVolume::default().level(), EmrVolume::DEFAULT);
+        assert_eq!(DstarConfig::default().emr_volume.level(), 1);
     }
 
     #[test]

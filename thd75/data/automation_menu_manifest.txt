@@ -1,0 +1,271 @@
+## MENU CONFIGURATION
+
+| No. | Display | Description | Setting Values |
+|-----|---------|-------------|----------------|
+| **TX/RX - RX** | | | |
+| 100 | **Programmable VFO** | Programmable VFO setting (Band A only) | Varies with the selected frequency band |
+| 101 | **Beat Shift** | Beat shift | **Type 1** - Type 8 |
+| 102 | **USB Out Select** | USB output select | AF/ IF/ Detect |
+| 103 | **FM Narrow** | FM narrow | **Off**/ On |
+| 104 | **MW/ SW Antenna** | MW/ SW Antenna | ANT connector / **Bar Antenna** |
+| 105 | **WX Alert** | Weather alert | **Off**/ On (TH-D75A only) |
+| **TX/RX - TX** | | | |
+| 110 | **TX Inhibit** | TX inhibit | **Off**/ On |
+| 111 | **Time-out Timer** | Time-out timer | 0.5/ 1.0/ 1.5/ 2.0/ 2.5/ 3.0/ 3.5/ 4.0/ 4.5/ 5.0/ **10.0** [min] |
+| 112 | **Mic. Sensitivity** | Microphone sensitivity | High/ **Medium**/ Low |
+| **TX/RX - RX Filter** | | | |
+| 120 | **SSB High Cut** | SSB high cut frequency | 2.2/ **2.4**/ 2.6/ 2.8/ 3.0 [kHz] |
+| 121 | **CW Width** | CW bandwidth | 0.3/ 0.5/ **1.0**/ 1.5/ 2.0 [kHz] |
+| 122 | **AM High Cut** | AM high cut frequency | 3.0/ 4.5/ **6.0**/ 7.5 [kHz] |
+| **TX/RX - Scan** | | | |
+| 130 | **Resume** | Resume method | **Time**/ Carrier/ Seek |
+| 131 | **Resume (Digital)** | Resume method (Digital) | Time/ Carrier/ **Seek** |
+| 132 | **Time Restart** | Time operate restart time | 1 - **5** - 10 [sec] |
+| 133 | **Carrier Restart** | Carrier operate restart time | 1 - **2** - 10 [sec] |
+| 134 | **Priority Scan** | Priority scan | **Off**/ On |
+| 135 | **Scan Auto Backlight** | Scan auto backlight | **Off**/ On |
+| 136 | **Auto Weather Scan** | Auto Weather Channel Scan | **Off**/ On (TH-D75A only) |
+| **TX/RX - Repeater** | | | |
+| 140 | **Offset Frequency** | Offset frequency | Varies with the selected frequency band |
+| 141 | **Auto Offset** | Auto repeater offset | Off/ **On** |
+| 142 | **CALL Key** | CALL key function | **CALL** (TH-D75A)/ **1750Hz** (TH-D75E) |
+| 143 | **1750Hz TX Hold** | 1750 Hz TX hold | **Off**/ On |
+| **TX/RX - VOX** | | | |
+| 150 | **VOX** | VOX on/ off | **Off**/ On |
+| 151 | **Gain** | VOX gain level | 0 - **4** - 9 |
+| 152 | **Delay** | VOX delay time | 250/ **500**/ 750/ 1000/ 1500/ 2000/ 3000 [ms] |
+| 153 | **TX on Busy** | VOX on busy | **Off**/ On |
+| **TX/RX - DTMF** | | | |
+| 160 | **Encode Speed** | Encode speed | 50/ **100**/ 150 [ms] |
+| 161 | **Pause Time** | Pause time | 100/ 250/ **500**/ 750/ 1000/ 1500/ 2000 [ms] |
+| 162 | **TX Hold** | TX hold | **Off**/ On |
+| 163 | **DTMF Memory** | DTMF memory | Up to 10 channels for DTMF memory channel, Up to 16 characters for DTMF memory name, Up to 16 digits for DTMF memory code |
+| 164 | **EchoLink Memory** | EchoLink memory | Up to 10 channels for EchoLink memory channel, Up to 8 characters for EchoLink memory name, Up to 8 digits for one channel code |
+| **TX/RX - CW** | | | |
+| 170 | **Pitch Frequency** | Pitch frequency | 400 - **800** - 1000 [Hz] |
+| 171 | **Reverse** | Reverse | **Normal**/ Reverse |
+| **TX/RX - Others** | | | |
+| 180 | **QSO Log** | QSO log | **Off**/ On |
+| 181 | **LED Control** | LED control | **RX**: Check, FM Radio: Uncheck |
+| **Memory - Memory Channel** | | | |
+| 200 | **View List** | Memory channel list | - |
+| 201 | **Group Name** | Memory group name input | Up to 16 characters |
+| 202 | **Recall Method** | Memory channel recall method | **All Bands**/ Current Band |
+| 203 | **Group Link** | Memory group link registration | register up to 30 memory group links |
+| 204 | **CALL Ch List** | CALL channel list | - |
+| **Memory - Repeater List** | | | |
+| 210 | **View List** | Repeater list | - |
+| **Memory - Callsign List** | | | |
+| 220 | **View List** | Callsign list | - |
+| **Memory - Hotspot List** | | | |
+| 230 | **View List** | Hotspot list | - |
+| **Audio File - Recording File** | | | |
+| 300 | **View List** | Recording file list | - |
+| 301 | **Recording** | Recording | **Stop**/ Start |
+| 302 | **Recording Band** | Recording band | **A Band**/ B Band |
+| **Audio File - Voice Message** | | | |
+| 310 | **View List** | Voice message list | - |
+| 311 | **TX Monitor** | TX monitor | Off / **On** |
+| 312 | **Digital Auto Reply** | Digital auto reply | **Off**/ Voice Message 1 - Voice Message 4 |
+| **GPS - Basic Settings** | | | |
+| 400 | **Built-in GPS** | Built-in GPS | Off/ **On** |
+| 401 | **My Position** | My position | **GPS**/ My Position 1 - 5 |
+| 402 | **Position Ambiguity** | Position ambiguity mode | **Off**/ 1-Digit - 4-Digit |
+| 403 | **Operating Mode** | Built-in GPS operating mode | **Normal**/ GPS Receiver |
+| 404 | **Battery Saver** | Battery saver time | Off/ 1min/ 2min/ 4min/ 8min/ **Auto** |
+| 405 | **PC Output** | GPS data output to PC | **Off**/ On |
+| 406 | **Sentence** | Sentence | **$GPGGA**/ $GPGLL/ $GPGSA / $GPGSV/ **$GPRMC**/ $GPVTG |
+| **GPS - Track Log** | | | |
+| 410 | **Track Log** | Track log recording | **Off**/ On |
+| 411 | **Clear Track Log** | Clear track log | - |
+| 412 | **Record Method** | Record method | **Time**/ Distance/ Beacon |
+| 413 | **Interval** | Interval time | 2 - **10** - 1800 [sec] |
+| 414 | **Distance** | Distance | **0.01** - 9.99 [mile, km, nm] |
+| **APRS - Basic Settings** | | | |
+| 500 | **My Callsign** | Callsign entry (for APRS) | Up to 9 characters |
+| 501 | **Icon** | Icon | **Person**/ Bicycle/ Motorcycle, etc. (total 68 icons) |
+| 502 | **Position Comment** | Position comment | Off Duty/ Enroute/ **In Service**/ Returning/ Committed/ Special/ PRIORITY/ CUSTOM0 ~ CUSTOM6/ EMERGENCY! |
+| 503 | **Status Text** | Status text | Status Text: **1** - 5, TX Rate: Off/ 1/1 - **1/4** - 1/8, Up to 42 characters |
+| 504 | **Packet Path** | Packet path type | type: **New-N**/ Relay/ Region/ Others1-Others3, WIDE1-1: Off/On, RELAY: Off/On, ABBR: Up to 5 characters, Total Hops: 0 - **1** - 7, Path: Up to 79 characters |
+| 505 | **Data Speed** | Data communications speed | **1200 bps**/ 9600 bps |
+| 506 | **Data Band** | Internal data band type | **A Band**/ B Band |
+| 507 | **DCD Sense** | DCD sense type | **Busy**/ Detect Data/ Off (Ignore) |
+| 508 | **TX Delay** | TX delay time | 100/ 150/ **200**/ 300/ 400/ 500/ 750/ 1000 [ms] |
+| 509 | **APRS Lock** | APRS lock | Frequency/ PTT/ APRS Key: All unchecked |
+| **APRS - Beacon TX Control** | | | |
+| 510 | **Method** | Method | Manual/ PTT/ **Auto**/ SmartBeaconing |
+| 511 | **Initial Interval** | Initial Interval timer | 0.2/ 0.5/ **1**/ 2/ 3/ 5/ 10/ 20/ 30/ 60 [min] |
+| 512 | **Decay Algorithm** | Decay Algorithm | Off/ **On** |
+| 513 | **Prop. Pathing** | Prop. Pathing | Off/ **On** |
+| 514 | **Speed** | Speed | Off/ **On** |
+| 515 | **Altitude** | Altitude | **Off**/ On |
+| 516 | **Object** | Object name | Name: up to 9 characters, Type: **Live Object**/ Killed Object/ Live Item/ Killed Item, Method: Off/ Temp./ Auto(15 min)/ Auto(30 min)/ Auto(60 min), N(S): Latitude, E(W): Longitude, Icon (Total 68 kinds): **Eyeball**/ Portable (Tent)/ HAM store, etc., Comment: up to 42 characters |
+| **APRS - QSY Information** | | | |
+| 520 | **QSY Info. in Status** | QSY information in status | **Off**/ On |
+| 521 | **Tone/Narrow** | Tone/ Narrow | **Off**/ On |
+| 522 | **Shift/Offset** | Shift/ Offset | **Off**/ On |
+| 523 | **QSY Limit Distance** | QSY limit distance | **Off**/ 10/ 20 ... 2490/ 2500 [mile, km, nm] |
+| **APRS - SmartBeaconing** | | | |
+| 530 | **Low/High Speed** | Low speed/ High speed setting | Low Speed: 2 - **5** - 30 [mile/h, km/h, knots], High Speed: 2 - **70** - 90 [mile/h, km/h, knots] |
+| 531 | **Slow Rate** | Low speed transmission interval time | 1- **30** - 100 [min] |
+| 532 | **Fast Rate** | High speed transmission interval time | 10 - **120** - 180 [sec] |
+| 533 | **Turn Angle** | Driving direction change, minimum value setting | 5 deg - **28 deg** - 90 deg |
+| 534 | **Turn Slope** | Driving direction change, additional value setting | 1 (10deg/speed) - **(26 10deg/speed)** - 255 (10deg/speed) |
+| 535 | **Turn Time** | Minimum time delay between each beacon transmission | 5 - **60** - 180 [sec] |
+| **APRS - Waypoint** | | | |
+| 540 | **Format** | Way point format | **NMEA**/ MAGELLAN/ KENWOOD |
+| 541 | **Length** | Way point name length | **6-Char**/ 7-Char/ 8-Char/ 9-Char |
+| 542 | **Output** | Way point output type | **All**/ Local/ Filtered |
+| **APRS - Packet Filter** | | | |
+| 550 | **Position Limit** | Position limit | **Off**/ 10/ 20 ... 2490/ 2500 [mile, km, nm] |
+| 551 | **Filter Type** | Filter type | Weather/ Digipeater/ Mobile/ Object/ NAVITRA/ 1-WAY/ Others |
+| **APRS - Message** | | | |
+| 560 | **User Phrases** | User phrases | Up to 32 characters x 20 phrases |
+| 561 | **Auto Reply** | Auto message reply | **Off**/ On |
+| 562 | **Reply To** | Reply to | Up to 9 characters |
+| 563 | **Reply Delay Time** | Reply delay time | 0/ **10**/ 20/ 30/ 60 [sec] |
+| 564 | **Reply Message Text** | Reply message text input | Up to 50 characters |
+| **APRS - Notification** | | | |
+| 570 | **RX Beep** | RX beep | Off/ Message Only/ Mine/ All New/ **All** |
+| 571 | **TX Beep** | TX beep | Off/ **On** |
+| 572 | **Special Call** | Special call | Up to 9 characters |
+| 573 | **Display Area** | Display area | **Entire Always**/ Entire Display/ One Line |
+| 574 | **Interrupt Time** | Interrupt time | 3/ 5/ **10**/ 20/ 30/ 60/ infinite [sec] |
+| 575 | **APRS Voice** | APRS voice | **Off**/ On |
+| **APRS - Digipeat** | | | |
+| 580 | **Digipeat(MyCall)** | Digipeat function | **Off**/ On |
+| 581 | **UIcheck** | UI check time | 1 - **28** - 250 [sec] |
+| 582 | **UIdigipeat** | UIdigipeat | **Off**/ On |
+| 583 | **UIdigi Aliases** | UIdigi aliases | Up to 9 characters x 4 |
+| 584 | **UIflood** | UIflood | **Off**/ On |
+| 585 | **UIflood Alias** | UIflood alias | Up to 5 characters |
+| 586 | **UIfloodSubstitution** | UIflood substitution | **First**/ ID/ NOID |
+| 587 | **UItrace** | UItrace | **Off**/ On |
+| 588 | **UItrace Alias** | UItrace alias | Up to 5 characters |
+| **APRS - Others** | | | |
+| 590 | **PC Output** | PC output type | **Off**/ Raw Packets/ Waypoints |
+| 591 | **Network** | Network type | **APRS[APK005]**/ Altnet |
+| 592 | **Voice Alert** | Voice alert type | **Off**/ On/ RX Only |
+| 593 | **VA Frequency** | VA frequency type | 67.0 - **100.0** - 254.1 Hz |
+| 594 | **Message Group Code** | Message group code | Up to 9 characters x 6 codes (ALL,QST,CQ,KWD) |
+| 595 | **Bulletin Group Code** | Bulletin group code | Up to 5 characters x 6 codes |
+| **Digital - RX History** | | | |
+| 600 | **View History** | View History | - |
+| **Digital - TX/RX** | | | |
+| 610 | **My Callsign** | Callsign entry (for DV/DR mode) | Up to 8 characters + up to 4 characters |
+| 611 | **TX Message** | TX message | **Off**/ 1/ 2/ 3/ 4/ 5 |
+| 612 | **Direct Reply** | Direct reply | Off/ **On** |
+| 613 | **Auto Reply Timing** | Auto reply timing | **Immediate**/ 5/ 10/ 20/ 30/ 60 [sec] |
+| 614 | **Data TX End Timing** | Data TX end timing | **Off**/ 0.5/ 1/ 1.5/ 2 [sec] |
+| 615 | **EMR Volume Level** | EMR Volume level | 1 - **25** - 50 |
+| 616 | **RX AFC** | RX AFC | **Off**/ On |
+| 617 | **FM Auto Det. on DV** | FM auto detector on DV | **Off**/ On |
+| 618 | **Data Frame Output** | Data Frame Output | **All**/ Related to DSQ/ DATA Mode |
+| 619 | **Break Call** | Break Call | **Off**/ On |
+| **Digital - Digital Squelch** | | | |
+| 620 | **Select Type** | Select Type | **Off**/Code Squelch/ Callsign Squelch |
+| 621 | **Digital Code** | Digital Code | **00** - 99 |
+| **Digital - GPS Data TX** | | | |
+| 630 | **GPS Info. in Frame** | GPS Information in frame | **Off**/ On |
+| 631 | **Sentence** | Sentence | **$GPGGA**/ $GPGLL/ $GPGSA/ $GPGSV/ **$GPRMC**/ $GPVTG/ APRS Sentence |
+| 632 | **Auto TX** | Auto TX | **Off**/ 0.2/ 0.5/ 1/ 2/ 3/ 5/ 10/ 20/ 30/ 60 [min] |
+| **Digital - RX Notification** | | | |
+| 640 | **Display Method** | Display method | Off/ **All**/ Related to DQS/ My Station Only |
+| 641 | **Single Display Size** | Single display size | Half Display/ **Entire Display** |
+| 642 | **Dual Display Size** | Dual display size | Half Display/ **Entire Display** |
+| 643 | **Display Hold Time** | Display hold time | 0 / 3/ 5/ **10**/ 20/ 30 / 60/ Infinite [sec] |
+| 644 | **Callsign Announce** | Callsign announce | **Off**/ Kerchunk/ Except Kerchunk/ My Station Only/ All |
+| 645 | **Standby Beep** | Standby beep | **Off**/ On |
+| **Digital - DV Gateway** | | | |
+| 650 | **DV Gateway Mode** | DV Gateway mode setting | **Off**/ Reflector TERM Mode |
+| 651 | **My Callsign** | Callsign entry (for DV Gateway mode) | Up to 8 character callsign + 6 patterns of up to 4 character identification code |
+| 652 | **RPT1** | RPT1 (for DV Gateway mode) | Up to 8 characters |
+| 653 | **RPT2** | RPT2 (for DV Gateway mode) | Up to 8 characters |
+| 654 | **Device Information** | Device name | Up to 16 characters |
+| **FM Broadcasting - Basic Settings** | | | |
+| 700 | **FM Radio Mode** | FM radio mode | **Off**/ On |
+| 701 | **Auto Mute RET. Time** | Auto mute return time | 1 - **3** - 10 [sec] |
+| **FM Broadcasting - Memory** | | | |
+| 710 | **FM Radio List** | FM radio list | - |
+| **SD Card - Export** | | | |
+| 800 | **Config Data** | Config data | - |
+| 801 | **Config Data + V.Msg** | Config data and voice message | - |
+| 802 | **Repeater List Only** | Repeater list only | - |
+| 803 | **Callsign List Only** | Callsign list only | - |
+| **SD Card - Import** | | | |
+| 810 | **Config Data** | Config data | - |
+| 811 | **Config Data + V.Msg** | Config data and voice message | - |
+| 812 | **Repeater List Only** | Repeater list only | - |
+| 813 | **Callsign List Only** | Callsign list only | - |
+| **SD Card - Unmount** | | | |
+| 820 | **Execute** | Unmount execute | - |
+| **SD Card - Format** | | | |
+| 830 | **Execute** | Format execute | - |
+| **SD Card - Memory Size** | | | |
+| 840 | **View** | Free capacity | - |
+| **Configuration - Display** | | | |
+| 900 | **Backlight Control** | Backlight control | **Auto**/ Auto (DC-IN)/ Manual/ On |
+| 901 | **Backlight Timer** | Backlight timer | 3 - **10** - 60 [sec] |
+| 902 | **LCD Brightness** | LCD brightness | **High**/ Medium/ Low |
+| 903 | **Power-on Message** | Power-on message input | Up to 16 characters |
+| 904 | **Single Band Display** | Single band display type | Off/ GPS(Altitude) / GPS(GS)/ **Date**/ Demodulation Mode |
+| 905 | **Meter Type** | Meter type | **Type 1**/ Type 2/ Type 3 |
+| 906 | **Background Color** | Background color select | **Black**/ White |
+| 907 | **Info. Backlight** | Information Backlight | Off/ LCD/ **LCD+Key** |
+| **Configuration - Audio** | | | |
+| 910 | **Balance** | Audio balance | A:100/ B:0, A:100/ B:25, A:100/ B:50, A:100/ B:75, **A:100/ B:100**, A:75/ B:100, A:50/ B:100, A:25/ B:100, A:0/B:100, Operation Band Only |
+| 911 | **TX/RX EQ** | TX/RX EQ | RX EQ/ TX EQ(FM, NFM)/ TX EQ(DV) |
+| 912 | **TX EQ Level** | TX EQ Level | -9 - **±0** - +3 [dB] |
+| 913 | **RX EQ Level** | RX EQ Level | -9 - **±0** - +9 [dB] |
+| 914 | **Beep** | Beep | Off/ **On** |
+| 915 | **Beep Volume** | Beep volume | **Volume Link**/ Level 1 - Level 7 |
+| 916 | **Voice Guidance** | Voice guidance | **Off**/ Manual/ Auto1/ Auto2 |
+| 917 | **Voice Guidance Vol.** | Voice guidance volume | **Volume Link**/ Level 1 - Level 7 |
+| 918 | **VoiceGuidanceSpeed** | Voice guidance speed | **Speed 1** - Speed 4 |
+| 919 | **Callsign Readout** | Callsign readout method | **Standard**/ Full Phonetics/ Suffix Phonetics |
+| 91A | **USB Audio Out. Lvl.** | USB Audio Output level | Level 1 - **Level 7** |
+| **Configuration - Battery** | | | |
+| 920 | **Battery Saver** | Battery Saver | Off/ 0.2/ 0.4/ 0.6/ 0.8/ **1.0**/ 2.0/ 3.0/ 4.0/ 5.0 [sec] |
+| 921 | **APO: Auto Power Off** | APO: Auto Power Off | Off/ 15/ **30**/ 60 [min] |
+| 922 | **Battery Level** | Battery Level | - |
+| 923 | **Charging** | Battery charging when power is on | Off / **On** |
+| **Configuration - Bluetooth** | | | |
+| 930 | **Bluetooth** | Bluetooth | **Off** / On |
+| 931 | **Connect** | Connect | - |
+| 932 | **Device Search** | Device Search | - |
+| 933 | **Disconnect** | Disconnect | - |
+| 934 | **Pairing Mode** | Pairing Mode | - |
+| 935 | **Device Information** | Device Information | Up to 19 characters |
+| 936 | **Auto Connect** | Auto Connect | Off / **On** |
+| **Configuration - Auxiliary** | | | |
+| 940 | **PF1 Key** | PF1 Key | Recording - Voice Message 1-4 - Voice Guidance - Battery Level - VOX - Group Name - **Balance (PF1)** - **GPS (PF2)** - Track LOG - SQL - SHIFT - STEP - LOW - Key Lock - Lockout - M>V - T. SEL - NEW - Voice Alert - LCD Brightness - DTMF CH0 - EchoLink CH0 - 1750Hz Tone - M. IN |
+| 941 | **PF2 Key** | PF2 Key | (same options as PF1) |
+| 942 | **PF1 (Mic)** | PF1 (Mic) | Recording - Voice Message 1-4 - Voice Guidance - Battery Level - VOX - Group Name - Balance - GPS - Track LOG - SQL - SHIFT - STEP - LOW - Key Lock - Lockout - M>V - T. SEL - NEW - Voice Alert - LCD Brightness - DTMF CH0 - EchoLink CH0 - 1750Hz Tone - Screen Capture - MODE - **MENU - A/B (PF1 Mic)** - **VFO (PF2 Mic)** - **MR (PF3 Mic)** - CALL - MSG - LIST - BCON - REV - TONE - MHz - MARK - DUAL - APRS - OBJ - ATT - FINE - POS - BAND - MONI - UP - DOWN |
+| 943 | **PF2 (Mic)** | PF2 (Mic) | (same options as PF1 Mic) |
+| 944 | **PF3 (Mic)** | PF3 (Mic) | (same options as PF1 Mic) |
+| 945 | **Cursor Shift** | Cursor shift | **Off**/ 1.0/ 1.5/ 2.0 [sec] |
+| 946 | **Secret Access Code** | Secret access code input | 000 - 999 (TH-D75A only) |
+| **Configuration - Date & Time** | | | |
+| 950 | **Setting** | Date and time setting | - |
+| **Configuration - Lock** | | | |
+| 960 | **Keys Lock Type** | Keys lock type | **Key Lock**/ Frequency Lock |
+| 961 | **DTMF Keys Lock** | DTMF keys lock | **Off**/ On |
+| 962 | **Mic Keys Lock** | Microphone keys lock | **Off**/ On |
+| 963 | **Volume Lock** | Volume lock | **Off**/ On |
+| **Configuration - Units** | | | |
+| 970 | **Speed, Distance** | Speed/ Distance | **mi/h, mile** (TH-D75A)/ **km/h, km** (TH-D75E)/ knots, nm |
+| 971 | **Altitude, Rain** | Altitude/ Rain | **feet, inch** (TH-D75A)/ **m, mm** (TH-D75E) |
+| 972 | **Temperature** | Temperature | **°F** (TH-D75A)/ **°C** (TH-D75E) |
+| 973 | **Latitude, Longitude** | Latitude/ Longitude | **dd°mm.mm'**/ dd°mm'ss.s" |
+| 974 | **Grid Square Format** | Grid square format | **Maidenhead Grid**/ SAR Grid (CONV)/ SAR Grid (CELL) |
+| **Configuration - Interface** | | | |
+| 980 | **USB Function** | USB Function | **COM+AF/IF Output**/ Mass Storage |
+| 981 | **PC Output (GPS)** | PC Output (GPS) | **USB**/ Bluetooth |
+| 982 | **PC Output (APRS)** | PC Output (APRS) | **USB**/ Bluetooth |
+| 983 | **KISS** | PC Input/ Output (KISS) | **USB**/ Bluetooth |
+| 984 | **DV/DR** | PC Input/ Output (DV/DR) | **USB**/ Bluetooth |
+| 985 | **DV Gateway** | PC Input/ Output (DV Gateway) | **USB**/ Bluetooth |
+| **Configuration - System** | | | |
+| 990 | **Language** | Language | **English**/ Japanese |
+| 991 | **Version** | Firmware version | - |
+| 999 | **Reset** | Reset | **VFO Reset**/ Partial Reset/ Full Reset |

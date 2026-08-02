@@ -99,6 +99,207 @@ pub enum McpSpeed {
     Fast,
 }
 
+/// One page in an ordered, compare-and-exchange MCP transaction.
+///
+/// The transaction reads the live page and requires it to match `expected`
+/// byte-for-byte before it can write `replacement`. Keeping both complete
+/// pages in the request makes the optimistic-concurrency guard explicit and
+/// gives callers the exact bytes needed for a later compensating transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpPageExchange {
+    page: u16,
+    expected: [u8; programming::PAGE_SIZE],
+    replacement: [u8; programming::PAGE_SIZE],
+}
+
+impl McpPageExchange {
+    /// Construct one guarded page replacement.
+    #[must_use]
+    pub const fn new(
+        page: u16,
+        expected: [u8; programming::PAGE_SIZE],
+        replacement: [u8; programming::PAGE_SIZE],
+    ) -> Self {
+        Self {
+            page,
+            expected,
+            replacement,
+        }
+    }
+
+    /// MCP page address.
+    #[must_use]
+    pub const fn page(&self) -> u16 {
+        self.page
+    }
+
+    /// Exact live bytes required before any page in the transaction is written.
+    #[must_use]
+    pub const fn expected(&self) -> &[u8; programming::PAGE_SIZE] {
+        &self.expected
+    }
+
+    /// Bytes to write after every expected page has matched.
+    #[must_use]
+    pub const fn replacement(&self) -> &[u8; programming::PAGE_SIZE] {
+        &self.replacement
+    }
+}
+
+/// The in-session operation that stopped an MCP page exchange.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum McpPageExchangeOperationError {
+    /// A page could not be read during the compare phase.
+    #[error("could not read MCP page 0x{page:04X} for comparison: {source}")]
+    Read {
+        /// Page whose read failed.
+        page: u16,
+        /// Underlying MCP or transport failure.
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// A live page differed from the caller's expected snapshot.
+    #[error(
+        "MCP compare mismatch on page 0x{page:04X} at offset 0x{offset:02X}: \
+         expected 0x{expected:02X}, found 0x{actual:02X}"
+    )]
+    CompareMismatch {
+        /// Page containing the first mismatch.
+        page: u16,
+        /// First differing byte offset within the page.
+        offset: usize,
+        /// Caller-supplied expected byte.
+        expected: u8,
+        /// Byte read from the radio.
+        actual: u8,
+    },
+
+    /// A page write or its immediate read-back verification failed.
+    #[error("verified write of MCP page 0x{page:04X} failed: {source}")]
+    Write {
+        /// Page whose write may have reached the radio.
+        page: u16,
+        /// Underlying write or read-back failure.
+        #[source]
+        source: Box<Error>,
+    },
+}
+
+impl McpPageExchangeOperationError {
+    /// Page on which the transaction stopped.
+    #[must_use]
+    pub const fn page(&self) -> u16 {
+        match self {
+            Self::Read { page, .. }
+            | Self::CompareMismatch { page, .. }
+            | Self::Write { page, .. } => *page,
+        }
+    }
+}
+
+/// A rejected or failed ordered MCP page compare-and-exchange transaction.
+///
+/// For operation and cleanup failures, [`Self::possibly_written_pages`]
+/// returns every page whose write was started, in caller order. The final page
+/// may not have been verified (or even received by the radio), so a
+/// compensating restore should conservatively compare and restore every page
+/// in that list.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum McpPageExchangeError {
+    /// The request named one page more than once.
+    #[error("duplicate MCP compare-and-exchange page 0x{page:04X}")]
+    DuplicatePage {
+        /// Duplicated page address.
+        page: u16,
+    },
+
+    /// A page was outside the memory image or inside the protected factory area.
+    #[error("invalid MCP compare-and-exchange page 0x{page:04X}: {source}")]
+    InvalidPage {
+        /// Rejected page address.
+        page: u16,
+        /// Typed range or write-protection error.
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// Programming mode could not be entered.
+    #[error("could not enter MCP mode for compare-and-exchange: {source}")]
+    Entry {
+        /// Entry failure, including any entry-path cleanup failure.
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// The page operation failed, but MCP cleanup succeeded.
+    #[error(
+        "MCP compare-and-exchange failed after writes may have started for \
+         {possibly_written_pages:?}: {operation}"
+    )]
+    Operation {
+        /// Pages whose writes may have started, in caller order.
+        possibly_written_pages: Vec<u16>,
+        /// Read, comparison, write, or read-back failure.
+        #[source]
+        operation: Box<McpPageExchangeOperationError>,
+    },
+
+    /// Every page operation succeeded, but leaving MCP mode failed.
+    #[error(
+        "MCP compare-and-exchange cleanup failed after writes to \
+         {possibly_written_pages:?}: {cleanup}"
+    )]
+    Cleanup {
+        /// Successfully written and verified pages, in caller order.
+        possibly_written_pages: Vec<u16>,
+        /// MCP exit or CAT-restoration failure.
+        #[source]
+        cleanup: Box<Error>,
+    },
+
+    /// Both the page operation and MCP cleanup failed.
+    #[error(
+        "MCP compare-and-exchange failed after writes may have started for \
+         {possibly_written_pages:?}: {operation}; cleanup also failed: {cleanup}"
+    )]
+    OperationAndCleanup {
+        /// Pages whose writes may have started, in caller order.
+        possibly_written_pages: Vec<u16>,
+        /// Read, comparison, write, or read-back failure.
+        operation: Box<McpPageExchangeOperationError>,
+        /// MCP exit or CAT-restoration failure.
+        #[source]
+        cleanup: Box<Error>,
+    },
+}
+
+impl McpPageExchangeError {
+    /// Pages whose writes may have started, preserving caller order.
+    ///
+    /// The slice is empty for preflight, entry, read, and compare failures.
+    #[must_use]
+    pub fn possibly_written_pages(&self) -> &[u16] {
+        match self {
+            Self::Operation {
+                possibly_written_pages,
+                ..
+            }
+            | Self::Cleanup {
+                possibly_written_pages,
+                ..
+            }
+            | Self::OperationAndCleanup {
+                possibly_written_pages,
+                ..
+            } => possibly_written_pages,
+            Self::DuplicatePage { .. } | Self::InvalidPage { .. } | Self::Entry { .. } => &[],
+        }
+    }
+}
+
 /// Timeout for a full memory dump.
 ///
 /// At 9600 baud: 1955 pages x 261 bytes x 10 bits/byte / 9600 bps ~ 53 s.
@@ -506,6 +707,149 @@ impl<T: Transport> Radio<T> {
         self.finish_mcp_operation(result, exit_result)
     }
 
+    /// Compare and conditionally replace sparse MCP pages in caller order.
+    ///
+    /// This is the guarded primitive for temporary multi-page state changes.
+    /// Before entering programming mode, it rejects out-of-range, protected,
+    /// and duplicate pages. Inside one MCP session it then reads **every**
+    /// requested page, compares every live page byte-for-byte with its
+    /// [`McpPageExchange::expected`] snapshot, and only then starts writing.
+    /// Changed replacements are written and immediately read-back verified in
+    /// exactly the order supplied by the caller; unchanged replacements are
+    /// still compared but are not written. The returned page numbers are the
+    /// changed pages successfully written, in caller order.
+    ///
+    /// An empty request is a no-op and does not enter programming mode.
+    ///
+    /// # Atomicity and restoration
+    ///
+    /// The compare phase is all-or-nothing, but the TH-D75 has no atomic
+    /// multi-page write operation. A later write or verification can fail
+    /// after earlier pages changed. On error,
+    /// [`McpPageExchangeError::possibly_written_pages`] identifies, in caller
+    /// order, every page whose write may have started. Its last page is not
+    /// necessarily verified. Callers performing a temporary change should
+    /// retain the request's complete expected pages and conservatively restore
+    /// every page in that list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpPageExchangeError::DuplicatePage`] or
+    /// [`McpPageExchangeError::InvalidPage`] before any I/O. A live-byte
+    /// mismatch is reported only after all requested pages have been read and
+    /// causes zero writes. After a successful MCP entry, exit is always
+    /// attempted, including read, mismatch, write, and verification failures;
+    /// a simultaneous operation and cleanup failure retains both errors.
+    pub async fn compare_exchange_memory_pages(
+        &mut self,
+        exchanges: &[McpPageExchange],
+    ) -> Result<Vec<u16>, McpPageExchangeError> {
+        let mut distinct_pages = std::collections::HashSet::with_capacity(exchanges.len());
+        for exchange in exchanges {
+            let page = exchange.page;
+            if let Err(source) = Self::validate_mcp_page_range(page, 1) {
+                return Err(McpPageExchangeError::InvalidPage {
+                    page,
+                    source: Box::new(source),
+                });
+            }
+            if programming::is_factory_calibration_page(page) {
+                return Err(McpPageExchangeError::InvalidPage {
+                    page,
+                    source: Box::new(Error::MemoryWriteProtected { page }),
+                });
+            }
+            if !distinct_pages.insert(page) {
+                return Err(McpPageExchangeError::DuplicatePage { page });
+            }
+        }
+
+        if exchanges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.enter_programming_mode()
+            .await
+            .map_err(|source| McpPageExchangeError::Entry {
+                source: Box::new(source),
+            })?;
+
+        let mut possibly_written_pages = Vec::with_capacity(exchanges.len());
+        let operation: Result<Vec<u16>, McpPageExchangeOperationError> = async {
+            // Complete every read before checking expectations. A stale page
+            // anywhere in the request therefore gates every write.
+            let mut live_pages = Vec::with_capacity(exchanges.len());
+            for exchange in exchanges {
+                let page = exchange.page;
+                let live = self.read_single_page(page).await.map_err(|source| {
+                    McpPageExchangeOperationError::Read {
+                        page,
+                        source: Box::new(source),
+                    }
+                })?;
+                live_pages.push(live);
+            }
+
+            for (exchange, live) in exchanges.iter().zip(&live_pages) {
+                if let Some((offset, (&expected, &actual))) = exchange
+                    .expected
+                    .iter()
+                    .zip(live.iter())
+                    .enumerate()
+                    .find(|(_, (expected, actual))| expected != actual)
+                {
+                    return Err(McpPageExchangeOperationError::CompareMismatch {
+                        page: exchange.page,
+                        offset,
+                        expected,
+                        actual,
+                    });
+                }
+            }
+
+            for exchange in exchanges {
+                if exchange.expected == exchange.replacement {
+                    continue;
+                }
+
+                // Record the page before polling the write. Any returned
+                // failure can mean the W frame reached the radio even when
+                // its ACK or verification did not complete.
+                possibly_written_pages.push(exchange.page);
+                self.write_single_page(exchange.page, &exchange.replacement)
+                    .await
+                    .map_err(|source| McpPageExchangeOperationError::Write {
+                        page: exchange.page,
+                        source: Box::new(source),
+                    })?;
+            }
+
+            Ok(possibly_written_pages.clone())
+        }
+        .await;
+
+        // Successful entry has one unconditional exit path, regardless of
+        // which read, comparison, write, or read-back operation failed.
+        let cleanup = self.exit_programming_mode().await;
+
+        match (operation, cleanup) {
+            (Ok(written_pages), Ok(())) => Ok(written_pages),
+            (Err(operation), Ok(())) => Err(McpPageExchangeError::Operation {
+                possibly_written_pages,
+                operation: Box::new(operation),
+            }),
+            (Ok(_), Err(cleanup)) => Err(McpPageExchangeError::Cleanup {
+                possibly_written_pages,
+                cleanup: Box::new(cleanup),
+            }),
+            (Err(operation), Err(cleanup)) => Err(McpPageExchangeError::OperationAndCleanup {
+                possibly_written_pages,
+                operation: Box::new(operation),
+                cleanup: Box::new(cleanup),
+            }),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // High-level: single page read/write
     // -----------------------------------------------------------------------
@@ -745,8 +1089,8 @@ impl<T: Transport> Radio<T> {
     /// (e.g. enabling DV Gateway / Reflector Terminal Mode, where the
     /// radio comes back speaking the MMDVM binary protocol): the normal
     /// post-exit reconnect would race that reboot. Over Bluetooth the
-    /// link can reopen in the pre-reboot window and then wedge
-    /// mid-command as the radio's stack dies. The write is still
+    /// link can reopen in the pre-reboot window and then be interrupted
+    /// mid-command when the radio resets its stack. The write is still
     /// verified by read-back inside the session; the connection is
     /// deliberately left dead afterwards and the caller owns recovery
     /// (typically by reconnecting from a fresh process once the radio
@@ -1867,6 +2211,7 @@ impl<T: Transport> Radio<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::{McpPageExchange, McpPageExchangeError, McpPageExchangeOperationError};
     use crate::error::{Error, ProtocolError, TransportError};
     use crate::protocol::programming;
     use crate::protocol::{Command, Response};
@@ -3228,6 +3573,367 @@ mod tests {
             McpPhase::ExitSent,
             "failed CAT identity proof must keep detached cleanup poisoned"
         );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn page_exchange_preserves_caller_read_and_write_order() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        // Deliberately neither ascending nor descending. The third exchange
+        // is unchanged: it must still be read and compared in position, but
+        // must not produce a write.
+        let first_page = 0x0042;
+        let second_page = 0x0040;
+        let unchanged_page = 0x0041;
+        let first_expected = [0x11; programming::PAGE_SIZE];
+        let second_expected = [0x22; programming::PAGE_SIZE];
+        let unchanged = [0x33; programming::PAGE_SIZE];
+        let mut first_replacement = first_expected;
+        let mut second_replacement = second_expected;
+        set_byte(&mut first_replacement, 7, 0xA1)?;
+        set_byte(&mut second_replacement, 9, 0xB2)?;
+
+        for (page, data) in [
+            (first_page, &first_expected),
+            (second_page, &second_expected),
+            (unchanged_page, &unchanged),
+        ] {
+            let read = programming::build_read_command(page);
+            mock.expect(&read, &build_w_response(page, data)?);
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+        }
+
+        // The strict script proves writes retain caller order and that the
+        // unchanged third page is skipped.
+        for (page, replacement) in [
+            (first_page, &first_replacement),
+            (second_page, &second_replacement),
+        ] {
+            let write = programming::build_write_command(page, replacement);
+            mock.expect(&write, &[programming::ACK]);
+            let verify = programming::build_read_command(page);
+            mock.expect(&verify, &build_w_response(page, replacement)?);
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+        }
+
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let exchanges = [
+            McpPageExchange::new(first_page, first_expected, first_replacement),
+            McpPageExchange::new(second_page, second_expected, second_replacement),
+            McpPageExchange::new(unchanged_page, unchanged, unchanged),
+        ];
+        let mut radio = Radio::connect(mock).await?;
+        let written = radio.compare_exchange_memory_pages(&exchanges).await?;
+        assert_eq!(written, [first_page, second_page]);
+        assert_eq!(radio.mcp_phase, McpPhase::Inactive);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn page_exchange_reads_all_pages_then_mismatch_causes_zero_writes() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let pages = [0x0010, 0x0012, 0x0011];
+        let expected = [
+            [0x10; programming::PAGE_SIZE],
+            [0x20; programming::PAGE_SIZE],
+            [0x30; programming::PAGE_SIZE],
+        ];
+        let mut live = expected;
+        set_byte(&mut live[1], 0x5A, 0xFE)?;
+
+        // Even though page index 1 mismatches, index 2 must be read before
+        // comparison begins. No W command is scripted, so any write fails the
+        // test before the exit exchange.
+        for ((page, _), data) in pages.iter().zip(&expected).zip(&live) {
+            let read = programming::build_read_command(*page);
+            mock.expect(&read, &build_w_response(*page, data)?);
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+        }
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let exchanges = [
+            McpPageExchange::new(pages[0], expected[0], [0xA0; programming::PAGE_SIZE]),
+            McpPageExchange::new(pages[1], expected[1], [0xB0; programming::PAGE_SIZE]),
+            McpPageExchange::new(pages[2], expected[2], [0xC0; programming::PAGE_SIZE]),
+        ];
+        let mut radio = Radio::connect(mock).await?;
+        let error = match radio.compare_exchange_memory_pages(&exchanges).await {
+            Err(error) => error,
+            Ok(written) => {
+                return Err(
+                    format!("stale expected page unexpectedly wrote pages: {written:?}").into(),
+                );
+            }
+        };
+        assert!(
+            matches!(
+                &error,
+                McpPageExchangeError::Operation { operation, .. }
+                    if matches!(
+                        operation.as_ref(),
+                        McpPageExchangeOperationError::CompareMismatch {
+                            page: 0x0012,
+                            offset: 0x5A,
+                            expected: 0x20,
+                            actual: 0xFE,
+                        }
+                    )
+            ),
+            "first mismatch was not reported exactly: {error:?}"
+        );
+        assert!(error.possibly_written_pages().is_empty());
+        assert_eq!(radio.mcp_phase, McpPhase::Inactive);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn page_exchange_rejects_duplicate_protected_and_invalid_pages_before_io() -> TestResult {
+        let data = [0u8; programming::PAGE_SIZE];
+
+        let mut duplicate_radio = Radio::connect(MockTransport::new()).await?;
+        let duplicate = [
+            McpPageExchange::new(0x0010, data, data),
+            McpPageExchange::new(0x0010, data, data),
+        ];
+        let result = duplicate_radio
+            .compare_exchange_memory_pages(&duplicate)
+            .await;
+        assert!(matches!(
+            result,
+            Err(McpPageExchangeError::DuplicatePage { page: 0x0010 })
+        ));
+        duplicate_radio.transport.assert_complete();
+
+        let protected_page = programming::MAX_WRITABLE_PAGE + 1;
+        let mut protected_radio = Radio::connect(MockTransport::new()).await?;
+        let protected = [McpPageExchange::new(protected_page, data, data)];
+        let result = protected_radio
+            .compare_exchange_memory_pages(&protected)
+            .await;
+        assert!(matches!(
+            result,
+            Err(McpPageExchangeError::InvalidPage { page, source })
+                if page == protected_page
+                    && matches!(source.as_ref(), Error::MemoryWriteProtected { page: p } if *p == protected_page)
+        ));
+        protected_radio.transport.assert_complete();
+
+        let invalid_page = programming::TOTAL_PAGES;
+        let mut invalid_radio = Radio::connect(MockTransport::new()).await?;
+        let invalid = [McpPageExchange::new(invalid_page, data, data)];
+        let result = invalid_radio.compare_exchange_memory_pages(&invalid).await;
+        assert!(matches!(
+            result,
+            Err(McpPageExchangeError::InvalidPage { page, source })
+                if page == invalid_page
+                    && matches!(source.as_ref(), Error::McpPageOutOfRange { page: p, .. } if *p == invalid_page)
+        ));
+        invalid_radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn page_exchange_write_failure_reports_ordered_possible_writes_and_exits() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let first_page = 0x0012;
+        let second_page = 0x0010;
+        let first_expected = [0x11; programming::PAGE_SIZE];
+        let second_expected = [0x22; programming::PAGE_SIZE];
+        let first_replacement = [0xA1; programming::PAGE_SIZE];
+        let second_replacement = [0xB2; programming::PAGE_SIZE];
+
+        for (page, data) in [
+            (first_page, &first_expected),
+            (second_page, &second_expected),
+        ] {
+            let read = programming::build_read_command(page);
+            mock.expect(&read, &build_w_response(page, data)?);
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+        }
+
+        let first_write = programming::build_write_command(first_page, &first_replacement);
+        mock.expect(&first_write, &[programming::ACK]);
+        let first_verify = programming::build_read_command(first_page);
+        mock.expect(
+            &first_verify,
+            &build_w_response(first_page, &first_replacement)?,
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        let second_write = programming::build_write_command(second_page, &second_replacement);
+        mock.expect(&second_write, &[0x15]);
+
+        // Cleanup remains mandatory after the failed W acknowledgement.
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let exchanges = [
+            McpPageExchange::new(first_page, first_expected, first_replacement),
+            McpPageExchange::new(second_page, second_expected, second_replacement),
+        ];
+        let mut radio = Radio::connect(mock).await?;
+        let error = match radio.compare_exchange_memory_pages(&exchanges).await {
+            Err(error) => error,
+            Ok(written) => {
+                return Err(format!("NAKed exchange unexpectedly wrote pages: {written:?}").into());
+            }
+        };
+        assert_eq!(
+            error.possibly_written_pages(),
+            [first_page, second_page],
+            "the failing page must be included for conservative restoration"
+        );
+        assert!(
+            matches!(
+                &error,
+                McpPageExchangeError::Operation { operation, .. }
+                    if matches!(
+                        operation.as_ref(),
+                        McpPageExchangeOperationError::Write { page, source }
+                            if *page == second_page
+                                && matches!(
+                                    source.as_ref(),
+                                    Error::WriteNotAcknowledged { page, got: 0x15 }
+                                        if *page == second_page
+                                )
+                    )
+            ),
+            "write failure lost its page or typed cause: {error:?}"
+        );
+        assert_eq!(radio.mcp_phase, McpPhase::Inactive);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn page_exchange_readback_failure_reports_possible_write_and_exits() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page = 0x0010;
+        let expected = [0x11; programming::PAGE_SIZE];
+        let replacement = [0x77; programming::PAGE_SIZE];
+        let read = programming::build_read_command(page);
+        mock.expect(&read, &build_w_response(page, &expected)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        let write = programming::build_write_command(page, &replacement);
+        mock.expect(&write, &[programming::ACK]);
+        let mut bad_readback = replacement;
+        set_byte(&mut bad_readback, 0x3C, 0x00)?;
+        mock.expect(&read, &build_w_response(page, &bad_readback)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect(mock).await?;
+        let exchange = [McpPageExchange::new(page, expected, replacement)];
+        let error = match radio.compare_exchange_memory_pages(&exchange).await {
+            Err(error) => error,
+            Ok(written) => {
+                return Err(
+                    format!("corrupt readback unexpectedly accepted pages: {written:?}").into(),
+                );
+            }
+        };
+        assert_eq!(error.possibly_written_pages(), [page]);
+        assert!(
+            matches!(
+                &error,
+                McpPageExchangeError::Operation { operation, .. }
+                    if matches!(
+                        operation.as_ref(),
+                        McpPageExchangeOperationError::Write { page: p, source }
+                            if *p == page
+                                && matches!(
+                                    source.as_ref(),
+                                    Error::McpVerifyMismatch {
+                                        page: p,
+                                        offset: 0x3C,
+                                        expected: 0x77,
+                                        actual: 0x00,
+                                    } if *p == page
+                                )
+                    )
+            ),
+            "readback mismatch lost its typed cause: {error:?}"
+        );
+        assert_eq!(radio.mcp_phase, McpPhase::Inactive);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn page_exchange_retains_compare_and_exit_failures() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page = 0x0010;
+        let expected = [0x11; programming::PAGE_SIZE];
+        let actual = [0x22; programming::PAGE_SIZE];
+        let read = programming::build_read_command(page);
+        mock.expect(&read, &build_w_response(page, &actual)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // A wrong exit ACK is still followed by a successful CAT identity
+        // proof. Both it and the comparison failure must remain visible.
+        mock.expect(b"E", &[0x15]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let exchange = [McpPageExchange::new(
+            page,
+            expected,
+            [0x33; programming::PAGE_SIZE],
+        )];
+        let mut radio = Radio::connect(mock).await?;
+        let error = match radio.compare_exchange_memory_pages(&exchange).await {
+            Err(error) => error,
+            Ok(written) => {
+                return Err(format!(
+                    "mismatched page and bad exit unexpectedly succeeded: {written:?}"
+                )
+                .into());
+            }
+        };
+        assert!(error.possibly_written_pages().is_empty());
+        assert!(
+            matches!(
+                &error,
+                McpPageExchangeError::OperationAndCleanup {
+                    operation,
+                    cleanup,
+                    ..
+                } if matches!(
+                    operation.as_ref(),
+                    McpPageExchangeOperationError::CompareMismatch {
+                        page: 0x0010,
+                        offset: 0,
+                        expected: 0x11,
+                        actual: 0x22,
+                    }
+                ) && matches!(cleanup.as_ref(), Error::McpExitNotAcknowledged { got: 0x15 })
+            ),
+            "combined operation/cleanup context was not retained: {error:?}"
+        );
+        assert_eq!(radio.mcp_phase, McpPhase::Inactive);
         radio.transport.assert_complete();
         Ok(())
     }

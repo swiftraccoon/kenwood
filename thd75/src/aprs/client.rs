@@ -150,7 +150,8 @@ impl AprsClientConfig {
     ///
     /// - Symbol: car (`/>`)
     /// - Baud: 1200 bps (standard APRS AFSK)
-    /// - `SmartBeaconing`: TH-D75 defaults (Menu 540-547)
+    /// - `SmartBeaconing`: TH-D75A V1.03 defaults (Menu 530-535), normalized
+    ///   from the default mi/h setting to km/h
     /// - Max stations: 500, timeout: 1 hour
     /// - Auto-ack: on
     #[must_use]
@@ -1469,6 +1470,18 @@ mod tests {
     fn test_address() -> Ax25Address {
         Ax25Address::new("N0CALL", 7)
             .unwrap_or_else(|_| unreachable!("N0CALL-7 is statically valid"))
+    }
+
+    #[test]
+    fn client_uses_v103_smart_beaconing_defaults() {
+        let smart = AprsClientConfig::new("N0CALL", 7).smart_beaconing;
+        assert!((smart.low_speed_kmh - 8.046_72).abs() < f64::EPSILON);
+        assert!((smart.high_speed_kmh - 112.654_08).abs() < f64::EPSILON);
+        assert_eq!(smart.slow_rate_secs, 1800);
+        assert_eq!(smart.fast_rate_secs, 120);
+        assert!((smart.turn_slope - 41.842_944).abs() < f64::EPSILON);
+        assert!((smart.turn_min_deg - 28.0).abs() < f64::EPSILON);
+        assert_eq!(smart.turn_time_secs, 60);
     }
 
     #[tokio::test]
