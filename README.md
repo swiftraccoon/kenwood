@@ -57,14 +57,18 @@ expecting stability.
 | [`sextant/`](sextant/) | GUI D-STAR reflector client; exercises the laptop-only encode/decode pipeline against a local `polaris` reflector | experimental |
 | [`stargazer/`](stargazer/) | D-STAR observatory: discovery and XLX monitoring, with unwired voice-capture components | experimental |
 | [`lodestar-core/`](lodestar-core/) | UniFFI Rust core for the Lodestar macOS/iPadOS app | experimental |
+| [`azimuth-core/`](azimuth-core/) | UniFFI Rust core for Azimuth: authenticated automation control and stale-safe MCP setting transactions | experimental |
 
 ## App
 
 | App | Platform | Source | Status |
 |-----|----------|--------|--------|
 | Lodestar | iPadOS, macOS | [`lodestar/`](lodestar/) (Xcode) + [`lodestar-core/`](lodestar-core/) (Rust via UniFFI) | experimental |
+| Azimuth | M-series iPadOS, macOS | [`azimuth/`](azimuth/) (Xcode) + [`azimuth-core/`](azimuth-core/) (Rust via UniFFI) | experimental |
 
 Lodestar is a SwiftUI D-STAR gateway app for DPlus / DExtra / DCS reflectors. The macOS build bridges a TH-D75 over native `IOBluetooth` RFCOMM; the iPadOS build drives the radio directly over USB-C through an embedded DriverKit extension on M-series iPads, and keeps relaying while backgrounded. Both also work reflector-only with no radio (TX/RX over IP). iPhone is not supported. Build via XcodeGen: `(cd lodestar && xcodegen generate && open Lodestar.xcodeproj)`.
+
+Azimuth is the dedicated SwiftUI TH-D75 control center and field guide. It mirrors the authenticated 240×180 radio screen, exposes all 25 guarded front-panel keys, reads the complete reviewed 400-field settings catalog, and applies user-approved natural-language proposals through stale-safe verified MCP transactions. It uses direct USB-C through an embedded DriverKit extension on M-series iPads and the public CDC serial device on macOS. Build the core with `./azimuth-core/scripts/build-xcframework.sh`, then generate the app with `(cd azimuth && xcodegen generate)`.
 
 ## Building
 
@@ -75,7 +79,7 @@ cargo test --workspace
 ./ci-local.sh   # cross-platform CI: macOS locally, Ubuntu + Fedora in k8s pods
 ```
 
-Rust 1.94+, edition 2024. Workspace-level lints enforce `unsafe_code = "forbid"`, `missing_docs = "deny"`, and clippy `pedantic`/`nursery`/`cargo`. A crate's `[lints]` table replaces the workspace one rather than merging, so four crates restate it: `thd75` and `thd75-tui` deny (rather than forbid) `unsafe_code` for the macOS `IOBluetooth` bindings, `lodestar-core` permits it for the generated UniFFI scaffolding, and `thd75-repl` restates the table only to diverge on other lints; it forbids `unsafe_code` and contains no FFI. Every `unsafe` block outside that allowlist is rejected by `./lint.sh`'s unsafe audit.
+Rust 1.94+, edition 2024. Workspace-level lints enforce `unsafe_code = "forbid"`, `missing_docs = "deny"`, and clippy `pedantic`/`nursery`/`cargo`. A crate's `[lints]` table replaces the workspace one rather than merging, so five crates restate it: `thd75` denies (rather than forbids) `unsafe_code` only for the audited macOS `IOBluetooth` helper and Vision OCR bridge FFI, `thd75-tui` forbids it, `lodestar-core` and `azimuth-core` permit generated UniFFI scaffolding, and `thd75-repl` restates the table only to diverge on other lints; it forbids `unsafe_code` and contains no FFI. Every `unsafe` block outside that allowlist is rejected by `./lint.sh`'s unsafe audit.
 
 ## License
 
