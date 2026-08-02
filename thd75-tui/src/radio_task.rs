@@ -52,12 +52,11 @@ impl ConnectFailure {
     }
 }
 
-/// Open a transport on the calling thread (must be main for BT).
+/// Open a transport on the calling thread.
 ///
-/// This is synchronous: call from main before starting tokio.
-/// On macOS, Bluetooth RFCOMM callbacks require the main thread's
-/// `CFRunLoop`, so transport discovery must happen before the tokio
-/// runtime is spawned on a dedicated thread.
+/// This is synchronous. On macOS the native RFCOMM implementation owns its
+/// `IOBluetooth` objects and run loop inside a helper process, so callers may
+/// invoke it from any thread.
 ///
 /// # Arguments
 /// - `port`: explicit serial port path (e.g. `/dev/cu.usbmodem*`), or
@@ -88,20 +87,10 @@ pub(crate) fn discover_and_open_transport(
 /// # Arguments
 /// - `mcp_speed`: `"fast"` for `McpSpeed::Fast` (risky), anything else for Safe.
 /// - `tx`: channel for sending state updates and errors to the TUI.
-/// - `bt_req_tx` / `bt_resp_rx`: channels for requesting BT reconnect from
-///   the main thread (`IOBluetooth` RFCOMM must be opened on main).
 /// - `cmd_rx`: channel for receiving user commands from the TUI.
 #[expect(
-    clippy::similar_names,
     clippy::too_many_lines,
-    reason = "`bt_req_tx` and `bt_resp_rx` (and internally `bt_req_rx`/`bt_resp_tx`) form \
-              the canonical request/response channel pair for the main-thread IOBluetooth \
-              reconnect path. The names are structurally parallel by design; renaming \
-              would obscure which channel is the request side and which is the response \
-              side. The channel pair exists because IOBluetooth RFCOMM reconnect must run \
-              on the process main thread (Cocoa run loop); the radio task lives on a \
-              tokio worker and dispatches reconnect requests across this channel pair. \
-              `too_many_lines` fires because the function owns the entire radio task loop \
+    reason = "The function owns the entire radio task loop \
               (command polling + event handling + BT reconnect dance) in a single \
               `tokio::select!` over MPSC receivers; splitting would require channel \
               plumbing for no reader benefit."
@@ -112,10 +101,8 @@ pub(crate) async fn spawn_with_transport(
     mcp_speed: String,
     tx: mpsc::UnboundedSender<Message>,
     mut cmd_rx: mpsc::UnboundedReceiver<crate::event::RadioCommand>,
-    bt_req_tx: std::sync::mpsc::Sender<(Option<String>, u32)>,
-    bt_resp_rx: std::sync::mpsc::Receiver<Result<(String, EitherTransport), String>>,
 ) -> Result<String, ConnectFailure> {
-    let baud = SerialTransport::DEFAULT_BAUD;
+    let serial_baud = SerialTransport::DEFAULT_BAUD;
     // connect_safe sends a TNC-exit preamble, recovering a radio that a
     // crashed application left stuck in KISS mode.
     let mut radio = Radio::connect_safe(transport).await.map_err(|e| {
@@ -530,13 +517,9 @@ pub(crate) async fn spawn_with_transport(
             // After MCP programming mode, the D75's USB stack resets and the
             // device may re-enumerate with a different path (e.g., the
             // usbmodem suffix changes on macOS). We first try the original
-            // path, then auto-discover USB. If both fail (e.g., BT connection),
-            // we request the main thread to open a new BT transport (IOBluetooth
-            // RFCOMM must be opened on the main thread for CFRunLoop callbacks).
-            // Close the old transport BEFORE opening a new connection. Critical
-            // for Bluetooth: do_rfcomm_open() calls [device closeConnection] on
-            // the shared IOBluetoothDevice, which would corrupt the old
-            // RfcommContext's channel pointer if it's still alive.
+            // path, then auto-discover USB/Bluetooth. Close and drop the old
+            // transport before opening its replacement so only one owner can
+            // hold the radio's SPP channel at a time.
             if let Some(ref mut r) = radio_opt
                 && let Err(e) = r.close_transport().await
             {
@@ -551,28 +534,17 @@ pub(crate) async fn spawn_with_transport(
                     "Reconnect attempt {attempts}..."
                 )));
 
-                // On macOS, native IOBluetooth RFCOMM must be opened on the
-                // main thread (CFRunLoop). On Linux/Windows, BT SPP serial
-                // ports can be opened directly from any thread.
-                #[cfg(target_os = "macos")]
-                let skip_direct = SerialTransport::is_bluetooth_port(&path_clone);
-                #[cfg(not(target_os = "macos"))]
-                let skip_direct = false;
-
-                let connect_result = if skip_direct {
-                    Err("BT requires main thread".to_string())
-                } else {
-                    discover_and_open(Some(&path_clone), baud)
-                        .or_else(|_| discover_and_open(None, baud))
-                }
-                .or_else(|_| {
-                    bt_req_tx
-                        .send((Some(path_clone.clone()), baud))
-                        .map_err(|e| e.to_string())?;
-                    bt_resp_rx
-                        .recv_timeout(Duration::from_secs(10))
-                        .map_err(|e| e.to_string())?
-                });
+                // Discovery/open is synchronous and may use the native
+                // helper's bounded 22-second startup window. Keep it off the
+                // async scheduler; awaiting this one result also prevents a
+                // late response from being consumed by a later attempt.
+                let requested_path = path_clone.clone();
+                let connect_result = tokio::task::spawn_blocking(move || {
+                    discover_and_open(Some(&requested_path), serial_baud)
+                        .or_else(|_| discover_and_open(None, serial_baud))
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("transport reconnect worker failed: {error}")));
                 if let Ok((_p, transport)) = connect_result {
                     match Radio::connect(transport).await {
                         Ok(mut new_radio) => match new_radio.identify().await {

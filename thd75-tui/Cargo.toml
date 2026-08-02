@@ -29,14 +29,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # KNOWN DIVERGENCE FROM WORKSPACE (this block replaces, never merges with,
 # the workspace `[lints.rust]`):
-# - `unsafe_code` is weakened from the workspace `forbid` to `deny`: the
-#   binary must pump the macOS CFRunLoop for IOBluetooth callbacks, which
-#   requires one FFI block in `src/main.rs` under a scoped
-#   `#[expect(unsafe_code, reason = ...)]`. `deny` + scoped expect is the
-#   same pattern the `thd75` crate uses for its IOBluetooth module.
+# - `unsafe_code` matches the workspace `forbid`: macOS IOBluetooth now runs
+#   entirely inside the library's process-isolated helper, so the TUI has no
+#   native CFRunLoop FFI.
 # - Everything else mirrors the workspace block.
 [lints.rust]
-unsafe_code = "deny"
+unsafe_code = "forbid"
 missing_docs = "deny"
 missing_debug_implementations = "deny"
 unreachable_pub = "deny"
