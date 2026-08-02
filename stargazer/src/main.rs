@@ -201,6 +201,13 @@ async fn main() -> ExitCode {
 }
 
 /// Import salvaged dvrec packet logs as recordings.
+///
+/// Per-file parse and write failures are logged and counted in the
+/// printed summary but do not fail the run: corrupt published files
+/// persist on disk indefinitely, so treating them as fatal would
+/// permanently wedge any pipeline that runs the importer ahead of
+/// later stages. The exit code reports only whether the recordings
+/// tree itself could be walked.
 fn import_dvrec(recordings: &std::path::Path) -> ExitCode {
     let writer = stargazer::writer::Writer::new(recordings.to_path_buf(), true);
     match stargazer::dvrec::import_tree(recordings, &writer) {
@@ -216,11 +223,7 @@ fn import_dvrec(recordings: &std::path::Path) -> ExitCode {
                 summary.skipped_voiceless,
                 summary.failed
             );
-            if summary.failed > 0 {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            }
+            ExitCode::SUCCESS
         }
     }
 }
