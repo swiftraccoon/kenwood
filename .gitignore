@@ -28,6 +28,8 @@ thd75_re/
 *.ambe
 
 !README.md
+!.claude-review/
+!.claude-review/*.md
 
 # dstar-gateway: public docs and ADRs are committed
 !dstar-gateway/README.md
