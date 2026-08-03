@@ -1144,6 +1144,62 @@ impl<T: Transport> Radio<T> {
         self.finish_mcp_operation(result, exit_result)
     }
 
+    /// Selectively modify one page and detach only when a write occurred.
+    ///
+    /// The page is read once, patched in memory, and compared with its
+    /// original contents. If unchanged, no page write is issued and the
+    /// normal exit path restores CAT before returning `false`. If changed,
+    /// the page is written with read-back verification and the detached exit
+    /// path returns `true`, leaving recovery to the caller while the setting
+    /// takes effect.
+    ///
+    /// This is intended for persistent mode flags whose changed value causes
+    /// a reboot, but whose already-correct value must not incur a redundant
+    /// flash write or detached restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MemoryWriteProtected`] before I/O for a protected
+    /// page. Otherwise returns an error from programming entry, page I/O,
+    /// verification, exit, or unchanged-state CAT restoration. After an
+    /// operation failure, the normal reconnect-and-identify cleanup path is
+    /// used rather than trusting a possibly stale detached-exit ACK.
+    pub async fn modify_memory_page_detached_if_changed<F>(
+        &mut self,
+        page: u16,
+        modify: F,
+    ) -> Result<bool, Error>
+    where
+        F: FnOnce(&mut [u8; programming::PAGE_SIZE]),
+    {
+        if programming::is_factory_calibration_page(page) {
+            return Err(Error::MemoryWriteProtected { page });
+        }
+
+        self.enter_programming_mode().await?;
+
+        let result: Result<bool, Error> = async {
+            let original = self.read_single_page(page).await?;
+            let mut modified = original;
+            modify(&mut modified);
+            if modified == original {
+                Ok(false)
+            } else {
+                self.write_single_page(page, &modified).await?;
+                Ok(true)
+            }
+        }
+        .await;
+
+        let exit_result = if matches!(&result, Ok(true)) {
+            self.exit_programming_mode_detached().await
+        } else {
+            self.exit_programming_mode().await
+        };
+
+        self.finish_mcp_operation(result, exit_result)
+    }
+
     // -----------------------------------------------------------------------
     // High-level: structured data accessors
     // -----------------------------------------------------------------------

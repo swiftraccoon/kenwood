@@ -308,28 +308,29 @@ fn render_mcp_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
     // -------------------------------------------------------------------------
     // Left pane: APRS config fields
     // -------------------------------------------------------------------------
-    // Field-level APRS settings (My callsign / Beacon interval / Packet
-    // path) used to be displayed here, sourced from `aprs.my_callsign()`,
-    // `aprs.beacon_interval()`, `aprs.packet_path()`. Those accessors
+    // Field-level APRS settings (Beacon interval / Packet path) used to be
+    // displayed here from `aprs.beacon_interval()` and `aprs.packet_path()`.
+    // Those accessors
     // were removed from `thd75::memory::AprsAccess` because their
     // sub-page offsets were imported from D74 development notes and
     // never verified against D75 firmware or hardware. See
     // `thd75/src/memory/aprs.rs` module docs for the verification
     // criteria to reintroduce them.
     //
-    // Until a verified offset map lands, surface the gap to the user
-    // rather than displaying potentially-wrong values.
+    // The callsign is available independently through the verified live CS
+    // command. Until the remaining offset map lands, surface those gaps rather
+    // than displaying potentially-wrong values.
+    let my_callsign = app.state.aprs_callsign.as_ref().map_or_else(
+        || "<not available>".to_owned(),
+        |callsign| callsign.as_str().to_owned(),
+    );
     let lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled(
             " APRS Configuration",
             Style::default().fg(Color::Yellow),
         )),
         Line::from(""),
-        kv_line(
-            "My callsign",
-            "<offset unverified; use CAT MY for live value>".to_owned(),
-            Color::DarkGray,
-        ),
+        kv_line("My callsign", my_callsign, Color::White),
         kv_line(
             "Beacon interval",
             "<offset unverified>".to_owned(),

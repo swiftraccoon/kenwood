@@ -1,6 +1,6 @@
 //! Audio control methods.
 //!
-//! Controls AF (Audio Frequency) gain (band-indexed) and VOX (Voice-Operated
+//! Controls global AF (Audio Frequency) gain and VOX (Voice-Operated
 //! Exchange) settings for hands-free transmit.
 //!
 //! # D75 tone commands
@@ -17,7 +17,7 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::{AfGainLevel, Band, DstarSlot, TncBaud, TncMode, VoxDelay, VoxGain};
+use crate::types::{AfGainLevel, DstarSlot, RadioClock, TncBaud, TncMode, VoxDelay, VoxGain};
 
 use super::Radio;
 
@@ -44,38 +44,20 @@ impl<T: Transport> Radio<T> {
 
     /// Set the AF gain level (AG write).
     ///
-    /// # Get/set asymmetry
-    ///
-    /// The get and set commands have different wire formats on the D75:
-    /// - **Read** (`AG\r`): bare command, returns a global gain level. Band-indexed read
-    ///   (`AG 0\r`) returns `?`.
-    /// - **Write** (`AG NNN\r`): bare 3-digit zero-padded value (e.g., `AG 015\r`). Despite
-    ///   the `band` parameter in this method's signature, the wire format is bare (no band
-    ///   index) and the value applies globally.
+    /// Both reads (`AG\r`) and writes (`AG NNN\r`) operate on one global
+    /// level. Band-indexed AG commands are rejected by the radio.
     ///
     /// # Valid range
     ///
-    /// `level` must be 0 through 99. The wire format zero-pads to 3 digits (e.g., `AG 005\r`).
-    /// Values outside 0-99 may be rejected or cause unexpected behavior.
+    /// `level` is validated to 0 through 200. The wire format zero-pads to
+    /// three digits (for example, `AG 005\r` or `AG 200\r`).
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Validation`] if `level` exceeds 99 (the type
-    /// is deliberately lenient because *reads* can return values above
-    /// 99, but the firmware's write range is 000-099). Returns an
-    /// error if the command fails or the response is unexpected.
-    pub async fn set_af_gain(&mut self, band: Band, level: AfGainLevel) -> Result<(), Error> {
-        if level.as_u8() > 99 {
-            return Err(Error::Validation(
-                crate::error::ValidationError::SettingOutOfRange {
-                    name: "AF gain (write)",
-                    value: level.as_u8(),
-                    detail: "must be 0-99",
-                },
-            ));
-        }
-        tracing::debug!(?band, ?level, "setting AF gain");
-        let response = self.execute(Command::SetAfGain { band, level }).await?;
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn set_af_gain(&mut self, level: AfGainLevel) -> Result<(), Error> {
+        tracing::debug!(?level, "setting global AF gain");
+        let response = self.execute(Command::SetAfGain { level }).await?;
         match response {
             Response::AfGain { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -224,16 +206,18 @@ impl<T: Transport> Radio<T> {
     /// `RT` is overloaded on the D75 (repeater tone vs real-time clock on D74).
     /// It was discovered during audio subsystem probing.
     ///
-    /// Hardware-verified: bare `RT\r` returns `RT YYMMDDHHmmss`.
+    /// Hardware-verified: bare `RT\r` returns either a calendar-valid
+    /// `RT YYMMDDHHmmss` value or the exact `RT ------------` unavailable
+    /// sentinel.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_real_time_clock(&mut self) -> Result<String, Error> {
+    pub async fn get_real_time_clock(&mut self) -> Result<RadioClock, Error> {
         tracing::debug!("reading real-time clock");
         let response = self.execute(Command::GetRealTimeClock).await?;
         match response {
-            Response::RealTimeClock { datetime } => Ok(datetime),
+            Response::RealTimeClock { clock } => Ok(clock),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "RealTimeClock".into(),
                 actual: format!("{other:?}").into_bytes(),

@@ -1,56 +1,13 @@
 //! Memory commands: ME, MR, 0M.
 //!
-//! Provides serialization of ME write commands and parsing of ME responses.
-//! MR (recall) and 0M (programming mode) are action commands whose responses
-//! are either echoes or absent.
+//! Provides serialization of ME reads and MR actions, plus parsing of ME/MR
+//! responses. Lossy ME writes are intentionally not exposed.
 
 use crate::error::ProtocolError;
-use crate::types::Band;
+use crate::types::{Band, MemoryChannelRecord, MemorySelector};
 
-use super::core::{CHANNEL_FIELD_COUNT, parse_channel_fields, serialize_channel_fields};
-use super::{Command, Response};
-
-/// Serialize a memory write command into its wire-format body (without trailing `\r`).
-///
-/// The ME wire format has 23 comma-separated fields: 1 channel number followed
-/// by 22 data fields. Two ME-specific fields (at positions 14 and 22) are
-/// inserted relative to the 20-field FO layout and serialized as `0`.
-///
-/// Returns `None` if the command is not a memory write command.
-pub(crate) fn serialize_memory_write(cmd: &Command) -> Option<String> {
-    match cmd {
-        Command::SetMemoryChannel { channel, data } => {
-            let fo = serialize_channel_fields(data);
-            // FO serializes 20 comma-separated fields. Split them so we can
-            // insert the two ME-specific extras.
-            let parts: Vec<&str> = fo.split(',').collect();
-            debug_assert_eq!(
-                parts.len(),
-                CHANNEL_FIELD_COUNT,
-                "FO serializer must produce exactly {CHANNEL_FIELD_COUNT} comma-separated \
-                 fields before ME layout reconstruction",
-            );
-
-            // Reconstruct ME layout:
-            //   parts[0..=12]  -> ME fields 1..=13  (freq through x5)
-            //   "0"            -> ME field 14        (ME-specific)
-            //   parts[13..=19] -> ME fields 15..=21  (tt through dm)
-            //   "0"            -> ME field 22        (ME-specific)
-            let (head, tail) = parts.split_at(parts.len().min(13));
-            let me_body: String = head
-                .iter()
-                .copied()
-                .chain(std::iter::once("0"))
-                .chain(tail.iter().copied())
-                .chain(std::iter::once("0"))
-                .collect::<Vec<&str>>()
-                .join(",");
-
-            Some(format!("ME {channel:03},{me_body}"))
-        }
-        _ => None,
-    }
-}
+use super::Response;
+use super::core::{CHANNEL_FIELD_COUNT, parse_channel_fields};
 
 /// Parse a memory command response from mnemonic and payload.
 ///
@@ -107,13 +64,7 @@ fn parse_me(payload: &str) -> Result<Response, ProtocolError> {
         });
     }
 
-    let channel = ch_str
-        .parse::<u16>()
-        .map_err(|_| ProtocolError::FieldParse {
-            command: "ME".to_owned(),
-            field: "channel".to_owned(),
-            detail: format!("invalid channel number: {ch_str:?}"),
-        })?;
+    let selector = parse_selector(ch_str, "ME")?;
 
     // Remap ME fields to the 20-field FO layout, skipping the two ME-specific
     // fields at body indices 13 (ME field 14) and 21 (ME field 22).
@@ -142,18 +93,41 @@ fn parse_me(payload: &str) -> Result<Response, ProtocolError> {
          shared `parse_channel_fields` path to accept the input",
     );
 
-    let data = parse_channel_fields(&fo_fields, "ME")?;
+    let channel = parse_channel_fields(&fo_fields, "ME")?;
+    let me_field_14_raw = body
+        .get(13)
+        .ok_or_else(|| ProtocolError::FieldCount {
+            command: "ME".to_owned(),
+            expected: ME_FIELD_COUNT,
+            actual,
+        })?
+        .to_string();
+    let me_field_22_raw = body
+        .get(21)
+        .ok_or_else(|| ProtocolError::FieldCount {
+            command: "ME".to_owned(),
+            expected: ME_FIELD_COUNT,
+            actual,
+        })?
+        .to_string();
 
-    Ok(Response::MemoryChannel { channel, data })
+    Ok(Response::MemoryChannel {
+        selector,
+        record: MemoryChannelRecord {
+            channel,
+            me_field_14_raw,
+            me_field_22_raw,
+        },
+    })
 }
 
 /// Parse an MR response.
 ///
 /// Two formats are supported:
-/// - Write acknowledgment: `band,channel` (comma-separated, e.g., `0,021`)
-/// - Read response: `bandCCC` (no comma, e.g., `021` meaning band 0 channel 21)
+/// - Write acknowledgment: `band,selector` (comma-separated, e.g., `0,021`)
+/// - Read response: `selector` alone (e.g., `021`, `L00`, or `Pri`)
 ///
-/// Hardware-verified: `MR 0\r` returns `MR 021` (read, no comma).
+/// Hardware-verified: `MR 0\r` returns `MR 021` (read, no band in the frame).
 /// `MR 0,021\r` returns `MR 0,021` (write acknowledgment, with comma).
 fn parse_mr(payload: &str) -> Result<Response, ProtocolError> {
     if let Some((band_str, ch_str)) = payload.split_once(',') {
@@ -172,58 +146,19 @@ fn parse_mr(payload: &str) -> Result<Response, ProtocolError> {
             detail: e.to_string(),
         })?;
 
-        let channel = ch_str
-            .parse::<u16>()
-            .map_err(|_| ProtocolError::FieldParse {
-                command: "MR".to_owned(),
-                field: "channel".to_owned(),
-                detail: format!("invalid channel number: {ch_str:?}"),
-            })?;
+        let selector = parse_selector(ch_str, "MR")?;
 
-        Ok(Response::MemoryRecall { band, channel })
+        Ok(Response::MemoryRecall { band, selector })
     } else {
-        // Read response format: "bandCCC" (no comma)
-        // First character is the band digit, rest is the channel number.
-        if payload.is_empty() {
-            return Err(ProtocolError::FieldParse {
-                command: "MR".to_owned(),
-                field: "all".to_owned(),
-                detail: "empty MR read payload".to_owned(),
-            });
-        }
-
-        // Char-boundary-safe split: a (bogus) multi-byte first
-        // character must be a parse error, not a slice panic.
-        let Some((band_str, ch_str)) = payload.split_at_checked(1) else {
-            return Err(ProtocolError::FieldParse {
-                command: "MR".to_owned(),
-                field: "band".to_owned(),
-                detail: format!("non-ASCII MR payload: {payload:?}"),
-            });
-        };
-
-        let band_val = band_str
-            .parse::<u8>()
-            .map_err(|_| ProtocolError::FieldParse {
-                command: "MR".to_owned(),
-                field: "band".to_owned(),
-                detail: format!("invalid band: {band_str:?}"),
-            })?;
-
-        let band = Band::try_from(band_val).map_err(|e| ProtocolError::FieldParse {
-            command: "MR".to_owned(),
-            field: "band".to_owned(),
-            detail: e.to_string(),
-        })?;
-
-        let channel = ch_str
-            .parse::<u16>()
-            .map_err(|_| ProtocolError::FieldParse {
-                command: "MR".to_owned(),
-                field: "channel".to_owned(),
-                detail: format!("invalid channel number: {ch_str:?}"),
-            })?;
-
-        Ok(Response::CurrentChannel { band, channel })
+        let selector = parse_selector(payload, "MR")?;
+        Ok(Response::CurrentChannel { selector })
     }
+}
+
+fn parse_selector(payload: &str, command: &str) -> Result<MemorySelector, ProtocolError> {
+    MemorySelector::try_from(payload).map_err(|error| ProtocolError::FieldParse {
+        command: command.to_owned(),
+        field: "selector".to_owned(),
+        detail: error.to_string(),
+    })
 }

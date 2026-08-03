@@ -1,4 +1,4 @@
-//! Scan-related radio methods: scan resume (SR write-only), step size (SF), band scope (BS).
+//! Scan-related radio methods plus MW/SW antenna selection.
 //!
 //! # Single Band Display (per Operating Tips §5.10.4)
 //!
@@ -77,42 +77,38 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get band scope data for a band (BS read).
-    ///
-    /// The radio echoes back the band number when queried.
+    /// Get the MW/SW receive antenna selection (BS read).
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_band_scope(&mut self, band: Band) -> Result<Band, Error> {
-        tracing::debug!(?band, "reading band scope");
-        let response = self.execute(Command::GetBandScope { band }).await?;
+    pub async fn get_bar_antenna(&mut self) -> Result<bool, Error> {
+        tracing::debug!("reading MW/SW antenna selection");
+        let response = self.execute(Command::GetBarAntenna).await?;
         match response {
-            Response::BandScope { band: scope_band } => Ok(scope_band),
+            Response::BarAntenna { enabled } => Ok(enabled),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "BandScope".into(),
+                expected: "BarAntenna".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
     }
 
-    /// Set band scope configuration for a band (BS write).
+    /// Select the MW/SW receive antenna (BS write).
     ///
-    /// # Wire format
-    ///
-    /// `BS band,value\r` where band is 0 (A) or 1 (B). The exact meaning
-    /// of the value parameter is unknown.
+    /// `true` selects the internal bar antenna; `false` selects the external
+    /// ANT Connector.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_band_scope(&mut self, band: Band, value: u8) -> Result<(), Error> {
-        tracing::info!(?band, value, "setting band scope configuration");
-        let response = self.execute(Command::SetBandScope { band, value }).await?;
+    pub async fn set_bar_antenna(&mut self, enabled: bool) -> Result<(), Error> {
+        tracing::info!(enabled, "setting MW/SW antenna selection");
+        let response = self.execute(Command::SetBarAntenna { enabled }).await?;
         match response {
-            Response::BandScope { .. } => Ok(()),
+            Response::BarAntenna { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "BandScope".into(),
+                expected: "BarAntenna".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }

@@ -30,22 +30,6 @@ type BoxErr = Box<dyn std::error::Error>;
 // Shared fixtures
 // ---------------------------------------------------------------------------
 
-/// Typical FO response for Band A at 145.000 MHz.
-const FO_RESPONSE_145: &[u8] =
-    b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r";
-
-/// FO write command for 146.520 MHz (all other fields preserved from
-/// `FO_RESPONSE_145`).
-const FO_WRITE_146520: &[u8] =
-    b"FO 0,0146520000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r";
-
-/// FO echo after writing 146.520 MHz.
-const FO_RESPONSE_146520: &[u8] =
-    b"FO 0,0146520000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r";
-
-/// FQ short response for Band A at 146.520 MHz.
-const FQ_RESPONSE_146520: &[u8] = b"FQ 0,0146520000\r";
-
 // ---------------------------------------------------------------------------
 // tune_frequency
 // ---------------------------------------------------------------------------
@@ -72,67 +56,23 @@ fn patch_page(base: &[u8; 256], idx: usize, value: u8) -> Result<[u8; 256], BoxE
 }
 
 #[tokio::test]
-async fn tune_frequency_when_already_vfo() -> TestResult {
-    // Radio is already in VFO mode, so no VM write is needed.
-    let mut mock = MockTransport::new();
-    // ensure_mode: query VM -> already VFO
-    mock.expect(b"VM 0\r", b"VM 0,0\r");
-    // read current FO
-    mock.expect(b"FO 0\r", FO_RESPONSE_145);
-    // write updated frequency
-    mock.expect(FO_WRITE_146520, FO_RESPONSE_146520);
-    // verify readback
-    mock.expect(b"FQ 0\r", FQ_RESPONSE_146520);
-
-    let mut radio = Radio::connect(mock).await?;
-    radio
-        .tune_frequency(Band::A, Frequency::new(146_520_000))
-        .await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn tune_frequency_switches_from_memory_to_vfo() -> TestResult {
-    // Radio starts in Memory mode, so it must switch to VFO first.
-    let mut mock = MockTransport::new();
-    // ensure_mode: query VM -> Memory (1), needs to switch
-    mock.expect(b"VM 0\r", b"VM 0,1\r");
-    // switch to VFO mode
-    mock.expect(b"VM 0,0\r", b"VM 0,0\r");
-    // read current FO
-    mock.expect(b"FO 0\r", FO_RESPONSE_145);
-    // write updated frequency
-    mock.expect(FO_WRITE_146520, FO_RESPONSE_146520);
-    // verify readback
-    mock.expect(b"FQ 0\r", FQ_RESPONSE_146520);
-
-    let mut radio = Radio::connect(mock).await?;
-    radio
-        .tune_frequency(Band::A, Frequency::new(146_520_000))
-        .await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn tune_frequency_readback_mismatch_is_error() -> TestResult {
-    // The radio clamps out-of-band FO writes silently; the readback
-    // is the only verification. A mismatch must be an error, not a
-    // warn-and-Ok; the operator would otherwise transmit on the
-    // wrong frequency believing the tune succeeded.
-    let mut mock = MockTransport::new();
-    mock.expect(b"VM 0\r", b"VM 0,0\r");
-    mock.expect(b"FO 0\r", FO_RESPONSE_145);
-    mock.expect(FO_WRITE_146520, FO_RESPONSE_146520);
-    // Readback shows the radio did NOT take the new frequency.
-    mock.expect(b"FQ 0\r", b"FQ 0,0145000000\r");
-
+async fn tune_frequency_is_quarantined_before_mode_change_or_io() -> TestResult {
+    // No exchanges are scripted. Any VM/FO/FQ access would therefore return
+    // a transport error instead of the explicit quarantine error.
+    let mock = MockTransport::new();
     let mut radio = Radio::connect(mock).await?;
     let result = radio
         .tune_frequency(Band::A, Frequency::new(146_520_000))
         .await;
     assert!(
-        matches!(result, Err(Error::FrequencyReadbackMismatch { .. })),
-        "a readback mismatch must be an error: {result:?}"
+        matches!(
+            result,
+            Err(Error::UnqualifiedCatWrite {
+                command: "FO/FQ",
+                ..
+            })
+        ),
+        "frequency tuning must fail before changing mode or performing I/O: {result:?}"
     );
     Ok(())
 }
@@ -222,51 +162,21 @@ async fn tune_channel_band_b() -> TestResult {
 
 #[tokio::test]
 async fn quick_tune_sets_freq_mode_and_step() -> TestResult {
-    let mut mock = MockTransport::new();
-    // tune_frequency:
-    //   ensure_mode: already VFO
-    mock.expect(b"VM 0\r", b"VM 0,0\r");
-    //   FO read
-    mock.expect(b"FO 0\r", FO_RESPONSE_145);
-    //   FO write
-    mock.expect(FO_WRITE_146520, FO_RESPONSE_146520);
-    //   FQ verify
-    mock.expect(b"FQ 0\r", FQ_RESPONSE_146520);
-    // set_mode: FM = 0
-    mock.expect(b"MD 0,0\r", b"MD 0,0\r");
-    // set_step_size: Hz5000 = 0
-    mock.expect(b"SF 0,0\r", b"SF 0,0\r");
-
+    let mock = MockTransport::new();
     let mut radio = Radio::connect(mock).await?;
-    radio
+    let result = radio
         .quick_tune(Band::A, 146_520_000, Mode::Fm, StepSize::Hz5000)
-        .await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn quick_tune_nfm_with_step_12500() -> TestResult {
-    // Different mode and step size to confirm all three sub-calls forward
-    // their parameters correctly.
-    let mut mock = MockTransport::new();
-    // tune_frequency sub-sequence (145 -> 145, same frequency, just verifying)
-    mock.expect(b"VM 0\r", b"VM 0,0\r");
-    mock.expect(b"FO 0\r", FO_RESPONSE_145);
-    // FO write: frequency 145.000 MHz (same as readback, so write identical)
-    mock.expect(
-        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
-        FO_RESPONSE_145,
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::UnqualifiedCatWrite {
+                command: "FO/FQ",
+                ..
+            })
+        ),
+        "quick_tune must not continue to mode or step writes after quarantine: {result:?}"
     );
-    mock.expect(b"FQ 0\r", b"FQ 0,0145000000\r");
-    // set_mode: NFM = 6
-    mock.expect(b"MD 0,6\r", b"MD 0,6\r");
-    // set_step_size: Hz12500 = 5
-    mock.expect(b"SF 0,5\r", b"SF 0,5\r");
-
-    let mut radio = Radio::connect(mock).await?;
-    radio
-        .quick_tune(Band::A, 145_000_000, Mode::Nfm, StepSize::Hz12500)
-        .await?;
     Ok(())
 }
 

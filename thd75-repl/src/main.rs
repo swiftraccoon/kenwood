@@ -38,7 +38,6 @@ use thd75_repl::aprintln;
 use clap::Parser;
 use dstar_gateway_core::slowdata::{SlowDataTextCollector, encode_text_message};
 use kenwood_thd75::LinkDiagnosis;
-use kenwood_thd75::Radio;
 use kenwood_thd75::memory::{
     MCP_D75_SCHEMA_FIRMWARE, MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, MCP_D75_SCHEMA_MODEL,
     is_supported_mcp_d75_schema_target,
@@ -46,6 +45,7 @@ use kenwood_thd75::memory::{
 use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::{AprsClient, AprsClientConfig, AprsEvent, Ax25Address, DigipeaterConfig};
 use kenwood_thd75::{DStarEvent, DStarGateway, DStarGatewayConfig};
+use kenwood_thd75::{FirmwareProfile, Radio};
 
 use dstar_gateway::auth::AuthClient;
 use dstar_gateway::tokio_shell::{AsyncSession, ShellError};
@@ -1501,7 +1501,7 @@ async fn dispatch_cat(radio: &mut Radio<EitherTransport>, cmd: &str, parts: &[&s
         "tnc" => commands::tnc_mode(radio, args).await,
         "beacontype" => commands::beacon_type(radio, args).await,
         "battery" | "bat" => commands::battery(radio).await,
-        "lock" => commands::lock(radio, args).await,
+        "lock" => commands::lock(radio, args),
         "dualband" | "dual" => commands::dual_band(radio, args).await,
         "bluetooth" | "bt" => commands::bluetooth(radio, args).await,
         "vox" => commands::vox(radio, args).await,
@@ -2119,17 +2119,29 @@ async fn run_set_gateway_off(transport: EitherTransport) -> Result<(), Box<dyn s
     }
     let firmware = radio.get_firmware_version().await?;
     validate_gateway_mcp_target(&identity.model, &firmware)?;
-    let gateway = radio.get_gateway().await?;
-    println!("Verified TH-D75 firmware {firmware}; Menu 650 is {gateway}.");
-    if gateway == kenwood_thd75::types::DvGatewayMode::Off {
-        radio.disconnect().await?;
-        println!("DV Gateway is already off; no memory write or reboot was needed.");
-        return Ok(());
+    let profile = FirmwareProfile::from_version(&firmware);
+    if profile.supports_bare_gateway() {
+        let gateway = radio.get_gateway().await?;
+        println!("Verified TH-D75 firmware {firmware}; Menu 650 is {gateway}.");
+        if gateway == kenwood_thd75::types::DvGatewayMode::Off {
+            radio.disconnect().await?;
+            println!("DV Gateway is already off; no memory write or reboot was needed.");
+            return Ok(());
+        }
+    } else {
+        println!(
+            "Verified TH-D75 firmware {firmware}; checking Menu 650 through its verified MCP byte."
+        );
     }
 
     println!("Clearing Menu 650 via its firmware-verified MCP byte.");
     match automated_terminal_exit(&mut radio).await {
-        Ok(()) => {
+        Ok(false) => {
+            radio.disconnect().await?;
+            println!("DV Gateway is already off; no memory write or reboot was needed.");
+            Ok(())
+        }
+        Ok(true) => {
             drop(radio.disconnect().await);
             println!(
                 "DV Gateway flag cleared. The radio reboots into normal control mode. \
@@ -2162,9 +2174,45 @@ async fn run_set_gateway_off(transport: EitherTransport) -> Result<(), Box<dyn s
 /// Returns an error if programming-mode entry, the page read, the page
 /// write, or the exit write fails. Entry timing out because the
 /// gateway app swallowed the handshake is the expected failure shape.
-async fn automated_terminal_exit(radio: &mut Radio<EitherTransport>) -> Result<(), String> {
+async fn automated_terminal_exit(radio: &mut Radio<EitherTransport>) -> Result<bool, String> {
     println!("Attempting automated exit: clearing the DV Gateway flag via memory write.");
-    write_gateway_mode_with_interrupt_recovery(radio, 0).await
+    clear_gateway_mode_with_interrupt(radio, mcp_termination_signal()).await
+}
+
+/// Clear Menu 650 while avoiding a write and detached reboot when its byte is
+/// already zero.
+async fn clear_gateway_mode_with_interrupt<I>(
+    radio: &mut Radio<EitherTransport>,
+    interrupt: I,
+) -> Result<bool, String>
+where
+    I: Future<Output = std::io::Result<()>>,
+{
+    let interrupt_result = {
+        let write = radio.modify_memory_page_detached_if_changed(GATEWAY_MODE_PAGE, |data| {
+            data[GATEWAY_MODE_BYTE] = 0;
+        });
+        tokio::pin!(write);
+        tokio::pin!(interrupt);
+        tokio::select! {
+            biased;
+            result = &mut write => {
+                return result.map_err(|error| format!("MCP write failed: {error}"));
+            }
+            signal = &mut interrupt => signal,
+        }
+    };
+
+    let interruption = interrupt_result.map_or_else(
+        |error| {
+            format!(
+                "MCP termination listener failed ({error}); the Menu 650 operation was cancelled; \
+                 the setting may already have changed"
+            )
+        },
+        |()| "Menu 650 operation interrupted; the setting may already have changed".to_owned(),
+    );
+    Err(recover_interrupted_gateway_write(radio, interruption).await)
 }
 
 /// Apply the Menu 650 byte while treating catchable process termination as
@@ -4818,6 +4866,54 @@ mod gateway_off_tests {
         mock.expect(&write_command, &[programming::ACK]);
         let modified_response = page_response(GATEWAY_MODE_PAGE, &modified);
         mock.expect(&read_command, &modified_response);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        mock.expect(&[programming::EXIT], &[programming::ACK]);
+
+        run_set_gateway_off(EitherTransport::Mock(mock)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn azimuth_already_off_uses_mcp_read_without_gw_or_page_write() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
+        mock.expect(b"FV\x0D", b"FV 1.03.AZM\x0D");
+        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+
+        let mut original = [0x5A; programming::PAGE_SIZE];
+        original[GATEWAY_MODE_BYTE] = 0;
+        let read_command = programming::build_read_command(GATEWAY_MODE_PAGE);
+        mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &original));
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // An unchanged page takes the normal MCP exit/reconnect path. There
+        // is deliberately no page write and no GW exchange in this script.
+        mock.expect(&[programming::EXIT], &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
+
+        run_set_gateway_off(EitherTransport::Mock(mock)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn azimuth_active_gateway_is_cleared_without_gw_query() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
+        mock.expect(b"FV\x0D", b"FV 1.03.AZM\x0D");
+        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+
+        let mut original = [0x5A; programming::PAGE_SIZE];
+        original[GATEWAY_MODE_BYTE] = 1;
+        let read_command = programming::build_read_command(GATEWAY_MODE_PAGE);
+        mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &original));
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        let mut modified = original;
+        modified[GATEWAY_MODE_BYTE] = 0;
+        let write_command = programming::build_write_command(GATEWAY_MODE_PAGE, &modified);
+        mock.expect(&write_command, &[programming::ACK]);
+        mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &modified));
         mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(&[programming::EXIT], &[programming::ACK]);
 

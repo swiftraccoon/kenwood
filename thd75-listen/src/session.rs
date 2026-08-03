@@ -42,7 +42,7 @@ pub async fn save_state<T: Transport>(
         io: radio.get_io_port().await?,
         squelch: radio.get_squelch(Band::B).await?,
         mode: radio.get_mode(Band::B).await?,
-        freq: radio.get_frequency(Band::B).await?.rx_frequency,
+        freq: radio.get_frequency(Band::B).await?,
     })
 }
 

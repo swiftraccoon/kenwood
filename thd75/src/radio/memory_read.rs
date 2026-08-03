@@ -59,10 +59,7 @@ const COMMON_PATCH_ATTESTATIONS: &[PatchAttestation] = &[
 ];
 
 /// DDR offset containing the fixed screen-capture bitmap header.
-pub const DDR_PROBE_OFFSET: MemoryReadOffset = match MemoryReadOffset::new(0x17_D1BC) {
-    Ok(offset) => offset,
-    Err(_) => unreachable!(),
-};
+pub const DDR_PROBE_OFFSET: MemoryReadOffset = MemoryReadOffset::new_const(0x17_D1BC);
 
 /// Backward-compatible name for [`DDR_PROBE_OFFSET`].
 pub const PROBE_OFFSET: MemoryReadOffset = DDR_PROBE_OFFSET;

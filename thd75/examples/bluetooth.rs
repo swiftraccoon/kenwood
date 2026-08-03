@@ -33,9 +33,9 @@ use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
-use kenwood_thd75::Radio;
 use kenwood_thd75::transport::Transport;
 use kenwood_thd75::types::Band;
+use kenwood_thd75::{FirmwareProfile, Radio};
 
 #[cfg(target_os = "linux")]
 const DEFAULT_BT_PORT: Option<&str> = Some("/dev/rfcomm0");
@@ -90,12 +90,17 @@ async fn inspect_radio<T: Transport>(transport: T) -> Result<(), Box<dyn std::er
 
     let fw = radio.get_firmware_version().await?;
     println!("Firmware: {fw}");
+    let firmware_profile = FirmwareProfile::from_version(&fw);
 
     let (tnc_mode, tnc_baud) = radio.get_tnc_mode().await?;
     println!("TNC mode: {tnc_mode} ({tnc_baud})");
 
-    let gateway = radio.get_gateway().await?;
-    println!("DV Gateway: {gateway}");
+    if firmware_profile.supports_bare_gateway() {
+        let gateway = radio.get_gateway().await?;
+        println!("DV Gateway: {gateway}");
+    } else {
+        println!("DV Gateway: unavailable (firmware reserves GW for recovery)");
+    }
 
     let (gps_enabled, gps_pc_output) = radio.get_gps_config().await?;
     println!(
@@ -109,7 +114,7 @@ async fn inspect_radio<T: Transport>(transport: T) -> Result<(), Box<dyn std::er
         let freq = radio.get_frequency(band).await?;
         let mode = radio.get_mode(band).await?;
         let smeter = radio.get_smeter(band).await?;
-        println!("Band {band}: {} {mode} S={smeter:02}", freq.rx_frequency,);
+        println!("Band {band}: {freq} {mode} S={smeter:02}");
     }
 
     // Check Bluetooth state (should be on since we are connected via BT).

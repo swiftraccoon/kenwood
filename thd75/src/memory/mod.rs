@@ -330,7 +330,7 @@ impl MemoryImage {
         DstarAccess::new(&self.raw)
     }
 
-    /// Access the GPS configuration region (raw bytes).
+    /// Access the official MCP-D75 GPS menu fields and mapped waypoint data.
     #[must_use]
     pub fn gps(&self) -> GpsAccess<'_> {
         GpsAccess::new(&self.raw)

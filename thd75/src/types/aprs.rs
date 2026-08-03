@@ -176,10 +176,16 @@ impl AprsCallsign {
     ///
     /// # Errors
     ///
-    /// Returns `None` if the callsign exceeds 9 characters.
+    /// Returns `None` if the value exceeds nine bytes, is non-ASCII, or
+    /// contains an ASCII control character. The CAT protocol is CR-delimited,
+    /// so rejecting controls also prevents a callsign from injecting a second
+    /// command onto the wire.
     #[must_use]
     pub fn new(callsign: &str) -> Option<Self> {
-        if callsign.len() <= Self::MAX_LEN {
+        if callsign.len() <= Self::MAX_LEN
+            && callsign.is_ascii()
+            && !callsign.bytes().any(|byte| byte.is_ascii_control())
+        {
             Some(Self(callsign.to_owned()))
         } else {
             None
@@ -2019,6 +2025,13 @@ mod tests {
     #[test]
     fn aprs_callsign_too_long() {
         assert!(AprsCallsign::new("N0CALL-150").is_none());
+    }
+
+    #[test]
+    fn aprs_callsign_rejects_non_ascii_and_wire_controls() {
+        assert!(AprsCallsign::new("NØCALL").is_none());
+        assert!(AprsCallsign::new("N0CALL\rID").is_none());
+        assert!(AprsCallsign::new("N0CALL\n").is_none());
     }
 
     #[test]

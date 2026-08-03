@@ -27,26 +27,56 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 // ============================================================================
 
 #[test]
-fn serialize_me_read() {
+fn serialize_me_read() -> TestResult {
     assert_eq!(
-        protocol::serialize(&Command::GetMemoryChannel { channel: 0 }),
+        protocol::serialize(&Command::GetMemoryChannel {
+            selector: MemorySelector::channel(0)?,
+        }),
         b"ME 000\r"
     );
+    Ok(())
 }
 
 #[test]
-fn serialize_me_read_channel_99() {
+fn serialize_me_read_channel_99() -> TestResult {
     assert_eq!(
-        protocol::serialize(&Command::GetMemoryChannel { channel: 99 }),
+        protocol::serialize(&Command::GetMemoryChannel {
+            selector: MemorySelector::channel(99)?,
+        }),
         b"ME 099\r"
     );
+    Ok(())
 }
 
 #[test]
-fn serialize_me_read_channel_999() {
+fn serialize_me_read_channel_999() -> TestResult {
     assert_eq!(
-        protocol::serialize(&Command::GetMemoryChannel { channel: 999 }),
+        protocol::serialize(&Command::GetMemoryChannel {
+            selector: MemorySelector::channel(999)?,
+        }),
         b"ME 999\r"
+    );
+    Ok(())
+}
+
+#[test]
+fn serialize_me_read_program_scan_edge() -> TestResult {
+    assert_eq!(
+        protocol::serialize(&Command::GetMemoryChannel {
+            selector: MemorySelector::program_lower(7)?,
+        }),
+        b"ME L07\r"
+    );
+    Ok(())
+}
+
+#[test]
+fn serialize_me_read_priority() {
+    assert_eq!(
+        protocol::serialize(&Command::GetMemoryChannel {
+            selector: MemorySelector::PRIORITY,
+        }),
+        b"ME Pri\r"
     );
 }
 
@@ -55,16 +85,18 @@ fn parse_me_response_basic() -> TestResult {
     // Real D75 ME format: all zeros, no tone/shift
     let raw = b"ME 000,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00,0";
     let r = protocol::parse(raw)?;
-    let Response::MemoryChannel { channel, data } = r else {
+    let Response::MemoryChannel { selector, record } = r else {
         return Err(format!("expected MemoryChannel, got {r:?}").into());
     };
-    assert_eq!(channel, 0);
-    assert_eq!(data.rx_frequency, Frequency::new(145_000_000));
-    assert_eq!(data.tx_offset, Frequency::new(600_000));
-    assert_eq!(data.step_size, StepSize::Hz5000);
-    assert!(!data.tone_enable());
-    assert!(!data.reverse());
-    assert_eq!(data.flags_0a_raw(), 0);
+    assert_eq!(selector.channel_number(), Some(0));
+    assert_eq!(record.rx_frequency, Frequency::new(145_000_000));
+    assert_eq!(record.tx_offset, Frequency::new(600_000));
+    assert_eq!(record.step_size, StepSize::Hz5000);
+    assert!(!record.tone_enable());
+    assert!(!record.reverse());
+    assert_eq!(record.flags_0a_raw(), 0);
+    assert_eq!(record.me_field_14_raw, "0");
+    assert_eq!(record.me_field_22_raw, "0");
     Ok(())
 }
 
@@ -73,88 +105,14 @@ fn parse_me_response_with_name() -> TestResult {
     // tone=1[7], ctcss=1[8], dcs=1[9], cross=0[10], rev=0[11], shift=1[12]
     let raw = b"ME 042,0440000000,0005000000,0,0,0,0,0,1,1,1,0,0,0,1,14,14,023,0,REPEATER,1,05,0";
     let r = protocol::parse(raw)?;
-    let Response::MemoryChannel { channel, data } = r else {
+    let Response::MemoryChannel { selector, record } = r else {
         return Err(format!("expected MemoryChannel, got {r:?}").into());
     };
-    assert_eq!(channel, 42);
-    assert_eq!(data.rx_frequency, Frequency::new(440_000_000));
-    assert_eq!(data.urcall, ChannelName::new("REPEATER")?);
-    Ok(())
-}
-
-#[test]
-fn me_write_serialize() {
-    let ch = ChannelMemory::default();
-    let cmd = Command::SetMemoryChannel {
-        channel: 5,
-        data: ch,
-    };
-    let wire = protocol::serialize(&cmd);
-    assert!(wire.starts_with(b"ME 005,"));
-    assert!(wire.ends_with(b"\r"));
-}
-
-#[test]
-fn me_write_serialize_full() -> TestResult {
-    let ch = ChannelMemory {
-        rx_frequency: Frequency::new(145_000_000),
-        tx_offset: Frequency::new(600_000),
-        step_size: StepSize::Hz5000,
-        mode_flags_raw: 0,
-        shift: ShiftDirection::SIMPLEX,
-        flags_0a_raw: 0,
-        tone_code: ToneCode::new(8)?,
-        ctcss_code: ToneCode::new(8)?,
-        dcs_code: DcsCode::new(0)?,
-        cross_tone_combo: CrossToneType::DcsOff,
-        digital_squelch: FlashDigitalSquelch::Off,
-        urcall: ChannelName::new("CQCQCQ")?,
-        data_mode: 0,
-    };
-    let wire = protocol::serialize(&Command::SetMemoryChannel {
-        channel: 0,
-        data: ch,
-    });
-    assert_eq!(
-        wire,
-        b"ME 000,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00,0\r"
-    );
-    Ok(())
-}
-
-#[test]
-fn me_write_parse_round_trip() -> TestResult {
-    let ch = ChannelMemory {
-        rx_frequency: Frequency::new(145_000_000),
-        tx_offset: Frequency::new(600_000),
-        step_size: StepSize::Hz5000,
-        mode_flags_raw: 0,
-        shift: ShiftDirection::SIMPLEX,
-        flags_0a_raw: 0,
-        tone_code: ToneCode::new(8)?,
-        ctcss_code: ToneCode::new(8)?,
-        dcs_code: DcsCode::new(0)?,
-        cross_tone_combo: CrossToneType::DcsOff,
-        digital_squelch: FlashDigitalSquelch::Off,
-        urcall: ChannelName::new("CQCQCQ")?,
-        data_mode: 0,
-    };
-    let wire = protocol::serialize(&Command::SetMemoryChannel {
-        channel: 42,
-        data: ch.clone(),
-    });
-    // Strip trailing \r and parse
-    let frame = wire.split_last().map(|(_, r)| r).ok_or("empty wire")?;
-    let r = protocol::parse(frame)?;
-    let Response::MemoryChannel {
-        channel,
-        data: parsed,
-    } = r
-    else {
-        return Err(format!("expected MemoryChannel, got {r:?}").into());
-    };
-    assert_eq!(channel, 42);
-    assert_eq!(parsed, ch);
+    assert_eq!(selector.channel_number(), Some(42));
+    assert_eq!(record.rx_frequency, Frequency::new(440_000_000));
+    assert_eq!(record.urcall, ChannelName::new("REPEATER")?);
+    assert_eq!(record.me_field_14_raw, "1");
+    assert_eq!(record.me_field_22_raw, "0");
     Ok(())
 }
 
@@ -163,46 +121,48 @@ fn me_write_parse_round_trip() -> TestResult {
 // ============================================================================
 
 #[test]
-fn serialize_mr_recall_band_a() {
+fn serialize_mr_recall_band_a() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::RecallMemoryChannel {
             band: Band::A,
-            channel: 0
+            selector: MemorySelector::channel(0)?,
         }),
         b"MR 0,000\r"
     );
+    Ok(())
 }
 
 #[test]
-fn serialize_mr_recall_band_b_channel_123() {
+fn serialize_mr_recall_band_b_channel_123() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::RecallMemoryChannel {
             band: Band::B,
-            channel: 123
+            selector: MemorySelector::channel(123)?,
         }),
         b"MR 1,123\r"
     );
+    Ok(())
 }
 
 #[test]
 fn parse_mr_echo_response() -> TestResult {
     let r = protocol::parse(b"MR 0,000")?;
-    let Response::MemoryRecall { band, channel } = r else {
+    let Response::MemoryRecall { band, selector } = r else {
         return Err(format!("expected MemoryRecall, got {r:?}").into());
     };
     assert_eq!(band, Band::A);
-    assert_eq!(channel, 0);
+    assert_eq!(selector.channel_number(), Some(0));
     Ok(())
 }
 
 #[test]
 fn parse_mr_echo_band_b() -> TestResult {
     let r = protocol::parse(b"MR 1,042")?;
-    let Response::MemoryRecall { band, channel } = r else {
+    let Response::MemoryRecall { band, selector } = r else {
         return Err(format!("expected MemoryRecall, got {r:?}").into());
     };
     assert_eq!(band, Band::B);
-    assert_eq!(channel, 42);
+    assert_eq!(selector.channel_number(), Some(42));
     Ok(())
 }
 
@@ -230,34 +190,67 @@ fn serialize_mr_read_band_b() {
 fn parse_mr_read_response() -> TestResult {
     // Hardware returns `MR 021` (no comma) for `MR 0\r`
     let r = protocol::parse(b"MR 021")?;
-    let Response::CurrentChannel { band, channel } = r else {
+    let Response::CurrentChannel { selector } = r else {
         return Err(format!("expected CurrentChannel, got {r:?}").into());
     };
-    assert_eq!(band, Band::A);
-    assert_eq!(channel, 21);
+    assert_eq!(selector.channel_number(), Some(21));
     Ok(())
 }
 
 #[test]
-fn parse_mr_read_response_band_b() -> TestResult {
-    let r = protocol::parse(b"MR 1042")?;
-    let Response::CurrentChannel { band, channel } = r else {
+fn parse_mr_read_response_program_scan_edge() -> TestResult {
+    let r = protocol::parse(b"MR U42")?;
+    let Response::CurrentChannel { selector } = r else {
         return Err(format!("expected CurrentChannel, got {r:?}").into());
     };
-    assert_eq!(band, Band::B);
-    assert_eq!(channel, 42);
+    assert_eq!(selector, MemorySelector::program_upper(42)?);
     Ok(())
 }
 
 #[test]
-fn parse_mr_read_response_channel_0() -> TestResult {
-    let r = protocol::parse(b"MR 0000")?;
-    let Response::CurrentChannel { band, channel } = r else {
+fn parse_mr_read_response_priority() -> TestResult {
+    let r = protocol::parse(b"MR Pri")?;
+    let Response::CurrentChannel { selector } = r else {
         return Err(format!("expected CurrentChannel, got {r:?}").into());
     };
-    assert_eq!(band, Band::A);
-    assert_eq!(channel, 0);
+    assert_eq!(selector, MemorySelector::PRIORITY);
     Ok(())
+}
+
+#[test]
+fn memory_selector_accepts_all_documented_boundaries() -> TestResult {
+    let valid = [
+        ("000", MemorySelector::channel(0)?),
+        ("999", MemorySelector::channel(999)?),
+        ("L00", MemorySelector::program_lower(0)?),
+        ("L49", MemorySelector::program_lower(49)?),
+        ("U00", MemorySelector::program_upper(0)?),
+        ("U49", MemorySelector::program_upper(49)?),
+        ("T01", MemorySelector::regional_t(1)?),
+        ("T30", MemorySelector::regional_t(30)?),
+        ("A01", MemorySelector::regional_a(1)?),
+        ("A10", MemorySelector::regional_a(10)?),
+        ("Pri", MemorySelector::PRIORITY),
+    ];
+
+    for (wire, expected) in valid {
+        let selector = MemorySelector::try_from(wire)?;
+        assert_eq!(selector, expected);
+        assert_eq!(selector.to_string(), wire);
+    }
+    Ok(())
+}
+
+#[test]
+fn memory_selector_rejects_noncanonical_and_out_of_range_values() {
+    for wire in [
+        "", "00", "0000", "L50", "U50", "T00", "T31", "A00", "A11", "PRI", "pri", "-01",
+    ] {
+        assert!(
+            MemorySelector::try_from(wire).is_err(),
+            "invalid selector was accepted: {wire:?}"
+        );
+    }
 }
 
 // ============================================================================

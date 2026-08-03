@@ -146,19 +146,24 @@ async fn verify_cat_writes() {
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetDualBand"),
     }
 
-    // Lock
-    let orig_lc = radio.get_lock().await.unwrap();
-    match radio.set_lock(!orig_lc).await {
+    // LCD backlight control
+    let orig_lc = radio.get_backlight_control().await.unwrap();
+    let next_lc = if orig_lc == BacklightControl::Manual {
+        BacklightControl::Auto
+    } else {
+        BacklightControl::Manual
+    };
+    match radio.set_backlight_control(next_lc).await {
         Ok(()) => {
-            let rb = radio.get_lock().await.unwrap();
-            let _ = radio.set_lock(orig_lc).await;
-            if rb == !orig_lc {
-                println!("  {:<25} OK", "SetLock");
+            let rb = radio.get_backlight_control().await.unwrap();
+            let _ = radio.set_backlight_control(orig_lc).await;
+            if rb == next_lc {
+                println!("  {:<25} OK", "SetBacklightControl");
             } else {
-                println!("  {:<25} FAIL", "SetLock");
+                println!("  {:<25} FAIL", "SetBacklightControl");
             }
         }
-        Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetLock"),
+        Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetBacklightControl"),
     }
 
     // Bluetooth
@@ -217,8 +222,16 @@ async fn verify_cat_writes() {
     }
 
     // Frequency Down (DW sends step-down then reads back frequency)
-    match radio.frequency_down(Band::A).await {
-        Ok(ch) => println!("  {:<25} OK (freq={})", "FrequencyDown", ch.rx_frequency),
+    match radio.set_band(Band::A).await {
+        Ok(()) => {}
+        Err(e) => {
+            println!("  {:<25} WRITE_FAILED selecting Band A: {e}", "FrequencyDown");
+            let _ = radio.disconnect().await;
+            return;
+        }
+    }
+    match radio.frequency_down().await {
+        Ok(frequency) => println!("  {:<25} OK (freq={frequency})", "FrequencyDown"),
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "FrequencyDown"),
     }
 

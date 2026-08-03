@@ -24,8 +24,13 @@ use tracing as _;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 // ============================================================================
-// AI -- Auto-info (write-only boolean)
+// AI -- Auto-info (bare read and boolean write)
 // ============================================================================
+
+#[test]
+fn serialize_ai_read() {
+    assert_eq!(protocol::serialize(&Command::GetAutoInfo), b"AI\r");
+}
 
 #[test]
 fn serialize_ai_on() {
@@ -63,6 +68,18 @@ fn parse_ai_response_off() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn parse_ai_bare_ack_is_not_disabled_state() -> TestResult {
+    let response = protocol::parse(b"AI")?;
+    assert!(matches!(response, Response::AutoInfoAck));
+    Ok(())
+}
+
+#[test]
+fn parse_ai_rejects_non_boolean_state() {
+    assert!(protocol::parse(b"AI 2").is_err());
+}
+
 // ============================================================================
 // BY -- Busy (read-only, band + boolean)
 // ============================================================================
@@ -95,6 +112,11 @@ fn parse_by_not_busy() -> TestResult {
     assert_eq!(band, Band::B);
     assert!(!busy);
     Ok(())
+}
+
+#[test]
+fn parse_by_rejects_non_boolean() {
+    assert!(protocol::parse(b"BY 0,2").is_err());
 }
 
 // ============================================================================
@@ -140,173 +162,120 @@ fn parse_dl_disabled() -> TestResult {
 
 #[test]
 fn serialize_dw_band_a() {
-    assert_eq!(
-        protocol::serialize(&Command::FrequencyDown { band: Band::A }),
-        b"DW 0\r"
-    );
+    assert_eq!(protocol::serialize(&Command::FrequencyDown), b"DW\r");
 }
 
 #[test]
 fn serialize_dw_band_b() {
-    assert_eq!(
-        protocol::serialize(&Command::FrequencyDown { band: Band::B }),
-        b"DW 1\r"
-    );
+    assert_eq!(protocol::serialize(&Command::FrequencyDown), b"DW\r");
 }
 
 #[test]
 fn parse_dw_response() -> TestResult {
-    let r = protocol::parse(b"DW 0")?;
+    let r = protocol::parse(b"DW")?;
     let Response::FrequencyDown = r else {
         return Err(format!("expected FrequencyDown, got {r:?}").into());
     };
     Ok(())
 }
 
-// ============================================================================
-// BE -- Beep (boolean)
-// ============================================================================
-
 #[test]
-fn serialize_be_read() {
-    assert_eq!(protocol::serialize(&Command::GetBeep), b"BE\r");
+fn parse_dw_rejects_payload() {
+    assert!(protocol::parse(b"DW 0").is_err());
 }
 
 #[test]
-fn serialize_be_on() {
-    assert_eq!(
-        protocol::serialize(&Command::SetBeep { enabled: true }),
-        b"BE 1\r"
-    );
-}
-
-#[test]
-fn serialize_be_off() {
-    assert_eq!(
-        protocol::serialize(&Command::SetBeep { enabled: false }),
-        b"BE 0\r"
-    );
-}
-
-#[test]
-fn parse_be_enabled() -> TestResult {
-    let r = protocol::parse(b"BE 1")?;
-    let Response::Beep { enabled } = r else {
-        return Err(format!("expected Beep, got {r:?}").into());
-    };
-    assert!(enabled);
+fn parse_up_bare_response() -> TestResult {
+    let response = protocol::parse(b"UP")?;
+    assert!(matches!(response, Response::FrequencyUp));
     Ok(())
 }
 
 #[test]
-fn parse_be_disabled() -> TestResult {
-    let r = protocol::parse(b"BE 0")?;
-    let Response::Beep { enabled } = r else {
-        return Err(format!("expected Beep, got {r:?}").into());
-    };
-    assert!(!enabled);
-    Ok(())
+fn parse_up_rejects_payload() {
+    assert!(protocol::parse(b"UP 0").is_err());
 }
 
 // ============================================================================
-// RX -- Receive (action, band parameter)
+// RX -- Receive (bare action)
 // ============================================================================
 
 #[test]
 fn serialize_rx() {
-    assert_eq!(
-        protocol::serialize(&Command::Receive { band: Band::A }),
-        b"RX 0\r"
-    );
+    assert_eq!(protocol::serialize(&Command::Receive), b"RX\r");
 }
 
 #[test]
-fn serialize_rx_band_b() {
-    assert_eq!(
-        protocol::serialize(&Command::Receive { band: Band::B }),
-        b"RX 1\r"
-    );
+fn parse_rx_rejects_payload() {
+    assert!(protocol::parse(b"RX 0").is_err());
 }
 
 // ============================================================================
-// TX -- Transmit (action, band parameter)
+// TX -- Transmit (bare action)
 // ============================================================================
 
 #[test]
 fn serialize_tx() {
-    assert_eq!(
-        protocol::serialize(&Command::Transmit { band: Band::A }),
-        b"TX 0\r"
-    );
+    assert_eq!(protocol::serialize(&Command::Transmit), b"TX\r");
 }
 
 #[test]
-fn serialize_tx_band_b() {
-    assert_eq!(
-        protocol::serialize(&Command::Transmit { band: Band::B }),
-        b"TX 1\r"
-    );
+fn parse_tx_rejects_payload() {
+    assert!(protocol::parse(b"TX 0").is_err());
 }
 
 // ============================================================================
-// LC -- Lock control (boolean)
+// LC -- LCD backlight control (0-3)
 // ============================================================================
 
 #[test]
 fn serialize_lc_read() {
-    assert_eq!(protocol::serialize(&Command::GetLock), b"LC\r");
+    assert_eq!(protocol::serialize(&Command::GetBacklightControl), b"LC\r");
 }
 
 #[test]
-fn serialize_lc_locked() {
+fn serialize_lc_auto() {
     assert_eq!(
-        protocol::serialize(&Command::SetLock { locked: true }),
-        b"LC 1\r"
-    );
-}
-
-#[test]
-fn serialize_lc_unlocked() {
-    assert_eq!(
-        protocol::serialize(&Command::SetLock { locked: false }),
-        b"LC 0\r"
-    );
-}
-
-#[test]
-fn parse_lc_locked() -> TestResult {
-    let r = protocol::parse(b"LC 1")?;
-    let Response::Lock { locked } = r else {
-        return Err(format!("expected Lock, got {r:?}").into());
-    };
-    assert!(locked);
-    Ok(())
-}
-
-#[test]
-fn parse_lc_unlocked() -> TestResult {
-    let r = protocol::parse(b"LC 0")?;
-    let Response::Lock { locked } = r else {
-        return Err(format!("expected Lock, got {r:?}").into());
-    };
-    assert!(!locked);
-    Ok(())
-}
-
-#[test]
-fn serialize_lc_full() -> TestResult {
-    assert_eq!(
-        protocol::serialize(&Command::SetLockFull {
-            locked: true,
-            lock_type: KeyLockType::try_from(2)?,
-            lock_a: true,
-            lock_b: false,
-            lock_c: true,
-            lock_ptt: false,
+        protocol::serialize(&Command::SetBacklightControl {
+            mode: BacklightControl::Auto
         }),
-        b"LC 1,2,1,0,1,0\r"
+        b"LC 2\r"
     );
+}
+
+#[test]
+fn serialize_lc_auto_dc_in() {
+    assert_eq!(
+        protocol::serialize(&Command::SetBacklightControl {
+            mode: BacklightControl::AutoDcIn
+        }),
+        b"LC 3\r"
+    );
+}
+
+#[test]
+fn parse_lc_on() -> TestResult {
+    let r = protocol::parse(b"LC 1")?;
+    let Response::BacklightControl { mode } = r else {
+        return Err(format!("expected BacklightControl, got {r:?}").into());
+    };
+    assert_eq!(mode, BacklightControl::On);
     Ok(())
+}
+
+#[test]
+fn parse_lc_manual() -> TestResult {
+    let r = protocol::parse(b"LC 0")?;
+    let Response::BacklightControl { mode } = r else {
+        return Err(format!("expected BacklightControl, got {r:?}").into());
+    };
+    assert_eq!(mode, BacklightControl::Manual);
+    Ok(())
+}
+
+#[test]
+fn parse_lc_rejects_out_of_range_mode() {
+    assert!(protocol::parse(b"LC 4").is_err());
 }
 
 // ============================================================================
@@ -367,6 +336,16 @@ fn parse_bl_charging() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn parse_bl_preserves_unqualified_raw_five() -> TestResult {
+    let r = protocol::parse(b"BL 5")?;
+    let Response::BatteryLevel { level } = r else {
+        return Err(format!("expected BatteryLevel, got {r:?}").into());
+    };
+    assert_eq!(level, BatteryLevel::Raw5);
+    Ok(())
+}
+
 // ============================================================================
 // VD -- VOX delay (numeric)
 // ============================================================================
@@ -380,21 +359,27 @@ fn serialize_vd_read() {
 fn serialize_vd_write() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::SetVoxDelay {
-            delay: VoxDelay::new(10)?
+            delay: VoxDelay::new(6)?
         }),
-        b"VD 10\r"
+        b"VD 6\r"
     );
     Ok(())
 }
 
 #[test]
 fn parse_vd_response() -> TestResult {
-    let r = protocol::parse(b"VD 7")?;
+    let r = protocol::parse(b"VD 4")?;
     let Response::VoxDelay { delay } = r else {
         return Err(format!("expected VoxDelay, got {r:?}").into());
     };
-    assert_eq!(delay, VoxDelay::new(7)?);
+    assert_eq!(delay, VoxDelay::new(4)?);
+    assert_eq!(delay.as_millis(), 1500);
     Ok(())
+}
+
+#[test]
+fn parse_vd_rejects_out_of_range_index() {
+    assert!(protocol::parse(b"VD 7").is_err());
 }
 
 // ============================================================================

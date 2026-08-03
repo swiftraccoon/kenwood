@@ -6,6 +6,8 @@
 //!
 //! Run with radio connected: cargo run --bin arfc_verification_probe
 
+mod firmware_guard;
+
 use kenwood_thd75::protocol::Codec;
 use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
 
@@ -72,44 +74,87 @@ fn main() {
         )
         .await;
 
+        let fv_response = send_and_read(&mut transport, &mut codec, "FV", &mut buf).await;
+        println!("Firmware identity: {fv_response}");
+        let firmware_version = firmware_guard::parse_fv_frame(&fv_response).map(str::to_owned);
+
         // === Power Level Range ===
         println!("=== Power Level (PC) ===");
-        println!("PC 0 (read A): {}", send_and_read(&mut transport, &mut codec, "PC 0", &mut buf).await);
-        println!("PC 1 (read B): {}", send_and_read(&mut transport, &mut codec, "PC 1", &mut buf).await);
+        println!(
+            "PC 0 (read A): {}",
+            send_and_read(&mut transport, &mut codec, "PC 0", &mut buf).await
+        );
+        println!(
+            "PC 1 (read B): {}",
+            send_and_read(&mut transport, &mut codec, "PC 1", &mut buf).await
+        );
         // Try writing values 4-6 to see if the radio accepts them
         for val in 4..=6 {
-            println!("PC 0,{val} (write): {}", send_and_read(&mut transport, &mut codec, &format!("PC 0,{val}"), &mut buf).await);
+            println!(
+                "PC 0,{val} (write): {}",
+                send_and_read(&mut transport, &mut codec, &format!("PC 0,{val}"), &mut buf).await
+            );
         }
         // Read back to see what happened
-        println!("PC 0 (after): {}", send_and_read(&mut transport, &mut codec, "PC 0", &mut buf).await);
+        println!(
+            "PC 0 (after): {}",
+            send_and_read(&mut transport, &mut codec, "PC 0", &mut buf).await
+        );
 
         // === D7 Command ===
         println!("\n=== D7 (D75-specific) ===");
-        println!("D7 bare: {}", send_and_read(&mut transport, &mut codec, "D7", &mut buf).await);
+        println!(
+            "D7 bare: {}",
+            send_and_read(&mut transport, &mut codec, "D7", &mut buf).await
+        );
 
         // === 0B and 0L Commands ===
         println!("\n=== 0B / 0L (status commands) ===");
-        println!("0B bare: {}", send_and_read(&mut transport, &mut codec, "0B", &mut buf).await);
-        println!("0L bare: {}", send_and_read(&mut transport, &mut codec, "0L", &mut buf).await);
+        println!(
+            "0B bare: {}",
+            send_and_read(&mut transport, &mut codec, "0B", &mut buf).await
+        );
+        println!(
+            "0L bare: {}",
+            send_and_read(&mut transport, &mut codec, "0L", &mut buf).await
+        );
 
         // === Unknown ARFC Commands ===
         println!("\n=== Unknown ARFC Commands ===");
         for cmd in &["MK", "QA", "SC", "TC", "TC 1", "UE", "WI", "XK", "YM", "ZO"] {
-            println!("{cmd}: {}", send_and_read(&mut transport, &mut codec, cmd, &mut buf).await);
+            println!(
+                "{cmd}: {}",
+                send_and_read(&mut transport, &mut codec, cmd, &mut buf).await
+            );
         }
 
         // === ToneMode CrossTone ===
         println!("\n=== TN (TNC/Tone mode) ===");
-        println!("TN bare: {}", send_and_read(&mut transport, &mut codec, "TN", &mut buf).await);
+        println!(
+            "TN bare: {}",
+            send_and_read(&mut transport, &mut codec, "TN", &mut buf).await
+        );
 
         // === Memory Channel Mode ===
         println!("\n=== VM (VFO/Memory mode) ===");
-        println!("VM 0: {}", send_and_read(&mut transport, &mut codec, "VM 0", &mut buf).await);
-        println!("VM 1: {}", send_and_read(&mut transport, &mut codec, "VM 1", &mut buf).await);
+        println!(
+            "VM 0: {}",
+            send_and_read(&mut transport, &mut codec, "VM 0", &mut buf).await
+        );
+        println!(
+            "VM 1: {}",
+            send_and_read(&mut transport, &mut codec, "VM 1", &mut buf).await
+        );
 
         // === DV Gateway Mode ===
         println!("\n=== GW (Gateway mode) ===");
-        println!("GW bare: {}", send_and_read(&mut transport, &mut codec, "GW", &mut buf).await);
+        match firmware_guard::require_stock_bare_probe("GW", firmware_version.as_deref()) {
+            Ok(()) => println!(
+                "GW bare: {}",
+                send_and_read(&mut transport, &mut codec, "GW", &mut buf).await
+            ),
+            Err(diagnostic) => println!("{diagnostic}"),
+        }
 
         println!("\n=== Probe complete ===");
     });

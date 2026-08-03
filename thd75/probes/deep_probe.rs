@@ -26,6 +26,8 @@
 //!
 //! Run: cargo test --test deep_probe -- --ignored --nocapture --test-threads=1
 
+mod firmware_guard;
+
 use kenwood_thd75::protocol::Codec;
 use kenwood_thd75::transport::{SerialTransport, Transport};
 use std::io::Write as IoWrite;
@@ -121,7 +123,17 @@ async fn deep_probe_all_reads() {
     // ================================================================
     output.push("\n===== IDENTITY =====".into());
     alive = alive && bare_read(&mut transport, "ID", &mut output).await;
-    alive = alive && bare_read(&mut transport, "FV", &mut output).await;
+    let firmware_version = if alive {
+        let response = raw_cmd(&mut transport, "FV").await;
+        log(&mut output, "FV", &response);
+        alive = response.is_some();
+        response
+            .as_deref()
+            .and_then(firmware_guard::parse_fv_frame)
+            .map(str::to_owned)
+    } else {
+        None
+    };
     alive = alive && bare_read(&mut transport, "AE", &mut output).await;
 
     // ================================================================
@@ -256,18 +268,24 @@ async fn deep_probe_all_reads() {
             alive = bare_read(&mut transport, "CS", &mut output).await;
         }
         if alive {
-            alive = bare_read(&mut transport, "GW", &mut output).await;
+            match firmware_guard::require_stock_bare_probe("GW", firmware_version.as_deref()) {
+                Ok(()) => alive = bare_read(&mut transport, "GW", &mut output).await,
+                Err(diagnostic) => output.push(format!("  {diagnostic}")),
+            }
         }
     }
 
     // ================================================================
-    // GPS: bare reads only (GM bare is safe, GM with params is NOT)
+    // GPS: bare reads only (stock GM is guarded by exact FV)
     // ================================================================
     if alive {
         output.push("\n===== GPS =====".into());
         alive = bare_read(&mut transport, "GP", &mut output).await;
         if alive {
-            alive = bare_read(&mut transport, "GM", &mut output).await;
+            match firmware_guard::require_stock_bare_probe("GM", firmware_version.as_deref()) {
+                Ok(()) => alive = bare_read(&mut transport, "GM", &mut output).await,
+                Err(diagnostic) => output.push(format!("  {diagnostic}")),
+            }
         }
         if alive {
             alive = bare_read(&mut transport, "GS", &mut output).await;

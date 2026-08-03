@@ -16,7 +16,7 @@
 //! - ASCII printable only (no box-drawing or symbols)
 
 use kenwood_thd75::types::{
-    Band, BatteryLevel, BeaconMode, DetectOutputMode, PowerLevel, TncBaud, TncMode,
+    Band, BatteryLevel, BeaconMode, DetectOutputMode, PowerLevel, RadioClock, TncBaud, TncMode,
 };
 
 /// Human-readable band name. Matches the pre-extraction helper which
@@ -202,6 +202,7 @@ pub const fn battery_level_display(level: BatteryLevel) -> &'static str {
         BatteryLevel::TwoThirds => "two thirds",
         BatteryLevel::Full => "full",
         BatteryLevel::Charging => "charging",
+        BatteryLevel::Raw5 => "state 5, meaning not yet qualified",
     }
 }
 
@@ -231,7 +232,7 @@ pub fn battery(level: BatteryLevel) -> String {
 
 /// `Radio clock: {time}`.
 #[must_use]
-pub fn clock(time: impl std::fmt::Display) -> String {
+pub fn clock(time: RadioClock) -> String {
     format!("Radio clock: {time}")
 }
 
@@ -710,7 +711,7 @@ pub fn startup_identified(model: &str, firmware: &str) -> String {
 mod tests {
     use super::*;
     use crate::lint;
-    use kenwood_thd75::types::Band;
+    use kenwood_thd75::types::{Band, RadioDateTime};
 
     fn assert_lint(s: &str) {
         let result = lint::check_output(s);
@@ -870,6 +871,10 @@ mod tests {
             (BatteryLevel::TwoThirds, "Battery level: two thirds"),
             (BatteryLevel::Full, "Battery level: full"),
             (BatteryLevel::Charging, "Battery level: charging"),
+            (
+                BatteryLevel::Raw5,
+                "Battery level: state 5, meaning not yet qualified",
+            ),
         ];
         for (level, expected) in cases {
             let s = battery(level);
@@ -893,10 +898,13 @@ mod tests {
     }
 
     #[test]
-    fn clock_format() {
-        let s = clock("2026-04-10 14:32:07");
+    fn clock_format() -> Result<(), kenwood_thd75::error::ValidationError> {
+        let value = RadioDateTime::new(2026, 4, 10, 14, 32, 7)?;
+        let s = clock(value.into());
         assert_eq!(s, "Radio clock: 2026-04-10 14:32:07");
         assert_lint(&s);
+        assert_eq!(clock(RadioClock::Unavailable), "Radio clock: unavailable");
+        Ok(())
     }
 
     #[test]

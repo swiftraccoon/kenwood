@@ -1,5 +1,5 @@
-//! Tests for the remaining 5 protocol groups: Scan, APRS, D-STAR, GPS,
-//! and system commands (Bluetooth, SD, User Settings).
+//! Tests for the remaining protocol groups: Scan, APRS, D-STAR, GPS,
+//! and system commands (Bluetooth and SD).
 
 use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::types::*;
@@ -78,16 +78,13 @@ fn parse_sf_response_band_b() -> TestResult {
 
 #[test]
 fn serialize_bs_read() {
-    assert_eq!(
-        protocol::serialize(&Command::GetBandScope { band: Band::A }),
-        b"BS 0\r"
-    );
+    assert_eq!(protocol::serialize(&Command::GetBarAntenna), b"BS\r");
 }
 
 #[test]
-fn serialize_bs_read_band_b() {
+fn serialize_bs_write_bar_antenna() {
     assert_eq!(
-        protocol::serialize(&Command::GetBandScope { band: Band::B }),
+        protocol::serialize(&Command::SetBarAntenna { enabled: true }),
         b"BS 1\r"
     );
 }
@@ -95,20 +92,20 @@ fn serialize_bs_read_band_b() {
 #[test]
 fn parse_bs_response() -> TestResult {
     let r = protocol::parse(b"BS 0")?;
-    let Response::BandScope { band } = r else {
-        return Err(format!("expected BandScope, got {r:?}").into());
+    let Response::BarAntenna { enabled } = r else {
+        return Err(format!("expected BarAntenna, got {r:?}").into());
     };
-    assert_eq!(band, Band::A);
+    assert!(!enabled);
     Ok(())
 }
 
 #[test]
 fn parse_bs_response_band_b() -> TestResult {
     let r = protocol::parse(b"BS 1")?;
-    let Response::BandScope { band } = r else {
-        return Err(format!("expected BandScope, got {r:?}").into());
+    let Response::BarAntenna { enabled } = r else {
+        return Err(format!("expected BarAntenna, got {r:?}").into());
     };
-    assert_eq!(band, Band::B);
+    assert!(enabled);
     Ok(())
 }
 
@@ -156,6 +153,13 @@ fn parse_ae_response_serial_info() -> TestResult {
 }
 
 #[test]
+fn parse_ae_rejects_malformed_shape() {
+    assert!(protocol::parse(b"AE C3C10368").is_err());
+    assert!(protocol::parse(b"AE SHORT,K01").is_err());
+    assert!(protocol::parse(b"AE C3C10368,K001").is_err());
+}
+
+#[test]
 fn serialize_pt_read() {
     assert_eq!(protocol::serialize(&Command::GetBeaconType), b"PT\r");
 }
@@ -166,36 +170,45 @@ fn parse_pt_response() -> TestResult {
     let Response::BeaconType { mode } = r else {
         return Err(format!("expected BeaconType, got {r:?}").into());
     };
-    assert_eq!(mode, BeaconMode::Ptt);
+    assert_eq!(mode, BeaconMode::Auto);
     Ok(())
 }
 
 #[test]
 fn serialize_ms_read() {
-    assert_eq!(protocol::serialize(&Command::GetPositionSource), b"MS\r");
+    assert_eq!(
+        protocol::serialize(&Command::GetMyPositionSelection),
+        b"MS\r"
+    );
 }
 
 #[test]
-fn serialize_ms_write() {
+fn serialize_ms_write() -> TestResult {
     assert_eq!(
-        protocol::serialize(&Command::SendMessage {
-            text: "hello world".into()
+        protocol::serialize(&Command::SetMyPositionSelection {
+            selection: MyPositionSelection::new(5)?
         }),
-        b"MS hello world\r"
+        b"MS 5\r"
     );
+    Ok(())
 }
 
 #[test]
 fn parse_ms_response() -> TestResult {
     let r = protocol::parse(b"MS 0")?;
-    let Response::PositionSource { source } = r else {
-        return Err(format!("expected PositionSource, got {r:?}").into());
+    let Response::MyPositionSelection { selection } = r else {
+        return Err(format!("expected MyPositionSelection, got {r:?}").into());
     };
-    assert_eq!(source, 0);
+    assert_eq!(selection.as_u8(), 0);
     Ok(())
 }
 
-// === D-STAR (DS, CS, GW) ===
+#[test]
+fn parse_ms_rejects_out_of_range_selection() {
+    assert!(protocol::parse(b"MS 6").is_err());
+}
+
+// === APRS CS + D-STAR (DS, GW) ===
 
 #[test]
 fn serialize_ds_read() {
@@ -214,30 +227,26 @@ fn parse_ds_response() -> TestResult {
 
 #[test]
 fn serialize_cs_read() {
-    assert_eq!(
-        protocol::serialize(&Command::GetActiveCallsignSlot),
-        b"CS\r"
-    );
+    assert_eq!(protocol::serialize(&Command::GetAprsCallsign), b"CS\r");
 }
 
 #[test]
 fn serialize_cs_write() -> TestResult {
+    let callsign = AprsCallsign::new("KQ4NIT-7").ok_or("valid APRS callsign rejected")?;
     assert_eq!(
-        protocol::serialize(&Command::SetActiveCallsignSlot {
-            slot: CallsignSlot::new(10)?
-        }),
-        b"CS 10\r"
+        protocol::serialize(&Command::SetAprsCallsign { callsign }),
+        b"CS KQ4NIT-7\r"
     );
     Ok(())
 }
 
 #[test]
 fn parse_cs_response() -> TestResult {
-    let r = protocol::parse(b"CS 10")?;
-    let Response::ActiveCallsignSlot { slot } = r else {
-        return Err(format!("expected ActiveCallsignSlot, got {r:?}").into());
+    let r = protocol::parse(b"CS KQ4NIT-7")?;
+    let Response::AprsCallsign { callsign } = r else {
+        return Err(format!("expected AprsCallsign, got {r:?}").into());
     };
-    assert_eq!(slot, CallsignSlot::new(10)?);
+    assert_eq!(callsign.as_str(), "KQ4NIT-7");
     Ok(())
 }
 
@@ -254,6 +263,21 @@ fn parse_gw_response() -> TestResult {
     };
     assert_eq!(value, DvGatewayMode::Off);
     Ok(())
+}
+
+#[test]
+fn parse_gw_reflector_terminal() -> TestResult {
+    let response = protocol::parse(b"GW 1")?;
+    let Response::Gateway { value } = response else {
+        return Err(format!("expected Gateway, got {response:?}").into());
+    };
+    assert_eq!(value, DvGatewayMode::ReflectorTerminal);
+    Ok(())
+}
+
+#[test]
+fn parse_gw_rejects_fabricated_value_two() {
+    assert!(protocol::parse(b"GW 2").is_err());
 }
 
 // === GPS (GP, GM, GS) ===
@@ -291,6 +315,12 @@ fn parse_gp_response_enabled() -> TestResult {
     assert!(gps_enabled);
     assert!(pc_output);
     Ok(())
+}
+
+#[test]
+fn parse_gp_rejects_non_boolean_fields() {
+    assert!(protocol::parse(b"GP 2,0").is_err());
+    assert!(protocol::parse(b"GP 0,9").is_err());
 }
 
 #[test]
@@ -357,6 +387,31 @@ fn parse_gs_response_mixed() -> TestResult {
     assert!(rmc);
     assert!(!vtg);
     Ok(())
+}
+
+#[test]
+fn parse_gs_rejects_non_boolean_fields() {
+    assert!(protocol::parse(b"GS 1,0,2,0,1,0").is_err());
+}
+
+// === Radio type (TY) ===
+
+#[test]
+fn parse_ty_accepts_exact_region_and_hex_variant() -> TestResult {
+    let response = protocol::parse(b"TY K,F")?;
+    let Response::RadioType { region, variant } = response else {
+        return Err(format!("expected RadioType, got {response:?}").into());
+    };
+    assert_eq!(region, "K");
+    assert_eq!(variant, 15);
+    Ok(())
+}
+
+#[test]
+fn parse_ty_rejects_invalid_region_or_variant_shape() {
+    assert!(protocol::parse(b"TY X,2").is_err());
+    assert!(protocol::parse(b"TY K,10").is_err());
+    assert!(protocol::parse(b"TY K,f").is_err());
 }
 
 // === Bluetooth (BT) ===
@@ -426,22 +481,5 @@ fn parse_sd_response_absent() -> TestResult {
         return Err(format!("expected SdCard, got {r:?}").into());
     };
     assert!(!present);
-    Ok(())
-}
-
-// === User Settings (US) ===
-
-#[test]
-fn serialize_us_read() {
-    assert_eq!(protocol::serialize(&Command::GetUserSettings), b"US\r");
-}
-
-#[test]
-fn parse_us_response() -> TestResult {
-    let r = protocol::parse(b"US 5")?;
-    let Response::UserSettings { value } = r else {
-        return Err(format!("expected UserSettings, got {r:?}").into());
-    };
-    assert_eq!(value, 5);
     Ok(())
 }

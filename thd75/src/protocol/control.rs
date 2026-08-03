@@ -1,4 +1,4 @@
-//! Control commands: AI, BY, DL, DW, RX, TX, LC, IO, BL, BE, VD, VG, VX.
+//! Control commands: AI, BY, DL, DW, RX, TX, LC, IO, BL, VD, VG, VX.
 //!
 //! These commands control radio-wide functions including auto-info
 //! notifications, transmit/receive switching, lock control, battery level,
@@ -6,6 +6,7 @@
 //! settings for hands-free operation.
 
 use crate::error::ProtocolError;
+use crate::types::BacklightControl;
 use crate::types::Band;
 use crate::types::radio_params::{BatteryLevel, DetectOutputMode, VoxDelay, VoxGain};
 
@@ -19,13 +20,28 @@ pub(crate) fn parse_control(
     payload: &str,
 ) -> Option<Result<Response, ProtocolError>> {
     match mnemonic {
-        "AI" => Some(parse_bool(payload, "AI").map(|enabled| Response::AutoInfo { enabled })),
+        "AI" => Some(match payload {
+            "" => Ok(Response::AutoInfoAck),
+            _ => parse_required_bool(payload, "AI", "enabled")
+                .map(|enabled| Response::AutoInfo { enabled }),
+        }),
         "BY" => Some(parse_by(payload)),
-        "DL" => Some(parse_bool(payload, "DL").map(|enabled| Response::DualBand { enabled })),
-        "DW" => Some(Ok(Response::FrequencyDown)),
-        "BE" => Some(parse_bool(payload, "BE").map(|enabled| Response::Beep { enabled })),
-        "RX" | "TX" => Some(Ok(Response::Ok)),
-        "LC" => Some(parse_bool(payload, "LC").map(|locked| Response::Lock { locked })),
+        "DL" => Some(
+            parse_required_bool(payload, "DL", "enabled")
+                .map(|enabled| Response::DualBand { enabled }),
+        ),
+        "DW" => Some(parse_empty_action(payload, "DW").map(|()| Response::FrequencyDown)),
+        "UP" => Some(parse_empty_action(payload, "UP").map(|()| Response::FrequencyUp)),
+        "RX" | "TX" => Some(parse_empty_action(payload, mnemonic).map(|()| Response::Ok)),
+        "LC" => Some(parse_u8_field(payload, "LC", "mode").and_then(|raw| {
+            BacklightControl::try_from(raw)
+                .map(|mode| Response::BacklightControl { mode })
+                .map_err(|error| ProtocolError::FieldParse {
+                    command: "LC".to_owned(),
+                    field: "mode".to_owned(),
+                    detail: error.to_string(),
+                })
+        })),
         "IO" => Some(parse_u8_field(payload, "IO", "value").and_then(|raw| {
             DetectOutputMode::try_from(raw)
                 .map(|value| Response::IoPort { value })
@@ -54,23 +70,36 @@ pub(crate) fn parse_control(
                     detail: e.to_string(),
                 })
         })),
-        "VX" => Some(parse_bool(payload, "VX").map(|enabled| Response::Vox { enabled })),
+        "VX" => Some(
+            parse_required_bool(payload, "VX", "enabled").map(|enabled| Response::Vox { enabled }),
+        ),
         _ => None,
     }
 }
 
-/// Parse a boolean field ("0" or "1").
-///
-/// Empty/missing value is treated as `false` (observed on BE, AI echo).
-fn parse_bool(payload: &str, cmd: &str) -> Result<bool, ProtocolError> {
-    match payload.trim() {
-        "" | "0" => Ok(false),
+/// Parse a required Boolean digit.
+fn parse_required_bool(payload: &str, cmd: &str, field: &str) -> Result<bool, ProtocolError> {
+    match payload {
+        "0" => Ok(false),
         "1" => Ok(true),
         _ => Err(ProtocolError::FieldParse {
             command: cmd.to_owned(),
-            field: "value".to_owned(),
+            field: field.to_owned(),
             detail: format!("expected 0 or 1, got {payload:?}"),
         }),
+    }
+}
+
+/// Require the empty payload used by a bare action acknowledgment.
+fn parse_empty_action(payload: &str, cmd: &str) -> Result<(), ProtocolError> {
+    if payload.is_empty() {
+        Ok(())
+    } else {
+        Err(ProtocolError::FieldParse {
+            command: cmd.to_owned(),
+            field: "payload".to_owned(),
+            detail: format!("expected an empty payload, got {payload:?}"),
+        })
     }
 }
 
@@ -127,9 +156,6 @@ fn parse_bl(payload: &str) -> Result<Response, ProtocolError> {
 /// Parse BY (busy): "band,busy".
 fn parse_by(payload: &str) -> Result<Response, ProtocolError> {
     let (band, val_str) = split_band_value(payload, "BY")?;
-    let val = parse_u8_field(val_str, "BY", "busy")?;
-    Ok(Response::Busy {
-        band,
-        busy: val != 0,
-    })
+    let busy = parse_required_bool(val_str, "BY", "busy")?;
+    Ok(Response::Busy { band, busy })
 }

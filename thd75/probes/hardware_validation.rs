@@ -3,6 +3,8 @@
 //! Exercises every command group and prints raw responses for capture.
 //! Run with: `cargo test --test hardware_validation -- --ignored --nocapture --test-threads=1`
 
+mod firmware_guard;
+
 use kenwood_thd75::error::Error;
 use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::radio::Radio;
@@ -29,6 +31,21 @@ async fn probe(radio: &mut Radio<SerialTransport>, cmd: Command) -> Result<Respo
         Err(e) => println!("  {cmd_name} ERR | sent: {wire_str} | error: {e}"),
     }
     result
+}
+
+/// Determine the exact firmware identity before any stock bare `GM`/`GW` probe.
+async fn exact_firmware_version(radio: &mut Radio<SerialTransport>) -> Option<String> {
+    match probe(radio, Command::GetFirmwareVersion).await {
+        Ok(Response::FirmwareVersion { version }) => Some(version),
+        Ok(other) => {
+            println!("  FV ERR | unexpected response while authorizing stock probes: {other:?}");
+            None
+        }
+        Err(error) => {
+            println!("  FV ERR | cannot authorize stock probes: {error}");
+            None
+        }
+    }
 }
 
 // ============================================================
@@ -108,10 +125,28 @@ async fn hw_vfo_commands() {
     // FT: Function type (bare read, no band)
     let _ = probe(&mut radio, Command::GetFunctionType).await;
 
-    // SH: Filter width (by mode index)
-    let _ = probe(&mut radio, Command::GetFilterWidth { mode_index: 0 }).await;
-    let _ = probe(&mut radio, Command::GetFilterWidth { mode_index: 1 }).await;
-    let _ = probe(&mut radio, Command::GetFilterWidth { mode_index: 2 }).await;
+    // SH: Filter width (by receiver mode)
+    let _ = probe(
+        &mut radio,
+        Command::GetFilterWidth {
+            mode: FilterMode::Ssb,
+        },
+    )
+    .await;
+    let _ = probe(
+        &mut radio,
+        Command::GetFilterWidth {
+            mode: FilterMode::Cw,
+        },
+    )
+    .await;
+    let _ = probe(
+        &mut radio,
+        Command::GetFilterWidth {
+            mode: FilterMode::Am,
+        },
+    )
+    .await;
 
     // RA: Attenuator
     let _ = probe(&mut radio, Command::GetAttenuator { band: Band::A }).await;
@@ -139,8 +174,8 @@ async fn hw_control_commands() {
 
     // DW: Frequency Down (action, not probed; it would change frequency)
 
-    // LC: Lock control
-    let _ = probe(&mut radio, Command::GetLock).await;
+    // LC: LCD backlight control
+    let _ = probe(&mut radio, Command::GetBacklightControl).await;
 
     // BL: Battery Level
     let _ = probe(&mut radio, Command::GetBatteryLevel).await;
@@ -174,8 +209,20 @@ async fn hw_tnc_dstar_clock_commands() {
     let _ = probe(&mut radio, Command::GetTncMode).await;
 
     // DC: D-STAR callsign slots 1-6
-    let _ = probe(&mut radio, Command::GetDstarCallsign { slot: 1 }).await;
-    let _ = probe(&mut radio, Command::GetDstarCallsign { slot: 2 }).await;
+    let _ = probe(
+        &mut radio,
+        Command::GetDstarCallsign {
+            slot: DstarSlot::new(1).expect("slot 1 is valid"),
+        },
+    )
+    .await;
+    let _ = probe(
+        &mut radio,
+        Command::GetDstarCallsign {
+            slot: DstarSlot::new(2).expect("slot 2 is valid"),
+        },
+    )
+    .await;
 
     // RT: Real-time clock (bare read)
     let _ = probe(&mut radio, Command::GetRealTimeClock).await;
@@ -194,17 +241,29 @@ async fn hw_memory_commands() {
     println!("\n=== MEMORY COMMANDS ===");
 
     // ME: Read memory channel 0
-    let _ = probe(&mut radio, Command::GetMemoryChannel { channel: 0 }).await;
+    let _ = probe(
+        &mut radio,
+        Command::GetMemoryChannel {
+            selector: MemorySelector::try_from(0_u16).unwrap(),
+        },
+    )
+    .await;
 
     // ME: Read memory channel 1
-    let _ = probe(&mut radio, Command::GetMemoryChannel { channel: 1 }).await;
+    let _ = probe(
+        &mut radio,
+        Command::GetMemoryChannel {
+            selector: MemorySelector::try_from(1_u16).unwrap(),
+        },
+    )
+    .await;
 
     // MR: Recall memory channel 0 on band A
     let _ = probe(
         &mut radio,
         Command::RecallMemoryChannel {
             band: Band::A,
-            channel: 0,
+            selector: MemorySelector::try_from(0_u16).unwrap(),
         },
     )
     .await;
@@ -214,7 +273,7 @@ async fn hw_memory_commands() {
         &mut radio,
         Command::RecallMemoryChannel {
             band: Band::A,
-            channel: 1,
+            selector: MemorySelector::try_from(1_u16).unwrap(),
         },
     )
     .await;
@@ -238,7 +297,7 @@ async fn hw_aprs_commands() {
     let _ = probe(&mut radio, Command::GetTncBaud).await;
     let _ = probe(&mut radio, Command::GetSerialInfo).await;
     let _ = probe(&mut radio, Command::GetBeaconType).await;
-    let _ = probe(&mut radio, Command::GetPositionSource).await;
+    let _ = probe(&mut radio, Command::GetMyPositionSelection).await;
 
     let _ = radio.disconnect().await;
 }
@@ -252,10 +311,15 @@ async fn hw_aprs_commands() {
 async fn hw_dstar_commands() {
     let mut radio = connect().await;
     println!("\n=== D-STAR COMMANDS ===");
+    let firmware_version = exact_firmware_version(&mut radio).await;
 
     let _ = probe(&mut radio, Command::GetDstarSlot).await;
-    let _ = probe(&mut radio, Command::GetActiveCallsignSlot).await;
-    let _ = probe(&mut radio, Command::GetGateway).await;
+    match firmware_guard::require_stock_bare_probe("GW", firmware_version.as_deref()) {
+        Ok(()) => {
+            let _ = probe(&mut radio, Command::GetGateway).await;
+        }
+        Err(diagnostic) => println!("  {diagnostic}"),
+    }
 
     let _ = radio.disconnect().await;
 }
@@ -269,16 +333,22 @@ async fn hw_dstar_commands() {
 async fn hw_gps_commands() {
     let mut radio = connect().await;
     println!("\n=== GPS COMMANDS ===");
+    let firmware_version = exact_firmware_version(&mut radio).await;
 
     let _ = probe(&mut radio, Command::GetGpsConfig).await;
-    let _ = probe(&mut radio, Command::GetGpsMode).await;
+    match firmware_guard::require_stock_bare_probe("GM", firmware_version.as_deref()) {
+        Ok(()) => {
+            let _ = probe(&mut radio, Command::GetGpsMode).await;
+        }
+        Err(diagnostic) => println!("  {diagnostic}"),
+    }
     let _ = probe(&mut radio, Command::GetGpsSentences).await;
 
     let _ = radio.disconnect().await;
 }
 
 // ============================================================
-// System commands (BT, SD, US)
+// System commands (BT, SD)
 // ============================================================
 
 #[tokio::test]
@@ -289,13 +359,12 @@ async fn hw_system_commands() {
 
     let _ = probe(&mut radio, Command::GetBluetooth).await;
     let _ = probe(&mut radio, Command::GetSdCard).await;
-    let _ = probe(&mut radio, Command::GetUserSettings).await;
 
     let _ = radio.disconnect().await;
 }
 
 // ============================================================
-// Scan commands (SR, SF, BS)
+// Scan commands (SR, SF), plus BS antenna selection
 // ============================================================
 
 #[tokio::test]
@@ -306,7 +375,7 @@ async fn hw_scan_commands() {
 
     // SR is write-only on D75 (bare `SR\r` returns `?`)
     let _ = probe(&mut radio, Command::GetStepSize { band: Band::A }).await;
-    let _ = probe(&mut radio, Command::GetBandScope { band: Band::A }).await;
+    let _ = probe(&mut radio, Command::GetBarAntenna).await;
 
     let _ = radio.disconnect().await;
 }

@@ -1517,7 +1517,7 @@ async fn run_baseline<T: Transport>(
 ) -> AuditResult<()> {
     println!("Running raw read-only preflight...");
     let identity = run_specs(transport, codec, private, sanitized, 0, IDENTITY_READS).await?;
-    validate_identity(&identity)?;
+    validate_identity(&identity, profile)?;
     let (ai_spec, remaining_preflight) = BASELINE_PREFLIGHT
         .split_first()
         .ok_or_else(|| invalid_input("baseline preflight allowlist is empty"))?;
@@ -1589,7 +1589,7 @@ async fn run_make_safe<T: Transport>(
     )
     .await?;
     sequence += IDENTITY_READS.len();
-    validate_identity(&identity)?;
+    validate_identity(&identity, BaselineProfile::StockDefault)?;
 
     println!("Capturing original safety state...");
     let original =
@@ -2527,7 +2527,7 @@ fn write_json_line(writer: &mut BufWriter<File>, value: &Value) -> AuditResult<(
 fn validate_response_grammar(command: &str, response: &[u8]) -> bool {
     match command {
         "ID" => response == b"ID TH-D75",
-        "FV" => response == b"FV 1.03",
+        "FV" => matches!(response, b"FV 1.03" | b"FV 1.03.AZM"),
         "TY" => validate_ty_shape(response),
         "AE" => validate_ae(response),
         "AI" => decimal_field(response, b"AI ", 1, 0, 1),
@@ -2781,9 +2781,13 @@ fn validate_rt(response: &[u8]) -> bool {
     (1..=max_day).contains(&day)
 }
 
-fn validate_identity(observed: &[(String, Vec<u8>)]) -> AuditResult<()> {
+fn validate_identity(observed: &[(String, Vec<u8>)], profile: BaselineProfile) -> AuditResult<()> {
     expect_response(observed, "ID", b"ID TH-D75")?;
-    expect_response(observed, "FV", b"FV 1.03")?;
+    let firmware = match profile {
+        BaselineProfile::StockDefault => b"FV 1.03".as_slice(),
+        BaselineProfile::Automation => b"FV 1.03.AZM".as_slice(),
+    };
+    expect_response(observed, "FV", firmware)?;
     expect_response(observed, "TY", EXPECTED_TY)
 }
 
@@ -3291,6 +3295,9 @@ mod tests {
 
     #[test]
     fn strict_grammar_covers_firmware_boundaries() {
+        assert!(validate_response_grammar("FV", b"FV 1.03"));
+        assert!(validate_response_grammar("FV", b"FV 1.03.AZM"));
+        assert!(!validate_response_grammar("FV", b"FV 1.03.000"));
         assert!(validate_response_grammar("BL", b"BL 5"));
         assert!(validate_response_grammar("VD", b"VD 6"));
         assert!(validate_response_grammar("MS", b"MS 5"));
@@ -3302,6 +3309,25 @@ mod tests {
         assert!(!validate_response_grammar("BL", b"BL 6"));
         assert!(!validate_response_grammar("VD", b"VD 7"));
         assert!(!validate_response_grammar("SF 1", b"SF 1,C"));
+    }
+
+    #[test]
+    fn identity_validation_is_profile_exact() -> TestResult {
+        let common = |firmware: &[u8]| {
+            vec![
+                ("ID".to_owned(), b"ID TH-D75".to_vec()),
+                ("FV".to_owned(), firmware.to_vec()),
+                ("TY".to_owned(), EXPECTED_TY.to_vec()),
+            ]
+        };
+        let stock = common(b"FV 1.03");
+        let automation = common(b"FV 1.03.AZM");
+
+        validate_identity(&stock, BaselineProfile::StockDefault)?;
+        validate_identity(&automation, BaselineProfile::Automation)?;
+        assert!(validate_identity(&stock, BaselineProfile::Automation).is_err());
+        assert!(validate_identity(&automation, BaselineProfile::StockDefault).is_err());
+        Ok(())
     }
 
     #[test]

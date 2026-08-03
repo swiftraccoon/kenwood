@@ -3,8 +3,8 @@
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;
 use kenwood_thd75::types::{
-    Band, BeaconMode, DetectOutputMode, DstarSlot, FilterMode, FineStep, StepSize, TncBaud,
-    VfoMemoryMode,
+    Band, BeaconMode, DetectOutputMode, DstarSlot, FilterMode, FineStep, MyPositionSelection,
+    StepSize, TncBaud, VfoMemoryMode,
 };
 
 // Deps visible to every kenwood-thd75 test target but unused here.
@@ -114,9 +114,9 @@ async fn recall_channel_band_b() -> TestResult {
 #[tokio::test]
 async fn frequency_up() -> TestResult {
     let mut mock = MockTransport::new();
-    mock.expect(b"UP 0\r", b"UP 0\r");
+    mock.expect(b"UP\r", b"UP\r");
     let mut radio = Radio::connect(mock).await?;
-    radio.frequency_up(Band::A).await?;
+    radio.frequency_up().await?;
     Ok(())
 }
 
@@ -140,7 +140,7 @@ async fn set_fm_radio() -> TestResult {
     Ok(())
 }
 
-// ---- FS: get_fine_step / set_fine_step ----
+// ---- FS: get_fine_step ----
 
 #[tokio::test]
 async fn get_fine_step() -> TestResult {
@@ -149,15 +149,6 @@ async fn get_fine_step() -> TestResult {
     let mut radio = Radio::connect(mock).await?;
     let step = radio.get_fine_step().await?;
     assert_eq!(step, FineStep::Hz20);
-    Ok(())
-}
-
-#[tokio::test]
-async fn set_fine_step() -> TestResult {
-    let mut mock = MockTransport::new();
-    mock.expect(b"FS 0,2\r", b"FS 2\r");
-    let mut radio = Radio::connect(mock).await?;
-    radio.set_fine_step(Band::A, FineStep::Hz500).await?;
     Ok(())
 }
 
@@ -244,15 +235,14 @@ async fn set_step_size() -> TestResult {
     Ok(())
 }
 
-// ---- BS: get_band_scope ----
+// ---- BS: bar antenna ----
 
 #[tokio::test]
-async fn get_band_scope() -> TestResult {
+async fn get_bar_antenna() -> TestResult {
     let mut mock = MockTransport::new();
-    mock.expect(b"BS 0\r", b"BS 0\r");
+    mock.expect(b"BS\r", b"BS 1\r");
     let mut radio = Radio::connect(mock).await?;
-    let band = radio.get_band_scope(Band::A).await?;
-    assert_eq!(band, Band::A);
+    assert!(radio.get_bar_antenna().await?);
     Ok(())
 }
 
@@ -273,18 +263,6 @@ async fn get_sd_status_present() -> TestResult {
     mock.expect(b"SD\r", b"SD 1\r");
     let mut radio = Radio::connect(mock).await?;
     assert!(radio.get_sd_status().await?);
-    Ok(())
-}
-
-// ---- 0E: get_mcp_status ----
-
-#[tokio::test]
-async fn get_mcp_status() -> TestResult {
-    let mut mock = MockTransport::new();
-    mock.expect(b"0E\r", b"0E 0\r");
-    let mut radio = Radio::connect(mock).await?;
-    let status = radio.get_mcp_status().await?;
-    assert_eq!(status, "0");
     Ok(())
 }
 
@@ -348,20 +326,22 @@ async fn set_tnc_baud() -> TestResult {
 #[tokio::test]
 async fn set_beacon_type() -> TestResult {
     let mut mock = MockTransport::new();
-    mock.expect(b"PT 3\r", b"PT 3\r");
+    mock.expect(b"PT 2\r", b"PT 2\r");
     let mut radio = Radio::connect(mock).await?;
     radio.set_beacon_type(BeaconMode::Auto).await?;
     Ok(())
 }
 
-// ---- MS: send_message ----
+// ---- MS: My Position selection ----
 
 #[tokio::test]
-async fn send_message() -> TestResult {
+async fn set_my_position_selection() -> TestResult {
     let mut mock = MockTransport::new();
-    mock.expect(b"MS hello\r", b"MS 0\r");
+    mock.expect(b"MS 5\r", b"MS 5\r");
     let mut radio = Radio::connect(mock).await?;
-    radio.send_message("hello").await?;
+    radio
+        .set_my_position_selection(MyPositionSelection::new(5)?)
+        .await?;
     Ok(())
 }
 
@@ -398,18 +378,6 @@ fn serialize_get_vfo_memory_mode() {
     assert_eq!(
         serialize(&Command::GetVfoMemoryMode { band: Band::B }),
         b"VM 1\r"
-    );
-}
-
-#[test]
-fn serialize_set_fine_step() {
-    use kenwood_thd75::protocol::{Command, serialize};
-    assert_eq!(
-        serialize(&Command::SetFineStep {
-            band: Band::A,
-            step: FineStep::Hz500
-        }),
-        b"FS 0,2\r"
     );
 }
 
@@ -454,7 +422,7 @@ fn serialize_set_beacon_type() {
         serialize(&Command::SetBeaconType {
             mode: BeaconMode::Ptt
         }),
-        b"PT 2\r"
+        b"PT 1\r"
     );
 }
 

@@ -7,11 +7,16 @@ Async Rust library for full control of the Kenwood TH-D75 ham radio transceiver.
 
 ## Features
 
-- **CAT protocol**: All 55 commands with strict type safety. Every parameter uses validated types that reject invalid values at construction time.
+- **Qualified CAT protocol**: Typed parsing and serialization for established
+  TH-D75 contracts, with validated parameter types that reject invalid values
+  at construction time. Service-only `0E` and unresolved `BE`/`US` operations
+  are deliberately excluded from the ordinary typed API.
 - **MCP programming**: Binary memory access via `0M PROGRAM` mode. Read all
-  1,200 MCP channel entries (1,000 standard channels plus special channels),
-  settings, and calibration pages; modify user configuration while the final
-  two factory-calibration pages remain write-protected.
+  1,152 data-backed channel records (1,000 standard channels plus 152 special
+  channels), along with the full 1,200-slot flag and name tables whose tail
+  also stores group metadata. Read settings and calibration pages; modify user
+  configuration while the final two factory-calibration pages remain
+  write-protected.
 - **Generated MCP-D75 menu schema**: 400 user-configuration fields, with offsets, bit masks, value domains, and English option labels extracted from the official MCP-D75 serializers. The `mcp_menu --read` example takes a sparse, structurally read-only snapshot; batch patches read only the touched pages, preserve shared bits, enter programming mode once, and verify every changed page. Runtime CAT state, channel records, and factory calibration remain separate interfaces.
 - **SD card parsing**: Read `.d75` configs, `.nme` GPS logs, `.tsv` repeater/callsign/QSO lists, `.wav` audio recordings, and `.bmp` screen captures.
 - **Closed-loop V1.03.AZM automation**: Byte-attest the exact custom runtime,
@@ -50,11 +55,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("firmware {version}");
 
     let freq = radio.get_frequency(kenwood_thd75::types::Band::A).await?;
-    println!("Band A: {}", freq.rx_frequency);
+    println!("Band A: {freq}");
 
     Ok(())
 }
 ```
+
+## Tests
+
+The KI4LAX comparisons in `tests/spec_audit.rs` require an untracked,
+third-party JSON fixture. They are explicitly ignored by default, so `cargo
+test` reports the skipped coverage instead of counting unexecuted comparisons
+as passes. Fixture-independent checks in that target still run normally.
+
+Run only the external-spec comparisons with an explicit fixture:
+
+```text
+THD75_KI4LAX_SPEC=/absolute/path/to/ki4lax_cat_spec.json \
+  cargo test -p kenwood-thd75 --test spec_audit -- --ignored
+```
+
+This explicit run fails if the variable is unset, the fixture cannot be read,
+or its JSON/schema is malformed.
 
 ## Examples
 
@@ -200,7 +222,7 @@ authenticated refusal is always before the first digit and leaves the session
 usable; ABI 3 rejects every partial-refusal receipt. Recovery never assumes an
 undocumented numeric-entry timeout.
 Zero-hold behavior is not treated as hardware-qualified until the live runner
-opens harmless information page 991, proves the exact Firmware Version / V1.03
+opens harmless information page 991, proves the exact Version / V1.03.AZM
 screen, and restores the exact baseline frame.
 
 After independently validating the snapshot's screen semantics, the core host
@@ -211,6 +233,9 @@ use kenwood_thd75::radio::automation::{
     GuardedDecimalRoute, GuardedDecimalRouteOutcome,
 };
 
+# async fn guarded_route_example<T: kenwood_thd75::Transport>(
+#     mut radio: kenwood_thd75::Radio<T>,
+# ) -> Result<(), Box<dyn std::error::Error>> {
 let mut session = radio.qualify_automation().await?;
 let menu = session.capture_screen().await?;
 // Establish the expected screen with an application-specific pixel/OCR check
@@ -222,6 +247,8 @@ let outcome = session
 if !matches!(outcome, GuardedDecimalRouteOutcome::Dispatched(_)) {
     return Err("guarded menu route was not fully dispatched".into());
 }
+# Ok(())
+# }
 ```
 
 `automation_audit` uses that one-command path for complete decimal menu routes;
@@ -306,14 +333,18 @@ Run the full audit into a new owner-private absolute directory:
 
 ```text
 cargo run -p kenwood-thd75 --release --example automation_audit -- \
-  --device TH-D75 --output-dir /private/path/new-audit-directory
+  --port /dev/cu.usbmodem1234 --output-dir /private/path/new-audit-directory
 ```
+
+Use `--device TH-D75` instead of `--port PATH` for native Bluetooth. The two
+endpoint options are mutually exclusive; omitting both preserves the existing
+`TH-D75` Bluetooth default.
 
 Use `--menu 991` for one leaf, or `--start NUMBER --limit COUNT` for a bounded
 slice. Only complete 217-leaf coverage can report `FULL_PASS`; explicit subsets
-report `SCOPED_PASS`. The runner requires macOS native Bluetooth and Vision,
-and writes its private evidence bundle only beneath the requested owner-private
-output directory.
+report `SCOPED_PASS`. The runner requires macOS Vision; radio transport may be
+an explicit USB CDC path or native Bluetooth. It writes its private evidence
+bundle only beneath the requested owner-private output directory.
 
 The unchanged ABI-3 runtime and hooks passed a complete TH-D75A/V1.03 hardware
 run in the predecessor package on 2026-07-31:

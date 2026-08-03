@@ -131,9 +131,39 @@ fn serialize_rt_read() {
 #[test]
 fn parse_rt_response() -> TestResult {
     let r = protocol::parse(b"RT 240104095700")?;
-    let Response::RealTimeClock { datetime } = r else {
+    let Response::RealTimeClock { clock } = r else {
         return Err(format!("expected RealTimeClock, got {r:?}").into());
     };
-    assert_eq!(datetime, "240104095700");
+    let Some(datetime) = clock.date_time() else {
+        return Err("expected available radio clock".into());
+    };
+    assert_eq!(datetime.to_wire_string(), "240104095700");
+    assert_eq!(datetime.to_string(), "2024-01-04 09:57:00");
     Ok(())
+}
+
+#[test]
+fn parse_rt_unavailable_response() -> TestResult {
+    let r = protocol::parse(b"RT ------------")?;
+    assert!(matches!(
+        r,
+        Response::RealTimeClock {
+            clock: kenwood_thd75::types::RadioClock::Unavailable
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn reject_malformed_rt_responses() {
+    for response in [
+        b"RT".as_slice(),
+        b"RT 230229235959",
+        b"RT 241332000000",
+        b"RT 240101240000",
+        b"RT -----------",
+        b"RT -------------",
+    ] {
+        assert!(protocol::parse(response).is_err(), "accepted {response:?}");
+    }
 }

@@ -18,11 +18,11 @@
 //! | 0x000 | 0x100 | File header (model ID, metadata) |
 //! | 0x100 | ... | MCP memory image (settings, channels, names, etc.) |
 //!
-//! Channel data lives at `.d75 offset 0x100 + MCP offset`. The exact
-//! section layout is inferred from D74 development notes and adapted
-//! for the D75's expanded feature set.
+//! Channel data lives at `.d75 offset 0x100 + MCP offset` and follows the
+//! canonical TH-D75 MCP page geometry in [`crate::protocol::programming`].
 
 use super::SdCardError;
+use crate::protocol::programming;
 use crate::types::channel::FlashChannel;
 
 /// Size of the `.d75` file header in bytes.
@@ -32,7 +32,7 @@ pub const HEADER_SIZE: usize = 0x100;
 pub const MAX_CHANNELS: usize = 1000;
 
 /// Size of each channel memory entry in bytes.
-const CHANNEL_ENTRY_SIZE: usize = FlashChannel::BYTE_SIZE; // 40
+const CHANNEL_ENTRY_SIZE: usize = programming::CHANNEL_RECORD_SIZE; // 40
 
 /// Size of each channel name entry in bytes.
 const CHANNEL_NAME_SIZE: usize = 16;
@@ -47,7 +47,9 @@ const CHANNEL_FLAGS_OFFSET: usize = HEADER_SIZE + 0x2000;
 
 /// `.d75` file offset to the channel memory data section.
 ///
-/// Each channel is a 40-byte structure.
+/// Each 256-byte MCP memgroup contains six 40-byte channel records followed
+/// by 16 bytes of padding. Channel 6 therefore starts on the next page rather
+/// than immediately after channel 5.
 ///
 /// File offset = `HEADER_SIZE + 0x4000 = 0x4100`.
 const CHANNEL_DATA_OFFSET: usize = HEADER_SIZE + 0x4000;
@@ -62,8 +64,30 @@ const CHANNEL_NAME_OFFSET: usize = HEADER_SIZE + 0x10000;
 /// Size of each channel flags entry in bytes.
 const CHANNEL_FLAGS_SIZE: usize = 4;
 
+const _: () = assert!(
+    CHANNEL_ENTRY_SIZE == FlashChannel::BYTE_SIZE,
+    "FlashChannel size must match the canonical MCP channel record size"
+);
+const _: () = assert!(
+    programming::CHANNELS_PER_MEMGROUP * CHANNEL_ENTRY_SIZE + programming::MEMGROUP_PADDING
+        == programming::PAGE_SIZE,
+    "MCP channel records and padding must exactly fill one page"
+);
+
 /// Known model identification strings found at offset 0 of the header.
 const KNOWN_MODELS: &[&str] = &["Data For TH-D75A", "Data For TH-D75E", "Data For TH-D75"];
+
+/// Return the `.d75` file offset for a channel's 40-byte MCP record.
+///
+/// MCP channel data is page-shaped, not a flat array: each page holds six
+/// records and ends with 16 bytes of padding.
+const fn channel_data_offset(channel: usize) -> usize {
+    let memgroup = channel / programming::CHANNELS_PER_MEMGROUP;
+    let slot = channel % programming::CHANNELS_PER_MEMGROUP;
+    CHANNEL_DATA_OFFSET
+        + memgroup * programming::PAGE_SIZE
+        + slot * programming::CHANNEL_RECORD_SIZE
+}
 
 /// Parsed `.d75` configuration file header (256 bytes).
 ///
@@ -197,7 +221,7 @@ pub fn parse_config(data: &[u8]) -> Result<RadioConfig, SdCardError> {
     let mut channels = Vec::with_capacity(MAX_CHANNELS);
 
     for i in 0..MAX_CHANNELS {
-        let ch_offset = CHANNEL_DATA_OFFSET + (i * CHANNEL_ENTRY_SIZE);
+        let ch_offset = channel_data_offset(i);
         let name_offset = CHANNEL_NAME_OFFSET + (i * CHANNEL_NAME_SIZE);
         let flags_offset = CHANNEL_FLAGS_OFFSET + (i * CHANNEL_FLAGS_SIZE);
 
@@ -295,7 +319,7 @@ pub fn write_config(config: &RadioConfig) -> Vec<u8> {
         }
 
         // Channel memory (40 bytes)
-        let ch_offset = CHANNEL_DATA_OFFSET + (i * CHANNEL_ENTRY_SIZE);
+        let ch_offset = channel_data_offset(i);
         let ch_end = ch_offset + CHANNEL_ENTRY_SIZE;
         if let Some(dst) = out.get_mut(ch_offset..ch_end) {
             let bytes = entry.flash.to_bytes();
@@ -601,7 +625,6 @@ mod tests {
     #[test]
     fn write_d75_preserves_channel_data() -> TestResult {
         use crate::memory::MemoryImage;
-        use crate::protocol::programming;
 
         let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
 
@@ -626,9 +649,119 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_channel_parse_error() -> TestResult {
-        use crate::protocol::programming;
+    fn parse_config_skips_memgroup_padding_before_channel_six() -> TestResult {
+        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
+        let mut data = vec![0u8; HEADER_SIZE + programming::TOTAL_SIZE];
+        write_slice(&mut data, 0, &header.raw)?;
 
+        let channel_five = FlashChannel {
+            rx_frequency: Frequency::new(446_000_000),
+            ..FlashChannel::default()
+        };
+        let channel_six = FlashChannel {
+            rx_frequency: Frequency::new(145_600_000),
+            ..FlashChannel::default()
+        };
+        write_slice(&mut data, channel_data_offset(5), &channel_five.to_bytes())?;
+        write_slice(&mut data, channel_data_offset(6), &channel_six.to_bytes())?;
+
+        let padding_start = channel_data_offset(5) + CHANNEL_ENTRY_SIZE;
+        assert_eq!(
+            channel_data_offset(6) - padding_start,
+            programming::MEMGROUP_PADDING
+        );
+        assert_eq!(
+            data.get(padding_start..channel_data_offset(6))
+                .ok_or("channel memgroup padding missing")?,
+            &[0u8; programming::MEMGROUP_PADDING]
+        );
+
+        let parsed = parse_config(&data)?;
+        let parsed_five = parsed.channels.get(5).ok_or("channel 5 missing")?;
+        let parsed_six = parsed.channels.get(6).ok_or("channel 6 missing")?;
+        assert_eq!(parsed_five.flash.rx_frequency.as_hz(), 446_000_000);
+        assert_eq!(parsed_six.flash.rx_frequency.as_hz(), 145_600_000);
+        assert!(parsed_five.used);
+        assert!(parsed_six.used);
+        Ok(())
+    }
+
+    #[test]
+    fn write_config_preserves_memgroup_padding_before_channel_six() -> TestResult {
+        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
+        let mut raw_image = vec![0u8; programming::TOTAL_SIZE];
+        let padding_start = channel_data_offset(5) + CHANNEL_ENTRY_SIZE;
+        let padding_end = channel_data_offset(6);
+        let padding_body_start = padding_start - HEADER_SIZE;
+        let padding_body_end = padding_end - HEADER_SIZE;
+        raw_image
+            .get_mut(padding_body_start..padding_body_end)
+            .ok_or("raw image channel padding missing")?
+            .fill(0xA5);
+
+        let channel_five = FlashChannel {
+            rx_frequency: Frequency::new(446_000_000),
+            ..FlashChannel::default()
+        };
+        let channel_six = FlashChannel {
+            rx_frequency: Frequency::new(145_600_000),
+            ..FlashChannel::default()
+        };
+        let config = RadioConfig {
+            header,
+            channels: vec![
+                make_channel(5, "PAGE ZERO", channel_five.clone()),
+                make_channel(6, "PAGE ONE", channel_six.clone()),
+            ],
+            raw_image,
+        };
+
+        let written = write_config(&config);
+        assert_eq!(
+            written
+                .get(channel_data_offset(5)..channel_data_offset(5) + CHANNEL_ENTRY_SIZE)
+                .ok_or("written channel 5 missing")?,
+            &channel_five.to_bytes()
+        );
+        assert_eq!(
+            written
+                .get(channel_data_offset(6)..channel_data_offset(6) + CHANNEL_ENTRY_SIZE)
+                .ok_or("written channel 6 missing")?,
+            &channel_six.to_bytes()
+        );
+        assert_eq!(
+            written
+                .get(padding_start..padding_end)
+                .ok_or("written channel padding missing")?,
+            &[0xA5; programming::MEMGROUP_PADDING]
+        );
+
+        let parsed = parse_config(&written)?;
+        assert_eq!(
+            parsed
+                .channels
+                .get(5)
+                .ok_or("round-tripped channel 5 missing")?
+                .flash
+                .rx_frequency
+                .as_hz(),
+            446_000_000
+        );
+        assert_eq!(
+            parsed
+                .channels
+                .get(6)
+                .ok_or("round-tripped channel 6 missing")?
+                .flash
+                .rx_frequency
+                .as_hz(),
+            145_600_000
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_config_channel_parse_error() -> TestResult {
         let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
 
         // Build a valid .d75 file, then corrupt channel 0's step_size byte.

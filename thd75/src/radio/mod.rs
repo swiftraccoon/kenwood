@@ -37,6 +37,46 @@ use crate::types::radio_params::VfoMemoryMode;
 /// Default timeout for command execution (5 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Exact firmware identity used by the Azimuth automation build.
+pub const AZIMUTH_AUTOMATION_FIRMWARE: &str = "1.03.AZM";
+
+/// CAT command profile selected from the radio's exact firmware identity.
+///
+/// The Azimuth automation firmware deliberately repurposes bare `GM` and
+/// `GW`, so high-level stock operations using those mnemonics must not put
+/// them on the wire. All other identities retain the standard CAT profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirmwareProfile {
+    /// Standard Kenwood CAT command meanings.
+    StandardCat,
+    /// Azimuth automation commands occupy the stock bare `GM`/`GW` slots.
+    AzimuthAutomation,
+}
+
+impl FirmwareProfile {
+    /// Classify one exact CAT `FV` response value.
+    #[must_use]
+    pub fn from_version(version: &str) -> Self {
+        if version == AZIMUTH_AUTOMATION_FIRMWARE {
+            Self::AzimuthAutomation
+        } else {
+            Self::StandardCat
+        }
+    }
+
+    /// Whether bare `GM` retains its stock GPS-mode meaning.
+    #[must_use]
+    pub const fn supports_bare_gps_mode(self) -> bool {
+        matches!(self, Self::StandardCat)
+    }
+
+    /// Whether bare `GW` retains its stock gateway-mode meaning.
+    #[must_use]
+    pub const fn supports_bare_gateway(self) -> bool {
+        matches!(self, Self::StandardCat)
+    }
+}
+
 /// Information returned by [`Radio::identify`].
 #[derive(Debug, Clone)]
 pub struct RadioInfo {
@@ -125,6 +165,8 @@ pub struct Radio<T: Transport> {
     pub(crate) codec: Codec,
     pub(crate) notifications: tokio::sync::broadcast::Sender<Response>,
     pub(crate) timeout: Duration,
+    /// Last exact firmware identity returned by a successful `FV` command.
+    pub(crate) firmware_version: Option<String>,
     /// Cached mode for band A. `None` until a VM command is observed.
     pub(crate) mode_a: Option<RadioMode>,
     /// Cached mode for band B. `None` until a VM command is observed.
@@ -207,6 +249,7 @@ impl<T: Transport> Radio<T> {
             codec: Codec::new(),
             notifications: tx,
             timeout: DEFAULT_TIMEOUT,
+            firmware_version: None,
             mode_a: None,
             mode_b: None,
             mcp_speed: programming::McpSpeed::default(),
@@ -353,6 +396,37 @@ impl<T: Transport> Radio<T> {
         self.timeout = duration;
     }
 
+    /// Return the last exact firmware identity observed from `FV`, if any.
+    #[must_use]
+    pub fn cached_firmware_version(&self) -> Option<&str> {
+        self.firmware_version.as_deref()
+    }
+
+    /// Return the cached CAT command profile, if firmware has been queried.
+    #[must_use]
+    pub fn firmware_profile(&self) -> Option<FirmwareProfile> {
+        self.cached_firmware_version()
+            .map(FirmwareProfile::from_version)
+    }
+
+    /// Query firmware once when necessary and reject a repurposed high-level
+    /// command before its colliding mnemonic reaches the wire.
+    pub(crate) async fn require_firmware_command(
+        &mut self,
+        command: &'static str,
+        supported: fn(FirmwareProfile) -> bool,
+    ) -> Result<(), Error> {
+        let firmware = match &self.firmware_version {
+            Some(version) => version.clone(),
+            None => self.get_firmware_version().await?,
+        };
+        if supported(FirmwareProfile::from_version(&firmware)) {
+            Ok(())
+        } else {
+            Err(Error::CommandUnavailableOnFirmware { command, firmware })
+        }
+    }
+
     /// Set the MCP transfer speed for programming mode operations.
     ///
     /// The default is [`McpSpeed::Safe`] (9600 baud throughout, ~55 s
@@ -405,6 +479,25 @@ impl<T: Transport> Radio<T> {
         // token and must never reach the wire.
         if matches!(cmd, Command::ReadMemory { .. }) {
             return Err(Error::MemoryReadNotQualified);
+        }
+
+        // Once FV has identified the Azimuth automation build, do not let raw
+        // callers bypass the same GM/GW collision guard used by the typed
+        // helpers. Those bare mnemonics are automation opcodes on that image,
+        // not the stock GPS/gateway reads.
+        if let Some(firmware) = &self.firmware_version {
+            let profile = FirmwareProfile::from_version(firmware);
+            let blocked = match &cmd {
+                Command::GetGpsMode if !profile.supports_bare_gps_mode() => Some("GM"),
+                Command::GetGateway if !profile.supports_bare_gateway() => Some("GW"),
+                _ => None,
+            };
+            if let Some(command) = blocked {
+                return Err(Error::CommandUnavailableOnFirmware {
+                    command,
+                    firmware: firmware.clone(),
+                });
+            }
         }
 
         // 0.5. Warn if the command is likely to fail in the current mode.
@@ -470,6 +563,9 @@ impl<T: Transport> Radio<T> {
                 }
                 // 4. Track mode changes from successful VM responses.
                 self.track_mode_from_response(&cmd, &inner);
+                if let Ok(Response::FirmwareVersion { version }) = &inner {
+                    self.firmware_version = Some(version.clone());
+                }
                 inner
             }
             Err(_elapsed) => {
@@ -636,14 +732,6 @@ impl<T: Transport> Radio<T> {
     /// or `None` if the command is compatible (or the mode is unknown).
     const fn check_mode_compatibility(&self, cmd: &Command) -> Option<&'static str> {
         match cmd {
-            Command::SetFrequency { band, .. } | Command::SetFrequencyFull { band, .. } => {
-                match self.get_cached_mode(*band) {
-                    Some(RadioMode::Vfo) | None => None,
-                    Some(_) => {
-                        Some("SetFrequency requires VFO mode \u{2014} use tune_frequency() instead")
-                    }
-                }
-            }
             Command::RecallMemoryChannel { band, .. } => match self.get_cached_mode(*band) {
                 Some(RadioMode::Memory) | None => None,
                 Some(_) => Some(
@@ -905,6 +993,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_colliding_commands_are_blocked_after_azimuth_firmware_is_known() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"FV\r", b"FV 1.03.AZM\r");
+        let mut radio = Radio::connect(mock).await?;
+        assert_eq!(radio.get_firmware_version().await?, "1.03.AZM");
+
+        for (command, mnemonic) in [(Command::GetGpsMode, "GM"), (Command::GetGateway, "GW")] {
+            let result = radio.execute(command).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::CommandUnavailableOnFirmware { command, ref firmware })
+                        if command == mnemonic && firmware == "1.03.AZM"
+                ),
+                "expected cached-firmware collision guard for {mnemonic}, got {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn multiple_subscribers_receive_notifications() -> TestResult {
         let mock = MockTransport::new();
         let radio = Radio::connect(mock).await?;
@@ -931,9 +1040,9 @@ mod tests {
     #[tokio::test]
     async fn radio_not_available_response() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.expect(b"BE\r", b"N\r");
+        mock.expect(b"ID\r", b"N\r");
         let mut radio = Radio::connect(mock).await?;
-        let result = radio.execute(Command::GetBeep).await;
+        let result = radio.execute(Command::GetRadioId).await;
         assert!(
             matches!(result, Err(Error::NotAvailable)),
             "expected NotAvailable, got {result:?}"
@@ -987,18 +1096,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_af_gain_rejects_write_out_of_range() -> TestResult {
-        // AG accepts 0-99 on write (reads can exceed 99, so the type
-        // is lenient), so the write path must validate.
-        let mock = MockTransport::new();
+    async fn set_af_gain_accepts_valid_upper_bound() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"AG 200\r", b"AG 200\r");
         let mut radio = Radio::connect(mock).await?;
-        let result = radio
-            .set_af_gain(Band::A, crate::types::AfGainLevel::new(150))
-            .await;
-        assert!(
-            matches!(result, Err(Error::Validation(_))),
-            "AG write above 99 must fail validation: {result:?}"
-        );
+        radio
+            .set_af_gain(crate::types::AfGainLevel::new(200))
+            .await?;
         Ok(())
     }
 

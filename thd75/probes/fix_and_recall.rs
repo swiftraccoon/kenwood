@@ -4,7 +4,7 @@
 use kenwood_thd75::protocol::{self, Command, programming};
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::Band;
+use kenwood_thd75::types::{Band, MemorySelector};
 
 async fn connect() -> Radio<SerialTransport> {
     let ports = SerialTransport::discover_usb().unwrap();
@@ -90,7 +90,7 @@ async fn fix_channel_2_name_and_recall_rutherfordton() {
     let _ = radio4
         .execute(Command::RecallMemoryChannel {
             band: Band::A,
-            channel: ch,
+            selector: MemorySelector::try_from(ch).unwrap(),
         })
         .await;
 
@@ -98,7 +98,7 @@ async fn fix_channel_2_name_and_recall_rutherfordton() {
 
     // Verify by reading current frequency
     let freq = radio4.get_frequency(Band::A).await.unwrap();
-    println!("  Band A now: {} MHz", freq.rx_frequency.as_mhz());
+    println!("  Band A now: {} MHz", freq.as_mhz());
 
     let _ = radio4.disconnect().await;
     println!("\n=== DONE ===");

@@ -2,7 +2,6 @@
 
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;
-use kenwood_thd75::types::Band;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -33,7 +32,7 @@ async fn get_set_af_gain() -> TestResult {
         kenwood_thd75::types::AfGainLevel::new(15)
     );
     radio
-        .set_af_gain(Band::A, kenwood_thd75::types::AfGainLevel::new(20))
+        .set_af_gain(kenwood_thd75::types::AfGainLevel::new(20))
         .await?;
     Ok(())
 }
@@ -67,8 +66,24 @@ async fn get_real_time_clock() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"RT\r", b"RT 240104095700\r");
     let mut radio = Radio::connect(mock).await?;
-    let datetime = radio.get_real_time_clock().await?;
-    assert_eq!(datetime, "240104095700");
+    let clock = radio.get_real_time_clock().await?;
+    let Some(datetime) = clock.date_time() else {
+        return Err("expected available radio clock".into());
+    };
+    assert_eq!(datetime.to_wire_string(), "240104095700");
+    assert_eq!(datetime.to_string(), "2024-01-04 09:57:00");
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_unavailable_real_time_clock() -> TestResult {
+    let mut mock = MockTransport::new();
+    mock.expect(b"RT\r", b"RT ------------\r");
+    let mut radio = Radio::connect(mock).await?;
+    assert_eq!(
+        radio.get_real_time_clock().await?,
+        kenwood_thd75::types::RadioClock::Unavailable
+    );
     Ok(())
 }
 
@@ -103,14 +118,14 @@ async fn vox_gain() -> TestResult {
 async fn vox_delay() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"VD\r", b"VD 3\r");
-    mock.expect(b"VD 7\r", b"VD 7\r");
+    mock.expect(b"VD 6\r", b"VD 6\r");
     let mut radio = Radio::connect(mock).await?;
     assert_eq!(
         radio.get_vox_delay().await?,
         kenwood_thd75::types::VoxDelay::new(3)?
     );
     radio
-        .set_vox_delay(kenwood_thd75::types::VoxDelay::new(7)?)
+        .set_vox_delay(kenwood_thd75::types::VoxDelay::new(6)?)
         .await?;
     Ok(())
 }

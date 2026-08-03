@@ -4,7 +4,8 @@
 //! reopen → identify → restore sequence, and the fail-fast rule:
 //! a command in flight when the link drops stays failed.
 
-use kenwood_thd75::radio::{LinkState, Radio};
+use kenwood_thd75::error::Error;
+use kenwood_thd75::radio::{FirmwareProfile, LinkState, Radio};
 use kenwood_thd75::transport::{MockTransport, Transport};
 
 // Deps visible to every kenwood-thd75 test target but unused here.
@@ -100,6 +101,34 @@ async fn reconnect_without_session_state_sends_only_identify() -> TestResult {
     radio.reconnect().await?;
     // The strict mock would have rejected any extra command (AI/GP/GS),
     // so reaching this point proves nothing else was sent.
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconnect_preserves_azimuth_firmware_profile() -> TestResult {
+    let mut mock = MockTransport::new();
+    mock.expect(b"FV\r", b"FV 1.03.AZM\r");
+    mock.expect_reopen(Ok(()));
+    expect_identify(&mut mock);
+
+    let mut radio = Radio::connect(mock).await?;
+    assert_eq!(radio.get_firmware_version().await?, "1.03.AZM");
+    radio.reconnect().await?;
+    assert_eq!(
+        radio.firmware_profile(),
+        Some(FirmwareProfile::AzimuthAutomation)
+    );
+    let gateway = radio.get_gateway().await;
+    assert!(
+        matches!(
+            gateway,
+            Err(Error::CommandUnavailableOnFirmware {
+                command: "GW",
+                ref firmware,
+            }) if firmware == "1.03.AZM"
+        ),
+        "cached AZM profile should reject GW after reconnect, got {gateway:?}"
+    );
     Ok(())
 }
 

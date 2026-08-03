@@ -29,10 +29,9 @@
 // registry and the hardware dump):
 //
 // - `lock`/`set_lock` (0x1060): that byte is `radio.BacklightControl`.
-//   Key-lock STATE is runtime state; the CAT layer
-//   (`Radio::get_lock`/`Radio::set_lock`, LC/DL wire commands) is the
-//   verified path. The persistent key-lock *configuration* is the bit
-//   pair at 0x1084 (`key_lock`/`frequency_lock` below).
+//   No CAT key-lock state operation is currently verified. The persistent
+//   key-lock *configuration* is the bit pair at 0x1084
+//   (`key_lock`/`frequency_lock` below).
 // - VFO block (0x0020): the hardware dump holds no VFO data there
 //   (entry 0 all-0xFF, entries 1-5 zero). Candidate real VFO records
 //   were observed at 0x0400/0x0430/0x0460 (48-byte stride, second bank
@@ -2203,10 +2202,10 @@ mod tests {
             s.set_bt_auto_connect(true);
         }),
         ("set_pf_key1", 0x107A, None, |s| {
-            let _ = s.set_pf_key1(1);
+            drop(s.set_pf_key1(1));
         }),
         ("set_pf_key2", 0x107B, None, |s| {
-            let _ = s.set_pf_key2(1);
+            drop(s.set_pf_key2(1));
         }),
         ("set_key_lock", 0x1084, Some(0x01), |s| s.set_key_lock(true)),
         ("set_frequency_lock", 0x1084, Some(0x02), |s| {

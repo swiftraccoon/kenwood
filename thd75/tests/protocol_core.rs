@@ -26,14 +26,6 @@ use tracing as _;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// Strip the trailing `\r` from a serialized wire frame, returning an error if empty.
-fn strip_cr(bytes: &[u8]) -> Result<&[u8], Box<dyn std::error::Error>> {
-    bytes
-        .split_last()
-        .map(|(_, rest)| rest)
-        .ok_or_else(|| "wire frame unexpectedly empty".into())
-}
-
 // ============================================================================
 // ID: Radio model identification
 // ============================================================================
@@ -101,26 +93,6 @@ fn parse_ps_off() -> TestResult {
         return Err(format!("expected PowerStatus, got {r:?}").into());
     };
     assert!(!on);
-    Ok(())
-}
-
-// ============================================================================
-// BE: Beep on/off (moved to control tests, but keep basic test here)
-// ============================================================================
-
-#[test]
-fn serialize_be_read() {
-    let bytes = protocol::serialize(&Command::GetBeep);
-    assert_eq!(bytes, b"BE\r");
-}
-
-#[test]
-fn parse_be_response() -> TestResult {
-    let r = protocol::parse(b"BE 0")?;
-    assert!(
-        matches!(r, Response::Beep { enabled: false }),
-        "expected Beep{{false}}, got {r:?}"
-    );
     Ok(())
 }
 
@@ -324,6 +296,41 @@ fn parse_fo_response_with_name() -> TestResult {
 }
 
 #[test]
+fn parse_fo_preserves_tx_step_mode_and_fine_fields() -> TestResult {
+    let raw = b"FO 1,0118000000,0000000000,A,B,3,1,2,0,0,0,0,0,0,08,08,000,0,,0,00";
+    let r = protocol::parse(raw)?;
+    let Response::FrequencyFull { channel, .. } = r else {
+        return Err(format!("expected FrequencyFull, got {r:?}").into());
+    };
+    assert_eq!(channel.step_size, StepSize::Hz50000);
+    assert_eq!(channel.tx_step_size, StepSize::Hz100000);
+    assert_eq!(channel.cat_mode()?, CatChannelMode::Am);
+    assert!(channel.fine_tuning_enabled());
+    assert_eq!(channel.fine_step()?, FineStep::Hz500);
+    Ok(())
+}
+
+#[test]
+fn parse_fo_rejects_noncanonical_or_out_of_domain_fields() {
+    let invalid = [
+        b"FO 0,0145000000,0000600000,a,0,0,0,0,0,0,0,0,0,0,08,08,000,0,,0,00".as_slice(),
+        b"FO 0,0145000000,0000600000,0,0,00,0,0,0,0,0,0,0,0,08,08,000,0,,0,00".as_slice(),
+        b"FO 0,0145000000,0000600000,0,0,0,0,0,2,0,0,0,0,0,08,08,000,0,,0,00".as_slice(),
+        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,0,8,08,000,0,,0,00".as_slice(),
+        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,0,08,08,000,4,,0,00".as_slice(),
+        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,,4,00".as_slice(),
+    ];
+
+    for raw in invalid {
+        assert!(
+            protocol::parse(raw).is_err(),
+            "noncanonical FO field was accepted: {:?}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+}
+
+#[test]
 fn parse_fo_wrong_field_count() -> TestResult {
     // Only 10 fields instead of 21
     let raw = b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0";
@@ -348,163 +355,9 @@ fn parse_fo_wrong_field_count() -> TestResult {
 }
 
 #[test]
-fn serialize_fo_write() -> TestResult {
-    // Construct a channel matching real D75 hardware output for 145 MHz simplex with shift-
-    let channel = ChannelMemory {
-        rx_frequency: Frequency::new(145_000_000),
-        tx_offset: Frequency::new(600_000),
-        step_size: StepSize::Hz5000,
-        mode_flags_raw: 0,
-        shift: ShiftDirection::DOWN,
-        flags_0a_raw: 0x02, // shift- = bits 1:0 = 2
-        tone_code: ToneCode::new(8)?,
-        ctcss_code: ToneCode::new(8)?,
-        dcs_code: DcsCode::new(0)?,
-        cross_tone_combo: CrossToneType::DcsOff,
-        digital_squelch: FlashDigitalSquelch::Off,
-        urcall: ChannelName::new("CQCQCQ")?,
-        data_mode: 0,
-    };
-    let bytes = protocol::serialize(&Command::SetFrequencyFull {
-        band: Band::A,
-        channel,
-    });
-    assert_eq!(
-        bytes,
-        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r"
-    );
-    Ok(())
-}
-
-#[test]
-fn fo_write_parse_round_trip() -> TestResult {
-    // Round-trip: serialize → parse → compare
-    // flags_0a_raw encodes all the tone/shift wire fields
-    let channel = ChannelMemory {
-        rx_frequency: Frequency::new(145_000_000),
-        tx_offset: Frequency::new(600_000),
-        step_size: StepSize::Hz5000,
-        mode_flags_raw: 0,
-        shift: ShiftDirection::DOWN,
-        flags_0a_raw: 0x02, // shift- = 2
-        tone_code: ToneCode::new(8)?,
-        ctcss_code: ToneCode::new(8)?,
-        dcs_code: DcsCode::new(0)?,
-        cross_tone_combo: CrossToneType::DcsOff,
-        digital_squelch: FlashDigitalSquelch::Off,
-        urcall: ChannelName::new("CQCQCQ")?,
-        data_mode: 0,
-    };
-    let bytes = protocol::serialize(&Command::SetFrequencyFull {
-        band: Band::A,
-        channel: channel.clone(),
-    });
-    let frame = strip_cr(&bytes)?;
-    let r = protocol::parse(frame)?;
-    let Response::FrequencyFull {
-        band,
-        channel: parsed,
-    } = r
-    else {
-        return Err(format!("expected FrequencyFull, got {r:?}").into());
-    };
-    assert_eq!(band, Band::A);
-    assert_eq!(parsed.rx_frequency, channel.rx_frequency);
-    assert_eq!(parsed.flags_0a_raw(), channel.flags_0a_raw());
-    assert_eq!(parsed.urcall, channel.urcall);
-    Ok(())
-}
-
-#[test]
-fn fo_flags_0a_raw_round_trip() -> TestResult {
-    // Verify that flags_0a_raw bits are preserved through serialize/parse
-    let channel = ChannelMemory {
-        flags_0a_raw: 0x2B, // bits: 10_1011 => x2=1, x3=0, x4=1, x5=3 (011)
-        ..ChannelMemory::default()
-    };
-    let bytes = protocol::serialize(&Command::SetFrequencyFull {
-        band: Band::A,
-        channel,
-    });
-    let frame = strip_cr(&bytes)?;
-    let r = protocol::parse(frame)?;
-    let Response::FrequencyFull {
-        channel: parsed, ..
-    } = r
-    else {
-        return Err(format!("expected FrequencyFull, got {r:?}").into());
-    };
-    assert_eq!(parsed.flags_0a_raw, 0x2B);
-    Ok(())
-}
-
-#[test]
-fn fo_flags_0a_raw_clamped_on_overflow() -> TestResult {
-    // Serialize a channel with flags_0a_raw = 0xFF (all bits set),
-    // parse it back and verify the shift field (bits 2:0) is masked to 0x07.
-    // In the new wire format, byte[10] is unpacked as 6 fields:
-    // tone(7), ctcss(8), dcs(9), cross(10), reverse(11), shift(12)
-    // where shift combines bits 2:0 as a single value.
-    let channel = ChannelMemory {
-        flags_0a_raw: 0xFF,
-        ..ChannelMemory::default()
-    };
-    let bytes = protocol::serialize(&Command::SetFrequencyFull {
-        band: Band::A,
-        channel,
-    });
-    let frame = strip_cr(&bytes)?;
-    let r = protocol::parse(frame)?;
-    let Response::FrequencyFull {
-        channel: parsed, ..
-    } = r
-    else {
-        return Err(format!("expected FrequencyFull, got {r:?}").into());
-    };
-    // All boolean fields = 1, shift = 7 (0x07)
-    // flags_0a_raw = (1<<7)|(1<<6)|(1<<5)|(1<<4)|(1<<3)|7 = 0xFF
-    assert_eq!(parsed.flags_0a_raw, 0xFF);
-    Ok(())
-}
-
-#[test]
-fn serialize_fq_write() -> TestResult {
-    let channel = ChannelMemory {
-        rx_frequency: Frequency::new(145_000_000),
-        tx_offset: Frequency::new(600_000),
-        step_size: StepSize::Hz5000,
-        mode_flags_raw: 0,
-        shift: ShiftDirection::DOWN,
-        flags_0a_raw: 0x02, // shift- = 2
-        tone_code: ToneCode::new(8)?,
-        ctcss_code: ToneCode::new(8)?,
-        dcs_code: DcsCode::new(0)?,
-        cross_tone_combo: CrossToneType::DcsOff,
-        digital_squelch: FlashDigitalSquelch::Off,
-        urcall: ChannelName::new("CQCQCQ")?,
-        data_mode: 0,
-    };
-    let bytes = protocol::serialize(&Command::SetFrequency {
-        band: Band::A,
-        channel,
-    });
-    assert_eq!(
-        bytes,
-        b"FQ 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r"
-    );
-    Ok(())
-}
-
-#[test]
-fn parse_fq_response_21_fields() -> TestResult {
+fn parse_fq_rejects_fo_shaped_response() {
     let raw = b"FQ 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00";
-    let r = protocol::parse(raw)?;
-    let Response::Frequency { band, channel } = r else {
-        return Err(format!("expected Frequency, got {r:?}").into());
-    };
-    assert_eq!(band, Band::A);
-    assert_eq!(channel.rx_frequency, Frequency::new(145_000_000));
-    Ok(())
+    assert!(protocol::parse(raw).is_err());
 }
 
 // ============================================================================
@@ -540,83 +393,6 @@ fn parse_fo_vfo_mode_all_extended_shift_values() {
     }
 }
 
-#[test]
-fn fo_vfo_extended_shift_round_trip() -> TestResult {
-    // Serialize with shift=5 (extended value in bits 2:0), parse back, verify.
-    let channel = ChannelMemory {
-        rx_frequency: Frequency::new(145_190_000),
-        tx_offset: Frequency::new(600_000),
-        step_size: StepSize::Hz5000,
-        mode_flags_raw: 0,
-        shift: ShiftDirection::new(5)?,
-        flags_0a_raw: 0x05, // shift=5 in bits 2:0
-        tone_code: ToneCode::new(8)?,
-        ctcss_code: ToneCode::new(8)?,
-        dcs_code: DcsCode::new(0)?,
-        cross_tone_combo: CrossToneType::DcsOff,
-        digital_squelch: FlashDigitalSquelch::Off,
-        urcall: ChannelName::new("CQCQCQ")?,
-        data_mode: 0,
-    };
-    let bytes = protocol::serialize(&Command::SetFrequencyFull {
-        band: Band::A,
-        channel: channel.clone(),
-    });
-    let frame = strip_cr(&bytes)?;
-    let r = protocol::parse(frame)?;
-    let Response::FrequencyFull {
-        band,
-        channel: parsed,
-    } = r
-    else {
-        return Err(format!("expected FrequencyFull, got {r:?}").into());
-    };
-    assert_eq!(band, Band::A);
-    assert_eq!(parsed.rx_frequency, channel.rx_frequency);
-    assert_eq!(parsed.flags_0a_raw & 0x07, 5);
-    assert_eq!(parsed.urcall, channel.urcall);
-    Ok(())
-}
-
-#[test]
-fn fo_vfo_tune_frequency_simulation() -> TestResult {
-    // Simulate the tune_frequency flow: read FO, modify freq, serialize, parse.
-    // Start with a VFO state that has shift=2 (shift-) at field[12].
-    let vfo_response = b"FO 0,0145190000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00";
-    let r = protocol::parse(vfo_response)?;
-    let Response::FrequencyFull { mut channel, .. } = r else {
-        return Err(format!("expected FrequencyFull, got {r:?}").into());
-    };
-
-    // Modify only the frequency (what tune_frequency does).
-    let new_freq = Frequency::new(146_520_000);
-    channel.rx_frequency = new_freq;
-
-    // Serialize the modified channel back (FO write).
-    let write_bytes = protocol::serialize(&Command::SetFrequencyFull {
-        band: Band::A,
-        channel,
-    });
-
-    // Parse the written data to verify round-trip.
-    let frame = strip_cr(&write_bytes)?;
-    let r2 = protocol::parse(frame)?;
-    let Response::FrequencyFull {
-        channel: written, ..
-    } = r2
-    else {
-        return Err(format!("expected FrequencyFull, got {r2:?}").into());
-    };
-    // New frequency should be set.
-    assert_eq!(written.rx_frequency, new_freq);
-    // Shift direction should be preserved (field[12]=2 → bits 2:0 = 2).
-    assert_eq!(written.flags_0a_raw & 0x07, 2);
-    // All other fields should be preserved.
-    assert_eq!(written.tx_offset, Frequency::new(600_000));
-    assert_eq!(written.urcall, ChannelName::new("CQCQCQ")?);
-    Ok(())
-}
-
 // ============================================================================
 // FQ: Short (2-field) response
 // ============================================================================
@@ -626,11 +402,11 @@ fn parse_fq_short_response() -> TestResult {
     // FQ read can return a short 2-field response: band,frequency.
     let raw = b"FQ 0,0145190000";
     let r = protocol::parse(raw)?;
-    let Response::Frequency { band, channel } = r else {
+    let Response::Frequency { band, frequency } = r else {
         return Err(format!("expected Frequency, got {r:?}").into());
     };
     assert_eq!(band, Band::A);
-    assert_eq!(channel.rx_frequency, Frequency::new(145_190_000));
+    assert_eq!(frequency, Frequency::new(145_190_000));
     Ok(())
 }
 

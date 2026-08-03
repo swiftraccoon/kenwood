@@ -130,7 +130,7 @@ squelch: Squelch level on band A (or: squelch b)
 power: Transmit power on band A (or: power b)
 att (attenuator): Attenuator on or off (or: att b)
 meter: Signal strength meter, S0 to S9 (or: meter b)
-lock: Key lock on or off
+lock: Unavailable; no verified CAT key-lock operation
 dualband: Dual band display on or off
 bt (bluetooth): Bluetooth on or off
 vox: Voice-operated transmit on or off
@@ -141,7 +141,6 @@ mode a fm: Set mode. Options: fm, nfm, am, dv, lsb, usb, cw, dr, wfm
 squelch a 3: Set squelch level, 0 through 5
 power a high: Set power. Options: high, medium, low, extra-low
 att a on: Set attenuator on or off
-lock on: Set key lock on or off
 dualband on: Set dual band on or off
 band b: Switch the operation band (a or b)
 ifout if: Stream band B IF to a computer (af restores audio)
@@ -256,7 +255,7 @@ An optional second word sets the speed, 1200 or 9600.";
 
 const BEACONTYPE_HELP: &str = "beacontype: Read or set the firmware beacon type.
 Usage: beacontype reads the current setting.
-beacontype off, manual, ptt, auto, or smart sets it.
+beacontype manual, ptt, auto, or smart sets it.
 Auto, smart, and ptt make the radio transmit by itself while the
 TNC is in APRS mode, so those settings ask for transmit confirmation.";
 
@@ -280,10 +279,9 @@ Example: meter
 Example: meter b
 Related commands: squelch, status";
 
-const LOCK_HELP: &str = "lock: Read or set the key lock state.
-Syntax: lock [on or off]
-Example: lock
-Example: lock on
+const LOCK_HELP: &str = "lock: Key lock is unavailable through verified CAT operations.
+The LC mnemonic controls LCD backlight mode, not key lock.
+Use the radio menu for key-lock configuration.
 Related commands: status";
 
 const BAND_HELP: &str = "band: Read or set the operation band.
@@ -429,7 +427,7 @@ Example: last all";
 
 const STATUS_HELP: &str = "status: Dump the full radio state in one block.
 Syntax: status
-Reads model, firmware, battery, clock, lock, both bands' settings.
+Reads model, firmware, battery, clock, and both bands' settings.
 Takes 2 to 3 seconds because it issues many CAT commands.
 Example: status";
 

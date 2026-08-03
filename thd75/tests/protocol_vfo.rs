@@ -38,7 +38,6 @@ fn serialize_ag_write() {
     // AG write is bare (no band), 3-digit zero-padded per KI4LAX.
     assert_eq!(
         protocol::serialize(&Command::SetAfGain {
-            band: Band::A,
             level: AfGainLevel::new(15)
         }),
         b"AG 015\r"
@@ -46,14 +45,12 @@ fn serialize_ag_write() {
 }
 
 #[test]
-fn serialize_ag_write_band_b() {
-    // Band is ignored; AG is global. 3-digit zero-padded.
+fn serialize_ag_write_upper_bound() {
     assert_eq!(
         protocol::serialize(&Command::SetAfGain {
-            band: Band::B,
-            level: AfGainLevel::new(39)
+            level: AfGainLevel::new(200)
         }),
-        b"AG 039\r"
+        b"AG 200\r"
     );
 }
 
@@ -75,6 +72,11 @@ fn parse_ag_low() -> TestResult {
     };
     assert_eq!(level, AfGainLevel::new(5));
     Ok(())
+}
+
+#[test]
+fn parse_ag_rejects_out_of_range_value() {
+    assert!(protocol::parse(b"AG 201").is_err());
 }
 
 // ============================================================================
@@ -267,7 +269,7 @@ fn serialize_ft_read() {
 
 #[test]
 fn parse_ft_response_bare() -> TestResult {
-    let r = protocol::parse(b"FT 2")?;
+    let r = protocol::parse(b"FT 1")?;
     let Response::FunctionType { enabled } = r else {
         return Err(format!("expected FunctionType, got {r:?}").into());
     };
@@ -276,14 +278,9 @@ fn parse_ft_response_bare() -> TestResult {
 }
 
 #[test]
-fn parse_ft_response_with_band_prefix() -> TestResult {
-    // Backward compatibility: handle "band,data" format in response
-    let r = protocol::parse(b"FT 0,2")?;
-    let Response::FunctionType { enabled } = r else {
-        return Err(format!("expected FunctionType, got {r:?}").into());
-    };
-    assert!(enabled);
-    Ok(())
+fn parse_ft_rejects_non_boolean_and_band_prefix() {
+    assert!(protocol::parse(b"FT 2").is_err());
+    assert!(protocol::parse(b"FT 0,1").is_err());
 }
 
 // ============================================================================
@@ -351,10 +348,7 @@ fn serialize_sh_write_ssb() -> TestResult {
 
 #[test]
 fn serialize_up() {
-    assert_eq!(
-        protocol::serialize(&Command::FrequencyUp { band: Band::A }),
-        b"UP 0\r"
-    );
+    assert_eq!(protocol::serialize(&Command::FrequencyUp), b"UP\r");
 }
 
 // ============================================================================
@@ -411,4 +405,9 @@ fn parse_ra_disabled() -> TestResult {
     assert_eq!(band, Band::B);
     assert!(!enabled);
     Ok(())
+}
+
+#[test]
+fn parse_ra_rejects_non_boolean() {
+    assert!(protocol::parse(b"RA 0,2").is_err());
 }

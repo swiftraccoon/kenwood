@@ -3,7 +3,7 @@
 use kenwood_thd75::protocol::programming;
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;
-use kenwood_thd75::types::Band;
+use kenwood_thd75::types::{BacklightControl, Band};
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -72,15 +72,15 @@ fn mock_modify_page_sequence(
 }
 
 #[tokio::test]
-async fn lock_control() -> TestResult {
+async fn backlight_control() -> TestResult {
     let mut mock = MockTransport::new();
-    // Wire LC 0 = locked on D75 (inverted); get_lock() returns true.
-    mock.expect(b"LC\r", b"LC 0\r");
-    // set_lock(false) → unlocked → sends wire LC 1 (inverted).
-    mock.expect(b"LC 1\r", b"LC 1\r");
+    mock.expect(b"LC\r", b"LC 2\r");
+    mock.expect(b"LC 3\r", b"LC 3\r");
     let mut radio = Radio::connect(mock).await?;
-    assert!(radio.get_lock().await?);
-    radio.set_lock(false).await?;
+    assert_eq!(radio.get_backlight_control().await?, BacklightControl::Auto);
+    radio
+        .set_backlight_control(BacklightControl::AutoDcIn)
+        .await?;
     Ok(())
 }
 
@@ -134,8 +134,10 @@ async fn attenuator_control() -> TestResult {
 #[tokio::test]
 async fn auto_info_control() -> TestResult {
     let mut mock = MockTransport::new();
+    mock.expect(b"AI\r", b"AI 0\r");
     mock.expect(b"AI 1\r", b"AI 1\r");
     let mut radio = Radio::connect(mock).await?;
+    assert!(!radio.get_auto_info().await?);
     radio.set_auto_info(true).await?;
     Ok(())
 }
@@ -147,25 +149,6 @@ async fn scan_resume() -> TestResult {
     let mut radio = Radio::connect(mock).await?;
     radio
         .set_scan_resume(kenwood_thd75::types::ScanResumeMethod::CarrierOperated)
-        .await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn set_lock_full() -> TestResult {
-    let mut mock = MockTransport::new();
-    // set_lock_full(true, ...) → locked=true inverted to wire 0.
-    mock.expect(b"LC 0,2,1,0,1,0\r", b"LC 0\r");
-    let mut radio = Radio::connect(mock).await?;
-    radio
-        .set_lock_full(
-            true,
-            kenwood_thd75::types::KeyLockType::try_from(2)?,
-            true,
-            false,
-            true,
-            false,
-        )
         .await?;
     Ok(())
 }
@@ -253,9 +236,9 @@ async fn set_vox_via_mcp_enables() -> TestResult {
     Ok(())
 }
 
-// NOTE: `set_lock_via_mcp` no longer exists. MCP offset 0x1060 is
-// `radio.BacklightControl` in the MCP-D75 registry, and the lock state
-// is runtime-only (CAT LC/DL, covered by `lock_control` above).
+// NOTE: `set_lock_via_mcp` no longer exists. MCP offset 0x1060 and CAT LC
+// both control `radio.BacklightControl`; no key-lock state operation is
+// currently verified.
 
 #[tokio::test(start_paused = true)]
 async fn set_bluetooth_via_mcp_enables() -> TestResult {
@@ -300,22 +283,23 @@ async fn set_beep_via_mcp_preserves_other_bytes() -> TestResult {
 #[tokio::test]
 async fn frequency_down() -> TestResult {
     let mut mock = MockTransport::new();
-    // DW 0 steps frequency down on Band A; radio echoes DW\r.
-    mock.expect(b"DW 0\r", b"DW\r");
+    // Resolve the current context, then issue the only accepted bare DW action.
+    mock.expect(b"BC\r", b"BC 0\r");
+    mock.expect(b"DW\r", b"DW\r");
     // Then we read back the new frequency.
     mock.expect(b"FQ 0\r", b"FQ 0,0144000000\r");
     let mut radio = Radio::connect(mock).await?;
-    let ch = radio.frequency_down(Band::A).await?;
-    assert_eq!(ch.rx_frequency.as_hz(), 144_000_000);
+    let frequency = radio.frequency_down().await?;
+    assert_eq!(frequency.as_hz(), 144_000_000);
     Ok(())
 }
 
 #[tokio::test]
 async fn frequency_down_blind() -> TestResult {
     let mut mock = MockTransport::new();
-    mock.expect(b"DW 0\r", b"DW\r");
+    mock.expect(b"DW\r", b"DW\r");
     let mut radio = Radio::connect(mock).await?;
-    radio.frequency_down_blind(Band::A).await?;
+    radio.frequency_down_blind().await?;
     Ok(())
 }
 

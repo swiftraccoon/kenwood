@@ -38,7 +38,7 @@
 //! captures the top-level Menu, returns to the reviewed masked dual-band home
 //! profile, and proves a second status-02 refusal did not reopen Menu. It then
 //! dispatches harmless route 991 in one zero-hold command, proves the exact
-//! Firmware Version / V1.03 page, and restores the same masked home profile.
+//! Version / V1.03.AZM page, and restores the same masked home profile.
 //! Full-frame equality remains evidence, not a verdict, because the stock home
 //! screen contains a clock and volatile status icons. Only that live canary
 //! qualifies zero-hold routing for the exhaustive audit.
@@ -82,9 +82,11 @@
 //!
 //! ```text
 //! cargo run -p kenwood-thd75 --release --example automation_audit -- \
+//!   --port /dev/cu.usbmodem1234 --output-dir /private/path/new-audit-directory
+//! cargo run -p kenwood-thd75 --release --example automation_audit -- \
 //!   --device TH-D75 --output-dir /private/path/new-audit-directory
 //! cargo run -p kenwood-thd75 --release --example automation_audit -- \
-//!   --device TH-D75 --output-dir /private/path/smoke --menu 991
+//!   --port /dev/cu.usbmodem1234 --output-dir /private/path/smoke --menu 991
 //! ```
 
 // Keep every workspace example dependency represented under the workspace's
@@ -131,7 +133,9 @@ mod macos {
         v103_selection_bands,
     };
     use kenwood_thd75::screen::vision::{NormalizedBounds, TextObservation, require_unique_text};
-    use kenwood_thd75::transport::BluetoothTransport;
+    use kenwood_thd75::transport::{
+        BluetoothTransport, EitherTransport, SerialTransport, Transport,
+    };
     use kenwood_thd75::types::{Band, FlashChannel, FlashDuplex, MemoryMode, VfoMemoryMode};
     use serde_json::{Value, json};
 
@@ -493,9 +497,60 @@ mod macos {
     ];
     const OBJECT_ROWS: [&str; 3] = ["Object1", "Object2", "Object3"];
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Endpoint {
+        Bluetooth(String),
+        Usb(String),
+    }
+
+    impl Endpoint {
+        const fn kind(&self) -> &'static str {
+            match self {
+                Self::Bluetooth(_) => "bluetooth",
+                Self::Usb(_) => "usb-cdc",
+            }
+        }
+
+        fn device_name(&self) -> Option<&str> {
+            match self {
+                Self::Bluetooth(device_name) => Some(device_name),
+                Self::Usb(_) => None,
+            }
+        }
+
+        fn port(&self) -> Option<&str> {
+            match self {
+                Self::Bluetooth(_) => None,
+                Self::Usb(port) => Some(port),
+            }
+        }
+
+        const fn pre_mcp_transport_policy(&self) -> PreMcpTransportPolicy {
+            match self {
+                Self::Bluetooth(_) => PreMcpTransportPolicy::ReuseQualifiedLink,
+                Self::Usb(_) => PreMcpTransportPolicy::ReopenUsbCdcAndIdentify,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PreMcpTransportPolicy {
+        ReuseQualifiedLink,
+        ReopenUsbCdcAndIdentify,
+    }
+
+    impl PreMcpTransportPolicy {
+        const fn action(self) -> &'static str {
+            match self {
+                Self::ReuseQualifiedLink => "reuse-qualified-link",
+                Self::ReopenUsbCdcAndIdentify => "close-reopen-and-prove-exact-identity",
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct Config {
-        device_name: String,
+        endpoint: Endpoint,
         output_dir: PathBuf,
         only_menu: Option<String>,
         start_menu: Option<String>,
@@ -768,6 +823,13 @@ mod macos {
         observations: Vec<TextObservation>,
         selected: Vec<String>,
         crc32: u32,
+    }
+
+    #[derive(Debug)]
+    struct InitialHomeState {
+        dual_band_baseline: CapturedScreen,
+        operation_band: Band,
+        single_band_baseline: Option<CapturedScreen>,
     }
 
     #[derive(Debug)]
@@ -1056,19 +1118,27 @@ mod macos {
             coverage,
         )?;
 
-        let bluetooth_started = Instant::now();
-        let transport = BluetoothTransport::open(Some(&config.device_name))?;
+        let transport_started = Instant::now();
+        let transport = open_transport(&config.endpoint)?;
         journal.append(json!({
-            "type": "bluetooth-open",
-            "elapsed_ms": millis(bluetooth_started.elapsed()),
-            "transport_policy": "library-owned-two-attempt-maximum; one fresh-helper retry only after NotFound",
+            "type": "transport-open",
+            "transport": config.endpoint.kind(),
+            "device_name": config.endpoint.device_name(),
+            "port": config.endpoint.port(),
+            "elapsed_ms": millis(transport_started.elapsed()),
+            "transport_policy": match &config.endpoint {
+                Endpoint::Bluetooth(_) => "library-owned-two-attempt-maximum; one fresh-helper retry only after NotFound",
+                Endpoint::Usb(_) => "exact-explicit-serial-path-at-default-USB-CDC-baud",
+            },
             "daemon_or_global_bluetooth_process_manipulated": false,
             "result": "pass",
         }))?;
         let mut radio = Radio::connect(transport).await?;
         let mut summary = Summary::default();
+        let pre_mcp_transport_policy = config.endpoint.pre_mcp_transport_policy();
         let result = execute_audit(
             &mut radio,
+            pre_mcp_transport_policy,
             &config.output_dir,
             &entries,
             expected_value_total,
@@ -1142,7 +1212,9 @@ mod macos {
     ) -> AuditResult<()> {
         journal.append(json!({
             "type": "session-start",
-            "device_name": config.device_name,
+            "transport": config.endpoint.kind(),
+            "device_name": config.endpoint.device_name(),
+            "port": config.endpoint.port(),
             "output_dir": config.output_dir,
             "manifest_total": manifest_total,
             "selected_total": selected_total,
@@ -1184,7 +1256,7 @@ mod macos {
                     "missing-snapshot": "status-02-command-3-result-2-no-release",
                     "changed-context": "top-menu-snapshot-then-MENU-to-home-then-refused-MENU-probe",
                     "command-4-zero-prefix-refusal": "top-menu-snapshot-then-MENU-to-home-then-R991-status-02-guard1-completed0-mask00",
-                    "zero-hold-route": "one-start-guard-then-atomic-991-to-exact-Firmware-Version-V1.03-page-then-masked-dual-band-home-restoration",
+                    "zero-hold-route": "one-start-guard-then-atomic-991-to-exact-Version-V1.03.AZM-page-then-masked-dual-band-home-restoration",
                     "zero-hold-qualified-only-after-live-canary": true,
                     "post-refusal-screen": "reviewed-v1.03-masked-dual-band-home-oracle",
                 },
@@ -1229,7 +1301,7 @@ mod macos {
     }
 
     async fn read_menu_134_pri_pages(
-        radio: &mut Radio<BluetoothTransport>,
+        radio: &mut Radio<EitherTransport>,
     ) -> AuditResult<([u8; programming::PAGE_SIZE], [u8; programming::PAGE_SIZE])> {
         let pages = radio
             .read_sparse_memory_pages(&[MENU_134_FLAG_PAGE, MENU_134_DATA_PAGE])
@@ -1292,7 +1364,7 @@ mod macos {
     }
 
     async fn setup_menu_134_pri(
-        radio: &mut Radio<BluetoothTransport>,
+        radio: &mut Radio<EitherTransport>,
         journal: &mut Journal,
         plan: &Menu134PriPlan,
     ) -> AuditResult<()> {
@@ -1384,7 +1456,7 @@ mod macos {
     }
 
     async fn restore_menu_134_pri(
-        radio: &mut Radio<BluetoothTransport>,
+        radio: &mut Radio<EitherTransport>,
         journal: &mut Journal,
         plan: &Menu134PriPlan,
         setup_succeeded: bool,
@@ -1485,12 +1557,12 @@ mod macos {
     }
 
     async fn qualify_menu_134_home<'a>(
-        radio: &'a mut Radio<BluetoothTransport>,
+        radio: &'a mut Radio<EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         baseline: &CapturedScreen,
         phase: &str,
-    ) -> AuditResult<AutomationSession<'a, BluetoothTransport>> {
+    ) -> AuditResult<AutomationSession<'a, EitherTransport>> {
         let qualification_started = Instant::now();
         let mut session = radio.qualify_automation().await?;
         journal.append(json!({
@@ -1546,7 +1618,8 @@ mod macos {
         reason = "the Menu 134 transaction keeps its durable intent, qualification, one-page audit, and unconditional cleanup in one visible fail-safe sequence"
     )]
     async fn audit_menu_134_transaction(
-        radio: &mut Radio<BluetoothTransport>,
+        radio: &mut Radio<EitherTransport>,
+        pre_mcp_transport_policy: PreMcpTransportPolicy,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -1557,6 +1630,13 @@ mod macos {
         let attempted_before = summary.attempted;
         journal.set_active_menu(Some("134"));
         let inspection = async {
+            prepare_transport_for_mcp(
+                radio,
+                pre_mcp_transport_policy,
+                journal,
+                "after-menu-automation-before-menu-134-prerequisite-read",
+            )
+            .await?;
             require_menu_134_priority_scan_off(snapshot_bool_field(
                 before,
                 "radio.PriorityScan",
@@ -1658,7 +1738,13 @@ mod macos {
                 .await
                 .map_err(|error| -> AuditError { Box::new(error) })
         } else {
-            Ok(())
+            prepare_transport_for_mcp(
+                radio,
+                pre_mcp_transport_policy,
+                journal,
+                "after-menu-134-automation-before-pri-restoration",
+            )
+            .await
         };
         let restoration = restore_menu_134_pri(radio, journal, &plan, setup_succeeded).await;
         let cleanup = combine_primary_and_cleanup_errors(
@@ -1676,7 +1762,7 @@ mod macos {
     }
 
     async fn record_recoverable_menu_failure(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         baseline: &CapturedScreen,
@@ -1732,7 +1818,7 @@ mod macos {
     }
 
     async fn audit_menu_chunk(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entries: &[&MenuEntry],
@@ -1803,7 +1889,7 @@ mod macos {
     }
 
     async fn prepare_transient_menu_state(
-        radio: &mut Radio<BluetoothTransport>,
+        radio: &mut Radio<EitherTransport>,
         entries: &[&MenuEntry],
         journal: &mut Journal,
     ) -> AuditResult<Option<TransientRadioState>> {
@@ -1893,7 +1979,7 @@ mod macos {
     }
 
     async fn restore_transient_menu_state(
-        radio: &mut Radio<BluetoothTransport>,
+        radio: &mut Radio<EitherTransport>,
         state: TransientRadioState,
         journal: &mut Journal,
         phase: &str,
@@ -1945,7 +2031,8 @@ mod macos {
         reason = "the explicit drop ends AutomationSession's exclusive Radio borrow before the bounded Menu 134 MCP transaction"
     )]
     async fn execute_audit(
-        radio: &mut Radio<BluetoothTransport>,
+        radio: &mut Radio<EitherTransport>,
+        pre_mcp_transport_policy: PreMcpTransportPolicy,
         output_dir: &Path,
         entries: &[&MenuEntry],
         expected_value_total: usize,
@@ -1956,13 +2043,15 @@ mod macos {
         summary: &mut Summary,
     ) -> AuditResult<()> {
         enum InitialSessionOutcome {
-            Ready(CapturedScreen),
+            Ready(InitialHomeState),
             Failed {
                 primary: AuditError,
                 in_session_recovery: AuditResult<()>,
                 reconnect_needed: bool,
                 in_session_phase: &'static str,
                 reconnect_phase: &'static str,
+                dual_band_baseline: Option<CapturedScreen>,
+                single_band_baseline: Option<CapturedScreen>,
             },
         }
 
@@ -1979,6 +2068,8 @@ mod macos {
         let initial_session_outcome = {
             let qualification_started = Instant::now();
             let mut session = radio.qualify_automation().await?;
+            let mut single_band_baseline = None;
+            let mut home_normalization_started = false;
             let abi = session.abi();
             journal.append(json!({
                 "type": "qualification",
@@ -2024,7 +2115,14 @@ mod macos {
                     }),
                 )?;
 
-                let baseline = normalize_to_home(&mut session, output_dir, journal).await?;
+                home_normalization_started = true;
+                let baseline = normalize_to_home_tracking_single_band(
+                    &mut session,
+                    output_dir,
+                    journal,
+                    &mut single_band_baseline,
+                )
+                .await?;
                 let baseline_profile = compare_dual_band_home(&baseline, &baseline)?;
                 journal_home_comparison(
                     journal,
@@ -2042,11 +2140,23 @@ mod macos {
                 "hidden_volatile_state_covered": false,
                 "result": "pass",
                 }))?;
-                Ok::<CapturedScreen, AuditError>(baseline)
+                let operation_band = observed_operation_band(&baseline).ok_or_else(|| {
+                    io::Error::other(
+                        "initial home screen did not expose one unambiguous PTT/operation-band marker",
+                    )
+                })?;
+                journal.append(json!({
+                    "type": "operation-band-screen-oracle",
+                    "phase": "initial-home",
+                    "operation_band": format!("{operation_band:?}"),
+                    "basis": "PTT-marker-rendered-in-exactly-one-reviewed-band-status-row",
+                    "result": "pass",
+                }))?;
+                Ok::<(CapturedScreen, Band), AuditError>((baseline, operation_band))
             }
             .await;
             match initial_preparation {
-                Ok(baseline) => {
+                Ok((baseline, operation_band)) => {
                     let canary_result = async {
                         verify_changed_context_guard_canary(
                             &mut session,
@@ -2072,62 +2182,134 @@ mod macos {
                     }
                     .await;
                     match canary_result {
-                        Ok(()) => InitialSessionOutcome::Ready(baseline),
+                        Ok(()) => InitialSessionOutcome::Ready(InitialHomeState {
+                            dual_band_baseline: baseline,
+                            operation_band,
+                            single_band_baseline,
+                        }),
                         Err(primary) => {
                             let in_session_recovery = if session.is_valid() {
-                                best_effort_home_recovery(
+                                let dual_band_recovery = best_effort_home_recovery(
                                     &mut session,
                                     output_dir,
                                     journal,
                                     &baseline,
                                     "after-pre-audit-canary-failure",
                                 )
-                                .await
+                                .await;
+                                let display_mode_recovery = if dual_band_recovery.is_ok() {
+                                    if let Some(single_band_baseline) =
+                                        single_band_baseline.as_ref()
+                                    {
+                                        restore_startup_single_band_profile(
+                                            &mut session,
+                                            output_dir,
+                                            journal,
+                                            single_band_baseline,
+                                            "after-pre-audit-canary-failure",
+                                        )
+                                        .await
+                                    } else {
+                                        Ok(())
+                                    }
+                                } else {
+                                    Ok(())
+                                };
+                                combine_primary_and_cleanup_errors(
+                                    Ok(()),
+                                    [
+                                        ("dual-band-home-recovery", dual_band_recovery),
+                                        ("startup-display-mode-restoration", display_mode_recovery),
+                                    ],
+                                )
                             } else {
                                 Ok(())
                             };
+                            let reconnect_needed =
+                                !session.is_valid() || in_session_recovery.is_err();
                             InitialSessionOutcome::Failed {
                                 primary,
                                 in_session_recovery,
-                                reconnect_needed: !session.is_valid(),
+                                reconnect_needed,
                                 in_session_phase: "pre-audit-canary-in-session-ui-recovery",
                                 reconnect_phase: "after-pre-audit-canary-reconnect",
+                                dual_band_baseline: Some(baseline),
+                                single_band_baseline,
                             }
                         }
                     }
                 }
                 Err(primary_error) => {
                     journal.set_active_menu(None);
-                    let in_session_recovery = if session.is_valid() {
-                        normalize_to_home(&mut session, output_dir, journal)
-                            .await
-                            .map(|_| ())
+                    let in_session_recovery = if session.is_valid() && home_normalization_started {
+                        let dual_band_recovery = normalize_to_home_tracking_single_band(
+                            &mut session,
+                            output_dir,
+                            journal,
+                            &mut single_band_baseline,
+                        )
+                        .await
+                        .map(|_| ());
+                        let display_mode_recovery = if dual_band_recovery.is_ok() {
+                            if let Some(single_band_baseline) = single_band_baseline.as_ref() {
+                                restore_startup_single_band_profile(
+                                    &mut session,
+                                    output_dir,
+                                    journal,
+                                    single_band_baseline,
+                                    "initial-preparation-failure",
+                                )
+                                .await
+                            } else {
+                                Ok(())
+                            }
+                        } else {
+                            Ok(())
+                        };
+                        combine_primary_and_cleanup_errors(
+                            Ok(()),
+                            [
+                                ("dual-band-home-recovery", dual_band_recovery),
+                                ("startup-display-mode-restoration", display_mode_recovery),
+                            ],
+                        )
                     } else {
                         Ok(())
                     };
+                    let reconnect_needed = !session.is_valid() || in_session_recovery.is_err();
                     InitialSessionOutcome::Failed {
                         primary: primary_error,
                         in_session_recovery,
-                        reconnect_needed: !session.is_valid(),
+                        reconnect_needed,
                         in_session_phase: "initial-preparation-in-session-ui-recovery",
                         reconnect_phase: "initial-preparation-reconnect",
+                        dual_band_baseline: None,
+                        single_band_baseline,
                     }
                 }
             }
         };
-        let initial_baseline = match initial_session_outcome {
-            InitialSessionOutcome::Ready(baseline) => baseline,
+        let initial_home = match initial_session_outcome {
+            InitialSessionOutcome::Ready(initial_home) => initial_home,
             InitialSessionOutcome::Failed {
                 primary,
                 in_session_recovery,
                 reconnect_needed,
                 in_session_phase,
                 reconnect_phase,
+                dual_band_baseline,
+                single_band_baseline,
             } => {
                 let reconnect_recovery = if reconnect_needed {
-                    reconnect_and_normalize_home(radio, output_dir, journal, reconnect_phase)
-                        .await
-                        .map(|_| ())
+                    reconnect_and_restore_initial_home_profile(
+                        radio,
+                        output_dir,
+                        journal,
+                        dual_band_baseline.as_ref(),
+                        single_band_baseline.as_ref(),
+                        reconnect_phase,
+                    )
+                    .await
                 } else {
                     Ok(())
                 };
@@ -2140,23 +2322,24 @@ mod macos {
                 );
             }
         };
-        let initial_operation_band =
-            observed_operation_band(&initial_baseline).ok_or_else(|| {
-                io::Error::other(
-                    "initial home screen did not expose one unambiguous PTT/operation-band marker",
-                )
-            })?;
-        journal.append(json!({
-            "type": "operation-band-screen-oracle",
-            "phase": "initial-home",
-            "operation_band": format!("{:?}", initial_operation_band),
-            "basis": "PTT-marker-rendered-in-exactly-one-reviewed-band-status-row",
-            "result": "pass",
-        }))?;
+        let InitialHomeState {
+            dual_band_baseline: initial_baseline,
+            operation_band: initial_operation_band,
+            single_band_baseline,
+        } = initial_home;
 
-        let before_result =
+        let before_result = async {
+            prepare_transport_for_mcp(
+                radio,
+                pre_mcp_transport_policy,
+                journal,
+                "after-initial-automation-before-audit-snapshot",
+            )
+            .await?;
             read_configuration_snapshot(radio, output_dir, snapshot_pages, journal, "before-audit")
-                .await;
+                .await
+        }
+        .await;
 
         let (audit_result, recovery_result, transient_state_restore_result) = match &before_result {
             Err(error) => (
@@ -2307,7 +2490,13 @@ mod macos {
                                 drop(session);
                                 let Menu134AuditOutcome { primary, cleanup } =
                                     audit_menu_134_transaction(
-                                        radio, output_dir, journal, entry, &baseline, before,
+                                        radio,
+                                        pre_mcp_transport_policy,
+                                        output_dir,
+                                        journal,
+                                        entry,
+                                        &baseline,
+                                        before,
                                         summary,
                                     )
                                     .await;
@@ -2507,9 +2696,18 @@ mod macos {
         // These cleanup checks are deliberately attempted even when a menu
         // entry fails. A primary navigation/validation error must never hide
         // whether the declared MCP configuration scope changed.
-        let after_result =
+        let after_result = async {
+            prepare_transport_for_mcp(
+                radio,
+                pre_mcp_transport_policy,
+                journal,
+                "after-menu-automation-before-final-snapshot",
+            )
+            .await?;
             read_configuration_snapshot(radio, output_dir, snapshot_pages, journal, "after-audit")
-                .await;
+                .await
+        }
+        .await;
         let nonmutation_result = match (&before_result, &after_result) {
             (Ok(before), Ok(after)) => require_configuration_unchanged(before, after, journal),
             (Err(before_error), Err(after_error)) => Err(io::Error::other(format!(
@@ -2544,11 +2742,7 @@ mod macos {
             }))?;
             let final_home = normalize_to_home(&mut session, output_dir, journal).await?;
             let comparison = compare_dual_band_home(&final_home, &initial_baseline)?;
-            let final_operation_band = observed_operation_band(&final_home).ok_or_else(|| {
-                io::Error::other(
-                    "final home screen did not expose one unambiguous PTT/operation-band marker",
-                )
-            })?;
+            let final_operation_band = observed_operation_band(&final_home);
             journal_home_comparison(
                 journal,
                 "post-final-mcp",
@@ -2560,19 +2754,42 @@ mod macos {
             journal.append(json!({
                 "type": "operation-band-screen-oracle",
                 "phase": "post-final-mcp",
-                "operation_band": format!("{:?}", final_operation_band),
+                "operation_band": final_operation_band.map(|band| format!("{band:?}")),
                 "expected_operation_band": format!("{:?}", initial_operation_band),
                 "basis": "PTT-marker-rendered-in-exactly-one-reviewed-band-status-row",
-                "result": if final_operation_band == initial_operation_band { "pass" } else { "fail" },
+                "result": if final_operation_band == Some(initial_operation_band) { "pass" } else { "fail" },
             }))?;
-            if comparison.restored() && final_operation_band == initial_operation_band {
+            let dual_band_restoration = if comparison.restored()
+                && final_operation_band == Some(initial_operation_band)
+            {
                 Ok(())
             } else {
                 Err(io::Error::other(
                     "final post-MCP screen did not restore the reviewed V1.03 dual-band home profile and operation-band marker",
                 )
                 .into())
-            }
+            };
+            let display_mode_restoration = if let Some(single_band_baseline) =
+                single_band_baseline.as_ref()
+            {
+                restore_startup_single_band_profile(
+                    &mut session,
+                    output_dir,
+                    journal,
+                    single_band_baseline,
+                    "post-final-mcp",
+                )
+                .await
+            } else {
+                Ok(())
+            };
+            combine_primary_and_cleanup_errors(
+                Ok(()),
+                [
+                    ("dual-band-home-restoration", dual_band_restoration),
+                    ("startup-display-mode-restoration", display_mode_restoration),
+                ],
+            )
         }
         .await;
 
@@ -2675,7 +2892,7 @@ mod macos {
     }
 
     async fn verify_changed_context_guard_canary(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         baseline: &CapturedScreen,
@@ -2775,7 +2992,7 @@ mod macos {
     }
 
     async fn verify_zero_hold_batch_route_canary(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         baseline: &CapturedScreen,
@@ -2803,7 +3020,7 @@ mod macos {
             "type": "automation-zero-hold-route-canary-intent",
             "route": "991",
             "expected_title": anchor_page_title(firmware_entry),
-            "expected_value": "V1.03",
+            "expected_value": "V1.03.AZM",
             "expected_restoration": "reviewed-v1.03-masked-dual-band-home-oracle",
             "runtime_qualified_before_canary": true,
             "zero_hold_behavior_qualified_before_canary": false,
@@ -2834,7 +3051,7 @@ mod macos {
         let payload = firmware_version_payload(&value);
         if !title_match || payload.is_none() {
             return Err(io::Error::other(
-                "V1.03.AZM zero-hold route 991 did not produce the exact Firmware Version / V1.03 information page",
+                "V1.03.AZM zero-hold route 991 did not produce the exact Version / V1.03.AZM information page",
             )
             .into());
         }
@@ -2860,7 +3077,7 @@ mod macos {
             "type": "automation-zero-hold-route-qualification",
             "route": "991",
             "physical_behavior": "three-synchronous-zero-hold-press-release-pairs",
-            "screen_result": "exact-Firmware-Version-title-and-V1.03-value",
+            "screen_result": "exact-Version-title-and-V1.03.AZM-value",
             "restoration": "reviewed-v1.03-masked-dual-band-home-oracle",
             "host_ocr_io_to_key_race_removed": true,
             "residual_concurrent_framebuffer_writer_toctou": true,
@@ -2874,7 +3091,7 @@ mod macos {
         reason = "the live command-4 canary keeps its intent, fresh lease, exact receipt checks, evidence, and masked home-screen proof together for auditability"
     )]
     async fn verify_zero_prefix_batch_refusal_canary(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         baseline: &CapturedScreen,
@@ -2997,7 +3214,7 @@ mod macos {
     }
 
     async fn capture_canary_quiescent(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         stem: &str,
@@ -3029,7 +3246,7 @@ mod macos {
     }
 
     async fn audit_menu_102(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -3060,7 +3277,7 @@ mod macos {
     }
 
     async fn prepare_menu_102_runtime(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         baseline: &CapturedScreen,
@@ -3157,7 +3374,7 @@ mod macos {
     }
 
     async fn audit_entry(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -3274,7 +3491,7 @@ mod macos {
     /// OCR, BMP write, journal write, or host transport turn occurs between
     /// digits.
     async fn dispatch_complete_menu_number(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         evidence_menu_number: &str,
@@ -3331,7 +3548,7 @@ mod macos {
     }
 
     async fn audit_direct_value(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -3429,7 +3646,7 @@ mod macos {
     }
 
     async fn direct_value_page_payload(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -3464,7 +3681,7 @@ mod macos {
     }
 
     async fn complete_numbered_row_payload(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -3499,7 +3716,7 @@ mod macos {
     }
 
     async fn enter_direct_value_page(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -3552,7 +3769,7 @@ mod macos {
     }
 
     async fn audit_row_only(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -3615,7 +3832,7 @@ mod macos {
     }
 
     async fn audit_safe_inspection(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -3728,7 +3945,7 @@ mod macos {
     }
 
     async fn enter_safe_inspection_page(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -3774,7 +3991,7 @@ mod macos {
     }
 
     async fn audit_91a_value(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -3859,7 +4076,7 @@ mod macos {
     }
 
     async fn prove_numbered_row_after_value(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -3898,7 +4115,7 @@ mod macos {
     }
 
     async fn open_complete_anchor_row(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         anchor: &MenuEntry,
@@ -3955,7 +4172,7 @@ mod macos {
     }
 
     async fn navigate_from_anchor_row(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         manifest: &[MenuEntry],
@@ -4081,7 +4298,7 @@ mod macos {
     }
 
     async fn navigate_submenus(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         ordered: &[(&str, &str)],
@@ -4119,7 +4336,7 @@ mod macos {
     }
 
     async fn navigate_rows(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         ordered: &[&MenuEntry],
@@ -4177,7 +4394,7 @@ mod macos {
     }
 
     async fn navigate_selected_labels(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         ordered: &[(&str, &str)],
@@ -4209,7 +4426,7 @@ mod macos {
     }
 
     async fn tap_capture_selected_exact(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         key: FrontPanelKey,
@@ -4228,9 +4445,25 @@ mod macos {
     }
 
     async fn normalize_to_home(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
+    ) -> AuditResult<CapturedScreen> {
+        let mut single_band_baseline = None;
+        normalize_to_home_tracking_single_band(
+            session,
+            output_dir,
+            journal,
+            &mut single_band_baseline,
+        )
+        .await
+    }
+
+    async fn normalize_to_home_tracking_single_band(
+        session: &mut AutomationSession<'_, EitherTransport>,
+        output_dir: &Path,
+        journal: &mut Journal,
+        single_band_baseline: &mut Option<CapturedScreen>,
     ) -> AuditResult<CapturedScreen> {
         let mut screen =
             capture_screen(session, output_dir, journal, "initial-state", None).await?;
@@ -4254,6 +4487,41 @@ mod macos {
                 }))?;
                 return Ok(baseline);
             }
+            if is_reviewed_single_band_home(&screen) {
+                if single_band_baseline.is_none() {
+                    *single_band_baseline = Some(screen.clone());
+                }
+                journal.append(json!({
+                    "type": "home-normalization-intent",
+                    "source_profile": "reviewed-v1.03-single-band-analog-home",
+                    "transition": ["F", "A/B"],
+                    "documented_semantics": "toggle-single-dual-band-display",
+                    "persistent_mcp_configuration_changed": false,
+                }))?;
+                tap_function_ab_toggle(
+                    session,
+                    journal,
+                    "normalize-reviewed-single-band-home-to-dual-band",
+                )
+                .await?;
+                tokio::time::sleep(SETTLE_DELAY).await;
+                let dual_band = capture_screen(
+                    session,
+                    output_dir,
+                    journal,
+                    "normalize-single-to-dual",
+                    None,
+                )
+                .await?;
+                if !is_operating_screen(&dual_band, None) {
+                    return Err(io::Error::other(
+                        "F then A/B did not convert the reviewed single-band analog home screen to a dual-band operating screen",
+                    )
+                    .into());
+                }
+                screen = dual_band;
+                continue;
+            }
             let (key, purpose) = menu_exit_key(&screen).ok_or_else(|| {
                 io::Error::other(
                     "initial screen is neither an operating screen nor a recognized menu context",
@@ -4274,7 +4542,7 @@ mod macos {
     }
 
     async fn capture_home_quiescent(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         stem: &str,
@@ -4326,7 +4594,7 @@ mod macos {
     }
 
     async fn restore_home(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         menu_number: &str,
@@ -4407,7 +4675,7 @@ mod macos {
     }
 
     async fn restore_menu_102_runtime(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         baseline: &CapturedScreen,
@@ -4497,7 +4765,7 @@ mod macos {
     }
 
     async fn restore_menu_102_dual_band(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         baseline: &CapturedScreen,
@@ -4534,7 +4802,7 @@ mod macos {
     }
 
     async fn finish_menu_102_runtime_restore(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         baseline: &CapturedScreen,
@@ -4594,7 +4862,7 @@ mod macos {
     }
 
     async fn reconnect_and_normalize_home(
-        radio: &mut Radio<BluetoothTransport>,
+        radio: &mut Radio<EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         phase: &str,
@@ -4636,8 +4904,60 @@ mod macos {
         normalize_to_home(&mut session, output_dir, journal).await
     }
 
+    async fn reconnect_and_restore_initial_home_profile(
+        radio: &mut Radio<EitherTransport>,
+        output_dir: &Path,
+        journal: &mut Journal,
+        dual_band_baseline: Option<&CapturedScreen>,
+        single_band_baseline: Option<&CapturedScreen>,
+        phase: &str,
+    ) -> AuditResult<()> {
+        let recovered = reconnect_and_normalize_home(radio, output_dir, journal, phase).await?;
+        let dual_band_recovery = if let Some(baseline) = dual_band_baseline {
+            let comparison = compare_dual_band_home(&recovered, baseline)?;
+            journal_home_comparison(journal, phase, None, &recovered, baseline, &comparison)?;
+            if comparison.restored() {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "initial-session reconnect did not restore the qualified dual-band home baseline",
+                )
+                .into())
+            }
+        } else {
+            Ok(())
+        };
+        let display_mode_recovery = if let Some(baseline) = single_band_baseline {
+            let qualification_started = Instant::now();
+            let mut session = radio.qualify_automation().await?;
+            journal.append(json!({
+                "type": "qualification",
+                "phase": format!("{phase}-startup-display-mode-restoration"),
+                "first_cat_or_mcp_operation": false,
+                "elapsed_ms": millis(qualification_started.elapsed()),
+                "abi": {
+                    "version": session.abi().version,
+                    "features": session.abi().features,
+                    "max_key": session.abi().max_key,
+                    "max_phase": session.abi().max_phase,
+                },
+            }))?;
+            restore_startup_single_band_profile(&mut session, output_dir, journal, baseline, phase)
+                .await
+        } else {
+            Ok(())
+        };
+        combine_primary_and_cleanup_errors(
+            Ok(()),
+            [
+                ("dual-band-home-recovery", dual_band_recovery),
+                ("startup-display-mode-restoration", display_mode_recovery),
+            ],
+        )
+    }
+
     async fn reconnect_and_recover_home(
-        radio: &mut Radio<BluetoothTransport>,
+        radio: &mut Radio<EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         baseline: &CapturedScreen,
@@ -4735,7 +5055,7 @@ mod macos {
     }
 
     async fn best_effort_home_recovery(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         baseline: &CapturedScreen,
@@ -4781,7 +5101,7 @@ mod macos {
     }
 
     async fn tap(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         journal: &mut Journal,
         key: FrontPanelKey,
         purpose: &str,
@@ -4812,7 +5132,7 @@ mod macos {
     }
 
     async fn tap_function_ab_toggle(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         journal: &mut Journal,
         purpose: &str,
     ) -> AuditResult<()> {
@@ -4839,10 +5159,56 @@ mod macos {
         Ok(())
     }
 
+    async fn restore_startup_single_band_profile(
+        session: &mut AutomationSession<'_, EitherTransport>,
+        output_dir: &Path,
+        journal: &mut Journal,
+        baseline: &CapturedScreen,
+        phase: &str,
+    ) -> AuditResult<()> {
+        journal.append(json!({
+            "type": "startup-display-mode-restoration-intent",
+            "phase": phase,
+            "startup_display_mode": "single-band",
+            "transition": ["F", "A/B"],
+            "persistent_mcp_configuration_changed": false,
+        }))?;
+        tap_function_ab_toggle(session, journal, "restore-startup-single-band-display-mode")
+            .await?;
+        tokio::time::sleep(SETTLE_DELAY).await;
+        let restored = capture_screen(
+            session,
+            output_dir,
+            journal,
+            &format!("{phase}-single-band-restored"),
+            None,
+        )
+        .await?;
+        let profile_matches = reviewed_single_band_home_matches(&restored, baseline);
+        journal.append(json!({
+            "type": "startup-display-mode-restoration",
+            "phase": phase,
+            "startup_display_mode": "single-band",
+            "baseline_crc32": format!("{:08X}", baseline.crc32),
+            "restored_crc32": format!("{:08X}", restored.crc32),
+            "frequency_and_operation_band_match": profile_matches,
+            "persistent_mcp_configuration_changed": false,
+            "result": if profile_matches { "pass" } else { "fail" },
+        }))?;
+        if profile_matches {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "F then A/B did not restore the reviewed startup single-band home profile",
+            )
+            .into())
+        }
+    }
+
     /// Capture and validate the one raw V1.03.AZM snapshot consumed by a complete
     /// numeric route, without performing OCR, file output, or journal I/O.
     async fn capture_numeric_route_snapshot(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         qualified_menu: &CapturedScreen,
     ) -> AuditResult<(AutomationSnapshot, u128, Duration)> {
         let capture_started_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
@@ -5003,7 +5369,7 @@ mod macos {
     }
 
     async fn capture_quiescent(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         stem: &str,
@@ -5024,7 +5390,7 @@ mod macos {
     }
 
     async fn capture_screen(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         suffix: &str,
@@ -5179,28 +5545,55 @@ mod macos {
     }
 
     fn parse_args() -> AuditResult<Config> {
-        let mut device_name = "TH-D75".to_owned();
+        parse_args_from(std::env::args().skip(1))
+    }
+
+    fn parse_args_from(args: impl IntoIterator<Item = String>) -> AuditResult<Config> {
+        let mut device_name = None;
+        let mut port = None;
         let mut output_dir = None;
         let mut only_menu = None;
         let mut start_menu = None;
         let mut limit = None;
-        let mut args = std::env::args().skip(1);
+        let mut args = args.into_iter();
         while let Some(argument) = args.next() {
             let value = args
                 .next()
                 .ok_or_else(|| invalid_input(format!("{argument} requires a value")))?;
+            if value.is_empty() || value.starts_with("--") {
+                return Err(invalid_input(format!("{argument} requires a value")));
+            }
             match argument.as_str() {
-                "--device" => device_name = value,
+                "--device" if device_name.is_none() => device_name = Some(value),
+                "--port" if port.is_none() => port = Some(value),
                 "--output-dir" if output_dir.is_none() => output_dir = Some(PathBuf::from(value)),
                 "--menu" if only_menu.is_none() => only_menu = Some(value),
                 "--start" if start_menu.is_none() => start_menu = Some(value),
                 "--limit" if limit.is_none() => limit = Some(value.parse()?),
-                "--output-dir" | "--menu" | "--start" | "--limit" => {
+                "--device" | "--port" | "--output-dir" | "--menu" | "--start" | "--limit" => {
                     return Err(invalid_input(format!("duplicate argument {argument}")));
                 }
                 _ => return Err(invalid_input(format!("unknown argument {argument}"))),
             }
         }
+        let endpoint = match (device_name, port) {
+            (Some(_), Some(_)) => {
+                return Err(invalid_input("--port and --device are mutually exclusive"));
+            }
+            (Some(device_name), None) => Endpoint::Bluetooth(device_name),
+            (None, Some(port)) => {
+                if !Path::new(&port).is_absolute() {
+                    return Err(invalid_input("--port must be an absolute path"));
+                }
+                if SerialTransport::is_bluetooth_port(&port) {
+                    return Err(invalid_input(
+                        "--port requires a USB CDC path; use --device for native Bluetooth",
+                    ));
+                }
+                Endpoint::Usb(port)
+            }
+            (None, None) => Endpoint::Bluetooth("TH-D75".to_owned()),
+        };
         if only_menu.is_some() && (start_menu.is_some() || limit.is_some()) {
             return Err(invalid_input(
                 "--menu cannot be combined with --start or --limit",
@@ -5210,12 +5603,58 @@ mod macos {
             return Err(invalid_input("--limit must be greater than zero"));
         }
         Ok(Config {
-            device_name,
+            endpoint,
             output_dir: output_dir.ok_or_else(|| invalid_input("--output-dir is required"))?,
             only_menu,
             start_menu,
             limit,
         })
+    }
+
+    fn open_transport(endpoint: &Endpoint) -> AuditResult<EitherTransport> {
+        match endpoint {
+            Endpoint::Bluetooth(device_name) => Ok(EitherTransport::Bluetooth(
+                BluetoothTransport::open(Some(device_name))?,
+            )),
+            Endpoint::Usb(port) => Ok(EitherTransport::Serial(SerialTransport::open(
+                port,
+                SerialTransport::DEFAULT_BAUD,
+            )?)),
+        }
+    }
+
+    async fn apply_pre_mcp_transport_policy<T: Transport>(
+        radio: &mut Radio<T>,
+        policy: PreMcpTransportPolicy,
+    ) -> Result<(), kenwood_thd75::Error> {
+        match policy {
+            PreMcpTransportPolicy::ReuseQualifiedLink => Ok(()),
+            PreMcpTransportPolicy::ReopenUsbCdcAndIdentify => radio.reconnect().await,
+        }
+    }
+
+    async fn prepare_transport_for_mcp<T: Transport>(
+        radio: &mut Radio<T>,
+        policy: PreMcpTransportPolicy,
+        journal: &mut Journal,
+        phase: &str,
+    ) -> AuditResult<()> {
+        let started = Instant::now();
+        apply_pre_mcp_transport_policy(radio, policy).await?;
+        journal.append(json!({
+            "type": "pre-mcp-transport-boundary",
+            "phase": phase,
+            "action": policy.action(),
+            "usb_cdc_reopen_reason": match policy {
+                PreMcpTransportPolicy::ReuseQualifiedLink => None,
+                PreMcpTransportPolicy::ReopenUsbCdcAndIdentify => Some(
+                    "discard-the-long-lived-automation-CDC-session-before-changing-line-coding-and-entering-MCP"
+                ),
+            },
+            "sleep_or_blind_retry_used": false,
+            "elapsed_ms": millis(started.elapsed()),
+            "result": "pass",
+        }))
     }
 
     fn prepare_output_dir(path: &Path) -> AuditResult<()> {
@@ -5495,7 +5934,7 @@ mod macos {
     }
 
     async fn read_configuration_snapshot(
-        radio: &mut Radio<BluetoothTransport>,
+        radio: &mut Radio<EitherTransport>,
         output_dir: &Path,
         expected_pages: &[u16],
         journal: &mut Journal,
@@ -7377,6 +7816,38 @@ mod macos {
             && anchor.is_none_or(|text| has_exact_text(&screen.observations, text))
     }
 
+    fn is_reviewed_single_band_home(screen: &CapturedScreen) -> bool {
+        let frequencies = home_frequency_anchors(screen);
+        let frequency_center_px = frequencies
+            .first()
+            .map(|anchor| (anchor.bounds.y() + anchor.bounds.height() / 2.0) * SCREEN_HEIGHT_F32);
+        frequencies.len() == 1
+            && frequency_center_px.is_some_and(|center| (45.0..=90.0).contains(&center))
+            && screen.selected.is_empty()
+            && screen_has_known_analog_mode(screen)
+            && observed_operation_band(screen).is_some()
+            && !baseline_has_disallowed_home_layout(screen)
+    }
+
+    fn reviewed_single_band_home_matches(
+        screen: &CapturedScreen,
+        baseline: &CapturedScreen,
+    ) -> bool {
+        let frequencies = home_frequency_anchors(screen);
+        let baseline_frequencies = home_frequency_anchors(baseline);
+        is_reviewed_single_band_home(screen)
+            && is_reviewed_single_band_home(baseline)
+            && frequencies
+                .first()
+                .zip(baseline_frequencies.first())
+                .is_some_and(|(actual, expected)| {
+                    frequencies.len() == 1
+                        && baseline_frequencies.len() == 1
+                        && actual.canonical == expected.canonical
+                })
+            && observed_operation_band(screen) == observed_operation_band(baseline)
+    }
+
     fn is_reviewed_single_band_b_home(
         screen: &CapturedScreen,
         dual_band_baseline: &CapturedScreen,
@@ -7879,9 +8350,14 @@ mod macos {
             .iter()
             .filter(|observation| observation.confidence() >= MIN_OCR_CONFIDENCE)
             .filter(|observation| (0.15..0.85).contains(&observation.bounds().y()))
-            .filter(|observation| canonical_text(observation.text()) == "v1.03")
+            .filter(|observation| {
+                canonical_text(observation.text())
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .eq("v1.03.azm".chars())
+            })
             .count();
-        (version_count == 1).then(|| vec!["Firmware=V1.03".to_owned()])
+        (version_count == 1).then(|| vec!["Firmware=V1.03.AZM".to_owned()])
     }
 
     fn ordinary_documented_payload(
@@ -8512,7 +8988,7 @@ mod macos {
     }
 
     async fn audit_scrollable_checkbox_payload(
-        session: &mut AutomationSession<'_, BluetoothTransport>,
+        session: &mut AutomationSession<'_, EitherTransport>,
         output_dir: &Path,
         journal: &mut Journal,
         entry: &MenuEntry,
@@ -9213,47 +9689,201 @@ mod macos {
             APRS_ICON_NAMES, AuditClass, CTCSS_FREQUENCIES, ConfigurationSnapshot, CoverageScope,
             DESTRUCTIVE_ACTION_NUMBERS, EXPECTED_CONFIGURATION_SNAPSHOT_FIELD_COUNT,
             EXPECTED_CONFIGURATION_SNAPSHOT_PAGE_COUNT, EXPECTED_MCP_TOTAL_PAGE_COUNT,
-            EXPECTED_MENU_COUNT, EXPECTED_SAFE_INSPECTION_COUNT, HOME_MASK_INCLUDED_PIXELS,
-            HOME_MASK_SIGNAL_METER_RECT, MENU_134_DATA_PAGE, MENU_134_FLAG_PAGE,
-            MENU_134_PRI_CHANNEL, MENU_134_PRI_FLAG_OFFSET, MENU_134_PRI_RECORD_OFFSET,
-            MENU_134_WX1_CHANNEL, MENU_134_WX1_FLAG_OFFSET, MENU_134_WX1_RECORD_OFFSET,
-            MENU_134_WX1_RX_HZ, MULTI_RECORD_EDITOR_NUMBERS, MY_POSITION_ROWS,
-            Menu134PriDisposition, POSITION_COMMENTS, REVIEWED_MANUAL, ROW_ONLY_NUMBERS,
-            RowOnlyPolicy, SAFE_INSPECTION_NUMBERS, SafeInspectionOracle, Summary,
-            aligned_use_marker, anchor_page_title, battery_level_payload, canonical_value_text,
+            EXPECTED_MENU_COUNT, EXPECTED_SAFE_INSPECTION_COUNT, Endpoint,
+            HOME_MASK_INCLUDED_PIXELS, HOME_MASK_SIGNAL_METER_RECT, MENU_134_DATA_PAGE,
+            MENU_134_FLAG_PAGE, MENU_134_PRI_CHANNEL, MENU_134_PRI_FLAG_OFFSET,
+            MENU_134_PRI_RECORD_OFFSET, MENU_134_WX1_CHANNEL, MENU_134_WX1_FLAG_OFFSET,
+            MENU_134_WX1_RECORD_OFFSET, MENU_134_WX1_RX_HZ, MULTI_RECORD_EDITOR_NUMBERS,
+            MY_POSITION_ROWS, Menu134PriDisposition, POSITION_COMMENTS, PreMcpTransportPolicy,
+            REVIEWED_MANUAL, ROW_ONLY_NUMBERS, RowOnlyPolicy, SAFE_INSPECTION_NUMBERS,
+            SafeInspectionOracle, Summary, aligned_use_marker, anchor_page_title,
+            apply_pre_mcp_transport_policy, battery_level_payload, canonical_value_text,
             category_parts, centered_scalar_documented_payload, checkbox_payload,
             checkbox_row_has_unique_label, checkbox_row_label_matches, class_for,
             combine_primary_and_cleanup_errors, compare_dual_band_home,
             configuration_snapshot_pages, configuration_snapshots_match, coverage_scope,
             direct_access_keys, dv_gateway_callsign_payload, dynamic_date_time_payload,
             entry_has_typed_value_oracle, entry_value_identity, eq_payload,
-            has_one_rendered_bottom_left_control, has_reviewed_safe_title,
-            is_restoration_top_level_menu, is_reviewed_single_band_b_home, is_safe_back_context,
-            is_top_level_menu, journal_screen_text, looks_like_bluetooth_address,
-            looks_like_bluetooth_device_class, looks_like_date, looks_like_time,
-            looks_like_utc_offset, manifest_entry, masked_home_bytes,
-            menu_710_is_exact_reviewed_singleton, menu_710_singleton_memory_submenu_matches,
-            menu_935_bluetooth_address_identity, menu_935_bluetooth_class_identity,
-            network_payload, normalized_menu_935_bluetooth_address,
-            numbered_row_documented_payload, numbered_row_matches, observed_operation_band,
-            ordered_home_anchor_texts_match, ordinary_documented_payload, parse_eq_frequency,
-            parse_eq_level, parse_frequency_khz, parse_menu_manifest, plan_menu_134_pri_pages,
+            firmware_version_payload, has_one_rendered_bottom_left_control,
+            has_reviewed_safe_title, is_restoration_top_level_menu, is_reviewed_single_band_b_home,
+            is_reviewed_single_band_home, is_safe_back_context, is_top_level_menu,
+            journal_screen_text, looks_like_bluetooth_address, looks_like_bluetooth_device_class,
+            looks_like_date, looks_like_time, looks_like_utc_offset, manifest_entry,
+            masked_home_bytes, menu_710_is_exact_reviewed_singleton,
+            menu_710_singleton_memory_submenu_matches, menu_935_bluetooth_address_identity,
+            menu_935_bluetooth_class_identity, network_payload,
+            normalized_menu_935_bluetooth_address, numbered_row_documented_payload,
+            numbered_row_matches, observed_operation_band, ordered_home_anchor_texts_match,
+            ordinary_documented_payload, parse_args_from, parse_eq_frequency, parse_eq_level,
+            parse_frequency_khz, parse_menu_manifest, plan_menu_134_pri_pages,
             plan_menu_134_restore_pages, recoverable_menu_failures_result, require_conclusive,
             require_exact_short_text, require_menu_134_priority_scan_off, retained_ui_label_alias,
-            row_only_anchor, row_only_policy, safe_inspection_oracle, safe_inspection_title,
-            screen_has_exact_menu_locator, screen_matches_label, scrollable_checkbox_labels,
-            selected_matches_label, selected_matches_label_for_menu, sha256_hex, speed_payload,
-            three_frames_are_identical, validate_manifest,
+            reviewed_single_band_home_matches, row_only_anchor, row_only_policy,
+            safe_inspection_oracle, safe_inspection_title, screen_has_exact_menu_locator,
+            screen_matches_label, scrollable_checkbox_labels, selected_matches_label,
+            selected_matches_label_for_menu, sha256_hex, speed_payload, three_frames_are_identical,
+            validate_manifest,
         };
+        use kenwood_thd75::Radio;
         use kenwood_thd75::memory::MCP_D75_MENU_FIELDS;
         use kenwood_thd75::protocol::programming;
         use kenwood_thd75::radio::automation::FrontPanelKey;
         use kenwood_thd75::screen::ui::{V103_SELECTION_RGB565, v103_selection_bands};
         use kenwood_thd75::screen::vision::{NormalizedBounds, TextObservation};
         use kenwood_thd75::screen::{SCREEN_BYTES, SCREEN_WIDTH, ScreenFrame};
+        use kenwood_thd75::transport::MockTransport;
         use kenwood_thd75::types::{FlashChannel, FlashDuplex, Frequency, MemoryMode};
 
         type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+        fn parse_cli(arguments: &[&str]) -> Result<super::Config, super::AuditError> {
+            parse_args_from(arguments.iter().map(|argument| (*argument).to_owned()))
+        }
+
+        #[test]
+        fn cli_defaults_to_the_existing_named_bluetooth_endpoint() -> TestResult {
+            let config = parse_cli(&["--output-dir", "/private/tmp/audit"])?;
+            assert_eq!(config.endpoint, Endpoint::Bluetooth("TH-D75".to_owned()));
+            Ok(())
+        }
+
+        #[test]
+        fn cli_accepts_an_explicit_usb_cdc_port_for_scoped_menu_audits() -> TestResult {
+            let config = parse_cli(&[
+                "--port",
+                "/dev/cu.usbmodem1234",
+                "--output-dir",
+                "/private/tmp/audit",
+                "--menu",
+                "991",
+            ])?;
+            assert_eq!(
+                config.endpoint,
+                Endpoint::Usb("/dev/cu.usbmodem1234".to_owned())
+            );
+            assert_eq!(
+                config.endpoint.pre_mcp_transport_policy(),
+                PreMcpTransportPolicy::ReopenUsbCdcAndIdentify
+            );
+            assert_eq!(config.only_menu.as_deref(), Some("991"));
+            Ok(())
+        }
+
+        #[test]
+        fn cli_preserves_an_explicit_bluetooth_device_name() -> TestResult {
+            let config = parse_cli(&[
+                "--device",
+                "Workshop D75",
+                "--output-dir",
+                "/private/tmp/audit",
+            ])?;
+            assert_eq!(
+                config.endpoint,
+                Endpoint::Bluetooth("Workshop D75".to_owned())
+            );
+            assert_eq!(
+                config.endpoint.pre_mcp_transport_policy(),
+                PreMcpTransportPolicy::ReuseQualifiedLink
+            );
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn usb_pre_mcp_boundary_reopens_then_completes_mcp_and_cat_recovery() -> TestResult {
+            let mut mock = MockTransport::new();
+            let page: u16 = 0x0010;
+            let page_bytes = [0x5A; programming::PAGE_SIZE];
+            let [page_hi, page_lo] = page.to_be_bytes();
+            let mut page_response = vec![b'W', page_hi, page_lo, 0, 0];
+            page_response.extend_from_slice(&page_bytes);
+
+            mock.expect_reopen(Ok(()));
+            mock.expect_reopen(Ok(()));
+            mock.expect(b"ID\r", b"ID TH-D75\r");
+            mock.expect(programming::ENTER_PROGRAMMING, b"0M\r");
+            mock.expect(&programming::build_read_command(page), &page_response);
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+            mock.expect(b"E", &[programming::ACK]);
+            mock.expect(b"ID\r", b"ID TH-D75\r");
+            mock.expect(b"ID\r", b"ID TH-D75\r");
+            let mut radio = Radio::connect(mock).await?;
+
+            apply_pre_mcp_transport_policy(
+                &mut radio,
+                PreMcpTransportPolicy::ReopenUsbCdcAndIdentify,
+            )
+            .await?;
+
+            let pages = radio.read_sparse_memory_pages(&[page]).await?;
+            assert_eq!(pages, vec![(page, page_bytes)]);
+            let identity = radio.identify().await?;
+            assert_eq!(identity.model, "TH-D75");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn bluetooth_pre_mcp_boundary_reuses_the_qualified_link() -> TestResult {
+            let mut mock = MockTransport::new();
+            mock.expect(b"ID\r", b"ID TH-D75\r");
+            let mut radio = Radio::connect(mock).await?;
+
+            apply_pre_mcp_transport_policy(&mut radio, PreMcpTransportPolicy::ReuseQualifiedLink)
+                .await?;
+
+            let identity = radio.identify().await?;
+            assert_eq!(identity.model, "TH-D75");
+            Ok(())
+        }
+
+        #[test]
+        fn cli_rejects_usb_and_bluetooth_endpoints_together_in_either_order() {
+            for arguments in [
+                [
+                    "--port",
+                    "/dev/cu.usbmodem1234",
+                    "--device",
+                    "TH-D75",
+                    "--output-dir",
+                    "/private/tmp/audit",
+                ],
+                [
+                    "--device",
+                    "TH-D75",
+                    "--port",
+                    "/dev/cu.usbmodem1234",
+                    "--output-dir",
+                    "/private/tmp/audit",
+                ],
+            ] {
+                let error = parse_cli(&arguments)
+                    .expect_err("USB and Bluetooth endpoints must be mutually exclusive")
+                    .to_string();
+                assert!(error.contains("--port and --device are mutually exclusive"));
+            }
+        }
+
+        #[test]
+        fn cli_rejects_non_absolute_or_bluetooth_serial_paths() {
+            let relative = parse_cli(&[
+                "--port",
+                "cu.usbmodem1234",
+                "--output-dir",
+                "/private/tmp/audit",
+            ])
+            .expect_err("relative serial path must fail")
+            .to_string();
+            assert!(relative.contains("--port must be an absolute path"));
+
+            let bluetooth = parse_cli(&[
+                "--port",
+                "/dev/cu.TH-D75",
+                "--output-dir",
+                "/private/tmp/audit",
+            ])
+            .expect_err("Bluetooth serial alias must not be accepted as USB")
+            .to_string();
+            assert!(bluetooth.contains("--port requires a USB CDC path"));
+        }
 
         fn audit_error(message: &'static str) -> super::AuditResult<()> {
             Err(std::io::Error::other(message).into())
@@ -13407,6 +14037,127 @@ mod macos {
             ));
             Ok(())
         }
+
+        #[test]
+        fn startup_single_band_oracle_requires_one_top_row_frequency_analog_mode_and_ptt_marker()
+        -> TestResult {
+            let frame = ScreenFrame::from_rgb565_le(vec![0_u8; SCREEN_BYTES])?;
+            let make_screen = |frequency_centers: &[f32],
+                               header: Option<&str>|
+             -> Result<_, super::AuditError> {
+                let mut observations = Vec::new();
+                if let Some(header) = header {
+                    observations.push(TextObservation::new(
+                        header,
+                        1.0,
+                        NormalizedBounds::new(0.02, 18.0 / 180.0, 0.30, 12.0 / 180.0)?,
+                    )?);
+                }
+                for (index, center) in frequency_centers.iter().copied().enumerate() {
+                    observations.push(TextObservation::new(
+                        if index == 0 { "146.900" } else { "440.000" },
+                        1.0,
+                        NormalizedBounds::new(0.05, (center - 9.0) / 180.0, 0.60, 18.0 / 180.0)?,
+                    )?);
+                }
+                Ok(super::CapturedScreen {
+                    crc32: frame.crc32(),
+                    frame: frame.clone(),
+                    observations,
+                    selected: Vec::new(),
+                })
+            };
+
+            assert!(is_reviewed_single_band_home(&make_screen(
+                &[60.0],
+                Some("PTT H FM")
+            )?));
+            assert!(!is_reviewed_single_band_home(&make_screen(
+                &[60.0],
+                Some("FM")
+            )?));
+            assert!(!is_reviewed_single_band_home(&make_screen(
+                &[60.0, 145.0],
+                Some("PTT H FM")
+            )?));
+            assert!(!is_reviewed_single_band_home(&make_screen(
+                &[120.0],
+                Some("PTT H FM")
+            )?));
+            Ok(())
+        }
+
+        #[test]
+        fn startup_single_band_restoration_requires_the_original_frequency_and_operation_band()
+        -> TestResult {
+            let frame = ScreenFrame::from_rgb565_le(vec![0_u8; SCREEN_BYTES])?;
+            let make_screen = |frequency: &str, ptt_y: f32| -> Result<_, super::AuditError> {
+                Ok(super::CapturedScreen {
+                    crc32: frame.crc32(),
+                    frame: frame.clone(),
+                    observations: vec![
+                        TextObservation::new(
+                            "PTT H FM",
+                            1.0,
+                            NormalizedBounds::new(0.02, ptt_y, 0.30, 12.0 / 180.0)?,
+                        )?,
+                        TextObservation::new(
+                            frequency,
+                            1.0,
+                            NormalizedBounds::new(0.05, (60.0 - 9.0) / 180.0, 0.60, 18.0 / 180.0)?,
+                        )?,
+                    ],
+                    selected: Vec::new(),
+                })
+            };
+
+            let baseline = make_screen("146.900", 0.10)?;
+            assert!(reviewed_single_band_home_matches(
+                &make_screen("146.900", 0.10)?,
+                &baseline
+            ));
+            assert!(!reviewed_single_band_home_matches(
+                &make_screen("147.000", 0.10)?,
+                &baseline
+            ));
+            assert!(!reviewed_single_band_home_matches(
+                &make_screen("146.900", 0.40)?,
+                &baseline
+            ));
+            Ok(())
+        }
+
+        #[test]
+        fn firmware_version_payload_requires_one_exact_azimuth_identity() -> TestResult {
+            let frame = ScreenFrame::from_rgb565_le(vec![0_u8; SCREEN_BYTES])?;
+            let make_screen = |values: &[&str]| -> Result<_, super::AuditError> {
+                let mut observations = Vec::with_capacity(values.len());
+                for (index, value) in values.iter().enumerate() {
+                    let bounds = NormalizedBounds::new(
+                        0.20,
+                        0.35 + u16::try_from(index).map_or(0.0, |value| f32::from(value) * 0.10),
+                        0.60,
+                        0.08,
+                    )?;
+                    observations.push(TextObservation::new(*value, 1.0, bounds)?);
+                }
+                Ok(super::CapturedScreen {
+                    crc32: frame.crc32(),
+                    frame: frame.clone(),
+                    observations,
+                    selected: Vec::new(),
+                })
+            };
+
+            assert_eq!(
+                firmware_version_payload(&make_screen(&["V1. 03. AZM"])?),
+                Some(vec!["Firmware=V1.03.AZM".to_owned()])
+            );
+            assert!(firmware_version_payload(&make_screen(&["V1.03"])?).is_none());
+            assert!(firmware_version_payload(&make_screen(&["V1.03.000"])?).is_none());
+            assert!(firmware_version_payload(&make_screen(&["V1.03.AZM", "V1.03.AZM"])?).is_none());
+            Ok(())
+        }
     }
 }
 
@@ -13422,6 +14173,6 @@ fn main() {
     use serde_json as _;
     use tokio as _;
 
-    eprintln!("automation_audit requires macOS native Bluetooth and Vision");
+    eprintln!("automation_audit requires macOS Vision; USB CDC and native Bluetooth are supported");
     std::process::exit(2);
 }

@@ -62,7 +62,7 @@ use kenwood_thd75::transport::{SerialTransport, Transport};
 type BackupError = Box<dyn StdError + Send + Sync>;
 type BackupResult<T> = Result<T, BackupError>;
 
-const CAT_BAUD: u32 = 9600;
+const CAT_BAUD: u32 = SerialTransport::DEFAULT_BAUD;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const DRAIN_QUIET_WINDOW: Duration = Duration::from_millis(30);
 const DRAIN_TOTAL_TIMEOUT: Duration = Duration::from_millis(250);
@@ -1186,12 +1186,8 @@ fn mnemonic_matches(frame: &[u8], mnemonic: &[u8]) -> bool {
 }
 
 fn validate_expected_identity(identity: &RawIdentity) -> BackupResult<()> {
-    let expected = RawIdentity {
-        id: b"ID TH-D75".to_vec(),
-        firmware: b"FV 1.03".to_vec(),
-        radio_type: b"TY K,2".to_vec(),
-    };
-    if identity == &expected {
+    let firmware_supported = matches!(identity.firmware.as_slice(), b"FV 1.03" | b"FV 1.03.AZM");
+    if identity.id == b"ID TH-D75" && firmware_supported && identity.radio_type == b"TY K,2" {
         Ok(())
     } else {
         Err(invalid_input(format!(
@@ -1237,6 +1233,13 @@ fn validate_cat_safety_subset(
     }
 }
 
+fn page_progress(page: u16, total: u16) -> (u32, u32, u32) {
+    let completed = u32::from(page) + 1;
+    let total = u32::from(total);
+    let percent = completed.saturating_mul(100) / total.max(1);
+    (completed, total, percent)
+}
+
 async fn read_image_with_interrupt_recovery<T: Transport>(
     radio: &mut Radio<T>,
     termination: &mut TerminationListener,
@@ -1244,8 +1247,7 @@ async fn read_image_with_interrupt_recovery<T: Transport>(
     let interrupt_result = {
         let read = radio.read_memory_image_with_progress(|page, total| {
             if page % 100 == 0 || page == total.saturating_sub(1) {
-                let completed = page.saturating_add(1);
-                let percent = completed.saturating_mul(100) / total;
+                let (completed, total, percent) = page_progress(page, total);
                 eprint!("\r  Page {completed}/{total} ({percent}%)");
             }
         });
@@ -1509,6 +1511,13 @@ mod tests {
     }
 
     #[test]
+    fn full_image_progress_uses_a_wide_intermediate() {
+        assert_eq!(page_progress(0, 1_955), (1, 1_955, 0));
+        assert_eq!(page_progress(700, 1_955), (701, 1_955, 35));
+        assert_eq!(page_progress(1_954, 1_955), (1_955, 1_955, 100));
+    }
+
+    #[test]
     fn identity_and_limited_cat_safety_subset_are_exact() {
         let identity = RawIdentity {
             id: b"ID TH-D75".to_vec(),
@@ -1516,6 +1525,13 @@ mod tests {
             radio_type: b"TY K,2".to_vec(),
         };
         assert!(validate_expected_identity(&identity).is_ok());
+
+        let azimuth_firmware = RawIdentity {
+            id: b"ID TH-D75".to_vec(),
+            firmware: b"FV 1.03.AZM".to_vec(),
+            radio_type: b"TY K,2".to_vec(),
+        };
+        assert!(validate_expected_identity(&azimuth_firmware).is_ok());
 
         let extended_firmware = RawIdentity {
             firmware: b"FV 1.03.000".to_vec(),

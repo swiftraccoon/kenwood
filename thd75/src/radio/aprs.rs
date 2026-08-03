@@ -13,7 +13,8 @@
 //!
 //! - **AS**: TNC baud rate (1200/9600)
 //! - **PT**: Beacon TX control mode
-//! - **MS**: Position source / message send (overloaded mnemonic)
+//! - **MS**: My Position selection
+//! - **CS**: APRS My Callsign
 //! - **AE**: Serial number info (not actually APRS-related, but shares the A prefix)
 //! - **BE**: Sends an APRS beacon (transmits on air, so it requires a valid
 //!   amateur licence and appropriate authorisation; use deliberately)
@@ -21,11 +22,51 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::{BeaconMode, TncBaud};
+use crate::types::{AprsCallsign, BeaconMode, MyPositionSelection, TncBaud};
 
 use super::Radio;
 
 impl<T: Transport> Radio<T> {
+    /// Read the APRS My Callsign value (CS read).
+    ///
+    /// This is the live CAT view of MCP `aprs.MyCallsign`; it is not a
+    /// D-STAR slot selector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the callsign response is invalid.
+    pub async fn get_aprs_callsign(&mut self) -> Result<AprsCallsign, Error> {
+        tracing::debug!("reading APRS My Callsign");
+        let response = self.execute(Command::GetAprsCallsign).await?;
+        match response {
+            Response::AprsCallsign { callsign } => Ok(callsign),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "AprsCallsign".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Write the APRS My Callsign value (CS write).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the radio rejects the value or returns an
+    /// unexpected response. Persistence across a power cycle has not yet been
+    /// dynamically qualified, so callers should verify with
+    /// [`get_aprs_callsign`](Self::get_aprs_callsign).
+    pub async fn set_aprs_callsign(&mut self, callsign: AprsCallsign) -> Result<(), Error> {
+        tracing::info!(callsign = callsign.as_str(), "setting APRS My Callsign");
+        let response = self.execute(Command::SetAprsCallsign { callsign }).await?;
+        match response {
+            Response::AprsCallsign { .. } => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "AprsCallsign".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
     /// Get the TNC baud rate (AS read).
     ///
     /// Returns 0 = 1200 baud, 1 = 9600 baud.
@@ -49,11 +90,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns the current beacon transmission mode:
     ///
-    /// - `0` = Off (no automatic beaconing)
-    /// - `1` = Manual (beacon sent only when explicitly triggered)
-    /// - `2` = PTT (beacon sent after each PTT release)
-    /// - `3` = Auto (beacon sent at fixed intervals set by the beacon interval timer)
-    /// - `4` = `SmartBeaconing` (adaptive beaconing based on speed and direction changes)
+    /// - `0` = Manual (beacon sent only when explicitly triggered)
+    /// - `1` = PTT (beacon sent after each PTT release)
+    /// - `2` = Auto (beacon sent at fixed intervals set by the beacon interval timer)
+    /// - `3` = `SmartBeaconing` (adaptive beaconing based on speed and direction changes)
     ///
     /// # Errors
     ///
@@ -70,18 +110,18 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get the APRS position source (MS read).
+    /// Get the selected APRS/GPS My Position entry (MS read).
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_position_source(&mut self) -> Result<u8, Error> {
-        tracing::debug!("reading APRS position source");
-        let response = self.execute(Command::GetPositionSource).await?;
+    pub async fn get_my_position_selection(&mut self) -> Result<MyPositionSelection, Error> {
+        tracing::debug!("reading My Position selection");
+        let response = self.execute(Command::GetMyPositionSelection).await?;
         match response {
-            Response::PositionSource { source } => Ok(source),
+            Response::MyPositionSelection { selection } => Ok(selection),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "PositionSource".into(),
+                expected: "MyPositionSelection".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -125,35 +165,23 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Send a message via the APRS/TNC interface (MS write).
-    ///
-    /// # RF emission warning
-    ///
-    /// **This command causes the radio to transmit on the air.** The TNC will key the
-    /// transmitter and send an AX.25 packet containing the message on the currently configured
-    /// APRS frequency. Ensure you are authorized to transmit on the current frequency before
-    /// calling this method.
-    ///
-    /// The transmission is a single packet burst (not continuous like [`transmit`](super::Radio::transmit)),
-    /// but it still constitutes an RF emission that must comply with radio regulations.
+    /// Set the selected APRS/GPS My Position entry (MS write).
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn send_message(&mut self, text: &str) -> Result<(), Error> {
-        tracing::info!("sending APRS message");
+    pub async fn set_my_position_selection(
+        &mut self,
+        selection: MyPositionSelection,
+    ) -> Result<(), Error> {
+        tracing::info!(?selection, "setting My Position selection");
         let response = self
-            .execute(Command::SendMessage {
-                text: text.to_owned(),
-            })
+            .execute(Command::SetMyPositionSelection { selection })
             .await?;
         match response {
-            // MS write echoes back as an MS response, which the parser
-            // decodes as PositionSource (the MS read variant). Both use
-            // the same wire mnemonic.
-            Response::PositionSource { .. } => Ok(()),
+            Response::MyPositionSelection { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "MS (PositionSource echo from message send)".into(),
+                expected: "MyPositionSelection".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }

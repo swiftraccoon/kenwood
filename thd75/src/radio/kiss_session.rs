@@ -71,6 +71,8 @@ pub struct KissSession<T: Transport> {
     notifications: tokio::sync::broadcast::Sender<Response>,
     /// Cached timeout from the Radio.
     timeout: Duration,
+    /// Cached exact firmware identity from the Radio.
+    firmware_version: Option<String>,
     /// Cached `mode_a` from the Radio.
     mode_a: Option<super::RadioMode>,
     /// Cached `mode_b` from the Radio.
@@ -141,6 +143,7 @@ impl<T: Transport> Radio<T> {
             codec: self.codec,
             notifications: self.notifications,
             timeout: self.timeout,
+            firmware_version: self.firmware_version,
             mode_a: self.mode_a,
             mode_b: self.mode_b,
             mcp_speed: self.mcp_speed,
@@ -465,6 +468,7 @@ impl<T: Transport> KissSession<T> {
             codec: self.codec,
             notifications: self.notifications,
             timeout: self.timeout,
+            firmware_version: self.firmware_version,
             mode_a: self.mode_a,
             mode_b: self.mode_b,
             mcp_speed: self.mcp_speed,

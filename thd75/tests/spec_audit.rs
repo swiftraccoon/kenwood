@@ -2,16 +2,20 @@
 //! command reference, a JSON transcription of a third-party PDF.
 //!
 //! The reference JSON is NOT committed to the repository (unverified
-//! third-party provenance). To run these tests, set the environment
-//! variable `THD75_KI4LAX_SPEC` to the absolute path of the JSON spec:
+//! third-party provenance). Tests that read it are marked `#[ignore]`, so a
+//! default test run reports that coverage as ignored instead of passing tests
+//! whose assertions did not run. To run the external-spec comparisons, set
+//! `THD75_KI4LAX_SPEC` to the absolute path of the JSON spec and include the
+//! ignored tests:
 //!
 //! ```bash
-//! THD75_KI4LAX_SPEC=/path/to/ki4lax_cat_spec.json cargo test -p kenwood-thd75 --test spec_audit
+//! THD75_KI4LAX_SPEC=/path/to/ki4lax_cat_spec.json \
+//!   cargo test -p kenwood-thd75 --test spec_audit -- --ignored
 //! ```
 //!
-//! When the variable is unset, every test in this file returns early
-//! without running any assertions (they appear as "ok" in the output
-//! but perform no checks).
+//! That explicit ignored-test run fails when the variable is unset, the file
+//! cannot be read, or its JSON/schema is malformed. Fixture-independent
+//! protocol invariants in this target continue to run by default.
 //!
 //! Any test failure means our code disagrees with the external reference.
 //! Investigate which is correct (spec, code, or hardware) before fixing.
@@ -39,25 +43,62 @@ use tracing as _;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 type BoxErr = Box<dyn std::error::Error>;
 
-/// Load the KI4LAX spec if `THD75_KI4LAX_SPEC` is set, else `None`.
-///
-/// Returns `Err` when the env var is set but the file is unreadable or the
-/// JSON is malformed. An unset env var produces `Ok(None)`, so tests can
-/// still run without the third-party fixture.
-fn load_spec() -> Result<Option<serde_json::Value>, BoxErr> {
-    let Some(path) = std::env::var_os("THD75_KI4LAX_SPEC") else {
-        return Ok(None);
-    };
-    let data = std::fs::read_to_string(&path).map_err(|e| -> BoxErr {
+const SPEC_ENV: &str = "THD75_KI4LAX_SPEC";
+
+/// Require an explicit path for an external-spec audit run.
+fn require_spec_path(path: Option<&std::ffi::OsStr>) -> Result<&std::ffi::OsStr, BoxErr> {
+    path.ok_or_else(|| {
         format!(
-            "failed to read THD75_KI4LAX_SPEC={}: {e}",
-            path.to_string_lossy()
+            "{SPEC_ENV} is not set; ignored KI4LAX spec audits require an explicit JSON fixture"
         )
         .into()
+    })
+}
+
+/// Parse the external reference while retaining its configured path in errors.
+fn parse_spec(data: &str, path: &std::ffi::OsStr) -> Result<serde_json::Value, BoxErr> {
+    serde_json::from_str(data).map_err(|e| -> BoxErr {
+        format!("invalid JSON in {SPEC_ENV}={}: {e}", path.to_string_lossy()).into()
+    })
+}
+
+/// Load the required KI4LAX spec for an explicitly enabled audit test.
+fn load_spec() -> Result<serde_json::Value, BoxErr> {
+    let configured_path = std::env::var_os(SPEC_ENV);
+    let path = require_spec_path(configured_path.as_deref())?;
+    let data = std::fs::read_to_string(path).map_err(|e| -> BoxErr {
+        format!("failed to read {SPEC_ENV}={}: {e}", path.to_string_lossy()).into()
     })?;
-    let json: serde_json::Value = serde_json::from_str(&data)
-        .map_err(|e| -> BoxErr { format!("invalid JSON in THD75_KI4LAX_SPEC: {e}").into() })?;
-    Ok(Some(json))
+    parse_spec(&data, path)
+}
+
+#[test]
+fn missing_external_spec_path_is_rejected() -> TestResult {
+    let error = require_spec_path(None)
+        .err()
+        .ok_or("missing external spec path unexpectedly succeeded")?;
+    let message = error.to_string();
+    assert!(
+        message.contains(SPEC_ENV) && message.contains("not set"),
+        "missing-path error should identify {SPEC_ENV}: {message}"
+    );
+    Ok(())
+}
+
+#[test]
+fn malformed_external_spec_json_is_rejected() -> TestResult {
+    let path = std::ffi::OsStr::new("test-fixture.json");
+    let error = parse_spec("{not valid JSON", path)
+        .err()
+        .ok_or("malformed external spec JSON unexpectedly parsed")?;
+    let message = error.to_string();
+    assert!(
+        message.contains("invalid JSON")
+            && message.contains(SPEC_ENV)
+            && message.contains("test-fixture.json"),
+        "malformed-JSON error should identify the configured fixture: {message}"
+    );
+    Ok(())
 }
 
 /// Collect every unique mnemonic our code maps from `command_name()`.
@@ -68,7 +109,6 @@ fn our_mnemonics() -> Result<Vec<&'static str>, BoxErr> {
         command_name(&Command::GetFirmwareVersion),             // FV
         command_name(&Command::GetPowerStatus),                 // PS
         command_name(&Command::GetRadioId),                     // ID
-        command_name(&Command::GetBeep),                        // BE
         command_name(&Command::GetPowerLevel { band: Band::A }), // PC
         command_name(&Command::GetBand),                        // BC
         command_name(&Command::GetVfoMemoryMode { band: Band::A }), // VM
@@ -82,22 +122,24 @@ fn our_mnemonics() -> Result<Vec<&'static str>, BoxErr> {
         command_name(&Command::GetFilterWidth {
             mode: FilterMode::Ssb,
         }), // SH
-        command_name(&Command::FrequencyUp { band: Band::A }),  // UP
-        command_name(&Command::FrequencyDown { band: Band::A }), // DW
+        command_name(&Command::FrequencyUp),                    // UP
+        command_name(&Command::FrequencyDown),                  // DW
         command_name(&Command::GetAttenuator { band: Band::A }), // RA
         command_name(&Command::SetAutoInfo { enabled: true }),  // AI
         command_name(&Command::GetBusy { band: Band::A }),      // BY
         command_name(&Command::GetDualBand),                    // DL
-        command_name(&Command::Receive { band: Band::A }),      // RX
-        command_name(&Command::Transmit { band: Band::A }),     // TX
-        command_name(&Command::GetLock),                        // LC
+        command_name(&Command::Receive),                        // RX
+        command_name(&Command::Transmit),                       // TX
+        command_name(&Command::GetBacklightControl),            // LC
         command_name(&Command::GetIoPort),                      // IO
         command_name(&Command::GetBatteryLevel),                // BL
         command_name(&Command::GetVoxDelay),                    // VD
         command_name(&Command::GetVoxGain),                     // VG
         command_name(&Command::GetVox),                         // VX
         command_name(&Command::GetCurrentChannel { band: Band::A }), // MR
-        command_name(&Command::GetMemoryChannel { channel: 0 }), // ME
+        command_name(&Command::GetMemoryChannel {
+            selector: MemorySelector::channel(0)?,
+        }), // ME
         command_name(&Command::EnterProgrammingMode),           // 0M
         command_name(&Command::GetTncMode),                     // TN
         command_name(&Command::GetDstarCallsign {
@@ -108,22 +150,20 @@ fn our_mnemonics() -> Result<Vec<&'static str>, BoxErr> {
             mode: ScanResumeMethod::TimeOperated,
         }), // SR
         command_name(&Command::GetStepSize { band: Band::A }),  // SF
-        command_name(&Command::GetBandScope { band: Band::A }), // BS
+        command_name(&Command::GetBarAntenna),                  // BS
         command_name(&Command::GetTncBaud),                     // AS
         command_name(&Command::GetSerialInfo),                  // AE
         command_name(&Command::GetBeaconType),                  // PT
-        command_name(&Command::GetPositionSource),              // MS
+        command_name(&Command::GetMyPositionSelection),         // MS
+        command_name(&Command::GetAprsCallsign),                // CS
         command_name(&Command::GetDstarSlot),                   // DS
-        command_name(&Command::GetActiveCallsignSlot),          // CS
         command_name(&Command::GetGateway),                     // GW
         command_name(&Command::GetGpsConfig),                   // GP
         command_name(&Command::GetGpsMode),                     // GM
         command_name(&Command::GetGpsSentences),                // GS
         command_name(&Command::GetBluetooth),                   // BT
         command_name(&Command::GetSdCard),                      // SD
-        command_name(&Command::GetUserSettings),                // US
         command_name(&Command::GetRadioType),                   // TY
-        command_name(&Command::GetMcpStatus),                   // 0E
     ])
 }
 
@@ -132,10 +172,9 @@ fn our_mnemonics() -> Result<Vec<&'static str>, BoxErr> {
 // ============================================================================
 
 #[test]
+#[ignore = "requires the external fixture configured by THD75_KI4LAX_SPEC"]
 fn all_spec_mnemonics_implemented() -> TestResult {
-    let Some(spec) = load_spec()? else {
-        return Ok(());
-    };
+    let spec = load_spec()?;
     let commands = spec
         .get("commands")
         .and_then(serde_json::Value::as_object)
@@ -183,10 +222,9 @@ fn all_our_mnemonics_are_valid() -> TestResult {
 // ============================================================================
 
 #[test]
+#[ignore = "requires the external fixture configured by THD75_KI4LAX_SPEC"]
 fn document_commands_beyond_spec() -> TestResult {
-    let Some(spec) = load_spec()? else {
-        return Ok(());
-    };
+    let spec = load_spec()?;
     let commands = spec
         .get("commands")
         .and_then(serde_json::Value::as_object)
@@ -203,21 +241,18 @@ fn document_commands_beyond_spec() -> TestResult {
     // undocumented command added should be reviewed.
     let expected_extra = vec![
         "PS", // Power status
-        "BE", // Beep (firmware stub)
         "VD", // VOX delay
         "VG", // VOX gain
         "VX", // VOX enable
         "0M", // MCP programming mode
         "DC", // D-STAR callsign
-        "BS", // Band scope
+        "BS", // MW/SW bar antenna selection
         "PT", // Beacon type
         "DS", // D-STAR slot
         "GM", // GPS mode
         "GS", // GPS sentences
         "SD", // SD card
-        "US", // User settings
-        "0E", // MCP status
-        "LC", // Lock (PDF has it but we also add SetLockFull)
+        "LC", // LCD backlight control
     ];
 
     for m in &extra {
@@ -234,10 +269,9 @@ fn document_commands_beyond_spec() -> TestResult {
 // ============================================================================
 
 #[test]
+#[ignore = "requires the external fixture configured by THD75_KI4LAX_SPEC"]
 fn mode_table_matches_spec() -> TestResult {
-    let Some(spec) = load_spec()? else {
-        return Ok(());
-    };
+    let spec = load_spec()?;
     let table_d = spec
         .get("tables")
         .and_then(|t| t.get("TABLE_D"))
@@ -278,10 +312,9 @@ fn mode_table_matches_spec() -> TestResult {
 // ============================================================================
 
 #[test]
+#[ignore = "requires the external fixture configured by THD75_KI4LAX_SPEC"]
 fn step_size_table_matches_spec() -> TestResult {
-    let Some(spec) = load_spec()? else {
-        return Ok(());
-    };
+    let spec = load_spec()?;
     let table_c = spec
         .get("tables")
         .and_then(|t| t.get("TABLE_C"))
@@ -310,10 +343,9 @@ fn step_size_table_matches_spec() -> TestResult {
 // ============================================================================
 
 #[test]
+#[ignore = "requires the external fixture configured by THD75_KI4LAX_SPEC"]
 fn tone_table_matches_spec() -> TestResult {
-    let Some(spec) = load_spec()? else {
-        return Ok(());
-    };
+    let spec = load_spec()?;
     let table_a = spec
         .get("tables")
         .and_then(|t| t.get("TABLE_A"))
@@ -346,10 +378,9 @@ fn tone_table_matches_spec() -> TestResult {
 // ============================================================================
 
 #[test]
+#[ignore = "requires the external fixture configured by THD75_KI4LAX_SPEC"]
 fn bl_is_read_only_per_spec() -> TestResult {
-    let Some(spec) = load_spec()? else {
-        return Ok(());
-    };
+    let spec = load_spec()?;
     let bl = spec
         .get("commands")
         .and_then(|c| c.get("BL"))
@@ -385,10 +416,9 @@ fn bl_values_include_spec_range() -> TestResult {
 // ============================================================================
 
 #[test]
+#[ignore = "requires the external fixture configured by THD75_KI4LAX_SPEC"]
 fn dw_is_write_only_per_spec() -> TestResult {
-    let Some(spec) = load_spec()? else {
-        return Ok(());
-    };
+    let spec = load_spec()?;
     let dw = spec
         .get("commands")
         .and_then(|c| c.get("DW"))
@@ -417,13 +447,12 @@ fn sq_range_matches_spec() -> TestResult {
 }
 
 // ============================================================================
-// AG format: spec says 3 chars, range 000-099
+// AG format: firmware requires a global 3-digit value in 000-200
 // ============================================================================
 
 #[test]
 fn ag_write_is_3_digit_per_spec() -> TestResult {
     let bytes = protocol::serialize(&Command::SetAfGain {
-        band: Band::A,
         level: AfGainLevel::new(15),
     });
     let wire = String::from_utf8(bytes)?;
@@ -463,10 +492,9 @@ fn sm_range_matches_spec() -> TestResult {
 // ============================================================================
 
 #[test]
+#[ignore = "requires the external fixture configured by THD75_KI4LAX_SPEC"]
 fn fo_has_21_fields_per_spec() -> TestResult {
-    let Some(spec) = load_spec()? else {
-        return Ok(());
-    };
+    let spec = load_spec()?;
     let expected = spec
         .get("commands")
         .and_then(|c| c.get("FO"))
@@ -475,14 +503,9 @@ fn fo_has_21_fields_per_spec() -> TestResult {
         .ok_or("commands.FO.field_count missing or not a number")?;
     assert_eq!(expected, 21);
 
-    let channel = ChannelMemory::default();
-    let bytes = protocol::serialize(&Command::SetFrequencyFull {
-        band: Band::A,
-        channel,
-    });
-    let wire = String::from_utf8(bytes)?;
-    let payload = wire
-        .trim_end_matches('\r')
+    // Count an observed FO read response. The former FO writer was lossy and
+    // is intentionally absent, so it must not be used to validate field shape.
+    let payload = "FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00"
         .strip_prefix("FO ")
         .ok_or("FO wire missing 'FO ' prefix")?;
     let count = payload.split(',').count();
@@ -495,10 +518,9 @@ fn fo_has_21_fields_per_spec() -> TestResult {
 // ============================================================================
 
 #[test]
+#[ignore = "requires the external fixture configured by THD75_KI4LAX_SPEC"]
 fn me_has_23_fields_per_spec() -> TestResult {
-    let Some(spec) = load_spec()? else {
-        return Ok(());
-    };
+    let spec = load_spec()?;
     let expected = spec
         .get("commands")
         .and_then(|c| c.get("ME"))
@@ -531,10 +553,9 @@ fn sf_fs_mnemonic_firmware_verified() {
 // ============================================================================
 
 #[test]
+#[ignore = "requires the external fixture configured by THD75_KI4LAX_SPEC"]
 fn fine_step_table_matches_spec() -> TestResult {
-    let Some(spec) = load_spec()? else {
-        return Ok(());
-    };
+    let spec = load_spec()?;
     let table_e = spec
         .get("tables")
         .and_then(|t| t.get("TABLE_E"))

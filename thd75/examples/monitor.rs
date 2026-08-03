@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             println!(
                 "Band {band}: {freq}  {mode}  S={smeter:02}  {busy}",
-                freq = freq.rx_frequency,
+                freq = freq,
                 busy = if busy { "BUSY" } else { "    " },
             );
         }

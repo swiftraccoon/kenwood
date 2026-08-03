@@ -26,7 +26,6 @@ pub(crate) fn parse_vfo(mnemonic: &str, payload: &str) -> Option<Result<Response
         "FS" => Some(parse_fs(payload)),
         "FT" => Some(parse_ft(payload)),
         "SH" => Some(parse_sh(payload)),
-        "UP" => Some(Ok(Response::Ok)),
         "RA" => Some(parse_ra(payload)),
         _ => None,
     }
@@ -43,6 +42,19 @@ fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> 
         field: field.to_owned(),
         detail: format!("invalid u8: {s:?}"),
     })
+}
+
+/// Parse a protocol Boolean, accepting exactly `0` or `1`.
+fn parse_bool_field(s: &str, cmd: &str, field: &str) -> Result<bool, ProtocolError> {
+    match s {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(ProtocolError::FieldParse {
+            command: cmd.to_owned(),
+            field: field.to_owned(),
+            detail: format!("expected 0 or 1, got {s:?}"),
+        }),
+    }
 }
 
 /// Split a `"band,value"` payload into (band, `value_str`).
@@ -73,7 +85,11 @@ fn split_band_value<'a>(payload: &'a str, cmd: &str) -> Result<(Band, &'a str), 
 /// Band-indexed `AG 0\r` returns `?`.
 fn parse_ag(payload: &str) -> Result<Response, ProtocolError> {
     let raw = parse_u8_field(payload.trim(), "AG", "level")?;
-    let level = AfGainLevel::from(raw);
+    let level = AfGainLevel::try_from(raw).map_err(|error| ProtocolError::FieldParse {
+        command: "AG".to_owned(),
+        field: "level".to_owned(),
+        detail: error.to_string(),
+    })?;
     Ok(Response::AfGain { level })
 }
 
@@ -129,19 +145,10 @@ fn parse_fs(payload: &str) -> Result<Response, ProtocolError> {
 
 /// Parse FT (function type): bare data (no band).
 ///
-/// Response to `FT\r` is a data value, possibly prefixed by band
-/// in "band,data" format for backward compatibility.
+/// Response to `FT\r` is exactly one Boolean digit with no band prefix.
 fn parse_ft(payload: &str) -> Result<Response, ProtocolError> {
-    // Handle both bare "N" and "band,N" formats
-    let data_str = if let Some((_prefix, val)) = payload.split_once(',') {
-        val
-    } else {
-        payload
-    };
-    let value = parse_u8_field(data_str, "FT", "value")?;
-    Ok(Response::FunctionType {
-        enabled: value != 0,
-    })
+    let enabled = parse_bool_field(payload, "FT", "value")?;
+    Ok(Response::FunctionType { enabled })
 }
 
 /// Parse SH (filter width): `mode_index,width`.
@@ -182,9 +189,6 @@ fn parse_sh(payload: &str) -> Result<Response, ProtocolError> {
 /// Parse RA (attenuator): "band,enabled".
 fn parse_ra(payload: &str) -> Result<Response, ProtocolError> {
     let (band, val_str) = split_band_value(payload, "RA")?;
-    let val = parse_u8_field(val_str, "RA", "enabled")?;
-    Ok(Response::Attenuator {
-        band,
-        enabled: val != 0,
-    })
+    let enabled = parse_bool_field(val_str, "RA", "enabled")?;
+    Ok(Response::Attenuator { band, enabled })
 }

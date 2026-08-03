@@ -1,10 +1,9 @@
-//! Write channel data to the radio.
+//! Write channel-name data through the MCP memory-page interface.
 //! Run: cargo test --test write_channels -- --ignored --nocapture --test-threads=1
 
 use kenwood_thd75::protocol::programming;
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::*;
 
 async fn connect() -> Radio<SerialTransport> {
     let ports = SerialTransport::discover_usb().unwrap();
@@ -19,27 +18,6 @@ async fn reconnect() -> Radio<SerialTransport> {
     // USB needs time to re-enumerate after MCP exit
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     connect().await
-}
-
-#[tokio::test]
-#[ignore]
-async fn set_channel_1_freq() {
-    let mut radio = connect().await;
-
-    println!("\n=== Setting channel 001 frequency to 145.190 MHz ===");
-
-    let mut ch1 = radio.read_channel(1).await.unwrap();
-    println!("  Before: {} Hz", ch1.rx_frequency.as_hz());
-
-    ch1.rx_frequency = Frequency::new(145_190_000);
-    radio.write_channel(1, &ch1).await.unwrap();
-
-    let ch1_verify = radio.read_channel(1).await.unwrap();
-    println!("  After:  {} Hz", ch1_verify.rx_frequency.as_hz());
-    assert_eq!(ch1_verify.rx_frequency.as_hz(), 145_190_000);
-    println!("  PASS");
-
-    let _ = radio.disconnect().await;
 }
 
 #[tokio::test]

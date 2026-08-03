@@ -7,8 +7,6 @@
 //! # Command relationships
 //!
 //! - **DS**: selects the active D-STAR callsign slot (which stored callsign configuration to use)
-//! - **CS**: selects the active callsign slot number (0-10), similar to DS but for the CS
-//!   slot register. The actual callsign text is read via DC.
 //! - **DC**: reads D-STAR callsign data for a given slot (1-6). This command lives in
 //!   [`audio.rs`](super) because it was discovered during audio subsystem probing; the DC
 //!   mnemonic is overloaded on the D75 compared to the D74.
@@ -17,27 +15,18 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::{CallsignSlot, DstarSlot, DvGatewayMode};
+use crate::types::{DstarSlot, DvGatewayMode};
 
 use super::Radio;
 
 /// D-STAR callsign slot 1 (URCALL / destination).
-const SLOT_URCALL: DstarSlot = match DstarSlot::new(1) {
-    Ok(s) => s,
-    Err(_) => unreachable!(),
-};
+const SLOT_URCALL: DstarSlot = DstarSlot::SLOT_1;
 
 /// D-STAR callsign slot 2 (RPT1 / access repeater).
-const SLOT_RPT1: DstarSlot = match DstarSlot::new(2) {
-    Ok(s) => s,
-    Err(_) => unreachable!(),
-};
+const SLOT_RPT1: DstarSlot = DstarSlot::SLOT_2;
 
 /// D-STAR callsign slot 3 (RPT2 / gateway repeater).
-const SLOT_RPT2: DstarSlot = match DstarSlot::new(3) {
-    Ok(s) => s,
-    Err(_) => unreachable!(),
-};
+const SLOT_RPT2: DstarSlot = DstarSlot::SLOT_3;
 
 impl<T: Transport> Radio<T> {
     /// Get the active D-STAR callsign slot (DS read).
@@ -52,48 +41,6 @@ impl<T: Transport> Radio<T> {
             Response::DstarSlot { slot } => Ok(slot),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "DstarSlot".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Get the active callsign slot number (CS bare read).
-    ///
-    /// CS returns a slot number (0-10), NOT the callsign text itself.
-    /// The actual callsign text is accessible via the CS callsign slots.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_active_callsign_slot(&mut self) -> Result<CallsignSlot, Error> {
-        tracing::debug!("reading active callsign slot");
-        let response = self.execute(Command::GetActiveCallsignSlot).await?;
-        match response {
-            Response::ActiveCallsignSlot { slot } => Ok(slot),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "ActiveCallsignSlot".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Set the active callsign slot (CS write).
-    ///
-    /// Selects which callsign slot is active. The callsign text itself
-    /// is read via DC (D-STAR callsign) slots 1-6.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_active_callsign_slot(&mut self, slot: CallsignSlot) -> Result<(), Error> {
-        tracing::info!(?slot, "setting active callsign slot");
-        let response = self
-            .execute(Command::SetActiveCallsignSlot { slot })
-            .await?;
-        match response {
-            Response::ActiveCallsignSlot { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "ActiveCallsignSlot".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -120,8 +67,12 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the command fails or the response is unexpected.
+    /// Returns [`Error::CommandUnavailableOnFirmware`] without sending `GW`
+    /// when the exact cached or queried firmware is `1.03.AZM`. Otherwise,
+    /// returns an error if the command fails or the response is unexpected.
     pub async fn get_gateway(&mut self) -> Result<DvGatewayMode, Error> {
+        self.require_firmware_command("GW", super::FirmwareProfile::supports_bare_gateway)
+            .await?;
         tracing::debug!("reading D-STAR gateway");
         let response = self.execute(Command::GetGateway).await?;
         match response {
@@ -332,9 +283,9 @@ impl<T: Transport> Radio<T> {
     // -----------------------------------------------------------------------
     //
     // The TH-D75 does not expose a CAT command for sending D-STAR slow-data
-    // text messages. The `MS` command is APRS-only (position source / message
-    // send). D-STAR slow-data messages are embedded in the DV voice stream
-    // and are not accessible through the serial CAT protocol.
+    // text messages. `MS` selects the APRS/GPS My Position entry. D-STAR
+    // slow-data messages are embedded in the DV voice stream and are not
+    // accessible through the serial CAT protocol.
     //
     // To send D-STAR text, use the radio's front-panel menu or a D-STAR
     // application (BlueDV, etc.) over Bluetooth/USB data mode.

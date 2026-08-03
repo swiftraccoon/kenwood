@@ -1,8 +1,8 @@
-//! Safe high-level tuning APIs with automatic mode management.
+//! High-level tuning and memory-recall APIs.
 //!
-//! These methods handle VFO/Memory mode switching automatically, so callers
-//! do not need to worry about the radio being in the wrong mode. They are
-//! the recommended way to change frequencies and channels.
+//! Memory recall handles VFO/Memory mode switching automatically. Direct
+//! frequency tuning is quarantined until the complete FO write record can be
+//! preserved and verified.
 
 use crate::error::{Error, ProtocolError};
 use crate::transport::Transport;
@@ -11,42 +11,26 @@ use crate::types::{Band, Frequency, Mode, StepSize};
 use super::{Radio, RadioMode};
 
 impl<T: Transport> Radio<T> {
-    /// Tune a band to a specific frequency.
+    /// Attempt to tune a band to a specific frequency.
     ///
-    /// Automatically switches to VFO mode if needed, sets the frequency,
-    /// and verifies the change. This is the safe way to change frequencies.
+    /// Frequency tuning is temporarily quarantined because the only formerly
+    /// exposed writer was the lossy full-record FO path. This method returns
+    /// before changing mode or performing any I/O.
     ///
     /// # Errors
     ///
     /// Returns an error if the mode switch, frequency set, or verification
     /// read fails.
-    pub async fn tune_frequency(&mut self, band: Band, freq: Frequency) -> Result<(), Error> {
-        tracing::info!(?band, hz = freq.as_hz(), "tuning to frequency");
-
-        // Ensure VFO mode.
-        self.ensure_mode(band, RadioMode::Vfo).await?;
-
-        // Read current channel data so we can preserve settings (step, shift, etc.)
-        let mut channel = self.get_frequency_full(band).await?;
-        channel.rx_frequency = freq;
-
-        // Write the updated frequency.
-        self.set_frequency_full(band, &channel).await?;
-
-        // Verify. This readback is the only verification anywhere in
-        // the tune path: the radio clamps out-of-range FO writes
-        // silently, so a mismatch means the radio is NOT on the
-        // requested frequency and a subsequent transmit would key up
-        // on the wrong one.
-        let readback = self.get_frequency(band).await?;
-        if readback.rx_frequency != freq {
-            return Err(Error::FrequencyReadbackMismatch {
-                expected: freq.as_hz(),
-                actual: readback.rx_frequency.as_hz(),
-            });
-        }
-
-        Ok(())
+    #[expect(
+        clippy::unused_async,
+        reason = "Compatibility quarantine: keep the existing async public API while returning \
+                  before I/O until a frequency writer is qualified"
+    )]
+    pub async fn tune_frequency(&mut self, _band: Band, _freq: Frequency) -> Result<(), Error> {
+        Err(Error::UnqualifiedCatWrite {
+            command: "FO/FQ",
+            reason: "FO is lossy and the short FQ writer has not been qualified",
+        })
     }
 
     /// Tune a band to a memory channel by number.
@@ -207,39 +191,25 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    /// A typical FO response for Band A at 145.000 MHz.
-    /// Field layout verified against real D75 hardware (see `probes/fo_field_map.rs`).
-    const FO_RESPONSE_145: &[u8] =
-        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r";
-
-    /// FO write command for 146.520 MHz (preserving other fields from
-    /// `FO_RESPONSE_145` except the RX frequency).
-    const FO_WRITE_146520: &[u8] =
-        b"FO 0,0146520000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r";
-
-    /// FO response echoed after writing 146.520 MHz.
-    const FO_RESPONSE_146520: &[u8] =
-        b"FO 0,0146520000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r";
-
-    /// FQ short response for Band A at 146.520 MHz.
-    const FQ_RESPONSE_146520: &[u8] = b"FQ 0,0146520000\r";
-
     #[tokio::test]
-    async fn tune_frequency_already_in_vfo_mode() -> TestResult {
-        let mut mock = MockTransport::new();
-        // ensure_mode: query VM -> already VFO (0)
-        mock.expect(b"VM 0\r", b"VM 0,0\r");
-        // get_frequency_full: read current FO
-        mock.expect(b"FO 0\r", FO_RESPONSE_145);
-        // set_frequency_full: write new frequency
-        mock.expect(FO_WRITE_146520, FO_RESPONSE_146520);
-        // get_frequency: verify readback
-        mock.expect(b"FQ 0\r", FQ_RESPONSE_146520);
-
+    async fn tune_frequency_is_quarantined_before_io() -> TestResult {
+        // No exchanges are scripted. Any VM/FO/FQ access would produce a
+        // transport error instead of the explicit pre-I/O quarantine error.
+        let mock = MockTransport::new();
         let mut radio = Radio::connect(mock).await?;
-        radio
+        let result = radio
             .tune_frequency(Band::A, Frequency::new(146_520_000))
-            .await?;
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::UnqualifiedCatWrite {
+                    command: "FO/FQ",
+                    ..
+                })
+            ),
+            "frequency tuning must fail before changing mode or performing I/O: {result:?}"
+        );
         Ok(())
     }
 
@@ -282,26 +252,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quick_tune_sets_freq_mode_step() -> TestResult {
-        let mut mock = MockTransport::new();
-        // tune_frequency internals:
-        //   ensure_mode: query VM -> already VFO (0)
-        mock.expect(b"VM 0\r", b"VM 0,0\r");
-        //   get_frequency_full: FO read
-        mock.expect(b"FO 0\r", FO_RESPONSE_145);
-        //   set_frequency_full: FO write (146.520 MHz)
-        mock.expect(FO_WRITE_146520, FO_RESPONSE_146520);
-        //   get_frequency: verify readback
-        mock.expect(b"FQ 0\r", FQ_RESPONSE_146520);
-        // set_mode: MD write (FM = 0)
-        mock.expect(b"MD 0,0\r", b"MD 0,0\r");
-        // set_step_size: SF write (Hz5000 = 0x0)
-        mock.expect(b"SF 0,0\r", b"SF 0,0\r");
-
+    async fn quick_tune_stops_before_mode_or_step_io() -> TestResult {
+        // No exchanges are scripted. This proves quick_tune does not proceed
+        // to VM, MD, or SF after the quarantined frequency operation fails.
+        let mock = MockTransport::new();
         let mut radio = Radio::connect(mock).await?;
-        radio
+        let result = radio
             .quick_tune(Band::A, 146_520_000, Mode::Fm, StepSize::Hz5000)
-            .await?;
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::UnqualifiedCatWrite {
+                    command: "FO/FQ",
+                    ..
+                })
+            ),
+            "quick_tune must stop before mode or step I/O: {result:?}"
+        );
         Ok(())
     }
 }

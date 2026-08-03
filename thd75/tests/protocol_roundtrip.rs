@@ -96,21 +96,6 @@ fn arb_channel_memory() -> impl Strategy<Value = ChannelMemory> {
 // ============================================================================
 
 proptest! {
-    // 1. FO wire round-trip: serialize SetFrequencyFull, parse as FrequencyFull
-    #[test]
-    fn fo_wire_round_trip(band in arb_band(), channel in arb_channel_memory()) {
-        let cmd = Command::SetFrequencyFull { band, channel: channel.clone() };
-        let wire = protocol::serialize(&cmd);
-        let frame = wire.split_last().map(|(_, rest)| rest).ok_or_else(|| to_test_err("empty wire"))?;
-        let response = protocol::parse(frame).map_err(to_test_err)?;
-        let Response::FrequencyFull { band: b, channel: parsed } = response else {
-            prop_assert!(false, "wrong variant: {response:?}");
-            return Ok(());
-        };
-        prop_assert_eq!(b, band);
-        prop_assert_eq!(parsed, channel);
-    }
-
     // 2. 40-byte binary round-trip (byte[10] mapping now matches hardware)
     #[test]
     fn channel_memory_40byte_round_trip(channel in arb_channel_memory()) {
@@ -270,21 +255,6 @@ proptest! {
 
     // TN (TNC mode) is a bare read command with no write variant, so no round-trip.
     // CTCSS tone is configured through the FO (full channel) command.
-
-    // 15. ME wire round-trip: serialize SetMemoryChannel, parse as MemoryChannel
-    #[test]
-    fn me_wire_round_trip(ch_num in 0u16..1000, channel in arb_channel_memory()) {
-        let cmd = Command::SetMemoryChannel { channel: ch_num, data: channel.clone() };
-        let wire = protocol::serialize(&cmd);
-        let frame = wire.split_last().map(|(_, rest)| rest).ok_or_else(|| to_test_err("empty wire"))?;
-        let response = protocol::parse(frame).map_err(to_test_err)?;
-        let Response::MemoryChannel { channel: num, data: parsed } = response else {
-            prop_assert!(false, "wrong variant: {response:?}");
-            return Ok(());
-        };
-        prop_assert_eq!(num, ch_num);
-        prop_assert_eq!(parsed, channel);
-    }
 
     // 18. SH (filter width) wire round-trip
     #[test]

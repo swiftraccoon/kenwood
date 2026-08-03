@@ -3,6 +3,28 @@
 use super::{FieldValue, MenuField, PatchPlanner, SchemaError};
 
 impl MenuField {
+    pub(super) fn validate_patch_value(&self, value: FieldValue<'_>) -> Result<(), SchemaError> {
+        if !self.options.is_empty() || !self.allowed_values.is_empty() {
+            let FieldValue::Unsigned(raw) = value else {
+                return Err(SchemaError::TypeMismatch {
+                    field: self.descriptor.name,
+                    expected: "unsigned",
+                    actual: value.kind_name(),
+                });
+            };
+            let missing_enum = !self.options.is_empty() && self.option(raw).is_none();
+            let missing_choice =
+                !self.allowed_values.is_empty() && !self.allowed_values.contains(&raw);
+            if missing_enum || missing_choice {
+                return Err(SchemaError::DisallowedValue {
+                    field: self.descriptor.name,
+                    value: raw,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Validate and add a value to a masked patch plan.
     ///
     /// In addition to storage-codec validation, this rejects gap values for
@@ -25,24 +47,7 @@ impl MenuField {
         planner: &mut PatchPlanner,
         value: FieldValue<'_>,
     ) -> Result<(), SchemaError> {
-        if !self.options.is_empty() || !self.allowed_values.is_empty() {
-            let FieldValue::Unsigned(raw) = value else {
-                return Err(SchemaError::TypeMismatch {
-                    field: self.descriptor.name,
-                    expected: "unsigned",
-                    actual: value.kind_name(),
-                });
-            };
-            let missing_enum = !self.options.is_empty() && self.option(raw).is_none();
-            let missing_choice =
-                !self.allowed_values.is_empty() && !self.allowed_values.contains(&raw);
-            if missing_enum || missing_choice {
-                return Err(SchemaError::DisallowedValue {
-                    field: self.descriptor.name,
-                    value: raw,
-                });
-            }
-        }
+        self.validate_patch_value(value)?;
         let _planner = planner.set(&self.descriptor, value)?;
         Ok(())
     }
@@ -67,6 +72,30 @@ mod tests {
                 field: "radio.AutoWeatherScan",
                 value: 3,
             })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn low_level_planner_cannot_bypass_gapped_enum_domain() -> Result<(), &'static str> {
+        let field = gapped_field()?;
+        let mut planner = PatchPlanner::new();
+        assert!(
+            matches!(
+                planner.set(&field.descriptor, FieldValue::Unsigned(3)),
+                Err(SchemaError::DisallowedValue {
+                    field: "radio.AutoWeatherScan",
+                    value: 3,
+                })
+            ),
+            "the descriptor-level API must enforce generated enum membership"
+        );
+        assert!(
+            planner
+                .finish()
+                .map_err(|_| "empty plan did not finish")?
+                .is_empty(),
+            "a rejected value must not leave a partial patch"
         );
         Ok(())
     }
@@ -114,6 +143,42 @@ mod tests {
         let mut valid = PatchPlanner::new();
         field.plan_value(&mut valid, FieldValue::Unsigned(255))?;
         assert_eq!(valid.finish()?.pages().count(), 1);
+
+        let mut low_level = PatchPlanner::new();
+        assert!(
+            matches!(
+                low_level.set(&field.descriptor, FieldValue::Unsigned(30)),
+                Err(SchemaError::DisallowedValue {
+                    field: "radio.GroupLink0",
+                    value: 30,
+                })
+            ),
+            "the descriptor-level API must enforce generated finite choices"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_name_with_mismatched_descriptor_is_rejected() -> Result<(), &'static str> {
+        let field = gapped_field()?;
+        let stale = super::super::FieldDescriptor::new(
+            field.descriptor.name,
+            field.descriptor.offset + 1,
+            field.descriptor.codec,
+        );
+        let mut planner = PatchPlanner::new();
+        assert!(
+            matches!(
+                planner.set(&stale, FieldValue::Unsigned(2)),
+                Err(SchemaError::CatalogDescriptorMismatch {
+                    field: "radio.AutoWeatherScan",
+                    offset,
+                    expected_offset,
+                }) if offset == field.descriptor.offset + 1
+                    && expected_offset == field.descriptor.offset
+            ),
+            "a catalog name with stale descriptor metadata must fail closed"
+        );
         Ok(())
     }
 }

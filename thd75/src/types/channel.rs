@@ -128,6 +128,234 @@ impl ChannelName {
     }
 }
 
+/// Exact three-character selector used by the ME and MR CAT commands.
+///
+/// The selector is not always a decimal channel number. Firmware accepts
+/// program-scan edges (`L00`-`L49` and `U00`-`U49`), regional banks
+/// (`T01`-`T30` and `A01`-`A10`), and the priority selector (`Pri`) in
+/// addition to ordinary channels `000`-`999`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MemorySelectorValue {
+    Channel(u16),
+    ProgramLower(u8),
+    ProgramUpper(u8),
+    RegionalT(u8),
+    RegionalA(u8),
+    Priority,
+}
+
+/// Validated ME/MR memory selector.
+///
+/// The representation is private so out-of-range forms such as `L50` or
+/// `T00` cannot be constructed and then emitted by the infallible CAT
+/// serializer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MemorySelector(MemorySelectorValue);
+
+impl MemorySelector {
+    /// Priority channel selector (`Pri`).
+    pub const PRIORITY: Self = Self(MemorySelectorValue::Priority);
+
+    /// Construct an ordinary memory selector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::ChannelOutOfRange`] above channel 999.
+    pub const fn channel(channel: u16) -> Result<Self, ValidationError> {
+        if channel <= 999 {
+            Ok(Self(MemorySelectorValue::Channel(channel)))
+        } else {
+            Err(ValidationError::ChannelOutOfRange { channel, max: 999 })
+        }
+    }
+
+    /// Construct a lower program-scan edge (`L00`-`L49`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error above index 49.
+    pub const fn program_lower(index: u8) -> Result<Self, ValidationError> {
+        if index <= 49 {
+            Ok(Self(MemorySelectorValue::ProgramLower(index)))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "lower program-scan memory",
+                value: index,
+                detail: "must be L00-L49",
+            })
+        }
+    }
+
+    /// Construct an upper program-scan edge (`U00`-`U49`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error above index 49.
+    pub const fn program_upper(index: u8) -> Result<Self, ValidationError> {
+        if index <= 49 {
+            Ok(Self(MemorySelectorValue::ProgramUpper(index)))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "upper program-scan memory",
+                value: index,
+                detail: "must be U00-U49",
+            })
+        }
+    }
+
+    /// Construct a regional `T` selector (`T01`-`T30`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error outside 1-30.
+    pub const fn regional_t(index: u8) -> Result<Self, ValidationError> {
+        if index >= 1 && index <= 30 {
+            Ok(Self(MemorySelectorValue::RegionalT(index)))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "regional T memory",
+                value: index,
+                detail: "must be T01-T30",
+            })
+        }
+    }
+
+    /// Construct a regional `A` selector (`A01`-`A10`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error outside 1-10.
+    pub const fn regional_a(index: u8) -> Result<Self, ValidationError> {
+        if index >= 1 && index <= 10 {
+            Ok(Self(MemorySelectorValue::RegionalA(index)))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "regional A memory",
+                value: index,
+                detail: "must be A01-A10",
+            })
+        }
+    }
+
+    /// Return the ordinary numeric channel, if this is `000`-`999`.
+    #[must_use]
+    pub const fn channel_number(self) -> Option<u16> {
+        match self {
+            Self(MemorySelectorValue::Channel(channel)) => Some(channel),
+            _ => None,
+        }
+    }
+
+    fn invalid(selector: &str) -> ValidationError {
+        ValidationError::InvalidMemorySelector {
+            selector: selector.to_owned(),
+            detail: "expected 000-999, L00-L49, U00-U49, T01-T30, A01-A10, or Pri",
+        }
+    }
+}
+
+impl TryFrom<u16> for MemorySelector {
+    type Error = ValidationError;
+
+    fn try_from(channel: u16) -> Result<Self, Self::Error> {
+        Self::channel(channel)
+    }
+}
+
+impl TryFrom<&str> for MemorySelector {
+    type Error = ValidationError;
+
+    fn try_from(selector: &str) -> Result<Self, Self::Error> {
+        if selector == "Pri" {
+            return Ok(Self::PRIORITY);
+        }
+        if selector.len() != 3 || !selector.is_ascii() {
+            return Err(Self::invalid(selector));
+        }
+
+        let bytes = selector.as_bytes();
+        if bytes.iter().all(u8::is_ascii_digit) {
+            let channel = selector
+                .parse::<u16>()
+                .map_err(|_| Self::invalid(selector))?;
+            return Self::channel(channel);
+        }
+        let Some((&prefix, digits)) = bytes.split_first() else {
+            return Err(Self::invalid(selector));
+        };
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return Err(Self::invalid(selector));
+        }
+        let number = std::str::from_utf8(digits)
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| Self::invalid(selector))?;
+
+        let index = u8::try_from(number).map_err(|_| Self::invalid(selector))?;
+        match prefix {
+            b'L' if index <= 49 => Self::program_lower(index),
+            b'U' if index <= 49 => Self::program_upper(index),
+            b'T' if (1..=30).contains(&index) => Self::regional_t(index),
+            b'A' if (1..=10).contains(&index) => Self::regional_a(index),
+            _ => Err(Self::invalid(selector)),
+        }
+        .map_err(|_| Self::invalid(selector))
+    }
+}
+
+impl fmt::Display for MemorySelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            MemorySelectorValue::Channel(channel) => write!(f, "{channel:03}"),
+            MemorySelectorValue::ProgramLower(index) => write!(f, "L{index:02}"),
+            MemorySelectorValue::ProgramUpper(index) => write!(f, "U{index:02}"),
+            MemorySelectorValue::RegionalT(index) => write!(f, "T{index:02}"),
+            MemorySelectorValue::RegionalA(index) => write!(f, "A{index:02}"),
+            MemorySelectorValue::Priority => f.write_str("Pri"),
+        }
+    }
+}
+
+/// Operating mode encoding used specifically by FO/ME CAT records.
+///
+/// This table is intentionally distinct from [`crate::types::Mode`] and
+/// [`MemoryMode`], whose numeric values differ for AM and NFM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CatChannelMode {
+    /// Wide FM (`0`).
+    Fm = 0,
+    /// D-STAR digital voice (`1`).
+    Dv = 1,
+    /// Narrow FM (`2`).
+    Nfm = 2,
+    /// AM (`3`).
+    Am = 3,
+}
+
+impl TryFrom<u8> for CatChannelMode {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Fm),
+            1 => Ok(Self::Dv),
+            2 => Ok(Self::Nfm),
+            3 => Ok(Self::Am),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "FO/ME CAT channel mode",
+                value,
+                detail: "must be 0-3 (FM/DV/NFM/AM)",
+            }),
+        }
+    }
+}
+
+impl From<CatChannelMode> for u8 {
+    fn from(mode: CatChannelMode) -> Self {
+        mode as Self
+    }
+}
+
 /// 40-byte internal channel memory structure.
 ///
 /// Maps byte-for-byte to the firmware's internal representation at `DAT_c0012634`.
@@ -213,9 +441,87 @@ pub struct ChannelMemory {
     pub data_mode: u8,
 }
 
+/// Full shared 20-field FO/ME CAT channel record.
+///
+/// [`ChannelMemory`] holds the fields that also map to the 40-byte channel
+/// representation. `tx_step_size` is a separate CAT field and must be kept
+/// alongside it to avoid the loss that affected the former writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatChannelRecord {
+    /// Channel data represented by both CAT and the binary channel layout.
+    pub channel: ChannelMemory,
+    /// CAT transmit-step field (FO/ME field 3, TABLE C hex index).
+    pub tx_step_size: StepSize,
+}
+
+impl std::ops::Deref for CatChannelRecord {
+    type Target = ChannelMemory;
+
+    fn deref(&self) -> &Self::Target {
+        &self.channel
+    }
+}
+
+impl std::ops::DerefMut for CatChannelRecord {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.channel
+    }
+}
+
+/// Lossless ME response record, including both currently-unidentified
+/// ME-only fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryChannelRecord {
+    /// Shared FO/ME channel fields.
+    pub channel: CatChannelRecord,
+    /// Raw ME-only field at wire position 14.
+    pub me_field_14_raw: String,
+    /// Raw ME-only field at wire position 22.
+    pub me_field_22_raw: String,
+}
+
+impl std::ops::Deref for MemoryChannelRecord {
+    type Target = ChannelMemory;
+
+    fn deref(&self) -> &Self::Target {
+        &self.channel.channel
+    }
+}
+
+impl std::ops::DerefMut for MemoryChannelRecord {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.channel.channel
+    }
+}
+
 impl ChannelMemory {
     /// Size of the packed binary representation in bytes.
     pub const BYTE_SIZE: usize = 40;
+
+    /// Decode the mode bits using the FO/ME CAT-specific table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a binary record contains a mode not representable
+    /// on the four-value CAT channel wire.
+    pub fn cat_mode(&self) -> Result<CatChannelMode, ValidationError> {
+        CatChannelMode::try_from((self.mode_flags_raw >> 4) & 0x07)
+    }
+
+    /// Whether the FO/ME fine-tuning flag is enabled.
+    #[must_use]
+    pub const fn fine_tuning_enabled(&self) -> bool {
+        self.mode_flags_raw & 0x08 != 0
+    }
+
+    /// Decode the FO/ME fine-step bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the raw field is outside the documented 0-3 table.
+    pub fn fine_step(&self) -> Result<FineStep, ValidationError> {
+        FineStep::try_from(self.mode_flags_raw & 0x07)
+    }
 
     /// Tone (encode) enabled (`flags_0a_raw` bit 7).
     #[must_use]

@@ -132,13 +132,6 @@ fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
         .map_or_else(|| "Unknown".to_string(), |s| format!("{}", s.as_u8()));
     lines.push(kv_line("D-STAR Slot", slot_str, Color::White));
 
-    // Callsign slot
-    let cs_slot_str = app
-        .state
-        .dstar_callsign_slot
-        .map_or_else(|| "Unknown".to_string(), |s| format!("{}", s.as_u8()));
-    lines.push(kv_line("Callsign Slot", cs_slot_str, Color::White));
-
     // Input prompts
     lines.push(Line::from(""));
     if let Some(ref buf) = app.dstar_urcall_input {

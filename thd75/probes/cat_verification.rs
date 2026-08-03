@@ -6,6 +6,8 @@
 //!
 //! Run: cargo test --test cat_verification -- --ignored --nocapture --test-threads=1
 
+mod firmware_guard;
+
 use kenwood_thd75::protocol::Codec;
 use kenwood_thd75::transport::{SerialTransport, Transport};
 use std::io::Write as IoWrite;
@@ -62,6 +64,18 @@ fn check(
     results.push((cmd.to_string(), status, resp_str));
 }
 
+fn record_guarded_skip(
+    results: &mut Vec<(String, String, String)>,
+    command: &str,
+    diagnostic: String,
+) {
+    println!(
+        "  {:<8} {:<25} {:<12} {}",
+        "SKIPPED", command, "--", diagnostic
+    );
+    results.push((command.to_owned(), "SKIPPED".to_owned(), diagnostic));
+}
+
 #[tokio::test]
 #[ignore]
 async fn verify_all_cat_commands() {
@@ -86,6 +100,10 @@ async fn verify_all_cat_commands() {
     check(&mut results, &cmd, &resp, "ID", "Radio model");
 
     let (cmd, resp) = raw_exchange(&mut transport, "FV").await;
+    let firmware_version = resp
+        .as_deref()
+        .and_then(firmware_guard::parse_fv_frame)
+        .map(str::to_owned);
     check(&mut results, &cmd, &resp, "FV", "Firmware version");
 
     let (cmd, resp) = raw_exchange(&mut transport, "AE").await;
@@ -255,9 +273,6 @@ async fn verify_all_cat_commands() {
     let (cmd, resp) = raw_exchange(&mut transport, "DL").await;
     check(&mut results, &cmd, &resp, "DL", "Dual band display");
 
-    let (cmd, resp) = raw_exchange(&mut transport, "DW").await;
-    check(&mut results, &cmd, &resp, "DW", "Frequency down");
-
     let (cmd, resp) = raw_exchange(&mut transport, "LC").await;
     check(&mut results, &cmd, &resp, "LC", "Lock control");
 
@@ -301,8 +316,13 @@ async fn verify_all_cat_commands() {
     let (cmd, resp) = raw_exchange(&mut transport, "CS").await;
     check(&mut results, &cmd, &resp, "CS", "Active callsign slot");
 
-    let (cmd, resp) = raw_exchange(&mut transport, "GW").await;
-    check(&mut results, &cmd, &resp, "GW", "Gateway");
+    match firmware_guard::require_stock_bare_probe("GW", firmware_version.as_deref()) {
+        Ok(()) => {
+            let (cmd, resp) = raw_exchange(&mut transport, "GW").await;
+            check(&mut results, &cmd, &resp, "GW", "Gateway");
+        }
+        Err(diagnostic) => record_guarded_skip(&mut results, "GW", diagnostic),
+    }
 
     for slot in 1..=6u8 {
         let (cmd, resp) = raw_exchange(&mut transport, &format!("DC {slot}")).await;
@@ -319,8 +339,13 @@ async fn verify_all_cat_commands() {
     let (cmd, resp) = raw_exchange(&mut transport, "GP").await;
     check(&mut results, &cmd, &resp, "GP", "GPS config");
 
-    let (cmd, resp) = raw_exchange(&mut transport, "GM").await;
-    check(&mut results, &cmd, &resp, "GM", "GPS mode");
+    match firmware_guard::require_stock_bare_probe("GM", firmware_version.as_deref()) {
+        Ok(()) => {
+            let (cmd, resp) = raw_exchange(&mut transport, "GM").await;
+            check(&mut results, &cmd, &resp, "GM", "GPS mode");
+        }
+        Err(diagnostic) => record_guarded_skip(&mut results, "GM", diagnostic),
+    }
 
     let (cmd, resp) = raw_exchange(&mut transport, "GS").await;
     check(&mut results, &cmd, &resp, "GS", "GPS sentences");

@@ -1,65 +1,17 @@
-//! System-level radio methods: battery level, beep, lock, dual-band, frequency step, bluetooth, attenuator, auto-info.
+//! System-level radio methods: battery level, beep, backlight, dual-band, frequency step, bluetooth, attenuator, auto-info.
 //!
 //! The `set_*_via_mcp` methods write registry-verified MCP cells for
 //! settings whose CAT write is rejected or stubbed (beep, beep volume,
-//! VOX, Bluetooth). The key lock has no MCP path; its state is
-//! runtime-only and is controlled via CAT (`set_lock`/`get_lock`).
+//! VOX, Bluetooth).
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::{Band, BatteryLevel, ChannelMemory, DetectOutputMode, KeyLockType};
+use crate::types::{BacklightControl, Band, BatteryLevel, DetectOutputMode, Frequency};
 
 use super::Radio;
 
 impl<T: Transport> Radio<T> {
-    /// Get beep setting (BE read).
-    ///
-    /// D75 RE: `BE x` (x: 0=off, 1=on).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_beep(&mut self) -> Result<bool, Error> {
-        tracing::debug!("reading beep setting");
-        let response = self.execute(Command::GetBeep).await?;
-        match response {
-            Response::Beep { enabled } => Ok(enabled),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "Beep".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Set beep on/off (BE write).
-    ///
-    /// D75 RE: `BE x` (x: 0=off, 1=on).
-    ///
-    /// # D75 firmware bug
-    ///
-    /// **The CAT `BE` write command is a firmware stub on the TH-D75.** It always returns `?`
-    /// regardless of the value sent. The read (`get_beep`) works, but writes are silently
-    /// ignored by the firmware.
-    ///
-    /// Use [`set_beep_via_mcp`](Self::set_beep_via_mcp) instead, which writes directly to
-    /// the verified MCP memory offset (`0x1071`) and actually changes the setting.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_beep(&mut self, enabled: bool) -> Result<(), Error> {
-        tracing::debug!(enabled, "setting beep");
-        let response = self.execute(Command::SetBeep { enabled }).await?;
-        match response {
-            Response::Beep { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "Beep".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
     /// Get the battery charge level (BL read).
     ///
     /// Returns 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green),
@@ -80,146 +32,35 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set battery level display (BL write).
-    ///
-    /// # Warning
-    ///
-    /// The exact purpose of this command is unclear. It may control the battery
-    /// display indicator or be a calibration/test interface. The `display` and
-    /// `level` parameter semantics are undocumented.
-    ///
-    /// # Wire format
-    ///
-    /// `BL display,level\r` (7 bytes with comma).
+    /// Get the LCD backlight control mode (LC read).
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_battery_level(&mut self, bl_display: u8, level: u8) -> Result<(), Error> {
-        tracing::info!(
-            bl_display,
-            level,
-            "setting battery level display (BL write)"
-        );
-        let response = self
-            .execute(Command::SetBatteryLevel {
-                display: bl_display,
-                level,
-            })
-            .await?;
+    pub async fn get_backlight_control(&mut self) -> Result<BacklightControl, Error> {
+        tracing::debug!("reading backlight control mode");
+        let response = self.execute(Command::GetBacklightControl).await?;
         match response {
-            Response::BatteryLevel { .. } => Ok(()),
+            Response::BacklightControl { mode } => Ok(mode),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "BatteryLevel".into(),
+                expected: "BacklightControl".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
     }
 
-    /// Get the key lock state (LC read).
-    ///
-    /// On the TH-D75, the LC wire value is inverted: `LC 0` means locked,
-    /// `LC 1` means unlocked. This method inverts the response so that
-    /// `true` means locked (logical meaning). CAT is the only supported
-    /// path for the lock state; it is runtime state with no verified MCP
-    /// cell (the once-claimed `0x1060` is `radio.BacklightControl` in the
-    /// MCP-D75 registry).
+    /// Set the LCD backlight control mode (LC write).
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_lock(&mut self) -> Result<bool, Error> {
-        tracing::debug!("reading key lock state");
-        let response = self.execute(Command::GetLock).await?;
+    pub async fn set_backlight_control(&mut self, mode: BacklightControl) -> Result<(), Error> {
+        tracing::info!(?mode, "setting backlight control mode");
+        let response = self.execute(Command::SetBacklightControl { mode }).await?;
         match response {
-            // Wire value is inverted: 0 = locked, 1 = unlocked.
-            Response::Lock { locked } => Ok(!locked),
+            Response::BacklightControl { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "Lock".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Set the key lock state (LC write).
-    ///
-    /// Accepts logical meaning: `true` = locked, `false` = unlocked.
-    /// Inverts before sending on the wire (`LC 0` = locked, `LC 1` =
-    /// unlocked on the D75).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_lock(&mut self, locked: bool) -> Result<(), Error> {
-        tracing::info!(locked, "setting key lock");
-        // Invert: logical true (locked) → wire 0, logical false → wire 1.
-        let response = self.execute(Command::SetLock { locked: !locked }).await?;
-        match response {
-            Response::Lock { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "Lock".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Set all lock/control fields (LC 6-field write).
-    ///
-    /// Sends the full `LC a,b,c,d,e,f` format to configure all lock parameters at once.
-    ///
-    /// # Parameters
-    ///
-    /// - `locked`: master lock enable (`true` = locked, `false` = unlocked). Inverted
-    ///   before sending on the wire (D75: `0` = locked, `1` = unlocked).
-    /// - `lock_type`: what to lock: key only, key+PTT, or key+PTT+dial.
-    /// - `lock_a`: lock Band A controls (`true` = locked).
-    /// - `lock_b`: lock Band B controls (`true` = locked).
-    /// - `lock_c`: lock Band C controls (`true` = locked).
-    /// - `lock_ptt`: lock the PTT button (`true` = locked, prevents transmission).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        reason = "CAT `LC a,b,c,d,e,f` is a 6-field fixed-format command where five fields are \
-                  booleans (master lock, lock A/B/C, lock PTT) per the TH-D75 CAT reference. \
-                  The API mirrors the wire-level layout 1:1; grouping into a struct would add \
-                  indirection without improving correctness."
-    )]
-    pub async fn set_lock_full(
-        &mut self,
-        locked: bool,
-        lock_type: KeyLockType,
-        lock_a: bool,
-        lock_b: bool,
-        lock_c: bool,
-        lock_ptt: bool,
-    ) -> Result<(), Error> {
-        tracing::info!(
-            locked,
-            ?lock_type,
-            lock_a,
-            lock_b,
-            lock_c,
-            lock_ptt,
-            "setting full lock configuration"
-        );
-        // Invert master lock: logical true (locked) → wire 0.
-        let response = self
-            .execute(Command::SetLockFull {
-                locked: !locked,
-                lock_type,
-                lock_a,
-                lock_b,
-                lock_c,
-                lock_ptt,
-            })
-            .await?;
-        match response {
-            Response::Lock { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "Lock".into(),
+                expected: "BacklightControl".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -271,40 +112,40 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Step frequency down on the given band (DW action), then read back the
+    /// Step the current operating context down (DW action), then read back the
     /// resulting frequency.
     ///
     /// Sends `DW` to step down, then issues `FQ` to read back the new
-    /// frequency. Returns the post-step [`ChannelMemory`].
+    /// frequency. Returns the post-step [`Frequency`].
     ///
-    /// Per KI4LAX CAT reference: DW tunes the current band's frequency
-    /// down by the current step size. Counterpart to [`frequency_up`](super::Radio::frequency_up).
+    /// DW tunes the current operating context down by its current step size.
+    /// It is the counterpart to [`frequency_up`](super::Radio::frequency_up).
     ///
     /// # VFO mode requirement
     ///
-    /// The target band must be in VFO mode for this command to take effect. In Memory mode,
+    /// The current context must be in VFO mode for this command to take effect. In Memory mode,
     /// the command may be ignored or return an error.
     ///
     /// # Step size
     ///
-    /// The frequency moves by the band's current step size (see
+    /// The frequency moves by the current context's step size (see
     /// [`get_step_size`](super::Radio::get_step_size) /
     /// [`set_step_size`](super::Radio::set_step_size)). The step size varies by
     /// band and mode: for example, 25 kHz for FM, 1 kHz for SSB.
     ///
     /// # Wire format
     ///
-    /// `DW band\r` where band is 0 (A) or 1 (B). Despite the mnemonic suggesting "Dual Watch",
-    /// on the D75 this is strictly frequency-down.
+    /// Bare `DW\r`. Parameterized `DW band\r` is rejected by the firmware.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
     ///
-    /// [`ChannelMemory`]: crate::types::ChannelMemory
-    pub async fn frequency_down(&mut self, band: Band) -> Result<ChannelMemory, Error> {
-        tracing::debug!(?band, "stepping frequency down");
-        let response = self.execute(Command::FrequencyDown { band }).await?;
+    /// [`Frequency`]: crate::types::Frequency
+    pub async fn frequency_down(&mut self) -> Result<Frequency, Error> {
+        let band = self.get_band().await?;
+        tracing::debug!(?band, "stepping current operating context down");
+        let response = self.execute(Command::FrequencyDown).await?;
         // The radio echoes either `DW\r` (parsed as FrequencyDown) or a bare
         // OK depending on firmware version and AI mode state.
         match response {
@@ -319,7 +160,7 @@ impl<T: Transport> Radio<T> {
         self.get_frequency(band).await
     }
 
-    /// Step frequency down on the given band (DW action) without reading
+    /// Step the current operating context down (DW action) without reading
     /// back the result.
     ///
     /// This is the fire-and-forget variant of [`frequency_down`](Self::frequency_down).
@@ -329,9 +170,9 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn frequency_down_blind(&mut self, band: Band) -> Result<(), Error> {
-        tracing::debug!(?band, "stepping frequency down (blind)");
-        let response = self.execute(Command::FrequencyDown { band }).await?;
+    pub async fn frequency_down_blind(&mut self) -> Result<(), Error> {
+        tracing::debug!("stepping current operating context down (blind)");
+        let response = self.execute(Command::FrequencyDown).await?;
         match response {
             Response::FrequencyDown | Response::Ok => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -411,7 +252,27 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set the auto-info mode (AI write). This is a write-only command.
+    /// Read the auto-info mode (bare AI read).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn get_auto_info(&mut self) -> Result<bool, Error> {
+        tracing::debug!("reading auto-info mode");
+        let response = self.execute(Command::GetAutoInfo).await?;
+        match response {
+            Response::AutoInfo { enabled } => {
+                self.auto_info_enabled = enabled;
+                Ok(enabled)
+            }
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "AutoInfo".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
+    /// Set the auto-info mode (AI write).
     ///
     /// When enabled (`AI 1`), the radio pushes unsolicited status updates over the serial
     /// connection whenever internal state changes. This includes frequency changes (FQ),
@@ -422,9 +283,6 @@ impl<T: Transport> Radio<T> {
     /// returned by [`subscribe`](Self::subscribe). The `execute()` method routes solicited
     /// responses (matching the sent command's mnemonic) to the caller and unsolicited frames
     /// to the broadcast channel.
-    ///
-    /// This command is write-only; there is no `AI` read form. To check the current state,
-    /// you must track it in your application after calling this method.
     ///
     /// # Wire format
     ///
@@ -437,7 +295,7 @@ impl<T: Transport> Radio<T> {
         tracing::info!(enabled, "setting auto-info mode");
         let response = self.execute(Command::SetAutoInfo { enabled }).await?;
         match response {
-            Response::AutoInfo { .. } => {
+            Response::AutoInfo { .. } | Response::AutoInfoAck => {
                 // Remembered so `Radio::reconnect` re-asserts it.
                 self.auto_info_enabled = enabled;
                 Ok(())
@@ -530,26 +388,6 @@ impl<T: Transport> Radio<T> {
             Response::SdCard { present } => Ok(present),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "SdCard".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Get MCP status (0E read).
-    ///
-    /// Returns `N` (not available) in normal operating mode. This mnemonic
-    /// appears to be MCP-related.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_mcp_status(&mut self) -> Result<String, Error> {
-        tracing::debug!("reading MCP status");
-        let response = self.execute(Command::GetMcpStatus).await?;
-        match response {
-            Response::McpStatus { value } => Ok(value),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "McpStatus".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -687,9 +525,8 @@ impl<T: Transport> Radio<T> {
 
     // NOTE: there is deliberately no `set_lock_via_mcp`. The legacy MCP
     // lock offset (0x1060) is `radio.BacklightControl` in the MCP-D75
-    // registry, and writing it silently rewrote the backlight mode. The
-    // key-lock state is runtime state; `set_lock`/`get_lock` (CAT LC/DL)
-    // are the supported path.
+    // registry, and LC controls that same backlight mode. No key-lock state
+    // operation is currently verified.
 
     /// Set Bluetooth on/off via MCP memory write.
     ///

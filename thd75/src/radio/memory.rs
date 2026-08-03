@@ -3,7 +3,7 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::ChannelMemory;
+use crate::types::{ChannelMemory, MemoryChannelRecord, MemorySelector};
 
 use super::Radio;
 
@@ -14,19 +14,32 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn read_channel(&mut self, channel: u16) -> Result<ChannelMemory, Error> {
-        // The `ME {:03}` wire format silently grows to 4+ digits for
-        // out-of-range channels, so validate before the wire.
-        if channel > 999 {
-            return Err(Error::Validation(
-                crate::error::ValidationError::ChannelOutOfRange { channel, max: 999 },
-            ));
-        }
-        tracing::debug!(channel, "reading memory channel");
-        let response = self.execute(Command::GetMemoryChannel { channel }).await?;
+        let selector = MemorySelector::try_from(channel)?;
+        let record = self.read_memory(selector).await?;
+        Ok(record.channel.channel)
+    }
+
+    /// Read a complete ME record by its exact selector.
+    ///
+    /// Unlike [`read_channel`](Self::read_channel), this preserves the CAT
+    /// transmit-step field and both currently-unidentified ME-only fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport/protocol error if the command fails.
+    pub async fn read_memory(
+        &mut self,
+        selector: MemorySelector,
+    ) -> Result<MemoryChannelRecord, Error> {
+        tracing::debug!(%selector, "reading memory record");
+        let response = self.execute(Command::GetMemoryChannel { selector }).await?;
         match response {
-            Response::MemoryChannel { data, .. } => Ok(data),
+            Response::MemoryChannel {
+                selector: response_selector,
+                record,
+            } if response_selector == selector => Ok(record),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "MemoryChannel".into(),
+                expected: format!("MemoryChannel {{ selector: {selector} }}"),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -68,31 +81,35 @@ impl<T: Transport> Radio<T> {
         Ok(results)
     }
 
-    /// Write a memory channel by number (ME write).
+    /// Attempt to write a memory channel by number (ME write).
+    ///
+    /// This writer is quarantined. The former codec discarded four shared
+    /// FO fields and both ME-only fields, then replaced them with zeroes. It
+    /// remains unavailable until all 22 ME fields can be preserved and the
+    /// restore/readback behavior is qualified on hardware.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn write_channel(&mut self, channel: u16, data: &ChannelMemory) -> Result<(), Error> {
+    #[expect(
+        clippy::unused_async,
+        reason = "Compatibility quarantine: keep the existing async public API while returning \
+                  before I/O until the full ME wire record is qualified"
+    )]
+    pub async fn write_channel(
+        &mut self,
+        channel: u16,
+        _data: &ChannelMemory,
+    ) -> Result<(), Error> {
         if channel > 999 {
             return Err(Error::Validation(
                 crate::error::ValidationError::ChannelOutOfRange { channel, max: 999 },
             ));
         }
-        tracing::info!(channel, "writing memory channel");
-        let response = self
-            .execute(Command::SetMemoryChannel {
-                channel,
-                data: data.clone(),
-            })
-            .await?;
-        match response {
-            Response::MemoryChannel { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "MemoryChannel".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
+        Err(Error::UnqualifiedCatWrite {
+            command: "ME",
+            reason: "the current channel model cannot preserve all 22 wire fields",
+        })
     }
 }
 

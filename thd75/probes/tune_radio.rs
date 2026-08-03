@@ -44,7 +44,7 @@ async fn tune_bands() {
     let _ = radio
         .execute(Command::RecallMemoryChannel {
             band: Band::A,
-            channel: 21,
+            selector: MemorySelector::try_from(21_u16).unwrap(),
         })
         .await;
 
@@ -53,7 +53,7 @@ async fn tune_bands() {
     let _ = radio
         .execute(Command::RecallMemoryChannel {
             band: Band::B,
-            channel: 19,
+            selector: MemorySelector::try_from(19_u16).unwrap(),
         })
         .await;
 
@@ -61,11 +61,8 @@ async fn tune_bands() {
     let freq_a = radio.get_frequency(Band::A).await.unwrap();
     let freq_b = radio.get_frequency(Band::B).await.unwrap();
     println!("\n=== Result ===");
-    println!("  Band A: {} MHz (CH 021)", freq_a.rx_frequency.as_mhz());
-    println!(
-        "  Band B: {} MHz (CH 019 RutherfdtnPD)",
-        freq_b.rx_frequency.as_mhz()
-    );
+    println!("  Band A: {} MHz (CH 021)", freq_a.as_mhz());
+    println!("  Band B: {} MHz (CH 019 RutherfdtnPD)", freq_b.as_mhz());
 
     let _ = radio.disconnect().await;
 }

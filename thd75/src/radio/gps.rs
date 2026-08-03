@@ -179,13 +179,19 @@ impl<T: Transport> Radio<T> {
     /// standard transceiver operation. `GpsReceiver` (1) means GPS-only mode.
     ///
     /// # Warning
-    /// Only the bare `GM\r` read is safe. Sending `GM 1\r` would reboot
-    /// the radio into GPS-only mode. This method only sends the bare read.
+    /// On standard CAT firmware, only the bare `GM\r` read is safe; sending
+    /// `GM 1\r` would reboot the radio into GPS-only mode. The exact
+    /// `1.03.AZM` firmware repurposes bare `GM`, so this method refuses that
+    /// profile before sending `GM`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the command fails or the response is unexpected.
+    /// Returns [`Error::CommandUnavailableOnFirmware`] without sending `GM`
+    /// on exact `1.03.AZM`. Otherwise, returns an error if the command fails
+    /// or the response is unexpected.
     pub async fn get_gps_mode(&mut self) -> Result<GpsRadioMode, Error> {
+        self.require_firmware_command("GM", super::FirmwareProfile::supports_bare_gps_mode)
+            .await?;
         tracing::debug!("reading GPS/Radio mode");
         let response = self.execute(Command::GetGpsMode).await?;
         match response {

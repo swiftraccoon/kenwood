@@ -44,9 +44,13 @@ async fn write_af_gain() {
     println!("  Original AF gain: {original}");
 
     // Pick a different value (toggle between 10 and 20)
-    let new_value = if original == 10 { 20 } else { 10 };
+    let new_value = if original.as_u8() == 10 {
+        AfGainLevel::new(20)
+    } else {
+        AfGainLevel::new(10)
+    };
     println!("  Writing AF gain: {new_value}");
-    radio.set_af_gain(Band::A, new_value).await.unwrap();
+    radio.set_af_gain(new_value).await.unwrap();
 
     // Read back; must be the new value
     let readback = radio.get_af_gain().await.unwrap();
@@ -54,7 +58,7 @@ async fn write_af_gain() {
     assert_eq!(readback, new_value, "AF gain write did not take effect");
 
     // Restore original
-    radio.set_af_gain(Band::A, original).await.unwrap();
+    radio.set_af_gain(original).await.unwrap();
     let restored = radio.get_af_gain().await.unwrap();
     println!("  Restored AF gain: {restored}");
     assert_eq!(restored, original, "Failed to restore original AF gain");
@@ -336,135 +340,6 @@ async fn write_auto_info() {
 }
 
 // ============================================================
-// FO WRITE: full channel data round-trip
-// ============================================================
-
-/// Test: Write full channel data via FO, read back, verify all fields.
-/// This is the ultimate write test: FO carries all 21 fields.
-/// Safe: we read current state, modify only the step size (cosmetic),
-/// write it back, verify, then restore.
-#[tokio::test]
-#[ignore]
-async fn write_fo_full_channel() {
-    let mut radio = connect().await;
-    println!("\n=== WRITE: FO FULL CHANNEL ===");
-
-    // Read current full state
-    let original = radio.get_frequency_full(Band::A).await.unwrap();
-    println!(
-        "  Original: freq={} step={:?} name={:?}",
-        original.rx_frequency.as_hz(),
-        original.step_size,
-        original.urcall.as_str()
-    );
-
-    // Create modified copy: change step size (harmless)
-    let mut modified = original.clone();
-    modified.step_size = match original.step_size {
-        StepSize::Hz5000 => StepSize::Hz12500,
-        _ => StepSize::Hz5000,
-    };
-    println!("  Writing: step={:?}", modified.step_size);
-    radio.set_frequency_full(Band::A, &modified).await.unwrap();
-
-    // Read back and verify the change
-    let readback = radio.get_frequency_full(Band::A).await.unwrap();
-    println!(
-        "  Readback: freq={} step={:?} name={:?}",
-        readback.rx_frequency.as_hz(),
-        readback.step_size,
-        readback.urcall.as_str()
-    );
-    assert_eq!(
-        readback.step_size, modified.step_size,
-        "FO step size write did not take effect"
-    );
-    // Verify other fields weren't clobbered
-    assert_eq!(
-        readback.rx_frequency, original.rx_frequency,
-        "FO write clobbered rx_frequency"
-    );
-    assert_eq!(
-        readback.tx_offset, original.tx_offset,
-        "FO write clobbered tx_offset"
-    );
-
-    // Restore original
-    radio.set_frequency_full(Band::A, &original).await.unwrap();
-    let restored = radio.get_frequency_full(Band::A).await.unwrap();
-    println!("  Restored: step={:?}", restored.step_size);
-    assert_eq!(
-        restored.step_size, original.step_size,
-        "Failed to restore original step size"
-    );
-
-    let _ = radio.disconnect().await;
-    println!("  PASS");
-}
-
-// ============================================================
-// MEMORY WRITE: channel memory round-trip
-// ============================================================
-
-/// Test: Write a memory channel via ME, read back, verify.
-/// Modifies channel 099 (unlikely to be in use) to avoid clobbering
-/// real saved channels. Restores after test.
-#[tokio::test]
-#[ignore]
-async fn write_memory_channel() {
-    let mut radio = connect().await;
-    println!("\n=== WRITE: MEMORY CHANNEL 099 ===");
-
-    // Read channel 099 current state (may be empty/default)
-    let original = radio.read_channel(99).await.unwrap();
-    println!(
-        "  Original ch099: freq={} name={:?}",
-        original.rx_frequency.as_hz(),
-        original.urcall.as_str()
-    );
-
-    // Write a known test pattern
-    let mut test_channel = original.clone();
-    test_channel.rx_frequency = Frequency::new(146_520_000); // National simplex
-    test_channel.tx_offset = Frequency::new(0);
-    test_channel.shift = ShiftDirection::SIMPLEX;
-    test_channel.step_size = StepSize::Hz5000;
-    test_channel.urcall = ChannelName::new("TEST99").unwrap();
-
-    println!(
-        "  Writing ch099: freq={} name={:?}",
-        test_channel.rx_frequency.as_hz(),
-        test_channel.urcall.as_str()
-    );
-    radio.write_channel(99, &test_channel).await.unwrap();
-
-    // Read back and verify
-    let readback = radio.read_channel(99).await.unwrap();
-    println!(
-        "  Readback ch099: freq={} name={:?}",
-        readback.rx_frequency.as_hz(),
-        readback.urcall.as_str()
-    );
-    assert_eq!(
-        readback.rx_frequency, test_channel.rx_frequency,
-        "ME frequency write failed"
-    );
-    assert_eq!(readback.urcall.as_str(), "TEST99", "ME urcall write failed");
-
-    // Restore original
-    radio.write_channel(99, &original).await.unwrap();
-    let restored = radio.read_channel(99).await.unwrap();
-    println!(
-        "  Restored ch099: freq={} name={:?}",
-        restored.rx_frequency.as_hz(),
-        restored.urcall.as_str()
-    );
-
-    let _ = radio.disconnect().await;
-    println!("  PASS");
-}
-
-// ============================================================
 // INVESTIGATE REJECTED COMMANDS
 // ============================================================
 
@@ -518,7 +393,7 @@ async fn investigate_mr_command() {
     let result = radio
         .execute(Command::RecallMemoryChannel {
             band: Band::A,
-            channel: 0,
+            selector: MemorySelector::try_from(0_u16).unwrap(),
         })
         .await;
     match &result {
@@ -528,25 +403,6 @@ async fn investigate_mr_command() {
 
     // The RE shows MR handler at 0xC002E694; it might take band,channel format
     // rather than just channel number.
-
-    let _ = radio.disconnect().await;
-}
-
-/// Investigate US (user settings): does it need a sub-parameter?
-/// Theory: US may be a prefix command that needs a sub-command number.
-#[tokio::test]
-#[ignore]
-async fn investigate_us_command() {
-    let mut radio = connect().await;
-    println!("\n=== INVESTIGATE: US COMMAND ===");
-
-    // Try US with parameter 0
-    println!("  Trying raw 'US 0'...");
-    let result = radio.execute(Command::GetUserSettings).await;
-    match &result {
-        Ok(resp) => println!("  US OK: {resp:?}"),
-        Err(e) => println!("  US fails: {e}"),
-    }
 
     let _ = radio.disconnect().await;
 }

@@ -36,6 +36,19 @@ fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> 
     })
 }
 
+/// Parse a protocol Boolean, accepting exactly `0` or `1`.
+fn parse_bool_field(s: &str, cmd: &str, field: &str) -> Result<bool, ProtocolError> {
+    match s {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(ProtocolError::FieldParse {
+            command: cmd.to_owned(),
+            field: field.to_owned(),
+            detail: format!("expected 0 or 1, got {s:?}"),
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Individual parsers
 // ---------------------------------------------------------------------------
@@ -59,11 +72,11 @@ fn parse_gp(payload: &str) -> Result<Response, ProtocolError> {
             detail: format!("expected 2 fields (gps_enabled,pc_output), got {payload:?}"),
         });
     }
-    let gps_val = parse_u8_field(gps_str, "GP", "gps_enabled")?;
-    let pc_val = parse_u8_field(pc_str, "GP", "pc_output")?;
+    let gps_enabled = parse_bool_field(gps_str, "GP", "gps_enabled")?;
+    let pc_output = parse_bool_field(pc_str, "GP", "pc_output")?;
     Ok(Response::GpsConfig {
-        gps_enabled: gps_val != 0,
-        pc_output: pc_val != 0,
+        gps_enabled,
+        pc_output,
     })
 }
 
@@ -100,12 +113,12 @@ fn parse_gs(payload: &str) -> Result<Response, ProtocolError> {
             detail: format!("expected 6 fields, got {actual}"),
         });
     };
-    let gga = parse_u8_field(raw_gga, "GS", "gga")? != 0;
-    let gll = parse_u8_field(raw_gll, "GS", "gll")? != 0;
-    let gsa = parse_u8_field(raw_gsa, "GS", "gsa")? != 0;
-    let gsv = parse_u8_field(raw_gsv, "GS", "gsv")? != 0;
-    let rmc = parse_u8_field(raw_rmc, "GS", "rmc")? != 0;
-    let vtg = parse_u8_field(raw_vtg, "GS", "vtg")? != 0;
+    let gga = parse_bool_field(raw_gga, "GS", "gga")?;
+    let gll = parse_bool_field(raw_gll, "GS", "gll")?;
+    let gsa = parse_bool_field(raw_gsa, "GS", "gsa")?;
+    let gsv = parse_bool_field(raw_gsv, "GS", "gsv")?;
+    let rmc = parse_bool_field(raw_rmc, "GS", "rmc")?;
+    let vtg = parse_bool_field(raw_vtg, "GS", "vtg")?;
     Ok(Response::GpsSentences {
         gga,
         gll,

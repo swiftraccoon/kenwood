@@ -1,10 +1,10 @@
-//! D-STAR (Digital Smart Technologies for Amateur Radio) commands: DS, CS, GW.
+//! D-STAR (Digital Smart Technologies for Amateur Radio) commands: DS and GW.
 //!
-//! Provides parsing of responses for the 3 D-STAR-related CAT protocol
+//! Provides parsing of responses for the D-STAR-related CAT protocol
 //! commands. Serialization is handled inline by the main dispatcher.
 
 use crate::error::ProtocolError;
-use crate::types::radio_params::{CallsignSlot, DstarSlot, DvGatewayMode};
+use crate::types::radio_params::{DstarSlot, DvGatewayMode};
 
 use super::Response;
 
@@ -30,15 +30,6 @@ pub(crate) fn parse_dstar(
                 .map(|slot| Response::DstarSlot { slot })
                 .map_err(|e| ProtocolError::FieldParse {
                     command: "DS".into(),
-                    field: "slot".into(),
-                    detail: e.to_string(),
-                })
-        })),
-        "CS" => Some(parse_u8_field(payload, "CS", "slot").and_then(|raw| {
-            CallsignSlot::try_from(raw)
-                .map(|slot| Response::ActiveCallsignSlot { slot })
-                .map_err(|e| ProtocolError::FieldParse {
-                    command: "CS".into(),
                     field: "slot".into(),
                     detail: e.to_string(),
                 })

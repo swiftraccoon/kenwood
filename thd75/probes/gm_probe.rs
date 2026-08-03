@@ -1,4 +1,6 @@
 //! Quick probe: does GM have a read response?
+mod firmware_guard;
+
 use kenwood_thd75::protocol::Codec;
 use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
 
@@ -19,6 +21,34 @@ fn open_transport() -> (String, EitherTransport) {
     panic!("No device found");
 }
 
+async fn send_and_read(
+    transport: &mut EitherTransport,
+    codec: &mut Codec,
+    buf: &mut [u8],
+    command: &str,
+) -> Option<String> {
+    let wire = format!("{command}\r");
+    if transport.write(wire.as_bytes()).await.is_err() {
+        return None;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match transport.read(buf).await {
+                Ok(n) if n > 0 => {
+                    codec.feed(&buf[..n]);
+                    if let Some(frame) = codec.next_frame() {
+                        return String::from_utf8_lossy(&frame).to_string();
+                    }
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
 fn main() {
     let (path, mut transport) = open_transport();
     eprintln!("Connected via: {path}");
@@ -33,102 +63,44 @@ fn main() {
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(500),
             transport.read(&mut buf),
-        ).await;
+        )
+        .await;
+
+        let fv_response = send_and_read(&mut transport, &mut codec, &mut buf, "FV").await;
+        match &fv_response {
+            Some(response) => println!("Firmware identity: {response}"),
+            None => println!("Firmware identity: timeout (stock GM will be refused)"),
+        }
+        let firmware_version = fv_response
+            .as_deref()
+            .and_then(firmware_guard::parse_fv_frame)
+            .map(str::to_owned);
 
         // Test GM bare read
-        let _ = transport.write(b"GM\r").await;
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            async {
-                loop {
-                    match transport.read(&mut buf).await {
-                        Ok(n) if n > 0 => {
-                            codec.feed(&buf[..n]);
-                            if let Some(frame) = codec.next_frame() {
-                                return String::from_utf8_lossy(&frame).to_string();
-                            }
-                        }
-                        _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-                    }
-                }
+        match firmware_guard::require_stock_bare_probe("GM", firmware_version.as_deref()) {
+            Ok(()) => match send_and_read(&mut transport, &mut codec, &mut buf, "GM").await {
+                Some(response) => println!("GM read response: {response}"),
+                None => println!("GM read: timeout (no response)"),
             },
-        ).await;
-        match result {
-            Ok(resp) => println!("GM read response: {resp}"),
-            Err(_) => println!("GM read: timeout (no response)"),
+            Err(diagnostic) => println!("{diagnostic}"),
         }
 
         // Test MS bare read
-        let _ = transport.write(b"MS\r").await;
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            async {
-                loop {
-                    match transport.read(&mut buf).await {
-                        Ok(n) if n > 0 => {
-                            codec.feed(&buf[..n]);
-                            if let Some(frame) = codec.next_frame() {
-                                return String::from_utf8_lossy(&frame).to_string();
-                            }
-                        }
-                        _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-                    }
-                }
-            },
-        ).await;
-        match result {
-            Ok(resp) => println!("MS read response: {resp}"),
-            Err(_) => println!("MS read: timeout (no response)"),
+        match send_and_read(&mut transport, &mut codec, &mut buf, "MS").await {
+            Some(response) => println!("MS read response: {response}"),
+            None => println!("MS read: timeout (no response)"),
         }
 
         // Test BS 0 read
-        let _ = transport.write(b"BS 0\r").await;
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            async {
-                loop {
-                    match transport.read(&mut buf).await {
-                        Ok(n) if n > 0 => {
-                            codec.feed(&buf[..n]);
-                            if let Some(frame) = codec.next_frame() {
-                                return String::from_utf8_lossy(&frame).to_string();
-                            }
-                        }
-                        _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-                    }
-                }
-            },
-        ).await;
-        match result {
-            Ok(resp) => println!("BS 0 read response: {resp}"),
-            Err(_) => println!("BS 0 read: timeout (no response)"),
+        match send_and_read(&mut transport, &mut codec, &mut buf, "BS 0").await {
+            Some(response) => println!("BS 0 read response: {response}"),
+            None => println!("BS 0 read: timeout (no response)"),
         }
 
         // Test BL read (already works, just verify format)
-        let _ = transport.write(b"BL\r").await;
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            async {
-                loop {
-                    match transport.read(&mut buf).await {
-                        Ok(n) if n > 0 => {
-                            codec.feed(&buf[..n]);
-                            if let Some(frame) = codec.next_frame() {
-                                return String::from_utf8_lossy(&frame).to_string();
-                            }
-                        }
-                        _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-                    }
-                }
-            },
-        ).await;
-        match result {
-            Ok(resp) => println!("BL read response: {resp}"),
-            Err(_) => println!("BL read: timeout (no response)"),
+        match send_and_read(&mut transport, &mut codec, &mut buf, "BL").await {
+            Some(response) => println!("BL read response: {response}"),
+            None => println!("BL read: timeout (no response)"),
         }
     });
 }

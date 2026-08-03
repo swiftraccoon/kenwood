@@ -96,8 +96,7 @@ pub(crate) async fn save_if_dsp_radio_state<T: Transport>(
     let band_b_frequency = radio
         .get_frequency(Band::B)
         .await
-        .map_err(|error| format!("reading Band-B frequency: {error}"))?
-        .rx_frequency;
+        .map_err(|error| format!("reading Band-B frequency: {error}"))?;
 
     Ok(SavedIfDspRadioState {
         operation_band,

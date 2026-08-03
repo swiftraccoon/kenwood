@@ -20,33 +20,32 @@
 //!
 //! The D75 has two frequency-related command pairs:
 //!
-//! - **FQ** (read-only): returns the current frequency and step size for a band. Writes are
-//!   rejected by the firmware; use FO for frequency changes.
-//! - **FO** (read/write): returns or sets the full channel configuration for a band, including
-//!   frequency, offset, tone mode, CTCSS/DCS codes, shift direction, and more. This is the
-//!   primary command for tuning the radio via CAT.
+//! - **FQ** (read-only): returns exactly the band and its ten-digit frequency. It does not
+//!   carry a step-size or full channel record.
+//! - **FO** (read-only in this library): returns the full 20-field CAT channel record. The
+//!   former writer was lossy and is quarantined until every field and its readback behavior
+//!   have been qualified.
 //!
 //! # VFO mode requirement
 //!
-//! Most write commands in this module (FO write, MD write, SQ write, FS write, etc.) require the
-//! target band to be in VFO mode. If the band is in Memory, Call, or WX mode, the radio returns
-//! `?` and the write is silently rejected. Use [`set_vfo_memory_mode`](Radio::set_vfo_memory_mode)
-//! to switch to VFO mode first, or use the safe `tune_frequency()` API which handles mode
-//! management automatically.
+//! Band-indexed write commands generally require the target band to be in VFO mode. If the band
+//! is in Memory, Call, or WX mode, the radio may reject the write. Use
+//! [`set_vfo_memory_mode`](Radio::set_vfo_memory_mode) explicitly. Frequency tuning remains
+//! unavailable while the complete FO write record is under qualification.
 //!
 //! # Tone and offset configuration
 //!
 //! CTCSS tone, DCS code, tone mode, and repeater offset are not configured through dedicated
-//! commands. Instead, they are fields within the [`ChannelMemory`] struct passed to
-//! [`set_frequency_full`](Radio::set_frequency_full) (FO write). Read the current state with
-//! [`get_frequency_full`](Radio::get_frequency_full), modify the desired fields, and write it back.
+//! commands. They are fields within the full FO record returned by
+//! [`get_frequency_full`](Radio::get_frequency_full). Writing that record is intentionally
+//! unavailable because a partial read-modify-write can alter unrelated radio state.
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
 use crate::types::{
-    Band, ChannelMemory, FilterMode, FilterWidthIndex, FineStep, Mode, PowerLevel, SMeterReading,
-    SquelchLevel, VfoMemoryMode,
+    Band, CatChannelRecord, ChannelMemory, FilterMode, FilterWidthIndex, FineStep, Frequency,
+    MemorySelector, Mode, PowerLevel, SMeterReading, SquelchLevel, VfoMemoryMode,
 };
 
 use super::Radio;
@@ -57,11 +56,11 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_frequency(&mut self, band: Band) -> Result<ChannelMemory, Error> {
+    pub async fn get_frequency(&mut self, band: Band) -> Result<Frequency, Error> {
         tracing::debug!(?band, "reading frequency data");
         let response = self.execute(Command::GetFrequency { band }).await?;
         match response {
-            Response::Frequency { channel, .. } => Ok(channel),
+            Response::Frequency { frequency, .. } => Ok(frequency),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "Frequency".into(),
                 actual: format!("{other:?}").into_bytes(),
@@ -74,7 +73,7 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_frequency_full(&mut self, band: Band) -> Result<ChannelMemory, Error> {
+    pub async fn get_frequency_full(&mut self, band: Band) -> Result<CatChannelRecord, Error> {
         tracing::debug!(?band, "reading full frequency data");
         let response = self.execute(Command::GetFrequencyFull { band }).await?;
         match response {
@@ -86,47 +85,31 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Write full frequency and settings for the given band (FO write).
+    /// Attempt to write a full FO record.
     ///
-    /// Sends the full channel configuration (frequency, offset, tone mode, CTCSS/DCS codes,
-    /// shift direction, and other fields) to the radio for the specified band.
-    ///
-    /// # VFO mode requirement
-    ///
-    /// The target band **must** be in VFO mode (`VM band,0`). If the band is in Memory, Call,
-    /// or WX mode, the radio returns `?` and the write is silently rejected. Use
-    /// [`set_vfo_memory_mode`](Self::set_vfo_memory_mode) to switch to VFO first, or prefer
-    /// `tune_frequency()` which handles mode management safely.
-    ///
-    /// # Wire format
-    ///
-    /// `FO band,freq,step,shift,reverse,tone_status,ctcss_status,dcs_status,tone_freq,ctcss_freq,dcs_code,offset,...\r`
-    ///
-    /// The full FO command encodes all 21 fields of the [`ChannelMemory`] struct as
-    /// comma-separated values.
+    /// This writer is quarantined. The former codec emitted literal zeroes
+    /// for transmit step, CAT mode, fine-enable, and fine-step. A seemingly
+    /// harmless read-modify-write could therefore change DV to FM and clear
+    /// fine tuning. It remains unavailable until every FO field is modeled
+    /// and full-record readback is qualified on hardware.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
+    #[expect(
+        clippy::unused_async,
+        reason = "Compatibility quarantine: keep the existing async public API while returning \
+                  before I/O until the full FO wire record is qualified"
+    )]
     pub async fn set_frequency_full(
         &mut self,
-        band: Band,
-        channel: &ChannelMemory,
+        _band: Band,
+        _channel: &ChannelMemory,
     ) -> Result<(), Error> {
-        tracing::debug!(?band, "writing full frequency data");
-        let response = self
-            .execute(Command::SetFrequencyFull {
-                band,
-                channel: channel.clone(),
-            })
-            .await?;
-        match response {
-            Response::FrequencyFull { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "FrequencyFull".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
+        Err(Error::UnqualifiedCatWrite {
+            command: "FO",
+            reason: "the current channel model cannot preserve all 20 wire fields",
+        })
     }
 
     /// Get the operating mode for the given band (MD read).
@@ -319,7 +302,7 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Switch the given band to transmit mode (TX action).
+    /// Switch the current operating context to transmit mode (bare TX action).
     ///
     /// # RF emission warning
     ///
@@ -335,14 +318,15 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Wire format
     ///
-    /// `TX band\r` where band is 0 (A) or 1 (B). Returns `OK\r` on success.
+    /// `TX\r`. The command has no band parameter; select the active band
+    /// separately before transmitting. Returns `OK\r` on success.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn transmit(&mut self, band: Band) -> Result<(), Error> {
-        tracing::info!(?band, "keying transmitter");
-        let response = self.execute(Command::Transmit { band }).await?;
+    pub async fn transmit(&mut self) -> Result<(), Error> {
+        tracing::info!("keying transmitter on the current operating context");
+        let response = self.execute(Command::Transmit).await?;
         match response {
             Response::Ok => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -352,7 +336,7 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Switch the given band to receive mode (RX action).
+    /// Switch the current operating context to receive mode (bare RX action).
     ///
     /// Stops transmitting and returns the radio to receive mode. This is the counterpart to
     /// [`transmit`](Self::transmit) and **must** be called after transmitting to stop RF
@@ -360,14 +344,14 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Wire format
     ///
-    /// `RX band\r` where band is 0 (A) or 1 (B). Returns `OK\r` on success.
+    /// `RX\r`. Returns `OK\r` on success.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn receive(&mut self, band: Band) -> Result<(), Error> {
-        tracing::info!(?band, "returning to receive");
-        let response = self.execute(Command::Receive { band }).await?;
+    pub async fn receive(&mut self) -> Result<(), Error> {
+        tracing::info!("returning the current operating context to receive");
+        let response = self.execute(Command::Receive).await?;
         match response {
             Response::Ok => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -509,20 +493,22 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get the current memory channel number for a band (MR read).
+    /// Get the current memory selector for a band (MR read).
     ///
-    /// Hardware-verified: `MR band\r` returns `MR bandCCC` where CCC is
-    /// the channel number. This is a read that queries which channel is
-    /// active, not an action that changes the channel.
+    /// Hardware-verified: the request is band-indexed, while the response is
+    /// the selector alone (`MR 021`, `MR L00`, `MR Pri`, and so on). This is a
+    /// read that queries which selector is active, not an action that changes
+    /// the channel. A band with no active memory selector (for example, while
+    /// operating in VFO mode) returns `N`, surfaced as [`Error::NotAvailable`].
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_current_channel(&mut self, band: Band) -> Result<u16, Error> {
-        tracing::debug!(?band, "reading current memory channel");
+    pub async fn get_current_channel(&mut self, band: Band) -> Result<MemorySelector, Error> {
+        tracing::debug!(?band, "reading current memory selector");
         let response = self.execute(Command::GetCurrentChannel { band }).await?;
         match response {
-            Response::CurrentChannel { channel, .. } => Ok(channel),
+            Response::CurrentChannel { selector } => Ok(selector),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "CurrentChannel".into(),
                 actual: format!("{other:?}").into_bytes(),
@@ -539,27 +525,41 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns an error if the command fails or the response is unexpected.
     pub async fn recall_channel(&mut self, band: Band, channel: u16) -> Result<(), Error> {
-        // The `MR {},{:03}` wire format silently grows to 4+ digits
-        // for out-of-range channels, so validate before the wire.
-        if channel > 999 {
-            return Err(Error::Validation(
-                crate::error::ValidationError::ChannelOutOfRange { channel, max: 999 },
-            ));
-        }
-        tracing::info!(?band, channel, "recalling memory channel");
+        let selector = MemorySelector::try_from(channel)?;
+        self.recall_memory(band, selector).await
+    }
+
+    /// Recall an exact memory selector on the given band (MR action).
+    ///
+    /// Supports ordinary channels, program-scan edges, regional selectors,
+    /// and the priority channel without collapsing them to a fabricated
+    /// numeric channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails or the response is unexpected.
+    pub async fn recall_memory(
+        &mut self,
+        band: Band,
+        selector: MemorySelector,
+    ) -> Result<(), Error> {
+        tracing::info!(?band, %selector, "recalling memory selector");
         let response = self
-            .execute(Command::RecallMemoryChannel { band, channel })
+            .execute(Command::RecallMemoryChannel { band, selector })
             .await?;
         match response {
-            Response::MemoryRecall { .. } => Ok(()),
+            Response::MemoryRecall {
+                band: response_band,
+                selector: response_selector,
+            } if response_band == band && response_selector == selector => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "MemoryRecall".into(),
+                expected: format!("MemoryRecall {{ band: {band:?}, selector: {selector} }}"),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
     }
 
-    /// Step the frequency up by one increment on the given band (UP action).
+    /// Step the current operating context up by one increment (bare UP action).
     ///
     /// This is an ACTION command that changes the radio's active frequency.
     /// There is no undo; the previous frequency is not preserved.
@@ -567,13 +567,13 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn frequency_up(&mut self, band: Band) -> Result<(), Error> {
-        tracing::info!(?band, "stepping frequency up");
-        let response = self.execute(Command::FrequencyUp { band }).await?;
+    pub async fn frequency_up(&mut self) -> Result<(), Error> {
+        tracing::info!("stepping current operating context up");
+        let response = self.execute(Command::FrequencyUp).await?;
         match response {
-            Response::Ok => Ok(()),
+            Response::FrequencyUp | Response::Ok => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "Ok".into(),
+                expected: "FrequencyUp".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -627,7 +627,8 @@ impl<T: Transport> Radio<T> {
     /// Get the fine step setting (FS bare read).
     ///
     /// Firmware-verified: FS = Fine Step. Bare `FS\r` returns a single value (0-3).
-    /// No band parameter: the radio returns a global fine step setting.
+    /// No band parameter: the radio returns the fine step for the current
+    /// operating context.
     ///
     /// # Errors
     ///
@@ -637,30 +638,6 @@ impl<T: Transport> Radio<T> {
         let response = self.execute(Command::GetFineStep).await?;
         match response {
             Response::FineStep { step } => Ok(step),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "FineStep".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Set the fine step for a band (FS write).
-    ///
-    /// Firmware-verified: `FS band,step\r` (band 0-1, step 0-3).
-    ///
-    /// # Firmware bug (v1.03)
-    ///
-    /// FS write is broken on firmware 1.03: the radio returns `N`
-    /// (not available) for all write attempts.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_fine_step(&mut self, band: Band, step: FineStep) -> Result<(), Error> {
-        tracing::info!(?band, ?step, "setting fine step");
-        let response = self.execute(Command::SetFineStep { band, step }).await?;
-        match response {
-            Response::FineStep { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "FineStep".into(),
                 actual: format!("{other:?}").into_bytes(),
@@ -706,92 +683,6 @@ impl<T: Transport> Radio<T> {
             Response::FunctionType { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "FunctionType".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Set the S-meter value for a band (SM write) -- calibration/test interface.
-    ///
-    /// # Warning
-    ///
-    /// This is likely a calibration or test/debug interface. Setting the S-meter
-    /// value directly may interfere with normal signal strength readings. The
-    /// exact behavior and persistence of written values is undocumented.
-    ///
-    /// # Wire format
-    ///
-    /// `SM band,level\r` where band is 0 (A) or 1 (B) and level is a hex nibble value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_smeter(&mut self, band: Band, level: SMeterReading) -> Result<(), Error> {
-        tracing::info!(?band, ?level, "setting S-meter (SM write, calibration)");
-        let response = self.execute(Command::SetSmeter { band, level }).await?;
-        match response {
-            Response::Smeter { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "Smeter".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Set the busy/squelch state for a band (BY write) -- test/debug interface.
-    ///
-    /// # Warning
-    ///
-    /// This is likely a test or debug interface. Setting the busy state directly
-    /// may interfere with normal squelch operation. Use with caution.
-    ///
-    /// # Wire format
-    ///
-    /// `BY band,state\r` where band is 0 (A) or 1 (B) and state is 0 (not busy)
-    /// or 1 (busy).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_busy(&mut self, band: Band, busy: bool) -> Result<(), Error> {
-        tracing::info!(?band, busy, "setting busy state (BY write, test/debug)");
-        let response = self.execute(Command::SetBusy { band, busy }).await?;
-        match response {
-            Response::Busy { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "Busy".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Set the radio model identification string (ID write) -- factory programming command.
-    ///
-    /// # Safety
-    ///
-    /// **DANGEROUS FACTORY COMMAND.** This is intended for factory programming
-    /// only. Writing an incorrect model ID may cause the radio to behave as a
-    /// different model, disable features, or brick the device. **Do not use
-    /// unless you fully understand the consequences.**
-    ///
-    /// # Wire format
-    ///
-    /// `ID model\r`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_radio_id(&mut self, model: &str) -> Result<(), Error> {
-        tracing::warn!(model, "setting radio model ID (FACTORY COMMAND)");
-        let response = self
-            .execute(Command::SetRadioId {
-                model: model.to_owned(),
-            })
-            .await?;
-        match response {
-            Response::RadioId { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "RadioId".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }

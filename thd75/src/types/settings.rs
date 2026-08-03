@@ -86,16 +86,23 @@ impl Default for DisplaySettings {
 /// timer duration (Menu No. 901). Pressing `[Power]` while lit turns
 /// the light off immediately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum BacklightControl {
+    /// Backlight is toggled manually with the assigned backlight key.
+    Manual = 0,
     /// Backlight always on while power is on.
-    On,
+    On = 1,
     /// Backlight auto (turns on with key press or encoder rotation,
     /// off after the timer in Menu No. 901 expires). Also lights on
     /// APRS interrupt reception and scan pause/stop.
-    Auto,
-    /// Backlight always off (only `[Power]` can trigger temporary
-    /// lighting in Manual mode, per User Manual Chapter 12).
-    Off,
+    Auto = 2,
+    /// Automatic on battery and continuously on while DC input is present.
+    AutoDcIn = 3,
+}
+
+impl BacklightControl {
+    /// Number of CAT/MCP values accepted by Menu No. 900 (`0..=3`).
+    pub const COUNT: u8 = 4;
 }
 
 /// Background color theme for the LCD display (Menu No. 906).
@@ -828,15 +835,22 @@ impl TryFrom<u8> for BacklightControl {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::On),
-            1 => Ok(Self::Auto),
-            2 => Ok(Self::Off),
+            0 => Ok(Self::Manual),
+            1 => Ok(Self::On),
+            2 => Ok(Self::Auto),
+            3 => Ok(Self::AutoDcIn),
             _ => Err(ValidationError::SettingOutOfRange {
                 name: "backlight control",
                 value,
-                detail: "must be 0-2",
+                detail: "must be 0-3",
             }),
         }
+    }
+}
+
+impl From<BacklightControl> for u8 {
+    fn from(control: BacklightControl) -> Self {
+        control as Self
     }
 }
 

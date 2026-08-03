@@ -308,6 +308,15 @@ pub enum SchemaError {
         /// Supplied raw value.
         value: u64,
     },
+    /// A descriptor reuses a generated catalog name with different metadata.
+    CatalogDescriptorMismatch {
+        /// Field name shared with the generated catalog entry.
+        field: &'static str,
+        /// Offset supplied by the caller.
+        offset: usize,
+        /// Offset declared by the generated catalog.
+        expected_offset: usize,
+    },
     /// Text is too long for a fixed-width field.
     TextTooLong {
         /// Field name.
@@ -421,6 +430,15 @@ impl fmt::Display for SchemaError {
             Self::DisallowedValue { field, value } => {
                 write!(f, "field {field} does not allow raw value {value}")
             }
+            Self::CatalogDescriptorMismatch {
+                field,
+                offset,
+                expected_offset,
+            } => write!(
+                f,
+                "field {field} descriptor does not match the generated catalog \
+                 (offset 0x{offset:X}, expected 0x{expected_offset:X})"
+            ),
             Self::TextTooLong { field, actual, max } => {
                 write!(f, "field {field} text is {actual} bytes (maximum {max})")
             }
@@ -650,15 +668,21 @@ impl PatchPlanner {
     /// [`SchemaError::PatchConflict`].  A later assignment therefore never
     /// silently replaces an earlier one.
     ///
-    /// Only the descriptor's storage codec is validated here.  Finite enum
-    /// and UI-choice domains live in the generated [`MenuField`] metadata and
-    /// are enforced by [`MenuField::plan_value`].
+    /// The descriptor's storage codec is always validated here. Finite enum
+    /// and UI-choice domains live in the generated [`MenuField`] metadata; if
+    /// this descriptor names a generated menu field, those domains are also
+    /// enforced so callers cannot bypass [`MenuField::plan_value`] by passing
+    /// its descriptor directly. A descriptor that reuses a generated field
+    /// name but does not exactly match its catalog entry is rejected.
     ///
     /// # Errors
     ///
-    /// Returns an error for a type mismatch, out-of-range value, oversized
-    /// text or byte input, malformed descriptor, or conflicting overlapping
-    /// patch.
+    /// Returns [`SchemaError::DisallowedValue`] for a generated field value
+    /// outside its finite enum or UI-choice domain, and
+    /// [`SchemaError::CatalogDescriptorMismatch`] when generated catalog
+    /// metadata has been altered. Other errors cover type mismatches,
+    /// out-of-range values, oversized text or byte input, malformed
+    /// descriptors, and conflicting overlapping patches.
     ///
     /// [`MenuField`]: super::MenuField
     /// [`MenuField::plan_value`]: super::MenuField::plan_value
@@ -667,6 +691,16 @@ impl PatchPlanner {
         field: &FieldDescriptor,
         value: FieldValue<'_>,
     ) -> Result<&mut Self, SchemaError> {
+        if let Some(menu_field) = super::menu_field(field.name) {
+            if menu_field.descriptor != *field {
+                return Err(SchemaError::CatalogDescriptorMismatch {
+                    field: field.name,
+                    offset: field.offset,
+                    expected_offset: menu_field.descriptor.offset,
+                });
+            }
+            menu_field.validate_patch_value(value)?;
+        }
         let encoded = encode_field(field, value)?;
         for (absolute, mask, bits) in encoded {
             self.merge_byte(field.name, absolute, mask, bits)?;

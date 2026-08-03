@@ -9,7 +9,8 @@
 
 use crate::{help_text, lint, output};
 use kenwood_thd75::types::{
-    Band, BatteryLevel, BeaconMode, DetectOutputMode, PowerLevel, TncBaud, TncMode,
+    Band, BatteryLevel, BeaconMode, DetectOutputMode, PowerLevel, RadioClock, RadioDateTime,
+    TncBaud, TncMode,
 };
 
 /// One entry in the coverage table: a human-readable source name and
@@ -126,7 +127,6 @@ fn gen_tnc_mode() -> Vec<String> {
 fn gen_beacon_type() -> Vec<String> {
     let mut v = Vec::new();
     for mode in [
-        BeaconMode::Off,
         BeaconMode::Manual,
         BeaconMode::Ptt,
         BeaconMode::Auto,
@@ -169,6 +169,7 @@ fn gen_battery() -> Vec<String> {
         BatteryLevel::TwoThirds,
         BatteryLevel::Full,
         BatteryLevel::Charging,
+        BatteryLevel::Raw5,
     ]
     .iter()
     .map(|l| output::battery(*l))
@@ -184,7 +185,13 @@ fn gen_firmware_version() -> Vec<String> {
 }
 
 fn gen_clock() -> Vec<String> {
-    vec![output::clock("2026-04-10 14:32:07")]
+    let Ok(value) = RadioDateTime::new(2026, 4, 10, 14, 32, 7) else {
+        return vec![output::clock(RadioClock::Unavailable)];
+    };
+    vec![
+        output::clock(value.into()),
+        output::clock(RadioClock::Unavailable),
+    ]
 }
 
 fn gen_key_lock() -> Vec<String> {

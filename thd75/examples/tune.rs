@@ -101,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read back to confirm.
     let readback = radio.get_frequency(band).await?;
-    println!("Band {band} now on: {} Hz", readback.rx_frequency);
+    println!("Band {band} now on: {} Hz", readback.as_hz());
 
     radio.disconnect().await?;
     println!("Disconnected.");

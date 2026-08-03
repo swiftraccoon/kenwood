@@ -98,11 +98,19 @@ async fn map_single_setting(
     set_cmd: Command,
     restore_cmd: Command,
 ) -> Vec<(usize, u8, u8)> {
+    map_single_setting_with_radio(name, connect().await, set_cmd, restore_cmd).await
+}
+
+async fn map_single_setting_with_radio(
+    name: &str,
+    mut radio: Radio<SerialTransport>,
+    set_cmd: Command,
+    restore_cmd: Command,
+) -> Vec<(usize, u8, u8)> {
     println!("\n=== Mapping '{name}' ===\n");
 
     // Step 1: Baseline dump.
     println!("  [1/4] Baseline dump...");
-    let mut radio = connect().await;
     let baseline = dump_memory(&mut radio).await;
     eprintln!();
     println!("         {} bytes", baseline.len());
@@ -154,6 +162,45 @@ async fn map_single_setting(
     }
 
     diffs
+}
+
+fn backlight_mapping_commands(original: BacklightControl) -> (Command, Command) {
+    let changed = if original == BacklightControl::Manual {
+        BacklightControl::Auto
+    } else {
+        BacklightControl::Manual
+    };
+    (
+        Command::SetBacklightControl { mode: changed },
+        Command::SetBacklightControl { mode: original },
+    )
+}
+
+async fn map_backlight_control_setting() -> Vec<(usize, u8, u8)> {
+    let mut radio = connect().await;
+    let original = radio.get_backlight_control().await.unwrap();
+    let (set_cmd, restore_cmd) = backlight_mapping_commands(original);
+    map_single_setting_with_radio("backlight_control", radio, set_cmd, restore_cmd).await
+}
+
+#[test]
+fn backlight_mapping_always_changes_then_restores_the_observed_mode() {
+    for original in [
+        BacklightControl::Manual,
+        BacklightControl::On,
+        BacklightControl::Auto,
+        BacklightControl::AutoDcIn,
+    ] {
+        let (set_cmd, restore_cmd) = backlight_mapping_commands(original);
+        assert!(matches!(
+            set_cmd,
+            Command::SetBacklightControl { mode } if mode != original
+        ));
+        assert!(matches!(
+            restore_cmd,
+            Command::SetBacklightControl { mode } if mode == original
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,13 +260,8 @@ async fn map_attenuator_a() {
 
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
-async fn map_lock() {
-    let _ = map_single_setting(
-        "lock",
-        Command::SetLock { locked: false },
-        Command::SetLock { locked: true },
-    )
-    .await;
+async fn map_backlight_control() {
+    let _ = map_backlight_control_setting().await;
 }
 
 #[tokio::test]
@@ -359,11 +401,6 @@ async fn map_all_settings() {
             restore_cmd: Command::SetVoxDelay { delay: 1 },
         },
         SettingTest {
-            name: "lock",
-            set_cmd: Command::SetLock { locked: false },
-            restore_cmd: Command::SetLock { locked: true },
-        },
-        SettingTest {
             name: "dual_band",
             set_cmd: Command::SetDualBand { enabled: true },
             restore_cmd: Command::SetDualBand { enabled: false },
@@ -430,12 +467,17 @@ async fn map_all_settings() {
     ];
 
     let mut results: BTreeMap<String, Vec<(usize, u8, u8)>> = BTreeMap::new();
+    let total = tests.len() + 1;
+
+    println!("\n--- Setting 1/{total}: 'backlight_control' ---");
+    let backlight_diffs = map_backlight_control_setting().await;
+    let _ = results.insert("backlight_control".to_string(), backlight_diffs);
 
     for (i, test) in tests.iter().enumerate() {
         println!(
             "\n--- Setting {}/{}: '{}' ---",
-            i + 1,
-            tests.len(),
+            i + 2,
+            total,
             test.name
         );
 

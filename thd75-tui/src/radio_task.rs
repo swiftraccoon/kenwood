@@ -1,10 +1,12 @@
 use std::time::Duration;
 
+use kenwood_thd75::FirmwareProfile;
 use kenwood_thd75::LinkDiagnosis;
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::{Band, SMeterReading};
+use kenwood_thd75::transport::Transport;
+use kenwood_thd75::types::{Band, DvGatewayMode, GpsRadioMode, SMeterReading};
 use tokio::sync::mpsc;
 
 use crate::app::{BandState, Message, RadioState};
@@ -135,7 +137,13 @@ pub(crate) async fn spawn_with_transport(
     // Subscribe to unsolicited notifications from AI mode
     let mut notifications = radio.subscribe();
 
-    let firmware_version = radio.get_firmware_version().await.unwrap_or_default();
+    // GM and GW are repurposed by the Azimuth automation firmware. Keep the
+    // exact firmware profile alongside the radio so periodic polling never
+    // emits either stock query on that target. A failed FV read is also
+    // fail-closed: collision-prone reads remain disabled until reconnect can
+    // establish the profile.
+    let (firmware_version, mut firmware_profile) =
+        read_firmware_profile(&mut radio, "initial connection").await;
     let radio_type = radio
         .get_radio_type()
         .await
@@ -236,7 +244,14 @@ pub(crate) async fn spawn_with_transport(
                 loop {
                     tokio::select! {
                         () = tokio::time::sleep(POLL_INTERVAL) => {
-                            match poll_once(radio, s_meter_a, s_meter_b, busy_a, busy_b).await {
+                            match poll_once(
+                                radio,
+                                firmware_profile,
+                                s_meter_a,
+                                s_meter_b,
+                                busy_a,
+                                busy_b,
+                            ).await {
                                 Ok(state) => {
                                     if tx.send(Message::RadioUpdate(state)).is_err() {
                                         return;
@@ -335,7 +350,12 @@ pub(crate) async fn spawn_with_transport(
                                     // Don't break: stay in poll loop, radio is still connected
                                 }
                                 crate::event::RadioCommand::FreqUp(band) => {
-                                    if let Err(e) = radio.frequency_up(band).await {
+                                    let result = async {
+                                        radio.set_band(band).await?;
+                                        radio.frequency_up().await
+                                    }
+                                    .await;
+                                    if let Err(e) = result {
                                         let _send = tx.send(Message::RadioError(format!("Freq up: {e}")));
                                     }
                                 }
@@ -370,11 +390,6 @@ pub(crate) async fn spawn_with_transport(
                                 crate::event::RadioCommand::SetMode { band, mode } => {
                                     if let Err(e) = radio.set_mode(band, mode).await {
                                         let _send = tx.send(Message::RadioError(format!("Set mode: {e} (may require VFO mode)")));
-                                    }
-                                }
-                                crate::event::RadioCommand::SetLock(on) => {
-                                    if let Err(e) = radio.set_lock(on).await {
-                                        let _send = tx.send(Message::RadioError(format!("Set lock: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetDualBand(on) => {
@@ -549,6 +564,9 @@ pub(crate) async fn spawn_with_transport(
                     match Radio::connect(transport).await {
                         Ok(mut new_radio) => match new_radio.identify().await {
                             Ok(_) => {
+                                let (firmware_version, refreshed_profile) =
+                                    read_firmware_profile(&mut new_radio, "reconnect").await;
+                                firmware_profile = refreshed_profile;
                                 if let Err(e) = new_radio.set_auto_info(true).await {
                                     tracing::error!("AI mode failed after reconnect: {e}");
                                     let _send = tx.send(Message::RadioError(format!(
@@ -561,6 +579,10 @@ pub(crate) async fn spawn_with_transport(
                                 busy_a = false;
                                 busy_b = false;
                                 let _send = tx.send(Message::Reconnected);
+                                let _send = tx.send(Message::RadioUpdate(RadioState {
+                                    firmware_version,
+                                    ..RadioState::default()
+                                }));
                                 radio_opt = Some(new_radio);
                                 continue 'outer;
                             }
@@ -633,6 +655,7 @@ macro_rules! global_read {
 )]
 async fn poll_once(
     radio: &mut Radio<EitherTransport>,
+    firmware_profile: Option<FirmwareProfile>,
     s_meter_a: SMeterReading,
     s_meter_b: SMeterReading,
     busy_a: bool,
@@ -660,7 +683,6 @@ async fn poll_once(
     // BE (beep) is a firmware stub on D75: always returns N.
     // Beep state is read from MCP image instead. Skip polling.
     let beep = false;
-    let lock = global_read!(radio, "LC", radio.get_lock(), false);
     let dual_band = global_read!(radio, "DL", radio.get_dual_band(), false);
     let bluetooth = global_read!(radio, "BT", radio.get_bluetooth(), false);
     let vox = global_read!(radio, "VX", radio.get_vox(), false);
@@ -684,12 +706,12 @@ async fn poll_once(
     );
     let gps = radio.get_gps_config().await.unwrap_or((false, false));
     let gps_sentences = radio.get_gps_sentences().await.ok();
-    let gps_mode = radio.get_gps_mode().await.ok();
+    let (gps_mode, dstar_gw) = poll_collision_sensitive_state(radio, firmware_profile).await;
     let beacon_type = global_read!(
         radio,
         "BN",
         radio.get_beacon_type(),
-        kenwood_thd75::types::BeaconMode::Off
+        kenwood_thd75::types::BeaconMode::Manual
     );
     // FS read (no band parameter): returns N in some modes
     let fine_step = radio.get_fine_step().await.ok();
@@ -706,19 +728,17 @@ async fn poll_once(
         .get_filter_width(kenwood_thd75::types::FilterMode::Am)
         .await
         .ok();
+    let aprs_callsign = radio.get_aprs_callsign().await.ok();
     // D-STAR reads: non-fatal, default to empty/None on error
     let dstar_urcall = radio.get_urcall().await.unwrap_or_default();
     let dstar_rpt1 = radio.get_rpt1().await.unwrap_or_default();
     let dstar_rpt2 = radio.get_rpt2().await.unwrap_or_default();
-    let dstar_gw = radio.get_gateway().await.ok();
     let dstar_slot = radio.get_dstar_slot().await.ok();
-    let dstar_callsign_slot = radio.get_active_callsign_slot().await.ok();
     Ok(RadioState {
         band_a,
         band_b,
         battery_level,
         beep,
-        lock,
         dual_band,
         bluetooth,
         vox,
@@ -746,8 +766,61 @@ async fn poll_once(
         dstar_rpt2_suffix: dstar_rpt2.1,
         dstar_gateway_mode: dstar_gw,
         dstar_slot,
-        dstar_callsign_slot,
+        aprs_callsign,
     })
+}
+
+/// Read and classify the exact firmware identity for one fresh radio link.
+///
+/// This helper is deliberately used for both initial connection and every
+/// replacement transport so collision policy cannot leak across reconnects.
+async fn read_firmware_profile<T: Transport>(
+    radio: &mut Radio<T>,
+    connection_phase: &str,
+) -> (String, Option<FirmwareProfile>) {
+    match radio.get_firmware_version().await {
+        Ok(firmware) => {
+            let profile = FirmwareProfile::from_version(&firmware);
+            (firmware, Some(profile))
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %connection_phase,
+                "firmware profile unavailable; disabling bare GM/GW polling"
+            );
+            (String::new(), None)
+        }
+    }
+}
+
+/// Read stock CAT state whose mnemonics are repurposed by some firmware.
+///
+/// Unknown firmware is treated conservatively. This keeps a transient FV
+/// failure from turning the next TUI poll into a five-second GW timeout.
+async fn poll_collision_sensitive_state<T: Transport>(
+    radio: &mut Radio<T>,
+    firmware_profile: Option<FirmwareProfile>,
+) -> (Option<GpsRadioMode>, Option<DvGatewayMode>) {
+    let gps_mode = if firmware_profile
+        .as_ref()
+        .is_some_and(|profile| profile.supports_bare_gps_mode())
+    {
+        radio.get_gps_mode().await.ok()
+    } else {
+        None
+    };
+
+    let gateway = if firmware_profile
+        .as_ref()
+        .is_some_and(|profile| profile.supports_bare_gateway())
+    {
+        radio.get_gateway().await.ok()
+    } else {
+        None
+    };
+
+    (gps_mode, gateway)
 }
 
 /// Poll per-band state: frequency, squelch setting, mode, power, attenuator, step size.
@@ -759,7 +832,7 @@ async fn poll_once(
 /// radio's own display behavior. The `s_meter` and `busy` fields are set to
 /// zero here and overwritten by `poll_once` with the AI-driven values.
 async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<BandState, PollError> {
-    let channel = radio
+    let frequency = radio
         .get_frequency(band)
         .await
         .map_err(|e| classify_error(&format!("FQ {band:?}"), &e))?;
@@ -788,7 +861,7 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
     let step_size = radio.get_step_size(band).await.ok().map(|(_, s)| s);
 
     Ok(BandState {
-        frequency: channel.rx_frequency,
+        frequency,
         mode,
         s_meter: SMeterReading::ZERO, // Set by AI notification handler
         squelch,
@@ -806,14 +879,14 @@ async fn freq_down(
     radio: &mut Radio<EitherTransport>,
     band: Band,
 ) -> Result<(), kenwood_thd75::Error> {
-    let ch = radio.get_frequency(band).await?;
+    let frequency = radio.get_frequency(band).await?;
     // SF may return N (not available) in some modes; default to 5 kHz
     let step = radio
         .get_step_size(band)
         .await
         .map(|(_, s)| s)
         .unwrap_or(kenwood_thd75::types::StepSize::Hz5000);
-    let new_hz = ch.rx_frequency.as_hz().saturating_sub(step.as_hz());
+    let new_hz = frequency.as_hz().saturating_sub(step.as_hz());
     radio
         .tune_frequency(band, kenwood_thd75::types::Frequency::new(new_hz))
         .await
@@ -1064,4 +1137,85 @@ fn discover_and_open(port: Option<&str>, baud: u32) -> Result<(String, EitherTra
     }
 
     Err("No TH-D75 found on USB or Bluetooth".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kenwood_thd75::MockTransport;
+    use kenwood_thd75::radio::LinkState;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn azimuth_poll_skips_bare_gm_and_gw_without_waiting() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"FV\r", b"FV 1.03.AZM\r");
+        let mut radio = Radio::connect(mock).await?;
+        let (_, profile) = read_firmware_profile(&mut radio, "test").await;
+
+        assert_eq!(profile, Some(FirmwareProfile::AzimuthAutomation));
+        let collision_state = tokio::time::timeout(
+            Duration::from_millis(100),
+            poll_collision_sensitive_state(&mut radio, profile),
+        )
+        .await?;
+        assert_eq!(collision_state, (None, None));
+        assert_eq!(*radio.link_state().borrow(), LinkState::Up);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_firmware_skips_collision_sensitive_polling() -> TestResult {
+        let mock = MockTransport::new();
+        let mut radio = Radio::connect(mock).await?;
+
+        let collision_state = tokio::time::timeout(
+            Duration::from_millis(100),
+            poll_collision_sensitive_state(&mut radio, None),
+        )
+        .await?;
+        assert_eq!(collision_state, (None, None));
+        assert_eq!(*radio.link_state().borrow(), LinkState::Up);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn near_match_firmware_retains_stock_gm_and_gw_polling() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"FV\r", b"FV 1.03.AZM2\r");
+        mock.expect(b"GM\r", b"GM 0\r");
+        mock.expect(b"GW\r", b"GW 0\r");
+        let mut radio = Radio::connect(mock).await?;
+        let (_, profile) = read_firmware_profile(&mut radio, "test").await;
+
+        assert_eq!(profile, Some(FirmwareProfile::StandardCat));
+        let collision_state = poll_collision_sensitive_state(&mut radio, profile).await;
+        assert_eq!(
+            collision_state,
+            (Some(GpsRadioMode::Normal), Some(DvGatewayMode::Off),)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_radio_reacquires_its_own_firmware_profile() -> TestResult {
+        let mut first_mock = MockTransport::new();
+        first_mock.expect(b"FV\r", b"FV 1.03\r");
+        let mut first_radio = Radio::connect(first_mock).await?;
+        let (_, first_profile) = read_firmware_profile(&mut first_radio, "initial").await;
+
+        let mut replacement_mock = MockTransport::new();
+        replacement_mock.expect(b"FV\r", b"FV 1.03.AZM\r");
+        let mut replacement_radio = Radio::connect(replacement_mock).await?;
+        let (_, replacement_profile) =
+            read_firmware_profile(&mut replacement_radio, "reconnect").await;
+
+        assert_eq!(first_profile, Some(FirmwareProfile::StandardCat));
+        assert_eq!(
+            replacement_profile,
+            Some(FirmwareProfile::AzimuthAutomation)
+        );
+        Ok(())
+    }
 }

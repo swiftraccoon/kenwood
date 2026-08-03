@@ -1,34 +1,20 @@
-//! User/extra commands: US, TY, 0E.
+//! Radio-type command: TY.
 //!
-//! Provides parsing of responses for user settings and extra commands.
+//! Provides parsing of the radio region and hardware variant response.
 //! Serialization is handled inline by the main dispatcher.
 
 use crate::error::ProtocolError;
 
 use super::Response;
 
-/// Parse a `u8` from a string field.
-fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> {
-    s.parse::<u8>().map_err(|_| ProtocolError::FieldParse {
-        command: cmd.to_owned(),
-        field: field.to_owned(),
-        detail: format!("invalid u8: {s:?}"),
-    })
-}
-
-/// Parse a user/extra command response from mnemonic and payload.
+/// Parse the TY command response from mnemonic and payload.
 ///
-/// Handles US (user settings), TY (radio type/region), and 0E (MCP status).
-/// Returns `None` if the mnemonic is not handled by this module.
+/// Returns `None` if the mnemonic is not TY. `US` is a write-only unresolved
+/// handler and `0E` is a service-state transition; neither belongs in the
+/// ordinary CAT response model.
 pub(crate) fn parse_user(mnemonic: &str, payload: &str) -> Option<Result<Response, ProtocolError>> {
     match mnemonic {
-        "US" => Some(
-            parse_u8_field(payload, "US", "value").map(|value| Response::UserSettings { value }),
-        ),
         "TY" => Some(parse_ty(payload)),
-        "0E" => Some(Ok(Response::McpStatus {
-            value: payload.to_owned(),
-        })),
         _ => None,
     }
 }
@@ -46,7 +32,35 @@ fn parse_ty(payload: &str) -> Result<Response, ProtocolError> {
                 detail: format!("expected region,variant, got {payload:?}"),
             })?;
 
-    let variant = parse_u8_field(variant_str, "TY", "variant")?;
+    if !matches!(region_str, "E" | "J" | "K" | "0") {
+        return Err(ProtocolError::FieldParse {
+            command: "TY".to_owned(),
+            field: "region".to_owned(),
+            detail: format!("expected E, J, K, or 0, got {region_str:?}"),
+        });
+    }
+
+    let variant_bytes = variant_str.as_bytes();
+    let &[variant_byte] = variant_bytes else {
+        return Err(ProtocolError::FieldParse {
+            command: "TY".to_owned(),
+            field: "variant".to_owned(),
+            detail: format!("expected one hexadecimal digit, got {variant_str:?}"),
+        });
+    };
+    if !variant_byte.is_ascii_digit() && !(b'A'..=b'F').contains(&variant_byte) {
+        return Err(ProtocolError::FieldParse {
+            command: "TY".to_owned(),
+            field: "variant".to_owned(),
+            detail: format!("expected one uppercase hexadecimal digit, got {variant_str:?}"),
+        });
+    }
+    let variant =
+        u8::from_str_radix(variant_str, 16).map_err(|error| ProtocolError::FieldParse {
+            command: "TY".to_owned(),
+            field: "variant".to_owned(),
+            detail: error.to_string(),
+        })?;
 
     Ok(Response::RadioType {
         region: region_str.to_owned(),

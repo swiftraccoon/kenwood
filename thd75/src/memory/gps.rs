@@ -1,61 +1,63 @@
 //! Typed access to the GPS configuration region of the memory image.
 //!
-//! The GPS configuration is estimated to occupy ~4,096 bytes around
-//! byte offset `0x19000` in the MCP address space. This includes GPS
-//! receiver settings, position memory slots, track log configuration,
-//! and NMEA output selection.
+//! Kenwood's official MCP-D75 serializer places `GpsMenuData` at
+//! `0x1100`-`0x11C0`. This span includes GPS receiver settings, five
+//! My Position records, track-log configuration, NMEA output selection,
+//! and the active My Position selector.
 //!
-//! # Offset confidence
+//! # Offset provenance
 //!
-//! The GPS region boundaries are estimated from the overall memory
-//! layout analysis. No GPS offsets have been confirmed via differential
-//! dump on a D75. All typed accessors in this module are marked with
-//! `# Verification` in their doc comments.
+//! The menu offsets come from the generated
+//! [`MCP_D75_MENU_FIELDS`](super::MCP_D75_MENU_FIELDS) registry, produced
+//! from the reviewed official MCP-D75 serializers. The scalar anchor values
+//! at `0x1100`-`0x1105` are also pinned against the retained physical-radio
+//! MCP image in `tests/fixtures/memory_dump.bin`.
+//!
+//! The GPS channel-index and waypoint regions near `0x4D000` are separate
+//! from `GpsMenuData`; their retained reverse-engineering evidence is
+//! documented alongside those constants below.
 
-use crate::types::gps::{GpsOperatingMode, GpsPositionAmbiguity};
+use crate::types::gps::{GpsBatterySaver, GpsOperatingMode, GpsPositionAmbiguity};
 
-/// Estimated byte offset of the GPS configuration region.
+/// First byte written by the official `GpsMenuData` serializer.
+const GPS_MENU_OFFSET: usize = 0x1100;
+
+/// Exclusive end of the official `GpsMenuData` field span.
 ///
-/// This is an estimate based on the overall memory layout analysis.
-/// The actual start may differ by a few pages.
-const GPS_ESTIMATED_OFFSET: usize = 0x19000;
+/// The final public field is the one-byte `gps.MyPositionSelect` at
+/// `0x11C0`.
+const GPS_MENU_END: usize = 0x11C1;
 
-/// Estimated size of the GPS configuration region.
-const GPS_ESTIMATED_SIZE: usize = 0x1000; // 4 KB
+/// Size of the official `GpsMenuData` field span.
+const GPS_MENU_SIZE: usize = GPS_MENU_END - GPS_MENU_OFFSET;
 
 // ---------------------------------------------------------------------------
-// Estimated field offsets within the GPS region
+// MCP-D75 serializer field offsets
 //
-// These offsets are relative to GPS_ESTIMATED_OFFSET and are rough
-// estimates based on menu ordering and typical Kenwood layout patterns.
-// None have been verified on hardware.
+// These absolute offsets are intentionally named after their generated
+// registry fields. A test below binds every constant to the registry, while
+// literal anchor tests independently reject the legacy 0x19000 guess.
 // ---------------------------------------------------------------------------
 
-/// Estimated offset for GPS enabled (1 byte, 0 = off, 1 = on).
-/// Relative to `GPS_ESTIMATED_OFFSET`.
-const GPS_ENABLED_REL: usize = 0x00;
+/// `gps.BuiltInGps` (1 byte, 0 = off, 1 = on).
+const GPS_ENABLED_OFFSET: usize = 0x1100;
 
-/// Estimated offset for GPS PC output (1 byte, 0 = off, 1 = on).
-/// Relative to `GPS_ESTIMATED_OFFSET`.
-const GPS_PC_OUTPUT_REL: usize = 0x01;
+/// `gps.PositionAmbiguity` (1 byte, 0-4 = Off through 4-Digit).
+const GPS_POSITION_AMBIGUITY_OFFSET: usize = 0x1101;
 
-/// Estimated offset for GPS operating mode (1 byte, enum index).
-/// Relative to `GPS_ESTIMATED_OFFSET`.
-const GPS_OPERATING_MODE_REL: usize = 0x02;
+/// `gps.OperatingMode` (1 byte, 0 = Normal, 1 = GPS Receiver).
+const GPS_OPERATING_MODE_OFFSET: usize = 0x1102;
 
-/// Estimated offset for GPS battery saver (1 byte, 0 = off, 1 = on).
-/// Relative to `GPS_ESTIMATED_OFFSET`.
-const GPS_BATTERY_SAVER_REL: usize = 0x03;
+/// `gps.BatterySaver` (1 byte, 0-5 = Off, 1/2/4/8 minutes, Auto).
+const GPS_BATTERY_SAVER_OFFSET: usize = 0x1103;
 
-/// Estimated offset for position ambiguity (1 byte, 0-4).
-/// Relative to `GPS_ESTIMATED_OFFSET`.
-const GPS_POSITION_AMBIGUITY_REL: usize = 0x04;
+/// `gps.PcOutput` (1 byte, 0 = off, 1 = on).
+const GPS_PC_OUTPUT_OFFSET: usize = 0x1104;
 
-/// Estimated offset for NMEA sentence flags (1 byte, bit field:
+/// `gps.Sentence_*` shared byte (bit field:
 /// bit 0 = GGA, bit 1 = GLL, bit 2 = GSA, bit 3 = GSV,
 /// bit 4 = RMC, bit 5 = VTG).
-/// Relative to `GPS_ESTIMATED_OFFSET`.
-const GPS_NMEA_FLAGS_REL: usize = 0x05;
+const GPS_NMEA_FLAGS_OFFSET: usize = 0x1105;
 
 // ---------------------------------------------------------------------------
 // GPS channel index
@@ -92,19 +94,18 @@ const GPS_WAYPOINT_RECORD_SIZE: usize = 0x20;
 
 /// Read-only access to the GPS configuration region.
 ///
-/// Provides raw byte access and typed field accessors for the estimated
-/// GPS settings region. All offsets are estimates and need verification
-/// via differential memory dumps.
+/// Provides raw byte access and typed field accessors for the official
+/// MCP-D75 GPS menu span and the separately mapped position-memory index.
 ///
-/// # Known settings (from menu analysis, offsets estimated)
+/// # Known menu settings
 ///
 /// - Built-in GPS on/off
 /// - My Position (5 manual slots, each with lat/lon/alt)
 /// - Position ambiguity setting
-/// - GPS operating mode (standalone/SBAS)
+/// - GPS operating mode (Normal/GPS Receiver)
+/// - GPS battery-saver interval
 /// - PC output format (NMEA sentences enabled/disabled)
 /// - Track log settings (record method, interval, distance)
-/// - GPS data TX settings (auto TX, interval)
 #[derive(Debug)]
 pub struct GpsAccess<'a> {
     image: &'a [u8],
@@ -116,15 +117,14 @@ impl<'a> GpsAccess<'a> {
         Self { image }
     }
 
-    /// Get the raw bytes at the estimated GPS region.
+    /// Get the raw official `GpsMenuData` field span.
     ///
-    /// Returns the bytes at offset `0x19000` through `0x19FFF`. These
-    /// boundaries are estimates and may not perfectly align with the
-    /// actual GPS configuration data.
+    /// Returns bytes `0x1100..0x11C1`: from `gps.BuiltInGps` through
+    /// the final one-byte `gps.MyPositionSelect` field. Gaps and record
+    /// padding inside that span are returned unchanged.
     #[must_use]
-    pub fn estimated_region(&self) -> Option<&[u8]> {
-        let end = GPS_ESTIMATED_OFFSET + GPS_ESTIMATED_SIZE;
-        self.image.get(GPS_ESTIMATED_OFFSET..end)
+    pub fn menu_region(&self) -> Option<&[u8]> {
+        self.image.get(GPS_MENU_OFFSET..GPS_MENU_END)
     }
 
     /// Read an arbitrary byte range from the image.
@@ -137,101 +137,73 @@ impl<'a> GpsAccess<'a> {
         self.image.get(offset..end)
     }
 
-    /// Get the estimated size of the GPS region in bytes.
+    /// Get the size of the official `GpsMenuData` field span in bytes.
     #[must_use]
-    pub const fn estimated_region_size(&self) -> usize {
-        GPS_ESTIMATED_SIZE
+    pub const fn menu_region_size(&self) -> usize {
+        GPS_MENU_SIZE
     }
 
     // -----------------------------------------------------------------------
-    // Typed GPS accessors (estimated offsets)
+    // Typed GPS accessors (official MCP-D75 serializer offsets)
     // -----------------------------------------------------------------------
 
     /// Read GPS enabled setting.
     ///
-    /// # Offset
-    ///
-    /// Estimated at `0x19000` (first byte of the GPS region).
-    ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
+    /// MCP-D75 field `gps.BuiltInGps` at `0x1100`.
     #[must_use]
     pub fn gps_enabled(&self) -> bool {
-        self.image
-            .get(GPS_ESTIMATED_OFFSET + GPS_ENABLED_REL)
-            .is_some_and(|&b| b != 0)
+        self.image.get(GPS_ENABLED_OFFSET).is_some_and(|&b| b != 0)
     }
 
     /// Read GPS PC output setting.
     ///
-    /// # Offset
-    ///
-    /// Estimated at `0x19001`.
-    ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
+    /// MCP-D75 field `gps.PcOutput` at `0x1104`.
     #[must_use]
     pub fn pc_output(&self) -> bool {
         self.image
-            .get(GPS_ESTIMATED_OFFSET + GPS_PC_OUTPUT_REL)
+            .get(GPS_PC_OUTPUT_OFFSET)
             .is_some_and(|&b| b != 0)
     }
 
-    /// Read GPS operating mode.
+    /// Read GPS operating mode (`gps.OperatingMode` at `0x1102`).
     ///
-    /// # Offset
-    ///
-    /// Estimated at `0x19002`.
-    ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
+    /// The official domain is 0 = Normal and 1 = GPS Receiver. Invalid
+    /// bytes are treated as Normal; the MCP-D75 writer constrains the field
+    /// to its official 0-1 domain.
     #[must_use]
     pub fn operating_mode(&self) -> GpsOperatingMode {
         match self
             .image
-            .get(GPS_ESTIMATED_OFFSET + GPS_OPERATING_MODE_REL)
+            .get(GPS_OPERATING_MODE_OFFSET)
             .copied()
             .unwrap_or(0)
         {
-            1 => GpsOperatingMode::Sbas,
-            2 => GpsOperatingMode::Manual,
-            _ => GpsOperatingMode::Standalone,
+            1 => GpsOperatingMode::GpsReceiver,
+            _ => GpsOperatingMode::Normal,
         }
     }
 
-    /// Read GPS battery saver setting.
+    /// Read the GPS battery-saver interval (`gps.BatterySaver` at `0x1103`).
     ///
-    /// # Offset
-    ///
-    /// Estimated at `0x19003`.
-    ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
+    /// Invalid bytes are treated as Off; the MCP-D75 writer constrains the
+    /// field to its official 0-5 domain.
     #[must_use]
-    pub fn battery_saver(&self) -> bool {
+    pub fn battery_saver(&self) -> GpsBatterySaver {
         self.image
-            .get(GPS_ESTIMATED_OFFSET + GPS_BATTERY_SAVER_REL)
-            .is_some_and(|&b| b != 0)
+            .get(GPS_BATTERY_SAVER_OFFSET)
+            .copied()
+            .and_then(|raw| GpsBatterySaver::try_from(raw).ok())
+            .unwrap_or(GpsBatterySaver::Off)
     }
 
     /// Read GPS position ambiguity level.
     ///
-    /// # Offset
-    ///
-    /// Estimated at `0x19004`.
-    ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
+    /// MCP-D75 field `gps.PositionAmbiguity` at `0x1101`.
     #[must_use]
     pub fn position_ambiguity(&self) -> GpsPositionAmbiguity {
         match self
             .image
-            .get(GPS_ESTIMATED_OFFSET + GPS_POSITION_AMBIGUITY_REL)
+            .get(GPS_POSITION_AMBIGUITY_OFFSET)
             .copied()
             .unwrap_or(0)
         {
@@ -249,17 +221,11 @@ impl<'a> GpsAccess<'a> {
     /// bit 4 = RMC, bit 5 = VTG. Returns `0x3F` (all enabled) if
     /// unreadable.
     ///
-    /// # Offset
-    ///
-    /// Estimated at `0x19005`.
-    ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
+    /// MCP-D75 shared `gps.Sentence_*` byte at `0x1105`.
     #[must_use]
     pub fn nmea_sentence_flags(&self) -> u8 {
         self.image
-            .get(GPS_ESTIMATED_OFFSET + GPS_NMEA_FLAGS_REL)
+            .get(GPS_NMEA_FLAGS_OFFSET)
             .copied()
             .unwrap_or(0x3F)
     }
@@ -269,13 +235,7 @@ impl<'a> GpsAccess<'a> {
     /// `bit` selects the sentence: 0 = GGA, 1 = GLL, 2 = GSA,
     /// 3 = GSV, 4 = RMC, 5 = VTG.
     ///
-    /// # Offset
-    ///
-    /// Estimated at `0x19005`.
-    ///
-    /// # Verification
-    ///
-    /// Offset is estimated, not hardware-verified.
+    /// MCP-D75 shared `gps.Sentence_*` byte at `0x1105`.
     #[must_use]
     pub fn nmea_sentence_enabled(&self, bit: u8) -> bool {
         if bit > 5 {
@@ -389,8 +349,10 @@ impl<'a> GpsAccess<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::FieldCodec;
+    use crate::memory::menu_fields::menu_field;
     use crate::protocol::programming::TOTAL_SIZE;
-    use crate::types::gps::{GpsOperatingMode, GpsPositionAmbiguity};
+    use crate::types::gps::{GpsBatterySaver, GpsOperatingMode, GpsPositionAmbiguity};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;
@@ -421,14 +383,12 @@ mod tests {
     }
 
     #[test]
-    fn gps_estimated_region_accessible() -> TestResult {
+    fn gps_menu_region_accessible() -> TestResult {
         let image = vec![0xBB_u8; TOTAL_SIZE];
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         let gps = mi.gps();
-        let region = gps
-            .estimated_region()
-            .ok_or("gps.estimated_region() returned None")?;
-        assert_eq!(region.len(), GPS_ESTIMATED_SIZE);
+        let region = gps.menu_region().ok_or("gps.menu_region() returned None")?;
+        assert_eq!(region.len(), GPS_MENU_SIZE);
         assert!(region.iter().all(|&b| b == 0xBB));
         Ok(())
     }
@@ -436,12 +396,12 @@ mod tests {
     #[test]
     fn gps_read_bytes() -> TestResult {
         let mut image = make_gps_image();
-        write_slice(&mut image, GPS_ESTIMATED_OFFSET, &[0x01, 0x02, 0x03, 0x04])?;
+        write_slice(&mut image, GPS_MENU_OFFSET, &[0x01, 0x02, 0x03, 0x04])?;
 
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         let gps = mi.gps();
         let bytes = gps
-            .read_bytes(GPS_ESTIMATED_OFFSET, 4)
+            .read_bytes(GPS_MENU_OFFSET, 4)
             .ok_or("gps.read_bytes returned None")?;
         assert_eq!(bytes, &[0x01, 0x02, 0x03, 0x04]);
         Ok(())
@@ -452,14 +412,127 @@ mod tests {
         let image = make_gps_image();
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         let gps = mi.gps();
-        assert_eq!(gps.estimated_region_size(), 0x1000);
+        assert_eq!(gps.menu_region_size(), 0xC1);
+        Ok(())
+    }
+
+    /// Literal addresses deliberately do not use implementation constants or
+    /// the generated registry. Poisoning the former 0x19000 guess makes this
+    /// fail if any accessor ever regresses to that location.
+    #[test]
+    fn gps_scalar_accessors_use_official_literal_addresses() -> TestResult {
+        let mut image = make_gps_image();
+        set_byte(&mut image, 0x1100, 1)?;
+        set_byte(&mut image, 0x1101, 4)?;
+        set_byte(&mut image, 0x1102, 1)?;
+        set_byte(&mut image, 0x1103, 5)?;
+        set_byte(&mut image, 0x1104, 1)?;
+        set_byte(&mut image, 0x1105, 0x15)?;
+        write_slice(&mut image, 0x19000, &[0, 0, 0, 0, 0, 0])?;
+
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        let gps = mi.gps();
+        assert!(gps.gps_enabled());
+        assert_eq!(gps.position_ambiguity(), GpsPositionAmbiguity::Level4);
+        assert_eq!(gps.operating_mode(), GpsOperatingMode::GpsReceiver);
+        assert_eq!(gps.battery_saver(), GpsBatterySaver::Auto);
+        assert!(gps.pc_output());
+        assert_eq!(gps.nmea_sentence_flags(), 0x15);
+        Ok(())
+    }
+
+    /// Independent first/last-byte anchors pin the serializer span rather
+    /// than merely checking a size constant against itself.
+    #[test]
+    fn gps_menu_region_uses_official_literal_span() -> TestResult {
+        let mut image = make_gps_image();
+        set_byte(&mut image, 0x1100, 0xA1)?;
+        set_byte(&mut image, 0x11C0, 0xB2)?;
+        set_byte(&mut image, 0x19000, 0xCC)?;
+
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        let gps = mi.gps();
+        let region = gps.menu_region().ok_or("GPS menu region missing")?;
+        assert_eq!(region.len(), 0xC1);
+        assert_eq!(region.first(), Some(&0xA1));
+        assert_eq!(region.last(), Some(&0xB2));
+        assert!(!region.contains(&0xCC));
+        Ok(())
+    }
+
+    /// Cross-layer guard: hand-written accessors must remain bound to the
+    /// reviewed official MCP-D75 registry fields and domains.
+    #[test]
+    fn gps_scalar_constants_bind_official_registry_fields() -> TestResult {
+        const ANCHORS: &[(&str, usize, FieldCodec)] = &[
+            ("gps.BuiltInGps", GPS_ENABLED_OFFSET, FieldCodec::Bool),
+            (
+                "gps.PositionAmbiguity",
+                GPS_POSITION_AMBIGUITY_OFFSET,
+                FieldCodec::Byte { min: 0, max: 4 },
+            ),
+            (
+                "gps.OperatingMode",
+                GPS_OPERATING_MODE_OFFSET,
+                FieldCodec::Byte { min: 0, max: 1 },
+            ),
+            (
+                "gps.BatterySaver",
+                GPS_BATTERY_SAVER_OFFSET,
+                FieldCodec::Byte { min: 0, max: 5 },
+            ),
+            ("gps.PcOutput", GPS_PC_OUTPUT_OFFSET, FieldCodec::Bool),
+        ];
+        const SENTENCE_BITS: &[(&str, u8)] = &[
+            ("gps.Sentence_Gpgga", 0x01),
+            ("gps.Sentence_Gpgll", 0x02),
+            ("gps.Sentence_Gpgsa", 0x04),
+            ("gps.Sentence_Gpgsv", 0x08),
+            ("gps.Sentence_Gprmc", 0x10),
+            ("gps.Sentence_Gpvtg", 0x20),
+        ];
+
+        for &(name, offset, codec) in ANCHORS {
+            let field = menu_field(name).ok_or_else(|| format!("missing registry field {name}"))?;
+            assert_eq!(field.descriptor.offset, offset, "{name} offset");
+            assert_eq!(field.descriptor.codec, codec, "{name} codec");
+        }
+
+        for &(name, mask) in SENTENCE_BITS {
+            let field = menu_field(name).ok_or_else(|| format!("missing registry field {name}"))?;
+            assert_eq!(field.descriptor.offset, GPS_NMEA_FLAGS_OFFSET, "{name}");
+            assert_eq!(
+                field.descriptor.codec,
+                FieldCodec::BitBool { mask },
+                "{name}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The retained full MCP image is independent hardware evidence for all
+    /// six scalar cells. These values differ from the bytes at 0x19000.
+    #[test]
+    fn retained_radio_dump_matches_gps_scalar_accessors() -> TestResult {
+        let image = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/memory_dump.bin"
+        ))?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        let gps = mi.gps();
+        assert!(!gps.gps_enabled());
+        assert_eq!(gps.position_ambiguity(), GpsPositionAmbiguity::Level2);
+        assert_eq!(gps.operating_mode(), GpsOperatingMode::Normal);
+        assert_eq!(gps.battery_saver(), GpsBatterySaver::EightMinutes);
+        assert!(!gps.pc_output());
+        assert_eq!(gps.nmea_sentence_flags(), 0x3F);
         Ok(())
     }
 
     #[test]
     fn gps_enabled() -> TestResult {
         let mut image = make_gps_image();
-        set_byte(&mut image, GPS_ESTIMATED_OFFSET + GPS_ENABLED_REL, 1)?;
+        set_byte(&mut image, GPS_ENABLED_OFFSET, 1)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.gps().gps_enabled());
         Ok(())
@@ -476,7 +549,7 @@ mod tests {
     #[test]
     fn gps_pc_output() -> TestResult {
         let mut image = make_gps_image();
-        set_byte(&mut image, GPS_ESTIMATED_OFFSET + GPS_PC_OUTPUT_REL, 1)?;
+        set_byte(&mut image, GPS_PC_OUTPUT_OFFSET, 1)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert!(mi.gps().pc_output());
         Ok(())
@@ -485,18 +558,18 @@ mod tests {
     #[test]
     fn gps_operating_mode() -> TestResult {
         let mut image = make_gps_image();
-        set_byte(&mut image, GPS_ESTIMATED_OFFSET + GPS_OPERATING_MODE_REL, 1)?;
+        set_byte(&mut image, GPS_OPERATING_MODE_OFFSET, 1)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.gps().operating_mode(), GpsOperatingMode::Sbas);
+        assert_eq!(mi.gps().operating_mode(), GpsOperatingMode::GpsReceiver);
         Ok(())
     }
 
     #[test]
-    fn gps_operating_mode_manual() -> TestResult {
+    fn gps_operating_mode_invalid_defaults_to_normal() -> TestResult {
         let mut image = make_gps_image();
-        set_byte(&mut image, GPS_ESTIMATED_OFFSET + GPS_OPERATING_MODE_REL, 2)?;
+        set_byte(&mut image, GPS_OPERATING_MODE_OFFSET, 2)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.gps().operating_mode(), GpsOperatingMode::Manual);
+        assert_eq!(mi.gps().operating_mode(), GpsOperatingMode::Normal);
         Ok(())
     }
 
@@ -504,27 +577,23 @@ mod tests {
     fn gps_operating_mode_default() -> TestResult {
         let image = make_gps_image();
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.gps().operating_mode(), GpsOperatingMode::Standalone);
+        assert_eq!(mi.gps().operating_mode(), GpsOperatingMode::Normal);
         Ok(())
     }
 
     #[test]
     fn gps_battery_saver() -> TestResult {
         let mut image = make_gps_image();
-        set_byte(&mut image, GPS_ESTIMATED_OFFSET + GPS_BATTERY_SAVER_REL, 1)?;
+        set_byte(&mut image, GPS_BATTERY_SAVER_OFFSET, 4)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(mi.gps().battery_saver());
+        assert_eq!(mi.gps().battery_saver(), GpsBatterySaver::EightMinutes);
         Ok(())
     }
 
     #[test]
     fn gps_position_ambiguity() -> TestResult {
         let mut image = make_gps_image();
-        set_byte(
-            &mut image,
-            GPS_ESTIMATED_OFFSET + GPS_POSITION_AMBIGUITY_REL,
-            3,
-        )?;
+        set_byte(&mut image, GPS_POSITION_AMBIGUITY_OFFSET, 3)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         assert_eq!(mi.gps().position_ambiguity(), GpsPositionAmbiguity::Level3);
         Ok(())
@@ -542,7 +611,7 @@ mod tests {
     fn gps_nmea_flags() -> TestResult {
         let mut image = make_gps_image();
         // Enable GGA (bit 0) and RMC (bit 4) = 0b00010001 = 0x11.
-        set_byte(&mut image, GPS_ESTIMATED_OFFSET + GPS_NMEA_FLAGS_REL, 0x11)?;
+        set_byte(&mut image, GPS_NMEA_FLAGS_OFFSET, 0x11)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         let gps = mi.gps();
         assert_eq!(gps.nmea_sentence_flags(), 0x11);

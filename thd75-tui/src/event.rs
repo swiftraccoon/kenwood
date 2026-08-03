@@ -48,8 +48,6 @@ pub(crate) enum RadioCommand {
         band: kenwood_thd75::types::Band,
         mode: kenwood_thd75::types::Mode,
     },
-    /// Toggle lock on/off (LC write: verified working, value inverted on D75).
-    SetLock(bool),
     /// Toggle dual band on/off (DL write: verified working, value inverted on D75).
     SetDualBand(bool),
     /// Toggle bluetooth on/off (BT write: verified working).

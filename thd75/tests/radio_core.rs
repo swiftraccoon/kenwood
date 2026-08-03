@@ -1,5 +1,6 @@
 //! Integration tests for radio core methods.
 
+use kenwood_thd75::Error;
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;
 use kenwood_thd75::types::*;
@@ -39,40 +40,29 @@ async fn get_frequency_full() -> TestResult {
 #[tokio::test]
 async fn get_frequency() -> TestResult {
     let mut mock = MockTransport::new();
-    mock.expect(
-        b"FQ 0\r",
-        b"FQ 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
-    );
+    mock.expect(b"FQ 0\r", b"FQ 0,0145000000\r");
     let mut radio = Radio::connect(mock).await?;
-    let ch = radio.get_frequency(Band::A).await?;
-    assert_eq!(ch.rx_frequency.as_hz(), 145_000_000);
+    let frequency = radio.get_frequency(Band::A).await?;
+    assert_eq!(frequency.as_hz(), 145_000_000);
     Ok(())
 }
 
 #[tokio::test]
-async fn set_frequency_full() -> TestResult {
-    let mut mock = MockTransport::new();
-    mock.expect(
-        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
-        b"FO 0,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
-    );
+async fn set_frequency_full_is_quarantined_before_io() -> TestResult {
+    // No exchanges are scripted. Any transport access would therefore return
+    // a transport error instead of the explicit quarantine error.
+    let mock = MockTransport::new();
     let mut radio = Radio::connect(mock).await?;
-    let ch = ChannelMemory {
-        rx_frequency: Frequency::new(145_000_000),
-        tx_offset: Frequency::new(600_000),
-        step_size: StepSize::Hz5000,
-        mode_flags_raw: 0,
-        shift: ShiftDirection::DOWN,
-        flags_0a_raw: 0x02, // shift- = 2
-        tone_code: ToneCode::new(8)?,
-        ctcss_code: ToneCode::new(8)?,
-        dcs_code: DcsCode::new(0)?,
-        cross_tone_combo: CrossToneType::DcsOff,
-        digital_squelch: FlashDigitalSquelch::Off,
-        urcall: ChannelName::new("CQCQCQ")?,
-        data_mode: 0,
-    };
-    radio.set_frequency_full(Band::A, &ch).await?;
+    let result = radio
+        .set_frequency_full(Band::A, &ChannelMemory::default())
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::UnqualifiedCatWrite { command: "FO", .. })
+        ),
+        "the lossy FO writer must fail before performing I/O: {result:?}"
+    );
     Ok(())
 }
 
@@ -111,17 +101,22 @@ async fn get_firmware_version() -> TestResult {
     mock.expect(b"FV\r", b"FV 1.03.000\r");
     let mut radio = Radio::connect(mock).await?;
     assert_eq!(radio.get_firmware_version().await?, "1.03.000");
+    assert_eq!(radio.cached_firmware_version(), Some("1.03.000"));
+    assert_eq!(
+        radio.firmware_profile(),
+        Some(kenwood_thd75::FirmwareProfile::StandardCat)
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn transmit_and_receive() -> TestResult {
     let mut mock = MockTransport::new();
-    mock.expect(b"TX 0\r", b"TX 0\r");
-    mock.expect(b"RX 0\r", b"RX 0\r");
+    mock.expect(b"TX\r", b"TX\r");
+    mock.expect(b"RX\r", b"RX\r");
     let mut radio = Radio::connect(mock).await?;
-    radio.transmit(Band::A).await?;
-    radio.receive(Band::A).await?;
+    radio.transmit().await?;
+    radio.receive().await?;
     Ok(())
 }
 

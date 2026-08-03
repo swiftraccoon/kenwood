@@ -47,14 +47,21 @@ const MAX_REGULAR_CHANNEL: u16 = 999;
 /// Total channel entries including extended channels.
 const TOTAL_ENTRIES: usize = programming::TOTAL_CHANNEL_ENTRIES; // 1200
 
-/// Maximum channel index as u16 (1199). `TOTAL_ENTRIES` is 1200, which
-/// always fits in u16, so this truncation is safe.
+/// Number of channel entries that have a corresponding 40-byte data record.
+///
+/// The flag and name tables expose 1,200 raw slots, but the 192 data
+/// memgroups hold only 1,152 channel records. Name slots starting at 1,152
+/// are used for other data, including group names.
+const CHANNEL_DATA_ENTRIES: usize = MEMGROUP_COUNT * CHANNELS_PER_MEMGROUP; // 1152
+
+/// Maximum channel index with flag, data, and name destinations (1151).
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "`TOTAL_ENTRIES = 1200`, so `TOTAL_ENTRIES - 1 = 1199`. u16::MAX = 65535. The \
+    reason = "`CHANNEL_DATA_ENTRIES = 1152`, so `CHANNEL_DATA_ENTRIES - 1 = 1151`. u16::MAX = \
+              65535. The \
               const cast is lossless and evaluated at compile time."
 )]
-const MAX_ENTRY_INDEX: u16 = (TOTAL_ENTRIES - 1) as u16;
+const MAX_CHANNEL_DATA_INDEX: u16 = (CHANNEL_DATA_ENTRIES - 1) as u16;
 
 // ---------------------------------------------------------------------------
 // ChannelAccess (read-only)
@@ -261,47 +268,63 @@ impl<'a> ChannelWriter<'a> {
     /// # Errors
     ///
     /// Returns [`MemoryError::ChannelOutOfRange`] if the channel number
-    /// exceeds the maximum.
+    /// has no corresponding 40-byte channel data record or if the backing
+    /// image does not contain every destination. The image is unchanged on
+    /// error.
     pub fn set(&mut self, entry: &ChannelEntry) -> Result<(), MemoryError> {
         let number = entry.number as usize;
-        if number >= TOTAL_ENTRIES {
+        if number >= CHANNEL_DATA_ENTRIES {
             return Err(MemoryError::ChannelOutOfRange {
                 channel: entry.number,
-                max: MAX_ENTRY_INDEX,
+                max: MAX_CHANNEL_DATA_INDEX,
             });
         }
 
-        // Write flag.
-        self.set_flag(entry.number, entry.used, entry.lockout)?;
-
-        // Write flash channel data.
-        self.set_flash(entry.number, &entry.flash)?;
-
-        // Write name.
-        self.set_name(entry.number, &entry.name)?;
-
-        Ok(())
-    }
-
-    /// Write a channel flag.
-    fn set_flag(&mut self, number: u16, used: bool, lockout: bool) -> Result<(), MemoryError> {
-        let number_usize = number as usize;
-        let offset = FLAGS_OFFSET + number_usize * FLAG_RECORD_SIZE;
-        let flag_bytes = self
-            .image
-            .get_mut(offset..offset + FLAG_RECORD_SIZE)
-            .ok_or(MemoryError::ChannelOutOfRange {
-                channel: number,
-                max: MAX_ENTRY_INDEX,
-            })?;
-        let [byte0, byte1, ..] = flag_bytes else {
-            return Err(MemoryError::ChannelOutOfRange {
-                channel: number,
-                max: MAX_ENTRY_INDEX,
-            });
+        let out_of_range = || MemoryError::ChannelOutOfRange {
+            channel: entry.number,
+            max: MAX_CHANNEL_DATA_INDEX,
         };
 
-        if used {
+        let flag_offset = FLAGS_OFFSET + number * FLAG_RECORD_SIZE;
+        let flag_end = flag_offset + FLAG_RECORD_SIZE;
+
+        let memgroup = number / CHANNELS_PER_MEMGROUP;
+        let slot = number % CHANNELS_PER_MEMGROUP;
+        let data_offset = DATA_OFFSET + memgroup * PAGE_SIZE + slot * CHANNEL_RECORD_SIZE;
+        let data_end = data_offset + CHANNEL_RECORD_SIZE;
+
+        let name_offset = NAMES_OFFSET + number * NAME_ENTRY_SIZE;
+        let name_end = name_offset + NAME_ENTRY_SIZE;
+
+        // Obtain all three disjoint destinations before changing any of them.
+        // This makes a short/corrupt backing image an all-or-nothing failure.
+        let Some((flags_region, data_and_names)) = self.image.split_at_mut_checked(DATA_OFFSET)
+        else {
+            return Err(out_of_range());
+        };
+        let Some((data_region, names_region)) =
+            data_and_names.split_at_mut_checked(NAMES_OFFSET - DATA_OFFSET)
+        else {
+            return Err(out_of_range());
+        };
+
+        let Some(flag_bytes) = flags_region.get_mut(flag_offset..flag_end) else {
+            return Err(out_of_range());
+        };
+        let data_relative = data_offset - DATA_OFFSET;
+        let Some(data_bytes) = data_region.get_mut(data_relative..data_end - DATA_OFFSET) else {
+            return Err(out_of_range());
+        };
+        let name_relative = name_offset - NAMES_OFFSET;
+        let Some(name_bytes) = names_region.get_mut(name_relative..name_end - NAMES_OFFSET) else {
+            return Err(out_of_range());
+        };
+
+        let mut next_flag = [0u8; FLAG_RECORD_SIZE];
+        next_flag.copy_from_slice(flag_bytes);
+        let [byte0, byte1, _, _] = &mut next_flag;
+
+        if entry.used {
             // Preserve the existing band indicator if already set.
             // Transitioning from empty to used defaults to 0x00 (VHF).
             if *byte0 == FLAG_EMPTY {
@@ -312,59 +335,26 @@ impl<'a> ChannelWriter<'a> {
         }
 
         // Byte 1: lockout in bit 0, preserve other bits.
-        if lockout {
+        if entry.lockout {
             *byte1 |= 0x01;
         } else {
             *byte1 &= !0x01;
         }
 
-        Ok(())
-    }
-
-    /// Write the 40-byte flash channel record.
-    fn set_flash(&mut self, number: u16, memory: &FlashChannel) -> Result<(), MemoryError> {
-        let number_usize = number as usize;
-        let memgroup = number_usize / CHANNELS_PER_MEMGROUP;
-        let slot = number_usize % CHANNELS_PER_MEMGROUP;
-
-        if memgroup >= MEMGROUP_COUNT {
-            return Err(MemoryError::ChannelOutOfRange {
-                channel: number,
-                max: MAX_ENTRY_INDEX,
-            });
-        }
-
-        let offset = DATA_OFFSET + memgroup * PAGE_SIZE + slot * CHANNEL_RECORD_SIZE;
-        let dst = self
-            .image
-            .get_mut(offset..offset + CHANNEL_RECORD_SIZE)
-            .ok_or(MemoryError::ChannelOutOfRange {
-                channel: number,
-                max: MAX_ENTRY_INDEX,
-            })?;
-
-        let bytes = memory.to_bytes();
-        dst.copy_from_slice(&bytes);
-        Ok(())
-    }
-
-    /// Write a channel display name (up to 16 bytes, null-padded).
-    fn set_name(&mut self, number: u16, name: &str) -> Result<(), MemoryError> {
-        let number_usize = number as usize;
-        let offset = NAMES_OFFSET + number_usize * NAME_ENTRY_SIZE;
-        let dst = self.image.get_mut(offset..offset + NAME_ENTRY_SIZE).ok_or(
-            MemoryError::ChannelOutOfRange {
-                channel: number,
-                max: MAX_ENTRY_INDEX,
-            },
-        )?;
-
-        let mut buf = [0u8; NAME_ENTRY_SIZE];
-        // Zip is bounded by the shorter of buf (NAME_ENTRY_SIZE) and src; no indexing.
-        buf.iter_mut()
-            .zip(name.as_bytes().iter())
+        let next_data = entry.flash.to_bytes();
+        let mut next_name = [0u8; NAME_ENTRY_SIZE];
+        // Zip is bounded by the shorter of the fixed-size buffer and source; no indexing.
+        next_name
+            .iter_mut()
+            .zip(entry.name.as_bytes().iter())
             .for_each(|(b, &s)| *b = s);
-        dst.copy_from_slice(&buf);
+
+        // All fallible validation and destination acquisition completed above;
+        // these three fixed-size copies are the transaction's commit point.
+        flag_bytes.copy_from_slice(&next_flag);
+        data_bytes.copy_from_slice(&next_data);
+        name_bytes.copy_from_slice(&next_name);
+
         Ok(())
     }
 
@@ -691,24 +681,105 @@ mod tests {
     }
 
     #[test]
-    fn channel_writer_out_of_range() -> TestResult {
+    fn channel_writer_accepts_last_channel_with_a_data_record() -> TestResult {
         let image = make_test_image()?;
         let mut mi = super::super::MemoryImage::from_raw(image)?;
 
         let entry = ChannelEntry {
-            number: 1200,
-            name: String::new(),
-            flash: FlashChannel::default(),
-            used: false,
-            lockout: false,
+            number: MAX_CHANNEL_DATA_INDEX,
+            name: "LAST DATA SLOT".to_owned(),
+            flash: FlashChannel {
+                rx_frequency: Frequency::new(433_920_000),
+                ..FlashChannel::default()
+            },
+            used: true,
+            lockout: true,
         };
 
-        let mut writer = ChannelWriter::new(mi.as_raw_mut());
-        let result = writer.set(&entry);
-        assert!(
-            result.is_err(),
-            "expected out-of-range set to fail: {result:?}"
+        {
+            let mut writer = ChannelWriter::new(mi.as_raw_mut());
+            writer.set(&entry)?;
+        }
+
+        let read_back = mi
+            .channels()
+            .get(MAX_CHANNEL_DATA_INDEX)
+            .ok_or("last backed channel missing after write")?;
+        assert!(read_back.used);
+        assert!(read_back.lockout);
+        assert_eq!(read_back.name, "LAST DATA SLOT");
+        assert_eq!(read_back.flash.rx_frequency.as_hz(), 433_920_000);
+        Ok(())
+    }
+
+    #[test]
+    fn channel_writer_rejects_unbacked_raw_slots_without_mutation() -> TestResult {
+        for number in [1152, 1199, 1200] {
+            let mut image = make_test_image()?;
+            let before = image.clone();
+            let entry = ChannelEntry {
+                number,
+                name: "MUST NOT WRITE".to_owned(),
+                flash: FlashChannel {
+                    rx_frequency: Frequency::new(145_000_000),
+                    ..FlashChannel::default()
+                },
+                used: true,
+                lockout: true,
+            };
+
+            let err = {
+                let mut writer = ChannelWriter::new(&mut image);
+                writer
+                    .set(&entry)
+                    .err()
+                    .ok_or("expected unbacked channel write to fail")?
+            };
+            assert_eq!(
+                err,
+                MemoryError::ChannelOutOfRange {
+                    channel: number,
+                    max: MAX_CHANNEL_DATA_INDEX,
+                }
+            );
+            assert_eq!(image, before, "channel {number} error mutated the image");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn channel_writer_short_image_error_is_transactional() -> TestResult {
+        // Flags and channel data for channel 10 exist, but its name destination
+        // does not. The writer must discover that before changing the earlier
+        // regions.
+        let mut image = vec![0x7C; NAMES_OFFSET];
+        let before = image.clone();
+        let entry = ChannelEntry {
+            number: 10,
+            name: "NO DESTINATION".to_owned(),
+            flash: FlashChannel {
+                rx_frequency: Frequency::new(145_000_000),
+                ..FlashChannel::default()
+            },
+            used: true,
+            lockout: true,
+        };
+
+        let err = {
+            let mut writer = ChannelWriter::new(&mut image);
+            writer
+                .set(&entry)
+                .err()
+                .ok_or("expected short image channel write to fail")?
+        };
+        assert_eq!(
+            err,
+            MemoryError::ChannelOutOfRange {
+                channel: 10,
+                max: MAX_CHANNEL_DATA_INDEX,
+            }
         );
+        assert_eq!(image, before, "failed channel write mutated short image");
         Ok(())
     }
 }

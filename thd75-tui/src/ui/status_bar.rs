@@ -35,9 +35,6 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let mut flags = Vec::new();
     flags.push(format!("BAT:{}", s.battery_level));
     flags.push(format!("Vol:{}", s.af_gain));
-    if s.lock {
-        flags.push("LCK".into());
-    }
     if s.bluetooth {
         flags.push("BT".into());
     }

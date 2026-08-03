@@ -84,11 +84,10 @@ pub struct GpsConfig {
     pub enabled: bool,
     /// GPS PC output mode (send NMEA data to the serial port).
     pub pc_output: bool,
-    /// GPS operating mode.
+    /// GPS operating mode (Menu 403: Normal or GPS Receiver).
     pub operating_mode: GpsOperatingMode,
-    /// GPS battery saver (reduce GPS power consumption by cycling
-    /// the receiver on and off).
-    pub battery_saver: bool,
+    /// GPS battery saver interval (Menu 404).
+    pub battery_saver: GpsBatterySaver,
     /// NMEA sentence output selection (which sentences to include in
     /// PC output).
     pub sentence_output: NmeaSentences,
@@ -111,8 +110,8 @@ impl Default for GpsConfig {
         Self {
             enabled: true,
             pc_output: false,
-            operating_mode: GpsOperatingMode::Standalone,
-            battery_saver: false,
+            operating_mode: GpsOperatingMode::Normal,
+            battery_saver: GpsBatterySaver::Off,
             sentence_output: NmeaSentences::default(),
             track_log: TrackLogConfig::default(),
             my_positions: Default::default(),
@@ -127,16 +126,18 @@ impl Default for GpsConfig {
 // Operating mode
 // ---------------------------------------------------------------------------
 
-/// GPS receiver operating mode.
+/// GPS receiver operating mode (Menu 403).
+///
+/// The MCP-D75 `gps.OperatingMode` field and the radio menu expose exactly
+/// two values. `GpsReceiver` turns off the transceiver function and boots the
+/// radio into its GPS-only operating mode.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GpsOperatingMode {
-    /// Standalone GPS receiver (internal GPS only).
-    Standalone,
-    /// SBAS (Satellite Based Augmentation System) enabled.
-    /// Uses WAAS/EGNOS/MSAS for improved accuracy.
-    Sbas,
-    /// Manual position entry (GPS receiver off, use stored coordinates).
-    Manual,
+    /// Normal transceiver operation.
+    Normal = 0,
+    /// GPS receiver-only operation.
+    GpsReceiver = 1,
 }
 
 impl TryFrom<u8> for GpsOperatingMode {
@@ -144,15 +145,72 @@ impl TryFrom<u8> for GpsOperatingMode {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::Standalone),
-            1 => Ok(Self::Sbas),
-            2 => Ok(Self::Manual),
+            0 => Ok(Self::Normal),
+            1 => Ok(Self::GpsReceiver),
             _ => Err(crate::error::ValidationError::SettingOutOfRange {
                 name: "GPS operating mode",
                 value,
-                detail: "must be 0-2",
+                detail: "must be 0-1",
             }),
         }
+    }
+}
+
+impl From<GpsOperatingMode> for u8 {
+    fn from(mode: GpsOperatingMode) -> Self {
+        mode as Self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Battery saver
+// ---------------------------------------------------------------------------
+
+/// GPS receiver battery-saver interval (Menu 404).
+///
+/// The numeric choices are minutes of GPS off-time. `Auto` progressively
+/// increases that off-time from one to eight minutes as documented by the
+/// TH-D75 user manual.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GpsBatterySaver {
+    /// Battery saver disabled.
+    Off = 0,
+    /// One-minute off-time.
+    OneMinute = 1,
+    /// Two-minute off-time.
+    TwoMinutes = 2,
+    /// Four-minute off-time.
+    FourMinutes = 3,
+    /// Eight-minute off-time.
+    EightMinutes = 4,
+    /// Automatically increase the off-time from one to eight minutes.
+    Auto = 5,
+}
+
+impl TryFrom<u8> for GpsBatterySaver {
+    type Error = crate::error::ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Off),
+            1 => Ok(Self::OneMinute),
+            2 => Ok(Self::TwoMinutes),
+            3 => Ok(Self::FourMinutes),
+            4 => Ok(Self::EightMinutes),
+            5 => Ok(Self::Auto),
+            _ => Err(crate::error::ValidationError::SettingOutOfRange {
+                name: "GPS battery saver",
+                value,
+                detail: "must be 0-5",
+            }),
+        }
+    }
+}
+
+impl From<GpsBatterySaver> for u8 {
+    fn from(mode: GpsBatterySaver) -> Self {
+        mode as Self
     }
 }
 
@@ -511,7 +569,33 @@ mod tests {
         let cfg = GpsConfig::default();
         assert!(cfg.enabled);
         assert!(!cfg.pc_output);
-        assert_eq!(cfg.operating_mode, GpsOperatingMode::Standalone);
+        assert_eq!(cfg.operating_mode, GpsOperatingMode::Normal);
+        assert_eq!(cfg.battery_saver, GpsBatterySaver::Off);
+    }
+
+    #[test]
+    fn gps_menu_enums_match_official_raw_domains() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(GpsOperatingMode::try_from(0)?, GpsOperatingMode::Normal);
+        assert_eq!(
+            GpsOperatingMode::try_from(1)?,
+            GpsOperatingMode::GpsReceiver
+        );
+        assert!(GpsOperatingMode::try_from(2).is_err());
+
+        let battery_modes = [
+            GpsBatterySaver::Off,
+            GpsBatterySaver::OneMinute,
+            GpsBatterySaver::TwoMinutes,
+            GpsBatterySaver::FourMinutes,
+            GpsBatterySaver::EightMinutes,
+            GpsBatterySaver::Auto,
+        ];
+        for (raw, expected) in (0_u8..=5).zip(battery_modes) {
+            assert_eq!(GpsBatterySaver::try_from(raw)?, expected);
+            assert_eq!(u8::from(expected), raw);
+        }
+        assert!(GpsBatterySaver::try_from(6).is_err());
+        Ok(())
     }
 
     #[test]

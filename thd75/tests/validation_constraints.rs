@@ -418,16 +418,16 @@ fn filter_mode_boundary() {
 fn battery_level_boundary() {
     assert_eq!(
         BatteryLevel::COUNT,
-        5,
-        "spec: KI4LAX BL (0-3) + HW verified (4=charging)"
+        6,
+        "firmware handler domain is 0-5; meaning of raw 5 is unqualified"
     );
     assert!(
         BatteryLevel::try_from(BatteryLevel::COUNT - 1).is_ok(),
-        "4 is max"
+        "5 is max"
     );
     assert!(
         BatteryLevel::try_from(BatteryLevel::COUNT).is_err(),
-        "5 must be rejected"
+        "6 must be rejected"
     );
 }
 
@@ -443,11 +443,11 @@ fn vox_gain_boundary() {
 
 #[test]
 fn vox_delay_boundary() {
-    assert_eq!(VoxDelay::MAX, 30, "spec: User Manual Menu 152");
-    assert!(VoxDelay::new(VoxDelay::MAX).is_ok(), "30 is max");
+    assert_eq!(VoxDelay::MAX, 6, "firmware/MCP raw domain is 0-6");
+    assert!(VoxDelay::new(VoxDelay::MAX).is_ok(), "6 is max");
     assert!(
         VoxDelay::new(VoxDelay::MAX + 1).is_err(),
-        "31 must be rejected"
+        "7 must be rejected"
     );
 }
 
@@ -463,14 +463,14 @@ fn tnc_baud_boundary() {
 
 #[test]
 fn beacon_mode_boundary() {
-    assert_eq!(BeaconMode::COUNT, 5, "spec: User Manual");
+    assert_eq!(BeaconMode::COUNT, 4, "firmware ledger: PT 0-3");
     assert!(
         BeaconMode::try_from(BeaconMode::COUNT - 1).is_ok(),
-        "4 is max"
+        "3 is max"
     );
     assert!(
         BeaconMode::try_from(BeaconMode::COUNT).is_err(),
-        "5 must be rejected"
+        "4 must be rejected"
     );
 }
 
@@ -491,16 +491,6 @@ fn dstar_slot_boundary() {
 }
 
 #[test]
-fn callsign_slot_boundary() {
-    assert_eq!(CallsignSlot::MAX, 10, "spec: firmware RE");
-    assert!(CallsignSlot::new(CallsignSlot::MAX).is_ok(), "10 is max");
-    assert!(
-        CallsignSlot::new(CallsignSlot::MAX + 1).is_err(),
-        "11 must be rejected"
-    );
-}
-
-#[test]
 fn detect_output_mode_boundary() {
     assert_eq!(DetectOutputMode::COUNT, 3, "spec: KI4LAX IO + ARFC RE");
     assert!(
@@ -515,14 +505,14 @@ fn detect_output_mode_boundary() {
 
 #[test]
 fn dv_gateway_mode_boundary() {
-    assert_eq!(DvGatewayMode::COUNT, 3, "spec: ARFC RE a/ai.cs");
+    assert_eq!(DvGatewayMode::COUNT, 2, "firmware GW/MCP domain is 0-1");
     assert!(
         DvGatewayMode::try_from(DvGatewayMode::COUNT - 1).is_ok(),
-        "2 is max"
+        "1 is max"
     );
     assert!(
         DvGatewayMode::try_from(DvGatewayMode::COUNT).is_err(),
-        "3 must be rejected"
+        "2 must be rejected"
     );
 }
 
@@ -784,6 +774,7 @@ fn channel_enum_types_round_trip() -> TestResult {
 
 #[test]
 fn radio_param_types_round_trip() -> TestResult {
+    assert_try_from_round_trip_inclusive::<AfGainLevel>(0..=AfGainLevel::MAX, "AfGainLevel")?;
     assert_try_from_round_trip::<SquelchLevel>(0..SquelchLevel::COUNT, "SquelchLevel")?;
     assert_try_from_round_trip::<SMeterReading>(0..SMeterReading::COUNT, "SMeterReading")?;
     assert_try_from_round_trip::<VfoMemoryMode>(0..VfoMemoryMode::COUNT, "VfoMemoryMode")?;
@@ -793,6 +784,11 @@ fn radio_param_types_round_trip() -> TestResult {
     assert_try_from_round_trip_inclusive::<VoxDelay>(0..=VoxDelay::MAX, "VoxDelay")?;
     assert_try_from_round_trip::<TncBaud>(0..TncBaud::COUNT, "TncBaud")?;
     assert_try_from_round_trip::<BeaconMode>(0..BeaconMode::COUNT, "BeaconMode")?;
+    assert_try_from_round_trip::<MyPositionSelection>(
+        0..MyPositionSelection::COUNT,
+        "MyPositionSelection",
+    )?;
+    assert_try_from_round_trip::<BacklightControl>(0..BacklightControl::COUNT, "BacklightControl")?;
     assert_try_from_round_trip::<DetectOutputMode>(0..DetectOutputMode::COUNT, "DetectOutputMode")?;
     assert_try_from_round_trip::<DvGatewayMode>(0..DvGatewayMode::COUNT, "DvGatewayMode")?;
     assert_try_from_round_trip::<TncMode>(0..TncMode::COUNT, "TncMode")?;
@@ -808,12 +804,6 @@ fn radio_param_types_round_trip() -> TestResult {
     for i in DstarSlot::MIN..=DstarSlot::MAX {
         let val = DstarSlot::new(i)?;
         assert_eq!(u8::from(val), i, "DstarSlot round-trip failed for {i}");
-    }
-
-    // CallsignSlot: 0..=MAX
-    for i in 0u8..=CallsignSlot::MAX {
-        let val = CallsignSlot::new(i)?;
-        assert_eq!(u8::from(val), i, "CallsignSlot round-trip failed for {i}");
     }
 
     // ScanResumeMethod uses from_raw/to_raw

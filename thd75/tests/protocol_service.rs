@@ -5,7 +5,7 @@
 //! transport framing, and read/write semantics are independently live-verified.
 
 use kenwood_thd75::error::ProtocolError;
-use kenwood_thd75::protocol::{self, Command, Response};
+use kenwood_thd75::protocol;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -24,23 +24,10 @@ use tokio as _;
 use tokio_serial as _;
 use tracing as _;
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
-
-#[test]
-fn normal_0e_mcp_status_remains_supported() -> TestResult {
-    assert_eq!(protocol::serialize(&Command::GetMcpStatus), b"0E\r");
-
-    let response = protocol::parse(b"0E")?;
-    let Response::McpStatus { value } = response else {
-        return Err(format!("expected McpStatus, got {response:?}").into());
-    };
-    assert_eq!(value, "");
-    Ok(())
-}
-
 #[test]
 fn factory_service_responses_are_quarantined() {
     let frames: &[(&[u8], &str)] = &[
+        (b"0E", "0E"),
         (b"0G", "0G"),
         (b"9R 000000,AF", "9R"),
         (b"9E 000000,AA", "9E"),

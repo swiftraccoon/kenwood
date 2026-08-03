@@ -114,10 +114,7 @@ pub(crate) async fn clock<T: Transport>(radio: &mut Radio<T>) {
 pub(crate) async fn frequency<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     let band = parse_band(args.first());
     match radio.get_frequency(band).await {
-        Ok(ch) => aprintln!(
-            "{}",
-            thd75_repl::output::frequency(band, ch.rx_frequency.as_hz())
-        ),
+        Ok(frequency) => aprintln!("{}", thd75_repl::output::frequency(band, frequency.as_hz())),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
@@ -166,7 +163,7 @@ pub(crate) async fn tnc_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) 
     }
 }
 
-/// Read or set the firmware beacon type. Args: `[off|manual|ptt|auto|smart]`.
+/// Read or set the firmware beacon type. Args: `[manual|ptt|auto|smart]`.
 ///
 /// Auto, smart, and PTT make the radio transmit BY ITSELF while its
 /// TNC is in APRS mode, so those settings go through the transmit
@@ -180,7 +177,6 @@ pub(crate) async fn beacon_type<T: Transport>(radio: &mut Radio<T>, args: &[&str
         return;
     };
     let mode = match arg.to_lowercase().as_str() {
-        "off" => kenwood_thd75::types::BeaconMode::Off,
         "manual" => kenwood_thd75::types::BeaconMode::Manual,
         "ptt" => kenwood_thd75::types::BeaconMode::Ptt,
         "auto" => kenwood_thd75::types::BeaconMode::Auto,
@@ -190,7 +186,7 @@ pub(crate) async fn beacon_type<T: Transport>(radio: &mut Radio<T>, args: &[&str
                 "{}",
                 thd75_repl::output::error(format_args!("unknown beacon type: {other}"))
             );
-            aprintln!("Valid types: off, manual, ptt, auto, smart");
+            aprintln!("Valid types: manual, ptt, auto, smart");
             return;
         }
     };
@@ -248,19 +244,14 @@ pub(crate) async fn smeter<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 // Lock / Bluetooth / Attenuator
 // ---------------------------------------------------------------------------
 
-/// Read or set the key lock state. Args: `[on|off]`.
-pub(crate) async fn lock<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    if let Some(val) = args.first().and_then(|s| parse_bool(s)) {
-        match radio.set_lock(val).await {
-            Ok(()) => aprintln!("{}", thd75_repl::output::key_lock(val)),
-            Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
-        }
-    } else {
-        match radio.get_lock().await {
-            Ok(locked) => aprintln!("{}", thd75_repl::output::key_lock(locked)),
-            Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
-        }
-    }
+/// Report that key lock has no verified CAT operation.
+pub(crate) fn lock<T: Transport>(_radio: &mut Radio<T>, _args: &[&str]) {
+    aprintln!(
+        "{}",
+        thd75_repl::output::error(
+            "Key lock has no verified CAT operation; LC controls the LCD backlight"
+        )
+    );
 }
 
 /// Read or set Bluetooth state. Args: `[on|off]`.
@@ -303,11 +294,16 @@ pub(crate) async fn attenuator<T: Transport>(radio: &mut Radio<T>, args: &[&str]
 /// Step frequency up by one increment, then read back. Args: `[a|b]`.
 pub(crate) async fn step_up<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     let band = parse_band(args.first());
-    match radio.frequency_up(band).await {
+    let result = async {
+        radio.set_band(band).await?;
+        radio.frequency_up().await
+    }
+    .await;
+    match result {
         Ok(()) => match radio.get_frequency(band).await {
-            Ok(ch) => aprintln!(
+            Ok(frequency) => aprintln!(
                 "{}",
-                thd75_repl::output::stepped_up(band, ch.rx_frequency.as_hz())
+                thd75_repl::output::stepped_up(band, frequency.as_hz())
             ),
             Err(e) => aprintln!(
                 "{}",
@@ -323,10 +319,15 @@ pub(crate) async fn step_up<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 /// Step frequency down by one increment and read back. Args: `[a|b]`.
 pub(crate) async fn step_down<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     let band = parse_band(args.first());
-    match radio.frequency_down(band).await {
-        Ok(ch) => aprintln!(
+    let result = async {
+        radio.set_band(band).await?;
+        radio.frequency_down().await
+    }
+    .await;
+    match result {
+        Ok(frequency) => aprintln!(
             "{}",
-            thd75_repl::output::stepped_down(band, ch.rx_frequency.as_hz())
+            thd75_repl::output::stepped_down(band, frequency.as_hz())
         ),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
@@ -971,11 +972,7 @@ pub(crate) async fn status<T: Transport>(radio: &mut Radio<T>) {
     } else {
         aprintln!("Radio clock: not available");
     }
-    if let Ok(locked) = radio.get_lock().await {
-        aprintln!("{}", thd75_repl::output::key_lock(locked));
-    } else {
-        aprintln!("Key lock: not available");
-    }
+    aprintln!("Key lock: not available (no verified CAT operation)");
     if let Ok(on) = radio.get_dual_band().await {
         aprintln!("{}", thd75_repl::output::dual_band(on));
     } else {
@@ -994,11 +991,8 @@ pub(crate) async fn status<T: Transport>(radio: &mut Radio<T>) {
 
     for band in [Band::A, Band::B] {
         let name = band_name(band);
-        if let Ok(ch) = radio.get_frequency(band).await {
-            aprintln!(
-                "{}",
-                thd75_repl::output::frequency(band, ch.rx_frequency.as_hz())
-            );
+        if let Ok(frequency) = radio.get_frequency(band).await {
+            aprintln!("{}", thd75_repl::output::frequency(band, frequency.as_hz()));
         } else {
             aprintln!("Band {name} frequency: not available");
         }

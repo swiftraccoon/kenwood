@@ -35,16 +35,16 @@ pub mod wireless;
 
 pub use band::Band;
 pub use channel::{
-    ChannelMemory, ChannelName, CrossToneType, FineStep, FlashChannel, FlashDigitalSquelch,
-    FlashDuplex,
+    CatChannelMode, CatChannelRecord, ChannelMemory, ChannelName, CrossToneType, FineStep,
+    FlashChannel, FlashDigitalSquelch, FlashDuplex, MemoryChannelRecord, MemorySelector,
 };
 pub use frequency::Frequency;
 pub use mode::{CoarseStepMultiplier, MemoryMode, Mode, PowerLevel, ShiftDirection, StepSize};
 pub use radio_params::{
-    AfGainLevel, BatteryLevel, BeaconMode, CallsignSlot, DdrOffset, DetectOutputMode, DstarSlot,
-    DvGatewayMode, FilterMode, FilterWidthIndex, GpsRadioMode, MEM_READ_BOUND,
-    MEMORY_READ_WIRE_BOUND, MemoryReadOffset, MemoryReadTarget, ReadLen, SMeterReading,
-    SquelchLevel, TncBaud, TncMode, VfoMemoryMode, VoxDelay, VoxGain,
+    AfGainLevel, BatteryLevel, BeaconMode, DdrOffset, DetectOutputMode, DstarSlot, DvGatewayMode,
+    FilterMode, FilterWidthIndex, GpsRadioMode, MEM_READ_BOUND, MEMORY_READ_WIRE_BOUND,
+    MemoryReadOffset, MemoryReadTarget, MyPositionSelection, ReadLen, SMeterReading, SquelchLevel,
+    TncBaud, TncMode, VfoMemoryMode, VoxDelay, VoxGain,
 };
 pub use tone::{
     CTCSS_FREQUENCIES, CtcssMode, DCS_CODES, DataSpeed, DcsCode, LockoutMode, ToneCode, ToneMode,
@@ -74,7 +74,7 @@ pub use dstar::{
 
 // GPS subsystem re-exports.
 pub use gps::{
-    CoordinateFormat, GpsConfig, GpsDataTx, GpsFix, GpsOperatingMode, GpsPosition,
+    CoordinateFormat, GpsBatterySaver, GpsConfig, GpsDataTx, GpsFix, GpsOperatingMode, GpsPosition,
     GpsPositionAmbiguity, GridSquareFormat, NmeaSentences, PositionMemory, PositionName,
     TargetPoint, TrackLogConfig, TrackRecordMethod,
 };
@@ -95,6 +95,7 @@ pub use settings::{
     RxEqualizer, SpeedDistanceUnit, SystemSettings, TemperatureUnit, TxEqLevel, TxEqualizer,
     VoiceGuideSpeed,
 };
+pub use system::{RADIO_CLOCK_UNAVAILABLE_WIRE, RadioClock, RadioDateTime};
 
 // CW (Morse code) re-exports.
 pub use cw::{CwConfig, CwDelay, CwPitch};

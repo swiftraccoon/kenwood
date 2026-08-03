@@ -2294,6 +2294,7 @@ impl<T: Transport> Radio<T> {
             Ok(metadata) => {
                 self.desynced = false;
                 self.gm_poisoned = false;
+                self.firmware_version = Some(super::AZIMUTH_AUTOMATION_FIRMWARE.to_owned());
                 Ok(AutomationSession {
                     radio: self,
                     abi: EXPECTED_ABI,

@@ -43,8 +43,8 @@
 //! println!("Connected to: {}", info.model);
 //!
 //! // Read the current frequency on Band A.
-//! let channel = radio.get_frequency(Band::A).await?;
-//! println!("RX frequency: {} Hz", channel.rx_frequency.as_hz());
+//! let frequency = radio.get_frequency(Band::A).await?;
+//! println!("RX frequency: {} Hz", frequency.as_hz());
 //!
 //! // Disconnect cleanly.
 //! radio.disconnect().await?;
@@ -97,9 +97,9 @@ use serde_json as _;
 
 // Convenience re-exports for the most commonly used types.
 pub use error::Error;
-pub use radio::Radio;
 pub use radio::diagnostics::LinkDiagnosis;
 pub use radio::programming::McpSpeed;
+pub use radio::{FirmwareProfile, Radio};
 #[cfg(target_os = "macos")]
 pub use transport::BluetoothTransport;
 pub use transport::{EitherTransport, MockTransport, SerialTransport, Transport};

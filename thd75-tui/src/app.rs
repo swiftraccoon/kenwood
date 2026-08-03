@@ -105,7 +105,7 @@ fn parse_reflector_input(input: &str) -> Option<(String, char)> {
 }
 
 /// Number of rows in the settings list (must match `SettingRow::ALL.len()`).
-pub(crate) const SETTINGS_COUNT: usize = 76;
+pub(crate) const SETTINGS_COUNT: usize = 75;
 
 /// Settings row identifiers for the interactive settings list.
 ///
@@ -193,8 +193,6 @@ pub(crate) enum SettingRow {
     PfKey2,
 
     // --- Lock ---
-    /// Lock (CAT: LC).
-    Lock,
     /// Key-lock configuration checkbox (MCP only).
     KeyLock,
     /// Frequency-lock configuration checkbox (MCP only).
@@ -293,8 +291,8 @@ pub(crate) enum SettingRow {
     GpsPcOutput,
     /// Auto-info notifications (CAT: AI).
     AutoInfo,
-    /// D-STAR callsign slot (CAT: CS).
-    CallsignSlot,
+    /// APRS My Callsign (CAT: CS, read-only in this UI).
+    AprsCallsign,
     /// D-STAR slot (CAT: DS).
     DstarSlot,
     /// Scan resume method (CAT: SR write-only).
@@ -344,7 +342,6 @@ impl SettingRow {
         Self::PfKey1,
         Self::PfKey2,
         // Lock
-        Self::Lock,
         Self::KeyLock,
         Self::FrequencyLock,
         Self::AprsLockFrequency,
@@ -394,7 +391,7 @@ impl SettingRow {
         Self::GpsEnabled,
         Self::GpsPcOutput,
         Self::AutoInfo,
-        Self::CallsignSlot,
+        Self::AprsCallsign,
         Self::DstarSlot,
         Self::ScanResumeCat,
     ];
@@ -433,7 +430,6 @@ impl SettingRow {
             Self::MicSensitivity => "Mic Sensitivity",
             Self::PfKey1 => "PF Key 1",
             Self::PfKey2 => "PF Key 2",
-            Self::Lock => "Lock",
             Self::KeyLock => "Key Lock",
             Self::FrequencyLock => "Frequency Lock",
             Self::AprsLockFrequency => "APRS Lock: Frequency",
@@ -475,7 +471,7 @@ impl SettingRow {
             Self::GpsEnabled => "GPS Enabled",
             Self::GpsPcOutput => "GPS PC Output",
             Self::AutoInfo => "Auto Info",
-            Self::CallsignSlot => "Callsign Slot",
+            Self::AprsCallsign => "APRS My Callsign",
             Self::DstarSlot => "D-STAR Slot",
             Self::ScanResumeCat => "Scan Resume (CAT)",
         }
@@ -492,7 +488,7 @@ impl SettingRow {
             Self::DtmfSpeed => Some("── DTMF ──"),
             Self::RepeaterAutoOffset => Some("── Repeater ──"),
             Self::MicSensitivity => Some("── Auxiliary ──"),
-            Self::Lock => Some("── Lock ──"),
+            Self::KeyLock => Some("── Lock ──"),
             Self::BacklightControl => Some("── Display ──"),
             Self::EmrVolumeLevel => Some("── Audio ──"),
             Self::SpeedDistanceUnit => Some("── Units ──"),
@@ -556,7 +552,6 @@ impl SettingRow {
                 | Self::VfoMemModeB
                 | Self::TncBaud
                 | Self::BeaconType
-                | Self::CallsignSlot
                 | Self::DstarSlot
         )
     }
@@ -576,7 +571,6 @@ impl SettingRow {
                 | Self::VoxEnabled
                 | Self::VoxGain
                 | Self::VoxDelay
-                | Self::Lock
                 | Self::DualBand
                 | Self::Bluetooth
                 | Self::PowerA
@@ -594,7 +588,7 @@ impl SettingRow {
                 | Self::GpsEnabled
                 | Self::GpsPcOutput
                 | Self::AutoInfo
-                | Self::CallsignSlot
+                | Self::AprsCallsign
                 | Self::DstarSlot
                 | Self::ScanResumeCat
         )
@@ -780,8 +774,8 @@ impl Default for BandState {
 #[expect(
     clippy::struct_excessive_bools,
     reason = "RadioState aggregates the TH-D75's independent CAT toggle settings (beep, \
-              lock, dual_band, bluetooth, vox, gps_enabled, gps_pc_output), each mapping \
-              1:1 to a distinct CAT command name (BP, LK, DW, BT, VX, GP, GP). Collapsing \
+              dual_band, bluetooth, vox, gps_enabled, gps_pc_output), each mapping \
+              1:1 to a distinct CAT command name. Collapsing \
               these into a `HashSet<RadioFlag>` (the refactor clippy wants) would break \
               the 1:1 CAT-command-to-field mapping that makes the poll_once / apply_state \
               code trivially auditable against the D-STAR + CAT spec. The bools here are \
@@ -792,7 +786,6 @@ pub(crate) struct RadioState {
     pub band_b: BandState,
     pub battery_level: BatteryLevel,
     pub beep: bool,
-    pub lock: bool,
     pub dual_band: bool,
     pub bluetooth: bool,
     pub vox: bool,
@@ -830,8 +823,8 @@ pub(crate) struct RadioState {
     pub dstar_gateway_mode: Option<kenwood_thd75::types::DvGatewayMode>,
     /// Active D-STAR slot.
     pub dstar_slot: Option<kenwood_thd75::types::DstarSlot>,
-    /// Active callsign slot.
-    pub dstar_callsign_slot: Option<kenwood_thd75::types::CallsignSlot>,
+    /// Live APRS My Callsign read through CAT CS.
+    pub aprs_callsign: Option<kenwood_thd75::types::AprsCallsign>,
 }
 
 impl Default for RadioState {
@@ -841,7 +834,6 @@ impl Default for RadioState {
             band_b: BandState::default(),
             battery_level: BatteryLevel::Empty,
             beep: false,
-            lock: false,
             dual_band: false,
             bluetooth: false,
             vox: false,
@@ -854,7 +846,7 @@ impl Default for RadioState {
             gps_pc_output: false,
             gps_sentences: None,
             gps_mode: None,
-            beacon_type: BeaconMode::Off,
+            beacon_type: BeaconMode::Manual,
             fine_step: None,
             filter_width_ssb: None,
             filter_width_cw: None,
@@ -868,7 +860,7 @@ impl Default for RadioState {
             dstar_rpt2_suffix: String::new(),
             dstar_gateway_mode: None,
             dstar_slot: None,
-            dstar_callsign_slot: None,
+            aprs_callsign: None,
         }
     }
 }
@@ -1220,8 +1212,8 @@ impl App {
                 if state.dstar_slot.is_none() {
                     state.dstar_slot = self.state.dstar_slot;
                 }
-                if state.dstar_callsign_slot.is_none() {
-                    state.dstar_callsign_slot = self.state.dstar_callsign_slot;
+                if state.aprs_callsign.is_none() {
+                    state.aprs_callsign.clone_from(&self.state.aprs_callsign);
                 }
                 self.state = state;
                 self.connected = true;
@@ -2108,12 +2100,6 @@ impl App {
         // CAT-backed boolean settings
         if let Some(ref tx) = self.cmd_tx.clone() {
             match row {
-                SettingRow::Lock => {
-                    let next = !self.state.lock;
-                    let _send = tx.send(crate::event::RadioCommand::SetLock(next));
-                    self.status_message = Some(format!("Lock → {}", on_off(next)));
-                    return;
-                }
                 SettingRow::DualBand => {
                     let next = !self.state.dual_band;
                     let _send = tx.send(crate::event::RadioCommand::SetDualBand(next));
@@ -2169,6 +2155,11 @@ impl App {
                 }
                 SettingRow::AutoInfo => {
                     self.status_message = Some("Auto Info: not yet wired".into());
+                    return;
+                }
+                SettingRow::AprsCallsign => {
+                    self.status_message =
+                        Some("APRS My Callsign is currently read-only in this view".into());
                     return;
                 }
                 _ => {}
@@ -2537,7 +2528,7 @@ impl App {
                 SettingRow::BeaconType => {
                     let cur = u8::from(self.state.beacon_type);
                     let next = if delta > 0 {
-                        cur.saturating_add(1).min(4)
+                        cur.saturating_add(1).min(3)
                     } else {
                         cur.saturating_sub(1)
                     };
@@ -2545,11 +2536,6 @@ impl App {
                         let _send = tx.send(crate::event::RadioCommand::SetBeaconType(mode));
                         self.status_message = Some(format!("Beacon Type → {mode}"));
                     }
-                    return;
-                }
-                SettingRow::CallsignSlot => {
-                    self.status_message =
-                        Some("Callsign Slot: not yet polled, cannot adjust".into());
                     return;
                 }
                 SettingRow::DstarSlot => {

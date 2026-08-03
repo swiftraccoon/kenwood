@@ -212,7 +212,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let io0 = radio.get_io_port().await?;
     let sq0 = radio.get_squelch(Band::B).await?;
     let mode0 = radio.get_mode(Band::B).await?;
-    let freq0 = radio.get_frequency(Band::B).await?.rx_frequency;
+    let freq0 = radio.get_frequency(Band::B).await?;
     println!(
         "saved state: band={band0:?} dual={dual0} io={io0} squelch={} mode={mode0} freq={} Hz",
         u8::from(sq0),

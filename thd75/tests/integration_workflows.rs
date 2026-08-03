@@ -113,34 +113,26 @@ async fn audio_settings_workflow() -> TestResult {
 #[tokio::test]
 async fn system_settings_workflow() -> TestResult {
     let mut mock = MockTransport::new();
-    // LC wire value 0 = locked on D75 (inverted), so get_lock() returns true.
-    mock.expect(b"LC\r", b"LC 0\r");
+    mock.expect(b"LC\r", b"LC 2\r");
     mock.expect(b"BT\r", b"BT 1\r");
 
     let mut radio = Radio::connect(mock).await?;
-    assert!(radio.get_lock().await?);
+    assert_eq!(radio.get_backlight_control().await?, BacklightControl::Auto);
     assert!(radio.get_bluetooth().await?);
     Ok(())
 }
 
 #[tokio::test]
-async fn dstar_callsign_slot_workflow() -> TestResult {
+async fn aprs_callsign_workflow() -> TestResult {
     let mut mock = MockTransport::new();
-    mock.expect(b"CS\r", b"CS 10\r");
-    mock.expect(b"CS 5\r", b"CS 5\r");
-    mock.expect(b"CS\r", b"CS 5\r");
+    mock.expect(b"CS\r", b"CS N0CALL-7\r");
+    mock.expect(b"CS KQ4NIT-7\r", b"CS KQ4NIT-7\r");
+    mock.expect(b"CS\r", b"CS KQ4NIT-7\r");
 
     let mut radio = Radio::connect(mock).await?;
-    assert_eq!(
-        radio.get_active_callsign_slot().await?,
-        CallsignSlot::new(10)?
-    );
-    radio
-        .set_active_callsign_slot(CallsignSlot::new(5)?)
-        .await?;
-    assert_eq!(
-        radio.get_active_callsign_slot().await?,
-        CallsignSlot::new(5)?
-    );
+    assert_eq!(radio.get_aprs_callsign().await?.as_str(), "N0CALL-7");
+    let callsign = AprsCallsign::new("KQ4NIT-7").ok_or("valid APRS callsign rejected")?;
+    radio.set_aprs_callsign(callsign).await?;
+    assert_eq!(radio.get_aprs_callsign().await?.as_str(), "KQ4NIT-7");
     Ok(())
 }

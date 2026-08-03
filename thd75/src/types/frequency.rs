@@ -92,16 +92,26 @@ impl Frequency {
     /// Returns [`ProtocolError::FieldParse`] if the string is not
     /// exactly 10 characters or contains non-numeric characters.
     pub fn from_wire_string(s: &str) -> Result<Self, ProtocolError> {
+        Self::from_wire_field(s, "FQ", "frequency")
+    }
+
+    /// Parses a CAT frequency while retaining the calling command and field
+    /// in any diagnostic.
+    pub(crate) fn from_wire_field(
+        s: &str,
+        command: &str,
+        field: &str,
+    ) -> Result<Self, ProtocolError> {
         if s.len() != 10 {
             return Err(ProtocolError::FieldParse {
-                command: "FQ".to_owned(),
-                field: "frequency".to_owned(),
+                command: command.to_owned(),
+                field: field.to_owned(),
                 detail: format!("expected 10-digit string, got {} chars", s.len()),
             });
         }
         let hz: u32 = s.parse().map_err(|_| ProtocolError::FieldParse {
-            command: "FQ".to_owned(),
-            field: "frequency".to_owned(),
+            command: command.to_owned(),
+            field: field.to_owned(),
             detail: format!("non-numeric frequency string: {s:?}"),
         })?;
         Ok(Self(hz))

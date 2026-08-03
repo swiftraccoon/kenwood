@@ -172,11 +172,11 @@ fn render_settings_list(
             BatteryLevel::TwoThirds => "2/3 (Green)".to_string(),
             BatteryLevel::Full => "Full (Green)".to_string(),
             BatteryLevel::Charging => "Charging".to_string(),
+            BatteryLevel::Raw5 => "State 5 (unqualified)".to_string(),
         }
     }));
     lines.push(kv(" AF Gain", &format!("{}", s.af_gain)));
     lines.push(kv(" Beep", &on_off(s.beep)));
-    lines.push(kv(" Lock", &on_off(s.lock)));
     lines.push(kv(" Dual Band", &on_off(s.dual_band)));
     lines.push(kv(" Bluetooth", &on_off(s.bluetooth)));
     lines.push(kv(" VOX", &on_off(s.vox)));
@@ -363,8 +363,7 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::PfKey1 => mcp_num(app, |s| s.settings().pf_key1()),
         SettingRow::PfKey2 => mcp_num(app, |s| s.settings().pf_key2()),
 
-        // --- Lock (Lock: live CAT; rest: MCP) ---
-        SettingRow::Lock => bool_span(app.state.lock),
+        // --- Lock (MCP) ---
         SettingRow::KeyLock => mcp_bool(app, |s| s.settings().key_lock()),
         SettingRow::FrequencyLock => mcp_bool(app, |s| s.settings().frequency_lock()),
         SettingRow::AprsLockFrequency => mcp_bool(app, |s| s.settings().aprs_lock_frequency()),
@@ -480,8 +479,11 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         | SettingRow::TncBaud
         | SettingRow::GpsPcOutput
         | SettingRow::AutoInfo
-        | SettingRow::CallsignSlot
         | SettingRow::DstarSlot => ("?".into(), Color::DarkGray),
+        SettingRow::AprsCallsign => app.state.aprs_callsign.as_ref().map_or_else(
+            || ("?".into(), Color::DarkGray),
+            |callsign| (callsign.as_str().to_owned(), Color::Yellow),
+        ),
     }
 }
 

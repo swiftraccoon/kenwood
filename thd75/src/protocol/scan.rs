@@ -1,11 +1,11 @@
-//! Scan commands: SR, SF, BS.
+//! Scan commands: SR and SF, plus BS antenna selection.
 //!
 //! Provides parsing of responses for scan-related CAT protocol commands.
 //!
 //! Firmware-verified:
 //! - SR has no read form (bare `SR\r` returns `?`). Write-only.
 //! - SF = Step Size, band-indexed (`SF band\r` returns `SF band,step`).
-//! - BS is band-indexed (`BS band\r` returns `BS band`).
+//! - BS controls the MW/SW antenna (`BS\r` reads, `BS 0|1\r` writes).
 
 use crate::error::ProtocolError;
 use crate::types::Band;
@@ -78,13 +78,15 @@ fn parse_sf(payload: &str) -> Result<Response, ProtocolError> {
     Ok(Response::StepSize { band, step })
 }
 
-/// Parse BS (band scope): just a band number echoed back.
+/// Parse BS (MW/SW antenna): 0 = ANT Connector, 1 = internal bar antenna.
 fn parse_bs(payload: &str) -> Result<Response, ProtocolError> {
-    let band_val = parse_u8_field(payload.trim(), "BS", "band")?;
-    let band = Band::try_from(band_val).map_err(|e| ProtocolError::FieldParse {
-        command: "BS".to_owned(),
-        field: "band".to_owned(),
-        detail: e.to_string(),
-    })?;
-    Ok(Response::BandScope { band })
+    match payload.trim() {
+        "0" => Ok(Response::BarAntenna { enabled: false }),
+        "1" => Ok(Response::BarAntenna { enabled: true }),
+        value => Err(ProtocolError::FieldParse {
+            command: "BS".to_owned(),
+            field: "enabled".to_owned(),
+            detail: format!("expected 0 or 1, got {value:?}"),
+        }),
+    }
 }

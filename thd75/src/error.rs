@@ -62,6 +62,26 @@ pub enum Error {
     #[error("command not available in current radio mode")]
     NotAvailable,
 
+    /// A high-level CAT operation is unavailable because this firmware
+    /// repurposes the command mnemonic for a different protocol.
+    #[error("CAT command {command} is unavailable on firmware {firmware}")]
+    CommandUnavailableOnFirmware {
+        /// The colliding CAT command mnemonic.
+        command: &'static str,
+        /// Exact firmware identity returned by `FV`.
+        firmware: String,
+    },
+
+    /// A CAT writer is intentionally quarantined because its complete wire
+    /// record or hardware effect has not yet been qualified.
+    #[error("CAT write {command} is unavailable: {reason}")]
+    UnqualifiedCatWrite {
+        /// CAT mnemonic whose writer is quarantined.
+        command: &'static str,
+        /// Concise reason the operation cannot safely be emitted.
+        reason: &'static str,
+    },
+
     /// A command timed out waiting for a response.
     #[error("command timed out after {0:?}")]
     Timeout(Duration),
@@ -556,6 +576,25 @@ pub enum ValidationError {
         channel: u16,
         /// The maximum valid channel number.
         max: u16,
+    },
+
+    /// A three-character ME/MR memory selector is not in the firmware's
+    /// accepted selector domain.
+    #[error("invalid memory selector {selector:?}: {detail}")]
+    InvalidMemorySelector {
+        /// Rejected selector text.
+        selector: String,
+        /// Human-readable accepted-domain description.
+        detail: &'static str,
+    },
+
+    /// A real-time-clock payload is not a valid `YYMMDDHHmmss` value.
+    #[error("invalid radio date/time {value:?}: {detail}")]
+    InvalidRadioDateTime {
+        /// Rejected wire value.
+        value: String,
+        /// Human-readable validation failure.
+        detail: &'static str,
     },
 
     /// A settings/configuration enum value is outside its valid range.

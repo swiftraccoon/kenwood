@@ -9,8 +9,8 @@
 //! Hardware testing confirmed the actual semantics documented here.
 
 use crate::error::ProtocolError;
-use crate::types::DstarSlot;
 use crate::types::radio_params::{TncBaud, TncMode};
+use crate::types::{DstarSlot, RadioClock};
 
 use super::Response;
 
@@ -104,19 +104,15 @@ fn parse_dc(payload: &str) -> Result<Response, ProtocolError> {
     })
 }
 
-/// Parse RT (real-time clock): bare datetime string.
+/// Parse RT (real-time clock): strict datetime or unavailable sentinel.
 ///
 /// Hardware-verified: bare `RT\r` returns `RT YYMMDDHHmmss`.
 /// Example: `RT 240104095700`.
 fn parse_rt(payload: &str) -> Result<Response, ProtocolError> {
-    if payload.is_empty() {
-        return Err(ProtocolError::FieldParse {
-            command: "RT".to_owned(),
-            field: "datetime".to_owned(),
-            detail: "empty datetime payload".to_owned(),
-        });
-    }
-    Ok(Response::RealTimeClock {
-        datetime: payload.to_owned(),
-    })
+    let clock = RadioClock::try_from(payload).map_err(|error| ProtocolError::FieldParse {
+        command: "RT".to_owned(),
+        field: "clock".to_owned(),
+        detail: error.to_string(),
+    })?;
+    Ok(Response::RealTimeClock { clock })
 }

@@ -75,29 +75,51 @@ impl fmt::Display for SquelchLevel {
 }
 
 // ---------------------------------------------------------------------------
-// AfGainLevel (0-99)
+// AfGainLevel (0-200)
 // ---------------------------------------------------------------------------
 
-/// Audio frequency gain level.
+/// Audio frequency gain level (0-200).
 ///
 /// Controls the volume output level. Used by the `AG` CAT command.
 /// The wire format is a bare 3-digit zero-padded decimal (`AG 015\r`).
-///
-/// The write range is 0-99 per KI4LAX spec, but the radio's read response
-/// can return values up to 255 when the volume knob is turned beyond the
-/// write-command range. The type accepts the full 0-255 range to avoid
-/// parse errors on hardware-observed values (e.g., AG 113).
+/// Firmware handler validation and hardware reads establish one shared
+/// read/write domain of 0 through 200.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AfGainLevel(u8);
 
 impl AfGainLevel {
+    /// Maximum valid AF gain level (inclusive).
+    pub const MAX: u8 = 200;
+
     /// Creates a new `AfGainLevel` from a raw value.
     ///
-    /// Accepts the full `u8` range (0-255) since the radio can return
-    /// values above 99 on read, even though writes are limited to 0-99.
+    /// This compatibility constructor is intended for values already known
+    /// to be in range. Use [`Self::try_new`] for untrusted input.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` exceeds 200.
     #[must_use]
     pub const fn new(value: u8) -> Self {
+        assert!(value <= Self::MAX, "AF gain level must be 0-200");
         Self(value)
+    }
+
+    /// Tries to create an AF gain level from an untrusted raw value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] if `value > 200`.
+    pub const fn try_new(value: u8) -> Result<Self, ValidationError> {
+        if value > Self::MAX {
+            Err(ValidationError::SettingOutOfRange {
+                name: "AF gain level",
+                value,
+                detail: "must be 0-200",
+            })
+        } else {
+            Ok(Self(value))
+        }
     }
 
     /// Returns the raw `u8` value.
@@ -107,9 +129,11 @@ impl AfGainLevel {
     }
 }
 
-impl From<u8> for AfGainLevel {
-    fn from(value: u8) -> Self {
-        Self::new(value)
+impl TryFrom<u8> for AfGainLevel {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::try_new(value)
     }
 }
 
@@ -331,10 +355,10 @@ impl From<FilterMode> for u8 {
 }
 
 // ---------------------------------------------------------------------------
-// BatteryLevel (0-4)
+// BatteryLevel (0-5)
 // ---------------------------------------------------------------------------
 
-/// Battery charge level (0-4).
+/// Battery runtime state (0-5).
 ///
 /// Reported by the `BL` CAT command. Read-only on the TH-D75.
 /// Menu No. 922 displays the battery level on the radio.
@@ -344,6 +368,7 @@ impl From<FilterMode> for u8 {
 /// - 2 = 2/3 (Green)
 /// - 3 = Full (Green)
 /// - 4 = Charging (USB power connected)
+/// - 5 = Firmware runtime state 5 (meaning not yet qualified)
 ///
 /// Per User Manual Chapter 28: the supplied KNB-75LA is 1820 mAh,
 /// 7.4 V Li-ion. Battery life at TX:RX:standby = 6:6:48 ratio with
@@ -363,11 +388,14 @@ pub enum BatteryLevel {
     Full = 3,
     /// Charging: USB power connected (index 4).
     Charging = 4,
+    /// Runtime state 5. The firmware can emit this value, but its user-facing
+    /// meaning has not yet been established.
+    Raw5 = 5,
 }
 
 impl BatteryLevel {
-    /// Number of valid battery level values (0-4).
-    pub const COUNT: u8 = 5;
+    /// Number of valid battery runtime values (0-5).
+    pub const COUNT: u8 = 6;
 }
 
 impl fmt::Display for BatteryLevel {
@@ -378,6 +406,7 @@ impl fmt::Display for BatteryLevel {
             Self::TwoThirds => f.write_str("2/3"),
             Self::Full => f.write_str("Full"),
             Self::Charging => f.write_str("Charging"),
+            Self::Raw5 => f.write_str("State 5"),
         }
     }
 }
@@ -392,10 +421,11 @@ impl TryFrom<u8> for BatteryLevel {
             2 => Ok(Self::TwoThirds),
             3 => Ok(Self::Full),
             4 => Ok(Self::Charging),
+            5 => Ok(Self::Raw5),
             _ => Err(ValidationError::SettingOutOfRange {
                 name: "battery level",
                 value,
-                detail: "must be 0-4",
+                detail: "must be 0-5",
             }),
         }
     }
@@ -475,10 +505,10 @@ impl fmt::Display for VoxGain {
 }
 
 // ---------------------------------------------------------------------------
-// VoxDelay (0-30)
+// VoxDelay (raw index 0-6)
 // ---------------------------------------------------------------------------
 
-/// VOX delay in 100ms units (0-30, i.e. 0ms to 3000ms).
+/// VOX delay selection encoded as a raw index from 0 through 6.
 ///
 /// Controls how long the transmitter stays keyed after voice stops.
 /// Used by the `VD` CAT command. VOX must be enabled (`VX 1`) first.
@@ -492,22 +522,40 @@ impl fmt::Display for VoxGain {
 pub struct VoxDelay(u8);
 
 impl VoxDelay {
-    /// Zero delay (level 0).
+    /// Raw index zero, corresponding to 250 ms.
+    ///
+    /// Retained as a compatibility alias; this is not a zero-millisecond delay.
     pub const ZERO: Self = Self(0);
-    /// Maximum valid VOX delay value (inclusive).
-    pub const MAX: u8 = 30;
+    /// 250 ms (raw index 0).
+    pub const MS_250: Self = Self(0);
+    /// 500 ms (raw index 1).
+    pub const MS_500: Self = Self(1);
+    /// 750 ms (raw index 2).
+    pub const MS_750: Self = Self(2);
+    /// 1000 ms (raw index 3).
+    pub const MS_1000: Self = Self(3);
+    /// 1500 ms (raw index 4).
+    pub const MS_1500: Self = Self(4);
+    /// 2000 ms (raw index 5).
+    pub const MS_2000: Self = Self(5);
+    /// 3000 ms (raw index 6).
+    pub const MS_3000: Self = Self(6);
+    /// Maximum valid raw VOX delay index (inclusive).
+    pub const MAX: u8 = 6;
+
+    const MILLISECONDS: [u16; 7] = [250, 500, 750, 1000, 1500, 2000, 3000];
 
     /// Creates a new `VoxDelay` from a raw value.
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::SettingOutOfRange`] if `value > 30`.
+    /// Returns [`ValidationError::SettingOutOfRange`] if `value > 6`.
     pub const fn new(value: u8) -> Result<Self, ValidationError> {
-        if value > 30 {
+        if value > Self::MAX {
             Err(ValidationError::SettingOutOfRange {
                 name: "VOX delay",
                 value,
-                detail: "must be 0-30",
+                detail: "raw index must be 0-6",
             })
         } else {
             Ok(Self(value))
@@ -523,7 +571,25 @@ impl VoxDelay {
     /// Returns the delay in milliseconds.
     #[must_use]
     pub const fn as_millis(self) -> u16 {
-        self.0 as u16 * 100
+        let [
+            delay_0,
+            delay_1,
+            delay_2,
+            delay_3,
+            delay_4,
+            delay_5,
+            delay_6,
+        ] = Self::MILLISECONDS;
+        match self.0 {
+            0 => delay_0,
+            1 => delay_1,
+            2 => delay_2,
+            3 => delay_3,
+            4 => delay_4,
+            5 => delay_5,
+            6 => delay_6,
+            _ => 0,
+        }
     }
 }
 
@@ -605,30 +671,27 @@ impl From<TncBaud> for u8 {
 /// APRS beacon transmission mode.
 ///
 /// Controls how the radio sends APRS position beacons.
-/// Used by the `BN` CAT command.
+/// Used by the `PT` CAT command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BeaconMode {
-    /// Beaconing off (index 0).
-    Off = 0,
-    /// Manual beacon: press button to transmit (index 1).
-    Manual = 1,
-    /// PTT beacon: transmit position on each PTT keyup (index 2).
-    Ptt = 2,
-    /// Auto beacon: transmit at configured interval (index 3).
-    Auto = 3,
-    /// `SmartBeaconing`: adaptive interval based on speed/heading (index 4).
-    SmartBeaconing = 4,
+    /// Manual beacon: transmit only when explicitly requested (wire value 0).
+    Manual = 0,
+    /// PTT beacon: transmit position on each PTT keyup (wire value 1).
+    Ptt = 1,
+    /// Auto beacon: transmit at the configured interval (wire value 2).
+    Auto = 2,
+    /// `SmartBeaconing`: adaptive interval based on speed/heading (wire value 3).
+    SmartBeaconing = 3,
 }
 
 impl BeaconMode {
-    /// Number of valid beacon mode values (0-4).
-    pub const COUNT: u8 = 5;
+    /// Number of valid beacon mode values (0-3).
+    pub const COUNT: u8 = 4;
 }
 
 impl fmt::Display for BeaconMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Off => f.write_str("Off"),
             Self::Manual => f.write_str("Manual"),
             Self::Ptt => f.write_str("PTT"),
             Self::Auto => f.write_str("Auto"),
@@ -642,15 +705,14 @@ impl TryFrom<u8> for BeaconMode {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::Off),
-            1 => Ok(Self::Manual),
-            2 => Ok(Self::Ptt),
-            3 => Ok(Self::Auto),
-            4 => Ok(Self::SmartBeaconing),
+            0 => Ok(Self::Manual),
+            1 => Ok(Self::Ptt),
+            2 => Ok(Self::Auto),
+            3 => Ok(Self::SmartBeaconing),
             _ => Err(ValidationError::SettingOutOfRange {
                 name: "beacon mode",
                 value,
-                detail: "must be 0-4",
+                detail: "must be 0-3",
             }),
         }
     }
@@ -659,6 +721,67 @@ impl TryFrom<u8> for BeaconMode {
 impl From<BeaconMode> for u8 {
     fn from(mode: BeaconMode) -> Self {
         mode as Self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MyPositionSelection (0-5)
+// ---------------------------------------------------------------------------
+
+/// Selected APRS/GPS "My Position" entry (0-5).
+///
+/// This is the validated value read and written by the `MS` CAT command and
+/// stored in the MCP `gps.MyPositionSelect` byte at `0x11C0`. It deliberately
+/// preserves the numeric selection instead of assigning unverified names to
+/// the six firmware values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MyPositionSelection(u8);
+
+impl MyPositionSelection {
+    /// Number of valid selection values (0-5).
+    pub const COUNT: u8 = 6;
+
+    /// Creates a validated My Position selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] if `value > 5`.
+    pub const fn new(value: u8) -> Result<Self, ValidationError> {
+        if value > 5 {
+            Err(ValidationError::SettingOutOfRange {
+                name: "My Position selection",
+                value,
+                detail: "must be 0-5",
+            })
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the CAT/MCP numeric value.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for MyPositionSelection {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<MyPositionSelection> for u8 {
+    fn from(selection: MyPositionSelection) -> Self {
+        selection.0
+    }
+}
+
+impl fmt::Display for MyPositionSelection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -678,6 +801,12 @@ impl DstarSlot {
     pub const MIN: u8 = 1;
     /// Maximum valid D-STAR slot index.
     pub const MAX: u8 = 6;
+    /// Slot 1.
+    pub const SLOT_1: Self = Self(1);
+    /// Slot 2.
+    pub const SLOT_2: Self = Self(2);
+    /// Slot 3.
+    pub const SLOT_3: Self = Self(3);
 
     /// Creates a new `DstarSlot` from a raw value.
     ///
@@ -718,65 +847,6 @@ impl From<DstarSlot> for u8 {
 }
 
 impl fmt::Display for DstarSlot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Slot {}", self.0)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CallsignSlot (0-10)
-// ---------------------------------------------------------------------------
-
-/// D-STAR active callsign slot index (0-10).
-///
-/// Selects which callsign from the repeater list is active.
-/// Used by the `CS` CAT command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CallsignSlot(u8);
-
-impl CallsignSlot {
-    /// Maximum valid callsign slot index (inclusive).
-    pub const MAX: u8 = 10;
-
-    /// Creates a new `CallsignSlot` from a raw value.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ValidationError::SettingOutOfRange`] if `value > 10`.
-    pub const fn new(value: u8) -> Result<Self, ValidationError> {
-        if value > 10 {
-            Err(ValidationError::SettingOutOfRange {
-                name: "callsign slot",
-                value,
-                detail: "must be 0-10",
-            })
-        } else {
-            Ok(Self(value))
-        }
-    }
-
-    /// Returns the raw `u8` value.
-    #[must_use]
-    pub const fn as_u8(self) -> u8 {
-        self.0
-    }
-}
-
-impl TryFrom<u8> for CallsignSlot {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl From<CallsignSlot> for u8 {
-    fn from(slot: CallsignSlot) -> Self {
-        slot.0
-    }
-}
-
-impl fmt::Display for CallsignSlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Slot {}", self.0)
     }
@@ -867,16 +937,11 @@ pub enum DvGatewayMode {
     Off = 0,
     /// Reflector Terminal Mode enabled (index 1).
     ReflectorTerminal = 1,
-    /// Access Point mode (index 2). Discovered via ARFC-D75 decompilation
-    /// which shows 3 gateway modes (0/1/2). Needs hardware verification
-    /// to confirm exact behavior; it may be "Auto" or "Access Point" mode
-    /// for D-STAR hotspot operation.
-    AccessPoint = 2,
 }
 
 impl DvGatewayMode {
-    /// Number of valid DV gateway mode values (0-2).
-    pub const COUNT: u8 = 3;
+    /// Number of firmware-defined DV gateway mode values (0-1).
+    pub const COUNT: u8 = 2;
 }
 
 impl fmt::Display for DvGatewayMode {
@@ -884,7 +949,6 @@ impl fmt::Display for DvGatewayMode {
         match self {
             Self::Off => f.write_str("Off"),
             Self::ReflectorTerminal => f.write_str("Reflector TERM"),
-            Self::AccessPoint => f.write_str("Access Point"),
         }
     }
 }
@@ -896,11 +960,10 @@ impl TryFrom<u8> for DvGatewayMode {
         match value {
             0 => Ok(Self::Off),
             1 => Ok(Self::ReflectorTerminal),
-            2 => Ok(Self::AccessPoint),
             _ => Err(ValidationError::SettingOutOfRange {
                 name: "DV gateway mode",
                 value,
-                detail: "must be 0-2",
+                detail: "must be 0-1",
             }),
         }
     }
@@ -1222,6 +1285,16 @@ impl MemoryReadOffset {
     /// The highest valid offset.
     pub const MAX: Self = Self(0x00FF_FFFF);
 
+    /// Constructs a compile-time offset whose bound has been verified by the
+    /// defining module.
+    pub(crate) const fn new_const(value: u32) -> Self {
+        debug_assert!(
+            value <= 0x00FF_FFFF,
+            "compile-time memory-read offset exceeds the six-digit wire domain"
+        );
+        Self(value)
+    }
+
     /// Creates a new `MemoryReadOffset` from a raw value.
     ///
     /// # Errors
@@ -1416,12 +1489,13 @@ mod tests {
     }
 
     #[test]
-    fn af_gain_valid() {
-        // AfGainLevel accepts full u8 range; radio reads can exceed 99
+    fn af_gain_valid() -> TestResult {
         assert_eq!(AfGainLevel::new(0).as_u8(), 0);
         assert_eq!(AfGainLevel::new(99).as_u8(), 99);
-        assert_eq!(AfGainLevel::new(113).as_u8(), 113);
-        assert_eq!(AfGainLevel::new(255).as_u8(), 255);
+        assert_eq!(AfGainLevel::new(200).as_u8(), 200);
+        assert_eq!(AfGainLevel::try_from(200)?.as_u8(), 200);
+        assert!(AfGainLevel::try_from(201).is_err());
+        Ok(())
     }
 
     #[test]
@@ -1465,6 +1539,7 @@ mod tests {
     #[test]
     fn battery_level_charging() -> TestResult {
         assert_eq!(BatteryLevel::try_from(4)?, BatteryLevel::Charging);
+        assert_eq!(BatteryLevel::try_from(5)?, BatteryLevel::Raw5);
         Ok(())
     }
 
@@ -1477,8 +1552,11 @@ mod tests {
 
     #[test]
     fn vox_delay_millis() -> TestResult {
-        let d = VoxDelay::new(15)?;
-        assert_eq!(d.as_millis(), 1500);
+        let expected = [250, 500, 750, 1000, 1500, 2000, 3000];
+        for (raw, millis) in expected.into_iter().enumerate() {
+            let delay = VoxDelay::new(u8::try_from(raw)?)?;
+            assert_eq!(delay.as_millis(), millis);
+        }
         assert!(VoxDelay::new(VoxDelay::MAX + 1).is_err());
         Ok(())
     }
@@ -1525,13 +1603,6 @@ mod tests {
     fn tnc_mode_kiss() -> TestResult {
         assert_eq!(TncMode::try_from(2)?, TncMode::Kiss);
         Ok(())
-    }
-
-    #[test]
-    fn callsign_slot_valid() {
-        assert!(CallsignSlot::new(0).is_ok());
-        assert!(CallsignSlot::new(CallsignSlot::MAX).is_ok());
-        assert!(CallsignSlot::new(CallsignSlot::MAX + 1).is_err());
     }
 
     #[test]
