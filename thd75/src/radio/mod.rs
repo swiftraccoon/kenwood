@@ -158,8 +158,9 @@ pub(crate) enum McpPhase {
 ///
 /// The `Radio` struct tracks the VFO/Memory mode of each band when VM
 /// commands are sent through it, enabling mode-compatibility warnings.
-/// Use the safe tuning methods ([`tune_frequency`](Radio::tune_frequency),
-/// [`tune_channel`](Radio::tune_channel)) for automatic mode management.
+/// [`tune_channel`](Radio::tune_channel) performs qualified memory-mode
+/// management and recall. [`tune_frequency`](Radio::tune_frequency) currently
+/// fails before I/O because no direct FO/FQ frequency writer is qualified.
 pub struct Radio<T: Transport> {
     pub(crate) transport: T,
     pub(crate) codec: Codec,

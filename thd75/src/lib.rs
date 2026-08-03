@@ -4,9 +4,12 @@
 //! CAT (Computer Aided Transceiver) -- the serial command protocol Kenwood
 //! uses for remote radio control.
 //!
-//! This library supports all 55 CAT commands over USB serial or Bluetooth
-//! SPP connections. Command definitions and validation rules are based on
-//! analysis of TH-D75 firmware v1.03.000.
+//! This library exposes typed, individually qualified CAT operations over USB
+//! serial or Bluetooth SPP. Unresolved, service-only, or lossy write paths are
+//! excluded or fail before I/O. Command definitions and validation rules are
+//! aligned with the stock Kenwood V1.03 schema and live hardware validation;
+//! closed-loop screen/input automation additionally requires exact
+//! `1.03.AZM` with ABI 3.
 //!
 //! # TH-D75 overview (per User Manual Chapter 28)
 //!

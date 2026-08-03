@@ -99,8 +99,9 @@ pub enum Command {
     ///
     /// Mode values: 0 = VFO, 1 = Memory, 2 = Call, 3 = WX.
     /// This is an ACTION command that changes the radio's operating mode.
-    /// Prefer the safe tuning methods which handle mode switching
-    /// automatically.
+    /// Prefer [`Radio::tune_channel`](crate::radio::Radio::tune_channel) for
+    /// qualified memory recall. Direct frequency tuning is quarantined until a
+    /// lossless FO/FQ writer is qualified.
     SetVfoMemoryMode {
         /// Target band.
         band: Band,

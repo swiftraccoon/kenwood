@@ -122,12 +122,13 @@ impl<T: Transport> Radio<T> {
         Ok(channel)
     }
 
-    /// Quick-tune: set frequency, operating mode, and step size in one call.
+    /// Attempt to set frequency, operating mode, and step size in one call.
     ///
-    /// Switches to VFO mode if needed, then sets the frequency, operating
-    /// mode, and step size. This is a convenience method that combines
-    /// [`tune_frequency`](Self::tune_frequency), [`set_mode`](Self::set_mode),
-    /// and [`set_step_size`](Self::set_step_size).
+    /// This compatibility API currently returns the fail-closed error from
+    /// [`tune_frequency`](Self::tune_frequency) before changing mode or
+    /// performing I/O. If a direct-frequency writer is qualified later, the
+    /// remaining mode and step operations must still retain their existing
+    /// readback contracts.
     ///
     /// # Errors
     ///

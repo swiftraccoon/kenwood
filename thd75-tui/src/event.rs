@@ -26,7 +26,10 @@ pub(crate) enum RadioCommand {
     FreqUp(kenwood_thd75::types::Band),
     /// Step frequency down by one increment on the given band.
     FreqDown(kenwood_thd75::types::Band),
-    /// Tune to a specific frequency on the given band.
+    /// Request a specific frequency on the given band.
+    ///
+    /// The library currently rejects this before I/O because direct FO/FQ
+    /// writes are not qualified.
     TuneFreq {
         /// The band to tune.
         band: kenwood_thd75::types::Band,

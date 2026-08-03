@@ -206,7 +206,10 @@ pub(crate) async fn configure_if_dsp_radio<T: Transport>(
     Ok(())
 }
 
-/// Retune Band B while preserving the live IF-output requirement.
+/// Attempt to retune Band B while preserving the live IF-output requirement.
+///
+/// This currently returns the direct-frequency quarantine error after safely
+/// pausing and resuming IF output.
 pub(crate) async fn retune_if_dsp_radio<T: Transport>(
     radio: &mut Radio<T>,
     frequency_hz: u32,
@@ -256,7 +259,7 @@ pub(crate) async fn retune_if_dsp_radio<T: Transport>(
     }
 }
 
-/// Restore every saved value, continue after failures, and verify each result.
+/// Attempt every saved-value restore, continue after failures, and verify each result.
 pub(crate) async fn restore_if_dsp_radio<T: Transport>(
     radio: &mut Radio<T>,
     saved: SavedIfDspRadioState,

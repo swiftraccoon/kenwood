@@ -59,8 +59,8 @@ uniffi = { version = "0.31", features = ["bindgen-tests"] }
 # out of `unsafe_code` enforcement because UniFFI's generated scaffolding
 # emits `#[unsafe(no_mangle)]`, fundamental to the Rust-to-Swift FFI.
 # This crate exists for that FFI, so unsafe is inherent to its purpose.
-# The `thd75` crate uses a similar pattern for its IOBluetooth wrapper
-# (module-scoped `#[expect(unsafe_code)]` on `transport/bluetooth.rs`).
+# The `thd75` crate uses a similar source-level guard around its audited
+# IOBluetooth helper and Vision OCR bridge.
 [lints.rust]
 missing_docs = "deny"
 missing_debug_implementations = "deny"

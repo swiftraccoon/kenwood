@@ -337,7 +337,8 @@ pub(crate) async fn step_down<T: Transport>(radio: &mut Radio<T>, args: &[&str])
 // Tuning
 // ---------------------------------------------------------------------------
 
-/// Tune a band to a specific frequency in megahertz. Args: `<a|b> <mhz>`.
+/// Parse a direct-frequency request and report the library's fail-closed
+/// FO/FQ safety error. Args: `<a|b> <mhz>`.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,

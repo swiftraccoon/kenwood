@@ -3194,8 +3194,9 @@ impl App {
 
     /// Apply a channel edit from the edit buffer.
     ///
-    /// Uses ME (memory channel) write via CAT. This tunes the radio's live
-    /// channel, not permanent memory storage (which would require MCP).
+    /// This does not write the selected memory record. A frequency entry sends
+    /// the currently quarantined live-band tune request, mode changes only the
+    /// live band, and the remaining fields report that no editor is available.
     fn apply_channel_edit(&mut self, field: ChannelEditField, buf: &str) {
         if buf.is_empty() {
             self.status_message = Some("No value entered".into());
@@ -3276,9 +3277,10 @@ impl App {
             | ChannelEditField::ToneFreq
             | ChannelEditField::Duplex
             | ChannelEditField::Offset => {
-                // These fields are stored in the ME channel record and require
-                // either a full ME write (which changes the live channel) or MCP
-                // for permanent memory storage. Full ME write support is planned.
+                // These fields are stored in the ME channel record. The full
+                // ME writer is quarantined until every field can be preserved;
+                // permanent memory storage would instead require a verified
+                // MCP editor.
                 self.status_message = Some(format!(
                     "Ch {ch_num}: {} editing not yet implemented; requires ME write",
                     field.label()

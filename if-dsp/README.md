@@ -28,9 +28,12 @@ before AGC.
 
 ## Consumers
 
-[`thd75-listen`](../thd75-listen/) drives this crate against the TH-D75's
-IF-over-USB-audio stream; the I/O shell (sound card, serial CAT, terminal)
-lives entirely on that side of the boundary.
+[`thd75-listen`](../thd75-listen/) is the command-line audio-shell consumer,
+but its live path is currently blocked before DSP startup by the library's
+direct-frequency write quarantine. [`azimuth-core`](../azimuth-core/) wraps the
+same channelizer and `SpectrumEstimator` for Azimuth's live iPadOS spectrum,
+waterfall, passband, level, clipping, and capture-loss views. Sound-card,
+serial, UI, and playback policy remain entirely in those consumers.
 
 ## Status
 

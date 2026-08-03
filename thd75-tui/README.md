@@ -7,10 +7,14 @@ Terminal UI for the Kenwood TH-D75. Built on [`kenwood-thd75`](../thd75/), [rata
 ## Scope
 
 - Real-time CAT display: frequency, mode, squelch, RSSI, battery level, power step, tones, shift direction, step size.
-- Memory channel browser: 1000 channels with name / frequency / mode / group columns; edit and write back via CAT or MCP.
+- Memory channel browser: inspect 1000 channels with name, frequency, mode, and
+  group columns. Per-channel editing and CAT ME writes are not currently
+  available.
 - APRS monitor panel: decoded position (including Mic-E), message, and weather reports, plus digipeated packets, query responses, and a last-heard station list. Status, telemetry, object, and item packets are received but not yet decoded into their own display.
 - D-STAR gateway reflector monitor (via [`dstar-gateway-core`](../dstar-gateway-core/)): link status, heard stations, voice-transmission events.
-- MCP programming: full memory dump (~55 s at 9600 baud), channel read/write, settings patches. Cached at `~/Library/Caches/thd75-tui/mcp.bin` on macOS for offline correlation.
+- MCP programming: full memory dump (~55 s at 9600 baud), memory-image
+  inspection, and settings patches. Cached at
+  `~/Library/Caches/thd75-tui/mcp.bin` on macOS for offline correlation.
 - Reflector Terminal Mode: detects a radio booted into terminal mode and, with `--exit-terminal-mode`, guides an exit and reconnects instead of just reporting it.
 
 ## Running
@@ -23,6 +27,11 @@ Default port auto-discovers USB (VID `0x2166` / PID `0x9023`) or the paired Blue
 
 ## Status
 
-Pre-release. The TUI follows library-side API churn closely; layout, keybindings, and panel organization change without notice between commits.
+Direct arbitrary-frequency and precision-down controls are unavailable while
+the library's FO/FQ writer is quarantined; qualified frequency reads, one-step
+UP, and populated memory recall remain available.
+
+Pre-release. The TUI follows library-side API churn closely; layout,
+keybindings, and panel organization change without notice between commits.
 
 Part of the [kenwood](..) workspace. License: GPL-2.0-or-later.

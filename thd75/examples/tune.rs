@@ -1,13 +1,13 @@
-//! Tune the radio to a frequency or memory channel.
+//! Recall a memory channel or demonstrate the direct-frequency safety gate.
 //!
-//! Demonstrates the safe tuning API which automatically handles
-//! VFO/Memory mode switching.
+//! Memory recall automatically handles VFO/Memory mode switching. The
+//! `--freq` form currently returns `UnqualifiedCatWrite` before radio I/O
+//! because no FO/FQ frequency writer has been qualified.
 //!
 //! Usage:
 //! ```text
-//! cargo run --example tune -- --band a --freq 145190000
 //! cargo run --example tune -- --band b --channel 21
-//! cargo run --example tune -- --band a --freq 446000000 /dev/cu.usbmodem5678
+//! cargo run --example tune -- --band a --freq 145190000 # expected safety refusal
 //! ```
 //!
 //! Pass a custom serial port as the last positional argument.

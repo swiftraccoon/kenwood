@@ -643,14 +643,15 @@ impl AutomationController {
         response.await.map_err(response_lost)
     }
 
-    /// Retune Band B using the hardware-required AF → tune → IF sequence.
+    /// Attempt to retune Band B using the hardware-required AF → tune → IF sequence.
     ///
     /// The original pre-session frequency remains in the saved restoration
-    /// snapshot. Success means the new frequency and IF-output re-engagement
-    /// were both readback verified and automation control was restored. Any
-    /// retune failure immediately restores the pre-session snapshot and ends
-    /// the IF session; an incomplete restore is retained as
-    /// `NeedsRestoration`.
+    /// snapshot. The current `kenwood-thd75` direct-frequency writer fails
+    /// closed before I/O, so this operation currently resumes IF, attempts the
+    /// pre-session restore, and returns an error. If a writer is qualified
+    /// later, success must still mean that the new frequency and IF-output
+    /// re-engagement were both readback verified. Any retune failure ends the
+    /// IF session; an incomplete restore is retained as `NeedsRestoration`.
     ///
     /// # Errors
     ///
@@ -671,11 +672,13 @@ impl AutomationController {
         response.await.map_err(response_lost)?
     }
 
-    /// Stop owning IF mode and restore every saved radio value with readback.
+    /// Stop owning IF mode and attempt to restore every saved radio value.
     ///
     /// A failed field remains represented as `NeedsRestoration` so callers can
     /// retry restoration without mistaking the physical IF output for active.
-    /// Success is returned only after automation control is requalified.
+    /// The current direct-frequency quarantine means the frequency step cannot
+    /// succeed even when it was never changed. Success is returned only after
+    /// every step passes readback and automation control is requalified.
     ///
     /// # Errors
     ///
@@ -803,9 +806,10 @@ impl AutomationController {
 
 /// Connect through Swift's USB byte stream and prove the automation extension.
 ///
-/// Qualification attests the exact TH-D75 and V1.03 identity, patched hooks,
-/// complete V1.03.AZM runtime, ABI, aperture bounds, and stable metadata. It then
-/// runs the missing-snapshot refusal canary before returning the controller.
+/// Qualification attests the exact TH-D75 model, CAT firmware identity
+/// `1.03.AZM`, patched hooks, complete V1.03.AZM runtime, ABI, aperture bounds,
+/// and stable metadata. It then runs the missing-snapshot refusal canary before
+/// returning the controller.
 ///
 /// # Errors
 ///

@@ -1,9 +1,9 @@
 //! Accessible SSB/CW/AM demodulator for the TH-D75 IF-over-USB stream.
 //!
-//! Tunes the radio over CAT (the USB CDC interface) while capturing
-//! the 12 kHz IF from the radio's USB audio interface (device name
-//! "ADC stream IN"), demodulating it with `if-dsp`, and playing the
-//! audio on the default output device.
+//! Contains the CAT setup, 12 kHz `ADC stream IN` capture, `if-dsp`
+//! demodulation, playback, and accessible prompt pipeline. A connected-radio
+//! session currently stops at its initial frequency request because the
+//! library's direct FO/FQ writer fails closed before I/O.
 //!
 //! Design notes:
 //! - No `tokio::signal`: Ctrl-C arrives as a rustyline interrupt and
@@ -12,8 +12,9 @@
 //!   channel -> callback; volume and signal level cross threads as
 //!   `AtomicU32` float bits; overruns/underruns are counters plus a
 //!   once-per-session announcement.
-//! - Every radio setting touched is saved first and restored on every
-//!   exit path (see `thd75_listen::session`).
+//! - Every radio setting that may be touched is saved first. Exit performs a
+//!   best-effort restore and reports each failed field; frequency restoration
+//!   remains unavailable under the same direct-write quarantine.
 
 // The accessibility-lint dev-dependency is used by the library's unit
 // tests; the bin's test build links dev-deps too.
@@ -505,11 +506,13 @@ fn run_session(
     Ok(())
 }
 
-/// Retune with the IF toggle.
+/// Attempt to retune with the IF toggle.
 ///
 /// The radio rejects FO frequency writes while `IO = IF` is engaged
 /// (hardware-verified), so drop to AF, tune, re-engage IF, and verify
-/// the re-engage by readback. The audio pauses for the toggle.
+/// the re-engage by readback. The audio pauses for the toggle. The direct tune
+/// currently fails before I/O; this function still restores IF and returns the
+/// safety error.
 async fn retune(radio: &mut Radio<SerialTransport>, hz: u32) -> Result<(), String> {
     radio
         .set_io_port(DetectOutputMode::Af)

@@ -4,8 +4,9 @@
 //!
 //! The crate deliberately contains no platform USB implementation. Swift owns
 //! the iPadOS or macOS USB connection and implements [`ByteTransport`]; Rust
-//! owns all TH-D75 framing, exact automation qualification, guarded input, screen
-//! authentication, and MCP setting validation.
+//! owns all TH-D75 framing, exact automation qualification, guarded input,
+//! screen authentication, MCP setting validation, host-owned APRS/KISS
+//! sessions, and physical IF-DSP processing.
 
 #[forbid(unsafe_code)]
 mod aprs;

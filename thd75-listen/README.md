@@ -1,21 +1,25 @@
 # thd75-listen
 
-Accessible SSB/CW/AM demodulator for the Kenwood TH-D75's IF-over-USB-audio
-stream. The TH-D75 can present its 12 kHz IF as a USB sound-card input;
-this tool tunes the radio over CAT, demodulates that stream with
-[`if-dsp`](../if-dsp/), and plays the audio on the default output device,
-adding listening modes the radio itself does not demodulate.
+Experimental accessible SSB/CW/AM demodulator for the Kenwood TH-D75's
+IF-over-USB-audio stream. The TH-D75 can present its 12 kHz IF as a USB
+sound-card input, and this tool contains the capture, demodulation, playback,
+prompt, and state-restoration pipeline. A connected-radio session currently
+cannot pass its initial direct-frequency step because unqualified FO/FQ writes
+fail closed in [`kenwood-thd75`](../thd75/).
 
 ## How it works
 
-- Tunes and configures the radio over the USB CDC serial interface
-  (via [`kenwood-thd75`](../thd75/)).
+- Is designed to tune and configure the radio over the USB CDC serial
+  interface (via [`kenwood-thd75`](../thd75/)); direct startup and interactive
+  retuning are currently unavailable.
 - Captures the 12 kHz IF from the radio's USB audio interface
   (the "ADC stream IN" device).
 - Demodulates USB/LSB/CW/AM at baseband and plays the result;
   volume and signal level are adjustable live from the prompt.
-- Every radio setting the session touches is saved first and restored on
-  every exit path, so the radio comes back exactly as it was.
+- Every radio setting the session may touch is saved first. Exit performs a
+  best-effort, read-back-checked restore and reports each failed field;
+  frequency restoration currently reports failure for the same FO/FQ safety
+  reason.
 
 ## Accessibility
 
@@ -29,8 +33,9 @@ well with screen readers.
 cargo run -p thd75-listen -- [--port /dev/tty.usbmodem...] [--freq <MHz>]
 ```
 
-Without `--port` the serial device is auto-detected. The radio must have
-its IF output enabled for the selected band.
+Without `--port` the serial device is auto-detected. The radio must expose its
+`ADC stream IN` USB audio interface. Until a direct-frequency writer is
+qualified, the command exits at the initial tune and does not start audio.
 
 ## Layout
 

@@ -1,8 +1,9 @@
 //! Radio state discipline for the listener.
 //!
-//! Everything the listener touches is saved before, and restored
-//! after: the save/configure/restore pattern hardware-verified by
-//! the IF-tap work, formalized.
+//! Everything the listener may touch is saved before configuration. Exit uses
+//! a best-effort, read-back-checked restore and reports failed fields. Direct
+//! frequency restoration currently fails closed with the library's FO/FQ
+//! quarantine.
 
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::Transport;

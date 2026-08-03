@@ -153,7 +153,7 @@ step a 5: Set frequency step size by index, 0 through 11
 -- Tuning --
 up: Step frequency up on band A (or: up b)
 down: Step frequency down on band A (or: down b)
-tune a 146.520: Tune band A to a frequency in megahertz
+tune: Unavailable; direct frequency writes fail closed
 recall a 5: Recall memory channel 5 on band A
 -- Memory channels --
 ch 5: Read memory channel 5
@@ -345,11 +345,14 @@ Example: down
 Example: down b
 Related commands: up, step, tune";
 
-const TUNE_HELP: &str = "tune: Tune a band to a specific frequency in megahertz.
+const TUNE_HELP: &str = "tune: Direct frequency tuning is unavailable.
+The FO/FQ writer is not qualified.
+This command fails before radio input or output.
 Syntax: tune [a or b] [frequency in megahertz]
 Example: tune a 146.520
 Example: tune b 446.000
-Related commands: freq, up, down";
+Use up, down, or recall for qualified frequency changes.
+Related commands: freq, up, down, recall";
 
 const RECALL_HELP: &str = "recall: Recall a memory channel on a band.
 Syntax: recall [a or b] [channel number]

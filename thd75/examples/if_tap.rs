@@ -1,5 +1,10 @@
-//! Engage the TH-D75's IF tap (CAT `IO`, radio Menu 102) and verify it
-//! end to end, restoring every touched setting afterwards.
+//! Exercise the TH-D75 IF-tap setup and best-effort restoration sequence.
+//!
+//! This example currently reaches the quarantined direct-frequency step after
+//! applying its Band B/single-band preconditions, then restores instead of
+//! completing a capture. It remains useful as an explicit hardware workflow
+//! once a lossless FO/FQ writer is qualified; do not treat it as an operational
+//! capture example while `Radio::tune_frequency` fails closed.
 //!
 //! The radio's USB interface carries a capture-only audio function whose
 //! device name is "ADC stream IN" (mono 48 kHz), not "TH-D75". With

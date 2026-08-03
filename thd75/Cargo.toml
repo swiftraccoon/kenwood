@@ -44,10 +44,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "signal", "test-util"] }
 # KNOWN DIVERGENCE FROM WORKSPACE: this crate declares its own [lints.*]
 # blocks (cargo replaces, never merges, the workspace set). Divergences:
 # - `unsafe_code` is NOT declared here: the workspace `forbid` cannot be
-#   weakened at crate level, and this crate needs one unsafe module for
-#   the IOBluetooth FFI. The guard lives at the source level instead:
-#   `#![deny(unsafe_code)]` in lib.rs with a scoped `expect` in
-#   transport/bluetooth.rs.
+#   weakened at crate level, and this crate needs audited unsafe modules for
+#   the IOBluetooth helper and macOS Vision OCR bridge. The guard lives at the
+#   source level instead: `#![deny(unsafe_code)]` in lib.rs with scoped,
+#   reasoned expectations in transport/bluetooth.rs and screen/vision.rs.
 # - Everything else mirrors the workspace policy; see the inline notes.
 [lints.rust]
 missing_docs = "deny"

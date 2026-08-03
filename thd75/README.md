@@ -3,14 +3,17 @@
 [![Rust 1.94+](https://img.shields.io/badge/rust-1.94%2B-blue.svg)](https://www.rust-lang.org)
 [![License: GPL v2+](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](https://github.com/swiftraccoon/kenwood/blob/main/LICENSE)
 
-Async Rust library for full control of the Kenwood TH-D75 ham radio transceiver.
+Async Rust library for typed, hardware-qualified control and inspection of the
+Kenwood TH-D75 ham radio transceiver.
 
 ## Features
 
 - **Qualified CAT protocol**: Typed parsing and serialization for established
   TH-D75 contracts, with validated parameter types that reject invalid values
   at construction time. Service-only `0E` and unresolved `BE`/`US` operations
-  are deliberately excluded from the ordinary typed API.
+  are deliberately excluded from the ordinary typed API. Lossy or unqualified
+  FO/FQ frequency writers and the ME memory-record writer fail before radio
+  I/O; memory recall and qualified UP/DW stepping remain available.
 - **MCP programming**: Binary memory access via `0M PROGRAM` mode. Read all
   1,152 data-backed channel records (1,000 standard channels plus 152 special
   channels), along with the full 1,200-slot flag and name tables whose tail
@@ -86,11 +89,14 @@ Runnable examples live in [`examples/`](https://github.com/swiftraccoon/kenwood/
 |---------|-------------|
 | `identify` | Print the radio model ID, firmware version, region code, and power status. |
 | `monitor` | Poll S-meter, frequency, mode, and busy state on both bands every 250 ms. |
-| `tune` | Tune to a frequency or memory channel via the safe VFO/Memory-switching API. |
+| `tune` | Recall a populated memory channel through the qualified mode-switching API. Its frequency form currently returns the fail-closed FO/FQ safety error before I/O. |
 | `channel_dump` | Read memory channels 0-999 via CAT, optionally reading display names via MCP. |
 | `config_backup` | Read the entire 500 KB radio memory via MCP and save it to a binary file. |
 | `write_settings` | Temporarily change and restore squelch via CAT, then overwrite channel 0's display name via MCP. |
 | `mcp_menu` | List, read, validate, and batch-write generated MCP-D75 menu fields using sparse page access. Writes are dry-run by default. |
+| `read_validation` | Trace and compare live, read-only FV/TY/FQ/FO/MR/ME/RT responses against their lossless typed results. |
+| `if_tap` | Exercise the IF-output setup/capture/restore sequence. It currently reaches the quarantined direct-frequency step after applying its Band B/single-band preconditions, then runs best-effort restoration instead of completing a capture. |
+| `verify_state` | Attest and inspect supported modified-firmware memory-read targets for qualification and offset discovery. |
 | `bluetooth` | Connect over native macOS Bluetooth or a Linux/Windows serial RFCOMM port (pair via Menu 934 first). |
 | `bt_native` | Exercise the native `IOBluetooth` RFCOMM transport (macOS). |
 | `pf_screen_capture` | Assign the front-panel PF1 key to Screen Capture via an MCP memory write. |
@@ -98,7 +104,7 @@ Runnable examples live in [`examples/`](https://github.com/swiftraccoon/kenwood/
 | `automation_probe` | Qualify V1.03.AZM, retain authenticated screen BMPs, exercise MENU/navigation, restore the UI, and require exact OCR text (macOS only). |
 | `automation_tap` | Execute one exact guarded key tap and retain before/after pixel and optional OCR evidence (macOS only). |
 | `automation_audit` | Audit all 217 reviewed menu leaves, or an explicitly scoped subset, using guarded-input and screen evidence (macOS only). |
-| `hardware_audit` | Run a fixed, read-only CAT capability audit; the automation profile exact-attests V1.03.AZM and excludes its `GM`/`GW` command collisions. |
+| `hardware_audit` | Run a fixed, read-only CAT capability audit; the automation profile exact-attests CAT identity `1.03.AZM` and excludes its `GM`/`GW` command collisions. |
 
 ## Batch MCP menu writes
 
@@ -319,7 +325,7 @@ verified independently because they are outside the 350-page menu-field
 snapshot. The durable `menu-134-pri-pages-before.bin` artifact remains the
 recovery source if power or the process is lost between the ordered writes.
 
-The runner's first CAT/MCP operation is exact V1.03.AZM qualification. It then runs the
+The runner's first CAT/MCP operation is exact `1.03.AZM` qualification. It then runs the
 missing-snapshot, changed-context, and live zero-hold 991 canaries before any
 MCP access. After the before-audit MCP snapshot it requalifies V1.03.AZM and requires
 the exact initial home framebuffer before auditing leaves.
@@ -346,12 +352,12 @@ report `SCOPED_PASS`. The runner requires macOS Vision; radio transport may be
 an explicit USB CDC path or native Bluetooth. It writes its private evidence
 bundle only beneath the requested owner-private output directory.
 
-The unchanged ABI-3 runtime and hooks passed a complete TH-D75A/V1.03 hardware
-run in the predecessor package on 2026-07-31:
-`FULL_217_ROWS_162_VALUES_14_SAFE_INSPECTIONS_PASS`. The V1.03.AZM package has
-separately passed deterministic dual-build, emulation, patch/repack, and
-extract verification; its new payload identity still requires a physical
-flash and CAT readback. In the predecessor hardware run, all 217 rows were
+The V1.03.AZM firmware package has been physically flashed: CAT `FV` returns
+the exact stored identity `1.03.AZM`, ABI 3 qualification succeeds, and the
+typed read-only CAT validation passes on hardware. The unchanged ABI 3 runtime
+and hooks also passed a complete
+TH-D75A/V1.03 hardware run before the final displayed firmware identity was
+applied: `FULL_217_ROWS_162_VALUES_14_SAFE_INSPECTIONS_PASS`. All 217 rows were
 attempted, located, and restored; 162 value/information pages and 14 safe
 inspections were validated, 41 editor/action pages were not entered, and the
 run reported zero inconclusive results or errors. The before/after MCP
@@ -394,7 +400,10 @@ shared baseband and macOS system Bluetooth services alone.
 
 ## Radio compatibility
 
-Tested on TH-D75A firmware v1.03. The TH-D75E (European model) has different TX frequency ranges but uses the same protocol.
+The CAT and MCP schema is aligned with stock Kenwood V1.03. Live typed reads and
+closed-loop automation are validated on a TH-D75A running exact `1.03.AZM`
+(automation ABI 3). The TH-D75E (European model) has different TX frequency
+ranges but uses the same protocol.
 
 ## License
 

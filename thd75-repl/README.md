@@ -4,7 +4,8 @@ Accessible command-line REPL for the Kenwood TH-D75 transceiver. Its screen-read
 
 ## Features
 
-- CAT radio control (frequency, mode, squelch, power, VOX, etc.)
+- CAT radio inspection and qualified controls, including frequency reads and
+  stepping, memory recall, mode, squelch, power, and VOX
 - D-STAR reflector gateway (DPlus/DExtra/DCS, REF/XRF/XLX/DCS reflectors)
 - APRS KISS mode (packet radio)
 - Auto-detect Reflector Terminal Mode on startup
@@ -62,7 +63,12 @@ At the `d75>` prompt, the most useful commands are:
 - `verbose on` / `quiet`: toggle monitor verbosity
 - `confirm on` / `confirm off`: toggle transmit confirmation
 
-Standard commands cover frequency, mode, power, squelch, attenuator, VOX, dual band, Bluetooth, lock, FM radio, memory channels, GPS, URCALL, and reflector linking.
+Standard commands cover frequency reads and stepping, mode, power, squelch,
+attenuator, VOX, dual band, Bluetooth, FM radio, memory recall, GPS, URCALL, and
+reflector linking. Arbitrary direct frequency tuning currently reports a
+fail-closed safety error before radio I/O because FO/FQ writes are not
+qualified. The `lock` command reports that no verified CAT key-lock operation
+is available; it does not change the radio.
 
 ## Script mode
 
@@ -80,7 +86,6 @@ Example `contest-setup.txt`:
 # Contest startup
 power a high
 mode a fm
-tune a 146.520
 squelch a 3
 status
 ```
