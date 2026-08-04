@@ -9,7 +9,7 @@
 //! (wrong length, missing magic, zero stream id, invalid module byte)
 //! return `Err`.
 
-use crate::header::{DStarHeader, ENCODED_LEN};
+use crate::header::{DstarHeader, ENCODED_LEN};
 use crate::types::{Callsign, Module, ProtocolKind, StreamId};
 use crate::validator::{Diagnostic, DiagnosticSink};
 use crate::voice::VoiceFrame;
@@ -256,7 +256,7 @@ fn parse_dsvt_voice(bytes: &[u8]) -> Result<(StreamId, u8, VoiceFrame), DExtraEr
 fn parse_dsvt_header(
     bytes: &[u8],
     sink: &mut dyn DiagnosticSink,
-) -> Result<(StreamId, DStarHeader), DExtraError> {
+) -> Result<(StreamId, DstarHeader), DExtraError> {
     check_dsvt_magic(bytes)?;
     // Byte [4] must be 0x10 (header type) for a voice header.
     if bytes.get(4).copied() != Some(0x10) {
@@ -268,7 +268,7 @@ fn parse_dsvt_header(
         .ok_or(DExtraError::UnknownPacketLength { got: bytes.len() })?;
     let mut arr = [0u8; ENCODED_LEN];
     arr.copy_from_slice(hdr_slice);
-    let decoded = DStarHeader::decode(&arr);
+    let decoded = DstarHeader::decode(&arr);
     if decoded.flag1 != 0 || decoded.flag2 != 0 || decoded.flag3 != 0 {
         sink.record(Diagnostic::HeaderFlagsNonZero {
             protocol: ProtocolKind::DExtra,
@@ -327,8 +327,8 @@ mod tests {
         StreamId::new(n).unwrap()
     }
 
-    fn test_header() -> DStarHeader {
-        DStarHeader {
+    fn test_header() -> DstarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,

@@ -4,7 +4,7 @@
 //! the number of bytes written. Hot-path encoding is allocation-free.
 
 use crate::error::EncodeError;
-use crate::header::DStarHeader;
+use crate::header::DstarHeader;
 use crate::types::{Callsign, Module, StreamId};
 use crate::voice::VoiceFrame;
 
@@ -271,7 +271,7 @@ pub fn encode_poll_reply(
 /// into a single 100-byte DCS voice frame.
 pub fn encode_voice(
     out: &mut [u8],
-    header: &DStarHeader,
+    header: &DstarHeader,
     stream_id: StreamId,
     seq: u8,
     frame: &VoiceFrame,
@@ -515,8 +515,8 @@ mod tests {
         StreamId::new(n).unwrap()
     }
 
-    const fn test_header() -> DStarHeader {
-        DStarHeader {
+    const fn test_header() -> DstarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,
@@ -784,7 +784,7 @@ mod tests {
     #[test]
     fn encode_voice_embeds_flag_bytes_verbatim() -> TestResult {
         let mut buf = [0u8; 128];
-        let header = DStarHeader {
+        let header = DstarHeader {
             flag1: 0xAA,
             flag2: 0xBB,
             flag3: 0xCC,

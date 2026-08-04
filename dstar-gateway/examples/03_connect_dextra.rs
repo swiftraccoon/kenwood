@@ -17,7 +17,7 @@
 //! 27-byte voice data layout rather than DCS's single 100-byte
 //! combined frame.
 
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
 use std::sync::Arc;

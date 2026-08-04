@@ -72,7 +72,7 @@ mod tests {
     fn reflector_callsign_accepts_ref030() -> TestResult {
         let rc = ReflectorCallsign::try_from_str("REF030")?;
         assert_eq!(rc.protocol(), ProtocolKind::DPlus);
-        assert_eq!(rc.callsign().as_str(), "REF030");
+        assert_eq!(rc.callsign().text(), Ok("REF030"));
         Ok(())
     }
 

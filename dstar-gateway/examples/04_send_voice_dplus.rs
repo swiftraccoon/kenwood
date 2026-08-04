@@ -27,7 +27,7 @@
 //! in.** Without the opt-in the example resolves the address, runs
 //! the handshake, and exits without keying any voice frames.
 
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
 use std::env;
@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use dstar_gateway::auth::AuthClient;
 use dstar_gateway::tokio_shell::AsyncSession;
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{
     Authenticated, ClientStateKind, Configured, Connecting, DPlus, Session,
@@ -129,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. If the operator opted in, key the transmitter for 1.2 seconds
     //    (60 frames at 20 ms).
     if actually_transmit {
-        let header = DStarHeader::for_relay(
+        let header = DstarHeader::for_relay(
             callsign,
             Module::B,
             reflector_callsign,

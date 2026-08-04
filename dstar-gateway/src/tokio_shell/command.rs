@@ -1,7 +1,7 @@
 //! `Command` enum for the channel between an `AsyncSession` handle
 //! and the spawned `SessionLoop` task.
 
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::types::StreamId;
 use dstar_gateway_core::voice::VoiceFrame;
 
@@ -14,7 +14,7 @@ pub enum Command {
     /// Send a voice header and start a new outbound stream.
     SendHeader {
         /// The header to transmit.
-        header: Box<DStarHeader>,
+        header: Box<DstarHeader>,
         /// Stream id for the voice burst.
         stream_id: StreamId,
         /// Reply channel: `Ok(())` on success, or the shell error.

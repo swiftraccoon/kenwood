@@ -30,7 +30,7 @@ use std::net::SocketAddr;
 
 use dstar_gateway_core::EncodeError;
 use dstar_gateway_core::codec::{dcs, dextra, dplus};
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::types::{Module, ProtocolKind, StreamId};
 use dstar_gateway_core::voice::VoiceFrame;
 
@@ -55,7 +55,7 @@ pub struct CrossProtocolEvent {
     pub event: VoiceEvent,
     /// The cached header for this stream, if any. Required for
     /// `DCS` transcoding but optional for `DPlus`/`DExtra`.
-    pub cached_header: Option<DStarHeader>,
+    pub cached_header: Option<DstarHeader>,
 }
 
 /// A decoded voice event ready for cross-protocol fan-out.
@@ -69,7 +69,7 @@ pub enum VoiceEvent {
     /// Start of a stream. Requires the D-STAR header.
     StreamStart {
         /// The D-STAR header for this stream.
-        header: DStarHeader,
+        header: DstarHeader,
         /// The stream id.
         stream_id: StreamId,
     },
@@ -128,7 +128,7 @@ pub enum TranscodeError {
 pub fn transcode_voice(
     target: ProtocolKind,
     event: &VoiceEvent,
-    cached_header: Option<&DStarHeader>,
+    cached_header: Option<&DstarHeader>,
     out: &mut [u8],
 ) -> Result<usize, TranscodeError> {
     // `ProtocolKind` is `#[non_exhaustive]`; cover every known
@@ -190,7 +190,7 @@ fn transcode_dplus(event: &VoiceEvent, out: &mut [u8]) -> Result<usize, Transcod
 
 fn transcode_dcs(
     event: &VoiceEvent,
-    cached_header: Option<&DStarHeader>,
+    cached_header: Option<&DstarHeader>,
     out: &mut [u8],
 ) -> Result<usize, TranscodeError> {
     // DCS is special: every voice packet embeds the header, so
@@ -241,8 +241,8 @@ mod tests {
         }
     }
 
-    fn test_header() -> DStarHeader {
-        DStarHeader {
+    fn test_header() -> DstarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,

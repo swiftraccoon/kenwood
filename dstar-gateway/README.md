@@ -31,7 +31,7 @@ list.
 | Crate | What it does |
 |-------|--------------|
 | [`dstar-gateway-core`](../dstar-gateway-core) | Sans-io codec + typestate `Session<P, S>` state machines. No tokio, no I/O. |
-| [`dstar-gateway`](.) (this crate) | Tokio `AsyncSession<P>` shell, `DPlus` TCP `AuthClient`, optional XLX reflector-directory fetcher. |
+| [`dstar-gateway`](.) (this crate) | Tokio `AsyncSession<P>` shell, `DPlus` TCP `AuthClient`, optional explicitly insecure plaintext-HTTP XLX directory fetcher. |
 | [`dstar-gateway-server`](../dstar-gateway-server) | Multi-client `Reflector` server. Supports `DExtra`, `DPlus`, and DCS, all enabled by default. |
 
 ## Quickstart
@@ -121,7 +121,7 @@ versions of each.
 | `DPlus` reflector server | Implemented | `handle_inbound_dplus` endpoint, on by default |
 | `DCS` reflector server | Implemented | `handle_inbound_dcs` endpoint, on by default |
 | `blocking` feature | Optional | CLI-friendly variant of `AsyncSession` |
-| `hosts-fetcher` feature | Optional | Pulls `reqwest`; fetches the XLX reflector directory over HTTP |
+| `insecure-plaintext-xlx-directory` feature | Optional | Pulls `reqwest`; explicitly opts into the XLX registry's unauthenticated plaintext-HTTP endpoint |
 | Slow-data sub-codec | Implemented | Short messages embedded in voice frames |
 | DPRS position reports | Implemented | Decodes `$$CRC`-prefixed slow-data strings |
 | Lenient parsing | Implemented | Structured `Diagnostic` via `DiagnosticSink` trait |
@@ -131,16 +131,19 @@ versions of each.
 
 ```toml
 [dependencies]
-dstar-gateway = { path = "../dstar-gateway", features = ["hosts-fetcher"] }
+dstar-gateway = { path = "../dstar-gateway", features = ["insecure-plaintext-xlx-directory"] }
 ```
 
 - `blocking`: compile a caller-driven synchronous shell backed by
   `std::net::UdpSocket`. Callers do not run a Tokio runtime, although
   Tokio remains an unconditional dependency of this async client crate.
-- `hosts-fetcher`: pulls `reqwest`; fetches the XLX reflector
-  directory from `http://xlxapi.rlx.lu/api.php?do=GetReflectorHostname`
-  via `HostsFetcher::fetch_xlx_directory`, returning protocol-tagged
-  host entries.
+- `insecure-plaintext-xlx-directory`: pulls `reqwest` and exposes
+  `insecure_plaintext_xlx_directory::InsecurePlaintextXlxDirectoryFetcher`.
+  Calling `fetch_over_plaintext_http` contacts
+  `http://xlxapi.rlx.lu/api.php?do=GetReflectorHostname`. The server has no
+  working HTTPS endpoint, so the response has no confidentiality,
+  authenticity, or integrity and returned addresses must be treated as
+  untrusted network input.
 - `examples-network`: compile examples that contact live network services.
 - `hardware-tests`: compile ignored live-reflector integration tests.
   These last two flags are for examples/tests rather than downstream APIs.

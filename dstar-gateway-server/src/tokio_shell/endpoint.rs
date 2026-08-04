@@ -5,7 +5,7 @@
 //! [`ProtocolEndpoint::handle_inbound`] is the sans-io entry point;
 //! [`ProtocolEndpoint::run`] is the UDP pump plus the voice fan-out path.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use dstar_gateway_core::codec::dplus::{
     encode_poll_echo as encode_dplus_poll_echo,
 };
 use dstar_gateway_core::error::Error as CoreError;
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::client::Protocol;
 use dstar_gateway_core::session::server::ServerEvent;
 use dstar_gateway_core::types::{Callsign, Module, ProtocolKind, StreamId};
@@ -251,6 +251,8 @@ pub struct ProtocolEndpoint<P: Protocol> {
     /// packet; `DPlus` sessions keep this placeholder because the
     /// `DPlus` LINK2 packet doesn't carry a module on the wire.
     default_reflector_module: Module,
+    /// Modules admitted by this endpoint.
+    configured_modules: HashSet<Module>,
     /// Per-module active stream cache: populated on voice header,
     /// updated on voice data, cleared on voice EOT. Drives the
     /// 21-frame header-retransmit cadence in [`Self::handle_inbound`].
@@ -337,6 +339,7 @@ impl<P: Protocol> ProtocolEndpoint<P> {
             authorizer,
             voice_bus,
             EndpointSettings::default(),
+            HashSet::from([default_reflector_module]),
         )
     }
 
@@ -346,6 +349,13 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     /// it derives the settings from its [`ReflectorConfig`] so the
     /// configured rate limit, client caps, keepalive interval, and
     /// inactivity timeouts actually govern the endpoint's behavior.
+    /// `configured_modules` is the closed set admitted by `DExtra` and
+    /// `DCS` LINK packets.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `default_reflector_module` is absent from
+    /// `configured_modules`.
     #[must_use]
     pub fn new_with_settings(
         protocol: ProtocolKind,
@@ -353,11 +363,17 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         authorizer: Arc<dyn ClientAuthorizer>,
         voice_bus: Option<broadcast::Sender<CrossProtocolEvent>>,
         settings: EndpointSettings,
+        configured_modules: HashSet<Module>,
     ) -> Self {
+        assert!(
+            configured_modules.contains(&default_reflector_module),
+            "default reflector module must be configured"
+        );
         Self {
             protocol,
             clients: ClientPool::<P>::new(),
             default_reflector_module,
+            configured_modules,
             stream_cache: Mutex::new(HashMap::new()),
             authorizer,
             pending_events: Mutex::new(VecDeque::new()),
@@ -402,7 +418,7 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     ///
     /// This method is **not** cancel-safe. It takes multiple
     /// [`ClientPool`] locks in sequence (`contains` → `insert` →
-    /// `set_module` / `remove` → `record_last_heard`) and cancellation
+    /// core drive → `set_module` / `remove` → `record_last_heard`) and cancellation
     /// between any two awaits can leave the pool in a half-updated
     /// state where a session has been created but not yet attached to
     /// its module in the reverse index. The reflector's run loop is
@@ -456,49 +472,24 @@ impl<P: Protocol> ProtocolEndpoint<P> {
             return Ok(EndpointOutcome::<P>::empty());
         }
 
-        // LINK → authorizer. Rejected attempts never materialize a
-        // ClientHandle; they produce a NAK + `ClientRejected` event.
+        // LINK → configured-module, authorizer, and capacity gates.
+        // Rejected attempts never materialize a ClientHandle; they
+        // produce a NAK + `ClientRejected` event.
         let link_access: Option<AccessPolicy> = if let Some(ClientPacket::Link {
             callsign,
             reflector_module,
             ..
         }) = pre_decoded.clone()
         {
-            let attempt = LinkAttempt {
-                protocol: self.protocol,
-                callsign,
-                peer,
-                module: reflector_module,
-            };
-            match self.authorizer.authorize(&attempt) {
-                Ok(access_policy) => {
-                    // Capacity gate, adjacent to the authorizer
-                    // verdict: total-client and per-module caps from
-                    // the reflector config.
-                    if let Some(reject) = self.link_capacity_reject(peer, reflector_module).await {
-                        tracing::info!(
-                            ?peer,
-                            %callsign,
-                            %reflector_module,
-                            reason = ?reject,
-                            "client capacity limit rejected DExtra LINK attempt"
-                        );
-                        return Ok(Self::build_dextra_reject_outcome(
-                            peer,
-                            callsign,
-                            reflector_module,
-                            reject,
-                        ));
-                    }
-                    Some(access_policy)
-                }
+            match self.authorize_link(peer, callsign, reflector_module).await {
+                Ok(access_policy) => Some(access_policy),
                 Err(reject) => {
                     tracing::info!(
                         ?peer,
                         %callsign,
                         %reflector_module,
                         reason = ?reject,
-                        "authorizer rejected DExtra LINK attempt"
+                        "DExtra LINK attempt rejected"
                     );
                     return Ok(Self::build_dextra_reject_outcome(
                         peer,
@@ -512,7 +503,7 @@ impl<P: Protocol> ProtocolEndpoint<P> {
             None
         };
 
-        self.ensure_handle(peer, link_access, now).await;
+        let created = self.ensure_handle(peer, link_access, now).await;
 
         // ReadOnly voice drop check: must happen BEFORE drive_core
         // so the state machine never sees the voice bytes.
@@ -531,7 +522,9 @@ impl<P: Protocol> ProtocolEndpoint<P> {
             return Ok(outcome);
         }
 
-        let mut outcome = self.drive_core(&peer, bytes, now).await?;
+        let mut outcome = self
+            .drive_core_for_handle(peer, bytes, now, created, link_access)
+            .await?;
         self.clients.record_last_heard(&peer, now).await;
         self.mirror_link_events(&outcome, peer).await;
 
@@ -653,7 +646,7 @@ impl<P: Protocol> ProtocolEndpoint<P> {
                 None
             };
 
-        self.ensure_handle(peer, link_access, now).await;
+        let created = self.ensure_handle(peer, link_access, now).await;
 
         if self
             .read_only_drop_voice_dplus(pre_decoded.as_ref(), peer, now)
@@ -670,7 +663,9 @@ impl<P: Protocol> ProtocolEndpoint<P> {
             return Ok(outcome);
         }
 
-        let mut outcome = self.drive_core(&peer, bytes, now).await?;
+        let mut outcome = self
+            .drive_core_for_handle(peer, bytes, now, created, link_access)
+            .await?;
         self.clients.record_last_heard(&peer, now).await;
         self.mirror_link_events(&outcome, peer).await;
 
@@ -719,40 +714,15 @@ impl<P: Protocol> ProtocolEndpoint<P> {
             ..
         }) = pre_decoded.clone()
         {
-            let attempt = LinkAttempt {
-                protocol: self.protocol,
-                callsign,
-                peer,
-                module: reflector_module,
-            };
-            match self.authorizer.authorize(&attempt) {
-                Ok(access_policy) => {
-                    // Capacity gate, adjacent to the authorizer
-                    // verdict; see the DExtra sibling.
-                    if let Some(reject) = self.link_capacity_reject(peer, reflector_module).await {
-                        tracing::info!(
-                            ?peer,
-                            %callsign,
-                            %reflector_module,
-                            reason = ?reject,
-                            "client capacity limit rejected DCS LINK attempt"
-                        );
-                        return Ok(Self::build_dcs_reject_outcome(
-                            peer,
-                            callsign,
-                            reflector_module,
-                            reject,
-                        ));
-                    }
-                    Some(access_policy)
-                }
+            match self.authorize_link(peer, callsign, reflector_module).await {
+                Ok(access_policy) => Some(access_policy),
                 Err(reject) => {
                     tracing::info!(
                         ?peer,
                         %callsign,
                         %reflector_module,
                         reason = ?reject,
-                        "authorizer rejected DCS LINK attempt"
+                        "DCS LINK attempt rejected"
                     );
                     return Ok(Self::build_dcs_reject_outcome(
                         peer,
@@ -766,7 +736,7 @@ impl<P: Protocol> ProtocolEndpoint<P> {
             None
         };
 
-        self.ensure_handle(peer, link_access, now).await;
+        let created = self.ensure_handle(peer, link_access, now).await;
 
         if self
             .read_only_drop_voice_dcs(pre_decoded.as_ref(), peer, now)
@@ -783,7 +753,9 @@ impl<P: Protocol> ProtocolEndpoint<P> {
             return Ok(outcome);
         }
 
-        let mut outcome = self.drive_core(&peer, bytes, now).await?;
+        let mut outcome = self
+            .drive_core_for_handle(peer, bytes, now, created, link_access)
+            .await?;
         self.clients.record_last_heard(&peer, now).await;
         self.mirror_link_events(&outcome, peer).await;
 
@@ -804,9 +776,10 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     /// creating one if needed.
     ///
     /// `link_access` is the authorizer decision from a fresh LINK
-    /// pre-decode; if `None` (e.g. for non-LINK packets) the
-    /// fallback is [`AccessPolicy::ReadWrite`]. The LINK path above
-    /// overwrites the fallback when it fires. New handles get a TX
+    /// pre-decode. `None` is possible for the first, callsign-free
+    /// `DPlus` handshake packet and therefore defaults to
+    /// [`AccessPolicy::ReadOnly`] until LINK2 is authorized and
+    /// accepted by the core. New handles get a TX
     /// token bucket sized from the configured
     /// [`EndpointSettings::tx_rate_limit_frames_per_sec`].
     async fn ensure_handle(
@@ -814,11 +787,11 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         peer: SocketAddr,
         link_access: Option<AccessPolicy>,
         now: Instant,
-    ) {
+    ) -> bool {
         if self.clients.contains(&peer).await {
-            return;
+            return false;
         }
-        let access = link_access.unwrap_or(AccessPolicy::ReadWrite);
+        let access = link_access.unwrap_or(AccessPolicy::ReadOnly);
         let reflector_module = self.default_reflector_module;
         let core = ServerSessionCore::new(self.protocol, peer, reflector_module);
         let handle = ClientHandle::new_with_tx_rate(
@@ -828,6 +801,79 @@ impl<P: Protocol> ProtocolEndpoint<P> {
             self.settings.tx_rate_limit_frames_per_sec,
         );
         self.clients.insert(peer, handle).await;
+        true
+    }
+
+    /// Whether `module` belongs to this endpoint's configured module set.
+    fn module_is_configured(&self, module: Module) -> bool {
+        self.configured_modules.contains(&module)
+    }
+
+    /// Apply the common module, authorizer, and capacity gates for a
+    /// single-packet reflector LINK attempt.
+    async fn authorize_link(
+        &self,
+        peer: SocketAddr,
+        callsign: Callsign,
+        module: Module,
+    ) -> Result<AccessPolicy, RejectReason> {
+        if !self.module_is_configured(module) {
+            return Err(RejectReason::UnknownModule);
+        }
+        let attempt = LinkAttempt {
+            protocol: self.protocol,
+            callsign,
+            peer,
+            module,
+        };
+        let access = self.authorizer.authorize(&attempt)?;
+        if let Some(reject) = self.link_capacity_reject(peer, module).await {
+            return Err(reject);
+        }
+        Ok(access)
+    }
+
+    /// Drive an existing/new handle and roll back a newly inserted
+    /// handle when the core rejects the packet with an error.
+    async fn drive_core_for_handle(
+        &self,
+        peer: SocketAddr,
+        bytes: &[u8],
+        now: Instant,
+        created: bool,
+        pending_access: Option<AccessPolicy>,
+    ) -> Result<EndpointOutcome<P>, ShellError> {
+        match self.drive_core(&peer, bytes, now, pending_access).await {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                if created {
+                    drop(self.clients.remove(&peer).await);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn outcome_linked(outcome: &EndpointOutcome<P>) -> bool {
+        outcome
+            .events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::ClientLinked { .. }))
+    }
+
+    /// `DPlus` emits no second `ClientLinked` event for an idempotent
+    /// LINK2, so the accepted OKRW reply is the exact acceptance
+    /// signal for both initial and repeated handshakes.
+    fn dplus_link2_was_accepted(outcome: &EndpointOutcome<P>) -> bool {
+        let mut expected = [0_u8; 16];
+        let Ok(length) = encode_link2_reply(&mut expected, Link2Result::Accept) else {
+            return false;
+        };
+        let expected = expected.get(..length).unwrap_or(&[]);
+        outcome
+            .txs
+            .iter()
+            .any(|(payload, _)| payload.as_slice() == expected)
     }
 
     /// Check the configured client-capacity limits for a peer's LINK
@@ -916,7 +962,7 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         &self,
         outcome: &EndpointOutcome<P>,
         peer: SocketAddr,
-        fallback_header: Option<DStarHeader>,
+        fallback_header: Option<DstarHeader>,
     ) {
         let Some(bus) = &self.voice_bus else {
             return;
@@ -956,12 +1002,12 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         }
     }
 
-    /// Look up the cached `DStarHeader` (if any) for the given module.
+    /// Look up the cached `DstarHeader` (if any) for the given module.
     ///
     /// Used by [`Self::publish_voice_events`] so `DCS` subscribers
     /// on the other side of the bus receive the header context they
     /// need to re-encode inbound voice data into 100-byte packets.
-    async fn cached_header_for_module(&self, module: Module) -> Option<DStarHeader> {
+    async fn cached_header_for_module(&self, module: Module) -> Option<DstarHeader> {
         let cache = self.stream_cache.lock().await;
         cache.get(&module).map(|entry| *entry.header())
     }
@@ -971,7 +1017,7 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     /// Convenience wrapper the inbound handlers use to snapshot the
     /// live header before mutating the stream cache. See
     /// [`Self::publish_voice_events`] for how the snapshot is used.
-    async fn module_cached_header_of_peer(&self, peer: SocketAddr) -> Option<DStarHeader> {
+    async fn module_cached_header_of_peer(&self, peer: SocketAddr) -> Option<DstarHeader> {
         let module = self.clients.module_of(&peer).await?;
         self.cached_header_for_module(module).await
     }
@@ -1505,17 +1551,21 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         outcome
     }
 
-    /// Drive the core's state machine and drain its outbox + events.
+    /// Drive the core's state machine, apply an accepted access verdict, and
+    /// drain its outbox + events.
     ///
     /// Held as a private helper so the lock-protected mutation of the
-    /// per-peer `ServerSessionCore` stays in one place. We take the
-    /// pool's mutex, borrow the handle mutably, feed the core, and
-    /// drain everything into owned `Vec`s before releasing the lock.
+    /// per-peer `ServerSessionCore` stays in one place. We take the pool's
+    /// mutex, borrow the handle mutably, feed the core, drain everything into
+    /// owned `Vec`s, and apply `pending_access` only when that outcome proves
+    /// the link was accepted. The state transition and authorization update
+    /// therefore become visible together when the lock is released.
     async fn drive_core(
         &self,
         peer: &SocketAddr,
         bytes: &[u8],
         now: Instant,
+        pending_access: Option<AccessPolicy>,
     ) -> Result<EndpointOutcome<P>, ShellError> {
         // We need mutable access to the handle inside the pool's
         // HashMap. `ClientPool` intentionally doesn't expose `&mut`
@@ -1542,6 +1592,16 @@ impl<P: Protocol> ProtocolEndpoint<P> {
                 }
                 while let Some(ev) = handle.session.pop_event::<P>() {
                     outcome.events.push(ev);
+                }
+                if let Some(access) = pending_access {
+                    let accepted = match self.protocol {
+                        ProtocolKind::DPlus => Self::dplus_link2_was_accepted(&outcome),
+                        ProtocolKind::DExtra | ProtocolKind::Dcs => Self::outcome_linked(&outcome),
+                        _ => false,
+                    };
+                    if accepted {
+                        handle.access = access;
+                    }
                 }
                 Ok(())
             })
@@ -1816,8 +1876,8 @@ impl<P: Protocol> ProtocolEndpoint<P> {
         self.fan_out_outcome(socket, &outcome, peer, owned_bytes, &mut evicted_peers)
             .await;
 
-        // Fix 4: Remove any peers whose send-failure count crossed
-        // the eviction threshold on this tick. The ClientEvicted
+        // Remove any peers whose send-failure count crossed the
+        // eviction threshold on this tick. The ClientEvicted
         // event itself is emitted by `evict_peer` so consumers of
         // the server event stream can observe the eviction.
         for evicted in evicted_peers {
@@ -1884,8 +1944,8 @@ impl<P: Protocol> ProtocolEndpoint<P> {
             Ok(report) => evicted_peers.extend(report.evicted),
             Err(e) => tracing::warn!(?peer, ?e, "fan_out_voice failed"),
         }
-        // Fix 3: If the stream cache fired a header retransmit on
-        // this tick, fan out the cached bytes alongside the normal
+        // If the stream cache fired a header retransmit on this tick,
+        // fan out the cached bytes alongside the normal
         // frame. We send the data frame FIRST (above) and the cached
         // header SECOND so listeners who missed the initial header
         // still get refreshed context immediately after decoding the
@@ -1916,25 +1976,28 @@ mod tests {
     };
     use dstar_gateway_core::codec::dcs::{
         GatewayType as DcsGatewayType, encode_connect_link as encode_dcs_link,
-        encode_connect_unlink as encode_dcs_unlink, encode_voice as encode_dcs_voice,
+        encode_connect_nak as encode_dcs_nak, encode_connect_unlink as encode_dcs_unlink,
+        encode_voice as encode_dcs_voice,
     };
     use dstar_gateway_core::codec::dextra::{
-        encode_connect_link, encode_poll, encode_unlink, encode_voice_data, encode_voice_eot,
-        encode_voice_header,
+        encode_connect_link, encode_connect_nak as encode_dextra_nak, encode_poll, encode_unlink,
+        encode_voice_data, encode_voice_eot, encode_voice_header,
     };
     use dstar_gateway_core::codec::dplus::{
-        encode_link1 as encode_dplus_link1, encode_link2 as encode_dplus_link2,
-        encode_unlink as encode_dplus_unlink, encode_voice_data as encode_dplus_voice_data,
-        encode_voice_eot as encode_dplus_voice_eot,
+        Link2Result, encode_link1 as encode_dplus_link1, encode_link2 as encode_dplus_link2,
+        encode_link2_reply, encode_unlink as encode_dplus_unlink,
+        encode_voice_data as encode_dplus_voice_data, encode_voice_eot as encode_dplus_voice_eot,
         encode_voice_header as encode_dplus_voice_header,
     };
-    use dstar_gateway_core::header::DStarHeader;
+    use dstar_gateway_core::header::DstarHeader;
     use dstar_gateway_core::session::client::{DExtra, DPlus, Dcs};
-    use dstar_gateway_core::session::server::{ServerEvent, ServerStateKind};
+    use dstar_gateway_core::session::server::{ClientRejectedReason, ServerEvent, ServerStateKind};
     use dstar_gateway_core::types::{Callsign, Module, ProtocolKind, StreamId, Suffix};
     use dstar_gateway_core::voice::VoiceFrame;
+    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1947,6 +2010,54 @@ mod tests {
 
     fn allow_all() -> Arc<dyn ClientAuthorizer> {
         Arc::new(AllowAllAuthorizer)
+    }
+
+    fn configured_modules() -> HashSet<Module> {
+        HashSet::from([Module::C])
+    }
+
+    struct SwitchableAuthorizer {
+        read_only: AtomicBool,
+    }
+
+    impl SwitchableAuthorizer {
+        const fn new() -> Self {
+            Self {
+                read_only: AtomicBool::new(false),
+            }
+        }
+
+        fn set_read_only(&self) {
+            self.read_only.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl ClientAuthorizer for SwitchableAuthorizer {
+        fn authorize(
+            &self,
+            _request: &crate::reflector::LinkAttempt,
+        ) -> Result<crate::reflector::AccessPolicy, crate::reflector::RejectReason> {
+            if self.read_only.load(Ordering::SeqCst) {
+                Ok(crate::reflector::AccessPolicy::ReadOnly)
+            } else {
+                Ok(crate::reflector::AccessPolicy::ReadWrite)
+            }
+        }
+    }
+
+    struct PanicAuthorizer;
+
+    impl ClientAuthorizer for PanicAuthorizer {
+        #[expect(
+            clippy::panic,
+            reason = "the test authorizer must prove the call is unreachable"
+        )]
+        fn authorize(
+            &self,
+            _request: &crate::reflector::LinkAttempt,
+        ) -> Result<crate::reflector::AccessPolicy, crate::reflector::RejectReason> {
+            panic!("unconfigured modules must be rejected before authorization")
+        }
     }
 
     #[tokio::test]
@@ -2621,12 +2732,12 @@ mod tests {
         Ok(())
     }
 
-    fn test_header(cs_my: &str) -> DStarHeader {
+    fn test_header(cs_my: &str) -> DstarHeader {
         let mut my_bytes = *b"        ";
         for (dst, byte) in my_bytes.iter_mut().zip(cs_my.bytes().take(8)) {
             *dst = byte;
         }
-        DStarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,
@@ -2645,7 +2756,7 @@ mod tests {
         }
     }
 
-    // ─── Fix 1: DenyAllAuthorizer path ────────────────────────────
+    // ─── Denied authorization ─────────────────────────────────────
     #[tokio::test]
     async fn dextra_link_rejected_by_deny_all_authorizer() -> TestResult {
         let ep = ProtocolEndpoint::<DExtra>::new(
@@ -2690,7 +2801,7 @@ mod tests {
         Ok(())
     }
 
-    // ─── Fix 3: StreamCache 21-frame header retransmit ────────────
+    // ─── StreamCache 21-frame header retransmit ───────────────────
     #[tokio::test]
     async fn dextra_stream_cache_retransmits_header_every_21_frames() -> TestResult {
         let ep = ProtocolEndpoint::<DExtra>::new(ProtocolKind::DExtra, Module::C, allow_all());
@@ -3295,7 +3406,7 @@ mod tests {
         Ok(())
     }
 
-    // ─── Fix 4: ClientEvicted event path ──────────────────────────
+    // ─── ClientEvicted event path ─────────────────────────────────
     #[tokio::test]
     async fn dextra_endpoint_surfaces_evict_peer_event_next_tick() -> TestResult {
         // evict_peer is an async helper; we exercise it directly to
@@ -3443,7 +3554,7 @@ mod tests {
         Ok(())
     }
 
-    // ─── Fix 2: ReadOnly voice drop path ──────────────────────────
+    // ─── Read-only voice drop path ────────────────────────────────
     #[tokio::test]
     async fn dextra_readonly_voice_header_is_dropped() -> TestResult {
         let ep = ProtocolEndpoint::<DExtra>::new(
@@ -3506,6 +3617,467 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn dplus_link1_is_fail_closed_and_readonly_link2_stays_readonly() -> TestResult {
+        let ep = ProtocolEndpoint::<DPlus>::new(
+            ProtocolKind::DPlus,
+            Module::C,
+            Arc::new(ReadOnlyAuthorizer),
+        );
+        let mut link1 = [0_u8; 8];
+        let link1_len = encode_dplus_link1(&mut link1)?;
+        drop(
+            ep.handle_inbound(
+                link1.get(..link1_len).ok_or("empty LINK1")?,
+                peer(),
+                Instant::now(),
+            )
+            .await?,
+        );
+        assert_eq!(
+            ep.clients().access_of(&peer()).await,
+            Some(crate::reflector::AccessPolicy::ReadOnly),
+            "callsign-free transitional handles must start read-only"
+        );
+
+        let mut link2 = [0_u8; 32];
+        let link2_len = encode_dplus_link2(&mut link2, &Callsign::from_wire_bytes(*b"W1AW    "))?;
+        drop(
+            ep.handle_inbound(
+                link2.get(..link2_len).ok_or("empty LINK2")?,
+                peer(),
+                Instant::now(),
+            )
+            .await?,
+        );
+        assert_eq!(
+            ep.clients().access_of(&peer()).await,
+            Some(crate::reflector::AccessPolicy::ReadOnly)
+        );
+
+        let mut voice = [0_u8; 64];
+        let voice_len = encode_dplus_voice_header(&mut voice, sid(), &test_header("W1AW"))?;
+        let outcome = ep
+            .handle_inbound(
+                voice.get(..voice_len).ok_or("empty voice")?,
+                peer(),
+                Instant::now(),
+            )
+            .await?;
+        assert!(matches!(
+            outcome.events.first(),
+            Some(ServerEvent::VoiceFromReadOnlyDropped { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dcs_readonly_link_drops_voice_before_core() -> TestResult {
+        let ep = ProtocolEndpoint::<Dcs>::new(
+            ProtocolKind::Dcs,
+            Module::C,
+            Arc::new(ReadOnlyAuthorizer),
+        );
+        let dcs_peer = test_peer(40551);
+        drop(
+            link_dcs(
+                &ep,
+                dcs_peer,
+                Callsign::from_wire_bytes(*b"W1AW    "),
+                Module::C,
+                Instant::now(),
+            )
+            .await?,
+        );
+        let mut voice = [0_u8; 128];
+        let voice_len = encode_dcs_voice(
+            &mut voice,
+            &test_header("W1AW"),
+            sid(),
+            0,
+            &VoiceFrame::silence(),
+            false,
+        )?;
+        let outcome = ep
+            .handle_inbound(
+                voice.get(..voice_len).ok_or("empty DCS voice")?,
+                dcs_peer,
+                Instant::now(),
+            )
+            .await?;
+        assert!(matches!(
+            outcome.events.first(),
+            Some(ServerEvent::VoiceFromReadOnlyDropped { .. })
+        ));
+        let state = ep
+            .clients()
+            .with_handle_mut(&dcs_peer, |handle| handle.session.state_kind())
+            .await
+            .ok_or("DCS handle missing")?;
+        assert_eq!(state, ServerStateKind::Linked);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dextra_cross_module_relink_replaces_access_and_drops_voice() -> TestResult {
+        let dextra_auth = Arc::new(SwitchableAuthorizer::new());
+        let dextra = ProtocolEndpoint::<DExtra>::new_with_settings(
+            ProtocolKind::DExtra,
+            Module::C,
+            dextra_auth.clone(),
+            None,
+            EndpointSettings::default(),
+            HashSet::from([Module::C, Module::D]),
+        );
+        let dextra_peer = test_peer(40561);
+        let callsign = Callsign::from_wire_bytes(*b"W1AW    ");
+        drop(link_dextra(&dextra, dextra_peer, callsign, Module::C, Instant::now()).await?);
+        assert_eq!(
+            dextra.clients().access_of(&dextra_peer).await,
+            Some(crate::reflector::AccessPolicy::ReadWrite)
+        );
+        assert_eq!(
+            dextra.clients().module_of(&dextra_peer).await,
+            Some(Module::C)
+        );
+
+        dextra_auth.set_read_only();
+        let relink = link_dextra(&dextra, dextra_peer, callsign, Module::D, Instant::now()).await?;
+        assert!(relink.events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::ClientLinked {
+                    module: Module::D,
+                    ..
+                }
+            )
+        }));
+        assert_eq!(
+            dextra.clients().access_of(&dextra_peer).await,
+            Some(crate::reflector::AccessPolicy::ReadOnly)
+        );
+        assert_eq!(
+            dextra.clients().module_of(&dextra_peer).await,
+            Some(Module::D)
+        );
+        assert!(
+            dextra
+                .clients()
+                .members_of_module(Module::C)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            dextra.clients().members_of_module(Module::D).await,
+            vec![dextra_peer]
+        );
+
+        let mut voice = [0_u8; 64];
+        let voice_len = encode_voice_header(&mut voice, sid(), &test_header("W1AW"))?;
+        let voice_outcome = dextra
+            .handle_inbound(
+                voice.get(..voice_len).ok_or("empty voice")?,
+                dextra_peer,
+                Instant::now(),
+            )
+            .await?;
+        assert!(matches!(
+            voice_outcome.events.first(),
+            Some(ServerEvent::VoiceFromReadOnlyDropped { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dcs_cross_module_relink_replaces_access_and_drops_voice() -> TestResult {
+        let dcs_auth = Arc::new(SwitchableAuthorizer::new());
+        let dcs = ProtocolEndpoint::<Dcs>::new_with_settings(
+            ProtocolKind::Dcs,
+            Module::C,
+            dcs_auth.clone(),
+            None,
+            EndpointSettings::default(),
+            HashSet::from([Module::C, Module::D]),
+        );
+        let dcs_peer = test_peer(40562);
+        let callsign = Callsign::from_wire_bytes(*b"W1AW    ");
+        drop(link_dcs(&dcs, dcs_peer, callsign, Module::C, Instant::now()).await?);
+        assert_eq!(
+            dcs.clients().access_of(&dcs_peer).await,
+            Some(crate::reflector::AccessPolicy::ReadWrite)
+        );
+        assert_eq!(dcs.clients().module_of(&dcs_peer).await, Some(Module::C));
+
+        dcs_auth.set_read_only();
+        let relink = link_dcs(&dcs, dcs_peer, callsign, Module::D, Instant::now()).await?;
+        assert!(relink.events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::ClientLinked {
+                    module: Module::D,
+                    ..
+                }
+            )
+        }));
+        assert_eq!(
+            dcs.clients().access_of(&dcs_peer).await,
+            Some(crate::reflector::AccessPolicy::ReadOnly)
+        );
+        assert_eq!(dcs.clients().module_of(&dcs_peer).await, Some(Module::D));
+        assert!(dcs.clients().members_of_module(Module::C).await.is_empty());
+        assert_eq!(
+            dcs.clients().members_of_module(Module::D).await,
+            vec![dcs_peer]
+        );
+
+        let mut voice = [0_u8; 128];
+        let voice_len = encode_dcs_voice(
+            &mut voice,
+            &test_header("W1AW"),
+            sid(),
+            0,
+            &VoiceFrame::silence(),
+            false,
+        )?;
+        let voice_outcome = dcs
+            .handle_inbound(
+                voice.get(..voice_len).ok_or("empty DCS voice")?,
+                dcs_peer,
+                Instant::now(),
+            )
+            .await?;
+        assert!(matches!(
+            voice_outcome.events.first(),
+            Some(ServerEvent::VoiceFromReadOnlyDropped { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dplus_link1_stays_readonly_until_accepted_readwrite_link2() -> TestResult {
+        let dplus = ProtocolEndpoint::<DPlus>::new(ProtocolKind::DPlus, Module::C, allow_all());
+        let dplus_peer = test_peer(40563);
+        let callsign = Callsign::from_wire_bytes(*b"W1AW    ");
+        let mut link1 = [0_u8; 8];
+        let link1_len = encode_dplus_link1(&mut link1)?;
+        drop(
+            dplus
+                .handle_inbound(
+                    link1.get(..link1_len).ok_or("empty LINK1")?,
+                    dplus_peer,
+                    Instant::now(),
+                )
+                .await?,
+        );
+        assert_eq!(
+            dplus.clients().access_of(&dplus_peer).await,
+            Some(crate::reflector::AccessPolicy::ReadOnly)
+        );
+        assert_eq!(dplus.clients().module_of(&dplus_peer).await, None);
+
+        let mut link2 = [0_u8; 32];
+        let link2_len = encode_dplus_link2(&mut link2, &callsign)?;
+        let link2_outcome = dplus
+            .handle_inbound(
+                link2.get(..link2_len).ok_or("empty LINK2")?,
+                dplus_peer,
+                Instant::now(),
+            )
+            .await?;
+        assert!(
+            link2_outcome
+                .txs
+                .iter()
+                .any(|(payload, _)| { payload.windows(4).any(|window| window == b"OKRW") })
+        );
+        assert_eq!(
+            dplus.clients().access_of(&dplus_peer).await,
+            Some(crate::reflector::AccessPolicy::ReadWrite)
+        );
+        assert_eq!(
+            dplus.clients().module_of(&dplus_peer).await,
+            Some(Module::C)
+        );
+
+        let mut voice = [0_u8; 64];
+        let voice_len = encode_dplus_voice_header(&mut voice, sid(), &test_header("W1AW"))?;
+        let voice_outcome = dplus
+            .handle_inbound(
+                voice.get(..voice_len).ok_or("empty voice")?,
+                dplus_peer,
+                Instant::now(),
+            )
+            .await?;
+        assert!(matches!(
+            voice_outcome.events.first(),
+            Some(ServerEvent::ClientStreamStarted { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dplus_accepted_relink_replaces_access_policy() -> TestResult {
+        let dplus_auth = Arc::new(SwitchableAuthorizer::new());
+        let dplus =
+            ProtocolEndpoint::<DPlus>::new(ProtocolKind::DPlus, Module::C, dplus_auth.clone());
+        let dplus_peer = test_peer(40564);
+        let callsign = Callsign::from_wire_bytes(*b"W1AW    ");
+        let mut link1 = [0_u8; 8];
+        let link1_len = encode_dplus_link1(&mut link1)?;
+        drop(
+            dplus
+                .handle_inbound(
+                    link1.get(..link1_len).ok_or("empty LINK1")?,
+                    dplus_peer,
+                    Instant::now(),
+                )
+                .await?,
+        );
+        let mut link2 = [0_u8; 32];
+        let link2_len = encode_dplus_link2(&mut link2, &callsign)?;
+        let link2_bytes = link2.get(..link2_len).ok_or("empty LINK2")?;
+        drop(
+            dplus
+                .handle_inbound(link2_bytes, dplus_peer, Instant::now())
+                .await?,
+        );
+        dplus_auth.set_read_only();
+        drop(
+            dplus
+                .handle_inbound(link2_bytes, dplus_peer, Instant::now())
+                .await?,
+        );
+        assert_eq!(
+            dplus.clients().access_of(&dplus_peer).await,
+            Some(crate::reflector::AccessPolicy::ReadOnly)
+        );
+
+        let mut voice = [0_u8; 64];
+        let voice_len = encode_dplus_voice_header(&mut voice, sid(), &test_header("W1AW"))?;
+        let voice_outcome = dplus
+            .handle_inbound(
+                voice.get(..voice_len).ok_or("empty voice")?,
+                dplus_peer,
+                Instant::now(),
+            )
+            .await?;
+        assert!(matches!(
+            voice_outcome.events.first(),
+            Some(ServerEvent::VoiceFromReadOnlyDropped { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_dplus_relink_does_not_apply_authorizer_policy() -> TestResult {
+        let authorizer = Arc::new(SwitchableAuthorizer::new());
+        let ep = ProtocolEndpoint::<DPlus>::new(ProtocolKind::DPlus, Module::C, authorizer.clone());
+        let dplus_peer = test_peer(40565);
+        let mut link1 = [0_u8; 8];
+        let link1_len = encode_dplus_link1(&mut link1)?;
+        drop(
+            ep.handle_inbound(
+                link1.get(..link1_len).ok_or("empty LINK1")?,
+                dplus_peer,
+                Instant::now(),
+            )
+            .await?,
+        );
+        let mut initial = [0_u8; 32];
+        let initial_len =
+            encode_dplus_link2(&mut initial, &Callsign::from_wire_bytes(*b"W1AW    "))?;
+        drop(
+            ep.handle_inbound(
+                initial.get(..initial_len).ok_or("empty LINK2")?,
+                dplus_peer,
+                Instant::now(),
+            )
+            .await?,
+        );
+
+        authorizer.set_read_only();
+        let mut mismatched = [0_u8; 32];
+        let mismatch_len =
+            encode_dplus_link2(&mut mismatched, &Callsign::from_wire_bytes(*b"K1ABC   "))?;
+        let outcome = ep
+            .handle_inbound(
+                mismatched.get(..mismatch_len).ok_or("empty LINK2")?,
+                dplus_peer,
+                Instant::now(),
+            )
+            .await?;
+        let mut busy = [0_u8; 16];
+        let busy_len = encode_link2_reply(&mut busy, Link2Result::Busy)?;
+        assert_eq!(
+            outcome.txs.first().map(|tx| tx.0.as_slice()),
+            busy.get(..busy_len)
+        );
+        assert_eq!(
+            ep.clients().access_of(&dplus_peer).await,
+            Some(crate::reflector::AccessPolicy::ReadWrite),
+            "a core-rejected re-link must not change the established policy"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dextra_unconfigured_module_is_rejected_before_authorization() -> TestResult {
+        let ep = ProtocolEndpoint::<DExtra>::new_with_settings(
+            ProtocolKind::DExtra,
+            Module::C,
+            Arc::new(PanicAuthorizer),
+            None,
+            EndpointSettings::default(),
+            configured_modules(),
+        );
+        let callsign = Callsign::from_wire_bytes(*b"W1AW    ");
+        let outcome = link_dextra(&ep, peer(), callsign, Module::D, Instant::now()).await?;
+        let mut nak = [0_u8; 16];
+        let nak_len = encode_dextra_nak(&mut nak, &callsign, Module::D)?;
+        assert_eq!(
+            outcome.txs.first().map(|tx| tx.0.as_slice()),
+            nak.get(..nak_len)
+        );
+        assert!(matches!(
+            outcome.events.first(),
+            Some(ServerEvent::ClientRejected {
+                reason: ClientRejectedReason::UnknownModule,
+                ..
+            })
+        ));
+        assert!(ep.clients().is_empty().await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dcs_unconfigured_module_is_rejected_before_authorization() -> TestResult {
+        let ep = ProtocolEndpoint::<Dcs>::new_with_settings(
+            ProtocolKind::Dcs,
+            Module::C,
+            Arc::new(PanicAuthorizer),
+            None,
+            EndpointSettings::default(),
+            configured_modules(),
+        );
+        let callsign = Callsign::from_wire_bytes(*b"W1AW    ");
+        let outcome = link_dcs(&ep, peer(), callsign, Module::D, Instant::now()).await?;
+        let mut nak = [0_u8; 32];
+        let nak_len = encode_dcs_nak(&mut nak, &callsign, Module::D)?;
+        assert_eq!(
+            outcome.txs.first().map(|tx| tx.0.as_slice()),
+            nak.get(..nak_len)
+        );
+        assert!(matches!(
+            outcome.events.first(),
+            Some(ServerEvent::ClientRejected {
+                reason: ClientRejectedReason::UnknownModule,
+                ..
+            })
+        ));
+        assert!(ep.clients().is_empty().await);
+        Ok(())
+    }
+
     // ─── config knobs must have runtime effect ────────────────────
 
     fn test_peer(port: u16) -> SocketAddr {
@@ -3559,6 +4131,7 @@ mod tests {
             allow_all(),
             None,
             settings,
+            configured_modules(),
         );
         let now = Instant::now();
         drop(
@@ -3604,6 +4177,7 @@ mod tests {
             allow_all(),
             None,
             settings,
+            configured_modules(),
         );
         let cs = Callsign::from_wire_bytes(*b"W1AW    ");
         for port in [41001, 41002] {
@@ -3648,6 +4222,7 @@ mod tests {
             allow_all(),
             None,
             settings,
+            HashSet::from([Module::C, Module::D]),
         );
         let cs = Callsign::from_wire_bytes(*b"W1AW    ");
         drop(link_dextra(&ep, test_peer(41011), cs, Module::C, Instant::now()).await?);
@@ -3687,6 +4262,7 @@ mod tests {
             allow_all(),
             None,
             settings,
+            configured_modules(),
         );
         // First client completes the handshake.
         let mut link1_buf = [0u8; 8];
@@ -3741,6 +4317,7 @@ mod tests {
             allow_all(),
             None,
             settings,
+            configured_modules(),
         );
         let mut link1_buf = [0u8; 8];
         let n1 = encode_dplus_link1(&mut link1_buf)?;
@@ -3842,6 +4419,7 @@ mod tests {
             allow_all(),
             None,
             settings,
+            configured_modules(),
         );
         let cs = Callsign::from_wire_bytes(*b"W1AW    ");
         drop(link_dcs(&ep, test_peer(41041), cs, Module::C, Instant::now()).await?);
@@ -3871,6 +4449,7 @@ mod tests {
             allow_all(),
             None,
             settings,
+            configured_modules(),
         );
         let cs = Callsign::from_wire_bytes(*b"W1AW    ");
         drop(link_dcs(&ep, test_peer(41051), cs, Module::C, Instant::now()).await?);
@@ -3897,6 +4476,7 @@ mod tests {
             allow_all(),
             None,
             settings,
+            configured_modules(),
         );
         let base = Instant::now();
         let peer_a = test_peer(41061);
@@ -3980,6 +4560,7 @@ mod tests {
             allow_all(),
             None,
             settings,
+            configured_modules(),
         );
         let base = Instant::now();
         drop(
@@ -4047,6 +4628,7 @@ mod tests {
             allow_all(),
             None,
             settings,
+            configured_modules(),
         );
         let base = Instant::now();
         let peer_a = test_peer(41071);
@@ -4110,6 +4692,7 @@ mod tests {
             allow_all(),
             None,
             EndpointSettings::default(),
+            configured_modules(),
         );
         let base = Instant::now();
         // Fully linked peer A.
@@ -4156,6 +4739,7 @@ mod tests {
             allow_all(),
             None,
             settings,
+            configured_modules(),
         );
         let base = Instant::now();
         // W1AW links its module B to reflector module C.

@@ -21,7 +21,7 @@ use dstar_gateway_core::codec::dcs::{
     encode_poll_reply, encode_poll_request, encode_voice,
 };
 use dstar_gateway_core::validator::NullSink;
-use dstar_gateway_core::{Callsign, DStarHeader, Module, StreamId, Suffix, VoiceFrame};
+use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, Suffix, VoiceFrame};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
@@ -79,8 +79,8 @@ prop_compose! {
     }
 }
 
-const fn dcs_header(my_call: Callsign) -> DStarHeader {
-    DStarHeader {
+const fn dcs_header(my_call: Callsign) -> DstarHeader {
+    DstarHeader {
         flag1: 0,
         flag2: 0,
         flag3: 0,

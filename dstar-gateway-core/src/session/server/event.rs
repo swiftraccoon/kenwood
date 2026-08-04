@@ -10,7 +10,7 @@ use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 
-use crate::header::DStarHeader;
+use crate::header::DstarHeader;
 use crate::session::client::Protocol;
 use crate::types::{Callsign, Module, StreamId};
 use crate::voice::VoiceFrame;
@@ -79,7 +79,7 @@ pub enum ServerEvent<P: Protocol> {
         /// Stream id.
         stream_id: StreamId,
         /// The header they sent.
-        header: DStarHeader,
+        header: DstarHeader,
     },
     /// A client sent a voice frame.
     ClientStreamFrame {

@@ -5,7 +5,7 @@
 //! voice packet is 100 bytes and embeds the full D-STAR header, so
 //! there is no separate "voice header" packet length on the wire.
 
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
 mod common;
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use common::fake_reflector::FakeReflector;
 use dstar_gateway::tokio_shell::AsyncSession;
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{ClientStateKind, Configured, Dcs, Session};
 use dstar_gateway_core::types::{Callsign, Module, StreamId, Suffix};
@@ -68,7 +68,7 @@ async fn dcs_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std::er
     // Send header + 5 voice frames + EOT. DCS packs everything into
     // 100-byte frames (header is embedded), so every send produces
     // exactly one 100-byte datagram.
-    let header = DStarHeader {
+    let header = DstarHeader {
         flag1: 0,
         flag2: 0,
         flag3: 0,

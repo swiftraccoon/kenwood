@@ -98,7 +98,7 @@ pub async fn fan_out_voice_at<P: Protocol>(
     let mut report = FanOutReport::default();
     let members = clients.members_of_module(module).await;
     for peer in members.iter().copied().filter(|p| *p != from) {
-        // Fix 5: consult the per-client TX token bucket BEFORE the
+        // Consult the per-client TX token bucket before the
         // kernel send. On empty-bucket, drop the frame for THIS
         // peer: rate-limited is not the same as broken, so we do
         // NOT mark_unhealthy here. Other peers on the same module
@@ -231,7 +231,7 @@ mod tests {
         Ok(())
     }
 
-    // ─── Fix 4: unhealthy-client eviction ─────────────────────────
+    // ─── Unhealthy-client eviction ────────────────────────────────
     #[tokio::test]
     async fn fan_out_reports_evicted_peer_after_threshold() -> TestResult {
         // Set up two peers on the same module: A is the originator
@@ -292,7 +292,7 @@ mod tests {
         Ok(())
     }
 
-    // ─── Fix 5: per-client TX token-bucket rate limiting ─────────
+    // ─── Per-client TX token-bucket rate limiting ─────────────────
     #[tokio::test]
     async fn fan_out_rate_limits_peer_when_tx_budget_exhausted() -> TestResult {
         use dstar_gateway_core::ServerSessionCore;

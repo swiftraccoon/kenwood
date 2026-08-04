@@ -1,6 +1,8 @@
 //! Parsed slow data block types.
 
-use crate::header::DStarHeader;
+use crate::header::DstarHeader;
+
+use super::text::SlowDataText;
 
 /// Slow data block type, recovered from the high nibble of byte 0
 /// after descrambling.
@@ -47,23 +49,19 @@ impl SlowDataBlockKind {
     }
 }
 
-/// 20-character status text frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SlowDataText {
-    /// Trimmed text (UTF-8 lossy).
-    pub text: String,
-}
-
 /// A complete slow data block extracted from a stream of voice frames.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlowDataBlock {
-    /// GPS NMEA sentence.
-    Gps(String),
+    /// GPS/NMEA payload bytes preserved exactly as received.
+    ///
+    /// Consumers may validate these as ASCII when interpreting a complete
+    /// sentence; the slow-data layer does not replace malformed RF bytes.
+    Gps(Vec<u8>),
     /// 20-character text frame.
     Text(SlowDataText),
     /// Retransmitted header.
-    HeaderRetx(DStarHeader),
+    HeaderRetx(DstarHeader),
     /// Fast data block 1, with an opaque payload.
     FastData(Vec<u8>),
     /// Squelch / control marker.

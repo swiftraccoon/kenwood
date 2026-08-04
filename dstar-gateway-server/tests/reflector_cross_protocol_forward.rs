@@ -39,7 +39,7 @@ use tokio::sync::broadcast;
 use dstar_gateway_core::codec::dextra::{
     encode_connect_link, encode_voice_data, encode_voice_eot, encode_voice_header,
 };
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::client::{DExtra, DPlus, Dcs};
 use dstar_gateway_core::types::{Callsign, Module, ProtocolKind, StreamId, Suffix};
 use dstar_gateway_core::voice::VoiceFrame;
@@ -55,8 +55,8 @@ const fn sid() -> StreamId {
     }
 }
 
-const fn test_header(my: [u8; 8]) -> DStarHeader {
-    DStarHeader {
+const fn test_header(my: [u8; 8]) -> DstarHeader {
+    DstarHeader {
         flag1: 0,
         flag2: 0,
         flag3: 0,

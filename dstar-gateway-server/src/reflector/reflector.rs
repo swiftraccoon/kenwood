@@ -179,6 +179,7 @@ impl Reflector {
         // shell-level knobs (rate limit, client caps, keepalive and
         // inactivity windows).
         let settings = EndpointSettings::from(&config);
+        let configured_modules = config.modules.clone();
         let dextra = if config.is_enabled(ProtocolKind::DExtra) {
             Some(Arc::new(ProtocolEndpoint::<DExtra>::new_with_settings(
                 ProtocolKind::DExtra,
@@ -186,6 +187,7 @@ impl Reflector {
                 Arc::clone(&authorizer_arc),
                 voice_bus.clone(),
                 settings.clone(),
+                configured_modules.clone(),
             )))
         } else {
             None
@@ -197,6 +199,7 @@ impl Reflector {
                 Arc::clone(&authorizer_arc),
                 voice_bus.clone(),
                 settings.clone(),
+                configured_modules.clone(),
             )))
         } else {
             None
@@ -208,6 +211,7 @@ impl Reflector {
                 Arc::clone(&authorizer_arc),
                 voice_bus.clone(),
                 settings,
+                configured_modules,
             )))
         } else {
             None

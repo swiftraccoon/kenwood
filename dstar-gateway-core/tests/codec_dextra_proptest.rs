@@ -21,7 +21,7 @@ use dstar_gateway_core::codec::dextra::{
     encode_voice_data, encode_voice_eot, encode_voice_header,
 };
 use dstar_gateway_core::validator::NullSink;
-use dstar_gateway_core::{Callsign, DStarHeader, Module, StreamId, Suffix, VoiceFrame};
+use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, Suffix, VoiceFrame};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
@@ -79,8 +79,8 @@ prop_compose! {
     }
 }
 
-const fn xrf030_header(my_call: Callsign) -> DStarHeader {
-    DStarHeader {
+const fn xrf030_header(my_call: Callsign) -> DstarHeader {
+    DstarHeader {
         flag1: 0,
         flag2: 0,
         flag3: 0,

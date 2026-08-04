@@ -6,7 +6,8 @@
 //! in the encoder will fail these tests loudly.
 //!
 //! Method for hand-computing a vector for input `"<text>"`:
-//!   1. Pad/truncate to exactly 20 bytes with ASCII space.
+//!   1. Validate at most 20 bytes of printable ASCII and pad to exactly
+//!      20 bytes with ASCII spaces.
 //!   2. For each block index i ∈ 0..=3:
 //!      a. Let `chunk = padded[i*5..i*5+5]` (5 bytes).
 //!      b. Let `block = [0x40 | i, chunk[0], chunk[1], chunk[2], chunk[3], chunk[4]]`.
@@ -22,7 +23,9 @@ use thiserror as _;
 use tracing as _;
 use trybuild as _;
 
-use dstar_gateway_core::slowdata::encode_text_message;
+use dstar_gateway_core::slowdata::{
+    SlowDataTextMessage, SlowDataTextMessageError, encode_text_message,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -41,7 +44,7 @@ fn golden_hi_padded() -> TestResult {
     //   Block 3: type=0x43, rest spaces
     //     half1 = [0x33, 0x6F, 0xB3]
     //     half2 = [0x50, 0x6F, 0xB3]
-    let out = encode_text_message("Hi");
+    let out = encode_text_message(SlowDataTextMessage::try_from_text("Hi")?);
     assert_eq!(out.len(), 8);
     assert_eq!(*out.first().ok_or("index 0 in range")?, [0x30, 0x07, 0xFA]);
     assert_eq!(*out.get(1).ok_or("index 1 in range")?, [0x50, 0x6F, 0xB3]);
@@ -55,8 +58,13 @@ fn golden_hi_padded() -> TestResult {
 }
 
 #[test]
-fn golden_empty_returns_empty() {
-    assert!(encode_text_message("").is_empty());
+fn golden_empty_is_an_explicit_all_space_message() -> TestResult {
+    let out = encode_text_message(SlowDataTextMessage::try_from_text("")?);
+    assert_eq!(out[0], [0x30, 0x6F, 0xB3]);
+    assert_eq!(out[1], [0x50, 0x6F, 0xB3]);
+    assert_eq!(out[6], [0x33, 0x6F, 0xB3]);
+    assert_eq!(out[7], [0x50, 0x6F, 0xB3]);
+    Ok(())
 }
 
 #[test]
@@ -66,7 +74,7 @@ fn golden_exactly_20_chars_preserves_all_chars() -> TestResult {
     //   half1 = [(0x40|i)^0x70, 'A'^0x4F, 'A'^0x93] = [0x30|i, 0x0E, 0xD2]
     //   half2 = ['A'^0x70, 'A'^0x4F, 'A'^0x93]      = [0x31, 0x0E, 0xD2]
     //   (0x41 = 'A')
-    let out = encode_text_message("AAAAAAAAAAAAAAAAAAAA");
+    let out = encode_text_message(SlowDataTextMessage::try_from_text("AAAAAAAAAAAAAAAAAAAA")?);
     assert_eq!(out.len(), 8);
     assert_eq!(*out.first().ok_or("index 0 in range")?, [0x30, 0x0E, 0xD2]);
     assert_eq!(*out.get(1).ok_or("index 1 in range")?, [0x31, 0x0E, 0xD2]);
@@ -80,16 +88,14 @@ fn golden_exactly_20_chars_preserves_all_chars() -> TestResult {
 }
 
 #[test]
-fn golden_long_input_truncated_to_first_20_chars() -> TestResult {
-    // First 20 chars of "1234567890ABCDEFGHIJKLMN" = "1234567890ABCDEFGHIJ"
-    // Spot-check block 0: [0x40, '1','2','3','4','5']
-    //   half1 = [0x40^0x70, '1'^0x4F, '2'^0x93] = [0x30, 0x7E, 0xA1]
-    //   half2 = ['3'^0x70, '4'^0x4F, '5'^0x93] = [0x43, 0x7B, 0xA6]
-    let out = encode_text_message("1234567890ABCDEFGHIJKLMN");
-    assert_eq!(out.len(), 8);
-    assert_eq!(*out.first().ok_or("index 0 in range")?, [0x30, 0x7E, 0xA1]);
-    assert_eq!(*out.get(1).ok_or("index 1 in range")?, [0x43, 0x7B, 0xA6]);
-    Ok(())
+fn long_input_is_rejected_without_truncation() {
+    assert_eq!(
+        SlowDataTextMessage::try_from_text("1234567890ABCDEFGHIJKLMN"),
+        Err(SlowDataTextMessageError::TooLong {
+            length: 24,
+            maximum: 20,
+        })
+    );
 }
 
 #[test]
@@ -107,7 +113,7 @@ fn golden_alphanumeric_roundtrip_exact() -> TestResult {
     // Block 3: [0x43, ' ',' ',' ',' ',' ']
     //   half1 = [0x33, 0x6F, 0xB3]
     //   half2 = [0x50, 0x6F, 0xB3]
-    let out = encode_text_message("HELLO WORLD");
+    let out = encode_text_message(SlowDataTextMessage::try_from_text("HELLO WORLD")?);
     assert_eq!(out.len(), 8);
     assert_eq!(*out.first().ok_or("index 0 in range")?, [0x30, 0x07, 0xD6]);
     assert_eq!(*out.get(1).ok_or("index 1 in range")?, [0x3C, 0x03, 0xDC]);

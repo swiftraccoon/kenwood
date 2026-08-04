@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use crate::codec::dplus::HostList;
 use crate::error::{Error, StateError};
-use crate::header::DStarHeader;
+use crate::header::DstarHeader;
 use crate::session::driver::{Driver, Transmit};
 use crate::types::{Callsign, StreamId};
 use crate::validator::Diagnostic;
@@ -95,6 +95,15 @@ impl<P: Protocol, S: ClientState> Driver for Session<P, S> {
         peer: SocketAddr,
         bytes: &[u8],
     ) -> Result<(), Self::Error> {
+        if peer != self.peer() {
+            tracing::debug!(
+                expected = %self.peer(),
+                actual = %peer,
+                bytes_len = bytes.len(),
+                "ignoring datagram from unexpected peer"
+            );
+            return Ok(());
+        }
         self.inner.handle_input(now, peer, bytes)
     }
 
@@ -351,7 +360,7 @@ impl<P: Protocol> Session<P, Connected> {
     pub fn send_header(
         &mut self,
         now: Instant,
-        header: &DStarHeader,
+        header: &DstarHeader,
         stream_id: StreamId,
     ) -> Result<(), Error> {
         self.inner.enqueue_send_header(now, header, stream_id)
@@ -500,6 +509,31 @@ mod tests {
     }
 
     #[test]
+    fn dextra_connect_ignores_ack_from_unexpected_peer() -> TestResult {
+        let now = Instant::now();
+        let session = new_dextra_configured();
+        let mut connecting = session.connect(now)?;
+        assert!(
+            connecting.poll_transmit(now).is_some(),
+            "LINK transmit ready"
+        );
+
+        let mut ack_buf = [0_u8; 16];
+        let n = encode_connect_ack(&mut ack_buf, &cs(*b"W1AW    "), Module::C)?;
+        let unexpected = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39999);
+        connecting.handle_input(now, unexpected, ack_buf.get(..n).ok_or("slice")?)?;
+
+        assert_eq!(connecting.state_kind(), ClientStateKind::Connecting);
+        assert!(
+            connecting.poll_event().is_none(),
+            "foreign ACK must not emit Connected"
+        );
+        connecting.handle_input(now, ADDR, ack_buf.get(..n).ok_or("slice")?)?;
+        assert_eq!(connecting.state_kind(), ClientStateKind::Connected);
+        Ok(())
+    }
+
+    #[test]
     fn dextra_promote_fails_if_still_connecting() -> TestResult {
         let now = Instant::now();
         let session = new_dextra_configured();
@@ -547,8 +581,8 @@ mod tests {
 
     use crate::types::Suffix;
 
-    const fn test_header() -> DStarHeader {
-        DStarHeader {
+    const fn test_header() -> DstarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,

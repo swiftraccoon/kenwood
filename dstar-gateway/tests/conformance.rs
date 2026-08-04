@@ -36,7 +36,7 @@ use pcap_parser::traits::PcapReaderIterator;
 use pcap_parser::{LegacyPcapReader, PcapBlockOwned, PcapError};
 
 use dstar_gateway as _;
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 use thiserror as _;
 use tokio as _;

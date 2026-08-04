@@ -142,7 +142,7 @@ mod tests {
         // Synthesized sentence for W1AW at 35.5N 82.55W
         let sentence = "$$CRC0000,W1AW    *>APDPRS,DSTAR*:!3530.00N/08233.00W#/Asheville test";
         let report = parse_dprs(sentence)?;
-        assert_eq!(report.callsign.as_str().trim(), "W1AW");
+        assert_eq!(report.callsign.text(), Ok("W1AW"));
         assert!((report.latitude.degrees() - 35.5).abs() < 0.001);
         assert!((report.longitude.degrees() - (-82.55)).abs() < 0.001);
         assert_eq!(report.symbol, '/');

@@ -20,7 +20,7 @@ real reflectors and is ready for a published release.
 - **Workspace foundation**: three-crate workspace, shared `types`
   module with `Callsign`, `Module`, `ReflectorCallsign`,
   `StreamId`, `Suffix`, `BandLetter`, `ProtocolKind`, and the
-  `DStarHeader` struct with CRC-CCITT validation.
+  `DstarHeader` struct with CRC-CCITT validation.
 - **DPlus codec**: full wire-format encode/decode for the DPlus
   (REF port 20001) protocol. Covers LINK1, LINK1_ACK, LINK2,
   OKRW, NAK, keepalive, voice header, voice data, EOT, and the
@@ -83,11 +83,10 @@ real reflectors and is ready for a published release.
   dead addresses don't burn the overall connect budget.
 - **`blocking` feature**: caller-driven synchronous shell using
   `std::net::UdpSocket`; callers do not need to run a tokio runtime.
-- **`hosts-fetcher` feature**: pulls `reqwest`; fetches the XLX
-  reflector directory from
-  `http://xlxapi.rlx.lu/api.php?do=GetReflectorHostname` over HTTP
-  via `HostsFetcher::fetch_xlx_directory`, returning
-  protocol-tagged host entries.
+- **`insecure-plaintext-xlx-directory` feature**: pulls `reqwest` and exposes
+  the explicitly named `InsecurePlaintextXlxDirectoryFetcher`. Its
+  `fetch_over_plaintext_http` method contacts the XLX registry's HTTP-only
+  endpoint. Responses have no confidentiality, authenticity, or integrity.
 - **Loopback integration tests**: full tokio shell +
   `FakeReflector` UDP harness exercising connect → voice → EOT
   → disconnect round trips for all three protocols.

@@ -9,8 +9,9 @@ use super::parser::DprsReport;
 /// Encode a `DprsReport` into a DPRS sentence with a correct
 /// `$$CRC<hex>` checksum.
 ///
-/// The output `String` is cleared first, then written in place. The
-/// CRC is computed over the sentence body (everything after the
+/// On success, the output `String` is replaced with the encoded sentence; on
+/// error, it is left unchanged. The CRC is computed over the sentence body
+/// (everything after the
 /// comma following `$$CRC<hex>`) using [`super::compute_crc`]:
 /// CRC-CCITT with reflected polynomial `0x8408`, initial value
 /// `0xFFFF`, final `~accumulator`, matching the ircDDBGateway
@@ -18,8 +19,10 @@ use super::parser::DprsReport;
 ///
 /// # Errors
 ///
-/// Returns [`DprsError::MalformedCoordinates`] if the report's lat/lon
-/// values can't be formatted. This should not happen with validated
+/// Returns [`DprsError::InvalidCallsign`] if a receive-side callsign contains
+/// bytes that cannot be represented in the ASCII DPRS sentence, or
+/// [`DprsError::MalformedCoordinates`] if the report's lat/lon values can't
+/// be formatted. The latter should not happen with validated
 /// [`super::coordinates::Latitude`] / [`super::coordinates::Longitude`]
 /// newtypes.
 ///
@@ -34,13 +37,24 @@ pub fn encode_dprs(report: &DprsReport, out: &mut String) -> Result<(), DprsErro
     // CRC prefixed.
     let mut body = String::new();
 
-    // Callsign (space-padded to 8 bytes), read straight from the
-    // wire bytes so we don't depend on `Callsign::as_str()`'s
-    // trimming behaviour.
+    // Callsign (space-padded to 8 bytes). Receive-side callsigns preserve
+    // arbitrary wire bytes, but a DPRS sentence is ASCII text; reject an
+    // invalid field instead of expanding bytes >= 0x80 into multi-byte UTF-8.
     let cs_bytes = report.callsign.as_bytes();
-    for &b in cs_bytes {
-        body.push(char::from(b));
+    let callsign = report
+        .callsign
+        .text()
+        .map_err(|_| DprsError::InvalidCallsign {
+            reason: "wire field contains a byte outside printable ASCII",
+        })?;
+    if callsign.is_empty() {
+        return Err(DprsError::InvalidCallsign {
+            reason: "wire field is empty after removing padding",
+        });
     }
+    let callsign_wire = std::str::from_utf8(cs_bytes)
+        .unwrap_or_else(|_| unreachable!("validated printable ASCII is valid UTF-8"));
+    body.push_str(callsign_wire);
 
     body.push_str("*>APDPRS,DSTAR*:!");
 
@@ -158,6 +172,24 @@ mod tests {
         assert_eq!(parsed.callsign, original.callsign);
         assert!((parsed.latitude.degrees() - original.latitude.degrees()).abs() < 0.001);
         assert!((parsed.longitude.degrees() - original.longitude.degrees()).abs() < 0.001);
+        Ok(())
+    }
+
+    #[test]
+    fn encode_rejects_non_ascii_receive_callsign_without_utf8_expansion() -> TestResult {
+        let report = DprsReport {
+            callsign: Callsign::from_wire_bytes([b'W', b'1', 0x80, b'W', b' ', b' ', b' ', b' ']),
+            latitude: Latitude::try_new(35.5)?,
+            longitude: Longitude::try_new(-82.55)?,
+            symbol: '/',
+            comment: None,
+        };
+        let mut encoded = String::from("unchanged until call");
+        assert!(matches!(
+            encode_dprs(&report, &mut encoded),
+            Err(DprsError::InvalidCallsign { .. })
+        ));
+        assert_eq!(encoded, "unchanged until call");
         Ok(())
     }
 }

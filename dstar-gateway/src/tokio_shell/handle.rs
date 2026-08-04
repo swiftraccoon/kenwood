@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Instant;
 
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::client::{Connected, Event, Protocol, Session};
 use dstar_gateway_core::types::StreamId;
 use dstar_gateway_core::voice::VoiceFrame;
@@ -155,7 +155,7 @@ impl<P: Protocol> AsyncSession<P> {
     /// discarded. Either way the session state remains consistent.
     pub async fn send_header(
         &mut self,
-        header: DStarHeader,
+        header: DstarHeader,
         stream_id: StreamId,
     ) -> Result<(), ShellError> {
         let (tx, rx) = tokio::sync::oneshot::channel();

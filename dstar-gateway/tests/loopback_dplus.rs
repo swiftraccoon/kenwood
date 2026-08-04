@@ -6,7 +6,7 @@
 //! drive two recv/enqueue round trips on the client side before it
 //! can promote to `Connected`.
 
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
 mod common;
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use common::fake_reflector::FakeReflector;
 use dstar_gateway::tokio_shell::AsyncSession;
 use dstar_gateway_core::codec::dplus::HostList;
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{
     Authenticated, ClientStateKind, Configured, Connecting, DPlus, Session,
@@ -101,7 +101,7 @@ async fn dplus_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std::
     let mut async_session = AsyncSession::spawn(connected, Arc::clone(&client_sock));
 
     // 6. Send a voice header + 5 voice data frames + EOT.
-    let header = DStarHeader {
+    let header = DstarHeader {
         flag1: 0,
         flag2: 0,
         flag3: 0,

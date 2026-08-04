@@ -11,17 +11,18 @@
 //! reference receive-path pattern this type mirrors.
 
 use super::type_error::TypeError;
+use super::wire_text::{WireTextError, diagnostic_wire_bytes, trimmed_printable_ascii};
 
 /// D-STAR callsign (8 bytes, ASCII, space-padded on the right).
 ///
 /// # Invariants
 ///
-/// - Constructed via [`Self::try_from_str`]: ASCII, 1..=8 bytes after
-///   trimming trailing whitespace, space-padded to exactly 8 bytes.
+/// - Constructed via [`Self::try_from_str`]: printable ASCII, 1..=8 bytes after
+///   removing trailing ASCII-space padding, then padded to exactly 8 bytes.
 /// - Constructed via [`Self::from_wire_bytes`]: any 8 bytes,
 ///   verbatim. Used on the receive path where real reflectors emit
 ///   non-printable bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[doc(alias = "call-sign")]
 #[doc(alias = "operator")]
 pub struct Callsign([u8; 8]);
@@ -29,14 +30,15 @@ pub struct Callsign([u8; 8]);
 impl Callsign {
     /// Try to build a `Callsign` from a string slice.
     ///
-    /// - Must be ASCII
-    /// - Must be 1..=8 bytes (trailing whitespace is trimmed before
-    ///   length check, then space-padded to exactly 8 bytes)
+    /// - Must be printable ASCII
+    /// - Must be 1..=8 bytes (trailing ASCII spaces are removed before the
+    ///   length check, then restored as fixed-width padding)
     ///
     /// # Errors
     ///
     /// Returns [`TypeError::InvalidCallsign`] if `s` is empty, longer
-    /// than 8 bytes after trimming, or contains non-ASCII characters.
+    /// than 8 bytes after padding removal, or contains a byte outside
+    /// printable ASCII.
     ///
     /// # Example
     ///
@@ -47,7 +49,7 @@ impl Callsign {
     /// # Ok::<(), dstar_gateway_core::TypeError>(())
     /// ```
     pub fn try_from_str(s: &str) -> Result<Self, TypeError> {
-        let trimmed = s.trim_end();
+        let trimmed = s.trim_end_matches(' ');
         if trimmed.is_empty() {
             return Err(TypeError::InvalidCallsign { reason: "empty" });
         }
@@ -56,9 +58,9 @@ impl Callsign {
                 reason: "longer than 8 bytes",
             });
         }
-        if !trimmed.is_ascii() {
+        if !trimmed.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
             return Err(TypeError::InvalidCallsign {
-                reason: "non-ASCII character",
+                reason: "byte outside printable ASCII",
             });
         }
         let mut buf = [b' '; 8];
@@ -92,23 +94,50 @@ impl Callsign {
         &self.0
     }
 
-    /// Return the trimmed string (no trailing spaces).
+    /// Return validated protocol text without trailing space padding.
     ///
-    /// Uses lossy UTF-8 conversion via [`String::from_utf8_lossy`] so
-    /// wire bytes stored verbatim via [`Self::from_wire_bytes`] that
-    /// are not valid UTF-8 are rendered with `U+FFFD` replacement
-    /// characters rather than panicking.
+    /// The receive constructor intentionally accepts arbitrary bytes. This
+    /// method therefore validates the stored field instead of replacing
+    /// malformed bytes. [`Self::as_bytes`] always remains available for exact
+    /// inspection when validation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireTextError`] at the first byte outside printable ASCII.
+    pub fn text(&self) -> Result<&str, WireTextError> {
+        trimmed_printable_ascii(&self.0)
+    }
+
+    /// Return text for a valid callsign or an exact escaped diagnostic.
+    ///
+    /// This compatibility view never inserts Unicode replacement characters.
+    /// Use [`Self::text`] for semantic decisions, because it distinguishes
+    /// validated callsign text from malformed receive bytes.
     #[must_use]
     pub fn as_str(&self) -> std::borrow::Cow<'_, str> {
-        let end = self.0.iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
-        let slice = self.0.get(..end).unwrap_or(&[]);
-        String::from_utf8_lossy(slice)
+        self.text().map_or_else(
+            |_| std::borrow::Cow::Owned(diagnostic_wire_bytes(&self.0)),
+            std::borrow::Cow::Borrowed,
+        )
     }
 }
 
 impl std::fmt::Display for Callsign {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
+        match self.text() {
+            Ok(text) => f.write_str(text),
+            Err(_) => f.write_str(&diagnostic_wire_bytes(&self.0)),
+        }
+    }
+}
+
+impl std::fmt::Debug for Callsign {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Callsign")
+            .field("bytes", &self.0)
+            .field("text", &self.text())
+            .finish()
     }
 }
 
@@ -122,7 +151,7 @@ mod tests {
     fn callsign_accepts_w1aw() -> TestResult {
         let cs = Callsign::try_from_str("W1AW")?;
         assert_eq!(cs.as_bytes(), b"W1AW    ");
-        assert_eq!(cs.as_str(), "W1AW");
+        assert_eq!(cs.text(), Ok("W1AW"));
         Ok(())
     }
 
@@ -151,9 +180,21 @@ mod tests {
     }
 
     #[test]
+    fn callsign_rejects_control_instead_of_trimming_it() {
+        let Err(err) = Callsign::try_from_str("W1AW\n") else {
+            unreachable!("a line ending is data, not callsign padding");
+        };
+        assert!(matches!(err, TypeError::InvalidCallsign { .. }));
+    }
+
+    #[test]
     fn callsign_display_trimmed() -> TestResult {
         let cs = Callsign::try_from_str("W1AW")?;
         assert_eq!(format!("{cs}"), "W1AW");
+        assert!(
+            format!("{cs:?}").contains("W1AW"),
+            "debug output should include validated callsign text"
+        );
         Ok(())
     }
 
@@ -168,7 +209,7 @@ mod tests {
     fn callsign_from_wire_bytes_roundtrip() {
         let cs = Callsign::from_wire_bytes(*b"W1AW    ");
         assert_eq!(cs.as_bytes(), b"W1AW    ");
-        assert_eq!(cs.as_str(), "W1AW");
+        assert_eq!(cs.text(), Ok("W1AW"));
     }
 
     #[test]
@@ -180,6 +221,14 @@ mod tests {
         let bytes = [b'A', 0xC3, b'C', b' ', b' ', b' ', b' ', b' '];
         let cs = Callsign::from_wire_bytes(bytes);
         assert_eq!(cs.as_bytes(), &bytes);
+        assert_eq!(
+            cs.text(),
+            Err(WireTextError {
+                index: 1,
+                byte: 0xC3,
+            })
+        );
+        assert_eq!(cs.as_str(), "<invalid wire bytes: 41 C3 43 20 20 20 20 20>");
     }
 
     #[test]
@@ -187,5 +236,12 @@ mod tests {
         let bytes = [0x00, b'1', b'A', b'W', b' ', b' ', b' ', b' '];
         let cs = Callsign::from_wire_bytes(bytes);
         assert_eq!(cs.as_bytes(), &bytes);
+        assert_eq!(
+            cs.text(),
+            Err(WireTextError {
+                index: 0,
+                byte: 0x00,
+            })
+        );
     }
 }

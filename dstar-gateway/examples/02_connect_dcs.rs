@@ -17,7 +17,7 @@
 //! header, so `send_header` caches the header internally and
 //! `send_voice` pulls it back out on every frame.
 
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
 use std::sync::Arc;

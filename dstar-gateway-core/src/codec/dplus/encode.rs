@@ -4,7 +4,7 @@
 //! the number of bytes written. Hot-path encoding is allocation-free.
 
 use crate::error::EncodeError;
-use crate::header::DStarHeader;
+use crate::header::DstarHeader;
 use crate::types::{Callsign, StreamId};
 use crate::voice::{AMBE_SILENCE, VoiceFrame};
 
@@ -211,7 +211,7 @@ pub fn encode_link2_reply(out: &mut [u8], result: Link2Result) -> Result<usize, 
 /// - `[11..14]` 0x00 0x01 0x02 (band1/2/3)
 /// - `[14..16]` `stream_id` little-endian
 /// - `[16]` 0x80 (header indicator)
-/// - `[17..58]` `DStarHeader::encode_for_dsvt()` (flag bytes zeroed, 41 bytes)
+/// - `[17..58]` `DstarHeader::encode_for_dsvt()` (flag bytes zeroed, 41 bytes)
 ///
 /// # Errors
 ///
@@ -221,12 +221,12 @@ pub fn encode_link2_reply(out: &mut [u8], result: Link2Result) -> Result<usize, 
 ///
 /// `ircDDBGateway/Common/HeaderData.cpp:637-684` (`getDPlusData`)
 /// for the reference encoder this function mirrors. The
-/// `DStarHeader::encode_for_dsvt` helper mirrors the same file's
+/// `DstarHeader::encode_for_dsvt` helper mirrors the same file's
 /// CRC logic.
 pub fn encode_voice_header(
     out: &mut [u8],
     stream_id: StreamId,
-    header: &DStarHeader,
+    header: &DstarHeader,
 ) -> Result<usize, EncodeError> {
     const LEN: usize = 58;
     if out.len() < LEN {
@@ -440,8 +440,8 @@ mod tests {
         StreamId::new(n).unwrap()
     }
 
-    fn test_header() -> DStarHeader {
-        DStarHeader {
+    fn test_header() -> DstarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,

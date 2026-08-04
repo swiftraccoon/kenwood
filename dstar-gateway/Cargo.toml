@@ -36,7 +36,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 [features]
 default = []
 blocking = []
-hosts-fetcher = ["dep:reqwest"]
+# Explicit opt-in to an XLX registry endpoint that supports plaintext HTTP
+# only. Data returned by this feature has no authenticity or integrity.
+insecure-plaintext-xlx-directory = ["dep:reqwest"]
 # Opt-in live-reflector integration tests. Requires a reachable
 # reflector (see `tests/hardware.rs`). Off by default so normal
 # `cargo test` runs do not reach out to the network. Enable with

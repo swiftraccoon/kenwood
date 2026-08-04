@@ -32,7 +32,7 @@ use crate::codec::dplus::{
     encode_poll_echo as dplus_encode_poll_echo, encode_unlink_ack,
 };
 use crate::error::{Error, ProtocolError};
-use crate::header::DStarHeader;
+use crate::header::DstarHeader;
 use crate::session::client::Protocol;
 use crate::session::driver::Transmit;
 use crate::session::outbox::{OutboundPacket, Outbox};
@@ -95,7 +95,7 @@ enum RawServerEvent {
     StreamStarted {
         peer: SocketAddr,
         stream_id: StreamId,
-        header: DStarHeader,
+        header: DstarHeader,
     },
     StreamFrame {
         peer: SocketAddr,
@@ -348,7 +348,7 @@ impl ServerSessionCore {
         Ok(())
     }
 
-    fn on_dextra_voice_header(&mut self, stream_id: StreamId, header: DStarHeader) {
+    fn on_dextra_voice_header(&mut self, stream_id: StreamId, header: DstarHeader) {
         if self.state != InternalState::Linked {
             return;
         }
@@ -531,7 +531,7 @@ impl ServerSessionCore {
         Ok(())
     }
 
-    fn on_dplus_voice_header(&mut self, stream_id: StreamId, header: DStarHeader) {
+    fn on_dplus_voice_header(&mut self, stream_id: StreamId, header: DstarHeader) {
         if self.state != InternalState::Linked {
             return;
         }
@@ -673,7 +673,7 @@ impl ServerSessionCore {
 
     fn on_dcs_voice(
         &mut self,
-        header: DStarHeader,
+        header: DstarHeader,
         stream_id: StreamId,
         seq: u8,
         frame: VoiceFrame,
@@ -789,7 +789,7 @@ mod tests {
         encode_link1, encode_link2, encode_poll as dplus_encode_poll,
         encode_unlink as dplus_encode_unlink,
     };
-    use crate::header::DStarHeader;
+    use crate::header::DstarHeader;
     use crate::session::client::{DExtra, DPlus, Dcs};
     use crate::types::{Callsign, Module, StreamId, Suffix};
     use crate::voice::VoiceFrame;
@@ -806,8 +806,8 @@ mod tests {
         Callsign::from_wire_bytes(bytes)
     }
 
-    const fn test_header(my: [u8; 8]) -> DStarHeader {
-        DStarHeader {
+    const fn test_header(my: [u8; 8]) -> DstarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,

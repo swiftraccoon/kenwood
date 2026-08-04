@@ -6,62 +6,49 @@
 //!
 //! Reference: `ircDDBGateway/Common/SlowDataEncoder.cpp`.
 
-use super::scrambler::scramble;
-
-/// Number of text blocks in a complete message.
-const TEXT_BLOCK_COUNT: u8 = 4;
-
-/// Characters per text block.
-const TEXT_CHARS_PER_BLOCK: usize = 5;
-
-/// Upper nibble of a text-block type byte.
-const TEXT_BLOCK_TYPE: u8 = 0x40;
-
-/// Fixed message length in characters (4 blocks × 5 chars).
-const MAX_MESSAGE_LEN: usize = TEXT_BLOCK_COUNT as usize * TEXT_CHARS_PER_BLOCK;
+use super::{SlowDataTextMessage, scrambler::scramble};
 
 /// Encode a text message into eight scrambled 3-byte slow-data payloads.
 ///
-/// The output is always exactly 8 payloads (4 blocks × 2 halves) for
-/// any non-empty input. Empty input returns an empty vector.
-///
-/// Messages longer than 20 characters are truncated; shorter messages
-/// are right-padded with ASCII spaces.
+/// Construction of [`SlowDataTextMessage`] proves that the input is exactly
+/// 20 wire bytes containing printable ASCII plus right-side space padding.
+/// The output is therefore always exactly eight payloads (four blocks × two
+/// halves), with no encoder-side truncation or replacement.
 #[must_use]
-pub fn encode_text_message(text: &str) -> Vec<[u8; 3]> {
-    if text.is_empty() {
-        return Vec::new();
-    }
+pub const fn encode_text_message(message: SlowDataTextMessage) -> [[u8; 3]; 8] {
+    let [
+        b0,
+        b1,
+        b2,
+        b3,
+        b4,
+        b5,
+        b6,
+        b7,
+        b8,
+        b9,
+        b10,
+        b11,
+        b12,
+        b13,
+        b14,
+        b15,
+        b16,
+        b17,
+        b18,
+        b19,
+    ] = message.into_bytes();
 
-    let bytes = text.as_bytes();
-    let len = bytes.len().min(MAX_MESSAGE_LEN);
-
-    let mut padded = [b' '; MAX_MESSAGE_LEN];
-    if let (Some(dst), Some(src)) = (padded.get_mut(..len), bytes.get(..len)) {
-        dst.copy_from_slice(src);
-    }
-
-    let mut out = Vec::with_capacity(8);
-    for block_index in 0u8..TEXT_BLOCK_COUNT {
-        let start = usize::from(block_index) * TEXT_CHARS_PER_BLOCK;
-        let end = start + TEXT_CHARS_PER_BLOCK;
-
-        let mut block = [0u8; 6];
-        block[0] = TEXT_BLOCK_TYPE | block_index;
-        let Some(chars) = padded.get(start..end) else {
-            continue;
-        };
-        let Some(block_chars) = block.get_mut(1..=TEXT_CHARS_PER_BLOCK) else {
-            continue;
-        };
-        block_chars.copy_from_slice(chars);
-
-        let half1 = scramble([block[0], block[1], block[2]]);
-        let half2 = scramble([block[3], block[4], block[5]]);
-        out.push(half1);
-        out.push(half2);
-    }
-    out
+    [
+        scramble([0x40, b0, b1]),
+        scramble([b2, b3, b4]),
+        scramble([0x41, b5, b6]),
+        scramble([b7, b8, b9]),
+        scramble([0x42, b10, b11]),
+        scramble([b12, b13, b14]),
+        scramble([0x43, b15, b16]),
+        scramble([b17, b18, b19]),
+    ]
 }
 
 #[cfg(test)]
@@ -73,13 +60,20 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn empty_input_returns_empty_vec() {
-        assert!(encode_text_message("").is_empty());
+    fn empty_text_is_an_explicit_all_space_message() -> TestResult {
+        let out = encode_text_message(SlowDataTextMessage::try_from_text("")?);
+        let mut collector = SlowDataTextCollector::new();
+        for (index, fragment) in (1u8..).zip(out) {
+            collector.push(fragment, index);
+        }
+        let message = collector.take_message().ok_or("complete")?;
+        assert_eq!(message.as_bytes(), b"                    ");
+        Ok(())
     }
 
     #[test]
     fn short_input_pads_with_spaces() -> TestResult {
-        let out = encode_text_message("Hi");
+        let out = encode_text_message(SlowDataTextMessage::try_from_text("Hi")?);
         assert_eq!(out.len(), 8);
 
         let mut c = SlowDataTextCollector::new();
@@ -87,45 +81,35 @@ mod tests {
             c.push(*h, idx);
         }
         let msg = c.take_message().ok_or("complete")?;
-        assert_eq!(&msg[..], b"Hi                  ");
+        assert_eq!(msg.as_bytes(), b"Hi                  ");
         Ok(())
     }
 
     #[test]
     fn exactly_20_chars_roundtrip() -> TestResult {
-        let out = encode_text_message("ABCDEFGHIJKLMNOPQRST");
+        let out = encode_text_message(SlowDataTextMessage::try_from_text("ABCDEFGHIJKLMNOPQRST")?);
         let mut c = SlowDataTextCollector::new();
         for (idx, h) in (1u8..).zip(out.iter()) {
             c.push(*h, idx);
         }
         let msg = c.take_message().ok_or("complete")?;
-        assert_eq!(&msg[..], b"ABCDEFGHIJKLMNOPQRST");
+        assert_eq!(msg.as_bytes(), b"ABCDEFGHIJKLMNOPQRST");
         Ok(())
     }
 
     #[test]
-    fn long_input_truncates_to_20() -> TestResult {
-        let out = encode_text_message("1234567890ABCDEFGHIJKLMN");
-        let mut c = SlowDataTextCollector::new();
-        for (idx, h) in (1u8..).zip(out.iter()) {
-            c.push(*h, idx);
-        }
-        let msg = c.take_message().ok_or("complete")?;
-        assert_eq!(&msg[..], b"1234567890ABCDEFGHIJ");
-        Ok(())
-    }
-
-    #[test]
-    fn output_is_always_eight_payloads() {
+    fn output_is_always_eight_payloads() -> TestResult {
         for text in &["A", "Hello", "Hello world", "X".repeat(20).as_str()] {
-            let out = encode_text_message(text);
+            let message = SlowDataTextMessage::try_from_text(text)?;
+            let out = encode_text_message(message);
             assert_eq!(out.len(), 8, "text = {text:?}");
         }
+        Ok(())
     }
 
     #[test]
     fn descramble_reveals_block_index_and_text_chars() -> TestResult {
-        let out = encode_text_message("ABCDEFGHIJKLMNOPQRST");
+        let out = encode_text_message(SlowDataTextMessage::try_from_text("ABCDEFGHIJKLMNOPQRST")?);
         for block in 0u8..4 {
             let half1 = *out
                 .get(usize::from(block) * 2)

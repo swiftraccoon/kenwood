@@ -1,9 +1,8 @@
 //! D-STAR slow-data text-message collector.
 //!
 //! Assembles four 5-character text blocks into a complete 20-character
-//! message. Unlike [`SlowDataAssembler`], which treats the low nibble
-//! of the type byte as a variable payload length, this collector uses
-//! the fixed-block-index protocol defined in
+//! message. This collector specializes the fixed-block-index protocol
+//! also recognized by [`SlowDataAssembler`], as defined in
 //! `ircDDBGateway/Common/TextCollector.cpp`:
 //!
 //! - Type byte high nibble `0x4` identifies a text block.
@@ -23,6 +22,7 @@
 //! [`SlowDataAssembler`]: super::SlowDataAssembler
 
 use super::scrambler::descramble;
+use super::text::{SlowDataText, SlowDataTextMessage};
 
 /// Fixed block count in a complete text message.
 const TEXT_BLOCK_COUNT: u8 = 4;
@@ -153,14 +153,14 @@ impl SlowDataTextCollector {
                 self.block_buffer[0], self.block_buffer[1], self.block_buffer[2],
                 self.block_buffer[3], self.block_buffer[4], self.block_buffer[5]
             ),
-            chars = format_args!("{:?}", String::from_utf8_lossy(src)),
+            chars = ?SlowDataText::from_wire_bytes(src.to_vec()).text(),
             "text block accepted"
         );
     }
 
     /// Return the complete 20-char message if all four blocks have been seen.
     #[must_use]
-    pub fn message(&self) -> Option<[u8; MAX_MESSAGE_LEN]> {
+    pub fn message(&self) -> Option<SlowDataTextMessage> {
         if self.seen_mask != 0b1111 {
             return None;
         }
@@ -171,11 +171,11 @@ impl SlowDataTextCollector {
             let dst = out.get_mut(start..end)?;
             dst.copy_from_slice(slot);
         }
-        Some(out)
+        Some(SlowDataTextMessage::from_wire_bytes(out))
     }
 
     /// Consume the complete message and rearm the collector.
-    pub fn take_message(&mut self) -> Option<[u8; MAX_MESSAGE_LEN]> {
+    pub fn take_message(&mut self) -> Option<SlowDataTextMessage> {
         let msg = self.message()?;
         self.rearm();
         Some(msg)
@@ -227,7 +227,7 @@ mod tests {
             ],
         );
         let msg = c.take_message().ok_or("complete message")?;
-        assert_eq!(&msg[..], b"CQ working          ");
+        assert_eq!(msg.as_bytes(), b"CQ working          ");
         Ok(())
     }
 
@@ -248,7 +248,7 @@ mod tests {
             ],
         );
         let msg = c.take_message().ok_or("complete message")?;
-        assert_eq!(&msg[..], b"AAAAABBBBBCCCCCDDDDD");
+        assert_eq!(msg.as_bytes(), b"AAAAABBBBBCCCCCDDDDD");
         Ok(())
     }
 
@@ -312,7 +312,7 @@ mod tests {
             ],
         );
         let msg = c.take_message().ok_or("message after resync")?;
-        assert_eq!(&msg[..], b"HI!!!               ");
+        assert_eq!(msg.as_bytes(), b"HI!!!               ");
         Ok(())
     }
 
@@ -365,7 +365,7 @@ mod tests {
             ],
         );
         let taken = c.take_message().ok_or("message ready")?;
-        assert_eq!(&taken[..], b"Hello world         ");
+        assert_eq!(taken.as_bytes(), b"Hello world         ");
         assert!(c.message().is_none());
         Ok(())
     }

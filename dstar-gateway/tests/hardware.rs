@@ -37,7 +37,7 @@
 
 #![cfg(feature = "hardware-tests")]
 
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
 use std::net::SocketAddr;
@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use dstar_gateway::auth::AuthClient;
 use dstar_gateway::tokio_shell::AsyncSession;
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{
     Authenticated, ClientStateKind, Configured, Connecting, DExtra, DPlus, Dcs, Session,
@@ -102,15 +102,15 @@ async fn resolve_peer(host: &str, port: u16) -> Result<SocketAddr, Box<dyn std::
         .ok_or_else(|| format!("reflector host {target} resolved to zero addresses").into())
 }
 
-/// Build a well-formed `DStarHeader` with the given reflector callsign
+/// Build a well-formed `DstarHeader` with the given reflector callsign
 /// prefix (e.g., `"REF030"`) and local callsign. Pattern matches the
 /// loopback tests in `loopback_dplus.rs`.
 fn build_header(
     reflector_callsign: &str,
     reflector_module: char,
     my_call: Callsign,
-) -> Result<DStarHeader, Box<dyn std::error::Error>> {
-    Ok(DStarHeader::for_relay(
+) -> Result<DstarHeader, Box<dyn std::error::Error>> {
+    Ok(DstarHeader::for_relay(
         my_call,
         Module::B,
         Callsign::try_from_str(reflector_callsign)?,

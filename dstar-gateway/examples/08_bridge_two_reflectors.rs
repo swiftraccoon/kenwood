@@ -24,7 +24,7 @@
 //!     --features examples-network
 //! ```
 
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
 use std::env;
@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dstar_gateway::tokio_shell::AsyncSession;
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{
     ClientStateKind, Configured, Connected, DExtra, Event, Session,
@@ -163,7 +163,7 @@ async fn forward(
         Event::VoiceStart {
             stream_id, header, ..
         } => {
-            let mut outbound_header = DStarHeader::for_relay(
+            let mut outbound_header = DstarHeader::for_relay(
                 route.operator,
                 route.local_module,
                 route.reflector,

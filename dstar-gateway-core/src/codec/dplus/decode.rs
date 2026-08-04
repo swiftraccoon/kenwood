@@ -8,7 +8,7 @@
 //! supplied sink but still return a parsed packet. Only fatal errors
 //! (wrong length, missing magic, zero stream id) return `Err`.
 
-use crate::header::{DStarHeader, ENCODED_LEN};
+use crate::header::{DstarHeader, ENCODED_LEN};
 use crate::types::{Callsign, ProtocolKind, StreamId};
 use crate::validator::{Diagnostic, DiagnosticSink};
 use crate::voice::VoiceFrame;
@@ -207,7 +207,7 @@ fn decode_dsvt_client(
 
 type DsvtParse = (
     StreamId,
-    Option<DStarHeader>,
+    Option<DstarHeader>,
     Option<VoiceFrame>,
     bool,
     bool,
@@ -241,7 +241,7 @@ fn parse_dsvt_common(bytes: &[u8], sink: &mut dyn DiagnosticSink) -> Result<Dsvt
             .ok_or(DPlusError::UnknownPacketLength { got: len })?;
         let mut arr = [0u8; ENCODED_LEN];
         arr.copy_from_slice(hdr_slice);
-        let decoded = DStarHeader::decode(&arr);
+        let decoded = DstarHeader::decode(&arr);
         // Lenient: diagnose non-zero flag bytes but still return the header.
         if decoded.flag1 != 0 || decoded.flag2 != 0 || decoded.flag3 != 0 {
             sink.record(Diagnostic::HeaderFlagsNonZero {
@@ -301,8 +301,8 @@ mod tests {
         StreamId::new(n).unwrap()
     }
 
-    fn test_header() -> DStarHeader {
-        DStarHeader {
+    fn test_header() -> DstarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,

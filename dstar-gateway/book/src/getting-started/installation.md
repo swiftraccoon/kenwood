@@ -17,7 +17,7 @@ This gets you the default feature set: the tokio-backed
 `AsyncSession<P>`, the DPlus `AuthClient`, and all three codecs.
 
 `dstar-gateway` re-exports the core's leaf types (`Callsign`,
-`Module`, `DStarHeader`, `VoiceFrame`, `Error`, …) from its crate
+`Module`, `DstarHeader`, `VoiceFrame`, `Error`, …) from its crate
 root, so simple programs need only this one dependency. The typestate
 session machinery (`Session`, `Driver`, the `Configured` /
 `Connected` state markers, and the `DPlus` / `DExtra` / `Dcs`
@@ -29,7 +29,7 @@ core directly, add `dstar-gateway-core` as an explicit dependency.
 | Feature | Default? | What it enables |
 |---------|----------|-----------------|
 | `blocking` | off | Compiles a caller-driven synchronous shell under `dstar_gateway::blocking_shell`. It uses `std::net::UdpSocket` and does not run a tokio runtime, although tokio remains a dependency of the async crate. |
-| `hosts-fetcher` | off | Pulls `reqwest` and enables `dstar_gateway::hosts_fetcher::HostsFetcher`, which fetches the XLX reflector directory (http://xlxapi.rlx.lu) over HTTP via `HostsFetcher::fetch_xlx_directory`. |
+| `insecure-plaintext-xlx-directory` | off | Pulls `reqwest` and exposes `dstar_gateway::insecure_plaintext_xlx_directory::InsecurePlaintextXlxDirectoryFetcher`. Its `fetch_over_plaintext_http` method contacts the HTTP-only XLX registry without confidentiality, authenticity, or integrity. |
 | `examples-network` | off | Compiles examples that contact live network services; intended for repository development. |
 | `hardware-tests` | off | Compiles ignored live-reflector integration tests; intended for repository development. |
 
@@ -37,7 +37,7 @@ To enable both:
 
 ```toml
 [dependencies]
-dstar-gateway = { git = "https://github.com/swiftraccoon/kenwood", branch = "main", features = ["blocking", "hosts-fetcher"] }
+dstar-gateway = { git = "https://github.com/swiftraccoon/kenwood", branch = "main", features = ["blocking", "insecure-plaintext-xlx-directory"] }
 ```
 
 ## MSRV

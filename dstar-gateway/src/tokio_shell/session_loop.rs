@@ -135,6 +135,16 @@ impl<P: Protocol> SessionLoop<P> {
                             }));
                         }
                     };
+                    if peer != self.session.peer() {
+                        tracing::debug!(
+                            target: "dstar_gateway::tokio_shell",
+                            expected = %self.session.peer(),
+                            actual = %peer,
+                            bytes_len = n,
+                            "ignoring UDP datagram from unexpected peer"
+                        );
+                        continue;
+                    }
                     // Refresh the peer-activity watch for link-health
                     // consumers. Send only fails when every receiver
                     // is gone, which is harmless here.

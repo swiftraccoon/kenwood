@@ -20,7 +20,7 @@
 //!     --features examples-network
 //! ```
 
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
 use std::collections::HashMap;
@@ -118,17 +118,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ev = async_session.next_event() => {
                 let Some(event) = ev else { break };
                 match event {
-                    Event::VoiceFrame { stream_id, frame, .. } => {
+                    Event::VoiceFrame { stream_id, seq, frame } => {
                         let asm = assemblers.entry(stream_id).or_default();
-                        if let Some(block) = asm.push(frame.slow_data) {
+                        if let Some(block) = asm.push(frame.slow_data, seq) {
                             // Only GPS blocks carry DPRS sentences; other
                             // kinds (text, header retx, squelch) are logged
                             // at debug level but not parsed further.
                             match block {
                                 SlowDataBlock::Gps(sentence) => {
-                                    match parse_dprs(&sentence) {
-                                        Ok(report) => log_report(&report),
-                                        Err(e) => tracing::debug!(?e, sentence, "dprs parse failed"),
+                                    match std::str::from_utf8(&sentence) {
+                                        Ok(sentence_text) => match parse_dprs(sentence_text) {
+                                            Ok(report) => log_report(&report),
+                                            Err(e) => tracing::debug!(?e, ?sentence, "dprs parse failed"),
+                                        },
+                                        Err(e) => tracing::debug!(?e, ?sentence, "non-UTF-8 GPS slow data"),
                                     }
                                 }
                                 other => tracing::debug!(?other, "non-gps slow data block"),

@@ -35,7 +35,7 @@ pub const ENCODED_LEN: usize = 41;
 
 /// D-STAR radio header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DStarHeader {
+pub struct DstarHeader {
     /// Control flag byte 1.
     pub flag1: u8,
     /// Reserved flag byte 2.
@@ -54,7 +54,7 @@ pub struct DStarHeader {
     pub my_suffix: Suffix,
 }
 
-impl DStarHeader {
+impl DstarHeader {
     /// Encode the header into 41 bytes with CRC.
     #[must_use]
     pub fn encode(&self) -> [u8; ENCODED_LEN] {
@@ -245,8 +245,8 @@ mod tests {
         Callsign::from_wire_bytes(bytes)
     }
 
-    fn test_header() -> DStarHeader {
-        DStarHeader {
+    fn test_header() -> DstarHeader {
+        DstarHeader {
             flag1: 0x00,
             flag2: 0x00,
             flag3: 0x00,
@@ -263,7 +263,7 @@ mod tests {
         let header = test_header();
         let encoded = header.encode();
         assert_eq!(encoded.len(), ENCODED_LEN);
-        let decoded = DStarHeader::decode(&encoded);
+        let decoded = DstarHeader::decode(&encoded);
         assert_eq!(decoded, header);
     }
 
@@ -277,7 +277,7 @@ mod tests {
         if let Some(byte) = encoded.get_mut(40) {
             *byte ^= 0xFF;
         }
-        let decoded = DStarHeader::decode(&encoded);
+        let decoded = DstarHeader::decode(&encoded);
         assert_eq!(decoded.my_call, header.my_call);
     }
 
@@ -290,13 +290,13 @@ mod tests {
         if let Some(byte) = encoded.get_mut(27) {
             *byte = 0xC3;
         }
-        let decoded = DStarHeader::decode(&encoded);
+        let decoded = DstarHeader::decode(&encoded);
         assert_eq!(decoded.my_call.as_bytes()[0], 0xC3);
     }
 
     #[test]
     fn encode_for_dsvt_zeros_flag_bytes_before_crc() {
-        let hdr = DStarHeader {
+        let hdr = DstarHeader {
             flag1: 0xAA,
             flag2: 0xBB,
             flag3: 0xCC,
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn for_relay_rpt1_carries_local_module_byte() {
-        let header = DStarHeader::for_relay(
+        let header = DstarHeader::for_relay(
             Callsign::from_wire_bytes(*b"W1AW    "),
             Module::C,
             Callsign::from_wire_bytes(*b"REF030  "),
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn for_relay_rpt2_carries_reflector_module_byte() {
-        let header = DStarHeader::for_relay(
+        let header = DstarHeader::for_relay(
             Callsign::from_wire_bytes(*b"W1AW    "),
             Module::C,
             Callsign::from_wire_bytes(*b"REF030  "),
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn for_relay_ur_call_is_cqcqcq() {
-        let header = DStarHeader::for_relay(
+        let header = DstarHeader::for_relay(
             Callsign::from_wire_bytes(*b"W1AW    "),
             Module::C,
             Callsign::from_wire_bytes(*b"REF030  "),
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn for_relay_zeroes_flag_bytes() {
-        let header = DStarHeader::for_relay(
+        let header = DstarHeader::for_relay(
             Callsign::from_wire_bytes(*b"W1AW    "),
             Module::C,
             Callsign::from_wire_bytes(*b"REF030  "),
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn for_relay_passes_through_my_call_and_suffix() {
-        let header = DStarHeader::for_relay(
+        let header = DstarHeader::for_relay(
             Callsign::from_wire_bytes(*b"GATEWAY "),
             Module::C,
             Callsign::from_wire_bytes(*b"REF030  "),
@@ -433,7 +433,7 @@ mod tests {
         // 7 bytes feed rpt1; byte 7 is reserved for the module letter.
         // (Real callsigns are ≤6 chars so this only matters for
         // adversarial inputs, but the invariant must hold.)
-        let header = DStarHeader::for_relay(
+        let header = DstarHeader::for_relay(
             Callsign::from_wire_bytes(*b"OPERATOR"),
             Module::A,
             Callsign::from_wire_bytes(*b"REFCALLR"),
@@ -449,12 +449,12 @@ mod tests {
 
     #[test]
     fn suffix_roundtrip_nonempty() {
-        let hdr = DStarHeader {
+        let hdr = DstarHeader {
             my_suffix: Suffix::from_wire_bytes(*b"ECHO"),
             ..test_header()
         };
         let encoded = hdr.encode();
-        let decoded = DStarHeader::decode(&encoded);
+        let decoded = DstarHeader::decode(&encoded);
         assert_eq!(decoded.my_suffix.as_bytes(), b"ECHO");
     }
 }

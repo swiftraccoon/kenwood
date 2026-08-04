@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::codec::{dcs, dextra, dplus};
 use crate::error::{DcsError, Error, ProtocolError, StateError};
-use crate::header::DStarHeader;
+use crate::header::DstarHeader;
 use crate::session::driver::Transmit;
 use crate::session::outbox::{OutboundPacket, Outbox};
 use crate::session::timer_wheel::TimerWheel;
@@ -94,7 +94,7 @@ enum RawEvent {
         /// D-STAR stream id.
         stream_id: StreamId,
         /// Decoded D-STAR header.
-        header: DStarHeader,
+        header: DstarHeader,
     },
     /// Voice data frame within an active stream.
     VoiceFrame {
@@ -172,7 +172,7 @@ pub struct SessionCore {
     /// `DPlus` and `DExtra` do not embed the header in voice frames,
     /// so the cache is not consulted on those protocols; it is still
     /// populated for symmetry and future header retransmit support.
-    cached_tx_header: Option<DStarHeader>,
+    cached_tx_header: Option<DstarHeader>,
     /// Stream id of the currently-active incoming voice stream, or
     /// `None` when no stream is active.
     ///
@@ -268,7 +268,7 @@ impl SessionCore {
     /// stream before the new `VoiceStart`. That covers the case where a
     /// new talker takes the module mid-flight without an EOT from
     /// the previous one.
-    fn emit_voice_start_if_new(&mut self, now: Instant, stream_id: StreamId, header: DStarHeader) {
+    fn emit_voice_start_if_new(&mut self, now: Instant, stream_id: StreamId, header: DstarHeader) {
         match self.active_rx_stream {
             Some(current) if current == stream_id => {
                 tracing::trace!(
@@ -677,7 +677,7 @@ impl SessionCore {
     pub fn enqueue_send_header(
         &mut self,
         now: Instant,
-        header: &DStarHeader,
+        header: &DstarHeader,
         stream_id: StreamId,
     ) -> Result<(), Error> {
         if self.state != ClientStateKind::Connected {
@@ -1888,7 +1888,7 @@ mod tests {
     // ── Voice TX / RX ────────────────────────────────────────
 
     use crate::error::DcsError;
-    use crate::header::DStarHeader;
+    use crate::header::DstarHeader;
     use crate::types::{StreamId, Suffix};
     use crate::voice::VoiceFrame;
 
@@ -1904,8 +1904,8 @@ mod tests {
         StreamId::new(n).unwrap()
     }
 
-    const fn test_header() -> DStarHeader {
-        DStarHeader {
+    const fn test_header() -> DstarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,

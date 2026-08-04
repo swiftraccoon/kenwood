@@ -7,7 +7,7 @@
 //! `UdpSocket`. The paired [`FakeReflector`] replies to the 11-byte
 //! LINK and records every datagram the shell emits.
 
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
 mod common;
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use common::fake_reflector::FakeReflector;
 use dstar_gateway::tokio_shell::AsyncSession;
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{ClientStateKind, Configured, DExtra, Event, Session};
 use dstar_gateway_core::types::{Callsign, Module, StreamId, Suffix};
@@ -76,7 +76,7 @@ async fn dextra_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std:
     let mut async_session = AsyncSession::spawn(connected, Arc::clone(&client_sock));
 
     // 6. Send a voice header + 5 voice data frames + EOT.
-    let header = DStarHeader {
+    let header = DstarHeader {
         flag1: 0,
         flag2: 0,
         flag3: 0,
@@ -178,8 +178,8 @@ async fn dextra_async_session_observes_connected_event() -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// The activity watch must advance when a datagram arrives from the
-/// reflector after the session task is spawned.
+/// The activity watch must ignore foreign-source datagrams and advance
+/// only when a datagram arrives from the configured reflector.
 #[tokio::test]
 async fn activity_watch_updates_on_inbound_datagram() -> Result<(), Box<dyn std::error::Error>> {
     let fake = FakeReflector::spawn_dextra().await?;
@@ -206,8 +206,24 @@ async fn activity_watch_updates_on_inbound_datagram() -> Result<(), Box<dyn std:
     let mut activity = async_session.activity();
     let before = *activity.borrow_and_update();
 
+    let foreign = UdpSocket::bind("127.0.0.1:0").await?;
+    let _ = foreign
+        .send_to(b"spoofed activity", client_sock.local_addr()?)
+        .await?;
+    assert!(
+        timeout(Duration::from_millis(250), activity.changed())
+            .await
+            .is_err(),
+        "foreign datagram must not refresh peer activity"
+    );
+    assert_eq!(
+        *activity.borrow(),
+        before,
+        "foreign datagram must leave the activity instant unchanged"
+    );
+
     // A DExtra keepalive from the reflector: 8-char callsign + NUL.
-    // Any inbound datagram must refresh the activity instant.
+    // A datagram from the configured peer must refresh the activity instant.
     fake.send_to_peer(b"XRF030  \0").await?;
 
     timeout(Duration::from_secs(2), activity.changed()).await??;

@@ -4,7 +4,7 @@
 //! the number of bytes written. Hot-path encoding is allocation-free.
 
 use crate::error::EncodeError;
-use crate::header::DStarHeader;
+use crate::header::DstarHeader;
 use crate::types::{Callsign, Module, StreamId};
 use crate::voice::{AMBE_SILENCE, DSTAR_SYNC_BYTES, VoiceFrame};
 
@@ -168,7 +168,7 @@ pub fn encode_poll_echo(out: &mut [u8], callsign: &Callsign) -> Result<usize, En
 /// - `[9..12]`: `0x00 0x01 0x02` (band1/band2/band3)
 /// - `[12..14]`: `stream_id` little-endian
 /// - `[14]`: `0x80` (header indicator)
-/// - `[15..56]`: [`DStarHeader::encode_for_dsvt`] (41 bytes: 3 zero flag
+/// - `[15..56]`: [`DstarHeader::encode_for_dsvt`] (41 bytes: 3 zero flag
 ///   bytes + RPT2 + RPT1 + YOUR + MY + `MY_SUFFIX` + CRC)
 ///
 /// # Errors
@@ -183,7 +183,7 @@ pub fn encode_poll_echo(out: &mut [u8], callsign: &Callsign) -> Result<usize, En
 pub fn encode_voice_header(
     out: &mut [u8],
     stream_id: StreamId,
-    header: &DStarHeader,
+    header: &DstarHeader,
 ) -> Result<usize, EncodeError> {
     if out.len() < VOICE_HEADER_LEN {
         return Err(EncodeError::BufferTooSmall {
@@ -496,8 +496,8 @@ mod tests {
         StreamId::new(n).unwrap()
     }
 
-    const fn test_header() -> DStarHeader {
-        DStarHeader {
+    const fn test_header() -> DstarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,

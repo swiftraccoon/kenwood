@@ -22,7 +22,7 @@ use tokio::sync::watch;
 use dstar_gateway_core::codec::dextra::{
     encode_connect_link, encode_voice_data, encode_voice_eot, encode_voice_header,
 };
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::client::DExtra;
 use dstar_gateway_core::types::{Callsign, Module, ProtocolKind, StreamId, Suffix};
 use dstar_gateway_core::voice::VoiceFrame;
@@ -46,8 +46,8 @@ const fn sid() -> StreamId {
     }
 }
 
-const fn header_for(my: [u8; 8]) -> DStarHeader {
-    DStarHeader {
+const fn header_for(my: [u8; 8]) -> DstarHeader {
+    DstarHeader {
         flag1: 0,
         flag2: 0,
         flag3: 0,
@@ -106,6 +106,7 @@ async fn three_clients_fan_out_voice_without_echo() -> Result<(), Box<dyn std::e
             keepalive_interval: Duration::from_secs(3600),
             ..EndpointSettings::default()
         },
+        std::collections::HashSet::from([Module::C]),
     ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let endpoint_task = {

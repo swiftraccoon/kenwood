@@ -10,7 +10,7 @@ use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 
-use crate::header::DStarHeader;
+use crate::header::DstarHeader;
 use crate::types::StreamId;
 use crate::validator::Diagnostic;
 use crate::voice::VoiceFrame;
@@ -53,7 +53,7 @@ pub enum Event<P: Protocol> {
         /// Stream id.
         stream_id: StreamId,
         /// Decoded D-STAR header.
-        header: DStarHeader,
+        header: DstarHeader,
         /// Diagnostics observed during header parsing.
         diagnostics: Vec<Diagnostic>,
     },

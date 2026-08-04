@@ -13,14 +13,14 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::types::StreamId;
 
 /// Cached state for one active voice stream on one module.
 #[derive(Debug, Clone)]
 pub struct StreamCache {
     stream_id: StreamId,
-    header: DStarHeader,
+    header: DstarHeader,
     /// Raw wire-format bytes of the voice header packet, cached for
     /// 21-frame retransmit. Populated when the endpoint observes a
     /// fresh voice header; re-sent verbatim on each cadence tick.
@@ -40,7 +40,7 @@ impl StreamCache {
     #[must_use]
     pub const fn new(
         stream_id: StreamId,
-        header: DStarHeader,
+        header: DstarHeader,
         from: SocketAddr,
         now: Instant,
     ) -> Self {
@@ -64,7 +64,7 @@ impl StreamCache {
     #[must_use]
     pub const fn new_with_bytes(
         stream_id: StreamId,
-        header: DStarHeader,
+        header: DstarHeader,
         header_bytes: Vec<u8>,
         from: SocketAddr,
         now: Instant,
@@ -116,7 +116,7 @@ impl StreamCache {
 
     /// The cached voice header.
     #[must_use]
-    pub const fn header(&self) -> &DStarHeader {
+    pub const fn header(&self) -> &DstarHeader {
         &self.header
     }
 
@@ -148,7 +148,7 @@ impl StreamCache {
 #[cfg(test)]
 mod tests {
     use super::{Duration, Instant, SocketAddr, StreamCache, StreamId};
-    use dstar_gateway_core::header::DStarHeader;
+    use dstar_gateway_core::header::DstarHeader;
     use dstar_gateway_core::types::{Callsign, Suffix};
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -158,8 +158,8 @@ mod tests {
         PEER
     }
 
-    fn header() -> DStarHeader {
-        DStarHeader {
+    fn header() -> DstarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,

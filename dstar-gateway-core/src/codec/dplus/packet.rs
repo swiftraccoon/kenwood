@@ -5,7 +5,7 @@
 //! sends to a client. The codec is symmetric; both directions are
 //! first-class.
 
-use crate::header::DStarHeader;
+use crate::header::DstarHeader;
 use crate::types::{Callsign, StreamId};
 use crate::voice::VoiceFrame;
 
@@ -33,7 +33,7 @@ pub enum ClientPacket {
         /// D-STAR stream id.
         stream_id: StreamId,
         /// Decoded D-STAR header (lenient; bytes preserved verbatim).
-        header: DStarHeader,
+        header: DstarHeader,
     },
 
     /// 29-byte voice data (DSVT framed).
@@ -85,7 +85,7 @@ pub enum ServerPacket {
         /// D-STAR stream id.
         stream_id: StreamId,
         /// Decoded D-STAR header.
-        header: DStarHeader,
+        header: DstarHeader,
     },
 
     /// 29-byte voice data.
@@ -137,7 +137,7 @@ mod tests {
         let cs = Callsign::from_wire_bytes(*b"W1AW    ");
         let p = ClientPacket::Link2 { callsign: cs };
         assert!(
-            matches!(&p, ClientPacket::Link2 { callsign } if callsign.as_str() == "W1AW"),
+            matches!(&p, ClientPacket::Link2 { callsign } if callsign.text() == Ok("W1AW")),
             "expected Link2 with W1AW, got {p:?}"
         );
     }

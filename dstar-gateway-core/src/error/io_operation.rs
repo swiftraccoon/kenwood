@@ -20,8 +20,8 @@ pub enum IoOperation {
     TcpAuthWrite,
     /// Reading from the `DPlus` auth TCP stream.
     TcpAuthRead,
-    /// HTTP GET for the host file fetcher.
-    HostsFetcherHttpGet,
+    /// Explicitly insecure plaintext HTTP GET for the XLX directory.
+    InsecurePlaintextXlxDirectoryHttpGet,
 }
 
 #[cfg(test)]

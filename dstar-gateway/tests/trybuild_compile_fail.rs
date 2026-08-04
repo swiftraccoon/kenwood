@@ -15,7 +15,7 @@
 use dstar_gateway as _;
 use dstar_gateway_core as _;
 use pcap_parser as _;
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 use thiserror as _;
 use tokio as _;

@@ -7,7 +7,7 @@
 //! spawn a session loop: the typestate `.promote()` call fails
 //! because the session is in `Closed`, not `Connected`.
 
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
 mod common;

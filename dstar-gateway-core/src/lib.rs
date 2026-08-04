@@ -31,7 +31,7 @@ pub use error::{
     DExtraError, DPlusError, DcsError, EncodeError, Error, IoOperation, ProtocolError, StateError,
     TimeoutError,
 };
-pub use header::{DStarHeader, ENCODED_LEN, crc_ccitt};
+pub use header::{DstarHeader, ENCODED_LEN, crc_ccitt};
 pub use hosts::{HostEntry, HostFile};
 pub use session::client::{
     AnySession, Authenticated, ClientState, ClientStateKind, Closed, Configured, Connected,
@@ -44,10 +44,12 @@ pub use session::server::{
 pub use session::{Driver, Transmit};
 pub use slowdata::{
     MAX_MESSAGE_LEN, SlowDataAssembler, SlowDataBlock, SlowDataBlockKind, SlowDataError,
-    SlowDataText, SlowDataTextCollector, descramble, encode_text_message, scramble,
+    SlowDataText, SlowDataTextCollector, SlowDataTextMessage, SlowDataTextMessageError, descramble,
+    encode_text_message, scramble,
 };
 pub use types::{
     BandLetter, Callsign, Module, ProtocolKind, ReflectorCallsign, StreamId, Suffix, TypeError,
+    WireTextError,
 };
 pub use validator::{
     AuthHostSkipReason, CallsignField, Diagnostic, DiagnosticSink, NullSink, TracingSink, VecSink,

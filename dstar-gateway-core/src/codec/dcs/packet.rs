@@ -5,7 +5,7 @@
 //! to a client. The codec is symmetric; both directions are
 //! first-class.
 
-use crate::header::DStarHeader;
+use crate::header::DstarHeader;
 use crate::types::{Callsign, Module, StreamId};
 use crate::voice::VoiceFrame;
 
@@ -48,7 +48,7 @@ pub enum ClientPacket {
     /// 100-byte voice frame (header + AMBE + slow data all embedded).
     Voice {
         /// Decoded D-STAR header embedded at bytes `[4..43]`.
-        header: DStarHeader,
+        header: DstarHeader,
         /// D-STAR stream id.
         stream_id: StreamId,
         /// Frame sequence number.
@@ -91,7 +91,7 @@ pub enum ServerPacket {
     /// 100-byte voice frame forwarded to a connected client.
     Voice {
         /// Decoded D-STAR header embedded at bytes `[4..43]`.
-        header: DStarHeader,
+        header: DstarHeader,
         /// D-STAR stream id.
         stream_id: StreamId,
         /// Frame sequence number.

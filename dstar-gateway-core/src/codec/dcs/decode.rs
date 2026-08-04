@@ -9,7 +9,7 @@
 //! (wrong length, missing magic, zero stream id, invalid module byte)
 //! return `Err`.
 
-use crate::header::DStarHeader;
+use crate::header::DstarHeader;
 use crate::types::{Callsign, Module, ProtocolKind, StreamId, Suffix};
 use crate::validator::{Diagnostic, DiagnosticSink};
 use crate::voice::VoiceFrame;
@@ -242,7 +242,7 @@ fn decode_server_voice(
 fn parse_voice(
     bytes: &[u8],
     sink: &mut dyn DiagnosticSink,
-) -> Result<(DStarHeader, StreamId, u8, VoiceFrame, bool), DcsError> {
+) -> Result<(DstarHeader, StreamId, u8, VoiceFrame, bool), DcsError> {
     // Magic check at [0..4].
     let magic = bytes
         .get(..4)
@@ -299,15 +299,15 @@ fn parse_voice(
     Ok((header, stream_id, seq, frame, is_end))
 }
 
-/// Extract a `DStarHeader` from the embedded `[4..43]` region of a
+/// Extract a `DstarHeader` from the embedded `[4..43]` region of a
 /// DCS voice packet.
 ///
 /// DCS stores the header fields starting at offset 4 with a layout
-/// that differs from [`DStarHeader::encode`]'s default 41-byte
+/// that differs from [`DstarHeader::encode`]'s default 41-byte
 /// encoding: the flag bytes are at offsets 4/5/6 and the suffix is
 /// at offsets 39..43 (no CRC). Build the struct manually from the
 /// field positions.
-fn decode_dcs_header_from_voice(bytes: &[u8]) -> DStarHeader {
+fn decode_dcs_header_from_voice(bytes: &[u8]) -> DstarHeader {
     let flag1 = bytes.get(4).copied().unwrap_or(0);
     let flag2 = bytes.get(5).copied().unwrap_or(0);
     let flag3 = bytes.get(6).copied().unwrap_or(0);
@@ -333,7 +333,7 @@ fn decode_dcs_header_from_voice(bytes: &[u8]) -> DStarHeader {
         sfx.copy_from_slice(src);
     }
 
-    DStarHeader {
+    DstarHeader {
         flag1,
         flag2,
         flag3,
@@ -369,8 +369,8 @@ mod tests {
         StreamId::new(n).unwrap()
     }
 
-    fn test_header() -> DStarHeader {
-        DStarHeader {
+    fn test_header() -> DstarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,
@@ -761,7 +761,7 @@ mod tests {
     fn voice_flag_bytes_non_zero_raises_diagnostic() -> TestResult {
         use crate::validator::VecSink;
 
-        let header = DStarHeader {
+        let header = DstarHeader {
             flag1: 0xAA,
             ..test_header()
         };

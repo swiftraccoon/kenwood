@@ -40,9 +40,10 @@ are the places to go.
   `send_header` / `send_voice` / `send_eot` / `disconnect` /
   `next_event` methods. Also contains the DPlus TCP `AuthClient`,
   the optional `blocking` feature (a caller-driven synchronous
-  shell for CLI scripts), and the optional `hosts-fetcher`
-  feature (pulls `reqwest` and fetches the XLX reflector
-  directory over HTTP).
+  shell for CLI scripts), and the optional
+  `insecure-plaintext-xlx-directory` feature. That feature's name is a
+  deliberate warning: the XLX registry supports plaintext HTTP only, so
+  returned addresses have no authenticity or integrity guarantee.
 - **`dstar-gateway-server`**: the reflector server. Provides the
   `Reflector` type, the `ClientPool<P>`, the `fan_out_voice`
   function, the `ClientAuthorizer` trait, and an optional

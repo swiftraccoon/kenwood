@@ -25,10 +25,10 @@
 //!   under the `blocking_shell` module. Its caller-driven API uses
 //!   `std::net::UdpSocket` and does not require running a tokio runtime;
 //!   tokio remains an unconditional dependency of this async crate.
-//! - `hosts-fetcher`: pulls `reqwest` for fetching the XLX reflector
-//!   directory under the `hosts_fetcher` module. Disabled by default so
-//!   the crate stays dependency-light for consumers who don't need
-//!   HTTP.
+//! - `insecure-plaintext-xlx-directory`: pulls `reqwest` and exposes
+//!   `insecure_plaintext_xlx_directory` for an explicit fetch from the XLX
+//!   registry's HTTP-only endpoint. The response has no transport
+//!   confidentiality, authenticity, or integrity. Disabled by default.
 //!
 //! # Core re-exports
 //!
@@ -42,8 +42,8 @@ pub mod tokio_shell;
 #[cfg(feature = "blocking")]
 pub mod blocking_shell;
 
-#[cfg(feature = "hosts-fetcher")]
-pub mod hosts_fetcher;
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
+pub mod insecure_plaintext_xlx_directory;
 
 // Re-export the core's leaf types so simple consumers need only this
 // crate. The typestate session machinery (`Session`, `Driver`, the
@@ -51,7 +51,7 @@ pub mod hosts_fetcher;
 // driving the sans-io core directly requires an explicit
 // `dstar-gateway-core` dependency.
 pub use dstar_gateway_core::{
-    AMBE_SILENCE, BandLetter, Callsign, DSTAR_SYNC_BYTES, DStarHeader, Error, HostEntry, HostFile,
+    AMBE_SILENCE, BandLetter, Callsign, DSTAR_SYNC_BYTES, DstarHeader, Error, HostEntry, HostFile,
     Module, ProtocolKind, ReflectorCallsign, StreamId, Suffix, TypeError, VoiceFrame,
 };
 

@@ -21,7 +21,7 @@
 //!     --features "examples-network blocking"
 //! ```
 
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
 use std::env;

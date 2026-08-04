@@ -18,7 +18,7 @@
 //! attaches an empty `HostList` as a placeholder, mirroring the
 //! `tests/loopback_dplus.rs` integration test.
 
-#[cfg(feature = "hosts-fetcher")]
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
 use std::sync::Arc;
