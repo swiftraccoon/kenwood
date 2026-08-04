@@ -54,6 +54,8 @@ jobs:
             <p>Other crates in this workspace:
               <a href="thd75_tui/">thd75-tui</a>,
               <a href="thd75_repl/">thd75-repl</a>,
+              <a href="thd75_listen/">thd75-listen</a>,
+              <a href="if_dsp/">if-dsp</a>,
               <a href="kiss_tnc/">kiss-tnc</a>,
               <a href="ax25_codec/">ax25-codec</a>,
               <a href="aprs/">aprs</a>,
@@ -67,9 +69,11 @@ jobs:
               <a href="mmdvm_core/">mmdvm-core</a>,
               <a href="mmdvm/">mmdvm</a>,
               <a href="mbelib_rs/">mbelib-rs</a>,
+              <a href="mcp_d75_extract/">mcp-d75-extract</a>,
               <a href="sextant/">sextant</a>,
               <a href="stargazer/">stargazer</a>,
-              <a href="lodestar_core/">lodestar-core</a>.
+              <a href="lodestar_core/">lodestar-core</a>,
+              <a href="azimuth_core/">azimuth-core</a>.
             </p>
           </body>
           </html>
