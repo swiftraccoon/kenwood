@@ -2,8 +2,8 @@
 //!
 //! Contains the CAT setup, 12 kHz `ADC stream IN` capture, `if-dsp`
 //! demodulation, playback, and accessible prompt pipeline. A connected-radio
-//! session currently stops at its initial frequency request because the
-//! library's direct FO/FQ writer fails closed before I/O.
+//! session starts only when Band B is already at the requested frequency;
+//! the library intentionally exposes no arbitrary CAT frequency writer.
 //!
 //! Design notes:
 //! - No `tokio::signal`: Ctrl-C arrives as a rustyline interrupt and
@@ -13,8 +13,8 @@
 //!   `AtomicU32` float bits; overruns/underruns are counters plus a
 //!   once-per-session announcement.
 //! - Every radio setting that may be touched is saved first. Exit performs a
-//!   best-effort restore and reports each failed field; frequency restoration
-//!   remains unavailable under the same direct-write quarantine.
+//!   best-effort restore and reports each failed field. Frequency is never
+//!   written, so exit verifies that it still matches the saved value.
 
 // The accessibility-lint dev-dependency is used by the library's unit
 // tests; the bin's test build links dev-deps too.
@@ -30,7 +30,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use if_dsp::{Channelizer, ChannelizerConfig, DemodMode};
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::{Band, DetectOutputMode, Frequency};
+use kenwood_thd75::types::Band;
 use thd75_listen::parser::{self, Command};
 use thd75_listen::{output, session};
 
@@ -228,10 +228,10 @@ fn run() -> Result<(), String> {
     let transport = {
         let _reactor = rt.enter();
         let port = find_serial_port(args.port)?;
-        SerialTransport::open(&port, 115_200).map_err(|e| format!("opening {port}: {e}"))?
+        SerialTransport::open(&port).map_err(|e| format!("opening {port}: {e}"))?
     };
     let mut radio = rt
-        .block_on(Radio::connect_safe(transport))
+        .block_on(Radio::connect_with_tnc_exit(transport))
         .map_err(|e| format!("connecting: {e}"))?;
     let _info = rt
         .block_on(radio.identify())
@@ -243,16 +243,38 @@ fn run() -> Result<(), String> {
 
     // Every path from here restores the radio before returning.
     let result = run_session(&rt, &mut radio, &input_dev, &output_dev, args.freq_hz);
-    let report = rt.block_on(session::restore(&mut radio, saved));
-    if report.failed.is_empty() {
-        println!("{}", output::goodbye());
+    let recovery_error = if radio.cat_recovery_required() {
+        rt.block_on(radio.recover_cat()).err()
     } else {
-        for item in report.failed {
-            println!("{}", output::restore_warning(item));
+        None
+    };
+
+    if recovery_error.is_none() {
+        let report = rt.block_on(session::restore(&mut radio, saved));
+        if report.failed.is_empty() {
+            println!("{}", output::goodbye());
+        } else {
+            for item in report.failed {
+                println!("{}", output::restore_warning(item));
+            }
         }
+    } else {
+        println!(
+            "{}",
+            output::restore_warning("all radio settings because CAT recovery failed")
+        );
     }
     drop(rt.block_on(radio.disconnect()));
-    result
+    match (result, recovery_error) {
+        (Ok(()), None) => Ok(()),
+        (Err(error), None) => Err(error),
+        (Ok(()), Some(recovery)) => Err(format!(
+            "CAT recovery failed before radio-state restoration: {recovery}"
+        )),
+        (Err(error), Some(recovery)) => Err(format!(
+            "{error}; CAT recovery also failed before radio-state restoration: {recovery}"
+        )),
+    }
 }
 
 /// Configure the radio, start the audio pipeline, and run the prompt
@@ -271,13 +293,15 @@ fn run_session(
     output_dev: &cpal::Device,
     freq_hz: u32,
 ) -> Result<(), String> {
-    // Tune BEFORE engaging IF output: the radio rejects FO frequency
-    // writes with "not available in current mode" while IO = IF is
-    // active (hardware-verified). configure_for_listening ends with
-    // the IF engage, so the initial tune must precede it, and the
-    // tune command toggles IF off and back on around each retune.
-    rt.block_on(radio.tune_frequency(Band::B, Frequency::new(freq_hz)))
-        .map_err(|e| format!("initial tune: {e}"))?;
+    let initial_frequency = rt
+        .block_on(radio.get_frequency(Band::B))
+        .map_err(|e| format!("reading initial Band-B frequency: {e}"))?;
+    if initial_frequency.as_hz() != freq_hz {
+        return Err(format!(
+            "Band B is at {} Hz, not {freq_hz} Hz; tune the radio directly before starting because arbitrary CAT frequency writes are not qualified",
+            initial_frequency.as_hz()
+        ));
+    }
     rt.block_on(session::configure_for_listening(radio))?;
 
     let shared = Arc::new(SharedAudio {
@@ -506,27 +530,19 @@ fn run_session(
     Ok(())
 }
 
-/// Attempt to retune with the IF toggle.
-///
-/// The radio rejects FO frequency writes while `IO = IF` is engaged
-/// (hardware-verified), so drop to AF, tune, re-engage IF, and verify
-/// the re-engage by readback. The audio pauses for the toggle. The direct tune
-/// currently fails before I/O; this function still restores IF and returns the
-/// safety error.
+/// Verify that Band B is already on the requested frequency.
 async fn retune(radio: &mut Radio<SerialTransport>, hz: u32) -> Result<(), String> {
-    radio
-        .set_io_port(DetectOutputMode::Af)
+    let current = radio
+        .get_frequency(Band::B)
         .await
-        .map_err(|e| format!("pausing IF output: {e}"))?;
-    let tuned = radio.tune_frequency(Band::B, Frequency::new(hz)).await;
-    let back = radio.set_io_port(DetectOutputMode::If).await;
-    let verified = matches!(radio.get_io_port().await, Ok(DetectOutputMode::If));
-    tuned.map_err(|e| e.to_string())?;
-    back.map_err(|e| format!("resuming IF output: {e}"))?;
-    if verified {
+        .map_err(|e| format!("reading Band-B frequency: {e}"))?;
+    if current.as_hz() == hz {
         Ok(())
     } else {
-        Err("IF output did not re-engage after tuning".to_owned())
+        Err(format!(
+            "Band B is at {} Hz, not {hz} Hz; tune the radio directly because arbitrary CAT frequency writes are not qualified",
+            current.as_hz()
+        ))
     }
 }
 
