@@ -6,14 +6,13 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use kenwood_thd75::types::SMeterReading;
 
-use crate::app::{App, BandState, InputMode, Pane};
+use crate::app::{App, BandState, Pane};
 
 /// Render a band panel (A or B) into the given area.
 ///
 /// Displays frequency, mode, power, squelch, busy/RX indicator,
-/// S-meter bar, step size, and attenuator state. When the pane is
-/// focused and in frequency input mode, an additional input prompt
-/// line is shown. Returns early for non-band panes.
+/// S-meter bar, step size, and attenuator state. Returns early for non-band
+/// panes.
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>, area: Rect, pane: Pane) {
     let (title, band) = match pane {
         Pane::BandA => (" Band A ", &app.state.band_a),
@@ -26,24 +25,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, area: Rect, pane: Pane) {
         .borders(Borders::ALL)
         .border_style(super::border_style(app, pane));
 
-    let mut lines = band_lines(band);
-
-    // Show frequency input prompt when active on this pane
-    if app.focus == pane
-        && let InputMode::FreqInput(ref buf) = app.input_mode
-    {
-        lines.push(Line::from(vec![
-            Span::styled("  Freq: ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                format!("{buf}▎ MHz"),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-    }
-
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(band_lines(band)).block(block), area);
 }
 
 /// Build the 4-line display for a band panel:
@@ -79,7 +61,7 @@ fn band_lines(band: &BandState) -> Vec<Line<'static>> {
         Span::raw("  "),
         Span::styled("Sq:", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{}", band.squelch.as_u8()),
+            format!("{}", band.squelch.as_raw()),
             Style::default().fg(Color::Yellow),
         ),
         Span::raw("  "),
@@ -111,7 +93,7 @@ fn s_meter_line(reading: SMeterReading) -> Line<'static> {
     let label = reading.s_unit(); // e.g. "S0", "S3", "S9"
     // Use the raw-to-S-unit mapping for the bar width:
     // raw 0→S0, 1→S1, 2→S3, 3→S5, 4→S7, 5→S9
-    let s_unit: u8 = match reading.as_u8() {
+    let s_unit: u8 = match reading.as_raw() {
         1 => 1,
         2 => 3,
         3 => 5,

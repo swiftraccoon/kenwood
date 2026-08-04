@@ -4,6 +4,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
+use kenwood_thd75::memory::{MemoryImage, SettingsValueError};
+use kenwood_thd75::types::{
+    AltitudeRainUnit, AutoPowerOff, BatterySaverInterval, DtmfPause, Language, MicSensitivity,
+    PcOutputInterface, SpeedDistanceUnit, StoredFrontPanelPfAssignment, TemperatureUnit,
+    VoiceAnnounceMode,
+};
+
 use crate::app::{App, McpState, Pane, SettingRow, cat_settings, mcp_settings};
 
 fn bool_span(b: bool) -> (String, Color) {
@@ -172,16 +179,22 @@ fn render_settings_list(
             BatteryLevel::TwoThirds => "2/3 (Green)".to_string(),
             BatteryLevel::Full => "Full (Green)".to_string(),
             BatteryLevel::Charging => "Charging".to_string(),
-            BatteryLevel::Raw5 => "State 5 (unqualified)".to_string(),
+            BatteryLevel::Unidentified5 => "State 5 (unqualified)".to_string(),
         }
     }));
     lines.push(kv(" AF Gain", &format!("{}", s.af_gain)));
     lines.push(kv(" Beep", &on_off(s.beep)));
-    lines.push(kv(" Dual Band", &on_off(s.dual_band)));
+    lines.push(kv(" Band Mode", &s.band_mode.to_string()));
     lines.push(kv(" Bluetooth", &on_off(s.bluetooth)));
     lines.push(kv(" VOX", &on_off(s.vox)));
-    lines.push(kv(" GPS", &on_off(s.gps_enabled)));
-    lines.push(kv(" Beacon", &format!("{}", s.beacon_type)));
+    lines.push(kv(
+        " GPS",
+        &s.gps_settings.map_or_else(
+            || "Unavailable".to_owned(),
+            |settings| on_off(settings.enabled()),
+        ),
+    ));
+    lines.push(kv(" Beacon", &format!("{}", s.beacon_mode)));
     lines.push(kv(
         " Fine Step",
         &s.fine_step
@@ -264,8 +277,8 @@ fn render_settings_list(
 fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
     match row {
         // --- RX (live CAT for squelch, MCP for filters) ---
-        SettingRow::SquelchA => num_span(app.state.band_a.squelch.as_u8()),
-        SettingRow::SquelchB => num_span(app.state.band_b.squelch.as_u8()),
+        SettingRow::SquelchA => num_span(app.state.band_a.squelch.as_raw()),
+        SettingRow::SquelchB => num_span(app.state.band_b.squelch.as_raw()),
         SettingRow::StepSizeA => (
             app.state
                 .band_a
@@ -304,64 +317,99 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
                 .map_or_else(|| "N/A".into(), |w| format!("{w}")),
             Color::Yellow,
         ),
-        SettingRow::SsbHighCut => mcp_num(app, |s| s.settings().ssb_high_cut()),
-        SettingRow::CwWidth => mcp_num(app, |s| s.settings().cw_width()),
-        SettingRow::AmHighCut => mcp_num(app, |s| s.settings().am_high_cut()),
+        SettingRow::SsbHighCut => mcp_str(app, |s| {
+            s.settings()
+                .ssb_high_cut()
+                .map(|value| format!("{value:?}"))
+        }),
+        SettingRow::CwWidth => mcp_str(app, |s| {
+            s.settings().cw_width().map(|value| format!("{value:?}"))
+        }),
+        SettingRow::AmHighCut => mcp_str(app, |s| {
+            s.settings().am_high_cut().map(|value| format!("{value:?}"))
+        }),
 
         // --- Scan ---
-        SettingRow::ScanResume => mcp_num(app, |s| s.settings().scan_resume()),
-        SettingRow::DigitalScanResume => mcp_num(app, |s| s.settings().digital_scan_resume()),
-        SettingRow::ScanRestartTime => mcp_num(app, |s| s.settings().scan_restart_time()),
-        SettingRow::ScanRestartCarrier => mcp_num(app, |s| s.settings().scan_restart_carrier()),
+        SettingRow::ScanResume => mcp_str(app, |s| {
+            s.settings().scan_resume().map(|value| format!("{value:?}"))
+        }),
+        SettingRow::DigitalScanResume => mcp_str(app, |s| {
+            s.settings()
+                .digital_scan_resume()
+                .map(|value| format!("{value:?}"))
+        }),
+        SettingRow::ScanRestartTime => mcp_str(app, |s| {
+            s.settings()
+                .scan_restart_time()
+                .map(|value| format!("{} s", value.as_seconds()))
+        }),
+        SettingRow::ScanRestartCarrier => mcp_str(app, |s| {
+            s.settings()
+                .scan_restart_carrier()
+                .map(|value| format!("{} s", value.as_seconds()))
+        }),
 
         // --- TX ---
         SettingRow::TimeoutTimer => mcp_str(app, |s| {
-            // 0-10 indexes the official minute table, NOT a minute count.
-            [
-                "0.5", "1.0", "1.5", "2.0", "2.5", "3.0", "3.5", "4.0", "4.5", "5.0", "10.0",
-            ]
-            .get(usize::from(s.settings().timeout_timer()))
-            .map_or_else(|| "?".into(), |minutes| format!("{minutes} min"))
+            s.settings()
+                .timeout_timer()
+                .map(|value| format!("{} s", value.as_seconds()))
         }),
         SettingRow::TxInhibit => mcp_bool(app, |s| s.settings().tx_inhibit()),
         SettingRow::BeatShift => mcp_str(app, |s| {
-            // Raw 0-7 selects beat-shift Type 1-8.
-            format!(
-                "Type {}",
-                u8::from(s.settings().beat_shift()).saturating_add(1)
-            )
+            s.settings()
+                .beat_shift()
+                .map(|value| format!("Type {}", u8::from(value) + 1))
         }),
 
         // --- VOX (gain/delay: live CAT; rest: MCP) ---
         SettingRow::VoxEnabled => bool_span(app.state.vox),
-        SettingRow::VoxGain => num_span(app.state.vox_gain.as_u8()),
+        SettingRow::VoxGain => num_span(app.state.vox_gain.as_raw()),
         SettingRow::VoxDelay => (format!("{}", app.state.vox_delay), Color::Yellow),
         SettingRow::VoxTxOnBusy => mcp_bool(app, |s| s.settings().vox_tx_on_busy()),
 
         // --- CW ---
-        SettingRow::CwPitch => mcp_num(app, |s| s.settings().cw_pitch()),
+        SettingRow::CwPitch => mcp_str(app, |s| {
+            s.settings()
+                .cw_pitch()
+                .map(|value| format!("{} Hz", value.as_hz()))
+        }),
 
         // --- DTMF ---
-        SettingRow::DtmfSpeed => mcp_num(app, |s| s.settings().dtmf_speed()),
-        SettingRow::DtmfPauseTime => mcp_num(app, |s| s.settings().dtmf_pause_time()),
+        SettingRow::DtmfSpeed => mcp_str(app, |s| {
+            s.settings().dtmf_speed().map(|value| format!("{value:?}"))
+        }),
+        SettingRow::DtmfPauseTime => mcp_str(app, |s| {
+            s.settings().dtmf_pause_time().map(|value| match value {
+                DtmfPause::Ms100 => "100 ms".to_owned(),
+                DtmfPause::Ms250 => "250 ms".to_owned(),
+                DtmfPause::Ms500 => "500 ms".to_owned(),
+                DtmfPause::Ms750 => "750 ms".to_owned(),
+                DtmfPause::Ms1000 => "1000 ms".to_owned(),
+                DtmfPause::Ms1500 => "1500 ms".to_owned(),
+                DtmfPause::Ms2000 => "2000 ms".to_owned(),
+            })
+        }),
         SettingRow::DtmfTxHold => mcp_bool(app, |s| s.settings().dtmf_tx_hold()),
 
         // --- Repeater ---
         SettingRow::RepeaterAutoOffset => mcp_bool(app, |s| s.settings().repeater_auto_offset()),
-        SettingRow::RepeaterCallKey => mcp_num(app, |s| s.settings().repeater_call_key()),
+        SettingRow::RepeaterCallKey => mcp_str(app, |s| {
+            s.settings()
+                .repeater_call_key()
+                .map(|value| format!("{value:?}"))
+        }),
 
         // --- Auxiliary ---
         SettingRow::MicSensitivity => mcp_str(app, |s| {
-            // radio.MicSensitivity is inverted versus intuition: 0=High, 2=Low.
-            // The getter clamps to 0-2.
-            match s.settings().mic_sensitivity() {
-                0 => "High".into(),
-                1 => "Medium".into(),
-                _ => "Low".into(),
-            }
+            s.settings().mic_sensitivity().map(|value| match value {
+                MicSensitivity::High => "High".to_owned(),
+                MicSensitivity::Medium => "Medium".to_owned(),
+                MicSensitivity::Low => "Low".to_owned(),
+            })
         }),
-        SettingRow::PfKey1 => mcp_num(app, |s| s.settings().pf_key1()),
-        SettingRow::PfKey2 => mcp_num(app, |s| s.settings().pf_key2()),
+        SettingRow::PfKey1 => mcp_str(app, |s| s.settings().pf_key1().map(format_pf_assignment)),
+        SettingRow::PfKey2 => mcp_str(app, |s| s.settings().pf_key2().map(format_pf_assignment)),
 
         // --- Lock (MCP) ---
         SettingRow::KeyLock => mcp_bool(app, |s| s.settings().key_lock()),
@@ -371,50 +419,84 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::AprsLockKey => mcp_bool(app, |s| s.settings().aprs_lock_key()),
 
         // --- Display (DualBand: live CAT; rest: MCP) ---
-        SettingRow::BacklightControl => mcp_num(app, |s| s.settings().backlight_control()),
-        SettingRow::BacklightTimer => mcp_num(app, |s| s.settings().backlight_timer()),
-        SettingRow::DualBand => bool_span(app.state.dual_band),
+        SettingRow::BacklightControl => mcp_str(app, |s| {
+            s.settings()
+                .backlight_control()
+                .map(|value| format!("{value:?}"))
+        }),
+        SettingRow::BacklightTimer => mcp_str(app, |s| {
+            s.settings()
+                .backlight_timer()
+                .map(|value| format!("{} s", value.as_seconds()))
+        }),
+        SettingRow::DualBand => (app.state.band_mode.to_string(), Color::Yellow),
 
         // --- Audio ---
-        SettingRow::EmrVolumeLevel => mcp_num(app, |s| s.settings().emr_volume_level()),
-        SettingRow::AutoMuteReturnTime => mcp_num(app, |s| s.settings().auto_mute_return_time()),
+        SettingRow::EmrVolumeLevel => mcp_num(app, |s| {
+            s.settings()
+                .emr_volume_level()
+                .map(kenwood_thd75::types::EmrVolume::as_raw)
+        }),
+        SettingRow::AutoMuteReturnTime => mcp_str(app, |s| {
+            s.settings()
+                .auto_mute_return_time()
+                .map(|value| format!("{} s", value.as_seconds()))
+        }),
         SettingRow::Announce => mcp_str(app, |s| {
-            // radio.VoiceAnnounce mode selector; the getter clamps to 0-3.
-            match s.settings().announce() {
-                0 => "Off".into(),
-                1 => "Manual".into(),
-                2 => "Auto1".into(),
-                _ => "Auto2".into(),
-            }
+            s.settings().announce().map(|value| match value {
+                VoiceAnnounceMode::Off => "Off".to_owned(),
+                VoiceAnnounceMode::Manual => "Manual".to_owned(),
+                VoiceAnnounceMode::Auto1 => "Auto1".to_owned(),
+                VoiceAnnounceMode::Auto2 => "Auto2".to_owned(),
+            })
         }),
         SettingRow::KeyBeep => mcp_bool(app, |s| s.settings().key_beep()),
-        SettingRow::BeepVolume => mcp_num(app, |s| s.settings().beep_volume()),
-        SettingRow::VoiceVolume => mcp_num(app, |s| s.settings().voice_volume()),
-        SettingRow::VoiceSpeed => mcp_num(app, |s| s.settings().voice_speed()),
+        SettingRow::BeepVolume => mcp_str(app, |s| {
+            s.settings().beep_volume().map(|value| {
+                value
+                    .fixed_level()
+                    .map_or_else(|| "VOL Link".to_owned(), |level| format!("Level {level}"))
+            })
+        }),
+        SettingRow::VoiceVolume => mcp_str(app, |s| {
+            s.settings().voice_volume().map(|value| {
+                value
+                    .fixed_level()
+                    .map_or_else(|| "VOL Link".to_owned(), |level| format!("Level {level}"))
+            })
+        }),
+        SettingRow::VoiceSpeed => mcp_str(app, |s| {
+            s.settings()
+                .voice_speed()
+                .map(|value| format!("Speed {}", u8::from(value) + 1))
+        }),
         SettingRow::VolumeLock => mcp_bool(app, |s| s.settings().volume_lock()),
 
         // --- Units ---
-        SettingRow::SpeedDistanceUnit => {
-            mcp_str(app, |s| match s.settings().speed_distance_unit_raw() {
-                0 => "mph".into(),
-                1 => "km/h".into(),
-                2 => "knots".into(),
-                v => format!("{v}"),
-            })
-        }
+        SettingRow::SpeedDistanceUnit => mcp_str(app, |s| {
+            s.settings()
+                .display_units()
+                .map(|units| match units.speed_distance {
+                    SpeedDistanceUnit::MilesPerHour => "mph".to_owned(),
+                    SpeedDistanceUnit::KilometersPerHour => "km/h".to_owned(),
+                    SpeedDistanceUnit::Knots => "knots".to_owned(),
+                })
+        }),
         SettingRow::AltitudeRainUnit => mcp_str(app, |s| {
-            if s.settings().altitude_rain_unit_raw() == 0 {
-                "ft/in".into()
-            } else {
-                "m/mm".into()
-            }
+            s.settings()
+                .display_units()
+                .map(|units| match units.altitude_rain {
+                    AltitudeRainUnit::FeetInch => "ft/in".to_owned(),
+                    AltitudeRainUnit::MetersMm => "m/mm".to_owned(),
+                })
         }),
         SettingRow::TemperatureUnit => mcp_str(app, |s| {
-            if s.settings().temperature_unit_raw() == 0 {
-                "°F".into()
-            } else {
-                "°C".into()
-            }
+            s.settings()
+                .display_units()
+                .map(|units| match units.temperature {
+                    TemperatureUnit::Fahrenheit => "°F".to_owned(),
+                    TemperatureUnit::Celsius => "°C".to_owned(),
+                })
         }),
 
         // --- Bluetooth (Bluetooth: live CAT; BtAutoConnect: MCP) ---
@@ -422,34 +504,47 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::BtAutoConnect => mcp_bool(app, |s| s.settings().bt_auto_connect()),
 
         // --- Interface ---
-        SettingRow::GpsBtInterface => mcp_num(app, |s| s.settings().gps_bt_interface()),
-        SettingRow::AprsUsbMode => mcp_num(app, |s| s.settings().aprs_usb_mode()),
+        SettingRow::GpsBtInterface => mcp_str(app, |s| {
+            s.settings()
+                .gps_pc_output_interface()
+                .map(format_pc_interface)
+        }),
+        SettingRow::AprsUsbMode => mcp_str(app, |s| {
+            s.settings()
+                .aprs_pc_output_interface()
+                .map(format_pc_interface)
+        }),
 
         // --- System ---
         SettingRow::Language => mcp_str(app, |s| {
-            use kenwood_thd75::types::settings::Language;
-            match s.settings().language() {
-                Language::English => "English".into(),
-                Language::Japanese => "Japanese".into(),
-            }
+            s.settings().language().map(|value| match value {
+                Language::English => "English".to_owned(),
+                Language::Japanese => "Japanese".to_owned(),
+            })
         }),
 
         // --- Battery ---
         SettingRow::BatterySaver => mcp_str(app, |s| {
-            // radio.BatterySaver: 0=Off, 1-9 select the saver interval.
-            [
-                "Off", "0.2 s", "0.4 s", "0.6 s", "0.8 s", "1.0 s", "2.0 s", "3.0 s", "4.0 s",
-                "5.0 s",
-            ]
-            .get(usize::from(s.settings().battery_saver()))
-            .map_or_else(|| "?".into(), |interval| (*interval).into())
+            s.settings().battery_saver().map(|value| match value {
+                BatterySaverInterval::Off => "Off".to_owned(),
+                BatterySaverInterval::Seconds0_2 => "0.2 s".to_owned(),
+                BatterySaverInterval::Seconds0_4 => "0.4 s".to_owned(),
+                BatterySaverInterval::Seconds0_6 => "0.6 s".to_owned(),
+                BatterySaverInterval::Seconds0_8 => "0.8 s".to_owned(),
+                BatterySaverInterval::Seconds1 => "1.0 s".to_owned(),
+                BatterySaverInterval::Seconds2 => "2.0 s".to_owned(),
+                BatterySaverInterval::Seconds3 => "3.0 s".to_owned(),
+                BatterySaverInterval::Seconds4 => "4.0 s".to_owned(),
+                BatterySaverInterval::Seconds5 => "5.0 s".to_owned(),
+            })
         }),
-        SettingRow::AutoPowerOff => mcp_str(app, |s| match s.settings().auto_power_off_raw() {
-            0 => "Off".into(),
-            1 => "15 min".into(),
-            2 => "30 min".into(),
-            3 => "60 min".into(),
-            v => format!("{v}"),
+        SettingRow::AutoPowerOff => mcp_str(app, |s| {
+            s.settings().auto_power_off().map(|value| match value {
+                AutoPowerOff::Off => "Off".to_owned(),
+                AutoPowerOff::Min15 => "15 min".to_owned(),
+                AutoPowerOff::Min30 => "30 min".to_owned(),
+                AutoPowerOff::Min60 => "60 min".to_owned(),
+            })
         }),
 
         // --- CAT Radio Controls ---
@@ -457,61 +552,89 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::PowerB => (format!("{}", app.state.band_b.power_level), Color::Yellow),
         SettingRow::AttenuatorA => bool_span(app.state.band_a.attenuator),
         SettingRow::AttenuatorB => bool_span(app.state.band_b.attenuator),
-        SettingRow::ModeA => (format!("{}", app.state.band_a.mode), Color::Cyan),
-        SettingRow::ModeB => (format!("{}", app.state.band_b.mode), Color::Cyan),
-        SettingRow::BeaconType => (format!("{}", app.state.beacon_type), Color::Yellow),
-        SettingRow::GpsEnabled => bool_span(app.state.gps_enabled),
-        SettingRow::ScanResumeCat => (
-            app.state.scan_resume_cat.map_or_else(
-                || "? (write-only)".into(),
-                |m| match m {
-                    kenwood_thd75::types::ScanResumeMethod::TimeOperated => "Time".into(),
-                    kenwood_thd75::types::ScanResumeMethod::CarrierOperated => "Carrier".into(),
-                    kenwood_thd75::types::ScanResumeMethod::Seek => "Seek".into(),
-                },
-            ),
-            Color::Yellow,
+        SettingRow::OperatingModeA => (format!("{}", app.state.band_a.mode), Color::Cyan),
+        SettingRow::OperatingModeB => (format!("{}", app.state.band_b.mode), Color::Cyan),
+        SettingRow::BeaconMode => (format!("{}", app.state.beacon_mode), Color::Yellow),
+        SettingRow::GpsEnabled => app.state.gps_settings.map_or_else(
+            || ("Unavailable".into(), Color::DarkGray),
+            |settings| bool_span(settings.enabled()),
         ),
+        SettingRow::GpsPcOutput => app.state.gps_settings.map_or_else(
+            || ("Unavailable".into(), Color::DarkGray),
+            |settings| bool_span(settings.pc_output()),
+        ),
+        SettingRow::ScanResumeCat => ("Quarantined".into(), Color::Red),
         SettingRow::ActiveBand
-        | SettingRow::VfoMemModeA
-        | SettingRow::VfoMemModeB
+        | SettingRow::TuningModeA
+        | SettingRow::TuningModeB
         | SettingRow::FmRadio
-        | SettingRow::TncBaud
-        | SettingRow::GpsPcOutput
+        | SettingRow::PacketDataRate
         | SettingRow::AutoInfo
         | SettingRow::DstarSlot => ("?".into(), Color::DarkGray),
         SettingRow::AprsCallsign => app.state.aprs_callsign.as_ref().map_or_else(
             || ("?".into(), Color::DarkGray),
-            |callsign| (callsign.as_str().to_owned(), Color::Yellow),
+            |callsign| (callsign.to_string(), Color::Yellow),
         ),
     }
 }
 
-/// Read a boolean from the MCP image; returns ("?", `DarkGray`) if not loaded.
-fn mcp_bool(app: &App, f: impl Fn(&kenwood_thd75::memory::MemoryImage) -> bool) -> (String, Color) {
-    if let McpState::Loaded { ref image, .. } = app.mcp {
-        bool_span(f(image))
-    } else {
-        ("?".into(), Color::DarkGray)
+fn format_pf_assignment(value: StoredFrontPanelPfAssignment) -> String {
+    match value {
+        StoredFrontPanelPfAssignment::Official(function) => format!("{function:?}"),
+        StoredFrontPanelPfAssignment::OffMenu(_) => {
+            format!("Off-menu byte 0x{:02X}", value.as_raw())
+        }
     }
 }
 
-/// Read a u8 from the MCP image; returns ("?", `DarkGray`) if not loaded.
-fn mcp_num(app: &App, f: impl Fn(&kenwood_thd75::memory::MemoryImage) -> u8) -> (String, Color) {
-    if let McpState::Loaded { ref image, .. } = app.mcp {
-        num_span(f(image))
-    } else {
-        ("?".into(), Color::DarkGray)
+fn format_pc_interface(value: PcOutputInterface) -> String {
+    match value {
+        PcOutputInterface::Usb => "USB".to_owned(),
+        PcOutputInterface::Bluetooth => "Bluetooth".to_owned(),
     }
 }
 
-/// Read a string from the MCP image; returns ("?", `DarkGray`) if not loaded.
-fn mcp_str(
+/// Read a strict boolean from the MCP image. Invalid stored bytes are rendered
+/// as errors rather than being interpreted as false.
+fn mcp_bool(
     app: &App,
-    f: impl Fn(&kenwood_thd75::memory::MemoryImage) -> String,
+    f: impl Fn(&MemoryImage) -> Result<bool, SettingsValueError>,
 ) -> (String, Color) {
     if let McpState::Loaded { ref image, .. } = app.mcp {
-        (f(image), Color::Yellow)
+        match f(image) {
+            Ok(value) => bool_span(value),
+            Err(error) => (format!("Error: {error}"), Color::Red),
+        }
+    } else {
+        ("?".into(), Color::DarkGray)
+    }
+}
+
+/// Read a strict numeric value from the MCP image.
+fn mcp_num(
+    app: &App,
+    f: impl Fn(&MemoryImage) -> Result<u8, SettingsValueError>,
+) -> (String, Color) {
+    if let McpState::Loaded { ref image, .. } = app.mcp {
+        match f(image) {
+            Ok(value) => num_span(value),
+            Err(error) => (format!("Error: {error}"), Color::Red),
+        }
+    } else {
+        ("?".into(), Color::DarkGray)
+    }
+}
+
+/// Read and format a strict typed value from the MCP image.
+fn mcp_str(
+    app: &App,
+    f: impl Fn(&MemoryImage) -> Result<String, SettingsValueError>,
+) -> (String, Color) {
+    if let McpState::Loaded { ref image, .. } = app.mcp {
+        match f(image) {
+            Ok(value) => (value, Color::Yellow),
+            Err(error) => (format!("Error: {error}"), Color::Red),
+        }
     } else {
         ("?".into(), Color::DarkGray)
     }

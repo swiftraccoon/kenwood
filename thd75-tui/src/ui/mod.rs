@@ -67,7 +67,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         MainView::Aprs => {
             aprs::render(app, frame, list_area, detail_area);
         }
-        MainView::DStar => {
+        MainView::Dstar => {
             dstar::render(app, frame, list_area, detail_area);
         }
         MainView::Gps => {

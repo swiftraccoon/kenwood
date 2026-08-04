@@ -1,10 +1,18 @@
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use kenwood_thd75::memory::MemoryImage;
+use kenwood_thd75::error::ValidationError;
+use kenwood_thd75::memory::dstar::DstarReadError;
+use kenwood_thd75::memory::{MemoryError, MemoryImage};
 use kenwood_thd75::types::{
-    AfGainLevel, BatteryLevel, BeaconMode, Frequency, Mode, PowerLevel, SMeterReading,
-    SquelchLevel, VoxDelay, VoxGain,
+    AfGainLevel, AltitudeRainUnit, AmHighCut, AutoMuteReturnDelay, AutoPowerOff, BacklightControl,
+    BacklightTimer, BandMode, BatteryLevel, BatterySaverInterval, BeaconMode, BeatShift,
+    CwFilterWidth, CwPitch, DisplayUnits, DtmfPause, DtmfToneDuration, EmrVolume, Frequency,
+    FrontPanelPfFunction, GpsSettings, Language, LinkedVolumeLevel, MicSensitivity, NmeaSentences,
+    OperatingMode, PcOutputInterface, PowerLevel, RegularChannel, RepeaterCallKey, SMeterReading,
+    ScanRestartDelay, ScanResumeMethod, SpeedDistanceUnit, SquelchLevel, SsbHighCut,
+    StoredFrontPanelPfAssignment, TemperatureUnit, TransmitTimeout, VoiceAnnounceMode,
+    VoiceGuideSpeed, VoxDelay, VoxGain,
 };
 
 /// Path to the MCP cache file.
@@ -269,22 +277,22 @@ pub(crate) enum SettingRow {
     AttenuatorA,
     /// Attenuator Band B (CAT: RA).
     AttenuatorB,
-    /// Mode Band A (CAT: MD).
-    ModeA,
-    /// Mode Band B (CAT: MD).
-    ModeB,
+    /// Operating mode Band A (CAT: MD).
+    OperatingModeA,
+    /// Operating mode Band B (CAT: MD).
+    OperatingModeB,
     /// Active band A/B (CAT: BC).
     ActiveBand,
-    /// VFO/Memory mode Band A (CAT: VM).
-    VfoMemModeA,
-    /// VFO/Memory mode Band B (CAT: VM).
-    VfoMemModeB,
+    /// Tuning mode Band A (CAT: VM).
+    TuningModeA,
+    /// Tuning mode Band B (CAT: VM).
+    TuningModeB,
     /// FM Radio on/off (CAT: FR).
     FmRadio,
-    /// TNC baud rate (CAT: AS).
-    TncBaud,
-    /// Beacon type (CAT: PT).
-    BeaconType,
+    /// Packet data rate (CAT: AS).
+    PacketDataRate,
+    /// Beacon mode (CAT: PT).
+    BeaconMode,
     /// GPS enabled (CAT: GP).
     GpsEnabled,
     /// GPS PC output (CAT: GP).
@@ -295,7 +303,7 @@ pub(crate) enum SettingRow {
     AprsCallsign,
     /// D-STAR slot (CAT: DS).
     DstarSlot,
-    /// Scan resume method (CAT: SR write-only).
+    /// Unidentified stock SR operation (displayed as quarantined).
     ScanResumeCat,
 }
 
@@ -380,14 +388,14 @@ impl SettingRow {
         Self::PowerB,
         Self::AttenuatorA,
         Self::AttenuatorB,
-        Self::ModeA,
-        Self::ModeB,
+        Self::OperatingModeA,
+        Self::OperatingModeB,
         Self::ActiveBand,
-        Self::VfoMemModeA,
-        Self::VfoMemModeB,
+        Self::TuningModeA,
+        Self::TuningModeB,
         Self::FmRadio,
-        Self::TncBaud,
-        Self::BeaconType,
+        Self::PacketDataRate,
+        Self::BeaconMode,
         Self::GpsEnabled,
         Self::GpsPcOutput,
         Self::AutoInfo,
@@ -451,8 +459,8 @@ impl SettingRow {
             Self::TemperatureUnit => "Temperature Unit",
             Self::Bluetooth => "Bluetooth",
             Self::BtAutoConnect => "BT Auto Connect",
-            Self::GpsBtInterface => "GPS/BT Interface",
-            Self::AprsUsbMode => "APRS USB Mode",
+            Self::GpsBtInterface => "GPS PC Interface",
+            Self::AprsUsbMode => "APRS PC Interface",
             Self::Language => "Language",
             Self::BatterySaver => "Battery Saver",
             Self::AutoPowerOff => "Auto Power Off",
@@ -460,20 +468,20 @@ impl SettingRow {
             Self::PowerB => "Power B",
             Self::AttenuatorA => "Attenuator A",
             Self::AttenuatorB => "Attenuator B",
-            Self::ModeA => "Mode A",
-            Self::ModeB => "Mode B",
+            Self::OperatingModeA => "Mode A",
+            Self::OperatingModeB => "Mode B",
             Self::ActiveBand => "Active Band",
-            Self::VfoMemModeA => "VFO/Mem A",
-            Self::VfoMemModeB => "VFO/Mem B",
+            Self::TuningModeA => "VFO/Mem A",
+            Self::TuningModeB => "VFO/Mem B",
             Self::FmRadio => "FM Radio",
-            Self::TncBaud => "TNC Baud",
-            Self::BeaconType => "Beacon Type",
+            Self::PacketDataRate => "Packet Data Rate",
+            Self::BeaconMode => "Beacon Mode",
             Self::GpsEnabled => "GPS Enabled",
             Self::GpsPcOutput => "GPS PC Output",
             Self::AutoInfo => "Auto Info",
             Self::AprsCallsign => "APRS My Callsign",
             Self::DstarSlot => "D-STAR Slot",
-            Self::ScanResumeCat => "Scan Resume (CAT)",
+            Self::ScanResumeCat => "SR (unqualified)",
         }
     }
 
@@ -509,7 +517,6 @@ impl SettingRow {
                 | Self::SquelchB
                 | Self::StepSizeA
                 | Self::StepSizeB
-                | Self::ScanResumeCat
                 | Self::SsbHighCut
                 | Self::CwWidth
                 | Self::AmHighCut
@@ -541,17 +548,18 @@ impl SettingRow {
                 | Self::TemperatureUnit
                 | Self::GpsBtInterface
                 | Self::AprsUsbMode
+                | Self::Language
                 | Self::BatterySaver
                 | Self::AutoPowerOff
                 | Self::PowerA
                 | Self::PowerB
-                | Self::ModeA
-                | Self::ModeB
+                | Self::OperatingModeA
+                | Self::OperatingModeB
                 | Self::ActiveBand
-                | Self::VfoMemModeA
-                | Self::VfoMemModeB
-                | Self::TncBaud
-                | Self::BeaconType
+                | Self::TuningModeA
+                | Self::TuningModeB
+                | Self::PacketDataRate
+                | Self::BeaconMode
                 | Self::DstarSlot
         )
     }
@@ -577,20 +585,18 @@ impl SettingRow {
                 | Self::PowerB
                 | Self::AttenuatorA
                 | Self::AttenuatorB
-                | Self::ModeA
-                | Self::ModeB
+                | Self::OperatingModeA
+                | Self::OperatingModeB
                 | Self::ActiveBand
-                | Self::VfoMemModeA
-                | Self::VfoMemModeB
-                | Self::FmRadio
-                | Self::TncBaud
-                | Self::BeaconType
+                | Self::TuningModeA
+                | Self::TuningModeB
+                | Self::PacketDataRate
+                | Self::BeaconMode
                 | Self::GpsEnabled
                 | Self::GpsPcOutput
                 | Self::AutoInfo
                 | Self::AprsCallsign
                 | Self::DstarSlot
-                | Self::ScanResumeCat
         )
     }
 }
@@ -617,31 +623,74 @@ const fn on_off(b: bool) -> &'static str {
     if b { "On" } else { "Off" }
 }
 
-/// Step a PF-key assignment one position through the registry's gapped
-/// domain (0-30 excluding 5, 23, 25 and 26), in the direction of `delta`.
-///
-/// Saturates at the domain edges (0 and 30 are both valid), so the
-/// result is always accepted by the library's PF-key validators.
-fn next_pf_key(cur: u8, delta: i8) -> u8 {
-    // Reads preserve the exact flash byte, including off-menu probe values
-    // such as 31 and erased/uninitialized 0xFF. Clamp those to the highest
-    // writable registry value before stepping so the TUI can always recover
-    // the setting instead of repeatedly proposing an invalid byte.
-    let mut next = cur.min(30);
-    loop {
-        let stepped = if delta > 0 {
-            next.saturating_add(1).min(30)
-        } else {
-            next.saturating_sub(1)
-        };
-        if stepped == next {
-            // Saturated at a domain edge.
-            return stepped;
-        }
-        next = stepped;
-        if !matches!(next, 5 | 23 | 25 | 26) {
-            return next;
-        }
+/// Step through an explicitly declared typed setting domain, saturating at
+/// either end. A missing current value is reported to the caller instead of
+/// silently choosing a default.
+fn step_selection<T: Copy + PartialEq>(current: T, delta: i8, values: &[T]) -> Option<T> {
+    let index = values.iter().position(|&value| value == current)?;
+    let next_index = if delta > 0 {
+        index.saturating_add(1).min(values.len().saturating_sub(1))
+    } else {
+        index.saturating_sub(1)
+    };
+    values.get(next_index).copied()
+}
+
+/// Step a PF-key assignment through the official gapped menu domain.
+/// Off-menu bytes are intentionally not coerced to an official assignment.
+fn next_pf_key(current: StoredFrontPanelPfAssignment, delta: i8) -> Option<FrontPanelPfFunction> {
+    let StoredFrontPanelPfAssignment::Official(current) = current else {
+        return None;
+    };
+    step_selection(
+        current,
+        delta,
+        &[
+            FrontPanelPfFunction::Recording,
+            FrontPanelPfFunction::VoiceMessage1,
+            FrontPanelPfFunction::VoiceMessage2,
+            FrontPanelPfFunction::VoiceMessage3,
+            FrontPanelPfFunction::VoiceMessage4,
+            FrontPanelPfFunction::VoiceGuidance,
+            FrontPanelPfFunction::BatteryLevel,
+            FrontPanelPfFunction::Vox,
+            FrontPanelPfFunction::GroupName,
+            FrontPanelPfFunction::Balance,
+            FrontPanelPfFunction::Gps,
+            FrontPanelPfFunction::TrackLog,
+            FrontPanelPfFunction::Squelch,
+            FrontPanelPfFunction::Shift,
+            FrontPanelPfFunction::Step,
+            FrontPanelPfFunction::Power,
+            FrontPanelPfFunction::KeyLock,
+            FrontPanelPfFunction::Lockout,
+            FrontPanelPfFunction::MemoryToVfo,
+            FrontPanelPfFunction::ToneSelect,
+            FrontPanelPfFunction::NewMemory,
+            FrontPanelPfFunction::VoiceAlert,
+            FrontPanelPfFunction::LcdBrightness,
+            FrontPanelPfFunction::DtmfChannel0,
+            FrontPanelPfFunction::EcholinkChannel0,
+            FrontPanelPfFunction::Tone1750Hz,
+            FrontPanelPfFunction::MemoryInput,
+        ],
+    )
+}
+
+fn next_linked_volume(
+    current: LinkedVolumeLevel,
+    delta: i8,
+) -> Result<LinkedVolumeLevel, ValidationError> {
+    let current = current.as_raw();
+    let next = if delta > 0 {
+        current.saturating_add(1).min(7)
+    } else {
+        current.saturating_sub(1)
+    };
+    if next == 0 {
+        Ok(LinkedVolumeLevel::VOLUME_LINK)
+    } else {
+        LinkedVolumeLevel::fixed(next)
     }
 }
 
@@ -683,7 +732,7 @@ pub(crate) enum MainView {
     /// MCP settings: ~3s per change, brief disconnect.
     SettingsMcp,
     Aprs,
-    DStar,
+    Dstar,
     Gps,
     Mcp,
     /// FM broadcast radio control (76-108 MHz WFM on Band B).
@@ -693,9 +742,8 @@ pub(crate) enum MainView {
 /// Which field is selected in channel edit mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChannelEditField {
-    Frequency,
     Name,
-    Mode,
+    OperatingMode,
     ToneMode,
     ToneFreq,
     Duplex,
@@ -705,21 +753,19 @@ pub(crate) enum ChannelEditField {
 impl ChannelEditField {
     pub(crate) const fn next(self) -> Self {
         match self {
-            Self::Frequency => Self::Name,
-            Self::Name => Self::Mode,
-            Self::Mode => Self::ToneMode,
+            Self::Name => Self::OperatingMode,
+            Self::OperatingMode => Self::ToneMode,
             Self::ToneMode => Self::ToneFreq,
             Self::ToneFreq => Self::Duplex,
             Self::Duplex => Self::Offset,
-            Self::Offset => Self::Frequency,
+            Self::Offset => Self::Name,
         }
     }
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
-            Self::Frequency => "Frequency",
             Self::Name => "Name",
-            Self::Mode => "Mode",
+            Self::OperatingMode => "Mode",
             Self::ToneMode => "Tone Mode",
             Self::ToneFreq => "Tone Freq",
             Self::Duplex => "Duplex",
@@ -734,15 +780,13 @@ pub(crate) enum InputMode {
     Normal,
     /// Searching channels: buffer holds the search string.
     Search(String),
-    /// Entering a frequency: buffer holds digits typed so far.
-    FreqInput(String),
 }
 
 /// Live state for one band, updated by the radio poller.
 #[derive(Debug, Clone)]
 pub(crate) struct BandState {
     pub frequency: Frequency,
-    pub mode: Mode,
+    pub mode: OperatingMode,
     /// S-meter level (0–5). Driven by AI-pushed BY notifications, not polled.
     pub s_meter: SMeterReading,
     /// Squelch setting (0–6 on D75).
@@ -758,7 +802,7 @@ impl Default for BandState {
     fn default() -> Self {
         Self {
             frequency: Frequency::new(145_000_000),
-            mode: Mode::Fm,
+            mode: OperatingMode::Fm,
             s_meter: SMeterReading::ZERO,
             squelch: SquelchLevel::OPEN,
             power_level: PowerLevel::High,
@@ -771,22 +815,12 @@ impl Default for BandState {
 
 /// Aggregated radio state from the poller.
 #[derive(Debug, Clone)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "RadioState aggregates the TH-D75's independent CAT toggle settings (beep, \
-              dual_band, bluetooth, vox, gps_enabled, gps_pc_output), each mapping \
-              1:1 to a distinct CAT command name. Collapsing \
-              these into a `HashSet<RadioFlag>` (the refactor clippy wants) would break \
-              the 1:1 CAT-command-to-field mapping that makes the poll_once / apply_state \
-              code trivially auditable against the D-STAR + CAT spec. The bools here are \
-              the data model, not a premature abstraction."
-)]
 pub(crate) struct RadioState {
     pub band_a: BandState,
     pub band_b: BandState,
     pub battery_level: BatteryLevel,
     pub beep: bool,
-    pub dual_band: bool,
+    pub band_mode: BandMode,
     pub bluetooth: bool,
     pub vox: bool,
     pub vox_gain: VoxGain,
@@ -794,19 +828,16 @@ pub(crate) struct RadioState {
     pub af_gain: AfGainLevel,
     pub firmware_version: String,
     pub radio_type: String,
-    pub gps_enabled: bool,
-    pub gps_pc_output: bool,
-    /// NMEA sentence enable flags: (GGA, GLL, GSA, GSV, RMC, VTG).
-    pub gps_sentences: Option<(bool, bool, bool, bool, bool, bool)>,
+    pub gps_settings: Option<GpsSettings>,
+    /// Validated, nonempty NMEA sentence selection.
+    pub gps_sentences: Option<NmeaSentences>,
     /// GPS/Radio operating mode (GM read).
     pub gps_mode: Option<kenwood_thd75::types::GpsRadioMode>,
-    pub beacon_type: BeaconMode,
+    pub beacon_mode: BeaconMode,
     pub fine_step: Option<kenwood_thd75::types::FineStep>,
     pub filter_width_ssb: Option<kenwood_thd75::types::FilterWidthIndex>,
     pub filter_width_cw: Option<kenwood_thd75::types::FilterWidthIndex>,
     pub filter_width_am: Option<kenwood_thd75::types::FilterWidthIndex>,
-    /// Last-written scan resume method (write-only, not readable from D75).
-    pub scan_resume_cat: Option<kenwood_thd75::types::ScanResumeMethod>,
     /// D-STAR URCALL callsign (8-char, space-padded).
     pub dstar_urcall: String,
     /// D-STAR URCALL suffix (4-char, space-padded).
@@ -834,24 +865,22 @@ impl Default for RadioState {
             band_b: BandState::default(),
             battery_level: BatteryLevel::Empty,
             beep: false,
-            dual_band: false,
+            band_mode: BandMode::Single,
             bluetooth: false,
             vox: false,
             vox_gain: VoxGain::ZERO,
-            vox_delay: VoxDelay::ZERO,
-            af_gain: AfGainLevel::new(0),
+            vox_delay: VoxDelay::MS_250,
+            af_gain: AfGainLevel::ZERO,
             firmware_version: String::new(),
             radio_type: String::new(),
-            gps_enabled: false,
-            gps_pc_output: false,
+            gps_settings: None,
             gps_sentences: None,
             gps_mode: None,
-            beacon_type: BeaconMode::Manual,
+            beacon_mode: BeaconMode::Manual,
             fine_step: None,
             filter_width_ssb: None,
             filter_width_cw: None,
             filter_width_am: None,
-            scan_resume_cat: None,
             dstar_urcall: String::new(),
             dstar_urcall_suffix: String::new(),
             dstar_rpt1: String::new(),
@@ -867,17 +896,17 @@ impl Default for RadioState {
 
 /// Whether the D-STAR gateway is active in the radio task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DStarMode {
-    /// Not in gateway mode: show CAT config view on the D-STAR panel.
+pub(crate) enum DstarMode {
+    /// Not in gateway mode: show CAT settings on the D-STAR panel.
     Inactive,
-    /// Gateway mode active: `DStarGateway` is running in the radio task.
+    /// Gateway mode active: `DstarGateway` is running in the radio task.
     Active,
 }
 
 /// Whether the APRS client is active in the radio task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AprsMode {
-    /// Not in APRS mode: show MCP config view on the APRS panel.
+    /// Not in APRS mode: show stored settings on the APRS panel.
     Inactive,
     /// APRS mode active: `AprsClient` is running in the radio task.
     Active,
@@ -887,11 +916,11 @@ pub(crate) enum AprsMode {
 #[derive(Debug, Clone)]
 pub(crate) struct AprsMessageStatus {
     /// Destination callsign.
-    pub addressee: String,
+    pub addressee: kenwood_thd75::MessageAddressee,
     /// Message text.
-    pub text: String,
+    pub text: kenwood_thd75::MessageText,
     /// Message ID from the messenger.
-    pub message_id: String,
+    pub message_id: kenwood_thd75::MessageId,
     /// Delivery state.
     pub state: AprsMessageState,
 }
@@ -964,24 +993,28 @@ pub(crate) enum Message {
     AprsStarted,
     /// The radio task has exited APRS mode.
     AprsStopped,
+    /// APRS did not return a radio with proved ordinary CAT control.
+    AprsRecoveryFailed(String),
     /// An APRS event was received from the radio task.
     AprsEvent(kenwood_thd75::AprsEvent),
     /// An APRS message was sent and assigned a message ID for tracking.
     AprsMessageSent {
-        addressee: String,
-        text: String,
-        message_id: String,
+        addressee: kenwood_thd75::MessageAddressee,
+        text: kenwood_thd75::MessageText,
+        message_id: kenwood_thd75::MessageId,
     },
     /// Error from the APRS subsystem.
     AprsError(String),
     /// The radio task has entered D-STAR gateway mode successfully.
-    DStarStarted,
+    DstarStarted,
     /// The radio task has exited D-STAR gateway mode.
-    DStarStopped,
+    DstarStopped,
+    /// D-STAR did not return a radio with proved ordinary CAT control.
+    DstarRecoveryFailed(String),
     /// A D-STAR event was received from the radio task (gateway mode).
-    DStarEvent(kenwood_thd75::DStarEvent),
+    DstarEvent(kenwood_thd75::DstarEvent),
     /// Error from the D-STAR subsystem.
-    DStarError(String),
+    DstarError(String),
     Quit,
 }
 
@@ -1020,7 +1053,7 @@ pub(crate) struct App {
     pub settings_mcp_index: usize,
     /// Active search filter for channel list (empty = show all).
     pub search_filter: String,
-    /// Which band channel-tune and freq-input target (last focused band pane).
+    /// Which band receives channel recalls and step/mode changes.
     pub target_band: kenwood_thd75::types::Band,
     /// Sender for commands to the radio background task.
     pub cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::event::RadioCommand>>,
@@ -1035,15 +1068,15 @@ pub(crate) struct App {
     /// When set, the APRS message compose prompt is active.
     pub aprs_compose: Option<String>,
     /// D-STAR mode state.
-    pub dstar_mode: DStarMode,
+    pub dstar_mode: DstarMode,
     /// D-STAR last heard entries (gateway mode).
     pub dstar_last_heard: Vec<kenwood_thd75::LastHeardEntry>,
     /// Selected index in the D-STAR last heard list.
     pub dstar_last_heard_index: usize,
     /// Current D-STAR text message (from slow data).
-    pub dstar_text_message: Option<String>,
+    pub dstar_text_message: Option<kenwood_thd75::SlowDataTextMessage>,
     /// Current D-STAR RX header (gateway mode).
-    pub dstar_rx_header: Option<dstar_gateway_core::DStarHeader>,
+    pub dstar_rx_header: Option<dstar_gateway_core::DstarHeader>,
     /// Whether a D-STAR voice transmission is active.
     pub dstar_rx_active: bool,
     /// D-STAR URCALL input buffer (when prompting).
@@ -1062,34 +1095,32 @@ pub(crate) struct App {
 
 impl App {
     /// Returns the list of used channel numbers, filtered by `search_filter`.
-    pub(crate) fn filtered_channels(&self) -> Vec<u16> {
+    pub(crate) fn filtered_channels(&self) -> Result<Vec<RegularChannel>, MemoryError> {
         if let McpState::Loaded { ref image, .. } = self.mcp {
             let channels = image.channels();
             let filter = self.search_filter.to_uppercase();
-            (0u16..1200)
-                .filter(|&i| {
-                    if !channels.is_used(i) {
-                        return false;
-                    }
-                    if filter.is_empty() {
-                        return true;
-                    }
-                    // Match against channel name or number
-                    if let Some(entry) = channels.get(i) {
-                        entry.name.to_uppercase().contains(&filter)
-                            || i.to_string().contains(&filter)
-                    } else {
-                        false
-                    }
-                })
-                .collect()
+            let mut filtered = Vec::new();
+            for channel in RegularChannel::all() {
+                if !channels.is_used(channel)? {
+                    continue;
+                }
+                let entry = channels.get(channel)?;
+                if filter.is_empty()
+                    || entry.name().as_str().to_uppercase().contains(&filter)
+                    || channel.to_string().contains(&filter)
+                {
+                    filtered.push(channel);
+                }
+            }
+            Ok(filtered)
         } else {
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 
     fn used_channel_count(&self) -> usize {
-        self.filtered_channels().len()
+        self.filtered_channels()
+            .map_or(0, |channels| channels.len())
     }
 
     /// Create a new app instance, loading MCP cache from disk if available.
@@ -1149,7 +1180,7 @@ impl App {
             aprs_messages: Vec::new(),
             aprs_station_index: 0,
             aprs_compose: None,
-            dstar_mode: DStarMode::Inactive,
+            dstar_mode: DstarMode::Inactive,
             dstar_last_heard: Vec::new(),
             dstar_last_heard_index: 0,
             dstar_text_message: None,
@@ -1158,7 +1189,7 @@ impl App {
             dstar_urcall_input: None,
             dstar_reflector_input: None,
             channel_edit_mode: false,
-            channel_edit_field: ChannelEditField::Frequency,
+            channel_edit_field: ChannelEditField::Name,
             channel_edit_buffer: String::new(),
             fm_radio_on: false,
         }
@@ -1188,10 +1219,6 @@ impl App {
                 }
                 if state.radio_type.is_empty() {
                     state.radio_type = std::mem::take(&mut self.state.radio_type);
-                }
-                // Preserve write-only fields not readable from radio
-                if state.scan_resume_cat.is_none() {
-                    state.scan_resume_cat = self.state.scan_resume_cat;
                 }
                 // Preserve D-STAR state when not provided by poll
                 if state.dstar_urcall.is_empty() {
@@ -1298,6 +1325,14 @@ impl App {
                 self.status_message = Some("APRS mode stopped, CAT polling resumed".into());
                 true
             }
+            Message::AprsRecoveryFailed(error) => {
+                self.aprs_mode = AprsMode::Inactive;
+                self.connected = false;
+                self.status_message = Some(format!(
+                    "APRS session ended without usable CAT control: {error}; reconnecting..."
+                ));
+                true
+            }
             Message::AprsEvent(event) => {
                 self.handle_aprs_event(event);
                 true
@@ -1319,24 +1354,34 @@ impl App {
                 self.status_message = Some(format!("APRS: {err}"));
                 true
             }
-            Message::DStarStarted => {
-                self.dstar_mode = DStarMode::Active;
+            Message::DstarStarted => {
+                self.dstar_mode = DstarMode::Active;
                 self.status_message = Some("D-STAR gateway mode active".into());
                 true
             }
-            Message::DStarStopped => {
-                self.dstar_mode = DStarMode::Inactive;
+            Message::DstarStopped => {
+                self.dstar_mode = DstarMode::Inactive;
                 self.dstar_rx_active = false;
                 self.dstar_rx_header = None;
                 self.status_message =
                     Some("D-STAR gateway mode stopped, CAT polling resumed".into());
                 true
             }
-            Message::DStarEvent(event) => {
+            Message::DstarRecoveryFailed(error) => {
+                self.dstar_mode = DstarMode::Inactive;
+                self.dstar_rx_active = false;
+                self.dstar_rx_header = None;
+                self.connected = false;
+                self.status_message = Some(format!(
+                    "D-STAR session ended without usable CAT control: {error}; reconnecting..."
+                ));
+                true
+            }
+            Message::DstarEvent(event) => {
                 self.handle_dstar_event(event);
                 true
             }
-            Message::DStarError(err) => {
+            Message::DstarError(err) => {
                 self.status_message = Some(format!("D-STAR: {err}"));
                 true
             }
@@ -1403,7 +1448,25 @@ impl App {
                         && let Some(station) = self.aprs_stations.get(self.aprs_station_index)
                         && let Some(ref tx) = self.cmd_tx
                     {
-                        let addressee = station.callsign.clone();
+                        let addressee =
+                            match kenwood_thd75::MessageAddressee::new(&station.callsign) {
+                                Ok(addressee) => addressee,
+                                Err(error) => {
+                                    self.status_message = Some(format!(
+                                        "Cannot message {}: {error}",
+                                        station.callsign
+                                    ));
+                                    return true;
+                                }
+                            };
+                        let text = match kenwood_thd75::MessageText::new(&text) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                self.status_message =
+                                    Some(format!("Invalid APRS message: {error}"));
+                                return true;
+                            }
+                        };
                         let _send = tx.send(crate::event::RadioCommand::SendAprsMessage {
                             addressee: addressee.clone(),
                             text: text.clone(),
@@ -1469,12 +1532,13 @@ impl App {
                         return true;
                     };
                     if let Some(ref tx) = self.cmd_tx {
-                        let _send = tx.send(crate::event::RadioCommand::ConnectReflector {
+                        let _send = tx.send(crate::event::RadioCommand::PrepareReflectorLink {
                             name: name.clone(),
                             module,
                         });
-                        self.status_message =
-                            Some(format!("Connecting to {name} module {module}..."));
+                        self.status_message = Some(format!(
+                            "Preparing {name} module {module}; key up to send the link command"
+                        ));
                     }
                 }
                 KeyCode::Backspace => {
@@ -1520,59 +1584,6 @@ impl App {
                     let buf = self.channel_edit_buffer.clone();
                     self.apply_channel_edit(field, &buf);
                     self.channel_edit_buffer.clear();
-                }
-                _ => {}
-            }
-            return true;
-        }
-
-        // Handle frequency input mode
-        if let InputMode::FreqInput(ref mut buf) = self.input_mode {
-            match key.code {
-                KeyCode::Esc => {
-                    self.input_mode = InputMode::Normal;
-                }
-                KeyCode::Enter => {
-                    // Parse as MHz (e.g. "145.19" -> 145_190_000 Hz).
-                    // `parse::<f64>` accepts negatives, NaN, and infinity;
-                    // an unguarded `as u32` would silently saturate those,
-                    // so reject anything outside the D75 tuning range
-                    // (~0.1..=1300 MHz) before casting.
-                    if let Ok(mhz) = buf.parse::<f64>()
-                        && mhz.is_finite()
-                        && (0.0..=1300.0).contains(&mhz)
-                    {
-                        #[expect(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss,
-                            reason = "The guard above rejects non-finite, negative, and \
-                                      > 1300 MHz inputs, so `mhz * 1e6` is within 0..=1.3e9 \
-                                      and the `as u32` cast cannot saturate or lose sign."
-                        )]
-                        let hz = (mhz * 1_000_000.0) as u32;
-                        if let Some(ref tx) = self.cmd_tx {
-                            let _send = tx.send(crate::event::RadioCommand::TuneFreq {
-                                band: self.target_band,
-                                freq: hz,
-                            });
-                        }
-                        let band_label = if self.target_band == kenwood_thd75::types::Band::B {
-                            "B"
-                        } else {
-                            "A"
-                        };
-                        self.status_message =
-                            Some(format!("Tuning Band {band_label} to {mhz:.6} MHz..."));
-                    } else {
-                        self.status_message = Some(format!("Invalid frequency: {buf}"));
-                    }
-                    self.input_mode = InputMode::Normal;
-                }
-                KeyCode::Backspace => {
-                    let _ = buf.pop();
-                }
-                KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
-                    buf.push(c);
                 }
                 _ => {}
             }
@@ -1662,13 +1673,18 @@ impl App {
                     && matches!(self.focus, Pane::Main | Pane::Detail)
                     && matches!(self.mcp, McpState::Loaded { .. }) =>
             {
-                let used = self.filtered_channels();
-                if used.get(self.channel_list_index).is_some() {
-                    self.channel_edit_mode = true;
-                    self.channel_edit_field = ChannelEditField::Frequency;
-                    self.channel_edit_buffer.clear();
-                    self.status_message =
-                        Some("Edit mode: Tab=next field, Enter=apply, Esc=cancel".into());
+                match self.filtered_channels() {
+                    Ok(used) if used.get(self.channel_list_index).is_some() => {
+                        self.channel_edit_mode = true;
+                        self.channel_edit_field = ChannelEditField::Name;
+                        self.channel_edit_buffer.clear();
+                        self.status_message =
+                            Some("Edit mode: Tab=next field, Enter=apply, Esc=cancel".into());
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.status_message = Some(format!("Channel data unavailable: {error}"));
+                    }
                 }
                 true
             }
@@ -1696,11 +1712,11 @@ impl App {
                 true
             }
             KeyCode::Char('d') => {
-                if self.main_view == MainView::DStar && self.focus == Pane::Main {
+                if self.main_view == MainView::Dstar && self.focus == Pane::Main {
                     // Toggle D-STAR gateway mode on/off when already viewing D-STAR panel.
                     self.toggle_dstar_mode();
                 } else {
-                    self.main_view = MainView::DStar;
+                    self.main_view = MainView::Dstar;
                     self.focus = Pane::Main;
                 }
                 true
@@ -1719,11 +1735,6 @@ impl App {
                 if self.focus == Pane::Main && self.main_view == MainView::Channels =>
             {
                 self.input_mode = InputMode::Search(self.search_filter.clone());
-                true
-            }
-            // Frequency direct entry
-            KeyCode::Char('f') if matches!(self.focus, Pane::BandA | Pane::BandB) => {
-                self.input_mode = InputMode::FreqInput(String::new());
                 true
             }
             // GPS panel or jump-to-first-channel
@@ -1773,7 +1784,7 @@ impl App {
                             self.aprs_station_index =
                                 self.aprs_station_index.saturating_add(1).min(max);
                         }
-                        MainView::DStar => {
+                        MainView::Dstar => {
                             let max = self.dstar_last_heard.len().saturating_sub(1);
                             self.dstar_last_heard_index =
                                 self.dstar_last_heard_index.saturating_add(1).min(max);
@@ -1813,7 +1824,7 @@ impl App {
                         MainView::Aprs => {
                             self.aprs_station_index = self.aprs_station_index.saturating_sub(1);
                         }
-                        MainView::DStar => {
+                        MainView::Dstar => {
                             self.dstar_last_heard_index =
                                 self.dstar_last_heard_index.saturating_sub(1);
                         }
@@ -1838,21 +1849,27 @@ impl App {
                 true
             }
             KeyCode::Enter if self.focus == Pane::Main && self.main_view == MainView::Channels => {
-                let used = self.filtered_channels();
-                if let Some(&ch_num) = used.get(self.channel_list_index)
-                    && let Some(ref tx) = self.cmd_tx
-                {
-                    let band_label = if self.target_band == kenwood_thd75::types::Band::B {
-                        "B"
-                    } else {
-                        "A"
-                    };
-                    let _send = tx.send(crate::event::RadioCommand::TuneChannel {
-                        band: self.target_band,
-                        channel: ch_num,
-                    });
-                    self.status_message =
-                        Some(format!("Tuning Band {band_label} to channel {ch_num}..."));
+                match self.filtered_channels() {
+                    Ok(used) => {
+                        if let Some(&channel) = used.get(self.channel_list_index)
+                            && let Some(ref tx) = self.cmd_tx
+                        {
+                            let band_label = if self.target_band == kenwood_thd75::types::Band::B {
+                                "B"
+                            } else {
+                                "A"
+                            };
+                            let _send = tx.send(crate::event::RadioCommand::TuneChannel {
+                                band: self.target_band,
+                                channel,
+                            });
+                            self.status_message =
+                                Some(format!("Tuning Band {band_label} to channel {channel}..."));
+                        }
+                    }
+                    Err(error) => {
+                        self.status_message = Some(format!("Channel data unavailable: {error}"));
+                    }
                 }
                 true
             }
@@ -1930,12 +1947,12 @@ impl App {
                 let (band, cur) = if self.focus == Pane::BandA {
                     (
                         kenwood_thd75::types::Band::A,
-                        self.state.band_a.squelch.as_u8(),
+                        self.state.band_a.squelch.as_raw(),
                     )
                 } else {
                     (
                         kenwood_thd75::types::Band::B,
-                        self.state.band_b.squelch.as_u8(),
+                        self.state.band_b.squelch.as_raw(),
                     )
                 };
                 let next = cur.saturating_sub(1);
@@ -1949,12 +1966,12 @@ impl App {
                 let (band, cur) = if self.focus == Pane::BandA {
                     (
                         kenwood_thd75::types::Band::A,
-                        self.state.band_a.squelch.as_u8(),
+                        self.state.band_a.squelch.as_raw(),
                     )
                 } else {
                     (
                         kenwood_thd75::types::Band::B,
-                        self.state.band_b.squelch.as_u8(),
+                        self.state.band_b.squelch.as_raw(),
                     )
                 };
                 let next = cur.saturating_add(1).min(6);
@@ -1996,9 +2013,9 @@ impl App {
                 if let Some(ref tx) = self.cmd_tx {
                     // Use 0,0 as placeholder; real GPS position would come from the radio.
                     let _send = tx.send(crate::event::RadioCommand::BeaconPosition {
-                        lat: 0.0,
-                        lon: 0.0,
-                        comment: String::new(),
+                        latitude: kenwood_thd75::Latitude::EQUATOR,
+                        longitude: kenwood_thd75::Longitude::PRIME_MERIDIAN,
+                        comment: kenwood_thd75::PositionReportText::default(),
                     });
                     self.status_message = Some("Beacon sent".into());
                 }
@@ -2033,9 +2050,9 @@ impl App {
             }
             // D-STAR: set CQ (URCALL = CQCQCQ)
             KeyCode::Char('C')
-                if self.main_view == MainView::DStar
+                if self.main_view == MainView::Dstar
                     && self.focus == Pane::Main
-                    && self.dstar_mode == DStarMode::Inactive =>
+                    && self.dstar_mode == DstarMode::Inactive =>
             {
                 if let Some(ref tx) = self.cmd_tx {
                     let _send = tx.send(crate::event::RadioCommand::SetCQ);
@@ -2045,31 +2062,32 @@ impl App {
             }
             // D-STAR: set URCALL (prompt)
             KeyCode::Char('u')
-                if self.main_view == MainView::DStar
+                if self.main_view == MainView::Dstar
                     && self.focus == Pane::Main
-                    && self.dstar_mode == DStarMode::Inactive =>
+                    && self.dstar_mode == DstarMode::Inactive =>
             {
                 self.dstar_urcall_input = Some(String::new());
                 true
             }
-            // D-STAR: connect reflector (prompt)
+            // D-STAR: prepare reflector link (prompt)
             KeyCode::Char('r')
-                if self.main_view == MainView::DStar
+                if self.main_view == MainView::Dstar
                     && self.focus == Pane::Main
-                    && self.dstar_mode == DStarMode::Inactive =>
+                    && self.dstar_mode == DstarMode::Inactive =>
             {
                 self.dstar_reflector_input = Some(String::new());
                 true
             }
-            // D-STAR: unlink reflector
+            // D-STAR: prepare reflector unlink
             KeyCode::Char('U')
-                if self.main_view == MainView::DStar
+                if self.main_view == MainView::Dstar
                     && self.focus == Pane::Main
-                    && self.dstar_mode == DStarMode::Inactive =>
+                    && self.dstar_mode == DstarMode::Inactive =>
             {
                 if let Some(ref tx) = self.cmd_tx {
-                    let _send = tx.send(crate::event::RadioCommand::DisconnectReflector);
-                    self.status_message = Some("Unlinking reflector...".into());
+                    let _send = tx.send(crate::event::RadioCommand::PrepareReflectorUnlink);
+                    self.status_message =
+                        Some("Preparing unlink; key up to send the command".into());
                 }
                 true
             }
@@ -2101,9 +2119,12 @@ impl App {
         if let Some(ref tx) = self.cmd_tx.clone() {
             match row {
                 SettingRow::DualBand => {
-                    let next = !self.state.dual_band;
-                    let _send = tx.send(crate::event::RadioCommand::SetDualBand(next));
-                    self.status_message = Some(format!("Dual band → {}", on_off(next)));
+                    let next = match self.state.band_mode {
+                        BandMode::Dual => BandMode::Single,
+                        BandMode::Single => BandMode::Dual,
+                    };
+                    let _send = tx.send(crate::event::RadioCommand::SetBandMode(next));
+                    self.status_message = Some(format!("Band mode → {next}"));
                     return;
                 }
                 SettingRow::Bluetooth => {
@@ -2137,20 +2158,34 @@ impl App {
                     return;
                 }
                 SettingRow::FmRadio => {
-                    let _send = tx.send(crate::event::RadioCommand::SetFmRadio(true));
-                    self.status_message =
-                        Some("FM Radio: enabled (read-back not available)".into());
+                    self.status_message = Some(
+                        "FM Radio is read-only: retained hardware evidence rejects FR writes"
+                            .into(),
+                    );
                     return;
                 }
                 SettingRow::GpsEnabled => {
-                    let next = !self.state.gps_enabled;
-                    let _send = tx.send(crate::event::RadioCommand::SetGpsConfig(next, false));
+                    let Some(current) = self.state.gps_settings else {
+                        self.status_message =
+                            Some("GPS settings unavailable; reconnect to refresh".into());
+                        return;
+                    };
+                    let next = !current.enabled();
+                    let settings = GpsSettings::new(next, current.pc_output());
+                    let _send = tx.send(crate::event::RadioCommand::SetGpsSettings(settings));
                     self.status_message = Some(format!("GPS → {}", on_off(next)));
                     return;
                 }
                 SettingRow::GpsPcOutput => {
-                    self.status_message =
-                        Some("GPS PC Output: SetGpsSentences not yet wired".into());
+                    let Some(current) = self.state.gps_settings else {
+                        self.status_message =
+                            Some("GPS settings unavailable; reconnect to refresh".into());
+                        return;
+                    };
+                    let next = !current.pc_output();
+                    let settings = GpsSettings::new(current.enabled(), next);
+                    let _send = tx.send(crate::event::RadioCommand::SetGpsSettings(settings));
+                    self.status_message = Some(format!("GPS PC Output → {}", on_off(next)));
                     return;
                 }
                 SettingRow::AutoInfo => {
@@ -2184,11 +2219,33 @@ impl App {
 
         macro_rules! toggle_bool {
             ($getter:ident, $setter:ident, $label:expr) => {{
-                let new_val = !image.settings().$getter();
-                if let Some((offset, value)) = image.modify_setting(|w| w.$setter(new_val)) {
-                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message =
-                        Some(format!("{} → {}, applying...", $label, on_off(new_val)));
+                match image.settings().$getter() {
+                    Ok(current) => {
+                        let new_val = !current;
+                        match image.modify_setting(|writer| writer.$setter(new_val)) {
+                            Ok(Some((offset, value))) => {
+                                let _send = tx.send(crate::event::RadioCommand::McpWriteByte {
+                                    offset,
+                                    value,
+                                });
+                                self.status_message = Some(format!(
+                                    "{} → {}, applying...",
+                                    $label,
+                                    on_off(new_val)
+                                ));
+                            }
+                            Ok(None) => {
+                                self.status_message =
+                                    Some(format!("{}: no setting byte changed", $label));
+                            }
+                            Err(error) => {
+                                self.status_message = Some(format!("{}: {error}", $label));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.status_message = Some(format!("{}: {error}", $label));
+                    }
                 }
             }};
         }
@@ -2262,7 +2319,7 @@ impl App {
         if let Some(ref tx) = self.cmd_tx.clone() {
             match row {
                 SettingRow::SquelchA => {
-                    let cur = self.state.band_a.squelch.as_u8();
+                    let cur = self.state.band_a.squelch.as_raw();
                     let next = if delta > 0 {
                         cur.saturating_add(1).min(6)
                     } else {
@@ -2278,7 +2335,7 @@ impl App {
                     return;
                 }
                 SettingRow::SquelchB => {
-                    let cur = self.state.band_b.squelch.as_u8();
+                    let cur = self.state.band_b.squelch.as_raw();
                     let next = if delta > 0 {
                         cur.saturating_add(1).min(6)
                     } else {
@@ -2294,7 +2351,7 @@ impl App {
                     return;
                 }
                 SettingRow::VoxGain => {
-                    let cur = self.state.vox_gain.as_u8();
+                    let cur = self.state.vox_gain.as_raw();
                     let next = if delta > 0 {
                         cur.saturating_add(1).min(9)
                     } else {
@@ -2307,7 +2364,7 @@ impl App {
                     return;
                 }
                 SettingRow::VoxDelay => {
-                    let cur = self.state.vox_delay.as_u8();
+                    let cur = self.state.vox_delay.as_raw();
                     let next = if delta > 0 {
                         cur.saturating_add(1).min(30)
                     } else {
@@ -2404,33 +2461,9 @@ impl App {
                     return;
                 }
                 SettingRow::ScanResumeCat => {
-                    use kenwood_thd75::types::ScanResumeMethod;
-                    let methods = [
-                        ScanResumeMethod::TimeOperated,
-                        ScanResumeMethod::CarrierOperated,
-                        ScanResumeMethod::Seek,
-                    ];
-                    let cur_idx = self
-                        .state
-                        .scan_resume_cat
-                        .and_then(|m| methods.iter().position(|&x| x == m))
-                        .unwrap_or(0);
-                    let next_idx = if delta > 0 {
-                        (cur_idx + 1) % methods.len()
-                    } else {
-                        (cur_idx + methods.len() - 1) % methods.len()
-                    };
-                    let Some(&next) = methods.get(next_idx) else {
-                        return;
-                    };
-                    let _send = tx.send(crate::event::RadioCommand::SetScanResumeCat(next));
-                    self.state.scan_resume_cat = Some(next);
-                    let label = match next {
-                        ScanResumeMethod::TimeOperated => "Time",
-                        ScanResumeMethod::CarrierOperated => "Carrier",
-                        ScanResumeMethod::Seek => "Seek",
-                    };
-                    self.status_message = Some(format!("Scan Resume → {label}"));
+                    self.status_message = Some(
+                        "SR is quarantined; configure scan resume through Menu 130/131".into(),
+                    );
                     return;
                 }
                 SettingRow::PowerA => {
@@ -2461,42 +2494,42 @@ impl App {
                     self.status_message = Some(format!("Power B → {next}"));
                     return;
                 }
-                SettingRow::ModeA => {
-                    use kenwood_thd75::types::Mode;
+                SettingRow::OperatingModeA => {
+                    use kenwood_thd75::types::OperatingMode;
                     let next = match self.state.band_a.mode {
-                        Mode::Fm => Mode::Nfm,
-                        Mode::Nfm => Mode::Am,
-                        Mode::Am => Mode::Lsb,
-                        Mode::Lsb => Mode::Usb,
-                        Mode::Usb => Mode::Cw,
-                        Mode::Cw => Mode::Dv,
-                        Mode::Dv => Mode::Dr,
-                        Mode::Dr => Mode::Wfm,
-                        Mode::Wfm => Mode::CwReverse,
-                        Mode::CwReverse => Mode::Fm,
+                        OperatingMode::Fm => OperatingMode::Nfm,
+                        OperatingMode::Nfm => OperatingMode::Am,
+                        OperatingMode::Am => OperatingMode::Lsb,
+                        OperatingMode::Lsb => OperatingMode::Usb,
+                        OperatingMode::Usb => OperatingMode::Cw,
+                        OperatingMode::Cw => OperatingMode::Dv,
+                        OperatingMode::Dv => OperatingMode::Dr,
+                        OperatingMode::Dr => OperatingMode::Wfm,
+                        OperatingMode::Wfm => OperatingMode::CwReverse,
+                        OperatingMode::CwReverse => OperatingMode::Fm,
                     };
-                    let _send = tx.send(crate::event::RadioCommand::SetMode {
+                    let _send = tx.send(crate::event::RadioCommand::SetOperatingMode {
                         band: kenwood_thd75::types::Band::A,
                         mode: next,
                     });
                     self.status_message = Some(format!("Mode A → {next}"));
                     return;
                 }
-                SettingRow::ModeB => {
-                    use kenwood_thd75::types::Mode;
+                SettingRow::OperatingModeB => {
+                    use kenwood_thd75::types::OperatingMode;
                     let next = match self.state.band_b.mode {
-                        Mode::Fm => Mode::Nfm,
-                        Mode::Nfm => Mode::Am,
-                        Mode::Am => Mode::Lsb,
-                        Mode::Lsb => Mode::Usb,
-                        Mode::Usb => Mode::Cw,
-                        Mode::Cw => Mode::Dv,
-                        Mode::Dv => Mode::Dr,
-                        Mode::Dr => Mode::Wfm,
-                        Mode::Wfm => Mode::CwReverse,
-                        Mode::CwReverse => Mode::Fm,
+                        OperatingMode::Fm => OperatingMode::Nfm,
+                        OperatingMode::Nfm => OperatingMode::Am,
+                        OperatingMode::Am => OperatingMode::Lsb,
+                        OperatingMode::Lsb => OperatingMode::Usb,
+                        OperatingMode::Usb => OperatingMode::Cw,
+                        OperatingMode::Cw => OperatingMode::Dv,
+                        OperatingMode::Dv => OperatingMode::Dr,
+                        OperatingMode::Dr => OperatingMode::Wfm,
+                        OperatingMode::Wfm => OperatingMode::CwReverse,
+                        OperatingMode::CwReverse => OperatingMode::Fm,
                     };
-                    let _send = tx.send(crate::event::RadioCommand::SetMode {
+                    let _send = tx.send(crate::event::RadioCommand::SetOperatingMode {
                         band: kenwood_thd75::types::Band::B,
                         mode: next,
                     });
@@ -2507,34 +2540,34 @@ impl App {
                     self.status_message = Some("Active Band: BC command not yet wired".into());
                     return;
                 }
-                SettingRow::VfoMemModeA => {
+                SettingRow::TuningModeA => {
                     self.status_message = Some("VFO/Mem A: VM command not yet wired".into());
                     return;
                 }
-                SettingRow::VfoMemModeB => {
+                SettingRow::TuningModeB => {
                     self.status_message = Some("VFO/Mem B: VM command not yet wired".into());
                     return;
                 }
-                SettingRow::TncBaud => {
-                    let baud = if delta > 0 {
-                        kenwood_thd75::types::TncBaud::Bps9600
+                SettingRow::PacketDataRate => {
+                    let data_rate = if delta > 0 {
+                        kenwood_thd75::types::PacketDataRate::Bps9600
                     } else {
-                        kenwood_thd75::types::TncBaud::Bps1200
+                        kenwood_thd75::types::PacketDataRate::Bps1200
                     };
-                    let _send = tx.send(crate::event::RadioCommand::SetTncBaud(baud));
-                    self.status_message = Some(format!("TNC Baud → {baud}"));
+                    let _send = tx.send(crate::event::RadioCommand::SetPacketDataRate(data_rate));
+                    self.status_message = Some(format!("Packet Data Rate → {data_rate}"));
                     return;
                 }
-                SettingRow::BeaconType => {
-                    let cur = u8::from(self.state.beacon_type);
+                SettingRow::BeaconMode => {
+                    let cur = u8::from(self.state.beacon_mode);
                     let next = if delta > 0 {
                         cur.saturating_add(1).min(3)
                     } else {
                         cur.saturating_sub(1)
                     };
                     if let Ok(mode) = BeaconMode::try_from(next) {
-                        let _send = tx.send(crate::event::RadioCommand::SetBeaconType(mode));
-                        self.status_message = Some(format!("Beacon Type → {mode}"));
+                        let _send = tx.send(crate::event::RadioCommand::SetBeaconMode(mode));
+                        self.status_message = Some(format!("Beacon Mode → {mode}"));
                     }
                     return;
                 }
@@ -2556,399 +2589,642 @@ impl App {
             return;
         };
 
-        /// Compute a new numeric value by applying `delta` to the current value,
-        /// then write it via `modify_setting`.
-        macro_rules! adjust_numeric {
-            ($getter:ident, $setter:ident, $label:expr, $image:expr, $delta:expr, $tx:expr) => {{
-                let new_val = $image.settings().$getter().saturating_add_signed($delta);
-                if let Some((offset, value)) = $image.modify_setting(|w| w.$setter(new_val)) {
-                    let _send =
-                        $tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!("{} → {}, applying...", $label, new_val));
+        /// Read a typed setting, step it within an explicit typed domain, then
+        /// transactionally apply its typed setter.
+        macro_rules! adjust_typed {
+            ($getter:ident, $setter:ident, $step:expr, $label:expr, $display:expr) => {{
+                match image.settings().$getter() {
+                    Ok(current) => match ($step)(current, delta) {
+                        Some(next) => {
+                            let display = ($display)(next);
+                            match image.modify_setting(|writer| writer.$setter(next)) {
+                                Ok(Some((offset, value))) => {
+                                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte {
+                                        offset,
+                                        value,
+                                    });
+                                    self.status_message =
+                                        Some(format!("{} → {}, applying...", $label, display));
+                                }
+                                Ok(None) => {
+                                    self.status_message =
+                                        Some(format!("{} unchanged ({display})", $label));
+                                }
+                                Err(error) => {
+                                    self.status_message = Some(format!("{}: {error}", $label));
+                                }
+                            }
+                        }
+                        None => {
+                            self.status_message = Some(format!(
+                                "{}: current stored value is not an adjustable menu choice",
+                                $label
+                            ));
+                        }
+                    },
+                    Err(error) => {
+                        self.status_message = Some(format!("{}: {error}", $label));
+                    }
+                }
+            }};
+        }
+
+        /// Apply a numeric constructor that reports a validation error rather
+        /// than representing an invalid menu choice as absence.
+        macro_rules! adjust_validated_typed {
+            ($getter:ident, $setter:ident, $step:expr, $label:expr, $display:expr) => {{
+                match image.settings().$getter() {
+                    Ok(current) => match ($step)(current, delta) {
+                        Ok(next) => {
+                            let display = ($display)(next);
+                            match image.modify_setting(|writer| writer.$setter(next)) {
+                                Ok(Some((offset, value))) => {
+                                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte {
+                                        offset,
+                                        value,
+                                    });
+                                    self.status_message =
+                                        Some(format!("{} → {}, applying...", $label, display));
+                                }
+                                Ok(None) => {
+                                    self.status_message =
+                                        Some(format!("{} unchanged ({display})", $label));
+                                }
+                                Err(error) => {
+                                    self.status_message = Some(format!("{}: {error}", $label));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.status_message = Some(format!("{}: {error}", $label));
+                        }
+                    },
+                    Err(error) => {
+                        self.status_message = Some(format!("{}: {error}", $label));
+                    }
                 }
             }};
         }
 
         match row {
             SettingRow::SsbHighCut => {
-                adjust_numeric!(
+                adjust_typed!(
                     ssb_high_cut,
                     set_ssb_high_cut,
+                    |current: SsbHighCut, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            SsbHighCut::Khz2_2,
+                            SsbHighCut::Khz2_4,
+                            SsbHighCut::Khz2_6,
+                            SsbHighCut::Khz2_8,
+                            SsbHighCut::Khz3_0,
+                        ],
+                    ),
                     "SSB High Cut",
-                    image,
-                    delta,
-                    tx
+                    |value| format!("{value:?}")
                 );
             }
             SettingRow::CwWidth => {
-                adjust_numeric!(cw_width, set_cw_width, "CW Width", image, delta, tx);
+                adjust_typed!(
+                    cw_width,
+                    set_cw_width,
+                    |current: CwFilterWidth, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            CwFilterWidth::Khz0_3,
+                            CwFilterWidth::Khz0_5,
+                            CwFilterWidth::Khz1_0,
+                            CwFilterWidth::Khz1_5,
+                            CwFilterWidth::Khz2_0,
+                        ],
+                    ),
+                    "CW Width",
+                    |value| format!("{value:?}")
+                );
             }
             SettingRow::AmHighCut => {
-                adjust_numeric!(
+                adjust_typed!(
                     am_high_cut,
                     set_am_high_cut,
+                    |current: AmHighCut, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            AmHighCut::Khz3_0,
+                            AmHighCut::Khz4_5,
+                            AmHighCut::Khz6_0,
+                            AmHighCut::Khz7_5,
+                        ],
+                    ),
                     "AM High Cut",
-                    image,
-                    delta,
-                    tx
+                    |value| format!("{value:?}")
                 );
             }
             SettingRow::ScanResume => {
-                adjust_numeric!(
+                adjust_typed!(
                     scan_resume,
                     set_scan_resume,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            ScanResumeMethod::TimeOperated,
+                            ScanResumeMethod::CarrierOperated,
+                            ScanResumeMethod::Seek,
+                        ],
+                    ),
                     "Scan Resume",
-                    image,
-                    delta,
-                    tx
+                    |value| format!("{value:?}")
                 );
             }
             SettingRow::DigitalScanResume => {
-                adjust_numeric!(
+                adjust_typed!(
                     digital_scan_resume,
                     set_digital_scan_resume,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            ScanResumeMethod::TimeOperated,
+                            ScanResumeMethod::CarrierOperated,
+                            ScanResumeMethod::Seek,
+                        ],
+                    ),
                     "Dig Scan Resume",
-                    image,
-                    delta,
-                    tx
+                    |value| format!("{value:?}")
                 );
             }
             SettingRow::ScanRestartTime => {
-                adjust_numeric!(
+                adjust_validated_typed!(
                     scan_restart_time,
                     set_scan_restart_time,
+                    |current: ScanRestartDelay, direction| {
+                        let seconds = if direction > 0 {
+                            current.as_seconds().saturating_add(1).min(10)
+                        } else {
+                            current.as_seconds().saturating_sub(1).max(1)
+                        };
+                        ScanRestartDelay::new(seconds)
+                    },
                     "Scan Restart Time",
-                    image,
-                    delta,
-                    tx
+                    |value: ScanRestartDelay| format!("{} s", value.as_seconds())
                 );
             }
             SettingRow::ScanRestartCarrier => {
-                adjust_numeric!(
+                adjust_validated_typed!(
                     scan_restart_carrier,
                     set_scan_restart_carrier,
+                    |current: ScanRestartDelay, direction| {
+                        let seconds = if direction > 0 {
+                            current.as_seconds().saturating_add(1).min(10)
+                        } else {
+                            current.as_seconds().saturating_sub(1).max(1)
+                        };
+                        ScanRestartDelay::new(seconds)
+                    },
                     "Scan Restart Carrier",
-                    image,
-                    delta,
-                    tx
+                    |value: ScanRestartDelay| format!("{} s", value.as_seconds())
                 );
             }
             SettingRow::TimeoutTimer => {
-                // radio.TimeOutTimer: 0-10 indexes the minute table, NOT a minute count.
-                let new_val = if delta > 0 {
-                    image.settings().timeout_timer().saturating_add(1).min(10)
-                } else {
-                    image.settings().timeout_timer().saturating_sub(1)
-                };
-                if let Some((offset, value)) =
-                    image.modify_setting(|w| w.set_timeout_timer(new_val))
-                {
-                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!(
-                        "Timeout Timer → {} min, applying...",
-                        [
-                            "0.5", "1.0", "1.5", "2.0", "2.5", "3.0", "3.5", "4.0", "4.5", "5.0",
-                            "10.0",
-                        ]
-                        .get(new_val as usize)
-                        .unwrap_or(&"?")
-                    ));
-                }
+                adjust_typed!(
+                    timeout_timer,
+                    set_timeout_timer,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            TransmitTimeout::Seconds30,
+                            TransmitTimeout::Seconds60,
+                            TransmitTimeout::Seconds90,
+                            TransmitTimeout::Seconds120,
+                            TransmitTimeout::Seconds150,
+                            TransmitTimeout::Seconds180,
+                            TransmitTimeout::Seconds210,
+                            TransmitTimeout::Seconds240,
+                            TransmitTimeout::Seconds270,
+                            TransmitTimeout::Seconds300,
+                            TransmitTimeout::Seconds600,
+                        ],
+                    ),
+                    "Timeout Timer",
+                    |value: TransmitTimeout| format!("{} s", value.as_seconds())
+                );
             }
             SettingRow::BeatShift => {
-                // radio.BeatShift: eight types (raw 0-7 = Type 1-8), not on/off.
-                let cur = u8::from(image.settings().beat_shift());
-                let new_raw = if delta > 0 {
-                    cur.saturating_add(1).min(7)
-                } else {
-                    cur.saturating_sub(1)
-                };
-                if let Ok(shift) = kenwood_thd75::types::BeatShift::try_from(new_raw)
-                    && let Some((offset, value)) = image.modify_setting(|w| w.set_beat_shift(shift))
-                {
-                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!(
-                        "Beat Shift → Type {}, applying...",
-                        new_raw.saturating_add(1)
-                    ));
-                }
+                adjust_typed!(
+                    beat_shift,
+                    set_beat_shift,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            BeatShift::Type1,
+                            BeatShift::Type2,
+                            BeatShift::Type3,
+                            BeatShift::Type4,
+                            BeatShift::Type5,
+                            BeatShift::Type6,
+                            BeatShift::Type7,
+                            BeatShift::Type8,
+                        ],
+                    ),
+                    "Beat Shift",
+                    |value: BeatShift| format!("Type {}", u8::from(value) + 1)
+                );
             }
             SettingRow::CwPitch => {
-                adjust_numeric!(cw_pitch, set_cw_pitch, "CW Pitch", image, delta, tx);
+                adjust_typed!(
+                    cw_pitch,
+                    set_cw_pitch,
+                    |current: CwPitch, direction| {
+                        let hertz = if direction > 0 {
+                            current
+                                .as_hz()
+                                .saturating_add(CwPitch::STEP_HZ)
+                                .min(CwPitch::MAX_HZ)
+                        } else {
+                            current
+                                .as_hz()
+                                .saturating_sub(CwPitch::STEP_HZ)
+                                .max(CwPitch::MIN_HZ)
+                        };
+                        match CwPitch::new(hertz) {
+                            Ok(pitch) => Some(pitch),
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    hertz,
+                                    "clamped CW pitch violated the typed menu domain"
+                                );
+                                None
+                            }
+                        }
+                    },
+                    "CW Pitch",
+                    |value: CwPitch| format!("{} Hz", value.as_hz())
+                );
             }
             SettingRow::DtmfSpeed => {
-                adjust_numeric!(dtmf_speed, set_dtmf_speed, "DTMF Speed", image, delta, tx);
+                adjust_typed!(
+                    dtmf_speed,
+                    set_dtmf_speed,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            DtmfToneDuration::Ms50,
+                            DtmfToneDuration::Ms100,
+                            DtmfToneDuration::Ms150,
+                        ],
+                    ),
+                    "DTMF Speed",
+                    |value| format!("{value:?}")
+                );
             }
             SettingRow::DtmfPauseTime => {
-                adjust_numeric!(
+                adjust_typed!(
                     dtmf_pause_time,
                     set_dtmf_pause_time,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            DtmfPause::Ms100,
+                            DtmfPause::Ms250,
+                            DtmfPause::Ms500,
+                            DtmfPause::Ms750,
+                            DtmfPause::Ms1000,
+                            DtmfPause::Ms1500,
+                            DtmfPause::Ms2000,
+                        ],
+                    ),
                     "DTMF Pause",
-                    image,
-                    delta,
-                    tx
+                    |value| format!("{value:?}")
                 );
             }
             SettingRow::RepeaterCallKey => {
-                adjust_numeric!(
+                adjust_typed!(
                     repeater_call_key,
                     set_repeater_call_key,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[RepeaterCallKey::CallChannel, RepeaterCallKey::Tone1750Hz,],
+                    ),
                     "Call Key",
-                    image,
-                    delta,
-                    tx
+                    |value| format!("{value:?}")
                 );
             }
             SettingRow::MicSensitivity => {
-                // radio.MicSensitivity is inverted versus intuition: 0=High, 2=Low.
-                let new_val = if delta > 0 {
-                    image.settings().mic_sensitivity().saturating_add(1).min(2)
-                } else {
-                    image.settings().mic_sensitivity().saturating_sub(1)
-                };
-                if let Some((offset, value)) =
-                    image.modify_setting(|w| w.set_mic_sensitivity(new_val))
-                {
-                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!(
-                        "Mic Sens → {}, applying...",
-                        ["High", "Medium", "Low"]
-                            .get(new_val as usize)
-                            .unwrap_or(&"?")
-                    ));
-                }
+                adjust_typed!(
+                    mic_sensitivity,
+                    set_mic_sensitivity,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            MicSensitivity::High,
+                            MicSensitivity::Medium,
+                            MicSensitivity::Low,
+                        ],
+                    ),
+                    "Mic Sens",
+                    |value| format!("{value:?}")
+                );
             }
             SettingRow::PfKey1 => {
-                let new_val = next_pf_key(image.settings().pf_key1(), delta);
-                let mut write = Ok(());
-                let changed = image.modify_setting(|w| write = w.set_pf_key1(new_val));
-                if let Err(e) = write {
-                    self.status_message = Some(format!("PF Key 1: {e}"));
-                } else if let Some((offset, value)) = changed {
-                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!("PF Key 1 → {new_val}, applying..."));
-                }
+                adjust_typed!(
+                    pf_key1,
+                    set_pf_key1,
+                    next_pf_key,
+                    "PF Key 1",
+                    |value| format!("{value:?}")
+                );
             }
             SettingRow::PfKey2 => {
-                let new_val = next_pf_key(image.settings().pf_key2(), delta);
-                let mut write = Ok(());
-                let changed = image.modify_setting(|w| write = w.set_pf_key2(new_val));
-                if let Err(e) = write {
-                    self.status_message = Some(format!("PF Key 2: {e}"));
-                } else if let Some((offset, value)) = changed {
-                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!("PF Key 2 → {new_val}, applying..."));
-                }
+                adjust_typed!(
+                    pf_key2,
+                    set_pf_key2,
+                    next_pf_key,
+                    "PF Key 2",
+                    |value| format!("{value:?}")
+                );
             }
             SettingRow::BacklightControl => {
-                adjust_numeric!(
+                adjust_typed!(
                     backlight_control,
                     set_backlight_control,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            BacklightControl::Manual,
+                            BacklightControl::On,
+                            BacklightControl::Auto,
+                            BacklightControl::AutoDcIn,
+                        ],
+                    ),
                     "Backlight Ctrl",
-                    image,
-                    delta,
-                    tx
+                    |value| format!("{value:?}")
                 );
             }
             SettingRow::BacklightTimer => {
-                adjust_numeric!(
+                adjust_validated_typed!(
                     backlight_timer,
                     set_backlight_timer,
+                    |current: BacklightTimer, direction| {
+                        let seconds = if direction > 0 {
+                            current.as_seconds().saturating_add(1).min(60)
+                        } else {
+                            current.as_seconds().saturating_sub(1).max(3)
+                        };
+                        BacklightTimer::new(seconds)
+                    },
                     "Backlight Timer",
-                    image,
-                    delta,
-                    tx
+                    |value: BacklightTimer| format!("{} s", value.as_seconds())
                 );
             }
             SettingRow::EmrVolumeLevel => {
-                adjust_numeric!(
+                adjust_validated_typed!(
                     emr_volume_level,
                     set_emr_volume_level,
+                    |current: EmrVolume, direction| {
+                        let level = if direction > 0 {
+                            current.as_raw().saturating_add(1).min(EmrVolume::MAX)
+                        } else {
+                            current.as_raw().saturating_sub(1).max(EmrVolume::MIN)
+                        };
+                        EmrVolume::new(level)
+                    },
                     "EMR Vol",
-                    image,
-                    delta,
-                    tx
+                    |value: EmrVolume| format!("Level {}", value.as_raw())
                 );
             }
             SettingRow::AutoMuteReturnTime => {
-                adjust_numeric!(
+                adjust_validated_typed!(
                     auto_mute_return_time,
                     set_auto_mute_return_time,
+                    |current: AutoMuteReturnDelay, direction| {
+                        let seconds = if direction > 0 {
+                            current.as_seconds().saturating_add(1).min(10)
+                        } else {
+                            current.as_seconds().saturating_sub(1).max(1)
+                        };
+                        AutoMuteReturnDelay::new(seconds)
+                    },
                     "Auto Mute",
-                    image,
-                    delta,
-                    tx
+                    |value: AutoMuteReturnDelay| format!("{} s", value.as_seconds())
                 );
             }
             SettingRow::Announce => {
-                // radio.VoiceAnnounce: 0=Off, 1=Manual, 2=Auto1, 3=Auto2. This is a
-                // mode selector, not an on/off switch.
-                let new_val = if delta > 0 {
-                    image.settings().announce().saturating_add(1).min(3)
-                } else {
-                    image.settings().announce().saturating_sub(1)
-                };
-                if let Some((offset, value)) = image.modify_setting(|w| w.set_announce(new_val)) {
-                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!(
-                        "Announce → {}, applying...",
-                        ["Off", "Manual", "Auto1", "Auto2"]
-                            .get(new_val as usize)
-                            .unwrap_or(&"?")
-                    ));
-                }
+                adjust_typed!(
+                    announce,
+                    set_announce,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            VoiceAnnounceMode::Off,
+                            VoiceAnnounceMode::Manual,
+                            VoiceAnnounceMode::Auto1,
+                            VoiceAnnounceMode::Auto2,
+                        ],
+                    ),
+                    "Announce",
+                    |value| format!("{value:?}")
+                );
             }
             SettingRow::BeepVolume => {
-                // radio.BeepVolume: 0-7, where 0 is the legal "VOL Link" value.
-                adjust_numeric!(beep_volume, set_beep_volume, "Beep Vol", image, delta, tx);
+                adjust_validated_typed!(
+                    beep_volume,
+                    set_beep_volume,
+                    next_linked_volume,
+                    "Beep Vol",
+                    |value: LinkedVolumeLevel| value
+                        .fixed_level()
+                        .map_or_else(|| "VOL Link".to_owned(), |level| format!("Level {level}"),)
+                );
             }
             SettingRow::VoiceVolume => {
-                adjust_numeric!(
+                adjust_validated_typed!(
                     voice_volume,
                     set_voice_volume,
+                    next_linked_volume,
                     "Voice Vol",
-                    image,
-                    delta,
-                    tx
+                    |value: LinkedVolumeLevel| value
+                        .fixed_level()
+                        .map_or_else(|| "VOL Link".to_owned(), |level| format!("Level {level}"),)
                 );
             }
             SettingRow::VoiceSpeed => {
-                adjust_numeric!(
+                adjust_typed!(
                     voice_speed,
                     set_voice_speed,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            VoiceGuideSpeed::Speed1,
+                            VoiceGuideSpeed::Speed2,
+                            VoiceGuideSpeed::Speed3,
+                            VoiceGuideSpeed::Speed4,
+                        ],
+                    ),
                     "Voice Speed",
-                    image,
-                    delta,
-                    tx
+                    |value: VoiceGuideSpeed| format!("Speed {}", u8::from(value) + 1)
                 );
             }
             SettingRow::SpeedDistanceUnit => {
-                let new_val = if delta > 0 {
-                    image
-                        .settings()
-                        .speed_distance_unit_raw()
-                        .saturating_add(1)
-                        .min(2)
-                } else {
-                    image.settings().speed_distance_unit_raw().saturating_sub(1)
-                };
-                if let Some((offset, value)) =
-                    image.modify_setting(|w| w.set_speed_distance_unit_raw(new_val))
-                {
-                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!(
-                        "Speed Unit → {}, applying...",
-                        ["mph", "km/h", "knots"]
-                            .get(new_val as usize)
-                            .unwrap_or(&"?")
-                    ));
-                }
+                adjust_typed!(
+                    display_units,
+                    set_speed_distance_unit,
+                    |current: DisplayUnits, direction| step_selection(
+                        current.speed_distance,
+                        direction,
+                        &[
+                            SpeedDistanceUnit::MilesPerHour,
+                            SpeedDistanceUnit::KilometersPerHour,
+                            SpeedDistanceUnit::Knots,
+                        ],
+                    ),
+                    "Speed Unit",
+                    |value| match value {
+                        SpeedDistanceUnit::MilesPerHour => "mph".to_owned(),
+                        SpeedDistanceUnit::KilometersPerHour => "km/h".to_owned(),
+                        SpeedDistanceUnit::Knots => "knots".to_owned(),
+                    }
+                );
             }
             SettingRow::AltitudeRainUnit => {
-                let new_val = if delta > 0 {
-                    image
-                        .settings()
-                        .altitude_rain_unit_raw()
-                        .saturating_add(1)
-                        .min(1)
-                } else {
-                    image.settings().altitude_rain_unit_raw().saturating_sub(1)
-                };
-                if let Some((offset, value)) =
-                    image.modify_setting(|w| w.set_altitude_rain_unit_raw(new_val))
-                {
-                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!(
-                        "Alt Unit → {}, applying...",
-                        if new_val == 0 { "ft/in" } else { "m/mm" }
-                    ));
-                }
+                adjust_typed!(
+                    display_units,
+                    set_altitude_rain_unit,
+                    |current: DisplayUnits, direction| step_selection(
+                        current.altitude_rain,
+                        direction,
+                        &[AltitudeRainUnit::FeetInch, AltitudeRainUnit::MetersMm],
+                    ),
+                    "Alt Unit",
+                    |value| match value {
+                        AltitudeRainUnit::FeetInch => "ft/in".to_owned(),
+                        AltitudeRainUnit::MetersMm => "m/mm".to_owned(),
+                    }
+                );
             }
             SettingRow::TemperatureUnit => {
-                let new_val = if delta > 0 {
-                    image
-                        .settings()
-                        .temperature_unit_raw()
-                        .saturating_add(1)
-                        .min(1)
-                } else {
-                    image.settings().temperature_unit_raw().saturating_sub(1)
-                };
-                if let Some((offset, value)) =
-                    image.modify_setting(|w| w.set_temperature_unit_raw(new_val))
-                {
-                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!(
-                        "Temp Unit → {}, applying...",
-                        if new_val == 0 { "°F" } else { "°C" }
-                    ));
-                }
+                adjust_typed!(
+                    display_units,
+                    set_temperature_unit,
+                    |current: DisplayUnits, direction| step_selection(
+                        current.temperature,
+                        direction,
+                        &[TemperatureUnit::Fahrenheit, TemperatureUnit::Celsius],
+                    ),
+                    "Temp Unit",
+                    |value| match value {
+                        TemperatureUnit::Fahrenheit => "°F".to_owned(),
+                        TemperatureUnit::Celsius => "°C".to_owned(),
+                    }
+                );
             }
             SettingRow::GpsBtInterface => {
-                adjust_numeric!(
-                    gps_bt_interface,
-                    set_gps_bt_interface,
-                    "GPS/BT",
-                    image,
-                    delta,
-                    tx
+                adjust_typed!(
+                    gps_pc_output_interface,
+                    set_gps_pc_output_interface,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[PcOutputInterface::Usb, PcOutputInterface::Bluetooth],
+                    ),
+                    "GPS PC Interface",
+                    |value| match value {
+                        PcOutputInterface::Usb => "USB".to_owned(),
+                        PcOutputInterface::Bluetooth => "Bluetooth".to_owned(),
+                    }
                 );
             }
             SettingRow::AprsUsbMode => {
-                adjust_numeric!(
-                    aprs_usb_mode,
-                    set_aprs_usb_mode,
-                    "APRS USB",
-                    image,
-                    delta,
-                    tx
+                adjust_typed!(
+                    aprs_pc_output_interface,
+                    set_aprs_pc_output_interface,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[PcOutputInterface::Usb, PcOutputInterface::Bluetooth],
+                    ),
+                    "APRS PC Interface",
+                    |value| match value {
+                        PcOutputInterface::Usb => "USB".to_owned(),
+                        PcOutputInterface::Bluetooth => "Bluetooth".to_owned(),
+                    }
+                );
+            }
+            SettingRow::Language => {
+                adjust_typed!(
+                    language,
+                    set_language,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[Language::English, Language::Japanese],
+                    ),
+                    "Language",
+                    |value| match value {
+                        Language::English => "English".to_owned(),
+                        Language::Japanese => "Japanese".to_owned(),
+                    }
                 );
             }
             SettingRow::BatterySaver => {
-                // radio.BatterySaver: 0=Off, 1-9 select the 0.2-5.0 s saver
-                // interval. This is a 10-value selector, not an on/off switch.
-                let new_val = if delta > 0 {
-                    image.settings().battery_saver().saturating_add(1).min(9)
-                } else {
-                    image.settings().battery_saver().saturating_sub(1)
-                };
-                if let Some((offset, value)) =
-                    image.modify_setting(|w| w.set_battery_saver(new_val))
-                {
-                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!(
-                        "Battery Saver → {}, applying...",
-                        [
-                            "Off", "0.2 s", "0.4 s", "0.6 s", "0.8 s", "1.0 s", "2.0 s", "3.0 s",
-                            "4.0 s", "5.0 s",
-                        ]
-                        .get(new_val as usize)
-                        .unwrap_or(&"?")
-                    ));
-                }
+                adjust_typed!(
+                    battery_saver,
+                    set_battery_saver,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            BatterySaverInterval::Off,
+                            BatterySaverInterval::Seconds0_2,
+                            BatterySaverInterval::Seconds0_4,
+                            BatterySaverInterval::Seconds0_6,
+                            BatterySaverInterval::Seconds0_8,
+                            BatterySaverInterval::Seconds1,
+                            BatterySaverInterval::Seconds2,
+                            BatterySaverInterval::Seconds3,
+                            BatterySaverInterval::Seconds4,
+                            BatterySaverInterval::Seconds5,
+                        ],
+                    ),
+                    "Battery Saver",
+                    |value| format!("{value:?}")
+                );
             }
             SettingRow::AutoPowerOff => {
-                // radio.AutoPowerOff: 0=Off, 1=15 min, 2=30 min, 3=60 min.
-                let new_val = if delta > 0 {
-                    image
-                        .settings()
-                        .auto_power_off_raw()
-                        .saturating_add(1)
-                        .min(3)
-                } else {
-                    image.settings().auto_power_off_raw().saturating_sub(1)
-                };
-                if let Some((offset, value)) =
-                    image.modify_setting(|w| w.set_auto_power_off_raw(new_val))
-                {
-                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte { offset, value });
-                    self.status_message = Some(format!(
-                        "Auto PwrOff → {}, applying...",
-                        ["Off", "15 min", "30 min", "60 min"]
-                            .get(new_val as usize)
-                            .unwrap_or(&"?")
-                    ));
-                }
+                adjust_typed!(
+                    auto_power_off,
+                    set_auto_power_off,
+                    |current, direction| step_selection(
+                        current,
+                        direction,
+                        &[
+                            AutoPowerOff::Off,
+                            AutoPowerOff::Min15,
+                            AutoPowerOff::Min30,
+                            AutoPowerOff::Min60,
+                        ],
+                    ),
+                    "Auto PwrOff",
+                    |value| match value {
+                        AutoPowerOff::Off => "Off".to_owned(),
+                        AutoPowerOff::Min15 => "15 min".to_owned(),
+                        AutoPowerOff::Min30 => "30 min".to_owned(),
+                        AutoPowerOff::Min60 => "60 min".to_owned(),
+                    }
+                );
             }
             _ => {
                 self.status_message = Some(format!("{}: not adjustable", row.label()));
@@ -3008,19 +3284,31 @@ impl App {
                     Some(format!("APRS msg from {}: {}", msg.addressee, msg.text));
             }
             AprsEvent::MessageDelivered(id) => {
-                if let Some(m) = self.aprs_messages.iter_mut().find(|m| m.message_id == id) {
+                if let Some(m) = self
+                    .aprs_messages
+                    .iter_mut()
+                    .find(|m| m.message_id.as_str() == id.as_str())
+                {
                     m.state = AprsMessageState::Delivered;
                 }
                 self.status_message = Some(format!("Message {id} delivered"));
             }
             AprsEvent::MessageRejected(id) => {
-                if let Some(m) = self.aprs_messages.iter_mut().find(|m| m.message_id == id) {
+                if let Some(m) = self
+                    .aprs_messages
+                    .iter_mut()
+                    .find(|m| m.message_id.as_str() == id.as_str())
+                {
                     m.state = AprsMessageState::Rejected;
                 }
                 self.status_message = Some(format!("Message {id} rejected"));
             }
             AprsEvent::MessageExpired(id) => {
-                if let Some(m) = self.aprs_messages.iter_mut().find(|m| m.message_id == id) {
+                if let Some(m) = self
+                    .aprs_messages
+                    .iter_mut()
+                    .find(|m| m.message_id.as_str() == id.as_str())
+                {
                     m.state = AprsMessageState::Expired;
                 }
                 self.status_message = Some(format!("Message {id} expired"));
@@ -3081,28 +3369,37 @@ impl App {
     }
 
     /// Toggle APRS mode on or off.
-    fn handle_dstar_event(&mut self, event: kenwood_thd75::DStarEvent) {
-        use kenwood_thd75::DStarEvent;
+    fn handle_dstar_event(&mut self, event: kenwood_thd75::DstarEvent) {
+        use kenwood_thd75::DstarEvent;
         match event {
-            DStarEvent::VoiceStart(header) => {
+            DstarEvent::VoiceStart(header) => {
                 self.dstar_rx_active = true;
                 self.dstar_rx_header = Some(header);
                 self.dstar_text_message = None;
             }
-            DStarEvent::VoiceData(_frame) => {
+            DstarEvent::VoiceData(_frame) => {
                 // Voice data: no UI action needed.
             }
-            DStarEvent::VoiceEnd => {
+            DstarEvent::VoiceEnd => {
                 self.dstar_rx_active = false;
             }
-            DStarEvent::VoiceLost => {
+            DstarEvent::VoiceLost => {
                 self.dstar_rx_active = false;
                 self.status_message = Some("D-STAR: voice lost (no clean EOT)".into());
             }
-            DStarEvent::TextMessage(text) => {
+            DstarEvent::EventsDropped { count } => {
+                self.dstar_rx_active = false;
+                self.dstar_rx_header = None;
+                self.status_message =
+                    Some(format!("D-STAR: modem event stream lost {count} event(s)"));
+            }
+            DstarEvent::ProtocolViolation(violation) => {
+                self.status_message = Some(format!("D-STAR: {violation}"));
+            }
+            DstarEvent::TextMessage(text) => {
                 self.dstar_text_message = Some(text);
             }
-            DStarEvent::StationHeard(entry) => {
+            DstarEvent::StationHeard(entry) => {
                 // Update the last-heard list (newest first).
                 if let Some(idx) = self
                     .dstar_last_heard
@@ -3115,34 +3412,41 @@ impl App {
                 // Limit to 100 entries.
                 self.dstar_last_heard.truncate(100);
             }
-            DStarEvent::UrCallCommand(action) => {
+            DstarEvent::UrCallCommand(action) => {
                 self.status_message = Some(format!("D-STAR: URCALL command detected: {action:?}"));
             }
-            DStarEvent::StatusUpdate(_status) => {
+            DstarEvent::StatusUpdate(_status) => {
                 // Modem status: no UI action needed.
+            }
+            DstarEvent::ModemEvent(event) => {
+                self.status_message = Some(format!("D-STAR modem: {event:?}"));
             }
         }
     }
 
     fn toggle_gps(&mut self) {
-        let next = !self.state.gps_enabled;
+        let Some(current) = self.state.gps_settings else {
+            self.status_message = Some("GPS settings unavailable; reconnect to refresh".into());
+            return;
+        };
+        let next = !current.enabled();
         if let Some(ref tx) = self.cmd_tx {
-            let _send = tx.send(crate::event::RadioCommand::SetGpsConfig(
-                next,
-                self.state.gps_pc_output,
-            ));
+            let settings = GpsSettings::new(next, current.pc_output());
+            let _send = tx.send(crate::event::RadioCommand::SetGpsSettings(settings));
             self.status_message =
                 Some(format!("GPS {}", if next { "enabled" } else { "disabled" }));
         }
     }
 
     fn toggle_gps_pc_output(&mut self) {
-        let next = !self.state.gps_pc_output;
+        let Some(current) = self.state.gps_settings else {
+            self.status_message = Some("GPS settings unavailable; reconnect to refresh".into());
+            return;
+        };
+        let next = !current.pc_output();
         if let Some(ref tx) = self.cmd_tx {
-            let _send = tx.send(crate::event::RadioCommand::SetGpsConfig(
-                self.state.gps_enabled,
-                next,
-            ));
+            let settings = GpsSettings::new(current.enabled(), next);
+            let _send = tx.send(crate::event::RadioCommand::SetGpsSettings(settings));
             self.status_message = Some(format!(
                 "GPS PC Output {}",
                 if next { "enabled" } else { "disabled" }
@@ -3152,28 +3456,45 @@ impl App {
 
     fn toggle_dstar_mode(&mut self) {
         match self.dstar_mode {
-            DStarMode::Inactive => {
-                // Build D-STAR config from MCP data if available.
-                let callsign = if let McpState::Loaded { ref image, .. } = self.mcp {
-                    let cs = image.dstar().my_callsign();
-                    if cs.is_empty() {
-                        "N0CALL".to_string()
-                    } else {
-                        cs
+            DstarMode::Inactive => {
+                let callsign = if let McpState::Loaded { image, .. } = &self.mcp {
+                    match image.dstar().my_callsign() {
+                        Ok(Some(callsign)) => callsign,
+                        Ok(None) => {
+                            self.status_message = Some(
+                                "D-STAR MY callsign is not configured; set Menu 610 before entering gateway mode"
+                                    .into(),
+                            );
+                            return;
+                        }
+                        Err(error @ DstarReadError::MissingRange { .. }) => {
+                            self.status_message =
+                                Some(format!("D-STAR MY callsign data is incomplete: {error}"));
+                            return;
+                        }
+                        Err(error) => {
+                            self.status_message =
+                                Some(format!("D-STAR MY callsign data is invalid: {error}"));
+                            return;
+                        }
                     }
                 } else {
-                    "N0CALL".to_string()
+                    self.status_message = Some(
+                        "D-STAR MY callsign unavailable; load MCP data before entering gateway mode"
+                            .into(),
+                    );
+                    return;
                 };
 
-                let config = kenwood_thd75::DStarGatewayConfig::new(&callsign);
+                let config = kenwood_thd75::DstarGatewayConfig::new(callsign);
                 if let Some(ref tx) = self.cmd_tx {
-                    let _send = tx.send(crate::event::RadioCommand::EnterDStar { config });
+                    let _send = tx.send(crate::event::RadioCommand::EnterDstar { config });
                     self.status_message = Some("Entering D-STAR gateway mode...".into());
                 }
             }
-            DStarMode::Active => {
+            DstarMode::Active => {
                 if let Some(ref tx) = self.cmd_tx {
-                    let _send = tx.send(crate::event::RadioCommand::ExitDStar);
+                    let _send = tx.send(crate::event::RadioCommand::ExitDstar);
                     self.status_message = Some("Exiting D-STAR gateway mode...".into());
                 }
             }
@@ -3181,21 +3502,13 @@ impl App {
     }
 
     fn toggle_fm_radio(&mut self) {
-        let next = !self.fm_radio_on;
-        if let Some(ref tx) = self.cmd_tx {
-            let _send = tx.send(crate::event::RadioCommand::SetFmRadio(next));
-            self.fm_radio_on = next;
-            self.status_message = Some(format!(
-                "FM Radio {}",
-                if next { "enabled" } else { "disabled" }
-            ));
-        }
+        self.status_message =
+            Some("FM Radio is read-only: retained hardware evidence rejects FR writes".into());
     }
 
     /// Apply a channel edit from the edit buffer.
     ///
-    /// This does not write the selected memory record. A frequency entry sends
-    /// the currently quarantined live-band tune request, mode changes only the
+    /// This does not write the selected memory record. Mode changes only the
     /// live band, and the remaining fields report that no editor is available.
     fn apply_channel_edit(&mut self, field: ChannelEditField, buf: &str) {
         if buf.is_empty() {
@@ -3203,65 +3516,43 @@ impl App {
             return;
         }
 
-        let used = self.filtered_channels();
+        let used = match self.filtered_channels() {
+            Ok(used) => used,
+            Err(error) => {
+                self.status_message = Some(format!("Channel data unavailable: {error}"));
+                return;
+            }
+        };
         let Some(&ch_num) = used.get(self.channel_list_index) else {
             self.status_message = Some("No channel selected".into());
             return;
         };
 
         match field {
-            ChannelEditField::Frequency => {
-                // Parse as MHz, tune via CAT. `parse::<f64>` accepts
-                // negatives, NaN, and infinity; an unguarded `as u32`
-                // would silently saturate those, so reject anything
-                // outside the D75 tuning range before casting.
-                if let Ok(mhz) = buf.parse::<f64>()
-                    && mhz.is_finite()
-                    && (0.0..=1300.0).contains(&mhz)
-                {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        reason = "The guard above rejects non-finite, negative, and \
-                                  > 1300 MHz inputs, so `mhz * 1e6` is within 0..=1.3e9 \
-                                  and the `as u32` cast cannot saturate or lose sign."
-                    )]
-                    let hz = (mhz * 1_000_000.0) as u32;
-                    if let Some(ref tx) = self.cmd_tx {
-                        let _send = tx.send(crate::event::RadioCommand::TuneFreq {
-                            band: self.target_band,
-                            freq: hz,
-                        });
-                        self.status_message = Some(format!("Ch {ch_num}: tuning to {mhz:.6} MHz"));
-                    }
-                } else {
-                    self.status_message = Some(format!("Invalid frequency: {buf}"));
-                }
-            }
             ChannelEditField::Name => {
                 // Channel name editing requires MCP write (no CAT command for name-only).
                 self.status_message = Some(format!(
                     "Ch {ch_num}: name editing requires MCP write; use MCP panel (m)"
                 ));
             }
-            ChannelEditField::Mode => {
+            ChannelEditField::OperatingMode => {
                 // Cycle mode via CAT
                 if let Some(ref tx) = self.cmd_tx {
-                    use kenwood_thd75::types::Mode;
+                    use kenwood_thd75::types::OperatingMode;
                     let mode = match buf.to_uppercase().as_str() {
-                        "FM" => Some(Mode::Fm),
-                        "NFM" => Some(Mode::Nfm),
-                        "AM" => Some(Mode::Am),
-                        "DV" => Some(Mode::Dv),
-                        "LSB" => Some(Mode::Lsb),
-                        "USB" => Some(Mode::Usb),
-                        "CW" => Some(Mode::Cw),
-                        "DR" => Some(Mode::Dr),
-                        "WFM" => Some(Mode::Wfm),
+                        "FM" => Some(OperatingMode::Fm),
+                        "NFM" => Some(OperatingMode::Nfm),
+                        "AM" => Some(OperatingMode::Am),
+                        "DV" => Some(OperatingMode::Dv),
+                        "LSB" => Some(OperatingMode::Lsb),
+                        "USB" => Some(OperatingMode::Usb),
+                        "CW" => Some(OperatingMode::Cw),
+                        "DR" => Some(OperatingMode::Dr),
+                        "WFM" => Some(OperatingMode::Wfm),
                         _ => None,
                     };
                     if let Some(mode) = mode {
-                        let _send = tx.send(crate::event::RadioCommand::SetMode {
+                        let _send = tx.send(crate::event::RadioCommand::SetOperatingMode {
                             band: self.target_band,
                             mode,
                         });
@@ -3277,10 +3568,9 @@ impl App {
             | ChannelEditField::ToneFreq
             | ChannelEditField::Duplex
             | ChannelEditField::Offset => {
-                // These fields are stored in the ME channel record. The full
-                // ME writer is quarantined until every field can be preserved;
-                // permanent memory storage would instead require a verified
-                // MCP editor.
+                // These fields are stored in the ME channel record. No
+                // hardware-qualified ME writer is exposed; permanent memory
+                // storage would instead require a verified MCP editor.
                 self.status_message = Some(format!(
                     "Ch {ch_num}: {} editing not yet implemented; requires ME write",
                     field.label()
@@ -3292,22 +3582,26 @@ impl App {
     fn toggle_aprs_mode(&mut self) {
         match self.aprs_mode {
             AprsMode::Inactive => {
-                // Source the operator's callsign+SSID from defaults
-                // rather than from a sub-page MCP offset. The previous
-                // implementation read `image.aprs().my_callsign()`, but
-                // that accessor was removed from `kenwood_thd75::memory`
-                // when its offset (imported from D74 development notes)
-                // could not be verified against D75 firmware or
-                // hardware.
-                //
-                // TODO: replace this default with a CAT-side `MY?` read
-                // once that wraps the live value, or with an MCP read
-                // once a verified offset is available. Tracking the
-                // verification work belongs in `thd75/src/memory/aprs.rs`
-                // module docs.
-                let (callsign, ssid) = ("N0CALL".to_string(), 7u8);
+                // The live CS read is the authority for the station identity.
+                // Never substitute a placeholder callsign into a mode that can
+                // transmit on the operator's behalf.
+                let Some(callsign) = self.state.aprs_callsign.as_ref() else {
+                    self.status_message = Some(
+                        "Cannot enter APRS mode: the radio has no readable APRS callsign".into(),
+                    );
+                    return;
+                };
 
-                let config = Box::new(kenwood_thd75::AprsClientConfig::new(&callsign, ssid));
+                let config = match kenwood_thd75::AprsClientConfig::new(callsign.address().clone())
+                {
+                    Ok(config) => Box::new(config),
+                    Err(error) => {
+                        self.status_message = Some(format!(
+                            "Cannot enter APRS mode with the configured station identity: {error}"
+                        ));
+                        return;
+                    }
+                };
                 if let Some(ref tx) = self.cmd_tx {
                     let _send = tx.send(crate::event::RadioCommand::EnterAprs { config });
                     self.status_message = Some("Entering APRS mode...".into());
@@ -3326,19 +3620,61 @@ impl App {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use kenwood_thd75::types::{
+        FrontPanelPfFunction, GpsSettings, LinkedVolumeLevel, StoredFrontPanelPfAssignment,
+    };
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    use super::{App, McpState, Message, RadioState, next_pf_key, parse_reflector_input};
+    use super::{
+        App, AprsMode, AprsStationCache, DstarMode, InputMode, MainView, McpState, Message, Pane,
+        RadioState, SettingRow, cat_settings, next_linked_volume, next_pf_key,
+        parse_reflector_input,
+    };
     use crate::event::RadioCommand;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn pf_key_step_recovers_from_exact_off_menu_bytes() {
+    fn linked_volume_steps_across_link_and_fixed_levels_and_saturates() -> TestResult {
+        let level_1 = LinkedVolumeLevel::fixed(1)?;
+        let level_7 = LinkedVolumeLevel::fixed(7)?;
+
+        assert_eq!(
+            next_linked_volume(LinkedVolumeLevel::VOLUME_LINK, 1)?,
+            level_1
+        );
+        assert_eq!(
+            next_linked_volume(level_1, -1)?,
+            LinkedVolumeLevel::VOLUME_LINK
+        );
+        assert_eq!(next_linked_volume(level_7, 1)?, level_7);
+        assert_eq!(
+            next_linked_volume(LinkedVolumeLevel::VOLUME_LINK, -1)?,
+            LinkedVolumeLevel::VOLUME_LINK
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pf_key_step_refuses_to_invent_an_assignment_for_off_menu_bytes() {
         for raw in [31, 0xFF] {
-            assert_eq!(next_pf_key(raw, 1), 30);
-            assert_eq!(next_pf_key(raw, -1), 29);
+            assert_eq!(
+                next_pf_key(StoredFrontPanelPfAssignment::from(raw), 1),
+                None
+            );
+            assert_eq!(
+                next_pf_key(StoredFrontPanelPfAssignment::from(raw), -1),
+                None
+            );
         }
+
+        assert_eq!(
+            next_pf_key(
+                StoredFrontPanelPfAssignment::Official(FrontPanelPfFunction::VoiceMessage4),
+                1,
+            ),
+            Some(FrontPanelPfFunction::VoiceGuidance)
+        );
     }
 
     // ── Reducer: `update(Message) -> bool` ────────────────────────
@@ -3459,6 +3795,84 @@ mod tests {
         );
     }
 
+    fn dstar_gateway_app() -> (App, UnboundedReceiver<RadioCommand>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::with_cache_path(String::new(), None);
+        app.cmd_tx = Some(tx);
+        (app, rx)
+    }
+
+    #[test]
+    fn dstar_gateway_uses_the_validated_mcp_callsign() -> TestResult {
+        let (mut app, mut rx) = dstar_gateway_app();
+        let mut raw = vec![0u8; 500_480];
+        raw.get_mut(0x1CA8..0x1CB0)
+            .ok_or("MY-callsign field missing from test image")?
+            .copy_from_slice(b"KQ4NIT  ");
+        assert!(app.update(Message::McpReadComplete(raw)));
+
+        app.toggle_dstar_mode();
+        match rx.try_recv()? {
+            RadioCommand::EnterDstar { config } => {
+                assert_eq!(config.callsign.as_str(), "KQ4NIT");
+            }
+            other => return Err(format!("expected EnterDstar, got {other:?}").into()),
+        }
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Entering D-STAR gateway mode...")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dstar_gateway_refuses_to_fabricate_an_unconfigured_callsign() {
+        let (mut app, mut rx) = dstar_gateway_app();
+        assert!(app.update(Message::McpReadComplete(vec![0u8; 500_480])));
+
+        app.toggle_dstar_mode();
+        assert!(
+            rx.try_recv().is_err(),
+            "an unconfigured MY callsign must not emit EnterDstar"
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("D-STAR MY callsign is not configured; set Menu 610 before entering gateway mode")
+        );
+    }
+
+    #[test]
+    fn dstar_gateway_surfaces_invalid_or_unavailable_mcp_data() -> TestResult {
+        let (mut unavailable, mut unavailable_rx) = dstar_gateway_app();
+        unavailable.toggle_dstar_mode();
+        assert!(unavailable_rx.try_recv().is_err());
+        assert_eq!(
+            unavailable.status_message.as_deref(),
+            Some("D-STAR MY callsign unavailable; load MCP data before entering gateway mode")
+        );
+
+        let (mut invalid, mut invalid_rx) = dstar_gateway_app();
+        let mut raw = vec![0u8; 500_480];
+        *raw.get_mut(0x1CA1)
+            .ok_or("MY-callsign selector missing from test image")? = 6;
+        assert!(invalid.update(Message::McpReadComplete(raw)));
+        invalid.toggle_dstar_mode();
+        assert!(invalid_rx.try_recv().is_err());
+        let status = invalid
+            .status_message
+            .as_deref()
+            .ok_or("invalid MCP data must set a status message")?;
+        assert!(
+            status.starts_with("D-STAR MY callsign data is invalid:"),
+            "unexpected status: {status}"
+        );
+        assert!(
+            status.contains("invalid value 6"),
+            "unexpected status: {status}"
+        );
+        Ok(())
+    }
+
     /// `McpProgress` must not mistake a write for a read: while a write
     /// is in flight, progress ticks stay `Writing` (the UI otherwise
     /// reports "Reading page N/M" during a write).
@@ -3505,6 +3919,30 @@ mod tests {
 
         assert!(app.update(Message::Reconnected));
         assert!(app.connected, "Reconnected sets it again");
+    }
+
+    #[test]
+    fn mode_recovery_failures_never_claim_that_cat_polling_resumed() {
+        let mut app = App::with_cache_path(String::new(), None);
+        app.connected = true;
+        assert!(app.update(Message::AprsStarted));
+        assert!(app.update(Message::AprsRecoveryFailed("identity proof failed".into())));
+        assert_eq!(app.aprs_mode, AprsMode::Inactive);
+        assert!(!app.connected);
+        let aprs_status = app.status_message.as_deref().unwrap_or_default();
+        assert!(aprs_status.contains("without usable CAT control"));
+        assert!(!aprs_status.contains("polling resumed"));
+
+        app.connected = true;
+        assert!(app.update(Message::DstarStarted));
+        assert!(app.update(Message::DstarRecoveryFailed(
+            "transport reopen failed".into()
+        )));
+        assert_eq!(app.dstar_mode, DstarMode::Inactive);
+        assert!(!app.connected);
+        let dstar_status = app.status_message.as_deref().unwrap_or_default();
+        assert!(dstar_status.contains("without usable CAT control"));
+        assert!(!dstar_status.contains("polling resumed"));
     }
 
     #[test]
@@ -3577,8 +4015,212 @@ mod tests {
         (app, rx)
     }
 
+    fn aprs_compose_app() -> (App, UnboundedReceiver<RadioCommand>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::with_cache_path(String::new(), None);
+        app.cmd_tx = Some(tx);
+        app.aprs_compose = Some(String::new());
+        app.aprs_stations.push(AprsStationCache {
+            callsign: "W1AW".to_owned(),
+            latitude: None,
+            longitude: None,
+            speed_knots: None,
+            course_degrees: None,
+            symbol_table: None,
+            symbol_code: None,
+            comment: None,
+            packet_count: 1,
+            last_path: Vec::new(),
+            last_heard: std::time::Instant::now(),
+        });
+        (app, rx)
+    }
+
+    #[test]
+    fn aprs_compose_emits_validated_message_values() -> TestResult {
+        let (mut app, mut rx) = aprs_compose_app();
+        type_str(&mut app, "Hello");
+        press(&mut app, KeyCode::Enter);
+
+        match rx.try_recv()? {
+            RadioCommand::SendAprsMessage { addressee, text } => {
+                assert_eq!(addressee.as_str(), "W1AW");
+                assert_eq!(text.as_str(), "Hello");
+                Ok(())
+            }
+            other => Err(format!("expected SendAprsMessage, got {other:?}").into()),
+        }
+    }
+
+    #[test]
+    fn aprs_compose_rejects_unrepresentable_text_before_radio_task() -> TestResult {
+        let (mut app, mut rx) = aprs_compose_app();
+        type_str(&mut app, "reserved | telemetry delimiter");
+        press(&mut app, KeyCode::Enter);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "invalid text emitted a radio command"
+        );
+        let status = app.status_message.ok_or("expected validation status")?;
+        assert!(status.contains("Invalid APRS message"));
+        Ok(())
+    }
+
+    fn app_with_gps_settings(settings: GpsSettings) -> (App, UnboundedReceiver<RadioCommand>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::with_cache_path(String::new(), None);
+        app.cmd_tx = Some(tx);
+        app.state.gps_settings = Some(settings);
+        (app, rx)
+    }
+
+    fn assert_gps_settings(
+        rx: &mut UnboundedReceiver<RadioCommand>,
+        expected: GpsSettings,
+    ) -> TestResult {
+        match rx.try_recv()? {
+            RadioCommand::SetGpsSettings(actual) => {
+                assert_eq!(actual, expected);
+                Ok(())
+            }
+            other => Err(format!("expected SetGpsSettings, got {other:?}").into()),
+        }
+    }
+
+    #[test]
+    fn gps_shortcuts_preserve_the_other_settings_field() -> TestResult {
+        let (mut gps_app, mut gps_rx) = app_with_gps_settings(GpsSettings::new(false, true));
+        gps_app.toggle_gps();
+        assert_gps_settings(&mut gps_rx, GpsSettings::new(true, true))?;
+
+        let (mut output_app, mut output_rx) = app_with_gps_settings(GpsSettings::new(true, false));
+        output_app.toggle_gps_pc_output();
+        assert_gps_settings(&mut output_rx, GpsSettings::new(true, true))
+    }
+
+    #[test]
+    fn gps_settings_rows_preserve_the_other_settings_field() -> TestResult {
+        let gps_rows = cat_settings();
+        let gps_enabled_index = gps_rows
+            .iter()
+            .position(|row| *row == SettingRow::GpsEnabled)
+            .ok_or("GPS enabled row missing")?;
+        let gps_output_index = gps_rows
+            .iter()
+            .position(|row| *row == SettingRow::GpsPcOutput)
+            .ok_or("GPS PC output row missing")?;
+
+        let (mut gps_app, mut gps_rx) = app_with_gps_settings(GpsSettings::new(false, true));
+        gps_app.main_view = MainView::SettingsCat;
+        gps_app.settings_cat_index = gps_enabled_index;
+        gps_app.toggle_setting();
+        assert_gps_settings(&mut gps_rx, GpsSettings::new(true, true))?;
+
+        let (mut output_app, mut output_rx) = app_with_gps_settings(GpsSettings::new(true, false));
+        output_app.main_view = MainView::SettingsCat;
+        output_app.settings_cat_index = gps_output_index;
+        output_app.toggle_setting();
+        assert_gps_settings(&mut output_rx, GpsSettings::new(true, true))
+    }
+
+    #[test]
+    fn gps_toggles_refuse_when_current_settings_are_unavailable() -> TestResult {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::with_cache_path(String::new(), None);
+        app.cmd_tx = Some(tx);
+
+        app.toggle_gps();
+        assert!(
+            rx.try_recv().is_err(),
+            "unknown GPS state must not emit a write"
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("GPS settings unavailable; reconnect to refresh")
+        );
+
+        app.toggle_gps_pc_output();
+        assert!(
+            rx.try_recv().is_err(),
+            "unknown PC-output state must not emit a write"
+        );
+
+        app.main_view = MainView::SettingsCat;
+        let rows = cat_settings();
+        for target in [SettingRow::GpsEnabled, SettingRow::GpsPcOutput] {
+            app.settings_cat_index = rows
+                .iter()
+                .position(|row| *row == target)
+                .ok_or("GPS settings row missing")?;
+            app.toggle_setting();
+            assert!(
+                rx.try_recv().is_err(),
+                "unknown GPS settings state must not emit a write"
+            );
+        }
+        Ok(())
+    }
+
     fn press(app: &mut App, code: KeyCode) {
         let _render = app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn band_panes_do_not_offer_arbitrary_frequency_entry() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::with_cache_path(String::new(), None);
+        app.cmd_tx = Some(tx);
+
+        for pane in [Pane::BandA, Pane::BandB] {
+            app.focus = pane;
+            press(&mut app, KeyCode::Char('f'));
+            assert_eq!(
+                app.input_mode,
+                InputMode::Normal,
+                "lowercase f must not open an unsupported frequency editor on {pane:?}"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "lowercase f must not send a radio command on {pane:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aprs_mode_refuses_to_invent_a_station_identity() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::with_cache_path(String::new(), None);
+        app.cmd_tx = Some(tx);
+
+        app.toggle_aprs_mode();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a missing radio callsign must not start a transmitting APRS session"
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Cannot enter APRS mode: the radio has no readable APRS callsign")
+        );
+    }
+
+    #[test]
+    fn aprs_mode_uses_the_live_radio_callsign() -> TestResult {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::with_cache_path(String::new(), None);
+        app.cmd_tx = Some(tx);
+        app.state.aprs_callsign = Some(kenwood_thd75::types::AprsCallsign::new("KQ4NIT-9")?);
+
+        app.toggle_aprs_mode();
+
+        match rx.try_recv()? {
+            RadioCommand::EnterAprs { config } => {
+                assert_eq!(config.source().to_string(), "KQ4NIT-9");
+                Ok(())
+            }
+            other => Err(format!("expected EnterAprs, got {other:?}").into()),
+        }
     }
 
     fn type_str(app: &mut App, s: &str) {
@@ -3587,19 +4229,19 @@ mod tests {
         }
     }
 
-    fn assert_connect(
+    fn assert_prepare_link(
         rx: &mut UnboundedReceiver<RadioCommand>,
         expected_name: &str,
         expected_module: char,
     ) -> TestResult {
         let cmd = rx.try_recv()?;
         match cmd {
-            RadioCommand::ConnectReflector { name, module } => {
+            RadioCommand::PrepareReflectorLink { name, module } => {
                 assert_eq!(name, expected_name, "reflector name");
                 assert_eq!(module, expected_module, "reflector module");
                 Ok(())
             }
-            other => Err(format!("expected ConnectReflector, got {other:?}").into()),
+            other => Err(format!("expected PrepareReflectorLink, got {other:?}").into()),
         }
     }
 
@@ -3645,7 +4287,7 @@ mod tests {
         let (mut app, mut rx) = reflector_app();
         type_str(&mut app, "REF030C");
         press(&mut app, KeyCode::Enter);
-        assert_connect(&mut rx, "REF030", 'C')
+        assert_prepare_link(&mut rx, "REF030", 'C')
     }
 
     #[test]
@@ -3653,7 +4295,7 @@ mod tests {
         let (mut app, mut rx) = reflector_app();
         type_str(&mut app, "REF030 C");
         press(&mut app, KeyCode::Enter);
-        assert_connect(&mut rx, "REF030", 'C')
+        assert_prepare_link(&mut rx, "REF030", 'C')
     }
 
     #[test]
@@ -3661,6 +4303,6 @@ mod tests {
         let (mut app, mut rx) = reflector_app();
         type_str(&mut app, "ref030c");
         press(&mut app, KeyCode::Enter);
-        assert_connect(&mut rx, "REF030", 'C')
+        assert_prepare_link(&mut rx, "REF030", 'C')
     }
 }

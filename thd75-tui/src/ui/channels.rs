@@ -4,6 +4,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
+use kenwood_thd75::types::{ChannelTransmitValue, CrossToneType, ShiftDirection, ToneMode};
+
 use crate::app::{App, ChannelEditField, InputMode, McpState, Pane};
 
 pub(crate) fn render_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -22,23 +24,38 @@ pub(crate) fn render_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     if let McpState::Loaded { image, .. } = &app.mcp {
         let channels = image.channels();
-        let used = app.filtered_channels();
-        let items: Vec<ListItem<'_>> = used
+        let used = match app.filtered_channels() {
+            Ok(used) => used,
+            Err(error) => {
+                let message = format!(" Channel data error:\n {error}");
+                frame.render_widget(Paragraph::new(message).block(block), area);
+                return;
+            }
+        };
+        let items = used
             .iter()
             .map(|&i| {
-                let entry = channels.get(i);
-                let name = entry.as_ref().map(|e| e.name.clone()).unwrap_or_default();
-                let freq = entry
-                    .as_ref()
-                    .map(|e| format!("{:.3}", e.flash.rx_frequency.as_mhz()))
-                    .unwrap_or_default();
-                ListItem::new(Line::from(vec![
+                let entry = channels.get(i)?;
+                let name = entry.name().to_string();
+                let freq = entry.programmed().map_or_else(
+                    || "empty".to_owned(),
+                    |channel| format!("{:.3}", channel.receive_frequency.as_mhz()),
+                );
+                Ok(ListItem::new(Line::from(vec![
                     Span::styled(format!("{i:>4}: "), Style::default().fg(Color::DarkGray)),
                     Span::styled(format!("{name:<12}"), Style::default().fg(Color::White)),
                     Span::styled(format!(" {freq}"), Style::default().fg(Color::Cyan)),
-                ]))
+                ])))
             })
-            .collect();
+            .collect::<Result<Vec<ListItem<'_>>, kenwood_thd75::memory::MemoryError>>();
+        let items = match items {
+            Ok(items) => items,
+            Err(error) => {
+                let message = format!(" Channel data error:\n {error}");
+                frame.render_widget(Paragraph::new(message).block(block), area);
+                return;
+            }
+        };
 
         let mut list_state = ListState::default();
         list_state.select(Some(
@@ -77,32 +94,62 @@ pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
     match &app.mcp {
         McpState::Loaded { image, .. } => {
             let channels = image.channels();
-            let used = app.filtered_channels();
-            if let Some(&ch_num) = used.get(app.channel_list_index)
-                && let Some(entry) = channels.get(ch_num)
-            {
-                let fc = &entry.flash;
+            let used = match app.filtered_channels() {
+                Ok(used) => used,
+                Err(error) => {
+                    let message = format!(" Channel data error:\n {error}");
+                    frame.render_widget(Paragraph::new(message).block(block), area);
+                    return;
+                }
+            };
+            if let Some(&ch_num) = used.get(app.channel_list_index) {
+                let entry = match channels.get(ch_num) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        let message = format!(" Channel data error:\n {error}");
+                        frame.render_widget(Paragraph::new(message).block(block), area);
+                        return;
+                    }
+                };
+                let Some(channel) = entry.programmed() else {
+                    frame.render_widget(Paragraph::new(" Empty channel slot").block(block), area);
+                    return;
+                };
 
                 // Tone/squelch summary string
-                let tone_info = if fc.tone_enabled {
-                    format!("CTCSS TX {}", fc.tone_code.index())
-                } else if fc.ctcss_enabled {
-                    format!("CTCSS {}/{}", fc.tone_code.index(), fc.ctcss_code.index())
-                } else if fc.dtcs_enabled {
-                    format!("DCS {:03}", u16::from(fc.dcs_code.index()))
-                } else {
-                    "None".to_string()
+                let tone_info = match channel.tone_mode {
+                    ToneMode::Off => "None".to_string(),
+                    ToneMode::Tone => format!("CTCSS TX {}", channel.tone_code.as_raw()),
+                    ToneMode::Ctcss => {
+                        format!(
+                            "CTCSS {}/{}",
+                            channel.tone_code.as_raw(),
+                            channel.ctcss_code.as_raw()
+                        )
+                    }
+                    ToneMode::Dcs => format!("DCS {:03}", channel.dcs_code.code_value()),
+                    ToneMode::CrossTone => {
+                        let cross = match channel.cross_tone.tone_type() {
+                            CrossToneType::DcsOff => "D/O",
+                            CrossToneType::ToneDcs => "T/D",
+                            CrossToneType::DcsCtcss => "D/C",
+                            CrossToneType::ToneCtcss => "T/C",
+                        };
+                        format!("Cross {cross}")
+                    }
                 };
 
                 // Duplex direction string
-                let duplex_info = match fc.duplex {
-                    kenwood_thd75::types::FlashDuplex::Simplex => "Simplex".to_string(),
-                    kenwood_thd75::types::FlashDuplex::Plus => {
-                        format!("+{:.3} MHz", fc.tx_offset.as_mhz())
+                let duplex_info = match channel.transmit_value() {
+                    ChannelTransmitValue::SplitTransmitFrequency(frequency) => {
+                        format!("Split TX {:.6} MHz", frequency.as_mhz())
                     }
-                    kenwood_thd75::types::FlashDuplex::Minus => {
-                        format!("-{:.3} MHz", fc.tx_offset.as_mhz())
-                    }
+                    ChannelTransmitValue::RepeaterOffset(offset) => match channel.shift {
+                        ShiftDirection::Simplex => "Simplex".to_string(),
+                        ShiftDirection::Plus => format!("+{:.3} MHz", offset.as_mhz()),
+                        ShiftDirection::Minus => format!("-{:.3} MHz", offset.as_mhz()),
+                        ShiftDirection::Minus7Point6MHz => "-7.600 MHz".to_string(),
+                    },
                 };
 
                 let mut lines = vec![
@@ -113,7 +160,7 @@ pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
                     Line::from(vec![
                         Span::styled("  Name:    ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
-                            entry.name.clone(),
+                            entry.name().to_string(),
                             Style::default()
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
@@ -123,7 +170,7 @@ pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
                     Line::from(vec![
                         Span::styled("  RX:      ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
-                            format!("{:.6} MHz", fc.rx_frequency.as_mhz()),
+                            format!("{:.6} MHz", channel.receive_frequency.as_mhz()),
                             Style::default().fg(Color::Green),
                         ),
                     ]),
@@ -133,7 +180,10 @@ pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
                     ]),
                     Line::from(vec![
                         Span::styled("  Mode:    ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(format!("{}", fc.mode), Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!("{}", channel.mode),
+                            Style::default().fg(Color::White),
+                        ),
                     ]),
                     Line::from(vec![
                         Span::styled("  Tone:    ", Style::default().fg(Color::DarkGray)),
@@ -151,9 +201,8 @@ pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
                     )));
 
                     let fields = [
-                        ChannelEditField::Frequency,
                         ChannelEditField::Name,
-                        ChannelEditField::Mode,
+                        ChannelEditField::OperatingMode,
                         ChannelEditField::ToneMode,
                         ChannelEditField::ToneFreq,
                         ChannelEditField::Duplex,

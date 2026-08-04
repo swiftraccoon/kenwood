@@ -20,7 +20,7 @@ Terminal UI for the Kenwood TH-D75. Built on [`kenwood-thd75`](../thd75/), [rata
 ## Running
 
 ```
-cargo run -p thd75-tui -- [--port /dev/cu.usbmodem*] [--baud 115200] [--mcp-speed safe|fast] [--exit-terminal-mode]
+cargo run -p thd75-tui -- [--port /dev/cu.usbmodem*] [--baud 115200] [--exit-terminal-mode]
 ```
 
 Default port auto-discovers USB (VID `0x2166` / PID `0x9023`) or the paired Bluetooth SPP channel (macOS IOBluetooth RFCOMM; Linux/Windows via the serial emulator).
@@ -28,7 +28,7 @@ Default port auto-discovers USB (VID `0x2166` / PID `0x9023`) or the paired Blue
 ## Status
 
 Direct arbitrary-frequency and precision-down controls are unavailable while
-the library's FO/FQ writer is quarantined; qualified frequency reads, one-step
+the library's FO writer is quarantined; qualified frequency reads, one-step
 UP, and populated memory recall remain available.
 
 Pre-release. The TUI follows library-side API churn closely; layout,

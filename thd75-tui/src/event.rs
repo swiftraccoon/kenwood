@@ -15,27 +15,17 @@ pub(crate) enum RadioCommand {
     ReadMemory,
     /// Trigger a full MCP memory write to the radio.
     WriteMemory(Vec<u8>),
-    /// Tune the given band to a memory channel number.
+    /// Tune the given band to a regular memory channel.
     TuneChannel {
         /// The band to tune.
         band: kenwood_thd75::types::Band,
-        /// The memory channel number (0–1199).
-        channel: u16,
+        /// The validated regular memory channel (0–999).
+        channel: kenwood_thd75::types::RegularChannel,
     },
     /// Step frequency up by one increment on the given band.
     FreqUp(kenwood_thd75::types::Band),
     /// Step frequency down by one increment on the given band.
     FreqDown(kenwood_thd75::types::Band),
-    /// Request a specific frequency on the given band.
-    ///
-    /// The library currently rejects this before I/O because direct FO/FQ
-    /// writes are not qualified.
-    TuneFreq {
-        /// The band to tune.
-        band: kenwood_thd75::types::Band,
-        /// The frequency in Hz.
-        freq: u32,
-    },
     /// Set the squelch level for the given band (SQ write: verified working).
     SetSquelch {
         band: kenwood_thd75::types::Band,
@@ -47,12 +37,12 @@ pub(crate) enum RadioCommand {
         enabled: bool,
     },
     /// Set the operating mode for the given band (MD write: may return N in some modes).
-    SetMode {
+    SetOperatingMode {
         band: kenwood_thd75::types::Band,
-        mode: kenwood_thd75::types::Mode,
+        mode: kenwood_thd75::types::OperatingMode,
     },
-    /// Toggle dual band on/off (DL write: verified working, value inverted on D75).
-    SetDualBand(bool),
+    /// Select single-band or dual-band presentation (DL write).
+    SetBandMode(kenwood_thd75::types::BandMode),
     /// Toggle bluetooth on/off (BT write: verified working).
     SetBluetooth(bool),
     /// Toggle VOX on/off (VX write: verified working).
@@ -61,21 +51,17 @@ pub(crate) enum RadioCommand {
     SetVoxGain(kenwood_thd75::types::VoxGain),
     /// Set VOX delay (VD write: verified working).
     SetVoxDelay(kenwood_thd75::types::VoxDelay),
-    /// Set TNC baud rate (AS write: verified working).
-    SetTncBaud(kenwood_thd75::types::TncBaud),
-    /// Set beacon type (PT write: verified working).
-    SetBeaconType(kenwood_thd75::types::BeaconMode),
-    /// Set GPS config (GP write: verified working).
-    SetGpsConfig(bool, bool),
-    /// Set FM radio on/off (FR write: verified working).
-    SetFmRadio(bool),
+    /// Set packet data rate (AS write: verified working).
+    SetPacketDataRate(kenwood_thd75::types::PacketDataRate),
+    /// Set beacon mode (PT write: verified working).
+    SetBeaconMode(kenwood_thd75::types::BeaconMode),
+    /// Set GPS settings (GP write: verified working).
+    SetGpsSettings(kenwood_thd75::types::GpsSettings),
     /// Set the step size for the given band (SF write: verified working).
     SetStepSize {
         band: kenwood_thd75::types::Band,
         step: kenwood_thd75::types::StepSize,
     },
-    /// Set the scan resume method (SR write: write-only on D75).
-    SetScanResumeCat(kenwood_thd75::types::ScanResumeMethod),
     /// Write a single byte to MCP memory via `modify_memory_page`.
     /// Enters MCP mode, modifies one byte, exits. USB drops and reconnects.
     /// Used for settings where CAT writes are rejected by D75 firmware.
@@ -94,24 +80,24 @@ pub(crate) enum RadioCommand {
         /// Suffix (up to 4 chars).
         suffix: String,
     },
-    /// Connect to a D-STAR reflector via CAT (sets URCALL to link command).
-    ConnectReflector {
+    /// Prepare a D-STAR reflector link by setting URCALL through CAT.
+    PrepareReflectorLink {
         /// Reflector callsign (e.g. "REF030").
         name: String,
         /// Reflector module letter (e.g. 'C').
         module: char,
     },
-    /// Disconnect from the current D-STAR reflector via CAT.
-    DisconnectReflector,
+    /// Prepare a D-STAR reflector unlink by setting URCALL through CAT.
+    PrepareReflectorUnlink,
     /// Set URCALL to CQCQCQ via CAT.
     SetCQ,
-    /// Enter D-STAR gateway mode (MMDVM/DStarGateway).
-    EnterDStar {
+    /// Enter D-STAR gateway mode using the MMDVM transport.
+    EnterDstar {
         /// D-STAR gateway configuration.
-        config: kenwood_thd75::DStarGatewayConfig,
+        config: kenwood_thd75::DstarGatewayConfig,
     },
     /// Exit D-STAR gateway mode.
-    ExitDStar,
+    ExitDstar,
     /// Enter APRS/KISS mode. The radio task enters KISS mode and starts
     /// processing APRS packets instead of CAT polling.
     EnterAprs {
@@ -126,18 +112,18 @@ pub(crate) enum RadioCommand {
     /// Send an APRS message to a station while in APRS mode.
     SendAprsMessage {
         /// Destination callsign.
-        addressee: String,
+        addressee: kenwood_thd75::MessageAddressee,
         /// Message text.
-        text: String,
+        text: kenwood_thd75::MessageText,
     },
     /// Transmit a manual position beacon while in APRS mode.
     BeaconPosition {
-        /// Latitude in decimal degrees.
-        lat: f64,
-        /// Longitude in decimal degrees.
-        lon: f64,
+        /// Validated latitude.
+        latitude: kenwood_thd75::Latitude,
+        /// Validated longitude.
+        longitude: kenwood_thd75::Longitude,
         /// Beacon comment text.
-        comment: String,
+        comment: kenwood_thd75::PositionReportText,
     },
 }
 

@@ -44,7 +44,7 @@ fn kv_line(label: &str, value: String, value_color: Color) -> Line<'_> {
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     match app.aprs_mode {
         AprsMode::Active => render_live(app, frame, list_area, detail_area),
-        AprsMode::Inactive => render_mcp_config(app, frame, list_area, detail_area),
+        AprsMode::Inactive => render_stored_settings(app, frame, list_area, detail_area),
     }
 }
 
@@ -245,7 +245,10 @@ fn render_live(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: R
                         format!("  -> {}: ", msg.addressee),
                         Style::default().fg(Color::DarkGray),
                     ),
-                    Span::styled(msg.text.clone(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        msg.text.as_str().to_owned(),
+                        Style::default().fg(Color::White),
+                    ),
                     Span::styled(format!(" [{status_str}]"), Style::default().fg(color)),
                 ]));
             }
@@ -264,17 +267,10 @@ fn render_live(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: R
 }
 
 // ---------------------------------------------------------------------------
-// MCP config view (KISS not active)
+// Stored-settings view (KISS not active)
 // ---------------------------------------------------------------------------
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Draws the complete APRS MCP-config section row-by-row. Ratatui's \
-              immediate-mode API means each visible cell is an explicit construction \
-              call; splitting would move layout logic away from the constraints that \
-              bound it."
-)]
-fn render_mcp_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
+fn render_stored_settings(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     let block = Block::default()
         .title(" APRS ")
         .borders(Borders::ALL)
@@ -306,27 +302,24 @@ fn render_mcp_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
     let aprs = image.aprs();
 
     // -------------------------------------------------------------------------
-    // Left pane: APRS config fields
+    // Left pane: APRS settings fields
     // -------------------------------------------------------------------------
-    // Field-level APRS settings (Beacon interval / Packet path) used to be
-    // displayed here from `aprs.beacon_interval()` and `aprs.packet_path()`.
-    // Those accessors
-    // were removed from `thd75::memory::AprsAccess` because their
-    // sub-page offsets were imported from D74 development notes and
-    // never verified against D75 firmware or hardware. See
-    // `thd75/src/memory/aprs.rs` module docs for the verification
-    // criteria to reintroduce them.
+    // Field-level APRS settings such as beacon interval and packet path are
+    // not displayed from this opaque MCP region because their TH-D75 offsets
+    // are not verified. See `thd75::memory::AprsAccess` for the boundary-only
+    // contract.
     //
     // The callsign is available independently through the verified live CS
     // command. Until the remaining offset map lands, surface those gaps rather
     // than displaying potentially-wrong values.
-    let my_callsign = app.state.aprs_callsign.as_ref().map_or_else(
-        || "<not available>".to_owned(),
-        |callsign| callsign.as_str().to_owned(),
-    );
+    let my_callsign = app
+        .state
+        .aprs_callsign
+        .as_ref()
+        .map_or_else(|| "<not available>".to_owned(), ToString::to_string);
     let lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled(
-            " APRS Configuration",
+            " APRS Settings",
             Style::default().fg(Color::Yellow),
         )),
         Line::from(""),
@@ -363,8 +356,8 @@ fn render_mcp_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
 
     let region_info = [
         ("Status header", "0x15100", "256 bytes"),
-        ("Data / settings", "0x15200", "~16 KB"),
-        ("Position data", "0x25100", "19,200 bytes (confirmed)"),
+        ("Opaque APRS data", "0x15200", "through 0x24FFF"),
+        ("Callsign table", "0x25000", "D-STAR boundary"),
     ];
 
     for (name, offset, size) in region_info {
@@ -381,20 +374,6 @@ fn render_mcp_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
     }
 
     detail_lines.push(Line::from(""));
-
-    let has_pos = aprs.has_position_data();
-    let (pos_str, pos_col) = if has_pos {
-        ("Yes", Color::Cyan)
-    } else {
-        ("No", Color::DarkGray)
-    };
-    detail_lines.push(Line::from(vec![
-        Span::styled(
-            "  Position data present  ",
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(pos_str, Style::default().fg(pos_col)),
-    ]));
 
     let region_sz = aprs.region_size();
     detail_lines.push(Line::from(vec![

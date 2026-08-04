@@ -1,3 +1,4 @@
+use kenwood_thd75::types::NmeaSentence;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -22,7 +23,7 @@ const fn on_off(b: bool) -> &'static str {
 
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>, left_area: Rect, right_area: Rect) {
     render_status(app, frame, left_area);
-    render_config(app, frame, right_area);
+    render_settings(app, frame, right_area);
 }
 
 // ---------------------------------------------------------------------------
@@ -36,14 +37,20 @@ fn render_status(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .border_style(super::border_style(app, Pane::Main));
 
     let s = &app.state;
+    let gps_enabled = s
+        .gps_settings
+        .map(kenwood_thd75::types::GpsSettings::enabled);
+    let pc_output = s
+        .gps_settings
+        .map(kenwood_thd75::types::GpsSettings::pc_output);
 
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     lines.push(Line::from(""));
     lines.push(kv_line(
         "GPS",
-        on_off(s.gps_enabled).into(),
-        if s.gps_enabled {
+        gps_enabled.map_or_else(|| "Unavailable".into(), |enabled| on_off(enabled).into()),
+        if gps_enabled == Some(true) {
             Color::Green
         } else {
             Color::DarkGray
@@ -51,8 +58,8 @@ fn render_status(app: &App, frame: &mut Frame<'_>, area: Rect) {
     ));
     lines.push(kv_line(
         "PC Output",
-        on_off(s.gps_pc_output).into(),
-        if s.gps_pc_output {
+        pc_output.map_or_else(|| "Unavailable".into(), |enabled| on_off(enabled).into()),
+        if pc_output == Some(true) {
             Color::Green
         } else {
             Color::DarkGray
@@ -60,24 +67,37 @@ fn render_status(app: &App, frame: &mut Frame<'_>, area: Rect) {
     ));
 
     lines.push(Line::from(""));
-    if s.gps_enabled {
-        lines.push(Line::from(Span::styled(
-            "  Position data requires NMEA PC output.",
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  GPS fix info is not available via CAT.",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "  GPS is disabled.",
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  Press [g] to enable.",
-            Style::default().fg(Color::DarkGray),
-        )));
+    match gps_enabled {
+        Some(true) => {
+            lines.push(Line::from(Span::styled(
+                "  Position data requires NMEA PC output.",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  GPS fix info is not available via CAT.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        Some(false) => {
+            lines.push(Line::from(Span::styled(
+                "  GPS is disabled.",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Press [g] to enable.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "  GPS state is unavailable.",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Reconnect to refresh before changing it.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 
     // Key hints
@@ -94,12 +114,12 @@ fn render_status(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
-// Right pane: GPS Configuration (NMEA sentences)
+// Right pane: GPS Settings (NMEA sentences)
 // ---------------------------------------------------------------------------
 
-fn render_config(app: &App, frame: &mut Frame<'_>, area: Rect) {
+fn render_settings(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()
-        .title(" GPS Configuration ")
+        .title(" GPS Settings ")
         .borders(Borders::ALL)
         .border_style(super::border_style(app, Pane::Detail));
 
@@ -114,11 +134,26 @@ fn render_config(app: &App, frame: &mut Frame<'_>, area: Rect) {
     )));
     lines.push(Line::from(""));
 
-    if let Some((gga, gll, gsa, gsv, rmc, vtg)) = s.gps_sentences {
+    if let Some(sentences) = s.gps_sentences {
         // Two-column layout for sentence flags
-        lines.push(sentence_row("GGA", gga, "GLL", gll));
-        lines.push(sentence_row("GSA", gsa, "GSV", gsv));
-        lines.push(sentence_row("RMC", rmc, "VTG", vtg));
+        lines.push(sentence_row(
+            "GGA",
+            sentences.contains(NmeaSentence::Gga),
+            "GLL",
+            sentences.contains(NmeaSentence::Gll),
+        ));
+        lines.push(sentence_row(
+            "GSA",
+            sentences.contains(NmeaSentence::Gsa),
+            "GSV",
+            sentences.contains(NmeaSentence::Gsv),
+        ));
+        lines.push(sentence_row(
+            "RMC",
+            sentences.contains(NmeaSentence::Rmc),
+            "VTG",
+            sentences.contains(NmeaSentence::Vtg),
+        ));
     } else {
         lines.push(Line::from(Span::styled(
             "  (not available)",

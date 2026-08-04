@@ -3,10 +3,14 @@ use std::time::Duration;
 use kenwood_thd75::FirmwareProfile;
 use kenwood_thd75::LinkDiagnosis;
 use kenwood_thd75::Radio;
+use kenwood_thd75::WritableMcpPage;
 use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::transport::Transport;
-use kenwood_thd75::types::{Band, DvGatewayMode, GpsRadioMode, SMeterReading};
+use kenwood_thd75::types::{
+    Band, BandMode, DstarCallsign, DstarSuffix, DvGatewayMode, GpsRadioMode, Module,
+    ReflectorCallsign, SMeterReading,
+};
 use tokio::sync::mpsc;
 
 use crate::app::{BandState, Message, RadioState};
@@ -87,7 +91,6 @@ pub(crate) fn discover_and_open_transport(
 /// direct SM/BY polling.
 ///
 /// # Arguments
-/// - `mcp_speed`: `"fast"` for `McpSpeed::Fast` (risky), anything else for Safe.
 /// - `tx`: channel for sending state updates and errors to the TUI.
 /// - `cmd_rx`: channel for receiving user commands from the TUI.
 #[expect(
@@ -100,27 +103,22 @@ pub(crate) fn discover_and_open_transport(
 pub(crate) async fn spawn_with_transport(
     path: String,
     transport: EitherTransport,
-    mcp_speed: String,
     tx: mpsc::UnboundedSender<Message>,
     mut cmd_rx: mpsc::UnboundedReceiver<crate::event::RadioCommand>,
 ) -> Result<String, ConnectFailure> {
     let serial_baud = SerialTransport::DEFAULT_BAUD;
-    // connect_safe sends a TNC-exit preamble, recovering a radio that a
+    // connect_with_tnc_exit sends a TNC-exit preamble, recovering a radio that a
     // crashed application left stuck in KISS mode.
-    let mut radio = Radio::connect_safe(transport).await.map_err(|e| {
+    let mut radio = Radio::connect_with_tnc_exit(transport).await.map_err(|e| {
         ConnectFailure::generic(format!("Could not initialise the radio link: {e}"))
     })?;
-
-    if mcp_speed == "fast" {
-        radio.set_mcp_speed(kenwood_thd75::McpSpeed::Fast);
-    }
 
     // Verify identity. A failure here (most often a timeout) means the
     // radio is not answering CAT control: it is in Reflector Terminal
     // Mode, or otherwise unresponsive. Probe the link so the operator
     // gets actionable guidance instead of a bare "command timed out".
     if radio.identify().await.is_err() {
-        let diagnosis = radio.diagnose_link().await;
+        let diagnosis = radio.probe_silent_link().await;
         return Err(ConnectFailure::diagnosed(diagnosis));
     }
 
@@ -144,10 +142,16 @@ pub(crate) async fn spawn_with_transport(
     // establish the profile.
     let (firmware_version, mut firmware_profile) =
         read_firmware_profile(&mut radio, "initial connection").await;
+    if radio.cat_recovery_required() {
+        return Err(ConnectFailure::generic(
+            "Firmware identification ended at an ambiguous CAT boundary; reconnect the radio link"
+                .to_owned(),
+        ));
+    }
     let radio_type = radio
         .get_radio_type()
         .await
-        .map(|(region, variant)| format!("{region} v{variant}"))
+        .map(|radio_type| format!("{} v{}", radio_type.region(), radio_type.hardware_variant()))
         .unwrap_or_default();
 
     let _send = tx.send(Message::RadioUpdate(RadioState {
@@ -176,10 +180,15 @@ pub(crate) async fn spawn_with_transport(
         // APRS mode entry (radio consumed). `aprs_pending` stores an APRS
         // config when the inner loop broke because of an EnterAprs command.
         let mut aprs_pending: Option<Box<kenwood_thd75::AprsClientConfig>> = None;
-        let mut dstar_pending: Option<kenwood_thd75::DStarGatewayConfig> = None;
+        let mut dstar_pending: Option<kenwood_thd75::DstarGatewayConfig> = None;
 
         // Main loop: poll + handle commands + process AI notifications
         'outer: loop {
+            // A returned owner from a failed binary-mode transition must be
+            // retained only for orderly disconnect; it is not safe for CAT
+            // polling until a fresh mode-clearing connection succeeds.
+            let mut reconnect_required = false;
+
             // --- Handle pending APRS mode entry ---
             // This runs outside the select! borrow scope so we can take()
             // the radio from the Option without conflicting borrows.
@@ -201,17 +210,20 @@ pub(crate) async fn spawn_with_transport(
                         let _send = tx.send(Message::AprsStopped);
                         continue 'outer;
                     }
-                    Err(EnterAprsError::KissExitFailed(msg)) => {
-                        let _send = tx.send(Message::AprsError(msg));
-                        let _send = tx.send(Message::AprsStopped);
-                        let _send = tx.send(Message::Disconnected);
-                        // radio_opt is None; fall through to reconnect.
+                    Err(EnterAprsError::RadioRecoveryFailed { message, radio }) => {
+                        radio_opt = radio.map(|radio| *radio);
+                        let _send = tx.send(Message::AprsRecoveryFailed(message));
+                        // Fall through to reconnect. If session recovery returned
+                        // the radio, the reconnect path closes that owner before
+                        // opening a replacement transport.
+                        reconnect_required = true;
                     }
                 }
             }
 
             // --- Handle pending D-STAR gateway mode entry ---
-            if let Some(config) = dstar_pending.take()
+            if !reconnect_required
+                && let Some(config) = dstar_pending.take()
                 && let Some(taken_radio) = radio_opt.take()
             {
                 match enter_dstar_session(taken_radio, config, &tx, &mut cmd_rx).await {
@@ -226,21 +238,23 @@ pub(crate) async fn spawn_with_transport(
                         busy_a = false;
                         busy_b = false;
                         radio_opt = Some(r);
-                        let _send = tx.send(Message::DStarStopped);
+                        let _send = tx.send(Message::DstarStopped);
                         continue 'outer;
                     }
-                    Err(EnterDStarError::MmdvmExitFailed(msg)) => {
-                        let _send = tx.send(Message::DStarError(msg));
-                        let _send = tx.send(Message::DStarStopped);
-                        let _send = tx.send(Message::Disconnected);
-                        // radio_opt is None; fall through to reconnect.
+                    Err(EnterDstarError::RadioRecoveryFailed { message, radio }) => {
+                        radio_opt = radio.map(|radio| *radio);
+                        let _send = tx.send(Message::DstarRecoveryFailed(message));
+                        // Fall through to reconnect. If session recovery returned
+                        // the radio, the reconnect path closes that owner before
+                        // opening a replacement transport.
+                        reconnect_required = true;
                     }
                 }
             }
 
             // --- CAT polling inner loop ---
             // radio_opt must be Some here unless we're reconnecting.
-            if let Some(ref mut radio) = radio_opt {
+            if !reconnect_required && let Some(ref mut radio) = radio_opt {
                 loop {
                     tokio::select! {
                         () = tokio::time::sleep(POLL_INTERVAL) => {
@@ -283,7 +297,6 @@ pub(crate) async fn spawn_with_transport(
                                         Ok(level) => match band {
                                             Band::A => { s_meter_a = level; busy_a = true; }
                                             Band::B => { s_meter_b = level; busy_b = true; }
-                                            _ => {}
                                         },
                                         Err(e) => {
                                             tracing::warn!(?band, "SM read failed on BY: {e}");
@@ -291,7 +304,6 @@ pub(crate) async fn spawn_with_transport(
                                             match band {
                                                 Band::A => busy_a = true,
                                                 Band::B => busy_b = true,
-                                                _ => {}
                                             }
                                         }
                                     }
@@ -300,7 +312,6 @@ pub(crate) async fn spawn_with_transport(
                                     match band {
                                         Band::A => { s_meter_a = zero; busy_a = false; }
                                         Band::B => { s_meter_b = zero; busy_b = false; }
-                                        _ => {}
                                     }
                                 }
                             }
@@ -360,21 +371,11 @@ pub(crate) async fn spawn_with_transport(
                                     }
                                 }
                                 crate::event::RadioCommand::FreqDown(band) => {
-                                    // DW exists as a blind step-down, but we use the manual
-                                    // read-subtract-tune path for precision: DW doesn't confirm
-                                    // the resulting frequency, and we need the exact value for
-                                    // the TUI display update.
                                     match freq_down(radio, band).await {
                                         Ok(()) => {}
                                         Err(e) => {
                                             let _send = tx.send(Message::RadioError(format!("Freq down: {e}")));
                                         }
-                                    }
-                                }
-                                crate::event::RadioCommand::TuneFreq { band, freq } => {
-                                    let f = kenwood_thd75::types::Frequency::new(freq);
-                                    if let Err(e) = radio.tune_frequency(band, f).await {
-                                        let _send = tx.send(Message::RadioError(format!("Tune freq: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetSquelch { band, level } => {
@@ -387,14 +388,14 @@ pub(crate) async fn spawn_with_transport(
                                         let _send = tx.send(Message::RadioError(format!("Set atten: {e}")));
                                     }
                                 }
-                                crate::event::RadioCommand::SetMode { band, mode } => {
-                                    if let Err(e) = radio.set_mode(band, mode).await {
+                                crate::event::RadioCommand::SetOperatingMode { band, mode } => {
+                                    if let Err(e) = radio.set_operating_mode(band, mode).await {
                                         let _send = tx.send(Message::RadioError(format!("Set mode: {e} (may require VFO mode)")));
                                     }
                                 }
-                                crate::event::RadioCommand::SetDualBand(on) => {
-                                    if let Err(e) = radio.set_dual_band(on).await {
-                                        let _send = tx.send(Message::RadioError(format!("Set dual band: {e}")));
+                                crate::event::RadioCommand::SetBandMode(mode) => {
+                                    if let Err(e) = radio.set_band_mode(mode).await {
+                                        let _send = tx.send(Message::RadioError(format!("Set band mode: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetBluetooth(on) => {
@@ -427,29 +428,19 @@ pub(crate) async fn spawn_with_transport(
                                         let _send = tx.send(Message::RadioError(format!("Set step: {e}")));
                                     }
                                 }
-                                crate::event::RadioCommand::SetScanResumeCat(method) => {
-                                    if let Err(e) = radio.set_scan_resume(method).await {
-                                        let _send = tx.send(Message::RadioError(format!("Scan resume: {e}")));
+                                crate::event::RadioCommand::SetPacketDataRate(data_rate) => {
+                                    if let Err(e) = radio.set_packet_data_rate(data_rate).await {
+                                        let _send = tx.send(Message::RadioError(format!("Packet data rate: {e}")));
                                     }
                                 }
-                                crate::event::RadioCommand::SetTncBaud(rate) => {
-                                    if let Err(e) = radio.set_tnc_baud(rate).await {
-                                        let _send = tx.send(Message::RadioError(format!("TNC baud: {e}")));
+                                crate::event::RadioCommand::SetBeaconMode(mode) => {
+                                    if let Err(e) = radio.set_beacon_mode(mode).await {
+                                        let _send = tx.send(Message::RadioError(format!("Beacon mode: {e}")));
                                     }
                                 }
-                                crate::event::RadioCommand::SetBeaconType(mode) => {
-                                    if let Err(e) = radio.set_beacon_type(mode).await {
-                                        let _send = tx.send(Message::RadioError(format!("Beacon type: {e}")));
-                                    }
-                                }
-                                crate::event::RadioCommand::SetGpsConfig(enabled, pc_output) => {
-                                    if let Err(e) = radio.set_gps_config(enabled, pc_output).await {
-                                        let _send = tx.send(Message::RadioError(format!("GPS config: {e}")));
-                                    }
-                                }
-                                crate::event::RadioCommand::SetFmRadio(enabled) => {
-                                    if let Err(e) = radio.set_fm_radio(enabled).await {
-                                        let _send = tx.send(Message::RadioError(format!("FM radio: {e}")));
+                                crate::event::RadioCommand::SetGpsSettings(settings) => {
+                                    if let Err(e) = radio.set_gps_settings(settings).await {
+                                        let _send = tx.send(Message::RadioError(format!("GPS settings: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::McpWriteByte { offset, value } => {
@@ -458,17 +449,22 @@ pub(crate) async fn spawn_with_transport(
                                     let page = offset / 256;
                                     let byte_idx = (offset % 256) as usize;
                                     let _send = tx.send(Message::RadioError(format!("Writing MCP 0x{offset:04X}...")));
-                                    match radio.modify_memory_page(page, |data| {
-                                        if let Some(byte) = data.get_mut(byte_idx) {
-                                            *byte = value;
-                                        }
-                                    }).await {
-                                        Ok(()) => {
-                                            // Update the in-memory MCP cache so the TUI
-                                            // stays in sync without requiring a full re-read.
-                                            let _send = tx.send(Message::McpByteWritten { offset, value });
-                                            let _send = tx.send(Message::RadioError(format!("MCP 0x{offset:04X} = {value}; reconnecting...")));
-                                        }
+                                    match WritableMcpPage::new(page) {
+                                        Ok(page) => match radio.modify_memory_page(page, |data| {
+                                            if let Some(byte) = data.get_mut(byte_idx) {
+                                                *byte = value;
+                                            }
+                                        }).await {
+                                            Ok(()) => {
+                                                // Update the in-memory MCP cache so the TUI
+                                                // stays in sync without requiring a full re-read.
+                                                let _send = tx.send(Message::McpByteWritten { offset, value });
+                                                let _send = tx.send(Message::RadioError(format!("MCP 0x{offset:04X} = {value}; reconnecting...")));
+                                            }
+                                            Err(e) => {
+                                                let _send = tx.send(Message::McpError(format!("MCP write 0x{offset:04X}: {e}")));
+                                            }
+                                        },
                                         Err(e) => {
                                             let _send = tx.send(Message::McpError(format!("MCP write 0x{offset:04X}: {e}")));
                                         }
@@ -478,18 +474,54 @@ pub(crate) async fn spawn_with_transport(
                                     break; // Go to reconnect loop
                                 }
                                 crate::event::RadioCommand::SetUrcall { callsign, suffix } => {
-                                    if let Err(e) = radio.set_urcall(&callsign, &suffix).await {
+                                    let callsign = match DstarCallsign::new(&callsign) {
+                                        Ok(callsign) => callsign,
+                                        Err(e) => {
+                                            let _send = tx.send(Message::RadioError(format!(
+                                                "Set URCALL: {e}"
+                                            )));
+                                            continue;
+                                        }
+                                    };
+                                    let suffix = match DstarSuffix::new(&suffix) {
+                                        Ok(suffix) => suffix,
+                                        Err(e) => {
+                                            let _send = tx.send(Message::RadioError(format!(
+                                                "Set URCALL: {e}"
+                                            )));
+                                            continue;
+                                        }
+                                    };
+                                    if let Err(e) = radio.set_urcall(callsign, suffix).await {
                                         let _send = tx.send(Message::RadioError(format!("Set URCALL: {e}")));
                                     }
                                 }
-                                crate::event::RadioCommand::ConnectReflector { name, module } => {
-                                    if let Err(e) = radio.connect_reflector(&name, module).await {
-                                        let _send = tx.send(Message::RadioError(format!("Connect reflector: {e}")));
+                                crate::event::RadioCommand::PrepareReflectorLink { name, module } => {
+                                    let name = match ReflectorCallsign::try_from_str(&name) {
+                                        Ok(name) => name,
+                                        Err(e) => {
+                                            let _send = tx.send(Message::RadioError(format!(
+                                                "Prepare reflector link: {e}"
+                                            )));
+                                            continue;
+                                        }
+                                    };
+                                    let module = match Module::try_from_char(module) {
+                                        Ok(module) => module,
+                                        Err(e) => {
+                                            let _send = tx.send(Message::RadioError(format!(
+                                                "Prepare reflector link: {e}"
+                                            )));
+                                            continue;
+                                        }
+                                    };
+                                    if let Err(e) = radio.prepare_reflector_link(name, module).await {
+                                        let _send = tx.send(Message::RadioError(format!("Prepare reflector link: {e}")));
                                     }
                                 }
-                                crate::event::RadioCommand::DisconnectReflector => {
-                                    if let Err(e) = radio.disconnect_reflector().await {
-                                        let _send = tx.send(Message::RadioError(format!("Disconnect reflector: {e}")));
+                                crate::event::RadioCommand::PrepareReflectorUnlink => {
+                                    if let Err(e) = radio.prepare_reflector_unlink().await {
+                                        let _send = tx.send(Message::RadioError(format!("Prepare reflector unlink: {e}")));
                                     }
                                 }
                                 crate::event::RadioCommand::SetCQ => {
@@ -497,11 +529,11 @@ pub(crate) async fn spawn_with_transport(
                                         let _send = tx.send(Message::RadioError(format!("Set CQ: {e}")));
                                     }
                                 }
-                                crate::event::RadioCommand::EnterDStar { config } => {
+                                crate::event::RadioCommand::EnterDstar { config } => {
                                     dstar_pending = Some(config);
                                     continue 'outer;
                                 }
-                                crate::event::RadioCommand::ExitDStar => {
+                                crate::event::RadioCommand::ExitDstar => {
                                     let _send = tx.send(Message::RadioError(
                                         "Not in D-STAR gateway mode".into()
                                     ));
@@ -524,8 +556,20 @@ pub(crate) async fn spawn_with_transport(
                             }
                         }
                     }
+
+                    // The returned error alone does not always reveal whether
+                    // the CAT frame boundary is still trustworthy. A malformed
+                    // matching response, for example, returns a protocol error
+                    // while deliberately poisoning the handle. Never continue
+                    // polling such a handle.
+                    if radio.cat_recovery_required() {
+                        let _send = tx.send(Message::RadioError(
+                            "CAT response boundary became ambiguous; reconnecting".to_owned(),
+                        ));
+                        break;
+                    }
                 }
-            } // if radio_opt.is_some()
+            } // if CAT polling is safe and a radio owner is present
 
             // Reconnect loop.
             //
@@ -535,12 +579,11 @@ pub(crate) async fn spawn_with_transport(
             // path, then auto-discover USB/Bluetooth. Close and drop the old
             // transport before opening its replacement so only one owner can
             // hold the radio's SPP channel at a time.
-            if let Some(ref mut r) = radio_opt
-                && let Err(e) = r.close_transport().await
+            if let Some(radio) = radio_opt.take()
+                && let Err(error) = radio.disconnect().await
             {
-                tracing::warn!("failed to close transport before reconnect: {e}");
+                tracing::warn!(%error, "failed to close transport before reconnect");
             }
-            drop(radio_opt.take()); // Ensure old radio is dropped before reconnect.
             tokio::time::sleep(Duration::from_secs(3)).await;
             let mut attempts = 0u32;
             loop {
@@ -561,11 +604,19 @@ pub(crate) async fn spawn_with_transport(
                 .await
                 .unwrap_or_else(|error| Err(format!("transport reconnect worker failed: {error}")));
                 if let Ok((_p, transport)) = connect_result {
-                    match Radio::connect(transport).await {
+                    match connect_for_recovery(transport).await {
                         Ok(mut new_radio) => match new_radio.identify().await {
                             Ok(_) => {
                                 let (firmware_version, refreshed_profile) =
                                     read_firmware_profile(&mut new_radio, "reconnect").await;
+                                if new_radio.cat_recovery_required() {
+                                    let _send = tx.send(Message::RadioError(
+                                        "Firmware identification left an ambiguous CAT boundary; retrying reconnect"
+                                            .to_owned(),
+                                    ));
+                                    drop(new_radio.disconnect().await);
+                                    continue;
+                                }
                                 firmware_profile = refreshed_profile;
                                 if let Err(e) = new_radio.set_auto_info(true).await {
                                     tracing::error!("AI mode failed after reconnect: {e}");
@@ -607,6 +658,17 @@ pub(crate) async fn spawn_with_transport(
     });
 
     Ok(path)
+}
+
+/// Connect a replacement transport after a possibly ambiguous mode exit.
+///
+/// KISS and MMDVM exit failures can leave the radio speaking binary framing,
+/// so every fresh transport used by the reconnect loop must first send the
+/// mode-clearing preamble.
+async fn connect_for_recovery<T: Transport>(
+    transport: T,
+) -> Result<Radio<T>, kenwood_thd75::Error> {
+    Radio::connect_with_tnc_exit(transport).await
 }
 
 /// Distinguishes transport errors (connection lost) from protocol errors
@@ -683,7 +745,7 @@ async fn poll_once(
     // BE (beep) is a firmware stub on D75: always returns N.
     // Beep state is read from MCP image instead. Skip polling.
     let beep = false;
-    let dual_band = global_read!(radio, "DL", radio.get_dual_band(), false);
+    let band_mode = global_read!(radio, "DL", radio.get_band_mode(), BandMode::Single);
     let bluetooth = global_read!(radio, "BT", radio.get_bluetooth(), false);
     let vox = global_read!(radio, "VX", radio.get_vox(), false);
     let vox_gain = global_read!(
@@ -696,21 +758,21 @@ async fn poll_once(
         radio,
         "VD",
         radio.get_vox_delay(),
-        kenwood_thd75::types::VoxDelay::ZERO
+        kenwood_thd75::types::VoxDelay::MS_250
     );
     let af_gain = global_read!(
         radio,
         "AG",
         radio.get_af_gain(),
-        kenwood_thd75::types::AfGainLevel::new(0)
+        kenwood_thd75::types::AfGainLevel::ZERO
     );
-    let gps = radio.get_gps_config().await.unwrap_or((false, false));
+    let gps_settings = radio.get_gps_settings().await.ok();
     let gps_sentences = radio.get_gps_sentences().await.ok();
     let (gps_mode, dstar_gw) = poll_collision_sensitive_state(radio, firmware_profile).await;
-    let beacon_type = global_read!(
+    let beacon_mode = global_read!(
         radio,
         "BN",
-        radio.get_beacon_type(),
+        radio.get_beacon_mode(),
         kenwood_thd75::types::BeaconMode::Manual
     );
     // FS read (no band parameter): returns N in some modes
@@ -728,7 +790,7 @@ async fn poll_once(
         .get_filter_width(kenwood_thd75::types::FilterMode::Am)
         .await
         .ok();
-    let aprs_callsign = radio.get_aprs_callsign().await.ok();
+    let aprs_callsign = radio.get_aprs_callsign().await.ok().flatten();
     // D-STAR reads: non-fatal, default to empty/None on error
     let dstar_urcall = radio.get_urcall().await.unwrap_or_default();
     let dstar_rpt1 = radio.get_rpt1().await.unwrap_or_default();
@@ -739,7 +801,7 @@ async fn poll_once(
         band_b,
         battery_level,
         beep,
-        dual_band,
+        band_mode,
         bluetooth,
         vox,
         vox_gain,
@@ -747,23 +809,21 @@ async fn poll_once(
         af_gain,
         firmware_version: String::new(),
         radio_type: String::new(),
-        gps_enabled: gps.0,
-        gps_pc_output: gps.1,
+        gps_settings,
         gps_sentences,
         gps_mode,
-        beacon_type,
+        beacon_mode,
         fine_step,
         filter_width_ssb,
         filter_width_cw,
         filter_width_am,
-        scan_resume_cat: None, // Write-only on D75, not readable
         // D-STAR state: non-fatal reads (protocol errors use defaults)
-        dstar_urcall: dstar_urcall.0,
-        dstar_urcall_suffix: dstar_urcall.1,
-        dstar_rpt1: dstar_rpt1.0,
-        dstar_rpt1_suffix: dstar_rpt1.1,
-        dstar_rpt2: dstar_rpt2.0,
-        dstar_rpt2_suffix: dstar_rpt2.1,
+        dstar_urcall: dstar_urcall.callsign.as_str().to_owned(),
+        dstar_urcall_suffix: dstar_urcall.suffix.as_str().to_owned(),
+        dstar_rpt1: dstar_rpt1.callsign.as_str().to_owned(),
+        dstar_rpt1_suffix: dstar_rpt1.suffix.as_str().to_owned(),
+        dstar_rpt2: dstar_rpt2.callsign.as_str().to_owned(),
+        dstar_rpt2_suffix: dstar_rpt2.suffix.as_str().to_owned(),
         dstar_gateway_mode: dstar_gw,
         dstar_slot,
         aprs_callsign,
@@ -780,8 +840,8 @@ async fn read_firmware_profile<T: Transport>(
 ) -> (String, Option<FirmwareProfile>) {
     match radio.get_firmware_version().await {
         Ok(firmware) => {
-            let profile = FirmwareProfile::from_version(&firmware);
-            (firmware, Some(profile))
+            let profile = FirmwareProfile::from_identity(&firmware);
+            (firmware.to_string(), Some(profile))
         }
         Err(error) => {
             tracing::warn!(
@@ -806,7 +866,7 @@ async fn poll_collision_sensitive_state<T: Transport>(
         .as_ref()
         .is_some_and(|profile| profile.supports_bare_gps_mode())
     {
-        radio.get_gps_mode().await.ok()
+        radio.read_gps_mode().await.ok()
     } else {
         None
     };
@@ -815,7 +875,7 @@ async fn poll_collision_sensitive_state<T: Transport>(
         .as_ref()
         .is_some_and(|profile| profile.supports_bare_gateway())
     {
-        radio.get_gateway().await.ok()
+        radio.read_gateway().await.ok()
     } else {
         None
     };
@@ -847,7 +907,7 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
         .map_err(|e| classify_error(&format!("SQ {band:?}"), &e))?;
 
     let mode = radio
-        .get_mode(band)
+        .get_operating_mode(band)
         .await
         .map_err(|e| classify_error(&format!("MD {band:?}"), &e))?;
 
@@ -858,7 +918,7 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
 
     let attenuator = radio.get_attenuator(band).await.unwrap_or(false);
     // SF returns N (not available) in some modes; gracefully default
-    let step_size = radio.get_step_size(band).await.ok().map(|(_, s)| s);
+    let step_size = radio.get_step_size(band).await.ok();
 
     Ok(BandState {
         frequency,
@@ -872,30 +932,25 @@ async fn poll_band(radio: &mut Radio<EitherTransport>, band: Band) -> Result<Ban
     })
 }
 
-/// Step frequency down by reading current freq + step size, subtracting, and tuning.
-/// DW (frequency down) exists but does not echo the resulting frequency, so we
-/// compute it manually for accurate TUI display.
+/// Select a band and step its current operating context down once.
 async fn freq_down(
     radio: &mut Radio<EitherTransport>,
     band: Band,
 ) -> Result<(), kenwood_thd75::Error> {
-    let frequency = radio.get_frequency(band).await?;
-    // SF may return N (not available) in some modes; default to 5 kHz
-    let step = radio
-        .get_step_size(band)
-        .await
-        .map(|(_, s)| s)
-        .unwrap_or(kenwood_thd75::types::StepSize::Hz5000);
-    let new_hz = frequency.as_hz().saturating_sub(step.as_hz());
-    radio
-        .tune_frequency(band, kenwood_thd75::types::Frequency::new(new_hz))
-        .await
+    radio.set_band(band).await?;
+    let _frequency = radio.frequency_down().await?;
+    Ok(())
 }
 
-/// Error type for the APRS session helper: the radio is lost, reconnect required.
+/// Error type for the APRS session helper: CAT recovery failed and reconnect is required.
 enum EnterAprsError {
-    /// KISS exit failed or the session ended with a transport error.
-    KissExitFailed(String),
+    /// KISS entry, exit, or the required CAT restoration failed.
+    RadioRecoveryFailed {
+        /// Operator-facing failure details.
+        message: String,
+        /// A surviving transport owner, when the library could return one.
+        radio: Option<Box<Radio<EitherTransport>>>,
+    },
 }
 
 /// Enter APRS mode, run the event loop, and return the radio on clean exit.
@@ -910,10 +965,11 @@ async fn enter_aprs_session(
 ) -> Result<Radio<EitherTransport>, EnterAprsError> {
     let mut client = match kenwood_thd75::AprsClient::start(radio, config).await {
         Ok(c) => c,
-        Err((_radio, e)) => {
-            return Err(EnterAprsError::KissExitFailed(format!(
-                "KISS entry failed: {e}"
-            )));
+        Err((radio, e)) => {
+            return Err(EnterAprsError::RadioRecoveryFailed {
+                message: format!("KISS entry failed: {e}"),
+                radio: Some(Box::new(radio)),
+            });
         }
     };
 
@@ -922,15 +978,22 @@ async fn enter_aprs_session(
     let exit_result = run_aprs_loop(&mut client, tx, cmd_rx).await;
 
     match client.stop().await {
-        Ok(new_radio) => {
+        Ok(mut new_radio) => {
             if let Err(msg) = exit_result {
                 let _send = tx.send(Message::AprsError(msg));
             }
+            if let Err(error) = new_radio.restore_cat_after_mode_exit().await {
+                return Err(EnterAprsError::RadioRecoveryFailed {
+                    message: format!("KISS exit succeeded, but CAT restoration failed: {error}"),
+                    radio: Some(Box::new(new_radio)),
+                });
+            }
             Ok(new_radio)
         }
-        Err((_client, e)) => Err(EnterAprsError::KissExitFailed(format!(
-            "KISS exit failed: {e}"
-        ))),
+        Err((_client, e)) => Err(EnterAprsError::RadioRecoveryFailed {
+            message: format!("KISS exit failed: {e}"),
+            radio: None,
+        }),
     }
 }
 
@@ -980,8 +1043,15 @@ async fn run_aprs_loop(
                             }
                         }
                     }
-                    crate::event::RadioCommand::BeaconPosition { lat, lon, comment } => {
-                        if let Err(e) = client.beacon_position(lat, lon, &comment).await {
+                    crate::event::RadioCommand::BeaconPosition {
+                        latitude,
+                        longitude,
+                        comment,
+                    } => {
+                        if let Err(e) = client
+                            .beacon_position(latitude, longitude, &comment)
+                            .await
+                        {
                             let _send = tx.send(Message::AprsError(
                                 format!("Beacon failed: {e}")
                             ));
@@ -999,51 +1069,64 @@ async fn run_aprs_loop(
     }
 }
 
-/// Error type for the D-STAR gateway session: the radio is lost, reconnect required.
-enum EnterDStarError {
-    /// MMDVM exit failed or the session ended with a transport error.
-    MmdvmExitFailed(String),
+/// Error type for the D-STAR gateway session: CAT recovery failed and reconnect is required.
+enum EnterDstarError {
+    /// MMDVM entry, exit, or the required CAT restoration failed.
+    RadioRecoveryFailed {
+        /// Operator-facing failure details.
+        message: String,
+        /// A surviving transport owner, when the library could return one.
+        radio: Option<Box<Radio<EitherTransport>>>,
+    },
 }
 
 /// Enter D-STAR gateway mode, run the event loop, and return the radio on clean exit.
 ///
-/// Takes ownership of the `Radio` (consumed by `DStarGateway::start`), runs the
-/// D-STAR event loop, and returns the `Radio` after `DStarGateway::stop`.
+/// Takes ownership of the `Radio` (consumed by `DstarGateway::start`), runs the
+/// D-STAR event loop, and returns the `Radio` after `DstarGateway::stop`.
 async fn enter_dstar_session(
     radio: Radio<EitherTransport>,
-    config: kenwood_thd75::DStarGatewayConfig,
+    config: kenwood_thd75::DstarGatewayConfig,
     tx: &mpsc::UnboundedSender<Message>,
     cmd_rx: &mut mpsc::UnboundedReceiver<crate::event::RadioCommand>,
-) -> Result<Radio<EitherTransport>, EnterDStarError> {
-    let mut gateway = match kenwood_thd75::DStarGateway::start(radio, config).await {
+) -> Result<Radio<EitherTransport>, EnterDstarError> {
+    let mut gateway = match kenwood_thd75::DstarGateway::start(radio, config).await {
         Ok(g) => g,
-        Err((_radio, e)) => {
-            return Err(EnterDStarError::MmdvmExitFailed(format!(
-                "D-STAR gateway start failed: {e}"
-            )));
+        Err((radio, e)) => {
+            return Err(EnterDstarError::RadioRecoveryFailed {
+                message: format!("D-STAR gateway start failed: {e}"),
+                radio: radio.map(Box::new),
+            });
         }
     };
 
-    let _send = tx.send(Message::DStarStarted);
+    let _send = tx.send(Message::DstarStarted);
 
     let exit_result = run_dstar_loop(&mut gateway, tx, cmd_rx).await;
 
     match gateway.stop().await {
-        Ok(new_radio) => {
+        Ok(mut new_radio) => {
             if let Err(msg) = exit_result {
-                let _send = tx.send(Message::DStarError(msg));
+                let _send = tx.send(Message::DstarError(msg));
+            }
+            if let Err(error) = new_radio.restore_cat_after_mode_exit().await {
+                return Err(EnterDstarError::RadioRecoveryFailed {
+                    message: format!("MMDVM exit succeeded, but CAT restoration failed: {error}"),
+                    radio: Some(Box::new(new_radio)),
+                });
             }
             Ok(new_radio)
         }
-        Err(e) => Err(EnterDStarError::MmdvmExitFailed(format!(
-            "D-STAR gateway stop failed: {e}"
-        ))),
+        Err(e) => Err(EnterDstarError::RadioRecoveryFailed {
+            message: format!("D-STAR gateway stop failed: {e}"),
+            radio: None,
+        }),
     }
 }
 
-/// Run the D-STAR gateway event loop until `ExitDStar` is received or a transport error occurs.
+/// Run the D-STAR gateway event loop until `ExitDstar` is received or a transport error occurs.
 async fn run_dstar_loop(
-    gateway: &mut kenwood_thd75::DStarGateway<EitherTransport>,
+    gateway: &mut kenwood_thd75::DstarGateway<EitherTransport>,
     tx: &mpsc::UnboundedSender<Message>,
     cmd_rx: &mut mpsc::UnboundedReceiver<crate::event::RadioCommand>,
 ) -> Result<(), String> {
@@ -1052,7 +1135,7 @@ async fn run_dstar_loop(
             event_result = gateway.next_event() => {
                 match event_result {
                     Ok(Some(event)) => {
-                        if tx.send(Message::DStarEvent(event)).is_err() {
+                        if tx.send(Message::DstarEvent(event)).is_err() {
                             return Ok(()); // TUI closed
                         }
                     }
@@ -1066,7 +1149,7 @@ async fn run_dstar_loop(
             }
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
-                    crate::event::RadioCommand::ExitDStar => {
+                    crate::event::RadioCommand::ExitDstar => {
                         return Ok(());
                     }
                     _ => {
@@ -1096,13 +1179,13 @@ fn discover_and_open(port: Option<&str>, baud: u32) -> Result<(String, EitherTra
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let transport = SerialTransport::open(path, baud)
+                let transport = SerialTransport::open_with_baud(path, baud)
                     .map_err(|e| format!("Failed to open {path}: {e}"))?;
                 return Ok((path.to_string(), EitherTransport::Serial(transport)));
             }
         }
-        let transport =
-            SerialTransport::open(path, baud).map_err(|e| format!("Failed to open {path}: {e}"))?;
+        let transport = SerialTransport::open_with_baud(path, baud)
+            .map_err(|e| format!("Failed to open {path}: {e}"))?;
         return Ok((path.to_string(), EitherTransport::Serial(transport)));
     }
 
@@ -1112,7 +1195,7 @@ fn discover_and_open(port: Option<&str>, baud: u32) -> Result<(String, EitherTra
 
     if let Some(info) = usb_ports.first() {
         let path = info.port_name.clone();
-        let transport = SerialTransport::open(&path, baud)
+        let transport = SerialTransport::open_with_baud(&path, baud)
             .map_err(|e| format!("Failed to open {path}: {e}"))?;
         return Ok((path, EitherTransport::Serial(transport)));
     }
@@ -1131,7 +1214,7 @@ fn discover_and_open(port: Option<&str>, baud: u32) -> Result<(String, EitherTra
         SerialTransport::discover_bluetooth().map_err(|e| format!("BT discovery failed: {e}"))?;
     if let Some(info) = bt_ports.first() {
         let path = info.port_name.clone();
-        let transport = SerialTransport::open(&path, baud)
+        let transport = SerialTransport::open_with_baud(&path, baud)
             .map_err(|e| format!("Failed to open BT port {path}: {e}"))?;
         return Ok((path, EitherTransport::Serial(transport)));
     }
@@ -1151,7 +1234,7 @@ mod tests {
     async fn azimuth_poll_skips_bare_gm_and_gw_without_waiting() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"FV\r", b"FV 1.03.AZM\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let (_, profile) = read_firmware_profile(&mut radio, "test").await;
 
         assert_eq!(profile, Some(FirmwareProfile::AzimuthAutomation));
@@ -1168,7 +1251,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_firmware_skips_collision_sensitive_polling() -> TestResult {
         let mock = MockTransport::new();
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
 
         let collision_state = tokio::time::timeout(
             Duration::from_millis(100),
@@ -1181,20 +1264,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn near_match_firmware_retains_stock_gm_and_gw_polling() -> TestResult {
+    async fn unknown_firmware_disables_collision_sensitive_polling() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.expect(b"FV\r", b"FV 1.03.AZM2\r");
-        mock.expect(b"GM\r", b"GM 0\r");
-        mock.expect(b"GW\r", b"GW 0\r");
-        let mut radio = Radio::connect(mock).await?;
+        mock.expect(b"FV\r", b"FV 1.03.XYZ\r");
+        let mut radio = Radio::new(mock);
         let (_, profile) = read_firmware_profile(&mut radio, "test").await;
 
-        assert_eq!(profile, Some(FirmwareProfile::StandardCat));
+        assert_eq!(profile, Some(FirmwareProfile::Unknown));
         let collision_state = poll_collision_sensitive_state(&mut radio, profile).await;
-        assert_eq!(
-            collision_state,
-            (Some(GpsRadioMode::Normal), Some(DvGatewayMode::Off),)
-        );
+        assert_eq!(collision_state, (None, None));
         Ok(())
     }
 
@@ -1202,12 +1280,12 @@ mod tests {
     async fn replacement_radio_reacquires_its_own_firmware_profile() -> TestResult {
         let mut first_mock = MockTransport::new();
         first_mock.expect(b"FV\r", b"FV 1.03\r");
-        let mut first_radio = Radio::connect(first_mock).await?;
+        let mut first_radio = Radio::new(first_mock);
         let (_, first_profile) = read_firmware_profile(&mut first_radio, "initial").await;
 
         let mut replacement_mock = MockTransport::new();
         replacement_mock.expect(b"FV\r", b"FV 1.03.AZM\r");
-        let mut replacement_radio = Radio::connect(replacement_mock).await?;
+        let mut replacement_radio = Radio::new(replacement_mock);
         let (_, replacement_profile) =
             read_firmware_profile(&mut replacement_radio, "reconnect").await;
 
@@ -1216,6 +1294,59 @@ mod tests {
             replacement_profile,
             Some(FirmwareProfile::AzimuthAutomation)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_connection_sends_mode_clearing_preamble() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r", b"");
+        mock.expect(b"\r", b"");
+        mock.expect(&[0x03], b"");
+        mock.expect(&[0xC0, 0xFF, 0xC0], b"");
+        mock.expect(b"\rTC 1\r", b"");
+        mock.expect(b"TN 0,0\r", b"");
+
+        let radio = connect_for_recovery(EitherTransport::Mock(mock)).await?;
+        drop(radio);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aprs_entry_failure_preserves_returned_radio_owner() -> TestResult {
+        let radio = Radio::new(EitherTransport::Mock(MockTransport::new()));
+        let config = kenwood_thd75::AprsClientConfig::try_new("N0CALL", 0)?;
+        let (message_tx, _message_rx) = mpsc::unbounded_channel();
+        let (_command_tx, mut command_rx) = mpsc::unbounded_channel();
+
+        let outcome = enter_aprs_session(radio, config, &message_tx, &mut command_rx).await;
+        let Err(EnterAprsError::RadioRecoveryFailed {
+            radio: Some(radio), ..
+        }) = outcome
+        else {
+            return Err("APRS entry failure must retain the returned radio owner".into());
+        };
+
+        (*radio).disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dstar_entry_failure_preserves_returned_radio_owner() -> TestResult {
+        let radio = Radio::new(EitherTransport::Mock(MockTransport::new()));
+        let config = kenwood_thd75::DstarGatewayConfig::new(DstarCallsign::new("N0CALL")?);
+        let (message_tx, _message_rx) = mpsc::unbounded_channel();
+        let (_command_tx, mut command_rx) = mpsc::unbounded_channel();
+
+        let outcome = enter_dstar_session(radio, config, &message_tx, &mut command_rx).await;
+        let Err(EnterDstarError::RadioRecoveryFailed {
+            radio: Some(radio), ..
+        }) = outcome
+        else {
+            return Err("D-STAR entry failure must retain the returned radio owner".into());
+        };
+
+        (*radio).disconnect().await?;
         Ok(())
     }
 }

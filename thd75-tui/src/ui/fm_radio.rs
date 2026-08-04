@@ -86,7 +86,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "  Use Band B pane (2) to tune FM stations.",
+                "  Use Band B pane (2), then ↑/↓ to step stations.",
                 Style::default().fg(Color::DarkGray),
             )),
         ]

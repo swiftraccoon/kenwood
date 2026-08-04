@@ -38,10 +38,6 @@ struct Cli {
     #[arg(short, long, default_value_t = 115_200)]
     baud: u32,
 
-    /// MCP transfer speed: safe or fast.
-    #[arg(long, default_value = "safe")]
-    mcp_speed: String,
-
     /// If the radio is found in Reflector Terminal Mode, guide an exit
     /// (prompt for the Menu 650 change) and reconnect, instead of just
     /// reporting it and quitting.
@@ -109,8 +105,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<RunOutcome, String>>();
 
-        let mcp_speed = cli.mcp_speed.clone();
-
         let _thread = std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -129,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let result = rt.block_on(async {
-                run_app(&mut terminal, transport, mcp_speed)
+                run_app(&mut terminal, transport)
                     .await
                     .map_err(|e| e.to_string())
             });
@@ -186,7 +180,6 @@ fn guide_terminal_mode_exit(message: &str) {
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     transport: Result<(String, kenwood_thd75::transport::EitherTransport), String>,
-    mcp_speed: String,
 ) -> Result<RunOutcome, Box<dyn std::error::Error>> {
     let mut events = event::EventHandler::new();
     let tx = events.sender();
@@ -201,11 +194,10 @@ async fn run_app(
         }
     };
 
-    let port_display =
-        match radio_task::spawn_with_transport(path, transport, mcp_speed, tx, cmd_rx).await {
-            Ok(p) => p,
-            Err(failure) => return Ok(RunOutcome::ConnectFailed(failure)),
-        };
+    let port_display = match radio_task::spawn_with_transport(path, transport, tx, cmd_rx).await {
+        Ok(p) => p,
+        Err(failure) => return Ok(RunOutcome::ConnectFailed(failure)),
+    };
 
     let mut app = App::new(port_display);
     app.connected = true;

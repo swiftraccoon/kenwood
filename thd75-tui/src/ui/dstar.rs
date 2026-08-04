@@ -1,12 +1,13 @@
 use std::time::Instant;
 
+use kenwood_thd75::memory::dstar::DstarReadError;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::app::{App, DStarMode, McpState, Pane};
+use crate::app::{App, DstarMode, McpState, Pane};
 
 /// Format a duration since `then` as a human-readable "ago" string.
 fn ago(then: Instant) -> String {
@@ -41,26 +42,57 @@ fn fmt_callsign(cs: &str) -> String {
     }
 }
 
+/// Render malformed fixed-width wire data without inventing text for it.
+fn invalid_wire_bytes(bytes: &[u8], error: kenwood_thd75::WireTextError) -> String {
+    let hexadecimal = bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("<invalid {hexadecimal}: {error}>")
+}
+
+fn gateway_callsign(callsign: kenwood_thd75::ObservedDstarCallsign) -> String {
+    callsign.text().map_or_else(
+        |error| invalid_wire_bytes(callsign.as_bytes(), error),
+        str::to_owned,
+    )
+}
+
+fn gateway_suffix(suffix: dstar_gateway_core::Suffix) -> String {
+    suffix.text().map_or_else(
+        |error| invalid_wire_bytes(suffix.as_bytes(), error),
+        str::to_owned,
+    )
+}
+
+fn gateway_text_message(message: &kenwood_thd75::SlowDataTextMessage) -> String {
+    message.text().map_or_else(
+        |error| invalid_wire_bytes(message.as_bytes(), error),
+        str::to_owned,
+    )
+}
+
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     match app.dstar_mode {
-        DStarMode::Active => render_gateway(app, frame, list_area, detail_area),
-        DStarMode::Inactive => render_cat_config(app, frame, list_area, detail_area),
+        DstarMode::Active => render_gateway(app, frame, list_area, detail_area),
+        DstarMode::Inactive => render_cat_settings(app, frame, list_area, detail_area),
     }
 }
 
 // ---------------------------------------------------------------------------
-// CAT config view (gateway not active)
+// CAT settings view (gateway not active)
 // ---------------------------------------------------------------------------
 
 #[expect(
     clippy::too_many_lines,
-    reason = "Draws the complete D-STAR CAT-config section. Ratatui's immediate-mode \
+    reason = "Draws the complete D-STAR CAT-settings section. Ratatui's immediate-mode \
               API means each visible cell is an explicit construction call; splitting \
               would move layout logic away from the constraints that bound it."
 )]
-fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
+fn render_cat_settings(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     let block = Block::default()
-        .title(" D-STAR Configuration ")
+        .title(" D-STAR Settings ")
         .borders(Borders::ALL)
         .border_style(super::border_style(app, Pane::Main));
 
@@ -73,11 +105,13 @@ fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
 
     // Show MCP-based MY callsign if available
     if let McpState::Loaded { ref image, .. } = app.mcp {
-        let my_cs = image.dstar().my_callsign();
-        let (disp, col) = if my_cs.is_empty() {
-            ("<not set>".into(), Color::DarkGray)
-        } else {
-            (my_cs, Color::Cyan)
+        let (disp, col) = match image.dstar().my_callsign() {
+            Ok(Some(callsign)) => (callsign.as_str().to_owned(), Color::Cyan),
+            Ok(None) => ("Not configured (Menu 610)".to_owned(), Color::Yellow),
+            Err(error @ DstarReadError::MissingRange { .. }) => {
+                (format!("Incomplete MCP data: {error}"), Color::Red)
+            }
+            Err(error) => (format!("Invalid MCP data: {error}"), Color::Red),
         };
         lines.push(kv_line("MY Callsign", disp, col));
         lines.push(Line::from(""));
@@ -129,7 +163,7 @@ fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
     let slot_str = app
         .state
         .dstar_slot
-        .map_or_else(|| "Unknown".to_string(), |s| format!("{}", s.as_u8()));
+        .map_or_else(|| "Unknown".to_string(), |s| format!("{}", s.as_raw()));
     lines.push(kv_line("D-STAR Slot", slot_str, Color::White));
 
     // Input prompts
@@ -153,7 +187,7 @@ fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(Span::styled(
-            " [r] Connect Reflector   [U] Unlink Reflector",
+            " [r] Prepare Link       [U] Prepare Unlink",
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -171,8 +205,8 @@ fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
 
     let actions = [
         ("[C]", "CQ (set URCALL to CQCQCQ)"),
-        ("[r]", "Connect to reflector"),
-        ("[U]", "Unlink from reflector"),
+        ("[r]", "Prepare reflector link URCALL"),
+        ("[U]", "Prepare reflector unlink URCALL"),
         ("[u]", "Set URCALL manually"),
         ("[d]", "Enter gateway mode (MMDVM)"),
     ];
@@ -187,7 +221,6 @@ fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
     // MCP D-STAR info if available
     if let McpState::Loaded { ref image, .. } = app.mcp {
         let dstar = image.dstar();
-        let rpt_count = dstar.repeater_count();
 
         detail_lines.push(Line::from(""));
         detail_lines.push(Line::from(Span::styled(
@@ -195,7 +228,14 @@ fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
             Style::default().fg(Color::Yellow),
         )));
         detail_lines.push(Line::from(""));
-        detail_lines.push(kv_line("Repeaters", format!("{rpt_count}"), Color::White));
+        let (repeater_count, repeater_count_color) = match dstar.repeater_count() {
+            Ok(count) => (count.to_string(), Color::White),
+            Err(error @ DstarReadError::MissingRange { .. }) => {
+                (format!("Incomplete MCP data: {error}"), Color::Red)
+            }
+            Err(error) => (format!("Invalid MCP data: {error}"), Color::Red),
+        };
+        detail_lines.push(kv_line("Repeaters", repeater_count, repeater_count_color));
 
         let region_sz = dstar.region_size();
         detail_lines.push(kv_line(
@@ -212,7 +252,7 @@ fn render_cat_config(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
 }
 
 // ---------------------------------------------------------------------------
-// Gateway mode view (DStarGateway active)
+// Gateway mode view (`DstarGateway` active)
 // ---------------------------------------------------------------------------
 
 #[expect(
@@ -258,8 +298,8 @@ fn render_gateway(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area
             let idx = start + i;
             let is_selected = idx == app.dstar_last_heard_index;
 
-            let callsign = format!("{:<9}", entry.callsign.trim());
-            let dest = format!("{:<9}", entry.destination.trim());
+            let callsign = format!("{:<9}", gateway_callsign(entry.callsign));
+            let dest = format!("{:<9}", gateway_callsign(entry.destination));
             let time = ago(entry.timestamp);
 
             let style = if is_selected {
@@ -306,59 +346,66 @@ fn render_gateway(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area
             Color::DarkGray
         };
 
-        detail_lines.push(kv_line(
-            "From",
-            format!("{} {}", header.my_call.as_str(), header.my_suffix.as_str()),
-            Color::Cyan,
-        ));
+        let my_call = gateway_callsign(header.my_call.into());
+        let my_suffix = gateway_suffix(header.my_suffix);
+        let from = if my_suffix.is_empty() {
+            my_call
+        } else {
+            format!("{my_call} {my_suffix}")
+        };
+        detail_lines.push(kv_line("From", from, Color::Cyan));
         detail_lines.push(kv_line(
             "To",
-            header.ur_call.as_str().into_owned(),
+            gateway_callsign(header.ur_call.into()),
             Color::White,
         ));
         detail_lines.push(kv_line(
             "RPT1",
-            header.rpt1.as_str().into_owned(),
+            gateway_callsign(header.rpt1.into()),
             Color::White,
         ));
         detail_lines.push(kv_line(
             "RPT2",
-            header.rpt2.as_str().into_owned(),
+            gateway_callsign(header.rpt2.into()),
             Color::White,
         ));
         detail_lines.push(kv_line("Status", status_str.to_string(), status_color));
 
         if let Some(ref text) = app.dstar_text_message {
             detail_lines.push(Line::from(""));
-            detail_lines.push(kv_line("Text Message", text.clone(), Color::Yellow));
+            detail_lines.push(kv_line(
+                "Text Message",
+                gateway_text_message(text),
+                Color::Yellow,
+            ));
         }
     } else if let Some(entry) = app.dstar_last_heard.get(app.dstar_last_heard_index) {
         // Show selected station info when no active transmission
         detail_lines.push(Line::from(Span::styled(
-            format!(" {}", entry.callsign.trim()),
+            format!(" {}", gateway_callsign(entry.callsign)),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
         detail_lines.push(Line::from(""));
 
-        let suffix = entry.suffix.trim();
+        let suffix = gateway_suffix(entry.suffix);
         if !suffix.is_empty() {
-            detail_lines.push(kv_line("Suffix", suffix.to_string(), Color::White));
+            detail_lines.push(kv_line("Suffix", suffix, Color::White));
         }
         detail_lines.push(kv_line(
             "Destination",
-            entry.destination.trim().to_string(),
+            gateway_callsign(entry.destination),
             Color::White,
         ));
         detail_lines.push(kv_line(
             "RPT1",
-            entry.repeater1.trim().to_string(),
+            gateway_callsign(entry.repeater1),
             Color::White,
         ));
         detail_lines.push(kv_line(
             "RPT2",
-            entry.repeater2.trim().to_string(),
+            gateway_callsign(entry.repeater2),
             Color::White,
         ));
         detail_lines.push(kv_line("Last heard", ago(entry.timestamp), Color::White));

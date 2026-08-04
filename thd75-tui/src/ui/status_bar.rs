@@ -41,10 +41,12 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     if s.vox {
         flags.push("VOX".into());
     }
-    if s.gps_enabled {
+    if s.gps_settings
+        .is_some_and(kenwood_thd75::types::GpsSettings::enabled)
+    {
         flags.push("GPS".into());
     }
-    if !s.dual_band {
+    if matches!(s.band_mode, kenwood_thd75::types::BandMode::Single) {
         flags.push("1BD".into());
     }
     if app.aprs_mode == AprsMode::Active {
