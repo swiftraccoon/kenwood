@@ -23,7 +23,7 @@ mod transport;
 
 pub use aprs::{
     AprsActivityDirection, AprsActivityKind, AprsActivityRecord, AprsOperationalSnapshot,
-    AprsSessionConfig, AprsSessionPhase, AprsSessionStatus, AprsStationRecord, AprsTncBaud,
+    AprsPacketDataRate, AprsSessionConfig, AprsSessionPhase, AprsSessionStatus, AprsStationRecord,
 };
 pub use automation::{
     AutomationAbiRecord, AutomationController, AutomationError, FrontPanelKey,

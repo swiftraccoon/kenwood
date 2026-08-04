@@ -3,7 +3,7 @@
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::Transport;
 use kenwood_thd75::types::{
-    Band, DetectOutputMode, Frequency, Mode, SquelchLevel, StepSize, VfoMemoryMode,
+    Band, BandMode, Frequency, OperatingMode, SquelchLevel, StepSize, TuningMode, UsbAudioOutput,
 };
 
 /// Fixed center of the TH-D75 real low-IF USB stream.
@@ -13,10 +13,10 @@ pub(crate) const IF_CENTER_HZ: u32 = 12_000;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SavedIfDspRadioState {
     operation_band: Band,
-    dual_band: bool,
-    output_mode: DetectOutputMode,
+    band_mode: BandMode,
+    usb_audio_output: UsbAudioOutput,
     band_b_squelch: SquelchLevel,
-    band_b_mode: Mode,
+    band_b_operating_mode: OperatingMode,
     band_b_step: StepSize,
     band_b_frequency: Frequency,
 }
@@ -59,40 +59,35 @@ pub(crate) async fn save_if_dsp_radio_state<T: Transport>(
         .get_band()
         .await
         .map_err(|error| format!("reading operation band: {error}"))?;
-    let band_b_vfo_mode = radio
-        .get_vfo_memory_mode(Band::B)
+    let band_b_tuning_mode = radio
+        .get_tuning_mode(Band::B)
         .await
-        .map_err(|error| format!("reading Band-B channel mode: {error}"))?;
-    if band_b_vfo_mode != VfoMemoryMode::Vfo {
+        .map_err(|error| format!("reading Band-B tuning mode: {error}"))?;
+    if band_b_tuning_mode != TuningMode::Vfo {
         return Err(format!(
-            "Band B is in {band_b_vfo_mode} mode; IF-DSP requires Band B to already be in VFO mode so its selected memory/call/weather channel is never changed"
+            "Band B is in {band_b_tuning_mode} tuning mode; IF-DSP requires Band B to already be in VFO mode so its selected memory/call/weather channel is never changed"
         ));
     }
-    let dual_band = radio
-        .get_dual_band()
+    let band_mode = radio
+        .get_band_mode()
         .await
-        .map_err(|error| format!("reading dual-band state: {error}"))?;
-    let output_mode = radio
-        .get_io_port()
+        .map_err(|error| format!("reading band presentation: {error}"))?;
+    let usb_audio_output = radio
+        .get_usb_audio_output()
         .await
         .map_err(|error| format!("reading USB output mode: {error}"))?;
     let band_b_squelch = radio
         .get_squelch(Band::B)
         .await
         .map_err(|error| format!("reading Band-B squelch: {error}"))?;
-    let band_b_mode = radio
-        .get_mode(Band::B)
+    let band_b_operating_mode = radio
+        .get_operating_mode(Band::B)
         .await
         .map_err(|error| format!("reading Band-B demodulation mode: {error}"))?;
-    let (step_band, band_b_step) = radio
+    let band_b_step = radio
         .get_step_size(Band::B)
         .await
         .map_err(|error| format!("reading Band-B tuning step: {error}"))?;
-    if step_band != Band::B {
-        return Err(format!(
-            "reading Band-B tuning step returned unexpected band {step_band}"
-        ));
-    }
     let band_b_frequency = radio
         .get_frequency(Band::B)
         .await
@@ -100,10 +95,10 @@ pub(crate) async fn save_if_dsp_radio_state<T: Transport>(
 
     Ok(SavedIfDspRadioState {
         operation_band,
-        dual_band,
-        output_mode,
+        band_mode,
+        usb_audio_output,
         band_b_squelch,
-        band_b_mode,
+        band_b_operating_mode,
         band_b_step,
         band_b_frequency,
     })
@@ -113,13 +108,13 @@ pub(crate) async fn save_if_dsp_radio_state<T: Transport>(
 pub(crate) async fn configure_if_dsp_radio<T: Transport>(
     radio: &mut Radio<T>,
 ) -> Result<(), String> {
-    let band_b_vfo_mode = radio
-        .get_vfo_memory_mode(Band::B)
+    let band_b_tuning_mode = radio
+        .get_tuning_mode(Band::B)
         .await
-        .map_err(|error| format!("rechecking Band-B channel mode: {error}"))?;
-    if band_b_vfo_mode != VfoMemoryMode::Vfo {
+        .map_err(|error| format!("rechecking Band-B tuning mode: {error}"))?;
+    if band_b_tuning_mode != TuningMode::Vfo {
         return Err(format!(
-            "Band B changed to {band_b_vfo_mode} mode before IF-DSP setup; no radio setting was changed"
+            "Band B changed to {band_b_tuning_mode} tuning mode before IF-DSP setup; no radio setting was changed"
         ));
     }
 
@@ -138,14 +133,14 @@ pub(crate) async fn configure_if_dsp_radio<T: Transport>(
     }
 
     radio
-        .set_dual_band(false)
+        .set_band_mode(BandMode::Single)
         .await
         .map_err(|error| format!("selecting Single Band mode: {error}"))?;
-    let dual_band = radio
-        .get_dual_band()
+    let band_mode = radio
+        .get_band_mode()
         .await
         .map_err(|error| format!("verifying Single Band mode: {error}"))?;
-    if dual_band {
+    if band_mode != BandMode::Single {
         return Err("the radio remained in Dual Band mode".to_owned());
     }
 
@@ -153,26 +148,26 @@ pub(crate) async fn configure_if_dsp_radio<T: Transport>(
         .set_step_size(Band::B, StepSize::Hz5000)
         .await
         .map_err(|error| format!("setting the Band-B 5 kHz tuning step: {error}"))?;
-    let (step_band, step) = radio
+    let step = radio
         .get_step_size(Band::B)
         .await
         .map_err(|error| format!("verifying the Band-B tuning step: {error}"))?;
-    if step_band != Band::B || step != StepSize::Hz5000 {
-        return Err(format!(
-            "Band-B tuning-step readback was {step_band} {step}, not Band B 5 kHz"
-        ));
+    if step != StepSize::Hz5000 {
+        return Err(format!("Band-B tuning-step readback was {step}, not 5 kHz"));
     }
 
     radio
-        .set_mode(Band::B, Mode::Usb)
+        .set_operating_mode(Band::B, OperatingMode::Usb)
         .await
         .map_err(|error| format!("setting Band B to USB mode: {error}"))?;
-    let mode = radio
-        .get_mode(Band::B)
+    let operating_mode = radio
+        .get_operating_mode(Band::B)
         .await
         .map_err(|error| format!("verifying Band-B USB mode: {error}"))?;
-    if mode != Mode::Usb {
-        return Err(format!("Band-B mode readback was {mode}, not USB"));
+    if operating_mode != OperatingMode::Usb {
+        return Err(format!(
+            "Band-B operating-mode readback was {operating_mode}, not USB"
+        ));
     }
 
     radio
@@ -186,76 +181,56 @@ pub(crate) async fn configure_if_dsp_radio<T: Transport>(
     if squelch != SquelchLevel::OPEN {
         return Err(format!(
             "Band-B squelch readback was {}, not open",
-            squelch.as_u8()
+            squelch.as_raw()
         ));
     }
 
     radio
-        .set_io_port(DetectOutputMode::If)
+        .set_usb_audio_output(UsbAudioOutput::IntermediateFrequency)
         .await
         .map_err(|error| format!("enabling 12 kHz USB IF output: {error}"))?;
-    let output_mode = radio
-        .get_io_port()
+    let usb_audio_output = radio
+        .get_usb_audio_output()
         .await
         .map_err(|error| format!("verifying 12 kHz USB IF output: {error}"))?;
-    if output_mode != DetectOutputMode::If {
+    if usb_audio_output != UsbAudioOutput::IntermediateFrequency {
         return Err(format!(
-            "USB output readback was {output_mode}, not IF; IF requires Single Band mode on Band B"
+            "USB output readback was {usb_audio_output}, not Intermediate Frequency; that output requires Single Band mode on Band B"
         ));
     }
     Ok(())
 }
 
-/// Attempt to retune Band B while preserving the live IF-output requirement.
+/// Verify that Band B is already tuned and still supplying its USB IF output.
 ///
-/// This currently returns the direct-frequency quarantine error after safely
-/// pausing and resuming IF output.
+/// Arbitrary CAT frequency writes are not qualified. The operator must tune
+/// the radio directly; this function only accepts exact frequency and IF-mode
+/// readbacks.
 pub(crate) async fn retune_if_dsp_radio<T: Transport>(
     radio: &mut Radio<T>,
     frequency_hz: u32,
 ) -> Result<(), String> {
-    let pause_write_result = radio
-        .set_io_port(DetectOutputMode::Af)
+    let current = radio
+        .get_frequency(Band::B)
         .await
-        .map_err(|error| format!("pausing IF output before tuning: {error}"));
-    let pause_result = match pause_write_result {
-        Ok(()) => radio
-            .get_io_port()
+        .map_err(|error| format!("reading Band-B frequency: {error}"))?;
+    if current.as_hz() == frequency_hz {
+        let usb_audio_output = radio
+            .get_usb_audio_output()
             .await
-            .map_err(|error| format!("verifying paused IF output: {error}")),
-        Err(detail) => Err(detail),
-    };
-    let tune_result = match pause_result {
-        Ok(DetectOutputMode::Af) => radio
-            .tune_frequency(Band::B, Frequency::new(frequency_hz))
-            .await
-            .map_err(|error| format!("tuning Band B to {frequency_hz} Hz: {error}")),
-        Ok(value) => Err(format!(
-            "USB output readback was {value}, not AF before tuning"
-        )),
-        Err(detail) => Err(detail),
-    };
-    let resume_result = radio.set_io_port(DetectOutputMode::If).await;
-    let resumed = radio.get_io_port().await;
-
-    let mut failures = Vec::new();
-    if let Err(detail) = tune_result {
-        failures.push(detail);
-    }
-    if let Err(error) = resume_result {
-        failures.push(format!("re-enabling IF output after tuning: {error}"));
-    }
-    match resumed {
-        Ok(DetectOutputMode::If) => {}
-        Ok(value) => failures.push(format!(
-            "USB output readback was {value}, not IF after tuning"
-        )),
-        Err(error) => failures.push(format!("verifying IF output after tuning: {error}")),
-    }
-    if failures.is_empty() {
-        Ok(())
+            .map_err(|error| format!("verifying 12 kHz USB IF output: {error}"))?;
+        if usb_audio_output == UsbAudioOutput::IntermediateFrequency {
+            Ok(())
+        } else {
+            Err(format!(
+                "USB output readback was {usb_audio_output}, not Intermediate Frequency after verifying Band-B frequency"
+            ))
+        }
     } else {
-        Err(failures.join("; "))
+        Err(format!(
+            "Band B is at {} Hz, not {frequency_hz} Hz; arbitrary CAT frequency writes are not qualified, so tune the radio directly",
+            current.as_hz()
+        ))
     }
 }
 
@@ -266,9 +241,15 @@ pub(crate) async fn restore_if_dsp_radio<T: Transport>(
 ) -> IfDspRestoreReport {
     let mut report = IfDspRestoreReport::default();
 
-    let temporary_af_ok = radio.set_io_port(DetectOutputMode::Af).await.is_ok()
-        && matches!(radio.get_io_port().await, Ok(DetectOutputMode::Af));
-    if !temporary_af_ok {
+    let temporary_audio_ok = radio
+        .set_usb_audio_output(UsbAudioOutput::Audio)
+        .await
+        .is_ok()
+        && matches!(
+            radio.get_usb_audio_output().await,
+            Ok(UsbAudioOutput::Audio)
+        );
+    if !temporary_audio_ok {
         report
             .failed_steps
             .push("temporary AF output for safe restoration".to_owned());
@@ -283,9 +264,15 @@ pub(crate) async fn restore_if_dsp_radio<T: Transport>(
         report.failed_steps.push("Band-B squelch".to_owned());
     }
 
-    let mode_ok = radio.set_mode(Band::B, saved.band_b_mode).await.is_ok()
-        && matches!(radio.get_mode(Band::B).await, Ok(value) if value == saved.band_b_mode);
-    if !mode_ok {
+    let operating_mode_ok = radio
+        .set_operating_mode(Band::B, saved.band_b_operating_mode)
+        .await
+        .is_ok()
+        && matches!(
+            radio.get_operating_mode(Band::B).await,
+            Ok(value) if value == saved.band_b_operating_mode
+        );
+    if !operating_mode_ok {
         report
             .failed_steps
             .push("Band-B demodulation mode".to_owned());
@@ -295,22 +282,21 @@ pub(crate) async fn restore_if_dsp_radio<T: Transport>(
         .set_step_size(Band::B, saved.band_b_step)
         .await
         .is_ok()
-        && matches!(radio.get_step_size(Band::B).await, Ok((Band::B, value)) if value == saved.band_b_step);
+        && matches!(radio.get_step_size(Band::B).await, Ok(value) if value == saved.band_b_step);
     if !step_ok {
         report.failed_steps.push("Band-B tuning step".to_owned());
     }
 
-    if radio
-        .tune_frequency(Band::B, saved.band_b_frequency)
-        .await
-        .is_err()
-    {
+    if !matches!(
+        radio.get_frequency(Band::B).await,
+        Ok(value) if value == saved.band_b_frequency
+    ) {
         report.failed_steps.push("Band-B frequency".to_owned());
     }
 
-    let dual_ok = radio.set_dual_band(saved.dual_band).await.is_ok()
-        && matches!(radio.get_dual_band().await, Ok(value) if value == saved.dual_band);
-    if !dual_ok {
+    let band_mode_ok = radio.set_band_mode(saved.band_mode).await.is_ok()
+        && matches!(radio.get_band_mode().await, Ok(value) if value == saved.band_mode);
+    if !band_mode_ok {
         report.failed_steps.push("Dual/Single Band mode".to_owned());
     }
 
@@ -320,8 +306,11 @@ pub(crate) async fn restore_if_dsp_radio<T: Transport>(
         report.failed_steps.push("operation band".to_owned());
     }
 
-    let output_ok = radio.set_io_port(saved.output_mode).await.is_ok()
-        && matches!(radio.get_io_port().await, Ok(value) if value == saved.output_mode);
+    let output_ok = radio
+        .set_usb_audio_output(saved.usb_audio_output)
+        .await
+        .is_ok()
+        && matches!(radio.get_usb_audio_output().await, Ok(value) if value == saved.usb_audio_output);
     if !output_ok {
         report.failed_steps.push("USB output mode".to_owned());
     }
@@ -347,13 +336,13 @@ mod tests {
         mock.expect(b"MD 1\r", b"MD 1,0\r");
         mock.expect(b"SF 1\r", b"SF 1,8\r");
         mock.expect(b"FQ 1\r", b"FQ 1,0435640000\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
 
         let saved = save_if_dsp_radio_state(&mut radio).await?;
 
         assert_eq!(saved.operation_band, Band::A, "operation band");
-        assert!(saved.dual_band, "dual-band state is wire-inverted");
-        assert_eq!(saved.output_mode, DetectOutputMode::Af, "output mode");
+        assert_eq!(saved.band_mode, BandMode::Dual);
+        assert_eq!(saved.usb_audio_output, UsbAudioOutput::Audio);
         assert_eq!(saved.band_b_step, StepSize::Hz25000, "tuning step");
         assert_eq!(saved.band_b_frequency_hz(), 435_640_000, "frequency");
         Ok(())
@@ -364,12 +353,12 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.expect(b"BC\r", b"BC 0\r");
         mock.expect(b"VM 1\r", b"VM 1,1\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
 
         let result = save_if_dsp_radio_state(&mut radio).await;
 
         assert!(
-            matches!(result, Err(ref detail) if detail.contains("Memory mode") && detail.contains("VFO mode")),
+            matches!(result, Err(ref detail) if detail.contains("Memory tuning mode") && detail.contains("VFO mode")),
             "expected an explicit non-VFO refusal, got {result:?}"
         );
         Ok(())
@@ -391,7 +380,7 @@ mod tests {
         mock.expect(b"SQ 1\r", b"SQ 1,0\r");
         mock.expect(b"IO 1\r", b"IO 1\r");
         mock.expect(b"IO\r", b"IO 1\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
 
         configure_if_dsp_radio(&mut radio).await?;
         Ok(())
@@ -401,10 +390,10 @@ mod tests {
     async fn restore_includes_and_verifies_the_original_tuning_step() -> TestResult {
         let saved = SavedIfDspRadioState {
             operation_band: Band::A,
-            dual_band: true,
-            output_mode: DetectOutputMode::Af,
+            band_mode: BandMode::Dual,
+            usb_audio_output: UsbAudioOutput::Audio,
             band_b_squelch: SquelchLevel::try_from(2)?,
-            band_b_mode: Mode::Fm,
+            band_b_operating_mode: OperatingMode::Fm,
             band_b_step: StepSize::Hz25000,
             band_b_frequency: Frequency::new(435_640_000),
         };
@@ -417,14 +406,14 @@ mod tests {
         mock.expect(b"MD 1\r", b"MD 1,0\r");
         mock.expect(b"SF 1,8\r", b"SF 1,8\r");
         mock.expect(b"SF 1\r", b"SF 1,8\r");
-        mock.expect(b"VM 1\r", b"?\r");
+        mock.expect(b"FQ 1\r", b"?\r");
         mock.expect(b"DL 0\r", b"DL 0\r");
         mock.expect(b"DL\r", b"DL 0\r");
         mock.expect(b"BC 0\r", b"BC 0\r");
         mock.expect(b"BC\r", b"BC 0\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
 
         let report = restore_if_dsp_radio(&mut radio, saved).await;
 
@@ -440,10 +429,10 @@ mod tests {
     async fn restore_keeps_if_off_until_frequency_then_restores_saved_if_last() -> TestResult {
         let saved = SavedIfDspRadioState {
             operation_band: Band::B,
-            dual_band: false,
-            output_mode: DetectOutputMode::If,
+            band_mode: BandMode::Single,
+            usb_audio_output: UsbAudioOutput::IntermediateFrequency,
             band_b_squelch: SquelchLevel::OPEN,
-            band_b_mode: Mode::Usb,
+            band_b_operating_mode: OperatingMode::Usb,
             band_b_step: StepSize::Hz5000,
             band_b_frequency: Frequency::new(14_074_000),
         };
@@ -456,14 +445,14 @@ mod tests {
         mock.expect(b"MD 1\r", b"MD 1,4\r");
         mock.expect(b"SF 1,0\r", b"SF 1,0\r");
         mock.expect(b"SF 1\r", b"SF 1,0\r");
-        mock.expect(b"VM 1\r", b"?\r");
+        mock.expect(b"FQ 1\r", b"?\r");
         mock.expect(b"DL 1\r", b"DL 1\r");
         mock.expect(b"DL\r", b"DL 1\r");
         mock.expect(b"BC 1\r", b"BC 1\r");
         mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"IO 1\r", b"IO 1\r");
         mock.expect(b"IO\r", b"IO 1\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
 
         let report = restore_if_dsp_radio(&mut radio, saved).await;
 
@@ -476,56 +465,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retune_attempts_if_resume_after_af_readback_mismatch() -> TestResult {
+    async fn retune_rejects_a_frequency_mismatch_without_mutating_the_radio() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.expect(b"IO 0\r", b"IO 0\r");
-        mock.expect(b"IO\r", b"IO 2\r");
-        mock.expect(b"IO 1\r", b"IO 1\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0435640000\r");
         mock.expect(b"IO\r", b"IO 1\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
 
         let result = retune_if_dsp_radio(&mut radio, 14_074_000).await;
 
         assert!(
-            matches!(result, Err(ref detail) if detail.contains("not AF before tuning")),
-            "expected the AF readback failure after verified IF resume, got {result:?}"
+            matches!(result, Err(ref detail) if detail.contains("435640000 Hz") && detail.contains("not 14074000 Hz") && detail.contains("not qualified")),
+            "expected an explicit quarantined-write refusal, got {result:?}"
+        );
+        assert_eq!(
+            radio.get_usb_audio_output().await?,
+            UsbAudioOutput::IntermediateFrequency,
+            "the sentinel IO query must remain untouched by the rejected retune"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn retune_attempts_if_resume_after_af_write_error() -> TestResult {
+    async fn retune_rejects_a_non_if_output_after_the_frequency_matches() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.expect(b"IO 0\r", b"?\r");
-        mock.expect(b"IO 1\r", b"IO 1\r");
-        mock.expect(b"IO\r", b"IO 1\r");
-        let mut radio = Radio::connect(mock).await?;
-
-        let result = retune_if_dsp_radio(&mut radio, 14_074_000).await;
-
-        assert!(
-            matches!(result, Err(ref detail) if detail.contains("pausing IF output")),
-            "expected the AF write failure after verified IF resume, got {result:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn retune_uses_af_tune_if_and_verifies_both_frequency_and_output() -> TestResult {
-        const CURRENT: &[u8] =
-            b"FO 1,0435640000,0005000000,0,0,0,0,0,1,1,1,0,0,1,14,14,023,0,REPEATER,1,05\r";
-        const TARGET: &[u8] =
-            b"FO 1,0014074000,0005000000,0,0,0,0,0,1,1,1,0,0,1,14,14,023,0,REPEATER,1,05\r";
-        let mut mock = MockTransport::new();
-        mock.expect(b"IO 0\r", b"IO 0\r");
-        mock.expect(b"IO\r", b"IO 0\r");
-        mock.expect(b"VM 1\r", b"VM 1,0\r");
-        mock.expect(b"FO 1\r", CURRENT);
-        mock.expect(TARGET, TARGET);
         mock.expect(b"FQ 1\r", b"FQ 1,0014074000\r");
-        mock.expect(b"IO 1\r", b"IO 1\r");
+        mock.expect(b"IO\r", b"IO 2\r");
+        let mut radio = Radio::new(mock);
+
+        let result = retune_if_dsp_radio(&mut radio, 14_074_000).await;
+
+        assert!(
+            matches!(result, Err(ref detail) if detail.contains("Detect") && detail.contains("not Intermediate Frequency")),
+            "expected an explicit IF-output readback failure, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retune_verifies_the_pretuned_frequency_and_if_output() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"FQ 1\r", b"FQ 1,0014074000\r");
         mock.expect(b"IO\r", b"IO 1\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
 
         retune_if_dsp_radio(&mut radio, 14_074_000).await?;
         Ok(())

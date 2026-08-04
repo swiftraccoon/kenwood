@@ -4,31 +4,32 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::aprs::{
-    AprsData, AprsItem, AprsObject, AprsPosition, MAX_APRS_MESSAGE_TEXT_LEN,
-    build_aprs_message_packet, build_aprs_position_report_packet, parse_aprs_data_full,
+    AprsData, AprsItem, AprsObject, AprsPosition, AprsSymbol, Latitude, Longitude,
+    MessageAddressee, MessageId, MessageText, PositionReportText, build_aprs_message_packet,
+    build_aprs_position_report_packet, parse_aprs_data_full,
 };
-use ax25_codec::{Ax25Address, Ax25Packet, RouteEntry, build_ax25, parse_ax25};
-use kenwood_thd75::types::TncBaud;
+use ax25_codec::{Ax25Address, Ax25Packet, DigipeaterPath, build_ax25, parse_ax25};
+use kenwood_thd75::types::PacketDataRate;
 
 use crate::automation::AutomationError;
 
 /// Maximum number of activity rows retained by the in-memory journal.
 const ACTIVITY_CAPACITY: usize = 1_000;
 
-/// TNC data rate used for an APRS KISS session.
+/// Packet data rate used for an APRS KISS session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum AprsTncBaud {
-    /// 1200-baud AFSK, normally used on VHF APRS channels.
+pub enum AprsPacketDataRate {
+    /// 1200 bps AFSK, normally used on VHF APRS channels.
     Bps1200,
-    /// 9600-baud packet mode.
+    /// 9600 bps packet mode.
     Bps9600,
 }
 
-impl From<AprsTncBaud> for TncBaud {
-    fn from(value: AprsTncBaud) -> Self {
+impl From<AprsPacketDataRate> for PacketDataRate {
+    fn from(value: AprsPacketDataRate) -> Self {
         match value {
-            AprsTncBaud::Bps1200 => Self::Bps1200,
-            AprsTncBaud::Bps9600 => Self::Bps9600,
+            AprsPacketDataRate::Bps1200 => Self::Bps1200,
+            AprsPacketDataRate::Bps9600 => Self::Bps9600,
         }
     }
 }
@@ -43,8 +44,8 @@ pub struct AprsSessionConfig {
     pub station_callsign: String,
     /// Comma-separated AX.25 digipeater path, or empty for a direct path.
     pub path: String,
-    /// TNC data rate.
-    pub baud: AprsTncBaud,
+    /// Packet data rate.
+    pub data_rate: AprsPacketDataRate,
     /// APRS symbol table or overlay character, exactly one printable ASCII byte.
     pub symbol_table: String,
     /// APRS symbol code, exactly one printable ASCII byte.
@@ -66,7 +67,7 @@ impl Default for AprsSessionConfig {
         Self {
             station_callsign: String::new(),
             path: "WIDE1-1,WIDE2-1".to_owned(),
-            baud: AprsTncBaud::Bps1200,
+            data_rate: AprsPacketDataRate::Bps1200,
             symbol_table: "/".to_owned(),
             symbol_code: ">".to_owned(),
             tx_delay_10ms: 50,
@@ -267,9 +268,8 @@ pub struct AprsOperationalSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct AprsRuntimeConfig {
     pub(crate) source: Option<Ax25Address>,
-    pub(crate) path: Vec<RouteEntry>,
-    pub(crate) symbol_table: char,
-    pub(crate) symbol_code: char,
+    pub(crate) path: DigipeaterPath,
+    pub(crate) symbol: AprsSymbol,
 }
 
 impl AprsSessionConfig {
@@ -298,12 +298,13 @@ impl AprsSessionConfig {
             .map_err(|error| invalid_config(&format!("invalid digipeater path: {error}")))?;
         let symbol_table = one_symbol(&self.symbol_table, "symbol table")?;
         let symbol_code = one_symbol(&self.symbol_code, "symbol code")?;
+        let symbol = AprsSymbol::from_chars(symbol_table, symbol_code)
+            .map_err(|error| invalid_config(&format!("invalid APRS symbol: {error}")))?;
 
         Ok(AprsRuntimeConfig {
             source,
             path,
-            symbol_table,
-            symbol_code,
+            symbol,
         })
     }
 }
@@ -542,33 +543,24 @@ impl AprsActivityStore {
             .ok_or_else(|| AutomationError::AprsOperation {
                 detail: "set a valid source callsign before transmitting".to_owned(),
             })?;
-        if text.len() > MAX_APRS_MESSAGE_TEXT_LEN {
-            return Err(AutomationError::AprsOperation {
-                detail: format!(
-                    "message text is {} bytes; APRS permits at most {MAX_APRS_MESSAGE_TEXT_LEN}",
-                    text.len()
-                ),
-            });
-        }
-        if addressee.is_empty() || addressee.len() > 9 || !addressee.is_ascii() {
-            return Err(AutomationError::AprsOperation {
-                detail: "message addressee must contain 1–9 ASCII characters".to_owned(),
-            });
-        }
-        if let Some(identifier) = message_id
-            && (identifier.is_empty()
-                || identifier.len() > 5
-                || !identifier.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-        {
-            return Err(AutomationError::AprsOperation {
-                detail: "message ID must contain 1–5 ASCII letters or digits".to_owned(),
-            });
-        }
+        let addressee =
+            MessageAddressee::new(addressee).map_err(|error| AutomationError::AprsOperation {
+                detail: format!("invalid message addressee: {error}"),
+            })?;
+        let text = MessageText::new(text).map_err(|error| AutomationError::AprsOperation {
+            detail: format!("invalid message text: {error}"),
+        })?;
+        let message_id = message_id
+            .map(MessageId::new)
+            .transpose()
+            .map_err(|error| AutomationError::AprsOperation {
+                detail: format!("invalid message ID: {error}"),
+            })?;
         Ok(build_aprs_message_packet(
             &source,
-            addressee,
-            text,
-            message_id,
+            &addressee,
+            &text,
+            message_id.as_ref(),
             &runtime.path,
         ))
     }
@@ -579,16 +571,17 @@ impl AprsActivityStore {
         longitude: f64,
         comment: &str,
     ) -> Result<Ax25Packet, AutomationError> {
-        if !latitude.is_finite()
-            || !longitude.is_finite()
-            || !(-90.0..=90.0).contains(&latitude)
-            || !(-180.0..=180.0).contains(&longitude)
-        {
-            return Err(AutomationError::AprsOperation {
-                detail: "position must contain finite latitude −90…90 and longitude −180…180"
-                    .to_owned(),
-            });
-        }
+        let latitude = Latitude::new(latitude).map_err(|error| AutomationError::AprsOperation {
+            detail: format!("invalid latitude: {error}"),
+        })?;
+        let longitude =
+            Longitude::new(longitude).map_err(|error| AutomationError::AprsOperation {
+                detail: format!("invalid longitude: {error}"),
+            })?;
+        let comment =
+            PositionReportText::new(comment).map_err(|error| AutomationError::AprsOperation {
+                detail: format!("invalid position text: {error}"),
+            })?;
         let runtime = self.active_runtime()?;
         let source = runtime
             .source
@@ -599,9 +592,8 @@ impl AprsActivityStore {
             &source,
             latitude,
             longitude,
-            runtime.symbol_table,
-            runtime.symbol_code,
-            comment,
+            runtime.symbol,
+            &comment,
             &runtime.path,
         ))
     }
@@ -726,7 +718,7 @@ fn activity_from_packet(
     let source = packet.source.to_string();
     let destination = packet.destination.to_string();
     let path: Vec<String> = packet.digipeaters.iter().map(ToString::to_string).collect();
-    let raw_packet = tnc2_packet(&source, &destination, &path, &packet.info);
+    let raw_packet = tnc2_packet(&source, &destination, &path, packet.information());
     let decoded = decode_summary(&source, packet);
     AprsActivityRecord {
         sequence: 0,
@@ -758,10 +750,14 @@ struct DecodedSummary {
 }
 
 fn decode_summary(source: &str, packet: &Ax25Packet) -> DecodedSummary {
-    let Ok(data) = parse_aprs_data_full(&packet.info, packet.destination.callsign.as_str()) else {
+    let Ok(data) = parse_aprs_data_full(packet.information(), packet.destination.callsign.as_str())
+    else {
         return DecodedSummary {
             kind: AprsActivityKind::Ax25,
-            summary: format!("{source}: {}", String::from_utf8_lossy(&packet.info)),
+            summary: format!(
+                "{source}: {}",
+                String::from_utf8_lossy(packet.information())
+            ),
             latitude: None,
             longitude: None,
             speed_knots: None,
@@ -785,10 +781,10 @@ fn decode_summary(source: &str, packet: &Ax25Packet) -> DecodedSummary {
         ),
         AprsData::Object(object) => object_summary(source, &object),
         AprsData::Item(item) => item_summary(source, &item),
-        AprsData::Weather(weather) => {
-            let detail = weather.temperature.map_or_else(
+        AprsData::PositionlessWeather(report) => {
+            let detail = report.weather.temperature().map_or_else(
                 || "weather report".to_owned(),
-                |temperature| format!("weather {temperature} °F"),
+                |temperature| format!("weather {} °F", temperature.get()),
             );
             simple_summary(AprsActivityKind::Weather, format!("{source} {detail}"))
         }
@@ -857,7 +853,7 @@ fn object_summary(source: &str, object: &AprsObject) -> DecodedSummary {
         AprsActivityKind::Object,
         source,
         "object",
-        &object.name,
+        object.name.as_str(),
         object.live,
         &object.position,
     )
@@ -993,8 +989,14 @@ mod tests {
     #[test]
     fn received_position_is_exactly_journaled_and_updates_station() -> TestResult {
         let source = Ax25Address::new("N0CALL", 7)?;
-        let packet =
-            build_aprs_position_report_packet(&source, 35.25, -97.75, '/', '>', "mobile", &[]);
+        let packet = build_aprs_position_report_packet(
+            &source,
+            Latitude::new(35.25)?,
+            Longitude::new(-97.75)?,
+            AprsSymbol::CAR,
+            &PositionReportText::new("mobile")?,
+            &DigipeaterPath::empty(),
+        );
         let raw = build_ax25(&packet);
         let mut store = AprsActivityStore::default();
         store.begin_start(AprsSessionConfig::default());
@@ -1026,6 +1028,23 @@ mod tests {
         assert_eq!(record.kind, AprsActivityKind::Message);
         assert_eq!(record.raw_ax25, expected);
         assert!(record.raw_packet.contains(":W1AW     :hello{42"));
+        Ok(())
+    }
+
+    #[test]
+    fn position_send_rejects_invalid_text_at_command_boundary() -> TestResult {
+        let mut store = AprsActivityStore::default();
+        store.begin_start(AprsSessionConfig {
+            station_callsign: "K1ABC-7".to_owned(),
+            ..AprsSessionConfig::default()
+        });
+        store.mark_active();
+
+        let result = store.build_position(35.25, -97.75, "bad\ntext");
+        let Err(AutomationError::AprsOperation { detail }) = result else {
+            return Err("invalid APRS text should fail at the command boundary".into());
+        };
+        assert!(detail.contains("non-printable ASCII byte 0x0A"));
         Ok(())
     }
 

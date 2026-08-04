@@ -18,10 +18,12 @@ use kenwood_thd75::radio::automation::{
 };
 use kenwood_thd75::radio::kiss_session::KissSession;
 use kenwood_thd75::radio::programming::{
-    McpPageExchange, McpPageExchangeError, McpPageExchangeOperationError,
+    McpPage, McpPageExchange, McpPageExchangeError, McpPageExchangeOperationError, WritableMcpPage,
 };
 use kenwood_thd75::screen::{SCREEN_HEIGHT, SCREEN_WIDTH};
-use kenwood_thd75::transport::Transport;
+use kenwood_thd75::types::{
+    KissDuplex, KissPersistence, KissSlotTime, KissTxDelay, KissTxTail, PacketDataRate,
+};
 use kiss_tnc::KissCommand;
 use tokio::sync::{mpsc, oneshot};
 
@@ -995,7 +997,7 @@ impl DeferredReply {
                 drop(reply.send(Err(AutomationError::AutomationRestoration {
                     operation: "setting read".to_owned(),
                     detail,
-                })))
+                })));
             }
             Self::Apply { reply, .. } => {
                 drop(reply.send(Err(AutomationError::AutomationRestoration {
@@ -1075,25 +1077,22 @@ async fn run_controller(
     ready: oneshot::Sender<Result<AutomationAbiRecord, AutomationError>>,
     aprs: Arc<Mutex<AprsActivityStore>>,
 ) {
-    let mut radio = match Radio::connect(transport).await {
-        Ok(radio) => radio,
-        Err(error) => {
-            drop(ready.send(Err(map_initial_error(error))));
-            return;
-        }
-    };
+    let mut radio = Radio::new(transport);
     let mut initial_ready = Some(ready);
     let mut deferred_reply: Option<DeferredReply> = None;
     let mut settings_snapshot: Option<SettingsSnapshot> = None;
     let mut if_dsp_session: Option<ActiveIfDspSession> = None;
-    let mut synchronize_cat_after_kiss_return = false;
+    let mut restore_cat_after_kiss_return = false;
     let mut next_screen_lease = 1_u64;
     let mut next_settings_snapshot = 1_u64;
 
     loop {
-        let cat_synchronization = if synchronize_cat_after_kiss_return {
-            synchronize_cat_after_kiss_return = false;
-            synchronize_cat_after_kiss(&mut radio).await
+        let cat_synchronization = if restore_cat_after_kiss_return {
+            restore_cat_after_kiss_return = false;
+            radio
+                .restore_cat_after_mode_exit()
+                .await
+                .map_err(|error| error.to_string())
         } else {
             Ok(())
         };
@@ -1188,10 +1187,11 @@ async fn run_controller(
             ActorBreak::StartAprs { config, reply } => {
                 settings_snapshot = None;
                 lock_aprs_store(&aprs).begin_start(config.clone());
-                let mut kiss = match radio.enter_kiss(config.baud.into()).await {
+                let mut kiss = match radio.enter_kiss(config.data_rate.into()).await {
                     Ok(kiss) => kiss,
                     Err((returned_radio, error)) => {
                         radio = returned_radio;
+                        restore_cat_after_kiss_return = true;
                         let detail = format!("could not enter KISS mode: {error}");
                         deferred_reply = Some(DeferredReply::FailedAprsStart { reply, detail });
                         continue;
@@ -1203,7 +1203,7 @@ async fn run_controller(
                     match kiss.exit().await {
                         Ok(returned_radio) => {
                             radio = returned_radio;
-                            synchronize_cat_after_kiss_return = true;
+                            restore_cat_after_kiss_return = true;
                             deferred_reply = Some(DeferredReply::FailedAprsStart { reply, detail });
                             continue;
                         }
@@ -1234,7 +1234,7 @@ async fn run_controller(
                         match kiss.exit().await {
                             Ok(returned_radio) => {
                                 radio = returned_radio;
-                                synchronize_cat_after_kiss_return = true;
+                                restore_cat_after_kiss_return = true;
                                 deferred_reply = Some(DeferredReply::StopAprs { reply });
                             }
                             Err((_kiss, error)) => {
@@ -1462,30 +1462,6 @@ async fn qualify_automation(
     Ok(session)
 }
 
-/// Re-establish ordinary CAT framing after a successful KISS Return.
-///
-/// `KissSession::exit` deliberately marks its returned `Radio` as
-/// desynchronized because binary frames may still be buffered. An ordinary
-/// identity exchange owns the tolerant drain needed at that one proven mode
-/// boundary. The strict automation qualifier remains fail-closed and runs only after
-/// this helper succeeds. If the in-place exchange cannot prove CAT framing,
-/// reopen the CDC session once and use `Radio::reconnect`'s exact identity
-/// proof instead.
-async fn synchronize_cat_after_kiss<T: Transport>(radio: &mut Radio<T>) -> Result<(), String> {
-    let in_place_failure = match radio.identify().await {
-        Ok(info) if info.model == "TH-D75" => return Ok(()),
-        Ok(info) => format!(
-            "CAT identity after KISS Return reported {}, not TH-D75",
-            info.model
-        ),
-        Err(error) => format!("CAT identity after KISS Return failed: {error}"),
-    };
-
-    radio.reconnect().await.map_err(|error| {
-        format!("{in_place_failure}; clean CDC reopen and CAT identity also failed: {error}")
-    })
-}
-
 #[expect(
     clippy::too_many_lines,
     reason = "the exhaustive command dispatcher makes mode-conflict replies auditable"
@@ -1621,12 +1597,27 @@ async fn apply_aprs_kiss_config(
     config: &AprsSessionConfig,
 ) -> Result<(), RadioError> {
     kiss.set_receive_timeout(Duration::from_millis(250));
-    kiss.set_tx_delay(config.tx_delay_10ms).await?;
-    kiss.set_persistence(config.persistence).await?;
-    kiss.set_slot_time(config.slot_time_10ms).await?;
-    kiss.set_tx_tail(config.tx_tail_10ms).await?;
-    kiss.set_full_duplex(config.full_duplex).await?;
-    kiss.set_hardware_baud(config.baud == crate::aprs::AprsTncBaud::Bps1200)
+    kiss.set_tx_delay(KissTxDelay::from_milliseconds(
+        u16::from(config.tx_delay_10ms) * 10,
+    )?)
+    .await?;
+    kiss.set_persistence(KissPersistence::new(config.persistence))
+        .await?;
+    kiss.set_slot_time(KissSlotTime::from_milliseconds(
+        u16::from(config.slot_time_10ms) * 10,
+    )?)
+    .await?;
+    kiss.set_tx_tail(KissTxTail::from_milliseconds(
+        u16::from(config.tx_tail_10ms) * 10,
+    )?)
+    .await?;
+    kiss.set_duplex(if config.full_duplex {
+        KissDuplex::Full
+    } else {
+        KissDuplex::Half
+    })
+    .await?;
+    kiss.set_hardware_data_rate(PacketDataRate::from(config.data_rate))
         .await?;
     Ok(())
 }
@@ -1869,13 +1860,23 @@ async fn read_settings(
     ensure_settings_target(radio, false).await?;
     let fields = select_fields(requested_ids)?;
     let pages = pages_for_fields(&fields)?;
+    let pages: Vec<McpPage> = pages
+        .into_iter()
+        .map(McpPage::new)
+        .collect::<Result<_, _>>()
+        .map_err(|error| AutomationError::SettingsRead {
+            detail: error.to_string(),
+        })?;
     let live_pages = radio
         .read_sparse_memory_pages(&pages)
         .await
         .map_err(|error| AutomationError::SettingsRead {
             detail: error.to_string(),
         })?;
-    let page_map: BTreeMap<u16, [u8; PAGE_SIZE]> = live_pages.into_iter().collect();
+    let page_map: BTreeMap<u16, [u8; PAGE_SIZE]> = live_pages
+        .into_iter()
+        .map(|(page, data)| (page.as_raw(), data))
+        .collect();
     let field_ids: Vec<String> = fields
         .iter()
         .map(|field| field.descriptor.name.to_owned())
@@ -1930,29 +1931,32 @@ async fn apply_settings(
         .take()
         .ok_or(AutomationError::SettingsSnapshotUnavailable { snapshot_id })?;
     let replacements = replacement_pages(&consumed.pages, &patches)?;
-    let exchanges: Vec<McpPageExchange> = patches
-        .pages()
-        .map(|page| {
-            let expected = consumed
-                .pages
-                .get(&page)
-                .copied()
-                .ok_or(AutomationError::SettingsSnapshotUnavailable { snapshot_id })?;
-            let replacement =
-                replacements
-                    .get(&page)
+    let exchanges: Vec<McpPageExchange> =
+        patches
+            .pages()
+            .map(|page| {
+                let raw_page = page.as_raw();
+                let expected = consumed
+                    .pages
+                    .get(&raw_page)
                     .copied()
-                    .ok_or_else(|| AutomationError::Internal {
-                        detail: format!("replacement for MCP page 0x{page:04X} is missing"),
-                    })?;
-            Ok(McpPageExchange::new(page, expected, replacement))
-        })
-        .collect::<Result<_, AutomationError>>()?;
+                    .ok_or(AutomationError::SettingsSnapshotUnavailable { snapshot_id })?;
+                let replacement = replacements.get(&raw_page).copied().ok_or_else(|| {
+                    AutomationError::Internal {
+                        detail: format!("replacement for MCP page 0x{raw_page:04X} is missing"),
+                    }
+                })?;
+                Ok(McpPageExchange::new(page, expected, replacement))
+            })
+            .collect::<Result<_, AutomationError>>()?;
 
     let pages_written = radio
         .compare_exchange_memory_pages(&exchanges)
         .await
-        .map_err(|error| map_exchange_error(&error))?;
+        .map_err(|error| map_exchange_error(&error))?
+        .into_iter()
+        .map(WritableMcpPage::as_raw)
+        .collect();
 
     let mut refreshed_pages = consumed.pages;
     for (page, replacement) in replacements {
@@ -2013,7 +2017,7 @@ fn verify_setting_preconditions(
     }
     if patches
         .pages()
-        .any(|page| !snapshot.pages.contains_key(&page))
+        .any(|page| !snapshot.pages.contains_key(&page.as_raw()))
     {
         return Err(AutomationError::SettingsSnapshotUnavailable {
             snapshot_id: snapshot.id,
@@ -2032,7 +2036,7 @@ async fn ensure_settings_target(
     let firmware = radio.get_firmware_version().await.map_err(|error| {
         settings_operation_error(applying, format!("firmware identity failed: {error}"))
     })?;
-    if !is_supported_mcp_d75_schema_target(&identity.model, &firmware) {
+    if !is_supported_mcp_d75_schema_target(identity.model, &firmware) {
         return Err(settings_operation_error(
             applying,
             format!(
@@ -2139,13 +2143,11 @@ fn decode_values(
             let field = menu_field(identifier).ok_or_else(|| AutomationError::SettingsRead {
                 detail: format!("unknown cached setting identifier {identifier}"),
             })?;
-            let value =
-                field
-                    .descriptor
-                    .read(&image)
-                    .map_err(|error| AutomationError::SettingsRead {
-                        detail: error.to_string(),
-                    })?;
+            let value = field
+                .read(&image)
+                .map_err(|error| AutomationError::SettingsRead {
+                    detail: error.to_string(),
+                })?;
             Ok(SettingValueRecord {
                 setting_id: field.descriptor.name.to_owned(),
                 value: setting_value(value),
@@ -2170,17 +2172,18 @@ fn replacement_pages(
 ) -> Result<BTreeMap<u16, [u8; PAGE_SIZE]>, AutomationError> {
     let mut replacements = BTreeMap::new();
     for page in patches.pages() {
+        let raw_page = page.as_raw();
         let mut replacement = expected
-            .get(&page)
+            .get(&raw_page)
             .copied()
             .ok_or(AutomationError::SettingsSnapshotUnavailable { snapshot_id: 0 })?;
         let patch = patches
             .page(page)
             .ok_or_else(|| AutomationError::Internal {
-                detail: format!("patch for MCP page 0x{page:04X} is missing"),
+                detail: format!("patch for MCP page 0x{raw_page:04X} is missing"),
             })?;
         patch.apply_to_page(&mut replacement);
-        let _previous = replacements.insert(page, replacement);
+        let _previous = replacements.insert(raw_page, replacement);
     }
     Ok(replacements)
 }
@@ -2202,17 +2205,6 @@ fn map_exchange_error(error: &McpPageExchangeError) -> AutomationError {
         format!("{error}; writes may have started for pages {possibly_written:?}")
     };
     AutomationError::SettingsApply { detail }
-}
-
-fn map_initial_error(error: RadioError) -> AutomationError {
-    match error {
-        RadioError::Transport(error) => AutomationError::UsbTransport {
-            detail: error.to_string(),
-        },
-        other => AutomationError::AutomationQualification {
-            detail: other.to_string(),
-        },
-    }
 }
 
 fn map_guarded_error(error: GuardedKeyError) -> AutomationError {
@@ -2243,10 +2235,19 @@ mod tests {
     use super::*;
     use kenwood_thd75::screen::{SCREEN_BYTES, ScreenFrame};
     use kenwood_thd75::transport::MockTransport;
-    use kenwood_thd75::types::TncBaud;
+    use kenwood_thd75::types::{PacketDataRate, RadioModel};
     use kiss_tnc::FEND;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn expect_cat_recovery_preamble(transport: &mut MockTransport) {
+        transport.expect(b"\r", b"");
+        transport.expect(b"\r", b"");
+        transport.expect(&[0x03], b"");
+        transport.expect(&[FEND, 0xFF, FEND], b"");
+        transport.expect(b"\rTC 1\r", b"");
+        transport.expect(b"TN 0,0\r", b"");
+    }
 
     #[test]
     fn screen_record_has_exact_dimensions_and_rendering() -> TestResult {
@@ -2306,26 +2307,26 @@ mod tests {
         let mut transport = MockTransport::new();
         transport.expect(b"TN 2,0\r", b"TN 2,0\r");
         transport.expect(&[FEND, 0xFF, FEND], &[]);
+        expect_cat_recovery_preamble(&mut transport);
         transport.expect(b"ID\r", b"ID TH-D75\r");
         transport.expect(b"ID\r", b"ID TH-D75\r");
+        transport.pend_when_empty();
 
-        let radio = Radio::connect(transport).await?;
+        let radio = Radio::new(transport);
         let kiss = radio
-            .enter_kiss(TncBaud::Bps1200)
+            .enter_kiss(PacketDataRate::Bps1200)
             .await
             .map_err(|(_, error)| error)?;
         let mut radio = kiss.exit().await.map_err(|(_, error)| error)?;
 
         let direct_qualification = radio.qualify_automation().await;
         assert!(
-            direct_qualification.as_ref().is_err_and(|error| error
-                .to_string()
-                .contains("a synchronized CAT stream before automation qualification")),
+            matches!(direct_qualification, Err(RadioError::CatRecoveryRequired)),
             "KISS exit must keep the strict qualifier fail-closed: {direct_qualification:?}"
         );
 
-        synchronize_cat_after_kiss(&mut radio).await?;
-        assert_eq!(radio.identify().await?.model, "TH-D75");
+        radio.restore_cat_after_mode_exit().await?;
+        assert_eq!(radio.identify().await?.model, RadioModel::ThD75);
         Ok(())
     }
 
@@ -2334,20 +2335,23 @@ mod tests {
         let mut transport = MockTransport::new();
         transport.expect(b"TN 2,0\r", b"TN 2,0\r");
         transport.expect(&[FEND, 0xFF, FEND], &[]);
+        expect_cat_recovery_preamble(&mut transport);
         transport.expect(b"ID\r", b"ID OTHER\r");
         transport.expect_reopen(Ok(()));
+        expect_cat_recovery_preamble(&mut transport);
         transport.expect(b"ID\r", b"ID TH-D75\r");
         transport.expect(b"ID\r", b"ID TH-D75\r");
+        transport.pend_when_empty();
 
-        let radio = Radio::connect(transport).await?;
+        let radio = Radio::new(transport);
         let kiss = radio
-            .enter_kiss(TncBaud::Bps1200)
+            .enter_kiss(PacketDataRate::Bps1200)
             .await
             .map_err(|(_, error)| error)?;
         let mut radio = kiss.exit().await.map_err(|(_, error)| error)?;
 
-        synchronize_cat_after_kiss(&mut radio).await?;
-        assert_eq!(radio.identify().await?.model, "TH-D75");
+        radio.restore_cat_after_mode_exit().await?;
+        assert_eq!(radio.identify().await?.model, RadioModel::ThD75);
         Ok(())
     }
 
@@ -2519,7 +2523,7 @@ mod tests {
         ];
         let raw: BTreeSet<u8> = keys
             .into_iter()
-            .map(|key| RadioFrontPanelKey::from(key).as_u8())
+            .map(|key| RadioFrontPanelKey::from(key).as_raw())
             .collect();
 
         assert_eq!(raw.len(), 25, "all dispatcher keys must remain distinct");

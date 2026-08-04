@@ -10,13 +10,13 @@ use kenwood_thd75::memory::{
 /// Top-level MCP-D75 setting group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum SettingMenu {
-    /// General radio configuration.
+    /// General radio settings.
     Radio,
-    /// GPS configuration.
+    /// GPS settings.
     Gps,
-    /// APRS configuration.
+    /// APRS settings.
     Aprs,
-    /// D-STAR configuration.
+    /// D-STAR settings.
     Dv,
 }
 
