@@ -55,7 +55,7 @@ expecting stability.
 | [`mmdvm/`](mmdvm/) | Tokio async shell for MMDVM modems | experimental |
 | [`mbelib-rs/`](mbelib-rs/) | AMBE 3600×2400 voice codec (decoder default; encoder behind `--features encoder`) | experimental |
 | [`sextant/`](sextant/) | GUI D-STAR reflector client; exercises the laptop-only encode/decode pipeline against a local `polaris` reflector | experimental |
-| [`stargazer/`](stargazer/) | D-STAR observatory: discovery and XLX monitoring, with unwired voice-capture components | experimental |
+| [`stargazer/`](stargazer/) | D-STAR reflector recorder and activity survey: listen-only multi-target capture to raw AMBE, WAV, and metadata | experimental |
 | [`lodestar-core/`](lodestar-core/) | UniFFI Rust core for the Lodestar macOS/iPadOS app | experimental |
 | [`azimuth-core/`](azimuth-core/) | UniFFI Rust core for Azimuth: authenticated automation, stale-safe MCP settings, host-owned APRS/KISS, and physical IF-DSP | experimental |
 

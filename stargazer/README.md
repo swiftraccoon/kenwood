@@ -15,6 +15,8 @@ callsign = "N0CALL"            # your callsign: reflector login + DPlus auth
 recordings_dir = "recordings"  # created if missing
 write_wav = true               # decoded WAV alongside the raw AMBE
 local_module = "D"             # module letter presented in rpt1 (A-E)
+max_capture_seconds = 3600      # required retained prefix per transmission
+max_concurrent_captures = 4     # required simultaneous stream-state bound
 
 [[record]]
 reflector = "REF030"
@@ -48,6 +50,8 @@ exponential backoff. `--verbose` enables per-frame debug logging.
 | `recordings_dir` | `"recordings"` | Base directory for recordings (created if missing) |
 | `write_wav` | `true` | Decode and write a WAV next to each raw AMBE archive |
 | `local_module` | `"D"` | Local module letter in rpt1 (A–E; other letters are silently dropped by xlxd-derived reflectors) |
+| `max_capture_seconds` | *required* | Maximum retained prefix for one transmission; must be greater than zero |
+| `max_concurrent_captures` | *required* | Maximum simultaneous retained or limit-suppressed stream states per reflector session; must be greater than zero |
 | `[[record]].reflector` | *required* | Reflector callsign, e.g. `"REF030"` (also the wire callsign for DCS) |
 | `[[record]].protocol` | *required* | `dplus`, `dextra`, or `dcs` |
 | `[[record]].host` | *required* | Host name or IP; always explicit, there is no discovery |
@@ -57,6 +61,14 @@ exponential backoff. `--verbose` enables per-frame debug logging.
 `DPlus` targets attempt authentication against the D-STAR gateway auth
 service first; if that fails, stargazer logs a warning and connects
 unauthenticated (most reflectors accept the link anyway).
+
+The two capture limits are operator policy, not protocol limits. On the first
+frame beyond `max_capture_seconds`, Stargazer writes the retained prefix with
+`end_reason = "capture_limit"`, logs the loss, and rejects the rest of that
+stream until EOT or inactivity frees its stream ID. If a new interleaved stream
+would exceed `max_concurrent_captures`, Stargazer logs the rejected stream,
+finalizes admitted partial captures, and reconnects rather than retaining
+unbounded state or silently beginning a mid-stream recording.
 
 ## Recording layout
 
@@ -83,8 +95,9 @@ never a torn recording.
 
 ### `.ambe`: raw frame container
 
-Everything the reflector sent for the stream, exactly as it arrived.
-All integers little-endian.
+Every retained frame exactly as it arrived. A normal recording contains the
+whole stream; a recording whose metadata says `capture_limit` contains exactly
+the configured prefix. All integers little-endian.
 
 ```
 Header (16 bytes):
@@ -160,7 +173,8 @@ Field notes:
   wall-clock delta additionally includes network jitter.
 - `end_reason` is `eot` (real end-of-transmission), `inactivity`
   (stream timed out), `disconnect` (link dropped mid-stream), or
-  `shutdown` (stargazer exited mid-stream). Partial captures are
+  `shutdown` (stargazer exited mid-stream), or `capture_limit` (the retained
+  prefix reached the operator's configured bound). Partial captures are
   first-class recordings with honest metadata, not discarded.
 - `header` is `null` when no voice header was ever received.
 - `frames.gaps` counts frames missing from the sequence; `fec` sums

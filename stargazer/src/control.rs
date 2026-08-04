@@ -255,6 +255,8 @@ impl Coordinator {
             target,
             self.config.callsign,
             self.config.local_module,
+            self.config.capture_limit,
+            self.config.concurrent_capture_limit,
             Arc::clone(&self.writer),
             shutdown_rx,
         ));
@@ -340,9 +342,13 @@ impl Coordinator {
                     if new_config.callsign != self.config.callsign
                         || new_config.local_module != self.config.local_module
                         || new_config.recordings_dir != self.config.recordings_dir
+                        || new_config.write_wav != self.config.write_wav
+                        || new_config.capture_limit != self.config.capture_limit
+                        || new_config.concurrent_capture_limit
+                            != self.config.concurrent_capture_limit
                     {
                         notes.push(
-                            "callsign/local_module/recordings_dir changes need a restart"
+                            "callsign/local_module/recordings_dir/write_wav/max_capture_seconds/max_concurrent_captures changes need a restart"
                                 .to_string(),
                         );
                     }
@@ -499,7 +505,7 @@ mod tests {
             path,
             format!(
                 "callsign = \"KQ4NIT\"\nlocal_module = \"D\"\nwrite_wav = false\n\
-                 recordings_dir = \"{}\"\n[[record]]\nreflector = \"{reflector}\"\n\
+                 max_capture_seconds = 3600\nmax_concurrent_captures = 4\nrecordings_dir = \"{}\"\n[[record]]\nreflector = \"{reflector}\"\n\
                  protocol = \"dextra\"\nhost = \"127.0.0.1\"\nport = 1\nmodules = [\"C\"]\n",
                 recordings.display()
             ),

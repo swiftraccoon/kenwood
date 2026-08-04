@@ -78,7 +78,7 @@ struct SlowDataDoc {
     text: Option<String>,
     /// Raw 20 message bytes as hex, present only when the message
     /// is not clean printable ASCII (e.g. JIS X 0201 half-width
-    /// katakana from Japanese radios), where `text` is lossy.
+    /// katakana from Japanese radios), where `text` is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     text_hex: Option<String>,
     dprs: Vec<DprsDoc>,
@@ -394,7 +394,7 @@ mod tests {
     use super::*;
     use crate::capture::{CompletedRecording, EndReason, FrameRecord, StreamOrigin};
     use chrono::{DateTime, Utc};
-    use dstar_gateway_core::{Callsign, DStarHeader, Module, StreamId, Suffix};
+    use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, Suffix};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -410,7 +410,7 @@ mod tests {
                 peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20001),
             },
             stream_id: StreamId::new(0x04D2)?,
-            header: Some(DStarHeader {
+            header: Some(DstarHeader {
                 flag1: 12,
                 flag2: 0,
                 flag3: 0,
@@ -520,9 +520,14 @@ mod tests {
         msg[1] = 0xB6; // ｶ
         msg[2] = b'7';
         msg[3] = b'3';
-        rec.text = Some(String::from_utf8_lossy(&msg).trim_end().to_string());
+        rec.text = None;
         rec.text_bytes = Some(msg);
         let doc = serde_json::to_value(build_doc(&rec, &audio))?;
+        assert!(
+            doc.pointer("/slow_data/text")
+                .is_some_and(serde_json::Value::is_null),
+            "invalid wire text must not be exposed through a replacement string"
+        );
         let hex = doc
             .pointer("/slow_data/text_hex")
             .and_then(|v| v.as_str())

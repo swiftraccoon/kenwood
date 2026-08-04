@@ -30,7 +30,7 @@
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use dstar_gateway_core::{Callsign, DStarHeader, Module, StreamId, Suffix};
+use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, Suffix};
 
 use crate::capture::{CompletedRecording, EndReason, FrameRecord, StreamOrigin};
 use crate::writer::Writer;
@@ -53,7 +53,7 @@ pub enum DvrecError {
 #[derive(Debug)]
 pub struct ParsedDvrec {
     /// Routing header from the `hdr` line.
-    pub header: DStarHeader,
+    pub header: DstarHeader,
     /// Stream id (filename byte order).
     pub stream_id: StreamId,
     /// Voice frames in log order.
@@ -122,10 +122,10 @@ fn tokenize(line: &str) -> Option<LogLine<'_>> {
     })
 }
 
-fn header_from_payload(payload: &[&str]) -> Option<DStarHeader> {
+fn header_from_payload(payload: &[&str]) -> Option<DstarHeader> {
     let flags = hex_bytes::<3>(payload.first()?)?;
     let (my, suffix) = payload.get(4)?.split_once('/')?;
-    Some(DStarHeader {
+    Some(DstarHeader {
         flag1: flags[0],
         flag2: flags[1],
         flag3: flags[2],

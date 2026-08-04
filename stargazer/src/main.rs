@@ -290,6 +290,8 @@ async fn record(config_path: &std::path::Path) -> ExitCode {
     tracing::info!(
         targets = config.targets.len(),
         recordings_dir = %config.recordings_dir.display(),
+        max_capture_seconds = config.capture_limit.as_seconds(),
+        max_concurrent_captures = config.concurrent_capture_limit.get(),
         "stargazer recording"
     );
 

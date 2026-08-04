@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use dstar_gateway_core::{Callsign, Module};
 use serde::Deserialize;
 
+use crate::capture::{CaptureDurationLimit, ConcurrentCaptureLimit};
+
 /// Which D-STAR reflector protocol a target speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolChoice {
@@ -70,6 +72,10 @@ pub struct Config {
     pub recordings_dir: PathBuf,
     /// Whether to decode and write a WAV alongside the raw AMBE.
     pub write_wav: bool,
+    /// Operator-selected maximum retained prefix for one transmission.
+    pub capture_limit: CaptureDurationLimit,
+    /// Operator-selected maximum number of simultaneous stream states.
+    pub concurrent_capture_limit: ConcurrentCaptureLimit,
     /// Local module letter presented in rpt1 (A-E).
     pub local_module: Module,
     /// Expanded record targets, one per `(reflector, module)`.
@@ -104,6 +110,8 @@ struct RawConfig {
     recordings_dir: PathBuf,
     #[serde(default = "default_true")]
     write_wav: bool,
+    max_capture_seconds: u64,
+    max_concurrent_captures: u64,
     #[serde(default = "default_local_module")]
     local_module: String,
     #[serde(default, rename = "record")]
@@ -138,7 +146,8 @@ fn default_local_module() -> String {
 ///
 /// Returns [`ConfigError::Parse`] on malformed TOML and
 /// [`ConfigError::Invalid`] on schema violations (bad callsign or
-/// module, unknown protocol, no targets, duplicate targets).
+/// module, invalid capture limits, unknown protocol, no targets, or
+/// duplicate targets).
 pub fn parse(text: &str) -> Result<Config, ConfigError> {
     let raw: RawConfig = toml::from_str(text)?;
 
@@ -152,6 +161,12 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
             local_module.as_char()
         )));
     }
+
+    let capture_limit = CaptureDurationLimit::try_from_seconds(raw.max_capture_seconds)
+        .map_err(|error| ConfigError::Invalid(format!("max_capture_seconds: {error}")))?;
+    let concurrent_capture_limit =
+        ConcurrentCaptureLimit::try_from_count(raw.max_concurrent_captures)
+            .map_err(|error| ConfigError::Invalid(format!("max_concurrent_captures: {error}")))?;
 
     let mut targets = Vec::new();
     let mut seen: HashSet<(String, char)> = HashSet::new();
@@ -202,6 +217,8 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
         callsign,
         recordings_dir: raw.recordings_dir,
         write_wav: raw.write_wav,
+        capture_limit,
+        concurrent_capture_limit,
         local_module,
         targets,
     })
@@ -240,6 +257,8 @@ mod tests {
 
     const GOOD: &str = r#"
 callsign = "W1AW"
+max_capture_seconds = 3600
+max_concurrent_captures = 4
 
 [[record]]
 reflector = "ref030"
@@ -261,6 +280,9 @@ modules = ["A", "B"]
         assert_eq!(cfg.targets.len(), 3);
         assert_eq!(cfg.recordings_dir, PathBuf::from("recordings"));
         assert!(cfg.write_wav);
+        assert_eq!(cfg.capture_limit.as_seconds(), 3600);
+        assert_eq!(cfg.capture_limit.as_frames(), 180_000);
+        assert_eq!(cfg.concurrent_capture_limit.get(), 4);
         assert_eq!(cfg.local_module, Module::D);
         let t0 = cfg.targets.first().ok_or("no target 0")?;
         assert_eq!(t0.reflector, "REF030", "reflector is uppercased");
@@ -314,9 +336,40 @@ modules = ["A", "B"]
 
     #[test]
     fn rejects_empty_config() {
-        let result = parse("callsign = \"W1AW\"\n");
+        let result =
+            parse("callsign = \"W1AW\"\nmax_capture_seconds = 60\nmax_concurrent_captures = 1\n");
         assert!(
             matches!(result, Err(ConfigError::Invalid(ref m)) if m.contains("no [[record]]")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn capture_limit_is_required_and_positive() {
+        let missing = GOOD.replace("max_capture_seconds = 3600\n", "");
+        assert!(
+            matches!(parse(&missing), Err(ConfigError::Parse(_))),
+            "a missing retention policy must fail closed"
+        );
+
+        let zero = GOOD.replace("max_capture_seconds = 3600", "max_capture_seconds = 0");
+        let result = parse(&zero);
+        assert!(
+            matches!(result, Err(ConfigError::Invalid(ref message)) if message.contains("greater than zero")),
+            "got {result:?}"
+        );
+
+        let missing_concurrent = GOOD.replace("max_concurrent_captures = 4\n", "");
+        assert!(
+            matches!(parse(&missing_concurrent), Err(ConfigError::Parse(_))),
+            "a missing aggregate retention policy must fail closed"
+        );
+
+        let zero_concurrent =
+            GOOD.replace("max_concurrent_captures = 4", "max_concurrent_captures = 0");
+        let result = parse(&zero_concurrent);
+        assert!(
+            matches!(result, Err(ConfigError::Invalid(ref message)) if message.contains("greater than zero")),
             "got {result:?}"
         );
     }

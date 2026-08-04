@@ -8,16 +8,134 @@
 //! filesystem; the session shell passes `now` into every event
 //! method, and the writer consumes the completed values.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use chrono::{DateTime, Utc};
 use dstar_gateway_core::dprs::{DprsReport, parse_dprs};
 use dstar_gateway_core::slowdata::{SlowDataAssembler, SlowDataBlock, SlowDataTextCollector};
-use dstar_gateway_core::{DStarHeader, Module, StreamId, VoiceFrame};
+use dstar_gateway_core::{DstarHeader, Module, StreamId, VoiceFrame};
 
 /// D-STAR voice seq values cycle 0..=20 (one 21-frame superframe).
 pub(crate) const SEQ_MODULUS: u16 = 21;
+
+/// D-STAR voice frames carried per second of codec time.
+const FRAMES_PER_SECOND: usize = 50;
+
+/// Validated operator policy for the largest retained stream prefix.
+///
+/// This is a storage policy, not a claim about a protocol maximum. The
+/// configured number of seconds is converted to the exact number of 20 ms
+/// D-STAR voice frames that may be retained in memory and written to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureDurationLimit {
+    seconds: NonZeroU64,
+    frames: NonZeroUsize,
+}
+
+impl CaptureDurationLimit {
+    /// Validate an operator-supplied duration in seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureLimitError::Zero`] for zero or
+    /// [`CaptureLimitError::TooLarge`] when the corresponding frame count
+    /// cannot be represented on this platform.
+    pub fn try_from_seconds(seconds: u64) -> Result<Self, CaptureLimitError> {
+        let seconds = NonZeroU64::new(seconds).ok_or(CaptureLimitError::Zero)?;
+        let seconds_as_usize =
+            usize::try_from(seconds.get()).map_err(|_| CaptureLimitError::TooLarge { seconds })?;
+        let frames = seconds_as_usize
+            .checked_mul(FRAMES_PER_SECOND)
+            .and_then(NonZeroUsize::new)
+            .ok_or(CaptureLimitError::TooLarge { seconds })?;
+        Ok(Self { seconds, frames })
+    }
+
+    /// Configured duration in seconds.
+    #[must_use]
+    pub const fn as_seconds(self) -> u64 {
+        self.seconds.get()
+    }
+
+    /// Exact maximum number of retained voice frames.
+    #[must_use]
+    pub const fn as_frames(self) -> usize {
+        self.frames.get()
+    }
+}
+
+/// Invalid capture-duration policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CaptureLimitError {
+    /// A zero-second limit cannot retain a recording.
+    #[error("capture duration must be greater than zero seconds")]
+    Zero,
+    /// The duration cannot be represented as a frame count on this platform.
+    #[error(
+        "capture duration {seconds} seconds exceeds this platform's addressable frame capacity"
+    )]
+    TooLarge {
+        /// Rejected operator-supplied duration.
+        seconds: NonZeroU64,
+    },
+}
+
+/// Validated maximum number of simultaneous stream states retained for one
+/// reflector session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConcurrentCaptureLimit(NonZeroUsize);
+
+impl ConcurrentCaptureLimit {
+    /// Validate an operator-supplied simultaneous-capture count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConcurrentCaptureLimitError::Zero`] for zero or
+    /// [`ConcurrentCaptureLimitError::TooLarge`] when the count cannot be
+    /// represented on this platform.
+    pub fn try_from_count(count: u64) -> Result<Self, ConcurrentCaptureLimitError> {
+        let count = NonZeroU64::new(count).ok_or(ConcurrentCaptureLimitError::Zero)?;
+        let count = usize::try_from(count.get())
+            .map_err(|_| ConcurrentCaptureLimitError::TooLarge { count })?;
+        let count = NonZeroUsize::new(count).ok_or(ConcurrentCaptureLimitError::Zero)?;
+        Ok(Self(count))
+    }
+
+    /// Maximum number of simultaneous retained or suppressed streams.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+/// Invalid simultaneous-capture policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ConcurrentCaptureLimitError {
+    /// A zero count would reject every transmission.
+    #[error("concurrent capture count must be greater than zero")]
+    Zero,
+    /// The count cannot be represented on this platform.
+    #[error("concurrent capture count {count} exceeds this platform's addressable capacity")]
+    TooLarge {
+        /// Rejected operator-supplied count.
+        count: NonZeroU64,
+    },
+}
+
+/// A new stream could not be admitted without exceeding the operator's
+/// aggregate capture-state bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "stream {stream_id:04X} exceeds the configured maximum of {max_concurrent} concurrent captures"
+)]
+pub struct CaptureCapacityError {
+    /// Stream identifier that was rejected.
+    pub stream_id: u16,
+    /// Configured simultaneous-capture limit.
+    pub max_concurrent: usize,
+}
 
 /// Frames missing between consecutive received seq values.
 ///
@@ -59,6 +177,9 @@ pub enum EndReason {
     Disconnect,
     /// Stargazer was shut down while the stream was open.
     Shutdown,
+    /// The operator's retention limit was reached; the archived prefix is
+    /// complete, and the rest of the stream was deliberately discarded.
+    CaptureLimit,
 }
 
 impl EndReason {
@@ -70,6 +191,7 @@ impl EndReason {
             Self::Inactivity => "inactivity",
             Self::Disconnect => "disconnect",
             Self::Shutdown => "shutdown",
+            Self::CaptureLimit => "capture_limit",
         }
     }
 }
@@ -110,7 +232,7 @@ pub struct CompletedRecording {
     /// D-STAR stream id.
     pub stream_id: StreamId,
     /// Decoded voice header, if one was received.
-    pub header: Option<DStarHeader>,
+    pub header: Option<DstarHeader>,
     /// Stringified lenient-parse diagnostics from the header.
     pub header_diagnostics: Vec<String>,
     /// Wall clock when the stream opened.
@@ -123,9 +245,9 @@ pub struct CompletedRecording {
     pub frames: Vec<FrameRecord>,
     /// Missing frames inferred from seq discontinuities.
     pub gaps: u64,
-    /// 20-character D-STAR TX message, trailing spaces trimmed
-    /// (lossy UTF-8 view, since Japanese radios commonly send JIS X 0201
-    /// half-width katakana, which is not UTF-8).
+    /// Validated printable-ASCII D-STAR TX message, without trailing
+    /// wire-space padding. Invalid textual bytes remain available through
+    /// [`Self::text_bytes`] and never receive replacement characters.
     pub text: Option<String>,
     /// The TX message's raw 20 wire bytes, kept losslessly.
     pub text_bytes: Option<[u8; 20]>,
@@ -151,7 +273,7 @@ impl CompletedRecording {
 /// One in-progress stream.
 #[derive(Debug)]
 struct StreamCapture {
-    header: Option<DStarHeader>,
+    header: Option<DstarHeader>,
     header_diagnostics: Vec<String>,
     started_at: DateTime<Utc>,
     frames: Vec<FrameRecord>,
@@ -195,22 +317,21 @@ impl StreamCapture {
         // Text: the collector wants every frame index, and index 0 is
         // its documented reset signal for superframe sync.
         self.text_collector.push(frame.slow_data, seq);
-        if self.text.is_none()
+        if self.text_bytes.is_none()
             && let Some(msg) = self.text_collector.take_message()
         {
-            let s = String::from_utf8_lossy(&msg).trim_end().to_string();
-            if !s.is_empty() {
-                self.text = Some(s);
-                self.text_bytes = Some(msg);
+            self.text_bytes = Some(msg.into_bytes());
+            if let Ok(text) = msg.text()
+                && !text.is_empty()
+            {
+                self.text = Some(text.to_owned());
             }
         }
 
-        // GPS/DPRS: sync-frame bytes are not slow data, so feeding them
-        // would corrupt an in-progress block.
-        if seq != 0
-            && let Some(SlowDataBlock::Gps(sentence)) = self.assembler.push(frame.slow_data)
+        if let Some(SlowDataBlock::Gps(sentence_bytes)) = self.assembler.push(frame.slow_data, seq)
+            && let Ok(sentence) = std::str::from_utf8(&sentence_bytes)
         {
-            self.consume_gps_sentence(&sentence);
+            self.consume_gps_sentence(sentence);
         }
     }
 
@@ -232,31 +353,53 @@ impl StreamCapture {
 #[derive(Debug)]
 pub struct CaptureManager {
     origin: StreamOrigin,
+    limit: CaptureDurationLimit,
+    concurrent_limit: ConcurrentCaptureLimit,
     open: HashMap<u16, StreamCapture>,
+    limit_reached: HashSet<u16>,
 }
 
 impl CaptureManager {
-    /// Create a manager for one connection's streams.
+    /// Create a manager for one connection's streams and retention policy.
     #[must_use]
-    pub fn new(origin: StreamOrigin) -> Self {
+    pub fn new(
+        origin: StreamOrigin,
+        limit: CaptureDurationLimit,
+        concurrent_limit: ConcurrentCaptureLimit,
+    ) -> Self {
         Self {
             origin,
+            limit,
+            concurrent_limit,
             open: HashMap::new(),
+            limit_reached: HashSet::new(),
         }
     }
 
     /// Handle a `VoiceStart`: open a capture, or attach the header
     /// to a capture opened by frames that beat the header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureCapacityError`] when admitting a new stream would
+    /// exceed the configured simultaneous-capture limit.
     pub fn on_voice_start(
         &mut self,
         stream_id: StreamId,
-        header: DStarHeader,
+        header: DstarHeader,
         diagnostics: Vec<String>,
         now: DateTime<Utc>,
-    ) {
+    ) -> Result<(), CaptureCapacityError> {
+        let raw_id = stream_id.get();
+        if self.limit_reached.contains(&raw_id) {
+            return Ok(());
+        }
+        if !self.open.contains_key(&raw_id) {
+            self.ensure_capacity(raw_id)?;
+        }
         let entry = self
             .open
-            .entry(stream_id.get())
+            .entry(raw_id)
             .or_insert_with(|| StreamCapture::new(now));
         // Attach without touching accumulated frames; keep the first
         // header if the core ever re-emits one.
@@ -264,22 +407,55 @@ impl CaptureManager {
             entry.header = Some(header);
             entry.header_diagnostics = diagnostics;
         }
+        Ok(())
     }
 
-    /// Handle a `VoiceFrame`: append to the stream's capture,
-    /// opening a headerless capture for an unknown stream id.
+    /// Handle a `VoiceFrame`, opening a headerless capture if necessary.
+    ///
+    /// Returns a partial recording with [`EndReason::CaptureLimit`] when this
+    /// is the first frame beyond the configured retained prefix. Later frames
+    /// for that stream are rejected until its end event and return `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureCapacityError`] when a headerless new stream would
+    /// exceed the configured simultaneous-capture limit.
     pub fn on_voice_frame(
         &mut self,
         stream_id: StreamId,
         seq: u8,
         frame: &VoiceFrame,
         now: DateTime<Utc>,
-    ) {
+    ) -> Result<Option<CompletedRecording>, CaptureCapacityError> {
+        let raw_id = stream_id.get();
+        if self.limit_reached.contains(&raw_id) {
+            return Ok(None);
+        }
+        if self
+            .open
+            .get(&raw_id)
+            .is_some_and(|capture| capture.frames.len() >= self.limit.as_frames())
+        {
+            let Some(capture) = self.open.remove(&raw_id) else {
+                return Ok(None);
+            };
+            let _newly_limited = self.limit_reached.insert(raw_id);
+            return Ok(Some(self.complete(
+                stream_id,
+                capture,
+                EndReason::CaptureLimit,
+                now,
+            )));
+        }
+        if !self.open.contains_key(&raw_id) {
+            self.ensure_capacity(raw_id)?;
+        }
         let entry = self
             .open
-            .entry(stream_id.get())
+            .entry(raw_id)
             .or_insert_with(|| StreamCapture::new(now));
         entry.push_frame(seq, frame);
+        Ok(None)
     }
 
     /// Handle a `VoiceEnd`: finalize and return the recording.
@@ -290,7 +466,11 @@ impl CaptureManager {
         end_reason: EndReason,
         now: DateTime<Utc>,
     ) -> Option<CompletedRecording> {
-        let capture = self.open.remove(&stream_id.get())?;
+        let raw_id = stream_id.get();
+        if self.limit_reached.remove(&raw_id) {
+            return None;
+        }
+        let capture = self.open.remove(&raw_id)?;
         Some(self.complete(stream_id, capture, end_reason, now))
     }
 
@@ -300,6 +480,7 @@ impl CaptureManager {
         end_reason: EndReason,
         now: DateTime<Utc>,
     ) -> Vec<CompletedRecording> {
+        self.limit_reached.clear();
         let mut done: Vec<CompletedRecording> = Vec::with_capacity(self.open.len());
         let drained: Vec<(u16, StreamCapture)> = self.open.drain().collect();
         for (raw_id, capture) in drained {
@@ -313,7 +494,18 @@ impl CaptureManager {
     /// Number of currently open streams.
     #[must_use]
     pub fn active_count(&self) -> usize {
-        self.open.len()
+        self.open.len() + self.limit_reached.len()
+    }
+
+    fn ensure_capacity(&self, stream_id: u16) -> Result<(), CaptureCapacityError> {
+        if self.active_count() >= self.concurrent_limit.get() {
+            Err(CaptureCapacityError {
+                stream_id,
+                max_concurrent: self.concurrent_limit.get(),
+            })
+        } else {
+            Ok(())
+        }
     }
 
     fn complete(
@@ -357,8 +549,8 @@ mod tests {
         }
     }
 
-    fn header() -> DStarHeader {
-        DStarHeader {
+    fn header() -> DstarHeader {
+        DstarHeader {
             flag1: 0,
             flag2: 0,
             flag3: 0,
@@ -381,6 +573,35 @@ mod tests {
         }
     }
 
+    fn limit(seconds: u64) -> CaptureDurationLimit {
+        CaptureDurationLimit::try_from_seconds(seconds)
+            .unwrap_or_else(|error| unreachable!("valid test capture limit: {error}"))
+    }
+
+    fn concurrent(count: u64) -> ConcurrentCaptureLimit {
+        ConcurrentCaptureLimit::try_from_count(count)
+            .unwrap_or_else(|error| unreachable!("valid test concurrency limit: {error}"))
+    }
+
+    fn manager() -> CaptureManager {
+        CaptureManager::new(origin(), limit(60), concurrent(4))
+    }
+
+    fn start(mgr: &mut CaptureManager, stream_id: StreamId) {
+        assert!(
+            mgr.on_voice_start(stream_id, header(), Vec::new(), t0())
+                .is_ok(),
+            "ordinary test traffic must remain below the concurrent capture limit"
+        );
+    }
+
+    fn retain(mgr: &mut CaptureManager, stream_id: StreamId, seq: u8, frame: &VoiceFrame) {
+        assert!(
+            matches!(mgr.on_voice_frame(stream_id, seq, frame, t0()), Ok(None)),
+            "ordinary test traffic must remain below the capture limit"
+        );
+    }
+
     fn t0() -> DateTime<Utc> {
         DateTime::<Utc>::UNIX_EPOCH
     }
@@ -397,11 +618,115 @@ mod tests {
     }
 
     #[test]
+    fn capture_duration_limit_is_exact_and_rejects_zero() {
+        let one_second = limit(1);
+        assert_eq!(one_second.as_seconds(), 1);
+        assert_eq!(one_second.as_frames(), 50);
+        assert_eq!(
+            CaptureDurationLimit::try_from_seconds(0),
+            Err(CaptureLimitError::Zero)
+        );
+        assert_eq!(
+            ConcurrentCaptureLimit::try_from_count(0),
+            Err(ConcurrentCaptureLimitError::Zero)
+        );
+    }
+
+    #[test]
+    fn exact_capture_limit_can_still_end_normally() {
+        let mut mgr = CaptureManager::new(origin(), limit(1), concurrent(1));
+        start(&mut mgr, sid(1));
+        for index in 0..50usize {
+            let seq = u8::try_from(index % usize::from(SEQ_MODULUS))
+                .unwrap_or_else(|_| unreachable!("D-STAR sequence values are representable as u8"));
+            retain(&mut mgr, sid(1), seq, &frame(seq));
+        }
+
+        let recording = mgr.on_voice_end(sid(1), EndReason::Eot, t0());
+        assert!(
+            matches!(recording, Some(ref value) if value.frames.len() == 50 && value.end_reason == EndReason::Eot),
+            "the configured frame count itself must not be treated as loss: {recording:?}"
+        );
+    }
+
+    #[test]
+    fn first_excess_frame_finalizes_visible_prefix_and_suppresses_tail() {
+        let mut mgr = CaptureManager::new(origin(), limit(1), concurrent(1));
+        start(&mut mgr, sid(1));
+        for index in 0..50usize {
+            let seq = u8::try_from(index % usize::from(SEQ_MODULUS))
+                .unwrap_or_else(|_| unreachable!("D-STAR sequence values are representable as u8"));
+            retain(&mut mgr, sid(1), seq, &frame(seq));
+        }
+
+        let overflow = mgr.on_voice_frame(sid(1), 8, &frame(8), t0());
+        assert!(
+            matches!(overflow, Ok(Some(ref value)) if value.frames.len() == 50 && value.end_reason == EndReason::CaptureLimit),
+            "the first unretained frame must return an explicitly partial recording: {overflow:?}"
+        );
+        assert_eq!(
+            mgr.active_count(),
+            1,
+            "the limited stream remains suppressed"
+        );
+        assert!(
+            matches!(mgr.on_voice_frame(sid(1), 9, &frame(9), t0()), Ok(None)),
+            "the tail must not start a second headerless recording"
+        );
+        start(&mut mgr, sid(1));
+        assert!(
+            mgr.on_voice_end(sid(1), EndReason::Eot, t0()).is_none(),
+            "the real end only clears suppression; the partial recording was already emitted"
+        );
+        assert_eq!(mgr.active_count(), 0);
+        start(&mut mgr, sid(1));
+        assert_eq!(
+            mgr.active_count(),
+            1,
+            "a stream id must be reusable after its normal end"
+        );
+    }
+
+    #[test]
+    fn concurrent_limit_rejects_new_id_and_inactivity_frees_capacity() {
+        let mut mgr = CaptureManager::new(origin(), limit(60), concurrent(1));
+        start(&mut mgr, sid(1));
+        let rejected = mgr.on_voice_start(sid(2), header(), Vec::new(), t0());
+        assert_eq!(
+            rejected,
+            Err(CaptureCapacityError {
+                stream_id: 2,
+                max_concurrent: 1,
+            })
+        );
+        let headerless_rejected = mgr.on_voice_frame(sid(2), 0, &frame(0), t0());
+        assert!(
+            matches!(
+                headerless_rejected,
+                Err(CaptureCapacityError {
+                    stream_id: 2,
+                    max_concurrent: 1,
+                })
+            ),
+            "frames that beat their header must obey the same aggregate bound"
+        );
+        assert_eq!(mgr.active_count(), 1);
+
+        assert!(
+            mgr.on_voice_end(sid(1), EndReason::Inactivity, t0())
+                .is_some(),
+            "inactivity must finalize the admitted stream"
+        );
+        start(&mut mgr, sid(2));
+        assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[test]
     fn happy_path_assembles_frames_in_order() {
-        let mut mgr = CaptureManager::new(origin());
-        mgr.on_voice_start(sid(0x04D2), header(), Vec::new(), t0());
+        let mut mgr = manager();
+        start(&mut mgr, sid(0x04D2));
         for seq in 0..=4u8 {
-            mgr.on_voice_frame(sid(0x04D2), seq, &frame(seq), t0());
+            retain(&mut mgr, sid(0x04D2), seq, &frame(seq));
         }
         let rec = mgr.on_voice_end(sid(0x04D2), EndReason::Eot, t0());
         let Some(rec) = rec else {
@@ -418,11 +743,11 @@ mod tests {
 
     #[test]
     fn seq_gap_is_counted_including_wrap() {
-        let mut mgr = CaptureManager::new(origin());
-        mgr.on_voice_start(sid(1), header(), Vec::new(), t0());
+        let mut mgr = manager();
+        start(&mut mgr, sid(1));
         // seq 18, 19, then jump to 1 (missing 20, 0) = gap 2
         for seq in [18u8, 19, 1] {
-            mgr.on_voice_frame(sid(1), seq, &frame(seq), t0());
+            retain(&mut mgr, sid(1), seq, &frame(seq));
         }
         let rec = mgr.on_voice_end(sid(1), EndReason::Eot, t0());
         assert!(
@@ -437,10 +762,10 @@ mod tests {
     /// corrupt the gap count.
     #[test]
     fn out_of_alphabet_seq_does_not_panic_or_count_gaps() {
-        let mut mgr = CaptureManager::new(origin());
-        mgr.on_voice_start(sid(1), header(), Vec::new(), t0());
+        let mut mgr = manager();
+        start(&mut mgr, sid(1));
         for seq in [3u8, 200, 3, 0xFF, 4] {
-            mgr.on_voice_frame(sid(1), seq, &frame(seq), t0());
+            retain(&mut mgr, sid(1), seq, &frame(seq));
         }
         let rec = mgr.on_voice_end(sid(1), EndReason::Eot, t0());
         assert!(
@@ -451,10 +776,10 @@ mod tests {
 
     #[test]
     fn duplicate_seq_is_not_a_gap() {
-        let mut mgr = CaptureManager::new(origin());
-        mgr.on_voice_start(sid(1), header(), Vec::new(), t0());
+        let mut mgr = manager();
+        start(&mut mgr, sid(1));
         for seq in [3u8, 3, 4] {
-            mgr.on_voice_frame(sid(1), seq, &frame(seq), t0());
+            retain(&mut mgr, sid(1), seq, &frame(seq));
         }
         let rec = mgr.on_voice_end(sid(1), EndReason::Eot, t0());
         assert!(matches!(rec, Some(ref r) if r.gaps == 0), "got {rec:?}");
@@ -462,12 +787,12 @@ mod tests {
 
     #[test]
     fn frames_before_header_open_a_capture_and_header_attaches() {
-        let mut mgr = CaptureManager::new(origin());
-        mgr.on_voice_frame(sid(7), 0, &frame(0), t0());
-        mgr.on_voice_frame(sid(7), 1, &frame(1), t0());
+        let mut mgr = manager();
+        retain(&mut mgr, sid(7), 0, &frame(0));
+        retain(&mut mgr, sid(7), 1, &frame(1));
         assert_eq!(mgr.active_count(), 1);
-        mgr.on_voice_start(sid(7), header(), Vec::new(), t0());
-        mgr.on_voice_frame(sid(7), 2, &frame(2), t0());
+        start(&mut mgr, sid(7));
+        retain(&mut mgr, sid(7), 2, &frame(2));
         let rec = mgr.on_voice_end(sid(7), EndReason::Eot, t0());
         assert!(
             matches!(rec, Some(ref r) if r.frames.len() == 3 && r.header.is_some()),
@@ -477,8 +802,8 @@ mod tests {
 
     #[test]
     fn never_headered_stream_completes_headerless() {
-        let mut mgr = CaptureManager::new(origin());
-        mgr.on_voice_frame(sid(9), 0, &frame(0), t0());
+        let mut mgr = manager();
+        retain(&mut mgr, sid(9), 0, &frame(0));
         let rec = mgr.on_voice_end(sid(9), EndReason::Inactivity, t0());
         assert!(
             matches!(rec, Some(ref r) if r.header.is_none()),
@@ -488,12 +813,12 @@ mod tests {
 
     #[test]
     fn interleaved_streams_stay_separate() {
-        let mut mgr = CaptureManager::new(origin());
-        mgr.on_voice_start(sid(1), header(), Vec::new(), t0());
-        mgr.on_voice_start(sid(2), header(), Vec::new(), t0());
-        mgr.on_voice_frame(sid(1), 0, &frame(0), t0());
-        mgr.on_voice_frame(sid(2), 0, &frame(0), t0());
-        mgr.on_voice_frame(sid(1), 1, &frame(1), t0());
+        let mut mgr = manager();
+        start(&mut mgr, sid(1));
+        start(&mut mgr, sid(2));
+        retain(&mut mgr, sid(1), 0, &frame(0));
+        retain(&mut mgr, sid(2), 0, &frame(0));
+        retain(&mut mgr, sid(1), 1, &frame(1));
         assert_eq!(mgr.active_count(), 2);
         let r1 = mgr.on_voice_end(sid(1), EndReason::Eot, t0());
         assert!(
@@ -505,10 +830,10 @@ mod tests {
 
     #[test]
     fn finalize_all_flushes_open_streams_with_reason() {
-        let mut mgr = CaptureManager::new(origin());
-        mgr.on_voice_start(sid(1), header(), Vec::new(), t0());
-        mgr.on_voice_frame(sid(1), 0, &frame(0), t0());
-        mgr.on_voice_start(sid(2), header(), Vec::new(), t0());
+        let mut mgr = manager();
+        start(&mut mgr, sid(1));
+        retain(&mut mgr, sid(1), 0, &frame(0));
+        start(&mut mgr, sid(2));
         let recs = mgr.finalize_all(EndReason::Shutdown, t0());
         assert_eq!(recs.len(), 2);
         assert!(recs.iter().all(|r| r.end_reason == EndReason::Shutdown));
@@ -517,24 +842,27 @@ mod tests {
 
     #[test]
     fn end_for_unknown_stream_is_none() {
-        let mut mgr = CaptureManager::new(origin());
+        let mut mgr = manager();
         assert!(mgr.on_voice_end(sid(42), EndReason::Eot, t0()).is_none());
     }
 
     #[test]
-    fn text_message_is_collected_from_encoded_fragments() {
-        let mut mgr = CaptureManager::new(origin());
-        mgr.on_voice_start(sid(1), header(), Vec::new(), t0());
-        let fragments = dstar_gateway_core::slowdata::encode_text_message("Asheville NC");
+    fn text_message_is_collected_from_encoded_fragments() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut mgr = manager();
+        start(&mut mgr, sid(1));
+        let message =
+            dstar_gateway_core::slowdata::SlowDataTextMessage::try_from_text("Asheville NC")?;
+        let fragments = dstar_gateway_core::slowdata::encode_text_message(message);
         // Frame 0 is the sync frame; text fragments ride frames 1..
-        mgr.on_voice_frame(sid(1), 0, &frame(0), t0());
+        retain(&mut mgr, sid(1), 0, &frame(0));
         for (i, frag) in fragments.iter().enumerate() {
             let seq = u8::try_from((i + 1) % 21).unwrap_or(1);
             let vf = VoiceFrame {
                 ambe: [0u8; 9],
                 slow_data: *frag,
             };
-            mgr.on_voice_frame(sid(1), seq, &vf, t0());
+            retain(&mut mgr, sid(1), seq, &vf);
         }
         let rec = mgr.on_voice_end(sid(1), EndReason::Eot, t0());
         assert!(
@@ -545,6 +873,49 @@ mod tests {
             matches!(rec, Some(ref r) if r.text_bytes == Some(*b"Asheville NC        ")),
             "raw message bytes must be kept losslessly: {rec:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_first_text_message_is_retained_losslessly() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use dstar_gateway_core::slowdata::{SlowDataTextMessage, encode_text_message};
+
+        let mut mgr = manager();
+        start(&mut mgr, sid(1));
+        retain(&mut mgr, sid(1), 0, &frame(0));
+
+        let mut invalid_bytes = *b"FIRST MESSAGE       ";
+        invalid_bytes[0] = 0xB6;
+        let invalid = SlowDataTextMessage::from_wire_bytes(invalid_bytes);
+        let valid = SlowDataTextMessage::try_from_text("later valid")?;
+        for (index, fragment) in encode_text_message(invalid)
+            .into_iter()
+            .chain(encode_text_message(valid))
+            .enumerate()
+        {
+            let seq = u8::try_from(index + 1)?;
+            retain(
+                &mut mgr,
+                sid(1),
+                seq,
+                &VoiceFrame {
+                    ambe: [0; 9],
+                    slow_data: fragment,
+                },
+            );
+        }
+
+        let recording = mgr.on_voice_end(sid(1), EndReason::Eot, t0());
+        assert!(
+            matches!(
+                recording,
+                Some(ref value)
+                    if value.text.is_none() && value.text_bytes == Some(invalid_bytes)
+            ),
+            "the later valid message replaced the first raw message: {recording:?}"
+        );
+        Ok(())
     }
 
     #[test]

@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dstar_gateway_core::codec::dextra as dextra_codec;
-use dstar_gateway_core::{Callsign, DStarHeader, Module, StreamId, Suffix, VoiceFrame};
+use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, Suffix, VoiceFrame};
+use stargazer::capture::{CaptureDurationLimit, ConcurrentCaptureLimit};
 use stargazer::config::{ProtocolChoice, Target};
 use stargazer::session::run_supervisor;
 use stargazer::writer::Writer;
@@ -54,7 +55,7 @@ async fn fake_reflector() -> Result<(SocketAddr, tokio::task::JoinHandle<()>), s
                 let Some(sid) = StreamId::new(0x1234) else {
                     return;
                 };
-                let header = DStarHeader {
+                let header = DstarHeader {
                     flag1: 0,
                     flag2: 0,
                     flag3: 0,
@@ -109,6 +110,8 @@ async fn records_one_transmission_end_to_end() -> TestResult {
         target,
         Callsign::try_from_str("N0CALL")?,
         Module::D,
+        CaptureDurationLimit::try_from_seconds(60)?,
+        ConcurrentCaptureLimit::try_from_count(2)?,
         Arc::clone(&writer),
         shutdown_rx,
     ));

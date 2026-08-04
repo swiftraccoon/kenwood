@@ -16,12 +16,15 @@ use dstar_gateway_core::session::client::{
     ClientStateKind, Configured, Connecting, DExtra, DPlus, Dcs, Event, Protocol, Session,
     VoiceEndReason,
 };
-use dstar_gateway_core::{Callsign, DStarHeader, Module, StreamId, VoiceFrame};
+use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, VoiceFrame};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
-use crate::capture::{CaptureManager, CompletedRecording, EndReason, StreamOrigin};
+use crate::capture::{
+    CaptureDurationLimit, CaptureManager, CompletedRecording, ConcurrentCaptureLimit, EndReason,
+    StreamOrigin,
+};
 use crate::config::{ProtocolChoice, Target};
 use crate::writer::Writer;
 
@@ -84,7 +87,7 @@ enum LinkEvent {
         /// Stream id.
         stream_id: StreamId,
         /// Decoded header.
-        header: DStarHeader,
+        header: DstarHeader,
         /// Stringified lenient-parse diagnostics.
         diagnostics: Vec<String>,
     },
@@ -378,10 +381,44 @@ async fn pump_session(
                 }
                 Some(LinkEvent::VoiceStart { stream_id, header, diagnostics }) => {
                     tracing::debug!(target = %label, sid = stream_id.get(), "voice start");
-                    mgr.on_voice_start(stream_id, header, diagnostics, Utc::now());
+                    if let Err(error) = mgr.on_voice_start(stream_id, header, diagnostics, Utc::now()) {
+                        tracing::error!(
+                            target = %label,
+                            error = %error,
+                            "concurrent capture limit reached; disconnecting to reject the untracked stream"
+                        );
+                        for rec in mgr.finalize_all(EndReason::Disconnect, Utc::now()) {
+                            write_recording(writer, rec).await;
+                        }
+                        session.disconnect().await;
+                        return SessionOutcome::Dropped;
+                    }
                 }
                 Some(LinkEvent::VoiceFrame { stream_id, seq, frame }) => {
-                    mgr.on_voice_frame(stream_id, seq, &frame, Utc::now());
+                    match mgr.on_voice_frame(stream_id, seq, &frame, Utc::now()) {
+                        Ok(Some(rec)) => {
+                            tracing::error!(
+                                target = %label,
+                                sid = stream_id.get(),
+                                retained_frames = rec.frames.len(),
+                                "capture limit reached; writing the retained prefix and discarding this stream until its end event"
+                            );
+                            write_recording(writer, rec).await;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::error!(
+                                target = %label,
+                                error = %error,
+                                "concurrent capture limit reached; disconnecting to reject the untracked stream"
+                            );
+                            for rec in mgr.finalize_all(EndReason::Disconnect, Utc::now()) {
+                                write_recording(writer, rec).await;
+                            }
+                            session.disconnect().await;
+                            return SessionOutcome::Dropped;
+                        }
+                    }
                 }
                 Some(LinkEvent::VoiceEnd { stream_id, end_reason }) => {
                     if let Some(rec) = mgr.on_voice_end(stream_id, end_reason, Utc::now()) {
@@ -410,6 +447,8 @@ pub async fn run_supervisor(
     target: Target,
     callsign: Callsign,
     local_module: Module,
+    capture_limit: CaptureDurationLimit,
+    concurrent_capture_limit: ConcurrentCaptureLimit,
     writer: Arc<Writer>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -439,7 +478,7 @@ pub async fn run_supervisor(
                     port: target.port,
                     peer,
                 };
-                let mgr = CaptureManager::new(origin);
+                let mgr = CaptureManager::new(origin, capture_limit, concurrent_capture_limit);
 
                 let pump = tokio::spawn(pump_session(
                     session,
