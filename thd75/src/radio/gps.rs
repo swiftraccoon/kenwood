@@ -5,41 +5,36 @@
 //! TNC: when APRS beaconing is enabled and the GPS has a fix, position reports are
 //! automatically included in transmitted beacons.
 //!
-//! The `pc_output` flag in the GPS configuration controls whether raw NMEA sentences are
+//! The `pc_output` flag in the GPS settings controls whether raw NMEA sentences are
 //! forwarded over the serial (USB/BT) connection. This is useful for feeding GPS data to
 //! mapping software, but **competes with CAT command I/O** on the same serial channel.
 //!
 //! # Related commands
 //!
-//! - **GP**: GPS enable and PC output configuration
+//! - **GP**: GPS enable and PC output settings
 //! - **GS**: NMEA sentence selection (which sentence types to output)
 //! - **GM**: GPS/Radio mode (bare read only; `GM 1` reboots the radio into GPS-only mode)
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::GpsRadioMode;
+use crate::types::{GpsRadioMode, GpsSettings, NmeaSentences};
 
 use super::Radio;
 
 impl<T: Transport> Radio<T> {
-    /// Get GPS configuration (GP read).
-    ///
-    /// Returns `(gps_enabled, pc_output)`.
+    /// Get GPS settings (GP read).
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_gps_config(&mut self) -> Result<(bool, bool), Error> {
-        tracing::debug!("reading GPS config");
-        let response = self.execute(Command::GetGpsConfig).await?;
+    pub async fn get_gps_settings(&mut self) -> Result<GpsSettings, Error> {
+        tracing::debug!("reading GPS settings");
+        let response = self.execute(Command::GetGpsSettings).await?;
         match response {
-            Response::GpsConfig {
-                gps_enabled,
-                pc_output,
-            } => Ok((gps_enabled, pc_output)),
+            Response::GpsSettings { settings } => Ok(settings),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "GpsConfig".into(),
+                expected: "GpsSettings".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -47,8 +42,8 @@ impl<T: Transport> Radio<T> {
 
     /// Get GPS NMEA sentence enable flags (GS read).
     ///
-    /// Returns `(gga, gll, gsa, gsv, rmc, vtg)`: six booleans indicating which NMEA 0183
-    /// sentence types are enabled for output when `pc_output` is active.
+    /// Returns a validated, nonempty selection of NMEA 0183 sentence types
+    /// enabled for output when PC output is active.
     ///
     /// # Sentence types
     ///
@@ -67,20 +62,11 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_gps_sentences(
-        &mut self,
-    ) -> Result<(bool, bool, bool, bool, bool, bool), Error> {
+    pub async fn get_gps_sentences(&mut self) -> Result<NmeaSentences, Error> {
         tracing::debug!("reading GPS NMEA sentence flags");
         let response = self.execute(Command::GetGpsSentences).await?;
         match response {
-            Response::GpsSentences {
-                gga,
-                gll,
-                gsa,
-                gsv,
-                rmc,
-                vtg,
-            } => Ok((gga, gll, gsa, gsv, rmc, vtg)),
+            Response::GpsSentences { sentences } => Ok(sentences),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "GpsSentences".into(),
                 actual: format!("{other:?}").into_bytes(),
@@ -88,39 +74,33 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set GPS configuration (GP write).
+    /// Set GPS settings (GP write).
     ///
-    /// - `gps_enabled`: turns the GPS receiver on or off. When off, no position fix is
-    ///   available for APRS beaconing or display.
-    /// - `pc_output`: when `true`, the radio outputs raw NMEA sentences over the serial
-    ///   connection (USB or Bluetooth SPP). **This competes with CAT command I/O**: NMEA
-    ///   data will be interleaved with CAT responses on the same serial channel, which can
-    ///   confuse the protocol parser. Only enable this if you are prepared to handle mixed
-    ///   NMEA/CAT traffic, or if you are using the serial port exclusively for GPS data.
+    /// Turning the receiver off makes no position fix available for APRS
+    /// beaconing or display. When PC output is enabled, the radio emits raw
+    /// NMEA sentences over the USB or Bluetooth serial connection. This
+    /// competes with CAT command I/O: NMEA data is interleaved with CAT
+    /// responses on the same stream. Enable it only when the caller handles
+    /// mixed NMEA/CAT traffic or uses the serial port exclusively for GPS.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_gps_config(
-        &mut self,
-        gps_enabled: bool,
-        pc_output: bool,
-    ) -> Result<(), Error> {
-        tracing::info!(gps_enabled, pc_output, "setting GPS config");
-        let response = self
-            .execute(Command::SetGpsConfig {
-                gps_enabled,
-                pc_output,
-            })
-            .await?;
+    pub async fn set_gps_settings(&mut self, settings: GpsSettings) -> Result<(), Error> {
+        tracing::info!(
+            gps_enabled = settings.enabled(),
+            pc_output = settings.pc_output(),
+            "setting GPS settings"
+        );
+        let response = self.execute(Command::SetGpsSettings { settings }).await?;
         match response {
-            Response::GpsConfig { .. } => {
+            Response::GpsSettings { .. } => {
                 // Remembered so `Radio::reconnect` re-asserts it.
-                self.gps_config = Some((gps_enabled, pc_output));
+                self.gps_settings = Some(settings);
                 Ok(())
             }
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "GpsConfig".into(),
+                expected: "GpsSettings".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -128,42 +108,19 @@ impl<T: Transport> Radio<T> {
 
     /// Set GPS NMEA sentence enable flags (GS write).
     ///
-    /// Sets 6 boolean flags controlling which NMEA sentences are output:
-    /// GGA, GLL, GSA, GSV, RMC, VTG.
+    /// The selection is validated before I/O and therefore cannot contain
+    /// reserved bits or disable every sentence.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        reason = "CAT `GS band,gga,gll,gsa,gsv,rmc,vtg` is a 6-boolean fixed-format command; the \
-                  API mirrors the wire layout 1:1. Grouping into a struct would add indirection \
-                  without improving clarity since each bool names one NMEA sentence type."
-    )]
-    pub async fn set_gps_sentences(
-        &mut self,
-        gga: bool,
-        gll: bool,
-        gsa: bool,
-        gsv: bool,
-        rmc: bool,
-        vtg: bool,
-    ) -> Result<(), Error> {
-        tracing::info!(gga, gll, gsa, gsv, rmc, vtg, "setting GPS NMEA sentences");
-        let response = self
-            .execute(Command::SetGpsSentences {
-                gga,
-                gll,
-                gsa,
-                gsv,
-                rmc,
-                vtg,
-            })
-            .await?;
+    pub async fn set_gps_sentences(&mut self, sentences: NmeaSentences) -> Result<(), Error> {
+        tracing::info!(bits = sentences.bits(), "setting GPS NMEA sentences");
+        let response = self.execute(Command::SetGpsSentences { sentences }).await?;
         match response {
             Response::GpsSentences { .. } => {
                 // Remembered so `Radio::reconnect` re-asserts it.
-                self.gps_sentences = Some((gga, gll, gsa, gsv, rmc, vtg));
+                self.gps_sentences = Some(sentences);
                 Ok(())
             }
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -173,23 +130,25 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get GPS/Radio mode status (GM bare read).
+    /// Read GPS/Radio mode status, querying firmware first when it is not cached.
     ///
     /// Returns the current GPS/Radio operating mode. `Normal` (0) means
     /// standard transceiver operation. `GpsReceiver` (1) means GPS-only mode.
     ///
     /// # Warning
-    /// On standard CAT firmware, only the bare `GM\r` read is safe; sending
-    /// `GM 1\r` would reboot the radio into GPS-only mode. The exact
-    /// `1.03.AZM` firmware repurposes bare `GM`, so this method refuses that
-    /// profile before sending `GM`.
+    /// On a qualified standard CAT firmware identity, only the bare `GM\r`
+    /// read is safe; sending `GM 1\r` would reboot the radio into GPS-only
+    /// mode. The exact `1.03.AZM` firmware repurposes bare `GM`, and unknown
+    /// firmware may do the same, so this method refuses both profiles before
+    /// sending `GM`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::CommandUnavailableOnFirmware`] without sending `GM`
-    /// on exact `1.03.AZM`. Otherwise, returns an error if the command fails
-    /// or the response is unexpected.
-    pub async fn get_gps_mode(&mut self) -> Result<GpsRadioMode, Error> {
+    /// unless the exact firmware identity is in
+    /// [`super::STANDARD_CAT_FIRMWARE_IDENTITIES`]. On qualified firmware,
+    /// returns an error if the command fails or the response is unexpected.
+    pub async fn read_gps_mode(&mut self) -> Result<GpsRadioMode, Error> {
         self.require_firmware_command("GM", super::FirmwareProfile::supports_bare_gps_mode)
             .await?;
         tracing::debug!("reading GPS/Radio mode");

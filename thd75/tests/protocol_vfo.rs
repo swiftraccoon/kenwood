@@ -12,6 +12,7 @@ use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -34,24 +35,26 @@ fn serialize_ag_read() {
 }
 
 #[test]
-fn serialize_ag_write() {
+fn serialize_ag_write() -> TestResult {
     // AG write is bare (no band), 3-digit zero-padded per KI4LAX.
     assert_eq!(
         protocol::serialize(&Command::SetAfGain {
-            level: AfGainLevel::new(15)
+            level: AfGainLevel::new(15)?
         }),
         b"AG 015\r"
     );
+    Ok(())
 }
 
 #[test]
-fn serialize_ag_write_upper_bound() {
+fn serialize_ag_write_upper_bound() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::SetAfGain {
-            level: AfGainLevel::new(200)
+            level: AfGainLevel::new(200)?
         }),
         b"AG 200\r"
     );
+    Ok(())
 }
 
 #[test]
@@ -60,7 +63,7 @@ fn parse_ag_response() -> TestResult {
     let Response::AfGain { level } = r else {
         return Err(format!("expected AfGain, got {r:?}").into());
     };
-    assert_eq!(level, AfGainLevel::new(91));
+    assert_eq!(level, AfGainLevel::new(91)?);
     Ok(())
 }
 
@@ -70,7 +73,7 @@ fn parse_ag_low() -> TestResult {
     let Response::AfGain { level } = r else {
         return Err(format!("expected AfGain, got {r:?}").into());
     };
-    assert_eq!(level, AfGainLevel::new(5));
+    assert_eq!(level, AfGainLevel::new(5)?);
     Ok(())
 }
 
@@ -80,7 +83,7 @@ fn parse_ag_rejects_out_of_range_value() {
 }
 
 // ============================================================================
-// SQ -- Squelch (no zero-padding; D75 range 0-6 per KI4LAX)
+// SQ -- Squelch (one- or two-digit response; unpadded writes; range 0-6)
 // ============================================================================
 
 #[test]
@@ -143,6 +146,16 @@ fn parse_sq_out_of_range_rejected() {
     assert!(protocol::parse(b"SQ 1,09").is_err());
 }
 
+#[test]
+fn parse_sq_rejects_noncanonical_spelling() {
+    for malformed in [b"SQ 0,003".as_slice(), b"SQ 0,+3", b"SQ 0, 3", b"SQ 0,3 "] {
+        assert!(
+            protocol::parse(malformed).is_err(),
+            "accepted malformed SQ response {malformed:?}"
+        );
+    }
+}
+
 // ============================================================================
 // SM -- S-meter (read-only, zero-padded to 4 digits)
 // ============================================================================
@@ -184,13 +197,13 @@ fn parse_sm_out_of_range_rejected() {
 }
 
 // ============================================================================
-// MD -- Mode
+// MD -- Operating mode
 // ============================================================================
 
 #[test]
 fn serialize_md_read() {
     assert_eq!(
-        protocol::serialize(&Command::GetMode { band: Band::A }),
+        protocol::serialize(&Command::GetOperatingMode { band: Band::A }),
         b"MD 0\r"
     );
 }
@@ -198,9 +211,9 @@ fn serialize_md_read() {
 #[test]
 fn serialize_md_write() {
     assert_eq!(
-        protocol::serialize(&Command::SetMode {
+        protocol::serialize(&Command::SetOperatingMode {
             band: Band::A,
-            mode: Mode::Dv
+            mode: OperatingMode::Dv
         }),
         b"MD 0,1\r"
     );
@@ -209,11 +222,11 @@ fn serialize_md_write() {
 #[test]
 fn parse_md_fm() -> TestResult {
     let r = protocol::parse(b"MD 0,0")?;
-    let Response::Mode { band, mode } = r else {
-        return Err(format!("expected Mode, got {r:?}").into());
+    let Response::OperatingMode { band, mode } = r else {
+        return Err(format!("expected OperatingMode, got {r:?}").into());
     };
     assert_eq!(band, Band::A);
-    assert_eq!(mode, Mode::Fm);
+    assert_eq!(mode, OperatingMode::Fm);
     Ok(())
 }
 
@@ -221,11 +234,11 @@ fn parse_md_fm() -> TestResult {
 fn parse_md_lsb() -> TestResult {
     // MD mode 3 = LSB on D75 (not AM; AM is mode 2)
     let r = protocol::parse(b"MD 1,3")?;
-    let Response::Mode { band, mode } = r else {
-        return Err(format!("expected Mode, got {r:?}").into());
+    let Response::OperatingMode { band, mode } = r else {
+        return Err(format!("expected OperatingMode, got {r:?}").into());
     };
     assert_eq!(band, Band::B);
-    assert_eq!(mode, Mode::Lsb);
+    assert_eq!(mode, OperatingMode::Lsb);
     Ok(())
 }
 
@@ -259,19 +272,23 @@ fn parse_fs_value_3() -> TestResult {
 }
 
 // ============================================================================
-// FT -- Function type (bare read, no band parameter)
+// FT -- Fine Tune (bare read, Boolean write)
 // ============================================================================
 
 #[test]
 fn serialize_ft_read() {
-    assert_eq!(protocol::serialize(&Command::GetFunctionType), b"FT\r");
+    assert_eq!(protocol::serialize(&Command::GetFineTune), b"FT\r");
+    assert_eq!(
+        protocol::serialize(&Command::SetFineTune { enabled: true }),
+        b"FT 1\r"
+    );
 }
 
 #[test]
 fn parse_ft_response_bare() -> TestResult {
     let r = protocol::parse(b"FT 1")?;
-    let Response::FunctionType { enabled } = r else {
-        return Err(format!("expected FunctionType, got {r:?}").into());
+    let Response::FineTune { enabled } = r else {
+        return Err(format!("expected FineTune, got {r:?}").into());
     };
     assert!(enabled);
     Ok(())
@@ -310,20 +327,35 @@ fn serialize_sh_read_cw() {
 #[test]
 fn parse_sh_response() -> TestResult {
     let r = protocol::parse(b"SH 1,3")?;
-    let Response::FilterWidth { mode, width } = r else {
+    let Response::FilterWidth { width } = r else {
         return Err(format!("expected FilterWidth, got {r:?}").into());
     };
-    assert_eq!(mode, FilterMode::Cw);
-    assert_eq!(width, FilterWidthIndex::new(3, FilterMode::Cw)?);
+    assert_eq!(width.mode(), FilterMode::Cw);
+    assert_eq!(width, FilterWidthIndex::new(FilterMode::Cw, 3)?);
     Ok(())
+}
+
+#[test]
+fn parse_sh_rejects_unqualified_extra_and_cross_domain_values() {
+    assert!(
+        protocol::parse(b"SH 3").is_err(),
+        "a width without its mode must not be invented as SSB"
+    );
+    assert!(
+        protocol::parse(b"SH 0,3,1").is_err(),
+        "SH has exactly two response fields"
+    );
+    assert!(
+        protocol::parse(b"SH 2,4").is_err(),
+        "AM has no filter-width index 4"
+    );
 }
 
 #[test]
 fn serialize_sh_write() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::SetFilterWidth {
-            mode: FilterMode::Cw,
-            width: FilterWidthIndex::new(4, FilterMode::Cw)?
+            width: FilterWidthIndex::new(FilterMode::Cw, 4)?
         }),
         b"SH 1,4\r"
     );
@@ -334,8 +366,7 @@ fn serialize_sh_write() -> TestResult {
 fn serialize_sh_write_ssb() -> TestResult {
     assert_eq!(
         protocol::serialize(&Command::SetFilterWidth {
-            mode: FilterMode::Ssb,
-            width: FilterWidthIndex::new(3, FilterMode::Ssb)?
+            width: FilterWidthIndex::new(FilterMode::Ssb, 3)?
         }),
         b"SH 0,3\r"
     );

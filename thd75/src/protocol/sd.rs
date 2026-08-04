@@ -6,19 +6,7 @@
 use crate::error::ProtocolError;
 
 use super::Response;
-
-/// Parse a boolean field ("0" or "1").
-fn parse_bool(payload: &str, cmd: &str) -> Result<bool, ProtocolError> {
-    match payload {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => Err(ProtocolError::FieldParse {
-            command: cmd.to_owned(),
-            field: "value".to_owned(),
-            detail: format!("expected 0 or 1, got {payload:?}"),
-        }),
-    }
-}
+use super::fields::boolean;
 
 /// Parse an SD card command response from mnemonic and payload.
 ///
@@ -27,5 +15,5 @@ pub(crate) fn parse_sd(mnemonic: &str, payload: &str) -> Option<Result<Response,
     if mnemonic != "SD" {
         return None;
     }
-    Some(parse_bool(payload, "SD").map(|present| Response::SdCard { present }))
+    Some(boolean(payload, "SD", "value").map(|present| Response::SdCard { present }))
 }

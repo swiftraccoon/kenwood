@@ -7,15 +7,7 @@ use crate::error::ProtocolError;
 use crate::types::radio_params::{DstarSlot, DvGatewayMode};
 
 use super::Response;
-
-/// Parse a `u8` from a string field.
-fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> {
-    s.parse::<u8>().map_err(|_| ProtocolError::FieldParse {
-        command: cmd.to_owned(),
-        field: field.to_owned(),
-        detail: format!("invalid u8: {s:?}"),
-    })
-}
+use super::fields::decimal_u8;
 
 /// Parse a D-STAR command response from mnemonic and payload.
 ///
@@ -25,7 +17,7 @@ pub(crate) fn parse_dstar(
     payload: &str,
 ) -> Option<Result<Response, ProtocolError>> {
     match mnemonic {
-        "DS" => Some(parse_u8_field(payload, "DS", "slot").and_then(|raw| {
+        "DS" => Some(decimal_u8(payload, "DS", "slot").and_then(|raw| {
             DstarSlot::try_from(raw)
                 .map(|slot| Response::DstarSlot { slot })
                 .map_err(|e| ProtocolError::FieldParse {
@@ -34,7 +26,7 @@ pub(crate) fn parse_dstar(
                     detail: e.to_string(),
                 })
         })),
-        "GW" => Some(parse_u8_field(payload, "GW", "value").and_then(|raw| {
+        "GW" => Some(decimal_u8(payload, "GW", "value").and_then(|raw| {
             DvGatewayMode::try_from(raw)
                 .map(|value| Response::Gateway { value })
                 .map_err(|e| ProtocolError::FieldParse {

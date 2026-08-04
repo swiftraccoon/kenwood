@@ -5,7 +5,7 @@
 
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::Band;
+use kenwood_thd75::types::{Band, RadioModel};
 
 const BT_PORT: &str = "/dev/cu.TH-D75";
 
@@ -15,14 +15,14 @@ async fn bt_identify() {
     println!("\n=== BLUETOOTH TRANSPORT TEST ===\n");
 
     println!("Opening BT SPP at {BT_PORT}...");
-    let transport = SerialTransport::open(BT_PORT, 9600).unwrap();
+    let transport = SerialTransport::open_with_baud(BT_PORT, 9600).unwrap();
 
-    let mut radio = Radio::connect(transport).await.unwrap();
+    let mut radio = Radio::new(transport);
 
     println!("Sending ID command over Bluetooth...");
     let info = radio.identify().await.unwrap();
     println!("  Radio identified: {}", info.model);
-    assert!(info.model.contains("TH-D75"));
+    assert_eq!(info.model, RadioModel::ThD75);
 
     println!("Sending FV command over Bluetooth...");
     let version = radio.get_firmware_version().await.unwrap();
@@ -30,7 +30,7 @@ async fn bt_identify() {
 
     println!("Reading frequency over Bluetooth...");
     let ch = radio.get_frequency_full(Band::A).await.unwrap();
-    println!("  Band A: {} MHz", ch.rx_frequency.as_mhz());
+    println!("  Band A: {} MHz", ch.receive_frequency.as_mhz());
 
     println!("Reading S-meter over Bluetooth...");
     let sm = radio.get_smeter(Band::A).await.unwrap();
@@ -45,7 +45,7 @@ async fn bt_identify() {
     println!("  Power: {pc:?}");
 
     println!("Reading mode over Bluetooth...");
-    let md = radio.get_mode(Band::A).await.unwrap();
+    let md = radio.get_operating_mode(Band::A).await.unwrap();
     println!("  Mode: {md:?}");
 
     println!("Reading BT status over Bluetooth (meta!)...");

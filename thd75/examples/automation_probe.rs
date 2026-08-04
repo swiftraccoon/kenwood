@@ -24,6 +24,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -85,7 +86,7 @@ mod macos {
     pub(super) async fn run() -> ProbeResult<()> {
         let config = parse_args()?;
         let transport = BluetoothTransport::open(Some(&config.device_name))?;
-        let mut radio = Radio::connect(transport).await?;
+        let mut radio = Radio::new(transport);
 
         let qualification_started = Instant::now();
         let captures = {
@@ -437,13 +438,13 @@ mod macos {
                             io::Error::other("missing navigation capture duration")
                         })?;
                         print_key_metadata("navigation_key", key_metadata);
-                        let label = format!("navigation-{:02X}", key.as_u8());
+                        let label = format!("navigation-{:02X}", key.as_raw());
                         write_snapshot(&config.output_dir, &label, navigated, elapsed)?;
                         let menu_delta = differing_pixels(&menu.frame, &navigated.frame);
                         if menu_delta == 0 {
                             return Err(io::Error::other(format!(
                                 "key 0x{:02X} produced no menu framebuffer change",
-                                key.as_u8()
+                                key.as_raw()
                             ))
                             .into());
                         }

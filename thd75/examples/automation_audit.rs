@@ -95,6 +95,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -125,7 +126,7 @@ mod macos {
         GUARDED_ROUTE_MAX_DURATION, GUARDED_SNAPSHOT_MAX_AGE, GuardedDecimalRoute,
         GuardedDecimalRouteOutcome, GuardedKeyOutcome, GuardedKeyResult,
     };
-    use kenwood_thd75::radio::programming::McpPageExchange;
+    use kenwood_thd75::radio::programming::{McpPage, McpPageExchange, WritableMcpPage};
     use kenwood_thd75::screen::SCREEN_WIDTH;
     use kenwood_thd75::screen::ScreenFrame;
     use kenwood_thd75::screen::ui::{
@@ -136,7 +137,9 @@ mod macos {
     use kenwood_thd75::transport::{
         BluetoothTransport, EitherTransport, SerialTransport, Transport,
     };
-    use kenwood_thd75::types::{Band, FlashChannel, FlashDuplex, MemoryMode, VfoMemoryMode};
+    use kenwood_thd75::types::{
+        Band, BandMode, ChannelMode, ShiftDirection, StoredChannel, TuningMode,
+    };
     use serde_json::{Value, json};
 
     type AuditError = Box<dyn StdError + Send + Sync>;
@@ -857,7 +860,7 @@ mod macos {
     #[derive(Debug, Clone, Copy)]
     struct TransientRadioState {
         original_band: Band,
-        original_band_a_mode: VfoMemoryMode,
+        original_band_a_tuning_mode: TuningMode,
         normalized_for_menu_100: bool,
     }
 
@@ -881,18 +884,34 @@ mod macos {
             matches!(self.disposition, Menu134PriDisposition::StagedFromStockWx1)
         }
 
-        const fn setup_exchanges(&self) -> [McpPageExchange; 2] {
-            [
-                McpPageExchange::new(MENU_134_DATA_PAGE, self.data_before, self.data_staged),
-                McpPageExchange::new(MENU_134_FLAG_PAGE, self.flag_before, self.flag_staged),
-            ]
+        fn setup_exchanges(&self) -> AuditResult<[McpPageExchange; 2]> {
+            Ok([
+                McpPageExchange::new(
+                    WritableMcpPage::new(MENU_134_DATA_PAGE)?,
+                    self.data_before,
+                    self.data_staged,
+                ),
+                McpPageExchange::new(
+                    WritableMcpPage::new(MENU_134_FLAG_PAGE)?,
+                    self.flag_before,
+                    self.flag_staged,
+                ),
+            ])
         }
 
-        const fn direct_restore_exchanges(&self) -> [McpPageExchange; 2] {
-            [
-                McpPageExchange::new(MENU_134_FLAG_PAGE, self.flag_staged, self.flag_before),
-                McpPageExchange::new(MENU_134_DATA_PAGE, self.data_staged, self.data_before),
-            ]
+        fn direct_restore_exchanges(&self) -> AuditResult<[McpPageExchange; 2]> {
+            Ok([
+                McpPageExchange::new(
+                    WritableMcpPage::new(MENU_134_FLAG_PAGE)?,
+                    self.flag_staged,
+                    self.flag_before,
+                ),
+                McpPageExchange::new(
+                    WritableMcpPage::new(MENU_134_DATA_PAGE)?,
+                    self.data_staged,
+                    self.data_before,
+                ),
+            ])
         }
     }
 
@@ -938,11 +957,11 @@ mod macos {
         flag: [u8; programming::FLAG_RECORD_SIZE],
         record: &[u8; programming::CHANNEL_RECORD_SIZE],
     ) -> AuditResult<()> {
-        let channel = FlashChannel::from_bytes(record)?;
-        if !MENU_134_BAND_B_RX_RANGE_HZ.contains(&channel.rx_frequency.as_hz()) {
+        let channel = StoredChannel::from_bytes(record)?;
+        if !MENU_134_BAND_B_RX_RANGE_HZ.contains(&channel.receive_frequency.as_hz()) {
             return Err(io::Error::other(format!(
                 "programmed Pri channel RX frequency {} Hz is outside documented Band-B receive coverage",
-                channel.rx_frequency.as_hz()
+                channel.receive_frequency.as_hz()
             ))
             .into());
         }
@@ -968,20 +987,20 @@ mod macos {
             ))
             .into());
         }
-        let channel = FlashChannel::from_bytes(record)?;
-        if channel.rx_frequency.as_hz() != MENU_134_WX1_RX_HZ
-            || channel.mode != MemoryMode::Fm
+        let channel = StoredChannel::from_bytes(record)?;
+        if channel.receive_frequency.as_hz() != MENU_134_WX1_RX_HZ
+            || channel.mode != ChannelMode::Fm
             || channel.split
-            || channel.duplex != FlashDuplex::Simplex
-            || channel.tx_offset.as_hz() != 0
+            || channel.shift != ShiftDirection::Simplex
+            || channel.transmit_offset_or_frequency.as_hz() != 0
         {
             return Err(io::Error::other(format!(
-                "stock WX1 donor did not match the retained receive-only fixture (RX {} Hz, mode {}, split {}, duplex {:?}, offset {} Hz)",
-                channel.rx_frequency.as_hz(),
+                "stock WX1 donor did not match the retained receive-only fixture (RX {} Hz, mode {}, split {}, shift {:?}, offset {} Hz)",
+                channel.receive_frequency.as_hz(),
                 channel.mode,
                 channel.split,
-                channel.duplex,
-                channel.tx_offset.as_hz()
+                channel.shift,
+                channel.transmit_offset_or_frequency.as_hz()
             ))
             .into());
         }
@@ -1059,8 +1078,16 @@ mod macos {
             .into());
         }
         Ok([
-            McpPageExchange::new(MENU_134_FLAG_PAGE, live_flag, plan.flag_before),
-            McpPageExchange::new(MENU_134_DATA_PAGE, live_data, plan.data_before),
+            McpPageExchange::new(
+                WritableMcpPage::new(MENU_134_FLAG_PAGE)?,
+                live_flag,
+                plan.flag_before,
+            ),
+            McpPageExchange::new(
+                WritableMcpPage::new(MENU_134_DATA_PAGE)?,
+                live_data,
+                plan.data_before,
+            ),
         ])
     }
 
@@ -1133,7 +1160,7 @@ mod macos {
             "daemon_or_global_bluetooth_process_manipulated": false,
             "result": "pass",
         }))?;
-        let mut radio = Radio::connect(transport).await?;
+        let mut radio = Radio::new(transport);
         let mut summary = Summary::default();
         let pre_mcp_transport_policy = config.endpoint.pre_mcp_transport_policy();
         let result = execute_audit(
@@ -1304,7 +1331,10 @@ mod macos {
         radio: &mut Radio<EitherTransport>,
     ) -> AuditResult<([u8; programming::PAGE_SIZE], [u8; programming::PAGE_SIZE])> {
         let pages = radio
-            .read_sparse_memory_pages(&[MENU_134_FLAG_PAGE, MENU_134_DATA_PAGE])
+            .read_sparse_memory_pages(&[
+                McpPage::new(MENU_134_FLAG_PAGE)?,
+                McpPage::new(MENU_134_DATA_PAGE)?,
+            ])
             .await?;
         let [(flag_page, flag), (data_page, data)] = pages.as_slice() else {
             return Err(io::Error::other(format!(
@@ -1313,7 +1343,7 @@ mod macos {
             ))
             .into());
         };
-        if *flag_page != MENU_134_FLAG_PAGE || *data_page != MENU_134_DATA_PAGE {
+        if flag_page.as_raw() != MENU_134_FLAG_PAGE || data_page.as_raw() != MENU_134_DATA_PAGE {
             return Err(
                 io::Error::other("Menu 134 MCP read returned unexpected page addresses").into(),
             );
@@ -1368,7 +1398,7 @@ mod macos {
         journal: &mut Journal,
         plan: &Menu134PriPlan,
     ) -> AuditResult<()> {
-        let exchanges = plan.setup_exchanges();
+        let exchanges = plan.setup_exchanges()?;
         journal.append(json!({
             "type": "menu-134-pri-prerequisite-setup-intent",
             "menu_number": "134",
@@ -1399,7 +1429,10 @@ mod macos {
         match result {
             Ok(written) => {
                 let expected = if plan.temporary_write_required() {
-                    vec![MENU_134_DATA_PAGE, MENU_134_FLAG_PAGE]
+                    vec![
+                        WritableMcpPage::new(MENU_134_DATA_PAGE)?,
+                        WritableMcpPage::new(MENU_134_FLAG_PAGE)?,
+                    ]
                 } else {
                     Vec::new()
                 };
@@ -1441,10 +1474,15 @@ mod macos {
     }
 
     fn validate_menu_134_written_pages(
-        written: &[u16],
+        written: &[WritableMcpPage],
         expected: &[u16],
         phase: &str,
     ) -> AuditResult<()> {
+        let written = written
+            .iter()
+            .copied()
+            .map(WritableMcpPage::as_raw)
+            .collect::<Vec<_>>();
         if written == expected {
             Ok(())
         } else {
@@ -1475,7 +1513,7 @@ mod macos {
 
         let mut direct_error: Option<AuditError> = None;
         if plan.temporary_write_required() && setup_succeeded {
-            let direct = plan.direct_restore_exchanges();
+            let direct = plan.direct_restore_exchanges()?;
             match radio.compare_exchange_memory_pages(&direct).await {
                 Ok(written) => {
                     if let Err(error) = validate_menu_134_written_pages(
@@ -1508,7 +1546,7 @@ mod macos {
                 let expected = exchanges
                     .iter()
                     .filter(|exchange| exchange.expected() != exchange.replacement())
-                    .map(McpPageExchange::page)
+                    .map(|exchange| exchange.page().as_raw())
                     .collect::<Vec<_>>();
                 validate_menu_134_written_pages(&written, &expected, "fallback restoration")
             }
@@ -1900,7 +1938,7 @@ mod macos {
 
         let state = TransientRadioState {
             original_band: radio.get_band().await?,
-            original_band_a_mode: radio.get_vfo_memory_mode(Band::A).await?,
+            original_band_a_tuning_mode: radio.get_tuning_mode(Band::A).await?,
             normalized_for_menu_100: normalize_for_menu_100,
         };
         journal.append(json!({
@@ -1910,23 +1948,23 @@ mod macos {
                 "menu_100": normalize_for_menu_100.then_some("stock-v1.03-menu-100-requires-operation-band-A-and-band-A-VFO"),
             },
             "operation_band": format!("{:?}", state.original_band),
-            "band_a_vfo_memory_mode": format!("{:?}", state.original_band_a_mode),
+            "band_a_tuning_mode": format!("{:?}", state.original_band_a_tuning_mode),
             "persistent_mcp_configuration_will_be_temporarily_changed": false,
         }))?;
 
         let preparation = async {
             if state.normalized_for_menu_100
-                && state.original_band_a_mode != VfoMemoryMode::Vfo
+                && state.original_band_a_tuning_mode != TuningMode::Vfo
             {
                 journal.append(json!({
                     "type": "transient-radio-state-intent",
-                    "action": "set-band-a-vfo-memory-mode",
-                    "from": format!("{:?}", state.original_band_a_mode),
-                    "to": format!("{:?}", VfoMemoryMode::Vfo),
+                    "action": "set-band-a-tuning-mode",
+                    "from": format!("{:?}", state.original_band_a_tuning_mode),
+                    "to": format!("{:?}", TuningMode::Vfo),
                     "wire_semantics": "VM 0,0",
                 }))?;
                 radio
-                    .set_vfo_memory_mode(Band::A, VfoMemoryMode::Vfo)
+                    .set_tuning_mode(Band::A, TuningMode::Vfo)
                     .await?;
             }
             if state.normalized_for_menu_100 && state.original_band != Band::A {
@@ -1940,13 +1978,13 @@ mod macos {
                 radio.set_band(Band::A).await?;
             }
 
-            let verified_mode = radio.get_vfo_memory_mode(Band::A).await?;
+            let verified_tuning_mode = radio.get_tuning_mode(Band::A).await?;
             let verified_band = radio.get_band().await?;
             if state.normalized_for_menu_100
-                && (verified_mode != VfoMemoryMode::Vfo || verified_band != Band::A)
+                && (verified_tuning_mode != TuningMode::Vfo || verified_band != Band::A)
             {
                 return Err(io::Error::other(format!(
-                    "transient Menu 100 normalization expected Band A/VFO, got {verified_band:?}/{verified_mode:?}"
+                    "transient Menu 100 normalization expected Band A/VFO, got {verified_band:?}/{verified_tuning_mode:?}"
                 ))
                 .into());
             }
@@ -1954,7 +1992,7 @@ mod macos {
                 "type": "transient-radio-state-verification",
                 "phase": "before-menu-audit",
                 "operation_band": format!("{:?}", verified_band),
-                "band_a_vfo_memory_mode": format!("{:?}", verified_mode),
+                "band_a_tuning_mode": format!("{:?}", verified_tuning_mode),
                 "result": "pass",
             }))?;
             Ok::<(), AuditError>(())
@@ -1988,27 +2026,28 @@ mod macos {
             "type": "transient-radio-state-restore-intent",
             "phase": phase,
             "operation_band": format!("{:?}", state.original_band),
-            "band_a_vfo_memory_mode": format!("{:?}", state.original_band_a_mode),
+            "band_a_tuning_mode": format!("{:?}", state.original_band_a_tuning_mode),
         }))?;
 
         if state.normalized_for_menu_100
-            && radio.get_vfo_memory_mode(Band::A).await? != state.original_band_a_mode
+            && radio.get_tuning_mode(Band::A).await? != state.original_band_a_tuning_mode
         {
             radio
-                .set_vfo_memory_mode(Band::A, state.original_band_a_mode)
+                .set_tuning_mode(Band::A, state.original_band_a_tuning_mode)
                 .await?;
         }
         if state.normalized_for_menu_100 && radio.get_band().await? != state.original_band {
             radio.set_band(state.original_band).await?;
         }
-        let verified_mode = radio.get_vfo_memory_mode(Band::A).await?;
+        let verified_tuning_mode = radio.get_tuning_mode(Band::A).await?;
         let verified_band = radio.get_band().await?;
         if state.normalized_for_menu_100
-            && (verified_mode != state.original_band_a_mode || verified_band != state.original_band)
+            && (verified_tuning_mode != state.original_band_a_tuning_mode
+                || verified_band != state.original_band)
         {
             return Err(io::Error::other(format!(
-                "transient-state restore expected {:?}/{:?}, got {verified_band:?}/{verified_mode:?}",
-                state.original_band, state.original_band_a_mode
+                "transient-state restore expected {:?}/{:?}, got {verified_band:?}/{verified_tuning_mode:?}",
+                state.original_band, state.original_band_a_tuning_mode
             ))
             .into());
         }
@@ -2016,7 +2055,7 @@ mod macos {
             "type": "transient-radio-state-restore-verification",
             "phase": phase,
             "operation_band": format!("{:?}", verified_band),
-            "band_a_vfo_memory_mode": format!("{:?}", verified_mode),
+            "band_a_tuning_mode": format!("{:?}", verified_tuning_mode),
             "result": "pass",
         }))?;
         Ok(())
@@ -2090,7 +2129,7 @@ mod macos {
                 "type": "automation-guard-canary-intent",
                 "scenario": "missing-snapshot",
                 "guarded_probe_key": format!("{:?}", FrontPanelKey::Menu),
-                "raw_key": FrontPanelKey::Menu.as_u8(),
+                "raw_key": FrontPanelKey::Menu.as_raw(),
                 "required_before_first_screen_capture": true,
                 }))?;
                 let missing = session
@@ -2844,7 +2883,7 @@ mod macos {
             || receipt.seqlock != metadata.seqlock
             || metadata.last_command != 3
             || metadata.last_key_result != 2
-            || metadata.last_key != u32::from(expected_key.as_u8())
+            || metadata.last_key != u32::from(expected_key.as_raw())
             || metadata.last_phase != 0
         {
             return Err(io::Error::other(format!(
@@ -2877,7 +2916,7 @@ mod macos {
             "scenario": scenario,
             "context_change_key": context_change_key.map(|key| format!("{key:?}")),
             "guarded_probe_key": format!("{guarded_probe_key:?}"),
-            "guarded_probe_raw_key": guarded_probe_key.as_u8(),
+            "guarded_probe_raw_key": guarded_probe_key.as_raw(),
             "wire_reply_status": "02-exact-echo-authenticated",
             "firmware_command": 3,
             "firmware_result": 2,
@@ -3152,7 +3191,7 @@ mod macos {
             || receipt.event_mask != 0
             || receipt.metadata.last_command != 4
             || receipt.metadata.last_key_result != 2
-            || receipt.metadata.last_key != u32::from(FrontPanelKey::Pf1_9.as_u8())
+            || receipt.metadata.last_key != u32::from(FrontPanelKey::Pf1_9.as_raw())
             || receipt.metadata.last_phase != 0
         {
             return Err(io::Error::other(
@@ -4991,30 +5030,30 @@ mod macos {
             "failed_operation_replayed": false,
         }))?;
 
-        let observed_dual_band = radio.get_dual_band().await?;
-        if !observed_dual_band {
-            radio.set_dual_band(true).await?;
+        let observed_band_mode = radio.get_band_mode().await?;
+        if observed_band_mode != BandMode::Dual {
+            radio.set_band_mode(BandMode::Dual).await?;
         }
         let observed_band = radio.get_band().await?;
         if observed_band != target_band {
             radio.set_band(target_band).await?;
         }
-        let verified_dual_band = radio.get_dual_band().await?;
+        let verified_band_mode = radio.get_band_mode().await?;
         let verified_band = radio.get_band().await?;
-        let runtime_restored = verified_dual_band && verified_band == target_band;
+        let runtime_restored = verified_band_mode == BandMode::Dual && verified_band == target_band;
         journal.append(json!({
             "type": "automation-reconnect-runtime-restoration",
             "phase": phase,
             "before": {
-                "dual_band": observed_dual_band,
+                "band_mode": format!("{observed_band_mode:?}"),
                 "operation_band": format!("{observed_band:?}"),
             },
             "after": {
-                "dual_band": verified_dual_band,
+                "band_mode": format!("{verified_band_mode:?}"),
                 "operation_band": format!("{verified_band:?}"),
             },
             "target": {
-                "dual_band": true,
+                "band_mode": "Dual",
                 "operation_band": format!("{target_band:?}"),
             },
             "persistent_mcp_configuration_changed": false,
@@ -5116,7 +5155,7 @@ mod macos {
             "type": "key-intent",
             "purpose": purpose,
             "key": format!("{key:?}"),
-            "raw_key": key.as_u8(),
+            "raw_key": key.as_raw(),
         }))?;
         let started = Instant::now();
         let metadata = session.tap_key(key).await?;
@@ -5124,7 +5163,7 @@ mod macos {
             "type": "key-receipt",
             "purpose": purpose,
             "key": format!("{key:?}"),
-            "raw_key": key.as_u8(),
+            "raw_key": key.as_raw(),
             "elapsed_ms": millis(started.elapsed()),
             "metadata": metadata_json(&metadata),
         }))?;
@@ -5140,7 +5179,7 @@ mod macos {
             "type": "key-pair-intent",
             "purpose": purpose,
             "keys": [format!("{:?}", FrontPanelKey::Function), format!("{:?}", FrontPanelKey::Ab)],
-            "raw_keys": [FrontPanelKey::Function.as_u8(), FrontPanelKey::Ab.as_u8()],
+            "raw_keys": [FrontPanelKey::Function.as_raw(), FrontPanelKey::Ab.as_raw()],
             "documented_semantics": "toggle-dual-single-band-display",
             "capture_sleep_or_filesystem_io_between_taps": false,
         }))?;
@@ -5325,7 +5364,7 @@ mod macos {
                 "digit_index": digit_index,
                 "digit_ordinal": digit_index + 1,
                 "key": format!("{key:?}"),
-                "raw_key": key.as_u8(),
+                "raw_key": key.as_raw(),
                 "submitted_in_atomic_firmware_command": true,
                 "dispatch_authorized_by_start_guard": matches!(&evidence.outcome, GuardedDecimalRouteOutcome::Dispatched(_)),
                 "complete_press_release_authenticated": digit_index < usize::from(receipt.completed_taps),
@@ -5616,10 +5655,7 @@ mod macos {
             Endpoint::Bluetooth(device_name) => Ok(EitherTransport::Bluetooth(
                 BluetoothTransport::open(Some(device_name))?,
             )),
-            Endpoint::Usb(port) => Ok(EitherTransport::Serial(SerialTransport::open(
-                port,
-                SerialTransport::DEFAULT_BAUD,
-            )?)),
+            Endpoint::Usb(port) => Ok(EitherTransport::Serial(SerialTransport::open(port)?)),
         }
     }
 
@@ -5941,7 +5977,17 @@ mod macos {
         phase: &str,
     ) -> AuditResult<ConfigurationSnapshot> {
         let started = Instant::now();
-        let pages = radio.read_sparse_memory_pages(expected_pages).await?;
+        let typed_pages: Vec<McpPage> = expected_pages
+            .iter()
+            .copied()
+            .map(McpPage::new)
+            .collect::<Result<_, _>>()?;
+        let pages = radio
+            .read_sparse_memory_pages(&typed_pages)
+            .await?
+            .into_iter()
+            .map(|(page, data)| (page.as_raw(), data))
+            .collect::<Vec<_>>();
         let actual_page_numbers = pages.iter().map(|(page, _)| *page).collect::<Vec<_>>();
         if actual_page_numbers != expected_pages {
             return Err(io::Error::other(format!(
@@ -6572,7 +6618,7 @@ mod macos {
             })?;
             destination.copy_from_slice(bytes);
         }
-        Ok(field.descriptor.read(&image)?)
+        Ok(field.read(&image)?)
     }
 
     fn snapshot_unsigned_field(
@@ -9732,12 +9778,474 @@ mod macos {
         use kenwood_thd75::screen::vision::{NormalizedBounds, TextObservation};
         use kenwood_thd75::screen::{SCREEN_BYTES, SCREEN_WIDTH, ScreenFrame};
         use kenwood_thd75::transport::MockTransport;
-        use kenwood_thd75::types::{FlashChannel, FlashDuplex, Frequency, MemoryMode};
+        use kenwood_thd75::types::{
+            ChannelMode, Frequency, RadioModel, ShiftDirection, StoredChannel,
+        };
 
         type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+        fn require_error<T>(
+            result: super::AuditResult<T>,
+            message: &'static str,
+        ) -> super::AuditResult<super::AuditError> {
+            match result {
+                Ok(_) => Err(super::invalid_input(message)),
+                Err(error) => Ok(error),
+            }
+        }
+
+        fn write_bytes(destination: &mut [u8], offset: usize, source: &[u8]) -> TestResult {
+            let end = offset
+                .checked_add(source.len())
+                .ok_or_else(|| super::invalid_input("test fixture byte range overflowed"))?;
+            let target = destination
+                .get_mut(offset..end)
+                .ok_or_else(|| super::invalid_input("test fixture byte range was out of bounds"))?;
+            target.copy_from_slice(source);
+            Ok(())
+        }
+
+        fn set_rgb565_pixel(bytes: &mut [u8], x: usize, y: usize, value: u16) -> TestResult {
+            let pixel_index = y
+                .checked_mul(SCREEN_WIDTH)
+                .and_then(|row| row.checked_add(x))
+                .ok_or_else(|| super::invalid_input("test pixel coordinate overflowed"))?;
+            let byte_offset = pixel_index
+                .checked_mul(2)
+                .ok_or_else(|| super::invalid_input("test pixel byte offset overflowed"))?;
+            write_bytes(bytes, byte_offset, &value.to_le_bytes())
+        }
+
+        fn fill_rgb565_rect(
+            bytes: &mut [u8],
+            x_range: std::ops::Range<usize>,
+            y_range: std::ops::Range<usize>,
+            value: u16,
+        ) -> TestResult {
+            for y in y_range {
+                for x in x_range.clone() {
+                    set_rgb565_pixel(bytes, x, y, value)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn selected_frame(
+            x_range: std::ops::Range<usize>,
+            y_range: std::ops::Range<usize>,
+        ) -> Result<ScreenFrame, Box<dyn std::error::Error + Send + Sync>> {
+            let mut bytes = vec![0_u8; SCREEN_BYTES];
+            fill_rgb565_rect(&mut bytes, x_range, y_range, V103_SELECTION_RGB565)?;
+            Ok(ScreenFrame::from_rgb565_le(bytes)?)
+        }
+
+        fn single_changed_byte_frame(
+            offset: usize,
+            description: &'static str,
+        ) -> Result<ScreenFrame, Box<dyn std::error::Error + Send + Sync>> {
+            let mut bytes = vec![0_u8; SCREEN_BYTES];
+            let byte = bytes.get_mut(offset).ok_or(description)?;
+            *byte = 1;
+            Ok(ScreenFrame::from_rgb565_le(bytes)?)
+        }
+
+        fn replace_observation(
+            observations: &mut [TextObservation],
+            index: usize,
+            replacement: TextObservation,
+        ) -> TestResult {
+            let observation = observations
+                .get_mut(index)
+                .ok_or_else(|| super::invalid_input("synthetic screen has too few observations"))?;
+            *observation = replacement;
+            Ok(())
+        }
+
+        fn check_fm_auto_row(frame: ScreenFrame) -> Result<ScreenFrame, super::AuditError> {
+            let mut screen = super::CapturedScreen {
+                crc32: frame.crc32(),
+                frame,
+                observations: vec![
+                    TextObservation::new(
+                        "FM Auto Det. on",
+                        1.0,
+                        NormalizedBounds::new(
+                            0.006_956_39,
+                            0.254_447_85,
+                            0.760_902_17,
+                            0.139_248_36,
+                        )?,
+                    )?,
+                    TextObservation::new(
+                        "DV",
+                        1.0,
+                        NormalizedBounds::new(0.808_333_34, 0.266_666_68, 0.108_333_334, 0.10)?,
+                    )?,
+                    TextObservation::new(
+                        "On",
+                        1.0,
+                        NormalizedBounds::new(
+                            0.866_666_7,
+                            0.388_888_9,
+                            0.091_666_67,
+                            0.077_777_78,
+                        )?,
+                    )?,
+                ],
+                selected: Vec::new(),
+            };
+            assert!(selected_matches_label(&screen, "FM Auto Det. on DV"));
+            screen.observations.push(TextObservation::new(
+                "Unexpected",
+                1.0,
+                NormalizedBounds::new(0.35, 46.0 / 180.0, 0.30, 18.0 / 180.0)?,
+            )?);
+            assert!(!selected_matches_label(&screen, "FM Auto Det. on DV"));
+            assert!(screen.observations.pop().is_some());
+            screen.observations.push(TextObservation::new(
+                "DV",
+                1.0,
+                NormalizedBounds::new(0.50, 46.0 / 180.0, 0.10, 18.0 / 180.0)?,
+            )?);
+            assert!(!selected_matches_label(&screen, "FM Auto Det. on DV"));
+            Ok(screen.frame)
+        }
+
+        fn check_display_hold_row(frame: ScreenFrame) -> Result<ScreenFrame, super::AuditError> {
+            let mut observations = vec![TextObservation::new(
+                "Display Hold Time",
+                1.0,
+                NormalizedBounds::new(0.013_724_981, 0.248_474_39, 0.849_638_6, 0.138_628_24)?,
+            )?];
+            observations.extend([
+                TextObservation::new(
+                    "Display Hold",
+                    1.0,
+                    NormalizedBounds::new(0.007_609_933, 0.260_035_2, 0.609_440_5, 0.132_493_35)?,
+                )?,
+                TextObservation::new(
+                    "Time",
+                    1.0,
+                    NormalizedBounds::new(0.627_642_3, 0.255_962_04, 0.245_325_18, 0.136_314_36)?,
+                )?,
+                TextObservation::new(
+                    "5",
+                    1.0,
+                    NormalizedBounds::new(0.708_333_3, 0.377_777_79, 0.05, 0.088_888_89)?,
+                )?,
+                TextObservation::new(
+                    "sec",
+                    1.0,
+                    NormalizedBounds::new(0.841_666_64, 0.40, 0.116_666_67, 0.066_666_67)?,
+                )?,
+            ]);
+            let screen = super::CapturedScreen {
+                crc32: frame.crc32(),
+                frame,
+                observations,
+                selected: Vec::new(),
+            };
+            assert!(selected_matches_label(&screen, "Display Hold Time"));
+            let fragments_only = super::CapturedScreen {
+                crc32: screen.crc32,
+                frame: screen.frame,
+                observations: screen.observations.into_iter().skip(1).collect(),
+                selected: Vec::new(),
+            };
+            assert!(selected_matches_label(&fragments_only, "Display Hold Time"));
+            Ok(fragments_only.frame)
+        }
+
+        fn check_usb_audio_level_row() -> TestResult {
+            let frame = selected_frame(0..SCREEN_WIDTH, 124..164)?;
+            let mut screen = super::CapturedScreen {
+                crc32: frame.crc32(),
+                frame,
+                observations: vec![
+                    TextObservation::new(
+                        "USB Audio Out. Lvl.",
+                        1.0,
+                        NormalizedBounds::new(
+                            0.011_640_143,
+                            0.696_791_65,
+                            0.935_191,
+                            0.141_157_87,
+                        )?,
+                    )?,
+                    TextObservation::new(
+                        "USB Audio Out.",
+                        1.0,
+                        NormalizedBounds::new(
+                            0.007_155_005_4,
+                            0.700_637_04,
+                            0.702_457,
+                            0.133_807_17,
+                        )?,
+                    )?,
+                    TextObservation::new(
+                        "LVI.",
+                        1.0,
+                        NormalizedBounds::new(
+                            0.763_974_9,
+                            0.718_633_23,
+                            0.181_526_56,
+                            0.095_427_72,
+                        )?,
+                    )?,
+                    TextObservation::new(
+                        "Level 7",
+                        1.0,
+                        NormalizedBounds::new(
+                            0.712_242_8,
+                            0.827_381_55,
+                            0.246_300_73,
+                            0.075_562_306,
+                        )?,
+                    )?,
+                ],
+                selected: Vec::new(),
+            };
+            assert!(selected_matches_label(&screen, "USB Audio Out. Lvl."));
+            assert!(!selected_matches_label(&screen, "Display Hold Lvl."));
+            screen.observations.push(TextObservation::new(
+                "LVI.",
+                1.0,
+                NormalizedBounds::new(0.50, 0.70, 0.18, 0.10)?,
+            )?);
+            assert!(!selected_matches_label(&screen, "USB Audio Out. Lvl."));
+            Ok(())
+        }
+
         fn parse_cli(arguments: &[&str]) -> Result<super::Config, super::AuditError> {
             parse_args_from(arguments.iter().map(|argument| (*argument).to_owned()))
+        }
+
+        fn test_entry_identity(
+            entries: &[super::MenuEntry],
+            number: &str,
+            displayed: &str,
+        ) -> super::AuditResult<Option<String>> {
+            Ok(entry_value_identity(
+                manifest_entry(entries, number)?,
+                displayed,
+            ))
+        }
+
+        fn assert_domain_value(
+            entries: &[super::MenuEntry],
+            number: &str,
+            displayed: &str,
+            expected_valid: bool,
+        ) -> TestResult {
+            let actual_valid = test_entry_identity(entries, number, displayed)?.is_some();
+            assert_eq!(
+                actual_valid, expected_valid,
+                "menu {number} validity for reviewed value {displayed:?}"
+            );
+            Ok(())
+        }
+
+        fn check_numeric_domain_group_one(entries: &[super::MenuEntry]) -> TestResult {
+            for value in 1..=8 {
+                assert_domain_value(entries, "101", &format!("Type {value}"), true)?;
+            }
+            for value in ["Type 0", "Type 9"] {
+                assert_domain_value(entries, "101", value, false)?;
+            }
+            for number in ["132", "133"] {
+                for value in ["1 sec", "10 sec"] {
+                    assert_domain_value(entries, number, value, true)?;
+                }
+                for value in ["0 sec", "11 sec"] {
+                    assert_domain_value(entries, number, value, false)?;
+                }
+            }
+            for value in ["Off", "15 min", "30 min", "60 min"] {
+                assert_domain_value(entries, "136", value, true)?;
+            }
+            for value in ["On", "10 min", "45 min", "90 min"] {
+                assert_domain_value(entries, "136", value, false)?;
+            }
+            for (value, valid) in [("0", true), ("9", true), ("10", false)] {
+                assert_domain_value(entries, "151", value, valid)?;
+            }
+            for value in (400..=1000).step_by(100) {
+                assert_domain_value(entries, "170", &format!("{value} Hz"), true)?;
+            }
+            for value in ["399 Hz", "450 Hz", "1001 Hz"] {
+                assert_domain_value(entries, "170", value, false)?;
+            }
+            assert_domain_value(entries, "402", "Off", true)?;
+            for value in 1..=4 {
+                assert_domain_value(entries, "402", &format!("{value}-Digit"), true)?;
+            }
+            for value in ["0-Digit", "5-Digit"] {
+                assert_domain_value(entries, "402", value, false)?;
+            }
+            for value in ["Off", "1 min", "2 min", "4 min", "8 min", "Auto"] {
+                assert_domain_value(entries, "404", value, true)?;
+            }
+            for value in ["3 min", "16 min"] {
+                assert_domain_value(entries, "404", value, false)?;
+            }
+            for (number, minimum, maximum, suffix) in [
+                ("413", 2_u16, 1800_u16, "sec"),
+                ("531", 1, 100, "min"),
+                ("532", 10, 180, "sec"),
+                ("533", 5, 90, "deg"),
+                ("535", 5, 180, "sec"),
+                ("581", 1, 250, "sec"),
+                ("701", 1, 10, "sec"),
+                ("901", 3, 60, "sec"),
+            ] {
+                assert_domain_value(entries, number, &format!("{minimum} {suffix}"), true)?;
+                assert_domain_value(entries, number, &format!("{maximum} {suffix}"), true)?;
+                if let Some(adjacent) = minimum.checked_sub(1) {
+                    assert_domain_value(entries, number, &format!("{adjacent} {suffix}"), false)?;
+                }
+                assert_domain_value(entries, number, &format!("{} {suffix}", maximum + 1), false)?;
+            }
+            for (value, valid) in [
+                ("0.01 mile", true),
+                ("9.99 km", true),
+                ("0.00 mile", false),
+                ("10.00 nm", false),
+                ("0.1 mile", false),
+                ("00.01 mile", false),
+            ] {
+                assert_domain_value(entries, "414", value, valid)?;
+            }
+            for (value, valid) in [
+                ("1 (10deg/speed)", true),
+                ("255 10deg/speed", true),
+                ("0 (10deg/speed)", false),
+                ("256 (10deg/speed)", false),
+            ] {
+                assert_domain_value(entries, "534", value, valid)?;
+            }
+            Ok(())
+        }
+
+        fn check_numeric_domain_group_two(entries: &[super::MenuEntry]) -> TestResult {
+            for frequency in CTCSS_FREQUENCIES {
+                assert_domain_value(entries, "593", &format!("{frequency} Hz"), true)?;
+            }
+            for value in ["66.9 Hz", "67.1 Hz", "254.2 Hz"] {
+                assert_domain_value(entries, "593", value, false)?;
+            }
+            for (value, valid) in [
+                ("Level 1", true),
+                ("Level 50", true),
+                ("1", false),
+                ("Level 0", false),
+                ("Level 51", false),
+            ] {
+                assert_domain_value(entries, "615", value, valid)?;
+            }
+            for value in 0..=99 {
+                assert_domain_value(entries, "621", &format!("{value:02}"), true)?;
+            }
+            for value in ["0", "000", "100"] {
+                assert_domain_value(entries, "621", value, false)?;
+            }
+            for number in ["915", "917"] {
+                for value in ["Volume Link", "VOL Link", "VOL"] {
+                    assert_domain_value(entries, number, value, true)?;
+                }
+                for value in 1..=7 {
+                    assert_domain_value(entries, number, &format!("Level {value}"), true)?;
+                }
+                for value in ["Level 0", "Level 8"] {
+                    assert_domain_value(entries, number, value, false)?;
+                }
+            }
+            for (number, prefix, maximum) in [("918", "Speed", 4), ("91A", "Level", 7)] {
+                for value in 1..=maximum {
+                    assert_domain_value(entries, number, &format!("{prefix} {value}"), true)?;
+                }
+                assert_domain_value(entries, number, &format!("{prefix} 0"), false)?;
+                assert_domain_value(entries, number, &format!("{prefix} {}", maximum + 1), false)?;
+            }
+            assert_eq!(APRS_ICON_NAMES.len(), 68);
+            for icon in APRS_ICON_NAMES {
+                assert_domain_value(entries, "501", icon, true)?;
+            }
+            assert_domain_value(entries, "501", "Unknown Icon", false)?;
+            assert_eq!(POSITION_COMMENTS.len(), 15);
+            for comment in POSITION_COMMENTS {
+                assert_domain_value(entries, "502", comment, true)?;
+            }
+            assert_domain_value(entries, "502", "CUSTOM7", false)?;
+            Ok(())
+        }
+
+        fn check_centered_scalar_cases(
+            entries: &[super::MenuEntry],
+            frame: &ScreenFrame,
+        ) -> TestResult {
+            let cases: [(&str, &[&str]); 21] = [
+                ("120", &["2. 4 kHz"]),
+                ("121", &["1.0 kHz", "1.0 KHZ"]),
+                ("122", &["6.0 kHz", "6. 0 kHz"]),
+                ("132", &["8 sec"]),
+                ("133", &["4 sec"]),
+                ("140", &["5.00 MHz"]),
+                ("170", &["800 Hz"]),
+                ("413", &["10 sec"]),
+                ("414", &["0.01 mile"]),
+                ("523", &["Off"]),
+                ("531", &["30 min"]),
+                ("532", &["120 sec", "120", "sec"]),
+                ("533", &["28 deg"]),
+                ("534", &["26 (10deg/speed)"]),
+                ("535", &["60 sec", "60", "sec"]),
+                ("550", &["Off"]),
+                ("593", &["100.0 Hz", "100. 0 Hz"]),
+                ("615", &["Level 25"]),
+                ("621", &["00"]),
+                ("901", &["13 sec"]),
+                ("91A", &["Level 7"]),
+            ];
+            for (number, values) in cases {
+                let entry = manifest_entry(entries, number)?;
+                let value_bounds = match number {
+                    "413" => NormalizedBounds::new(
+                        0.379_942_54,
+                        0.392_260_55,
+                        0.315_402_3,
+                        0.131_187_74,
+                    )?,
+                    "414" => {
+                        NormalizedBounds::new(0.257_482_05, 0.383_476_5, 0.460_035_9, 0.144_158_14)?
+                    }
+                    _ => NormalizedBounds::new(0.31, 0.388, 0.36, 0.125)?,
+                };
+                let mut observations = values
+                    .iter()
+                    .map(|value| TextObservation::new(*value, 1.0, value_bounds))
+                    .collect::<Result<Vec<_>, _>>()?;
+                observations.push(TextObservation::new(
+                    anchor_page_title(entry),
+                    1.0,
+                    NormalizedBounds::new(0.0, 0.02, 0.60, 0.10)?,
+                )?);
+                observations.push(TextObservation::new(
+                    "Back",
+                    1.0,
+                    NormalizedBounds::new(0.08, 0.90, 0.16, 0.08)?,
+                )?);
+                let screen = super::CapturedScreen {
+                    crc32: frame.crc32(),
+                    frame: frame.clone(),
+                    observations,
+                    selected: Vec::new(),
+                };
+                assert!(
+                    centered_scalar_documented_payload(entry, &screen).is_some(),
+                    "centered scalar Menu {number} should validate"
+                );
+            }
+            Ok(())
         }
 
         #[test]
@@ -9801,12 +10309,15 @@ mod macos {
             mock.expect_reopen(Ok(()));
             mock.expect(b"ID\r", b"ID TH-D75\r");
             mock.expect(programming::ENTER_PROGRAMMING, b"0M\r");
-            mock.expect(&programming::build_read_command(page), &page_response);
+            mock.expect(
+                &programming::build_read_command(programming::McpPage::new(page)?),
+                &page_response,
+            );
             mock.expect(&[programming::ACK], &[programming::ACK]);
             mock.expect(b"E", &[programming::ACK]);
             mock.expect(b"ID\r", b"ID TH-D75\r");
             mock.expect(b"ID\r", b"ID TH-D75\r");
-            let mut radio = Radio::connect(mock).await?;
+            let mut radio = Radio::new(mock);
 
             apply_pre_mcp_transport_policy(
                 &mut radio,
@@ -9814,10 +10325,11 @@ mod macos {
             )
             .await?;
 
-            let pages = radio.read_sparse_memory_pages(&[page]).await?;
-            assert_eq!(pages, vec![(page, page_bytes)]);
+            let typed_page = programming::McpPage::new(page)?;
+            let pages = radio.read_sparse_memory_pages(&[typed_page]).await?;
+            assert_eq!(pages, vec![(typed_page, page_bytes)]);
             let identity = radio.identify().await?;
-            assert_eq!(identity.model, "TH-D75");
+            assert_eq!(identity.model, RadioModel::ThD75);
             Ok(())
         }
 
@@ -9825,18 +10337,18 @@ mod macos {
         async fn bluetooth_pre_mcp_boundary_reuses_the_qualified_link() -> TestResult {
             let mut mock = MockTransport::new();
             mock.expect(b"ID\r", b"ID TH-D75\r");
-            let mut radio = Radio::connect(mock).await?;
+            let mut radio = Radio::new(mock);
 
             apply_pre_mcp_transport_policy(&mut radio, PreMcpTransportPolicy::ReuseQualifiedLink)
                 .await?;
 
             let identity = radio.identify().await?;
-            assert_eq!(identity.model, "TH-D75");
+            assert_eq!(identity.model, RadioModel::ThD75);
             Ok(())
         }
 
         #[test]
-        fn cli_rejects_usb_and_bluetooth_endpoints_together_in_either_order() {
+        fn cli_rejects_usb_and_bluetooth_endpoints_together_in_either_order() -> TestResult {
             for arguments in [
                 [
                     "--port",
@@ -9855,61 +10367,80 @@ mod macos {
                     "/private/tmp/audit",
                 ],
             ] {
-                let error = parse_cli(&arguments)
-                    .expect_err("USB and Bluetooth endpoints must be mutually exclusive")
-                    .to_string();
+                let error = require_error(
+                    parse_cli(&arguments),
+                    "USB and Bluetooth endpoints must be mutually exclusive",
+                )?
+                .to_string();
                 assert!(error.contains("--port and --device are mutually exclusive"));
             }
+            Ok(())
         }
 
         #[test]
-        fn cli_rejects_non_absolute_or_bluetooth_serial_paths() {
-            let relative = parse_cli(&[
-                "--port",
-                "cu.usbmodem1234",
-                "--output-dir",
-                "/private/tmp/audit",
-            ])
-            .expect_err("relative serial path must fail")
+        fn cli_rejects_non_absolute_or_bluetooth_serial_paths() -> TestResult {
+            let relative = require_error(
+                parse_cli(&[
+                    "--port",
+                    "cu.usbmodem1234",
+                    "--output-dir",
+                    "/private/tmp/audit",
+                ]),
+                "relative serial path must fail",
+            )?
             .to_string();
             assert!(relative.contains("--port must be an absolute path"));
 
-            let bluetooth = parse_cli(&[
-                "--port",
-                "/dev/cu.TH-D75",
-                "--output-dir",
-                "/private/tmp/audit",
-            ])
-            .expect_err("Bluetooth serial alias must not be accepted as USB")
+            let bluetooth = require_error(
+                parse_cli(&[
+                    "--port",
+                    "/dev/cu.TH-D75",
+                    "--output-dir",
+                    "/private/tmp/audit",
+                ]),
+                "Bluetooth serial alias must not be accepted as USB",
+            )?
             .to_string();
             assert!(bluetooth.contains("--port requires a USB CDC path"));
+            Ok(())
         }
 
         fn audit_error(message: &'static str) -> super::AuditResult<()> {
             Err(std::io::Error::other(message).into())
         }
 
-        fn menu_134_stock_wx1() -> FlashChannel {
-            FlashChannel {
-                rx_frequency: Frequency::new(MENU_134_WX1_RX_HZ),
-                tx_offset: Frequency::new(0),
-                mode: MemoryMode::Fm,
+        fn synthetic_stored_channel(receive_frequency: Frequency) -> StoredChannel {
+            let mut wire = [0_u8; StoredChannel::BYTE_SIZE];
+            wire[..4].copy_from_slice(&receive_frequency.to_le_bytes());
+            StoredChannel::from_bytes(&wire).unwrap_or_else(|error| {
+                unreachable!("fixed all-zero synthetic channel record must decode: {error}")
+            })
+        }
+
+        fn menu_134_stock_wx1() -> StoredChannel {
+            StoredChannel {
+                receive_frequency: Frequency::new(MENU_134_WX1_RX_HZ),
+                transmit_offset_or_frequency: Frequency::new(0),
+                mode: ChannelMode::Fm,
                 split: false,
-                duplex: FlashDuplex::Simplex,
-                ..FlashChannel::default()
+                shift: ShiftDirection::Simplex,
+                ..synthetic_stored_channel(Frequency::new(MENU_134_WX1_RX_HZ))
             }
         }
 
         fn menu_134_empty_pri_fixture()
-        -> ([u8; programming::PAGE_SIZE], [u8; programming::PAGE_SIZE]) {
+        -> super::AuditResult<([u8; programming::PAGE_SIZE], [u8; programming::PAGE_SIZE])>
+        {
             let mut flag = [0xA5; programming::PAGE_SIZE];
             flag[MENU_134_PRI_FLAG_OFFSET] = programming::FLAG_EMPTY;
             flag[MENU_134_WX1_FLAG_OFFSET] = programming::FLAG_VHF;
             let mut data = [0x5A; programming::PAGE_SIZE];
-            data[MENU_134_WX1_RECORD_OFFSET
-                ..MENU_134_WX1_RECORD_OFFSET + programming::CHANNEL_RECORD_SIZE]
-                .copy_from_slice(&menu_134_stock_wx1().to_bytes());
-            (flag, data)
+            write_bytes(
+                &mut data,
+                MENU_134_WX1_RECORD_OFFSET,
+                &menu_134_stock_wx1().to_bytes(),
+            )?;
+            Ok((flag, data))
         }
 
         fn synthetic_home_screen(
@@ -10149,7 +10680,11 @@ mod macos {
                 let actual_field = match safe_inspection_oracle(number)? {
                     SafeInspectionOracle::ActiveChoice { field, .. }
                     | SafeInspectionOracle::ShortText { field, .. } => field,
-                    oracle => panic!("menu {number} has unexpected oracle {oracle:?}"),
+                    oracle => {
+                        return Err(super::invalid_input(format!(
+                            "menu {number} has unexpected oracle {oracle:?}"
+                        )));
+                    }
                 };
                 assert_eq!(actual_field, expected_field, "menu {number}");
             }
@@ -10203,12 +10738,7 @@ mod macos {
             };
 
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 20..44 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..SCREEN_WIDTH, 20..44, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let mut screen = super::CapturedScreen {
                 crc32: frame.crc32(),
@@ -10221,12 +10751,18 @@ mod macos {
                 selected: vec!["1:KQ4NIT /D75A".to_owned()],
             };
             let payload = dv_gateway_callsign_payload(&screen, &before)?;
-            assert_eq!(payload["selected_index"], 0);
-            assert_eq!(payload["selected_row_ordinal"], 1);
+            assert_eq!(payload.get("selected_index"), Some(&serde_json::json!(0)));
+            assert_eq!(
+                payload.get("selected_row_ordinal"),
+                Some(&serde_json::json!(1))
+            );
             assert!(payload.get("selected_callsign").is_none());
             assert!(payload.get("selected_memo").is_none());
 
-            screen.observations[0] = TextObservation::new(
+            let observation = screen.observations.first_mut().ok_or_else(|| {
+                super::invalid_input("synthetic callsign screen has no observation")
+            })?;
+            *observation = TextObservation::new(
                 "1:KQ4NIT /OTHER",
                 1.0,
                 NormalizedBounds::new(0.01, 20.0 / 180.0, 0.65, 24.0 / 180.0)?,
@@ -10399,23 +10935,35 @@ mod macos {
             };
 
             let payload = dynamic_date_time_payload(&screen, &before)?;
-            assert_eq!(payload["mcp_raw"], 0);
+            assert_eq!(payload.get("mcp_raw"), Some(&serde_json::json!(0)));
             assert_eq!(
-                payload["comparison"],
-                "MCP-time-zone-domain-and-unique-right-column-live-date-time-UTC-offset-syntax-in-three-exact-value-rows"
+                payload
+                    .get("comparison")
+                    .and_then(serde_json::Value::as_str),
+                Some(
+                    "MCP-time-zone-domain-and-unique-right-column-live-date-time-UTC-offset-syntax-in-three-exact-value-rows"
+                )
             );
 
-            screen.observations[2] = TextObservation::new(
-                "UTC -05:00",
-                1.0,
-                NormalizedBounds::new(0.45, 0.91, 0.52, 0.08)?,
+            replace_observation(
+                &mut screen.observations,
+                2,
+                TextObservation::new(
+                    "UTC -05:00",
+                    1.0,
+                    NormalizedBounds::new(0.45, 0.91, 0.52, 0.08)?,
+                )?,
             )?;
             assert!(dynamic_date_time_payload(&screen, &before).is_err());
 
-            screen.observations[2] = TextObservation::new(
-                "UTC -05:00",
-                1.0,
-                NormalizedBounds::new(0.42, 0.78, 0.20, 0.13)?,
+            replace_observation(
+                &mut screen.observations,
+                2,
+                TextObservation::new(
+                    "UTC -05:00",
+                    1.0,
+                    NormalizedBounds::new(0.42, 0.78, 0.20, 0.13)?,
+                )?,
             )?;
             screen.observations.push(TextObservation::new(
                 "UTC +09:00",
@@ -10496,14 +11044,7 @@ mod macos {
 
         #[test]
         fn retained_r30_menu960_973_and_984_forms_are_page_scoped_and_one_locus() -> TestResult {
-            let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 20..44 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
-            let selected_frame = ScreenFrame::from_rgb565_le(bytes)?;
+            let selected_frame = selected_frame(0..SCREEN_WIDTH, 20..44)?;
             let entries = parse_menu_manifest(REVIEWED_MANUAL)?;
             let first_row =
                 NormalizedBounds::new(0.033_333_328, 0.122_222_22, 0.475, 0.122_222_22)?;
@@ -10609,17 +11150,11 @@ mod macos {
         #[test]
         fn retained_r35_menu999_reset_alias_is_exact_page_scoped_and_one_locus() -> TestResult {
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 124..164 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..SCREEN_WIDTH, 124..164, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
-            let exact_bounds =
-                NormalizedBounds::new(0.0, 0.699_999_99, 0.258_333_33, 0.122_222_22)?;
+            let exact_bounds = NormalizedBounds::new(0.0, 0.7, 0.258_333_33, 0.122_222_22)?;
             let alias_bounds =
-                NormalizedBounds::new(0.016_666_666, 0.711_111_13, 0.241_666_66, 0.097_222_224)?;
+                NormalizedBounds::new(0.016_666_666, 0.711_111_1, 0.241_666_66, 0.097_222_22)?;
             let mut row = super::CapturedScreen {
                 crc32: frame.crc32(),
                 frame,
@@ -10649,11 +11184,10 @@ mod macos {
         fn retained_r30_menu911_checkbox_payload_uses_all_rows_pixels_and_unique_loci() -> TestResult
         {
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            let gray: u16 = (15 << 11) | (30 << 5) | 15;
+            let gray: u16 = (0x0F << 11) | (0x1E << 5) | 0x0F;
             for center_y in [32_usize, 56, 80] {
                 for x in 7..12 {
-                    let offset = (center_y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&gray.to_le_bytes());
+                    set_rgb565_pixel(&mut bytes, x, center_y, gray)?;
                 }
             }
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
@@ -10701,23 +11235,13 @@ mod macos {
 
         #[test]
         fn retained_r26_battery_level_accepts_a_bounded_shell_with_or_without_fill() -> TestResult {
-            let neutral = (20_u16 << 11) | (40_u16 << 5) | 20_u16;
-            let green = 50_u16 << 5;
+            let neutral = (0x14_u16 << 11) | (0x28_u16 << 5) | 0x14_u16;
+            let green = 0x32_u16 << 5;
             let build = |with_fill: bool| -> TestResult {
                 let mut bytes = vec![0_u8; SCREEN_BYTES];
-                for y in 27..138 {
-                    for x in 84..156 {
-                        let offset = (y * 240 + x) * 2;
-                        bytes[offset..offset + 2].copy_from_slice(&neutral.to_le_bytes());
-                    }
-                }
+                fill_rgb565_rect(&mut bytes, 84..156, 27..138, neutral)?;
                 if with_fill {
-                    for y in 73..125 {
-                        for x in 93..147 {
-                            let offset = (y * 240 + x) * 2;
-                            bytes[offset..offset + 2].copy_from_slice(&green.to_le_bytes());
-                        }
-                    }
+                    fill_rgb565_rect(&mut bytes, 93..147, 73..125, green)?;
                 }
                 let frame = ScreenFrame::from_rgb565_le(bytes)?;
                 let screen = super::CapturedScreen {
@@ -10802,12 +11326,7 @@ mod macos {
         #[test]
         fn label_matches_require_confident_unique_punctuation_preserving_equality() -> TestResult {
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 20..40 {
-                for x in 0..200 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..200, 20..40, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let selected_bounds = NormalizedBounds::new(0.0, 20.0 / 180.0, 0.5, 20.0 / 180.0)?;
             let selected_observation =
@@ -10911,14 +11430,7 @@ mod macos {
         #[test]
         fn retained_v103_checkbox_and_value_ocr_forms_resolve_to_one_physical_locus() -> TestResult
         {
-            let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 20..44 {
-                for x in 0..200 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
-            let frame = ScreenFrame::from_rgb565_le(bytes)?;
+            let frame = selected_frame(0..200, 20..44)?;
             let row_zero = NormalizedBounds::new(0.03, 20.0 / 180.0, 0.45, 24.0 / 180.0)?;
             let row_one = NormalizedBounds::new(0.03, 44.0 / 180.0, 0.45, 24.0 / 180.0)?;
             let weather_alias = NormalizedBounds::new(0.04, 22.0 / 180.0, 0.43, 20.0 / 180.0)?;
@@ -10935,7 +11447,7 @@ mod macos {
             };
             assert!(checkbox_row_has_unique_label(&screen, 0, "RX"));
             assert!(checkbox_row_has_unique_label(&screen, 1, "PTT"));
-            let weather_frame = screen.frame.clone();
+            let weather_frame = screen.frame;
             let weather_screen = super::CapturedScreen {
                 crc32: weather_frame.crc32(),
                 frame: weather_frame,
@@ -10950,7 +11462,7 @@ mod macos {
             let object_alias = NormalizedBounds::new(0.047, 21.0 / 180.0, 0.62, 22.0 / 180.0)?;
             let mut object_screen = super::CapturedScreen {
                 crc32: weather_screen.crc32,
-                frame: weather_screen.frame.clone(),
+                frame: weather_screen.frame,
                 observations: vec![
                     TextObservation::new("2Object/Item", 1.0, object_alias)?,
                     TextObservation::new("MObject/Item", 1.0, row_zero)?,
@@ -10965,15 +11477,7 @@ mod macos {
             )?);
             assert!(!selected_matches_label(&object_screen, "Object/Item"));
 
-            let mut gpgsa_bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 68..92 {
-                for x in 0..200 {
-                    let offset = (y * 240 + x) * 2;
-                    gpgsa_bytes[offset..offset + 2]
-                        .copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
-            let gpgsa_frame = ScreenFrame::from_rgb565_le(gpgsa_bytes)?;
+            let gpgsa_frame = selected_frame(0..200, 68..92)?;
             let merged_gpgsa_bounds =
                 NormalizedBounds::new(0.066_523_16, 0.377_088_81, 0.358_620_35, 0.134_711_24)?;
             let exact_gpgsa_bounds =
@@ -10995,15 +11499,7 @@ mod macos {
             )?);
             assert!(!selected_matches_label(&gpgsa_screen, "$GPGSA"));
 
-            let mut row_bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 44..84 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    row_bytes[offset..offset + 2]
-                        .copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
-            let row_frame = ScreenFrame::from_rgb565_le(row_bytes)?;
+            let row_frame = selected_frame(0..SCREEN_WIDTH, 44..84)?;
             let numbered_row = super::CapturedScreen {
                 crc32: row_frame.crc32(),
                 frame: row_frame,
@@ -11033,12 +11529,7 @@ mod macos {
         #[test]
         fn retained_r40_menu_631_gpvtg_vision_form_is_page_scoped() -> TestResult {
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 140..164 {
-                for x in 0..232 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..232, 140..164, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let exact_bounds =
                 NormalizedBounds::new(0.091_448_15, 0.776_800_1, 0.333_770_36, 0.135_288_75)?;
@@ -11083,12 +11574,7 @@ mod macos {
             assert!(menu_710_is_exact_reviewed_singleton(&entries, menu_710));
 
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 44..68 {
-                for x in 0..232 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..232, 44..68, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let memory_bounds =
                 NormalizedBounds::new(0.0, 0.257_669_48, 0.317_925_75, 0.128_735_51)?;
@@ -11159,19 +11645,21 @@ mod macos {
 
             let exact_frame = screen.frame.clone();
             let mut shifted_bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 45..69 {
-                for x in 0..232 {
-                    let offset = (y * 240 + x) * 2;
-                    shifted_bytes[offset..offset + 2]
-                        .copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut shifted_bytes, 0..232, 45..69, V103_SELECTION_RGB565)?;
             screen.frame = ScreenFrame::from_rgb565_le(shifted_bytes)?;
             assert!(!menu_710_singleton_memory_submenu_matches(&screen));
             screen.frame = exact_frame;
-            screen.observations[4] = TextObservation::new("Memories", 1.0, memory_bounds)?;
+            replace_observation(
+                &mut screen.observations,
+                4,
+                TextObservation::new("Memories", 1.0, memory_bounds)?,
+            )?;
             assert!(!menu_710_singleton_memory_submenu_matches(&screen));
-            screen.observations[4] = TextObservation::new("Memory", 1.0, memory_bounds)?;
+            replace_observation(
+                &mut screen.observations,
+                4,
+                TextObservation::new("Memory", 1.0, memory_bounds)?,
+            )?;
             screen.observations.push(TextObservation::new(
                 "Memory",
                 1.0,
@@ -11184,12 +11672,7 @@ mod macos {
         #[test]
         fn retained_r17_row_ocr_alternatives_are_one_locus_not_competing_labels() -> TestResult {
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 124..164 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..SCREEN_WIDTH, 124..164, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let mut wx_row = super::CapturedScreen {
                 crc32: frame.crc32(),
@@ -11401,12 +11884,7 @@ mod macos {
         #[test]
         fn retained_r17_narrow_row_aliases_do_not_become_global_fuzzy_matching() -> TestResult {
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 84..124 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..SCREEN_WIDTH, 84..124, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let cw = super::CapturedScreen {
                 crc32: frame.crc32(),
@@ -11425,12 +11903,7 @@ mod macos {
                     TextObservation::new(
                         "CH Hidth",
                         1.0,
-                        NormalizedBounds::new(
-                            0.007_411_215,
-                            0.482_950_99,
-                            0.410_002_9,
-                            0.121_658_65,
-                        )?,
+                        NormalizedBounds::new(0.007_411_215, 0.482_951, 0.410_002_9, 0.121_658_65)?,
                     )?,
                     TextObservation::new(
                         "1.0 kHz",
@@ -11488,12 +11961,7 @@ mod macos {
         #[test]
         fn retained_r20_turn_time_and_mobile_alternatives_share_one_exact_locus() -> TestResult {
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 124..164 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..SCREEN_WIDTH, 124..164, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let turn_time = super::CapturedScreen {
                 crc32: frame.crc32(),
@@ -11547,12 +12015,7 @@ mod macos {
                     TextObservation::new(
                         "Mobile",
                         1.0,
-                        NormalizedBounds::new(
-                            0.110_105_01,
-                            0.384_613_2,
-                            0.304_789_99,
-                            0.116_884_75,
-                        )?,
+                        NormalizedBounds::new(0.110_105_01, 0.384_613_2, 0.304_79, 0.116_884_75)?,
                     )?,
                     TextObservation::new(
                         "aMobile",
@@ -11575,12 +12038,7 @@ mod macos {
         #[test]
         fn retained_r21_digipeat_and_uicheck_ocr_forms_are_narrowly_accepted() -> TestResult {
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 44..84 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..SCREEN_WIDTH, 44..84, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let row = super::CapturedScreen {
                 crc32: frame.crc32(),
@@ -11706,17 +12164,12 @@ mod macos {
         #[test]
         fn retained_r23_row_aliases_require_the_exact_observed_form_and_one_locus() -> TestResult {
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 44..84 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..SCREEN_WIDTH, 44..84, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let alias_bounds = NormalizedBounds::new(0.0, 46.0 / 180.0, 0.72, 20.0 / 180.0)?;
             let mut row = super::CapturedScreen {
                 crc32: frame.crc32(),
-                frame: frame.clone(),
+                frame,
                 observations: vec![
                     TextObservation::new("Uldigi Aliases", 1.0, alias_bounds)?,
                     TextObservation::new(
@@ -11736,8 +12189,8 @@ mod macos {
             assert!(!selected_matches_label(&row, "UIdigi Aliases"));
 
             let mut tx_rx_eq = super::CapturedScreen {
-                crc32: frame.crc32(),
-                frame: frame.clone(),
+                crc32: row.crc32,
+                frame: row.frame,
                 observations: vec![TextObservation::new("TXYRX EQ", 1.0, alias_bounds)?],
                 selected: Vec::new(),
             };
@@ -11794,166 +12247,22 @@ mod macos {
         #[test]
         fn retained_r23_40_pixel_rows_accept_only_exact_ordered_upper_lane_fragments() -> TestResult
         {
-            let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 44..84 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
-            let frame = ScreenFrame::from_rgb565_le(bytes)?;
-            let mut fm_auto = super::CapturedScreen {
-                crc32: frame.crc32(),
-                frame: frame.clone(),
-                observations: vec![
-                    TextObservation::new(
-                        "FM Auto Det. on",
-                        1.0,
-                        NormalizedBounds::new(
-                            0.006_956_39,
-                            0.254_447_85,
-                            0.760_902_17,
-                            0.139_248_36,
-                        )?,
-                    )?,
-                    TextObservation::new(
-                        "DV",
-                        1.0,
-                        NormalizedBounds::new(0.808_333_34, 0.266_666_68, 0.108_333_334, 0.10)?,
-                    )?,
-                    TextObservation::new(
-                        "On",
-                        1.0,
-                        NormalizedBounds::new(
-                            0.866_666_7,
-                            0.388_888_9,
-                            0.091_666_67,
-                            0.077_777_78,
-                        )?,
-                    )?,
-                ],
-                selected: Vec::new(),
-            };
-            assert!(selected_matches_label(&fm_auto, "FM Auto Det. on DV"));
-            fm_auto.observations.push(TextObservation::new(
-                "Unexpected",
-                1.0,
-                NormalizedBounds::new(0.35, 46.0 / 180.0, 0.30, 18.0 / 180.0)?,
-            )?);
-            assert!(!selected_matches_label(&fm_auto, "FM Auto Det. on DV"));
-            assert!(fm_auto.observations.pop().is_some());
-            fm_auto.observations.push(TextObservation::new(
-                "DV",
-                1.0,
-                NormalizedBounds::new(0.50, 46.0 / 180.0, 0.10, 18.0 / 180.0)?,
-            )?);
-            assert!(!selected_matches_label(&fm_auto, "FM Auto Det. on DV"));
-
-            let full = TextObservation::new(
-                "Display Hold Time",
-                1.0,
-                NormalizedBounds::new(0.013_724_981, 0.248_474_39, 0.849_638_6, 0.138_628_24)?,
-            )?;
-            let fragments_and_value = vec![
-                TextObservation::new(
-                    "Display Hold",
-                    1.0,
-                    NormalizedBounds::new(0.007_609_933, 0.260_035_2, 0.609_440_5, 0.132_493_35)?,
-                )?,
-                TextObservation::new(
-                    "Time",
-                    1.0,
-                    NormalizedBounds::new(0.627_642_3, 0.255_962_04, 0.245_325_18, 0.136_314_36)?,
-                )?,
-                TextObservation::new(
-                    "5",
-                    1.0,
-                    NormalizedBounds::new(0.708_333_3, 0.377_777_79, 0.05, 0.088_888_89)?,
-                )?,
-                TextObservation::new(
-                    "sec",
-                    1.0,
-                    NormalizedBounds::new(0.841_666_64, 0.40, 0.116_666_67, 0.066_666_67)?,
-                )?,
-            ];
-            let mut display_hold_observations = vec![full];
-            display_hold_observations.extend(fragments_and_value.clone());
-            let display_hold = super::CapturedScreen {
-                crc32: frame.crc32(),
-                frame: frame.clone(),
-                observations: display_hold_observations,
-                selected: Vec::new(),
-            };
-            assert!(selected_matches_label(&display_hold, "Display Hold Time"));
-            let fragments_only = super::CapturedScreen {
-                crc32: frame.crc32(),
-                frame,
-                observations: fragments_and_value,
-                selected: Vec::new(),
-            };
-            assert!(selected_matches_label(&fragments_only, "Display Hold Time"));
-
-            let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 124..164 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
-            let frame = ScreenFrame::from_rgb565_le(bytes)?;
-            let live_91a = vec![
-                TextObservation::new(
-                    "USB Audio Out. Lvl.",
-                    1.0,
-                    NormalizedBounds::new(0.011_640_143, 0.696_791_65, 0.935_191, 0.141_157_87)?,
-                )?,
-                TextObservation::new(
-                    "USB Audio Out.",
-                    1.0,
-                    NormalizedBounds::new(0.007_155_005_4, 0.700_637_04, 0.702_457, 0.133_807_17)?,
-                )?,
-                TextObservation::new(
-                    "LVI.",
-                    1.0,
-                    NormalizedBounds::new(0.763_974_9, 0.718_633_23, 0.181_526_56, 0.095_427_72)?,
-                )?,
-                TextObservation::new(
-                    "Level 7",
-                    1.0,
-                    NormalizedBounds::new(0.712_242_8, 0.827_381_55, 0.246_300_73, 0.075_562_306)?,
-                )?,
-            ];
-            let mut menu_91a = super::CapturedScreen {
-                crc32: frame.crc32(),
-                frame,
-                observations: live_91a,
-                selected: Vec::new(),
-            };
-            assert!(selected_matches_label(&menu_91a, "USB Audio Out. Lvl."));
-            assert!(!selected_matches_label(&menu_91a, "Display Hold Lvl."));
-            menu_91a.observations.push(TextObservation::new(
-                "LVI.",
-                1.0,
-                NormalizedBounds::new(0.50, 0.70, 0.18, 0.10)?,
-            )?);
-            assert!(!selected_matches_label(&menu_91a, "USB Audio Out. Lvl."));
+            let frame = selected_frame(0..SCREEN_WIDTH, 44..84)?;
+            let frame = check_fm_auto_row(frame)?;
+            let _frame = check_display_hold_row(frame)?;
+            check_usb_audio_level_row()?;
             Ok(())
         }
 
         #[test]
         fn retained_r35_menu701_accepts_only_the_exact_merged_value_fragment() -> TestResult {
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 84..124 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..SCREEN_WIDTH, 84..124, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let merged_bounds =
                 NormalizedBounds::new(0.011_052_416, 0.399_691_64, 0.764_512_8, 0.289_719_8)?;
             let left_bounds =
-                NormalizedBounds::new(0.007_238_440_3, 0.467_255_2, 0.702_393_2, 0.144_879_12)?;
+                NormalizedBounds::new(0.007_238_44, 0.467_255_2, 0.702_393_2, 0.144_879_12)?;
             let right_bounds =
                 NormalizedBounds::new(0.75, 0.488_888_9, 0.216_666_67, 0.111_111_11)?;
             let lower_sec_bounds =
@@ -11969,7 +12278,7 @@ mod macos {
             let menu_locator = TextObservation::new(
                 "701",
                 1.0,
-                NormalizedBounds::new(0.866_666_7, 0.022_222_221, 0.116_666_67, 0.088_888_89)?,
+                NormalizedBounds::new(0.866_666_7, 0.022_222_22, 0.116_666_67, 0.088_888_89)?,
             )?;
             let mut live_observations = vec![
                 menu_locator.clone(),
@@ -12064,12 +12373,7 @@ mod macos {
             assert!(!entry_has_typed_value_oracle(entry));
 
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 124..164 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..SCREEN_WIDTH, 124..164, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let row = super::CapturedScreen {
                 crc32: frame.crc32(),
@@ -12098,12 +12402,7 @@ mod macos {
             let entries = parse_menu_manifest(REVIEWED_MANUAL)?;
             let entry = manifest_entry(&entries, "404")?;
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 116..140 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..SCREEN_WIDTH, 116..140, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let mut screen = super::CapturedScreen {
                 crc32: frame.crc32(),
@@ -12153,12 +12452,7 @@ mod macos {
         fn retained_r19_menu501_row_accepts_only_the_overlapping_icon_ocr_alternative() -> TestResult
         {
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 44..84 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..SCREEN_WIDTH, 44..84, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let mut row = super::CapturedScreen {
                 crc32: frame.crc32(),
@@ -12167,7 +12461,7 @@ mod macos {
                     TextObservation::new(
                         "501",
                         1.0,
-                        NormalizedBounds::new(0.866_666_7, 0.022_222_221, 0.116_666_67, 0.10)?,
+                        NormalizedBounds::new(0.866_666_7, 0.022_222_22, 0.116_666_67, 0.10)?,
                     )?,
                     TextObservation::new(
                         "rcon",
@@ -12227,12 +12521,7 @@ mod macos {
                     TextObservation::new(
                         "Status Text1",
                         1.0,
-                        NormalizedBounds::new(
-                            0.008_333_327,
-                            0.122_222_22,
-                            0.600_000_02,
-                            0.122_222_22,
-                        )?,
+                        NormalizedBounds::new(0.008_333_327, 0.122_222_22, 0.6, 0.122_222_22)?,
                     )?,
                     TextObservation::new(
                         "USE",
@@ -12256,8 +12545,11 @@ mod macos {
             else {
                 return Err("Menu 503 lost its active-choice oracle".into());
             };
-            assert_eq!(labels[0], "Status Text1");
-            assert!(aligned_use_marker(&status, labels[0]).is_some());
+            let label = labels
+                .first()
+                .ok_or("Menu 503 active-choice oracle has no labels")?;
+            assert_eq!(*label, "Status Text1");
+            assert!(aligned_use_marker(&status, label).is_some());
             assert_eq!(aligned_use_marker(&status, "Status Text 1"), None);
 
             let packet = super::CapturedScreen {
@@ -12301,8 +12593,11 @@ mod macos {
             else {
                 return Err("Menu 504 lost its active-choice oracle".into());
             };
-            assert_eq!(labels[0], "Type: New-N");
-            assert!(aligned_use_marker(&packet, labels[0]).is_some());
+            let label = labels
+                .first()
+                .ok_or("Menu 504 active-choice oracle has no labels")?;
+            assert_eq!(*label, "Type: New-N");
+            assert!(aligned_use_marker(&packet, label).is_some());
             assert_eq!(aligned_use_marker(&packet, "New-N"), None);
             Ok(())
         }
@@ -12322,7 +12617,7 @@ mod macos {
                     TextObservation::new(
                         "Pathing",
                         1.0,
-                        NormalizedBounds::new(0.20, 0.022_222_221, 0.258_333_33, 0.10)?,
+                        NormalizedBounds::new(0.20, 0.022_222_22, 0.258_333_33, 0.10)?,
                     )?,
                     TextObservation::new(
                         "Prop. Pathing",
@@ -12432,7 +12727,9 @@ mod macos {
         fn quiescence_requires_three_consecutive_identical_frames() -> TestResult {
             let first = ScreenFrame::from_rgb565_le(vec![0_u8; SCREEN_BYTES])?;
             let mut changed = vec![0_u8; SCREEN_BYTES];
-            changed[0] = 1;
+            *changed
+                .first_mut()
+                .ok_or("synthetic screen unexpectedly has no bytes")? = 1;
             let second = ScreenFrame::from_rgb565_le(changed)?;
             let third = ScreenFrame::from_rgb565_le(vec![0_u8; SCREEN_BYTES])?;
 
@@ -12492,19 +12789,13 @@ mod macos {
         #[test]
         fn ordinary_values_must_belong_to_an_explicit_typed_domain() -> TestResult {
             let entries = parse_menu_manifest(REVIEWED_MANUAL)?;
-            let identity = |number: &str, displayed: &str| {
-                entry_value_identity(
-                    manifest_entry(&entries, number).expect("reviewed menu exists"),
-                    displayed,
-                )
-            };
-            assert!(identity("510", "Auto").is_some());
-            assert_eq!(identity("510", "Manua l"), None);
-            assert!(identity("904", "GPS(GS)").is_some());
-            assert!(identity("910", "A:100/B:100").is_some());
-            assert_eq!(identity("980", "IF Output"), None);
-            assert!(identity("980", "COM+AF/IF Output").is_some());
-            assert_eq!(identity("970", "mi"), None);
+            assert!(test_entry_identity(&entries, "510", "Auto")?.is_some());
+            assert_eq!(test_entry_identity(&entries, "510", "Manua l")?, None);
+            assert!(test_entry_identity(&entries, "904", "GPS(GS)")?.is_some());
+            assert!(test_entry_identity(&entries, "910", "A:100/B:100")?.is_some());
+            assert_eq!(test_entry_identity(&entries, "980", "IF Output")?, None);
+            assert!(test_entry_identity(&entries, "980", "COM+AF/IF Output")?.is_some());
+            assert_eq!(test_entry_identity(&entries, "970", "mi")?, None);
             Ok(())
         }
 
@@ -12543,12 +12834,7 @@ mod macos {
             }
 
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 44..68 {
-                for x in 0..200 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..200, 44..68, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let primary_bounds =
                 NormalizedBounds::new(0.016_475_836, 0.259_522_35, 0.552_465, 0.122_621_98)?;
@@ -12565,8 +12851,11 @@ mod macos {
             };
             let payload = ordinary_documented_payload(entry, &screen)
                 .ok_or("same-index Menu 611 alternatives should validate")?;
-            assert_eq!(payload[0], "DocumentedDomain=choice:1");
-            assert!(!payload[0].contains("Dylan"));
+            let value = payload
+                .first()
+                .ok_or("Menu 611 typed payload unexpectedly has no value")?;
+            assert_eq!(value, "DocumentedDomain=choice:1");
+            assert!(!value.contains("Dylan"));
             screen
                 .observations
                 .push(TextObservation::new("2:other", 1.0, primary_bounds)?);
@@ -12589,12 +12878,7 @@ mod macos {
             );
 
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 20..44 {
-                for x in 0..200 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..200, 20..44, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let exact_bounds =
                 NormalizedBounds::new(0.008_333_332, 0.122_222_22, 0.15, 0.122_222_22)?;
@@ -12644,38 +12928,35 @@ mod macos {
         fn page_specific_domains_expand_shorthand_and_preserve_embedded_punctuation() -> TestResult
         {
             let entries = parse_menu_manifest(REVIEWED_MANUAL)?;
-            let identity = |number: &str, displayed: &str| {
-                entry_value_identity(
-                    manifest_entry(&entries, number).expect("reviewed menu exists"),
-                    displayed,
-                )
-            };
 
-            assert!(identity("140", "00.00 MHz").is_some());
-            assert!(identity("140", "0.600 MHz").is_some());
-            assert_eq!(identity("140", "29.96 MHz"), None);
+            assert!(test_entry_identity(&entries, "140", "00.00 MHz")?.is_some());
+            assert!(test_entry_identity(&entries, "140", "0.600 MHz")?.is_some());
+            assert_eq!(test_entry_identity(&entries, "140", "29.96 MHz")?, None);
 
-            assert!(identity("550", "Off").is_some());
-            assert!(identity("550", "10 mile").is_some());
-            assert!(identity("550", "2500 km").is_some());
-            assert_eq!(identity("550", "15 mile"), None);
-            assert_eq!(identity("550", "2510 km"), None);
+            assert!(test_entry_identity(&entries, "550", "Off")?.is_some());
+            assert!(test_entry_identity(&entries, "550", "10 mile")?.is_some());
+            assert!(test_entry_identity(&entries, "550", "2500 km")?.is_some());
+            assert_eq!(test_entry_identity(&entries, "550", "15 mile")?, None);
+            assert_eq!(test_entry_identity(&entries, "550", "2510 km")?, None);
 
-            assert!(identity("940", "Balance").is_some());
-            assert!(identity("940", "Balance (PF1)").is_some());
-            assert!(identity("941", "GPS").is_some());
-            assert!(identity("942", "A/B").is_some());
-            assert!(identity("943", "VFO (PF2 Mic)").is_some());
-            assert!(identity("944", "MR").is_some());
-            assert_eq!(identity("940", "same options as PF1"), None);
+            assert!(test_entry_identity(&entries, "940", "Balance")?.is_some());
+            assert!(test_entry_identity(&entries, "940", "Balance (PF1)")?.is_some());
+            assert!(test_entry_identity(&entries, "941", "GPS")?.is_some());
+            assert!(test_entry_identity(&entries, "942", "A/B")?.is_some());
+            assert!(test_entry_identity(&entries, "943", "VFO (PF2 Mic)")?.is_some());
+            assert!(test_entry_identity(&entries, "944", "MR")?.is_some());
+            assert_eq!(
+                test_entry_identity(&entries, "940", "same options as PF1")?,
+                None
+            );
 
-            assert!(identity("970", "mi/h, mile").is_some());
-            assert!(identity("970", "km/h, km").is_some());
-            assert!(identity("970", "knots, nm").is_some());
-            assert_eq!(identity("970", "mi"), None);
-            assert!(identity("980", "COM+AF/IF Output").is_some());
-            assert!(identity("980", "Mass Storage").is_some());
-            assert_eq!(identity("980", "IF Output"), None);
+            assert!(test_entry_identity(&entries, "970", "mi/h, mile")?.is_some());
+            assert!(test_entry_identity(&entries, "970", "km/h, km")?.is_some());
+            assert!(test_entry_identity(&entries, "970", "knots, nm")?.is_some());
+            assert_eq!(test_entry_identity(&entries, "970", "mi")?, None);
+            assert!(test_entry_identity(&entries, "980", "COM+AF/IF Output")?.is_some());
+            assert!(test_entry_identity(&entries, "980", "Mass Storage")?.is_some());
+            assert_eq!(test_entry_identity(&entries, "980", "IF Output")?, None);
             Ok(())
         }
 
@@ -12683,148 +12964,8 @@ mod macos {
         fn reviewed_numeric_and_discrete_domains_accept_all_values_and_adjacent_invalids()
         -> TestResult {
             let entries = parse_menu_manifest(REVIEWED_MANUAL)?;
-            let identity = |number: &str, displayed: &str| {
-                entry_value_identity(
-                    manifest_entry(&entries, number).expect("reviewed menu exists"),
-                    displayed,
-                )
-            };
-            let valid = |number: &str, displayed: &str| {
-                assert!(
-                    identity(number, displayed).is_some(),
-                    "menu {number} rejected reviewed value {displayed:?}"
-                );
-            };
-            let invalid = |number: &str, displayed: &str| {
-                assert_eq!(
-                    identity(number, displayed),
-                    None,
-                    "menu {number} accepted out-of-domain value {displayed:?}"
-                );
-            };
-
-            for value in 1..=8 {
-                valid("101", &format!("Type {value}"));
-            }
-            invalid("101", "Type 0");
-            invalid("101", "Type 9");
-
-            for number in ["132", "133"] {
-                valid(number, "1 sec");
-                valid(number, "10 sec");
-                invalid(number, "0 sec");
-                invalid(number, "11 sec");
-            }
-            for value in ["Off", "15 min", "30 min", "60 min"] {
-                valid("136", value);
-            }
-            for value in ["On", "10 min", "45 min", "90 min"] {
-                invalid("136", value);
-            }
-            valid("151", "0");
-            valid("151", "9");
-            invalid("151", "10");
-
-            for value in (400..=1000).step_by(100) {
-                valid("170", &format!("{value} Hz"));
-            }
-            for value in ["399 Hz", "450 Hz", "1001 Hz"] {
-                invalid("170", value);
-            }
-
-            valid("402", "Off");
-            for value in 1..=4 {
-                valid("402", &format!("{value}-Digit"));
-            }
-            invalid("402", "0-Digit");
-            invalid("402", "5-Digit");
-
-            for value in ["Off", "1 min", "2 min", "4 min", "8 min", "Auto"] {
-                valid("404", value);
-            }
-            invalid("404", "3 min");
-            invalid("404", "16 min");
-
-            for (number, minimum, maximum, suffix) in [
-                ("413", 2_u16, 1800_u16, "sec"),
-                ("531", 1, 100, "min"),
-                ("532", 10, 180, "sec"),
-                ("533", 5, 90, "deg"),
-                ("535", 5, 180, "sec"),
-                ("581", 1, 250, "sec"),
-                ("701", 1, 10, "sec"),
-                ("901", 3, 60, "sec"),
-            ] {
-                valid(number, &format!("{minimum} {suffix}"));
-                valid(number, &format!("{maximum} {suffix}"));
-                if let Some(adjacent) = minimum.checked_sub(1) {
-                    invalid(number, &format!("{adjacent} {suffix}"));
-                }
-                invalid(number, &format!("{} {suffix}", maximum + 1));
-            }
-            valid("414", "0.01 mile");
-            valid("414", "9.99 km");
-            invalid("414", "0.00 mile");
-            invalid("414", "10.00 nm");
-            invalid("414", "0.1 mile");
-            invalid("414", "00.01 mile");
-
-            valid("534", "1 (10deg/speed)");
-            valid("534", "255 10deg/speed");
-            invalid("534", "0 (10deg/speed)");
-            invalid("534", "256 (10deg/speed)");
-
-            for frequency in CTCSS_FREQUENCIES {
-                valid("593", &format!("{frequency} Hz"));
-            }
-            for value in ["66.9 Hz", "67.1 Hz", "254.2 Hz"] {
-                invalid("593", value);
-            }
-
-            valid("615", "Level 1");
-            valid("615", "Level 50");
-            invalid("615", "1");
-            invalid("615", "Level 0");
-            invalid("615", "Level 51");
-
-            for value in 0..=99 {
-                valid("621", &format!("{value:02}"));
-            }
-            invalid("621", "0");
-            invalid("621", "000");
-            invalid("621", "100");
-
-            for number in ["915", "917"] {
-                valid(number, "Volume Link");
-                valid(number, "VOL Link");
-                valid(number, "VOL");
-                for value in 1..=7 {
-                    valid(number, &format!("Level {value}"));
-                }
-                invalid(number, "Level 0");
-                invalid(number, "Level 8");
-            }
-            for value in 1..=4 {
-                valid("918", &format!("Speed {value}"));
-            }
-            invalid("918", "Speed 0");
-            invalid("918", "Speed 5");
-            for value in 1..=7 {
-                valid("91A", &format!("Level {value}"));
-            }
-            invalid("91A", "Level 0");
-            invalid("91A", "Level 8");
-
-            assert_eq!(APRS_ICON_NAMES.len(), 68);
-            for icon in APRS_ICON_NAMES {
-                valid("501", icon);
-            }
-            invalid("501", "Unknown Icon");
-            assert_eq!(POSITION_COMMENTS.len(), 15);
-            for comment in POSITION_COMMENTS {
-                valid("502", comment);
-            }
-            invalid("502", "CUSTOM7");
+            check_numeric_domain_group_one(&entries)?;
+            check_numeric_domain_group_two(&entries)?;
             Ok(())
         }
 
@@ -12844,12 +12985,7 @@ mod macos {
             assert_eq!(ordinary_documented_payload(entry, &no_band), None);
 
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 20..40 {
-                for x in 0..200 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..200, 20..40, V103_SELECTION_RGB565)?;
             let selected_frame = ScreenFrame::from_rgb565_le(bytes)?;
             let mut selected = super::CapturedScreen {
                 crc32: selected_frame.crc32(),
@@ -12886,68 +13022,7 @@ mod macos {
         -> TestResult {
             let entries = parse_menu_manifest(REVIEWED_MANUAL)?;
             let frame = ScreenFrame::from_rgb565_le(vec![0_u8; SCREEN_BYTES])?;
-            let cases: [(&str, &[&str]); 21] = [
-                ("120", &["2. 4 kHz"]),
-                ("121", &["1.0 kHz", "1.0 KHZ"]),
-                ("122", &["6.0 kHz", "6. 0 kHz"]),
-                ("132", &["8 sec"]),
-                ("133", &["4 sec"]),
-                ("140", &["5.00 MHz"]),
-                ("170", &["800 Hz"]),
-                ("413", &["10 sec"]),
-                ("414", &["0.01 mile"]),
-                ("523", &["Off"]),
-                ("531", &["30 min"]),
-                ("532", &["120 sec", "120", "sec"]),
-                ("533", &["28 deg"]),
-                ("534", &["26 (10deg/speed)"]),
-                ("535", &["60 sec", "60", "sec"]),
-                ("550", &["Off"]),
-                ("593", &["100.0 Hz", "100. 0 Hz"]),
-                ("615", &["Level 25"]),
-                ("621", &["00"]),
-                ("901", &["13 sec"]),
-                ("91A", &["Level 7"]),
-            ];
-            for (number, values) in cases {
-                let entry = manifest_entry(&entries, number)?;
-                let value_bounds = match number {
-                    "413" => NormalizedBounds::new(
-                        0.379_942_54,
-                        0.392_260_55,
-                        0.315_402_3,
-                        0.131_187_74,
-                    )?,
-                    "414" => {
-                        NormalizedBounds::new(0.257_482_05, 0.383_476_5, 0.460_035_9, 0.144_158_14)?
-                    }
-                    _ => NormalizedBounds::new(0.31, 0.388, 0.36, 0.125)?,
-                };
-                let mut observations = values
-                    .iter()
-                    .map(|value| TextObservation::new(*value, 1.0, value_bounds))
-                    .collect::<Result<Vec<_>, _>>()?;
-                observations.push(TextObservation::new(
-                    anchor_page_title(entry),
-                    1.0,
-                    NormalizedBounds::new(0.0, 0.02, 0.60, 0.10)?,
-                )?);
-                observations.push(TextObservation::new(
-                    "Back",
-                    1.0,
-                    NormalizedBounds::new(0.08, 0.90, 0.16, 0.08)?,
-                )?);
-                let screen = super::CapturedScreen {
-                    crc32: frame.crc32(),
-                    frame: frame.clone(),
-                    observations,
-                    selected: Vec::new(),
-                };
-                assert!(
-                    centered_scalar_documented_payload(entry, &screen).is_some(),
-                    "centered scalar Menu {number} should validate"
-                );
-            }
+            check_centered_scalar_cases(&entries, &frame)?;
             assert_eq!(canonical_value_text("2. 4 kHz"), "2.4 khz");
             assert_eq!(canonical_value_text("St. Louis"), "st. louis");
 
@@ -13000,12 +13075,7 @@ mod macos {
             let entries = parse_menu_manifest(REVIEWED_MANUAL)?;
             let entry = manifest_entry(&entries, "151")?;
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 44..84 {
-                for x in 0..240 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..SCREEN_WIDTH, 44..84, V103_SELECTION_RGB565)?;
             let frame = ScreenFrame::from_rgb565_le(bytes)?;
             let mut row = super::CapturedScreen {
                 crc32: frame.crc32(),
@@ -13146,10 +13216,12 @@ mod macos {
                 MENU_134_PRI_RECORD_OFFSET + programming::CHANNEL_RECORD_SIZE,
                 MENU_134_WX1_RECORD_OFFSET
             );
-            assert!(
-                MENU_134_WX1_RECORD_OFFSET + programming::CHANNEL_RECORD_SIZE
-                    <= programming::PAGE_SIZE
-            );
+            const {
+                assert!(
+                    MENU_134_WX1_RECORD_OFFSET + programming::CHANNEL_RECORD_SIZE
+                        <= programming::PAGE_SIZE
+                );
+            }
         }
 
         #[test]
@@ -13201,15 +13273,19 @@ mod macos {
                     programming::FLAG_VHF,
                     "{name} proves WX1 uses special-channel flag byte 0x00"
                 );
-                let donor = FlashChannel::from_bytes(
+                let donor = StoredChannel::from_bytes(
                     &data[MENU_134_WX1_RECORD_OFFSET
                         ..MENU_134_WX1_RECORD_OFFSET + programming::CHANNEL_RECORD_SIZE],
                 )?;
-                assert_eq!(donor.rx_frequency.as_hz(), MENU_134_WX1_RX_HZ, "{name}");
-                assert_eq!(donor.mode, MemoryMode::Fm, "{name}");
+                assert_eq!(
+                    donor.receive_frequency.as_hz(),
+                    MENU_134_WX1_RX_HZ,
+                    "{name}"
+                );
+                assert_eq!(donor.mode, ChannelMode::Fm, "{name}");
                 assert!(!donor.split, "{name}");
-                assert_eq!(donor.duplex, FlashDuplex::Simplex, "{name}");
-                assert_eq!(donor.tx_offset.as_hz(), 0, "{name}");
+                assert_eq!(donor.shift, ShiftDirection::Simplex, "{name}");
+                assert_eq!(donor.transmit_offset_or_frequency.as_hz(), 0, "{name}");
 
                 let plan = plan_menu_134_pri_pages(flag, data)?;
                 assert_eq!(
@@ -13228,7 +13304,7 @@ mod macos {
 
         #[test]
         fn menu_134_empty_pri_plan_changes_only_one_flag_byte_and_one_record() -> TestResult {
-            let (flag, data) = menu_134_empty_pri_fixture();
+            let (flag, data) = menu_134_empty_pri_fixture()?;
             let donor = data[MENU_134_WX1_RECORD_OFFSET
                 ..MENU_134_WX1_RECORD_OFFSET + programming::CHANNEL_RECORD_SIZE]
                 .to_vec();
@@ -13275,19 +13351,19 @@ mod macos {
                 &plan.data_before[MENU_134_PRI_RECORD_OFFSET + programming::CHANNEL_RECORD_SIZE..]
             );
 
-            let setup = plan.setup_exchanges();
+            let setup = plan.setup_exchanges()?;
             assert_eq!(
                 setup
                     .iter()
-                    .map(|exchange| exchange.page())
+                    .map(|exchange| exchange.page().as_raw())
                     .collect::<Vec<_>>(),
                 vec![MENU_134_DATA_PAGE, MENU_134_FLAG_PAGE]
             );
-            let restore = plan.direct_restore_exchanges();
+            let restore = plan.direct_restore_exchanges()?;
             assert_eq!(
                 restore
                     .iter()
-                    .map(|exchange| exchange.page())
+                    .map(|exchange| exchange.page().as_raw())
                     .collect::<Vec<_>>(),
                 vec![MENU_134_FLAG_PAGE, MENU_134_DATA_PAGE]
             );
@@ -13296,10 +13372,10 @@ mod macos {
 
         #[test]
         fn menu_134_valid_existing_pri_is_a_page_exact_no_op() -> TestResult {
-            let (mut flag, mut data) = menu_134_empty_pri_fixture();
-            let existing = FlashChannel {
-                rx_frequency: Frequency::new(446_000_000),
-                ..FlashChannel::default()
+            let (mut flag, mut data) = menu_134_empty_pri_fixture()?;
+            let existing = StoredChannel {
+                receive_frequency: Frequency::new(446_000_000),
+                ..synthetic_stored_channel(Frequency::new(446_000_000))
             };
             flag[MENU_134_PRI_FLAG_OFFSET] = programming::FLAG_UHF;
             data[MENU_134_PRI_RECORD_OFFSET
@@ -13311,12 +13387,12 @@ mod macos {
             assert_eq!(plan.flag_before, plan.flag_staged);
             assert_eq!(plan.data_before, plan.data_staged);
             assert!(
-                plan.setup_exchanges()
+                plan.setup_exchanges()?
                     .iter()
                     .all(|exchange| { exchange.expected() == exchange.replacement() })
             );
             assert!(
-                plan.direct_restore_exchanges()
+                plan.direct_restore_exchanges()?
                     .iter()
                     .all(|exchange| { exchange.expected() == exchange.replacement() })
             );
@@ -13324,43 +13400,43 @@ mod macos {
         }
 
         #[test]
-        fn menu_134_rejects_invalid_existing_pri_and_each_wx1_fixture_constraint() {
+        fn menu_134_rejects_invalid_existing_pri_and_each_wx1_fixture_constraint() -> TestResult {
             assert!(require_menu_134_priority_scan_off(false).is_ok());
             assert!(require_menu_134_priority_scan_off(true).is_err());
 
-            let (mut flag, mut data) = menu_134_empty_pri_fixture();
+            let (mut flag, mut data) = menu_134_empty_pri_fixture()?;
             flag[MENU_134_PRI_FLAG_OFFSET] = 0x03;
             data[MENU_134_PRI_RECORD_OFFSET
                 ..MENU_134_PRI_RECORD_OFFSET + programming::CHANNEL_RECORD_SIZE]
                 .copy_from_slice(
-                    &FlashChannel {
-                        rx_frequency: Frequency::new(446_000_000),
-                        ..FlashChannel::default()
+                    &StoredChannel {
+                        receive_frequency: Frequency::new(446_000_000),
+                        ..synthetic_stored_channel(Frequency::new(446_000_000))
                     }
                     .to_bytes(),
                 );
             assert!(plan_menu_134_pri_pages(flag, data).is_err());
 
-            let (mut out_of_range_flag, mut out_of_range_data) = menu_134_empty_pri_fixture();
+            let (mut out_of_range_flag, mut out_of_range_data) = menu_134_empty_pri_fixture()?;
             out_of_range_flag[MENU_134_PRI_FLAG_OFFSET] = programming::FLAG_VHF;
             out_of_range_data[MENU_134_PRI_RECORD_OFFSET
                 ..MENU_134_PRI_RECORD_OFFSET + programming::CHANNEL_RECORD_SIZE]
                 .copy_from_slice(
-                    &FlashChannel {
-                        rx_frequency: Frequency::new(99_999),
-                        ..FlashChannel::default()
+                    &StoredChannel {
+                        receive_frequency: Frequency::new(99_999),
+                        ..synthetic_stored_channel(Frequency::new(99_999))
                     }
                     .to_bytes(),
                 );
             assert!(plan_menu_134_pri_pages(out_of_range_flag, out_of_range_data).is_err());
 
-            let (mut malformed_flag, mut malformed_data) = menu_134_empty_pri_fixture();
+            let (mut malformed_flag, mut malformed_data) = menu_134_empty_pri_fixture()?;
             malformed_flag[MENU_134_PRI_FLAG_OFFSET] = programming::FLAG_VHF;
             malformed_data[MENU_134_PRI_RECORD_OFFSET + 0x08] = 0xF0;
             assert!(plan_menu_134_pri_pages(malformed_flag, malformed_data).is_err());
 
-            let mutate_donor = |channel: FlashChannel, band: u8| {
-                let (mut flag, mut data) = menu_134_empty_pri_fixture();
+            let mutate_donor = |channel: StoredChannel, band: u8| -> super::AuditResult<_> {
+                let (mut flag, mut data) = menu_134_empty_pri_fixture()?;
                 flag[MENU_134_WX1_FLAG_OFFSET] = band;
                 data[MENU_134_WX1_RECORD_OFFSET
                     ..MENU_134_WX1_RECORD_OFFSET + programming::CHANNEL_RECORD_SIZE]
@@ -13370,15 +13446,15 @@ mod macos {
             assert!(mutate_donor(menu_134_stock_wx1(), programming::FLAG_220).is_err());
             let mut malformed_donor = menu_134_stock_wx1().to_bytes();
             malformed_donor[0x08] = 0xF0;
-            let (malformed_flag, mut malformed_data) = menu_134_empty_pri_fixture();
+            let (malformed_flag, mut malformed_data) = menu_134_empty_pri_fixture()?;
             malformed_data[MENU_134_WX1_RECORD_OFFSET
                 ..MENU_134_WX1_RECORD_OFFSET + programming::CHANNEL_RECORD_SIZE]
                 .copy_from_slice(&malformed_donor);
             assert!(plan_menu_134_pri_pages(malformed_flag, malformed_data).is_err());
             assert!(
                 mutate_donor(
-                    FlashChannel {
-                        rx_frequency: Frequency::new(MENU_134_WX1_RX_HZ - 5_000),
+                    StoredChannel {
+                        receive_frequency: Frequency::new(MENU_134_WX1_RX_HZ - 5_000),
                         ..menu_134_stock_wx1()
                     },
                     programming::FLAG_VHF,
@@ -13387,8 +13463,8 @@ mod macos {
             );
             assert!(
                 mutate_donor(
-                    FlashChannel {
-                        mode: MemoryMode::Am,
+                    StoredChannel {
+                        mode: ChannelMode::Am,
                         ..menu_134_stock_wx1()
                     },
                     programming::FLAG_VHF,
@@ -13397,7 +13473,7 @@ mod macos {
             );
             assert!(
                 mutate_donor(
-                    FlashChannel {
+                    StoredChannel {
                         split: true,
                         ..menu_134_stock_wx1()
                     },
@@ -13407,8 +13483,8 @@ mod macos {
             );
             assert!(
                 mutate_donor(
-                    FlashChannel {
-                        duplex: FlashDuplex::Plus,
+                    StoredChannel {
+                        shift: ShiftDirection::Plus,
                         ..menu_134_stock_wx1()
                     },
                     programming::FLAG_VHF,
@@ -13417,20 +13493,21 @@ mod macos {
             );
             assert!(
                 mutate_donor(
-                    FlashChannel {
-                        tx_offset: Frequency::new(600_000),
+                    StoredChannel {
+                        transmit_offset_or_frequency: Frequency::new(600_000),
                         ..menu_134_stock_wx1()
                     },
                     programming::FLAG_VHF,
                 )
                 .is_err()
             );
+            Ok(())
         }
 
         #[test]
         fn menu_134_restore_planner_covers_every_partial_write_state_and_rejects_drift()
         -> TestResult {
-            let (flag, data) = menu_134_empty_pri_fixture();
+            let (flag, data) = menu_134_empty_pri_fixture()?;
             let plan = plan_menu_134_pri_pages(flag, data)?;
             for (live_flag, live_data) in [
                 (plan.flag_before, plan.data_before),
@@ -13439,8 +13516,8 @@ mod macos {
                 (plan.flag_staged, plan.data_staged),
             ] {
                 let exchanges = plan_menu_134_restore_pages(&plan, live_flag, live_data)?;
-                assert_eq!(exchanges[0].page(), MENU_134_FLAG_PAGE);
-                assert_eq!(exchanges[1].page(), MENU_134_DATA_PAGE);
+                assert_eq!(exchanges[0].page().as_raw(), MENU_134_FLAG_PAGE);
+                assert_eq!(exchanges[1].page().as_raw(), MENU_134_DATA_PAGE);
                 assert_eq!(exchanges[0].expected(), &live_flag);
                 assert_eq!(exchanges[1].expected(), &live_data);
                 assert_eq!(exchanges[0].replacement(), &plan.flag_before);
@@ -13457,7 +13534,7 @@ mod macos {
         }
 
         #[test]
-        fn menu_134_failure_aggregation_never_hides_primary_or_cleanup_paths() {
+        fn menu_134_failure_aggregation_never_hides_primary_or_cleanup_paths() -> TestResult {
             for mask in 0_u8..16 {
                 let cleanup = |bit: u8, label: &'static str| {
                     if mask & bit == 0 {
@@ -13492,26 +13569,31 @@ mod macos {
                     }
                 }
             }
-            let both = combine_primary_and_cleanup_errors(
-                audit_error("menu-134-primary"),
-                [("restore", audit_error("menu-134-restore"))],
-            )
-            .expect_err("primary plus restoration failure must fail")
+            let both = require_error(
+                combine_primary_and_cleanup_errors(
+                    audit_error("menu-134-primary"),
+                    [("restore", audit_error("menu-134-restore"))],
+                ),
+                "primary plus restoration failure must fail",
+            )?
             .to_string();
             assert!(both.contains("menu-134-primary"));
             assert!(both.contains("menu-134-restore"));
+            Ok(())
         }
 
         #[test]
-        fn recoverable_failure_verdict_is_empty_only_for_no_failures() {
+        fn recoverable_failure_verdict_is_empty_only_for_no_failures() -> TestResult {
             assert!(recoverable_menu_failures_result(&[]).is_ok());
-            let error =
-                recoverable_menu_failures_result(&["134: setup".to_owned(), "151: OCR".to_owned()])
-                    .expect_err("nonempty failure set must fail")
-                    .to_string();
+            let error = require_error(
+                recoverable_menu_failures_result(&["134: setup".to_owned(), "151: OCR".to_owned()]),
+                "nonempty failure set must fail",
+            )?
+            .to_string();
             assert!(error.contains("2 recoverable menu audit failure(s)"));
             assert!(error.contains("134: setup"));
             assert!(error.contains("151: OCR"));
+            Ok(())
         }
 
         #[test]
@@ -13526,7 +13608,12 @@ mod macos {
                 usize::from(programming::TOTAL_PAGES),
                 EXPECTED_MCP_TOTAL_PAGE_COUNT
             );
-            assert!(pages.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(pages.windows(2).all(|pair| {
+                let [first, second] = pair else {
+                    return false;
+                };
+                first < second
+            }));
             assert!(pages.iter().all(|page| *page < programming::TOTAL_PAGES));
 
             let first_page = *pages
@@ -13560,12 +13647,7 @@ mod macos {
         #[test]
         fn network_payload_coalesces_one_locus_and_rejects_conflicting_loci() -> TestResult {
             let mut bytes = vec![0_u8; SCREEN_BYTES];
-            for y in 20..40 {
-                for x in 0..200 {
-                    let offset = (y * 240 + x) * 2;
-                    bytes[offset..offset + 2].copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
-                }
-            }
+            fill_rgb565_rect(&mut bytes, 0..200, 20..40, V103_SELECTION_RGB565)?;
             let aprs_bounds = NormalizedBounds::new(0.0, 20.0 / 180.0, 0.20, 20.0 / 180.0)?;
             let code_bounds = NormalizedBounds::new(0.35, 20.0 / 180.0, 0.38, 20.0 / 180.0)?;
             let use_bounds = NormalizedBounds::new(0.84, 20.0 / 180.0, 0.12, 20.0 / 180.0)?;
@@ -13609,7 +13691,7 @@ mod macos {
         }
 
         #[test]
-        fn scrollable_checkbox_routes_cover_every_row_in_order() -> TestResult {
+        fn scrollable_checkbox_routes_cover_every_row_in_order() {
             assert_eq!(
                 scrollable_checkbox_labels("551"),
                 Some(
@@ -13641,7 +13723,6 @@ mod macos {
                 )
             );
             assert_eq!(scrollable_checkbox_labels("406"), None);
-            Ok(())
         }
 
         #[test]
@@ -13729,7 +13810,7 @@ mod macos {
             let actual_shape = synthetic_top_menu_screen(false)?;
             assert!(is_top_level_menu(&actual_shape));
 
-            let mut restoration_only = actual_shape.clone();
+            let mut restoration_only = actual_shape;
             restoration_only
                 .observations
                 .retain(|observation| !matches!(observation.text(), "TX/RX" | "Digital"));
@@ -13750,42 +13831,48 @@ mod macos {
         }
 
         #[test]
-        fn audit_error_aggregation_preserves_primary_and_every_cleanup_failure() {
+        fn audit_error_aggregation_preserves_primary_and_every_cleanup_failure() -> TestResult {
             assert!(combine_primary_and_cleanup_errors::<0>(Ok(()), []).is_ok());
 
-            let primary_only =
-                combine_primary_and_cleanup_errors(audit_error("primary"), [("cleanup", Ok(()))])
-                    .expect_err("primary error must remain an error")
-                    .to_string();
+            let primary_only = require_error(
+                combine_primary_and_cleanup_errors(audit_error("primary"), [("cleanup", Ok(()))]),
+                "primary error must remain an error",
+            )?
+            .to_string();
             assert_eq!(primary_only, "primary");
 
-            let cleanup_only = combine_primary_and_cleanup_errors(
-                Ok(()),
-                [
-                    ("first", audit_error("one")),
-                    ("second", audit_error("two")),
-                ],
-            )
-            .expect_err("cleanup errors must fail the audit")
+            let cleanup_only = require_error(
+                combine_primary_and_cleanup_errors(
+                    Ok(()),
+                    [
+                        ("first", audit_error("one")),
+                        ("second", audit_error("two")),
+                    ],
+                ),
+                "cleanup errors must fail the audit",
+            )?
             .to_string();
             assert_eq!(
                 cleanup_only,
                 "audit cleanup failed: first: one; second: two"
             );
 
-            let both = combine_primary_and_cleanup_errors(
-                audit_error("primary"),
-                [
-                    ("first", audit_error("one")),
-                    ("second", audit_error("two")),
-                ],
-            )
-            .expect_err("primary and cleanup errors must both remain visible")
+            let both = require_error(
+                combine_primary_and_cleanup_errors(
+                    audit_error("primary"),
+                    [
+                        ("first", audit_error("one")),
+                        ("second", audit_error("two")),
+                    ],
+                ),
+                "primary and cleanup errors must both remain visible",
+            )?
             .to_string();
             assert_eq!(
                 both,
                 "primary audit failure: primary; cleanup failures: first: one; second: two"
             );
+            Ok(())
         }
 
         #[test]
@@ -13932,13 +14019,9 @@ mod macos {
             assert_eq!(dropout_comparison.masked_differing_pixels, 0);
             assert!(dropout_comparison.restored());
 
-            let mut volatile_change = vec![0_u8; SCREEN_BYTES];
             let volatile_offset = (5 * SCREEN_WIDTH + 10) * 2;
-            let volatile_byte = volatile_change
-                .get_mut(volatile_offset)
-                .ok_or("volatile test pixel unavailable")?;
-            *volatile_byte = 1;
-            let volatile_frame = ScreenFrame::from_rgb565_le(volatile_change)?;
+            let volatile_frame =
+                single_changed_byte_frame(volatile_offset, "volatile test pixel unavailable")?;
             let volatile = super::CapturedScreen {
                 crc32: volatile_frame.crc32(),
                 frame: volatile_frame,
@@ -13950,7 +14033,6 @@ mod macos {
             assert_eq!(volatile_comparison.masked_differing_pixels, 0);
             assert!(volatile_comparison.restored());
 
-            let mut meter_change = vec![0_u8; SCREEN_BYTES];
             let (meter_x, meter_y, meter_width, meter_height) = HOME_MASK_SIGNAL_METER_RECT;
             assert_eq!(
                 (meter_x, meter_y, meter_width, meter_height),
@@ -13958,11 +14040,8 @@ mod macos {
             );
             let meter_offset =
                 ((meter_y + meter_height - 1) * SCREEN_WIDTH + meter_x + meter_width - 1) * 2;
-            let meter_byte = meter_change
-                .get_mut(meter_offset)
-                .ok_or("S-meter test pixel unavailable")?;
-            *meter_byte = 1;
-            let meter_frame = ScreenFrame::from_rgb565_le(meter_change)?;
+            let meter_frame =
+                single_changed_byte_frame(meter_offset, "S-meter test pixel unavailable")?;
             let meter = super::CapturedScreen {
                 crc32: meter_frame.crc32(),
                 frame: meter_frame,
@@ -13974,13 +14053,9 @@ mod macos {
             assert_eq!(meter_comparison.masked_differing_pixels, 0);
             assert!(meter_comparison.restored());
 
-            let mut stable_change = vec![0_u8; SCREEN_BYTES];
             let stable_offset = (80 * SCREEN_WIDTH + 10) * 2;
-            let stable_byte = stable_change
-                .get_mut(stable_offset)
-                .ok_or("stable test pixel unavailable")?;
-            *stable_byte = 1;
-            let stable_frame = ScreenFrame::from_rgb565_le(stable_change)?;
+            let stable_frame =
+                single_changed_byte_frame(stable_offset, "stable test pixel unavailable")?;
             let stable = super::CapturedScreen {
                 crc32: stable_frame.crc32(),
                 frame: stable_frame,

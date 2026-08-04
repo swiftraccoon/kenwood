@@ -12,14 +12,18 @@ async fn raw_cmd(transport: &mut SerialTransport, cmd: &str) -> Option<Vec<u8>> 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let n = transport.read(&mut buf).await.unwrap();
-            codec.feed(&buf[..n]);
+            if let Err(error) = codec.feed(&buf[..n]) {
+                eprintln!("CAT framing failed while reading `{cmd}`: {error}");
+                return None;
+            }
             if let Some(frame) = codec.next_frame() {
-                return frame;
+                return Some(frame);
             }
         }
     })
     .await
     .ok()
+    .flatten()
 }
 
 #[tokio::test]
@@ -27,7 +31,7 @@ async fn raw_cmd(transport: &mut SerialTransport, cmd: &str) -> Option<Vec<u8>> 
 async fn probe_mr_formats() {
     let ports = SerialTransport::discover_usb().unwrap();
     let mut transport =
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
+        SerialTransport::open(&ports[0].port_name).unwrap();
 
     println!("\n=== MR COMMAND FORMAT PROBING ===\n");
 

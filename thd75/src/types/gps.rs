@@ -1,164 +1,53 @@
-//! GPS (Global Positioning System) configuration and data types.
+//! GPS (Global Positioning System) settings and data types.
 //!
 //! The TH-D75 has a built-in GPS receiver that provides position data in
 //! NMEA (National Marine Electronics Association) format. GPS data is used
 //! for APRS position beaconing, D-STAR position reporting, waypoint
 //! navigation, track logging, and manual position storage.
 //!
-//! These types model every GPS setting accessible through the TH-D75's
-//! menu system (Chapter 13 of the user manual) and CAT commands (GP, GM, GS).
+//! The types in this module mirror individual TH-D75 storage or CAT domains.
+//! They deliberately do not combine unrelated GPS, APRS, and D-STAR settings
+//! into one aggregate.
+
+use crate::error::ValidationError;
 
 // ---------------------------------------------------------------------------
-// Top-level GPS configuration
+// Top-level GPS settings
 // ---------------------------------------------------------------------------
 
-/// Complete GPS configuration for the TH-D75.
+/// Live built-in GPS and PC-output state carried by the `GP` CAT command.
 ///
-/// Covers all settings from the radio's GPS menu tree, including
-/// receiver control, output format, track logging, and position memory.
-/// Derived from the capability gap analysis features 95-109.
-///
-/// Per User Manual Chapter 13 and Chapter 28:
-///
-/// # GPS specifications
-///
-/// - TTFF (cold start): approximately 40 seconds
-/// - TTFF (hot start): approximately 5 seconds
-/// - Horizontal accuracy: 10 m or less
-/// - Receive sensitivity: approximately -141 dBm (acquisition)
-/// - GPS logger mode current consumption: 125 mA
-///
-/// # GPS Receiver mode (per User Manual Chapter 13, Menu No. 403)
-///
-/// GPS Receiver mode turns off the transceiver function entirely to
-/// prolong battery life during GPS track logging. Only GPS information
-/// is displayed. The FM broadcast radio still works in this mode.
-/// Limited key operations are available: `[MENU]`, `[MARK]`, `[F]`
-/// (toggle North Up / Heading Up), and navigation between GPS screens.
-///
-/// # My Position (per User Manual Chapter 13, Menu No. 401)
-///
-/// 5 position memory channels store latitude, longitude, and a name
-/// (up to 8 characters) for locations from which you frequently
-/// transmit APRS packets. Select `GPS` to use the live GPS position
-/// or `My Position 1-5` for a fixed stored position.
-///
-/// # Position Ambiguity (per User Manual Chapter 13, Menu No. 402)
-///
-/// Controls how many trailing digits of position data are omitted
-/// from APRS packets: Off (full precision), 1-Digit, 2-Digit,
-/// 3-Digit, or 4-Digit.
-///
-/// # Position Memory (per User Manual Chapter 13)
-///
-/// The radio provides 100 position memory slots, each storing
-/// latitude, longitude, altitude, timestamp, name (up to 8 characters),
-/// and APRS icon. Memories can be sorted by name or date/time, used
-/// as target points for navigation, or cleared individually or all
-/// at once.
-///
-/// # GPS Battery Saver (per User Manual Chapter 13, Menu No. 404)
-///
-/// Options: Off / 1 / 2 / 4 / 8 minutes / Auto. The Auto setting
-/// progressively increases the GPS off-time: 1 min -> 2 min -> 4 min
-/// -> 8 min (stays at 8 min). If position is later acquired then lost,
-/// the cycle restarts at 1 minute.
-///
-/// # GPS PC Output (per User Manual Chapter 13, Menu No. 405)
-///
-/// When enabled, NMEA data is output via USB or Bluetooth (selected
-/// by Menu No. 981). Configurable sentences (Menu No. 406): `$GPGGA`,
-/// `$GPGLL`, `$GPGSA`, `$GPGSV`, `$GPRMC`, `$GPVTG`. At least one
-/// sentence must remain selected.
-///
-/// # Track Log (per User Manual Chapter 13, Menu No. 410-414)
-///
-/// Records movement to a microSD memory card. Record methods: Time
-/// (interval 2-1800 seconds), Distance (0.01-9.99 miles/km/nm), or
-/// Beacon (synced with APRS beacon transmissions). Track log files
-/// are named by start date/time (e.g., `05122024_124705.nme`).
-/// Track logging pauses when the microSD card is full.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GpsConfig {
-    /// Built-in GPS receiver on/off.
-    pub enabled: bool,
-    /// GPS PC output mode (send NMEA data to the serial port).
-    pub pc_output: bool,
-    /// GPS operating mode (Menu 403: Normal or GPS Receiver).
-    pub operating_mode: GpsOperatingMode,
-    /// GPS battery saver interval (Menu 404).
-    pub battery_saver: GpsBatterySaver,
-    /// NMEA sentence output selection (which sentences to include in
-    /// PC output).
-    pub sentence_output: NmeaSentences,
-    /// Track log recording configuration.
-    pub track_log: TrackLogConfig,
-    /// Manual position memory slots (5 available: "My Position 1"
-    /// through "My Position 5").
-    pub my_positions: [PositionMemory; 5],
-    /// Position ambiguity level (shared with APRS, but configured
-    /// in GPS menu).
-    pub position_ambiguity: GpsPositionAmbiguity,
-    /// GPS data TX configuration (auto-transmit position on DV mode).
-    pub data_tx: GpsDataTx,
-    /// Target point for navigation (bearing/distance display).
-    pub target_point: Option<TargetPoint>,
-}
-
-impl Default for GpsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            pc_output: false,
-            operating_mode: GpsOperatingMode::Normal,
-            battery_saver: GpsBatterySaver::Off,
-            sentence_output: NmeaSentences::default(),
-            track_log: TrackLogConfig::default(),
-            my_positions: Default::default(),
-            position_ambiguity: GpsPositionAmbiguity::Full,
-            data_tx: GpsDataTx::default(),
-            target_point: None,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Operating mode
-// ---------------------------------------------------------------------------
-
-/// GPS receiver operating mode (Menu 403).
-///
-/// The MCP-D75 `gps.OperatingMode` field and the radio menu expose exactly
-/// two values. `GpsReceiver` turns off the transceiver function and boots the
-/// radio into its GPS-only operating mode.
-#[repr(u8)]
+/// Other GPS menu settings have independent storage and wire domains and are
+/// intentionally not part of this value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GpsOperatingMode {
-    /// Normal transceiver operation.
-    Normal = 0,
-    /// GPS receiver-only operation.
-    GpsReceiver = 1,
+pub struct GpsSettings {
+    enabled: bool,
+    pc_output: bool,
 }
 
-impl TryFrom<u8> for GpsOperatingMode {
-    type Error = crate::error::ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Normal),
-            1 => Ok(Self::GpsReceiver),
-            _ => Err(crate::error::ValidationError::SettingOutOfRange {
-                name: "GPS operating mode",
-                value,
-                detail: "must be 0-1",
-            }),
-        }
+impl GpsSettings {
+    /// Creates the exact state represented by the two `GP` CAT fields.
+    #[must_use]
+    pub const fn new(enabled: bool, pc_output: bool) -> Self {
+        Self { enabled, pc_output }
     }
-}
 
-impl From<GpsOperatingMode> for u8 {
-    fn from(mode: GpsOperatingMode) -> Self {
-        mode as Self
+    /// Returns whether the built-in GPS receiver is enabled.
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    /// Returns whether the radio outputs GPS data to the selected PC port.
+    #[must_use]
+    pub const fn pc_output(self) -> bool {
+        self.pc_output
+    }
+
+    /// Returns the documented TH-D75 factory state for Menu 400 and 405.
+    #[must_use]
+    pub const fn factory_default() -> Self {
+        Self::new(true, false)
     }
 }
 
@@ -189,7 +78,7 @@ pub enum GpsBatterySaver {
 }
 
 impl TryFrom<u8> for GpsBatterySaver {
-    type Error = crate::error::ValidationError;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -199,7 +88,7 @@ impl TryFrom<u8> for GpsBatterySaver {
             3 => Ok(Self::FourMinutes),
             4 => Ok(Self::EightMinutes),
             5 => Ok(Self::Auto),
-            _ => Err(crate::error::ValidationError::SettingOutOfRange {
+            _ => Err(ValidationError::SettingOutOfRange {
                 name: "GPS battery saver",
                 value,
                 detail: "must be 0-5",
@@ -218,52 +107,150 @@ impl From<GpsBatterySaver> for u8 {
 // NMEA sentences
 // ---------------------------------------------------------------------------
 
-/// NMEA sentence output selection.
-///
-/// Controls which NMEA 0183 sentences are included when GPS data is
-/// output to the PC serial port. Each sentence provides different
-/// navigation data.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "Mirrors the `GS band,gga,gll,gsa,gsv,rmc,vtg` CAT command 1:1; each bool is one \
-              NMEA 0183 sentence-type enable bit per the TH-D75 CAT reference. Keeping the \
-              fields independent matches the protocol layout the type serialises to."
-)]
+/// A selectable NMEA 0183 sentence emitted by GPS PC output (Menu 406).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NmeaSentences {
-    /// GGA -- Global Positioning System Fix Data.
-    /// Contains time, position, fix quality, number of satellites, HDOP,
-    /// altitude, and geoid separation.
-    pub gga: bool,
-    /// GLL -- Geographic Position (latitude/longitude).
-    /// Contains position and time with status.
-    pub gll: bool,
-    /// GSA -- GPS DOP (Dilution of Precision) and Active Satellites.
-    /// Contains fix mode, satellite PRNs, PDOP, HDOP, VDOP.
-    pub gsa: bool,
-    /// GSV -- GPS Satellites in View.
-    /// Contains satellite PRN, elevation, azimuth, and SNR for each
-    /// visible satellite.
-    pub gsv: bool,
-    /// RMC -- Recommended Minimum Specific GNSS Data.
-    /// Contains time, status, position, speed, course, date, and
-    /// magnetic variation. This is the most commonly used sentence.
-    pub rmc: bool,
-    /// VTG -- Course Over Ground and Ground Speed.
-    /// Contains true/magnetic course and speed in knots/km/h.
-    pub vtg: bool,
+pub enum NmeaSentence {
+    /// Global Positioning System Fix Data.
+    Gga,
+    /// Geographic Position (latitude and longitude).
+    Gll,
+    /// DOP and active satellites.
+    Gsa,
+    /// Satellites in view.
+    Gsv,
+    /// Recommended Minimum Specific GNSS Data.
+    Rmc,
+    /// Course over ground and ground speed.
+    Vtg,
 }
 
-impl Default for NmeaSentences {
-    fn default() -> Self {
-        Self {
-            gga: true,
-            gll: true,
-            gsa: true,
-            gsv: true,
-            rmc: true,
-            vtg: true,
+impl NmeaSentence {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Gga => 1 << 0,
+            Self::Gll => 1 << 1,
+            Self::Gsa => 1 << 2,
+            Self::Gsv => 1 << 3,
+            Self::Rmc => 1 << 4,
+            Self::Vtg => 1 << 5,
         }
+    }
+
+    /// Returns the three-letter sentence identifier without `$GP`.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Gga => "GGA",
+            Self::Gll => "GLL",
+            Self::Gsa => "GSA",
+            Self::Gsv => "GSV",
+            Self::Rmc => "RMC",
+            Self::Vtg => "VTG",
+        }
+    }
+}
+
+/// Nonempty NMEA sentence selection for GPS PC output.
+///
+/// Only bits 0 through 5 are defined by Menu 406 and the `GS` CAT command.
+/// The radio's UI requires at least one sentence to remain selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NmeaSentences(u8);
+
+impl NmeaSentences {
+    const VALID_BITS: u8 = 0x3F;
+
+    /// Returns all six supported NMEA sentences selected.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self(Self::VALID_BITS)
+    }
+
+    /// Returns the documented factory selection: GGA and RMC.
+    #[must_use]
+    pub const fn factory_default() -> Self {
+        Self(NmeaSentence::Gga.bit() | NmeaSentence::Rmc.bit())
+    }
+
+    /// Returns the six-bit radio representation.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Returns whether `sentence` is selected.
+    #[must_use]
+    pub const fn contains(self, sentence: NmeaSentence) -> bool {
+        self.0 & sentence.bit() != 0
+    }
+
+    /// Returns a selection with `sentence` enabled.
+    #[must_use]
+    pub const fn with(self, sentence: NmeaSentence) -> Self {
+        Self(self.0 | sentence.bit())
+    }
+
+    /// Returns a selection with `sentence` disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] when
+    /// removing the sentence would leave the selection empty.
+    pub const fn without(self, sentence: NmeaSentence) -> Result<Self, ValidationError> {
+        let bits = self.0 & !sentence.bit();
+        if bits == 0 {
+            Err(ValidationError::SettingOutOfRange {
+                name: "NMEA sentence selection",
+                value: bits,
+                detail: "at least one of bits 0-5 must be selected",
+            })
+        } else {
+            Ok(Self(bits))
+        }
+    }
+
+    /// Builds a typed selection from the six ordered fields carried by the
+    /// `GS` protocol response: GGA, GLL, GSA, GSV, RMC, and VTG.
+    pub(crate) const fn try_from_flags(
+        [gga, gll, gsa, gsv, rmc, vtg]: [bool; 6],
+    ) -> Result<Self, ValidationError> {
+        let bits = (gga as u8)
+            | (gll as u8) << 1
+            | (gsa as u8) << 2
+            | (gsv as u8) << 3
+            | (rmc as u8) << 4
+            | (vtg as u8) << 5;
+        if bits == 0 {
+            Err(ValidationError::SettingOutOfRange {
+                name: "NMEA sentence selection",
+                value: bits,
+                detail: "at least one of bits 0-5 must be selected",
+            })
+        } else {
+            Ok(Self(bits))
+        }
+    }
+}
+
+impl TryFrom<u8> for NmeaSentences {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value == 0 || value & !Self::VALID_BITS != 0 {
+            Err(ValidationError::SettingOutOfRange {
+                name: "NMEA sentence selection",
+                value,
+                detail: "must select at least one of bits 0-5 and set no reserved bits",
+            })
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
+
+impl From<NmeaSentences> for u8 {
+    fn from(sentences: NmeaSentences) -> Self {
+        sentences.bits()
     }
 }
 
@@ -271,52 +258,92 @@ impl Default for NmeaSentences {
 // Track log
 // ---------------------------------------------------------------------------
 
-/// Track log recording configuration.
+/// Track log recording settings.
 ///
 /// The TH-D75 records GPS track logs to the microSD card at
 /// `/KENWOOD/TH-D75/GPS_LOG/` in NMEA format (`.nme` files).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TrackLogConfig {
-    /// Track log recording method.
-    pub record_method: TrackRecordMethod,
-    /// Recording interval in seconds (range 1-9999).
-    /// Used when `record_method` is `Interval`.
-    pub interval_seconds: u16,
-    /// Recording distance in meters (range 10-9999).
-    /// Used when `record_method` is `Distance`.
-    pub distance_meters: u16,
+pub struct TrackLogSettings {
+    enabled: bool,
+    record_method: TrackRecordMethod,
+    interval: TrackIntervalSeconds,
+    distance: TrackDistanceHundredths,
 }
 
-impl Default for TrackLogConfig {
-    fn default() -> Self {
+impl TrackLogSettings {
+    /// Creates track-log settings from independently validated fields.
+    #[must_use]
+    pub const fn new(
+        enabled: bool,
+        record_method: TrackRecordMethod,
+        interval: TrackIntervalSeconds,
+        distance: TrackDistanceHundredths,
+    ) -> Self {
         Self {
-            record_method: TrackRecordMethod::Off,
-            interval_seconds: 5,
-            distance_meters: 100,
+            enabled,
+            record_method,
+            interval,
+            distance,
         }
+    }
+
+    /// Returns whether track-log recording is enabled (Menu 410).
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    /// Returns the acquisition method (Menu 412).
+    #[must_use]
+    pub const fn record_method(self) -> TrackRecordMethod {
+        self.record_method
+    }
+
+    /// Returns the stored time interval (Menu 413).
+    #[must_use]
+    pub const fn interval(self) -> TrackIntervalSeconds {
+        self.interval
+    }
+
+    /// Returns the stored distance in hundredths of the Menu 970 unit.
+    #[must_use]
+    pub const fn distance(self) -> TrackDistanceHundredths {
+        self.distance
+    }
+
+    /// Returns the documented TH-D75 factory track-log settings.
+    #[must_use]
+    pub const fn factory_default() -> Self {
+        Self::new(
+            false,
+            TrackRecordMethod::Time,
+            TrackIntervalSeconds::new_unchecked(10),
+            TrackDistanceHundredths::new_unchecked(1),
+        )
     }
 }
 
 /// Track log recording trigger method.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrackRecordMethod {
-    /// Track log recording disabled.
-    Off,
     /// Record at a fixed time interval.
-    Interval,
+    Time = 0,
     /// Record when the distance threshold is exceeded.
-    Distance,
+    Distance = 1,
+    /// Record with APRS beacon transmissions.
+    Beacon = 2,
 }
 
 impl TryFrom<u8> for TrackRecordMethod {
-    type Error = crate::error::ValidationError;
+    type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::Off),
-            1 => Ok(Self::Interval),
-            2 => Ok(Self::Distance),
-            _ => Err(crate::error::ValidationError::SettingOutOfRange {
+            0 => Ok(Self::Time),
+            1 => Ok(Self::Distance),
+            2 => Ok(Self::Beacon),
+            _ => Err(ValidationError::SettingOutOfRange {
                 name: "track record method",
                 value,
                 detail: "must be 0-2",
@@ -325,11 +352,110 @@ impl TryFrom<u8> for TrackRecordMethod {
     }
 }
 
+impl From<TrackRecordMethod> for u8 {
+    fn from(method: TrackRecordMethod) -> Self {
+        method as Self
+    }
+}
+
+/// Track-log time interval in seconds (Menu 413, raw `2..=1800`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TrackIntervalSeconds(u16);
+
+impl TrackIntervalSeconds {
+    /// Minimum accepted interval in seconds.
+    pub const MIN: u16 = 2;
+    /// Maximum accepted interval in seconds.
+    pub const MAX: u16 = 1800;
+
+    const fn new_unchecked(seconds: u16) -> Self {
+        Self(seconds)
+    }
+
+    /// Creates an interval in the radio's accepted range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::IntegerOutOfRange`] unless `seconds` is in
+    /// `2..=1800`.
+    pub const fn new(seconds: u16) -> Result<Self, ValidationError> {
+        if seconds >= Self::MIN && seconds <= Self::MAX {
+            Ok(Self(seconds))
+        } else {
+            Err(ValidationError::IntegerOutOfRange {
+                name: "track-log time interval",
+                value: seconds as i64,
+                detail: "must be 2-1800 seconds",
+            })
+        }
+    }
+
+    /// Returns the interval in seconds, identical to its MCP value.
+    #[must_use]
+    pub const fn as_seconds(self) -> u16 {
+        self.0
+    }
+}
+
+impl From<TrackIntervalSeconds> for u16 {
+    fn from(interval: TrackIntervalSeconds) -> Self {
+        interval.as_seconds()
+    }
+}
+
+/// Track-log distance in hundredths of the selected Menu 970 unit.
+///
+/// Raw `1` means `0.01`, while raw `999` means `9.99`. The unit is selected
+/// elsewhere and may be miles, kilometres, or nautical miles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TrackDistanceHundredths(u16);
+
+impl TrackDistanceHundredths {
+    /// Minimum encoded distance (`0.01` selected units).
+    pub const MIN: u16 = 1;
+    /// Maximum encoded distance (`9.99` selected units).
+    pub const MAX: u16 = 999;
+
+    const fn new_unchecked(hundredths: u16) -> Self {
+        Self(hundredths)
+    }
+
+    /// Creates a distance accepted by the radio.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::IntegerOutOfRange`] unless `hundredths` is
+    /// in `1..=999`.
+    pub const fn new(hundredths: u16) -> Result<Self, ValidationError> {
+        if hundredths >= Self::MIN && hundredths <= Self::MAX {
+            Ok(Self(hundredths))
+        } else {
+            Err(ValidationError::IntegerOutOfRange {
+                name: "track-log distance",
+                value: hundredths as i64,
+                detail: "must be 1-999 hundredths of the selected unit",
+            })
+        }
+    }
+
+    /// Returns the encoded hundredths of the selected unit.
+    #[must_use]
+    pub const fn as_hundredths(self) -> u16 {
+        self.0
+    }
+}
+
+impl From<TrackDistanceHundredths> for u16 {
+    fn from(distance: TrackDistanceHundredths) -> Self {
+        distance.as_hundredths()
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Position memory
+// My Position
 // ---------------------------------------------------------------------------
 
-/// GPS position memory slot.
+/// One of the radio's five stored "My Position" values.
 ///
 /// The TH-D75 provides 5 "My Position" slots ("My Position 1" through
 /// "My Position 5") for storing known locations. These can be used as
@@ -341,27 +467,52 @@ impl TryFrom<u8> for TrackRecordMethod {
 /// icon. A position memory entry can be copied to one of these "My
 /// Position" slots (§5.14.5) or to an APRS Object for transmission.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PositionMemory {
-    /// Descriptive name for the position (up to 8 characters).
-    pub name: PositionName,
-    /// Latitude in decimal degrees (positive = North, negative = South).
-    /// Range: -90.0 to +90.0.
-    pub latitude: f64,
-    /// Longitude in decimal degrees (positive = East, negative = West).
-    /// Range: -180.0 to +180.0.
-    pub longitude: f64,
-    /// Altitude in meters above mean sea level.
-    pub altitude: f64,
+pub struct MyPosition {
+    name: PositionName,
+    latitude: aprs::Latitude,
+    longitude: aprs::Longitude,
+    altitude: PositionAltitudeMeters,
 }
 
-impl Default for PositionMemory {
-    fn default() -> Self {
+impl MyPosition {
+    /// Creates a stored My Position value from validated components.
+    #[must_use]
+    pub const fn new(
+        name: PositionName,
+        latitude: aprs::Latitude,
+        longitude: aprs::Longitude,
+        altitude: PositionAltitudeMeters,
+    ) -> Self {
         Self {
-            name: PositionName::default(),
-            latitude: 0.0,
-            longitude: 0.0,
-            altitude: 0.0,
+            name,
+            latitude,
+            longitude,
+            altitude,
         }
+    }
+
+    /// Returns the fixed-width position name.
+    #[must_use]
+    pub const fn name(&self) -> &PositionName {
+        &self.name
+    }
+
+    /// Returns the validated latitude.
+    #[must_use]
+    pub const fn latitude(&self) -> aprs::Latitude {
+        self.latitude
+    }
+
+    /// Returns the validated longitude.
+    #[must_use]
+    pub const fn longitude(&self) -> aprs::Longitude {
+        self.longitude
+    }
+
+    /// Returns the validated altitude.
+    #[must_use]
+    pub const fn altitude(&self) -> PositionAltitudeMeters {
+        self.altitude
     }
 }
 
@@ -377,14 +528,30 @@ impl PositionName {
     ///
     /// # Errors
     ///
-    /// Returns `None` if the name exceeds 8 characters.
-    #[must_use]
-    pub fn new(name: &str) -> Option<Self> {
-        if name.len() <= Self::MAX_LEN {
-            Some(Self(name.to_owned()))
-        } else {
-            None
+    /// Returns [`ValidationError::TextLengthOutOfRange`] if the name exceeds
+    /// eight bytes, or [`ValidationError::InvalidTextByte`] at the first
+    /// non-ASCII or NUL byte. Spaces are retained exactly as supplied.
+    pub fn new(name: &str) -> Result<Self, ValidationError> {
+        if name.len() > Self::MAX_LEN {
+            return Err(ValidationError::TextLengthOutOfRange {
+                name: "position name",
+                len: name.len(),
+                detail: "must be at most 8 encoded bytes",
+            });
         }
+        if let Some((offset, value)) = name
+            .bytes()
+            .enumerate()
+            .find(|(_, byte)| !byte.is_ascii() || *byte == 0)
+        {
+            return Err(ValidationError::InvalidTextByte {
+                name: "position name",
+                offset,
+                value,
+                detail: "must contain only non-NUL ASCII bytes",
+            });
+        }
+        Ok(Self(name.to_owned()))
     }
 
     /// Returns the name as a string slice.
@@ -394,139 +561,45 @@ impl PositionName {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Position ambiguity (GPS-specific)
-// ---------------------------------------------------------------------------
-
-/// GPS position ambiguity level.
-///
-/// Each level removes one digit of precision from the transmitted
-/// position, progressively obscuring the exact location. Identical
-/// in concept to APRS position ambiguity but configured via the GPS menu.
+/// Altitude stored by a My Position record, in whole metres.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GpsPositionAmbiguity {
-    /// Full precision (approximately 60 feet).
-    Full,
-    /// 1 digit removed (approximately 1/10 mile).
-    Level1,
-    /// 2 digits removed (approximately 1 mile).
-    Level2,
-    /// 3 digits removed (approximately 10 miles).
-    Level3,
-    /// 4 digits removed (approximately 60 miles).
-    Level4,
-}
+pub struct PositionAltitudeMeters(i32);
 
-// ---------------------------------------------------------------------------
-// GPS data TX
-// ---------------------------------------------------------------------------
+impl PositionAltitudeMeters {
+    /// Minimum altitude accepted by the stock MCP schema.
+    pub const MIN: i32 = -500;
+    /// Maximum altitude accepted by the stock MCP schema.
+    pub const MAX: i32 = 15_000;
 
-/// GPS data TX configuration for D-STAR mode.
-///
-/// Controls automatic transmission of GPS position data in D-STAR DV
-/// frame headers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GpsDataTx {
-    /// Enable automatic GPS data transmission on DV mode.
-    pub auto_tx: bool,
-    /// Auto TX interval in seconds (range 1-9999).
-    pub interval_seconds: u16,
-}
-
-impl Default for GpsDataTx {
-    fn default() -> Self {
-        Self {
-            auto_tx: false,
-            interval_seconds: 60,
+    /// Creates an altitude in the radio's accepted range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::IntegerOutOfRange`] unless `meters` is in
+    /// `-500..=15000`.
+    pub const fn new(meters: i32) -> Result<Self, ValidationError> {
+        if meters >= Self::MIN && meters <= Self::MAX {
+            Ok(Self(meters))
+        } else {
+            Err(ValidationError::IntegerOutOfRange {
+                name: "My Position altitude",
+                value: meters as i64,
+                detail: "must be -500 through 15000 metres",
+            })
         }
+    }
+
+    /// Returns whole metres, identical to the signed MCP value.
+    #[must_use]
+    pub const fn as_meters(self) -> i32 {
+        self.0
     }
 }
 
-// ---------------------------------------------------------------------------
-// GPS position (parsed from NMEA)
-// ---------------------------------------------------------------------------
-
-/// Parsed GPS position from the receiver.
-///
-/// Represents the current GPS fix data as parsed from NMEA sentences
-/// (GGA, RMC, etc.). This is a read-only data type populated by the
-/// GPS receiver.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GpsPosition {
-    /// Latitude in decimal degrees (positive = North, negative = South).
-    pub latitude: f64,
-    /// Longitude in decimal degrees (positive = East, negative = West).
-    pub longitude: f64,
-    /// Altitude above mean sea level in meters.
-    pub altitude: f64,
-    /// Ground speed in km/h.
-    pub speed: f64,
-    /// Course over ground in degrees (0.0 = true north, 90.0 = east).
-    pub course: f64,
-    /// GPS fix quality.
-    pub fix: GpsFix,
-    /// Number of satellites used in the fix.
-    pub satellites: u8,
-    /// Horizontal dilution of precision (HDOP). Lower is better.
-    /// Typical values: 1.0 = excellent, 2.0 = good, 5.0 = moderate.
-    pub hdop: f64,
-    /// UTC timestamp in "`HHMMSSss`" format (hours, minutes, seconds,
-    /// hundredths), or `None` if time is not available.
-    pub timestamp: Option<String>,
-    /// UTC date in "DDMMYY" format, or `None` if date is not available.
-    pub date: Option<String>,
-    /// Maidenhead grid square locator (4 or 6 characters).
-    pub grid_square: Option<String>,
-}
-
-impl Default for GpsPosition {
-    fn default() -> Self {
-        Self {
-            latitude: 0.0,
-            longitude: 0.0,
-            altitude: 0.0,
-            speed: 0.0,
-            course: 0.0,
-            fix: GpsFix::NoFix,
-            satellites: 0,
-            hdop: 99.9,
-            timestamp: None,
-            date: None,
-            grid_square: None,
-        }
+impl From<PositionAltitudeMeters> for i32 {
+    fn from(altitude: PositionAltitudeMeters) -> Self {
+        altitude.as_meters()
     }
-}
-
-/// GPS fix quality/type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GpsFix {
-    /// No fix available.
-    NoFix,
-    /// 2D fix (latitude and longitude only, no altitude).
-    Fix2D,
-    /// 3D fix (latitude, longitude, and altitude).
-    Fix3D,
-    /// Differential GPS fix (DGPS/SBAS-corrected position).
-    DGps,
-}
-
-// ---------------------------------------------------------------------------
-// Target point
-// ---------------------------------------------------------------------------
-
-/// Navigation target point.
-///
-/// When set, the radio displays bearing and distance from the current
-/// GPS position to the target point. The firmware outputs `$GPWPL` NMEA
-/// sentences for waypoint data (handler at `0xC00D0FA0`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct TargetPoint {
-    /// Target latitude in decimal degrees (positive = North).
-    pub latitude: f64,
-    /// Target longitude in decimal degrees (positive = East).
-    pub longitude: f64,
-    /// Optional descriptive name for the target.
-    pub name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -537,23 +610,70 @@ pub struct TargetPoint {
 ///
 /// Controls how coordinates are displayed on the radio's screen.
 /// Configured in the "Units" menu section.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CoordinateFormat {
-    /// Degrees, minutes, seconds (DD MM'SS").
-    Dms,
     /// Degrees, decimal minutes (DD MM.MMM').
-    Dmm,
-    /// Decimal degrees (DD.DDDDD).
-    Dd,
+    Dmm = 0,
+    /// Degrees, minutes, seconds (DD MM'SS").
+    Dms = 1,
 }
 
-/// Grid square format for Maidenhead locator display.
+impl TryFrom<u8> for CoordinateFormat {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Dmm),
+            1 => Ok(Self::Dms),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "coordinate display format",
+                value,
+                detail: "must be 0-1",
+            }),
+        }
+    }
+}
+
+impl From<CoordinateFormat> for u8 {
+    fn from(format: CoordinateFormat) -> Self {
+        format as Self
+    }
+}
+
+/// Grid display format configured in the radio Units menu.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GridSquareFormat {
-    /// 4-character grid square (e.g. "EM85").
-    Four,
-    /// 6-character grid square (e.g. "`EM85qd`").
-    Six,
+    /// Maidenhead grid locator.
+    Maidenhead = 0,
+    /// Search-and-rescue conventional grid.
+    SarConv = 1,
+    /// Search-and-rescue cellular grid.
+    SarCell = 2,
+}
+
+impl TryFrom<u8> for GridSquareFormat {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Maidenhead),
+            1 => Ok(Self::SarConv),
+            2 => Ok(Self::SarCell),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "grid display format",
+                value,
+                detail: "must be 0-2",
+            }),
+        }
+    }
+}
+
+impl From<GridSquareFormat> for u8 {
+    fn from(format: GridSquareFormat) -> Self {
+        format as Self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -565,23 +685,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gps_config_default() {
-        let cfg = GpsConfig::default();
-        assert!(cfg.enabled);
-        assert!(!cfg.pc_output);
-        assert_eq!(cfg.operating_mode, GpsOperatingMode::Normal);
-        assert_eq!(cfg.battery_saver, GpsBatterySaver::Off);
+    fn gps_settings_model_only_the_gp_fields() {
+        let settings = GpsSettings::new(false, true);
+        assert!(!settings.enabled());
+        assert!(settings.pc_output());
+
+        let factory = GpsSettings::factory_default();
+        assert!(factory.enabled());
+        assert!(!factory.pc_output());
     }
 
     #[test]
-    fn gps_menu_enums_match_official_raw_domains() -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(GpsOperatingMode::try_from(0)?, GpsOperatingMode::Normal);
-        assert_eq!(
-            GpsOperatingMode::try_from(1)?,
-            GpsOperatingMode::GpsReceiver
-        );
-        assert!(GpsOperatingMode::try_from(2).is_err());
-
+    fn gps_battery_saver_matches_official_raw_domain() -> Result<(), Box<dyn std::error::Error>> {
         let battery_modes = [
             GpsBatterySaver::Off,
             GpsBatterySaver::OneMinute,
@@ -599,79 +714,152 @@ mod tests {
     }
 
     #[test]
-    fn nmea_sentences_default_all_enabled() {
-        let s = NmeaSentences::default();
-        assert!(s.gga);
-        assert!(s.gll);
-        assert!(s.gsa);
-        assert!(s.gsv);
-        assert!(s.rmc);
-        assert!(s.vtg);
+    fn nmea_sentences_enforce_exact_nonempty_six_bit_domain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sentences = NmeaSentences::try_from(0x15)?;
+        assert_eq!(sentences.bits(), 0x15);
+        assert!(sentences.contains(NmeaSentence::Gga));
+        assert!(!sentences.contains(NmeaSentence::Gll));
+        assert!(sentences.contains(NmeaSentence::Gsa));
+        assert!(sentences.contains(NmeaSentence::Rmc));
+        assert_eq!(u8::from(sentences), 0x15);
+
+        assert!(NmeaSentences::try_from(0).is_err());
+        assert!(NmeaSentences::try_from(0x40).is_err());
+        assert!(NmeaSentences::try_from(0x80).is_err());
+        Ok(())
     }
 
     #[test]
-    fn track_log_default_off() {
-        let tl = TrackLogConfig::default();
-        assert_eq!(tl.record_method, TrackRecordMethod::Off);
-        assert_eq!(tl.interval_seconds, 5);
-        assert_eq!(tl.distance_meters, 100);
+    fn nmea_sentence_mutation_preserves_nonempty_invariant()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let factory = NmeaSentences::factory_default();
+        assert_eq!(factory.bits(), 0x11);
+        assert!(factory.contains(NmeaSentence::Gga));
+        assert!(factory.contains(NmeaSentence::Rmc));
+        assert_eq!(NmeaSentences::all().bits(), 0x3F);
+
+        let only_rmc = factory.without(NmeaSentence::Gga)?;
+        assert_eq!(only_rmc.bits(), 0x10);
+        assert!(only_rmc.without(NmeaSentence::Rmc).is_err());
+        assert_eq!(only_rmc.with(NmeaSentence::Vtg).bits(), 0x30);
+
+        let from_wire = NmeaSentences::try_from_flags([true, false, false, false, true, false])?;
+        assert_eq!(from_wire, factory);
+        assert!(NmeaSentences::try_from_flags([false; 6]).is_err());
+        Ok(())
     }
 
     #[test]
-    fn position_memory_default() {
-        let pm = PositionMemory::default();
-        assert_eq!(pm.name.as_str(), "");
-        assert!((pm.latitude - 0.0).abs() < f64::EPSILON);
-        assert!((pm.longitude - 0.0).abs() < f64::EPSILON);
+    fn nmea_sentence_labels_are_protocol_identifiers() {
+        assert_eq!(NmeaSentence::Gga.label(), "GGA");
+        assert_eq!(NmeaSentence::Gll.label(), "GLL");
+        assert_eq!(NmeaSentence::Gsa.label(), "GSA");
+        assert_eq!(NmeaSentence::Gsv.label(), "GSV");
+        assert_eq!(NmeaSentence::Rmc.label(), "RMC");
+        assert_eq!(NmeaSentence::Vtg.label(), "VTG");
+    }
+
+    #[test]
+    fn track_log_method_and_ranges_match_menu_410_through_414()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let methods = [
+            TrackRecordMethod::Time,
+            TrackRecordMethod::Distance,
+            TrackRecordMethod::Beacon,
+        ];
+        for (raw, expected) in (0_u8..=2).zip(methods) {
+            assert_eq!(TrackRecordMethod::try_from(raw)?, expected);
+            assert_eq!(u8::from(expected), raw);
+        }
+        assert!(TrackRecordMethod::try_from(3).is_err());
+
+        assert!(TrackIntervalSeconds::new(1).is_err());
+        assert_eq!(TrackIntervalSeconds::new(2)?.as_seconds(), 2);
+        assert_eq!(TrackIntervalSeconds::new(1800)?.as_seconds(), 1800);
+        assert!(TrackIntervalSeconds::new(1801).is_err());
+
+        assert!(TrackDistanceHundredths::new(0).is_err());
+        assert_eq!(TrackDistanceHundredths::new(1)?.as_hundredths(), 1);
+        assert_eq!(TrackDistanceHundredths::new(999)?.as_hundredths(), 999);
+        assert!(TrackDistanceHundredths::new(1000).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn track_log_factory_default_is_explicit_and_valid() {
+        let track = TrackLogSettings::factory_default();
+        assert!(!track.enabled());
+        assert_eq!(track.record_method(), TrackRecordMethod::Time);
+        assert_eq!(track.interval().as_seconds(), 10);
+        assert_eq!(track.distance().as_hundredths(), 1);
     }
 
     #[test]
     fn position_name_valid() -> Result<(), Box<dyn std::error::Error>> {
-        let name = PositionName::new("Home").ok_or("valid position name rejected")?;
+        let name = PositionName::new("Home")?;
         assert_eq!(name.as_str(), "Home");
         Ok(())
     }
 
     #[test]
     fn position_name_max_length() -> Result<(), Box<dyn std::error::Error>> {
-        let name = PositionName::new("12345678").ok_or("valid 8-char name rejected")?;
+        let name = PositionName::new("12345678")?;
         assert_eq!(name.as_str(), "12345678");
         Ok(())
     }
 
     #[test]
     fn position_name_too_long() {
-        assert!(PositionName::new("123456789").is_none());
+        assert!(PositionName::new("123456789").is_err());
     }
 
     #[test]
-    fn gps_position_default_no_fix() {
-        let pos = GpsPosition::default();
-        assert_eq!(pos.fix, GpsFix::NoFix);
-        assert_eq!(pos.satellites, 0);
+    fn position_name_rejects_unsafe_storage_bytes_and_preserves_spaces()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(PositionName::new("café").is_err());
+        assert!(PositionName::new("ab\0cd").is_err());
+
+        let spaced = PositionName::new(" A B ")?;
+        assert_eq!(spaced.as_str(), " A B ");
+        Ok(())
     }
 
     #[test]
-    fn gps_data_tx_default() {
-        let dtx = GpsDataTx::default();
-        assert!(!dtx.auto_tx);
-        assert_eq!(dtx.interval_seconds, 60);
+    fn position_memory_reuses_validated_coordinates_and_altitude()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let latitude = aprs::Latitude::new(35.6762)?;
+        let longitude = aprs::Longitude::new(139.6503)?;
+        let altitude = PositionAltitudeMeters::new(40)?;
+        let memory = MyPosition::new(PositionName::new(" Tokyo ")?, latitude, longitude, altitude);
+
+        assert_eq!(memory.name().as_str(), " Tokyo ");
+        assert_eq!(memory.latitude(), latitude);
+        assert_eq!(memory.longitude(), longitude);
+        assert_eq!(memory.altitude(), altitude);
+        assert!(PositionAltitudeMeters::new(-501).is_err());
+        assert_eq!(PositionAltitudeMeters::new(-500)?.as_meters(), -500);
+        assert_eq!(PositionAltitudeMeters::new(15_000)?.as_meters(), 15_000);
+        assert!(PositionAltitudeMeters::new(15_001).is_err());
+        Ok(())
     }
 
     #[test]
-    fn gps_fix_variants() {
-        assert_ne!(GpsFix::NoFix, GpsFix::Fix2D);
-        assert_ne!(GpsFix::Fix2D, GpsFix::Fix3D);
-        assert_ne!(GpsFix::Fix3D, GpsFix::DGps);
-    }
+    fn coordinate_and_grid_formats_match_official_raw_domains()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(CoordinateFormat::try_from(0)?, CoordinateFormat::Dmm);
+        assert_eq!(CoordinateFormat::try_from(1)?, CoordinateFormat::Dms);
+        assert_eq!(u8::from(CoordinateFormat::Dmm), 0);
+        assert_eq!(u8::from(CoordinateFormat::Dms), 1);
+        assert!(CoordinateFormat::try_from(2).is_err());
 
-    #[test]
-    fn target_point_construction() {
-        let tp = TargetPoint {
-            latitude: 35.6762,
-            longitude: 139.6503,
-            name: Some("Tokyo".to_owned()),
-        };
-        assert!((tp.latitude - 35.6762).abs() < 0.0001);
+        assert_eq!(GridSquareFormat::try_from(0)?, GridSquareFormat::Maidenhead);
+        assert_eq!(GridSquareFormat::try_from(1)?, GridSquareFormat::SarConv);
+        assert_eq!(GridSquareFormat::try_from(2)?, GridSquareFormat::SarCell);
+        assert_eq!(u8::from(GridSquareFormat::Maidenhead), 0);
+        assert_eq!(u8::from(GridSquareFormat::SarConv), 1);
+        assert_eq!(u8::from(GridSquareFormat::SarCell), 2);
+        assert!(GridSquareFormat::try_from(3).is_err());
+        Ok(())
     }
 }

@@ -3,7 +3,7 @@
 
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::Band;
+use kenwood_thd75::types::{Band, RadioModel};
 
 #[tokio::test]
 #[ignore]
@@ -14,10 +14,10 @@ async fn live_identify() {
         "No TH-D75 found -- connect radio via USB"
     );
     let transport =
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
-    let mut radio = Radio::connect(transport).await.unwrap();
+        SerialTransport::open(&ports[0].port_name).unwrap();
+    let mut radio = Radio::new(transport);
     let info = radio.identify().await.unwrap();
-    assert!(info.model.contains("TH-D75"));
+    assert_eq!(info.model, RadioModel::ThD75);
     println!("Radio identified: {}", info.model);
     radio.disconnect().await.unwrap();
 }
@@ -27,10 +27,9 @@ async fn live_identify() {
 async fn live_firmware_version() {
     let ports = SerialTransport::discover_usb().unwrap();
     let transport =
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
-    let mut radio = Radio::connect(transport).await.unwrap();
+        SerialTransport::open(&ports[0].port_name).unwrap();
+    let mut radio = Radio::new(transport);
     let version = radio.get_firmware_version().await.unwrap();
-    assert!(!version.is_empty());
     println!("Firmware: {version}");
     radio.disconnect().await.unwrap();
 }
@@ -40,10 +39,10 @@ async fn live_firmware_version() {
 async fn live_read_frequency() {
     let ports = SerialTransport::discover_usb().unwrap();
     let transport =
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
-    let mut radio = Radio::connect(transport).await.unwrap();
+        SerialTransport::open(&ports[0].port_name).unwrap();
+    let mut radio = Radio::new(transport);
     let ch = radio.get_frequency_full(Band::A).await.unwrap();
-    println!("Band A: {} MHz", ch.rx_frequency.as_mhz());
+    println!("Band A: {} MHz", ch.receive_frequency.as_mhz());
     radio.disconnect().await.unwrap();
 }
 
@@ -61,8 +60,8 @@ async fn live_read_channel_names() {
         "No TH-D75 found -- connect radio via USB"
     );
     let transport =
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
-    let mut radio = Radio::connect(transport).await.unwrap();
+        SerialTransport::open(&ports[0].port_name).unwrap();
+    let mut radio = Radio::new(transport);
 
     let names = radio.read_channel_names().await.unwrap();
 
@@ -73,8 +72,7 @@ async fn live_read_channel_names() {
         }
     }
 
-    // Note: The USB connection does not survive the programming mode
-    // transition. The radio's USB stack resets when exiting MCP mode.
-    // A fresh connection is needed for subsequent CAT commands.
+    // The helper waited for the USB reset, reopened the transport, and proved
+    // CAT identity before returning, so this controller remains usable.
     let _ = radio.disconnect().await;
 }

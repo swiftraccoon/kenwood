@@ -31,6 +31,7 @@ use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -44,6 +45,10 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 type BoxErr = Box<dyn std::error::Error>;
 
 const SPEC_ENV: &str = "THD75_KI4LAX_SPEC";
+
+/// Protocol transitions owned by dedicated state machines rather than the
+/// generic CAT command API.
+const SPECIALIZED_MNEMONICS: &[&str] = &["0M"];
 
 /// Require an explicit path for an external-spec audit run.
 fn require_spec_path(path: Option<&std::ffi::OsStr>) -> Result<&std::ffi::OsStr, BoxErr> {
@@ -111,14 +116,14 @@ fn our_mnemonics() -> Result<Vec<&'static str>, BoxErr> {
         command_name(&Command::GetRadioId),                     // ID
         command_name(&Command::GetPowerLevel { band: Band::A }), // PC
         command_name(&Command::GetBand),                        // BC
-        command_name(&Command::GetVfoMemoryMode { band: Band::A }), // VM
+        command_name(&Command::GetTuningMode { band: Band::A }), // VM
         command_name(&Command::GetFmRadio),                     // FR
         command_name(&Command::GetAfGain),                      // AG
         command_name(&Command::GetSquelch { band: Band::A }),   // SQ
         command_name(&Command::GetSmeter { band: Band::A }),    // SM
-        command_name(&Command::GetMode { band: Band::A }),      // MD
+        command_name(&Command::GetOperatingMode { band: Band::A }), // MD
         command_name(&Command::GetFineStep),                    // FS
-        command_name(&Command::GetFunctionType),                // FT
+        command_name(&Command::GetFineTune),                    // FT
         command_name(&Command::GetFilterWidth {
             mode: FilterMode::Ssb,
         }), // SH
@@ -127,38 +132,34 @@ fn our_mnemonics() -> Result<Vec<&'static str>, BoxErr> {
         command_name(&Command::GetAttenuator { band: Band::A }), // RA
         command_name(&Command::SetAutoInfo { enabled: true }),  // AI
         command_name(&Command::GetBusy { band: Band::A }),      // BY
-        command_name(&Command::GetDualBand),                    // DL
+        command_name(&Command::GetBandMode),                    // DL
         command_name(&Command::Receive),                        // RX
         command_name(&Command::Transmit),                       // TX
         command_name(&Command::GetBacklightControl),            // LC
-        command_name(&Command::GetIoPort),                      // IO
+        command_name(&Command::GetUsbAudioOutput),              // IO
         command_name(&Command::GetBatteryLevel),                // BL
         command_name(&Command::GetVoxDelay),                    // VD
         command_name(&Command::GetVoxGain),                     // VG
         command_name(&Command::GetVox),                         // VX
         command_name(&Command::GetCurrentChannel { band: Band::A }), // MR
         command_name(&Command::GetMemoryChannel {
-            selector: MemorySelector::channel(0)?,
+            selector: RegularChannel::new(0)?.into(),
         }), // ME
-        command_name(&Command::EnterProgrammingMode),           // 0M
         command_name(&Command::GetTncMode),                     // TN
         command_name(&Command::GetDstarCallsign {
             slot: DstarSlot::new(1)?,
         }), // DC
         command_name(&Command::GetRealTimeClock),               // RT
-        command_name(&Command::SetScanResume {
-            mode: ScanResumeMethod::TimeOperated,
-        }), // SR
         command_name(&Command::GetStepSize { band: Band::A }),  // SF
-        command_name(&Command::GetBarAntenna),                  // BS
-        command_name(&Command::GetTncBaud),                     // AS
+        command_name(&Command::GetAntennaInput),                // BS
+        command_name(&Command::GetPacketDataRate),              // AS
         command_name(&Command::GetSerialInfo),                  // AE
-        command_name(&Command::GetBeaconType),                  // PT
+        command_name(&Command::GetBeaconMode),                  // PT
         command_name(&Command::GetMyPositionSelection),         // MS
         command_name(&Command::GetAprsCallsign),                // CS
         command_name(&Command::GetDstarSlot),                   // DS
         command_name(&Command::GetGateway),                     // GW
-        command_name(&Command::GetGpsConfig),                   // GP
+        command_name(&Command::GetGpsSettings),                 // GP
         command_name(&Command::GetGpsMode),                     // GM
         command_name(&Command::GetGpsSentences),                // GS
         command_name(&Command::GetBluetooth),                   // BT
@@ -183,14 +184,15 @@ fn all_spec_mnemonics_implemented() -> TestResult {
 
     let mut missing = Vec::new();
     for mnemonic in commands.keys() {
-        if !ours.contains(&mnemonic.as_str()) {
+        if !ours.contains(&mnemonic.as_str()) && !SPECIALIZED_MNEMONICS.contains(&mnemonic.as_str())
+        {
             missing.push(mnemonic.clone());
         }
     }
 
-    // FS/SF mnemonic discrepancy resolved via firmware RE:
+    // The established TH-D75 contracts resolve the FS/SF naming discrepancy:
     // SF = Step Size (band-indexed, 0-11), FS = Fine Step (bare read, 0-3).
-    // Our code now matches the firmware dispatch table exactly.
+    // the implementation preserves those distinct domains.
     let documented_conflicts: &[&str] = &[];
     let real_missing: Vec<&String> = missing
         .iter()
@@ -209,10 +211,7 @@ fn all_spec_mnemonics_implemented() -> TestResult {
 fn all_our_mnemonics_are_valid() -> TestResult {
     // Verify every entry in our_mnemonics() is a real 2-char string
     for m in our_mnemonics()? {
-        assert!(
-            m.len() == 2 || m == "0M" || m == "0E",
-            "Invalid mnemonic: {m:?}"
-        );
+        assert_eq!(m.len(), 2, "Invalid mnemonic: {m:?}");
     }
     Ok(())
 }
@@ -236,18 +235,17 @@ fn document_commands_beyond_spec() -> TestResult {
         .filter(|m| !commands.contains_key(**m))
         .collect();
 
-    // These are commands we implement from firmware RE that KI4LAX
-    // didn't document. This list must be kept up to date: any NEW
+    // These established commands are absent from the external fixture. This
+    // list must be kept up to date: any NEW
     // undocumented command added should be reviewed.
     let expected_extra = vec![
         "PS", // Power status
         "VD", // VOX delay
         "VG", // VOX gain
         "VX", // VOX enable
-        "0M", // MCP programming mode
         "DC", // D-STAR callsign
         "BS", // MW/SW bar antenna selection
-        "PT", // Beacon type
+        "PT", // Beacon mode
         "DS", // D-STAR slot
         "GM", // GPS mode
         "GS", // GPS sentences
@@ -265,12 +263,12 @@ fn document_commands_beyond_spec() -> TestResult {
 }
 
 // ============================================================================
-// Mode table: TABLE D values must match our Mode enum
+// Mode table: TABLE D values must match our OperatingMode enum
 // ============================================================================
 
 #[test]
 #[ignore = "requires the external fixture configured by THD75_KI4LAX_SPEC"]
-fn mode_table_matches_spec() -> TestResult {
+fn operating_mode_table_matches_spec() -> TestResult {
     let spec = load_spec()?;
     let table_d = spec
         .get("tables")
@@ -284,26 +282,29 @@ fn mode_table_matches_spec() -> TestResult {
         let expected_name = name_val
             .as_str()
             .ok_or_else(|| format!("TABLE_D[{index_str}] is not a string"))?;
-        let mode = Mode::try_from(index)
-            .map_err(|_| format!("Mode index {index} from spec is invalid in our code"))?;
+        let mode = OperatingMode::try_from(index)
+            .map_err(|_| format!("OperatingMode index {index} from spec is invalid in our code"))?;
         assert_eq!(
             mode.to_string(),
             expected_name,
-            "Mode {index}: spec says {expected_name}, we say {mode}"
+            "OperatingMode {index}: spec says {expected_name}, we say {mode}"
         );
     }
 
-    // Modes 8 (WFM) and 9 (CW-R) are NOT in the KI4LAX spec but
-    // confirmed via ARFC-D75 decompilation. Mode 10 should be invalid.
+    // Modes 8 (WFM) and 9 (CW-R) are established TH-D75 values that are not
+    // present in the external fixture. Mode 10 is outside the domain.
     assert!(
-        Mode::try_from(8).is_ok(),
-        "Mode 8 (WFM) confirmed by ARFC RE"
+        OperatingMode::try_from(8).is_ok(),
+        "Mode 8 (WFM) must remain accepted"
     );
     assert!(
-        Mode::try_from(9).is_ok(),
-        "Mode 9 (CW-R) confirmed by ARFC RE"
+        OperatingMode::try_from(9).is_ok(),
+        "Mode 9 (CW-R) must remain accepted"
     );
-    assert!(Mode::try_from(10).is_err(), "Mode 10 should be invalid");
+    assert!(
+        OperatingMode::try_from(10).is_err(),
+        "Mode 10 should be invalid"
+    );
     Ok(())
 }
 
@@ -363,10 +364,11 @@ fn tone_table_matches_spec() -> TestResult {
         );
     }
 
-    // Index 50 = 1750 Hz tone burst (not in KI4LAX spec, confirmed by ARFC RE)
+    // Index 50 is the established 1750 Hz tone-burst selection, which is not
+    // present in the external fixture.
     assert!(
         ToneCode::new(50).is_ok(),
-        "Tone code 50 (1750 Hz burst) confirmed by ARFC RE"
+        "Tone code 50 (1750 Hz burst) must remain accepted"
     );
     // Index 51 should be invalid
     assert!(ToneCode::new(51).is_err(), "Tone code 51 should be invalid");
@@ -453,7 +455,7 @@ fn sq_range_matches_spec() -> TestResult {
 #[test]
 fn ag_write_is_3_digit_per_spec() -> TestResult {
     let bytes = protocol::serialize(&Command::SetAfGain {
-        level: AfGainLevel::new(15),
+        level: AfGainLevel::new(15)?,
     });
     let wire = String::from_utf8(bytes)?;
     let payload = wire

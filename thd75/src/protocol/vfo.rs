@@ -7,12 +7,13 @@
 use crate::error::ProtocolError;
 use crate::types::Band;
 use crate::types::channel::FineStep;
-use crate::types::mode::Mode;
+use crate::types::mode::OperatingMode;
 use crate::types::radio_params::{
     AfGainLevel, FilterMode, FilterWidthIndex, SMeterReading, SquelchLevel,
 };
 
 use super::Response;
+use super::fields::{boolean, decimal_u8, fixed_decimal_u8, split_exact};
 
 /// Parse a VFO command response from mnemonic and payload.
 ///
@@ -31,42 +32,10 @@ pub(crate) fn parse_vfo(mnemonic: &str, payload: &str) -> Option<Result<Response
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Parse a `u8` from a string field.
-fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> {
-    s.parse::<u8>().map_err(|_| ProtocolError::FieldParse {
-        command: cmd.to_owned(),
-        field: field.to_owned(),
-        detail: format!("invalid u8: {s:?}"),
-    })
-}
-
-/// Parse a protocol Boolean, accepting exactly `0` or `1`.
-fn parse_bool_field(s: &str, cmd: &str, field: &str) -> Result<bool, ProtocolError> {
-    match s {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => Err(ProtocolError::FieldParse {
-            command: cmd.to_owned(),
-            field: field.to_owned(),
-            detail: format!("expected 0 or 1, got {s:?}"),
-        }),
-    }
-}
-
 /// Split a `"band,value"` payload into (band, `value_str`).
 fn split_band_value<'a>(payload: &'a str, cmd: &str) -> Result<(Band, &'a str), ProtocolError> {
-    let (band_str, value) = payload
-        .split_once(',')
-        .ok_or_else(|| ProtocolError::FieldParse {
-            command: cmd.to_owned(),
-            field: "all".to_owned(),
-            detail: format!("expected band,value, got {payload:?}"),
-        })?;
-    let band_val = parse_u8_field(band_str, cmd, "band")?;
+    let [band_str, value] = split_exact::<2>(payload, cmd)?;
+    let band_val = decimal_u8(band_str, cmd, "band")?;
     let band = Band::try_from(band_val).map_err(|e| ProtocolError::FieldParse {
         command: cmd.to_owned(),
         field: "band".to_owned(),
@@ -84,7 +53,7 @@ fn split_band_value<'a>(payload: &'a str, cmd: &str) -> Result<(Band, &'a str), 
 /// Hardware observation: bare `AG\r` returns a global gain level (e.g., `091`).
 /// Band-indexed `AG 0\r` returns `?`.
 fn parse_ag(payload: &str) -> Result<Response, ProtocolError> {
-    let raw = parse_u8_field(payload.trim(), "AG", "level")?;
+    let raw = fixed_decimal_u8::<3>(payload, "AG", "level")?;
     let level = AfGainLevel::try_from(raw).map_err(|error| ProtocolError::FieldParse {
         command: "AG".to_owned(),
         field: "level".to_owned(),
@@ -93,10 +62,20 @@ fn parse_ag(payload: &str) -> Result<Response, ProtocolError> {
     Ok(Response::AfGain { level })
 }
 
-/// Parse SQ (squelch): "band,ll" (zero-padded 2 digits).
+/// Parse SQ (squelch): `band,level`.
+///
+/// Hardware returns both the canonical unpadded form (`3`) and the older
+/// two-digit form (`03`). Longer spellings are not part of the wire grammar.
 fn parse_sq(payload: &str) -> Result<Response, ProtocolError> {
     let (band, val_str) = split_band_value(payload, "SQ")?;
-    let raw = parse_u8_field(val_str, "SQ", "level")?;
+    if !(1..=2).contains(&val_str.len()) {
+        return Err(ProtocolError::FieldParse {
+            command: "SQ".to_owned(),
+            field: "level".to_owned(),
+            detail: format!("expected one or two decimal digits, got {val_str:?}"),
+        });
+    }
+    let raw = decimal_u8(val_str, "SQ", "level")?;
     let level = SquelchLevel::try_from(raw).map_err(|e| ProtocolError::FieldParse {
         command: "SQ".to_owned(),
         field: "level".to_owned(),
@@ -108,7 +87,7 @@ fn parse_sq(payload: &str) -> Result<Response, ProtocolError> {
 /// Parse SM (S-meter): "band,level" (hardware may return 1-4 digits).
 fn parse_sm(payload: &str) -> Result<Response, ProtocolError> {
     let (band, val_str) = split_band_value(payload, "SM")?;
-    let raw = parse_u8_field(val_str, "SM", "level")?;
+    let raw = decimal_u8(val_str, "SM", "level")?;
     let level = SMeterReading::try_from(raw).map_err(|e| ProtocolError::FieldParse {
         command: "SM".to_owned(),
         field: "level".to_owned(),
@@ -120,13 +99,13 @@ fn parse_sm(payload: &str) -> Result<Response, ProtocolError> {
 /// Parse MD (mode): "band,mode".
 fn parse_md(payload: &str) -> Result<Response, ProtocolError> {
     let (band, val_str) = split_band_value(payload, "MD")?;
-    let mode_val = parse_u8_field(val_str, "MD", "mode")?;
-    let mode = Mode::try_from(mode_val).map_err(|e| ProtocolError::FieldParse {
+    let mode_val = decimal_u8(val_str, "MD", "mode")?;
+    let mode = OperatingMode::try_from(mode_val).map_err(|e| ProtocolError::FieldParse {
         command: "MD".to_owned(),
         field: "mode".to_owned(),
         detail: e.to_string(),
     })?;
-    Ok(Response::Mode { band, mode })
+    Ok(Response::OperatingMode { band, mode })
 }
 
 /// Parse FS (fine step): bare `"value"` format (no band).
@@ -134,7 +113,7 @@ fn parse_md(payload: &str) -> Result<Response, ProtocolError> {
 /// Firmware-verified: bare `FS\r` returns `FS value` (single value, no comma).
 /// Value is a fine step index 0-3.
 fn parse_fs(payload: &str) -> Result<Response, ProtocolError> {
-    let step_val = parse_u8_field(payload.trim(), "FS", "step")?;
+    let step_val = fixed_decimal_u8::<1>(payload, "FS", "step")?;
     let step = FineStep::try_from(step_val).map_err(|e| ProtocolError::FieldParse {
         command: "FS".to_owned(),
         field: "step".to_owned(),
@@ -143,52 +122,37 @@ fn parse_fs(payload: &str) -> Result<Response, ProtocolError> {
     Ok(Response::FineStep { step })
 }
 
-/// Parse FT (function type): bare data (no band).
+/// Parse FT (Fine Tune state): bare data (no band).
 ///
 /// Response to `FT\r` is exactly one Boolean digit with no band prefix.
 fn parse_ft(payload: &str) -> Result<Response, ProtocolError> {
-    let enabled = parse_bool_field(payload, "FT", "value")?;
-    Ok(Response::FunctionType { enabled })
+    let enabled = boolean(payload, "FT", "value")?;
+    Ok(Response::FineTune { enabled })
 }
 
 /// Parse SH (filter width): `mode_index,width`.
 ///
 /// The response to `SH N\r` includes the mode index and filter width.
 fn parse_sh(payload: &str) -> Result<Response, ProtocolError> {
-    if let Some((mode_str, width_str)) = payload.split_once(',') {
-        let mode_raw = parse_u8_field(mode_str, "SH", "mode")?;
-        let mode = FilterMode::try_from(mode_raw).map_err(|e| ProtocolError::FieldParse {
-            command: "SH".to_owned(),
-            field: "mode".to_owned(),
-            detail: e.to_string(),
-        })?;
-        let width_raw = parse_u8_field(width_str, "SH", "width")?;
-        let width =
-            FilterWidthIndex::from_raw(width_raw).map_err(|e| ProtocolError::FieldParse {
-                command: "SH".into(),
-                field: "width".into(),
-                detail: e.to_string(),
-            })?;
-        Ok(Response::FilterWidth { mode, width })
-    } else {
-        // Bare response - treat payload as width with mode SSB
-        let width_raw = parse_u8_field(payload, "SH", "width")?;
-        let width =
-            FilterWidthIndex::from_raw(width_raw).map_err(|e| ProtocolError::FieldParse {
-                command: "SH".into(),
-                field: "width".into(),
-                detail: e.to_string(),
-            })?;
-        Ok(Response::FilterWidth {
-            mode: FilterMode::Ssb,
-            width,
-        })
-    }
+    let [mode_str, width_str] = split_exact::<2>(payload, "SH")?;
+    let mode_raw = decimal_u8(mode_str, "SH", "mode")?;
+    let mode = FilterMode::try_from(mode_raw).map_err(|e| ProtocolError::FieldParse {
+        command: "SH".to_owned(),
+        field: "mode".to_owned(),
+        detail: e.to_string(),
+    })?;
+    let width_raw = decimal_u8(width_str, "SH", "width")?;
+    let width = FilterWidthIndex::new(mode, width_raw).map_err(|e| ProtocolError::FieldParse {
+        command: "SH".into(),
+        field: "width".into(),
+        detail: e.to_string(),
+    })?;
+    Ok(Response::FilterWidth { width })
 }
 
 /// Parse RA (attenuator): "band,enabled".
 fn parse_ra(payload: &str) -> Result<Response, ProtocolError> {
     let (band, val_str) = split_band_value(payload, "RA")?;
-    let enabled = parse_bool_field(val_str, "RA", "enabled")?;
+    let enabled = boolean(val_str, "RA", "enabled")?;
     Ok(Response::Attenuator { band, enabled })
 }

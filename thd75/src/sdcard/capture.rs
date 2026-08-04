@@ -20,20 +20,24 @@
 
 use super::{SdCardError, read_u16_le, read_u32_le};
 
-/// Expected screen width in pixels.
-const EXPECTED_WIDTH: u32 = 240;
+/// TH-D75 screen width in pixels.
+pub const SCREEN_CAPTURE_WIDTH: u32 = 240;
 
-/// Expected screen height in pixels.
-const EXPECTED_HEIGHT: u32 = 180;
+/// TH-D75 screen height in pixels.
+pub const SCREEN_CAPTURE_HEIGHT: u32 = 180;
 
-/// Expected bits per pixel.
-const EXPECTED_BPP: u16 = 24;
+/// Bit depth of a TH-D75 screen capture.
+pub const SCREEN_CAPTURE_BITS_PER_PIXEL: u16 = 24;
 
 /// Expected number of color planes.
 const EXPECTED_PLANES: u16 = 1;
 
 /// Bytes per canonical RGB pixel.
 const RGB_BYTES_PER_PIXEL: usize = 3;
+
+/// Exact number of bytes in the canonical top-down RGB888 pixel buffer.
+pub const SCREEN_CAPTURE_RGB_BYTE_LEN: usize =
+    SCREEN_CAPTURE_WIDTH as usize * SCREEN_CAPTURE_HEIGHT as usize * RGB_BYTES_PER_PIXEL;
 
 /// BMP file header size (14 bytes).
 const BMP_HEADER_SIZE: usize = 14;
@@ -49,30 +53,61 @@ const BI_RGB: u32 = 0;
 
 /// A parsed TH-D75 screen capture.
 ///
-/// Contains validated image metadata and canonical RGB pixel data.
+/// The dimensions, bit depth, and pixel-buffer length are invariants of this
+/// type. A value can only be obtained by parsing a structurally valid TH-D75
+/// BMP capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenCapture {
-    /// Image width in pixels. Expected: 240 for TH-D75.
-    pub width: u32,
-    /// Image height in pixels. Expected: 180 for TH-D75.
-    pub height: u32,
-    /// Bits per pixel. Expected: 24 for TH-D75.
-    pub bits_per_pixel: u16,
-    /// RGB pixel data in top-down row order.
+    pixels: Box<[u8; SCREEN_CAPTURE_RGB_BYTE_LEN]>,
+}
+
+impl ScreenCapture {
+    /// Return the fixed TH-D75 screen width in pixels.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        SCREEN_CAPTURE_WIDTH
+    }
+
+    /// Return the fixed TH-D75 screen height in pixels.
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        SCREEN_CAPTURE_HEIGHT
+    }
+
+    /// Return the fixed TH-D75 screen bit depth.
+    #[must_use]
+    pub const fn bits_per_pixel(&self) -> u16 {
+        SCREEN_CAPTURE_BITS_PER_PIXEL
+    }
+
+    /// Borrow the exact-size RGB888 pixel buffer in top-down row order.
     ///
-    /// Each pixel is three bytes: red, green, blue. Row zero is the top
-    /// display row. BMP row padding is stripped.
-    pub pixels: Vec<u8>,
+    /// Each pixel is three bytes in red, green, blue order. Row zero is the
+    /// top display row. BMP row padding is not present.
+    #[must_use]
+    pub fn rgb888(&self) -> &[u8; SCREEN_CAPTURE_RGB_BYTE_LEN] {
+        &self.pixels
+    }
+
+    /// Consume the capture and return its exact-size RGB888 pixel buffer.
+    #[must_use]
+    pub fn into_rgb888(self) -> Box<[u8; SCREEN_CAPTURE_RGB_BYTE_LEN]> {
+        self.pixels
+    }
 }
 
 /// Read a little-endian `i32` from a byte slice at the given offset.
 ///
-/// Returns `0` if the slice is too short; the caller is expected to have
-/// validated the buffer length before calling.
-fn read_i32_le(data: &[u8], offset: usize) -> i32 {
-    data.get(offset..offset + 4)
-        .and_then(|s| <[u8; 4]>::try_from(s).ok())
-        .map_or(0, i32::from_le_bytes)
+/// Returns [`SdCardError::FileTooSmall`] if the field is truncated.
+fn read_i32_le(data: &[u8], offset: usize) -> Result<i32, SdCardError> {
+    Ok(i32::from_le_bytes(
+        data.get(offset..offset.saturating_add(4))
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .ok_or_else(|| SdCardError::FileTooSmall {
+                expected: offset.saturating_add(4),
+                actual: data.len(),
+            })?,
+    ))
 }
 
 /// Parse a BMP screen capture file from raw bytes.
@@ -96,14 +131,17 @@ pub fn parse(data: &[u8]) -> Result<ScreenCapture, SdCardError> {
     let file_header = parse_file_header(data)?;
     let dib_header = parse_dib_header(data)?;
     let layout = validate_pixel_layout(data, file_header, dib_header)?;
-    let pixels = decode_pixels(data, file_header, dib_header, layout)?;
+    let pixels = decode_pixels(data, file_header, dib_header, layout)?
+        .into_boxed_slice()
+        .try_into()
+        .map_err(|pixels: Box<[u8]>| {
+            invalid_bmp(format!(
+                "decoded RGB buffer has {} bytes (expected {SCREEN_CAPTURE_RGB_BYTE_LEN})",
+                pixels.len()
+            ))
+        })?;
 
-    Ok(ScreenCapture {
-        width: dib_header.width,
-        height: dib_header.height,
-        bits_per_pixel: dib_header.bits_per_pixel,
-        pixels,
-    })
+    Ok(ScreenCapture { pixels })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,7 +155,6 @@ struct DibHeader {
     width: u32,
     height: u32,
     raw_height: i32,
-    bits_per_pixel: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,24 +188,24 @@ fn parse_file_header(data: &[u8]) -> Result<FileHeader, SdCardError> {
         return Err(invalid_bmp("missing BM magic bytes"));
     }
 
-    let declared_file_size = usize_header_field(read_u32_le(data, 2), "declared file size")?;
+    let declared_file_size = usize_header_field(read_u32_le(data, 2)?, "declared file size")?;
     if declared_file_size != data.len() {
         return Err(invalid_bmp(format!(
             "declared file size {declared_file_size} does not match actual size {}",
             data.len()
         )));
     }
-    let reserved_1 = read_u16_le(data, 6);
-    let reserved_2 = read_u16_le(data, 8);
+    let reserved_1 = read_u16_le(data, 6)?;
+    let reserved_2 = read_u16_le(data, 8)?;
     if reserved_1 != 0 || reserved_2 != 0 {
         return Err(invalid_bmp(format!(
             "reserved file-header fields must be zero (got {reserved_1}, {reserved_2})"
         )));
     }
 
-    let pixel_offset = usize_header_field(read_u32_le(data, 10), "pixel offset")?;
+    let pixel_offset = usize_header_field(read_u32_le(data, 10)?, "pixel offset")?;
 
-    let dib_size = read_u32_le(data, 14);
+    let dib_size = read_u32_le(data, 14)?;
     if dib_size < MIN_DIB_HEADER_SIZE {
         return Err(invalid_bmp(format!(
             "DIB header size {dib_size} too small (minimum {MIN_DIB_HEADER_SIZE})"
@@ -199,8 +236,8 @@ fn parse_file_header(data: &[u8]) -> Result<FileHeader, SdCardError> {
 fn parse_dib_header(data: &[u8]) -> Result<DibHeader, SdCardError> {
     // A positive height stores BMP rows bottom-up; a negative height stores
     // them top-down. The returned pixels are top-down in both cases.
-    let raw_width = read_i32_le(data, 18);
-    let raw_height = read_i32_le(data, 22);
+    let raw_width = read_i32_le(data, 18)?;
+    let raw_height = read_i32_le(data, 22)?;
 
     let Ok(width) = u32::try_from(raw_width) else {
         return Err(invalid_bmp(format!("invalid width {raw_width}")));
@@ -219,22 +256,25 @@ fn parse_dib_header(data: &[u8]) -> Result<DibHeader, SdCardError> {
     }
     let height = raw_height.unsigned_abs();
 
-    let planes = read_u16_le(data, 26);
+    let planes = read_u16_le(data, 26)?;
     if planes != EXPECTED_PLANES {
         return Err(invalid_bmp(format!(
             "invalid color plane count {planes} (expected {EXPECTED_PLANES})"
         )));
     }
 
-    let bits_per_pixel = read_u16_le(data, 28);
-    let compression = read_u32_le(data, 30);
+    let bits_per_pixel = read_u16_le(data, 28)?;
+    let compression = read_u32_le(data, 30)?;
     if compression != BI_RGB {
         return Err(invalid_bmp(format!(
             "unsupported compression type {compression} (expected 0 for BI_RGB)"
         )));
     }
 
-    if width != EXPECTED_WIDTH || height != EXPECTED_HEIGHT || bits_per_pixel != EXPECTED_BPP {
+    if width != SCREEN_CAPTURE_WIDTH
+        || height != SCREEN_CAPTURE_HEIGHT
+        || bits_per_pixel != SCREEN_CAPTURE_BITS_PER_PIXEL
+    {
         return Err(SdCardError::UnexpectedImageFormat {
             width,
             height,
@@ -246,7 +286,6 @@ fn parse_dib_header(data: &[u8]) -> Result<DibHeader, SdCardError> {
         width,
         height,
         raw_height,
-        bits_per_pixel,
     })
 }
 
@@ -270,7 +309,7 @@ fn validate_pixel_layout(
         .checked_mul(height)
         .ok_or_else(|| invalid_bmp("pixel data size overflows address space"))?;
 
-    let declared_image_size = usize_header_field(read_u32_le(data, 34), "declared image size")?;
+    let declared_image_size = usize_header_field(read_u32_le(data, 34)?, "declared image size")?;
     if declared_image_size != pixel_data_size {
         return Err(invalid_bmp(format!(
             "declared image size {declared_image_size} does not match computed size \
@@ -438,7 +477,7 @@ mod tests {
     }
 
     fn pixel_at(pixels: &[u8], row: usize, column: usize) -> Result<[u8; 3], BoxErr> {
-        let offset = (row * EXPECTED_WIDTH as usize + column) * RGB_BYTES_PER_PIXEL;
+        let offset = (row * SCREEN_CAPTURE_WIDTH as usize + column) * RGB_BYTES_PER_PIXEL;
         let end = offset + RGB_BYTES_PER_PIXEL;
         let pixel = pixels.get(offset..end).ok_or_else(|| {
             format!(
@@ -471,11 +510,11 @@ mod tests {
         let bmp = build_bmp(240, 180, 24);
         let cap = parse(&bmp)?;
 
-        assert_eq!(cap.width, 240);
-        assert_eq!(cap.height, 180);
-        assert_eq!(cap.bits_per_pixel, 24);
+        assert_eq!(cap.width(), 240);
+        assert_eq!(cap.height(), 180);
+        assert_eq!(cap.bits_per_pixel(), 24);
         // 240 * 180 * 3 = 129600 canonical RGB bytes.
-        assert_eq!(cap.pixels.len(), 240 * 180 * 3);
+        assert_eq!(cap.rgb888().len(), SCREEN_CAPTURE_RGB_BYTE_LEN);
         Ok(())
     }
 
@@ -485,10 +524,10 @@ mod tests {
         let top_down = parse(&build_bmp(240, -180, 24))?;
 
         assert_eq!(bottom_up, top_down);
-        assert_eq!(pixel_at(&bottom_up.pixels, 0, 0)?, expected_rgb(0, 0));
-        assert_eq!(pixel_at(&bottom_up.pixels, 5, 7)?, expected_rgb(5, 7));
+        assert_eq!(pixel_at(bottom_up.rgb888(), 0, 0)?, expected_rgb(0, 0));
+        assert_eq!(pixel_at(bottom_up.rgb888(), 5, 7)?, expected_rgb(5, 7));
         assert_eq!(
-            pixel_at(&bottom_up.pixels, 179, 239)?,
+            pixel_at(bottom_up.rgb888(), 179, 239)?,
             expected_rgb(179, 239)
         );
         Ok(())

@@ -3,6 +3,9 @@
 /// Exact firmware identity whose automation ABI repurposes bare `GM` and `GW`.
 pub(crate) const AZIMUTH_AUTOMATION_FIRMWARE: &str = "1.03.AZM";
 
+/// Exact stock identities whose bare `GM` and `GW` meanings are established.
+pub(crate) const STOCK_FIRMWARE_IDENTITIES: [&str; 2] = ["1.03", "1.03.000"];
+
 /// Extract an exact firmware version from one CAT `FV` response frame.
 ///
 /// A valid frame is `FV ` followed by one non-empty token. Whitespace or an
@@ -19,18 +22,21 @@ pub(crate) fn parse_fv_frame(frame: &str) -> Option<&str> {
 
 /// Authorize one stock bare `GM`/`GW` probe only after exact FV discovery.
 ///
-/// Near matches deliberately retain stock behavior. An exact automation
-/// identity or an undetermined identity produces a diagnostic suitable for
-/// printing directly by a probe.
+/// Only exact established stock identities are accepted. An automation,
+/// unknown, future, or undetermined identity produces a diagnostic suitable
+/// for printing directly by a probe.
 pub(crate) fn require_stock_bare_probe(
     mnemonic: &str,
     firmware_version: Option<&str>,
 ) -> Result<(), String> {
     match firmware_version {
+        Some(version) if STOCK_FIRMWARE_IDENTITIES.contains(&version) => Ok(()),
         Some(AZIMUTH_AUTOMATION_FIRMWARE) => Err(format!(
             "SKIPPED stock bare {mnemonic}: FV {AZIMUTH_AUTOMATION_FIRMWARE} repurposes {mnemonic} for the Azimuth automation ABI"
         )),
-        Some(_) => Ok(()),
+        Some(version) => Err(format!(
+            "REFUSED stock bare {mnemonic}: FV {version} is not an established stock identity"
+        )),
         None => Err(format!(
             "REFUSED stock bare {mnemonic}: exact FV could not be determined"
         )),
@@ -48,11 +54,17 @@ mod tests {
     }
 
     #[test]
-    fn near_matches_retain_stock_behavior() {
-        for version in ["1.03", "1.03.AZM2", "1.03.azm", "V1.03.AZM"] {
+    fn only_exact_stock_identities_are_authorized() {
+        for version in STOCK_FIRMWARE_IDENTITIES {
             assert!(
                 require_stock_bare_probe("GM", Some(version)).is_ok(),
-                "near match {version:?} must retain stock behavior"
+                "established stock identity {version:?} must be authorized"
+            );
+        }
+        for version in ["1.03.AZM2", "1.03.azm", "V1.03.AZM", "1.04"] {
+            assert!(
+                require_stock_bare_probe("GM", Some(version)).is_err(),
+                "unknown identity {version:?} must fail closed"
             );
         }
     }

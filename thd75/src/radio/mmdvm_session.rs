@@ -8,7 +8,7 @@
 //!
 //! # Design notes
 //!
-//! The session holds an [`mmdvm::AsyncModem`] that owns the transport via a
+//! The session holds an [`::mmdvm::AsyncModem`] that owns the transport via a
 //! [`MmdvmTransportAdapter`]. All MMDVM framing, periodic status polling,
 //! TX-queue slot gating, and RX frame dispatch happen inside the
 //! `AsyncModem`'s spawned task; the session itself is just a thin
@@ -17,7 +17,7 @@
 //!
 //! Higher-level D-STAR operation (slow-data decode, last-heard list,
 //! URCALL parsing, echo recording, etc.) lives in
-//! [`crate::mmdvm::DStarGateway`], which owns an [`MmdvmSession`] and
+//! [`crate::dstar_gateway::DstarGateway`], which owns an [`MmdvmSession`] and
 //! delegates raw frame I/O to it.
 //!
 //! # Example
@@ -25,58 +25,42 @@
 //! ```rust,no_run
 //! # use kenwood_thd75::radio::Radio;
 //! # use kenwood_thd75::transport::SerialTransport;
-//! # use kenwood_thd75::types::TncBaud;
+//! # use kenwood_thd75::types::PacketDataRate;
 //! # async fn example() -> Result<(), kenwood_thd75::error::Error> {
-//! let transport = SerialTransport::open("/dev/cu.usbmodem1234", 115_200)?;
-//! let radio = Radio::connect(transport).await?;
+//! let transport = SerialTransport::open("/dev/cu.usbmodem1234")?;
+//! let radio = Radio::new(transport);
 //!
 //! // Enter MMDVM mode (consumes the Radio).
-//! let session = radio.enter_mmdvm(TncBaud::Bps9600).await.map_err(|(_, e)| e)?;
+//! let session = radio.enter_mmdvm(PacketDataRate::Bps9600).await.map_err(|(_, e)| e)?;
 //!
 //! // ... use session.modem_mut() for raw MMDVM operations, or build a
-//! // DStarGateway on top of it ...
+//! // DstarGateway on top of it ...
 //!
-//! // Exit MMDVM mode (returns the Radio).
-//! let radio = session.exit().await?;
+//! // Exit MMDVM mode, then prove that ordinary CAT framing is restored.
+//! let mut radio = session.exit().await?;
+//! radio.restore_cat_after_mode_exit().await?;
 //! # Ok(())
 //! # }
 //! ```
 
 use std::time::Duration;
 
-use mmdvm::AsyncModem;
+use ::mmdvm::AsyncModem;
 
 use crate::error::{Error, ProtocolError};
-use crate::protocol::{Codec, Command, Response};
+use crate::protocol::{Command, Response};
 use crate::transport::{MmdvmTransportAdapter, Transport};
-use crate::types::{TncBaud, TncMode};
+use crate::types::{PacketDataRate, TncMode};
 
-use super::Radio;
+use super::{Radio, cat_restore_state::CatRestoreState};
 
 /// Wait time after the `TN 0,0` exit command before rebuilding the
 /// `Radio`. Matches the pre-refactor delay so the TNC has time to
 /// switch back to CAT mode.
 const EXIT_SWITCH_DELAY: Duration = Duration::from_millis(100);
 
-/// Cached Radio state that persists across an MMDVM session so the
-/// `Radio` can be rebuilt on [`MmdvmSession::exit`].
-struct RadioState {
-    codec: Codec,
-    notifications: tokio::sync::broadcast::Sender<Response>,
-    timeout: Duration,
-    firmware_version: Option<String>,
-    mode_a: Option<super::RadioMode>,
-    mode_b: Option<super::RadioMode>,
-    mcp_speed: super::programming::McpSpeed,
-    gm_poisoned: bool,
-    link_state_tx: tokio::sync::watch::Sender<super::LinkState>,
-    auto_info_enabled: bool,
-    gps_config: Option<(bool, bool)>,
-    gps_sentences: Option<(bool, bool, bool, bool, bool, bool)>,
-}
-
 /// An MMDVM session that owns the radio transport via an
-/// [`mmdvm::AsyncModem`].
+/// [`::mmdvm::AsyncModem`].
 ///
 /// While this session is active, the transport speaks the MMDVM binary
 /// framing protocol and all I/O is funneled through the spawned
@@ -89,7 +73,7 @@ pub struct MmdvmSession<T: Transport + Unpin + 'static> {
     /// Async MMDVM modem driving the transport.
     modem: AsyncModem<MmdvmTransportAdapter<T>>,
     /// Radio state cached for restoration on exit.
-    radio_state: RadioState,
+    cat_restore: CatRestoreState,
 }
 
 impl<T: Transport + Unpin + 'static> std::fmt::Debug for MmdvmSession<T> {
@@ -103,78 +87,78 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
     ///
     /// Use this when the radio is already in MMDVM mode (e.g. after
     /// enabling DV Gateway / Reflector Terminal Mode via MCP write to
-    /// offset `0x1CA0`). The transport is assumed to already speak
-    /// MMDVM binary framing.
+    /// offset `0x1CA0`). The transport must already have a successful MMDVM
+    /// link diagnosis or a correlated owned MMDVM transition recorded on it.
     ///
     /// # Errors
     ///
-    /// Returns the original radio and [`Error::MemoryReadStreamPoisoned`] if
-    /// an incomplete GM exchange requires a reconnect, or
-    /// [`Error::McpInterrupted`] if an MCP session is not fully recovered.
+    /// Returns the original radio and [`Error::BinaryModeNotProven`] if the
+    /// link is still ordinary CAT, [`Error::MemoryReadStreamPoisoned`] if an
+    /// incomplete GM exchange requires a reconnect, or [`Error::McpInterrupted`]
+    /// if an MCP session is not fully recovered.
     #[expect(
         clippy::result_large_err,
         reason = "The ownership-preserving error matches enter_mmdvm: callers need the original \
                   Radio to reconnect or recover MCP without losing the selected transport"
     )]
     pub fn into_mmdvm_session(self) -> Result<MmdvmSession<T>, (Self, Error)> {
-        if let Err(error) = self.require_unpoisoned_gm_stream() {
-            return Err((self, error));
-        }
-        if self.mcp_phase != super::McpPhase::Inactive {
-            return Err((self, Error::McpInterrupted));
-        }
+        let (transport, cat_restore) = self.into_binary_mode_parts()?;
 
         tracing::info!("wrapping transport as MMDVM session (radio already in gateway mode)");
-        let adapter = MmdvmTransportAdapter::new(self.transport);
+        let adapter = MmdvmTransportAdapter::new(transport);
         let modem = AsyncModem::spawn(adapter);
-        Ok(MmdvmSession {
-            modem,
-            radio_state: RadioState {
-                codec: self.codec,
-                notifications: self.notifications,
-                timeout: self.timeout,
-                firmware_version: self.firmware_version,
-                mode_a: self.mode_a,
-                mode_b: self.mode_b,
-                mcp_speed: self.mcp_speed,
-                gm_poisoned: self.gm_poisoned,
-                link_state_tx: self.link_state_tx,
-                auto_info_enabled: self.auto_info_enabled,
-                gps_config: self.gps_config,
-                gps_sentences: self.gps_sentences,
-            },
-        })
+        Ok(MmdvmSession { modem, cat_restore })
     }
 
     /// Enter MMDVM mode, consuming this [`Radio`] and returning an [`MmdvmSession`].
     ///
     /// Sends the `TN 3,x` CAT command to switch the TNC to MMDVM mode at the
-    /// specified baud rate. After this call, the serial port speaks MMDVM
+    /// specified packet data rate. After this call, the serial port speaks MMDVM
     /// binary framing. Use [`MmdvmSession::exit`] to return to CAT mode.
     ///
     /// # Errors
     ///
-    /// On failure, returns the [`Radio`] alongside the error so the caller
-    /// can continue using CAT mode. The radio is NOT consumed on error.
-    pub async fn enter_mmdvm(mut self, baud: TncBaud) -> Result<MmdvmSession<T>, (Self, Error)> {
-        tracing::info!(?baud, "entering MMDVM mode");
+    /// On failure, returns the [`Radio`] alongside the error. If the transition
+    /// write may have reached the radio, that handle rejects ordinary CAT until
+    /// [`Radio::restore_cat_after_mode_exit`] proves the framing boundary.
+    pub async fn enter_mmdvm(
+        mut self,
+        data_rate: PacketDataRate,
+    ) -> Result<MmdvmSession<T>, (Self, Error)> {
+        tracing::info!(?data_rate, "entering MMDVM mode");
         let response = match self
             .execute(Command::SetTncMode {
                 mode: TncMode::Mmdvm,
-                setting: baud,
+                data_rate,
             })
             .await
         {
             Ok(r) => r,
-            Err(e) => return Err((self, e)),
+            Err(e) => {
+                if matches!(
+                    e,
+                    Error::Timeout(_) | Error::Transport(_) | Error::Protocol(_)
+                ) {
+                    self.cat_state = super::CatState::RecoveryRequired;
+                }
+                return Err((self, e));
+            }
         };
         match response {
-            Response::TncMode { .. } => {}
+            Response::TncMode {
+                mode: TncMode::Mmdvm,
+                data_rate: response_data_rate,
+            } if response_data_rate == data_rate => {
+                // The exact TN echo is the CAT-side proof that the transport
+                // may now be consumed by the typed binary session.
+                self.cat_state = super::CatState::BinaryProven;
+            }
             other => {
+                self.cat_state = super::CatState::RecoveryRequired;
                 return Err((
                     self,
                     Error::Protocol(ProtocolError::UnexpectedResponse {
-                        expected: "TncMode".into(),
+                        expected: format!("TncMode {{ mode: Mmdvm, data_rate: {data_rate:?} }}"),
                         actual: format!("{other:?}").into_bytes(),
                     }),
                 ));
@@ -186,19 +170,19 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
 }
 
 impl<T: Transport + Unpin + 'static> MmdvmSession<T> {
-    /// Mutable access to the underlying [`mmdvm::AsyncModem`].
+    /// Mutable access to the underlying [`::mmdvm::AsyncModem`].
     ///
     /// Consumers that need low-level MMDVM control (custom status polls,
     /// mode changes, raw frame send) work with the handle directly.
     /// Higher-level D-STAR orchestration (headers, voice frames, EOT)
-    /// is wrapped by [`crate::mmdvm::DStarGateway`].
+    /// is wrapped by [`crate::dstar_gateway::DstarGateway`].
     pub const fn modem_mut(&mut self) -> &mut AsyncModem<MmdvmTransportAdapter<T>> {
         &mut self.modem
     }
 
-    /// Consume the session and return its [`mmdvm::AsyncModem`].
+    /// Consume the session and return its [`::mmdvm::AsyncModem`].
     ///
-    /// Used by [`crate::mmdvm::DStarGateway`] to keep long-lived ownership
+    /// Used by [`crate::dstar_gateway::DstarGateway`] to keep long-lived ownership
     /// of the modem while tracking D-STAR-specific state separately.
     /// Returns the associated Radio restore state alongside the modem
     /// so the caller can rebuild the [`Radio`] after shutdown.
@@ -206,7 +190,7 @@ impl<T: Transport + Unpin + 'static> MmdvmSession<T> {
         (
             self.modem,
             MmdvmRadioRestore {
-                state: self.radio_state,
+                cat_restore: self.cat_restore,
                 _phantom: std::marker::PhantomData,
             },
         )
@@ -214,14 +198,17 @@ impl<T: Transport + Unpin + 'static> MmdvmSession<T> {
 
     /// Exit MMDVM mode and return the [`Radio`].
     ///
-    /// Shuts down the [`mmdvm::AsyncModem`], recovering the transport,
+    /// Shuts down the [`::mmdvm::AsyncModem`], recovering the transport,
     /// sends `TN 0,0` on the raw transport to return the radio's TNC to
-    /// normal APRS mode, then rebuilds the `Radio` from saved state.
+    /// normal APRS mode, then rebuilds the `Radio` from saved state. The
+    /// returned radio is deliberately desynchronized; callers must require
+    /// [`Radio::restore_cat_after_mode_exit`] to succeed before reporting or
+    /// resuming ordinary CAT operation.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Transport`] if the `TN 0,0` write fails, or
-    /// translates [`mmdvm::ShellError`] into [`Error::Transport`] /
+    /// translates [`::mmdvm::ShellError`] into [`Error::Transport`] /
     /// [`Error::Protocol`] as appropriate.
     pub async fn exit(self) -> Result<Radio<T>, Error> {
         tracing::info!("exiting MMDVM mode");
@@ -231,15 +218,15 @@ impl<T: Transport + Unpin + 'static> MmdvmSession<T> {
     }
 }
 
-/// Radio restore state carried alongside the [`mmdvm::AsyncModem`] during
+/// Radio restore state carried alongside the [`::mmdvm::AsyncModem`] during
 /// MMDVM operation. Keeps the `Radio`'s CAT-mode codec, notifications,
 /// timeouts, and VFO/memory cache alive so they can be restored on exit.
 ///
 /// This type is crate-internal; it only escapes [`MmdvmSession::into_parts`]
-/// so [`crate::mmdvm::DStarGateway`] can reconstruct the `Radio` after
+/// so [`crate::dstar_gateway::DstarGateway`] can reconstruct the `Radio` after
 /// `AsyncModem::shutdown`.
 pub(crate) struct MmdvmRadioRestore<T: Transport + Unpin + 'static> {
-    state: RadioState,
+    cat_restore: CatRestoreState,
     _phantom: std::marker::PhantomData<fn() -> T>,
 }
 
@@ -250,7 +237,42 @@ impl<T: Transport + Unpin + 'static> std::fmt::Debug for MmdvmRadioRestore<T> {
 }
 
 impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
+    /// Shut down the MMDVM consumer and rebuild ownership of the same binary
+    /// link without sending a mode-exit command.
+    ///
+    /// Used when persistent Reflector Terminal Mode remains active but a
+    /// higher-level gateway initialization fails. Binary proof is retained
+    /// only when both the modem loop and transport pump shut down cleanly. A
+    /// pump failure may return a transport internally, but reopening it would
+    /// establish a new link whose protocol has not been proved, so that handle
+    /// is deliberately dropped instead of being mislabeled binary-safe.
+    pub(crate) async fn shutdown_and_rebuild_binary(
+        self,
+        modem: AsyncModem<MmdvmTransportAdapter<T>>,
+    ) -> Result<Radio<T>, Error> {
+        let adapter = modem.shutdown().await.map_err(shell_err_to_thd75_err)?;
+        let inner = adapter
+            .shutdown_and_recover()
+            .await
+            .map_err(|recovery_error| {
+                let (_transport, pump_error) = recovery_error.into_parts();
+                Error::Transport(crate::error::TransportError::Disconnected(
+                    std::io::Error::new(
+                        pump_error.kind(),
+                        format!(
+                            "MMDVM transport could not be cleanly reclaimed without invalidating \
+                         binary proof: {pump_error}"
+                        ),
+                    ),
+                ))
+            })?;
+        Ok(self.cat_restore.rebuild_binary_proven(inner))
+    }
+
     /// Shut down the modem, send `TN 0,0`, and rebuild the [`Radio`].
+    ///
+    /// The returned radio remains deliberately desynchronized until
+    /// [`Radio::restore_cat_after_mode_exit`] succeeds.
     pub(crate) async fn exit_and_rebuild(
         self,
         modem: AsyncModem<MmdvmTransportAdapter<T>>,
@@ -259,10 +281,32 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
         let adapter = modem.shutdown().await.map_err(shell_err_to_thd75_err)?;
 
         // Pull the inner T out of the adapter.
-        let mut inner = adapter
-            .into_inner()
-            .await
-            .map_err(|e| Error::Transport(crate::error::TransportError::Disconnected(e)))?;
+        let mut inner = match adapter.shutdown_and_recover().await {
+            Ok(inner) => inner,
+            Err(recovery_error) => {
+                let (transport, pump_error) = recovery_error.into_parts();
+                let Some(mut inner) = transport else {
+                    return Err(Error::Transport(
+                        crate::error::TransportError::Disconnected(pump_error),
+                    ));
+                };
+                tracing::warn!(
+                    error = %pump_error,
+                    "MMDVM pump failed; reopening recovered transport before CAT restoration"
+                );
+                if let Err(reopen_error) = inner.reopen().await {
+                    return Err(Error::Transport(
+                        crate::error::TransportError::Disconnected(std::io::Error::new(
+                            pump_error.kind(),
+                            format!(
+                                "MMDVM pump failed: {pump_error}; recovered transport could not reopen: {reopen_error}"
+                            ),
+                        )),
+                    ));
+                }
+                inner
+            }
+        };
 
         // Send TN 0,0 on the raw transport to switch the TNC back to
         // APRS mode. The adapter is dropped; we speak ASCII CAT on T
@@ -272,57 +316,38 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
         // Small delay to let the TNC switch back to CAT mode.
         tokio::time::sleep(EXIT_SWITCH_DELAY).await;
 
-        Ok(Radio {
-            transport: inner,
-            codec: self.state.codec,
-            notifications: self.state.notifications,
-            timeout: self.state.timeout,
-            firmware_version: self.state.firmware_version,
-            mode_a: self.state.mode_a,
-            mode_b: self.state.mode_b,
-            mcp_speed: self.state.mcp_speed,
-            last_cmd_time: None,
-            // MMDVM binary traffic may have left residue on the line,
-            // so drain before the first CAT command.
-            desynced: true,
-            gm_poisoned: self.state.gm_poisoned,
-            mcp_phase: super::McpPhase::Inactive,
-            mcp_saved_timeout: None,
-            mcp_pending_exit_error: None,
-            link_state_tx: self.state.link_state_tx,
-            auto_info_enabled: self.state.auto_info_enabled,
-            gps_config: self.state.gps_config,
-            gps_sentences: self.state.gps_sentences,
-        })
+        Ok(self.cat_restore.rebuild_desynchronized(inner))
     }
 }
 
-/// Translate an [`mmdvm::ShellError`] into a thd75 [`Error`].
-fn shell_err_to_thd75_err(err: mmdvm::ShellError) -> Error {
+/// Translate an [`::mmdvm::ShellError`] into a thd75 [`Error`].
+fn shell_err_to_thd75_err(err: ::mmdvm::ShellError) -> Error {
     match err {
-        mmdvm::ShellError::SessionClosed => Error::Protocol(ProtocolError::UnexpectedResponse {
+        ::mmdvm::ShellError::SessionClosed => Error::Protocol(ProtocolError::UnexpectedResponse {
             expected: "MMDVM session active".into(),
             actual: b"session closed".to_vec(),
         }),
-        mmdvm::ShellError::Core(e) => Error::Protocol(ProtocolError::FieldParse {
+        ::mmdvm::ShellError::Core(e) => Error::Protocol(ProtocolError::FieldParse {
             command: "MMDVM".to_owned(),
             field: "frame".to_owned(),
             detail: format!("{e}"),
         }),
-        mmdvm::ShellError::Io(e) => Error::Transport(crate::error::TransportError::Disconnected(e)),
-        mmdvm::ShellError::BufferFull { mode } => {
+        ::mmdvm::ShellError::Io(e) => {
+            Error::Transport(crate::error::TransportError::Disconnected(e))
+        }
+        ::mmdvm::ShellError::BufferFull { mode } => {
             Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: format!("MMDVM {mode:?} buffer ready"),
                 actual: b"buffer full".to_vec(),
             })
         }
-        mmdvm::ShellError::Nak { command, reason } => {
+        ::mmdvm::ShellError::Nak { command, reason } => {
             Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: format!("MMDVM ACK for 0x{command:02X}"),
                 actual: format!("NAK: {reason:?}").into_bytes(),
             })
         }
-        // `mmdvm::ShellError` is `#[non_exhaustive]`. Surface unknown
+        // `::mmdvm::ShellError` is `#[non_exhaustive]`. Surface unknown
         // variants as a generic transport disconnection.
         _ => Error::Transport(crate::error::TransportError::Disconnected(
             std::io::Error::other("unknown MMDVM shell error"),
@@ -334,17 +359,17 @@ fn shell_err_to_thd75_err(err: mmdvm::ShellError) -> Error {
 mod tests {
     use super::*;
     use crate::transport::MockTransport;
-    use crate::types::TncBaud;
+    use crate::types::PacketDataRate;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// Helper: create a Radio with a mock that expects the TN 3,x command.
-    async fn mock_radio_for_mmdvm(baud: TncBaud) -> Result<Radio<MockTransport>, Error> {
-        let tn_cmd = format!("TN 3,{}\r", u8::from(baud));
-        let tn_resp = format!("TN 3,{}\r", u8::from(baud));
+    fn mock_radio_for_mmdvm(data_rate: PacketDataRate) -> Radio<MockTransport> {
+        let tn_cmd = format!("TN 3,{}\r", u8::from(data_rate));
+        let tn_resp = format!("TN 3,{}\r", u8::from(data_rate));
         let mut mock = MockTransport::new();
         mock.expect(tn_cmd.as_bytes(), tn_resp.as_bytes());
-        Radio::connect(mock).await
+        Radio::new(mock)
     }
 
     #[tokio::test]
@@ -354,9 +379,9 @@ mod tests {
         // inside a `LocalSet` so the spawn succeeds.
         tokio::task::LocalSet::new()
             .run_until(async {
-                let radio = mock_radio_for_mmdvm(TncBaud::Bps1200).await?;
+                let radio = mock_radio_for_mmdvm(PacketDataRate::Bps1200);
                 let session = radio
-                    .enter_mmdvm(TncBaud::Bps1200)
+                    .enter_mmdvm(PacketDataRate::Bps1200)
                     .await
                     .map_err(|(_, e)| e)?;
                 assert!(format!("{session:?}").contains("MmdvmSession"));
@@ -366,12 +391,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enter_mmdvm_9600_baud() -> TestResult {
+    async fn enter_mmdvm_9600_bps() -> TestResult {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let radio = mock_radio_for_mmdvm(TncBaud::Bps9600).await?;
+                let radio = mock_radio_for_mmdvm(PacketDataRate::Bps9600);
                 let _session = radio
-                    .enter_mmdvm(TncBaud::Bps9600)
+                    .enter_mmdvm(PacketDataRate::Bps9600)
                     .await
                     .map_err(|(_, e)| e)?;
                 Ok(())
@@ -379,9 +404,75 @@ mod tests {
             .await
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_mmdvm_entry_failure_blocks_cat_reuse() -> TestResult {
+        let mut transport = MockTransport::new();
+        transport.expect_hang(b"TN 3,1\r");
+        let mut radio = Radio::new(transport);
+        radio.set_timeout(Duration::from_millis(1));
+
+        let Err((mut radio, error)) = radio.enter_mmdvm(PacketDataRate::Bps9600).await else {
+            return Err("silent MMDVM transition unexpectedly created a session".into());
+        };
+        assert!(matches!(error, Error::Timeout(_)));
+        assert_eq!(radio.cat_state, crate::radio::CatState::RecoveryRequired);
+        assert!(matches!(
+            radio.identify().await,
+            Err(Error::CatRecoveryRequired)
+        ));
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exit_returns_desynchronized_radio_with_preserved_cat_state() -> TestResult {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut transport = MockTransport::new();
+                transport.expect_any_write();
+                transport.expect(b"TN 0,0\r", b"");
+                transport.pend_when_empty();
+                let mut radio = Radio::new(transport);
+                radio.set_timeout(Duration::from_millis(731));
+                radio.firmware_version = Some(crate::types::FirmwareIdentity::new("1.03.AZM")?);
+                radio.tuning_mode_b = Some(crate::types::TuningMode::Call);
+                radio.auto_info_enabled = true;
+                radio.gps_settings = Some(crate::types::GpsSettings::new(true, true));
+                radio.gps_sentences = Some(crate::types::NmeaSentences::all());
+                radio.cat_state = crate::radio::CatState::BinaryProven;
+
+                let session = radio.into_mmdvm_session().map_err(|(_, error)| error)?;
+                let radio = session.exit().await?;
+
+                assert_eq!(radio.timeout, Duration::from_millis(731));
+                assert_eq!(
+                    radio
+                        .firmware_version
+                        .as_ref()
+                        .map(crate::types::FirmwareIdentity::as_str),
+                    Some("1.03.AZM")
+                );
+                assert_eq!(radio.tuning_mode_b, Some(crate::types::TuningMode::Call));
+                assert!(radio.auto_info_enabled);
+                assert_eq!(
+                    radio.gps_settings,
+                    Some(crate::types::GpsSettings::new(true, true))
+                );
+                assert_eq!(
+                    radio.gps_sentences,
+                    Some(crate::types::NmeaSentences::all())
+                );
+                assert!(radio.desynced);
+                assert!(radio.codec.is_empty());
+                radio.transport.assert_complete();
+                Ok(())
+            })
+            .await
+    }
+
     #[tokio::test]
     async fn direct_mmdvm_conversion_rejects_a_poisoned_gm_stream() -> TestResult {
-        let mut radio = Radio::connect(MockTransport::new()).await?;
+        let mut radio = Radio::new(MockTransport::new());
         radio.gm_poisoned = true;
 
         let Err((radio, error)) = radio.into_mmdvm_session() else {
@@ -393,8 +484,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_mmdvm_conversion_rejects_an_unproved_cat_link() -> TestResult {
+        let radio = Radio::new(MockTransport::new());
+
+        let Err((radio, error)) = radio.into_mmdvm_session() else {
+            return Err("unproved CAT link unexpectedly entered MMDVM mode".into());
+        };
+        assert!(matches!(error, Error::BinaryModeNotProven));
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn direct_mmdvm_conversion_rejects_active_mcp() -> TestResult {
-        let mut radio = Radio::connect(MockTransport::new()).await?;
+        let mut radio = Radio::new(MockTransport::new());
         radio.mcp_phase = super::super::McpPhase::Active;
 
         let Err((radio, error)) = radio.into_mmdvm_session() else {

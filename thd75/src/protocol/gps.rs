@@ -2,14 +2,15 @@
 //!
 //! Provides parsing of responses for the 3 GPS-related CAT protocol
 //! commands:
-//! - GP: GPS configuration (enabled + PC output)
+//! - GP: GPS settings (enabled + PC output)
 //! - GM: GPS/Radio mode (single value)
-//! - GS: GPS NMEA sentence enable flags (6 booleans)
+//! - GS: validated GPS NMEA sentence selection
 
 use crate::error::ProtocolError;
-use crate::types::GpsRadioMode;
+use crate::types::{GpsRadioMode, GpsSettings, NmeaSentences};
 
 use super::Response;
+use super::fields::{boolean, decimal_u8, split_exact};
 
 /// Parse a GPS command response from mnemonic and payload.
 ///
@@ -23,68 +24,23 @@ pub(crate) fn parse_gps(mnemonic: &str, payload: &str) -> Option<Result<Response
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Parse a `u8` from a string field.
-fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> {
-    s.parse::<u8>().map_err(|_| ProtocolError::FieldParse {
-        command: cmd.to_owned(),
-        field: field.to_owned(),
-        detail: format!("invalid u8: {s:?}"),
-    })
-}
-
-/// Parse a protocol Boolean, accepting exactly `0` or `1`.
-fn parse_bool_field(s: &str, cmd: &str, field: &str) -> Result<bool, ProtocolError> {
-    match s {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => Err(ProtocolError::FieldParse {
-            command: cmd.to_owned(),
-            field: field.to_owned(),
-            detail: format!("expected 0 or 1, got {s:?}"),
-        }),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Individual parsers
-// ---------------------------------------------------------------------------
-
-/// Parse GP (GPS config): `gps_enabled,pc_output`.
+/// Parse GP (GPS settings): `gps_enabled,pc_output`.
 ///
 /// Two comma-separated values, each 0 or 1.
 fn parse_gp(payload: &str) -> Result<Response, ProtocolError> {
-    let (gps_str, pc_str) = payload
-        .split_once(',')
-        .ok_or_else(|| ProtocolError::FieldParse {
-            command: "GP".to_owned(),
-            field: "all".to_owned(),
-            detail: format!("expected 2 fields (gps_enabled,pc_output), got {payload:?}"),
-        })?;
-    // Reject any extra comma, matching the old `split(',').len() != 2` check.
-    if pc_str.contains(',') {
-        return Err(ProtocolError::FieldParse {
-            command: "GP".to_owned(),
-            field: "all".to_owned(),
-            detail: format!("expected 2 fields (gps_enabled,pc_output), got {payload:?}"),
-        });
-    }
-    let gps_enabled = parse_bool_field(gps_str, "GP", "gps_enabled")?;
-    let pc_output = parse_bool_field(pc_str, "GP", "pc_output")?;
-    Ok(Response::GpsConfig {
-        gps_enabled,
-        pc_output,
+    let [gps_str, pc_str] = split_exact::<2>(payload, "GP")?;
+    let gps_enabled = boolean(gps_str, "GP", "gps_enabled")?;
+    let pc_output = boolean(pc_str, "GP", "pc_output")?;
+    Ok(Response::GpsSettings {
+        settings: GpsSettings::new(gps_enabled, pc_output),
     })
 }
 
 /// Parse GM (GPS mode): single value (0=Normal, 1=GPS Receiver).
 ///
-/// Firmware-verified: `cat_gm_handler` guard `local_18 < 2`.
+/// The radio accepts only wire values 0 and 1.
 fn parse_gm(payload: &str) -> Result<Response, ProtocolError> {
-    let raw = parse_u8_field(payload, "GM", "mode")?;
+    let raw = decimal_u8(payload, "GM", "mode")?;
     let mode = GpsRadioMode::try_from(raw).map_err(|e| ProtocolError::FieldParse {
         command: "GM".into(),
         field: "mode".into(),
@@ -95,7 +51,8 @@ fn parse_gm(payload: &str) -> Result<Response, ProtocolError> {
 
 /// Parse GS (GPS NMEA sentences): `gga,gll,gsa,gsv,rmc,vtg`.
 ///
-/// Six comma-separated values, each 0 or 1.
+/// Six comma-separated values, each 0 or 1. The radio's documented invariant
+/// requires at least one sentence to remain selected.
 #[expect(
     clippy::similar_names,
     reason = "NMEA 0183 sentence type codes (gga/gll/gsa/gsv/rmc/vtg) are 3-char \
@@ -104,27 +61,19 @@ fn parse_gm(payload: &str) -> Result<Response, ProtocolError> {
               vocabulary the GS command speaks."
 )]
 fn parse_gs(payload: &str) -> Result<Response, ProtocolError> {
-    let parts: Vec<&str> = payload.split(',').collect();
-    let actual = parts.len();
-    let &[raw_gga, raw_gll, raw_gsa, raw_gsv, raw_rmc, raw_vtg] = parts.as_slice() else {
-        return Err(ProtocolError::FieldParse {
-            command: "GS".to_owned(),
-            field: "all".to_owned(),
-            detail: format!("expected 6 fields, got {actual}"),
-        });
-    };
-    let gga = parse_bool_field(raw_gga, "GS", "gga")?;
-    let gll = parse_bool_field(raw_gll, "GS", "gll")?;
-    let gsa = parse_bool_field(raw_gsa, "GS", "gsa")?;
-    let gsv = parse_bool_field(raw_gsv, "GS", "gsv")?;
-    let rmc = parse_bool_field(raw_rmc, "GS", "rmc")?;
-    let vtg = parse_bool_field(raw_vtg, "GS", "vtg")?;
-    Ok(Response::GpsSentences {
-        gga,
-        gll,
-        gsa,
-        gsv,
-        rmc,
-        vtg,
-    })
+    let [raw_gga, raw_gll, raw_gsa, raw_gsv, raw_rmc, raw_vtg] = split_exact::<6>(payload, "GS")?;
+    let sentences = NmeaSentences::try_from_flags([
+        boolean(raw_gga, "GS", "gga")?,
+        boolean(raw_gll, "GS", "gll")?,
+        boolean(raw_gsa, "GS", "gsa")?,
+        boolean(raw_gsv, "GS", "gsv")?,
+        boolean(raw_rmc, "GS", "rmc")?,
+        boolean(raw_vtg, "GS", "vtg")?,
+    ])
+    .map_err(|error| ProtocolError::FieldParse {
+        command: "GS".to_owned(),
+        field: "all".to_owned(),
+        detail: error.to_string(),
+    })?;
+    Ok(Response::GpsSentences { sentences })
 }

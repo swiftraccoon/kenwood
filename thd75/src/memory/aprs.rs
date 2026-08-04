@@ -1,47 +1,33 @@
-//! Typed access to the APRS configuration region of the memory image.
+//! Bounded access to the opaque APRS archive region of the memory image.
 //!
-//! The APRS configuration occupies pages `0x0151`+ in the MCP address
-//! space. This includes the APRS message status header (256 bytes at
-//! page `0x0151`), followed by APRS messages, settings, and extended
-//! configuration data.
+//! The bounded region begins with the APRS message status header (256 bytes at
+//! page `0x0151`) followed by opaque APRS data. It is not the radio menu
+//! settings block; known APRS menu fields are decoded through the generated
+//! menu-field registry.
 //!
 //! # Verification status
 //!
-//! ⚠ **Field-level offsets inside the APRS data region are not
-//! hardware-verified on a TH-D75.** This module exposes only the region-
-//! boundary readers (`status_header`, `data_region`, `position_data_*`)
-//! and a generic `read_bytes` accessor. Field-level typed accessors
-//! (`my_callsign`, `beacon_interval`, `packet_path`) were previously
-//! present but **have been removed**: their offsets were ported from
-//! TH-D74 development notes during the April 2026 extraction, and
-//! D74 confirmations are not confirmations on D75. Returning typed
-//! values from unverified
-//! offsets violates the validation contract: the type system promised
-//! "this is the callsign" while in practice the bytes might come from
-//! a completely unrelated field.
+//! Field-level offsets inside this APRS data region are not verified for the
+//! TH-D75. This module therefore exposes only the verified region boundaries
+//! (`status_header` and `data_region`) and a bounded `read_bytes` accessor.
+//! It does not assign field semantics to opaque bytes.
 //!
 //! ## How to reintroduce typed accessors
 //!
-//! Each field needs *both* of the following before a typed accessor is
-//! added back:
-//!
-//! 1. **Firmware-RE confirmation.** Trace the MCP address-decoder
-//!    function in the TH-D75 firmware and confirm the candidate offset
-//!    is a D75 finding, not a D74 trace.
-//! 2. **Hardware round-trip.** Capture an MCP image from a known-state
-//!    radio, set the field via the menu, re-capture, then diff the byte
-//!    at the candidate offset and confirm it tracks the change.
-//!
-//! Only when both pass should a typed accessor land, with the source
-//! comment recording the firmware function address and the hardware
-//! capture date that verified it.
+//! A typed field accessor requires an exact TH-D75 offset, an encoded domain,
+//! and controlled radio write/readback evidence that the field tracks the
+//! named setting. Until all three are available, callers should use the
+//! generated menu-field registry for known settings or treat these bytes as
+//! opaque.
 //!
 //! # Cross-references
 //!
 //! The region-boundary constants (`APRS_STATUS_PAGE`, `APRS_START`,
-//! `DSTAR_RPT_START`) live in [`crate::protocol::programming`] and are
+//! `DSTAR_CALLSIGN_START`) live in [`crate::protocol::programming`] and are
 //! considered verified at the page level. Only sub-page field offsets
-//! were unverified.
+//! were unverified. Radio menu settings that sit outside this opaque region,
+//! including `aprs.MyCallsign`, are decoded through
+//! [`MemoryImage::menu_setting`](crate::memory::MemoryImage::menu_setting).
 
 use crate::protocol::programming;
 
@@ -49,47 +35,33 @@ use crate::protocol::programming;
 pub const APRS_STATUS_OFFSET: usize =
     programming::APRS_STATUS_PAGE as usize * programming::PAGE_SIZE;
 
-/// Byte offset of the APRS messages and settings region (`0x15200`).
+/// Byte offset of the opaque APRS data region (`0x15200`).
 pub const APRS_DATA_OFFSET: usize = programming::APRS_START as usize * programming::PAGE_SIZE;
 
-/// Estimated end of the APRS region (before D-STAR repeater list).
-pub const APRS_END_OFFSET: usize = programming::DSTAR_RPT_START as usize * programming::PAGE_SIZE;
+/// End of the opaque APRS region at the proven D-STAR callsign-table start.
+pub const APRS_END_OFFSET: usize =
+    programming::DSTAR_CALLSIGN_START as usize * programming::PAGE_SIZE;
 
 // ---------------------------------------------------------------------------
 // Sub-page field offsets within the APRS data region
 //
 // Intentionally empty. See the module-level "Verification status"
 // section: typed field accessors were removed when their offsets could
-// not be confirmed against D75 firmware RE or hardware. Add `const`
-// offsets back here only when the corresponding accessor has both a
-// firmware-RE citation and a hardware-capture date.
+// not be confirmed by controlled memory-image diffs and radio readback. Add
+// `const` offsets back here only with reproducible evidence for both the
+// address and its encoded domain.
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// APRS/GPS position data region
-//
-// The APRS/GPS position data occupies 0x4B00 bytes (19,200 bytes) starting
-// at byte offset 0x25100 in the MCP memory image.
-// ---------------------------------------------------------------------------
-
-/// Byte offset of the APRS/GPS position data region (`0x25100`).
-///
-/// 0x4B00 bytes of APRS/GPS position data starting at offset 0x25100.
-pub const APRS_POSITION_DATA_OFFSET: usize = 0x2_5100;
-
-/// Size of the APRS/GPS position data region in bytes.
-pub const APRS_POSITION_DATA_SIZE: usize = 0x4B00;
 
 // ---------------------------------------------------------------------------
 // AprsAccess (read-only)
 // ---------------------------------------------------------------------------
 
-/// Read-only access to the APRS configuration region.
+/// Read-only access to the opaque APRS archive region.
 ///
-/// Provides **region-boundary** byte access for the APRS settings
-/// region at pages `0x0151`+. The page-level layout (status header,
-/// data region, position data region) is verified; sub-page field
-/// offsets are not; see the module-level "Verification status" section
+/// Provides **region-boundary** byte access at pages `0x0151`+. The page-level
+/// layout (status header and opaque data region) is verified; sub-page field
+/// offsets are not; see
+/// the module-level "Verification status" section
 /// for what was removed and why, and for the criteria a typed accessor
 /// must meet before it can be reintroduced.
 ///
@@ -98,8 +70,8 @@ pub const APRS_POSITION_DATA_SIZE: usize = 0x4B00;
 /// | MCP Offset | Content                                        | Status         |
 /// |------------|------------------------------------------------|----------------|
 /// | `0x15100`  | APRS message status header (256 bytes)         | page-verified  |
-/// | `0x15200`  | APRS messages and settings (~16 KB)            | page-verified  |
-/// | `0x25100`  | APRS/GPS position data region (0x4B00 bytes)   | page-verified  |
+/// | `0x15200`  | Opaque APRS data                                | boundary only  |
+/// | `0x25000`  | D-STAR direct-callsign table begins             | table-verified |
 /// | (any sub-page field)                                        | **unverified** |
 #[derive(Debug)]
 pub struct AprsAccess<'a> {
@@ -114,8 +86,8 @@ impl<'a> AprsAccess<'a> {
 
     /// Get the raw APRS message status header (256 bytes at page `0x0151`).
     ///
-    /// Contains metadata for APRS messages: count, read/unread flags,
-    /// index pointers.
+    /// The page is returned without assigning meanings to its individual
+    /// bytes.
     #[must_use]
     pub fn status_header(&self) -> Option<&[u8]> {
         let end = APRS_STATUS_OFFSET + programming::PAGE_SIZE;
@@ -125,8 +97,9 @@ impl<'a> AprsAccess<'a> {
     /// Get the raw APRS data region (pages `0x0152` through the start of
     /// the D-STAR region).
     ///
-    /// Contains APRS messages, callsign, status texts, packet path,
-    /// `SmartBeaconing` parameters, digipeater config, and more.
+    /// No field semantics are assigned within this region. Use
+    /// [`MemoryImage::menu_setting`](crate::memory::MemoryImage::menu_setting)
+    /// for known APRS menu settings.
     #[must_use]
     pub fn data_region(&self) -> Option<&[u8]> {
         self.image.get(APRS_DATA_OFFSET..APRS_END_OFFSET)
@@ -134,11 +107,14 @@ impl<'a> AprsAccess<'a> {
 
     /// Read an arbitrary byte range from the APRS region.
     ///
-    /// The offset is an absolute MCP byte address. Returns `None` if
-    /// the range extends past the image.
+    /// The offset is an absolute MCP byte address. Returns `None` if the
+    /// addition overflows or any byte falls outside the APRS-owned range.
     #[must_use]
     pub fn read_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
-        let end = offset + len;
+        let end = offset.checked_add(len)?;
+        if offset < APRS_STATUS_OFFSET || end > APRS_END_OFFSET {
+            return None;
+        }
         self.image.get(offset..end)
     }
 
@@ -149,68 +125,16 @@ impl<'a> AprsAccess<'a> {
     }
 
     // -----------------------------------------------------------------------
-    // Typed sub-page field accessors: REMOVED pending verification.
+    // Typed sub-page field accessors remain unavailable pending verification.
     //
-    // `my_callsign`, `my_callsign_typed`, `beacon_interval`,
-    // `packet_path_index`, and `packet_path` previously lived here.
-    // They were removed because the sub-page offsets they relied on
-    // were imported from D74 development notes and never confirmed
-    // against D75 firmware or hardware. See the module-level
-    // "Verification status" section for the criteria to reintroduce
-    // any of them.
+    // Typed setting and packet-path accessors previously lived here.
+    // See the module-level "Verification status" section for the criteria to
+    // introduce any of them.
     //
-    // Callers needing field-level access today should use
-    // [`AprsAccess::read_bytes`] with an absolute offset they have
-    // verified themselves, then parse the bytes locally.
-    // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // APRS/GPS position data region (page-verified address)
-    // -----------------------------------------------------------------------
-
-    /// Get the raw APRS/GPS position data region (0x4B00 bytes at `0x25100`).
-    ///
-    /// This region contains APRS position data, stored object data, and
-    /// GPS-related configuration.
-    ///
-    /// Returns `None` if the region extends past the image.
-    #[must_use]
-    pub fn position_data_region(&self) -> Option<&[u8]> {
-        let end = APRS_POSITION_DATA_OFFSET + APRS_POSITION_DATA_SIZE;
-        self.image.get(APRS_POSITION_DATA_OFFSET..end)
-    }
-
-    /// Get the total size of the APRS/GPS position data region in bytes.
-    ///
-    /// Always returns 0x4B00 (19,200 bytes).
-    #[must_use]
-    pub const fn position_data_size(&self) -> usize {
-        APRS_POSITION_DATA_SIZE
-    }
-
-    /// Read a byte range from the APRS/GPS position data region.
-    ///
-    /// The `rel_offset` is relative to the start of the position data
-    /// region (`0x25100`). Returns `None` if the range extends past the
-    /// region or the image.
-    #[must_use]
-    pub fn position_data_bytes(&self, rel_offset: usize, len: usize) -> Option<&[u8]> {
-        if rel_offset + len > APRS_POSITION_DATA_SIZE {
-            return None;
-        }
-        let abs_offset = APRS_POSITION_DATA_OFFSET + rel_offset;
-        self.image.get(abs_offset..abs_offset + len)
-    }
-
-    /// Check if the APRS/GPS position data region contains any non-zero data.
-    ///
-    /// Returns `true` if any byte in the region is non-zero, indicating
-    /// that position data has been stored.
-    #[must_use]
-    pub fn has_position_data(&self) -> bool {
-        self.position_data_region()
-            .is_some_and(|data| data.iter().any(|&b| b != 0x00 && b != 0xFF))
-    }
+    // Callers needing a generated, verified radio menu field should use
+    // [`MemoryImage::menu_setting`](crate::memory::MemoryImage::menu_setting).
+    // For uncatalogued APRS bytes, use [`AprsAccess::read_bytes`] only with an
+    // absolute offset independently verified for the TH-D75.
 }
 
 // ---------------------------------------------------------------------------
@@ -223,40 +147,6 @@ mod tests {
     use crate::protocol::programming::TOTAL_SIZE;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
-    type BoxErr = Box<dyn std::error::Error>;
-
-    fn set_byte(image: &mut [u8], offset: usize, value: u8) -> Result<(), BoxErr> {
-        let img_len = image.len();
-        *image
-            .get_mut(offset)
-            .ok_or_else(|| format!("set_byte: offset {offset} out of range (len={img_len})"))? =
-            value;
-        Ok(())
-    }
-
-    fn write_slice(image: &mut [u8], offset: usize, data: &[u8]) -> Result<(), BoxErr> {
-        let end = offset + data.len();
-        let img_len = image.len();
-        image
-            .get_mut(offset..end)
-            .ok_or_else(|| {
-                format!("write_slice: range {offset}..{end} out of bounds (len={img_len})")
-            })?
-            .copy_from_slice(data);
-        Ok(())
-    }
-
-    fn fill_range(image: &mut [u8], offset: usize, len: usize, value: u8) -> Result<(), BoxErr> {
-        let end = offset + len;
-        let img_len = image.len();
-        image
-            .get_mut(offset..end)
-            .ok_or_else(|| {
-                format!("fill_range: range {offset}..{end} out of bounds (len={img_len})")
-            })?
-            .fill(value);
-        Ok(())
-    }
 
     #[test]
     fn aprs_status_header_accessible() -> TestResult {
@@ -296,101 +186,11 @@ mod tests {
         Ok(())
     }
 
-    // Tests for typed sub-page accessors (my_callsign, beacon_interval,
-    // packet_path) were removed alongside the accessors themselves;
+    // Tests for typed sub-page accessors were removed alongside the accessors;
     // they exercised synthetic round-trips at unverified offsets, which
     // is exactly the failure mode the deletion was meant to prevent
     // (a green test passing on a wrong offset is worse than no test
     // because it manufactures false confidence). See the module-level
     // "Verification status" section for the criteria a reintroduced
     // accessor and its test must meet.
-
-    // -----------------------------------------------------------------------
-    // APRS/GPS position data region tests (page-verified address)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn aprs_position_data_region_accessible() -> TestResult {
-        let image = vec![0u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let aprs = mi.aprs();
-        let region = aprs
-            .position_data_region()
-            .ok_or("position_data_region returned None")?;
-        assert_eq!(region.len(), APRS_POSITION_DATA_SIZE);
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_position_data_size() -> TestResult {
-        let image = vec![0u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.aprs().position_data_size(), 0x4B00);
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_position_data_bytes() -> TestResult {
-        let mut image = vec![0u8; TOTAL_SIZE];
-        // Write known data at the start of the position data region.
-        write_slice(
-            &mut image,
-            APRS_POSITION_DATA_OFFSET,
-            &[0x01, 0x02, 0x03, 0x04],
-        )?;
-
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let aprs = mi.aprs();
-        let bytes = aprs
-            .position_data_bytes(0, 4)
-            .ok_or("position_data_bytes(0, 4) returned None")?;
-        assert_eq!(bytes, &[0x01, 0x02, 0x03, 0x04]);
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_position_data_bytes_past_region() -> TestResult {
-        let image = vec![0u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        // Try to read past the end of the position data region.
-        assert!(
-            mi.aprs()
-                .position_data_bytes(APRS_POSITION_DATA_SIZE, 1)
-                .is_none()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_has_position_data_empty() -> TestResult {
-        let image = vec![0u8; TOTAL_SIZE];
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.aprs().has_position_data());
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_has_position_data_populated() -> TestResult {
-        let mut image = vec![0u8; TOTAL_SIZE];
-        // Write non-zero data in the position data region.
-        set_byte(&mut image, APRS_POSITION_DATA_OFFSET + 100, 0x42)?;
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(mi.aprs().has_position_data());
-        Ok(())
-    }
-
-    #[test]
-    fn aprs_has_position_data_all_ff() -> TestResult {
-        let mut image = vec![0u8; TOTAL_SIZE];
-        // Fill with 0xFF (common empty marker) -- should not count.
-        fill_range(
-            &mut image,
-            APRS_POSITION_DATA_OFFSET,
-            APRS_POSITION_DATA_SIZE,
-            0xFF,
-        )?;
-        let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.aprs().has_position_data());
-        Ok(())
-    }
 }

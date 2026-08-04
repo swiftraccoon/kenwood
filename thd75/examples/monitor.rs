@@ -17,6 +17,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -37,8 +38,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "/dev/cu.usbmodem1234".to_owned());
 
     println!("Connecting to {port}...");
-    let transport = SerialTransport::open(&port, 115_200)?;
-    let mut radio = Radio::connect(transport).await?;
+    let transport = SerialTransport::open(&port)?;
+    let mut radio = Radio::new(transport);
 
     let info = radio.identify().await?;
     println!("Connected to: {}", info.model);
@@ -48,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for band in [Band::A, Band::B] {
             let freq = radio.get_frequency(band).await?;
             let smeter = radio.get_smeter(band).await?;
-            let mode = radio.get_mode(band).await?;
+            let mode = radio.get_operating_mode(band).await?;
             let busy = radio.get_busy(band).await?;
 
             println!(

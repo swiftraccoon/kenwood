@@ -128,9 +128,8 @@ const EXPECTED_ABI: AutomationAbi = AutomationAbi {
 
 /// One of the 25 ordinary input-dispatch identifiers accepted by automation.
 ///
-/// Stock handler-table analysis proves the named functions. Live
-/// key-to-screen qualification additionally proved the four directional
-/// orientations from exact selected-menu-label transitions.
+/// Live key-to-screen qualification established the named functions and the
+/// four directional orientations from exact selected-menu-label transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum FrontPanelKey {
@@ -189,7 +188,7 @@ pub enum FrontPanelKey {
 impl FrontPanelKey {
     /// Return the exact raw dispatcher identifier.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self as u8
     }
 }
@@ -235,7 +234,7 @@ impl TryFrom<u8> for FrontPanelKey {
 
 impl From<FrontPanelKey> for u8 {
     fn from(key: FrontPanelKey) -> Self {
-        key.as_u8()
+        key.as_raw()
     }
 }
 
@@ -330,7 +329,7 @@ pub enum KeyPhase {
 impl KeyPhase {
     /// Return the exact raw phase value.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self as u8
     }
 }
@@ -354,7 +353,7 @@ impl TryFrom<u8> for KeyPhase {
 
 impl From<KeyPhase> for u8 {
     fn from(phase: KeyPhase) -> Self {
-        phase.as_u8()
+        phase.as_raw()
     }
 }
 
@@ -1093,7 +1092,7 @@ impl<T: Transport> AutomationSession<'_, T> {
     /// snapshot. The firmware compares all 21,600 live 32-bit framebuffer
     /// words (43,200 RGB565 pixels / 86,400 bytes) once before any input, then
     /// synchronously emits all three zero-hold
-    /// press/release pairs in the same handler so the stock numeric-entry
+    /// press/release pairs in the same transaction so the stock numeric-entry
     /// redraw after digit one cannot invalidate the original Menu guard. The
     /// single wire reply and one double-read stable metadata record authenticate
     /// either all six events or a zero-input refusal. Command count
@@ -1171,8 +1170,8 @@ impl<T: Transport> AutomationSession<'_, T> {
     /// Dispatch one complete guarded-input transaction of up to three keys.
     ///
     /// The transaction consumes exactly one fresh [`AutomationSnapshot`]. Each
-    /// press uses `GM G`, whose firmware handler compares the live framebuffer
-    /// byte-for-byte with that frozen snapshot before synchronous dispatch. A
+    /// press uses `GM G`, which compares the live framebuffer byte-for-byte
+    /// with that frozen snapshot before synchronous dispatch. A
     /// matching press is always followed by an unconditional `GM K` release.
     /// No metadata transfer, capture, OCR, or filesystem work occurs between
     /// keys. One final stable metadata record authenticates the aggregate
@@ -1389,7 +1388,7 @@ impl<T: Transport> AutomationSession<'_, T> {
     }
 
     async fn send_guarded_press(&mut self, key: FrontPanelKey, sequence: u8) -> Result<u8, Error> {
-        let request = format!("GM G{:02X},0{sequence:02X}\r", key.as_u8());
+        let request = format!("GM G{:02X},0{sequence:02X}\r", key.as_raw());
         let reply = self
             .radio
             .strict_cat_exchange(request.as_bytes(), 13)
@@ -1502,14 +1501,14 @@ impl<T: Transport> AutomationSession<'_, T> {
     ) -> Result<(), Error> {
         let request = format!(
             "GM K{:02X},{}{:02X}\r",
-            key.as_u8(),
-            phase.as_u8(),
+            key.as_raw(),
+            phase.as_raw(),
             sequence
         );
         let expected = format!(
             "GM K{:02X},{}{:02X}00\r",
-            key.as_u8(),
-            phase.as_u8(),
+            key.as_raw(),
+            phase.as_raw(),
             sequence
         );
         self.radio
@@ -1897,13 +1896,13 @@ impl<T: Transport> AutomationSession<'_, T> {
                     route_guard_count == 1
                         && route_completed_taps == 3
                         && route_event_mask == 0x3F
-                        && last_phase == u32::from(KeyPhase::Release.as_u8())
+                        && last_phase == u32::from(KeyPhase::Release.as_raw())
                 } else {
                     last_key_result == RESULT_CONTEXT_CHANGED
                         && route_completed_taps == 0
                         && route_guard_count == 1
                         && route_event_mask == 0
-                        && last_phase == u32::from(KeyPhase::Press.as_u8())
+                        && last_phase == u32::from(KeyPhase::Press.as_raw())
                 };
                 digits_valid
                     && last_host_sequence <= 0xFF
@@ -1973,8 +1972,8 @@ impl<T: Transport> AutomationSession<'_, T> {
             && metadata.command_count == expected_command_count
             && metadata.last_command == COMMAND_KEY
             && metadata.last_host_sequence == u32::from(sequence)
-            && metadata.last_key == u32::from(key.as_u8())
-            && metadata.last_phase == u32::from(phase.as_u8())
+            && metadata.last_key == u32::from(key.as_raw())
+            && metadata.last_phase == u32::from(phase.as_raw())
             && metadata.last_key_result == RESULT_OK
         {
             Ok(())
@@ -1998,8 +1997,8 @@ impl<T: Transport> AutomationSession<'_, T> {
             && metadata.command_count == expected_command_count
             && metadata.last_command == COMMAND_GUARDED_KEY
             && metadata.last_host_sequence == u32::from(sequence)
-            && metadata.last_key == u32::from(key.as_u8())
-            && metadata.last_phase == u32::from(KeyPhase::Press.as_u8())
+            && metadata.last_key == u32::from(key.as_raw())
+            && metadata.last_phase == u32::from(KeyPhase::Press.as_raw())
             && metadata.last_key_result == RESULT_CONTEXT_CHANGED
         {
             Ok(())
@@ -2028,19 +2027,19 @@ impl<T: Transport> AutomationSession<'_, T> {
                     && metadata.route_event_mask == 0x3F
                     && route
                         .key_at(2)
-                        .is_some_and(|key| metadata.last_key == u32::from(key.as_u8()))
-                    && metadata.last_phase == u32::from(KeyPhase::Release.as_u8())
+                        .is_some_and(|key| metadata.last_key == u32::from(key.as_raw()))
+                    && metadata.last_phase == u32::from(KeyPhase::Release.as_raw())
                     && metadata.last_key_result == RESULT_OK
             }
             2 => {
                 let refused_key_matches = route
                     .key_at(0)
-                    .is_some_and(|key| metadata.last_key == u32::from(key.as_u8()));
+                    .is_some_and(|key| metadata.last_key == u32::from(key.as_raw()));
                 metadata.route_completed_taps == 0
                     && metadata.route_guard_count == 1
                     && metadata.route_event_mask == 0
                     && refused_key_matches
-                    && metadata.last_phase == u32::from(KeyPhase::Press.as_u8())
+                    && metadata.last_phase == u32::from(KeyPhase::Press.as_raw())
                     && metadata.last_key_result == RESULT_CONTEXT_CHANGED
             }
             _ => false,
@@ -2212,6 +2211,11 @@ impl<T: Transport> Radio<T> {
     /// I/O begins, cancellation or failure poisons the strict GM stream until
     /// [`Radio::reconnect`].
     pub async fn qualify_automation(&mut self) -> Result<AutomationSession<'_, T>, Error> {
+        // Qualification is a strict CAT conversation, not a recovery path.
+        // Require an already trusted frame boundary before any attestation
+        // traffic is sent.
+        self.require_cat_ready()?;
+
         if self.mcp_phase != McpPhase::Inactive {
             return Err(Error::McpInterrupted);
         }
@@ -2294,7 +2298,9 @@ impl<T: Transport> Radio<T> {
             Ok(metadata) => {
                 self.desynced = false;
                 self.gm_poisoned = false;
-                self.firmware_version = Some(super::AZIMUTH_AUTOMATION_FIRMWARE.to_owned());
+                self.firmware_version = Some(crate::types::FirmwareIdentity::new(
+                    super::AZIMUTH_AUTOMATION_FIRMWARE,
+                )?);
                 Ok(AutomationSession {
                     radio: self,
                     abi: EXPECTED_ABI,
@@ -2409,11 +2415,26 @@ mod tests {
     };
     use crate::error::Error;
     use crate::protocol::memread::encode_hex_upper;
-    use crate::radio::Radio;
+    use crate::radio::{CatState, Radio};
     use crate::screen::{SCREEN_BYTES, ScreenFrame};
     use crate::transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn qualification_rejects_untrusted_cat_boundaries_before_io() -> TestResult {
+        for cat_state in [CatState::RecoveryRequired, CatState::BinaryProven] {
+            let mut radio = Radio::new(MockTransport::new());
+            radio.cat_state = cat_state;
+
+            let result = radio.qualify_automation().await;
+
+            assert!(matches!(result, Err(Error::CatRecoveryRequired)));
+            assert!(!radio.gm_poisoned);
+            assert!(!radio.desynced);
+        }
+        Ok(())
+    }
 
     #[derive(Debug, Clone, Copy)]
     struct MetadataFixture {
@@ -2707,8 +2728,8 @@ mod tests {
             command_count,
             last_command: COMMAND_KEY,
             last_host_sequence: u32::from(sequence),
-            last_key: u32::from(key.as_u8()),
-            last_phase: u32::from(phase.as_u8()),
+            last_key: u32::from(key.as_raw()),
+            last_phase: u32::from(phase.as_raw()),
             last_key_result: RESULT_OK,
             ..MetadataFixture::default()
         })
@@ -2735,8 +2756,8 @@ mod tests {
                 command_count,
                 last_command: command,
                 last_host_sequence: u32::from(sequence),
-                last_key: u32::from(key.as_u8()),
-                last_phase: u32::from(phase.as_u8()),
+                last_key: u32::from(key.as_raw()),
+                last_phase: u32::from(phase.as_raw()),
                 last_key_result: result,
                 ..MetadataFixture::default()
             },
@@ -2772,11 +2793,11 @@ mod tests {
                 command_count,
                 last_command: COMMAND_GUARDED_DECIMAL_ROUTE,
                 last_host_sequence: u32::from(sequence),
-                last_key: u32::from(last_key.as_u8()),
+                last_key: u32::from(last_key.as_raw()),
                 last_phase: u32::from(if success {
-                    KeyPhase::Release.as_u8()
+                    KeyPhase::Release.as_raw()
                 } else {
-                    KeyPhase::Press.as_u8()
+                    KeyPhase::Press.as_raw()
                 }),
                 last_key_result: result,
                 route_ascii: route.packed_ascii(),
@@ -2830,7 +2851,7 @@ mod tests {
     fn raw_key_conversions_cover_only_the_verified_domain() -> TestResult {
         for raw in 0_u8..=AUTOMATION_MAX_KEY {
             let key = FrontPanelKey::try_from(raw)?;
-            assert_eq!(key.as_u8(), raw, "front-panel key must round-trip");
+            assert_eq!(key.as_raw(), raw, "front-panel key must round-trip");
         }
         assert!(FrontPanelKey::try_from(0x19).is_err());
         assert!(KeyPhase::try_from(0).is_ok());
@@ -2877,7 +2898,7 @@ mod tests {
         )?;
         let mut mock = MockTransport::new();
         queue_qualification(&mut mock, &initial)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let session = radio.qualify_automation().await?;
         assert_eq!(session.abi(), EXPECTED_ABI);
         assert_eq!(session.last_generation, 8);
@@ -2891,7 +2912,7 @@ mod tests {
     async fn guarded_input_without_a_capture_is_refused_before_io() -> TestResult {
         let snapshot = automation_snapshot(7, 10, 20)?;
         let mock = MockTransport::new();
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             session.guarded_input_lease = None;
@@ -2914,8 +2935,8 @@ mod tests {
                 seqlock: 2,
                 command_count: 1,
                 last_command: COMMAND_GUARDED_KEY,
-                last_key: u32::from(FrontPanelKey::Menu.as_u8()),
-                last_phase: u32::from(KeyPhase::Press.as_u8()),
+                last_key: u32::from(FrontPanelKey::Menu.as_raw()),
+                last_phase: u32::from(KeyPhase::Press.as_raw()),
                 last_key_result: RESULT_CONTEXT_CHANGED,
                 ..MetadataFixture::default()
             },
@@ -2926,7 +2947,7 @@ mod tests {
         mock.expect(b"GM G01,000\r", b"GM G01,00002\r");
         queue_range(&mut mock, METADATA_OFFSET, &refused)?;
         queue_range(&mut mock, METADATA_OFFSET, &refused)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session_without_snapshot(&mut radio);
             let outcome = session
@@ -2958,7 +2979,7 @@ mod tests {
         mock.expect(b"GM G01,002\r", b"GM G01,00202\r");
         queue_range(&mut mock, METADATA_OFFSET, &refused)?;
         queue_range(&mut mock, METADATA_OFFSET, &refused)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let outcome = session
@@ -2992,7 +3013,7 @@ mod tests {
         mock.expect(b"GM R991,02\r", b"GM R991,0202\r");
         queue_range(&mut mock, METADATA_OFFSET, &refused)?;
         queue_range(&mut mock, METADATA_OFFSET, &refused)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let outcome = session
@@ -3026,7 +3047,7 @@ mod tests {
         mock.expect(b"GM R991,02\r", b"GM R991,0200\r");
         queue_range(&mut mock, METADATA_OFFSET, &dispatched)?;
         queue_range(&mut mock, METADATA_OFFSET, &dispatched)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let result = session
@@ -3067,7 +3088,7 @@ mod tests {
         mock.expect(b"GM K0D,105\r", b"GM K0D,10500\r");
         queue_range(&mut mock, METADATA_OFFSET, &final_metadata)?;
         queue_range(&mut mock, METADATA_OFFSET, &final_metadata)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let outcome = session.guarded_tap_keys(&snapshot, &keys).await?;
@@ -3120,8 +3141,8 @@ mod tests {
         let success = metadata_bytes_for(
             EXPECTED_ABI,
             MetadataFixture {
-                last_key: u32::from(FrontPanelKey::Mark0.as_u8()),
-                last_phase: u32::from(KeyPhase::Release.as_u8()),
+                last_key: u32::from(FrontPanelKey::Mark0.as_raw()),
+                last_phase: u32::from(KeyPhase::Release.as_raw()),
                 last_key_result: RESULT_OK,
                 route_completed_taps: 3,
                 route_event_mask: 0x3F,
@@ -3134,8 +3155,8 @@ mod tests {
         let refused = metadata_bytes_for(
             EXPECTED_ABI,
             MetadataFixture {
-                last_key: u32::from(FrontPanelKey::Pf1_9.as_u8()),
-                last_phase: u32::from(KeyPhase::Press.as_u8()),
+                last_key: u32::from(FrontPanelKey::Pf1_9.as_raw()),
+                last_phase: u32::from(KeyPhase::Press.as_raw()),
                 last_key_result: RESULT_CONTEXT_CHANGED,
                 ..common
             },
@@ -3146,8 +3167,8 @@ mod tests {
         let partial = metadata_bytes_for(
             EXPECTED_ABI,
             MetadataFixture {
-                last_key: u32::from(FrontPanelKey::Tone8.as_u8()),
-                last_phase: u32::from(KeyPhase::Press.as_u8()),
+                last_key: u32::from(FrontPanelKey::Tone8.as_raw()),
+                last_phase: u32::from(KeyPhase::Press.as_raw()),
                 last_key_result: RESULT_CONTEXT_CHANGED,
                 route_completed_taps: 1,
                 route_event_mask: 0x03,
@@ -3170,7 +3191,7 @@ mod tests {
         mock.expect(b"GM R991,00\r", b"GM R991,0000\r");
         queue_range(&mut mock, METADATA_OFFSET, &final_metadata)?;
         queue_range(&mut mock, METADATA_OFFSET, &final_metadata)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let outcome = session.guarded_decimal_route(&snapshot, route).await?;
@@ -3202,7 +3223,7 @@ mod tests {
         mock.expect(b"GM R991,00\r", b"GM R991,0002\r");
         queue_range(&mut mock, METADATA_OFFSET, &refused)?;
         queue_range(&mut mock, METADATA_OFFSET, &refused)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let outcome = session.guarded_decimal_route(&snapshot, route).await?;
@@ -3235,7 +3256,7 @@ mod tests {
             u64::try_from(GUARDED_ROUTE_MAX_DURATION.as_millis())? + 1,
         );
         mock.expect(b"GM R991,00\r", b"");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let result = session.guarded_decimal_route(&snapshot, route).await;
@@ -3271,7 +3292,7 @@ mod tests {
         mock.expect(b"GM G01,000\r", b"GM G01,00002\r");
         queue_range(&mut mock, METADATA_OFFSET, &changed)?;
         queue_range(&mut mock, METADATA_OFFSET, &changed)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let outcome = session
@@ -3306,7 +3327,7 @@ mod tests {
             u64::try_from(GUARDED_ROUTE_MAX_DURATION.as_millis())? + 1,
         );
         mock.expect(b"GM G0B,000\r", b"");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let result = session
@@ -3354,7 +3375,7 @@ mod tests {
         mock.expect(b"GM K01,101\r", b"GM K01,10100\r");
         queue_range(&mut mock, METADATA_OFFSET, &final_release)?;
         queue_range(&mut mock, METADATA_OFFSET, &final_release)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let outcome = session
@@ -3396,7 +3417,7 @@ mod tests {
         mock.expect(b"GM K0B,101\r", b"");
         queue_range(&mut mock, METADATA_OFFSET, &first_release)?;
         queue_range(&mut mock, METADATA_OFFSET, &first_release)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let outcome = session
@@ -3421,7 +3442,7 @@ mod tests {
         let mut wrong = snapshot.clone();
         wrong.metadata.command_count = wrong.metadata.command_count.wrapping_add(1);
         let mock = MockTransport::new();
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let wrong_result = session.guarded_tap_key(&wrong, FrontPanelKey::Menu).await;
@@ -3452,7 +3473,7 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.expect(b"GM G01,000\r", b"GM G01,00000\r");
         mock.expect_hang(b"GM K01,101\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let cancelled = tokio::time::timeout(
@@ -3478,7 +3499,7 @@ mod tests {
         mock.expect(b"GM K01,000\r", b"GM K01,00000\r");
         queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
         queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut session = direct_session(&mut radio, 7);
         let observed = session.key_event(key, KeyPhase::Press).await?;
         assert_eq!(observed.last_key, 1);
@@ -3497,7 +3518,7 @@ mod tests {
             mock.expect(b"GM K01,000\r", b"GM K01,00000\r");
             queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
             queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
-            let mut radio = Radio::connect(mock).await?;
+            let mut radio = Radio::new(mock);
             let mut session = direct_session(&mut radio, 7);
             let result = session.key_event(key, KeyPhase::Press).await;
             assert!(
@@ -3517,7 +3538,7 @@ mod tests {
         mock.expect(b"GM K01,000\r", b"GM K01,00000\r");
         queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
         queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut session = direct_session_with_receipt(&mut radio, 7, u32::MAX, u32::MAX - 1);
         let observed = session.key_event(key, KeyPhase::Press).await?;
         assert_eq!(observed.command_count, 0);
@@ -3530,7 +3551,7 @@ mod tests {
     async fn wrong_key_echo_poisons_session_and_stream() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"GM K01,000\r", b"GM K01,00100\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_session(&mut radio, 7);
             let result = session
@@ -3555,7 +3576,7 @@ mod tests {
         mock.expect(b"GM K01,101\r", b"GM K01,10100\r");
         queue_range(&mut mock, METADATA_OFFSET, &release)?;
         queue_range(&mut mock, METADATA_OFFSET, &release)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut session = direct_session(&mut radio, 7);
         let observed = session.tap_key(key).await?;
         assert_eq!(observed.last_phase, 1);
@@ -3575,7 +3596,7 @@ mod tests {
         mock.expect(b"GM K01,101\r", b"GM K01,10100\r");
         queue_range(&mut mock, METADATA_OFFSET, &release)?;
         queue_range(&mut mock, METADATA_OFFSET, &release)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut session = direct_session(&mut radio, 7);
         let result = session.tap_key(key).await;
         assert!(result.is_err());
@@ -3613,7 +3634,7 @@ mod tests {
             queue_range(&mut mock, METADATA_OFFSET, &release)?;
         }
 
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_session(&mut radio, 7);
             for tap_index in 0..TAP_COUNT {
@@ -3636,7 +3657,7 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.expect(b"GM K01,000\r", b"GM K01,00000\r");
         mock.expect_hang(b"GM K01,101\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_session(&mut radio, 7);
             let cancelled =
@@ -3658,7 +3679,7 @@ mod tests {
         queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
         queue_range(&mut mock, PIXEL_OFFSET, &pixels)?;
         queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut session = direct_session(&mut radio, 7);
         let snapshot = session.capture_screen().await?;
         assert_eq!(snapshot.frame.rgb565_le(), pixels);
@@ -3680,7 +3701,7 @@ mod tests {
         queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
         queue_range(&mut mock, RLE_OFFSET, &encoded)?;
         queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut session = direct_session(&mut radio, 7);
         let snapshot = session.capture_screen().await?;
         assert_eq!(snapshot.frame.rgb565_le(), pixels);
@@ -3715,7 +3736,7 @@ mod tests {
             queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
             queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
         }
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut session = direct_session(&mut radio, 7);
         let result = session.capture_screen().await;
         assert!(matches!(
@@ -3749,7 +3770,7 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.expect(b"GM S000000\r", b"GM S00000001\r");
         queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut session = direct_session(&mut radio, 7);
         let result = session.capture_screen().await;
         assert!(result.is_err());
@@ -3761,7 +3782,7 @@ mod tests {
     async fn malformed_snapshot_status_poisons() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"GM S000000\r", b"GM S00000002\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut session = direct_session(&mut radio, 7);
         let result = session.capture_screen().await;
         assert!(result.is_err());
@@ -3775,7 +3796,7 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.expect(b"GM S000000\r", b"GM S00000000\r");
         queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut session = direct_session(&mut radio, 7);
         let result = session.capture_screen().await;
         assert!(result.is_err());
@@ -3800,7 +3821,7 @@ mod tests {
             let mut mock = MockTransport::new();
             mock.expect(b"GM S000000\r", b"GM S00000000\r");
             queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
-            let mut radio = Radio::connect(mock).await?;
+            let mut radio = Radio::new(mock);
             let mut session = direct_session(&mut radio, 7);
             let result = session.capture_screen().await;
             assert!(
@@ -3834,7 +3855,7 @@ mod tests {
         queue_range(&mut mock, METADATA_OFFSET, &before)?;
         queue_range(&mut mock, RLE_OFFSET, &encoded)?;
         queue_range(&mut mock, METADATA_OFFSET, &after)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut session = direct_session(&mut radio, 7);
         let result = session.capture_screen().await;
         assert!(result.is_err());
@@ -3852,7 +3873,7 @@ mod tests {
         queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
         queue_range(&mut mock, RLE_OFFSET, &encoded)?;
         queue_range(&mut mock, METADATA_OFFSET, &metadata)?;
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut session = direct_session(&mut radio, 7);
         let result = session.capture_screen().await;
         assert!(result.is_err());
@@ -3864,7 +3885,7 @@ mod tests {
     async fn cancelled_snapshot_poisons_session_and_stream() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect_hang(b"GM S000000\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut session = direct_session(&mut radio, 7);
             let cancelled =

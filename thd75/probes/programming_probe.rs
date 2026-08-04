@@ -59,8 +59,7 @@ fn hex_dump(data: &[u8], label: &str) {
 async fn probe_programming_mode() {
     let ports = SerialTransport::discover_usb().unwrap();
     assert!(!ports.is_empty(), "No TH-D75 found");
-    let mut transport =
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
+    let mut transport = SerialTransport::open(&ports[0].port_name).unwrap();
 
     println!("\n=== 0M PROGRAM BINARY PROTOCOL PROBE ===\n");
 

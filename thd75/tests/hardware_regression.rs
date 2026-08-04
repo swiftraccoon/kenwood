@@ -4,7 +4,7 @@
 //! Each test targets a specific bug discovered during hardware testing.
 
 use kenwood_thd75::error::Error;
-use kenwood_thd75::protocol::{self, Command, Response};
+use kenwood_thd75::protocol::{self, Response};
 use kenwood_thd75::types::*;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
@@ -15,6 +15,7 @@ use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -34,8 +35,8 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 fn parse_n_response() -> TestResult {
     let r = protocol::parse(b"N")?;
     assert!(
-        matches!(r, Response::NotAvailable),
-        "expected NotAvailable, got {r:?}"
+        matches!(r, Response::NotAvailableInCurrentMode),
+        "expected NotAvailableInCurrentMode, got {r:?}"
     );
     Ok(())
 }
@@ -46,8 +47,8 @@ fn parse_be_n_response_is_not_available() -> TestResult {
     // before the mnemonic dispatch. So this is handled by the N check.
     let r = protocol::parse(b"N")?;
     assert!(
-        matches!(r, Response::NotAvailable),
-        "expected NotAvailable, got {r:?}"
+        matches!(r, Response::NotAvailableInCurrentMode),
+        "expected NotAvailableInCurrentMode, got {r:?}"
     );
     Ok(())
 }
@@ -107,9 +108,12 @@ fn parse_me_real_hardware_format() -> TestResult {
     let Response::MemoryChannel { selector, record } = r else {
         return Err(format!("expected MemoryChannel, got {r:?}").into());
     };
-    assert_eq!(selector.channel_number(), Some(0));
-    assert_eq!(record.rx_frequency, Frequency::new(154_205_000));
-    assert_eq!(record.urcall.as_str(), "CQCQCQ");
+    assert_eq!(selector.regular_channel(), Some(RegularChannel::new(0)?));
+    assert_eq!(
+        record.channel.receive_frequency,
+        Frequency::new(154_205_000)
+    );
+    assert_eq!(record.channel.ur_call.as_str(), "CQCQCQ");
     Ok(())
 }
 
@@ -121,8 +125,11 @@ fn parse_me_23_fields() -> TestResult {
     let Response::MemoryChannel { selector, record } = r else {
         return Err(format!("expected MemoryChannel, got {r:?}").into());
     };
-    assert_eq!(selector.channel_number(), Some(0));
-    assert_eq!(record.rx_frequency, Frequency::new(145_190_000));
+    assert_eq!(selector.regular_channel(), Some(RegularChannel::new(0)?));
+    assert_eq!(
+        record.channel.receive_frequency,
+        Frequency::new(145_190_000)
+    );
     Ok(())
 }
 
@@ -133,8 +140,11 @@ fn parse_me_channel_001() -> TestResult {
     let Response::MemoryChannel { selector, record } = r else {
         return Err(format!("expected MemoryChannel, got {r:?}").into());
     };
-    assert_eq!(selector.channel_number(), Some(1));
-    assert_eq!(record.rx_frequency, Frequency::new(155_190_000));
+    assert_eq!(selector.regular_channel(), Some(RegularChannel::new(1)?));
+    assert_eq!(
+        record.channel.receive_frequency,
+        Frequency::new(155_190_000)
+    );
     Ok(())
 }
 
@@ -147,11 +157,13 @@ fn parse_me_with_tone_settings() -> TestResult {
     let Response::MemoryChannel { selector, record } = r else {
         return Err(format!("expected MemoryChannel, got {r:?}").into());
     };
-    assert_eq!(selector.channel_number(), Some(3));
-    assert_eq!(record.rx_frequency, Frequency::new(155_340_000));
-    // field[8]=1 → CTCSS enable → maps to byte[10] bit 6
-    // In our struct, ctcss is stored via flags_0a_raw bit 6
-    assert_eq!(record.flags_0a_raw() & 0x40, 0x40);
+    assert_eq!(selector.regular_channel(), Some(RegularChannel::new(3)?));
+    assert_eq!(
+        record.channel.receive_frequency,
+        Frequency::new(155_340_000)
+    );
+    // ME field 8 enables the semantic CTCSS receive mode.
+    assert_eq!(record.channel.tone_mode, ToneMode::Ctcss);
     Ok(())
 }
 
@@ -163,7 +175,7 @@ fn parse_me_with_tone_settings() -> TestResult {
 fn parse_dw_returns_frequency_down() -> TestResult {
     let r = protocol::parse(b"DW")?;
     assert!(
-        matches!(r, Response::FrequencyDown),
+        matches!(r, Response::FrequencyDownAck),
         "expected FrequencyDown, got {r:?}"
     );
     Ok(())
@@ -185,7 +197,7 @@ async fn execute_timeout_field_exists() -> TestResult {
     use std::time::Duration;
 
     let mock = MockTransport::new();
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     radio.set_timeout(Duration::from_millis(100));
     // Verify it doesn't panic and the field is set.
     Ok(())
@@ -220,7 +232,7 @@ fn parse_error_response_still_works() -> TestResult {
 }
 
 // ============================================================================
-// Radio-level NotAvailable handling
+// Radio-level NotAvailableInCurrentMode handling
 // ============================================================================
 
 #[tokio::test]
@@ -230,11 +242,11 @@ async fn radio_not_available_response() -> TestResult {
 
     let mut mock = MockTransport::new();
     mock.expect(b"ID\r", b"N\r");
-    let mut radio = Radio::connect(mock).await?;
-    let result = radio.execute(Command::GetRadioId).await;
+    let mut radio = Radio::new(mock);
+    let result = radio.identify().await;
     assert!(
-        matches!(result, Err(Error::NotAvailable)),
-        "expected NotAvailable, got {result:?}"
+        matches!(result, Err(Error::NotAvailableInCurrentMode)),
+        "expected NotAvailableInCurrentMode, got {result:?}"
     );
     Ok(())
 }

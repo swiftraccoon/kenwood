@@ -11,6 +11,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -22,7 +23,7 @@ use tracing as _;
 
 use kenwood_thd75::protocol::memread::encode_hex_upper;
 use kenwood_thd75::protocol::{Command, Response, parse, serialize};
-use kenwood_thd75::types::{DdrOffset, MEM_READ_BOUND, ReadLen};
+use kenwood_thd75::types::{MEMORY_READ_WIRE_BOUND, MemoryReadOffset, ReadLen};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
@@ -37,7 +38,7 @@ fn to_test_err<E: std::fmt::Debug>(e: E) -> TestCaseError {
 #[test]
 fn serializes_exactly_thirteen_bytes() -> TestResult {
     let cmd = Command::ReadMemory {
-        offset: DdrOffset::new(0x17_D1BC)?,
+        offset: MemoryReadOffset::new(0x17_D1BC)?,
         len: ReadLen::new(64)?,
     };
     let wire = serialize(&cmd);
@@ -49,7 +50,7 @@ fn serializes_exactly_thirteen_bytes() -> TestResult {
 #[test]
 fn pads_offset_to_six_digits_and_len_to_two() -> TestResult {
     let cmd = Command::ReadMemory {
-        offset: DdrOffset::ZERO,
+        offset: MemoryReadOffset::ZERO,
         len: ReadLen::new(1)?,
     };
     assert_eq!(serialize(&cmd), b"GM 000000,01\r".to_vec());
@@ -59,8 +60,8 @@ fn pads_offset_to_six_digits_and_len_to_two() -> TestResult {
 #[test]
 fn encodes_256_as_double_zero() -> TestResult {
     let cmd = Command::ReadMemory {
-        offset: DdrOffset::new(0xFF_FF00)?,
-        len: ReadLen::MAX,
+        offset: MemoryReadOffset::new(0xFF_FF00)?,
+        len: ReadLen::new(ReadLen::MAX)?,
     };
     assert_eq!(serialize(&cmd), b"GM FFFF00,00\r".to_vec());
     Ok(())
@@ -69,7 +70,7 @@ fn encodes_256_as_double_zero() -> TestResult {
 #[test]
 fn grammar_anchors_land_where_the_radio_checks_them() -> TestResult {
     let cmd = Command::ReadMemory {
-        offset: DdrOffset::new(0xAB_CDEF)?,
+        offset: MemoryReadOffset::new(0xAB_CDEF)?,
         len: ReadLen::new(16)?,
     };
     let wire = serialize(&cmd);
@@ -82,7 +83,7 @@ fn grammar_anchors_land_where_the_radio_checks_them() -> TestResult {
 #[test]
 fn hex_digits_are_uppercase() -> TestResult {
     let cmd = Command::ReadMemory {
-        offset: DdrOffset::new(0xAB_CDEF)?,
+        offset: MemoryReadOffset::new(0xAB_CDEF)?,
         len: ReadLen::new(0xBC)?,
     };
     assert_eq!(serialize(&cmd), b"GM ABCDEF,BC\r".to_vec());
@@ -100,7 +101,7 @@ fn parses_reply_with_echoed_offset() -> TestResult {
         matches!(
             &response,
             Response::MemoryData { offset, bytes }
-                if offset.as_u32() == 0x17_D1BC
+                if offset.as_raw() == 0x17_D1BC
                     && bytes.as_slice() == [0x42, 0x4D, 0x76, 0xFA]
         ),
         "unexpected response: {response:?}"
@@ -109,19 +110,22 @@ fn parses_reply_with_echoed_offset() -> TestResult {
 }
 
 #[test]
-fn parses_lowercase_hex_defensively() -> TestResult {
-    // The radio emits uppercase only, but accepting both costs nothing and
-    // guards against a relay or future firmware that normalises case.
-    let response = parse(b"GM 000010,deadbeef")?;
-    assert!(
-        matches!(
-            &response,
-            Response::MemoryData { bytes, .. }
-                if bytes.as_slice() == [0xDE, 0xAD, 0xBE, 0xEF]
-        ),
-        "unexpected response: {response:?}"
-    );
-    Ok(())
+fn rejects_noncanonical_offset_and_data_spelling() {
+    for malformed in [
+        b"GM 000010,deadbeef".as_slice(),
+        b"GM 00001,DEAD".as_slice(),
+        b"GM 0000010,DEAD".as_slice(),
+        b"GM 00000010,DEAD".as_slice(),
+        b"GM 00001a,DEAD".as_slice(),
+        b"GM 000010, DEAD".as_slice(),
+        b"GM 000010,DEAD ".as_slice(),
+    ] {
+        let result = parse(malformed);
+        assert!(
+            result.is_err(),
+            "noncanonical memory reply was accepted: {malformed:?}"
+        );
+    }
 }
 
 #[test]
@@ -134,6 +138,17 @@ fn parses_a_full_256_byte_reply() -> TestResult {
         "expected 256 bytes, got {response:?}"
     );
     Ok(())
+}
+
+#[test]
+fn rejects_a_257_byte_reply_before_decoding() {
+    let data = vec![0xA5; 257];
+    let frame = format!("GM 000000,{}", encode_hex_upper(&data));
+    let result = parse(frame.as_bytes());
+    assert!(
+        result.is_err(),
+        "memory replies may contain at most 256 bytes: {result:?}"
+    );
 }
 
 #[test]
@@ -174,15 +189,15 @@ proptest! {
     /// Builds a reply exactly as the radio would, then parses it back.
     #[test]
     fn hex_reply_round_trips(
-        offset in 0u32..MEM_READ_BOUND,
+        offset in 0u32..MEMORY_READ_WIRE_BOUND,
         data in proptest::collection::vec(any::<u8>(), 1..=256),
     ) {
         let frame = format!("GM {offset:06X},{}", encode_hex_upper(&data));
         let response = parse(frame.as_bytes()).map_err(to_test_err)?;
         match response {
             Response::MemoryData { offset: got, bytes } => {
-                prop_assert_eq!(got.as_u32(), offset);
-                prop_assert_eq!(bytes, data);
+                prop_assert_eq!(got.as_raw(), offset);
+                prop_assert_eq!(bytes.as_slice(), data.as_slice());
             }
             other => prop_assert!(false, "wrong variant: {:?}", other),
         }
@@ -192,11 +207,11 @@ proptest! {
     /// the radio checks in the positions it checks them.
     #[test]
     fn every_serialized_request_is_well_formed(
-        offset in 0u32..MEM_READ_BOUND,
+        offset in 0u32..MEMORY_READ_WIRE_BOUND,
         len in 1u16..=256,
     ) {
         let cmd = Command::ReadMemory {
-            offset: DdrOffset::new(offset).map_err(to_test_err)?,
+            offset: MemoryReadOffset::new(offset).map_err(to_test_err)?,
             len: ReadLen::new(len).map_err(to_test_err)?,
         };
         let wire = serialize(&cmd);

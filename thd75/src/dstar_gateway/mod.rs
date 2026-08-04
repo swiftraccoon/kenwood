@@ -2,9 +2,9 @@
 //!
 //! The TH-D75 in Reflector Terminal Mode speaks the MMDVM binary
 //! framing protocol on its serial link. This module owns the radio-facing
-//! side of that interface: a [`DStarGateway`] wraps an
-//! [`mmdvm::AsyncModem`] and translates its [`mmdvm::Event`] stream into
-//! the higher-level [`DStarEvent`]s that TH-D75 consumers care about
+//! side of that interface: a [`DstarGateway`] wraps an
+//! [`::mmdvm::AsyncModem`] and translates its [`::mmdvm::Event`] stream into
+//! the higher-level [`DstarEvent`]s that TH-D75 consumers care about
 //! (slow-data text messages, URCALL commands, last-heard tracking,
 //! echo record/playback).
 //!
@@ -20,6 +20,12 @@ pub mod gateway;
 
 // Re-export the most commonly used types from mmdvm-core so thd75
 // consumers don't need to depend on it directly.
+/// An exact event emitted by the asynchronous MMDVM modem loop.
+pub use ::mmdvm::Event as MmdvmEvent;
+pub use dstar_gateway_core::{SlowDataTextMessage, WireTextError};
 pub use mmdvm_core::{MmdvmError, ModemMode, ModemStatus, NakReason};
 
-pub use gateway::{DStarEvent, DStarGateway, DStarGatewayConfig, LastHeardEntry, ReconnectPolicy};
+pub use gateway::{
+    DstarEvent, DstarGateway, DstarGatewayConfig, DstarProtocolViolation, DstarStatusReflector,
+    DstarStatusReflectorError, LastHeardEntry, ObservedDstarCallsign,
+};

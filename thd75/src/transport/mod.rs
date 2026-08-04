@@ -18,7 +18,7 @@
 //!
 //! # USB (per Operating Tips §5.13)
 //!
-//! - CDC virtual COM port (same driver as TH-D74, available at kenwood.com)
+//! - CDC virtual COM port
 //! - USB audio output: 48 kHz / 16-bit / mono, output only (same as speaker
 //!   output). Adjustable via Menu No. 91A.
 //! - USB Mass Storage: Menu No. 980 (Windows only for mass storage feature)
@@ -46,7 +46,7 @@ pub mod serial;
 pub use bluetooth::BluetoothTransport;
 pub use broker::{BrokerHandle, MainThreadBroker};
 pub use either::EitherTransport;
-pub use mmdvm_adapter::MmdvmTransportAdapter;
+pub use mmdvm_adapter::{MmdvmTransportAdapter, MmdvmTransportRecoveryError};
 pub use mock::MockTransport;
 pub use serial::SerialTransport;
 
@@ -62,7 +62,19 @@ pub trait Transport: Send + Sync {
     /// Send raw bytes to the radio.
     fn write(&mut self, data: &[u8]) -> impl Future<Output = Result<(), TransportError>> + Send;
 
-    /// Read available bytes into buffer, return count of bytes read.
+    /// Read available bytes into `buf`, returning the initialized byte count.
+    ///
+    /// # Cancellation safety
+    ///
+    /// This future must be cancellation-safe: if it is dropped while pending,
+    /// the next call must still be able to deliver every byte that was not
+    /// returned to the caller. [`MmdvmTransportAdapter`] deliberately races a
+    /// pending read against outbound work so one blocked read cannot prevent a
+    /// write; that race cancels and recreates the losing read future.
+    ///
+    /// Returning a count larger than `buf.len()` violates this trait's
+    /// contract. Consumers treat that as terminal transport corruption rather
+    /// than indexing beyond the initialized region.
     fn read(
         &mut self,
         buf: &mut [u8],

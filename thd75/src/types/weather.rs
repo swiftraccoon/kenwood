@@ -36,31 +36,74 @@
 //! stops when the channel with the highest signal level is found or
 //! when no signal is received on any channel.
 //!
-//! These types model weather alert settings from the TH-D75 user manual.
-//! Derived from the capability gap analysis features 158 and 196.
+//! These types model weather alert settings from the TH-D75 menu and MCP
+//! storage domains.
 
 // ---------------------------------------------------------------------------
-// Weather configuration
+// Weather settings
 // ---------------------------------------------------------------------------
 
-/// Weather alert receiver configuration (TH-D75A only).
+/// Weather alert receiver settings (TH-D75A only).
 ///
 /// Controls the weather alert monitoring and automatic weather channel
 /// scanning features. These features are only available on the Americas
 /// model (TH-D75A); they are not present on the European model (TH-D75E).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct WeatherConfig {
+pub struct WeatherSettings {
     /// Enable weather alert monitoring.
     ///
     /// When enabled, the radio periodically checks NOAA Weather Radio
     /// frequencies for 1050 Hz weather alert tones and sounds an alarm
     /// when detected.
     pub alert: bool,
-    /// Enable automatic weather channel scanning.
-    ///
-    /// When enabled, the radio scans all 10 NOAA Weather Radio channels
-    /// to find the strongest signal for the current location.
-    pub auto_scan: bool,
+    /// Automatic weather-channel scan interval.
+    pub auto_scan: WeatherAutoScan,
+}
+
+/// Automatic weather-channel scanning interval stored by Menu No. 136.
+///
+/// The MCP menu field uses the non-contiguous raw values `0`, `1`, `2`, and
+/// `4` for Off, 15, 30, and 60 minutes respectively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum WeatherAutoScan {
+    /// Automatic scanning disabled (raw `0`).
+    #[default]
+    Off,
+    /// Scan every 15 minutes (raw `1`).
+    Minutes15,
+    /// Scan every 30 minutes (raw `2`).
+    Minutes30,
+    /// Scan every 60 minutes (raw `4`).
+    Minutes60,
+}
+
+impl TryFrom<u8> for WeatherAutoScan {
+    type Error = crate::error::ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Off),
+            1 => Ok(Self::Minutes15),
+            2 => Ok(Self::Minutes30),
+            4 => Ok(Self::Minutes60),
+            _ => Err(crate::error::ValidationError::SettingOutOfRange {
+                name: "automatic weather scan interval",
+                value,
+                detail: "must be raw 0, 1, 2, or 4 (Off, 15, 30, or 60 minutes)",
+            }),
+        }
+    }
+}
+
+impl From<WeatherAutoScan> for u8 {
+    fn from(interval: WeatherAutoScan) -> Self {
+        match interval {
+            WeatherAutoScan::Off => 0,
+            WeatherAutoScan::Minutes15 => 1,
+            WeatherAutoScan::Minutes30 => 2,
+            WeatherAutoScan::Minutes60 => 4,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -72,19 +115,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn weather_config_default() {
-        let cfg = WeatherConfig::default();
-        assert!(!cfg.alert);
-        assert!(!cfg.auto_scan);
+    fn weather_settings_default() {
+        let settings = WeatherSettings::default();
+        assert!(!settings.alert);
+        assert_eq!(settings.auto_scan, WeatherAutoScan::Off);
     }
 
     #[test]
-    fn weather_config_enabled() {
-        let cfg = WeatherConfig {
+    fn weather_settings_enabled() {
+        let settings = WeatherSettings {
             alert: true,
-            auto_scan: true,
+            auto_scan: WeatherAutoScan::Minutes30,
         };
-        assert!(cfg.alert);
-        assert!(cfg.auto_scan);
+        assert!(settings.alert);
+        assert_eq!(settings.auto_scan, WeatherAutoScan::Minutes30);
+    }
+
+    #[test]
+    fn weather_auto_scan_preserves_sparse_storage_domain() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for (raw, interval) in [
+            (0, WeatherAutoScan::Off),
+            (1, WeatherAutoScan::Minutes15),
+            (2, WeatherAutoScan::Minutes30),
+            (4, WeatherAutoScan::Minutes60),
+        ] {
+            assert_eq!(WeatherAutoScan::try_from(raw)?, interval);
+            assert_eq!(u8::from(interval), raw);
+        }
+        assert!(WeatherAutoScan::try_from(3).is_err());
+        Ok(())
     }
 }

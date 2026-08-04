@@ -1,8 +1,8 @@
 //! Validate lossless typed CAT reads against a connected TH-D75.
 //!
-//! This example is deliberately read-only. It issues only `FV`, `TY`, `FQ`,
-//! `FO`, `MR`, `ME`, and `RT` queries and prints every transport chunk so the
-//! typed results can be compared with the exact wire responses.
+//! This example is deliberately read-only. It issues only `FV`, `AE`, `TY`,
+//! `FQ`, `FO`, `MR`, `ME`, and `RT` queries and prints every transport chunk
+//! so the typed results can be compared with the exact wire responses.
 //!
 //! Run:
 //! `cargo run -p kenwood-thd75 --example read_validation -- /dev/cu.usbmodem1234`
@@ -14,6 +14,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -27,7 +28,7 @@ use std::future::Future;
 
 use kenwood_thd75::error::TransportError;
 use kenwood_thd75::transport::{SerialTransport, Transport};
-use kenwood_thd75::types::{Band, MemorySelector};
+use kenwood_thd75::types::{Band, MemoryChannelAddress};
 use kenwood_thd75::{Error, Radio};
 
 #[derive(Debug)]
@@ -76,16 +77,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "/dev/cu.usbmodem1234".to_owned());
     println!("Opening {port} at 115200 baud");
-    let transport = SerialTransport::open(&port, SerialTransport::DEFAULT_BAUD)?;
-    let mut radio = Radio::connect(WireTrace::new(transport)).await?;
+    let transport = SerialTransport::open(&port)?;
+    let mut radio = Radio::new(WireTrace::new(transport));
 
     let firmware = radio.get_firmware_version().await?;
     println!("typed FV => {firmware:?}");
 
+    let serial_information = radio.get_serial_information().await?;
+    println!("typed AE => {serial_information:?}");
+
     let radio_type = radio.get_radio_type().await?;
     println!("typed TY => {radio_type:?}");
 
-    let mut selectors = Vec::<MemorySelector>::new();
+    let mut addresses = Vec::<MemoryChannelAddress>::new();
     for band in [Band::A, Band::B] {
         let band_number = u8::from(band);
 
@@ -101,24 +105,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match radio.get_current_channel(band).await {
             Ok(selector) => {
                 println!("typed MR {band_number} => {selector}");
-                if !selectors.contains(&selector) {
-                    selectors.push(selector);
+                if let Some(address) = selector.address() {
+                    if !addresses.contains(&address) {
+                        addresses.push(address);
+                    }
+                } else {
+                    println!("typed ME => skipped (MR reported output-only {selector})");
                 }
             }
-            Err(Error::NotAvailable) => {
-                println!("typed MR {band_number} => NotAvailable (band is not in memory mode)");
+            Err(Error::NotAvailableInCurrentMode) => {
+                println!(
+                    "typed MR {band_number} => NotAvailableInCurrentMode (band is not in memory mode)"
+                );
             }
             Err(error) => return Err(error.into()),
         }
     }
 
-    if selectors.is_empty() {
-        println!("typed ME => skipped (MR returned no active memory selectors)");
+    if addresses.is_empty() {
+        println!("typed ME => skipped (MR returned no readable memory addresses)");
     }
-    for selector in selectors {
-        match radio.read_memory(selector).await {
-            Ok(record) => println!("typed ME {selector} => {record:#?}"),
-            Err(Error::NotAvailable) => println!("typed ME {selector} => NotAvailable"),
+    for address in addresses {
+        match radio.get_channel_record(address).await {
+            Ok(record) => println!("typed ME {address} => {record:#?}"),
+            Err(Error::NotAvailableInCurrentMode) => {
+                println!("typed ME {address} => NotAvailableInCurrentMode");
+            }
             Err(error) => return Err(error.into()),
         }
     }

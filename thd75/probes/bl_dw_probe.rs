@@ -14,7 +14,10 @@ async fn raw(transport: &mut SerialTransport, cmd: &[u8]) -> Option<String> {
             match transport.read(&mut buf).await {
                 Ok(0) => return None,
                 Ok(n) => {
-                    codec.feed(&buf[..n]);
+                    if let Err(error) = codec.feed(&buf[..n]) {
+                        eprintln!("CAT framing failed while reading a probe response: {error}");
+                        return None;
+                    }
                     if let Some(frame) = codec.next_frame() {
                         return Some(String::from_utf8_lossy(&frame).to_string());
                     }
@@ -31,7 +34,7 @@ async fn raw(transport: &mut SerialTransport, cmd: &[u8]) -> Option<String> {
 #[ignore]
 async fn probe_bl_formats() {
     let ports = SerialTransport::discover_usb().unwrap();
-    let mut t = SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
+    let mut t = SerialTransport::open(&ports[0].port_name).unwrap();
 
     println!("\n=== BL PROBE ===");
     // Read current value
@@ -57,7 +60,7 @@ async fn probe_bl_formats() {
 #[ignore]
 async fn probe_dw_formats() {
     let ports = SerialTransport::discover_usb().unwrap();
-    let mut t = SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
+    let mut t = SerialTransport::open(&ports[0].port_name).unwrap();
 
     println!("\n=== DW PROBE ===");
     // Read current value

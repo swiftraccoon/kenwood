@@ -1,5 +1,5 @@
-//! Integration tests for the 13 control protocol commands:
-//! AI, BY, DL, DW, BE, RX, TX, LC, IO, BL, VD, VG, VX.
+//! Integration tests for the 14 control and bare-action protocol commands:
+//! AI, BY, DL, DW, UP, BE, RX, TX, LC, IO, BL, VD, VG, VX.
 
 use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::types::*;
@@ -11,6 +11,7 @@ use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -120,39 +121,41 @@ fn parse_by_rejects_non_boolean() {
 }
 
 // ============================================================================
-// DL -- Dual-band display (boolean)
+// DL -- Single-band or dual-band display
 // ============================================================================
 
 #[test]
 fn serialize_dl_read() {
-    assert_eq!(protocol::serialize(&Command::GetDualBand), b"DL\r");
+    assert_eq!(protocol::serialize(&Command::GetBandMode), b"DL\r");
 }
 
 #[test]
-fn serialize_dl_on() {
+fn serialize_dl_single_band() {
     assert_eq!(
-        protocol::serialize(&Command::SetDualBand { enabled: true }),
+        protocol::serialize(&Command::SetBandMode {
+            mode: BandMode::Single,
+        }),
         b"DL 1\r"
     );
 }
 
 #[test]
-fn parse_dl_enabled() -> TestResult {
+fn parse_dl_single_band() -> TestResult {
     let r = protocol::parse(b"DL 1")?;
-    let Response::DualBand { enabled } = r else {
-        return Err(format!("expected DualBand, got {r:?}").into());
+    let Response::BandMode { mode } = r else {
+        return Err(format!("expected BandMode, got {r:?}").into());
     };
-    assert!(enabled);
+    assert_eq!(mode, BandMode::Single);
     Ok(())
 }
 
 #[test]
-fn parse_dl_disabled() -> TestResult {
+fn parse_dl_dual_band() -> TestResult {
     let r = protocol::parse(b"DL 0")?;
-    let Response::DualBand { enabled } = r else {
-        return Err(format!("expected DualBand, got {r:?}").into());
+    let Response::BandMode { mode } = r else {
+        return Err(format!("expected BandMode, got {r:?}").into());
     };
-    assert!(!enabled);
+    assert_eq!(mode, BandMode::Dual);
     Ok(())
 }
 
@@ -173,7 +176,7 @@ fn serialize_dw_band_b() {
 #[test]
 fn parse_dw_response() -> TestResult {
     let r = protocol::parse(b"DW")?;
-    let Response::FrequencyDown = r else {
+    let Response::FrequencyDownAck = r else {
         return Err(format!("expected FrequencyDown, got {r:?}").into());
     };
     Ok(())
@@ -187,7 +190,7 @@ fn parse_dw_rejects_payload() {
 #[test]
 fn parse_up_bare_response() -> TestResult {
     let response = protocol::parse(b"UP")?;
-    assert!(matches!(response, Response::FrequencyUp));
+    assert!(matches!(response, Response::FrequencyUpAck));
     Ok(())
 }
 
@@ -197,12 +200,41 @@ fn parse_up_rejects_payload() {
 }
 
 // ============================================================================
+// BE -- transmit one APRS beacon (bare on-air action)
+// ============================================================================
+
+#[test]
+fn serialize_beacon_transmit_action() {
+    assert_eq!(protocol::serialize(&Command::TransmitAprsBeacon), b"BE\r");
+}
+
+#[test]
+fn parse_beacon_transmit_acknowledgement() -> TestResult {
+    assert!(matches!(
+        protocol::parse(b"BE")?,
+        Response::AprsBeaconTransmitAck
+    ));
+    Ok(())
+}
+
+#[test]
+fn parse_beacon_transmit_rejects_a_payload() {
+    assert!(protocol::parse(b"BE 0").is_err());
+}
+
+// ============================================================================
 // RX -- Receive (bare action)
 // ============================================================================
 
 #[test]
 fn serialize_rx() {
     assert_eq!(protocol::serialize(&Command::Receive), b"RX\r");
+}
+
+#[test]
+fn parse_rx_echo() -> TestResult {
+    assert!(matches!(protocol::parse(b"RX")?, Response::ReceiveAck));
+    Ok(())
 }
 
 #[test]
@@ -217,6 +249,12 @@ fn parse_rx_rejects_payload() {
 #[test]
 fn serialize_tx() {
     assert_eq!(protocol::serialize(&Command::Transmit), b"TX\r");
+}
+
+#[test]
+fn parse_tx_echo() -> TestResult {
+    assert!(matches!(protocol::parse(b"TX")?, Response::TransmitAck));
+    Ok(())
 }
 
 #[test]
@@ -279,21 +317,21 @@ fn parse_lc_rejects_out_of_range_mode() {
 }
 
 // ============================================================================
-// IO -- I/O port (read-only, u8 value)
+// IO -- USB audio output selection
 // ============================================================================
 
 #[test]
 fn serialize_io_read() {
-    assert_eq!(protocol::serialize(&Command::GetIoPort), b"IO\r");
+    assert_eq!(protocol::serialize(&Command::GetUsbAudioOutput), b"IO\r");
 }
 
 #[test]
 fn parse_io_response() -> TestResult {
     let r = protocol::parse(b"IO 0")?;
-    let Response::IoPort { value } = r else {
-        return Err(format!("expected IoPort, got {r:?}").into());
+    let Response::UsbAudioOutput { output } = r else {
+        return Err(format!("expected UsbAudioOutput, got {r:?}").into());
     };
-    assert_eq!(value, DetectOutputMode::Af);
+    assert_eq!(output, UsbAudioOutput::Audio);
     Ok(())
 }
 
@@ -337,12 +375,52 @@ fn parse_bl_charging() -> TestResult {
 }
 
 #[test]
+fn parse_bl_accepts_a_valid_unsolicited_band_prefix() -> TestResult {
+    let response = protocol::parse(b"BL 0,3")?;
+    assert!(matches!(
+        response,
+        Response::BatteryLevel {
+            level: BatteryLevel::Full
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn parse_bl_rejects_an_unknown_or_malformed_prefix() {
+    for frame in [b"BL 2,3".as_slice(), b"BL x,3", b"BL ,3", b"BL 0, 3"] {
+        assert!(
+            protocol::parse(frame).is_err(),
+            "malformed BL prefix must be rejected: {frame:?}"
+        );
+    }
+}
+
+#[test]
+fn response_envelope_requires_exactly_one_space_before_payload() {
+    for frame in [
+        b"BL3".as_slice(),
+        b"BL  3",
+        b"BL\t3",
+        b"BL\n3",
+        b"bl 3",
+        b"B! 3",
+        &[b'B', b'L', b' ', 0xFF],
+    ] {
+        assert!(
+            protocol::parse(frame).is_err(),
+            "malformed response envelope must be rejected: {frame:?}"
+        );
+    }
+}
+
+#[test]
 fn parse_bl_preserves_unqualified_raw_five() -> TestResult {
     let r = protocol::parse(b"BL 5")?;
     let Response::BatteryLevel { level } = r else {
         return Err(format!("expected BatteryLevel, got {r:?}").into());
     };
-    assert_eq!(level, BatteryLevel::Raw5);
+    assert_eq!(level, BatteryLevel::Unidentified5);
     Ok(())
 }
 
@@ -373,7 +451,7 @@ fn parse_vd_response() -> TestResult {
         return Err(format!("expected VoxDelay, got {r:?}").into());
     };
     assert_eq!(delay, VoxDelay::new(4)?);
-    assert_eq!(delay.as_millis(), 1500);
+    assert_eq!(delay.as_milliseconds(), 1500);
     Ok(())
 }
 

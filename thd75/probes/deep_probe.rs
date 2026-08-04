@@ -1,10 +1,10 @@
 //! Deep probe: map the full read-only data surface of the TH-D75.
 //!
-//! STRICTLY READ-ONLY. Every command sent here has been verified against
-//! D74 development notes and Hamlib source.
+//! STRICTLY READ-ONLY. Every emitted form must have an established TH-D75
+//! read contract. This probe does not send candidate or inferred mnemonics.
 //!
 //! ## Commands EXCLUDED (will change radio state):
-//! - SR (RESET: factory resets radio)
+//! - SR with a parameter (changes the scan-resume setting)
 //! - 0M (enters programming mode; radio stops responding)
 //! - TX (keys transmitter; transmits on air)
 //! - RX (forces receive mode)
@@ -22,7 +22,7 @@
 //! - Bare mnemonic: `XX\r`, for commands with no index
 //! - Band-indexed: `XX 0\r` / `XX 1\r`, for per-band queries
 //! - Channel-indexed: `ME ccc\r`, which reads memory channel data
-//! - Slot-indexed: `DC 1\r`-`DC 6\r`, `CS 0\r`-`CS 10\r`
+//! - Slot-indexed: `DC 1\r`-`DC 6\r`
 //!
 //! Run: cargo test --test deep_probe -- --ignored --nocapture --test-threads=1
 
@@ -30,7 +30,6 @@ mod firmware_guard;
 
 use kenwood_thd75::protocol::Codec;
 use kenwood_thd75::transport::{SerialTransport, Transport};
-use std::io::Write as IoWrite;
 
 async fn raw_cmd(transport: &mut SerialTransport, cmd: &str) -> Option<String> {
     let wire = format!("{cmd}\r");
@@ -44,7 +43,10 @@ async fn raw_cmd(transport: &mut SerialTransport, cmd: &str) -> Option<String> {
             match transport.read(&mut buf).await {
                 Ok(0) => return None,
                 Ok(n) => {
-                    codec.feed(&buf[..n]);
+                    if let Err(error) = codec.feed(&buf[..n]) {
+                        eprintln!("CAT framing failed while reading `{cmd}`: {error}");
+                        return None;
+                    }
                     if let Some(frame) = codec.next_frame() {
                         return Some(String::from_utf8_lossy(&frame).to_string());
                     }
@@ -108,7 +110,7 @@ async fn deep_probe_all_reads() {
     let ports = SerialTransport::discover_usb().unwrap();
     assert!(!ports.is_empty(), "No TH-D75 found");
     let mut transport =
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
+        SerialTransport::open(&ports[0].port_name).unwrap();
 
     let mut output: Vec<String> = Vec::new();
     let mut alive = true;
@@ -116,7 +118,7 @@ async fn deep_probe_all_reads() {
     output.push("TH-D75 Deep Probe: CONFIRMED SAFE READS ONLY".into());
     output.push("Date: 2026-03-25".into());
     output.push(format!("Port: {}", ports[0].port_name));
-    output.push("Sources: D74 development notes, Hamlib".into());
+    output.push("Contract: established TH-D75 read forms only".into());
 
     // ================================================================
     // IDENTITY (confirmed read-only, no params)
@@ -324,14 +326,12 @@ async fn deep_probe_all_reads() {
     }
 
     // ================================================================
-    // SCAN: SF per band, BS per band
+    // SCAN: SF per band. BS is not band-indexed; `BS 0` and `BS 1` are
+    // antenna-selection writes and must never be emitted by this probe.
     // ================================================================
     if alive {
         output.push("\n===== SCAN =====".into());
         alive = band_read(&mut transport, "SF", &mut output).await;
-        if alive {
-            alive = band_read(&mut transport, "BS", &mut output).await;
-        }
     }
 
     // ================================================================
@@ -385,7 +385,7 @@ async fn deep_probe_all_reads() {
     let _ = transport.close().await;
 
     // ================================================================
-    // PRINT & SAVE
+    // PRINT
     // ================================================================
     if !alive {
         output.push("\n*** CONNECTION LOST DURING PROBE ***".into());
@@ -398,10 +398,4 @@ async fn deep_probe_all_reads() {
         println!("{line}");
     }
 
-    let path = "tests/fixtures/deep_probe_results.txt";
-    let mut f = std::fs::File::create(path).unwrap();
-    for line in &output {
-        writeln!(f, "{line}").unwrap();
-    }
-    println!("\nResults saved to {path}");
 }

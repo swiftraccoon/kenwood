@@ -1,75 +1,48 @@
-//! Scan commands: SR and SF, plus BS antenna selection.
+//! Identified scan commands: SF plus BS antenna selection.
 //!
 //! Provides parsing of responses for scan-related CAT protocol commands.
 //!
 //! Firmware-verified:
-//! - SR has no read form (bare `SR\r` returns `?`). Write-only.
 //! - SF = Step Size, band-indexed (`SF band\r` returns `SF band,step`).
 //! - BS controls the MW/SW antenna (`BS\r` reads, `BS 0|1\r` writes).
+//!
+//! Firmware analysis identifies `SR 0/1/2` as the scan-resume operation
+//! (Time/Carrier/Seek), not a reset. This module currently implements only the
+//! independently qualified `SF` and `BS` CAT surfaces; the public analog and
+//! digital scan-resume setters target their separate MCP menu cells.
 
 use crate::error::ProtocolError;
-use crate::types::Band;
 use crate::types::mode::StepSize;
+use crate::types::{AntennaInput, Band};
 
 use super::Response;
+use super::fields::{boolean, fixed_decimal_u8, split_exact, upper_hex_nibble};
 
 /// Parse a scan command response from mnemonic and payload.
 ///
 /// Returns `None` if the mnemonic is not a scan command.
 ///
-/// Note: SR has no read form on the TH-D75 (bare `SR\r` returns `?`).
-/// When a write echo `SR value` is received, it is treated as a write
-/// acknowledgment (`Ok`).
 pub(crate) fn parse_scan(mnemonic: &str, payload: &str) -> Option<Result<Response, ProtocolError>> {
     match mnemonic {
-        "SR" => Some(Ok(Response::Ok)),
         "SF" => Some(parse_sf(payload)),
         "BS" => Some(parse_bs(payload)),
         _ => None,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Parse a `u8` from a string field.
-fn parse_u8_field(s: &str, cmd: &str, field: &str) -> Result<u8, ProtocolError> {
-    s.parse::<u8>().map_err(|_| ProtocolError::FieldParse {
-        command: cmd.to_owned(),
-        field: field.to_owned(),
-        detail: format!("invalid u8: {s:?}"),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Individual parsers
-// ---------------------------------------------------------------------------
-
 /// Parse SF (step size): `band,step`.
 ///
 /// Firmware-verified: SF = Step Size. `SF band\r` returns `SF band,step`.
 fn parse_sf(payload: &str) -> Result<Response, ProtocolError> {
-    let (band_str, step_str) =
-        payload
-            .split_once(',')
-            .ok_or_else(|| ProtocolError::FieldParse {
-                command: "SF".to_owned(),
-                field: "all".to_owned(),
-                detail: format!("expected band,step, got {payload:?}"),
-            })?;
-    let band_val = parse_u8_field(band_str, "SF", "band")?;
+    let [band_str, step_str] = split_exact::<2>(payload, "SF")?;
+    let band_val = fixed_decimal_u8::<1>(band_str, "SF", "band")?;
     let band = Band::try_from(band_val).map_err(|e| ProtocolError::FieldParse {
         command: "SF".to_owned(),
         field: "band".to_owned(),
         detail: e.to_string(),
     })?;
-    // Step value uses hex (TABLE C: A=50kHz, B=100kHz, confirmed by ARFC RE)
-    let step_val = u8::from_str_radix(step_str, 16).map_err(|_| ProtocolError::FieldParse {
-        command: "SF".to_owned(),
-        field: "step".to_owned(),
-        detail: format!("invalid hex step: {step_str:?}"),
-    })?;
+    // Step value is one hexadecimal index; A and B select 50 and 100 kHz.
+    let step_val = upper_hex_nibble(step_str, "SF", "step")?;
     let step = StepSize::try_from(step_val).map_err(|e| ProtocolError::FieldParse {
         command: "SF".to_owned(),
         field: "step".to_owned(),
@@ -80,13 +53,11 @@ fn parse_sf(payload: &str) -> Result<Response, ProtocolError> {
 
 /// Parse BS (MW/SW antenna): 0 = ANT Connector, 1 = internal bar antenna.
 fn parse_bs(payload: &str) -> Result<Response, ProtocolError> {
-    match payload.trim() {
-        "0" => Ok(Response::BarAntenna { enabled: false }),
-        "1" => Ok(Response::BarAntenna { enabled: true }),
-        value => Err(ProtocolError::FieldParse {
-            command: "BS".to_owned(),
-            field: "enabled".to_owned(),
-            detail: format!("expected 0 or 1, got {value:?}"),
-        }),
-    }
+    boolean(payload, "BS", "internal bar selection").map(|internal_bar| Response::AntennaInput {
+        input: if internal_bar {
+            AntennaInput::InternalBar
+        } else {
+            AntennaInput::Connector
+        },
+    })
 }

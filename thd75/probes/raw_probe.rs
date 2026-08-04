@@ -7,7 +7,7 @@ use kenwood_thd75::transport::{SerialTransport, Transport};
 async fn raw_exchange(cmd: &[u8]) {
     let ports = SerialTransport::discover_usb().unwrap();
     let mut transport =
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
+        SerialTransport::open(&ports[0].port_name).unwrap();
 
     let cmd_str = String::from_utf8_lossy(&cmd[..cmd.len() - 1]);
     let _ = transport.write(cmd).await;
@@ -18,16 +18,16 @@ async fn raw_exchange(cmd: &[u8]) {
     let timeout = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let n = transport.read(&mut buf).await.unwrap();
-            codec.feed(&buf[..n]);
+            codec.feed(&buf[..n])?;
             if let Some(frame) = codec.next_frame() {
-                return frame;
+                return Ok(frame);
             }
         }
     })
     .await;
 
     match timeout {
-        Ok(frame) => {
+        Ok(Ok(frame)) => {
             let text = String::from_utf8_lossy(&frame);
             let fields: Vec<&str> = text.split(',').collect();
             println!("CMD: {cmd_str}");
@@ -37,6 +37,10 @@ async fn raw_exchange(cmd: &[u8]) {
                 println!("    [{i:2}] = {f:?}");
             }
             println!();
+        }
+        Ok(Err(error)) => {
+            println!("CMD: {cmd_str}");
+            println!("  CAT FRAMING ERROR: {error}\n");
         }
         Err(_) => {
             println!("CMD: {cmd_str}");
@@ -66,10 +70,4 @@ async fn probe_dc_raw() {
 async fn probe_fq_raw() {
     raw_exchange(b"FQ 0\r").await;
     raw_exchange(b"FQ 1\r").await;
-}
-
-#[tokio::test]
-#[ignore]
-async fn probe_be_raw() {
-    raw_exchange(b"BE\r").await;
 }

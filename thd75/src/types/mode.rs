@@ -6,20 +6,19 @@ use crate::error::ValidationError;
 
 /// Operating mode as returned by the `MD` (mode) CAT command.
 ///
-/// The TH-D75 supports 10 modes (0-9) via the `MD` command. Modes 0-7
-/// are confirmed by firmware RE and the KI4LAX CAT command reference.
-/// Modes 8 (WFM) and 9 (CW-R) are confirmed by the ARFC-D75
-/// decompilation.
+/// The `MD` response has ten defined wire values (0-9). This complete read
+/// domain does not imply that every value can be selected with an `MD` write
+/// in every band or current radio state.
 ///
-/// Note: the `FO`/`ME` commands use a **different** mode encoding
-/// (0=FM, 1=DV, 2=NFM, 3=AM) stored as a raw `u8` in [`ChannelMemory`].
-/// This enum is only used for the `MD` command.
+/// Channel records use the same values through WFM, represented by the
+/// narrower [`ChannelMode`] type because channel storage does not accept
+/// CW-R.
 ///
-/// # Band restrictions (per Kenwood Operating Tips §5.9)
+/// # Receiver and front-panel availability
 ///
 /// Not all modes are available on both bands:
 ///
-/// - **Band A** supports only **FM** and **DV**. Band A is the amateur
+/// - **Band A** supports **FM**, **NFM**, **DV**, and **DR**. Band A is the amateur
 ///   TX/RX band (144/220/430 MHz). Its receiver chain (VCO/PLL IC800,
 ///   IF IC IC900) is a double super heterodyne with 1st IF at 57.15 MHz
 ///   and 2nd IF at 450 kHz. It has no third IF stage, so AM/SSB/CW
@@ -30,12 +29,9 @@ use crate::error::ValidationError;
 ///   which feeds into the CODEC (IC2011) for AM/SSB/CW demodulation.
 ///   This triple super heterodyne architecture is what enables the
 ///   wideband mode support (service manual §2.1.3.2).
-/// - **DR** (D-STAR repeater mode) is only available on **Band A**.
-///   Attempting to set DR on Band B via `MD` will be rejected by the
-///   firmware with a `?` error.
 ///
-/// Attempting to set an unsupported mode on a band via the `MD` command
-/// will result in the radio returning a `?` error response.
+/// CAT write availability is narrower and state-dependent. Callers must use
+/// immediate readback rather than infer a state change from the write reply.
 ///
 /// # Mode cycling on the radio (per User Manual Chapter 5)
 ///
@@ -49,19 +45,17 @@ use crate::error::ValidationError;
 ///
 /// # WFM (Wide FM)
 ///
-/// WFM is `MD` mode 8, confirmed by ARFC-D75 decompilation. It is the
-/// FM broadcast radio mode used on Band B for the 76-108 MHz range.
+/// WFM is `MD` mode 8. It is the FM broadcast radio mode used on Band B for
+/// the 76-108 MHz range.
 /// The radio's display shows "WFM" in this mode.
 ///
 /// # CW-R (CW Reverse)
 ///
-/// CW-R is `MD` mode 9, confirmed by ARFC-D75 decompilation. It uses
-/// LSB detection for CW reception instead of the default USB detection
-/// used by standard CW mode.
+/// CW-R is `MD` mode 9. It uses LSB detection for CW reception instead of the
+/// default USB detection used by standard CW mode.
 ///
-/// [`ChannelMemory`]: crate::types::ChannelMemory
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Mode {
+pub enum OperatingMode {
     /// FM modulation (index 0). Available on both Band A and Band B.
     Fm = 0,
     /// D-STAR digital voice (index 1). Available on both Band A and Band B.
@@ -78,27 +72,24 @@ pub enum Mode {
     /// CW / Morse code (index 5). Band B only: requires the 3rd IF at
     /// 10.8 kHz (via 3rd mixer IC1001 and 460.8 kHz local oscillation).
     Cw = 5,
-    /// Narrow FM modulation (index 6). Band B only: Band A supports
-    /// only standard FM deviation.
+    /// Narrow FM modulation (index 6). Available on both Band A and Band B.
     Nfm = 6,
-    /// D-STAR repeater mode (index 7). Band A only: DR requires the
-    /// CTRL/PTT band for gateway access and callsign routing.
+    /// D-STAR repeater mode (index 7). Available on both Band A and Band B.
     Dr = 7,
-    /// Wide FM (index 8). Band B only: FM broadcast reception mode
-    /// for the 76-108 MHz range. Confirmed by ARFC-D75 decompilation.
+    /// Wide FM (index 8). Band B only: FM broadcast reception mode for the
+    /// 76-108 MHz range.
     Wfm = 8,
-    /// CW Reverse (index 9). Band B only: uses LSB detection for CW
-    /// reception instead of the default USB. Confirmed by ARFC-D75
-    /// decompilation.
+    /// CW Reverse (index 9). Band B only: uses LSB detection for CW reception
+    /// instead of the default USB.
     CwReverse = 9,
 }
 
-impl Mode {
+impl OperatingMode {
     /// Number of valid mode values (0-9).
     pub const COUNT: u8 = 10;
 }
 
-impl fmt::Display for Mode {
+impl fmt::Display for OperatingMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Fm => f.write_str("FM"),
@@ -115,7 +106,7 @@ impl fmt::Display for Mode {
     }
 }
 
-impl TryFrom<u8> for Mode {
+impl TryFrom<u8> for OperatingMode {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
@@ -130,13 +121,13 @@ impl TryFrom<u8> for Mode {
             7 => Ok(Self::Dr),
             8 => Ok(Self::Wfm),
             9 => Ok(Self::CwReverse),
-            _ => Err(ValidationError::ModeOutOfRange(value)),
+            _ => Err(ValidationError::OperatingModeOutOfRange(value)),
         }
     }
 }
 
-impl From<Mode> for u8 {
-    fn from(mode: Mode) -> Self {
+impl From<OperatingMode> for u8 {
+    fn from(mode: OperatingMode) -> Self {
         mode as Self
     }
 }
@@ -144,7 +135,7 @@ impl From<Mode> for u8 {
 /// Transmit power level.
 ///
 /// Maps to the power field in the `PC`, `FO`, and `ME` commands.
-/// The D75 firmware RE confirms 4 levels: Hi (0), Mid (1), Lo (2), EL (3).
+/// The four wire values are Hi (0), Mid (1), Lo (2), and EL (3).
 ///
 /// Per User Manual Chapter 5 and Chapter 28: power output with external
 /// DC 13.8 V or battery 7.4 V:
@@ -167,7 +158,7 @@ pub enum PowerLevel {
     Medium = 1,
     /// Low power, 0.5 W (index 2).
     Low = 2,
-    /// Extra-low power, 50 mW (index 3). D75-specific; not present on the TH-D74.
+    /// Extra-low power, 50 mW (index 3).
     ExtraLow = 3,
 }
 
@@ -207,65 +198,56 @@ impl From<PowerLevel> for u8 {
     }
 }
 
-/// Repeater shift direction, stored as a raw firmware value.
+/// Repeater shift stored by FO/ME and MCP/SD-card channel records.
 ///
-/// Maps to the shift field (4-bit, low nibble of byte 0x08) in the `FO`
-/// and `ME` commands. Known values: 0 = Simplex, 1 = Up, 2 = Down,
-/// 3 = Split. Values 4-15 are used by VFO mode for extended shift
-/// configurations whose meaning is not yet fully documented.
-///
-/// Accepts any value in the 4-bit range 0-15 to avoid parse failures
-/// when reading VFO state from the radio.
+/// Split operation is a separate flag. Value 3 is the TH-D75's dedicated
+/// minus 7.6 MHz shift used in the applicable regional band plan.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ShiftDirection(u8);
+pub enum ShiftDirection {
+    /// Transmit and receive on the same frequency (`0`).
+    Simplex = 0,
+    /// Transmit above the receive frequency by the configured offset (`1`).
+    Plus = 1,
+    /// Transmit below the receive frequency by the configured offset (`2`).
+    Minus = 2,
+    /// Transmit 7.6 MHz below the receive frequency (`3`).
+    Minus7Point6MHz = 3,
+}
 
 impl ShiftDirection {
-    /// Simplex, no shift (value 0).
-    pub const SIMPLEX: Self = Self(0);
-    /// Positive shift (value 1).
-    pub const UP: Self = Self(1);
-    /// Negative shift (value 2).
-    pub const DOWN: Self = Self(2);
-    /// Split: separate TX frequency (value 3).
-    pub const SPLIT: Self = Self(3);
-
-    /// Creates a new `ShiftDirection` from a raw 4-bit value.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ValidationError::ShiftOutOfRange`] if `value > 15`.
-    pub const fn new(value: u8) -> Result<Self, ValidationError> {
-        if value <= 15 {
-            Ok(Self(value))
-        } else {
-            Err(ValidationError::ShiftOutOfRange(value))
-        }
-    }
-
-    /// Returns the raw firmware value.
-    #[must_use]
-    pub const fn as_u8(self) -> u8 {
-        self.0
-    }
-
-    /// Returns `true` if this is a well-known shift direction (0-3).
-    #[must_use]
-    pub const fn is_known(self) -> bool {
-        self.0 <= 3
-    }
+    /// Number of channel-shift values.
+    pub const COUNT: u8 = 4;
 }
 
 impl TryFrom<u8> for ShiftDirection {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Self::new(value)
+        match value {
+            0 => Ok(Self::Simplex),
+            1 => Ok(Self::Plus),
+            2 => Ok(Self::Minus),
+            3 => Ok(Self::Minus7Point6MHz),
+            _ => Err(ValidationError::ShiftOutOfRange(value)),
+        }
     }
 }
 
 impl From<ShiftDirection> for u8 {
     fn from(dir: ShiftDirection) -> Self {
-        dir.0
+        dir as Self
+    }
+}
+
+impl fmt::Display for ShiftDirection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Simplex => "Simplex",
+            Self::Plus => "+",
+            Self::Minus => "-",
+            Self::Minus7Point6MHz => "-7.6 MHz",
+        })
     }
 }
 
@@ -289,10 +271,7 @@ impl From<ShiftDirection> for u8 {
 /// if 144.995 MHz is shown with 5 kHz steps, switching to 12.5 kHz
 /// steps changes it to 144.9875 MHz.
 ///
-/// # KI4LAX TABLE C reference
-///
-/// The hex index-to-step-size mapping (TABLE C in the KI4LAX CAT command
-/// reference) is as follows:
+/// The CAT wire index-to-step-size mapping is:
 ///
 /// | Index (hex) | Step size |
 /// |-------------|-----------|
@@ -413,131 +392,40 @@ impl From<StepSize> for u8 {
     }
 }
 
-/// Coarse tuning step multiplier.
+/// Operating mode accepted by FO/ME and stored in channel memory.
 ///
-/// Discovered via ARFC-D75 decompilation. The ARFC application multiplies
-/// the base step size by this factor before sending `UP`/`DW` commands,
-/// enabling faster tuning in large frequency ranges. This is a
-/// client-side feature; the radio itself has no coarse step command.
-///
-/// For example, with a 25.0 kHz base step and a `X10` multiplier, each
-/// `UP`/`DW` press tunes 250.0 kHz.
+/// The encoding is identical to [`OperatingMode`] for values 0 through 8. CW-R is an
+/// `MD` operating mode but is not a valid stored-channel mode, so this type
+/// makes that distinction explicit at API boundaries.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CoarseStepMultiplier {
-    /// 1x, no multiplication, same as normal step (index 0).
-    X1 = 0,
-    /// 2x multiplication (index 1).
-    X2 = 1,
-    /// 5x multiplication (index 2).
-    X5 = 2,
-    /// 10x multiplication (index 3).
-    X10 = 3,
-    /// 50x multiplication (index 4).
-    X50 = 4,
-    /// 100x multiplication (index 5).
-    X100 = 5,
-}
-
-impl CoarseStepMultiplier {
-    /// Number of valid coarse step multiplier values (0-5).
-    pub const COUNT: u8 = 6;
-
-    /// Returns the numeric multiplier value.
-    #[must_use]
-    pub const fn multiplier(self) -> u16 {
-        match self {
-            Self::X1 => 1,
-            Self::X2 => 2,
-            Self::X5 => 5,
-            Self::X10 => 10,
-            Self::X50 => 50,
-            Self::X100 => 100,
-        }
-    }
-}
-
-impl fmt::Display for CoarseStepMultiplier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "x{}", self.multiplier())
-    }
-}
-
-impl TryFrom<u8> for CoarseStepMultiplier {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::X1),
-            1 => Ok(Self::X2),
-            2 => Ok(Self::X5),
-            3 => Ok(Self::X10),
-            4 => Ok(Self::X50),
-            5 => Ok(Self::X100),
-            _ => Err(ValidationError::SettingOutOfRange {
-                name: "coarse step multiplier",
-                value,
-                detail: "must be 0-5",
-            }),
-        }
-    }
-}
-
-impl From<CoarseStepMultiplier> for u8 {
-    fn from(mult: CoarseStepMultiplier) -> Self {
-        mult as Self
-    }
-}
-
-/// Operating mode as stored in the flash memory image.
-///
-/// This enum represents the mode encoding used in the MCP programming
-/// memory (channel data byte 0x09 bits \[6:4\]). It differs from [`Mode`]
-/// which represents the CAT wire format.
-///
-/// # Flash encoding
-///
-/// | Value | Mode |
-/// |-------|------|
-/// | 0 | FM |
-/// | 1 | DV (D-STAR digital voice) |
-/// | 2 | AM |
-/// | 3 | LSB (lower sideband) |
-/// | 4 | USB (upper sideband) |
-/// | 5 | CW (Morse code) |
-/// | 6 | NFM (narrow FM) |
-/// | 7 | DR (D-STAR repeater) |
-///
-/// # CAT encoding (for comparison)
-///
-/// The CAT protocol (`FO`/`ME` commands) uses a different mapping:
-/// 0=FM, 1=DV, 2=NFM, 3=AM. The memory image encoding adds LSB, USB,
-/// CW, and DR modes that are not available via CAT.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MemoryMode {
-    /// FM modulation (flash value 0).
+pub enum ChannelMode {
+    /// FM modulation (`0`).
     Fm = 0,
-    /// D-STAR digital voice (flash value 1).
+    /// D-STAR digital voice (`1`).
     Dv = 1,
-    /// AM modulation (flash value 2).
+    /// AM modulation (`2`).
     Am = 2,
-    /// Lower sideband (flash value 3).
+    /// Lower sideband (`3`).
     Lsb = 3,
-    /// Upper sideband (flash value 4).
+    /// Upper sideband (`4`).
     Usb = 4,
-    /// CW / Morse code (flash value 5).
+    /// CW / Morse code (`5`).
     Cw = 5,
-    /// Narrow FM modulation (flash value 6).
+    /// Narrow FM modulation (`6`).
     Nfm = 6,
-    /// D-STAR repeater mode (flash value 7).
+    /// D-STAR repeater mode (`7`).
     Dr = 7,
+    /// Wide FM broadcast mode (`8`).
+    Wfm = 8,
 }
 
-impl MemoryMode {
-    /// Number of valid memory mode values (0-7).
-    pub const COUNT: u8 = 8;
+impl ChannelMode {
+    /// Number of valid channel-mode values (0-8).
+    pub const COUNT: u8 = 9;
 }
 
-impl fmt::Display for MemoryMode {
+impl fmt::Display for ChannelMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Fm => f.write_str("FM"),
@@ -548,11 +436,12 @@ impl fmt::Display for MemoryMode {
             Self::Cw => f.write_str("CW"),
             Self::Nfm => f.write_str("NFM"),
             Self::Dr => f.write_str("DR"),
+            Self::Wfm => f.write_str("WFM"),
         }
     }
 }
 
-impl TryFrom<u8> for MemoryMode {
+impl TryFrom<u8> for ChannelMode {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
@@ -565,14 +454,39 @@ impl TryFrom<u8> for MemoryMode {
             5 => Ok(Self::Cw),
             6 => Ok(Self::Nfm),
             7 => Ok(Self::Dr),
-            _ => Err(ValidationError::MemoryModeOutOfRange(value)),
+            8 => Ok(Self::Wfm),
+            _ => Err(ValidationError::ChannelModeOutOfRange(value)),
         }
     }
 }
 
-impl From<MemoryMode> for u8 {
-    fn from(mode: MemoryMode) -> Self {
+impl From<ChannelMode> for u8 {
+    fn from(mode: ChannelMode) -> Self {
         mode as Self
+    }
+}
+
+impl From<ChannelMode> for OperatingMode {
+    fn from(mode: ChannelMode) -> Self {
+        match mode {
+            ChannelMode::Fm => Self::Fm,
+            ChannelMode::Dv => Self::Dv,
+            ChannelMode::Am => Self::Am,
+            ChannelMode::Lsb => Self::Lsb,
+            ChannelMode::Usb => Self::Usb,
+            ChannelMode::Cw => Self::Cw,
+            ChannelMode::Nfm => Self::Nfm,
+            ChannelMode::Dr => Self::Dr,
+            ChannelMode::Wfm => Self::Wfm,
+        }
+    }
+}
+
+impl TryFrom<OperatingMode> for ChannelMode {
+    type Error = ValidationError;
+
+    fn try_from(mode: OperatingMode) -> Result<Self, Self::Error> {
+        Self::try_from(u8::from(mode))
     }
 }
 
@@ -583,56 +497,56 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    // --- Mode ---
+    // --- OperatingMode ---
 
     #[test]
-    fn mode_valid_range() -> TestResult {
-        for i in 0u8..Mode::COUNT {
-            let val = Mode::try_from(i)?;
-            assert_eq!(u8::from(val), i, "Mode round-trip failed at {i}");
+    fn operating_mode_valid_range() -> TestResult {
+        for i in 0u8..OperatingMode::COUNT {
+            let val = OperatingMode::try_from(i)?;
+            assert_eq!(u8::from(val), i, "OperatingMode round-trip failed at {i}");
         }
         Ok(())
     }
 
     #[test]
-    fn mode_invalid() {
-        assert!(Mode::try_from(Mode::COUNT).is_err());
-        assert!(Mode::try_from(255).is_err());
+    fn operating_mode_invalid() {
+        assert!(OperatingMode::try_from(OperatingMode::COUNT).is_err());
+        assert!(OperatingMode::try_from(255).is_err());
     }
 
     #[test]
-    fn mode_round_trip() -> TestResult {
-        for i in 0u8..Mode::COUNT {
-            let val = Mode::try_from(i)?;
+    fn operating_mode_round_trip() -> TestResult {
+        for i in 0u8..OperatingMode::COUNT {
+            let val = OperatingMode::try_from(i)?;
             assert_eq!(u8::from(val), i);
         }
         Ok(())
     }
 
     #[test]
-    fn mode_error_variant() -> TestResult {
-        let err = Mode::try_from(Mode::COUNT)
+    fn operating_mode_error_variant() -> TestResult {
+        let err = OperatingMode::try_from(OperatingMode::COUNT)
             .err()
-            .ok_or("expected ModeOutOfRange error but got Ok")?;
+            .ok_or("expected OperatingModeOutOfRange error but got Ok")?;
         assert!(
-            matches!(err, ValidationError::ModeOutOfRange(10)),
-            "expected ModeOutOfRange(10), got {err:?}"
+            matches!(err, ValidationError::OperatingModeOutOfRange(10)),
+            "expected OperatingModeOutOfRange(10), got {err:?}"
         );
         Ok(())
     }
 
     #[test]
-    fn mode_display() {
-        assert_eq!(Mode::Fm.to_string(), "FM");
-        assert_eq!(Mode::Dv.to_string(), "DV");
-        assert_eq!(Mode::Am.to_string(), "AM");
-        assert_eq!(Mode::Lsb.to_string(), "LSB");
-        assert_eq!(Mode::Usb.to_string(), "USB");
-        assert_eq!(Mode::Cw.to_string(), "CW");
-        assert_eq!(Mode::Nfm.to_string(), "NFM");
-        assert_eq!(Mode::Dr.to_string(), "DR");
-        assert_eq!(Mode::Wfm.to_string(), "WFM");
-        assert_eq!(Mode::CwReverse.to_string(), "CW-R");
+    fn operating_mode_display() {
+        assert_eq!(OperatingMode::Fm.to_string(), "FM");
+        assert_eq!(OperatingMode::Dv.to_string(), "DV");
+        assert_eq!(OperatingMode::Am.to_string(), "AM");
+        assert_eq!(OperatingMode::Lsb.to_string(), "LSB");
+        assert_eq!(OperatingMode::Usb.to_string(), "USB");
+        assert_eq!(OperatingMode::Cw.to_string(), "CW");
+        assert_eq!(OperatingMode::Nfm.to_string(), "NFM");
+        assert_eq!(OperatingMode::Dr.to_string(), "DR");
+        assert_eq!(OperatingMode::Wfm.to_string(), "WFM");
+        assert_eq!(OperatingMode::CwReverse.to_string(), "CW-R");
     }
 
     // --- PowerLevel ---
@@ -685,8 +599,7 @@ mod tests {
 
     #[test]
     fn shift_direction_valid_range() -> TestResult {
-        // All 4-bit values (0-15) are valid.
-        for i in 0u8..=15 {
+        for i in 0u8..ShiftDirection::COUNT {
             let val = ShiftDirection::try_from(i)?;
             assert_eq!(u8::from(val), i, "ShiftDirection round-trip failed at {i}");
         }
@@ -695,13 +608,13 @@ mod tests {
 
     #[test]
     fn shift_direction_invalid() {
-        assert!(ShiftDirection::try_from(16).is_err());
+        assert!(ShiftDirection::try_from(ShiftDirection::COUNT).is_err());
         assert!(ShiftDirection::try_from(255).is_err());
     }
 
     #[test]
     fn shift_direction_round_trip() -> TestResult {
-        for i in 0u8..=15 {
+        for i in 0u8..ShiftDirection::COUNT {
             let val = ShiftDirection::try_from(i)?;
             assert_eq!(u8::from(val), i);
         }
@@ -709,32 +622,25 @@ mod tests {
     }
 
     #[test]
-    fn shift_direction_known_constants() {
-        assert_eq!(ShiftDirection::SIMPLEX.as_u8(), 0);
-        assert_eq!(ShiftDirection::UP.as_u8(), 1);
-        assert_eq!(ShiftDirection::DOWN.as_u8(), 2);
-        assert_eq!(ShiftDirection::SPLIT.as_u8(), 3);
-        assert!(ShiftDirection::SIMPLEX.is_known());
-        assert!(ShiftDirection::SPLIT.is_known());
-    }
-
-    #[test]
-    fn shift_direction_extended_vfo_values() -> TestResult {
-        // Values 4-15 are valid but not "known" named shift modes.
-        let ext = ShiftDirection::new(8)?;
-        assert_eq!(ext.as_u8(), 8);
-        assert!(!ext.is_known());
-        Ok(())
+    fn shift_direction_values_and_display() {
+        assert_eq!(u8::from(ShiftDirection::Simplex), 0);
+        assert_eq!(u8::from(ShiftDirection::Plus), 1);
+        assert_eq!(u8::from(ShiftDirection::Minus), 2);
+        assert_eq!(u8::from(ShiftDirection::Minus7Point6MHz), 3);
+        assert_eq!(ShiftDirection::Simplex.to_string(), "Simplex");
+        assert_eq!(ShiftDirection::Plus.to_string(), "+");
+        assert_eq!(ShiftDirection::Minus.to_string(), "-");
+        assert_eq!(ShiftDirection::Minus7Point6MHz.to_string(), "-7.6 MHz");
     }
 
     #[test]
     fn shift_direction_error_variant() -> TestResult {
-        let err = ShiftDirection::try_from(16)
+        let err = ShiftDirection::try_from(ShiftDirection::COUNT)
             .err()
             .ok_or("expected ShiftOutOfRange error but got Ok")?;
         assert!(
-            matches!(err, ValidationError::ShiftOutOfRange(16)),
-            "expected ShiftOutOfRange(16), got {err:?}"
+            matches!(err, ValidationError::ShiftOutOfRange(4)),
+            "expected ShiftOutOfRange(4), got {err:?}"
         );
         Ok(())
     }
@@ -816,116 +722,58 @@ mod tests {
         assert_eq!(StepSize::Hz8330.to_string(), "8.33 kHz");
     }
 
-    // --- MemoryMode ---
+    // --- ChannelMode ---
 
     #[test]
-    fn memory_mode_valid_range() -> TestResult {
-        for i in 0u8..MemoryMode::COUNT {
-            let val = MemoryMode::try_from(i)?;
-            assert_eq!(u8::from(val), i, "MemoryMode round-trip failed at {i}");
+    fn channel_mode_valid_range() -> TestResult {
+        for i in 0u8..ChannelMode::COUNT {
+            let val = ChannelMode::try_from(i)?;
+            assert_eq!(u8::from(val), i, "ChannelMode round-trip failed at {i}");
         }
         Ok(())
     }
 
     #[test]
-    fn memory_mode_invalid() {
-        assert!(MemoryMode::try_from(MemoryMode::COUNT).is_err());
-        assert!(MemoryMode::try_from(255).is_err());
+    fn channel_mode_invalid() {
+        assert!(ChannelMode::try_from(ChannelMode::COUNT).is_err());
+        assert!(ChannelMode::try_from(255).is_err());
     }
 
     #[test]
-    fn memory_mode_round_trip() -> TestResult {
-        for i in 0u8..MemoryMode::COUNT {
-            let val = MemoryMode::try_from(i)?;
-            assert_eq!(u8::from(val), i);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn memory_mode_error_variant() -> TestResult {
-        let err = MemoryMode::try_from(MemoryMode::COUNT)
+    fn channel_mode_error_variant() -> TestResult {
+        let err = ChannelMode::try_from(ChannelMode::COUNT)
             .err()
-            .ok_or("expected MemoryModeOutOfRange error but got Ok")?;
+            .ok_or("expected ChannelModeOutOfRange error but got Ok")?;
         assert!(
-            matches!(err, ValidationError::MemoryModeOutOfRange(8)),
-            "expected MemoryModeOutOfRange(8), got {err:?}"
+            matches!(err, ValidationError::ChannelModeOutOfRange(9)),
+            "expected ChannelModeOutOfRange(9), got {err:?}"
         );
         Ok(())
     }
 
     #[test]
-    fn memory_mode_display() {
-        assert_eq!(MemoryMode::Fm.to_string(), "FM");
-        assert_eq!(MemoryMode::Dv.to_string(), "DV");
-        assert_eq!(MemoryMode::Am.to_string(), "AM");
-        assert_eq!(MemoryMode::Lsb.to_string(), "LSB");
-        assert_eq!(MemoryMode::Usb.to_string(), "USB");
-        assert_eq!(MemoryMode::Cw.to_string(), "CW");
-        assert_eq!(MemoryMode::Nfm.to_string(), "NFM");
-        assert_eq!(MemoryMode::Dr.to_string(), "DR");
+    fn channel_mode_display() {
+        assert_eq!(ChannelMode::Fm.to_string(), "FM");
+        assert_eq!(ChannelMode::Dv.to_string(), "DV");
+        assert_eq!(ChannelMode::Am.to_string(), "AM");
+        assert_eq!(ChannelMode::Lsb.to_string(), "LSB");
+        assert_eq!(ChannelMode::Usb.to_string(), "USB");
+        assert_eq!(ChannelMode::Cw.to_string(), "CW");
+        assert_eq!(ChannelMode::Nfm.to_string(), "NFM");
+        assert_eq!(ChannelMode::Dr.to_string(), "DR");
+        assert_eq!(ChannelMode::Wfm.to_string(), "WFM");
     }
 
     #[test]
-    fn cat_mode_matches_flash_encoding() {
-        // CAT MD and flash memory use the same encoding for all 8 modes (0-7).
-        assert_eq!(u8::from(Mode::Fm), u8::from(MemoryMode::Fm));
-        assert_eq!(u8::from(Mode::Dv), u8::from(MemoryMode::Dv));
-        assert_eq!(u8::from(Mode::Am), u8::from(MemoryMode::Am));
-        assert_eq!(u8::from(Mode::Lsb), u8::from(MemoryMode::Lsb));
-        assert_eq!(u8::from(Mode::Usb), u8::from(MemoryMode::Usb));
-        assert_eq!(u8::from(Mode::Cw), u8::from(MemoryMode::Cw));
-        assert_eq!(u8::from(Mode::Nfm), u8::from(MemoryMode::Nfm));
-        assert_eq!(u8::from(Mode::Dr), u8::from(MemoryMode::Dr));
-    }
-
-    // --- CoarseStepMultiplier ---
-
-    #[test]
-    fn coarse_step_multiplier_valid_range() -> TestResult {
-        for i in 0u8..CoarseStepMultiplier::COUNT {
-            let val = CoarseStepMultiplier::try_from(i)?;
-            assert_eq!(
-                u8::from(val),
-                i,
-                "CoarseStepMultiplier round-trip failed at {i}"
-            );
+    fn channel_mode_matches_md_encoding() -> TestResult {
+        for raw in 0u8..ChannelMode::COUNT {
+            let channel_mode = ChannelMode::try_from(raw)?;
+            let md_mode = OperatingMode::try_from(raw)?;
+            assert_eq!(OperatingMode::from(channel_mode), md_mode);
         }
+        assert_eq!(u8::from(ChannelMode::Wfm), 8);
+        assert!(ChannelMode::try_from(ChannelMode::COUNT).is_err());
+        assert!(ChannelMode::try_from(OperatingMode::CwReverse).is_err());
         Ok(())
-    }
-
-    #[test]
-    fn coarse_step_multiplier_invalid() {
-        assert!(CoarseStepMultiplier::try_from(CoarseStepMultiplier::COUNT).is_err());
-        assert!(CoarseStepMultiplier::try_from(255).is_err());
-    }
-
-    #[test]
-    fn coarse_step_multiplier_round_trip() -> TestResult {
-        for i in 0u8..CoarseStepMultiplier::COUNT {
-            let val = CoarseStepMultiplier::try_from(i)?;
-            assert_eq!(u8::from(val), i);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn coarse_step_multiplier_values() {
-        assert_eq!(CoarseStepMultiplier::X1.multiplier(), 1);
-        assert_eq!(CoarseStepMultiplier::X2.multiplier(), 2);
-        assert_eq!(CoarseStepMultiplier::X5.multiplier(), 5);
-        assert_eq!(CoarseStepMultiplier::X10.multiplier(), 10);
-        assert_eq!(CoarseStepMultiplier::X50.multiplier(), 50);
-        assert_eq!(CoarseStepMultiplier::X100.multiplier(), 100);
-    }
-
-    #[test]
-    fn coarse_step_multiplier_display() {
-        assert_eq!(CoarseStepMultiplier::X1.to_string(), "x1");
-        assert_eq!(CoarseStepMultiplier::X2.to_string(), "x2");
-        assert_eq!(CoarseStepMultiplier::X5.to_string(), "x5");
-        assert_eq!(CoarseStepMultiplier::X10.to_string(), "x10");
-        assert_eq!(CoarseStepMultiplier::X50.to_string(), "x50");
-        assert_eq!(CoarseStepMultiplier::X100.to_string(), "x100");
     }
 }

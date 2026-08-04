@@ -2,31 +2,55 @@
 //!
 //! APRS is a digital communications protocol for real-time tactical information exchange. The
 //! TH-D75 has a built-in TNC (Terminal Node Controller) that handles AX.25 packet encoding and
-//! decoding, supporting both 1200 baud (VHF, standard APRS on 144.390 MHz in North America) and
-//! 9600 baud (UHF) operation.
+//! decoding, supporting both 1200 bps (VHF, standard APRS on 144.390 MHz in North America) and
+//! 9600 bps (UHF) operation.
 //!
 //! The TNC handles position beaconing, message exchange, and weather reporting. Beacon
-//! transmission is controlled by the beacon type setting (PT command), which determines whether
+//! transmission is controlled by the beacon mode setting (PT command), which determines whether
 //! beacons are sent manually, at fixed intervals, or based on `SmartBeaconing` rules.
 //!
 //! # Related commands
 //!
-//! - **AS**: TNC baud rate (1200/9600)
+//! - **AS**: Packet-data rate (1200/9600 bps)
 //! - **PT**: Beacon TX control mode
 //! - **MS**: My Position selection
 //! - **CS**: APRS My Callsign
-//! - **AE**: Serial number info (not actually APRS-related, but shares the A prefix)
 //! - **BE**: Sends an APRS beacon (transmits on air, so it requires a valid
 //!   amateur licence and appropriate authorisation; use deliberately)
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::{AprsCallsign, BeaconMode, MyPositionSelection, TncBaud};
+use crate::types::{AprsCallsign, BeaconMode, MyPositionSelection, PacketDataRate};
 
 use super::Radio;
 
 impl<T: Transport> Radio<T> {
+    /// Trigger one APRS beacon transmission (BE action).
+    ///
+    /// # On-air operation
+    ///
+    /// A successful call asks the radio to transmit immediately. Callers are
+    /// responsible for a valid amateur-radio licence, an appropriate
+    /// frequency, a configured APRS identity and path, and all applicable
+    /// operating rules. The radio returns `N` when its TNC is not ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the radio rejects the action, transport fails, or
+    /// the response is not the exact bare `BE` acknowledgement.
+    pub async fn transmit_aprs_beacon(&mut self) -> Result<(), Error> {
+        tracing::info!("requesting an immediate APRS beacon transmission");
+        let response = self.execute(Command::TransmitAprsBeacon).await?;
+        match response {
+            Response::AprsBeaconTransmitAck => Ok(()),
+            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "AprsBeaconTransmitAck".into(),
+                actual: format!("{other:?}").into_bytes(),
+            })),
+        }
+    }
+
     /// Read the APRS My Callsign value (CS read).
     ///
     /// This is the live CAT view of MCP `aprs.MyCallsign`; it is not a
@@ -35,7 +59,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the callsign response is invalid.
-    pub async fn get_aprs_callsign(&mut self) -> Result<AprsCallsign, Error> {
+    /// An unconfigured radio slot is returned as `None`.
+    pub async fn get_aprs_callsign(&mut self) -> Result<Option<AprsCallsign>, Error> {
         tracing::debug!("reading APRS My Callsign");
         let response = self.execute(Command::GetAprsCallsign).await?;
         match response {
@@ -56,10 +81,10 @@ impl<T: Transport> Radio<T> {
     /// dynamically qualified, so callers should verify with
     /// [`get_aprs_callsign`](Self::get_aprs_callsign).
     pub async fn set_aprs_callsign(&mut self, callsign: AprsCallsign) -> Result<(), Error> {
-        tracing::info!(callsign = callsign.as_str(), "setting APRS My Callsign");
+        tracing::info!(callsign = %callsign, "setting APRS My Callsign");
         let response = self.execute(Command::SetAprsCallsign { callsign }).await?;
         match response {
-            Response::AprsCallsign { .. } => Ok(()),
+            Response::AprsCallsign { callsign: Some(_) } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "AprsCallsign".into(),
                 actual: format!("{other:?}").into_bytes(),
@@ -67,20 +92,20 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Get the TNC baud rate (AS read).
+    /// Get the packet-data rate (AS read).
     ///
-    /// Returns 0 = 1200 baud, 1 = 9600 baud.
+    /// Returns 0 = 1200 bps, 1 = 9600 bps.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_tnc_baud(&mut self) -> Result<TncBaud, Error> {
-        tracing::debug!("reading TNC baud rate");
-        let response = self.execute(Command::GetTncBaud).await?;
+    pub async fn get_packet_data_rate(&mut self) -> Result<PacketDataRate, Error> {
+        tracing::debug!("reading packet data rate");
+        let response = self.execute(Command::GetPacketDataRate).await?;
         match response {
-            Response::TncBaud { rate } => Ok(rate),
+            Response::PacketDataRate { data_rate } => Ok(data_rate),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "TncBaud".into(),
+                expected: "PacketDataRate".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -98,13 +123,13 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_beacon_type(&mut self) -> Result<BeaconMode, Error> {
-        tracing::debug!("reading beacon type");
-        let response = self.execute(Command::GetBeaconType).await?;
+    pub async fn get_beacon_mode(&mut self) -> Result<BeaconMode, Error> {
+        tracing::debug!("reading beacon mode");
+        let response = self.execute(Command::GetBeaconMode).await?;
         match response {
-            Response::BeaconType { mode } => Ok(mode),
+            Response::BeaconMode { mode } => Ok(mode),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "BeaconType".into(),
+                expected: "BeaconMode".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -127,20 +152,22 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set the TNC baud rate (AS write).
+    /// Set the packet-data rate (AS write).
     ///
-    /// Values: 0 = 1200 baud, 1 = 9600 baud.
+    /// Values: 0 = 1200 bps, 1 = 9600 bps.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_tnc_baud(&mut self, rate: TncBaud) -> Result<(), Error> {
-        tracing::info!(?rate, "setting TNC baud rate");
-        let response = self.execute(Command::SetTncBaud { rate }).await?;
+    pub async fn set_packet_data_rate(&mut self, data_rate: PacketDataRate) -> Result<(), Error> {
+        tracing::info!(?data_rate, "setting packet data rate");
+        let response = self
+            .execute(Command::SetPacketDataRate { data_rate })
+            .await?;
         match response {
-            Response::TncBaud { .. } => Ok(()),
+            Response::PacketDataRate { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "TncBaud".into(),
+                expected: "PacketDataRate".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -148,18 +175,18 @@ impl<T: Transport> Radio<T> {
 
     /// Set the beacon TX control mode (PT write).
     ///
-    /// See [`get_beacon_type`](Self::get_beacon_type) for valid mode values and their meanings.
+    /// See [`get_beacon_mode`](Self::get_beacon_mode) for valid mode values and their meanings.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_beacon_type(&mut self, mode: BeaconMode) -> Result<(), Error> {
-        tracing::info!(?mode, "setting beacon type");
-        let response = self.execute(Command::SetBeaconType { mode }).await?;
+    pub async fn set_beacon_mode(&mut self, mode: BeaconMode) -> Result<(), Error> {
+        tracing::info!(?mode, "setting beacon mode");
+        let response = self.execute(Command::SetBeaconMode { mode }).await?;
         match response {
-            Response::BeaconType { .. } => Ok(()),
+            Response::BeaconMode { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "BeaconType".into(),
+                expected: "BeaconMode".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }
@@ -182,26 +209,6 @@ impl<T: Transport> Radio<T> {
             Response::MyPositionSelection { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "MyPositionSelection".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Get the radio's serial number and model code (AE read).
-    ///
-    /// Despite the AE mnemonic, this returns serial info, not APRS data.
-    /// Returns `(serial, model_code)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_serial_info(&mut self) -> Result<(String, String), Error> {
-        tracing::debug!("reading serial info");
-        let response = self.execute(Command::GetSerialInfo).await?;
-        match response {
-            Response::SerialInfo { serial, model_code } => Ok((serial, model_code)),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "SerialInfo".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }

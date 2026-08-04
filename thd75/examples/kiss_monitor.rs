@@ -20,6 +20,7 @@
 // weakening the lint.
 use aprs_is as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use mmdvm as _;
 use mmdvm_core as _;
 use proptest as _;
@@ -41,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("(Enable KISS mode on the radio first: [F] > [LIST] > KISS mode ON)");
     println!("Press Ctrl+C to stop.\n");
 
-    let mut transport = SerialTransport::open(&port, 9600)?;
+    let mut transport = SerialTransport::open_with_baud(&port, 9600)?;
 
     let mut buf = [0u8; 2048];
     let mut accumulator = Vec::new();
@@ -86,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         print!(": ");
 
                         // Try to parse as APRS position report.
-                        if let Ok(pos) = aprs::parse_aprs_position(&ax25.info) {
+                        if let Ok(pos) = aprs::parse_aprs_position(ax25.information()) {
                             println!(
                                 "APRS {:.4},{:.4} ({}{}) \"{}\"",
                                 pos.latitude,
@@ -97,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         } else {
                             // Not a position report -- show raw info.
-                            let info_str = String::from_utf8_lossy(&ax25.info);
+                            let info_str = String::from_utf8_lossy(ax25.information());
                             println!("{info_str}");
                         }
                     } else {

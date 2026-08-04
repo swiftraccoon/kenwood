@@ -1,7 +1,7 @@
 //! Integration tests for TN, DC, RT protocol commands.
 //!
 //! Hardware-verified on D75:
-//! - TN: TNC mode (bare read only, returns mode,setting)
+//! - TN: TNC mode (bare read only, returns mode and packet data rate)
 //! - DC: D-STAR callsign slots 1-6 (slot-indexed read)
 //! - RT: Real-time clock (bare read, returns `YYMMDDHHmmss`)
 //!
@@ -9,7 +9,7 @@
 //! testing confirmed the actual semantics documented here.
 
 use kenwood_thd75::protocol::{self, Command, Response};
-use kenwood_thd75::types::{DstarSlot, TncBaud, TncMode};
+use kenwood_thd75::types::{DstarCallsign, DstarSlot, DstarSuffix, PacketDataRate, TncMode};
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -18,6 +18,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -44,35 +45,35 @@ fn parse_tn_response() -> TestResult {
     // TN 0 is TNC OFF, hardware-verified 2026-07-18 (display shows no
     // packet-mode indicator). An earlier generation mapped 0 to APRS.
     let r = protocol::parse(b"TN 0,0")?;
-    let Response::TncMode { mode, setting } = r else {
+    let Response::TncMode { mode, data_rate } = r else {
         return Err(format!("expected TncMode, got {r:?}").into());
     };
     assert_eq!(mode, TncMode::Off);
-    assert_eq!(setting, TncBaud::Bps1200);
+    assert_eq!(data_rate, PacketDataRate::Bps1200);
     Ok(())
 }
 
 #[test]
 fn parse_tn_kiss_mode() -> TestResult {
     let r = protocol::parse(b"TN 2,0")?;
-    let Response::TncMode { mode, setting } = r else {
+    let Response::TncMode { mode, data_rate } = r else {
         return Err(format!("expected TncMode, got {r:?}").into());
     };
     assert_eq!(mode, TncMode::Kiss);
-    assert_eq!(setting, TncBaud::Bps1200);
+    assert_eq!(data_rate, PacketDataRate::Bps1200);
     Ok(())
 }
 
 #[test]
 fn parse_tn_aprs_9600() -> TestResult {
     // TN 1 is the firmware APRS mode ("APRS 12"/"APRS 96" on the
-    // display); setting 1 = 9600 bps.
+    // display); data-rate value 1 = 9600 bps.
     let r = protocol::parse(b"TN 1,1")?;
-    let Response::TncMode { mode, setting } = r else {
+    let Response::TncMode { mode, data_rate } = r else {
         return Err(format!("expected TncMode, got {r:?}").into());
     };
     assert_eq!(mode, TncMode::Aprs);
-    assert_eq!(setting, TncBaud::Bps9600);
+    assert_eq!(data_rate, PacketDataRate::Bps9600);
     Ok(())
 }
 
@@ -114,9 +115,63 @@ fn parse_dc_response() -> TestResult {
         return Err(format!("expected DstarCallsign, got {r:?}").into());
     };
     assert_eq!(slot, DstarSlot::new(1)?);
-    assert_eq!(callsign, "KQ4NIT  ");
-    assert_eq!(suffix, "D75A");
+    assert_eq!(callsign, DstarCallsign::new("KQ4NIT")?);
+    assert_eq!(suffix, DstarSuffix::new("D75A")?);
+    assert_eq!(callsign.to_wire_bytes(), *b"KQ4NIT  ");
+    assert_eq!(suffix.to_wire_bytes(), *b"D75A");
     Ok(())
+}
+
+#[test]
+fn parse_dc_accepts_hardware_observed_empty_fields() -> TestResult {
+    let response = protocol::parse(b"DC 3,,")?;
+    let Response::DstarCallsign {
+        slot,
+        callsign,
+        suffix,
+    } = response
+    else {
+        return Err(format!("expected DstarCallsign, got {response:?}").into());
+    };
+    assert_eq!(slot, DstarSlot::new(3)?);
+    assert!(callsign.is_empty());
+    assert_eq!(suffix, DstarSuffix::default());
+    Ok(())
+}
+
+#[test]
+fn serialize_dc_write_uses_exact_fixed_width_fields() -> TestResult {
+    assert_eq!(
+        protocol::serialize(&Command::SetDstarCallsign {
+            slot: DstarSlot::new(1)?,
+            callsign: DstarCallsign::new("KQ4NIT")?,
+            suffix: DstarSuffix::new("D75A")?,
+        }),
+        b"DC 1,KQ4NIT  ,D75A\r"
+    );
+    assert_eq!(
+        protocol::serialize(&Command::SetDstarCallsign {
+            slot: DstarSlot::new(2)?,
+            callsign: DstarCallsign::default(),
+            suffix: DstarSuffix::default(),
+        }),
+        b"DC 2,        ,    \r"
+    );
+    Ok(())
+}
+
+#[test]
+fn parse_dc_rejects_wrong_field_count() {
+    assert!(protocol::parse(b"DC 1,KQ4NIT").is_err());
+    assert!(protocol::parse(b"DC 1,KQ4NIT,D75A,EXTRA").is_err());
+}
+
+#[test]
+fn parse_dc_rejects_invalid_identity_fields() {
+    assert!(protocol::parse(b"DC 1,123456789,D75A").is_err());
+    assert!(protocol::parse(b"DC 1,KQ4NIT,12345").is_err());
+    assert!(protocol::parse("DC 1,NØCALL,D75A".as_bytes()).is_err());
+    assert!(protocol::parse(b"DC 1,N0\rCALL,D75A").is_err());
 }
 
 // ============================================================================

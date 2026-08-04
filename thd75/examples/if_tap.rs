@@ -1,10 +1,6 @@
-//! Exercise the TH-D75 IF-tap setup and best-effort restoration sequence.
-//!
-//! This example currently reaches the quarantined direct-frequency step after
-//! applying its Band B/single-band preconditions, then restores instead of
-//! completing a capture. It remains useful as an explicit hardware workflow
-//! once a lossless FO/FQ writer is qualified; do not treat it as an operational
-//! capture example while `Radio::tune_frequency` fails closed.
+//! Capture the TH-D75's AF, IF, and detector outputs, then restore the settings
+//! changed for the capture. Tune Band B to the requested frequency before
+//! starting; direct-frequency writes are intentionally outside this example.
 //!
 //! The radio's USB interface carries a capture-only audio function whose
 //! device name is "ADC stream IN" (mono 48 kHz), not "TH-D75". With
@@ -32,6 +28,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -45,7 +42,9 @@ use std::error::Error;
 
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::{Band, DetectOutputMode, Frequency, Mode, SquelchLevel};
+use kenwood_thd75::types::{
+    Band, BandMode, Frequency, OperatingMode, SquelchLevel, UsbAudioOutput,
+};
 
 /// Default capture frequency: a 70 cm slot on the 5 kHz raster, proving
 /// IF output works on VHF/UHF (the per-sub-band default mode table is
@@ -141,9 +140,19 @@ async fn run_test(
     // Preconditions for IF/Detect: operation band B, Single Band mode,
     // non-DV mode.
     radio.set_band(Band::B).await?;
-    radio.set_dual_band(false).await?;
-    radio.tune_frequency(Band::B, freq).await?;
-    radio.set_mode(Band::B, Mode::Usb).await?;
+    radio.set_band_mode(BandMode::Single).await?;
+    let current = radio.get_frequency(Band::B).await?;
+    if current != freq {
+        return Err(format!(
+            "Band B is at {} Hz, not {} Hz; tune the radio directly before running this example",
+            current.as_hz(),
+            freq.as_hz()
+        )
+        .into());
+    }
+    radio
+        .set_operating_mode(Band::B, OperatingMode::Usb)
+        .await?;
     radio
         .set_squelch(Band::B, SquelchLevel::try_from(0)?)
         .await?;
@@ -157,9 +166,11 @@ async fn run_test(
         capture(idx, "if_af_ref.wav")?;
     }
 
-    radio.set_io_port(DetectOutputMode::If).await?;
-    let now = radio.get_io_port().await?;
-    if !matches!(now, DetectOutputMode::If) {
+    radio
+        .set_usb_audio_output(UsbAudioOutput::IntermediateFrequency)
+        .await?;
+    let now = radio.get_usb_audio_output().await?;
+    if !matches!(now, UsbAudioOutput::IntermediateFrequency) {
         return Err(format!("IO readback after set If: {now} - IF not engaged").into());
     }
     println!("IO = IF engaged (readback confirmed)");
@@ -168,9 +179,9 @@ async fn run_test(
         capture(idx, "if_tap.wav")?;
     }
 
-    radio.set_io_port(DetectOutputMode::Detect).await?;
-    let now = radio.get_io_port().await?;
-    if matches!(now, DetectOutputMode::Detect) {
+    radio.set_usb_audio_output(UsbAudioOutput::Detect).await?;
+    let now = radio.get_usb_audio_output().await?;
+    if matches!(now, UsbAudioOutput::Detect) {
         println!("IO = Detect engaged (readback confirmed)");
         settle().await;
         if let Some(idx) = idx {
@@ -206,20 +217,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => println!("no ffmpeg / audio device found; running without captures"),
     }
 
-    let transport = SerialTransport::open(&port, 115_200)?;
-    let mut radio = Radio::connect_safe(transport).await?;
+    let transport = SerialTransport::open(&port)?;
+    let mut radio = Radio::connect_with_tnc_exit(transport).await?;
     let info = radio.identify().await?;
     println!("connected: {}", info.model);
 
     // Save every setting the test touches.
     let band0 = radio.get_band().await?;
-    let dual0 = radio.get_dual_band().await?;
-    let io0 = radio.get_io_port().await?;
+    let band_mode0 = radio.get_band_mode().await?;
+    let usb_audio_output0 = radio.get_usb_audio_output().await?;
     let sq0 = radio.get_squelch(Band::B).await?;
-    let mode0 = radio.get_mode(Band::B).await?;
+    let mode0 = radio.get_operating_mode(Band::B).await?;
     let freq0 = radio.get_frequency(Band::B).await?;
     println!(
-        "saved state: band={band0:?} dual={dual0} io={io0} squelch={} mode={mode0} freq={} Hz",
+        "saved state: band={band0:?} band_mode={band_mode0} usb_audio_output={usb_audio_output0} squelch={} mode={mode0} freq={} Hz",
         u8::from(sq0),
         freq0.as_hz()
     );
@@ -231,16 +242,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Best-effort restore, then verify it landed.
     println!("restoring saved state...");
-    drop(radio.set_io_port(io0).await);
+    drop(radio.set_usb_audio_output(usb_audio_output0).await);
     drop(radio.set_squelch(Band::B, sq0).await);
-    drop(radio.set_mode(Band::B, mode0).await);
-    drop(radio.tune_frequency(Band::B, freq0).await);
-    drop(radio.set_dual_band(dual0).await);
+    drop(radio.set_operating_mode(Band::B, mode0).await);
+    let frequency_restored = matches!(radio.get_frequency(Band::B).await, Ok(now) if now == freq0);
+    drop(radio.set_band_mode(band_mode0).await);
     drop(radio.set_band(band0).await);
-    let io_v = radio.get_io_port().await?;
-    let dual_v = radio.get_dual_band().await?;
+    let usb_audio_output_v = radio.get_usb_audio_output().await?;
+    let band_mode_v = radio.get_band_mode().await?;
     let band_v = radio.get_band().await?;
-    println!("restored: io={io_v} dual={dual_v} band={band_v:?}");
+    println!(
+        "restored: usb_audio_output={usb_audio_output_v} band_mode={band_mode_v} band={band_v:?} frequency={frequency_restored}"
+    );
 
     drop(radio.disconnect().await);
     result.map(|()| println!("IF tap example complete"))

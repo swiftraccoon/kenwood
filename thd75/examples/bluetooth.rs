@@ -24,6 +24,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -77,12 +78,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connecting via Bluetooth SPP on {port}...");
     println!("(Radio must be paired via Menu 934 first.)\n");
 
-    let transport = SerialTransport::open(&port, SerialTransport::DEFAULT_BAUD)?;
+    let transport = SerialTransport::open(&port)?;
     inspect_radio(transport).await
 }
 
 async fn inspect_radio<T: Transport>(transport: T) -> Result<(), Box<dyn std::error::Error>> {
-    let mut radio = Radio::connect(transport).await?;
+    let mut radio = Radio::new(transport);
 
     // Identify.
     let info = radio.identify().await?;
@@ -90,29 +91,33 @@ async fn inspect_radio<T: Transport>(transport: T) -> Result<(), Box<dyn std::er
 
     let fw = radio.get_firmware_version().await?;
     println!("Firmware: {fw}");
-    let firmware_profile = FirmwareProfile::from_version(&fw);
+    let firmware_profile = FirmwareProfile::from_identity(&fw);
 
-    let (tnc_mode, tnc_baud) = radio.get_tnc_mode().await?;
-    println!("TNC mode: {tnc_mode} ({tnc_baud})");
+    let tnc = radio.get_tnc_mode().await?;
+    println!("TNC mode: {} ({})", tnc.mode, tnc.data_rate);
 
     if firmware_profile.supports_bare_gateway() {
-        let gateway = radio.get_gateway().await?;
+        let gateway = radio.read_gateway().await?;
         println!("DV Gateway: {gateway}");
     } else {
-        println!("DV Gateway: unavailable (firmware reserves GW for recovery)");
+        println!("DV Gateway: unavailable (bare GW is not qualified for this firmware)");
     }
 
-    let (gps_enabled, gps_pc_output) = radio.get_gps_config().await?;
+    let gps_settings = radio.get_gps_settings().await?;
     println!(
         "GPS: {} (PC output {})",
-        if gps_enabled { "ON" } else { "OFF" },
-        if gps_pc_output { "ON" } else { "OFF" }
+        if gps_settings.enabled() { "ON" } else { "OFF" },
+        if gps_settings.pc_output() {
+            "ON"
+        } else {
+            "OFF"
+        }
     );
 
     // Read state from both bands.
     for band in [Band::A, Band::B] {
         let freq = radio.get_frequency(band).await?;
-        let mode = radio.get_mode(band).await?;
+        let mode = radio.get_operating_mode(band).await?;
         let smeter = radio.get_smeter(band).await?;
         println!("Band {band}: {freq} {mode} S={smeter:02}");
     }

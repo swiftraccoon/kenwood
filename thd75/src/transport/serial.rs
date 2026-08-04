@@ -28,8 +28,9 @@
 //! firmware update mode (PTT+1 at power-on), though update mode uses
 //! the bootloader's simpler USB implementation rather than `MatrixQuest`.
 //!
-//! [`open`](SerialTransport::open) auto-detects BT ports and applies the
-//! correct settings.
+//! [`open`](SerialTransport::open) uses the standard USB rate, while
+//! [`open_with_baud`](SerialTransport::open_with_baud) accepts an explicit
+//! USB rate. Both auto-detect BT ports and apply the required BT settings.
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_serial::{FlowControl, SerialPort, SerialStream};
@@ -73,6 +74,7 @@ struct UsbReopenIdentity {
     serial_number: Option<String>,
     alias_key: String,
     serial_unique_at_open: bool,
+    stable_path_anchor: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,7 +119,12 @@ fn capture_usb_identity(
 ) -> Option<UsbReopenIdentity> {
     let selected = candidates
         .iter()
-        .find(|candidate| candidate.path == selected_path)?;
+        .find(|candidate| candidate.path == selected_path)
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|candidate| same_serial_endpoint(&candidate.path, selected_path))
+        })?;
     let serial_unique_at_open = selected
         .serial_number
         .as_deref()
@@ -133,9 +140,23 @@ fn capture_usb_identity(
         });
     Some(UsbReopenIdentity {
         serial_number: selected.serial_number.clone(),
-        alias_key: usb_alias_key(selected_path),
+        alias_key: usb_alias_key(&selected.path),
         serial_unique_at_open,
+        stable_path_anchor: (selected.path != selected_path).then(|| selected_path.to_owned()),
     })
+}
+
+/// Compare an enumerated device node with the path the caller opened.
+///
+/// Linux commonly supplies stable `/dev/serial/by-id/...` symlinks while the
+/// serial enumerator reports `/dev/ttyACM*`. Capturing identity through that
+/// alias is required for an identity-preserving reopen after USB re-enumerates.
+fn same_serial_endpoint(enumerated_path: &str, selected_path: &str) -> bool {
+    enumerated_path == selected_path
+        || std::fs::canonicalize(enumerated_path)
+            .ok()
+            .zip(std::fs::canonicalize(selected_path).ok())
+            .is_some_and(|(enumerated, selected)| enumerated == selected)
 }
 
 fn choose_preferred_alias(candidates: &[&UsbCandidate], stored_path: &str) -> Option<String> {
@@ -176,7 +197,12 @@ fn select_usb_reopen_path(
         .iter()
         .filter(|candidate| {
             identity.serial_number.as_deref().map_or_else(
-                || usb_alias_key(&candidate.path) == identity.alias_key,
+                || {
+                    identity.stable_path_anchor.as_deref().map_or_else(
+                        || usb_alias_key(&candidate.path) == identity.alias_key,
+                        |stable_path| same_serial_endpoint(&candidate.path, stable_path),
+                    )
+                },
                 |serial_number| candidate.serial_number.as_deref() == Some(serial_number),
             )
         })
@@ -223,23 +249,39 @@ impl SerialTransport {
             || (lower.contains("bluetooth") && !lower.contains("incoming"))
     }
 
+    fn connection_settings(path: &str, requested_baud: u32) -> (bool, u32, FlowControl) {
+        let is_bluetooth = Self::is_bluetooth_port(path);
+        if is_bluetooth {
+            (true, BT_BAUD, FlowControl::Hardware)
+        } else {
+            (false, requested_baud, FlowControl::None)
+        }
+    }
+
     /// Open a serial port by path.
     ///
     /// Bluetooth SPP ports are auto-detected by name and configured with
-    /// 9600 baud and RTS/CTS flow control. USB ports use the provided
-    /// baud rate with no flow control.
+    /// 9600 baud and RTS/CTS flow control. USB ports use
+    /// [`Self::DEFAULT_BAUD`] with no flow control.
     ///
     /// # Errors
     ///
     /// Returns [`TransportError::Open`] if the port cannot be opened.
-    pub fn open(path: &str, baud: u32) -> Result<Self, TransportError> {
-        let is_bt = Self::is_bluetooth_port(path);
-        let actual_baud = if is_bt { BT_BAUD } else { baud };
-        let flow = if is_bt {
-            FlowControl::Hardware
-        } else {
-            FlowControl::None
-        };
+    pub fn open(path: &str) -> Result<Self, TransportError> {
+        Self::open_with_baud(path, Self::DEFAULT_BAUD)
+    }
+
+    /// Open a serial port with an explicit USB baud rate.
+    ///
+    /// `baud` applies to USB/physical serial endpoints. Bluetooth SPP ports
+    /// remain auto-detected and always use 9600 baud with RTS/CTS flow control,
+    /// regardless of the requested USB rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Open`] if the port cannot be opened.
+    pub fn open_with_baud(path: &str, baud: u32) -> Result<Self, TransportError> {
+        let (is_bt, actual_baud, flow) = Self::connection_settings(path, baud);
 
         tracing::info!(
             path = %path,
@@ -403,6 +445,7 @@ impl Transport for SerialTransport {
     async fn reopen(&mut self) -> Result<(), TransportError> {
         tracing::info!(path = %self.path, baud = self.baud, "reopening serial transport");
         let original_identity = self.usb_identity.clone();
+        let reopen_anchor = self.path.clone();
         // Best-effort close: a re-enumerated or unplugged port may
         // already be gone, and BT SPP ports skip shutdown by design.
         drop(self.close().await);
@@ -431,7 +474,7 @@ impl Transport for SerialTransport {
         // Bluetooth SPP paths are stable device nodes. USB paths were
         // selected above against the identity captured at the initial open;
         // an unqualified non-Bluetooth endpoint is deliberately not reopened.
-        let mut fresh = Self::open(&path, self.baud)?;
+        let mut fresh = Self::open_with_baud(&path, self.baud)?;
         if let Some(identity) = original_identity {
             if identity.serial_number.is_some()
                 && fresh
@@ -450,6 +493,10 @@ impl Transport for SerialTransport {
             }
             fresh.usb_identity = Some(identity);
         }
+        // Keep the caller-selected stable alias (for example
+        // /dev/serial/by-id/...) as the anchor for every later reopen even
+        // though this attempt opened the enumerator's current tty node.
+        fresh.path = reopen_anchor;
         *self = fresh;
         Ok(())
     }
@@ -476,6 +523,35 @@ mod tests {
             "/dev/cu.Bluetooth-Incoming-Port"
         ));
         assert!(!SerialTransport::is_bluetooth_port("COM3"));
+    }
+
+    #[test]
+    fn default_open_has_the_standard_usb_signature() {
+        fn require_open_signatures(
+            _: fn(&str) -> Result<SerialTransport, TransportError>,
+            _: fn(&str, u32) -> Result<SerialTransport, TransportError>,
+        ) {
+        }
+
+        require_open_signatures(SerialTransport::open, SerialTransport::open_with_baud);
+    }
+
+    #[test]
+    fn explicit_usb_baud_is_preserved_without_flow_control() {
+        let (is_bluetooth, baud, flow) =
+            SerialTransport::connection_settings("/dev/cu.usbmodem1101", 57_600);
+        assert!(!is_bluetooth);
+        assert_eq!(baud, 57_600);
+        assert!(matches!(flow, FlowControl::None));
+    }
+
+    #[test]
+    fn bluetooth_overrides_requested_baud_and_enables_hardware_flow_control() {
+        let (is_bluetooth, baud, flow) =
+            SerialTransport::connection_settings("/dev/cu.TH-D75", 230_400);
+        assert!(is_bluetooth);
+        assert_eq!(baud, BT_BAUD);
+        assert!(matches!(flow, FlowControl::Hardware));
     }
 
     fn usb_candidate(path: &str, serial_number: Option<&str>) -> UsbCandidate {
@@ -511,6 +587,67 @@ mod tests {
             select_usb_reopen_path(&reenumerated, &identity, "/dev/cu.usbmodem101"),
             Ok("/dev/cu.usbmodem303".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_serial_by_id_alias_remains_the_reopen_anchor() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "kenwood-thd75-serial-alias-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory)?;
+        let first_node = directory.join("ttyACM0");
+        let second_node = directory.join("ttyACM1");
+        let wrong_node = directory.join("ttyACM-other");
+        let stable_alias = directory.join("radio-by-id");
+        drop(std::fs::File::create(&first_node)?);
+        drop(std::fs::File::create(&second_node)?);
+        drop(std::fs::File::create(&wrong_node)?);
+        symlink(&first_node, &stable_alias)?;
+
+        let first_node = first_node.to_string_lossy().into_owned();
+        let second_node = second_node.to_string_lossy().into_owned();
+        let stable_alias = stable_alias.to_string_lossy().into_owned();
+        let opened = vec![usb_candidate(&first_node, None)];
+        let identity = capture_usb_identity(&opened, &stable_alias)
+            .ok_or("stable serial alias did not capture USB identity")?;
+        assert_eq!(identity.alias_key, first_node);
+        assert_eq!(identity.stable_path_anchor.as_deref(), Some(&*stable_alias));
+
+        std::fs::remove_file(&stable_alias)?;
+        symlink(&second_node, &stable_alias)?;
+        let reenumerated = vec![usb_candidate(&second_node, None)];
+        let first_reopen = select_usb_reopen_path(&reenumerated, &identity, &stable_alias);
+        let second_reopen = select_usb_reopen_path(&reenumerated, &identity, &stable_alias);
+
+        std::fs::remove_file(&stable_alias)?;
+        let dangling_alias = select_usb_reopen_path(&reenumerated, &identity, &stable_alias);
+        symlink(&wrong_node, &stable_alias)?;
+        let wrong_alias = select_usb_reopen_path(&reenumerated, &identity, &stable_alias);
+
+        std::fs::remove_file(&stable_alias)?;
+        std::fs::remove_file(&first_node)?;
+        std::fs::remove_file(&second_node)?;
+        std::fs::remove_file(&wrong_node)?;
+        std::fs::remove_dir(&directory)?;
+
+        assert_eq!(first_reopen, Ok(second_node.clone()));
+        assert_eq!(second_reopen, Ok(second_node));
+        assert!(
+            dangling_alias.is_err(),
+            "a dangling stable alias reopened by node name"
+        );
+        assert!(
+            wrong_alias.is_err(),
+            "a repointed alias selected the wrong endpoint"
+        );
+        Ok(())
     }
 
     #[test]

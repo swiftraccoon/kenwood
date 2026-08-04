@@ -1,13 +1,12 @@
-//! Recall a memory channel or demonstrate the direct-frequency safety gate.
+//! Recall a regular memory channel.
 //!
-//! Memory recall automatically handles VFO/Memory mode switching. The
-//! `--freq` form currently returns `UnqualifiedCatWrite` before radio I/O
-//! because no FO/FQ frequency writer has been qualified.
+//! Memory recall automatically handles VFO/Memory mode switching. Arbitrary
+//! frequency writes are intentionally absent because no complete FO writer
+//! has been qualified.
 //!
 //! Usage:
 //! ```text
 //! cargo run --example tune -- --band b --channel 21
-//! cargo run --example tune -- --band a --freq 145190000 # expected safety refusal
 //! ```
 //!
 //! Pass a custom serial port as the last positional argument.
@@ -19,6 +18,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -30,7 +30,7 @@ use tracing as _;
 
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::{Band, Frequency};
+use kenwood_thd75::types::{Band, RegularChannel};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,30 +49,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
         None => {
-            eprintln!("Usage: tune --band <a|b> [--freq <hz> | --channel <num>] [port]");
+            eprintln!("Usage: tune --band <a|b> --channel <num> [port]");
             std::process::exit(1);
         }
     };
 
-    // Parse --freq or --channel (one required).
-    let freq_hz: Option<u32> = args
-        .iter()
-        .position(|a| a == "--freq")
-        .and_then(|i| args.get(i + 1))
-        .map(|s| s.parse())
-        .transpose()?;
-
-    let channel_num: Option<u16> = args
+    let channel: RegularChannel = args
         .iter()
         .position(|a| a == "--channel")
         .and_then(|i| args.get(i + 1))
-        .map(|s| s.parse())
-        .transpose()?;
-
-    if freq_hz.is_some() == channel_num.is_some() {
-        eprintln!("Specify exactly one of --freq <hz> or --channel <num>");
-        std::process::exit(1);
-    }
+        .map(|s| s.parse::<u16>())
+        .transpose()?
+        .map(RegularChannel::new)
+        .transpose()?
+        .ok_or("missing --channel <num>")?;
 
     // Serial port is the last positional arg that starts with '/dev/' or 'COM'.
     let port = args
@@ -82,22 +72,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "/dev/cu.usbmodem1234".to_owned());
 
     println!("Connecting to {port}...");
-    let transport = SerialTransport::open(&port, 115_200)?;
-    let mut radio = Radio::connect(transport).await?;
+    let transport = SerialTransport::open(&port)?;
+    let mut radio = Radio::new(transport);
 
     let info = radio.identify().await?;
     println!("Connected to: {}", info.model);
 
-    if let Some(hz) = freq_hz {
-        let freq = Frequency::new(hz);
-        println!("Tuning band {band} to {freq}...");
-        radio.tune_frequency(band, freq).await?;
-        println!("Done.");
-    } else if let Some(ch) = channel_num {
-        println!("Tuning band {band} to channel {ch}...");
-        radio.tune_channel(band, ch).await?;
-        println!("Done.");
-    }
+    println!("Tuning band {band} to channel {channel}...");
+    radio.tune_channel(band, channel).await?;
+    println!("Done.");
 
     // Read back to confirm.
     let readback = radio.get_frequency(band).await?;

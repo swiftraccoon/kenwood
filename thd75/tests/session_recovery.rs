@@ -1,12 +1,15 @@
-//! Supervisor behavior: backoff-driven healing over the scripted mock
+//! Link-recovery behavior: backoff-driven retries over the scripted mock
 //! transport, with the event stream as the observable contract.
 
 use std::time::Duration;
 
 use kenwood_thd75::error::TransportError;
 use kenwood_thd75::radio::{LinkState, Radio};
-use kenwood_thd75::session::{LinkEvent, RadioSupervisor, ReconnectPolicy};
+use kenwood_thd75::session::{
+    LinkEvent, RadioLinkRecovery, ReconnectAttemptLimit, ReconnectPolicy,
+};
 use kenwood_thd75::transport::MockTransport;
+use kenwood_thd75::types::RadioModel;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -15,6 +18,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -39,23 +43,24 @@ fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<LinkEvent>) -> Vec<Lin
 }
 
 #[tokio::test(start_paused = true)]
-async fn heal_retries_until_restore_and_reports_events() -> TestResult {
+async fn recovery_retries_until_restore_and_reports_events() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect_eof(b"FV\r"); // kill the link mid-command
     mock.expect_reopen(Err(TransportError::NotFound)); // attempt 1 fails
     mock.expect_reopen(Ok(())); // attempt 2 succeeds
     expect_identify(&mut mock);
 
-    let radio = Radio::connect(mock).await?;
-    let mut sup = RadioSupervisor::new(radio, ReconnectPolicy::default(), 5);
-    let mut events = sup.events();
+    let radio = Radio::new(mock);
+    let attempt_limit = ReconnectAttemptLimit::new(5)?;
+    let mut recovery = RadioLinkRecovery::new(radio, ReconnectPolicy::default(), attempt_limit);
+    let mut events = recovery.events();
 
-    let failed = sup.radio().get_firmware_version().await;
+    let failed = recovery.radio().get_firmware_version().await;
     assert!(failed.is_err(), "expected link failure, got {failed:?}");
-    assert_eq!(*sup.radio().link_state().borrow(), LinkState::Down);
+    assert_eq!(*recovery.radio().link_state().borrow(), LinkState::Down);
 
-    sup.heal().await?;
-    assert_eq!(*sup.radio().link_state().borrow(), LinkState::Up);
+    recovery.recover().await?;
+    assert_eq!(*recovery.radio().link_state().borrow(), LinkState::Up);
 
     let seen = drain_events(&mut events);
     assert!(
@@ -80,23 +85,27 @@ async fn heal_retries_until_restore_and_reports_events() -> TestResult {
 }
 
 #[tokio::test(start_paused = true)]
-async fn heal_gives_up_after_attempt_budget() -> TestResult {
+async fn recovery_gives_up_after_attempt_budget() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect_eof(b"FV\r");
     mock.expect_reopen(Err(TransportError::NotFound));
     mock.expect_reopen(Err(TransportError::NotFound));
     mock.expect_reopen(Err(TransportError::NotFound));
 
-    let radio = Radio::connect(mock).await?;
-    let mut sup = RadioSupervisor::new(radio, ReconnectPolicy::default(), 3);
-    let mut events = sup.events();
+    let radio = Radio::new(mock);
+    let attempt_limit = ReconnectAttemptLimit::new(3)?;
+    let mut recovery = RadioLinkRecovery::new(radio, ReconnectPolicy::default(), attempt_limit);
+    let mut events = recovery.events();
 
-    let failed = sup.radio().get_firmware_version().await;
+    let failed = recovery.radio().get_firmware_version().await;
     assert!(failed.is_err(), "expected link failure, got {failed:?}");
 
-    let r = sup.heal().await;
-    assert!(r.is_err(), "heal must surface the final error, got {r:?}");
-    assert_eq!(*sup.radio().link_state().borrow(), LinkState::Down);
+    let r = recovery.recover().await;
+    assert!(
+        r.is_err(),
+        "recovery must surface the final error, got {r:?}"
+    );
+    assert_eq!(*recovery.radio().link_state().borrow(), LinkState::Down);
 
     let seen = drain_events(&mut events);
     assert!(
@@ -107,13 +116,14 @@ async fn heal_gives_up_after_attempt_budget() -> TestResult {
 }
 
 #[tokio::test(start_paused = true)]
-async fn heal_is_noop_when_link_up() -> TestResult {
+async fn recovery_is_noop_when_link_up() -> TestResult {
     let mock = MockTransport::new();
-    let radio = Radio::connect(mock).await?;
-    let mut sup = RadioSupervisor::new(radio, ReconnectPolicy::default(), 3);
-    let mut events = sup.events();
+    let radio = Radio::new(mock);
+    let attempt_limit = ReconnectAttemptLimit::new(3)?;
+    let mut recovery = RadioLinkRecovery::new(radio, ReconnectPolicy::default(), attempt_limit);
+    let mut events = recovery.events();
 
-    sup.heal().await?;
+    recovery.recover().await?;
     let seen = drain_events(&mut events);
     assert!(seen.is_empty(), "no events for a healthy link: {seen:?}");
     Ok(())
@@ -127,14 +137,15 @@ async fn backoff_delays_follow_policy() -> TestResult {
     mock.expect_reopen(Ok(()));
     expect_identify(&mut mock);
 
-    let radio = Radio::connect(mock).await?;
-    let policy = ReconnectPolicy::new(Duration::from_secs(1), Duration::from_secs(8));
-    let mut sup = RadioSupervisor::new(radio, policy, 5);
-    let mut events = sup.events();
+    let radio = Radio::new(mock);
+    let policy = ReconnectPolicy::new(Duration::from_secs(1), Duration::from_secs(8))?;
+    let attempt_limit = ReconnectAttemptLimit::new(5)?;
+    let mut recovery = RadioLinkRecovery::new(radio, policy, attempt_limit);
+    let mut events = recovery.events();
 
-    let failed = sup.radio().get_firmware_version().await;
+    let failed = recovery.radio().get_firmware_version().await;
     assert!(failed.is_err(), "expected link failure, got {failed:?}");
-    sup.heal().await?;
+    recovery.recover().await?;
 
     let delays: Vec<Duration> = drain_events(&mut events)
         .into_iter()
@@ -155,10 +166,11 @@ async fn backoff_delays_follow_policy() -> TestResult {
 async fn into_inner_returns_the_radio() -> TestResult {
     let mut mock = MockTransport::new();
     expect_identify(&mut mock);
-    let radio = Radio::connect(mock).await?;
-    let sup = RadioSupervisor::new(radio, ReconnectPolicy::default(), 3);
-    let mut radio = sup.into_inner();
+    let radio = Radio::new(mock);
+    let attempt_limit = ReconnectAttemptLimit::new(3)?;
+    let recovery = RadioLinkRecovery::new(radio, ReconnectPolicy::default(), attempt_limit);
+    let mut radio = recovery.into_inner();
     let info = radio.identify().await?;
-    assert!(info.model.contains("TH-D75"), "got {}", info.model);
+    assert_eq!(info.model, RadioModel::ThD75);
     Ok(())
 }

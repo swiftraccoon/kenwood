@@ -35,6 +35,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -56,13 +57,11 @@ use std::time::{Duration, Instant};
 use kenwood_thd75::Radio;
 use kenwood_thd75::error::Error as RadioError;
 use kenwood_thd75::protocol::{Codec, programming};
-use kenwood_thd75::radio::programming::McpSpeed;
 use kenwood_thd75::transport::{SerialTransport, Transport};
 
 type BackupError = Box<dyn StdError + Send + Sync>;
 type BackupResult<T> = Result<T, BackupError>;
 
-const CAT_BAUD: u32 = SerialTransport::DEFAULT_BAUD;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const DRAIN_QUIET_WINDOW: Duration = Duration::from_millis(30);
 const DRAIN_TOTAL_TIMEOUT: Duration = Duration::from_millis(250);
@@ -451,7 +450,7 @@ async fn main() -> BackupResult<()> {
         confirm_ui_checked(&config.port)?;
     }
 
-    let mut transport = SerialTransport::open(&config.port, CAT_BAUD)?;
+    let mut transport = SerialTransport::open(&config.port)?;
     let mut codec = Codec::new();
     let preflight_result = run_preflight(&mut transport, &mut codec).await;
     let (identity, cat_safety) = match preflight_result {
@@ -508,8 +507,7 @@ async fn main() -> BackupResult<()> {
         ));
     }
 
-    let mut radio = Radio::connect(transport).await?;
-    radio.set_mcp_speed(McpSpeed::Safe);
+    let mut radio = Radio::new(transport);
     let mut termination = TerminationListener::install()?;
 
     println!(
@@ -523,7 +521,7 @@ async fn main() -> BackupResult<()> {
             let cleanup_unproved = error
                 .downcast_ref::<RadioError>()
                 .is_some_and(mcp_cleanup_unproved);
-            let close_result = close_radio(&mut radio).await;
+            let close_result = close_radio(radio).await;
             let error = with_close_result(error, close_result);
             if cleanup_unproved {
                 return Err(invalid_input(format!(
@@ -541,7 +539,7 @@ async fn main() -> BackupResult<()> {
             image.len(),
             programming::TOTAL_SIZE
         ));
-        return Err(with_close_result(error, close_radio(&mut radio).await));
+        return Err(with_close_result(error, close_radio(radio).await));
     }
 
     let postflight: BackupResult<PublishedOutput> = tokio::select! {
@@ -556,7 +554,7 @@ async fn main() -> BackupResult<()> {
             disconnect_radio(radio).await?;
 
             validate_usb_port(&config.port)?;
-            let mut post_transport = SerialTransport::open(&config.port, CAT_BAUD)?;
+            let mut post_transport = SerialTransport::open(&config.port)?;
             let mut post_codec = Codec::new();
             let post_result = run_preflight(&mut post_transport, &mut post_codec).await;
             let post_close = close_transport(&mut post_transport).await;
@@ -1113,7 +1111,11 @@ async fn query_raw<T: Transport>(
             let chunk = buffer
                 .get(..count)
                 .ok_or_else(|| invalid_input("transport returned an invalid byte count"))?;
-            codec.feed(chunk);
+            codec.feed(chunk).map_err(|error| {
+                invalid_input(format!(
+                    "CAT framing failed while awaiting the raw preflight response: {error}"
+                ))
+            })?;
             while let Some(frame) = codec.next_frame() {
                 if frame == b"?" || frame == b"N" {
                     return Err(invalid_input(format!(
@@ -1163,7 +1165,11 @@ async fn drain_stale<T: Transport>(transport: &mut T, codec: &mut Codec) -> Back
                         "too much stale CAT/NMEA data before the raw preflight query",
                     ));
                 }
-                codec.feed(chunk);
+                codec.feed(chunk).map_err(|error| {
+                    invalid_input(format!(
+                        "CAT framing failed while draining stale preflight input: {error}"
+                    ))
+                })?;
                 while codec.next_frame().is_some() {}
             }
             Ok(Err(error)) => return Err(Box::new(error)),
@@ -1382,8 +1388,8 @@ async fn close_transport<T: Transport>(transport: &mut T) -> BackupResult<()> {
     Ok(())
 }
 
-async fn close_radio<T: Transport>(radio: &mut Radio<T>) -> BackupResult<()> {
-    tokio::time::timeout(CLOSE_TIMEOUT, radio.close_transport())
+async fn close_radio<T: Transport>(radio: Radio<T>) -> BackupResult<()> {
+    tokio::time::timeout(CLOSE_TIMEOUT, radio.disconnect())
         .await
         .map_err(|_| invalid_input("radio transport close timed out"))??;
     Ok(())
@@ -1412,8 +1418,32 @@ fn invalid_input(message: impl Into<String>) -> BackupError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kenwood_thd75::transport::MockTransport;
 
     type TestResult = BackupResult<()>;
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_raw_response_is_reported_as_a_framing_failure() -> TestResult {
+        let mut transport = MockTransport::new();
+        transport.pend_when_empty();
+        let oversized = vec![b'X'; Codec::MAX_BUFFERED_BYTES + 1];
+        transport.expect(b"ID\r", &oversized);
+        let mut codec = Codec::new();
+
+        let result = query_raw(&mut transport, &mut codec, b"ID\r").await;
+        let Err(error) = result else {
+            return Err(invalid_input(
+                "oversized raw CAT response unexpectedly produced a frame",
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("CAT framing failed while awaiting the raw preflight response")
+        );
+        transport.assert_complete();
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[derive(Debug)]

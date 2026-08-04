@@ -1,8 +1,9 @@
 //! FM broadcast radio types.
 //!
-//! The TH-D75 has a built-in wideband FM broadcast receiver covering
-//! 76.0-107.9 MHz. It provides 10 FM memory channels (FM0-FM9) for
-//! storing favourite broadcast stations.
+//! The TH-D75 has a built-in wideband FM broadcast receiver. The user manual
+//! gives its inclusive tuning range as 76.0-108.0 MHz, while the operating
+//! tips describe broadcast station centers through 107.9 MHz. This type uses
+//! the user manual's inclusive storage domain.
 //!
 //! # Reception methods (per Operating Tips §5.10.7)
 //!
@@ -31,10 +32,11 @@
 //! - When FM Radio mode is on, Menu No. 105, 134, 200, 203, 204, 210,
 //!   and 220 cannot be accessed.
 //!
-//! The FM radio is toggled on/off via the FR CAT command (already
-//! implemented as `get_fm_radio` / `set_fm_radio`). FM memory channels
-//! are managed through the radio's menu system or MCP software, as there
-//! is no CAT command for individual FM memory channel programming.
+//! The FM radio state is readable through the FR CAT command. Retained
+//! hardware evidence rejects FR writes, so changes use Menu 700's exact MCP
+//! cell through `Radio::set_fm_radio_via_mcp`. FM memory channels are managed
+//! through the radio's menu system or MCP software; no CAT command programs
+//! an individual FM memory channel.
 //!
 //! When FM radio mode is active, the display shows "WFM" (Wide FM) and
 //! the radio uses the wideband FM demodulator. The LED control setting
@@ -45,11 +47,15 @@
 
 use std::fmt;
 
-/// FM broadcast radio frequency range lower bound (76.0 MHz), in Hz.
-pub const FM_RADIO_MIN_HZ: u32 = 76_000_000;
+use crate::error::ValidationError;
 
-/// FM broadcast radio frequency range upper bound (108.0 MHz), in Hz.
-pub const FM_RADIO_MAX_HZ: u32 = 108_000_000;
+use super::Frequency;
+
+/// FM broadcast radio frequency range lower bound (76.0 MHz).
+pub const FM_RADIO_MIN: Frequency = Frequency::new(76_000_000);
+
+/// FM broadcast radio frequency range upper bound (108.0 MHz).
+pub const FM_RADIO_MAX: Frequency = Frequency::new(108_000_000);
 
 /// Number of FM radio memory channels available.
 pub const FM_RADIO_CHANNEL_COUNT: u8 = 10;
@@ -65,31 +71,36 @@ pub struct FmRadioChannel {
     number: u8,
     /// Station frequency in Hz (76,000,000 - 108,000,000).
     /// The radio tunes in 50/100 kHz steps in the FM broadcast band.
-    frequency_hz: u32,
-    /// Station name (up to 8 characters).
+    frequency: Frequency,
+    /// Station name (up to 8 UTF-8 encoded bytes).
     name: String,
 }
 
 impl FmRadioChannel {
     /// Create a new FM radio channel.
     ///
-    /// Returns `None` if the channel number or frequency is out of range,
-    /// or if the name exceeds 8 characters. Fields are private so this
-    /// validation cannot be bypassed after construction.
-    #[must_use]
-    pub fn new(number: u8, frequency_hz: u32, name: String) -> Option<Self> {
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::FmRadioChannelOutOfRange`] outside FM0-FM9,
+    /// [`ValidationError::FmRadioFrequencyOutOfRange`] outside 76-108 MHz
+    /// inclusive, or [`ValidationError::FmRadioNameTooLong`] when `name`
+    /// exceeds eight UTF-8 encoded bytes. Fields are private, so validation
+    /// cannot be bypassed after construction.
+    pub fn new(number: u8, frequency: Frequency, name: String) -> Result<Self, ValidationError> {
         if number >= FM_RADIO_CHANNEL_COUNT {
-            return None;
+            return Err(ValidationError::FmRadioChannelOutOfRange { channel: number });
         }
-        if !(FM_RADIO_MIN_HZ..=FM_RADIO_MAX_HZ).contains(&frequency_hz) {
-            return None;
+        if !(FM_RADIO_MIN..=FM_RADIO_MAX).contains(&frequency) {
+            return Err(ValidationError::FmRadioFrequencyOutOfRange {
+                frequency_hz: frequency.as_hz(),
+            });
         }
         if name.len() > 8 {
-            return None;
+            return Err(ValidationError::FmRadioNameTooLong { len: name.len() });
         }
-        Some(Self {
+        Ok(Self {
             number,
-            frequency_hz,
+            frequency,
             name,
         })
     }
@@ -102,8 +113,8 @@ impl FmRadioChannel {
 
     /// Station frequency in Hz.
     #[must_use]
-    pub const fn frequency_hz(&self) -> u32 {
-        self.frequency_hz
+    pub const fn frequency(&self) -> Frequency {
+        self.frequency
     }
 
     /// Station name (may be empty).
@@ -115,7 +126,7 @@ impl FmRadioChannel {
     /// Returns the frequency in MHz as a floating-point value.
     #[must_use]
     pub fn frequency_mhz(&self) -> f64 {
-        f64::from(self.frequency_hz) / 1_000_000.0
+        self.frequency.as_mhz()
     }
 }
 
@@ -159,10 +170,9 @@ mod tests {
 
     #[test]
     fn fm_channel_valid() -> Result<(), Box<dyn std::error::Error>> {
-        let ch = FmRadioChannel::new(0, 89_100_000, "NPR".to_owned())
-            .ok_or("valid FM channel rejected")?;
+        let ch = FmRadioChannel::new(0, Frequency::new(89_100_000), "NPR".to_owned())?;
         assert_eq!(ch.number(), 0);
-        assert_eq!(ch.frequency_hz(), 89_100_000);
+        assert_eq!(ch.frequency(), Frequency::new(89_100_000));
         assert!((ch.frequency_mhz() - 89.1).abs() < 0.001);
         assert_eq!(ch.name(), "NPR");
         Ok(())
@@ -170,28 +180,43 @@ mod tests {
 
     #[test]
     fn fm_channel_invalid_number() {
-        assert!(FmRadioChannel::new(10, 89_100_000, String::new()).is_none());
+        assert!(matches!(
+            FmRadioChannel::new(10, Frequency::new(89_100_000), String::new()),
+            Err(ValidationError::FmRadioChannelOutOfRange { channel: 10 })
+        ));
     }
 
     #[test]
     fn fm_channel_invalid_frequency_low() {
-        assert!(FmRadioChannel::new(0, 75_000_000, String::new()).is_none());
+        assert!(matches!(
+            FmRadioChannel::new(0, Frequency::new(75_000_000), String::new()),
+            Err(ValidationError::FmRadioFrequencyOutOfRange {
+                frequency_hz: 75_000_000
+            })
+        ));
     }
 
     #[test]
     fn fm_channel_invalid_frequency_high() {
-        assert!(FmRadioChannel::new(0, 109_000_000, String::new()).is_none());
+        assert!(matches!(
+            FmRadioChannel::new(0, Frequency::new(109_000_000), String::new()),
+            Err(ValidationError::FmRadioFrequencyOutOfRange {
+                frequency_hz: 109_000_000
+            })
+        ));
     }
 
     #[test]
     fn fm_channel_name_too_long() {
-        assert!(FmRadioChannel::new(0, 89_100_000, "123456789".to_owned()).is_none());
+        assert!(matches!(
+            FmRadioChannel::new(0, Frequency::new(89_100_000), "123456789".to_owned()),
+            Err(ValidationError::FmRadioNameTooLong { len: 9 })
+        ));
     }
 
     #[test]
     fn fm_channel_display_with_name() -> Result<(), Box<dyn std::error::Error>> {
-        let ch = FmRadioChannel::new(3, 101_100_000, "KFLY".to_owned())
-            .ok_or("valid FM channel rejected")?;
+        let ch = FmRadioChannel::new(3, Frequency::new(101_100_000), "KFLY".to_owned())?;
         let s = format!("{ch}");
         assert!(s.contains("FM3"));
         assert!(s.contains("101.1"));
@@ -201,8 +226,7 @@ mod tests {
 
     #[test]
     fn fm_channel_display_without_name() -> Result<(), Box<dyn std::error::Error>> {
-        let ch =
-            FmRadioChannel::new(0, 88_500_000, String::new()).ok_or("valid FM channel rejected")?;
+        let ch = FmRadioChannel::new(0, Frequency::new(88_500_000), String::new())?;
         let s = format!("{ch}");
         assert!(s.contains("FM0"));
         assert!(s.contains("88.5"));
@@ -213,11 +237,11 @@ mod tests {
     #[test]
     fn fm_channel_boundary_frequencies() {
         // Lower bound
-        let low = FmRadioChannel::new(0, FM_RADIO_MIN_HZ, String::new());
-        assert!(low.is_some());
+        let low = FmRadioChannel::new(0, FM_RADIO_MIN, String::new());
+        assert!(low.is_ok());
         // Upper bound
-        let high = FmRadioChannel::new(0, FM_RADIO_MAX_HZ, String::new());
-        assert!(high.is_some());
+        let high = FmRadioChannel::new(0, FM_RADIO_MAX, String::new());
+        assert!(high.is_ok());
     }
 
     #[test]

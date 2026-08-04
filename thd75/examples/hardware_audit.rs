@@ -44,6 +44,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -60,13 +61,12 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use kenwood_thd75::error::TransportError;
+use kenwood_thd75::Radio;
 use kenwood_thd75::protocol::Codec;
 use kenwood_thd75::radio::automation::AutomationAbi;
 #[cfg(target_os = "macos")]
 use kenwood_thd75::transport::BluetoothTransport;
 use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
-use kenwood_thd75::{Error as RadioError, Radio};
 use serde_json::{Map, Value, json};
 
 type AuditError = Box<dyn Error + Send + Sync>;
@@ -875,9 +875,7 @@ fn validate_usb_port(port: &str) -> AuditResult<()> {
 
 fn open_transport(endpoint: &Endpoint) -> AuditResult<EitherTransport> {
     match endpoint {
-        Endpoint::Usb(port) => Ok(EitherTransport::Serial(SerialTransport::open(
-            port, CAT_BAUD,
-        )?)),
+        Endpoint::Usb(port) => Ok(EitherTransport::Serial(SerialTransport::open(port)?)),
         Endpoint::Bluetooth(device_name) => open_bluetooth_transport(device_name),
     }
 }
@@ -905,61 +903,11 @@ async fn close_transport<T: Transport>(transport: &mut T) -> AuditResult<()> {
         )
 }
 
-struct RadioRawTransport<'a, T: Transport>(&'a mut Radio<T>);
-
-fn map_radio_write_error(error: RadioError) -> TransportError {
-    match error {
-        RadioError::Transport(error) => error,
-        error => TransportError::Write(io::Error::other(error)),
-    }
-}
-
-fn map_radio_read_error(error: RadioError) -> TransportError {
-    match error {
-        RadioError::Transport(error) => error,
-        error => TransportError::Read(io::Error::other(error)),
-    }
-}
-
-fn map_radio_connection_error(error: RadioError) -> TransportError {
-    match error {
-        RadioError::Transport(error) => error,
-        error => TransportError::Disconnected(io::Error::other(error)),
-    }
-}
-
-impl<T: Transport> Transport for RadioRawTransport<'_, T> {
-    async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
-        self.0
-            .transport_write(data)
-            .await
-            .map_err(map_radio_write_error)
-    }
-
-    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
-        self.0
-            .transport_read(buffer)
-            .await
-            .map_err(map_radio_read_error)
-    }
-
-    async fn close(&mut self) -> Result<(), TransportError> {
-        self.0
-            .close_transport()
-            .await
-            .map_err(map_radio_connection_error)
-    }
-
-    async fn reopen(&mut self) -> Result<(), TransportError> {
-        self.0.reconnect().await.map_err(map_radio_connection_error)
-    }
-}
-
 async fn qualify_automation_on_endpoint(
     endpoint: &Endpoint,
 ) -> AuditResult<(Radio<EitherTransport>, AutomationAbi)> {
     let transport = open_transport(endpoint)?;
-    let mut radio = Radio::connect(transport).await?;
+    let mut radio = Radio::new(transport);
     let qualification = radio
         .qualify_automation()
         .await
@@ -1047,11 +995,16 @@ async fn run_selected_profile(
             drop(tokio::time::timeout(CLOSE_TIMEOUT, radio.disconnect()).await);
             return Err(error);
         }
-        let result = {
-            let mut transport = RadioRawTransport(&mut radio);
-            run_configured_audit(config, &mut transport, private, sanitized, session_dir).await
+        let mut transport = match radio.into_raw_protocol_session() {
+            Ok(transport) => transport,
+            Err((radio, error)) => {
+                drop(tokio::time::timeout(CLOSE_TIMEOUT, radio.disconnect()).await);
+                return Err(error.into());
+            }
         };
-        let close = tokio::time::timeout(CLOSE_TIMEOUT, radio.disconnect())
+        let result =
+            run_configured_audit(config, &mut transport, private, sanitized, session_dir).await;
+        let close = tokio::time::timeout(CLOSE_TIMEOUT, transport.disconnect())
             .await
             .map_or_else(
                 |_| Err(invalid_input("transport close timed out")),
@@ -2104,7 +2057,12 @@ async fn await_response<T: Transport>(
             };
         };
         received.extend_from_slice(chunk);
-        codec.feed(chunk);
+        if let Err(error) = codec.feed(chunk) {
+            return ExchangeTerminal::Failure {
+                code: "framing-overflow",
+                detail: format!("CAT framing failed while awaiting the response: {error}"),
+            };
+        }
         let mut matched = None;
         while let Some(frame) = codec.next_frame() {
             if matched.is_none()
@@ -2175,7 +2133,13 @@ async fn drain_stale<T: Transport>(transport: &mut T, codec: &mut Codec) -> Drai
                     break;
                 };
                 bytes.extend_from_slice(chunk);
-                codec.feed(chunk);
+                if let Err(error) = codec.feed(chunk) {
+                    failure = Some((
+                        "drain-framing-overflow",
+                        format!("CAT framing failed while draining stale input: {error}"),
+                    ));
+                    break;
+                }
                 while let Some(frame) = codec.next_frame() {
                     frames.push(frame);
                 }
@@ -2938,12 +2902,13 @@ mod tests {
     }
 
     #[test]
-    fn cli_requires_exactly_one_endpoint() {
-        let missing = test_config(&["baseline", "--capture-root", "/tmp/audit"])
-            .expect_err("an endpoint is required");
+    fn cli_requires_exactly_one_endpoint() -> TestResult {
+        let Err(missing) = test_config(&["baseline", "--capture-root", "/tmp/audit"]) else {
+            return Err(invalid_input("an endpoint is required"));
+        };
         assert!(missing.to_string().contains("exactly one"));
 
-        let both = test_config(&[
+        let Err(both) = test_config(&[
             "baseline",
             "--port",
             "/dev/cu.usbmodem101",
@@ -2951,9 +2916,11 @@ mod tests {
             "TH-D75",
             "--capture-root",
             "/tmp/audit",
-        ])
-        .expect_err("USB and Bluetooth are mutually exclusive");
+        ]) else {
+            return Err(invalid_input("USB and Bluetooth are mutually exclusive"));
+        };
         assert!(both.to_string().contains("exactly one"));
+        Ok(())
     }
 
     #[test]
@@ -3007,50 +2974,58 @@ mod tests {
         assert!(config.machine_checked_read_only);
         assert_eq!(config.profile.case_count(), 59);
 
-        let interactive = test_config(&[
+        let Err(interactive) = test_config(&[
             "baseline",
             "--automation",
             "--bluetooth",
             "TH-D75",
             "--capture-root",
             "/tmp/audit",
-        ])
-        .expect_err("V1.03.AZM unexpectedly accepted an operator-only preflight");
+        ]) else {
+            return Err(invalid_input(
+                "V1.03.AZM unexpectedly accepted an operator-only preflight",
+            ));
+        };
         assert!(
             interactive
                 .to_string()
                 .contains("requires --machine-checked-read-only")
         );
 
-        let write_capable = test_config(&[
+        let Err(write_capable) = test_config(&[
             "make-safe",
             "--automation",
             "--bluetooth",
             "TH-D75",
             "--capture-root",
             "/tmp/audit",
-        ])
-        .expect_err("V1.03.AZM unexpectedly enabled a write-capable mode");
+        ]) else {
+            return Err(invalid_input(
+                "V1.03.AZM unexpectedly enabled a write-capable mode",
+            ));
+        };
         assert!(write_capable.to_string().contains("read-only baseline"));
         Ok(())
     }
 
     #[test]
-    fn machine_checked_mode_cannot_enable_make_safe() {
-        let error = test_config(&[
+    fn machine_checked_mode_cannot_enable_make_safe() -> TestResult {
+        let Err(error) = test_config(&[
             "make-safe",
             "--bluetooth",
             "TH-D75",
             "--machine-checked-read-only",
             "--capture-root",
             "/tmp/audit",
-        ])
-        .expect_err("machine checking is read-only");
+        ]) else {
+            return Err(invalid_input("machine checking is read-only"));
+        };
         assert!(
             error
                 .to_string()
                 .contains("only for the read-only baseline")
         );
+        Ok(())
     }
 
     #[test]
@@ -3157,7 +3132,7 @@ mod tests {
     }
 
     #[test]
-    fn automation_fixed_cat_profile_excludes_only_bare_gm_and_gw() -> TestResult {
+    fn automation_fixed_cat_profile_excludes_only_bare_gm_and_gw() {
         let stock: Vec<&CommandSpec> = IDENTITY_READS
             .iter()
             .chain(BASELINE_PREFLIGHT)
@@ -3183,7 +3158,6 @@ mod tests {
         assert!(!automation_wires.contains(b"GM\r".as_slice()));
         assert!(!automation_wires.contains(b"GW\r".as_slice()));
         assert!(automation.iter().all(|spec| !spec.state_change));
-        Ok(())
     }
 
     #[test]
@@ -3396,6 +3370,24 @@ mod tests {
         )
         .await;
         assert_eq!(result.terminal_code(), "response-timeout");
+        transport.assert_complete();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_response_is_reported_as_a_framing_failure() {
+        let mut transport = MockTransport::new();
+        transport.pend_when_empty();
+        let oversized = vec![b'X'; Codec::MAX_BUFFERED_BYTES + 1];
+        transport.expect(b"ID\r", &oversized);
+        let mut codec = Codec::new();
+
+        let result = exchange(
+            &mut transport,
+            &mut codec,
+            &CommandSpec::public("A1-P0-ID-READ", b"ID\r"),
+        )
+        .await;
+        assert_eq!(result.terminal_code(), "framing-overflow");
         transport.assert_complete();
     }
 

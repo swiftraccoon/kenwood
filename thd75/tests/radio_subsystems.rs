@@ -3,6 +3,7 @@
 use kenwood_thd75::error::Error;
 use kenwood_thd75::radio::{FirmwareProfile, Radio};
 use kenwood_thd75::transport::MockTransport;
+use kenwood_thd75::types::{NmeaSentence, NmeaSentences};
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -11,6 +12,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -26,8 +28,15 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 async fn get_aprs_callsign() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"CS\r", b"CS KQ4NIT-7\r");
-    let mut radio = Radio::connect(mock).await?;
-    assert_eq!(radio.get_aprs_callsign().await?.as_str(), "KQ4NIT-7");
+    let mut radio = Radio::new(mock);
+    assert_eq!(
+        radio
+            .get_aprs_callsign()
+            .await?
+            .ok_or("radio returned an empty APRS callsign slot")?
+            .to_string(),
+        "KQ4NIT-7"
+    );
     Ok(())
 }
 
@@ -35,21 +44,29 @@ async fn get_aprs_callsign() -> TestResult {
 async fn set_aprs_callsign() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"CS KQ4NIT-7\r", b"CS KQ4NIT-7\r");
-    let mut radio = Radio::connect(mock).await?;
-    let callsign = kenwood_thd75::types::AprsCallsign::new("KQ4NIT-7")
-        .ok_or("valid APRS callsign rejected")?;
+    let mut radio = Radio::new(mock);
+    let callsign = kenwood_thd75::types::AprsCallsign::new("KQ4NIT-7")?;
     radio.set_aprs_callsign(callsign).await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn get_gateway() -> TestResult {
+async fn get_empty_aprs_callsign_slot() -> TestResult {
+    let mut mock = MockTransport::new();
+    mock.expect(b"CS\r", b"CS \r");
+    let mut radio = Radio::new(mock);
+    assert_eq!(radio.get_aprs_callsign().await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_gateway() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"FV\r", b"FV 1.03.000\r");
     mock.expect(b"GW\r", b"GW 0\r");
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     assert_eq!(
-        radio.get_gateway().await?,
+        radio.read_gateway().await?,
         kenwood_thd75::types::DvGatewayMode::Off
     );
     Ok(())
@@ -59,7 +76,7 @@ async fn get_gateway() -> TestResult {
 async fn get_dstar_slot() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"DS\r", b"DS 1\r");
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     assert_eq!(
         radio.get_dstar_slot().await?,
         kenwood_thd75::types::DstarSlot::new(1)?
@@ -68,26 +85,47 @@ async fn get_dstar_slot() -> TestResult {
 }
 
 #[tokio::test]
-async fn get_tnc_baud() -> TestResult {
+async fn get_packet_data_rate() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"AS\r", b"AS 0\r");
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     assert_eq!(
-        radio.get_tnc_baud().await?,
-        kenwood_thd75::types::TncBaud::Bps1200
+        radio.get_packet_data_rate().await?,
+        kenwood_thd75::types::PacketDataRate::Bps1200
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn get_beacon_type() -> TestResult {
+async fn get_beacon_mode() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"PT\r", b"PT 2\r");
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     assert_eq!(
-        radio.get_beacon_type().await?,
+        radio.get_beacon_mode().await?,
         kenwood_thd75::types::BeaconMode::Auto
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transmit_aprs_beacon_requires_the_exact_bare_acknowledgement() -> TestResult {
+    let mut mock = MockTransport::new();
+    mock.expect(b"BE\r", b"BE\r");
+    let mut radio = Radio::new(mock);
+    radio.transmit_aprs_beacon().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn transmit_aprs_beacon_preserves_tnc_not_ready() -> TestResult {
+    let mut mock = MockTransport::new();
+    mock.expect(b"BE\r", b"N\r");
+    let mut radio = Radio::new(mock);
+    assert!(matches!(
+        radio.transmit_aprs_beacon().await,
+        Err(Error::NotAvailableInCurrentMode)
+    ));
     Ok(())
 }
 
@@ -95,30 +133,19 @@ async fn get_beacon_type() -> TestResult {
 async fn get_my_position_selection() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"MS\r", b"MS 0\r");
-    let mut radio = Radio::connect(mock).await?;
-    assert_eq!(radio.get_my_position_selection().await?.as_u8(), 0);
+    let mut radio = Radio::new(mock);
+    assert_eq!(radio.get_my_position_selection().await?.as_raw(), 0);
     Ok(())
 }
 
 #[tokio::test]
-async fn get_serial_info() -> TestResult {
-    let mut mock = MockTransport::new();
-    mock.expect(b"AE\r", b"AE C3C10368,K01\r");
-    let mut radio = Radio::connect(mock).await?;
-    let (serial, model_code) = radio.get_serial_info().await?;
-    assert_eq!(serial, "C3C10368");
-    assert_eq!(model_code, "K01");
-    Ok(())
-}
-
-#[tokio::test]
-async fn get_gps_config() -> TestResult {
+async fn get_gps_settings() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"GP\r", b"GP 0,0\r");
-    let mut radio = Radio::connect(mock).await?;
-    let (gps_enabled, pc_output) = radio.get_gps_config().await?;
-    assert!(!gps_enabled);
-    assert!(!pc_output);
+    let mut radio = Radio::new(mock);
+    let settings = radio.get_gps_settings().await?;
+    assert!(!settings.enabled());
+    assert!(!settings.pc_output());
     Ok(())
 }
 
@@ -126,25 +153,21 @@ async fn get_gps_config() -> TestResult {
 async fn get_gps_sentences() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"GS\r", b"GS 1,1,1,1,1,1\r");
-    let mut radio = Radio::connect(mock).await?;
-    let (gga, gll, gsa, gsv, rmc, vtg) = radio.get_gps_sentences().await?;
-    assert!(gga);
-    assert!(gll);
-    assert!(gsa);
-    assert!(gsv);
-    assert!(rmc);
-    assert!(vtg);
+    let mut radio = Radio::new(mock);
+    let sentences = radio.get_gps_sentences().await?;
+    assert_eq!(sentences, NmeaSentences::all());
+    assert!(sentences.contains(NmeaSentence::Rmc));
     Ok(())
 }
 
 #[tokio::test]
-async fn get_gps_mode() -> TestResult {
+async fn read_gps_mode() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"FV\r", b"FV 1.03.000\r");
     mock.expect(b"GM\r", b"GM 0\r");
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     assert_eq!(
-        radio.get_gps_mode().await?,
+        radio.read_gps_mode().await?,
         kenwood_thd75::types::GpsRadioMode::Normal
     );
     Ok(())
@@ -154,48 +177,57 @@ async fn get_gps_mode() -> TestResult {
 async fn azimuth_profile_rejects_bare_gateway_and_gps_without_writes() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"FV\r", b"FV 1.03.AZM\r");
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
 
-    let gateway = radio.get_gateway().await;
+    let gateway = radio.read_gateway().await;
     assert!(
         matches!(
             gateway,
             Err(Error::CommandUnavailableOnFirmware {
                 command: "GW",
                 ref firmware,
-            }) if firmware == "1.03.AZM"
+            }) if firmware.as_str() == "1.03.AZM"
         ),
         "AZM gateway query should fail locally, got {gateway:?}"
     );
-    let gps = radio.get_gps_mode().await;
+    let gps = radio.read_gps_mode().await;
     assert!(
         matches!(
             gps,
             Err(Error::CommandUnavailableOnFirmware {
                 command: "GM",
                 ref firmware,
-            }) if firmware == "1.03.AZM"
+            }) if firmware.as_str() == "1.03.AZM"
         ),
         "AZM GPS-mode query should fail locally, got {gps:?}"
     );
     assert_eq!(
-        radio.firmware_profile(),
+        radio.cached_firmware_profile(),
         Some(FirmwareProfile::AzimuthAutomation)
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn near_match_azimuth_identity_keeps_standard_gateway_command() -> TestResult {
+async fn unknown_firmware_identity_blocks_unqualified_gateway_command() -> TestResult {
     let mut mock = MockTransport::new();
-    mock.expect(b"FV\r", b"FV 1.03.AZM2\r");
-    mock.expect(b"GW\r", b"GW 0\r");
-    let mut radio = Radio::connect(mock).await?;
+    mock.expect(b"FV\r", b"FV 1.03.XYZ\r");
+    let mut radio = Radio::new(mock);
 
-    assert_eq!(
-        radio.get_gateway().await?,
-        kenwood_thd75::types::DvGatewayMode::Off
+    let gateway = radio.read_gateway().await;
+    assert!(
+        matches!(
+            gateway,
+            Err(Error::CommandUnavailableOnFirmware {
+                command: "GW",
+                ref firmware,
+            }) if firmware.as_str() == "1.03.XYZ"
+        ),
+        "unknown firmware must fail closed, got {gateway:?}"
     );
-    assert_eq!(radio.firmware_profile(), Some(FirmwareProfile::StandardCat));
+    assert_eq!(
+        radio.cached_firmware_profile(),
+        Some(FirmwareProfile::Unknown)
+    );
     Ok(())
 }

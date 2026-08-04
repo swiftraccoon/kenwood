@@ -1,16 +1,17 @@
 //! Channel URCALL and memory types for the TH-D75 transceiver.
 //!
-//! This module contains two channel representations:
+//! This module contains three exact channel representations:
 //!
-//! - [`ChannelMemory`]: the CAT wire format (FO/ME commands), used by the
-//!   protocol layer for over-the-air command encoding/decoding.
-//! - [`FlashChannel`]: the 40-byte flash memory format (MCP/SD card), used
+//! - [`CatChannelRecord`]: the 20 shared textual fields returned by `FO` and
+//!   `ME`.
+//! - [`CatMemoryChannelRecord`]: an `ME` record plus its split and scan-lockout
+//!   fields.
+//! - [`StoredChannel`]: the 40-byte stored memory format (MCP/SD card), used
 //!   by the memory and SD card modules for binary image parsing.
 //!
-//! The two formats differ in field layout at bytes 0x09, 0x0A, 0x0E, and
-//! 0x0F-0x27. The flash format includes `MemoryMode` (8 modes including
-//! LSB/USB/CW/DR), separated D-STAR callsigns, and structured tone/duplex
-//! bit fields.
+//! CAT records are comma-separated text and never have a binary form. Stored
+//! records use semantic types for established fields and exact typed storage
+//! for bits whose meanings have not yet been established.
 //!
 //! # Memory architecture (per User Manual Chapter 8)
 //!
@@ -59,114 +60,327 @@
 use std::fmt;
 
 use crate::error::{ProtocolError, ValidationError};
-use crate::types::dstar::DstarCallsign;
+use crate::types::RegularChannel;
+use crate::types::dstar::{DigitalSquelchCode, DigitalSquelchType, DstarCallsign};
 use crate::types::frequency::Frequency;
-use crate::types::mode::{MemoryMode, ShiftDirection, StepSize};
-use crate::types::tone::{CtcssMode, DcsCode, ToneCode};
+use crate::types::mode::{ChannelMode, ShiftDirection, StepSize};
+use crate::types::tone::{CtcssCode, DcsCode, ToneCode, ToneMode};
 
-/// D-STAR URCALL callsign (up to 8 characters, stored in 24 bytes).
-///
-/// The TH-D75 stores this field in a 24-byte region to accommodate
-/// multi-byte character encodings such as Shift-JIS (Japanese Industrial
-/// Standards) on Japanese-market models. This type validates ASCII-only
-/// content with a maximum of 8 characters.
-///
-/// Despite being labeled "Channel Name" in some documentation, this field
-/// stores the D-STAR "UR" (your) callsign, defaulting to "CQCQCQ" for
-/// general CQ calls. User-assigned channel display names are stored
-/// separately in flash and are only accessible via the MCP programming
-/// interface.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub struct ChannelName(String);
+/// A memory group in the inclusive range 0-29.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MemoryGroup(u8);
 
-impl ChannelName {
-    /// Creates a new `ChannelName` from a string slice.
+impl MemoryGroup {
+    /// Lowest memory-group index.
+    pub const MIN: u8 = 0;
+
+    /// Highest memory-group index.
+    pub const MAX: u8 = 29;
+
+    /// Number of memory groups.
+    pub const COUNT: usize = 30;
+
+    /// Construct a memory-group index.
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::ChannelNameTooLong`] if the callsign
-    /// exceeds 8 characters.
-    pub fn new(name: &str) -> Result<Self, ValidationError> {
-        let len = name.len();
-        if len > 8 {
-            return Err(ValidationError::ChannelNameTooLong { len });
+    /// Returns [`ValidationError::MemoryGroupOutOfRange`] above group 29.
+    pub const fn new(group: u8) -> Result<Self, ValidationError> {
+        if group <= Self::MAX {
+            Ok(Self(group))
+        } else {
+            Err(ValidationError::MemoryGroupOutOfRange { group })
         }
-        Ok(Self(name.to_owned()))
     }
 
-    /// Returns the URCALL callsign as a string slice.
+    /// Return the zero-based group index.
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub const fn as_raw(self) -> u8 {
+        self.0
     }
 
-    /// Encodes the URCALL callsign as a 24-byte null-padded ASCII array.
-    #[must_use]
-    pub fn to_bytes(&self) -> [u8; 24] {
-        let mut buf = [0u8; 24];
-        // `ChannelName::new` caps the inner string at 8 bytes, so zipping
-        // against `buf` (length 24) is always bounded without a fallible
-        // copy_from_slice + length check.
-        buf.iter_mut()
-            .zip(self.0.as_bytes().iter())
-            .for_each(|(dst, &byte)| *dst = byte);
-        buf
-    }
-
-    /// Decodes a URCALL callsign from a 24-byte null-padded array.
-    ///
-    /// Scans for the first null byte and takes ASCII characters up to
-    /// that point. If no null byte is found, takes up to 8 characters.
-    #[must_use]
-    pub fn from_bytes(bytes: &[u8; 24]) -> Self {
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(8).min(8);
-        // `end <= 8 <= 24 == bytes.len()`, so `get(..end)` always yields
-        // `Some`; the fallback is unreachable but keeps this panic-free.
-        let slice = bytes.get(..end).unwrap_or(bytes);
-        let s = String::from_utf8_lossy(slice);
-        Self(s.into_owned())
+    /// Iterate over every memory group in numeric order.
+    pub fn all() -> impl ExactSizeIterator<Item = Self> + DoubleEndedIterator {
+        (Self::MIN..=Self::MAX).map(Self)
     }
 }
 
-/// Exact three-character selector used by the ME and MR CAT commands.
-///
-/// The selector is not always a decimal channel number. Firmware accepts
-/// program-scan edges (`L00`-`L49` and `U00`-`U49`), regional banks
-/// (`T01`-`T30` and `A01`-`A10`), and the priority selector (`Pri`) in
-/// addition to ordinary channels `000`-`999`.
+impl TryFrom<u8> for MemoryGroup {
+    type Error = ValidationError;
+
+    fn try_from(group: u8) -> Result<Self, Self::Error> {
+        Self::new(group)
+    }
+}
+
+impl From<MemoryGroup> for u8 {
+    fn from(group: MemoryGroup) -> Self {
+        group.as_raw()
+    }
+}
+
+impl From<MemoryGroup> for usize {
+    fn from(group: MemoryGroup) -> Self {
+        Self::from(group.as_raw())
+    }
+}
+
+impl fmt::Display for MemoryGroup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+/// Band marker stored in a populated memory channel's flag record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum MemorySelectorValue {
-    Channel(u16),
+pub enum MemoryChannelBand {
+    /// VHF channel band code (`0x00`).
+    Vhf,
+    /// 220 MHz channel band code (`0x01`).
+    Band220,
+    /// UHF channel band code (`0x02`).
+    Uhf,
+    /// 50 MHz channel band code (`0x05`).
+    Band50MHz,
+}
+
+impl MemoryChannelBand {
+    /// Decode the three-bit band code stored at the bottom of flag byte zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::MemoryChannelBandOutOfRange`] for a code
+    /// that has not been verified in a physical TH-D75 memory image.
+    pub const fn from_wire_code(marker: u8) -> Result<Self, ValidationError> {
+        match marker {
+            0x00 => Ok(Self::Vhf),
+            0x01 => Ok(Self::Band220),
+            0x02 => Ok(Self::Uhf),
+            0x05 => Ok(Self::Band50MHz),
+            _ => Err(ValidationError::MemoryChannelBandOutOfRange { marker }),
+        }
+    }
+
+    /// Return the three-bit code used by the radio's memory-channel flag.
+    #[must_use]
+    pub const fn to_wire_code(self) -> u8 {
+        match self {
+            Self::Vhf => 0x00,
+            Self::Band220 => 0x01,
+            Self::Uhf => 0x02,
+            Self::Band50MHz => 0x05,
+        }
+    }
+}
+
+impl TryFrom<u8> for MemoryChannelBand {
+    type Error = ValidationError;
+
+    fn try_from(marker: u8) -> Result<Self, Self::Error> {
+        Self::from_wire_code(marker)
+    }
+}
+
+impl From<MemoryChannelBand> for u8 {
+    fn from(band: MemoryChannelBand) -> Self {
+        band.to_wire_code()
+    }
+}
+
+/// Lossless four-byte flag record for a regular memory channel.
+///
+/// Physical radio images prove that byte zero is not a standalone band
+/// value: channel 1 in the validation fixture stores `0x08` while remaining
+/// a VHF memory. Only its low three bits are decoded as the band code. Every
+/// other bit is retained verbatim so reading and writing a channel cannot
+/// erase fields whose meaning has not yet been established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StoredChannelFlag {
+    wire: [u8; Self::WIRE_SIZE],
+    state: StoredChannelFlagState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum StoredChannelFlagState {
+    Empty,
+    Programmed {
+        band: MemoryChannelBand,
+        group: MemoryGroup,
+        scan_lockout: bool,
+    },
+}
+
+impl StoredChannelFlag {
+    /// Width of a memory-channel flag record.
+    pub const WIRE_SIZE: usize = 4;
+
+    const BAND_CODE_MASK: u8 = 0x07;
+    const SCAN_LOCKOUT_MASK: u8 = 0x01;
+    const EMPTY_MARKER: u8 = 0xFF;
+
+    /// Construct the canonical empty-channel flag with group byte zero.
+    ///
+    /// Use [`Self::empty_for_regular_channel`] when clearing a regular slot;
+    /// physical radio images retain the channel's default group byte even
+    /// while byte zero marks the slot empty.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            wire: [Self::EMPTY_MARKER, 0x00, 0x00, 0xFF],
+            state: StoredChannelFlagState::Empty,
+        }
+    }
+
+    /// Construct the observed empty flag for a regular channel.
+    #[must_use]
+    pub const fn empty_for_regular_channel(channel: RegularChannel) -> Self {
+        let [default_group, _] = (channel.as_raw() / 100).to_le_bytes();
+        Self {
+            wire: [Self::EMPTY_MARKER, 0x00, default_group, 0xFF],
+            state: StoredChannelFlagState::Empty,
+        }
+    }
+
+    /// Construct a canonical programmed-channel flag.
+    #[must_use]
+    pub const fn programmed(
+        band: MemoryChannelBand,
+        group: MemoryGroup,
+        scan_lockout: bool,
+    ) -> Self {
+        Self {
+            wire: [
+                band.to_wire_code(),
+                if scan_lockout {
+                    Self::SCAN_LOCKOUT_MASK
+                } else {
+                    0x00
+                },
+                group.as_raw(),
+                0xFF,
+            ],
+            state: StoredChannelFlagState::Programmed {
+                band,
+                group,
+                scan_lockout,
+            },
+        }
+    }
+
+    /// Decode and retain an exact flag record from a radio image.
+    ///
+    /// Empty records are retained without interpreting their other bytes.
+    /// Programmed records validate the proven band code and memory-group
+    /// fields while keeping all unknown bits intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::MemoryChannelBandOutOfRange`] for an
+    /// unverified programmed-channel band code, or
+    /// [`ValidationError::MemoryGroupOutOfRange`] for a programmed channel
+    /// whose group is outside 0-29.
+    pub fn try_from_wire(wire: [u8; Self::WIRE_SIZE]) -> Result<Self, ValidationError> {
+        let state = if wire[0] == Self::EMPTY_MARKER {
+            StoredChannelFlagState::Empty
+        } else {
+            StoredChannelFlagState::Programmed {
+                band: MemoryChannelBand::from_wire_code(wire[0] & Self::BAND_CODE_MASK)?,
+                group: MemoryGroup::new(wire[2])?,
+                scan_lockout: wire[1] & Self::SCAN_LOCKOUT_MASK != 0,
+            }
+        };
+        Ok(Self { wire, state })
+    }
+
+    /// Return whether the memory slot is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        matches!(self.state, StoredChannelFlagState::Empty)
+    }
+
+    /// Return whether the memory slot is programmed.
+    #[must_use]
+    pub const fn is_programmed(self) -> bool {
+        !self.is_empty()
+    }
+
+    /// Return the stored band for a programmed slot.
+    #[must_use]
+    pub const fn band(self) -> Option<MemoryChannelBand> {
+        match self.state {
+            StoredChannelFlagState::Empty => None,
+            StoredChannelFlagState::Programmed { band, .. } => Some(band),
+        }
+    }
+
+    /// Return the group assigned to a programmed slot.
+    #[must_use]
+    pub const fn group(self) -> Option<MemoryGroup> {
+        match self.state {
+            StoredChannelFlagState::Empty => None,
+            StoredChannelFlagState::Programmed { group, .. } => Some(group),
+        }
+    }
+
+    /// Return whether a programmed slot is locked out of normal scans.
+    #[must_use]
+    pub const fn scan_lockout(self) -> Option<bool> {
+        match self.state {
+            StoredChannelFlagState::Empty => None,
+            StoredChannelFlagState::Programmed { scan_lockout, .. } => Some(scan_lockout),
+        }
+    }
+
+    /// Return the exact bytes read from, or to be written to, the radio.
+    #[must_use]
+    pub const fn to_wire_bytes(self) -> [u8; Self::WIRE_SIZE] {
+        self.wire
+    }
+}
+
+impl TryFrom<&[u8]> for StoredChannelFlag {
+    type Error = ValidationError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let wire: [u8; Self::WIRE_SIZE] =
+            bytes
+                .try_into()
+                .map_err(|_| ValidationError::StoredChannelFlagLength {
+                    actual: bytes.len(),
+                })?;
+        Self::try_from_wire(wire)
+    }
+}
+
+/// Exact three-character address accepted by ME reads and MR recalls.
+///
+/// A memory address is not always a decimal channel number. Firmware accepts
+/// program-scan edges (`L00`-`L49` and `U00`-`U49`) and regional banks
+/// (`T01`-`T30` and `A01`-`A10`) in addition to ordinary channels `000`-`999`.
+/// The `Pri` label is deliberately absent: firmware emits it from an MR read,
+/// but its shared input parser does not accept it as an ME or MR address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MemoryChannelAddressValue {
+    Channel(RegularChannel),
     ProgramLower(u8),
     ProgramUpper(u8),
     RegionalT(u8),
     RegionalA(u8),
-    Priority,
 }
 
-/// Validated ME/MR memory selector.
+/// Validated address of a readable or recallable memory channel.
 ///
 /// The representation is private so out-of-range forms such as `L50` or
-/// `T00` cannot be constructed and then emitted by the infallible CAT
+/// `T00`, and the output-only `Pri` label cannot reach the infallible CAT
 /// serializer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MemorySelector(MemorySelectorValue);
+pub struct MemoryChannelAddress(MemoryChannelAddressValue);
 
-impl MemorySelector {
-    /// Priority channel selector (`Pri`).
-    pub const PRIORITY: Self = Self(MemorySelectorValue::Priority);
-
-    /// Construct an ordinary memory selector.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ValidationError::ChannelOutOfRange`] above channel 999.
-    pub const fn channel(channel: u16) -> Result<Self, ValidationError> {
-        if channel <= 999 {
-            Ok(Self(MemorySelectorValue::Channel(channel)))
-        } else {
-            Err(ValidationError::ChannelOutOfRange { channel, max: 999 })
-        }
+impl MemoryChannelAddress {
+    /// Construct an ordinary memory-channel address.
+    #[must_use]
+    pub const fn regular(channel: RegularChannel) -> Self {
+        Self(MemoryChannelAddressValue::Channel(channel))
     }
 
     /// Construct a lower program-scan edge (`L00`-`L49`).
@@ -176,7 +390,7 @@ impl MemorySelector {
     /// Returns a validation error above index 49.
     pub const fn program_lower(index: u8) -> Result<Self, ValidationError> {
         if index <= 49 {
-            Ok(Self(MemorySelectorValue::ProgramLower(index)))
+            Ok(Self(MemoryChannelAddressValue::ProgramLower(index)))
         } else {
             Err(ValidationError::SettingOutOfRange {
                 name: "lower program-scan memory",
@@ -193,7 +407,7 @@ impl MemorySelector {
     /// Returns a validation error above index 49.
     pub const fn program_upper(index: u8) -> Result<Self, ValidationError> {
         if index <= 49 {
-            Ok(Self(MemorySelectorValue::ProgramUpper(index)))
+            Ok(Self(MemoryChannelAddressValue::ProgramUpper(index)))
         } else {
             Err(ValidationError::SettingOutOfRange {
                 name: "upper program-scan memory",
@@ -210,7 +424,7 @@ impl MemorySelector {
     /// Returns a validation error outside 1-30.
     pub const fn regional_t(index: u8) -> Result<Self, ValidationError> {
         if index >= 1 && index <= 30 {
-            Ok(Self(MemorySelectorValue::RegionalT(index)))
+            Ok(Self(MemoryChannelAddressValue::RegionalT(index)))
         } else {
             Err(ValidationError::SettingOutOfRange {
                 name: "regional T memory",
@@ -227,7 +441,7 @@ impl MemorySelector {
     /// Returns a validation error outside 1-10.
     pub const fn regional_a(index: u8) -> Result<Self, ValidationError> {
         if index >= 1 && index <= 10 {
-            Ok(Self(MemorySelectorValue::RegionalA(index)))
+            Ok(Self(MemoryChannelAddressValue::RegionalA(index)))
         } else {
             Err(ValidationError::SettingOutOfRange {
                 name: "regional A memory",
@@ -239,9 +453,9 @@ impl MemorySelector {
 
     /// Return the ordinary numeric channel, if this is `000`-`999`.
     #[must_use]
-    pub const fn channel_number(self) -> Option<u16> {
+    pub const fn regular_channel(self) -> Option<RegularChannel> {
         match self {
-            Self(MemorySelectorValue::Channel(channel)) => Some(channel),
+            Self(MemoryChannelAddressValue::Channel(channel)) => Some(channel),
             _ => None,
         }
     }
@@ -249,26 +463,29 @@ impl MemorySelector {
     fn invalid(selector: &str) -> ValidationError {
         ValidationError::InvalidMemorySelector {
             selector: selector.to_owned(),
-            detail: "expected 000-999, L00-L49, U00-U49, T01-T30, A01-A10, or Pri",
+            detail: "expected 000-999, L00-L49, U00-U49, T01-T30, or A01-A10",
         }
     }
 }
 
-impl TryFrom<u16> for MemorySelector {
+impl TryFrom<u16> for MemoryChannelAddress {
     type Error = ValidationError;
 
     fn try_from(channel: u16) -> Result<Self, Self::Error> {
-        Self::channel(channel)
+        RegularChannel::new(channel).map(Self::regular)
     }
 }
 
-impl TryFrom<&str> for MemorySelector {
+impl From<RegularChannel> for MemoryChannelAddress {
+    fn from(channel: RegularChannel) -> Self {
+        Self::regular(channel)
+    }
+}
+
+impl TryFrom<&str> for MemoryChannelAddress {
     type Error = ValidationError;
 
     fn try_from(selector: &str) -> Result<Self, Self::Error> {
-        if selector == "Pri" {
-            return Ok(Self::PRIORITY);
-        }
         if selector.len() != 3 || !selector.is_ascii() {
             return Err(Self::invalid(selector));
         }
@@ -278,7 +495,7 @@ impl TryFrom<&str> for MemorySelector {
             let channel = selector
                 .parse::<u16>()
                 .map_err(|_| Self::invalid(selector))?;
-            return Self::channel(channel);
+            return RegularChannel::new(channel).map(Self::regular);
         }
         let Some((&prefix, digits)) = bytes.split_first() else {
             return Err(Self::invalid(selector));
@@ -303,505 +520,267 @@ impl TryFrom<&str> for MemorySelector {
     }
 }
 
-impl fmt::Display for MemorySelector {
+impl fmt::Display for MemoryChannelAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            MemorySelectorValue::Channel(channel) => write!(f, "{channel:03}"),
-            MemorySelectorValue::ProgramLower(index) => write!(f, "L{index:02}"),
-            MemorySelectorValue::ProgramUpper(index) => write!(f, "U{index:02}"),
-            MemorySelectorValue::RegionalT(index) => write!(f, "T{index:02}"),
-            MemorySelectorValue::RegionalA(index) => write!(f, "A{index:02}"),
-            MemorySelectorValue::Priority => f.write_str("Pri"),
+            MemoryChannelAddressValue::Channel(channel) => {
+                write!(f, "{:03}", channel.as_raw())
+            }
+            MemoryChannelAddressValue::ProgramLower(index) => write!(f, "L{index:02}"),
+            MemoryChannelAddressValue::ProgramUpper(index) => write!(f, "U{index:02}"),
+            MemoryChannelAddressValue::RegionalT(index) => write!(f, "T{index:02}"),
+            MemoryChannelAddressValue::RegionalA(index) => write!(f, "A{index:02}"),
         }
     }
 }
 
-/// Operating mode encoding used specifically by FO/ME CAT records.
+/// Selector reported by an MR current-channel read.
 ///
-/// This table is intentionally distinct from [`crate::types::Mode`] and
-/// [`MemoryMode`], whose numeric values differ for AM and NFM.
+/// The radio can report its priority channel as `Pri` even though `Pri` is not
+/// accepted by the memory-address input parser. Keeping that output-only state
+/// separate prevents it from being fed back into an ME read or MR recall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CatChannelMode {
-    /// Wide FM (`0`).
-    Fm = 0,
-    /// D-STAR digital voice (`1`).
-    Dv = 1,
-    /// Narrow FM (`2`).
-    Nfm = 2,
-    /// AM (`3`).
-    Am = 3,
+pub enum CurrentMemorySelector {
+    /// An address that can also be read or recalled.
+    Address(MemoryChannelAddress),
+    /// The output-only priority-channel label (`Pri`).
+    Priority,
 }
 
-impl TryFrom<u8> for CatChannelMode {
+impl CurrentMemorySelector {
+    /// Return an address suitable for ME reads and MR recalls, if available.
+    #[must_use]
+    pub const fn address(self) -> Option<MemoryChannelAddress> {
+        match self {
+            Self::Address(address) => Some(address),
+            Self::Priority => None,
+        }
+    }
+
+    /// Return the ordinary numeric channel, if this is `000`-`999`.
+    #[must_use]
+    pub const fn regular_channel(self) -> Option<RegularChannel> {
+        match self.address() {
+            Some(address) => address.regular_channel(),
+            None => None,
+        }
+    }
+
+    fn invalid(selector: &str) -> ValidationError {
+        ValidationError::InvalidMemorySelector {
+            selector: selector.to_owned(),
+            detail: "expected 000-999, L00-L49, U00-U49, T01-T30, A01-A10, or Pri",
+        }
+    }
+}
+
+impl From<MemoryChannelAddress> for CurrentMemorySelector {
+    fn from(address: MemoryChannelAddress) -> Self {
+        Self::Address(address)
+    }
+}
+
+impl From<RegularChannel> for CurrentMemorySelector {
+    fn from(channel: RegularChannel) -> Self {
+        Self::Address(channel.into())
+    }
+}
+
+impl TryFrom<&str> for CurrentMemorySelector {
     type Error = ValidationError;
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Fm),
-            1 => Ok(Self::Dv),
-            2 => Ok(Self::Nfm),
-            3 => Ok(Self::Am),
-            _ => Err(ValidationError::SettingOutOfRange {
-                name: "FO/ME CAT channel mode",
-                value,
-                detail: "must be 0-3 (FM/DV/NFM/AM)",
-            }),
+    fn try_from(selector: &str) -> Result<Self, Self::Error> {
+        if selector == "Pri" {
+            Ok(Self::Priority)
+        } else {
+            MemoryChannelAddress::try_from(selector)
+                .map(Self::Address)
+                .map_err(|_| Self::invalid(selector))
         }
     }
 }
 
-impl From<CatChannelMode> for u8 {
-    fn from(mode: CatChannelMode) -> Self {
-        mode as Self
+impl fmt::Display for CurrentMemorySelector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Address(address) => address.fmt(formatter),
+            Self::Priority => formatter.write_str("Pri"),
+        }
     }
 }
 
-/// 40-byte internal channel memory structure.
+/// Exact unidentified high bits carried alongside channel code indices.
 ///
-/// Maps byte-for-byte to the firmware's internal representation at `DAT_c0012634`.
-/// See `thd75/re_output/channel_memory_structure.txt`.
-///
-/// # Channel display names
-///
-/// Channel display names are NOT accessible via the CAT
-/// protocol. The `urcall` field stores the D-STAR URCALL destination callsign
-/// from the ME/FO wire format (typically "CQCQCQ" for D-STAR). Display names
-/// are only accessible via the MCP programming protocol on USB interface 2.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChannelMemory {
-    /// RX frequency in Hz (byte 0x00, 4 bytes, little-endian).
-    pub rx_frequency: Frequency,
-    /// TX offset or split TX frequency in Hz (byte 0x04, 4 bytes, little-endian).
-    pub tx_offset: Frequency,
-    /// Frequency step size (byte 0x08 high nibble).
-    pub step_size: StepSize,
-    /// Raw byte 0x09: mode and fine tuning configuration, as packed
-    /// from the CAT wire fields.
-    ///
-    /// Bit layout (what [`crate::protocol`]'s FO/ME parser packs from
-    /// wire fields \[3\]-\[6\]):
-    /// - bit 7: reserved
-    /// - bits 6:4: operating mode in the **CAT wire encoding**
-    ///   (0=FM, 1=DV, 2=NFM, 3=AM; hardware-verified, NOT the
-    ///   MD/flash encoding, where 2=AM and 6=NFM)
-    /// - bit 3: fine tuning enable
-    /// - bits 2:0: fine step size
-    ///
-    /// Do not interpret these bits with `Mode`/`MemoryMode` (both use
-    /// the MD/flash encoding); same byte positions, different value
-    /// tables. `FlashChannel`'s byte 0x09 uses the flash layout.
-    pub mode_flags_raw: u8,
-    /// Shift direction (byte 0x08 low nibble in binary format).
-    ///
-    /// Authoritative for byte 0x08; `flags_0a_raw` bits 2:0 carry a
-    /// 3-bit copy on the wire, so use [`Self::set_shift`] to keep both
-    /// in sync. (This field can hold extended values like 8 that FO
-    /// returns in VFO mode, which don't fit in the 3-bit copy.)
-    pub shift: ShiftDirection,
-    /// Raw byte 0x0A: the single source of truth for the tone flags;
-    /// read it through the accessors ([`Self::tone_enable`],
-    /// [`Self::ctcss_mode`], [`Self::dcs_enable`],
-    /// [`Self::cross_tone_reverse`], [`Self::reverse`]) and prefer the
-    /// corresponding setters (and [`Self::set_shift`]) for writes:
-    /// they keep the 3-bit shift copy in bits 2:0 consistent with the
-    /// `shift` field.
-    ///
-    /// Hardware-verified bit layout (20 channels, 0 exceptions):
-    /// - bit 7: tone encode enable
-    /// - bit 6: CTCSS enable
-    /// - bit 5: DCS enable
-    /// - bit 4: cross-tone enable
-    /// - bit 3: reverse
-    /// - bits 2:0: shift direction (0=simplex, 1=+, 2=-, 4=split)
-    pub flags_0a_raw: u8,
-    /// Tone encoder frequency code index (byte 0x0B).
-    pub tone_code: ToneCode,
-    /// CTCSS decoder frequency code index (byte 0x0C).
-    pub ctcss_code: ToneCode,
-    /// DCS code index (byte 0x0D).
-    pub dcs_code: DcsCode,
-    /// Cross-tone combination type (byte 0x0E bits 5:4, range 0-3).
-    ///
-    /// CAT wire field 16. Controls how TX and RX tone types are combined
-    /// when cross-tone mode is enabled (`cross_tone_reverse` / byte 0x0A bit 4).
-    pub cross_tone_combo: CrossToneType,
-    /// Digital squelch mode (byte 0x0E bits 1:0, range 0-2).
-    ///
-    /// CAT wire field 18: 0=Off, 1=Code Squelch, 2=Callsign Squelch.
-    /// Note: channel lockout (ME field 22) is stored separately in MCP
-    /// flags region at offset 0x2000, not here.
-    pub digital_squelch: FlashDigitalSquelch,
-    /// D-STAR URCALL destination callsign (byte 0x0F, 24 bytes).
-    ///
-    /// Stores the D-STAR "UR" (your) callsign, defaulting to "CQCQCQ"
-    /// for general CQ calls. Display names are stored separately in MCP
-    /// at offset 0x10000.
-    pub urcall: ChannelName,
-    /// Digital code (CAT wire field 19, 2 digits).
-    pub data_mode: u8,
+/// Firmware copies and formats the complete CTCSS, DCS, and digital-squelch
+/// code bytes. Their established indices occupy `0x0C[5:0]`, `0x0D[6:0]`,
+/// and `0x27[6:0]`; retained evidence does not establish meanings for the
+/// remaining high bits. This type preserves those bits without inventing
+/// semantic labels or weakening validation of the known indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChannelCodeUnidentifiedBits {
+    ctcss_code_bits_7_to_6: u8,
+    dcs_code_bit_7: bool,
+    digital_squelch_code_bit_7: bool,
 }
 
-/// Full shared 20-field FO/ME CAT channel record.
+impl ChannelCodeUnidentifiedBits {
+    /// Construct the exact unidentified code bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] if the CTCSS component
+    /// does not fit its two-bit field.
+    pub const fn new(
+        ctcss_code_bits_7_to_6: u8,
+        dcs_code_bit_7: bool,
+        digital_squelch_code_bit_7: bool,
+    ) -> Result<Self, ValidationError> {
+        if ctcss_code_bits_7_to_6 <= 3 {
+            Ok(Self {
+                ctcss_code_bits_7_to_6,
+                dcs_code_bit_7,
+                digital_squelch_code_bit_7,
+            })
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "channel CTCSS-code unidentified bits 7:6",
+                value: ctcss_code_bits_7_to_6,
+                detail: "must fit two bits (0-3)",
+            })
+        }
+    }
+
+    /// Return the exact value from CTCSS-code bits 7:6.
+    #[must_use]
+    pub const fn ctcss_code_bits_7_to_6(self) -> u8 {
+        self.ctcss_code_bits_7_to_6
+    }
+
+    /// Return the exact value from DCS-code bit 7.
+    #[must_use]
+    pub const fn dcs_code_bit_7(self) -> bool {
+        self.dcs_code_bit_7
+    }
+
+    /// Return the exact value from digital-squelch-code bit 7.
+    #[must_use]
+    pub const fn digital_squelch_code_bit_7(self) -> bool {
+        self.digital_squelch_code_bit_7
+    }
+
+    const fn ctcss_wire_value(self, code: CtcssCode) -> u8 {
+        (self.ctcss_code_bits_7_to_6 << 6) | code.as_raw()
+    }
+
+    const fn dcs_wire_value(self, code: DcsCode) -> u8 {
+        let high_bit = if self.dcs_code_bit_7 { 0x80 } else { 0 };
+        high_bit | code.as_raw()
+    }
+
+    const fn digital_squelch_wire_value(self, code: DigitalSquelchCode) -> u8 {
+        let high_bit = if self.digital_squelch_code_bit_7 {
+            0x80
+        } else {
+            0
+        };
+        high_bit | code.as_raw()
+    }
+}
+
+/// Meaning of a channel record's context-dependent transmit value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChannelTransmitValue {
+    /// A repeater offset from the receive frequency.
+    RepeaterOffset(Frequency),
+    /// An independent absolute transmit frequency for an odd split.
+    SplitTransmitFrequency(Frequency),
+}
+
+impl fmt::Display for ChannelTransmitValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RepeaterOffset(offset) => write!(formatter, "repeater offset {offset}"),
+            Self::SplitTransmitFrequency(frequency) => {
+                write!(formatter, "split transmit frequency {frequency}")
+            }
+        }
+    }
+}
+
+/// Complete typed representation of the 20 shared FO/ME CAT fields.
 ///
-/// [`ChannelMemory`] holds the fields that also map to the 40-byte channel
-/// representation. `tx_step_size` is a separate CAT field and must be kept
-/// alongside it to avoid the loss that affected the former writer.
+/// CAT records are textual protocol records, not the radio's 40-byte MCP
+/// memory layout. Keeping this type independent from [`StoredChannel`] avoids
+/// fabricating bytes that CAT never returns and makes every transmitted field
+/// visible by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatChannelRecord {
-    /// Channel data represented by both CAT and the binary channel layout.
-    pub channel: ChannelMemory,
-    /// CAT transmit-step field (FO/ME field 3, TABLE C hex index).
-    pub tx_step_size: StepSize,
+    /// Receive frequency in hertz.
+    pub receive_frequency: Frequency,
+    /// Repeater offset or absolute transmit frequency, depending on context.
+    pub transmit_offset_or_frequency: Frequency,
+    /// Receive tuning step.
+    pub receive_step: StepSize,
+    /// Transmit tuning step.
+    pub transmit_step: StepSize,
+    /// Operating mode encoded in the CAT channel record.
+    pub mode: ChannelMode,
+    /// Whether fine tuning is enabled.
+    pub fine_tuning: bool,
+    /// Fine-tuning step.
+    pub fine_step: FineStep,
+    /// The single active tone-signaling mode.
+    pub tone_mode: ToneMode,
+    /// Whether repeater reverse is enabled.
+    pub reverse: bool,
+    /// Repeater shift direction. Split is reported separately by ME.
+    pub shift: ShiftDirection,
+    /// Transmit tone or tone-burst index.
+    pub tone_code: ToneCode,
+    /// Receive CTCSS decoder index; unidentified high bits are stored below.
+    pub ctcss_code: CtcssCode,
+    /// DCS code index; its unidentified high bit is stored below.
+    pub dcs_code: DcsCode,
+    /// Exact cross-tone field, including its two unidentified high bits.
+    pub cross_tone: CrossToneField,
+    /// D-STAR destination callsign.
+    pub ur_call: DstarCallsign,
+    /// Per-channel D-STAR squelch selection.
+    pub digital_squelch: DigitalSquelchType,
+    /// Per-channel D-STAR squelch code; its unidentified high bit is stored below.
+    pub digital_squelch_code: DigitalSquelchCode,
+    /// Exact unidentified high bits carried by the three code fields.
+    pub unidentified_code_bits: ChannelCodeUnidentifiedBits,
 }
 
-impl std::ops::Deref for CatChannelRecord {
-    type Target = ChannelMemory;
-
-    fn deref(&self) -> &Self::Target {
-        &self.channel
-    }
-}
-
-impl std::ops::DerefMut for CatChannelRecord {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.channel
-    }
-}
-
-/// Lossless ME response record, including both currently-unidentified
-/// ME-only fields.
+/// Complete ME memory-channel response.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryChannelRecord {
+pub struct CatMemoryChannelRecord {
     /// Shared FO/ME channel fields.
     pub channel: CatChannelRecord,
-    /// Raw ME-only field at wire position 14.
-    pub me_field_14_raw: String,
-    /// Raw ME-only field at wire position 22.
-    pub me_field_22_raw: String,
+    /// Whether the stored transmit frequency is an independent split.
+    pub split: bool,
+    /// Whether scanning skips this memory channel.
+    pub scan_lockout: bool,
 }
 
-impl std::ops::Deref for MemoryChannelRecord {
-    type Target = ChannelMemory;
-
-    fn deref(&self) -> &Self::Target {
-        &self.channel.channel
-    }
-}
-
-impl std::ops::DerefMut for MemoryChannelRecord {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.channel.channel
-    }
-}
-
-impl ChannelMemory {
-    /// Size of the packed binary representation in bytes.
-    pub const BYTE_SIZE: usize = 40;
-
-    /// Decode the mode bits using the FO/ME CAT-specific table.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a binary record contains a mode not representable
-    /// on the four-value CAT channel wire.
-    pub fn cat_mode(&self) -> Result<CatChannelMode, ValidationError> {
-        CatChannelMode::try_from((self.mode_flags_raw >> 4) & 0x07)
-    }
-
-    /// Whether the FO/ME fine-tuning flag is enabled.
+impl CatMemoryChannelRecord {
+    /// Interpret the shared transmit field using this ME record's split flag.
     #[must_use]
-    pub const fn fine_tuning_enabled(&self) -> bool {
-        self.mode_flags_raw & 0x08 != 0
-    }
-
-    /// Decode the FO/ME fine-step bits.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the raw field is outside the documented 0-3 table.
-    pub fn fine_step(&self) -> Result<FineStep, ValidationError> {
-        FineStep::try_from(self.mode_flags_raw & 0x07)
-    }
-
-    /// Tone (encode) enabled (`flags_0a_raw` bit 7).
-    #[must_use]
-    pub const fn tone_enable(&self) -> bool {
-        self.flags_0a_raw & 0x80 != 0
-    }
-
-    /// CTCSS mode (`flags_0a_raw` bit 6). The wire only carries
-    /// enable/disable here; the full On/EncodeOnly split lives in the
-    /// TN command.
-    #[must_use]
-    pub const fn ctcss_mode(&self) -> CtcssMode {
-        if self.flags_0a_raw & 0x40 != 0 {
-            CtcssMode::On
+    pub const fn transmit_value(&self) -> ChannelTransmitValue {
+        if self.split {
+            ChannelTransmitValue::SplitTransmitFrequency(self.channel.transmit_offset_or_frequency)
         } else {
-            CtcssMode::Off
+            ChannelTransmitValue::RepeaterOffset(self.channel.transmit_offset_or_frequency)
         }
-    }
-
-    /// DCS enabled (`flags_0a_raw` bit 5).
-    #[must_use]
-    pub const fn dcs_enable(&self) -> bool {
-        self.flags_0a_raw & 0x20 != 0
-    }
-
-    /// Cross-tone enabled (`flags_0a_raw` bit 4).
-    #[must_use]
-    pub const fn cross_tone_reverse(&self) -> bool {
-        self.flags_0a_raw & 0x10 != 0
-    }
-
-    /// Reverse mode (`flags_0a_raw` bit 3).
-    #[must_use]
-    pub const fn reverse(&self) -> bool {
-        self.flags_0a_raw & 0x08 != 0
-    }
-
-    /// Raw byte 0x0A (see the field docs for the bit layout).
-    #[must_use]
-    pub const fn flags_0a_raw(&self) -> u8 {
-        self.flags_0a_raw
-    }
-
-    /// Set tone (encode) enable (`flags_0a_raw` bit 7).
-    pub const fn set_tone_enable(&mut self, on: bool) {
-        self.set_flag_bit(0x80, on);
-    }
-
-    /// Set CTCSS enable (`flags_0a_raw` bit 6).
-    pub const fn set_ctcss_enable(&mut self, on: bool) {
-        self.set_flag_bit(0x40, on);
-    }
-
-    /// Set DCS enable (`flags_0a_raw` bit 5).
-    pub const fn set_dcs_enable(&mut self, on: bool) {
-        self.set_flag_bit(0x20, on);
-    }
-
-    /// Set cross-tone enable (`flags_0a_raw` bit 4).
-    pub const fn set_cross_tone_reverse(&mut self, on: bool) {
-        self.set_flag_bit(0x10, on);
-    }
-
-    /// Set reverse mode (`flags_0a_raw` bit 3).
-    pub const fn set_reverse(&mut self, on: bool) {
-        self.set_flag_bit(0x08, on);
-    }
-
-    /// Set the shift direction, keeping both wire encodings in sync
-    /// (the `shift` field for byte 0x08 and `flags_0a_raw` bits 2:0).
-    pub const fn set_shift(&mut self, shift: ShiftDirection) {
-        self.shift = shift;
-        self.flags_0a_raw = (self.flags_0a_raw & !0x07) | (shift.as_u8() & 0x07);
-    }
-
-    const fn set_flag_bit(&mut self, bit: u8, on: bool) {
-        if on {
-            self.flags_0a_raw |= bit;
-        } else {
-            self.flags_0a_raw &= !bit;
-        }
-    }
-
-    /// Serializes the channel memory to a 40-byte packed binary array.
-    #[must_use]
-    pub fn to_bytes(&self) -> [u8; 40] {
-        let mut buf = [0u8; 40];
-
-        // bytes[0..4]: RX frequency, little-endian
-        buf[0..4].copy_from_slice(&self.rx_frequency.to_le_bytes());
-
-        // bytes[4..8]: TX offset, little-endian
-        buf[4..8].copy_from_slice(&self.tx_offset.to_le_bytes());
-
-        // byte 0x08: step_size (high nibble) | shift (low nibble)
-        buf[0x08] = (u8::from(self.step_size) << 4) | u8::from(self.shift);
-
-        // byte 0x09: mode + fine tuning flags (preserved as raw byte)
-        buf[0x09] = self.mode_flags_raw;
-
-        // byte 0x0A: flags_0a_raw (all 8 bits, hardware-verified mapping):
-        //   bit 7 = tone encode, bit 6 = CTCSS, bit 5 = DCS, bit 4 = cross-tone,
-        //   bit 3 = reverse, bits 2:0 = shift direction
-        buf[0x0A] = self.flags_0a_raw;
-
-        // byte 0x0B: tone code index
-        buf[0x0B] = self.tone_code.index();
-
-        // byte 0x0C: CTCSS code index
-        buf[0x0C] = self.ctcss_code.index();
-
-        // byte 0x0D: DCS code index
-        buf[0x0D] = self.dcs_code.index();
-
-        // byte 0x0E: cross_tone_combo (bits 5:4) | data_speed=3 (bits 3:2) | digital_squelch (bits 1:0)
-        buf[0x0E] = ((u8::from(self.cross_tone_combo) & 0x03) << 4)
-            | 0x0C
-            | (u8::from(self.digital_squelch) & 0x03);
-
-        // bytes[0x0F..0x27]: URCALL callsign (24 bytes)
-        buf[0x0F..0x27].copy_from_slice(&self.urcall.to_bytes());
-
-        // byte 0x27: data mode
-        buf[0x27] = self.data_mode;
-
-        buf
-    }
-
-    /// Parses a channel memory from a byte slice (must be >= 40 bytes).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProtocolError::FieldParse`] if any field contains an
-    /// invalid value, or if the slice is too short.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        // Capture the raw length first, because `first_chunk` only yields the
-        // prefix and the error message should reflect the original input size.
-        let total_len = bytes.len();
-        let bytes: &[u8; Self::BYTE_SIZE] =
-            bytes
-                .first_chunk()
-                .ok_or_else(|| ProtocolError::FieldParse {
-                    command: "channel".into(),
-                    field: "length".into(),
-                    detail: format!(
-                        "expected at least {} bytes, got {total_len}",
-                        Self::BYTE_SIZE,
-                    ),
-                })?;
-
-        let rx_frequency = Frequency::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let tx_offset = Frequency::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-
-        let step_size =
-            StepSize::try_from(bytes[0x08] >> 4).map_err(|e| ProtocolError::FieldParse {
-                command: "channel".into(),
-                field: "step_size".into(),
-                detail: e.to_string(),
-            })?;
-
-        let shift = ShiftDirection::try_from(bytes[0x08] & 0x0F).map_err(|e| {
-            ProtocolError::FieldParse {
-                command: "channel".into(),
-                field: "shift".into(),
-                detail: e.to_string(),
-            }
-        })?;
-
-        // byte 0x09: mode + fine tuning flags (preserved as raw byte)
-        let mode_flags_raw = bytes[0x09];
-
-        // byte 0x0A: all 8 bits (hardware-verified mapping), stored
-        // raw; the flag accessors derive their values on demand.
-        let flags_0a_raw = bytes[0x0A];
-
-        let tone_code = ToneCode::new(bytes[0x0B]).map_err(|e| ProtocolError::FieldParse {
-            command: "channel".into(),
-            field: "tone_code".into(),
-            detail: e.to_string(),
-        })?;
-
-        let ctcss_code = ToneCode::new(bytes[0x0C]).map_err(|e| ProtocolError::FieldParse {
-            command: "channel".into(),
-            field: "ctcss_code".into(),
-            detail: e.to_string(),
-        })?;
-
-        let dcs_code = DcsCode::new(bytes[0x0D]).map_err(|e| ProtocolError::FieldParse {
-            command: "channel".into(),
-            field: "dcs_code".into(),
-            detail: e.to_string(),
-        })?;
-
-        // byte 0x0E: cross_tone_combo (bits 5:4) | digital_squelch (bits 1:0)
-        let cross_tone_combo = CrossToneType::try_from((bytes[0x0E] >> 4) & 0x03).map_err(|e| {
-            ProtocolError::FieldParse {
-                command: "channel".into(),
-                field: "cross_tone_combo".into(),
-                detail: e.to_string(),
-            }
-        })?;
-        let digital_squelch = FlashDigitalSquelch::try_from(bytes[0x0E] & 0x03).map_err(|e| {
-            ProtocolError::FieldParse {
-                command: "channel".into(),
-                field: "digital_squelch".into(),
-                detail: e.to_string(),
-            }
-        })?;
-
-        let mut urcall_arr = [0u8; 24];
-        urcall_arr.copy_from_slice(&bytes[0x0F..0x27]);
-        let urcall = ChannelName::from_bytes(&urcall_arr);
-
-        let data_mode = bytes[0x27];
-
-        Ok(Self {
-            rx_frequency,
-            tx_offset,
-            step_size,
-            mode_flags_raw,
-            shift,
-            flags_0a_raw,
-            tone_code,
-            ctcss_code,
-            dcs_code,
-            cross_tone_combo,
-            digital_squelch,
-            urcall,
-            data_mode,
-        })
     }
 }
 
 // ===========================================================================
-// Flash channel types (MCP / SD card binary format)
+// Stored channel types (MCP / SD card binary format)
 // ===========================================================================
 
-/// Duplex mode as stored in flash memory byte 0x0A bits \[1:0\].
-///
-/// Combined with the split flag (bit 2) to determine the full duplex
-/// configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FlashDuplex {
-    /// Simplex -- TX on same frequency as RX (value 0).
-    Simplex = 0,
-    /// Plus -- TX frequency = RX + offset (value 1).
-    Plus = 1,
-    /// Minus -- TX frequency = RX - offset (value 2).
-    Minus = 2,
-}
-
-impl FlashDuplex {
-    /// Number of valid flash duplex values (0-2).
-    pub const COUNT: u8 = 3;
-}
-
-impl TryFrom<u8> for FlashDuplex {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Simplex),
-            1 => Ok(Self::Plus),
-            2 => Ok(Self::Minus),
-            _ => Err(ValidationError::SettingOutOfRange {
-                name: "flash duplex",
-                value,
-                detail: "must be 0-2 (simplex/+/-)",
-            }),
-        }
-    }
-}
-
-impl From<FlashDuplex> for u8 {
-    fn from(d: FlashDuplex) -> Self {
-        d as Self
-    }
-}
-
-/// Cross-tone type as stored in flash memory byte 0x0E bits \[5:4\].
+/// Cross-tone type as stored in MCP/SD-card byte 0x0E bits \[5:4\].
 ///
 /// Determines how different tone/DCS codes are applied to TX vs RX
 /// when cross-tone mode is active.
@@ -816,6 +795,7 @@ impl From<FlashDuplex> for u8 {
 /// | 1 | Tone | DCS | T/D |
 /// | 2 | DCS | CTCSS | D/C |
 /// | 3 | Tone | CTCSS | T/C |
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CrossToneType {
     /// DCS encode (TX), Off decode (RX). Display: D/O (value 0).
@@ -853,42 +833,131 @@ impl From<CrossToneType> for u8 {
     }
 }
 
-/// Flash digital squelch mode at byte 0x0E bits \[1:0\].
+/// Exact four-bit cross-tone field used by FO/ME and stored byte `0x0E`.
 ///
-/// Controls whether D-STAR digital squelch is active per-channel.
-/// This is the per-channel flash encoding; the system-level
-/// [`DigitalSquelch`](crate::types::dstar::DigitalSquelch) config is separate.
+/// The low two bits select the documented [`CrossToneType`]. Firmware emits
+/// the complete hexadecimal nibble, but the meaning of its upper two bits has
+/// not been established. This type preserves those bits instead of silently
+/// masking them or assigning an unsupported meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FlashDigitalSquelch {
-    /// Digital squelch off (value 0).
-    Off = 0,
-    /// Code squelch -- match digital code (value 1).
-    Code = 1,
-    /// Callsign squelch -- match source callsign (value 2).
-    Callsign = 2,
-}
+pub struct CrossToneField(u8);
 
-impl FlashDigitalSquelch {
-    /// Number of valid flash digital squelch values (0-2).
-    pub const COUNT: u8 = 3;
-}
+impl CrossToneField {
+    /// Largest value representable by the four-bit wire field.
+    pub const MAX: u8 = 0x0F;
 
-impl TryFrom<u8> for FlashDigitalSquelch {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Off),
-            1 => Ok(Self::Code),
-            2 => Ok(Self::Callsign),
-            _ => Err(ValidationError::FlashDigitalSquelchOutOfRange(value)),
+    /// Construct an exact cross-tone wire field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] above `0x0F`.
+    pub const fn new(raw: u8) -> Result<Self, ValidationError> {
+        if raw <= Self::MAX {
+            Ok(Self(raw))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "cross-tone field",
+                value: raw,
+                detail: "must fit one hexadecimal digit (0x0-0xF)",
+            })
         }
+    }
+
+    /// Return the complete four-bit wire value.
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        self.0
+    }
+
+    /// Return the documented cross-tone selection from the low two bits.
+    #[must_use]
+    pub const fn tone_type(self) -> CrossToneType {
+        let low_bits = self.0 & 0x03;
+        if low_bits == 0 {
+            CrossToneType::DcsOff
+        } else if low_bits == 1 {
+            CrossToneType::ToneDcs
+        } else if low_bits == 2 {
+            CrossToneType::DcsCtcss
+        } else {
+            CrossToneType::ToneCtcss
+        }
+    }
+
+    /// Return the preserved, unidentified upper two bits as a value `0..=3`.
+    #[must_use]
+    pub const fn unidentified_bits(self) -> u8 {
+        self.0 >> 2
     }
 }
 
-impl From<FlashDigitalSquelch> for u8 {
-    fn from(ds: FlashDigitalSquelch) -> Self {
-        ds as Self
+impl TryFrom<u8> for CrossToneField {
+    type Error = ValidationError;
+
+    fn try_from(raw: u8) -> Result<Self, Self::Error> {
+        Self::new(raw)
+    }
+}
+
+impl From<CrossToneField> for u8 {
+    fn from(field: CrossToneField) -> Self {
+        field.as_raw()
+    }
+}
+
+impl From<CrossToneType> for CrossToneField {
+    fn from(tone_type: CrossToneType) -> Self {
+        Self(u8::from(tone_type))
+    }
+}
+
+/// Exact value stored in MCP/SD-card byte `0x0E` bits 3:2.
+///
+/// Retained radio images use all four possible values, but the repository has
+/// no controlled serializer diff proving their semantic labels. The raw
+/// two-bit value remains typed and range-checked without inventing a meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChannelByte0eBits3To2(u8);
+
+impl ChannelByte0eBits3To2 {
+    /// Number of values representable by the two-bit field.
+    pub const COUNT: u8 = 4;
+
+    /// Construct the exact two-bit field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] above `3`.
+    pub const fn new(raw: u8) -> Result<Self, ValidationError> {
+        if raw < Self::COUNT {
+            Ok(Self(raw))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "channel byte 0x0E bits 3:2",
+                value: raw,
+                detail: "must fit two bits (0-3)",
+            })
+        }
+    }
+
+    /// Return the exact two-bit value.
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for ChannelByte0eBits3To2 {
+    type Error = ValidationError;
+
+    fn try_from(raw: u8) -> Result<Self, Self::Error> {
+        Self::new(raw)
+    }
+}
+
+impl From<ChannelByte0eBits3To2> for u8 {
+    fn from(bits: ChannelByte0eBits3To2) -> Self {
+        bits.as_raw()
     }
 }
 
@@ -905,6 +974,7 @@ impl From<FlashDigitalSquelch> for u8 {
 /// not change the current frequency, but the next frequency change
 /// uses the normal step size. The fine step can be set independently
 /// per frequency band.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FineStep {
     /// 20 Hz fine step (value 0).
@@ -953,382 +1023,403 @@ impl fmt::Display for FineStep {
     }
 }
 
-/// 40-byte flash memory channel structure.
+/// Exact 40-byte channel record used by MCP programming and `.d75` files.
 ///
-/// Maps byte-for-byte to the MCP programming memory and `.d75` file format.
-/// Field layout derived from firmware analysis.
-///
-/// This struct represents the **flash encoding**, which differs from the
-/// CAT wire format ([`ChannelMemory`]) in several ways:
-///
-/// - **Mode** (byte 0x09 bits \[6:4\]): 8 modes including HF (LSB/USB/CW)
-///   and DR, vs 4 modes in CAT.
-/// - **Tone/duplex** (byte 0x0A): structured bit fields for tone, CTCSS,
-///   DTCS, cross-tone, split, and duplex direction.
-/// - **D-STAR callsigns** (bytes 0x0F-0x26): three separate 8-byte fields
-///   (UR, RPT1, RPT2) instead of one 24-byte blob.
-/// - **Cross-tone / digital squelch** (byte 0x0E): cross-tone type and
-///   per-channel digital squelch mode.
-///
-/// The per-field offsets documented on each struct member below are the
-/// complete byte map, correlated against MCP memory dumps from hardware.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "Mirrors the MCP flash channel record 1:1; each bool is a discrete bit in the 40-byte \
-              binary layout (tone_enabled, ctcss_enabled, dtcs_enabled, cross_tone, reverse, \
-              narrow, fine_mode, byte09_bit7, split_tune). A bitflags enum would lose the \
-              byte-for-byte offset documentation that makes this struct useful."
-)]
+/// Established wire fields have semantic types. Redundant and constrained
+/// bits are derived during serialization and validated during parsing;
+/// unidentified code bits are retained exactly without semantic guesses.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlashChannel {
-    /// RX frequency in Hz (offset 0x00, 4 bytes, little-endian).
-    pub rx_frequency: Frequency,
-    /// TX offset or split TX frequency in Hz (offset 0x04, 4 bytes, little-endian).
-    pub tx_offset: Frequency,
-    /// Frequency step size (offset 0x08 bits \[7:4\]).
-    pub step_size: StepSize,
-    /// Raw low nibble of byte 0x08 (split tune step / unknown bit 0).
-    pub byte08_low: u8,
-    /// Operating mode (offset 0x09 bits \[6:4\]).
-    pub mode: MemoryMode,
-    /// Narrow FM flag (offset 0x09 bit 3).
-    pub narrow: bool,
-    /// Fine tuning mode enabled (offset 0x09 bit 2).
-    pub fine_mode: bool,
-    /// Fine tuning step size (offset 0x09 bits \[1:0\]).
+pub struct StoredChannel {
+    /// Receive frequency in hertz (bytes `0x00..0x04`).
+    pub receive_frequency: Frequency,
+    /// Repeater offset or absolute split transmit frequency (bytes `0x04..0x08`).
+    pub transmit_offset_or_frequency: Frequency,
+    /// Receive tuning step (byte `0x08` high nibble).
+    pub receive_step: StepSize,
+    /// Transmit tuning step (byte `0x08` low nibble).
+    pub transmit_step: StepSize,
+    /// Stored operating mode (byte `0x09` high nibble).
+    pub mode: ChannelMode,
+    /// Whether fine tuning is enabled (byte `0x09` bit 2).
+    pub fine_tuning: bool,
+    /// Fine-tuning step (byte `0x09` bits 1:0).
     pub fine_step: FineStep,
-    /// Raw bit 7 of byte 0x09 (unknown / reserved).
-    pub byte09_bit7: bool,
-    /// Tone encode enable (offset 0x0A bit 7).
-    pub tone_enabled: bool,
-    /// CTCSS encode+decode enable (offset 0x0A bit 6).
-    pub ctcss_enabled: bool,
-    /// DTCS (DCS) enable (offset 0x0A bit 5).
-    pub dtcs_enabled: bool,
-    /// Cross-tone mode enable (offset 0x0A bit 4).
-    pub cross_tone: bool,
-    /// Raw bit 3 of byte 0x0A (unknown / reserved).
-    pub byte0a_bit3: bool,
-    /// Odd split flag (offset 0x0A bit 2). When set, `tx_offset` is an
-    /// absolute TX frequency rather than a repeater offset.
+    /// The single active tone-signaling mode (byte `0x0A` high nibble).
+    pub tone_mode: ToneMode,
+    /// Whether repeater reverse is enabled (byte `0x0A` bit 3).
+    pub reverse: bool,
+    /// Whether the transmit value is an independent frequency (byte `0x0A` bit 2).
     pub split: bool,
-    /// Duplex direction (offset 0x0A bits \[1:0\]).
-    pub duplex: FlashDuplex,
-    /// CTCSS TX tone index (offset 0x0B, 0-49).
+    /// Repeater shift direction (byte `0x0A` bits 1:0).
+    pub shift: ShiftDirection,
+    /// Transmit tone or tone-burst index (byte `0x0B`).
     pub tone_code: ToneCode,
-    /// CTCSS RX tone index (offset 0x0C bits \[5:0\]).
-    pub ctcss_code: ToneCode,
-    /// Raw high bits of byte 0x0C (bits \[7:6\], unknown).
-    pub byte0c_high: u8,
-    /// DCS code index (offset 0x0D bits \[6:0\]).
+    /// Receive CTCSS decoder index (byte `0x0C` bits 5:0).
+    pub ctcss_code: CtcssCode,
+    /// DCS code index (byte `0x0D` bits 6:0).
     pub dcs_code: DcsCode,
-    /// Raw bit 7 of byte 0x0D (unknown / reserved).
-    pub byte0d_bit7: bool,
-    /// Cross-tone type (offset 0x0E bits \[5:4\]).
-    pub cross_tone_type: CrossToneType,
-    /// Digital squelch mode (offset 0x0E bits \[1:0\]).
-    pub digital_squelch: FlashDigitalSquelch,
-    /// Raw bits of byte 0x0E that are not cross-tone or digital squelch
-    /// (bits \[7:6\] and \[3:2\]).
-    pub byte0e_reserved: u8,
-    /// D-STAR UR callsign (offset 0x0F, 8 bytes, space-padded).
+    /// Exact cross-tone field, including unidentified bits (byte `0x0E` high nibble).
+    pub cross_tone: CrossToneField,
+    /// Exact, semantically unidentified value from byte `0x0E` bits 3:2.
+    pub byte_0e_bits_3_to_2: ChannelByte0eBits3To2,
+    /// Per-channel D-STAR squelch selection (byte `0x0E` bits 1:0).
+    pub digital_squelch: DigitalSquelchType,
+    /// D-STAR destination callsign (bytes `0x0F..0x17`).
     pub ur_call: DstarCallsign,
-    /// D-STAR RPT1 callsign (offset 0x17, 8 bytes, space-padded).
+    /// D-STAR first repeater callsign (bytes `0x17..0x1F`).
     pub rpt1: DstarCallsign,
-    /// D-STAR RPT2 callsign (offset 0x1F, 8 bytes, space-padded).
+    /// D-STAR second repeater callsign (bytes `0x1F..0x27`).
     pub rpt2: DstarCallsign,
-    /// D-STAR DV code (offset 0x27 bits \[6:0\], 0-127).
-    pub dv_code: u8,
-    /// Raw bit 7 of byte 0x27 (unknown / reserved).
-    pub byte27_bit7: bool,
+    /// Per-channel D-STAR squelch code (byte `0x27` bits 6:0).
+    pub digital_squelch_code: DigitalSquelchCode,
+    /// Exact unidentified high bits from bytes `0x0C`, `0x0D`, and `0x27`.
+    pub unidentified_code_bits: ChannelCodeUnidentifiedBits,
 }
 
-impl FlashChannel {
-    /// Size of the packed binary representation in bytes.
+impl StoredChannel {
+    /// Size of one packed stored record.
     pub const BYTE_SIZE: usize = 40;
 
-    /// Parses a flash channel from a byte slice (must be >= 40 bytes).
+    /// Validate the receive-frequency marker for a programmed slot.
+    ///
+    /// A `StoredChannel` can be decoded without its separate flag record, so
+    /// [`Self::from_bytes`] accepts the zero and erased markers used by empty
+    /// storage. Once a flag classifies the record as programmed, those markers
+    /// are invalid.
     ///
     /// # Errors
     ///
-    /// Returns [`ProtocolError::FieldParse`] if any field contains an
-    /// invalid value, or if the slice is too short.
-    #[expect(
-        clippy::similar_names,
-        clippy::too_many_lines,
-        reason = "`rx_frequency`/`tx_offset` plus `tone_code`/`ctcss_code`/`dtcs_code` are the \
-                  canonical RE notes names; renaming would desync from firmware documentation. \
-                  The method decodes every bit of a 40-byte flash record inline so the bit \
-                  layout is visible in one place; splitting would fragment that."
-    )]
+    /// Returns [`ValidationError::FrequencyOutOfRange`] when the receive
+    /// frequency is zero or the erased `u32::MAX` marker.
+    pub const fn validate_programmed(&self) -> Result<(), ValidationError> {
+        let frequency = self.receive_frequency.as_hz();
+        if frequency == 0 || frequency == u32::MAX {
+            Err(ValidationError::FrequencyOutOfRange(frequency))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Parse one exact stored-channel record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::FieldParse`] when the length is not exactly
+    /// 40 bytes, a constrained field contains an invalid value, or the
+    /// redundant NFM marker contradicts the stored mode.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        // Capture the raw length first, because `first_chunk` only yields the
-        // prefix and the error message should reflect the original input size.
-        let total_len = bytes.len();
-        let bytes: &[u8; Self::BYTE_SIZE] =
-            bytes
-                .first_chunk()
-                .ok_or_else(|| ProtocolError::FieldParse {
-                    command: "flash_channel".into(),
-                    field: "length".into(),
-                    detail: format!(
-                        "expected at least {} bytes, got {total_len}",
-                        Self::BYTE_SIZE,
-                    ),
-                })?;
-
-        let rx_frequency = Frequency::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let tx_offset = Frequency::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-
-        // Byte 0x08: step_size [7:4] | low nibble [3:0]
-        let step_size =
-            StepSize::try_from(bytes[0x08] >> 4).map_err(|e| ProtocolError::FieldParse {
-                command: "flash_channel".into(),
-                field: "step_size".into(),
-                detail: e.to_string(),
-            })?;
-        let byte08_low = bytes[0x08] & 0x0F;
-
-        // Byte 0x09: unknown[7] | mode[6:4] | narrow[3] | fine_mode[2] | fine_step[1:0]
-        let byte09 = bytes[0x09];
-        let byte09_bit7 = (byte09 >> 7) & 1 != 0;
-        let mode =
-            MemoryMode::try_from((byte09 >> 4) & 0x07).map_err(|e| ProtocolError::FieldParse {
-                command: "flash_channel".into(),
-                field: "mode".into(),
-                detail: e.to_string(),
-            })?;
-        let narrow = (byte09 >> 3) & 1 != 0;
-        let fine_mode = (byte09 >> 2) & 1 != 0;
-        let fine_step =
-            FineStep::try_from(byte09 & 0x03).map_err(|e| ProtocolError::FieldParse {
-                command: "flash_channel".into(),
-                field: "fine_step".into(),
-                detail: e.to_string(),
-            })?;
-
-        // Byte 0x0A: tone[7] | ctcss[6] | dtcs[5] | cross[4] | unk[3] | split[2] | duplex[1:0]
-        let byte0a = bytes[0x0A];
-        let tone_enabled = (byte0a >> 7) & 1 != 0;
-        let ctcss_enabled = (byte0a >> 6) & 1 != 0;
-        let dtcs_enabled = (byte0a >> 5) & 1 != 0;
-        let cross_tone = (byte0a >> 4) & 1 != 0;
-        let byte0a_bit3 = (byte0a >> 3) & 1 != 0;
-        let split = (byte0a >> 2) & 1 != 0;
-        let duplex =
-            FlashDuplex::try_from(byte0a & 0x03).map_err(|e| ProtocolError::FieldParse {
-                command: "flash_channel".into(),
-                field: "duplex".into(),
-                detail: e.to_string(),
-            })?;
-
-        // Byte 0x0B: CTCSS TX tone index
-        let tone_code = ToneCode::new(bytes[0x0B]).map_err(|e| ProtocolError::FieldParse {
-            command: "flash_channel".into(),
-            field: "tone_code".into(),
-            detail: e.to_string(),
+        let actual_length = bytes.len();
+        let bytes: &[u8; Self::BYTE_SIZE] = bytes.try_into().map_err(|_| {
+            Self::parse_error(
+                "length",
+                format!(
+                    "expected exactly {} bytes, got {actual_length}",
+                    Self::BYTE_SIZE
+                ),
+            )
         })?;
 
-        // Byte 0x0C: unknown[7:6] | CTCSS RX index[5:0]
-        let byte0c_high = (bytes[0x0C] >> 6) & 0x03;
-        let ctcss_code =
-            ToneCode::new(bytes[0x0C] & 0x3F).map_err(|e| ProtocolError::FieldParse {
-                command: "flash_channel".into(),
-                field: "ctcss_code".into(),
-                detail: e.to_string(),
-            })?;
+        let receive_frequency = Frequency::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let transmit_offset_or_frequency =
+            Frequency::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
 
-        // Byte 0x0D: unknown[7] | DCS code[6:0]
-        let byte0d_bit7 = (bytes[0x0D] >> 7) & 1 != 0;
-        let dcs_code = DcsCode::new(bytes[0x0D] & 0x7F).map_err(|e| ProtocolError::FieldParse {
-            command: "flash_channel".into(),
-            field: "dcs_code".into(),
-            detail: e.to_string(),
-        })?;
+        let receive_step = Self::parse_field("receive step", StepSize::try_from(bytes[0x08] >> 4))?;
+        let transmit_step =
+            Self::parse_field("transmit step", StepSize::try_from(bytes[0x08] & 0x0F))?;
 
-        // Byte 0x0E: reserved[7:6] | cross_type[5:4] | reserved[3:2] | digital_squelch[1:0]
-        let byte0e = bytes[0x0E];
-        let byte0e_reserved = (byte0e & 0xC0) | (byte0e & 0x0C);
-        let cross_tone_type = CrossToneType::try_from((byte0e >> 4) & 0x03).map_err(|e| {
-            ProtocolError::FieldParse {
-                command: "flash_channel".into(),
-                field: "cross_tone_type".into(),
-                detail: e.to_string(),
-            }
-        })?;
-        let digital_squelch = FlashDigitalSquelch::try_from(byte0e & 0x03).map_err(|e| {
-            ProtocolError::FieldParse {
-                command: "flash_channel".into(),
-                field: "digital_squelch".into(),
-                detail: e.to_string(),
-            }
-        })?;
+        let mode_and_fine = bytes[0x09];
+        let mode = Self::parse_field("mode", ChannelMode::try_from(mode_and_fine >> 4))?;
+        let nfm_marker = mode_and_fine & 0x08 != 0;
+        let expected_nfm_marker = mode == ChannelMode::Nfm;
+        if nfm_marker != expected_nfm_marker {
+            return Err(Self::parse_error(
+                "NFM marker",
+                format!(
+                    "bit 3 is {}, but mode {mode} requires {}",
+                    u8::from(nfm_marker),
+                    u8::from(expected_nfm_marker),
+                ),
+            ));
+        }
+        let fine_tuning = mode_and_fine & 0x04 != 0;
+        let fine_step = Self::parse_field("fine step", FineStep::try_from(mode_and_fine & 0x03))?;
 
-        // Bytes 0x0F-0x16: UR callsign (8 bytes)
-        let mut ur_arr = [0u8; 8];
-        ur_arr.copy_from_slice(&bytes[0x0F..0x17]);
-        let ur_call = DstarCallsign::from_wire_bytes(&ur_arr);
+        let tone_and_shift = bytes[0x0A];
+        let tone_mode = Self::parse_field("tone mode", ToneMode::try_from(tone_and_shift >> 4))?;
+        let reverse = tone_and_shift & 0x08 != 0;
+        let split = tone_and_shift & 0x04 != 0;
+        let shift = Self::parse_field("shift", ShiftDirection::try_from(tone_and_shift & 0x03))?;
 
-        // Bytes 0x17-0x1E: RPT1 callsign (8 bytes)
-        let mut rpt1_arr = [0u8; 8];
-        rpt1_arr.copy_from_slice(&bytes[0x17..0x1F]);
-        let rpt1 = DstarCallsign::from_wire_bytes(&rpt1_arr);
+        let transmit_tone_code = Self::parse_field("tone code", ToneCode::new(bytes[0x0B]))?;
+        let ctcss_code = Self::parse_field("CTCSS code", CtcssCode::new(bytes[0x0C] & 0x3F))?;
+        let dcs_code = Self::parse_field("DCS code", DcsCode::new(bytes[0x0D] & 0x7F))?;
 
-        // Bytes 0x1F-0x26: RPT2 callsign (8 bytes)
-        let mut rpt2_arr = [0u8; 8];
-        rpt2_arr.copy_from_slice(&bytes[0x1F..0x27]);
-        let rpt2 = DstarCallsign::from_wire_bytes(&rpt2_arr);
+        let cross_route_and_squelch = bytes[0x0E];
+        let cross_tone = Self::parse_field(
+            "cross-tone field",
+            CrossToneField::new(cross_route_and_squelch >> 4),
+        )?;
+        let byte_0e_bits_3_to_2 = Self::parse_field(
+            "byte 0x0E bits 3:2",
+            ChannelByte0eBits3To2::new((cross_route_and_squelch >> 2) & 0x03),
+        )?;
+        let digital_squelch = Self::parse_field(
+            "digital squelch",
+            DigitalSquelchType::try_from(cross_route_and_squelch & 0x03),
+        )?;
 
-        // Byte 0x27: unknown[7] | DV code[6:0]
-        let byte27_bit7 = (bytes[0x27] >> 7) & 1 != 0;
-        let dv_code = bytes[0x27] & 0x7F;
+        let mut ur_call_bytes = [0_u8; DstarCallsign::WIRE_LEN];
+        ur_call_bytes.copy_from_slice(&bytes[0x0F..0x17]);
+        let ur_call =
+            Self::parse_field("URCALL", DstarCallsign::try_from_flash_bytes(ur_call_bytes))?;
+
+        let mut rpt1_bytes = [0_u8; DstarCallsign::WIRE_LEN];
+        rpt1_bytes.copy_from_slice(&bytes[0x17..0x1F]);
+        let rpt1 = Self::parse_field("RPT1", DstarCallsign::try_from_flash_bytes(rpt1_bytes))?;
+
+        let mut rpt2_bytes = [0_u8; DstarCallsign::WIRE_LEN];
+        rpt2_bytes.copy_from_slice(&bytes[0x1F..0x27]);
+        let rpt2 = Self::parse_field("RPT2", DstarCallsign::try_from_flash_bytes(rpt2_bytes))?;
+
+        let digital_squelch_code = Self::parse_field(
+            "digital squelch code",
+            DigitalSquelchCode::new(bytes[0x27] & 0x7F),
+        )?;
+        let unidentified_code_bits = ChannelCodeUnidentifiedBits {
+            ctcss_code_bits_7_to_6: bytes[0x0C] >> 6,
+            dcs_code_bit_7: bytes[0x0D] & 0x80 != 0,
+            digital_squelch_code_bit_7: bytes[0x27] & 0x80 != 0,
+        };
 
         Ok(Self {
-            rx_frequency,
-            tx_offset,
-            step_size,
-            byte08_low,
+            receive_frequency,
+            transmit_offset_or_frequency,
+            receive_step,
+            transmit_step,
             mode,
-            narrow,
-            fine_mode,
+            fine_tuning,
             fine_step,
-            byte09_bit7,
-            tone_enabled,
-            ctcss_enabled,
-            dtcs_enabled,
-            cross_tone,
-            byte0a_bit3,
+            tone_mode,
+            reverse,
             split,
-            duplex,
-            tone_code,
+            shift,
+            tone_code: transmit_tone_code,
             ctcss_code,
-            byte0c_high,
             dcs_code,
-            byte0d_bit7,
-            cross_tone_type,
+            cross_tone,
+            byte_0e_bits_3_to_2,
             digital_squelch,
-            byte0e_reserved,
             ur_call,
             rpt1,
             rpt2,
-            dv_code,
-            byte27_bit7,
+            digital_squelch_code,
+            unidentified_code_bits,
         })
     }
 
-    /// Serializes the flash channel to a 40-byte packed binary array.
+    /// Serialize this channel to the exact 40-byte stored representation.
     #[must_use]
-    pub fn to_bytes(&self) -> [u8; 40] {
-        let mut buf = [0u8; 40];
+    pub fn to_bytes(&self) -> [u8; Self::BYTE_SIZE] {
+        let mut bytes = [0_u8; Self::BYTE_SIZE];
 
-        // bytes[0..4]: RX frequency, little-endian
-        buf[0..4].copy_from_slice(&self.rx_frequency.to_le_bytes());
+        bytes[0x00..0x04].copy_from_slice(&self.receive_frequency.to_le_bytes());
+        bytes[0x04..0x08].copy_from_slice(&self.transmit_offset_or_frequency.to_le_bytes());
 
-        // bytes[4..8]: TX offset, little-endian
-        buf[4..8].copy_from_slice(&self.tx_offset.to_le_bytes());
-
-        // byte 0x08: step_size[7:4] | low[3:0]
-        buf[0x08] = (u8::from(self.step_size) << 4) | (self.byte08_low & 0x0F);
-
-        // byte 0x09: bit7 | mode[6:4] | narrow[3] | fine_mode[2] | fine_step[1:0]
-        buf[0x09] = (u8::from(self.byte09_bit7) << 7)
-            | (u8::from(self.mode) << 4)
-            | (u8::from(self.narrow) << 3)
-            | (u8::from(self.fine_mode) << 2)
+        bytes[0x08] = (u8::from(self.receive_step) << 4) | u8::from(self.transmit_step);
+        bytes[0x09] = (u8::from(self.mode) << 4)
+            | (u8::from(self.mode == ChannelMode::Nfm) << 3)
+            | (u8::from(self.fine_tuning) << 2)
             | u8::from(self.fine_step);
-
-        // byte 0x0A: tone[7] | ctcss[6] | dtcs[5] | cross[4] | bit3 | split[2] | duplex[1:0]
-        buf[0x0A] = (u8::from(self.tone_enabled) << 7)
-            | (u8::from(self.ctcss_enabled) << 6)
-            | (u8::from(self.dtcs_enabled) << 5)
-            | (u8::from(self.cross_tone) << 4)
-            | (u8::from(self.byte0a_bit3) << 3)
+        bytes[0x0A] = (u8::from(self.tone_mode) << 4)
+            | (u8::from(self.reverse) << 3)
             | (u8::from(self.split) << 2)
-            | u8::from(self.duplex);
-
-        // byte 0x0B: tone code index
-        buf[0x0B] = self.tone_code.index();
-
-        // byte 0x0C: high[7:6] | ctcss_code[5:0]
-        buf[0x0C] = (self.byte0c_high << 6) | (self.ctcss_code.index() & 0x3F);
-
-        // byte 0x0D: bit7 | dcs_code[6:0]
-        buf[0x0D] = (u8::from(self.byte0d_bit7) << 7) | (self.dcs_code.index() & 0x7F);
-
-        // byte 0x0E: reserved[7:6] | cross_type[5:4] | reserved[3:2] | digital_squelch[1:0]
-        buf[0x0E] = (self.byte0e_reserved & 0xCC)
-            | (u8::from(self.cross_tone_type) << 4)
+            | u8::from(self.shift);
+        bytes[0x0B] = self.tone_code.as_raw();
+        bytes[0x0C] = self
+            .unidentified_code_bits
+            .ctcss_wire_value(self.ctcss_code);
+        bytes[0x0D] = self.unidentified_code_bits.dcs_wire_value(self.dcs_code);
+        bytes[0x0E] = (u8::from(self.cross_tone) << 4)
+            | (u8::from(self.byte_0e_bits_3_to_2) << 2)
             | u8::from(self.digital_squelch);
 
-        // bytes 0x0F-0x16: UR callsign
-        buf[0x0F..0x17].copy_from_slice(&self.ur_call.to_wire_bytes());
+        bytes[0x0F..0x17].copy_from_slice(&self.ur_call.to_flash_bytes());
+        bytes[0x17..0x1F].copy_from_slice(&self.rpt1.to_flash_bytes());
+        bytes[0x1F..0x27].copy_from_slice(&self.rpt2.to_flash_bytes());
+        bytes[0x27] = self
+            .unidentified_code_bits
+            .digital_squelch_wire_value(self.digital_squelch_code);
 
-        // bytes 0x17-0x1E: RPT1 callsign
-        buf[0x17..0x1F].copy_from_slice(&self.rpt1.to_wire_bytes());
-
-        // bytes 0x1F-0x26: RPT2 callsign
-        buf[0x1F..0x27].copy_from_slice(&self.rpt2.to_wire_bytes());
-
-        // byte 0x27: bit7 | dv_code[6:0]
-        buf[0x27] = (u8::from(self.byte27_bit7) << 7) | (self.dv_code & 0x7F);
-
-        buf
+        bytes
     }
-}
 
-impl Default for FlashChannel {
-    fn default() -> Self {
-        Self {
-            rx_frequency: Frequency::new(0),
-            tx_offset: Frequency::new(0),
-            step_size: StepSize::Hz5000,
-            byte08_low: 0,
-            mode: MemoryMode::Fm,
-            narrow: false,
-            fine_mode: false,
-            fine_step: FineStep::Hz20,
-            byte09_bit7: false,
-            tone_enabled: false,
-            ctcss_enabled: false,
-            dtcs_enabled: false,
-            cross_tone: false,
-            byte0a_bit3: false,
-            split: false,
-            duplex: FlashDuplex::Simplex,
-            tone_code: ToneCode::default(),
-            ctcss_code: ToneCode::default(),
-            byte0c_high: 0,
-            dcs_code: DcsCode::default(),
-            byte0d_bit7: false,
-            cross_tone_type: CrossToneType::DcsOff,
-            digital_squelch: FlashDigitalSquelch::Off,
-            byte0e_reserved: 0,
-            ur_call: DstarCallsign::default(),
-            rpt1: DstarCallsign::default(),
-            rpt2: DstarCallsign::default(),
-            dv_code: 0,
-            byte27_bit7: false,
+    fn parse_field<T, E>(field: &'static str, result: Result<T, E>) -> Result<T, ProtocolError>
+    where
+        E: fmt::Display,
+    {
+        result.map_err(|error| Self::parse_error(field, error))
+    }
+
+    fn parse_error(field: &'static str, detail: impl fmt::Display) -> ProtocolError {
+        ProtocolError::FieldParse {
+            command: "stored channel".to_owned(),
+            field: field.to_owned(),
+            detail: detail.to_string(),
+        }
+    }
+
+    /// Interpret the stored transmit field using this record's split flag.
+    #[must_use]
+    pub const fn transmit_value(&self) -> ChannelTransmitValue {
+        if self.split {
+            ChannelTransmitValue::SplitTransmitFrequency(self.transmit_offset_or_frequency)
+        } else {
+            ChannelTransmitValue::RepeaterOffset(self.transmit_offset_or_frequency)
         }
     }
 }
 
-impl Default for ChannelMemory {
-    fn default() -> Self {
-        Self {
-            rx_frequency: Frequency::new(0),
-            tx_offset: Frequency::new(0),
-            step_size: StepSize::Hz5000,
-            mode_flags_raw: 0,
-            shift: ShiftDirection::SIMPLEX,
-            flags_0a_raw: 0,
-            tone_code: ToneCode::default(),
-            ctcss_code: ToneCode::default(),
-            dcs_code: DcsCode::default(),
-            cross_tone_combo: CrossToneType::DcsOff,
-            digital_squelch: FlashDigitalSquelch::Off,
-            urcall: ChannelName::default(),
-            data_mode: 0,
+/// Exact channel-data storage classified by its separate flag record.
+///
+/// Programmed slots contain a [`StoredChannel`] whose receive frequency cannot
+/// be either empty-storage marker. Unprogrammed slots retain their
+/// uninterpreted 40 bytes because physical radio images use erased `0xFF`
+/// records that are intentionally not valid programmed-channel data. Private
+/// state variants prevent callers from pairing a programmed classification
+/// with an empty frequency marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredChannelData(StoredChannelDataState);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoredChannelDataState {
+    Programmed(StoredChannel),
+    Unprogrammed([u8; StoredChannel::BYTE_SIZE]),
+}
+
+impl StoredChannelData {
+    /// Classify a decoded channel as programmed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::FrequencyOutOfRange`] when the receive
+    /// frequency is zero or the erased `u32::MAX` marker.
+    pub fn new_programmed(channel: StoredChannel) -> Result<Self, ValidationError> {
+        channel.validate_programmed()?;
+        Ok(Self(StoredChannelDataState::Programmed(channel)))
+    }
+
+    pub(crate) const fn new_unprogrammed(bytes: [u8; StoredChannel::BYTE_SIZE]) -> Self {
+        Self(StoredChannelDataState::Unprogrammed(bytes))
+    }
+
+    /// Decode or retain one exact record according to its flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError`] if the record length is not exactly 40 bytes
+    /// or a programmed record contains an invalid field.
+    pub fn from_bytes(bytes: &[u8], flag: StoredChannelFlag) -> Result<Self, ProtocolError> {
+        if flag.is_programmed() {
+            let channel = StoredChannel::from_bytes(bytes)?;
+            Self::new_programmed(channel)
+                .map_err(|error| StoredChannel::parse_error("receive frequency", error))
+        } else {
+            let actual_length = bytes.len();
+            let wire = bytes.try_into().map_err(|_| ProtocolError::FieldParse {
+                command: "stored channel data".to_owned(),
+                field: "length".to_owned(),
+                detail: format!(
+                    "expected exactly {} bytes, got {actual_length}",
+                    StoredChannel::BYTE_SIZE,
+                ),
+            })?;
+            Ok(Self::new_unprogrammed(wire))
         }
+    }
+
+    /// Return the decoded channel when the slot is programmed.
+    #[must_use]
+    pub const fn programmed(&self) -> Option<&StoredChannel> {
+        match &self.0 {
+            StoredChannelDataState::Programmed(channel) => Some(channel),
+            StoredChannelDataState::Unprogrammed(_) => None,
+        }
+    }
+
+    /// Return the preserved bytes when the slot is unprogrammed.
+    #[must_use]
+    pub const fn unprogrammed_bytes(&self) -> Option<&[u8; StoredChannel::BYTE_SIZE]> {
+        match &self.0 {
+            StoredChannelDataState::Programmed(_) => None,
+            StoredChannelDataState::Unprogrammed(bytes) => Some(bytes),
+        }
+    }
+
+    /// Serialize or return the exact 40-byte stored representation.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; StoredChannel::BYTE_SIZE] {
+        match &self.0 {
+            StoredChannelDataState::Programmed(channel) => channel.to_bytes(),
+            StoredChannelDataState::Unprogrammed(bytes) => *bytes,
+        }
+    }
+}
+
+/// One physical MCP channel-data slot paired with its exact flag record.
+///
+/// The physical index is the zero-based position in the radio's 1,152-record
+/// channel-data region. Indices 0-999 correspond to regular memories; the
+/// remaining indices belong to special memories and therefore must not be
+/// coerced into [`RegularChannel`]. Empty slots retain their uninterpreted
+/// data bytes through [`StoredChannelData::unprogrammed_bytes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredChannelSlot {
+    physical_index: usize,
+    flag: StoredChannelFlag,
+    data: StoredChannelData,
+}
+
+impl StoredChannelSlot {
+    pub(crate) const fn new(
+        physical_index: usize,
+        flag: StoredChannelFlag,
+        data: StoredChannelData,
+    ) -> Self {
+        Self {
+            physical_index,
+            flag,
+            data,
+        }
+    }
+
+    /// Return the zero-based index in the physical channel-data region.
+    #[must_use]
+    pub const fn physical_index(&self) -> usize {
+        self.physical_index
+    }
+
+    /// Return the exact four-byte flag associated with this data slot.
+    #[must_use]
+    pub const fn flag(&self) -> StoredChannelFlag {
+        self.flag
+    }
+
+    /// Return the decoded programmed record or preserved empty-slot bytes.
+    #[must_use]
+    pub const fn data(&self) -> &StoredChannelData {
+        &self.data
+    }
+
+    /// Return whether the associated flag marks this slot as programmed.
+    #[must_use]
+    pub const fn is_programmed(&self) -> bool {
+        self.flag.is_programmed()
+    }
+
+    /// Consume the slot and return its physical index, exact flag, and data.
+    #[must_use]
+    pub const fn into_parts(self) -> (usize, StoredChannelFlag, StoredChannelData) {
+        (self.physical_index, self.flag, self.data)
     }
 }
 
@@ -1336,529 +1427,362 @@ impl Default for ChannelMemory {
 mod tests {
     use super::*;
     use crate::error::ValidationError;
-    use crate::types::frequency::Frequency;
-    use crate::types::mode::{ShiftDirection, StepSize};
-    use crate::types::tone::{CtcssMode, DcsCode, ToneCode};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
-    type BoxErr = Box<dyn std::error::Error>;
 
-    #[test]
-    fn flag_accessors_derive_from_raw_byte() -> TestResult {
-        // Single representation: the flag accessors read (and the
-        // setters write) `flags_0a_raw`; there is no separate bool
-        // state to fall out of sync with the wire byte.
-        let mut ch = ChannelMemory::default();
-        ch.set_tone_enable(true);
-        ch.set_reverse(true);
-        assert!(ch.tone_enable());
-        assert!(ch.reverse());
-        assert!(!ch.dcs_enable());
-        assert_eq!(ch.ctcss_mode(), CtcssMode::Off);
-        ch.set_ctcss_enable(true);
-        assert_eq!(ch.ctcss_mode(), CtcssMode::On);
-        // The packed byte carries exactly the same bits.
-        let bytes = ch.to_bytes();
-        assert_eq!(byte_at(&bytes, 0x0A)? & 0xC8, 0xC8);
-        Ok(())
-    }
-
-    #[test]
-    fn set_shift_keeps_raw_bits_in_sync() -> TestResult {
-        // Shift is double-encoded on the wire (byte 0x08 low nibble
-        // AND byte 0x0A bits 2:0), so the setter must keep both in
-        // sync so the two serializers can never disagree.
-        let mut ch = ChannelMemory::default();
-        ch.set_shift(ShiftDirection::DOWN);
-        assert_eq!(ch.shift, ShiftDirection::DOWN);
-        let bytes = ch.to_bytes();
-        assert_eq!(
-            byte_at(&bytes, 0x08)? & 0x0F,
-            u8::from(ShiftDirection::DOWN)
-        );
-        assert_eq!(
-            byte_at(&bytes, 0x0A)? & 0x07,
-            u8::from(ShiftDirection::DOWN)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn flash_duplex_error_names_its_own_range() {
-        // FlashDuplex is 0-2; borrowing ShiftOutOfRange would claim
-        // "must be 0-15" for a value that is invalid at 3.
-        let err = FlashDuplex::try_from(3u8);
-        assert!(
-            matches!(
-                err,
-                Err(ValidationError::SettingOutOfRange { value: 3, .. })
-            ),
-            "FlashDuplex must report its own range: {err:?}"
-        );
-    }
-
-    /// Return `bytes[offset]` or an error if the offset is out of bounds.
-    fn byte_at(bytes: &[u8], offset: usize) -> Result<u8, BoxErr> {
-        bytes.get(offset).copied().ok_or_else(|| {
-            format!(
-                "byte_at: offset {offset} out of bounds (len={})",
-                bytes.len()
-            )
-            .into()
-        })
-    }
-
-    /// Return `&bytes[start..end]` or an error if the range is out of bounds.
-    fn slice_range(bytes: &[u8], start: usize, end: usize) -> Result<&[u8], BoxErr> {
-        bytes.get(start..end).ok_or_else(|| {
-            format!(
-                "slice_range: {start}..{end} out of bounds (len={})",
-                bytes.len()
-            )
-            .into()
+    fn synthetic_stored_channel(receive_frequency: Frequency) -> StoredChannel {
+        let mut wire = [0_u8; StoredChannel::BYTE_SIZE];
+        wire[..4].copy_from_slice(&receive_frequency.to_le_bytes());
+        StoredChannel::from_bytes(&wire).unwrap_or_else(|error| {
+            unreachable!("fixed all-zero synthetic channel record must decode: {error}")
         })
     }
 
     #[test]
-    fn channel_name_valid() -> TestResult {
-        let name = ChannelName::new("RPT1")?;
-        assert_eq!(name.as_str(), "RPT1");
+    fn stored_channel_flag_preserves_physical_opaque_bits() -> TestResult {
+        let wire = [0x08, 0xA0, 0x00, 0x00];
+        let flag = StoredChannelFlag::try_from_wire(wire)?;
+        assert!(flag.is_programmed());
+        assert_eq!(flag.band(), Some(MemoryChannelBand::Vhf));
+        assert_eq!(flag.group(), Some(MemoryGroup::new(0)?));
+        assert_eq!(flag.scan_lockout(), Some(false));
+        assert_eq!(flag.to_wire_bytes(), wire);
         Ok(())
     }
 
     #[test]
-    fn channel_name_empty() -> TestResult {
-        let name = ChannelName::new("")?;
-        assert_eq!(name.as_str(), "");
+    fn stored_channel_flag_decodes_verified_50_mhz_code() -> TestResult {
+        let flag = StoredChannelFlag::try_from_wire([0x05, 0x01, 0x07, 0xA5])?;
+        assert_eq!(flag.band(), Some(MemoryChannelBand::Band50MHz));
+        assert_eq!(flag.group(), Some(MemoryGroup::new(7)?));
+        assert_eq!(flag.scan_lockout(), Some(true));
+        assert_eq!(flag.to_wire_bytes(), [0x05, 0x01, 0x07, 0xA5]);
         Ok(())
     }
 
     #[test]
-    fn channel_name_max_length() -> TestResult {
-        let name = ChannelName::new("12345678")?;
-        assert_eq!(name.as_str(), "12345678");
+    fn stored_channel_flag_rejects_unverified_programmed_fields() {
+        assert!(matches!(
+            StoredChannelFlag::try_from_wire([0x03, 0x00, 0x00, 0xFF]),
+            Err(ValidationError::MemoryChannelBandOutOfRange { marker: 3 })
+        ));
+        assert!(matches!(
+            StoredChannelFlag::try_from_wire([0x00, 0x00, 30, 0xFF]),
+            Err(ValidationError::MemoryGroupOutOfRange { group: 30 })
+        ));
+    }
+
+    #[test]
+    fn stored_channel_flag_keeps_empty_record_opaque() -> TestResult {
+        let wire = [0xFF, 0xA5, 0xFE, 0x00];
+        let flag = StoredChannelFlag::try_from_wire(wire)?;
+        assert!(flag.is_empty());
+        assert_eq!(flag.band(), None);
+        assert_eq!(flag.group(), None);
+        assert_eq!(flag.scan_lockout(), None);
+        assert_eq!(flag.to_wire_bytes(), wire);
         Ok(())
     }
 
     #[test]
-    fn channel_name_too_long() -> TestResult {
-        let err = ChannelName::new("123456789")
-            .err()
-            .ok_or("expected ChannelNameTooLong error but got Ok")?;
-        assert!(
-            matches!(err, ValidationError::ChannelNameTooLong { len: 9 }),
-            "expected ChannelNameTooLong {{ len: 9 }}, got {err:?}"
+    fn empty_regular_channel_flags_retain_the_default_hundreds_group() -> TestResult {
+        let channel_140 = RegularChannel::new(140)?;
+        let channel_999 = RegularChannel::new(999)?;
+
+        assert_eq!(
+            StoredChannelFlag::empty_for_regular_channel(channel_140).to_wire_bytes(),
+            [0xFF, 0x00, 0x01, 0xFF],
+        );
+        assert_eq!(
+            StoredChannelFlag::empty_for_regular_channel(channel_999).to_wire_bytes(),
+            [0xFF, 0x00, 0x09, 0xFF],
         );
         Ok(())
     }
 
     #[test]
-    fn channel_name_to_bytes_padded() -> TestResult {
-        let name = ChannelName::new("RPT1")?;
-        let bytes = name.to_bytes();
-        assert_eq!(bytes.len(), 24);
-        assert_eq!(slice_range(&bytes, 0, 4)?, b"RPT1");
-        assert!(
-            slice_range(&bytes, 4, bytes.len())?.iter().all(|&b| b == 0),
-            "bytes[4..] should be all zero"
+    fn stored_channel_data_preserves_every_unprogrammed_byte() -> TestResult {
+        let mut wire = [0xFF; StoredChannel::BYTE_SIZE];
+        wire[0x0E] = 0x6B;
+        wire[0x27] = 0x80;
+        let flag = StoredChannelFlag::empty_for_regular_channel(RegularChannel::new(140)?);
+
+        let stored = StoredChannelData::from_bytes(&wire, flag)?;
+
+        assert_eq!(stored.programmed(), None);
+        assert_eq!(stored.unprogrammed_bytes(), Some(&wire));
+        assert_eq!(stored.to_bytes(), wire);
+        Ok(())
+    }
+
+    fn populated_stored_channel() -> Result<StoredChannel, ValidationError> {
+        Ok(StoredChannel {
+            receive_frequency: Frequency::new(145_670_000),
+            transmit_offset_or_frequency: Frequency::new(600_000),
+            receive_step: StepSize::Hz12500,
+            transmit_step: StepSize::Hz25000,
+            mode: ChannelMode::Lsb,
+            fine_tuning: true,
+            fine_step: FineStep::Hz500,
+            tone_mode: ToneMode::CrossTone,
+            reverse: true,
+            split: true,
+            shift: ShiftDirection::Plus,
+            tone_code: ToneCode::new(50)?,
+            ctcss_code: CtcssCode::new(12)?,
+            dcs_code: DcsCode::new(42)?,
+            cross_tone: CrossToneField::new(0x09)?,
+            byte_0e_bits_3_to_2: ChannelByte0eBits3To2::new(2)?,
+            digital_squelch: DigitalSquelchType::CallsignSquelch,
+            ur_call: DstarCallsign::new("CQCQCQ")?,
+            rpt1: DstarCallsign::new("KQ4NIT B")?,
+            rpt2: DstarCallsign::new("KQ4NIT G")?,
+            digital_squelch_code: DigitalSquelchCode::new(99)?,
+            unidentified_code_bits: ChannelCodeUnidentifiedBits::new(3, true, true)?,
+        })
+    }
+
+    #[test]
+    fn stored_channel_full_record_round_trips_losslessly() -> TestResult {
+        let channel = populated_stored_channel()?;
+        let bytes = channel.to_bytes();
+
+        assert_eq!(bytes.len(), StoredChannel::BYTE_SIZE);
+        assert_eq!(&bytes[0x00..0x04], &145_670_000_u32.to_le_bytes());
+        assert_eq!(&bytes[0x04..0x08], &600_000_u32.to_le_bytes());
+        assert_eq!(bytes[0x08], 0x58);
+        assert_eq!(bytes[0x09], 0x36);
+        assert_eq!(bytes[0x0A], 0x1D);
+        assert_eq!(bytes[0x0B], 50);
+        assert_eq!(bytes[0x0C], 0xCC);
+        assert_eq!(bytes[0x0D], 0xAA);
+        assert_eq!(bytes[0x0E], 0x9A);
+        assert_eq!(&bytes[0x0F..0x17], b"CQCQCQ\0\0");
+        assert_eq!(&bytes[0x17..0x1F], b"KQ4NIT B");
+        assert_eq!(&bytes[0x1F..0x27], b"KQ4NIT G");
+        assert_eq!(bytes[0x27], 0xE3);
+        assert_eq!(StoredChannel::from_bytes(&bytes)?, channel);
+        assert_eq!(
+            channel.transmit_value(),
+            ChannelTransmitValue::SplitTransmitFrequency(Frequency::new(600_000)),
         );
+        assert_eq!(channel.unidentified_code_bits.ctcss_code_bits_7_to_6(), 3);
+        assert!(channel.unidentified_code_bits.dcs_code_bit_7());
+        assert!(channel.unidentified_code_bits.digital_squelch_code_bit_7());
         Ok(())
     }
 
     #[test]
-    fn channel_name_from_bytes() -> TestResult {
-        let mut bytes = [0u8; 24];
-        bytes
-            .get_mut(..4)
-            .ok_or("bytes[..4] out of range")?
-            .copy_from_slice(b"RPT1");
-        let name = ChannelName::from_bytes(&bytes);
-        assert_eq!(name.as_str(), "RPT1");
-        Ok(())
-    }
-
-    // --- ChannelMemory tests ---
-
-    #[test]
-    fn channel_memory_byte_layout_size() {
-        assert_eq!(ChannelMemory::BYTE_SIZE, 40);
-    }
-
-    #[test]
-    fn channel_memory_round_trip_simplex_vhf() -> TestResult {
-        // flags_0a_raw must be consistent with individual fields for round-trip
-        // tone=bit7, shift=bits2:0=1 → flags_0a_raw = 0x81
-        let ch = ChannelMemory {
-            rx_frequency: Frequency::new(145_000_000),
-            tx_offset: Frequency::new(600_000),
-            step_size: StepSize::Hz12500,
-            mode_flags_raw: 0,
-            shift: ShiftDirection::UP,
-            flags_0a_raw: 0x81, // tone(bit7) + shift+(bit0)
-            tone_code: ToneCode::new(8)?,
-            ctcss_code: ToneCode::new(8)?,
-            dcs_code: DcsCode::new(0)?,
-            cross_tone_combo: CrossToneType::DcsOff,
-            digital_squelch: FlashDigitalSquelch::Off,
-            urcall: ChannelName::new("")?,
-            data_mode: 0,
+    fn channel_transmit_value_distinguishes_offset_from_split_frequency() {
+        let offset = StoredChannel {
+            transmit_offset_or_frequency: Frequency::new(600_000),
+            ..synthetic_stored_channel(Frequency::new(1))
         };
-        let bytes = ch.to_bytes();
-        assert_eq!(bytes.len(), 40);
-        let parsed = ChannelMemory::from_bytes(&bytes)?;
-        assert_eq!(parsed, ch);
-        Ok(())
-    }
+        assert_eq!(
+            offset.transmit_value(),
+            ChannelTransmitValue::RepeaterOffset(Frequency::new(600_000)),
+        );
 
-    #[test]
-    fn channel_memory_byte08_packing() -> TestResult {
-        let ch = ChannelMemory {
-            step_size: StepSize::Hz12500, // index 5
-            shift: ShiftDirection::UP,    // 1
-            ..ChannelMemory::default()
+        let split = StoredChannel {
+            transmit_offset_or_frequency: Frequency::new(146_520_000),
+            split: true,
+            ..synthetic_stored_channel(Frequency::new(1))
         };
-        let bytes = ch.to_bytes();
-        assert_eq!(byte_at(&bytes, 0x08)?, 0x51); // 5 << 4 | 1
-        Ok(())
+        assert_eq!(
+            split.transmit_value(),
+            ChannelTransmitValue::SplitTransmitFrequency(Frequency::new(146_520_000)),
+        );
     }
 
     #[test]
-    fn channel_memory_byte09_packing() -> TestResult {
-        // Tone flags live in byte 0x0A, so setting them must leave the
-        // mode/fine-tuning byte 0x09 untouched.
-        let mut ch = ChannelMemory::default();
-        ch.set_reverse(true);
-        ch.set_tone_enable(true);
-        ch.set_ctcss_enable(true);
-        let bytes = ch.to_bytes();
-        assert_eq!(byte_at(&bytes, 0x09)?, 0x00);
-        Ok(())
-    }
-
-    #[test]
-    fn channel_memory_byte0a_packing() -> TestResult {
-        // byte[0x0A] is stored directly from flags_0a_raw (hardware-verified)
-        // tone=bit7, ctcss=bit6, dcs=bit5, cross=bit4, reverse=bit3, shift=bits2:0
-        let ch = ChannelMemory {
-            flags_0a_raw: 0xB0, // tone(bit7) + dcs(bit5) + cross(bit4)
-            ..ChannelMemory::default()
-        };
-        let bytes = ch.to_bytes();
-        assert_eq!(byte_at(&bytes, 0x0A)?, 0xB0);
-        assert!(ch.tone_enable());
-        assert!(ch.dcs_enable());
-        assert!(ch.cross_tone_reverse());
-        assert!(!ch.reverse());
-        Ok(())
-    }
-
-    #[test]
-    fn channel_memory_unknown_bits_passthrough() -> TestResult {
-        let ch = ChannelMemory {
-            flags_0a_raw: 0x2B,
-            ..ChannelMemory::default()
-        };
-        let bytes = ch.to_bytes();
-        assert_eq!(byte_at(&bytes, 0x0A)?, 0x2B);
-        let parsed = ChannelMemory::from_bytes(&bytes)?;
-        assert_eq!(parsed.flags_0a_raw, 0x2B);
-        Ok(())
-    }
-
-    #[test]
-    fn channel_memory_byte0e_packing() -> TestResult {
-        let ch = ChannelMemory {
-            cross_tone_combo: CrossToneType::ToneDcs,
-            digital_squelch: FlashDigitalSquelch::Code,
-            ..ChannelMemory::default()
-        };
-        let bytes = ch.to_bytes();
-        assert_eq!(byte_at(&bytes, 0x0E)?, 0x1D); // (1<<4) | 0x0C | 1
-        Ok(())
-    }
-
-    #[test]
-    fn channel_memory_frequency_le_bytes() -> TestResult {
-        let ch = ChannelMemory {
-            rx_frequency: Frequency::new(145_000_000),
-            tx_offset: Frequency::new(600_000),
-            ..ChannelMemory::default()
-        };
-        let bytes = ch.to_bytes();
-        let rx_bytes = slice_range(&bytes, 0, 4)?;
-        let rx_arr: [u8; 4] = rx_bytes.try_into().map_err(|_| "rx_bytes length != 4")?;
-        assert_eq!(u32::from_le_bytes(rx_arr), 145_000_000);
-        let tx_bytes = slice_range(&bytes, 4, 8)?;
-        let tx_arr: [u8; 4] = tx_bytes.try_into().map_err(|_| "tx_bytes length != 4")?;
-        assert_eq!(u32::from_le_bytes(tx_arr), 600_000);
-        Ok(())
-    }
-
-    // --- FlashChannel tests ---
-
-    #[test]
-    fn flash_channel_byte_size() {
-        assert_eq!(FlashChannel::BYTE_SIZE, 40);
-    }
-
-    #[test]
-    fn flash_channel_default_round_trip() -> TestResult {
-        let ch = FlashChannel::default();
-        let bytes = ch.to_bytes();
-        let parsed = FlashChannel::from_bytes(&bytes)?;
-        assert_eq!(parsed, ch);
-        Ok(())
-    }
-
-    #[test]
-    fn flash_channel_mode_encoding() -> TestResult {
-        use crate::types::mode::MemoryMode;
-        // Flash mode encoding: FM=0, DV=1, AM=2, LSB=3, USB=4, CW=5, NFM=6, DR=7
-        for (raw, expected) in [
-            (0, MemoryMode::Fm),
-            (1, MemoryMode::Dv),
-            (2, MemoryMode::Am),
-            (3, MemoryMode::Lsb),
-            (4, MemoryMode::Usb),
-            (5, MemoryMode::Cw),
-            (6, MemoryMode::Nfm),
-            (7, MemoryMode::Dr),
-        ] {
-            let ch = FlashChannel {
-                mode: expected,
-                ..FlashChannel::default()
+    fn stored_channel_mode_nibble_and_nfm_marker_are_exact() -> TestResult {
+        for raw in 0..ChannelMode::COUNT {
+            let mode = ChannelMode::try_from(raw)?;
+            let channel = StoredChannel {
+                mode,
+                ..synthetic_stored_channel(Frequency::new(1))
             };
-            let bytes = ch.to_bytes();
-            // Mode is at byte 0x09 bits [6:4]
+            let bytes = channel.to_bytes();
+
+            assert_eq!(bytes[0x09] >> 4, raw);
+            assert_eq!(bytes[0x09] & 0x08 != 0, mode == ChannelMode::Nfm);
+            assert_eq!(StoredChannel::from_bytes(&bytes)?.mode, mode);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stored_channel_rejects_contradictory_nfm_markers() {
+        let mut fm_with_marker = synthetic_stored_channel(Frequency::new(1)).to_bytes();
+        fm_with_marker[0x09] |= 0x08;
+        assert!(StoredChannel::from_bytes(&fm_with_marker).is_err());
+
+        let mut nfm_without_marker = StoredChannel {
+            mode: ChannelMode::Nfm,
+            ..synthetic_stored_channel(Frequency::new(1))
+        }
+        .to_bytes();
+        nfm_without_marker[0x09] &= !0x08;
+        assert!(StoredChannel::from_bytes(&nfm_without_marker).is_err());
+    }
+
+    #[test]
+    fn stored_channel_tone_mode_is_exactly_one_selection() -> TestResult {
+        for tone_mode in ToneMode::ALL {
+            let channel = StoredChannel {
+                tone_mode,
+                ..synthetic_stored_channel(Frequency::new(1))
+            };
+            let bytes = channel.to_bytes();
+            assert_eq!(bytes[0x0A] >> 4, u8::from(tone_mode));
+            assert_eq!(StoredChannel::from_bytes(&bytes)?.tone_mode, tone_mode);
+        }
+
+        for invalid_nibble in [3_u8, 5, 6, 7, 9, 0x0F] {
+            let mut bytes = synthetic_stored_channel(Frequency::new(1)).to_bytes();
+            bytes[0x0A] = invalid_nibble << 4;
+            assert!(StoredChannel::from_bytes(&bytes).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stored_channel_step_and_shift_domains_round_trip() -> TestResult {
+        for receive_raw in 0..StepSize::COUNT {
+            for transmit_raw in 0..StepSize::COUNT {
+                let receive_step = StepSize::try_from(receive_raw)?;
+                let transmit_step = StepSize::try_from(transmit_raw)?;
+                let channel = StoredChannel {
+                    receive_step,
+                    transmit_step,
+                    ..synthetic_stored_channel(Frequency::new(1))
+                };
+                let parsed = StoredChannel::from_bytes(&channel.to_bytes())?;
+                assert_eq!(parsed.receive_step, receive_step);
+                assert_eq!(parsed.transmit_step, transmit_step);
+            }
+        }
+
+        for shift_raw in 0..ShiftDirection::COUNT {
+            let shift = ShiftDirection::try_from(shift_raw)?;
+            let channel = StoredChannel {
+                shift,
+                ..synthetic_stored_channel(Frequency::new(1))
+            };
+            assert_eq!(StoredChannel::from_bytes(&channel.to_bytes())?.shift, shift);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stored_channel_unidentified_and_digital_squelch_fields_round_trip() -> TestResult {
+        for raw in 0..ChannelByte0eBits3To2::COUNT {
+            let bits = ChannelByte0eBits3To2::new(raw)?;
+            let channel = StoredChannel {
+                byte_0e_bits_3_to_2: bits,
+                ..synthetic_stored_channel(Frequency::new(1))
+            };
             assert_eq!(
-                (byte_at(&bytes, 0x09)? >> 4) & 0x07,
-                raw,
-                "mode {expected} should encode as {raw}"
+                StoredChannel::from_bytes(&channel.to_bytes())?.byte_0e_bits_3_to_2,
+                bits,
             );
-            let parsed = FlashChannel::from_bytes(&bytes)?;
-            assert_eq!(parsed.mode, expected);
+        }
+
+        for squelch_raw in 0..DigitalSquelchType::COUNT {
+            let digital_squelch = DigitalSquelchType::try_from(squelch_raw)?;
+            let channel = StoredChannel {
+                digital_squelch,
+                ..synthetic_stored_channel(Frequency::new(1))
+            };
+            assert_eq!(
+                StoredChannel::from_bytes(&channel.to_bytes())?.digital_squelch,
+                digital_squelch,
+            );
         }
         Ok(())
     }
 
     #[test]
-    fn flash_channel_mode_matches_cat() {
-        // CAT MD and flash memory use the same encoding for all 8 modes (0-7).
-        use crate::types::mode::{MemoryMode, Mode};
-        assert_eq!(u8::from(MemoryMode::Am), u8::from(Mode::Am));
-        assert_eq!(u8::from(MemoryMode::Nfm), u8::from(Mode::Nfm));
-        assert_eq!(u8::from(MemoryMode::Fm), u8::from(Mode::Fm));
-        assert_eq!(u8::from(MemoryMode::Dr), u8::from(Mode::Dr));
-    }
-
-    #[test]
-    fn flash_channel_byte09_packing() -> TestResult {
-        let ch = FlashChannel {
-            mode: MemoryMode::Am,        // 2 -> bits [6:4] = 0b010
-            narrow: true,                // bit 3
-            fine_mode: true,             // bit 2
-            fine_step: FineStep::Hz1000, // bits [1:0] = 3
-            byte09_bit7: false,
-            ..FlashChannel::default()
-        };
-        let bytes = ch.to_bytes();
-        // Expected: 0b0_010_1_1_11 = 0x2F
-        assert_eq!(byte_at(&bytes, 0x09)?, 0x2F);
-        let parsed = FlashChannel::from_bytes(&bytes)?;
-        assert_eq!(parsed.mode, MemoryMode::Am);
-        assert!(parsed.narrow);
-        assert!(parsed.fine_mode);
-        assert_eq!(parsed.fine_step, FineStep::Hz1000);
-        Ok(())
-    }
-
-    #[test]
-    fn flash_channel_byte0a_tone_duplex() -> TestResult {
-        let ch = FlashChannel {
-            tone_enabled: true,         // bit 7
-            ctcss_enabled: false,       // bit 6
-            dtcs_enabled: true,         // bit 5
-            cross_tone: false,          // bit 4
-            byte0a_bit3: false,         // bit 3
-            split: true,                // bit 2
-            duplex: FlashDuplex::Minus, // bits [1:0] = 2
-            ..FlashChannel::default()
-        };
-        let bytes = ch.to_bytes();
-        // Expected: 0b1_0_1_0_0_1_10 = 0xA6
-        assert_eq!(byte_at(&bytes, 0x0A)?, 0xA6);
-        let parsed = FlashChannel::from_bytes(&bytes)?;
-        assert!(parsed.tone_enabled);
-        assert!(!parsed.ctcss_enabled);
-        assert!(parsed.dtcs_enabled);
-        assert!(!parsed.cross_tone);
-        assert!(parsed.split);
-        assert_eq!(parsed.duplex, FlashDuplex::Minus);
-        Ok(())
-    }
-
-    #[test]
-    fn flash_channel_dstar_callsigns() -> TestResult {
-        use crate::types::dstar::DstarCallsign;
-        let ch = FlashChannel {
-            ur_call: DstarCallsign::new("CQCQCQ").ok_or("invalid UR callsign")?,
-            rpt1: DstarCallsign::new("W4BFB B").ok_or("invalid RPT1 callsign")?,
-            rpt2: DstarCallsign::new("W4BFB G").ok_or("invalid RPT2 callsign")?,
-            ..FlashChannel::default()
-        };
-        let bytes = ch.to_bytes();
-        // UR at 0x0F-0x16 (8 bytes, space-padded)
-        assert_eq!(slice_range(&bytes, 0x0F, 0x17)?, b"CQCQCQ  ");
-        // RPT1 at 0x17-0x1E
-        assert_eq!(slice_range(&bytes, 0x17, 0x1F)?, b"W4BFB B ");
-        // RPT2 at 0x1F-0x26
-        assert_eq!(slice_range(&bytes, 0x1F, 0x27)?, b"W4BFB G ");
-
-        let parsed = FlashChannel::from_bytes(&bytes)?;
-        assert_eq!(parsed.ur_call.as_str(), "CQCQCQ");
-        assert_eq!(parsed.rpt1.as_str(), "W4BFB B");
-        assert_eq!(parsed.rpt2.as_str(), "W4BFB G");
-        Ok(())
-    }
-
-    #[test]
-    fn flash_channel_byte0e_cross_tone_digital_squelch() -> TestResult {
-        let ch = FlashChannel {
-            cross_tone_type: CrossToneType::DcsCtcss, // bits [5:4] = 2
-            digital_squelch: FlashDigitalSquelch::Callsign, // bits [1:0] = 2
-            byte0e_reserved: 0,
-            ..FlashChannel::default()
-        };
-        let bytes = ch.to_bytes();
-        // Expected: 0b00_10_00_10 = 0x22
-        assert_eq!(byte_at(&bytes, 0x0E)?, 0x22);
-        let parsed = FlashChannel::from_bytes(&bytes)?;
-        assert_eq!(parsed.cross_tone_type, CrossToneType::DcsCtcss);
-        assert_eq!(parsed.digital_squelch, FlashDigitalSquelch::Callsign);
-        Ok(())
-    }
-
-    #[test]
-    fn flash_channel_dv_code() -> TestResult {
-        let ch = FlashChannel {
-            dv_code: 42,
-            byte27_bit7: true,
-            ..FlashChannel::default()
-        };
-        let bytes = ch.to_bytes();
-        assert_eq!(byte_at(&bytes, 0x27)?, 0x80 | 0x2A);
-        let parsed = FlashChannel::from_bytes(&bytes)?;
-        assert_eq!(parsed.dv_code, 42);
-        assert!(parsed.byte27_bit7);
-        Ok(())
-    }
-
-    #[test]
-    fn flash_channel_full_round_trip() -> TestResult {
-        use crate::types::dstar::DstarCallsign;
-        let ch = FlashChannel {
-            rx_frequency: Frequency::new(146_520_000),
-            tx_offset: Frequency::new(600_000),
-            step_size: StepSize::Hz12500,
-            byte08_low: 0x03,
-            mode: MemoryMode::Dv,
-            narrow: false,
-            fine_mode: true,
-            fine_step: FineStep::Hz100,
-            byte09_bit7: false,
-            tone_enabled: true,
-            ctcss_enabled: true,
-            dtcs_enabled: false,
-            cross_tone: false,
-            byte0a_bit3: false,
-            split: false,
-            duplex: FlashDuplex::Plus,
-            tone_code: ToneCode::new(8)?,
-            ctcss_code: ToneCode::new(12)?,
-            byte0c_high: 0,
-            dcs_code: DcsCode::new(5)?,
-            byte0d_bit7: false,
-            cross_tone_type: CrossToneType::ToneDcs,
-            digital_squelch: FlashDigitalSquelch::Code,
-            byte0e_reserved: 0,
-            ur_call: DstarCallsign::new("CQCQCQ").ok_or("invalid UR callsign")?,
-            rpt1: DstarCallsign::new("W4BFB B").ok_or("invalid RPT1 callsign")?,
-            rpt2: DstarCallsign::new("W4BFB G").ok_or("invalid RPT2 callsign")?,
-            dv_code: 99,
-            byte27_bit7: false,
-        };
-        let bytes = ch.to_bytes();
-        assert_eq!(bytes.len(), 40);
-        let parsed = FlashChannel::from_bytes(&bytes)?;
-        assert_eq!(parsed, ch);
-        Ok(())
-    }
-
-    #[test]
-    fn flash_channel_too_short() {
-        let bytes = [0u8; 39];
-        let err = FlashChannel::from_bytes(&bytes);
-        assert!(
-            err.is_err(),
-            "expected from_bytes to reject 39-byte input: {err:?}"
-        );
-    }
-
-    #[test]
-    fn flash_channel_reserved_bits_preserved() -> TestResult {
-        let ch = FlashChannel {
-            byte0c_high: 0x03,
-            byte0d_bit7: true,
-            byte0e_reserved: 0xCC, // bits [7:6] and [3:2]
-            byte0a_bit3: true,
-            byte09_bit7: true,
-            ..FlashChannel::default()
-        };
-        let bytes = ch.to_bytes();
-        let parsed = FlashChannel::from_bytes(&bytes)?;
-        assert_eq!(parsed.byte0c_high, 0x03);
-        assert!(parsed.byte0d_bit7);
-        assert_eq!(parsed.byte0e_reserved, 0xCC);
-        assert!(parsed.byte0a_bit3);
-        assert!(parsed.byte09_bit7);
-        Ok(())
-    }
-
-    #[test]
-    fn flash_fine_step_display() {
-        assert_eq!(FineStep::Hz20.to_string(), "20 Hz");
-        assert_eq!(FineStep::Hz100.to_string(), "100 Hz");
-        assert_eq!(FineStep::Hz500.to_string(), "500 Hz");
-        assert_eq!(FineStep::Hz1000.to_string(), "1000 Hz");
-    }
-
-    #[test]
-    fn flash_duplex_round_trip() -> TestResult {
-        for i in 0u8..FlashDuplex::COUNT {
-            let d = FlashDuplex::try_from(i)?;
-            assert_eq!(u8::from(d), i);
+    fn programmed_channel_data_rejects_empty_frequency_markers() -> TestResult {
+        let flag =
+            StoredChannelFlag::programmed(MemoryChannelBand::Vhf, MemoryGroup::new(0)?, false);
+        for marker in [0, u32::MAX] {
+            let wire = synthetic_stored_channel(Frequency::new(marker)).to_bytes();
+            assert!(
+                StoredChannelData::from_bytes(&wire, flag).is_err(),
+                "programmed receive-frequency marker {marker} must be rejected",
+            );
         }
-        assert!(FlashDuplex::try_from(FlashDuplex::COUNT).is_err());
         Ok(())
     }
 
     #[test]
-    fn cross_tone_type_round_trip() -> TestResult {
-        for i in 0u8..CrossToneType::COUNT {
-            let ct = CrossToneType::try_from(i)?;
-            assert_eq!(u8::from(ct), i);
+    fn stored_channel_rejects_every_out_of_domain_wire_field() -> TestResult {
+        let invalid_fields = [
+            (0x08, 0xF0, "receive step"),
+            (0x08, 0x0F, "transmit step"),
+            (0x0C, 50, "CTCSS code"),
+            (0x0D, 104, "DCS code"),
+            (0x0E, 0x0F, "digital squelch"),
+            (0x27, 100, "digital squelch code"),
+        ];
+
+        for (offset, value, description) in invalid_fields {
+            let mut bytes = synthetic_stored_channel(Frequency::new(1)).to_bytes();
+            let byte = bytes
+                .get_mut(offset)
+                .ok_or("test field offset exceeds stored-channel record")?;
+            *byte = value;
+            assert!(
+                StoredChannel::from_bytes(&bytes).is_err(),
+                "{description} value 0x{value:02X} must be rejected",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stored_channel_requires_exact_record_length() {
+        for length in [StoredChannel::BYTE_SIZE - 1, StoredChannel::BYTE_SIZE + 1] {
+            let bytes = vec![0_u8; length];
+            assert!(StoredChannel::from_bytes(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn cross_tone_field_preserves_every_wire_nibble() -> TestResult {
+        for raw in 0..=CrossToneField::MAX {
+            let field = CrossToneField::new(raw)?;
+            assert_eq!(field.as_raw(), raw);
+            assert_eq!(u8::from(field.tone_type()), raw & 0x03);
+            assert_eq!(field.unidentified_bits(), raw >> 2);
+
+            let channel = StoredChannel {
+                cross_tone: field,
+                ..synthetic_stored_channel(Frequency::new(1))
+            };
+            assert_eq!(
+                StoredChannel::from_bytes(&channel.to_bytes())?.cross_tone,
+                field
+            );
+        }
+        assert!(CrossToneField::new(CrossToneField::MAX + 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cross_tone_and_fine_step_wire_values_round_trip() -> TestResult {
+        for raw in 0..CrossToneType::COUNT {
+            let value = CrossToneType::try_from(raw)?;
+            assert_eq!(u8::from(value), raw);
         }
         assert!(CrossToneType::try_from(CrossToneType::COUNT).is_err());
-        Ok(())
-    }
 
-    #[test]
-    fn flash_digital_squelch_round_trip() -> TestResult {
-        for i in 0u8..FlashDigitalSquelch::COUNT {
-            let ds = FlashDigitalSquelch::try_from(i)?;
-            assert_eq!(u8::from(ds), i);
+        for raw in 0..FineStep::COUNT {
+            let value = FineStep::try_from(raw)?;
+            assert_eq!(u8::from(value), raw);
         }
-        assert!(FlashDigitalSquelch::try_from(FlashDigitalSquelch::COUNT).is_err());
+        assert!(FineStep::try_from(FineStep::COUNT).is_err());
         Ok(())
     }
 }

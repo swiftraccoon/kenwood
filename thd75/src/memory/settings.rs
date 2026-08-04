@@ -25,34 +25,69 @@
 //! pair at `0x1084` and the APRS lock triple at `0x120A`. Their setters
 //! perform masked read-modify-write so unrelated bits survive.
 
-// Removed legacy accessors (offsets disproven against the MCP-D75
-// registry and the hardware dump):
-//
-// - `lock`/`set_lock` (0x1060): that byte is `radio.BacklightControl`.
-//   No CAT key-lock state operation is currently verified. The persistent
-//   key-lock *configuration* is the bit pair at 0x1084
-//   (`key_lock`/`frequency_lock` below).
-// - VFO block (0x0020): the hardware dump holds no VFO data there
-//   (entry 0 all-0xFF, entries 1-5 zero). Candidate real VFO records
-//   were observed at 0x0400/0x0430/0x0460 (48-byte stride, second bank
-//   at 0x0600) but remain unverified; no accessor until they are.
-// - `model_name` (0x11D0): unmapped gap after `gps.MyPositionSelect`;
-//   the famous "TH-D75" string lives at 0x10D0 =
-//   `radio.BluetoothDeviceName` (reachable through the registry).
-// - `squelch_a`/`squelch_b` (0x100D/0x100E): squelch is runtime state
-//   (CAT `SQ`), never serialized by MCP-D75; those bytes are the
-//   digital scan-resume and time-restart cells.
-// - `callsign_raw` (0x1300): that offset is
-//   `aprs.StatusTextList[4].StatusText`. D-STAR MY callsigns live in
-//   `dv.MyCallsignDvGatewayList` at 0x1CA8 (see `memory::dstar`).
-
 use crate::error::ValidationError;
 use crate::protocol::programming;
-use crate::types::PowerLevel;
+use crate::types::cw::CwPitch;
+use crate::types::dstar::EmrVolume;
+use crate::types::dtmf::DtmfPause;
+use crate::types::scan::ScanResumeMethod;
 use crate::types::settings::{
-    AltitudeRainUnit, AutoPowerOff, BeatShift, DisplayUnits, Language, SpeedDistanceUnit,
-    TemperatureUnit,
+    AltitudeRainUnit, AmHighCut, AutoMuteReturnDelay, AutoPowerOff, BacklightControl,
+    BacklightTimer, BatterySaverInterval, BeatShift, CwFilterWidth, DisplayUnits, DtmfToneDuration,
+    FrontPanelPfFunction, Language, LinkedVolumeLevel, PcOutputInterface, PowerOnMessage,
+    RepeaterCallKey, ScanRestartDelay, SpeedDistanceUnit, SsbHighCut, StoredFrontPanelPfAssignment,
+    TemperatureUnit, TransmitTimeout, VoiceAnnounceMode, VoiceGuideSpeed,
 };
+use crate::types::{BandMode, CoordinateFormat, GridSquareFormat, PowerLevel, VoxDelay, VoxGain};
+
+/// An invalid or unavailable value in the settings region of an MCP image.
+///
+/// Unlike live CAT parsing, settings access reads bytes that may have come
+/// from a damaged or incompatible image. Callers must be able to distinguish
+/// that state from a legitimate minimum or default selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SettingsValueError {
+    /// The complete memory image did not contain a required setting byte.
+    MissingByte {
+        /// Registry setting name.
+        setting: &'static str,
+        /// Absolute byte offset in the MCP image.
+        offset: usize,
+    },
+    /// A stored byte was outside the setting's declared domain.
+    InvalidValue {
+        /// Registry setting name.
+        setting: &'static str,
+        /// Absolute byte offset in the MCP image.
+        offset: usize,
+        /// Invalid stored byte.
+        value: u8,
+        /// Human-readable accepted domain.
+        detail: &'static str,
+    },
+}
+
+impl std::fmt::Display for SettingsValueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingByte { setting, offset } => {
+                write!(f, "{setting} byte is missing at MCP offset 0x{offset:04X}")
+            }
+            Self::InvalidValue {
+                setting,
+                offset,
+                value,
+                detail,
+            } => write!(
+                f,
+                "{setting} has invalid value {value} at MCP offset 0x{offset:04X} ({detail})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SettingsValueError {}
 
 // ---------------------------------------------------------------------------
 // System settings region (0x0000 - 0x1FFF)
@@ -210,6 +245,10 @@ const SPEED_DISTANCE_UNIT_OFFSET: usize = 0x1088;
 const ALTITUDE_RAIN_UNIT_OFFSET: usize = 0x1089;
 /// `radio.Temperature` (1 byte, 0=°F, 1=°C).
 const TEMPERATURE_UNIT_OFFSET: usize = 0x108A;
+/// `radio.LatitudeLongitude` (1 byte, 0=DD MM.MM, 1=DD MM SS.S).
+const COORDINATE_FORMAT_OFFSET: usize = 0x108B;
+/// `radio.GridSquareFormat` (1 byte, 0=Maidenhead, 1=SAR CONV, 2=SAR CELL).
+const GRID_SQUARE_FORMAT_OFFSET: usize = 0x108C;
 
 // --- Interfaces ---
 /// `radio.PcOutputInterfaceGps` (1 byte, 0=USB, 1=Bluetooth).
@@ -229,26 +268,7 @@ const EMR_VOLUME_LEVEL_OFFSET: usize = 0x1A03;
 /// `radio.PowerOnMessage` (16 bytes, NUL-padded).
 const POWER_ON_MESSAGE_OFFSET: usize = 0x10C0;
 /// Size of the power-on message field.
-const POWER_ON_MESSAGE_SIZE: usize = 16;
-
-/// True when `value` is a member of the gapped `radio.Pf1PfKey` /
-/// `radio.Pf2PfKey` domain (0-30 excluding 5, 23, 25, 26).
-const fn pf_key_valid(value: u8) -> bool {
-    value <= 30 && !matches!(value, 5 | 23 | 25 | 26)
-}
-
-/// Validate a PF-key assignment against the registry's gapped domain.
-const fn validate_pf_key(name: &'static str, value: u8) -> Result<(), ValidationError> {
-    if pf_key_valid(value) {
-        Ok(())
-    } else {
-        Err(ValidationError::SettingOutOfRange {
-            name,
-            value,
-            detail: "must be 0-30, excluding 5, 23, 25, 26",
-        })
-    }
-}
+const POWER_ON_MESSAGE_SIZE: usize = PowerOnMessage::WIRE_LEN;
 
 // ---------------------------------------------------------------------------
 // SettingsAccess (read-only)
@@ -275,19 +295,66 @@ impl<'a> SettingsAccess<'a> {
     ///
     /// Returns `None` if the image is too small.
     #[must_use]
-    pub fn raw(&self) -> Option<&[u8]> {
+    pub fn as_raw(&self) -> Option<&[u8]> {
         let end = SETTINGS_OFFSET + SETTINGS_SIZE;
         self.image.get(SETTINGS_OFFSET..end)
     }
 
-    /// Get the power-on message (`radio.PowerOnMessage`, up to 16
-    /// characters).
+    /// Get the power-on message (`radio.PowerOnMessage`, up to 16 bytes).
     ///
-    /// MCP offset `0x10C0`. Returns the NUL-padded ASCII string with
-    /// padding removed.
-    #[must_use]
-    pub fn power_on_message(&self) -> String {
-        extract_string(self.image, POWER_ON_MESSAGE_OFFSET, POWER_ON_MESSAGE_SIZE)
+    /// MCP offset `0x10C0`. The semantic text is printable ASCII
+    /// (`0x20`-`0x7E`) and the remainder of the fixed field is NUL-padded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the image is incomplete, a semantic
+    /// byte is outside printable ASCII, or bytes after the first NUL are
+    /// nonzero.
+    pub fn power_on_message(&self) -> Result<PowerOnMessage, SettingsValueError> {
+        let end = POWER_ON_MESSAGE_OFFSET + POWER_ON_MESSAGE_SIZE;
+        let bytes = self.image.get(POWER_ON_MESSAGE_OFFSET..end).ok_or(
+            SettingsValueError::MissingByte {
+                setting: "radio.PowerOnMessage",
+                offset: end - 1,
+            },
+        )?;
+        let wire = <[u8; PowerOnMessage::WIRE_LEN]>::try_from(bytes).map_err(|_| {
+            SettingsValueError::MissingByte {
+                setting: "radio.PowerOnMessage",
+                offset: end - 1,
+            }
+        })?;
+
+        PowerOnMessage::try_from_wire(wire).map_err(|error| match error {
+            ValidationError::InvalidPowerOnMessageByte { offset, value } => {
+                SettingsValueError::InvalidValue {
+                    setting: "radio.PowerOnMessage",
+                    offset: POWER_ON_MESSAGE_OFFSET + offset,
+                    value,
+                    detail: "text bytes must be printable ASCII 0x20-0x7E",
+                }
+            }
+            ValidationError::PowerOnMessageDataAfterNul { offset, value, .. } => {
+                SettingsValueError::InvalidValue {
+                    setting: "radio.PowerOnMessage",
+                    offset: POWER_ON_MESSAGE_OFFSET + offset,
+                    value,
+                    detail: "bytes after the first NUL must be NUL padding",
+                }
+            }
+            ValidationError::PowerOnMessageTooLong { .. } => SettingsValueError::InvalidValue {
+                setting: "radio.PowerOnMessage",
+                offset: POWER_ON_MESSAGE_OFFSET,
+                value: 0,
+                detail: "text exceeds the fixed 16-byte field",
+            },
+            _ => SettingsValueError::InvalidValue {
+                setting: "radio.PowerOnMessage",
+                offset: POWER_ON_MESSAGE_OFFSET,
+                value: 0,
+                detail: "text is outside the power-on message domain",
+            },
+        })
     }
 
     /// Read an arbitrary byte range from the settings region.
@@ -296,8 +363,60 @@ impl<'a> SettingsAccess<'a> {
     /// address). Returns `None` if the range extends past the image.
     #[must_use]
     pub fn read_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
-        let end = offset + len;
+        let end = offset.checked_add(len)?;
         self.image.get(offset..end)
+    }
+
+    fn setting_byte(&self, setting: &'static str, offset: usize) -> Result<u8, SettingsValueError> {
+        self.image
+            .get(offset)
+            .copied()
+            .ok_or(SettingsValueError::MissingByte { setting, offset })
+    }
+
+    fn setting_value<T>(
+        &self,
+        setting: &'static str,
+        offset: usize,
+        detail: &'static str,
+    ) -> Result<T, SettingsValueError>
+    where
+        T: TryFrom<u8>,
+    {
+        let raw = self.setting_byte(setting, offset)?;
+        T::try_from(raw).map_err(|_| SettingsValueError::InvalidValue {
+            setting,
+            offset,
+            value: raw,
+            detail,
+        })
+    }
+
+    fn setting_bool(
+        &self,
+        setting: &'static str,
+        offset: usize,
+    ) -> Result<bool, SettingsValueError> {
+        let raw = self.setting_byte(setting, offset)?;
+        match raw {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(SettingsValueError::InvalidValue {
+                setting,
+                offset,
+                value: raw,
+                detail: "must be 0 or 1",
+            }),
+        }
+    }
+
+    fn setting_bit(
+        &self,
+        setting: &'static str,
+        offset: usize,
+        mask: u8,
+    ) -> Result<bool, SettingsValueError> {
+        Ok(self.setting_byte(setting, offset)? & mask != 0)
     }
 
     // -----------------------------------------------------------------------
@@ -306,460 +425,540 @@ impl<'a> SettingsAccess<'a> {
 
     /// Read the beat-shift type (`radio.BeatShift`).
     ///
-    /// MCP offset `0x1000`. Returns [`BeatShift::Type1`] if the byte is
-    /// out of range or unreadable.
-    #[must_use]
-    pub fn beat_shift(&self) -> BeatShift {
-        self.image
-            .get(BEAT_SHIFT_OFFSET)
-            .copied()
-            .and_then(|b| BeatShift::try_from(b).ok())
-            .unwrap_or(BeatShift::Type1)
+    /// MCP offset `0x1000`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn beat_shift(&self) -> Result<BeatShift, SettingsValueError> {
+        self.setting_value("radio.BeatShift", BEAT_SHIFT_OFFSET, "must be 0-7")
     }
 
-    /// Read TX inhibit (`radio.TxInhibit`; false if unreadable).
+    /// Read TX inhibit (`radio.TxInhibit`).
     ///
     /// MCP offset `0x1001`.
-    #[must_use]
-    pub fn tx_inhibit(&self) -> bool {
-        self.image.get(TX_INHIBIT_OFFSET).is_some_and(|&b| b != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or is not 0 or 1.
+    pub fn tx_inhibit(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bool("radio.TxInhibit", TX_INHIBIT_OFFSET)
     }
 
-    /// Read the TX timeout timer index (`radio.TimeOutTimer`, 0-10; 0
-    /// if unreadable).
+    /// Read the TX timeout selection (`radio.TimeOutTimer`).
     ///
     /// MCP offset `0x1003`. Indexes the table 0.5, 1.0, 1.5, 2.0, 2.5,
     /// 3.0, 3.5, 4.0, 4.5, 5.0, 10.0 minutes, NOT a minute count.
-    #[must_use]
-    pub fn timeout_timer(&self) -> u8 {
-        self.image
-            .get(TIMEOUT_TIMER_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(10))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn timeout_timer(&self) -> Result<TransmitTimeout, SettingsValueError> {
+        self.setting_value("radio.TimeOutTimer", TIMEOUT_TIMER_OFFSET, "must be 0-10")
     }
 
-    /// Read microphone sensitivity (`radio.MicSensitivity`, 0-2; 0 if
-    /// unreadable).
+    /// Read microphone sensitivity (`radio.MicSensitivity`).
     ///
     /// MCP offset `0x1006`. The encoding is inverted versus intuition:
     /// **0=High, 1=Medium, 2=Low**.
-    #[must_use]
-    pub fn mic_sensitivity(&self) -> u8 {
-        self.image
-            .get(MIC_SENSITIVITY_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(2))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn mic_sensitivity(
+        &self,
+    ) -> Result<crate::types::settings::MicSensitivity, SettingsValueError> {
+        self.setting_value(
+            "radio.MicSensitivity",
+            MIC_SENSITIVITY_OFFSET,
+            "must be 0-2",
+        )
     }
 
-    /// Read the SSB high-cut filter (`radio.SsbHighCut`, 0-4 =
-    /// 2.2/2.4/2.6/2.8/3.0 kHz; 0 if unreadable).
+    /// Read the SSB high-cut filter (`radio.SsbHighCut`).
     ///
     /// MCP offset `0x1008`.
-    #[must_use]
-    pub fn ssb_high_cut(&self) -> u8 {
-        self.image
-            .get(SSB_HIGH_CUT_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(4))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn ssb_high_cut(&self) -> Result<SsbHighCut, SettingsValueError> {
+        self.setting_value("radio.SsbHighCut", SSB_HIGH_CUT_OFFSET, "must be 0-4")
     }
 
-    /// Read the CW filter width (`radio.CwWidth`, 0-4 =
-    /// 0.3/0.5/1.0/1.5/2.0 kHz; 0 if unreadable).
+    /// Read the CW filter width (`radio.CwWidth`).
     ///
     /// MCP offset `0x1009`. The D75 menu calls this "CW Width" (it was
     /// previously misnamed "CW high cut" here).
-    #[must_use]
-    pub fn cw_width(&self) -> u8 {
-        self.image
-            .get(CW_WIDTH_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(4))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn cw_width(&self) -> Result<CwFilterWidth, SettingsValueError> {
+        self.setting_value("radio.CwWidth", CW_WIDTH_OFFSET, "must be 0-4")
     }
 
-    /// Read the AM high-cut filter (`radio.AmHighCut`, 0-3 =
-    /// 3.0/4.5/6.0/7.5 kHz; 0 if unreadable).
+    /// Read the AM high-cut filter (`radio.AmHighCut`).
     ///
     /// MCP offset `0x100A`.
-    #[must_use]
-    pub fn am_high_cut(&self) -> u8 {
-        self.image
-            .get(AM_HIGH_CUT_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(3))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn am_high_cut(&self) -> Result<AmHighCut, SettingsValueError> {
+        self.setting_value("radio.AmHighCut", AM_HIGH_CUT_OFFSET, "must be 0-3")
     }
 
     // -----------------------------------------------------------------------
     // Scan
     // -----------------------------------------------------------------------
 
-    /// Read the analog scan-resume method (`radio.ScanResumeAnalog`,
-    /// 0=Time, 1=Carrier, 2=Seek; 0 if unreadable).
+    /// Read the analog scan-resume method (`radio.ScanResumeAnalog`).
     ///
     /// MCP offset `0x100C`.
-    #[must_use]
-    pub fn scan_resume(&self) -> u8 {
-        self.image
-            .get(SCAN_RESUME_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(2))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn scan_resume(&self) -> Result<ScanResumeMethod, SettingsValueError> {
+        self.setting_value("radio.ScanResumeAnalog", SCAN_RESUME_OFFSET, "must be 0-2")
     }
 
-    /// Read the digital scan-resume method (`radio.ScanResumeDigital`,
-    /// 0=Time, 1=Carrier, 2=Seek; 0 if unreadable).
+    /// Read the digital scan-resume method (`radio.ScanResumeDigital`).
     ///
     /// MCP offset `0x100D`.
-    #[must_use]
-    pub fn digital_scan_resume(&self) -> u8 {
-        self.image
-            .get(DIGITAL_SCAN_RESUME_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(2))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn digital_scan_resume(&self) -> Result<ScanResumeMethod, SettingsValueError> {
+        self.setting_value(
+            "radio.ScanResumeDigital",
+            DIGITAL_SCAN_RESUME_OFFSET,
+            "must be 0-2",
+        )
     }
 
-    /// Read the time-operated scan restart time (`radio.TimeRestart`,
-    /// 1-10 seconds; 0 if unreadable).
+    /// Read the time-operated scan restart time (`radio.TimeRestart`).
     ///
     /// MCP offset `0x100E`.
-    #[must_use]
-    pub fn scan_restart_time(&self) -> u8 {
-        self.image
-            .get(SCAN_RESTART_TIME_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(10))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn scan_restart_time(&self) -> Result<ScanRestartDelay, SettingsValueError> {
+        self.setting_value(
+            "radio.TimeRestart",
+            SCAN_RESTART_TIME_OFFSET,
+            "must be 1-10 seconds",
+        )
     }
 
     /// Read the carrier-operated scan restart time
-    /// (`radio.CarrierRestart`, 1-10 seconds; 0 if unreadable).
+    /// (`radio.CarrierRestart`).
     ///
     /// MCP offset `0x100F`.
-    #[must_use]
-    pub fn scan_restart_carrier(&self) -> u8 {
-        self.image
-            .get(SCAN_RESTART_CARRIER_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(10))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn scan_restart_carrier(&self) -> Result<ScanRestartDelay, SettingsValueError> {
+        self.setting_value(
+            "radio.CarrierRestart",
+            SCAN_RESTART_CARRIER_OFFSET,
+            "must be 1-10 seconds",
+        )
     }
 
     // -----------------------------------------------------------------------
     // Repeater
     // -----------------------------------------------------------------------
 
-    /// Read repeater auto offset (`radio.AutoOffset`; false if
-    /// unreadable).
+    /// Read repeater auto offset (`radio.AutoOffset`).
     ///
     /// MCP offset `0x1018`.
-    #[must_use]
-    pub fn repeater_auto_offset(&self) -> bool {
-        self.image
-            .get(REPEATER_AUTO_OFFSET_OFFSET)
-            .is_some_and(|&b| b != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or is not 0 or 1.
+    pub fn repeater_auto_offset(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bool("radio.AutoOffset", REPEATER_AUTO_OFFSET_OFFSET)
     }
 
-    /// Read the CALL key function (`radio.CallKey`, 0=CALL, 1=1750 Hz;
-    /// 0 if unreadable).
+    /// Read the CALL key function (`radio.CallKey`).
     ///
     /// MCP offset `0x1019`.
-    #[must_use]
-    pub fn repeater_call_key(&self) -> u8 {
-        self.image
-            .get(REPEATER_CALL_KEY_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(1))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn repeater_call_key(&self) -> Result<RepeaterCallKey, SettingsValueError> {
+        self.setting_value("radio.CallKey", REPEATER_CALL_KEY_OFFSET, "must be 0-1")
     }
 
     // -----------------------------------------------------------------------
     // VOX
     // -----------------------------------------------------------------------
 
-    /// Read VOX enabled (`radio.Vox`; false if unreadable).
+    /// Read VOX enabled (`radio.Vox`).
     ///
     /// MCP offset `0x101B`. Hardware verified.
-    #[must_use]
-    pub fn vox_enabled(&self) -> bool {
-        self.image.get(VOX_ENABLED_OFFSET).is_some_and(|&b| b != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or is not 0 or 1.
+    pub fn vox_enabled(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bool("radio.Vox", VOX_ENABLED_OFFSET)
     }
 
-    /// Read VOX gain (`radio.VoxGain`, 0-9; 0 if unreadable).
+    /// Read VOX gain (`radio.VoxGain`, 0-9).
     ///
     /// MCP offset `0x101C`. Hardware verified.
-    #[must_use]
-    pub fn vox_gain(&self) -> u8 {
-        self.image
-            .get(VOX_GAIN_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(9))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] rather than silently clamping an invalid
+    /// stored byte or inventing a value for an incomplete image.
+    pub fn vox_gain(&self) -> Result<VoxGain, SettingsValueError> {
+        let raw = self.setting_byte("radio.VoxGain", VOX_GAIN_OFFSET)?;
+        VoxGain::new(raw).map_err(|_| SettingsValueError::InvalidValue {
+            setting: "radio.VoxGain",
+            offset: VOX_GAIN_OFFSET,
+            value: raw,
+            detail: "must be 0-9",
+        })
     }
 
-    /// Read the VOX delay index (`radio.VoxDelay`, 0-6; 0 if
-    /// unreadable).
+    /// Read the VOX delay selection (`radio.VoxDelay`, raw index 0-6).
     ///
     /// MCP offset `0x101D`. Indexes the table 250, 500, 750, 1000,
     /// 1500, 2000, 3000 ms, NOT a 100 ms unit count.
-    #[must_use]
-    pub fn vox_delay(&self) -> u8 {
-        self.image
-            .get(VOX_DELAY_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(6))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] rather than silently clamping an invalid
+    /// stored byte or inventing a value for an incomplete image.
+    pub fn vox_delay(&self) -> Result<VoxDelay, SettingsValueError> {
+        let raw = self.setting_byte("radio.VoxDelay", VOX_DELAY_OFFSET)?;
+        VoxDelay::new(raw).map_err(|_| SettingsValueError::InvalidValue {
+            setting: "radio.VoxDelay",
+            offset: VOX_DELAY_OFFSET,
+            value: raw,
+            detail: "raw index must be 0-6",
+        })
     }
 
-    /// Read VOX TX-on-busy (`radio.VoxTxOnBusy`; false if unreadable).
+    /// Read VOX TX-on-busy (`radio.VoxTxOnBusy`).
     ///
     /// MCP offset `0x101E`.
-    #[must_use]
-    pub fn vox_tx_on_busy(&self) -> bool {
-        self.image
-            .get(VOX_TX_ON_BUSY_OFFSET)
-            .is_some_and(|&b| b != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or is not 0 or 1.
+    pub fn vox_tx_on_busy(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bool("radio.VoxTxOnBusy", VOX_TX_ON_BUSY_OFFSET)
     }
 
     // -----------------------------------------------------------------------
     // DTMF
     // -----------------------------------------------------------------------
 
-    /// Read DTMF speed (`radio.DtmfSpeed`, 0-2 = 50/100/150 ms; 0 if
-    /// unreadable).
+    /// Read DTMF tone duration (`radio.DtmfSpeed`).
     ///
     /// MCP offset `0x101F`.
-    #[must_use]
-    pub fn dtmf_speed(&self) -> u8 {
-        self.image
-            .get(DTMF_SPEED_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(2))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn dtmf_speed(&self) -> Result<DtmfToneDuration, SettingsValueError> {
+        self.setting_value("radio.DtmfSpeed", DTMF_SPEED_OFFSET, "must be 0-2")
     }
 
-    /// Read DTMF pause time (`radio.DtmfPauseTime`, 0-6 =
-    /// 100/250/500/750/1000/1500/2000 ms; 0 if unreadable).
+    /// Read DTMF pause time (`radio.DtmfPauseTime`).
     ///
     /// MCP offset `0x1020`.
-    #[must_use]
-    pub fn dtmf_pause_time(&self) -> u8 {
-        self.image
-            .get(DTMF_PAUSE_TIME_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(6))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn dtmf_pause_time(&self) -> Result<DtmfPause, SettingsValueError> {
+        let raw = self.setting_byte("radio.DtmfPauseTime", DTMF_PAUSE_TIME_OFFSET)?;
+        match raw {
+            0 => Ok(DtmfPause::Ms100),
+            1 => Ok(DtmfPause::Ms250),
+            2 => Ok(DtmfPause::Ms500),
+            3 => Ok(DtmfPause::Ms750),
+            4 => Ok(DtmfPause::Ms1000),
+            5 => Ok(DtmfPause::Ms1500),
+            6 => Ok(DtmfPause::Ms2000),
+            _ => Err(SettingsValueError::InvalidValue {
+                setting: "radio.DtmfPauseTime",
+                offset: DTMF_PAUSE_TIME_OFFSET,
+                value: raw,
+                detail: "must be 0-6",
+            }),
+        }
     }
 
-    /// Read DTMF TX hold (`radio.DtmfTxHold`; false if unreadable).
+    /// Read DTMF TX hold (`radio.DtmfTxHold`).
     ///
     /// MCP offset `0x1021`.
-    #[must_use]
-    pub fn dtmf_tx_hold(&self) -> bool {
-        self.image.get(DTMF_TX_HOLD_OFFSET).is_some_and(|&b| b != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or is not 0 or 1.
+    pub fn dtmf_tx_hold(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bool("radio.DtmfTxHold", DTMF_TX_HOLD_OFFSET)
     }
 
     // -----------------------------------------------------------------------
     // CW receive
     // -----------------------------------------------------------------------
 
-    /// Read the CW pitch index (`radio.CwPitchFreq`, 0-6; 0 if
-    /// unreadable).
+    /// Read the CW pitch (`radio.CwPitchFreq`).
     ///
     /// MCP offset `0x1024`.
-    #[must_use]
-    pub fn cw_pitch(&self) -> u8 {
-        self.image
-            .get(CW_PITCH_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(6))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn cw_pitch(&self) -> Result<CwPitch, SettingsValueError> {
+        let raw = self.setting_byte("radio.CwPitchFreq", CW_PITCH_OFFSET)?;
+        let hz = 400 + u16::from(raw) * 100;
+        CwPitch::new(hz).map_err(|_| SettingsValueError::InvalidValue {
+            setting: "radio.CwPitchFreq",
+            offset: CW_PITCH_OFFSET,
+            value: raw,
+            detail: "must be 0-6 (400-1000 Hz)",
+        })
     }
 
     // -----------------------------------------------------------------------
     // Audio
     // -----------------------------------------------------------------------
 
-    /// Read the auto-mute return time (`radio.AutoMuteRetTime`, 1-10;
-    /// 0 if unreadable).
+    /// Read the auto-mute return time (`radio.AutoMuteRetTime`).
     ///
     /// MCP offset `0x1041`.
-    #[must_use]
-    pub fn auto_mute_return_time(&self) -> u8 {
-        self.image
-            .get(AUTO_MUTE_RETURN_TIME_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(10))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn auto_mute_return_time(&self) -> Result<AutoMuteReturnDelay, SettingsValueError> {
+        self.setting_value(
+            "radio.AutoMuteRetTime",
+            AUTO_MUTE_RETURN_TIME_OFFSET,
+            "must be 1-10 seconds",
+        )
     }
 
-    /// Read the EMR volume level (`dv.EmrVolumeLevelTxRx`, 1-50; 0 if
-    /// unreadable).
+    /// Read the EMR volume level (`dv.EmrVolumeLevelTxRx`).
     ///
     /// MCP offset `0x1A03`.
-    #[must_use]
-    pub fn emr_volume_level(&self) -> u8 {
-        self.image
-            .get(EMR_VOLUME_LEVEL_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(50))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn emr_volume_level(&self) -> Result<EmrVolume, SettingsValueError> {
+        let raw = self.setting_byte("dv.EmrVolumeLevelTxRx", EMR_VOLUME_LEVEL_OFFSET)?;
+        EmrVolume::new(raw).map_err(|_| SettingsValueError::InvalidValue {
+            setting: "dv.EmrVolumeLevelTxRx",
+            offset: EMR_VOLUME_LEVEL_OFFSET,
+            value: raw,
+            detail: "must be 1-50",
+        })
     }
 
     // -----------------------------------------------------------------------
     // Display
     // -----------------------------------------------------------------------
 
-    /// Read backlight control (`radio.BacklightControl`, 0=Manual,
-    /// 1=On, 2=Auto, 3=Auto (DC-IN); 0 if unreadable).
+    /// Read backlight control (`radio.BacklightControl`).
     ///
     /// MCP offset `0x1060`.
-    #[must_use]
-    pub fn backlight_control(&self) -> u8 {
-        self.image
-            .get(BACKLIGHT_CONTROL_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(3))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn backlight_control(&self) -> Result<BacklightControl, SettingsValueError> {
+        self.setting_value(
+            "radio.BacklightControl",
+            BACKLIGHT_CONTROL_OFFSET,
+            "must be 0-3",
+        )
     }
 
-    /// Read the backlight timer (`radio.BacklightTimer`, 3-60 seconds;
-    /// 0 if unreadable).
+    /// Read the backlight timer (`radio.BacklightTimer`).
     ///
     /// MCP offset `0x1061`.
-    #[must_use]
-    pub fn backlight_timer(&self) -> u8 {
-        self.image
-            .get(BACKLIGHT_TIMER_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(60))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn backlight_timer(&self) -> Result<BacklightTimer, SettingsValueError> {
+        self.setting_value(
+            "radio.BacklightTimer",
+            BACKLIGHT_TIMER_OFFSET,
+            "must be 3-60 seconds",
+        )
     }
 
     // -----------------------------------------------------------------------
     // Beep / voice guidance
     // -----------------------------------------------------------------------
 
-    /// Read key beep (`radio.Beep`; false if unreadable).
+    /// Read key beep (`radio.Beep`).
     ///
     /// MCP offset `0x1071`. Hardware verified.
-    #[must_use]
-    pub fn key_beep(&self) -> bool {
-        self.image.get(KEY_BEEP_OFFSET).is_some_and(|&b| b != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or is not 0 or 1.
+    pub fn key_beep(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bool("radio.Beep", KEY_BEEP_OFFSET)
     }
 
-    /// Read beep volume (`radio.BeepVolume`, 0-7; 0 if unreadable).
+    /// Read beep volume (`radio.BeepVolume`).
     ///
     /// MCP offset `0x1072`. **0 is a legal value meaning "VOL Link"**
     /// (beep follows the main volume); 1-7 are fixed levels.
-    #[must_use]
-    pub fn beep_volume(&self) -> u8 {
-        self.image
-            .get(BEEP_VOLUME_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(7))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn beep_volume(&self) -> Result<LinkedVolumeLevel, SettingsValueError> {
+        self.setting_value(
+            "radio.BeepVolume",
+            BEEP_VOLUME_OFFSET,
+            "must be 0-7, where 0 means VOL Link",
+        )
     }
 
-    /// Read the voice announce mode (`radio.VoiceAnnounce`, 0=Off,
-    /// 1=Manual, 2=Auto1, 3=Auto2; 0 if unreadable).
+    /// Read the voice announce mode (`radio.VoiceAnnounce`).
     ///
     /// MCP offset `0x1073`.
-    #[must_use]
-    pub fn announce(&self) -> u8 {
-        self.image
-            .get(ANNOUNCE_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(3))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn announce(&self) -> Result<VoiceAnnounceMode, SettingsValueError> {
+        self.setting_value("radio.VoiceAnnounce", ANNOUNCE_OFFSET, "must be 0-3")
     }
 
-    /// Read the voice announce volume (`radio.VoiceAnnounceVolume`,
-    /// 0-7; 0 if unreadable).
+    /// Read the voice announce volume (`radio.VoiceAnnounceVolume`).
     ///
     /// MCP offset `0x1074`. **0 is a legal value meaning "VOL Link"**;
     /// 1-7 are fixed levels.
-    #[must_use]
-    pub fn voice_volume(&self) -> u8 {
-        self.image
-            .get(VOICE_VOLUME_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(7))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn voice_volume(&self) -> Result<LinkedVolumeLevel, SettingsValueError> {
+        self.setting_value(
+            "radio.VoiceAnnounceVolume",
+            VOICE_VOLUME_OFFSET,
+            "must be 0-7, where 0 means VOL Link",
+        )
     }
 
-    /// Read the voice guidance speed (`radio.VoiceGuidanceSpeed`, 0-3 =
-    /// Speed 1-4; 0 if unreadable).
+    /// Read the voice guidance speed (`radio.VoiceGuidanceSpeed`).
     ///
     /// MCP offset `0x1097`.
-    #[must_use]
-    pub fn voice_speed(&self) -> u8 {
-        self.image
-            .get(VOICE_SPEED_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(3))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn voice_speed(&self) -> Result<VoiceGuideSpeed, SettingsValueError> {
+        self.setting_value(
+            "radio.VoiceGuidanceSpeed",
+            VOICE_SPEED_OFFSET,
+            "must be 0-3",
+        )
     }
 
     // -----------------------------------------------------------------------
     // Battery / power
     // -----------------------------------------------------------------------
 
-    /// Read the battery saver interval index (`radio.BatterySaver`,
-    /// 0=Off, 1-9 select 0.2-5.0 s; 0 if unreadable).
+    /// Read the battery saver interval (`radio.BatterySaver`).
     ///
     /// MCP offset `0x1076`. This is a 10-value selector, not an on/off
     /// switch.
-    #[must_use]
-    pub fn battery_saver(&self) -> u8 {
-        self.image
-            .get(BATTERY_SAVER_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(9))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn battery_saver(&self) -> Result<BatterySaverInterval, SettingsValueError> {
+        self.setting_value("radio.BatterySaver", BATTERY_SAVER_OFFSET, "must be 0-9")
     }
 
     /// Read auto power off (`radio.AutoPowerOff`).
     ///
-    /// MCP offset `0x1077`. Returns [`AutoPowerOff::Off`] if the byte
-    /// is out of range or unreadable.
-    #[must_use]
-    pub fn auto_power_off(&self) -> AutoPowerOff {
-        self.image
-            .get(AUTO_POWER_OFF_OFFSET)
-            .copied()
-            .and_then(|b| AutoPowerOff::try_from(b).ok())
-            .unwrap_or(AutoPowerOff::Off)
+    /// MCP offset `0x1077`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn auto_power_off(&self) -> Result<AutoPowerOff, SettingsValueError> {
+        self.setting_value("radio.AutoPowerOff", AUTO_POWER_OFF_OFFSET, "must be 0-3")
     }
 
     // -----------------------------------------------------------------------
     // Bluetooth
     // -----------------------------------------------------------------------
 
-    /// Read Bluetooth on/off (`radio.BluetoothOnOff`; false if
-    /// unreadable).
+    /// Read Bluetooth on/off (`radio.BluetoothOnOff`).
     ///
     /// MCP offset `0x1078`. Hardware verified.
-    #[must_use]
-    pub fn bluetooth(&self) -> bool {
-        self.image.get(BLUETOOTH_OFFSET).is_some_and(|&b| b != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or is not 0 or 1.
+    pub fn bluetooth(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bool("radio.BluetoothOnOff", BLUETOOTH_OFFSET)
     }
 
-    /// Read Bluetooth auto-connect (`radio.BluetoothAutoConnect`;
-    /// false if unreadable).
+    /// Read Bluetooth auto-connect (`radio.BluetoothAutoConnect`).
     ///
     /// MCP offset `0x1079`.
-    #[must_use]
-    pub fn bt_auto_connect(&self) -> bool {
-        self.image
-            .get(BT_AUTO_CONNECT_OFFSET)
-            .is_some_and(|&b| b != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or is not 0 or 1.
+    pub fn bt_auto_connect(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bool("radio.BluetoothAutoConnect", BT_AUTO_CONNECT_OFFSET)
     }
 
     // -----------------------------------------------------------------------
     // PF keys
     // -----------------------------------------------------------------------
 
-    /// Read the exact stored PF1 key assignment byte
-    /// (`radio.Pf1PfKey`; 0 if unreadable).
+    /// Read the exact stored PF1 key assignment (`radio.Pf1PfKey`).
     ///
     /// MCP offset `0x107A`. The official writable domain is 0-30 with
     /// gaps, but hardware probes may leave a known off-menu function code
     /// such as 31 (Screen Capture). Reads preserve such values exactly;
-    /// [`SettingsWriter::set_pf_key1`] still enforces the official domain.
-    #[must_use]
-    pub fn pf_key1(&self) -> u8 {
-        self.image.get(PF_KEY1_OFFSET).copied().unwrap_or_default()
+    /// [`SettingsWriter::set_pf_key1`] accepts only official assignments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing.
+    pub fn pf_key1(&self) -> Result<StoredFrontPanelPfAssignment, SettingsValueError> {
+        self.setting_byte("radio.Pf1PfKey", PF_KEY1_OFFSET)
+            .map(StoredFrontPanelPfAssignment::from)
     }
 
-    /// Read the exact stored PF2 key assignment byte
-    /// (`radio.Pf2PfKey`; 0 if unreadable).
+    /// Read the exact stored PF2 key assignment (`radio.Pf2PfKey`).
     ///
     /// MCP offset `0x107B`. Reads preserve values outside the official
     /// writable domain so diagnostics cannot silently misreport them.
-    #[must_use]
-    pub fn pf_key2(&self) -> u8 {
-        self.image.get(PF_KEY2_OFFSET).copied().unwrap_or_default()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing.
+    pub fn pf_key2(&self) -> Result<StoredFrontPanelPfAssignment, SettingsValueError> {
+        self.setting_byte("radio.Pf2PfKey", PF_KEY2_OFFSET)
+            .map(StoredFrontPanelPfAssignment::from)
     }
 
     // -----------------------------------------------------------------------
@@ -767,69 +966,83 @@ impl<'a> SettingsAccess<'a> {
     // -----------------------------------------------------------------------
 
     /// Read the key-lock configuration bit
-    /// (`radio.KeyLockTypeKeyLock`; false if unreadable).
+    /// (`radio.KeyLockTypeKeyLock`).
     ///
     /// MCP offset `0x1084`, bit `0x01`. This is the "Key Lock"
     /// checkbox of the lock-type menu, not the runtime lock state (the
     /// latter is CAT `LC`/`DL`).
-    #[must_use]
-    pub fn key_lock(&self) -> bool {
-        self.image
-            .get(KEY_LOCK_OFFSET)
-            .is_some_and(|&b| b & KEY_LOCK_KEY_MASK != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the shared byte is missing.
+    pub fn key_lock(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bit(
+            "radio.KeyLockTypeKeyLock",
+            KEY_LOCK_OFFSET,
+            KEY_LOCK_KEY_MASK,
+        )
     }
 
     /// Read the frequency-lock configuration bit
     /// (`radio.KeyLockTypeFrequencyLock`; false if unreadable).
     ///
     /// MCP offset `0x1084`, bit `0x02`.
-    #[must_use]
-    pub fn frequency_lock(&self) -> bool {
-        self.image
-            .get(KEY_LOCK_OFFSET)
-            .is_some_and(|&b| b & KEY_LOCK_FREQUENCY_MASK != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the shared byte is missing.
+    pub fn frequency_lock(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bit(
+            "radio.KeyLockTypeFrequencyLock",
+            KEY_LOCK_OFFSET,
+            KEY_LOCK_FREQUENCY_MASK,
+        )
     }
 
-    /// Read volume lock (`radio.VolumeLockOnOff`; false if
-    /// unreadable).
+    /// Read volume lock (`radio.VolumeLockOnOff`).
     ///
     /// MCP offset `0x1087`.
-    #[must_use]
-    pub fn volume_lock(&self) -> bool {
-        self.image.get(VOLUME_LOCK_OFFSET).is_some_and(|&b| b != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or is not 0 or 1.
+    pub fn volume_lock(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bool("radio.VolumeLockOnOff", VOLUME_LOCK_OFFSET)
     }
 
-    /// Read the APRS-lock frequency bit (`aprs.Frequency`; false if
-    /// unreadable).
+    /// Read the APRS-lock frequency bit (`aprs.Frequency`).
     ///
     /// MCP offset `0x120A`, bit `0x01`. Part of the APRS key-lock
     /// checkbox set.
-    #[must_use]
-    pub fn aprs_lock_frequency(&self) -> bool {
-        self.image
-            .get(APRS_LOCK_OFFSET)
-            .is_some_and(|&b| b & APRS_LOCK_FREQUENCY_MASK != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the shared byte is missing.
+    pub fn aprs_lock_frequency(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bit("aprs.Frequency", APRS_LOCK_OFFSET, APRS_LOCK_FREQUENCY_MASK)
     }
 
     /// Read the APRS-lock PTT bit (`aprs.Ptt`; false if unreadable).
     ///
     /// MCP offset `0x120A`, bit `0x02`.
-    #[must_use]
-    pub fn aprs_lock_ptt(&self) -> bool {
-        self.image
-            .get(APRS_LOCK_OFFSET)
-            .is_some_and(|&b| b & APRS_LOCK_PTT_MASK != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the shared byte is missing.
+    pub fn aprs_lock_ptt(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bit("aprs.Ptt", APRS_LOCK_OFFSET, APRS_LOCK_PTT_MASK)
     }
 
     /// Read the APRS-lock APRS-key bit (`aprs.AprsKey`; false if
     /// unreadable).
     ///
     /// MCP offset `0x120A`, bit `0x04`.
-    #[must_use]
-    pub fn aprs_lock_key(&self) -> bool {
-        self.image
-            .get(APRS_LOCK_OFFSET)
-            .is_some_and(|&b| b & APRS_LOCK_KEY_MASK != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the shared byte is missing.
+    pub fn aprs_lock_key(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bit("aprs.AprsKey", APRS_LOCK_OFFSET, APRS_LOCK_KEY_MASK)
     }
 
     // -----------------------------------------------------------------------
@@ -837,89 +1050,88 @@ impl<'a> SettingsAccess<'a> {
     // -----------------------------------------------------------------------
 
     /// Read display unit settings (`radio.SpeedDistance`,
-    /// `radio.AltitudeRain`, `radio.Temperature`).
+    /// `radio.AltitudeRain`, `radio.Temperature`, `radio.LatitudeLongitude`,
+    /// and `radio.GridSquareFormat`).
     ///
-    /// MCP offsets `0x1088` (speed/distance), `0x1089` (altitude/rain),
-    /// `0x108A` (temperature).
-    #[must_use]
-    pub fn display_units(&self) -> DisplayUnits {
-        let speed_distance = match self
-            .image
-            .get(SPEED_DISTANCE_UNIT_OFFSET)
-            .copied()
-            .unwrap_or(0)
-        {
-            1 => SpeedDistanceUnit::KilometersPerHour,
-            2 => SpeedDistanceUnit::Knots,
-            _ => SpeedDistanceUnit::MilesPerHour,
-        };
-
-        let altitude_rain = match self
-            .image
-            .get(ALTITUDE_RAIN_UNIT_OFFSET)
-            .copied()
-            .unwrap_or(0)
-        {
-            1 => AltitudeRainUnit::MetersMm,
-            _ => AltitudeRainUnit::FeetInch,
-        };
-
-        let temperature = match self
-            .image
-            .get(TEMPERATURE_UNIT_OFFSET)
-            .copied()
-            .unwrap_or(0)
-        {
-            1 => TemperatureUnit::Celsius,
-            _ => TemperatureUnit::Fahrenheit,
-        };
-
-        DisplayUnits {
-            speed_distance,
-            altitude_rain,
-            temperature,
-        }
+    /// MCP offsets `0x1088` through `0x108C`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if any byte is missing or invalid.
+    pub fn display_units(&self) -> Result<DisplayUnits, SettingsValueError> {
+        Ok(DisplayUnits {
+            speed_distance: self.setting_value(
+                "radio.SpeedDistance",
+                SPEED_DISTANCE_UNIT_OFFSET,
+                "must be 0-2",
+            )?,
+            altitude_rain: self.setting_value(
+                "radio.AltitudeRain",
+                ALTITUDE_RAIN_UNIT_OFFSET,
+                "must be 0-1",
+            )?,
+            temperature: self.setting_value(
+                "radio.Temperature",
+                TEMPERATURE_UNIT_OFFSET,
+                "must be 0-1",
+            )?,
+            coordinates: self.setting_value(
+                "radio.LatitudeLongitude",
+                COORDINATE_FORMAT_OFFSET,
+                "must be 0-1",
+            )?,
+            grid_square: self.setting_value(
+                "radio.GridSquareFormat",
+                GRID_SQUARE_FORMAT_OFFSET,
+                "must be 0-2",
+            )?,
+        })
     }
 
     /// Read language (`radio.Language`).
     ///
-    /// MCP offset `0x1092`. Returns [`Language::English`] if the byte
-    /// is out of range or unreadable.
-    #[must_use]
-    pub fn language(&self) -> Language {
-        match self.image.get(LANGUAGE_OFFSET).copied().unwrap_or(0) {
-            1 => Language::Japanese,
-            _ => Language::English,
-        }
+    /// MCP offset `0x1092`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn language(&self) -> Result<Language, SettingsValueError> {
+        self.setting_value("radio.Language", LANGUAGE_OFFSET, "must be 0-1")
     }
 
     // -----------------------------------------------------------------------
     // Interfaces
     // -----------------------------------------------------------------------
 
-    /// Read the GPS PC-output interface (`radio.PcOutputInterfaceGps`,
-    /// 0=USB, 1=Bluetooth; 0 if unreadable).
+    /// Read the GPS PC-output interface (`radio.PcOutputInterfaceGps`).
     ///
     /// MCP offset `0x108E`.
-    #[must_use]
-    pub fn gps_bt_interface(&self) -> u8 {
-        self.image
-            .get(GPS_BT_INTERFACE_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(1))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn gps_pc_output_interface(&self) -> Result<PcOutputInterface, SettingsValueError> {
+        self.setting_value(
+            "radio.PcOutputInterfaceGps",
+            GPS_BT_INTERFACE_OFFSET,
+            "must be 0-1",
+        )
     }
 
     /// Read the APRS PC-output interface
-    /// (`radio.PcOutputInterfaceAprs`, 0=USB, 1=Bluetooth; 0 if
-    /// unreadable).
+    /// (`radio.PcOutputInterfaceAprs`).
     ///
     /// MCP offset `0x108F`.
-    #[must_use]
-    pub fn aprs_usb_mode(&self) -> u8 {
-        self.image
-            .get(APRS_USB_MODE_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(1))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn aprs_pc_output_interface(&self) -> Result<PcOutputInterface, SettingsValueError> {
+        self.setting_value(
+            "radio.PcOutputInterfaceAprs",
+            APRS_USB_MODE_OFFSET,
+            "must be 0-1",
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -929,78 +1141,41 @@ impl<'a> SettingsAccess<'a> {
     /// Read Band A power level.
     ///
     /// MCP offset `0x0359`. Hardware verified.
-    /// Returns `High` if the byte is out of range or unreadable.
-    #[must_use]
-    pub fn power_level_a(&self) -> PowerLevel {
-        self.image
-            .get(POWER_LEVEL_A_OFFSET)
-            .copied()
-            .and_then(|b| PowerLevel::try_from(b).ok())
-            .unwrap_or(PowerLevel::High)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or invalid.
+    pub fn power_level_a(&self) -> Result<PowerLevel, SettingsValueError> {
+        self.setting_value("Band A power level", POWER_LEVEL_A_OFFSET, "must be 0-3")
     }
 
     /// Read Band A attenuator setting (0=off, 1=on).
     ///
     /// MCP offset `0x035C`. Hardware verified.
-    #[must_use]
-    pub fn attenuator_a(&self) -> bool {
-        self.image.get(ATTENUATOR_A_OFFSET).is_some_and(|&b| b != 0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the byte is missing or is not 0 or 1.
+    pub fn attenuator_a(&self) -> Result<bool, SettingsValueError> {
+        self.setting_bool("Band A attenuator", ATTENUATOR_A_OFFSET)
     }
 
     /// Read dual-band display setting (0=single, 1=dual).
     ///
     /// MCP offset `0x0396`. Hardware verified.
-    #[must_use]
-    pub fn dual_band(&self) -> bool {
-        self.image.get(DUAL_BAND_OFFSET).is_some_and(|&b| b != 0)
-    }
-
-    // -----------------------------------------------------------------------
-    // Raw numeric accessors for enum-typed settings (for UI +/- cycling)
-    // -----------------------------------------------------------------------
-
-    /// Read auto power off as raw byte (0=Off, 1=15m, 2=30m, 3=60m).
     ///
-    /// MCP offset `0x1077`.
-    #[must_use]
-    pub fn auto_power_off_raw(&self) -> u8 {
-        self.image
-            .get(AUTO_POWER_OFF_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(3))
-    }
-
-    /// Read speed/distance unit as raw byte (0=mph, 1=km/h, 2=knots).
+    /// # Errors
     ///
-    /// MCP offset `0x1088`.
-    #[must_use]
-    pub fn speed_distance_unit_raw(&self) -> u8 {
-        self.image
-            .get(SPEED_DISTANCE_UNIT_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(2))
-    }
-
-    /// Read altitude/rain unit as raw byte (0=ft/in, 1=m/mm).
-    ///
-    /// MCP offset `0x1089`.
-    #[must_use]
-    pub fn altitude_rain_unit_raw(&self) -> u8 {
-        self.image
-            .get(ALTITUDE_RAIN_UNIT_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(1))
-    }
-
-    /// Read temperature unit as raw byte (0=°F, 1=°C).
-    ///
-    /// MCP offset `0x108A`.
-    #[must_use]
-    pub fn temperature_unit_raw(&self) -> u8 {
-        self.image
-            .get(TEMPERATURE_UNIT_OFFSET)
-            .copied()
-            .map_or(0, |b| b.min(1))
+    /// Returns [`SettingsValueError`] if the byte is missing or is not 0 or 1.
+    pub fn band_mode(&self) -> Result<BandMode, SettingsValueError> {
+        self.setting_bool("Dual-band display", DUAL_BAND_OFFSET)
+            .map(|dual| {
+                if dual {
+                    BandMode::Dual
+                } else {
+                    BandMode::Single
+                }
+            })
     }
 }
 
@@ -1011,9 +1186,9 @@ impl<'a> SettingsAccess<'a> {
 /// Mutable access to the system settings region of the memory image.
 ///
 /// Every write method targets a registry-verified offset (or one of
-/// the three hardware-verified band-state cells) and clamps or
-/// validates the value against the registry domain, so a write can
-/// never place an out-of-domain byte in an official menu field.
+/// the three hardware-verified band-state cells) and accepts a value whose
+/// type already proves the registry domain. An incomplete image produces an
+/// explicit error instead of silently dropping the write.
 /// Setters for shared bit bytes (`0x1084`, `0x120A`) perform masked
 /// read-modify-write and never touch bits owned by other fields.
 #[derive(Debug)]
@@ -1027,23 +1202,63 @@ impl<'a> SettingsWriter<'a> {
         Self { image }
     }
 
-    /// Write `value` to the byte at `offset`, if in bounds.
-    fn put(&mut self, offset: usize, value: u8) {
-        if let Some(b) = self.image.get_mut(offset) {
-            *b = value;
-        }
+    /// Write `value` to the byte at `offset`.
+    fn put(
+        &mut self,
+        setting: &'static str,
+        offset: usize,
+        value: u8,
+    ) -> Result<(), SettingsValueError> {
+        let byte = self
+            .image
+            .get_mut(offset)
+            .ok_or(SettingsValueError::MissingByte { setting, offset })?;
+        *byte = value;
+        Ok(())
     }
 
     /// Set or clear `mask` within the shared bit byte at `offset`,
     /// preserving all other bits (masked read-modify-write).
-    fn put_bit(&mut self, offset: usize, mask: u8, enabled: bool) {
-        if let Some(b) = self.image.get_mut(offset) {
-            if enabled {
-                *b |= mask;
-            } else {
-                *b &= !mask;
-            }
+    fn put_bit(
+        &mut self,
+        setting: &'static str,
+        offset: usize,
+        mask: u8,
+        enabled: bool,
+    ) -> Result<(), SettingsValueError> {
+        let byte = self
+            .image
+            .get_mut(offset)
+            .ok_or(SettingsValueError::MissingByte { setting, offset })?;
+        if enabled {
+            *byte |= mask;
+        } else {
+            *byte &= !mask;
         }
+        Ok(())
+    }
+
+    /// Set the power-on message (`radio.PowerOnMessage`).
+    ///
+    /// MCP offset `0x10C0`. The validated printable ASCII text is followed by
+    /// NUL padding through the end of the 16-byte field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the complete target field is missing.
+    pub fn set_power_on_message(
+        &mut self,
+        value: &PowerOnMessage,
+    ) -> Result<(), SettingsValueError> {
+        let end = POWER_ON_MESSAGE_OFFSET + POWER_ON_MESSAGE_SIZE;
+        let field = self.image.get_mut(POWER_ON_MESSAGE_OFFSET..end).ok_or(
+            SettingsValueError::MissingByte {
+                setting: "radio.PowerOnMessage",
+                offset: end - 1,
+            },
+        )?;
+        field.copy_from_slice(&value.to_wire_bytes());
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1053,90 +1268,156 @@ impl<'a> SettingsWriter<'a> {
     /// Set the beat-shift type (`radio.BeatShift`).
     ///
     /// MCP offset `0x1000`.
-    pub fn set_beat_shift(&mut self, value: BeatShift) {
-        self.put(BEAT_SHIFT_OFFSET, u8::from(value));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_beat_shift(&mut self, value: BeatShift) -> Result<(), SettingsValueError> {
+        self.put("radio.BeatShift", BEAT_SHIFT_OFFSET, u8::from(value))
     }
 
     /// Set TX inhibit on/off (`radio.TxInhibit`).
     ///
     /// MCP offset `0x1001`.
-    pub fn set_tx_inhibit(&mut self, enabled: bool) {
-        self.put(TX_INHIBIT_OFFSET, u8::from(enabled));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_tx_inhibit(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put("radio.TxInhibit", TX_INHIBIT_OFFSET, u8::from(enabled))
     }
 
-    /// Set the TX timeout timer index (`radio.TimeOutTimer`, clamped
-    /// to 0-10).
+    /// Set the TX timeout timer (`radio.TimeOutTimer`).
     ///
     /// MCP offset `0x1003`. The value indexes the 0.5-10.0 minute
     /// table (see [`SettingsAccess::timeout_timer`]).
-    pub fn set_timeout_timer(&mut self, value: u8) {
-        self.put(TIMEOUT_TIMER_OFFSET, value.min(10));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_timeout_timer(&mut self, value: TransmitTimeout) -> Result<(), SettingsValueError> {
+        self.put("radio.TimeOutTimer", TIMEOUT_TIMER_OFFSET, u8::from(value))
     }
 
-    /// Set microphone sensitivity (`radio.MicSensitivity`, clamped to
-    /// 0-2; **0=High, 1=Medium, 2=Low**).
+    /// Set microphone sensitivity (`radio.MicSensitivity`).
     ///
     /// MCP offset `0x1006`.
-    pub fn set_mic_sensitivity(&mut self, value: u8) {
-        self.put(MIC_SENSITIVITY_OFFSET, value.min(2));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_mic_sensitivity(
+        &mut self,
+        value: crate::types::settings::MicSensitivity,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.MicSensitivity",
+            MIC_SENSITIVITY_OFFSET,
+            u8::from(value),
+        )
     }
 
-    /// Set the SSB high-cut filter (`radio.SsbHighCut`, clamped to
-    /// 0-4).
+    /// Set the SSB high-cut filter (`radio.SsbHighCut`).
     ///
     /// MCP offset `0x1008`.
-    pub fn set_ssb_high_cut(&mut self, value: u8) {
-        self.put(SSB_HIGH_CUT_OFFSET, value.min(4));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_ssb_high_cut(&mut self, value: SsbHighCut) -> Result<(), SettingsValueError> {
+        self.put("radio.SsbHighCut", SSB_HIGH_CUT_OFFSET, u8::from(value))
     }
 
-    /// Set the CW filter width (`radio.CwWidth`, clamped to 0-4).
+    /// Set the CW filter width (`radio.CwWidth`).
     ///
     /// MCP offset `0x1009`.
-    pub fn set_cw_width(&mut self, value: u8) {
-        self.put(CW_WIDTH_OFFSET, value.min(4));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_cw_width(&mut self, value: CwFilterWidth) -> Result<(), SettingsValueError> {
+        self.put("radio.CwWidth", CW_WIDTH_OFFSET, u8::from(value))
     }
 
-    /// Set the AM high-cut filter (`radio.AmHighCut`, clamped to 0-3).
+    /// Set the AM high-cut filter (`radio.AmHighCut`).
     ///
     /// MCP offset `0x100A`.
-    pub fn set_am_high_cut(&mut self, value: u8) {
-        self.put(AM_HIGH_CUT_OFFSET, value.min(3));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_am_high_cut(&mut self, value: AmHighCut) -> Result<(), SettingsValueError> {
+        self.put("radio.AmHighCut", AM_HIGH_CUT_OFFSET, u8::from(value))
     }
 
     // -----------------------------------------------------------------------
     // Scan
     // -----------------------------------------------------------------------
 
-    /// Set the analog scan-resume method (`radio.ScanResumeAnalog`,
-    /// clamped to 0-2).
+    /// Set the analog scan-resume method (`radio.ScanResumeAnalog`).
     ///
     /// MCP offset `0x100C`.
-    pub fn set_scan_resume(&mut self, value: u8) {
-        self.put(SCAN_RESUME_OFFSET, value.min(2));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_scan_resume(&mut self, value: ScanResumeMethod) -> Result<(), SettingsValueError> {
+        self.put("radio.ScanResumeAnalog", SCAN_RESUME_OFFSET, value.as_raw())
     }
 
-    /// Set the digital scan-resume method (`radio.ScanResumeDigital`,
-    /// clamped to 0-2).
+    /// Set the digital scan-resume method (`radio.ScanResumeDigital`).
     ///
     /// MCP offset `0x100D`.
-    pub fn set_digital_scan_resume(&mut self, value: u8) {
-        self.put(DIGITAL_SCAN_RESUME_OFFSET, value.min(2));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_digital_scan_resume(
+        &mut self,
+        value: ScanResumeMethod,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.ScanResumeDigital",
+            DIGITAL_SCAN_RESUME_OFFSET,
+            value.as_raw(),
+        )
     }
 
-    /// Set the time-operated scan restart time (`radio.TimeRestart`,
-    /// clamped to 1-10 seconds).
+    /// Set the time-operated scan restart time (`radio.TimeRestart`).
     ///
     /// MCP offset `0x100E`. 0 is not a legal value for this field.
-    pub fn set_scan_restart_time(&mut self, value: u8) {
-        self.put(SCAN_RESTART_TIME_OFFSET, value.clamp(1, 10));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_scan_restart_time(
+        &mut self,
+        value: ScanRestartDelay,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.TimeRestart",
+            SCAN_RESTART_TIME_OFFSET,
+            u8::from(value),
+        )
     }
 
     /// Set the carrier-operated scan restart time
-    /// (`radio.CarrierRestart`, clamped to 1-10 seconds).
+    /// (`radio.CarrierRestart`).
     ///
     /// MCP offset `0x100F`. 0 is not a legal value for this field.
-    pub fn set_scan_restart_carrier(&mut self, value: u8) {
-        self.put(SCAN_RESTART_CARRIER_OFFSET, value.clamp(1, 10));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_scan_restart_carrier(
+        &mut self,
+        value: ScanRestartDelay,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.CarrierRestart",
+            SCAN_RESTART_CARRIER_OFFSET,
+            u8::from(value),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1146,16 +1427,30 @@ impl<'a> SettingsWriter<'a> {
     /// Set repeater auto offset on/off (`radio.AutoOffset`).
     ///
     /// MCP offset `0x1018`.
-    pub fn set_repeater_auto_offset(&mut self, enabled: bool) {
-        self.put(REPEATER_AUTO_OFFSET_OFFSET, u8::from(enabled));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_repeater_auto_offset(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.AutoOffset",
+            REPEATER_AUTO_OFFSET_OFFSET,
+            u8::from(enabled),
+        )
     }
 
-    /// Set the CALL key function (`radio.CallKey`, clamped to 0-1;
-    /// 0=CALL, 1=1750 Hz).
+    /// Set the CALL key function (`radio.CallKey`).
     ///
     /// MCP offset `0x1019`.
-    pub fn set_repeater_call_key(&mut self, value: u8) {
-        self.put(REPEATER_CALL_KEY_OFFSET, value.min(1));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_repeater_call_key(
+        &mut self,
+        value: RepeaterCallKey,
+    ) -> Result<(), SettingsValueError> {
+        self.put("radio.CallKey", REPEATER_CALL_KEY_OFFSET, u8::from(value))
     }
 
     // -----------------------------------------------------------------------
@@ -1165,108 +1460,188 @@ impl<'a> SettingsWriter<'a> {
     /// Set VOX enabled on/off (`radio.Vox`).
     ///
     /// MCP offset `0x101B`. Hardware verified.
-    pub fn set_vox_enabled(&mut self, enabled: bool) {
-        self.put(VOX_ENABLED_OFFSET, u8::from(enabled));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_vox_enabled(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put("radio.Vox", VOX_ENABLED_OFFSET, u8::from(enabled))
     }
 
-    /// Set VOX gain level (`radio.VoxGain`, clamped to 0-9).
+    /// Set VOX gain level (`radio.VoxGain`, 0-9).
     ///
     /// MCP offset `0x101C`. Hardware verified.
-    pub fn set_vox_gain(&mut self, gain: u8) {
-        self.put(VOX_GAIN_OFFSET, gain.min(9));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_vox_gain(&mut self, gain: VoxGain) -> Result<(), SettingsValueError> {
+        self.put("radio.VoxGain", VOX_GAIN_OFFSET, gain.as_raw())
     }
 
-    /// Set the VOX delay index (`radio.VoxDelay`, clamped to 0-6).
+    /// Set the VOX delay selection (`radio.VoxDelay`, raw index 0-6).
     ///
     /// MCP offset `0x101D`. The value indexes the 250-3000 ms table
     /// (see [`SettingsAccess::vox_delay`]); it is NOT a 100 ms unit
     /// count.
-    pub fn set_vox_delay(&mut self, delay: u8) {
-        self.put(VOX_DELAY_OFFSET, delay.min(6));
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_vox_delay(&mut self, delay: VoxDelay) -> Result<(), SettingsValueError> {
+        self.put("radio.VoxDelay", VOX_DELAY_OFFSET, delay.as_raw())
     }
 
     /// Set VOX TX-on-busy on/off (`radio.VoxTxOnBusy`).
     ///
     /// MCP offset `0x101E`.
-    pub fn set_vox_tx_on_busy(&mut self, enabled: bool) {
-        self.put(VOX_TX_ON_BUSY_OFFSET, u8::from(enabled));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_vox_tx_on_busy(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.VoxTxOnBusy",
+            VOX_TX_ON_BUSY_OFFSET,
+            u8::from(enabled),
+        )
     }
 
     // -----------------------------------------------------------------------
     // DTMF
     // -----------------------------------------------------------------------
 
-    /// Set DTMF speed (`radio.DtmfSpeed`, clamped to 0-2).
+    /// Set DTMF tone duration (`radio.DtmfSpeed`).
     ///
     /// MCP offset `0x101F`.
-    pub fn set_dtmf_speed(&mut self, value: u8) {
-        self.put(DTMF_SPEED_OFFSET, value.min(2));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_dtmf_speed(&mut self, value: DtmfToneDuration) -> Result<(), SettingsValueError> {
+        self.put("radio.DtmfSpeed", DTMF_SPEED_OFFSET, u8::from(value))
     }
 
-    /// Set DTMF pause time (`radio.DtmfPauseTime`, clamped to 0-6).
+    /// Set DTMF pause time (`radio.DtmfPauseTime`).
     ///
     /// MCP offset `0x1020`.
-    pub fn set_dtmf_pause_time(&mut self, value: u8) {
-        self.put(DTMF_PAUSE_TIME_OFFSET, value.min(6));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_dtmf_pause_time(&mut self, value: DtmfPause) -> Result<(), SettingsValueError> {
+        let raw = match value {
+            DtmfPause::Ms100 => 0,
+            DtmfPause::Ms250 => 1,
+            DtmfPause::Ms500 => 2,
+            DtmfPause::Ms750 => 3,
+            DtmfPause::Ms1000 => 4,
+            DtmfPause::Ms1500 => 5,
+            DtmfPause::Ms2000 => 6,
+        };
+        self.put("radio.DtmfPauseTime", DTMF_PAUSE_TIME_OFFSET, raw)
     }
 
     /// Set DTMF TX hold on/off (`radio.DtmfTxHold`).
     ///
     /// MCP offset `0x1021`.
-    pub fn set_dtmf_tx_hold(&mut self, enabled: bool) {
-        self.put(DTMF_TX_HOLD_OFFSET, u8::from(enabled));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_dtmf_tx_hold(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put("radio.DtmfTxHold", DTMF_TX_HOLD_OFFSET, u8::from(enabled))
     }
 
     // -----------------------------------------------------------------------
     // CW receive
     // -----------------------------------------------------------------------
 
-    /// Set the CW pitch index (`radio.CwPitchFreq`, clamped to 0-6).
+    /// Set the CW pitch (`radio.CwPitchFreq`).
     ///
     /// MCP offset `0x1024`.
-    pub fn set_cw_pitch(&mut self, value: u8) {
-        self.put(CW_PITCH_OFFSET, value.min(6));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_cw_pitch(&mut self, value: CwPitch) -> Result<(), SettingsValueError> {
+        let raw = u8::try_from((value.as_hz() - CwPitch::MIN_HZ) / CwPitch::STEP_HZ)
+            .unwrap_or_else(|_| unreachable!("validated CW pitch index fits in one byte"));
+        self.put("radio.CwPitchFreq", CW_PITCH_OFFSET, raw)
     }
 
     // -----------------------------------------------------------------------
     // Audio
     // -----------------------------------------------------------------------
 
-    /// Set the auto-mute return time (`radio.AutoMuteRetTime`, clamped
-    /// to 1-10).
+    /// Set the auto-mute return time (`radio.AutoMuteRetTime`).
     ///
     /// MCP offset `0x1041`. 0 is not a legal value for this field.
-    pub fn set_auto_mute_return_time(&mut self, value: u8) {
-        self.put(AUTO_MUTE_RETURN_TIME_OFFSET, value.clamp(1, 10));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_auto_mute_return_time(
+        &mut self,
+        value: AutoMuteReturnDelay,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.AutoMuteRetTime",
+            AUTO_MUTE_RETURN_TIME_OFFSET,
+            u8::from(value),
+        )
     }
 
-    /// Set the EMR volume level (`dv.EmrVolumeLevelTxRx`, clamped to
-    /// 1-50).
+    /// Set the EMR volume level (`dv.EmrVolumeLevelTxRx`).
     ///
     /// MCP offset `0x1A03`. 0 is not a legal value for this field.
-    pub fn set_emr_volume_level(&mut self, value: u8) {
-        self.put(EMR_VOLUME_LEVEL_OFFSET, value.clamp(1, 50));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_emr_volume_level(&mut self, value: EmrVolume) -> Result<(), SettingsValueError> {
+        self.put(
+            "dv.EmrVolumeLevelTxRx",
+            EMR_VOLUME_LEVEL_OFFSET,
+            value.as_raw(),
+        )
     }
 
     // -----------------------------------------------------------------------
     // Display
     // -----------------------------------------------------------------------
 
-    /// Set backlight control (`radio.BacklightControl`, clamped to
-    /// 0-3).
+    /// Set backlight control (`radio.BacklightControl`).
     ///
     /// MCP offset `0x1060`.
-    pub fn set_backlight_control(&mut self, value: u8) {
-        self.put(BACKLIGHT_CONTROL_OFFSET, value.min(3));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_backlight_control(
+        &mut self,
+        value: BacklightControl,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.BacklightControl",
+            BACKLIGHT_CONTROL_OFFSET,
+            u8::from(value),
+        )
     }
 
-    /// Set the backlight timer (`radio.BacklightTimer`, clamped to
-    /// 3-60 seconds).
+    /// Set the backlight timer (`radio.BacklightTimer`).
     ///
     /// MCP offset `0x1061`. Values below 3 are not legal for this
     /// field.
-    pub fn set_backlight_timer(&mut self, value: u8) {
-        self.put(BACKLIGHT_TIMER_OFFSET, value.clamp(3, 60));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_backlight_timer(&mut self, value: BacklightTimer) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.BacklightTimer",
+            BACKLIGHT_TIMER_OFFSET,
+            u8::from(value),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1276,59 +1651,93 @@ impl<'a> SettingsWriter<'a> {
     /// Set key beep on/off (`radio.Beep`).
     ///
     /// MCP offset `0x1071`. Hardware verified.
-    pub fn set_key_beep(&mut self, enabled: bool) {
-        self.put(KEY_BEEP_OFFSET, u8::from(enabled));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_key_beep(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put("radio.Beep", KEY_BEEP_OFFSET, u8::from(enabled))
     }
 
-    /// Set beep volume (`radio.BeepVolume`, clamped to 0-7; 0 = VOL
-    /// Link).
+    /// Set beep volume (`radio.BeepVolume`).
     ///
     /// MCP offset `0x1072`.
-    pub fn set_beep_volume(&mut self, volume: u8) {
-        self.put(BEEP_VOLUME_OFFSET, volume.min(7));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_beep_volume(&mut self, volume: LinkedVolumeLevel) -> Result<(), SettingsValueError> {
+        self.put("radio.BeepVolume", BEEP_VOLUME_OFFSET, u8::from(volume))
     }
 
-    /// Set the voice announce mode (`radio.VoiceAnnounce`, clamped to
-    /// 0-3; 0=Off, 1=Manual, 2=Auto1, 3=Auto2).
+    /// Set the voice announce mode (`radio.VoiceAnnounce`).
     ///
     /// MCP offset `0x1073`.
-    pub fn set_announce(&mut self, value: u8) {
-        self.put(ANNOUNCE_OFFSET, value.min(3));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_announce(&mut self, value: VoiceAnnounceMode) -> Result<(), SettingsValueError> {
+        self.put("radio.VoiceAnnounce", ANNOUNCE_OFFSET, u8::from(value))
     }
 
-    /// Set the voice announce volume (`radio.VoiceAnnounceVolume`,
-    /// clamped to 0-7; 0 = VOL Link).
+    /// Set the voice announce volume (`radio.VoiceAnnounceVolume`).
     ///
     /// MCP offset `0x1074`.
-    pub fn set_voice_volume(&mut self, value: u8) {
-        self.put(VOICE_VOLUME_OFFSET, value.min(7));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_voice_volume(&mut self, value: LinkedVolumeLevel) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.VoiceAnnounceVolume",
+            VOICE_VOLUME_OFFSET,
+            u8::from(value),
+        )
     }
 
-    /// Set the voice guidance speed (`radio.VoiceGuidanceSpeed`,
-    /// clamped to 0-3).
+    /// Set the voice guidance speed (`radio.VoiceGuidanceSpeed`).
     ///
     /// MCP offset `0x1097`.
-    pub fn set_voice_speed(&mut self, value: u8) {
-        self.put(VOICE_SPEED_OFFSET, value.min(3));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_voice_speed(&mut self, value: VoiceGuideSpeed) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.VoiceGuidanceSpeed",
+            VOICE_SPEED_OFFSET,
+            u8::from(value),
+        )
     }
 
     // -----------------------------------------------------------------------
     // Battery / power
     // -----------------------------------------------------------------------
 
-    /// Set the battery saver interval index (`radio.BatterySaver`,
-    /// clamped to 0-9; 0 = Off).
+    /// Set the battery saver interval (`radio.BatterySaver`).
     ///
     /// MCP offset `0x1076`.
-    pub fn set_battery_saver(&mut self, value: u8) {
-        self.put(BATTERY_SAVER_OFFSET, value.min(9));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_battery_saver(
+        &mut self,
+        value: BatterySaverInterval,
+    ) -> Result<(), SettingsValueError> {
+        self.put("radio.BatterySaver", BATTERY_SAVER_OFFSET, u8::from(value))
     }
 
     /// Set auto power off (`radio.AutoPowerOff`).
     ///
     /// MCP offset `0x1077`.
-    pub fn set_auto_power_off(&mut self, value: AutoPowerOff) {
-        self.put(AUTO_POWER_OFF_OFFSET, u8::from(value));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_auto_power_off(&mut self, value: AutoPowerOff) -> Result<(), SettingsValueError> {
+        self.put("radio.AutoPowerOff", AUTO_POWER_OFF_OFFSET, u8::from(value))
     }
 
     // -----------------------------------------------------------------------
@@ -1338,16 +1747,28 @@ impl<'a> SettingsWriter<'a> {
     /// Set Bluetooth on/off (`radio.BluetoothOnOff`).
     ///
     /// MCP offset `0x1078`. Hardware verified.
-    pub fn set_bluetooth(&mut self, enabled: bool) {
-        self.put(BLUETOOTH_OFFSET, u8::from(enabled));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_bluetooth(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put("radio.BluetoothOnOff", BLUETOOTH_OFFSET, u8::from(enabled))
     }
 
     /// Set Bluetooth auto-connect on/off
     /// (`radio.BluetoothAutoConnect`).
     ///
     /// MCP offset `0x1079`.
-    pub fn set_bt_auto_connect(&mut self, enabled: bool) {
-        self.put(BT_AUTO_CONNECT_OFFSET, u8::from(enabled));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_bt_auto_connect(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.BluetoothAutoConnect",
+            BT_AUTO_CONNECT_OFFSET,
+            u8::from(enabled),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1360,14 +1781,9 @@ impl<'a> SettingsWriter<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::SettingOutOfRange`] if `value` is
-    /// outside the gapped domain (0-30 excluding 5, 23, 25, 26); a
-    /// plain clamp cannot express the gaps, and writing a gap value
-    /// would store an invalid menu selection.
-    pub fn set_pf_key1(&mut self, value: u8) -> Result<(), ValidationError> {
-        validate_pf_key("PF1 key", value)?;
-        self.put(PF_KEY1_OFFSET, value);
-        Ok(())
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_pf_key1(&mut self, value: FrontPanelPfFunction) -> Result<(), SettingsValueError> {
+        self.put("radio.Pf1PfKey", PF_KEY1_OFFSET, u8::from(value))
     }
 
     /// Set the PF2 key assignment (`radio.Pf2PfKey`).
@@ -1376,12 +1792,9 @@ impl<'a> SettingsWriter<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::SettingOutOfRange`] if `value` is
-    /// outside the gapped domain (0-30 excluding 5, 23, 25, 26).
-    pub fn set_pf_key2(&mut self, value: u8) -> Result<(), ValidationError> {
-        validate_pf_key("PF2 key", value)?;
-        self.put(PF_KEY2_OFFSET, value);
-        Ok(())
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_pf_key2(&mut self, value: FrontPanelPfFunction) -> Result<(), SettingsValueError> {
+        self.put("radio.Pf2PfKey", PF_KEY2_OFFSET, u8::from(value))
     }
 
     // -----------------------------------------------------------------------
@@ -1394,45 +1807,93 @@ impl<'a> SettingsWriter<'a> {
     /// MCP offset `0x1084`, bit `0x01`. Masked read-modify-write: the
     /// frequency-lock bit and the six unowned bits of the byte are
     /// preserved.
-    pub fn set_key_lock(&mut self, enabled: bool) {
-        self.put_bit(KEY_LOCK_OFFSET, KEY_LOCK_KEY_MASK, enabled);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the shared byte is missing.
+    pub fn set_key_lock(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put_bit(
+            "radio.KeyLockTypeKeyLock",
+            KEY_LOCK_OFFSET,
+            KEY_LOCK_KEY_MASK,
+            enabled,
+        )
     }
 
     /// Set the frequency-lock configuration bit
     /// (`radio.KeyLockTypeFrequencyLock`).
     ///
     /// MCP offset `0x1084`, bit `0x02`. Masked read-modify-write.
-    pub fn set_frequency_lock(&mut self, enabled: bool) {
-        self.put_bit(KEY_LOCK_OFFSET, KEY_LOCK_FREQUENCY_MASK, enabled);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the shared byte is missing.
+    pub fn set_frequency_lock(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put_bit(
+            "radio.KeyLockTypeFrequencyLock",
+            KEY_LOCK_OFFSET,
+            KEY_LOCK_FREQUENCY_MASK,
+            enabled,
+        )
     }
 
     /// Set volume lock on/off (`radio.VolumeLockOnOff`).
     ///
     /// MCP offset `0x1087`.
-    pub fn set_volume_lock(&mut self, enabled: bool) {
-        self.put(VOLUME_LOCK_OFFSET, u8::from(enabled));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_volume_lock(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.VolumeLockOnOff",
+            VOLUME_LOCK_OFFSET,
+            u8::from(enabled),
+        )
     }
 
     /// Set the APRS-lock frequency bit (`aprs.Frequency`).
     ///
     /// MCP offset `0x120A`, bit `0x01`. Masked read-modify-write: the
     /// other APRS-lock bits and the five unowned bits are preserved.
-    pub fn set_aprs_lock_frequency(&mut self, enabled: bool) {
-        self.put_bit(APRS_LOCK_OFFSET, APRS_LOCK_FREQUENCY_MASK, enabled);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the shared byte is missing.
+    pub fn set_aprs_lock_frequency(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put_bit(
+            "aprs.Frequency",
+            APRS_LOCK_OFFSET,
+            APRS_LOCK_FREQUENCY_MASK,
+            enabled,
+        )
     }
 
     /// Set the APRS-lock PTT bit (`aprs.Ptt`).
     ///
     /// MCP offset `0x120A`, bit `0x02`. Masked read-modify-write.
-    pub fn set_aprs_lock_ptt(&mut self, enabled: bool) {
-        self.put_bit(APRS_LOCK_OFFSET, APRS_LOCK_PTT_MASK, enabled);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the shared byte is missing.
+    pub fn set_aprs_lock_ptt(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put_bit("aprs.Ptt", APRS_LOCK_OFFSET, APRS_LOCK_PTT_MASK, enabled)
     }
 
     /// Set the APRS-lock APRS-key bit (`aprs.AprsKey`).
     ///
     /// MCP offset `0x120A`, bit `0x04`. Masked read-modify-write.
-    pub fn set_aprs_lock_key(&mut self, enabled: bool) {
-        self.put_bit(APRS_LOCK_OFFSET, APRS_LOCK_KEY_MASK, enabled);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the shared byte is missing.
+    pub fn set_aprs_lock_key(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put_bit(
+            "aprs.AprsKey",
+            APRS_LOCK_OFFSET,
+            APRS_LOCK_KEY_MASK,
+            enabled,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1442,67 +1903,142 @@ impl<'a> SettingsWriter<'a> {
     /// Set speed/distance display unit (`radio.SpeedDistance`).
     ///
     /// MCP offset `0x1088`.
-    pub fn set_speed_distance_unit(&mut self, value: SpeedDistanceUnit) {
-        let raw = match value {
-            SpeedDistanceUnit::MilesPerHour => 0,
-            SpeedDistanceUnit::KilometersPerHour => 1,
-            SpeedDistanceUnit::Knots => 2,
-        };
-        self.put(SPEED_DISTANCE_UNIT_OFFSET, raw);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_speed_distance_unit(
+        &mut self,
+        value: SpeedDistanceUnit,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.SpeedDistance",
+            SPEED_DISTANCE_UNIT_OFFSET,
+            u8::from(value),
+        )
     }
 
     /// Set altitude/rain display unit (`radio.AltitudeRain`).
     ///
     /// MCP offset `0x1089`.
-    pub fn set_altitude_rain_unit(&mut self, value: AltitudeRainUnit) {
-        let raw = match value {
-            AltitudeRainUnit::FeetInch => 0,
-            AltitudeRainUnit::MetersMm => 1,
-        };
-        self.put(ALTITUDE_RAIN_UNIT_OFFSET, raw);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_altitude_rain_unit(
+        &mut self,
+        value: AltitudeRainUnit,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.AltitudeRain",
+            ALTITUDE_RAIN_UNIT_OFFSET,
+            u8::from(value),
+        )
     }
 
     /// Set temperature display unit (`radio.Temperature`).
     ///
     /// MCP offset `0x108A`.
-    pub fn set_temperature_unit(&mut self, value: TemperatureUnit) {
-        let raw = match value {
-            TemperatureUnit::Fahrenheit => 0,
-            TemperatureUnit::Celsius => 1,
-        };
-        self.put(TEMPERATURE_UNIT_OFFSET, raw);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_temperature_unit(
+        &mut self,
+        value: TemperatureUnit,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.Temperature",
+            TEMPERATURE_UNIT_OFFSET,
+            u8::from(value),
+        )
+    }
+
+    /// Set latitude/longitude display notation (`radio.LatitudeLongitude`).
+    ///
+    /// MCP offset `0x108B`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_coordinate_format(
+        &mut self,
+        value: CoordinateFormat,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.LatitudeLongitude",
+            COORDINATE_FORMAT_OFFSET,
+            u8::from(value),
+        )
+    }
+
+    /// Set grid-square display format (`radio.GridSquareFormat`).
+    ///
+    /// MCP offset `0x108C`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_grid_square_format(
+        &mut self,
+        value: GridSquareFormat,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.GridSquareFormat",
+            GRID_SQUARE_FORMAT_OFFSET,
+            u8::from(value),
+        )
     }
 
     /// Set language (`radio.Language`).
     ///
     /// MCP offset `0x1092`.
-    pub fn set_language(&mut self, value: Language) {
-        let raw = match value {
-            Language::English => 0,
-            Language::Japanese => 1,
-        };
-        self.put(LANGUAGE_OFFSET, raw);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_language(&mut self, value: Language) -> Result<(), SettingsValueError> {
+        self.put("radio.Language", LANGUAGE_OFFSET, u8::from(value))
     }
 
     // -----------------------------------------------------------------------
     // Interfaces
     // -----------------------------------------------------------------------
 
-    /// Set the GPS PC-output interface (`radio.PcOutputInterfaceGps`,
-    /// clamped to 0-1; 0=USB, 1=Bluetooth).
+    /// Set the GPS PC-output interface (`radio.PcOutputInterfaceGps`).
     ///
     /// MCP offset `0x108E`.
-    pub fn set_gps_bt_interface(&mut self, value: u8) {
-        self.put(GPS_BT_INTERFACE_OFFSET, value.min(1));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_gps_pc_output_interface(
+        &mut self,
+        value: PcOutputInterface,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.PcOutputInterfaceGps",
+            GPS_BT_INTERFACE_OFFSET,
+            u8::from(value),
+        )
     }
 
-    /// Set the APRS PC-output interface
-    /// (`radio.PcOutputInterfaceAprs`, clamped to 0-1; 0=USB,
-    /// 1=Bluetooth).
+    /// Set the APRS PC-output interface (`radio.PcOutputInterfaceAprs`).
     ///
     /// MCP offset `0x108F`.
-    pub fn set_aprs_usb_mode(&mut self, value: u8) {
-        self.put(APRS_USB_MODE_OFFSET, value.min(1));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_aprs_pc_output_interface(
+        &mut self,
+        value: PcOutputInterface,
+    ) -> Result<(), SettingsValueError> {
+        self.put(
+            "radio.PcOutputInterfaceAprs",
+            APRS_USB_MODE_OFFSET,
+            u8::from(value),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1512,70 +2048,39 @@ impl<'a> SettingsWriter<'a> {
     /// Set Band A power level.
     ///
     /// MCP offset `0x0359`. Hardware verified.
-    pub fn set_power_level_a(&mut self, level: PowerLevel) {
-        self.put(POWER_LEVEL_A_OFFSET, u8::from(level));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_power_level_a(&mut self, level: PowerLevel) -> Result<(), SettingsValueError> {
+        self.put("Band A power level", POWER_LEVEL_A_OFFSET, u8::from(level))
     }
 
     /// Set Band A attenuator on/off.
     ///
     /// MCP offset `0x035C`. Hardware verified.
-    pub fn set_attenuator_a(&mut self, enabled: bool) {
-        self.put(ATTENUATOR_A_OFFSET, u8::from(enabled));
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_attenuator_a(&mut self, enabled: bool) -> Result<(), SettingsValueError> {
+        self.put("Band A attenuator", ATTENUATOR_A_OFFSET, u8::from(enabled))
     }
 
-    /// Set dual-band display on/off.
+    /// Set single-band or dual-band display.
     ///
     /// MCP offset `0x0396`. Hardware verified.
-    pub fn set_dual_band(&mut self, enabled: bool) {
-        self.put(DUAL_BAND_OFFSET, u8::from(enabled));
-    }
-
-    // -----------------------------------------------------------------------
-    // Raw numeric setters for enum-typed settings (for UI +/- cycling)
-    // -----------------------------------------------------------------------
-
-    /// Set auto power off as raw byte (0=Off, 1=15m, 2=30m, 3=60m;
-    /// clamped to 0-3).
     ///
-    /// MCP offset `0x1077`.
-    pub fn set_auto_power_off_raw(&mut self, value: u8) {
-        self.put(AUTO_POWER_OFF_OFFSET, value.min(3));
-    }
-
-    /// Set speed/distance unit as raw byte (0=mph, 1=km/h, 2=knots;
-    /// clamped to 0-2).
+    /// # Errors
     ///
-    /// MCP offset `0x1088`.
-    pub fn set_speed_distance_unit_raw(&mut self, value: u8) {
-        self.put(SPEED_DISTANCE_UNIT_OFFSET, value.min(2));
+    /// Returns [`SettingsValueError`] if the target byte is missing.
+    pub fn set_band_mode(&mut self, mode: BandMode) -> Result<(), SettingsValueError> {
+        self.put(
+            "Dual-band display",
+            DUAL_BAND_OFFSET,
+            u8::from(matches!(mode, BandMode::Dual)),
+        )
     }
-
-    /// Set altitude/rain unit as raw byte (0=ft/in, 1=m/mm; clamped to
-    /// 0-1).
-    ///
-    /// MCP offset `0x1089`.
-    pub fn set_altitude_rain_unit_raw(&mut self, value: u8) {
-        self.put(ALTITUDE_RAIN_UNIT_OFFSET, value.min(1));
-    }
-
-    /// Set temperature unit as raw byte (0=°F, 1=°C; clamped to 0-1).
-    ///
-    /// MCP offset `0x108A`.
-    pub fn set_temperature_unit_raw(&mut self, value: u8) {
-        self.put(TEMPERATURE_UNIT_OFFSET, value.min(1));
-    }
-}
-
-/// Extract a null-terminated ASCII string from the image at a given offset.
-fn extract_string(image: &[u8], offset: usize, max_len: usize) -> String {
-    let Some(slice) = image.get(offset..offset + max_len) else {
-        return String::new();
-    };
-    let nul = slice.iter().position(|&b| b == 0).unwrap_or(max_len);
-    let Some(trimmed) = slice.get(..nul) else {
-        return String::new();
-    };
-    String::from_utf8_lossy(trimmed).trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1651,7 +2156,7 @@ mod tests {
         let image = make_settings_image()?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         let settings = mi.settings();
-        assert_eq!(settings.power_on_message(), "Hello D75!");
+        assert_eq!(settings.power_on_message()?.as_str(), "Hello D75!");
         Ok(())
     }
 
@@ -1661,7 +2166,7 @@ mod tests {
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         let settings = mi.settings();
         let raw = settings
-            .raw()
+            .as_raw()
             .ok_or("settings raw slice unexpectedly None")?;
         assert_eq!(raw.len(), SETTINGS_SIZE);
         Ok(())
@@ -1679,6 +2184,114 @@ mod tests {
             bytes.get(..10).ok_or("read_bytes returned <10 bytes")?,
             b"Hello D75!"
         );
+        assert!(
+            settings.read_bytes(usize::MAX, 2).is_none(),
+            "overflowing diagnostic ranges must fail instead of wrapping"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn power_on_message_preserves_spaces_and_rejects_bad_padding() -> TestResult {
+        let mut image = make_settings_image()?;
+        write_slice(
+            &mut image,
+            POWER_ON_MESSAGE_OFFSET,
+            b"  D75  \0\0\0\0\0\0\0\0\0",
+        )?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        assert_eq!(mi.settings().power_on_message()?.as_str(), "  D75  ");
+
+        let mut image = make_settings_image()?;
+        write_slice(
+            &mut image,
+            POWER_ON_MESSAGE_OFFSET,
+            b"D75\0X\0\0\0\0\0\0\0\0\0\0\0",
+        )?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        assert!(matches!(
+            mi.settings().power_on_message(),
+            Err(SettingsValueError::InvalidValue {
+                setting: "radio.PowerOnMessage",
+                offset,
+                value: b'X',
+                detail: "bytes after the first NUL must be NUL padding",
+            }) if offset == POWER_ON_MESSAGE_OFFSET + 4
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn power_on_message_read_rejects_non_printable_bytes_at_the_exact_offset() -> TestResult {
+        for (relative_offset, value) in [(0, 0x1F), (1, 0x7F), (2, 0xFF)] {
+            let mut image = make_settings_image()?;
+            set_byte(&mut image, POWER_ON_MESSAGE_OFFSET + relative_offset, value)?;
+            let mi = crate::memory::MemoryImage::from_raw(image)?;
+            assert!(matches!(
+                mi.settings().power_on_message(),
+                Err(SettingsValueError::InvalidValue {
+                    setting: "radio.PowerOnMessage",
+                    offset,
+                    value: actual_value,
+                    detail: "text bytes must be printable ASCII 0x20-0x7E",
+                }) if offset == POWER_ON_MESSAGE_OFFSET + relative_offset
+                    && actual_value == value
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn strict_boolean_access_rejects_non_boolean_bytes() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, KEY_BEEP_OFFSET, 2)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        assert!(matches!(
+            mi.settings().key_beep(),
+            Err(SettingsValueError::InvalidValue {
+                setting: "radio.Beep",
+                offset: KEY_BEEP_OFFSET,
+                value: 2,
+                detail: "must be 0 or 1",
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_images_return_explicit_read_and_write_errors() {
+        let mut short = [0_u8; 1];
+        assert!(matches!(
+            SettingsAccess::new(&short).key_beep(),
+            Err(SettingsValueError::MissingByte {
+                setting: "radio.Beep",
+                offset: KEY_BEEP_OFFSET,
+            })
+        ));
+        assert!(matches!(
+            SettingsWriter::new(&mut short).set_key_beep(true),
+            Err(SettingsValueError::MissingByte {
+                setting: "radio.Beep",
+                offset: KEY_BEEP_OFFSET,
+            })
+        ));
+        assert_eq!(short, [0]);
+    }
+
+    #[test]
+    fn incomplete_power_on_message_write_is_atomic() -> TestResult {
+        let end = POWER_ON_MESSAGE_OFFSET + POWER_ON_MESSAGE_SIZE;
+        let mut short = vec![0xA5; end - 1];
+        let before = short.clone();
+        let message = PowerOnMessage::new("D75")?;
+        assert!(matches!(
+            SettingsWriter::new(&mut short).set_power_on_message(&message),
+            Err(SettingsValueError::MissingByte {
+                setting: "radio.PowerOnMessage",
+                offset,
+            }) if offset == end - 1
+        ));
+        assert_eq!(short, before, "failed fixed-field writes must be atomic");
         Ok(())
     }
 
@@ -1691,7 +2304,7 @@ mod tests {
         let mut image = make_settings_image()?;
         set_byte(&mut image, KEY_BEEP_OFFSET, 1)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(mi.settings().key_beep());
+        assert!(mi.settings().key_beep()?);
         Ok(())
     }
 
@@ -1699,7 +2312,7 @@ mod tests {
     fn settings_key_beep_off() -> TestResult {
         let image = make_settings_image()?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.settings().key_beep());
+        assert!(!mi.settings().key_beep()?);
         Ok(())
     }
 
@@ -1711,18 +2324,43 @@ mod tests {
         set_byte(&mut image, VOX_DELAY_OFFSET, 5)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         let settings = mi.settings();
-        assert!(settings.vox_enabled());
-        assert_eq!(settings.vox_gain(), 7);
-        assert_eq!(settings.vox_delay(), 5);
+        assert!(settings.vox_enabled()?);
+        assert_eq!(settings.vox_gain()?, VoxGain::new(7)?);
+        assert_eq!(settings.vox_delay()?, VoxDelay::new(5)?);
         Ok(())
     }
 
     #[test]
-    fn settings_vox_delay_clamped_to_registry_domain() -> TestResult {
+    fn settings_vox_gain_rejects_invalid_stored_value() -> TestResult {
+        let mut image = make_settings_image()?;
+        set_byte(&mut image, VOX_GAIN_OFFSET, 0xFF)?;
+        let mi = crate::memory::MemoryImage::from_raw(image)?;
+        assert!(matches!(
+            mi.settings().vox_gain(),
+            Err(SettingsValueError::InvalidValue {
+                setting: "radio.VoxGain",
+                offset: VOX_GAIN_OFFSET,
+                value: 0xFF,
+                detail: "must be 0-9",
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn settings_vox_delay_rejects_invalid_stored_value() -> TestResult {
         let mut image = make_settings_image()?;
         set_byte(&mut image, VOX_DELAY_OFFSET, 0xFF)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().vox_delay(), 6);
+        assert!(matches!(
+            mi.settings().vox_delay(),
+            Err(SettingsValueError::InvalidValue {
+                setting: "radio.VoxDelay",
+                offset: VOX_DELAY_OFFSET,
+                value: 0xFF,
+                detail: "raw index must be 0-6",
+            })
+        ));
         Ok(())
     }
 
@@ -1731,7 +2369,7 @@ mod tests {
         let mut image = make_settings_image()?;
         set_byte(&mut image, DUAL_BAND_OFFSET, 1)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(mi.settings().dual_band());
+        assert_eq!(mi.settings().band_mode()?, BandMode::Dual);
         Ok(())
     }
 
@@ -1739,7 +2377,7 @@ mod tests {
     fn settings_dual_band_off() -> TestResult {
         let image = make_settings_image()?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.settings().dual_band());
+        assert_eq!(mi.settings().band_mode()?, BandMode::Single);
         Ok(())
     }
 
@@ -1748,7 +2386,7 @@ mod tests {
         let mut image = make_settings_image()?;
         set_byte(&mut image, ATTENUATOR_A_OFFSET, 1)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(mi.settings().attenuator_a());
+        assert!(mi.settings().attenuator_a()?);
         Ok(())
     }
 
@@ -1757,16 +2395,24 @@ mod tests {
         let mut image = make_settings_image()?;
         set_byte(&mut image, POWER_LEVEL_A_OFFSET, 2)?; // Lo
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().power_level_a(), PowerLevel::Low);
+        assert_eq!(mi.settings().power_level_a()?, PowerLevel::Low);
         Ok(())
     }
 
     #[test]
-    fn settings_power_level_a_invalid_defaults_to_high() -> TestResult {
+    fn settings_power_level_a_rejects_invalid_stored_value() -> TestResult {
         let mut image = make_settings_image()?;
         set_byte(&mut image, POWER_LEVEL_A_OFFSET, 0xFF)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().power_level_a(), PowerLevel::High);
+        assert!(matches!(
+            mi.settings().power_level_a(),
+            Err(SettingsValueError::InvalidValue {
+                setting: "Band A power level",
+                offset: POWER_LEVEL_A_OFFSET,
+                value: 0xFF,
+                detail: "must be 0-3",
+            })
+        ));
         Ok(())
     }
 
@@ -1776,8 +2422,8 @@ mod tests {
         set_byte(&mut image, BLUETOOTH_OFFSET, 1)?;
         set_byte(&mut image, BT_AUTO_CONNECT_OFFSET, 1)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(mi.settings().bluetooth());
-        assert!(mi.settings().bt_auto_connect());
+        assert!(mi.settings().bluetooth()?);
+        assert!(mi.settings().bt_auto_connect()?);
         Ok(())
     }
 
@@ -1787,16 +2433,24 @@ mod tests {
         // clamped minimum.
         let image = make_settings_image()?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().beep_volume(), 0);
+        assert_eq!(mi.settings().beep_volume()?, LinkedVolumeLevel::VOLUME_LINK);
         Ok(())
     }
 
     #[test]
-    fn settings_beep_volume_clamped() -> TestResult {
+    fn settings_beep_volume_rejects_invalid_stored_value() -> TestResult {
         let mut image = make_settings_image()?;
         set_byte(&mut image, BEEP_VOLUME_OFFSET, 0xFF)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().beep_volume(), 7);
+        assert!(matches!(
+            mi.settings().beep_volume(),
+            Err(SettingsValueError::InvalidValue {
+                setting: "radio.BeepVolume",
+                offset: BEEP_VOLUME_OFFSET,
+                value: 0xFF,
+                detail: "must be 0-7, where 0 means VOL Link",
+            })
+        ));
         Ok(())
     }
 
@@ -1805,7 +2459,7 @@ mod tests {
         let mut image = make_settings_image()?;
         set_byte(&mut image, BACKLIGHT_CONTROL_OFFSET, 2)?; // Auto
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().backlight_control(), 2);
+        assert_eq!(mi.settings().backlight_control()?, BacklightControl::Auto);
         Ok(())
     }
 
@@ -1815,26 +2469,33 @@ mod tests {
         set_byte(&mut image, AUTO_POWER_OFF_OFFSET, 2)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         // Raw 2 is 30 minutes on the D75 (0=Off, 1=15, 2=30, 3=60).
-        assert_eq!(mi.settings().auto_power_off(), AutoPowerOff::Min30);
+        assert_eq!(mi.settings().auto_power_off()?, AutoPowerOff::Min30);
         Ok(())
     }
 
     #[test]
-    fn settings_auto_power_off_raw_one_is_fifteen_minutes() -> TestResult {
+    fn settings_auto_power_off_one_is_fifteen_minutes() -> TestResult {
         let mut image = make_settings_image()?;
         set_byte(&mut image, AUTO_POWER_OFF_OFFSET, 1)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().auto_power_off(), AutoPowerOff::Min15);
-        assert_eq!(mi.settings().auto_power_off_raw(), 1);
+        assert_eq!(mi.settings().auto_power_off()?, AutoPowerOff::Min15);
         Ok(())
     }
 
     #[test]
-    fn settings_auto_power_off_unknown_defaults_to_off() -> TestResult {
+    fn settings_auto_power_off_rejects_invalid_stored_value() -> TestResult {
         let mut image = make_settings_image()?;
         set_byte(&mut image, AUTO_POWER_OFF_OFFSET, 0xFF)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().auto_power_off(), AutoPowerOff::Off);
+        assert!(matches!(
+            mi.settings().auto_power_off(),
+            Err(SettingsValueError::InvalidValue {
+                setting: "radio.AutoPowerOff",
+                offset: AUTO_POWER_OFF_OFFSET,
+                value: 0xFF,
+                detail: "must be 0-3",
+            })
+        ));
         Ok(())
     }
 
@@ -1843,7 +2504,10 @@ mod tests {
         let mut image = make_settings_image()?;
         set_byte(&mut image, BATTERY_SAVER_OFFSET, 9)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().battery_saver(), 9);
+        assert_eq!(
+            mi.settings().battery_saver()?,
+            BatterySaverInterval::Seconds5
+        );
         Ok(())
     }
 
@@ -1852,16 +2516,24 @@ mod tests {
         let mut image = make_settings_image()?;
         set_byte(&mut image, BEAT_SHIFT_OFFSET, 7)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().beat_shift(), BeatShift::Type8);
+        assert_eq!(mi.settings().beat_shift()?, BeatShift::Type8);
         Ok(())
     }
 
     #[test]
-    fn settings_beat_shift_invalid_defaults_to_type1() -> TestResult {
+    fn settings_beat_shift_rejects_invalid_stored_value() -> TestResult {
         let mut image = make_settings_image()?;
         set_byte(&mut image, BEAT_SHIFT_OFFSET, 0xFF)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().beat_shift(), BeatShift::Type1);
+        assert!(matches!(
+            mi.settings().beat_shift(),
+            Err(SettingsValueError::InvalidValue {
+                setting: "radio.BeatShift",
+                offset: BEAT_SHIFT_OFFSET,
+                value: 0xFF,
+                detail: "must be 0-7",
+            })
+        ));
         Ok(())
     }
 
@@ -1872,8 +2544,8 @@ mod tests {
         // must not leak into either reader.
         set_byte(&mut image, KEY_LOCK_OFFSET, 0xFC | 0x01)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(mi.settings().key_lock());
-        assert!(!mi.settings().frequency_lock());
+        assert!(mi.settings().key_lock()?);
+        assert!(!mi.settings().frequency_lock()?);
         Ok(())
     }
 
@@ -1882,9 +2554,9 @@ mod tests {
         let mut image = make_settings_image()?;
         set_byte(&mut image, APRS_LOCK_OFFSET, 0x05)?; // frequency + APRS key
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(mi.settings().aprs_lock_frequency());
-        assert!(!mi.settings().aprs_lock_ptt());
-        assert!(mi.settings().aprs_lock_key());
+        assert!(mi.settings().aprs_lock_frequency()?);
+        assert!(!mi.settings().aprs_lock_ptt()?);
+        assert!(mi.settings().aprs_lock_key()?);
         Ok(())
     }
 
@@ -1894,11 +2566,15 @@ mod tests {
         set_byte(&mut image, SPEED_DISTANCE_UNIT_OFFSET, 1)?; // km/h
         set_byte(&mut image, ALTITUDE_RAIN_UNIT_OFFSET, 1)?; // m/mm
         set_byte(&mut image, TEMPERATURE_UNIT_OFFSET, 1)?; // Celsius
+        set_byte(&mut image, COORDINATE_FORMAT_OFFSET, 1)?; // DMS
+        set_byte(&mut image, GRID_SQUARE_FORMAT_OFFSET, 2)?; // SAR CELL
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        let units = mi.settings().display_units();
+        let units = mi.settings().display_units()?;
         assert_eq!(units.speed_distance, SpeedDistanceUnit::KilometersPerHour);
         assert_eq!(units.altitude_rain, AltitudeRainUnit::MetersMm);
         assert_eq!(units.temperature, TemperatureUnit::Celsius);
+        assert_eq!(units.coordinates, CoordinateFormat::Dms);
+        assert_eq!(units.grid_square, GridSquareFormat::SarCell);
         Ok(())
     }
 
@@ -1907,7 +2583,7 @@ mod tests {
         let mut image = make_settings_image()?;
         set_byte(&mut image, LANGUAGE_OFFSET, 1)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert_eq!(mi.settings().language(), Language::Japanese);
+        assert_eq!(mi.settings().language()?, Language::Japanese);
         Ok(())
     }
 
@@ -1919,65 +2595,92 @@ mod tests {
     fn write_key_beep() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        assert!(!mi.settings().key_beep());
-        mi.settings_mut().set_key_beep(true);
-        assert!(mi.settings().key_beep());
-        mi.settings_mut().set_key_beep(false);
-        assert!(!mi.settings().key_beep());
+        assert!(!mi.settings().key_beep()?);
+        mi.settings_mut().set_key_beep(true)?;
+        assert!(mi.settings().key_beep()?);
+        mi.settings_mut().set_key_beep(false)?;
+        assert!(!mi.settings().key_beep()?);
         Ok(())
     }
 
     #[test]
-    fn write_vox_gain_clamped() -> TestResult {
+    fn write_power_on_message_replaces_the_complete_fixed_field() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        mi.settings_mut().set_vox_gain(0xFF);
-        assert_eq!(mi.settings().vox_gain(), 9);
+        let message = PowerOnMessage::new(" READY ")?;
+        mi.settings_mut().set_power_on_message(&message)?;
+        assert_eq!(mi.settings().power_on_message()?.as_str(), " READY ");
+        let settings = mi.settings();
+        let raw = settings
+            .read_bytes(POWER_ON_MESSAGE_OFFSET, POWER_ON_MESSAGE_SIZE)
+            .ok_or("power-on message field is missing")?;
+        assert_eq!(
+            raw, b" READY \0\0\0\0\0\0\0\0\0",
+            "setter must NUL-pad the complete 16-byte field"
+        );
         Ok(())
     }
 
     #[test]
-    fn write_vox_delay_clamped_to_registry_domain() -> TestResult {
-        // The legacy setter accepted up to 30 ("100 ms units" fiction);
-        // the registry domain is 0-6 (250-3000 ms table).
+    fn write_vox_gain_requires_validated_value() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        mi.settings_mut().set_vox_delay(30);
+        assert!(VoxGain::new(0xFF).is_err());
+        let gain = VoxGain::new(9)?;
+        mi.settings_mut().set_vox_gain(gain)?;
+        assert_eq!(mi.settings().vox_gain()?, gain);
+        Ok(())
+    }
+
+    #[test]
+    fn write_vox_delay_requires_validated_value() -> TestResult {
+        let image = make_settings_image()?;
+        let mut mi = crate::memory::MemoryImage::from_raw(image)?;
+        assert!(VoxDelay::new(30).is_err());
+        mi.settings_mut().set_vox_delay(VoxDelay::MS_3000)?;
         assert_eq!(get_byte(mi.as_raw(), VOX_DELAY_OFFSET)?, 6);
+        assert_eq!(mi.settings().vox_delay()?, VoxDelay::MS_3000);
         Ok(())
     }
 
     #[test]
-    fn write_backlight_timer_clamps_to_min_three() -> TestResult {
-        // radio.BacklightTimer has domain 3-60: values below 3 are not
-        // legal stored bytes.
+    fn write_backlight_timer_requires_validated_value() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        mi.settings_mut().set_backlight_timer(0);
+        assert!(BacklightTimer::new(0).is_err());
+        assert!(BacklightTimer::new(61).is_err());
+        mi.settings_mut()
+            .set_backlight_timer(BacklightTimer::new(3)?)?;
         assert_eq!(get_byte(mi.as_raw(), BACKLIGHT_TIMER_OFFSET)?, 3);
-        mi.settings_mut().set_backlight_timer(0xFF);
+        mi.settings_mut()
+            .set_backlight_timer(BacklightTimer::new(60)?)?;
         assert_eq!(get_byte(mi.as_raw(), BACKLIGHT_TIMER_OFFSET)?, 60);
         Ok(())
     }
 
     #[test]
-    fn write_scan_restart_times_clamp_to_min_one() -> TestResult {
+    fn write_scan_restart_times_require_validated_values() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        mi.settings_mut().set_scan_restart_time(0);
-        mi.settings_mut().set_scan_restart_carrier(0);
+        assert!(ScanRestartDelay::new(0).is_err());
+        let one_second = ScanRestartDelay::new(1)?;
+        mi.settings_mut().set_scan_restart_time(one_second)?;
+        mi.settings_mut().set_scan_restart_carrier(one_second)?;
         assert_eq!(get_byte(mi.as_raw(), SCAN_RESTART_TIME_OFFSET)?, 1);
         assert_eq!(get_byte(mi.as_raw(), SCAN_RESTART_CARRIER_OFFSET)?, 1);
         Ok(())
     }
 
     #[test]
-    fn write_emr_volume_level_clamps_to_domain() -> TestResult {
+    fn write_emr_volume_level_requires_validated_value() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        mi.settings_mut().set_emr_volume_level(0);
+        assert!(EmrVolume::new(0).is_err());
+        assert!(EmrVolume::new(51).is_err());
+        mi.settings_mut().set_emr_volume_level(EmrVolume::new(1)?)?;
         assert_eq!(get_byte(mi.as_raw(), EMR_VOLUME_LEVEL_OFFSET)?, 1);
-        mi.settings_mut().set_emr_volume_level(0xFF);
+        mi.settings_mut()
+            .set_emr_volume_level(EmrVolume::new(50)?)?;
         assert_eq!(get_byte(mi.as_raw(), EMR_VOLUME_LEVEL_OFFSET)?, 50);
         Ok(())
     }
@@ -1986,8 +2689,8 @@ mod tests {
     fn write_beat_shift() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        mi.settings_mut().set_beat_shift(BeatShift::Type5);
-        assert_eq!(mi.settings().beat_shift(), BeatShift::Type5);
+        mi.settings_mut().set_beat_shift(BeatShift::Type5)?;
+        assert_eq!(mi.settings().beat_shift()?, BeatShift::Type5);
         assert_eq!(get_byte(mi.as_raw(), BEAT_SHIFT_OFFSET)?, 4);
         Ok(())
     }
@@ -1996,37 +2699,35 @@ mod tests {
     fn write_auto_power_off_enum_encoding() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        mi.settings_mut().set_auto_power_off(AutoPowerOff::Min15);
+        mi.settings_mut().set_auto_power_off(AutoPowerOff::Min15)?;
         assert_eq!(get_byte(mi.as_raw(), AUTO_POWER_OFF_OFFSET)?, 1);
-        mi.settings_mut().set_auto_power_off(AutoPowerOff::Min60);
+        mi.settings_mut().set_auto_power_off(AutoPowerOff::Min60)?;
         assert_eq!(get_byte(mi.as_raw(), AUTO_POWER_OFF_OFFSET)?, 3);
         Ok(())
     }
 
     #[test]
-    fn write_pf_keys_validate_the_gapped_domain() -> TestResult {
+    fn write_pf_keys_accept_only_typed_official_assignments() -> TestResult {
         let image = make_settings_image()?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
-        mi.settings_mut().set_pf_key1(30)?;
-        assert_eq!(mi.settings().pf_key1(), 30);
-        mi.settings_mut().set_pf_key2(11)?;
-        assert_eq!(mi.settings().pf_key2(), 11);
+        mi.settings_mut()
+            .set_pf_key1(FrontPanelPfFunction::MemoryInput)?;
+        assert_eq!(
+            mi.settings().pf_key1()?,
+            StoredFrontPanelPfAssignment::Official(FrontPanelPfFunction::MemoryInput)
+        );
+        mi.settings_mut().set_pf_key2(FrontPanelPfFunction::Gps)?;
+        assert_eq!(
+            mi.settings().pf_key2()?,
+            StoredFrontPanelPfAssignment::Official(FrontPanelPfFunction::Gps)
+        );
 
         for invalid in [5u8, 23, 25, 26, 31, 0xFF] {
-            let result = mi.settings_mut().set_pf_key1(invalid);
             assert!(
-                result.is_err(),
-                "PF1 raw {invalid} must be rejected: {result:?}"
-            );
-            let result = mi.settings_mut().set_pf_key2(invalid);
-            assert!(
-                result.is_err(),
-                "PF2 raw {invalid} must be rejected: {result:?}"
+                FrontPanelPfFunction::try_from(invalid).is_err(),
+                "PF raw {invalid} must not construct an official assignment"
             );
         }
-        // Rejected writes must not have modified the stored bytes.
-        assert_eq!(mi.settings().pf_key1(), 30);
-        assert_eq!(mi.settings().pf_key2(), 11);
         Ok(())
     }
 
@@ -2037,8 +2738,16 @@ mod tests {
         set_byte(&mut image, PF_KEY2_OFFSET, 0xFF)?;
         let mi = crate::memory::MemoryImage::from_raw(image)?;
 
-        assert_eq!(mi.settings().pf_key1(), 31);
-        assert_eq!(mi.settings().pf_key2(), 0xFF);
+        assert_eq!(mi.settings().pf_key1()?.as_raw(), 31);
+        assert_eq!(mi.settings().pf_key2()?.as_raw(), 0xFF);
+        assert!(matches!(
+            mi.settings().pf_key1()?,
+            StoredFrontPanelPfAssignment::OffMenu(_)
+        ));
+        assert!(matches!(
+            mi.settings().pf_key2()?,
+            StoredFrontPanelPfAssignment::OffMenu(_)
+        ));
         Ok(())
     }
 
@@ -2049,13 +2758,13 @@ mod tests {
         set_byte(&mut image, KEY_LOCK_OFFSET, 0xFC)?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
 
-        mi.settings_mut().set_key_lock(true);
+        mi.settings_mut().set_key_lock(true)?;
         assert_eq!(get_byte(mi.as_raw(), KEY_LOCK_OFFSET)?, 0xFD);
-        mi.settings_mut().set_frequency_lock(true);
+        mi.settings_mut().set_frequency_lock(true)?;
         assert_eq!(get_byte(mi.as_raw(), KEY_LOCK_OFFSET)?, 0xFF);
-        mi.settings_mut().set_key_lock(false);
+        mi.settings_mut().set_key_lock(false)?;
         assert_eq!(get_byte(mi.as_raw(), KEY_LOCK_OFFSET)?, 0xFE);
-        mi.settings_mut().set_frequency_lock(false);
+        mi.settings_mut().set_frequency_lock(false)?;
         assert_eq!(get_byte(mi.as_raw(), KEY_LOCK_OFFSET)?, 0xFC);
         Ok(())
     }
@@ -2067,16 +2776,16 @@ mod tests {
         set_byte(&mut image, APRS_LOCK_OFFSET, 0xF8)?;
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
 
-        mi.settings_mut().set_aprs_lock_frequency(true);
+        mi.settings_mut().set_aprs_lock_frequency(true)?;
         assert_eq!(get_byte(mi.as_raw(), APRS_LOCK_OFFSET)?, 0xF9);
-        mi.settings_mut().set_aprs_lock_ptt(true);
+        mi.settings_mut().set_aprs_lock_ptt(true)?;
         assert_eq!(get_byte(mi.as_raw(), APRS_LOCK_OFFSET)?, 0xFB);
-        mi.settings_mut().set_aprs_lock_key(true);
+        mi.settings_mut().set_aprs_lock_key(true)?;
         assert_eq!(get_byte(mi.as_raw(), APRS_LOCK_OFFSET)?, 0xFF);
-        mi.settings_mut().set_aprs_lock_ptt(false);
+        mi.settings_mut().set_aprs_lock_ptt(false)?;
         assert_eq!(get_byte(mi.as_raw(), APRS_LOCK_OFFSET)?, 0xFD);
-        mi.settings_mut().set_aprs_lock_frequency(false);
-        mi.settings_mut().set_aprs_lock_key(false);
+        mi.settings_mut().set_aprs_lock_frequency(false)?;
+        mi.settings_mut().set_aprs_lock_key(false)?;
         assert_eq!(get_byte(mi.as_raw(), APRS_LOCK_OFFSET)?, 0xF8);
         Ok(())
     }
@@ -2087,23 +2796,23 @@ mod tests {
         let mut mi = crate::memory::MemoryImage::from_raw(image)?;
 
         // Set everything to non-default values.
-        mi.settings_mut().set_key_beep(true);
-        mi.settings_mut().set_vox_enabled(true);
-        mi.settings_mut().set_vox_gain(9);
-        mi.settings_mut().set_dual_band(true);
-        mi.settings_mut().set_attenuator_a(true);
-        mi.settings_mut().set_power_level_a(PowerLevel::ExtraLow);
-        mi.settings_mut().set_bluetooth(true);
+        mi.settings_mut().set_key_beep(true)?;
+        mi.settings_mut().set_vox_enabled(true)?;
+        mi.settings_mut().set_vox_gain(VoxGain::new(9)?)?;
+        mi.settings_mut().set_band_mode(BandMode::Dual)?;
+        mi.settings_mut().set_attenuator_a(true)?;
+        mi.settings_mut().set_power_level_a(PowerLevel::ExtraLow)?;
+        mi.settings_mut().set_bluetooth(true)?;
 
         // Verify reads match.
         let s = mi.settings();
-        assert!(s.key_beep());
-        assert!(s.vox_enabled());
-        assert_eq!(s.vox_gain(), 9);
-        assert!(s.dual_band());
-        assert!(s.attenuator_a());
-        assert_eq!(s.power_level_a(), PowerLevel::ExtraLow);
-        assert!(s.bluetooth());
+        assert!(s.key_beep()?);
+        assert!(s.vox_enabled()?);
+        assert_eq!(s.vox_gain()?, VoxGain::new(9)?);
+        assert_eq!(s.band_mode()?, BandMode::Dual);
+        assert!(s.attenuator_a()?);
+        assert_eq!(s.power_level_a()?, PowerLevel::ExtraLow);
+        assert!(s.bluetooth()?);
 
         // Verify raw bytes at the verified offsets.
         let raw = mi.as_raw();
@@ -2122,9 +2831,24 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A setter invocation for the offset-audit table.
-    type ApplySetter = fn(&mut SettingsWriter<'_>);
+    type ApplySetter = fn(&mut SettingsWriter<'_>) -> Result<(), SettingsValueError>;
 
-    /// Every settings setter, paired with the flash offset it must
+    fn test_value<T>(
+        value: Result<T, ValidationError>,
+        setting: &'static str,
+        offset: usize,
+        raw: u8,
+        detail: &'static str,
+    ) -> Result<T, SettingsValueError> {
+        value.map_err(|_| SettingsValueError::InvalidValue {
+            setting,
+            offset,
+            value: raw,
+            detail,
+        })
+    }
+
+    /// Every single-byte settings setter, paired with the flash offset it must
     /// write, transcribed INDEPENDENTLY from the MCP-D75 registry map
     /// (hex literals, not the `*_OFFSET` constants): a transposed
     /// digit in a constant would corrupt an unrelated radio setting on
@@ -2133,132 +2857,207 @@ mod tests {
     /// setters that share a byte with other registry fields.
     static SETTER_OFFSET_TABLE: &[(&str, usize, Option<u8>, ApplySetter)] = &[
         ("set_beat_shift", 0x1000, None, |s| {
-            s.set_beat_shift(BeatShift::Type2);
+            s.set_beat_shift(BeatShift::Type2)
         }),
         ("set_tx_inhibit", 0x1001, None, |s| s.set_tx_inhibit(true)),
         ("set_timeout_timer", 0x1003, None, |s| {
-            s.set_timeout_timer(1);
+            s.set_timeout_timer(TransmitTimeout::Seconds60)
         }),
         ("set_mic_sensitivity", 0x1006, None, |s| {
-            s.set_mic_sensitivity(1);
+            s.set_mic_sensitivity(crate::types::settings::MicSensitivity::Medium)
         }),
-        ("set_ssb_high_cut", 0x1008, None, |s| s.set_ssb_high_cut(1)),
-        ("set_cw_width", 0x1009, None, |s| s.set_cw_width(1)),
-        ("set_am_high_cut", 0x100A, None, |s| s.set_am_high_cut(1)),
-        ("set_scan_resume", 0x100C, None, |s| s.set_scan_resume(1)),
+        ("set_ssb_high_cut", 0x1008, None, |s| {
+            s.set_ssb_high_cut(SsbHighCut::Khz2_4)
+        }),
+        ("set_cw_width", 0x1009, None, |s| {
+            s.set_cw_width(CwFilterWidth::Khz0_5)
+        }),
+        ("set_am_high_cut", 0x100A, None, |s| {
+            s.set_am_high_cut(AmHighCut::Khz4_5)
+        }),
+        ("set_scan_resume", 0x100C, None, |s| {
+            s.set_scan_resume(ScanResumeMethod::CarrierOperated)
+        }),
         ("set_digital_scan_resume", 0x100D, None, |s| {
-            s.set_digital_scan_resume(1);
+            s.set_digital_scan_resume(ScanResumeMethod::CarrierOperated)
         }),
         ("set_scan_restart_time", 0x100E, None, |s| {
-            s.set_scan_restart_time(1);
+            let delay = test_value(
+                ScanRestartDelay::new(2),
+                "radio.TimeRestart",
+                SCAN_RESTART_TIME_OFFSET,
+                2,
+                "must be 1-10 seconds",
+            )?;
+            s.set_scan_restart_time(delay)
         }),
         ("set_scan_restart_carrier", 0x100F, None, |s| {
-            s.set_scan_restart_carrier(1);
+            let delay = test_value(
+                ScanRestartDelay::new(2),
+                "radio.CarrierRestart",
+                SCAN_RESTART_CARRIER_OFFSET,
+                2,
+                "must be 1-10 seconds",
+            )?;
+            s.set_scan_restart_carrier(delay)
         }),
         ("set_repeater_auto_offset", 0x1018, None, |s| {
-            s.set_repeater_auto_offset(true);
+            s.set_repeater_auto_offset(true)
         }),
         ("set_repeater_call_key", 0x1019, None, |s| {
-            s.set_repeater_call_key(1);
+            s.set_repeater_call_key(RepeaterCallKey::Tone1750Hz)
         }),
         ("set_vox_enabled", 0x101B, None, |s| s.set_vox_enabled(true)),
-        ("set_vox_gain", 0x101C, None, |s| s.set_vox_gain(1)),
-        ("set_vox_delay", 0x101D, None, |s| s.set_vox_delay(1)),
-        ("set_vox_tx_on_busy", 0x101E, None, |s| {
-            s.set_vox_tx_on_busy(true);
+        ("set_vox_gain", 0x101C, None, |s| {
+            let gain = VoxGain::new(1).map_err(|_| SettingsValueError::InvalidValue {
+                setting: "radio.VoxGain",
+                offset: VOX_GAIN_OFFSET,
+                value: 1,
+                detail: "must be 0-9",
+            })?;
+            s.set_vox_gain(gain)
         }),
-        ("set_dtmf_speed", 0x101F, None, |s| s.set_dtmf_speed(1)),
+        ("set_vox_delay", 0x101D, None, |s| {
+            s.set_vox_delay(VoxDelay::MS_500)
+        }),
+        ("set_vox_tx_on_busy", 0x101E, None, |s| {
+            s.set_vox_tx_on_busy(true)
+        }),
+        ("set_dtmf_speed", 0x101F, None, |s| {
+            s.set_dtmf_speed(DtmfToneDuration::Ms100)
+        }),
         ("set_dtmf_pause_time", 0x1020, None, |s| {
-            s.set_dtmf_pause_time(1);
+            s.set_dtmf_pause_time(DtmfPause::Ms250)
         }),
         ("set_dtmf_tx_hold", 0x1021, None, |s| {
-            s.set_dtmf_tx_hold(true);
+            s.set_dtmf_tx_hold(true)
         }),
-        ("set_cw_pitch", 0x1024, None, |s| s.set_cw_pitch(1)),
+        ("set_cw_pitch", 0x1024, None, |s| {
+            let pitch = CwPitch::new(500).map_err(|_| SettingsValueError::InvalidValue {
+                setting: "radio.CwPitchFreq",
+                offset: CW_PITCH_OFFSET,
+                value: 1,
+                detail: "must be 0-6 (400-1000 Hz)",
+            })?;
+            s.set_cw_pitch(pitch)
+        }),
         ("set_auto_mute_return_time", 0x1041, None, |s| {
-            s.set_auto_mute_return_time(2);
+            let delay = test_value(
+                AutoMuteReturnDelay::new(2),
+                "radio.AutoMuteRetTime",
+                AUTO_MUTE_RETURN_TIME_OFFSET,
+                2,
+                "must be 1-10 seconds",
+            )?;
+            s.set_auto_mute_return_time(delay)
         }),
         ("set_backlight_control", 0x1060, None, |s| {
-            s.set_backlight_control(1);
+            s.set_backlight_control(BacklightControl::On)
         }),
         ("set_backlight_timer", 0x1061, None, |s| {
-            s.set_backlight_timer(10);
+            let timer = test_value(
+                BacklightTimer::new(10),
+                "radio.BacklightTimer",
+                BACKLIGHT_TIMER_OFFSET,
+                10,
+                "must be 3-60 seconds",
+            )?;
+            s.set_backlight_timer(timer)
         }),
         ("set_key_beep", 0x1071, None, |s| s.set_key_beep(true)),
-        ("set_beep_volume", 0x1072, None, |s| s.set_beep_volume(1)),
-        ("set_announce", 0x1073, None, |s| s.set_announce(1)),
-        ("set_voice_volume", 0x1074, None, |s| s.set_voice_volume(1)),
+        ("set_beep_volume", 0x1072, None, |s| {
+            let volume = test_value(
+                LinkedVolumeLevel::fixed(1),
+                "radio.BeepVolume",
+                BEEP_VOLUME_OFFSET,
+                1,
+                "must be 0-7, where 0 means VOL Link",
+            )?;
+            s.set_beep_volume(volume)
+        }),
+        ("set_announce", 0x1073, None, |s| {
+            s.set_announce(VoiceAnnounceMode::Manual)
+        }),
+        ("set_voice_volume", 0x1074, None, |s| {
+            let volume = test_value(
+                LinkedVolumeLevel::fixed(1),
+                "radio.VoiceAnnounceVolume",
+                VOICE_VOLUME_OFFSET,
+                1,
+                "must be 0-7, where 0 means VOL Link",
+            )?;
+            s.set_voice_volume(volume)
+        }),
         ("set_battery_saver", 0x1076, None, |s| {
-            s.set_battery_saver(1);
+            s.set_battery_saver(BatterySaverInterval::Seconds0_2)
         }),
         ("set_auto_power_off", 0x1077, None, |s| {
-            s.set_auto_power_off(AutoPowerOff::Min15);
-        }),
-        ("set_auto_power_off_raw", 0x1077, None, |s| {
-            s.set_auto_power_off_raw(1);
+            s.set_auto_power_off(AutoPowerOff::Min15)
         }),
         ("set_bluetooth", 0x1078, None, |s| s.set_bluetooth(true)),
         ("set_bt_auto_connect", 0x1079, None, |s| {
-            s.set_bt_auto_connect(true);
+            s.set_bt_auto_connect(true)
         }),
         ("set_pf_key1", 0x107A, None, |s| {
-            drop(s.set_pf_key1(1));
+            s.set_pf_key1(FrontPanelPfFunction::VoiceMessage1)
         }),
         ("set_pf_key2", 0x107B, None, |s| {
-            drop(s.set_pf_key2(1));
+            s.set_pf_key2(FrontPanelPfFunction::VoiceMessage1)
         }),
         ("set_key_lock", 0x1084, Some(0x01), |s| s.set_key_lock(true)),
         ("set_frequency_lock", 0x1084, Some(0x02), |s| {
-            s.set_frequency_lock(true);
+            s.set_frequency_lock(true)
         }),
         ("set_volume_lock", 0x1087, None, |s| s.set_volume_lock(true)),
         ("set_speed_distance_unit", 0x1088, None, |s| {
-            s.set_speed_distance_unit(SpeedDistanceUnit::KilometersPerHour);
-        }),
-        ("set_speed_distance_unit_raw", 0x1088, None, |s| {
-            s.set_speed_distance_unit_raw(1);
+            s.set_speed_distance_unit(SpeedDistanceUnit::KilometersPerHour)
         }),
         ("set_altitude_rain_unit", 0x1089, None, |s| {
-            s.set_altitude_rain_unit(AltitudeRainUnit::MetersMm);
-        }),
-        ("set_altitude_rain_unit_raw", 0x1089, None, |s| {
-            s.set_altitude_rain_unit_raw(1);
+            s.set_altitude_rain_unit(AltitudeRainUnit::MetersMm)
         }),
         ("set_temperature_unit", 0x108A, None, |s| {
-            s.set_temperature_unit(TemperatureUnit::Celsius);
+            s.set_temperature_unit(TemperatureUnit::Celsius)
         }),
-        ("set_temperature_unit_raw", 0x108A, None, |s| {
-            s.set_temperature_unit_raw(1);
+        ("set_gps_pc_output_interface", 0x108E, None, |s| {
+            s.set_gps_pc_output_interface(PcOutputInterface::Bluetooth)
         }),
-        ("set_gps_bt_interface", 0x108E, None, |s| {
-            s.set_gps_bt_interface(1);
-        }),
-        ("set_aprs_usb_mode", 0x108F, None, |s| {
-            s.set_aprs_usb_mode(1);
+        ("set_aprs_pc_output_interface", 0x108F, None, |s| {
+            s.set_aprs_pc_output_interface(PcOutputInterface::Bluetooth)
         }),
         ("set_language", 0x1092, None, |s| {
-            s.set_language(Language::Japanese);
+            s.set_language(Language::Japanese)
         }),
-        ("set_voice_speed", 0x1097, None, |s| s.set_voice_speed(1)),
+        ("set_voice_speed", 0x1097, None, |s| {
+            s.set_voice_speed(VoiceGuideSpeed::Speed2)
+        }),
         ("set_aprs_lock_frequency", 0x120A, Some(0x01), |s| {
-            s.set_aprs_lock_frequency(true);
+            s.set_aprs_lock_frequency(true)
         }),
         ("set_aprs_lock_ptt", 0x120A, Some(0x02), |s| {
-            s.set_aprs_lock_ptt(true);
+            s.set_aprs_lock_ptt(true)
         }),
         ("set_aprs_lock_key", 0x120A, Some(0x04), |s| {
-            s.set_aprs_lock_key(true);
+            s.set_aprs_lock_key(true)
         }),
         ("set_emr_volume_level", 0x1A03, None, |s| {
-            s.set_emr_volume_level(2);
+            let volume = test_value(
+                EmrVolume::new(2),
+                "dv.EmrVolumeLevelTxRx",
+                EMR_VOLUME_LEVEL_OFFSET,
+                2,
+                "must be 1-50",
+            )?;
+            s.set_emr_volume_level(volume)
         }),
         ("set_power_level_a", 0x0359, None, |s| {
-            s.set_power_level_a(PowerLevel::ExtraLow);
+            s.set_power_level_a(PowerLevel::ExtraLow)
         }),
         ("set_attenuator_a", 0x035C, None, |s| {
-            s.set_attenuator_a(true);
+            s.set_attenuator_a(true)
         }),
-        ("set_dual_band", 0x0396, None, |s| s.set_dual_band(true)),
+        ("set_band_mode", 0x0396, None, |s| {
+            s.set_band_mode(BandMode::Dual)
+        }),
     ];
 
     /// Applies every entry of [`SETTER_OFFSET_TABLE`] to a fresh image
@@ -2267,12 +3066,12 @@ mod tests {
     /// setters, additionally asserts the change stayed within the
     /// owned bits.
     #[test]
-    fn every_setter_writes_exactly_one_byte_at_its_documented_offset() -> TestResult {
+    fn every_single_byte_setter_writes_its_documented_offset() -> TestResult {
         for (name, offset, mask, apply) in SETTER_OFFSET_TABLE {
             let image = make_settings_image()?;
             let mut mi = crate::memory::MemoryImage::from_raw(image)?;
             let before = mi.as_raw().to_vec();
-            apply(&mut mi.settings_mut());
+            apply(&mut mi.settings_mut())?;
             let after = mi.as_raw();
             let diffs: Vec<usize> = before
                 .iter()
@@ -2304,7 +3103,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Registry codec shape expected for one settings-layer binding.
-    /// Byte domains are the clamp bounds the setters enforce, so a
+    /// Byte domains are the exact domains the typed accessors enforce, so a
     /// registry regeneration that changes a domain fails this test
     /// until the accessor is re-audited.
     enum ExpectedCodec {
@@ -2312,9 +3111,9 @@ mod tests {
         Bool,
         /// `FieldCodec::Byte` with this inclusive domain.
         Byte {
-            /// Smallest legal raw value (setter clamp floor).
+            /// Smallest legal raw value.
             min: u8,
-            /// Largest legal raw value (setter clamp ceiling).
+            /// Largest legal raw value.
             max: u8,
         },
         /// `FieldCodec::BitBool` with exactly this owned mask.
@@ -2520,6 +3319,16 @@ mod tests {
             ExpectedCodec::Byte { min: 0, max: 1 },
         ),
         (
+            COORDINATE_FORMAT_OFFSET,
+            "radio.LatitudeLongitude",
+            ExpectedCodec::Byte { min: 0, max: 1 },
+        ),
+        (
+            GRID_SQUARE_FORMAT_OFFSET,
+            "radio.GridSquareFormat",
+            ExpectedCodec::Byte { min: 0, max: 2 },
+        ),
+        (
             GPS_BT_INTERFACE_OFFSET,
             "radio.PcOutputInterfaceGps",
             ExpectedCodec::Byte { min: 0, max: 1 },
@@ -2589,7 +3398,7 @@ mod tests {
                     assert_eq!(
                         (*min, *max),
                         (reg_min, reg_max),
-                        "{name}: accessor clamp bounds diverge from the registry domain"
+                        "{name}: accessor domain diverges from the registry domain"
                     );
                 }
                 (ExpectedCodec::BitBool { mask }, FieldCodec::BitBool { mask: reg_mask }) => {
@@ -2649,9 +3458,9 @@ mod tests {
         }
     }
 
-    /// The PF-key setters hand-code the registry's gapped domain; pin
-    /// the gap set to the generated option list so a registry change
-    /// cannot silently outdate the validator.
+    /// The PF assignment type encodes the registry's gapped domain; pin
+    /// the variant set to the generated option list so a registry change
+    /// cannot silently outdate the type.
     #[test]
     fn pf_key_validation_matches_the_registry_options() -> TestResult {
         for name in ["radio.Pf1PfKey", "radio.Pf2PfKey"] {
@@ -2659,9 +3468,9 @@ mod tests {
             for raw in 0..=30_u8 {
                 let in_registry = field.option(u64::from(raw)).is_some();
                 assert_eq!(
-                    pf_key_valid(raw),
+                    FrontPanelPfFunction::try_from(raw).is_ok(),
                     in_registry,
-                    "{name}: validator and registry disagree about raw value {raw}"
+                    "{name}: typed domain and registry disagree about raw value {raw}"
                 );
             }
         }

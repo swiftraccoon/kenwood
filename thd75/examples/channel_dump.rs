@@ -19,6 +19,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -30,6 +31,7 @@ use tracing as _;
 
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::SerialTransport;
+use kenwood_thd75::types::RegularChannel;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,8 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "/dev/cu.usbmodem1234".to_owned());
 
     println!("Connecting to {port}...");
-    let transport = SerialTransport::open(&port, 115_200)?;
-    let mut radio = Radio::connect(transport).await?;
+    let transport = SerialTransport::open(&port)?;
+    let mut radio = Radio::new(transport);
 
     let info = radio.identify().await?;
     println!("Connected to: {}\n", info.model);
@@ -52,22 +54,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Reading channels via CAT...\n");
     let mut populated = Vec::new();
 
-    for ch in 0..1000_u16 {
-        match radio.read_channel(ch).await {
-            Ok(data) if data.rx_frequency.as_hz() > 0 => {
+    for channel in RegularChannel::all() {
+        match radio.get_regular_channel_record(channel).await {
+            Ok(data) if data.channel.receive_frequency.as_hz() > 0 => {
                 println!(
-                    "CH {:03}: {} {} shift={} step={:?}",
-                    ch,
-                    data.rx_frequency,
-                    data.urcall.as_str(),
-                    data.shift.as_u8(),
-                    data.step_size,
+                    "CH {:03}: {} {} shift={} step={:?} transmit={} lockout={}",
+                    channel,
+                    data.channel.receive_frequency,
+                    data.channel.ur_call.as_str(),
+                    u8::from(data.channel.shift),
+                    data.channel.receive_step,
+                    data.transmit_value(),
+                    data.scan_lockout,
                 );
-                populated.push(ch);
+                populated.push(channel);
             }
             Ok(_) => {} // empty channel
             Err(e) => {
-                eprintln!("CH {ch:03}: error: {e}");
+                eprintln!("CH {channel:03}: error: {e}");
             }
         }
     }
@@ -77,15 +81,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Optionally read display names via MCP programming mode.
     if read_names {
         println!("\nEntering programming mode to read channel names...");
-        println!("(USB connection will reset after this operation)\n");
+        println!("(USB will reset and the library will restore CAT before returning)\n");
 
         let names = radio.read_channel_names().await?;
-        for (i, name) in names.iter().enumerate() {
+        for (channel, name) in RegularChannel::all().zip(&names) {
             if !name.is_empty() {
-                println!("CH {i:03}: {name}");
+                println!("CH {channel:03}: {name}");
             }
         }
-        println!("\nDone. USB connection has been reset by the radio.");
+        println!("\nDone. CAT was restored after the radio reset USB.");
     } else {
         radio.disconnect().await?;
         println!("Disconnected.");

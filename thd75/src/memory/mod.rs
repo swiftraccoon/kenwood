@@ -16,7 +16,9 @@
 //! Mutation works the same way: call a mutable accessor, modify a
 //! field, and the change is written directly into the backing buffer.
 //! When you are done, call [`MemoryImage::into_raw`] to get the bytes
-//! back for writing to the radio or saving to a `.d75` file.
+//! back for writing to the radio. A complete `.d75` file is represented by
+//! [`crate::sdcard::config::RadioConfig`], which retains its otherwise opaque
+//! 256-byte header alongside this image.
 
 pub mod aprs;
 pub mod channels;
@@ -27,12 +29,10 @@ mod menu_patch;
 pub mod schema;
 pub mod settings;
 
-use crate::sdcard::SdCardError;
-
 use std::fmt;
 
 use crate::protocol::programming;
-use crate::sdcard::config::{self as d75, ConfigHeader};
+use crate::types::{FirmwareIdentity, RadioModel, RegularChannel};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -56,6 +56,21 @@ pub enum MemoryError {
         /// The maximum valid channel number (inclusive).
         max: u16,
     },
+    /// A channel entry cannot be represented without violating its typed
+    /// memory-image invariants.
+    InvalidChannelEntry {
+        /// Channel containing the invalid value.
+        channel: RegularChannel,
+        /// Human-readable validation failure.
+        detail: String,
+    },
+    /// A requested region's end offset cannot be represented by [`usize`].
+    RegionEndOverflow {
+        /// Byte offset where the region would begin.
+        offset: usize,
+        /// Requested region length in bytes.
+        length: usize,
+    },
     /// A region could not be parsed.
     ParseError {
         /// The region name (e.g. "channel 42 data").
@@ -63,10 +78,17 @@ pub enum MemoryError {
         /// Human-readable detail.
         detail: String,
     },
-    /// The `.d75` file is invalid.
-    D75Error {
-        /// Human-readable detail.
-        detail: String,
+    /// A typed settings read or write rejected a missing or invalid byte.
+    SettingsValue {
+        /// The underlying typed settings error.
+        source: SettingsValueError,
+    },
+    /// A single-setting mutation changed more than one backing byte.
+    MultipleSettingBytesChanged {
+        /// First changed MCP byte offset.
+        first: u16,
+        /// Second changed MCP byte offset.
+        second: u16,
     },
 }
 
@@ -82,26 +104,41 @@ impl fmt::Display for MemoryError {
             Self::ChannelOutOfRange { channel, max } => {
                 write!(f, "channel {channel} out of range (max {max})")
             }
+            Self::InvalidChannelEntry { channel, detail } => {
+                write!(f, "invalid channel {channel}: {detail}")
+            }
+            Self::RegionEndOverflow { offset, length } => write!(
+                f,
+                "memory region end overflows usize: offset {offset} + length {length}"
+            ),
             Self::ParseError { region, detail } => {
                 write!(f, "failed to parse {region}: {detail}")
             }
-            Self::D75Error { detail } => {
-                write!(f, "invalid .d75 file: {detail}")
-            }
+            Self::SettingsValue { source } => source.fmt(f),
+            Self::MultipleSettingBytesChanged { first, second } => write!(
+                f,
+                "single-setting mutation changed MCP bytes 0x{first:04X} and 0x{second:04X}"
+            ),
         }
     }
 }
 
 impl std::error::Error for MemoryError {}
 
+impl From<SettingsValueError> for MemoryError {
+    fn from(source: SettingsValueError) -> Self {
+        Self::SettingsValue { source }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Re-exports for convenience
 // ---------------------------------------------------------------------------
 
 pub use aprs::AprsAccess;
-pub use channels::{ChannelAccess, ChannelWriter};
+pub use channels::{ChannelAccess, ChannelEntry, ChannelWriter};
 pub use dstar::DstarAccess;
-pub use gps::GpsAccess;
+pub use gps::{GpsAccess, GpsValueError};
 pub use menu_fields::{
     MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_VERSION, MCP_D75_SOURCE_SHA256, MenuField, MenuOption,
     StorageTransform, menu_field,
@@ -110,7 +147,7 @@ pub use schema::{
     BytePatch, DecodedFieldValue, Endian, FieldCodec, FieldDescriptor, FieldValue, PagePatch,
     PatchPlanner, PatchSet, SchemaError, StringEncoding,
 };
-pub use settings::{SettingsAccess, SettingsWriter};
+pub use settings::{SettingsAccess, SettingsValueError, SettingsWriter};
 
 /// Radio model whose live MCP layout is represented by the generated schema.
 pub const MCP_D75_SCHEMA_MODEL: &str = "TH-D75";
@@ -130,16 +167,16 @@ pub const MCP_D75_SCHEMA_FIRMWARE_IDENTITIES: &[&str] = &["1.03", "1.03.000", "1
 /// [`MCP_D75_SCHEMA_FIRMWARE_IDENTITIES`]. All other strings are rejected,
 /// including later build suffixes such as `1.03.001`.
 #[must_use]
-pub fn canonicalize_mcp_d75_schema_firmware(firmware: &str) -> Option<&'static str> {
+pub fn canonicalize_mcp_d75_schema_firmware(firmware: &FirmwareIdentity) -> Option<&'static str> {
     MCP_D75_SCHEMA_FIRMWARE_IDENTITIES
-        .contains(&firmware)
+        .contains(&firmware.as_str())
         .then_some(MCP_D75_SCHEMA_FIRMWARE)
 }
 
 /// Whether a live CAT identity exactly matches the MCP-D75 schema target.
 #[must_use]
-pub fn is_supported_mcp_d75_schema_target(model: &str, firmware: &str) -> bool {
-    model == MCP_D75_SCHEMA_MODEL && canonicalize_mcp_d75_schema_firmware(firmware).is_some()
+pub fn is_supported_mcp_d75_schema_target(model: RadioModel, firmware: &FirmwareIdentity) -> bool {
+    model == RadioModel::ThD75 && canonicalize_mcp_d75_schema_firmware(firmware).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -148,24 +185,29 @@ pub fn is_supported_mcp_d75_schema_target(model: &str, firmware: &str) -> bool {
 
 /// A parsed TH-D75 memory image providing typed access to all settings.
 ///
-/// The image is exactly [`programming::TOTAL_SIZE`] bytes (500,480).
-/// Create one from a raw MCP dump, or from a `.d75` file via
-/// [`from_d75_file`](Self::from_d75_file).
+/// The image is exactly [`programming::TOTAL_SIZE`] bytes (500,480). Create one
+/// from a raw MCP dump. Parse a complete `.d75` file with
+/// [`crate::sdcard::config::parse_config`] so its opaque header remains paired
+/// with the image in a [`crate::sdcard::config::RadioConfig`].
 ///
 /// # Examples
 ///
 /// ```rust,no_run
-/// use kenwood_thd75::memory::MemoryImage;
+/// use kenwood_thd75::{RegularChannel, memory::MemoryImage};
 ///
-/// # fn example(raw: Vec<u8>) -> Result<(), kenwood_thd75::memory::MemoryError> {
+/// # fn example(raw: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
 /// let image = MemoryImage::from_raw(raw)?;
 ///
 /// // Read channel 0.
 /// let channels = image.channels();
-/// if channels.is_used(0) {
-///     if let Some(entry) = channels.get(0) {
-///         println!("Ch 0: {} ({} Hz)", entry.name, entry.flash.rx_frequency.as_hz());
-///     }
+/// let channel = RegularChannel::new(0)?;
+/// let entry = channels.get(channel)?;
+/// if let Some(programmed) = entry.programmed() {
+///     println!(
+///         "Ch 0: {} ({} Hz)",
+///         entry.name(),
+///         programmed.receive_frequency.as_hz()
+///     );
 /// }
 ///
 /// // Get the raw bytes back for writing.
@@ -217,7 +259,7 @@ impl MemoryImage {
     /// Apply a schema-generated menu patch set to this complete image.
     ///
     /// This is the offline counterpart to
-    /// [`Radio::apply_menu_patches`](crate::radio::Radio::apply_menu_patches).
+    /// [`Radio::apply_menu_patches_via_mcp`](crate::radio::Radio::apply_menu_patches_via_mcp).
     /// Masked bit fields preserve unrelated bits already present in the
     /// image. Patch sets built by [`PatchPlanner`] are validated at plan
     /// time, so they can never address bytes outside the radio's memory
@@ -259,18 +301,19 @@ impl MemoryImage {
     /// Apply a settings mutation and return the changed byte's MCP offset
     /// and new value.
     ///
-    /// The closure receives a `SettingsWriter` to modify exactly one setting.
-    /// This method snapshots the settings page before the closure, runs it,
-    /// then diffs to find the single changed byte. Returns `Some((offset, value))`
-    /// if a byte changed, or `None` if nothing changed.
+    /// The closure receives a [`SettingsWriter`] and must modify at most one
+    /// stored byte. The mutation is transactional: a rejected value or a
+    /// multi-byte change restores the original settings region.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if more than one byte changed (the closure should modify
-    /// exactly one setting).
-    pub fn modify_setting<F>(&mut self, f: F) -> Option<(u16, u8)>
+    /// Returns [`MemoryError::SettingsValue`] if the typed setter rejects the
+    /// operation, [`MemoryError::MultipleSettingBytesChanged`] if the closure
+    /// changes more than one byte, or [`MemoryError::InvalidSize`] if the
+    /// complete settings region is unavailable.
+    pub fn modify_setting<F>(&mut self, f: F) -> Result<Option<(u16, u8)>, MemoryError>
     where
-        F: FnOnce(&mut SettingsWriter<'_>),
+        F: FnOnce(&mut SettingsWriter<'_>) -> Result<(), SettingsValueError>,
     {
         // Settings-bearing bytes span 0x0000..0x2000 in the raw image:
         // band state (power level 0x0359, attenuator 0x035C, dual band
@@ -283,48 +326,87 @@ impl MemoryImage {
         const SETTINGS_START: usize = 0x0000;
         const SETTINGS_END: usize = 0x2000;
 
-        // Snapshot the settings region. If the image is shorter than
-        // SETTINGS_END (shouldn't happen for a valid MCP image), there's nothing
-        // to diff against, so return early via `?` (function returns `Option`).
-        let snapshot_src = self.raw.get(SETTINGS_START..SETTINGS_END)?;
+        let snapshot_src =
+            self.raw
+                .get(SETTINGS_START..SETTINGS_END)
+                .ok_or(MemoryError::InvalidSize {
+                    actual: self.raw.len(),
+                    expected: SETTINGS_END,
+                })?;
         let mut snapshot = [0u8; SETTINGS_END - SETTINGS_START];
         snapshot.copy_from_slice(snapshot_src);
+        let restore = |raw: &mut [u8]| {
+            let region = raw
+                .get_mut(SETTINGS_START..SETTINGS_END)
+                .unwrap_or_else(|| {
+                    unreachable!("settings writer cannot resize its borrowed memory image")
+                });
+            region.copy_from_slice(&snapshot);
+        };
 
-        // Apply the mutation
-        f(&mut SettingsWriter::new(&mut self.raw));
-
-        // Diff to find the changed byte
-        let mut changed: Option<(u16, u8)> = None;
-        for (i, &snap_byte) in snapshot.iter().enumerate() {
-            let Some(&current) = self.raw.get(SETTINGS_START + i) else {
-                continue;
-            };
-            if current != snap_byte {
-                assert!(
-                    changed.is_none(),
-                    "modify_setting: more than one byte changed"
-                );
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "Settings region is tiny (a few KB within the 500KB MCP image) and \
-                              `SETTINGS_START + i` cannot exceed the settings-region size which \
-                              fits in u16::MAX. The returned offset is only used to identify \
-                              which settings byte changed."
-                )]
-                let offset = (SETTINGS_START + i) as u16;
-                changed = Some((offset, current));
-            }
+        if let Err(error) = f(&mut SettingsWriter::new(&mut self.raw)) {
+            restore(&mut self.raw);
+            return Err(error.into());
         }
-        changed
+
+        let current_region =
+            self.raw
+                .get(SETTINGS_START..SETTINGS_END)
+                .ok_or(MemoryError::InvalidSize {
+                    actual: self.raw.len(),
+                    expected: SETTINGS_END,
+                })?;
+        let mut changes = snapshot.iter().zip(current_region).enumerate().filter_map(
+            |(index, (&before, &after))| {
+                (before != after).then_some((SETTINGS_START + index, after))
+            },
+        );
+        let first = changes.next();
+        let second = changes.next();
+        drop(changes);
+
+        let typed_change = |(offset, value): (usize, u8)| {
+            let offset = u16::try_from(offset)
+                .unwrap_or_else(|_| unreachable!("settings-region offset fits in u16"));
+            (offset, value)
+        };
+        if let Some(second) = second {
+            let (first, _) = typed_change(
+                first.unwrap_or_else(|| unreachable!("a second change requires a first change")),
+            );
+            let (second, _) = typed_change(second);
+            restore(&mut self.raw);
+            return Err(MemoryError::MultipleSettingBytesChanged { first, second });
+        }
+        Ok(first.map(typed_change))
     }
 
-    /// Access the APRS configuration region (raw bytes).
+    /// Access the opaque APRS archive region (raw bytes).
     #[must_use]
     pub fn aprs(&self) -> AprsAccess<'_> {
         AprsAccess::new(&self.raw)
     }
 
-    /// Access the D-STAR configuration region (raw bytes).
+    /// Decode a named radio menu setting from the generated MCP-D75 catalog.
+    ///
+    /// This is the field-level path for settings that live outside their
+    /// subsystem's opaque bulk region. For example, APRS My Callsign is
+    /// available as `image.menu_setting("aprs.MyCallsign")` even though its
+    /// byte offset precedes the region exposed by [`Self::aprs`].
+    ///
+    /// Returns `Ok(None)` when the catalog has no field with `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaError`] when the stored bytes do not satisfy the
+    /// catalog field's codec or declared value domain.
+    pub fn menu_setting(&self, name: &str) -> Result<Option<DecodedFieldValue>, SchemaError> {
+        menu_field(name)
+            .map(|field| field.read(&self.raw))
+            .transpose()
+    }
+
+    /// Access the D-STAR settings region (raw bytes).
     #[must_use]
     pub fn dstar(&self) -> DstarAccess<'_> {
         DstarAccess::new(&self.raw)
@@ -336,100 +418,30 @@ impl MemoryImage {
         GpsAccess::new(&self.raw)
     }
 
-    // -----------------------------------------------------------------------
-    // .d75 file integration
-    // -----------------------------------------------------------------------
-
-    /// Create from a `.d75` config file (strips the 256-byte header).
-    ///
-    /// The `.d75` file format is a 256-byte file header followed by the
-    /// raw MCP memory image. This constructor validates the header and
-    /// extracts the image body.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MemoryError::D75Error`] if the file is too short or
-    /// the header model string is not recognised.
-    /// Returns [`MemoryError::InvalidSize`] if the body is not the
-    /// expected size.
-    pub fn from_d75_file(data: &[u8]) -> Result<Self, MemoryError> {
-        let min_size = d75::HEADER_SIZE + programming::TOTAL_SIZE;
-        if data.len() < min_size {
-            return Err(MemoryError::D75Error {
-                detail: format!(
-                    "file too small: {} bytes (expected at least {})",
-                    data.len(),
-                    min_size
-                ),
-            });
-        }
-
-        // Validate the header by attempting to parse it.
-        let header_result = d75::parse_config(data);
-        if let Err(e) = header_result {
-            return Err(MemoryError::D75Error {
-                detail: e.to_string(),
-            });
-        }
-
-        let body = data
-            .get(d75::HEADER_SIZE..d75::HEADER_SIZE + programming::TOTAL_SIZE)
-            .ok_or_else(|| MemoryError::D75Error {
-                detail: format!(
-                    "file body too short after header: {} bytes, expected {}",
-                    data.len().saturating_sub(d75::HEADER_SIZE),
-                    programming::TOTAL_SIZE
-                ),
-            })?
-            .to_vec();
-        Self::from_raw(body)
-    }
-
-    /// Export as a `.d75` config file (prepends header).
-    ///
-    /// Uses the provided [`ConfigHeader`] to build the file. The header
-    /// is preserved as-is (including model string and version bytes) for
-    /// round-trip fidelity.
-    #[must_use]
-    pub fn to_d75_file(&self, header: &ConfigHeader) -> Vec<u8> {
-        let mut out = Vec::with_capacity(d75::HEADER_SIZE + self.raw.len());
-        out.extend_from_slice(&header.raw);
-        out.extend_from_slice(&self.raw);
-        out
-    }
-
-    /// Export this image as a `.d75` file ready to write to the SD card.
-    ///
-    /// Uses a default TH-D75A header with the standard version bytes.
-    /// For a specific model or custom header, use [`to_d75_file`](Self::to_d75_file).
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`SdCardError`] if the built-in model string is rejected
-    /// (unreachable under normal operation: `"Data For TH-D75A"` is in the
-    /// crate's `KNOWN_MODELS` constant, so this method is effectively
-    /// infallible unless that constant changes).
-    pub fn to_d75_bytes(&self) -> Result<Vec<u8>, SdCardError> {
-        let header = d75::make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
-        Ok(self.to_d75_file(&header))
-    }
-
     /// Read a byte range from the image.
     ///
-    /// Returns `None` if the range is out of bounds.
+    /// Returns `None` if the range is out of bounds or computing its end
+    /// offset would overflow [`usize`].
     #[must_use]
     pub fn read_region(&self, offset: usize, len: usize) -> Option<&[u8]> {
-        self.raw.get(offset..offset + len)
+        let end = offset.checked_add(len)?;
+        self.raw.get(offset..end)
     }
 
     /// Write bytes into the image at the given offset.
     ///
     /// # Errors
     ///
-    /// Returns [`MemoryError::InvalidSize`] if the write extends past
-    /// the end of the image.
+    /// Returns [`MemoryError::RegionEndOverflow`] if computing the write's end
+    /// offset would overflow [`usize`], or [`MemoryError::InvalidSize`] if the
+    /// write extends past the end of the image.
     pub fn write_region(&mut self, offset: usize, data: &[u8]) -> Result<(), MemoryError> {
-        let end = offset + data.len();
+        let end = offset
+            .checked_add(data.len())
+            .ok_or(MemoryError::RegionEndOverflow {
+                offset,
+                length: data.len(),
+            })?;
         let raw_len = self.raw.len();
         let dst = self
             .raw
@@ -451,70 +463,32 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn schema_firmware_identity_canonicalization_is_exact() {
+    fn schema_firmware_identity_canonicalization_is_exact() -> TestResult {
         assert!(MCP_D75_SCHEMA_FIRMWARE_IDENTITIES.contains(&"1.03.AZM"));
         for supported in MCP_D75_SCHEMA_FIRMWARE_IDENTITIES {
+            let identity = FirmwareIdentity::new(supported)?;
             assert_eq!(
-                canonicalize_mcp_d75_schema_firmware(supported),
+                canonicalize_mcp_d75_schema_firmware(&identity),
                 Some(MCP_D75_SCHEMA_FIRMWARE),
                 "supported CAT identity was not canonicalized: {supported:?}"
             );
             assert!(
-                is_supported_mcp_d75_schema_target(MCP_D75_SCHEMA_MODEL, supported),
+                is_supported_mcp_d75_schema_target(RadioModel::ThD75, &identity),
                 "supported schema target was rejected: {supported:?}"
             );
         }
 
-        for rejected in ["1.03.001", "1.04", "1.03.0", " 1.03", "1.03 "] {
+        for rejected in ["1.03.001", "1.04", "1.03.0"] {
+            let identity = FirmwareIdentity::new(rejected)?;
             assert_eq!(
-                canonicalize_mcp_d75_schema_firmware(rejected),
+                canonicalize_mcp_d75_schema_firmware(&identity),
                 None,
                 "unsupported CAT identity was accepted: {rejected:?}"
             );
         }
-        assert!(
-            !is_supported_mcp_d75_schema_target("TH-D74", "1.03"),
-            "wrong model was accepted"
-        );
-    }
-
-    #[test]
-    fn to_d75_bytes_round_trip() -> TestResult {
-        let raw = vec![0u8; programming::TOTAL_SIZE];
-        let image = MemoryImage::from_raw(raw.clone())?;
-        let d75_bytes = image.to_d75_bytes()?;
-
-        // Should be header + raw image.
-        assert_eq!(d75_bytes.len(), d75::HEADER_SIZE + programming::TOTAL_SIZE);
-
-        // The body portion should match the original raw data.
-        assert_eq!(
-            d75_bytes
-                .get(d75::HEADER_SIZE..)
-                .ok_or("d75 bytes too short")?,
-            &raw[..]
-        );
-
-        // The header should be parseable and identify as D75A.
-        let reparsed = MemoryImage::from_d75_file(&d75_bytes)?;
-        assert_eq!(reparsed.as_raw(), &raw[..]);
-        Ok(())
-    }
-
-    #[test]
-    fn to_d75_file_with_custom_header() -> TestResult {
-        let raw = vec![0u8; programming::TOTAL_SIZE];
-        let image = MemoryImage::from_raw(raw)?;
-        let header = d75::make_header("Data For TH-D75E", [0x01, 0x02, 0x03, 0x04])?;
-        let d75_bytes = image.to_d75_file(&header);
-
-        // Verify header model.
-        let reparsed_config = d75::parse_config(&d75_bytes)?;
-        assert_eq!(reparsed_config.header.model, "Data For TH-D75E");
-        assert_eq!(
-            reparsed_config.header.version_bytes,
-            [0x01, 0x02, 0x03, 0x04]
-        );
+        for malformed in [" 1.03", "1.03 "] {
+            assert!(FirmwareIdentity::new(malformed).is_err());
+        }
         Ok(())
     }
 
@@ -538,10 +512,21 @@ mod tests {
     fn modify_setting_returns_changed_byte() -> TestResult {
         let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE])?;
         // key_beep lives at offset 0x1071; set it from 0 to 1
-        let result = image.modify_setting(|w| {
-            w.set_key_beep(true);
-        });
+        let result = image.modify_setting(|w| w.set_key_beep(true))?;
         assert_eq!(result, Some((0x1071, 1)));
+        Ok(())
+    }
+
+    #[test]
+    fn menu_setting_reaches_aprs_callsign_outside_aprs_bulk_region() -> TestResult {
+        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE])?;
+        image.write_region(0x1200, b"N0CALL\0\0\0")?;
+
+        assert_eq!(
+            image.menu_setting("aprs.MyCallsign")?,
+            Some(DecodedFieldValue::Text("N0CALL".to_owned()))
+        );
+        assert_eq!(image.menu_setting("aprs.DoesNotExist")?, None);
         Ok(())
     }
 
@@ -552,9 +537,7 @@ mod tests {
         // reported as "nothing changed", silently skipping the radio
         // write-back.
         let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE])?;
-        let result = image.modify_setting(|w| {
-            w.set_dual_band(true);
-        });
+        let result = image.modify_setting(|w| w.set_band_mode(crate::types::BandMode::Dual))?;
         assert_eq!(result, Some((0x0396, 1)));
         Ok(())
     }
@@ -563,27 +546,34 @@ mod tests {
     fn modify_setting_no_change_returns_none() -> TestResult {
         let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE])?;
         // beep is already 0 (false); setting it to false again changes nothing
-        let result = image.modify_setting(|w| {
-            w.set_key_beep(false);
-        });
+        let result = image.modify_setting(|w| w.set_key_beep(false))?;
         assert_eq!(result, None);
         Ok(())
     }
 
     #[test]
-    #[should_panic(expected = "more than one byte changed")]
-    fn modify_setting_panics_on_multi_byte() {
-        let raw = vec![0u8; programming::TOTAL_SIZE];
-        // Unwrap is OK here: this test is specifically verifying the panic
-        // from modify_setting. #[should_panic] captures it.
-        let Ok(mut image) = MemoryImage::from_raw(raw) else {
-            unreachable!("TOTAL_SIZE is always a valid memory image size");
-        };
-        let _ = image.modify_setting(|w| {
-            // Change two distinct single-byte settings
-            w.set_key_beep(true); // 0x1071
-            w.set_beep_volume(5); // 0x1072
-        });
+    fn modify_setting_rejects_and_rolls_back_multi_byte_mutation() -> TestResult {
+        use crate::types::LinkedVolumeLevel;
+
+        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE])?;
+        let volume = LinkedVolumeLevel::fixed(5)?;
+        let error = image
+            .modify_setting(|writer| {
+                writer.set_key_beep(true)?;
+                writer.set_beep_volume(volume)
+            })
+            .err()
+            .ok_or("two-byte mutation should be rejected")?;
+
+        assert!(matches!(
+            error,
+            MemoryError::MultipleSettingBytesChanged {
+                first: 0x1071,
+                second: 0x1072
+            }
+        ));
+        assert_eq!(image.as_raw().get(0x1071..=0x1072), Some([0, 0].as_slice()));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -601,13 +591,31 @@ mod tests {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // from_d75_file too-small error
-    // -----------------------------------------------------------------------
+    #[test]
+    fn read_region_returns_none_when_end_overflows_usize() -> TestResult {
+        let image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE])?;
+
+        assert_eq!(image.read_region(usize::MAX, 1), None);
+        assert_eq!(image.read_region(1, usize::MAX), None);
+        Ok(())
+    }
 
     #[test]
-    fn from_d75_file_too_small() {
-        assert!(MemoryImage::from_d75_file(&[0u8; 100]).is_err());
+    fn write_region_reports_end_overflow_before_slicing() -> TestResult {
+        let mut image = MemoryImage::from_raw(vec![0u8; programming::TOTAL_SIZE])?;
+        let error = image
+            .write_region(usize::MAX, &[0xA5])
+            .err()
+            .ok_or("overflowing write should fail")?;
+
+        assert_eq!(
+            error,
+            MemoryError::RegionEndOverflow {
+                offset: usize::MAX,
+                length: 1,
+            }
+        );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

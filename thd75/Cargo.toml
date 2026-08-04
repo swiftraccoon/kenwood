@@ -29,6 +29,7 @@ aprs = { path = "../aprs" }
 aprs-is = { path = "../aprs-is" }
 ax25-codec = { path = "../ax25-codec" }
 dstar-gateway-core = { path = "../dstar-gateway-core" }
+encoding_rs = "0.8"
 kiss-tnc = { path = "../kiss-tnc" }
 mmdvm-core = { path = "../mmdvm-core" }
 mmdvm = { path = "../mmdvm" }
@@ -41,15 +42,43 @@ proptest = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "test-util"] }
 
+# These live-radio tools also contain offline unit tests. Register only those
+# examples as test targets so the harness executes their tests, never `main`.
+[[example]]
+name = "automation_audit"
+test = true
+
+[[example]]
+name = "config_backup"
+test = true
+
+[[example]]
+name = "hardware_audit"
+test = true
+
+[[example]]
+name = "identify"
+test = true
+
+[[example]]
+name = "mcp_menu"
+test = true
+
+[[example]]
+name = "verify_state"
+test = true
+
 # KNOWN DIVERGENCE FROM WORKSPACE: this crate declares its own [lints.*]
 # blocks (cargo replaces, never merges, the workspace set). Divergences:
-# - `unsafe_code` is NOT declared here: the workspace `forbid` cannot be
-#   weakened at crate level, and this crate needs audited unsafe modules for
-#   the IOBluetooth helper and macOS Vision OCR bridge. The guard lives at the
-#   source level instead: `#![deny(unsafe_code)]` in lib.rs with scoped,
-#   reasoned expectations in transport/bluetooth.rs and screen/vision.rs.
+# - `unsafe_code` is `deny` rather than the workspace's `forbid`: this crate
+#   needs two audited, scoped expectations for the IOBluetooth helper and
+#   macOS Vision OCR bridge. Keeping the package-level deny applies the guard
+#   to every Cargo library, test, and example target while allowing those two
+#   reasoned expectations to operate. Manual hardware probes are source-audited
+#   by `lint.sh` because they are deliberately not Cargo targets.
 # - Everything else mirrors the workspace policy; see the inline notes.
 [lints.rust]
+unsafe_code = "deny"
 missing_docs = "deny"
 missing_debug_implementations = "deny"
 unreachable_pub = "deny"

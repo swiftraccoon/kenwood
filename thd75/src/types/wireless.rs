@@ -35,69 +35,50 @@
 //! | RM\* | DOWN | Step frequency/channel down |
 //! | RM# | UP | Step frequency/channel up |
 //!
-//! These types model wireless control settings from Chapter 25 of the
-//! TH-D75 user manual.
+//! [`RemoteControlCode`] models the three-digit value stored by Menu No. 946.
+
+use crate::error::ValidationError;
 
 // ---------------------------------------------------------------------------
-// Wireless control configuration
+// Wireless control code
 // ---------------------------------------------------------------------------
 
-/// Wireless remote control configuration.
+/// Wireless remote-control secret code (Menu No. 946).
 ///
-/// When enabled, the radio listens for incoming DTMF command sequences
-/// and executes them if the correct password prefix is received.
-/// The password is a 4-digit DTMF code (digits `0`-`9`, `A`-`D`,
-/// `*`, `#`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub struct WirelessControlConfig {
-    /// Enable wireless remote control reception.
-    pub enabled: bool,
-    /// 4-digit DTMF password for wireless control access.
-    pub password: WirelessPassword,
-}
-
-/// Wireless control DTMF password.
-///
-/// The password must be exactly 4 valid DTMF characters (`0`-`9`,
-/// `A`-`D`, `*`, `#`).
-///
-/// Note: the User Manual Chapter 25 describes a 3-digit numeric secret
-/// access code (000-999, Menu No. 946) for the over-the-air protocol.
-/// This 4-character DTMF password is the MCP/firmware internal
-/// representation which may include extended DTMF characters.
+/// The user manual and MCP memory schema agree that this is exactly three
+/// decimal digits (`000` through `999`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct WirelessPassword(String);
+pub struct RemoteControlCode(String);
 
-impl WirelessPassword {
-    /// Required password length (exactly 4 characters).
-    pub const LEN: usize = 4;
+impl RemoteControlCode {
+    /// Required code length in encoded bytes.
+    pub const LEN: usize = 3;
 
-    /// Creates a new wireless control password.
+    /// Creates a wireless remote-control secret code.
     ///
     /// # Errors
     ///
-    /// Returns `None` if the password is not exactly 4 characters or
-    /// contains invalid DTMF digits.
-    #[must_use]
-    pub fn new(password: &str) -> Option<Self> {
-        if password.len() == Self::LEN && password.chars().all(super::dtmf::is_valid_dtmf) {
-            Some(Self(password.to_owned()))
-        } else {
-            None
+    /// Returns [`ValidationError::RemoteControlCodeLength`] unless `code` is
+    /// exactly three encoded bytes, or
+    /// [`ValidationError::InvalidRemoteControlCodeDigit`] at the first
+    /// non-decimal character.
+    pub fn new(code: &str) -> Result<Self, ValidationError> {
+        if code.len() != Self::LEN {
+            return Err(ValidationError::RemoteControlCodeLength { len: code.len() });
         }
+        if let Some((offset, value)) = code
+            .char_indices()
+            .find(|(_, character)| !character.is_ascii_digit())
+        {
+            return Err(ValidationError::InvalidRemoteControlCodeDigit { offset, value });
+        }
+        Ok(Self(code.to_owned()))
     }
 
-    /// Returns the password as a string slice.
+    /// Returns the three-digit code.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl Default for WirelessPassword {
-    fn default() -> Self {
-        // Default password "0000" (all zeros).
-        Self("0000".to_owned())
     }
 }
 
@@ -110,43 +91,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wireless_config_default() {
-        let cfg = WirelessControlConfig::default();
-        assert!(!cfg.enabled);
-        assert_eq!(cfg.password.as_str(), "0000");
-    }
-
-    #[test]
-    fn wireless_password_valid() -> Result<(), Box<dyn std::error::Error>> {
-        let pwd = WirelessPassword::new("1234").ok_or("valid password rejected")?;
-        assert_eq!(pwd.as_str(), "1234");
+    fn remote_control_code_valid() -> Result<(), Box<dyn std::error::Error>> {
+        let code = RemoteControlCode::new("123")?;
+        assert_eq!(code.as_str(), "123");
         Ok(())
     }
 
     #[test]
-    fn wireless_password_dtmf_chars() -> Result<(), Box<dyn std::error::Error>> {
-        let pwd = WirelessPassword::new("A*#B").ok_or("valid DTMF password rejected")?;
-        assert_eq!(pwd.as_str(), "A*#B");
+    fn remote_control_code_accepts_leading_zeroes() -> Result<(), Box<dyn std::error::Error>> {
+        let code = RemoteControlCode::new("007")?;
+        assert_eq!(code.as_str(), "007");
         Ok(())
     }
 
     #[test]
-    fn wireless_password_too_short() {
-        assert!(WirelessPassword::new("123").is_none());
+    fn remote_control_code_too_short() {
+        assert!(matches!(
+            RemoteControlCode::new("12"),
+            Err(ValidationError::RemoteControlCodeLength { len: 2 })
+        ));
     }
 
     #[test]
-    fn wireless_password_too_long() {
-        assert!(WirelessPassword::new("12345").is_none());
+    fn remote_control_code_too_long() {
+        assert!(matches!(
+            RemoteControlCode::new("1234"),
+            Err(ValidationError::RemoteControlCodeLength { len: 4 })
+        ));
     }
 
     #[test]
-    fn wireless_password_invalid_chars() {
-        assert!(WirelessPassword::new("12E4").is_none());
-    }
-
-    #[test]
-    fn wireless_password_lowercase_rejected() {
-        assert!(WirelessPassword::new("12a4").is_none());
+    fn remote_control_code_rejects_non_decimal_characters() {
+        assert!(matches!(
+            RemoteControlCode::new("12A"),
+            Err(ValidationError::InvalidRemoteControlCodeDigit {
+                offset: 2,
+                value: 'A'
+            })
+        ));
+        assert!(matches!(
+            RemoteControlCode::new("1#3"),
+            Err(ValidationError::InvalidRemoteControlCodeDigit {
+                offset: 1,
+                value: '#'
+            })
+        ));
     }
 }

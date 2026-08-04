@@ -75,7 +75,7 @@ impl BrokerHandle {
     ///
     /// # Errors
     ///
-    /// The future resolves to [`TransportError::WrongThread`] if the
+    /// The future resolves to [`TransportError::BrokerUnavailable`] if the
     /// broker is gone (no thread will ever run the job); otherwise it
     /// carries whatever the job itself returns.
     pub fn run(
@@ -86,9 +86,11 @@ impl BrokerHandle {
         let sent = self.tx.send((job, reply_tx)).is_ok();
         async move {
             if !sent {
-                return Err(TransportError::WrongThread);
+                return Err(TransportError::BrokerUnavailable);
             }
-            reply_rx.await.map_err(|_| TransportError::WrongThread)?
+            reply_rx
+                .await
+                .map_err(|_| TransportError::BrokerUnavailable)?
         }
     }
 }
@@ -134,7 +136,10 @@ mod tests {
         let handle = broker.handle();
         drop(broker);
         let r = handle.run(Box::new(|| Ok(()))).await;
-        assert!(matches!(r, Err(TransportError::WrongThread)), "got {r:?}");
+        assert!(
+            matches!(r, Err(TransportError::BrokerUnavailable)),
+            "got {r:?}"
+        );
         Ok(())
     }
 

@@ -29,6 +29,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -38,8 +39,8 @@ use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
-use kenwood_thd75::Radio;
 use kenwood_thd75::transport::SerialTransport;
+use kenwood_thd75::{Radio, WritableMcpPage};
 
 /// MCP page holding the PF-key assignment block (0x107A is in page 0x10).
 const PF_KEY_PAGE: u16 = 0x10;
@@ -55,15 +56,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "/dev/cu.usbmodem1234".to_owned());
 
     println!("Connecting to {port} ...");
-    let transport = SerialTransport::open(&port, 115_200)?;
-    let mut radio = Radio::connect(transport).await?;
+    let transport = SerialTransport::open(&port)?;
+    let mut radio = Radio::new(transport);
 
     println!("Writing front-panel PF1 (MCP 0x107A) = 0x{SCREEN_CAPTURE:02X} ...");
     println!("Radio will show 'PROG MCP'; the USB connection resets on exit.\n");
 
     let mut previous = 0_u8;
     radio
-        .modify_memory_page(PF_KEY_PAGE, |page| {
+        .modify_memory_page(WritableMcpPage::new(PF_KEY_PAGE)?, |page| {
             previous = page[FRONT_PF1];
             page[FRONT_PF1] = SCREEN_CAPTURE;
         })

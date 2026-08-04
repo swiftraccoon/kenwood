@@ -19,6 +19,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -28,14 +29,8 @@ use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
-use kenwood_thd75::Radio;
 use kenwood_thd75::transport::SerialTransport;
-
-const AUTOMATION_FIRMWARE: &str = "1.03.AZM";
-
-fn supports_stock_gateway_command(firmware: &str) -> bool {
-    firmware != AUTOMATION_FIRMWARE
-}
+use kenwood_thd75::{FirmwareProfile, Radio};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,18 +52,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = port.unwrap_or_else(|| "/dev/cu.usbmodem1234".to_owned());
 
     println!("Connecting to {port}...");
-    let transport = SerialTransport::open(&port, 115_200)?;
+    let transport = SerialTransport::open(&port)?;
     let mut radio = if recover_cat {
         println!("Sending the opt-in KISS/TNC-to-CAT recovery preamble...");
-        Radio::connect_safe(transport).await?
+        Radio::connect_with_tnc_exit(transport).await?
     } else {
-        Radio::connect(transport).await?
+        Radio::new(transport)
     };
 
     let info = match radio.identify().await {
         Ok(info) => info,
         Err(error) => {
-            let diagnosis = radio.diagnose_link().await;
+            let diagnosis = radio.probe_silent_link().await;
             println!("CAT identification failed: {error}");
             println!("{}", diagnosis.guidance());
             drop(radio.disconnect().await);
@@ -80,43 +75,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let fw = radio.get_firmware_version().await?;
     println!("Firmware: {fw}");
+    let firmware_profile = FirmwareProfile::from_identity(&fw);
 
-    let (region, variant) = radio.get_radio_type().await?;
-    println!("Region:   {region} (variant {variant})");
+    let serial_information = radio.get_serial_information().await?;
+    println!("Serial:   {}", serial_information.serial_number());
+    println!("Model code: {}", serial_information.model_code());
+
+    let radio_type = radio.get_radio_type().await?;
+    println!(
+        "Region:   {} (variant {})",
+        radio_type.region(),
+        radio_type.hardware_variant()
+    );
 
     let power = radio.get_power_status().await?;
     println!("Power:    {}", if power { "ON" } else { "OFF" });
 
-    let (tnc_mode, tnc_baud) = radio.get_tnc_mode().await?;
-    println!("TNC:      {tnc_mode} ({tnc_baud})");
+    let tnc = radio.get_tnc_mode().await?;
+    println!("TNC:      {} ({})", tnc.mode, tnc.data_rate);
 
-    let (gps_enabled, gps_pc_output) = radio.get_gps_config().await?;
+    let gps_settings = radio.get_gps_settings().await?;
     println!(
         "GPS:      {} (PC output {})",
-        if gps_enabled { "ON" } else { "OFF" },
-        if gps_pc_output { "ON" } else { "OFF" }
+        if gps_settings.enabled() { "ON" } else { "OFF" },
+        if gps_settings.pc_output() {
+            "ON"
+        } else {
+            "OFF"
+        }
     );
 
-    let beacon = radio.get_beacon_type().await?;
+    let beacon = radio.get_beacon_mode().await?;
     println!("Beacon:   {beacon}");
 
     let position = radio.get_my_position_selection().await?;
     println!("Position: {position}");
 
-    let bar_antenna = radio.get_bar_antenna().await?;
-    println!(
-        "Bar ant.:  {}",
-        if bar_antenna { "ENABLED" } else { "DISABLED" }
-    );
+    let antenna_input = radio.get_antenna_input().await?;
+    println!("MW/SW input: {antenna_input}");
 
     let backlight = radio.get_backlight_control().await?;
     println!("Backlight: {backlight:?}");
 
-    if supports_stock_gateway_command(&fw) {
-        let gateway = radio.get_gateway().await?;
+    if firmware_profile.supports_bare_gateway() {
+        let gateway = radio.read_gateway().await?;
         println!("Gateway:  {gateway}");
     } else {
-        println!("Gateway:  unavailable (GW is reserved by {AUTOMATION_FIRMWARE})");
+        println!("Gateway:  unavailable for {firmware_profile:?}");
     }
 
     let bluetooth = radio.get_bluetooth().await?;
@@ -131,13 +136,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn automation_firmware_does_not_issue_colliding_stock_gateway_command() {
-        assert!(!supports_stock_gateway_command(AUTOMATION_FIRMWARE));
+    fn automation_firmware_does_not_issue_colliding_stock_gateway_command() -> TestResult {
+        let firmware = kenwood_thd75::FirmwareIdentity::new("1.03.AZM")?;
+        assert!(!FirmwareProfile::from_identity(&firmware).supports_bare_gateway());
+        Ok(())
     }
 
     #[test]
-    fn stock_firmware_retains_gateway_command() {
-        assert!(supports_stock_gateway_command("1.03"));
+    fn stock_firmware_retains_gateway_command() -> TestResult {
+        let firmware = kenwood_thd75::FirmwareIdentity::new("1.03")?;
+        assert!(FirmwareProfile::from_identity(&firmware).supports_bare_gateway());
+        Ok(())
     }
 }

@@ -17,6 +17,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -89,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = FrontPanelKey::try_from(raw_key)?;
 
     let transport = BluetoothTransport::open(Some(&device_name))?;
-    let mut radio = Radio::connect(transport).await?;
+    let mut radio = Radio::new(transport);
     let qualification_started = Instant::now();
     let (before, key_metadata, after, key_elapsed) = {
         let mut session = radio.qualify_automation().await?;

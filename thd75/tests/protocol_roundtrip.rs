@@ -1,7 +1,7 @@
 //! Property-based round-trip tests for the CAT protocol.
 //!
 //! Uses `proptest` to verify that serialize-then-parse produces the
-//! original values, and that binary packing round-trips exactly.
+//! original values for genuine CAT commands and shared wire types.
 
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -13,6 +13,7 @@ use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use mmdvm as _;
 use mmdvm_core as _;
 use serde_json as _;
@@ -22,7 +23,7 @@ use tokio_serial as _;
 use tracing as _;
 
 use kenwood_thd75::protocol::{self, Command, Response};
-use kenwood_thd75::types::tone::{CtcssMode, DcsCode, ToneCode};
+use kenwood_thd75::types::tone::{DcsCode, ToneCode};
 use kenwood_thd75::types::*;
 use kiss_tnc::{KissCommand, KissFrame, KissPort, decode_kiss_frame, encode_kiss_frame};
 
@@ -45,118 +46,12 @@ fn arb_band() -> impl Strategy<Value = Band> {
     (0u8..2).prop_filter_map("invalid band", |i| Band::try_from(i).ok())
 }
 
-fn arb_channel_memory() -> impl Strategy<Value = ChannelMemory> {
-    // Split into sub-tuples to stay within proptest's 12-element limit.
-    // flags_0a_raw is the source of truth for tone/shift wire fields.
-    // Individual bool fields (tone_enable, dcs_enable, etc.) and shift must
-    // be consistent with flags_0a_raw for serialize→parse round-trip.
-    let part_a = (
-        any::<u32>(),            // rx_frequency
-        any::<u32>(),            // tx_offset
-        (0u8..StepSize::COUNT),  // step_size
-        (0u8..CtcssMode::COUNT), // ctcss_mode
-        (0u8..=255u8),           // flags_0a_raw (all 8 bits; serializer uses this)
-    );
-    let part_b = (
-        (0u8..ToneCode::MAX_INDEX),        // tone_code
-        (0u8..ToneCode::MAX_INDEX),        // ctcss_code
-        (0u8..DcsCode::COUNT),             // dcs_code
-        (0u8..CrossToneType::COUNT),       // cross_tone_combo
-        (0u8..FlashDigitalSquelch::COUNT), // digital_squelch
-        "[A-Z0-9]{0,8}",                   // urcall (alphanumeric only for wire safety)
-        any::<u8>(),                       // data_mode
-    );
-    (part_a, part_b).prop_filter_map(
-        "channel memory construction failed",
-        |((rx, tx, step, _ctcss_m, flags), (tc, cc, dc, ds, lo, urcall, dm))| {
-            // The tone flags live in flags_0a_raw itself; only shift
-            // needs deriving (it is double-encoded on the wire).
-            let shift_val = flags & 0x07;
-            Some(ChannelMemory {
-                rx_frequency: Frequency::new(rx),
-                tx_offset: Frequency::new(tx),
-                step_size: StepSize::try_from(step).ok()?,
-                mode_flags_raw: 0,
-                shift: ShiftDirection::try_from(shift_val).ok()?,
-                flags_0a_raw: flags,
-                tone_code: ToneCode::new(tc).ok()?,
-                ctcss_code: ToneCode::new(cc).ok()?,
-                dcs_code: DcsCode::new(dc).ok()?,
-                cross_tone_combo: CrossToneType::try_from(ds).ok()?,
-                digital_squelch: FlashDigitalSquelch::try_from(lo).ok()?,
-                urcall: ChannelName::new(&urcall).ok()?,
-                data_mode: dm,
-            })
-        },
-    )
-}
-
 // ============================================================================
 // Property-based tests
 // ============================================================================
 
 proptest! {
-    // 2. 40-byte binary round-trip (byte[10] mapping now matches hardware)
-    #[test]
-    fn channel_memory_40byte_round_trip(channel in arb_channel_memory()) {
-        let bytes = channel.to_bytes();
-        prop_assert_eq!(bytes.len(), 40);
-        let parsed = ChannelMemory::from_bytes(&bytes).map_err(to_test_err)?;
-        prop_assert_eq!(parsed, channel);
-    }
-
-    // 3. Byte 0x08 packing (step + shift)
-    #[test]
-    fn byte_08_packing(step in 0u8..StepSize::COUNT, shift in 0u8..4) {
-        let ch = ChannelMemory {
-            step_size: StepSize::try_from(step).map_err(to_test_err)?,
-            mode_flags_raw: 0,
-            shift: ShiftDirection::try_from(shift).map_err(to_test_err)?,
-            ..ChannelMemory::default()
-        };
-        let bytes = ch.to_bytes();
-        let b08 = *bytes.get(0x08).ok_or_else(|| to_test_err("bytes[0x08] missing"))?;
-        prop_assert_eq!(b08 >> 4, step);
-        prop_assert_eq!(b08 & 0x0F, shift);
-    }
-
-    // 4. Byte 0x09 packing (currently zeroed; mode/fine not individually modeled)
-    #[test]
-    fn byte_09_packing(_rev in any::<bool>(), _tone in any::<bool>(), _ctcss in 0u8..CtcssMode::COUNT) {
-        let ch = ChannelMemory::default();
-        let bytes = ch.to_bytes();
-        let b09 = *bytes.get(0x09).ok_or_else(|| to_test_err("bytes[0x09] missing"))?;
-        prop_assert_eq!(b09, 0);
-    }
-
-    // 5. Byte 0x0A packing: flags_0a_raw is stored directly (hardware-verified)
-    #[test]
-    fn byte_0a_packing(flags in 0u8..=255u8) {
-        let ch = ChannelMemory {
-            flags_0a_raw: flags,
-            shift: ShiftDirection::try_from(flags & 0x07).map_err(to_test_err)?,
-            ..ChannelMemory::default()
-        };
-        let bytes = ch.to_bytes();
-        let b0a = *bytes.get(0x0A).ok_or_else(|| to_test_err("bytes[0x0A] missing"))?;
-        prop_assert_eq!(b0a, flags);
-    }
-
-    // 6. Byte 0x0E packing (cross_tone_combo + digital_squelch)
-    #[test]
-    fn byte_0e_packing(combo in 0u8..CrossToneType::COUNT, squelch in 0u8..FlashDigitalSquelch::COUNT) {
-        let ch = ChannelMemory {
-            cross_tone_combo: CrossToneType::try_from(combo).map_err(to_test_err)?,
-            digital_squelch: FlashDigitalSquelch::try_from(squelch).map_err(to_test_err)?,
-            ..ChannelMemory::default()
-        };
-        let bytes = ch.to_bytes();
-        let b0e = *bytes.get(0x0E).ok_or_else(|| to_test_err("bytes[0x0E] missing"))?;
-        prop_assert_eq!((b0e >> 4) & 0x03, combo);
-        prop_assert_eq!(b0e & 0x03, squelch);
-    }
-
-    // 7. Frequency wire format round-trip
+    // Frequency wire format round-trip
     #[test]
     fn frequency_wire_round_trip(hz in any::<u32>()) {
         let f = Frequency::new(hz);
@@ -165,7 +60,7 @@ proptest! {
         prop_assert_eq!(parsed.as_hz(), hz);
     }
 
-    // 8. Frequency LE bytes round-trip
+    // Frequency LE bytes round-trip
     #[test]
     fn frequency_le_round_trip(hz in any::<u32>()) {
         let f = Frequency::new(hz);
@@ -173,24 +68,38 @@ proptest! {
         prop_assert_eq!(parsed.as_hz(), hz);
     }
 
-    // 9. ToneCode round-trip
+    // ToneCode round-trip
     #[test]
     fn tone_code_round_trip(idx in 0u8..=ToneCode::MAX_INDEX) {
         let tc = ToneCode::new(idx).map_err(to_test_err)?;
-        prop_assert_eq!(tc.index(), idx);
+        prop_assert_eq!(tc.as_raw(), idx);
     }
 
-    // 10. DcsCode round-trip
+    // DcsCode round-trip
     #[test]
     fn dcs_code_round_trip(idx in 0u8..DcsCode::COUNT) {
         let dc = DcsCode::new(idx).map_err(to_test_err)?;
-        prop_assert_eq!(dc.index(), idx);
+        prop_assert_eq!(dc.as_raw(), idx);
     }
 
-    // 11. AG (AF gain) has no round-trip: write is band-indexed "AG band,level"
-    //     but read returns bare "AG level" (no band). Asymmetric by design.
+    // AG (global AF gain) wire round-trip
+    #[test]
+    fn af_gain_round_trip(raw_level in 0u8..=AfGainLevel::MAX) {
+        let level = AfGainLevel::new(raw_level).map_err(to_test_err)?;
+        let wire = protocol::serialize(&Command::SetAfGain { level });
+        let frame = wire
+            .split_last()
+            .map(|(_, rest)| rest)
+            .ok_or_else(|| to_test_err("empty wire"))?;
+        let response = protocol::parse(frame).map_err(to_test_err)?;
+        let Response::AfGain { level: parsed } = response else {
+            prop_assert!(false, "wrong response: {response:?}");
+            return Ok(());
+        };
+        prop_assert_eq!(parsed, level);
+    }
 
-    // 12. SQ (squelch) wire round-trip
+    // SQ (squelch) wire round-trip
     #[test]
     fn sq_round_trip(band in arb_band(), raw_level in 0u8..SquelchLevel::COUNT) {
         let level = SquelchLevel::new(raw_level).map_err(to_test_err)?;
@@ -206,15 +115,15 @@ proptest! {
         prop_assert_eq!(l, level);
     }
 
-    // 13. MD (mode) wire round-trip
+    // MD (mode) wire round-trip
     #[test]
-    fn md_round_trip(band in arb_band(), mode_val in 0u8..Mode::COUNT) {
-        let mode = Mode::try_from(mode_val).map_err(to_test_err)?;
-        let cmd = Command::SetMode { band, mode };
+    fn md_round_trip(band in arb_band(), mode_val in 0u8..OperatingMode::COUNT) {
+        let mode = OperatingMode::try_from(mode_val).map_err(to_test_err)?;
+        let cmd = Command::SetOperatingMode { band, mode };
         let wire = protocol::serialize(&cmd);
         let frame = wire.split_last().map(|(_, rest)| rest).ok_or_else(|| to_test_err("empty wire"))?;
         let r = protocol::parse(frame).map_err(to_test_err)?;
-        let Response::Mode { band: b, mode: m } = r else {
+        let Response::OperatingMode { band: b, mode: m } = r else {
             prop_assert!(false, "wrong: {r:?}");
             return Ok(());
         };
@@ -222,7 +131,7 @@ proptest! {
         prop_assert_eq!(m, mode);
     }
 
-    // 14. PC (power level) wire round-trip
+    // PC (power level) wire round-trip
     #[test]
     fn pc_round_trip(band in arb_band(), pl in 0u8..PowerLevel::COUNT) {
         let level = PowerLevel::try_from(pl).map_err(to_test_err)?;
@@ -238,7 +147,7 @@ proptest! {
         prop_assert_eq!(l, level);
     }
 
-    // 16. KISS frame encode/decode round-trip.
+    // KISS frame encode/decode round-trip.
     //
     // The TH-D75 only ever uses port 0; this exercises every defined
     // nibble-encoded KISS command with arbitrary payload data.
@@ -256,23 +165,23 @@ proptest! {
     // TN (TNC mode) is a bare read command with no write variant, so no round-trip.
     // CTCSS tone is configured through the FO (full channel) command.
 
-    // 18. SH (filter width) wire round-trip
+    // SH (filter width) wire round-trip
     #[test]
     fn sh_round_trip(mode in 0u8..FilterMode::COUNT, width in 0u8..5) {
         let filter_mode = FilterMode::try_from(mode).map_err(to_test_err)?;
         // AM mode max is 3, SSB/CW max is 4
         let max_width = if mode == 2 { 4 } else { 5 };
         if width < max_width {
-            let filter_width = FilterWidthIndex::new(width, filter_mode).map_err(to_test_err)?;
-            let cmd = Command::SetFilterWidth { mode: filter_mode, width: filter_width };
+            let filter_width = FilterWidthIndex::new(filter_mode, width).map_err(to_test_err)?;
+            let cmd = Command::SetFilterWidth { width: filter_width };
             let wire = protocol::serialize(&cmd);
             let frame = wire.split_last().map(|(_, rest)| rest).ok_or_else(|| to_test_err("empty wire"))?;
             let r = protocol::parse(frame).map_err(to_test_err)?;
-            let Response::FilterWidth { mode: m, width: w } = r else {
+            let Response::FilterWidth { width: w } = r else {
                 prop_assert!(false, "wrong: {r:?}");
                 return Ok(());
             };
-            prop_assert_eq!(m, filter_mode);
+            prop_assert_eq!(w.mode(), filter_mode);
             prop_assert_eq!(w, filter_width);
         }
     }

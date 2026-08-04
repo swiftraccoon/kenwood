@@ -18,7 +18,7 @@ use std::io::Write;
 fn open_transport() -> (String, EitherTransport) {
     if let Ok(ports) = SerialTransport::discover_usb() {
         if let Some(info) = ports.first() {
-            let t = SerialTransport::open(&info.port_name, SerialTransport::DEFAULT_BAUD)
+            let t = SerialTransport::open(&info.port_name)
                 .expect("USB open failed");
             return (info.port_name.clone(), EitherTransport::Serial(t));
         }
@@ -70,7 +70,16 @@ fn main() {
         .await
         {
             if n > 0 {
-                codec.feed(&buf[..n]);
+                if let Err(error) = codec.feed(&buf[..n]) {
+                    eprintln!("CAT framing failed while draining GPS setup responses: {error}");
+                    if let Err(cleanup_error) = transport.write(b"GP 1,0\r").await {
+                        eprintln!(
+                            "disabling GPS PC output after the framing failure also failed: \
+                             {cleanup_error}"
+                        );
+                    }
+                    return;
+                }
                 while codec.next_frame().is_some() {}
             }
         }

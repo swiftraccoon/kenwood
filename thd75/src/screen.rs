@@ -28,8 +28,12 @@ const STOCK_BMP_HEADER: [u8; 54] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
-fn decode_rgb565_le(pair: &[u8]) -> Option<u16> {
-    <[u8; 2]>::try_from(pair).ok().map(u16::from_le_bytes)
+const fn zero_extend_rgb565(pixel: u16) -> [u8; 3] {
+    let [low, high] = pixel.to_le_bytes();
+    let red = high & 0xF8;
+    let green = ((high & 0x07) << 5) | ((low & 0xE0) >> 3);
+    let blue = (low & 0x1F) << 3;
+    [red, green, blue]
 }
 
 /// A malformed native LCD frame or out-of-range pixel coordinate.
@@ -61,7 +65,7 @@ pub enum ScreenError {
 /// One exact, top-down RGB565LE TH-D75 LCD frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenFrame {
-    rgb565_le: Box<[u8]>,
+    rgb565_le: Box<[u8; SCREEN_BYTES]>,
 }
 
 impl ScreenFrame {
@@ -72,22 +76,23 @@ impl ScreenFrame {
     /// Returns [`ScreenError::InvalidLength`] unless `bytes` contains exactly
     /// [`SCREEN_BYTES`] bytes.
     pub fn from_rgb565_le(bytes: Vec<u8>) -> Result<Self, ScreenError> {
-        if bytes.len() != SCREEN_BYTES {
-            return Err(ScreenError::InvalidLength {
-                actual: bytes.len(),
-                expected: SCREEN_BYTES,
-            });
-        }
-        Ok(Self {
-            rgb565_le: bytes.into_boxed_slice(),
-        })
+        let actual = bytes.len();
+        let rgb565_le =
+            bytes
+                .into_boxed_slice()
+                .try_into()
+                .map_err(|_bytes| ScreenError::InvalidLength {
+                    actual,
+                    expected: SCREEN_BYTES,
+                })?;
+        Ok(Self { rgb565_le })
     }
 
     /// Native top-down RGB565 little-endian bytes, exactly as published by the
     /// radio.
     #[must_use]
     pub fn rgb565_le(&self) -> &[u8] {
-        &self.rgb565_le
+        self.rgb565_le.as_slice()
     }
 
     /// Return one native RGB565 pixel.
@@ -106,15 +111,17 @@ impl ScreenFrame {
             });
         }
         let offset = y * SCREEN_STRIDE + x * 2;
-        self.rgb565_le
+        let pair = self
+            .rgb565_le
             .get(offset..offset + 2)
-            .and_then(decode_rgb565_le)
+            .and_then(|bytes| <&[u8; 2]>::try_from(bytes).ok())
             .ok_or(ScreenError::CoordinateOutOfRange {
                 x,
                 y,
                 width: SCREEN_WIDTH,
                 height: SCREEN_HEIGHT,
-            })
+            })?;
+        Ok(u16::from_le_bytes(*pair))
     }
 
     /// Convert to top-down, tightly packed RGB888.
@@ -124,13 +131,9 @@ impl ScreenFrame {
     #[must_use]
     pub fn to_rgb888(&self) -> Vec<u8> {
         let mut rgb = Vec::with_capacity(SCREEN_WIDTH * SCREEN_HEIGHT * 3);
-        for pair in self.rgb565_le.chunks_exact(2) {
-            if let Some(pixel) = decode_rgb565_le(pair) {
-                let red = u8::try_from((pixel >> 8) & 0xF8).unwrap_or(0);
-                let green = u8::try_from((pixel >> 3) & 0xFC).unwrap_or(0);
-                let blue = u8::try_from((pixel << 3) & 0xF8).unwrap_or(0);
-                rgb.extend_from_slice(&[red, green, blue]);
-            }
+        let (pixels, _remainder) = self.rgb565_le.as_slice().as_chunks::<2>();
+        for pair in pixels {
+            rgb.extend_from_slice(&zero_extend_rgb565(u16::from_le_bytes(*pair)));
         }
         rgb
     }
@@ -142,13 +145,10 @@ impl ScreenFrame {
         let mut bmp = Vec::with_capacity(STOCK_BMP_HEADER.len() + SCREEN_WIDTH * SCREEN_HEIGHT * 3);
         bmp.extend_from_slice(&STOCK_BMP_HEADER);
         for row in self.rgb565_le.chunks_exact(SCREEN_STRIDE).rev() {
-            for pair in row.chunks_exact(2) {
-                if let Some(pixel) = decode_rgb565_le(pair) {
-                    let blue = u8::try_from((pixel << 3) & 0xF8).unwrap_or(0);
-                    let green = u8::try_from((pixel >> 3) & 0xFC).unwrap_or(0);
-                    let red = u8::try_from((pixel >> 8) & 0xF8).unwrap_or(0);
-                    bmp.extend_from_slice(&[blue, green, red]);
-                }
+            let (pixels, _remainder) = row.as_chunks::<2>();
+            for pair in pixels {
+                let [red, green, blue] = zero_extend_rgb565(u16::from_le_bytes(*pair));
+                bmp.extend_from_slice(&[blue, green, red]);
             }
         }
         bmp
@@ -159,7 +159,7 @@ impl ScreenFrame {
     #[must_use]
     pub fn crc32(&self) -> u32 {
         let mut crc = u32::MAX;
-        for byte in &self.rgb565_le {
+        for byte in self.rgb565_le.as_slice() {
             crc ^= u32::from(*byte);
             for _ in 0..8 {
                 let low_bit_mask = 0_u32.wrapping_sub(crc & 1);
@@ -174,7 +174,7 @@ impl ScreenFrame {
 mod tests {
     use super::{
         SCREEN_BYTES, SCREEN_HEIGHT, SCREEN_STRIDE, SCREEN_WIDTH, STOCK_BMP_HEADER, ScreenError,
-        ScreenFrame,
+        ScreenFrame, zero_extend_rgb565,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -210,6 +210,15 @@ mod tests {
             Err(ScreenError::CoordinateOutOfRange { .. })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn rgb565_zero_extension_preserves_every_component_boundary() {
+        assert_eq!(zero_extend_rgb565(0x0000), [0x00, 0x00, 0x00]);
+        assert_eq!(zero_extend_rgb565(0xF800), [0xF8, 0x00, 0x00]);
+        assert_eq!(zero_extend_rgb565(0x07E0), [0x00, 0xFC, 0x00]);
+        assert_eq!(zero_extend_rgb565(0x001F), [0x00, 0x00, 0xF8]);
+        assert_eq!(zero_extend_rgb565(0xFFFF), [0xF8, 0xFC, 0xF8]);
     }
 
     #[test]

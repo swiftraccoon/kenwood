@@ -117,7 +117,7 @@ impl StateSnapshot {
                     u32::try_from(index).map_err(|_| VerifyError::WindowLayoutMismatch {
                         detail: format!("window at {my_offset} is too long to index"),
                     })?;
-                let raw = my_offset.as_u32().checked_add(index_u32).ok_or_else(|| {
+                let raw = my_offset.as_raw().checked_add(index_u32).ok_or_else(|| {
                     VerifyError::WindowLayoutMismatch {
                         detail: format!("window at {my_offset} overflows the address space"),
                     }
@@ -255,7 +255,7 @@ mod tests {
         let changes = before.diff(&after)?;
         assert_eq!(changes.len(), 1);
         let change = changes.first().ok_or("missing change")?;
-        assert_eq!(change.offset.as_u32(), 0x1002);
+        assert_eq!(change.offset.as_raw(), 0x1002);
         assert_eq!(change.before, 3);
         assert_eq!(change.after, 9);
         Ok(())
@@ -267,8 +267,8 @@ mod tests {
         let after = snap(0x20, &[1, 0, 2])?;
         let changes = before.diff(&after)?;
         assert_eq!(changes.len(), 2);
-        assert_eq!(changes.first().ok_or("missing")?.offset.as_u32(), 0x20);
-        assert_eq!(changes.get(1).ok_or("missing")?.offset.as_u32(), 0x22);
+        assert_eq!(changes.first().ok_or("missing")?.offset.as_raw(), 0x20);
+        assert_eq!(changes.get(1).ok_or("missing")?.offset.as_raw(), 0x22);
         Ok(())
     }
 
@@ -331,8 +331,8 @@ mod tests {
             .get("radio.UsbFunction")
             .ok_or("UsbFunction missing after round trip")?;
         assert_eq!(usb.len(), 2);
-        assert_eq!(usb.first().ok_or("empty")?.as_u32(), 0x10);
-        assert_eq!(usb.get(1).ok_or("short")?.as_u32(), 0x20);
+        assert_eq!(usb.first().ok_or("empty")?.as_raw(), 0x10);
+        assert_eq!(usb.get(1).ok_or("short")?.as_raw(), 0x20);
         assert_eq!(
             parsed
                 .get("radio.BacklightControl")

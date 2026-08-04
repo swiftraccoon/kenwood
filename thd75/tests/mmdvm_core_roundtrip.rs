@@ -1,10 +1,10 @@
 //! Regression test: end-to-end MMDVM wire round-trip preserves core's
-//! `DStarHeader` fields via the `mmdvm-core` codec. Proves that the
+//! `DstarHeader` fields via the `mmdvm-core` codec. Proves that the
 //! thd75 → mmdvm-core integration point does not lose information
 //! when carrying D-STAR protocol types through the MMDVM binary wire
 //! format.
 
-use dstar_gateway_core::{Callsign, DStarHeader, Suffix, VoiceFrame};
+use dstar_gateway_core::{Callsign, DstarHeader, Suffix, VoiceFrame};
 use mmdvm_core::{
     MMDVM_DSTAR_DATA, MMDVM_DSTAR_HEADER, MMDVM_FRAME_START, MmdvmFrame, decode_frame, encode_frame,
 };
@@ -14,6 +14,7 @@ use mmdvm_core::{
 use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
+use encoding_rs as _;
 use kenwood_thd75 as _;
 use kiss_tnc as _;
 use mmdvm as _;
@@ -28,7 +29,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
 fn dstar_header_survives_mmdvm_wire_roundtrip() -> TestResult {
-    let original = DStarHeader {
+    let original = DstarHeader {
         flag1: 0x40,
         flag2: 0x21,
         flag3: 0x03,
@@ -54,14 +55,14 @@ fn dstar_header_survives_mmdvm_wire_roundtrip() -> TestResult {
     assert_eq!(consumed, 44);
     assert_eq!(decoded_frame.command, MMDVM_DSTAR_HEADER);
 
-    // Re-decode the 41-byte payload back into a `DStarHeader` and
+    // Re-decode the 41-byte payload back into a `DstarHeader` and
     // compare field-for-field.
     let payload: [u8; 41] = decoded_frame
         .payload
         .as_slice()
         .try_into()
         .map_err(|_| "expected 41-byte D-STAR header payload")?;
-    let decoded = DStarHeader::decode(&payload);
+    let decoded = DstarHeader::decode(&payload);
     assert_eq!(decoded, original);
     Ok(())
 }
@@ -108,7 +109,7 @@ fn non_ascii_callsign_bytes_preserved_verbatim() -> TestResult {
     if let Some(b) = rpt1_bytes.get_mut(1) {
         *b = 0xA9;
     }
-    let original = DStarHeader {
+    let original = DstarHeader {
         flag1: 0,
         flag2: 0,
         flag3: 0,
@@ -128,7 +129,7 @@ fn non_ascii_callsign_bytes_preserved_verbatim() -> TestResult {
         .as_slice()
         .try_into()
         .map_err(|_| "expected 41-byte D-STAR header payload")?;
-    let decoded = DStarHeader::decode(&payload);
+    let decoded = DstarHeader::decode(&payload);
     assert_eq!(decoded, original);
     Ok(())
 }

@@ -181,10 +181,14 @@ impl MockTransport {
             .push_back(MockRead::Delayed(data.to_vec(), delay_ms));
     }
 
-    /// Accept any subsequent `write()` calls without validation.
+    /// Accept otherwise-unscripted subsequent `write()` calls without
+    /// validation.
     ///
-    /// When enabled, writes succeed without checking against expected
-    /// exchanges and no response is queued.
+    /// A write that exactly matches the next scripted exchange still consumes
+    /// that exchange and queues its response. Any other write succeeds without
+    /// consuming the script or queuing data. This permits tests to ignore a
+    /// variable number of write-only frames while retaining a later exact
+    /// request/response boundary.
     pub const fn expect_any_write(&mut self) {
         self.accept_any_write = true;
     }
@@ -213,6 +217,43 @@ impl MockTransport {
             self.exchanges.len()
         );
     }
+
+    /// Panic if any scripted reopen outcomes remain unconsumed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the code under test did not perform every expected reopen.
+    pub fn assert_reopen_script_complete(&self) {
+        assert!(
+            self.reopen_script.is_empty(),
+            "MockTransport has {} unconsumed reopen outcome(s)",
+            self.reopen_script.len()
+        );
+    }
+
+    /// Copy one transport-sized prefix and preserve the unread suffix for the
+    /// next read, matching stream-oriented serial and RFCOMM transports.
+    fn deliver_data(&mut self, data: &[u8], buf: &mut [u8]) -> Result<usize, TransportError> {
+        let len = data.len().min(buf.len());
+        let source = data.get(..len).ok_or_else(|| {
+            TransportError::Read(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mock response prefix exceeded its source buffer",
+            ))
+        })?;
+        let target = buf.get_mut(..len).ok_or_else(|| {
+            TransportError::Read(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mock response prefix exceeded the caller's read buffer",
+            ))
+        })?;
+        target.copy_from_slice(source);
+
+        if let Some(remainder) = data.get(len..).filter(|remainder| !remainder.is_empty()) {
+            self.pending.push_front(MockRead::Data(remainder.to_vec()));
+        }
+        Ok(len)
+    }
 }
 
 impl Default for MockTransport {
@@ -225,9 +266,15 @@ impl Transport for MockTransport {
     async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
         tracing::debug!(bytes = data.len(), "mock: write");
 
-        if self.accept_any_write && self.exchanges.is_empty() {
-            tracing::debug!("mock: accepting any write (no response queued)");
-            return Ok(());
+        if self.accept_any_write {
+            let matches_next_exchange = self
+                .exchanges
+                .front()
+                .is_some_and(|(expected, _)| expected == data);
+            if !matches_next_exchange {
+                tracing::debug!("mock: accepting unscripted write (no response queued)");
+                return Ok(());
+            }
         }
 
         let (expected_cmd, response) = self.exchanges.pop_front().ok_or_else(|| {
@@ -278,10 +325,7 @@ impl Transport for MockTransport {
             tokio::time::sleep_until(deadline).await;
             self.delay_started = None;
             if let Some(MockRead::Delayed(data, _)) = self.pending.pop_front() {
-                let len = data.len().min(buf.len());
-                if let (Some(dst), Some(src)) = (buf.get_mut(..len), data.get(..len)) {
-                    dst.copy_from_slice(src);
-                }
+                let len = self.deliver_data(&data, buf)?;
                 tracing::debug!(bytes = len, "mock: delayed read");
                 return Ok(len);
             }
@@ -298,10 +342,7 @@ impl Transport for MockTransport {
 
         match outcome {
             MockRead::Data(response) => {
-                let len = response.len().min(buf.len());
-                if let (Some(dst), Some(src)) = (buf.get_mut(..len), response.get(..len)) {
-                    dst.copy_from_slice(src);
-                }
+                let len = self.deliver_data(&response, buf)?;
                 tracing::debug!(bytes = len, "mock: read");
                 Ok(len)
             }
@@ -372,6 +413,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wildcard_writes_preserve_a_later_exact_exchange() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect_any_write();
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        mock.write(b"write-only binary frame").await?;
+        mock.write(b"another binary frame").await?;
+        mock.write(b"ID\r").await?;
+
+        let mut buffer = [0_u8; 64];
+        let count = mock.read(&mut buffer).await?;
+        assert_eq!(read_prefix(&buffer, count)?, b"ID TH-D75\r");
+        mock.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn multiple_exchanges() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"ID\r", b"ID TH-D75\r");
@@ -416,6 +474,32 @@ mod tests {
             result.is_err(),
             "expected read-before-write to fail: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn reads_preserve_data_that_does_not_fit_the_caller_buffer() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.queue_read(b"abcdef");
+        let mut buf = [0u8; 2];
+
+        for expected in [b"ab".as_slice(), b"cd".as_slice(), b"ef".as_slice()] {
+            let n = mock.read(&mut buf).await?;
+            assert_eq!(read_prefix(&buf, n)?, expected);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delayed_reads_preserve_their_unread_suffix() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.queue_read_delayed(b"abcd", 0);
+        let mut buf = [0u8; 3];
+
+        let first = mock.read(&mut buf).await?;
+        assert_eq!(read_prefix(&buf, first)?, b"abc");
+        let second = mock.read(&mut buf).await?;
+        assert_eq!(read_prefix(&buf, second)?, b"d");
+        Ok(())
     }
 
     #[tokio::test]

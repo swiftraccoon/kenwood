@@ -19,13 +19,14 @@
 //! Each setting gets its own `#[ignore]` test so it can be run individually
 //! without risk of accumulating MCP sessions.
 //!
-//! Run one:   `cargo test --test auto_offset_mapper map_squelch_a -- --ignored --nocapture`
-//! Run all:   `cargo test --test auto_offset_mapper -- --ignored --nocapture --test-threads=1`
+//! This archival probe source is not registered as a Cargo target. Before a
+//! hardware run, review it against `docs/audit/probe_queue.md`, promote the
+//! reviewed copy to an explicit test target, and run that target serially.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use kenwood_thd75::protocol::Command;
+use kenwood_thd75::error::Error;
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::*;
@@ -35,19 +36,15 @@ use kenwood_thd75::types::*;
 // ---------------------------------------------------------------------------
 
 /// Connect to the first discovered USB serial radio.
-async fn connect() -> Radio<SerialTransport> {
+fn connect() -> Radio<SerialTransport> {
     let ports = SerialTransport::discover_usb().unwrap();
-    Radio::connect(
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap(),
-    )
-    .await
-    .unwrap()
+    Radio::new(SerialTransport::open(&ports[0].port_name).unwrap())
 }
 
 /// Wait for the USB stack to re-enumerate after MCP exit, then connect.
 async fn reconnect() -> Radio<SerialTransport> {
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    connect().await
+    connect()
 }
 
 /// Read the full 500 KB memory image with progress output.
@@ -79,35 +76,193 @@ const fn region_name(offset: usize) -> &'static str {
         0x02000..0x03300 => "Ch Flags",
         0x04000..0x10000 => "Ch Data",
         0x10000..0x14B00 => "Ch Names",
-        0x15100..0x2A100 => "APRS",
-        0x2A100..0x4D100 => "D-STAR",
+        0x15100..0x25000 => "APRS",
+        0x25000..0x29B00 => "D-STAR callsign list",
+        0x29B00..0x2A000 => "D-STAR list gap",
+        0x2A000..0x4D100 => "D-STAR repeater/tail",
         0x4D100..0x7A300 => "BT/Tail",
         _ => "Unknown",
+    }
+}
+
+/// One setting whose live value can be observed and changed through a typed
+/// `Radio` operation.
+#[derive(Debug, Clone, Copy)]
+enum SettingKind {
+    Squelch(Band),
+    PowerLevel(Band),
+    Attenuator(Band),
+    BacklightControl,
+    BandMode,
+    Vox,
+    VoxGain,
+    VoxDelay,
+    Bluetooth,
+    AutoInfo,
+    OperatingMode(Band),
+}
+
+impl SettingKind {
+    /// Read the exact value that must be restored after the differential run.
+    async fn observe(self, radio: &mut Radio<SerialTransport>) -> Result<SettingValue, Error> {
+        match self {
+            Self::Squelch(band) => radio
+                .get_squelch(band)
+                .await
+                .map(|value| SettingValue::Squelch { band, value }),
+            Self::PowerLevel(band) => radio
+                .get_power_level(band)
+                .await
+                .map(|value| SettingValue::PowerLevel { band, value }),
+            Self::Attenuator(band) => radio
+                .get_attenuator(band)
+                .await
+                .map(|enabled| SettingValue::Attenuator { band, enabled }),
+            Self::BacklightControl => radio
+                .get_backlight_control()
+                .await
+                .map(SettingValue::BacklightControl),
+            Self::BandMode => radio.get_band_mode().await.map(SettingValue::BandMode),
+            Self::Vox => radio.get_vox().await.map(SettingValue::Vox),
+            Self::VoxGain => radio.get_vox_gain().await.map(SettingValue::VoxGain),
+            Self::VoxDelay => radio.get_vox_delay().await.map(SettingValue::VoxDelay),
+            Self::Bluetooth => radio.get_bluetooth().await.map(SettingValue::Bluetooth),
+            Self::AutoInfo => radio.get_auto_info().await.map(SettingValue::AutoInfo),
+            Self::OperatingMode(band) => radio
+                .get_operating_mode(band)
+                .await
+                .map(|value| SettingValue::OperatingMode { band, value }),
+        }
+    }
+}
+
+/// A fully typed setting value, including any band needed to write it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingValue {
+    Squelch { band: Band, value: SquelchLevel },
+    PowerLevel { band: Band, value: PowerLevel },
+    Attenuator { band: Band, enabled: bool },
+    BacklightControl(BacklightControl),
+    BandMode(BandMode),
+    Vox(bool),
+    VoxGain(VoxGain),
+    VoxDelay(VoxDelay),
+    Bluetooth(bool),
+    AutoInfo(bool),
+    OperatingMode {
+        band: Band,
+        value: OperatingMode,
+    },
+}
+
+impl SettingValue {
+    /// Choose a valid value guaranteed to differ from the observed value.
+    fn contrasting(self) -> Self {
+        match self {
+            Self::Squelch { band, value } => Self::Squelch {
+                band,
+                value: if value == SquelchLevel::MAX {
+                    SquelchLevel::OPEN
+                } else {
+                    SquelchLevel::MAX
+                },
+            },
+            Self::PowerLevel { band, value } => Self::PowerLevel {
+                band,
+                value: if value == PowerLevel::Low {
+                    PowerLevel::High
+                } else {
+                    PowerLevel::Low
+                },
+            },
+            Self::Attenuator { band, enabled } => Self::Attenuator {
+                band,
+                enabled: !enabled,
+            },
+            Self::BacklightControl(value) => {
+                Self::BacklightControl(if value == BacklightControl::Manual {
+                    BacklightControl::Auto
+                } else {
+                    BacklightControl::Manual
+                })
+            }
+            Self::BandMode(mode) => Self::BandMode(match mode {
+                BandMode::Dual => BandMode::Single,
+                BandMode::Single => BandMode::Dual,
+            }),
+            Self::Vox(enabled) => Self::Vox(!enabled),
+            Self::VoxGain(value) => Self::VoxGain(if value.as_raw() == VoxGain::MAX {
+                VoxGain::ZERO
+            } else {
+                VoxGain::new(VoxGain::MAX).expect("VoxGain::MAX must remain valid")
+            }),
+            Self::VoxDelay(value) => Self::VoxDelay(if value == VoxDelay::MS_3000 {
+                VoxDelay::MS_250
+            } else {
+                VoxDelay::MS_3000
+            }),
+            Self::Bluetooth(enabled) => Self::Bluetooth(!enabled),
+            Self::AutoInfo(enabled) => Self::AutoInfo(!enabled),
+            Self::OperatingMode { band, value } => Self::OperatingMode {
+                band,
+                value: if value == OperatingMode::Nfm {
+                    OperatingMode::Fm
+                } else {
+                    OperatingMode::Nfm
+                },
+            },
+        }
+    }
+
+    /// Apply this value through the corresponding validated high-level API.
+    async fn apply(self, radio: &mut Radio<SerialTransport>) -> Result<(), Error> {
+        match self {
+            Self::Squelch { band, value } => radio.set_squelch(band, value).await,
+            Self::PowerLevel { band, value } => radio.set_power_level(band, value).await,
+            Self::Attenuator { band, enabled } => radio.set_attenuator(band, enabled).await,
+            Self::BacklightControl(value) => radio.set_backlight_control(value).await,
+            Self::BandMode(mode) => radio.set_band_mode(mode).await,
+            Self::Vox(enabled) => radio.set_vox(enabled).await,
+            Self::VoxGain(value) => radio.set_vox_gain(value).await,
+            Self::VoxDelay(value) => radio.set_vox_delay(value).await,
+            Self::Bluetooth(enabled) => radio.set_bluetooth(enabled).await,
+            Self::AutoInfo(enabled) => radio.set_auto_info(enabled).await,
+            Self::OperatingMode { band, value } => {
+                radio.set_operating_mode(band, value).await
+            }
+        }
     }
 }
 
 /// Run a single-setting mapping test with exactly two MCP dumps.
 ///
 /// 1. Baseline dump (MCP session 1).
-/// 2. Reconnect, apply `set_cmd` via CAT.
+/// 2. Reconnect, apply a contrasting value via the typed CAT API.
 /// 3. Modified dump (MCP session 2).
-/// 4. Reconnect, apply `restore_cmd` via CAT.
+/// 4. Reconnect, restore the exact value observed before the baseline dump.
 /// 5. Print and return the byte-level diffs.
-async fn map_single_setting(
-    name: &str,
-    set_cmd: Command,
-    restore_cmd: Command,
-) -> Vec<(usize, u8, u8)> {
-    map_single_setting_with_radio(name, connect().await, set_cmd, restore_cmd).await
+async fn map_single_setting(name: &str, kind: SettingKind) -> Vec<(usize, u8, u8)> {
+    map_single_setting_with_radio(name, connect(), kind).await
 }
 
 async fn map_single_setting_with_radio(
     name: &str,
     mut radio: Radio<SerialTransport>,
-    set_cmd: Command,
-    restore_cmd: Command,
+    kind: SettingKind,
 ) -> Vec<(usize, u8, u8)> {
     println!("\n=== Mapping '{name}' ===\n");
+
+    let original = match kind.observe(&mut radio).await {
+        Ok(value) => value,
+        Err(error) => {
+            println!("  Cannot observe the original value: {error}");
+            let _ = radio.disconnect().await;
+            return Vec::new();
+        }
+    };
+    let changed = original.contrasting();
+    println!("  Original: {original:?}");
+    println!("  Probe value: {changed:?}");
 
     // Step 1: Baseline dump.
     println!("  [1/4] Baseline dump...");
@@ -120,7 +275,7 @@ async fn map_single_setting_with_radio(
     // Step 2: Reconnect and change the setting via CAT.
     println!("  [2/4] Changing setting via CAT...");
     let mut radio = reconnect().await;
-    let set_result = radio.execute(set_cmd).await;
+    let set_result = changed.apply(&mut radio).await;
     match &set_result {
         Ok(_) => println!("         OK"),
         Err(e) => {
@@ -141,7 +296,7 @@ async fn map_single_setting_with_radio(
     // Step 4: Reconnect and restore.
     println!("  [4/4] Restoring setting via CAT...");
     let mut radio = reconnect().await;
-    let restore_result = radio.execute(restore_cmd).await;
+    let restore_result = original.apply(&mut radio).await;
     match &restore_result {
         Ok(_) => println!("         OK"),
         Err(e) => println!("         FAILED: {e}"),
@@ -164,42 +319,40 @@ async fn map_single_setting_with_radio(
     diffs
 }
 
-fn backlight_mapping_commands(original: BacklightControl) -> (Command, Command) {
-    let changed = if original == BacklightControl::Manual {
-        BacklightControl::Auto
-    } else {
-        BacklightControl::Manual
-    };
-    (
-        Command::SetBacklightControl { mode: changed },
-        Command::SetBacklightControl { mode: original },
-    )
-}
-
 async fn map_backlight_control_setting() -> Vec<(usize, u8, u8)> {
-    let mut radio = connect().await;
-    let original = radio.get_backlight_control().await.unwrap();
-    let (set_cmd, restore_cmd) = backlight_mapping_commands(original);
-    map_single_setting_with_radio("backlight_control", radio, set_cmd, restore_cmd).await
+    map_single_setting("backlight_control", SettingKind::BacklightControl).await
 }
 
 #[test]
-fn backlight_mapping_always_changes_then_restores_the_observed_mode() {
-    for original in [
-        BacklightControl::Manual,
-        BacklightControl::On,
-        BacklightControl::Auto,
-        BacklightControl::AutoDcIn,
-    ] {
-        let (set_cmd, restore_cmd) = backlight_mapping_commands(original);
-        assert!(matches!(
-            set_cmd,
-            Command::SetBacklightControl { mode } if mode != original
-        ));
-        assert!(matches!(
-            restore_cmd,
-            Command::SetBacklightControl { mode } if mode == original
-        ));
+fn every_probe_value_differs_from_its_observed_value() {
+    let values = [
+        SettingValue::Squelch {
+            band: Band::A,
+            value: SquelchLevel::OPEN,
+        },
+        SettingValue::PowerLevel {
+            band: Band::A,
+            value: PowerLevel::High,
+        },
+        SettingValue::Attenuator {
+            band: Band::A,
+            enabled: false,
+        },
+        SettingValue::BacklightControl(BacklightControl::Manual),
+        SettingValue::BandMode(BandMode::Single),
+        SettingValue::Vox(false),
+        SettingValue::VoxGain(VoxGain::ZERO),
+        SettingValue::VoxDelay(VoxDelay::MS_250),
+        SettingValue::Bluetooth(false),
+        SettingValue::AutoInfo(false),
+        SettingValue::OperatingMode {
+            band: Band::A,
+            value: OperatingMode::Fm,
+        },
+    ];
+
+    for original in values {
+        assert_ne!(original.contrasting(), original);
     }
 }
 
@@ -210,52 +363,19 @@ fn backlight_mapping_always_changes_then_restores_the_observed_mode() {
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
 async fn map_squelch_a() {
-    let _ = map_single_setting(
-        "squelch_a",
-        Command::SetSquelch {
-            band: Band::A,
-            level: 5,
-        },
-        Command::SetSquelch {
-            band: Band::A,
-            level: 2,
-        },
-    )
-    .await;
+    let _ = map_single_setting("squelch_a", SettingKind::Squelch(Band::A)).await;
 }
 
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
 async fn map_power_level_a() {
-    let _ = map_single_setting(
-        "power_level_a",
-        Command::SetPowerLevel {
-            band: Band::A,
-            level: PowerLevel::Low,
-        },
-        Command::SetPowerLevel {
-            band: Band::A,
-            level: PowerLevel::High,
-        },
-    )
-    .await;
+    let _ = map_single_setting("power_level_a", SettingKind::PowerLevel(Band::A)).await;
 }
 
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
 async fn map_attenuator_a() {
-    let _ = map_single_setting(
-        "attenuator_a",
-        Command::SetAttenuator {
-            band: Band::A,
-            enabled: true,
-        },
-        Command::SetAttenuator {
-            band: Band::A,
-            enabled: false,
-        },
-    )
-    .await;
+    let _ = map_single_setting("attenuator_a", SettingKind::Attenuator(Band::A)).await;
 }
 
 #[tokio::test]
@@ -267,23 +387,13 @@ async fn map_backlight_control() {
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
 async fn map_dual_band() {
-    let _ = map_single_setting(
-        "dual_band",
-        Command::SetDualBand { enabled: true },
-        Command::SetDualBand { enabled: false },
-    )
-    .await;
+    let _ = map_single_setting("band_mode", SettingKind::BandMode).await;
 }
 
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
 async fn map_vox_enable() {
-    let _ = map_single_setting(
-        "vox_enable",
-        Command::SetVox { enabled: true },
-        Command::SetVox { enabled: false },
-    )
-    .await;
+    let _ = map_single_setting("vox_enable", SettingKind::Vox).await;
 }
 
 #[tokio::test]
@@ -291,24 +401,14 @@ async fn map_vox_enable() {
 async fn map_vox_gain() {
     // VOX must already be enabled for VG to work. This test assumes
     // VOX is on or accepts that the radio may return N.
-    let _ = map_single_setting(
-        "vox_gain",
-        Command::SetVoxGain { gain: 9 },
-        Command::SetVoxGain { gain: 4 },
-    )
-    .await;
+    let _ = map_single_setting("vox_gain", SettingKind::VoxGain).await;
 }
 
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
 async fn map_vox_delay() {
     // VOX must already be enabled for VD to work. Same caveat as vox_gain.
-    let _ = map_single_setting(
-        "vox_delay",
-        Command::SetVoxDelay { delay: 9 },
-        Command::SetVoxDelay { delay: 1 },
-    )
-    .await;
+    let _ = map_single_setting("vox_delay", SettingKind::VoxDelay).await;
 }
 
 // BL is battery level (read-only) per KI4LAX, so no MCP offset mapping is needed.
@@ -316,12 +416,7 @@ async fn map_vox_delay() {
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
 async fn map_bluetooth() {
-    let _ = map_single_setting(
-        "bluetooth_off",
-        Command::SetBluetooth { enabled: false },
-        Command::SetBluetooth { enabled: true },
-    )
-    .await;
+    let _ = map_single_setting("bluetooth", SettingKind::Bluetooth).await;
 }
 
 // DW is frequency down (action command) per KI4LAX, so no MCP offset mapping is needed.
@@ -329,27 +424,15 @@ async fn map_bluetooth() {
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
 async fn map_auto_info() {
-    let _ = map_single_setting(
-        "auto_info",
-        Command::SetAutoInfo { enabled: true },
-        Command::SetAutoInfo { enabled: false },
-    )
-    .await;
+    let _ = map_single_setting("auto_info", SettingKind::AutoInfo).await;
 }
 
 #[tokio::test]
 #[ignore = "requires connected radio hardware"]
-async fn map_mode_a_nfm() {
+async fn map_operating_mode_a_nfm() {
     let _ = map_single_setting(
-        "mode_a_nfm",
-        Command::SetMode {
-            band: Band::A,
-            mode: Mode::Nfm,
-        },
-        Command::SetMode {
-            band: Band::A,
-            mode: Mode::Fm,
-        },
+        "operating_mode_a",
+        SettingKind::OperatingMode(Band::A),
     )
     .await;
 }
@@ -358,14 +441,12 @@ async fn map_mode_a_nfm() {
 // Batch mapper -- runs all settings sequentially, writes results file
 // ---------------------------------------------------------------------------
 
-/// Defines a single CAT setting to map via differential MCP dumps.
+/// Defines a single typed CAT setting to map via differential MCP dumps.
 struct SettingTest {
     /// Human-readable name for the setting.
     name: &'static str,
-    /// CAT command to change the setting to a known non-default value.
-    set_cmd: Command,
-    /// CAT command to restore the setting to its original value.
-    restore_cmd: Command,
+    /// Operation used to observe, change, and restore the setting.
+    kind: SettingKind,
 }
 
 #[tokio::test]
@@ -387,80 +468,46 @@ async fn map_all_settings() {
         // BL is battery level (read-only) per KI4LAX; excluded.
         SettingTest {
             name: "vox_enable",
-            set_cmd: Command::SetVox { enabled: true },
-            restore_cmd: Command::SetVox { enabled: false },
+            kind: SettingKind::Vox,
         },
         SettingTest {
             name: "vox_gain",
-            set_cmd: Command::SetVoxGain { gain: 9 },
-            restore_cmd: Command::SetVoxGain { gain: 4 },
+            kind: SettingKind::VoxGain,
         },
         SettingTest {
             name: "vox_delay",
-            set_cmd: Command::SetVoxDelay { delay: 9 },
-            restore_cmd: Command::SetVoxDelay { delay: 1 },
+            kind: SettingKind::VoxDelay,
         },
         SettingTest {
             name: "dual_band",
-            set_cmd: Command::SetDualBand { enabled: true },
-            restore_cmd: Command::SetDualBand { enabled: false },
+            kind: SettingKind::BandMode,
         },
         SettingTest {
             name: "attenuator_a",
-            set_cmd: Command::SetAttenuator {
-                band: Band::A,
-                enabled: true,
-            },
-            restore_cmd: Command::SetAttenuator {
-                band: Band::A,
-                enabled: false,
-            },
+            kind: SettingKind::Attenuator(Band::A),
         },
         SettingTest {
             name: "power_level_a",
-            set_cmd: Command::SetPowerLevel {
-                band: Band::A,
-                level: PowerLevel::Low,
-            },
-            restore_cmd: Command::SetPowerLevel {
-                band: Band::A,
-                level: PowerLevel::High,
-            },
+            kind: SettingKind::PowerLevel(Band::A),
         },
         SettingTest {
             name: "squelch_a",
-            set_cmd: Command::SetSquelch {
-                band: Band::A,
-                level: 5,
-            },
-            restore_cmd: Command::SetSquelch {
-                band: Band::A,
-                level: 2,
-            },
+            kind: SettingKind::Squelch(Band::A),
         },
-        // BE (beep) write is a D75 firmware stub -- always returns `?`.
-        // Beep can only be changed via MCP memory write. Excluded.
+        // BE is the bare APRS beacon transmit action, not a beep setting.
+        // Key beep can only be changed via MCP memory write. Excluded.
         SettingTest {
-            name: "bluetooth_off",
-            set_cmd: Command::SetBluetooth { enabled: false },
-            restore_cmd: Command::SetBluetooth { enabled: true },
+            name: "bluetooth",
+            kind: SettingKind::Bluetooth,
         },
         // DW is frequency down (action command) per KI4LAX; excluded.
         SettingTest {
             name: "auto_info",
-            set_cmd: Command::SetAutoInfo { enabled: true },
-            restore_cmd: Command::SetAutoInfo { enabled: false },
+            kind: SettingKind::AutoInfo,
         },
         SettingTest {
-            name: "mode_a_nfm",
-            set_cmd: Command::SetMode {
-                band: Band::A,
-                mode: Mode::Nfm,
-            },
-            restore_cmd: Command::SetMode {
-                band: Band::A,
-                mode: Mode::Fm,
-            },
+            name: "operating_mode_a",
+            kind: SettingKind::OperatingMode(Band::A),
         },
         // TN = TNC mode, DC = D-STAR callsign (not tone/DCS).
         // CTCSS/DCS are set through the FO (full channel) command.
@@ -474,15 +521,9 @@ async fn map_all_settings() {
     let _ = results.insert("backlight_control".to_string(), backlight_diffs);
 
     for (i, test) in tests.iter().enumerate() {
-        println!(
-            "\n--- Setting {}/{}: '{}' ---",
-            i + 2,
-            total,
-            test.name
-        );
+        println!("\n--- Setting {}/{}: '{}' ---", i + 2, total, test.name);
 
-        let diffs =
-            map_single_setting(test.name, test.set_cmd.clone(), test.restore_cmd.clone()).await;
+        let diffs = map_single_setting(test.name, test.kind).await;
         let _ = results.insert(test.name.to_string(), diffs);
     }
 

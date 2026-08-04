@@ -21,6 +21,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -32,7 +33,7 @@ use tracing as _;
 
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::Band;
+use kenwood_thd75::types::{Band, ChannelDisplayName, RegularChannel};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,8 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     println!("=== Part 1: CAT writes ===\n");
     println!("Connecting to {port}...");
-    let transport = SerialTransport::open(&port, 115_200)?;
-    let mut radio = Radio::connect(transport).await?;
+    let transport = SerialTransport::open(&port)?;
+    let mut radio = Radio::new(transport);
 
     let info = radio.identify().await?;
     println!("Connected to: {}\n", info.model);
@@ -54,19 +55,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read current squelch, change it, then restore.
     let band = Band::A;
     let original_squelch = radio.get_squelch(band).await?;
-    println!("Band A squelch: {}", original_squelch.as_u8());
+    println!("Band A squelch: {}", original_squelch.as_raw());
 
-    let test_val = if original_squelch.as_u8() >= 3 {
-        original_squelch.as_u8() - 1
+    let test_val = if original_squelch.as_raw() >= 3 {
+        original_squelch.as_raw() - 1
     } else {
-        original_squelch.as_u8() + 1
+        original_squelch.as_raw() + 1
     };
     let test_squelch = kenwood_thd75::types::SquelchLevel::new(test_val)?;
-    println!("Setting squelch to {}...", test_squelch.as_u8());
+    println!("Setting squelch to {}...", test_squelch.as_raw());
     radio.set_squelch(band, test_squelch).await?;
 
     let readback = radio.get_squelch(band).await?;
-    println!("Squelch readback: {}", readback.as_u8());
+    println!("Squelch readback: {}", readback.as_raw());
 
     println!("Restoring squelch to {original_squelch}...");
     radio.set_squelch(band, original_squelch).await?;
@@ -84,17 +85,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     println!("=== Part 2: MCP writes ===\n");
     println!("Reconnecting to {port} for MCP operations...");
-    let transport = SerialTransport::open(&port, 115_200)?;
-    let mut radio = Radio::connect(transport).await?;
+    let transport = SerialTransport::open(&port)?;
+    let mut radio = Radio::new(transport);
 
     // Write a channel name via MCP (read-modify-write of one page).
     // This enters and exits programming mode.
     println!("WARNING: overwriting channel 0 name with 'EXAMPLE' via MCP.");
     println!("(Radio will show 'PROG MCP' briefly)\n");
-    radio.write_channel_name(0, "EXAMPLE").await?;
+    let name = ChannelDisplayName::new("EXAMPLE")?;
+    radio
+        .write_channel_name(RegularChannel::new(0)?, &name)
+        .await?;
 
     println!("Channel name written.");
-    println!("USB connection has been reset by the radio.");
+    println!("CAT was restored after the radio reset USB.");
     println!("Restore channel 0's original name manually when finished.");
     println!("\nTo verify: reconnect and run `cargo run --example channel_dump -- --names`");
 

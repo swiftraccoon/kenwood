@@ -14,20 +14,21 @@
 //! cargo test --test memory_dump -- --ignored --nocapture --test-threads=1
 //! ```
 
+use kenwood_thd75::RegularChannel;
 use kenwood_thd75::memory::MemoryImage;
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::SerialTransport;
 
 /// Connect to the first discovered TH-D75 via USB.
-async fn connect() -> Radio<SerialTransport> {
+fn connect() -> Radio<SerialTransport> {
     let ports = SerialTransport::discover_usb().expect("USB discovery failed");
     assert!(
         !ports.is_empty(),
         "No TH-D75 found -- connect radio via USB"
     );
-    let transport = SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD)
+    let transport = SerialTransport::open(&ports[0].port_name)
         .expect("Failed to open serial port");
-    Radio::connect(transport).await.expect("Failed to connect")
+    Radio::new(transport)
 }
 
 /// Dump the full 500 KB radio memory to `tests/fixtures/memory_dump.bin`.
@@ -37,7 +38,7 @@ async fn connect() -> Radio<SerialTransport> {
 #[tokio::test]
 #[ignore = "requires TH-D75 connected via USB; takes ~55 seconds"]
 async fn dump_full_memory() {
-    let mut radio = connect().await;
+    let mut radio = connect();
 
     eprintln!("Starting full memory dump (1955 pages at 9600 baud)...");
 
@@ -63,17 +64,25 @@ async fn dump_full_memory() {
     eprintln!("Model name       : {:?}", settings.model_name());
 
     let channels = mem.channels();
-    let populated = channels.count();
+    let populated = channels.count().expect("channel flags failed to decode");
     eprintln!("Populated channels: {populated}");
 
-    for i in 0..20u16 {
-        if channels.is_used(i) {
-            let name = channels.name(i);
-            if let Some(ch) = channels.get(i) {
+    for channel in RegularChannel::all().take(20) {
+        if channels
+            .is_used(channel)
+            .expect("channel flag failed to decode")
+        {
+            let name = channels
+                .name(channel)
+                .expect("channel name failed to decode");
+            let entry = channels
+                .get(channel)
+                .expect("channel record failed to decode");
+            if let Some(programmed) = entry.programmed() {
                 eprintln!(
                     "  CH {:03}: {:>10.4} MHz -- {}",
-                    i,
-                    ch.flash.rx_frequency.as_mhz(),
+                    channel.as_raw(),
+                    programmed.receive_frequency.as_mhz(),
                     name,
                 );
             }
@@ -88,8 +97,10 @@ async fn dump_full_memory() {
     print_region_summary("Ch Flags    ", raw, 0x2000, 0x3300);
     print_region_summary("Ch Data     ", raw, 0x4000, 0x10000);
     print_region_summary("Ch Names    ", raw, 0x10000, 0x14B00);
-    print_region_summary("APRS        ", raw, 0x15100, 0x2A100);
-    print_region_summary("D-STAR      ", raw, 0x2A100, 0x4D100);
+    print_region_summary("APRS        ", raw, 0x15100, 0x25000);
+    print_region_summary("D-STAR calls", raw, 0x25000, 0x29B00);
+    print_region_summary("D-STAR gap  ", raw, 0x29B00, 0x2A000);
+    print_region_summary("D-STAR rpt  ", raw, 0x2A000, 0x4D100);
     print_region_summary("BT + Tail   ", raw, 0x4D100, raw.len());
 
     // USB connection drops after programming mode -- disconnect is best-effort.

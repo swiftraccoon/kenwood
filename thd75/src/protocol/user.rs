@@ -4,14 +4,16 @@
 //! Serialization is handled inline by the main dispatcher.
 
 use crate::error::ProtocolError;
+use crate::types::{HardwareVariant, RadioRegion, RadioType};
 
 use super::Response;
+use super::fields::{split_exact, upper_hex_nibble};
 
 /// Parse the TY command response from mnemonic and payload.
 ///
-/// Returns `None` if the mnemonic is not TY. `US` is a write-only unresolved
-/// handler and `0E` is a service-state transition; neither belongs in the
-/// ordinary CAT response model.
+/// Returns `None` if the mnemonic is not TY. `US` is write-only and unresolved;
+/// `0E` changes service state. Neither belongs in the ordinary CAT response
+/// model.
 pub(crate) fn parse_user(mnemonic: &str, payload: &str) -> Option<Result<Response, ProtocolError>> {
     match mnemonic {
         "TY" => Some(parse_ty(payload)),
@@ -23,47 +25,24 @@ pub(crate) fn parse_user(mnemonic: &str, payload: &str) -> Option<Result<Respons
 ///
 /// Format: `region,variant` (e.g., `K,2`).
 fn parse_ty(payload: &str) -> Result<Response, ProtocolError> {
-    let (region_str, variant_str) =
-        payload
-            .split_once(',')
-            .ok_or_else(|| ProtocolError::FieldParse {
-                command: "TY".to_owned(),
-                field: "all".to_owned(),
-                detail: format!("expected region,variant, got {payload:?}"),
-            })?;
+    let [region_str, variant_str] = split_exact::<2>(payload, "TY")?;
 
-    if !matches!(region_str, "E" | "J" | "K" | "0") {
-        return Err(ProtocolError::FieldParse {
-            command: "TY".to_owned(),
-            field: "region".to_owned(),
-            detail: format!("expected E, J, K, or 0, got {region_str:?}"),
-        });
-    }
+    let region = RadioRegion::try_from(region_str).map_err(|error| ProtocolError::FieldParse {
+        command: "TY".to_owned(),
+        field: "region".to_owned(),
+        detail: error.to_string(),
+    })?;
 
-    let variant_bytes = variant_str.as_bytes();
-    let &[variant_byte] = variant_bytes else {
-        return Err(ProtocolError::FieldParse {
+    let variant_raw = upper_hex_nibble(variant_str, "TY", "hardware_variant")?;
+    let hardware_variant =
+        HardwareVariant::new(variant_raw).map_err(|error| ProtocolError::FieldParse {
             command: "TY".to_owned(),
-            field: "variant".to_owned(),
-            detail: format!("expected one hexadecimal digit, got {variant_str:?}"),
-        });
-    };
-    if !variant_byte.is_ascii_digit() && !(b'A'..=b'F').contains(&variant_byte) {
-        return Err(ProtocolError::FieldParse {
-            command: "TY".to_owned(),
-            field: "variant".to_owned(),
-            detail: format!("expected one uppercase hexadecimal digit, got {variant_str:?}"),
-        });
-    }
-    let variant =
-        u8::from_str_radix(variant_str, 16).map_err(|error| ProtocolError::FieldParse {
-            command: "TY".to_owned(),
-            field: "variant".to_owned(),
+            field: "hardware_variant".to_owned(),
             detail: error.to_string(),
         })?;
 
-    Ok(Response::RadioType {
-        region: region_str.to_owned(),
-        variant,
-    })
+    Ok(Response::RadioType(RadioType::new(
+        region,
+        hardware_variant,
+    )))
 }

@@ -3,7 +3,8 @@
 //! The normal-mode `GM` mnemonic is safe only on a firmware image carrying one
 //! exact V1.03 patch. [`Radio::qualify_mem_read_for`] performs a strict,
 //! byte-exact attestation and returns a borrowed [`MemoryReader`]. Raw
-//! [`Radio::execute`] calls remain unable to send memory reads.
+//! commands remain unreachable through the public API, and the crate-private
+//! command executor rejects memory reads without that borrowed capability.
 
 use std::time::Duration;
 
@@ -60,9 +61,6 @@ const COMMON_PATCH_ATTESTATIONS: &[PatchAttestation] = &[
 
 /// DDR offset containing the fixed screen-capture bitmap header.
 pub const DDR_PROBE_OFFSET: MemoryReadOffset = MemoryReadOffset::new_const(0x17_D1BC);
-
-/// Backward-compatible name for [`DDR_PROBE_OFFSET`].
-pub const PROBE_OFFSET: MemoryReadOffset = DDR_PROBE_OFFSET;
 
 /// Complete fixed bitmap header at [`DDR_PROBE_OFFSET`].
 pub const PROBE_EXPECTED_HEADER: [u8; 54] = [
@@ -122,7 +120,7 @@ impl<T: Transport> MemoryReader<'_, T> {
     /// Returns [`Error::MemoryReadNotQualified`] after a prior failed or
     /// cancelled operation, [`Error::MemoryReadOutOfRange`] outside the
     /// qualified target, or a transport/protocol error for an invalid exchange.
-    pub async fn read_memory(
+    pub async fn read_bytes(
         &mut self,
         offset: MemoryReadOffset,
         len: ReadLen,
@@ -152,8 +150,8 @@ impl<T: Transport> MemoryReader<'_, T> {
     /// # Errors
     ///
     /// Returns a validation error for a zero or out-of-range request, plus any
-    /// error from [`Self::read_memory`].
-    pub async fn read_memory_range(
+    /// error from [`Self::read_bytes`].
+    pub async fn read_bytes_range(
         &mut self,
         start: MemoryReadOffset,
         total: u32,
@@ -162,7 +160,7 @@ impl<T: Transport> MemoryReader<'_, T> {
         let chunks = plan_read_for_target(self.target, start, total)?;
         let mut output = Vec::new();
         for chunk in chunks {
-            let bytes = self.read_memory(chunk.offset, chunk.len).await?;
+            let bytes = self.read_bytes(chunk.offset, chunk.len).await?;
             output.extend_from_slice(&bytes);
         }
         Ok(output)
@@ -176,7 +174,7 @@ impl<T: Transport> MemoryReader<'_, T> {
     /// # Errors
     ///
     /// Returns [`Error::MemoryReadNotQualified`] for low NOR or a poisoned
-    /// reader, plus any error from [`Self::read_memory_range`].
+    /// reader, plus any error from [`Self::read_bytes_range`].
     pub async fn capture_snapshot(
         &mut self,
         windows: &[(MemoryReadOffset, u32)],
@@ -184,7 +182,7 @@ impl<T: Transport> MemoryReader<'_, T> {
         self.require_ddr()?;
         let mut captured = Vec::with_capacity(windows.len());
         for &(offset, length) in windows {
-            let bytes = self.read_memory_range(offset, length).await?;
+            let bytes = self.read_bytes_range(offset, length).await?;
             captured.push((offset, bytes));
         }
         Ok(StateSnapshot::from_windows(captured))
@@ -223,18 +221,18 @@ impl<T: Transport> MemoryReader<'_, T> {
             .into());
         }
 
-        let end = u64::from(start.as_u32()) + u64::from(total);
+        let end = u64::from(start.as_raw()) + u64::from(total);
         if end > u64::from(self.target.bound()) {
             return Err(Error::MemoryReadOutOfRange {
                 target: self.target.as_str(),
-                offset: start.as_u32(),
-                length: sample_len.as_u16(),
+                offset: start.as_raw(),
+                length: sample_len.as_bytes(),
                 bound: self.target.bound(),
             });
         }
 
         let mut planned = Vec::new();
-        let mut cursor = start.as_u32();
+        let mut cursor = start.as_raw();
         while u64::from(cursor) < end {
             let offset = MemoryReadOffset::new(cursor)?;
             self.validate_range(offset, sample_len)?;
@@ -247,7 +245,7 @@ impl<T: Transport> MemoryReader<'_, T> {
 
         let mut windows = Vec::with_capacity(planned.len());
         for offset in planned {
-            let bytes = self.read_memory(offset, sample_len).await?;
+            let bytes = self.read_bytes(offset, sample_len).await?;
             windows.push((offset, bytes));
         }
         Ok(StateSnapshot::from_windows(windows))
@@ -271,14 +269,14 @@ impl<T: Transport> MemoryReader<'_, T> {
     }
 
     fn validate_range(&self, offset: MemoryReadOffset, len: ReadLen) -> Result<(), Error> {
-        let end = u64::from(offset.as_u32()) + u64::from(len.as_u16());
+        let end = u64::from(offset.as_raw()) + u64::from(len.as_bytes());
         if end <= u64::from(self.target.bound()) {
             Ok(())
         } else {
             Err(Error::MemoryReadOutOfRange {
                 target: self.target.as_str(),
-                offset: offset.as_u32(),
-                length: len.as_u16(),
+                offset: offset.as_raw(),
+                length: len.as_bytes(),
                 bound: self.target.bound(),
             })
         }
@@ -317,20 +315,12 @@ impl<T: Transport> Radio<T> {
         })
     }
 
-    /// Explicit-target compatibility spelling for
-    /// [`Self::qualify_mem_read_for`].
-    ///
-    /// # Errors
-    ///
-    /// Returns any error from [`Self::qualify_mem_read_for`].
-    pub async fn probe_mem_read_for(
-        &mut self,
-        target: MemoryReadTarget,
-    ) -> Result<MemoryReader<'_, T>, Error> {
-        self.qualify_mem_read_for(target).await
-    }
-
     async fn attest_memory_read(&mut self, target: MemoryReadTarget) -> Result<(), Error> {
+        // A strict GM proof must start at a known CAT frame boundary. In
+        // particular, it cannot be used to clear an ambiguous ordinary CAT
+        // exchange or to escape a proven binary session.
+        self.require_cat_ready()?;
+
         if self.mcp_phase != McpPhase::Inactive {
             return Err(Error::McpInterrupted);
         }
@@ -399,7 +389,7 @@ impl<T: Transport> Radio<T> {
         for length in [1_usize, 16, PROBE_EXPECTED_HEADER.len()] {
             self.attest_exact_read(
                 MemoryReadTarget::DdrV103,
-                DDR_PROBE_OFFSET.as_u32(),
+                DDR_PROBE_OFFSET.as_raw(),
                 PROBE_EXPECTED_HEADER.get(..length).ok_or_else(|| {
                     Self::strict_protocol_error(
                         "a valid fixed DDR probe prefix",
@@ -411,11 +401,15 @@ impl<T: Transport> Radio<T> {
         }
 
         let full = self
-            .attest_checked_read(MemoryReadTarget::DdrV103, 0, ReadLen::MAX)
+            .attest_checked_read(MemoryReadTarget::DdrV103, 0, ReadLen::new(ReadLen::MAX)?)
             .await?;
         Self::require_exact_read_len(&full, 256, "maximum-length DDR read")?;
         let top = self
-            .attest_checked_read(MemoryReadTarget::DdrV103, 0xFF_FF00, ReadLen::MAX)
+            .attest_checked_read(
+                MemoryReadTarget::DdrV103,
+                0xFF_FF00,
+                ReadLen::new(ReadLen::MAX)?,
+            )
             .await?;
         Self::require_exact_read_len(&top, 256, "top-of-DDR-window read")?;
 
@@ -444,7 +438,7 @@ impl<T: Transport> Radio<T> {
             .attest_checked_read(MemoryReadTarget::LowNorV103, 0, ReadLen::new(64)?)
             .await?;
         let maximum = self
-            .attest_checked_read(MemoryReadTarget::LowNorV103, 0, ReadLen::MAX)
+            .attest_checked_read(MemoryReadTarget::LowNorV103, 0, ReadLen::new(ReadLen::MAX)?)
             .await?;
         Self::require_exact_read_len(&maximum, 256, "maximum-length low-NOR read")?;
         if maximum.get(..1) != Some(one.as_slice())
@@ -509,7 +503,7 @@ impl<T: Transport> Radio<T> {
         if !Self::attestation_read_allowed(target, raw_offset, len) {
             return Err(Self::strict_protocol_error(
                 "one exact allowlisted GM attestation read",
-                format!("{target:?} 0x{raw_offset:06X}+{}", len.as_u16()).into_bytes(),
+                format!("{target:?} 0x{raw_offset:06X}+{}", len.as_bytes()).into_bytes(),
             ));
         }
         let bytes = self
@@ -520,7 +514,7 @@ impl<T: Transport> Radio<T> {
     }
 
     fn attestation_read_allowed(target: MemoryReadTarget, raw_offset: u32, len: ReadLen) -> bool {
-        let length = len.as_u16();
+        let length = len.as_bytes();
         let base_offset = Self::patch_attestation_offset(target, BASE_ATTESTATION_FIRMWARE_OFFSET);
         let patch = (raw_offset == base_offset && matches!(length, 1 | 16))
             || COMMON_PATCH_ATTESTATIONS.iter().any(|item| {
@@ -564,11 +558,13 @@ impl<T: Transport> Radio<T> {
         len: ReadLen,
     ) -> Result<Vec<u8>, Error> {
         let request = format!("GM {offset},{:02X}\r", len.as_wire());
-        let expected_len = 11 + usize::from(len.as_u16()) * 2;
+        let expected_len = 11 + usize::from(len.as_bytes()) * 2;
         let frame = self
             .strict_cat_exchange(request.as_bytes(), expected_len)
             .await?;
-        parse_strict_read_reply(&frame, offset, len).map_err(Error::Protocol)
+        parse_strict_read_reply(&frame, offset, len)
+            .map(|data| data.as_slice().to_vec())
+            .map_err(Error::Protocol)
     }
 
     pub(super) async fn strict_expect(
@@ -746,7 +742,7 @@ mod tests {
     };
     use crate::error::Error;
     use crate::protocol::Command;
-    use crate::radio::Radio;
+    use crate::radio::{CatState, Radio};
     use crate::transport::MockTransport;
     use crate::types::{MemoryReadOffset, MemoryReadTarget, ReadLen};
 
@@ -816,9 +812,9 @@ mod tests {
         mock.pend_when_empty();
         queue_identity(mock);
         queue_patch_attestation(mock, MemoryReadTarget::DdrV103, 0xC0, DDR_BASE_ATTESTATION);
-        queue_checked_read(mock, DDR_PROBE_OFFSET.as_u32(), &[0x42]);
-        queue_checked_read(mock, DDR_PROBE_OFFSET.as_u32(), &PROBE_EXPECTED);
-        queue_checked_read(mock, DDR_PROBE_OFFSET.as_u32(), &PROBE_EXPECTED_HEADER);
+        queue_checked_read(mock, DDR_PROBE_OFFSET.as_raw(), &[0x42]);
+        queue_checked_read(mock, DDR_PROBE_OFFSET.as_raw(), &PROBE_EXPECTED);
+        queue_checked_read(mock, DDR_PROBE_OFFSET.as_raw(), &PROBE_EXPECTED_HEADER);
         queue_checked_read(mock, 0, &[0_u8; 256]);
         queue_checked_read(mock, 0xFF_FF00, &[0_u8; 256]);
         mock.expect(b"GM FFFFFF,02\r", b"N\r");
@@ -834,6 +830,23 @@ mod tests {
             target,
             valid: true,
         }
+    }
+
+    #[tokio::test]
+    async fn qualification_rejects_untrusted_cat_boundaries_before_io() -> TestResult {
+        for cat_state in [CatState::RecoveryRequired, CatState::BinaryProven] {
+            let mut radio = Radio::new(MockTransport::new());
+            radio.cat_state = cat_state;
+
+            let result = radio
+                .qualify_mem_read_for(MemoryReadTarget::LowNorV103)
+                .await;
+
+            assert!(matches!(result, Err(Error::CatRecoveryRequired)));
+            assert!(!radio.gm_poisoned);
+            assert!(!radio.desynced);
+        }
+        Ok(())
     }
 
     #[test]
@@ -907,7 +920,7 @@ mod tests {
     #[tokio::test]
     async fn raw_execute_never_sends_gm() -> TestResult {
         let mock = MockTransport::new();
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let result = radio
             .execute(Command::ReadMemory {
                 offset: MemoryReadOffset::ZERO,
@@ -923,13 +936,13 @@ mod tests {
         let mut mock = MockTransport::new();
         queue_low_nor_attestation(&mut mock);
         mock.expect(b"GM 000010,04\r", &reply(0x10, &[0xDE, 0xAD, 0xBE, 0xEF]));
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut reader = radio
             .qualify_mem_read_for(MemoryReadTarget::LowNorV103)
             .await?;
         assert_eq!(reader.target(), MemoryReadTarget::LowNorV103);
         let bytes = reader
-            .read_memory(MemoryReadOffset::new(0x10)?, ReadLen::new(4)?)
+            .read_bytes(MemoryReadOffset::new(0x10)?, ReadLen::new(4)?)
             .await?;
         assert_eq!(bytes, [0xDE, 0xAD, 0xBE, 0xEF]);
         Ok(())
@@ -939,7 +952,7 @@ mod tests {
     async fn ddr_qualification_uses_runtime_relative_patch_offsets() -> TestResult {
         let mut mock = MockTransport::new();
         queue_ddr_attestation(&mut mock);
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let reader = radio
             .qualify_mem_read_for(MemoryReadTarget::DdrV103)
             .await?;
@@ -953,7 +966,7 @@ mod tests {
         mock.pend_when_empty();
         queue_identity(&mut mock);
         queue_checked_read(&mut mock, 0x06_F8A0, &[0x60]);
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let result = radio.qualify_mem_read_for(MemoryReadTarget::DdrV103).await;
         assert!(result.is_err(), "wrong base discriminator must fail");
         Ok(())
@@ -965,7 +978,7 @@ mod tests {
         mock.pend_when_empty();
         mock.expect(b"ID\r", b"ID TH-D75\r");
         mock.expect(b"FV\r", b"FV 1.03.000\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let result = radio
             .qualify_mem_read_for(MemoryReadTarget::LowNorV103)
             .await;
@@ -979,10 +992,10 @@ mod tests {
     #[tokio::test]
     async fn low_nor_range_is_rejected_before_wire_io() -> TestResult {
         let mock = MockTransport::new();
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut reader = direct_reader(&mut radio, MemoryReadTarget::LowNorV103);
         let result = reader
-            .read_memory(MemoryReadOffset::new(0x20_0000)?, ReadLen::new(1)?)
+            .read_bytes(MemoryReadOffset::new(0x20_0000)?, ReadLen::new(1)?)
             .await;
         assert!(matches!(result, Err(Error::MemoryReadOutOfRange { .. })));
         assert!(reader.is_valid(), "preflight rejection must not poison");
@@ -993,10 +1006,10 @@ mod tests {
     async fn low_nor_last_byte_is_inside_the_qualified_window() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"GM 1FFFFF,01\r", &reply(0x1F_FFFF, &[0x5A]));
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut reader = direct_reader(&mut radio, MemoryReadTarget::LowNorV103);
         let bytes = reader
-            .read_memory(MemoryReadOffset::new(0x1F_FFFF)?, ReadLen::new(1)?)
+            .read_bytes(MemoryReadOffset::new(0x1F_FFFF)?, ReadLen::new(1)?)
             .await?;
         assert_eq!(bytes, [0x5A]);
         Ok(())
@@ -1005,7 +1018,7 @@ mod tests {
     #[tokio::test]
     async fn low_nor_cannot_create_a_ddr_snapshot() -> TestResult {
         let mock = MockTransport::new();
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut reader = direct_reader(&mut radio, MemoryReadTarget::LowNorV103);
         let result = reader
             .capture_snapshot(&[(MemoryReadOffset::ZERO, 1)])
@@ -1018,10 +1031,10 @@ mod tests {
     async fn strict_reader_rejects_lowercase_and_poisons_capability() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"GM 000010,02\r", b"GM 000010,dead\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut reader = direct_reader(&mut radio, MemoryReadTarget::LowNorV103);
         let result = reader
-            .read_memory(MemoryReadOffset::new(0x10)?, ReadLen::new(2)?)
+            .read_bytes(MemoryReadOffset::new(0x10)?, ReadLen::new(2)?)
             .await;
         assert!(result.is_err(), "lowercase strict reply must fail");
         assert!(!reader.is_valid(), "failed I/O must poison the reader");
@@ -1032,10 +1045,10 @@ mod tests {
     async fn strict_reader_rejects_two_frames_in_one_read() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"GM 000010,01\r", b"GM 000010,AA\rID TH-D75\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut reader = direct_reader(&mut radio, MemoryReadTarget::LowNorV103);
         let result = reader
-            .read_memory(MemoryReadOffset::new(0x10)?, ReadLen::new(1)?)
+            .read_bytes(MemoryReadOffset::new(0x10)?, ReadLen::new(1)?)
             .await;
         assert!(result.is_err(), "a trailing frame must fail");
         Ok(())
@@ -1045,10 +1058,10 @@ mod tests {
     async fn strict_reader_rejects_a_wrong_echo() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"GM 000010,01\r", &reply(0x11, &[0xAA]));
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let mut reader = direct_reader(&mut radio, MemoryReadTarget::LowNorV103);
         let result = reader
-            .read_memory(MemoryReadOffset::new(0x10)?, ReadLen::new(1)?)
+            .read_bytes(MemoryReadOffset::new(0x10)?, ReadLen::new(1)?)
             .await;
         assert!(result.is_err(), "wrong echoed offset must fail");
         assert!(!reader.is_valid(), "failed strict exchange must poison");
@@ -1059,7 +1072,7 @@ mod tests {
     async fn cancelling_qualification_marks_the_stream_desynchronized() -> TestResult {
         let mut mock = MockTransport::new();
         mock.pend_when_empty();
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(1),
             radio.qualify_mem_read_for(MemoryReadTarget::LowNorV103),
@@ -1082,12 +1095,12 @@ mod tests {
     async fn cancelling_a_reader_operation_poisons_the_capability() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect_hang(b"GM 000010,01\r");
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         {
             let mut reader = direct_reader(&mut radio, MemoryReadTarget::LowNorV103);
             let result = tokio::time::timeout(
                 std::time::Duration::from_millis(1),
-                reader.read_memory(MemoryReadOffset::new(0x10)?, ReadLen::new(1)?),
+                reader.read_bytes(MemoryReadOffset::new(0x10)?, ReadLen::new(1)?),
             )
             .await;
             assert!(result.is_err(), "outer cancellation should win");
@@ -1116,8 +1129,8 @@ mod tests {
     #[tokio::test]
     async fn buffered_codec_bytes_block_attestation_without_a_write() -> TestResult {
         let mock = MockTransport::new();
-        let mut radio = Radio::connect(mock).await?;
-        radio.codec.feed(b"partial");
+        let mut radio = Radio::new(mock);
+        radio.codec.feed(b"partial")?;
         let result = radio
             .qualify_mem_read_for(MemoryReadTarget::LowNorV103)
             .await;
@@ -1132,7 +1145,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn immediate_would_block_is_not_a_quiet_line() -> TestResult {
         let mock = MockTransport::new();
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let result = radio
             .qualify_mem_read_for(MemoryReadTarget::LowNorV103)
             .await;

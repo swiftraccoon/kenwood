@@ -19,12 +19,15 @@
 //! The [`ChannelAccess`] struct borrows the raw image and provides methods
 //! to read individual channels or iterate over all populated channels.
 
+use crate::error::ValidationError;
 use crate::protocol::programming::{
-    self, CHANNEL_RECORD_SIZE, CHANNELS_PER_MEMGROUP, ChannelFlag, FLAG_EMPTY, FLAG_RECORD_SIZE,
+    self, CHANNEL_DATA_RECORD_COUNT, CHANNEL_RECORD_SIZE, CHANNELS_PER_MEMGROUP, FLAG_RECORD_SIZE,
     MEMGROUP_COUNT, NAME_ENTRY_SIZE, PAGE_SIZE,
 };
-use crate::sdcard::config::ChannelEntry;
-use crate::types::channel::FlashChannel;
+use crate::types::{
+    ChannelDisplayName, MemoryChannelBand, MemoryGroup, RegularChannel, StoredChannel,
+    StoredChannelData, StoredChannelFlag,
+};
 
 use super::MemoryError;
 
@@ -41,27 +44,138 @@ const DATA_OFFSET: usize = 0x4000;
 /// Byte offset of channel names (1,200 entries x 16 bytes).
 const NAMES_OFFSET: usize = 0x10000;
 
-/// Maximum regular channel number (0-999).
-const MAX_REGULAR_CHANNEL: u16 = 999;
+// ---------------------------------------------------------------------------
+// ChannelEntry
+// ---------------------------------------------------------------------------
 
-/// Total channel entries including extended channels.
-const TOTAL_ENTRIES: usize = programming::TOTAL_CHANNEL_ENTRIES; // 1200
-
-/// Number of channel entries that have a corresponding 40-byte data record.
+/// One regular memory-channel slot and all three records that define it.
 ///
-/// The flag and name tables expose 1,200 raw slots, but the 192 data
-/// memgroups hold only 1,152 channel records. Name slots starting at 1,152
-/// are used for other data, including group names.
-const CHANNEL_DATA_ENTRIES: usize = MEMGROUP_COUNT * CHANNELS_PER_MEMGROUP; // 1152
+/// The fields are private so callers cannot pair a programmed flag with an
+/// invalid receive frequency or place an unrepresentable raw bit value in a
+/// channel that will later be written. Use [`ChannelEntry::new_programmed`] for a
+/// new channel and [`ChannelEntry::empty`] to clear a slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelEntry {
+    number: RegularChannel,
+    name: ChannelDisplayName,
+    data: StoredChannelData,
+    flag: StoredChannelFlag,
+}
 
-/// Maximum channel index with flag, data, and name destinations (1151).
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "`CHANNEL_DATA_ENTRIES = 1152`, so `CHANNEL_DATA_ENTRIES - 1 = 1151`. u16::MAX = \
-              65535. The \
-              const cast is lossless and evaluated at compile time."
-)]
-const MAX_CHANNEL_DATA_INDEX: u16 = (CHANNEL_DATA_ENTRIES - 1) as u16;
+impl ChannelEntry {
+    /// Construct an empty regular-channel slot.
+    #[must_use]
+    pub fn empty(number: RegularChannel) -> Self {
+        Self {
+            number,
+            name: ChannelDisplayName::default(),
+            data: StoredChannelData::new_unprogrammed([0xFF; StoredChannel::BYTE_SIZE]),
+            flag: StoredChannelFlag::empty_for_regular_channel(number),
+        }
+    }
+
+    /// Construct a programmed regular-channel slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] when the receive frequency is the
+    /// zero/erased marker rather than a programmed frequency.
+    pub fn new_programmed(
+        number: RegularChannel,
+        name: ChannelDisplayName,
+        stored_channel: StoredChannel,
+        band: MemoryChannelBand,
+        group: MemoryGroup,
+        scan_lockout: bool,
+    ) -> Result<Self, ValidationError> {
+        let entry = Self {
+            number,
+            name,
+            data: StoredChannelData::new_programmed(stored_channel)?,
+            flag: StoredChannelFlag::programmed(band, group, scan_lockout),
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    fn from_stored_parts(
+        number: RegularChannel,
+        name: ChannelDisplayName,
+        data: StoredChannelData,
+        flag: StoredChannelFlag,
+    ) -> Result<Self, ValidationError> {
+        let entry = Self {
+            number,
+            name,
+            data,
+            flag,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    /// Return this slot's regular channel number.
+    #[must_use]
+    pub const fn number(&self) -> RegularChannel {
+        self.number
+    }
+
+    /// Return the validated 16-byte display name.
+    #[must_use]
+    pub const fn name(&self) -> &ChannelDisplayName {
+        &self.name
+    }
+
+    /// Return the decoded record when this slot is programmed.
+    #[must_use]
+    pub const fn programmed(&self) -> Option<&StoredChannel> {
+        self.data.programmed()
+    }
+
+    /// Return the exact typed-or-preserved channel data.
+    #[must_use]
+    pub const fn data(&self) -> &StoredChannelData {
+        &self.data
+    }
+
+    /// Return the exact decoded flag record, including opaque bits.
+    #[must_use]
+    pub const fn flag(&self) -> StoredChannelFlag {
+        self.flag
+    }
+
+    /// Return whether this slot is programmed.
+    #[must_use]
+    pub const fn is_programmed(&self) -> bool {
+        self.flag.is_programmed()
+    }
+
+    /// Consume the entry and return its independently encoded records.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        RegularChannel,
+        ChannelDisplayName,
+        StoredChannelData,
+        StoredChannelFlag,
+    ) {
+        (self.number, self.name, self.data, self.flag)
+    }
+
+    /// Validate that this entry can be written without normalization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] when a programmed slot has a zero receive
+    /// frequency or the erased `u32::MAX` marker.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if let Some(channel) = self.programmed() {
+            channel.validate_programmed()?;
+        }
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ChannelAccess (read-only)
@@ -84,51 +198,43 @@ impl<'a> ChannelAccess<'a> {
     }
 
     /// Get the number of populated (non-empty) regular channels (0-999).
-    #[must_use]
-    pub fn count(&self) -> usize {
-        (0..=MAX_REGULAR_CHANNEL)
-            .filter(|&ch| self.is_used(ch))
-            .count()
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::ParseError`] if a regular channel's flag record
+    /// is malformed.
+    pub fn count(&self) -> Result<usize, MemoryError> {
+        let mut count = 0;
+        for channel in RegularChannel::all() {
+            count += usize::from(self.is_used(channel)?);
+        }
+        Ok(count)
     }
 
     /// Check if a channel slot is in use.
+    /// # Errors
     ///
-    /// Returns `false` for out-of-range channel numbers.
-    #[must_use]
-    pub fn is_used(&self, number: u16) -> bool {
-        let number_usize = number as usize;
-        if number_usize >= TOTAL_ENTRIES {
-            return false;
-        }
-        let offset = FLAGS_OFFSET + number_usize * FLAG_RECORD_SIZE;
-        self.image
-            .get(offset)
-            .copied()
-            .is_some_and(|b| b != FLAG_EMPTY)
+    /// Returns [`MemoryError::ParseError`] if the channel's flag record is
+    /// missing or malformed.
+    pub fn is_used(&self, number: RegularChannel) -> Result<bool, MemoryError> {
+        Ok(!self.flag(number)?.is_empty())
     }
 
     /// Get a specific channel by number.
     ///
-    /// Returns `None` if the channel number is out of range or if the
-    /// channel data cannot be read from the image.
-    #[must_use]
-    pub fn get(&self, number: u16) -> Option<ChannelEntry> {
-        let number_usize = number as usize;
-        if number_usize >= TOTAL_ENTRIES {
-            return None;
-        }
-
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::ParseError`] if any populated channel field is
+    /// missing or malformed.
+    pub fn get(&self, number: RegularChannel) -> Result<ChannelEntry, MemoryError> {
         let flag = self.flag(number)?;
-        let used = flag.used != FLAG_EMPTY;
-        let flash = self.flash(number)?;
-        let name = self.name(number);
+        let data = self.stored_data_with_flag(number, flag)?;
+        let name = self.name(number)?;
 
-        Some(ChannelEntry {
-            number,
-            name,
-            flash,
-            used,
-            lockout: flag.lockout,
+        ChannelEntry::from_stored_parts(number, name, data, flag).map_err(|error| {
+            MemoryError::ParseError {
+                region: format!("channel {number}"),
+                detail: error.to_string(),
+            }
         })
     }
 
@@ -136,109 +242,188 @@ impl<'a> ChannelAccess<'a> {
     ///
     /// Skips empty channel slots. The returned entries are in channel
     /// number order.
-    #[must_use]
-    pub fn all(&self) -> Vec<ChannelEntry> {
-        (0..=MAX_REGULAR_CHANNEL)
-            .filter_map(|ch| {
-                let entry = self.get(ch)?;
-                if entry.used { Some(entry) } else { None }
-            })
-            .collect()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::ParseError`] when any populated channel record,
+    /// name, or flag is missing or malformed.
+    pub fn all(&self) -> Result<Vec<ChannelEntry>, MemoryError> {
+        let mut entries = Vec::new();
+        for channel in RegularChannel::all() {
+            let entry = self.get(channel)?;
+            if entry.is_programmed() {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
     }
 
     /// Get all channel entries (0-999), including empty slots.
-    #[must_use]
-    pub fn all_slots(&self) -> Vec<ChannelEntry> {
-        (0..=MAX_REGULAR_CHANNEL)
-            .filter_map(|ch| self.get(ch))
-            .collect()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::ParseError`] when any channel record, name, or
+    /// flag is missing or malformed.
+    pub fn all_slots(&self) -> Result<Vec<ChannelEntry>, MemoryError> {
+        let mut entries = Vec::with_capacity(RegularChannel::COUNT);
+        for channel in RegularChannel::all() {
+            entries.push(self.get(channel)?);
+        }
+        Ok(entries)
     }
 
     /// Get the display name for a channel.
     ///
-    /// Returns an empty string for channels without a user-assigned name
-    /// or for out-of-range channel numbers.
-    #[must_use]
-    pub fn name(&self, number: u16) -> String {
-        let number_usize = number as usize;
-        if number_usize >= TOTAL_ENTRIES {
-            return String::new();
-        }
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::ParseError`] if the fixed-width field is not a
+    /// valid channel display name.
+    pub fn name(&self, number: RegularChannel) -> Result<ChannelDisplayName, MemoryError> {
+        let number_usize = usize::from(number);
         let offset = NAMES_OFFSET + number_usize * NAME_ENTRY_SIZE;
-        self.image
+        let bytes = self
+            .image
             .get(offset..offset + NAME_ENTRY_SIZE)
-            .map(programming::extract_name)
-            .unwrap_or_default()
+            .ok_or_else(|| MemoryError::ParseError {
+                region: format!("channel {number} name"),
+                detail: "name entry is outside the memory image".to_owned(),
+            })?;
+        let wire: [u8; NAME_ENTRY_SIZE] =
+            bytes.try_into().map_err(|_| MemoryError::ParseError {
+                region: format!("channel {number} name"),
+                detail: format!("expected {NAME_ENTRY_SIZE} bytes, got {}", bytes.len()),
+            })?;
+        programming::decode_channel_display_name(wire).map_err(|error| MemoryError::ParseError {
+            region: format!("channel {number} name"),
+            detail: error.to_string(),
+        })
     }
 
     /// Get the channel flag (used/band, lockout, group) for a channel.
     ///
-    /// Returns `None` for out-of-range channel numbers.
-    #[must_use]
-    pub fn flag(&self, number: u16) -> Option<ChannelFlag> {
-        let number_usize = number as usize;
-        if number_usize >= TOTAL_ENTRIES {
-            return None;
-        }
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::ParseError`] if the record is missing, has an
+    /// unverified programmed-channel band code, or assigns a populated
+    /// channel outside groups 0-29.
+    pub fn flag(&self, number: RegularChannel) -> Result<StoredChannelFlag, MemoryError> {
+        let number_usize = usize::from(number);
         let offset = FLAGS_OFFSET + number_usize * FLAG_RECORD_SIZE;
-        let slice = self.image.get(offset..offset + FLAG_RECORD_SIZE)?;
-        programming::parse_channel_flag(slice)
+        let slice = self
+            .image
+            .get(offset..offset + FLAG_RECORD_SIZE)
+            .ok_or_else(|| MemoryError::ParseError {
+                region: format!("channel {number} flag"),
+                detail: "flag record is outside the memory image".to_owned(),
+            })?;
+        programming::parse_channel_flag(slice).map_err(|error| MemoryError::ParseError {
+            region: format!("channel {number} flag"),
+            detail: error.to_string(),
+        })
     }
 
-    /// Get the 40-byte flash channel record for a channel.
+    /// Get the exact 40-byte stored data for a channel.
     ///
-    /// Returns `None` for out-of-range channel numbers or if the data
-    /// cannot be parsed. Uses the flash memory encoding ([`FlashChannel`])
-    /// which includes all 8 operating modes and structured D-STAR fields.
-    #[must_use]
-    pub fn flash(&self, number: u16) -> Option<FlashChannel> {
-        let number_usize = number as usize;
-        if number_usize >= TOTAL_ENTRIES {
-            return None;
-        }
+    /// Programmed records are decoded as [`StoredChannel`]; empty records are
+    /// returned as preserved raw bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::ParseError`] if the record is missing or
+    /// malformed.
+    pub fn stored_data(&self, number: RegularChannel) -> Result<StoredChannelData, MemoryError> {
+        let flag = self.flag(number)?;
+        self.stored_data_with_flag(number, flag)
+    }
+
+    fn stored_data_with_flag(
+        &self,
+        number: RegularChannel,
+        flag: StoredChannelFlag,
+    ) -> Result<StoredChannelData, MemoryError> {
+        let number_usize = usize::from(number);
 
         // Channel data layout: memgroup = ch / 6, slot = ch % 6
         // byte_offset = 0x4000 + memgroup * 256 + slot * 40
         let memgroup = number_usize / CHANNELS_PER_MEMGROUP;
         let slot = number_usize % CHANNELS_PER_MEMGROUP;
 
-        if memgroup >= MEMGROUP_COUNT {
-            return None;
-        }
+        debug_assert!(
+            memgroup < MEMGROUP_COUNT,
+            "validated regular channel must map inside the channel memory groups"
+        );
 
         let offset = DATA_OFFSET + memgroup * PAGE_SIZE + slot * CHANNEL_RECORD_SIZE;
-        let slice = self.image.get(offset..offset + CHANNEL_RECORD_SIZE)?;
-        FlashChannel::from_bytes(slice).ok()
+        let slice = self
+            .image
+            .get(offset..offset + CHANNEL_RECORD_SIZE)
+            .ok_or_else(|| MemoryError::ParseError {
+                region: format!("channel {number} data"),
+                detail: "channel record is outside the memory image".to_owned(),
+            })?;
+        StoredChannelData::from_bytes(slice, flag).map_err(|error| MemoryError::ParseError {
+            region: format!("channel {number} data"),
+            detail: error.to_string(),
+        })
     }
 
-    /// Get all channel names (0-999) as a vector of strings.
+    /// Get all validated regular-channel names (0-999).
     ///
     /// Empty names are represented as empty strings.
-    #[must_use]
-    pub fn names(&self) -> Vec<String> {
-        (0..=MAX_REGULAR_CHANNEL).map(|ch| self.name(ch)).collect()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::ParseError`] when any fixed-width name field is
+    /// missing or invalid.
+    pub fn names(&self) -> Result<Vec<ChannelDisplayName>, MemoryError> {
+        let mut names = Vec::with_capacity(RegularChannel::COUNT);
+        for channel in RegularChannel::all() {
+            names.push(self.name(channel)?);
+        }
+        Ok(names)
     }
 
     /// Get a group name by group index (0-29).
     ///
     /// Group names are stored at name indices 1152-1181.
-    #[must_use]
-    pub fn group_name(&self, group: u8) -> String {
-        if group >= 30 {
-            return String::new();
-        }
-        let name_index = 1152 + group as usize;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::ParseError`] when the fixed-width group-name
+    /// field is missing or invalid.
+    pub fn group_name(&self, group: MemoryGroup) -> Result<ChannelDisplayName, MemoryError> {
+        let name_index = 1152 + usize::from(group);
         let offset = NAMES_OFFSET + name_index * NAME_ENTRY_SIZE;
-        self.image
+        let bytes = self
+            .image
             .get(offset..offset + NAME_ENTRY_SIZE)
-            .map(programming::extract_name)
-            .unwrap_or_default()
+            .ok_or_else(|| MemoryError::ParseError {
+                region: format!("group {group} name"),
+                detail: "group-name entry is outside the memory image".to_owned(),
+            })?;
+        let wire: [u8; NAME_ENTRY_SIZE] =
+            bytes.try_into().map_err(|_| MemoryError::ParseError {
+                region: format!("group {group} name"),
+                detail: format!("expected {NAME_ENTRY_SIZE} bytes, got {}", bytes.len()),
+            })?;
+        programming::decode_channel_display_name(wire).map_err(|error| MemoryError::ParseError {
+            region: format!("group {group} name"),
+            detail: error.to_string(),
+        })
     }
 
     /// Get all 30 group names.
-    #[must_use]
-    pub fn group_names(&self) -> Vec<String> {
-        (0..30).map(|g| self.group_name(g)).collect()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::ParseError`] when any fixed-width group-name
+    /// field is missing or invalid.
+    pub fn group_names(&self) -> Result<Vec<ChannelDisplayName>, MemoryError> {
+        let mut names = Vec::with_capacity(MemoryGroup::COUNT);
+        for group in MemoryGroup::all() {
+            names.push(self.group_name(group)?);
+        }
+        Ok(names)
     }
 }
 
@@ -272,17 +457,24 @@ impl<'a> ChannelWriter<'a> {
     /// image does not contain every destination. The image is unchanged on
     /// error.
     pub fn set(&mut self, entry: &ChannelEntry) -> Result<(), MemoryError> {
-        let number = entry.number as usize;
-        if number >= CHANNEL_DATA_ENTRIES {
+        entry
+            .validate()
+            .map_err(|error| MemoryError::InvalidChannelEntry {
+                channel: entry.number(),
+                detail: error.to_string(),
+            })?;
+
+        let number = usize::from(entry.number());
+        if number >= CHANNEL_DATA_RECORD_COUNT {
             return Err(MemoryError::ChannelOutOfRange {
-                channel: entry.number,
-                max: MAX_CHANNEL_DATA_INDEX,
+                channel: entry.number().as_raw(),
+                max: RegularChannel::MAX,
             });
         }
 
         let out_of_range = || MemoryError::ChannelOutOfRange {
-            channel: entry.number,
-            max: MAX_CHANNEL_DATA_INDEX,
+            channel: entry.number().as_raw(),
+            max: RegularChannel::MAX,
         };
 
         let flag_offset = FLAGS_OFFSET + number * FLAG_RECORD_SIZE;
@@ -320,34 +512,9 @@ impl<'a> ChannelWriter<'a> {
             return Err(out_of_range());
         };
 
-        let mut next_flag = [0u8; FLAG_RECORD_SIZE];
-        next_flag.copy_from_slice(flag_bytes);
-        let [byte0, byte1, _, _] = &mut next_flag;
-
-        if entry.used {
-            // Preserve the existing band indicator if already set.
-            // Transitioning from empty to used defaults to 0x00 (VHF).
-            if *byte0 == FLAG_EMPTY {
-                *byte0 = 0x00;
-            }
-        } else {
-            *byte0 = FLAG_EMPTY;
-        }
-
-        // Byte 1: lockout in bit 0, preserve other bits.
-        if entry.lockout {
-            *byte1 |= 0x01;
-        } else {
-            *byte1 &= !0x01;
-        }
-
-        let next_data = entry.flash.to_bytes();
-        let mut next_name = [0u8; NAME_ENTRY_SIZE];
-        // Zip is bounded by the shorter of the fixed-size buffer and source; no indexing.
-        next_name
-            .iter_mut()
-            .zip(entry.name.as_bytes().iter())
-            .for_each(|(b, &s)| *b = s);
+        let next_flag = entry.flag().to_wire_bytes();
+        let next_data = entry.data().to_bytes();
+        let next_name = entry.name().to_wire_bytes();
 
         // All fallible validation and destination acquisition completed above;
         // these three fixed-size copies are the transaction's commit point.
@@ -358,36 +525,30 @@ impl<'a> ChannelWriter<'a> {
         Ok(())
     }
 
-    /// Write a group name (up to 16 bytes, null-padded).
+    /// Write a validated group name.
     ///
     /// Group indices are 0-29.
     ///
     /// # Errors
     ///
-    /// Returns [`MemoryError::ChannelOutOfRange`] if the group index
-    /// is out of range.
-    pub fn set_group_name(&mut self, group: u8, name: &str) -> Result<(), MemoryError> {
-        if group >= 30 {
-            return Err(MemoryError::ChannelOutOfRange {
-                channel: u16::from(group),
-                max: 29,
-            });
-        }
-        let name_index = 1152 + group as usize;
+    /// Returns [`MemoryError::ChannelOutOfRange`] if the backing image does
+    /// not contain the group's fixed-width name field.
+    pub fn set_group_name(
+        &mut self,
+        group: MemoryGroup,
+        name: &ChannelDisplayName,
+    ) -> Result<(), MemoryError> {
+        let name_index = 1152 + usize::from(group);
         let offset = NAMES_OFFSET + name_index * NAME_ENTRY_SIZE;
         let dst = self
             .image
             .get_mut(offset..offset + NAME_ENTRY_SIZE)
             .ok_or_else(|| MemoryError::ChannelOutOfRange {
-                channel: u16::from(group),
-                max: 29,
+                channel: u16::from(group.as_raw()),
+                max: u16::from(MemoryGroup::MAX),
             })?;
 
-        let mut buf = [0u8; NAME_ENTRY_SIZE];
-        buf.iter_mut()
-            .zip(name.as_bytes().iter())
-            .for_each(|(b, &s)| *b = s);
-        dst.copy_from_slice(&buf);
+        dst.copy_from_slice(&name.to_wire_bytes());
         Ok(())
     }
 }
@@ -400,10 +561,18 @@ impl<'a> ChannelWriter<'a> {
 mod tests {
     use super::*;
     use crate::protocol::programming::TOTAL_SIZE;
-    use crate::types::Frequency;
+    use crate::types::{Frequency, MemoryChannelBand};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;
+
+    fn synthetic_stored_channel(receive_frequency: Frequency) -> StoredChannel {
+        let mut wire = [0_u8; StoredChannel::BYTE_SIZE];
+        wire[..4].copy_from_slice(&receive_frequency.to_le_bytes());
+        StoredChannel::from_bytes(&wire).unwrap_or_else(|error| {
+            unreachable!("fixed all-zero synthetic channel record must decode: {error}")
+        })
+    }
 
     /// Set a single byte at `offset` in a mutable slice, returning an error if out of range.
     fn set_byte(image: &mut [u8], offset: usize, value: u8) -> Result<(), BoxErr> {
@@ -449,7 +618,7 @@ mod tests {
         fill_range(
             &mut image,
             NAMES_OFFSET,
-            TOTAL_ENTRIES * NAME_ENTRY_SIZE,
+            programming::TOTAL_CHANNEL_ENTRIES * NAME_ENTRY_SIZE,
             0x00,
         )?;
 
@@ -478,7 +647,8 @@ mod tests {
         set_byte(&mut image, 0x400D, 0x00)?;
         // Data speed / lockout
         set_byte(&mut image, 0x400E, 0x00)?;
-        // URCALL: 24 bytes of zeros (empty callsign)
+        // D-STAR callsigns: 24 bytes of zeros (three empty NUL-padded fields).
+        fill_range(&mut image, 0x400F, 24, 0x00)?;
         // data_mode
         set_byte(&mut image, 0x4027, 0x00)?;
 
@@ -505,6 +675,7 @@ mod tests {
         set_byte(&mut image, 0x40D4, 0x00)?;
         set_byte(&mut image, 0x40D5, 0x00)?;
         set_byte(&mut image, 0x40D6, 0x00)?;
+        fill_range(&mut image, 0x40D7, 24, 0x00)?;
         set_byte(&mut image, 0x40EF, 0x00)?;
 
         // Channel 5 name.
@@ -537,9 +708,9 @@ mod tests {
         let image = make_test_image()?;
         let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
-        assert!(ch.is_used(0));
-        assert!(!ch.is_used(1));
-        assert!(ch.is_used(5));
+        assert!(ch.is_used(RegularChannel::new(0)?)?);
+        assert!(!ch.is_used(RegularChannel::new(1)?)?);
+        assert!(ch.is_used(RegularChannel::new(5)?)?);
         Ok(())
     }
 
@@ -548,7 +719,7 @@ mod tests {
         let image = make_test_image()?;
         let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
-        assert_eq!(ch.count(), 2); // channels 0 and 5
+        assert_eq!(ch.count()?, 2); // channels 0 and 5
         Ok(())
     }
 
@@ -557,9 +728,9 @@ mod tests {
         let image = make_test_image()?;
         let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
-        assert_eq!(ch.name(0), "2M CALL");
-        assert_eq!(ch.name(5), "UHF CHAN");
-        assert_eq!(ch.name(1), ""); // empty channel
+        assert_eq!(ch.name(RegularChannel::new(0)?)?.as_str(), "2M CALL");
+        assert_eq!(ch.name(RegularChannel::new(5)?)?.as_str(), "UHF CHAN");
+        assert!(ch.name(RegularChannel::new(1)?)?.is_empty());
         Ok(())
     }
 
@@ -569,26 +740,31 @@ mod tests {
         let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
 
-        let entry0 = ch.get(0).ok_or("ch.get(0) returned None")?;
-        assert!(entry0.used);
-        assert!(!entry0.lockout);
-        assert_eq!(entry0.name, "2M CALL");
-        assert_eq!(entry0.flash.rx_frequency.as_hz(), 146_520_000);
+        let entry0 = ch.get(RegularChannel::new(0)?)?;
+        assert!(entry0.is_programmed());
+        assert_eq!(entry0.flag().scan_lockout(), Some(false));
+        assert_eq!(entry0.name().as_str(), "2M CALL");
+        assert_eq!(
+            entry0
+                .programmed()
+                .ok_or("channel 0 should be programmed")?
+                .receive_frequency
+                .as_hz(),
+            146_520_000,
+        );
 
-        let entry5 = ch.get(5).ok_or("ch.get(5) returned None")?;
-        assert!(entry5.used);
-        assert!(entry5.lockout);
-        assert_eq!(entry5.name, "UHF CHAN");
-        assert_eq!(entry5.flash.rx_frequency.as_hz(), 446_000_000);
-        Ok(())
-    }
-
-    #[test]
-    fn channel_get_out_of_range() -> TestResult {
-        let image = make_test_image()?;
-        let mi = super::super::MemoryImage::from_raw(image)?;
-        let ch = mi.channels();
-        assert!(ch.get(1200).is_none());
+        let entry5 = ch.get(RegularChannel::new(5)?)?;
+        assert!(entry5.is_programmed());
+        assert_eq!(entry5.flag().scan_lockout(), Some(true));
+        assert_eq!(entry5.name().as_str(), "UHF CHAN");
+        assert_eq!(
+            entry5
+                .programmed()
+                .ok_or("channel 5 should be programmed")?
+                .receive_frequency
+                .as_hz(),
+            446_000_000,
+        );
         Ok(())
     }
 
@@ -597,10 +773,16 @@ mod tests {
         let image = make_test_image()?;
         let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
-        let all = ch.all();
+        let all = ch.all()?;
         assert_eq!(all.len(), 2);
-        assert_eq!(all.first().ok_or("all[0] missing")?.number, 0);
-        assert_eq!(all.get(1).ok_or("all[1] missing")?.number, 5);
+        assert_eq!(
+            all.first().ok_or("all[0] missing")?.number(),
+            RegularChannel::new(0)?
+        );
+        assert_eq!(
+            all.get(1).ok_or("all[1] missing")?.number(),
+            RegularChannel::new(5)?
+        );
         Ok(())
     }
 
@@ -610,15 +792,17 @@ mod tests {
         let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
 
-        let ch0_flag = ch.flag(0).ok_or("channel 0 flag missing")?;
-        assert_eq!(ch0_flag.used, 0x00); // VHF
-        assert!(!ch0_flag.lockout);
-        assert_eq!(ch0_flag.group, 0);
+        let ch0_flag = ch.flag(RegularChannel::new(0)?)?;
+        assert_eq!(ch0_flag.band(), Some(MemoryChannelBand::Vhf));
+        assert_eq!(ch0_flag.scan_lockout(), Some(false));
+        assert_eq!(ch0_flag.group(), Some(MemoryGroup::new(0)?));
+        assert_eq!(ch0_flag.to_wire_bytes(), [0x00, 0x00, 0x00, 0xFF]);
 
-        let ch5_flag = ch.flag(5).ok_or("channel 5 flag missing")?;
-        assert_eq!(ch5_flag.used, 0x02); // UHF
-        assert!(ch5_flag.lockout);
-        assert_eq!(ch5_flag.group, 3);
+        let ch5_flag = ch.flag(RegularChannel::new(5)?)?;
+        assert_eq!(ch5_flag.band(), Some(MemoryChannelBand::Uhf));
+        assert_eq!(ch5_flag.scan_lockout(), Some(true));
+        assert_eq!(ch5_flag.group(), Some(MemoryGroup::new(3)?));
+        assert_eq!(ch5_flag.to_wire_bytes(), [0x02, 0x01, 0x03, 0xFF]);
         Ok(())
     }
 
@@ -630,8 +814,8 @@ mod tests {
 
         let mi = super::super::MemoryImage::from_raw(image)?;
         let ch = mi.channels();
-        assert_eq!(ch.group_name(0), "Ham Radio");
-        assert_eq!(ch.group_name(1), ""); // no name set
+        assert_eq!(ch.group_name(MemoryGroup::new(0)?)?.as_str(), "Ham Radio");
+        assert!(ch.group_name(MemoryGroup::new(1)?)?.is_empty());
         Ok(())
     }
 
@@ -640,16 +824,14 @@ mod tests {
         let image = make_test_image()?;
         let mut mi = super::super::MemoryImage::from_raw(image)?;
 
-        let entry = ChannelEntry {
-            number: 10,
-            name: "TEST CH".to_owned(),
-            flash: FlashChannel {
-                rx_frequency: Frequency::new(145_000_000),
-                ..FlashChannel::default()
-            },
-            used: true,
-            lockout: false,
-        };
+        let entry = ChannelEntry::new_programmed(
+            RegularChannel::new(10)?,
+            ChannelDisplayName::new("TEST CH")?,
+            synthetic_stored_channel(Frequency::new(145_000_000)),
+            MemoryChannelBand::Vhf,
+            MemoryGroup::new(0)?,
+            false,
+        )?;
 
         {
             let mut writer = ChannelWriter::new(mi.as_raw_mut());
@@ -657,11 +839,19 @@ mod tests {
         }
 
         let ch = mi.channels();
-        assert!(ch.is_used(10));
-        let read_back = ch.get(10).ok_or("ch.get(10) returned None after write")?;
-        assert!(read_back.used);
-        assert_eq!(read_back.name, "TEST CH");
-        assert_eq!(read_back.flash.rx_frequency.as_hz(), 145_000_000);
+        let channel = RegularChannel::new(10)?;
+        assert!(ch.is_used(channel)?);
+        let read_back = ch.get(channel)?;
+        assert!(read_back.is_programmed());
+        assert_eq!(read_back.name().as_str(), "TEST CH");
+        assert_eq!(
+            read_back
+                .programmed()
+                .ok_or("written channel should be programmed")?
+                .receive_frequency
+                .as_hz(),
+            145_000_000,
+        );
         Ok(())
     }
 
@@ -672,29 +862,27 @@ mod tests {
 
         {
             let mut writer = ChannelWriter::new(mi.as_raw_mut());
-            writer.set_group_name(0, "My Group")?;
+            writer.set_group_name(MemoryGroup::new(0)?, &ChannelDisplayName::new("My Group")?)?;
         }
 
         let ch = mi.channels();
-        assert_eq!(ch.group_name(0), "My Group");
+        assert_eq!(ch.group_name(MemoryGroup::new(0)?)?.as_str(), "My Group");
         Ok(())
     }
 
     #[test]
-    fn channel_writer_accepts_last_channel_with_a_data_record() -> TestResult {
+    fn channel_writer_accepts_last_regular_channel() -> TestResult {
         let image = make_test_image()?;
         let mut mi = super::super::MemoryImage::from_raw(image)?;
 
-        let entry = ChannelEntry {
-            number: MAX_CHANNEL_DATA_INDEX,
-            name: "LAST DATA SLOT".to_owned(),
-            flash: FlashChannel {
-                rx_frequency: Frequency::new(433_920_000),
-                ..FlashChannel::default()
-            },
-            used: true,
-            lockout: true,
-        };
+        let entry = ChannelEntry::new_programmed(
+            RegularChannel::new(RegularChannel::MAX)?,
+            ChannelDisplayName::new("LAST DATA SLOT")?,
+            synthetic_stored_channel(Frequency::new(433_920_000)),
+            MemoryChannelBand::Uhf,
+            MemoryGroup::new(0)?,
+            true,
+        )?;
 
         {
             let mut writer = ChannelWriter::new(mi.as_raw_mut());
@@ -703,47 +891,18 @@ mod tests {
 
         let read_back = mi
             .channels()
-            .get(MAX_CHANNEL_DATA_INDEX)
-            .ok_or("last backed channel missing after write")?;
-        assert!(read_back.used);
-        assert!(read_back.lockout);
-        assert_eq!(read_back.name, "LAST DATA SLOT");
-        assert_eq!(read_back.flash.rx_frequency.as_hz(), 433_920_000);
-        Ok(())
-    }
-
-    #[test]
-    fn channel_writer_rejects_unbacked_raw_slots_without_mutation() -> TestResult {
-        for number in [1152, 1199, 1200] {
-            let mut image = make_test_image()?;
-            let before = image.clone();
-            let entry = ChannelEntry {
-                number,
-                name: "MUST NOT WRITE".to_owned(),
-                flash: FlashChannel {
-                    rx_frequency: Frequency::new(145_000_000),
-                    ..FlashChannel::default()
-                },
-                used: true,
-                lockout: true,
-            };
-
-            let err = {
-                let mut writer = ChannelWriter::new(&mut image);
-                writer
-                    .set(&entry)
-                    .err()
-                    .ok_or("expected unbacked channel write to fail")?
-            };
-            assert_eq!(
-                err,
-                MemoryError::ChannelOutOfRange {
-                    channel: number,
-                    max: MAX_CHANNEL_DATA_INDEX,
-                }
-            );
-            assert_eq!(image, before, "channel {number} error mutated the image");
-        }
+            .get(RegularChannel::new(RegularChannel::MAX)?)?;
+        assert!(read_back.is_programmed());
+        assert_eq!(read_back.flag().scan_lockout(), Some(true));
+        assert_eq!(read_back.name().as_str(), "LAST DATA SLOT");
+        assert_eq!(
+            read_back
+                .programmed()
+                .ok_or("last regular channel should be programmed")?
+                .receive_frequency
+                .as_hz(),
+            433_920_000,
+        );
         Ok(())
     }
 
@@ -754,16 +913,14 @@ mod tests {
         // regions.
         let mut image = vec![0x7C; NAMES_OFFSET];
         let before = image.clone();
-        let entry = ChannelEntry {
-            number: 10,
-            name: "NO DESTINATION".to_owned(),
-            flash: FlashChannel {
-                rx_frequency: Frequency::new(145_000_000),
-                ..FlashChannel::default()
-            },
-            used: true,
-            lockout: true,
-        };
+        let entry = ChannelEntry::new_programmed(
+            RegularChannel::new(10)?,
+            ChannelDisplayName::new("NO DESTINATION")?,
+            synthetic_stored_channel(Frequency::new(145_000_000)),
+            MemoryChannelBand::Vhf,
+            MemoryGroup::new(0)?,
+            true,
+        )?;
 
         let err = {
             let mut writer = ChannelWriter::new(&mut image);
@@ -776,7 +933,7 @@ mod tests {
             err,
             MemoryError::ChannelOutOfRange {
                 channel: 10,
-                max: MAX_CHANNEL_DATA_INDEX,
+                max: RegularChannel::MAX,
             }
         );
         assert_eq!(image, before, "failed channel write mutated short image");

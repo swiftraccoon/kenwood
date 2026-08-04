@@ -17,9 +17,12 @@
 //! genuine GPS-mode replies to the GPS parser.
 
 use crate::error::ProtocolError;
+use std::fmt;
+
 use crate::types::{MemoryReadOffset, MemoryReadTarget, ReadLen};
 
 use super::Response;
+use super::fields::split_exact;
 
 /// The CAT mnemonic carrying the memory-read request.
 ///
@@ -46,7 +49,7 @@ pub const MEM_READ_MNEMONIC: &str = "GM";
 pub fn serialize_read(offset: MemoryReadOffset, len: ReadLen) -> String {
     format!(
         "{MEM_READ_MNEMONIC} {:06X},{:02X}",
-        offset.as_u32(),
+        offset.as_raw(),
         len.as_wire()
     )
 }
@@ -106,7 +109,7 @@ pub fn plan_read_for_target(
     }
 
     // Widen to u64 so the sum cannot wrap regardless of inputs.
-    let last = u64::from(start.as_u32()) + u64::from(total) - 1;
+    let last = u64::from(start.as_raw()) + u64::from(total) - 1;
     if last >= u64::from(target.bound()) {
         let detail = match target {
             MemoryReadTarget::DdrV103 => "range must end below DDR bound 0x1000000",
@@ -120,7 +123,7 @@ pub fn plan_read_for_target(
     }
 
     let mut chunks = Vec::new();
-    let mut cursor = start.as_u32();
+    let mut cursor = start.as_raw();
     let mut remaining = total;
     while remaining > 0 {
         let take = remaining.min(256);
@@ -171,14 +174,108 @@ pub fn encode_hex_upper(data: &[u8]) -> String {
     out
 }
 
-/// Decodes one uppercase or lowercase hexadecimal digit.
-const fn hex_digit(byte: u8) -> Option<u8> {
+/// Decodes one uppercase hexadecimal digit.
+const fn uppercase_hex_digit(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'A'..=b'F' => Some(byte - b'A' + 10),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
         _ => None,
     }
+}
+
+/// A bounded, nonempty memory-read payload returned by modified firmware.
+///
+/// The CAT command can return one through 256 bytes. Keeping the fixed
+/// fixed-size allocation and validated length together makes that wire
+/// invariant available to every consumer. A malformed reply cannot control
+/// the allocation size.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MemoryReadData {
+    storage: Box<[u8; 256]>,
+    len: ReadLen,
+}
+
+impl MemoryReadData {
+    /// Return the exact decoded bytes.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        // `ReadLen` can represent only 1..=256, and `storage` has exactly 256
+        // elements, so this split point is guaranteed to be in bounds.
+        self.storage.split_at(self.len()).0
+    }
+
+    /// Return the decoded byte count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        usize::from(self.len.as_bytes())
+    }
+
+    /// Memory-read replies are never empty by protocol construction.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Return the same byte count as the constrained request type.
+    #[must_use]
+    pub const fn read_len(&self) -> ReadLen {
+        self.len
+    }
+}
+
+impl fmt::Debug for MemoryReadData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("MemoryReadData")
+            .field(&self.as_slice())
+            .finish()
+    }
+}
+
+fn decode_memory_data(hex: &[u8]) -> Result<MemoryReadData, ProtocolError> {
+    let field_err = |detail: String| ProtocolError::FieldParse {
+        command: MEM_READ_MNEMONIC.to_owned(),
+        field: "data".to_owned(),
+        detail,
+    };
+    if hex.is_empty() {
+        return Err(field_err("expected at least one data byte".to_owned()));
+    }
+    if hex.len() > 512 {
+        return Err(field_err(format!(
+            "hex data is {} bytes; maximum is 512",
+            hex.len()
+        )));
+    }
+    if !hex.len().is_multiple_of(2) {
+        return Err(field_err(format!("odd hex length {}", hex.len())));
+    }
+
+    let decoded_len = hex.len() / 2;
+    let decoded_len = u16::try_from(decoded_len)
+        .map_err(|_| field_err("decoded length does not fit in u16".to_owned()))?;
+    let len = ReadLen::new(decoded_len).map_err(|error| field_err(error.to_string()))?;
+    let mut storage = [0_u8; 256];
+    for (index, pair) in hex.chunks_exact(2).enumerate() {
+        let high = pair
+            .first()
+            .copied()
+            .and_then(uppercase_hex_digit)
+            .ok_or_else(|| field_err("expected uppercase hexadecimal data".to_owned()))?;
+        let low = pair
+            .get(1)
+            .copied()
+            .and_then(uppercase_hex_digit)
+            .ok_or_else(|| field_err("expected uppercase hexadecimal data".to_owned()))?;
+        let Some(byte) = storage.get_mut(index) else {
+            return Err(field_err("decoded data exceeds 256 bytes".to_owned()));
+        };
+        *byte = (high << 4) | low;
+    }
+    Ok(MemoryReadData {
+        storage: Box::new(storage),
+        len,
+    })
 }
 
 /// Decodes one byte-exact memory-read reply during capability attestation.
@@ -190,14 +287,14 @@ pub(crate) fn parse_strict_read_reply(
     frame: &[u8],
     expected_offset: MemoryReadOffset,
     expected_len: ReadLen,
-) -> Result<Vec<u8>, ProtocolError> {
+) -> Result<MemoryReadData, ProtocolError> {
     let field_err = |field: &str, detail: String| ProtocolError::FieldParse {
         command: MEM_READ_MNEMONIC.to_owned(),
         field: field.to_owned(),
         detail,
     };
     let prefix = format!("{MEM_READ_MNEMONIC} {expected_offset},");
-    let data_len = usize::from(expected_len.as_u16()) * 2;
+    let data_len = usize::from(expected_len.as_bytes()) * 2;
     let expected_frame_len = prefix.len() + data_len + 1;
     if frame.len() != expected_frame_len {
         return Err(field_err(
@@ -225,26 +322,18 @@ pub(crate) fn parse_strict_read_reply(
     let hex = frame
         .get(prefix.len()..data_end)
         .ok_or_else(|| field_err("data", "missing data field".to_owned()))?;
-    let mut bytes = Vec::with_capacity(usize::from(expected_len.as_u16()));
-    for pair in hex.chunks_exact(2) {
-        let decode = |byte: u8| match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        };
-        let high = pair
-            .first()
-            .copied()
-            .and_then(decode)
-            .ok_or_else(|| field_err("data", "expected uppercase hexadecimal".to_owned()))?;
-        let low = pair
-            .get(1)
-            .copied()
-            .and_then(decode)
-            .ok_or_else(|| field_err("data", "expected uppercase hexadecimal".to_owned()))?;
-        bytes.push((high << 4) | low);
+    let data = decode_memory_data(hex)?;
+    if data.read_len() != expected_len {
+        return Err(field_err(
+            "data",
+            format!(
+                "expected {} decoded byte(s), got {}",
+                expected_len.as_bytes(),
+                data.len()
+            ),
+        ));
     }
-    Ok(bytes)
+    Ok(data)
 }
 
 /// Parses a memory-read reply.
@@ -269,23 +358,12 @@ pub(crate) fn parse_memread(
     Some(parse_memread_payload(payload))
 }
 
-/// Returns `true` if `payload` has the shape of a memory-read reply.
-///
-/// That is an offset of hexadecimal digits, a comma, and at least one data
-/// character. A stock GPS-mode reply is a single decimal digit with no comma,
-/// so the two are unambiguous.
-///
-/// The offset is allowed to be longer than six digits here so that an
-/// out-of-range offset still reaches [`parse_memread_payload`] and produces a
-/// precise error instead of silently falling through to another parser.
+/// Returns `true` if `payload` is unambiguously attempting the comma-separated
+/// memory-read reply form. Stock GPS-mode replies contain no comma, so every
+/// comma-bearing `GM` payload belongs here and malformed ones must fail here
+/// rather than being reinterpreted as GPS state.
 fn looks_like_memread(payload: &str) -> bool {
-    let Some((offset, rest)) = payload.split_once(',') else {
-        return false;
-    };
-    !offset.is_empty()
-        && offset.len() <= 8
-        && offset.bytes().all(|b| hex_digit(b).is_some())
-        && !rest.trim().is_empty()
+    payload.contains(',')
 }
 
 /// Parses the `OOOOOO,<hex>` portion of a memory-read reply.
@@ -296,43 +374,29 @@ fn parse_memread_payload(payload: &str) -> Result<Response, ProtocolError> {
         detail,
     };
 
-    let (offset_str, hex) = payload
-        .split_once(',')
-        .ok_or_else(|| field_err("offset", "missing ',' separator".to_owned()))?;
-
-    let raw = u32::from_str_radix(offset_str, 16)
-        .map_err(|e| field_err("offset", format!("{offset_str:?}: {e}")))?;
-    let offset = MemoryReadOffset::new(raw).map_err(|e| field_err("offset", format!("{e}")))?;
-
-    // `Codec::next_frame` already strips the `\r` terminator, so trimming is
-    // belt-and-braces. It earns its keep on this radio because GPS NMEA output
-    // shares the serial line and stray whitespace is a realistic artifact; the
-    // alternative is a confusing "odd hex length" error for a sound reply.
-    let hex_bytes = hex.trim().as_bytes();
-    if hex_bytes.is_empty() {
-        return Err(field_err("data", "no data bytes".to_owned()));
-    }
-    if hex_bytes.len() % 2 != 0 {
+    let [offset_str, hex] = split_exact::<2>(payload, MEM_READ_MNEMONIC)?;
+    if offset_str.len() != 6
+        || !offset_str
+            .as_bytes()
+            .iter()
+            .all(|&byte| uppercase_hex_digit(byte).is_some())
+    {
         return Err(field_err(
-            "data",
-            format!("odd hex length {}", hex_bytes.len()),
+            "offset",
+            format!("expected exactly six uppercase hexadecimal digits, got {offset_str:?}"),
         ));
     }
-
-    let mut bytes = Vec::with_capacity(hex_bytes.len() / 2);
-    for pair in hex_bytes.chunks_exact(2) {
-        let hi = pair
-            .first()
-            .copied()
-            .and_then(hex_digit)
-            .ok_or_else(|| field_err("data", "invalid hex digit".to_owned()))?;
-        let lo = pair
-            .get(1)
-            .copied()
-            .and_then(hex_digit)
-            .ok_or_else(|| field_err("data", "invalid hex digit".to_owned()))?;
-        bytes.push((hi << 4) | lo);
-    }
+    let raw = offset_str.bytes().try_fold(0_u32, |value, byte| {
+        let digit = uppercase_hex_digit(byte).ok_or_else(|| {
+            field_err(
+                "offset",
+                format!("expected uppercase hexadecimal, got byte 0x{byte:02X}"),
+            )
+        })?;
+        Ok::<u32, ProtocolError>((value << 4) | u32::from(digit))
+    })?;
+    let offset = MemoryReadOffset::new(raw).map_err(|e| field_err("offset", format!("{e}")))?;
+    let bytes = decode_memory_data(hex.as_bytes())?;
     Ok(Response::MemoryData { offset, bytes })
 }
 
@@ -356,8 +420,8 @@ mod tests {
         let offset = MemoryReadOffset::new(0x10)?;
         let length = ReadLen::new(2)?;
         assert_eq!(
-            parse_strict_read_reply(b"GM 000010,DEAD\r", offset, length)?,
-            [0xDE, 0xAD]
+            parse_strict_read_reply(b"GM 000010,DEAD\r", offset, length)?.as_slice(),
+            &[0xDE, 0xAD]
         );
         for invalid in [
             b"GM 000010,dead\r".as_slice(),
@@ -381,10 +445,10 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         let first = chunks.first().ok_or("missing first chunk")?;
         let second = chunks.get(1).ok_or("missing second chunk")?;
-        assert_eq!(first.offset.as_u32(), 0);
-        assert_eq!(first.len.as_u16(), 256);
-        assert_eq!(second.offset.as_u32(), 256);
-        assert_eq!(second.len.as_u16(), 256);
+        assert_eq!(first.offset.as_raw(), 0);
+        assert_eq!(first.len.as_bytes(), 256);
+        assert_eq!(second.offset.as_raw(), 256);
+        assert_eq!(second.len.as_bytes(), 256);
         Ok(())
     }
 
@@ -392,7 +456,7 @@ mod tests {
     fn plans_remainder_chunk() -> TestResult {
         let chunks = plan_read(MemoryReadOffset::ZERO, 300)?;
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks.get(1).ok_or("missing chunk")?.len.as_u16(), 44);
+        assert_eq!(chunks.get(1).ok_or("missing chunk")?.len.as_bytes(), 44);
         Ok(())
     }
 
@@ -401,8 +465,8 @@ mod tests {
         let chunks = plan_read(MemoryReadOffset::new(0x17_D1BC)?, 64)?;
         assert_eq!(chunks.len(), 1);
         let only = chunks.first().ok_or("missing chunk")?;
-        assert_eq!(only.offset.as_u32(), 0x17_D1BC);
-        assert_eq!(only.len.as_u16(), 64);
+        assert_eq!(only.offset.as_raw(), 0x17_D1BC);
+        assert_eq!(only.len.as_bytes(), 64);
         Ok(())
     }
 
@@ -411,7 +475,7 @@ mod tests {
         // 0xFFFF00 + 256 - 1 == 0xFFFFFF, which is inside the bound.
         let chunks = plan_read(MemoryReadOffset::new(0xFF_FF00)?, 256)?;
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks.first().ok_or("missing chunk")?.len.as_u16(), 256);
+        assert_eq!(chunks.first().ok_or("missing chunk")?.len.as_bytes(), 256);
         Ok(())
     }
 

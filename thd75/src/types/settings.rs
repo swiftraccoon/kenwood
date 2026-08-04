@@ -1,11 +1,12 @@
 //! Radio-wide system, audio, and display settings for the TH-D75.
 //!
 //! These types cover the radio's global configuration accessible through
-//! the menu system (Configuration, Audio, Display sections). They model
-//! settings from the capability gap analysis features 123-197 that are
-//! not subsystem-specific (not APRS, D-STAR, or GPS).
+//! the Configuration, Audio, and Display menu groups. Aggregate structs use
+//! the exact scalar domains in the MCP-D75 menu registry; they deliberately
+//! omit action rows, read-only information, blobs, and list editors.
 
 use crate::error::ValidationError;
+use crate::types::gps::{CoordinateFormat, GridSquareFormat};
 
 // ---------------------------------------------------------------------------
 // Display settings
@@ -13,8 +14,7 @@ use crate::error::ValidationError;
 
 /// Display and illumination settings.
 ///
-/// Controls the TH-D75's LCD backlight, color theme, power-on message,
-/// and meter display. Derived from capability gap analysis features 159-169.
+/// Exact editable values in Configuration > Display (Menus No. 900-907).
 ///
 /// # Menu numbers (per Operating Tips §5.2, User Manual Chapter 12)
 ///
@@ -39,44 +39,20 @@ use crate::error::ValidationError;
 pub struct DisplaySettings {
     /// LCD backlight control mode.
     pub backlight_control: BacklightControl,
-    /// Backlight auto-off timer in seconds (0 = always on).
-    pub backlight_timer: u8,
-    /// LCD brightness level (1-6, 1 = dimmest, 6 = brightest).
-    pub lcd_brightness: u8,
+    /// Backlight auto-off timer.
+    pub backlight_timer: BacklightTimer,
+    /// LCD brightness.
+    pub lcd_brightness: LcdBrightness,
     /// Background color theme.
     pub background_color: BackgroundColor,
     /// Power-on message displayed at startup (up to 16 characters).
     pub power_on_message: PowerOnMessage,
-    /// Single-band display mode (show only one band at a time).
-    pub single_band_display: bool,
+    /// Information shown in single-band mode.
+    pub single_band_display: SingleBandDisplay,
     /// S-meter and power meter display type.
     pub meter_type: MeterType,
-    /// Display method for the dual-band screen.
-    pub display_method: DisplayMethod,
-    /// LED indicator control.
-    pub led_control: LedControl,
-    /// Info backlight on receive.
-    pub info_backlight: bool,
-    /// Display hold time for transient information (seconds).
-    pub display_hold_time: DisplayHoldTime,
-}
-
-impl Default for DisplaySettings {
-    fn default() -> Self {
-        Self {
-            backlight_control: BacklightControl::Auto,
-            backlight_timer: 5,
-            lcd_brightness: 4,
-            background_color: BackgroundColor::Blue,
-            power_on_message: PowerOnMessage::default(),
-            single_band_display: false,
-            meter_type: MeterType::Bar,
-            display_method: DisplayMethod::Dual,
-            led_control: LedControl::new(true, false),
-            info_backlight: true,
-            display_hold_time: DisplayHoldTime::Sec3,
-        }
-    }
+    /// Backlight behavior for APRS/D-STAR notifications and scan pauses.
+    pub information_backlight: InformationBacklight,
 }
 
 /// LCD backlight control mode (Menu No. 900).
@@ -105,69 +81,208 @@ impl BacklightControl {
     pub const COUNT: u8 = 4;
 }
 
-/// Background color theme for the LCD display (Menu No. 906).
-///
-/// Per User Manual Chapter 12: the user manual defines only Black
-/// and White options. The Operating Tips previously referenced Amber,
-/// Green, Blue, and White. The actual available values depend on
-/// firmware version.
+/// LCD brightness (Menu No. 902, `radio.LcdBrightness`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BackgroundColor {
-    /// Amber / warm color theme.
-    Amber,
-    /// Green color theme.
-    Green,
-    /// Blue color theme (default).
-    Blue,
-    /// White color theme.
-    White,
+#[repr(u8)]
+pub enum LcdBrightness {
+    /// Low brightness.
+    Low = 0,
+    /// Medium brightness.
+    Medium = 1,
+    /// High brightness.
+    High = 2,
 }
 
-/// Power-on message text (up to 16 characters).
+/// Text displayed for approximately two seconds when the TH-D75 powers on.
+///
+/// Menu No. 903 and the corresponding MCP field share one exact domain: zero
+/// to sixteen printable ASCII bytes (`0x20`-`0x7E`). Spaces are data,
+/// including leading and trailing spaces, and are never trimmed. The memory
+/// image stores shorter messages with trailing NUL padding, which is not part
+/// of the semantic text.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct PowerOnMessage(String);
 
 impl PowerOnMessage {
-    /// Maximum length of the power-on message.
+    /// Maximum encoded message length.
     pub const MAX_LEN: usize = 16;
 
-    /// Creates a new power-on message.
+    /// Width of the NUL-padded MCP memory-image field.
+    pub const WIRE_LEN: usize = 16;
+
+    /// Construct a power-on message from user-visible text.
     ///
     /// # Errors
     ///
-    /// Returns `None` if the text exceeds 16 characters.
-    #[must_use]
-    pub fn new(text: &str) -> Option<Self> {
-        if text.len() <= Self::MAX_LEN {
-            Some(Self(text.to_owned()))
-        } else {
-            None
+    /// Returns [`ValidationError::PowerOnMessageTooLong`] when `text` exceeds
+    /// sixteen encoded bytes. Returns
+    /// [`ValidationError::InvalidPowerOnMessageByte`] at the first byte
+    /// outside printable ASCII (`0x20`-`0x7E`).
+    pub fn new(text: &str) -> Result<Self, ValidationError> {
+        if text.len() > Self::MAX_LEN {
+            return Err(ValidationError::PowerOnMessageTooLong { len: text.len() });
         }
+
+        if let Some((offset, value)) = text
+            .bytes()
+            .enumerate()
+            .find(|(_, value)| !is_printable_ascii(*value))
+        {
+            return Err(ValidationError::InvalidPowerOnMessageByte { offset, value });
+        }
+
+        Ok(Self(text.to_owned()))
     }
 
-    /// Returns the power-on message as a string slice.
+    /// Decode the exact 16-byte MCP memory-image field.
+    ///
+    /// A full-width message needs no terminator. A shorter message must be
+    /// followed exclusively by NUL padding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::PowerOnMessageDataAfterNul`] for nonzero
+    /// data after the first NUL. Returns
+    /// [`ValidationError::InvalidPowerOnMessageByte`] for a semantic byte
+    /// outside printable ASCII.
+    pub fn try_from_wire(bytes: [u8; Self::WIRE_LEN]) -> Result<Self, ValidationError> {
+        let text_len = bytes
+            .iter()
+            .position(|&value| value == 0)
+            .unwrap_or(Self::WIRE_LEN);
+
+        if let Some((offset, &value)) = bytes
+            .iter()
+            .enumerate()
+            .skip(text_len.saturating_add(1))
+            .find(|(_, value)| **value != 0)
+        {
+            return Err(ValidationError::PowerOnMessageDataAfterNul {
+                terminator_offset: text_len,
+                offset,
+                value,
+            });
+        }
+
+        if let Some((offset, &value)) = bytes
+            .iter()
+            .take(text_len)
+            .enumerate()
+            .find(|(_, value)| !is_printable_ascii(**value))
+        {
+            return Err(ValidationError::InvalidPowerOnMessageByte { offset, value });
+        }
+
+        let text = bytes
+            .iter()
+            .take(text_len)
+            .map(|&value| char::from(value))
+            .collect();
+        Ok(Self(text))
+    }
+
+    /// Encode the exact 16-byte, NUL-padded MCP memory-image field.
+    #[must_use]
+    pub fn to_wire_bytes(&self) -> [u8; Self::WIRE_LEN] {
+        let mut bytes = [0; Self::WIRE_LEN];
+        bytes
+            .iter_mut()
+            .zip(self.0.bytes())
+            .for_each(|(destination, source)| *destination = source);
+        bytes
+    }
+
+    /// Return the message text without trimming spaces.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Return `true` when the message contains no bytes.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Return the encoded message length in bytes.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
-/// S-meter and power meter display type.
+impl TryFrom<&str> for PowerOnMessage {
+    type Error = ValidationError;
+
+    fn try_from(text: &str) -> Result<Self, Self::Error> {
+        Self::new(text)
+    }
+}
+
+impl std::fmt::Display for PowerOnMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for PowerOnMessage {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+const fn is_printable_ascii(value: u8) -> bool {
+    value == b' ' || value.is_ascii_graphic()
+}
+
+/// Information shown in single-band mode (Menu No. 904).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum SingleBandDisplay {
+    /// Do not show supplemental information.
+    Off = 0,
+    /// Show GPS altitude.
+    GpsAltitude = 1,
+    /// Show GPS ground speed.
+    GpsGroundSpeed = 2,
+    /// Show the date.
+    Date = 3,
+    /// Show the demodulation mode.
+    DemodulationMode = 4,
+}
+
+/// S-meter and power-meter design (Menu No. 905).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum MeterType {
-    /// Bar graph meter display.
-    Bar,
-    /// Numeric (digital) meter display.
-    Numeric,
+    /// Meter design Type 1.
+    Type1 = 0,
+    /// Meter design Type 2.
+    Type2 = 1,
+    /// Meter design Type 3.
+    Type3 = 2,
 }
 
-/// Display method for the main screen.
+/// LCD background color (Menu No. 906).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DisplayMethod {
-    /// Show both bands simultaneously.
-    Dual,
-    /// Show single band only.
-    Single,
+#[repr(u8)]
+pub enum BackgroundColor {
+    /// Black background.
+    Black = 0,
+    /// White background.
+    White = 1,
+}
+
+/// Notification backlight behavior (Menu No. 907).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum InformationBacklight {
+    /// Do not illuminate for notifications.
+    Off = 0,
+    /// Illuminate only the LCD.
+    Lcd = 1,
+    /// Illuminate the LCD and keys.
+    LcdAndKeys = 2,
 }
 
 /// Independent LED indicator controls (Menu No. 181).
@@ -181,12 +296,6 @@ pub struct LedControl {
     pub receive: bool,
     /// Light the LED while the FM broadcast radio is playing.
     pub fm_radio: bool,
-}
-
-impl Default for LedControl {
-    fn default() -> Self {
-        Self::new(true, false)
-    }
 }
 
 impl LedControl {
@@ -209,28 +318,11 @@ impl LedControl {
     }
 }
 
-/// Display hold time for transient information.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DisplayHoldTime {
-    /// 3 second hold time.
-    Sec3,
-    /// 5 second hold time.
-    Sec5,
-    /// 10 second hold time.
-    Sec10,
-    /// Continuous (hold until dismissed).
-    Continuous,
-}
-
 // ---------------------------------------------------------------------------
 // Audio settings
 // ---------------------------------------------------------------------------
 
-/// Audio and sound settings.
-///
-/// Controls the TH-D75's beep, equalizer, microphone sensitivity,
-/// and voice guidance features. Derived from capability gap analysis
-/// features 123-148.
+/// Exact editable values in Configuration > Audio (Menus No. 910-91A).
 ///
 /// # Audio equalizer (per User Manual Chapter 12)
 ///
@@ -249,47 +341,91 @@ pub enum DisplayHoldTime {
 /// operation band when both bands are simultaneously busy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioSettings {
-    /// Key beep on/off.
-    pub beep: bool,
-    /// Beep volume level (1-7).
-    pub beep_volume: u8,
+    /// Balance between Band A and Band B.
+    pub balance: AudioBalance,
     /// TX equalizer enables and four independently adjustable bands.
     pub tx_equalizer: TxEqualizer,
     /// RX equalizer enable and five independently adjustable bands.
     pub rx_equalizer: RxEqualizer,
-    /// Microphone sensitivity level.
-    pub mic_sensitivity: MicSensitivity,
-    /// Voice guidance on/off.
-    pub voice_guidance: bool,
-    /// Voice guidance volume (1-7).
-    pub voice_guidance_volume: u8,
+    /// Key beep on/off.
+    pub beep: bool,
+    /// Key-beep volume or main-volume link.
+    pub beep_volume: LinkedVolumeLevel,
+    /// Voice announcement behavior.
+    pub voice_announce: VoiceAnnounceMode,
+    /// Voice-guidance volume or main-volume link.
+    pub voice_announce_volume: LinkedVolumeLevel,
     /// Voice guidance speed.
     pub voice_guidance_speed: VoiceGuideSpeed,
-    /// Audio balance between Band A and Band B (0 = A only, 50 = equal,
-    /// 100 = B only).
-    pub balance: u8,
-    /// TX monitor on/off (hear own transmit audio).
-    pub tx_monitor: bool,
+    /// Callsign pronunciation method.
+    pub callsign_readout: CallsignReadout,
     /// USB audio output level.
-    pub usb_audio_output_level: u8,
+    pub usb_audio_output_level: UsbAudioOutputLevel,
 }
 
-impl Default for AudioSettings {
-    fn default() -> Self {
-        Self {
-            beep: true,
-            beep_volume: 4,
-            tx_equalizer: TxEqualizer::default(),
-            rx_equalizer: RxEqualizer::default(),
-            mic_sensitivity: MicSensitivity::Medium,
-            voice_guidance: false,
-            voice_guidance_volume: 4,
-            voice_guidance_speed: VoiceGuideSpeed::Normal,
-            balance: 50,
-            tx_monitor: false,
-            usb_audio_output_level: 4,
-        }
-    }
+/// Audio balance between Band A and Band B (Menu No. 910).
+///
+/// These are ten discrete menu choices, not a percentage slider. In choices
+/// 0-4 Band A remains at 100 while Band B rises; in choices 5-8 Band B
+/// remains at 100 while Band A falls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum AudioBalance {
+    /// A:100 / B:0.
+    A100B0 = 0,
+    /// A:100 / B:25.
+    A100B25 = 1,
+    /// A:100 / B:50.
+    A100B50 = 2,
+    /// A:100 / B:75.
+    A100B75 = 3,
+    /// A:100 / B:100.
+    A100B100 = 4,
+    /// A:75 / B:100.
+    A75B100 = 5,
+    /// A:50 / B:100.
+    A50B100 = 6,
+    /// A:25 / B:100.
+    A25B100 = 7,
+    /// A:0 / B:100.
+    A0B100 = 8,
+    /// Output only the current operation band.
+    OperationBandOnly = 9,
+}
+
+/// Callsign pronunciation method (Menu No. 919).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum CallsignReadout {
+    /// Read letters normally.
+    Standard = 0,
+    /// Read the complete callsign phonetically.
+    FullPhonetics = 1,
+    /// Read only the suffix phonetically.
+    SuffixPhonetics = 2,
+}
+
+/// USB audio capture level (Menu No. 91A).
+///
+/// The stored value is zero-based even though the radio labels the choices
+/// Level 1 through Level 7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum UsbAudioOutputLevel {
+    /// Level 1.
+    Level1 = 0,
+    /// Level 2.
+    Level2 = 1,
+    /// Level 3.
+    Level3 = 2,
+    /// Level 4.
+    Level4 = 3,
+    /// Level 5.
+    Level5 = 4,
+    /// Level 6.
+    Level6 = 5,
+    /// Level 7.
+    Level7 = 6,
 }
 
 /// One TH-D75 TX equalizer band level, from -9 through +3 dB.
@@ -307,13 +443,21 @@ impl TxEqLevel {
     /// Flat (0 dB) TX equalizer level.
     pub const FLAT: Self = Self(0);
 
-    /// Creates a TX equalizer level if `db` is in `-9..=3`.
-    #[must_use]
-    pub const fn new(db: i8) -> Option<Self> {
+    /// Creates a TX equalizer level.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::IntegerOutOfRange`] unless `db` is in
+    /// `-9..=3`.
+    pub const fn new(db: i8) -> Result<Self, ValidationError> {
         if db >= Self::MIN_DB && db <= Self::MAX_DB {
-            Some(Self(db))
+            Ok(Self(db))
         } else {
-            None
+            Err(ValidationError::IntegerOutOfRange {
+                name: "TX EQ level",
+                value: db as i64,
+                detail: "must be -9 through +3 dB",
+            })
         }
     }
 
@@ -379,13 +523,21 @@ impl RxEqLevel {
     /// Flat (0 dB) RX equalizer level.
     pub const FLAT: Self = Self(0);
 
-    /// Creates an RX equalizer level if `db` is in `-9..=9`.
-    #[must_use]
-    pub const fn new(db: i8) -> Option<Self> {
+    /// Creates an RX equalizer level.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::IntegerOutOfRange`] unless `db` is in
+    /// `-9..=9`.
+    pub const fn new(db: i8) -> Result<Self, ValidationError> {
         if db >= Self::MIN_DB && db <= Self::MAX_DB {
-            Some(Self(db))
+            Ok(Self(db))
         } else {
-            None
+            Err(ValidationError::IntegerOutOfRange {
+                name: "RX EQ level",
+                value: db as i64,
+                detail: "must be -9 through +9 dB",
+            })
         }
     }
 
@@ -506,24 +658,28 @@ impl Default for RxEqualizer {
 /// Per User Manual Chapter 12: applies to both the internal microphone
 /// and an external microphone. Default: Medium.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum MicSensitivity {
-    /// Low sensitivity.
-    Low,
-    /// Medium sensitivity (default).
-    Medium,
     /// High sensitivity.
-    High,
+    High = 0,
+    /// Medium sensitivity (default).
+    Medium = 1,
+    /// Low sensitivity.
+    Low = 2,
 }
 
 /// Voice guidance speed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum VoiceGuideSpeed {
-    /// Slow voice guidance.
-    Slow,
-    /// Normal speed voice guidance.
-    Normal,
-    /// Fast voice guidance.
-    Fast,
+    /// Voice guidance speed 1.
+    Speed1 = 0,
+    /// Voice guidance speed 2.
+    Speed2 = 1,
+    /// Voice guidance speed 3.
+    Speed3 = 2,
+    /// Voice guidance speed 4.
+    Speed4 = 3,
 }
 
 /// Receiver beat-shift type (`radio.BeatShift`, raw 0-7).
@@ -533,34 +689,601 @@ pub enum VoiceGuideSpeed {
 /// passband. This is a type selector, not an on/off switch: the
 /// MCP-D75 serializer stores one byte with domain 0-7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum BeatShift {
     /// Beat shift type 1.
-    Type1,
+    Type1 = 0,
     /// Beat shift type 2.
-    Type2,
+    Type2 = 1,
     /// Beat shift type 3.
-    Type3,
+    Type3 = 2,
     /// Beat shift type 4.
-    Type4,
+    Type4 = 3,
     /// Beat shift type 5.
-    Type5,
+    Type5 = 4,
     /// Beat shift type 6.
-    Type6,
+    Type6 = 5,
     /// Beat shift type 7.
-    Type7,
+    Type7 = 6,
     /// Beat shift type 8.
-    Type8,
+    Type8 = 7,
+}
+
+/// Transmit time-out timer selection (`radio.TimeOutTimer`).
+///
+/// Each variant is one exact menu selection. The stored byte is an index,
+/// not a duration in a fixed unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum TransmitTimeout {
+    /// 30 seconds.
+    Seconds30 = 0,
+    /// 60 seconds.
+    Seconds60 = 1,
+    /// 90 seconds.
+    Seconds90 = 2,
+    /// 120 seconds.
+    Seconds120 = 3,
+    /// 150 seconds.
+    Seconds150 = 4,
+    /// 180 seconds.
+    Seconds180 = 5,
+    /// 210 seconds.
+    Seconds210 = 6,
+    /// 240 seconds.
+    Seconds240 = 7,
+    /// 270 seconds.
+    Seconds270 = 8,
+    /// 300 seconds.
+    Seconds300 = 9,
+    /// 600 seconds.
+    Seconds600 = 10,
+}
+
+impl TransmitTimeout {
+    /// Returns the selected transmit limit in seconds.
+    #[must_use]
+    pub const fn as_seconds(self) -> u16 {
+        match self {
+            Self::Seconds30 => 30,
+            Self::Seconds60 => 60,
+            Self::Seconds90 => 90,
+            Self::Seconds120 => 120,
+            Self::Seconds150 => 150,
+            Self::Seconds180 => 180,
+            Self::Seconds210 => 210,
+            Self::Seconds240 => 240,
+            Self::Seconds270 => 270,
+            Self::Seconds300 => 300,
+            Self::Seconds600 => 600,
+        }
+    }
+}
+
+/// SSB receive high-cut filter selection (`radio.SsbHighCut`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum SsbHighCut {
+    /// 2.2 kHz.
+    Khz2_2 = 0,
+    /// 2.4 kHz.
+    Khz2_4 = 1,
+    /// 2.6 kHz.
+    Khz2_6 = 2,
+    /// 2.8 kHz.
+    Khz2_8 = 3,
+    /// 3.0 kHz.
+    Khz3_0 = 4,
+}
+
+/// CW receive filter width selection (`radio.CwWidth`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum CwFilterWidth {
+    /// 0.3 kHz.
+    Khz0_3 = 0,
+    /// 0.5 kHz.
+    Khz0_5 = 1,
+    /// 1.0 kHz.
+    Khz1_0 = 2,
+    /// 1.5 kHz.
+    Khz1_5 = 3,
+    /// 2.0 kHz.
+    Khz2_0 = 4,
+}
+
+/// AM receive high-cut filter selection (`radio.AmHighCut`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum AmHighCut {
+    /// 3.0 kHz.
+    Khz3_0 = 0,
+    /// 4.5 kHz.
+    Khz4_5 = 1,
+    /// 6.0 kHz.
+    Khz6_0 = 2,
+    /// 7.5 kHz.
+    Khz7_5 = 3,
+}
+
+/// Scan restart delay from 1 through 10 seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScanRestartDelay(u8);
+
+impl ScanRestartDelay {
+    /// Creates a scan restart delay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] unless `seconds` is in
+    /// `1..=10`.
+    pub const fn new(seconds: u8) -> Result<Self, ValidationError> {
+        if seconds >= 1 && seconds <= 10 {
+            Ok(Self(seconds))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "scan restart delay",
+                value: seconds,
+                detail: "must be 1-10 seconds",
+            })
+        }
+    }
+
+    /// Returns the delay in seconds.
+    #[must_use]
+    pub const fn as_seconds(self) -> u8 {
+        self.0
+    }
+}
+
+/// Function assigned to the repeater CALL key (`radio.CallKey`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RepeaterCallKey {
+    /// Recall the CALL channel.
+    CallChannel = 0,
+    /// Transmit a 1,750 Hz tone.
+    Tone1750Hz = 1,
+}
+
+/// DTMF tone duration selection (`radio.DtmfSpeed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum DtmfToneDuration {
+    /// 50 ms per digit.
+    Ms50 = 0,
+    /// 100 ms per digit.
+    Ms100 = 1,
+    /// 150 ms per digit.
+    Ms150 = 2,
+}
+
+impl DtmfToneDuration {
+    /// Returns the duration of each DTMF tone in milliseconds.
+    #[must_use]
+    pub const fn as_milliseconds(self) -> u16 {
+        match self {
+            Self::Ms50 => 50,
+            Self::Ms100 => 100,
+            Self::Ms150 => 150,
+        }
+    }
+}
+
+/// Automatic mute return delay from 1 through 10 seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AutoMuteReturnDelay(u8);
+
+impl AutoMuteReturnDelay {
+    /// Creates a return delay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] unless `seconds` is in
+    /// `1..=10`.
+    pub const fn new(seconds: u8) -> Result<Self, ValidationError> {
+        if seconds >= 1 && seconds <= 10 {
+            Ok(Self(seconds))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "automatic mute return delay",
+                value: seconds,
+                detail: "must be 1-10 seconds",
+            })
+        }
+    }
+
+    /// Returns the delay in seconds.
+    #[must_use]
+    pub const fn as_seconds(self) -> u8 {
+        self.0
+    }
+}
+
+/// Backlight timer from 3 through 60 seconds (`radio.BacklightTimer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BacklightTimer(u8);
+
+impl BacklightTimer {
+    /// Creates a backlight timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] unless `seconds` is in
+    /// `3..=60`.
+    pub const fn new(seconds: u8) -> Result<Self, ValidationError> {
+        if seconds >= 3 && seconds <= 60 {
+            Ok(Self(seconds))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "backlight timer",
+                value: seconds,
+                detail: "must be 3-60 seconds",
+            })
+        }
+    }
+
+    /// Returns the timer duration in seconds.
+    #[must_use]
+    pub const fn as_seconds(self) -> u8 {
+        self.0
+    }
+}
+
+/// A volume selection that may follow the main volume or use Level 1-7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LinkedVolumeLevel(u8);
+
+impl LinkedVolumeLevel {
+    /// Follow the radio's main volume control.
+    pub const VOLUME_LINK: Self = Self(0);
+
+    /// Creates a fixed Level 1-7 selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] unless `level` is in
+    /// `1..=7`.
+    pub const fn fixed(level: u8) -> Result<Self, ValidationError> {
+        if level >= 1 && level <= 7 {
+            Ok(Self(level))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "linked volume fixed level",
+                value: level,
+                detail: "must be 1-7",
+            })
+        }
+    }
+
+    /// Returns the fixed level, or `None` when linked to main volume.
+    #[must_use]
+    pub const fn fixed_level(self) -> Option<u8> {
+        if self.0 == 0 { None } else { Some(self.0) }
+    }
+
+    /// Returns the MCP representation, where zero means main-volume link.
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        self.0
+    }
+}
+
+/// Voice announcement mode (`radio.VoiceAnnounce`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum VoiceAnnounceMode {
+    /// Voice announcements disabled.
+    Off = 0,
+    /// Announce only when requested manually.
+    Manual = 1,
+    /// Automatic announcement mode 1.
+    Auto1 = 2,
+    /// Automatic announcement mode 2.
+    Auto2 = 3,
+}
+
+/// Battery saver interval (`radio.BatterySaver`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum BatterySaverInterval {
+    /// Battery saver disabled.
+    Off = 0,
+    /// 0.2 seconds.
+    Seconds0_2 = 1,
+    /// 0.4 seconds.
+    Seconds0_4 = 2,
+    /// 0.6 seconds.
+    Seconds0_6 = 3,
+    /// 0.8 seconds.
+    Seconds0_8 = 4,
+    /// 1.0 seconds.
+    Seconds1 = 5,
+    /// 2.0 seconds.
+    Seconds2 = 6,
+    /// 3.0 seconds.
+    Seconds3 = 7,
+    /// 4.0 seconds.
+    Seconds4 = 8,
+    /// 5.0 seconds.
+    Seconds5 = 9,
+}
+
+/// Host interface selected for GPS or APRS PC output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum PcOutputInterface {
+    /// USB CDC interface.
+    Usb = 0,
+    /// Bluetooth serial interface.
+    Bluetooth = 1,
+}
+
+/// One official front-panel PF key function.
+///
+/// The discriminants match the gapped `radio.Pf1PfKey` and
+/// `radio.Pf2PfKey` menu domain exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum FrontPanelPfFunction {
+    /// Recording.
+    Recording = 0,
+    /// Voice message 1.
+    VoiceMessage1 = 1,
+    /// Voice message 2.
+    VoiceMessage2 = 2,
+    /// Voice message 3.
+    VoiceMessage3 = 3,
+    /// Voice message 4.
+    VoiceMessage4 = 4,
+    /// Voice guidance.
+    VoiceGuidance = 6,
+    /// Battery level announcement.
+    BatteryLevel = 7,
+    /// VOX.
+    Vox = 8,
+    /// Group name.
+    GroupName = 9,
+    /// Audio balance.
+    Balance = 10,
+    /// GPS.
+    Gps = 11,
+    /// Track log.
+    TrackLog = 12,
+    /// Squelch.
+    Squelch = 13,
+    /// Repeater shift.
+    Shift = 14,
+    /// Tuning step.
+    Step = 15,
+    /// Transmit power.
+    Power = 16,
+    /// Key lock.
+    KeyLock = 17,
+    /// Memory lockout.
+    Lockout = 18,
+    /// Memory-to-VFO transfer.
+    MemoryToVfo = 19,
+    /// Tone selection.
+    ToneSelect = 20,
+    /// New memory entry.
+    NewMemory = 21,
+    /// Voice alert.
+    VoiceAlert = 22,
+    /// LCD brightness.
+    LcdBrightness = 24,
+    /// DTMF memory channel 0.
+    DtmfChannel0 = 27,
+    /// `EchoLink` memory channel 0.
+    EcholinkChannel0 = 28,
+    /// 1,750 Hz tone.
+    Tone1750Hz = 29,
+    /// Memory registration.
+    MemoryInput = 30,
+}
+
+/// One official microphone PF key function (Menus No. 942-944).
+///
+/// The discriminants match the gapped MCP-D75 menu domain exactly. Unlike
+/// the front-panel PF keys, microphone PF keys include navigation and APRS
+/// operations and do not offer memory registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum MicrophonePfFunction {
+    /// Recording.
+    Recording = 0,
+    /// Voice message 1.
+    VoiceMessage1 = 1,
+    /// Voice message 2.
+    VoiceMessage2 = 2,
+    /// Voice message 3.
+    VoiceMessage3 = 3,
+    /// Voice message 4.
+    VoiceMessage4 = 4,
+    /// Voice guidance.
+    VoiceGuidance = 6,
+    /// Battery level announcement.
+    BatteryLevel = 7,
+    /// VOX.
+    Vox = 8,
+    /// Group name.
+    GroupName = 9,
+    /// Audio balance.
+    Balance = 10,
+    /// GPS.
+    Gps = 11,
+    /// Track log.
+    TrackLog = 12,
+    /// Squelch.
+    Squelch = 13,
+    /// Repeater shift.
+    Shift = 14,
+    /// Tuning step.
+    Step = 15,
+    /// Transmit power.
+    Power = 16,
+    /// Key lock.
+    KeyLock = 17,
+    /// Memory lockout.
+    Lockout = 18,
+    /// Memory-to-VFO transfer.
+    MemoryToVfo = 19,
+    /// Tone selection.
+    ToneSelect = 20,
+    /// New memory entry.
+    NewMemory = 21,
+    /// Voice alert.
+    VoiceAlert = 22,
+    /// LCD brightness.
+    LcdBrightness = 24,
+    /// DTMF memory channel 0.
+    DtmfChannel0 = 27,
+    /// `EchoLink` memory channel 0.
+    EcholinkChannel0 = 28,
+    /// 1,750 Hz tone.
+    Tone1750Hz = 29,
+    /// Screen capture.
+    ScreenCapture = 31,
+    /// Change demodulation mode.
+    Mode = 32,
+    /// Open the menu.
+    Menu = 33,
+    /// Select Band A/B.
+    BandSelect = 34,
+    /// Enter VFO mode.
+    Vfo = 35,
+    /// Enter memory-recall mode.
+    MemoryRecall = 36,
+    /// Recall the CALL channel.
+    Call = 37,
+    /// Open APRS messages.
+    Message = 38,
+    /// Open the APRS station list.
+    List = 39,
+    /// Transmit an APRS beacon.
+    Beacon = 40,
+    /// Reverse repeater shift.
+    Reverse = 41,
+    /// Select tone signaling.
+    Tone = 42,
+    /// Select MHz tuning.
+    Megahertz = 44,
+    /// Set or inspect a position mark.
+    Mark = 45,
+    /// Toggle dual-band display.
+    Dual = 46,
+    /// Open APRS operations.
+    Aprs = 47,
+    /// Open APRS objects.
+    Object = 48,
+    /// Toggle attenuation.
+    Attenuator = 49,
+    /// Toggle fine tuning.
+    Fine = 50,
+    /// Open position information.
+    Position = 51,
+    /// Select the operating band.
+    Band = 52,
+    /// Open squelch/monitor.
+    Monitor = 53,
+    /// Navigate up.
+    Up = 54,
+    /// Navigate down.
+    Down = 55,
+}
+
+/// Automatic cursor-shift delay for text entry (Menu No. 945).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum CursorShift {
+    /// Do not shift the cursor automatically.
+    Off = 0,
+    /// Shift after 1.0 second.
+    Seconds1 = 1,
+    /// Shift after 1.5 seconds.
+    Seconds1_5 = 2,
+    /// Shift after 2.0 seconds.
+    Seconds2 = 3,
+}
+
+/// Exact stored time-zone selector used by Menu No. 951.
+///
+/// The MCP-D75 registry proves which selector bytes are accepted, but it does
+/// not provide a trustworthy mapping from every byte to a UTC offset. This
+/// type therefore preserves and validates the selector without fabricating
+/// offset semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StoredTimeZone(u8);
+
+impl StoredTimeZone {
+    /// Return the exact MCP selector byte.
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        self.0
+    }
+}
+
+/// USB device function (Menu No. 980).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum UsbFunction {
+    /// USB serial control plus AF/IF audio output.
+    ComAndAudioOutput = 0,
+    /// USB mass-storage access to the memory card.
+    MassStorage = 1,
+}
+
+/// A stored PF assignment byte that is not an official menu selection.
+///
+/// This diagnostic type has no public constructor. It exists so reads can
+/// preserve an observed off-menu byte without claiming that byte is writable
+/// or has an official function assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OffMenuPfCode(u8);
+
+impl OffMenuPfCode {
+    pub(crate) const fn from_raw(raw: u8) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the exact stored byte.
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        self.0
+    }
+}
+
+/// Exact PF assignment read from an MCP image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StoredFrontPanelPfAssignment {
+    /// An official writable menu selection.
+    Official(FrontPanelPfFunction),
+    /// An exact off-menu byte retained for diagnostics.
+    OffMenu(OffMenuPfCode),
+}
+
+impl StoredFrontPanelPfAssignment {
+    /// Returns the exact byte stored in the image.
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        match self {
+            Self::Official(function) => function as u8,
+            Self::OffMenu(code) => code.as_raw(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // System settings
 // ---------------------------------------------------------------------------
 
-/// System-wide radio settings.
+/// Exact scalar values in the remaining Configuration menu groups.
 ///
-/// Covers global configuration such as power management, key lock,
-/// display units, language, and programmable function keys.
-/// Derived from capability gap analysis features 170-197.
+/// [`DisplaySettings`] and [`AudioSettings`] cover their corresponding menu
+/// groups. This aggregate covers Battery, Bluetooth, Auxiliary, Date & Time,
+/// Lock, Units, Interface, and Language. It intentionally omits action rows,
+/// read-only information, blobs, list editors, and text fields such as the
+/// Bluetooth device name and secret access code.
 ///
 /// # USB charging (per Operating Tips §5.1)
 ///
@@ -588,85 +1311,60 @@ pub enum BeatShift {
 /// of inactivity.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "Maps 1:1 to the D75 System menu tree; each bool is a discrete on/off menu item \
-              (battery saver, key lock, PC output NMEA, GPS on). Collapsing to bitflags would \
-              lose the per-field User Manual Menu-number documentation."
+    reason = "Each bool is a distinct MCP menu field; combining unrelated settings into flags \
+              would erase their independent names and storage cells."
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemSettings {
-    /// Battery saver on/off (reduce power in standby by cycling the
-    /// receiver).
-    pub battery_saver: bool,
+    /// Battery-saver receive-off interval (Menu No. 920).
+    pub battery_saver: BatterySaverInterval,
     /// Auto power off timer.
     pub auto_power_off: AutoPowerOff,
-    /// Key lock enabled.
-    pub key_lock: bool,
-    /// Key lock type (which keys are affected).
-    pub key_lock_type: KeyLockType,
-    /// Volume lock (prevent accidental volume changes).
-    pub volume_lock: bool,
-    /// DTMF key lock (lock the DTMF keypad separately).
-    pub dtmf_lock: bool,
-    /// Mic key lock (lock microphone keys).
-    pub mic_lock: bool,
+    /// Permit charging while the radio is powered on (Menu No. 923).
+    pub charging_while_powered_on: bool,
+    /// Bluetooth radio enabled (Menu No. 930).
+    pub bluetooth_enabled: bool,
+    /// Reconnect automatically to the most recent Bluetooth device
+    /// (Menu No. 936).
+    pub bluetooth_auto_connect: bool,
+    /// Front-panel PF1 assignment (Menu No. 940).
+    pub front_panel_pf1: FrontPanelPfFunction,
+    /// Front-panel PF2 assignment (Menu No. 941).
+    pub front_panel_pf2: FrontPanelPfFunction,
+    /// Microphone PF1 assignment (Menu No. 942).
+    pub microphone_pf1: MicrophonePfFunction,
+    /// Microphone PF2 assignment (Menu No. 943).
+    pub microphone_pf2: MicrophonePfFunction,
+    /// Microphone PF3 assignment (Menu No. 944).
+    pub microphone_pf3: MicrophonePfFunction,
+    /// Automatic cursor-shift delay for text entry (Menu No. 945).
+    pub cursor_shift: CursorShift,
+    /// Exact stored time-zone selector from the clock editor.
+    pub time_zone: StoredTimeZone,
+    /// Independent key/frequency lock choices (Menu No. 960).
+    pub key_lock: KeyLockSelection,
+    /// Lock DTMF keys (Menu No. 961).
+    pub dtmf_keys_locked: bool,
+    /// Lock microphone keys (Menu No. 962).
+    pub microphone_keys_locked: bool,
+    /// Lock the volume control (Menu No. 963).
+    pub volume_locked: bool,
     /// Display unit system.
     pub display_units: DisplayUnits,
+    /// USB device function (Menu No. 980).
+    pub usb_function: UsbFunction,
+    /// GPS PC-output interface (Menu No. 981).
+    pub gps_output_interface: PcOutputInterface,
+    /// APRS PC-output interface (Menu No. 982).
+    pub aprs_output_interface: PcOutputInterface,
+    /// KISS-mode interface (Menu No. 983).
+    pub kiss_interface: PcOutputInterface,
+    /// DV/DR-mode interface (Menu No. 984).
+    pub digital_mode_interface: PcOutputInterface,
+    /// DV Gateway-mode interface (Menu No. 985).
+    pub dv_gateway_interface: PcOutputInterface,
     /// Language selection.
     pub language: Language,
-    /// Time-out timer in seconds (0 = disabled, 30-600).
-    /// Automatically stops TX after the timeout.
-    ///
-    /// Menu No. 111. Per User Manual Chapter 12: available values are
-    /// 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, and 10.0
-    /// minutes. Default: 10.0 minutes. This function cannot be turned
-    /// off entirely -- it protects the transceiver from thermal damage.
-    /// A warning beep sounds just before TX is cut off. After timeout,
-    /// the transceiver beeps even if beep is disabled.
-    pub time_out_timer: u16,
-    /// Programmable function key PF1 (front panel) assignment.
-    pub pf1_key: PfKeyFunction,
-    /// Programmable function key PF2 (front panel) assignment.
-    pub pf2_key: PfKeyFunction,
-    /// Programmable function key PF1 (mic) assignment.
-    pub pf1_mic: PfKeyFunction,
-    /// Programmable function key PF2 (mic) assignment.
-    pub pf2_mic: PfKeyFunction,
-    /// Programmable function key PF3 (mic) assignment.
-    pub pf3_mic: PfKeyFunction,
-    /// WX alert on/off (automatic weather channel scan; TH-D75A only).
-    pub wx_alert: bool,
-    /// Secret access code enabled (require code to power on).
-    pub secret_access_code: bool,
-    /// Date format.
-    pub date_format: DateFormat,
-    /// Time zone offset from UTC (e.g. -5 for EST).
-    pub time_zone_offset: i8,
-}
-
-impl Default for SystemSettings {
-    fn default() -> Self {
-        Self {
-            battery_saver: true,
-            auto_power_off: AutoPowerOff::Off,
-            key_lock: false,
-            key_lock_type: KeyLockType::KeyOnly,
-            volume_lock: false,
-            dtmf_lock: false,
-            mic_lock: false,
-            display_units: DisplayUnits::default(),
-            language: Language::English,
-            time_out_timer: 0,
-            pf1_key: PfKeyFunction::Monitor,
-            pf2_key: PfKeyFunction::VoiceAlert,
-            pf1_mic: PfKeyFunction::Monitor,
-            pf2_mic: PfKeyFunction::VoiceAlert,
-            pf3_mic: PfKeyFunction::VoiceAlert,
-            wx_alert: false,
-            secret_access_code: false,
-            date_format: DateFormat::YearMonthDay,
-            time_zone_offset: 0,
-        }
-    }
 }
 
 /// Auto power off timer duration (Menu No. 921).
@@ -681,36 +1379,33 @@ impl Default for SystemSettings {
 /// raw 0-3) agrees exactly. Earlier revisions of this enum invented
 /// 90/120-minute variants that do not exist on the D75.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum AutoPowerOff {
     /// Auto power off disabled.
-    Off,
+    Off = 0,
     /// Power off after 15 minutes of inactivity.
-    Min15,
+    Min15 = 1,
     /// Power off after 30 minutes of inactivity.
-    Min30,
+    Min30 = 2,
     /// Power off after 60 minutes of inactivity.
-    Min60,
+    Min60 = 3,
 }
 
-/// Key lock type -- which controls are affected by key lock (Menu No. 960).
+/// Independent lock-type checkboxes (Menu No. 960).
 ///
-/// Per User Manual Chapter 12: key lock is toggled by pressing and
-/// holding `[F]`. The `[MONI]`, `[PTT]`, `[Power]`, and `[VOL]`
-/// controls can never be locked.
-///
-/// The User Manual lists options as `Key Lock` and/or `Frequency Lock`
-/// (checkboxes), with different combined behaviors:
-/// - Key Lock only: locks all front panel keys.
-/// - Frequency Lock only: locks frequency/channel controls.
-/// - Both: locks all keys and the encoder control.
+/// MCP stores these as two independent bits. All four combinations are valid,
+/// including neither checkbox selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KeyLockType {
-    /// Lock front panel keys only.
-    KeyOnly,
-    /// Lock front panel keys and PTT.
-    KeyAndPtt,
-    /// Lock front panel keys, PTT, and dial.
-    KeyPttAndDial,
+pub struct KeyLockSelection {
+    /// Select the Key Lock checkbox.
+    pub keys: bool,
+    /// Select the Frequency Lock checkbox.
+    pub frequency: bool,
+}
+
+impl KeyLockSelection {
+    /// Number of valid combinations of the two lock bits (`0..=3`).
+    pub const COUNT: u8 = 4;
 }
 
 /// Display unit preferences.
@@ -724,111 +1419,385 @@ pub struct DisplayUnits {
     pub altitude_rain: AltitudeRainUnit,
     /// Temperature units.
     pub temperature: TemperatureUnit,
-}
-
-impl Default for DisplayUnits {
-    fn default() -> Self {
-        Self {
-            speed_distance: SpeedDistanceUnit::MilesPerHour,
-            altitude_rain: AltitudeRainUnit::FeetInch,
-            temperature: TemperatureUnit::Fahrenheit,
-        }
-    }
+    /// Latitude/longitude display notation.
+    pub coordinates: CoordinateFormat,
+    /// Grid-square display system.
+    pub grid_square: GridSquareFormat,
 }
 
 /// Speed and distance measurement units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum SpeedDistanceUnit {
     /// Miles per hour / miles.
-    MilesPerHour,
+    MilesPerHour = 0,
     /// Kilometers per hour / kilometers.
-    KilometersPerHour,
+    KilometersPerHour = 1,
     /// Knots / nautical miles.
-    Knots,
+    Knots = 2,
 }
 
 /// Altitude and rainfall measurement units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum AltitudeRainUnit {
     /// Feet / inches.
-    FeetInch,
+    FeetInch = 0,
     /// Meters / millimeters.
-    MetersMm,
+    MetersMm = 1,
 }
 
 /// Temperature measurement units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum TemperatureUnit {
     /// Fahrenheit.
-    Fahrenheit,
+    Fahrenheit = 0,
     /// Celsius.
-    Celsius,
+    Celsius = 1,
 }
 
 /// Language selection (Menu No. 990).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Language {
     /// English.
-    English,
+    English = 0,
     /// Japanese.
-    Japanese,
-}
-
-/// Date display format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DateFormat {
-    /// Year/Month/Day (e.g. 2026/03/28).
-    YearMonthDay,
-    /// Month/Day/Year (e.g. 03/28/2026).
-    MonthDayYear,
-    /// Day/Month/Year (e.g. 28/03/2026).
-    DayMonthYear,
-}
-
-/// Programmable function key assignment.
-///
-/// The TH-D75 has 2 front-panel PF keys (Menu No. 940/941) and 3
-/// microphone PF keys (Menu No. 942/943/944), each assignable to one
-/// of these functions.
-///
-/// Per User Manual Chapter 12: the microphone PF keys support a larger
-/// set of functions than the front-panel keys, including MODE, MENU,
-/// A/B, VFO, MR, CALL, MSG, LIST, BCON, REV, TONE, MHz, MARK, DUAL,
-/// APRS, OBJ, ATT, FINE, POS, BAND, MONI, UP, DOWN, and Screen Capture.
-/// Front-panel PF keys additionally support M.IN (memory registration).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PfKeyFunction {
-    /// Monitor (open squelch).
-    Monitor,
-    /// Voice alert toggle.
-    VoiceAlert,
-    /// Weather channel.
-    Wx,
-    /// Scan start/stop.
-    Scan,
-    /// Frequency direct entry.
-    DirectEntry,
-    /// VFO/Memory mode toggle.
-    VfoMr,
-    /// Screen capture (save to SD card).
-    ScreenCapture,
-    /// Backlight toggle.
-    Backlight,
-    /// Voice guidance toggle.
-    VoiceGuidance,
-    /// Lock toggle.
-    Lock,
-    /// 1750 Hz tone burst.
-    Tone1750,
-    /// APRS beacon transmit.
-    AprsBeacon,
-    /// Recording start/stop.
-    Recording,
+    Japanese = 1,
 }
 
 // ---------------------------------------------------------------------------
 // TryFrom<u8> implementations for MCP binary parsing
 // ---------------------------------------------------------------------------
+
+macro_rules! impl_raw_setting_enum {
+    ($type:ty, $name:literal, $detail:literal, {$($raw:literal => $variant:path),+ $(,)?}) => {
+        impl TryFrom<u8> for $type {
+            type Error = ValidationError;
+
+            fn try_from(value: u8) -> Result<Self, Self::Error> {
+                match value {
+                    $($raw => Ok($variant),)+
+                    _ => Err(ValidationError::SettingOutOfRange {
+                        name: $name,
+                        value,
+                        detail: $detail,
+                    }),
+                }
+            }
+        }
+
+        impl From<$type> for u8 {
+            fn from(value: $type) -> Self {
+                match value {
+                    $($variant => $raw,)+
+                }
+            }
+        }
+    };
+}
+
+impl_raw_setting_enum!(LcdBrightness, "LCD brightness", "must be 0-2", {
+    0 => LcdBrightness::Low,
+    1 => LcdBrightness::Medium,
+    2 => LcdBrightness::High,
+});
+
+impl_raw_setting_enum!(SingleBandDisplay, "single-band display", "must be 0-4", {
+    0 => SingleBandDisplay::Off,
+    1 => SingleBandDisplay::GpsAltitude,
+    2 => SingleBandDisplay::GpsGroundSpeed,
+    3 => SingleBandDisplay::Date,
+    4 => SingleBandDisplay::DemodulationMode,
+});
+
+impl_raw_setting_enum!(MeterType, "meter type", "must be 0-2", {
+    0 => MeterType::Type1,
+    1 => MeterType::Type2,
+    2 => MeterType::Type3,
+});
+
+impl_raw_setting_enum!(BackgroundColor, "background color", "must be 0-1", {
+    0 => BackgroundColor::Black,
+    1 => BackgroundColor::White,
+});
+
+impl_raw_setting_enum!(InformationBacklight, "information backlight", "must be 0-2", {
+    0 => InformationBacklight::Off,
+    1 => InformationBacklight::Lcd,
+    2 => InformationBacklight::LcdAndKeys,
+});
+
+impl_raw_setting_enum!(AudioBalance, "audio balance", "must be 0-9", {
+    0 => AudioBalance::A100B0,
+    1 => AudioBalance::A100B25,
+    2 => AudioBalance::A100B50,
+    3 => AudioBalance::A100B75,
+    4 => AudioBalance::A100B100,
+    5 => AudioBalance::A75B100,
+    6 => AudioBalance::A50B100,
+    7 => AudioBalance::A25B100,
+    8 => AudioBalance::A0B100,
+    9 => AudioBalance::OperationBandOnly,
+});
+
+impl_raw_setting_enum!(CallsignReadout, "callsign readout", "must be 0-2", {
+    0 => CallsignReadout::Standard,
+    1 => CallsignReadout::FullPhonetics,
+    2 => CallsignReadout::SuffixPhonetics,
+});
+
+impl_raw_setting_enum!(UsbAudioOutputLevel, "USB audio output level", "must be 0-6", {
+    0 => UsbAudioOutputLevel::Level1,
+    1 => UsbAudioOutputLevel::Level2,
+    2 => UsbAudioOutputLevel::Level3,
+    3 => UsbAudioOutputLevel::Level4,
+    4 => UsbAudioOutputLevel::Level5,
+    5 => UsbAudioOutputLevel::Level6,
+    6 => UsbAudioOutputLevel::Level7,
+});
+
+impl_raw_setting_enum!(CursorShift, "cursor shift", "must be 0-3", {
+    0 => CursorShift::Off,
+    1 => CursorShift::Seconds1,
+    2 => CursorShift::Seconds1_5,
+    3 => CursorShift::Seconds2,
+});
+
+impl_raw_setting_enum!(UsbFunction, "USB function", "must be 0-1", {
+    0 => UsbFunction::ComAndAudioOutput,
+    1 => UsbFunction::MassStorage,
+});
+
+impl_raw_setting_enum!(MicrophonePfFunction, "microphone PF function", "must be an official menu code", {
+    0 => MicrophonePfFunction::Recording,
+    1 => MicrophonePfFunction::VoiceMessage1,
+    2 => MicrophonePfFunction::VoiceMessage2,
+    3 => MicrophonePfFunction::VoiceMessage3,
+    4 => MicrophonePfFunction::VoiceMessage4,
+    6 => MicrophonePfFunction::VoiceGuidance,
+    7 => MicrophonePfFunction::BatteryLevel,
+    8 => MicrophonePfFunction::Vox,
+    9 => MicrophonePfFunction::GroupName,
+    10 => MicrophonePfFunction::Balance,
+    11 => MicrophonePfFunction::Gps,
+    12 => MicrophonePfFunction::TrackLog,
+    13 => MicrophonePfFunction::Squelch,
+    14 => MicrophonePfFunction::Shift,
+    15 => MicrophonePfFunction::Step,
+    16 => MicrophonePfFunction::Power,
+    17 => MicrophonePfFunction::KeyLock,
+    18 => MicrophonePfFunction::Lockout,
+    19 => MicrophonePfFunction::MemoryToVfo,
+    20 => MicrophonePfFunction::ToneSelect,
+    21 => MicrophonePfFunction::NewMemory,
+    22 => MicrophonePfFunction::VoiceAlert,
+    24 => MicrophonePfFunction::LcdBrightness,
+    27 => MicrophonePfFunction::DtmfChannel0,
+    28 => MicrophonePfFunction::EcholinkChannel0,
+    29 => MicrophonePfFunction::Tone1750Hz,
+    31 => MicrophonePfFunction::ScreenCapture,
+    32 => MicrophonePfFunction::Mode,
+    33 => MicrophonePfFunction::Menu,
+    34 => MicrophonePfFunction::BandSelect,
+    35 => MicrophonePfFunction::Vfo,
+    36 => MicrophonePfFunction::MemoryRecall,
+    37 => MicrophonePfFunction::Call,
+    38 => MicrophonePfFunction::Message,
+    39 => MicrophonePfFunction::List,
+    40 => MicrophonePfFunction::Beacon,
+    41 => MicrophonePfFunction::Reverse,
+    42 => MicrophonePfFunction::Tone,
+    44 => MicrophonePfFunction::Megahertz,
+    45 => MicrophonePfFunction::Mark,
+    46 => MicrophonePfFunction::Dual,
+    47 => MicrophonePfFunction::Aprs,
+    48 => MicrophonePfFunction::Object,
+    49 => MicrophonePfFunction::Attenuator,
+    50 => MicrophonePfFunction::Fine,
+    51 => MicrophonePfFunction::Position,
+    52 => MicrophonePfFunction::Band,
+    53 => MicrophonePfFunction::Monitor,
+    54 => MicrophonePfFunction::Up,
+    55 => MicrophonePfFunction::Down,
+});
+
+impl_raw_setting_enum!(TransmitTimeout, "transmit timeout", "must be 0-10", {
+    0 => TransmitTimeout::Seconds30,
+    1 => TransmitTimeout::Seconds60,
+    2 => TransmitTimeout::Seconds90,
+    3 => TransmitTimeout::Seconds120,
+    4 => TransmitTimeout::Seconds150,
+    5 => TransmitTimeout::Seconds180,
+    6 => TransmitTimeout::Seconds210,
+    7 => TransmitTimeout::Seconds240,
+    8 => TransmitTimeout::Seconds270,
+    9 => TransmitTimeout::Seconds300,
+    10 => TransmitTimeout::Seconds600,
+});
+
+impl_raw_setting_enum!(SsbHighCut, "SSB high-cut filter", "must be 0-4", {
+    0 => SsbHighCut::Khz2_2,
+    1 => SsbHighCut::Khz2_4,
+    2 => SsbHighCut::Khz2_6,
+    3 => SsbHighCut::Khz2_8,
+    4 => SsbHighCut::Khz3_0,
+});
+
+impl_raw_setting_enum!(CwFilterWidth, "CW filter width", "must be 0-4", {
+    0 => CwFilterWidth::Khz0_3,
+    1 => CwFilterWidth::Khz0_5,
+    2 => CwFilterWidth::Khz1_0,
+    3 => CwFilterWidth::Khz1_5,
+    4 => CwFilterWidth::Khz2_0,
+});
+
+impl_raw_setting_enum!(AmHighCut, "AM high-cut filter", "must be 0-3", {
+    0 => AmHighCut::Khz3_0,
+    1 => AmHighCut::Khz4_5,
+    2 => AmHighCut::Khz6_0,
+    3 => AmHighCut::Khz7_5,
+});
+
+impl_raw_setting_enum!(RepeaterCallKey, "repeater CALL key", "must be 0-1", {
+    0 => RepeaterCallKey::CallChannel,
+    1 => RepeaterCallKey::Tone1750Hz,
+});
+
+impl_raw_setting_enum!(DtmfToneDuration, "DTMF tone duration", "must be 0-2", {
+    0 => DtmfToneDuration::Ms50,
+    1 => DtmfToneDuration::Ms100,
+    2 => DtmfToneDuration::Ms150,
+});
+
+impl_raw_setting_enum!(VoiceAnnounceMode, "voice announce mode", "must be 0-3", {
+    0 => VoiceAnnounceMode::Off,
+    1 => VoiceAnnounceMode::Manual,
+    2 => VoiceAnnounceMode::Auto1,
+    3 => VoiceAnnounceMode::Auto2,
+});
+
+impl_raw_setting_enum!(BatterySaverInterval, "battery saver interval", "must be 0-9", {
+    0 => BatterySaverInterval::Off,
+    1 => BatterySaverInterval::Seconds0_2,
+    2 => BatterySaverInterval::Seconds0_4,
+    3 => BatterySaverInterval::Seconds0_6,
+    4 => BatterySaverInterval::Seconds0_8,
+    5 => BatterySaverInterval::Seconds1,
+    6 => BatterySaverInterval::Seconds2,
+    7 => BatterySaverInterval::Seconds3,
+    8 => BatterySaverInterval::Seconds4,
+    9 => BatterySaverInterval::Seconds5,
+});
+
+impl_raw_setting_enum!(PcOutputInterface, "PC output interface", "must be 0-1", {
+    0 => PcOutputInterface::Usb,
+    1 => PcOutputInterface::Bluetooth,
+});
+
+impl_raw_setting_enum!(FrontPanelPfFunction, "front-panel PF function", "must be an official menu code", {
+    0 => FrontPanelPfFunction::Recording,
+    1 => FrontPanelPfFunction::VoiceMessage1,
+    2 => FrontPanelPfFunction::VoiceMessage2,
+    3 => FrontPanelPfFunction::VoiceMessage3,
+    4 => FrontPanelPfFunction::VoiceMessage4,
+    6 => FrontPanelPfFunction::VoiceGuidance,
+    7 => FrontPanelPfFunction::BatteryLevel,
+    8 => FrontPanelPfFunction::Vox,
+    9 => FrontPanelPfFunction::GroupName,
+    10 => FrontPanelPfFunction::Balance,
+    11 => FrontPanelPfFunction::Gps,
+    12 => FrontPanelPfFunction::TrackLog,
+    13 => FrontPanelPfFunction::Squelch,
+    14 => FrontPanelPfFunction::Shift,
+    15 => FrontPanelPfFunction::Step,
+    16 => FrontPanelPfFunction::Power,
+    17 => FrontPanelPfFunction::KeyLock,
+    18 => FrontPanelPfFunction::Lockout,
+    19 => FrontPanelPfFunction::MemoryToVfo,
+    20 => FrontPanelPfFunction::ToneSelect,
+    21 => FrontPanelPfFunction::NewMemory,
+    22 => FrontPanelPfFunction::VoiceAlert,
+    24 => FrontPanelPfFunction::LcdBrightness,
+    27 => FrontPanelPfFunction::DtmfChannel0,
+    28 => FrontPanelPfFunction::EcholinkChannel0,
+    29 => FrontPanelPfFunction::Tone1750Hz,
+    30 => FrontPanelPfFunction::MemoryInput,
+});
+
+impl TryFrom<u8> for ScanRestartDelay {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ScanRestartDelay> for u8 {
+    fn from(value: ScanRestartDelay) -> Self {
+        value.as_seconds()
+    }
+}
+
+impl TryFrom<u8> for AutoMuteReturnDelay {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<AutoMuteReturnDelay> for u8 {
+    fn from(value: AutoMuteReturnDelay) -> Self {
+        value.as_seconds()
+    }
+}
+
+impl TryFrom<u8> for BacklightTimer {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<BacklightTimer> for u8 {
+    fn from(value: BacklightTimer) -> Self {
+        value.as_seconds()
+    }
+}
+
+impl TryFrom<u8> for LinkedVolumeLevel {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value <= 7 {
+            Ok(Self(value))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "linked volume level",
+                value,
+                detail: "must be 0-7, where 0 means VOL Link",
+            })
+        }
+    }
+}
+
+impl From<LinkedVolumeLevel> for u8 {
+    fn from(value: LinkedVolumeLevel) -> Self {
+        value.as_raw()
+    }
+}
+
+impl From<u8> for StoredFrontPanelPfAssignment {
+    fn from(raw: u8) -> Self {
+        FrontPanelPfFunction::try_from(raw).map_or_else(
+            |_| Self::OffMenu(OffMenuPfCode::from_raw(raw)),
+            Self::Official,
+        )
+    }
+}
 
 impl TryFrom<u8> for BacklightControl {
     type Error = ValidationError;
@@ -851,56 +1820,6 @@ impl TryFrom<u8> for BacklightControl {
 impl From<BacklightControl> for u8 {
     fn from(control: BacklightControl) -> Self {
         control as Self
-    }
-}
-
-impl TryFrom<u8> for BackgroundColor {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Amber),
-            1 => Ok(Self::Green),
-            2 => Ok(Self::Blue),
-            3 => Ok(Self::White),
-            _ => Err(ValidationError::SettingOutOfRange {
-                name: "background color",
-                value,
-                detail: "must be 0-3",
-            }),
-        }
-    }
-}
-
-impl TryFrom<u8> for MeterType {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Bar),
-            1 => Ok(Self::Numeric),
-            _ => Err(ValidationError::SettingOutOfRange {
-                name: "meter type",
-                value,
-                detail: "must be 0-1",
-            }),
-        }
-    }
-}
-
-impl TryFrom<u8> for DisplayMethod {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Dual),
-            1 => Ok(Self::Single),
-            _ => Err(ValidationError::SettingOutOfRange {
-                name: "display method",
-                value,
-                detail: "must be 0-1",
-            }),
-        }
     }
 }
 
@@ -929,32 +1848,14 @@ impl From<LedControl> for u8 {
     }
 }
 
-impl TryFrom<u8> for DisplayHoldTime {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Sec3),
-            1 => Ok(Self::Sec5),
-            2 => Ok(Self::Sec10),
-            3 => Ok(Self::Continuous),
-            _ => Err(ValidationError::SettingOutOfRange {
-                name: "display hold time",
-                value,
-                detail: "must be 0-3",
-            }),
-        }
-    }
-}
-
 impl TryFrom<u8> for MicSensitivity {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::Low),
+            0 => Ok(Self::High),
             1 => Ok(Self::Medium),
-            2 => Ok(Self::High),
+            2 => Ok(Self::Low),
             _ => Err(ValidationError::SettingOutOfRange {
                 name: "mic sensitivity",
                 value,
@@ -964,20 +1865,33 @@ impl TryFrom<u8> for MicSensitivity {
     }
 }
 
+impl From<MicSensitivity> for u8 {
+    fn from(value: MicSensitivity) -> Self {
+        value as Self
+    }
+}
+
 impl TryFrom<u8> for VoiceGuideSpeed {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::Slow),
-            1 => Ok(Self::Normal),
-            2 => Ok(Self::Fast),
+            0 => Ok(Self::Speed1),
+            1 => Ok(Self::Speed2),
+            2 => Ok(Self::Speed3),
+            3 => Ok(Self::Speed4),
             _ => Err(ValidationError::SettingOutOfRange {
                 name: "voice guide speed",
                 value,
-                detail: "must be 0-2",
+                detail: "must be 0-3",
             }),
         }
+    }
+}
+
+impl From<VoiceGuideSpeed> for u8 {
+    fn from(value: VoiceGuideSpeed) -> Self {
+        value as Self
     }
 }
 
@@ -1033,31 +1947,50 @@ impl From<AutoPowerOff> for u8 {
     }
 }
 
-impl KeyLockType {
-    /// Number of valid key lock type values (0-2).
-    pub const COUNT: u8 = 3;
-}
-
-impl TryFrom<u8> for KeyLockType {
+impl TryFrom<u8> for KeyLockSelection {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::KeyOnly),
-            1 => Ok(Self::KeyAndPtt),
-            2 => Ok(Self::KeyPttAndDial),
-            _ => Err(ValidationError::SettingOutOfRange {
-                name: "key lock type",
+        if value & !0x03 == 0 {
+            Ok(Self {
+                keys: value & 0x01 != 0,
+                frequency: value & 0x02 != 0,
+            })
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "key lock selection",
                 value,
-                detail: "must be 0-2",
-            }),
+                detail: "must contain only Key Lock (0x01) and Frequency Lock (0x02) bits",
+            })
         }
     }
 }
 
-impl From<KeyLockType> for u8 {
-    fn from(klt: KeyLockType) -> Self {
-        klt as Self
+impl From<KeyLockSelection> for u8 {
+    fn from(value: KeyLockSelection) -> Self {
+        Self::from(value.keys) | (Self::from(value.frequency) << 1)
+    }
+}
+
+impl TryFrom<u8> for StoredTimeZone {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if matches!(value, 0..=52 | 56..=112 | 201..=203) {
+            Ok(Self(value))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                name: "stored time-zone selector",
+                value,
+                detail: "must be 0-52, 56-112, or 201-203",
+            })
+        }
+    }
+}
+
+impl From<StoredTimeZone> for u8 {
+    fn from(value: StoredTimeZone) -> Self {
+        value.as_raw()
     }
 }
 
@@ -1077,20 +2010,76 @@ impl TryFrom<u8> for Language {
     }
 }
 
-impl TryFrom<u8> for DateFormat {
+impl From<Language> for u8 {
+    fn from(value: Language) -> Self {
+        value as Self
+    }
+}
+
+impl TryFrom<u8> for SpeedDistanceUnit {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::YearMonthDay),
-            1 => Ok(Self::MonthDayYear),
-            2 => Ok(Self::DayMonthYear),
+            0 => Ok(Self::MilesPerHour),
+            1 => Ok(Self::KilometersPerHour),
+            2 => Ok(Self::Knots),
             _ => Err(ValidationError::SettingOutOfRange {
-                name: "date format",
+                name: "speed and distance unit",
                 value,
                 detail: "must be 0-2",
             }),
         }
+    }
+}
+
+impl From<SpeedDistanceUnit> for u8 {
+    fn from(value: SpeedDistanceUnit) -> Self {
+        value as Self
+    }
+}
+
+impl TryFrom<u8> for AltitudeRainUnit {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::FeetInch),
+            1 => Ok(Self::MetersMm),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "altitude and rain unit",
+                value,
+                detail: "must be 0-1",
+            }),
+        }
+    }
+}
+
+impl From<AltitudeRainUnit> for u8 {
+    fn from(value: AltitudeRainUnit) -> Self {
+        value as Self
+    }
+}
+
+impl TryFrom<u8> for TemperatureUnit {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Fahrenheit),
+            1 => Ok(Self::Celsius),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "temperature unit",
+                value,
+                detail: "must be 0-1",
+            }),
+        }
+    }
+}
+
+impl From<TemperatureUnit> for u8 {
+    fn from(value: TemperatureUnit) -> Self {
+        value as Self
     }
 }
 
@@ -1103,22 +2092,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_settings_default() {
-        let ds = DisplaySettings::default();
-        assert_eq!(ds.backlight_control, BacklightControl::Auto);
-        assert_eq!(ds.background_color, BackgroundColor::Blue);
-        assert_eq!(ds.led_control, LedControl::new(true, false));
-        assert_eq!(ds.led_control, LedControl::default());
+    fn display_settings_cover_menus_900_through_907() -> Result<(), ValidationError> {
+        let settings = DisplaySettings {
+            backlight_control: BacklightControl::Auto,
+            backlight_timer: BacklightTimer::try_from(10)?,
+            lcd_brightness: LcdBrightness::High,
+            background_color: BackgroundColor::Black,
+            power_on_message: PowerOnMessage::new("HELLO !!")?,
+            single_band_display: SingleBandDisplay::Off,
+            meter_type: MeterType::Type1,
+            information_backlight: InformationBacklight::LcdAndKeys,
+        };
+
+        assert_eq!(settings.power_on_message.as_str(), "HELLO !!");
+        assert_eq!(u8::from(settings.lcd_brightness), 2);
+        assert_eq!(u8::from(settings.background_color), 0);
+        Ok(())
     }
 
     #[test]
-    fn audio_settings_default() {
-        let a = AudioSettings::default();
-        assert!(a.beep);
-        assert_eq!(a.beep_volume, 4);
-        assert_eq!(a.mic_sensitivity, MicSensitivity::Medium);
-        assert_eq!(a.tx_equalizer, TxEqualizer::default());
-        assert_eq!(a.rx_equalizer, RxEqualizer::default());
+    fn audio_settings_cover_menus_910_through_91a() -> Result<(), ValidationError> {
+        let settings = AudioSettings {
+            balance: AudioBalance::A100B100,
+            tx_equalizer: TxEqualizer::default(),
+            rx_equalizer: RxEqualizer::default(),
+            beep: true,
+            beep_volume: LinkedVolumeLevel::try_from(4)?,
+            voice_announce: VoiceAnnounceMode::Off,
+            voice_announce_volume: LinkedVolumeLevel::VOLUME_LINK,
+            voice_guidance_speed: VoiceGuideSpeed::Speed1,
+            callsign_readout: CallsignReadout::Standard,
+            usb_audio_output_level: UsbAudioOutputLevel::Level1,
+        };
+
+        assert!(settings.beep);
+        assert_eq!(settings.beep_volume.fixed_level(), Some(4));
+        assert_eq!(u8::from(settings.balance), 4);
+        Ok(())
     }
 
     #[test]
@@ -1136,13 +2146,13 @@ mod tests {
     #[test]
     fn tx_eq_level_validates_and_round_trips_raw() -> Result<(), Box<dyn std::error::Error>> {
         for db in TxEqLevel::MIN_DB..=TxEqLevel::MAX_DB {
-            let level = TxEqLevel::new(db).ok_or("in-range TX EQ level rejected")?;
+            let level = TxEqLevel::new(db)?;
             assert_eq!(TxEqLevel::from_raw(level.as_raw()), Some(level));
             assert_eq!(TxEqLevel::try_from(u8::from(level))?, level);
             assert_eq!(level.as_db(), db);
         }
-        assert!(TxEqLevel::new(-10).is_none());
-        assert!(TxEqLevel::new(4).is_none());
+        assert!(TxEqLevel::new(-10).is_err());
+        assert!(TxEqLevel::new(4).is_err());
         assert!(TxEqLevel::from_raw(13).is_none());
         assert!(TxEqLevel::try_from(13).is_err());
         Ok(())
@@ -1151,51 +2161,266 @@ mod tests {
     #[test]
     fn rx_eq_level_validates_and_round_trips_raw() -> Result<(), Box<dyn std::error::Error>> {
         for db in RxEqLevel::MIN_DB..=RxEqLevel::MAX_DB {
-            let level = RxEqLevel::new(db).ok_or("in-range RX EQ level rejected")?;
+            let level = RxEqLevel::new(db)?;
             assert_eq!(RxEqLevel::from_raw(level.as_raw()), Some(level));
             assert_eq!(RxEqLevel::try_from(u8::from(level))?, level);
             assert_eq!(level.as_db(), db);
         }
-        assert!(RxEqLevel::new(-10).is_none());
-        assert!(RxEqLevel::new(10).is_none());
+        assert!(RxEqLevel::new(-10).is_err());
+        assert!(RxEqLevel::new(10).is_err());
         assert!(RxEqLevel::from_raw(19).is_none());
         assert!(RxEqLevel::try_from(19).is_err());
         Ok(())
     }
 
     #[test]
-    fn system_settings_default() {
-        let s = SystemSettings::default();
-        assert!(s.battery_saver);
-        assert_eq!(s.auto_power_off, AutoPowerOff::Off);
-        assert_eq!(s.language, Language::English);
-        assert_eq!(s.time_out_timer, 0);
+    fn power_on_message_preserves_printable_ascii_and_spaces() -> Result<(), ValidationError> {
+        let msg = PowerOnMessage::new(" TH-D75~ ")?;
+        assert_eq!(msg.as_str(), " TH-D75~ ");
+        assert_eq!(msg.as_ref(), " TH-D75~ ");
+        assert_eq!(msg.to_string(), " TH-D75~ ");
+        assert_eq!(msg.len(), 9);
+        assert!(!msg.is_empty());
+
+        let empty = PowerOnMessage::try_from("")?;
+        assert!(empty.is_empty());
+        assert_eq!(empty.to_wire_bytes(), [0; PowerOnMessage::WIRE_LEN]);
+        Ok(())
     }
 
     #[test]
-    fn power_on_message_valid() -> Result<(), Box<dyn std::error::Error>> {
-        let msg = PowerOnMessage::new("TH-D75 Ready").ok_or("valid message rejected")?;
+    fn power_on_message_accepts_exact_text_byte_boundaries() -> Result<(), ValidationError> {
+        let msg = PowerOnMessage::new(" ~")?;
+        assert_eq!(msg.as_str(), " ~");
+        assert_eq!(msg.to_wire_bytes().get(..2), Some(&b" ~"[..]));
+        Ok(())
+    }
+
+    #[test]
+    fn power_on_message_max_length_round_trips_without_a_terminator() -> Result<(), ValidationError>
+    {
+        let msg = PowerOnMessage::new("1234567890123456")?;
+        assert_eq!(msg.len(), PowerOnMessage::MAX_LEN);
+        assert_eq!(msg.to_wire_bytes(), *b"1234567890123456");
+        assert_eq!(PowerOnMessage::try_from_wire(msg.to_wire_bytes())?, msg);
+        Ok(())
+    }
+
+    #[test]
+    fn power_on_message_short_wire_value_round_trips_with_nul_padding()
+    -> Result<(), ValidationError> {
+        let msg = PowerOnMessage::new("TH-D75 Ready")?;
         assert_eq!(msg.as_str(), "TH-D75 Ready");
+        assert_eq!(msg.to_wire_bytes(), *b"TH-D75 Ready\0\0\0\0");
+        assert_eq!(PowerOnMessage::try_from_wire(msg.to_wire_bytes())?, msg);
         Ok(())
     }
 
     #[test]
-    fn power_on_message_max_length() -> Result<(), Box<dyn std::error::Error>> {
-        let msg =
-            PowerOnMessage::new("1234567890123456").ok_or("valid 16-char message rejected")?;
-        assert_eq!(msg.as_str().len(), 16);
+    fn power_on_message_reports_exact_length_error() {
+        assert!(matches!(
+            PowerOnMessage::new("12345678901234567"),
+            Err(ValidationError::PowerOnMessageTooLong { len: 17 })
+        ));
+    }
+
+    #[test]
+    fn power_on_message_rejects_every_non_printable_boundary_with_exact_offset() {
+        for (text, offset, value) in [
+            ("\u{1f}", 0, 0x1F),
+            ("D75\nREADY", 3, b'\n'),
+            ("D75\0READY", 3, 0),
+            ("\u{7f}", 0, 0x7F),
+            ("D75 ✓", 4, 0xE2),
+        ] {
+            assert!(matches!(
+                PowerOnMessage::new(text),
+                Err(ValidationError::InvalidPowerOnMessageByte {
+                    offset: actual_offset,
+                    value: actual_value,
+                }) if actual_offset == offset && actual_value == value
+            ));
+        }
+    }
+
+    #[test]
+    fn power_on_message_wire_decode_rejects_control_bytes_and_data_after_nul() {
+        let mut control = [0; PowerOnMessage::WIRE_LEN];
+        control[0] = b'D';
+        control[1] = 0x1F;
+        assert!(matches!(
+            PowerOnMessage::try_from_wire(control),
+            Err(ValidationError::InvalidPowerOnMessageByte {
+                offset: 1,
+                value: 0x1F,
+            })
+        ));
+
+        let mut data_after_nul = [0; PowerOnMessage::WIRE_LEN];
+        data_after_nul[..5].copy_from_slice(b"D\0BAD");
+        assert!(matches!(
+            PowerOnMessage::try_from_wire(data_after_nul),
+            Err(ValidationError::PowerOnMessageDataAfterNul {
+                terminator_offset: 1,
+                offset: 2,
+                value: b'B',
+            })
+        ));
+    }
+
+    #[test]
+    fn exact_selector_types_round_trip_and_reject_out_of_domain_values()
+    -> Result<(), ValidationError> {
+        for raw in 0..=10 {
+            let value = TransmitTimeout::try_from(raw)?;
+            assert_eq!(u8::from(value), raw);
+        }
+        assert_eq!(TransmitTimeout::Seconds600.as_seconds(), 600);
+        assert!(TransmitTimeout::try_from(11).is_err());
+
+        for raw in 0..=4 {
+            assert_eq!(u8::from(SsbHighCut::try_from(raw)?), raw);
+            assert_eq!(u8::from(CwFilterWidth::try_from(raw)?), raw);
+        }
+        assert!(SsbHighCut::try_from(5).is_err());
+        assert!(CwFilterWidth::try_from(5).is_err());
+
+        for raw in 0..=3 {
+            assert_eq!(u8::from(AmHighCut::try_from(raw)?), raw);
+            assert_eq!(u8::from(VoiceAnnounceMode::try_from(raw)?), raw);
+            assert_eq!(u8::from(VoiceGuideSpeed::try_from(raw)?), raw);
+        }
+        assert!(AmHighCut::try_from(4).is_err());
+        assert!(VoiceAnnounceMode::try_from(4).is_err());
+        assert!(VoiceGuideSpeed::try_from(4).is_err());
+
+        for raw in 0..=9 {
+            assert_eq!(u8::from(BatterySaverInterval::try_from(raw)?), raw);
+            assert_eq!(u8::from(AudioBalance::try_from(raw)?), raw);
+        }
+        assert!(BatterySaverInterval::try_from(10).is_err());
+        assert!(AudioBalance::try_from(10).is_err());
+
+        for raw in 0..=2 {
+            assert_eq!(u8::from(DtmfToneDuration::try_from(raw)?), raw);
+            assert_eq!(u8::from(MicSensitivity::try_from(raw)?), raw);
+            assert_eq!(u8::from(LcdBrightness::try_from(raw)?), raw);
+            assert_eq!(u8::from(MeterType::try_from(raw)?), raw);
+            assert_eq!(u8::from(InformationBacklight::try_from(raw)?), raw);
+            assert_eq!(u8::from(CallsignReadout::try_from(raw)?), raw);
+        }
+        assert!(DtmfToneDuration::try_from(3).is_err());
+        assert!(MicSensitivity::try_from(3).is_err());
+        assert!(LcdBrightness::try_from(3).is_err());
+        assert!(MeterType::try_from(3).is_err());
+        assert!(InformationBacklight::try_from(3).is_err());
+        assert!(CallsignReadout::try_from(3).is_err());
+
+        for raw in 0..=4 {
+            assert_eq!(u8::from(SingleBandDisplay::try_from(raw)?), raw);
+        }
+        assert!(SingleBandDisplay::try_from(5).is_err());
+
+        for raw in 0..=6 {
+            assert_eq!(u8::from(UsbAudioOutputLevel::try_from(raw)?), raw);
+        }
+        assert!(UsbAudioOutputLevel::try_from(7).is_err());
+
+        for raw in 0..KeyLockSelection::COUNT {
+            assert_eq!(u8::from(KeyLockSelection::try_from(raw)?), raw);
+        }
+        assert!(KeyLockSelection::try_from(KeyLockSelection::COUNT).is_err());
         Ok(())
     }
 
     #[test]
-    fn power_on_message_too_long() {
-        assert!(PowerOnMessage::new("12345678901234567").is_none());
+    fn microphone_pf_domain_preserves_registry_gaps() -> Result<(), ValidationError> {
+        const GAPS: &[u8] = &[5, 23, 25, 26, 30, 43];
+        for raw in 0..=55 {
+            if GAPS.contains(&raw) {
+                assert!(MicrophonePfFunction::try_from(raw).is_err());
+            } else {
+                assert_eq!(u8::from(MicrophonePfFunction::try_from(raw)?), raw);
+            }
+        }
+        assert!(MicrophonePfFunction::try_from(56).is_err());
+        Ok(())
     }
 
     #[test]
-    fn display_units_default() {
-        let u = DisplayUnits::default();
-        assert_eq!(u.speed_distance, SpeedDistanceUnit::MilesPerHour);
-        assert_eq!(u.temperature, TemperatureUnit::Fahrenheit);
+    fn stored_time_zone_validates_registry_selector_domain() -> Result<(), ValidationError> {
+        for raw in (0..=52).chain(56..=112).chain(201..=203) {
+            assert_eq!(u8::from(StoredTimeZone::try_from(raw)?), raw);
+        }
+        for raw in [53, 54, 55, 113, 200, 204, u8::MAX] {
+            assert!(StoredTimeZone::try_from(raw).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_settings_newtypes_reject_values_instead_of_clamping() -> Result<(), ValidationError>
+    {
+        assert!(ScanRestartDelay::new(0).is_err());
+        assert_eq!(ScanRestartDelay::try_from(1)?.as_seconds(), 1);
+        assert_eq!(ScanRestartDelay::try_from(10)?.as_seconds(), 10);
+        assert!(ScanRestartDelay::new(11).is_err());
+
+        assert!(AutoMuteReturnDelay::new(0).is_err());
+        assert_eq!(AutoMuteReturnDelay::try_from(1)?.as_seconds(), 1);
+        assert_eq!(AutoMuteReturnDelay::try_from(10)?.as_seconds(), 10);
+        assert!(AutoMuteReturnDelay::new(11).is_err());
+
+        assert!(BacklightTimer::new(2).is_err());
+        assert_eq!(BacklightTimer::try_from(3)?.as_seconds(), 3);
+        assert_eq!(BacklightTimer::try_from(60)?.as_seconds(), 60);
+        assert!(BacklightTimer::new(61).is_err());
+
+        assert_eq!(
+            LinkedVolumeLevel::try_from(0)?,
+            LinkedVolumeLevel::VOLUME_LINK
+        );
+        assert_eq!(LinkedVolumeLevel::try_from(7)?.fixed_level(), Some(7));
+        assert!(LinkedVolumeLevel::try_from(8).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pf_assignments_preserve_off_menu_bytes_without_making_them_writable()
+    -> Result<(), ValidationError> {
+        for raw in 0..=30 {
+            let official = FrontPanelPfFunction::try_from(raw);
+            if matches!(raw, 5 | 23 | 25 | 26) {
+                assert!(official.is_err());
+                assert!(matches!(
+                    StoredFrontPanelPfAssignment::from(raw),
+                    StoredFrontPanelPfAssignment::OffMenu(_)
+                ));
+            } else {
+                let value = official?;
+                assert_eq!(u8::from(value), raw);
+                assert_eq!(
+                    StoredFrontPanelPfAssignment::from(raw),
+                    StoredFrontPanelPfAssignment::Official(value)
+                );
+            }
+        }
+        let off_menu = StoredFrontPanelPfAssignment::from(0xFF);
+        assert_eq!(off_menu.as_raw(), 0xFF);
+        assert!(matches!(off_menu, StoredFrontPanelPfAssignment::OffMenu(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn display_units_include_coordinate_and_grid_formats() {
+        let units = DisplayUnits {
+            speed_distance: SpeedDistanceUnit::MilesPerHour,
+            altitude_rain: AltitudeRainUnit::FeetInch,
+            temperature: TemperatureUnit::Fahrenheit,
+            coordinates: CoordinateFormat::Dmm,
+            grid_square: GridSquareFormat::Maidenhead,
+        };
+        assert_eq!(units.coordinates, CoordinateFormat::Dmm);
+        assert_eq!(units.grid_square, GridSquareFormat::Maidenhead);
     }
 }

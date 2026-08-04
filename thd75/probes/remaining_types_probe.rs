@@ -8,7 +8,7 @@ use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
 fn open_transport() -> (String, EitherTransport) {
     if let Ok(ports) = SerialTransport::discover_usb() {
         if let Some(info) = ports.first() {
-            let t = SerialTransport::open(&info.port_name, SerialTransport::DEFAULT_BAUD)
+            let t = SerialTransport::open(&info.port_name)
                 .expect("USB open failed");
             return (info.port_name.clone(), EitherTransport::Serial(t));
         }
@@ -35,7 +35,9 @@ async fn send_and_read(
         loop {
             match transport.read(buf).await {
                 Ok(n) if n > 0 => {
-                    codec.feed(&buf[..n]);
+                    if let Err(error) = codec.feed(&buf[..n]) {
+                        return format!("CAT FRAMING ERROR: {error}");
+                    }
                     if let Some(frame) = codec.next_frame() {
                         return String::from_utf8_lossy(&frame).to_string();
                     }
@@ -70,38 +72,71 @@ fn main() {
 
         // === SH (Filter Width) ===
         println!("=== SH (Filter Width) ===");
-        println!("SH bare: {}", send_and_read(&mut transport, &mut codec, "SH", &mut buf).await);
+        println!(
+            "SH bare: {}",
+            send_and_read(&mut transport, &mut codec, "SH", &mut buf).await
+        );
         for mode in 0..=2 {
-            println!("SH {mode}: {}", send_and_read(&mut transport, &mut codec, &format!("SH {mode}"), &mut buf).await);
+            println!(
+                "SH {mode}: {}",
+                send_and_read(&mut transport, &mut codec, &format!("SH {mode}"), &mut buf).await
+            );
         }
         // Try write format
-        println!("SH 0,0: {}", send_and_read(&mut transport, &mut codec, "SH 0,0", &mut buf).await);
+        println!(
+            "SH 0,0: {}",
+            send_and_read(&mut transport, &mut codec, "SH 0,0", &mut buf).await
+        );
 
         // === MS (Position Source) ===
         println!("\n=== MS (Position Source) ===");
-        println!("MS bare: {}", send_and_read(&mut transport, &mut codec, "MS", &mut buf).await);
+        println!(
+            "MS bare: {}",
+            send_and_read(&mut transport, &mut codec, "MS", &mut buf).await
+        );
 
         // === SF (Scan Range) ===
         println!("\n=== SF (Scan Range) ===");
-        println!("SF 0: {}", send_and_read(&mut transport, &mut codec, "SF 0", &mut buf).await);
-        println!("SF 1: {}", send_and_read(&mut transport, &mut codec, "SF 1", &mut buf).await);
-        println!("SF bare: {}", send_and_read(&mut transport, &mut codec, "SF", &mut buf).await);
+        println!(
+            "SF 0: {}",
+            send_and_read(&mut transport, &mut codec, "SF 0", &mut buf).await
+        );
+        println!(
+            "SF 1: {}",
+            send_and_read(&mut transport, &mut codec, "SF 1", &mut buf).await
+        );
+        println!(
+            "SF bare: {}",
+            send_and_read(&mut transport, &mut codec, "SF", &mut buf).await
+        );
 
         // === BL (Battery Level) ===
         println!("\n=== BL (Battery Level) ===");
-        println!("BL bare: {}", send_and_read(&mut transport, &mut codec, "BL", &mut buf).await);
+        println!(
+            "BL bare: {}",
+            send_and_read(&mut transport, &mut codec, "BL", &mut buf).await
+        );
 
         // === IO (verify) ===
         println!("\n=== IO (verify) ===");
-        println!("IO bare: {}", send_and_read(&mut transport, &mut codec, "IO", &mut buf).await);
+        println!(
+            "IO bare: {}",
+            send_and_read(&mut transport, &mut codec, "IO", &mut buf).await
+        );
 
         // === US (User Settings) ===
         println!("\n=== US (User Settings) ===");
-        println!("US bare: {}", send_and_read(&mut transport, &mut codec, "US", &mut buf).await);
+        println!(
+            "US bare: {}",
+            send_and_read(&mut transport, &mut codec, "US", &mut buf).await
+        );
 
         // === TY (Radio Type) ===
         println!("\n=== TY (Radio Type) ===");
-        println!("TY bare: {}", send_and_read(&mut transport, &mut codec, "TY", &mut buf).await);
+        println!(
+            "TY bare: {}",
+            send_and_read(&mut transport, &mut codec, "TY", &mut buf).await
+        );
 
         println!("\n=== Probe complete ===");
     });

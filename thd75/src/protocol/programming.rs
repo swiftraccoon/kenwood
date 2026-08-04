@@ -15,10 +15,9 @@
 //!
 //! Entering programming mode makes the radio stop responding to normal
 //! CAT commands. Always exit programming mode when done.
-//!
-//! The `0M` handler is at firmware address `0xC002F01C`.
 
-use crate::error::ProtocolError;
+use crate::error::{Error, ProtocolError, ValidationError};
+use crate::types::{ChannelDisplayName, StoredChannelFlag};
 
 /// Command to enter MCP programming mode (ASCII).
 ///
@@ -26,7 +25,7 @@ use crate::error::ProtocolError;
 /// command sitting in the radio's CAT line buffer, for example an
 /// MMDVM-detection probe (`E0 03 00`) sent just before, so it cannot
 /// be prepended to `0M PROGRAM` and corrupt the handshake. This mirrors
-/// the `\r`-prefixed preamble `Radio::connect_safe` uses; the radio
+/// the `\r`-prefixed preamble `Radio::connect_with_tnc_exit` uses; the radio
 /// treats the empty leading line as a no-op.
 pub const ENTER_PROGRAMMING: &[u8] = b"\r0M PROGRAM\r";
 
@@ -57,6 +56,157 @@ pub const FACTORY_CAL_PAGES: u16 = 2;
 
 /// Last page that may be safely written (inclusive).
 pub const MAX_WRITABLE_PAGE: u16 = TOTAL_PAGES - FACTORY_CAL_PAGES - 1; // 0x07A0 = 1952
+
+/// A physical page in the TH-D75 MCP memory image.
+///
+/// This type cannot represent an address at or beyond [`TOTAL_PAGES`].
+/// Requiring it at protocol serialization boundaries prevents an invalid raw
+/// page number from reaching the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct McpPage(u16);
+
+impl McpPage {
+    /// First physical MCP page.
+    pub const MIN: u16 = 0;
+
+    /// Last physical MCP page.
+    pub const MAX: u16 = TOTAL_PAGES - 1;
+
+    /// Validate a raw MCP page address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::McpPageOutOfRange`] when `page` lies beyond the
+    /// physical memory image.
+    pub const fn new(page: u16) -> Result<Self, Error> {
+        if page >= TOTAL_PAGES {
+            return Err(Error::McpPageOutOfRange {
+                page,
+                total_pages: TOTAL_PAGES,
+            });
+        }
+        Ok(Self(page))
+    }
+
+    /// Return the validated raw MCP page address.
+    #[must_use]
+    pub const fn as_raw(self) -> u16 {
+        self.0
+    }
+}
+
+impl TryFrom<u16> for McpPage {
+    type Error = Error;
+
+    fn try_from(page: u16) -> Result<Self, Self::Error> {
+        Self::new(page)
+    }
+}
+
+impl From<McpPage> for u16 {
+    fn from(page: McpPage) -> Self {
+        page.as_raw()
+    }
+}
+
+impl std::fmt::UpperHex for McpPage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::UpperHex::fmt(&self.as_raw(), formatter)
+    }
+}
+
+/// A physical MCP page that is safe for ordinary configuration writes.
+///
+/// This type cannot represent either an address beyond the TH-D75 memory
+/// image or either of the two factory-calibration pages. Public write-frame
+/// construction requires this type so protected addresses cannot be
+/// serialized accidentally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WritableMcpPage(McpPage);
+
+impl WritableMcpPage {
+    /// First writable MCP page.
+    pub const MIN: u16 = 0;
+
+    /// Last writable MCP page, immediately before factory calibration.
+    pub const MAX: u16 = MAX_WRITABLE_PAGE;
+
+    /// Validate a raw MCP page address for writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::McpPageOutOfRange`] when `page` lies beyond the
+    /// physical memory image. Returns [`Error::McpWriteProtected`] for
+    /// either factory-calibration page.
+    pub const fn new(page: u16) -> Result<Self, Error> {
+        if page >= TOTAL_PAGES {
+            return Err(Error::McpPageOutOfRange {
+                page,
+                total_pages: TOTAL_PAGES,
+            });
+        }
+        Self::from_page(McpPage(page))
+    }
+
+    /// Validate a physical MCP page for ordinary configuration writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::McpWriteProtected`] for either
+    /// factory-calibration page.
+    pub const fn from_page(page: McpPage) -> Result<Self, Error> {
+        if is_factory_calibration_page(page) {
+            return Err(Error::McpWriteProtected { page });
+        }
+        Ok(Self(page))
+    }
+
+    /// Return the underlying physical MCP page.
+    #[must_use]
+    pub const fn page(self) -> McpPage {
+        self.0
+    }
+
+    /// Return the validated raw MCP page address.
+    #[must_use]
+    pub const fn as_raw(self) -> u16 {
+        self.page().as_raw()
+    }
+}
+
+impl TryFrom<u16> for WritableMcpPage {
+    type Error = Error;
+
+    fn try_from(page: u16) -> Result<Self, Self::Error> {
+        Self::new(page)
+    }
+}
+
+impl TryFrom<McpPage> for WritableMcpPage {
+    type Error = Error;
+
+    fn try_from(page: McpPage) -> Result<Self, Self::Error> {
+        Self::from_page(page)
+    }
+}
+
+impl From<WritableMcpPage> for McpPage {
+    fn from(page: WritableMcpPage) -> Self {
+        page.page()
+    }
+}
+
+impl From<WritableMcpPage> for u16 {
+    fn from(page: WritableMcpPage) -> Self {
+        page.as_raw()
+    }
+}
+
+impl std::fmt::UpperHex for WritableMcpPage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::UpperHex::fmt(&self.as_raw(), formatter)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Memory region page addresses
@@ -92,8 +242,12 @@ pub const APRS_STATUS_PAGE: u16 = 0x0151;
 /// First page of APRS messages and settings.
 pub const APRS_START: u16 = 0x0152;
 
-/// First page of D-STAR repeater list and callsign list.
-pub const DSTAR_RPT_START: u16 = 0x02A1;
+/// First page of the 300-record D-STAR direct-callsign table.
+pub const DSTAR_CALLSIGN_START: u16 = 0x0250;
+/// Last page occupied by the 300-record D-STAR direct-callsign table.
+pub const DSTAR_CALLSIGN_END: u16 = 0x029A;
+/// First page of the 1,500-record D-STAR repeater table.
+pub const DSTAR_RPT_START: u16 = 0x02A0;
 
 /// First page of Bluetooth device data and remaining config.
 pub const BT_START: u16 = 0x04D1;
@@ -121,7 +275,10 @@ pub const NAMES_PER_PAGE: usize = 16;
 /// Maximum number of usable channel names (channels 0-999).
 pub const MAX_CHANNELS: usize = 1000;
 
-/// Total channel entries including extended channels (scan edges, WX, call).
+/// Total channel flag and name slots, including extended channels.
+///
+/// Only [`CHANNEL_DATA_RECORD_COUNT`] of these slots have a 40-byte channel-data
+/// record. The remaining slots belong to the extended flag/name domain.
 pub const TOTAL_CHANNEL_ENTRIES: usize = 1200;
 
 // ---------------------------------------------------------------------------
@@ -137,8 +294,15 @@ pub const CHANNELS_PER_MEMGROUP: usize = 6;
 /// Padding bytes at the end of each memgroup.
 pub const MEMGROUP_PADDING: usize = 16;
 
-/// Number of memgroups (200 memgroups, 192 used for 1152 channels + 8 spare).
+/// Number of memgroups physically present in the channel-data region.
 pub const MEMGROUP_COUNT: usize = 192;
+
+/// Number of 40-byte channel-data records stored by the radio.
+///
+/// This is deliberately distinct from [`TOTAL_CHANNEL_ENTRIES`], because the
+/// flag and name tables contain 48 additional extended slots without matching
+/// records in the channel-data region.
+pub const CHANNEL_DATA_RECORD_COUNT: usize = MEMGROUP_COUNT * CHANNELS_PER_MEMGROUP;
 
 // ---------------------------------------------------------------------------
 // Channel flag constants
@@ -147,14 +311,16 @@ pub const MEMGROUP_COUNT: usize = 192;
 /// Size of one channel flag record in bytes.
 pub const FLAG_RECORD_SIZE: usize = 4;
 
-/// Flag `used` value indicating an empty/unused channel slot.
+/// Byte-zero value indicating an empty/unused channel slot.
 pub const FLAG_EMPTY: u8 = 0xFF;
-/// Flag `used` value indicating a VHF channel (freq < 150 MHz).
+/// Low three-bit band code identifying a VHF channel.
 pub const FLAG_VHF: u8 = 0x00;
-/// Flag `used` value indicating a 220 MHz channel (150-400 MHz).
+/// Low three-bit band code identifying a 220 MHz channel.
 pub const FLAG_220: u8 = 0x01;
-/// Flag `used` value indicating a UHF channel (freq >= 400 MHz).
+/// Low three-bit band code identifying a UHF channel.
 pub const FLAG_UHF: u8 = 0x02;
+/// Low three-bit band code identifying a 50 MHz channel.
+pub const FLAG_50_MHZ: u8 = 0x05;
 
 // ---------------------------------------------------------------------------
 // Wire protocol sizes
@@ -170,8 +336,8 @@ pub const W_HEADER_SIZE: usize = 5;
 ///
 /// Format: `R` + 2-byte big-endian page + `0x00 0x00` (5 bytes total).
 #[must_use]
-pub const fn build_read_command(page: u16) -> [u8; 5] {
-    let addr = page.to_be_bytes();
+pub const fn build_read_command(page: McpPage) -> [u8; 5] {
+    let addr = page.as_raw().to_be_bytes();
     [b'R', addr[0], addr[1], 0x00, 0x00]
 }
 
@@ -179,44 +345,54 @@ pub const fn build_read_command(page: u16) -> [u8; 5] {
 ///
 /// Format: `W` + 2-byte big-endian page + `0x00 0x00` + 256-byte data = 261 bytes.
 ///
+/// A [`WritableMcpPage`] proves that the command cannot target an address
+/// outside the physical image or either factory-calibration page.
+///
 /// The radio responds with a single ACK byte (`0x06`) on success.
 #[must_use]
-pub fn build_write_command(page: u16, data: &[u8; PAGE_SIZE]) -> Vec<u8> {
-    let addr = page.to_be_bytes();
+pub fn build_write_command(page: WritableMcpPage, data: &[u8; PAGE_SIZE]) -> Vec<u8> {
+    let addr = page.as_raw().to_be_bytes();
     let mut cmd = Vec::with_capacity(W_RESPONSE_SIZE);
     cmd.extend_from_slice(&[b'W', addr[0], addr[1], 0x00, 0x00]);
     cmd.extend_from_slice(data);
     cmd
 }
 
-/// Returns `true` if the given page is within the factory calibration region
-/// that must never be overwritten.
+/// Returns `true` if the given physical page is within the factory calibration
+/// region that must never be overwritten.
 #[must_use]
-pub const fn is_factory_calibration_page(page: u16) -> bool {
-    page > MAX_WRITABLE_PAGE
+pub const fn is_factory_calibration_page(page: McpPage) -> bool {
+    page.as_raw() > MAX_WRITABLE_PAGE
 }
 
-/// Parse a write response from the radio.
+/// Parse a page-read response from the radio.
 ///
 /// Format: `W` + 4-byte address + 256-byte data = 261 bytes total.
 /// Bytes 1-2 are the page address (big-endian), bytes 3-4 are the
 /// offset (always zero).
 ///
-/// Returns `(page_address, data_slice)` on success.
+/// Returns the validated physical page and an exact-size reference to its
+/// data on success.
 ///
 /// # Errors
 ///
-/// - [`ProtocolError::WriteResponseTooShort`] if the buffer is shorter
-///   than [`W_RESPONSE_SIZE`].
+/// - [`ProtocolError::WriteResponseSize`] if the buffer is not exactly
+///   [`W_RESPONSE_SIZE`] bytes.
 /// - [`ProtocolError::WriteResponseBadMarker`] if the first byte is not
 ///   `'W'`.
 /// - [`ProtocolError::WriteResponseNonzeroOffset`] if address bytes 3-4
 ///   contain an offset other than zero.
-pub fn parse_write_response(buf: &[u8]) -> Result<(u16, &[u8]), ProtocolError> {
+pub fn parse_page_read_response(buf: &[u8]) -> Result<(McpPage, &[u8; PAGE_SIZE]), ProtocolError> {
     // W response layout: `W` marker + 4-byte address + PAGE_SIZE bytes.
     let actual = buf.len();
+    if actual != W_RESPONSE_SIZE {
+        return Err(ProtocolError::WriteResponseSize {
+            actual,
+            expected: W_RESPONSE_SIZE,
+        });
+    }
     let &[marker, page_hi, page_lo, off_hi, off_lo, ..] = buf else {
-        return Err(ProtocolError::WriteResponseTooShort {
+        return Err(ProtocolError::WriteResponseSize {
             actual,
             expected: W_RESPONSE_SIZE,
         });
@@ -228,86 +404,57 @@ pub fn parse_write_response(buf: &[u8]) -> Result<(u16, &[u8]), ProtocolError> {
     if offset != 0 {
         return Err(ProtocolError::WriteResponseNonzeroOffset { got: offset });
     }
-    let page = u16::from_be_bytes([page_hi, page_lo]);
-    let data = buf
+    let raw_page = u16::from_be_bytes([page_hi, page_lo]);
+    let page = McpPage::new(raw_page).map_err(|error| ProtocolError::FieldParse {
+        command: "MCP W page read".into(),
+        field: "page address".into(),
+        detail: error.to_string(),
+    })?;
+    let data: &[u8; PAGE_SIZE] = buf
         .get(5..5 + PAGE_SIZE)
-        .ok_or(ProtocolError::WriteResponseTooShort {
+        .and_then(|data| data.try_into().ok())
+        .ok_or(ProtocolError::WriteResponseSize {
             actual,
             expected: W_RESPONSE_SIZE,
         })?;
     Ok((page, data))
 }
 
-/// Extract a channel name from a 16-byte entry.
+/// Decode one exact channel display-name entry from the MCP name table.
 ///
-/// Names are null-terminated ASCII/UTF-8 within a fixed 16-byte field.
-/// Returns the name as a trimmed string, stopping at the first null byte.
-#[must_use]
-pub fn extract_name(entry: &[u8]) -> String {
-    let end = entry
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(entry.len())
-        .min(NAME_ENTRY_SIZE);
-    entry
-        .get(..end)
-        .map(String::from_utf8_lossy)
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+/// Full-width 16-byte names do not carry a terminator. Shorter names are
+/// NUL-padded. Invalid bytes and nonzero data after the first NUL are errors.
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] when the entry violates the channel display
+/// name encoding.
+pub fn decode_channel_display_name(
+    entry: [u8; NAME_ENTRY_SIZE],
+) -> Result<ChannelDisplayName, ValidationError> {
+    ChannelDisplayName::try_from_wire(entry)
 }
 
-/// Parse a 4-byte channel flag record.
+/// Parse and validate an exact four-byte channel flag record.
 ///
-/// Format: `[used, lockout_byte, group, 0xFF]`.
+/// The returned value retains all four bytes. Only the fields established by
+/// physical radio images are interpreted: `0xFF` in byte zero means empty,
+/// the low three bits of byte zero encode the band, bit zero of byte one is
+/// scan lockout, and byte two is the memory group. Higher and trailing bits
+/// are intentionally opaque and survive round trips unchanged.
 ///
-/// - `used`: `0xFF` = empty, `0x00` = VHF, `0x01` = 220, `0x02` = UHF
-/// - `lockout_byte` bit 0: `1` = locked out from scan
-/// - `group`: bank/group assignment (0-29)
-#[must_use]
-pub fn parse_channel_flag(bytes: &[u8]) -> Option<ChannelFlag> {
-    let &[used, lockout_byte, group, _pad, ..] = bytes else {
-        return None;
-    };
-    Some(ChannelFlag {
-        used,
-        lockout: lockout_byte & 0x01 != 0,
-        group,
-    })
-}
-
-/// A single channel's flag data (4 bytes per channel at MCP offset 0x2000+).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChannelFlag {
-    /// Band indicator: `0xFF` = empty, `0x00` = VHF, `0x01` = 220 MHz, `0x02` = UHF.
-    pub used: u8,
-    /// `true` if the channel is locked out from scanning.
-    pub lockout: bool,
-    /// Bank/group assignment (0-29, 30 groups).
-    pub group: u8,
-}
-
-impl ChannelFlag {
-    /// Returns `true` if this channel slot is empty/unused.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.used == FLAG_EMPTY
-    }
-
-    /// Serialize this flag back to a 4-byte record.
-    #[must_use]
-    pub const fn to_bytes(&self) -> [u8; FLAG_RECORD_SIZE] {
-        [
-            self.used,
-            if self.lockout { 0x01 } else { 0x00 },
-            self.group,
-            0xFF,
-        ]
-    }
+/// # Errors
+///
+/// Returns [`ValidationError`] when the record width, programmed band code,
+/// or programmed memory group is invalid.
+pub fn parse_channel_flag(bytes: &[u8]) -> Result<StoredChannelFlag, ValidationError> {
+    StoredChannelFlag::try_from(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{MemoryChannelBand, MemoryGroup};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;
@@ -320,28 +467,56 @@ mod tests {
     }
 
     #[test]
-    fn build_read_command_page_256() {
-        let cmd = build_read_command(256);
+    fn build_read_command_page_256() -> TestResult {
+        let cmd = build_read_command(McpPage::new(256)?);
         assert_eq!(cmd, [b'R', 0x01, 0x00, 0x00, 0x00]);
+        Ok(())
     }
 
     #[test]
-    fn build_read_command_page_318() {
+    fn build_read_command_page_318() -> TestResult {
         // Channel 999 is on page 256 + (999/16) = 256 + 62 = 318
-        let cmd = build_read_command(318);
+        let cmd = build_read_command(McpPage::new(318)?);
         assert_eq!(cmd, [b'R', 0x01, 0x3E, 0x00, 0x00]);
+        Ok(())
     }
 
     #[test]
-    fn build_read_command_page_zero() {
-        let cmd = build_read_command(0);
+    fn build_read_command_page_zero() -> TestResult {
+        let cmd = build_read_command(McpPage::new(0)?);
         assert_eq!(cmd, [b'R', 0x00, 0x00, 0x00, 0x00]);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_page_boundaries_are_validated_before_serialization() -> TestResult {
+        let first = McpPage::new(McpPage::MIN)?;
+        let last = McpPage::new(McpPage::MAX)?;
+
+        assert_eq!(build_read_command(first), [b'R', 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(build_read_command(last), [b'R', 0x07, 0xA2, 0x00, 0x00]);
+        assert_eq!(u16::from(last), TOTAL_PAGES - 1);
+
+        for page in [TOTAL_PAGES, u16::MAX] {
+            let result = McpPage::new(page);
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::McpPageOutOfRange {
+                        page: rejected,
+                        total_pages: TOTAL_PAGES,
+                    }) if rejected == page
+                ),
+                "out-of-range page 0x{page:04X} reached serialization: {result:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
     fn build_write_command_format() -> TestResult {
         let data = [0xAA; PAGE_SIZE];
-        let cmd = build_write_command(0x0100, &data);
+        let cmd = build_write_command(WritableMcpPage::new(0x0100)?, &data);
         assert_eq!(cmd.len(), W_RESPONSE_SIZE);
         assert_eq!(byte_at(&cmd, 0)?, b'W');
         assert_eq!(byte_at(&cmd, 1)?, 0x01); // page high byte
@@ -361,50 +536,93 @@ mod tests {
     #[test]
     fn build_write_command_page_zero() -> TestResult {
         let data = [0u8; PAGE_SIZE];
-        let cmd = build_write_command(0, &data);
+        let cmd = build_write_command(WritableMcpPage::new(0)?, &data);
         assert_eq!(byte_at(&cmd, 1)?, 0x00);
         assert_eq!(byte_at(&cmd, 2)?, 0x00);
         Ok(())
     }
 
     #[test]
-    fn factory_calibration_page_detection() {
-        // Pages 0x07A1 and 0x07A2 are factory calibration
-        assert!(!is_factory_calibration_page(0x07A0)); // last writable
-        assert!(is_factory_calibration_page(0x07A1)); // factory cal
-        assert!(is_factory_calibration_page(0x07A2)); // factory cal
-        assert!(!is_factory_calibration_page(0x0000)); // system settings
-        assert!(!is_factory_calibration_page(0x0100)); // channel names
+    fn writable_mcp_page_accepts_complete_safe_range() -> TestResult {
+        let first = WritableMcpPage::new(WritableMcpPage::MIN)?;
+        let last_page = McpPage::new(WritableMcpPage::MAX)?;
+        let last = WritableMcpPage::try_from(last_page)?;
+
+        assert_eq!(first.as_raw(), 0);
+        assert_eq!(last.as_raw(), MAX_WRITABLE_PAGE);
+        assert_eq!(McpPage::from(last), last_page);
+        assert_eq!(u16::from(last), MAX_WRITABLE_PAGE);
+        Ok(())
     }
 
     #[test]
-    fn parse_write_response_valid() -> TestResult {
+    fn writable_mcp_page_rejects_factory_calibration_pages() -> TestResult {
+        for page in (MAX_WRITABLE_PAGE + 1)..TOTAL_PAGES {
+            let physical_page = McpPage::new(page)?;
+            let result = WritableMcpPage::try_from(physical_page);
+            assert!(
+                matches!(result, Err(Error::McpWriteProtected { page: rejected }) if rejected.as_raw() == page),
+                "factory-calibration page 0x{page:04X} was not rejected: {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn writable_mcp_page_rejects_out_of_range_addresses() {
+        for page in [TOTAL_PAGES, u16::MAX] {
+            let result = WritableMcpPage::new(page);
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::McpPageOutOfRange {
+                        page: rejected,
+                        total_pages: TOTAL_PAGES,
+                    }) if rejected == page
+                ),
+                "out-of-range page 0x{page:04X} was not rejected: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn factory_calibration_page_detection() {
+        // Pages 0x07A1 and 0x07A2 are factory calibration
+        assert!(!is_factory_calibration_page(McpPage(0x07A0))); // last writable
+        assert!(is_factory_calibration_page(McpPage(0x07A1))); // factory cal
+        assert!(is_factory_calibration_page(McpPage(0x07A2))); // factory cal
+        assert!(!is_factory_calibration_page(McpPage(0x0000))); // system settings
+        assert!(!is_factory_calibration_page(McpPage(0x0100))); // channel names
+    }
+
+    #[test]
+    fn parse_page_read_response_valid() -> TestResult {
         let mut resp = vec![b'W', 0x01, 0x00, 0x00, 0x00]; // W + 4-byte address
         resp.extend_from_slice(&[0x41; 256]); // 256 bytes of 'A'
         assert_eq!(resp.len(), 261);
-        let (addr, data) = parse_write_response(&resp)?;
-        assert_eq!(addr, 256);
+        let (page, data) = parse_page_read_response(&resp)?;
+        assert_eq!(page.as_raw(), 256);
         assert_eq!(data.len(), 256);
         assert!(data.iter().all(|&b| b == 0x41));
         Ok(())
     }
 
     #[test]
-    fn parse_write_response_full_page() -> TestResult {
+    fn parse_page_read_response_full_page() -> TestResult {
         let mut resp = vec![b'W', 0x01, 0x3E, 0x00, 0x00]; // page 318
         resp.extend_from_slice(&[0u8; 256]);
         assert_eq!(resp.len(), 261);
-        let (addr, data) = parse_write_response(&resp)?;
-        assert_eq!(addr, 318);
+        let (page, data) = parse_page_read_response(&resp)?;
+        assert_eq!(page.as_raw(), 318);
         assert_eq!(data.len(), 256);
         Ok(())
     }
 
     #[test]
-    fn parse_write_response_invalid_marker() {
+    fn parse_page_read_response_invalid_marker() {
         let mut resp = vec![b'X', 0x01, 0x00, 0x00, 0x00];
         resp.extend_from_slice(&[0u8; 256]);
-        let result = parse_write_response(&resp);
+        let result = parse_page_read_response(&resp);
         assert!(
             matches!(
                 result,
@@ -415,10 +633,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_write_response_rejects_nonzero_offset() {
+    fn parse_page_read_response_rejects_nonzero_offset() {
         let mut resp = vec![b'W', 0x01, 0x00, 0x01, 0x23];
         resp.extend_from_slice(&[0x41; 256]);
-        let result = parse_write_response(&resp);
+        let result = parse_page_read_response(&resp);
         assert!(
             matches!(
                 result,
@@ -429,62 +647,100 @@ mod tests {
     }
 
     #[test]
-    fn parse_write_response_empty() {
+    fn parse_page_read_response_empty() {
         let resp: Vec<u8> = vec![];
-        let result = parse_write_response(&resp);
+        let result = parse_page_read_response(&resp);
         assert!(
-            matches!(result, Err(ProtocolError::WriteResponseTooShort { .. })),
-            "expected WriteResponseTooShort, got {result:?}"
+            matches!(result, Err(ProtocolError::WriteResponseSize { .. })),
+            "expected WriteResponseSize, got {result:?}"
         );
     }
 
     #[test]
-    fn parse_write_response_too_short() {
+    fn parse_page_read_response_too_short() {
         let resp = vec![b'W', 0x01, 0x00, 0x00, 0x00, 0x41]; // only 6 bytes
-        let result = parse_write_response(&resp);
+        let result = parse_page_read_response(&resp);
         assert!(
-            matches!(result, Err(ProtocolError::WriteResponseTooShort { .. })),
-            "expected WriteResponseTooShort, got {result:?}"
+            matches!(result, Err(ProtocolError::WriteResponseSize { .. })),
+            "expected WriteResponseSize, got {result:?}"
         );
     }
 
     #[test]
-    fn extract_name_null_terminated() -> TestResult {
+    fn parse_page_read_response_rejects_trailing_bytes() {
+        let mut resp = vec![b'W', 0x01, 0x00, 0x00, 0x00];
+        resp.extend(std::iter::repeat_n(0x41, PAGE_SIZE + 1));
+        let result = parse_page_read_response(&resp);
+        assert!(
+            matches!(
+                result,
+                Err(ProtocolError::WriteResponseSize {
+                    actual,
+                    expected: W_RESPONSE_SIZE,
+                }) if actual == W_RESPONSE_SIZE + 1
+            ),
+            "expected exact-size rejection, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_page_read_response_rejects_invalid_page_echoes() {
+        for page in [TOTAL_PAGES, u16::MAX] {
+            let [page_hi, page_lo] = page.to_be_bytes();
+            let mut response = vec![b'W', page_hi, page_lo, 0x00, 0x00];
+            response.extend_from_slice(&[0u8; PAGE_SIZE]);
+
+            let result = parse_page_read_response(&response);
+            assert!(
+                matches!(result, Err(ProtocolError::FieldParse { .. })),
+                "invalid echoed page 0x{page:04X} was accepted: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_channel_display_name_null_terminated() -> TestResult {
         let mut entry = [0u8; 16];
         entry
             .get_mut(..4)
             .ok_or("entry[..4] missing")?
             .copy_from_slice(b"RPT1");
-        assert_eq!(extract_name(&entry), "RPT1");
+        assert_eq!(decode_channel_display_name(entry)?.as_str(), "RPT1");
         Ok(())
     }
 
     #[test]
-    fn extract_name_full_length() {
+    fn decode_channel_display_name_short_value() -> TestResult {
         let entry = *b"ForestCityPD\x00\x00\x00\x00";
-        assert_eq!(extract_name(&entry), "ForestCityPD");
+        assert_eq!(decode_channel_display_name(entry)?.as_str(), "ForestCityPD");
+        Ok(())
     }
 
     #[test]
-    fn extract_name_empty() {
+    fn decode_channel_display_name_empty() -> TestResult {
         let entry = [0u8; 16];
-        assert_eq!(extract_name(&entry), "");
+        assert!(decode_channel_display_name(entry)?.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn extract_name_max_16_chars() {
-        let entry = *b"1234567890ABCDEF";
-        assert_eq!(extract_name(&entry), "1234567890ABCDEF");
+    fn decode_channel_display_name_accepts_physical_full_width_value() -> TestResult {
+        let entry = *b"WX  1 Greenville";
+        assert_eq!(
+            decode_channel_display_name(entry)?.as_str(),
+            "WX  1 Greenville"
+        );
+        Ok(())
     }
 
     #[test]
-    fn extract_name_trims_whitespace() -> TestResult {
+    fn decode_channel_display_name_preserves_whitespace() -> TestResult {
         let mut entry = [0u8; 16];
         entry
             .get_mut(..6)
             .ok_or("entry[..6] missing")?
             .copy_from_slice(b"RPT1  ");
-        assert_eq!(extract_name(&entry), "RPT1");
+        assert_eq!(decode_channel_display_name(entry)?.as_str(), "RPT1  ");
         Ok(())
     }
 
@@ -549,6 +805,8 @@ mod tests {
         )]
         {
             assert!(MAX_WRITABLE_PAGE < TOTAL_PAGES);
+            assert_eq!(CHANNEL_DATA_RECORD_COUNT, 1_152);
+            assert_eq!(TOTAL_CHANNEL_ENTRIES - CHANNEL_DATA_RECORD_COUNT, 48);
         }
         assert_eq!(FACTORY_CAL_PAGES, 2);
     }
@@ -573,8 +831,10 @@ mod tests {
             assert!(CHANNEL_DATA_END < CHANNEL_NAMES_START);
             // Names end before APRS starts
             assert!(CHANNEL_NAMES_END < APRS_START);
-            // APRS region before D-STAR
-            assert!(APRS_START < DSTAR_RPT_START);
+            // APRS region before the D-STAR callsign table
+            assert!(APRS_START < DSTAR_CALLSIGN_START);
+            // The callsign allocation ends before the repeater table
+            assert!(DSTAR_CALLSIGN_END < DSTAR_RPT_START);
             // D-STAR before Bluetooth
             assert!(DSTAR_RPT_START < BT_START);
         }
@@ -583,41 +843,42 @@ mod tests {
     #[test]
     fn channel_flag_parse_vhf() -> TestResult {
         let bytes = [FLAG_VHF, 0x00, 0x05, 0xFF];
-        let flag = parse_channel_flag(&bytes).ok_or("parse_channel_flag returned None")?;
+        let flag = parse_channel_flag(&bytes)?;
         assert!(!flag.is_empty());
-        assert!(!flag.lockout);
-        assert_eq!(flag.group, 5);
-        assert_eq!(flag.used, FLAG_VHF);
+        assert_eq!(flag.scan_lockout(), Some(false));
+        assert_eq!(flag.group(), Some(MemoryGroup::new(5)?));
+        assert_eq!(flag.band(), Some(MemoryChannelBand::Vhf));
         Ok(())
     }
 
     #[test]
     fn channel_flag_parse_empty() -> TestResult {
         let bytes = [FLAG_EMPTY, 0x00, 0x00, 0xFF];
-        let flag = parse_channel_flag(&bytes).ok_or("parse_channel_flag returned None")?;
+        let flag = parse_channel_flag(&bytes)?;
         assert!(flag.is_empty());
+        assert_eq!(flag.band(), None);
+        assert_eq!(flag.group(), None);
+        assert_eq!(flag.scan_lockout(), None);
         Ok(())
     }
 
     #[test]
     fn channel_flag_parse_locked_out() -> TestResult {
         let bytes = [FLAG_UHF, 0x01, 0x0A, 0xFF];
-        let flag = parse_channel_flag(&bytes).ok_or("parse_channel_flag returned None")?;
+        let flag = parse_channel_flag(&bytes)?;
         assert!(!flag.is_empty());
-        assert!(flag.lockout);
-        assert_eq!(flag.group, 10);
+        assert_eq!(flag.scan_lockout(), Some(true));
+        assert_eq!(flag.group(), Some(MemoryGroup::new(10)?));
+        assert_eq!(flag.band(), Some(MemoryChannelBand::Uhf));
         Ok(())
     }
 
     #[test]
     fn channel_flag_round_trip() -> TestResult {
-        let flag = ChannelFlag {
-            used: FLAG_220,
-            lockout: true,
-            group: 15,
-        };
-        let bytes = flag.to_bytes();
-        let parsed = parse_channel_flag(&bytes).ok_or("parse_channel_flag returned None")?;
+        let flag =
+            StoredChannelFlag::programmed(MemoryChannelBand::Band220, MemoryGroup::new(15)?, true);
+        let bytes = flag.to_wire_bytes();
+        let parsed = parse_channel_flag(&bytes)?;
         assert_eq!(parsed, flag);
         Ok(())
     }
@@ -625,6 +886,20 @@ mod tests {
     #[test]
     fn channel_flag_too_short() {
         let bytes = [0xFF, 0x00, 0x00]; // only 3 bytes
-        assert!(parse_channel_flag(&bytes).is_none());
+        assert!(matches!(
+            parse_channel_flag(&bytes),
+            Err(ValidationError::StoredChannelFlagLength { actual: 3 })
+        ));
+    }
+
+    #[test]
+    fn channel_flag_preserves_verified_opaque_bits() -> TestResult {
+        let bytes = [0x08, 0xA0, 0x00, 0x00];
+        let flag = parse_channel_flag(&bytes)?;
+        assert_eq!(flag.band(), Some(MemoryChannelBand::Vhf));
+        assert_eq!(flag.scan_lockout(), Some(false));
+        assert_eq!(flag.group(), Some(MemoryGroup::new(0)?));
+        assert_eq!(flag.to_wire_bytes(), bytes);
+        Ok(())
     }
 }

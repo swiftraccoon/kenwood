@@ -9,8 +9,14 @@
 //! replaced with well-known testing callsigns (`N0CALL`, `W1AW`) and
 //! positions with synthetic values.
 
-use aprs::{AprsData, MessageKind, MiceMessage, parse_aprs_data, parse_aprs_data_full};
-use ax25_codec::{Ax25Packet, CommandResponse, RouteEntry, build_ax25, parse_ax25};
+use aprs::{
+    AprsData, BarometricPressure, Fahrenheit, Humidity, MessageKind, MiceMessage,
+    ThreeDigitWeatherValue, WindDirection, parse_aprs_data, parse_aprs_data_full,
+};
+use ax25_codec::{
+    Ax25Address, Ax25Error, Ax25Packet, Ax25Pid, CommandResponse, DigipeaterPath, RouteEntry,
+    build_ax25, parse_ax25,
+};
 use kenwood_thd75::aprs::ax25_to_kiss_wire;
 use kiss_tnc::{KissFrame, decode_kiss_frame, encode_kiss_frame};
 
@@ -19,6 +25,7 @@ use kiss_tnc::{KissFrame, decode_kiss_frame, encode_kiss_frame};
 // weakening the lint.
 use aprs_is as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use mmdvm as _;
 use mmdvm_core as _;
 use proptest as _;
@@ -33,27 +40,29 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 /// Build a KISS-wrapped AX.25 UI frame from (src, dst, path, info)
 /// components. Used by the tests below to simulate what a radio's KISS
 /// TNC emits.
-fn make_wire_frame(src: &str, dst: &str, digis: &[&str], info: &[u8]) -> Vec<u8> {
-    use ax25_codec::Ax25Address;
-    let source =
-        Ax25Address::new(src, 0).unwrap_or_else(|_| unreachable!("test fixture src is valid"));
-    let destination =
-        Ax25Address::new(dst, 0).unwrap_or_else(|_| unreachable!("test fixture dst is valid"));
-    let digipeaters: Vec<RouteEntry> = digis
+fn make_wire_frame(
+    src: &str,
+    dst: &str,
+    digis: &[&str],
+    info: &[u8],
+) -> Result<Vec<u8>, Ax25Error> {
+    let source = Ax25Address::new(src, 0)?;
+    let destination = Ax25Address::new(dst, 0)?;
+    let entries: Vec<RouteEntry> = digis
         .iter()
-        .filter_map(|d| RouteEntry::new(d, 0).ok())
-        .collect();
-    let packet = Ax25Packet {
+        .map(|d| RouteEntry::new(d, 0))
+        .collect::<Result<_, _>>()?;
+    let packet = Ax25Packet::unnumbered_information(
         source,
         destination,
-        digipeaters,
-        command_or_response: Some(CommandResponse::Command),
-        control: 0x03,
-        protocol: 0xF0,
-        info: info.to_vec(),
-    };
+        DigipeaterPath::new(entries)?,
+        CommandResponse::Command,
+        false,
+        Ax25Pid::NoLayer3,
+        info.to_vec(),
+    );
     let ax25 = build_ax25(&packet);
-    encode_kiss_frame(&KissFrame::data(ax25))
+    Ok(encode_kiss_frame(&KissFrame::data(ax25)))
 }
 
 #[test]
@@ -65,11 +74,11 @@ fn real_capture_uncompressed_position() -> TestResult {
         "APK005",
         &["WIDE1", "WIDE2"],
         b"!3515.00N/09745.00W>088/015/A=001234Test beacon",
-    );
+    )?;
     let kiss = decode_kiss_frame(&wire)?;
     let packet = parse_ax25(&kiss.data)?;
     assert_eq!(packet.source.callsign, "N0CALL");
-    let data = parse_aprs_data(&packet.info)?;
+    let data = parse_aprs_data(packet.information())?;
     let AprsData::Position(pos) = data else {
         return Err(format!("expected Position, got {data:?}").into());
     };
@@ -91,26 +100,31 @@ fn real_capture_mice_emergency() -> TestResult {
     // Use "354UPP" where U=N indicator, P=+100 offset, P=W.
     //
     // Actually the simplest: construct via the builder and verify parse.
-    use aprs::build_aprs_mice_with_message_packet;
+    use aprs::{
+        AprsSymbol, Course, Latitude, Longitude, MiceSpeed, MiceStatusText,
+        build_aprs_mice_with_message_packet,
+    };
     use ax25_codec::Ax25Address;
     let source =
         Ax25Address::new("N0CALL", 7).unwrap_or_else(|_| unreachable!("N0CALL-7 is valid"));
     let packet = build_aprs_mice_with_message_packet(
         &source,
-        35.25,
-        -97.75,
-        30,
-        180,
+        Latitude::new(35.25)?,
+        Longitude::new(-97.75)?,
+        MiceSpeed::new(30)?,
+        Course::new(180)?,
         MiceMessage::Emergency,
-        '/',
-        'E',
-        "emergency test",
-        &[],
+        AprsSymbol::from_chars('/', 'E')?,
+        &MiceStatusText::new("emergency test")?,
+        &DigipeaterPath::empty(),
     );
     let wire = ax25_to_kiss_wire(&packet);
     let kiss = decode_kiss_frame(&wire)?;
     let parsed_packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data_full(&parsed_packet.info, &parsed_packet.destination.callsign)?;
+    let data = parse_aprs_data_full(
+        parsed_packet.information(),
+        &parsed_packet.destination.callsign,
+    )?;
     let AprsData::Position(pos) = data else {
         return Err(format!("expected Position, got {data:?}").into());
     };
@@ -130,21 +144,24 @@ fn real_capture_weather_station() -> TestResult {
         "APK005",
         &[],
         b"!3515.00N/09745.00W_090/010g020t072r001p005P010h55b10135",
-    );
+    )?;
     let kiss = decode_kiss_frame(&wire)?;
     let packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(&packet.info)?;
+    let data = parse_aprs_data(packet.information())?;
     let AprsData::Position(pos) = data else {
         return Err(format!("expected Position, got {data:?}").into());
     };
     assert_eq!(pos.symbol_code, '_');
     let wx = pos.weather.ok_or("expected embedded weather")?;
-    assert_eq!(wx.wind_direction, Some(90));
-    assert_eq!(wx.wind_speed, Some(10));
-    assert_eq!(wx.wind_gust, Some(20));
-    assert_eq!(wx.temperature, Some(72));
-    assert_eq!(wx.humidity, Some(55));
-    assert_eq!(wx.pressure, Some(10135));
+    assert_eq!(wx.wind_direction().map(WindDirection::degrees), Some(90));
+    assert_eq!(wx.wind_speed().map(ThreeDigitWeatherValue::value), Some(10),);
+    assert_eq!(wx.wind_gust().map(ThreeDigitWeatherValue::value), Some(20),);
+    assert_eq!(wx.temperature().map(Fahrenheit::get), Some(72));
+    assert_eq!(wx.humidity().map(Humidity::percent), Some(55));
+    assert_eq!(
+        wx.pressure().map(BarometricPressure::tenths_hpa),
+        Some(10_135),
+    );
     Ok(())
 }
 
@@ -155,10 +172,10 @@ fn real_capture_bulletin_message() -> TestResult {
         "APK005",
         &[],
         b":BLN1     :Net tonight at 8 PM on 146.52",
-    );
+    )?;
     let kiss = decode_kiss_frame(&wire)?;
     let packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(&packet.info)?;
+    let data = parse_aprs_data(packet.information())?;
     let AprsData::Message(msg) = data else {
         return Err(format!("expected Message, got {data:?}").into());
     };
@@ -174,16 +191,16 @@ fn real_capture_object_with_timestamp() -> TestResult {
         "APK005",
         &[],
         b";EVENT    *092345z3515.00N/09745.00W>Run marathon",
-    );
+    )?;
     let kiss = decode_kiss_frame(&wire)?;
     let packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(&packet.info)?;
+    let data = parse_aprs_data(packet.information())?;
     let AprsData::Object(obj) = data else {
         return Err(format!("expected Object, got {data:?}").into());
     };
-    assert_eq!(obj.name, "EVENT");
+    assert_eq!(obj.name.as_str(), "EVENT");
     assert!(obj.live);
-    assert_eq!(obj.timestamp, "092345z");
+    assert_eq!(obj.timestamp.to_wire_string(), "092345z");
     Ok(())
 }
 
@@ -194,15 +211,15 @@ fn real_capture_telemetry() -> TestResult {
         "APK005",
         &[],
         b"T#042,123,456,789,012,345,10101010",
-    );
+    )?;
     let kiss = decode_kiss_frame(&wire)?;
     let packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(&packet.info)?;
+    let data = parse_aprs_data(packet.information())?;
     let AprsData::Telemetry(t) = data else {
         return Err(format!("expected Telemetry, got {data:?}").into());
     };
-    assert_eq!(t.sequence, "042");
-    assert_eq!(*t.analog.first().ok_or("analog[0] missing")?, Some(123));
+    assert_eq!(t.sequence.to_string(), "042");
+    assert_eq!(t.analog.first().ok_or("analog[0] missing")?.value(), 123);
     assert_eq!(t.digital, 0b1010_1010);
     Ok(())
 }
@@ -214,10 +231,10 @@ fn real_capture_third_party() -> TestResult {
         "APK005",
         &[],
         b"}W1AW>APK005,TCPIP,N0CALL*:!4903.50N/07201.75W-From the internet",
-    );
+    )?;
     let kiss = decode_kiss_frame(&wire)?;
     let packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(&packet.info)?;
+    let data = parse_aprs_data(packet.information())?;
     let AprsData::ThirdParty { header, payload } = data else {
         return Err(format!("expected ThirdParty, got {data:?}").into());
     };
@@ -228,10 +245,10 @@ fn real_capture_third_party() -> TestResult {
 
 #[test]
 fn real_capture_grid_square() -> TestResult {
-    let wire = make_wire_frame("N0CALL", "APK005", &[], b"[EM13qc");
+    let wire = make_wire_frame("N0CALL", "APK005", &[], b"[EM13qc")?;
     let kiss = decode_kiss_frame(&wire)?;
     let packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(&packet.info)?;
+    let data = parse_aprs_data(packet.information())?;
     let AprsData::Grid(grid) = data else {
         return Err(format!("expected Grid, got {data:?}").into());
     };

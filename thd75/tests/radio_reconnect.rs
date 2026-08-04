@@ -4,9 +4,11 @@
 //! reopen → identify → restore sequence, and the fail-fast rule:
 //! a command in flight when the link drops stays failed.
 
+use kenwood_thd75::McpPage;
 use kenwood_thd75::error::Error;
 use kenwood_thd75::radio::{FirmwareProfile, LinkState, Radio};
 use kenwood_thd75::transport::{MockTransport, Transport};
+use kenwood_thd75::types::GpsSettings;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -15,6 +17,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -37,7 +40,7 @@ async fn reconnect_reopens_and_reidentifies() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect_reopen(Ok(()));
     expect_identify(&mut mock);
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     radio.reconnect().await?;
     assert_eq!(*radio.link_state().borrow(), LinkState::Up);
     Ok(())
@@ -52,7 +55,7 @@ async fn dropped_link_fails_command_and_reconnect_restores() -> TestResult {
     mock.expect_reopen(Ok(()));
     expect_identify(&mut mock);
 
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     let watch = radio.link_state();
     assert_eq!(*watch.borrow(), LinkState::Up);
 
@@ -70,7 +73,7 @@ async fn dropped_link_fails_command_and_reconnect_restores() -> TestResult {
 async fn write_failure_marks_link_down() -> TestResult {
     // No expectations scripted: the very first write fails.
     let mock = MockTransport::new();
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     let r = radio.get_firmware_version().await;
     assert!(r.is_err(), "expected write failure, got {r:?}");
     assert_eq!(*radio.link_state().borrow(), LinkState::Down);
@@ -86,7 +89,7 @@ async fn reconnect_restores_auto_info_only_if_enabled() -> TestResult {
     // Restored exactly once after identify.
     mock.expect(b"AI 1\r", b"AI 1\r");
 
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     radio.set_auto_info(true).await?;
     radio.reconnect().await?;
     Ok(())
@@ -97,7 +100,7 @@ async fn reconnect_without_session_state_sends_only_identify() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect_reopen(Ok(()));
     expect_identify(&mut mock);
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     radio.reconnect().await?;
     // The strict mock would have rejected any extra command (AI/GP/GS),
     // so reaching this point proves nothing else was sent.
@@ -105,43 +108,46 @@ async fn reconnect_without_session_state_sends_only_identify() -> TestResult {
 }
 
 #[tokio::test]
-async fn reconnect_preserves_azimuth_firmware_profile() -> TestResult {
+async fn reconnect_invalidates_and_requalifies_azimuth_firmware_profile() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"FV\r", b"FV 1.03.AZM\r");
     mock.expect_reopen(Ok(()));
     expect_identify(&mut mock);
+    mock.expect(b"FV\r", b"FV 1.03.AZM\r");
 
-    let mut radio = Radio::connect(mock).await?;
-    assert_eq!(radio.get_firmware_version().await?, "1.03.AZM");
+    let mut radio = Radio::new(mock);
+    assert_eq!(radio.get_firmware_version().await?.as_str(), "1.03.AZM");
     radio.reconnect().await?;
-    assert_eq!(
-        radio.firmware_profile(),
-        Some(FirmwareProfile::AzimuthAutomation)
-    );
-    let gateway = radio.get_gateway().await;
+    assert_eq!(radio.cached_firmware_profile(), None);
+
+    let gateway = radio.read_gateway().await;
     assert!(
         matches!(
             gateway,
             Err(Error::CommandUnavailableOnFirmware {
                 command: "GW",
                 ref firmware,
-            }) if firmware == "1.03.AZM"
+            }) if firmware.as_str() == "1.03.AZM"
         ),
-        "cached AZM profile should reject GW after reconnect, got {gateway:?}"
+        "fresh AZM qualification should reject GW, got {gateway:?}"
+    );
+    assert_eq!(
+        radio.cached_firmware_profile(),
+        Some(FirmwareProfile::AzimuthAutomation)
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn reconnect_restores_gps_config() -> TestResult {
+async fn reconnect_restores_gps_settings() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"GP 1,1\r", b"GP 1,1\r");
     mock.expect_reopen(Ok(()));
     expect_identify(&mut mock);
     mock.expect(b"GP 1,1\r", b"GP 1,1\r");
 
-    let mut radio = Radio::connect(mock).await?;
-    radio.set_gps_config(true, true).await?;
+    let mut radio = Radio::new(mock);
+    radio.set_gps_settings(GpsSettings::new(true, true)).await?;
     radio.reconnect().await?;
     Ok(())
 }
@@ -153,7 +159,7 @@ async fn failed_reopen_leaves_link_down() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect_eof(b"FV\r");
     mock.expect_reopen(Err(TransportError::NotFound));
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     let cmd = radio.get_firmware_version().await;
     assert!(cmd.is_err(), "expected transport failure, got {cmd:?}");
     let r = radio.reconnect().await;
@@ -195,7 +201,7 @@ impl Transport for WedgedWriteTransport {
 async fn wedged_write_times_out_and_marks_link_down() -> TestResult {
     use kenwood_thd75::error::Error;
 
-    let mut radio = Radio::connect(WedgedWriteTransport).await?;
+    let mut radio = Radio::new(WedgedWriteTransport);
     let r = radio.get_firmware_version().await;
     assert!(
         matches!(r, Err(Error::Timeout(_))),
@@ -227,7 +233,7 @@ async fn mcp_exit_reconnects_and_cat_works() -> TestResult {
     let mut mock = MockTransport::new();
     // Enter programming mode, read one page, ACK, exit.
     mock.expect(b"\r0M PROGRAM\r", b"0M\r");
-    let cmd = programming::build_read_command(page);
+    let cmd = programming::build_read_command(McpPage::new(page)?);
     mock.expect(&cmd, &build_w_response(page, &[0x5Au8; 256])?);
     mock.expect(&[programming::ACK], &[programming::ACK]);
     mock.expect(b"E", &[programming::ACK]);
@@ -237,11 +243,11 @@ async fn mcp_exit_reconnects_and_cat_works() -> TestResult {
     // ...and CAT answers immediately afterwards.
     mock.expect(b"FV\r", b"FV 1.03.000\r");
 
-    let mut radio = Radio::connect(mock).await?;
-    let data = radio.read_page(page).await?;
+    let mut radio = Radio::new(mock);
+    let data = radio.read_page(McpPage::new(page)?).await?;
     assert_eq!(*data.first().ok_or("data[0] missing")?, 0x5A);
     assert_eq!(*radio.link_state().borrow(), LinkState::Up);
     let fw = radio.get_firmware_version().await?;
-    assert!(fw.contains("1.03"), "unexpected firmware string: {fw}");
+    assert_eq!(fw.as_str(), "1.03.000", "unexpected firmware: {fw}");
     Ok(())
 }

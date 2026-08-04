@@ -5,38 +5,23 @@ use kenwood_thd75::protocol::programming;
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::SerialTransport;
 
-async fn connect() -> Radio<SerialTransport> {
+fn connect() -> Radio<SerialTransport> {
     let ports = SerialTransport::discover_usb().unwrap();
-    Radio::connect(
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap(),
-    )
-    .await
-    .unwrap()
-}
-
-async fn reconnect() -> Radio<SerialTransport> {
-    // USB needs time to re-enumerate after MCP exit
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    connect().await
+    Radio::new(SerialTransport::open(&ports[0].port_name).unwrap())
 }
 
 #[tokio::test]
 #[ignore]
 async fn set_channel_2_name() {
-    // Step 1: Read name page, modify, write back in ONE MCP session
-    let mut radio = connect().await;
+    let mut radio = connect();
     println!("\n=== Setting channel 002 name to RutherfordtonPD ===");
 
-    // Use read_page + write_page which each do their own MCP session.
-    // We need to do read + modify + write in one session.
-    // The current API enters/exits per call. We need to read the page
-    // first, then reconnect and write it.
-
-    // Read the name page
-    let page_data = radio
-        .read_memory_pages(programming::CHANNEL_NAMES_START, 1)
-        .await
-        .unwrap();
+    let page = programming::McpPage::new(programming::CHANNEL_NAMES_START)
+        .expect("channel-name page is inside the MCP image");
+    let writable_page =
+        programming::WritableMcpPage::from_page(page).expect("channel-name page is writable");
+    let mut session = radio.enter_mcp().await.unwrap();
+    let mut page_data = session.read_page(page).await.unwrap();
 
     println!("  Read name page, ch002 before:");
     let old_name_bytes = &page_data[32..48]; // channel 2 at offset 2*16
@@ -47,27 +32,14 @@ async fn set_channel_2_name() {
     );
 
     // Modify channel 2's name
-    let mut page = [0u8; 256];
-    page.copy_from_slice(&page_data[..256]);
     let name_bytes = b"RutherfordtonPD\0";
-    page[32..48].copy_from_slice(name_bytes);
+    page_data[32..48].copy_from_slice(name_bytes);
 
-    // Reconnect (USB drops after MCP exit)
-    drop(radio);
-    let mut radio2 = reconnect().await;
-
-    // Write the modified page
-    radio2
-        .write_memory_pages(programming::CHANNEL_NAMES_START, &page)
-        .await
-        .unwrap();
+    session.write_page(writable_page, &page_data).await.unwrap();
+    session.exit().await.unwrap();
     println!("  Name page written");
 
-    // Reconnect again to verify
-    drop(radio2);
-    let mut radio3 = reconnect().await;
-
-    let names = radio3.read_channel_names().await.unwrap();
+    let names = radio.read_channel_names().await.unwrap();
     let ch2_name = names.get(2).map(|s| s.as_str()).unwrap_or("");
     println!("  After: ch002 = {ch2_name:?}");
     assert_eq!(ch2_name, "RutherfordtonPD");

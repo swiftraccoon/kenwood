@@ -6,6 +6,7 @@
 use crate::error::ProtocolError;
 
 use super::Response;
+use super::fields::boolean;
 
 /// Parse a Bluetooth command response from mnemonic and payload.
 ///
@@ -22,13 +23,5 @@ pub(crate) fn parse_bluetooth(
 
 /// Parse BT (Bluetooth): "0" or "1".
 fn parse_bt(payload: &str) -> Result<Response, ProtocolError> {
-    match payload {
-        "0" => Ok(Response::Bluetooth { enabled: false }),
-        "1" => Ok(Response::Bluetooth { enabled: true }),
-        _ => Err(ProtocolError::FieldParse {
-            command: "BT".to_owned(),
-            field: "enabled".to_owned(),
-            detail: format!("expected 0 or 1, got {payload:?}"),
-        }),
-    }
+    boolean(payload, "BT", "enabled").map(|enabled| Response::Bluetooth { enabled })
 }

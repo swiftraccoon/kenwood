@@ -9,7 +9,7 @@
 //!
 //! - `EchoLink` memory channels are separate from normal DTMF memory.
 //! - They do NOT store operating frequencies, tones, or power information.
-//! - Each slot stores a callsign/name (up to 8 characters) and a node
+//! - Each slot stores a callsign/name (up to 8 encoded bytes) and a node
 //!   number or DTMF code (up to 8 digits).
 //! - The radio supports `EchoLink` "Connect by Call" (prefix `C`) and
 //!   "Query by Call" (prefix `07`) functions with automatic callsign-to-DTMF
@@ -18,7 +18,8 @@
 //!   automatically converts the callsign to DTMF with `C` prefix and `#` suffix.
 //!
 //! These types model `EchoLink` settings from the TH-D75's menu system.
-//! Derived from the capability gap analysis feature 138.
+
+use crate::error::ValidationError;
 
 // ---------------------------------------------------------------------------
 // EchoLink memory slot
@@ -34,10 +35,10 @@
 pub struct EchoLinkMemory {
     /// Slot index (0-9).
     pub slot: EchoLinkSlot,
-    /// Station name or callsign (up to 8 characters).
+    /// Station name or callsign (up to 8 UTF-8 encoded bytes).
     pub name: EchoLinkName,
-    /// `EchoLink` node number (up to 6 digits).
-    pub node_number: EchoLinkNode,
+    /// Stored node number or DTMF control code (up to 8 digits).
+    pub code: EchoLinkCode,
 }
 
 /// `EchoLink` memory slot index (0-9).
@@ -55,24 +56,24 @@ impl EchoLinkSlot {
     ///
     /// # Errors
     ///
-    /// Returns `None` if the index exceeds 9.
-    #[must_use]
-    pub const fn new(index: u8) -> Option<Self> {
+    /// Returns [`ValidationError::EchoLinkSlotOutOfRange`] if the index
+    /// exceeds 9.
+    pub const fn new(index: u8) -> Result<Self, ValidationError> {
         if index <= Self::MAX {
-            Some(Self(index))
+            Ok(Self(index))
         } else {
-            None
+            Err(ValidationError::EchoLinkSlotOutOfRange { index })
         }
     }
 
     /// Returns the slot index.
     #[must_use]
-    pub const fn index(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self.0
     }
 }
 
-/// `EchoLink` station name (up to 8 characters).
+/// `EchoLink` station name (up to 8 UTF-8 encoded bytes).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct EchoLinkName(String);
 
@@ -84,13 +85,13 @@ impl EchoLinkName {
     ///
     /// # Errors
     ///
-    /// Returns `None` if the text exceeds 8 characters.
-    #[must_use]
-    pub fn new(text: &str) -> Option<Self> {
+    /// Returns [`ValidationError::EchoLinkNameTooLong`] if `text` exceeds
+    /// eight UTF-8 encoded bytes.
+    pub fn new(text: &str) -> Result<Self, ValidationError> {
         if text.len() <= Self::MAX_LEN {
-            Some(Self(text.to_owned()))
+            Ok(Self(text.to_owned()))
         } else {
-            None
+            Err(ValidationError::EchoLinkNameTooLong { len: text.len() })
         }
     }
 
@@ -101,40 +102,45 @@ impl EchoLinkName {
     }
 }
 
-/// `EchoLink` node number (up to 6 digits).
+/// `EchoLink` node number or DTMF control code (up to 8 digits).
 ///
 /// `EchoLink` node numbers are numeric identifiers assigned to each
 /// registered station. They are transmitted via DTMF tones through
 /// a repeater to initiate an `EchoLink` connection.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub struct EchoLinkNode(String);
+pub struct EchoLinkCode(String);
 
-impl EchoLinkNode {
-    /// Maximum length of an `EchoLink` node number.
-    pub const MAX_LEN: usize = 6;
+impl EchoLinkCode {
+    /// Maximum length of a stored `EchoLink` DTMF code.
+    pub const MAX_LEN: usize = 8;
 
-    /// Creates a new `EchoLink` node number.
+    /// Creates a new `EchoLink` DTMF code.
     ///
     /// # Errors
     ///
-    /// Returns `None` if the string exceeds 6 characters or contains
-    /// non-digit characters.
-    #[must_use]
-    pub fn new(number: &str) -> Option<Self> {
-        if number.len() <= Self::MAX_LEN && number.chars().all(|c| c.is_ascii_digit()) {
-            Some(Self(number.to_owned()))
-        } else {
-            None
+    /// Returns [`ValidationError::EchoLinkCodeTooLong`] if the string exceeds
+    /// eight encoded bytes, or [`ValidationError::InvalidEchoLinkCodeDigit`]
+    /// at the first character outside `0`-`9`, `A`-`D`, `*`, and `#`.
+    pub fn new(code: &str) -> Result<Self, ValidationError> {
+        if code.len() > Self::MAX_LEN {
+            return Err(ValidationError::EchoLinkCodeTooLong { len: code.len() });
         }
+        if let Some((offset, value)) = code
+            .char_indices()
+            .find(|(_, c)| !super::dtmf::is_valid_dtmf(*c))
+        {
+            return Err(ValidationError::InvalidEchoLinkCodeDigit { offset, value });
+        }
+        Ok(Self(code.to_owned()))
     }
 
-    /// Returns the node number as a string slice.
+    /// Returns the code as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// Returns `true` if the node number is empty.
+    /// Returns `true` if the code is empty.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -152,75 +158,96 @@ mod tests {
     #[test]
     fn echolink_slot_valid_range() {
         for i in 0u8..=9 {
-            assert!(EchoLinkSlot::new(i).is_some());
+            assert!(EchoLinkSlot::new(i).is_ok());
         }
     }
 
     #[test]
     fn echolink_slot_invalid() {
-        assert!(EchoLinkSlot::new(10).is_none());
+        assert!(matches!(
+            EchoLinkSlot::new(10),
+            Err(ValidationError::EchoLinkSlotOutOfRange { index: 10 })
+        ));
     }
 
     #[test]
     fn echolink_slot_index() -> Result<(), Box<dyn std::error::Error>> {
-        let slot = EchoLinkSlot::new(5).ok_or("valid slot index rejected")?;
-        assert_eq!(slot.index(), 5);
+        let slot = EchoLinkSlot::new(5)?;
+        assert_eq!(slot.as_raw(), 5);
         Ok(())
     }
 
     #[test]
     fn echolink_name_valid() -> Result<(), Box<dyn std::error::Error>> {
-        let name = EchoLinkName::new("W1AW").ok_or("valid echolink name rejected")?;
+        let name = EchoLinkName::new("W1AW")?;
         assert_eq!(name.as_str(), "W1AW");
         Ok(())
     }
 
     #[test]
     fn echolink_name_max_length() -> Result<(), Box<dyn std::error::Error>> {
-        let name = EchoLinkName::new("12345678").ok_or("valid 8-char name rejected")?;
+        let name = EchoLinkName::new("12345678")?;
         assert_eq!(name.as_str().len(), 8);
         Ok(())
     }
 
     #[test]
     fn echolink_name_too_long() {
-        assert!(EchoLinkName::new("123456789").is_none());
+        assert!(matches!(
+            EchoLinkName::new("123456789"),
+            Err(ValidationError::EchoLinkNameTooLong { len: 9 })
+        ));
     }
 
     #[test]
-    fn echolink_node_valid() -> Result<(), Box<dyn std::error::Error>> {
-        let node = EchoLinkNode::new("123456").ok_or("valid 6-digit node rejected")?;
-        assert_eq!(node.as_str(), "123456");
-        assert!(!node.is_empty());
+    fn echolink_code_valid() -> Result<(), Box<dyn std::error::Error>> {
+        let code = EchoLinkCode::new("12A*34#D")?;
+        assert_eq!(code.as_str(), "12A*34#D");
+        assert!(!code.is_empty());
         Ok(())
     }
 
     #[test]
-    fn echolink_node_short() -> Result<(), Box<dyn std::error::Error>> {
-        let node = EchoLinkNode::new("1").ok_or("valid 1-digit node rejected")?;
-        assert_eq!(node.as_str(), "1");
+    fn echolink_code_short() -> Result<(), Box<dyn std::error::Error>> {
+        let code = EchoLinkCode::new("1")?;
+        assert_eq!(code.as_str(), "1");
         Ok(())
     }
 
     #[test]
-    fn echolink_node_empty() -> Result<(), Box<dyn std::error::Error>> {
-        let node = EchoLinkNode::new("").ok_or("empty node rejected")?;
-        assert!(node.is_empty());
+    fn echolink_code_empty() -> Result<(), Box<dyn std::error::Error>> {
+        let code = EchoLinkCode::new("")?;
+        assert!(code.is_empty());
         Ok(())
     }
 
     #[test]
-    fn echolink_node_too_long() {
-        assert!(EchoLinkNode::new("1234567").is_none());
+    fn echolink_code_too_long() {
+        assert!(matches!(
+            EchoLinkCode::new("123456789"),
+            Err(ValidationError::EchoLinkCodeTooLong { len: 9 })
+        ));
     }
 
     #[test]
-    fn echolink_node_non_digit() {
-        assert!(EchoLinkNode::new("12A456").is_none());
+    fn echolink_code_rejects_non_dtmf_letter() {
+        assert!(matches!(
+            EchoLinkCode::new("12E456"),
+            Err(ValidationError::InvalidEchoLinkCodeDigit {
+                offset: 2,
+                value: 'E'
+            })
+        ));
     }
 
     #[test]
-    fn echolink_node_special_chars() {
-        assert!(EchoLinkNode::new("12*456").is_none());
+    fn echolink_code_rejects_space() {
+        assert!(matches!(
+            EchoLinkCode::new("12 456"),
+            Err(ValidationError::InvalidEchoLinkCodeDigit {
+                offset: 2,
+                value: ' '
+            })
+        ));
     }
 }

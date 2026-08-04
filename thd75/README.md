@@ -3,39 +3,68 @@
 [![Rust 1.94+](https://img.shields.io/badge/rust-1.94%2B-blue.svg)](https://www.rust-lang.org)
 [![License: GPL v2+](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](https://github.com/swiftraccoon/kenwood/blob/main/LICENSE)
 
-Async Rust library for typed, hardware-qualified control and inspection of the
-Kenwood TH-D75 ham radio transceiver.
+Async Rust library for typed control and inspection of the Kenwood TH-D75
+amateur-radio transceiver. The public surface includes only operations whose
+behavior has been checked against the radio or an exact, lossless file format.
 
 ## Features
 
-- **Qualified CAT protocol**: Typed parsing and serialization for established
-  TH-D75 contracts, with validated parameter types that reject invalid values
-  at construction time. Service-only `0E` and unresolved `BE`/`US` operations
-  are deliberately excluded from the ordinary typed API. Lossy or unqualified
-  FO/FQ frequency writers and the ME memory-record writer fail before radio
-  I/O; memory recall and qualified UP/DW stepping remain available.
-- **MCP programming**: Binary memory access via `0M PROGRAM` mode. Read all
-  1,152 data-backed channel records (1,000 standard channels plus 152 special
-  channels), along with the full 1,200-slot flag and name tables whose tail
-  also stores group metadata. Read settings and calibration pages; modify user
-  configuration while the final two factory-calibration pages remain
-  write-protected.
-- **Generated MCP-D75 menu schema**: 400 user-configuration fields, with offsets, bit masks, value domains, and English option labels extracted from the official MCP-D75 serializers. The `mcp_menu --read` example takes a sparse, structurally read-only snapshot; batch patches read only the touched pages, preserve shared bits, enter programming mode once, and verify every changed page. Runtime CAT state, channel records, and factory calibration remain separate interfaces.
-- **SD card parsing**: Read `.d75` configs, `.nme` GPS logs, `.tsv` repeater/callsign/QSO lists, `.wav` audio recordings, and `.bmp` screen captures.
-- **Closed-loop V1.03.AZM automation**: Byte-attest the exact custom runtime,
-  inject bounded stock key press/release events, capture stable RGB565 LCD
-  frames over raw or RLE apertures, verify firmware and host CRC-32, and make
-  exact pixel/macOS Vision OCR assertions. Guarded numeric routes authenticate
-  the Menu frame once and synchronously dispatch all three digits in the same
-  handler. A concurrent framebuffer writer can still race the completed
-  comparison.
+- **Typed CAT control**: Read identity, frequency, operating state, menus, and
+  channel records without exposing wire fields to callers. Validated types
+  reject values the radio cannot represent. Memory recall and frequency
+  stepping are available; unresolved or lossy writes are absent from the
+  public API.
+- **MCP programming**: Read the radio's complete programming image, including
+  all standard and special channel slots, names, flags, and user settings.
+  Page framing, acknowledgements, cleanup, reconnect, and read-back
+  verification are handled as one workflow. Factory-calibration pages remain
+  read-only.
+- **Typed menu settings**: Read and update 400 user-facing menu fields by name.
+  Sparse reads fetch only the needed pages. Batch updates preserve unrelated
+  bits, enter programming mode once, and verify every changed page.
+- **SD card parsing**: Read `.d75` configs, `.nme` GPS logs, callsign and QSO
+  tables, `.wav` audio recordings, and `.bmp` screen captures. The repeater
+  importer validates Kenwood's exact 31-column catalog, decodes official
+  UTF-16LE and Shift-JIS downloads, then applies model/region selection before
+  enforcing the radio's 1,500-entry capacity. QSO logs enforce the manual's
+  exact 24-column schema and documented wire spellings while preserving every
+  other field without reinterpretation.
+- **Closed-loop V1.03.AZM automation**: Verify the exact custom firmware before
+  accepting input or screen access. Guarded sessions can press front-panel
+  keys, capture stable screen frames, verify checksums, and make exact pixel or
+  macOS Vision OCR assertions.
 - **APRS integration**: High-level `AprsClient` that owns `Radio<T>` + `KissSession` and threads `now: Instant` into the sans-io stack. Packet-radio protocol code (KISS framing, AX.25 codec, APRS parser/digipeater/SmartBeaconing/messaging/station-list, APRS-IS) lives in the sibling [`kiss-tnc`](https://github.com/swiftraccoon/kenwood/tree/main/kiss-tnc), [`ax25-codec`](https://github.com/swiftraccoon/kenwood/tree/main/ax25-codec), [`aprs`](https://github.com/swiftraccoon/kenwood/tree/main/aprs), [`aprs-is`](https://github.com/swiftraccoon/kenwood/tree/main/aprs-is) crates.
-- **MCP bridge**: Menu 970-aware smart-beacon speed normalization from mph, km/h, or knots into the APRS model in `thd75/src/aprs/mcp_bridge.rs`.
+- **APRS settings bridge**: Convert the radio's `SmartBeaconing` speed settings
+  from the configured display unit into the host-side APRS model.
 - **Transport layer**: USB (CDC ACM) and Bluetooth SPP with auto-detection. On
   macOS, potentially unbounded native `IOBluetooth` calls are isolated in a
   killable helper process; Linux and Windows use serial RFCOMM ports.
-- **Session resilience**: `Radio::reconnect()` re-establishes a dropped USB or Bluetooth link on the same transport identity (surviving USB re-enumeration and MCP programming-mode exits), and an opt-in `RadioSupervisor` retries with capped exponential backoff while broadcasting typed link events. MCP writes verify by read-back before reporting success.
+- **Session resilience**: `Radio::reconnect()` re-establishes a dropped USB or Bluetooth link on the same transport identity (surviving USB re-enumeration and MCP programming-mode exits), and `RadioLinkRecovery` explicitly retries with capped exponential backoff while broadcasting typed link events. MCP writes verify by read-back before reporting success.
 - **Async**: Built on tokio. All radio operations are async.
+
+## API vocabulary
+
+The public API follows these naming rules:
+
+- `get_*` performs one CAT request/response exchange. `cached_*` performs no
+  I/O. `read_*` and `write_*` are multi-exchange or bulk operations that may
+  hold the link for their whole workflow.
+- `enter_*` sends bytes to put the radio into an exclusive mode and returns a
+  session that owns that mode. `into_*` is a local ownership conversion with
+  no I/O.
+- `Settings` means values resident in the radio. `Config` means host-side
+  options or an owned configuration-file model. `Stored*` names values from a
+  radio memory image, while `Cat*` names CAT text records.
+- A `new` constructor returns `Result<_, ValidationError>` whenever its input
+  can be outside the represented domain. Unit-bearing constructors and
+  accessors state the unit, such as `from_khz` and `as_milliseconds`; raw
+  representation access uses `as_raw`.
+- `Default` is reserved for an empty, disabled, or representation-neutral
+  value. A documented radio factory state is named `factory_default`; if that
+  state depends on region, band, or display units, the required context is an
+  argument instead of an implicit global default.
+- Rust identifiers spell the acronym `Dstar`; operator-facing prose uses
+  `D-STAR`.
 
 ## Quick start
 
@@ -50,9 +79,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = ports.first().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "no TH-D75 USB port found")
     })?;
-    let transport = SerialTransport::open(&port.port_name, SerialTransport::DEFAULT_BAUD)?;
+    let transport = SerialTransport::open(&port.port_name)?;
 
-    let mut radio = Radio::connect(transport).await?;
+    let mut radio = Radio::new(transport);
 
     let version = radio.get_firmware_version().await?;
     println!("firmware {version}");
@@ -66,10 +95,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Tests
 
-The KI4LAX comparisons in `tests/spec_audit.rs` require an untracked,
-third-party JSON fixture. They are explicitly ignored by default, so `cargo
-test` reports the skipped coverage instead of counting unexecuted comparisons
-as passes. Fixture-independent checks in that target still run normally.
+Optional comparisons in `tests/spec_audit.rs` require an untracked,
+third-party JSON fixture. They are ignored by default, so `cargo test` reports
+the skipped coverage instead of counting unexecuted comparisons as passes.
+Fixture-independent checks in that target still run normally.
 
 Run only the external-spec comparisons with an explicit fixture:
 
@@ -87,15 +116,15 @@ Runnable examples live in [`examples/`](https://github.com/swiftraccoon/kenwood/
 
 | Example | Description |
 |---------|-------------|
-| `identify` | Print the radio model ID, firmware version, region code, and power status. |
+| `identify` | Print the typed radio model ID, firmware identity, serial number, model code, region, hardware variant, and power status. |
 | `monitor` | Poll S-meter, frequency, mode, and busy state on both bands every 250 ms. |
-| `tune` | Recall a populated memory channel through the qualified mode-switching API. Its frequency form currently returns the fail-closed FO/FQ safety error before I/O. |
+| `tune` | Recall a populated memory channel, switching the selected band into memory mode when needed. |
 | `channel_dump` | Read memory channels 0-999 via CAT, optionally reading display names via MCP. |
 | `config_backup` | Read the entire 500 KB radio memory via MCP and save it to a binary file. |
 | `write_settings` | Temporarily change and restore squelch via CAT, then overwrite channel 0's display name via MCP. |
 | `mcp_menu` | List, read, validate, and batch-write generated MCP-D75 menu fields using sparse page access. Writes are dry-run by default. |
-| `read_validation` | Trace and compare live, read-only FV/TY/FQ/FO/MR/ME/RT responses against their lossless typed results. |
-| `if_tap` | Exercise the IF-output setup/capture/restore sequence. It currently reaches the quarantined direct-frequency step after applying its Band B/single-band preconditions, then runs best-effort restoration instead of completing a capture. |
+| `read_validation` | Trace and compare live, read-only FV/AE/TY/FQ/FO/MR/ME/RT responses against their lossless typed results. |
+| `if_tap` | Capture AF, 12 kHz IF, and detector audio from the current Band B frequency, then restore the original radio settings. The operator must tune Band B first. |
 | `verify_state` | Attest and inspect supported modified-firmware memory-read targets for qualification and offset discovery. |
 | `bluetooth` | Connect over native macOS Bluetooth or a Linux/Windows serial RFCOMM port (pair via Menu 934 first). |
 | `bt_native` | Exercise the native `IOBluetooth` RFCOMM transport (macOS). |

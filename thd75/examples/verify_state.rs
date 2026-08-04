@@ -25,8 +25,7 @@
 //!
 //! `discover` is the workhorse: start it, change one setting on the radio or
 //! from another tool, press Enter, and it names the addresses that moved. That
-//! is how the runtime offset map gets built without reverse engineering each
-//! field.
+//! is how a runtime offset map can be narrowed using direct state correlation.
 //!
 //! `scan` is the same idea aimed at a large window, and it coalesces changed
 //! bytes into contiguous runs. A display redraw shows up as one large run,
@@ -52,6 +51,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -71,9 +71,6 @@ use kenwood_thd75::types::{MemoryReadOffset, MemoryReadTarget, ReadLen};
 use kenwood_thd75::verify::{ByteChange, RuntimeOffsetMap};
 
 type Failure = Box<dyn std::error::Error>;
-
-/// Baud rate for normal CAT over USB.
-const CAT_BAUD: u32 = 115_200;
 
 /// Bytes shown per hexdump line.
 const DUMP_WIDTH: usize = 16;
@@ -172,7 +169,7 @@ const fn total_points(len: u32, stride: u32) -> u32 {
 fn coalesce_samples(changes: &[ByteChange], stride: u32) -> Vec<(u32, u32)> {
     let mut points: Vec<u32> = changes
         .iter()
-        .map(|c| (c.offset.as_u32() / stride) * stride)
+        .map(|c| (c.offset.as_raw() / stride) * stride)
         .collect();
     points.sort_unstable();
     points.dedup();
@@ -192,7 +189,7 @@ fn coalesce_samples(changes: &[ByteChange], stride: u32) -> Vec<(u32, u32)> {
 fn coalesce(changes: &[ByteChange]) -> Vec<(u32, u32)> {
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for change in changes {
-        let addr = change.offset.as_u32();
+        let addr = change.offset.as_raw();
         match runs.last_mut() {
             Some(last) if addr == last.0 + last.1 => last.1 += 1,
             _ => runs.push((addr, 1)),
@@ -277,8 +274,8 @@ async fn run() -> Result<(), Failure> {
     let invocation = parse_invocation(&args)?;
     validate_usb_port(&invocation.port)?;
 
-    let transport = SerialTransport::open(&invocation.port, CAT_BAUD)?;
-    let mut radio = Radio::connect(transport).await?;
+    let transport = SerialTransport::open(&invocation.port)?;
+    let mut radio = Radio::new(transport);
 
     println!(
         "Attesting {} memory-read target ...",
@@ -310,7 +307,7 @@ async fn mode_dump(
     raw_offset: u32,
     len: u32,
 ) -> Result<(), Failure> {
-    let bytes = reader.read_memory_range(offset, len).await?;
+    let bytes = reader.read_bytes_range(offset, len).await?;
     println!("{len} bytes at {offset}:");
     hexdump(raw_offset, &bytes);
     Ok(())
@@ -423,6 +420,17 @@ async fn mode_hunt(
     Ok(())
 }
 
+#[tokio::main]
+async fn main() {
+    // Print the Display form rather than returning Err from main, which would
+    // print the Debug form. The most common failure here is a refusal from
+    // unmodified firmware, and that message is written to be read.
+    if let Err(e) = run().await {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MemoryReadTarget, Operation, parse_invocation};
@@ -470,16 +478,5 @@ mod tests {
                 "invalid invocation reached the hardware phase: {invalid:?}"
             );
         }
-    }
-}
-
-#[tokio::main]
-async fn main() {
-    // Print the Display form rather than returning Err from main, which would
-    // print the Debug form. The most common failure here is a refusal from
-    // unmodified firmware, and that message is written to be read.
-    if let Err(e) = run().await {
-        eprintln!("error: {e}");
-        std::process::exit(1);
     }
 }

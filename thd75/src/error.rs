@@ -1,12 +1,12 @@
 //! Error types for the kenwood-thd75 library.
 //!
-//! This module defines a three-level error hierarchy that mirrors the
-//! library's architecture:
+//! This module defines an error hierarchy that mirrors the library's
+//! architecture:
 //!
 //! 1. **[`enum@Error`]**: the top-level enum returned by all public API
-//!    methods. It wraps the three lower-level categories below, plus
-//!    radio-specific conditions like [`Error::RadioError`] (`?` response),
-//!    [`Error::NotAvailable`] (`N` response), [`Error::Timeout`], and
+//!    methods. It wraps the lower-level categories below, plus
+//!    radio-specific conditions like [`Error::CommandRejected`] (`?` response),
+//!    [`Error::NotAvailableInCurrentMode`] (`N` response), [`Error::Timeout`], and
 //!    MCP memory-related errors.
 //!
 //! 2. **[`TransportError`]**: failures in the serial/Bluetooth I/O
@@ -22,15 +22,21 @@
 //!    terminator). Wrapped by [`Error::Protocol`].
 //!
 //! 4. **[`ValidationError`]**: failures when a caller-supplied value
-//!    is outside the valid range for its type (e.g., band index > 13,
+//!    is outside the valid range for its type (e.g., band index > 1,
 //!    tone code > 49, power level > 3). These are raised **before** any
 //!    I/O occurs, during construction of typed wrappers. Wrapped by
 //!    [`Error::Validation`].
 //!
-//! All three lower-level error types implement `From` conversion into
+//! 5. **[`kiss_tnc::KissError`]**: failures while decoding the binary KISS
+//!    stream. Malformed and oversized frames retain their precise decoder
+//!    error and are wrapped by [`Error::Kiss`].
+//!
+//! Wrapped lower-level error types implement `From` conversion into
 //! [`enum@Error`], so the `?` operator propagates them naturally.
 
 use std::time::Duration;
+
+use crate::protocol::programming::{McpPage, WritableMcpPage};
 
 use thiserror::Error;
 
@@ -50,17 +56,60 @@ pub enum Error {
     #[error(transparent)]
     Validation(#[from] ValidationError),
 
+    /// A received KISS frame was malformed or exceeded the framing limit.
+    #[error(transparent)]
+    Kiss(#[from] kiss_tnc::KissError),
+
+    /// An APRS-IS packet line was malformed or used noncanonical AX.25
+    /// identities.
+    #[error(transparent)]
+    AprsIsLine(#[from] aprs_is::AprsIsLineError),
+
+    /// An APRS information field was malformed for its declared data type.
+    #[error(transparent)]
+    AprsPacket(#[from] aprs::AprsError),
+
+    /// Wrapping an APRS-IS packet as a third-party RF packet would exceed the
+    /// AX.25 information-field limit.
+    #[error(
+        "APRS-IS third-party packet is too large for RF: {actual} information bytes (max {maximum})"
+    )]
+    AprsThirdPartyInformationTooLong {
+        /// Length after adding the third-party `TCPIP,IGATE*` wrapper.
+        actual: usize,
+        /// AX.25 information-field maximum (`256`).
+        maximum: usize,
+    },
+
     /// Comparing two state snapshots failed.
     #[error(transparent)]
     Verify(#[from] crate::verify::VerifyError),
 
-    /// The radio returned an error response (`?\r`).
-    #[error("radio returned error response")]
-    RadioError,
+    /// The radio rejected the command with `?\r`.
+    #[error("radio rejected the command (`?` response)")]
+    CommandRejected,
 
     /// The radio returned "not available" (`N\r`): command not supported in current mode.
     #[error("command not available in current radio mode")]
-    NotAvailable,
+    NotAvailableInCurrentMode,
+
+    /// A mode write returned a semantic rejection and its required readback
+    /// also failed, so the resulting radio state could not be proved.
+    #[error(
+        "operating-mode write for band {band} requested {requested} and returned {rejection}; \
+         immediate readback also failed: {readback}"
+    )]
+    OperatingModeWriteUnconfirmed {
+        /// Band targeted by the write.
+        band: crate::types::Band,
+        /// Operating mode requested by the caller.
+        requested: crate::types::OperatingMode,
+        /// Semantic response returned for the write (`?` or `N`).
+        rejection: Box<Self>,
+        /// Failure that prevented immediate state readback.
+        #[source]
+        readback: Box<Self>,
+    },
 
     /// A high-level CAT operation is unavailable because this firmware
     /// repurposes the command mnemonic for a different protocol.
@@ -69,39 +118,49 @@ pub enum Error {
         /// The colliding CAT command mnemonic.
         command: &'static str,
         /// Exact firmware identity returned by `FV`.
-        firmware: String,
-    },
-
-    /// A CAT writer is intentionally quarantined because its complete wire
-    /// record or hardware effect has not yet been qualified.
-    #[error("CAT write {command} is unavailable: {reason}")]
-    UnqualifiedCatWrite {
-        /// CAT mnemonic whose writer is quarantined.
-        command: &'static str,
-        /// Concise reason the operation cannot safely be emitted.
-        reason: &'static str,
+        firmware: crate::types::FirmwareIdentity,
     },
 
     /// A command timed out waiting for a response.
     #[error("command timed out after {0:?}")]
     Timeout(Duration),
 
+    /// A CAT exchange or binary-mode transition ended at an uncertain boundary.
+    ///
+    /// A command future may have been cancelled after its write began, or a
+    /// binary-mode entry/exit command may have reached the radio without a
+    /// correlated reply. Ordinary CAT traffic is blocked until the transport
+    /// is recovered and an isolated TH-D75 identity exchange succeeds.
+    #[error(
+        "the CAT stream has an unresolved in-flight exchange or binary-mode transition; \
+         call Radio::recover_cat before sending another command"
+    )]
+    CatRecoveryRequired,
+
+    /// A caller attempted to wrap a CAT-ready transport as a binary session
+    /// without first proving or completing the corresponding mode transition.
+    #[error(
+        "binary mode has not been proved on this link; complete an owned mode transition or a \
+         successful binary link diagnosis first"
+    )]
+    BinaryModeNotProven,
+
     /// The radio has not been identified yet; call `identify()` first.
-    #[error("radio not identified \u{2014} call identify() first")]
+    #[error("radio not identified; call identify() first")]
     NotIdentified,
 
     /// A write was attempted to a protected memory region (factory calibration).
     #[error("write to protected page 0x{page:04X} denied (factory calibration region)")]
-    MemoryWriteProtected {
+    McpWriteProtected {
         /// The page address that was denied.
-        page: u16,
+        page: McpPage,
     },
 
     /// The radio did not ACK a write command.
     #[error("write to page 0x{page:04X} not acknowledged (expected ACK 0x06, got 0x{got:02X})")]
-    WriteNotAcknowledged {
+    McpWriteNotAcknowledged {
         /// The page address that was being written.
-        page: u16,
+        page: WritableMcpPage,
         /// The byte received instead of ACK.
         got: u8,
     },
@@ -117,7 +176,7 @@ pub enum Error {
     )]
     McpVerifyMismatch {
         /// The page address that was written.
-        page: u16,
+        page: WritableMcpPage,
         /// The first differing byte offset within the page.
         offset: usize,
         /// The byte that was written.
@@ -128,22 +187,11 @@ pub enum Error {
 
     /// The supplied memory image has an invalid size.
     #[error("invalid memory image size: {actual} bytes (expected {expected})")]
-    InvalidImageSize {
+    McpInvalidImageSize {
         /// The actual size in bytes.
         actual: usize,
         /// The expected size in bytes.
         expected: usize,
-    },
-
-    /// A frequency tune was written but the radio's readback shows a
-    /// different frequency, meaning the radio silently clamped or rejected
-    /// the write (typically an out-of-band value or wrong mode).
-    #[error("frequency readback mismatch: wrote {expected} Hz, radio reports {actual} Hz")]
-    FrequencyReadbackMismatch {
-        /// The frequency that was written, in Hz.
-        expected: u32,
-        /// The frequency the radio reports, in Hz.
-        actual: u32,
     },
 
     /// An MCP page read returned data for a different page than the one
@@ -152,9 +200,9 @@ pub enum Error {
     #[error("MCP page mismatch: requested 0x{requested:04X}, radio answered 0x{answered:04X}")]
     McpPageMismatch {
         /// The page that was requested.
-        requested: u16,
+        requested: McpPage,
         /// The page the radio's response was for.
-        answered: u16,
+        answered: McpPage,
     },
 
     /// The radio did not complete the ACK handshake for an MCP page read.
@@ -164,7 +212,7 @@ pub enum Error {
     )]
     McpPageReadNotAcknowledged {
         /// The page contained in the complete `W` response.
-        page: u16,
+        page: McpPage,
         /// The byte received instead of ACK.
         got: u8,
     },
@@ -185,7 +233,7 @@ pub enum Error {
          {accepted_firmware_identities:?}); connected target is model {actual_model} \
          firmware {actual_firmware}"
     )]
-    UnsupportedMcpSchemaTarget {
+    McpUnsupportedSchemaTarget {
         /// Model required by the generated schema.
         expected_model: &'static str,
         /// Canonical vendor firmware release required by the schema.
@@ -193,9 +241,9 @@ pub enum Error {
         /// Exact CAT `FV` strings accepted for that vendor release.
         accepted_firmware_identities: &'static [&'static str],
         /// Model reported by the connected radio.
-        actual_model: String,
+        actual_model: crate::types::RadioModel,
         /// Firmware reported by the connected radio.
-        actual_firmware: String,
+        actual_firmware: crate::types::FirmwareIdentity,
     },
 
     /// The radio answered an MCP exit command with a byte other than ACK.
@@ -238,6 +286,24 @@ pub enum Error {
         cleanup: Box<Self>,
     },
 
+    /// CAT framing could not be restored after leaving a binary radio mode.
+    ///
+    /// Both attempts are retained: the first tried to prove CAT on the
+    /// existing transport, and the second closed and reopened that transport
+    /// before trying again. Callers must treat the radio as not restored and
+    /// establish a new connection or explicitly retry recovery.
+    #[error(
+        "CAT restoration failed in place: {in_place}; the reconnect attempt also failed: {reconnect}"
+    )]
+    CatRestorationFailed {
+        /// Failure from the in-place CAT identity exchange.
+        in_place: Box<Self>,
+        /// Failure from closing, reopening, sending the universal mode-exit
+        /// preamble, or proving the isolated CAT identity exchange.
+        #[source]
+        reconnect: Box<Self>,
+    },
+
     /// An MCP exit byte may already have reached the radio.
     ///
     /// Sending `E` twice has undefined framing semantics, so recovery must
@@ -249,7 +315,10 @@ pub enum Error {
     /// cancelled mid-transfer). The radio may still be in PROG MCP mode
     /// where CAT commands do not work, so call
     /// `Radio::recover_from_interrupted_mcp` first.
-    #[error("MCP session interrupted; radio may be in programming mode. Recover first")]
+    #[error(
+        "MCP session interrupted; radio may be in programming mode; call \
+         Radio::recover_from_interrupted_mcp first"
+    )]
     McpInterrupted,
 
     /// A GM memory read was requested before the installed patched target was
@@ -273,7 +342,7 @@ pub enum Error {
     /// in flight. Only reopening the transport can exclude a delayed tail.
     #[error(
         "the GM memory-read stream is poisoned by an incomplete strict exchange; \
-         reconnect before sending any more commands"
+         call Radio::recover_cat before sending any more commands"
     )]
     MemoryReadStreamPoisoned,
 
@@ -361,6 +430,10 @@ pub enum TransportError {
     /// transports whose platform API requires its original opening thread.
     #[error("reopen must run on the thread that opened the transport")]
     WrongThread,
+
+    /// The main-thread broker has been dropped and cannot execute more jobs.
+    #[error("the main-thread transport broker is no longer available")]
+    BrokerUnavailable,
 }
 
 /// Errors in the CAT protocol layer (framing, field parsing, etc.).
@@ -412,12 +485,30 @@ pub enum ProtocolError {
         Vec<u8>,
     ),
 
-    /// An MCP `W` write response was shorter than the required frame size.
-    #[error("W response too short: {actual} bytes, expected {expected}")]
-    WriteResponseTooShort {
+    /// Unconsumed CAT input exceeded the codec's bounded framing buffer.
+    ///
+    /// The codec becomes poisoned when this occurs and the transport stream
+    /// must be reopened or otherwise brought to a proven frame boundary before
+    /// the codec is cleared. This prevents a suffix of an oversized frame from
+    /// being mistaken for a fresh response.
+    #[error(
+        "CAT framing buffer would exceed {maximum} bytes: {buffered} buffered + {incoming} incoming"
+    )]
+    FrameTooLong {
+        /// Maximum unconsumed byte count accepted by the codec.
+        maximum: usize,
+        /// Bytes buffered before the rejected feed.
+        buffered: usize,
+        /// Bytes in the rejected feed.
+        incoming: usize,
+    },
+
+    /// An MCP `W` response did not have the exact required frame size.
+    #[error("W response has {actual} bytes, expected exactly {expected}")]
+    WriteResponseSize {
         /// The actual byte count received.
         actual: usize,
-        /// The minimum byte count required (marker + 4-byte address + page).
+        /// The exact byte count required (marker + 4-byte address + page).
         expected: usize,
     },
 
@@ -440,6 +531,26 @@ pub enum ProtocolError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ValidationError {
+    /// An Internet-to-RF `IGate` locality limit exceeds the bounded AX.25
+    /// digipeater path domain.
+    #[error("IGate locality allows {maximum} repeated hops (must be 0-8)")]
+    IGateLocalityOutOfRange {
+        /// Rejected maximum count of repeated path entries.
+        maximum: u8,
+    },
+
+    /// An Internet-to-RF `IGate` eligibility period is zero or exceeds a
+    /// protocol-defined maximum.
+    #[error("invalid Internet-to-RF IGate {field} period {value:?}: {detail}")]
+    IGatePeriodOutOfRange {
+        /// Eligibility period being configured.
+        field: &'static str,
+        /// Rejected duration.
+        value: Duration,
+        /// Exact valid domain.
+        detail: &'static str,
+    },
+
     /// The CTCSS tone code is outside the valid range 0-50
     /// (0-49 = the 50 CTCSS tones, 50 = the 1750 Hz tone burst).
     #[error("tone code {0} out of range (must be 0-50)")]
@@ -448,24 +559,24 @@ pub enum ValidationError {
         u8,
     ),
 
-    /// The band index is outside the valid range 0-13.
-    #[error("band index {0} out of range (must be 0-13)")]
+    /// The band index is outside the valid range 0-1.
+    #[error("band index {0} out of range (must be 0-1)")]
     BandOutOfRange(
         /// The invalid band index.
         u8,
     ),
 
     /// The operating mode is outside the valid range 0-9.
-    #[error("mode {0} out of range (must be 0-9: FM/DV/AM/LSB/USB/CW/NFM/DR/WFM/CW-R)")]
-    ModeOutOfRange(
-        /// The invalid mode value.
+    #[error("operating mode {0} out of range (must be 0-9: FM/DV/AM/LSB/USB/CW/NFM/DR/WFM/CW-R)")]
+    OperatingModeOutOfRange(
+        /// The invalid operating-mode value.
         u8,
     ),
 
-    /// The memory (flash) mode is outside the valid range 0-7.
-    #[error("memory mode {0} out of range (must be 0-7: FM/DV/AM/LSB/USB/CW/NFM/DR)")]
-    MemoryModeOutOfRange(
-        /// The invalid memory mode value.
+    /// A channel-record mode is outside the valid range 0-8.
+    #[error("channel mode {0} out of range (must be 0-8: FM/DV/AM/LSB/USB/CW/NFM/DR/WFM)")]
+    ChannelModeOutOfRange(
+        /// The invalid channel mode value.
         u8,
     ),
 
@@ -476,15 +587,15 @@ pub enum ValidationError {
         u8,
     ),
 
-    /// The tone mode is outside the valid range 0-2.
-    #[error("tone mode {0} out of range (must be 0-2: Off/CTCSS/DCS)")]
+    /// A channel tone-mode nibble is not one of its five one-hot values.
+    #[error("tone mode 0x{0:X} is invalid (expected 0, 1, 2, 4, or 8)")]
     ToneModeOutOfRange(
-        /// The invalid tone mode.
+        /// The invalid channel tone-mode nibble.
         u8,
     ),
 
-    /// The shift direction is outside the valid 4-bit range 0-15.
-    #[error("shift direction {0} out of range (must be 0-15)")]
+    /// The channel shift is outside the four values implemented by the radio.
+    #[error("shift direction {0} out of range (must be 0-3)")]
     ShiftOutOfRange(
         /// The invalid shift direction.
         u8,
@@ -504,20 +615,6 @@ pub enum ValidationError {
         u8,
     ),
 
-    /// The data speed is outside the valid range 0-1.
-    #[error("data speed {0} out of range (must be 0-1)")]
-    DataSpeedOutOfRange(
-        /// The invalid data speed.
-        u8,
-    ),
-
-    /// The lockout mode is outside the valid range 0-2.
-    #[error("lockout mode {0} out of range (must be 0-2)")]
-    LockoutOutOfRange(
-        /// The invalid lockout mode.
-        u8,
-    ),
-
     /// The DCS code index is not in the valid code table.
     #[error("DCS code index {0} not in valid code table")]
     DcsCodeInvalid(
@@ -525,24 +622,191 @@ pub enum ValidationError {
         u8,
     ),
 
-    /// The channel name exceeds the maximum length of 8 characters.
-    #[error("channel name too long ({len} chars, max 8)")]
-    ChannelNameTooLong {
-        /// The actual length of the channel name.
+    /// A CTCSS decoder code is outside the 50-entry CTCSS table.
+    #[error("CTCSS code index {0} out of range (must be 0-49)")]
+    CtcssCodeOutOfRange(
+        /// The invalid CTCSS code index.
+        u8,
+    ),
+
+    /// A memory channel display name exceeds its 16-byte storage field.
+    #[error("channel display name is {len} bytes long (maximum is 16)")]
+    ChannelDisplayNameTooLong {
+        /// The actual encoded length in bytes.
         len: usize,
     },
 
-    /// A callsign or callsign suffix exceeds its maximum length.
-    #[error("callsign field too long ({len} chars, max {max})")]
+    /// A memory channel display name contains a byte outside printable ASCII.
+    #[error(
+        "channel display name byte at offset {offset} is 0x{value:02X} \
+         (expected printable ASCII 0x20-0x7E)"
+    )]
+    InvalidChannelDisplayNameByte {
+        /// Zero-based byte offset of the invalid value.
+        offset: usize,
+        /// The invalid byte.
+        value: u8,
+    },
+
+    /// A power-on message exceeds its 16-byte display and storage field.
+    #[error("power-on message is {len} bytes long (maximum is 16)")]
+    PowerOnMessageTooLong {
+        /// Actual encoded length in bytes.
+        len: usize,
+    },
+
+    /// A power-on message contains a byte the TH-D75 cannot display as text.
+    #[error(
+        "power-on message byte at offset {offset} is 0x{value:02X} \
+         (expected printable ASCII 0x20-0x7E)"
+    )]
+    InvalidPowerOnMessageByte {
+        /// Zero-based byte offset of the invalid value.
+        offset: usize,
+        /// Invalid byte.
+        value: u8,
+    },
+
+    /// A NUL-padded power-on-message field contains data after its terminator.
+    #[error(
+        "power-on message has nonzero byte 0x{value:02X} at offset {offset} \
+         after its NUL terminator at offset {terminator_offset}"
+    )]
+    PowerOnMessageDataAfterNul {
+        /// Zero-based byte offset of the first NUL terminator.
+        terminator_offset: usize,
+        /// Zero-based byte offset of the unexpected value.
+        offset: usize,
+        /// Unexpected nonzero byte.
+        value: u8,
+    },
+
+    /// A CAT `ID` response names a radio other than the exact TH-D75 model
+    /// this crate controls.
+    #[error("unsupported radio model identity {model:?} (expected exact TH-D75)")]
+    UnsupportedRadioModel {
+        /// Rejected CAT model identity.
+        model: String,
+    },
+
+    /// A CAT firmware identity does not fit its fixed one-to-eight-byte field.
+    #[error("firmware identity is {len} bytes long (expected 1-{max})")]
+    FirmwareIdentityLength {
+        /// Actual encoded length.
+        len: usize,
+        /// Maximum encoded length.
+        max: usize,
+    },
+
+    /// A CAT firmware identity contains whitespace, non-ASCII, or a control
+    /// byte instead of one visible ASCII token.
+    #[error(
+        "firmware identity byte at offset {offset} is 0x{value:02X} \
+         (expected visible ASCII 0x21-0x7E)"
+    )]
+    InvalidFirmwareIdentityByte {
+        /// Zero-based byte offset of the invalid value.
+        offset: usize,
+        /// Invalid byte.
+        value: u8,
+    },
+
+    /// A fixed-width CAT identity field has the wrong encoded length.
+    #[error("{field} is {actual} bytes long (expected exactly {expected})")]
+    IdentityFieldLength {
+        /// Stable English field name used in diagnostics.
+        field: &'static str,
+        /// Actual encoded length.
+        actual: usize,
+        /// Required encoded length.
+        expected: usize,
+    },
+
+    /// A fixed-width CAT identity contains a byte that cannot occur in its
+    /// comma-separated printable-ASCII field.
+    #[error(
+        "{field} byte at offset {offset} is 0x{value:02X} \
+         (expected printable ASCII 0x20-0x7E other than comma)"
+    )]
+    InvalidIdentityFieldByte {
+        /// Stable English field name used in diagnostics.
+        field: &'static str,
+        /// Zero-based byte offset of the invalid value.
+        offset: usize,
+        /// Invalid byte.
+        value: u8,
+    },
+
+    /// A CAT `TY` response contains a market/region code the firmware cannot
+    /// emit.
+    #[error("unknown radio region code {code:?} (expected 0, E, J, or K)")]
+    UnknownRadioRegion {
+        /// Rejected exact field value.
+        code: String,
+    },
+
+    /// A hardware-variant value cannot fit the single hexadecimal digit used
+    /// by the CAT `TY` response.
+    #[error("hardware variant {value} is out of range (expected 0-15)")]
+    HardwareVariantOutOfRange {
+        /// Rejected numeric value.
+        value: u8,
+    },
+
+    /// A memory channel display-name field contains data after its NUL terminator.
+    #[error(
+        "channel display name has nonzero byte 0x{value:02X} at offset {offset} \
+         after its NUL terminator"
+    )]
+    ChannelDisplayNameDataAfterNul {
+        /// Zero-based byte offset of the unexpected value.
+        offset: usize,
+        /// The unexpected nonzero byte.
+        value: u8,
+    },
+
+    /// A callsign or callsign suffix exceeds its fixed-width byte field.
+    #[error("callsign field too long ({len} bytes, max {max})")]
     CallsignTooLong {
-        /// The actual length.
+        /// The actual encoded length.
         len: usize,
         /// The maximum allowed length.
         max: usize,
     },
 
-    /// The frequency is outside the valid range for the band.
-    #[error("frequency {0} Hz out of range for band")]
+    /// A D-STAR callsign or suffix contains a byte unsafe for its CAT field.
+    #[error(
+        "D-STAR {field} byte at offset {offset} is 0x{value:02X} \
+         (expected printable ASCII other than comma)"
+    )]
+    InvalidDstarCallsignByte {
+        /// Field containing the invalid byte (`callsign` or `suffix`).
+        field: &'static str,
+        /// Zero-based byte offset of the invalid value.
+        offset: usize,
+        /// The invalid byte.
+        value: u8,
+    },
+
+    /// A NUL-padded D-STAR identity field contains data in its padding.
+    #[error(
+        "D-STAR {field} padding byte at offset {offset} is 0x{value:02X} \
+         (expected NUL padding)"
+    )]
+    InvalidDstarCallsignPadding {
+        /// Field containing the invalid padding.
+        field: &'static str,
+        /// Zero-based byte offset of the invalid padding byte.
+        offset: usize,
+        /// Invalid byte found after the first NUL.
+        value: u8,
+    },
+
+    /// A stored channel has the erased or empty receive-frequency marker.
+    #[error(
+        "stored channel receive frequency {0} Hz is invalid \
+         (must be 1-4,294,967,294 Hz)"
+    )]
     FrequencyOutOfRange(
         /// The invalid frequency in Hz.
         u32,
@@ -562,13 +826,6 @@ pub enum ValidationError {
         u8,
     ),
 
-    /// The flash digital squelch mode is outside the valid range 0-2.
-    #[error("flash digital squelch mode {0} out of range (must be 0-2)")]
-    FlashDigitalSquelchOutOfRange(
-        /// The invalid flash digital squelch value.
-        u8,
-    ),
-
     /// The channel number is outside the valid range.
     #[error("channel {channel} out of range (max {max})")]
     ChannelOutOfRange {
@@ -576,6 +833,42 @@ pub enum ValidationError {
         channel: u16,
         /// The maximum valid channel number.
         max: u16,
+    },
+
+    /// A memory-group index is outside the radio's 30 groups.
+    #[error("memory group {group} out of range (max 29)")]
+    MemoryGroupOutOfRange {
+        /// The invalid group index.
+        group: u8,
+    },
+
+    /// A memory-channel band code is not one of the values verified in radio images.
+    #[error(
+        "memory channel band code 0x{marker:02X} is invalid (expected 0x00, 0x01, 0x02, or 0x05)"
+    )]
+    MemoryChannelBandOutOfRange {
+        /// The invalid three-bit band code.
+        marker: u8,
+    },
+
+    /// A stored-channel flag record does not have its required four-byte width.
+    #[error("stored channel flag must be exactly 4 bytes, got {actual}")]
+    StoredChannelFlagLength {
+        /// Number of bytes supplied by the caller.
+        actual: usize,
+    },
+
+    /// A KISS timing value is outside its radio-supported ten-millisecond domain.
+    #[error(
+        "{parameter} {milliseconds} ms is invalid (expected 0-{maximum_milliseconds} ms in 10 ms steps)"
+    )]
+    InvalidKissTiming {
+        /// Name of the KISS control being validated.
+        parameter: &'static str,
+        /// Requested duration in milliseconds.
+        milliseconds: u16,
+        /// Largest duration accepted for this control.
+        maximum_milliseconds: u16,
     },
 
     /// A three-character ME/MR memory selector is not in the firmware's
@@ -595,6 +888,223 @@ pub enum ValidationError {
         value: String,
         /// Human-readable validation failure.
         detail: &'static str,
+    },
+
+    /// An FM broadcast-memory channel index is outside FM0-FM9.
+    #[error("FM radio channel {channel} out of range (must be 0-9)")]
+    FmRadioChannelOutOfRange {
+        /// Rejected zero-based channel index.
+        channel: u8,
+    },
+
+    /// An FM broadcast-memory frequency is outside 76-108 MHz inclusive.
+    #[error(
+        "FM radio frequency {frequency_hz} Hz out of range \
+         (must be 76000000-108000000 Hz)"
+    )]
+    FmRadioFrequencyOutOfRange {
+        /// Rejected frequency in hertz.
+        frequency_hz: u32,
+    },
+
+    /// An FM broadcast-memory station name exceeds its eight-byte field.
+    #[error("FM radio station name is {len} bytes long (maximum is 8)")]
+    FmRadioNameTooLong {
+        /// Actual UTF-8 encoded length.
+        len: usize,
+    },
+
+    /// A voice-message name exceeds its eight-byte field.
+    #[error("voice message name is {len} bytes long (maximum is 8)")]
+    VoiceMessageNameTooLong {
+        /// Actual UTF-8 encoded length.
+        len: usize,
+    },
+
+    /// A voice recording duration exceeds its selected channel's capacity.
+    #[error(
+        "voice message channel {channel} duration is {seconds} seconds \
+         (maximum is {maximum})"
+    )]
+    VoiceMessageDurationOutOfRange {
+        /// One-based voice-message channel number.
+        channel: u8,
+        /// Rejected duration in seconds.
+        seconds: u8,
+        /// Maximum duration accepted by that channel.
+        maximum: u8,
+    },
+
+    /// A voice-message repeat interval is above 60 seconds.
+    #[error("voice repeat interval {seconds} seconds out of range (must be 0-60)")]
+    VoiceRepeatIntervalOutOfRange {
+        /// Rejected interval in seconds.
+        seconds: u8,
+    },
+
+    /// A CW sidetone pitch is outside the stepped menu domain.
+    #[error("CW pitch {hz} Hz is invalid (must be 400-1000 Hz in 100 Hz steps)")]
+    CwPitchOutOfRange {
+        /// Rejected pitch in hertz.
+        hz: u16,
+    },
+
+    /// A DTMF memory-slot index is outside 0-9.
+    #[error("DTMF memory slot {index} out of range (must be 0-9)")]
+    DtmfSlotOutOfRange {
+        /// Rejected zero-based slot index.
+        index: u8,
+    },
+
+    /// A DTMF memory name exceeds its sixteen-byte field.
+    #[error("DTMF memory name is {len} bytes long (maximum is 16)")]
+    DtmfNameTooLong {
+        /// Actual UTF-8 encoded length.
+        len: usize,
+    },
+
+    /// A DTMF auto-dial sequence exceeds sixteen digits.
+    #[error("DTMF digit sequence is {len} bytes long (maximum is 16)")]
+    DtmfDigitsTooLong {
+        /// Actual encoded length.
+        len: usize,
+    },
+
+    /// A DTMF auto-dial sequence contains a character outside the keypad.
+    #[error(
+        "DTMF digit at byte offset {offset} is {value:?} \
+         (expected 0-9, A-D, *, or #)"
+    )]
+    InvalidDtmfDigit {
+        /// Byte offset of the rejected character.
+        offset: usize,
+        /// Rejected character.
+        value: char,
+    },
+
+    /// An `EchoLink` memory-slot index is outside 0-9.
+    #[error("EchoLink memory slot {index} out of range (must be 0-9)")]
+    EchoLinkSlotOutOfRange {
+        /// Rejected zero-based slot index.
+        index: u8,
+    },
+
+    /// An `EchoLink` station name exceeds its eight-byte field.
+    #[error("EchoLink station name is {len} bytes long (maximum is 8)")]
+    EchoLinkNameTooLong {
+        /// Actual UTF-8 encoded length.
+        len: usize,
+    },
+
+    /// An `EchoLink` DTMF code exceeds eight digits.
+    #[error("EchoLink DTMF code is {len} bytes long (maximum is 8)")]
+    EchoLinkCodeTooLong {
+        /// Actual encoded length.
+        len: usize,
+    },
+
+    /// An `EchoLink` code contains a character outside the DTMF keypad.
+    #[error(
+        "EchoLink DTMF digit at byte offset {offset} is {value:?} \
+         (expected 0-9, A-D, *, or #)"
+    )]
+    InvalidEchoLinkCodeDigit {
+        /// Byte offset of the rejected character.
+        offset: usize,
+        /// Rejected character.
+        value: char,
+    },
+
+    /// A wireless remote-control code is not exactly three encoded bytes.
+    #[error("wireless remote-control code is {len} bytes long (expected exactly 3)")]
+    RemoteControlCodeLength {
+        /// Actual UTF-8 encoded length.
+        len: usize,
+    },
+
+    /// A validated integer-backed type received a value outside its domain.
+    ///
+    /// This complements [`ValidationError::SettingOutOfRange`] for domains
+    /// whose values do not fit in `u8`.
+    #[error("{name} value {value} out of range ({detail})")]
+    IntegerOutOfRange {
+        /// Stable English name of the validated value.
+        name: &'static str,
+        /// Rejected integer value.
+        value: i64,
+        /// Human-readable accepted-domain description.
+        detail: &'static str,
+    },
+
+    /// A validated text field has an encoded length outside its domain.
+    #[error("{name} is {len} bytes long ({detail})")]
+    TextLengthOutOfRange {
+        /// Stable English name of the validated text field.
+        name: &'static str,
+        /// Rejected encoded length in bytes.
+        len: usize,
+        /// Human-readable accepted-length description.
+        detail: &'static str,
+    },
+
+    /// A validated text field contains a byte outside its character domain.
+    #[error("{name} byte at offset {offset} is 0x{value:02X} ({detail})")]
+    InvalidTextByte {
+        /// Stable English name of the validated text field.
+        name: &'static str,
+        /// Zero-based byte offset of the rejected value.
+        offset: usize,
+        /// Rejected byte.
+        value: u8,
+        /// Human-readable accepted-character description.
+        detail: &'static str,
+    },
+
+    /// A validated character is outside its accepted character set.
+    #[error("{name} character {value:?} is invalid ({detail})")]
+    InvalidCharacter {
+        /// Stable English name of the validated character.
+        name: &'static str,
+        /// Rejected character.
+        value: char,
+        /// Human-readable accepted-character description.
+        detail: &'static str,
+    },
+
+    /// A validated textual value has invalid structure beyond one byte.
+    #[error("{name} value {value:?} is invalid ({detail}; {reason})")]
+    InvalidTextValue {
+        /// Stable English name of the validated value.
+        name: &'static str,
+        /// Rejected text.
+        value: String,
+        /// Human-readable accepted-domain description.
+        detail: &'static str,
+        /// Specific reason reported by the underlying parser.
+        reason: String,
+    },
+
+    /// A validated collection contains too many entries.
+    #[error("{name} contains {len} entries ({detail})")]
+    CollectionLengthOutOfRange {
+        /// Stable English name of the validated collection.
+        name: &'static str,
+        /// Rejected entry count.
+        len: usize,
+        /// Human-readable accepted-count description.
+        detail: &'static str,
+    },
+
+    /// A wireless remote-control code contains a non-decimal character.
+    #[error(
+        "wireless remote-control code digit at byte offset {offset} is {value:?} \
+         (expected 0-9)"
+    )]
+    InvalidRemoteControlCodeDigit {
+        /// Byte offset of the rejected character.
+        offset: usize,
+        /// Rejected character.
+        value: char,
     },
 
     /// A settings/configuration enum value is outside its valid range.
@@ -654,10 +1164,44 @@ mod tests {
     }
 
     #[test]
-    fn mode_error_message_covers_full_range() {
-        // Mode accepts 0-9 (including WFM=8 and CW-R=9); the message
+    fn generic_validated_type_errors_preserve_rejected_context() {
+        let integer = ValidationError::IntegerOutOfRange {
+            name: "track-log interval",
+            value: 1,
+            detail: "must be 2-1800 seconds",
+        };
+        assert_eq!(
+            integer.to_string(),
+            "track-log interval value 1 out of range (must be 2-1800 seconds)"
+        );
+
+        let length = ValidationError::TextLengthOutOfRange {
+            name: "position name",
+            len: 9,
+            detail: "must be at most 8 encoded bytes",
+        };
+        assert_eq!(
+            length.to_string(),
+            "position name is 9 bytes long (must be at most 8 encoded bytes)"
+        );
+
+        let byte = ValidationError::InvalidTextByte {
+            name: "stored APRS status text",
+            offset: 4,
+            value: b'\n',
+            detail: "must contain only printable ASCII bytes 0x20-0x7E",
+        };
+        assert_eq!(
+            byte.to_string(),
+            "stored APRS status text byte at offset 4 is 0x0A (must contain only printable ASCII bytes 0x20-0x7E)"
+        );
+    }
+
+    #[test]
+    fn operating_mode_error_message_covers_full_range() {
+        // OperatingMode accepts 0-9 (including WFM=8 and CW-R=9); the message
         // must not claim 0-7.
-        let err = ValidationError::ModeOutOfRange(10);
+        let err = ValidationError::OperatingModeOutOfRange(10);
         let msg = err.to_string();
         assert!(
             msg.contains("0-9"),
@@ -678,7 +1222,7 @@ mod tests {
 
     #[test]
     fn error_from_validation() {
-        let val_err = ValidationError::BandOutOfRange(14);
+        let val_err = ValidationError::BandOutOfRange(2);
         let err: Error = val_err.into();
         assert!(matches!(err, Error::Validation(_)));
     }
@@ -718,6 +1262,15 @@ mod tests {
         let p_err = ProtocolError::MalformedFrame(vec![0xFF]);
         let err: Error = p_err.into();
         assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[test]
+    fn error_from_kiss() {
+        let err: Error = kiss_tnc::KissError::FrameTooLong.into();
+        assert!(matches!(
+            err,
+            Error::Kiss(kiss_tnc::KissError::FrameTooLong)
+        ));
     }
 
     #[test]

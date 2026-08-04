@@ -9,7 +9,7 @@ use kenwood_thd75::transport::{SerialTransport, Transport};
 async fn scan_channels_0_to_19() {
     let ports = SerialTransport::discover_usb().unwrap();
     let mut transport =
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap();
+        SerialTransport::open(&ports[0].port_name).unwrap();
 
     println!("\n=== MEMORY CHANNEL SCAN (0-19) ===");
     println!(
@@ -28,16 +28,16 @@ async fn scan_channels_0_to_19() {
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let n = transport.read(&mut buf).await.unwrap();
-                codec.feed(&buf[..n]);
+                codec.feed(&buf[..n])?;
                 if let Some(frame) = codec.next_frame() {
-                    return frame;
+                    return Ok(frame);
                 }
             }
         })
         .await;
 
         match result {
-            Ok(frame) => {
+            Ok(Ok(frame)) => {
                 let text = String::from_utf8_lossy(&frame);
                 let fields: Vec<&str> = text.split(',').collect();
                 if fields.len() >= 20 {
@@ -49,6 +49,7 @@ async fn scan_channels_0_to_19() {
                     println!("{:<5} (response: {} fields)", ch, fields.len());
                 }
             }
+            Ok(Err(error)) => println!("{:<5} CAT FRAMING ERROR: {error}", ch),
             Err(_) => println!("{:<5} TIMEOUT", ch),
         }
     }

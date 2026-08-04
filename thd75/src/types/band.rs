@@ -4,11 +4,11 @@ use std::fmt;
 
 use crate::error::ValidationError;
 
-/// Radio band index (0-13).
+/// Selectable receiver band in the TH-D75 CAT protocol.
 ///
-/// The TH-D75 uses a numeric band index in the `FO` and `ME` commands.
-/// Variants `A` and `B` correspond to the two main VFO bands; the
-/// remaining `Band2`..`Band13` map to additional sub-band selections.
+/// CAT commands identify the upper and lower receivers as `0` and `1`.
+/// The radio's frequency-range selections within those receivers are not
+/// additional CAT bands.
 ///
 /// # Band architecture (per Kenwood Operating Tips §1.1, §5.9; User Manual Chapter 5)
 ///
@@ -73,49 +73,14 @@ pub enum Band {
     A = 0,
     /// Band B: wideband RX (0.1–524 MHz, all modes). Index 1.
     B = 1,
-    /// Band 2 (index 2). Extended band index used internally by the firmware
-    /// for multi-band selection. Most CAT commands (e.g., `FQ`, `MD`, `SQ`)
-    /// only accept Band A (0) or Band B (1); sending an extended index
-    /// typically results in a `?` error response.
-    Band2 = 2,
-    /// Band 3 (index 3). Extended firmware band index. See [`Band::Band2`]
-    /// for details on CAT command restrictions.
-    Band3 = 3,
-    /// Band 4 (index 4). Extended firmware band index. See [`Band::Band2`]
-    /// for details on CAT command restrictions.
-    Band4 = 4,
-    /// Band 5 (index 5). Extended firmware band index. See [`Band::Band2`]
-    /// for details on CAT command restrictions.
-    Band5 = 5,
-    /// Band 6 (index 6). Extended firmware band index. See [`Band::Band2`]
-    /// for details on CAT command restrictions.
-    Band6 = 6,
-    /// Band 7 (index 7). Extended firmware band index. See [`Band::Band2`]
-    /// for details on CAT command restrictions.
-    Band7 = 7,
-    /// Band 8 (index 8). Extended firmware band index. See [`Band::Band2`]
-    /// for details on CAT command restrictions.
-    Band8 = 8,
-    /// Band 9 (index 9). Extended firmware band index. See [`Band::Band2`]
-    /// for details on CAT command restrictions.
-    Band9 = 9,
-    /// Band 10 (index 10). Extended firmware band index. See [`Band::Band2`]
-    /// for details on CAT command restrictions.
-    Band10 = 10,
-    /// Band 11 (index 11). Extended firmware band index. See [`Band::Band2`]
-    /// for details on CAT command restrictions.
-    Band11 = 11,
-    /// Band 12 (index 12). Extended firmware band index. See [`Band::Band2`]
-    /// for details on CAT command restrictions.
-    Band12 = 12,
-    /// Band 13 (index 13). Extended firmware band index. See [`Band::Band2`]
-    /// for details on CAT command restrictions.
-    Band13 = 13,
 }
 
 impl Band {
-    /// Number of valid band values (0-13).
-    pub const COUNT: u8 = 14;
+    /// Number of selectable CAT bands.
+    pub const COUNT: u8 = 2;
+
+    /// Every selectable CAT band, in wire-value order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::A, Self::B];
 }
 
 impl fmt::Display for Band {
@@ -123,7 +88,6 @@ impl fmt::Display for Band {
         match self {
             Self::A => f.write_str("A"),
             Self::B => f.write_str("B"),
-            other => write!(f, "Band {}", u8::from(*other)),
         }
     }
 }
@@ -135,18 +99,6 @@ impl TryFrom<u8> for Band {
         match value {
             0 => Ok(Self::A),
             1 => Ok(Self::B),
-            2 => Ok(Self::Band2),
-            3 => Ok(Self::Band3),
-            4 => Ok(Self::Band4),
-            5 => Ok(Self::Band5),
-            6 => Ok(Self::Band6),
-            7 => Ok(Self::Band7),
-            8 => Ok(Self::Band8),
-            9 => Ok(Self::Band9),
-            10 => Ok(Self::Band10),
-            11 => Ok(Self::Band11),
-            12 => Ok(Self::Band12),
-            13 => Ok(Self::Band13),
             _ => Err(ValidationError::BandOutOfRange(value)),
         }
     }
@@ -165,8 +117,12 @@ mod tests {
 
     #[test]
     fn band_valid_range() {
-        for i in 0u8..Band::COUNT {
-            assert!(Band::try_from(i).is_ok(), "Band({i}) should be valid");
+        for (wire_value, band) in (0_u8..).zip(Band::ALL) {
+            assert_eq!(u8::from(band), wire_value);
+            assert!(
+                Band::try_from(wire_value).is_ok(),
+                "Band({wire_value}) should be valid"
+            );
         }
     }
 
@@ -191,8 +147,8 @@ mod tests {
             .err()
             .ok_or("expected BandOutOfRange but got Ok")?;
         assert!(
-            matches!(err, ValidationError::BandOutOfRange(14)),
-            "expected BandOutOfRange(14), got {err:?}"
+            matches!(err, ValidationError::BandOutOfRange(2)),
+            "expected BandOutOfRange(2), got {err:?}"
         );
         Ok(())
     }
@@ -201,7 +157,5 @@ mod tests {
     fn band_display() {
         assert_eq!(Band::A.to_string(), "A");
         assert_eq!(Band::B.to_string(), "B");
-        assert_eq!(Band::Band5.to_string(), "Band 5");
-        assert_eq!(Band::Band13.to_string(), "Band 13");
     }
 }

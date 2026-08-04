@@ -13,6 +13,7 @@ use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -27,13 +28,13 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 #[tokio::test]
 async fn full_session_from_fixture() -> TestResult {
     let mock = MockTransport::from_fixture(Path::new("tests/fixtures/basic_session.txt"))?;
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
 
     let info = radio.identify().await?;
-    assert_eq!(info.model, "TH-D75");
+    assert_eq!(info.model, RadioModel::ThD75);
 
     let ch = radio.get_frequency_full(Band::A).await?;
-    assert_eq!(ch.rx_frequency.as_hz(), 145_000_000);
+    assert_eq!(ch.receive_frequency.as_hz(), 145_000_000);
 
     radio.set_auto_info(true).await?;
 
@@ -51,10 +52,10 @@ async fn identify_then_basics() -> TestResult {
     mock.expect(b"FV\r", b"FV 1.03.000\r");
     mock.expect(b"PS\r", b"PS 1\r");
 
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     let info = radio.identify().await?;
-    assert!(info.model.contains("TH-D75"));
-    assert_eq!(radio.get_firmware_version().await?, "1.03.000");
+    assert_eq!(info.model, RadioModel::ThD75);
+    assert_eq!(radio.get_firmware_version().await?.as_str(), "1.03.000");
     assert!(radio.get_power_status().await?);
     Ok(())
 }
@@ -72,10 +73,10 @@ async fn frequency_change_workflow() -> TestResult {
     // Read S-meter
     mock.expect(b"SM 0\r", b"SM 0,0003\r");
 
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     let ch = radio.get_frequency_full(Band::A).await?;
-    assert_eq!(ch.rx_frequency.as_hz(), 145_000_000);
-    radio.set_mode(Band::A, Mode::Dv).await?;
+    assert_eq!(ch.receive_frequency.as_hz(), 145_000_000);
+    radio.set_operating_mode(Band::A, OperatingMode::Dv).await?;
     assert_eq!(radio.get_smeter(Band::A).await?, SMeterReading::new(3)?);
     Ok(())
 }
@@ -88,9 +89,17 @@ async fn memory_channel_workflow() -> TestResult {
         b"ME 005,0145000000,0000600000,0,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00,0\r",
     );
 
-    let mut radio = Radio::connect(mock).await?;
-    let ch = radio.read_channel(5).await?;
-    assert_eq!(ch.rx_frequency.as_hz(), 145_000_000);
+    let mut radio = Radio::new(mock);
+    let ch = radio
+        .get_regular_channel_record(RegularChannel::new(5)?)
+        .await?;
+    assert_eq!(ch.channel.receive_frequency.as_hz(), 145_000_000);
+    assert!(!ch.split);
+    assert!(!ch.scan_lockout);
+    assert_eq!(
+        ch.transmit_value(),
+        ChannelTransmitValue::RepeaterOffset(Frequency::new(600_000)),
+    );
     Ok(())
 }
 
@@ -101,11 +110,11 @@ async fn audio_settings_workflow() -> TestResult {
     mock.expect(b"TN\r", b"TN 0,0\r");
     mock.expect(b"VX\r", b"VX 0\r");
 
-    let mut radio = Radio::connect(mock).await?;
-    assert_eq!(radio.get_af_gain().await?, AfGainLevel::new(20));
-    let (tnc_mode, tnc_setting) = radio.get_tnc_mode().await?;
-    assert_eq!(tnc_mode, TncMode::Off);
-    assert_eq!(tnc_setting, TncBaud::Bps1200);
+    let mut radio = Radio::new(mock);
+    assert_eq!(radio.get_af_gain().await?, AfGainLevel::new(20)?);
+    let tnc = radio.get_tnc_mode().await?;
+    assert_eq!(tnc.mode, TncMode::Off);
+    assert_eq!(tnc.data_rate, PacketDataRate::Bps1200);
     assert!(!radio.get_vox().await?);
     Ok(())
 }
@@ -116,7 +125,7 @@ async fn system_settings_workflow() -> TestResult {
     mock.expect(b"LC\r", b"LC 2\r");
     mock.expect(b"BT\r", b"BT 1\r");
 
-    let mut radio = Radio::connect(mock).await?;
+    let mut radio = Radio::new(mock);
     assert_eq!(radio.get_backlight_control().await?, BacklightControl::Auto);
     assert!(radio.get_bluetooth().await?);
     Ok(())
@@ -129,10 +138,24 @@ async fn aprs_callsign_workflow() -> TestResult {
     mock.expect(b"CS KQ4NIT-7\r", b"CS KQ4NIT-7\r");
     mock.expect(b"CS\r", b"CS KQ4NIT-7\r");
 
-    let mut radio = Radio::connect(mock).await?;
-    assert_eq!(radio.get_aprs_callsign().await?.as_str(), "N0CALL-7");
-    let callsign = AprsCallsign::new("KQ4NIT-7").ok_or("valid APRS callsign rejected")?;
+    let mut radio = Radio::new(mock);
+    assert_eq!(
+        radio
+            .get_aprs_callsign()
+            .await?
+            .ok_or("radio returned an empty APRS callsign slot")?
+            .to_string(),
+        "N0CALL-7"
+    );
+    let callsign = AprsCallsign::new("KQ4NIT-7")?;
     radio.set_aprs_callsign(callsign).await?;
-    assert_eq!(radio.get_aprs_callsign().await?.as_str(), "KQ4NIT-7");
+    assert_eq!(
+        radio
+            .get_aprs_callsign()
+            .await?
+            .ok_or("radio returned an empty APRS callsign slot")?
+            .to_string(),
+        "KQ4NIT-7"
+    );
     Ok(())
 }

@@ -35,6 +35,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -49,17 +50,18 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::io;
 
-use kenwood_thd75::Radio;
 use kenwood_thd75::memory::{
     DecodedFieldValue, FieldCodec, FieldValue, MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_FIRMWARE,
     MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, MCP_D75_SCHEMA_MODEL, MCP_D75_SCHEMA_VERSION,
-    MCP_D75_SOURCE_SHA256, MenuField, PatchPlanner, PatchSet, is_supported_mcp_d75_schema_target,
-    menu_field,
+    MCP_D75_SOURCE_SHA256, MenuField, PatchPlanner, PatchSet, SchemaError,
+    is_supported_mcp_d75_schema_target, menu_field,
 };
 use kenwood_thd75::protocol::programming;
 #[cfg(target_os = "macos")]
 use kenwood_thd75::transport::BluetoothTransport;
 use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
+use kenwood_thd75::types::{FirmwareIdentity, RadioModel};
+use kenwood_thd75::{McpPage, Radio};
 
 type BoxError = Box<dyn std::error::Error>;
 type Result<T = ()> = std::result::Result<T, BoxError>;
@@ -103,10 +105,10 @@ fn invalid_input(message: impl Into<String>) -> BoxError {
     Box::new(io::Error::new(io::ErrorKind::InvalidInput, message.into()))
 }
 
-fn validate_schema_target(model: &str, firmware: &str) -> Result {
+fn validate_schema_target(model: RadioModel, firmware: &FirmwareIdentity) -> Result {
     if !is_supported_mcp_d75_schema_target(model, firmware) {
         return Err(invalid_input(format!(
-            "refusing MCP-D75 schema access to model {model:?} firmware {firmware:?}; \
+            "refusing MCP-D75 schema access to model {model} firmware {firmware}; \
              validated target is {MCP_D75_SCHEMA_MODEL} vendor firmware \
              {MCP_D75_SCHEMA_FIRMWARE}; accepted exact CAT FV identities are \
              {MCP_D75_SCHEMA_FIRMWARE_IDENTITIES:?}"
@@ -424,6 +426,32 @@ fn render_unsigned(field: &MenuField, raw: u64, min: u64, max: u64) -> String {
     raw.to_string()
 }
 
+/// Recover the exact scalar from a strict read error that reports its value.
+///
+/// Snapshot inspection must distinguish invalid stored data from an
+/// undecodable field. The schema reader correctly rejects values that cannot
+/// be written, while these error variants retain enough information for this
+/// read-only tool to display the observed scalar with an explicit warning.
+const fn observed_scalar_after_validation_error(
+    codec: FieldCodec,
+    error: &SchemaError,
+) -> Option<DecodedFieldValue> {
+    match (codec, error) {
+        (FieldCodec::Bool, SchemaError::UnsignedOutOfRange { value, .. }) => {
+            Some(DecodedFieldValue::Bool(*value != 0))
+        }
+        (
+            FieldCodec::Byte { .. } | FieldCodec::BitField { .. } | FieldCodec::Unsigned { .. },
+            SchemaError::UnsignedOutOfRange { value, .. }
+            | SchemaError::DisallowedValue { value, .. },
+        ) => Some(DecodedFieldValue::Unsigned(*value)),
+        (FieldCodec::Signed { .. }, SchemaError::SignedOutOfRange { value, .. }) => {
+            Some(DecodedFieldValue::Signed(*value))
+        }
+        _ => None,
+    }
+}
+
 fn render_field(field: &MenuField, image: &[u8]) -> String {
     let name = field.descriptor.name;
     let raw_bytes = match raw_field_bytes(field, image) {
@@ -439,13 +467,18 @@ fn render_field(field: &MenuField, image: &[u8]) -> String {
         );
     }
 
-    let decoded = match field.descriptor.read(image) {
+    let decoded = match field.read(image) {
         Ok(value) => value,
         Err(error) => {
-            return format!(
-                "{name} = hex:{} [decode error: {error}]",
-                hex_bytes(raw_bytes)
-            );
+            match observed_scalar_after_validation_error(field.descriptor.codec, &error) {
+                Some(value) => value,
+                None => {
+                    return format!(
+                        "{name} = hex:{} [decode error: {error}]",
+                        hex_bytes(raw_bytes)
+                    );
+                }
+            }
         }
     };
 
@@ -506,17 +539,22 @@ fn decoded_json(field: &MenuField, image: &[u8]) -> Value {
             });
         }
     };
-    let value = match field.descriptor.read(image) {
-        Ok(value) => value,
+    let (value, validation_error) = match field.read(image) {
+        Ok(value) => (value, None),
         Err(error) => {
-            return json!({
-                "kind": "decode_error",
-                "message": error.to_string(),
-            });
+            let Some(value) =
+                observed_scalar_after_validation_error(field.descriptor.codec, &error)
+            else {
+                return json!({
+                    "kind": "decode_error",
+                    "message": error.to_string(),
+                });
+            };
+            (value, Some(error.to_string()))
         }
     };
 
-    match (field.descriptor.codec, value) {
+    let mut decoded = match (field.descriptor.codec, value) {
         (FieldCodec::Bool, DecodedFieldValue::Bool(value)) => json!({
             "canonical_raw": raw_bytes.first().is_some_and(|raw| *raw <= 1),
             "kind": "boolean",
@@ -554,7 +592,16 @@ fn decoded_json(field: &MenuField, image: &[u8]) -> Value {
                 codec.value_kind()
             ),
         }),
+    };
+    if let Some(validation_error) = validation_error
+        && let Some(object) = decoded.as_object_mut()
+    {
+        drop(object.insert(
+            "validation_error".to_owned(),
+            Value::String(validation_error),
+        ));
     }
+    decoded
 }
 
 fn unsigned_json(field: &MenuField, raw: u64, min: u64, max: u64) -> Value {
@@ -673,12 +720,22 @@ where
     T: Transport,
     I: Future<Output = io::Result<()>>,
 {
+    let pages: Vec<McpPage> = pages
+        .iter()
+        .copied()
+        .map(McpPage::new)
+        .collect::<std::result::Result<_, _>>()?;
     let interrupt_result = {
-        let read = radio.read_sparse_memory_pages(pages);
+        let read = radio.read_sparse_memory_pages(&pages);
         tokio::pin!(read);
         tokio::pin!(interrupt);
         tokio::select! {
-            result = &mut read => return Ok(result?),
+            result = &mut read => {
+                return Ok(result?
+                    .into_iter()
+                    .map(|(page, data)| (page.as_raw(), data))
+                    .collect());
+            }
             signal = &mut interrupt => signal,
         }
     };
@@ -713,11 +770,16 @@ where
     I: Future<Output = io::Result<()>>,
 {
     let interrupt_result = {
-        let write = radio.apply_menu_patches(patches);
+        let write = radio.apply_menu_patches_via_mcp(patches);
         tokio::pin!(write);
         tokio::pin!(interrupt);
         tokio::select! {
-            result = &mut write => return Ok(result?),
+            result = &mut write => {
+                return Ok(result?
+                    .into_iter()
+                    .map(kenwood_thd75::WritableMcpPage::as_raw)
+                    .collect());
+            }
             signal = &mut interrupt => signal,
         }
     };
@@ -744,7 +806,7 @@ async fn recover_interrupted_mcp<T: Transport>(
             "{interruption}; MCP exit and normal CAT recovery completed"
         )),
         Err(recovery_error) => match radio.identify().await {
-            Ok(info) if info.model == MCP_D75_SCHEMA_MODEL => invalid_input(format!(
+            Ok(info) if info.model == RadioModel::ThD75 => invalid_input(format!(
                 "{interruption}; normal CAT is restored, but MCP exit reported: \
                  {recovery_error}"
             )),
@@ -896,7 +958,10 @@ fn add_assignment(planner: &mut PatchPlanner, assignment: &str) -> Result {
 }
 
 fn print_patch_summary(patches: &PatchSet) {
-    let pages: Vec<u16> = patches.pages().collect();
+    let pages: Vec<u16> = patches
+        .pages()
+        .map(kenwood_thd75::WritableMcpPage::as_raw)
+        .collect();
     let byte_count: usize = patches
         .page_patches()
         .iter()
@@ -920,10 +985,7 @@ fn print_patch_summary(patches: &PatchSet) {
 
 fn open_transport(endpoint: &Endpoint) -> Result<EitherTransport> {
     match endpoint {
-        Endpoint::Usb(port) => Ok(EitherTransport::Serial(SerialTransport::open(
-            port,
-            SerialTransport::DEFAULT_BAUD,
-        )?)),
+        Endpoint::Usb(port) => Ok(EitherTransport::Serial(SerialTransport::open(port)?)),
         Endpoint::Bluetooth(device_name) => open_bluetooth_transport(device_name),
     }
 }
@@ -978,10 +1040,10 @@ async fn main() -> Result {
                 println!("{connecting}");
             }
             let transport = open_transport(&endpoint)?;
-            let mut radio = Radio::connect(transport).await?;
+            let mut radio = Radio::new(transport);
             let info = radio.identify().await?;
             let firmware = radio.get_firmware_version().await?;
-            if let Err(error) = validate_schema_target(&info.model, &firmware) {
+            if let Err(error) = validate_schema_target(info.model, &firmware) {
                 drop(radio.disconnect().await);
                 return Err(error);
             }
@@ -990,7 +1052,13 @@ async fn main() -> Result {
             radio.disconnect().await?;
             let image = assemble_sparse_image(&page_data)?;
             if json {
-                let snapshot = json_snapshot(&fields, pages.len(), &image, &info.model, &firmware);
+                let snapshot = json_snapshot(
+                    &fields,
+                    pages.len(),
+                    &image,
+                    info.model.as_str(),
+                    firmware.as_str(),
+                );
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
             } else {
                 println!("Radio: {} firmware {firmware}", info.model);
@@ -1014,10 +1082,10 @@ async fn main() -> Result {
 
             println!("Connecting to {}...", endpoint.description());
             let transport = open_transport(&endpoint)?;
-            let mut radio = Radio::connect(transport).await?;
+            let mut radio = Radio::new(transport);
             let info = radio.identify().await?;
             let firmware = radio.get_firmware_version().await?;
-            if let Err(error) = validate_schema_target(&info.model, &firmware) {
+            if let Err(error) = validate_schema_target(info.model, &firmware) {
                 drop(radio.disconnect().await);
                 return Err(error);
             }
@@ -1045,6 +1113,7 @@ mod tests {
     };
     use kenwood_thd75::protocol::programming;
     use kenwood_thd75::transport::MockTransport;
+    use kenwood_thd75::types::{FirmwareIdentity, RadioModel};
 
     const NO_OPTIONS: &[MenuOption] = &[];
     const ENUM_OPTIONS: &[MenuOption] = &[MenuOption {
@@ -1054,24 +1123,60 @@ mod tests {
         resource_key: None,
     }];
 
+    fn require_error<T>(
+        result: Result<T>,
+        message: &'static str,
+    ) -> Result<Box<dyn std::error::Error>> {
+        match result {
+            Ok(_) => Err(super::invalid_input(message)),
+            Err(error) => Ok(error),
+        }
+    }
+
+    fn image_with_byte(field: &MenuField, raw: u8) -> Result<Vec<u8>> {
+        let mut image = vec![0; field.descriptor.offset + 1];
+        let stored = image
+            .get_mut(field.descriptor.offset)
+            .ok_or_else(|| super::invalid_input("synthetic field offset is out of bounds"))?;
+        *stored = raw;
+        Ok(image)
+    }
+
+    fn json_at<'a>(value: &'a serde_json::Value, path: &[&str]) -> Result<&'a serde_json::Value> {
+        let mut current = value;
+        for component in path {
+            current = current.get(*component).ok_or_else(|| {
+                super::invalid_input(format!("JSON path `{}` is missing", path.join(".")))
+            })?;
+        }
+        Ok(current)
+    }
+
+    fn assert_json(
+        value: &serde_json::Value,
+        path: &[&str],
+        expected: &serde_json::Value,
+    ) -> Result {
+        assert_eq!(json_at(value, path)?, expected);
+        Ok(())
+    }
+
     #[test]
     fn schema_target_accepts_only_qualified_exact_firmware_identities() -> Result {
         for firmware in MCP_D75_SCHEMA_FIRMWARE_IDENTITIES {
-            validate_schema_target("TH-D75", firmware)?;
+            let firmware = FirmwareIdentity::new(firmware)?;
+            validate_schema_target(RadioModel::ThD75, &firmware)?;
         }
 
-        for (model, firmware) in [
-            ("TH-D74", "1.03"),
-            ("TH-D75", "1.02"),
-            ("TH-D75", "1.03.001"),
-            ("TH-D75", "1.04"),
-        ] {
-            let error = validate_schema_target(model, firmware)
-                .expect_err("unsupported schema target unexpectedly accepted");
+        for firmware in ["1.02", "1.03.001", "1.04"] {
+            let firmware = FirmwareIdentity::new(firmware)?;
+            let error = require_error(
+                validate_schema_target(RadioModel::ThD75, &firmware),
+                "unsupported schema target unexpectedly accepted",
+            )?;
             let message = error.to_string();
             assert!(
-                message.contains(model)
-                    && message.contains(firmware)
+                message.contains(firmware.as_str())
                     && message.contains("TH-D75")
                     && message.contains("1.03"),
                 "schema-target refusal lost its qualification: {message}"
@@ -1149,18 +1254,22 @@ mod tests {
             } if filter == "beep"
         ));
 
-        let endpoint_conflict = parse_arguments(vec![
-            "--read".to_owned(),
-            "--port".to_owned(),
-            "/dev/test".to_owned(),
-            "--bluetooth".to_owned(),
-            "TH-D75".to_owned(),
-        ])
-        .expect_err("USB and Bluetooth endpoints unexpectedly parsed together");
+        let endpoint_conflict = require_error(
+            parse_arguments(vec![
+                "--read".to_owned(),
+                "--port".to_owned(),
+                "/dev/test".to_owned(),
+                "--bluetooth".to_owned(),
+                "TH-D75".to_owned(),
+            ]),
+            "USB and Bluetooth endpoints unexpectedly parsed together",
+        )?;
         assert!(endpoint_conflict.to_string().contains("mutually exclusive"));
 
-        let write_json = parse_arguments(vec!["--json".to_owned(), "radio.Beep=on".to_owned()])
-            .expect_err("machine output unexpectedly accepted on the patch path");
+        let write_json = require_error(
+            parse_arguments(vec!["--json".to_owned(), "radio.Beep=on".to_owned()]),
+            "machine output unexpectedly accepted on the patch path",
+        )?;
         assert!(write_json.to_string().contains("only with --read"));
         Ok(())
     }
@@ -1228,31 +1337,19 @@ mod tests {
         let qsy = menu_field("aprs.QsyLimit")
             .ok_or_else(|| super::invalid_input("QSY limit field is missing"))?;
         assert_eq!(
-            render_field(qsy, &{
-                let mut image = vec![0; qsy.descriptor.offset + 1];
-                image[qsy.descriptor.offset] = 0;
-                image
-            }),
+            render_field(qsy, &image_with_byte(qsy, 0)?),
             "aprs.QsyLimit = \"Off\" (raw=0)"
         );
         for (raw, displayed) in [(1, 10), (250, 2500)] {
             assert_eq!(
-                render_field(qsy, &{
-                    let mut image = vec![0; qsy.descriptor.offset + 1];
-                    image[qsy.descriptor.offset] = raw;
-                    image
-                }),
+                render_field(qsy, &image_with_byte(qsy, raw)?),
                 format!("aprs.QsyLimit = {displayed} (raw={raw})")
             );
         }
 
         let pf1 = menu_field("radio.Pf1PfKey")
             .ok_or_else(|| super::invalid_input("PF1 field is missing"))?;
-        let rendered = render_field(pf1, &{
-            let mut image = vec![0; pf1.descriptor.offset + 1];
-            image[pf1.descriptor.offset] = 31;
-            image
-        });
+        let rendered = render_field(pf1, &image_with_byte(pf1, 31)?);
         assert!(
             rendered.contains("\"Screen Capture\" (raw=31)")
                 && rendered.contains("official Mic-PF enum")
@@ -1376,33 +1473,72 @@ mod tests {
             serde_json::to_string(&json_snapshot(&forward, 3, &image, "TH-D75", "1.03"))?,
             "caller order changed machine output"
         );
-        assert_eq!(snapshot["snapshot"]["field_count"], 4);
-        assert_eq!(snapshot["snapshot"]["page_count"], 3);
-        assert_eq!(snapshot["radio"]["model"], "TH-D75");
+        assert_json(
+            &snapshot,
+            &["snapshot", "field_count"],
+            &serde_json::json!(4),
+        )?;
+        assert_json(
+            &snapshot,
+            &["snapshot", "page_count"],
+            &serde_json::json!(3),
+        )?;
+        assert_json(&snapshot, &["radio", "model"], &serde_json::json!("TH-D75"))?;
 
-        let fields = snapshot["fields"]
+        let fields = json_at(&snapshot, &["fields"])?
             .as_array()
             .ok_or_else(|| super::invalid_input("JSON fields are not an array"))?;
         assert_eq!(fields.len(), 4, "a requested field was omitted");
-        assert_eq!(fields[0]["id"], "test.a_enum");
-        assert_eq!(fields[0]["offset"], 0);
-        assert_eq!(fields[0]["raw_hex"], "00");
-        assert_eq!(fields[0]["decoded"]["value"], 0);
-        assert_eq!(fields[0]["decoded"]["option"]["label"], "Zero");
+        let enumeration = fields
+            .first()
+            .ok_or_else(|| super::invalid_input("enum JSON record is missing"))?;
+        assert_json(enumeration, &["id"], &serde_json::json!("test.a_enum"))?;
+        assert_json(enumeration, &["offset"], &serde_json::json!(0))?;
+        assert_json(enumeration, &["raw_hex"], &serde_json::json!("00"))?;
+        assert_json(enumeration, &["decoded", "value"], &serde_json::json!(0))?;
+        assert_json(
+            enumeration,
+            &["decoded", "option", "label"],
+            &serde_json::json!("Zero"),
+        )?;
 
-        assert_eq!(fields[1]["id"], "test.b_bool");
-        assert_eq!(fields[1]["decoded"]["value"], true);
-        assert_eq!(fields[1]["decoded"]["canonical_raw"], false);
+        let boolean = fields
+            .get(1)
+            .ok_or_else(|| super::invalid_input("boolean JSON record is missing"))?;
+        assert_json(boolean, &["id"], &serde_json::json!("test.b_bool"))?;
+        assert_json(boolean, &["decoded", "value"], &serde_json::json!(true))?;
+        assert_json(
+            boolean,
+            &["decoded", "canonical_raw"],
+            &serde_json::json!(false),
+        )?;
+        let boolean_decoded = json_at(boolean, &["decoded"])?;
+        assert!(
+            json_at(boolean_decoded, &["validation_error"])?
+                .as_str()
+                .is_some_and(|error| error.contains("outside 0..=1")),
+            "noncanonical JSON lost the strict schema error: {boolean_decoded}"
+        );
 
-        assert_eq!(fields[2]["id"], "test.c_text");
-        assert_eq!(fields[2]["raw_hex"], "FF00");
-        assert_eq!(fields[2]["decoded"]["kind"], "decode_error");
+        let invalid_text = fields
+            .get(2)
+            .ok_or_else(|| super::invalid_input("invalid-text JSON record is missing"))?;
+        assert_json(invalid_text, &["id"], &serde_json::json!("test.c_text"))?;
+        assert_json(invalid_text, &["raw_hex"], &serde_json::json!("FF00"))?;
+        assert_json(
+            invalid_text,
+            &["decoded", "kind"],
+            &serde_json::json!("decode_error"),
+        )?;
 
-        assert_eq!(fields[3]["id"], "test.d_blob");
-        assert_eq!(fields[3]["offset_hex"], "0x00004");
-        assert_eq!(fields[3]["decoded"]["kind"], "bytes");
-        assert_eq!(fields[3]["decoded"]["hex"], "ABCD");
-        assert_eq!(fields[3]["decoded"]["length"], 2);
+        let blob = fields
+            .get(3)
+            .ok_or_else(|| super::invalid_input("blob JSON record is missing"))?;
+        assert_json(blob, &["id"], &serde_json::json!("test.d_blob"))?;
+        assert_json(blob, &["offset_hex"], &serde_json::json!("0x00004"))?;
+        assert_json(blob, &["decoded", "kind"], &serde_json::json!("bytes"))?;
+        assert_json(blob, &["decoded", "hex"], &serde_json::json!("ABCD"))?;
+        assert_json(blob, &["decoded", "length"], &serde_json::json!(2))?;
         Ok(())
     }
 
@@ -1412,7 +1548,7 @@ mod tests {
         mock.expect(programming::ENTER_PROGRAMMING, b"0M\r");
 
         let page = 0x0010;
-        let read = programming::build_read_command(page);
+        let read = programming::build_read_command(programming::McpPage::new(page)?);
         mock.expect_hang(&read);
         mock.expect(&[programming::EXIT], &[programming::ACK]);
         mock.expect_reopen(Ok(()));
@@ -1420,14 +1556,14 @@ mod tests {
         // A second CAT probe proves the helper returned a usable radio.
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let result = read_sparse_with_interrupt(&mut radio, &[page], async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Err(std::io::Error::other("signal backend unavailable"))
         })
         .await;
 
-        let error = result.expect_err("listener failure unexpectedly returned a snapshot");
+        let error = require_error(result, "listener failure unexpectedly returned a snapshot")?;
         let message = error.to_string();
         assert!(
             message.contains("interrupt listener failed")
@@ -1437,7 +1573,7 @@ mod tests {
         );
 
         let info = radio.identify().await?;
-        assert_eq!(info.model, "TH-D75");
+        assert_eq!(info.model, RadioModel::ThD75);
         Ok(())
     }
 
@@ -1453,7 +1589,7 @@ mod tests {
         mock.expect(programming::ENTER_PROGRAMMING, b"0M\r");
 
         let page = 0x0010;
-        let read = programming::build_read_command(page);
+        let read = programming::build_read_command(programming::McpPage::new(page)?);
         let original = [0u8; programming::PAGE_SIZE];
         let mut read_response = Vec::with_capacity(programming::W_RESPONSE_SIZE);
         let [page_hi, page_lo] = page.to_be_bytes();
@@ -1464,7 +1600,8 @@ mod tests {
 
         let mut modified = original;
         modified[0x71] = 1;
-        let write = programming::build_write_command(page, &modified);
+        let write =
+            programming::build_write_command(programming::WritableMcpPage::new(page)?, &modified);
         mock.expect_hang(&write);
 
         mock.expect(&[programming::EXIT], &[programming::ACK]);
@@ -1473,14 +1610,14 @@ mod tests {
         // A final probe proves the helper returned a CAT-capable radio.
         mock.expect(b"ID\r", b"ID TH-D75\r");
 
-        let mut radio = Radio::connect(mock).await?;
+        let mut radio = Radio::new(mock);
         let result = apply_patches_with_interrupt(&mut radio, &patches, async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Ok(())
         })
         .await;
 
-        let error = result.expect_err("interrupted write unexpectedly completed");
+        let error = require_error(result, "interrupted write unexpectedly completed")?;
         let message = error.to_string();
         assert!(
             message.contains("one or more earlier pages may already have changed")
@@ -1489,7 +1626,7 @@ mod tests {
         );
 
         let info = radio.identify().await?;
-        assert_eq!(info.model, "TH-D75");
+        assert_eq!(info.model, RadioModel::ThD75);
         Ok(())
     }
 }

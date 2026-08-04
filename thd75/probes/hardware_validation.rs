@@ -1,31 +1,39 @@
 //! Comprehensive hardware validation against a live TH-D75.
 //!
-//! Exercises every command group and prints raw responses for capture.
-//! Run with: `cargo test --test hardware_validation -- --ignored --nocapture --test-threads=1`
+//! Exercises every command group and prints typed responses alongside the
+//! corresponding offline wire encoding for capture.
+//!
+//! This archival probe source is not registered as a Cargo target. Before a
+//! hardware run, review it against `docs/audit/probe_queue.md`, promote the
+//! reviewed copy to an explicit test target, and run that target serially.
 
 mod firmware_guard;
 
 use kenwood_thd75::error::Error;
-use kenwood_thd75::protocol::{self, Command, Response};
+use kenwood_thd75::protocol::{self, Command};
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::*;
 
 /// Helper: connect to the first discovered TH-D75.
-async fn connect() -> Radio<SerialTransport> {
+fn connect() -> Radio<SerialTransport> {
     let ports = SerialTransport::discover_usb().expect("USB discovery failed");
     assert!(!ports.is_empty(), "No TH-D75 found; connect radio via USB");
-    let transport = SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD)
-        .expect("Failed to open serial port");
-    Radio::connect(transport).await.expect("Failed to connect")
+    let transport = SerialTransport::open(&ports[0].port_name).expect("Failed to open serial port");
+    Radio::new(transport)
 }
 
-/// Helper: execute a raw command and print the result.
-async fn probe(radio: &mut Radio<SerialTransport>, cmd: Command) -> Result<Response, Error> {
+/// Record offline wire metadata around one typed radio operation.
+async fn probe<T, F>(cmd: Command, operation: F) -> Result<T, Error>
+where
+    T: std::fmt::Debug,
+    F: std::future::Future<Output = Result<T, Error>>,
+{
     let cmd_name = protocol::command_name(&cmd);
     let wire = protocol::serialize(&cmd);
-    let wire_str = String::from_utf8_lossy(&wire[..wire.len() - 1]); // strip \r
-    let result = radio.execute(cmd).await;
+    let wire_without_terminator = wire.strip_suffix(b"\r").unwrap_or(&wire);
+    let wire_str = String::from_utf8_lossy(wire_without_terminator);
+    let result = operation.await;
     match &result {
         Ok(resp) => println!("  {cmd_name} OK | sent: {wire_str} | response: {resp:?}"),
         Err(e) => println!("  {cmd_name} ERR | sent: {wire_str} | error: {e}"),
@@ -34,13 +42,9 @@ async fn probe(radio: &mut Radio<SerialTransport>, cmd: Command) -> Result<Respo
 }
 
 /// Determine the exact firmware identity before any stock bare `GM`/`GW` probe.
-async fn exact_firmware_version(radio: &mut Radio<SerialTransport>) -> Option<String> {
-    match probe(radio, Command::GetFirmwareVersion).await {
-        Ok(Response::FirmwareVersion { version }) => Some(version),
-        Ok(other) => {
-            println!("  FV ERR | unexpected response while authorizing stock probes: {other:?}");
-            None
-        }
+async fn exact_firmware_version(radio: &mut Radio<SerialTransport>) -> Option<FirmwareIdentity> {
+    match probe(Command::GetFirmwareVersion, radio.get_firmware_version()).await {
+        Ok(version) => Some(version),
         Err(error) => {
             println!("  FV ERR | cannot authorize stock probes: {error}");
             None
@@ -55,41 +59,65 @@ async fn exact_firmware_version(radio: &mut Radio<SerialTransport>) -> Option<St
 #[tokio::test]
 #[ignore]
 async fn hw_core_commands() {
-    let mut radio = connect().await;
+    let mut radio = connect();
     println!("\n=== CORE COMMANDS ===");
 
     // ID: Radio identification
-    let _ = probe(&mut radio, Command::GetRadioId).await;
+    let _ = probe(Command::GetRadioId, radio.identify()).await;
 
     // FV: Firmware version
-    let _ = probe(&mut radio, Command::GetFirmwareVersion).await;
+    let _ = probe(Command::GetFirmwareVersion, radio.get_firmware_version()).await;
 
     // PS: Power status
-    let _ = probe(&mut radio, Command::GetPowerStatus).await;
+    let _ = probe(Command::GetPowerStatus, radio.get_power_status()).await;
 
     // BE: Send beacon (DANGEROUS: transmits; skipped in normal testing)
-    // let _ = probe(&mut radio, Command::SendBeacon).await;
+    // Intentionally do not call `radio.transmit_aprs_beacon()` here: it emits RF.
 
     // FQ: Quick frequency read (Band A)
-    let _ = probe(&mut radio, Command::GetFrequency { band: Band::A }).await;
+    let _ = probe(
+        Command::GetFrequency { band: Band::A },
+        radio.get_frequency(Band::A),
+    )
+    .await;
 
     // FQ: Quick frequency read (Band B)
-    let _ = probe(&mut radio, Command::GetFrequency { band: Band::B }).await;
+    let _ = probe(
+        Command::GetFrequency { band: Band::B },
+        radio.get_frequency(Band::B),
+    )
+    .await;
 
     // FO: Full frequency + settings (Band A)
-    let _ = probe(&mut radio, Command::GetFrequencyFull { band: Band::A }).await;
+    let _ = probe(
+        Command::GetFrequencyFull { band: Band::A },
+        radio.get_frequency_full(Band::A),
+    )
+    .await;
 
     // FO: Full frequency + settings (Band B)
-    let _ = probe(&mut radio, Command::GetFrequencyFull { band: Band::B }).await;
+    let _ = probe(
+        Command::GetFrequencyFull { band: Band::B },
+        radio.get_frequency_full(Band::B),
+    )
+    .await;
 
     // PC: Power level (Band A)
-    let _ = probe(&mut radio, Command::GetPowerLevel { band: Band::A }).await;
+    let _ = probe(
+        Command::GetPowerLevel { band: Band::A },
+        radio.get_power_level(Band::A),
+    )
+    .await;
 
     // PC: Power level (Band B)
-    let _ = probe(&mut radio, Command::GetPowerLevel { band: Band::B }).await;
+    let _ = probe(
+        Command::GetPowerLevel { band: Band::B },
+        radio.get_power_level(Band::B),
+    )
+    .await;
 
     // FR: Frequency range
-    let _ = probe(&mut radio, Command::GetFmRadio).await;
+    let _ = probe(Command::GetFmRadio, radio.get_fm_radio()).await;
 
     let _ = radio.disconnect().await;
 }
@@ -101,56 +129,88 @@ async fn hw_core_commands() {
 #[tokio::test]
 #[ignore]
 async fn hw_vfo_commands() {
-    let mut radio = connect().await;
+    let mut radio = connect();
     println!("\n=== VFO COMMANDS ===");
 
     // AG: AF Gain (bare read)
-    let _ = probe(&mut radio, Command::GetAfGain).await;
+    let _ = probe(Command::GetAfGain, radio.get_af_gain()).await;
 
     // SQ: Squelch
-    let _ = probe(&mut radio, Command::GetSquelch { band: Band::A }).await;
-    let _ = probe(&mut radio, Command::GetSquelch { band: Band::B }).await;
+    let _ = probe(
+        Command::GetSquelch { band: Band::A },
+        radio.get_squelch(Band::A),
+    )
+    .await;
+    let _ = probe(
+        Command::GetSquelch { band: Band::B },
+        radio.get_squelch(Band::B),
+    )
+    .await;
 
     // SM: S-meter
-    let _ = probe(&mut radio, Command::GetSmeter { band: Band::A }).await;
-    let _ = probe(&mut radio, Command::GetSmeter { band: Band::B }).await;
+    let _ = probe(
+        Command::GetSmeter { band: Band::A },
+        radio.get_smeter(Band::A),
+    )
+    .await;
+    let _ = probe(
+        Command::GetSmeter { band: Band::B },
+        radio.get_smeter(Band::B),
+    )
+    .await;
 
     // MD: Mode
-    let _ = probe(&mut radio, Command::GetMode { band: Band::A }).await;
-    let _ = probe(&mut radio, Command::GetMode { band: Band::B }).await;
+    let _ = probe(
+        Command::GetOperatingMode { band: Band::A },
+        radio.get_operating_mode(Band::A),
+    )
+    .await;
+    let _ = probe(
+        Command::GetOperatingMode { band: Band::B },
+        radio.get_operating_mode(Band::B),
+    )
+    .await;
 
     // FS: Fine step (bare read)
-    let _ = probe(&mut radio, Command::GetFineStep).await;
+    let _ = probe(Command::GetFineStep, radio.get_fine_step()).await;
 
     // FT: Function type (bare read, no band)
-    let _ = probe(&mut radio, Command::GetFunctionType).await;
+    let _ = probe(Command::GetFineTune, radio.get_fine_tune()).await;
 
     // SH: Filter width (by receiver mode)
     let _ = probe(
-        &mut radio,
         Command::GetFilterWidth {
             mode: FilterMode::Ssb,
         },
+        radio.get_filter_width(FilterMode::Ssb),
     )
     .await;
     let _ = probe(
-        &mut radio,
         Command::GetFilterWidth {
             mode: FilterMode::Cw,
         },
+        radio.get_filter_width(FilterMode::Cw),
     )
     .await;
     let _ = probe(
-        &mut radio,
         Command::GetFilterWidth {
             mode: FilterMode::Am,
         },
+        radio.get_filter_width(FilterMode::Am),
     )
     .await;
 
     // RA: Attenuator
-    let _ = probe(&mut radio, Command::GetAttenuator { band: Band::A }).await;
-    let _ = probe(&mut radio, Command::GetAttenuator { band: Band::B }).await;
+    let _ = probe(
+        Command::GetAttenuator { band: Band::A },
+        radio.get_attenuator(Band::A),
+    )
+    .await;
+    let _ = probe(
+        Command::GetAttenuator { band: Band::B },
+        radio.get_attenuator(Band::B),
+    )
+    .await;
 
     let _ = radio.disconnect().await;
 }
@@ -162,35 +222,35 @@ async fn hw_vfo_commands() {
 #[tokio::test]
 #[ignore]
 async fn hw_control_commands() {
-    let mut radio = connect().await;
+    let mut radio = connect();
     println!("\n=== CONTROL COMMANDS ===");
 
     // BY: Busy status
-    let _ = probe(&mut radio, Command::GetBusy { band: Band::A }).await;
-    let _ = probe(&mut radio, Command::GetBusy { band: Band::B }).await;
+    let _ = probe(Command::GetBusy { band: Band::A }, radio.get_busy(Band::A)).await;
+    let _ = probe(Command::GetBusy { band: Band::B }, radio.get_busy(Band::B)).await;
 
     // DL: Dual band display
-    let _ = probe(&mut radio, Command::GetDualBand).await;
+    let _ = probe(Command::GetBandMode, radio.get_band_mode()).await;
 
     // DW: Frequency Down (action, not probed; it would change frequency)
 
     // LC: LCD backlight control
-    let _ = probe(&mut radio, Command::GetBacklightControl).await;
+    let _ = probe(Command::GetBacklightControl, radio.get_backlight_control()).await;
 
     // BL: Battery Level
-    let _ = probe(&mut radio, Command::GetBatteryLevel).await;
+    let _ = probe(Command::GetBatteryLevel, radio.get_battery_level()).await;
 
     // VX: VOX
-    let _ = probe(&mut radio, Command::GetVox).await;
+    let _ = probe(Command::GetVox, radio.get_vox()).await;
 
     // VG: VOX gain
-    let _ = probe(&mut radio, Command::GetVoxGain).await;
+    let _ = probe(Command::GetVoxGain, radio.get_vox_gain()).await;
 
     // VD: VOX delay
-    let _ = probe(&mut radio, Command::GetVoxDelay).await;
+    let _ = probe(Command::GetVoxDelay, radio.get_vox_delay()).await;
 
     // IO: I/O port
-    let _ = probe(&mut radio, Command::GetIoPort).await;
+    let _ = probe(Command::GetUsbAudioOutput, radio.get_usb_audio_output()).await;
 
     let _ = radio.disconnect().await;
 }
@@ -202,84 +262,81 @@ async fn hw_control_commands() {
 #[tokio::test]
 #[ignore]
 async fn hw_tnc_dstar_clock_commands() {
-    let mut radio = connect().await;
+    let mut radio = connect();
     println!("\n=== TNC / D-STAR / CLOCK COMMANDS ===");
 
     // TN: TNC mode (bare read)
-    let _ = probe(&mut radio, Command::GetTncMode).await;
+    let _ = probe(Command::GetTncMode, radio.get_tnc_mode()).await;
 
     // DC: D-STAR callsign slots 1-6
+    let slot_1 = DstarSlot::new(1).expect("slot 1 is valid");
     let _ = probe(
-        &mut radio,
-        Command::GetDstarCallsign {
-            slot: DstarSlot::new(1).expect("slot 1 is valid"),
-        },
+        Command::GetDstarCallsign { slot: slot_1 },
+        radio.get_dstar_callsign(slot_1),
     )
     .await;
+    let slot_2 = DstarSlot::new(2).expect("slot 2 is valid");
     let _ = probe(
-        &mut radio,
-        Command::GetDstarCallsign {
-            slot: DstarSlot::new(2).expect("slot 2 is valid"),
-        },
+        Command::GetDstarCallsign { slot: slot_2 },
+        radio.get_dstar_callsign(slot_2),
     )
     .await;
 
     // RT: Real-time clock (bare read)
-    let _ = probe(&mut radio, Command::GetRealTimeClock).await;
+    let _ = probe(Command::GetRealTimeClock, radio.get_real_time_clock()).await;
 
     let _ = radio.disconnect().await;
 }
 
 // ============================================================
-// Memory commands (ME, MR, 0M)
+// Memory commands (ME, MR)
 // ============================================================
 
 #[tokio::test]
 #[ignore]
 async fn hw_memory_commands() {
-    let mut radio = connect().await;
+    let mut radio = connect();
     println!("\n=== MEMORY COMMANDS ===");
 
     // ME: Read memory channel 0
+    let channel_0 = RegularChannel::new(0).expect("channel 0 is valid");
     let _ = probe(
-        &mut radio,
         Command::GetMemoryChannel {
-            selector: MemorySelector::try_from(0_u16).unwrap(),
+            selector: channel_0.into(),
         },
+        radio.get_regular_channel_record(channel_0),
     )
     .await;
 
     // ME: Read memory channel 1
+    let channel_1 = RegularChannel::new(1).expect("channel 1 is valid");
     let _ = probe(
-        &mut radio,
         Command::GetMemoryChannel {
-            selector: MemorySelector::try_from(1_u16).unwrap(),
+            selector: channel_1.into(),
         },
+        radio.get_regular_channel_record(channel_1),
     )
     .await;
 
     // MR: Recall memory channel 0 on band A
     let _ = probe(
-        &mut radio,
         Command::RecallMemoryChannel {
             band: Band::A,
-            selector: MemorySelector::try_from(0_u16).unwrap(),
+            selector: channel_0.into(),
         },
+        radio.recall_channel(Band::A, channel_0),
     )
     .await;
 
     // MR: Recall memory channel 1 on band A
     let _ = probe(
-        &mut radio,
         Command::RecallMemoryChannel {
             band: Band::A,
-            selector: MemorySelector::try_from(1_u16).unwrap(),
+            selector: channel_1.into(),
         },
+        radio.recall_channel(Band::A, channel_1),
     )
     .await;
-
-    // 0M: Enter programming mode (DANGEROUS; skipped in normal testing)
-    // let _ = probe(&mut radio, Command::EnterProgrammingMode).await;
 
     let _ = radio.disconnect().await;
 }
@@ -291,13 +348,17 @@ async fn hw_memory_commands() {
 #[tokio::test]
 #[ignore]
 async fn hw_aprs_commands() {
-    let mut radio = connect().await;
+    let mut radio = connect();
     println!("\n=== APRS COMMANDS ===");
 
-    let _ = probe(&mut radio, Command::GetTncBaud).await;
-    let _ = probe(&mut radio, Command::GetSerialInfo).await;
-    let _ = probe(&mut radio, Command::GetBeaconType).await;
-    let _ = probe(&mut radio, Command::GetMyPositionSelection).await;
+    let _ = probe(Command::GetPacketDataRate, radio.get_packet_data_rate()).await;
+    let _ = probe(Command::GetSerialInfo, radio.get_serial_information()).await;
+    let _ = probe(Command::GetBeaconMode, radio.get_beacon_mode()).await;
+    let _ = probe(
+        Command::GetMyPositionSelection,
+        radio.get_my_position_selection(),
+    )
+    .await;
 
     let _ = radio.disconnect().await;
 }
@@ -309,14 +370,17 @@ async fn hw_aprs_commands() {
 #[tokio::test]
 #[ignore]
 async fn hw_dstar_commands() {
-    let mut radio = connect().await;
+    let mut radio = connect();
     println!("\n=== D-STAR COMMANDS ===");
     let firmware_version = exact_firmware_version(&mut radio).await;
 
-    let _ = probe(&mut radio, Command::GetDstarSlot).await;
-    match firmware_guard::require_stock_bare_probe("GW", firmware_version.as_deref()) {
+    let _ = probe(Command::GetDstarSlot, radio.get_dstar_slot()).await;
+    match firmware_guard::require_stock_bare_probe(
+        "GW",
+        firmware_version.as_ref().map(FirmwareIdentity::as_str),
+    ) {
         Ok(()) => {
-            let _ = probe(&mut radio, Command::GetGateway).await;
+            let _ = probe(Command::GetGateway, radio.read_gateway()).await;
         }
         Err(diagnostic) => println!("  {diagnostic}"),
     }
@@ -331,18 +395,21 @@ async fn hw_dstar_commands() {
 #[tokio::test]
 #[ignore]
 async fn hw_gps_commands() {
-    let mut radio = connect().await;
+    let mut radio = connect();
     println!("\n=== GPS COMMANDS ===");
     let firmware_version = exact_firmware_version(&mut radio).await;
 
-    let _ = probe(&mut radio, Command::GetGpsConfig).await;
-    match firmware_guard::require_stock_bare_probe("GM", firmware_version.as_deref()) {
+    let _ = probe(Command::GetGpsSettings, radio.get_gps_settings()).await;
+    match firmware_guard::require_stock_bare_probe(
+        "GM",
+        firmware_version.as_ref().map(FirmwareIdentity::as_str),
+    ) {
         Ok(()) => {
-            let _ = probe(&mut radio, Command::GetGpsMode).await;
+            let _ = probe(Command::GetGpsMode, radio.read_gps_mode()).await;
         }
         Err(diagnostic) => println!("  {diagnostic}"),
     }
-    let _ = probe(&mut radio, Command::GetGpsSentences).await;
+    let _ = probe(Command::GetGpsSentences, radio.get_gps_sentences()).await;
 
     let _ = radio.disconnect().await;
 }
@@ -354,11 +421,11 @@ async fn hw_gps_commands() {
 #[tokio::test]
 #[ignore]
 async fn hw_system_commands() {
-    let mut radio = connect().await;
+    let mut radio = connect();
     println!("\n=== SYSTEM COMMANDS ===");
 
-    let _ = probe(&mut radio, Command::GetBluetooth).await;
-    let _ = probe(&mut radio, Command::GetSdCard).await;
+    let _ = probe(Command::GetBluetooth, radio.get_bluetooth()).await;
+    let _ = probe(Command::GetSdCard, radio.get_sd_status()).await;
 
     let _ = radio.disconnect().await;
 }
@@ -370,12 +437,16 @@ async fn hw_system_commands() {
 #[tokio::test]
 #[ignore]
 async fn hw_scan_commands() {
-    let mut radio = connect().await;
+    let mut radio = connect();
     println!("\n=== SCAN COMMANDS ===");
 
     // SR is write-only on D75 (bare `SR\r` returns `?`)
-    let _ = probe(&mut radio, Command::GetStepSize { band: Band::A }).await;
-    let _ = probe(&mut radio, Command::GetBarAntenna).await;
+    let _ = probe(
+        Command::GetStepSize { band: Band::A },
+        radio.get_step_size(Band::A),
+    )
+    .await;
+    let _ = probe(Command::GetAntennaInput, radio.get_antenna_input()).await;
 
     let _ = radio.disconnect().await;
 }

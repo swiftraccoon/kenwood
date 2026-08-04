@@ -1,6 +1,6 @@
 //! Safe value planning for generated MCP-D75 menu metadata.
 
-use super::{FieldValue, MenuField, PatchPlanner, SchemaError};
+use super::{DecodedFieldValue, FieldValue, MenuField, PatchPlanner, SchemaError};
 
 impl MenuField {
     pub(super) fn validate_patch_value(&self, value: FieldValue<'_>) -> Result<(), SchemaError> {
@@ -23,6 +23,21 @@ impl MenuField {
             }
         }
         Ok(())
+    }
+
+    /// Decode and validate this field from a complete MCP memory image.
+    ///
+    /// This enforces both the storage codec and any finite enum or UI-choice
+    /// domain declared by the generated MCP-D75 catalog. A corrupt raw value
+    /// is therefore reported instead of being presented as a valid setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the field is outside the image, its descriptor is
+    /// malformed, or its stored value is outside the catalog's accepted
+    /// domain.
+    pub fn read(&self, image: &[u8]) -> Result<DecodedFieldValue, SchemaError> {
+        self.descriptor.read(image)
     }
 
     /// Validate and add a value to a masked patch plan.
@@ -68,6 +83,32 @@ mod tests {
         let mut planner = PatchPlanner::new();
         assert_eq!(
             field.plan_value(&mut planner, FieldValue::Unsigned(3)),
+            Err(SchemaError::DisallowedValue {
+                field: "radio.AutoWeatherScan",
+                value: 3,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gapped_enum_rejects_invalid_stored_value() -> Result<(), &'static str> {
+        let field = gapped_field()?;
+        let mut image = vec![0; field.descriptor.offset + 1];
+        let stored = image
+            .get_mut(field.descriptor.offset)
+            .ok_or("generated field offset missing")?;
+        *stored = 3;
+
+        assert_eq!(
+            field.read(&image),
+            Err(SchemaError::DisallowedValue {
+                field: "radio.AutoWeatherScan",
+                value: 3,
+            })
+        );
+        assert_eq!(
+            field.descriptor.read(&image),
             Err(SchemaError::DisallowedValue {
                 field: "radio.AutoWeatherScan",
                 value: 3,

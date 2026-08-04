@@ -1,4 +1,4 @@
-//! FM repeater configuration types.
+//! FM repeater settings types.
 //!
 //! The TH-D75 supports FM repeater operation with configurable offset
 //! frequency, automatic offset based on the operating band, a 1750 Hz
@@ -52,25 +52,26 @@
 //! Reverse is on.
 //!
 //! These types model repeater settings from Chapter 7 of the TH-D75
-//! user manual. Derived from the capability gap analysis features 198-199
-//! and feature 137 (1750 Hz tone).
+//! user manual, including the 1750 Hz tone function.
+
+use super::Frequency;
 
 // ---------------------------------------------------------------------------
-// Repeater configuration
+// Repeater settings
 // ---------------------------------------------------------------------------
 
-/// FM repeater operating configuration.
+/// FM repeater operating settings.
 ///
 /// Controls the offset frequency, automatic offset selection, and
 /// 1750 Hz tone burst behavior for accessing FM repeaters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RepeaterConfig {
-    /// Repeater offset frequency in Hz.
+pub struct RepeaterSettings {
+    /// Repeater offset frequency.
     ///
     /// The offset is the difference between the repeater's transmit and
     /// receive frequencies. Common values are 600 kHz (2 m band) and
     /// 5 MHz (70 cm band).
-    pub offset_frequency: u32,
+    pub offset_frequency: Frequency,
     /// Enable automatic offset selection based on the operating frequency.
     ///
     /// When enabled, the radio automatically selects the correct offset
@@ -82,16 +83,6 @@ pub struct RepeaterConfig {
     /// The 1750 Hz tone burst is used to access repeaters that require
     /// a burst tone instead of or in addition to CTCSS/DCS.
     pub tone_burst_1750hz: ToneBurstHold,
-}
-
-impl Default for RepeaterConfig {
-    fn default() -> Self {
-        Self {
-            offset_frequency: 600_000,
-            auto_offset: true,
-            tone_burst_1750hz: ToneBurstHold::Off,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -130,22 +121,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repeater_config_default() {
-        let cfg = RepeaterConfig::default();
-        assert_eq!(cfg.offset_frequency, 600_000);
-        assert!(cfg.auto_offset);
-        assert_eq!(cfg.tone_burst_1750hz, ToneBurstHold::Off);
+    fn repeater_settings_require_an_explicit_band_offset() {
+        let settings = RepeaterSettings {
+            offset_frequency: Frequency::new(600_000),
+            auto_offset: true,
+            tone_burst_1750hz: ToneBurstHold::Off,
+        };
+        assert_eq!(settings.offset_frequency, Frequency::new(600_000));
+        assert!(settings.auto_offset);
+        assert_eq!(settings.tone_burst_1750hz, ToneBurstHold::Off);
     }
 
     #[test]
-    fn repeater_config_uhf_offset() {
-        let cfg = RepeaterConfig {
-            offset_frequency: 5_000_000,
+    fn repeater_settings_uhf_offset() {
+        let settings = RepeaterSettings {
+            offset_frequency: Frequency::new(5_000_000),
             auto_offset: false,
             tone_burst_1750hz: ToneBurstHold::Hold,
         };
-        assert_eq!(cfg.offset_frequency, 5_000_000);
-        assert!(!cfg.auto_offset);
-        assert_eq!(cfg.tone_burst_1750hz, ToneBurstHold::Hold);
+        assert_eq!(settings.offset_frequency, Frequency::new(5_000_000));
+        assert!(!settings.auto_offset);
+        assert_eq!(settings.tone_burst_1750hz, ToneBurstHold::Hold);
     }
 }

@@ -1,11 +1,11 @@
-//! Integration tests encoding every validation boundary from the firmware's
-//! `radio_validate_channel_params` function at `0xC003C694`.
+//! Integration tests for established CAT, MCP channel-storage, and radio-menu
+//! validation boundaries.
 //!
 //! These tests verify the exact accept/reject boundaries for each validated
-//! type, ensuring 1:1 correspondence with firmware reverse-engineering data.
+//! type and keep every public constructor aligned with its documented domain.
 
 use kenwood_thd75::error::ValidationError;
-use kenwood_thd75::types::tone::{CTCSS_FREQUENCIES, DCS_CODES};
+use kenwood_thd75::types::tone::{CTCSS_FREQUENCIES, CtcssCode, DCS_CODES};
 use kenwood_thd75::types::*;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
@@ -16,6 +16,7 @@ use ::aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -43,15 +44,14 @@ fn entry<T: Copy>(table: &[T], idx: usize, name: &str) -> Result<T, BoxErr> {
 
 #[test]
 fn tone_code_boundary() {
-    // Independent spec assertion: KI4LAX TABLE A (50 CTCSS) + ARFC RE (code 50 = 1750Hz)
-    assert_eq!(ToneCode::MAX_INDEX, 50, "spec: KI4LAX TABLE A + ARFC RE");
+    assert_eq!(ToneCode::MAX_INDEX, 50, "indices 0-49 plus 1750 Hz burst");
     assert!(
         ToneCode::new(ToneCode::MAX_INDEX - 1).is_ok(),
         "49 is the last CTCSS tone code"
     );
     assert!(
         ToneCode::new(ToneCode::MAX_INDEX).is_ok(),
-        "50 is the 1750 Hz tone burst (ARFC RE)"
+        "50 is the 1750 Hz tone burst"
     );
     assert!(
         ToneCode::new(ToneCode::MAX_INDEX + 1).is_err(),
@@ -60,29 +60,41 @@ fn tone_code_boundary() {
 }
 
 #[test]
-fn band_boundary() {
-    assert_eq!(Band::COUNT, 14, "spec: firmware RE");
-    assert!(
-        Band::try_from(Band::COUNT - 1).is_ok(),
-        "13 is the last valid band"
-    );
-    assert!(Band::try_from(Band::COUNT).is_err(), "14 must be rejected");
+fn ctcss_code_boundary() -> TestResult {
+    assert_eq!(CtcssCode::COUNT, 50, "decoder table indices 0-49");
+    assert!(CtcssCode::try_from(CtcssCode::MAX_INDEX).is_ok());
+    assert!(CtcssCode::try_from(CtcssCode::COUNT).is_err());
+    assert!(CtcssCode::try_from(ToneCode::new(50)?).is_err());
+    Ok(())
 }
 
 #[test]
-fn mode_boundary() {
-    assert_eq!(
-        Mode::COUNT,
-        10,
-        "spec: KI4LAX TABLE D (0-7) + ARFC RE (8=WFM, 9=CW-R)"
-    );
-    assert!(Mode::try_from(7u8).is_ok(), "7 (DR) is valid");
-    assert!(Mode::try_from(8u8).is_ok(), "8 (WFM) confirmed by ARFC RE");
+fn band_boundary() {
+    assert_eq!(Band::COUNT, 2, "CAT selects only receiver bands A and B");
     assert!(
-        Mode::try_from(Mode::COUNT - 1).is_ok(),
-        "9 (CW-R) confirmed by ARFC RE"
+        Band::try_from(Band::COUNT - 1).is_ok(),
+        "1 is the last valid band"
     );
-    assert!(Mode::try_from(Mode::COUNT).is_err(), "10 must be rejected");
+    assert!(Band::try_from(Band::COUNT).is_err(), "2 must be rejected");
+}
+
+#[test]
+fn operating_mode_boundary() {
+    assert_eq!(
+        OperatingMode::COUNT,
+        10,
+        "established MD read domain is 0-9"
+    );
+    assert!(OperatingMode::try_from(7u8).is_ok(), "7 (DR) is valid");
+    assert!(OperatingMode::try_from(8u8).is_ok(), "8 (WFM) is valid");
+    assert!(
+        OperatingMode::try_from(OperatingMode::COUNT - 1).is_ok(),
+        "9 (CW-R) is valid"
+    );
+    assert!(
+        OperatingMode::try_from(OperatingMode::COUNT).is_err(),
+        "10 must be rejected"
+    );
 }
 
 #[test]
@@ -100,27 +112,29 @@ fn power_level_boundary() {
 
 #[test]
 fn tone_mode_boundary() {
-    assert_eq!(ToneMode::COUNT, 4, "spec: ARFC RE a/a1.cs");
-    assert!(ToneMode::try_from(2u8).is_ok(), "2 (DCS) is valid");
-    assert!(
-        ToneMode::try_from(ToneMode::COUNT - 1).is_ok(),
-        "3 (CrossTone) confirmed by ARFC RE"
-    );
-    assert!(
-        ToneMode::try_from(ToneMode::COUNT).is_err(),
-        "4 must be rejected"
-    );
+    assert_eq!(ToneMode::COUNT, 5, "Off plus four one-hot signaling modes");
+    assert_eq!(ToneMode::ALL.map(u8::from), [0, 8, 4, 2, 1]);
+    for raw in [0, 1, 2, 4, 8] {
+        assert!(
+            ToneMode::try_from(raw).is_ok(),
+            "{raw} is a valid tone mode"
+        );
+    }
+    for raw in [3, 5, 6, 7, 9, 15] {
+        assert!(ToneMode::try_from(raw).is_err(), "{raw} is not one-hot");
+    }
 }
 
 #[test]
 fn shift_direction_boundary() {
+    assert_eq!(ShiftDirection::COUNT, 4);
     assert!(
-        ShiftDirection::try_from(15u8).is_ok(),
-        "15 is the last valid shift direction (4-bit field)"
+        ShiftDirection::try_from(ShiftDirection::Minus7Point6MHz as u8).is_ok(),
+        "3 is the dedicated -7.6 MHz shift"
     );
     assert!(
-        ShiftDirection::try_from(16u8).is_err(),
-        "16 must be rejected"
+        ShiftDirection::try_from(ShiftDirection::COUNT).is_err(),
+        "4 is the separate split flag, not a shift value"
     );
 }
 
@@ -138,53 +152,14 @@ fn step_size_boundary() {
 }
 
 #[test]
-fn data_speed_boundary() {
-    assert_eq!(DataSpeed::COUNT, 2, "spec: KI4LAX");
+fn channel_urcall_length_boundary() {
     assert!(
-        DataSpeed::try_from(DataSpeed::COUNT - 1).is_ok(),
-        "1 (9600bps) is the last valid data speed"
+        DstarCallsign::new("12345678").is_ok(),
+        "8-byte URCALL must be accepted"
     );
     assert!(
-        DataSpeed::try_from(DataSpeed::COUNT).is_err(),
-        "2 must be rejected"
-    );
-}
-
-#[test]
-fn lockout_boundary() {
-    assert_eq!(LockoutMode::COUNT, 3, "spec: KI4LAX ME field");
-    assert!(
-        LockoutMode::try_from(LockoutMode::COUNT - 1).is_ok(),
-        "2 (Group) is the last valid lockout mode"
-    );
-    assert!(
-        LockoutMode::try_from(LockoutMode::COUNT).is_err(),
-        "3 must be rejected"
-    );
-}
-
-#[test]
-fn ctcss_mode_boundary() {
-    assert_eq!(CtcssMode::COUNT, 3, "spec: firmware RE");
-    assert!(
-        CtcssMode::try_from(CtcssMode::COUNT - 1).is_ok(),
-        "2 (EncodeOnly) is the last valid CTCSS mode"
-    );
-    assert!(
-        CtcssMode::try_from(CtcssMode::COUNT).is_err(),
-        "3 must be rejected"
-    );
-}
-
-#[test]
-fn channel_name_length_boundary() {
-    assert!(
-        ChannelName::new("12345678").is_ok(),
-        "8-char name must be accepted"
-    );
-    assert!(
-        ChannelName::new("123456789").is_err(),
-        "9-char name must be rejected"
+        DstarCallsign::new("123456789").is_err(),
+        "9-byte URCALL must be rejected"
     );
 }
 
@@ -210,7 +185,7 @@ fn dcs_code_index_boundary() {
 fn tone_code_full_valid_range() -> TestResult {
     for i in 0u8..=ToneCode::MAX_INDEX {
         let val = ToneCode::new(i)?;
-        assert_eq!(val.index(), i, "ToneCode round-trip failed at {i}");
+        assert_eq!(val.as_raw(), i, "ToneCode round-trip failed at {i}");
     }
     for i in (ToneCode::MAX_INDEX + 1)..=255 {
         assert!(ToneCode::new(i).is_err(), "ToneCode({i}) should be invalid");
@@ -231,13 +206,16 @@ fn band_full_valid_range() -> TestResult {
 }
 
 #[test]
-fn mode_full_valid_range() -> TestResult {
-    for i in 0u8..Mode::COUNT {
-        let val = Mode::try_from(i)?;
-        assert_eq!(u8::from(val), i, "Mode round-trip failed at {i}");
+fn operating_mode_full_valid_range() -> TestResult {
+    for i in 0u8..OperatingMode::COUNT {
+        let val = OperatingMode::try_from(i)?;
+        assert_eq!(u8::from(val), i, "OperatingMode round-trip failed at {i}");
     }
-    for i in Mode::COUNT..=255 {
-        assert!(Mode::try_from(i).is_err(), "Mode({i}) should be invalid");
+    for i in OperatingMode::COUNT..=255 {
+        assert!(
+            OperatingMode::try_from(i).is_err(),
+            "OperatingMode({i}) should be invalid"
+        );
     }
     Ok(())
 }
@@ -246,7 +224,7 @@ fn mode_full_valid_range() -> TestResult {
 fn dcs_code_full_valid_range() -> TestResult {
     for i in 0u8..DcsCode::COUNT {
         let val = DcsCode::new(i)?;
-        assert_eq!(val.index(), i, "DcsCode round-trip failed at {i}");
+        assert_eq!(val.as_raw(), i, "DcsCode round-trip failed at {i}");
     }
     for i in DcsCode::COUNT..=255 {
         assert!(DcsCode::new(i).is_err(), "DcsCode({i}) should be invalid");
@@ -265,7 +243,7 @@ fn ctcss_frequency_table_every_entry() {
         107.2, 110.9, 114.8, 118.8, 123.0, 127.3, 131.8, 136.5, 141.3, 146.2, 151.4, 156.7, 159.8,
         162.2, 165.5, 167.9, 171.3, 173.8, 177.3, 179.9, 183.5, 186.2, 189.9, 192.8, 196.6, 199.5,
         203.5, 206.5, 210.7, 218.1, 225.7, 229.1, 233.6, 241.8, 250.3, 254.1,
-        1750.0, // Code 50: 1750 Hz tone burst (ARFC RE, not a CTCSS tone)
+        1750.0, // Code 50: 1750 Hz tone burst, not a CTCSS tone.
     ];
     assert_eq!(CTCSS_FREQUENCIES.len(), expected.len());
     for (i, (&actual, &exp)) in CTCSS_FREQUENCIES.iter().zip(expected.iter()).enumerate() {
@@ -335,10 +313,10 @@ fn tone_code_frequency_cross_reference() -> TestResult {
     for i in 0u8..ToneCode::MAX_INDEX {
         let tc = ToneCode::new(i)?;
         let expected = entry(&CTCSS_FREQUENCIES, usize::from(i), "CTCSS_FREQUENCIES")?;
-        let actual = tc.frequency_hz();
+        let actual = tc.as_hz();
         assert!(
             (actual - expected).abs() < f64::EPSILON,
-            "ToneCode({i}).frequency_hz() = {actual}, expected CTCSS_FREQUENCIES[{i}] = {expected}"
+            "ToneCode({i}).as_hz() = {actual}, expected CTCSS_FREQUENCIES[{i}] = {expected}"
         );
     }
     Ok(())
@@ -389,14 +367,14 @@ fn smeter_reading_boundary() {
 }
 
 #[test]
-fn vfo_memory_mode_boundary() {
-    assert_eq!(VfoMemoryMode::COUNT, 4, "spec: KI4LAX VM + ARFC RE");
+fn tuning_mode_boundary() {
+    assert_eq!(TuningMode::COUNT, 4, "established VM domain is 0-3");
     assert!(
-        VfoMemoryMode::try_from(VfoMemoryMode::COUNT - 1).is_ok(),
+        TuningMode::try_from(TuningMode::COUNT - 1).is_ok(),
         "3 is max"
     );
     assert!(
-        VfoMemoryMode::try_from(VfoMemoryMode::COUNT).is_err(),
+        TuningMode::try_from(TuningMode::COUNT).is_err(),
         "4 must be rejected"
     );
 }
@@ -419,7 +397,7 @@ fn battery_level_boundary() {
     assert_eq!(
         BatteryLevel::COUNT,
         6,
-        "firmware handler domain is 0-5; meaning of raw 5 is unqualified"
+        "BL domain is 0-5; meaning of raw 5 is unqualified"
     );
     assert!(
         BatteryLevel::try_from(BatteryLevel::COUNT - 1).is_ok(),
@@ -443,7 +421,7 @@ fn vox_gain_boundary() {
 
 #[test]
 fn vox_delay_boundary() {
-    assert_eq!(VoxDelay::MAX, 6, "firmware/MCP raw domain is 0-6");
+    assert_eq!(VoxDelay::MAX, 6, "CAT/MCP raw domain is 0-6");
     assert!(VoxDelay::new(VoxDelay::MAX).is_ok(), "6 is max");
     assert!(
         VoxDelay::new(VoxDelay::MAX + 1).is_err(),
@@ -452,18 +430,21 @@ fn vox_delay_boundary() {
 }
 
 #[test]
-fn tnc_baud_boundary() {
-    assert_eq!(TncBaud::COUNT, 2, "spec: KI4LAX TN");
-    assert!(TncBaud::try_from(TncBaud::COUNT - 1).is_ok(), "1 is max");
+fn packet_data_rate_boundary() {
+    assert_eq!(PacketDataRate::COUNT, 2, "CAT TN/AS domain is 0-1");
     assert!(
-        TncBaud::try_from(TncBaud::COUNT).is_err(),
+        PacketDataRate::try_from(PacketDataRate::COUNT - 1).is_ok(),
+        "1 is max"
+    );
+    assert!(
+        PacketDataRate::try_from(PacketDataRate::COUNT).is_err(),
         "2 must be rejected"
     );
 }
 
 #[test]
 fn beacon_mode_boundary() {
-    assert_eq!(BeaconMode::COUNT, 4, "firmware ledger: PT 0-3");
+    assert_eq!(BeaconMode::COUNT, 4, "PT domain is 0-3");
     assert!(
         BeaconMode::try_from(BeaconMode::COUNT - 1).is_ok(),
         "3 is max"
@@ -492,20 +473,20 @@ fn dstar_slot_boundary() {
 
 #[test]
 fn detect_output_mode_boundary() {
-    assert_eq!(DetectOutputMode::COUNT, 3, "spec: KI4LAX IO + ARFC RE");
+    assert_eq!(UsbAudioOutput::COUNT, 3, "IO domain is 0-2");
     assert!(
-        DetectOutputMode::try_from(DetectOutputMode::COUNT - 1).is_ok(),
+        UsbAudioOutput::try_from(UsbAudioOutput::COUNT - 1).is_ok(),
         "2 is max"
     );
     assert!(
-        DetectOutputMode::try_from(DetectOutputMode::COUNT).is_err(),
+        UsbAudioOutput::try_from(UsbAudioOutput::COUNT).is_err(),
         "3 must be rejected"
     );
 }
 
 #[test]
 fn dv_gateway_mode_boundary() {
-    assert_eq!(DvGatewayMode::COUNT, 2, "firmware GW/MCP domain is 0-1");
+    assert_eq!(DvGatewayMode::COUNT, 2, "GW/MCP domain is 0-1");
     assert!(
         DvGatewayMode::try_from(DvGatewayMode::COUNT - 1).is_ok(),
         "1 is max"
@@ -518,11 +499,7 @@ fn dv_gateway_mode_boundary() {
 
 #[test]
 fn tnc_mode_boundary() {
-    assert_eq!(
-        TncMode::COUNT,
-        4,
-        "spec: firmware RE (3 from KI4LAX + MMDVM)"
-    );
+    assert_eq!(TncMode::COUNT, 4, "verified TNC mode domain is 0-3");
     assert!(TncMode::try_from(TncMode::COUNT - 1).is_ok(), "3 is max");
     assert!(
         TncMode::try_from(TncMode::COUNT).is_err(),
@@ -532,7 +509,7 @@ fn tnc_mode_boundary() {
 
 #[test]
 fn gps_radio_mode_boundary() {
-    assert_eq!(GpsRadioMode::COUNT, 2, "spec: firmware guard local_18 < 2");
+    assert_eq!(GpsRadioMode::COUNT, 2, "GM domain is 0-1");
     assert!(
         GpsRadioMode::try_from(GpsRadioMode::COUNT - 1).is_ok(),
         "1 is max"
@@ -546,11 +523,11 @@ fn gps_radio_mode_boundary() {
 #[test]
 fn filter_width_index_ssb_boundary() {
     assert!(
-        FilterWidthIndex::new(4, FilterMode::Ssb).is_ok(),
+        FilterWidthIndex::new(FilterMode::Ssb, 4).is_ok(),
         "4 is max for SSB"
     );
     assert!(
-        FilterWidthIndex::new(5, FilterMode::Ssb).is_err(),
+        FilterWidthIndex::new(FilterMode::Ssb, 5).is_err(),
         "5 must be rejected for SSB"
     );
 }
@@ -558,11 +535,11 @@ fn filter_width_index_ssb_boundary() {
 #[test]
 fn filter_width_index_am_boundary() {
     assert!(
-        FilterWidthIndex::new(3, FilterMode::Am).is_ok(),
+        FilterWidthIndex::new(FilterMode::Am, 3).is_ok(),
         "3 is max for AM"
     );
     assert!(
-        FilterWidthIndex::new(4, FilterMode::Am).is_err(),
+        FilterWidthIndex::new(FilterMode::Am, 4).is_err(),
         "4 must be rejected for AM"
     );
 }
@@ -578,28 +555,15 @@ fn fine_step_boundary() {
 }
 
 #[test]
-fn key_lock_type_boundary() {
-    assert_eq!(KeyLockType::COUNT, 3, "spec: User Manual Menu 960");
+fn key_lock_selection_boundary() {
+    assert_eq!(KeyLockSelection::COUNT, 4, "spec: MCP-D75 Menu 960");
     assert!(
-        KeyLockType::try_from(KeyLockType::COUNT - 1).is_ok(),
-        "2 is max"
+        KeyLockSelection::try_from(KeyLockSelection::COUNT - 1).is_ok(),
+        "3 is the final two-bit combination"
     );
     assert!(
-        KeyLockType::try_from(KeyLockType::COUNT).is_err(),
-        "3 must be rejected"
-    );
-}
-
-#[test]
-fn coarse_step_multiplier_boundary() {
-    assert_eq!(CoarseStepMultiplier::COUNT, 6, "spec: ARFC RE a/a2.cs");
-    assert!(
-        CoarseStepMultiplier::try_from(CoarseStepMultiplier::COUNT - 1).is_ok(),
-        "5 is max"
-    );
-    assert!(
-        CoarseStepMultiplier::try_from(CoarseStepMultiplier::COUNT).is_err(),
-        "6 must be rejected"
+        KeyLockSelection::try_from(KeyLockSelection::COUNT).is_err(),
+        "unknown lock bits must be rejected"
     );
 }
 
@@ -617,42 +581,23 @@ fn cross_tone_type_boundary() {
 }
 
 #[test]
-fn flash_duplex_boundary() {
-    assert_eq!(FlashDuplex::COUNT, 3, "spec: firmware RE byte 0x0A");
+fn digital_squelch_type_boundary() {
+    assert_eq!(DigitalSquelchType::COUNT, 3, "spec: KI4LAX FO field T");
     assert!(
-        FlashDuplex::try_from(FlashDuplex::COUNT - 1).is_ok(),
+        DigitalSquelchType::try_from(DigitalSquelchType::COUNT - 1).is_ok(),
         "2 is max"
     );
     assert!(
-        FlashDuplex::try_from(FlashDuplex::COUNT).is_err(),
-        "3 must be rejected"
-    );
-}
-
-#[test]
-fn flash_digital_squelch_boundary() {
-    assert_eq!(FlashDigitalSquelch::COUNT, 3, "spec: KI4LAX FO field T");
-    assert!(
-        FlashDigitalSquelch::try_from(FlashDigitalSquelch::COUNT - 1).is_ok(),
-        "2 is max"
-    );
-    assert!(
-        FlashDigitalSquelch::try_from(FlashDigitalSquelch::COUNT).is_err(),
+        DigitalSquelchType::try_from(DigitalSquelchType::COUNT).is_err(),
         "3 must be rejected"
     );
 }
 
 #[test]
 fn memory_mode_boundary() {
-    assert_eq!(MemoryMode::COUNT, 8, "spec: KI4LAX TABLE D");
-    assert!(
-        MemoryMode::try_from(MemoryMode::COUNT - 1).is_ok(),
-        "7 is max"
-    );
-    assert!(
-        MemoryMode::try_from(MemoryMode::COUNT).is_err(),
-        "8 must be rejected"
-    );
+    assert_eq!(ChannelMode::COUNT, 9, "FO/ME and stored modes 0-8");
+    assert!(ChannelMode::try_from(8).is_ok(), "8 is WFM");
+    assert!(ChannelMode::try_from(ChannelMode::COUNT).is_err());
 }
 
 #[test]
@@ -670,12 +615,12 @@ fn scan_resume_method_boundary() {
 
 #[test]
 fn cw_pitch_boundary() {
-    assert!(CwPitch::new(400).is_some(), "400 is min");
-    assert!(CwPitch::new(1000).is_some(), "1000 is max");
-    assert!(CwPitch::new(399).is_none(), "399 must be rejected");
-    assert!(CwPitch::new(1001).is_none(), "1001 must be rejected");
+    assert!(CwPitch::new(400).is_ok(), "400 is min");
+    assert!(CwPitch::new(1000).is_ok(), "1000 is max");
+    assert!(CwPitch::new(399).is_err(), "399 must be rejected");
+    assert!(CwPitch::new(1001).is_err(), "1001 must be rejected");
     assert!(
-        CwPitch::new(450).is_none(),
+        CwPitch::new(450).is_err(),
         "450 must be rejected (not on 100 Hz step)"
     );
 }
@@ -689,15 +634,12 @@ fn all_validation_error_variants_display() {
     let variants: Vec<ValidationError> = vec![
         ValidationError::ToneCodeOutOfRange(99),
         ValidationError::BandOutOfRange(99),
-        ValidationError::ModeOutOfRange(99),
+        ValidationError::OperatingModeOutOfRange(99),
         ValidationError::PowerLevelOutOfRange(99),
         ValidationError::ToneModeOutOfRange(99),
         ValidationError::ShiftOutOfRange(99),
         ValidationError::StepSizeOutOfRange(99),
-        ValidationError::DataSpeedOutOfRange(99),
-        ValidationError::LockoutOutOfRange(99),
         ValidationError::DcsCodeInvalid(99),
-        ValidationError::ChannelNameTooLong { len: 99 },
         ValidationError::FrequencyOutOfRange(99),
     ];
     for (i, variant) in variants.iter().enumerate() {
@@ -749,22 +691,26 @@ where
 #[test]
 fn channel_enum_types_round_trip() -> TestResult {
     assert_try_from_round_trip::<Band>(0..Band::COUNT, "Band")?;
-    assert_try_from_round_trip::<Mode>(0..Mode::COUNT, "Mode")?;
+    assert_try_from_round_trip::<OperatingMode>(0..OperatingMode::COUNT, "OperatingMode")?;
     assert_try_from_round_trip::<PowerLevel>(0..PowerLevel::COUNT, "PowerLevel")?;
-    assert_try_from_round_trip::<ToneMode>(0..ToneMode::COUNT, "ToneMode")?;
-    assert_try_from_round_trip::<ShiftDirection>(0..16, "ShiftDirection")?;
+    for tone_mode in ToneMode::ALL {
+        let raw = u8::from(tone_mode);
+        assert_eq!(ToneMode::try_from(raw)?, tone_mode);
+    }
+    assert_try_from_round_trip::<ShiftDirection>(0..ShiftDirection::COUNT, "ShiftDirection")?;
     assert_try_from_round_trip::<StepSize>(0..StepSize::COUNT, "StepSize")?;
-    assert_try_from_round_trip::<DataSpeed>(0..DataSpeed::COUNT, "DataSpeed")?;
-    assert_try_from_round_trip::<LockoutMode>(0..LockoutMode::COUNT, "LockoutMode")?;
-    assert_try_from_round_trip::<CtcssMode>(0..CtcssMode::COUNT, "CtcssMode")?;
     assert_try_from_round_trip::<CrossToneType>(0..CrossToneType::COUNT, "CrossToneType")?;
-    assert_try_from_round_trip::<FlashDuplex>(0..FlashDuplex::COUNT, "FlashDuplex")?;
-    assert_try_from_round_trip::<FlashDigitalSquelch>(
-        0..FlashDigitalSquelch::COUNT,
-        "FlashDigitalSquelch",
+    assert_try_from_round_trip::<ChannelByte0eBits3To2>(
+        0..ChannelByte0eBits3To2::COUNT,
+        "ChannelByte0eBits3To2",
+    )?;
+    assert_try_from_round_trip::<DigitalSquelchType>(
+        0..DigitalSquelchType::COUNT,
+        "DigitalSquelchType",
     )?;
     assert_try_from_round_trip::<FineStep>(0..FineStep::COUNT, "FineStep")?;
-    assert_try_from_round_trip::<MemoryMode>(0..MemoryMode::COUNT, "MemoryMode")?;
+    assert_try_from_round_trip::<ChannelMode>(0..ChannelMode::COUNT, "ChannelMode")?;
+    assert_try_from_round_trip::<CtcssCode>(0..CtcssCode::COUNT, "CtcssCode")?;
     Ok(())
 }
 
@@ -777,29 +723,23 @@ fn radio_param_types_round_trip() -> TestResult {
     assert_try_from_round_trip_inclusive::<AfGainLevel>(0..=AfGainLevel::MAX, "AfGainLevel")?;
     assert_try_from_round_trip::<SquelchLevel>(0..SquelchLevel::COUNT, "SquelchLevel")?;
     assert_try_from_round_trip::<SMeterReading>(0..SMeterReading::COUNT, "SMeterReading")?;
-    assert_try_from_round_trip::<VfoMemoryMode>(0..VfoMemoryMode::COUNT, "VfoMemoryMode")?;
+    assert_try_from_round_trip::<TuningMode>(0..TuningMode::COUNT, "TuningMode")?;
     assert_try_from_round_trip::<FilterMode>(0..FilterMode::COUNT, "FilterMode")?;
     assert_try_from_round_trip::<BatteryLevel>(0..BatteryLevel::COUNT, "BatteryLevel")?;
     assert_try_from_round_trip_inclusive::<VoxGain>(0..=VoxGain::MAX, "VoxGain")?;
     assert_try_from_round_trip_inclusive::<VoxDelay>(0..=VoxDelay::MAX, "VoxDelay")?;
-    assert_try_from_round_trip::<TncBaud>(0..TncBaud::COUNT, "TncBaud")?;
+    assert_try_from_round_trip::<PacketDataRate>(0..PacketDataRate::COUNT, "PacketDataRate")?;
     assert_try_from_round_trip::<BeaconMode>(0..BeaconMode::COUNT, "BeaconMode")?;
     assert_try_from_round_trip::<MyPositionSelection>(
         0..MyPositionSelection::COUNT,
         "MyPositionSelection",
     )?;
     assert_try_from_round_trip::<BacklightControl>(0..BacklightControl::COUNT, "BacklightControl")?;
-    assert_try_from_round_trip::<DetectOutputMode>(0..DetectOutputMode::COUNT, "DetectOutputMode")?;
+    assert_try_from_round_trip::<UsbAudioOutput>(0..UsbAudioOutput::COUNT, "UsbAudioOutput")?;
     assert_try_from_round_trip::<DvGatewayMode>(0..DvGatewayMode::COUNT, "DvGatewayMode")?;
     assert_try_from_round_trip::<TncMode>(0..TncMode::COUNT, "TncMode")?;
     assert_try_from_round_trip::<GpsRadioMode>(0..GpsRadioMode::COUNT, "GpsRadioMode")?;
-    assert_try_from_round_trip::<FilterWidthIndex>(0..5, "FilterWidthIndex")?;
-    assert_try_from_round_trip::<KeyLockType>(0..KeyLockType::COUNT, "KeyLockType")?;
-    assert_try_from_round_trip::<CoarseStepMultiplier>(
-        0..CoarseStepMultiplier::COUNT,
-        "CoarseStepMultiplier",
-    )?;
-
+    assert_try_from_round_trip::<KeyLockSelection>(0..KeyLockSelection::COUNT, "KeyLockSelection")?;
     // DstarSlot starts at 1
     for i in DstarSlot::MIN..=DstarSlot::MAX {
         let val = DstarSlot::new(i)?;
@@ -812,7 +752,7 @@ fn radio_param_types_round_trip() -> TestResult {
             format!("ScanResumeMethod::from_raw({i}) returned None").into()
         })?;
         assert_eq!(
-            val.to_raw(),
+            val.as_raw(),
             i,
             "ScanResumeMethod round-trip failed for {i}"
         );

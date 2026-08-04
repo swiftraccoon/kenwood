@@ -21,6 +21,7 @@ use ax25_codec::parse_ax25;
 // weakening the lint.
 use aprs_is as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kenwood_thd75 as _;
 use kiss_tnc as _;
 use mmdvm as _;

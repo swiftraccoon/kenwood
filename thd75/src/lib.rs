@@ -38,8 +38,8 @@
 //!
 //! # async fn example() -> Result<(), kenwood_thd75::error::Error> {
 //! // Connect over USB serial.
-//! let transport = SerialTransport::open("/dev/cu.usbmodem1234", 115_200)?;
-//! let mut radio = Radio::connect(transport).await?;
+//! let transport = SerialTransport::open("/dev/cu.usbmodem1234")?;
+//! let mut radio = Radio::new(transport);
 //!
 //! // Verify the radio identity.
 //! let info = radio.identify().await?;
@@ -66,20 +66,20 @@
 //! - [`memory`]: typed accessors over a TH-D75 memory image (from MCP or `.d75` files).
 //! - [`sdcard`]: parsers for TH-D75 SD card files (`.d75` config, `.tsv` lists, `.nme` logs, and more).
 //! - [`aprs`]: TH-D75-specific APRS glue, namely [`AprsClient`] owning a [`Radio`]
-//!   and [`KissSession`], the MCP-config bridge, and digipeater-path helpers.
+//!   and [`KissSession`], the stored-settings bridge, and digipeater-path helpers.
 //!   Generic KISS/AX.25/APRS decoding lives in the `kiss-tnc`, `ax25-codec`,
 //!   and `aprs` sibling crates.
-//! - [`mmdvm`]: D-STAR gateway client ([`DStarGateway`]) for Reflector Terminal
+//! - [`dstar_gateway`]: D-STAR gateway client ([`DstarGateway`]) for Reflector Terminal
 //!   Mode, built on the `mmdvm-core` framing codec and `dstar-gateway-core`
 //!   protocol crates.
-//! - [`session`]: link supervision, covering the reconnect backoff policy and the
-//!   opt-in supervisor driving [`Radio::reconnect`](radio::Radio::reconnect).
+//! - [`session`]: explicit link recovery, covering the reconnect backoff policy
+//!   and the opt-in wrapper that drives [`Radio::reconnect`](radio::Radio::reconnect).
 //! - [`error`]: error types for transport, protocol, and validation failures.
 
 pub mod aprs;
+pub mod dstar_gateway;
 pub mod error;
 pub mod memory;
-pub mod mmdvm;
 pub mod protocol;
 pub mod radio;
 pub mod screen;
@@ -101,11 +101,15 @@ use serde_json as _;
 // Convenience re-exports for the most commonly used types.
 pub use error::Error;
 pub use radio::diagnostics::LinkDiagnosis;
-pub use radio::programming::McpSpeed;
+pub use radio::programming::{McpPage, McpSession, WritableMcpPage};
 pub use radio::{FirmwareProfile, Radio};
 #[cfg(target_os = "macos")]
 pub use transport::BluetoothTransport;
 pub use transport::{EitherTransport, MockTransport, SerialTransport, Transport};
+pub use types::{
+    ChannelDisplayName, FirmwareIdentity, HardwareVariant, ModelCode, RadioModel, RadioRegion,
+    RadioType, RegularChannel, SerialInformation, SerialNumber,
+};
 
 // Memory image re-exports.
 pub use memory::{MemoryError, MemoryImage};
@@ -119,21 +123,29 @@ pub use memory::{MemoryError, MemoryImage};
 // than routing through these re-exports.
 pub use ::aprs::{
     AprsData, AprsDataExtension, AprsError, AprsItem, AprsMessage, AprsMessenger, AprsObject,
-    AprsPosition, AprsQuery, AprsStatus, AprsTelemetry, AprsWeather, DigiAction, DigipeaterConfig,
-    Phg, PhgDirectivity, SmartBeaconing, SmartBeaconingConfig, StationEntry, StationList,
-    build_aprs_item, build_aprs_message, build_aprs_mice, build_aprs_object,
+    AprsPosition, AprsPositionlessWeatherReport, AprsQuery, AprsReportTimestamp,
+    AprsReportTimestampFormat, AprsStatus, AprsStatusTimestamp, AprsSymbol, AprsTelemetry,
+    AprsTextError, AprsTextField, AprsWeather, AprsWeatherTimestamp, BarometricPressure,
+    CompressedPositionText, Course, DigiAction, DigipeaterConfig, Fahrenheit, Heading, Humidity,
+    ItemName, Latitude, Longitude, Luminosity, MessageAddressee, MessageId, MessageText, MiceSpeed,
+    MiceStatusText, ObjectName, Phg, PhgDirectivity, PositionReportText, SmartBeaconing,
+    SmartBeaconingConfig, Speed, StationEntry, StationList, StatusText, SymbolTable,
+    ThreeDigitWeatherValue, TimestampedStatusText, WeatherComment, WeatherValueError,
+    WindDirection, build_aprs_item, build_aprs_message, build_aprs_mice, build_aprs_object,
     build_aprs_position_compressed, build_aprs_position_report, build_aprs_status,
-    build_aprs_weather, build_query_response_position, parse_aprs_extensions,
+    build_aprs_timestamped_status, build_aprs_weather, build_query_response_position,
+    parse_aprs_extensions,
 };
 pub use aprs_is::{
-    AprsIsClient, AprsIsConfig, AprsIsError, AprsIsEvent, aprs_is_passcode, build_login_string,
-    format_is_packet, parse_is_line,
+    AprsIsClient, AprsIsConfig, AprsIsError, AprsIsEvent, AprsIsUplinkLine, AprsIsUplinkLineError,
+    IGateFormatError, Passcode, aprs_is_passcode, build_login_string, format_is_packet,
+    parse_is_line,
 };
-pub use ax25_codec::{Ax25Address, Ax25Error, Ax25Packet};
+pub use ax25_codec::{Ax25Address, Ax25Error, Ax25Packet, DigipeaterPath};
 pub use kiss_tnc::{KissError, KissFrame};
 
 // D75-specific re-exports.
-pub use aprs::client::{AprsClient, AprsClientConfig, AprsEvent};
+pub use aprs::client::{AprsClient, AprsClientConfig, AprsEvent, IGateRfLocality, IGateToRfConfig};
 
 // KISS session re-export.
 pub use radio::kiss_session::KissSession;
@@ -141,15 +153,19 @@ pub use radio::kiss_session::KissSession;
 // MMDVM session re-export.
 pub use radio::mmdvm_session::MmdvmSession;
 
-// MMDVM gateway re-exports. Raw codec types live in mmdvm-core; the
+// Link-recovery policy.
+pub use session::ReconnectPolicy;
+
+// D-STAR gateway re-exports. Raw codec types live in mmdvm-core; the
 // async event loop lives in mmdvm. The types re-exported here
 // compose those crates into the D-STAR-specific surface
 // TH-D75 consumers use.
-pub use mmdvm::{
-    DStarEvent, DStarGateway, DStarGatewayConfig, LastHeardEntry, MmdvmError, ModemMode,
-    ModemStatus, NakReason, ReconnectPolicy,
+pub use dstar_gateway::{
+    DstarEvent, DstarGateway, DstarGatewayConfig, DstarProtocolViolation, DstarStatusReflector,
+    DstarStatusReflectorError, LastHeardEntry, MmdvmError, ModemMode, ModemStatus, NakReason,
+    ObservedDstarCallsign, SlowDataTextMessage, WireTextError,
 };
 
 // SD card re-exports.
 pub use sdcard::SdCardError;
-pub use sdcard::config::{ConfigHeader, write_d75};
+pub use sdcard::config::{ConfigFileModel, ConfigHeader, RadioConfig, parse_config, write_config};

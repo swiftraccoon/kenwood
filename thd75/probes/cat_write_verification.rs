@@ -7,13 +7,9 @@ use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::*;
 
-async fn connect() -> Radio<SerialTransport> {
+fn connect() -> Radio<SerialTransport> {
     let ports = SerialTransport::discover_usb().unwrap();
-    Radio::connect(
-        SerialTransport::open(&ports[0].port_name, SerialTransport::DEFAULT_BAUD).unwrap(),
-    )
-    .await
-    .unwrap()
+    Radio::new(SerialTransport::open(&ports[0].port_name).unwrap())
 }
 
 macro_rules! test_write {
@@ -41,7 +37,7 @@ macro_rules! test_write {
 #[tokio::test]
 #[ignore]
 async fn verify_cat_writes() {
-    let mut radio = connect().await;
+    let mut radio = connect();
 
     println!("\n=== CAT WRITE COMMAND VERIFICATION ===\n");
     println!("  {:<25} RESULT", "COMMAND");
@@ -66,7 +62,7 @@ async fn verify_cat_writes() {
 
     // VOX gain
     let orig_vg = radio.get_vox_gain().await.unwrap();
-    let new_vg = if orig_vg == 3 { 6 } else { 3 };
+    let new_vg = VoxGain::new(if orig_vg.as_raw() == 3 { 6 } else { 3 }).unwrap();
     match radio.set_vox_gain(new_vg).await {
         Ok(()) => {
             let rb = radio.get_vox_gain().await.unwrap();
@@ -82,7 +78,11 @@ async fn verify_cat_writes() {
 
     // VOX delay
     let orig_vd = radio.get_vox_delay().await.unwrap();
-    let new_vd = if orig_vd == 2 { 5 } else { 2 };
+    let new_vd = if orig_vd == VoxDelay::MS_750 {
+        VoxDelay::MS_2000
+    } else {
+        VoxDelay::MS_750
+    };
     match radio.set_vox_delay(new_vd).await {
         Ok(()) => {
             let rb = radio.get_vox_delay().await.unwrap();
@@ -132,18 +132,22 @@ async fn verify_cat_writes() {
     }
 
     // Dual band
-    let orig_dl = radio.get_dual_band().await.unwrap();
-    match radio.set_dual_band(!orig_dl).await {
+    let orig_dl = radio.get_band_mode().await.unwrap();
+    let next_dl = match orig_dl {
+        BandMode::Dual => BandMode::Single,
+        BandMode::Single => BandMode::Dual,
+    };
+    match radio.set_band_mode(next_dl).await {
         Ok(()) => {
-            let rb = radio.get_dual_band().await.unwrap();
-            let _ = radio.set_dual_band(orig_dl).await;
-            if rb == !orig_dl {
-                println!("  {:<25} OK", "SetDualBand");
+            let rb = radio.get_band_mode().await.unwrap();
+            let _ = radio.set_band_mode(orig_dl).await;
+            if rb == next_dl {
+                println!("  {:<25} OK", "SetBandMode");
             } else {
-                println!("  {:<25} FAIL", "SetDualBand");
+                println!("  {:<25} FAIL", "SetBandMode");
             }
         }
-        Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetDualBand"),
+        Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetBandMode"),
     }
 
     // LCD backlight control
@@ -183,7 +187,7 @@ async fn verify_cat_writes() {
 
     // Squelch
     let orig_sq = radio.get_squelch(Band::A).await.unwrap();
-    let new_sq = if orig_sq == 3 { 5 } else { 3 };
+    let new_sq = SquelchLevel::new(if orig_sq.as_raw() == 3 { 5 } else { 3 }).unwrap();
     match radio.set_squelch(Band::A, new_sq).await {
         Ok(()) => {
             let rb = radio.get_squelch(Band::A).await.unwrap();
@@ -201,21 +205,21 @@ async fn verify_cat_writes() {
     let bl = radio.get_battery_level().await.unwrap();
     println!("  {:<25} READ_ONLY (level: {bl})", "BatteryLevel");
 
-    // Mode
-    let orig_md = radio.get_mode(Band::A).await.unwrap();
-    let new_md = if orig_md == Mode::Fm {
-        Mode::Nfm
+    // Operating mode
+    let orig_md = radio.get_operating_mode(Band::A).await.unwrap();
+    let new_md = if orig_md == OperatingMode::Fm {
+        OperatingMode::Nfm
     } else {
-        Mode::Fm
+        OperatingMode::Fm
     };
-    match radio.set_mode(Band::A, new_md).await {
+    match radio.set_operating_mode(Band::A, new_md).await {
         Ok(()) => {
-            let rb = radio.get_mode(Band::A).await.unwrap();
-            let _ = radio.set_mode(Band::A, orig_md).await;
+            let rb = radio.get_operating_mode(Band::A).await.unwrap();
+            let _ = radio.set_operating_mode(Band::A, orig_md).await;
             if rb == new_md {
-                println!("  {:<25} OK", "SetMode");
+                println!("  {:<25} OK", "SetOperatingMode");
             } else {
-                println!("  {:<25} FAIL (readback: {rb:?})", "SetMode");
+                println!("  {:<25} FAIL (readback: {rb:?})", "SetOperatingMode");
             }
         }
         Err(e) => println!("  {:<25} WRITE_FAILED: {e}", "SetMode"),

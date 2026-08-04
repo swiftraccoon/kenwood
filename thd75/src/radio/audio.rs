@@ -3,29 +3,18 @@
 //! Controls global AF (Audio Frequency) gain and VOX (Voice-Operated
 //! Exchange) settings for hands-free transmit.
 //!
-//! # D75 tone commands
-//!
-//! The D75 firmware RE originally identified TN, DC, and RT as tone commands.
-//! Hardware testing revealed their actual functions:
-//! - **TN**: TNC mode (not CTCSS tone)
-//! - **DC**: D-STAR callsign slots (not DCS code)
-//! - **RT**: Real-time clock (not repeater tone)
-//!
-//! CTCSS tone and DCS code are instead configured through the FO (full
-//! frequency/offset) command's channel data fields.
-
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::{AfGainLevel, DstarSlot, RadioClock, TncBaud, TncMode, VoxDelay, VoxGain};
+use crate::types::{AfGainLevel, VoxDelay, VoxGain};
 
 use super::Radio;
 
 impl<T: Transport> Radio<T> {
     /// Get the AF gain level (AG read).
     ///
-    /// D75 RE: bare `AG\r` returns global gain level. Band-indexed read
-    /// returns `?`, so this is a global query.
+    /// Bare `AG\r` returns the global gain level. A band-indexed read returns
+    /// `?`, so this is a global query.
     ///
     /// # Errors
     ///
@@ -62,164 +51,6 @@ impl<T: Transport> Radio<T> {
             Response::AfGain { .. } => Ok(()),
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "AfGain".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Get the TNC mode (TN bare read).
-    ///
-    /// Hardware-verified: bare `TN\r` returns `TN mode,setting`.
-    /// Returns `(mode, setting)`.
-    ///
-    /// Valid mode values per firmware validation: 0, 1, 2, 3.
-    /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_tnc_mode(&mut self) -> Result<(TncMode, TncBaud), Error> {
-        tracing::debug!("reading TNC mode");
-        let response = self.execute(Command::GetTncMode).await?;
-        match response {
-            Response::TncMode { mode, setting } => Ok((mode, setting)),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "TncMode".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Set the TNC mode (TN write).
-    ///
-    /// Valid mode values per firmware validation: 0, 1, 2, 3.
-    /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
-    ///
-    /// # Wire format
-    ///
-    /// `TN mode,setting\r`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_tnc_mode(&mut self, mode: TncMode, setting: TncBaud) -> Result<(), Error> {
-        tracing::info!(?mode, ?setting, "setting TNC mode");
-        let response = self.execute(Command::SetTncMode { mode, setting }).await?;
-        match response {
-            Response::TncMode { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "TncMode".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Get D-STAR callsign data for a slot (DC read).
-    ///
-    /// Hardware-verified: `DC slot\r` where slot is 1-6.
-    /// Returns `(callsign, suffix)`.
-    ///
-    /// Note: This method lives in `audio.rs` rather than `dstar.rs` because
-    /// it was discovered during audio subsystem hardware probing. The `DC`
-    /// mnemonic is overloaded on the D75 (DCS code, not D-STAR callsign
-    /// as on D74).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_dstar_callsign(&mut self, slot: DstarSlot) -> Result<(String, String), Error> {
-        tracing::debug!(?slot, "reading D-STAR callsign");
-        let response = self.execute(Command::GetDstarCallsign { slot }).await?;
-        match response {
-            Response::DstarCallsign {
-                callsign, suffix, ..
-            } => Ok((callsign, suffix)),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "DstarCallsign".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Set D-STAR callsign data for a slot (DC write).
-    ///
-    /// Writes callsign and suffix data to one of the 6 D-STAR callsign slots.
-    ///
-    /// # Wire format
-    ///
-    /// `DC slot,callsign,suffix\r` where slot is 1-6, callsign is 8 characters
-    /// (space-padded), and suffix is up to 4 characters.
-    ///
-    /// # Parameters
-    ///
-    /// - `slot`: Callsign slot number (1-6).
-    /// - `callsign`: Callsign string (8 characters, space-padded to length).
-    /// - `suffix`: Callsign suffix (up to 4 characters, e.g., "D75A").
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn set_dstar_callsign(
-        &mut self,
-        slot: DstarSlot,
-        callsign: &str,
-        suffix: &str,
-    ) -> Result<(), Error> {
-        // Validate through the typed callsign/suffix constructors so
-        // an over-length value never reaches the wire.
-        if crate::types::DstarCallsign::new(callsign).is_none() {
-            return Err(Error::Validation(
-                crate::error::ValidationError::CallsignTooLong {
-                    len: callsign.len(),
-                    max: 8,
-                },
-            ));
-        }
-        if crate::types::DstarSuffix::new(suffix).is_none() {
-            return Err(Error::Validation(
-                crate::error::ValidationError::CallsignTooLong {
-                    len: suffix.len(),
-                    max: 4,
-                },
-            ));
-        }
-        tracing::info!(?slot, callsign, suffix, "setting D-STAR callsign");
-        let response = self
-            .execute(Command::SetDstarCallsign {
-                slot,
-                callsign: callsign.to_owned(),
-                suffix: suffix.to_owned(),
-            })
-            .await?;
-        match response {
-            Response::DstarCallsign { .. } => Ok(()),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "DstarCallsign".into(),
-                actual: format!("{other:?}").into_bytes(),
-            })),
-        }
-    }
-
-    /// Get the real-time clock (RT bare read).
-    ///
-    /// Note: This method lives in `audio.rs` rather than `system.rs` because
-    /// `RT` is overloaded on the D75 (repeater tone vs real-time clock on D74).
-    /// It was discovered during audio subsystem probing.
-    ///
-    /// Hardware-verified: bare `RT\r` returns either a calendar-valid
-    /// `RT YYMMDDHHmmss` value or the exact `RT ------------` unavailable
-    /// sentinel.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    pub async fn get_real_time_clock(&mut self) -> Result<RadioClock, Error> {
-        tracing::debug!("reading real-time clock");
-        let response = self.execute(Command::GetRealTimeClock).await?;
-        match response {
-            Response::RealTimeClock { clock } => Ok(clock),
-            other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "RealTimeClock".into(),
                 actual: format!("{other:?}").into_bytes(),
             })),
         }

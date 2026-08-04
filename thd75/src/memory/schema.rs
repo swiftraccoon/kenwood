@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::protocol::programming;
+use crate::protocol::programming::{self, McpPage, WritableMcpPage};
 
 /// Byte order for a multi-byte integer field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,9 +27,10 @@ pub enum StringEncoding {
     Utf8,
     /// MCP-D75's model-dependent memory-map encoding.
     ///
-    /// The patch engine accepts ASCII for this encoding.  Non-ASCII input is
-    /// rejected because the official application switches between Windows-
-    /// 1252 and Shift-JIS according to the radio model.
+    /// The patch engine accepts only printable ASCII (`0x20`-`0x7E`) for this
+    /// encoding. Other bytes are rejected because control bytes are not
+    /// display text and the official application switches between Windows-
+    /// 1252 and Shift-JIS for extended characters according to radio model.
     MemoryMap,
 }
 
@@ -62,6 +63,12 @@ pub enum FieldCodec {
         max: u8,
     },
     /// A fixed-width padded string.
+    ///
+    /// NUL padding is terminator-based: decoded bytes after the first NUL
+    /// must also be NUL. Other padding bytes are removed only from the end.
+    /// Semantic text containing a NUL for NUL padding, or ending in any
+    /// non-NUL padding byte, is rejected so encoding and decoding are exact
+    /// inverses for every accepted value.
     FixedString {
         /// Number of bytes reserved in the image.
         len: usize,
@@ -135,17 +142,24 @@ impl FieldDescriptor {
         }
     }
 
-    /// MCP page containing the field's first byte.
+    /// Physical MCP page containing the field's first byte.
     ///
     /// # Errors
     ///
     /// Returns [`SchemaError::OffsetTooLarge`] when the offset cannot be
-    /// represented by the TH-D75's 16-bit page address.
-    pub fn page(self) -> Result<u16, SchemaError> {
+    /// represented by the TH-D75's 16-bit page address, or
+    /// [`SchemaError::OutOfBounds`] when it is outside the physical image.
+    pub fn page(self) -> Result<McpPage, SchemaError> {
         let page = self.offset / programming::PAGE_SIZE;
-        u16::try_from(page).map_err(|_| SchemaError::OffsetTooLarge {
+        let page = u16::try_from(page).map_err(|_| SchemaError::OffsetTooLarge {
             field: self.name,
             offset: self.offset,
+        })?;
+        McpPage::new(page).map_err(|_| SchemaError::OutOfBounds {
+            field: self.name,
+            offset: self.offset,
+            len: 1,
+            image_len: programming::TOTAL_SIZE,
         })
     }
 
@@ -153,23 +167,38 @@ impl FieldDescriptor {
     ///
     /// # Errors
     ///
-    /// Returns an error for an out-of-bounds field, malformed codec, or an
-    /// invalid encoded string.
+    /// Returns an error for an out-of-bounds field, malformed codec, invalid
+    /// encoded value, or a value outside the field's declared domain.
+    /// [`SchemaError::FixedStringDataAfterNul`] identifies an ambiguous
+    /// NUL-padded field instead of discarding bytes after its terminator. If
+    /// this descriptor names a generated menu field, its finite enum or
+    /// UI-choice domain is enforced as well.
     pub fn read(self, image: &[u8]) -> Result<DecodedFieldValue, SchemaError> {
-        match self.codec {
-            FieldCodec::Byte { .. } => Ok(DecodedFieldValue::Unsigned(u64::from(read_byte(
-                image,
-                self.name,
-                self.offset,
-            )?))),
-            FieldCodec::Bool => Ok(DecodedFieldValue::Bool(
-                read_byte(image, self.name, self.offset)? != 0,
-            )),
+        let menu_field = super::menu_field(self.name);
+        if let Some(field) = menu_field
+            && field.descriptor != self
+        {
+            return Err(SchemaError::CatalogDescriptorMismatch {
+                field: self.name,
+                offset: self.offset,
+                expected_offset: field.descriptor.offset,
+            });
+        }
+
+        let decoded = match self.codec {
+            FieldCodec::Byte { min, max } => {
+                let value = u64::from(read_byte(image, self.name, self.offset)?);
+                validate_unsigned(self.name, value, u64::from(min), u64::from(max))?;
+                DecodedFieldValue::Unsigned(value)
+            }
+            FieldCodec::Bool => {
+                let value = read_byte(image, self.name, self.offset)?;
+                validate_unsigned(self.name, u64::from(value), 0, 1)?;
+                DecodedFieldValue::Bool(value == 1)
+            }
             FieldCodec::BitBool { mask } => {
                 validate_bool_mask(self.name, mask)?;
-                Ok(DecodedFieldValue::Bool(
-                    read_byte(image, self.name, self.offset)? & mask != 0,
-                ))
+                DecodedFieldValue::Bool(read_byte(image, self.name, self.offset)? & mask != 0)
             }
             FieldCodec::BitField {
                 mask,
@@ -179,9 +208,9 @@ impl FieldDescriptor {
             } => {
                 validate_bit_codec(self.name, mask, shift, min, max)?;
                 let byte = read_byte(image, self.name, self.offset)?;
-                Ok(DecodedFieldValue::Unsigned(u64::from(
-                    (byte & mask) >> shift,
-                )))
+                let value = u64::from((byte & mask) >> shift);
+                validate_unsigned(self.name, value, u64::from(min), u64::from(max))?;
+                DecodedFieldValue::Unsigned(value)
             }
             FieldCodec::FixedString {
                 len,
@@ -189,37 +218,60 @@ impl FieldDescriptor {
                 padding,
             } => {
                 let bytes = read_range(image, self.name, self.offset, len)?;
-                let end = bytes
-                    .iter()
-                    .rposition(|&byte| byte != padding)
-                    .map_or(0, |index| index + 1);
-                let trimmed = bytes.get(..end).ok_or(SchemaError::OutOfBounds {
-                    field: self.name,
-                    offset: self.offset,
-                    len,
-                    image_len: image.len(),
-                })?;
-                if encoding == StringEncoding::MemoryMap && !trimmed.is_ascii() {
-                    return Err(SchemaError::UnsupportedMemoryMapText { field: self.name });
+                let semantic =
+                    decode_fixed_string_bytes(self.name, self.offset, image.len(), bytes, padding)?;
+                if encoding == StringEncoding::MemoryMap
+                    && let Some((offset, &value)) = semantic
+                        .iter()
+                        .enumerate()
+                        .find(|(_, value)| !is_printable_ascii(**value))
+                {
+                    return Err(SchemaError::InvalidMemoryMapTextByte {
+                        field: self.name,
+                        offset,
+                        value,
+                    });
                 }
-                let text = std::str::from_utf8(trimmed)
+                let text = std::str::from_utf8(semantic)
                     .map_err(|_| SchemaError::InvalidText { field: self.name })?;
-                Ok(DecodedFieldValue::Text(text.to_owned()))
+                DecodedFieldValue::Text(text.to_owned())
             }
-            FieldCodec::Unsigned { width, endian, .. } => {
+            FieldCodec::Unsigned {
+                width,
+                endian,
+                min,
+                max,
+            } => {
                 let width = validate_width(self.name, width)?;
-                let bytes = read_range(image, self.name, self.offset, width)?;
-                Ok(DecodedFieldValue::Unsigned(decode_unsigned(bytes, endian)))
+                validate_unsigned_capacity(self.name, width, max)?;
+                let bytes = read_range(image, self.name, self.offset, width.bytes())?;
+                let value = decode_unsigned(bytes, endian);
+                validate_unsigned(self.name, value, min, max)?;
+                DecodedFieldValue::Unsigned(value)
             }
-            FieldCodec::Signed { width, endian, .. } => {
+            FieldCodec::Signed {
+                width,
+                endian,
+                min,
+                max,
+            } => {
                 let width = validate_width(self.name, width)?;
-                let bytes = read_range(image, self.name, self.offset, width)?;
-                Ok(DecodedFieldValue::Signed(decode_signed(bytes, endian)))
+                validate_signed_capacity(self.name, width, min, max)?;
+                let bytes = read_range(image, self.name, self.offset, width.bytes())?;
+                let value = decode_signed(bytes, width, endian);
+                validate_signed(self.name, value, min, max)?;
+                DecodedFieldValue::Signed(value)
             }
-            FieldCodec::Bytes { len } => Ok(DecodedFieldValue::Bytes(
-                read_range(image, self.name, self.offset, len)?.to_vec(),
-            )),
+            FieldCodec::Bytes { len } => {
+                DecodedFieldValue::Bytes(read_range(image, self.name, self.offset, len)?.to_vec())
+            }
+        };
+
+        if let Some(field) = menu_field {
+            field.validate_patch_value(decoded.as_field_value())?;
         }
+
+        Ok(decoded)
     }
 }
 
@@ -264,6 +316,18 @@ pub enum DecodedFieldValue {
     Text(String),
     /// Raw bytes.
     Bytes(Vec<u8>),
+}
+
+impl DecodedFieldValue {
+    const fn as_field_value(&self) -> FieldValue<'_> {
+        match self {
+            Self::Unsigned(value) => FieldValue::Unsigned(*value),
+            Self::Signed(value) => FieldValue::Signed(*value),
+            Self::Bool(value) => FieldValue::Bool(*value),
+            Self::Text(value) => FieldValue::Text(value.as_str()),
+            Self::Bytes(value) => FieldValue::Bytes(value.as_slice()),
+        }
+    }
 }
 
 /// Failure while validating, encoding, merging, or applying schema patches.
@@ -326,10 +390,42 @@ pub enum SchemaError {
         /// Maximum byte count.
         max: usize,
     },
-    /// Non-ASCII text was supplied for a model-dependent memory-map field.
-    UnsupportedMemoryMapText {
+    /// Semantic text for a NUL-padded field contains its terminator byte.
+    TextContainsNul {
         /// Field name.
         field: &'static str,
+        /// Zero-based byte offset of the NUL within the supplied text.
+        offset: usize,
+    },
+    /// Semantic text ends with the field's padding byte and would be shortened
+    /// when decoded.
+    TextEndsWithPadding {
+        /// Field name.
+        field: &'static str,
+        /// Zero-based byte offset of the trailing padding byte.
+        offset: usize,
+        /// Padding byte declared by the field codec.
+        padding: u8,
+    },
+    /// A NUL-padded image contains data after its first NUL terminator.
+    FixedStringDataAfterNul {
+        /// Field name.
+        field: &'static str,
+        /// Zero-based byte offset of the first NUL terminator.
+        terminator_offset: usize,
+        /// Zero-based byte offset of the unexpected later byte.
+        offset: usize,
+        /// Unexpected non-NUL byte.
+        value: u8,
+    },
+    /// A model-dependent memory-map field contains a non-display byte.
+    InvalidMemoryMapTextByte {
+        /// Field name.
+        field: &'static str,
+        /// Zero-based byte offset within the semantic text.
+        offset: usize,
+        /// Invalid byte.
+        value: u8,
     },
     /// Existing bytes are not valid text for the descriptor.
     InvalidText {
@@ -369,7 +465,7 @@ pub enum SchemaError {
         /// Field name.
         field: &'static str,
         /// Protected MCP page.
-        page: u16,
+        page: McpPage,
     },
     /// Integer width is zero or greater than eight bytes.
     InvalidIntegerWidth {
@@ -434,17 +530,33 @@ impl fmt::Display for SchemaError {
                 field,
                 offset,
                 expected_offset,
-            } => write!(
-                f,
-                "field {field} descriptor does not match the generated catalog \
-                 (offset 0x{offset:X}, expected 0x{expected_offset:X})"
-            ),
+            } => fmt_catalog_descriptor_mismatch(f, field, *offset, *expected_offset),
             Self::TextTooLong { field, actual, max } => {
                 write!(f, "field {field} text is {actual} bytes (maximum {max})")
             }
-            Self::UnsupportedMemoryMapText { field } => write!(
+            Self::TextContainsNul { field, offset } => write!(
                 f,
-                "field {field} uses model-dependent text encoding; only ASCII is safe"
+                "field {field} text contains a NUL terminator at byte {offset}"
+            ),
+            Self::TextEndsWithPadding {
+                field,
+                offset,
+                padding,
+            } => fmt_text_ends_with_padding(f, field, *offset, *padding),
+            Self::FixedStringDataAfterNul {
+                field,
+                terminator_offset,
+                offset,
+                value,
+            } => fmt_fixed_string_data_after_nul(f, field, *terminator_offset, *offset, *value),
+            Self::InvalidMemoryMapTextByte {
+                field,
+                offset,
+                value,
+            } => write!(
+                f,
+                "field {field} text byte at offset {offset} is 0x{value:02X} \
+                 (expected printable ASCII 0x20-0x7E)"
             ),
             Self::InvalidText { field } => write!(f, "field {field} contains invalid text"),
             Self::ByteLength {
@@ -460,10 +572,7 @@ impl fmt::Display for SchemaError {
                 offset,
                 len,
                 image_len,
-            } => write!(
-                f,
-                "field {field} range 0x{offset:X}..+{len} exceeds image length {image_len}"
-            ),
+            } => fmt_out_of_bounds(f, field, *offset, *len, *image_len),
             Self::OffsetTooLarge { field, offset } => {
                 write!(
                     f,
@@ -492,13 +601,75 @@ impl fmt::Display for SchemaError {
                 existing,
                 offset,
                 mask,
-            } => write!(
-                f,
-                "field {field} conflicts with bits planned by {existing} at MCP offset \
-                 0x{offset:X}, mask 0x{mask:02X}"
-            ),
+            } => fmt_patch_conflict(f, field, existing, *offset, *mask),
         }
     }
+}
+
+fn fmt_catalog_descriptor_mismatch(
+    formatter: &mut fmt::Formatter<'_>,
+    field: &str,
+    offset: usize,
+    expected_offset: usize,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "field {field} descriptor does not match the generated catalog \
+         (offset 0x{offset:X}, expected 0x{expected_offset:X})"
+    )
+}
+
+fn fmt_text_ends_with_padding(
+    formatter: &mut fmt::Formatter<'_>,
+    field: &str,
+    offset: usize,
+    padding: u8,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "field {field} text ends with padding byte 0x{padding:02X} at byte {offset}"
+    )
+}
+
+fn fmt_fixed_string_data_after_nul(
+    formatter: &mut fmt::Formatter<'_>,
+    field: &str,
+    terminator_offset: usize,
+    offset: usize,
+    value: u8,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "field {field} contains byte 0x{value:02X} at byte {offset} after its NUL terminator at \
+         byte {terminator_offset}"
+    )
+}
+
+fn fmt_out_of_bounds(
+    formatter: &mut fmt::Formatter<'_>,
+    field: &str,
+    offset: usize,
+    len: usize,
+    image_len: usize,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "field {field} range 0x{offset:X}..+{len} exceeds image length {image_len}"
+    )
+}
+
+fn fmt_patch_conflict(
+    formatter: &mut fmt::Formatter<'_>,
+    field: &str,
+    existing: &str,
+    offset: usize,
+    mask: u8,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "field {field} conflicts with bits planned by {existing} at MCP offset 0x{offset:X}, \
+         mask 0x{mask:02X}"
+    )
 }
 
 impl std::error::Error for SchemaError {}
@@ -524,9 +695,9 @@ impl BytePatch {
         self.mask
     }
 
-    /// Desired values already positioned under [`mask`](Self::mask).
+    /// Desired raw bits already positioned under [`mask`](Self::mask).
     #[must_use]
-    pub const fn value(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self.value
     }
 }
@@ -534,14 +705,14 @@ impl BytePatch {
 /// Masked changes for one 256-byte MCP page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PagePatch {
-    page: u16,
+    page: WritableMcpPage,
     bytes: Vec<BytePatch>,
 }
 
 impl PagePatch {
-    /// MCP page address.
+    /// Validated writable MCP page address.
     #[must_use]
-    pub const fn page(&self) -> u16 {
+    pub const fn page(&self) -> WritableMcpPage {
         self.page
     }
 
@@ -557,7 +728,7 @@ impl PagePatch {
     pub fn apply_to_page(&self, page: &mut [u8; programming::PAGE_SIZE]) {
         for patch in &self.bytes {
             if let Some(byte) = page.get_mut(usize::from(patch.offset)) {
-                *byte = (*byte & !patch.mask) | (patch.value & patch.mask);
+                *byte = (*byte & !patch.mask) | (patch.as_raw() & patch.mask);
             }
         }
     }
@@ -588,14 +759,14 @@ impl PatchSet {
         &self.pages
     }
 
-    /// Iterate over the sorted MCP page addresses.
-    pub fn pages(&self) -> impl Iterator<Item = u16> + '_ {
+    /// Iterate over the sorted writable MCP page addresses.
+    pub fn pages(&self) -> impl Iterator<Item = WritableMcpPage> + '_ {
         self.pages.iter().map(PagePatch::page)
     }
 
     /// Find the patch for one MCP page.
     #[must_use]
-    pub fn page(&self, page: u16) -> Option<&PagePatch> {
+    pub fn page(&self, page: WritableMcpPage) -> Option<&PagePatch> {
         self.pages.iter().find(|patch| patch.page == page)
     }
 
@@ -611,7 +782,7 @@ impl PatchSet {
     /// touched byte; the image is unmodified in that case.
     pub fn apply_to_image(&self, image: &mut [u8]) -> Result<(), SchemaError> {
         for page_patch in &self.pages {
-            let page_start = usize::from(page_patch.page) * programming::PAGE_SIZE;
+            let page_start = usize::from(page_patch.page.as_raw()) * programming::PAGE_SIZE;
             for patch in &page_patch.bytes {
                 let absolute = page_start + usize::from(patch.offset);
                 if absolute >= image.len() {
@@ -625,11 +796,11 @@ impl PatchSet {
             }
         }
         for page_patch in &self.pages {
-            let page_start = usize::from(page_patch.page) * programming::PAGE_SIZE;
+            let page_start = usize::from(page_patch.page.as_raw()) * programming::PAGE_SIZE;
             for patch in &page_patch.bytes {
                 let absolute = page_start + usize::from(patch.offset);
                 if let Some(byte) = image.get_mut(absolute) {
-                    *byte = (*byte & !patch.mask) | (patch.value & patch.mask);
+                    *byte = (*byte & !patch.mask) | (patch.as_raw() & patch.mask);
                 }
             }
         }
@@ -681,8 +852,8 @@ impl PatchPlanner {
     /// outside its finite enum or UI-choice domain, and
     /// [`SchemaError::CatalogDescriptorMismatch`] when generated catalog
     /// metadata has been altered. Other errors cover type mismatches,
-    /// out-of-range values, oversized text or byte input, malformed
-    /// descriptors, and conflicting overlapping patches.
+    /// out-of-range values, oversized or padding-ambiguous text, invalid byte
+    /// input, malformed descriptors, and conflicting overlapping patches.
     ///
     /// [`MenuField`]: super::MenuField
     /// [`MenuField::plan_value`]: super::MenuField::plan_value
@@ -721,7 +892,7 @@ impl PatchPlanner {
     /// memory image, and [`SchemaError::WriteProtected`] for a patch inside
     /// the factory-calibration region.
     pub fn finish(self) -> Result<PatchSet, SchemaError> {
-        let mut pages: BTreeMap<u16, Vec<BytePatch>> = BTreeMap::new();
+        let mut pages: BTreeMap<WritableMcpPage, Vec<BytePatch>> = BTreeMap::new();
         for (absolute, claim) in self.bytes {
             if absolute >= programming::TOTAL_SIZE {
                 return Err(SchemaError::OutOfBounds {
@@ -736,18 +907,24 @@ impl PatchPlanner {
                 field: claim.owner,
                 offset: absolute,
             })?;
-            if programming::is_factory_calibration_page(page) {
-                return Err(SchemaError::WriteProtected {
+            let physical_page = McpPage::new(page).map_err(|_| SchemaError::OutOfBounds {
+                field: claim.owner,
+                offset: absolute,
+                len: 1,
+                image_len: programming::TOTAL_SIZE,
+            })?;
+            let writable_page = WritableMcpPage::from_page(physical_page).map_err(|_| {
+                SchemaError::WriteProtected {
                     field: claim.owner,
-                    page,
-                });
-            }
+                    page: physical_page,
+                }
+            })?;
             let in_page = absolute % programming::PAGE_SIZE;
             let offset = u8::try_from(in_page).map_err(|_| SchemaError::OffsetTooLarge {
                 field: claim.owner,
                 offset: absolute,
             })?;
-            pages.entry(page).or_default().push(BytePatch {
+            pages.entry(writable_page).or_default().push(BytePatch {
                 offset,
                 mask: claim.mask,
                 value: claim.value,
@@ -846,7 +1023,7 @@ fn encode_field(
                 min: u64::from(min),
                 max: u64::from(max),
             })?;
-            let shifted = byte.checked_shl(u32::from(shift)).unwrap_or(0) & mask;
+            let shifted = (byte << shift) & mask;
             Ok(vec![(field.offset, mask, shifted)])
         }
         (
@@ -865,8 +1042,33 @@ fn encode_field(
                     max: len,
                 });
             }
-            if encoding == StringEncoding::MemoryMap && !bytes.is_ascii() {
-                return Err(SchemaError::UnsupportedMemoryMapText { field: field.name });
+            if padding == 0 {
+                if let Some(offset) = bytes.iter().position(|&byte| byte == 0) {
+                    return Err(SchemaError::TextContainsNul {
+                        field: field.name,
+                        offset,
+                    });
+                }
+            } else if let Some((offset, &last_byte)) = bytes.iter().enumerate().next_back()
+                && last_byte == padding
+            {
+                return Err(SchemaError::TextEndsWithPadding {
+                    field: field.name,
+                    offset,
+                    padding,
+                });
+            }
+            if encoding == StringEncoding::MemoryMap
+                && let Some((offset, &value)) = bytes
+                    .iter()
+                    .enumerate()
+                    .find(|(_, value)| !is_printable_ascii(**value))
+            {
+                return Err(SchemaError::InvalidMemoryMapTextByte {
+                    field: field.name,
+                    offset,
+                    value,
+                });
             }
             let mut result = Vec::with_capacity(len);
             for index in 0..len {
@@ -885,14 +1087,14 @@ fn encode_field(
             },
             FieldValue::Unsigned(value),
         ) => {
-            let width_bytes = validate_width(field.name, width)?;
+            let width = validate_width(field.name, width)?;
             validate_unsigned_capacity(field.name, width, max)?;
             validate_unsigned(field.name, value, min, max)?;
             let bytes = match endian {
                 Endian::Little => value.to_le_bytes(),
                 Endian::Big => value.to_be_bytes(),
             };
-            encode_integer_bytes(field, bytes, width_bytes, endian)
+            encode_integer_bytes(field, bytes, width, endian)
         }
         (
             FieldCodec::Signed {
@@ -903,14 +1105,14 @@ fn encode_field(
             },
             FieldValue::Signed(value),
         ) => {
-            let width_bytes = validate_width(field.name, width)?;
+            let width = validate_width(field.name, width)?;
             validate_signed_capacity(field.name, width, min, max)?;
             validate_signed(field.name, value, min, max)?;
             let bytes = match endian {
                 Endian::Little => value.to_le_bytes(),
                 Endian::Big => value.to_be_bytes(),
             };
-            encode_integer_bytes(field, bytes, width_bytes, endian)
+            encode_integer_bytes(field, bytes, width, endian)
         }
         (FieldCodec::Bytes { len }, FieldValue::Bytes(bytes)) => {
             if bytes.len() != len {
@@ -931,19 +1133,63 @@ fn encode_field(
     }
 }
 
+fn decode_fixed_string_bytes<'a>(
+    field: &'static str,
+    field_offset: usize,
+    image_len: usize,
+    bytes: &'a [u8],
+    padding: u8,
+) -> Result<&'a [u8], SchemaError> {
+    let end = if padding == 0 {
+        let Some(terminator_offset) = bytes.iter().position(|&byte| byte == 0) else {
+            return Ok(bytes);
+        };
+        if let Some((offset, &value)) = bytes
+            .iter()
+            .enumerate()
+            .skip(terminator_offset + 1)
+            .find(|(_, byte)| **byte != 0)
+        {
+            return Err(SchemaError::FixedStringDataAfterNul {
+                field,
+                terminator_offset,
+                offset,
+                value,
+            });
+        }
+        terminator_offset
+    } else {
+        bytes
+            .iter()
+            .rposition(|&byte| byte != padding)
+            .map_or(0, |index| index + 1)
+    };
+
+    bytes.get(..end).ok_or(SchemaError::OutOfBounds {
+        field,
+        offset: field_offset,
+        len: bytes.len(),
+        image_len,
+    })
+}
+
+const fn is_printable_ascii(value: u8) -> bool {
+    value == b' ' || value.is_ascii_graphic()
+}
+
 fn encode_integer_bytes(
     field: &FieldDescriptor,
     bytes: [u8; 8],
-    width: usize,
+    width: IntegerWidth,
     endian: Endian,
 ) -> Result<Vec<(usize, u8, u8)>, SchemaError> {
     let selected = match endian {
-        Endian::Little => bytes.get(..width),
-        Endian::Big => bytes.get(8usize.saturating_sub(width)..),
+        Endian::Little => bytes.get(..width.bytes()),
+        Endian::Big => bytes.get(width.start_in_full_width()..),
     }
-    .ok_or_else(|| SchemaError::InvalidIntegerWidth {
+    .ok_or(SchemaError::InvalidIntegerWidth {
         field: field.name,
-        width: u8::try_from(width).unwrap_or(u8::MAX),
+        width: width.0,
     })?;
     selected
         .iter()
@@ -997,20 +1243,48 @@ const fn validate_signed(
     Ok(())
 }
 
-fn validate_width(field: &'static str, width: u8) -> Result<usize, SchemaError> {
-    if !(1..=8).contains(&width) {
-        return Err(SchemaError::InvalidIntegerWidth { field, width });
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IntegerWidth(u8);
+
+impl IntegerWidth {
+    fn new(field: &'static str, width: u8) -> Result<Self, SchemaError> {
+        if !(1..=8).contains(&width) {
+            return Err(SchemaError::InvalidIntegerWidth { field, width });
+        }
+        Ok(Self(width))
     }
-    Ok(usize::from(width))
+
+    fn bytes(self) -> usize {
+        usize::from(self.0)
+    }
+
+    fn bits(self) -> u32 {
+        u32::from(self.0) * 8
+    }
+
+    fn start_in_full_width(self) -> usize {
+        8 - self.bytes()
+    }
+}
+
+fn validate_width(field: &'static str, width: u8) -> Result<IntegerWidth, SchemaError> {
+    IntegerWidth::new(field, width)
 }
 
 /// Reject an unsigned domain wider than the encoded byte width, which would
 /// otherwise truncate silently.
-fn validate_unsigned_capacity(field: &'static str, width: u8, max: u64) -> Result<(), SchemaError> {
-    if width < 8 {
-        let capacity = (1_u64 << (8 * u32::from(width))) - 1;
+fn validate_unsigned_capacity(
+    field: &'static str,
+    width: IntegerWidth,
+    max: u64,
+) -> Result<(), SchemaError> {
+    if width.0 < 8 {
+        let capacity = (1_u64 << width.bits()) - 1;
         if max > capacity {
-            return Err(SchemaError::DomainExceedsWidth { field, width });
+            return Err(SchemaError::DomainExceedsWidth {
+                field,
+                width: width.0,
+            });
         }
     }
     Ok(())
@@ -1020,14 +1294,17 @@ fn validate_unsigned_capacity(field: &'static str, width: u8, max: u64) -> Resul
 /// otherwise truncate silently.
 fn validate_signed_capacity(
     field: &'static str,
-    width: u8,
+    width: IntegerWidth,
     min: i64,
     max: i64,
 ) -> Result<(), SchemaError> {
-    if width < 8 {
-        let half = 1_i64 << (8 * u32::from(width) - 1);
+    if width.0 < 8 {
+        let half = 1_i64 << (width.bits() - 1);
         if min < -half || max > half - 1 {
-            return Err(SchemaError::DomainExceedsWidth { field, width });
+            return Err(SchemaError::DomainExceedsWidth {
+                field,
+                width: width.0,
+            });
         }
     }
     Ok(())
@@ -1107,19 +1384,19 @@ fn decode_unsigned(bytes: &[u8], endian: Endian) -> u64 {
     }
 }
 
-fn decode_signed(bytes: &[u8], endian: Endian) -> i64 {
+fn decode_signed(bytes: &[u8], width: IntegerWidth, endian: Endian) -> i64 {
     let unsigned = decode_unsigned(bytes, endian);
-    let bit_count = bytes.len().saturating_mul(8);
-    if bit_count == 0 || bit_count >= 64 {
+    let bit_count = width.bits();
+    if bit_count == 64 {
         return i64::from_ne_bytes(unsigned.to_ne_bytes());
     }
     let sign_bit = 1_u64 << (bit_count - 1);
-    if unsigned & sign_bit == 0 {
-        i64::try_from(unsigned).unwrap_or(i64::MAX)
+    let extended = if unsigned & sign_bit == 0 {
+        unsigned
     } else {
-        let extension = u64::MAX << bit_count;
-        i64::from_ne_bytes((unsigned | extension).to_ne_bytes())
-    }
+        unsigned | (u64::MAX << bit_count)
+    };
+    i64::from_ne_bytes(extended.to_ne_bytes())
 }
 
 #[cfg(test)]
@@ -1140,11 +1417,32 @@ mod tests {
     );
 
     #[test]
+    fn field_page_is_physical_and_bounds_checked() -> TestResult {
+        assert_eq!(ENABLE.page()?.as_raw(), 0x10);
+
+        let beyond = FieldDescriptor::new(
+            "test.beyond",
+            programming::TOTAL_SIZE,
+            FieldCodec::Byte { min: 0, max: 255 },
+        );
+        assert!(matches!(
+            beyond.page(),
+            Err(SchemaError::OutOfBounds {
+                field: "test.beyond",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn bit_patch_preserves_fresh_unrelated_bits() -> TestResult {
         let mut planner = PatchPlanner::new();
         let _planner = planner.set(&ENABLE, FieldValue::Unsigned(1))?;
         let patches = planner.finish()?;
-        let page_patch = patches.page(0x10).ok_or("page 0x10 missing")?;
+        let page_patch = patches
+            .page(WritableMcpPage::new(0x10)?)
+            .ok_or("page 0x10 missing")?;
         let mut page = [0b1010_0011; programming::PAGE_SIZE];
         page_patch.apply_to_page(&mut page);
         assert_eq!(page.get(0x10), Some(&0b1010_0111));
@@ -1163,7 +1461,7 @@ mod tests {
         let patches = planner.finish()?;
         let mut page = [0b1010_0011; programming::PAGE_SIZE];
         patches
-            .page(0x10)
+            .page(WritableMcpPage::new(0x10)?)
             .ok_or("page 0x10 missing")?
             .apply_to_page(&mut page);
         assert_eq!(page.get(0x10), Some(&0b1010_0111));
@@ -1192,9 +1490,13 @@ mod tests {
             .set(&ENABLE, FieldValue::Unsigned(1))?
             .set(&second, FieldValue::Unsigned(1))?;
         let patches = planner.finish()?;
-        let bytes = patches.page(0x10).ok_or("page missing")?.bytes();
+        let bytes = patches
+            .page(WritableMcpPage::new(0x10)?)
+            .ok_or("page missing")?
+            .bytes();
         assert_eq!(bytes.len(), 1);
         assert_eq!(bytes.first().map(|patch| patch.mask()), Some(0x0C));
+        assert_eq!(bytes.first().map(|patch| patch.as_raw()), Some(0x0C));
 
         let contradictory = FieldDescriptor::new(
             "test.contradictory",
@@ -1237,12 +1539,250 @@ mod tests {
         let mut planner = PatchPlanner::new();
         let _planner = planner.set(&field, FieldValue::Text("OK"))?;
         let patches = planner.finish()?;
-        assert_eq!(patches.pages().collect::<Vec<_>>(), vec![0x10, 0x11]);
+        assert_eq!(
+            patches
+                .pages()
+                .map(WritableMcpPage::as_raw)
+                .collect::<Vec<_>>(),
+            vec![0x10, 0x11]
+        );
         let mut image = vec![0xFF; 0x1200];
         patches.apply_to_image(&mut image)?;
         assert_eq!(image.get(0x10FE..0x1103), Some(&b"OK\0\0\0"[..]));
         assert_eq!(field.read(&image)?, DecodedFieldValue::Text("OK".into()));
         Ok(())
+    }
+
+    #[test]
+    fn nul_padded_string_rejects_embedded_nul_on_write() {
+        let field = FieldDescriptor::new(
+            "test.nul_text",
+            0,
+            FieldCodec::FixedString {
+                len: 5,
+                encoding: StringEncoding::Utf8,
+                padding: 0,
+            },
+        );
+        let mut planner = PatchPlanner::new();
+        let result = planner.set(&field, FieldValue::Text("A\0B"));
+
+        assert!(
+            matches!(
+                result,
+                Err(SchemaError::TextContainsNul {
+                    field: "test.nul_text",
+                    offset: 1,
+                })
+            ),
+            "embedded NUL must not be accepted as semantic text: {result:?}"
+        );
+    }
+
+    #[test]
+    fn nul_padded_string_rejects_image_data_after_terminator() {
+        let field = FieldDescriptor::new(
+            "test.nul_image",
+            0,
+            FieldCodec::FixedString {
+                len: 5,
+                encoding: StringEncoding::Utf8,
+                padding: 0,
+            },
+        );
+        let image = *b"A\0B\0\0";
+        let result = field.read(&image);
+
+        assert!(
+            matches!(
+                result,
+                Err(SchemaError::FixedStringDataAfterNul {
+                    field: "test.nul_image",
+                    terminator_offset: 1,
+                    offset: 2,
+                    value: b'B',
+                })
+            ),
+            "non-NUL data after the terminator must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn space_padded_string_rejects_semantic_trailing_space() {
+        let field = FieldDescriptor::new(
+            "test.space_text",
+            0,
+            FieldCodec::FixedString {
+                len: 5,
+                encoding: StringEncoding::Utf8,
+                padding: b' ',
+            },
+        );
+        let mut planner = PatchPlanner::new();
+        let result = planner.set(&field, FieldValue::Text("AB "));
+
+        assert!(
+            matches!(
+                result,
+                Err(SchemaError::TextEndsWithPadding {
+                    field: "test.space_text",
+                    offset: 2,
+                    padding: b' ',
+                })
+            ),
+            "semantic trailing space would be lost on read: {result:?}"
+        );
+    }
+
+    #[test]
+    fn space_padded_string_preserves_interior_space() -> TestResult {
+        let field = FieldDescriptor::new(
+            "test.interior_space",
+            0,
+            FieldCodec::FixedString {
+                len: 6,
+                encoding: StringEncoding::Utf8,
+                padding: b' ',
+            },
+        );
+        let mut planner = PatchPlanner::new();
+        let _planner = planner.set(&field, FieldValue::Text("A B"))?;
+        let patches = planner.finish()?;
+        let mut image = [0_u8; programming::PAGE_SIZE];
+        patches.apply_to_image(&mut image)?;
+
+        assert_eq!(image.get(..6), Some(&b"A B   "[..]));
+        assert_eq!(field.read(&image)?, DecodedFieldValue::Text("A B".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_string_exact_full_width_round_trips_without_terminator() -> TestResult {
+        let field = FieldDescriptor::new(
+            "test.full_width",
+            0,
+            FieldCodec::FixedString {
+                len: 5,
+                encoding: StringEncoding::Utf8,
+                padding: 0,
+            },
+        );
+        let mut planner = PatchPlanner::new();
+        let _planner = planner.set(&field, FieldValue::Text("A BCD"))?;
+        let patches = planner.finish()?;
+        let mut image = [0_u8; programming::PAGE_SIZE];
+        patches.apply_to_image(&mut image)?;
+
+        assert_eq!(image.get(..5), Some(&b"A BCD"[..]));
+        assert_eq!(field.read(&image)?, DecodedFieldValue::Text("A BCD".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_map_text_accepts_exact_printable_ascii_boundaries() -> TestResult {
+        let field = FieldDescriptor::new(
+            "test.memory_map_text",
+            0,
+            FieldCodec::FixedString {
+                len: 4,
+                encoding: StringEncoding::MemoryMap,
+                padding: 0,
+            },
+        );
+        let mut planner = PatchPlanner::new();
+        let _planner = planner.set(&field, FieldValue::Text(" ~"))?;
+        let patches = planner.finish()?;
+        let mut image = [0_u8; programming::PAGE_SIZE];
+        patches.apply_to_image(&mut image)?;
+
+        assert_eq!(image.get(..4), Some(&b" ~\0\0"[..]));
+        assert_eq!(field.read(&image)?, DecodedFieldValue::Text(" ~".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_map_text_rejects_non_printable_input_without_mutating_the_plan() -> TestResult {
+        let existing = FieldDescriptor::new("test.existing", 0, FieldCodec::Bool);
+        let text = FieldDescriptor::new(
+            "test.memory_map_text",
+            8,
+            FieldCodec::FixedString {
+                len: 4,
+                encoding: StringEncoding::MemoryMap,
+                padding: 0,
+            },
+        );
+        let mut planner = PatchPlanner::new();
+        let _planner = planner.set(&existing, FieldValue::Bool(true))?;
+
+        for (value, offset, byte) in [("A\n", 1, b'\n'), ("\u{7f}", 0, 0x7F), ("✓", 0, 0xE2)] {
+            let result = planner.set(&text, FieldValue::Text(value));
+            assert!(matches!(
+                result,
+                Err(SchemaError::InvalidMemoryMapTextByte {
+                    field: "test.memory_map_text",
+                    offset: actual_offset,
+                    value: actual_value,
+                }) if actual_offset == offset && actual_value == byte
+            ));
+        }
+
+        let patches = planner.finish()?;
+        let mut image = [0_u8; programming::PAGE_SIZE];
+        patches.apply_to_image(&mut image)?;
+        assert_eq!(image.first(), Some(&1));
+        assert_eq!(image.get(8..12), Some(&[0; 4][..]));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_map_text_read_reports_the_exact_non_printable_byte() {
+        let field = FieldDescriptor::new(
+            "test.memory_map_text",
+            0,
+            FieldCodec::FixedString {
+                len: 4,
+                encoding: StringEncoding::MemoryMap,
+                padding: 0,
+            },
+        );
+        let image = [b'A', 0x1F, 0, 0];
+
+        assert!(matches!(
+            field.read(&image),
+            Err(SchemaError::InvalidMemoryMapTextByte {
+                field: "test.memory_map_text",
+                offset: 1,
+                value: 0x1F,
+            })
+        ));
+    }
+
+    #[test]
+    fn nonstandard_padding_rejects_semantic_trailing_padding_byte() {
+        let field = FieldDescriptor::new(
+            "test.other_padding",
+            0,
+            FieldCodec::FixedString {
+                len: 5,
+                encoding: StringEncoding::Utf8,
+                padding: b'~',
+            },
+        );
+        let mut planner = PatchPlanner::new();
+        let result = planner.set(&field, FieldValue::Text("END~"));
+
+        assert!(
+            matches!(
+                result,
+                Err(SchemaError::TextEndsWithPadding {
+                    field: "test.other_padding",
+                    offset: 3,
+                    padding: b'~',
+                })
+            ),
+            "semantic trailing padding would be lost on read: {result:?}"
+        );
     }
 
     #[test]
@@ -1281,6 +1821,60 @@ mod tests {
     }
 
     #[test]
+    fn integer_codecs_reject_invalid_widths_before_accessing_image_data() {
+        let zero_width = FieldDescriptor::new(
+            "test.zero_width",
+            0,
+            FieldCodec::Unsigned {
+                width: 0,
+                endian: Endian::Little,
+                min: 0,
+                max: 0,
+            },
+        );
+        let oversized = FieldDescriptor::new(
+            "test.oversized_width",
+            0,
+            FieldCodec::Signed {
+                width: 9,
+                endian: Endian::Big,
+                min: 0,
+                max: 0,
+            },
+        );
+
+        for (field, value, expected_width) in [
+            (zero_width, FieldValue::Unsigned(0), 0),
+            (oversized, FieldValue::Signed(0), 9),
+        ] {
+            let read = field.read(&[]);
+            assert!(
+                matches!(
+                    read,
+                    Err(SchemaError::InvalidIntegerWidth {
+                        field: error_field,
+                        width,
+                    }) if error_field == field.name && width == expected_width
+                ),
+                "invalid width must be rejected before reading the image: {read:?}"
+            );
+
+            let mut planner = PatchPlanner::new();
+            let write = planner.set(&field, value);
+            assert!(
+                matches!(
+                    write,
+                    Err(SchemaError::InvalidIntegerWidth {
+                        field: error_field,
+                        width,
+                    }) if error_field == field.name && width == expected_width
+                ),
+                "invalid width must be rejected before encoding: {write:?}"
+            );
+        }
+    }
+
+    #[test]
     fn validation_rejects_bad_values_and_lengths() {
         let byte = FieldDescriptor::new("test.byte", 0, FieldCodec::Byte { min: 1, max: 3 });
         let bytes = FieldDescriptor::new("test.bytes", 0, FieldCodec::Bytes { len: 2 });
@@ -1296,6 +1890,54 @@ mod tests {
         assert!(matches!(
             planner.set(&bytes, FieldValue::Bytes(&[1])),
             Err(SchemaError::ByteLength { .. })
+        ));
+    }
+
+    #[test]
+    fn reads_reject_values_outside_declared_domains() {
+        let byte = FieldDescriptor::new("test.byte", 0, FieldCodec::Byte { min: 1, max: 3 });
+        let boolean = FieldDescriptor::new("test.bool", 1, FieldCodec::Bool);
+        let bit_field = FieldDescriptor::new(
+            "test.bits",
+            2,
+            FieldCodec::BitField {
+                mask: 0b0000_1100,
+                shift: 2,
+                min: 1,
+                max: 2,
+            },
+        );
+        let unsigned = FieldDescriptor::new(
+            "test.unsigned",
+            3,
+            FieldCodec::Unsigned {
+                width: 2,
+                endian: Endian::Little,
+                min: 10,
+                max: 20,
+            },
+        );
+        let signed = FieldDescriptor::new(
+            "test.signed",
+            5,
+            FieldCodec::Signed {
+                width: 1,
+                endian: Endian::Little,
+                min: -2,
+                max: 2,
+            },
+        );
+        let image = [4, 2, 0, 9, 0, 3];
+
+        for field in [byte, boolean, bit_field, unsigned] {
+            assert!(matches!(
+                field.read(&image),
+                Err(SchemaError::UnsignedOutOfRange { .. })
+            ));
+        }
+        assert!(matches!(
+            signed.read(&image),
+            Err(SchemaError::SignedOutOfRange { .. })
         ));
     }
 
@@ -1337,8 +1979,8 @@ mod tests {
                 result,
                 Err(SchemaError::WriteProtected {
                     field: "test.calibration",
-                    page: 0x7A1,
-                })
+                    page,
+                }) if page.as_raw() == 0x7A1
             ),
             "calibration pages must be rejected at plan time: {result:?}"
         );

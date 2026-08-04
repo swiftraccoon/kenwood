@@ -25,8 +25,8 @@ pub struct SquelchLevel(u8);
 impl SquelchLevel {
     /// Open squelch (level 0).
     pub const OPEN: Self = Self(0);
-    /// Maximum squelch (level 6).
-    pub const MAX: Self = Self(6);
+    /// Maximum valid squelch level (inclusive).
+    pub const MAX: u8 = 6;
     /// Number of valid squelch levels (0-6).
     pub const COUNT: u8 = 7;
 
@@ -36,7 +36,7 @@ impl SquelchLevel {
     ///
     /// Returns [`ValidationError::SettingOutOfRange`] if `value > 6`.
     pub const fn new(value: u8) -> Result<Self, ValidationError> {
-        if value > 6 {
+        if value > Self::MAX {
             Err(ValidationError::SettingOutOfRange {
                 name: "squelch level",
                 value,
@@ -49,7 +49,7 @@ impl SquelchLevel {
 
     /// Returns the raw `u8` value.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self.0
     }
 }
@@ -88,29 +88,17 @@ impl fmt::Display for SquelchLevel {
 pub struct AfGainLevel(u8);
 
 impl AfGainLevel {
+    /// Muted audio (level 0).
+    pub const ZERO: Self = Self(0);
     /// Maximum valid AF gain level (inclusive).
     pub const MAX: u8 = 200;
 
     /// Creates a new `AfGainLevel` from a raw value.
     ///
-    /// This compatibility constructor is intended for values already known
-    /// to be in range. Use [`Self::try_new`] for untrusted input.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `value` exceeds 200.
-    #[must_use]
-    pub const fn new(value: u8) -> Self {
-        assert!(value <= Self::MAX, "AF gain level must be 0-200");
-        Self(value)
-    }
-
-    /// Tries to create an AF gain level from an untrusted raw value.
-    ///
     /// # Errors
     ///
     /// Returns [`ValidationError::SettingOutOfRange`] if `value > 200`.
-    pub const fn try_new(value: u8) -> Result<Self, ValidationError> {
+    pub const fn new(value: u8) -> Result<Self, ValidationError> {
         if value > Self::MAX {
             Err(ValidationError::SettingOutOfRange {
                 name: "AF gain level",
@@ -124,7 +112,7 @@ impl AfGainLevel {
 
     /// Returns the raw `u8` value.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self.0
     }
 }
@@ -133,7 +121,7 @@ impl TryFrom<u8> for AfGainLevel {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Self::try_new(value)
+        Self::new(value)
     }
 }
 
@@ -185,7 +173,7 @@ impl SMeterReading {
 
     /// Returns the raw `u8` value.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self.0
     }
 
@@ -225,10 +213,10 @@ impl fmt::Display for SMeterReading {
 }
 
 // ---------------------------------------------------------------------------
-// VfoMemoryMode
+// TuningMode
 // ---------------------------------------------------------------------------
 
-/// VFO/Memory/Call/Weather operating mode.
+/// VFO/Memory/Call/Weather tuning mode.
 ///
 /// Controls which channel selection mode the band is in.
 /// Used by the `VM` CAT command.
@@ -247,7 +235,7 @@ impl fmt::Display for SMeterReading {
 /// - **Weather mode**: NOAA weather channels (TH-D75A only, 10 channels
 ///   A1-A10 at 161.650-163.275 MHz).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VfoMemoryMode {
+pub enum TuningMode {
     /// VFO mode: frequency entered directly (index 0).
     Vfo = 0,
     /// Memory channel mode: recalls stored channels (index 1).
@@ -258,12 +246,12 @@ pub enum VfoMemoryMode {
     Weather = 3,
 }
 
-impl VfoMemoryMode {
+impl TuningMode {
     /// Number of valid VFO/memory mode values (0-3).
     pub const COUNT: u8 = 4;
 }
 
-impl fmt::Display for VfoMemoryMode {
+impl fmt::Display for TuningMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Vfo => f.write_str("VFO"),
@@ -274,7 +262,7 @@ impl fmt::Display for VfoMemoryMode {
     }
 }
 
-impl TryFrom<u8> for VfoMemoryMode {
+impl TryFrom<u8> for TuningMode {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
@@ -284,7 +272,7 @@ impl TryFrom<u8> for VfoMemoryMode {
             2 => Ok(Self::Call),
             3 => Ok(Self::Weather),
             _ => Err(ValidationError::SettingOutOfRange {
-                name: "VFO/memory mode",
+                name: "tuning mode",
                 value,
                 detail: "must be 0-3",
             }),
@@ -292,8 +280,8 @@ impl TryFrom<u8> for VfoMemoryMode {
     }
 }
 
-impl From<VfoMemoryMode> for u8 {
-    fn from(mode: VfoMemoryMode) -> Self {
+impl From<TuningMode> for u8 {
+    fn from(mode: TuningMode) -> Self {
         mode as Self
     }
 }
@@ -305,7 +293,7 @@ impl From<VfoMemoryMode> for u8 {
 /// Receiver filter mode selection.
 ///
 /// Selects which demodulator's filter width to read or set.
-/// Used by the `SF` CAT command.
+/// Used by the `SH` CAT command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FilterMode {
     /// SSB (LSB/USB) filter (index 0).
@@ -390,7 +378,7 @@ pub enum BatteryLevel {
     Charging = 4,
     /// Runtime state 5. The firmware can emit this value, but its user-facing
     /// meaning has not yet been established.
-    Raw5 = 5,
+    Unidentified5 = 5,
 }
 
 impl BatteryLevel {
@@ -406,7 +394,7 @@ impl fmt::Display for BatteryLevel {
             Self::TwoThirds => f.write_str("2/3"),
             Self::Full => f.write_str("Full"),
             Self::Charging => f.write_str("Charging"),
-            Self::Raw5 => f.write_str("State 5"),
+            Self::Unidentified5 => f.write_str("State 5"),
         }
     }
 }
@@ -421,7 +409,7 @@ impl TryFrom<u8> for BatteryLevel {
             2 => Ok(Self::TwoThirds),
             3 => Ok(Self::Full),
             4 => Ok(Self::Charging),
-            5 => Ok(Self::Raw5),
+            5 => Ok(Self::Unidentified5),
             _ => Err(ValidationError::SettingOutOfRange {
                 name: "battery level",
                 value,
@@ -479,7 +467,7 @@ impl VoxGain {
 
     /// Returns the raw `u8` value.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self.0
     }
 }
@@ -522,10 +510,6 @@ impl fmt::Display for VoxGain {
 pub struct VoxDelay(u8);
 
 impl VoxDelay {
-    /// Raw index zero, corresponding to 250 ms.
-    ///
-    /// Retained as a compatibility alias; this is not a zero-millisecond delay.
-    pub const ZERO: Self = Self(0);
     /// 250 ms (raw index 0).
     pub const MS_250: Self = Self(0);
     /// 500 ms (raw index 1).
@@ -564,13 +548,13 @@ impl VoxDelay {
 
     /// Returns the raw `u8` value.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self.0
     }
 
     /// Returns the delay in milliseconds.
     #[must_use]
-    pub const fn as_millis(self) -> u16 {
+    pub const fn as_milliseconds(self) -> u16 {
         let [
             delay_0,
             delay_1,
@@ -609,31 +593,32 @@ impl From<VoxDelay> for u8 {
 
 impl fmt::Display for VoxDelay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}ms", self.as_millis())
+        write!(f, "{}ms", self.as_milliseconds())
     }
 }
 
 // ---------------------------------------------------------------------------
-// TncBaud
+// PacketDataRate
 // ---------------------------------------------------------------------------
 
-/// TNC data baud rate.
+/// Packet-data rate shared by APRS, KISS, and MMDVM operation.
 ///
-/// Controls the APRS/KISS data speed. Used by the `DS` CAT command.
+/// The CAT and stored APRS encodings both use `0` for 1200 bps and `1` for
+/// 9600 bps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TncBaud {
-    /// 1200 bps AFSK (index 0).
+pub enum PacketDataRate {
+    /// 1200 bps (index 0).
     Bps1200 = 0,
-    /// 9600 bps GMSK (index 1).
+    /// 9600 bps (index 1).
     Bps9600 = 1,
 }
 
-impl TncBaud {
-    /// Number of valid TNC baud rate values (0-1).
+impl PacketDataRate {
+    /// Number of valid packet-data-rate values (0-1).
     pub const COUNT: u8 = 2;
 }
 
-impl fmt::Display for TncBaud {
+impl fmt::Display for PacketDataRate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Bps1200 => f.write_str("1200 bps"),
@@ -642,7 +627,7 @@ impl fmt::Display for TncBaud {
     }
 }
 
-impl TryFrom<u8> for TncBaud {
+impl TryFrom<u8> for PacketDataRate {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
@@ -650,17 +635,17 @@ impl TryFrom<u8> for TncBaud {
             0 => Ok(Self::Bps1200),
             1 => Ok(Self::Bps9600),
             _ => Err(ValidationError::SettingOutOfRange {
-                name: "TNC baud rate",
+                name: "packet data rate",
                 value,
-                detail: "must be 0-1",
+                detail: "must be 0-1: 1200/9600 bps",
             }),
         }
     }
 }
 
-impl From<TncBaud> for u8 {
-    fn from(baud: TncBaud) -> Self {
-        baud as Self
+impl From<PacketDataRate> for u8 {
+    fn from(data_rate: PacketDataRate) -> Self {
+        data_rate as Self
     }
 }
 
@@ -671,7 +656,8 @@ impl From<TncBaud> for u8 {
 /// APRS beacon transmission mode.
 ///
 /// Controls how the radio sends APRS position beacons.
-/// Used by the `PT` CAT command.
+/// Used by the `PT` CAT command and the stored `aprs.BeaconTxMethod` setting;
+/// those two representations intentionally share the same `0..=3` encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BeaconMode {
     /// Manual beacon: transmit only when explicitly requested (wire value 0).
@@ -760,7 +746,7 @@ impl MyPositionSelection {
 
     /// Returns the CAT/MCP numeric value.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self.0
     }
 }
@@ -827,7 +813,7 @@ impl DstarSlot {
 
     /// Returns the raw `u8` value.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self.0
     }
 }
@@ -853,7 +839,104 @@ impl fmt::Display for DstarSlot {
 }
 
 // ---------------------------------------------------------------------------
-// DetectOutputMode (IO command)
+// AntennaInput (BS command)
+// ---------------------------------------------------------------------------
+
+/// MW/SW receive antenna selected by the `BS` CAT command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AntennaInput {
+    /// External antenna connector (`BS 0`).
+    Connector,
+    /// Internal bar antenna (`BS 1`).
+    InternalBar,
+}
+
+impl AntennaInput {
+    /// Return the exact `BS` wire value.
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        match self {
+            Self::Connector => 0,
+            Self::InternalBar => 1,
+        }
+    }
+}
+
+impl From<AntennaInput> for u8 {
+    fn from(input: AntennaInput) -> Self {
+        input.as_raw()
+    }
+}
+
+impl fmt::Display for AntennaInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connector => f.write_str("ANT connector"),
+            Self::InternalBar => f.write_str("internal bar antenna"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BandMode (DL command)
+// ---------------------------------------------------------------------------
+
+/// Front-panel band presentation selected by the `DL` CAT command.
+///
+/// The wire values name the resulting selection directly: `DL 0` is dual-band
+/// display and `DL 1` is single-band display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BandMode {
+    /// Both bands are displayed (`DL 0`).
+    Dual,
+    /// Only the active band is displayed (`DL 1`).
+    Single,
+}
+
+impl BandMode {
+    /// Return the exact `DL` wire value.
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        match self {
+            Self::Dual => 0,
+            Self::Single => 1,
+        }
+    }
+}
+
+impl TryFrom<u8> for BandMode {
+    type Error = ValidationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Dual),
+            1 => Ok(Self::Single),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "band mode",
+                value,
+                detail: "must be 0 (dual) or 1 (single)",
+            }),
+        }
+    }
+}
+
+impl From<BandMode> for u8 {
+    fn from(mode: BandMode) -> Self {
+        mode.as_raw()
+    }
+}
+
+impl fmt::Display for BandMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Dual => f.write_str("Dual Band"),
+            Self::Single => f.write_str("Single Band"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UsbAudioOutput (IO command)
 // ---------------------------------------------------------------------------
 
 /// AF/IF/Detect output mode (Menu No. 102).
@@ -873,37 +956,37 @@ impl fmt::Display for DstarSlot {
 ///
 /// Source: User Manual Chapter 12 "AF/IF/DETECT OUTPUT MODE".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DetectOutputMode {
-    /// AF output: received audio sound (index 0).
-    Af = 0,
-    /// IF output: received IF signal of Band B to PC (index 1).
-    If = 1,
+pub enum UsbAudioOutput {
+    /// Received audio output (index 0).
+    Audio = 0,
+    /// Intermediate-frequency signal from Band B (index 1).
+    IntermediateFrequency = 1,
     /// Detect output: decoded signal of Band B to PC (index 2).
     Detect = 2,
 }
 
-impl DetectOutputMode {
+impl UsbAudioOutput {
     /// Number of valid detect output mode values (0-2).
     pub const COUNT: u8 = 3;
 }
 
-impl fmt::Display for DetectOutputMode {
+impl fmt::Display for UsbAudioOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Af => f.write_str("AF"),
-            Self::If => f.write_str("IF"),
+            Self::Audio => f.write_str("Audio"),
+            Self::IntermediateFrequency => f.write_str("Intermediate Frequency"),
             Self::Detect => f.write_str("Detect"),
         }
     }
 }
 
-impl TryFrom<u8> for DetectOutputMode {
+impl TryFrom<u8> for UsbAudioOutput {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::Af),
-            1 => Ok(Self::If),
+            0 => Ok(Self::Audio),
+            1 => Ok(Self::IntermediateFrequency),
             2 => Ok(Self::Detect),
             _ => Err(ValidationError::SettingOutOfRange {
                 name: "detect output mode",
@@ -914,8 +997,8 @@ impl TryFrom<u8> for DetectOutputMode {
     }
 }
 
-impl From<DetectOutputMode> for u8 {
-    fn from(mode: DetectOutputMode) -> Self {
+impl From<UsbAudioOutput> for u8 {
+    fn from(mode: UsbAudioOutput) -> Self {
         mode as Self
     }
 }
@@ -930,7 +1013,7 @@ impl From<DetectOutputMode> for u8 {
 /// access via USB or Bluetooth using third-party MMDVM applications.
 /// Used by the `GW` CAT command.
 ///
-/// Source: User Manual §16-13, firmware decompilation of `cat_gw_handler`.
+/// Menu 650 is described in User Manual section 16-13.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DvGatewayMode {
     /// DV Gateway off (index 0).
@@ -984,17 +1067,14 @@ impl From<DvGatewayMode> for u8 {
 /// Controls the built-in TNC's protocol mode. Used by the `TN` CAT command.
 /// The second field of TN is the data speed (0=1200, 1=9600).
 ///
-/// Source: firmware validation (mode < 4), Operating Tips §2.7-2.8 (KISS),
-/// §4.5 (Reflector Terminal/MMDVM), firmware string table (NAVITRA).
+/// The four established values cover ordinary CAT, APRS, KISS, and
+/// MMDVM/Reflector Terminal operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TncMode {
     /// TNC off: no packet mode active, plain CAT operation (index 0).
     ///
-    /// Hardware-verified 2026-07-18: after `TN 0,0` the radio's display
-    /// shows no packet-mode indicator (neither "APRS 12" nor "KISS 12").
-    /// An earlier code generation labeled index 0 as APRS, which made
-    /// every recovery preamble read back as "APRS mode" while the TNC
-    /// was actually off.
+    /// After `TN 0,0`, the radio shows no packet-mode indicator: neither
+    /// `APRS 12` nor `KISS 12`.
     Off = 0,
     /// APRS mode: packet operation run by the radio firmware (index 1).
     /// The display shows "APRS 12" (or "APRS 96" at 9600 bps).
@@ -1052,11 +1132,47 @@ impl From<TncMode> for u8 {
     }
 }
 
+/// TNC modes that leave the transport under ordinary CAT control.
+///
+/// KISS and MMDVM are deliberately absent because entering either binary
+/// protocol transfers transport ownership to a typed session. Use
+/// [`Radio::enter_kiss`](crate::radio::Radio::enter_kiss) or
+/// [`Radio::enter_mmdvm`](crate::radio::Radio::enter_mmdvm) for those modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TncControlMode {
+    /// Disable the radio's packet engine.
+    Off,
+    /// Let the radio firmware operate APRS itself.
+    Aprs,
+}
+
+impl From<TncControlMode> for TncMode {
+    fn from(mode: TncControlMode) -> Self {
+        match mode {
+            TncControlMode::Off => Self::Off,
+            TncControlMode::Aprs => Self::Aprs,
+        }
+    }
+}
+
+/// Current TNC mode and packet data rate returned by the `TN` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TncState {
+    /// Current TNC operating mode.
+    pub mode: TncMode,
+    /// Current packet data rate.
+    pub data_rate: PacketDataRate,
+}
+
 // ---------------------------------------------------------------------------
 // FilterWidthIndex (SH command)
 // ---------------------------------------------------------------------------
 
-/// IF receive filter width index for the SH (filter width) command.
+/// Mode-qualified IF receive filter width index for the SH command.
+///
+/// The receiver mode is retained with the numeric index because the valid
+/// domain and physical bandwidth both depend on it. An AM width therefore
+/// cannot be confused with an SSB/CW width after construction.
 ///
 /// The valid range depends on the filter mode:
 /// - **SSB** (mode 0): 0-4 -> 2.2 / 2.4 / 2.6 / 2.8 / 3.0 kHz high-cut
@@ -1073,7 +1189,10 @@ impl From<TncMode> for u8 {
 /// Source: Kenwood TH-D75A/E Operating Tips §5.10 (May 2024).
 /// Hardware-verified: `SH mode,width\r` returns echo on success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FilterWidthIndex(u8);
+pub struct FilterWidthIndex {
+    mode: FilterMode,
+    index: u8,
+}
 
 impl FilterWidthIndex {
     /// Maximum valid index for SSB and CW modes.
@@ -1087,70 +1206,41 @@ impl FilterWidthIndex {
     ///
     /// Returns [`ValidationError::SettingOutOfRange`] if `value` exceeds the
     /// mode-specific maximum (4 for SSB/CW, 3 for AM).
-    pub const fn new(value: u8, mode: FilterMode) -> Result<Self, ValidationError> {
+    pub const fn new(mode: FilterMode, index: u8) -> Result<Self, ValidationError> {
         let max = match mode {
             FilterMode::Ssb | FilterMode::Cw => Self::MAX_SSB_CW,
             FilterMode::Am => Self::MAX_AM,
         };
-        if value > max {
+        if index > max {
             Err(ValidationError::SettingOutOfRange {
                 name: "filter width index",
-                value,
+                value: index,
                 detail: match mode {
                     FilterMode::Ssb | FilterMode::Cw => "must be 0-4 for SSB/CW",
                     FilterMode::Am => "must be 0-3 for AM",
                 },
             })
         } else {
-            Ok(Self(value))
+            Ok(Self { mode, index })
         }
     }
 
-    /// Creates a `FilterWidthIndex` from a raw value without mode checking.
-    ///
-    /// Uses the maximum range (0-4) which covers all modes. Use this when
-    /// parsing responses where the mode is known but the width may come from
-    /// hardware that could return extended values.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ValidationError::SettingOutOfRange`] if `value > 4`.
-    pub const fn from_raw(value: u8) -> Result<Self, ValidationError> {
-        if value > Self::MAX_SSB_CW {
-            Err(ValidationError::SettingOutOfRange {
-                name: "filter width index",
-                value,
-                detail: "must be 0-4",
-            })
-        } else {
-            Ok(Self(value))
-        }
-    }
-
-    /// Returns the raw `u8` value.
+    /// Receiver mode whose width table this index belongs to.
     #[must_use]
-    pub const fn as_u8(self) -> u8 {
-        self.0
+    pub const fn mode(self) -> FilterMode {
+        self.mode
     }
-}
 
-impl TryFrom<u8> for FilterWidthIndex {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Self::from_raw(value)
-    }
-}
-
-impl From<FilterWidthIndex> for u8 {
-    fn from(idx: FilterWidthIndex) -> Self {
-        idx.0
+    /// Position in the selected mode's filter-width table.
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        self.index
     }
 }
 
 impl fmt::Display for FilterWidthIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.index)
     }
 }
 
@@ -1163,10 +1253,7 @@ impl fmt::Display for FilterWidthIndex {
 /// Controls whether the radio operates in normal transceiver mode or
 /// switches to GPS-receiver-only mode.
 ///
-/// # Firmware verification
-///
-/// The `cat_gm_handler` at `0xC002EC52` guards with `local_18 < 2`,
-/// confirming only values 0 and 1 are valid.
+/// Hardware accepts only values 0 and 1.
 ///
 /// # Warning
 ///
@@ -1283,7 +1370,7 @@ impl MemoryReadOffset {
     /// The lowest valid offset.
     pub const ZERO: Self = Self(0);
     /// The highest valid offset.
-    pub const MAX: Self = Self(0x00FF_FFFF);
+    pub const MAX: u32 = 0x00FF_FFFF;
 
     /// Constructs a compile-time offset whose bound has been verified by the
     /// defining module.
@@ -1302,7 +1389,7 @@ impl MemoryReadOffset {
     /// Returns [`ValidationError::MemoryParamOutOfRange`] if
     /// `value > 0xFFFFFF`.
     pub const fn new(value: u32) -> Result<Self, ValidationError> {
-        if value > 0x00FF_FFFF {
+        if value > Self::MAX {
             Err(ValidationError::MemoryParamOutOfRange {
                 name: "memory-read offset",
                 value,
@@ -1315,7 +1402,7 @@ impl MemoryReadOffset {
 
     /// Returns the raw offset.
     #[must_use]
-    pub const fn as_u32(self) -> u32 {
+    pub const fn as_raw(self) -> u32 {
         self.0
     }
 }
@@ -1326,22 +1413,10 @@ impl fmt::Display for MemoryReadOffset {
     }
 }
 
-/// Backward-compatible name for [`MemoryReadOffset`].
-///
-/// New code should use the target-neutral name because the GM patch can expose
-/// either DDR or low NOR.
-pub type DdrOffset = MemoryReadOffset;
-
-/// Backward-compatible name for [`MEMORY_READ_WIRE_BOUND`].
-///
-/// This is only the wire grammar's ceiling. Use [`MemoryReadTarget::bound`] for
-/// a qualified live target; low-NOR V1.03 is deliberately limited to 2 MiB.
-pub const MEM_READ_BOUND: u32 = MEMORY_READ_WIRE_BOUND;
-
 /// The number of bytes to read in one memory-read request.
 ///
 /// Valid range is `1..=256`. The radio encodes 256 as the wire value `0x00`,
-/// which is why [`ReadLen::as_wire`] is separate from [`ReadLen::as_u16`].
+/// which is why [`ReadLen::as_wire`] is separate from [`ReadLen::as_bytes`].
 ///
 /// The wire byte is what gets stored, so the logical count is produced by
 /// widening rather than narrowing. That keeps the single unavoidable narrowing
@@ -1351,7 +1426,7 @@ pub struct ReadLen(u8);
 
 impl ReadLen {
     /// The largest read a single request can return.
-    pub const MAX: Self = Self(0);
+    pub const MAX: u16 = 256;
 
     /// Creates a new `ReadLen` from a raw byte count.
     ///
@@ -1381,7 +1456,7 @@ impl ReadLen {
     /// trip `clippy::cast_lossless` for no benefit, since no caller needs this
     /// in a const context.
     #[must_use]
-    pub fn as_u16(self) -> u16 {
+    pub fn as_bytes(self) -> u16 {
         if self.0 == 0 { 256 } else { u16::from(self.0) }
     }
 
@@ -1410,10 +1485,10 @@ mod memread_param_tests {
 
     #[test]
     fn offset_accepts_zero_and_max() -> TestResult {
-        assert_eq!(MemoryReadOffset::new(0)?.as_u32(), 0);
-        assert_eq!(MemoryReadOffset::new(0x00FF_FFFF)?.as_u32(), 0x00FF_FFFF);
-        assert_eq!(MemoryReadOffset::MAX.as_u32(), 0x00FF_FFFF);
-        assert_eq!(MemoryReadOffset::ZERO.as_u32(), 0);
+        assert_eq!(MemoryReadOffset::new(0)?.as_raw(), 0);
+        assert_eq!(MemoryReadOffset::new(0x00FF_FFFF)?.as_raw(), 0x00FF_FFFF);
+        assert_eq!(MemoryReadOffset::MAX, 0x00FF_FFFF);
+        assert_eq!(MemoryReadOffset::ZERO.as_raw(), 0);
         Ok(())
     }
 
@@ -1439,8 +1514,8 @@ mod memread_param_tests {
         assert_eq!(ReadLen::new(255)?.as_wire(), 255);
         // 256 is encoded on the wire as 0x00.
         assert_eq!(ReadLen::new(256)?.as_wire(), 0);
-        assert_eq!(ReadLen::new(256)?.as_u16(), 256);
-        assert_eq!(ReadLen::MAX.as_u16(), 256);
+        assert_eq!(ReadLen::new(256)?.as_bytes(), 256);
+        assert_eq!(ReadLen::MAX, 256);
         Ok(())
     }
 
@@ -1454,7 +1529,7 @@ mod memread_param_tests {
 
     #[test]
     fn bound_is_one_past_max_offset() {
-        assert_eq!(MEMORY_READ_WIRE_BOUND, MemoryReadOffset::MAX.as_u32() + 1);
+        assert_eq!(MEMORY_READ_WIRE_BOUND, MemoryReadOffset::MAX + 1);
     }
 
     #[test]
@@ -1474,7 +1549,7 @@ mod tests {
     fn squelch_level_valid() -> TestResult {
         for v in 0..SquelchLevel::COUNT {
             let val = SquelchLevel::new(v)?;
-            assert_eq!(val.as_u8(), v, "SquelchLevel round-trip failed at {v}");
+            assert_eq!(val.as_raw(), v, "SquelchLevel round-trip failed at {v}");
         }
         assert!(SquelchLevel::new(SquelchLevel::COUNT).is_err());
         Ok(())
@@ -1484,16 +1559,17 @@ mod tests {
     fn squelch_level_round_trip() -> TestResult {
         let sq = SquelchLevel::new(4)?;
         assert_eq!(u8::from(sq), 4);
-        assert_eq!(sq.as_u8(), 4);
+        assert_eq!(sq.as_raw(), 4);
         Ok(())
     }
 
     #[test]
     fn af_gain_valid() -> TestResult {
-        assert_eq!(AfGainLevel::new(0).as_u8(), 0);
-        assert_eq!(AfGainLevel::new(99).as_u8(), 99);
-        assert_eq!(AfGainLevel::new(200).as_u8(), 200);
-        assert_eq!(AfGainLevel::try_from(200)?.as_u8(), 200);
+        assert_eq!(AfGainLevel::new(0)?.as_raw(), 0);
+        assert_eq!(AfGainLevel::new(99)?.as_raw(), 99);
+        assert_eq!(AfGainLevel::new(200)?.as_raw(), 200);
+        assert!(AfGainLevel::new(201).is_err());
+        assert_eq!(AfGainLevel::try_from(200)?.as_raw(), 200);
         assert!(AfGainLevel::try_from(201).is_err());
         Ok(())
     }
@@ -1507,12 +1583,12 @@ mod tests {
     }
 
     #[test]
-    fn vfo_memory_mode_round_trip() -> TestResult {
-        for v in 0..VfoMemoryMode::COUNT {
-            let mode = VfoMemoryMode::try_from(v)?;
+    fn tuning_mode_round_trip() -> TestResult {
+        for v in 0..TuningMode::COUNT {
+            let mode = TuningMode::try_from(v)?;
             assert_eq!(u8::from(mode), v);
         }
-        assert!(VfoMemoryMode::try_from(VfoMemoryMode::COUNT).is_err());
+        assert!(TuningMode::try_from(TuningMode::COUNT).is_err());
         Ok(())
     }
 
@@ -1539,7 +1615,7 @@ mod tests {
     #[test]
     fn battery_level_charging() -> TestResult {
         assert_eq!(BatteryLevel::try_from(4)?, BatteryLevel::Charging);
-        assert_eq!(BatteryLevel::try_from(5)?, BatteryLevel::Raw5);
+        assert_eq!(BatteryLevel::try_from(5)?, BatteryLevel::Unidentified5);
         Ok(())
     }
 
@@ -1555,19 +1631,19 @@ mod tests {
         let expected = [250, 500, 750, 1000, 1500, 2000, 3000];
         for (raw, millis) in expected.into_iter().enumerate() {
             let delay = VoxDelay::new(u8::try_from(raw)?)?;
-            assert_eq!(delay.as_millis(), millis);
+            assert_eq!(delay.as_milliseconds(), millis);
         }
         assert!(VoxDelay::new(VoxDelay::MAX + 1).is_err());
         Ok(())
     }
 
     #[test]
-    fn tnc_baud_round_trip() -> TestResult {
-        for v in 0..TncBaud::COUNT {
-            let val = TncBaud::try_from(v)?;
-            assert_eq!(u8::from(val), v, "TncBaud round-trip failed at {v}");
+    fn packet_data_rate_round_trip() -> TestResult {
+        for v in 0..PacketDataRate::COUNT {
+            let val = PacketDataRate::try_from(v)?;
+            assert_eq!(u8::from(val), v, "PacketDataRate round-trip failed at {v}");
         }
-        assert!(TncBaud::try_from(TncBaud::COUNT).is_err());
+        assert!(PacketDataRate::try_from(PacketDataRate::COUNT).is_err());
         Ok(())
     }
 
@@ -1608,38 +1684,36 @@ mod tests {
     #[test]
     fn filter_width_ssb_cw_range() {
         for v in 0..=4 {
-            assert!(FilterWidthIndex::new(v, FilterMode::Ssb).is_ok());
-            assert!(FilterWidthIndex::new(v, FilterMode::Cw).is_ok());
+            assert!(FilterWidthIndex::new(FilterMode::Ssb, v).is_ok());
+            assert!(FilterWidthIndex::new(FilterMode::Cw, v).is_ok());
         }
-        assert!(FilterWidthIndex::new(5, FilterMode::Ssb).is_err());
-        assert!(FilterWidthIndex::new(5, FilterMode::Cw).is_err());
+        assert!(FilterWidthIndex::new(FilterMode::Ssb, 5).is_err());
+        assert!(FilterWidthIndex::new(FilterMode::Cw, 5).is_err());
     }
 
     #[test]
     fn filter_width_am_range() {
         for v in 0..=3 {
-            assert!(FilterWidthIndex::new(v, FilterMode::Am).is_ok());
+            assert!(FilterWidthIndex::new(FilterMode::Am, v).is_ok());
         }
-        assert!(FilterWidthIndex::new(4, FilterMode::Am).is_err());
+        assert!(FilterWidthIndex::new(FilterMode::Am, 4).is_err());
     }
 
     #[test]
-    fn filter_width_from_raw() {
-        assert!(FilterWidthIndex::from_raw(4).is_ok());
-        assert!(FilterWidthIndex::from_raw(5).is_err());
+    fn filter_width_retains_the_mode_that_defines_its_domain() -> TestResult {
+        let width = FilterWidthIndex::new(FilterMode::Cw, 4)?;
+        assert_eq!(width.mode(), FilterMode::Cw);
+        assert_eq!(width.as_raw(), 4);
+        Ok(())
     }
 
     #[test]
     fn detect_output_mode_round_trip() -> TestResult {
-        for v in 0..DetectOutputMode::COUNT {
-            let val = DetectOutputMode::try_from(v)?;
-            assert_eq!(
-                u8::from(val),
-                v,
-                "DetectOutputMode round-trip failed at {v}"
-            );
+        for v in 0..UsbAudioOutput::COUNT {
+            let val = UsbAudioOutput::try_from(v)?;
+            assert_eq!(u8::from(val), v, "UsbAudioOutput round-trip failed at {v}");
         }
-        assert!(DetectOutputMode::try_from(DetectOutputMode::COUNT).is_err());
+        assert!(UsbAudioOutput::try_from(UsbAudioOutput::COUNT).is_err());
         Ok(())
     }
 

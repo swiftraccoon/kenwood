@@ -6,7 +6,7 @@ use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
 fn open_transport() -> (String, EitherTransport) {
     if let Ok(ports) = SerialTransport::discover_usb() {
         if let Some(info) = ports.first() {
-            let t = SerialTransport::open(&info.port_name, SerialTransport::DEFAULT_BAUD)
+            let t = SerialTransport::open(&info.port_name)
                 .expect("USB open failed");
             return (info.port_name.clone(), EitherTransport::Serial(t));
         }
@@ -33,7 +33,9 @@ async fn send_and_read(
         loop {
             match transport.read(buf).await {
                 Ok(n) if n > 0 => {
-                    codec.feed(&buf[..n]);
+                    if let Err(error) = codec.feed(&buf[..n]) {
+                        return format!("CAT FRAMING ERROR: {error}");
+                    }
                     if let Some(frame) = codec.next_frame() {
                         return String::from_utf8_lossy(&frame).to_string();
                     }
@@ -70,25 +72,55 @@ fn main() {
         println!("Original SF 0: {original}");
 
         // Try setting step to 50kHz (index 10) using decimal
-        println!("Setting SF 0,10 (decimal): {}", send_and_read(&mut transport, &mut codec, "SF 0,10", &mut buf).await);
-        println!("Read back SF 0: {}", send_and_read(&mut transport, &mut codec, "SF 0", &mut buf).await);
+        println!(
+            "Setting SF 0,10 (decimal): {}",
+            send_and_read(&mut transport, &mut codec, "SF 0,10", &mut buf).await
+        );
+        println!(
+            "Read back SF 0: {}",
+            send_and_read(&mut transport, &mut codec, "SF 0", &mut buf).await
+        );
 
         // Try setting step to 50kHz (index 10) using hex A
-        println!("Setting SF 0,A (hex): {}", send_and_read(&mut transport, &mut codec, "SF 0,A", &mut buf).await);
-        println!("Read back SF 0: {}", send_and_read(&mut transport, &mut codec, "SF 0", &mut buf).await);
+        println!(
+            "Setting SF 0,A (hex): {}",
+            send_and_read(&mut transport, &mut codec, "SF 0,A", &mut buf).await
+        );
+        println!(
+            "Read back SF 0: {}",
+            send_and_read(&mut transport, &mut codec, "SF 0", &mut buf).await
+        );
 
         // Try setting step to 100kHz (index 11) using decimal
-        println!("Setting SF 0,11 (decimal): {}", send_and_read(&mut transport, &mut codec, "SF 0,11", &mut buf).await);
-        println!("Read back SF 0: {}", send_and_read(&mut transport, &mut codec, "SF 0", &mut buf).await);
+        println!(
+            "Setting SF 0,11 (decimal): {}",
+            send_and_read(&mut transport, &mut codec, "SF 0,11", &mut buf).await
+        );
+        println!(
+            "Read back SF 0: {}",
+            send_and_read(&mut transport, &mut codec, "SF 0", &mut buf).await
+        );
 
         // Try setting step to 100kHz (index 11) using hex B
-        println!("Setting SF 0,B (hex): {}", send_and_read(&mut transport, &mut codec, "SF 0,B", &mut buf).await);
-        println!("Read back SF 0: {}", send_and_read(&mut transport, &mut codec, "SF 0", &mut buf).await);
+        println!(
+            "Setting SF 0,B (hex): {}",
+            send_and_read(&mut transport, &mut codec, "SF 0,B", &mut buf).await
+        );
+        println!(
+            "Read back SF 0: {}",
+            send_and_read(&mut transport, &mut codec, "SF 0", &mut buf).await
+        );
 
         // Restore original
         if let Some(orig_val) = original.strip_prefix("SF ") {
             println!("Restoring: SF {orig_val}");
-            let _ = send_and_read(&mut transport, &mut codec, &format!("SF {orig_val}"), &mut buf).await;
+            let _ = send_and_read(
+                &mut transport,
+                &mut codec,
+                &format!("SF {orig_val}"),
+                &mut buf,
+            )
+            .await;
         }
 
         println!("\nDone. Check if responses show A/B (hex) or 10/11 (decimal).");

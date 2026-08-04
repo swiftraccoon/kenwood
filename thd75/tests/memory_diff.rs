@@ -27,6 +27,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -62,8 +63,10 @@ const fn region_for_offset(offset: usize) -> &'static str {
         0x10000..0x14B00 => "Channel names",
         0x14B00..0x15100 => "Group names / gap",
         0x15100..0x15200 => "APRS status header",
-        0x15200..0x2A100 => "APRS messages/settings",
-        0x2A100..0x4D100 => "D-STAR repeater/callsign",
+        0x15200..0x25000 => "APRS messages/settings",
+        0x25000..0x29B00 => "D-STAR callsign list",
+        0x29B00..0x2A000 => "D-STAR list gap",
+        0x2A000..0x4D100 => "D-STAR repeater/tail",
         0x4D100.. => "Bluetooth + tail config",
     }
 }

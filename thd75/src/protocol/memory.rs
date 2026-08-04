@@ -1,13 +1,14 @@
-//! Memory commands: ME, MR, 0M.
+//! Memory commands: ME and MR.
 //!
 //! Provides serialization of ME reads and MR actions, plus parsing of ME/MR
-//! responses. Lossy ME writes are intentionally not exposed.
+//! responses. ME writes remain unavailable until hardware qualification.
 
 use crate::error::ProtocolError;
-use crate::types::{Band, MemoryChannelRecord, MemorySelector};
+use crate::types::{Band, CatMemoryChannelRecord, CurrentMemorySelector, MemoryChannelAddress};
 
 use super::Response;
 use super::core::{CHANNEL_FIELD_COUNT, parse_channel_fields};
+use super::fields::{boolean, decimal_u8, split_exact};
 
 /// Parse a memory command response from mnemonic and payload.
 ///
@@ -19,7 +20,6 @@ pub(crate) fn parse_memory(
     match mnemonic {
         "ME" => Some(parse_me(payload)),
         "MR" => Some(parse_mr(payload)),
-        "0M" => Some(Ok(Response::ProgrammingMode)),
         _ => None,
     }
 }
@@ -30,93 +30,42 @@ const ME_FIELD_COUNT: usize = 23;
 /// Parse an ME (memory channel) response.
 ///
 /// ME responses contain 23 comma-separated fields: 1 channel number followed by
-/// 22 data fields. The ME layout differs from FO by inserting one extra field
-/// at position 14 (between x5 and tone-code) and one extra field at position 22
-/// (after data-mode):
+/// 22 data fields. ME inserts its split flag before the shift field and appends
+/// the scan-lockout flag after the shared channel data:
 ///
 /// ```text
 /// ME layout (22 data fields after channel):
-///   [ 1.. 13] freq, offset, step, shift, reverse, tone, ctcss, dcs, x1-x5
-///   [14]      ME-specific field (unknown purpose)
-///   [15..=21] tt, cc, ddd, ds, urcall, lo, dm
-///   [22]      ME-specific field (unknown purpose)
+///   [ 1..=12] frequency through reverse
+///   [13]      split
+///   [14]      shift
+///   [15..=21] tone code through digital-squelch code
+///   [22]      scan lockout
 /// ```
 ///
 /// We remap these into the 20-field FO order and delegate to
 /// [`parse_channel_fields`].
 fn parse_me(payload: &str) -> Result<Response, ProtocolError> {
-    let fields: Vec<&str> = payload.split(',').collect();
-    let actual = fields.len();
+    let fields = split_exact::<ME_FIELD_COUNT>(payload, "ME")?;
+    let selector = parse_memory_address(fields[0], "ME")?;
 
-    // ME wire: `channel,f1..=f13,me14,f15..=f21,me22` (23 fields exactly).
-    let &[ch_str, ref body @ ..] = fields.as_slice() else {
-        return Err(ProtocolError::FieldCount {
-            command: "ME".to_owned(),
-            expected: ME_FIELD_COUNT,
-            actual,
-        });
-    };
-    if body.len() != ME_FIELD_COUNT - 1 {
-        return Err(ProtocolError::FieldCount {
-            command: "ME".to_owned(),
-            expected: ME_FIELD_COUNT,
-            actual,
-        });
-    }
-
-    let selector = parse_selector(ch_str, "ME")?;
-
-    // Remap ME fields to the 20-field FO layout, skipping the two ME-specific
-    // fields at body indices 13 (ME field 14) and 21 (ME field 22).
-    //   body[0..=12]  -> FO fields 0..=12  (freq through x5, 13 items)
-    //   body[14..=20] -> FO fields 13..=19 (tt through dm, 7 items)
-    let Some(head) = body.get(..13) else {
-        return Err(ProtocolError::FieldCount {
-            command: "ME".to_owned(),
-            expected: ME_FIELD_COUNT,
-            actual,
-        });
-    };
-    let Some(tail) = body.get(14..21) else {
-        return Err(ProtocolError::FieldCount {
-            command: "ME".to_owned(),
-            expected: ME_FIELD_COUNT,
-            actual,
-        });
-    };
-    let fo_fields: Vec<&str> = head.iter().chain(tail.iter()).copied().collect();
-
-    debug_assert_eq!(
-        fo_fields.len(),
-        CHANNEL_FIELD_COUNT,
-        "ME → FO reconstruction must yield exactly {CHANNEL_FIELD_COUNT} fields for the \
-         shared `parse_channel_fields` path to accept the input",
-    );
+    // Remap ME's shared fields to FO order. ME field 13 is the split flag;
+    // field 14 is the actual shift field used as FO field 12.
+    let fo_fields: [&str; CHANNEL_FIELD_COUNT] = [
+        fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], fields[7], fields[8],
+        fields[9], fields[10], fields[11], fields[12], fields[14], fields[15], fields[16],
+        fields[17], fields[18], fields[19], fields[20], fields[21],
+    ];
 
     let channel = parse_channel_fields(&fo_fields, "ME")?;
-    let me_field_14_raw = body
-        .get(13)
-        .ok_or_else(|| ProtocolError::FieldCount {
-            command: "ME".to_owned(),
-            expected: ME_FIELD_COUNT,
-            actual,
-        })?
-        .to_string();
-    let me_field_22_raw = body
-        .get(21)
-        .ok_or_else(|| ProtocolError::FieldCount {
-            command: "ME".to_owned(),
-            expected: ME_FIELD_COUNT,
-            actual,
-        })?
-        .to_string();
+    let split = boolean(fields[13], "ME", "split")?;
+    let scan_lockout = boolean(fields[22], "ME", "scan_lockout")?;
 
     Ok(Response::MemoryChannel {
         selector,
-        record: MemoryChannelRecord {
+        record: CatMemoryChannelRecord {
             channel,
-            me_field_14_raw,
-            me_field_22_raw,
+            split,
+            scan_lockout,
         },
     })
 }
@@ -130,15 +79,10 @@ fn parse_me(payload: &str) -> Result<Response, ProtocolError> {
 /// Hardware-verified: `MR 0\r` returns `MR 021` (read, no band in the frame).
 /// `MR 0,021\r` returns `MR 0,021` (write acknowledgment, with comma).
 fn parse_mr(payload: &str) -> Result<Response, ProtocolError> {
-    if let Some((band_str, ch_str)) = payload.split_once(',') {
+    if payload.contains(',') {
         // Write acknowledgment format: "band,channel"
-        let band_val = band_str
-            .parse::<u8>()
-            .map_err(|_| ProtocolError::FieldParse {
-                command: "MR".to_owned(),
-                field: "band".to_owned(),
-                detail: format!("invalid band: {band_str:?}"),
-            })?;
+        let [band_str, ch_str] = split_exact::<2>(payload, "MR")?;
+        let band_val = decimal_u8(band_str, "MR", "band")?;
 
         let band = Band::try_from(band_val).map_err(|e| ProtocolError::FieldParse {
             command: "MR".to_owned(),
@@ -146,19 +90,30 @@ fn parse_mr(payload: &str) -> Result<Response, ProtocolError> {
             detail: e.to_string(),
         })?;
 
-        let selector = parse_selector(ch_str, "MR")?;
+        let selector = parse_memory_address(ch_str, "MR")?;
 
-        Ok(Response::MemoryRecall { band, selector })
+        Ok(Response::MemoryRecallAck { band, selector })
     } else {
-        let selector = parse_selector(payload, "MR")?;
+        let selector = parse_current_selector(payload)?;
         Ok(Response::CurrentChannel { selector })
     }
 }
 
-fn parse_selector(payload: &str, command: &str) -> Result<MemorySelector, ProtocolError> {
-    MemorySelector::try_from(payload).map_err(|error| ProtocolError::FieldParse {
+fn parse_memory_address(
+    payload: &str,
+    command: &str,
+) -> Result<MemoryChannelAddress, ProtocolError> {
+    MemoryChannelAddress::try_from(payload).map_err(|error| ProtocolError::FieldParse {
         command: command.to_owned(),
-        field: "selector".to_owned(),
+        field: "memory_address".to_owned(),
+        detail: error.to_string(),
+    })
+}
+
+fn parse_current_selector(payload: &str) -> Result<CurrentMemorySelector, ProtocolError> {
+    CurrentMemorySelector::try_from(payload).map_err(|error| ProtocolError::FieldParse {
+        command: "MR".to_owned(),
+        field: "current_selector".to_owned(),
         detail: error.to_string(),
     })
 }

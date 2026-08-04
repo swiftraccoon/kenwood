@@ -12,7 +12,7 @@ use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
 fn open_transport() -> (String, EitherTransport) {
     if let Ok(ports) = SerialTransport::discover_usb() {
         if let Some(info) = ports.first() {
-            let t = SerialTransport::open(&info.port_name, SerialTransport::DEFAULT_BAUD)
+            let t = SerialTransport::open(&info.port_name)
                 .expect("USB open failed");
             return (info.port_name.clone(), EitherTransport::Serial(t));
         }
@@ -40,7 +40,10 @@ async fn cmd_matched(
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(std::time::Duration::from_millis(500), t.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => {
-                codec.feed(&buf[..n]);
+                if let Err(error) = codec.feed(&buf[..n]) {
+                    eprintln!("CAT framing failed while reading `{command}`: {error}");
+                    return None;
+                }
                 while let Some(frame) = codec.next_frame() {
                     let s = String::from_utf8_lossy(&frame).to_string();
                     if s.starts_with(expect_prefix) {
@@ -56,7 +59,12 @@ async fn cmd_matched(
                     .await
                     {
                         if n > 0 {
-                            codec.feed(&buf[..n]);
+                            if let Err(error) = codec.feed(&buf[..n]) {
+                                eprintln!(
+                                    "CAT framing failed while draining after `{command}`: {error}"
+                                );
+                                return None;
+                            }
                         }
                         while codec.next_frame().is_some() {}
                     }
@@ -93,15 +101,16 @@ fn main() {
 
         // Read ME for channels with unusual byte[8], byte[9], or byte[14]
         println!("--- Reading stored memory channels ---");
-        let targets: Vec<u16> = vec![
-            // byte[14] = 0x3C (cross-tone channels)
-            31, 33, 34, 75, 88,
-            // 1100+ range: non-zero byte[8] and byte[9] lower nibble
-            1101, 1102, 1103, 1104, 1105, 1106, 1107, 1108, 1109, 1110,
-            1131, 1132, 1133, 1134, 1135, 1136,
-            // byte[8] non-zero, byte[9] = 0x43/0x75/0x79
-            1152, 1158, 1159,
+        let cross_tone_channels = [31, 33, 34, 75, 88];
+        let channels_with_lower_nibble_data = [
+            1101, 1102, 1103, 1104, 1105, 1106, 1107, 1108, 1109, 1110, 1131, 1132, 1133, 1134,
+            1135, 1136,
         ];
+        let channels_with_distinct_byte_nine = [1152, 1158, 1159];
+        let targets = cross_tone_channels
+            .into_iter()
+            .chain(channels_with_lower_nibble_data)
+            .chain(channels_with_distinct_byte_nine);
         for ch in targets {
             let cmd = format!("ME {ch:03}");
             if let Some(r) = cmd_matched(&mut transport, &mut codec, &cmd, "ME ").await {

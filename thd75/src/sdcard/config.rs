@@ -22,11 +22,20 @@
 //! canonical TH-D75 MCP page geometry in [`crate::protocol::programming`].
 
 use super::SdCardError;
+use crate::error::ValidationError;
+use crate::memory::{ChannelAccess, ChannelWriter, MemoryImage};
 use crate::protocol::programming;
-use crate::types::channel::FlashChannel;
+use crate::types::{
+    ChannelDisplayName, MemoryChannelBand, MemoryGroup, RegularChannel, StoredChannel,
+};
+
+pub use crate::memory::ChannelEntry;
 
 /// Size of the `.d75` file header in bytes.
 pub const HEADER_SIZE: usize = 0x100;
+
+/// Size of the model identifier at the start of a `.d75` header.
+pub const MODEL_IDENTIFIER_SIZE: usize = 16;
 
 /// Maximum number of memory channels on the TH-D75.
 pub const MAX_CHANNELS: usize = 1000;
@@ -34,15 +43,13 @@ pub const MAX_CHANNELS: usize = 1000;
 /// Size of each channel memory entry in bytes.
 const CHANNEL_ENTRY_SIZE: usize = programming::CHANNEL_RECORD_SIZE; // 40
 
-/// Size of each channel name entry in bytes.
-const CHANNEL_NAME_SIZE: usize = 16;
-
 /// `.d75` file offset to the channel flags table.
 ///
 /// Each channel has a 4-byte flags entry. This precedes the channel
 /// memory data in the file layout.
 ///
 /// File offset = `HEADER_SIZE + 0x2000 = 0x2100`.
+#[cfg(test)]
 const CHANNEL_FLAGS_OFFSET: usize = HEADER_SIZE + 0x2000;
 
 /// `.d75` file offset to the channel memory data section.
@@ -52,21 +59,16 @@ const CHANNEL_FLAGS_OFFSET: usize = HEADER_SIZE + 0x2000;
 /// than immediately after channel 5.
 ///
 /// File offset = `HEADER_SIZE + 0x4000 = 0x4100`.
+#[cfg(test)]
 const CHANNEL_DATA_OFFSET: usize = HEADER_SIZE + 0x4000;
 
-/// `.d75` file offset to the channel name table.
-///
-/// Channel names are 16-byte null-padded strings.
-///
-/// File offset = `HEADER_SIZE + 0x10000 = 0x10100`.
-const CHANNEL_NAME_OFFSET: usize = HEADER_SIZE + 0x10000;
-
 /// Size of each channel flags entry in bytes.
+#[cfg(test)]
 const CHANNEL_FLAGS_SIZE: usize = 4;
 
 const _: () = assert!(
-    CHANNEL_ENTRY_SIZE == FlashChannel::BYTE_SIZE,
-    "FlashChannel size must match the canonical MCP channel record size"
+    CHANNEL_ENTRY_SIZE == StoredChannel::BYTE_SIZE,
+    "StoredChannel size must match the canonical MCP channel record size"
 );
 const _: () = assert!(
     programming::CHANNELS_PER_MEMGROUP * CHANNEL_ENTRY_SIZE + programming::MEMGROUP_PADDING
@@ -74,13 +76,71 @@ const _: () = assert!(
     "MCP channel records and padding must exactly fill one page"
 );
 
-/// Known model identification strings found at offset 0 of the header.
-const KNOWN_MODELS: &[&str] = &["Data For TH-D75A", "Data For TH-D75E", "Data For TH-D75"];
+const TH_D75A_IDENTIFIER: [u8; MODEL_IDENTIFIER_SIZE] = *b"Data For TH-D75A";
+const TH_D75E_IDENTIFIER: [u8; MODEL_IDENTIFIER_SIZE] = *b"Data For TH-D75E";
+const TH_D75_IDENTIFIER: [u8; MODEL_IDENTIFIER_SIZE] = *b"Data For TH-D75\0";
+
+/// Radio model identifier accepted by the `.d75` configuration format.
+///
+/// The on-disk field is exactly 16 bytes. The region-neutral identifier is
+/// 15 ASCII bytes followed by one NUL byte; the regional identifiers occupy
+/// all 16 bytes and have no terminator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigFileModel {
+    /// Americas model (`Data For TH-D75A`).
+    ThD75A,
+    /// European model (`Data For TH-D75E`).
+    ThD75E,
+    /// Region-neutral model (`Data For TH-D75` followed by NUL padding).
+    RegionNeutral,
+}
+
+impl ConfigFileModel {
+    /// Return the human-readable model identifier without padding.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ThD75A => "Data For TH-D75A",
+            Self::ThD75E => "Data For TH-D75E",
+            Self::RegionNeutral => "Data For TH-D75",
+        }
+    }
+
+    /// Return the exact 16 bytes stored in a `.d75` header.
+    #[must_use]
+    pub const fn identifier(self) -> [u8; MODEL_IDENTIFIER_SIZE] {
+        match self {
+            Self::ThD75A => TH_D75A_IDENTIFIER,
+            Self::ThD75E => TH_D75E_IDENTIFIER,
+            Self::RegionNeutral => TH_D75_IDENTIFIER,
+        }
+    }
+}
+
+impl TryFrom<[u8; MODEL_IDENTIFIER_SIZE]> for ConfigFileModel {
+    type Error = SdCardError;
+
+    fn try_from(identifier: [u8; MODEL_IDENTIFIER_SIZE]) -> Result<Self, Self::Error> {
+        match identifier {
+            TH_D75A_IDENTIFIER => Ok(Self::ThD75A),
+            TH_D75E_IDENTIFIER => Ok(Self::ThD75E),
+            TH_D75_IDENTIFIER => Ok(Self::RegionNeutral),
+            found => Err(SdCardError::InvalidModelIdentifier { found }),
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigFileModel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 /// Return the `.d75` file offset for a channel's 40-byte MCP record.
 ///
 /// MCP channel data is page-shaped, not a flat array: each page holds six
 /// records and ends with 16 bytes of padding.
+#[cfg(test)]
 const fn channel_data_offset(channel: usize) -> usize {
     let memgroup = channel / programming::CHANNELS_PER_MEMGROUP;
     let slot = channel % programming::CHANNELS_PER_MEMGROUP;
@@ -91,75 +151,146 @@ const fn channel_data_offset(channel: usize) -> usize {
 
 /// Parsed `.d75` configuration file header (256 bytes).
 ///
-/// The header contains the model identification string and metadata
-/// fields. The radio rejects files with unrecognised model strings.
+/// The header contains a validated model identifier and otherwise preserves
+/// every byte verbatim. Metadata accessors read directly from the bytes that
+/// [`write_config`] emits, so their views cannot diverge from the serialized
+/// header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigHeader {
-    /// Model identification string (e.g., `"Data For TH-D75A"`).
-    ///
-    /// Null-terminated, stored at offset 0x00 (up to 16 bytes).
-    pub model: String,
-
-    /// Version/checksum bytes at offset 0x14 (4 bytes).
-    ///
-    /// Observed as `0x95C48F42` for the TH-D75A; exact semantics unknown.
-    pub version_bytes: [u8; 4],
-
-    /// Raw header bytes preserved for round-trip fidelity.
-    ///
-    /// Always exactly 256 bytes. Fields above are parsed views into
-    /// this buffer.
-    pub raw: [u8; HEADER_SIZE],
+    raw: [u8; HEADER_SIZE],
 }
 
-/// Complete radio configuration from a `.d75` file.
+impl ConfigHeader {
+    /// Create a zero-filled header with the selected model and metadata bytes.
+    #[must_use]
+    pub fn new(model: ConfigFileModel, version_bytes: [u8; 4]) -> Self {
+        let mut raw = [0u8; HEADER_SIZE];
+        raw[..MODEL_IDENTIFIER_SIZE].copy_from_slice(&model.identifier());
+        raw[0x14..0x18].copy_from_slice(&version_bytes);
+        Self { raw }
+    }
+
+    /// Return the validated model represented by the serialized identifier.
+    #[must_use]
+    pub fn model(&self) -> ConfigFileModel {
+        let identifier = self
+            .raw
+            .first_chunk::<MODEL_IDENTIFIER_SIZE>()
+            .copied()
+            .unwrap_or_else(|| unreachable!("a fixed-size header contains its model identifier"));
+        ConfigFileModel::try_from(identifier)
+            .unwrap_or_else(|_| unreachable!("ConfigHeader construction validates its model"))
+    }
+
+    /// Return the four metadata bytes at offset `0x14`.
+    ///
+    /// These bytes are commonly described as a version or checksum, but their
+    /// exact semantics are not known.
+    #[must_use]
+    pub const fn version_bytes(&self) -> [u8; 4] {
+        [
+            self.raw[0x14],
+            self.raw[0x15],
+            self.raw[0x16],
+            self.raw[0x17],
+        ]
+    }
+
+    /// Return the exact 256 serialized header bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; HEADER_SIZE] {
+        &self.raw
+    }
+}
+
+impl TryFrom<[u8; HEADER_SIZE]> for ConfigHeader {
+    type Error = SdCardError;
+
+    fn try_from(raw: [u8; HEADER_SIZE]) -> Result<Self, Self::Error> {
+        let identifier = raw
+            .first_chunk::<MODEL_IDENTIFIER_SIZE>()
+            .copied()
+            .unwrap_or_else(|| unreachable!("a fixed-size header contains its model identifier"));
+        let _validated_model = ConfigFileModel::try_from(identifier)?;
+        Ok(Self { raw })
+    }
+}
+
+/// Complete, fixed-size radio configuration from a `.d75` file.
 ///
-/// This is the top-level structure returned by [`parse_config`].
+/// This is the top-level structure returned by [`parse_config`]. The channel
+/// and settings views all borrow the same canonical [`MemoryImage`], so a
+/// serialized configuration cannot diverge from a second cached copy.
 #[derive(Debug, Clone)]
 pub struct RadioConfig {
-    /// The 256-byte file header.
-    pub header: ConfigHeader,
-
-    /// Parsed memory channels (up to 1000).
-    ///
-    /// Each entry pairs the channel data with its display name and
-    /// flags. Unused channels (all-`0xFF` frequency) are still
-    /// present; check [`ChannelEntry::used`] to filter.
-    pub channels: Vec<ChannelEntry>,
-
-    /// Raw settings bytes (everything outside the channel regions).
-    ///
-    /// This preserves all data between the header and the channel
-    /// sections, and after the channel name table, enabling
-    /// round-trip write-back of settings we do not yet parse.
-    pub raw_image: Vec<u8>,
+    header: ConfigHeader,
+    memory_image: MemoryImage,
 }
 
-/// A single memory channel combining frequency data, display name, and flags.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChannelEntry {
-    /// Channel number (0--999).
-    pub number: u16,
-
-    /// User-assigned display name (up to 16 bytes, ASCII).
-    pub name: String,
-
-    /// The 40-byte flash channel data (frequency, mode, tone, offset, etc.).
+impl RadioConfig {
+    /// Combine a validated header and exact-size MCP memory image.
     ///
-    /// Uses the flash memory encoding ([`FlashChannel`]) which differs from
-    /// the CAT wire format ([`crate::types::ChannelMemory`]). Key differences
-    /// include the mode field (8 modes vs 4) and structured tone/duplex bit
-    /// packing.
-    pub flash: FlashChannel,
-
-    /// Whether this channel slot contains valid data.
+    /// # Errors
     ///
-    /// A channel is considered unused when its RX frequency is
-    /// `0x00000000` or `0xFFFFFFFF`.
-    pub used: bool,
+    /// Returns [`SdCardError::ChannelParse`] if any regular-channel slot in
+    /// the image has malformed flags, name bytes, channel data, or a
+    /// programmed marker paired with an invalid receive frequency.
+    pub fn new(header: ConfigHeader, memory_image: MemoryImage) -> Result<Self, SdCardError> {
+        validate_regular_channels(&memory_image)?;
+        Ok(Self {
+            header,
+            memory_image,
+        })
+    }
 
-    /// Channel lockout state from the flags table.
-    pub lockout: bool,
+    /// Borrow the exact 256-byte `.d75` header.
+    #[must_use]
+    pub const fn header(&self) -> &ConfigHeader {
+        &self.header
+    }
+
+    /// Borrow the canonical fixed-size MCP memory image.
+    #[must_use]
+    pub const fn memory_image(&self) -> &MemoryImage {
+        &self.memory_image
+    }
+
+    /// Mutably borrow the canonical fixed-size MCP memory image.
+    ///
+    /// Prefer its typed subsystem writers. Direct raw-byte mutation remains
+    /// available for diagnostics, and subsequent typed reads report any
+    /// malformed values rather than normalizing them.
+    #[must_use]
+    pub const fn memory_image_mut(&mut self) -> &mut MemoryImage {
+        &mut self.memory_image
+    }
+
+    /// Access regular channels from the canonical memory image.
+    #[must_use]
+    pub fn channels(&self) -> ChannelAccess<'_> {
+        self.memory_image.channels()
+    }
+
+    /// Mutate regular channels in the canonical memory image.
+    #[must_use]
+    pub fn channels_mut(&mut self) -> ChannelWriter<'_> {
+        self.memory_image.channels_mut()
+    }
+
+    /// Consume the configuration and return its header and memory image.
+    #[must_use]
+    pub fn into_parts(self) -> (ConfigHeader, MemoryImage) {
+        (self.header, self.memory_image)
+    }
+
+    /// Consume the configuration and return its memory image.
+    ///
+    /// This intentionally discards the `.d75` header. Use [`Self::into_parts`]
+    /// when the image may later be serialized as a complete configuration.
+    #[must_use]
+    pub fn into_memory_image(self) -> MemoryImage {
+        self.memory_image
+    }
 }
 
 /// Parses a `.d75` configuration file from raw bytes.
@@ -167,19 +298,42 @@ pub struct ChannelEntry {
 /// # Errors
 ///
 /// Returns [`SdCardError::FileTooSmall`] if the data is shorter than
-/// the minimum required size, or [`SdCardError::InvalidModelString`]
+/// the minimum required size, or [`SdCardError::InvalidModelIdentifier`]
 /// if the header model is not recognised.
 pub fn parse_config(data: &[u8]) -> Result<RadioConfig, SdCardError> {
-    // Minimum size: header + channel names region must be reachable.
-    let min_size = CHANNEL_NAME_OFFSET + (MAX_CHANNELS * CHANNEL_NAME_SIZE);
-    if data.len() < min_size {
+    let expected_size = HEADER_SIZE + programming::TOTAL_SIZE;
+    if data.len() < expected_size {
         return Err(SdCardError::FileTooSmall {
-            expected: min_size,
+            expected: expected_size,
+            actual: data.len(),
+        });
+    }
+    if data.len() > expected_size {
+        return Err(SdCardError::UnexpectedFileSize {
+            file_type: ".d75 configuration",
+            expected: expected_size,
             actual: data.len(),
         });
     }
 
-    // --- Parse header ---
+    let header = parse_header(data)?;
+    let raw_image = data
+        .get(HEADER_SIZE..)
+        .ok_or(SdCardError::FileTooSmall {
+            expected: HEADER_SIZE,
+            actual: data.len(),
+        })?
+        .to_vec();
+    let memory_image =
+        MemoryImage::from_raw(raw_image).map_err(|error| SdCardError::InvalidMemoryImage {
+            detail: error.to_string(),
+        })?;
+
+    RadioConfig::new(header, memory_image)
+}
+
+/// Parse and validate the fixed-size `.d75` file header.
+fn parse_header(data: &[u8]) -> Result<ConfigHeader, SdCardError> {
     let header_slice = data.get(..HEADER_SIZE).ok_or(SdCardError::FileTooSmall {
         expected: HEADER_SIZE,
         actual: data.len(),
@@ -190,294 +344,92 @@ pub fn parse_config(data: &[u8]) -> Result<RadioConfig, SdCardError> {
             actual: data.len(),
         })?;
 
-    let model_slice = raw_header.get(..16).ok_or(SdCardError::FileTooSmall {
-        expected: 16,
-        actual: raw_header.len(),
-    })?;
-    let model = extract_null_terminated(model_slice);
-    if !KNOWN_MODELS.contains(&model.as_str()) {
-        return Err(SdCardError::InvalidModelString { found: model });
-    }
+    ConfigHeader::try_from(raw_header)
+}
 
-    let version_slice = raw_header
-        .get(0x14..0x18)
-        .ok_or(SdCardError::FileTooSmall {
-            expected: 0x18,
-            actual: raw_header.len(),
-        })?;
-    let version_bytes =
-        <[u8; 4]>::try_from(version_slice).map_err(|_| SdCardError::FileTooSmall {
-            expected: 0x18,
-            actual: raw_header.len(),
-        })?;
-
-    let header = ConfigHeader {
-        model,
-        version_bytes,
-        raw: raw_header,
-    };
-
-    // --- Parse channels ---
-    let mut channels = Vec::with_capacity(MAX_CHANNELS);
-
-    for i in 0..MAX_CHANNELS {
-        let ch_offset = channel_data_offset(i);
-        let name_offset = CHANNEL_NAME_OFFSET + (i * CHANNEL_NAME_SIZE);
-        let flags_offset = CHANNEL_FLAGS_OFFSET + (i * CHANNEL_FLAGS_SIZE);
-
-        // Channel data: if the file is too short for this channel,
-        // treat it as unused rather than erroring (the file may have
-        // been truncated after the documented sections).
-        let ch_end = ch_offset + CHANNEL_ENTRY_SIZE;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "Loop index `i` ranges over 0..MAX_CHANNELS (=1000). u16::MAX is 65535, so \
-                      the usize-to-u16 cast is provably lossless."
-        )]
-        let ch_index = i as u16; // MAX_CHANNELS = 1000, always fits in u16
-
-        let (used, flash) = if let Some(ch_bytes) = data.get(ch_offset..ch_end) {
-            // ch_bytes is CHANNEL_ENTRY_SIZE (40) bytes so split_first_chunk::<4> always yields Some.
-            let rx_freq = ch_bytes
-                .split_first_chunk::<4>()
-                .map_or(0, |(head, _)| u32::from_le_bytes(*head));
-            let is_used = rx_freq != 0 && rx_freq != 0xFFFF_FFFF;
-            let ch = FlashChannel::from_bytes(ch_bytes).map_err(|e| SdCardError::ChannelParse {
-                index: ch_index,
-                detail: e.to_string(),
+/// Validate all one thousand regular-channel slots in numerical order.
+fn validate_regular_channels(memory_image: &MemoryImage) -> Result<(), SdCardError> {
+    let channels = memory_image.channels();
+    for number in RegularChannel::all() {
+        let _validated_entry = channels
+            .get(number)
+            .map_err(|error| SdCardError::ChannelParse {
+                index: number.as_raw(),
+                detail: error.to_string(),
             })?;
-            (is_used, ch)
-        } else {
-            (false, FlashChannel::default())
-        };
-
-        // Channel name
-        let name = data
-            .get(name_offset..name_offset + CHANNEL_NAME_SIZE)
-            .map_or_else(String::new, extract_null_terminated);
-
-        // Channel flags: bit 0 of byte 0 = lockout
-        let lockout = data
-            .get(flags_offset..flags_offset + CHANNEL_FLAGS_SIZE)
-            .and_then(<[u8]>::first)
-            .is_some_and(|b| b & 0x01 != 0);
-
-        channels.push(ChannelEntry {
-            number: ch_index,
-            name,
-            flash,
-            used,
-            lockout,
-        });
     }
-
-    // Preserve the entire memory image (minus header) for round-trip.
-    // The FileTooSmall check at the top of this function guarantees data.len() >= HEADER_SIZE.
-    let raw_image = data
-        .get(HEADER_SIZE..)
-        .ok_or(SdCardError::FileTooSmall {
-            expected: HEADER_SIZE,
-            actual: data.len(),
-        })?
-        .to_vec();
-
-    Ok(RadioConfig {
-        header,
-        channels,
-        raw_image,
-    })
+    Ok(())
 }
 
 /// Generates a `.d75` file from a [`RadioConfig`].
 ///
-/// The output is the header concatenated with the raw memory image,
-/// with channel data, names, and flags patched in from the
-/// [`RadioConfig::channels`] entries.
+/// The output is the header concatenated with the configuration's canonical,
+/// fixed-size memory image.
 #[must_use]
 pub fn write_config(config: &RadioConfig) -> Vec<u8> {
-    let image_size = config.raw_image.len();
-    let total_size = HEADER_SIZE + image_size;
-    let mut out = vec![0u8; total_size];
-
-    // Write header. `out` was just sized to `HEADER_SIZE + image_size`, so the 0..HEADER_SIZE
-    // split always succeeds; `copy_from_slice` panics only on length mismatch, which is
-    // impossible here since both halves are fixed-size HEADER_SIZE bytes.
-    if let Some(dst) = out.get_mut(..HEADER_SIZE) {
-        dst.copy_from_slice(&config.header.raw);
-    }
-
-    // Write raw image as the base (preserves all settings)
-    if let Some(dst) = out.get_mut(HEADER_SIZE..) {
-        dst.copy_from_slice(&config.raw_image);
-    }
-
-    // Patch channel data, names, and flags
-    for entry in &config.channels {
-        let i = entry.number as usize;
-        if i >= MAX_CHANNELS {
-            continue;
-        }
-
-        // Channel memory (40 bytes)
-        let ch_offset = channel_data_offset(i);
-        let ch_end = ch_offset + CHANNEL_ENTRY_SIZE;
-        if let Some(dst) = out.get_mut(ch_offset..ch_end) {
-            let bytes = entry.flash.to_bytes();
-            dst.copy_from_slice(&bytes);
-        }
-
-        // Channel name (16 bytes, null-padded)
-        let name_offset = CHANNEL_NAME_OFFSET + (i * CHANNEL_NAME_SIZE);
-        let name_end = name_offset + CHANNEL_NAME_SIZE;
-        if let Some(dst) = out.get_mut(name_offset..name_end) {
-            let mut name_buf = [0u8; CHANNEL_NAME_SIZE];
-            let src = entry.name.as_bytes();
-            let copy_len = src.len().min(CHANNEL_NAME_SIZE);
-            // Both halves are bounded by copy_len, so these slices exist by construction.
-            if let (Some(dst_head), Some(src_head)) =
-                (name_buf.get_mut(..copy_len), src.get(..copy_len))
-            {
-                dst_head.copy_from_slice(src_head);
-            }
-            dst.copy_from_slice(&name_buf);
-        }
-
-        // Channel flags (4 bytes, bit 0 = lockout)
-        let flags_offset = CHANNEL_FLAGS_OFFSET + (i * CHANNEL_FLAGS_SIZE);
-        if let Some(flag_byte) = out.get_mut(flags_offset) {
-            // Guard that the full 4-byte flags region is within bounds before touching byte 0.
-            if flags_offset + CHANNEL_FLAGS_SIZE <= total_size {
-                // Preserve existing flag bits; only toggle lockout bit 0.
-                if entry.lockout {
-                    *flag_byte |= 0x01;
-                } else {
-                    *flag_byte &= !0x01;
-                }
-            }
-        }
-    }
-
-    out
+    serialize_config_parts(config.memory_image(), config.header())
 }
 
-/// Extracts a null-terminated ASCII string from a byte slice.
-fn extract_null_terminated(bytes: &[u8]) -> String {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    // `position` guarantees `end <= bytes.len()`, so `.get(..end)` always returns `Some`.
-    bytes.get(..end).map_or_else(String::new, |valid| {
-        String::from_utf8_lossy(valid).into_owned()
-    })
-}
-
-/// Creates a minimal valid `.d75` header for the given model string.
+/// Create a minimal valid `.d75` header for a supported model.
 ///
 /// Useful for generating new configuration files from scratch.
-///
-/// # Errors
-///
-/// Returns [`SdCardError::InvalidModelString`] if the model string
-/// is not one of the known variants.
-pub fn make_header(model: &str, version_bytes: [u8; 4]) -> Result<ConfigHeader, SdCardError> {
-    if !KNOWN_MODELS.contains(&model) {
-        return Err(SdCardError::InvalidModelString {
-            found: model.to_owned(),
-        });
-    }
-
-    let mut raw = [0u8; HEADER_SIZE];
-    let model_bytes = model.as_bytes();
-    let copy_len = model_bytes.len().min(16);
-    // copy_len <= 16 <= HEADER_SIZE, so both slices are in bounds by construction.
-    if let (Some(dst), Some(src)) = (raw.get_mut(..copy_len), model_bytes.get(..copy_len)) {
-        dst.copy_from_slice(src);
-    }
-    // 0x18 <= HEADER_SIZE (0x100), so this 4-byte slot is in bounds by construction.
-    if let Some(dst) = raw.get_mut(0x14..0x18) {
-        dst.copy_from_slice(&version_bytes);
-    }
-
-    Ok(ConfigHeader {
-        model: model.to_owned(),
-        version_bytes,
-        raw,
-    })
+#[must_use]
+pub fn make_header(model: ConfigFileModel, version_bytes: [u8; 4]) -> ConfigHeader {
+    ConfigHeader::new(model, version_bytes)
 }
 
 /// Creates an empty [`ChannelEntry`] for the given channel number.
 #[must_use]
-pub fn empty_channel(number: u16) -> ChannelEntry {
-    ChannelEntry {
-        number,
-        name: String::new(),
-        flash: FlashChannel::default(),
-        used: false,
-        lockout: false,
-    }
+pub fn empty_channel(number: RegularChannel) -> ChannelEntry {
+    ChannelEntry::empty(number)
 }
 
-/// Creates a [`ChannelEntry`] with the given flash channel data.
-///
-/// The channel is automatically marked as `used = true` if the RX
-/// frequency is nonzero.
-#[must_use]
-pub fn make_channel(number: u16, name: &str, flash: FlashChannel) -> ChannelEntry {
-    let used = flash.rx_frequency.as_hz() != 0;
-    ChannelEntry {
-        number,
-        name: name.to_owned(),
-        flash,
-        used,
-        lockout: false,
-    }
-}
-
-/// Write a `.d75` configuration file from a raw memory image and header.
-///
-/// The `.d75` file format is: 256-byte header + raw MCP memory image.
-/// This produces files identical to those exported by Menu No. 800
-/// or the MCP-D75 application.
+/// Creates a [`ChannelEntry`] with the given stored channel data.
 ///
 /// # Errors
 ///
-/// Returns [`SdCardError::InvalidModelString`] if the header model string
-/// is not recognised. Returns [`SdCardError::FileTooSmall`] if the image
-/// is smaller than the minimum expected size for channel parsing.
-pub fn write_d75(
-    image: &crate::memory::MemoryImage,
-    header: &ConfigHeader,
-) -> Result<Vec<u8>, SdCardError> {
-    // Validate the header model string.
-    if !KNOWN_MODELS.contains(&header.model.as_str()) {
-        return Err(SdCardError::InvalidModelString {
-            found: header.model.clone(),
-        });
-    }
+/// Returns [`ValidationError`] if `name` is not a valid channel display name.
+pub fn make_channel(
+    number: RegularChannel,
+    name: &str,
+    stored_channel: StoredChannel,
+    band: MemoryChannelBand,
+    group: MemoryGroup,
+) -> Result<ChannelEntry, ValidationError> {
+    ChannelEntry::new_programmed(
+        number,
+        ChannelDisplayName::new(name)?,
+        stored_channel,
+        band,
+        group,
+        false,
+    )
+}
 
+/// Serialize the two validated parts retained by [`RadioConfig`].
+fn serialize_config_parts(image: &MemoryImage, header: &ConfigHeader) -> Vec<u8> {
     let raw = image.as_raw();
-
-    // Validate that the image is at least large enough for channel data
-    // (this ensures round-trip parse_config will succeed).
-    let min_body = CHANNEL_NAME_OFFSET - HEADER_SIZE + (MAX_CHANNELS * CHANNEL_NAME_SIZE);
-    if raw.len() < min_body {
-        return Err(SdCardError::FileTooSmall {
-            expected: min_body,
-            actual: raw.len(),
-        });
-    }
-
     let mut out = Vec::with_capacity(HEADER_SIZE + raw.len());
-    out.extend_from_slice(&header.raw);
+    out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(raw);
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::frequency::Frequency;
+    use crate::types::{StoredChannelFlag, frequency::Frequency};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;
+
+    fn synthetic_stored_channel(receive_frequency: Frequency) -> StoredChannel {
+        let mut wire = [0_u8; StoredChannel::BYTE_SIZE];
+        wire[..4].copy_from_slice(&receive_frequency.to_le_bytes());
+        StoredChannel::from_bytes(&wire).unwrap_or_else(|error| {
+            unreachable!("fixed all-zero synthetic channel record must decode: {error}")
+        })
+    }
 
     fn set_byte(image: &mut [u8], offset: usize, value: u8) -> Result<(), BoxErr> {
         let img_len = image.len();
@@ -500,143 +452,211 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn extract_null_terminated_basic() -> TestResult {
-        let mut buf = [0u8; 16];
-        buf.get_mut(..5)
-            .ok_or("buf too short for 5 bytes")?
-            .copy_from_slice(b"hello");
-        assert_eq!(extract_null_terminated(&buf), "hello");
+    fn mark_regular_channels_empty(image: &mut [u8], flags_offset: usize) -> Result<(), BoxErr> {
+        let flags_end = flags_offset + MAX_CHANNELS * CHANNEL_FLAGS_SIZE;
+        let flags = image
+            .get_mut(flags_offset..flags_end)
+            .ok_or("regular-channel flag table is outside the test image")?;
+        for flag in flags.chunks_exact_mut(CHANNEL_FLAGS_SIZE) {
+            let marker = flag
+                .first_mut()
+                .ok_or("channel flag record has no marker byte")?;
+            *marker = programming::FLAG_EMPTY;
+        }
         Ok(())
     }
 
     #[test]
-    fn extract_null_terminated_full() {
-        let buf = *b"abcdefghijklmnop";
-        assert_eq!(extract_null_terminated(&buf), "abcdefghijklmnop");
-    }
-
-    #[test]
-    fn make_header_valid() -> TestResult {
-        let hdr = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
-        assert_eq!(hdr.model, "Data For TH-D75A");
-        assert_eq!(hdr.version_bytes, [0x95, 0xC4, 0x8F, 0x42]);
-        assert_eq!(hdr.raw.len(), HEADER_SIZE);
-        Ok(())
-    }
-
-    #[test]
-    fn make_header_invalid_model() -> TestResult {
-        let err = make_header("Data For TH-D74A", [0; 4])
-            .err()
-            .ok_or("expected InvalidModelString error but got Ok")?;
-        assert!(
-            matches!(err, SdCardError::InvalidModelString { .. }),
-            "expected InvalidModelString, got {err:?}"
+    fn model_identifiers_include_exact_padding() {
+        assert_eq!(ConfigFileModel::ThD75A.identifier(), *b"Data For TH-D75A");
+        assert_eq!(ConfigFileModel::ThD75E.identifier(), *b"Data For TH-D75E");
+        assert_eq!(
+            ConfigFileModel::RegionNeutral.identifier(),
+            *b"Data For TH-D75\0"
         );
+    }
+
+    #[test]
+    fn make_header_views_match_serialized_bytes() {
+        let hdr = make_header(ConfigFileModel::ThD75A, [0x95, 0xC4, 0x8F, 0x42]);
+        assert_eq!(hdr.model(), ConfigFileModel::ThD75A);
+        assert_eq!(hdr.version_bytes(), [0x95, 0xC4, 0x8F, 0x42]);
+        assert_eq!(hdr.as_bytes().len(), HEADER_SIZE);
+        assert_eq!(
+            hdr.as_bytes().get(..MODEL_IDENTIFIER_SIZE),
+            Some(ConfigFileModel::ThD75A.identifier().as_slice())
+        );
+        assert_eq!(
+            hdr.as_bytes().get(0x14..0x18),
+            Some([0x95, 0xC4, 0x8F, 0x42].as_slice())
+        );
+    }
+
+    #[test]
+    fn config_header_rejects_and_preserves_invalid_identifier_bytes() -> TestResult {
+        let mut raw = *make_header(ConfigFileModel::RegionNeutral, [0; 4]).as_bytes();
+        let padding = raw
+            .get_mut(MODEL_IDENTIFIER_SIZE - 1)
+            .ok_or("model identifier padding byte missing")?;
+        *padding = 0xFF;
+        let expected = *raw
+            .first_chunk::<MODEL_IDENTIFIER_SIZE>()
+            .ok_or("model identifier missing")?;
+
+        let err = ConfigHeader::try_from(raw)
+            .err()
+            .ok_or("invalid model identifier should be rejected")?;
+        assert_eq!(err, SdCardError::InvalidModelIdentifier { found: expected });
         Ok(())
     }
 
     #[test]
-    fn empty_channel_defaults() {
-        let ch = empty_channel(42);
-        assert_eq!(ch.number, 42);
-        assert!(!ch.used);
-        assert!(!ch.lockout);
-        assert_eq!(ch.name, "");
+    fn empty_channel_defaults() -> TestResult {
+        let ch = empty_channel(RegularChannel::new(42)?);
+        assert_eq!(ch.number(), RegularChannel::new(42)?);
+        assert_eq!(ch.flag(), StoredChannelFlag::empty());
+        assert!(ch.name().is_empty());
+        Ok(())
     }
 
     #[test]
-    fn make_channel_marks_used() {
-        let flash = FlashChannel {
-            rx_frequency: Frequency::new(145_000_000),
-            ..FlashChannel::default()
-        };
-        let ch = make_channel(0, "2M RPT", flash);
-        assert!(ch.used);
-        assert_eq!(ch.name, "2M RPT");
+    fn make_channel_marks_used() -> TestResult {
+        let stored_channel = synthetic_stored_channel(Frequency::new(145_000_000));
+        let ch = make_channel(
+            RegularChannel::new(0)?,
+            "2M RPT",
+            stored_channel,
+            MemoryChannelBand::Vhf,
+            MemoryGroup::new(0)?,
+        )?;
+        assert!(ch.is_programmed());
+        assert_eq!(ch.name().as_str(), "2M RPT");
+        Ok(())
     }
 
     #[test]
-    fn make_channel_zero_freq_unused() {
-        let ch = make_channel(0, "empty", FlashChannel::default());
-        assert!(!ch.used);
+    fn make_channel_rejects_zero_frequency() -> TestResult {
+        let error = make_channel(
+            RegularChannel::new(0)?,
+            "empty",
+            synthetic_stored_channel(Frequency::new(0)),
+            MemoryChannelBand::Vhf,
+            MemoryGroup::new(0)?,
+        )
+        .err()
+        .ok_or("zero-frequency programmed channel should be rejected")?;
+        assert!(matches!(error, ValidationError::FrequencyOutOfRange(0)));
+        Ok(())
     }
 
     #[test]
-    fn write_d75_round_trip() -> TestResult {
+    fn write_config_round_trip() -> TestResult {
         use crate::memory::MemoryImage;
         use crate::protocol::programming;
 
-        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
-        let raw = vec![0u8; programming::TOTAL_SIZE];
-        let image = MemoryImage::from_raw(raw)?;
-
-        // Write the .d75 file.
-        let d75_bytes = write_d75(&image, &header)?;
+        let header = make_header(ConfigFileModel::ThD75A, [0x95, 0xC4, 0x8F, 0x42]);
+        let mut raw = vec![0u8; programming::TOTAL_SIZE];
+        mark_regular_channels_empty(&mut raw, CHANNEL_FLAGS_OFFSET - HEADER_SIZE)?;
+        let config = RadioConfig::new(header, MemoryImage::from_raw(raw)?)?;
+        let d75_bytes = write_config(&config);
 
         // The output should be header + image.
         assert_eq!(d75_bytes.len(), HEADER_SIZE + programming::TOTAL_SIZE);
         assert_eq!(
             d75_bytes.get(..HEADER_SIZE).ok_or("d75_bytes too short")?,
-            &header.raw
+            config.header().as_bytes()
         );
         assert_eq!(
             d75_bytes.get(HEADER_SIZE..).ok_or("d75_bytes too short")?,
-            image.as_raw()
+            config.memory_image().as_raw()
         );
 
         // Round-trip: parse it back and verify.
         let parsed = parse_config(&d75_bytes)?;
-        assert_eq!(parsed.header.model, "Data For TH-D75A");
-        assert_eq!(parsed.header.version_bytes, [0x95, 0xC4, 0x8F, 0x42]);
-        assert_eq!(parsed.raw_image.len(), d75_bytes.len() - HEADER_SIZE);
-        Ok(())
-    }
-
-    #[test]
-    fn write_d75_invalid_model_rejected() -> TestResult {
-        use crate::memory::MemoryImage;
-        use crate::protocol::programming;
-
-        let mut raw_header = [0u8; HEADER_SIZE];
-        raw_header
-            .get_mut(..17)
-            .ok_or("raw_header too short")?
-            .copy_from_slice(b"Data For TH-D74A\0");
-        let header = ConfigHeader {
-            model: "Data For TH-D74A".to_owned(),
-            version_bytes: [0; 4],
-            raw: raw_header,
-        };
-        let raw = vec![0u8; programming::TOTAL_SIZE];
-        let image = MemoryImage::from_raw(raw)?;
-
-        let err = write_d75(&image, &header)
-            .err()
-            .ok_or("expected InvalidModelString but got Ok")?;
-        assert!(
-            matches!(err, SdCardError::InvalidModelString { .. }),
-            "expected InvalidModelString, got {err:?}"
+        assert_eq!(parsed.header().model(), ConfigFileModel::ThD75A);
+        assert_eq!(parsed.header().version_bytes(), [0x95, 0xC4, 0x8F, 0x42]);
+        assert_eq!(
+            parsed.memory_image().as_raw().len(),
+            d75_bytes.len() - HEADER_SIZE
         );
         Ok(())
     }
 
     #[test]
-    fn write_d75_preserves_channel_data() -> TestResult {
+    fn write_config_preserves_every_opaque_header_byte_after_memory_mutation() -> TestResult {
+        let mut raw_header = [0xA5; HEADER_SIZE];
+        raw_header
+            .get_mut(..MODEL_IDENTIFIER_SIZE)
+            .ok_or("model identifier range missing from test header")?
+            .copy_from_slice(&ConfigFileModel::ThD75E.identifier());
+        let header = ConfigHeader::try_from(raw_header)?;
+
+        let mut raw_memory = vec![0u8; programming::TOTAL_SIZE];
+        mark_regular_channels_empty(&mut raw_memory, CHANNEL_FLAGS_OFFSET - HEADER_SIZE)?;
+        let mut config = RadioConfig::new(header, MemoryImage::from_raw(raw_memory)?)?;
+        let last_offset = programming::TOTAL_SIZE
+            .checked_sub(1)
+            .ok_or("memory image unexpectedly has no bytes")?;
+        config
+            .memory_image_mut()
+            .write_region(last_offset, &[0x5A])?;
+
+        let serialized = write_config(&config);
+        assert_eq!(
+            serialized
+                .get(..HEADER_SIZE)
+                .ok_or("serialized configuration is missing its header")?,
+            raw_header.as_slice()
+        );
+
+        let parsed = parse_config(&serialized)?;
+        assert_eq!(parsed.header().as_bytes(), &raw_header);
+        assert_eq!(
+            parsed
+                .memory_image()
+                .read_region(last_offset, 1)
+                .ok_or("parsed memory image is missing its final byte")?,
+            &[0x5A]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_config_rejects_trailing_bytes() -> TestResult {
+        let header = make_header(ConfigFileModel::ThD75A, [0x95, 0xC4, 0x8F, 0x42]);
+        let mut raw = vec![0u8; programming::TOTAL_SIZE];
+        mark_regular_channels_empty(&mut raw, CHANNEL_FLAGS_OFFSET - HEADER_SIZE)?;
+        let config = RadioConfig::new(header, MemoryImage::from_raw(raw)?)?;
+        let mut data = write_config(&config);
+        data.push(0xA5);
+
+        assert!(matches!(
+            parse_config(&data),
+            Err(SdCardError::UnexpectedFileSize {
+                file_type: ".d75 configuration",
+                expected,
+                actual,
+            }) if expected == HEADER_SIZE + programming::TOTAL_SIZE
+                && actual == expected + 1
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn write_config_preserves_channel_data() -> TestResult {
         use crate::memory::MemoryImage;
 
-        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
+        let header = make_header(ConfigFileModel::ThD75A, [0x95, 0xC4, 0x8F, 0x42]);
 
         // Build a raw image with some nonzero data in the channel region.
         let mut raw = vec![0u8; programming::TOTAL_SIZE];
+        mark_regular_channels_empty(&mut raw, CHANNEL_FLAGS_OFFSET - HEADER_SIZE)?;
         // Put a marker byte at offset 0x4000 (channel data section in the body).
         if raw.len() > 0x4000 {
             set_byte(&mut raw, 0x4000, 0xAB)?;
         }
-        let image = MemoryImage::from_raw(raw)?;
-
-        let d75_bytes = write_d75(&image, &header)?;
+        let config = RadioConfig::new(header, MemoryImage::from_raw(raw)?)?;
+        let d75_bytes = write_config(&config);
 
         // The marker should be at file offset HEADER_SIZE + 0x4000.
         assert_eq!(
@@ -650,20 +670,25 @@ mod tests {
 
     #[test]
     fn parse_config_skips_memgroup_padding_before_channel_six() -> TestResult {
-        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
+        let header = make_header(ConfigFileModel::ThD75A, [0x95, 0xC4, 0x8F, 0x42]);
         let mut data = vec![0u8; HEADER_SIZE + programming::TOTAL_SIZE];
-        write_slice(&mut data, 0, &header.raw)?;
+        write_slice(&mut data, 0, header.as_bytes())?;
+        mark_regular_channels_empty(&mut data, CHANNEL_FLAGS_OFFSET)?;
 
-        let channel_five = FlashChannel {
-            rx_frequency: Frequency::new(446_000_000),
-            ..FlashChannel::default()
-        };
-        let channel_six = FlashChannel {
-            rx_frequency: Frequency::new(145_600_000),
-            ..FlashChannel::default()
-        };
+        let channel_five = synthetic_stored_channel(Frequency::new(446_000_000));
+        let channel_six = synthetic_stored_channel(Frequency::new(145_600_000));
         write_slice(&mut data, channel_data_offset(5), &channel_five.to_bytes())?;
         write_slice(&mut data, channel_data_offset(6), &channel_six.to_bytes())?;
+        write_slice(
+            &mut data,
+            CHANNEL_FLAGS_OFFSET + 5 * CHANNEL_FLAGS_SIZE,
+            &[programming::FLAG_UHF, 0, 0, 0xFF],
+        )?;
+        write_slice(
+            &mut data,
+            CHANNEL_FLAGS_OFFSET + 6 * CHANNEL_FLAGS_SIZE,
+            &[programming::FLAG_VHF, 0, 0, 0xFF],
+        )?;
 
         let padding_start = channel_data_offset(5) + CHANNEL_ENTRY_SIZE;
         assert_eq!(
@@ -677,19 +702,34 @@ mod tests {
         );
 
         let parsed = parse_config(&data)?;
-        let parsed_five = parsed.channels.get(5).ok_or("channel 5 missing")?;
-        let parsed_six = parsed.channels.get(6).ok_or("channel 6 missing")?;
-        assert_eq!(parsed_five.flash.rx_frequency.as_hz(), 446_000_000);
-        assert_eq!(parsed_six.flash.rx_frequency.as_hz(), 145_600_000);
-        assert!(parsed_five.used);
-        assert!(parsed_six.used);
+        let parsed_five = parsed.channels().get(RegularChannel::new(5)?)?;
+        let parsed_six = parsed.channels().get(RegularChannel::new(6)?)?;
+        assert_eq!(
+            parsed_five
+                .programmed()
+                .ok_or("channel 5 should be programmed")?
+                .receive_frequency
+                .as_hz(),
+            446_000_000
+        );
+        assert_eq!(
+            parsed_six
+                .programmed()
+                .ok_or("channel 6 should be programmed")?
+                .receive_frequency
+                .as_hz(),
+            145_600_000
+        );
+        assert!(parsed_five.is_programmed());
+        assert!(parsed_six.is_programmed());
         Ok(())
     }
 
     #[test]
     fn write_config_preserves_memgroup_padding_before_channel_six() -> TestResult {
-        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
+        let header = make_header(ConfigFileModel::ThD75A, [0x95, 0xC4, 0x8F, 0x42]);
         let mut raw_image = vec![0u8; programming::TOTAL_SIZE];
+        mark_regular_channels_empty(&mut raw_image, CHANNEL_FLAGS_OFFSET - HEADER_SIZE)?;
         let padding_start = channel_data_offset(5) + CHANNEL_ENTRY_SIZE;
         let padding_end = channel_data_offset(6);
         let padding_body_start = padding_start - HEADER_SIZE;
@@ -699,22 +739,29 @@ mod tests {
             .ok_or("raw image channel padding missing")?
             .fill(0xA5);
 
-        let channel_five = FlashChannel {
-            rx_frequency: Frequency::new(446_000_000),
-            ..FlashChannel::default()
-        };
-        let channel_six = FlashChannel {
-            rx_frequency: Frequency::new(145_600_000),
-            ..FlashChannel::default()
-        };
-        let config = RadioConfig {
-            header,
-            channels: vec![
-                make_channel(5, "PAGE ZERO", channel_five.clone()),
-                make_channel(6, "PAGE ONE", channel_six.clone()),
-            ],
-            raw_image,
-        };
+        let channel_five = synthetic_stored_channel(Frequency::new(446_000_000));
+        let channel_six = synthetic_stored_channel(Frequency::new(145_600_000));
+        let entry_five = make_channel(
+            RegularChannel::new(5)?,
+            "PAGE ZERO",
+            channel_five.clone(),
+            MemoryChannelBand::Uhf,
+            MemoryGroup::new(0)?,
+        )?;
+        let entry_six = make_channel(
+            RegularChannel::new(6)?,
+            "PAGE ONE",
+            channel_six.clone(),
+            MemoryChannelBand::Vhf,
+            MemoryGroup::new(0)?,
+        )?;
+        let mut memory_image = MemoryImage::from_raw(raw_image)?;
+        {
+            let mut channels = memory_image.channels_mut();
+            channels.set(&entry_five)?;
+            channels.set(&entry_six)?;
+        }
+        let config = RadioConfig::new(header, memory_image)?;
 
         let written = write_config(&config);
         assert_eq!(
@@ -739,21 +786,21 @@ mod tests {
         let parsed = parse_config(&written)?;
         assert_eq!(
             parsed
-                .channels
-                .get(5)
-                .ok_or("round-tripped channel 5 missing")?
-                .flash
-                .rx_frequency
+                .channels()
+                .get(RegularChannel::new(5)?)?
+                .programmed()
+                .ok_or("channel 5 should be programmed")?
+                .receive_frequency
                 .as_hz(),
             446_000_000
         );
         assert_eq!(
             parsed
-                .channels
-                .get(6)
-                .ok_or("round-tripped channel 6 missing")?
-                .flash
-                .rx_frequency
+                .channels()
+                .get(RegularChannel::new(6)?)?
+                .programmed()
+                .ok_or("channel 6 should be programmed")?
+                .receive_frequency
                 .as_hz(),
             145_600_000
         );
@@ -762,11 +809,11 @@ mod tests {
 
     #[test]
     fn parse_config_channel_parse_error() -> TestResult {
-        let header = make_header("Data For TH-D75A", [0x95, 0xC4, 0x8F, 0x42])?;
+        let header = make_header(ConfigFileModel::ThD75A, [0x95, 0xC4, 0x8F, 0x42]);
 
         // Build a valid .d75 file, then corrupt channel 0's step_size byte.
         let mut d75_data = vec![0u8; HEADER_SIZE + programming::TOTAL_SIZE];
-        write_slice(&mut d75_data, 0, &header.raw)?;
+        write_slice(&mut d75_data, 0, header.as_bytes())?;
 
         // Channel 0 data starts at file offset CHANNEL_DATA_OFFSET.
         // Give it a nonzero RX frequency so it's "used" and parsed.

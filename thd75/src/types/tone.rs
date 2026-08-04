@@ -22,21 +22,14 @@ use crate::error::ValidationError;
 /// CTCSS (Continuous Tone-Coded Squelch System) frequency table.
 ///
 /// 51 entries: 50 sub-audible CTCSS tone frequencies (indices 0-49) plus
-/// the 1750 Hz tone burst at index 50. Indexed by [`ToneCode`]. The CTCSS
-/// table is at firmware address `0xC003C694`.
+/// the 1750 Hz tone burst at index 50. Indexed by [`ToneCode`].
 ///
-/// The D75 supports indices 0-49 (50 CTCSS tones), extending the D74's
-/// 35-tone table with 15 additional tones including interleaved entries
-/// in the 159-200 Hz range (159.8, 165.5, 171.3, 177.3, 183.5, 189.9,
-/// 196.6, 199.5) and high-frequency tones (210.7-254.1 Hz).
+/// The D75 supports indices 0-49, including interleaved entries in the
+/// 159-200 Hz range and high-frequency tones through 254.1 Hz.
 ///
 /// Index 50 (1750.0 Hz) is the European repeater access tone burst,
-/// confirmed by ARFC-D75 decompilation. It is NOT a CTCSS tone; it is
-/// a short audio-frequency burst used to open European repeaters.
-///
-/// This table corresponds to **KI4LAX TABLE A** in the CAT command
-/// reference, which maps hex indices 0x00-0x31 to CTCSS tone frequencies.
-/// Index 0x32 (50) for the 1750 Hz tone burst is from ARFC-D75 RE.
+/// not a CTCSS tone. It is a short audio-frequency burst used to open
+/// European repeaters.
 pub const CTCSS_FREQUENCIES: [f64; 51] = [
     67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, // 0-9
     94.8, 97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3, // 10-19
@@ -49,10 +42,7 @@ pub const CTCSS_FREQUENCIES: [f64; 51] = [
 /// DCS (Digital-Coded Squelch) code table.
 ///
 /// 104 digital squelch codes used for selective calling. Indexed by
-/// [`DcsCode`]. Table is at firmware address `0xC0086FC4`.
-///
-/// This table corresponds to **KI4LAX TABLE B** in the CAT command
-/// reference, which maps hex indices 0x00-0x67 to DCS code numbers.
+/// [`DcsCode`].
 pub const DCS_CODES: [u16; 104] = [
     23, 25, 26, 31, 32, 36, 43, 47, 51, 53, 54, 65, 71, 72, 73, 74, 114, 115, 116, 122, 125, 131,
     132, 134, 143, 145, 152, 155, 156, 162, 165, 172, 174, 205, 212, 223, 225, 226, 243, 244, 245,
@@ -67,18 +57,18 @@ pub const DCS_CODES: [u16; 104] = [
 /// Wraps a `u8` index in the range 0..=50. Indices 0-49 are standard
 /// CTCSS sub-audible tones. Index 50 is the 1750 Hz tone burst used for
 /// European repeater access; it is NOT a CTCSS tone but a short
-/// audio-frequency burst. Confirmed by ARFC-D75 decompilation.
+/// audio-frequency burst.
 ///
-/// Use [`ToneCode::frequency_hz`] to look up the corresponding frequency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// Use [`ToneCode::as_hz`] to look up the corresponding frequency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ToneCode(u8);
 
 impl ToneCode {
     /// Maximum valid tone code index (inclusive).
     pub const MAX_INDEX: u8 = 50;
 
-    /// 100.0 Hz CTCSS tone (index 12 in the TH-D75 codebook), the APRS
-    /// voice-alert default per TH-D75 Operating Tips §5.13.
+    /// 100.0 Hz CTCSS tone (index 12 in the TH-D75 codebook), the documented
+    /// Menu No. 593 factory choice for APRS voice alert.
     pub const TONE_100HZ: Self = Self(12);
 
     /// Creates a new `ToneCode` from a raw index.
@@ -96,7 +86,7 @@ impl ToneCode {
 
     /// Returns the raw index into the CTCSS frequency table.
     #[must_use]
-    pub const fn index(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self.0
     }
 
@@ -109,14 +99,95 @@ impl ToneCode {
                   in-bounds. Kept as indexed access because `slice::get` is not \
                   const-callable, so a `const fn` has no non-indexing accessor."
     )]
-    pub const fn frequency_hz(self) -> f64 {
+    pub const fn as_hz(self) -> f64 {
         CTCSS_FREQUENCIES[self.0 as usize]
     }
 }
 
 impl std::fmt::Display for ToneCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({} Hz)", self.0, self.frequency_hz())
+        write!(f, "{} ({} Hz)", self.0, self.as_hz())
+    }
+}
+
+/// Validated CTCSS decoder-frequency index (0-49).
+///
+/// Channel records have separate transmit-tone and receive-CTCSS fields. The
+/// transmit field also accepts the 1750 Hz burst at index 50, while a CTCSS
+/// decoder does not. This narrower type prevents that invalid state from
+/// reaching CAT or stored-channel APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CtcssCode(u8);
+
+impl CtcssCode {
+    /// Number of valid CTCSS decoder indices (`0` through `49`).
+    pub const COUNT: u8 = 50;
+
+    /// Largest valid CTCSS decoder index.
+    pub const MAX_INDEX: u8 = 49;
+
+    /// Construct a CTCSS decoder-frequency index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::CtcssCodeOutOfRange`] for index 50 or above.
+    pub const fn new(index: u8) -> Result<Self, ValidationError> {
+        if index <= Self::MAX_INDEX {
+            Ok(Self(index))
+        } else {
+            Err(ValidationError::CtcssCodeOutOfRange(index))
+        }
+    }
+
+    /// Return the zero-based CTCSS table index.
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        self.0
+    }
+
+    /// Return the selected CTCSS frequency in hertz.
+    #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`CtcssCode::new` proves the index is 0-49 and the table has 51 entries; indexed \
+                  access keeps this method const because `slice::get` is not const-callable"
+    )]
+    pub const fn as_hz(self) -> f64 {
+        CTCSS_FREQUENCIES[self.0 as usize]
+    }
+}
+
+impl TryFrom<u8> for CtcssCode {
+    type Error = ValidationError;
+
+    fn try_from(index: u8) -> Result<Self, Self::Error> {
+        Self::new(index)
+    }
+}
+
+impl From<CtcssCode> for u8 {
+    fn from(code: CtcssCode) -> Self {
+        code.as_raw()
+    }
+}
+
+impl From<CtcssCode> for ToneCode {
+    fn from(code: CtcssCode) -> Self {
+        Self(code.0)
+    }
+}
+
+impl TryFrom<ToneCode> for CtcssCode {
+    type Error = ValidationError;
+
+    fn try_from(code: ToneCode) -> Result<Self, Self::Error> {
+        Self::new(code.as_raw())
+    }
+}
+
+impl std::fmt::Display for CtcssCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} ({} Hz)", self.0, self.as_hz())
     }
 }
 
@@ -124,7 +195,7 @@ impl std::fmt::Display for ToneCode {
 ///
 /// Wraps a `u8` index in the range 0..=103. Use [`DcsCode::code_value`]
 /// to look up the corresponding DCS code number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DcsCode(u8);
 
 impl DcsCode {
@@ -149,7 +220,7 @@ impl DcsCode {
 
     /// Returns the raw index into the DCS code table.
     #[must_use]
-    pub const fn index(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         self.0
     }
 
@@ -173,38 +244,51 @@ impl std::fmt::Display for DcsCode {
     }
 }
 
-/// Tone signaling mode for a channel.
+/// Mutually exclusive tone signaling mode for a channel.
 ///
-/// Maps to the tone-mode field in the `FO` and `ME` commands.
-/// Corresponds to **KI4LAX TABLE F** in the CAT command reference
-/// (index 0 = Off, 1 = CTCSS, 2 = DCS).
+/// FO/ME represents this as four booleans. Flash stores the same state as a
+/// one-hot nibble in byte `0x0A`: Tone=`8`, CTCSS=`4`, DCS=`2`, Cross=`1`.
+/// Values with more than one bit set are invalid because the radio exposes
+/// these modes as one selection cycle.
 ///
 /// Per User Manual Chapter 10: CTCSS does not make conversations
 /// private -- it only relieves you from hearing unwanted conversations.
 /// When CTCSS or DCS is active during scan, scan stops on any signal
 /// but immediately resumes if the signal lacks the matching tone/code.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToneMode {
-    /// No tone signaling (index 0).
+    /// No tone signaling (`0`).
     Off = 0,
-    /// CTCSS tone (index 1).
-    Ctcss = 1,
-    /// DCS code (index 2).
+    /// Transmit a tone without receive-side decoding (`8`).
+    Tone = 8,
+    /// Transmit and decode CTCSS (`4`).
+    Ctcss = 4,
+    /// Transmit and decode DCS (`2`).
     Dcs = 2,
-    /// Cross-tone mode (index 3). Separate encode/decode signaling types.
-    /// Confirmed by ARFC-D75 decompilation (`a1` enum, 4 values).
-    CrossTone = 3,
+    /// Use separate transmit and receive signaling types (`1`).
+    CrossTone = 1,
 }
 
 impl ToneMode {
-    /// Number of valid tone mode values (0-3).
-    pub const COUNT: u8 = 4;
+    /// Number of semantic tone modes.
+    pub const COUNT: u8 = 5;
+
+    /// Every tone mode in the radio's front-panel cycle order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Off,
+        Self::Tone,
+        Self::Ctcss,
+        Self::Dcs,
+        Self::CrossTone,
+    ];
 }
 
 impl std::fmt::Display for ToneMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Off => f.write_str("Off"),
+            Self::Tone => f.write_str("Tone"),
             Self::Ctcss => f.write_str("CTCSS"),
             Self::Dcs => f.write_str("DCS"),
             Self::CrossTone => f.write_str("Cross Tone"),
@@ -218,9 +302,10 @@ impl TryFrom<u8> for ToneMode {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Off),
-            1 => Ok(Self::Ctcss),
+            1 => Ok(Self::CrossTone),
             2 => Ok(Self::Dcs),
-            3 => Ok(Self::CrossTone),
+            4 => Ok(Self::Ctcss),
+            8 => Ok(Self::Tone),
             _ => Err(ValidationError::ToneModeOutOfRange(value)),
         }
     }
@@ -228,141 +313,6 @@ impl TryFrom<u8> for ToneMode {
 
 impl From<ToneMode> for u8 {
     fn from(mode: ToneMode) -> Self {
-        mode as Self
-    }
-}
-
-/// CTCSS encode/decode mode (byte 0x09 bits \[1:0\]).
-///
-/// Controls whether CTCSS tones are encoded on transmit, decoded on
-/// receive, or both. Uses [`ValidationError::ToneModeOutOfRange`] for
-/// out-of-range values since it shares the same valid range (0-2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CtcssMode {
-    /// CTCSS disabled (index 0).
-    Off = 0,
-    /// Encode and decode CTCSS (index 1).
-    On = 1,
-    /// Encode CTCSS on transmit only (index 2).
-    EncodeOnly = 2,
-}
-
-impl CtcssMode {
-    /// Number of valid CTCSS mode values (0-2).
-    pub const COUNT: u8 = 3;
-}
-
-impl TryFrom<u8> for CtcssMode {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Off),
-            1 => Ok(Self::On),
-            2 => Ok(Self::EncodeOnly),
-            _ => Err(ValidationError::ToneModeOutOfRange(value)),
-        }
-    }
-}
-
-impl From<CtcssMode> for u8 {
-    fn from(mode: CtcssMode) -> Self {
-        mode as Self
-    }
-}
-
-/// Data speed for packet/digital modes.
-///
-/// Maps to the data-speed field in the `FO` and `ME` commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DataSpeed {
-    /// 1200 bps (index 0).
-    Bps1200 = 0,
-    /// 9600 bps (index 1).
-    Bps9600 = 1,
-}
-
-impl DataSpeed {
-    /// Number of valid data speed values (0-1).
-    pub const COUNT: u8 = 2;
-}
-
-impl std::fmt::Display for DataSpeed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Bps1200 => f.write_str("1200 bps"),
-            Self::Bps9600 => f.write_str("9600 bps"),
-        }
-    }
-}
-
-impl TryFrom<u8> for DataSpeed {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Bps1200),
-            1 => Ok(Self::Bps9600),
-            _ => Err(ValidationError::DataSpeedOutOfRange(value)),
-        }
-    }
-}
-
-impl From<DataSpeed> for u8 {
-    fn from(speed: DataSpeed) -> Self {
-        speed as Self
-    }
-}
-
-/// Channel lockout mode for scan operations.
-///
-/// Maps to the lockout field in the `ME` command.
-///
-/// Per User Manual Chapter 9: lockout can be set individually for all
-/// 1000 memory channels but cannot be set for program scan memory
-/// (L0/U0 through L49/U49). The lockout icon appears to the right of
-/// the channel number when a locked-out channel is recalled. Lockout
-/// cannot be toggled in VFO or CALL channel mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LockoutMode {
-    /// Not locked out (index 0).
-    Off = 0,
-    /// Locked out of scan (index 1).
-    On = 1,
-    /// Group lockout (index 2).
-    Group = 2,
-}
-
-impl LockoutMode {
-    /// Number of valid lockout mode values (0-2).
-    pub const COUNT: u8 = 3;
-}
-
-impl std::fmt::Display for LockoutMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Off => f.write_str("Off"),
-            Self::On => f.write_str("Locked Out"),
-            Self::Group => f.write_str("Group Lockout"),
-        }
-    }
-}
-
-impl TryFrom<u8> for LockoutMode {
-    type Error = ValidationError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Off),
-            1 => Ok(Self::On),
-            2 => Ok(Self::Group),
-            _ => Err(ValidationError::LockoutOutOfRange(value)),
-        }
-    }
-}
-
-impl From<LockoutMode> for u8 {
-    fn from(mode: LockoutMode) -> Self {
         mode as Self
     }
 }
@@ -388,7 +338,7 @@ mod tests {
     fn tone_code_valid_range() -> TestResult {
         for i in 0u8..=ToneCode::MAX_INDEX {
             let val = ToneCode::new(i)?;
-            assert_eq!(val.index(), i, "ToneCode round-trip failed at {i}");
+            assert_eq!(val.as_raw(), i, "ToneCode round-trip failed at {i}");
         }
         Ok(())
     }
@@ -402,14 +352,14 @@ mod tests {
     #[test]
     fn tone_code_frequency_lookup() -> TestResult {
         let tc = ToneCode::new(0)?;
-        assert!((tc.frequency_hz() - 67.0).abs() < f64::EPSILON);
+        assert!((tc.as_hz() - 67.0).abs() < f64::EPSILON);
         let tc = ToneCode::new(42)?;
-        assert!((tc.frequency_hz() - 210.7).abs() < f64::EPSILON);
+        assert!((tc.as_hz() - 210.7).abs() < f64::EPSILON);
         let tc = ToneCode::new(49)?;
-        assert!((tc.frequency_hz() - 254.1).abs() < f64::EPSILON);
+        assert!((tc.as_hz() - 254.1).abs() < f64::EPSILON);
         // Code 50: 1750 Hz tone burst (European repeater access).
         let tc = ToneCode::new(50)?;
-        assert!((tc.frequency_hz() - 1750.0).abs() < f64::EPSILON);
+        assert!((tc.as_hz() - 1750.0).abs() < f64::EPSILON);
         Ok(())
     }
 
@@ -421,6 +371,18 @@ mod tests {
         assert!((table_entry(&CTCSS_FREQUENCIES, 43)? - 218.1).abs() < f64::EPSILON);
         assert!((table_entry(&CTCSS_FREQUENCIES, 49)? - 254.1).abs() < f64::EPSILON);
         assert!((table_entry(&CTCSS_FREQUENCIES, 50)? - 1750.0).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn ctcss_code_valid_range_and_conversions() -> TestResult {
+        for raw in 0u8..CtcssCode::COUNT {
+            let code = CtcssCode::try_from(raw)?;
+            assert_eq!(u8::from(code), raw);
+            assert_eq!(ToneCode::from(code).as_raw(), raw);
+        }
+        assert!(CtcssCode::try_from(CtcssCode::COUNT).is_err());
+        assert!(CtcssCode::try_from(ToneCode::new(50)?).is_err());
         Ok(())
     }
 
@@ -453,45 +415,19 @@ mod tests {
 
     #[test]
     fn tone_mode_valid_range() -> TestResult {
-        for i in 0u8..ToneMode::COUNT {
-            let val = ToneMode::try_from(i)?;
-            assert_eq!(u8::from(val), i, "ToneMode round-trip failed at {i}");
+        assert_eq!(ToneMode::ALL.map(u8::from), [0, 8, 4, 2, 1]);
+        for expected in ToneMode::ALL {
+            let raw = u8::from(expected);
+            let actual = ToneMode::try_from(raw)?;
+            assert_eq!(actual, expected, "ToneMode round-trip failed at {raw}");
         }
         Ok(())
     }
 
     #[test]
     fn tone_mode_invalid() {
-        assert!(ToneMode::try_from(ToneMode::COUNT).is_err());
-    }
-
-    #[test]
-    fn data_speed_valid() -> TestResult {
-        for i in 0u8..DataSpeed::COUNT {
-            let val = DataSpeed::try_from(i)?;
-            assert_eq!(u8::from(val), i, "DataSpeed round-trip failed at {i}");
+        for raw in [3, 5, 6, 7, 9, 15, 255] {
+            assert!(ToneMode::try_from(raw).is_err(), "{raw} is not one-hot");
         }
-        assert!(DataSpeed::try_from(DataSpeed::COUNT).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn lockout_mode_valid() -> TestResult {
-        for i in 0u8..LockoutMode::COUNT {
-            let val = LockoutMode::try_from(i)?;
-            assert_eq!(u8::from(val), i, "LockoutMode round-trip failed at {i}");
-        }
-        assert!(LockoutMode::try_from(LockoutMode::COUNT).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn ctcss_mode_valid() -> TestResult {
-        for i in 0u8..CtcssMode::COUNT {
-            let val = CtcssMode::try_from(i)?;
-            assert_eq!(u8::from(val), i, "CtcssMode round-trip failed at {i}");
-        }
-        assert!(CtcssMode::try_from(CtcssMode::COUNT).is_err());
-        Ok(())
     }
 }

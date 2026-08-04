@@ -3,34 +3,37 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
 use crate::transport::Transport;
-use crate::types::{ChannelMemory, MemoryChannelRecord, MemorySelector};
+use crate::types::{CatMemoryChannelRecord, MemoryChannelAddress, RegularChannel};
 
 use super::Radio;
 
 impl<T: Transport> Radio<T> {
     /// Read a memory channel by number (ME read).
     ///
+    /// Returns the complete ME record, including split and scan-lockout state.
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
-    pub async fn read_channel(&mut self, channel: u16) -> Result<ChannelMemory, Error> {
-        let selector = MemorySelector::try_from(channel)?;
-        let record = self.read_memory(selector).await?;
-        Ok(record.channel.channel)
+    pub async fn get_regular_channel_record(
+        &mut self,
+        channel: RegularChannel,
+    ) -> Result<CatMemoryChannelRecord, Error> {
+        self.get_channel_record(channel.into()).await
     }
 
     /// Read a complete ME record by its exact selector.
     ///
-    /// Unlike [`read_channel`](Self::read_channel), this preserves the CAT
-    /// transmit-step field and both currently-unidentified ME-only fields.
+    /// Unlike [`get_regular_channel_record`](Self::get_regular_channel_record), this accepts every ME
+    /// selector form rather than only regular channels 000-999.
     ///
     /// # Errors
     ///
     /// Returns a transport/protocol error if the command fails.
-    pub async fn read_memory(
+    pub async fn get_channel_record(
         &mut self,
-        selector: MemorySelector,
-    ) -> Result<MemoryChannelRecord, Error> {
+        selector: MemoryChannelAddress,
+    ) -> Result<CatMemoryChannelRecord, Error> {
         tracing::debug!(%selector, "reading memory record");
         let response = self.execute(Command::GetMemoryChannel { selector }).await?;
         match response {
@@ -45,34 +48,35 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Read multiple memory channels efficiently.
+    /// Read multiple memory channels sequentially.
     ///
-    /// Reads channels in the given range and returns only occupied channels
-    /// (skips channels that return N/not available).
+    /// Reads channels in the given range and returns their complete ME records,
+    /// including split and scan-lockout state. Only occupied channels are
+    /// returned; channels that report N/not available are skipped.
     ///
     /// # Errors
     ///
     /// Returns an error if a transport or protocol error occurs (other than
     /// the radio returning N for an empty channel).
-    pub async fn read_channels(
+    pub async fn read_regular_channel_records<I>(
         &mut self,
-        range: std::ops::Range<u16>,
-    ) -> Result<Vec<(u16, ChannelMemory)>, Error> {
-        tracing::debug!(
-            start = range.start,
-            end = range.end,
-            "reading memory channels"
-        );
+        channels: I,
+    ) -> Result<Vec<(RegularChannel, CatMemoryChannelRecord)>, Error>
+    where
+        I: IntoIterator<Item = RegularChannel>,
+    {
+        let channels: Vec<_> = channels.into_iter().collect();
+        tracing::debug!(count = channels.len(), "reading memory channels");
         let mut results = Vec::new();
-        for ch in range {
-            match self.read_channel(ch).await {
+        for channel in channels {
+            match self.get_regular_channel_record(channel).await {
                 Ok(data) => {
                     // Skip channels with a zero frequency (empty).
-                    if data.rx_frequency.as_hz() != 0 {
-                        results.push((ch, data));
+                    if data.channel.receive_frequency.as_hz() != 0 {
+                        results.push((channel, data));
                     }
                 }
-                Err(Error::NotAvailable) => {
+                Err(Error::NotAvailableInCurrentMode) => {
                     // Channel is empty/not programmed, so skip it.
                 }
                 Err(e) => return Err(e),
@@ -80,100 +84,93 @@ impl<T: Transport> Radio<T> {
         }
         Ok(results)
     }
-
-    /// Attempt to write a memory channel by number (ME write).
-    ///
-    /// This writer is quarantined. The former codec discarded four shared
-    /// FO fields and both ME-only fields, then replaced them with zeroes. It
-    /// remains unavailable until all 22 ME fields can be preserved and the
-    /// restore/readback behavior is qualified on hardware.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails or the response is unexpected.
-    #[expect(
-        clippy::unused_async,
-        reason = "Compatibility quarantine: keep the existing async public API while returning \
-                  before I/O until the full ME wire record is qualified"
-    )]
-    pub async fn write_channel(
-        &mut self,
-        channel: u16,
-        _data: &ChannelMemory,
-    ) -> Result<(), Error> {
-        if channel > 999 {
-            return Err(Error::Validation(
-                crate::error::ValidationError::ChannelOutOfRange { channel, max: 999 },
-            ));
-        }
-        Err(Error::UnqualifiedCatWrite {
-            command: "ME",
-            reason: "the current channel model cannot preserve all 22 wire fields",
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::MockTransport;
+    use crate::types::{ChannelTransmitValue, Frequency};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// ME response for channel 5 with a valid frequency.
     const ME_RESP_005: &[u8] =
-        b"ME 005,0440000000,0005000000,5,2,0,0,0,0,0,0,0,0,0,0,08,08,000,0,,0,00,0\r";
+        b"ME 005,0440000000,0005000000,0,0,0,0,0,1,0,0,0,0,1,2,14,14,023,0,REPEATER,1,05,1\r";
 
     #[tokio::test]
-    async fn read_channels_returns_populated() -> TestResult {
+    async fn read_regular_channel_records_returns_populated() -> TestResult {
         let mut mock = MockTransport::new();
         // Channel 0: not available.
         mock.expect(b"ME 000\r", b"N\r");
         // Channel 1: populated.
         mock.expect(
             b"ME 001\r",
-            b"ME 001,0146520000,0000600000,5,0,0,0,0,0,0,0,0,0,0,0,08,08,000,0,,0,00,0\r",
+            b"ME 001,0146520000,0000600000,5,0,0,0,0,0,0,0,0,0,1,0,08,08,000,0,,0,00,1\r",
         );
         // Channel 2: not available.
         mock.expect(b"ME 002\r", b"N\r");
 
-        let mut radio = Radio::connect(mock).await?;
-        let channels = radio.read_channels(0..3).await?;
+        let mut radio = Radio::new(mock);
+        let channels = radio
+            .read_regular_channel_records(RegularChannel::range_inclusive(
+                RegularChannel::new(0)?,
+                RegularChannel::new(2)?,
+            ))
+            .await?;
         assert_eq!(channels.len(), 1);
         let first = channels.first().ok_or("channels[0] missing")?;
-        assert_eq!(first.0, 1);
-        assert_eq!(first.1.rx_frequency.as_hz(), 146_520_000);
+        assert_eq!(first.0, RegularChannel::new(1)?);
+        assert_eq!(first.1.channel.receive_frequency.as_hz(), 146_520_000);
+        assert!(first.1.split);
+        assert!(first.1.scan_lockout);
+        assert_eq!(
+            first.1.transmit_value(),
+            ChannelTransmitValue::SplitTransmitFrequency(Frequency::new(600_000)),
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn read_channels_empty_range() -> TestResult {
+    async fn read_regular_channel_records_empty_range() -> TestResult {
         let mock = MockTransport::new();
-        let mut radio = Radio::connect(mock).await?;
-        let channels = radio.read_channels(0..0).await?;
+        let mut radio = Radio::new(mock);
+        let channels = radio
+            .read_regular_channel_records(std::iter::empty())
+            .await?;
         assert!(channels.is_empty());
         Ok(())
     }
 
     #[tokio::test]
-    async fn read_channel_populated() -> TestResult {
+    async fn get_regular_channel_record_populated() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"ME 005\r", ME_RESP_005);
-        let mut radio = Radio::connect(mock).await?;
-        let data = radio.read_channel(5).await?;
-        assert_eq!(data.rx_frequency.as_hz(), 440_000_000);
+        let mut radio = Radio::new(mock);
+        let data = radio
+            .get_regular_channel_record(RegularChannel::new(5)?)
+            .await?;
+        assert_eq!(data.channel.receive_frequency.as_hz(), 440_000_000);
+        assert!(data.split);
+        assert!(data.scan_lockout);
+        assert_eq!(
+            data.transmit_value(),
+            ChannelTransmitValue::SplitTransmitFrequency(Frequency::new(5_000_000)),
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn read_channel_not_available() -> TestResult {
+    async fn get_regular_channel_record_not_available() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"ME 999\r", b"N\r");
-        let mut radio = Radio::connect(mock).await?;
-        let result = radio.read_channel(999).await;
+        let mut radio = Radio::new(mock);
+        let result = radio
+            .get_regular_channel_record(RegularChannel::new(999)?)
+            .await;
         assert!(
-            matches!(result, Err(Error::NotAvailable)),
-            "expected NotAvailable, got {result:?}"
+            matches!(result, Err(Error::NotAvailableInCurrentMode)),
+            "expected NotAvailableInCurrentMode, got {result:?}"
         );
         Ok(())
     }

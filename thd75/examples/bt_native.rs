@@ -7,6 +7,7 @@ use aprs as _;
 use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
+use encoding_rs as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -32,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match BluetoothTransport::open(None) {
             Ok(transport) => {
                 println!("  transport opened");
-                let mut radio = Radio::connect(transport).await?;
+                let mut radio = Radio::new(transport);
                 match radio.identify().await {
                     Ok(info) => println!("  identify: {}", info.model),
                     Err(e) => println!("  identify failed: {e}"),

@@ -6,39 +6,50 @@
 //! async or I/O dependencies; it operates purely on byte slices.
 //!
 //! The standard CAT command set is represented as [`Command`] and [`Response`]
-//! variants. Use [`serialize`] and [`parse`] to convert between typed
-//! representations and wire format. Unverified factory-service mnemonics are
-//! deliberately absent; the established MCP entry command remains paired with
-//! its dedicated binary programming implementation.
+//! variants. Use [`serialize`] and [`parse`] for offline wire inspection,
+//! capture tooling, and protocol tests. Live radio operations go through the
+//! operation-specific methods on [`Radio`](crate::radio::Radio), which add
+//! firmware qualification, response correlation, and any required multi-step
+//! sequencing. Unverified factory-service mnemonics are deliberately absent;
+//! the established MCP entry command remains paired with its dedicated binary
+//! programming implementation.
 
-pub mod aprs;
-pub mod bluetooth;
+mod aprs;
+mod bluetooth;
 pub mod codec;
-pub mod control;
-pub mod core;
-pub mod dstar;
-pub mod gps;
-pub mod memory;
+mod control;
+mod core;
+mod dstar;
+mod fields;
+mod gps;
+mod memory;
 pub mod memread;
 pub mod programming;
-pub mod scan;
-pub mod sd;
-pub mod tone;
-pub mod user;
-pub mod vfo;
+mod scan;
+mod sd;
+mod tone;
+mod user;
+mod vfo;
 
 pub use codec::Codec;
 
 use crate::error::ProtocolError;
 use crate::types::{
-    AfGainLevel, AprsCallsign, BacklightControl, Band, BeaconMode, CatChannelRecord,
-    DetectOutputMode, DstarSlot, DvGatewayMode, FilterMode, FilterWidthIndex, FineStep, Frequency,
-    GpsRadioMode, MemoryChannelRecord, MemoryReadOffset, MemorySelector, Mode, MyPositionSelection,
-    PowerLevel, RadioClock, ReadLen, SMeterReading, ScanResumeMethod, SquelchLevel, StepSize,
-    TncBaud, TncMode, VfoMemoryMode, VoxDelay, VoxGain,
+    AfGainLevel, AntennaInput, AprsCallsign, BacklightControl, Band, BandMode, BeaconMode,
+    CatChannelRecord, CatMemoryChannelRecord, CurrentMemorySelector, DstarCallsign, DstarSlot,
+    DstarSuffix, DvGatewayMode, FilterMode, FilterWidthIndex, FineStep, FirmwareIdentity,
+    Frequency, GpsRadioMode, GpsSettings, MemoryChannelAddress, MemoryReadOffset,
+    MyPositionSelection, NmeaSentence, NmeaSentences, OperatingMode, PacketDataRate, PowerLevel,
+    RadioClock, RadioModel, RadioType, ReadLen, SMeterReading, SerialInformation, SquelchLevel,
+    StepSize, TncMode, TuningMode, UsbAudioOutput, VoxDelay, VoxGain,
 };
 
-/// A CAT command to send to the radio.
+/// A typed CAT wire command.
+///
+/// This public enum is the offline protocol AST consumed by [`serialize`]. It
+/// is not a generic live-radio execution API: callers should use the matching
+/// operation-specific method on [`Radio`](crate::radio::Radio), whose contract
+/// can enforce the invariants for that operation.
 #[derive(Debug, Clone)]
 pub enum Command {
     // === Core (FQ, FO, FV, PS, ID, PC, BC, VM, FR) ===
@@ -86,42 +97,36 @@ pub enum Command {
         /// Target band.
         band: Band,
     },
-    /// Get VFO/Memory mode (VM read).
+    /// Get tuning mode (VM read).
     ///
-    /// Mode values: 0 = VFO, 1 = Memory, 2 = Call, 3 = WX.
-    /// Works in any mode. The response is used to update the
-    /// [`Radio`](crate::radio::Radio) cached mode state.
-    GetVfoMemoryMode {
+    /// Tuning mode values: 0 = VFO, 1 = Memory, 2 = Call, 3 = WX.
+    /// Works in any tuning mode. The response is used to update the
+    /// [`Radio`](crate::radio::Radio) cached tuning-mode state.
+    GetTuningMode {
         /// Target band.
         band: Band,
     },
-    /// Set VFO/Memory mode (VM write).
+    /// Set tuning mode (VM write).
     ///
-    /// Mode values: 0 = VFO, 1 = Memory, 2 = Call, 3 = WX.
-    /// This is an ACTION command that changes the radio's operating mode.
+    /// Tuning mode values: 0 = VFO, 1 = Memory, 2 = Call, 3 = WX.
+    /// This is an ACTION command that changes the radio's tuning mode.
     /// Prefer [`Radio::tune_channel`](crate::radio::Radio::tune_channel) for
-    /// qualified memory recall. Direct frequency tuning is quarantined until a
-    /// lossless FO/FQ writer is qualified.
-    SetVfoMemoryMode {
+    /// qualified memory recall. Direct frequency tuning is quarantined until
+    /// exact FO write/readback behavior is qualified.
+    SetTuningMode {
         /// Target band.
         band: Band,
-        /// VFO/Memory mode.
-        mode: VfoMemoryMode,
+        /// Tuning mode.
+        mode: TuningMode,
     },
     /// Get FM radio on/off state (FR read).
     GetFmRadio,
-    /// Set FM radio on/off state (FR write).
-    SetFmRadio {
-        /// Whether FM radio is enabled.
-        enabled: bool,
-    },
 
     // === VFO (AG, SQ, SM, MD, FS, FT, SH, UP, RA) ===
-    /// Get AF gain level for a band (AG read).
+    /// Get the global AF gain level (AG bare read).
     ///
-    /// Per KI4LAX CAT reference: `AG` returns gain level 000-099.
-    /// Hardware observation: bare `AG\r` returns global gain. Band-indexed
-    /// `AG band\r` returns `?`. Read is bare only.
+    /// Hardware observation: bare `AG\r` returns the global 0-200 gain
+    /// level. Band-indexed `AG band\r` returns `?`. Read is bare only.
     GetAfGain,
     /// Set AF gain level (AG write).
     ///
@@ -138,8 +143,7 @@ pub enum Command {
     },
     /// Set squelch level (SQ write).
     ///
-    /// Per KI4LAX CAT reference: `SQ x,yy` (x: band, yy: squelch level 0-6).
-    /// Sends `SQ band,level\r`.
+    /// Sends `SQ band,level\r`, where level is 0 through 6.
     SetSquelch {
         /// Target band.
         band: Band,
@@ -152,42 +156,33 @@ pub enum Command {
         band: Band,
     },
     /// Get operating mode (MD read).
-    GetMode {
+    GetOperatingMode {
         /// Target band.
         band: Band,
     },
     /// Set operating mode (MD write).
     ///
-    /// # Mode requirement
+    /// # Tuning-mode requirement
     /// Radio must be in VFO mode on the target band. Setting the
     /// operating mode (FM/DV/NFM/AM) only applies to the current VFO.
-    SetMode {
+    SetOperatingMode {
         /// Target band.
         band: Band,
         /// Operating mode to set.
-        mode: Mode,
+        mode: OperatingMode,
     },
     /// Get fine step (FS bare read).
     ///
     /// Firmware-verified: FS = Fine Step. Bare `FS\r` returns `FS value`
     /// (single value, no band). Band-indexed reads are not supported.
     GetFineStep,
-    /// Get function type (FT bare read, no band parameter).
+    /// Get Fine Tune state (FT bare read, no band parameter).
+    GetFineTune,
+    /// Set Fine Tune state (FT write).
     ///
-    /// Sends `FT\r` (bare). The radio returns the current function type.
-    GetFunctionType,
-    /// Set fine tune on/off (FT write).
-    ///
-    /// Wire format: `FT band,value\r` (band 0-1, value 0=off, 1=on).
-    ///
-    /// Per Operating Tips section 5.10.6: Fine Tune only works with AM modulation
-    /// and Band B. The write form takes a band parameter unlike the bare read.
-    /// Set fine tune on/off (FT write).
-    ///
-    /// Wire format: `FT value\r` (bare, no band parameter per ARFC-D75 RE).
-    /// ARFC sends `FT 0\r` (off) or `FT 1\r` (on).
-    SetFunctionType {
-        /// Whether fine tune is enabled.
+    /// Fine Tune applies only to AM operation on Band B.
+    SetFineTune {
+        /// Whether Fine Tune is enabled.
         enabled: bool,
     },
     /// Get filter width by mode index (SH read).
@@ -205,9 +200,7 @@ pub enum Command {
     /// value maps to the filter selection index for that mode (see
     /// [`GetFilterWidth`](Command::GetFilterWidth) for mode descriptions).
     SetFilterWidth {
-        /// Receiver filter mode.
-        mode: FilterMode,
-        /// Filter width index (0-4 for SSB/CW, 0-3 for AM).
+        /// Mode-qualified filter width index.
         width: FilterWidthIndex,
     },
     /// Step frequency up by one increment (UP action).
@@ -250,14 +243,15 @@ pub enum Command {
         /// Target band.
         band: Band,
     },
-    /// Get dual-band mode (DL read).
-    GetDualBand,
-    /// Set dual-band mode (DL write).
-    SetDualBand {
-        /// Whether dual-band is enabled.
-        enabled: bool,
+    /// Get the single-band or dual-band selection (DL read).
+    GetBandMode,
+    /// Set the single-band or dual-band selection (DL write).
+    SetBandMode {
+        /// Band presentation to select.
+        mode: BandMode,
     },
     /// Switch the current operating context to receive mode (bare RX action).
+    /// The radio acknowledges success by echoing bare `RX`.
     Receive,
     /// Key the transmitter (TX action).
     ///
@@ -265,6 +259,7 @@ pub enum Command {
     /// **This transmits on air.** Ensure you are authorized to transmit on
     /// the current frequency, have proper identification, and comply with
     /// all applicable regulations. Use [`Command::Receive`] to return to receive mode.
+    /// The radio acknowledges success by echoing bare `TX`.
     Transmit,
     /// Get LCD backlight control mode (LC read).
     GetBacklightControl,
@@ -273,18 +268,19 @@ pub enum Command {
         /// Backlight mode (0=Manual, 1=On, 2=Auto, 3=Auto DC-IN).
         mode: BacklightControl,
     },
-    /// Get AF/IF/Detect output mode (IO read).
-    GetIoPort,
-    /// Set AF/IF/Detect output mode (IO write).
-    SetIoPort {
-        /// Output mode (AF/IF/Detect).
-        value: DetectOutputMode,
+    /// Get USB audio output selection (IO read).
+    GetUsbAudioOutput,
+    /// Set USB audio output selection (IO write).
+    SetUsbAudioOutput {
+        /// USB output to select.
+        output: UsbAudioOutput,
     },
     /// Get battery level (BL read).
     ///
-    /// Per KI4LAX CAT reference: BL returns battery charge state.
-    /// 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green),
-    /// 4=Charging (observed on hardware when USB power is connected).
+    /// Returns 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green),
+    /// 3=Full (Green), 4=Charging, or the semantically unidentified runtime
+    /// state 5. Charging was observed on hardware while USB power was
+    /// connected.
     GetBatteryLevel,
     /// Get VOX delay (VD read).
     ///
@@ -300,7 +296,7 @@ pub enum Command {
     /// with [`SetVox`](Command::SetVox), then set the delay, then
     /// optionally disable VOX again.
     SetVoxDelay {
-        /// VOX delay (0-30, in 100ms units).
+        /// VOX delay selected from the radio's seven discrete durations.
         delay: VoxDelay,
     },
     /// Get VOX gain (VG read).
@@ -326,7 +322,7 @@ pub enum Command {
         enabled: bool,
     },
 
-    // === Memory (ME, MR, 0M) ===
+    // === Memory (ME, MR) ===
     /// Get the current memory channel number for a band (MR read).
     ///
     /// Hardware-verified: `MR band\r` returns `MR selector`; the response
@@ -340,8 +336,8 @@ pub enum Command {
     },
     /// Get memory channel data (ME read).
     GetMemoryChannel {
-        /// Exact memory selector.
-        selector: MemorySelector,
+        /// Exact memory-channel address.
+        selector: MemoryChannelAddress,
     },
     /// Recall memory channel: switches the radio's active channel (MR write).
     ///
@@ -357,41 +353,32 @@ pub enum Command {
     RecallMemoryChannel {
         /// Target band.
         band: Band,
-        /// Exact memory selector.
-        selector: MemorySelector,
+        /// Exact memory-channel address.
+        selector: MemoryChannelAddress,
     },
-    /// Enter MCP programming mode (0M action).
-    ///
-    /// # Safety
-    /// **DANGEROUS:** This puts the radio into programming mode where it
-    /// stops responding to normal CAT commands. The radio must be manually
-    /// restarted to recover. Do not use unless implementing a full MCP
-    /// programming interface.
-    EnterProgrammingMode,
-
     // === TNC / D-STAR / Clock (TN, DC, RT) ===
     /// Get TNC mode (TN bare read).
     ///
-    /// Hardware-verified: bare `TN\r` returns `TN mode,setting`.
+    /// Hardware-verified: bare `TN\r` returns `TN mode,data-rate`.
     /// Band-indexed `TN band\r` returns `?` (rejected).
     ///
-    /// The D75 RE misidentified this as CTCSS tone. On hardware, TN
-    /// returns TNC mode data (e.g., `TN 0,0`).
+    /// Hardware readback confirms that TN returns TNC mode data (for example,
+    /// `TN 0,0`).
     ///
-    /// Valid mode values per firmware validation: 0, 1, 2, 3.
+    /// Valid mode values: 0, 1, 2, 3.
     /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
     GetTncMode,
     /// Set TNC mode (TN write).
     ///
-    /// Wire format: `TN mode,setting\r`.
+    /// Wire format: `TN mode,data_rate\r`.
     ///
-    /// Valid mode values per firmware validation: 0, 1, 2, 3.
+    /// Valid mode values: 0, 1, 2, 3.
     /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
     SetTncMode {
         /// TNC operating mode (APRS/NAVITRA/KISS/MMDVM).
         mode: TncMode,
-        /// TNC data speed setting.
-        setting: TncBaud,
+        /// Packet-data rate.
+        data_rate: PacketDataRate,
     },
     /// Get D-STAR callsign data for a slot (DC read).
     ///
@@ -399,8 +386,7 @@ pub enum Command {
     /// `DC 0` returns `N` (not available). Slots 1-6 return callsign
     /// data in format `DC slot,callsign,suffix`.
     ///
-    /// The D75 RE misidentified this as DCS code. On hardware, DC
-    /// is the D-STAR callsign command.
+    /// Hardware readback confirms that DC addresses D-STAR callsign slots.
     GetDstarCallsign {
         /// Callsign slot (1-6). Slot 0 returns `N`.
         slot: DstarSlot,
@@ -413,34 +399,20 @@ pub enum Command {
     SetDstarCallsign {
         /// Callsign slot (1-6).
         slot: DstarSlot,
-        /// Callsign string (8 chars, space-padded).
-        callsign: String,
-        /// Callsign suffix (up to 4 chars).
-        suffix: String,
+        /// Validated callsign, encoded as exactly eight space-padded bytes.
+        callsign: DstarCallsign,
+        /// Validated suffix, encoded as exactly four space-padded bytes.
+        suffix: DstarSuffix,
     },
     /// Get real-time clock (RT bare read).
     ///
     /// Hardware-verified: bare `RT\r` returns `RT YYMMDDHHmmss`.
     /// Band-indexed `RT band\r` returns `?` (rejected).
     ///
-    /// The D75 RE misidentified this as repeater tone. On hardware, RT
-    /// returns the radio's real-time clock.
+    /// Hardware readback confirms that RT returns the radio's real-time clock.
     GetRealTimeClock,
 
-    // === Scan (SR, SF, BS) ===
-    /// Set scan resume mode (SR write-only).
-    ///
-    /// Hardware-verified: bare `SR\r` returns `?` (no read form).
-    /// SR is write-only. Sends `SR mode\r`.
-    ///
-    /// # Safety warning
-    /// On hardware, `SR 0` was observed to reboot the radio. The D75 RE
-    /// identifies this as scan resume, but the behavior may coincide with
-    /// a reset action. Use with caution.
-    SetScanResume {
-        /// Scan resume method.
-        mode: ScanResumeMethod,
-    },
+    // === Scan (SF, BS) ===
     /// Get step size for a band (SF read, band-indexed).
     ///
     /// Firmware-verified: SF = Step Size. `SF band\r` returns `SF band,step`.
@@ -459,24 +431,24 @@ pub enum Command {
         step: StepSize,
     },
     /// Get the MW/SW receive antenna selection (BS read).
-    GetBarAntenna,
+    GetAntennaInput,
     /// Select the MW/SW receive antenna (BS write).
-    SetBarAntenna {
-        /// `true` selects the internal bar antenna; `false` selects ANT Connector.
-        enabled: bool,
+    SetAntennaInput {
+        /// Antenna input to select.
+        input: AntennaInput,
     },
 
-    // === APRS (AS, PT, MS) ===
-    /// Get TNC baud rate (AS read).
+    // === APRS (AS, AE, BE, PT, MS, CS) ===
+    /// Get the packet-data rate (AS read).
     ///
-    /// Returns 0 = 1200 baud, 1 = 9600 baud.
-    GetTncBaud,
-    /// Set TNC baud rate (AS write).
+    /// Returns 0 = 1200 bps, 1 = 9600 bps.
+    GetPacketDataRate,
+    /// Set the packet-data rate (AS write).
     ///
-    /// Values: 0 = 1200 baud, 1 = 9600 baud.
-    SetTncBaud {
-        /// Baud rate.
-        rate: TncBaud,
+    /// Values: 0 = 1200 bps, 1 = 9600 bps.
+    SetPacketDataRate {
+        /// Packet-data rate.
+        data_rate: PacketDataRate,
     },
 
     // === Serial Info (AE) ===
@@ -486,9 +458,9 @@ pub enum Command {
     /// returns the radio's serial number and model code.
     GetSerialInfo,
     /// Get beacon TX control mode (PT read).
-    GetBeaconType,
+    GetBeaconMode,
     /// Set beacon TX control mode (PT write).
-    SetBeaconType {
+    SetBeaconMode {
         /// Beacon transmission mode.
         mode: BeaconMode,
     },
@@ -501,11 +473,16 @@ pub enum Command {
     },
     /// Get the APRS My Callsign value stored at MCP `aprs.MyCallsign` (CS read).
     GetAprsCallsign,
-    /// Set the APRS My Callsign value (CS write, at most nine characters).
+    /// Set the APRS My Callsign value (CS write, canonical AX.25 identity).
     SetAprsCallsign {
         /// Validated APRS callsign, optionally including an SSID.
         callsign: AprsCallsign,
     },
+    /// Trigger one APRS beacon transmission (BE action).
+    ///
+    /// This command can transmit over amateur-radio spectrum. The radio
+    /// returns `N` when its TNC is not ready for an APRS beacon.
+    TransmitAprsBeacon,
 
     // === D-STAR (DS, GW) ===
     /// Get active D-STAR callsign slot (DS read).
@@ -519,18 +496,16 @@ pub enum Command {
     GetGateway,
 
     // === GPS (GP, GM, GS) ===
-    /// Get GPS configuration (GP read).
+    /// Get GPS settings (GP read).
     ///
     /// Returns GPS enabled and PC output enabled flags.
-    GetGpsConfig,
-    /// Set GPS configuration (GP write).
+    GetGpsSettings,
+    /// Set GPS settings (GP write).
     ///
     /// Sets GPS enabled and PC output enabled flags.
-    SetGpsConfig {
-        /// Whether GPS is enabled.
-        gps_enabled: bool,
-        /// Whether GPS PC output is enabled.
-        pc_output: bool,
+    SetGpsSettings {
+        /// Complete two-field GPS receiver settings.
+        settings: GpsSettings,
     },
     /// Get GPS/Radio mode status (GM bare read).
     ///
@@ -540,24 +515,14 @@ pub enum Command {
     GetGpsMode,
     /// Get GPS NMEA sentence enable flags (GS read).
     ///
-    /// Returns 6 boolean flags for GGA, GLL, GSA, GSV, RMC, VTG.
+    /// Returns the validated selection of GGA, GLL, GSA, GSV, RMC, and VTG.
     GetGpsSentences,
     /// Set GPS NMEA sentence enable flags (GS write).
     ///
-    /// Sets 6 boolean flags for GGA, GLL, GSA, GSV, RMC, VTG.
+    /// Sets the validated, nonempty NMEA sentence selection.
     SetGpsSentences {
-        /// GGA (Global Positioning System Fix Data) enabled.
-        gga: bool,
-        /// GLL (Geographic Position - Latitude/Longitude) enabled.
-        gll: bool,
-        /// GSA (GNSS DOP and Active Satellites) enabled.
-        gsa: bool,
-        /// GSV (GNSS Satellites in View) enabled.
-        gsv: bool,
-        /// RMC (Recommended Minimum Navigation Information) enabled.
-        rmc: bool,
-        /// VTG (Course Over Ground and Ground Speed) enabled.
-        vtg: bool,
+        /// NMEA sentence types to output.
+        sentences: NmeaSentences,
     },
 
     // === Bluetooth (BT) ===
@@ -570,13 +535,10 @@ pub enum Command {
     },
 
     // === SD (SD) ===
-    /// Query SD card / programming interface status (SD read).
+    /// Query SD-card presence (SD read).
     ///
-    /// Note: The firmware's SD handler primarily checks for `SD PROGRAM`
-    /// to enter MCP programming mode. The bare `SD` read response (`SD 0/1`)
-    /// appears to indicate programming interface readiness, not SD card
-    /// presence. Do NOT send `SD PROGRAM`: it enters programming mode
-    /// and the radio stops responding to normal CAT commands.
+    /// MCP programming mode is entered by the distinct private
+    /// `0M PROGRAM` command, not by `SD PROGRAM`.
     GetSdCard,
 
     // === Memory read (requires modified firmware) ===
@@ -595,12 +557,11 @@ pub enum Command {
         len: ReadLen,
     },
 
-    // === Extra (TY) ===
+    // === Radio type (TY) ===
     /// Get radio type/region code (TY read).
     ///
-    /// Not in the firmware's 53-command dispatch table, likely processed
-    /// by a separate code path. Returns a region string and variant number
-    /// (e.g., `TY K,2` for US region, variant 2).
+    /// Returns a typed region and opaque hardware-variant nibble (e.g.,
+    /// `TY K,2` for the United States region, variant 2).
     GetRadioType,
 }
 
@@ -624,8 +585,8 @@ pub enum Response {
     },
     /// Firmware version response (FV).
     FirmwareVersion {
-        /// Version string.
-        version: String,
+        /// Exact bounded firmware identity.
+        version: FirmwareIdentity,
     },
     /// Power status response (PS).
     PowerStatus {
@@ -634,8 +595,8 @@ pub enum Response {
     },
     /// Radio model ID response (ID).
     RadioId {
-        /// Model identification string.
-        model: String,
+        /// Exact TH-D75 model identity.
+        model: RadioModel,
     },
     /// Power level response (PC).
     PowerLevel {
@@ -645,18 +606,18 @@ pub enum Response {
         level: PowerLevel,
     },
     /// Band response (BC read).
-    BandResponse {
+    Band {
         /// Current active band.
         band: Band,
     },
-    /// VFO/Memory mode response (VM).
+    /// Tuning-mode response (VM).
     ///
-    /// Mode values: 0 = VFO, 1 = Memory, 2 = Call, 3 = WX.
-    VfoMemoryMode {
+    /// Tuning mode values: 0 = VFO, 1 = Memory, 2 = Call, 3 = WX.
+    TuningMode {
         /// Band the mode is for.
         band: Band,
-        /// VFO/Memory mode.
-        mode: VfoMemoryMode,
+        /// Tuning mode.
+        mode: TuningMode,
     },
     /// FM radio on/off response (FR).
     FmRadio {
@@ -667,9 +628,10 @@ pub enum Response {
     // === VFO ===
     /// AF gain response (AG).
     ///
-    /// Per KI4LAX CAT reference: gain range 000-099.
+    /// Firmware validation and hardware reads establish the global range
+    /// `000` through `200`.
     AfGain {
-        /// Gain level (0-99). Global, not per-band.
+        /// Gain level (0-200). Global, not per-band.
         level: AfGainLevel,
     },
     /// Squelch level response (SQ).
@@ -687,11 +649,11 @@ pub enum Response {
         level: SMeterReading,
     },
     /// Operating mode response (MD).
-    Mode {
+    OperatingMode {
         /// Band the mode is for.
         band: Band,
         /// Current operating mode.
-        mode: Mode,
+        mode: OperatingMode,
     },
     /// Fine step response (FS).
     ///
@@ -700,16 +662,14 @@ pub enum Response {
         /// Current fine step setting.
         step: FineStep,
     },
-    /// Function type response (FT).
-    FunctionType {
-        /// Fine tune enabled (0=off, 1=on).
+    /// Fine Tune state response (FT).
+    FineTune {
+        /// Whether Fine Tune is enabled.
         enabled: bool,
     },
     /// Filter width response (SH).
     FilterWidth {
-        /// Receiver filter mode queried.
-        mode: FilterMode,
-        /// Filter width index (0-4 for SSB/CW, 0-3 for AM).
+        /// Mode-qualified filter width index.
         width: FilterWidthIndex,
     },
     /// Attenuator state response (RA).
@@ -737,24 +697,28 @@ pub enum Response {
         /// Whether the channel is busy.
         busy: bool,
     },
-    /// Dual-band mode response (DL).
-    DualBand {
-        /// Whether dual-band is enabled.
-        enabled: bool,
+    /// Single-band or dual-band selection response (DL).
+    BandMode {
+        /// Current band presentation.
+        mode: BandMode,
     },
     /// Frequency down acknowledgement (DW).
-    FrequencyDown,
+    FrequencyDownAck,
     /// Frequency up acknowledgement (UP).
-    FrequencyUp,
+    FrequencyUpAck,
+    /// Receive-mode action acknowledgement (RX).
+    ReceiveAck,
+    /// Transmit-mode action acknowledgement (TX).
+    TransmitAck,
     /// LCD backlight control mode response (LC).
     BacklightControl {
         /// Current backlight mode.
         mode: BacklightControl,
     },
-    /// AF/IF/Detect output mode response (IO).
-    IoPort {
-        /// Output mode.
-        value: DetectOutputMode,
+    /// USB audio output selection response (IO).
+    UsbAudioOutput {
+        /// Current USB output selection.
+        output: UsbAudioOutput,
     },
     /// Battery level response (BL).
     ///
@@ -766,7 +730,7 @@ pub enum Response {
     },
     /// VOX delay response (VD).
     VoxDelay {
-        /// Current VOX delay (0-30, in 100ms units).
+        /// Current VOX delay selected from the radio's seven discrete durations.
         delay: VoxDelay,
     },
     /// VOX gain response (VG).
@@ -783,20 +747,20 @@ pub enum Response {
     // === Memory ===
     /// Memory channel data response (ME).
     MemoryChannel {
-        /// Exact memory selector returned by the radio.
-        selector: MemorySelector,
-        /// Lossless ME record, including both unidentified ME-only fields.
-        record: MemoryChannelRecord,
+        /// Exact memory-channel address returned by the radio.
+        selector: MemoryChannelAddress,
+        /// Lossless ME record, including split and scan-lockout state.
+        record: CatMemoryChannelRecord,
     },
     /// Memory recall echo response (MR write acknowledgment).
     ///
     /// When `MR band,channel` is sent as a write/recall, the radio echoes
     /// back the band and channel as acknowledgment.
-    MemoryRecall {
+    MemoryRecallAck {
         /// Target band.
         band: Band,
-        /// Exact selector echoed by the radio.
-        selector: MemorySelector,
+        /// Exact memory-channel address echoed by the radio.
+        selector: MemoryChannelAddress,
     },
     /// Current memory selector response (MR read).
     ///
@@ -805,28 +769,21 @@ pub enum Response {
     /// not present in this frame and must not be inferred from the selector.
     CurrentChannel {
         /// Selector returned by the bandless MR response.
-        selector: MemorySelector,
+        selector: CurrentMemorySelector,
     },
-    /// Programming mode acknowledgment (0M).
-    ///
-    /// The radio enters MCP programming mode and stops responding to
-    /// normal CAT commands. This response should never actually be
-    /// received in practice.
-    ProgrammingMode,
-
     // === TNC / D-STAR / Clock ===
     /// TNC mode response (TN).
     ///
-    /// Hardware-verified: bare `TN\r` returns `TN mode,setting`.
+    /// Hardware-verified: bare `TN\r` returns `TN mode,data_rate`.
     /// Example: `TN 0,0`.
     ///
-    /// Valid mode values per firmware validation: 0, 1, 2, 3.
+    /// Valid mode values: 0, 1, 2, 3.
     /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
     TncMode {
         /// TNC operating mode.
         mode: TncMode,
-        /// TNC data speed setting.
-        setting: TncBaud,
+        /// Packet-data rate.
+        data_rate: PacketDataRate,
     },
     /// D-STAR callsign data response (DC).
     ///
@@ -835,10 +792,10 @@ pub enum Response {
     DstarCallsign {
         /// Callsign slot (1-6).
         slot: DstarSlot,
-        /// Callsign string (may be space-padded).
-        callsign: String,
-        /// Callsign suffix/module.
-        suffix: String,
+        /// Validated callsign with wire padding removed.
+        callsign: DstarCallsign,
+        /// Validated callsign suffix with wire padding removed.
+        suffix: DstarSuffix,
     },
     /// Real-time clock response (RT).
     ///
@@ -861,32 +818,27 @@ pub enum Response {
         step: StepSize,
     },
     /// MW/SW receive antenna selection response (BS).
-    BarAntenna {
-        /// `true` means internal bar antenna; `false` means ANT Connector.
-        enabled: bool,
+    AntennaInput {
+        /// Current receive antenna input.
+        input: AntennaInput,
     },
 
-    // === APRS ===
-    /// TNC baud rate response (AS).
+    // === APRS and A-prefixed identity ===
+    /// Packet-data rate response (AS).
     ///
-    /// Values: 0 = 1200 baud, 1 = 9600 baud.
-    TncBaud {
-        /// Baud rate.
-        rate: TncBaud,
+    /// Values: 0 = 1200 bps, 1 = 9600 bps.
+    PacketDataRate {
+        /// Current packet-data rate.
+        data_rate: PacketDataRate,
     },
     /// Serial number and model code response (AE).
     ///
     /// Despite the AE mnemonic (historically "APRS Extended"), this command
     /// returns the radio's serial number and model code.
     /// Format: `serial,model_code` (e.g., `C3C10368,K01`).
-    SerialInfo {
-        /// Radio serial number.
-        serial: String,
-        /// Model code (e.g., "K01").
-        model_code: String,
-    },
+    SerialInformation(SerialInformation),
     /// Beacon TX control mode response (PT).
-    BeaconType {
+    BeaconMode {
         /// Beacon transmission mode.
         mode: BeaconMode,
     },
@@ -897,9 +849,11 @@ pub enum Response {
     },
     /// APRS My Callsign response (CS).
     AprsCallsign {
-        /// Current APRS station callsign, optionally including an SSID.
-        callsign: AprsCallsign,
+        /// Current APRS station callsign, or `None` when the slot is empty.
+        callsign: Option<AprsCallsign>,
     },
+    /// Bare acknowledgement for an accepted APRS beacon transmit action (BE).
+    AprsBeaconTransmitAck,
 
     // === D-STAR ===
     /// Active D-STAR callsign slot response (DS).
@@ -914,41 +868,28 @@ pub enum Response {
     },
 
     // === GPS ===
-    /// GPS configuration response (GP).
+    /// GPS settings response (GP).
     ///
     /// Two boolean fields: GPS enabled and PC output enabled.
     /// Format: `gps_enabled,pc_output` (e.g., `0,0`).
-    GpsConfig {
-        /// Whether GPS is enabled.
-        gps_enabled: bool,
-        /// Whether GPS PC output is enabled.
-        pc_output: bool,
+    GpsSettings {
+        /// Complete two-field GPS receiver settings.
+        settings: GpsSettings,
     },
     /// GPS/Radio mode status response (GM).
     ///
     /// 0 = Normal transceiver mode, 1 = GPS receiver mode.
-    /// Firmware-verified: `cat_gm_handler` guard `local_18 < 2`.
+    /// Only the wire values 0 and 1 are valid.
     GpsMode {
         /// GPS/Radio operating mode.
         mode: GpsRadioMode,
     },
     /// GPS NMEA sentence enable flags response (GS).
     ///
-    /// Six boolean fields controlling which NMEA sentences are output:
-    /// GGA, GLL, GSA, GSV, RMC, VTG.
+    /// Validated, nonempty set of NMEA sentence types to output.
     GpsSentences {
-        /// GGA (Global Positioning System Fix Data) enabled.
-        gga: bool,
-        /// GLL (Geographic Position - Latitude/Longitude) enabled.
-        gll: bool,
-        /// GSA (GNSS DOP and Active Satellites) enabled.
-        gsa: bool,
-        /// GSV (GNSS Satellites in View) enabled.
-        gsv: bool,
-        /// RMC (Recommended Minimum Navigation Information) enabled.
-        rmc: bool,
-        /// VTG (Course Over Ground and Ground Speed) enabled.
-        vtg: bool,
+        /// NMEA sentence types selected by the radio.
+        sentences: NmeaSentences,
     },
 
     // === Bluetooth ===
@@ -959,13 +900,11 @@ pub enum Response {
     },
 
     // === SD ===
-    /// SD card / programming interface status response (SD).
+    /// SD-card presence response (SD).
     ///
-    /// The firmware's SD handler primarily checks for `SD PROGRAM` to enter
-    /// MCP programming mode. The bare `SD` read response (`SD 0/1`) appears
-    /// to indicate programming interface readiness, not SD card presence.
+    /// MCP programming mode uses the distinct private `0M PROGRAM` command.
     SdCard {
-        /// Programming interface readiness flag.
+        /// Whether an SD card is present.
         present: bool,
     },
 
@@ -978,82 +917,22 @@ pub enum Response {
     MemoryData {
         /// Offset echoed back by the radio.
         offset: MemoryReadOffset,
-        /// The decoded bytes.
-        bytes: Vec<u8>,
+        /// The bounded, nonempty decoded bytes.
+        bytes: memread::MemoryReadData,
     },
 
     // === Extra (TY) ===
     /// Radio type/region code response (TY).
     ///
-    /// Returns the radio's region code and hardware variant.
-    /// Example: `TY K,2` (K = US region, variant 2).
-    RadioType {
-        /// Region code string (e.g., "K" for US).
-        region: String,
-        /// Hardware variant number.
-        variant: u8,
-    },
+    /// Returns the radio's typed region and opaque hardware-variant nibble.
+    /// Example: `TY K,2` (K = United States region, variant 2).
+    RadioType(RadioType),
 
     // === Special ===
-    /// Write acknowledgment (radio echoes the command).
-    Ok,
     /// Error response (`?\r`).
     Error,
     /// Not available response (`N\r`): command not supported in current mode.
-    NotAvailable,
-}
-
-/// Band a band-indexed command addresses, `None` for global commands.
-///
-/// Used by the response-matching loop: with AI mode enabled the radio
-/// pushes `BY`/`FQ`/`MD`/`SQ` frames unsolicited (the same mnemonics
-/// as the reads), so an in-flight band-A query must not accept a
-/// band-B push as its answer.
-pub(crate) const fn command_band(cmd: &Command) -> Option<Band> {
-    match cmd {
-        Command::GetFrequency { band }
-        | Command::GetFrequencyFull { band }
-        | Command::GetPowerLevel { band }
-        | Command::SetPowerLevel { band, .. }
-        | Command::GetVfoMemoryMode { band }
-        | Command::SetVfoMemoryMode { band, .. }
-        | Command::GetSquelch { band }
-        | Command::SetSquelch { band, .. }
-        | Command::GetSmeter { band }
-        | Command::GetMode { band }
-        | Command::SetMode { band, .. }
-        | Command::GetBusy { band }
-        | Command::GetAttenuator { band }
-        | Command::SetAttenuator { band, .. }
-        | Command::GetStepSize { band }
-        | Command::SetStepSize { band, .. }
-        | Command::GetCurrentChannel { band }
-        | Command::RecallMemoryChannel { band, .. }
-        | Command::SetBand { band } => Some(*band),
-        _ => None,
-    }
-}
-
-/// Band a band-indexed response pertains to, `None` for global ones.
-///
-/// Counterpart of [`command_band`] for the response side of the
-/// unsolicited-push disambiguation.
-pub(crate) const fn response_band(response: &Response) -> Option<Band> {
-    match response {
-        Response::Frequency { band, .. }
-        | Response::FrequencyFull { band, .. }
-        | Response::PowerLevel { band, .. }
-        | Response::VfoMemoryMode { band, .. }
-        | Response::Squelch { band, .. }
-        | Response::Smeter { band, .. }
-        | Response::Mode { band, .. }
-        | Response::Busy { band, .. }
-        | Response::Attenuator { band, .. }
-        | Response::StepSize { band, .. }
-        | Response::MemoryRecall { band, .. }
-        | Response::BandResponse { band } => Some(*band),
-        _ => None,
-    }
+    NotAvailableInCurrentMode,
 }
 
 /// Get the CAT mnemonic for a command (for logging).
@@ -1067,46 +946,45 @@ pub const fn command_name(cmd: &Command) -> &'static str {
         Command::GetRadioId => "ID",
         Command::GetPowerLevel { .. } | Command::SetPowerLevel { .. } => "PC",
         Command::GetBand | Command::SetBand { .. } => "BC",
-        Command::GetVfoMemoryMode { .. } | Command::SetVfoMemoryMode { .. } => "VM",
-        Command::GetFmRadio | Command::SetFmRadio { .. } => "FR",
+        Command::GetTuningMode { .. } | Command::SetTuningMode { .. } => "VM",
+        Command::GetFmRadio => "FR",
         Command::GetAfGain | Command::SetAfGain { .. } => "AG",
         Command::GetSquelch { .. } | Command::SetSquelch { .. } => "SQ",
         Command::GetSmeter { .. } => "SM",
-        Command::GetMode { .. } | Command::SetMode { .. } => "MD",
+        Command::GetOperatingMode { .. } | Command::SetOperatingMode { .. } => "MD",
         Command::GetFineStep => "FS",
-        Command::GetFunctionType | Command::SetFunctionType { .. } => "FT",
+        Command::GetFineTune | Command::SetFineTune { .. } => "FT",
         Command::GetFilterWidth { .. } | Command::SetFilterWidth { .. } => "SH",
         Command::FrequencyUp => "UP",
         Command::FrequencyDown => "DW",
         Command::GetAttenuator { .. } | Command::SetAttenuator { .. } => "RA",
         Command::GetAutoInfo | Command::SetAutoInfo { .. } => "AI",
         Command::GetBusy { .. } => "BY",
-        Command::GetDualBand | Command::SetDualBand { .. } => "DL",
+        Command::GetBandMode | Command::SetBandMode { .. } => "DL",
         Command::Receive => "RX",
         Command::Transmit => "TX",
         Command::GetBacklightControl | Command::SetBacklightControl { .. } => "LC",
-        Command::GetIoPort | Command::SetIoPort { .. } => "IO",
+        Command::GetUsbAudioOutput | Command::SetUsbAudioOutput { .. } => "IO",
         Command::GetBatteryLevel => "BL",
         Command::GetVoxDelay | Command::SetVoxDelay { .. } => "VD",
         Command::GetVoxGain | Command::SetVoxGain { .. } => "VG",
         Command::GetVox | Command::SetVox { .. } => "VX",
         Command::GetCurrentChannel { .. } | Command::RecallMemoryChannel { .. } => "MR",
         Command::GetMemoryChannel { .. } => "ME",
-        Command::EnterProgrammingMode => "0M",
         Command::GetTncMode | Command::SetTncMode { .. } => "TN",
         Command::GetDstarCallsign { .. } | Command::SetDstarCallsign { .. } => "DC",
         Command::GetRealTimeClock => "RT",
-        Command::SetScanResume { .. } => "SR",
         Command::GetStepSize { .. } | Command::SetStepSize { .. } => "SF",
-        Command::GetBarAntenna | Command::SetBarAntenna { .. } => "BS",
-        Command::GetTncBaud | Command::SetTncBaud { .. } => "AS",
+        Command::GetAntennaInput | Command::SetAntennaInput { .. } => "BS",
+        Command::GetPacketDataRate | Command::SetPacketDataRate { .. } => "AS",
         Command::GetSerialInfo => "AE",
-        Command::GetBeaconType | Command::SetBeaconType { .. } => "PT",
+        Command::GetBeaconMode | Command::SetBeaconMode { .. } => "PT",
         Command::GetMyPositionSelection | Command::SetMyPositionSelection { .. } => "MS",
         Command::GetAprsCallsign | Command::SetAprsCallsign { .. } => "CS",
+        Command::TransmitAprsBeacon => "BE",
         Command::GetDstarSlot | Command::SetDstarSlot { .. } => "DS",
         Command::GetGateway => "GW",
-        Command::GetGpsConfig | Command::SetGpsConfig { .. } => "GP",
+        Command::GetGpsSettings | Command::SetGpsSettings { .. } => "GP",
         Command::GetGpsMode => "GM",
         Command::GetGpsSentences | Command::SetGpsSentences { .. } => "GS",
         Command::GetBluetooth | Command::SetBluetooth { .. } => "BT",
@@ -1148,38 +1026,35 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         }
         Command::GetBand => "BC".to_owned(),
         Command::SetBand { band } => format!("BC {}", u8::from(*band)),
-        Command::GetVfoMemoryMode { band } => format!("VM {}", u8::from(*band)),
-        Command::SetVfoMemoryMode { band, mode } => {
+        Command::GetTuningMode { band } => format!("VM {}", u8::from(*band)),
+        Command::SetTuningMode { band, mode } => {
             format!("VM {},{}", u8::from(*band), u8::from(*mode))
         }
         Command::GetFmRadio => "FR".to_owned(),
-        Command::SetFmRadio { enabled } => format!("FR {}", u8::from(*enabled)),
 
         // VFO
         Command::GetAfGain => "AG".to_owned(),
         Command::SetAfGain { level } => {
-            // D75 firmware AG write handler expects bare `AG AAA\r`.
-            // Band-indexed `AG band,level` is rejected with `?`; the exact
-            // global domain is 000-200.
-            format!("AG {:03}", level.as_u8())
+            // The radio expects bare `AG AAA\r`. Band-indexed
+            // `AG band,level` is rejected with `?`; the exact global domain
+            // is 000-200.
+            format!("AG {:03}", level.as_raw())
         }
         Command::GetSquelch { band } => format!("SQ {}", u8::from(*band)),
         Command::SetSquelch { band, level } => {
-            format!("SQ {},{}", u8::from(*band), level.as_u8())
+            format!("SQ {},{}", u8::from(*band), level.as_raw())
         }
         Command::GetSmeter { band } => format!("SM {}", u8::from(*band)),
-        Command::GetMode { band } => format!("MD {}", u8::from(*band)),
-        Command::SetMode { band, mode } => {
+        Command::GetOperatingMode { band } => format!("MD {}", u8::from(*band)),
+        Command::SetOperatingMode { band, mode } => {
             format!("MD {},{}", u8::from(*band), u8::from(*mode))
         }
         Command::GetFineStep => "FS".to_owned(),
-        Command::GetFunctionType => "FT".to_owned(),
-        Command::SetFunctionType { enabled } => {
-            format!("FT {}", u8::from(*enabled))
-        }
+        Command::GetFineTune => "FT".to_owned(),
+        Command::SetFineTune { enabled } => format!("FT {}", u8::from(*enabled)),
         Command::GetFilterWidth { mode } => format!("SH {}", u8::from(*mode)),
-        Command::SetFilterWidth { mode, width } => {
-            format!("SH {},{}", u8::from(*mode), width.as_u8())
+        Command::SetFilterWidth { width } => {
+            format!("SH {},{}", u8::from(width.mode()), width.as_raw())
         }
         Command::FrequencyUp => "UP".to_owned(),
         Command::FrequencyDown => "DW".to_owned(),
@@ -1192,19 +1067,19 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         Command::GetAutoInfo => "AI".to_owned(),
         Command::SetAutoInfo { enabled } => format!("AI {}", u8::from(*enabled)),
         Command::GetBusy { band } => format!("BY {}", u8::from(*band)),
-        Command::GetDualBand => "DL".to_owned(),
-        Command::SetDualBand { enabled } => format!("DL {}", u8::from(*enabled)),
+        Command::GetBandMode => "DL".to_owned(),
+        Command::SetBandMode { mode } => format!("DL {}", mode.as_raw()),
         Command::Receive => "RX".to_owned(),
         Command::Transmit => "TX".to_owned(),
         Command::GetBacklightControl => "LC".to_owned(),
         Command::SetBacklightControl { mode } => format!("LC {}", u8::from(*mode)),
-        Command::GetIoPort => "IO".to_owned(),
-        Command::SetIoPort { value } => format!("IO {}", u8::from(*value)),
+        Command::GetUsbAudioOutput => "IO".to_owned(),
+        Command::SetUsbAudioOutput { output } => format!("IO {}", u8::from(*output)),
         Command::GetBatteryLevel => "BL".to_owned(),
         Command::GetVoxDelay => "VD".to_owned(),
-        Command::SetVoxDelay { delay } => format!("VD {}", delay.as_u8()),
+        Command::SetVoxDelay { delay } => format!("VD {}", delay.as_raw()),
         Command::GetVoxGain => "VG".to_owned(),
-        Command::SetVoxGain { gain } => format!("VG {}", gain.as_u8()),
+        Command::SetVoxGain { gain } => format!("VG {}", gain.as_raw()),
         Command::GetVox => "VX".to_owned(),
         Command::SetVox { enabled } => format!("VX {}", u8::from(*enabled)),
 
@@ -1218,71 +1093,70 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         Command::RecallMemoryChannel { band, selector } => {
             format!("MR {},{selector}", u8::from(*band))
         }
-        Command::EnterProgrammingMode => "0M PROGRAM".to_owned(),
-
         // TNC / D-STAR / Clock
         Command::GetTncMode => "TN".to_owned(),
-        Command::SetTncMode { mode, setting } => {
-            format!("TN {},{}", u8::from(*mode), u8::from(*setting))
+        Command::SetTncMode { mode, data_rate } => {
+            format!("TN {},{}", u8::from(*mode), u8::from(*data_rate))
         }
-        Command::GetDstarCallsign { slot } => format!("DC {}", slot.as_u8()),
+        Command::GetDstarCallsign { slot } => format!("DC {}", slot.as_raw()),
         Command::SetDstarCallsign {
             slot,
             callsign,
             suffix,
-        } => format!("DC {},{callsign},{suffix}", slot.as_u8()),
+        } => format!(
+            "DC {},{:<8},{:<4}",
+            slot.as_raw(),
+            callsign.as_str(),
+            suffix.as_str()
+        ),
         Command::GetRealTimeClock => "RT".to_owned(),
 
         // Scan
-        Command::SetScanResume { mode } => format!("SR {}", mode.to_raw()),
         Command::GetStepSize { band } => format!("SF {}", u8::from(*band)),
         Command::SetStepSize { band, step } => {
             format!("SF {},{:X}", u8::from(*band), u8::from(*step))
         }
-        Command::GetBarAntenna => "BS".to_owned(),
-        Command::SetBarAntenna { enabled } => format!("BS {}", u8::from(*enabled)),
+        Command::GetAntennaInput => "BS".to_owned(),
+        Command::SetAntennaInput { input } => {
+            format!("BS {}", input.as_raw())
+        }
 
         // APRS
-        Command::GetTncBaud => "AS".to_owned(),
-        Command::SetTncBaud { rate } => format!("AS {}", u8::from(*rate)),
+        Command::GetPacketDataRate => "AS".to_owned(),
+        Command::SetPacketDataRate { data_rate } => format!("AS {}", u8::from(*data_rate)),
         Command::GetSerialInfo => "AE".to_owned(),
-        Command::GetBeaconType => "PT".to_owned(),
-        Command::SetBeaconType { mode } => format!("PT {}", u8::from(*mode)),
+        Command::GetBeaconMode => "PT".to_owned(),
+        Command::SetBeaconMode { mode } => format!("PT {}", u8::from(*mode)),
         Command::GetMyPositionSelection => "MS".to_owned(),
         Command::SetMyPositionSelection { selection } => {
             format!("MS {}", u8::from(*selection))
         }
         Command::GetAprsCallsign => "CS".to_owned(),
-        Command::SetAprsCallsign { callsign } => format!("CS {}", callsign.as_str()),
+        Command::SetAprsCallsign { callsign } => format!("CS {callsign}"),
+        Command::TransmitAprsBeacon => "BE".to_owned(),
 
         // D-STAR
         Command::GetDstarSlot => "DS".to_owned(),
-        Command::SetDstarSlot { slot } => format!("DS {}", slot.as_u8()),
+        Command::SetDstarSlot { slot } => format!("DS {}", slot.as_raw()),
         Command::GetGateway => "GW".to_owned(),
 
         // GPS
-        Command::GetGpsConfig => "GP".to_owned(),
-        Command::SetGpsConfig {
-            gps_enabled,
-            pc_output,
-        } => format!("GP {},{}", u8::from(*gps_enabled), u8::from(*pc_output)),
+        Command::GetGpsSettings => "GP".to_owned(),
+        Command::SetGpsSettings { settings } => format!(
+            "GP {},{}",
+            u8::from(settings.enabled()),
+            u8::from(settings.pc_output())
+        ),
         Command::GetGpsMode => "GM".to_owned(),
         Command::GetGpsSentences => "GS".to_owned(),
-        Command::SetGpsSentences {
-            gga,
-            gll,
-            gsa,
-            gsv,
-            rmc,
-            vtg,
-        } => format!(
+        Command::SetGpsSentences { sentences } => format!(
             "GS {},{},{},{},{},{}",
-            u8::from(*gga),
-            u8::from(*gll),
-            u8::from(*gsa),
-            u8::from(*gsv),
-            u8::from(*rmc),
-            u8::from(*vtg)
+            u8::from(sentences.contains(NmeaSentence::Gga)),
+            u8::from(sentences.contains(NmeaSentence::Gll)),
+            u8::from(sentences.contains(NmeaSentence::Gsa)),
+            u8::from(sentences.contains(NmeaSentence::Gsv)),
+            u8::from(sentences.contains(NmeaSentence::Rmc)),
+            u8::from(sentences.contains(NmeaSentence::Vtg))
         ),
 
         // Bluetooth
@@ -1299,9 +1173,9 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         Command::GetRadioType => "TY".to_owned(),
     };
 
+    tracing::trace!(wire = %body, "serialized wire format");
     let mut bytes = body.into_bytes();
     bytes.push(b'\r');
-    tracing::trace!(wire = %String::from_utf8_lossy(&bytes), "serialized wire format");
     bytes
 }
 
@@ -1313,6 +1187,14 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
 /// recognized. Returns [`ProtocolError::FieldParse`] for recognised
 /// commands whose payload parsing is not yet implemented.
 pub fn parse(frame: &[u8]) -> Result<Response, ProtocolError> {
+    if frame.len() > Codec::MAX_BUFFERED_BYTES {
+        return Err(ProtocolError::FrameTooLong {
+            maximum: Codec::MAX_BUFFERED_BYTES,
+            buffered: 0,
+            incoming: frame.len(),
+        });
+    }
+
     // Error response
     if frame == b"?" {
         tracing::debug!(mnemonic = "?", "parsing error response");
@@ -1322,7 +1204,15 @@ pub fn parse(frame: &[u8]) -> Result<Response, ProtocolError> {
     // Not-available response
     if frame == b"N" {
         tracing::debug!(mnemonic = "N", "parsing not-available response");
-        return Ok(Response::NotAvailable);
+        return Ok(Response::NotAvailableInCurrentMode);
+    }
+
+    if frame.iter().any(|byte| !(b' '..=b'~').contains(byte)) {
+        tracing::warn!(
+            ?frame,
+            "CAT frame contains a non-printable or non-ASCII byte"
+        );
+        return Err(ProtocolError::MalformedFrame(frame.to_vec()));
     }
 
     let frame_str = std::str::from_utf8(frame).map_err(|_| {
@@ -1330,8 +1220,7 @@ pub fn parse(frame: &[u8]) -> Result<Response, ProtocolError> {
         ProtocolError::MalformedFrame(frame.to_vec())
     })?;
 
-    // Extract the mnemonic: first 2 characters.
-    // Special case: "0M" starts with a digit.
+    // Extract the two-character mnemonic.
     if frame_str.len() < 2 {
         tracing::warn!(frame = %frame_str, "frame too short to contain mnemonic");
         return Err(ProtocolError::MalformedFrame(frame.to_vec()));
@@ -1344,13 +1233,23 @@ pub fn parse(frame: &[u8]) -> Result<Response, ProtocolError> {
         tracing::warn!(frame = %frame_str, "frame mnemonic is not two ASCII bytes");
         return Err(ProtocolError::MalformedFrame(frame.to_vec()));
     };
+    if !mnemonic
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        tracing::warn!(frame = %frame_str, "frame mnemonic contains an invalid byte");
+        return Err(ProtocolError::MalformedFrame(frame.to_vec()));
+    }
     tracing::debug!(mnemonic = %mnemonic, "parsing response");
 
-    // The rest of the frame after the mnemonic (may start with a space).
-    let payload = if frame_str.len() > 2 {
-        frame_str[2..].trim_start()
-    } else {
-        ""
+    // A payload is separated from its two-byte mnemonic by exactly one ASCII
+    // space. Do not normalize missing separators, tabs, or repeated spaces:
+    // doing so can turn malformed wire data into a different valid response.
+    let payload = match frame.get(2..) {
+        Some([]) => "",
+        Some([b' ', payload @ ..]) => std::str::from_utf8(payload)
+            .map_err(|_| ProtocolError::MalformedFrame(frame.to_vec()))?,
+        Some(_) | None => return Err(ProtocolError::MalformedFrame(frame.to_vec())),
     };
 
     // Try each sub-parser in turn.
@@ -1438,11 +1337,11 @@ mod tests {
     #[test]
     fn parse_ty_response() -> TestResult {
         let r = parse(b"TY K,2")?;
-        let Response::RadioType { region, variant } = r else {
+        let Response::RadioType(radio_type) = r else {
             return Err(format!("expected RadioType, got {r:?}").into());
         };
-        assert_eq!(region, "K");
-        assert_eq!(variant, 2);
+        assert_eq!(radio_type.region(), crate::types::RadioRegion::UnitedStates);
+        assert_eq!(radio_type.hardware_variant().as_raw(), 2);
         Ok(())
     }
 
@@ -1456,22 +1355,18 @@ mod tests {
     fn serialize_set_dstar_callsign() -> TestResult {
         let bytes = serialize(&Command::SetDstarCallsign {
             slot: DstarSlot::new(1)?,
-            callsign: "KQ4NIT  ".to_owned(),
-            suffix: "D75A".to_owned(),
+            callsign: DstarCallsign::new("KQ4NIT")?,
+            suffix: DstarSuffix::new("D75A")?,
         });
         assert_eq!(bytes, b"DC 1,KQ4NIT  ,D75A\r");
         Ok(())
     }
 
     #[test]
-    fn serialize_set_function_type() {
-        let bytes = serialize(&Command::SetFunctionType { enabled: true });
-        assert_eq!(bytes, b"FT 1\r");
-    }
-
-    #[test]
-    fn serialize_set_bar_antenna() {
-        let bytes = serialize(&Command::SetBarAntenna { enabled: true });
+    fn serialize_set_antenna_input() {
+        let bytes = serialize(&Command::SetAntennaInput {
+            input: AntennaInput::InternalBar,
+        });
         assert_eq!(bytes, b"BS 1\r");
     }
 
@@ -1479,24 +1374,23 @@ mod tests {
     fn serialize_set_tnc_mode() {
         let bytes = serialize(&Command::SetTncMode {
             mode: TncMode::Mmdvm,
-            setting: TncBaud::Bps1200,
+            data_rate: PacketDataRate::Bps1200,
         });
         assert_eq!(bytes, b"TN 3,0\r");
     }
 
     #[test]
     fn all_mnemonics_recognized() -> TestResult {
-        // All standard mnemonics.
-        // SR is write-only but its echo is still recognized by the parser.
+        // All standard mnemonics whose response semantics are identified.
         let mnemonics = [
-            "AI", "AG", "BC", "BY", "DL", "DW", "ME", "MR", "PC", "RX", "SQ", "SR", "SH", "TX",
-            "UP", "VM", "FQ", "FO", "PS", "FV", "ID", "CS", "TN", "BL", "GP", "GM", "SM", "RA",
-            "BT", "FS", "FT", "MD", "SF", "VD", "VG", "VX", "IO", "BS", "LC", "GS", "MS", "PT",
-            "AS", "DC", "DS", "RT", "FR", "GW", "SD", "0M", "AE",
+            "AI", "AG", "BC", "BY", "DL", "DW", "ME", "MR", "PC", "RX", "SQ", "SH", "TX", "UP",
+            "VM", "FQ", "FO", "PS", "FV", "ID", "CS", "TN", "BL", "GP", "GM", "SM", "RA", "BT",
+            "FS", "FT", "MD", "SF", "VD", "VG", "VX", "IO", "BS", "LC", "GS", "MS", "PT", "AS",
+            "DC", "DS", "RT", "FR", "GW", "SD", "AE", "BE",
             // Extra mnemonics not in main dispatch table
             "TY",
         ];
-        assert_eq!(mnemonics.len(), 52);
+        assert_eq!(mnemonics.len(), 51);
         for mnemonic in &mnemonics {
             let input = format!("{mnemonic} 0");
             let result = parse(input.as_bytes());

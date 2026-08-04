@@ -4,9 +4,11 @@
 //! memory scan, program scan, MHz scan, group link scan, priority scan,
 //! call scan, and band scope (spectrum display).
 //!
-//! Scan resume behavior (how the radio continues scanning after stopping
-//! on a signal) is configured via the SR command. The scan range for
-//! program scan is configured via the SF command.
+//! Scan resume behavior (how the radio continues scanning after stopping on
+//! a signal) is configured by Menu 130/131 and represented in the MCP image.
+//! Firmware analysis identifies the stock `SR 0/1/2` CAT values as
+//! Time/Carrier/Seek, not a reset. The public setters use the exact independent
+//! Menu 130/131 MCP cells so their analog and digital scope stays explicit.
 //!
 //! Per User Manual Chapter 9:
 //!
@@ -28,13 +30,8 @@ use super::Frequency;
 /// Scan resume method: controls how the radio resumes scanning after
 /// stopping on an active signal.
 ///
-/// Configured via Menu No. 130 (analog) or Menu No. 131 (digital DV/DR)
-/// on the radio, and via the SR CAT command. Default: Time for analog,
-/// Seek for digital.
-///
-/// # Safety warning
-/// The SR command with value 0 has been observed to reboot the radio
-/// on some firmware versions.
+/// Configured via Menu No. 130 (analog) or Menu No. 131 (digital DV/DR).
+/// Default: Time for analog, Seek for digital.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScanResumeMethod {
     /// Time-operated: resume scanning after a configurable delay even
@@ -55,7 +52,7 @@ impl ScanResumeMethod {
     /// Number of valid scan resume method values (0-2).
     pub const COUNT: u8 = 3;
 
-    /// Convert from the SR command's numeric value.
+    /// Convert from the MCP setting's numeric value.
     ///
     /// Returns `None` for unrecognized values.
     #[must_use]
@@ -68,9 +65,9 @@ impl ScanResumeMethod {
         }
     }
 
-    /// Convert to the SR command's numeric value.
+    /// Convert to the MCP setting's numeric value.
     #[must_use]
-    pub const fn to_raw(self) -> u8 {
+    pub const fn as_raw(self) -> u8 {
         match self {
             Self::TimeOperated => 0,
             Self::CarrierOperated => 1,
@@ -177,7 +174,7 @@ mod tests {
     fn scan_resume_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         for raw in 0..=2 {
             let method = ScanResumeMethod::from_raw(raw).ok_or("valid resume method rejected")?;
-            assert_eq!(method.to_raw(), raw);
+            assert_eq!(method.as_raw(), raw);
         }
         Ok(())
     }
@@ -190,9 +187,9 @@ mod tests {
 
     #[test]
     fn scan_resume_values() {
-        assert_eq!(ScanResumeMethod::TimeOperated.to_raw(), 0);
-        assert_eq!(ScanResumeMethod::CarrierOperated.to_raw(), 1);
-        assert_eq!(ScanResumeMethod::Seek.to_raw(), 2);
+        assert_eq!(ScanResumeMethod::TimeOperated.as_raw(), 0);
+        assert_eq!(ScanResumeMethod::CarrierOperated.as_raw(), 1);
+        assert_eq!(ScanResumeMethod::Seek.as_raw(), 2);
     }
 
     #[test]

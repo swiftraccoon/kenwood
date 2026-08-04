@@ -57,6 +57,50 @@ impl Frequency {
         Self(hz)
     }
 
+    /// Creates a frequency from an integer number of kilohertz.
+    ///
+    /// Returns `None` when converting to hertz would overflow the underlying
+    /// `u32` representation.
+    #[must_use]
+    pub const fn from_khz(khz: u32) -> Option<Self> {
+        match khz.checked_mul(1_000) {
+            Some(hz) => Some(Self(hz)),
+            None => None,
+        }
+    }
+
+    /// Add an offset expressed in hertz.
+    ///
+    /// Returns `None` if the result exceeds the frequency representation.
+    #[must_use]
+    pub const fn checked_add_hz(self, offset_hz: u32) -> Option<Self> {
+        match self.0.checked_add(offset_hz) {
+            Some(hz) => Some(Self(hz)),
+            None => None,
+        }
+    }
+
+    /// Subtract an offset expressed in hertz.
+    ///
+    /// Returns `None` if the result would be negative.
+    #[must_use]
+    pub const fn checked_sub_hz(self, offset_hz: u32) -> Option<Self> {
+        match self.0.checked_sub(offset_hz) {
+            Some(hz) => Some(Self(hz)),
+            None => None,
+        }
+    }
+
+    /// Apply a signed offset expressed in hertz.
+    ///
+    /// Returns `None` if the result falls outside the full `u32` frequency
+    /// representation.
+    #[must_use]
+    pub fn checked_offset_hz(self, offset_hz: i64) -> Option<Self> {
+        let adjusted = i64::from(self.0).checked_add(offset_hz)?;
+        u32::try_from(adjusted).ok().map(Self)
+    }
+
     /// Returns the frequency in Hz.
     #[must_use]
     pub const fn as_hz(self) -> u32 {
@@ -102,11 +146,11 @@ impl Frequency {
         command: &str,
         field: &str,
     ) -> Result<Self, ProtocolError> {
-        if s.len() != 10 {
+        if s.len() != 10 || !s.as_bytes().iter().all(u8::is_ascii_digit) {
             return Err(ProtocolError::FieldParse {
                 command: command.to_owned(),
                 field: field.to_owned(),
-                detail: format!("expected 10-digit string, got {} chars", s.len()),
+                detail: format!("expected exactly 10 ASCII decimal digits, got {s:?}"),
             });
         }
         let hz: u32 = s.parse().map_err(|_| ProtocolError::FieldParse {
@@ -152,6 +196,27 @@ mod tests {
     }
 
     #[test]
+    fn frequency_construction_from_khz_and_checked_offsets() {
+        let simplex = Frequency::new(146_520_000);
+        assert_eq!(Frequency::from_khz(146_520), Some(simplex));
+        assert_eq!(
+            simplex.checked_add_hz(600_000),
+            Some(Frequency::new(147_120_000))
+        );
+        assert_eq!(
+            simplex.checked_sub_hz(600_000),
+            Some(Frequency::new(145_920_000))
+        );
+        assert_eq!(
+            simplex.checked_offset_hz(-600_000),
+            Some(Frequency::new(145_920_000))
+        );
+        assert_eq!(Frequency::new(0).checked_sub_hz(1), None);
+        assert_eq!(Frequency::new(u32::MAX).checked_add_hz(1), None);
+        assert_eq!(Frequency::from_khz(u32::MAX), None);
+    }
+
+    #[test]
     fn frequency_display_mhz() {
         let f = Frequency::new(145_000_000);
         assert!((f.as_mhz() - 145.0).abs() < f64::EPSILON);
@@ -178,8 +243,18 @@ mod tests {
 
     #[test]
     fn frequency_from_wire_invalid() {
-        assert!(Frequency::from_wire_string("not_a_number").is_err());
-        assert!(Frequency::from_wire_string("12345").is_err()); // wrong length
+        for malformed in [
+            "not_a_number",
+            "12345",
+            "+145000000",
+            "-145000000",
+            "014500000 ",
+        ] {
+            assert!(
+                Frequency::from_wire_string(malformed).is_err(),
+                "non-wire frequency form was accepted: {malformed:?}"
+            );
+        }
     }
 
     #[test]

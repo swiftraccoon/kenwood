@@ -127,10 +127,6 @@ mod inner {
         /// The device name this transport was opened with (`None` used the
         /// default); reopen reuses it.
         device_name: Option<String>,
-        /// Retained for source compatibility with callers that attached the
-        /// former main-thread reopen broker. The process-isolated transport
-        /// can reopen from any thread.
-        broker: Option<crate::transport::BrokerHandle>,
     }
 
     impl std::fmt::Debug for BluetoothTransport {
@@ -140,7 +136,6 @@ mod inner {
                 .field("helper_pid", &self.child.as_ref().map(Child::id))
                 .field("helper_healthy", &self.helper_healthy)
                 .field("device_name", &self.device_name)
-                .field("broker", &self.broker)
                 .finish_non_exhaustive()
         }
     }
@@ -287,22 +282,7 @@ mod inner {
                 helper_healthy: true,
                 process_slot,
                 device_name: device_name.map(str::to_owned),
-                broker: None,
             })
-        }
-
-        /// Retain a former [`MainThreadBroker`] handle for API compatibility.
-        ///
-        /// The process-isolated implementation no longer needs a broker:
-        /// `IOBluetooth` and its `CFRunLoop` live on the helper's main thread, so
-        /// [`reopen`](Transport::reopen) is safe from any parent thread. The
-        /// handle is retained across reopen but is never invoked.
-        ///
-        /// [`MainThreadBroker`]: crate::transport::MainThreadBroker
-        #[must_use]
-        pub fn with_broker(mut self, handle: crate::transport::BrokerHandle) -> Self {
-            self.broker = Some(handle);
-            self
         }
 
         fn terminate_helper(&mut self, graceful: bool) {
@@ -435,7 +415,6 @@ mod inner {
 
         async fn reopen(&mut self) -> Result<(), TransportError> {
             let name = self.device_name.clone();
-            let broker = self.broker.clone();
             tracing::info!(
                 device = ?name,
                 max_open_attempts = HELPER_OPEN_MAX_ATTEMPTS,
@@ -444,9 +423,7 @@ mod inner {
             self.close().await?;
             // Public `open` owns the one-retry policy. Calling it once here
             // gives reopen the same two-attempt ceiling without nesting loops.
-            let mut fresh = Self::open(name.as_deref())?;
-            fresh.broker = broker;
-            *self = fresh;
+            *self = Self::open(name.as_deref())?;
             Ok(())
         }
     }
